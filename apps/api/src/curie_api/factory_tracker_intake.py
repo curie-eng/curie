@@ -42,10 +42,10 @@ from datetime import UTC, datetime
 from typing import Any
 
 import httpx
-from sqlalchemy import select, text
+from sqlalchemy import or_, select, text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
-from . import factory_base, factory_rediscovery, workitem_dispatch
+from . import factory_rediscovery, workitem_dispatch
 from .config import Settings
 from .factory_admission import LABEL_REFUSAL_MARKER, cancel_work_item, label_refusal
 from .forges.authority import may_start_with
@@ -73,13 +73,13 @@ from .forges.types import (
     MarkedNotice,
     ReplyTarget,
     RepositoryRef,
-    TicketLabels,
     TrackerIssueRef,
 )
 from .github_factory import lock_issue, work_item_for
 from .github_review_events import FeedbackUnavailable
-from .models import FactoryPollCursor, ThreadPublicationLineage, WorkItem
+from .models import ExecutionRequest, FactoryPollCursor, WorkItem
 from .workitem_dispatch import Admission
+from .workitems import lifecycle
 
 logger = logging.getLogger(__name__)
 
@@ -305,8 +305,64 @@ async def _poll_binding(
         polled = not polling or await _poll_label(
             sessionmaker, scope, tracker, label, running.get(label, []), held
         )
+        if polling and polled:
+            await _observe_existing_bases(sessionmaker, scope, tracker, label)
         if polled and label in sweeps:
             await _sweep_label(sessionmaker, scope, tracker, label, held)
+
+
+async def _observe_existing_bases(
+    sessionmaker: async_sessionmaker[AsyncSession], scope: _Scope, tracker: Tracker, label: str
+) -> None:
+    from .factory_base_reconcile import completed_base_relabel_authority, observe_base_labels
+    from .forges.trackers import code_host_for_repository
+
+    latest_status = (
+        select(ExecutionRequest.status)
+        .where(ExecutionRequest.work_item_id == WorkItem.id)
+        .order_by(ExecutionRequest.sequence.desc())
+        .limit(1)
+        .scalar_subquery()
+    )
+    async with sessionmaker() as session:
+        items = list(
+            await session.scalars(
+                select(WorkItem).where(
+                    WorkItem.tracker_kind == scope.tracker.kind,
+                    WorkItem.tracker_host == scope.tracker.host,
+                    WorkItem.tracker_scope_id == scope.binding.tracker_scope_id,
+                    WorkItem.trigger_label == label,
+                    WorkItem.cancelled_at.is_(None),
+                    or_(
+                        latest_status.in_(("waiting", "running")),
+                        completed_base_relabel_authority(),
+                    ),
+                )
+            )
+        )
+    for item in items:
+        try:
+            ticket = await tracker.ticket_labels(item.tracker_issue)
+            host = code_host_for_repository(scope.registry, scope.client, item.repository)
+            repository = await host.resolve_repository(item.repository_project_id)
+            if repository != item.repository or repository.path != item.repository_path:
+                continue
+            async with sessionmaker() as session:
+                current = await session.get(WorkItem, item.id)
+                if current is None or current.version != item.version:
+                    continue
+                await observe_base_labels(
+                    session,
+                    item=current,
+                    labels=set(ticket.labels),
+                    default_branch=repository.default_branch,
+                    event_identity=None,
+                    settings=scope.settings,
+                    client=scope.client,
+                )
+                await session.commit()
+        except (ForgeError, FeedbackUnavailable):
+            continue
 
 
 def _deferred(scope: _Scope, label: str, what: str, exc: Exception) -> None:
@@ -507,9 +563,20 @@ async def _apply(
             elif notice.disposition is Disposition.MENTION:
                 await _mention(session, scope, tracker, notice)
             else:
-                await _cancel(session, scope, label, notice)
+                await _cancel(
+                    session,
+                    scope,
+                    label,
+                    notice,
+                    cause="issue_deleted" if notice.event_id == "deleted" else "issue_cancelled",
+                )
         except NotFound:
             await session.rollback()
+            if notice.disposition is Disposition.CANCEL:
+                await lock_issue(session, notice.issue)
+                await _cancel(session, scope, label, notice, cause="issue_deleted")
+                await session.commit()
+                return
             logger.info(
                 "tracker intake for binding %s skipped a notice on a missing issue",
                 scope.binding.name,
@@ -526,17 +593,6 @@ async def _comment(tracker: Tracker, issue: TrackerIssueRef, marker: str, body: 
         await tracker.marked_comments.upsert_marked(ReplyTarget.on_issue(issue), marker, body)
     except ForgeError:
         raise FeedbackUnavailable("refusal_comment_unavailable") from None
-
-
-async def _has_open_pr(session: AsyncSession, item: WorkItem) -> bool:
-    if item.publication_lineage_id is None:
-        return False
-    status = await session.scalar(
-        select(ThreadPublicationLineage.status).where(
-            ThreadPublicationLineage.id == item.publication_lineage_id
-        )
-    )
-    return status == "open"
 
 
 async def _admit(
@@ -588,7 +644,7 @@ async def _admit(
         await _comment(tracker, issue, REPO_REFUSAL_MARKER, refusal_body(chosen))
         return
     try:
-        connection, code_host, repository = await _chosen_repository(scope, chosen)
+        connection, _, repository = await _chosen_repository(scope, chosen)
     except NotFound:
         await tracker.ticket_labels(issue)
         logger.warning(
@@ -616,21 +672,25 @@ async def _admit(
         label,
         notice,
         surface.agent_id,
-        chosen,
         connection,
-        code_host,
         repository,
-        existing is not None and await _has_open_pr(session, existing),
-        ticket,
     )
-    if admission is None:
-        return
     async with AsyncSession(
         bind=await session.connection(),
         join_transaction_mode="create_savepoint",
         expire_on_commit=False,
     ) as dispatch:
         result = await workitem_dispatch.readmit(dispatch, admission)
+        if existing is None and isinstance(result, lifecycle.WorkItemOutcome):
+            from .factory_base_reconcile import initialize_base_selection
+
+            await initialize_base_selection(
+                dispatch,
+                item_id=result.work_item.id,
+                labels=set(ticket.labels),
+                default_branch=repository.default_branch,
+                settings=scope.settings,
+            )
     _log_dispatch(scope, result)
 
 
@@ -642,11 +702,11 @@ async def _chosen_repository(
     configured one, or the repository is refused as moved."""
 
     connection = scope.registry.code_host(repo.code_host)
-    code_host = connection.adapter(scope.client)
-    repository = await resolve_stored(
-        code_host,
-        RepositoryRef(connection.config.kind, connection.config.host, repo.project_id, repo.path),
+    descriptor = RepositoryRef(
+        connection.config.kind, connection.config.host, repo.project_id, repo.path
     )
+    code_host = connection.adapter(scope.client, repository=descriptor)
+    repository = await resolve_stored(code_host, descriptor)
     return connection, code_host, repository
 
 
@@ -693,29 +753,12 @@ async def _admission(
     label: str,
     notice: MarkedNotice,
     agent_id: uuid.UUID,
-    repo: RepositoryBindingConfig,
     connection: CodeHostConnection,
-    code_host: CodeHost,
     repository: RepositoryRef,
-    has_open_pr: bool,
-    ticket: TicketLabels,
-) -> Admission | None:
-    """The admission facts on the chosen repository, or None after a base refusal."""
+) -> Admission:
+    """The admission facts on the chosen repository."""
 
     installation = await connection.installation_for(repository)
-    base: factory_base.ResolvedBase | None = None
-    if not has_open_pr:
-        resolved = await factory_base.resolve_base(
-            policy=repo,
-            labels=set(ticket.labels),
-            default_branch=repository.default_branch,
-            code_host=code_host,
-            repository=repository,
-        )
-        if isinstance(resolved, factory_base.BaseRefusal):
-            await factory_base.comment_refusal(tracker.marked_comments, notice.issue, resolved)
-            return None
-        base = resolved
     kind, address, conversation = reply_route(scope.registry, notice.issue, repository.path)
     return Admission(
         agent_id=agent_id,
@@ -729,7 +772,6 @@ async def _admission(
         requester=f"{tracker.kind}:{notice.actor.id}:{notice.actor.login}",
         request_id=notice_request_id(notice),
         trigger_label=label,
-        base=base,
     )
 
 
@@ -776,7 +818,14 @@ async def _mention(
     _log_dispatch(scope, result)
 
 
-async def _cancel(session: AsyncSession, scope: _Scope, label: str, notice: MarkedNotice) -> None:
+async def _cancel(
+    session: AsyncSession,
+    scope: _Scope,
+    label: str,
+    notice: MarkedNotice,
+    *,
+    cause: lifecycle.CancellationCause,
+) -> None:
     """Removing the label that admitted the WorkItem, or closing the issue, cancels it."""
 
     existing = await work_item_for(session, notice.issue)
@@ -784,7 +833,7 @@ async def _cancel(session: AsyncSession, scope: _Scope, label: str, notice: Mark
         return
     if (existing.trigger_label or scope.tracker.label) != label:
         return
-    await cancel_work_item(session, existing)
+    await cancel_work_item(session, existing, cause=cause)
 
 
 def _log_dispatch(scope: _Scope, result: Any) -> None:

@@ -112,13 +112,15 @@ def map_error_classification(raw: str | None) -> str:
 # such as OpenRouter answers HTTP 402, which the SDK reports only as
 # ``unknown`` with the provider's message as the assistant text. A key at its
 # own OpenRouter spend limit answers HTTP 403 "Key limit exceeded", which the SDK
-# reports as ``authentication_failed`` (#4104). Terminal and not retryable: more
-# attempts cannot add credits.
+# reports as ``authentication_failed`` (#4104). An OpenRouter workspace daily
+# budget HTTP 403 is reported by the SDK as ``authentication_failed``
+# (#5163). Terminal and not retryable: more attempts cannot add credits.
 CREDIT_EXHAUSTED_CLASSIFICATION = "model-credit-exhausted"
 _BILLING_SDK_CODE = "billing_error"
 _CREDIT_EXHAUSTED_TEXT = re.compile(
     r"\b402\b|payment required|insufficient (?:credits?|balance|funds)"
-    r"|(?:credit|spend|usage) limit|key limit exceeded|(?:more|out of|no) credits",
+    r"|(?:credit|spend|usage) limit|key limit exceeded|(?:more|out of|no) credits"
+    r"|budget of \S+ exceeded",
     re.IGNORECASE,
 )
 # SDK 0.2.159 bundles Claude Code 2.1.281. Its nFn/oFn/_h formatters emit

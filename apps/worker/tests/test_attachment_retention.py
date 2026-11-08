@@ -696,3 +696,24 @@ def test_the_workspace_reaper_still_sweeps_its_own_thread_beside_an_attachment_l
     # The attachment lane is still inside its own, longer window.
     assert attachment_lane.enumerate_expired() == []
     assert all(key in store.objects for key in attachment_set.object_keys)
+
+
+def test_lazy_composition_still_reaps_legacy_staged_objects(attachments: Any) -> None:
+    from curie_worker.config import WorkerConfig
+    from curie_worker.run import _attachment_coordinator
+
+    store = RetainingObjectStore()
+    _, prepared = _resolved(attachments, store, MovableClock(now=1.0))
+    lane = _attachment_coordinator(
+        WorkerConfig(
+            attachment_enabled=True, attachment_mode="lazy", internal_worker_token="worker"
+        ),
+        store,
+        {},
+    )
+    assert lane is not None
+    assert lane.enumerate_expired() == [ATTACHMENT_THREAD]
+    candidate = lane.begin_expired_reap(ATTACHMENT_THREAD)
+    assert candidate is not None
+    assert lane.finish_expired_reap(candidate)
+    assert all(key not in store.objects for key in prepared.object_keys)

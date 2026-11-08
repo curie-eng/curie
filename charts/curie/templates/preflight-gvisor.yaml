@@ -64,6 +64,7 @@ spec:
       {{- end }}
       {{- end }}
       runtimeClassName: {{ $gvisorClass }}
+      enableServiceLinks: false
       containers:
         - name: gvisor-check
           image: {{ .Values.security.gvisorPreflight.image }}

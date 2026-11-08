@@ -585,11 +585,13 @@ class JiraTracker:
     async def _cancellation(self, ref: TrackerIssueRef) -> _Pending | None:
         """Decision 12: a running issue without the label, or done, is cancelled."""
 
+        issue_id = self._issue_id(ref)
         try:
-            issue_id = self._issue_id(ref)
             fields = _fields(await self._read_issue(issue_id, "labels,status"))
         except NotFound:
-            return None
+            return _Pending(
+                ref, Actor(id="system", login="system"), "deleted", Disposition.CANCEL, None
+            )
         labelled = self.label in _labels(fields)
         if labelled and not _done(fields):
             return None

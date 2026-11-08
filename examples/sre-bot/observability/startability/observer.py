@@ -275,13 +275,16 @@ def gather(args: argparse.Namespace, dsn: str) -> list[dict[str, Any]]:
     from plugin_format import is_reserved_boot_env_name
     from sqlalchemy.ext.asyncio import create_async_engine
 
-    config.load_incluster_config()
+    config.load_incluster_config()  # type: ignore[no-untyped-call]
     apps, core, custom = client.AppsV1Api(), client.CoreV1Api(), client.CustomObjectsApi()
     cache: dict[tuple[str, str, str], Any] = {}
 
     def container(namespace: str, deployment: str, name: str) -> Any:
         """@spec STARTABILITY-5."""
-        spec = apps.read_namespaced_deployment(deployment, namespace).spec.template.spec
+        spec = cast(
+            Any,
+            apps.read_namespaced_deployment(deployment, namespace).spec.template.spec,
+        )
         matches = [c for c in spec.containers if c.name == name]
         if len(matches) != 1:
             raise ValueError("selected container is absent or ambiguous")
@@ -356,12 +359,13 @@ def gather(args: argparse.Namespace, dsn: str) -> list[dict[str, Any]]:
 
     def items(plural: str) -> list[dict[str, Any]]:
         """@spec STARTABILITY-5."""
-        return cast(
-            list[dict[str, Any]],
+        listed = cast(
+            dict[str, Any],
             custom.list_namespaced_custom_object(
                 "extensions.agents.x-k8s.io", "v1beta1", args.sandbox_namespace, plural
-            )["items"],
+            ),
         )
+        return cast(list[dict[str, Any]], listed["items"])
 
     pools = {
         p["metadata"]["name"]: p["spec"]["sandboxTemplateRef"]["name"]

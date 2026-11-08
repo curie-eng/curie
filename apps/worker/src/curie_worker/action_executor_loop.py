@@ -177,7 +177,14 @@ class KillSwitchReader(Protocol):
 
 
 class DeploymentReader(Protocol):
-    def read_namespaced_deployment(self, name: str, namespace: str, **kwargs: Any) -> Any: ...
+    def read_namespaced_deployment(
+        self,
+        name: str,
+        namespace: str,
+        *,
+        _preload_content: bool = ...,
+        _request_timeout: float | None = ...,
+    ) -> Any: ...
 
 
 DeploymentNameResolver = Callable[[str | None, str], Awaitable[str | None]]

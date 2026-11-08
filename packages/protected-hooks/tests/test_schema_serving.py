@@ -57,11 +57,29 @@ def graph_payload() -> dict[str, Any]:
         ("0102", False),
         ("0103", False),
         ("0108", False),
-        # #4930: the candidate reads the 0123 start failure detail column.
         ("0122", False),
         ("0123", False),
-        # #5067: the candidate writes deadlines only the 0140 checks admit.
-        ("0140", True),
+        ("0130", False),
+        # @spec HTTP-PRINCIPAL-ADOPTION-V1-2/9: authority ORM reads require 0132.
+        ("0131", False),
+        ("0136", False),
+        # @spec AGENT-ROLE-PERSISTENCE-V1-9: policy ORM requires 0133.
+        ("0132", False),
+        # @spec HTTP-APPROVAL-CONTINUITY-5: approval ORM requires 0137.
+        ("0133", False),
+        # @spec HTTP-INVOCATION-EXECUTION-21: Grid reports write the 0139 namespace kind.
+        ("0137", False),
+        # @spec AUTOMATED-REMEDIATION-15: 0138 only widens a CHECK below the floor.
+        ("0138", False),
+        ("0139", False),
+        # #5067: the stable deadline backport alone has none of the feature tables.
+        ("0140", False),
+        ("0141", False),
+        ("0143", False),
+        # The candidate minimum includes deleted-issue cancellation.
+        ("0144", False),
+        ("0145", False),
+        ("0147", True),
         ("0000", True),
         ("future-expand", True),
     ],

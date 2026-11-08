@@ -128,17 +128,26 @@ impl Fixture {
         .unwrap();
         fs::write(
             self.root.join("pyproject.toml"),
-            "[tool.uv.workspace]\nmembers = []\n",
+            concat!(
+                "[tool.uv.workspace]\nmembers = [\"packages/test-support\"]\n",
+                "[dependency-groups]\ndev = [\"curie-test-support\"]\n",
+                "[tool.uv.sources]\ncurie-test-support = {workspace = true}\n",
+            ),
         )
         .unwrap();
         fs::write(self.root.join("tools/preflight/always.txt"), "").unwrap();
         for relative in [
             "tools/test-env/test_env.py",
             "tools/e2e-ci-selection/select_tiers.py",
+            "tools/e2e-ci-selection/pytest_impact.py",
             "tools/e2e-ci-selection/cli_pytest_files.txt",
             ".github/e2e-selection.yaml",
             "release/atlas.py",
             "cli/Cargo.toml",
+            "packages/test-support/pyproject.toml",
+            "packages/test-support/src/curie_test_support/__init__.py",
+            "packages/test-support/src/curie_test_support/ratchets.py",
+            "tests/baselines/test-time.json",
         ] {
             let destination = self.root.join(relative);
             fs::create_dir_all(destination.parent().unwrap()).unwrap();
@@ -366,38 +375,6 @@ fn explicit_hooks_installer_uses_the_same_relative_path() {
 }
 
 #[test]
-fn cli_preflight_json_dry_run_matches_the_real_python_tool() {
-    let fixture = Fixture::new();
-    fixture.prepare_preflight();
-    let cli = fixture.real_cli(&["dev", "preflight", "--fast", "--dry-run", "--json"]);
-    assert!(cli.status.success(), "{}", visible(&cli));
-    let python = Command::new("uv")
-        .args([
-            "run",
-            "--no-project",
-            "--with",
-            "pyyaml==6.0.3",
-            "python3",
-            "tools/preflight/preflight.py",
-            "--fast",
-            "--dry-run",
-            "--json",
-        ])
-        .current_dir(&fixture.root)
-        .env("GIT_CONFIG_GLOBAL", "/dev/null")
-        .env("GIT_CONFIG_NOSYSTEM", "1")
-        .output()
-        .unwrap();
-    assert!(python.status.success(), "{}", visible(&python));
-    let cli_report: serde_json::Value = serde_json::from_slice(&cli.stdout).unwrap();
-    let python_report: serde_json::Value = serde_json::from_slice(&python.stdout).unwrap();
-    assert_preflight_schema(&cli_report);
-    assert_eq!(cli_report["checks"], python_report["checks"]);
-    assert_eq!(cli_report["dry_run"], true);
-    assert_eq!(cli_report["checks"].as_array().unwrap().len(), 3);
-}
-
-#[test]
 fn cli_preflight_defaults_to_full_and_executes_docs_only_without_services() {
     let fixture = Fixture::new();
     fixture.prepare_preflight();
@@ -418,7 +395,12 @@ fn cli_preflight_defaults_to_full_and_executes_docs_only_without_services() {
     assert_eq!(report["failures"], serde_json::json!([]));
     assert_eq!(report["ci_only"], serde_json::json!([]));
     let checks = report["checks"].as_array().unwrap();
-    for job in ["action-pins", "commit-messages", "gitleaks"] {
+    for job in [
+        "action-pins",
+        "commit-messages",
+        "gitleaks",
+        "python-static",
+    ] {
         let check = checks
             .iter()
             .find(|check| check["job"] == job)

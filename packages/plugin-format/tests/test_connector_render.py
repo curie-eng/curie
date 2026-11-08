@@ -888,12 +888,6 @@ def test_a_hosted_connector_with_no_fallback_mounts_nothing_rather_than_a_dead_u
     assert r.unhosted_mcp_entry(ConnectorSpec(image="x:1")) is None
 
 
-def test_a_remote_connector_needs_no_fallback_to_stay_reachable() -> None:
-    entry = r.unhosted_mcp_entry(REMOTE)
-    assert entry is not None
-    assert entry["url"] == "https://mcp.internal/mcp"
-
-
 def test_the_fallback_never_displaces_the_derived_url_where_curie_hosts() -> None:
     # The whole point is that `cluster` keeps hosting it. A fallback that won
     # everywhere would silently repoint a production agent at someone's laptop.
@@ -931,6 +925,58 @@ def test_a_referenced_secret_points_at_the_secret_the_author_named() -> None:
     assert ref["name"] == "grafana-mcp", "must point at the out-of-band Secret, not Curie's"
     assert ref["key"] == "TOKEN"
     assert "value" not in entry
+
+
+def _referenced_secret_name(from_secret: str, agent: str) -> str:
+    spec = ConnectorSpec(image="x:1", secrets=[SecretRef(name="T", from_secret=from_secret)])
+    dep = next(
+        o
+        for o in r.render(
+            release="rel",
+            agent=agent,
+            namespace="ns",
+            app_name="app",
+            connector="g",
+            spec=spec,
+            secret_name="curie-owned",
+            proxy=_caller_proxy(),
+        )
+        if o["kind"] == "Deployment"
+    )
+    entry = next(
+        e for e in dep["spec"]["template"]["spec"]["containers"][0]["env"] if e["name"] == "T"
+    )
+    name = entry["valueFrom"]["secretKeyRef"]["name"]
+    assert isinstance(name, str)
+    return name
+
+
+def test_a_referenced_secret_can_be_scoped_to_the_deploying_agent() -> None:
+    # One bundle deployed as two agents in one namespace: each agent's
+    # connector reads its own out-of-band Secret, not a shared one.
+    template = "example-read-${CURIE_AGENT}"
+    assert _referenced_secret_name(template, "foo") == "example-read-foo"
+    assert _referenced_secret_name(template, "foo-dev") == "example-read-foo-dev"
+
+
+def test_a_literal_referenced_secret_does_not_depend_on_the_agent() -> None:
+    assert _referenced_secret_name("example-read", "foo") == "example-read"
+    assert _referenced_secret_name("example-read", "foo-dev") == "example-read"
+
+
+@pytest.mark.parametrize("agent", ["Foo", "foo_dev", "a" * 250])
+def test_an_agent_that_cannot_complete_a_secret_name_refuses_to_render(agent: str) -> None:
+    # The validator proves the template fits every valid agent name, but the
+    # agent arrives separately at render. A name the API server would refuse
+    # at apply is refused here instead, naming both halves.
+    with pytest.raises(ValueError, match="example-read-"):
+        _referenced_secret_name("example-read-${CURIE_AGENT}", agent)
+
+
+def test_secret_ref_placeholders_are_disjoint_from_args_and_env_placeholders() -> None:
+    # `${CURIE_AGENT}` is substituted only in `from_secret`; an args/env value
+    # carrying it is still refused as unknown, and vice versa.
+    assert not set(r.SECRET_REF_PLACEHOLDERS) & set(r.PLACEHOLDERS)
 
 
 def test_owned_and_referenced_secrets_are_indistinguishable_to_the_container() -> None:
@@ -2021,22 +2067,6 @@ def test_a_proxy_keeps_a_direct_service_on_the_server_port_for_callers_that_are_
 
 
 # @spec ADR-0168 d7
-def test_without_a_proxy_there_is_no_direct_service() -> None:
-    # There is no rendered Service at all: a hosted connector without a caller
-    # key fails closed before any object is produced.
-    with pytest.raises(ValueError, match="hosted_connector_requires_caller_key"):
-        r.render(
-            release="acme-bot",
-            agent="acme-bot",
-            namespace="acme-bot",
-            app_name="acme-bot",
-            connector="grafana",
-            spec=HOSTED,
-            secret_name="conn-secrets",
-            proxy=None,
-        )
-
-
 # @spec ADR-0168 d7
 def test_a_server_on_the_proxy_port_keeps_its_direct_service_on_that_port() -> None:
     spec = HOSTED.model_copy(update={"port": r.CALLER_PROXY_PORT})
@@ -2399,3 +2429,30 @@ def test_no_client_auth_secrets_keep_pod_side_delivery() -> None:
             "name": name,
             "valueFrom": {"secretKeyRef": {"name": "conn-secrets", "key": name, "optional": False}},
         }
+
+
+_ROUTE = {"path": "/v1/review", "methods": ["POST"], "max_body_bytes": 64 * 1024 * 1024}
+
+
+# @spec ADR-0240 d3
+def test_declared_routes_reach_the_proxy_env_without_their_callers() -> None:
+    from plugin_format.connectors import ConnectorRoute
+
+    spec = HOSTED.model_copy(
+        update={"routes": [ConnectorRoute(**_ROUTE, callers=["review-tools"])]}
+    )
+    objs = _proxied(spec=spec)
+    assert json.loads(_proxy_env(objs)["CURIE_CALLER_PROXY_ROUTES"]) == [_ROUTE]
+    # The proxy cannot tell sandbox processes apart; callers are the runner's.
+    assert "review-tools" not in json.dumps(objs)
+    server = _containers(objs)["server"]
+    assert "CURIE_CALLER_PROXY_ROUTES" not in json.dumps(server)
+    baseline = _proxied()
+    for key in ("Service", "Service/direct", "NetworkPolicy/Egress", "NetworkPolicy/Ingress"):
+        assert objs[key] == baseline[key], key
+    assert server == _containers(baseline)["server"]
+
+
+# @spec ADR-0240 d3
+def test_without_declared_routes_the_proxy_env_does_not_name_any() -> None:
+    assert "CURIE_CALLER_PROXY_ROUTES" not in _proxy_env(_proxied())

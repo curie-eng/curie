@@ -115,6 +115,7 @@ def _cause(
     if state == "cancellation_requested":
         reasons = {
             "issue_cancelled": "the issue was cancelled (label removed or issue closed)",
+            "issue_deleted": "the tracker issue no longer exists",
             "execution_deadline": (
                 f"the {_deadline_seconds(req)} s execution deadline elapsed"
             ),
@@ -129,7 +130,9 @@ def _cause(
         if deadline is None:
             raise ValueError("a waiting request has no capacity deadline")
         text = "waiting for sandbox capacity"
-        if req.capacity_deferrals:
+        if req.last_deferral_reason == "admission_unavailable":
+            text = "waiting for sandbox admission observations"
+        elif req.capacity_deferrals:
             text += (
                 f"; deferred {req.capacity_deferrals} time(s) for capacity, "
                 f"last reason: {req.last_deferral_reason or 'unknown'}"
@@ -149,6 +152,8 @@ def _cause(
     if state == "cancelled":
         if cause == "lineage_closed":
             text = "cancelled: the pull request closed before this revision could start"
+        elif cause == "issue_deleted":
+            text = "cancelled: the tracker issue no longer exists"
         else:
             text = "cancelled: the issue label was removed or the issue was closed"
         if lineage is not None and lineage.pr_number is not None:
@@ -157,7 +162,7 @@ def _cause(
     if state == "expired":
         if cause == "capacity_wait_expired":
             return (
-                "expired: capacity_wait_expired, no sandbox capacity before the "
+                "expired: capacity_wait_expired, sandbox admission did not complete before the "
                 "waiting deadline"
             ) + _previous_start_failure(req)
         return (

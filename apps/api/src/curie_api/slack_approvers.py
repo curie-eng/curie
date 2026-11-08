@@ -53,7 +53,7 @@ from .config import Settings
 from .identities import slack_bot_tokens
 from .models import Approval
 from .slack_usergroups import SlackUserGroupClient
-from .usergroups import GroupMembershipSource, UserGroupLookupError
+from .usergroups import GroupMembershipSource, UserGroupLookupError, UserGroupMembership
 
 _NO_API_TOKEN = "no Slack bot token is configured for the API"
 
@@ -170,6 +170,21 @@ class SlackUserGroupMembers:
             )
         return MembershipVerdict(member=True, evidence=evidence)
 
+    def fresh(self) -> SlackUserGroupMembers:
+        """This set judged only from a lookup started for the caller.
+
+        A source without an uncached fetch cannot prove fresh membership, so the
+        returned set is undetermined. @spec HTTP-APPROVAL-CONTINUITY-8.
+        """
+
+        fetch = getattr(self._source, "fresh_members", None)
+        return SlackUserGroupMembers(
+            self._group_id,
+            None if fetch is None else _FreshMembers(fetch),
+            missing_source_reason=self._missing_source_reason if self._source is None
+            else "fresh membership lookup unavailable",
+        )
+
     def _undetermined(self, error: str) -> MembershipVerdict:
         """No member set, so no verdict: the authorizer fails closed on this.
 
@@ -192,6 +207,18 @@ class SlackUserGroupMembers:
                 "error": error,
             },
         )
+
+
+class _FreshMembers:
+    """Adapts an uncached fetch to the membership port. @spec HTTP-APPROVAL-CONTINUITY-8."""
+
+    def __init__(self, fetch: Any) -> None:
+        self._fetch = fetch
+
+    async def members(self, group_id: str) -> UserGroupMembership:
+        """@spec HTTP-APPROVAL-CONTINUITY-8."""
+        membership: UserGroupMembership = await self._fetch(group_id)
+        return membership
 
 
 def approval_token_identity(approval: Approval) -> str:

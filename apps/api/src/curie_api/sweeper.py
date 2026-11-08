@@ -45,10 +45,13 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
+import uuid
 from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime, timedelta
+from typing import Any, cast
 
 from curie_telemetry import operation_span, record_metric
+from fastapi import HTTPException
 from opentelemetry.trace import SpanKind, StatusCode
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
@@ -56,7 +59,10 @@ from curie_api.crud import approvals as crud_approvals
 from curie_api.crud import publications as crud_publications
 
 from .config import get_settings
-from .models import ApprovalStatus
+from .identity.http_approval import approval_is_selected
+from .identity.http_invocation import HttpInvocationRuntime
+from .identity_fence import lock_identity_reader
+from .models import Approval, ApprovalStatus
 from .remediation_approvals import (
     REMEDIATION_PURPOSE,
     reconcile_remediation_approvals,
@@ -70,6 +76,9 @@ from .resumequeue import (
 )
 
 logger = logging.getLogger(__name__)
+
+# Pages a pass may read past selected rows before it stops for this interval.
+_LEGACY_PAGES = 10
 _monotonic = time.monotonic
 
 
@@ -94,12 +103,27 @@ async def observe_pending_approvals(
     record_metric("curie.approval.pending.age", age, attributes=attributes)
 
 
+class SealedExpiryCursor:
+    """Round-robin keyset position over the sealed expiry lane.
+
+    Held by the caller across passes so rows the expiry owner keeps refusing
+    (an unverifiable capsule) cannot fill every batch and starve later rows.
+    @spec HTTP-APPROVAL-CONTINUITY-10.
+    """
+
+    def __init__(self) -> None:
+        self.after: tuple[datetime, uuid.UUID] | None = None
+
+
 async def sweep_expired_approvals(
     session: AsyncSession,
     resume_queue: ResumeQueue,
     *,
     now: datetime | None = None,
     limit: int = 100,
+    http_expiry: Callable[[uuid.UUID], Awaitable[Approval | None]] | None = None,
+    sealed_cursor: SealedExpiryCursor | None = None,
+    identity_runtime: HttpInvocationRuntime | None = None,
 ) -> int:
     """One sweep pass: expire every lapsed pending approval and wake its session.
 
@@ -119,17 +143,95 @@ async def sweep_expired_approvals(
     """
 
     now = now or datetime.now(UTC).replace(tzinfo=None)
-    lapsed = await crud_approvals.list_expired_pending_approvals(session, now=now, limit=limit)
     # Read ids and private parents into plain values up front: the per-record
     # rollback below expires every ORM instance in this shared session, so
     # reading record fields lazily in a later iteration would trigger an
     # implicit reload (MissingGreenlet under the async session).
-    approval_work = [
-        (record.id, approval_trace_context(record)) for record in lapsed
-    ]
+    #
+    # @spec HTTP-APPROVAL-CONTINUITY-10: only rows without stored provenance are
+    # legacy candidates, and the pass pages past any it classifies as selected,
+    # so rows this writer must leave pending never fill its batch.
+    approval_work: list[tuple[uuid.UUID, Any]] = []
+    after: tuple[datetime, uuid.UUID] | None = None
+    for _ in range(_LEGACY_PAGES):
+        page = await crud_approvals.list_expired_pending_approvals(
+            session, now=now, limit=limit, sealed=False, after=after
+        )
+        if not page:
+            break
+        after = (cast(datetime, page[-1].expires_at), page[-1].id)
+        for record in page:
+            try:
+                selected = await approval_is_selected(
+                    session, record, runtime=identity_runtime,
+                )
+            except HTTPException:
+                logger.warning(
+                    "approval %s identity classification unavailable; left pending",
+                    record.id,
+                )
+                continue
+            if not selected and len(approval_work) < limit:
+                approval_work.append((record.id, approval_trace_context(record)))
+        if len(approval_work) >= limit or len(page) < limit:
+            break
+    sealed_ids: list[uuid.UUID] = []
+    if http_expiry is not None:
+        # One page per pass from a round-robin cursor with wraparound, so rows
+        # the owner keeps refusing cannot fill every batch and starve later ones.
+        cursor = sealed_cursor if sealed_cursor is not None else SealedExpiryCursor()
+        sealed_page = await crud_approvals.list_expired_pending_approvals(
+            session, now=now, limit=limit, sealed=True, after=cursor.after
+        )
+        if not sealed_page and cursor.after is not None:
+            sealed_page = await crud_approvals.list_expired_pending_approvals(
+                session, now=now, limit=limit, sealed=True
+            )
+        cursor.after = (
+            (cast(datetime, sealed_page[-1].expires_at), sealed_page[-1].id)
+            if len(sealed_page) >= limit
+            else None
+        )
+        sealed_ids = [record.id for record in sealed_page]
+    await session.commit()
+    for approval_id in sealed_ids:
+        assert http_expiry is not None
+        try:
+            sealed = await http_expiry(approval_id)
+        except Exception:  # noqa: BLE001 - one row never blocks the pass.
+            logger.warning("selected approval %s expiry unavailable; left pending", approval_id)
+            continue
+        if sealed is None:
+            continue
+        # @spec HTTP-APPROVAL-CONTINUITY-11: the wake converges on the core-owned
+        # publisher; confirmed append precedes the mark, and a refusal or unknown
+        # append leaves it owed for the reconciler.
+        try:
+            await resume_queue.enqueue_approval(
+                approval_id, parent=approval_trace_context(sealed),
+            )
+            await crud_approvals.mark_approval_resumed(session, approval_id)
+        except Exception:  # noqa: BLE001 - the wake stays owed, never context-free.
+            await session.rollback()
+            logger.warning("selected approval %s expired; resume left owed", approval_id)
 
     flipped = 0
     for approval_id, stored_parent in approval_work:
+        # @spec HTTP-APPROVAL-CONTINUITY-14: classify again under the identity
+        # reader lock in the transaction the flip commits; a role change since
+        # the page read leaves a now-selected row to the sealing owner.
+        try:
+            await lock_identity_reader(session)
+            current = await session.get(Approval, approval_id, populate_existing=True)
+            still_legacy = current is not None and not await approval_is_selected(
+                session, current, runtime=identity_runtime,
+            )
+        except HTTPException:
+            still_legacy = False
+        if not still_legacy:
+            await session.rollback()
+            logger.warning("approval %s no longer legacy-expirable; left pending", approval_id)
+            continue
         try:
             with operation_span(
                 "curie.approval.expire",
@@ -238,8 +340,13 @@ async def run_expiry_sweeper(
     *,
     publication_patch_retention_seconds: int = 3600,
     remediation_admissions: Callable[[AsyncSession], Awaitable[int]] | None = None,
+    http_expiry: Callable[[uuid.UUID], Awaitable[Approval | None]] | None = None,
+    identity_runtime: HttpInvocationRuntime | None = None,
 ) -> None:
     """Periodic loop driving ``sweep_expired_approvals`` until ``stop`` is set.
+
+    ``identity_runtime`` is the app's HTTP invocation runtime; each legacy row is
+    classified by binding with its registrations (HTTP-APPROVAL-CONTINUITY-14).
 
     ``remediation_admissions``, when given, runs each pass after the sweep: it
     finishes remediation admission work a crash or an unreadable store left
@@ -260,6 +367,7 @@ async def run_expiry_sweeper(
     """
 
     last_success_monotonic: float | None = None
+    sealed_cursor = SealedExpiryCursor()
     while not stop.is_set():
         try:
             await asyncio.wait_for(stop.wait(), timeout=interval_s)
@@ -280,7 +388,13 @@ async def run_expiry_sweeper(
         ) as span:
             try:
                 async with sessionmaker() as session:
-                    await sweep_expired_approvals(session, resume_queue)
+                    # Without an owner or runtime the pass keeps its exact call shape.
+                    options: dict[str, Any] = {}
+                    if http_expiry is not None:
+                        options.update(http_expiry=http_expiry, sealed_cursor=sealed_cursor)
+                    if identity_runtime is not None:
+                        options.update(identity_runtime=identity_runtime)
+                    await sweep_expired_approvals(session, resume_queue, **options)
                     await crud_publications.reap_terminal_publication_patches(
                         session,
                         terminal_before=datetime.now(UTC).replace(tzinfo=None)

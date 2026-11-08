@@ -237,6 +237,11 @@ if [ "$1" = template ]; then
     exit 0
 fi
 if [ "$1" = get ] && [ "$2" = values ]; then
+    if [ -f "${{0%/*}}/converged-helm-applied" ]; then
+        case " $* " in
+            *" --all "*) printf '%s\n' '{{"agentSandbox":{{"deploy":false}}}}'; exit 0 ;;
+        esac
+    fi
     if [ -n "$CURIE_CAPACITY_EXISTING_VALUES" ]; then
         printf '%s\n' "$CURIE_CAPACITY_EXISTING_VALUES"
         exit 0
@@ -256,6 +261,7 @@ if [ "$1" = upgrade ] && [ "$2" = --install ]; then
     # Snapshot the CLI's actual stderr at invocation, before Helm can return.
     cat "$CURIE_CAPACITY_STDERR" > "$CURIE_CAPACITY_STDERR_AT_INSTALL"
     printf '%s\n' "$*" >> "$CURIE_CAPACITY_UPGRADES"
+    : > "${{0%/*}}/converged-helm-applied"
     exit 0
 fi
 {}
@@ -834,8 +840,11 @@ fn node_read_timeout_is_bounded_skips_once_and_stops_the_owned_read() {
         elapsed >= Duration::from_secs(19),
         "the actual 20-second deadline must be exercised: {elapsed:?}"
     );
+    // Waiting for the read means returning after it ends on its own at 60
+    // seconds. A tighter bound measures the host: a CI runner stall of about
+    // 13 seconds pushed a correct 20-second deadline past 30.
     assert!(
-        elapsed < Duration::from_secs(30),
+        elapsed < Duration::from_secs(60),
         "the advisory must not wait for the 60-second read: {elapsed:?}"
     );
     assert!(

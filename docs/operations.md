@@ -1254,6 +1254,14 @@ Secret reference through `api.githubAppExistingSecret` and
 `api.githubAppExistingSecretKey`. An `owner/*` allowlist or an inline-only
 `api.githubAppPrivateKey` refuses.
 
+After upgrading to a version implementing
+[ADR 0253](adr/0253-factory-base-labels-resolve-at-claim-and-follow-relabels.md),
+base selection resolves at claim after the label settling interval. A ticket
+with a disallowed `base:` label can have a waiting WorkItem and execution
+request; it cannot start execution. The factory records `base_not_allowed`
+and posts a marked refusal comment. Correcting the label lets that request
+retry against the retained repository base policy.
+
 The CLI machine must reach the retained `api.githubApiUrl` for identity
 resolution. Live `curie cluster up`, `curie apply`, `curie diff` and
 `curie cluster upgrade`, including upgrade `--dry-run`, may mint external
@@ -1530,9 +1538,10 @@ stays requested until the runtime reports that it stopped. An already linked
 pull request stays linked, and later publication is refused.
 
 Polling reads each bound repository every `factory.trackers[].pollIntervalSeconds`
-(default 45 seconds). It admits an open labeled issue with no grace delay,
-admits a mention and review feedback on a factory pull request, and cancels a
-work item whose issue was closed or unlabeled. Those reads do not record a
+(default 45 seconds). It can admit an open labeled issue immediately, but
+sandbox acquisition waits for the base label settling interval described below.
+It admits a mention and review feedback on a factory pull request, and cancels
+a work item whose issue was closed or unlabeled. Those reads do not record a
 webhook delivery. The webhook is optional. In webhook mode the missed-label
 backstop stays: every `FACTORY_RECONCILE_INTERVAL_S` (default 300, 0
 disables) the reconciler lists the open issues carrying the factory label and
@@ -1646,7 +1655,11 @@ the wait with `factory.ciWaitSeconds` (API env `FACTORY_CI_WAIT_S`, default
 kept. The wait still ends at the execution deadline if that comes first. CI that cannot be verified, including unreadable checks or missing
 required evidence, ends as `ci_unverified`, which is never success. The notice's
 Reason line explains why. The pull request stays open. The work item detail route still
-reports CI as `unavailable` / `github_forbidden` without the permission.
+reports CI as `unavailable`, with a 403's reason naming the read GitHub
+refused (`github_forbidden_list_check_runs`, `github_forbidden_get_combined_status`,
+`github_forbidden_get_branch_rules` or `github_forbidden_get_branch`). The
+reason names the operation and does not claim which App permission is missing:
+a 403 alone cannot say that (#5222).
 
 Per-repository factory settings live under `factory.bindings[].repos[]`. A
 binding joins one tracker (`tracker`) to its repositories, and each `repos`
@@ -1706,15 +1719,70 @@ The factory reads no `GITHUB_FACTORY_*` environment. The chart refuses an
 
 The branch a factory ticket starts from and targets is `bases` and
 `defaultBase` on the repository entry. `bases` is a non-empty list of unique
-allowed branches. `defaultBase` must be one of them and defaults to the
-repository default branch. A repository entry without `bases` may only use its
-default branch. A ticket picks a base with a `base:<branch>` issue label; with no
-label it uses the default. Two `base:` labels, a base outside `bases`, or a base
-that does not exist are refused with an issue comment, and no other branch is
-substituted. The base is frozen when the work item is created: a later label
-change is ignored. The status comment shows it on a `Base:` line, for example
+case-sensitive glob patterns: `main` permits only that branch, `release/*`
+permits matching release branches, and `*` permits any valid branch name that
+exists on the remote. `defaultBase` remains a literal branch name, must match
+an allowed pattern, and defaults to the repository default branch. A repository
+entry without `bases` may only use its default branch. Patterns never create
+branches; tags and local-only branches do not satisfy the remote existence check.
+
+A ticket picks a literal base with one `base:<branch>` issue label. No base
+label, including removal of the previous one, selects the default. Multiple
+base labels, invalid or disallowed names, and missing remote branches are
+refused with a visible reason; no other branch is substituted.
+
+The factory waits after the factory selection label is applied before acquiring
+the sandbox. Set `factory.baseLabelSettleSeconds` (API env
+`FACTORY_BASE_LABEL_SETTLE_S`) to change the interval: the default is 60 seconds,
+and zero is valid. Reapplying the selection label begins a new interval. At
+sandbox acquisition, the factory reads the current labels and records the base
+branch, its source and its remote commit. An earlier intake scan does not freeze
+that choice. The status comment shows a `Base:` line, for example
 ``Base: `next` (from label `base:next`)``, or `(deployment default)` when no label
 chose it.
+
+If the effective base changes before a PR exists, the platform cancels the old
+execution, waits for it to stop, and automatically starts fresh work from the
+new branch. The replacement gets fresh execution authority. Selecting the same
+branch from a different source updates the provenance without restarting;
+movement of the branch tip alone is not a base label change.
+
+After a PR exists, a durable platform operation replays its commits onto the
+new base and validates the replay. It pushes a clean result only if the remote
+PR head still matches the recorded head, then retargets the PR after confirming
+that push. Once the target change is durably confirmed, it appends and pushes a
+distinct empty commit with the same tree. Required CI must pass on that final
+head under the new target, including when no further code changes are needed.
+The empty commit remains in branch history and is an ancestor of later fixes.
+Old approvals and checks do not authorize the new head and base. Durable
+progress lets reconciliation resume after a restart.
+
+Base-label observation continues after a successful request completes while
+its factory PR remains open. A changed base creates a distinct waiting request
+through the same fenced transition path only when the stored repository and
+base pins match the current lineage, with an acknowledged successful current
+publication or an acknowledged, successfully settled base move. That authority
+may belong to an earlier completed request, including after a no-change
+follow-up; its operation and CI owners stay unchanged.
+
+Completed work without a PR, failed or cancelled requests, and locally closed
+lineages do not enter this polling path. Stale revision, head, base or owner
+evidence also excludes a completed request, as do an unacknowledged outcome,
+an unfinished move, an active publication or a reserved review. An old
+publication cannot authorize a head changed by a later applied base move.
+
+A replay conflict changes neither the remote branch nor the PR target. The
+status comment keeps the conflict visible until the factory selection label is
+reapplied to retry with current labels and remote state. Editing a base label
+alone does not retry a conflicting replay. Other refusals also remain visible.
+
+Explicit checkpoint restoration keeps the checkpoint's original trusted base
+commit and recorded PR target branch. It still checks the current repository
+and allowed patterns, and does not reinterpret the saved patch against current
+labels or a newer branch tip. See
+[ADR 0253](adr/0253-factory-base-labels-resolve-at-claim-and-follow-relabels.md)
+and the restoration exception in
+[ADR 0251](adr/0251-a-failed-factory-run-keeps-a-private-recovery-checkpoint-that-only-explicit-restoration-reads.md).
 
 When a publication request is refused, the issue's `Could not complete:`
 notice (cause `approval_create_failed`) carries the refusal code and message
@@ -1956,7 +2024,7 @@ converter decodes entities and backslash escapes only in prose after parsing,
 leaving code content escaped. Within blockquotes it converts headings to
 paragraphs, rules to literal `---` paragraphs, and flattens nested quote content.
 A last `Cause:` line names the platform cause code
-(`capacity_wait_expired`, `start_failed`, `execution_deadline`, `issue_cancelled`,
+(`capacity_wait_expired`, `start_failed`, `execution_deadline`, `issue_cancelled`, `issue_deleted`,
 `owner_lost`, `runner_escalated`, `unclassified`, `max_turns`, `runner_failed`,
 `no_pull_request`, `revision_unchanged`,
 `early_stop`, `publication_denied`, `publication_expired`, `publication_failed`,
@@ -2335,6 +2403,8 @@ it. `ci.state` is `passing`, `failing`, `pending`, `none` (no check runs),
 `not_applicable` (no pull request) or `unavailable` with a fixed `reason`:
 `no_head_sha`, `app_not_configured`, `installation_refused`,
 `github_unauthorized`, `github_forbidden`,
+`github_forbidden_list_check_runs`, `github_forbidden_get_combined_status`,
+`github_forbidden_get_branch_rules`, `github_forbidden_get_branch`,
 `github_not_found`, `github_rate_limited`, `github_error`, `timeout`,
 `malformed_response`, `too_many_check_runs` or `observation_busy` (every
 concurrent credential slot is held by an in-flight mint). The list route reports

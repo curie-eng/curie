@@ -5,6 +5,8 @@ name: Helm CI
 # job gives the chart the CI it otherwise lacks -- lint, render every shipped
 # values overlay, and schema-validate the rendered manifests.
 on:
+  merge_group:
+    types: [checks_requested]
   # Pull requests to main and next always start this workflow so the chart
   # aggregator can report. chart-changes decides whether the shards run,
   # using the historical path list in tools/helm-ci-gate/decide.py. Pushes
@@ -30,6 +32,7 @@ jobs:
     runs-on: ubuntu-24.04
     outputs:
       chart: ${{ steps.filter.outputs.chart }}
+      deep: ${{ steps.filter.outputs.deep }}
     steps:
       - uses: actions/checkout@v7
         with:
@@ -39,6 +42,9 @@ jobs:
         env:
           EVENT_NAME: ${{ github.event_name }}
           BASE_REF: ${{ github.base_ref }}
+          # The kind jobs are deep tiers. A pull request runs them only with
+          # the ci:deep label, read from the event on the next push.
+          DEEP_LABEL: ${{ contains(github.event.pull_request.labels.*.name, 'ci:deep') }}
         run: python3 tools/helm-ci-gate/decide.py select
 
   # The chart gate runs as parallel shards. The render assertions used to be
@@ -188,6 +194,16 @@ jobs:
       - name: Reject chart-owned extraEnv duplicates
         run: bash charts/curie/ci/reserved-env-assertions.sh
 
+      # A Service named <release>-<x> injects CURIE_<X>_PORT as a URL into any
+      # pod with service links on, which broke the drain hook (#5350).
+      - name: helm render assertions (service links off)
+        run: bash charts/curie/ci/service-links-assertions.sh
+
+      # Prove the HTTP identity operator files are off by default and, when
+      # selected, mount read-only into the API or dispatcher container alone.
+      - name: helm render assertions (HTTP identity operator files)
+        run: bash charts/curie/ci/http-identity-mount-assertions.sh
+
       # Prove the factory.* block renders CURIE_FORGES with mounted credential
       # files and that a removed api.* factory key is refused (#4397).
       - name: helm render assertions (factory forges)
@@ -218,6 +234,11 @@ jobs:
       # namespace, the same namespace the worker claims sandboxes in.
       - name: helm render assertions (api runner namespace)
         run: bash charts/curie/ci/api-runner-namespace-assertions.sh
+
+      # Prove workspace recovery (ADR 0251) is off by default, reaches the API
+      # and worker when enabled with a positive cap, and refuses a bad cap.
+      - name: helm render assertions (workspace recovery)
+        run: bash charts/curie/ci/workspace-recovery-assertions.sh
 
       # Prove the retired BYO-model LiteLLM sidecar (issue #253) is absent by
       # default and that enabling its values flag is refused by the chart
@@ -360,17 +381,6 @@ jobs:
           set -euo pipefail
           bash charts/curie/ci/otel-collector-k8s-events-assertions.sh
 
-      # Prove every first-party chart workload carries the shared OTLP env
-      # (#2360). Membership is derived from rendered chart-owned images, not a
-      # named allowlist, so a sixth Deployment is rejected rather than skipped.
-      # Optional mail, the runner SandboxTemplate, collector-on vs external
-      # endpoint, and the two mutation controls (unknown-without-OTLP, stripped
-      # OTLP) live in this script rather than the durability suite.
-      - name: helm render assertions (instrumented first-party workloads)
-        run: |
-          set -euo pipefail
-          bash charts/curie/ci/instrumented-workload-assertions.sh
-
       - name: helm render assertions (SRE bot observability stack)
         run: |
           set -euo pipefail
@@ -398,17 +408,6 @@ jobs:
         run: |
           set -euo pipefail
           bash charts/curie/ci/langfuse-image-pin-assertions.sh
-
-      # Refuse untagged, :latest and major/minor-alias image references in
-      # values *Image keys, in rendered container image fields, and in
-      # compose.dev.yaml services (#2318, #2319). The security probe's netshoot
-      # image was the first miss: a bare repository pulls :latest with implicit
-      # Always. An alias like postgres:16-alpine is the subtler one -- it has a
-      # tag, but upstream republishes it under the chart version.
-      - name: helm render assertions (unpinned images)
-        run: |
-          set -euo pipefail
-          bash charts/curie/ci/unpinned-image-assertions.sh
 
       # Prove postgres.podSecurityContext.fsGroup is the gid of the `postgres`
       # user inside the digest-pinned image, by running that image (#2319). The
@@ -528,14 +527,6 @@ jobs:
           set -euo pipefail
           bash charts/curie/ci/langfuse-clickhouse-readiness-assertions.sh
 
-      # Prove the Langfuse web+worker containers carry a numeric runAsUser
-      # alongside runAsNonRoot (issue #351) so the kubelet can verify non-root
-      # and the pods actually start on an enforcing cluster.
-      - name: helm render assertions (langfuse runAsUser)
-        run: |
-          set -euo pipefail
-          bash charts/curie/ci/langfuse-runasuser-assertions.sh
-
       # Prove the Postgres readiness gate is rendered on BOTH Langfuse
       # Deployments (#2330: it was web-only, so langfuse-worker crash-looped on
       # the same Prisma P1001 that #1853 fixed for web), ordered before the
@@ -549,32 +540,6 @@ jobs:
         run: |
           set -euo pipefail
           bash charts/curie/ci/langfuse-postgres-readiness-assertions.sh
-
-      # Prove langfuse-worker carries both probes on its :3030 endpoint -- #71's
-      # criterion is that every Deployment with a persistent process has both a
-      # readiness and a liveness probe, and the worker was the last violation.
-      # Readiness is the SIGTERM-aware /api/ready so a terminating pod drains;
-      # liveness is tcpSocket so a Postgres or Valkey blip cannot restart the
-      # single replica into its boot migrations (#71, #2330).
-      - name: helm render assertions (langfuse worker probes)
-        run: |
-          set -euo pipefail
-          bash charts/curie/ci/langfuse-worker-probe-assertions.sh
-
-      # Prove the probe-window invariant across the WHOLE render, not a named
-      # list: for every container carrying both probes, the liveness failure
-      # cutoff -- initialDelaySeconds + (failureThreshold - 1) * periodSeconds,
-      # kubelet defaults applied to omitted keys -- must be strictly LATER than
-      # the readiness one, or the kubelet restarts a container that is still
-      # inside the boot window readiness was sized to tolerate. postgres (WAL
-      # replay), langfuse-web and langfuse-worker (Prisma/ClickHouse boot
-      # migrations) and api all inverted the two probes. Also requires an
-      # explicit livenessProbe timeoutSeconds everywhere, since the kubelet's
-      # invisible 1s default is the silent half of the postgres case.
-      - name: helm render assertions (probe windows)
-        run: |
-          set -euo pipefail
-          bash charts/curie/ci/probe-window-assertions.sh
 
       # Prove the controller NetworkPolicy RBAC split (issue #350): exactly one
       # read-only cluster grant (get/list/watch) so the informer syncs, no
@@ -605,6 +570,25 @@ jobs:
             --set api.ingress.enabled=true --set api.ingress.host=api.example.com \
             -s templates/api-ingress.yaml \
             | kubeconform -strict -summary -kubernetes-version "$KUBE_VERSION"
+
+      - name: Install uv
+        id: install_uv
+        continue-on-error: true
+        uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
+        with:
+          python-version: "3.13"
+      - name: Back off before retrying Install uv
+        if: steps.install_uv.outcome == 'failure'
+        run: |
+          echo "Install uv failed on attempt 1 of 2, retrying in 15 seconds"
+          sleep 15
+      - name: Install uv (retry)
+        if: steps.install_uv.outcome == 'failure'
+        uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
+        with:
+          python-version: "3.13"
+      - name: Sync workspace
+        run: uv sync
 
       # Prove the GitHub App credential (ADR-0092): the App ID reaches the API
       # as digits (a float renders as "4.47597e+06" and 401s every call), and a
@@ -983,30 +967,10 @@ jobs:
           set -euo pipefail
           bash charts/curie/ci/worker-turn-receipt-assertions.sh
 
-      # This otherwise Python-free chart job needs the workspace because the
-      # web-identity gate below does not stop at the rendered YAML: it builds
-      # the real API and worker BundleStore objects under each rendered
-      # workload's env and asks the constructed boto3 client which credential
-      # provider won. Reading the manifests alone cannot tell an omitted
-      # credential apart from one the SDK signs as an empty identity.
-      - name: Install uv
-        id: install_uv
-        continue-on-error: true
-        uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
-        with:
-          python-version: "3.13"
-      - name: Back off before retrying Install uv
-        if: steps.install_uv.outcome == 'failure'
+      - name: helm render assertions (manifest policy P1-P5)
         run: |
-          echo "Install uv failed on attempt 1 of 2, retrying in 15 seconds"
-          sleep 15
-      - name: Install uv (retry)
-        if: steps.install_uv.outcome == 'failure'
-        uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
-        with:
-          python-version: "3.13"
-      - name: Sync workspace
-        run: uv sync
+          set -euo pipefail
+          bash charts/curie/ci/policy-assertions.sh
 
       # Prove the key-free object store path (#1325, #2211). Pointing the bundle
       # store at a real cloud object store used to REQUIRE static access keys:
@@ -1176,7 +1140,7 @@ jobs:
   helm:
     name: Chart (lint + template + kubeconform)
     runs-on: ubuntu-24.04
-    needs: [chart-changes, chart-lint-and-assertions-1, chart-assertions-2, chart-assertions-retained-values]
+    needs: [chart-changes, chart-lint-and-assertions-1, chart-assertions-2, chart-assertions-retained-values, reserved-env-upgrade, automatic-thread-isolation]
     # A completed run must record this check as success or failure. A
     # condition that can be false would mark it skipped and block release
     # authorization (#1470). Cancellation is the only skip.
@@ -1192,13 +1156,17 @@ jobs:
           SHARD_LINT: ${{ needs.chart-lint-and-assertions-1.result }}
           SHARD_RENDER: ${{ needs.chart-assertions-2.result }}
           SHARD_RETAINED: ${{ needs.chart-assertions-retained-values.result }}
+          EVENT_NAME: ${{ github.event_name }}
+          DEEP: ${{ needs.chart-changes.outputs.deep }}
+          KIND_RESERVED_ENV: ${{ needs.reserved-env-upgrade.result }}
+          KIND_THREAD_ISOLATION: ${{ needs.automatic-thread-isolation.result }}
         run: python3 tools/helm-ci-gate/decide.py aggregate
 
   reserved-env-upgrade:
     name: Reject legacy extraEnv before upgrade mutation
     runs-on: ubuntu-24.04
     needs: [chart-changes]
-    if: ${{ needs.chart-changes.outputs.chart == 'true' }}
+    if: ${{ needs.chart-changes.outputs.chart == 'true' && needs.chart-changes.outputs.deep == 'true' }}
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v7
@@ -1275,7 +1243,7 @@ jobs:
     name: Automatic thread isolation (kind)
     runs-on: ubuntu-24.04
     needs: [chart-changes]
-    if: ${{ needs.chart-changes.outputs.chart == 'true' }}
+    if: ${{ needs.chart-changes.outputs.chart == 'true' && needs.chart-changes.outputs.deep == 'true' }}
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@v7

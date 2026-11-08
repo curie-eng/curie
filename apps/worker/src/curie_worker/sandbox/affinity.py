@@ -305,6 +305,44 @@ class AffinityStore:
             self._claim_cred_key(claim_name), self._claim_cred_retiring_key(claim_name)
         )
 
+    # A Docker-enabled claim's daemon (ADR 0217). The marker, valued with the
+    # daemon namespace, is written before the first daemon object and has no
+    # TTL: it tells handle-less retirement that the claim has a daemon. The
+    # client credential is what the worker pings with, since it cannot read
+    # Secrets back; it lives no longer than the claim can. Never logged.
+
+    def _daemon_marker_key(self, claim_name: str) -> str:
+        return f"{self._prefix}:daemon-claim:{claim_name}"
+
+    def _daemon_cred_key(self, claim_name: str) -> str:
+        return f"{self._prefix}:daemon-tls:{claim_name}"
+
+    def mark_daemon(self, claim_name: str, namespace: str) -> bool:
+        """Associate ``claim_name`` with a daemon; False when it already was."""
+
+        return bool(self._redis.set(self._daemon_marker_key(claim_name), namespace, nx=True))
+
+    def daemon_namespace(self, claim_name: str) -> str | None:
+        raw = self._redis.get(self._daemon_marker_key(claim_name))
+        return None if raw is None else raw.decode() if isinstance(raw, bytes) else str(raw)
+
+    def remember_daemon_credential(
+        self, claim_name: str, files: Mapping[str, str], *, ttl_s: int
+    ) -> None:
+        self._redis.set(self._daemon_cred_key(claim_name), json.dumps(dict(files)), ex=ttl_s)
+
+    def daemon_credential(self, claim_name: str) -> dict[str, str] | None:
+        raw = self._redis.get(self._daemon_cred_key(claim_name))
+        return None if raw is None else dict(json.loads(raw))
+
+    def forget_daemon(
+        self, claim_name: str, *, marker: bool = True, credential: bool = True
+    ) -> None:
+        keys = [self._daemon_marker_key(claim_name)] if marker else []
+        keys += [self._daemon_cred_key(claim_name)] if credential else []
+        if keys:
+            self._redis.delete(*keys)
+
     def iter_claim_credentials(self) -> list[tuple[str, str, str]]:
         """``(claim_name, agent, credential)`` for reports that have not landed."""
 

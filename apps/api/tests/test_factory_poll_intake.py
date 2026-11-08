@@ -39,6 +39,7 @@ import pytest
 import redis.asyncio as aioredis
 from curie_api.config import Settings, get_settings
 from curie_api.main import create_app
+from curie_api.models import ExecutionRequest
 from curie_api.threadkeys import route_thread_key
 from curie_api.workitem_reconciler import WorkItemReconciler
 from curie_test_support.valkey import VALKEY_HOST, VALKEY_PORT, VALKEY_PW
@@ -48,6 +49,7 @@ from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
+from forge_fakes import factory_wake  # noqa: E402
 from forge_fakes import jira as jira_fake  # noqa: E402
 from forge_fakes.github import (  # noqa: E402
     INSTALLATION_ID,
@@ -355,7 +357,7 @@ class PollGitHub:
         if path in self.failures:
             return httpx.Response(self.failures[path], json={"message": "Unavailable fixture"})
         root = f"/repos/{REPO}"
-        if path == root:
+        if path in {root, f"/repositories/{REPO_ID}"}:
             return httpx.Response(
                 200,
                 json={
@@ -371,6 +373,18 @@ class PollGitHub:
             if sha is None:
                 return httpx.Response(404, json={"message": "Not Found"})
             return httpx.Response(200, json={"ref": f"refs/heads/{branch}", "object": {"sha": sha}})
+        matching_prefix = f"{root}/git/matching-refs/heads/"
+        if path.startswith(matching_prefix):
+            # https://docs.github.com/en/rest/git/refs#list-matching-references
+            prefix = path.removeprefix(matching_prefix)
+            return httpx.Response(
+                200,
+                json=[
+                    {"ref": f"refs/heads/{branch}", "object": {"type": "commit", "sha": sha}}
+                    for branch, sha in self.branches.items()
+                    if branch.startswith(prefix)
+                ],
+            )
         if path == f"{root}/issues":
             wanted = request.url.params.get("labels")
             listed = [
@@ -528,7 +542,7 @@ def _patch_credentials(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 def _client_type(github: PollGitHub) -> type[httpx.AsyncClient]:
-    transport = httpx.MockTransport(github.handle)
+    transport = httpx.MockTransport(lambda request: github.handle(request))
 
     class _Client(httpx.AsyncClient):
         def __init__(self, *args: Any, **kwargs: Any) -> None:
@@ -569,6 +583,7 @@ def webhook_factory(
 def _factory(monkeypatch: pytest.MonkeyPatch, key_dir: Path, intake: str) -> Any:
     for key, value in _poll_env(key_dir, intake).items():
         monkeypatch.setenv(key, value)
+    monkeypatch.setenv("INTERNAL_WORKER_TOKEN", "factory-intake-worker")
     get_settings.cache_clear()
     _patch_credentials(monkeypatch)
     github = PollGitHub()
@@ -611,7 +626,7 @@ def _requests(number: int) -> list[dict[str, Any]]:
     return _rows(
         "SELECT r.id, r.sequence, r.status, r.terminal_cause, r.objective, "
         "r.requester, w.id AS work_item_id, w.cancelled_at, "
-        "w.base_branch, w.base_source, w.base_commit, w.base_label_ignored "
+        "w.base_branch, w.base_source, w.base_commit, w.base_resolved_request_id "
         "FROM curie.work_items w "
         "LEFT JOIN curie.execution_requests r ON r.work_item_id = w.id "
         "WHERE w.tracker_scope_id = :repo AND w.tracker_issue_id = :number "
@@ -645,6 +660,83 @@ def _admit_label(client: TestClient, github: PollGitHub) -> tuple[int, dict[str,
     rows = _requests(number)
     assert len(rows) == 1
     return number, rows[0]
+
+
+def _acquire(client: TestClient, request_id: uuid.UUID) -> httpx.Response:
+    async def body() -> dict[str, Any]:
+        async with client.app.state.sessionmaker() as session:
+            request = await session.get(ExecutionRequest, request_id)
+            assert request is not None
+            return {
+                "owner": "factory-intake-owner",
+                "generation": request.dispatch_generation,
+                "wake": (await factory_wake(session, request_id)).model_dump(mode="json"),
+                "context": None,
+            }
+
+    return client.post(
+        f"/v1/internal/work-items/requests/{request_id}/acquire",
+        headers={"X-Curie-Worker-Token": get_settings().internal_worker_token},
+        json=client.portal.call(body),
+    )
+
+
+def _dispatch_state(request_id: uuid.UUID) -> dict[str, Any]:
+    (row,) = _rows(
+        "SELECT status, acquire_owner, start_deferrals, last_deferral_reason "
+        "FROM curie.execution_requests WHERE id = :id",
+        {"id": request_id},
+    )
+    return row
+
+
+@pytest.mark.parametrize("changed", [False, True], ids=["unchanged-base", "changed-base"])
+@pytest.mark.parametrize("intake", ["poll", "webhook"])
+def test_first_acquire_racing_initial_base_observation(
+    poll_factory: tuple[TestClient, PollGitHub],
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    changed: bool,
+    intake: str,
+) -> None:
+    client, github = poll_factory
+    _reconfigure(
+        monkeypatch,
+        tmp_path,
+        bindings=[github_repository_binding(bases=["main", "next"], default_base="main")],
+    )
+    if intake == "poll":
+        number = github.plant_issue()
+        _run_once(github)
+        [row] = _requests(number)
+    else:
+        number, row = _admit_label(client, github)
+    original = github.handle
+    observed = False
+
+    async def observe_during_branch_read(request: httpx.Request) -> httpx.Response:
+        nonlocal observed
+        response = original(request)
+        if request.url.path == f"/repos/{REPO}/git/ref/heads/main" and not observed:
+            observed = True
+            if changed:
+                github.issues[number].base_labels = ("base:next",)
+            github._etags["issues"] = f'"observe-base-{number}"'
+            await _run_once_async(github)
+        return response
+
+    monkeypatch.setattr(github, "handle", observe_during_branch_read)
+    acquired = _acquire(client, row["id"])
+
+    assert observed
+    if changed:
+        assert acquired.status_code == 409, acquired.text
+        assert acquired.json()["detail"]["code"] == "not_dispatchable"
+        assert _requests(number)[0]["base_branch"] is None
+        assert _dispatch_state(row["id"])["acquire_owner"] is None
+    else:
+        assert acquired.status_code == 200, acquired.text
+        assert _requests(number)[0]["base_commit"] == _MAIN_SHA
 
 
 def test_poll_admits_a_young_labeled_issue_once(
@@ -688,9 +780,23 @@ def test_poll_admits_a_young_labeled_issue_once(
             "label",
             _NEXT_SHA,
         ),
+        (
+            {"bases": ["main", "maint", "release"], "default_base": "maint"},
+            (),
+            "maint",
+            "default",
+            _MAIN_SHA,
+        ),
+        (
+            {"bases": ["main", "maint", "release"], "default_base": "maint"},
+            ("base:release",),
+            "release",
+            "label",
+            _NEXT_SHA,
+        ),
     ],
 )
-def test_poll_records_the_verified_selected_base(
+def test_poll_defers_base_resolution_until_current_selection_is_acquired(
     poll_factory: tuple[TestClient, PollGitHub],
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -700,7 +806,8 @@ def test_poll_records_the_verified_selected_base(
     source: str,
     commit: str,
 ) -> None:
-    _client, github = poll_factory
+    client, github = poll_factory
+    github.branches[branch] = commit
     if entry is not None:
         _reconfigure(monkeypatch, tmp_path, bindings=[github_repository_binding(**entry)])
     number = github.plant_issue(base_labels=labels)
@@ -709,7 +816,22 @@ def test_poll_records_the_verified_selected_base(
 
     rows = _requests(number)
     assert len(rows) == 1
+    request_id = rows[0]["id"]
     assert (rows[0]["base_branch"], rows[0]["base_source"], rows[0]["base_commit"]) == (
+        None,
+        None,
+        None,
+    )
+    assert rows[0]["base_resolved_request_id"] is None
+    assert not any("/git/ref/heads/" in request.url.path for request in github.calls)
+
+    acquired = _acquire(client, request_id)
+
+    assert acquired.status_code == 200, acquired.text
+    [claimed] = _requests(number)
+    assert claimed["id"] == request_id
+    assert claimed["base_resolved_request_id"] == request_id
+    assert (claimed["base_branch"], claimed["base_source"], claimed["base_commit"]) == (
         branch,
         source,
         commit,
@@ -723,32 +845,54 @@ def test_poll_records_the_verified_selected_base(
 
 
 @pytest.mark.parametrize(
-    ("labels", "allowed", "reason"),
+    ("labels", "allowed", "default_base", "reason"),
     [
-        (("base:main", "base:next"), ["main", "next"], "more than one base label"),
-        (("base:next",), ["main"], "not an allowed base"),
-        (("base:missing",), ["main", "missing"], "does not exist"),
+        (("base:main", "base:next"), ["main", "next"], "main", "more than one base label"),
+        (("base:next",), ["main"], "main", "not an allowed base"),
+        (("base:missing",), ["main", "missing"], "main", "does not exist"),
+        (("base:unapproved",), ["main", "maint", "release"], "maint", "not an allowed base"),
     ],
 )
-def test_poll_refuses_an_invalid_base_and_admits_after_correction(
+def test_poll_admits_invalid_base_then_acquisition_rechecks_the_same_request_after_correction(
     poll_factory: tuple[TestClient, PollGitHub],
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
     labels: tuple[str, ...],
     allowed: list[str],
+    default_base: str,
     reason: str,
 ) -> None:
-    _client, github = poll_factory
+    client, github = poll_factory
+    github.branches[default_base] = _MAIN_SHA
     _reconfigure(
         monkeypatch,
         tmp_path,
-        bindings=[github_repository_binding(bases=allowed, default_base="main")],
+        bindings=[github_repository_binding(bases=allowed, default_base=default_base)],
     )
     number = github.plant_issue(base_labels=labels)
 
     _run_once(github)
 
-    assert _requests(number) == []
+    [admitted] = _requests(number)
+    request_id = admitted["id"]
+    assert admitted["status"] == "waiting"
+    assert (admitted["base_branch"], admitted["base_source"], admitted["base_commit"]) == (
+        None,
+        None,
+        None,
+    )
+    assert admitted["base_resolved_request_id"] is None
+    assert not any("/git/ref/heads/" in request.url.path for request in github.calls)
+    assert github.comments == {}
+
+    refused = _acquire(client, request_id)
+
+    assert refused.status_code == 409, refused.text
+    refusal = _dispatch_state(request_id)
+    assert refusal["status"] == "waiting"
+    assert refusal["acquire_owner"] is None
+    assert refusal["start_deferrals"] == 0
+    assert refusal["last_deferral_reason"].startswith("base_")
     comments = list(github.comments.values())
     assert len(comments) == 1
     assert "<!-- curie-factory-base-refusal -->" in comments[0]["body"]
@@ -756,7 +900,13 @@ def test_poll_refuses_an_invalid_base_and_admits_after_correction(
 
     github._etags["issues"] = f'"retry-refusal-{number}"'
     _run_once(github)
-    assert _requests(number) == []
+    refused_again = _acquire(client, request_id)
+    assert refused_again.status_code == 409, refused_again.text
+    [waiting] = _requests(number)
+    assert waiting["id"] == request_id
+    assert waiting["status"] == "waiting"
+    assert waiting["base_resolved_request_id"] is None
+    assert _dispatch_state(request_id) == refusal
     assert list(github.comments.values()) == comments
     assert (
         len(
@@ -774,19 +924,31 @@ def test_poll_refuses_an_invalid_base_and_admits_after_correction(
     github._etags["issues"] = f'"corrected-base-{number}"'
     _run_once(github)
 
+    [waiting] = _requests(number)
+    assert waiting["id"] == request_id
+    assert waiting["base_resolved_request_id"] is None
+    repaired = _acquire(client, request_id)
+
+    assert repaired.status_code == 200, repaired.text
     rows = _requests(number)
     assert len(rows) == 1
+    assert rows[0]["id"] == request_id
+    assert rows[0]["base_resolved_request_id"] == request_id
     assert (rows[0]["base_branch"], rows[0]["base_source"], rows[0]["base_commit"]) == (
-        "main",
+        default_base,
         "default",
         _MAIN_SHA,
     )
 
 
-def test_poll_records_later_base_labels_without_readmitting_or_moving_the_base(
-    poll_factory: tuple[TestClient, PollGitHub], monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+@pytest.mark.parametrize("running", [False, True], ids=["pinned-waiting", "running"])
+def test_poll_uses_current_labels_at_claim_and_replaces_only_a_pinned_selection(
+    poll_factory: tuple[TestClient, PollGitHub],
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    running: bool,
 ) -> None:
-    _client, github = poll_factory
+    client, github = poll_factory
     _reconfigure(
         monkeypatch,
         tmp_path,
@@ -796,8 +958,9 @@ def test_poll_records_later_base_labels_without_readmitting_or_moving_the_base(
     _run_once(github)
     first = _requests(number)
     assert len(first) == 1
-    assert first[0]["base_branch"] == "next"
-    assert first[0]["base_label_ignored"] is None
+    first_id = first[0]["id"]
+    assert first[0]["base_branch"] is None
+    assert first[0]["base_resolved_request_id"] is None
     github.calls.clear()
 
     github.issues[number].base_labels = ("base:main",)
@@ -805,21 +968,81 @@ def test_poll_records_later_base_labels_without_readmitting_or_moving_the_base(
     _run_once(github)
 
     after = _requests(number)
-    assert [row["id"] for row in after] == [first[0]["id"]]
-    assert (after[0]["base_branch"], after[0]["base_commit"]) == ("next", _NEXT_SHA)
-    assert after[0]["base_label_ignored"] == "main"
+    assert [row["id"] for row in after] == [first_id]
+    assert (after[0]["base_branch"], after[0]["base_commit"]) == (None, None)
+    assert after[0]["base_resolved_request_id"] is None
     assert after[0]["status"] == first[0]["status"]
     assert not any("/git/ref/heads/" in request.url.path for request in github.calls)
+
+    acquired = _acquire(client, first_id)
+    assert acquired.status_code == 200, acquired.text
+    [pinned] = _requests(number)
+    assert (pinned["base_branch"], pinned["base_commit"], pinned["base_resolved_request_id"]) == (
+        "main",
+        _MAIN_SHA,
+        first_id,
+    )
+    if running:
+        started = client.post(
+            f"/v1/internal/work-items/requests/{first_id}/start",
+            headers={"X-Curie-Worker-Token": get_settings().internal_worker_token},
+            json={
+                "owner": "factory-intake-owner",
+                "generation": acquired.json()["generation"],
+                "claim_name": "claim-poll-intake",
+                "sandbox_name": "sandbox-poll-intake",
+                "context": acquired.json()["context"],
+            },
+        )
+        assert started.status_code == 200, started.text
 
     github.issues[number].base_labels = ("base:next",)
     github._etags["issues"] = f'"restored-base-{number}"'
     _run_once(github)
 
+    if running:
+        [stopping] = _requests(number)
+        assert stopping["id"] == first_id
+        assert stopping["status"] == "cancellation_requested"
+        assert (stopping["base_branch"], stopping["base_commit"]) == ("main", _MAIN_SHA)
+        headers = {"X-Curie-Worker-Token": get_settings().internal_worker_token}
+        teardown = client.post(
+            f"/v1/internal/work-items/requests/{first_id}/termination/claim",
+            headers=headers,
+            json={"owner": "factory-intake-owner"},
+        )
+        assert teardown.status_code == 200, teardown.text
+        stopped = client.post(
+            f"/v1/internal/work-items/requests/{first_id}/termination",
+            headers=headers,
+            json={
+                "runtime_epoch": teardown.json()["runtime_epoch"],
+                "observation": "runtime stopped",
+            },
+        )
+        assert stopped.status_code == 200, stopped.text
+        _run_once(github)
+
     restored = _requests(number)
-    assert [row["id"] for row in restored] == [first[0]["id"]]
-    assert (restored[0]["base_branch"], restored[0]["base_commit"]) == ("next", _NEXT_SHA)
-    assert restored[0]["base_label_ignored"] is None
-    assert not any("/git/ref/heads/" in request.url.path for request in github.calls)
+    assert [row["status"] for row in restored] == ["cancelled", "waiting"]
+    assert restored[0]["id"] == first_id
+    successor_id = restored[1]["id"]
+    assert successor_id != first_id
+    assert restored[1]["base_resolved_request_id"] != successor_id
+    replacement = _acquire(client, successor_id)
+    assert replacement.status_code == 200, replacement.text
+    [_, claimed] = _requests(number)
+    assert (
+        claimed["base_branch"],
+        claimed["base_commit"],
+        claimed["base_resolved_request_id"],
+    ) == (
+        "next",
+        _NEXT_SHA,
+        successor_id,
+    )
+    _run_once(github)
+    assert [row["id"] for row in _requests(number)] == [first_id, successor_id]
 
 
 def test_poll_cancels_a_closed_labeled_issue(
@@ -865,7 +1088,7 @@ def test_poll_defers_one_unreadable_issue_and_continues_other_intake(
     github._etags["issue-comments"] = '"healthy-mention-after-unavailable-issue"'
     pull = github.plant_pull()
     _own_pull_request(reviewed_request["work_item_id"], pull)
-    _complete(reviewed_request["id"])
+    _complete(client, reviewed_request["id"])
     github.add_review(pull, review_id, f"@{MENTION} please rename the helper")
     github.calls.clear()
 
@@ -947,7 +1170,7 @@ def test_poll_retries_permission_failure_after_events_and_continues_other_intake
     github.add_issue_comment(mentioned, comment_id, f"@{MENTION} please revise the helper")
     pull = github.plant_pull()
     _own_pull_request(reviewed_request["work_item_id"], pull)
-    _complete(reviewed_request["id"])
+    _complete(client, reviewed_request["id"])
     github.add_review(pull, review_id, f"@{MENTION} please rename the helper")
     github.calls.clear()
 
@@ -1007,7 +1230,7 @@ def test_poll_prunes_persisted_etags_for_cancelled_issues_and_closed_lineages(
     retired_pull, healthy_pull = github.plant_pull(), github.plant_pull()
     retired_lineage = _own_pull_request(retired_request["work_item_id"], retired_pull)
     _own_pull_request(healthy_request["work_item_id"], healthy_pull)
-    _complete(healthy_request["id"])
+    _complete(client, healthy_request["id"])
     _run_once(github)
     before = _rows(
         "SELECT etags FROM curie.factory_poll_cursors WHERE tracker_kind = 'github' "
@@ -1170,7 +1393,7 @@ def test_poll_admits_review_feedback_once(
     number, first = _admit_label(client, github)
     pull = github.plant_pull()
     _own_pull_request(first["work_item_id"], pull)
-    _complete(first["id"])
+    _complete(client, first["id"])
     comment_body = f"@{MENTION} please rename the helper"
     review_body = f"@{MENTION} please rename the helper before merge"
     comment_id = 73101
@@ -1265,7 +1488,7 @@ def _jira_owned_pull(client: TestClient, github: PollGitHub) -> tuple[uuid.UUID,
     _number, first = _admit_label(client, github)
     pull = github.plant_pull()
     _own_pull_request(first["work_item_id"], pull)
-    _complete(first["id"])
+    _complete(client, first["id"])
     _hand_to_jira(first["work_item_id"])
     return first["work_item_id"], pull
 
@@ -1309,7 +1532,7 @@ def test_poll_feedback_only_issue_mention_does_not_admit(
     # A GitHub factory issue still open in the repository: its number is one
     # the mention branch would match.
     number, row = _admit_label(client, github)
-    _complete(row["id"])
+    _complete(client, row["id"])
     _make_feedback_only(monkeypatch, tmp_path)
     before = [found["id"] for found in _requests(number)]
     comment_id = 73211
@@ -1379,7 +1602,7 @@ def test_webhook_of_a_polled_review_stays_one_request(
     number, first = _admit_label(client, github)
     pull = github.plant_pull()
     _own_pull_request(first["work_item_id"], pull)
-    _complete(first["id"])
+    _complete(client, first["id"])
     review_id = 74111
     review = github.add_review(pull, review_id, f"@{MENTION} please rename the helper")
     _run_once(github)

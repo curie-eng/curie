@@ -25,6 +25,8 @@ import httpx
 import redis
 from aci_protocol.s3 import build_s3_client
 from aci_protocol.turn import DEFAULT_IDENTITY
+from aiohttp import web
+from curie_internal.workspace_objects import WorkspaceObjectPort
 from curie_protected_hooks.source_policy_sql import SourceGate
 from curie_telemetry import bootstrap_service_telemetry, record_metric
 from redis.asyncio import Redis as AsyncRedis
@@ -38,6 +40,7 @@ from .action_executor_loop import ActionExecutorLoop
 from .actions import ActionClient, ActionRecorder
 from .approval_cards import ApprovalCardStore
 from .approvals import ApprovalClient
+from .attachment_access_client import AttachmentAccessClient
 from .attachments import (
     AttachmentCoordinator,
     AttachmentLimits,
@@ -60,6 +63,7 @@ from .eval import EvalReporter, EvalStreamConsumer, LangfuseEvalRecorder
 from .heartbeat import run_heartbeat
 from .hook_runs import HookRunRecorder
 from .hook_source_guard import CronHookSourceGuard
+from .identity_authority import HttpTurnAuthorityClient
 from .kernel.channel_read import drain_pending_channel_read_closes
 from .kernel.core import Kernel
 from .kernel.memory import drain_pending_memory_closes
@@ -117,6 +121,14 @@ from .workspace import (
     WorkspaceObjectStore,
     WorkspacePreparer,
 )
+from .workspace_recovery import WorkspaceRecoveryClient
+from .workspace_recovery_capture import WorkspaceRecoveryCapture
+from .workspace_recovery_storage import (
+    RecoveryCheckpointWriter,
+    RecoveryCollector,
+    RecoveryObjectStore,
+    build_recovery_s3_client,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -166,12 +178,15 @@ class Runtime:
     # None unless the end to end connector and the connector reconciler are
     # both on (#3245).
     e2e_reaper: E2EReaperLoop | None = None
+    # None unless workspace recovery is on with the internal token (ADR 0251).
+    workspace_recovery_gc: RecoveryCollector | None = None
     deploy_notice_consumer: DeployNoticeConsumer | None = None
     # Trims settled entries off the runs and eval streams (ADR 0184). Optional
     # only so a Runtime constructed elsewhere need not name it.
     stream_retention: StreamRetention | None = None
     resources: WorkerResources | None = None
     source_gate: SourceGate | None = None
+    attachment_broker: web.AppRunner | None = None
 
 
 # 365 days, the ceiling shared by all three operator-tunable seconds knobs
@@ -413,6 +428,7 @@ def _sandbox_client(
             # tiers disagreeing on how big a file may be is the kind of skew
             # that only shows up as a refusal in one place and not the other.
             attachment_limits=_attachment_limits(config),
+            attachment_cache_size_bytes=config.attachment_cache_size_bytes,
         )
         # Prewarm the runner image once at startup so the first claim window is
         # not gated on a cold pull. Best-effort inside ensure_image.
@@ -431,6 +447,52 @@ def create_source_gate_engine(config: WorkerConfig) -> AsyncEngine:
 async def _close_sync(close: Callable[[], None]) -> None:
     """@spec PROTECTED-HOOK-SOURCE-2."""
     await asyncio.to_thread(close)
+
+
+def _attachment_coordinator(
+    config: WorkerConfig, objects: WorkspaceObjectPort, slack_tokens: Mapping[str, str]
+) -> AttachmentCoordinator | None:
+    """Keep legacy object retention cleanup active during lazy rollout."""
+    return (
+        AttachmentCoordinator(
+            # The lane is on when any identity holds a token, so `default`'s
+            # may be blank here; `_files_for` refuses that identity before any
+            # fetch rather than this module standing in a broken port for it.
+            files=(
+                SlackFileClient(
+                    token=config.slack_bot_token,
+                    read_chunk_bytes=_attachment_limits(config).read_chunk_bytes,
+                )
+                if config.slack_bot_token
+                else None
+            ),
+            identity_files={
+                name: SlackFileClient(
+                    token=token,
+                    read_chunk_bytes=_attachment_limits(config).read_chunk_bytes,
+                )
+                for name, token in slack_tokens.items()
+                if name != DEFAULT_IDENTITY
+            },
+            channel_files=(
+                ChannelPortFileClient(
+                    credentials=config.adapter_credentials,
+                    read_chunk_bytes=_attachment_limits(config).read_chunk_bytes,
+                )
+                if config.adapter_credentials
+                else None
+            ),
+            objects=objects,
+            limits=_attachment_limits(config),
+        )
+        if config.attachment_enabled
+        and (
+            config.attachment_mode == "lazy"
+            or any(slack_tokens.values())
+            or bool(config.adapter_credentials)
+        )
+        else None
+    )
 
 
 def build(
@@ -478,7 +540,6 @@ def build(
         snapshot_patch_max_bytes=config.publication_patch_max_bytes,
     )
     owner.register_close("runner", runner.close, order=10)
-    binding = BindingResolver(engine, config)
     workspace_s3 = build_s3_client(
         endpoint_url=config.s3_endpoint_url,
         access_key=config.s3_access_key,
@@ -524,7 +585,7 @@ def build(
     # v0.8.8 answers it. The chart's ``worker.attachments.enabled`` gates the
     # sandbox half from the same value, so there is one knob and not two.
     #
-    # The credential condition is separate: the lane downloads a referenced
+    # In eager mode the credential condition is separate: the lane downloads a referenced
     # file with a Slack bot token, or with a channel-port adapter's secret
     # (ADR-0153), and the kernel treats a wired lane as authoritative. An
     # install holding neither (compose smoke) keeps running every turn exactly
@@ -532,7 +593,10 @@ def build(
     # An install holding only one gets a lane whose other client is None, and
     # a file on that other kind is refused by name.
     #
-    # It parks bytes in the PRIVATE workspace store, never the public bundle
+    # Lazy mode retains this coordinator only for legacy retention cleanup,
+    # even without provider credentials; all new downloads use the broker.
+    #
+    # It parks eager bytes in the PRIVATE workspace store, never the public bundle
     # bucket -- under its own ``attachments/`` key prefix, with its retention
     # ledger a sibling of ``_ownership/`` -- so an inbound file is reachable only
     # through a short-lived one-object presigned URL redeemed by the sandbox's
@@ -541,46 +605,89 @@ def build(
     # Each Slack identity's bot token, read once from this process's env
     # (ADR-0168 decision 5), so the lane and the sink serve the same set.
     slack_tokens = slack_bot_tokens(config, environ=env)
-    attachments = (
-        AttachmentCoordinator(
-            # The lane is on when any identity holds a token, so `default`'s
-            # may be blank here; `_files_for` refuses that identity before any
-            # fetch rather than this module standing in a broken port for it.
-            files=(
-                SlackFileClient(
-                    token=config.slack_bot_token,
-                    read_chunk_bytes=_attachment_limits(config).read_chunk_bytes,
-                )
-                if config.slack_bot_token
-                else None
-            ),
-            identity_files={
-                name: SlackFileClient(
-                    token=token,
-                    read_chunk_bytes=_attachment_limits(config).read_chunk_bytes,
-                )
-                for name, token in slack_tokens.items()
-                if name != DEFAULT_IDENTITY
-            },
-            channel_files=(
-                ChannelPortFileClient(
-                    credentials=config.adapter_credentials,
-                    read_chunk_bytes=_attachment_limits(config).read_chunk_bytes,
-                )
-                if config.adapter_credentials
-                else None
-            ),
-            objects=workspace_objects,
-            limits=_attachment_limits(config),
-        )
-        if config.attachment_enabled
-        and (any(slack_tokens.values()) or bool(config.adapter_credentials))
-        else None
-    )
+    attachments = _attachment_coordinator(config, workspace_objects, slack_tokens)
     # One API-lane HTTP client shared by the approval writer (#244) and the two
     # eval-lane reporters below; httpx.AsyncClient is task-safe.
     eval_http = httpx.AsyncClient(timeout=30.0)
     owner.register_close("eval-http", eval_http.aclose, order=30)
+    # @spec HTTP-INVOCATION-EXECUTION-18/22: one client answers the kernel's
+    # current checks and the binding owner's per-identity classification.
+    identity_authority = (
+        HttpTurnAuthorityClient(
+            api_base_url=config.api_base_url, worker_token=config.internal_worker_token,
+            client=eval_http,
+        )
+        if config.internal_worker_token else None
+    )
+    binding = BindingResolver(engine, config, identity_classifier=identity_authority)
+    recovery_gc: RecoveryCollector | None = None
+    recovery_capture: WorkspaceRecoveryCapture | None = None
+    if config.workspace_recovery_enabled and config.internal_worker_token:
+        recovery_s3 = build_recovery_s3_client(
+            endpoint_url=config.s3_endpoint_url,
+            access_key=config.s3_access_key,
+            secret_key=config.s3_secret_key,
+            region=config.s3_region,
+        )
+        owner.register_close(
+            "workspace-recovery-s3", lambda: _close_sync(recovery_s3.close), order=70
+        )
+        recovery_ledger = WorkspaceRecoveryClient(
+            api_base_url=config.api_base_url,
+            worker_token=config.internal_worker_token,
+            client=eval_http,
+        )
+        recovery_store = RecoveryObjectStore(client=recovery_s3, bucket=config.workspace_bucket)
+        recovery_gc = RecoveryCollector(
+            ledger=recovery_ledger,
+            store=recovery_store,
+            collector_id=config.consumer_name,
+        )
+        # The terminal capture (#5143). The config refuses recovery without
+        # managed workspaces, so the coordinator is always built here.
+        if workspace is not None:
+            recovery_capture = WorkspaceRecoveryCapture(
+                ledger=recovery_ledger,
+                writer=RecoveryCheckpointWriter(
+                    ledger=recovery_ledger,
+                    store=recovery_store,
+                    scratch_root=Path(config.workspace_scratch_root) / "recovery",
+                    base_archive_limit_bytes=config.workspace_max_archive_bytes,
+                ),
+                runner=runner,
+                coordinator=workspace,
+            )
+    attachment_access_client = None
+    broker_server = None
+    if config.attachment_enabled and config.attachment_mode == "lazy":
+        from .attachment_broker import AttachmentBroker
+
+        broker = AttachmentBroker(
+            internal_token=config.internal_worker_token,
+            routes_for_agent=binding.routes_for_agent,
+            slack_files={
+                name: SlackFileClient(token=token, read_chunk_bytes=64 * 1024)
+                for name, token in slack_tokens.items()
+                if token
+            },
+            channel_files=(
+                ChannelPortFileClient(
+                    credentials=config.adapter_credentials, read_chunk_bytes=64 * 1024
+                )
+                if config.adapter_credentials
+                else None
+            ),
+            api_url=config.api_base_url,
+            max_concurrent=config.attachment_broker_max_concurrent,
+            transfer_timeout_seconds=config.attachment_transfer_timeout_seconds,
+        )
+        broker_server = web.AppRunner(broker.create_app(), handler_cancellation=True)
+        owner.register_close("attachment-broker", broker_server.cleanup, order=25)
+        attachment_access_client = AttachmentAccessClient(
+            api_base_url=config.api_base_url,
+            worker_token=config.internal_worker_token,
+            client=eval_http,
+        )
     approval_client = ApprovalClient(
         api_base_url=config.api_base_url,
         api_key=config.api_key,
@@ -657,8 +764,11 @@ def build(
         markers=Markers(async_redis, config),
         config=config,
         binding=binding,
+        identity_authority=identity_authority,
         workspace=workspace,
+        recovery=recovery_capture,
         attachments=attachments,
+        attachment_access=attachment_access_client,
         # ADR 0205: the thread attachment ledger, behind the internal worker
         # token and nothing else. Without the token (or without the lane) no
         # ledger is wired and every turn's attachments behave as before.
@@ -781,6 +891,7 @@ def build(
         eval_http=eval_http,
         engine=engine,
         resources=owner,
+        attachment_broker=broker_server,
         source_gate=source_gate,
         card_store=card_store,
         orphan_sweeper=(
@@ -811,6 +922,7 @@ def build(
             bundles=cron_bundle_store,
         ),
         e2e_reaper=_build_e2e_reaper(config, work_items),
+        workspace_recovery_gc=recovery_gc,
         cron_loop=CronSchedulerLoop(
             source_guard=CronHookSourceGuard(source_gate, engine),
             engine=engine,
@@ -841,6 +953,7 @@ _SUPERVISED_OPERATIONS = frozenset(
         "cron",
         "publications",
         "e2e-reaper",
+        "workspace-recovery-gc",
     }
 )
 
@@ -1300,9 +1413,9 @@ def _build_e2e_reaper(
 
     # The same credential the connector reconciler loads (connector_k8s.py).
     try:
-        k8s_config.load_incluster_config()
+        k8s_config.load_incluster_config()  # type: ignore[no-untyped-call]
     except k8s_config.ConfigException:
-        k8s_config.load_kube_config()
+        k8s_config.load_kube_config()  # type: ignore[no-untyped-call]
     core = k8s_client.CoreV1Api()
     return E2EReaperLoop(
         clusters=lambda: connector_secret_clusters(
@@ -1473,6 +1586,12 @@ async def _run(config: WorkerConfig, env: Mapping[str, str]) -> None:
 async def _run_runtime(rt: Runtime, config: WorkerConfig, resources: WorkerResources) -> None:
     """@spec PROTECTED-HOOK-SOURCE-2."""
 
+    if rt.attachment_broker is not None:
+        await rt.attachment_broker.setup()
+        await web.TCPSite(
+            rt.attachment_broker, config.attachment_broker_host, config.attachment_broker_port
+        ).start()
+
     loop = asyncio.get_running_loop()
 
     # A single shutdown flag governs every supervised task. The liveness
@@ -1578,6 +1697,15 @@ async def _run_runtime(rt: Runtime, config: WorkerConfig, resources: WorkerResou
         tasks.append(launch("action-executor", lambda: rt.action_executor.run_forever(shutdown)))  # type: ignore[union-attr]
     if getattr(rt, "e2e_reaper", None) is not None:
         tasks.append(launch("e2e-reaper", lambda: rt.e2e_reaper.run_forever(shutdown)))  # type: ignore[union-attr]
+    recovery_gc = getattr(rt, "workspace_recovery_gc", None)
+    if recovery_gc is not None:
+        interval_s = config.workspace_recovery_collect_interval_s
+        tasks.append(
+            launch(
+                "workspace-recovery-gc",
+                lambda: recovery_gc.run_forever(shutdown, interval_s=interval_s),
+            )
+        )
     if rt.cron_loop is not None:
         tasks.append(launch("cron", lambda: rt.cron_loop.run_forever(shutdown)))  # type: ignore[union-attr]
     if getattr(rt, "publication_loop", None) is not None:

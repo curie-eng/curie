@@ -343,7 +343,7 @@ async def test_a_running_issue_missing_its_label_cancels_with_the_latest_removal
 
 
 @pytest.mark.anyio
-async def test_a_running_issue_that_is_gone_yields_nothing(fake: GitLabAPI) -> None:
+async def test_a_running_issue_that_is_gone_yields_deleted_cancellation(fake: GitLabAPI) -> None:
     tracker = gitlab_tracker(fake)
     iid = fake.add_issue("Ticket", author=WRITER)
     fake.label(iid, LABEL, WRITER)
@@ -352,7 +352,39 @@ async def test_a_running_issue_that_is_gone_yields_nothing(fake: GitLabAPI) -> N
 
     page = await tracker.poll_marked(admitted.cursor, running=(fake.issue_ref(iid),))
 
-    assert page.notices == ()
+    (cancel,) = page.notices
+    assert (cancel.issue, cancel.disposition, cancel.event_id) == (
+        fake.issue_ref(iid),
+        Disposition.CANCEL,
+        "deleted",
+    )
+    assert await tracker.verify_current(cancel) is True
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("status", [503, 429])
+async def test_a_transient_running_issue_read_defers_the_poll(fake: GitLabAPI, status: int) -> None:
+    tracker = gitlab_tracker(fake)
+    iid = fake.add_issue("Ticket", author=WRITER)
+    fake.label(iid, LABEL, WRITER)
+    admitted = await tracker.poll_marked(None, running=())
+    path = f"{PROJECT}/issues/{iid}"
+    reads = len(fake.calls("GET", path))
+    fake.script(status, path=path, method="GET", headers={"Retry-After": "30"})
+
+    with pytest.raises(Unavailable):
+        await tracker.poll_marked(admitted.cursor, running=(fake.issue_ref(iid),))
+
+    assert len(fake.calls("GET", path)) == reads + 1
+    if status == 429:
+        requests = len(fake.requests)
+        with pytest.raises(Unavailable):
+            await tracker.poll_marked(admitted.cursor, running=(fake.issue_ref(iid),))
+        assert len(fake.requests) == requests
+        return
+    resumed = await tracker.poll_marked(admitted.cursor, running=(fake.issue_ref(iid),))
+    assert resumed.notices == ()
+    assert len(fake.calls("GET", path)) == reads + 2
 
 
 @pytest.mark.anyio

@@ -981,19 +981,21 @@ pub(super) async fn compose_connector_readiness_targets(
 ///
 /// One helper, both local deploy callers (`local deploy` and `deploy-local`), so
 /// the shorthand cannot upload a source-built bundle and start no connector.
-/// The RESOLVED identity is passed in rather than re-derived from `plugin.json`:
-/// `--agent`/`--target` can override the manifest's name, and a helper that read
-/// it again would alias the connectors under one identity while the runner
-/// dialed another.
+/// The agent name is the one deploy resolved. `--agent` and `--target` can
+/// override the manifest, and reading `plugin.json` again would alias the
+/// containers under a name the runner does not dial. Release and namespace are
+/// read here from the same compose defaults the worker receives, so this
+/// function is the only place a local connector name is chosen.
 pub async fn bring_up_local(
     plugin_dir: &Path,
     decl: &crate::connector_build::ConnectorsFileDecl,
     lock: &crate::connector_build::ConnectorLockFileDecl,
-    identity: &crate::connector_build::ConnectorScope,
+    agent: &str,
     project: &str,
 ) -> Result<()> {
     use crate::connector_build as cb;
 
+    let identity = local_connector_scope(agent);
     let hosted: Vec<(&String, &cb::ConnectorSpecDecl)> = decl
         .connectors
         .iter()
@@ -1068,7 +1070,7 @@ pub async fn bring_up_local(
                 connector,
                 spec,
                 &cb::resolved_image(connector, spec, lock)?,
-                identity,
+                &identity,
                 project,
                 &secret_values,
             ).await?;
@@ -1078,7 +1080,7 @@ pub async fn bring_up_local(
         let overlay = cb::compose_overlay(
             lock,
             decl,
-            identity,
+            &identity,
             project,
             &secret_volumes,
             Some(&caller_key.verify_key),
@@ -1177,6 +1179,27 @@ async fn finish_connector_bring_up<T>(
         crate::ui::ui().warn(&err.to_string());
     }
     result
+}
+
+/// Release and namespace for a local-tier connector container.
+///
+/// The compose worker receives `CURIE_RELEASE=${CURIE_RELEASE:-curie}` and
+/// `CURIE_NAMESPACE=${CURIE_NAMESPACE:-default}`. The runner dials that pair.
+/// An empty value matches the compose `:-` form, which treats empty as unset.
+/// The cluster tier does not call this. Its release is the Helm release.
+fn local_connector_scope(agent: &str) -> crate::connector_build::ConnectorScope {
+    crate::connector_build::ConnectorScope {
+        release: compose_default_env("CURIE_RELEASE", "curie"),
+        agent: agent.to_string(),
+        namespace: compose_default_env("CURIE_NAMESPACE", "default"),
+    }
+}
+
+fn compose_default_env(key: &str, default: &str) -> String {
+    match std::env::var(key) {
+        Ok(value) if !value.is_empty() => value,
+        _ => default.to_string(),
+    }
 }
 
 /// Refuse the WHOLE bundle when a hosted connector declares a secret this box

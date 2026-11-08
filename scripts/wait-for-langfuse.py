@@ -1,4 +1,10 @@
-"""Bound CI startup on completed Langfuse migrations and usable read paths."""
+"""Bound CI startup on completed Langfuse migrations and usable read paths.
+
+With --start, --tier picks how much of the dev stack to boot: core starts only
+Postgres and Valkey, storage adds RustFS and its bucket initialization, and
+full (the default) also starts and checks Langfuse, ClickHouse and the OTel
+collector. Only the full tier checks Langfuse.
+"""
 
 from __future__ import annotations
 
@@ -19,6 +25,14 @@ from typing import Any
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 BACKING_SERVICES = ("postgres", "valkey", "clickhouse", "rustfs")
+CORE_SERVICES = ("postgres", "valkey")
+STORAGE_SERVICES = (*CORE_SERVICES, "rustfs")
+TIERS = ("core", "storage", "full")
+READY_MESSAGES = {
+    "core": "Core services (Postgres, Valkey) passed readiness; Langfuse was not started",
+    "storage": "Core services, RustFS and its bucket passed readiness; Langfuse was not started",
+    "full": "Langfuse migrations, authenticated trace reads, and worker readiness passed",
+}
 WORKER_PROBE = (
     "fetch('http://langfuse-worker:3030/api/ready')"
     ".then(response => process.exit(response.ok ? 0 : 1))"
@@ -239,6 +253,21 @@ class Readiness:
                     return
             self.pause()
 
+    def start_core(self) -> None:
+        self.run(
+            "up", "-d", "--wait", "--wait-timeout", str(math.ceil(self.remaining())),
+            *CORE_SERVICES,
+        )
+
+    def start_storage(self) -> None:
+        # Nothing depends on rustfs-init, so it exists only once started by name.
+        self.run("up", "-d", *STORAGE_SERVICES, "rustfs-init")
+        self.run(
+            "up", "-d", "--wait", "--wait-timeout", str(math.ceil(self.remaining())),
+            *STORAGE_SERVICES,
+        )
+        self.run("wait", "rustfs-init")
+
     def start(self, override: Path) -> None:
         override.write_text(
             'services:\n  langfuse-web:\n    restart: "no"\n'
@@ -269,16 +298,28 @@ def main() -> int:
         or os.environ.get("LANGFUSE_HOST")
         or "http://localhost:23000",
     )
+    parser.add_argument(
+        "--tier",
+        choices=TIERS,
+        default="full",
+        help="With --start: which services to boot (default full, the whole sequence).",
+    )
     parser.add_argument("--timeout-seconds", type=float, default=180)
     parser.add_argument("--poll-interval-seconds", type=float, default=3)
     arguments = parser.parse_args()
     try:
         if arguments.timeout_seconds <= 0 or arguments.poll_interval_seconds <= 0:
             raise ValueError("Langfuse readiness timing values must be positive")
+        if arguments.tier != "full" and not arguments.start:
+            raise ValueError("Langfuse readiness --tier core or storage requires --start")
         readiness = Readiness(
             arguments.timeout_seconds, arguments.poll_interval_seconds, arguments.web_url,
         )
-        if arguments.start:
+        if arguments.start and arguments.tier == "core":
+            readiness.start_core()
+        elif arguments.start and arguments.tier == "storage":
+            readiness.start_storage()
+        elif arguments.start:
             with tempfile.TemporaryDirectory(prefix="curie-langfuse-readiness-") as directory:
                 readiness.start(Path(directory) / "compose.yaml")
         else:
@@ -287,7 +328,7 @@ def main() -> int:
     except (OSError, RuntimeError, ValueError) as error:
         print(str(error), file=sys.stderr)
         return 1
-    print("Langfuse migrations, authenticated trace reads, and worker readiness passed")
+    print(READY_MESSAGES[arguments.tier])
     return 0
 
 

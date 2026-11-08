@@ -260,8 +260,30 @@ read verbatim from its `Status:` line. **Do not hand-edit it.** Run
 | 0237 | [Ordinary hook receipts preserve policy after stream retention](0237-ordinary-hook-receipts-preserve-policy-after-stream-retention.md) | Accepted |
 | 0238 | [A managed CNI installation qualifies through its own behavioral network producer](0238-a-managed-cni-installation-qualifies-through-its-own-behavioral-network-producer.md) | Accepted |
 | 0239 | [Release kind proof reuses a complete CI run on the same tree](0239-release-kind-proof-reuses-a-complete-ci-run-on-the-same-tree.md) | Accepted |
+| 0240 | [A hosted connector declares the routes its bundle's stdio servers call through the caller proxy](0240-a-hosted-connector-declares-the-routes-its-bundles-stdio-servers-call-through-the-caller-proxy.md) | Accepted |
+| 0241 | [A commissioning run separates destructive trials from final acceptance](0241-a-commissioning-run-separates-destructive-trials-from-final-acceptance.md) | Accepted |
+| 0242 | [Commissioning session scope makes the last observer finite](0242-commissioning-session-scope-makes-the-last-observer-finite.md) | Accepted |
+| 0243 | [Network case five measures new connection denial after replacement or policy change](0243-network-case-five-measures-new-connection-denial-after-replacement-or-policy-change.md) | Accepted |
+| 0244 | [Attachments are fetched on demand through scoped platform tools](0244-attachments-are-fetched-on-demand-through-scoped-platform-tools.md) | Accepted |
+| 0245 | [Protected lifecycle evidence binds host-owned contexts to actual SDK closure](0245-protected-lifecycle-evidence-binds-host-owned-contexts-to-actual-sdk-closure.md) | Accepted |
+| 0246 | [Common admission resolves an optional HTTP identity before authorized enqueue](0246-common-admission-resolves-an-optional-http-identity-before-authorized-enqueue.md) | Accepted |
 | 0247 | [A tree-identical parent or a schema window registration reuses checks](0247-a-tree-identical-parent-or-a-schema-window-registration-reuses-checks.md) | Accepted |
 | 0249 | [A factory run may take twelve hours](0249-a-factory-run-may-take-twelve-hours.md) | Accepted |
 | 0250 | [Verbatim Slack answers render as rich text sections with literal links](0250-verbatim-slack-answers-render-as-rich-text-sections-with-literal-links.md) | Accepted |
-| 0251 | [Claim-backed sandbox scratch is bounded by its storage request](0251-claim-backed-sandbox-scratch-is-bounded-by-its-storage-request.md) | Draft |
+| 0251 | [A failed factory run keeps a private recovery checkpoint that only explicit restoration reads](0251-a-failed-factory-run-keeps-a-private-recovery-checkpoint-that-only-explicit-restoration-reads.md) | Accepted |
+| 0252 | [HTTP identity resolves Enterprise Grid senders in their organisation](0252-http-identity-resolves-enterprise-grid-senders-in-their-organisation.md) | Accepted |
+| 0253 | [Factory base labels resolve at claim and follow relabels](0253-factory-base-labels-resolve-at-claim-and-follow-relabels.md) | Accepted |
+| 0254 | [HTTP identity applies to the channel identities an operator registers](0254-http-identity-applies-to-the-channel-identities-an-operator-registers.md) | Accepted |
+| 0255 | [Claim-backed sandbox scratch is bounded by its storage request](0255-claim-backed-sandbox-scratch-is-bounded-by-its-storage-request.md) | Draft |
+| 0256 | [Publication validates and pushes a Git object overlay](0256-publication-validates-and-pushes-a-git-object-overlay.md) | Accepted |
+| 0257 | [A release registers its schema window only at the cut](0257-a-release-registers-its-schema-window-only-at-the-cut.md) | Accepted |
+| 0258 | [A scheduled hook turn carries its deployment authority on HTTP identity bindings](0258-a-scheduled-hook-turn-carries-its-deployment-authority-on-http-identity-bindings.md) | Accepted |
+| 0259 | [A binding requires HTTP identity when its invocation or approver role needs HTTP facts](0259-a-binding-requires-http-identity-when-its-invocation-or-approver-role-needs-http-facts.md) | Accepted |
+| 0260 | [HTTP identity admits an email sender only on a signed email receiver proof](0260-http-identity-admits-an-email-sender-only-on-a-signed-email-receiver-proof.md) | Accepted |
+| 0261 | [HTTP identity resolves Slack Connect senders from operator-trusted partner namespaces](0261-http-identity-resolves-slack-connect-senders-from-operator-trusted-partner-namespaces.md) | Accepted |
+| 0262 | [The dispatcher qualifies each HTTP receiver once behind its own failure boundary](0262-the-dispatcher-qualifies-each-http-receiver-once-behind-its-own-failure-boundary.md) | Accepted |
+| 0263 | [HTTP identity accepts a one-to-one direct message to a registered receiver's bot](0263-http-identity-accepts-a-one-to-one-direct-message-to-a-registered-receivers-bot.md) | Accepted |
+| 0264 | [A selected delivery's reply slot is authenticated but outside its delivery intent](0264-a-selected-deliverys-reply-slot-is-authenticated-but-outside-its-delivery-intent.md) | Accepted |
+| 0265 | [A file-bearing Slack message's sender team may come from the sender's own files](0265-a-file-bearing-slack-messages-sender-team-may-come-from-the-senders-own-files.md) | Accepted |
+| 0266 | [Email receivers share a trusted sender domain under one namespace](0266-email-receivers-share-a-trusted-sender-domain-under-one-namespace.md) | Accepted |
 <!-- END GENERATED: adr-index -->

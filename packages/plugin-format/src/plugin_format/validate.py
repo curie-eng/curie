@@ -23,6 +23,7 @@ from .approval_policy import (
     connector_server_names,
     connector_tool_prefix,
     declared_mcp_server_names,
+    declared_stdio_server_names,
     effective_tool_prefix,
     grantable_routes,
 )
@@ -306,6 +307,7 @@ def _validate_connectors(root: Path, c: _Collector) -> None:
         c.error(code, message, CONNECTORS_FILE)
     if parsed is not None:
         _reject_connector_name_collisions(root, parsed, c)
+        _check_route_callers(root, parsed, c)
 
 
 def _read_connectors(root: Path) -> ConnectorsFile | None:
@@ -529,6 +531,48 @@ def _reject_connector_name_collisions(root: Path, parsed: ConnectorsFile, c: _Co
             "bundle's MCP config. Curie derives this server's URL from the Service it "
             f"creates, so remove the `{name}` entry from the MCP config and let "
             f"{CONNECTORS_FILE} own it.",
+            CONNECTORS_FILE,
+        )
+
+
+def _check_route_callers(root: Path, parsed: ConnectorsFile, c: _Collector) -> None:
+    """Each route caller is a stdio server this bundle declares (ADR 0240 decision 1).
+
+    The runner hosts a caller itself and hands it the route token, which it can
+    do only for a process it starts from the bundle's own declaration.
+    """
+
+    wanted = [
+        (name, index, caller)
+        for name, spec in sorted(parsed.connectors.items())
+        for index, route in enumerate(spec.routes)
+        for caller in route.callers
+        if caller
+    ]
+    if not wanted:
+        return
+    declared = declared_mcp_server_names(root)
+    stdio = declared_stdio_server_names(root)
+    if declared is None or stdio is None:
+        # `_validate_mcp` already refuses an unreadable declaration.
+        return
+    for name, index, caller in wanted:
+        if caller in stdio:
+            continue
+        code = (
+            "connectors.route_caller_not_stdio"
+            if caller in declared
+            else "connectors.route_caller_undeclared"
+        )
+        detail = (
+            "is not a stdio server, and only a stdio server the runner starts can "
+            "receive a route token"
+            if caller in declared
+            else "is not a server the bundle's MCP config declares"
+        )
+        c.error(
+            code,
+            f"connectors.{name}.routes[{index}]: caller `{caller}` {detail}",
             CONNECTORS_FILE,
         )
 

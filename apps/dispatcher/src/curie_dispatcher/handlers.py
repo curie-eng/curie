@@ -39,7 +39,9 @@ whether the caller may talk to the bot through this binding (ADR 0175,
 ``admission.AdmissionGate``). A refused caller gets no placeholder and no
 reply; the refusal is logged as ``CALLER_NOT_ALLOWED`` or, when the API could
 not answer and nothing was cached, ``ADMISSION_UNAVAILABLE``, and counted on
-``curie.turn.refused``. Approval-card clicks never start a turn (ADR-0106) and
+``curie.turn.refused``. A selected HTTP receiver's mention lane instead tells a
+refused or unavailable human sender once (HTTP-INVOCATION-EXECUTION-19).
+Approval-card clicks never start a turn (ADR-0106) and
 are not asked. Refusals made *above*
 these listeners by Bolt's own middleware (self events, authorization, listener
 matching) are documented in ``docs/interfaces/channel-ingress/INTERFACE.md``
@@ -57,6 +59,7 @@ import logging
 import re
 import threading
 import time
+from collections import OrderedDict
 from collections.abc import Callable, Mapping
 from datetime import UTC, datetime
 from queue import Full, Queue
@@ -83,6 +86,7 @@ from .approval_actions import (
     decline_unowned_envelope,
     is_approval_action,
     is_release_ownership_miss,
+    notify_refusal,
     open_note_dialog,
     render_approval_action,
     render_note_submission,
@@ -92,6 +96,13 @@ from .approval_actions import (
     this_release_owns_action,
 )
 from .config import DispatcherConfig, release_identity
+from .http_receiver import (
+    HttpReceiverRuntime,
+    ReceiverSubmission,
+    SelectedApprovalAnswers,
+    is_plain_direct_message,
+    is_reply_slot,
+)
 from .identities import delivery_key, minted_adapter
 from .identity import (
     IdentityResolver,
@@ -101,9 +112,17 @@ from .identity import (
 )
 from .inbound_attachments import derive_attachments
 from .inbound_text import derive_text
+from .inbound_text import strip_self_mention as _strip_self_mention
 from .marked_actions import MARK, REFUSAL, declared_driver, reserve_turn
 from .queue import claim_event, enqueue
-from .relevance import DropReason, Lane, classify, drop, missing_envelope_fields
+from .relevance import (
+    NON_CONTENT_SUBTYPES,
+    DropReason,
+    Lane,
+    classify,
+    drop,
+    missing_envelope_fields,
+)
 from .thread_context import SlackThreadContext
 
 if TYPE_CHECKING:
@@ -117,27 +136,6 @@ CONNECT_ACCOUNT_ACTION_ID = "curie_connect_account"
 
 def _utc_now_iso() -> str:
     return datetime.now(UTC).isoformat()
-
-
-def _strip_self_mention(text: str, bot_user_id: str | None) -> str:
-    """Remove every mention of THIS bot from an event's raw ``text``.
-
-    Slack delivers ``app_mention``/``message`` events with the mention token
-    still embedded verbatim -- ``<@BOT_USER_ID>``, optionally followed by a
-    ``|display name`` label, and (since the composer always inserts one after
-    an inline mention) trailing whitespace. Left unstripped, a mention-only
-    message -- ``@Squawk`` and nothing else -- reaches the worker as a
-    NON-empty string, the mention markup itself, rather than the empty text
-    the sender actually meant. A model-backed agent shrugs this off as prompt
-    noise, which is exactly why it went unnoticed; an agent whose behavior
-    branches on emptiness (a stack's push-vs-pop, #1525) pushes the literal
-    markup instead of popping. ``bot_user_id`` comes from Bolt's own
-    ``context["bot_user_id"]`` (resolved from the ``authorize`` result per
-    request), never re-derived here.
-    """
-    if not bot_user_id:
-        return text
-    return re.sub(rf"<@{re.escape(bot_user_id)}(?:\|[^>]*)?>\s*", "", text).strip()
 
 
 def _is_unambiguous_rejection(error: SlackApiError) -> bool:
@@ -326,6 +324,175 @@ def _refused_caller(
     return True
 
 
+
+# @spec HTTP-INVOCATION-EXECUTION-19: the same words for every refusal reason,
+# and separate retry words when access could not be checked at all.
+SELECTED_REFUSED_TEXT = "Sorry, I can't help with this request."
+SELECTED_UNAVAILABLE_TEXT = (
+    "I couldn't verify your access right now. Please try again in a few minutes."
+)
+
+
+class _SelectedNotices:
+    """Tell a person once why a selected mention or direct message was not taken.
+
+    Bounded per listener: a Slack redelivery reuses its native event_id, so a
+    remembered id posts no second notice. @spec HTTP-INVOCATION-EXECUTION-19/26.
+    """
+
+    _LIMIT = 1024
+
+    def __init__(self, web_client: WebClient, log: logging.Logger) -> None:
+        self._web = web_client
+        self._log = log
+        self._lock = threading.Lock()
+        self._seen: OrderedDict[str, None] = OrderedDict()
+
+    def _first(self, event_id: str) -> bool:
+        with self._lock:
+            if event_id in self._seen:
+                return False
+            self._seen[event_id] = None
+            while len(self._seen) > self._LIMIT:
+                self._seen.popitem(last=False)
+            return True
+
+    def send(
+        self, *, status: str, body: dict[str, Any], event: dict[str, Any], bot_user_id: Any,
+    ) -> None:
+        """Post the fixed notice to a human sender only; never raises."""
+        if status not in {"refused", "unavailable"}:
+            return
+        user, channel = event.get("user"), event.get("channel")
+        event_id, ts, thread_ts = body.get("event_id"), event.get("ts"), event.get("thread_ts")
+        if (
+            event.get("bot_id") or event.get("subtype") in NON_CONTENT_SUBTYPES
+            or type(user) is not str or not user or user == bot_user_id
+            or type(channel) is not str or not channel
+            or type(event_id) is not str or not event_id
+            or type(ts) is not str or not ts
+            or (thread_ts is not None and (type(thread_ts) is not str or not thread_ts))
+            or not self._first(event_id)
+        ):
+            return
+        text = SELECTED_REFUSED_TEXT if status == "refused" else SELECTED_UNAVAILABLE_TEXT
+        try:
+            if channel.startswith("D") or is_plain_direct_message(event):
+                # A direct message has no audience to hide the notice from.
+                # @spec HTTP-INVOCATION-EXECUTION-19/26.
+                self._web.chat_postMessage(channel=channel, thread_ts=thread_ts or ts, text=text)
+            elif thread_ts:
+                self._web.chat_postEphemeral(
+                    channel=channel, user=user, thread_ts=thread_ts, text=text,
+                )
+            else:
+                self._web.chat_postEphemeral(channel=channel, user=user, text=text)
+        except Exception as error:  # noqa: BLE001 - a lost notice changes no outcome
+            self._log.warning("selected mention notice failed error=%s", type(error).__name__)
+
+    def replace(
+        self, *, body: dict[str, Any], event: dict[str, Any], bot_user_id: Any,
+        channel: str, placeholder: str,
+    ) -> None:
+        """Turn a direct message attempt's placeholder into the fixed refusal; never raises.
+
+        A repeated native event_id, or a sender owed no notice, gets its
+        placeholder deleted instead. @spec HTTP-INVOCATION-EXECUTION-27.
+        """
+        user, event_id = event.get("user"), body.get("event_id")
+        owed = not (
+            event.get("bot_id") or event.get("subtype") in NON_CONTENT_SUBTYPES
+            or type(user) is not str or not user or user == bot_user_id
+            or type(event_id) is not str or not event_id
+        )
+        if owed and type(event_id) is str and self._first(event_id):
+            try:
+                self._web.chat_update(channel=channel, ts=placeholder, text=SELECTED_REFUSED_TEXT)
+            except Exception as error:  # noqa: BLE001 - a lost notice changes no outcome
+                self._log.warning(
+                    "selected mention notice failed error=%s", type(error).__name__,
+                )
+            return
+        _delete_placeholder(self._web, self._log, channel=channel, ts=placeholder)
+
+
+def _delete_placeholder(
+    web_client: WebClient, log: logging.Logger, *, channel: str, ts: str
+) -> None:
+    """Delete one placeholder this attempt posted; a failure is logged by class only.
+
+    @spec HTTP-INVOCATION-EXECUTION-27.
+    """
+    try:
+        web_client.chat_delete(channel=channel, ts=ts)
+    except Exception as error:  # noqa: BLE001 - a stray placeholder changes no outcome
+        log.warning("selected placeholder delete failed error=%s", type(error).__name__)
+
+
+class SelectedMention:
+    """What one selected mention or direct message submission ended with.
+
+    ``placeholder`` is this attempt's placeholder ts while it still stands: None
+    when none was posted or it was deleted. @spec HTTP-INVOCATION-EXECUTION-27.
+    """
+
+    __slots__ = ("result", "placeholder")
+
+    def __init__(self, result: ReceiverSubmission, placeholder: str | None) -> None:
+        self.result = result
+        self.placeholder = placeholder
+
+
+def submit_selected_mention(
+    runtime: HttpReceiverRuntime,
+    *,
+    web_client: WebClient,
+    config: DispatcherConfig,
+    log: logging.Logger,
+    body: dict[str, Any],
+    event: dict[str, Any],
+    slack_identity: str,
+    bot_user_id: str | None,
+) -> SelectedMention:
+    """Prepare, post the legacy placeholder, submit its slot, settle the placeholder.
+
+    Serves the selected mention and plain direct message lanes alike
+    (criterion 26); ``prepare`` decides which events are submitted.
+
+    The placeholder is posted only for a submission that passed every local
+    check, and is deleted only on proof that another slot owns the turn: a
+    duplicate answer naming a different slot. A duplicate naming this slot or
+    none, an accepted new turn, pending, unavailable and refused all keep it;
+    the listener turns a refused one into the notice.
+    @spec HTTP-INVOCATION-EXECUTION-27.
+    """
+    prepared = runtime.prepare(
+        body=body, event=event, slack_identity=slack_identity, bot_user_id=bot_user_id,
+    )
+    if prepared is None:
+        return SelectedMention(ReceiverSubmission(status="refused", stream_id=None), None)
+    placeholder = _post_placeholder(
+        web_client=web_client,
+        config=config,
+        log=log,
+        slack_event_id=str(body.get("event_id") or ""),
+        channel=prepared.channel,
+        thread_ts=prepared.thread_ts,
+    )
+    # A ts outside the slot grammar is kept but never submitted as a slot.
+    result = runtime.send(
+        prepared,
+        reply_ref=placeholder if placeholder is not None and is_reply_slot(placeholder) else "",
+    )
+    if (
+        placeholder is not None and result.status == "accepted" and result.duplicate
+        and result.reply_ref is not None and result.reply_ref != placeholder
+    ):
+        _delete_placeholder(web_client, log, channel=prepared.channel, ts=placeholder)
+        placeholder = None
+    return SelectedMention(result, placeholder)
+
+
 def _mint_turn(
     *,
     web_client: WebClient,
@@ -430,6 +597,31 @@ def _mint_turn(
     return stream_id
 
 
+def _delivery_canary(
+    *, lane: Lane, channel: str, slack_event_id: str, config: DispatcherConfig,
+    slack_identity: str, log: logging.Logger,
+) -> bool:
+    """Shared read-only short circuit. @spec HTTP-INVOCATION-EXECUTION-19."""
+    # A delivery canary proves Slack still delivers to this identity and
+    # nothing more (#4960): count it and stop before relevance and admission,
+    # so it never asks the API, posts a placeholder or mints a turn.
+    if lane == "mention" and channel in config.slack_delivery_canary_channels:
+        record_metric(
+            "curie.slack.delivery_canary",
+            attributes={"service.name": "curie-dispatcher", "slack_identity": slack_identity},
+        )
+        drop(
+            log,
+            DropReason.DELIVERY_CANARY,
+            event_id=slack_event_id,
+            level=logging.DEBUG,
+            channel=channel,
+        )
+        return True
+
+    return False
+
+
 def process_event(
     *,
     body: dict[str, Any],
@@ -504,21 +696,10 @@ def process_event(
         )
         return None
 
-    # A delivery canary proves Slack still delivers to this identity and
-    # nothing more (#4960): count it and stop before relevance and admission,
-    # so it never asks the API, posts a placeholder or mints a turn.
-    if lane == "mention" and channel in config.slack_delivery_canary_channels:
-        record_metric(
-            "curie.slack.delivery_canary",
-            attributes={"service.name": "curie-dispatcher", "slack_identity": slack_identity},
-        )
-        drop(
-            log,
-            DropReason.DELIVERY_CANARY,
-            event_id=slack_event_id,
-            level=logging.DEBUG,
-            channel=channel,
-        )
+    if _delivery_canary(
+        lane=lane, channel=channel, slack_event_id=slack_event_id, config=config,
+        slack_identity=slack_identity, log=log,
+    ):
         return None
 
     bots = identity_bots or {}
@@ -875,6 +1056,7 @@ def register_handlers(
     identity_bots: Mapping[str, str] | None = None,
     admission: AdmissionGate | None = None,
     identity_client: IdentityResolver | None = None,
+    http_receiver: HttpReceiverRuntime | None = None,
 ) -> None:
     """Wire the app_mention, (direct-message) message, block-action, and
     approval-card listeners. ``resolver`` (the approvals API client) is
@@ -887,11 +1069,36 @@ def register_handlers(
     lookup (#2910); None builds the production one from config, and a build
     that yields None registers no lookup at all."""
 
+    # @spec HTTP-INVOCATION-EXECUTION-19: selection is explicit and cannot fall back.
+    if http_receiver is not None and (
+        type(http_receiver) is not HttpReceiverRuntime
+        or http_receiver.identity_name != slack_identity
+    ):
+        raise ValueError("invalid_http_receiver_runtime")
     approval_resolver = resolver if resolver is not None else build_resolver(config)
+    # @spec HTTP-APPROVAL-CONTINUITY-7: the only caller of the selected answer path.
+    selected_answers = (
+        None if http_receiver is None
+        else SelectedApprovalAnswers(http_receiver, config.approval_chat_attester_secret)
+    )
+
+    def _answer_selected(body: dict[str, Any], decision: str) -> None:
+        """@spec HTTP-APPROVAL-CONTINUITY-7: post-ack answer and render, never raising."""
+        assert selected_answers is not None
+        try:
+            click = resolve_approval_action(
+                body=body, decision=decision, resolver=selected_answers, logger=logger,
+            )
+            if click is not None:
+                render_approval_action(click, web_client=web_client, logger=logger)
+        except Exception as exc:  # noqa: BLE001 - a raise past the ack eats the ack
+            log.warning("selected approval answer failed: %s", type(exc).__name__)
     admission_gate = admission if admission is not None else build_admission(config, redis_client)
     # Looked up as a module global so tests can keep the lookup offline.
     lookup: IdentityResolver | None = (
-        identity_client if identity_client is not None else build_identity_client(config)
+        None if http_receiver is not None else (
+            identity_client if identity_client is not None else build_identity_client(config)
+        )
     )
     if lookup is not None:
         # Registered first among this app's own middleware: it only submits to a
@@ -918,6 +1125,8 @@ def register_handlers(
     log = logger or logging.getLogger(__name__)
 
     driver_approval_probe = _DriverApprovalProbe()
+    # @spec HTTP-INVOCATION-EXECUTION-19/26: only the selected mention and DM lanes notify.
+    selected_notices = None if http_receiver is None else _SelectedNotices(web_client, log)
 
     def _driver_approval_owner(
         body: dict[str, Any],
@@ -934,6 +1143,9 @@ def register_handlers(
         decline with 503 for retry; exact row misses retain 404. Never call
         Slack here, and ask caller admission before dedupe and ownership.
         """
+        # @spec HTTP-INVOCATION-EXECUTION-19: selected intake precedes every legacy probe.
+        if http_receiver is not None:
+            return next()
         if str(event.get("channel") or "") in config.slack_delivery_canary_channels:
             return next()
         text = _strip_self_mention(derive_text(event), context.get("bot_user_id"))
@@ -979,10 +1191,61 @@ def register_handlers(
             return BoltResponse(status=status, body="")
         return next()
 
+    def _selected_delivery(
+        runtime: HttpReceiverRuntime, body: dict[str, Any], event: dict[str, Any],
+        context: dict[str, Any], *, lane: str,
+    ) -> None:
+        """Submit one selected mention or direct message and settle its placeholder.
+
+        @spec HTTP-INVOCATION-EXECUTION-19/26/27.
+        """
+        delivery = submit_selected_mention(
+            runtime, web_client=web_client, config=config, log=log, body=body,
+            event=event, slack_identity=slack_identity,
+            bot_user_id=context.get("bot_user_id"),
+        )
+        result = delivery.result
+        if result.status not in {"refused", "unavailable"}:
+            return
+        drop(
+            log, DropReason.CALLER_NOT_ALLOWED if result.status == "refused"
+            else DropReason.ADMISSION_UNAVAILABLE, lane=lane,
+            event_id=str(body.get("event_id") or ""),
+        )
+        assert selected_notices is not None
+        channel = str(event.get("channel"))
+        if result.status == "refused" and delivery.placeholder is not None:
+            if channel.startswith("D") or is_plain_direct_message(event):
+                # @spec HTTP-INVOCATION-EXECUTION-26/27: only the sender is in a
+                # direct message, so its placeholder becomes the notice.
+                selected_notices.replace(
+                    body=body, event=event, bot_user_id=context.get("bot_user_id"),
+                    channel=channel, placeholder=delivery.placeholder,
+                )
+                return
+            # @spec HTTP-INVOCATION-EXECUTION-27: a channel never sees who was
+            # refused. The placeholder goes, even if its delete fails, and the
+            # notice below stays ephemeral to the sender.
+            _delete_placeholder(web_client, log, channel=channel, ts=delivery.placeholder)
+        selected_notices.send(
+            status=result.status, body=body, event=event,
+            bot_user_id=context.get("bot_user_id"),
+        )
+
     @app.event("app_mention", middleware=[_driver_approval_owner])
     def _on_app_mention(
         body: dict[str, Any], event: dict[str, Any], context: dict[str, Any]
     ) -> None:
+        # @spec HTTP-INVOCATION-EXECUTION-19: Bolt has already acknowledged this event.
+        if http_receiver is not None:
+            if _delivery_canary(
+                lane="mention", channel=str(event.get("channel") or ""),
+                slack_event_id=str(body.get("event_id") or ""), config=config,
+                slack_identity=slack_identity, log=log,
+            ):
+                return
+            _selected_delivery(http_receiver, body, event, context, lane="mention")
+            return
         process_event(
             body=body,
             event=event,
@@ -1002,6 +1265,15 @@ def register_handlers(
 
     @app.event("message")
     def _on_message(body: dict[str, Any], event: dict[str, Any], context: dict[str, Any]) -> None:
+        # @spec HTTP-INVOCATION-EXECUTION-19/26.
+        if http_receiver is not None:
+            if not is_plain_direct_message(event):
+                # Every other message event stays silent.
+                drop(log, DropReason.UNSUBSCRIBED_LANE, event_id="", lane="im")
+                return
+            # @spec HTTP-INVOCATION-EXECUTION-27: the same placeholder and slot flow.
+            _selected_delivery(http_receiver, body, event, context, lane="im")
+            return
         # ENVELOPE VALIDATION, not a relevance decision (#2006). The manifest at
         # `apps/dispatcher/slack-app-manifest.yaml` subscribes bot_events to
         # exactly `app_mention` and `message.im`, so a message on any other
@@ -1053,6 +1325,11 @@ def register_handlers(
     # checked per install, not assumed after some interval.
     @app.action(APPROVE_ACTION_ID)
     def _on_approve(ack: Callable[..., Any], body: dict[str, Any]) -> None:
+        # @spec HTTP-APPROVAL-CONTINUITY-7: ack, then one proved bounded answer.
+        if selected_answers is not None:
+            ack()
+            _answer_selected(body, "approved")
+            return
         click = resolve_approval_action(
             body=body,
             decision="approved",
@@ -1077,6 +1354,11 @@ def register_handlers(
 
     @app.action(REJECT_ACTION_ID)
     def _on_reject(ack: Callable[..., Any], body: dict[str, Any]) -> None:
+        # @spec HTTP-APPROVAL-CONTINUITY-7: ack, then one proved bounded answer.
+        if selected_answers is not None:
+            ack()
+            _answer_selected(body, "rejected")
+            return
         click = resolve_approval_action(
             body=body,
             decision="rejected",
@@ -1107,6 +1389,15 @@ def register_handlers(
     # a second live behavior; the earlier wording claimed otherwise.
     @app.action(APPROVE_NOTE_ACTION_ID)
     def _on_approve_with_note(ack: Callable[..., Any], body: dict[str, Any]) -> None:
+        # @spec HTTP-APPROVAL-CONTINUITY-7: the dialog's fall-forward answers
+        # through the selected submission too, never the legacy client.
+        if selected_answers is not None:
+            ack()
+            open_note_dialog(
+                body=body, decision="approved", web_client=web_client,
+                resolver=selected_answers, logger=logger,
+            )
+            return
         if this_release_owns_action(body, approval_resolver) is False:
             decline_unowned_envelope(
                 ack,
@@ -1128,6 +1419,15 @@ def register_handlers(
 
     @app.action(REJECT_NOTE_ACTION_ID)
     def _on_reject_with_note(ack: Callable[..., Any], body: dict[str, Any]) -> None:
+        # @spec HTTP-APPROVAL-CONTINUITY-7: the dialog's fall-forward answers
+        # through the selected submission too, never the legacy client.
+        if selected_answers is not None:
+            ack()
+            open_note_dialog(
+                body=body, decision="rejected", web_client=web_client,
+                resolver=selected_answers, logger=logger,
+            )
+            return
         if this_release_owns_action(body, approval_resolver) is False:
             decline_unowned_envelope(
                 ack,
@@ -1154,6 +1454,21 @@ def register_handlers(
     # the open modal.
     @app.view(NOTE_MODAL_CALLBACK_ID)
     def _on_note_submitted(ack: Callable[..., Any], body: dict[str, Any]) -> None:
+        # @spec HTTP-APPROVAL-CONTINUITY-7: ACK precedes the bounded HTTP answer,
+        # so a refusal is shown as an ephemeral once the dialog has closed.
+        if selected_answers is not None:
+            ack()
+            selected = resolve_note_submission(
+                body=body, resolver=selected_answers, logger=logger,
+            )
+            if selected is not None:
+                render_note_submission(selected, web_client=web_client, logger=logger)
+                if selected.outcome.status_code != 200:
+                    notify_refusal(
+                        web_client, outcome=selected.outcome, channel=selected.channel,
+                        user=selected.user, log=log,
+                    )
+            return
         # Decide first, with no Slack round trip in the way: Slack allows three
         # seconds for the ack and the resolve POST is the only network hop the
         # decision needs (#1077).
@@ -1197,6 +1512,14 @@ def register_handlers(
     def _on_action(ack: Callable[..., None], body: dict[str, Any]) -> None:
         actions = body.get("actions") or []
         action_id = str(actions[0].get("action_id", "")) if actions else ""
+        # @spec HTTP-INVOCATION-EXECUTION-19 HTTP-APPROVAL-CONTINUITY-7: the
+        # dedicated approval listeners own their ack on a selected receiver too.
+        if http_receiver is not None:
+            if is_approval_action(action_id):
+                return
+            ack()
+            drop(log, DropReason.UNSUBSCRIBED_LANE, event_id="")
+            return
         if is_approval_action(action_id):
             # The dedicated approval listeners own ack-or-decline. Acking here
             # would consume an envelope the non-owning release must leave for

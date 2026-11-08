@@ -40,6 +40,7 @@ from channel_protocol.reply import ReplyAck, ReplyEvent, ReplyTarget
 from curie_worker.actions import ActionClient
 from curie_worker.attachments import PreparedAttachments
 from curie_worker.behaviorpacks import BehaviorPacks
+from curie_worker.binding import HttpIdentityBinding
 from curie_worker.capacity_wait import CapacityWaitRequested
 from curie_worker.kernel import attempt as kernel_attempt
 from curie_worker.kernel import clock as kernel_clock
@@ -117,6 +118,19 @@ def _safe_candidate_status(candidate: SandboxHandle) -> dict[str, object]:
 
 
 class _HistoryBinding:
+
+    async def identity_binding(
+        self, kind: str, adapter: str | None, address: str,
+    ) -> HttpIdentityBinding | None:
+        """@spec HTTP-INVOCATION-EXECUTION-18: explicit local fixture classification."""
+        agent_id = uuid.UUID("22222222-2222-4222-8222-222222222222")
+        return HttpIdentityBinding(
+            tenant_id=uuid.UUID("00000000-0000-4000-8000-000000000001"),
+            agent_id=agent_id,
+            binding_id=uuid.uuid5(uuid.NAMESPACE_URL, repr((kind, adapter, address))),
+            binding_generation=1, http_identity_required=False,
+        )
+
     async def resolve(self, _kind: str, _adapter: str | None, _channel: str) -> _FakeResolved:
         return _FakeResolved(uuid.UUID("22222222-2222-4222-8222-222222222222"))
 
@@ -399,6 +413,19 @@ def test_cancellation_during_deferred_job_boot_reply_releases_runner_response(
 
 class _BuiltInCodingBinding:
     """Resolved deployment facts for the built-in claim-time coding path."""
+
+    async def identity_binding(
+        self, kind: str, adapter: str | None, address: str,
+    ) -> HttpIdentityBinding | None:
+        """@spec HTTP-INVOCATION-EXECUTION-18: explicit local fixture classification."""
+        agent_id = uuid.UUID("22222222-2222-4222-8222-222222222222")
+        return HttpIdentityBinding(
+            tenant_id=uuid.UUID("00000000-0000-4000-8000-000000000001"),
+            agent_id=agent_id,
+            binding_id=uuid.uuid5(uuid.NAMESPACE_URL, repr((kind, adapter, address))),
+            binding_generation=1, http_identity_required=False,
+        )
+
 
     def __init__(
         self,
@@ -1158,6 +1185,19 @@ def test_conflicting_runtime_repo_is_terminal_before_claim_or_model(
             self.workspace_enabled = False
 
     class WorkspaceBinding:
+
+        async def identity_binding(
+            self, kind: str, adapter: str | None, address: str,
+        ) -> HttpIdentityBinding | None:
+            """@spec HTTP-INVOCATION-EXECUTION-18: explicit local fixture classification."""
+            agent_id = WorkspaceResolved().agent_id
+            return HttpIdentityBinding(
+                tenant_id=uuid.UUID("00000000-0000-4000-8000-000000000001"),
+                agent_id=agent_id,
+                binding_id=uuid.uuid5(uuid.NAMESPACE_URL, repr((kind, adapter, address))),
+                binding_generation=1, http_identity_required=False,
+            )
+
         async def resolve(
             self, _kind: str, _adapter: str | None, _channel: str
         ) -> WorkspaceResolved:
@@ -1293,6 +1333,19 @@ def test_workspace_capability_without_selection_keeps_fresh_thread_generic(
             self.workspace_enabled = False
 
     class WorkspaceBinding:
+
+        async def identity_binding(
+            self, kind: str, adapter: str | None, address: str,
+        ) -> HttpIdentityBinding | None:
+            """@spec HTTP-INVOCATION-EXECUTION-18: explicit local fixture classification."""
+            agent_id = WorkspaceResolved().agent_id
+            return HttpIdentityBinding(
+                tenant_id=uuid.UUID("00000000-0000-4000-8000-000000000001"),
+                agent_id=agent_id,
+                binding_id=uuid.uuid5(uuid.NAMESPACE_URL, repr((kind, adapter, address))),
+                binding_generation=1, http_identity_required=False,
+            )
+
         async def resolve(
             self, _kind: str, _adapter: str | None, _channel: str
         ) -> WorkspaceResolved:
@@ -2252,6 +2305,19 @@ def test_a_selection_refusal_is_logged_so_an_operator_can_find_it(make_harness, 
             self.workspace_enabled = True
 
     class WorkspaceBinding:
+
+        async def identity_binding(
+            self, kind: str, adapter: str | None, address: str,
+        ) -> HttpIdentityBinding | None:
+            """@spec HTTP-INVOCATION-EXECUTION-18: explicit local fixture classification."""
+            agent_id = WorkspaceResolved().agent_id
+            return HttpIdentityBinding(
+                tenant_id=uuid.UUID("00000000-0000-4000-8000-000000000001"),
+                agent_id=agent_id,
+                binding_id=uuid.uuid5(uuid.NAMESPACE_URL, repr((kind, adapter, address))),
+                binding_generation=1, http_identity_required=False,
+            )
+
         async def resolve(
             self, _kind: str, _adapter: str | None, _channel: str
         ) -> WorkspaceResolved:
@@ -2322,6 +2388,19 @@ def _workspace_binding(
             self.workspace_enabled = True
 
     class WorkspaceBinding:
+
+        async def identity_binding(
+            self, kind: str, adapter: str | None, address: str,
+        ) -> HttpIdentityBinding | None:
+            """@spec HTTP-INVOCATION-EXECUTION-18: explicit local fixture classification."""
+            agent_id = WorkspaceResolved().agent_id
+            return HttpIdentityBinding(
+                tenant_id=uuid.UUID("00000000-0000-4000-8000-000000000001"),
+                agent_id=agent_id,
+                binding_id=uuid.uuid5(uuid.NAMESPACE_URL, repr((kind, adapter, address))),
+                binding_generation=1, http_identity_required=False,
+            )
+
         async def resolve(
             self, _kind: str, _adapter: str | None, _channel: str
         ) -> WorkspaceResolved:
@@ -2427,8 +2506,8 @@ def test_workspace_preparation_failure_escalates_by_its_own_name(make_harness, c
         pytest.param(
             500,
             "workspace repository-selection failed: API returned HTTP 500",
-            3,
-            id="fault-exhausts-retry-budget",
+            None,
+            id="dependency-fault-retries-in-current-invocation",
         ),
         pytest.param(
             403,
@@ -2446,7 +2525,7 @@ def test_workspace_preparation_failure_escalates_by_its_own_name(make_harness, c
     ],
 )
 def test_workspace_selection_http_failure_preserves_diagnostic_and_retry_policy(
-    make_harness, status: int, expected_detail: str, expected_attempts: int
+    make_harness, status: int, expected_detail: str, expected_attempts: int | None
 ) -> None:
     """#4367: selection faults retain the reason while policy refusals stay terminal."""
 
@@ -2474,7 +2553,11 @@ def test_workspace_selection_http_failure_preserves_diagnostic_and_retry_policy(
                 api_url=str(server.make_url("")),
                 worker_token="workspace-test-token",
             )
-            async with make_harness(binding=_workspace_binding(deployment_id), max_attempts=3) as h:
+            async with make_harness(
+                binding=_workspace_binding(deployment_id),
+                max_attempts=1,
+                workspace_total_timeout_seconds=1,
+            ) as h:
                 h.kernel._workspace = WorkspaceClaimCoordinator(
                     preparer=SimpleNamespace(credentials=credentials),
                     substrate=h.substrate,
@@ -2485,7 +2568,10 @@ def test_workspace_selection_http_failure_preserves_diagnostic_and_retry_policy(
                 )
                 await h.kernel.process_event(event)
 
-                assert len(requests) == expected_attempts
+                if status == 500:
+                    assert len(requests) > h.config.max_attempts
+                else:
+                    assert len(requests) == expected_attempts
                 assert all(body["repo_full_name"] == "acme-corp/acme-bot" for body in requests)
                 assert h.fake_k8s.claim_envs == []
                 assert h.runner.opened == []
@@ -2495,9 +2581,9 @@ def test_workspace_selection_http_failure_preserves_diagnostic_and_retry_policy(
                 reply = h.sink.last_text
                 assert reply is not None
                 if status == 500:
+                    assert f"after {len(requests)} attempt(s)" in reply
                     assert kernel_failures.failure_class_from_reply(reply) == "workspace-error"
                     assert expected_detail in reply
-                    assert "after 3 attempt(s)" in reply
                     assert h.sink.completions[0].outcome == "escalated"
                 else:
                     assert reply == expected_detail
@@ -4349,6 +4435,19 @@ def test_quota_capacity_reclaims_oldest_idle_route_and_preserves_history(
     from curie_worker.sandbox.k8s import _claim_view
 
     class HistoryBinding:
+
+        async def identity_binding(
+            self, kind: str, adapter: str | None, address: str,
+        ) -> HttpIdentityBinding | None:
+            """@spec HTTP-INVOCATION-EXECUTION-18: explicit local fixture classification."""
+            agent_id = uuid.UUID("22222222-2222-4222-8222-222222222222")
+            return HttpIdentityBinding(
+                tenant_id=uuid.UUID("00000000-0000-4000-8000-000000000001"),
+                agent_id=agent_id,
+                binding_id=uuid.uuid5(uuid.NAMESPACE_URL, repr((kind, adapter, address))),
+                binding_generation=1, http_identity_required=False,
+            )
+
         async def resolve(self, _kind: str, _adapter: str | None, _channel: str) -> _FakeResolved:
             return _FakeResolved(uuid.UUID("22222222-2222-4222-8222-222222222222"))
 
@@ -5716,7 +5815,7 @@ def test_capacity_queued_notice_keeps_operator_accounting_out_of_the_reply(
             with caplog.at_level(logging.WARNING, logger="curie_worker.kernel"):
                 with pytest.raises(CapacityWaitRequested):
                     await h.kernel.process_event(event)
-            await h.kernel.notify_capacity_queued(event)
+            await h.kernel.notify_capacity_queued(event, wait_reply_ref=None)
 
             # Read off the rejection rather than retyping literals, so the two
             # halves of the boundary cannot drift apart.
@@ -5758,16 +5857,7 @@ def test_approval_resume_capacity_retries_then_escalates(
     make_harness,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """#3693, #3700: a resume that reclamation cannot help is not a runner failure.
-
-    The reclamation pass runs for the resume as for any turn, finds no idle
-    route to free, and the resume keeps its retries. Each of the three
-    attempts records the pass, and the failure is a ``sandbox-capacity``
-    escalation, not the fresh-turn capacity reply. The person is told the
-    agent was at capacity, with no quota detail (#2434). The same event id
-    resumes an approved, a rejected and an expired approval, so the sentence
-    names the decision, not an approval.
-    """
+    """#5399: a refused approval parks after one safe-reclamation pass."""
 
     real_record_metric = kernel_log.record_metric
     recorded: list[tuple[str, dict[str, str]]] = []
@@ -5801,45 +5891,22 @@ def test_approval_resume_capacity_retries_then_escalates(
             )
             lease = await _pressure_lease(h, ev.event_id)
 
-            await h.kernel.process_event(ev, lease=lease)
+            with pytest.raises(CapacityWaitRequested):
+                await h.kernel.process_event(ev, lease=lease)
 
-            assert len(h.fake_k8s.claim_envs) == 3
-            assert h.runner.opened == []
-            assert h.sink.updates == [
-                (
-                    "C1",
-                    "p-1",
-                    "curie-turn-failure: sandbox-capacity\n\n"
-                    "The run failed (sandbox-capacity) after 3 attempt(s). "
-                    "The agent was at capacity, so it could not continue after the "
-                    "approval decision. Send the request again in a few minutes if it "
-                    "is still needed. "
-                    "event_id=approval-example-resolved. Flagging for a human.",
-                )
-            ]
-            reply = h.sink.updates[0][2]
-            for leaked in (
-                "curie-sandbox-quota",
-                "limits.cpu",
-                "quota",
-                "runner-error",
-                "approved request",
-            ):
-                assert leaked not in reply
+            assert len(h.fake_k8s.claim_envs) == 1
+            assert h.runner.opened == h.sink.updates == h.sink.completions == []
             retries = [attrs for name, attrs in recorded if name == "curie.queue.retry"]
-            assert [attrs["retry_class"] for attrs in retries] == [
-                "sandbox-capacity",
-                "sandbox-capacity",
-            ]
+            assert retries == []
             reclaims = [
                 attrs["outcome"]
                 for name, attrs in recorded
                 if name == "curie.sandbox.lifecycle" and attrs.get("operation") == "reclaim"
             ]
-            assert reclaims == ["refused-no-safe-route"] * 3
-            assert h.sink.update_endpoints == [endpoint]
+            assert reclaims == ["refused-no-safe-route"]
+            assert h.sink.update_endpoints == []
             assert h.kernel._order_locks == {}
-            assert await h.async_redis.exists(h.config.done_key(ev.event_id))
+            assert not await h.async_redis.exists(h.config.done_key(ev.event_id))
 
     asyncio.run(go())
 
@@ -5894,13 +5961,7 @@ def test_approval_resume_refused_again_after_reclaim_keeps_its_capacity_failure(
     make_harness,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """#3700: the retry after a reclamation is refused again.
-
-    The resume records ``reclaimed-retry-refused`` and fails as
-    ``sandbox-capacity``. It neither sends the fresh turn's capacity reply nor
-    asks to wait for capacity (#2711), which would drop the approved
-    continuation.
-    """
+    """#5399: reclaim refusal parks without losing the approved continuation."""
 
     async def go() -> None:
         outcomes = _capture_pressure_outcomes(monkeypatch)
@@ -5923,17 +5984,16 @@ def test_approval_resume_refused_again_after_reclaim_keeps_its_capacity_failure(
             )
             lease = await _pressure_lease(h, ev.event_id)
 
-            await h.kernel.process_event(ev, lease=lease)
+            with pytest.raises(CapacityWaitRequested):
+                await h.kernel.process_event(ev, lease=lease)
 
             assert victim.claim_name in h.fake_k8s.deleted_claims
             # "reclaimed" is recorded only when the retry succeeds.
             assert outcomes == ["reclaimed-retry-refused"]
             assert h.runner.opened == []
-            reply = h.sink.updates[-1][2]
-            assert reply.startswith("curie-turn-failure: sandbox-capacity\n\n")
-            assert "queued" not in reply.lower()
-            assert "limits.cpu" not in reply
-            assert await h.async_redis.exists(h.config.done_key(ev.event_id))
+            assert h.sink.updates == h.sink.completions == []
+            assert h.kernel._order_locks == {}
+            assert not await h.async_redis.exists(h.config.done_key(ev.event_id))
 
     asyncio.run(go())
 
@@ -5941,9 +6001,9 @@ def test_approval_resume_refused_again_after_reclaim_keeps_its_capacity_failure(
 def test_approval_resume_capacity_keeps_an_earlier_pod_termination(
     make_harness,
     monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
-    """#3693: a resume whose pod was evicted, then refused for capacity on the
-    retries, still tells the operator about the eviction, as runner-error did."""
+    """#5399: parking preserves the earlier eviction in the operator log."""
 
     async def go() -> None:
         async with make_harness(
@@ -5979,13 +6039,15 @@ def test_approval_resume_capacity_keeps_an_earlier_pod_termination(
                 event_id="approval-evicted-resolved",
             )
 
-            await h.kernel.process_event(ev)
+            with caplog.at_level(logging.WARNING), pytest.raises(CapacityWaitRequested):
+                await h.kernel.process_event(ev)
 
             assert len(h.runner.opened) == 1
-            reply = h.sink.updates[-1][2]
-            assert reply.startswith("curie-turn-failure: sandbox-capacity\n\n")
-            assert "Earlier attempt: Kubernetes pod terminated: Evicted" in reply
-            assert "limits.cpu" not in reply
+            assert "Evicted" in caplog.text
+            assert "The node was low on memory." in caplog.text
+            assert h.sink.completions == []
+            assert not await h.async_redis.exists(h.config.done_key(ev.event_id))
+            assert h.kernel._order_locks == {}
 
     asyncio.run(go())
 
@@ -6256,6 +6318,19 @@ class _TokenBinding:
     so the test can assert the exact value the worker delivers as the Bearer
     header. The claim-time minting itself is covered by the binding unit tests;
     this proves the claim->handle->kernel->runner delivery path."""
+
+    async def identity_binding(
+        self, kind: str, adapter: str | None, address: str,
+    ) -> HttpIdentityBinding | None:
+        """@spec HTTP-INVOCATION-EXECUTION-18: explicit local fixture classification."""
+        agent_id = self._agent_id
+        return HttpIdentityBinding(
+            tenant_id=uuid.UUID("00000000-0000-4000-8000-000000000001"),
+            agent_id=agent_id,
+            binding_id=uuid.uuid5(uuid.NAMESPACE_URL, repr((kind, adapter, address))),
+            binding_generation=1, http_identity_required=False,
+        )
+
 
     def __init__(self, token: str, agent_id: uuid.UUID) -> None:
         self._token = token

@@ -30,7 +30,7 @@ from fastapi.responses import JSONResponse
 
 from ..auth import require_internal_worker_token
 from ..config import get_settings
-from ..deps import KillSwitchDep, SessionDep, StoreDep
+from ..deps import IdentityRuntimeDep, KillSwitchDep, SessionDep, StoreDep
 from ..remediation_admission import admit_nominations
 from ..remediation_binding import BindingUnavailable, resolve_protected_event
 from ..remediation_nomination_store import (
@@ -71,6 +71,7 @@ async def submit_remediation_nominations(
     session: SessionDep,
     store: StoreDep,
     kill_switch: KillSwitchDep,
+    identity_runtime: IdentityRuntimeDep,
 ) -> JSONResponse:
     """Record one protected turn's nomination block.
 
@@ -98,6 +99,6 @@ async def submit_remediation_nominations(
         return _refused(409, "nomination_conflict")
     # @spec AUTOMATED-REMEDIATION-8: admission decides each received row; a
     # replay finds them decided and changes nothing.
-    await admit_nominations(session, store, kill_switch, ids)
+    await admit_nominations(session, store, kill_switch, ids, identity_runtime=identity_runtime)
     accepted = RemediationNominationAccepted(event_id=event.event_id, nomination_ids=ids)
     return JSONResponse(content=accepted.model_dump(mode="json"), headers=_NO_STORE)

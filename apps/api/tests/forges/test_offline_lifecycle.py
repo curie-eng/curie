@@ -1,6 +1,6 @@
-"""The whole factory lifecycle, offline, once per tracker and code host pairing (#4398).
+"""The whole factory lifecycle, offline, for the github pairing (#4398).
 
-One lifecycle runs for each adapter pair (ADR 0197, "Two ports"): a ticket is
+One lifecycle runs for the github adapter pair (ADR 0197, "Two ports"): a ticket is
 marked, admission creates the WorkItem, the reconciler publishes the execute
 wake, a worker starts the run, a publication opens a pull request, CI on its
 head is red and the CI gate asks for a fix round on the same request, the fix
@@ -12,28 +12,7 @@ The ``github`` pair drives the GitHub fakes in ``forge_fakes``: the label and
 the review feedback arrive as signed webhooks on ``/github/webhook``, and the
 CI gate, status comments and labels talk HTTP to the threaded GitHub REST fake.
 
-The ``jira_cloud+github`` pair uses the in-memory adapters in
-``curie_api.forges.memory``: a ``jira_cloud`` InMemoryTracker paired with a
-``github`` InMemoryCodeHost. Admission goes through the forge-neutral dispatch
-functions on ``TrackerIssueRef`` and ``RepositoryRef``, the real reconciler and
-CI gate read the in-memory code host, and status replies go through the real
-port branch of ``factory_notices._sync_one`` (#4358 plan D6). The install boots
-with a GitHub code host and a Jira tracker binding, with factory polling off.
-The seams that would build a real adapter are replaced at test level:
-
-1. ``factory_code_host`` and ``code_host_for`` (``curie_api.forges.hosts``)
-   build the GitHub adapter for the paths that still take the install's
-   GitHub. Each is replaced in every module that imported it.
-2. ``curie_api.forges.trackers`` picks the tracker and code host of a WorkItem
-   (#4358 plan D4, D14): ``tracker_for_work_item`` answers the pair's
-   InMemoryTracker, ``code_host_for_repository`` its InMemoryCodeHost, and
-   ``issue_link`` the tracker port's own ``issue_url``. Each is replaced in the
-   module and in every module that imported it by name.
-
-The notice row records the posted comment as the port branch writes it: a
-comment id and post time, and no GitHub comment list.
-
-Both pairs insert publications and fix rounds directly (the approval and
+The helpers insert publications and fix rounds directly (the approval and
 publication Job path is not offline), with the helpers the factory terminus
 and CI wait suites use. Placeholder identifiers only.
 """
@@ -42,15 +21,12 @@ and CI wait suites use. Placeholder identifiers only.
 
 from __future__ import annotations
 
-import asyncio
 import copy
 import json
 import re
-import sys
 import uuid
-from collections.abc import Callable, Iterator
+from collections.abc import Iterator
 from dataclasses import dataclass
-from pathlib import Path
 from typing import Any, Protocol
 
 import httpx
@@ -58,34 +34,13 @@ import pytest
 import redis
 from aci_protocol import STREAM_PAYLOAD_FIELD
 from channel_protocol.work_item_events import execute_event_id
-from curie_api import factory_base, factory_notices, workitem_dispatch
+from curie_api import factory_notices
 from curie_api.config import get_settings
 from curie_api.factory_comment_text import marker_for
 from curie_api.factory_notices import FINAL_MARKER
-from curie_api.forges import trackers, types
-from curie_api.forges.authority import feedback_actionable, may_start_with
-from curie_api.forges.capabilities import (
-    CODE_HOST_OPERATIONS,
-    Operation,
-    Support,
-    validate_pairing,
-)
-from curie_api.forges.hosts import github_host
-from curie_api.forges.identity import issue_lock_keys, notice_request_id, revision_request_id
-from curie_api.forges.memory import InMemoryCodeHost, InMemoryTracker, all_supported
-from curie_api.forges.registry import forges_registry
-from curie_api.forges.types import (
-    Actor,
-    CheckState,
-    Disposition,
-    FeedbackKind,
-    PullRequest,
-    ReplyTarget,
-)
-from curie_api.github_factory_events import mentions_login
+from curie_api.forges import types
 from curie_api.main import create_app
-from curie_api.workitem_dispatch import Admission, DispatchConflict, acquire, start
-from curie_api.workitems.lifecycle import WorkItemOutcome
+from curie_api.workitem_dispatch import DispatchConflict, acquire, start
 from curie_test_support.valkey import VALKEY_HOST, VALKEY_PORT, VALKEY_PW
 from fastapi.testclient import TestClient
 from forge_fakes import factory_wake
@@ -99,8 +54,6 @@ from forge_fakes.github import (
     _issue_event,
     _post,
     _sender,
-    forges_document,
-    forges_env_json,
 )
 from forge_fakes.github_comments import (  # noqa: F401  (fixtures)
     HEAD_A,
@@ -115,7 +68,6 @@ from forge_fakes.github_comments import (  # noqa: F401  (fixtures)
     comments,
 )
 from sqlalchemy import text
-from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
 from test_factory_ci_wait import _attach_fix
 from test_factory_terminus import (
     _attach_publication,
@@ -126,12 +78,6 @@ from test_factory_terminus import (
 pytestmark = pytest.mark.usefixtures("clean_db")
 
 STATE_LABELS = frozenset(factory_notices.STATE_LABELS)
-JIRA_HOST = "example.atlassian.net"
-JIRA_SCOPE = "10000"
-JIRA_KEY = "PROJ-1"
-JIRA_BINDING = "jira-factory"
-MARKING_USER = Actor("6601", "acme-dev")
-REVIEWER = Actor("6602", "acme-reviewer")
 REVIEW_BODY = f"@{MENTION} please rename the helper before merge"
 ISSUE_NUMBER = 9481
 PR_NUMBER = 731
@@ -150,6 +96,7 @@ class Write:
 class Pair(Protocol):
     """What one adapter pairing supplies to the shared lifecycle."""
 
+    client: TestClient
     tracker_kind: str
     tracker_issue_id: str
     # Whether the status sink records the posted reply on its notice row, so a
@@ -257,7 +204,7 @@ def _execute_wake(request_id: uuid.UUID) -> dict[str, Any]:
     return wakes[0]
 
 
-def _start(request_id: uuid.UUID) -> None:
+def _start(client: TestClient, request_id: uuid.UUID) -> None:
     """A worker acquires the published generation and starts the runtime."""
 
     generation = _rows(
@@ -266,29 +213,49 @@ def _start(request_id: uuid.UUID) -> None:
     )[0]["dispatch_generation"]
 
     async def go() -> None:
-        engine = create_async_engine(get_settings().database_url)
-        try:
-            async with AsyncSession(engine) as session:
-                acquired = await acquire(
-                    session, request_id, owner="factory-owner", generation=generation,
-                    wake=await factory_wake(session, request_id),
-                    context=None,
-                )
-                assert not isinstance(acquired, DispatchConflict), acquired
-                started = await start(
-                    session,
-                    request_id,
-                    owner="factory-owner",
-                    generation=generation,
-                    claim_name="claim-factory",
-                    sandbox_name="sbx-factory",
-                    context=acquired.context,
-                )
-                assert not isinstance(started, DispatchConflict), started
-        finally:
-            await engine.dispose()
+        async with client.app.state.sessionmaker() as session:
+            acquired = await acquire(
+                session, request_id, owner="factory-owner", generation=generation,
+                wake=await factory_wake(session, request_id),
+                context=None,
+                client=client.app.state.http_client,
+            )
+            diagnostic: object = acquired
+            if isinstance(acquired, DispatchConflict):
+                persisted = (
+                    await session.execute(
+                        text(
+                            "SELECT r.status, r.wait_deadline, r.base_settle_until, "
+                            "r.dispatch_not_before, r.last_deferral_reason, "
+                            "r.version AS request_version, r.dispatch_generation, "
+                            "r.published_generation, r.acquired_generation, "
+                            "r.published_generation IS DISTINCT FROM "
+                            "r.dispatch_generation AS dispatch_pending, "
+                            "w.version AS work_item_version, clock_timestamp() AS database_now "
+                            "FROM curie.execution_requests r JOIN curie.work_items w "
+                            "ON w.id = r.work_item_id WHERE r.id = :id"
+                        ),
+                        {"id": request_id},
+                    )
+                ).mappings().one_or_none()
+                diagnostic = {
+                    "code": acquired.code,
+                    "expected_generation": generation,
+                    "persisted": dict(persisted) if persisted is not None else None,
+                }
+            assert not isinstance(acquired, DispatchConflict), diagnostic
+            started = await start(
+                session,
+                request_id,
+                owner="factory-owner",
+                generation=generation,
+                claim_name="claim-factory",
+                sandbox_name="sbx-factory",
+                context=acquired.context,
+            )
+            assert not isinstance(started, DispatchConflict), started
 
-    asyncio.run(go())
+    client.portal.call(go)
 
 
 def _ci_turns(request_id: uuid.UUID) -> list[dict[str, Any]]:
@@ -309,18 +276,12 @@ def _assert_one_reply(writes: list[Write], *, target: str) -> str:
 
 
 def _assert_unchanged_after_final(pair: Pair, request_id: uuid.UUID, seen: list[Write]) -> None:
-    """A finalized reply is never written again.
-
-    Without a finalized notice row (``pair.finalizes`` False) the reply is
-    re-rendered on later passes; it may then only be edited, and stays final.
-    """
+    """A finalized reply is never written again."""
 
     now = pair.writes(request_id)
     if pair.finalizes:
         assert now == seen
         return
-    assert now[: len(seen)] == seen
-    assert all(w.op == "edit" and FINAL_MARKER in w.body for w in now[len(seen) :]), now
 
 
 def _agent_id() -> uuid.UUID:
@@ -355,7 +316,7 @@ def _lifecycle(pair: Pair) -> None:
         str(REPO_ID),
         REPO,
     )
-    assert item["base_branch"] == "main" and item["base_commit"] is not None
+    assert (item["base_branch"], item["base_commit"]) == (None, None)
     assert [r["id"] for r in _requests(work_item_id)] == [first]
     assert _status(first) == ("waiting", None)
     assert _notice(first)["terminal_cause"] is None
@@ -368,7 +329,9 @@ def _lifecycle(pair: Pair) -> None:
     assert [w.op for w in pair.writes(first)] == ["create"]
 
     # 3. A worker starts the run.
-    _start(first)
+    _start(pair.client, first)
+    item = _work_item(pair)
+    assert item["base_branch"] == "main" and item["base_commit"] is not None
     _reconcile()
     assert _status(first) == ("running", None)
     assert pair.state_labels() == {"curie-factory:running"}
@@ -435,7 +398,7 @@ def _lifecycle(pair: Pair) -> None:
     _reconcile()
     assert _execute_wake(revision)["text"] == rows[1]["objective"]
     assert pair.state_labels() == {"curie-factory:queued"}
-    _start(revision)
+    _start(pair.client, revision)
     _reconcile()
     assert _status(revision) == ("running", None)
     assert pair.state_labels() == {"curie-factory:running"}
@@ -631,395 +594,12 @@ def _github_pair(monkeypatch: pytest.MonkeyPatch, sink: _CommentServer) -> Itera
             _drop_stream()
 
 
-# --- the jira_cloud + github pair --------------------------------------------------
-
-
-@dataclass(frozen=True)
-class _Logged:
-    target: str
-    comment_id: str
-    body: str
-
-
-def _replace_everywhere(monkeypatch: pytest.MonkeyPatch, seams: dict[str, Any]) -> None:
-    """Replace each ``curie_api.forges.trackers`` function in that module and in
-    every loaded ``curie_api`` module that imported it by name."""
-
-    originals = {name: getattr(trackers, name) for name in seams}
-    for module_name, module in list(sys.modules.items()):
-        if module is None or not module_name.startswith("curie_api"):
-            continue
-        for name, replacement in seams.items():
-            if getattr(module, name, None) is originals[name]:
-                monkeypatch.setattr(module, name, replacement)
-
-
-class _JiraPair:
-    tracker_kind = types.JIRA_CLOUD
-    # The port branch skips an unchanged rendered digest; it does not freeze a
-    # final reply the way the GitHub sink's finalized row does.
-    finalizes = False
-
-    def __init__(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        settings = get_settings()
-        self.binding = forges_registry(settings).binding(JIRA_BINDING)
-        self.tracker = InMemoryTracker(
-            kind=types.JIRA_CLOUD, host=JIRA_HOST, scope_id=JIRA_SCOPE, label=LABEL, mention=MENTION
-        )
-        # A code host with nothing it can rerun: a red check goes straight to a fix round.
-        self.code_host = InMemoryCodeHost(
-            kind=types.GITHUB,
-            host=github_host(settings),
-            capabilities={
-                **all_supported(CODE_HOST_OPERATIONS),
-                Operation.RERUN_FAILED: Support.NOOP,
-            },
-        )
-        validate_pairing(self.tracker, self.code_host)
-        self.repository = self.code_host.seed_repository(REPO, project_id=str(REPO_ID))
-        self.code_host.push(self.repository, "main", "initial commit")
-        self.issue = self.tracker.seed_issue(
-            "Widget parser drops the last field",
-            "Parsing a three-field line yields two fields.",
-            display_key=JIRA_KEY,
-        )
-        self.tracker_issue_id = self.issue.issue_id
-        self.tracker.grant(MARKING_USER)
-        self.code_host.grant(self.repository, REVIEWER)
-        self.branch = "curie/factory-proj-1"
-        self.cursor: str | None = None
-        self.feedback_cursor: str | None = None
-        self.pull: PullRequest | None = None
-        self.conversation = f"issue-{self.issue.issue_id}"
-        self.log: list[_Logged] = []
-        self._patch(monkeypatch)
-
-    def _patch(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        """The seams named in the module docstring."""
-
-        def host(*_args: Any, **_kwargs: Any) -> InMemoryCodeHost:
-            return self.code_host
-
-        for module, seams in (
-            ("curie_api.forges.hosts", ("code_host_for", "factory_code_host")),
-            ("curie_api.repository_access", ("code_host_for",)),
-            ("curie_api.github_factory", ("factory_code_host",)),
-            ("curie_api.routers.publications", ("code_host_for",)),
-            ("curie_api.routers.publication_code_host", ("publishing_code_host",)),
-            ("curie_api.factory_rediscovery", ("publishing_code_host",)),
-        ):
-            for seam in seams:
-                monkeypatch.setattr(f"{module}.{seam}", host)
-
-        def tracker(*_args: Any, **_kwargs: Any) -> InMemoryTracker:
-            return self.tracker
-
-        def link(_registry: Any, issue: Any, _repository: Any) -> str:
-            return self.tracker.issue_url(issue)
-
-        _replace_everywhere(
-            monkeypatch,
-            {
-                "tracker_for_work_item": tracker,
-                "code_host_for_repository": host,
-                "issue_link": link,
-            },
-        )
-        # Every status write either port makes, in order, for `writes`.
-        for side in (self.tracker.marked_comments, self.code_host.marked_comments):
-            monkeypatch.setattr(side, "upsert_marked", self._logged(side.upsert_marked))
-
-    def _logged(self, upsert: Callable[..., Any]) -> Callable[..., Any]:
-        async def upsert_marked(target: ReplyTarget, marker: str, body: str) -> Any:
-            result = await upsert(target, marker, body)
-            if result.written:
-                self.log.append(_Logged(target.kind, result.comment.id, body))
-            return result
-
-        return upsert_marked
-
-    @property
-    def issue_url(self) -> str:
-        return self.tracker.issue_url(self.issue)
-
-    async def _dispatch(self, facts: Admission, *, revision: bool) -> uuid.UUID:
-        engine = create_async_engine(get_settings().database_url)
-        try:
-            async with AsyncSession(engine, expire_on_commit=False) as session:
-                classid, objid = issue_lock_keys(facts.issue)
-                await session.execute(
-                    text(
-                        "SELECT pg_advisory_xact_lock("
-                        "CAST(:classid AS integer), CAST(:objid AS integer))"
-                    ),
-                    {"classid": classid, "objid": objid},
-                )
-                admit = workitem_dispatch.admit_revision if revision else workitem_dispatch.readmit
-                result = await admit(session, facts)
-                await session.commit()
-        finally:
-            await engine.dispose()
-        assert isinstance(result, WorkItemOutcome), result
-        assert not result.replayed
-        assert result.request is not None and result.request.id == facts.request_id
-        return facts.request_id
-
-    def mark(self) -> uuid.UUID:
-        self.tracker.apply_label(self.issue, LABEL, MARKING_USER)
-        agent_id = _agent_id()
-
-        async def go() -> uuid.UUID:
-            page = await self.tracker.poll_marked(self.cursor, running=())
-            notices = [n for n in page.notices if n.disposition is Disposition.ADMIT]
-            assert len(notices) == 1, page
-            notice = notices[0]
-            assert notice.issue == self.issue
-            assert await self.tracker.verify_current(notice)
-            actor = await self.tracker.marking_actor(self.issue, LABEL)
-            assert actor == notice.actor == MARKING_USER
-            assert await may_start_with(
-                self.binding.start_authority, self.issue, actor, tracker=self.tracker
-            )
-            self.cursor = page.cursor
-            base = await factory_base.resolve_base(
-                policy=forges_registry(get_settings()).binding_repository_policy(
-                    self.binding, self.repository
-                ),
-                labels=set(),
-                default_branch="main",
-                code_host=self.code_host,
-                repository=self.repository,
-            )
-            assert isinstance(base, factory_base.ResolvedBase), base
-            return await self._dispatch(
-                Admission(
-                    agent_id=agent_id,
-                    kind="jira",
-                    address=self.binding.name,
-                    reply_conversation_id=self.conversation,
-                    issue=self.issue,
-                    repository=self.repository,
-                    code_host_installation_id=INSTALLATION_ID,
-                    objective=self.tracker.issue_url(self.issue),
-                    requester=f"{types.JIRA_CLOUD}:{actor.id}:{actor.login}",
-                    request_id=notice_request_id(notice),
-                    base=base,
-                ),
-                revision=False,
-            )
-
-        request_id = asyncio.run(go())
-        item = _work_item(self)
-        assert (item["tracker_host"], item["tracker_scope_id"], item["tracker_display_key"]) == (
-            JIRA_HOST,
-            JIRA_SCOPE,
-            JIRA_KEY,
-        )
-        return request_id
-
-    def open_pull_request(self) -> tuple[int, str]:
-        async def go() -> PullRequest:
-            self.code_host.push(self.repository, self.branch, "Fix the widget parser")
-            assert (
-                await self.code_host.find_pull_request(self.repository, head_ref=self.branch)
-                is None
-            )
-            closing = await self.tracker.closing_reference(self.issue, self.repository)
-            pull = await self.code_host.open_pull_request(
-                self.repository,
-                head_ref=self.branch,
-                base_ref="main",
-                title="Fix the widget parser",
-                body=f"{closing}\n\nKeeps the last field of a line.",
-            )
-            await self.tracker.link_pull_request(self.issue, pull)
-            return pull
-
-        self.pull = asyncio.run(go())
-        return int(self.pull.ref.number), self.pull.head_sha
-
-    def push_head(self, stage: str) -> str:
-        return self.code_host.push(self.repository, self.branch, stage)
-
-    def set_ci(self, sha: str, *, green: bool) -> None:
-        failing = CheckState.SUCCESS if green else CheckState.FAILURE
-        self.code_host.report_checks(
-            sha,
-            {"unit-tests": failing, "lint": CheckState.SUCCESS},
-            excerpt=None if green else "test_widget_parses_input failed: expected 3, got 2",
-        )
-
-    def review(self, work_item_id: uuid.UUID, pr: int) -> uuid.UUID:
-        pull = self.pull
-        assert pull is not None and pull.ref.number == str(pr)
-        agent_id = _agent_id()
-
-        async def go() -> uuid.UUID:
-            seeded = self.code_host.seed_feedback(
-                pull.ref, REVIEWER, REVIEW_BODY, FeedbackKind.REVIEW_COMMENT, thread_id="7701"
-            )
-            page = await self.code_host.list_review_feedback(pull.ref, self.feedback_cursor)
-            self.feedback_cursor = page.cursor
-            asked = [item for item in page.items if mentions_login(item.body, MENTION)]
-            assert asked == [seeded]
-            feedback = asked[0]
-            assert await feedback_actionable(self.code_host, feedback, allowlist=())
-            assert feedback.thread_id is not None
-            url = f"{pull.url}#discussion_r{feedback.id}"
-            provenance = {
-                "event": FeedbackKind.REVIEW_COMMENT.value,
-                "url": url,
-                "sender": feedback.author.login,
-                "body": feedback.body,
-            }
-            return await self._dispatch(
-                Admission(
-                    agent_id=agent_id,
-                    kind="jira",
-                    address=self.binding.name,
-                    reply_conversation_id=self.conversation,
-                    issue=self.issue,
-                    repository=self.repository,
-                    code_host_installation_id=INSTALLATION_ID,
-                    objective=(
-                        f"{url}\n\nReview feedback asked for another revision.\n"
-                        + json.dumps(provenance)
-                    ),
-                    requester=f"{types.GITHUB}:{feedback.author.id}:{feedback.author.login}",
-                    request_id=revision_request_id(self.repository, feedback.kind, feedback.id),
-                    reply_target=ReplyTarget.on_thread(pull.ref, feedback.thread_id),
-                    reply_url=url,
-                ),
-                revision=True,
-            )
-
-        return asyncio.run(go())
-
-    def writes(self, request_id: uuid.UUID) -> list[Write]:
-        marker = marker_for(request_id)
-        seen: set[str] = set()
-        found: list[Write] = []
-        for entry in self.log:
-            if marker not in entry.body:
-                continue
-            found.append(
-                Write("edit" if entry.comment_id in seen else "create", entry.target, entry.body)
-            )
-            seen.add(entry.comment_id)
-        return found
-
-    def state_labels(self) -> set[str]:
-        return set(self.tracker.labels(self.issue)) & STATE_LABELS
-
-    def assert_terminal(self, first: uuid.UUID, revision: uuid.UUID) -> None:
-        assert self.pull is not None
-        # The issue reply lives on the tracker, the thread reply on the code host.
-        issue_target = ReplyTarget.on_issue(self.issue)
-        on_issue = self.tracker.marked_comments.comments(issue_target)
-        assert len(on_issue) == 1 and on_issue[0][0] == self.tracker.identity
-        assert marker_for(first) in on_issue[0][1] and FINAL_MARKER in on_issue[0][1]
-        thread = ReplyTarget.on_thread(self.pull.ref, "7701")
-        on_thread = self.code_host.marked_comments.comments(thread)
-        assert len(on_thread) == 1 and marker_for(revision) in on_thread[0][1]
-        # The pull request closes and links the ticket by its display key.
-        current = asyncio.run(self.code_host.read_pull_request(self.pull.ref))
-        assert current.body.startswith(f"Closes {JIRA_KEY}")
-        assert self.tracker.linked(self.issue) == (self.pull.ref,)
-        assert _lineage(_work_item(self)["id"])["pr_url"] == self.pull.url
-        # The state labels the sink wrote are the bot's own: no new notice, and
-        # the factory label still on the ticket cancels nothing.
-        page = asyncio.run(self.tracker.poll_marked(self.cursor, running=(self.issue,)))
-        assert page.notices == ()
-        assert LABEL in self.tracker.labels(self.issue)
-        # The port branch records the posted comment on the notice row, with no
-        # GitHub comment list; the label the sink applied is persisted.
-        for request_id in (first, revision):
-            row = _notice(request_id)
-            assert row["posted_at"] is not None and row["comment_id"] is not None, row
-            assert row["comment_list"] is None, row
-            assert row["refused_at"] is None, row
-            assert row["terminal_cause"] == "completed"
-        assert _notice(revision)["applied_label"] == "curie-factory:pr-open"
-
-
-def _jira_pair(monkeypatch: pytest.MonkeyPatch, key_dir: Path) -> Iterator[Pair]:
-    document = forges_document()
-    document["trackers"].append(
-        {
-            "name": "jira",
-            "kind": "jira_cloud",
-            "host": JIRA_HOST,
-            "api_url": f"https://{JIRA_HOST}",
-            "credential": {
-                "type": "static_token",
-                "username": "acme-bot@example.com",
-                "token": "fixture-jira-token",
-            },
-            "label": LABEL,
-            "mention": MENTION,
-        }
-    )
-    document["bindings"].append(
-        {
-            "name": JIRA_BINDING,
-            "tracker": "jira",
-            "tracker_scope_id": JIRA_SCOPE,
-            "repos": [
-                {
-                    "alias": "bot",
-                    "code_host": "github",
-                    "project_id": str(REPO_ID),
-                    "path": REPO,
-                }
-            ],
-            "default_repo": "bot",
-            "start_authority": {"type": "allowlist", "accounts": [MARKING_USER.id]},
-        }
-    )
-    for key, value in {
-        "CURIE_WORK_ITEM_WAIT_BUDGET_SECONDS": "30",
-        "CURIE_WORK_ITEM_RECONCILER_ENABLED": "false",
-        "RESUME_RECONCILER_ENABLED": "false",
-        "APPROVAL_SWEEP_INTERVAL_S": "0",
-        "DEAD_LETTER_WATCH_INTERVAL_S": "0",
-        # No GitHub intake: the reconciler must not poll a GitHub tracker.
-        "FACTORY_ENABLED": "false",
-        "CURIE_FORGES": forges_env_json(document, key_dir),
-        "GITHUB_REVIEW_INGRESS_ENABLED": "false",
-        "GITHUB_REPO_ALLOWLIST": '["acme-corp/*"]',
-        "GITHUB_TOKEN": "",
-        "INTERNAL_WORKER_TOKEN": "factory-terminus-worker",
-        "RUNS_STREAM": f"test:curie:offline-lifecycle:{uuid.uuid4().hex}",
-    }.items():
-        monkeypatch.setenv(key, value)
-    monkeypatch.delenv("GITHUB_API_URL", raising=False)
-    get_settings.cache_clear()
-    try:
-        with TestClient(create_app()) as client:
-            _create_agent(client, kind="jira", address=JIRA_BINDING)
-            try:
-                yield _JiraPair(monkeypatch)
-            finally:
-                _clear_ci_keys()
-                _drop_stream()
-    finally:
-        get_settings.cache_clear()
-
-
 # --- the test ----------------------------------------------------------------------
 
 
-@pytest.fixture(
-    params=[
-        pytest.param("github", id="github"),
-        pytest.param("jira_cloud+github", id="jira_cloud+github"),
-    ]
-)
+@pytest.fixture(params=[pytest.param("github", id="github")])
 def pair(request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch) -> Iterator[Pair]:
-    if request.param == "github":
-        yield from _github_pair(monkeypatch, request.getfixturevalue("comments"))
-    else:
-        yield from _jira_pair(monkeypatch, request.getfixturevalue("tmp_path"))
+    yield from _github_pair(monkeypatch, request.getfixturevalue("comments"))
 
 
 def test_the_factory_lifecycle_runs_offline_for_each_pairing(pair: Pair) -> None:

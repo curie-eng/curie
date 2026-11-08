@@ -4,6 +4,11 @@ Date: 2026-09-24
 
 Status: Accepted
 
+Partially superseded by [ADR 0246](0246-common-admission-resolves-an-optional-http-identity-before-authorized-enqueue.md):
+decision 2's migrated Slack composition/cache authority, decision 6's caller/link
+migration assumption, and decision 7's first-paragraph stale-allow timing. Other
+clauses and unmigrated local behavior remain unchanged.
+
 Accepted with explicit maintainer approval from Brian Conn in the review of
 [#3148](https://github.com/curie-eng/curie/pull/3148), the pull request that
 published this status, before implementation.

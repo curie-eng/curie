@@ -454,7 +454,8 @@
       "POST /v1/timeout",
       "POST /v1/turn-admit",
       "POST /v1/reset",
-      "POST /v1/snapshot"
+      "POST /v1/snapshot",
+      "POST /v1/checkpoint"
     ]
   },
   "read": {

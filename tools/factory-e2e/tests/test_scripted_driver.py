@@ -6,8 +6,10 @@ kind scenario remains the proof that the product completes an issue.
 
 from __future__ import annotations
 
+import base64
 import fcntl
 import json
+import os
 import socket
 import sqlite3
 import subprocess
@@ -20,6 +22,7 @@ from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
 import factory_e2e as fe
+import kind_images
 import pytest
 import scripted_kind as sk
 
@@ -487,6 +490,63 @@ def test_endpoint_probe_error_does_not_interrupt_cluster_and_registry_teardown(
             assert probe.connect_ex((model.host, model.port)) != 0
     finally:
         model.close()
+
+
+def test_closed_endpoint_self_connection_does_not_fail_cleanup(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    model_module = sk._module(
+        "factory_cleanup_self_connection_model", REPO_ROOT / "tools/model-script/model_script.py"
+    )
+    run = _cleanup_run(tmp_path, monkeypatch)
+    model = model_module.ModelScript(Path(run.args.transcript))
+    model.start()
+    run.model = model
+    calls = _successful_cleanup_commands(monkeypatch)
+    connections: list[tuple[Any, Any]] = []
+
+    class SelfConnectingSocket(socket.socket):
+        def connect_ex(self, address: Any) -> int:
+            # Force Linux's ephemeral source-port allocation to choose the
+            # just-closed listener's port. The TCP connection itself is real.
+            self.bind(address)
+            result = super().connect_ex(address)
+            assert result == 0
+            connections.append((self.getsockname(), self.getpeername()))
+            return result
+
+    monkeypatch.setattr(sk.socket, "socket", SelfConnectingSocket)
+    try:
+        errors = run.cleanup()
+        assert connections == [((model.host, model.port), (model.host, model.port))]
+        assert errors == []
+        assert run.evidence["cleanup_verified"] is True
+        _assert_remaining_teardown_attempted(run, calls)
+    finally:
+        model.close()
+
+
+def test_listening_endpoint_fails_cleanup_and_remaining_teardown_still_runs(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    model_module = sk._module(
+        "factory_cleanup_listening_model", REPO_ROOT / "tools/model-script/model_script.py"
+    )
+    run = _cleanup_run(tmp_path, monkeypatch)
+    model = model_module.ModelScript(Path(run.args.transcript))
+    model.start()
+    run.model = model
+    calls = _successful_cleanup_commands(monkeypatch)
+    close = model.close
+    monkeypatch.setattr(model, "close", lambda: None)
+    try:
+        assert run.cleanup() == [f"owned endpoint still listens on port {model.port}"]
+        assert run.evidence["cleanup_verified"] is False
+        _assert_remaining_teardown_attempted(run, calls)
+    finally:
+        close()
 
 
 def test_failed_registry_delete_and_verification_still_remove_owned_workdir(
@@ -1306,7 +1366,7 @@ def _image_check_commands(
 
     monkeypatch.setattr(sk, "REPO_ROOT", tmp_path)
     monkeypatch.setattr(sk.shutil, "which", lambda binary: f"/usr/bin/{Path(binary).name}")
-    monkeypatch.setattr(sk.ScriptedRun, "check_disk", lambda _self, _stage: None)
+    monkeypatch.setattr(sk.ScriptedRun, "check_disk", lambda _self, _stage, **_kwargs: None)
     calls: list[tuple[str, ...]] = []
     mutating: list[tuple[str, ...]] = []
 
@@ -1320,7 +1380,9 @@ def _image_check_commands(
         if argv[:3] == ("docker", "image", "inspect"):
             if argv[3] == missing:
                 return subprocess.CompletedProcess(argv, 1, "", f"Error: No such image: {missing}")
-            return subprocess.CompletedProcess(argv, 0, "[]", "")
+            return subprocess.CompletedProcess(
+                argv, 0, json.dumps([{"Size": 1024} for _ in argv[3:]]), ""
+            )
         mutating.append(argv)
         if argv[:3] in {("docker", "rm", "-f"), ("docker", "ps", "-aq")}:
             return subprocess.CompletedProcess(argv, 0, "", "")
@@ -1356,7 +1418,10 @@ def test_present_local_images_pass_the_check_and_reach_resource_creation(
     calls, mutating = _image_check_commands(tmp_path, monkeypatch, None)
 
     assert sk.main(_replay_args(tmp_path)) == fe.EXIT_FAILED
-    inspected = [argv[3] for argv in calls if argv[:3] == ("docker", "image", "inspect")]
+    inspected = {
+        image for argv in calls if argv[:3] == ("docker", "image", "inspect")
+        for image in argv[3:]
+    }
     assert sorted(inspected) == sorted(sk.IMAGES)
     assert mutating, "the run must proceed past the image check"
     assert mutating[0][:2] in {("docker", "run"), ("kind", "create")}
@@ -1476,3 +1541,176 @@ def test_publication_runtime_keeps_bounded_redacted_pod_failure_after_removal(
     assert all(
         "curietech.ai/component=publication" in call for call in calls if "jobs,pods" in call
     )
+
+
+# Observed Docker image inspect Size values from a fresh main candidate build.
+_CANDIDATE_IMAGE_BYTES = (716245847, 708133868, 74690291, 1065367629)
+
+
+@pytest.mark.parametrize("free_gib", [20, 8])
+def test_runtime_disk_budget_reserves_candidate_import_and_workloads(
+    free_gib: int, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(sk.shutil, "which", lambda binary: f"/usr/bin/{binary}")
+    monkeypatch.setattr(
+        sk.shutil, "disk_usage",
+        lambda _path: type("Usage", (), {"free": free_gib * 1024**3})(),
+    )
+    run = sk.ScriptedRun(_replay_args(tmp_path))
+
+    def command(*argv: str, **_kwargs: Any) -> str:
+        if argv[:2] == ("kind", "version"):
+            return "kind v0.24.0"
+        if argv[:3] == ("docker", "image", "inspect"):
+            return json.dumps([
+                {"Size": _CANDIDATE_IMAGE_BYTES[sk.IMAGES.index(image)]}
+                for image in argv[3:]
+            ])
+        assert argv[:2] in _READ_ONLY_PREREQUISITES
+        return ""
+
+    monkeypatch.setattr(run, "command", command)
+    if free_gib == 8:
+        with pytest.raises(fe.ConfigError, match="free disk"):
+            run.prerequisites()
+    else:
+        run.prerequisites()
+
+
+
+def test_image_builds_retain_the_existing_disk_reserve(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(sk.shutil, "which", lambda binary: f"/usr/bin/{binary}")
+    monkeypatch.setattr(
+        sk.shutil, "disk_usage", lambda _path: type("Usage", (), {"free": 20 * 1024**3})(),
+    )
+    args = _replay_args(tmp_path)
+    args.build_images = True
+    run = sk.ScriptedRun(args)
+    monkeypatch.setattr(run, "command", _refuse_external_command)
+    with pytest.raises(fe.ConfigError, match=str(30 * 1024**3)):
+        run.prerequisites()
+
+
+# Hosted candidate sizes at the runner-layer check: the runner is about
+# 745 MiB and each other candidate is about 150 MiB. The free-byte figure
+# is the hosted runner that refused this stage.
+_LAYER_STAGE_IMAGE_BYTES = {
+    "curie-api:local": 150 * 1024**2,
+    "curie-worker:local": 150 * 1024**2,
+    "curie-ui:local": 150 * 1024**2,
+    "curie-runner:latest": 745 * 1024**2,
+}
+_OBSERVED_HOSTED_FREE_BYTES = 26525540352
+_RUNNER_LAYER_BUDGET_BYTES = (
+    2 * _LAYER_STAGE_IMAGE_BYTES["curie-runner:latest"] + kind_images.RUNTIME_RESERVE_BYTES
+)
+
+
+def _layer_image_size(image: str) -> int:
+    if image in _LAYER_STAGE_IMAGE_BYTES:
+        return _LAYER_STAGE_IMAGE_BYTES[image]
+    if image.endswith("/curie-runner:latest"):
+        return _LAYER_STAGE_IMAGE_BYTES["curie-runner:latest"]
+    raise AssertionError(image)
+
+
+class _TokenResponse:
+    def __enter__(self) -> _TokenResponse:
+        return self
+
+    def __exit__(self, *_args: object) -> bool:
+        return False
+
+    def read(self, _size: int = -1) -> bytes:
+        return b'{"token":"example-token"}'
+
+
+class _PortForward:
+    def __init__(self) -> None:
+        read_fd, write_fd = os.pipe()
+        os.write(write_fd, b"Forwarding from 127.0.0.1:18080 -> 8000\n")
+        os.close(write_fd)
+        self.stdout = os.fdopen(read_fd, "r")
+
+
+def _drive_runner_layer(
+    free_bytes: int,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> tuple[sk.ScriptedRun, list[tuple[str, ...]]]:
+    monkeypatch.setattr(
+        sk.shutil,
+        "disk_usage",
+        lambda _path: type("Usage", (), {"free": free_bytes})(),
+    )
+    monkeypatch.setattr(sk.ssl, "create_default_context", lambda **_kwargs: object())
+    monkeypatch.setattr(sk, "urlopen", lambda *_args, **_kwargs: _TokenResponse())
+    monkeypatch.setattr(sk.subprocess, "Popen", lambda *_args, **_kwargs: _PortForward())
+    monkeypatch.setattr(
+        sk.fe,
+        "http_json",
+        lambda *_args, **_kwargs: (201, {"id": "agent-example"}),
+    )
+    run = sk.ScriptedRun(_replay_args(tmp_path))
+    run.workdir = tmp_path / "work"
+    run.workdir.mkdir()
+    run.stub = type(
+        "Stub",
+        (),
+        {"ca_file": tmp_path / "ca.pem", "base_url": "https://stub.example.test"},
+    )()
+    (tmp_path / "ca.pem").write_text("placeholder\n")
+    encoded = base64.b64encode(b"example-key").decode()
+
+    def kubectl(*_args: str, **_kwargs: Any) -> str:
+        return json.dumps({"data": {"apiKey": encoded}})
+
+    builds: list[tuple[str, ...]] = []
+
+    def command(*argv: str, **_kwargs: Any) -> str:
+        if argv[:3] == ("docker", "image", "inspect"):
+            return json.dumps([{"Size": _layer_image_size(image)} for image in argv[3:]])
+        if len(argv) > 1 and argv[1] == "build" and "--plugin-dir" in argv:
+            builds.append(argv)
+            return ""
+        if len(argv) > 1 and argv[1] == "cluster":
+            raise sk.ScriptedScenarioError("layer-admitted")
+        raise AssertionError(argv[0:2])
+
+    monkeypatch.setattr(run, "kubectl", kubectl)
+    monkeypatch.setattr(run, "command", command)
+    return run, builds
+
+
+@pytest.mark.parametrize(
+    ("free_bytes", "admitted"),
+    [
+        (_OBSERVED_HOSTED_FREE_BYTES, True),
+        (_RUNNER_LAYER_BUDGET_BYTES - 1, False),
+    ],
+    ids=["observed-hosted-free", "below-measured"],
+)
+def test_runner_layer_disk_budget_follows_the_runner_image(
+    free_bytes: int,
+    admitted: bool,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    run, builds = _drive_runner_layer(free_bytes, tmp_path, monkeypatch)
+    if admitted:
+        with pytest.raises(sk.ScriptedScenarioError, match="layer-admitted"):
+            run.deploy("localhost:5000")
+        assert len(builds) == 1
+        err = capsys.readouterr().err
+        for stage in ("building the runner layer", "built runner layer"):
+            assert (
+                f"{stage} disk_free_bytes={free_bytes} "
+                f"disk_required_bytes={_RUNNER_LAYER_BUDGET_BYTES}"
+            ) in err
+    else:
+        with pytest.raises(fe.ConfigError, match=str(_RUNNER_LAYER_BUDGET_BYTES)):
+            run.deploy("localhost:5000")
+        assert builds == []

@@ -15,8 +15,9 @@ import uuid
 from pathlib import Path
 from typing import Any
 
+import pytest
 import redis
-from aci_protocol import Final, QueuedTurn, ReplyHandle, SessionStatus
+from aci_protocol import ErrorEvent, Final, QueuedTurn, ReplyHandle, SessionStatus
 from aci_protocol.service_config import STREAM_PAYLOAD_FIELD
 from channel_protocol.reply import REPLY_WIRE_VERSION, ReplyTarget, TurnCompleted
 from curie_worker import markers as markers_module
@@ -569,12 +570,59 @@ def test_uncommitted_publication_with_a_lost_reply_redelivers_to_the_side_effect
             assert h.runner.opened == [PROMPT]
             assert await run_outcome(c.run) == "failed"
             texts = reply_texts(h)
-            assert any("prior attempt started an action" in t for t in texts), texts
+            assert any(
+                "prior attempt may already have executed an action" in t for t in texts
+            ), texts
             assert [n.text for n in notices(h)] == [
                 f'Scheduled sweep "{c.run.ref.name}" for 2026-09-21 stopped before it '
                 "finished (run outcome: failed). Not covered: github, notes."
             ]
             assert texts[-1] == notices(h)[0].text
             assert await successors(h) == []
+
+    asyncio.run(go())
+
+
+@pytest.mark.parametrize("reply_outage", [False, True])
+def test_failed_sweep_escalation_keeps_answer_and_drops_best_effort_coverage(
+    make_hook_run,
+    make_harness,
+    reply_outage: bool,
+) -> None:
+    async def go() -> None:
+        async with sweep_case(
+            make_hook_run,
+            make_harness,
+            slack_no_edit_streaming=True,
+            completion_sweep_grace_s=0,
+        ) as c:
+            h = c.h
+            c.checkpoint(covered=("slack",), uncovered=("github", "notes"))
+            h.runner.default_script = [
+                ErrorEvent(classification="runner-error", message="temporary failure"),
+                Final(text="", status=SessionStatus.CLASSIFIED_FAILURE),
+            ]
+            owned = await enqueue(h, cron_event(c.run))
+            if reply_outage:
+                h.sink.fail_events.add("reply.update")
+            await h.kernel.process_event(owned.event, lease=owned.lease)
+            assert await run_outcome(c.run) == "failed"
+            assert await h.kernel._markers.is_terminal(owned.event.event_id)
+            if reply_outage:
+                assert notices(h) == []
+                stored = await h.kernel._markers.read_completion(owned.event.event_id)
+                assert stored is not None and stored.record.answer is not None
+                h.sink.fail_events.clear()
+                await h.kernel.sweep_pending_completions()
+                assert notices(h) == []
+                assert len(h.runner.opened) == 1
+            else:
+                assert len(notices(h)) == 1
+                texts = reply_texts(h)
+                failure_index = next(
+                    i for i, text in enumerate(texts) if "curie-turn-failure:" in text
+                )
+                assert texts.index(notices(h)[0].text) > failure_index
+            assert await h.kernel._markers.read_completion(owned.event.event_id) is None
 
     asyncio.run(go())

@@ -11,8 +11,8 @@
     {"id": "wait_ci", "label": "Wait for CI"}
   ],
   "loops": [
-    {"start": "plan", "review": "plan_review", "cap": 3},
-    {"start": "implement", "review": "review_diff", "cap": 3},
+    {"start": "plan", "review": "plan_review", "cap": 1},
+    {"start": "implement", "review": "review_diff", "cap": 5},
     {"start": "implement", "review": "wait_ci", "cap": 3}
   ],
   "reviewer_model": "openai/gpt-6.1-sol",

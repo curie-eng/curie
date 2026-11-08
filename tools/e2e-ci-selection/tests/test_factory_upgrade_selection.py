@@ -125,7 +125,11 @@ def test_mixed_chart_and_factory_migration_pr_runs_upgrade_smoke(tmp_path: Path)
 def _collection_repository(tmp_path: Path) -> Path:
     root = tmp_path / "collection"
     root.mkdir()
-    for relative in ("pyproject.toml", "conftest.py", "tools/factory-e2e/tests/conftest.py"):
+    for relative in (
+        "pyproject.toml", "conftest.py", "tools/factory-e2e/tests/conftest.py",
+        "tools/factory-e2e/case_shards.py", "tools/factory-e2e/tests/case_durations.json",
+        "tests/baselines/test-time.json",
+    ):
         destination = root / relative
         destination.parent.mkdir(parents=True, exist_ok=True)
         shutil.copyfile(REPO_ROOT / relative, destination)
@@ -166,9 +170,10 @@ def _run_collection(root: Path, *arguments: str) -> subprocess.CompletedProcess[
 @pytest.mark.parametrize(
     ("event", "paths", "scope"),
     [
-        pytest.param(
-            "pull_request", ("apps/api/src/curie_api/main.py",), "full", id="full-pr"
-        ),
+        # uv.lock selects everything, so the pull request keeps the full scope
+        # (an application diff narrows to impact targets, which exclude the
+        # upgrade regression through the registry's pytest_impact.excluded).
+        pytest.param("pull_request", ("uv.lock",), "full", id="full-pr"),
         pytest.param(
             "pull_request", ("cli/src/config_migrate.rs",), "cli", id="cli-pr"
         ),

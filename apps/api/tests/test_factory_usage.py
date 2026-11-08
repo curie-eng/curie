@@ -282,7 +282,7 @@ def test_usage_sums_across_rounds_of_one_work_item_only(priced: Any) -> None:
     client, github, sink, _book = priced
     first = _admit(client, github, sink, 9607)
     work_item_id = _request(9607)["work_item_id"]
-    epoch = _start_running(first)
+    epoch = _start_running(client, first)
     assert _usage(client, first, STANDARD).status_code == 201
     _finish_failed(client, first, epoch, "ci_failed")
     second = _second_request(work_item_id, first)
@@ -330,7 +330,7 @@ def test_a_zero_token_row_for_an_unpriced_model_is_stored_unpriced_and_costs_zer
     client, github, sink, _book = priced
     request_id = _admit(client, github, sink, 9640)
     work_item_id = _request(9640)["work_item_id"]
-    _start_running(request_id)
+    _start_running(client, request_id)
 
     response = _usage(client, request_id, [_entry(UNPRICED, 0, 0)], primary=UNPRICED)
 
@@ -355,7 +355,7 @@ def test_a_nonzero_unpriced_row_stays_incomplete_beside_a_zero_unpriced_row(
     client, github, sink, _book = priced
     request_id = _admit(client, github, sink, 9641)
     work_item_id = _request(9641)["work_item_id"]
-    _start_running(request_id)
+    _start_running(client, request_id)
     assert _usage(client, request_id, [_entry(UNPRICED, 0, 0)], primary=UNPRICED).status_code == 201
     assert (
         _usage(
@@ -380,7 +380,7 @@ def test_the_blocked_run_comment_shows_the_explanation_and_a_complete_zero_usage
     client, github, sink, _book = priced
     request_id = _admit(client, github, sink, 9642)
     _reconcile()
-    epoch = _start_running(request_id)
+    epoch = _start_running(client, request_id)
     assert _usage(client, request_id, [_entry(UNPRICED, 0, 0)], primary=UNPRICED).status_code == 201
     _finish_failed(client, request_id, epoch, "early_stop", detail=explanation)
     _reconcile()
@@ -413,7 +413,7 @@ def test_the_terminal_comment_states_the_split_above_the_final_marker(priced: An
     client, github, sink, _book = priced
     request_id = _admit(client, github, sink, 9611)
     _reconcile()
-    epoch = _start_running(request_id)
+    epoch = _start_running(client, request_id)
     assert _usage(client, request_id, STANDARD).status_code == 201
     _finish_failed(client, request_id, epoch, "runner_escalated")
     _reconcile()
@@ -431,7 +431,7 @@ def test_an_unpriced_role_says_cost_unknown(priced: Any) -> None:
     client, github, sink, _book = priced
     request_id = _admit(client, github, sink, 9612)
     _reconcile()
-    epoch = _start_running(request_id)
+    epoch = _start_running(client, request_id)
     _usage(client, request_id, [_entry(IMPLEMENTER, 1_000_000, 500_000), _entry(UNPRICED, 5, 5)])
     _finish_failed(client, request_id, epoch, "runner_escalated")
     _reconcile()
@@ -446,7 +446,7 @@ def test_a_run_with_no_usage_says_so(priced: Any) -> None:
     client, github, sink, _book = priced
     request_id = _admit(client, github, sink, 9613)
     _reconcile()
-    epoch = _start_running(request_id)
+    epoch = _start_running(client, request_id)
     _finish_failed(client, request_id, epoch, "runner_escalated")
     _reconcile()
 
@@ -494,7 +494,7 @@ def test_one_model_in_two_roles_is_stored_twice_and_aggregated_by_role(priced: A
     request_id = _admit(client, github, sink, 9622)
     work_item_id = _request(9622)["work_item_id"]
     _reconcile()
-    epoch = _start_running(request_id)
+    epoch = _start_running(client, request_id)
     models = [
         _roled(IMPLEMENTER, "implementer", 1_000_000, 500_000),
         _roled(IMPLEMENTER, "reviewer", 200_000, 100_000),
@@ -533,7 +533,7 @@ def test_a_started_request_with_no_usage_is_not_a_complete_zero(priced: Any) -> 
     client, github, sink, _book = priced
     request_id = _admit(client, github, sink, 9623)
     work_item_id = _request(9623)["work_item_id"]
-    _start_running(request_id)
+    _start_running(client, request_id)
     headers = {"X-API-Key": get_settings().api_key}
     body = client.get(f"/work-items/{work_item_id}/usage", headers=headers).json()
     assert body["total_tokens"] == 0
@@ -556,10 +556,10 @@ def test_the_terminal_line_names_runs_that_reported_no_usage(priced: Any) -> Non
     first = _admit(client, github, sink, 9625)
     work_item_id = _request(9625)["work_item_id"]
     _reconcile()
-    epoch = _start_running(first)
+    epoch = _start_running(client, first)
     _finish_failed(client, first, epoch, "ci_failed")
     second = _second_request(work_item_id, first)
-    epoch2 = _start_running(second)
+    epoch2 = _start_running(client, second)
     assert _usage(client, second, STANDARD).status_code == 201
 
     headers = {"X-API-Key": get_settings().api_key}
@@ -678,7 +678,7 @@ def test_a_follow_up_turn_stores_only_its_increment_and_keeps_the_reviewer_role(
     client, github, sink, _book = priced
     request_id = _admit(client, github, sink, 9630)
     _reconcile()
-    epoch = _start_running(request_id)
+    epoch = _start_running(client, request_id)
     for body in captured:
         response = client.post(
             f"/v1/work-item-progress/{request_id}/usage",
@@ -838,7 +838,7 @@ def test_a_suffixed_opus_run_is_priced_in_full_and_counted_once(recorded_prices:
     request_id = _admit(client, github, sink, 9650)
     work_item_id = _request(9650)["work_item_id"]
     _reconcile()
-    epoch = _start_running(request_id)
+    epoch = _start_running(client, request_id)
     response = client.post(
         f"/v1/work-item-progress/{request_id}/usage",
         headers={"X-API-Key": _token(request_id)},

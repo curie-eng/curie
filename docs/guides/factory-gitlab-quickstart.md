@@ -143,6 +143,13 @@ Do not supply GitHub App flags: GitLab quickstart refuses them.
 
 ## Delegate a bounded issue
 
+You can use the [preparation skill](factory-preparation.md) in your coding agent
+to investigate and review the complete issue before submission. Install it with
+`curie factory skills install --agent codex` using a CLI build that contains the
+command; the guide covers other clients and source builds. Publication and
+selection use your agent's tracker connection when available, with the same
+start authority requirements described below.
+
 For the Python trial above, create this issue in GitLab:
 
 > Normalize greeting names. Trim leading and trailing whitespace in `greet`.

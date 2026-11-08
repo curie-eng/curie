@@ -54,6 +54,8 @@ patch lives in the template layer alongside the #66 RBAC patch below.
 {{- $controllerManifest = $controllerManifest | replace $controllerMetadataAnchor $controllerMetadata }}
 {{- $controllerServiceAccount := "      serviceAccountName: agent-sandbox-controller" }}
 {{- $controllerPodFields := $controllerServiceAccount }}
+{{- /* Service links off on every chart pod (#5350; see CLAUDE.md). */}}
+{{- $controllerPodFields = printf "%s\n      enableServiceLinks: false" $controllerPodFields }}
 {{- with .Values.priorityClasses.platform.name }}
 {{- $controllerPodFields = printf "%s\n      priorityClassName: %s" $controllerPodFields . }}
 {{- end }}
@@ -326,7 +328,7 @@ spec:
         {{- end }}
         {{- if $wf.enabled }}
         {{- if eq $env.scratchVolume.type "ephemeral" }}
-        {{- /* ADR 0251: workspace is a generic ephemeral volume. requests.storage
+        {{- /* ADR 0255: workspace is a generic ephemeral volume. requests.storage
                is the envelope size. The claim dies with the pod. */}}
         - name: workspace
           ephemeral:
@@ -362,7 +364,7 @@ spec:
         {{- if $runner.hardening.enabled }}
         {{- range $i, $p := $runner.hardening.writablePaths }}
         {{- if and (eq $env.scratchVolume.type "ephemeral") (eq (toString $p) (toString $runner.hardening.home)) }}
-        {{- /* ADR 0251: only the home writable volume is claim-backed. /tmp and
+        {{- /* ADR 0255: only the home writable volume is claim-backed. /tmp and
                every other writable path stay emptyDir with sizeLimit. */}}
         - name: writable-{{ $i }}
           ephemeral:
@@ -664,7 +666,7 @@ spec:
           resources:
             {{- toYaml $env.resources | nindent 12 }}
         {{- end }}
-        {{- if $af.enabled }}
+        {{- if and $af.enabled (ne (.Values.worker.attachments.mode | default "eager") "lazy") }}
         {{/*
         Inbound channel attachments (#2567). The worker holds the channel bot
         token, downloads each referenced file, parks it in the private object
@@ -905,6 +907,7 @@ spec:
             {{- toYaml $env.resources | nindent 12 }}
         {{- end }}
       {{- end }}
+      enableServiceLinks: false
       containers:
         - name: runner
           image: {{ $runnerImageRef | quote }}
@@ -933,6 +936,10 @@ spec:
                   optional: false
             {{- end }}
             {{- end }}
+            {{- end }}
+            {{- if and .Values.worker.attachments.enabled (eq (.Values.worker.attachments.mode | default "eager") "lazy") }}
+            - name: CURIE_ATTACHMENT_ACCESS_ENABLED
+              value: "1"
             {{- end }}
             {{- if and $runner.fakeModel (not .Values.inference.deploy) }}
             - name: CURIE_FAKE_MODEL

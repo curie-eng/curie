@@ -103,6 +103,7 @@ spec:
              "resources" .Values.langfuse.web.resources) | nindent 8 }}
       {{- end }}
       {{- end }}
+      enableServiceLinks: false
       containers:
         - name: langfuse-web
           image: {{ include "curie.image" (dict "repository" .Values.langfuse.image.web "tag" .Values.langfuse.image.tag "digest" .Values.langfuse.image.webDigest) | quote }}
@@ -227,6 +228,7 @@ spec:
              "resources" .Values.langfuse.worker.resources) | nindent 8 }}
       {{- end }}
       {{- end }}
+      enableServiceLinks: false
       containers:
         - name: langfuse-worker
           image: {{ include "curie.image" (dict "repository" .Values.langfuse.image.worker "tag" .Values.langfuse.image.tag "digest" .Values.langfuse.image.workerDigest) | quote }}
@@ -259,7 +261,7 @@ spec:
           # Deployments declare `timeoutSeconds` explicitly rather than taking
           # the kubelet's invisible 1s default, and on each container the
           # liveness failure cutoff must outlive the readiness one, pinned by
-          # ci/probe-window-assertions.sh.
+          # ci/policy/engine.py (P3).
           readinessProbe:
             httpGet:
               path: /api/ready

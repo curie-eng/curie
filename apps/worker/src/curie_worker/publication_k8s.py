@@ -128,9 +128,9 @@ def valid_base_branch(branch: str) -> bool:
         isinstance(branch, str)
         and 0 < len(branch) <= 1024
         and branch not in {"@", "HEAD"}
-        and not branch.startswith(("-", "/", "refs/heads/"))
+        and not branch.startswith(("-", "/"))
         and not branch.endswith(("/", "."))
-        and re.fullmatch(r"[0-9a-fA-F]{40,64}", branch) is None
+        and not any(char.isspace() for char in branch)
         and re.search(r"[\x00-\x20\x7f~^:?*\[\\]", branch) is None
         and not any(part in branch for part in ("..", "@{", "//"))
         and all(
@@ -336,7 +336,7 @@ fi
 git_with_timeout -c user.name="$GIT_USER_NAME" -c user.email="$GIT_USER_EMAIL" commit \
   -m "$COMMIT_TITLE" -m "Curie-Revision: $REVISION_ID"
 if [[ -z "$EXPECTED_REMOTE_HEAD" ]]; then
-  if [[ -z "$BASE_BRANCH" || "$BASE_BRANCH" == refs/heads/* || "$BASE_BRANCH" == -* ]] || \
+  if [[ -z "$BASE_BRANCH" || "$BASE_BRANCH" == -* ]] || \
       ! git_with_timeout check-ref-format "refs/heads/$BASE_BRANCH"; then
     echo "publication base branch is invalid" >&2
     exit 1
@@ -736,7 +736,7 @@ def build_publication_resources(
 def _as_serialized_mapping(obj: Any) -> dict[str, Any]:
     if isinstance(obj, dict):
         return copy.deepcopy(obj)
-    serialized = k8s_client.ApiClient().sanitize_for_serialization(obj)
+    serialized = k8s_client.ApiClient().sanitize_for_serialization(obj)  # type: ignore[no-untyped-call]
     if not isinstance(serialized, dict):
         raise PublicationResourceError("Kubernetes returned a non-object publication resource")
     return serialized
@@ -929,9 +929,9 @@ class KubernetesPublicationCluster:
 
     def __init__(self, namespace: str, *, kubeconfig: str | None = None) -> None:
         try:
-            k8s_config.load_incluster_config()
+            k8s_config.load_incluster_config()  # type: ignore[no-untyped-call]
         except k8s_config.ConfigException:
-            k8s_config.load_kube_config(config_file=kubeconfig)
+            k8s_config.load_kube_config(config_file=kubeconfig)  # type: ignore[no-untyped-call]
         self.namespace = namespace
         self._core = k8s_client.CoreV1Api()
         self._batch = k8s_client.BatchV1Api()
@@ -1015,7 +1015,10 @@ class KubernetesPublicationCluster:
             self._core.delete_namespaced_secret(
                 resources.names.secret,
                 self.namespace,
-                body={"preconditions": {"uid": secret_uid}},
+                body=cast(
+                    k8s_client.V1DeleteOptions,
+                    {"preconditions": {"uid": secret_uid}},
+                ),
             )
             existing["Secret"] = None
         if existing["Secret"] is None:

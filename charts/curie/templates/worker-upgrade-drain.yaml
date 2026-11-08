@@ -98,6 +98,7 @@ spec:
       imagePullSecrets:
         {{- toYaml . | nindent 8 }}
       {{- end }}
+      enableServiceLinks: false
       containers:
         - name: upgrade-drain
           # The WORKER image, deliberately: the gate reads the worker's own key
@@ -179,6 +180,7 @@ spec:
       imagePullSecrets:
         {{- toYaml . | nindent 8 }}
       {{- end }}
+      enableServiceLinks: false
       containers:
         - name: upgrade-drain-release
           image: {{ $image | quote }}
@@ -259,6 +261,7 @@ spec:
       imagePullSecrets:
         {{- toYaml . | nindent 8 }}
       {{- end }}
+      enableServiceLinks: false
       containers:
         - name: upgrade-drain-attest
           image: {{ $image | quote }}
@@ -332,6 +335,7 @@ spec:
       imagePullSecrets:
         {{- toYaml . | nindent 8 }}
       {{- end }}
+      enableServiceLinks: false
       containers:
         - name: upgrade-drain-hold
           image: {{ $image | quote }}

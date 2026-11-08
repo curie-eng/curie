@@ -676,6 +676,20 @@
         "title": "ActionUndoOut",
         "type": "object"
       },
+      "Active": {
+        "additionalProperties": false,
+        "properties": {
+          "active": {
+            "title": "Active",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "active"
+        ],
+        "title": "Active",
+        "type": "object"
+      },
       "Activity": {
         "additionalProperties": false,
         "properties": {
@@ -2247,6 +2261,232 @@
         "title": "ApprovalCreateOut",
         "type": "object"
       },
+      "ApprovalCreationIdentityV1": {
+        "additionalProperties": false,
+        "description": "@spec HTTP-APPROVAL-CONTINUITY-3/4.",
+        "properties": {
+          "context": {
+            "title": "Context",
+            "type": "string"
+          },
+          "payload": {
+            "title": "Payload",
+            "type": "string"
+          },
+          "schema_version": {
+            "const": 1,
+            "title": "Schema Version",
+            "type": "integer"
+          },
+          "scope": {
+            "$ref": "#/components/schemas/TurnAuthorityScopeV1"
+          }
+        },
+        "required": [
+          "schema_version",
+          "context",
+          "payload",
+          "scope"
+        ],
+        "title": "ApprovalCreationIdentityV1",
+        "type": "object"
+      },
+      "ApprovalCreationRequestV1": {
+        "additionalProperties": false,
+        "description": "@spec HTTP-APPROVAL-CONTINUITY-3.",
+        "properties": {
+          "approval": {
+            "$ref": "#/components/schemas/ApprovalRequest"
+          },
+          "identity": {
+            "$ref": "#/components/schemas/ApprovalCreationIdentityV1"
+          },
+          "request_id": {
+            "title": "Request Id",
+            "type": "string"
+          },
+          "schema_version": {
+            "const": 1,
+            "title": "Schema Version",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "schema_version",
+          "request_id",
+          "approval",
+          "identity"
+        ],
+        "title": "ApprovalCreationRequestV1",
+        "type": "object"
+      },
+      "ApprovalCreationResponseV1": {
+        "additionalProperties": false,
+        "description": "@spec HTTP-APPROVAL-CONTINUITY-3.",
+        "properties": {
+          "duplicate": {
+            "title": "Duplicate",
+            "type": "boolean"
+          },
+          "id": {
+            "title": "Id",
+            "type": "string"
+          },
+          "request_id": {
+            "title": "Request Id",
+            "type": "string"
+          },
+          "requested_by": {
+            "anyOf": [
+              {
+                "maxLength": 256,
+                "minLength": 1,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Requested By"
+          },
+          "schema_version": {
+            "const": 1,
+            "title": "Schema Version",
+            "type": "integer"
+          },
+          "status": {
+            "enum": [
+              "pending",
+              "approved",
+              "rejected",
+              "expired"
+            ],
+            "title": "Status",
+            "type": "string"
+          }
+        },
+        "required": [
+          "schema_version",
+          "request_id",
+          "id",
+          "status",
+          "duplicate",
+          "requested_by"
+        ],
+        "title": "ApprovalCreationResponseV1",
+        "type": "object"
+      },
+      "ApprovalGrantAuthorityRequestV1": {
+        "additionalProperties": false,
+        "description": "@spec HTTP-APPROVAL-CONTINUITY-12.",
+        "properties": {
+          "check": {
+            "$ref": "#/components/schemas/TurnAuthorityRequestV1"
+          },
+          "grant": {
+            "$ref": "#/components/schemas/ApprovalGrantExpectationV1"
+          },
+          "schema_version": {
+            "const": 1,
+            "title": "Schema Version",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "schema_version",
+          "check",
+          "grant"
+        ],
+        "title": "ApprovalGrantAuthorityRequestV1",
+        "type": "object"
+      },
+      "ApprovalGrantAuthorityResponseV1": {
+        "additionalProperties": false,
+        "description": "@spec HTTP-APPROVAL-CONTINUITY-12.",
+        "properties": {
+          "check": {
+            "$ref": "#/components/schemas/TurnAuthorityResponseV1"
+          },
+          "grant_sha256": {
+            "title": "Grant Sha256",
+            "type": "string"
+          },
+          "schema_version": {
+            "const": 1,
+            "title": "Schema Version",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "schema_version",
+          "check",
+          "grant_sha256"
+        ],
+        "title": "ApprovalGrantAuthorityResponseV1",
+        "type": "object"
+      },
+      "ApprovalGrantExpectationV1": {
+        "additionalProperties": false,
+        "description": "@spec HTTP-APPROVAL-CONTINUITY-12.",
+        "properties": {
+          "agent_id": {
+            "title": "Agent Id",
+            "type": "string"
+          },
+          "approval_id": {
+            "title": "Approval Id",
+            "type": "string"
+          },
+          "conversation_id": {
+            "maxLength": 1024,
+            "minLength": 1,
+            "title": "Conversation Id",
+            "type": "string"
+          },
+          "gate_kind": {
+            "enum": [
+              "permission",
+              "policy"
+            ],
+            "title": "Gate Kind",
+            "type": "string"
+          },
+          "granted_arguments_json": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Granted Arguments Json"
+          },
+          "granted_tool": {
+            "anyOf": [
+              {
+                "maxLength": 256,
+                "minLength": 1,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Granted Tool"
+          }
+        },
+        "required": [
+          "approval_id",
+          "agent_id",
+          "conversation_id",
+          "gate_kind",
+          "granted_tool",
+          "granted_arguments_json"
+        ],
+        "title": "ApprovalGrantExpectationV1",
+        "type": "object"
+      },
       "ApprovalIdentityFactsOut": {
         "description": "Per-row FACTS about one pending approval (#2753).\n\nFacts, never verdicts: nothing here says a row cannot be resolved. A route\nwhose approver set is the card channel's membership is a HEALTHY route that\nany attested chat click resolves, and it is reported like any other row.",
         "properties": {
@@ -3254,6 +3494,61 @@
         "title": "BehaviorPacksConfig",
         "type": "object"
       },
+      "BindingClassificationRequestV1": {
+        "additionalProperties": false,
+        "description": "@spec HTTP-INVOCATION-EXECUTION-22.",
+        "properties": {
+          "request_id": {
+            "title": "Request Id",
+            "type": "string"
+          },
+          "schema_version": {
+            "const": 1,
+            "title": "Schema Version",
+            "type": "integer"
+          },
+          "scope": {
+            "$ref": "#/components/schemas/TurnAuthorityScopeV1"
+          }
+        },
+        "required": [
+          "schema_version",
+          "request_id",
+          "scope"
+        ],
+        "title": "BindingClassificationRequestV1",
+        "type": "object"
+      },
+      "BindingClassificationResponseV1": {
+        "additionalProperties": false,
+        "description": "Classification, not permission. @spec HTTP-INVOCATION-EXECUTION-22.",
+        "properties": {
+          "http_identity_required": {
+            "title": "Http Identity Required",
+            "type": "boolean"
+          },
+          "request_id": {
+            "title": "Request Id",
+            "type": "string"
+          },
+          "schema_version": {
+            "const": 1,
+            "title": "Schema Version",
+            "type": "integer"
+          },
+          "scope": {
+            "$ref": "#/components/schemas/TurnAuthorityScopeV1"
+          }
+        },
+        "required": [
+          "schema_version",
+          "request_id",
+          "scope",
+          "http_identity_required"
+        ],
+        "title": "BindingClassificationResponseV1",
+        "type": "object"
+      },
       "Body_confirm_connection_identity_connect__token__confirm_post": {
         "properties": {
           "csrf": {
@@ -3505,6 +3800,30 @@
           "rows"
         ],
         "title": "CanvasTable",
+        "type": "object"
+      },
+      "Capability": {
+        "additionalProperties": false,
+        "properties": {
+          "expires_at": {
+            "title": "Expires At",
+            "type": "integer"
+          },
+          "lease_seconds": {
+            "title": "Lease Seconds",
+            "type": "integer"
+          },
+          "token": {
+            "title": "Token",
+            "type": "string"
+          }
+        },
+        "required": [
+          "token",
+          "expires_at",
+          "lease_seconds"
+        ],
+        "title": "Capability",
         "type": "object"
       },
       "ChannelAddress": {
@@ -4626,6 +4945,65 @@
         "title": "ClusterMessageReplyPage",
         "type": "object"
       },
+      "Completed": {
+        "additionalProperties": false,
+        "properties": {
+          "sha256": {
+            "pattern": "^[0-9a-f]{64}$",
+            "title": "Sha256",
+            "type": "string"
+          },
+          "size_bytes": {
+            "maximum": 9.223372036854776e+18,
+            "minimum": 0.0,
+            "title": "Size Bytes",
+            "type": "integer"
+          },
+          "transfer_id": {
+            "maxLength": 128,
+            "minLength": 32,
+            "title": "Transfer Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "transfer_id",
+          "sha256",
+          "size_bytes"
+        ],
+        "title": "Completed",
+        "type": "object"
+      },
+      "Completion": {
+        "additionalProperties": false,
+        "properties": {
+          "id": {
+            "title": "Id",
+            "type": "string"
+          },
+          "sha256": {
+            "title": "Sha256",
+            "type": "string"
+          },
+          "size_bytes": {
+            "title": "Size Bytes",
+            "type": "integer"
+          },
+          "status": {
+            "const": "complete",
+            "default": "complete",
+            "title": "Status",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "sha256",
+          "size_bytes"
+        ],
+        "title": "Completion",
+        "type": "object"
+      },
       "ConnectorManifests": {
         "description": "Kubernetes objects derived from a version's ``connectors.yaml``.\n\nThe API renders; the caller applies. Rendering is a pure function of the\nbundle plus the deployment context the caller supplies, so producing this\nneeds no cluster access and the API's read-only RBAC is untouched\n(ADR-0086, #1063).",
         "properties": {
@@ -4754,6 +5132,75 @@
           "expires_at"
         ],
         "title": "ConsoleSessionOut",
+        "type": "object"
+      },
+      "Context": {
+        "additionalProperties": false,
+        "properties": {
+          "agent_id": {
+            "format": "uuid",
+            "title": "Agent Id",
+            "type": "string"
+          },
+          "deployment_id": {
+            "format": "uuid",
+            "title": "Deployment Id",
+            "type": "string"
+          },
+          "event_id": {
+            "maxLength": 512,
+            "minLength": 1,
+            "title": "Event Id",
+            "type": "string"
+          },
+          "owner": {
+            "maxLength": 255,
+            "minLength": 1,
+            "title": "Owner",
+            "type": "string"
+          },
+          "route_generation": {
+            "minimum": 0.0,
+            "title": "Route Generation",
+            "type": "integer"
+          },
+          "sandbox_name": {
+            "maxLength": 255,
+            "minLength": 1,
+            "title": "Sandbox Name",
+            "type": "string"
+          },
+          "session_id": {
+            "maxLength": 255,
+            "minLength": 1,
+            "title": "Session Id",
+            "type": "string"
+          },
+          "thread_key": {
+            "maxLength": 1024,
+            "minLength": 1,
+            "title": "Thread Key",
+            "type": "string"
+          },
+          "ttl_s": {
+            "default": 3600,
+            "maximum": 3600.0,
+            "minimum": 1.0,
+            "title": "Ttl S",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "agent_id",
+          "thread_key",
+          "event_id",
+          "owner",
+          "deployment_id",
+          "session_id",
+          "sandbox_name",
+          "route_generation"
+        ],
+        "title": "Context",
         "type": "object"
       },
       "CostReport": {
@@ -6690,6 +7137,66 @@
         "title": "FactoryWake",
         "type": "object"
       },
+      "FileDescriptor": {
+        "additionalProperties": false,
+        "properties": {
+          "current": {
+            "title": "Current",
+            "type": "boolean"
+          },
+          "id": {
+            "title": "Id",
+            "type": "string"
+          },
+          "mime_type": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Mime Type"
+          },
+          "name": {
+            "title": "Name",
+            "type": "string"
+          },
+          "sha256": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Sha256"
+          },
+          "size_bytes": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Size Bytes"
+          }
+        },
+        "required": [
+          "id",
+          "name",
+          "mime_type",
+          "size_bytes",
+          "sha256",
+          "current"
+        ],
+        "title": "FileDescriptor",
+        "type": "object"
+      },
       "FinishBody": {
         "properties": {
           "cause": {
@@ -7108,7 +7615,8 @@
                   "hook_paused",
                   "live_session",
                   "enqueue_failed",
-                  "claim_expired"
+                  "claim_expired",
+                  "identity_refused"
                 ],
                 "type": "string"
               },
@@ -7669,6 +8177,32 @@
           }
         },
         "title": "ListedTargets",
+        "type": "object"
+      },
+      "Listing": {
+        "additionalProperties": false,
+        "properties": {
+          "cursor": {
+            "anyOf": [
+              {
+                "maxLength": 36,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Cursor"
+          },
+          "limit": {
+            "default": 50,
+            "maximum": 100.0,
+            "minimum": 1.0,
+            "title": "Limit",
+            "type": "integer"
+          }
+        },
+        "title": "Listing",
         "type": "object"
       },
       "LoadPackConfig": {
@@ -8260,6 +8794,42 @@
         "title": "ObservationNode",
         "type": "object"
       },
+      "Owner": {
+        "additionalProperties": false,
+        "properties": {
+          "agent_id": {
+            "format": "uuid",
+            "title": "Agent Id",
+            "type": "string"
+          },
+          "event_id": {
+            "maxLength": 512,
+            "minLength": 1,
+            "title": "Event Id",
+            "type": "string"
+          },
+          "owner": {
+            "maxLength": 255,
+            "minLength": 1,
+            "title": "Owner",
+            "type": "string"
+          },
+          "thread_key": {
+            "maxLength": 1024,
+            "minLength": 1,
+            "title": "Thread Key",
+            "type": "string"
+          }
+        },
+        "required": [
+          "agent_id",
+          "thread_key",
+          "event_id",
+          "owner"
+        ],
+        "title": "Owner",
+        "type": "object"
+      },
       "OwnerLostBody": {
         "properties": {
           "owner": {
@@ -8278,6 +8848,35 @@
           "runtime_epoch"
         ],
         "title": "OwnerLostBody",
+        "type": "object"
+      },
+      "Page": {
+        "additionalProperties": false,
+        "properties": {
+          "files": {
+            "items": {
+              "$ref": "#/components/schemas/FileDescriptor"
+            },
+            "title": "Files",
+            "type": "array"
+          },
+          "next_cursor": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Next Cursor"
+          }
+        },
+        "required": [
+          "files",
+          "next_cursor"
+        ],
+        "title": "Page",
         "type": "object"
       },
       "PhaseDeclaration": {
@@ -8391,6 +8990,25 @@
           "status"
         ],
         "title": "PrincipalOut",
+        "type": "object"
+      },
+      "PrincipalRef": {
+        "description": "Initiating principal provenance. @spec INITIATING-PRINCIPAL-1",
+        "properties": {
+          "authorization_version": {
+            "title": "Authorization Version",
+            "type": "integer"
+          },
+          "principal_id": {
+            "title": "Principal Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "principal_id",
+          "authorization_version"
+        ],
+        "title": "PrincipalRef",
         "type": "object"
       },
       "PrincipalResolutionOut": {
@@ -9946,7 +10564,7 @@
         "type": "object"
       },
       "QueuedTurn": {
-        "description": "A normalized inbound turn ready for the worker to route and run.\n\nThe channel-neutral promotion of the dispatcher's former ``QueuedSlackEvent``.\nThe Valkey Stream carries this model as a single ``payload`` JSON field; the\nstream-encoding helpers live with the producer (the dispatcher), not on this\nfrozen model, so the contract stays transport-agnostic.\n\n``source`` defaults to ``SLACK`` so a pre-upgrade producer that does not set\nit still decodes, which is what makes this addition a PATCH under this\npackage's change-class table rather than a breaking minor. The default is a\ncompatibility affordance and not a licence to omit it: every first-party mint\nsite sets it explicitly, exactly as ``ReplyHandle.adapter`` does. Defaulting\nto the non-job value is also the safe direction -- an unset ``source`` reads\nas a person's message, so a job can never be created by omission.\n\n``attachments`` defaults to the EMPTY LIST for the same reason and with the\nsame consequence: a pre-upgrade producer that omits the key still decodes,\nwhich is what makes adding it a PATCH under this package's change-class table\nrather than a breaking minor. The default is a compatibility affordance and\nnot a licence to omit it -- every first-party mint site that can see files\npasses them explicitly, exactly as ``source`` and ``ReplyHandle.adapter`` are\nset explicitly. The default is the empty collection and not ``None`` so a\nconsumer can write ``for ref in turn.attachments`` with no guard; \"this\nchannel reported no files\" and \"this producer predates the field\" are\ndeliberately the same value, because nothing downstream acts differently on\nthe two.\n\n``hook_run`` carries the scheduled hook identity when a hook produced the\nturn. It defaults to ``None`` so ordinary turns and pre-upgrade producers keep\ndecoding unchanged.\n\n``reply_handle`` is absent only for a targetless cron turn. That turn must\ncarry a complete, nonblank ``hook_run`` so the worker has explicit agent and\nscheduled run identity without inventing a reply route. Every targeted turn,\nincluding cron, keeps the existing reply handle contract unchanged.\n\n``tool_access`` asks for this one turn to be restricted (TOOL-ACCESS-1);\na worker implementing TOOL-ACCESS-6 forwards it as ``Event.tool_access``,\nand one that does not drops it. It defaults to ``None``, today's\nunrestricted turn, so a pre-upgrade producer keeps decoding unchanged. No\nfirst-party ingress sets it.",
+        "description": "A normalized inbound turn ready for the worker to route and run.\n\nThe channel-neutral promotion of the dispatcher's former ``QueuedSlackEvent``.\nThe Valkey Stream carries this model as a single ``payload`` JSON field; the\nstream-encoding helpers live with the producer (the dispatcher), not on this\nfrozen model, so the contract stays transport-agnostic.\n\n``source`` defaults to ``SLACK`` so a pre-upgrade producer that does not set\nit still decodes, which is what makes this addition a PATCH under this\npackage's change-class table rather than a breaking minor. The default is a\ncompatibility affordance and not a licence to omit it: every first-party mint\nsite sets it explicitly, exactly as ``ReplyHandle.adapter`` does. Defaulting\nto the non-job value is also the safe direction -- an unset ``source`` reads\nas a person's message, so a job can never be created by omission.\n\n``attachments`` defaults to the EMPTY LIST for the same reason and with the\nsame consequence: a pre-upgrade producer that omits the key still decodes,\nwhich is what makes adding it a PATCH under this package's change-class table\nrather than a breaking minor. The default is a compatibility affordance and\nnot a licence to omit it -- every first-party mint site that can see files\npasses them explicitly, exactly as ``source`` and ``ReplyHandle.adapter`` are\nset explicitly. The default is the empty collection and not ``None`` so a\nconsumer can write ``for ref in turn.attachments`` with no guard; \"this\nchannel reported no files\" and \"this producer predates the field\" are\ndeliberately the same value, because nothing downstream acts differently on\nthe two.\n\n``hook_run`` carries the scheduled hook identity when a hook produced the\nturn. It defaults to ``None`` so ordinary turns and pre-upgrade producers keep\ndecoding unchanged.\n\n``reply_handle`` is absent only for a targetless cron turn. That turn must\ncarry a complete, nonblank ``hook_run`` so the worker has explicit agent and\nscheduled run identity without inventing a reply route. Every targeted turn,\nincluding cron, keeps the existing reply handle contract unchanged.\n\n``tool_access`` asks for this one turn to be restricted (TOOL-ACCESS-1);\na worker implementing TOOL-ACCESS-6 forwards it as ``Event.tool_access``,\nand one that does not drops it. It defaults to ``None``, today's\nunrestricted turn, so a pre-upgrade producer keeps decoding unchanged. No\nfirst-party ingress sets it.\n\n``author_principal`` is the initiating subject admission resolved ``author``\nto (INITIATING-PRINCIPAL-1). ``author`` keeps its existing meaning. The\nexecuting actor, the agent, is never this principal. This is provenance,\nnot authority: neither its presence nor its absence grants anything.",
         "properties": {
           "attachments": {
             "default": [],
@@ -9959,6 +10577,16 @@
           "author": {
             "title": "Author",
             "type": "string"
+          },
+          "author_principal": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/PrincipalRef"
+              },
+              {
+                "type": "null"
+              }
+            ]
           },
           "conversation_id": {
             "title": "Conversation Id",
@@ -10051,6 +10679,1103 @@
           "pointer"
         ],
         "title": "ReadArguments",
+        "type": "object"
+      },
+      "RecoveryAcknowledged": {
+        "additionalProperties": false,
+        "properties": {
+          "released": {
+            "default": true,
+            "title": "Released",
+            "type": "boolean"
+          }
+        },
+        "title": "RecoveryAcknowledged",
+        "type": "object"
+      },
+      "RecoveryAcquireReader": {
+        "additionalProperties": false,
+        "properties": {
+          "checkpoint_id": {
+            "format": "uuid",
+            "title": "Checkpoint Id",
+            "type": "string"
+          },
+          "holder_id": {
+            "maxLength": 256,
+            "minLength": 1,
+            "pattern": "\\S",
+            "title": "Holder Id",
+            "type": "string"
+          },
+          "work_item_id": {
+            "format": "uuid",
+            "title": "Work Item Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "work_item_id",
+          "checkpoint_id",
+          "holder_id"
+        ],
+        "title": "RecoveryAcquireReader",
+        "type": "object"
+      },
+      "RecoveryCaptureAuthority": {
+        "additionalProperties": false,
+        "properties": {
+          "dispatch_generation": {
+            "maximum": 9.223372036854776e+18,
+            "minimum": 1.0,
+            "title": "Dispatch Generation",
+            "type": "integer"
+          },
+          "runtime_epoch": {
+            "maximum": 9.223372036854776e+18,
+            "minimum": 1.0,
+            "title": "Runtime Epoch",
+            "type": "integer"
+          },
+          "source_request_id": {
+            "format": "uuid",
+            "title": "Source Request Id",
+            "type": "string"
+          },
+          "work_item_id": {
+            "format": "uuid",
+            "title": "Work Item Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "work_item_id",
+          "source_request_id",
+          "runtime_epoch",
+          "dispatch_generation"
+        ],
+        "title": "RecoveryCaptureAuthority",
+        "type": "object"
+      },
+      "RecoveryCaptureContext": {
+        "additionalProperties": false,
+        "properties": {
+          "base_commit": {
+            "title": "Base Commit",
+            "type": "string"
+          },
+          "repository": {
+            "$ref": "#/components/schemas/RecoveryRepository"
+          },
+          "target_branch": {
+            "title": "Target Branch",
+            "type": "string"
+          }
+        },
+        "required": [
+          "repository",
+          "base_commit",
+          "target_branch"
+        ],
+        "title": "RecoveryCaptureContext",
+        "type": "object"
+      },
+      "RecoveryCaptureFailure": {
+        "additionalProperties": false,
+        "properties": {
+          "checkpoint_id": {
+            "format": "uuid",
+            "title": "Checkpoint Id",
+            "type": "string"
+          },
+          "status": {
+            "default": "tombstoned",
+            "enum": [
+              "tombstoned",
+              "retracted"
+            ],
+            "title": "Status",
+            "type": "string"
+          }
+        },
+        "required": [
+          "checkpoint_id"
+        ],
+        "title": "RecoveryCaptureFailure",
+        "type": "object"
+      },
+      "RecoveryClaimCollection": {
+        "additionalProperties": false,
+        "properties": {
+          "collector_id": {
+            "maxLength": 256,
+            "minLength": 1,
+            "pattern": "\\S",
+            "title": "Collector Id",
+            "type": "string"
+          },
+          "limit": {
+            "default": 100,
+            "maximum": 100.0,
+            "minimum": 1.0,
+            "title": "Limit",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "collector_id"
+        ],
+        "title": "RecoveryClaimCollection",
+        "type": "object"
+      },
+      "RecoveryCollectionClaim": {
+        "additionalProperties": false,
+        "properties": {
+          "claim_id": {
+            "format": "uuid",
+            "title": "Claim Id",
+            "type": "string"
+          },
+          "claimed_until": {
+            "format": "date-time",
+            "title": "Claimed Until",
+            "type": "string"
+          },
+          "key": {
+            "title": "Key",
+            "type": "string"
+          },
+          "object_id": {
+            "format": "uuid",
+            "title": "Object Id",
+            "type": "string"
+          },
+          "version": {
+            "title": "Version",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "object_id",
+          "key",
+          "claim_id",
+          "version",
+          "claimed_until"
+        ],
+        "title": "RecoveryCollectionClaim",
+        "type": "object"
+      },
+      "RecoveryCollectionClaims": {
+        "additionalProperties": false,
+        "properties": {
+          "claims": {
+            "items": {
+              "$ref": "#/components/schemas/RecoveryCollectionClaim"
+            },
+            "title": "Claims",
+            "type": "array"
+          }
+        },
+        "required": [
+          "claims"
+        ],
+        "title": "RecoveryCollectionClaims",
+        "type": "object"
+      },
+      "RecoveryComplete": {
+        "additionalProperties": false,
+        "properties": {
+          "checkpoint_id": {
+            "format": "uuid",
+            "title": "Checkpoint Id",
+            "type": "string"
+          },
+          "dispatch_generation": {
+            "maximum": 9.223372036854776e+18,
+            "minimum": 1.0,
+            "title": "Dispatch Generation",
+            "type": "integer"
+          },
+          "receipts": {
+            "items": {
+              "$ref": "#/components/schemas/RecoveryObjectReceipt"
+            },
+            "maxItems": 3,
+            "minItems": 1,
+            "title": "Receipts",
+            "type": "array"
+          },
+          "runtime_epoch": {
+            "maximum": 9.223372036854776e+18,
+            "minimum": 1.0,
+            "title": "Runtime Epoch",
+            "type": "integer"
+          },
+          "source_request_id": {
+            "format": "uuid",
+            "title": "Source Request Id",
+            "type": "string"
+          },
+          "work_item_id": {
+            "format": "uuid",
+            "title": "Work Item Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "work_item_id",
+          "source_request_id",
+          "runtime_epoch",
+          "dispatch_generation",
+          "checkpoint_id",
+          "receipts"
+        ],
+        "title": "RecoveryComplete",
+        "type": "object"
+      },
+      "RecoveryCompletion": {
+        "additionalProperties": false,
+        "properties": {
+          "checkpoint_id": {
+            "format": "uuid",
+            "title": "Checkpoint Id",
+            "type": "string"
+          },
+          "completed_at": {
+            "format": "date-time",
+            "title": "Completed At",
+            "type": "string"
+          },
+          "expires_at": {
+            "format": "date-time",
+            "title": "Expires At",
+            "type": "string"
+          },
+          "status": {
+            "const": "complete",
+            "default": "complete",
+            "title": "Status",
+            "type": "string"
+          }
+        },
+        "required": [
+          "checkpoint_id",
+          "completed_at",
+          "expires_at"
+        ],
+        "title": "RecoveryCompletion",
+        "type": "object"
+      },
+      "RecoveryFail": {
+        "additionalProperties": false,
+        "properties": {
+          "checkpoint_id": {
+            "format": "uuid",
+            "title": "Checkpoint Id",
+            "type": "string"
+          },
+          "dispatch_generation": {
+            "maximum": 9.223372036854776e+18,
+            "minimum": 1.0,
+            "title": "Dispatch Generation",
+            "type": "integer"
+          },
+          "reason": {
+            "enum": [
+              "upload_failed",
+              "capture_failed",
+              "capture_timeout",
+              "torn_capture",
+              "lease_lost"
+            ],
+            "title": "Reason",
+            "type": "string"
+          },
+          "retract": {
+            "default": false,
+            "title": "Retract",
+            "type": "boolean"
+          },
+          "runtime_epoch": {
+            "maximum": 9.223372036854776e+18,
+            "minimum": 1.0,
+            "title": "Runtime Epoch",
+            "type": "integer"
+          },
+          "source_request_id": {
+            "format": "uuid",
+            "title": "Source Request Id",
+            "type": "string"
+          },
+          "work_item_id": {
+            "format": "uuid",
+            "title": "Work Item Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "work_item_id",
+          "source_request_id",
+          "runtime_epoch",
+          "dispatch_generation",
+          "checkpoint_id",
+          "reason"
+        ],
+        "title": "RecoveryFail",
+        "type": "object"
+      },
+      "RecoveryFinalizeCollection": {
+        "additionalProperties": false,
+        "properties": {
+          "claim_id": {
+            "format": "uuid",
+            "title": "Claim Id",
+            "type": "string"
+          },
+          "collector_id": {
+            "maxLength": 256,
+            "minLength": 1,
+            "pattern": "\\S",
+            "title": "Collector Id",
+            "type": "string"
+          },
+          "object_id": {
+            "format": "uuid",
+            "title": "Object Id",
+            "type": "string"
+          },
+          "version": {
+            "maximum": 9.223372036854776e+18,
+            "minimum": 1.0,
+            "title": "Version",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "collector_id",
+          "object_id",
+          "claim_id",
+          "version"
+        ],
+        "title": "RecoveryFinalizeCollection",
+        "type": "object"
+      },
+      "RecoveryFinalized": {
+        "additionalProperties": false,
+        "properties": {
+          "finalized": {
+            "default": true,
+            "title": "Finalized",
+            "type": "boolean"
+          }
+        },
+        "title": "RecoveryFinalized",
+        "type": "object"
+      },
+      "RecoveryObjectDeclaration": {
+        "additionalProperties": false,
+        "properties": {
+          "kind": {
+            "enum": [
+              "base",
+              "patch",
+              "manifest"
+            ],
+            "title": "Kind",
+            "type": "string"
+          },
+          "sha256": {
+            "pattern": "^[0-9a-f]{64}$",
+            "title": "Sha256",
+            "type": "string"
+          },
+          "size_bytes": {
+            "maximum": 9.223372036854776e+18,
+            "minimum": 0.0,
+            "title": "Size Bytes",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "kind",
+          "size_bytes",
+          "sha256"
+        ],
+        "title": "RecoveryObjectDeclaration",
+        "type": "object"
+      },
+      "RecoveryObjectReceipt": {
+        "additionalProperties": false,
+        "properties": {
+          "key": {
+            "maxLength": 512,
+            "minLength": 1,
+            "title": "Key",
+            "type": "string"
+          },
+          "kind": {
+            "enum": [
+              "base",
+              "patch",
+              "manifest"
+            ],
+            "title": "Kind",
+            "type": "string"
+          },
+          "sha256": {
+            "pattern": "^[0-9a-f]{64}$",
+            "title": "Sha256",
+            "type": "string"
+          },
+          "size_bytes": {
+            "maximum": 9.223372036854776e+18,
+            "minimum": 0.0,
+            "title": "Size Bytes",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "kind",
+          "size_bytes",
+          "sha256",
+          "key"
+        ],
+        "title": "RecoveryObjectReceipt",
+        "type": "object"
+      },
+      "RecoveryOutcome": {
+        "additionalProperties": false,
+        "properties": {
+          "dispatch_generation": {
+            "maximum": 9.223372036854776e+18,
+            "minimum": 1.0,
+            "title": "Dispatch Generation",
+            "type": "integer"
+          },
+          "reason": {
+            "enum": [
+              "torn_capture",
+              "capture_timeout",
+              "capture_failed",
+              "runner_unavailable",
+              "patch_too_large",
+              "manifest_too_large",
+              "base_mismatch"
+            ],
+            "title": "Reason",
+            "type": "string"
+          },
+          "runtime_epoch": {
+            "maximum": 9.223372036854776e+18,
+            "minimum": 1.0,
+            "title": "Runtime Epoch",
+            "type": "integer"
+          },
+          "source_request_id": {
+            "format": "uuid",
+            "title": "Source Request Id",
+            "type": "string"
+          },
+          "work_item_id": {
+            "format": "uuid",
+            "title": "Work Item Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "work_item_id",
+          "source_request_id",
+          "runtime_epoch",
+          "dispatch_generation",
+          "reason"
+        ],
+        "title": "RecoveryOutcome",
+        "type": "object"
+      },
+      "RecoveryOutcomeRecorded": {
+        "additionalProperties": false,
+        "properties": {
+          "recorded": {
+            "title": "Recorded",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "recorded"
+        ],
+        "title": "RecoveryOutcomeRecorded",
+        "type": "object"
+      },
+      "RecoveryPublicCheckpoint": {
+        "additionalProperties": false,
+        "properties": {
+          "age_seconds": {
+            "minimum": 0.0,
+            "title": "Age Seconds",
+            "type": "number"
+          },
+          "available": {
+            "title": "Available",
+            "type": "boolean"
+          },
+          "base_commit": {
+            "pattern": "^(?:[0-9a-f]{40}|[0-9a-f]{64})$",
+            "title": "Base Commit",
+            "type": "string"
+          },
+          "checkpoint_id": {
+            "format": "uuid",
+            "title": "Checkpoint Id",
+            "type": "string"
+          },
+          "completed_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Completed At"
+          },
+          "expires_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Expires At"
+          },
+          "objects": {
+            "items": {
+              "$ref": "#/components/schemas/RecoveryPublicObject"
+            },
+            "maxItems": 3,
+            "title": "Objects",
+            "type": "array"
+          },
+          "repository": {
+            "$ref": "#/components/schemas/RecoveryRepository"
+          },
+          "source_request_id": {
+            "format": "uuid",
+            "title": "Source Request Id",
+            "type": "string"
+          },
+          "source_sequence": {
+            "maximum": 9.223372036854776e+18,
+            "minimum": 1.0,
+            "title": "Source Sequence",
+            "type": "integer"
+          },
+          "source_status": {
+            "maxLength": 256,
+            "minLength": 1,
+            "pattern": "\\S",
+            "title": "Source Status",
+            "type": "string"
+          },
+          "status": {
+            "enum": [
+              "staging",
+              "complete",
+              "tombstoned"
+            ],
+            "title": "Status",
+            "type": "string"
+          },
+          "target_branch": {
+            "maxLength": 1024,
+            "minLength": 1,
+            "pattern": "\\S",
+            "title": "Target Branch",
+            "type": "string"
+          },
+          "total_bytes": {
+            "minimum": 0.0,
+            "title": "Total Bytes",
+            "type": "integer"
+          },
+          "work_item_id": {
+            "format": "uuid",
+            "title": "Work Item Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "checkpoint_id",
+          "work_item_id",
+          "source_request_id",
+          "repository",
+          "base_commit",
+          "target_branch",
+          "source_sequence",
+          "source_status",
+          "completed_at",
+          "expires_at",
+          "age_seconds",
+          "status",
+          "available",
+          "total_bytes",
+          "objects"
+        ],
+        "title": "RecoveryPublicCheckpoint",
+        "type": "object"
+      },
+      "RecoveryPublicList": {
+        "additionalProperties": false,
+        "properties": {
+          "capture_outcome": {
+            "anyOf": [
+              {
+                "maxLength": 256,
+                "minLength": 1,
+                "pattern": "\\S",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Capture Outcome"
+          },
+          "capture_outcome_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Capture Outcome At"
+          },
+          "checkpoints": {
+            "items": {
+              "$ref": "#/components/schemas/RecoveryPublicCheckpoint"
+            },
+            "maxItems": 3,
+            "title": "Checkpoints",
+            "type": "array"
+          },
+          "repository": {
+            "$ref": "#/components/schemas/RecoveryRepository"
+          },
+          "work_item_id": {
+            "format": "uuid",
+            "title": "Work Item Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "work_item_id",
+          "repository",
+          "capture_outcome",
+          "capture_outcome_at",
+          "checkpoints"
+        ],
+        "title": "RecoveryPublicList",
+        "type": "object"
+      },
+      "RecoveryPublicObject": {
+        "additionalProperties": false,
+        "properties": {
+          "kind": {
+            "enum": [
+              "base",
+              "patch",
+              "manifest"
+            ],
+            "title": "Kind",
+            "type": "string"
+          },
+          "sha256": {
+            "pattern": "^[0-9a-f]{64}$",
+            "title": "Sha256",
+            "type": "string"
+          },
+          "size_bytes": {
+            "maximum": 9.223372036854776e+18,
+            "minimum": 0.0,
+            "title": "Size Bytes",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "kind",
+          "size_bytes",
+          "sha256"
+        ],
+        "title": "RecoveryPublicObject",
+        "type": "object"
+      },
+      "RecoveryReader": {
+        "additionalProperties": false,
+        "properties": {
+          "checkpoint_id": {
+            "format": "uuid",
+            "title": "Checkpoint Id",
+            "type": "string"
+          },
+          "expires_at": {
+            "format": "date-time",
+            "title": "Expires At",
+            "type": "string"
+          },
+          "holder_id": {
+            "title": "Holder Id",
+            "type": "string"
+          },
+          "lease_id": {
+            "format": "uuid",
+            "title": "Lease Id",
+            "type": "string"
+          },
+          "objects": {
+            "items": {
+              "$ref": "#/components/schemas/RecoveryObjectReceipt"
+            },
+            "title": "Objects",
+            "type": "array"
+          }
+        },
+        "required": [
+          "lease_id",
+          "checkpoint_id",
+          "holder_id",
+          "expires_at",
+          "objects"
+        ],
+        "title": "RecoveryReader",
+        "type": "object"
+      },
+      "RecoveryReleaseReader": {
+        "additionalProperties": false,
+        "properties": {
+          "holder_id": {
+            "maxLength": 256,
+            "minLength": 1,
+            "pattern": "\\S",
+            "title": "Holder Id",
+            "type": "string"
+          },
+          "lease_id": {
+            "format": "uuid",
+            "title": "Lease Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "lease_id",
+          "holder_id"
+        ],
+        "title": "RecoveryReleaseReader",
+        "type": "object"
+      },
+      "RecoveryRepository": {
+        "additionalProperties": false,
+        "properties": {
+          "host": {
+            "maxLength": 256,
+            "minLength": 1,
+            "pattern": "\\S",
+            "title": "Host",
+            "type": "string"
+          },
+          "path": {
+            "maxLength": 2048,
+            "minLength": 1,
+            "pattern": "\\S",
+            "title": "Path",
+            "type": "string"
+          },
+          "project_id": {
+            "maxLength": 256,
+            "minLength": 1,
+            "pattern": "\\S",
+            "title": "Project Id",
+            "type": "string"
+          },
+          "provider": {
+            "maxLength": 256,
+            "minLength": 1,
+            "pattern": "\\S",
+            "title": "Provider",
+            "type": "string"
+          }
+        },
+        "required": [
+          "provider",
+          "host",
+          "project_id",
+          "path"
+        ],
+        "title": "RecoveryRepository",
+        "type": "object"
+      },
+      "RecoveryReservation": {
+        "additionalProperties": false,
+        "properties": {
+          "capture_deadline": {
+            "format": "date-time",
+            "title": "Capture Deadline",
+            "type": "string"
+          },
+          "checkpoint_id": {
+            "format": "uuid",
+            "title": "Checkpoint Id",
+            "type": "string"
+          },
+          "objects": {
+            "items": {
+              "$ref": "#/components/schemas/RecoveryObjectReceipt"
+            },
+            "title": "Objects",
+            "type": "array"
+          },
+          "replayed": {
+            "title": "Replayed",
+            "type": "boolean"
+          },
+          "staging_expires_at": {
+            "format": "date-time",
+            "title": "Staging Expires At",
+            "type": "string"
+          }
+        },
+        "required": [
+          "checkpoint_id",
+          "objects",
+          "capture_deadline",
+          "staging_expires_at",
+          "replayed"
+        ],
+        "title": "RecoveryReservation",
+        "type": "object"
+      },
+      "RecoveryReserve": {
+        "additionalProperties": false,
+        "properties": {
+          "base_archive_limit_bytes": {
+            "maximum": 9.223372036854776e+18,
+            "minimum": 1.0,
+            "title": "Base Archive Limit Bytes",
+            "type": "integer"
+          },
+          "base_commit": {
+            "pattern": "^(?:[0-9a-f]{40}|[0-9a-f]{64})$",
+            "title": "Base Commit",
+            "type": "string"
+          },
+          "capture_budget_seconds": {
+            "default": 60.0,
+            "exclusiveMinimum": 0.0,
+            "maximum": 60.0,
+            "title": "Capture Budget Seconds",
+            "type": "number"
+          },
+          "dispatch_generation": {
+            "maximum": 9.223372036854776e+18,
+            "minimum": 1.0,
+            "title": "Dispatch Generation",
+            "type": "integer"
+          },
+          "idempotency_key": {
+            "maxLength": 256,
+            "minLength": 1,
+            "pattern": "\\S",
+            "title": "Idempotency Key",
+            "type": "string"
+          },
+          "objects": {
+            "items": {
+              "$ref": "#/components/schemas/RecoveryObjectDeclaration"
+            },
+            "maxItems": 3,
+            "minItems": 2,
+            "title": "Objects",
+            "type": "array"
+          },
+          "repository": {
+            "$ref": "#/components/schemas/RecoveryRepository"
+          },
+          "runtime_epoch": {
+            "maximum": 9.223372036854776e+18,
+            "minimum": 1.0,
+            "title": "Runtime Epoch",
+            "type": "integer"
+          },
+          "source_request_id": {
+            "format": "uuid",
+            "title": "Source Request Id",
+            "type": "string"
+          },
+          "target_branch": {
+            "maxLength": 1024,
+            "minLength": 1,
+            "pattern": "\\S",
+            "title": "Target Branch",
+            "type": "string"
+          },
+          "work_item_id": {
+            "format": "uuid",
+            "title": "Work Item Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "work_item_id",
+          "source_request_id",
+          "runtime_epoch",
+          "dispatch_generation",
+          "idempotency_key",
+          "repository",
+          "base_commit",
+          "target_branch",
+          "base_archive_limit_bytes",
+          "objects"
+        ],
+        "title": "RecoveryReserve",
+        "type": "object"
+      },
+      "Reference": {
+        "additionalProperties": false,
+        "properties": {
+          "file_id": {
+            "maxLength": 512,
+            "minLength": 1,
+            "title": "File Id",
+            "type": "string"
+          },
+          "mime_type": {
+            "anyOf": [
+              {
+                "maxLength": 255,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Mime Type"
+          },
+          "name": {
+            "maxLength": 1024,
+            "minLength": 1,
+            "title": "Name",
+            "type": "string"
+          },
+          "ordinal": {
+            "maximum": 1000.0,
+            "minimum": 0.0,
+            "title": "Ordinal",
+            "type": "integer"
+          },
+          "route_adapter": {
+            "anyOf": [
+              {
+                "maxLength": 255,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Route Adapter"
+          },
+          "route_identity": {
+            "maxLength": 255,
+            "minLength": 1,
+            "title": "Route Identity",
+            "type": "string"
+          },
+          "route_kind": {
+            "maxLength": 64,
+            "minLength": 1,
+            "title": "Route Kind",
+            "type": "string"
+          },
+          "size_bytes": {
+            "anyOf": [
+              {
+                "maximum": 9.223372036854776e+18,
+                "minimum": 0.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Size Bytes"
+          }
+        },
+        "required": [
+          "file_id",
+          "ordinal",
+          "name",
+          "route_kind",
+          "route_identity"
+        ],
+        "title": "Reference",
+        "type": "object"
+      },
+      "Registered": {
+        "additionalProperties": false,
+        "properties": {
+          "appended": {
+            "title": "Appended",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "appended"
+        ],
+        "title": "Registered",
+        "type": "object"
+      },
+      "Registration": {
+        "additionalProperties": false,
+        "properties": {
+          "agent_id": {
+            "format": "uuid",
+            "title": "Agent Id",
+            "type": "string"
+          },
+          "event_id": {
+            "maxLength": 512,
+            "minLength": 1,
+            "title": "Event Id",
+            "type": "string"
+          },
+          "refs": {
+            "items": {
+              "$ref": "#/components/schemas/Reference"
+            },
+            "maxItems": 1000,
+            "title": "Refs",
+            "type": "array"
+          },
+          "thread_key": {
+            "maxLength": 1024,
+            "minLength": 1,
+            "title": "Thread Key",
+            "type": "string"
+          }
+        },
+        "required": [
+          "agent_id",
+          "thread_key",
+          "event_id",
+          "refs"
+        ],
+        "title": "Registration",
         "type": "object"
       },
       "RemediationBreakerClose": {
@@ -10807,6 +12532,55 @@
           "target"
         ],
         "title": "RemediationVerifierRunStart",
+        "type": "object"
+      },
+      "Renewal": {
+        "additionalProperties": false,
+        "properties": {
+          "agent_id": {
+            "format": "uuid",
+            "title": "Agent Id",
+            "type": "string"
+          },
+          "current_event_id": {
+            "anyOf": [
+              {
+                "maxLength": 512,
+                "minLength": 1,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Current Event Id"
+          },
+          "event_id": {
+            "maxLength": 512,
+            "minLength": 1,
+            "title": "Event Id",
+            "type": "string"
+          },
+          "owner": {
+            "maxLength": 255,
+            "minLength": 1,
+            "title": "Owner",
+            "type": "string"
+          },
+          "thread_key": {
+            "maxLength": 1024,
+            "minLength": 1,
+            "title": "Thread Key",
+            "type": "string"
+          }
+        },
+        "required": [
+          "agent_id",
+          "thread_key",
+          "event_id",
+          "owner"
+        ],
+        "title": "Renewal",
         "type": "object"
       },
       "ReplyHandle": {
@@ -11659,7 +13433,8 @@
                   "hook_paused",
                   "live_session",
                   "enqueue_failed",
-                  "claim_expired"
+                  "claim_expired",
+                  "identity_refused"
                 ],
                 "type": "string"
               },
@@ -11706,7 +13481,8 @@
                   "hook_paused",
                   "live_session",
                   "enqueue_failed",
-                  "claim_expired"
+                  "claim_expired",
+                  "identity_refused"
                 ],
                 "type": "string"
               },
@@ -11767,6 +13543,21 @@
           "schedules"
         ],
         "title": "ScheduleListOut",
+        "type": "object"
+      },
+      "Selection": {
+        "additionalProperties": false,
+        "properties": {
+          "id": {
+            "format": "uuid",
+            "title": "Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id"
+        ],
+        "title": "Selection",
         "type": "object"
       },
       "SettingConfig": {
@@ -11840,6 +13631,18 @@
         "additionalProperties": false,
         "description": "The identity-bearing fields of one Slack delivery, as the dispatcher read them.\n\nStrict, so a string ``\"false\"`` is never taken as the positive statement\n``is_ext_shared_channel: false``; extra fields are refused, so a field this\nmapping does not use cannot be sent as if it were evidence.",
         "properties": {
+          "channel_type": {
+            "anyOf": [
+              {
+                "maxLength": 256,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Channel Type"
+          },
           "delivery": {
             "maxLength": 256,
             "title": "Delivery",
@@ -11853,6 +13656,18 @@
             "maxItems": 32,
             "title": "Enterprise Ids",
             "type": "array"
+          },
+          "event_source_team": {
+            "anyOf": [
+              {
+                "maxLength": 256,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Event Source Team"
           },
           "event_team": {
             "anyOf": [
@@ -12728,6 +14543,22 @@
         "title": "ThreadResetState",
         "type": "object"
       },
+      "Ticket": {
+        "additionalProperties": false,
+        "properties": {
+          "ticket": {
+            "maxLength": 128,
+            "minLength": 32,
+            "title": "Ticket",
+            "type": "string"
+          }
+        },
+        "required": [
+          "ticket"
+        ],
+        "title": "Ticket",
+        "type": "object"
+      },
       "TipsPackConfig": {
         "description": "Rotating capability tips for one agent (mirrors behaviorpacks.TipsPack).\nSeparate from LoadPackConfig: a load line is what the agent is doing now, a\ntip advertises what it can do.",
         "properties": {
@@ -12846,6 +14677,22 @@
         "title": "TrackerIssueIn",
         "type": "object"
       },
+      "Transfer": {
+        "additionalProperties": false,
+        "properties": {
+          "transfer_id": {
+            "maxLength": 128,
+            "minLength": 32,
+            "title": "Transfer Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "transfer_id"
+        ],
+        "title": "Transfer",
+        "type": "object"
+      },
       "TurnAccepted": {
         "description": "The ingress receipt. `duplicate` says whether THIS request enqueued.\n\n`stream_id` is None only while another request holds the claim and has not\nenqueued yet (the 202 case): there is no id to hand back yet, and the\nadapter's retry loop already knows what \"come back\" means.",
         "properties": {
@@ -12856,6 +14703,17 @@
           "event_id": {
             "title": "Event Id",
             "type": "string"
+          },
+          "reply_ref": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Reply Ref"
           },
           "stream_id": {
             "anyOf": [
@@ -12875,6 +14733,173 @@
           "duplicate"
         ],
         "title": "TurnAccepted",
+        "type": "object"
+      },
+      "TurnAuthorityRequestV1": {
+        "additionalProperties": false,
+        "description": "@spec HTTP-INVOCATION-EXECUTION-16.",
+        "properties": {
+          "approval_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Approval Id"
+          },
+          "context": {
+            "title": "Context",
+            "type": "string"
+          },
+          "event_id": {
+            "maxLength": 256,
+            "minLength": 1,
+            "title": "Event Id",
+            "type": "string"
+          },
+          "payload_sha256": {
+            "title": "Payload Sha256",
+            "type": "string"
+          },
+          "request_id": {
+            "title": "Request Id",
+            "type": "string"
+          },
+          "schema_version": {
+            "const": 1,
+            "title": "Schema Version",
+            "type": "integer"
+          },
+          "scope": {
+            "$ref": "#/components/schemas/TurnAuthorityScopeV1"
+          },
+          "stage": {
+            "enum": [
+              "prepare",
+              "claim_or_resume",
+              "start",
+              "steer"
+            ],
+            "title": "Stage",
+            "type": "string"
+          }
+        },
+        "required": [
+          "schema_version",
+          "request_id",
+          "stage",
+          "context",
+          "payload_sha256",
+          "event_id",
+          "scope",
+          "approval_id"
+        ],
+        "title": "TurnAuthorityRequestV1",
+        "type": "object"
+      },
+      "TurnAuthorityResponseV1": {
+        "additionalProperties": false,
+        "description": "@spec HTTP-INVOCATION-EXECUTION-16.",
+        "properties": {
+          "context_sha256": {
+            "title": "Context Sha256",
+            "type": "string"
+          },
+          "decision": {
+            "enum": [
+              "continue",
+              "refuse",
+              "unavailable"
+            ],
+            "title": "Decision",
+            "type": "string"
+          },
+          "event_id": {
+            "maxLength": 256,
+            "minLength": 1,
+            "title": "Event Id",
+            "type": "string"
+          },
+          "reason": {
+            "enum": [
+              "current_authority",
+              "caller_not_allowed",
+              "invalid_context",
+              "unsupported_resume",
+              "authority_unavailable"
+            ],
+            "title": "Reason",
+            "type": "string"
+          },
+          "request_id": {
+            "title": "Request Id",
+            "type": "string"
+          },
+          "schema_version": {
+            "const": 1,
+            "title": "Schema Version",
+            "type": "integer"
+          },
+          "scope": {
+            "$ref": "#/components/schemas/TurnAuthorityScopeV1"
+          },
+          "stage": {
+            "enum": [
+              "prepare",
+              "claim_or_resume",
+              "start",
+              "steer"
+            ],
+            "title": "Stage",
+            "type": "string"
+          }
+        },
+        "required": [
+          "schema_version",
+          "request_id",
+          "stage",
+          "event_id",
+          "context_sha256",
+          "scope",
+          "decision",
+          "reason"
+        ],
+        "title": "TurnAuthorityResponseV1",
+        "type": "object"
+      },
+      "TurnAuthorityScopeV1": {
+        "additionalProperties": false,
+        "description": "@spec HTTP-INVOCATION-EXECUTION-16.",
+        "properties": {
+          "agent_id": {
+            "title": "Agent Id",
+            "type": "string"
+          },
+          "binding_generation": {
+            "maximum": 9.223372036854776e+18,
+            "minimum": 0.0,
+            "title": "Binding Generation",
+            "type": "integer"
+          },
+          "binding_id": {
+            "title": "Binding Id",
+            "type": "string"
+          },
+          "tenant_id": {
+            "title": "Tenant Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "tenant_id",
+          "agent_id",
+          "binding_id",
+          "binding_generation"
+        ],
+        "title": "TurnAuthorityScopeV1",
         "type": "object"
       },
       "TurnProgressBody": {
@@ -13953,7 +15978,6 @@
           "estimated_cost_usd": {
             "anyOf": [
               {
-                "pattern": "^(?!^[-+.]*$)[+-]?0*\\d*\\.?\\d*$",
                 "type": "string"
               },
               {
@@ -14002,7 +16026,6 @@
           "estimated_cost_usd": {
             "anyOf": [
               {
-                "pattern": "^(?!^[-+.]*$)[+-]?0*\\d*\\.?\\d*$",
                 "type": "string"
               },
               {
@@ -14113,7 +16136,6 @@
           "estimated_cost_usd": {
             "anyOf": [
               {
-                "pattern": "^(?!^[-+.]*$)[+-]?0*\\d*\\.?\\d*$",
                 "type": "string"
               },
               {
@@ -14150,7 +16172,6 @@
           "estimated_cost_usd": {
             "anyOf": [
               {
-                "pattern": "^(?!^[-+.]*$)[+-]?0*\\d*\\.?\\d*$",
                 "type": "string"
               },
               {
@@ -21530,6 +23551,240 @@
         ]
       }
     },
+    "/attachment-access/authorize": {
+      "post": {
+        "operationId": "authorize_attachment_access_authorize_post",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "X-Curie-Attachment-Access",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Curie-Attachment-Access"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/Selection"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/FileDescriptor"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Authorize",
+        "tags": [
+          "attachment-access"
+        ]
+      }
+    },
+    "/attachment-access/completion": {
+      "post": {
+        "operationId": "completion_attachment_access_completion_post",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "X-Curie-Attachment-Access",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Curie-Attachment-Access"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/Transfer"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Completion"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Completion",
+        "tags": [
+          "attachment-access"
+        ]
+      }
+    },
+    "/attachment-access/fetch": {
+      "post": {
+        "operationId": "fetch_attachment_access_fetch_post",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "X-Curie-Attachment-Access",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Curie-Attachment-Access"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/Selection"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Fetch",
+        "tags": [
+          "attachment-access"
+        ]
+      }
+    },
+    "/attachment-access/list": {
+      "post": {
+        "operationId": "list_files_attachment_access_list_post",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "X-Curie-Attachment-Access",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Curie-Attachment-Access"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/Listing"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Page"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "List Files",
+        "tags": [
+          "attachment-access"
+        ]
+      }
+    },
     "/channel-canvas": {
       "post": {
         "operationId": "channel_canvas_channel_canvas_post",
@@ -22166,6 +24421,22 @@
                 }
               ],
               "title": "X-Api-Key"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-curie-receiver-proof",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Curie-Receiver-Proof"
             }
           }
         ],
@@ -26567,6 +28838,362 @@
         ]
       }
     },
+    "/v1/internal/attachment-access/complete": {
+      "post": {
+        "operationId": "complete_v1_internal_attachment_access_complete_post",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "X-Curie-Worker-Token",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Curie-Worker-Token"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/Completed"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Completion"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Complete",
+        "tags": [
+          "internal-attachment-access"
+        ]
+      }
+    },
+    "/v1/internal/attachment-access/context": {
+      "post": {
+        "operationId": "context_v1_internal_attachment_access_context_post",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "X-Curie-Worker-Token",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Curie-Worker-Token"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/Context"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Capability"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Context",
+        "tags": [
+          "internal-attachment-access"
+        ]
+      }
+    },
+    "/v1/internal/attachment-access/redeem": {
+      "post": {
+        "operationId": "redeem_v1_internal_attachment_access_redeem_post",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "X-Curie-Worker-Token",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Curie-Worker-Token"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/Ticket"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Redeem V1 Internal Attachment Access Redeem Post",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Redeem",
+        "tags": [
+          "internal-attachment-access"
+        ]
+      }
+    },
+    "/v1/internal/attachment-access/register": {
+      "post": {
+        "operationId": "register_v1_internal_attachment_access_register_post",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "X-Curie-Worker-Token",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Curie-Worker-Token"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/Registration"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Registered"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Register",
+        "tags": [
+          "internal-attachment-access"
+        ]
+      }
+    },
+    "/v1/internal/attachment-access/renew": {
+      "post": {
+        "operationId": "renew_v1_internal_attachment_access_renew_post",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "X-Curie-Worker-Token",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Curie-Worker-Token"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/Renewal"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Active"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Renew",
+        "tags": [
+          "internal-attachment-access"
+        ]
+      }
+    },
+    "/v1/internal/attachment-access/revoke": {
+      "post": {
+        "operationId": "revoke_v1_internal_attachment_access_revoke_post",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "X-Curie-Worker-Token",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Curie-Worker-Token"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/Owner"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Active"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Revoke",
+        "tags": [
+          "internal-attachment-access"
+        ]
+      }
+    },
     "/v1/internal/channel-read/context": {
       "post": {
         "operationId": "mint_channel_read_context_v1_internal_channel_read_context_post",
@@ -26835,6 +29462,246 @@
         "summary": "Verify Review",
         "tags": [
           "internal-github-reviews"
+        ]
+      }
+    },
+    "/v1/internal/identity/approval-grant/check": {
+      "post": {
+        "description": "@spec HTTP-APPROVAL-CONTINUITY-12.",
+        "operationId": "check_approval_grant_v1_internal_identity_approval_grant_check_post",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "X-Curie-Worker-Token",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Curie-Worker-Token"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ApprovalGrantAuthorityRequestV1"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApprovalGrantAuthorityResponseV1"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Check Approval Grant",
+        "tags": [
+          "internal-identity-authority"
+        ]
+      }
+    },
+    "/v1/internal/identity/approvals": {
+      "post": {
+        "description": "@spec HTTP-APPROVAL-CONTINUITY-3.",
+        "operationId": "create_identity_approval_v1_internal_identity_approvals_post",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "X-Curie-Worker-Token",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Curie-Worker-Token"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ApprovalCreationRequestV1"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApprovalCreationResponseV1"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Create Identity Approval",
+        "tags": [
+          "internal-identity-authority"
+        ]
+      }
+    },
+    "/v1/internal/identity/binding-classification/check": {
+      "post": {
+        "description": "The worker's per-identity question. Writes and grants nothing.\n\n@spec HTTP-INVOCATION-EXECUTION-22.",
+        "operationId": "check_binding_classification_v1_internal_identity_binding_classification_check_post",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "X-Curie-Worker-Token",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Curie-Worker-Token"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/BindingClassificationRequestV1"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BindingClassificationResponseV1"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Check Binding Classification",
+        "tags": [
+          "internal-identity-authority"
+        ]
+      }
+    },
+    "/v1/internal/identity/turn-authority/check": {
+      "post": {
+        "description": "@spec HTTP-INVOCATION-EXECUTION-8/16.",
+        "operationId": "check_turn_authority_v1_internal_identity_turn_authority_check_post",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "X-Curie-Worker-Token",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Curie-Worker-Token"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/TurnAuthorityRequestV1"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TurnAuthorityResponseV1"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Check Turn Authority",
+        "tags": [
+          "internal-identity-authority"
         ]
       }
     },
@@ -28990,6 +31857,537 @@
         ]
       }
     },
+    "/v1/internal/workspace-recovery/acquire-reader": {
+      "post": {
+        "operationId": "acquire_reader_v1_internal_workspace_recovery_acquire_reader_post",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "X-Curie-Worker-Token",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Curie-Worker-Token"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RecoveryAcquireReader"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RecoveryReader"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Acquire Reader",
+        "tags": [
+          "internal-workspace-recovery"
+        ]
+      }
+    },
+    "/v1/internal/workspace-recovery/claim-collection": {
+      "post": {
+        "operationId": "claim_collection_v1_internal_workspace_recovery_claim_collection_post",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "X-Curie-Worker-Token",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Curie-Worker-Token"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RecoveryClaimCollection"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RecoveryCollectionClaims"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Claim Collection",
+        "tags": [
+          "internal-workspace-recovery"
+        ]
+      }
+    },
+    "/v1/internal/workspace-recovery/complete": {
+      "post": {
+        "operationId": "complete_v1_internal_workspace_recovery_complete_post",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "X-Curie-Worker-Token",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Curie-Worker-Token"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RecoveryComplete"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RecoveryCompletion"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Complete",
+        "tags": [
+          "internal-workspace-recovery"
+        ]
+      }
+    },
+    "/v1/internal/workspace-recovery/context": {
+      "post": {
+        "operationId": "context_v1_internal_workspace_recovery_context_post",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "X-Curie-Worker-Token",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Curie-Worker-Token"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RecoveryCaptureAuthority"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RecoveryCaptureContext"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Context",
+        "tags": [
+          "internal-workspace-recovery"
+        ]
+      }
+    },
+    "/v1/internal/workspace-recovery/fail": {
+      "post": {
+        "operationId": "fail_v1_internal_workspace_recovery_fail_post",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "X-Curie-Worker-Token",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Curie-Worker-Token"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RecoveryFail"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RecoveryCaptureFailure"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Fail",
+        "tags": [
+          "internal-workspace-recovery"
+        ]
+      }
+    },
+    "/v1/internal/workspace-recovery/finalize-collection": {
+      "post": {
+        "operationId": "finalize_collection_v1_internal_workspace_recovery_finalize_collection_post",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "X-Curie-Worker-Token",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Curie-Worker-Token"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RecoveryFinalizeCollection"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RecoveryFinalized"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Finalize Collection",
+        "tags": [
+          "internal-workspace-recovery"
+        ]
+      }
+    },
+    "/v1/internal/workspace-recovery/outcome": {
+      "post": {
+        "operationId": "outcome_v1_internal_workspace_recovery_outcome_post",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "X-Curie-Worker-Token",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Curie-Worker-Token"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RecoveryOutcome"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RecoveryOutcomeRecorded"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Outcome",
+        "tags": [
+          "internal-workspace-recovery"
+        ]
+      }
+    },
+    "/v1/internal/workspace-recovery/release-reader": {
+      "post": {
+        "operationId": "release_reader_v1_internal_workspace_recovery_release_reader_post",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "X-Curie-Worker-Token",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Curie-Worker-Token"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RecoveryReleaseReader"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RecoveryAcknowledged"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Release Reader",
+        "tags": [
+          "internal-workspace-recovery"
+        ]
+      }
+    },
+    "/v1/internal/workspace-recovery/reserve": {
+      "post": {
+        "operationId": "reserve_v1_internal_workspace_recovery_reserve_post",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "X-Curie-Worker-Token",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Curie-Worker-Token"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RecoveryReserve"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RecoveryReservation"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Reserve",
+        "tags": [
+          "internal-workspace-recovery"
+        ]
+      }
+    },
     "/v1/internal/workspaces/{deployment_id}/credential": {
       "post": {
         "operationId": "redeem_workspace_credential_v1_internal_workspaces__deployment_id__credential_post",
@@ -29607,6 +33005,218 @@
         "summary": "Get Work Item",
         "tags": [
           "work-items"
+        ]
+      }
+    },
+    "/work-items/{work_item_id}/recovery": {
+      "get": {
+        "operationId": "list_checkpoints_work_items__work_item_id__recovery_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "work_item_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "Work Item Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-api-key",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Api-Key"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RecoveryPublicList"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "List Checkpoints",
+        "tags": [
+          "workspace-recovery"
+        ]
+      }
+    },
+    "/work-items/{work_item_id}/recovery/{checkpoint_id}": {
+      "get": {
+        "operationId": "checkpoint_status_work_items__work_item_id__recovery__checkpoint_id__get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "work_item_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "Work Item Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "checkpoint_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "Checkpoint Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-api-key",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Api-Key"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RecoveryPublicCheckpoint"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Checkpoint Status",
+        "tags": [
+          "workspace-recovery"
+        ]
+      }
+    },
+    "/work-items/{work_item_id}/recovery/{checkpoint_id}/objects/{kind}": {
+      "get": {
+        "operationId": "object_download_work_items__work_item_id__recovery__checkpoint_id__objects__kind__get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "work_item_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "Work Item Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "checkpoint_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "Checkpoint Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "kind",
+            "required": true,
+            "schema": {
+              "enum": [
+                "base",
+                "patch",
+                "manifest"
+              ],
+              "title": "Kind",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-api-key",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Api-Key"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/octet-stream": {
+                "schema": {
+                  "format": "binary",
+                  "type": "string"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Object Download",
+        "tags": [
+          "workspace-recovery"
         ]
       }
     },

@@ -402,14 +402,19 @@ class GitLabTracker:
         return notices
 
     async def _cancellation(self, ref: TrackerIssueRef) -> _Pending | None:
-        """A running issue that is closed, or lacks the label, is cancelled with
-        the latest close or remove event; a gone issue yields nothing."""
+        """Cancel running issues that are closed, unlabelled or no longer available."""
 
+        path = self._issue_path(ref)
         try:
-            path = self._issue_path(ref)
             issue = await self._transport.get_object(path)
         except NotFound:
-            return None
+            return _Pending(
+                ref,
+                Actor(id="system", login="system"),
+                "deleted",
+                Disposition.CANCEL,
+                datetime.now(UTC),
+            )
         if issue.get("state") == "closed":
             listed = await self._transport.list_all(f"{path}/resource_state_events")
             event = _latest([e for e in listed if e.get("state") == "closed"])

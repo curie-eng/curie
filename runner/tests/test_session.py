@@ -745,7 +745,7 @@ def test_optional_replay_export_failure_still_appends_portable_history(
     assert all("private replay token-PLACEHOLDER" not in message for message in messages)
 
 
-def test_persistence_stage_timeout_is_bounded_and_loss_stays_sticky(
+def test_persistence_stage_timeout_is_bounded_and_the_record_is_retried(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     assert session_module._HISTORY_PERSISTENCE_BUDGET_SECONDS == 15.0
@@ -778,12 +778,14 @@ def test_persistence_stage_timeout_is_bounded_and_loss_stays_sticky(
     first, second = anyio.run(go)
     assert first[-1].status is SessionStatus.DONE
     assert second[-1].status is SessionStatus.DONE
-    assert [record.user for record in store.turns] == ["second"]
+    # #5366: the timed-out append may have landed, but its record_id makes a
+    # retry safe, so it is deferred and lands ahead of the next turn's record.
+    assert [record.user for record in store.turns] == ["first", "second"]
     assert runner.turn_active is False
-    assert runner.history_durable is False
+    assert runner.history_durable is True
 
 
-def test_cancellation_during_persistence_marks_loss_without_a_terminal(caplog) -> None:
+def test_cancellation_during_persistence_keeps_the_record_without_a_terminal(caplog) -> None:
     store = _FirstBlockedTranscriptStore()
     runner, fake = _runner_with_history(store)
     first_lines: list[str] = []
@@ -822,10 +824,12 @@ def test_cancellation_during_persistence_marks_loss_without_a_terminal(caplog) -
     assert not any(isinstance(event, Final) for event in first)
     assert second[-1].status is SessionStatus.DONE
     assert sum("turn end" in record.getMessage() for record in caplog.records) == 1
-    assert [record.user for record in store.turns] == ["second"]
+    # #5366: an append cancelled after its request was sent is deferred, not
+    # lost (its record_id makes the retry safe), and lands in turn order.
+    assert [record.user for record in store.turns] == ["first", "second"]
     assert fake.interrupts == 0
     assert runner.turn_active is False
-    assert runner.history_durable is False
+    assert runner.history_durable is True
 
 
 def test_first_resumed_turn_records_cache_read_metric_once(monkeypatch) -> None:
@@ -2019,6 +2023,46 @@ def test_key_limit_403_ends_credit_exhausted_not_credential_rejected() -> None:
     # The worker maps the last ErrorEvent before the Final.
     assert errors[-1].classification == "model-credit-exhausted"
     assert "Key limit exceeded" in errors[0].message
+    assert events[-1].type == "final"
+    assert events[-1].status == SessionStatus.CLASSIFIED_FAILURE
+    assert runner.status == SessionStatus.CLASSIFIED_FAILURE
+
+
+# Observed 2026-10-29. An OpenRouter workspace daily budget refusal is HTTP 403,
+# and the SDK reports error="authentication_failed" (#5163).
+_OPENROUTER_WORKSPACE_BUDGET_403 = (
+    'API Error: 403 {"error":{"message":"Workspace daily budget of $20.00 exceeded. '
+    'Contact your org admin. $20.08 of $20.00 used; resets 2026-10-30T00:00:00.000Z.",'
+    '"code":403}}'
+)
+
+
+def test_workspace_budget_403_ends_credit_exhausted_not_credential_rejected() -> None:
+    script = [
+        AssistantMessage(
+            content=[TextBlock(text=_OPENROUTER_WORKSPACE_BUDGET_403)],
+            model="<synthetic>",
+            error="authentication_failed",
+        ),
+        ResultMessage(
+            subtype="success",
+            duration_ms=1,
+            duration_api_ms=1,
+            is_error=True,
+            num_turns=1,
+            session_id="s",
+            result=_OPENROUTER_WORKSPACE_BUDGET_403,
+        ),
+    ]
+    runner, _ = _runner(lambda: script)
+    events = _drain(runner, Event(type="message", text="go", user="U", ts="1"))
+
+    errors = [e for e in events if e.type == "error"]
+    classifications = [e.classification for e in errors]
+    assert "model-credential-rejected" not in classifications
+    # The worker maps the last ErrorEvent before the Final.
+    assert errors[-1].classification == "model-credit-exhausted"
+    assert "Workspace daily budget" in errors[0].message
     assert events[-1].type == "final"
     assert events[-1].status == SessionStatus.CLASSIFIED_FAILURE
     assert runner.status == SessionStatus.CLASSIFIED_FAILURE

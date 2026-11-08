@@ -49,7 +49,7 @@ from .factory_progress import VERIFICATION_PREFLIGHT_PHASE, PhaseView, phase_vie
 from .factory_reply_target import stored_reply_target
 from .factory_usage import format_usd, usage_line, work_item_usage
 from .forges.capabilities import Operation, Support
-from .forges.errors import ForgeError, Unauthorized
+from .forges.errors import ForgeError, NotFound, Unauthorized
 from .forges.github.comments import static_token
 from .forges.github.marked_comments import (
     GitHubCalls,
@@ -69,6 +69,7 @@ from .github_app import GitHubAppError, GitHubInstallationRefused
 from .models import (
     ExecutionRequest,
     ExecutionRequestPhaseReport,
+    FactoryBaseTransition,
     FactoryStatusComment,
     Publication,
     ThreadPublicationLineage,
@@ -144,10 +145,11 @@ _CAUSE_TEXT = {
         "the existing pull request is unchanged because this revision published nothing."
     ),
     "execution_deadline": "the run did not finish before its deadline.",
-    "capacity_wait_expired": "no runner capacity came free before the wait expired.",
+    "capacity_wait_expired": "sandbox admission did not complete before the wait expired.",
     "start_failed": "the sandbox did not start.",
     "owner_lost": "the worker running this request stopped responding.",
     "issue_cancelled": "the request was cancelled.",
+    "issue_deleted": "the tracker issue no longer exists.",
     "publication_denied": "a person denied the request to open the pull request.",
     "publication_expired": (
         "the request to open the pull request expired before anyone approved it."
@@ -268,7 +270,9 @@ def code_span(value: str) -> str:
     return f"{fence}{padded}{fence}"
 
 
-def render_base_line(work_item: WorkItem) -> str | None:
+def render_base_line(
+    work_item: WorkItem, transition: FactoryBaseTransition | None = None
+) -> str | None:
     """The status comment's ``Base:`` line (ADR 0186), or None on a legacy row."""
 
     if work_item.base_branch is None:
@@ -280,10 +284,27 @@ def render_base_line(work_item: WorkItem) -> str | None:
         )
     else:
         line = f"Base: {code_span(work_item.base_branch)} (deployment default)"
-    if work_item.base_label_ignored is not None:
+    if transition is not None and transition.phase != "applied":
+        line += f" Requested base: {code_span(transition.target_base_ref)}; "
+        if transition.phase in {"conflict", "refused"}:
+            line += f"base change refused ({transition.error_code or transition.phase})."
+            if (
+                work_item.base_requested_branch is not None
+                and work_item.base_requested_branch != transition.target_base_ref
+            ):
+                line += (
+                    f" Current requested base: {code_span(work_item.base_requested_branch)}; "
+                    "apply the factory label again to retry."
+                )
+        else:
+            line += f"base change pending ({transition.phase})."
+    elif (
+        work_item.base_requested_branch is not None
+        and work_item.base_requested_branch != work_item.base_branch
+    ):
         line += (
-            f" Label now says {code_span('base:' + work_item.base_label_ignored)};"
-            " the recorded base is kept."
+            f" Requested base: {code_span(work_item.base_requested_branch)}; "
+            "waiting for a fresh execution on the requested base."
         )
     return line
 
@@ -291,9 +312,9 @@ def render_base_line(work_item: WorkItem) -> str | None:
 async def mark_status_comment_stale(session: AsyncSession, work_item_id: uuid.UUID) -> None:
     """Let the reconciler edit the latest status comment once more.
 
-    Its body carries the ignored-label note, so a change to that note must reach
-    a comment that was already finalized. A sync holding the lease is flagged so
-    its writeback leaves the row due. The comment re-finalizes after the edit.
+    A selected or requested base change must reach a comment that was already
+    finalized. A sync holding the lease is flagged so its writeback leaves the
+    row due. The comment re-finalizes after the edit.
     """
 
     latest = (
@@ -892,12 +913,26 @@ async def _release_sync_claim(
         await session.commit()
 
 
+def _skip_missing_comment(row: FactoryStatusComment, now: datetime) -> None:
+    row.applied_label = ""
+    if row.posted_at is not None:
+        row.finalized_at = now
+    else:
+        row.refusal = (
+            "issue_deleted" if row.terminal_cause == "issue_deleted" else "recipient_missing"
+        )
+        row.refused_at = now
+
+
 async def _sync_one(
     client: httpx.AsyncClient,
     settings: Settings,
     claim: _StatusClaim,
 ) -> int:
     row = claim.row
+    if row.terminal_cause == "issue_deleted":
+        _skip_missing_comment(row, claim.now)
+        return 0
     if claim.tracker_issue.kind != GITHUB:
         return await _sync_through_ports(client, settings, claim)
     if claim.code_host_installation_id is None:
@@ -991,6 +1026,9 @@ async def _sync_port_comment(tracker: Tracker, code_host: CodeHost, claim: _Stat
         result = await comments_for(target, tracker, code_host).upsert_marked(
             target, status_marker(row.execution_request_id), body
         )
+    except NotFound:
+        _skip_missing_comment(row, now)
+        return 0
     except Unauthorized:
         row.comment_id = None
         row.posted_at = None
@@ -1243,6 +1281,14 @@ async def _render(
     elif request.status in {"waiting", "running", "cancellation_requested"} and pending_count:
         word = "revision" if pending_count == 1 else "revisions"
         waiting_line = f"{pending_count} {word} waiting on this run."
+    transition = await session.scalar(
+        select(FactoryBaseTransition)
+        .where(
+            FactoryBaseTransition.work_item_id == work_item.id,
+        )
+        .order_by(FactoryBaseTransition.committer_time.desc())
+        .limit(1)
+    )
     base = forges_registry(settings).card_base_url
     body = status_body(
         request_id=row.execution_request_id,
@@ -1252,7 +1298,7 @@ async def _render(
         result=result,
         paused_for_upgrade=paused_for_upgrade,
         waiting_line=waiting_line,
-        base_line=render_base_line(work_item),
+        base_line=render_base_line(work_item, transition),
     )
     if (
         request.status in {"queued", "waiting", "running", "cancellation_requested"}

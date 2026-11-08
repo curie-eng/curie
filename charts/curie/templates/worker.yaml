@@ -279,6 +279,7 @@ spec:
       {{- $hasWorkerApiKey = true }}
       {{- end }}
       {{- end }}
+      enableServiceLinks: false
       containers:
         - name: worker
           image: {{ include "curie.image" (dict "repository" .Values.worker.image.repository "tag" .Values.worker.image.tag "digest" .Values.worker.image.digest "defaultTag" .Chart.AppVersion) | quote }}
@@ -316,6 +317,10 @@ spec:
               value: {{ .Values.worker.workspace.maxCheckoutBytes | int64 | quote }}
             - name: CURIE_WORKSPACE_MAX_ARCHIVE_BYTES
               value: {{ .Values.worker.workspace.maxArchiveBytes | int64 | quote }}
+            # Workspace recovery capture (ADR 0251). The API renders the same
+            # value from the same helper.
+            - name: CURIE_WORKSPACE_RECOVERY_ENABLED
+              value: {{ include "curie.workspaceRecoveryEnabled" . | quote }}
             - name: CURIE_WORKSPACE_MAX_MEMBERS
               value: {{ .Values.worker.workspace.maxMembers | quote }}
             - name: CURIE_WORKSPACE_MAX_COMPRESSION_RATIO
@@ -335,6 +340,16 @@ spec:
             python reads 3.3554432e+07 as the number -- so the two sides are
             compared NUMERICALLY by ci/attachment-init-assertions.sh.
             */}}
+            - name: CURIE_ATTACHMENT_MODE
+              value: {{ .Values.worker.attachments.mode | default "eager" | quote }}
+            - name: CURIE_ATTACHMENT_BROKER_HOST
+              value: "0.0.0.0"
+            - name: CURIE_ATTACHMENT_BROKER_PORT
+              value: {{ (dig "broker" "port" 8093 .Values.worker.attachments) | quote }}
+            - name: CURIE_ATTACHMENT_BROKER_MAX_CONCURRENT
+              value: {{ (dig "broker" "maxConcurrent" 8 .Values.worker.attachments) | quote }}
+            - name: CURIE_ATTACHMENT_TRANSFER_TIMEOUT_SECONDS
+              value: {{ (dig "broker" "transferTimeoutSeconds" 300 .Values.worker.attachments) | quote }}
             - name: CURIE_ATTACHMENT_ENABLED
               value: {{ .Values.worker.attachments.enabled | quote }}
             - name: CURIE_ATTACHMENT_MAX_FILE_BYTES
@@ -355,7 +370,7 @@ spec:
             {{- $threadMaxFiles := .Values.worker.attachments.threadMaxFiles | default 20 | int64 }}
             {{- $threadMaxBytes := .Values.worker.attachments.threadMaxBytes | default 268435456 | int64 }}
             {{- $runnerAttachments := .Values.agentSandbox.runner.attachments | default dict }}
-            {{- if and .Values.worker.attachments.enabled $runnerAttachments.enabled }}
+            {{- if and .Values.worker.attachments.enabled $runnerAttachments.enabled (ne (.Values.worker.attachments.mode | default "eager") "lazy") }}
             {{- $volumeBytes := include "curie.capacity.memBytes" $runnerAttachments.sizeLimit | int64 }}
             {{- if gt $threadMaxBytes $volumeBytes }}
             {{- fail (printf "worker.attachments.threadMaxBytes (%d) exceeds agentSandbox.runner.attachments.sizeLimit (%s, %d bytes): one boot of a thread's files would overflow the sandbox's attachments volume. Lower threadMaxBytes or raise sizeLimit (ADR 0205 decision 7)." $threadMaxBytes (toString $runnerAttachments.sizeLimit) $volumeBytes) }}
@@ -713,7 +728,9 @@ spec:
               value: {{ .Values.agentSandbox.runner.bundleFetch.bucket | quote }}
             {{- include "curie.env.otel" (dict "root" . "extraEnv" .Values.worker.extraEnv) | nindent 12 }}
             {{- $checksumExtraEnv | nindent 12 }}
-          # No HTTP port on the worker, so an exec probe checks a heartbeat file
+          # Liveness uses an exec heartbeat file; the optional private attachment
+          # broker is a separate control-plane listener, not a liveness endpoint.
+          # The exec probe checks a heartbeat file
           # the asyncio event loop touches each tick. A wedged loop stops
           # touching it -> the file goes stale -> the probe fails -> restart.
           {{- include "curie.heartbeatProbes" . | nindent 10 }}

@@ -10,9 +10,9 @@ from sqlalchemy import select
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from . import directory_sync, identity_audit
+from . import directory_sync, identity_audit, principal_authority
 from .directory_credential import DirectoryClaims
-from .models import IdentityLink, IdentityNamespace, Principal, Tenant, TenantIdentityProvider
+from .models import IdentityLink, IdentityNamespace, Principal, TenantIdentityProvider
 from .schemas.directory import DirectoryConfigIn, DirectoryPersonIn, DirectorySnapshotIn
 
 
@@ -22,21 +22,11 @@ async def configuration(
     *,
     write: bool = False,
 ) -> TenantIdentityProvider:
-    tenant = await session.scalar(
-        select(Tenant)
-        .where(Tenant.id == tenant_id, Tenant.status == "active")
-        .with_for_update(read=True, key_share=True)
-    )
-    if tenant is None:
-        raise directory_sync.DirectorySyncError("tenant_unavailable")
-    row = await session.scalar(
-        select(TenantIdentityProvider)
-        .where(TenantIdentityProvider.tenant_id == tenant_id)
-        .with_for_update(read=not write)
-        .execution_options(populate_existing=True)
-    )
+    # @spec HTTP-PRINCIPAL-ADOPTION-V1-9.
+    row = await principal_authority.require_local_scope(session, tenant_id)
     if row is None:
         raise directory_sync.DirectorySyncError("directory_not_configured")
+    assert row.governed_domains is not None and row.managed_by is not None
     return row
 
 
@@ -45,16 +35,8 @@ async def update_configuration(
     tenant_id: uuid.UUID,
     body: DirectoryConfigIn,
 ) -> TenantIdentityProvider:
-    tenant = await session.scalar(
-        select(Tenant).where(Tenant.id == tenant_id, Tenant.status == "active").with_for_update()
-    )
-    if tenant is None:
-        raise directory_sync.DirectorySyncError("tenant_unavailable")
-    row = await session.scalar(
-        select(TenantIdentityProvider)
-        .where(TenantIdentityProvider.tenant_id == tenant_id)
-        .with_for_update()
-    )
+    # @spec HTTP-PRINCIPAL-ADOPTION-V1-9.
+    row = await principal_authority.require_local_scope(session, tenant_id)
     if body.expected_version != (row.version if row else 0):
         raise directory_sync.DirectoryConflict("stale_config_version")
     if row is None:
@@ -64,6 +46,7 @@ async def update_configuration(
             governed_domains=body.governed_domains,
             managed_by=body.managed_by,
             version=1,
+            lifecycle_generation=1,
         )
         session.add(row)
     else:
@@ -73,6 +56,7 @@ async def update_configuration(
             body.managed_by,
         )
         row.version += 1
+        row.lifecycle_generation += 1
     identity_audit.record(
         session,
         tenant_id=tenant_id,
@@ -105,6 +89,7 @@ async def scoped_namespaces(
     claims: DirectoryClaims,
     config: TenantIdentityProvider,
 ) -> dict[uuid.UUID, IdentityNamespace]:
+    assert config.governed_domains is not None
     # The same namespace lock serializes connect confirmations and replacements.
     rows = list(
         await session.scalars(
@@ -133,6 +118,7 @@ def validated_accounts(
     namespaces: dict[uuid.UUID, IdentityNamespace],
     config: TenantIdentityProvider,
 ) -> dict[str, set[tuple[uuid.UUID, str]]]:
+    assert config.governed_domains is not None
     accounts: dict[str, set[tuple[uuid.UUID, str]]] = {}
     all_keys: set[tuple[uuid.UUID, str]] = set()
     for person in people:
@@ -190,6 +176,9 @@ async def ingest_snapshot(
     body: DirectorySnapshotIn,
 ) -> directory_sync.SnapshotResult:
     async with session.begin_nested():
+        # @spec HTTP-PRINCIPAL-ADOPTION-V1-9. Never trust a pre-lock ORM config.
+        config = await authenticate(session, claims, write=True)
+        created = False
         await directory_sync.locked_team(session, claims.scope, team_id, body.expected_epoch)
         if not body.complete:
             raise directory_sync.DirectorySyncError("incomplete_snapshot")
@@ -200,12 +189,22 @@ async def ingest_snapshot(
                 raise directory_sync.DirectorySyncError("identity_epoch_required")
         elif body.expected_identity_epoch != config.identity_epoch:
             raise directory_sync.DirectoryConflict("stale_identity_epoch")
+        # @spec HTTP-PRINCIPAL-ADOPTION-V1-4. Lock existing people by UUID,
+        # before subject-ordered creation/profile work under the same scope.
+        await session.scalars(
+            select(Principal).where(
+                Principal.tenant_id == claims.scope.tenant_id,
+                Principal.idp_issuer == claims.scope.issuer,
+                Principal.idp_subject.in_([person.subject for person in body.people]),
+            ).order_by(Principal.id).with_for_update()
+            .execution_options(populate_existing=True)
+        )
         principal_ids: list[uuid.UUID] = []
         now = datetime.now(UTC)
         for person in sorted(body.people, key=lambda person: person.subject):
             # Unique issuer+subject is the only identity key. Concurrent group
             # ingestion cannot race a second human into existence.
-            await session.execute(
+            inserted = await session.scalar(
                 insert(Principal)
                 .values(
                     id=uuid.uuid4(),
@@ -218,7 +217,9 @@ async def ingest_snapshot(
                     email=person.email,
                 )
                 .on_conflict_do_nothing(constraint="principals_tenant_issuer_subject_key")
+                .returning(Principal.id)
             )
+            created = created or inserted is not None
             principal = await session.scalar(
                 select(Principal)
                 .where(
@@ -309,8 +310,11 @@ async def ingest_snapshot(
             principal_ids=principal_ids,
             complete=True,
         )
+        if created:
+            config.lifecycle_generation += 1
         if claims.namespace_ids:
             # This must roll back together with links, membership and audits.
             config.identity_epoch += 1
             await session.flush()
+        await session.flush()
         return result

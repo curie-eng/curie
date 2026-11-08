@@ -836,7 +836,16 @@ fn jira_add_agent_refuses_a_binding_with_a_differing_repository_set() {
         text.contains("acme/gears"),
         "names the recorded value: {text}"
     );
-    assert!(text.contains("--repo"), "says how to proceed: {text}");
+    assert!(
+        text.contains("docs/guides/dark-factory-quickstart.md#writing-the-values-by-hand"),
+        "names the hand written alias route: {text}"
+    );
+    assert!(text.contains("repo:<alias>"), "{text}");
+    assert!(text.contains("curie cluster surfaces"), "{text}");
+    assert!(
+        !text.contains("rerun with --repo"),
+        "a second repository is not a flag rerun: {text}"
+    );
 }
 
 #[test]

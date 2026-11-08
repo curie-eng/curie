@@ -18,7 +18,7 @@ _NO_WHITESPACE: dict[str, Any] = {"not": {"pattern": r"\s"}}
 
 def _positive_quantity(value: str) -> str:
     try:
-        quantity = parse_quantity(value)
+        quantity = parse_quantity(value)  # type: ignore[no-untyped-call]
         if quantity.is_finite() and quantity > 0:
             return value
     except (DecimalException, ValueError):

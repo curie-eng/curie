@@ -41,7 +41,7 @@ from curie_worker.approvals import (
     SettledApproval,
 )
 from curie_worker.behaviorpacks import BehaviorPacks
-from curie_worker.binding import GRANT_TOOL_ENV, FactoryContext, FactoryWake
+from curie_worker.binding import GRANT_TOOL_ENV, FactoryContext, FactoryWake, HttpIdentityBinding
 from curie_worker.kernel.workspace import _WorkspaceInferenceCarry
 from curie_worker.reply_sink import TargetRoute, _ClusterMessageReplyAdapter
 from curie_worker.runner_client import RunnerError
@@ -1347,6 +1347,10 @@ async def _publication_run(
         def touch(self, _thread_identity: str, *, ttl_seconds: int) -> None:
             del ttl_seconds
 
+        def current(self, _thread_identity: str) -> object:
+            # The retained prepared base the publication snapshot is anchored at.
+            return SimpleNamespace(repo_full_name="acme-corp/acme-private", base_sha="a" * 40)
+
     publication_api = PublicationApi() if publication_creator is None else publication_creator
     workspace = Workspace()
     binding = Binding(grant_event_id="unused", grant_tool="unused")
@@ -2379,6 +2383,19 @@ def test_publication_create_stops_retrying_when_its_budget_is_spent() -> None:
 class _FactoryBinding:
     """A workspace-enabled deployment for a factory execute turn."""
 
+    async def identity_binding(
+        self, kind: str, adapter: str | None, address: str,
+    ) -> HttpIdentityBinding | None:
+        """@spec HTTP-INVOCATION-EXECUTION-18: explicit local fixture classification."""
+        agent_id = uuid.UUID("11111111-1111-4111-8111-111111114180")
+        return HttpIdentityBinding(
+            tenant_id=uuid.UUID("00000000-0000-4000-8000-000000000001"),
+            agent_id=agent_id,
+            binding_id=uuid.uuid5(uuid.NAMESPACE_URL, repr((kind, adapter, address))),
+            binding_generation=1, http_identity_required=False,
+        )
+
+
     def _deployment(self) -> object:
         return SimpleNamespace(
             agent_id=uuid.UUID("11111111-1111-4111-8111-111111114180"),
@@ -2428,6 +2445,10 @@ class _FactoryWorkspace:
 
     def release(self, _thread_key: str) -> None:
         return None
+
+    def current(self, _thread_key: str) -> object:
+        # The retained prepared base the publication snapshot is anchored at.
+        return SimpleNamespace(repo_full_name="acme-corp/widgets", base_sha="a1" * 20)
 
 
 class _FactoryWorkItems:
@@ -3527,6 +3548,19 @@ class GrantBinding:
     mirroring the worker's real derivation from durable approval state.
     """
 
+    async def identity_binding(
+        self, kind: str, adapter: str | None, address: str,
+    ) -> HttpIdentityBinding | None:
+        """@spec HTTP-INVOCATION-EXECUTION-18: explicit local fixture classification."""
+        agent_id = self.agent_id
+        return HttpIdentityBinding(
+            tenant_id=uuid.UUID("00000000-0000-4000-8000-000000000001"),
+            agent_id=agent_id,
+            binding_id=uuid.uuid5(uuid.NAMESPACE_URL, repr((kind, adapter, address))),
+            binding_generation=1, http_identity_required=False,
+        )
+
+
     def __init__(self, *, grant_event_id: str, grant_tool: str, decision: str = "approved") -> None:
         self.grant_event_id = grant_event_id
         self.grant_tool = grant_tool
@@ -3776,7 +3810,18 @@ def test_publication_snapshot_inherits_the_attempts_remaining_delivery_budget(
                     approval_granted_tool="mcp__curie__publish_changes",
                 )
             ]
+            # The publication snapshot is requested only at a retained prepared
+            # base (#5230); this generic turn selects no repository otherwise.
+            h.kernel._workspace = SimpleNamespace(  # type: ignore[assignment]
+                current=lambda _thread_key: SimpleNamespace(
+                    repo_full_name="acme-corp/acme-bot", base_sha="a" * 40
+                ),
+                touch=lambda _thread_key, *, ttl_seconds: True,
+                release=lambda _thread_key: None,
+                enumerate_expired=lambda: [],
+            )
             observed_remaining: list[float] = []
+            observed_bases: list[str] = []
             consumed_turns = 0
             real_consume = h.kernel._consume
 
@@ -3791,9 +3836,11 @@ def test_publication_snapshot_inherits_the_attempts_remaining_delivery_budget(
                 _base_url: str,
                 token: str | None = None,
                 *,
+                base_sha: str,
                 remaining_s: float,
             ) -> None:
                 observed_remaining.append(remaining_s)
+                observed_bases.append(base_sha)
                 # Stop after capturing the boundary; _attempt deliberately
                 # converts runner snapshot failures into a publication error.
                 raise RunnerError("captured snapshot deadline")
@@ -3813,6 +3860,7 @@ def test_publication_snapshot_inherits_the_attempts_remaining_delivery_budget(
             assert consumed_turns == 1
             assert clock_s == 1000.25
             assert observed_remaining == [17.0]
+            assert observed_bases == ["a" * 40]
 
     asyncio.run(go())
 
@@ -3928,6 +3976,19 @@ def _awaiting_routed_script(summary: str, route: str) -> list:
 
 class RoutedBinding:
     """A minimal binding stand-in: one channel -> one agent with route bindings."""
+
+    async def identity_binding(
+        self, kind: str, adapter: str | None, address: str,
+    ) -> HttpIdentityBinding | None:
+        """@spec HTTP-INVOCATION-EXECUTION-18: explicit local fixture classification."""
+        agent_id = self.agent_id
+        return HttpIdentityBinding(
+            tenant_id=uuid.UUID("00000000-0000-4000-8000-000000000001"),
+            agent_id=agent_id,
+            binding_id=uuid.uuid5(uuid.NAMESPACE_URL, repr((kind, adapter, address))),
+            binding_generation=1, http_identity_required=False,
+        )
+
 
     def __init__(self, routes: dict | None) -> None:
         self.routes = routes
@@ -5960,6 +6021,19 @@ def test_publication_with_named_unbound_route_escalates_and_creates_nothing(
 class _WorkspacelessBinding:
     """A deployment with repository workspaces off, as `curie cluster message`
     installs it: a deployment id (so selection runs) and no bound repository."""
+
+    async def identity_binding(
+        self, kind: str, adapter: str | None, address: str,
+    ) -> HttpIdentityBinding | None:
+        """@spec HTTP-INVOCATION-EXECUTION-18: explicit local fixture classification."""
+        agent_id = uuid.UUID("22222222-2222-4222-8222-222222222828")
+        return HttpIdentityBinding(
+            tenant_id=uuid.UUID("00000000-0000-4000-8000-000000000001"),
+            agent_id=agent_id,
+            binding_id=uuid.uuid5(uuid.NAMESPACE_URL, repr((kind, adapter, address))),
+            binding_generation=1, http_identity_required=False,
+        )
+
 
     def __init__(self, deployment_id: uuid.UUID) -> None:
         self.deployment_id = deployment_id

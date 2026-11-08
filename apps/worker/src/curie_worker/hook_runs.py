@@ -38,6 +38,7 @@ HookRunReason = Literal[
     "live_session",
     "enqueue_failed",
     "claim_expired",
+    "identity_refused",
 ]
 
 logger = logging.getLogger(__name__)
@@ -207,6 +208,46 @@ class HookRunRecorder:
             started_at=row.started_at,
             version_id=row.version_id,
         )
+
+    async def scheduled_authority(self, ref: HookRunRef) -> bool:
+        """Whether the run is open at its agent's active deployment version.
+
+        Only platform admission writes a run row, from the current version's
+        declared cron hook, so an open row at the version the agent would boot
+        now is the deployment authority of ADR 0258. The ranking matches the
+        scheduler's and the binding resolver's: prod before dev, then the most
+        recent deployment. @spec HTTP-INVOCATION-EXECUTION-23.
+        """
+        key = _parse_ref(ref)
+        try:
+            async with self._engine.begin() as connection:
+                held = (
+                    await connection.execute(
+                        text(
+                            f"SELECT 1 FROM {self._schema}.hook_runs r "
+                            "WHERE r.agent_id = :agent_id AND r.name = :name "
+                            "AND r.slot_utc = :slot_utc AND r.outcome IS NULL "
+                            "AND r.version_id = ("
+                            f"SELECT d.version_id FROM {self._schema}.deployments d "
+                            f"JOIN {self._schema}.agent_versions v "
+                            "ON v.id = d.version_id AND v.agent_id = d.agent_id "
+                            "WHERE d.agent_id = r.agent_id AND d.status = 'active' "
+                            "ORDER BY (d.environment = 'prod') DESC, "
+                            "d.deployed_at DESC, d.id DESC LIMIT 1)"
+                        ),
+                        {
+                            "agent_id": key.agent_id,
+                            "name": key.name,
+                            "slot_utc": key.slot_utc,
+                        },
+                    )
+                ).one_or_none()
+        except SQLAlchemyError as exc:
+            raise HookRunRecorderError(
+                "hook run authority could not be read",
+                code="backend",
+            ) from exc
+        return held is not None
 
     async def renew(self, ref: HookRunRef, lease_s: float) -> bool:
         """Extend an open run's claim lease to at least ``lease_s`` from now.

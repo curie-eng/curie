@@ -651,7 +651,7 @@ def _collision_archive(connectors_yaml: str) -> bytes:
     return buf.getvalue()
 
 
-def _agent_row(name: str) -> str:
+def _agent_row(name: str, address: str = "C0EXAMPLE4") -> str:
     """Insert the agent row directly, the way a pre-validator install holds one.
 
     Mirrors `crud.create_agent`'s shape (the agent and its binding in one
@@ -668,7 +668,7 @@ def _agent_row(name: str) -> str:
             async with sessionmaker() as session:
                 agent = Agent(
                     name=name,
-                    channels=[AgentChannel(kind="slack", address="C0EXAMPLE4", adapter="default")],
+                    channels=[AgentChannel(kind="slack", address=address, adapter="default")],
                 )
                 session.add(agent)
                 await session.commit()
@@ -743,6 +743,68 @@ def test_the_same_bundle_still_renders_for_an_unambiguous_agent(
         f"{name}-allow-ingress",
     }
     assert name in body["mcp_entries"]["grafana"]["url"]
+
+
+# --------------------------------------------------------------------------- #
+# One bundle, two agents, two out-of-band Secrets: `from_secret` carrying
+# `${CURIE_AGENT}` is expanded by the route's render to the agent it renders
+# for. Real Postgres + RustFS, the same route `cluster deploy` reads.
+# --------------------------------------------------------------------------- #
+AGENT_SCOPED = (
+    "connectors:\n"
+    "  reader:\n"
+    "    image: ghcr.io/example/reader:1\n"
+    "    port: 8000\n"
+    "    secrets:\n"
+    "      - name: EXAMPLE_TOKEN\n"
+    "        from_secret: example-read-${CURIE_AGENT}\n"
+)
+
+
+def _upload(client: Any, headers: dict[str, str], agent_id: str, connectors_yaml: str) -> Any:
+    version = client.post(
+        f"/agents/{agent_id}/versions",
+        json={"version_label": "v1", "created_by": "test"},
+        headers=headers,
+    )
+    assert version.status_code == 201, version.text
+    version_id = version.json()["id"]
+    return version_id, client.put(
+        f"/agents/{agent_id}/versions/{version_id}/bundle",
+        files={"file": ("b.tar.gz", _collision_archive(connectors_yaml))},
+        headers=headers,
+    )
+
+
+def test_each_agent_renders_its_own_agent_scoped_secret(
+    client: Any, auth_headers: dict[str, str], clean_db: None, _caller_key: None
+) -> None:
+    rendered = {}
+    for agent, address in (("foo", "C0EXAMPLE5"), ("foo-dev", "C0EXAMPLE6")):
+        agent_id = _agent_row(agent, address)
+        version_id, stored = _upload(client, auth_headers, agent_id, AGENT_SCOPED)
+        assert stored.status_code == 201, stored.text
+        resp = _read_connectors(client, auth_headers, agent_id, version_id)
+        assert resp.status_code == 200, resp.text
+        dep = next(o for o in resp.json()["manifests"] if o["kind"] == "Deployment")
+        env = dep["spec"]["template"]["spec"]["containers"][0]["env"]
+        token = next(e for e in env if e["name"] == "EXAMPLE_TOKEN")
+        rendered[agent] = token["valueFrom"]["secretKeyRef"]["name"]
+    assert rendered == {"foo": "example-read-foo", "foo-dev": "example-read-foo-dev"}
+
+
+def test_an_unknown_from_secret_placeholder_never_becomes_a_version_bundle(
+    client: Any, auth_headers: dict[str, str], clean_db: None
+) -> None:
+    agent_id = _agent_row("foo")
+    _, stored = _upload(
+        client,
+        auth_headers,
+        agent_id,
+        AGENT_SCOPED.replace("${CURIE_AGENT}", "${CURIE_CONNECTOR_HOST}"),
+    )
+    assert stored.status_code >= 400, stored.text
+    assert "connectors.secret_ref_unknown_placeholder" in stored.text
 
 
 GITHUB = (

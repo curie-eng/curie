@@ -70,7 +70,7 @@ jobs:
         with:
           python-version: "3.13"
       - name: Install contract checker dependencies
-        run: python -m pip install -r tools/sre-contract/requirements.txt -e packages/plugin-format
+        run: python -m pip install -r tools/sre-contract/requirements.txt -e packages/plugin-format -e packages/test-support
       - name: Exercise causal contract and HTTP catalog mutations
         run: python -m pytest -q tools/sre-contract/tests
       - name: Validate the shipped supported bundle

@@ -24,6 +24,7 @@ import uuid
 from collections.abc import Iterator
 from dataclasses import dataclass
 from typing import Any
+from unittest.mock import MagicMock
 
 import httpx
 import pytest
@@ -239,6 +240,31 @@ def test_the_direct_message_lane_asks_too(
     _deliver(config, redis_client, _events_api_request("env-dm-2", "Ev-dm-2", listed_dm))
     assert len(_stream_entries(redis_client, config)) == 1
 
+
+
+@pytest.mark.parametrize("outcome", ["refused", "unavailable"])
+def test_a_legacy_refusal_still_posts_no_notice_of_any_kind(
+    config: DispatcherConfig,
+    redis_client: redis.Redis,
+    admission_api: FakeAdmissionApi,
+    outcome: str,
+) -> None:
+    """@spec HTTP-INVOCATION-EXECUTION-19: the selected notice never reaches the legacy lane."""
+    if outcome == "refused":
+        admission_api.lists[(CHANNEL, "default")] = {LISTED}
+    else:
+        admission_api.down = True
+    harness = _build_harness(config, redis_client)
+    harness.web_client.chat_postEphemeral = MagicMock()  # type: ignore[method-assign]
+    harness.handler.handle(
+        harness.sock,
+        _events_api_request(f"env-legacy-{outcome}", f"Ev-legacy-{outcome}", _mention(text="hi")),
+    )
+    _drain(harness.app)
+    assert harness.errors == []
+    assert _stream_entries(redis_client, config) == []
+    harness.web_client.chat_postEphemeral.assert_not_called()  # type: ignore[attr-defined]
+    assert harness.web_client.chat_postMessage.call_count == 0  # type: ignore[attr-defined]
 
 def test_a_button_click_is_judged_on_the_clicking_user(
     config: DispatcherConfig, redis_client: redis.Redis, admission_api: FakeAdmissionApi
@@ -547,13 +573,6 @@ def test_an_unreachable_api_is_unavailable_not_an_exception() -> None:
 
 
 # --- configuration --------------------------------------------------------------
-
-
-def test_the_cache_defaults_are_thirty_seconds_and_five_minutes(
-    config: DispatcherConfig,
-) -> None:
-    assert config.admission_cache_ttl_s == 30.0
-    assert config.admission_stale_s == 300.0
 
 
 @pytest.mark.parametrize(

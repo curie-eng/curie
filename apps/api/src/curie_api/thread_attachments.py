@@ -35,7 +35,7 @@ from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from .config import get_settings
-from .models import ThreadAttachmentRef, ThreadTranscript
+from .models import AttachmentCatalog, AttachmentReference, ThreadAttachmentRef, ThreadTranscript
 from .threadkeys import pre_identity_thread_key_for
 
 REF_FIELDS: tuple[str, ...] = (
@@ -351,6 +351,16 @@ async def delete_for(
     if not keys:
         return
     every = await _with_pre_identity(session, agent_id, keys)
+    if scope is None:
+        await session.execute(delete(AttachmentCatalog).where(
+            AttachmentCatalog.agent_id == agent_id,
+            AttachmentCatalog.thread_key.in_(every),
+        ))
+    await session.execute(delete(AttachmentReference).where(
+        AttachmentReference.agent_id == agent_id,
+        AttachmentReference.binding_scope == scope,
+        AttachmentReference.thread_key.in_(every),
+    ))
     await session.execute(
         delete(ThreadAttachmentRef).where(
             ThreadAttachmentRef.agent_id == agent_id,
@@ -368,6 +378,8 @@ async def sweep_orphans(session: AsyncSession, agent_id: uuid.UUID) -> None:
     LOCKED, like the transcript sweep. Does not commit.
     """
 
+    await sweep_reference_orphans(session, agent_id)
+    await sweep_catalog_orphans(session, agent_id)
     live_transcript = exists().where(
         ThreadTranscript.agent_id == ThreadAttachmentRef.agent_id,
         ThreadTranscript.binding_scope.is_not_distinct_from(ThreadAttachmentRef.binding_scope),
@@ -386,3 +398,30 @@ async def sweep_orphans(session: AsyncSession, agent_id: uuid.UUID) -> None:
         .with_for_update(skip_locked=True)
     )
     await session.execute(delete(ThreadAttachmentRef).where(ThreadAttachmentRef.id.in_(orphans)))
+
+
+async def sweep_reference_orphans(session: AsyncSession, agent_id: uuid.UUID) -> None:
+    """Lazy references share the transcript's retention, including pre-first-write."""
+    live = exists().where(
+        ThreadTranscript.agent_id == AttachmentReference.agent_id,
+        ThreadTranscript.binding_scope.is_not_distinct_from(AttachmentReference.binding_scope),
+        ThreadTranscript.thread_key == AttachmentReference.thread_key,
+        or_(ThreadTranscript.expires_at.is_(None), ThreadTranscript.expires_at > func.now()),
+    )
+    await session.execute(delete(AttachmentReference).where(
+        AttachmentReference.agent_id == agent_id,
+        AttachmentReference.expires_at <= func.now(), ~live,
+    ))
+
+
+async def sweep_catalog_orphans(session: AsyncSession, agent_id: uuid.UUID) -> None:
+    live = exists().where(
+        ThreadTranscript.agent_id == AttachmentCatalog.agent_id,
+        ThreadTranscript.binding_scope.is_(None),
+        ThreadTranscript.thread_key == AttachmentCatalog.thread_key,
+        or_(ThreadTranscript.expires_at.is_(None), ThreadTranscript.expires_at > func.now()),
+    )
+    await session.execute(delete(AttachmentCatalog).where(
+        AttachmentCatalog.agent_id == agent_id,
+        AttachmentCatalog.expires_at <= func.now(), ~live,
+    ))

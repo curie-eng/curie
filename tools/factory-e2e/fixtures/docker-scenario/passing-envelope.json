@@ -1,0 +1,1501 @@
+{
+  "schema": "docker-scenario/v1",
+  "nonce": "e8ce1a8c",
+  "runs": {
+    "a": {
+      "claim": "curie-thread-5d1e0a7b3c-e8ce1a",
+      "daemon_pod": "7bd5b54461f4",
+      "probe": {
+        "window": [
+          1792669432,
+          1792669451
+        ],
+        "info": {
+          "id": "c1c8410e-1137-4ebf-9eb9-586d0a2b134b",
+          "name": "7bd5b54461f4"
+        },
+        "holder": {
+          "id": "2e5ce74007fdb30a9f4ffc414ade4ba0e7aa2f4d421bb1f068e2aaf2f7ba3427",
+          "exit_code": 0
+        },
+        "escapes": [
+          {
+            "name": "userns-host",
+            "exit_code": 125,
+            "rule": "host-namespace",
+            "output_tail": "docker: Error response from daemon: authorization denied by plugin curie-authz: refused by rule host-namespace: body.HostConfig.UsernsMode is \"host\"\n\nRun 'docker run --help' for more information"
+          },
+          {
+            "name": "privileged",
+            "exit_code": 125,
+            "rule": "privileged",
+            "output_tail": "docker: Error response from daemon: authorization denied by plugin curie-authz: refused by rule privileged: HostConfig.Privileged is true\n\nRun 'docker run --help' for more information"
+          },
+          {
+            "name": "cap-add",
+            "exit_code": 125,
+            "rule": "cap-add",
+            "output_tail": "docker: Error response from daemon: authorization denied by plugin curie-authz: refused by rule cap-add: HostConfig.CapAdd \"CAP_SYS_ADMIN\" is outside Docker's default set\n\nRun 'docker run --help' for more information"
+          },
+          {
+            "name": "host-bind",
+            "exit_code": 125,
+            "rule": "host-bind",
+            "output_tail": "docker: Error response from daemon: authorization denied by plugin curie-authz: refused by rule host-bind: HostConfig.Binds \"/:/host\" has a host path source\n\nRun 'docker run --help' for more information"
+          },
+          {
+            "name": "mount-bind",
+            "exit_code": 125,
+            "rule": "host-bind",
+            "output_tail": "docker: Error response from daemon: authorization denied by plugin curie-authz: refused by rule host-bind: HostConfig.Mounts[0].Type is \"bind\"\n\nRun 'docker run --help' for more information"
+          },
+          {
+            "name": "volume-driver-bind",
+            "exit_code": 1,
+            "rule": "volume-driver-options",
+            "output_tail": "Error response from daemon: authorization denied by plugin curie-authz: refused by rule volume-driver-options: volume DriverOpts is set"
+          },
+          {
+            "name": "seccomp-unconfined",
+            "exit_code": 125,
+            "rule": "security-opt",
+            "output_tail": "docker: Error response from daemon: authorization denied by plugin curie-authz: refused by rule security-opt: HostConfig.SecurityOpt \"seccomp=unconfined\"\n\nRun 'docker run --help' for more information"
+          },
+          {
+            "name": "exec-privileged",
+            "exit_code": 1,
+            "rule": "exec-privileged",
+            "output_tail": "Error response from daemon: authorization denied by plugin curie-authz: refused by rule exec-privileged: exec Privileged is true"
+          }
+        ],
+        "egress": {
+          "pull": {
+            "image": "alpine:3.20",
+            "exit_code": 0
+          },
+          "targets": [
+            {
+              "name": "cluster-api",
+              "target": "10.96.0.1:443",
+              "exit_code": 1,
+              "reachable": false
+            },
+            {
+              "name": "curie-api",
+              "target": "10.96.112.40:8080",
+              "exit_code": 1,
+              "reachable": false
+            },
+            {
+              "name": "metadata",
+              "target": "169.254.169.254:80",
+              "exit_code": 1,
+              "reachable": false
+            }
+          ]
+        },
+        "cleanup": {
+          "holder_removed": true,
+          "volume_absent": true
+        }
+      },
+      "daemon": {
+        "pod": "7bd5b54461f4",
+        "pod_uid": "8a3f2c1e-4b7d-4e90-9a61-2f5c8d0b7e14",
+        "info": {
+          "id": "c1c8410e-1137-4ebf-9eb9-586d0a2b134b",
+          "name": "7bd5b54461f4"
+        },
+        "events": [
+          {
+            "Type": "container",
+            "Action": "create",
+            "Actor": {
+              "ID": "2e5ce74007fdb30a9f4ffc414ade4ba0e7aa2f4d421bb1f068e2aaf2f7ba3427",
+              "Attributes": {
+                "curie.fixture.nonce": "e8ce1a8c",
+                "image": "alpine:3.20",
+                "name": "nervous_beaver"
+              }
+            },
+            "scope": "local",
+            "time": 1792669433,
+            "timeNano": 1792669433581080846
+          },
+          {
+            "Type": "container",
+            "Action": "start",
+            "Actor": {
+              "ID": "2e5ce74007fdb30a9f4ffc414ade4ba0e7aa2f4d421bb1f068e2aaf2f7ba3427",
+              "Attributes": {
+                "curie.fixture.nonce": "e8ce1a8c",
+                "image": "alpine:3.20",
+                "name": "nervous_beaver"
+              }
+            },
+            "scope": "local",
+            "time": 1792669433,
+            "timeNano": 1792669433695944493
+          },
+          {
+            "Type": "container",
+            "Action": "create",
+            "Actor": {
+              "ID": "163430fced64e84af63f3d0bdba75982d64847b6df1274dea1fbc41803cb32a7",
+              "Attributes": {
+                "curie.fixture.nonce": "e8ce1a8c",
+                "image": "alpine:3.20",
+                "name": "stupefied_einstein"
+              }
+            },
+            "scope": "local",
+            "time": 1792669437,
+            "timeNano": 1792669437783812591
+          },
+          {
+            "Type": "container",
+            "Action": "attach",
+            "Actor": {
+              "ID": "163430fced64e84af63f3d0bdba75982d64847b6df1274dea1fbc41803cb32a7",
+              "Attributes": {
+                "curie.fixture.nonce": "e8ce1a8c",
+                "image": "alpine:3.20",
+                "name": "stupefied_einstein"
+              }
+            },
+            "scope": "local",
+            "time": 1792669437,
+            "timeNano": 1792669437786408988
+          },
+          {
+            "Type": "container",
+            "Action": "start",
+            "Actor": {
+              "ID": "163430fced64e84af63f3d0bdba75982d64847b6df1274dea1fbc41803cb32a7",
+              "Attributes": {
+                "curie.fixture.nonce": "e8ce1a8c",
+                "image": "alpine:3.20",
+                "name": "stupefied_einstein"
+              }
+            },
+            "scope": "local",
+            "time": 1792669437,
+            "timeNano": 1792669437917198313
+          },
+          {
+            "Type": "container",
+            "Action": "die",
+            "Actor": {
+              "ID": "163430fced64e84af63f3d0bdba75982d64847b6df1274dea1fbc41803cb32a7",
+              "Attributes": {
+                "curie.fixture.nonce": "e8ce1a8c",
+                "execDuration": "5",
+                "exitCode": "1",
+                "image": "alpine:3.20",
+                "name": "stupefied_einstein"
+              }
+            },
+            "scope": "local",
+            "time": 1792669443,
+            "timeNano": 1792669443002668785
+          },
+          {
+            "Type": "container",
+            "Action": "destroy",
+            "Actor": {
+              "ID": "163430fced64e84af63f3d0bdba75982d64847b6df1274dea1fbc41803cb32a7",
+              "Attributes": {
+                "curie.fixture.nonce": "e8ce1a8c",
+                "image": "alpine:3.20",
+                "name": "stupefied_einstein"
+              }
+            },
+            "scope": "local",
+            "time": 1792669443,
+            "timeNano": 1792669443007086214
+          },
+          {
+            "Type": "container",
+            "Action": "create",
+            "Actor": {
+              "ID": "9b6d2ea6440cb0bd0c9afeebb04cc654c17e361a0b7d32a34841e3af10a20802",
+              "Attributes": {
+                "curie.fixture.nonce": "e8ce1a8c",
+                "image": "alpine:3.20",
+                "name": "bold_sinoussi"
+              }
+            },
+            "scope": "local",
+            "time": 1792669443,
+            "timeNano": 1792669443477403077
+          },
+          {
+            "Type": "container",
+            "Action": "attach",
+            "Actor": {
+              "ID": "9b6d2ea6440cb0bd0c9afeebb04cc654c17e361a0b7d32a34841e3af10a20802",
+              "Attributes": {
+                "curie.fixture.nonce": "e8ce1a8c",
+                "image": "alpine:3.20",
+                "name": "bold_sinoussi"
+              }
+            },
+            "scope": "local",
+            "time": 1792669443,
+            "timeNano": 1792669443480287992
+          },
+          {
+            "Type": "container",
+            "Action": "start",
+            "Actor": {
+              "ID": "9b6d2ea6440cb0bd0c9afeebb04cc654c17e361a0b7d32a34841e3af10a20802",
+              "Attributes": {
+                "curie.fixture.nonce": "e8ce1a8c",
+                "image": "alpine:3.20",
+                "name": "bold_sinoussi"
+              }
+            },
+            "scope": "local",
+            "time": 1792669443,
+            "timeNano": 1792669443581069063
+          },
+          {
+            "Type": "container",
+            "Action": "die",
+            "Actor": {
+              "ID": "9b6d2ea6440cb0bd0c9afeebb04cc654c17e361a0b7d32a34841e3af10a20802",
+              "Attributes": {
+                "curie.fixture.nonce": "e8ce1a8c",
+                "execDuration": "5",
+                "exitCode": "1",
+                "image": "alpine:3.20",
+                "name": "bold_sinoussi"
+              }
+            },
+            "scope": "local",
+            "time": 1792669448,
+            "timeNano": 1792669448660499566
+          },
+          {
+            "Type": "container",
+            "Action": "destroy",
+            "Actor": {
+              "ID": "9b6d2ea6440cb0bd0c9afeebb04cc654c17e361a0b7d32a34841e3af10a20802",
+              "Attributes": {
+                "curie.fixture.nonce": "e8ce1a8c",
+                "image": "alpine:3.20",
+                "name": "bold_sinoussi"
+              }
+            },
+            "scope": "local",
+            "time": 1792669448,
+            "timeNano": 1792669448666208201
+          },
+          {
+            "Type": "container",
+            "Action": "create",
+            "Actor": {
+              "ID": "4319d75c4cecbff4b7ec63aed3926fd2ea935c4d7edcc3e637ee372abfb76651",
+              "Attributes": {
+                "curie.fixture.nonce": "e8ce1a8c",
+                "image": "alpine:3.20",
+                "name": "infallible_hermann"
+              }
+            },
+            "scope": "local",
+            "time": 1792669449,
+            "timeNano": 1792669449147989823
+          },
+          {
+            "Type": "container",
+            "Action": "attach",
+            "Actor": {
+              "ID": "4319d75c4cecbff4b7ec63aed3926fd2ea935c4d7edcc3e637ee372abfb76651",
+              "Attributes": {
+                "curie.fixture.nonce": "e8ce1a8c",
+                "image": "alpine:3.20",
+                "name": "infallible_hermann"
+              }
+            },
+            "scope": "local",
+            "time": 1792669449,
+            "timeNano": 1792669449150918969
+          },
+          {
+            "Type": "container",
+            "Action": "start",
+            "Actor": {
+              "ID": "4319d75c4cecbff4b7ec63aed3926fd2ea935c4d7edcc3e637ee372abfb76651",
+              "Attributes": {
+                "curie.fixture.nonce": "e8ce1a8c",
+                "image": "alpine:3.20",
+                "name": "infallible_hermann"
+              }
+            },
+            "scope": "local",
+            "time": 1792669449,
+            "timeNano": 1792669449254218183
+          },
+          {
+            "Type": "container",
+            "Action": "die",
+            "Actor": {
+              "ID": "4319d75c4cecbff4b7ec63aed3926fd2ea935c4d7edcc3e637ee372abfb76651",
+              "Attributes": {
+                "curie.fixture.nonce": "e8ce1a8c",
+                "execDuration": "0",
+                "exitCode": "0",
+                "image": "alpine:3.20",
+                "name": "infallible_hermann"
+              }
+            },
+            "scope": "local",
+            "time": 1792669449,
+            "timeNano": 1792669449346667021
+          },
+          {
+            "Type": "container",
+            "Action": "destroy",
+            "Actor": {
+              "ID": "4319d75c4cecbff4b7ec63aed3926fd2ea935c4d7edcc3e637ee372abfb76651",
+              "Attributes": {
+                "curie.fixture.nonce": "e8ce1a8c",
+                "image": "alpine:3.20",
+                "name": "infallible_hermann"
+              }
+            },
+            "scope": "local",
+            "time": 1792669449,
+            "timeNano": 1792669449350838203
+          },
+          {
+            "Type": "container",
+            "Action": "kill",
+            "Actor": {
+              "ID": "2e5ce74007fdb30a9f4ffc414ade4ba0e7aa2f4d421bb1f068e2aaf2f7ba3427",
+              "Attributes": {
+                "curie.fixture.nonce": "e8ce1a8c",
+                "image": "alpine:3.20",
+                "name": "nervous_beaver",
+                "signal": "9"
+              }
+            },
+            "scope": "local",
+            "time": 1792669450,
+            "timeNano": 1792669450417217069
+          },
+          {
+            "Type": "container",
+            "Action": "die",
+            "Actor": {
+              "ID": "2e5ce74007fdb30a9f4ffc414ade4ba0e7aa2f4d421bb1f068e2aaf2f7ba3427",
+              "Attributes": {
+                "curie.fixture.nonce": "e8ce1a8c",
+                "execDuration": "16",
+                "exitCode": "137",
+                "image": "alpine:3.20",
+                "name": "nervous_beaver"
+              }
+            },
+            "scope": "local",
+            "time": 1792669450,
+            "timeNano": 1792669450506444266
+          },
+          {
+            "Type": "container",
+            "Action": "destroy",
+            "Actor": {
+              "ID": "2e5ce74007fdb30a9f4ffc414ade4ba0e7aa2f4d421bb1f068e2aaf2f7ba3427",
+              "Attributes": {
+                "curie.fixture.nonce": "e8ce1a8c",
+                "image": "alpine:3.20",
+                "name": "nervous_beaver"
+              }
+            },
+            "scope": "local",
+            "time": 1792669450,
+            "timeNano": 1792669450510830748
+          }
+        ]
+      }
+    },
+    "b": {
+      "claim": "curie-thread-9a4c2f6e81-e8ce1b",
+      "daemon_pod": "3f6a91c0d2e8",
+      "probe": {
+        "window": [
+          1792669441,
+          1792669460
+        ],
+        "info": {
+          "id": "5b0e7d2a-9c41-4f63-a8e2-1d7c3b9f0a64",
+          "name": "3f6a91c0d2e8"
+        },
+        "holder": {
+          "id": "16ced23a636af41239dc1fa1bbfcc40e68f6d40b8f312dda551ba720cdc91e77",
+          "exit_code": 0
+        },
+        "escapes": [
+          {
+            "name": "userns-host",
+            "exit_code": 125,
+            "rule": "host-namespace",
+            "output_tail": "docker: Error response from daemon: authorization denied by plugin curie-authz: refused by rule host-namespace: body.HostConfig.UsernsMode is \"host\"\n\nRun 'docker run --help' for more information"
+          },
+          {
+            "name": "privileged",
+            "exit_code": 125,
+            "rule": "privileged",
+            "output_tail": "docker: Error response from daemon: authorization denied by plugin curie-authz: refused by rule privileged: HostConfig.Privileged is true\n\nRun 'docker run --help' for more information"
+          },
+          {
+            "name": "cap-add",
+            "exit_code": 125,
+            "rule": "cap-add",
+            "output_tail": "docker: Error response from daemon: authorization denied by plugin curie-authz: refused by rule cap-add: HostConfig.CapAdd \"CAP_SYS_ADMIN\" is outside Docker's default set\n\nRun 'docker run --help' for more information"
+          },
+          {
+            "name": "host-bind",
+            "exit_code": 125,
+            "rule": "host-bind",
+            "output_tail": "docker: Error response from daemon: authorization denied by plugin curie-authz: refused by rule host-bind: HostConfig.Binds \"/:/host\" has a host path source\n\nRun 'docker run --help' for more information"
+          },
+          {
+            "name": "mount-bind",
+            "exit_code": 125,
+            "rule": "host-bind",
+            "output_tail": "docker: Error response from daemon: authorization denied by plugin curie-authz: refused by rule host-bind: HostConfig.Mounts[0].Type is \"bind\"\n\nRun 'docker run --help' for more information"
+          },
+          {
+            "name": "volume-driver-bind",
+            "exit_code": 1,
+            "rule": "volume-driver-options",
+            "output_tail": "Error response from daemon: authorization denied by plugin curie-authz: refused by rule volume-driver-options: volume DriverOpts is set"
+          },
+          {
+            "name": "seccomp-unconfined",
+            "exit_code": 125,
+            "rule": "security-opt",
+            "output_tail": "docker: Error response from daemon: authorization denied by plugin curie-authz: refused by rule security-opt: HostConfig.SecurityOpt \"seccomp=unconfined\"\n\nRun 'docker run --help' for more information"
+          },
+          {
+            "name": "exec-privileged",
+            "exit_code": 1,
+            "rule": "exec-privileged",
+            "output_tail": "Error response from daemon: authorization denied by plugin curie-authz: refused by rule exec-privileged: exec Privileged is true"
+          }
+        ],
+        "egress": {
+          "pull": {
+            "image": "alpine:3.20",
+            "exit_code": 0
+          },
+          "targets": [
+            {
+              "name": "cluster-api",
+              "target": "10.96.0.1:443",
+              "exit_code": 1,
+              "reachable": false
+            },
+            {
+              "name": "curie-api",
+              "target": "10.96.112.40:8080",
+              "exit_code": 1,
+              "reachable": false
+            },
+            {
+              "name": "metadata",
+              "target": "169.254.169.254:80",
+              "exit_code": 1,
+              "reachable": false
+            }
+          ]
+        },
+        "cleanup": {
+          "holder_removed": true,
+          "volume_absent": true
+        }
+      },
+      "daemon": {
+        "pod": "3f6a91c0d2e8",
+        "pod_uid": "d27b6e05-81c3-4a2f-b6d9-03e4f7a1c58b",
+        "info": {
+          "id": "5b0e7d2a-9c41-4f63-a8e2-1d7c3b9f0a64",
+          "name": "3f6a91c0d2e8"
+        },
+        "events": [
+          {
+            "Type": "container",
+            "Action": "create",
+            "Actor": {
+              "ID": "16ced23a636af41239dc1fa1bbfcc40e68f6d40b8f312dda551ba720cdc91e77",
+              "Attributes": {
+                "curie.fixture.nonce": "e8ce1a8c",
+                "image": "alpine:3.20",
+                "name": "nervous_beaver"
+              }
+            },
+            "scope": "local",
+            "time": 1792669442,
+            "timeNano": 1792669442581080846
+          },
+          {
+            "Type": "container",
+            "Action": "start",
+            "Actor": {
+              "ID": "16ced23a636af41239dc1fa1bbfcc40e68f6d40b8f312dda551ba720cdc91e77",
+              "Attributes": {
+                "curie.fixture.nonce": "e8ce1a8c",
+                "image": "alpine:3.20",
+                "name": "nervous_beaver"
+              }
+            },
+            "scope": "local",
+            "time": 1792669442,
+            "timeNano": 1792669442695944493
+          },
+          {
+            "Type": "container",
+            "Action": "create",
+            "Actor": {
+              "ID": "f186ef5af2f4241f9e10374f9772c99291734c81f079298ebe7173a930e7e3f9",
+              "Attributes": {
+                "curie.fixture.nonce": "e8ce1a8c",
+                "image": "alpine:3.20",
+                "name": "stupefied_einstein"
+              }
+            },
+            "scope": "local",
+            "time": 1792669446,
+            "timeNano": 1792669446783812591
+          },
+          {
+            "Type": "container",
+            "Action": "attach",
+            "Actor": {
+              "ID": "f186ef5af2f4241f9e10374f9772c99291734c81f079298ebe7173a930e7e3f9",
+              "Attributes": {
+                "curie.fixture.nonce": "e8ce1a8c",
+                "image": "alpine:3.20",
+                "name": "stupefied_einstein"
+              }
+            },
+            "scope": "local",
+            "time": 1792669446,
+            "timeNano": 1792669446786408988
+          },
+          {
+            "Type": "container",
+            "Action": "start",
+            "Actor": {
+              "ID": "f186ef5af2f4241f9e10374f9772c99291734c81f079298ebe7173a930e7e3f9",
+              "Attributes": {
+                "curie.fixture.nonce": "e8ce1a8c",
+                "image": "alpine:3.20",
+                "name": "stupefied_einstein"
+              }
+            },
+            "scope": "local",
+            "time": 1792669446,
+            "timeNano": 1792669446917198313
+          },
+          {
+            "Type": "container",
+            "Action": "die",
+            "Actor": {
+              "ID": "f186ef5af2f4241f9e10374f9772c99291734c81f079298ebe7173a930e7e3f9",
+              "Attributes": {
+                "curie.fixture.nonce": "e8ce1a8c",
+                "execDuration": "5",
+                "exitCode": "1",
+                "image": "alpine:3.20",
+                "name": "stupefied_einstein"
+              }
+            },
+            "scope": "local",
+            "time": 1792669452,
+            "timeNano": 1792669452002668785
+          },
+          {
+            "Type": "container",
+            "Action": "destroy",
+            "Actor": {
+              "ID": "f186ef5af2f4241f9e10374f9772c99291734c81f079298ebe7173a930e7e3f9",
+              "Attributes": {
+                "curie.fixture.nonce": "e8ce1a8c",
+                "image": "alpine:3.20",
+                "name": "stupefied_einstein"
+              }
+            },
+            "scope": "local",
+            "time": 1792669452,
+            "timeNano": 1792669452007086214
+          },
+          {
+            "Type": "container",
+            "Action": "create",
+            "Actor": {
+              "ID": "b9fff93443999c4f463381396d146464416c1aad13b5323e14d12e6bdd0bab64",
+              "Attributes": {
+                "curie.fixture.nonce": "e8ce1a8c",
+                "image": "alpine:3.20",
+                "name": "bold_sinoussi"
+              }
+            },
+            "scope": "local",
+            "time": 1792669452,
+            "timeNano": 1792669452477403077
+          },
+          {
+            "Type": "container",
+            "Action": "attach",
+            "Actor": {
+              "ID": "b9fff93443999c4f463381396d146464416c1aad13b5323e14d12e6bdd0bab64",
+              "Attributes": {
+                "curie.fixture.nonce": "e8ce1a8c",
+                "image": "alpine:3.20",
+                "name": "bold_sinoussi"
+              }
+            },
+            "scope": "local",
+            "time": 1792669452,
+            "timeNano": 1792669452480287992
+          },
+          {
+            "Type": "container",
+            "Action": "start",
+            "Actor": {
+              "ID": "b9fff93443999c4f463381396d146464416c1aad13b5323e14d12e6bdd0bab64",
+              "Attributes": {
+                "curie.fixture.nonce": "e8ce1a8c",
+                "image": "alpine:3.20",
+                "name": "bold_sinoussi"
+              }
+            },
+            "scope": "local",
+            "time": 1792669452,
+            "timeNano": 1792669452581069063
+          },
+          {
+            "Type": "container",
+            "Action": "die",
+            "Actor": {
+              "ID": "b9fff93443999c4f463381396d146464416c1aad13b5323e14d12e6bdd0bab64",
+              "Attributes": {
+                "curie.fixture.nonce": "e8ce1a8c",
+                "execDuration": "5",
+                "exitCode": "1",
+                "image": "alpine:3.20",
+                "name": "bold_sinoussi"
+              }
+            },
+            "scope": "local",
+            "time": 1792669457,
+            "timeNano": 1792669457660499566
+          },
+          {
+            "Type": "container",
+            "Action": "destroy",
+            "Actor": {
+              "ID": "b9fff93443999c4f463381396d146464416c1aad13b5323e14d12e6bdd0bab64",
+              "Attributes": {
+                "curie.fixture.nonce": "e8ce1a8c",
+                "image": "alpine:3.20",
+                "name": "bold_sinoussi"
+              }
+            },
+            "scope": "local",
+            "time": 1792669457,
+            "timeNano": 1792669457666208201
+          },
+          {
+            "Type": "container",
+            "Action": "create",
+            "Actor": {
+              "ID": "0c7614b6d62483579c8c23e03035db021627d40f484e0dc5072d88fa2a62d59d",
+              "Attributes": {
+                "curie.fixture.nonce": "e8ce1a8c",
+                "image": "alpine:3.20",
+                "name": "infallible_hermann"
+              }
+            },
+            "scope": "local",
+            "time": 1792669458,
+            "timeNano": 1792669458147989823
+          },
+          {
+            "Type": "container",
+            "Action": "attach",
+            "Actor": {
+              "ID": "0c7614b6d62483579c8c23e03035db021627d40f484e0dc5072d88fa2a62d59d",
+              "Attributes": {
+                "curie.fixture.nonce": "e8ce1a8c",
+                "image": "alpine:3.20",
+                "name": "infallible_hermann"
+              }
+            },
+            "scope": "local",
+            "time": 1792669458,
+            "timeNano": 1792669458150918969
+          },
+          {
+            "Type": "container",
+            "Action": "start",
+            "Actor": {
+              "ID": "0c7614b6d62483579c8c23e03035db021627d40f484e0dc5072d88fa2a62d59d",
+              "Attributes": {
+                "curie.fixture.nonce": "e8ce1a8c",
+                "image": "alpine:3.20",
+                "name": "infallible_hermann"
+              }
+            },
+            "scope": "local",
+            "time": 1792669458,
+            "timeNano": 1792669458254218183
+          },
+          {
+            "Type": "container",
+            "Action": "die",
+            "Actor": {
+              "ID": "0c7614b6d62483579c8c23e03035db021627d40f484e0dc5072d88fa2a62d59d",
+              "Attributes": {
+                "curie.fixture.nonce": "e8ce1a8c",
+                "execDuration": "0",
+                "exitCode": "0",
+                "image": "alpine:3.20",
+                "name": "infallible_hermann"
+              }
+            },
+            "scope": "local",
+            "time": 1792669458,
+            "timeNano": 1792669458346667021
+          },
+          {
+            "Type": "container",
+            "Action": "destroy",
+            "Actor": {
+              "ID": "0c7614b6d62483579c8c23e03035db021627d40f484e0dc5072d88fa2a62d59d",
+              "Attributes": {
+                "curie.fixture.nonce": "e8ce1a8c",
+                "image": "alpine:3.20",
+                "name": "infallible_hermann"
+              }
+            },
+            "scope": "local",
+            "time": 1792669458,
+            "timeNano": 1792669458350838203
+          },
+          {
+            "Type": "container",
+            "Action": "kill",
+            "Actor": {
+              "ID": "16ced23a636af41239dc1fa1bbfcc40e68f6d40b8f312dda551ba720cdc91e77",
+              "Attributes": {
+                "curie.fixture.nonce": "e8ce1a8c",
+                "image": "alpine:3.20",
+                "name": "nervous_beaver",
+                "signal": "9"
+              }
+            },
+            "scope": "local",
+            "time": 1792669459,
+            "timeNano": 1792669459417217069
+          },
+          {
+            "Type": "container",
+            "Action": "die",
+            "Actor": {
+              "ID": "16ced23a636af41239dc1fa1bbfcc40e68f6d40b8f312dda551ba720cdc91e77",
+              "Attributes": {
+                "curie.fixture.nonce": "e8ce1a8c",
+                "execDuration": "16",
+                "exitCode": "137",
+                "image": "alpine:3.20",
+                "name": "nervous_beaver"
+              }
+            },
+            "scope": "local",
+            "time": 1792669459,
+            "timeNano": 1792669459506444266
+          },
+          {
+            "Type": "container",
+            "Action": "destroy",
+            "Actor": {
+              "ID": "16ced23a636af41239dc1fa1bbfcc40e68f6d40b8f312dda551ba720cdc91e77",
+              "Attributes": {
+                "curie.fixture.nonce": "e8ce1a8c",
+                "image": "alpine:3.20",
+                "name": "nervous_beaver"
+              }
+            },
+            "scope": "local",
+            "time": 1792669459,
+            "timeNano": 1792669459510830748
+          }
+        ]
+      }
+    }
+  },
+  "cleanup": {
+    "success": {
+      "claim": "curie-thread-bddc75485e-38aa9b",
+      "objects": [
+        {
+          "kind": "Pod",
+          "name": "curie-thread-bddc75485e-38aa9b",
+          "uid": "e51729d6-6be1-41df-8e3a-42b3911a7213"
+        },
+        {
+          "kind": "Service",
+          "name": "curie-thread-bddc75485e-38aa9b",
+          "uid": "0f158702-af5d-4d39-aa2f-6be40be3a99a"
+        },
+        {
+          "kind": "NetworkPolicy",
+          "name": "curie-thread-bddc75485e-38aa9b",
+          "uid": "b90e8cf9-c6f5-4838-923d-da97cce99fa0"
+        },
+        {
+          "kind": "Secret",
+          "name": "curie-thread-bddc75485e-38aa9b",
+          "uid": "6ddcd607-9b68-49e3-a0d2-11f23534c57b"
+        }
+      ],
+      "absent": true,
+      "remaining": [],
+      "settle_seconds": 3.7
+    },
+    "cancel": {
+      "claim": "curie-thread-cfe091e62e-239bd3",
+      "objects": [
+        {
+          "kind": "Pod",
+          "name": "curie-thread-cfe091e62e-239bd3",
+          "uid": "b336af37-0afd-4014-85cc-2f9bffb94b52"
+        },
+        {
+          "kind": "Service",
+          "name": "curie-thread-cfe091e62e-239bd3",
+          "uid": "3cdec460-1090-436e-bbcc-f38cd904ea8c"
+        },
+        {
+          "kind": "NetworkPolicy",
+          "name": "curie-thread-cfe091e62e-239bd3",
+          "uid": "6ef40f5d-0d47-4225-a1f3-73e36a167e7b"
+        },
+        {
+          "kind": "Secret",
+          "name": "curie-thread-cfe091e62e-239bd3",
+          "uid": "90e82f3c-94d9-42e6-8423-cf271e3b7f40"
+        }
+      ],
+      "absent": true,
+      "remaining": [],
+      "settle_seconds": 12.3
+    },
+    "worker_kill": {
+      "claim": "curie-thread-233c597680-e17e94",
+      "objects": [
+        {
+          "kind": "Pod",
+          "name": "curie-thread-233c597680-e17e94",
+          "uid": "73eae861-b065-4e92-90ac-c07e74695383"
+        },
+        {
+          "kind": "Service",
+          "name": "curie-thread-233c597680-e17e94",
+          "uid": "e0c72fa2-bf72-4cc2-9d3c-9f9b7a8672f8"
+        },
+        {
+          "kind": "NetworkPolicy",
+          "name": "curie-thread-233c597680-e17e94",
+          "uid": "3f441df5-8c0d-481f-846e-d85969362da7"
+        },
+        {
+          "kind": "Secret",
+          "name": "curie-thread-233c597680-e17e94",
+          "uid": "12e21d71-42dd-4816-b324-46de705bb110"
+        }
+      ],
+      "absent": true,
+      "remaining": [],
+      "settle_seconds": 92.0
+    },
+    "orphan_sweep": {
+      "claim": "curie-thread-b619f64f82-396074",
+      "objects": [
+        {
+          "kind": "Pod",
+          "name": "curie-thread-b619f64f82-396074",
+          "uid": "1a0a217d-8115-49e3-addd-d159e95444af"
+        },
+        {
+          "kind": "Service",
+          "name": "curie-thread-b619f64f82-396074",
+          "uid": "82d8afa2-ba6a-4e06-bc1d-18bbf80bdafa"
+        },
+        {
+          "kind": "NetworkPolicy",
+          "name": "curie-thread-b619f64f82-396074",
+          "uid": "aba8863c-8364-4ed5-9cc0-54d953f2e86a"
+        },
+        {
+          "kind": "Secret",
+          "name": "curie-thread-b619f64f82-396074",
+          "uid": "142c90af-7a88-4ca8-ab2f-f8fe6be2e6d8"
+        }
+      ],
+      "absent": true,
+      "remaining": [],
+      "settle_seconds": 181.7
+    }
+  },
+  "control": {
+    "docker_env": false,
+    "daemon_objects": 0,
+    "client_docker_files": false
+  },
+  "upgrade": {
+    "plan_lines": [
+      "repository runner rebuild: build catalog repository acme-corp/acme-bot in registry.example.com/acme-corp on registry.example.com/curie/curie-runner@sha256:4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c during Apply, then apply its receipt in the single Helm upgrade",
+      "custom repository runner preserved: acme-corp/acme-tools declares Dockerfile Dockerfile; after this upgrade, from the directory of a repo-runner.yaml spec containing its retained tools, probes and Dockerfile declaration, run: curie cluster factory --repo-runner acme-corp/acme-tools=repo-runner.yaml --registry registry.example.com/acme-corp --namespace curie --release curie --chart oci://registry.example.com/curie/charts/curie"
+    ],
+    "catalog": {
+      "repo": "acme-corp/acme-bot",
+      "before": "registry.example.com/acme-corp/runner-acme-bot@sha256:1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a",
+      "after": "registry.example.com/acme-corp/runner-acme-bot@sha256:2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b"
+    },
+    "custom": {
+      "repo": "acme-corp/acme-tools",
+      "before": "registry.example.com/acme-corp/runner-acme-tools@sha256:3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e",
+      "after": "registry.example.com/acme-corp/runner-acme-tools@sha256:3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e",
+      "reply": "This agent cannot start: repository acme-corp/acme-tools runner image was built on platform runner registry.example.com/curie/curie-runner@sha256:abababababababababababababababababababababababababababababababab, not this installation's sha256:4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c (stale_base); rebuild and rebind it on the installed pinned platform runner with `curie cluster factory --repo-runner acme-corp/acme-tools=<spec> --registry <registry> --namespace <namespace> --release <release> --context <context>`; use a repository runner spec containing its retained tools, probes and Dockerfile declaration. An operator has to make that change."
+    }
+  },
+  "ci": {
+    "first_head": "0f1e2d3c4b5a69788796a5b4c3d2e1f00f1e2d3c",
+    "required": [
+      "Compose (release stack validates)",
+      "Contracts (generated TypeScript compiles)",
+      "Python (ruff + mypy + pytest)",
+      "Rust (fmt + clippy + test)",
+      "UI (lint + vitest + build + Playwright)",
+      "gitleaks (full history)",
+      "E2E required",
+      "Fix pin verification",
+      "Chart (lint + template + kubeconform)"
+    ],
+    "checks": [
+      {
+        "name": "Rust (fmt + clippy + test)",
+        "head_sha": "0f1e2d3c4b5a69788796a5b4c3d2e1f00f1e2d3c",
+        "status": "completed",
+        "conclusion": "success"
+      },
+      {
+        "name": "Python (ruff + mypy + pytest)",
+        "head_sha": "0f1e2d3c4b5a69788796a5b4c3d2e1f00f1e2d3c",
+        "status": "completed",
+        "conclusion": "success"
+      },
+      {
+        "name": "Rust convergence regressions (kind)",
+        "head_sha": "0f1e2d3c4b5a69788796a5b4c3d2e1f00f1e2d3c",
+        "status": "completed",
+        "conclusion": "success"
+      },
+      {
+        "name": "Rust test (partition 1/3)",
+        "head_sha": "0f1e2d3c4b5a69788796a5b4c3d2e1f00f1e2d3c",
+        "status": "completed",
+        "conclusion": "success"
+      },
+      {
+        "name": "Rust test (partition 3/3)",
+        "head_sha": "0f1e2d3c4b5a69788796a5b4c3d2e1f00f1e2d3c",
+        "status": "completed",
+        "conclusion": "success"
+      },
+      {
+        "name": "Rust test (partition 2/3)",
+        "head_sha": "0f1e2d3c4b5a69788796a5b4c3d2e1f00f1e2d3c",
+        "status": "completed",
+        "conclusion": "success"
+      },
+      {
+        "name": "CodeQL",
+        "head_sha": "0f1e2d3c4b5a69788796a5b4c3d2e1f00f1e2d3c",
+        "status": "completed",
+        "conclusion": "success"
+      },
+      {
+        "name": "Rust test build",
+        "head_sha": "0f1e2d3c4b5a69788796a5b4c3d2e1f00f1e2d3c",
+        "status": "completed",
+        "conclusion": "success"
+      },
+      {
+        "name": "E2E required",
+        "head_sha": "0f1e2d3c4b5a69788796a5b4c3d2e1f00f1e2d3c",
+        "status": "completed",
+        "conclusion": "success"
+      },
+      {
+        "name": "E2E cluster upgrade matrix (${{ matrix.shard }})",
+        "head_sha": "0f1e2d3c4b5a69788796a5b4c3d2e1f00f1e2d3c",
+        "status": "completed",
+        "conclusion": "skipped"
+      },
+      {
+        "name": "Eval falsifiability gate (fake model, offline)",
+        "head_sha": "0f1e2d3c4b5a69788796a5b4c3d2e1f00f1e2d3c",
+        "status": "completed",
+        "conclusion": "skipped"
+      },
+      {
+        "name": "E2E approval resume after worker and store restarts (kind)",
+        "head_sha": "0f1e2d3c4b5a69788796a5b4c3d2e1f00f1e2d3c",
+        "status": "completed",
+        "conclusion": "skipped"
+      },
+      {
+        "name": "E2E released chart upgrade negative control (nil unsafe helpers)",
+        "head_sha": "0f1e2d3c4b5a69788796a5b4c3d2e1f00f1e2d3c",
+        "status": "completed",
+        "conclusion": "skipped"
+      },
+      {
+        "name": "E2E OIDC console login (real Dex)",
+        "head_sha": "0f1e2d3c4b5a69788796a5b4c3d2e1f00f1e2d3c",
+        "status": "completed",
+        "conclusion": "skipped"
+      },
+      {
+        "name": "E2E parity ladder (local-release, fake model)",
+        "head_sha": "0f1e2d3c4b5a69788796a5b4c3d2e1f00f1e2d3c",
+        "status": "completed",
+        "conclusion": "skipped"
+      },
+      {
+        "name": "E2E scripted factory (kind, scripted model, ${{ matrix.suite }})",
+        "head_sha": "0f1e2d3c4b5a69788796a5b4c3d2e1f00f1e2d3c",
+        "status": "completed",
+        "conclusion": "skipped"
+      },
+      {
+        "name": "E2E chart runtime regressions (kind, Calico, ${{ matrix.leg }})",
+        "head_sha": "0f1e2d3c4b5a69788796a5b4c3d2e1f00f1e2d3c",
+        "status": "completed",
+        "conclusion": "skipped"
+      },
+      {
+        "name": "E2E rollout-free invocation and dead-consumer recovery (kind)",
+        "head_sha": "0f1e2d3c4b5a69788796a5b4c3d2e1f00f1e2d3c",
+        "status": "completed",
+        "conclusion": "skipped"
+      },
+      {
+        "name": "CLI runs on old glibc (and publishes per-commit binaries)",
+        "head_sha": "0f1e2d3c4b5a69788796a5b4c3d2e1f00f1e2d3c",
+        "status": "completed",
+        "conclusion": "skipped"
+      },
+      {
+        "name": "CLI builds for macOS (the fourth release target)",
+        "head_sha": "0f1e2d3c4b5a69788796a5b4c3d2e1f00f1e2d3c",
+        "status": "completed",
+        "conclusion": "skipped"
+      },
+      {
+        "name": "E2E parity ladder (skill + local, fake model)",
+        "head_sha": "0f1e2d3c4b5a69788796a5b4c3d2e1f00f1e2d3c",
+        "status": "completed",
+        "conclusion": "skipped"
+      },
+      {
+        "name": "E2E released chart upgrade (released install to candidate)",
+        "head_sha": "0f1e2d3c4b5a69788796a5b4c3d2e1f00f1e2d3c",
+        "status": "completed",
+        "conclusion": "skipped"
+      },
+      {
+        "name": "E2E parity ladder (cluster rung on kind, fake model)",
+        "head_sha": "0f1e2d3c4b5a69788796a5b4c3d2e1f00f1e2d3c",
+        "status": "completed",
+        "conclusion": "skipped"
+      },
+      {
+        "name": "Forge instance regression (kind, ${{ matrix.suite }})",
+        "head_sha": "0f1e2d3c4b5a69788796a5b4c3d2e1f00f1e2d3c",
+        "status": "completed",
+        "conclusion": "skipped"
+      },
+      {
+        "name": "Build the curie release binary",
+        "head_sha": "0f1e2d3c4b5a69788796a5b4c3d2e1f00f1e2d3c",
+        "status": "completed",
+        "conclusion": "skipped"
+      },
+      {
+        "name": "Build CI images (no push)",
+        "head_sha": "0f1e2d3c4b5a69788796a5b4c3d2e1f00f1e2d3c",
+        "status": "completed",
+        "conclusion": "skipped"
+      },
+      {
+        "name": "Admitted agent runtime regressions (kind, shard ${{ matrix.shard }}/5)",
+        "head_sha": "0f1e2d3c4b5a69788796a5b4c3d2e1f00f1e2d3c",
+        "status": "completed",
+        "conclusion": "skipped"
+      },
+      {
+        "name": "Build ${{ matrix.name }} image (no push)",
+        "head_sha": "0f1e2d3c4b5a69788796a5b4c3d2e1f00f1e2d3c",
+        "status": "completed",
+        "conclusion": "skipped"
+      },
+      {
+        "name": "Image proofs (smoke, Docker daemon, toolchain)",
+        "head_sha": "0f1e2d3c4b5a69788796a5b4c3d2e1f00f1e2d3c",
+        "status": "completed",
+        "conclusion": "success"
+      },
+      {
+        "name": "Python pytest (shard 3/6)",
+        "head_sha": "0f1e2d3c4b5a69788796a5b4c3d2e1f00f1e2d3c",
+        "status": "completed",
+        "conclusion": "success"
+      },
+      {
+        "name": "Python dry run fixture (pytest)",
+        "head_sha": "0f1e2d3c4b5a69788796a5b4c3d2e1f00f1e2d3c",
+        "status": "completed",
+        "conclusion": "success"
+      },
+      {
+        "name": "Python pytest (shard 4/6)",
+        "head_sha": "0f1e2d3c4b5a69788796a5b4c3d2e1f00f1e2d3c",
+        "status": "completed",
+        "conclusion": "success"
+      },
+      {
+        "name": "Python pytest (shard 5/6)",
+        "head_sha": "0f1e2d3c4b5a69788796a5b4c3d2e1f00f1e2d3c",
+        "status": "completed",
+        "conclusion": "success"
+      },
+      {
+        "name": "Runtime assertion registration",
+        "head_sha": "0f1e2d3c4b5a69788796a5b4c3d2e1f00f1e2d3c",
+        "status": "completed",
+        "conclusion": "success"
+      },
+      {
+        "name": "Python pytest (shard 1/6)",
+        "head_sha": "0f1e2d3c4b5a69788796a5b4c3d2e1f00f1e2d3c",
+        "status": "completed",
+        "conclusion": "success"
+      },
+      {
+        "name": "Python pytest (shard 2/6)",
+        "head_sha": "0f1e2d3c4b5a69788796a5b4c3d2e1f00f1e2d3c",
+        "status": "completed",
+        "conclusion": "success"
+      },
+      {
+        "name": "E2E cluster upgrade matrix shards",
+        "head_sha": "0f1e2d3c4b5a69788796a5b4c3d2e1f00f1e2d3c",
+        "status": "completed",
+        "conclusion": "success"
+      },
+      {
+        "name": "Python pytest (shard 6/6)",
+        "head_sha": "0f1e2d3c4b5a69788796a5b4c3d2e1f00f1e2d3c",
+        "status": "completed",
+        "conclusion": "success"
+      },
+      {
+        "name": "Python static gates",
+        "head_sha": "0f1e2d3c4b5a69788796a5b4c3d2e1f00f1e2d3c",
+        "status": "completed",
+        "conclusion": "success"
+      },
+      {
+        "name": "Python container fixtures (pytest)",
+        "head_sha": "0f1e2d3c4b5a69788796a5b4c3d2e1f00f1e2d3c",
+        "status": "completed",
+        "conclusion": "success"
+      },
+      {
+        "name": "CI policy (workflow meta-tests)",
+        "head_sha": "0f1e2d3c4b5a69788796a5b4c3d2e1f00f1e2d3c",
+        "status": "completed",
+        "conclusion": "success"
+      },
+      {
+        "name": "Select Rust tests",
+        "head_sha": "0f1e2d3c4b5a69788796a5b4c3d2e1f00f1e2d3c",
+        "status": "completed",
+        "conclusion": "success"
+      },
+      {
+        "name": "Chart lint, kubeconform, and render assertions (1 of 3)",
+        "head_sha": "0f1e2d3c4b5a69788796a5b4c3d2e1f00f1e2d3c",
+        "status": "completed",
+        "conclusion": "skipped"
+      },
+      {
+        "name": "Chart render assertions (2 of 3)",
+        "head_sha": "0f1e2d3c4b5a69788796a5b4c3d2e1f00f1e2d3c",
+        "status": "completed",
+        "conclusion": "skipped"
+      },
+      {
+        "name": "Automatic thread isolation (kind)",
+        "head_sha": "0f1e2d3c4b5a69788796a5b4c3d2e1f00f1e2d3c",
+        "status": "completed",
+        "conclusion": "skipped"
+      },
+      {
+        "name": "Reject legacy extraEnv before upgrade mutation",
+        "head_sha": "0f1e2d3c4b5a69788796a5b4c3d2e1f00f1e2d3c",
+        "status": "completed",
+        "conclusion": "skipped"
+      },
+      {
+        "name": "Chart render assertions (3 of 3, retained values through the real CLI)",
+        "head_sha": "0f1e2d3c4b5a69788796a5b4c3d2e1f00f1e2d3c",
+        "status": "completed",
+        "conclusion": "skipped"
+      },
+      {
+        "name": "Chart (lint + template + kubeconform)",
+        "head_sha": "0f1e2d3c4b5a69788796a5b4c3d2e1f00f1e2d3c",
+        "status": "completed",
+        "conclusion": "success"
+      },
+      {
+        "name": "UI (lint + vitest + build + Playwright)",
+        "head_sha": "0f1e2d3c4b5a69788796a5b4c3d2e1f00f1e2d3c",
+        "status": "completed",
+        "conclusion": "success"
+      },
+      {
+        "name": "Preserve next on release merge",
+        "head_sha": "0f1e2d3c4b5a69788796a5b4c3d2e1f00f1e2d3c",
+        "status": "completed",
+        "conclusion": "success"
+      },
+      {
+        "name": "Action SHA pins",
+        "head_sha": "0f1e2d3c4b5a69788796a5b4c3d2e1f00f1e2d3c",
+        "status": "completed",
+        "conclusion": "success"
+      },
+      {
+        "name": "Turn canary contract",
+        "head_sha": "0f1e2d3c4b5a69788796a5b4c3d2e1f00f1e2d3c",
+        "status": "completed",
+        "conclusion": "success"
+      },
+      {
+        "name": "Rust (fmt + clippy)",
+        "head_sha": "0f1e2d3c4b5a69788796a5b4c3d2e1f00f1e2d3c",
+        "status": "completed",
+        "conclusion": "success"
+      },
+      {
+        "name": "Compose (release stack validates)",
+        "head_sha": "0f1e2d3c4b5a69788796a5b4c3d2e1f00f1e2d3c",
+        "status": "completed",
+        "conclusion": "success"
+      },
+      {
+        "name": "Select end to end tiers",
+        "head_sha": "0f1e2d3c4b5a69788796a5b4c3d2e1f00f1e2d3c",
+        "status": "completed",
+        "conclusion": "success"
+      },
+      {
+        "name": "Contracts (generated TypeScript compiles)",
+        "head_sha": "0f1e2d3c4b5a69788796a5b4c3d2e1f00f1e2d3c",
+        "status": "completed",
+        "conclusion": "success"
+      },
+      {
+        "name": "Commit messages (no AI attribution)",
+        "head_sha": "0f1e2d3c4b5a69788796a5b4c3d2e1f00f1e2d3c",
+        "status": "completed",
+        "conclusion": "success"
+      },
+      {
+        "name": "SRE bot adapter credential reconciliation",
+        "head_sha": "0f1e2d3c4b5a69788796a5b4c3d2e1f00f1e2d3c",
+        "status": "completed",
+        "conclusion": "success"
+      },
+      {
+        "name": "Detect chart-relevant changes",
+        "head_sha": "0f1e2d3c4b5a69788796a5b4c3d2e1f00f1e2d3c",
+        "status": "completed",
+        "conclusion": "success"
+      },
+      {
+        "name": "Analyze (python)",
+        "head_sha": "0f1e2d3c4b5a69788796a5b4c3d2e1f00f1e2d3c",
+        "status": "completed",
+        "conclusion": "success"
+      },
+      {
+        "name": "Comment when a Closes targets P0 / release-blocker / sre-bot-e2e-demo",
+        "head_sha": "0f1e2d3c4b5a69788796a5b4c3d2e1f00f1e2d3c",
+        "status": "completed",
+        "conclusion": "success"
+      },
+      {
+        "name": "Analyze (javascript-typescript)",
+        "head_sha": "0f1e2d3c4b5a69788796a5b4c3d2e1f00f1e2d3c",
+        "status": "completed",
+        "conclusion": "success"
+      },
+      {
+        "name": "gitleaks (full history)",
+        "head_sha": "0f1e2d3c4b5a69788796a5b4c3d2e1f00f1e2d3c",
+        "status": "completed",
+        "conclusion": "success"
+      },
+      {
+        "name": "PR body (real newlines)",
+        "head_sha": "0f1e2d3c4b5a69788796a5b4c3d2e1f00f1e2d3c",
+        "status": "completed",
+        "conclusion": "success"
+      },
+      {
+        "name": "Fix pin verification",
+        "head_sha": "0f1e2d3c4b5a69788796a5b4c3d2e1f00f1e2d3c",
+        "status": "completed",
+        "conclusion": "success"
+      }
+    ]
+  },
+  "lifecycle": {
+    "schema": "daemon-lifecycle/v1",
+    "failures": []
+  },
+  "compose": {
+    "project": "curie-compose-5c0d3a71-5cc379",
+    "window": [
+      1792819242.7541106,
+      1792819254.3097446
+    ],
+    "docker_host": "tcp://curie-docker-sections-a01e0a8:2375",
+    "published_host": "curie-docker-sections-a01e0a8",
+    "info": {
+      "id": "c1c8410e-1137-4ebf-9eb9-586d0a2b134b",
+      "name": "7bd5b54461f4"
+    },
+    "image": "python:3.13.15-slim-bookworm@sha256:ed86c82274b3c69b52fb5820f358f0bd7df0b603332063cb5c6e32bd220c3e6e",
+    "files": {
+      "compose.yaml": "cd4ffc855eb671a21348c2640f255282b359daf0420c02d155854e3f1266f8b9",
+      "server/Dockerfile": "2ba811bd5e79f21a7ec9d7b28540fca3ae4564ceeff0a7065d2a53bad61114fc",
+      "server/index.html": "c3041b7463803a09032cf193a624e1510e892bd9b3fcf930ddd08a57190a6d3c",
+      "client/Dockerfile": "cb72180203c48daa25bec58e437e809ed2d3b1583f6f083ab4124214697e74b6"
+    },
+    "expected": "curie-compose 5c0d3a71",
+    "build": {
+      "exit_code": 0,
+      "output_tail": "curie-compose-5c0d3a71-5cc379-server done\n#11 DONE 0.0s\n\n#12 [client] resolving provenance for metadata file\n#12 DONE 0.0s\n\n#13 [server] resolving provenance for metadata file\n#13 DONE 0.0s\n Image curie-compose-5c0d3a71-5cc379-client Building \n Image curie-compose-5c0d3a71-5cc379-server Building \n Image curie-compose-5c0d3a71-5cc379-client Built \n Image curie-compose-5c0d3a71-5cc379-server Built \n"
+    },
+    "up": {
+      "exit_code": 0,
+      "output_tail": "-compose-5c0d3a71-5cc379-client-1 Creating \n Container curie-compose-5c0d3a71-5cc379-server-1 Created \n Container curie-compose-5c0d3a71-5cc379-client-1 Created \n Container curie-compose-5c0d3a71-5cc379-server-1 Starting \n Container curie-compose-5c0d3a71-5cc379-client-1 Starting \n Container curie-compose-5c0d3a71-5cc379-server-1 Started \n Container curie-compose-5c0d3a71-5cc379-client-1 Started \n"
+    },
+    "services": [
+      {
+        "service": "client",
+        "state": "running"
+      },
+      {
+        "service": "server",
+        "state": "running"
+      }
+    ],
+    "reach": {
+      "from": "client",
+      "to": "server:8080",
+      "exit_code": 0,
+      "body": "curie-compose 5c0d3a71\n"
+    },
+    "published": {
+      "port": 32773,
+      "url": "http://curie-docker-sections-a01e0a8:32773/index.html",
+      "status": 200,
+      "body": "curie-compose 5c0d3a71\n"
+    },
+    "down": {
+      "exit_code": 0,
+      "output_tail": "ie-compose-5c0d3a71-5cc379-client-1 Removed \n Network curie-compose-5c0d3a71-5cc379_default Removing \n Image curie-compose-5c0d3a71-5cc379-server:latest Removing \n Image curie-compose-5c0d3a71-5cc379-client:latest Removing \n Image curie-compose-5c0d3a71-5cc379-server:latest Removed \n Image curie-compose-5c0d3a71-5cc379-client:latest Removed \n Network curie-compose-5c0d3a71-5cc379_default Removed \n"
+    },
+    "cleanup": {
+      "containers": [],
+      "networks": [],
+      "volumes": [],
+      "images": [],
+      "verified": true
+    }
+  },
+  "skill_rung": {
+    "window": [
+      1792819219.9588237,
+      1792819241.1336918
+    ],
+    "docker_host": "tcp://curie-docker-sections-a01e0a8:2375",
+    "published_host": "curie-docker-sections-a01e0a8",
+    "nonce": "3f9b2c64",
+    "info": {
+      "id": "c1c8410e-1137-4ebf-9eb9-586d0a2b134b",
+      "name": "7bd5b54461f4"
+    },
+    "inputs": {
+      "curie_bin": {
+        "sha256": "fbf74889adc7124a6a1dd43a240c8980c68574143fd24d0d77afd714563a2aa5",
+        "version": "curie 0.14.1"
+      },
+      "files": {
+        "cli/scripts/e2e-ladder.sh": "1a46c26d3647731de02fe5cc119e5969b2b470e9d2e332068aa3dbef6af85bfb",
+        "cli/scripts/e2e.sh": "6685ca83577c091bb913094a1437b82f78acd262fbdf5816b7e121a484bbbdf7",
+        "cli/scripts/gnu-process.py": "6dc670b8a3bae3fa6f3ef42e4a9c0b94a2f205ee26d337b813dc5b381e1bd75c"
+      },
+      "bundle": {
+        "path": "examples/weather",
+        "digest": "14dd4b84fe978febd07eeae95d042f076cc2ebccc55016b335725226e8af753a"
+      },
+      "source_revision": "108ea3ca7672c7f3f26b4c367597f518a7876051"
+    },
+    "image": {
+      "tag": "curie-runner",
+      "id": "sha256:898f4ab606531f5a3f5f5bcb6e3f02ad1307ee8f795a292418f411e3501aa134",
+      "label_nonce": "3f9b2c64",
+      "dockerfile": "runner/Dockerfile",
+      "dockerfile_sha256": "930254e6ccafccf5ff2ec3739ea7cf136c4e668fee8f6c48a2e31c15ce424721",
+      "daemon_id": "c1c8410e-1137-4ebf-9eb9-586d0a2b134b",
+      "exit_code": 0,
+      "output_tail": "sr/local/bin/node\n#22 CACHED\n\n#23 [stage-1  8/19] COPY runner/pip-requirements.txt ./runner/pip-requirements.txt\n#23 CACHED\n\n#24 [stage-1 19/19] COPY runner/pip.conf /etc/pip.conf\n#24 CACHED\n\n#25 exporting to image\n#25 exporting layers done\n#25 writing image sha256:898f4ab606531f5a3f5f5bcb6e3f02ad1307ee8f795a292418f411e3501aa134 done\n#25 naming to docker.io/library/curie-runner done\n#25 DONE 0.0s\n"
+    },
+    "ladder": {
+      "tiers": "skill",
+      "live": "0",
+      "exit_code": 0,
+      "passed": true,
+      "output_tail": "ffline, scripted replies)           \u2502\n\u2570\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u256f\nskill: no connector containers for a bundle that declares none (project local-1b2006c0-af1f-470c-8baa-c758d23d8f07)\n\nSKIPPING rung 2 (local): not named in CURIE_E2E_TIERS.\n\nSKIPPING rung (local-release): not named in CURIE_E2E_TIERS. Needs the\nrelease-pinned images built and tagged locally first; name it explicitly,\ne.g. CURIE_E2E_TIERS=skill,local,local-release.\n\nSKIPPING rung 3 (cluster): not named in CURIE_E2E_TIERS. It needs a live\nrelease and host-reachable pods, so it is opt-in: CURIE_E2E_TIERS=all.\n\n=== parity summary (what this run actually proved) ===\nrungs run: skill\nbundle identity: 1e4a44cf113dbe895577aaf395b8ae8543a74a1abd5ad371647aa1c685afca2b, reported by rung(s): skill\nnote: only one rung reported a digest, so the CROSS-RUNG digest comparison was vacuous for this tier set -- only that rung's own identity was recorded. This is NOT a cross-rung parity claim.\nsuite: \"weather\" with 1 case(s), resolved by the tier's own loader at rung(s): skill\ncase ids: reports-a-temperature (proven at local/cluster by digest equality; read back directly at skill, and at every rung under CURIE_E2E_LIVE=1)\nmodel mode read off the deployed artifact at rung(s): none\ngrading: PLUMBING-ONLY rungs: skill -- sealed against the fake model, so no rung graded reply content and a green here must never be read as a graded pass (ADR-0055, #612).\n\nLADDER PASS (tiers: skill)\nscaffolded demo at /tmp/tmp.MBhkTBDoIt/try-clean/tmp/curie-try-8dd6cc66-6615-4f08-932e-6a15b5ab9721\nno model credential found; using the scripted fake model\nstarting runner container 'curie-runner-local' from 'curie-runner'\nwaiting for runner: ok (1.0s)\nState recorded in /tmp/tmp.MBhkTBDoIt/try-clean/tmp/curie-try-8dd6cc66-6615-4f08-932e-6a15b5ab9721/.curie/runner.json; run skill down from that directory. skill message, skill eval, and skill status also work there. skill message and skill eval also accept --url.\n  -> [shell request] running shell request\n  !  possible change via shell request: request started; check the outcome before retrying\n  !  possible change via shell request: request finished; check the outcome before retrying\n\u2713 stopped and removed container 'curie-runner-local'\nremoved temporary demo at /tmp/tmp.MBhkTBDoIt/try-clean/tmp/curie-try-8dd6cc66-6615-4f08-932e-6a15b5ab9721\nstarting runner container 'curie-runner-local' from 'curie-runner'\nwaiting for runner: ok (1.0s)\n  -> [shell request] running shell request\n  !  possible change via shell request: request started; check the outcome before retrying\n  !  possible change via shell request: request finished; check the outcome before retrying\n-- final (done)\n\u2713 stopped and removed container 'curie-runner-local'\nrunner http://curie-docker-sections-a01e0a8:7245\nbundle 1e4a44cf113dbe895577aaf395b8ae8543a74a1abd5ad371647aa1c685afca2b\n\u26a0 warn  editable bundle differs from the running snapshot. Run `curie skill up` to load the changes.\n  -> [shell request] running shell request\n  !  possible change via shell request: request started; check the outcome before retrying\n  !  possible change via shell request: request finished; check the outcome before retrying\n-- final (done)\n\u2713 stopped and removed container 'curie-e2e-runner'\n\u2713 removed network 'curie-e2e-runner-net'\n\u26a0 warn  container 'curie-ladder-747-leftover-7200' does not carry the curietech.ai/managed-by=curie-cli label, so it may not be a Curie runner; removing it anyway\n\u2713 stopped and removed container 'curie-ladder-747-leftover-7200'\nno .curie/runner.json was present, so nothing to clear\nstarting runner container 'curie-ladder-hermetic-7200' from 'curie-runner'\nwaiting for runner: ok (1.0s)\nState recorded in /tmp/tmp.wqNmQ5kq2x/bundle-hermetic/.curie/runner.json; run skill down from that directory. skill message, skill eval, and skill status also work there. skill message and skill eval also accept --url.\n\u2713 stopped and removed container 'curie-ladder-hermetic-7200'\n"
+    },
+    "cleanup": {
+      "image_removed": true,
+      "containers": [],
+      "networks": [],
+      "volumes": [],
+      "verified": true
+    }
+  }
+}

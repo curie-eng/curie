@@ -65,6 +65,11 @@ builds and other toolchains need the setup described in the
 | An [Anthropic](https://console.anthropic.com/) API key (`sk-ant-`) or an [OpenRouter](https://openrouter.ai/) API key (`sk-or-`) | Anthropic defaults to `claude-sonnet-5-5` for implementation and `claude-opus-5-5` for review. OpenRouter defaults to `z-ai/glm-5.3-flash` for implementation and `openai/gpt-6.1-sol` for review. Plan on about 5 USD of available OpenRouter credit per run; actual spend varies. The command asks once, or reads `CURIE_CREDENTIALS`. |
 | A GitHub account | your own GitHub App and the trial repository |
 
+For the default new-kind path on Docker Desktop, plan for **at least 16 GiB
+allocated to Docker** before creating the cluster. Larger repositories may
+need more. For an existing cluster, check its available capacity instead.
+See [local kind capacity and recovery](#local-kind-capacity-and-recovery).
+
 The command checks all required tools on `PATH` before running any command or
 changing the cluster. If tools are missing, it lists every missing tool with
 its official installation link. `--dry-run` performs the same prerequisite
@@ -74,6 +79,17 @@ including when the context belongs to an existing kind cluster.
 A released `curie` deploys the dark factory runner image that release published.
 A binary built from a source checkout has no published layer for its own
 version and stops before deploy, naming the release install.
+
+### Follow the checkpoints
+
+| After | Confirm | If it differs |
+|---|---|---|
+| Installing the CLI | `curie --version` reports the released version you intended. | Check [installation](#install-curie) and your `PATH`. |
+| First quickstart command | `Kubernetes context:` is your selected context and the command prints a prefilled App registration link. No App has been applied yet. | Check [target selection](#choose-the-target-and-run-the-command) and [troubleshooting](#troubleshooting). |
+| GitHub App registration | The App is installed on the exact trial repository; you have its App ID and an absolute path to its private key. | Finish [App setup](#rerun-with-the-app) before the second command. |
+| Second quickstart command | `Factory quickstart ready` names the selected context, repository, polling intake, label, and deployed image. | Check [App setup](#rerun-with-the-app) and [troubleshooting](#troubleshooting). |
+| Adding the issue label | The App adds a status comment, then the issue shows queued or running state. | Check [label authority](#label-an-issue), then [sandbox capacity](#local-kind-capacity-and-recovery). |
+| PR publication and CI wait | Inspect the PR diff and verification table; use the issue's final status comment to determine whether the run completed or needs human action. | A PR can stay open after `Could not complete:`. Follow [CI and troubleshooting](#what-a-repository-with-no-ci-sees) rather than treating publication as success. |
 
 ## Install Curie
 
@@ -281,6 +297,11 @@ The cluster factory command performs the same check for its allowlisted reposito
 Without `--app-id`, it prints `toolchain inference skipped: no --app-id`.
 Dry-run describes the inference without reading GitHub.
 
+For a repository-specific image based on issue and PR history, use the local
+[factory environment setup skill](factory-environments.md) before reviewing a
+`--repo-runner` build and binding change. Its companion maintenance skill
+reviews later `needs human` outcomes for image and non-image repairs.
+
 Factory commits are authored by the GitHub App's bot identity. Before any Helm
 call, App setup resolves `<slug>[bot]` through GitHub's user API and configures
 `worker.publication.gitUserName=<slug>[bot]` and
@@ -405,14 +426,24 @@ reads as a single forge configuration document:
 3. `factory.bindings` join a tracker to repositories. Each entry under
    `repos` has an `alias`, a `codeHost`, a `projectId`, a `path`, optional
    `bases` and `defaultBase`, and an optional `ci` policy (`required` with
-   `key`, `paths` and `pendingKeyPrefix`, and `metadataRerunKeys`).
+   `key`, `paths` and `pendingKeyPrefix`, and `metadataRerunKeys`). `bases`
+   accepts case-sensitive glob patterns such as `release/*`; `defaultBase`
+   remains a literal allowed branch. Every selected branch must exist remotely.
 4. `factory.codeHosts[].egress` and `factory.trackers[].egress` list the CIDRs
    and ports the entry needs. A GitHub entry with none gets the chart's built-in
    GitHub set. `factory.sandboxEgress.<agent>: true` enrolls an agent in that
    egress policy.
 5. `factory.enabled`, `factory.intake` (`poll` or `webhook`),
    `factory.cardBaseUrl` and `factory.ciWaitSeconds` replace the matching
-   `api.*` settings.
+   `api.*` settings. `factory.baseLabelSettleSeconds` controls the wait after
+   the selection label is applied before the factory reads the current base
+   labels at sandbox acquisition. It defaults to 60 seconds; zero is valid.
+
+Base changes restart unpublished work or durably rebase and retarget its PR.
+A clean replay uses an expected-head fence, and required CI runs on a distinct
+same-tree commit pushed after retargeting. Conflicts leave the branch and PR
+target unchanged until the factory label is reapplied; see the
+[base selection rules](../operations.md#admitting-a-labelled-github-issue).
 
 The old `api.githubFactory*` keys are removed. To upgrade a v0.12.5
 installation configured with `curie cluster factory`, use a CLI containing
@@ -931,6 +962,14 @@ addresses your Data Center host resolves to on its port.
 
 ## Label an issue
 
+For guided issue preparation, install the
+[preparation skill](factory-preparation.md#install-prepare-and-hand-off) in your
+coding agent. It helps clarify the request, presents the full specification for
+review, and can publish and select it after explicit approval using your tracker
+connection. The guide includes the install command, supported clients and source
+build instructions while the feature awaits release. This uses the factory you
+configured above; skill installation alone does not create one.
+
 In the GitHub website, open an issue on the repository and add the label
 `curie-factory`. The person who adds the label must have write or admin access.
 Anyone else's label is ignored.
@@ -951,6 +990,34 @@ State labels Curie manages, one at a time:
 
 A cancelled run removes all four. Curie never changes your `curie-factory` label.
 
+## Local kind capacity and recovery
+
+If an admitted issue stays queued or says it is waiting for sandbox capacity,
+inspect the trial context before changing the issue label:
+
+```bash
+kubectl config current-context
+kubectl get pods -n "$CURIE_NAMESPACE"
+```
+
+For a Pending `curie-thread-...` pod, run
+`kubectl describe pod -n "$CURIE_NAMESPACE" POD_NAME` (replace `POD_NAME` with
+the name shown above) and read its Events. An `Insufficient memory` event
+means the scheduler cannot place that pod; waiting longer does not
+increase node capacity. Increase Docker Desktop's memory allocation to at
+least 16 GiB and recreate the disposable cluster. Alternatively, select a
+Kubernetes cluster with more available capacity. Then repeat the
+[first](#choose-the-target-and-run-the-command) and
+[second](#rerun-with-the-app) commands. Reuse an App already installed on the
+trial repository; cluster recreation does not require another App.
+
+If the issue is still queued after the new cluster is ready, remove
+`curie-factory` from the issue, wait for the status comment to report
+cancellation, then add the label again. Confirm the issue moves to running.
+Relabelling can start a new model run and incur another charge; inspect the
+issue and PR first. Administrators sizing agents for larger workloads can use
+the [bundle reference](../../examples/dark-factory/README.md#deploy-it-as-the-factory-agent).
+
 ## What a repository with no CI sees
 
 1. After publishing, Curie waits on the pull request's checks. With no checks
@@ -964,6 +1031,11 @@ A cancelled run removes all four. Curie never changes your `curie-factory` label
    See [Repository toolchain in the managed sandbox](repository-toolchain-in-the-managed-sandbox.md).
 3. The run ends when the agent's turn ends. A command left in the background
    does not keep the run alive.
+
+An opened PR is not the final result. If CI reads fail, the issue can end
+`Could not complete:` and `curie-factory:needs-human` while that PR stays open.
+Read the status reason and inspect the PR's checks; do not treat a locally
+passing test or a PR with zero checks as a completed factory run.
 
 ## Add another factory agent
 
@@ -997,6 +1069,13 @@ Reference: the same binding is made by hand with
 `--label` applies only when a surface is added, and the overlap rule above
 applies to it as well.
 
+A Jira plus GitHub quickstart on a site that already has a binding is refused
+before any write. One Jira site has one binding. Extend that binding by hand,
+as [Writing the values by hand](#writing-the-values-by-hand) describes: add a
+repo alias and keep `defaultRepo`, put a `repo:<alias>` label on the ticket,
+then bind the agent with
+`curie cluster surfaces <agent> --add jira=<binding> --label <label>`.
+
 ## Troubleshooting
 
 | What you see | Cause | Fix |
@@ -1005,8 +1084,10 @@ applies to it as well.
 | App setup says the App is not installed on the repository | The installation step was skipped | Install the App on that repository in the website and rerun the same command |
 | App setup refuses the key or the Secret | The key does not match `--app-id`, or Secret `curie-github-app` holds another App | Pass the matching id and key, or delete a stale Secret and rerun |
 | `no published dark factory runner` | This `curie` is a source build, or that version published no layer | Install a released `curie` and rerun |
-| Work item stays `waiting for sandbox capacity` | Another run holds the sandbox, or the runner pod cannot start | Run the release inspection command below to see pod readiness and unhealthy reasons. The run starts when capacity frees |
+| Work item stays `waiting for sandbox capacity` | Another run holds the sandbox, or the runner pod cannot start | Run the release inspection command below, then use [local kind capacity and recovery](#local-kind-capacity-and-recovery) if a work pod is Pending |
+| Pending work pod reports `Insufficient memory` | Its resource request exceeds the node's remaining allocatable memory | Follow [local kind capacity and recovery](#local-kind-capacity-and-recovery); waiting alone will not schedule it |
 | Status comment ends with `Could not complete:` | The run stopped. The comment's cause lines say why | Fix the cause, then relabel |
+| CI wait ends `github_forbidden_get_*` after opening a PR | A GitHub CI read returned 403; the reason names the read that was refused (`github_forbidden_list_check_runs`, `github_forbidden_get_combined_status`, `github_forbidden_get_branch_rules` or `github_forbidden_get_branch`) | Check the installed App's effective permissions and the PR checks. The reason does not claim which grant is missing, and a bare `github_forbidden` names no read; do not assume a missing grant or call the run complete, and record the refusal for [#5222](https://github.com/curie-eng/curie/issues/5222) |
 | `Could not resolve host: github.com` on kind | CoreDNS replica race | Rerun. The command scales CoreDNS to one replica |
 | Nothing happens after the label | The labelling user lacks write access, the label name differs, or the agent has no `github=<owner>/<name>` surface | Fix that and relabel. Polling notices the label on its interval |
 | Installation reports a pre-existing agent-sandbox controller | Another release owns it, or an unowned controller is already installed | Curie reuses a controller owned by another Helm release, or a healthy unowned controller with the matching chart image, by inferring `agentSandbox.controller.deploy=false`. An unhealthy or different unowned controller stops setup with a specific repair command. Have its owner make that repair, then rerun; release status cannot repair it. See [controller inference](../operations.md#curie-cluster-up) |
@@ -1055,8 +1136,9 @@ rm -f -- "$CURIE_TRIAL_KUBECONFIG"
 unset KUBECONFIG
 ```
 
-Delete the GitHub App in the GitHub website when you are done with it. Delete
-the downloaded private key file as well:
+If you created a GitHub App only for this trial, delete it in the GitHub
+website when you are done with it. Delete that App's downloaded private key
+file as well; keep an App and key that another run still uses:
 
 ```bash
 rm -f -- "$CURIE_APP_KEY_FILE"

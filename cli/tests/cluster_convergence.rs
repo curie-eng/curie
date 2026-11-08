@@ -67,7 +67,10 @@ impl Fixture {
                     .parent()
                     .unwrap(),
             )
-            .env("PATH", format!("{}:/usr/bin:/bin", self.0.path().display()))
+            .env(
+                "PATH",
+                crate::support::executable::isolated_fixture_path(self.0.path()),
+            )
             .env("KUBECONFIG", self.0.path().join("kubeconfig"))
             .env("CONVERGENCE_DRIVER_ROOT", self.0.path())
             .env("CONVERGENCE_DRIVER_SCENARIO", scenario)

@@ -24,10 +24,13 @@ from aci_protocol import (
     TurnSource,
 )
 from channel_protocol.reply import (
+    REPLY_WIRE_VERSION,
     NavAffordance,
     ReplyAck,
+    ReplyUpdate,
 )
 from curie_telemetry.redact import redact_text
+from redis.exceptions import RedisError
 
 from ..actions import ActionBackendError
 from ..approvals import (
@@ -44,6 +47,7 @@ from ..behaviorpacks import (
 )
 from ..capacity_wait import (
     CapacityWaitRequested,
+    current_order,
 )
 from ..delivery_lease import DeliveryLease
 from ..publication_validation import validate_snapshot_against_base
@@ -59,6 +63,7 @@ from ..runner_client import (
 )
 from ..sandbox.quota import capacity_rejection_is_valid
 from ..sandbox.types import (
+    AdmissionUnavailableError,
     CapacityExhaustedError,
     MissingAgentPoolError,
     SandboxError,
@@ -76,6 +81,7 @@ from ..workitem_dispatch import (
     parse_work_item_event_id,
 )
 from ..workspace import (
+    WorkspaceDependencyUnavailable,
     WorkspacePreparationError,
     WorkspaceSelectionRefused,
     WorkspaceStageTimeout,
@@ -86,6 +92,7 @@ if TYPE_CHECKING:
 
 from . import (
     approval,
+    attachment_access,
     channel_read,
     claim,
     clock,
@@ -178,6 +185,8 @@ async def _attempt(
 
     record = memory._AttemptMemoryTurns(agent_id=agent_id)
     reset = constants._MEMORY_TURNS.set(record)
+    aa_record = attachment_access.AttemptAttachmentAccess()
+    aa_reset = constants._ATTACHMENT_ACCESS_ATTEMPT.set(aa_record)
     cr_record = channel_read._AttemptChannelRead()
     cr_reset = constants._CHANNEL_READ_TURNS.set(cr_record)
     try:
@@ -199,6 +208,7 @@ async def _attempt(
             channel_read_grant=channel_read_grant,
         )
     finally:
+        constants._ATTACHMENT_ACCESS_ATTEMPT.reset(aa_reset)
         constants._MEMORY_TURNS.reset(reset)
         constants._CHANNEL_READ_TURNS.reset(cr_reset)
         # The lease heartbeat is a child of this attempt: it stops here, so a
@@ -209,6 +219,7 @@ async def _attempt(
             self._settle_memory_turns(record)
         if cr_record.pending():
             self._settle_channel_read(cr_record)
+        await attachment_access.close_attachment_access(self, aa_record)
 
 
 async def _attempt_turn(
@@ -252,8 +263,14 @@ async def _attempt_turn(
     placeholder = None if handle is None else handle.placeholder
     defer_job_booting = placeholder is None and qevent.source.is_job
     defer_review_booting = placeholder is None and review_candidate
+    # @spec HTTP-INVOCATION-EXECUTION-3/18: adopted work posts only after actual start.
+    from .identity import CURRENT
+
+    identity_carry = CURRENT.get()
+    http_delivery = identity_carry is not None and identity_carry.context is not None
     if (
-        handle is not None
+        not http_delivery
+        and handle is not None
         and not self._config.slack_no_edit_streaming
         and not (defer_job_booting or defer_review_booting)
     ):
@@ -278,7 +295,16 @@ async def _attempt_turn(
         else channel_read._ChannelReadMint(qevent=qevent, grant=channel_read_grant)
     )
 
-    attachment_intent = self._attachments is not None and bool(qevent.attachments)
+    lazy = self._config.attachment_enabled and self._config.attachment_mode == "lazy"
+    attachment_turn = (
+        attachment_access.AttachmentAccessTurn(
+            str(agent_id), str(workspace_deployment_id), thread_key, qevent.event_id
+        )
+        if lazy and agent_id is not None and workspace_deployment_id is not None
+        else None
+    )
+    aa_turn = constants._ATTACHMENT_ACCESS_TURN.set(attachment_turn)
+    attachment_intent = not lazy and self._attachments is not None and bool(qevent.attachments)
 
     # Critical section: decide steer-vs-new-turn and, if new, open the turn so
     # it is active before we release the Valkey lock (rule 1: no two live
@@ -344,6 +370,48 @@ async def _attempt_turn(
                     )
                 verified_review = verified
                 review_receipt = verified.receipt
+            if lazy:
+                if (
+                    self._attachment_access is None
+                    or agent_id is None
+                    or workspace_deployment_id is None
+                ):
+                    from ..attachment_access_client import AttachmentAccessUnavailable
+
+                    raise AttachmentAccessUnavailable(
+                        "On-demand attachments require a bound agent and compatible API."
+                    )
+                from aci_protocol.turn import route_identity
+
+                from ..binding import binding_adapter_for_handle
+
+                inbound = qevent.reply_handle
+                refs = []
+                if qevent.attachments:
+                    if inbound is None:
+                        raise ValueError("attachment references require an inbound route")
+                    adapter = binding_adapter_for_handle(inbound)
+                    refs = [
+                        dict(
+                            file_id=ref.id,
+                            ordinal=index,
+                            name=ref.name,
+                            mime_type=ref.mime_type,
+                            size_bytes=ref.size_bytes,
+                            route_kind=inbound.kind,
+                            route_adapter=adapter,
+                            route_identity=route_identity(inbound.kind, adapter),
+                        )
+                        for index, ref in enumerate(qevent.attachments)
+                    ]
+                # Empty registration establishes the current catalog incarnation
+                # after a reset, without reading any provider body or adding files.
+                await self._attachment_access.register(
+                    agent_id=str(agent_id),
+                    thread_key=thread_key,
+                    event_id=qevent.event_id,
+                    refs=refs,
+                )
             if attachment_intent:
                 routed = await self._route_attachment_and_start(
                     qevent,
@@ -390,28 +458,37 @@ async def _attempt_turn(
             await close_routed_turn()
             raise
         finally:
+            constants._ATTACHMENT_ACCESS_TURN.reset(aa_turn)
             constants._MEMORY_MINT.reset(memory_mint)
             constants._CHANNEL_READ_MINT.reset(cr_mint)
-    except CapacityExhaustedError as exc:
-        rejection = exc.rejection
-        logger.warning(
-            "sandbox capacity exhausted for event %s: quota=%s requested=%s used=%s hard=%s",
-            qevent.event_id,
-            rejection.quota_name,
-            rejection.requested,
-            rejection.used,
-            rejection.hard,
-        )
+    except (CapacityExhaustedError, AdmissionUnavailableError) as exc:
+        rejection = exc.rejection if isinstance(exc, CapacityExhaustedError) else None
+        if rejection is None:
+            record_reclaimed_retry()
+            logger.warning("sandbox admission inventory unavailable for event %s", qevent.event_id)
+        else:
+            logger.warning(
+                "sandbox capacity exhausted for event %s: quota=%s requested=%s used=%s hard=%s",
+                qevent.event_id,
+                rejection.quota_name,
+                rejection.requested,
+                rejection.used,
+                rejection.hard,
+            )
         parsed_execute = parse_work_item_event_id(qevent.event_id)
         if parsed_execute is not None and parsed_execute.kind in {"execute"}:
             run = self._work_item_runs.get(parsed_execute.request_id)
             if run is not None and not run.started:
                 release_order()
                 try:
-                    await run.defer("capacity", capacity=True, start_failure_detail=None)
+                    await run.defer(
+                        "admission_unavailable" if rejection is None else "capacity",
+                        capacity=rejection is not None,
+                        start_failure_detail=None,
+                    )
                 except WorkItemConflict as exc:
                     logger.info(
-                        "work-item capacity defer refused for %s: %s",
+                        "work-item admission defer refused for %s: %s",
                         qevent.event_id,
                         exc.code,
                     )
@@ -419,16 +496,29 @@ async def _attempt_turn(
 
         async def capacity_refusal() -> failures.TurnOutcome:
             # Started factory continuations wait in the driving loop:
-            # their running request cannot use SQL defer (#4275). An
-            # interactive approval keeps its bounded retry policy (#3693).
-            if (
-                parsed_execute is not None
-                and parsed_execute.is_ci_fix
-                and self._run_for_event(qevent.event_id) is not None
-            ) or self._is_approval_resume(qevent.event_id):
+            # their running request cannot use SQL defer (#4275).
+            if self._run_for_event(qevent.event_id) is not None and (
+                (parsed_execute is not None and parsed_execute.is_ci_fix)
+                or self._is_approval_resume(qevent.event_id)
+            ):
                 release_order()
                 return failures.TurnOutcome(terminal_ok=False, classification="sandbox-capacity")
             return await capacity_response()
+
+        if rejection is None:
+            if (
+                self._is_approval_resume(qevent.event_id)
+                and self._run_for_event(qevent.event_id) is not None
+            ):
+                return await capacity_refusal()
+            release_order()
+            if (
+                qevent.source is TurnSource.SLACK
+                and handle is not None
+                and (parsed_execute is None or not parsed_execute.is_ci_fix)
+            ):
+                raise CapacityWaitRequested() from None
+            raise
 
         if pressure_retried:
             self._record_pressure_outcome("reclaimed-retry-refused")
@@ -534,7 +624,8 @@ async def _attempt_turn(
         # retryable); the classification and log identify the fault, and the
         # terminal diagnostic carries a redacted, bounded reason naming the stage.
         record_reclaimed_retry()
-        release_order()
+        if not isinstance(exc, WorkspaceDependencyUnavailable) or self._can_park(qevent):
+            release_order()
         self._log_workspace_start_failure(
             qevent,
             event.text,
@@ -547,6 +638,7 @@ async def _attempt_turn(
             terminal_ok=False,
             classification="workspace-error",
             workspace_stage_timeout=isinstance(exc, WorkspaceStageTimeout),
+            workspace_dependency_unavailable=isinstance(exc, WorkspaceDependencyUnavailable),
             error_message=" ".join(redact_text(str(exc)).split())[
                 : constants._ESCALATION_DETAIL_MAX
             ],
@@ -670,6 +762,14 @@ async def _attempt_turn(
     assert routed is not None
     record_reclaimed_retry()
     try:
+        ordering = current_order()
+        if ordering is not None:
+            try:
+                await ordering[0].finish_order(ordering[2], ordering[1], ordering[3], started=True)
+            except RedisError:
+                logger.warning(
+                    "thread order release unavailable after runner start for %s", qevent.event_id
+                )
         release_order()
     except BaseException:  # noqa: BLE001 - broad catch kept at a failure boundary
         await close_routed_turn()
@@ -779,6 +879,7 @@ async def _attempt_turn(
                 ),
                 memory_grant=memory_grant,
                 channel_read_grant=channel_read_grant,
+                attachment_turn=attachment_turn,
             )
         outcome.workspace_inferred_repo = inferred
         if verified_review is not None:
@@ -788,13 +889,31 @@ async def _attempt_turn(
             outcome.approval_granted_tool,
         ):
             snapshot = None
+            # The worker names the base the snapshot is anchored at: the
+            # prepared commit retained for this thread, never the agent's HEAD.
+            snapshot_base: str | None = None
+            snapshot_base_error: str | None = None
+            try:
+                if self._workspace is None:
+                    raise WorkspacePreparationError(
+                        "publication-validation",
+                        "managed workspace coordinator is unavailable",
+                    )
+                prepared = await asyncio.to_thread(self._workspace.current, thread_key)
+                if prepared is None:
+                    raise WorkspacePreparationError(
+                        "publication-validation", "thread has no retained sanitized base"
+                    )
+                snapshot_base = prepared.base_sha
+            except WorkspacePreparationError as exc:
+                snapshot_base_error = f"publication snapshot failed: {exc}"
             snapshot_started = clock.time.monotonic()
             snapshot_budget_s = (
                 None if remaining_s is None else remaining_s - (snapshot_started - attempt_started)
             )
             snapshot_attempts = 0
             snapshot_failure_text = "remaining budget is 5 s or less"
-            while snapshot_attempts < 3:
+            while snapshot_base is not None and snapshot_attempts < 3:
                 snapshot_remaining_s = (
                     None
                     if snapshot_budget_s is None
@@ -810,6 +929,7 @@ async def _attempt_turn(
                     snapshot = await self._runner.snapshot(
                         routed.handle.base_url,
                         token=routed.handle.token or None,
+                        base_sha=snapshot_base,
                         remaining_s=snapshot_remaining_s,
                     )
                 except (RunnerError, aiohttp.ClientError, TimeoutError) as exc:
@@ -842,7 +962,9 @@ async def _attempt_turn(
                     await asyncio.sleep(float(snapshot_attempts))
                 else:
                     break
-            if snapshot is None:
+            if snapshot_base_error is not None:
+                outcome.publication_snapshot_error = snapshot_base_error
+            elif snapshot is None:
                 # A trusted publication request never falls through into an
                 # ordinary approval when snapshotting fails. The pause path
                 # reports this error and creates neither durable row.
@@ -1044,6 +1166,9 @@ async def _consume(
                 if termination is not None:
                     classification = "sandbox-terminated"
                     acc.error_message = failures._sandbox_termination_detail(termination)
+                    logger.warning(
+                        "sandbox terminated for event %s: %s", qevent.event_id, acc.error_message
+                    )
                     termination_carry = constants._SANDBOX_TERMINATION_CARRY.get()
                     if termination_carry is not None:
                         termination_carry.termination = termination
@@ -1289,7 +1414,7 @@ async def _escalate(
     message: str,
     *,
     failure_class: str,
-) -> None:
+) -> ReplyUpdate | None:
     """Deliver ``message`` as a failed turn, with the class on the first line.
 
     The class marker is what a consumer that sees only the reply text uses
@@ -1299,7 +1424,17 @@ async def _escalate(
 
     text = failures.turn_failure_reply(failure_class, message)
     logger.warning("escalating event %s: %s", qevent.event_id, text)
-    await self._reply_for(qevent, route, text)
+    if not self._markers.supports_answer_outbox:
+        await self._reply_for(qevent, route, text)
+        return None
+    if routing._is_targetless(qevent) or self._is_factory_work_item_turn(qevent.event_id):
+        return None
+    return ReplyUpdate(
+        version=REPLY_WIRE_VERSION,
+        event="reply.update",
+        target=self._target_for(qevent),
+        text=text,
+    )
 
 
 def _backoff(self: Kernel, attempt: int) -> float:

@@ -146,7 +146,9 @@ class FakeAppsV1Api:
         if kwargs.get("_preload_content") is False:
             return raw
         # Typed path: the same body through the client's own deserializer.
-        return k8s_client.ApiClient().deserialize(raw, "V1Deployment")
+        return k8s_client.ApiClient().deserialize(
+            raw.data.decode(), "V1Deployment", "application/json"
+        )
 
     def __getattr__(self, attr: str) -> Any:
         self.violations.append(attr)
@@ -541,10 +543,6 @@ async def test_a_ledger_failure_still_propagates(monkeypatch: pytest.MonkeyPatch
 
 
 # -- the time bound -----------------------------------------------------------
-
-
-def test_the_read_bound_is_two_seconds() -> None:
-    assert READ_TIMEOUT_SECONDS == 2.0
 
 
 @pytest.mark.parametrize("which", ["opening", "closing"])

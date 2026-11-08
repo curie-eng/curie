@@ -1,0 +1,96 @@
+{
+  "cases": [
+    {
+      "name": "delivery-charge",
+      "operation_id": "a0000000-0000-4000-8000-000000000001",
+      "kind": "delivery",
+      "request_digest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "limits": {
+        "deliveries": "5",
+        "launches": "5",
+        "model_calls": "5",
+        "output_tokens": "5",
+        "spend_microusd": "5"
+      },
+      "charge": {
+        "deliveries": "1",
+        "launches": "0",
+        "model_calls": "0",
+        "output_tokens": "0",
+        "spend_microusd": "0"
+      },
+      "expected_journal": {
+        "state": "running",
+        "generation": "2",
+        "counters": {
+          "deliveries": "1",
+          "launches": "0",
+          "model_calls": "0",
+          "output_tokens": "0",
+          "spend_microusd": "0"
+        },
+        "exhausted": ""
+      },
+      "expected_reservation": {
+        "kind": "delivery",
+        "request_digest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "charge": {
+          "deliveries": "1",
+          "launches": "0",
+          "model_calls": "0",
+          "output_tokens": "0",
+          "spend_microusd": "0"
+        },
+        "status": "dispatched",
+        "claim": "",
+        "exhausts": "0"
+      }
+    },
+    {
+      "name": "output-token-exhaustion",
+      "operation_id": "a0000000-0000-4000-8000-000000000002",
+      "kind": "model_call",
+      "request_digest": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "limits": {
+        "deliveries": "5",
+        "launches": "5",
+        "model_calls": "5",
+        "output_tokens": "2",
+        "spend_microusd": "5"
+      },
+      "charge": {
+        "deliveries": "0",
+        "launches": "0",
+        "model_calls": "1",
+        "output_tokens": "2",
+        "spend_microusd": "1"
+      },
+      "expected_journal": {
+        "state": "closing",
+        "generation": "3",
+        "counters": {
+          "deliveries": "0",
+          "launches": "0",
+          "model_calls": "1",
+          "output_tokens": "2",
+          "spend_microusd": "1"
+        },
+        "exhausted": "output_tokens"
+      },
+      "expected_reservation": {
+        "kind": "model_call",
+        "request_digest": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "charge": {
+          "deliveries": "0",
+          "launches": "0",
+          "model_calls": "1",
+          "output_tokens": "2",
+          "spend_microusd": "1"
+        },
+        "status": "dispatched",
+        "claim": "",
+        "exhausts": "1"
+      }
+    }
+  ]
+}

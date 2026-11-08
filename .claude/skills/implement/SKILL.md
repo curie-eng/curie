@@ -76,16 +76,13 @@ Keep a small state file inside the worktree at
   "open_findings": ["<review finding not yet fixed>"],
   "e2e": {
     "decision": {
-      "skill": { "status": "required | not applicable", "reason": "<surface reached, or the surface this change does not reach>" },
-      "local": { "status": "required | not applicable", "reason": "<...>" },
-      "local-release": { "status": "required | not applicable", "reason": "<...>" },
-      "cluster": { "status": "required | not applicable", "reason": "<...>" },
-      "live-provider": { "status": "required | not applicable", "reason": "<...>" },
-      "external-integration": { "status": "required | not applicable", "reason": "<...>" }
+      "boundary": "<cheapest executable boundary that proves the changed contract>",
+      "reason": "<failure mode this boundary observes>",
+      "ci": "<current-head CI URL for proof CI produces, or null>"
     },
     "evidence": [
       {
-        "tier": "<tier key from decision>",
+        "boundary": "<selected executable boundary>",
         "criterion": "<the acceptance criterion this observation proves>",
         "command": "<exact command as run>",
         "commit": "<candidate commit the run observed>",
@@ -93,10 +90,10 @@ Keep a small state file inside the worktree at
         "mode": "fake | live",
         "outcome": "pass | fail | blocked",
         "observed": "<the literal assertion, output line, or value observed, not a restatement of outcome>",
-        "negative": "<the falsifiable negative or second path, and what it observed>",
+        "negative": "<shared control corpus reference for the mechanism, or a second independent path>",
         "teardown": "<what was torn down, or why it was left running>",
         "blocker": "<what stopped this run, or null>",
-        "skip_reason": "<why this required tier produced no evidence, or null>"
+        "skip_reason": "<why required proof is missing, or null>"
       }
     ]
   },
@@ -111,21 +108,17 @@ or skips an unfinished one, and outstanding findings that lived only in a lost
 context are lost with it. A direct path change finishes with nothing to resume, so
 the file is optional there.
 
-Record the tier decision once, at triage. Record one evidence entry per
-required tier and criterion, filled in as the run observes it, with the
-positive proof in `command`, `mode`, `outcome`, and `observed`, and its
-falsifiable negative or second path in `negative` on that same entry. Two
-observations make one record, not two. Fill `command`, `commit`, `mode`,
-`outcome`, and `observed` from the run itself, never from intent, and set
-`artifact` whenever the run produced an identifiable image, release, bundle, or
-trace. `observed` carries the literal line the run printed, because an `outcome`
-of pass with nothing observed behind it is the self-report this record exists to
-replace. `teardown` is filled when the surface is released, naming what came
-down or why it was left running. A required tier that could not run records
-`outcome` blocked with its `blocker` and `skip_reason` rather than being dropped
-from the decision. A verification observed only in a context that
-is now gone cannot be re-checked, and a tier nobody recorded a decision for is
-indistinguishable from one that was skipped.
+Record the cheapest boundary and its failure mode at triage. Read current-head
+CI tier results from CI rather than copying them into run state or the PR body.
+Record what was actually run locally. Require additional local, live or external
+proof only where CI cannot produce it, with the exact command, candidate commit,
+mode and observed outcome. Reference one shared negative-control corpus per
+mechanism instead of copying controls at each tier or criterion; use a second
+independent path when no negative is constructible. Fill `artifact` when a run
+produces an identifiable image, release, bundle or trace, and `teardown` when its
+owned resources are released. Missing required proof records a blocked outcome,
+its blocker and skip reason; a CI URL without a passing current-head result does
+not establish proof.
 
 When a blocker or an unresolvable ambiguity appears after triage, set `status` to
 blocked, record the open question, surface it, and stop. The resume check in Setup
@@ -148,19 +141,18 @@ build before its first edit. If that assumption only appears after an edit, stop
 and either escalate or restart as a build path change; do not carry those edits
 forward.
 
-Classify the end-to-end tiers before the first edit, per the tier decision rule
-in AGENTS.md: every behavior changing path marks each of skill, local,
-local-release, cluster, live provider, and external integration required or not
-applicable, with a concrete reason. Any behavior-bearing path needs at least one
-required tier, and a change that bears no runtime behavior records that reason
-once instead. A direct path change makes no behavior change and classifies
-nothing.
+Choose the cheapest executable boundary that proves the changed contract, per
+AGENTS.md. A higher tier needs a failure mode the lower tier cannot see. Read CI
+tier results from CI; record what ran locally and require additional local, live
+or external proof only where CI cannot produce it. A change with no runtime
+behavior records that reason once and runs the validators appropriate to the
+changed artifact. File type alone does not grant that exemption.
 
 The path set is runner MCP catalog projection, unscoped PreToolUse,
 in-process platform MCP tools, workspace publication, and
 built-in coding-tool session capability. A behavior-bearing change that
 reaches any of those reaches both live-provider and external-integration.
-Those two rows are required on that path. The external-integration row is
+Those proof requirements apply on that path. External-integration proof can be
 satisfied by a CLI-driven cluster run: `curie cluster message` starts a turn with
 no Slack app, and an operator principal
 (`curie cluster approvals <agent> --mint-operator-principal <USER>`, then
@@ -171,7 +163,7 @@ means the two-release Socket Mode ownership behavior and, until publication
 approvals carry a route, workspace publication. "No model routing change" is not a valid n/a reason.
 Fake-model kind, skill ladder, and helper-only tests remain useful and are
 not sufficient for those acceptance criteria. Leave the required-tier item
-open when the evidence is missing; do not close it by marking the row n/a.
+open when the evidence is missing; do not claim missing proof passed.
 This rule does not pull the live e2e ladder onto unrelated pull requests.
 
 ## Build rules
@@ -189,11 +181,11 @@ caller when a return type or contract changes.
 Keep the roles separate, whether they are separate agents or one session working
 in order:
 
-- The test writer touches test paths only, never production source.
-- The implementer touches its own stream's source, never the tests, and never its
+1. The test writer touches test paths only, never production source.
+2. The implementer touches its own stream's source, never the tests, and never its
   own review findings.
-- A reviewer reads and reports, and never edits.
-- A fix addresses one finding area. Do not batch unrelated findings into a single
+3. A reviewer reads and reports, and never edits.
+4. A fix addresses one finding area. Do not batch unrelated findings into a single
   pass, and do not let a fix widen into a refactor.
 
 For a build path, write a short plan that identifies behavior sites, affected files,
@@ -257,11 +249,11 @@ probability.
 
 Choose one of two kinds:
 
-- Tracer, preferred whenever the experiment can safely be the first narrow
+1. Tracer, preferred whenever the experiment can safely be the first narrow
   production slice. It is kept production code and follows the normal test first,
   review, and verification rules. Run that slice alone: write its test, implement
   it, and harvest its observable result before releasing any remaining stream.
-- Throwaway, allowed only when execution is required and the evidence cannot come
+2. Throwaway, allowed only when execution is required and the evidence cannot come
   from a safe production slice. Brief exactly one uncertainty, one observable pass
   or fail result, a scope limited to that question, a cap of thirty minutes, and a
   written finding. Run it outside the committed tree, never commit it, harvest the
@@ -287,9 +279,9 @@ then rerun the relevant checks.
 Those two reviews are not waivable. No instruction in a task prompt, no time
 pressure, and no session setting skips them on a change that alters behavior. If an
 instruction appears to waive one, run it anyway and record in the summary that the
-instruction was overridden and why. Verification of a required tier is not
-waivable either, on the same terms. Everything else in this workflow is
-proportional to the change and may legitimately not run.
+instruction was overridden and why. Proof of the changed contract is required
+on the same terms. Everything else in this workflow is proportional to the change
+and may legitimately not run.
 
 Each reviewer writes its full findings to
 `.projects/plans/<branch-name>.findings.<reviewer>.md` and returns only a routing
@@ -300,11 +292,13 @@ claim that it passed leaves nothing to check, and a skipped review looks exactly
 the same from the outside.
 
 Add a security review for authorization, secrets, payments, personally identifiable
-information, or tenant boundaries. Verify every required tier through its real
-surface, and record each observation in run state as it happens. Static checks
-alone never prove a runtime acceptance criterion, and neither does a fake-tier pass
+information, or tenant boundaries. Verify the changed contract through its
+selected real boundary; read CI proof from CI and record local observations as
+they happen. Static checks alone never prove a runtime acceptance criterion, and
+neither does a fake-tier pass
 on a criterion about a real provider. Each meaningful acceptance criterion carries
-positive proof plus a falsifiable negative or a second independent path, per
+positive proof, with one shared negative-control corpus per mechanism or a second
+independent path where no negative is constructible, per
 Evidence per acceptance criterion in AGENTS.md.
 
 Before completion, run the full affected test suite plus the relevant type check and
@@ -317,7 +311,7 @@ When the pull request this run will open uses a GitHub closing keyword
 (`Closes`, `Fixes`, `Resolves`, and their past-tense forms) on an issue labeled
 `P0`, `release-blocker`, or `sre-bot-e2e-demo`, the review stage adds one extra
 read-only spec-vs-impl pass. That pass's only job is: each issue acceptance
-criterion is visible in the product diff, not only in the e2e table or the Fix
+criterion is visible in the product diff, not only in verification prose or the Fix
 pin selector. Scope review already asks whether each hunk traces to an AC; this
 pass asks the converse, whether each AC is in the diff.
 
@@ -352,42 +346,43 @@ itself, each item checked or marked not applicable with one line of evidence. Pr
 that covers similar ground does not satisfy it. The filled list is the artifact, and
 an item nobody had to answer for is an item nobody checked.
 
-- [ ] Failing tests were written and seen to fail before any implementation code
-- [ ] The test writer and the implementer worked in separate contexts
-- [ ] Code review passed, with its findings file on disk
-- [ ] Scope review passed, with its findings file on disk, and every non trivial
+1. [ ] Failing tests were written and seen to fail before any implementation code
+2. [ ] The test writer and the implementer worked in separate contexts
+3. [ ] Code review passed, with its findings file on disk
+4. [ ] Scope review passed, with its findings file on disk, and every non trivial
       hunk traces to an acceptance criterion, a mechanical exception, or an out of
       scope note in the pull request
-- [ ] Every broadened return type or changed contract had its callers checked
-- [ ] Sibling paths enumerated, and each one covered by this change, routed through
+5. [ ] Every broadened return type or changed contract had its callers checked
+6. [ ] Sibling paths enumerated, and each one covered by this change, routed through
       a shared helper, or filed as a follow up issue with its number
-- [ ] Every new or changed guard was seen rejecting violating input through its real
+7. [ ] Every new or changed guard was seen rejecting violating input through its real
       consumer path, by running it rather than by reading it
-- [ ] Security review passed, where the change touches that surface
-- [ ] The real affected surface was exercised, where the change reaches one
-- [ ] All six end-to-end tiers are classified required or not applicable in run
-      state, each with a concrete reason
-- [ ] Every required tier has an evidence record whose outcome is pass, naming
-      the exact command, the candidate commit, the mode, and the observed result
-- [ ] Every meaningful acceptance criterion carries positive proof plus a
-      falsifiable negative or a second independent path
-- [ ] The change does not undo an earlier deliberate decision, per Prior intent
-- [ ] Full affected test suite, type check, and lint pass on the final code
-- [ ] If this PR closes a `P0`, `release-blocker`, or `sre-bot-e2e-demo` issue,
-      spec-vs-impl confirmed each issue AC against the diff, not only the e2e
-      table or the Fix pin selector. Ordinary bugfixes that close neither label
+8. [ ] Security review passed, where the change touches that surface
+9. [ ] The real affected surface was exercised, where the change reaches one
+10. [ ] The cheapest boundary proving the changed contract is named, with a failure
+      mode the lower tier cannot see if a higher tier is selected
+11. [ ] Current-head CI proof is read from CI; local checks actually run and any
+      additional local, live or external proof CI cannot produce are recorded
+12. [ ] Every meaningful acceptance criterion has positive proof, with one shared
+      negative-control corpus per mechanism or a second independent path where
+      no negative is constructible
+13. [ ] The change does not undo an earlier deliberate decision, per Prior intent
+14. [ ] Full affected test suite, type check, and lint pass on the final code
+15. [ ] If this PR closes a `P0`, `release-blocker`, or `sre-bot-e2e-demo` issue,
+      spec-vs-impl confirmed each issue AC against the diff, not only the verification
+      prose or the Fix pin selector. Ordinary bugfixes that close neither label
       mark this n/a.
 
 A quick path change marks the failing tests, separate contexts, and prior intent
 items not applicable. A direct path change applies only the suite and lint items.
 The two review items are never not applicable on a change that alters behavior.
-On a quick or build path they are never not applicable, and a required tier whose
-evidence record is missing, failed, or blocked leaves its item open.
+On a quick or build path they are never not applicable. Missing, failed or blocked
+proof of the changed contract leaves its item open; CI proof is read from CI.
 
 Route a failed item back into the stage that owns it. Do not present the diff with
-an item still open. An open end-to-end item is a blocker: report it, with the tier,
-the command attempted, and what stopped it, rather than presenting the diff or
-opening the pull request.
+an item still open. Missing required proof is a blocker: report the selected boundary,
+the command or CI run, and what stopped it. An absent per-tier row is not a
+completion blocker.
 
 ## Finish
 

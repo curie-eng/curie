@@ -187,7 +187,7 @@ def _published(
 
     _label(client, github, number)
     row = _request(number)
-    _start_running(row["id"])
+    _start_running(client, row["id"])
     pr = next(_PRS)
     _attach_publication(row["work_item_id"], status="succeeded", pr=pr, head_sha=head_sha)
     return {**row, "pr": pr, "pr_url": f"https://github.com/{REPO}/pull/{pr}"}
@@ -1655,7 +1655,7 @@ def test_unlabel_during_the_ci_wait_stops_with_one_notice(admitted: Any) -> None
 @pytest.mark.parametrize(
     ("entry", "reason"),
     [
-        (ci_entry(check_status=403), "github_forbidden"),
+        (ci_entry(check_status=403), "github_forbidden_list_check_runs"),
         (
             (200, "BODYTEXT this is not json", 200, {"state": "pending", "statuses": []}),
             "malformed_response",
@@ -1707,7 +1707,11 @@ def test_pending_forever_times_out_inside_the_ci_wait(admitted: Any) -> None:
     ("entry", "cause", "summary"),
     [
         (ci_failing(), "ci_failed", "Failing checks:"),
-        (ci_entry(check_status=403), "ci_unverified", "Reason: github_forbidden"),
+        (
+            ci_entry(check_status=403),
+            "ci_unverified",
+            "Reason: github_forbidden_list_check_runs",
+        ),
         (ci_pending(), "ci_timeout", "Pending checks:"),
     ],
     ids=["ci_failed", "ci_unverified", "ci_timeout"],
@@ -2044,7 +2048,7 @@ def test_a_request_awaiting_ci_is_not_an_orphan(
     number = {"succeeded": 9790, "pending": 9791}[publication] + (10 if check == "declared" else 0)
     _label(client, github, number)
     row = _request(number)
-    epoch = _start_running(row["id"])
+    epoch = _start_running(client, row["id"])
     _attach_publication(
         row["work_item_id"],
         status=publication,
@@ -2066,7 +2070,7 @@ def test_a_request_with_no_publication_is_still_an_orphan_candidate(
     number = 9792
     _label(client, github, number)
     row = _request(number)
-    epoch = _start_running(row["id"])
+    epoch = _start_running(client, row["id"])
 
     assert str(row["id"]) in _listed_owner_ids(client)
 
@@ -2561,7 +2565,7 @@ def test_recorded_github_timeline_waits_for_python_aggregate_through_the_factory
     assert response.status_code == 200, response.text
     assert response.json()["status"] == "factory_admitted", response.text
     published = _request(number)
-    _start_running(published["id"])
+    _start_running(client, published["id"])
     pull = _published_stub_pull(stub, tmp_path)
     head_sha = pull["head"]["sha"]
     _attach_publication(
@@ -2773,7 +2777,7 @@ def test_managed_workspace_clones_the_tls_github_origin_through_real_api_and_sto
     assert admitted.status_code == 200, admitted.text
     assert admitted.json()["status"] == "factory_admitted", admitted.text
     request = _request(3815)
-    _start_running(request["id"])
+    _start_running(client, request["id"])
     pull = _published_stub_pull(stub, tmp_path)
     _attach_publication(
         request["work_item_id"], status="succeeded", pr=pull["number"], head_sha=pull["head"]["sha"]
@@ -2965,3 +2969,64 @@ def test_required_checks_empty_rules_list_keeps_a_green_completion(admitted: Any
     _reconcile()
 
     assert _terminal(number) == ("completed", "completed")
+
+
+def test_required_checks_refused_names_the_rules_operation_and_never_completes(
+    admitted: Any,
+) -> None:
+    """#5222: the status names the refused read, and a refusal is never success."""
+
+    client, github, sink = admitted
+    number = 9737
+    sink.ci_script = [ci_green()]
+    sink.rules["main"] = (403, {"message": "Resource not accessible by integration"})
+    published = _published(client, github, sink, number)
+    _set_base_ref(published["work_item_id"], "main")
+
+    _reconcile()
+
+    assert _terminal(number) == ("failed", "ci_unverified")
+    body = _body(sink, published["id"])
+    assert body.startswith("Could not complete:")
+    assert "Reason: github_forbidden_get_branch_rules" in body
+    assert "Get rules for a branch" in body
+    assert "Checks: read" not in body
+    assert "Completed:" not in body
+    assert _ci_turns(published["id"]) == []
+
+
+def test_no_ci_with_a_verified_empty_required_set_completes_after_the_grace(
+    admitted: Any,
+) -> None:
+    client, github, sink = admitted
+    number = 9738
+    sink.ci_script = [ci_empty()]
+    sink.rules["main"] = (200, [])
+    published = _published(client, github, sink, number)
+    _set_base_ref(published["work_item_id"], "main")
+
+    _reconcile()
+
+    assert _terminal(number) == ("running", None)
+    _assert_no_final_result(sink)
+
+    _reconcile_later(130)
+
+    assert _terminal(number) == ("completed", "completed")
+    assert "Note: No CI checks appeared within 120 s." in _body(sink, published["id"])
+
+
+def test_no_ci_with_a_refused_required_check_read_never_completes(admitted: Any) -> None:
+    client, github, sink = admitted
+    number = 9739
+    sink.ci_script = [ci_empty()]
+    sink.rules["main"] = (403, {"message": "refused"})
+    published = _published(client, github, sink, number)
+    _set_base_ref(published["work_item_id"], "main")
+
+    _reconcile()
+
+    assert _terminal(number) == ("failed", "ci_unverified")
+    body = _body(sink, published["id"])
+    assert "Reason: github_forbidden_get_branch_rules" in body
+    assert "Completed:" not in body

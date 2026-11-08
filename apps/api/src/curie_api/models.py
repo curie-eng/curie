@@ -573,6 +573,11 @@ class Approval(Base):
 
     __tablename__ = "approvals"
     __table_args__ = (
+        # @spec HTTP-APPROVAL-CONTINUITY-5. Private, bounded provenance.
+        CheckConstraint(
+            "identity_context IS NULL OR octet_length(identity_context) <= 16384",
+            name="approvals_identity_context_length_ck",
+        ),
         CheckConstraint(
             "(policy_identity IS NULL AND policy_version IS NULL) OR "
             "(policy_identity = 'publication:auto' AND policy_version >= 1)",
@@ -633,6 +638,8 @@ class Approval(Base):
     # ingress route derives it from the HTTP header, and terminal/recovery paths
     # use it only to reconnect telemetry after the human pause.
     traceparent: Mapped[str | None] = mapped_column(String(55), default=None)
+    # @spec HTTP-APPROVAL-CONTINUITY-5. Never part of a public approval DTO.
+    identity_context: Mapped[str | None] = mapped_column(Text, nullable=True, default=None)
     status: Mapped[str] = mapped_column(server_default=ApprovalStatus.pending, index=True)
     # Optional SLA: past this instant the record can no longer be approved or
     # rejected; a resolve attempt flips it to expired instead.
@@ -904,29 +911,36 @@ class WorkItem(Base):
     )
     # A relabel that arrived while a request was still running. The
     # reconciler admits it once that request reaches a terminus.
-    readmit_request_id: Mapped[uuid.UUID | None] = mapped_column(
-        UUID(as_uuid=True), default=None
-    )
+    readmit_request_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), default=None)
     readmit_requester: Mapped[str | None] = mapped_column(Text, default=None)
     readmit_objective: Mapped[str | None] = mapped_column(Text, default=None)
-    # The base resolved for that deferred relabel (ADR 0186). It replaces the
-    # recorded base only when the replacement request is admitted.
+    # Intent for a deferred label event. The successor resolves its remote
+    # base at acquisition while its predecessor keeps its own pin.
     readmit_base_branch: Mapped[str | None] = mapped_column(Text, default=None)
     readmit_base_source: Mapped[str | None] = mapped_column(Text, default=None)
     readmit_base_commit: Mapped[str | None] = mapped_column(Text, default=None)
-    # The base resolved at admission and frozen for every later run (ADR
-    # 0186). All three are NULL on a legacy row, which uses the repository
-    # default branch. ``base_label_ignored`` is the branch a later ``base:``
-    # label names when it disagrees with the recorded one.
+    # The exact base selected by the request recorded in base_resolved_request_id.
+    # The ignored-label column remains solely as historical expand data.
     base_branch: Mapped[str | None] = mapped_column(Text, default=None)
     base_source: Mapped[str | None] = mapped_column(Text, default=None)
     base_commit: Mapped[str | None] = mapped_column(Text, default=None)
     base_label_ignored: Mapped[str | None] = mapped_column(Text, default=None)
+    base_resolved_request_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), default=None
+    )
+    readmit_base_settle_until: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), default=None
+    )
+    base_selection_fingerprint: Mapped[str | None] = mapped_column(Text, default=None)
+    base_requested_branch: Mapped[str | None] = mapped_column(Text, default=None)
+    base_requested_source: Mapped[str | None] = mapped_column(Text, default=None)
+    workspace_recovery_outcome: Mapped[str | None] = mapped_column(String(128), default=None)
+    workspace_recovery_outcome_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), default=None
+    )
     version: Mapped[int] = mapped_column(default=1, server_default="1")
     next_sequence: Mapped[int] = mapped_column(default=1, server_default="1")
-    created_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), server_default=func.now()
-    )
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
     )
@@ -1034,7 +1048,8 @@ class ExecutionRequest(Base):
             "OR (status = 'cancellation_requested' AND started_at IS NOT NULL "
             "AND execution_deadline IS NOT NULL AND terminal_at IS NULL "
             "AND terminal_cause IS NOT NULL "
-            "AND terminal_cause IN ('issue_cancelled', 'execution_deadline', 'owner_lost') "
+            "AND terminal_cause IN ('issue_cancelled', 'issue_deleted', "
+            "'execution_deadline', 'owner_lost') "
             "AND termination_observation IS NULL) "
             "OR (status = 'completed' AND started_at IS NOT NULL "
             "AND execution_deadline IS NOT NULL AND terminal_at IS NOT NULL "
@@ -1056,7 +1071,7 @@ class ExecutionRequest(Base):
             "AND termination_observation IS NOT NULL))) "
             "OR (status = 'cancelled' AND terminal_at IS NOT NULL "
             "AND terminal_cause IS NOT NULL "
-            "AND terminal_cause IN ('issue_cancelled', 'lineage_closed') AND "
+            "AND terminal_cause IN ('issue_cancelled', 'issue_deleted', 'lineage_closed') AND "
             "((started_at IS NULL AND execution_deadline IS NULL "
             "AND termination_observation IS NULL) OR "
             "(started_at IS NOT NULL AND execution_deadline IS NOT NULL "
@@ -1158,7 +1173,8 @@ class ExecutionRequest(Base):
     sequence: Mapped[int]
     status: Mapped[str] = mapped_column(default="waiting", server_default="waiting")
     wait_deadline: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
-    started_at: Mapped[datetime | None] = mapped_column(
+    started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), default=None)
+    base_settle_until: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), default=None
     )
     execution_deadline: Mapped[datetime | None] = mapped_column(
@@ -2426,6 +2442,89 @@ class ThreadAttachmentRef(Base):
     )
 
 
+class AttachmentCatalog(Base):
+    """A transcript-lifetime incarnation, including catalogs with no files."""
+
+    __tablename__ = "attachment_catalogs"
+    __table_args__ = (
+        UniqueConstraint("agent_id", "thread_key", name="uq_attachment_catalog_thread"),
+        Index("ix_attachment_catalog_expiry", "agent_id", "expires_at"),
+    )
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    agent_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey(f"{SCHEMA}.agents.id", ondelete="CASCADE")
+    )
+    thread_key: Mapped[str] = mapped_column(Text)
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+
+
+class AttachmentReference(Base):
+    """An unfetched or verified reference in a thread catalog (ADR 0244).
+
+    Keyed exactly like ``ThreadTranscript`` and removed with it
+    (``curie_api.thread_attachments``). Only the worker writes it, through the
+    internal routes. It records the channel's file id and the route it came
+    from, never an endpoint, a URL or bytes. ``seq`` is the arrival order;
+    ``disk_name`` is the stable public display basename, unique in the thread.
+    The runner chooses its own local cache path after verified completion.
+    """
+
+    __tablename__ = "attachment_references"
+    __table_args__ = (
+        UniqueConstraint(
+            "agent_id",
+            "binding_scope",
+            "thread_key",
+            "event_id",
+            "file_id",
+            name="uq_attachment_references_event_file",
+            postgresql_nulls_not_distinct=True,
+        ),
+        UniqueConstraint(
+            "agent_id",
+            "binding_scope",
+            "thread_key",
+            "disk_name",
+            name="uq_attachment_references_disk_name",
+            postgresql_nulls_not_distinct=True,
+        ),
+        Index(
+            "ix_attachment_references_thread_seq",
+            "agent_id",
+            "binding_scope",
+            "thread_key",
+            "seq",
+        ),
+        Index("ix_attachment_references_expires_at", "expires_at"),
+        # The orphan sweep runs on every transcript write, scoped to one agent.
+        Index("ix_attachment_references_agent_expires_at", "agent_id", "expires_at"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    seq: Mapped[int] = mapped_column(BigInteger, Identity(always=True))
+    agent_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey(f"{SCHEMA}.agents.id", ondelete="CASCADE")
+    )
+    binding_scope: Mapped[str | None] = mapped_column(Text, default=None)
+    thread_key: Mapped[str] = mapped_column(Text)
+    event_id: Mapped[str] = mapped_column(Text)
+    file_id: Mapped[str] = mapped_column(Text)
+    ordinal: Mapped[int] = mapped_column(Integer)
+    name: Mapped[str] = mapped_column(Text)
+    disk_name: Mapped[str] = mapped_column(Text)
+    mime_type: Mapped[str | None] = mapped_column(Text, default=None)
+    size_bytes: Mapped[int | None] = mapped_column(BigInteger, default=None)
+    sha256: Mapped[str | None] = mapped_column(Text, default=None)
+    version: Mapped[int] = mapped_column(Integer, default=1, server_default="1")
+    route_kind: Mapped[str] = mapped_column(Text)
+    route_adapter: Mapped[str | None] = mapped_column(Text, default=None)
+    route_identity: Mapped[str] = mapped_column(Text)
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+
+
 class ConsoleSession(Base):
     """One console login: the code that establishes it and the session it becomes.
 
@@ -2671,7 +2770,8 @@ class RemediationNomination(Base):
         CheckConstraint(
             "refusal_code IS NULL OR refusal_code IN ('nomination_malformed', 'unknown_action', "
             "'nomination_duplicate', 'arguments_schema_mismatch', 'agent_stopped', "
-            "'reply_surface_unavailable', 'tune_execution_not_automated')",
+            "'reply_surface_unavailable', 'tune_execution_not_automated', "
+            "'http_identity_selected')",
             name="remediation_nominations_refusal_ck",
         ),
         CheckConstraint(
@@ -3041,6 +3141,8 @@ class PrincipalTeam(Base):
 class AgentAccessPolicy(Base):
     """Which teams may invoke an agent and approve for it (#4585, ADR 0220 s.8).
 
+    @spec AGENT-ROLE-PERSISTENCE-V1-2.
+
     One row per agent, absent until an operator sets one; a missing row and a
     NULL role both mean today's behavior for that role. Each team reference
     carries ``tenant_id``, so a policy cannot name another tenant's team, and a
@@ -3052,6 +3154,11 @@ class AgentAccessPolicy(Base):
     __tablename__ = "agent_access_policies"
     __table_args__ = (
         CheckConstraint("version >= 1", name="agent_access_policies_version_ck"),
+        # @spec AGENT-ROLE-PERSISTENCE-V1-2.
+        CheckConstraint(
+            "role_configuration IS NULL OR jsonb_typeof(role_configuration) = 'object'",
+            name="agent_access_policies_role_object_ck",
+        ),
         ForeignKeyConstraint(
             ["tenant_id", "agent_id"],
             [f"{SCHEMA}.agents.tenant_id", f"{SCHEMA}.agents.id"],
@@ -3077,6 +3184,10 @@ class AgentAccessPolicy(Base):
     )
     approver_team_id: Mapped[uuid.UUID | None] = mapped_column(
         UUID(as_uuid=True), default=None
+    )
+    # @spec AGENT-ROLE-PERSISTENCE-V1-2: absence is SQL NULL, never JSON null.
+    role_configuration: Mapped[dict[str, Any] | None] = mapped_column(
+        JSONB(none_as_null=True), nullable=True, default=None
     )
     version: Mapped[int] = mapped_column(Integer, default=1, server_default="1")
     updated_at: Mapped[datetime] = mapped_column(
@@ -3614,7 +3725,9 @@ class RemediationReceiptPost(Base):
 class IdentityNamespace(Base):
     """Where a provider's user ids are unique, per tenant (#2910, ADR 0198 decision 1).
 
-    For Slack, one ``slack_workspace`` per team id. ``authority`` is always the
+    For Slack, one ``slack_workspace`` per team id, and one ``slack_enterprise``
+    per Grid organisation id for HTTP receivers (ADR 0252, @spec
+    HTTP-INVOCATION-EXECUTION-21). ``authority`` is always the
     receiving installation's, never the event's (ADR 0198 decision 6, property
     3). Disabling a namespace keeps its links; resolution into it answers
     ``namespace_disabled`` (decision 9).
@@ -3624,7 +3737,8 @@ class IdentityNamespace(Base):
     __table_args__ = (
         CheckConstraint(_PROVIDER_CK[:-1] + ", 'email')", name="identity_namespaces_provider_ck"),
         CheckConstraint(
-            "kind IN ('slack_workspace', 'email_domain')", name="identity_namespaces_kind_ck"
+            "kind IN ('slack_workspace', 'email_domain', 'slack_enterprise')",
+            name="identity_namespaces_kind_ck",
         ),
         CheckConstraint(
             "kind <> 'email_domain' OR (provider = 'email' AND key = lower(key) AND "
@@ -3635,6 +3749,10 @@ class IdentityNamespace(Base):
         CheckConstraint(
             "kind <> 'slack_workspace' OR (provider = 'slack' AND key ~ '^T[A-Z0-9]{2,}$')",
             name="identity_namespaces_slack_workspace_key_ck",
+        ),
+        CheckConstraint(
+            "kind <> 'slack_enterprise' OR (provider = 'slack' AND key ~ '^E[A-Z0-9]{2,}$')",
+            name="identity_namespaces_slack_enterprise_key_ck",
         ),
         CheckConstraint("length(key) > 0", name="identity_namespaces_key_ck"),
         UniqueConstraint(
@@ -3741,13 +3859,26 @@ class TenantIdentityProvider(Base):
     __table_args__ = (
         CheckConstraint("version >= 1", name="tenant_identity_providers_version_ck"),
         CheckConstraint("identity_epoch >= 0", name="tenant_identity_providers_identity_epoch_ck"),
+        CheckConstraint("lifecycle_generation >= 0", name="tenant_identity_providers_lifecycle_ck"),
+        CheckConstraint(
+            "http_selection IS NULL OR jsonb_typeof(http_selection) = 'object'",
+            name="tenant_identity_providers_http_object_ck",
+        ),
+        CheckConstraint(
+            "(http_selection IS NULL AND governed_domains IS NOT NULL AND managed_by IS NOT NULL) "
+            "OR (http_selection IS NOT NULL AND lifecycle_generation >= 1)",
+            name="tenant_identity_providers_owner_ck",
+        ),
     )
     tenant_id: Mapped[uuid.UUID] = mapped_column(
         ForeignKey(f"{SCHEMA}.tenants.id"), primary_key=True
     )
     issuer: Mapped[str] = mapped_column(String)
-    governed_domains: Mapped[list[str]] = mapped_column(JSONB)
-    managed_by: Mapped[str] = mapped_column(String)
+    governed_domains: Mapped[list[str] | None] = mapped_column(JSONB(none_as_null=True))
+    managed_by: Mapped[str | None] = mapped_column(String)
+    # @spec HTTP-PRINCIPAL-ADOPTION-V1-2.
+    http_selection: Mapped[dict[str, Any] | None] = mapped_column(JSONB(none_as_null=True))
+    lifecycle_generation: Mapped[int] = mapped_column(BigInteger, default=0, server_default="0")
     version: Mapped[int] = mapped_column(Integer, default=1, server_default="1")
 
     # Shared channel-account ownership spans teams, so team epochs cannot fence it.
@@ -3810,3 +3941,220 @@ class IdentityConnectToken(Base):
     )
     verified_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), default=None)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+class FactoryBaseTransition(Base):
+    """One durable, leased rewrite and retarget of a factory lineage."""
+
+    __tablename__ = "factory_base_transitions"
+    __table_args__ = (
+        CheckConstraint(
+            "phase IN ('pending','prepared','pushed','retargeted','ci_prepared',"
+            "'ci_pushed','applied','conflict','refused')",
+            name="factory_base_transitions_phase_ck",
+        ),
+        CheckConstraint(
+            "version >= 1 AND attempts >= 0", name="factory_base_transitions_version_ck"
+        ),
+        CheckConstraint(
+            "base_source IN ('label','default')", name="factory_base_transitions_source_ck"
+        ),
+        Index(
+            "uq_factory_base_transitions_active_item",
+            "work_item_id",
+            unique=True,
+            postgresql_where=text("phase NOT IN ('applied','conflict','refused')"),
+        ),
+        Index(
+            "uq_factory_base_transitions_active_lineage",
+            "lineage_id",
+            unique=True,
+            postgresql_where=text("phase NOT IN ('applied','conflict','refused')"),
+        ),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    work_item_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey(f"{SCHEMA}.work_items.id", ondelete="CASCADE")
+    )
+    request_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey(f"{SCHEMA}.execution_requests.id", ondelete="CASCADE")
+    )
+    ci_request_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey(f"{SCHEMA}.execution_requests.id", ondelete="CASCADE")
+    )
+    lineage_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey(f"{SCHEMA}.thread_publication_lineages.id", ondelete="CASCADE")
+    )
+    phase: Mapped[str] = mapped_column(Text, default="pending", server_default="pending")
+    version: Mapped[int] = mapped_column(default=1, server_default="1")
+    owner: Mapped[str | None] = mapped_column(Text, default=None)
+    lease_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), default=None)
+    repository_snapshot: Mapped[dict[str, Any] | None] = mapped_column(JSONB, default=None)
+    old_base_ref: Mapped[str] = mapped_column(Text)
+    old_base_sha: Mapped[str] = mapped_column(Text)
+    old_head_sha: Mapped[str] = mapped_column(Text)
+    target_base_ref: Mapped[str] = mapped_column(Text)
+    target_base_sha: Mapped[str] = mapped_column(Text)
+    base_source: Mapped[str] = mapped_column(Text)
+    branch: Mapped[str] = mapped_column(Text)
+    pull_request_number: Mapped[str] = mapped_column(Text)
+    committer_name: Mapped[str] = mapped_column(Text)
+    committer_email: Mapped[str] = mapped_column(Text)
+    committer_time: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    rebased_head_sha: Mapped[str | None] = mapped_column(Text, default=None)
+    verification_head_sha: Mapped[str | None] = mapped_column(Text, default=None)
+    changed_paths: Mapped[list[str]] = mapped_column(JSONB, default=list, server_default="[]")
+    prepared_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), default=None)
+    pushed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), default=None)
+    retargeted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), default=None)
+    ci_pushed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), default=None)
+    applied_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), default=None)
+    outcome_ready_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), default=None)
+    ci_ready_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), default=None)
+    ci_settled_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), default=None)
+    refusal_noticed_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), default=None
+    )
+    error_code: Mapped[str | None] = mapped_column(Text, default=None)
+    attempts: Mapped[int] = mapped_column(default=0, server_default="0")
+    next_attempt_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+
+
+class WorkspaceRecoveryInstallation(Base):
+    __tablename__ = "workspace_recovery_installation"
+    __table_args__ = (CheckConstraint("id = 1", name="recovery_installation_singleton_ck"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, server_default="1")
+
+
+class WorkspaceRecoveryGroup(Base):
+    __tablename__ = "workspace_recovery_groups"
+    __table_args__ = (
+        ForeignKeyConstraint(
+            ["work_item_id", "last_good_checkpoint_id"],
+            [f"{SCHEMA}.workspace_recovery_checkpoints.work_item_id",
+             f"{SCHEMA}.workspace_recovery_checkpoints.id"],
+            name="recovery_group_last_good_fkey", use_alter=True,
+        ),
+    )
+
+    work_item_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey(f"{SCHEMA}.work_items.id", ondelete="RESTRICT"), primary_key=True
+    )
+    repository_provider: Mapped[str] = mapped_column(Text)
+    repository_host: Mapped[str] = mapped_column(Text)
+    repository_project_id: Mapped[str] = mapped_column(Text)
+    repository_path: Mapped[str] = mapped_column(Text)
+    base_commit: Mapped[str] = mapped_column(String(64))
+    target_branch: Mapped[str] = mapped_column(Text)
+    last_good_checkpoint_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True))
+
+
+class WorkspaceRecoveryCheckpoint(Base):
+    __tablename__ = "workspace_recovery_checkpoints"
+    __table_args__ = (
+        UniqueConstraint("work_item_id", "id", name="recovery_checkpoint_group_id_key"),
+        UniqueConstraint("source_request_id", "idempotency_key",
+                         name="recovery_checkpoint_idempotency_key"),
+        CheckConstraint("status IN ('staging', 'complete', 'tombstoned')",
+                        name="recovery_checkpoint_status_ck"),
+        CheckConstraint("runtime_epoch >= 1 AND dispatch_generation >= 1 AND version >= 1",
+                        name="recovery_checkpoint_authority_ck"),
+        CheckConstraint("char_length(idempotency_key) BETWEEN 1 AND 256",
+                        name="recovery_checkpoint_idempotency_length_ck"),
+        CheckConstraint("content_sha256 ~ '^[0-9a-f]{64}$'",
+                        name="recovery_checkpoint_digest_ck"),
+        CheckConstraint("(completed_at IS NULL) = (expires_at IS NULL) AND "
+                        "(status <> 'complete' OR completed_at IS NOT NULL)",
+                        name="recovery_checkpoint_completion_ck"),
+        Index("recovery_checkpoint_one_staging", "work_item_id", unique=True,
+              postgresql_where=text("status = 'staging'")),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    work_item_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey(f"{SCHEMA}.workspace_recovery_groups.work_item_id", ondelete="RESTRICT")
+    )
+    source_request_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey(f"{SCHEMA}.execution_requests.id", ondelete="RESTRICT")
+    )
+    runtime_epoch: Mapped[int] = mapped_column(BigInteger)
+    dispatch_generation: Mapped[int] = mapped_column(BigInteger)
+    idempotency_key: Mapped[str] = mapped_column(String(256))
+    content_sha256: Mapped[str] = mapped_column(String(64))
+    version: Mapped[int] = mapped_column(BigInteger, default=1, server_default="1")
+    includes_base: Mapped[bool] = mapped_column(default=False, server_default="false")
+    status: Mapped[str] = mapped_column(String(16), default="staging", server_default="staging")
+    capture_deadline: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    staging_expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
+class WorkspaceRecoveryObject(Base):
+    __tablename__ = "workspace_recovery_objects"
+    __table_args__ = (
+        ForeignKeyConstraint(
+            ["work_item_id", "checkpoint_id"],
+            [f"{SCHEMA}.workspace_recovery_checkpoints.work_item_id",
+             f"{SCHEMA}.workspace_recovery_checkpoints.id"],
+            name="recovery_object_checkpoint_fkey", ondelete="RESTRICT",
+        ),
+        CheckConstraint("kind IN ('base', 'patch', 'manifest') AND "
+                        "((kind = 'base') = (checkpoint_id IS NULL))",
+                        name="recovery_object_kind_ck"),
+        CheckConstraint("size_bytes >= 0 AND sha256 ~ '^[0-9a-f]{64}$'",
+                        name="recovery_object_descriptor_ck"),
+        CheckConstraint("status IN ('staging', 'complete', 'tombstoned', 'claimed')",
+                        name="recovery_object_status_ck"),
+        CheckConstraint("version >= 0 AND ((status = 'claimed' AND claim_id IS NOT NULL "
+                        "AND collector_id IS NOT NULL AND claimed_until IS NOT NULL) OR "
+                        "(status <> 'claimed' AND claim_id IS NULL AND collector_id IS NULL "
+                        "AND claimed_until IS NULL))",
+                        name="recovery_object_claim_ck"),
+        UniqueConstraint("checkpoint_id", "kind", name="recovery_object_checkpoint_kind_key"),
+        Index("recovery_object_one_base", "work_item_id", unique=True,
+              postgresql_where=text("kind = 'base'")),
+        Index("recovery_object_group", "work_item_id"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    work_item_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey(f"{SCHEMA}.workspace_recovery_groups.work_item_id", ondelete="RESTRICT")
+    )
+    checkpoint_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True))
+    kind: Mapped[str] = mapped_column(String(16))
+    key: Mapped[str] = mapped_column(String(512), unique=True)
+    size_bytes: Mapped[int] = mapped_column(BigInteger)
+    sha256: Mapped[str] = mapped_column(String(64))
+    status: Mapped[str] = mapped_column(String(16), default="staging", server_default="staging")
+    staging_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    claim_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True))
+    collector_id: Mapped[str | None] = mapped_column(String(256))
+    claimed_until: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    version: Mapped[int] = mapped_column(BigInteger, default=0, server_default="0")
+
+
+class WorkspaceRecoveryReader(Base):
+    __tablename__ = "workspace_recovery_readers"
+    __table_args__ = (
+        ForeignKeyConstraint(
+            ["work_item_id", "checkpoint_id"],
+            [f"{SCHEMA}.workspace_recovery_checkpoints.work_item_id",
+             f"{SCHEMA}.workspace_recovery_checkpoints.id"],
+            name="recovery_reader_checkpoint_fkey", ondelete="RESTRICT",
+        ),
+        UniqueConstraint("work_item_id", "checkpoint_id", "holder_id",
+                         name="recovery_reader_holder_key"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    work_item_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey(f"{SCHEMA}.workspace_recovery_groups.work_item_id", ondelete="RESTRICT")
+    )
+    checkpoint_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True))
+    holder_id: Mapped[str] = mapped_column(String(256))
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))

@@ -223,9 +223,19 @@ _DELIVERY_GENERATION_FIELD = "gen"
 _SETTLE_FENCED_LUA = """
 if redis.call('GET', KEYS[4]) ~= ARGV[7] then return 0 end
 if redis.call('HGET', KEYS[5], ARGV[8]) ~= ARGV[9] then return 0 end
+if ARGV[#ARGV] ~= '' then
+  local kind = redis.call('TYPE', KEYS[#KEYS]).ok
+  if kind ~= 'none' and kind ~= 'zset' then
+    return redis.error_reply('invalid thread order index')
+  end
+end
 redis.call('HDEL', KEYS[2], ARGV[11])
 redis.call('HSET', KEYS[2], ARGV[3], ARGV[5], ARGV[2], '1', ARGV[4], ARGV[6])
 redis.call('SADD', KEYS[3], ARGV[10])
+if ARGV[#ARGV] ~= '' then
+  redis.call('ZADD', KEYS[#KEYS], 0, ARGV[#ARGV])
+  redis.call('EXPIRE', KEYS[#KEYS], math.max(redis.call('TTL', KEYS[#KEYS]), tonumber(ARGV[1])))
+end
 if ARGV[12] == 'history_capacity' then
   redis.call('SET', KEYS[1], ARGV[12])
 else
@@ -333,6 +343,9 @@ class CompletionRecord(BaseModel):
     # partial channel failure replays delivery without running the model again.
     answer: ReplyUpdate | None = Field(default=None, exclude_if=lambda value: value is None)
     answer_best_effort: bool = Field(default=False, exclude_if=lambda value: not value)
+    thread_order: tuple[str, str] | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
     created_at: float
     done: bool = False
 
@@ -377,6 +390,11 @@ class CompletionIndexEntry:
             other.event_id,
             str(other.answer_namespace),
         )
+
+
+def delivery_order_token(entry_id: str) -> str:
+    milliseconds, sequence = map(int, entry_id.split("-", 1))
+    return f"{milliseconds:020d}-{sequence:020d}"
 
 
 def completion_generation(record: CompletionRecord) -> str:
@@ -439,6 +457,30 @@ class Markers:
             pipe.rpush(key, *values)
             pipe.expire(key, _MEMORY_STEER_TURNS_TTL_S)
             await pipe.execute()
+
+    async def record_attachment_access_turn(
+        self, thread_key: str, record: dict[str, Any], ttl_s: int
+    ) -> None:
+        await self._redis.set(
+            self._config.attachment_access_turn_key(thread_key), json.dumps(record), ex=ttl_s
+        )
+
+    async def read_attachment_access_turn(self, thread_key: str) -> dict[str, Any] | None:
+        raw = _as_str(await self._redis.get(self._config.attachment_access_turn_key(thread_key)))
+        if raw is None:
+            return None
+        data = json.loads(raw)
+        return data if isinstance(data, dict) else None
+
+    async def take_attachment_access_turn(self, thread_key: str, owner: str) -> bool:
+        return bool(
+            await self._redis.eval(
+                _TAKE_CHANNEL_READ_TURN_LUA,
+                1,
+                self._config.attachment_access_turn_key(thread_key),
+                owner,
+            )
+        )
 
     async def record_channel_read_turn(
         self, thread_key: str, record: LiveChannelReadTurn, ttl_s: int
@@ -709,6 +751,15 @@ class Markers:
                 },
             )
             pipe.sadd(self._generation_pending_key(generation), event_id)
+            if record.thread_order is not None:
+                thread_key, member = record.thread_order
+                key = self._config.capacity_thread_order_key(thread_key)
+                pipe.zadd(key, {member: 0})
+                ttl_s = max(
+                    self._config.idempotency_ttl_s, int(self._config.completion_max_retention_s)
+                )
+                pipe.expire(key, ttl_s, gt=True)
+                pipe.expire(key, ttl_s, nx=True)
             await pipe.execute()
         return generation
 
@@ -753,12 +804,15 @@ class Markers:
         ttl_s = max(self._config.idempotency_ttl_s, int(self._config.completion_max_retention_s))
         settled = await self._redis.eval(
             _SETTLE_FENCED_LUA,
-            5,
+            6,
             self._config.done_key(event_id),
             self._generation_storage_key(event_id, record_generation),
             self._generation_pending_key(record_generation),
             lease_key,
             state_key,
+            self._config.capacity_thread_order_key(
+                record.thread_order[0] if record.thread_order else ""
+            ),
             str(ttl_s),
             _DONE_FIELD,
             _RECORD_FIELD,
@@ -771,6 +825,7 @@ class Markers:
             event_id,
             _CAUSE_FIELD,
             marker_value,
+            record.thread_order[1] if record.thread_order else "",
         )
         return record_generation if int(settled) == 1 else None
 
@@ -802,7 +857,7 @@ class Markers:
         ttl_s = max(self._config.idempotency_ttl_s, int(self._config.completion_max_retention_s))
         settled = await self._redis.eval(
             _SETTLE_FENCED_AND_PUBLISH_LUA,
-            7,
+            8,
             self._config.done_key(event_id),
             self._generation_storage_key(event_id, record_generation),
             self._generation_pending_key(record_generation),
@@ -810,6 +865,9 @@ class Markers:
             state_key,
             successor_stream,
             self._config.sweep_published_key(event_id),
+            self._config.capacity_thread_order_key(
+                record.thread_order[0] if record.thread_order else ""
+            ),
             str(ttl_s),
             _DONE_FIELD,
             _RECORD_FIELD,
@@ -824,6 +882,7 @@ class Markers:
             marker_value,
             STREAM_PAYLOAD_FIELD,
             successor_payload,
+            record.thread_order[1] if record.thread_order else "",
         )
         return record_generation if int(settled) == 1 else None
 

@@ -19,6 +19,9 @@ Productizes the prototype's aiohttp ``/run`` into the ACI session channel:
                          session (eval isolation, #550); 409 while a turn is
                          active. Not an ACI wire frame -- a runner control route,
                          like /status and /healthz, so it takes no body
+- ``POST /v1/checkpoint`` capture the managed checkout against a worker-named
+                         trusted base commit as a patch plus manifest (ADR
+                         0251); optional and runner-private, carries no ACI frame
 
 One turn consumes the SDK generator at a time (enforced by the runner's turn
 lock); steer and interrupt are side-channel injections whose output surfaces on
@@ -27,16 +30,20 @@ the open ``/v1/event`` stream, exactly as the PT-2 steering proof showed.
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import hmac
 import inspect
 import json
+import re
 import secrets
 from collections.abc import Awaitable, Callable, Mapping
+from pathlib import Path
 from types import MappingProxyType
 from typing import TypedDict, cast
 
 from aci_protocol import (
+    ATTACHMENT_ACCESS_STATUS_FIELD,
     CHANNEL_READ_STATUS_FIELD,
     TOOL_ACCESS_STATUS_FIELD,
     Event,
@@ -54,6 +61,11 @@ from .executor import RUNNER_MODE_ENV as RUNNER_MODE_ENV
 from .final_answer import FINAL_ANSWER_HEADER
 from .session import SessionRunner
 from .turn_progress import ProgressCapability
+from .workspace_checkpoint import (
+    CheckpointRefusal,
+    capture_workspace_checkpoint,
+    parse_checkpoint_request,
+)
 from .workspace_snapshot import WorkspaceSnapshot, WorkspaceSnapshotError
 
 _NDJSON = "application/x-ndjson"
@@ -74,6 +86,7 @@ _GATED_PATHS = frozenset(
         "/v1/turn-admit",
         "/v1/reset",
         "/v1/snapshot",
+        "/v1/checkpoint",
         "/v1/status",
         # @spec ACTION-EXECUTOR-6: served only in executor mode; an ordinary
         # runner answers 404 behind the same bearer.
@@ -83,9 +96,16 @@ _GATED_PATHS = frozenset(
 
 # Typed app key so aiohttp resolves the runner without the string-key warning.
 RUNNER: web.AppKey[SessionRunner] = web.AppKey("runner", SessionRunner)
-Snapshotter = Callable[[], WorkspaceSnapshot | Awaitable[WorkspaceSnapshot]]
+# Called with the prepared base commit the worker named in the request.
+Snapshotter = Callable[[str], WorkspaceSnapshot | Awaitable[WorkspaceSnapshot]]
 SNAPSHOTTER: web.AppKey[object] = web.AppKey("snapshotter", object)
+_SNAPSHOT_BASE = re.compile(r"[0-9a-f]{40}(?:[0-9a-f]{24})?")
+_SNAPSHOT_REQUEST_REFUSAL = "snapshot request must name the prepared base_sha"
 STATUS_ATTESTATION: web.AppKey[object] = web.AppKey("status_attestation", object)
+# The checkpoint route's authority: whether a bearer is enforced, and the
+# managed workspace from the runner-held attestation (never from a request).
+CHECKPOINT_AUTHENTICATED: web.AppKey[bool] = web.AppKey("checkpoint_authenticated", bool)
+CHECKPOINT_WORKSPACE: web.AppKey[object] = web.AppKey("checkpoint_workspace", object)
 
 
 class _StatusAttestation(TypedDict):
@@ -184,7 +204,10 @@ def create_app(
     # An identity-bearing response exists only when middleware above enforces a
     # non-empty bearer. Tokenless apps (dev flag or in-process tests) keep both
     # status routes probe-only.
-    app[STATUS_ATTESTATION] = _bound_status_attestation(runner) if token else None
+    attestation = _bound_status_attestation(runner) if token else None
+    app[STATUS_ATTESTATION] = attestation
+    app[CHECKPOINT_AUTHENTICATED] = bool(token)
+    app[CHECKPOINT_WORKSPACE] = _checkpoint_workspace(attestation)
     app.add_routes(
         [
             web.get("/healthz", _healthz),
@@ -197,6 +220,7 @@ def create_app(
             web.post("/v1/turn-admit", _turn_admit),
             web.post("/v1/reset", _reset),
             web.post("/v1/snapshot", _snapshot),
+            web.post("/v1/checkpoint", _checkpoint),
         ]
     )
     app.on_startup.append(_on_startup)
@@ -214,6 +238,7 @@ _EXECUTOR_REFUSED_ROUTES = (
     "/v1/turn-admit",
     "/v1/reset",
     "/v1/snapshot",
+    "/v1/checkpoint",
 )
 
 
@@ -310,6 +335,8 @@ async def _status(request: web.Request) -> web.Response:
         # @spec RUNNER-TOOL-ACCESS-5: credential-free, so on both status routes.
         TOOL_ACCESS_STATUS_FIELD: list(runner.enforced_tool_access),
     }
+    if runner.enforces_attachment_access:
+        body[ATTACHMENT_ACCESS_STATUS_FIELD] = True
     if runner.enforces_channel_read:
         # Literal true only when curie-slack is mounted and the holder is live
         # (ADR 0100); credential free, so on both status routes. An absent key
@@ -343,12 +370,72 @@ async def _snapshot(request: web.Request) -> web.Response:
             },
             status=409,
         )
+    base_sha = _snapshot_base(await request.read())
+    if base_sha is None:
+        return web.json_response({"error": _SNAPSHOT_REQUEST_REFUSAL}, status=400)
     try:
-        result = snapshotter()
+        result = snapshotter(base_sha)
         captured = await result if inspect.isawaitable(result) else result
     except WorkspaceSnapshotError as exc:
         return web.json_response({"error": str(exc)}, status=422)
     return web.json_response(captured.to_json())
+
+
+def _checkpoint_workspace(attestation: Mapping[str, object] | None) -> Path | None:
+    """The managed workspace a checkpoint may read, from the bound attestation."""
+
+    if attestation is None or attestation.get("managed_workspace") is not True:
+        return None
+    cwd = attestation.get("cwd")
+    return Path(cwd) if isinstance(cwd, str) else None
+
+
+async def _checkpoint(request: web.Request) -> web.Response:
+    """Capture the managed checkout against a worker-supplied trusted base."""
+
+    if not request.app[CHECKPOINT_AUTHENTICATED]:
+        return web.json_response(
+            {"error": "this runner serves no bearer token", "code": "no_serving_token"},
+            status=409,
+        )
+    workspace = cast("Path | None", request.app[CHECKPOINT_WORKSPACE])
+    if workspace is None:
+        return web.json_response(
+            {"error": "this session has no managed workspace", "code": "no_managed_workspace"},
+            status=409,
+        )
+    try:
+        try:
+            body: object = json.loads(await request.read())
+        except (ValueError, RecursionError):
+            raise CheckpointRefusal("invalid_request", 400, "body is not JSON") from None
+        base_sha, budget_seconds = parse_checkpoint_request(body)
+        if request.app[RUNNER].turn_active:
+            raise CheckpointRefusal("turn_active", 409, "cannot checkpoint while a turn is active")
+        # Encoding and hashing the bounded result also stay off the event loop.
+        answer = await asyncio.to_thread(
+            lambda: capture_workspace_checkpoint(
+                workspace, base_sha=base_sha, budget_seconds=budget_seconds
+            ).to_json()
+        )
+    except CheckpointRefusal as refusal:
+        return web.json_response(refusal.body(), status=refusal.status)
+    return web.json_response(answer)
+
+
+def _snapshot_base(raw: bytes) -> str | None:
+    """The prepared base from a body of exactly ``{"base_sha": <full object id>}``."""
+
+    try:
+        body = json.loads(raw)
+    except (ValueError, RecursionError):
+        return None
+    if not isinstance(body, dict) or set(body) != {"base_sha"}:
+        return None
+    base_sha = body["base_sha"]
+    if not isinstance(base_sha, str) or not _SNAPSHOT_BASE.fullmatch(base_sha):
+        return None
+    return base_sha
 
 
 def _parse(body: object) -> Event | Interrupt:

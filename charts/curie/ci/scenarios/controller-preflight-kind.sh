@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Issue #4005: execute the actual controller-ready Helm hook in an owned kind
-# cluster. Keep the rendered SandboxWarmPool at zero replicas: its successful
+# Issue #4005: execute the actual controller-ready Helm hook on the caller's
+# kind cluster. Keep the rendered SandboxWarmPool at zero replicas: its successful
 # reconciliation establishes the durable metric without starting runner pods.
 # Issue #4197: an upgrade that does not restart a controller which restarted
 # once long before must pass on the stable serving leader and stay deployed.
@@ -11,8 +11,9 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CHART="$(cd "$SCRIPT_DIR/../.." && pwd)"
 REPO_ROOT="$(cd "$CHART/../.." && pwd)"
-CLUSTER=test-4005-controller-preflight
-CONTEXT="kind-$CLUSTER"
+: "${CURIE_SCENARIO_CONTEXT:?set the job-owned kind context}"
+CONTEXT="$CURIE_SCENARIO_CONTEXT"
+[[ "$CONTEXT" == kind-* ]] || { echo "FAIL: an explicit kind context is required" >&2; exit 1; }
 NAMESPACE=test-4005-controller-preflight
 CONSUMER_NAMESPACE=test-4461-controller-consumer
 RELEASE=curie-controller-preflight
@@ -27,51 +28,40 @@ fail() {
   exit 1
 }
 
-for command in kind docker kubectl helm python3; do
+for command in docker kubectl helm python3; do
   command -v "$command" >/dev/null || fail "required command is unavailable: $command"
 done
 python3 -c 'import yaml' || fail "PyYAML is required for the exact negative-control post-renderer"
-clusters="$(kind get clusters)" || fail "cannot inventory kind clusters"
-if grep -Fxq "$CLUSTER" <<< "$clusters"; then
-  fail "refusing a pre-existing cluster named $CLUSTER"
-fi
-owned_containers="$(docker ps -aq --filter "label=io.x-k8s.kind.cluster=$CLUSTER")" \
-  || fail "cannot inventory kind node ownership"
-[[ -z "$owned_containers" ]] || fail "refusing pre-existing kind node containers for $CLUSTER"
+for object in "namespace/$NAMESPACE" "namespace/$CONSUMER_NAMESPACE" "namespace/$CONTROLLER_NS" \
+  clusterrole/agent-sandbox-controller clusterrole/agent-sandbox-controller-extensions \
+  "clusterrole/$READ_ROLE" clusterrolebinding/agent-sandbox-controller \
+  clusterrolebinding/agent-sandbox-controller-extensions \
+  clusterrolebinding/agent-sandbox-controller-networkpolicies-read; do
+  existing="$(kubectl --context "$CONTEXT" get "$object" --ignore-not-found -o name)" \
+    || fail "cannot inventory $object"
+  [[ -z "$existing" ]] || fail "refusing pre-existing $object"
+done
 
 mkdir -p "$REPO_ROOT/.projects/4005-controller-preflight"
 TMP="$(mktemp -d "$REPO_ROOT/.projects/4005-controller-preflight/run.XXXXXX")"
-export KUBECONFIG="$TMP/kubeconfig"
-cluster_owned=0
+release_owned=0
 scenario_passed=0
 
 cleanup() {
-  local rc=$? cleanup_failed=0 remaining_clusters remaining_containers
+  local rc=$? cleanup_failed=0
   trap - EXIT INT TERM
   set +e
-  if [[ "$cluster_owned" -eq 1 ]]; then
-    kind delete cluster --name "$CLUSTER" --kubeconfig "$KUBECONFIG" \
-      || cleanup_failed=1
-    if remaining_clusters="$(kind get clusters)"; then
-      if grep -Fxq "$CLUSTER" <<< "$remaining_clusters"; then
-        cleanup_failed=1
-      fi
-    else
-      cleanup_failed=1
-    fi
-    if remaining_containers="$(docker ps -aq --filter "label=io.x-k8s.kind.cluster=$CLUSTER")"; then
-      [[ -z "$remaining_containers" ]] || cleanup_failed=1
-    else
-      cleanup_failed=1
-    fi
-    if [[ "$cleanup_failed" -eq 0 ]]; then
-      echo "Cleanup confirmed: owned kind cluster and node containers are gone, including all namespace and cluster resources."
-    else
-      echo "FAIL: could not confirm deletion of owned kind cluster $CLUSTER" >&2
-      [[ "$rc" -ne 0 ]] || rc=1
-    fi
+  if (( release_owned )); then
+    helm uninstall "$RELEASE" --kube-context "$CONTEXT" --namespace "$NAMESPACE" \
+      --no-hooks --ignore-not-found >"$TMP/uninstall.log" 2>&1 || cleanup_failed=1
+    kubectl --context "$CONTEXT" delete namespace "$NAMESPACE" "$CONSUMER_NAMESPACE" \
+      "$CONTROLLER_NS" --ignore-not-found --wait=false >"$TMP/delete.log" 2>&1 || cleanup_failed=1
   fi
   rm -rf "$TMP"
+  if (( cleanup_failed )); then
+    echo "FAIL: could not request owned controller-preflight teardown" >&2
+    rc=1
+  fi
   if [[ "$rc" -eq 0 && "$scenario_passed" -eq 1 ]]; then
     echo "PASS: fresh install, rotated logs, an old restart, and another namespace's NetworkPolicy delete refusal pass the actual upgrade hook and stay deployed; a cluster-scope RBAC crash-loop fails."
   fi
@@ -97,11 +87,8 @@ helm package "$CHART" --kube-context "$CONTEXT" --destination "$TMP" \
   > "$TMP/package.log" 2>&1 || fail "candidate release chart packaging failed"
 [[ -f "$CANDIDATE_CHART" ]] || fail "packaging did not create the expected candidate chart archive"
 
-# Register ownership before creation so even a partial startup is cleaned up.
-# The private kubeconfig and explicit context keep every operation on this run.
-cluster_owned=1
-kind create cluster --name "$CLUSTER" --kubeconfig "$KUBECONFIG" --wait 120s
 kubectl --context "$CONTEXT" create namespace "$NAMESPACE"
+release_owned=1
 
 values=(
   -f "$CHART/values-e2e-nogvisor.yaml"

@@ -94,6 +94,33 @@ def _block(value: Any) -> dict[str, Any]:
     return value if isinstance(value, dict) else {}
 
 
+# ADR 0265: at most this many files are read; a larger list supplies no team.
+_MAX_FILES_FOR_SENDER_TEAM = 100
+
+
+def _sender_file_team(event: dict[str, Any], user_id: str | None) -> str | None:
+    """The team named by the sender's own files, or None. @spec HTTP-INVOCATION-EXECUTION-28.
+
+    Only when the event names a user and neither ``user_team`` nor ``team``,
+    and every one of a bounded, nonempty list of file objects was uploaded by
+    that user and names the same nonblank ``user_team``.
+    """
+    if user_id is None or "user_team" in event or "team" in event:
+        return None
+    files = event.get("files")
+    if not isinstance(files, list) or not 0 < len(files) <= _MAX_FILES_FOR_SENDER_TEAM:
+        return None
+    teams: set[str] = set()
+    for item in files:
+        if not isinstance(item, dict) or item.get("user") != user_id:
+            return None
+        team = item.get("user_team")
+        if not isinstance(team, str) or not team.strip():
+            return None
+        teams.add(team)
+    return teams.pop() if len(teams) == 1 else None
+
+
 def slack_evidence(body: dict[str, Any]) -> dict[str, Any] | None:
     """The ADR 0201 sender evidence in ``body``, shaped as the API's ``SlackEvidence``.
 
@@ -101,8 +128,13 @@ def slack_evidence(body: dict[str, Any]) -> dict[str, Any] | None:
     sender's team. ``is_ext_shared_channel`` is kept only as a strict bool,
     because the API's mention path needs it to be exactly False. Every
     enterprise signal (an enterprise id anywhere, a ``context_enterprise_id``,
-    or ``is_enterprise_install: true``) goes into ``enterprise_ids``. None when the
+    or ``is_enterprise_install: true``) goes into ``enterprise_ids``. An event's
+    ``source_team`` is copied as ``event_source_team`` only when present (ADR
+    0261). None when the
     delivery names no user, so a bot message is skipped rather than guessed.
+    A team-less event whose every file is the sender's own and names one team
+    takes that team as ``event_user_team`` (ADR 0265); nothing else is read
+    from files.
     """
     event = body.get("event")
     enterprise_ids: set[str] = set()
@@ -134,10 +166,15 @@ def slack_evidence(body: dict[str, Any]) -> dict[str, Any] | None:
         evidence: dict[str, Any] = {
             "delivery": _text(event.get("type")) or "",
             "user_id": user_id,
-            "event_user_team": _text(event.get("user_team")),
+            "event_user_team": _text(event.get("user_team"))
+            or _sender_file_team(event, user_id),
             "event_team": _text(event.get("team")),
             "is_ext_shared_channel": shared if isinstance(shared, bool) else None,
         }
+        # Copied only when present, so evidence without it keeps its exact
+        # signed bytes. @spec HTTP-INVOCATION-EXECUTION-24.
+        if (source_team := _text(event.get("source_team"))) is not None:
+            evidence["event_source_team"] = source_team
     else:
         user = _block(body.get("user"))
         user_id = _text(user.get("id"))

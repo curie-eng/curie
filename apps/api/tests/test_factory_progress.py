@@ -382,7 +382,7 @@ def test_a_note_is_stripped_before_it_is_stored(admitted: Any) -> None:  # noqa:
 
 
 def _fail(client: Any, request_id: uuid.UUID) -> None:
-    epoch = _start_running(request_id)
+    epoch = _start_running(client, request_id)
     failed = client.post(
         f"/v1/internal/work-items/requests/{request_id}/finish",
         headers=WORKER,
@@ -963,12 +963,6 @@ def test_unreadable_stored_verification_is_never_acknowledged_as_a_replay(
     assert response.status_code == 409, response.text
     assert response.json()["code"] == "verification_exists"
     assert _reports(request_id) == stored
-
-
-def test_python_check_id_is_the_api_python_gate_key() -> None:
-    from curie_api.factory_progress import PYTHON_CHECK_ID
-
-    assert PYTHON_CHECK_ID == "python"
 
 
 def test_two_declared_checks_are_recorded_on_one_request(

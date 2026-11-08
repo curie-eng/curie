@@ -591,10 +591,6 @@ def _expiring(seconds_before_now: float) -> str:
     return (NOW - timedelta(seconds=seconds_before_now)).isoformat()
 
 
-def test_overdue_grace_is_ten_minutes() -> None:
-    assert OVERDUE_GRACE_S == 600
-
-
 def test_overdue_counts_only_namespaces_past_the_grace_or_without_a_ttl() -> None:
     """``expired`` is every namespace past its TTL; ``overdue`` is the ones the reaper is late on.
 

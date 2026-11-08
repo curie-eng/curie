@@ -24,10 +24,12 @@ import contextlib
 import hmac
 import logging
 import time
+import uuid
 from collections import OrderedDict
 from collections.abc import AsyncGenerator, AsyncIterator, Awaitable, Callable
 from dataclasses import replace
 
+import aiohttp
 import anyio
 from aci_protocol import (
     ErrorEvent,
@@ -60,6 +62,7 @@ from .adapter import (
     model_message_to_conversation,
 )
 from .approval import ApprovalGate, is_mcp_tool, platform_tool_names
+from .attachment_access import LAZY_ATTACHMENT_NOTICE, AttachmentAccessTurn
 from .budget import BUDGET_CLASSIFICATION, BudgetTracker
 from .final_answer import (
     FINAL_ANSWER_CLASSIFICATION,
@@ -71,6 +74,7 @@ from .history import (
     ApprovalContext,
     ConversationMessage,
     HarnessReplayState,
+    HistoryAppendError,
     HistoryCapacityError,
     NullTranscriptStore,
     TranscriptStore,
@@ -124,6 +128,11 @@ SessionFactory = Callable[[], ModelSession]
 _CONNECTOR_RECOVERY_BUDGET_SECONDS = 20.0
 _HISTORY_PERSISTENCE_BUDGET_SECONDS = 15.0
 _HISTORY_REPLAY_EXPORT_BUDGET_SECONDS = 5.0
+# Backoff for retrying transcript appends whose outcome is unknown (#5354,
+# #5366): the first retry waits the initial delay, each later one doubles it,
+# up to the cap.
+_HISTORY_RETRY_INITIAL_S = 0.5
+_HISTORY_RETRY_MAX_S = 5.0
 _CAPACITY_ADMISSION_TIMEOUT_S = 30.0
 # How long a turn waits, before sending its own query, for the terminal result
 # an abandoned predecessor left on the shared SDK stream (#3425). The abandoned
@@ -286,6 +295,23 @@ _HISTORY_CAPACITY_FINAL = Final(
 )
 
 
+def _append_outcome_unknown(exc: BaseException) -> bool:
+    """Whether a failed transcript append may land if it is sent again (#5366).
+
+    A connect failure, a cut or timed out connection, a 5xx, a 408 or a 429 says
+    nothing final about the request: it may not have been written, or it may
+    have committed before the response failed. Each turn record carries a
+    ``record_id`` the state API replays, so a retry cannot store it twice. A
+    capacity refusal, any other 4xx and every other error are final.
+    """
+
+    if isinstance(exc, aiohttp.ClientError | TimeoutError):
+        return True
+    if isinstance(exc, HistoryAppendError) and not isinstance(exc, HistoryCapacityError):
+        return exc.status >= 500 or exc.status in (408, 429)
+    return False
+
+
 def _history_capacity_lines(detail: str | None = None) -> tuple[str, str]:
     """The one non-retryable capacity refusal, shared by append and boot (#2820).
 
@@ -373,6 +399,7 @@ class SessionRunner:
         turn_progress: TurnProgress | None = None,
         memory_turn: MemoryTurn | None = None,
         channel_read: ChannelReadTurn | None = None,
+        attachment_access: AttachmentAccessTurn | None = None,
         tool_access: TurnToolAccess | None = None,
         attachment_notice: str | None = None,
         channel_kind: str | None = None,
@@ -420,6 +447,7 @@ class SessionRunner:
         # at turn start, renewed or cleared at each steer, cleared on every
         # terminal path before any await.
         self._channel_read = channel_read
+        self._attachment_access = attachment_access
         # Session-wide activity counters for report_progress (#3077); None when
         # no progress tool is mounted.
         self._progress_activity = progress_activity
@@ -536,12 +564,24 @@ class SessionRunner:
         # transcript append re-authorizes replacement, unless an earlier turn
         # was already lost by this process. Later appends cannot repair that
         # missing prefix, so the loss remains sticky for this runner's lifetime.
+        # An append whose outcome is unknown (a connect failure, a cut
+        # connection, a timeout, a 5xx, a cancellation after the request was
+        # sent) is not a loss (#5354, #5366): the state API replays a known
+        # ``record_id``, so the record is deferred and retried in order until it
+        # lands, and the fence stays shut until then.
         # A turn whose terminal the transcript never records (failed, budget,
         # interrupted, result-less) re-authorizes it too (#4188): replay
         # already holds everything it ever will, and leaving the fence shut
         # would lock the thread, since only another turn could reopen it.
         self._history_durable = True
         self._history_loss_observed = False
+        # Records whose append has not yet landed, oldest first. The
+        # lock serializes every transcript append, from a turn or the retry
+        # task, so records land in turn order. asyncio.Lock has no owner, so a
+        # turn generator finalized on another task still releases it.
+        self._deferred_history: list[TurnRecord] = []
+        self._history_append_lock = asyncio.Lock()
+        self._history_retry_task: asyncio.Task[None] | None = None
         self._terminal_persistence_ran = False
         # The cap and turn size of the last unboundable turn (#3301).
         self._capacity_detail: str | None = None
@@ -600,6 +640,11 @@ class SessionRunner:
         """Whether every completed logical turn is present in durable replay."""
 
         return self._history_durable
+
+    @property
+    def enforces_attachment_access(self) -> bool:
+        """The tools and active-turn enforcement were mounted together at boot."""
+        return self._attachment_access is not None
 
     @property
     def enforces_channel_read(self) -> bool:
@@ -682,7 +727,11 @@ class SessionRunner:
         ``state.final_text`` before this runs. Failed, budget, authentication,
         and idle turns leave it None and are not persisted. A capacity refusal
         propagates to the prepublication terminal decision. Other failures keep
-        the candidate terminal under the best effort history policy.
+        the candidate terminal under the best effort history policy. A record
+        whose append outcome is unknown, or that would land ahead of an earlier
+        such record, is deferred for the retry task (#5354, #5366); the
+        ``record_id`` minted here lets the state API store it once however
+        often it is sent.
         """
 
         if state.final_text is None:
@@ -696,6 +745,10 @@ class SessionRunner:
             and state.approval_gate_kind == "permission"
         ):
             messages = close_suspended_tool_calls(messages)
+        record: TurnRecord | None = None
+        # Set just before this turn's own request starts. A cancellation before
+        # then (waiting for the lock, or flushing older records) sent nothing.
+        own_append_started = False
         try:
             harness_replay: HarnessReplayState | None = None
             # Once a channel read body reached this SDK session, its native
@@ -743,13 +796,37 @@ class SessionRunner:
                     else None
                 ),
                 harness_replay=harness_replay,
+                record_id=uuid.uuid4().hex,
             )
-            native_retained = await self._history.append(record)
-            if harness_replay is not None and not native_retained:
-                requester = getattr(self._session, "request_full_checkpoint", None)
-                if not callable(requester):
-                    raise RuntimeError("native replay exporter cannot reset its checkpoint")
-                requester()
+            async with self._history_append_lock:
+                await self._flush_deferred_history()
+                if self._deferred_history:
+                    # An earlier record has not landed yet; this one must
+                    # not land ahead of it.
+                    self._deferred_history.append(record)
+                    logger.warning(
+                        "history append deferred session=%s behind=%d",
+                        self._session_id,
+                        len(self._deferred_history) - 1,
+                    )
+                else:
+                    own_append_started = True
+                    try:
+                        await self._append_history(record)
+                    except Exception as exc:
+                        if not _append_outcome_unknown(exc):
+                            raise
+                        # The request may or may not have been written. The
+                        # API replays a known record_id, so a retry cannot
+                        # duplicate the record (#5366).
+                        self._deferred_history.append(record)
+                        logger.warning(
+                            "history append deferred session=%s error_class=%s",
+                            self._session_id,
+                            type(exc).__name__,
+                        )
+                if self._deferred_history:
+                    self._ensure_history_retry()
         except HistoryCapacityError as exc:
             self._history_loss_observed = True
             self._history_durable = False
@@ -761,9 +838,25 @@ class SessionRunner:
             )
             raise
         except BaseException as exc:
-            self._history_loss_observed = True
             self._history_durable = False
-            if isinstance(exc, anyio.get_cancelled_exc_class()) or not isinstance(exc, Exception):
+            cancelled = isinstance(exc, anyio.get_cancelled_exc_class())
+            if record is not None and (not own_append_started or cancelled):
+                # This turn's request never started, or was cancelled with its
+                # outcome unknown: keep the record for the retry instead of
+                # losing it. A replayed record_id cannot land twice (#5366).
+                if all(item is not record for item in self._deferred_history):
+                    self._deferred_history.append(record)
+                self._ensure_history_retry()
+                logger.warning(
+                    "history append deferred session=%s error_class=%s",
+                    self._session_id,
+                    type(exc).__name__,
+                )
+                if cancelled or not isinstance(exc, Exception):
+                    raise
+                return
+            self._history_loss_observed = True
+            if not isinstance(exc, Exception):
                 raise
             status = getattr(exc, "status", None)
             if isinstance(status, int):
@@ -780,7 +873,98 @@ class SessionRunner:
                     type(exc).__name__,
                 )
         else:
-            self._history_durable = not self._history_loss_observed
+            self._history_durable = self._settled_history_durable()
+
+    def _settled_history_durable(self) -> bool:
+        """Durable replay holds every completed turn: none lost, none deferred."""
+
+        return not self._history_loss_observed and not self._deferred_history
+
+    async def _append_history(self, record: TurnRecord, *, retried: bool = False) -> None:
+        """Append one record, resetting the native checkpoint if it was dropped.
+
+        A ``retried`` record may have landed on an earlier attempt through
+        capacity compaction, which drops native replay, and the replayed
+        answer cannot say so; its checkpoint is reset too (#5366).
+        """
+
+        native_retained = await self._history.append(record)
+        if record.harness_replay is not None and (retried or not native_retained):
+            requester = getattr(self._session, "request_full_checkpoint", None)
+            if not callable(requester):
+                raise RuntimeError("native replay exporter cannot reset its checkpoint")
+            requester()
+
+    async def _flush_deferred_history(self) -> None:
+        """Append deferred records in order, stopping at one whose outcome is unknown.
+
+        The caller holds the append lock. A record that again fails with an
+        unknown outcome, or whose attempt is cancelled, stays at the head for
+        the next retry: the API replays its ``record_id``, so it lands once
+        (#5366). A final refusal (a 4xx, a capacity refusal) cannot succeed on
+        retry, so it becomes a sticky loss, as on the turn path.
+        """
+
+        persisted = 0
+        while self._deferred_history:
+            # The record stays at the head while its request is in flight, so
+            # the fence reads it as not yet durable until it lands.
+            record = self._deferred_history[0]
+            try:
+                await self._append_history(record, retried=True)
+            except BaseException as exc:
+                if isinstance(exc, anyio.get_cancelled_exc_class()):
+                    raise
+                if _append_outcome_unknown(exc):
+                    logger.debug(
+                        "deferred history append still pending session=%s error_class=%s "
+                        "pending=%d",
+                        self._session_id,
+                        type(exc).__name__,
+                        len(self._deferred_history),
+                    )
+                    break
+                self._history_loss_observed = True
+                del self._deferred_history[0]
+                if not isinstance(exc, Exception):
+                    raise
+                logger.warning(
+                    "deferred history append failed session=%s error_class=%s",
+                    self._session_id,
+                    type(exc).__name__,
+                )
+            else:
+                del self._deferred_history[0]
+                persisted += 1
+        if persisted:
+            logger.info(
+                "deferred history persisted session=%s records=%d",
+                self._session_id,
+                persisted,
+            )
+
+    def _ensure_history_retry(self) -> None:
+        task = self._history_retry_task
+        if task is None or task.done():
+            self._history_retry_task = asyncio.create_task(self._retry_deferred_history())
+
+    async def _retry_deferred_history(self) -> None:
+        """Retry deferred records with backoff until none remain (#5354, #5366)."""
+
+        delay = _HISTORY_RETRY_INITIAL_S
+        while self._deferred_history:
+            await asyncio.sleep(delay)
+            delay = min(delay * 2, _HISTORY_RETRY_MAX_S)
+            async with self._history_append_lock:
+                await self._flush_deferred_history()
+                # A turn in progress, through its terminal append, settles the
+                # fence itself; reopening it here could expose that turn.
+                if (
+                    not self._deferred_history
+                    and not self._turn_open
+                    and not self._persistence_owned
+                ):
+                    self._history_durable = self._settled_history_durable()
 
     async def _persist_terminal(
         self,
@@ -888,6 +1072,12 @@ class SessionRunner:
         await asyncio.shield(self.begin_start())
 
     async def close(self) -> None:
+        if self._attachment_access is not None:
+            self._attachment_access.end()
+        retry = self._history_retry_task
+        if retry is not None and not retry.done():
+            retry.cancel()
+            await asyncio.wait({retry})
         task = self._start_task
         if task is not None and not task.done():
             # Shutdown during a held preflight: cancelling kills the check's
@@ -919,6 +1109,8 @@ class SessionRunner:
         lock is free the moment this runs.
         """
 
+        if self._attachment_access is not None:
+            self._attachment_access.end()
         if self._channel_read is not None:
             self._channel_read.end()
         async with self._turn_lock:
@@ -1010,6 +1202,8 @@ class SessionRunner:
         self._unrestricted_prompt_sent = True
         if event is not None and self._memory_turn is not None:
             self._memory_turn.begin(event)
+        if self._attachment_access is not None:
+            self._attachment_access.steer(event)
         if self._channel_read is not None:
             # Replace or clear before the steered text reaches the model, so it
             # never reads under an earlier generation (ADR 0100).
@@ -1035,6 +1229,8 @@ class SessionRunner:
         if self._persistence_owned:
             return
         self._interrupt_requested = True
+        if self._attachment_access is not None:
+            self._attachment_access.end()
         if self._channel_read is not None:
             self._channel_read.end()
         if self._turn_open and not self._turn_ready:
@@ -1065,6 +1261,8 @@ class SessionRunner:
             return False
         # Only after the epoch guard: a stale timeout never touches the
         # current turn's channel read credential.
+        if self._attachment_access is not None:
+            self._attachment_access.end()
         if self._channel_read is not None:
             self._channel_read.end()
         timeout_interrupt_settled = anyio.Event()
@@ -1142,6 +1340,11 @@ class SessionRunner:
             )
         ) as stream:
             async for line in stream:
+                # The terminal can remain suspended at yield while its client
+                # drains. Retire access before exposing that final, while this
+                # generator still owns the logical turn lock.
+                if self._attachment_access is not None and not self._turn_open:
+                    self._attachment_access.end()
                 # #4940: hand the root span the closed classification, never the text.
                 # Only an error frame can carry one, so other lines skip the parse.
                 if '"type":"error"' in line:
@@ -1197,6 +1400,10 @@ class SessionRunner:
                 ),
             )
             self._active_state = state
+            attachment_opener = (
+                self._attachment_access.begin(event)
+                if self._attachment_access is not None else None
+            )
             if self._memory_turn is not None:
                 self._memory_turn.begin(event)
             if self._channel_read is not None:
@@ -1520,6 +1727,8 @@ class SessionRunner:
                             self._turn_epoch = None
                             # An abandoned turn loses its channel read credential
                             # before the interrupt below can await.
+                            if self._attachment_access is not None:
+                                self._attachment_access.end(attachment_opener)
                             if self._turn_open and self._channel_read is not None:
                                 self._channel_read.end()
                             # If the turn never reached a terminal final (_turn_open
@@ -1542,8 +1751,9 @@ class SessionRunner:
             finally:
                 if terminal_for_log and not self._terminal_persistence_ran:
                     # A terminal the transcript does not record adds nothing
-                    # replay must hold; only an earlier loss keeps the fence shut.
-                    self._history_durable = not self._history_loss_observed
+                    # replay must hold; only an earlier loss or a record still
+                    # deferred keeps the fence shut.
+                    self._history_durable = self._settled_history_durable()
                 if self._usage_reporter is not None:
                     # Every ending passes here, including GeneratorExit and
                     # cancellation. A turn that reached its result already
@@ -1563,6 +1773,8 @@ class SessionRunner:
                         int((time.monotonic() - start) * 1000),
                     )
                 self._active_state = None
+                if self._attachment_access is not None:
+                    self._attachment_access.end(attachment_opener)
                 if self._memory_turn is not None:
                     # However the turn ended, its write credential ends with it.
                     self._memory_turn.end()
@@ -1695,6 +1907,8 @@ class SessionRunner:
             self._read_only_prompt_sent = True
         self._result_pending = True
         prompt = frame_user_turn(event.type, event.user, event.text, self._channel_kind)
+        if self._attachment_access is not None:
+            prompt = f"{prompt}\n\n{LAZY_ATTACHMENT_NOTICE}"
         if self._attachment_notice is not None:
             prompt = f"{prompt}\n\n{self._attachment_notice}"
             self._attachment_notice = None

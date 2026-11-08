@@ -1,9 +1,16 @@
 """#4619: label admission must survive real factory execution and CI adoption.
 
-Run this file on its own: it builds the checkout it is executing, provisions
-an owned kind cluster on the configured Docker engine, and deletes it. Only
-provider HTTP endpoints are scripted. Infrastructure exceptions occur in
-fixture setup or teardown and cannot become an inverse-pin behavioral red.
+Run this file on its own: it provisions one owned kind cluster and one
+platform install per pytest process on the configured Docker engine, and
+deletes them at the end of the session. Cases share that install and are
+isolated by fresh agents per case and a verified clean start: every case
+checks the install against the baseline recorded when it became ready, and
+its finalizer resets everything a case can change, then verifies again.
+Locally the fixture builds the checkout it is executing; CI supplies the
+prebuilt candidate CLI and images through CURIE_C4_CANDIDATE_CLI and
+CURIE_C4_CANDIDATE_IMAGES. Only provider HTTP endpoints are scripted.
+Infrastructure exceptions occur in fixture setup or teardown and cannot
+become an inverse-pin behavioral red.
 """
 
 from __future__ import annotations
@@ -39,12 +46,29 @@ from c4_admitted_kind import (  # noqa: E402
     configure_harness,
     query_path,
 )
+from c4_shared_install import CaseIsolationError, leftover_state  # noqa: E402
 from channel_protocol.work_item_events import ci_event_id, terminate_event_id  # noqa: E402
 
 
 @pytest.fixture(autouse=True)
 def candidate_curie() -> None:
     """Override the directory fixture that installs a fake CURIE_BIN."""
+
+
+def remove_fixture_files(run: AdmittedKind) -> None:
+    # A failed setup keeps its private diagnostic even when every resource was
+    # successfully removed. The session fixture also preserves child records.
+    for path in run.root.iterdir():
+        if path.name == "diagnostics.sqlite3":
+            continue
+        if path.is_dir():
+            if any(path.rglob("diagnostics.sqlite3")):
+                continue
+            shutil.rmtree(path)
+        else:
+            path.unlink()
+    if not any(run.root.iterdir()):
+        run.root.rmdir()
 
 
 def finalize_fixture(run: AdmittedKind) -> None:
@@ -74,19 +98,7 @@ def finalize_fixture(run: AdmittedKind) -> None:
         raise RuntimeError(
             f"owned fixture cleanup failed ({categories}); private diagnostics retained"
         )
-    # A failed setup keeps its private diagnostic even when every resource was
-    # successfully removed. The session fixture also preserves child records.
-    for path in run.root.iterdir():
-        if path.name == "diagnostics.sqlite3":
-            continue
-        if path.is_dir():
-            if any(path.rglob("diagnostics.sqlite3")):
-                continue
-            shutil.rmtree(path)
-        else:
-            path.unlink()
-    if not any(run.root.iterdir()):
-        run.root.rmdir()
+    remove_fixture_files(run)
     if run.infrastructure_errors:
         raise RuntimeError("runtime infrastructure failed; private diagnostics retained")
 
@@ -109,30 +121,7 @@ def source_candidate(request: pytest.FixtureRequest) -> AdmittedKind:
     return run
 
 
-@pytest.fixture
-def kind_factory(
-    request: pytest.FixtureRequest,
-    monkeypatch: pytest.MonkeyPatch,
-    source_candidate: AdmittedKind,
-) -> AdmittedKind:
-    root = source_candidate.root / f"case-{uuid.uuid4().hex[:10]}"
-    root.mkdir()
-    temporary = root / "tmp"
-    temporary.mkdir()
-    monkeypatch.setenv("TMPDIR", str(temporary))
-    monkeypatch.setenv("CURIE_BIN", source_candidate.curie)
-    run = AdmittedKind(root, Path(source_candidate.curie))
-    run.source_candidate = source_candidate
-    run.images = source_candidate.images
-    run.tag_map = dict(zip(sk.IMAGES, run.images.values(), strict=True))
-    run.env.update(TMPDIR=str(temporary))
-
-    def cleanup() -> None:
-        finalize_fixture(run)
-
-    request.addfinalizer(cleanup)
-    configure_harness(monkeypatch, run)
-    run.execute()
+def assert_install_ready(run: AdmittedKind, *, worker_running: bool) -> None:
     if run.valkey("PING") != "PONG":
         raise RuntimeError("the authenticated fixture Valkey did not answer PING")
     deployments = json.loads(run.kubectl("-n", run.namespace, "get", "deployments", "-o", "json"))
@@ -148,15 +137,114 @@ def kind_factory(
     # Verify the candidate rather than inferring provenance from tag names.
     pods = json.loads(run.kubectl("-n", run.namespace, "get", "pods", "-o", "json"))["items"]
     for component in ("api", "worker", "ui"):
-        containers = [
-            c for pod in pods for c in pod["spec"]["containers"] if c["name"] == component
-        ]
+        if component == "worker" and not worker_running:
+            # A paused case has no worker pod; the template it starts from is checked.
+            deployment = json.loads(
+                run.kubectl("-n", run.namespace, "get", "deployment/curie-worker", "-o", "json")
+            )
+            containers = deployment["spec"]["template"]["spec"]["containers"]
+        else:
+            containers = [c for pod in pods for c in pod["spec"]["containers"]]
+        containers = [c for c in containers if c["name"] == component]
         if not containers or any(c["image"] != run.images[component] for c in containers):
             raise RuntimeError(
                 f"the running {component} does not use this execution's candidate image"
             )
+
+
+@pytest.fixture(scope="session")
+def shared_install(request: pytest.FixtureRequest, source_candidate: AdmittedKind) -> AdmittedKind:
+    session = pytest.MonkeyPatch()
+    root = source_candidate.root / f"install-{uuid.uuid4().hex[:10]}"
+    root.mkdir()
+    temporary = root / "tmp"
+    temporary.mkdir()
+    session.setenv("TMPDIR", str(temporary))
+    session.setenv("CURIE_BIN", source_candidate.curie)
+    run = AdmittedKind(root, Path(source_candidate.curie))
+    run.source_candidate = source_candidate
+    run.images = source_candidate.images
+    run.tag_map = dict(zip(sk.IMAGES, run.images.values(), strict=True))
+    run.env.update(TMPDIR=str(temporary))
+    session_root = run.root
+
+    def cleanup() -> None:
+        try:
+            run.root = session_root
+            run.diagnostic_path = session_root / "diagnostics.sqlite3"
+            finalize_fixture(run)
+        finally:
+            session.undo()
+
+    request.addfinalizer(cleanup)
+    configure_harness(session, run)
+    run.execute()
+    assert_install_ready(run, worker_running=True)
+    run.worker_replicas(0)
+    run.baseline = run.install_snapshot()
     run.deadline = None
     run.fixture_ready = True
+    return run
+
+
+@pytest.fixture
+def kind_factory(
+    request: pytest.FixtureRequest,
+    monkeypatch: pytest.MonkeyPatch,
+    shared_install: AdmittedKind,
+) -> AdmittedKind:
+    run = shared_install
+    case = request.node.nodeid
+    baseline = run.require_baseline()
+    # Never clean at start: a leftover means an earlier case's reset failed.
+    snapshot = run.install_snapshot()
+    leftovers = leftover_state(baseline, snapshot)
+    if leftovers:
+        run.record_isolation_failure("case-start", leftovers, snapshot, case=case)
+        raise CaseIsolationError(
+            "the shared install is not clean at case start: " + "; ".join(leftovers)
+        )
+    session_root = run.root
+    root = session_root / f"case-{uuid.uuid4().hex[:10]}"
+    root.mkdir()
+    temporary = root / "tmp"
+    temporary.mkdir()
+    monkeypatch.setenv("TMPDIR", str(temporary))
+    run.root = root
+    run.diagnostic_path = root / "diagnostics.sqlite3"
+    run.infrastructure_errors = []
+
+    def cleanup() -> None:
+        reset = False
+        try:
+            try:
+                run.reset_case(case=case)
+            except CaseIsolationError:
+                # reset_case recorded its own evidence before raising.
+                raise
+            except Exception as exc:
+                detail = run.redact_model_evidence(str(exc))
+                run.record_isolation_failure(
+                    "reset", [f"{type(exc).__name__}: {detail}"], None, case=case
+                )
+                raise
+            reset = True
+            if run.infrastructure_errors:
+                raise RuntimeError("runtime infrastructure failed; private diagnostics retained")
+        finally:
+            run.infrastructure_errors = []
+            # A failed reset keeps the case directory as evidence.
+            if reset:
+                remove_fixture_files(run)
+            run.root = session_root
+            run.diagnostic_path = session_root / "diagnostics.sqlite3"
+
+    request.addfinalizer(cleanup)
+    run.deploy_case_agents()
+    worker_running = "paused_factory" not in request.fixturenames
+    if worker_running:
+        run.worker_replicas(1)
+    assert_install_ready(run, worker_running=worker_running)
     return run
 
 
@@ -172,6 +260,10 @@ def observe_until(predicate: Callable[[], Any], *, seconds: int = 180) -> Any:
 
 def execution_observed(run: AdmittedKind, ticket: Ticket) -> dict[str, Any] | None:
     row = run.request(ticket)
+    if row and row["started_at"] is None and row["status"] == "waiting" and (
+        row["last_deferral_reason"] == "acquire_lost"
+    ):
+        return None
     if row and (row["started_at"] is not None or row["last_deferral_reason"] is not None):
         return row
     return None
@@ -423,6 +515,40 @@ def await_admission_status(run: AdmittedKind, ticket: Ticket, request_id: str) -
     )
 
 
+def await_base_pin_status(
+    run: AdmittedKind,
+    ticket: Ticket,
+    row: dict[str, Any],
+    notice_before: dict[str, Any],
+) -> None:
+    with run.stub.provider_lock:
+        branch = run.stub._repository_row()["default_branch"]
+        commit = run.stub._ref(branch)
+    assert branch and commit
+    assert run.sql(
+        "SELECT json_build_object('branch',base_branch,'source',base_source,"
+        "'commit',base_commit,'request_id',base_resolved_request_id) FROM curie.work_items "
+        f"WHERE id='{uuid.UUID(row['work_item_id'])}'"
+    ) == {"branch": branch, "source": "default", "commit": commit, "request_id": row["id"]}
+    assert notice_before["rendered_digest"] is not None
+    notice = observe_until(
+        lambda: n if (n := notice_state(run, row["id"]))
+        and n["comment_id"] == notice_before["comment_id"]
+        and n["posted_at"] == notice_before["posted_at"]
+        and n["rendered_digest"] is not None
+        and n["rendered_digest"] != notice_before["rendered_digest"]
+        and n["sync_owner"] is None
+        and not n["sync_invalidated"] else None
+    )
+    if notice is None:
+        failure = RuntimeError("base pin status outbox did not finish updating the fixture comment")
+        run.record_failure("base pin status readiness", failure)
+        raise failure
+    assert_status_on_original_tracker(run, ticket, row["id"])
+    assert len(run.comments(ticket)) == 1
+    no_execution_effects(run, ticket, row)
+
+
 def waiting_ticket(
     run: AdmittedKind, kind: str = "github"
 ) -> tuple[Ticket, dict[str, Any], dict[str, Any]]:
@@ -467,7 +593,8 @@ def factory_deferral(
     run: AdmittedKind, ticket: Ticket, before: dict[str, Any], reason: str
 ) -> dict[str, Any]:
     row = observe_until(
-        lambda: r if (r := run.request(ticket)) and r["last_deferral_reason"] else None
+        lambda: r if (r := run.request(ticket))
+        and r["start_deferrals"] != before["start_deferrals"] else None
     )
     assert row is not None, "request has no correlated factory authority refusal"
     assert row["last_deferral_reason"] == "not_started:" + reason
@@ -561,6 +688,39 @@ def test_execute_revalidates_current_authority(
 ) -> None:
     run = paused_factory
     ticket, before, wake = waiting_ticket(run)
+    if change == "deployment_missing":
+        notice_before = notice_state(run, before["id"])
+        body = acquire_body(before, wake)
+        path = f"/v1/internal/work-items/requests/{before['id']}"
+        grant = run.api("POST", path + "/acquire", body, internal=True)
+        assert grant["generation"] == before["dispatch_generation"]
+        assert grant["context"]["agent_id"] == ticket.agent.id
+        deferred = run.api(
+            "POST", path + "/defer",
+            {
+                "owner": body["owner"], "generation": grant["generation"],
+                "reason": "fixture_ready", "capacity": False,
+            }, internal=True,
+        )
+        current = run.request(ticket)
+        assert current is not None
+        assert current["status"] == "waiting"
+        assert current["dispatch_generation"] == before["dispatch_generation"] + 1
+        assert deferred["dispatch_generation"] == current["dispatch_generation"]
+        assert deferred["terminal_cause"] is None
+        assert datetime.fromisoformat(deferred["not_before"]) == datetime.fromisoformat(
+            current["dispatch_not_before"]
+        )
+        assert current["last_deferral_reason"] == "fixture_ready"
+        assert current["start_deferrals"] == before["start_deferrals"]
+        assert current["capacity_deferrals"] == before["capacity_deferrals"]
+        assert current["acquire_owner"] is None
+        assert current["acquired_generation"] is None
+        assert current["acquire_expires_at"] is None
+        wake = run.take_execute_wake(current)
+        before = run.request(ticket)
+        assert before is not None
+        await_base_pin_status(run, ticket, before, notice_before)
     comments = run.comments(ticket)
     agent_id = uuid.UUID(ticket.agent.id)
     binding = f"agent_id='{agent_id}' AND kind='github'"
@@ -667,6 +827,7 @@ def test_existing_acquire_fences_remain_read_only(
             f"WHERE id='{uuid.UUID(row['id'])}'"
         )
     else:
+        notice_before = notice_state(run, row["id"])
         run.api(
             "POST", f"/v1/internal/work-items/requests/{row['id']}/acquire",
             acquire_body(row, wake, owner="acme-other-worker"), internal=True,
@@ -675,6 +836,8 @@ def test_existing_acquire_fences_remain_read_only(
             "UPDATE curie.execution_requests SET acquire_expires_at=now()+interval '1 hour' "
             f"WHERE id='{uuid.UUID(row['id'])}'"
         )
+        await_base_pin_status(run, ticket, row, notice_before)
+        comments = run.comments(ticket)
     frozen = request_state(run, row["id"])
     run.enqueue(wake)
     run.worker_replicas(1)
@@ -1461,10 +1624,26 @@ def test_two_worker_ci_preserves_successor_identity_and_rejects_stale_predecesso
     assert worker_lane_identity(run, "c4-held-worker") == continuation_worker_before
 
 
-@pytest.mark.parametrize("action", ["renew", "late_start"])
 @pytest.mark.parametrize(
-    ("change", "reason"),
-    [("removed", "factory_binding_missing"), ("recreated", "factory_binding_changed")],
+    ("change", "reason", "action"),
+    [
+        pytest.param(
+            "removed", "factory_binding_missing", "renew",
+            id="removed-factory_binding_missing-renew",
+        ),
+        pytest.param(
+            "removed", "factory_binding_missing", "late_start",
+            id="removed-factory_binding_missing-late_start",
+        ),
+        pytest.param(
+            "recreated", "factory_binding_changed", "renew",
+            id="recreated-factory_binding_changed-renew",
+        ),
+        pytest.param(
+            "recreated", "factory_binding_changed", "late_start",
+            id="recreated-factory_binding_changed-late_start",
+        ),
+    ],
 )
 def test_renewal_and_late_start_revalidate_granted_binding(
     paused_factory: AdmittedKind, action: str, change: str, reason: str
@@ -1474,12 +1653,26 @@ def test_renewal_and_late_start_revalidate_granted_binding(
     body = acquire_body(before, wake)
     path = f"/v1/internal/work-items/requests/{before['id']}"
     status, grant = run.api_result("POST", path + "/acquire", body, internal=True)
-    assert status == 200, "the valid neighbor acquire did not grant the admitted request"
+    assert status == 200, f"the valid neighbor acquire did not grant the admitted request: {grant}"
     assert grant["context"]["agent_id"] == ticket.agent.id
     assert grant["generation"] == before["dispatch_generation"]
     assert grant["repository_path"] == REPOSITORY
     assert datetime.fromisoformat(grant["wait_deadline"]) == datetime.fromisoformat(
         before["wait_deadline"]
+    )
+    settle_seconds = run.kubectl(
+        "-n",
+        run.namespace,
+        "exec",
+        "deployment/curie-api",
+        "--",
+        "python",
+        "-c",
+        "from curie_api.config import get_settings; "
+        "print(get_settings().factory_base_label_settle_s)",
+    )
+    assert int(settle_seconds.strip()) == 0, (
+        "the admitted-agent fixture API did not consume a zero base-label settle interval"
     )
     run.api(
         "DELETE", query_path(

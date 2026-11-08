@@ -1,4 +1,6 @@
-"""The status comment states the recorded base and where it came from (#3095, ADR 0186)."""
+"""The status comment states the selected base, source and pending move (ADR 0253)."""
+
+# ruff: noqa: F811
 
 from __future__ import annotations
 
@@ -14,6 +16,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from curie_api.factory_comment_text import marker_for
 from curie_api.factory_notices import FINAL_MARKER, status_body
 from forge_fakes.github_comments import admitted, comments  # noqa: F401  (fixtures)
+from test_factory_base_ci_subject import moved  # noqa: F401
 from test_factory_status_comment import _admit, _execute, _marked
 from test_factory_terminus import _reconcile  # noqa: F401  (fixtures)
 
@@ -24,10 +27,6 @@ CARD = "https://curie.example.com/v1/factory/cards/abc.svg"
 WAITING = "_Waiting for the agent to report progress._"
 LABEL_LINE = "Base: `next` (from label `base:next`)"
 DEFAULT_LINE = "Base: `main` (deployment default)"
-IGNORED_LINE = (
-    "Base: `next` (from label `base:next`) "
-    "Label now says `base:main`; the recorded base is kept."
-)
 
 
 # --- status_body places the line ---------------------------------------------------
@@ -101,28 +100,25 @@ def _record_base(
     branch: str | None,
     source: str | None,
     commit: str | None,
-    ignored: str | None = None,
 ) -> None:
     _execute(
         "UPDATE curie.work_items SET base_branch = :branch, base_source = :source, "
-        "base_commit = :commit, base_label_ignored = :ignored "
+        "base_commit = :commit "
         "WHERE tracker_issue_id = :number",
         {
             "branch": branch,
             "source": source,
             "commit": commit,
-            "ignored": ignored,
             "number": str(number),
         },
     )
 
 
 @pytest.mark.parametrize(
-    ("number", "branch", "source", "ignored", "expected"),
+    ("number", "branch", "source", "expected"),
     [
-        (30951, "next", "label", None, LABEL_LINE),
-        (30952, "main", "default", None, DEFAULT_LINE),
-        (30953, "next", "label", "main", IGNORED_LINE),
+        (30951, "next", "label", LABEL_LINE),
+        (30952, "main", "default", DEFAULT_LINE),
     ],
 )
 def test_the_status_comment_renders_the_recorded_base(
@@ -130,12 +126,11 @@ def test_the_status_comment_renders_the_recorded_base(
     number: int,
     branch: str,
     source: str,
-    ignored: str | None,
     expected: str,
 ) -> None:
     client, github, sink = admitted
     request_id = _admit(client, github, sink, number)
-    _record_base(number, branch=branch, source=source, commit="5" * 40, ignored=ignored)
+    _record_base(number, branch=branch, source=source, commit="5" * 40)
 
     _reconcile()
 
@@ -157,3 +152,37 @@ def test_a_legacy_work_item_renders_no_base_line(admitted: Any) -> None:  # noqa
 
     (comment,) = _marked(sink, request_id)
     assert "Base:" not in comment["body"]
+
+
+@pytest.mark.parametrize(
+    ("phase", "error", "words"),
+    [
+        ("pending", None, ("pending", "waiting", "requested")),
+        ("pushed", None, ("pushed", "retarget", "moving")),
+        ("conflict", "rebase_conflict", ("conflict", "refused")),
+    ],
+)
+def test_status_renders_the_real_transition_target_and_progress(
+    moved: Any, phase: str, error: str | None, words: tuple[str, ...]
+) -> None:
+    client, _github, sink, row = moved
+    _execute(
+        "UPDATE curie.work_items SET base_branch = 'main', base_source = 'default', "
+        "base_commit = :commit WHERE id = :id",
+        {"id": row["work_item_id"], "commit": "1" * 40},
+    )
+    _execute(
+        "UPDATE curie.factory_base_transitions SET phase = :phase, error_code = :error "
+        "WHERE id = :id",
+        {"id": row["transition_id"], "phase": phase, "error": error},
+    )
+
+    client.portal.call(client.app.state.work_item_reconciler._sync_status_comments)
+
+    (comment,) = _marked(sink, row["id"])
+    body = comment["body"]
+    assert DEFAULT_LINE in body
+    assert "`next`" in body or "`base:next`" in body
+    assert any(word in body.lower() for word in words)
+    assert "the recorded base is kept" not in body
+    assert FINAL_MARKER not in body

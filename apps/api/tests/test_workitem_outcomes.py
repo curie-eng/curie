@@ -71,7 +71,7 @@ from curie_api.workitem_outcomes import derive_outcome
 from curie_api.workitems import lifecycle as workitems
 from curie_test_support.valkey import connect_or_skip
 from fastapi.testclient import TestClient
-from forge_fakes import factory_wake
+from forge_fakes import factory_wake, no_external_calls
 from forge_fakes.github import (
     ci_view,
     forges_document,
@@ -299,7 +299,7 @@ def _admit_revision(facts: SimpleNamespace) -> SimpleNamespace:
     return with_session(body)
 
 
-def _start(request_id: uuid.UUID, *, generation: int = 1) -> int:
+def _start(client: TestClient, request_id: uuid.UUID, *, generation: int = 1) -> int:
     async def body(session: AsyncSession) -> int:
         acquired = await acquire(
             session,
@@ -308,6 +308,7 @@ def _start(request_id: uuid.UUID, *, generation: int = 1) -> int:
             generation=generation,
             wake=await factory_wake(session, request_id),
             context=None,
+            client=client.app.state.http_client,
         )
         assert isinstance(acquired, AcquireGrant), acquired
         started = await start(
@@ -383,10 +384,9 @@ def _cancel(work_item_id: uuid.UUID, request_id: uuid.UUID) -> None:
 def _completed(client: TestClient, agent: dict[str, Any], **overrides: Any) -> SimpleNamespace:
     """Admit and start. Completion waits until a pull request is open."""
 
-    del client
     facts = _facts(agent["agent_id"], **overrides)
     seeded = _admit(facts)
-    seeded.runtime_epoch = _start(facts.request_id)
+    seeded.runtime_epoch = _start(client, facts.request_id)
     return seeded
 
 
@@ -636,14 +636,16 @@ def test_capacity_deferral_is_waiting_and_names_capacity(
     seeded = _admit(facts)
 
     async def body(session: AsyncSession) -> None:
-        acquired = await acquire(
-            session,
-            facts.request_id,
-            owner=OWNER,
-            generation=1,
-            wake=await factory_wake(session, facts.request_id),
-            context=None,
-        )
+        async with no_external_calls() as http_client:
+            acquired = await acquire(
+                session,
+                facts.request_id,
+                owner=OWNER,
+                generation=1,
+                wake=await factory_wake(session, facts.request_id),
+                context=None,
+                client=http_client,
+            )
         assert isinstance(acquired, AcquireGrant), acquired
         await defer(
             session,
@@ -706,7 +708,7 @@ def test_started_request_is_running(stack: TestClient, auth_headers: dict[str, s
     agent = _agent(stack, auth_headers)
     facts = _facts(agent["agent_id"])
     seeded = _admit(facts)
-    _start(facts.request_id)
+    _start(stack, facts.request_id)
 
     body = _detail(stack, auth_headers, seeded.work_item_id)
 
@@ -723,7 +725,7 @@ def test_cancel_while_running_is_cancellation_requested_naming_issue_cancelled(
     agent = _agent(stack, auth_headers)
     facts = _facts(agent["agent_id"])
     seeded = _admit(facts)
-    _start(facts.request_id)
+    _start(stack, facts.request_id)
     _cancel(seeded.work_item_id, facts.request_id)
 
     body = _detail(stack, auth_headers, seeded.work_item_id)
@@ -753,7 +755,7 @@ def test_cancelled_after_termination_is_recorded(
     agent = _agent(stack, auth_headers)
     facts = _facts(agent["agent_id"])
     seeded = _admit(facts)
-    _start(facts.request_id)
+    _start(stack, facts.request_id)
     _cancel(seeded.work_item_id, facts.request_id)
 
     async def terminate(session: AsyncSession) -> None:
@@ -780,7 +782,7 @@ def test_failed_names_terminal_cause_and_delivery_budget(
     agent = _agent(stack, auth_headers)
     facts = _facts(agent["agent_id"])
     seeded = _admit(facts)
-    epoch = _start(facts.request_id)
+    epoch = _start(stack, facts.request_id)
     _finish(facts.request_id, epoch, "failed", "deadline_halted")
 
     body = _detail(stack, auth_headers, seeded.work_item_id)
@@ -807,14 +809,16 @@ def test_failed_start_failed_names_the_attempts_and_last_reason(
                 text("SELECT dispatch_generation FROM curie.execution_requests WHERE id = :id"),
                 {"id": facts.request_id},
             )
-            granted = await acquire(
-                session,
-                facts.request_id,
-                owner=OWNER,
-                generation=generation,
-                wake=await factory_wake(session, facts.request_id),
-                context=None,
-            )
+            async with no_external_calls() as http_client:
+                granted = await acquire(
+                    session,
+                    facts.request_id,
+                    owner=OWNER,
+                    generation=generation,
+                    wake=await factory_wake(session, facts.request_id),
+                    context=None,
+                    client=http_client,
+                )
             assert getattr(granted, "code", None) is None, granted
             deferred = await defer(
                 session,
@@ -852,14 +856,16 @@ def _defer_once(request_id: uuid.UUID, *, reason: str, capacity: bool, detail: s
             text("SELECT dispatch_generation FROM curie.execution_requests WHERE id = :id"),
             {"id": request_id},
         )
-        granted = await acquire(
-            session,
-            request_id,
-            owner=OWNER,
-            generation=generation,
-            wake=await factory_wake(session, request_id),
-            context=None,
-        )
+        async with no_external_calls() as http_client:
+            granted = await acquire(
+                session,
+                request_id,
+                owner=OWNER,
+                generation=generation,
+                wake=await factory_wake(session, request_id),
+                context=None,
+                client=http_client,
+            )
         assert getattr(granted, "code", None) is None, granted
         deferred = await defer(
             session,
@@ -956,7 +962,6 @@ def test_elapsed_and_expired_capacity_wait_name_the_previous_start_failure(
     monkeypatch.setenv("CURIE_WORK_ITEM_WAIT_BUDGET_SECONDS", "3")
     get_settings.cache_clear()
     facts = _facts(agent["agent_id"])
-    admitted_at = time.monotonic()
     seeded = _admit(facts)
     _defer_once(
         facts.request_id,
@@ -965,7 +970,11 @@ def test_elapsed_and_expired_capacity_wait_name_the_previous_start_failure(
         detail=START_FAILURE_DETAIL,
     )
     _defer_once(facts.request_id, reason="capacity", capacity=True, detail=None)
-    time.sleep(max(0.0, 3.5 - (time.monotonic() - admitted_at)))
+    _execute(
+        "SELECT pg_sleep(GREATEST(0, EXTRACT(EPOCH FROM (wait_deadline - clock_timestamp())))) "
+        "FROM curie.execution_requests WHERE id = :id",
+        {"id": facts.request_id},
+    )
 
     elapsed = _detail(stack, auth_headers, seeded.work_item_id)
     assert elapsed["state"] == "waiting"
@@ -992,7 +1001,8 @@ def test_elapsed_and_expired_capacity_wait_name_the_previous_start_failure(
     expired = _detail(stack, auth_headers, seeded.work_item_id)
     assert expired["state"] == "expired"
     assert expired["actionable_cause"] == (
-        "expired: capacity_wait_expired, no sandbox capacity before the waiting deadline"
+        "expired: capacity_wait_expired, sandbox admission did not complete before the "
+        "waiting deadline"
         + PREVIOUS_START_FAILURE
     )
     assert expired["requests"][-1]["last_start_failure_detail"] == START_FAILURE_DETAIL
@@ -1039,7 +1049,7 @@ def test_running_and_completed_requests_report_no_start_failure(
     waiting = _detail(stack, auth_headers, seeded.work_item_id)
     assert PREVIOUS_START_FAILURE in waiting["actionable_cause"]
 
-    epoch = _start(facts.request_id, generation=_current_generation(facts.request_id))
+    epoch = _start(stack, facts.request_id, generation=_current_generation(facts.request_id))
     running = _detail(stack, auth_headers, seeded.work_item_id)
     assert running["state"] == "running"
     assert "previous start failure" not in running["actionable_cause"]
@@ -1286,7 +1296,7 @@ def test_opened_pr_binds_only_the_publication_request(
     publication = _publish(stack, agent["deployment_id"])
     other_facts = _facts(agent["agent_id"], issue_number=2578)
     other = _admit(other_facts)
-    _start(other_facts.request_id)
+    _start(stack, other_facts.request_id)
     assert _bound_lineage(owner.work_item_id) is None
     assert _bound_lineage(other.work_item_id) is None
 
@@ -1303,7 +1313,7 @@ def test_verified_repository_identity_must_match_work_item_to_bind(
     agent = _agent(stack, auth_headers)
     facts = _facts(agent["agent_id"], repository_id=102)
     seeded = _admit(facts)
-    _start(facts.request_id)
+    _start(stack, facts.request_id)
     publication = _publish(stack, agent["deployment_id"])
     _resolve(stack, auth_headers, publication["approval_id"])
     lease_owner = "outcomes-test-worker"
@@ -1393,7 +1403,7 @@ def test_readmitted_item_running_again_reports_running_and_keeps_the_pr(
     _complete(seeded)
     second = _facts(agent["agent_id"])
     _admit(second)
-    _start(second.request_id)
+    _start(stack, second.request_id)
 
     body = _detail(stack, auth_headers, seeded.work_item_id)
 
@@ -1517,6 +1527,62 @@ def test_queued_revision_promotion_reads_the_stored_reply_target(
     with_session(promote)
 
 
+
+def test_expired_admission_wait_does_not_claim_observed_capacity_exhaustion() -> None:
+    now = datetime.now(UTC)
+    work_item_id = uuid.uuid4()
+    item = WorkItem(
+        id=work_item_id,
+        agent_id=uuid.uuid4(),
+        tracker_kind="github",
+        tracker_host="github.com",
+        tracker_scope_id="101",
+        tracker_issue_id="5296",
+        code_host_kind="github",
+        code_host_host="github.com",
+        repository_project_id="101",
+        repository_path=REPO,
+        cancelled_at=None,
+        created_at=now,
+        updated_at=now,
+    )
+    request = ExecutionRequest(
+        id=uuid.uuid4(),
+        work_item_id=work_item_id,
+        sequence=1,
+        status="expired",
+        wait_deadline=now,
+        started_at=None,
+        execution_deadline=None,
+        terminal_at=now,
+        terminal_cause="capacity_wait_expired",
+        termination_observation=None,
+        created_at=now,
+        capacity_deferrals=1,
+        last_deferral_reason="capacity",
+        last_start_failure_detail=None,
+        objective=OBJECTIVE,
+        requester=REQUESTER,
+    )
+    outcome = derive_outcome(
+        item,
+        [request],
+        lineage=None,
+        publication=None,
+        approval=None,
+        pending_turn_approval=False,
+        now=now,
+        issue_url="https://github.com/curie-eng/curie/issues/5296",
+    )
+    assert outcome.state == "expired"
+    assert outcome.requests[0].terminal_cause == "capacity_wait_expired"
+    assert outcome.actionable_cause == (
+        "expired: capacity_wait_expired, sandbox admission did not complete before the "
+        "waiting deadline"
+    )
+    assert "no sandbox capacity" not in outcome.actionable_cause
+
+
 def test_only_closed_lineage_request_names_the_cancellation_cause() -> None:
     now = datetime.now(UTC)
     work_item_id = uuid.uuid4()
@@ -1605,7 +1671,7 @@ def test_linked_lineage_id_is_used_when_set(
     agent = _agent(stack, auth_headers)
     facts = _facts(agent["agent_id"])
     seeded = _admit(facts)
-    epoch = _start(facts.request_id)
+    epoch = _start(stack, facts.request_id)
     publication = _publish(
         stack,
         agent["deployment_id"],
@@ -1644,7 +1710,7 @@ def test_no_runtime_owner_or_secret_material_reaches_list_or_detail(
     agent = _agent(stack, auth_headers)
     running = _facts(agent["agent_id"], issue_number=1)
     running_item = _admit(running)
-    _start(running.request_id)
+    _start(stack, running.request_id)
     published = _completed(stack, agent, issue_number=2, reply_conversation_id="1700000000.000200")
     publication = _publish(stack, agent["deployment_id"], conversation_id="1700000000.000200")
     _execute(
@@ -1935,7 +2001,7 @@ def test_ci_unavailable_when_the_token_mint_fails(
     ("status", "reason"),
     [
         (401, "github_unauthorized"),
-        (403, "github_forbidden"),
+        (403, "github_forbidden_list_check_runs"),
         (404, "github_not_found"),
         (429, "github_rate_limited"),
         (500, "github_error"),
@@ -2056,7 +2122,7 @@ def test_cancel_termination_does_not_leak_the_observer_owner(
     agent = _agent(stack, auth_headers)
     facts = _facts(agent["agent_id"])
     seeded = _admit(facts)
-    _start(facts.request_id)
+    _start(stack, facts.request_id)
     _cancel(seeded.work_item_id, facts.request_id)
     _terminate(facts.request_id)
 
@@ -2069,7 +2135,7 @@ def test_deadline_termination_does_not_leak_the_observer_owner(
     agent = _agent(stack, auth_headers)
     facts = _facts(agent["agent_id"])
     seeded = _admit(facts)
-    _start(facts.request_id)
+    _start(stack, facts.request_id)
 
     async def elapse_deadline() -> None:
         # The deadline is write-once (trigger) and fixed at 1800 s; move it into
@@ -2318,7 +2384,7 @@ def _deadline_90_then_elapse(
     assert patched.status_code == 200, patched.text
     facts = _facts(agent["agent_id"])
     seeded = _admit(facts)
-    _start(facts.request_id)
+    _start(stack, facts.request_id)
 
     async def elapse_deadline() -> None:
         # Keep the configured 90 s span but move it into the past, triggers
@@ -3315,7 +3381,11 @@ def test_ci_detail_uses_the_statuses_list_not_the_combined_state(
 
 @pytest.mark.parametrize(
     ("status", "reason"),
-    [(401, "github_unauthorized"), (403, "github_forbidden"), (404, "github_not_found")],
+    [
+        (401, "github_unauthorized"),
+        (403, "github_forbidden_list_check_runs"),
+        (404, "github_not_found"),
+    ],
 )
 def test_ci_detail_refusals_map_to_fixed_reasons(
     monkeypatch: pytest.MonkeyPatch, status: int, reason: str
