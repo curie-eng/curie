@@ -216,9 +216,13 @@ has not expired, and names this agent, this connector, this tool and the call's
 canonical arguments
 (`apps/worker/src/curie_connector_proxy/server.py::_grant_refused`). The grant's
 `jti` is then spent once in Valkey with `SET NX EX`, so a replayed grant, a
-missing grant store or a failed spend refuses the call. A body with two or more
-gated calls is refused before any grant is spent. The grant header is stripped
-before the forward. A refused grant check answers with the JSON-RPC refusal
+missing grant store or a failed spend refuses the call. A grant whose `jti` is
+not a canonical lowercase hyphenated UUID is refused as invalid. A body with two
+or more gated calls is refused before any grant is spent, and so is a JSON-RPC
+batch carrying a gated call or a call that matches the presented grant
+(sub-reason `batched_call`). The grant header is stripped before the forward,
+and a spent grant is attested to the connector as described under
+`X-Curie-Grant-Verified` below. A refused grant check answers with the JSON-RPC refusal
 below, reason `grant_required`
 (`apps/worker/src/curie_connector_proxy/caller.py::GRANT_REQUIRED`). On a path
 the connector does not declare as a route, a body over 1 MiB is refused with a
@@ -403,6 +407,28 @@ refused until the rollout completes. An older proxy also never sets
 `X-Curie-Principal`, so a connector tool that requires a human refuses
 `missing_requester` behind it until the rollout completes.
 
+After a grant check spends a grant, the proxy attests it to the connector with
+exactly one `X-Curie-Grant-Verified` whose value is the spent grant's `jti`
+(`apps/worker/src/curie_connector_proxy/caller.py::GRANT_VERIFIED_HEADER`,
+ADR 0271 decision 7). It drops every inbound copy with the other identity
+headers, in any letter case and however often it repeats, on every path
+(`apps/worker/src/curie_connector_proxy/server.py::_NOT_FORWARDED`), and sets
+its own beside `X-Curie-Principal` only on a `tools/call` forward whose grant
+check returned an attestation
+(`apps/worker/src/curie_connector_proxy/server.py::_identity_headers`). A
+gated call attests the grant it spent. An ungated call attests only a grant
+whose signature, connector, tool and canonical arguments match it, after the
+same expiry and agent checks and a successful spend; a matching grant that has
+expired, names another agent or is already spent refuses `grant_required`, and
+any other incidental grant is stripped and the call forwarded unattested with
+nothing spent (`apps/worker/src/curie_connector_proxy/server.py::_grant_refused`).
+The runner's static `X-Curie-Connector-Grant` on every hosted entry therefore
+spends nothing on an unrelated call after an approved resume or on warm reuse.
+The decision log line ends ` attested=present` on an attested forward and never
+carries the value. The contract is under "Verified spent-grant header" below.
+The local tier runs no caller proxy, so no connector there receives the header,
+and a protected execution tool refuses every call there.
+
 ## Implementations today
 
 One production host plus a fake:
@@ -562,8 +588,9 @@ This section freezes the wire contract for
 [ADR 0271](../../adr/0271-per-request-approver-sets-and-separation-of-duties.md).
 The pure signer and verifier are available, and the API now enforces
 registration, the route lock and creation verification (see "What the API
-enforces today" below). Answer and resume authority, separation enforcement and
-the proxy verified-grant header are later slices and are not enforced yet.
+enforces today" below), and the connector proxy sets the verified-grant header
+(see "Verified spent-grant header" below). Answer and resume authority and
+separation enforcement are later slices and are not enforced yet.
 
 The connector helper is
 `packages/curie-internal/src/curie_internal/approver_ticket.py`.
@@ -912,3 +939,18 @@ from the proxy's gated list. The connector also checks its ticket and current
 local policy before the effect. API answer and resume checks own selected actor
 and separation policy; this header supplies no second approval policy or result
 lookup API. An uncertain upstream outcome never permits replay of a spent grant.
+
+The proxy implements this in
+`apps/worker/src/curie_connector_proxy/server.py`: `_forwardable` drops inbound
+copies, `_grant_refused` judges the gated and ungated cases and returns the
+attestation, `_grant_spent` performs the single-use spend before any forward,
+and `_handle` passes the attestation to `_identity_headers`. The worker mints
+the grant for exactly the approved tool and arguments with a fresh UUID `jti`
+(`apps/worker/src/curie_worker/kernel/claim.py::_connector_tool_grant`). The
+reference connector `tools/identity-e2e/human_restricted_connector.py` shows a
+protected execution handler: its `execute_attested` and `execute_approved`
+tools refuse a missing or malformed attestation and a grant id already used,
+then check the requester and, for `execute_approved`, the ticket's signature,
+scope, requester and argument digest, before current downstream authority and
+the effect. The proxy exists only on Kubernetes, so the header is only ever set
+there.
