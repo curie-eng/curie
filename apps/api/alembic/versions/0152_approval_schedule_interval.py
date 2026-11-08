@@ -1,7 +1,7 @@
 """Reserve the nullable approval reminder interval beside frozen deadlines.
 
-Revision ID: 0150
-Revises: 0149
+Revision ID: 0152
+Revises: 0151
 """
 
 from collections.abc import Sequence
@@ -9,8 +9,8 @@ from collections.abc import Sequence
 import sqlalchemy as sa
 from alembic import op
 
-revision: str = "0150"
-down_revision: str = "0149"
+revision: str = "0152"
+down_revision: str = "0151"
 branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
 

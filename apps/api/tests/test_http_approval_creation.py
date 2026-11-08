@@ -727,7 +727,7 @@ def test_pending_http_receipt_survives_schedule_schema_upgrade(creation_case):
     accepted(post(case), case.request)
     before = rows(case.request["approval"]["dedupe_key"])[0]
     try:
-        command.downgrade(alembic_config(), "0149")
+        command.downgrade(alembic_config(), "0151")
     finally:
         command.upgrade(alembic_config(), "head")
     accepted(post(case), case.request, duplicate=True)

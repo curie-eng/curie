@@ -13,7 +13,7 @@ from sqlalchemy.exc import IntegrityError
 def test_schedule_expansion_preserves_existing_approval_authority(
     isolated_migration_db: IsolatedMigrationDb,
 ) -> None:
-    isolated_migration_db.at("0149")
+    isolated_migration_db.at("0151")
     approval_id = uuid.uuid4()
     sql_rows(
         "INSERT INTO curie.approvals (id, conversation_id, author, summary, reply_kind, "
@@ -24,7 +24,7 @@ def test_schedule_expansion_preserves_existing_approval_authority(
     )
     before = sql_dicts("SELECT * FROM curie.approvals WHERE id=:id", {"id": approval_id})[0]
     digest = approval_record_digest(SimpleNamespace(**before))
-    command.upgrade(alembic_config(), "0150")
+    command.upgrade(alembic_config(), "0152")
     after = sql_dicts("SELECT * FROM curie.approvals WHERE id=:id", {"id": approval_id})[0]
     assert after == {**before, "remind_every_s": None}
     assert approval_record_digest(SimpleNamespace(**after)) == digest
@@ -33,5 +33,5 @@ def test_schedule_expansion_preserves_existing_approval_authority(
     assert approval_record_digest(SimpleNamespace(**scheduled)) == digest
     with pytest.raises(IntegrityError):
         sql_rows("UPDATE curie.approvals SET remind_every_s=0 WHERE id=:id", {"id": approval_id})
-    command.downgrade(alembic_config(), "0149")
+    command.downgrade(alembic_config(), "0151")
     assert sql_dicts("SELECT * FROM curie.approvals WHERE id=:id", {"id": approval_id})[0] == before

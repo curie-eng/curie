@@ -48,7 +48,7 @@ def test_candidate_requires_deploy_notices_after_ledger_schema(resource: str) ->
     # also requires main's deleted issue cancellation (0147).
     # 0149 stores webhook provenance and a wake-key generation and does not
     # raise the floor.
-    assert window == {"schema_min": "0151", "schema_head": "0151"}
+    assert window == {"schema_min": "0152", "schema_head": "0152"}
 
 
 @pytest.mark.parametrize("field", ["cargo", "chart", "app"])
@@ -79,7 +79,7 @@ def test_new_candidate_has_its_own_window_and_append_only_revision() -> None:
     assert data["windows"].get("0.14.2") == {"schema_min": "0123", "schema_head": "0123"}
     assert data["windows"].get("0.14.3") == {"schema_min": "0140", "schema_head": "0140"}
     assert data["windows"].get("0.14.4") == {"schema_min": "0140", "schema_head": "0140"}
-    assert data["revisions"][-34:] == [
+    assert data["revisions"][-35:] == [
         "0095",
         "0096",
         "0097",
@@ -114,6 +114,7 @@ def test_new_candidate_has_its_own_window_and_append_only_revision() -> None:
         "0148",
         "0149",
         "0151",
+        "0152",
     ]
     kinds = json.loads((ROOT / "apps/api/src/curie_api/revision_kinds.json").read_text())
     assert kinds["0102"] == "expand"
@@ -144,6 +145,7 @@ def test_new_candidate_has_its_own_window_and_append_only_revision() -> None:
     assert kinds["0148"] == "expand"
     assert kinds["0149"] == "expand"
     assert kinds["0151"] == "expand"
+    assert kinds["0152"] == "expand"
 
 
 def test_every_prior_registered_window_is_exactly_preserved() -> None:
@@ -242,7 +244,7 @@ def test_both_train_heads_upgrade_without_losing_existing_rows(
 
     command.upgrade(alembic_config(), "head")
 
-    assert current_revision() == "0151"
+    assert current_revision() == "0152"
     assert sql_dicts("SELECT name FROM curie.agents WHERE id = :id", {"id": agent_id}) == [
         {"name": "acme-retained"}
     ]
