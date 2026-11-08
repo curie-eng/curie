@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-import json
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any, cast
 
@@ -52,21 +51,6 @@ if TYPE_CHECKING:
 
 from . import claim, clock, constants, failures, log, routing
 from .log import logger
-
-
-async def _forget_settled_turn(self: Kernel, event_id: str) -> None:
-    for claim_name, expected in (await self._markers.watched_turns()).items():
-        record = json.loads(expected)
-        if record["event_id"] != event_id:
-            continue
-        handle = await asyncio.to_thread(self._substrate.lookup, record["thread_key"])
-        if handle is not None and handle.claim_name == claim_name:
-            status = await self._runner.status(
-                handle.base_url, token=handle.token or None, remaining_s=5.0
-            )
-            if not (status.get("turn_active") is False and status.get("history_durable") is True):
-                continue
-        await self._markers.forget_watched_turn(claim_name, expected)
 
 
 async def _complete(
@@ -400,10 +384,6 @@ async def _complete(
             # successor drops at the terminal-row preamble.
             await self._markers.publish_successor(self._config.stream, successor.model_dump_json())
         await self._markers.mark_done(event_id, marker_value=marker_value, generation=generation)
-    try:
-        await _forget_settled_turn(self, event_id)
-    except Exception:  # noqa: BLE001 - terminal settlement already committed
-        logger.warning("could not clear settled turn watch for %s", event_id, exc_info=True)
     constants._LIFECYCLE_OUTCOME.set(telemetry_outcome)
     if notice is not None and hook_carry is not None:
         hook_carry.notice_pending = None
@@ -529,10 +509,6 @@ async def _settle_targetless(
             return
     else:
         await self._markers.mark_done_without_completion(event_id)
-    try:
-        await _forget_settled_turn(self, event_id)
-    except Exception:  # noqa: BLE001 - terminal settlement already committed
-        logger.warning("could not clear settled turn watch for %s", event_id, exc_info=True)
     constants._LIFECYCLE_OUTCOME.set(telemetry_outcome)
     log.record_metric(
         "curie.turn.completed",

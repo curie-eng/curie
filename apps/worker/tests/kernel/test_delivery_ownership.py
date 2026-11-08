@@ -2284,12 +2284,13 @@ def test_settled_watch_is_removed_only_after_durable_idle(make_harness, durable:
             h.runner.hold.set()
             await _settle(consumer)
             assert await h.kernel._markers.is_terminal(event.event_id)
+            assert await h.kernel._markers.watched_turn(handle.claim_name) == expected
             if durable:
-                assert await h.kernel._markers.watched_turn(handle.claim_name) is None
-                assert await h.kernel.reap_orphans() == []
+                async with asyncio.timeout(5):
+                    while await h.kernel._markers.watched_turn(handle.claim_name) is not None:
+                        assert await h.kernel.reap_orphans() == []
                 assert h.substrate.lookup(thread) == handle
                 return
-            assert await h.kernel._markers.watched_turn(handle.claim_name) == expected
             async with asyncio.timeout(5):
                 while handle.claim_name not in await h.kernel.reap_orphans():
                     pass

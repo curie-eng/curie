@@ -71,10 +71,10 @@ until the shell answers again.
 Each fenced turn records its claim and delivery lease before it starts. After
 that lease is first observed absent, `CURIE_ABANDONED_TURN_GRACE_S` allows
 90 seconds for cleanup, plus the maintenance cadence. Maintenance takes the
-thread lock and checks the exact claim again. Settling a delivery removes its
-watch only after observing an idle runner with durable history, or confirming
-that its claim is gone. Otherwise the watch remains for maintenance, including
-when the delivery is terminal. An idle runner with durable history keeps its
+thread lock and checks the exact claim again. Settlement retains the watch
+for maintenance, including when the delivery is terminal. Maintenance removes
+it after observing an idle runner with durable history, confirming the claim
+is gone, or retiring it. An idle runner with durable history keeps its
 route. An active, unreadable or non-durable runner is retired through the
 supervisor. Retirement stops the child and verifies cleanup. If the runner
 settles before the supervisor checks it, the cleaned shell can be reused;
