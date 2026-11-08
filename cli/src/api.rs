@@ -511,11 +511,23 @@ pub struct ApproverUserResponse {
     pub subject: Option<String>,
 }
 
-/// The stored separation policy of a registration.
+/// The stored separation policy of a route, with or without a selector.
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 pub struct ApprovalSeparationResponse {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub exclude_requester: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exempt_group: Option<ExemptGroupResponse>,
+}
+
+/// The identity-provider group exempt from the requester exclusion, as the
+/// API returns it. Tolerant of fields a newer server adds.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct ExemptGroupResponse {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub issuer: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
 }
 
 fn deserialize_route_deadline<'de, D>(deserializer: D) -> Result<Option<Option<u64>>, D::Error>
@@ -680,12 +692,36 @@ pub struct ApproverUserWrite {
     pub subject: String,
 }
 
-/// The separation policy of a registration. `exempt_group` lands with a later
-/// ADR 0271 slice and is refused until the API accepts it.
+/// The separation policy of a route (ADR 0271). `exempt_group` is accepted by
+/// the API only with `exclude_requester: true`; the API is that gate.
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct ApprovalSeparationWrite {
     pub exclude_requester: bool,
+    #[serde(
+        default,
+        deserialize_with = "deserialize_exempt_group",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub exempt_group: Option<ExemptGroupWrite>,
+}
+
+/// Decode `exempt_group`, naming the field in a shape error: serde's own
+/// message for a wrong type names only the struct.
+fn deserialize_exempt_group<'de, D>(deserializer: D) -> Result<Option<ExemptGroupWrite>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Option::<ExemptGroupWrite>::deserialize(deserializer)
+        .map_err(|e| serde::de::Error::custom(format!("exempt_group: {e}")))
+}
+
+/// The identity-provider group exempt from the requester exclusion.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ExemptGroupWrite {
+    pub issuer: String,
+    pub id: String,
 }
 
 /// Where a route's card goes, as an operator writes it: a fixed Slack channel,

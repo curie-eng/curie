@@ -710,8 +710,7 @@ fn an_unknown_key_in_separation_or_exempt_group_is_refused_locally_naming_the_ro
             route["separation"]["exclude_everyone"] = serde_json::json!(true);
         }),
         ("email", |route| {
-            route["separation"]["exempt_group"]["email"] =
-                serde_json::json!("admins@example.test");
+            route["separation"]["exempt_group"]["email"] = serde_json::json!("admins@example.test");
         }),
         ("name", |route| {
             route["separation"]["exempt_group"]["name"] = serde_json::json!("admins");
@@ -841,7 +840,12 @@ fn a_flag_only_edit_carries_forward_every_selector_and_separation_route_field_by
         "{}",
         sent[0]
     );
-    assert_eq!(routes["deal_desk"], plain_route("C0EXAMPLE6"), "{}", sent[0]);
+    assert_eq!(
+        routes["deal_desk"],
+        plain_route("C0EXAMPLE6"),
+        "{}",
+        sent[0]
+    );
     assert_eq!(sent[0][ROUTES_EXPECTED], 6, "{}", sent[0]);
 }
 
@@ -849,7 +853,11 @@ fn a_flag_only_edit_carries_forward_every_selector_and_separation_route_field_by
 fn an_edited_route_that_holds_separation_keeps_it_and_its_exempt_group() {
     for (name, held, expected_target) in [
         ("refund_static", static_route("C0EXAMPLE2"), "C0EXAMPLE7"),
-        ("ledger_post", ticket_route_with_exempt_group(true), "C0EXAMPLE7"),
+        (
+            "ledger_post",
+            ticket_route_with_exempt_group(true),
+            "C0EXAMPLE7",
+        ),
     ] {
         let api = api(
             serde_json::json!({name: held.clone(), "deal_desk": plain_route("C0EXAMPLE5")}),
@@ -864,7 +872,11 @@ fn an_edited_route_that_holds_separation_keeps_it_and_its_exempt_group() {
         assert_eq!(sent.len(), 1, "{name}: {sent:?}");
         let mut want = held.clone();
         want["resolution"] = serde_json::json!({"kind": "slack", "address": expected_target});
-        assert_eq!(sent[0]["approval_routes"][name], want, "{name}: {}", sent[0]);
+        assert_eq!(
+            sent[0]["approval_routes"][name], want,
+            "{name}: {}",
+            sent[0]
+        );
         assert!(
             sent[0]["approval_routes"].get("deal_desk").is_none(),
             "{name}: an untouched plain route is not carried: {}",
