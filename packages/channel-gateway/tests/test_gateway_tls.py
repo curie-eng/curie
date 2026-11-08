@@ -16,8 +16,8 @@ API_TOKEN = "test-gateway-api-credential"
 WORKER_TOKEN = "test-gateway-worker-credential"
 
 
-@pytest.fixture(scope="module")
-def tls_gateway(tmp_path_factory):
+@pytest.fixture(scope="module", params=(False, True))
+def tls_gateway(tmp_path_factory, request):
     directory = tmp_path_factory.mktemp("gateway-tls")
     tls = make_shell_tls(directory)
     port = free_port()
@@ -31,7 +31,7 @@ def tls_gateway(tmp_path_factory):
         "CURIE_CHANNEL_GATEWAY_WORKER_TOKEN": WORKER_TOKEN,
         "CURIE_CHANNEL_GATEWAY_TLS_CERT": str(tls.cert),
         "CURIE_CHANNEL_GATEWAY_TLS_KEY": str(tls.key),
-        "CURIE_CHANNEL_GATEWAY_ALLOW_INSECURE": "false",
+        "CURIE_CHANNEL_GATEWAY_ALLOW_INSECURE": str(request.param).lower(),
         "CURIE_CHANNEL_GATEWAY_REPLAY_DB": str(directory / "requests.sqlite3"),
         "CURIE_SLACK_IDENTITIES": "[]",
         "SLACK_BOT_TOKEN": "",
