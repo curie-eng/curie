@@ -49,6 +49,15 @@ def _carried(text: str, secrets: Sequence[str]) -> str | None:
     return None
 
 
+def scrub_text(text: str, secrets: Sequence[str]) -> str:
+    """``text`` with every envelope and every one of ``secrets`` replaced by :data:`REDACTED`."""
+
+    text = ENVELOPE.sub(REDACTED, text)
+    for secret in secrets:
+        text = text.replace(secret, REDACTED)
+    return text
+
+
 def walk(node: Any, path: str, secrets: Sequence[str], found: Found) -> tuple[Any, int]:
     """Visit a JSON-like tree under the privacy rules: ``(replacement, string leaves checked)``.
 

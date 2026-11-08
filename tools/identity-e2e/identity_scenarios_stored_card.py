@@ -39,6 +39,8 @@ from collections.abc import Iterable, Mapping, Sequence
 from typing import Any
 
 import approver_ticket_driver as tickets
+import identity_scenarios_attestation as attestation
+import identity_scenarios_requester as req_helpers
 from identity_e2e import Harness, caller_fingerprint, principal_header_value, turn_summary
 from identity_scenarios import (
     CLOCK_SKEW_S,
@@ -50,8 +52,6 @@ from identity_scenarios import (
     scenario,
     send_summary,
 )
-from identity_scenarios_attestation import private_values, require_private_run
-from identity_scenarios_requester import approval_card
 
 SCENARIO = "stored-arguments-card"
 LIVE_TOOL = tickets.live_tool(tickets.CONNECTOR, tickets.TOOL)
@@ -323,7 +323,7 @@ def stored_arguments_card(harness: Harness, args: Any, evidence: Evidence) -> No
     # Every private value is held as soon as the run has it, so finish() scrubs
     # it out of the evidence even when the run stops before S3.
     evidence.hold_private(
-        private_values(
+        attestation.private_values(
             [human["subject"] for human in humans],
             [principal_header_value(human) for human in humans],
         )
@@ -472,7 +472,7 @@ def stored_arguments_card(harness: Harness, args: Any, evidence: Evidence) -> No
             replies = await_delivery(
                 harness, run.agent, state["conversation"], state["since"], approval_id, wait
             )
-            delivery = approval_card(replies, approval_id) or {}
+            delivery = req_helpers.approval_card(replies, approval_id) or {}
             seen["card_delivery"] = {key: delivery.get(key) for key in ("at", "event")}
             card = delivered_card(replies, approval_id)
             check(card is not None, f"no card for approval {approval_id} reached the email thread")
@@ -513,7 +513,7 @@ def stored_arguments_card(harness: Harness, args: Any, evidence: Evidence) -> No
             }
             seen["card_text_equals_display_summary"] = text == display
     finally:
-        private = private_values(
+        private = attestation.private_values(
             [human["subject"] for human in humans],
             [principal_header_value(human) for human in humans],
             secret.get("ticket"),
@@ -566,7 +566,7 @@ def restore_step(
                 "the restored deployment"
             )
         failed = seen["failed"]
-        require_private_run(
+        attestation.require_private_run(
             evidence,
             seen,
             secrets=secrets,

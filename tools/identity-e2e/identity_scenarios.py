@@ -135,6 +135,11 @@ class Evidence:
         self._redactions += count
         return count
 
+    def scrub_text(self, text: str) -> str:
+        """``text`` with each held private value and each token or ticket envelope redacted."""
+
+        return identity_privacy.scrub_text(text, self._private or ())
+
     @contextlib.contextmanager
     def step(self, step_id: str, title: str) -> Iterator[dict[str, Any]]:
         observed: dict[str, Any] = {}

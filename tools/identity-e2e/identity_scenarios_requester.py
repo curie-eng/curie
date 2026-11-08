@@ -597,13 +597,17 @@ def effect_call(
     return dict(seen["effect"])
 
 
-def _quietly(call: Callable[[], Any]) -> Any:
-    """``call()``, or None when it fails; for restores in a ``finally``."""
+def _quietly(evidence: Evidence, call: Callable[[], Any]) -> Any:
+    """``call()``, or None when it fails; for restores in a ``finally``.
+
+    A failure is logged by type and with the text scrubbed of the run's private
+    values, since a failed query can carry its bound parameters.
+    """
 
     try:
         return call()
     except HarnessError as exc:
-        log(f"restore failed: {exc}")
+        log(f"restore failed: {type(exc).__name__}: {evidence.scrub_text(str(exc))}")
         return None
 
 
@@ -784,7 +788,8 @@ def requester_effect(harness: Harness, args: Any, evidence: Evidence) -> None:
             )
         finally:
             restored = _quietly(
-                lambda: harness.provider_admin(ADMIN_MEMBERSHIP, {**membership, "member": True})
+                evidence,
+                lambda: harness.provider_admin(ADMIN_MEMBERSHIP, {**membership, "member": True}),
             )
             seen["restore_status"] = restored
         check(restored == 200, f"restoring {sender}'s membership answered {restored}")
@@ -821,7 +826,7 @@ def requester_effect(harness: Harness, args: Any, evidence: Evidence) -> None:
             )
         finally:
             restored = _quietly(
-                lambda: harness.provider_admin(ADMIN_AUTHORITY, {"available": True})
+                evidence, lambda: harness.provider_admin(ADMIN_AUTHORITY, {"available": True})
             )
             seen["restore_status"] = restored
         check(restored == 200, f"restoring the authority answered {restored}")
@@ -1097,7 +1102,9 @@ def requester_expiry(harness: Harness, args: Any, evidence: Evidence) -> None:
             seen["restored"] = (
                 None
                 if not isinstance(original, int)
-                else _quietly(lambda: harness.route_doctor(claim, original, only_if=doctored))
+                else _quietly(
+                    evidence, lambda: harness.route_doctor(claim, original, only_if=doctored)
+                )
             )
 
     with evidence.step(
@@ -1389,7 +1396,7 @@ def restore_approval_setup(
         previous = restore.get("approver_role")
         if previous is not None:
             seen["approver_role"], failure, residual = restore_approver_role(
-                harness, agent_id, previous, step="P0"
+                harness, evidence, agent_id, previous, step="P0"
             )
             if failure is not None:
                 failures.append(failure)
@@ -1430,7 +1437,12 @@ def set_approver_role(harness: Harness, agent_id: str) -> tuple[dict[str, Any], 
 
 
 def restore_approver_role(
-    harness: Harness, agent_id: str, previous: Mapping[str, Any], *, step: str
+    harness: Harness,
+    evidence: Evidence,
+    agent_id: str,
+    previous: Mapping[str, Any],
+    *,
+    step: str,
 ) -> tuple[dict[str, Any] | None, str | None, str | None]:
     """Put back the approver role filter :func:`set_approver_role` replaced.
 
@@ -1441,6 +1453,7 @@ def restore_approver_role(
     """
 
     role = _quietly(
+        evidence,
         lambda: harness.target.pod_python(
             ROLE_FILTER_SCRIPT,
             {
@@ -1449,7 +1462,7 @@ def restore_approver_role(
                 "role": "approver",
                 "filter": previous["previous"],
             },
-        )
+        ),
     )
     if role is None:
         return None, "approver role: the restore failed", None

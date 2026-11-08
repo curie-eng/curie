@@ -30,6 +30,7 @@ from fnmatch import fnmatchcase
 from typing import Any
 
 import identity_privacy
+import identity_scenarios_requester as req_helpers
 from identity_assets import ed25519_pair
 from identity_e2e import (
     AUTHORITY_GROUP,
@@ -61,19 +62,6 @@ from identity_scenarios import (
     scenario,
     send_summary,
     set_requester_flag,
-)
-from identity_scenarios_requester import (
-    _quietly,
-    answer_by_email,
-    approval_summary,
-    await_card,
-    await_effects,
-    flag_agent_of,
-    require_proxy_principal,
-    require_reference_connector,
-    restore_approver_role,
-    roster_groups,
-    set_approver_role,
 )
 from identity_target import b64url_decode, log
 
@@ -960,7 +948,7 @@ def warm_call(
         f"the dial sent caller {dial.get('caller')}, not the resume claim's token "
         f"({resume['caller_fingerprint']}), so it did not run in the resumed sandbox",
     )
-    effects = await_effects(harness, agent, since)
+    effects = req_helpers.await_effects(harness, agent, since)
     decisions = connector_decisions(harness, agent, since)
     seen.update(effects=effects, decisions=decisions)
     return {"dial": dial, "decisions": decisions, "effects": effects, "since": since}
@@ -988,7 +976,7 @@ def grant_attestation(harness: Harness, args: Any, evidence: Evidence) -> None:
         raise HarnessError(
             "grant-attestation needs the Kubernetes harness: the caller proxy exists only there"
         )
-    agent = flag_agent_of(harness, args)
+    agent = req_helpers.flag_agent_of(harness, args)
     requester, approver = args.sender.lower(), args.second_sender.lower()
     if requester == approver:
         raise HarnessError("grant-attestation needs two humans; --second-sender equals --sender")
@@ -1086,13 +1074,13 @@ def grant_attestation(harness: Harness, args: Any, evidence: Evidence) -> None:
                 dial.get("caller") == observed.get("caller_fingerprint"),
                 "the dial did not send the claim's caller token",
             )
-            effects = await_effects(harness, agent, since)
+            effects = req_helpers.await_effects(harness, agent, since)
             decisions = connector_decisions(harness, agent, since)
             seen.update(effects=effects, decisions=decisions)
             seen["unattested"] = require_unattested(
                 decisions, effects, tool=ATTESTED_TOOL, outcome=ATTESTATION_MISSING, since=since
             )
-            seen["proxy"] = require_proxy_principal(
+            seen["proxy"] = req_helpers.require_proxy_principal(
                 decisions, agent=agent, connector=REFERENCE_CONNECTOR, principal=True
             )
             require_no_spend(before, harness.grant_spends())
@@ -1124,11 +1112,12 @@ def grant_attestation(harness: Harness, args: Any, evidence: Evidence) -> None:
             check(
                 approval is not None,
                 f"no approval granting {live_name(ATTESTED_TOOL)} was raised for the "
-                f"conversation; the API lists {[approval_summary(row) for row in listed[:5]]}",
+                "conversation; the API lists "
+                f"{[req_helpers.approval_summary(row) for row in listed[:5]]}",
             )
             assert approval is not None
             seen["approval"] = {
-                **approval_summary(approval),
+                **req_helpers.approval_summary(approval),
                 "gate_kind": approval.get("gate_kind"),
                 "granted_tool": approval.get("granted_tool"),
             }
@@ -1138,7 +1127,7 @@ def grant_attestation(harness: Harness, args: Any, evidence: Evidence) -> None:
                 f"the approval's gate is {approval.get('gate_kind')}, not the permission gate",
             )
             approval_id = str(approval["id"])
-            card = await_card(harness, agent, conversation, since, approval_id, wait)
+            card = req_helpers.await_card(harness, agent, conversation, since, approval_id, wait)
             check(card is not None, f"no card for approval {approval_id} reached the email thread")
             seen["card"] = card
             effects = harness.connector_effects(agent, since)
@@ -1159,7 +1148,7 @@ def grant_attestation(harness: Harness, args: Any, evidence: Evidence) -> None:
             answer: dict[str, Any] = {}
             seen["answer"] = answer
             with harness.api() as api:
-                answered_at = answer_by_email(
+                answered_at = req_helpers.answer_by_email(
                     harness,
                     api,
                     answer,
@@ -1303,7 +1292,7 @@ def grant_attestation(harness: Harness, args: Any, evidence: Evidence) -> None:
                 f"the tool result names requester={dial.get('requester')} grant="
                 f"{dial.get('grant')}, expected {requester_fp} and {grant_fp}",
             )
-            seen["proxy"] = require_proxy_principal(
+            seen["proxy"] = req_helpers.require_proxy_principal(
                 call["decisions"], agent=agent, connector=REFERENCE_CONNECTOR, principal=True
             )
 
@@ -1382,7 +1371,7 @@ def grant_attestation(harness: Harness, args: Any, evidence: Evidence) -> None:
                 outcome=ATTESTATION_MISSING,
                 since=call["since"],
             )
-            seen["proxy"] = require_proxy_principal(
+            seen["proxy"] = req_helpers.require_proxy_principal(
                 call["decisions"], agent=agent, connector=REFERENCE_CONNECTOR, principal=True
             )
             require_no_spend(before, harness.grant_spends())
@@ -1451,7 +1440,7 @@ def setup(
     """
 
     require_install_ready(harness, seen, (agent,))
-    seen["reference_connector"] = require_reference_connector(harness, (agent,))
+    seen["reference_connector"] = req_helpers.require_reference_connector(harness, (agent,))
     worker = harness.target.kubectl_json("get", "deployment", harness.target.component("worker"))
     setting = reconciler_setting(worker)
     seen["connector_reconciler"] = setting
@@ -1468,7 +1457,7 @@ def setup(
         "the proxy verifies (G9)",
     )
     check(
-        AUTHORITY_GROUP in roster_groups(harness, approver),
+        AUTHORITY_GROUP in req_helpers.roster_groups(harness, approver),
         f"{approver} is not in {AUTHORITY_GROUP}, so the approver role cannot admit them",
     )
     with harness.api() as api:
@@ -1477,7 +1466,9 @@ def setup(
         flag, version = set_requester_flag(api, agent_id, True, what=f"setting {agent}'s flag on")
     seen["flag"] = {"flag": flag, "version": version, "previous": restore["flag"]}
     check(flag is True, f"{agent}'s flag is {flag!r}, not on")
-    restore["approver_role"], seen["approver_role"] = set_approver_role(harness, agent_id)
+    restore["approver_role"], seen["approver_role"] = req_helpers.set_approver_role(
+        harness, agent_id
+    )
 
     stored = stored_approval_tools(harness, agent_id)
     restore["approval_tools"] = stored
@@ -1561,7 +1552,7 @@ def unrelated_call_after(
     )
     logged = seen["unattested"]["logged"]["requester"]
     check(logged == requester, f"the effect names requester {logged}, expected {requester}")
-    seen["proxy"] = require_proxy_principal(
+    seen["proxy"] = req_helpers.require_proxy_principal(
         call["decisions"], agent=agent, connector=REFERENCE_CONNECTOR, principal=True
     )
     after = harness.grant_spends()
@@ -1715,7 +1706,7 @@ def restore_grant_setup(
                     )
                 return {"status": status, "readback": stored_approval_tools(harness, agent_id)}
 
-            done = _quietly(put_back_tools)
+            done = req_helpers._quietly(evidence, put_back_tools)
             seen["approval_required_tools"] = {"restored": previous_tools, **(done or {})}
             if done is None or done["status"] != 200:
                 failures.append("approval_required_tools: the PATCH failed")
@@ -1731,7 +1722,7 @@ def restore_grant_setup(
                 )
                 return harness.connector_pod_env(agent, REFERENCE_CONNECTOR, server, TICKET_ENV)
 
-            serving = _quietly(put_back_env)
+            serving = req_helpers._quietly(evidence, put_back_env)
             seen["ticket_env"] = (
                 None
                 if serving is None
@@ -1764,21 +1755,21 @@ def restore_grant_setup(
                         flag, version = requester_flag(api, agent_id)
                 return {"flag": flag, "version": version}
 
-            flagged = _quietly(put_back_flag)
+            flagged = req_helpers._quietly(evidence, put_back_flag)
             seen["flag"] = flagged
             if flagged is None or bool(flagged["flag"]) != wanted:
                 failures.append(f"flag: not restored to {wanted}")
         previous_role = restore.get("approver_role")
         if previous_role is not None:
-            seen["approver_role"], failure, residual = restore_approver_role(
-                harness, agent_id, previous_role, step="G0"
+            seen["approver_role"], failure, residual = req_helpers.restore_approver_role(
+                harness, evidence, agent_id, previous_role, step="G0"
             )
             if failure is not None:
                 failures.append(failure)
             elif residual is not None:
                 seen["residual"] = residual
         if "gated" in state:
-            now_gated = _quietly(lambda: serving_gated_tools(harness, agent))
+            now_gated = req_helpers._quietly(evidence, lambda: serving_gated_tools(harness, agent))
             seen["gated_tools"] = now_gated
             if now_gated is None or now_gated["patterns"] != list(state["gated"]):
                 failures.append(
@@ -1797,7 +1788,7 @@ def restore_grant_setup(
         with contextlib.suppress(OSError):
             (harness.state.directory / SELECTOR_KEY_DIR).rmdir()
         if failures:
-            log(f"grant-attestation restore incomplete: {failures}")
+            log(evidence.scrub_text(f"grant-attestation restore incomplete: {failures}"))
         require_private_run(
             evidence,
             seen,
