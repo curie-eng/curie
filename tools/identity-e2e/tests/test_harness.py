@@ -364,3 +364,91 @@ def test_up_sets_the_caller_key_pair_and_rolls_the_api_before_deploying_any_agen
             assert caller.get("signingKey", seed) == seed
             assert caller.get("verifyKey", verify) == verify
     assert target.values["connectorCaller"] == {"signingKey": seed, "verifyKey": verify}
+
+
+# --- grant-attestation log shapes (ADR 0271) ----------------------------------------
+
+_STAMP = "2026-11-08T09:10:11.123456789Z "
+_FP = "a1b2c3d4e5f60718"
+_GRANT_FP = "1111222233334444"
+
+
+@pytest.mark.parametrize("tool", ["execute_attested", "execute_approved"])
+@pytest.mark.parametrize("prefix", ["", _STAMP], ids=["bare", "kubectl-timestamp"])
+def test_parse_effect_line_reads_the_protected_tools(tool: str, prefix: str) -> None:
+    parsed = harness.parse_effect_line(f"{prefix}{tool} outcome=ok requester={_FP} grant={_GRANT_FP}")
+    assert parsed is not None
+    assert parsed["tool"] == tool
+    assert parsed["outcome"] == "ok"
+    assert parsed["requester"] == _FP
+    assert parsed["grant"] == _GRANT_FP
+    assert (parsed["at_epoch"] is None) == (prefix == "")
+
+
+def test_parse_effect_line_reads_a_refusal_with_no_grant() -> None:
+    parsed = harness.parse_effect_line(
+        f"{_STAMP}execute_attested outcome=attestation_missing requester=- grant=-"
+    )
+    assert parsed is not None
+    assert parsed["outcome"] == "attestation_missing"
+    assert parsed["requester"] == "-"
+    assert parsed["grant"] == "-"
+
+
+def test_parse_effect_line_grant_is_none_on_a_pre_change_line() -> None:
+    parsed = harness.parse_effect_line(f"{_STAMP}record_effect outcome=ok requester={_FP}")
+    assert parsed is not None
+    assert parsed["tool"] == "record_effect"
+    assert parsed["outcome"] == "ok"
+    assert parsed["requester"] == _FP
+    assert parsed["grant"] is None
+
+
+def test_parse_effect_line_record_effect_keeps_outcome_and_requester() -> None:
+    parsed = harness.parse_effect_line(
+        f"record_effect outcome=requester_missing requester=- grant=-"
+    )
+    assert parsed is not None
+    assert parsed["outcome"] == "requester_missing"
+    assert parsed["requester"] == "-"
+    assert parsed["grant"] == "-"
+
+
+@pytest.mark.parametrize(
+    "line",
+    [
+        "execute_attested outcome=ok",
+        "execute_approved outcome=ok requester=zz grant=-",
+        "list_tools outcome=ok requester=- grant=-",
+    ],
+)
+def test_parse_effect_line_rejects_malformed_or_other_tools(line: str) -> None:
+    assert harness.parse_effect_line(line) is None
+
+
+_DECISION = "INFO:curie_connector_proxy.server:caller=ie2e-on outcome=admitted method=POST path='/mcp'"
+
+
+def test_parse_proxy_decision_attested_present() -> None:
+    parsed = harness.parse_proxy_decision(f"{_STAMP}{_DECISION} principal=present attested=present")
+    assert parsed is not None
+    assert parsed["principal"] == "present"
+    assert parsed["attested"] == "present"
+
+
+def test_parse_proxy_decision_attested_is_none_when_absent() -> None:
+    parsed = harness.parse_proxy_decision(f"{_STAMP}{_DECISION} principal=present")
+    assert parsed is not None
+    assert parsed["attested"] is None
+
+
+def test_parse_proxy_decision_grant_refusal_has_no_attested() -> None:
+    line = (
+        "INFO:curie_connector_proxy.server:caller=ie2e-on outcome=grant_required "
+        "method=POST path='/mcp' grant=not_spent"
+    )
+    parsed = harness.parse_proxy_decision(line)
+    assert parsed is not None
+    assert parsed["outcome"] == "grant_required"
+    assert parsed["grant"] == "not_spent"
+    assert parsed["attested"] is None
