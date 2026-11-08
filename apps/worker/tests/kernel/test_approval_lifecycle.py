@@ -7099,9 +7099,18 @@ def test_approval_api_outage_retries_before_pausing_and_422_escalates(
     asyncio.run(go())
 
 
+_DEADLINE_VECTORS = json.loads(
+    (Path(__file__).resolve().parents[4] / "tests/vectors/approval-route-deadlines.json")
+    .read_text()
+)
+
+
 @pytest.mark.parametrize(
     "override,expected",
-    [({}, 86400), ({"expires_in_seconds": 7}, 7), ({"expires_in_seconds": None}, None)],
+    [
+        ({}, 86400),
+        *[({"expires_in_seconds": value}, value) for value in _DEADLINE_VECTORS["valid"]],
+    ],
 )
 def test_session_route_deadline_preserves_default_and_explicit_null(
     make_harness, override, expected
@@ -7118,7 +7127,7 @@ def test_session_route_deadline_preserves_default_and_explicit_null(
     asyncio.run(go())
 
 
-@pytest.mark.parametrize("value", [True, False, 0, -1, 1.5, "5"])
+@pytest.mark.parametrize("value", _DEADLINE_VECTORS["invalid"])
 def test_malformed_route_deadline_never_creates_approval(make_harness, value):
     async def go():
         approvals = RecordingApprovals()

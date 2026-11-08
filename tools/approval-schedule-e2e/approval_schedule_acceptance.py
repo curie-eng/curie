@@ -983,7 +983,10 @@ assert await redis.sismember(config.approval_references_pending_key(), {orphan["
             )
         )
         assert "notification" not in stored["omitted"]
-        for value in (True, False, 0, -1, 1.5, "5"):
+        deadline_vectors = json.loads(
+            (ROOT / "tests/vectors/approval-route-deadlines.json").read_text()
+        )
+        for value in deadline_vectors["invalid"]:
             response = self.http.patch(
                 f"/agents/{agent_id}",
                 json={"approval_routes": {"invalid": {**route, "expires_in_seconds": value}}},

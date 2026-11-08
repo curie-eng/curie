@@ -675,6 +675,7 @@ def test_forged_stale_or_foreign_resume_cannot_suspend_again(
     "override,producer,routed",
     [
         ({"expires_in_seconds": 3600}, 7, True),
+        ({"expires_in_seconds": 315360000}, 7, True),
         ({"expires_in_seconds": None}, 7, True),
         ({}, 23, True),
         ({}, None, True),
@@ -726,7 +727,7 @@ def test_pending_http_receipt_survives_schedule_schema_upgrade(creation_case):
     accepted(post(case), case.request)
     before = rows(case.request["approval"]["dedupe_key"])[0]
     try:
-        command.downgrade(alembic_config(), "0148")
+        command.downgrade(alembic_config(), "0149")
     finally:
         command.upgrade(alembic_config(), "head")
     accepted(post(case), case.request, duplicate=True)

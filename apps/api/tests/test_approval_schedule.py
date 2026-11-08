@@ -1,18 +1,25 @@
 """Route deadline persistence through the operator and creation boundaries."""
 
+import json
 from datetime import datetime
+from pathlib import Path
 from typing import Any
 
 import pytest
 from curie_api.schemas.approvals import ApprovalRouteBinding, ApprovalRouteBindingOut
 from pydantic import ValidationError
 
+DEADLINE_VECTORS = json.loads(
+    (Path(__file__).resolve().parents[3] / "tests/vectors/approval-route-deadlines.json")
+    .read_text()
+)
+
 
 def binding(**fields: Any) -> dict[str, Any]:
     return {"resolution": {"kind": "slack", "address": "C0EXAMPLE1"}, **fields}
 
 
-@pytest.mark.parametrize("value", [None, 1, 3600])
+@pytest.mark.parametrize("value", DEADLINE_VECTORS["valid"])
 def test_explicit_deadline_survives_every_route_projection(value: int | None) -> None:
     raw = binding(expires_in_seconds=value, notification=None, approvers=None)
     written = ApprovalRouteBinding.model_validate(raw).model_dump()
@@ -38,14 +45,20 @@ def test_readback_schema_rejects_a_route_without_a_resolution() -> None:
         validate({"expires_in_seconds": None}, schema)
 
 
-@pytest.mark.parametrize("value", [True, False, 0, -1, 1.5, 5.0, "5"])
-def test_route_deadline_refuses_non_positive_or_non_integer_values(value: Any) -> None:
+@pytest.mark.parametrize("value", DEADLINE_VECTORS["invalid"])
+def test_route_deadline_refuses_invalid_values(value: Any) -> None:
     with pytest.raises(ValidationError):
         ApprovalRouteBinding.model_validate(binding(expires_in_seconds=value))
 
 
 @pytest.mark.parametrize(
-    "override", [{}, {"expires_in_seconds": 3600}, {"expires_in_seconds": None}]
+    "override",
+    [
+        {},
+        {"expires_in_seconds": 3600},
+        {"expires_in_seconds": None},
+        {"expires_in_seconds": 315360000},
+    ],
 )
 def test_operator_deadline_round_trip(
     client: Any, auth_headers: dict[str, str], clean_db: None, override: dict[str, Any]
@@ -82,7 +95,13 @@ def test_operator_deadline_round_trip(
 
 @pytest.mark.parametrize(
     "override,producer",
-    [({"expires_in_seconds": 3600}, 7), ({"expires_in_seconds": None}, 7), ({}, 23), ({}, None)],
+    [
+        ({"expires_in_seconds": 3600}, 7),
+        ({"expires_in_seconds": None}, 7),
+        ({"expires_in_seconds": 315360000}, 7),
+        ({}, 23),
+        ({}, None),
+    ],
 )
 def test_legacy_creation_freezes_route_deadline(
     client: Any,
@@ -138,3 +157,19 @@ def test_legacy_creation_freezes_route_deadline(
         client.get(f"/approvals/{row['id']}", headers=auth_headers).json()["expires_at"]
         == row["expires_at"]
     )
+
+
+@pytest.mark.parametrize("value", [315360001, 250000000000, 18446744073709551616])
+def test_operator_refuses_oversized_deadlines(
+    client: Any, auth_headers: dict[str, str], clean_db: None, value: int
+) -> None:
+    response = client.post(
+        "/agents",
+        headers=auth_headers,
+        json={
+            "name": "acme-oversized-deadline",
+            "channel": {"kind": "slack", "address": "C0EXAMPLE0"},
+            "approval_routes": {"review": binding(expires_in_seconds=value)},
+        },
+    )
+    assert response.status_code == 422, response.text
