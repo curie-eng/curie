@@ -319,7 +319,7 @@ def crash_platform():
             async def connect() -> bool:
                 try:
                     connection = await asyncpg.connect(database_url, timeout=2)
-                except OSError:
+                except (OSError, TimeoutError, asyncpg.CannotConnectNowError):
                     return False
                 await connection.close()
                 return True
