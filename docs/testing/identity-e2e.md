@@ -613,7 +613,7 @@ connector logs as `grant=`.
 
 G4 to G8 are probes, not email turns, because no follow-up turn runs in the
 sandbox that holds the grant. Every follow-up turn boots a new sandbox:
-`kernel/claim.py::_boots_differently` replaces a warm route whose state-token
+`apps/worker/src/curie_worker/kernel/claim.py::_boots_differently` replaces a warm route whose state-token
 expiry is earlier than the new boot token's (#3823), and the new token's
 expiry, now plus the turn deadline plus the grace, is always the later. So the
 probes send that sandbox's own boot credentials, the caller token and the
