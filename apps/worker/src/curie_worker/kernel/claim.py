@@ -879,6 +879,14 @@ async def _route_and_start(
             # fallback as a 409; never send a null-authority steer to a live turn.
             steered = False
         else:
+            lease = constants._DELIVERY_LEASE.get()
+            if (
+                _is_fenced(lease)
+                and lease is not None
+                and lease.generation > 1
+                and await self._markers.saw_side_effect(queued_event_id)
+            ):
+                raise failures.PriorSideEffectObserved()
             steered = await self._runner.steer(
                 handle.base_url, steer_event, token=handle.token or None, remaining_s=remaining_s
             )
@@ -1017,10 +1025,16 @@ async def _route_and_start(
                 predecessor = json.loads(previous)
                 if not await self._markers.is_terminal(
                     predecessor["event_id"]
-                ) and not await self._workspace_handoff_ready(handle, remaining_s=remaining_s):
+                ) and not await self._workspace_handoff_ready(
+                    handle,
+                    remaining_s=remaining_s,
+                    predecessor_event_id=predecessor["event_id"],
+                ):
                     raise failures.HandoffPending(
                         f"thread {thread_key} still has an unsettled leased turn"
                     )
+            if await self._markers.saw_side_effect(queued_event_id):
+                raise failures.PriorSideEffectObserved()
             await self._markers.watch_turn(
                 thread_key, handle.claim_name, delivery_lease, queued_event_id
             )

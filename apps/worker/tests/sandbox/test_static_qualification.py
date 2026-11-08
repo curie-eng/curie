@@ -12,6 +12,7 @@ recycling of a shell exactly as it would against the platform.
 from __future__ import annotations
 
 import asyncio
+import base64
 import dataclasses
 import gzip
 import io
@@ -501,7 +502,7 @@ def test_connector_endpoint_settings_reach_the_runner_on_a_shell(
         },
     ).start()
     try:
-        signing_key = "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8="
+        signing_key = base64.b64encode(bytes(range(32))).decode()
         worker = worker_factory(
             [shell],
             {"connectors.yaml": b"connectors:\n  reviewer:\n    image: example/reviewer:1\n"},

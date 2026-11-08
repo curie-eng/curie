@@ -28,7 +28,10 @@ def test_upload_minter_and_verifier_share_the_wire_corpus() -> None:
         ).read_text()
     )
     token = caller_token.mint_upload(
-        vector["seed"], agent=vector["agent"], connector=vector["connector"], exp=vector["exp"]
+        base64.b64encode(bytes(range(*vector["seed_range"]))).decode(),
+        agent=vector["agent"],
+        connector=vector["connector"],
+        exp=vector["exp"],
     )
     assert token == vector["token"]
     keys = (caller.public_key(vector["public"]),)
