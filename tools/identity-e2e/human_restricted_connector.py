@@ -5,8 +5,10 @@ A small MCP server over streamable HTTP (``POST /mcp``, one JSON answer per
 request) with one tool, ``record_effect``. Before every effect it:
 
 1. Reads the requester only from the single ``X-Curie-Principal`` header its own
-   caller proxy sets (ADR 0270 decision 4). No header refuses
-   ``missing_requester``; a repeated or unreadable header refuses
+   caller proxy sets on its loopback forward (ADR 0270 decision 4). A request
+   from any other peer, such as a caller on the connector's ``-direct``
+   Service, never establishes a requester, whatever it sends. No requester
+   refuses ``missing_requester``; a repeated or unreadable header refuses
    ``requester_invalid``. Tool arguments are never read for identity, so a
    model-written name cannot grant or redirect authority.
 2. Asks current downstream authority: ``POST <AUTHORITY_URL>/authority`` with
@@ -39,6 +41,7 @@ import base64
 import binascii
 import hashlib
 import http.client
+import ipaddress
 import json
 import math
 import os
@@ -184,6 +187,21 @@ def read_principal_header(value: object) -> dict[str, str] | None:
     if principal_header_value(principal) != value:
         return None
     return principal
+
+
+def from_caller_proxy(host: str) -> bool:
+    """Whether a request's peer address is the caller proxy's loopback forward.
+
+    The proxy forwards to this server over loopback inside the pod; any other
+    peer reached the server around the proxy and attests nothing.
+    """
+
+    try:
+        address = ipaddress.ip_address(host)
+    except ValueError:
+        return False
+    mapped = address.ipv4_mapped if isinstance(address, ipaddress.IPv6Address) else None
+    return (mapped or address).is_loopback
 
 
 def fingerprint(header: str) -> str:
@@ -485,6 +503,8 @@ class _Handler(BaseHTTPRequestHandler):
     def _record_effect(self) -> tuple[str, str | None, int | None]:
         """``(outcome, requester fingerprint, effect number)`` for this request alone."""
 
+        if not from_caller_proxy(str(self.client_address[0])):
+            return MISSING_REQUESTER, None, None
         values = self.headers.get_all(PRINCIPAL_HEADER) or []
         if not values:
             return MISSING_REQUESTER, None, None
