@@ -206,6 +206,26 @@ networks:
         else:
             self.run(*self.compose, "stop", "curie-worker")
 
+    def deploy_extra(self, agent, bundle):
+        receipt = json.loads(
+            self.run(
+                self.cli,
+                "local",
+                "deploy",
+                "--agent",
+                agent,
+                "--plugin-dir",
+                str(bundle),
+                "--slack-channel",
+                f"C0EXAMPLE{len(self.agents) + 1}",
+                "--label",
+                "source-controls",
+                "--json",
+            )
+        )
+        self.agents[agent] = receipt["agent"]["id"]
+        self.receipts[agent] = receipt
+
     def capture_failure(self):
         output = self.run(*self.compose, "logs", "--no-color", "--tail", "150", "curie-worker")
         (self.root / "failure-worker.log").write_text(output)

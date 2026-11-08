@@ -3,7 +3,7 @@
 Run through ``curie dev test-env run -- uv run pytest -s <this file>``.
 The sibling worker fixture owns a real kind install and verifies teardown.
 This suite moves admission to HTTP, using an independent contract signer.
-It does not qualify the hosted connector or the live provider by itself.
+The separate hosted case requires a live provider and a connector-only SecretRef.
 """
 
 from __future__ import annotations
@@ -61,12 +61,44 @@ class Qualification(WakeStack):
     def close(self):
         try:
             if self.namespace_owned:
-                self.kube("delete", "namespace", NAME, "--wait=true", "--timeout=180s")
-                remaining = self.kube("get", "namespace", NAME, "--ignore-not-found", "-o", "name")
-                if remaining.strip():
-                    raise RuntimeError("qualification namespace survived teardown")
+                self.kube("delete", "namespace", NAME, "--wait=false")
         finally:
             super().close()
+
+    def scheduler_tick(self):
+        self.kube(
+            "exec",
+            "-i",
+            f"deployment/{FULLNAME}-worker",
+            "--",
+            "python3",
+            "-",
+            stdin="import asyncio,os\n"
+            "from curie_worker.run import build\n"
+            "from curie_worker.config import WorkerConfig\n"
+            "from curie_worker.worker_lifecycle import WorkerResources\n"
+            "async def tick():\n"
+            " resources=WorkerResources()\n"
+            " try:\n"
+            "  runtime=build(WorkerConfig(),os.environ,resources=resources)\n"
+            "  await runtime.cron_loop.one_pass()\n"
+            " finally: await resources.aclose()\n"
+            "asyncio.run(tick())\n",
+        )
+
+    def capture_failure(self):
+        super().capture_failure()
+        pods = json.loads(self.kube("get", "pods", "-o", "json"))["items"]
+        for index, pod in enumerate(pods):
+            for container in pod["spec"]["containers"]:
+                role = container["name"]
+                if role not in {"runner", "server", "caller-proxy"}:
+                    continue
+                try:
+                    output = self.kube("logs", pod["metadata"]["name"], "-c", role, "--tail=300")
+                except RuntimeError:
+                    output = "Container logs were unavailable during failure capture."
+                (self.root / f"failure-{role}-{index}.log").write_text(output)
 
     def api_python(self, code):
         return json.loads(
@@ -151,6 +183,59 @@ class Qualification(WakeStack):
         assert set(answer["body"]) == {"status", "run_id"}
         assert answer["body"]["status"] == "queued"
         return answer["body"]["run_id"]
+
+    def add_agent(self, agent):
+        bundle = self.root / agent
+        (bundle / ".claude-plugin").mkdir(parents=True)
+        (bundle / "skills/wake").mkdir(parents=True)
+        (bundle / ".claude-plugin/plugin.json").write_text(
+            json.dumps(
+                {
+                    "name": agent,
+                    "version": "1.0.0",
+                    "description": "Wake source controls",
+                    "triggers": [
+                        {
+                            "type": "webhook",
+                            "wake": True,
+                            "name": HOOK,
+                            "path": "inbound",
+                            "prompt": "Read pending items and record the result.",
+                        }
+                    ],
+                }
+            )
+        )
+        (bundle / "skills/wake/SKILL.md").write_text(
+            "---\nname: wake\ndescription: Read pending work.\n---\nRead pending work.\n"
+        )
+        self.deploy_extra(agent, bundle)
+
+    def deploy_extra(self, agent, bundle):
+        receipt = json.loads(
+            self.run(
+                self.cli,
+                "cluster",
+                "deploy",
+                "--context",
+                self.context,
+                "--namespace",
+                NAME,
+                "--release",
+                NAME,
+                "--agent",
+                agent,
+                "--plugin-dir",
+                str(bundle),
+                "--slack-channel",
+                f"C0EXAMPLE{len(self.agents) + 1}",
+                "--label",
+                "source-controls",
+                "--json",
+            )
+        )
+        self.agents[agent] = receipt["agent"]["id"]
+        self.receipts[agent] = receipt
 
     def deploy(self, agent):
         super().deploy(agent)
@@ -254,6 +339,81 @@ def test_acceptance_2(qualification):
     stack.settled(run, "ran")
 
 
+@pytest.mark.parametrize(
+    "guard", ["protected", "tombstone", "pending", "remediation", "partition", "binding"]
+)
+def test_source_controls(qualification, guard):
+    stack = qualification
+    agent = f"acme-wake-source-{guard}"
+    stack.add_agent(agent)
+    key = stack.key(agent)
+    stack.worker(False)
+    agent_id = stack.agents[agent]
+    if guard in {"protected", "tombstone", "pending"}:
+        target = {
+            "mode": "ordinary",
+            "tool_access": None,
+            "runtime_id": None,
+            "qualification_id": None,
+            "bundle_digest": None,
+        }
+        if guard == "protected":
+            target.update(
+                mode="protected",
+                tool_access="read-only",
+                runtime_id="33333333-3333-4333-8333-333333333333",
+                qualification_id="44444444-4444-4444-8444-444444444444",
+                bundle_digest="a" * 64,
+            )
+        intent = stack.api_python(
+            "import json\n"
+            "from curie_protected_hooks.source_policy_records import target_intent_sha256\n"
+            f"print(json.dumps(target_intent_sha256(json.loads({json.dumps(json.dumps(target))}))))\n"
+        )
+        operation = str(uuid.uuid4())
+        status = "pending" if guard == "pending" else "committed"
+        stack.sql(
+            "INSERT INTO curie.hook_source_operations "
+            "(agent_id,hook,operation_id,intent_sha256,status,generation) "
+            f"VALUES('{agent_id}','{HOOK}','{operation}','{intent}','{status}',1)"
+        )
+        if guard != "pending":
+            values = ["NULL" if value is None else "'" + value + "'" for value in target.values()]
+            stack.sql(
+                "INSERT INTO curie.hook_source_policies "
+                "(agent_id,hook,operation_id,generation,mode,tool_access,runtime_id,"
+                "qualification_id,bundle_digest,legacy_generation) "
+                f"VALUES('{agent_id}','{HOOK}','{operation}',1,{','.join(values)},0)"
+            )
+    elif guard == "remediation":
+        stack.sql(
+            "INSERT INTO curie.remediation_policies "
+            "(agent_id,hook,generation,operation_id,armed,active) "
+            f"VALUES('{agent_id}','{HOOK}',1,'{uuid.uuid4()}',false,false)"
+        )
+    else:
+        column, value = (
+            ("hook_partitions", {"pointer": "/item/id"})
+            if guard == "partition"
+            else ("source_bindings", {"workload_pointer": "/workload", "map": {}})
+        )
+        stack.sql(
+            f"UPDATE curie.agents SET {column}='{json.dumps({HOOK: value})}'::jsonb "
+            f"WHERE id='{agent_id}'"
+        )
+    before = stack.snapshot()
+    stack.assert_refused(409, "wake_source_not_ordinary", agent=agent, key=key)
+    route = f"/agents/{agent_id}/hooks/{HOOK}/wake-secret"
+    for path, method in ((route, "GET"), (route + "/rotate", "POST")):
+        response = stack.http(path, method=method, admin=True)[0]
+        assert response["status"] == 409
+        assert response["body"] == {"detail": "wake_source_not_ordinary"}
+    assert stack.snapshot() == before
+    assert (
+        stack.sql(f"SELECT count(*) FROM curie.hook_wake_keys WHERE agent_id='{agent_id}'") == "0"
+    )
+
+
 def test_acceptance_3(qualification):
     stack = qualification
     stack.worker(False)
@@ -342,9 +502,17 @@ def test_acceptance_5(qualification):
 def test_hosted_connector_session(qualification):
     """A live model reads and writes through the real hosted MCP connector."""
     stack = qualification
-    credential = os.environ.get("CURIE_CREDENTIALS") or os.environ.get("ANTHROPIC_API_KEY")
-    if not credential:
+    credential_name = next(
+        (
+            name
+            for name in ("CURIE_CREDENTIALS", "CLAUDE_CODE_OAUTH_TOKEN", "ANTHROPIC_API_KEY")
+            if os.environ.get(name)
+        ),
+        None,
+    )
+    if credential_name is None:
         raise RuntimeError("live connector qualification requires a provider credential")
+    credential = os.environ[credential_name]
     agent = "acme-wake-idle"
     agent_id = stack.agents[agent]
     key = stack.key(agent)
@@ -382,12 +550,19 @@ def test_hosted_connector_session(qualification):
         if os.environ.get(name):
             extra.append({"name": name, "value": os.environ[name]})
     live = stack.root / "live.yaml"
-    runner = {
-        "fakeModel": False,
-        "credentialsExistingSecret": "acme-model-credential",
-        "credentialsExistingSecretKey": "key",
-        "extraEnv": extra,
-    }
+    runner = {"fakeModel": False, "extraEnv": extra}
+    if credential_name == "CURIE_CREDENTIALS":
+        runner.update(
+            credentialsExistingSecret="acme-model-credential",
+            credentialsExistingSecretKey="key",
+        )
+    else:
+        extra.append(
+            {
+                "name": credential_name,
+                "valueFrom": {"secretKeyRef": {"name": "acme-model-credential", "key": "key"}},
+            }
+        )
     if os.environ.get("CURIE_MODEL"):
         runner["model"] = os.environ["CURIE_MODEL"]
     live.write_text(
@@ -431,7 +606,8 @@ def test_hosted_connector_session(qualification):
                 "connectors": {
                     "queue": {
                         "image": image,
-                        "no_client_auth": True,
+                        "no_client_auth": "Caller identity is verified by the platform proxy.",
+                        "scratch": {"path": "/tmp", "size_limit": "16Mi"},
                         "env": {
                             "WAKE_URL": f"http://{FULLNAME}-api:8000/hooks/{agent_id}/{HOOK}/wake"
                         },
