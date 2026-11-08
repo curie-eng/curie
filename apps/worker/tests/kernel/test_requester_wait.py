@@ -254,8 +254,8 @@ def test_a_parked_deferral_reparks_while_live_then_runs_on_its_own_sandbox(
     """@spec CONNECTOR-REQUESTER-3: each wake re-parks, the last one runs once.
 
     Bob's parked delivery is woken twice while Alice's turn is still live.
-    Inside the wait the deferral stays a plain ``CapacityWaitRequested``, and
-    each wake re-parks on the same record (same first wait and deadline, a
+    Each wake asks again for a requester handoff wait, and re-parks on the
+    same record outside the thread order (same first wait and deadline, a
     newer generation, one more deferral), always acked: three deliveries
     against a ``max_delivery`` of two dead-letter nothing. Liveness: once her
     turn ends, the next wake runs Bob's turn once on a new sandbox whose cct
@@ -307,7 +307,8 @@ def test_a_parked_deferral_reparks_while_live_then_runs_on_its_own_sandbox(
                 seen = outcomes[bob_turn.event_id]
                 assert len(seen) == 3
                 assert seen[0] is wait_cls
-                assert all(kind is CapacityWaitRequested for kind in seen[1:]), seen
+                assert all(kind is wait_cls for kind in seen[1:]), seen
+                assert getattr(previous, "reason", _NO_FIELD) == "requester_handoff"
                 assert all_opened(h) == ["alice is working"]
                 assert all_steers(h) == [] and all_interrupts(h) == 0
                 assert len(h.fake_k8s.claim_envs) == 1
@@ -346,6 +347,129 @@ def test_a_parked_deferral_reparks_while_live_then_runs_on_its_own_sandbox(
 
 
 # -- Regressions -----------------------------------------------------------------------------
+
+
+def test_a_capacity_wait_that_meets_another_requesters_live_turn_becomes_a_handoff_wait(
+    make_harness, caplog: pytest.LogCaptureFixture
+) -> None:
+    """@spec CONNECTOR-REQUESTER-3 (regression): an ordinary wait changes its reason.
+
+    Bob's delivery is already parked as an ordinary capacity wait, registered
+    in the thread's order, when Alice's turn goes live. Its wake meets her live
+    turn: the kernel asks for a requester handoff wait, so the consumer
+    releases Bob's order slot and re-parks the same record with reason
+    ``requester_handoff``. Alice's own follow-up then steers her live turn
+    instead of parking behind Bob. Liveness: once her turn ends, Bob's next
+    wake runs once on a new sandbox whose cct names Bob.
+    """
+    require_execution_interface()
+    require_requester_interface()
+    wait_cls = handoff_wait()
+    caplog.set_level(logging.DEBUG, logger="curie_worker")
+
+    async def run() -> None:
+        binding, alice, bob, core = event_parties()
+        async with make_harness(
+            binding=binding,
+            identity_authority=core,
+            per_sandbox_runners=2,
+            max_delivery=2,
+            **_LEASE_KNOBS,
+        ) as h:
+            consumer = consumer_for(h)
+            leases = DeliveryLeaseStore(h.async_redis, h.config)
+            waits = CapacityWaitStore(h.async_redis, h.config)
+            outcomes = observe_outcomes(h)
+            holds = hold_turns(h)
+            alice_turn = qevent("alice is working", thread="capacity-handoff")
+            key = thread_key(alice_turn)
+            bob_turn = qevent("bob asks", thread="capacity-handoff")
+            follow_up = qevent("alice follows up", thread="capacity-handoff")
+            order_key = waits._thread_order(key)
+
+            def ordered(event_id: str) -> bool:
+                return any(
+                    (member.decode() if isinstance(member, bytes) else str(member)).endswith(
+                        "|" + event_id
+                    )
+                    for member in members
+                )
+
+            core.by_event[bob_turn.event_id] = bob
+            fields = {"payload": bob_turn.model_dump_json(), "curie_identity_context_v1": CAPSULE}
+            entry_id, observed = await pending_entry(h, consumer, fields)
+            lease = await leases.acquire(
+                h.config.stream,
+                h.config.consumer_group,
+                entry_id,
+                consumer=h.config.consumer_name,
+            )
+            try:
+                first = await waits.park(
+                    entry_id, observed, bob_turn.event_id, lease, thread_key=key
+                )
+            finally:
+                await leases.release(
+                    h.config.stream,
+                    h.config.consumer_group,
+                    entry_id,
+                    owner=lease.owner,
+                    resume_event_id=None,
+                )
+            assert first.state == "waiting" and getattr(first, "reason", _NO_FIELD) == ""
+            members = await h.async_redis.zrange(order_key, 0, -1)
+            assert ordered(bob_turn.event_id), "the capacity park was not in the thread order"
+
+            opener = asyncio.create_task(process(h, alice_turn))
+            try:
+                await wait_until(lambda: any_turn_active(h), "alice's turn is live")
+                alice_handle = route(h, key)
+                alice_runner = runner_at(h, alice_handle)
+
+                woken_id, woken = await wake(h, waits, bob_turn.event_id)
+                await consumer._handle(woken_id, woken)
+
+                assert outcomes.get(bob_turn.event_id) == [wait_cls]
+                again = await waits.get(bob_turn.event_id)
+                assert again is not None and again.state == "waiting"
+                assert getattr(again, "reason", _NO_FIELD) == "requester_handoff"
+                assert again.first_wait_ms == first.first_wait_ms
+                assert again.deadline_ms == first.deadline_ms
+                members = await h.async_redis.zrange(order_key, 0, -1)
+                assert not ordered(bob_turn.event_id), "bob's wait kept its thread order slot"
+                assert logged(
+                    caplog,
+                    f"capacity wait parked event_id={bob_turn.event_id} cause=requester_handoff",
+                )
+                assert all_steers(h) == [] and all_interrupts(h) == 0
+                assert await pending_count(h) == 0
+
+                await deliver(h, consumer, core, follow_up, alice)
+
+                assert alice_runner.steers == ["alice follows up"], (
+                    "Alice's follow-up waited behind Bob's wait"
+                )
+                assert outcomes.get(follow_up.event_id) == [_RETURNED]
+                assert await waits.get(follow_up.event_id) is None
+            finally:
+                release(holds)
+                await opener
+
+            complete_turns(h)
+            woken_id, woken = await wake(h, waits, bob_turn.event_id)
+            await consumer._handle(woken_id, woken)
+
+            assert outcomes[bob_turn.event_id][-1] == _RETURNED
+            bob_handle = route(h, key)
+            assert bob_handle.claim_name != alice_handle.claim_name
+            claims = cct_claims(cct_of(h.fake_k8s.claim_envs[-1]))
+            assert claims["principal"] == principal_dict(bob)
+            assert runner_at(h, bob_handle).opened == ["bob asks"]
+            assert all_opened(h).count("bob asks") == 1
+            assert await is_done(h, bob_turn)
+            assert await dead_letters(h) == 0
+
+    asyncio.run(run())
 
 
 def test_a_delivery_that_cannot_park_keeps_the_pending_deferral(make_harness) -> None:
