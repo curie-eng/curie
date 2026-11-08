@@ -470,6 +470,22 @@ class Markers:
         value = await self._redis.hget(self._turn_recovery_key(), claim_name)
         return value.decode() if isinstance(value, bytes) else value
 
+    async def watched_turn_live(self, claim_name: str, expected: str) -> bool:
+        return bool(
+            await self._redis.eval(
+                """
+                local value = redis.call('HGET', KEYS[1], ARGV[1])
+                if value ~= ARGV[2] then return 0 end
+                local record = cjson.decode(value)
+                return redis.call('GET', record.lease_key) == record.owner and 1 or 0
+                """,
+                1,
+                self._turn_recovery_key(),
+                claim_name,
+                expected,
+            )
+        )
+
     async def abandoned_turn(self, claim_name: str, expected: str) -> bool:
         return bool(
             await self._redis.eval(
@@ -514,12 +530,31 @@ class Markers:
             expected,
         )
 
-    async def forget_settled_turn(self, event_id: str) -> None:
-        if not await self.is_terminal(event_id):
-            return
-        for claim_name, expected in (await self.watched_turns()).items():
-            if json.loads(expected)["event_id"] == event_id:
-                await self.forget_watched_turn(claim_name, expected)
+    async def note_terminal_status_failure(
+        self, claim_name: str, expected: str, *, limit: int
+    ) -> None:
+        await self._redis.eval(
+            """
+            local value = redis.call('HGET', KEYS[1], ARGV[1])
+            if value ~= ARGV[2] then return 0 end
+            local record = cjson.decode(value)
+            local failures = (record.status_read_failures or 0) + 1
+            if failures >= tonumber(ARGV[3]) then
+              redis.call('HDEL', KEYS[1], ARGV[1])
+              redis.call('HDEL', KEYS[2], ARGV[1])
+            else
+              record.status_read_failures = failures
+              redis.call('HSET', KEYS[1], ARGV[1], cjson.encode(record))
+            end
+            return failures
+            """,
+            2,
+            self._turn_recovery_key(),
+            self._turn_recovery_key() + ":absent",
+            claim_name,
+            expected,
+            limit,
+        )
 
     def _completion_storage_key(self, event_id: str, *, answer: CompletionNamespace = False) -> str:
         key = self._config.completion_key(event_id)
