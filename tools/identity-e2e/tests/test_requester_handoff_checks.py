@@ -19,9 +19,7 @@ PRINCIPAL_A = {"kind": "slack", "id": "U0AAAA"}
 PRINCIPAL_B = {"kind": "slack", "id": "U0BBBB"}
 
 
-def observed(
-    claim: str, created: float, principal: Any, fingerprint: str
-) -> dict[str, Any]:
+def observed(claim: str, created: float, principal: Any, fingerprint: str) -> dict[str, Any]:
     return {
         "claim": claim,
         "claim_created_epoch": created,
@@ -179,3 +177,51 @@ def test_deferred_allows_two_seconds_of_skew_on_b_claim() -> None:
     deferred([PENDING], b_claim_created=A_REPLY_AT - 2.0)
     with pytest.raises(identity_scenarios.StepFailed):
         deferred([PENDING], b_claim_created=A_REPLY_AT - 2.5)
+
+
+# --- serving_claim (H5 control) -------------------------------------------------------------
+
+
+def served(
+    claims: dict[str, Any], fingerprint: str = FP_A, claim: str = "claim-two"
+) -> dict[str, Any]:
+    return {
+        "claim": claim,
+        "caller_token_present": True,
+        "claims": claims,
+        "caller_fingerprint": fingerprint,
+    }
+
+
+def judge_serving(observation: dict[str, Any], texts: list[str]) -> dict[str, Any]:
+    return identity_scenarios.serving_claim(
+        observation, serving="claim-two", agent="ie2e-off", texts=texts
+    )
+
+
+def test_serving_claim_passes_principal_free_and_is_json_serialisable() -> None:
+    seen = judge_serving(served({"agent": "ie2e-off", "exp": 1}), [reply("probe", FP_A)])
+    json.dumps(seen)
+    assert seen["claim"] == "claim-two"
+
+
+def test_serving_claim_fails_when_a_replacement_carries_the_first_humans_principal() -> None:
+    """The probe that the old H5 failed and a claim-count-only H5 passed."""
+    with pytest.raises(identity_scenarios.StepFailed, match="carries a principal"):
+        judge_serving(served({"agent": "ie2e-off", "principal": PRINCIPAL_A}), ["all done"])
+
+
+def test_serving_claim_fails_when_a_live_dial_sent_another_token() -> None:
+    with pytest.raises(identity_scenarios.StepFailed, match="did not send the serving"):
+        judge_serving(served({"agent": "ie2e-off"}), [reply("probe", FP_B)])
+
+
+def test_serving_claim_fails_when_the_newest_claim_is_not_the_serving_one() -> None:
+    with pytest.raises(identity_scenarios.StepFailed, match="serving the live turn"):
+        judge_serving(served({"agent": "ie2e-off"}, claim="claim-three"), ["all done"])
+
+
+def test_serving_claim_fails_without_a_caller_token() -> None:
+    observation = {**served({"agent": "ie2e-off"}), "caller_token_present": False}
+    with pytest.raises(identity_scenarios.StepFailed, match="no connector caller token"):
+        judge_serving(observation, ["all done"])

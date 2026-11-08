@@ -1152,6 +1152,45 @@ def deferral_step(
         )
 
 
+def serving_claim(
+    served: Mapping[str, Any], *, serving: Any, agent: str, texts: Iterable[Any]
+) -> dict[str, Any]:
+    """The H5 control's serving claim: principal-free, and every live dial sent its token.
+
+    ``served`` is the newest claim observed since the warm send; it must be
+    ``serving``, the claim the live turn ran on. Its caller token names
+    ``agent`` and carries no principal, so nothing the second human steered
+    into the turn ran as anyone. Every ``connector-call`` line in the live
+    turn's replies carries that token's fingerprint. The second human's folded
+    message dials nothing of its own (the fake model runs only the live turn's
+    script). Returns the evidence, which never holds a token.
+    """
+
+    check(
+        served.get("claim") == serving,
+        f"the claim serving the live turn is {serving}, but the newest observed is "
+        f"{served.get('claim')}",
+    )
+    check(
+        bool(served.get("caller_token_present")),
+        f"no connector caller token reached the serving claim {serving}",
+    )
+    token_claims = served.get("claims") or {}
+    check(
+        token_claims.get("agent") == agent,
+        f"the serving claim's token names agent {token_claims.get('agent')}",
+    )
+    check(
+        "principal" not in token_claims,
+        f"the serving claim {serving} on a flag-off agent carries a principal",
+    )
+    live_calls = connector_calls(texts)
+    fingerprint = served.get("caller_fingerprint")
+    stray = [call for call in live_calls if call.get("caller") != fingerprint]
+    check(not stray, f"a dial in the live turn did not send the serving claim's token: {stray[:3]}")
+    return {**observed_token(served), "live_turn_calls": live_calls}
+
+
 def control_step(
     harness: Harness,
     evidence: Evidence,
@@ -1225,6 +1264,15 @@ def control_step(
             len(claims) <= 1,
             f"{second} got a claim of their own on a flag-off agent; claims since "
             f"{first}'s send: {claims}",
+        )
+        # The claim that served the live turn, the replacement when one opened
+        # and the warm claim otherwise, is judged itself (:func:`serving_claim`).
+        served = harness.observe(agent, since=float(sent["sent_at"]) - CLOCK_SKEW_S, wait=60)
+        seen["served"] = serving_claim(
+            served,
+            serving=claims[0] if claims else observed.get("claim"),
+            agent=agent,
+            texts=texts,
         )
         pending = worker_messages(harness, since, PENDING_MESSAGE)
         seen["pending"] = pending
