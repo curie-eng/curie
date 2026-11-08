@@ -208,10 +208,10 @@ def test_bash_env_omits_platform_credentials_while_the_model_call_keeps_its_key(
     assert "CURIE_MODEL=claude-sonnet-5" in rendered
     assert "STDIO_TOKEN=connector-sentinel" in rendered
     assert "CURIE_TEST_SHELL=boundary-kept" in rendered
+    assert rendered.count("bundle-upload-readable") >= 2
     assert not capture.exists(), "startup observed a model credential before command cleanup"
     assert not untrusted_capture.exists(), "SDK options replaced the trusted shell launcher"
     assert rendered.count("CURIE_MODEL=claude-sonnet-5") >= 2
-    assert rendered.count("bundle-upload-readable") >= 2
     for sentinel in _SENTINELS:
         assert sentinel not in rendered, sentinel
     assert _MODEL_KEY in api_keys
