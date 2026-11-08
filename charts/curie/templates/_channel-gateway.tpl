@@ -1,16 +1,17 @@
 {{- define "curie.env.channelGateway" -}}
 {{- $root := .root -}}
-{{- if or $root.Values.channelGateway.deploy $root.Values.channelGateway.url -}}
-{{- $http := and $root.Values.channelGateway.allowInsecure (not $root.Values.channelGateway.tlsSecret) -}}
+{{- $gateway := $root.Values.channelGateway | default dict -}}
+{{- if or $gateway.deploy $gateway.url -}}
+{{- $http := and $gateway.allowInsecure (not $gateway.tlsSecret) -}}
 {{- $scheme := ternary "http" "https" $http -}}
 - name: CURIE_CHANNEL_GATEWAY_URL
-  value: {{ $root.Values.channelGateway.url | default (printf "%s://%s-channel-gateway:%v" $scheme (include "curie.fullname" $root) $root.Values.channelGateway.port) | quote }}
+  value: {{ $gateway.url | default (printf "%s://%s-channel-gateway:%v" $scheme (include "curie.fullname" $root) $gateway.port) | quote }}
 - name: CURIE_CHANNEL_GATEWAY_TOKEN
   valueFrom:
     secretKeyRef:
       name: {{ include "curie.secretName" $root }}
       key: {{ printf "channelGateway%sToken" (title .caller) }}
 - name: CURIE_CHANNEL_GATEWAY_ALLOW_INSECURE
-  value: {{ $root.Values.channelGateway.allowInsecure | quote }}
+  value: {{ $gateway.allowInsecure | quote }}
 {{- end -}}
 {{- end -}}
