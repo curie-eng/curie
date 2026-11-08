@@ -10,7 +10,6 @@ import subprocess
 import sys
 from pathlib import Path
 
-import identity_scenarios  # first: loads the scenario modules in the order that works today
 import identity_scenarios_requester as requester
 import pytest
 from identity_e2e import HarnessError
