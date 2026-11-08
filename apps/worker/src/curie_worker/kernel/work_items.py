@@ -560,11 +560,16 @@ async def _preflight_reclaimed_delivery(
         return
     watched = await self._markers.watched_turn(handle.claim_name)
     if watched is not None:
-        status = await self._runner.status(
-            handle.base_url, token=handle.token or None, remaining_s=_left()
-        )
+        try:
+            status = await self._runner.status(
+                handle.base_url, token=handle.token or None, remaining_s=_left()
+            )
+        except Exception as exc:  # noqa: BLE001 - an unreadable predecessor is a handoff wait
+            raise memory.ReclaimPreflightUnsafe("watched predecessor status is unreadable") from exc
+        watched_event = json.loads(watched)["event_id"]
         if status.get("side_effect_emitted") is True:
-            await self._markers.mark_side_effect(json.loads(watched)["event_id"])
+            await self._markers.mark_side_effect(watched_event)
+        if await self._markers.saw_side_effect(watched_event):
             if status.get("turn_active") is False and status.get("history_durable") is True:
                 return
             await self.interrupt_thread(thread_key, "side effect from an abandoned delivery")
