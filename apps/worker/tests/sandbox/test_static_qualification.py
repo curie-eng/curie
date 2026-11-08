@@ -203,6 +203,8 @@ class _Worker:
         tls: ShellTls,
         shells: list[SupervisorProcess],
         bundle: dict[str, bytes] | None = None,
+        *,
+        connector_upload_signing_key: str = "",
     ) -> None:
         self.tls = tls
         self.client = StaticPoolSandboxClient(
@@ -214,6 +216,7 @@ class _Worker:
             key_prefix=prefix,
             retire_timeout_seconds=30.0,
             allow_unisolated_shells=True,
+            connector_upload_signing_key=connector_upload_signing_key,
         )
         self._pressure = AsyncRedis(host=VALKEY_HOST, port=VALKEY_PORT, password=VALKEY_PW)
         self.substrate = SandboxSubstrate(
@@ -290,8 +293,20 @@ def worker_factory(
 ) -> Iterator[Callable[..., _Worker]]:
     made: list[_Worker] = []
 
-    def make(shells: list[SupervisorProcess], bundle: dict[str, bytes] | None = None) -> _Worker:
-        worker = _Worker(valkey, prefix, tls, shells, bundle)
+    def make(
+        shells: list[SupervisorProcess],
+        bundle: dict[str, bytes] | None = None,
+        *,
+        connector_upload_signing_key: str = "",
+    ) -> _Worker:
+        worker = _Worker(
+            valkey,
+            prefix,
+            tls,
+            shells,
+            bundle,
+            connector_upload_signing_key=connector_upload_signing_key,
+        )
         made.append(worker)
         return worker
 
@@ -487,9 +502,11 @@ def test_connector_endpoint_settings_reach_the_runner_on_a_shell(
         },
     ).start()
     try:
+        signing_key = base64.b64encode(bytes(range(32))).decode()
         worker = worker_factory(
             [shell],
             {"connectors.yaml": b"connectors:\n  reviewer:\n    image: example/reviewer:1\n"},
+            connector_upload_signing_key=signing_key,
         )
         endpoints = {
             "version": 1,
@@ -505,8 +522,9 @@ def test_connector_endpoint_settings_reach_the_runner_on_a_shell(
         binding = BindingResolver.__new__(BindingResolver)
         binding._config = WorkerConfig(
             api_key="",
+            sandbox_substrate="static",
             bundle_plugin_dir=str(tmp_path),
-            connector_caller_signing_key=base64.b64encode(bytes(range(32))).decode(),
+            connector_caller_signing_key=signing_key,
             connector_endpoints=StaticConnectorEndpoints.model_validate(endpoints),
         )
         resolved = ResolvedDeployment(
@@ -536,6 +554,9 @@ def test_connector_endpoint_settings_reach_the_runner_on_a_shell(
         assert (started[CA_FILE_ENV], started["NODE_EXTRA_CA_CERTS"]) == (ca, ca)
         # The upload map is the runner's own derivation, never handed in.
         assert UPLOADS_ENV not in started
+        upload_file = Path(started["CURIE_CONNECTOR_UPLOAD_TOKENS_FILE"])
+        assert set(json.loads(upload_file.read_text())) == {"reviewer"}
         assert worker.substrate.release(thread)
+        assert not upload_file.exists()
     finally:
         shell.stop()

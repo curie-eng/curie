@@ -14,6 +14,7 @@ from functools import partial
 
 import httpx
 import redis.asyncio as redis
+from curie_channel_gateway.tls import gateway_http_mounts
 from curie_internal.valkey import AsyncRedis
 from curie_protected_hooks.source_policy_sql import SourceGate
 from curie_telemetry import (
@@ -158,7 +159,10 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     app.state.forges = forges_registry(settings)
     # The shared client reaches the code host, so it trusts the operator's
     # code host CA bundle as well as the public roots (#3831).
-    http_client = httpx.AsyncClient(timeout=10.0, verify=code_host_verify(settings))
+    http_client = httpx.AsyncClient(
+        timeout=10.0, verify=code_host_verify(settings),
+        mounts=gateway_http_mounts(settings.channel_gateway_url),
+    )
     app.state.http_client = http_client
     app.state.langfuse = LangfuseClient(settings, http_client)
     store = BundleStore(settings)

@@ -1715,13 +1715,17 @@ api:
       type: RuntimeDefault
 
 channelGateway:
-  # Enable after providing a server certificate trusted by the API and worker.
-  deploy: false
+  # Retained-value upgrades use the same defaults in files/channel-gateway-defaults.yaml.
+  # null deploys automatically when Slack is configured and url is empty.
+  # false requires an external url; true deploys even without Slack.
+  deploy: null
   replayStorageSize: 1Gi
   replayStorageClass: ""
   port: 8081
   url: ""
   allowInsecure: false
+  # Optional Secret with ca.crt, tls.crt and tls.key. Otherwise Helm provisions
+  # and preserves a certificate across upgrades using lookup.
   tlsSecret: ""
   apiToken: null
   workerToken: null

@@ -110,5 +110,5 @@ def test_image_upgrade_refuses_schema_one_process_settings(tmp_path):
     del settings["channel_gateway"]
     settings["slack"] = {"token": "xoxb-PLACEHOLDER"}
     (tmp_path / "process.json").write_bytes(canonical(settings))
-    with pytest.raises(product().WorkerBootstrapInvalid):
+    with pytest.raises(product().WorkerBootstrapInvalid, match="migrate-protected-process"):
         product().load_process_settings(str(tmp_path))
