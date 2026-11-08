@@ -561,6 +561,40 @@ fn a_same_route_edit_keeps_the_selector_routes_stored_deadline() {
 }
 
 #[test]
+fn flag_edits_preserve_selector_routes_reminder_intervals() {
+    for edited_route in ["ledger_post", "deal_desk"] {
+        for interval in [Some(serde_json::json!(60)), None] {
+            let mut stored = serde_json::json!({
+                "resolution": {"kind": "slack", "address": "C0EXAMPLE1"},
+                "approver_ticket": registration_readback(),
+                "separation": {"exclude_requester": true},
+            });
+            if let Some(interval) = &interval {
+                stored["remind_every_s"] = interval.clone();
+            }
+            let api = api(
+                serde_json::json!({"ledger_post": stored.clone(), "deal_desk": plain_route("C0EXAMPLE2")}),
+                6,
+                false,
+            );
+            let edit = format!("{edited_route}=C0EXAMPLE3");
+            let run = run(&args(
+                &api.server.base_url,
+                &["--route-resolution", &edit],
+            ));
+            assert_eq!(run.code, 0, "{}{}", run.stdout, run.stderr);
+            let sent = patches(&api.server);
+            assert_eq!(sent.len(), 1, "{sent:?}");
+            if edited_route == "ledger_post" {
+                stored["resolution"] =
+                    serde_json::json!({"kind": "slack", "address": "C0EXAMPLE3"});
+            }
+            assert_eq!(sent[0]["approval_routes"]["ledger_post"], stored);
+        }
+    }
+}
+
+#[test]
 fn a_single_route_edit_on_an_agent_without_selectors_sends_only_that_route() {
     let api = api(
         serde_json::json!({"deal_desk": plain_route("C0EXAMPLE2")}),
