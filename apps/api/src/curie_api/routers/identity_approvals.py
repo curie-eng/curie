@@ -1,9 +1,15 @@
-"""Internal creation transport. @spec HTTP-APPROVAL-CONTINUITY-3."""
+"""Internal creation and card registration transport.
 
+@spec HTTP-APPROVAL-CONTINUITY-3 APPROVER-DM-2.
+"""
+
+import uuid
 from collections.abc import Callable, Coroutine
 from typing import Any
 
 from curie_internal.identity_approval import (
+    ApprovalCardRegistrationRequestV1,
+    ApprovalCardRegistrationResponseV1,
     ApprovalCreationRequestV1,
     ApprovalCreationResponseV1,
     ApprovalCreationResponseV2,
@@ -14,7 +20,11 @@ from fastapi.responses import JSONResponse
 from fastapi.routing import APIRoute
 
 from curie_api.auth import require_internal_worker_token
-from curie_api.identity.http_approval import create_http_approval, decode_creation_json
+from curie_api.identity.http_approval import (
+    create_http_approval,
+    decode_creation_json,
+    register_approval_card,
+)
 from curie_api.wirebody import read_bounded_body
 
 
@@ -71,3 +81,18 @@ async def create_identity_approval(
     result = await create_http_approval(request, body)
     response.status_code = 200 if result.duplicate else 201
     return result
+
+
+@router.post(
+    "/{approval_id}/card", response_model=ApprovalCardRegistrationResponseV1, status_code=200,
+)
+async def register_identity_approval_card(
+    request: Request,
+    approval_id: uuid.UUID,
+    body: ApprovalCardRegistrationRequestV1,
+) -> ApprovalCardRegistrationResponseV1:
+    """Register the provider-returned DM channel of one approver-DM card.
+
+    @spec APPROVER-DM-2.
+    """
+    return await register_approval_card(request, approval_id, body)

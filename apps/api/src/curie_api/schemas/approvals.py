@@ -21,7 +21,9 @@ from pydantic_core import CoreSchema
 
 from .. import adapter_principal
 from .channels import (
+    BUILTIN_CLUSTER_MESSAGE_ADAPTER,
     CALLER_MAX_CHARS,
+    CHANNEL_KIND,
     EMAIL_CALLER,
     EMAIL_KIND,
     MAX_ALLOWED_CALLERS,
@@ -210,6 +212,38 @@ class ApprovalRequestingSurfaceTarget(BaseModel):
     mode: Literal["requesting_surface"]
 
 
+APPROVER_DM_MODE = "approver_dm"
+
+
+class ApprovalApproverDmTarget(BaseModel):
+    """Deliver the one card to the selected approver's DM (ADR 0272 decision 1).
+
+    The third form of a route's ``resolution``. ``identity`` names the Slack
+    bot identity (the same lowercase slug as a notification target's
+    ``adapter``; ``default`` is the default app and is stored as written) whose
+    installation posts the card to the one canonical person an approver ticket
+    selected. Valid only on a route that also registers ``approver_ticket``, and
+    never with a ``notification``; the route writer checks the first and that
+    the identity has a registered receiver. Strict, like the requesting-surface
+    form: no ``kind``, ``address`` or recipient may ride beside it.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    mode: Literal["approver_dm"]
+    identity: str
+
+    @field_validator("identity")
+    @classmethod
+    def _identity_slug(cls, value: str) -> str:
+        if not CHANNEL_KIND.match(value) or value == BUILTIN_CLUSTER_MESSAGE_ADAPTER:
+            raise ValueError(
+                "approver_dm identity must name a configured Slack bot identity as a "
+                "lowercase slug, for example default"
+            )
+        return value
+
+
 class ApprovalNotificationTarget(ChannelRouteWrite, _StoredWithoutNulls):
     """A visibility-only approval ping target and its server-side transport.
 
@@ -389,7 +423,8 @@ class ApprovalRouteBinding(_StoredWithoutNulls):
     """One strict workspace binding for a declared approval route (#1460).
 
     ``resolution`` is the single verified-identity action surface: a fixed
-    Slack channel, or the conversation that asked (ADR-0177).
+    Slack channel, the conversation that asked (ADR-0177), or the one selected
+    approver's DM (ADR 0272).
     ``notification`` may make the pending request visible elsewhere, but its
     message carries no interaction. ``approvers`` continues to narrow WHO may
     act through the resolution card path and is never inferred from notification
@@ -402,7 +437,9 @@ class ApprovalRouteBinding(_StoredWithoutNulls):
 
     _explicit_null_fields = frozenset({"expires_in_seconds"})
 
-    resolution: ApprovalResolutionTarget | ApprovalRequestingSurfaceTarget
+    resolution: (
+        ApprovalResolutionTarget | ApprovalRequestingSurfaceTarget | ApprovalApproverDmTarget
+    )
     notification: ApprovalNotificationTarget | None = None
     approvers: ApprovalApprovers | None = None
     expires_in_seconds: int | None = Field(default=None, strict=True, gt=0, le=315_360_000)
@@ -429,6 +466,14 @@ class ApprovalRouteBinding(_StoredWithoutNulls):
 
     @model_validator(mode="after")
     def _targets_must_differ(self) -> "ApprovalRouteBinding":
+        if isinstance(self.resolution, ApprovalApproverDmTarget):
+            if self.notification is not None:
+                # ADR 0272 decision 1: one card in one DM, and nothing else.
+                raise ValueError(
+                    "approver_dm_notification: an approver_dm resolution cannot carry a "
+                    "notification; the card goes only to the selected approver's DM"
+                )
+            return self
         if isinstance(self.resolution, ApprovalRequestingSurfaceTarget):
             if self.notification is not None:
                 # ADR-0177 decision 1: the card already joins the thread that
@@ -502,6 +547,15 @@ class ApprovalRequestingSurfaceTargetOut(BaseModel):
     mode: str
 
 
+class ApprovalApproverDmTargetOut(BaseModel):
+    """Read projection of ``ApprovalApproverDmTarget`` (ADR 0272); tolerant for repair."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    mode: Literal["approver_dm"]
+    identity: str
+
+
 class ApproverTicketCeilingUserOut(BaseModel):
     """Read projection of one ceiling user; tolerant for repair."""
 
@@ -567,7 +621,9 @@ class ApprovalRouteBindingOut(BaseModel):
 
     model_config = ConfigDict(extra="ignore")
 
-    resolution: ApprovalTargetOut | ApprovalRequestingSurfaceTargetOut
+    resolution: (
+        ApprovalTargetOut | ApprovalApproverDmTargetOut | ApprovalRequestingSurfaceTargetOut
+    )
     notification: ApprovalTargetOut | None = None
     approvers: ApprovalApproversOut | None = None
     expires_in_seconds: int | None = None

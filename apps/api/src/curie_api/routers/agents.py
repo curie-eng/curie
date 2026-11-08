@@ -50,6 +50,7 @@ from curie_api.schemas.versions import BundleFile, BundleFiles, VersionCreate, V
 
 from .. import approver_tickets, bundles, deploy, hook_signing
 from ..action_forward import RESTORE_TOOL
+from ..approver_dm import dm_route
 from ..auth import require_api_key
 from ..config import get_settings
 from ..deps import SessionDep, StoreDep
@@ -243,6 +244,21 @@ async def create_agent(data: AgentCreate, session: SessionDep) -> AgentOut:
             status.HTTP_422_UNPROCESSABLE_ENTITY,
             "separation cannot be set when an agent is created: create the agent, then "
             "write it with PATCH approval_routes and approval_routes_expected_version",
+        )
+    # ADR 0272 decision 1: an approver_dm resolution needs the route's selector
+    # registration and a registered receiver, both judged only by the
+    # versioned PATCH route write.
+    if data.approval_routes is not None and any(
+        dm_route(binding) is not None for binding in data.approval_routes.values()
+    ):
+        raise HTTPException(
+            status.HTTP_422_UNPROCESSABLE_ENTITY,
+            {
+                "code": crud_agents.APPROVER_DM_STATIC_ROUTE,
+                "message": "an approver_dm resolution cannot be set when an agent is created: "
+                "create the agent, register its approver_ticket selector, then write the "
+                "route with PATCH approval_routes and approval_routes_expected_version",
+            },
         )
     # name and repo_full_name are unique. A collision is a caller conflict (409),
     # not a server fault: catch the DB IntegrityError and map it, rather than

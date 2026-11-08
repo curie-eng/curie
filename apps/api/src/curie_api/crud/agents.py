@@ -15,17 +15,28 @@ from sqlalchemy.orm import selectinload
 from curie_api.schemas.agents import AgentCreate, HookPartitionConfig, SourceBindingConfig
 
 from .. import approver_tickets, identity_audit
-from ..identity.http_invocation import registered_binding_ids, tenant_selects_http_identity
+from ..approver_dm import dm_route
+from ..identity.http_invocation import (
+    HttpInvocationRuntime,
+    registered_binding_ids,
+    tenant_selects_http_identity,
+)
 from ..models import (
     DEFAULT_TENANT_ID,
     Agent,
     AgentChannel,
     AgentVersion,
+    ChannelIdentity,
     Deployment,
     WorkItem,
     WorkspaceRecoveryGroup,
 )
 from ..publication_policy import PublicationPolicyConflict
+
+# ADR 0272 decision 1 route-write refusal codes. @spec APPROVER-DM-1.
+APPROVER_DM_STATIC_ROUTE = "approver_dm_static_route"
+APPROVER_DM_NOTIFICATION = "approver_dm_notification"
+APPROVER_DM_RECEIVER_MISSING = "approver_dm_receiver_missing"
 
 # ADR 0270 decision 1 refusal codes. @spec CONNECTOR-REQUESTER-1.
 REQUESTER_IDENTITY_VERSION_CONFLICT = "agent.requester_identity_version_conflict"
@@ -392,6 +403,75 @@ class ApprovalRoutesRefused(Exception):
         self.code = code
 
 
+async def check_approver_dm_routes(
+    session: AsyncSession, agent: Agent, routes: dict[str, Any], *, runtime: object
+) -> None:
+    """Every ``approver_dm`` resolution of a proposed map is deliverable (ADR 0272).
+
+    Judged on the whole replacement map, kept routes included, inside the
+    caller's row-locked transaction. A DM resolution needs its route's own
+    ``approver_ticket`` selector (only a dynamic approval has one selected
+    person to deliver to), carries no notification, and names an active Slack
+    bot identity of the agent's tenant for which the live runtime registers a
+    receiver. Raises ``ApprovalRoutesRefused`` (422). @spec APPROVER-DM-1.
+    """
+
+    for name, binding in routes.items():
+        identity = dm_route(binding)
+        if identity is None:
+            continue
+        if "approver_ticket" not in binding:
+            raise ApprovalRoutesRefused(
+                422,
+                APPROVER_DM_STATIC_ROUTE,
+                f"route {name!r} resolves to approver_dm but registers no approver_ticket "
+                "selector; an approver DM is only for a dynamic route's one selected approver",
+            )
+        if binding.get("notification") is not None:
+            raise ApprovalRoutesRefused(
+                422,
+                APPROVER_DM_NOTIFICATION,
+                f"route {name!r} resolves to approver_dm and cannot carry a notification",
+            )
+        if not await approver_dm_receiver_registered(
+            session, runtime, tenant_id=agent.tenant_id, identity=identity
+        ):
+            raise ApprovalRoutesRefused(
+                422,
+                APPROVER_DM_RECEIVER_MISSING,
+                f"route {name!r} names approver_dm identity {identity!r}, which is not an "
+                "active Slack bot identity of this tenant with a registered receiver",
+            )
+
+
+async def approver_dm_receiver_registered(
+    session: AsyncSession, runtime: object, *, tenant_id: uuid.UUID, identity: str
+) -> bool:
+    """An active Slack identity row named ``identity`` and a receiver registered for it.
+
+    @spec APPROVER-DM-1.
+    """
+
+    if type(runtime) is not HttpInvocationRuntime:
+        return False
+    row = await session.scalar(
+        select(ChannelIdentity).where(
+            ChannelIdentity.tenant_id == tenant_id,
+            ChannelIdentity.provider == "slack",
+            ChannelIdentity.name == identity,
+            ChannelIdentity.status == "active",
+        )
+    )
+    if row is None:
+        return False
+    return any(
+        registration.tenant_id == str(tenant_id)
+        and registration.channel_identity_name == identity
+        and registration.channel_identity_id == str(row.id)
+        for registration in runtime._receivers.values()
+    )
+
+
 async def update_agent_approval_routes(
     session: AsyncSession,
     agent: Agent,
@@ -427,6 +507,7 @@ async def update_agent_approval_routes(
     assert locked is not None
     current = locked.connector_requester_identity_version
     try:
+        await check_approver_dm_routes(session, locked, routes, runtime=runtime)
         if expected_version is not None and expected_version != current:
             raise ApprovalRoutesRefused(
                 409,

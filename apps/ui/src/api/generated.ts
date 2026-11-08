@@ -3278,6 +3278,28 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/v1/internal/identity/approvals/{approval_id}/card": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Register Identity Approval Card
+         * @description Register the provider-returned DM channel of one approver-DM card.
+         *
+         *     @spec APPROVER-DM-2.
+         */
+        post: operations["register_identity_approval_card_v1_internal_identity_approvals__approval_id__card_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/v1/internal/identity/binding-classification/check": {
         parameters: {
             query?: never;
@@ -4981,6 +5003,41 @@ export interface components {
             org_name: string;
         };
         /**
+         * ApprovalApproverDmTarget
+         * @description Deliver the one card to the selected approver's DM (ADR 0272 decision 1).
+         *
+         *     The third form of a route's ``resolution``. ``identity`` names the Slack
+         *     bot identity (the same lowercase slug as a notification target's
+         *     ``adapter``; ``default`` is the default app and is stored as written) whose
+         *     installation posts the card to the one canonical person an approver ticket
+         *     selected. Valid only on a route that also registers ``approver_ticket``, and
+         *     never with a ``notification``; the route writer checks the first and that
+         *     the identity has a registered receiver. Strict, like the requesting-surface
+         *     form: no ``kind``, ``address`` or recipient may ride beside it.
+         */
+        ApprovalApproverDmTarget: {
+            /** Identity */
+            identity: string;
+            /**
+             * Mode
+             * @constant
+             */
+            mode: "approver_dm";
+        };
+        /**
+         * ApprovalApproverDmTargetOut
+         * @description Read projection of ``ApprovalApproverDmTarget`` (ADR 0272); tolerant for repair.
+         */
+        ApprovalApproverDmTargetOut: {
+            /** Identity */
+            identity: string;
+            /**
+             * Mode
+             * @constant
+             */
+            mode: "approver_dm";
+        };
+        /**
          * ApprovalApprovers
          * @description WHO may resolve a route's approvals (#420), as opposed to the binding's
          *     ``resolution``, which is only WHERE the interactive card posts.
@@ -5065,6 +5122,62 @@ export interface components {
             team_epoch?: number | null;
             /** Team Id */
             team_id?: string | null;
+        };
+        /**
+         * ApprovalCardRegistrationRequestV1
+         * @description Register the provider-returned DM channel of one approver-DM card.
+         *
+         *     ``identity`` is the same block the creation sent; ``card_identity`` and
+         *     ``recipient`` the delivery the creation returned; ``channel`` the DM
+         *     channel id the provider answered the post with, never the user id the post
+         *     named. @spec APPROVER-DM-2.
+         */
+        ApprovalCardRegistrationRequestV1: {
+            /** Approval Id */
+            approval_id: string;
+            /** Card Identity */
+            card_identity: string;
+            /** Channel */
+            channel: string;
+            /** Dedupe Key */
+            dedupe_key: string;
+            identity: components["schemas"]["ApprovalCreationIdentityV1"];
+            /** Recipient */
+            recipient: string;
+            /** Request Id */
+            request_id: string;
+            /**
+             * Schema Version
+             * @constant
+             */
+            schema_version: 1;
+        };
+        /**
+         * ApprovalCardRegistrationResponseV1
+         * @description The approval's status and stored card channel after a registration.
+         *
+         *     A terminal status means the card was never registered and the worker
+         *     settles the posted card now. @spec APPROVER-DM-2.
+         */
+        ApprovalCardRegistrationResponseV1: {
+            /** Approval Id */
+            approval_id: string;
+            /** Card Channel */
+            card_channel: string | null;
+            /** Duplicate */
+            duplicate: boolean;
+            /** Request Id */
+            request_id: string;
+            /**
+             * Schema Version
+             * @constant
+             */
+            schema_version: 1;
+            /**
+             * Status
+             * @enum {string}
+             */
+            status: "pending" | "approved" | "rejected" | "expired";
         };
         /**
          * ApprovalCreateOut
@@ -5182,9 +5295,12 @@ export interface components {
          *     ``granted_arguments`` is the canonical JSON text of the stored object, the
          *     opaque ``approval_ticket`` included; the worker renders these stored values,
          *     never its original model summary. Display data, never a permit.
-         *     @spec REQUEST-APPROVAL-4 REQUEST-APPROVAL-8 HTTP-APPROVAL-CONTINUITY-3.
+         *     ``delivery`` is present only for an approver-DM approval (ADR 0272), which
+         *     is always dynamic, and is omitted, not null, otherwise.
+         *     @spec REQUEST-APPROVAL-4 REQUEST-APPROVAL-8 HTTP-APPROVAL-CONTINUITY-3 APPROVER-DM-2.
          */
         ApprovalCreationResponseV2: {
+            delivery?: components["schemas"]["ApprovalDmDeliveryV1"] | null;
             /** Duplicate */
             duplicate: boolean;
             /** Granted Arguments */
@@ -5209,6 +5325,27 @@ export interface components {
              * @enum {string}
              */
             status: "pending" | "approved" | "rejected" | "expired";
+        };
+        /**
+         * ApprovalDmDeliveryV1
+         * @description The server-verified single recipient of an approver-DM card (ADR 0272).
+         *
+         *     ``identity`` is the Slack bot identity that posts the card,
+         *     ``provider_installation_id`` its installation, ``recipient`` the selected
+         *     approver's native user id there. @spec APPROVER-DM-2.
+         */
+        ApprovalDmDeliveryV1: {
+            /** Identity */
+            identity: string;
+            /**
+             * Mode
+             * @constant
+             */
+            mode: "approver_dm";
+            /** Provider Installation Id */
+            provider_installation_id: string;
+            /** Recipient */
+            recipient: string;
         };
         /**
          * ApprovalExemptGroup
@@ -5634,7 +5771,8 @@ export interface components {
          * @description One strict workspace binding for a declared approval route (#1460).
          *
          *     ``resolution`` is the single verified-identity action surface: a fixed
-         *     Slack channel, or the conversation that asked (ADR-0177).
+         *     Slack channel, the conversation that asked (ADR-0177), or the one selected
+         *     approver's DM (ADR 0272).
          *     ``notification`` may make the pending request visible elsewhere, but its
          *     message carries no interaction. ``approvers`` continues to narrow WHO may
          *     act through the resolution card path and is never inferred from notification
@@ -5651,7 +5789,7 @@ export interface components {
             /** Remind Every S */
             remind_every_s?: number | null;
             /** Resolution */
-            resolution: components["schemas"]["ApprovalResolutionTarget"] | components["schemas"]["ApprovalRequestingSurfaceTarget"];
+            resolution: components["schemas"]["ApprovalResolutionTarget"] | components["schemas"]["ApprovalRequestingSurfaceTarget"] | components["schemas"]["ApprovalApproverDmTarget"];
             separation?: components["schemas"]["ApprovalSeparation"] | null;
         };
         /**
@@ -5670,7 +5808,7 @@ export interface components {
             /** Remind Every S */
             remind_every_s?: number | null;
             /** Resolution */
-            resolution: components["schemas"]["ApprovalTargetOut"] | components["schemas"]["ApprovalRequestingSurfaceTargetOut"];
+            resolution: components["schemas"]["ApprovalTargetOut"] | components["schemas"]["ApprovalApproverDmTargetOut"] | components["schemas"]["ApprovalRequestingSurfaceTargetOut"];
             separation?: components["schemas"]["ApprovalSeparationOut"] | null;
         };
         /**
@@ -18550,6 +18688,43 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["ApprovalCreationResponseV1"] | components["schemas"]["ApprovalCreationResponseV2"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    register_identity_approval_card_v1_internal_identity_approvals__approval_id__card_post: {
+        parameters: {
+            query?: never;
+            header?: {
+                "X-Curie-Worker-Token"?: string | null;
+            };
+            path: {
+                approval_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ApprovalCardRegistrationRequestV1"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ApprovalCardRegistrationResponseV1"];
                 };
             };
             /** @description Validation Error */

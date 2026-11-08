@@ -33,10 +33,11 @@ from fastapi import HTTPException, Request
 from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from curie_api import approval_selection, identity_fence, principal_authority
+from curie_api import approval_selection, approver_dm, identity_fence, principal_authority
 from curie_api.approval_auth import AuthenticatedApprovalPrincipal
 from curie_api.approval_selection import SelectionRefused
 from curie_api.approval_teams import authenticated_actor_evidence, team_restriction
+from curie_api.approver_dm import DmCard
 from curie_api.authorizer import authorize_approval
 from curie_api.crud import approvals as approvals_crud
 from curie_api.models import Agent, Approval, ApprovalAuditEntry, ApprovalStatus, Principal
@@ -331,8 +332,17 @@ def _authenticate_actor(
     saved: wire.ApprovalContextV1,
     principal: AuthenticatedApprovalPrincipal,
     answer: ApprovalAnswer,
+    dm: DmCard | None,
 ) -> _Actor:
-    """Exact bytes, both signatures and equal Slack evidence. @spec HTTP-APPROVAL-CONTINUITY-7."""
+    """Exact bytes, both signatures and equal Slack evidence. @spec HTTP-APPROVAL-CONTINUITY-7.
+
+    The proved channel is the row's stored ``card_channel``, never the reply
+    channel: every HTTP-selected row stores its card target, so one without it
+    is an approver-DM card not yet registered, which nothing can answer. A
+    registered DM card (``dm``) is answered only through the receiver identity
+    and installation its record names, by its recorded recipient, in its
+    registered DM. @spec APPROVER-DM-3.
+    """
     slack = principal.slack
     if (
         principal.kind != "chat" or slack is None or principal.actor_channel is None
@@ -349,9 +359,9 @@ def _authenticate_actor(
         signed = SlackEvidence.model_validate(proof.slack.model_dump(mode="json"))
     except (UnicodeEncodeError, ValueError):
         _invalid()
-    target = row.card_channel or row.reply_channel
+    target = row.card_channel
     if (
-        registration is None
+        target is None or registration is None
         or proof.operation != answer.operation or proof.approval_id != str(row.id)
         or not hmac.compare_digest(proof.body_sha256, _sha256(answer.body))
         or not hmac.compare_digest(proof.attestation_sha256, attestation)
@@ -362,9 +372,13 @@ def _authenticate_actor(
         # The answering receiver may differ from the invoker's; the server-resolved
         # approval target names the identity it must be, and the originating
         # binding must be one this registration explicitly serves.
-        or registration.channel_identity_name != approval_token_identity(row)
+        or registration.channel_identity_name != approval_token_identity(row, dm)
         or registration.tenant_id != saved.scope.tenant_id
         or not _serves_origin(registration, row, saved)
+        or dm is not None and (
+            registration.provider_installation_id != dm.provider_installation_id
+            or proof.native_channel_id != dm.channel
+        )
     ):
         _invalid()
     # The registered-sender owner: an ordinary workspace keeps the existing
@@ -375,7 +389,7 @@ def _authenticate_actor(
         native_id, namespace = registered_sender(registration, signed)
     except HTTPException:
         _invalid()
-    if native_id != principal.subject:
+    if native_id != principal.subject or (dm is not None and native_id != dm.recipient):
         _invalid()
     return _Actor(
         registration,
@@ -471,7 +485,7 @@ async def _check_principal(
 
 async def _route_decision(
     row: Approval, route_binding: Any, actor: _Subject, approver_sets: Any,
-    subject: str, channel: str,
+    subject: str, channel: str, dm: DmCard | None,
 ) -> dict[str, Any] | None:
     """Explicit route restrictions through their existing owner, freshly.
 
@@ -483,13 +497,16 @@ async def _route_decision(
     judged in ``_Composition.verify`` from fresh facts, so the migrated-role
     early return here skips only the retained route restrictions, never them.
     @spec REQUEST-APPROVAL-5/6.
+
+    A registered approver-DM card's sets are read through its recorded
+    identity (``dm``). @spec APPROVER-DM-3.
     """
     role = None if actor.capture.policy is None else actor.capture.policy.roles.approver
     if role is not None and role.legacy_state == "migrated" and not team_restriction(
         row, route_binding,
     ):
         return None
-    approver_set = approver_sets(row, route_binding)
+    approver_set = approver_sets(row, route_binding, dm)
     if isinstance(approver_set, SlackUserGroupMembers):
         approver_set = approver_set.fresh()
     # An email actor answers as its mail adapter's principal, so a declared
@@ -610,6 +627,9 @@ class _Composition:
     subject is the answering actor sealed with the row rather than a new
     answer. ``selection_evidence`` holds the last canonical-route judgment.
     @spec REQUEST-APPROVAL-5/6.
+
+    ``dm`` is the row's registered approver-DM card, loaded once in phase 1.
+    @spec APPROVER-DM-3.
     """
 
     request: Request
@@ -636,6 +656,7 @@ class _Composition:
     route_evidence: dict[str, Any] | None = None
     selection_evidence: dict[str, Any] | None = None
     stage: str = "capture"
+    dm: DmCard | None = None
 
     async def _observe(self, subject: _Subject) -> _Subject:
         """Phase 2 for one subject. @spec HTTP-APPROVAL-CONTINUITY-9."""
@@ -664,7 +685,7 @@ class _Composition:
                 tasks = [group.create_task(self._observe(subject)) for subject in self.subjects]
                 route = None if actor is None else group.create_task(_route_decision(
                     self.row, self.route_binding, actor, self.approver_sets,
-                    self.actor_native, self.actor_channel,
+                    self.actor_native, self.actor_channel, self.dm,
                 ))
         except BaseExceptionGroup as group_error:
             # The group wraps a route denial and cancels pending lookups; the
@@ -779,13 +800,20 @@ class _Composition:
 
 def _preserved_actor(
     runtime: HttpInvocationRuntime, row: Approval, saved: wire.ApprovalContextV1,
+    dm: DmCard | None,
 ) -> tuple[_Actor, _PreservedAssociation]:
     """The sealed answering actor, under its still-current registration.
 
     @spec HTTP-APPROVAL-CONTINUITY-7/8/15.
+
+    A registered approver-DM card (``dm``) keeps the rules that admitted its
+    answer: the recorded identity and installation, the recorded recipient and
+    the registered DM. @spec APPROVER-DM-3.
     """
     scope = saved.actor_scope
     if scope is not None and scope.provider == "email":
+        if dm is not None:
+            _deny()
         return _preserved_email_actor(runtime, row, saved)
     registration = None if scope is None or saved.actor_receiver_id is None else (
         runtime._receivers.get((saved.actor_receiver_id, saved.actor_receiver_generation or 0))
@@ -799,10 +827,15 @@ def _preserved_actor(
         or registration.tenant_id != scope.tenant_id or scope.tenant_id != saved.scope.tenant_id
         or registration.channel_identity_id != scope.channel_identity_id
         or registration.provider_installation_id != scope.provider_installation_id
-        or registration.channel_identity_name != approval_token_identity(row)
+        or registration.channel_identity_name != approval_token_identity(row, dm)
         or not _serves_origin(registration, row, saved)
         or scope.provider != "slack"
         or (scope.native_id in registration.human_native_ids) != saved.actor_independent_human
+        or dm is not None and (
+            registration.provider_installation_id != dm.provider_installation_id
+            or scope.native_id != dm.recipient or scope.actor_channel != dm.channel
+            or row.card_channel != dm.channel
+        )
     ):
         _deny()
     return _Actor(
@@ -936,11 +969,13 @@ async def _answer(
             # Detached while fully loaded, so a rollback of this reader cannot
             # expire it: the capture refusal audit below reads it exactly as the
             # phases after a committed capture do. @spec REQUEST-APPROVAL-5/6.
+            # The registered DM card, read once under this reader. @spec APPROVER-DM-3.
+            dm = await approver_dm.card(session, row)
             session.expunge(row)
             actor_scope = (
                 _authenticate_email_actor(runtime, row, saved, principal, answer)
                 if principal.kind == "adapter"
-                else _authenticate_actor(runtime, row, saved, principal, answer)
+                else _authenticate_actor(runtime, row, saved, principal, answer, dm)
             )
             if approval_selection.canonical_route(row, route_binding):
                 audited = row
@@ -959,7 +994,7 @@ async def _answer(
             request, runtime, client, factory, valkey, approval_id, snapshot, row,
             route_binding, approver_sets, principal.subject, actor_scope.channel,
             [caller, actor], {"invocation": saved, "approver": None}, saved,
-            decision=answer.decision,
+            decision=answer.decision, dm=dm,
         )
         return await _decide(composition, principal, answer, actor_scope)
     except ApprovalSettled:
@@ -1107,12 +1142,13 @@ async def check_http_approval_actor(
             ):
                 _refuse(403, "unsupported_approval")
             route_binding = await approvals_crud.get_approval_route_binding(session, row)
+            dm = await approver_dm.card(session, row)
             # Detached while fully loaded, so a rollback of this reader cannot
             # expire it: the capture refusal audit reads it as after a commit.
             session.expunge(row)
             if approval_selection.canonical_route(row, route_binding):
                 audited = (row, saved)
-            actor, association = _preserved_actor(runtime, row, saved)
+            actor, association = _preserved_actor(runtime, row, saved, dm)
             subject = await _prepare(
                 session, runtime, "approver", actor.registration, actor.source,
             )
@@ -1120,7 +1156,7 @@ async def check_http_approval_actor(
         composition = _Composition(
             request, runtime, client, factory, valkey, approval_id, snapshot, row,
             route_binding, approver_sets, actor.source.sender.native_id, actor.channel,
-            [subject], {"approver": association}, saved, preserved=True,
+            [subject], {"approver": association}, saved, preserved=True, dm=dm,
         )
         await composition.observe_and_apply()
         await composition.recheck()
@@ -1238,12 +1274,13 @@ def approved_resume_current(state: Any) -> ApprovedResumeInvokerAuthority:
                 ):
                     _refuse(403, "unsupported_approval")
                 route_binding = await approvals_crud.get_approval_route_binding(session, row)
+                dm = await approver_dm.card(session, row)
                 # Detached while fully loaded, so a rollback of this reader cannot
                 # expire it: the capture refusal audit reads it as after a commit.
                 session.expunge(row)
                 if approval_selection.canonical_route(row, route_binding):
                     audited = row
-                actor, association = _preserved_actor(runtime, row, saved)
+                actor, association = _preserved_actor(runtime, row, saved, dm)
                 try:
                     caller_registration, caller_source = turn_invocation_source(runtime, saved)
                 except HTTPException:
@@ -1259,7 +1296,7 @@ def approved_resume_current(state: Any) -> ApprovedResumeInvokerAuthority:
                 request, runtime, client, factory, valkey, approval_id, snapshot, row,
                 route_binding, state.approver_sets, actor.source.sender.native_id,
                 actor.channel, [caller, approver], {"invocation": saved, "approver": association},
-                saved, preserved=True,
+                saved, preserved=True, dm=dm,
             )
             # Phases 2 and 3: lookups and route membership outside SQL, then lifecycle.
             await composition.observe_and_apply()

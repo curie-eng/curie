@@ -234,7 +234,8 @@ def test_a_registration_with_another_creation_context_is_refused(
         {"dedupe_key": "synthetic-other-event-" + uuid.uuid4().hex},
         {"approval_id": str(uuid.uuid4())},
     ):
-        body = card_body(request, row["id"], card_identity=identity, **changes)
+        body = card_body(request, row["id"], card_identity=identity)
+        body.update(changes)
         refused_exactly(post_card(case.client, row["id"], body), 422, "invalid_approval_context")
         _unregistered(case, request)
     body = card_body(request, row["id"], card_identity=identity)

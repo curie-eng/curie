@@ -21,6 +21,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.sql.elements import ColumnElement
 
 from ..approval_schedule import resolve_route_schedule
+from ..approver_dm import dm_route
 from ..approvers import card_on_requesting_surface
 from ..models import (
     Agent,
@@ -389,6 +390,10 @@ def _approval_served(approval: Approval, targets: _ServedTargets) -> bool:
 
     An approval with no agent, or a route whose resolution is missing or
     malformed, is served by no adapter: fail closed.
+
+    An ``approver_dm`` route (ADR 0272) is neither: its card sits in one
+    selected approver's Slack DM, so no adapter lists or answers it, before or
+    after the card is registered. @spec APPROVER-DM-3.
     """
 
     if approval.agent_id is None:
@@ -402,6 +407,8 @@ def _approval_served(approval: Approval, targets: _ServedTargets) -> bool:
         if approval.route and isinstance(approval_routes, dict)
         else None
     )
+    if dm_route(binding) is not None:
+        return False
     if card_on_requesting_surface(approval, binding):
         asking = (
             approval.reply_kind,

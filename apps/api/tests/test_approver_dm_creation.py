@@ -52,6 +52,7 @@ from approver_dm_support import dm_case as dm_case
 from approver_ticket_support import APPROVER_A, APPROVER_B, ROUTE, agent_state, store_routes
 from curie_api import identity_fence, principal_authority
 from curie_api.config import get_settings
+from curie_api.identity import http_invocation
 from curie_api.schemas.http_identity import NamespaceV1
 from principal_adoption_support import selection
 from role_policy_support import run
@@ -505,11 +506,85 @@ def test_recipient_facts_already_expired_refuse(
     with monkeypatch.context() as patch:
         patch.setattr(approval_answer_support, "_observation", stale)
         response = create(case.client, request)
-    assert (response.status_code, response.json()) in {
+    assert (response.status_code, response.json()) in [
         (422, {"detail": "approver_dm_account_unresolved"}),
         (503, {"detail": "authority_unavailable"}),
         (503, {"detail": "identity_authority_unavailable"}),
-    }, response.text
+    ], response.text
     assert rows(request["approval"]["dedupe_key"]) == []
     assert nonce_uses(case.scope["agent"], payload["nonce"]) == 0
+    _created(case)
+
+
+class _AfterRecipientLookup(dict[str, Any]):
+    """The provider's roster, flagging when the caller phase's own lookup begins.
+
+    The recipient (``native``) is looked up first; the creation's original
+    requester is looked up after it. ``caller_began`` turns true on the first
+    roster read for any other account once the recipient was read.
+    @spec APPROVER-DM-1.
+    """
+
+    def __init__(self, roster: dict[str, Any], native: str) -> None:
+        super().__init__(roster)
+        self.native, self.recipient_read, self.caller_began = native, False, False
+
+    def get(self, key: str, default: Any = None) -> Any:  # type: ignore[override]
+        """@spec APPROVER-DM-1."""
+        if key == self.native:
+            self.recipient_read = True
+        elif self.recipient_read:
+            self.caller_began = True
+        return super().get(key, default)
+
+
+def _caller_phase_clock(
+    case: SimpleNamespace, monkeypatch: pytest.MonkeyPatch, *, jump: timedelta,
+) -> _AfterRecipientLookup:
+    """Move the facts clock ``jump`` ahead for the recipient's facts once the caller phase starts.
+
+    Only ``http_invocation.source_facts`` validation of the recipient's
+    account reads the shifted clock; the caller's own facts and the first
+    recipient validation see real time. No sleeping.
+    @spec APPROVER-DM-1.
+    """
+    hook = _AfterRecipientLookup(case.provider.roster, NATIVE_A)
+    case.provider.roster = hook
+    original = http_invocation.validate_lookup
+
+    def shifted(response: bytes, lookup: Any, limits: Any, *, now: datetime) -> Any:
+        """@spec APPROVER-DM-1."""
+        if lookup.scope.sender.native_id == NATIVE_A and hook.caller_began:
+            now = now + jump
+        return original(response, lookup, limits, now=now)
+
+    monkeypatch.setattr(http_invocation, "validate_lookup", shifted)
+    return hook
+
+
+def test_recipient_facts_expiring_during_the_caller_phase_refuse(
+    dm_case: SimpleNamespace, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """@spec APPROVER-DM-1: the writer revalidates the recipient facts against their window.
+
+    The recipient's facts are valid when looked up. The creation's own
+    original-requester lookup follows; by the time the identity writer runs,
+    the recipient's delivery window has closed (the facts clock reads ten
+    seconds later for that account, against a two second age limit). The
+    creation refuses 503 ``authority_unavailable``, stores no approval and
+    leaves the nonce unspent. With the clock unmoved the same request creates.
+    """
+    case = dm_case
+    configured_dm(case)
+    saved = case.provider.roster
+    request, payload = dm_request(case)
+    with monkeypatch.context() as patch:
+        hook = _caller_phase_clock(case, patch, jump=timedelta(seconds=10))
+        try:
+            response = create(case.client, request)
+        finally:
+            case.provider.roster = saved
+    assert hook.caller_began, "the caller phase never looked the requester up"
+    _refused_unavailable(case, request, payload, response)
+    # Liveness: the same shape with no clock movement creates.
     _created(case)

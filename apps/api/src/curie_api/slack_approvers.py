@@ -39,6 +39,7 @@ from pydantic import ValidationError
 from curie_api.schemas.approvals import ApprovalApprovers
 from curie_api.schemas.channels import EMAIL_KIND
 
+from .approver_dm import DmCard
 from .approvers import (
     ApproverSet,
     EmailApprovers,
@@ -222,13 +223,20 @@ class _FreshMembers:
         return membership
 
 
-def approval_token_identity(approval: Approval) -> str:
+def approval_token_identity(approval: Approval, dm: DmCard | None = None) -> str:
     """The Slack identity whose token resolves this approval's groups (ADR-0168 decision 5).
 
     The rule is ``aci_protocol.turn.slack_speaking_identity``, shared with the
     worker so the two cannot disagree about a route.
+
+    An approval with a registered approver-DM card (``dm``, loaded once by the
+    caller from ``approver_dm.card``) speaks through the identity recorded at
+    registration instead: its card, its answers and its group lookups all
+    belong to that bot, never the invocation's reply identity. @spec APPROVER-DM-3.
     """
 
+    if dm is not None:
+        return dm.identity
     kind = approval.reply_kind or ""
     return slack_speaking_identity(kind, approval.reply_adapter, approval.reply_endpoint)
 
@@ -266,9 +274,14 @@ class SlackApproverSetSelector:
         self._group_client = group_client
         self._identity_clients = dict(identity_clients or {})
 
-    def __call__(self, approval: Approval, binding: Any) -> ApproverSet:
+    def __call__(
+        self, approval: Approval, binding: Any, dm: DmCard | None = None,
+    ) -> ApproverSet:
         """Precedence, exactly as issue #420 states it: ``users`` wins over
         ``group``, which wins over channel membership. No I/O happens here.
+
+        ``dm`` is the approval's registered approver-DM card: a group is then
+        read through the DM identity's client (@spec APPROVER-DM-3).
 
         Channel membership is not the universal fallback it once was: an
         approval that named a route whose binding is absent is refused outright
@@ -341,7 +354,7 @@ class SlackApproverSetSelector:
             # real refusal: an assert is stripped under `python -O`, and the
             # line below would then bind a set to a group named None.
             return InvalidApprovers("approvers block declares neither users nor group")
-        identity = approval_token_identity(approval)
+        identity = approval_token_identity(approval, dm)
         if identity == DEFAULT_IDENTITY:
             return SlackUserGroupMembers(group, self._group_client)
         return SlackUserGroupMembers(
