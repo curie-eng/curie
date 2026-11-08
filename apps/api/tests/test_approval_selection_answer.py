@@ -593,6 +593,50 @@ def test_a_provider_outage_at_resume_leaves_resume_refused_rows(
     assert len(resume_refusals(row["id"])) == before + 2
 
 
+@pytest.mark.parametrize("cause", list(CAPTURE_FAILURES))
+def test_a_resume_check_refused_at_capture_on_a_canonical_route_is_audited(
+    selection_case: SimpleNamespace, cause: str,
+) -> None:
+    """@spec REQUEST-APPROVAL-5/6: a phase 1 refusal of a resume check keeps its status and is audited.
+
+    After the selected approver's answer, with the provider credential not
+    registered (503, reported ``unavailable``/``authority_unavailable``) or
+    the original invoker's agent paused (403, reported ``refuse``/
+    ``caller_not_allowed``), ``turn-authority/check`` and
+    ``approval-grant/check`` each refuse at the reader capture and each add
+    exactly one ``resume_refused`` row with stage ``capture`` and the public
+    status and detail. Once the cause is removed both checks continue.
+    """
+    case = selection_case
+    configured(case)
+    row = dynamic(case, (APPROVER_A,))
+    answered(case, row, NATIVE_A)
+    entry = published(case, row["id"])
+    assert turn_check(case, entry, row["id"]) == CONTINUE
+    assert grant_check(case, entry, row["id"]) == CONTINUE
+    before = len(resume_refusals(row["id"]))
+    status = CAPTURE_FAILURES[cause]
+    expected = ("unavailable", "authority_unavailable") if status == 503 else REFUSE
+
+    with _capture_failure(case, cause):
+        assert turn_check(case, entry, row["id"]) == expected
+        evidence = one_more_resume_refusal(row["id"], before, NATIVE_A)
+        assert (evidence["status"], evidence["detail"], evidence["stage"]) == (
+            status, FIXED[status], "capture",
+        ), evidence
+        assert grant_check(case, entry, row["id"]) == expected
+        evidence = one_more_resume_refusal(row["id"], before + 1, NATIVE_A)
+        assert (evidence["status"], evidence["detail"], evidence["stage"]) == (
+            status, FIXED[status], "capture",
+        ), evidence
+    fence_stable(case.valkey)
+
+    assert len(resume_refusals(row["id"])) == before + 2
+    assert turn_check(case, entry, row["id"]) == CONTINUE
+    assert grant_check(case, entry, row["id"]) == CONTINUE
+    assert len(resume_refusals(row["id"])) == before + 2
+
+
 # --- AC1.11: revocation after the answer refuses the resume --------------------------
 
 
