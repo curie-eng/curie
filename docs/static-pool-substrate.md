@@ -72,15 +72,16 @@ Each fenced turn records its claim and delivery lease before it starts. After
 that lease is first observed absent, `CURIE_ABANDONED_TURN_GRACE_S` allows
 90 seconds for cleanup, plus the maintenance cadence. Maintenance takes the
 thread lock and checks the exact claim again. Settling a delivery removes its
-watch; maintenance also discards watches whose event is terminal. An idle runner
-with deferred history from a completed delivery keeps its route and its existing
-workspace handoff fence. For unfinished deliveries, an idle runner with durable
-history keeps its route. An active, unreadable or non-durable runner is retired
-through the supervisor. Abandoned-turn retirement always quarantines the static
-shell after stopping its child and running cleanup. Its health endpoint returns
-503; capacity returns only after the platform replaces the shell. This recovery
-also applies to Docker and Kubernetes through their normal claim retirement paths. An unreachable shell stays leased until retirement can
-be confirmed.
+watch only after observing an idle runner with durable history, or confirming
+that its claim is gone. Otherwise the watch remains for maintenance, including
+when the delivery is terminal. An idle runner with durable history keeps its
+route. An active, unreadable or non-durable runner is retired through the
+supervisor. Retirement stops the child and verifies cleanup. If the runner
+settles before the supervisor checks it, the cleaned shell can be reused;
+otherwise the shell is quarantined and its health endpoint returns 503 until
+the platform replaces it. This recovery also applies to Docker and Kubernetes
+through their normal claim retirement paths. An unreachable shell stays leased
+until retirement can be confirmed.
 
 The runner-local `CURIE_RUNNER_CLEANUP_TIMEOUT_S` defaults to 30 seconds,
 matching the existing abandoned-turn drain window. Set it on shells through
@@ -103,9 +104,9 @@ then removes the exact predecessor watch before starting its replacement turn.
 A completed predecessor is recognized through the existing terminal ledger;
 other unfinished predecessors must still reach a durable handoff boundary.
 The runner retains whether its latest turn emitted a side effect in authenticated
-status. Recovery persists that marker before retiring the claim and checks it
-again after preflight, so an unacknowledged side effect escalates instead of
-replaying. Each failed retirement retains its watch for the next pass without
+status. Recovery persists that marker before retiring the claim or replacing
+an unfinished predecessor's watch for a follow-up. It checks the marker again
+after preflight, so an unacknowledged side effect escalates instead of replaying. Each failed retirement retains its watch for the next pass without
 preventing other maintenance.
 
 Known gap: turns started through the attachment handoff do not register a

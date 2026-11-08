@@ -1017,7 +1017,11 @@ async def _route_and_start(
                 predecessor = json.loads(previous)
                 if not await self._markers.is_terminal(
                     predecessor["event_id"]
-                ) and not await self._workspace_handoff_ready(handle, remaining_s=remaining_s):
+                ) and not await self._workspace_handoff_ready(
+                    handle,
+                    remaining_s=remaining_s,
+                    predecessor_event_id=predecessor["event_id"],
+                ):
                     raise failures.HandoffPending(
                         f"thread {thread_key} still has an unsettled leased turn"
                     )
