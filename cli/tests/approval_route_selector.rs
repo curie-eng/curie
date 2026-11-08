@@ -865,10 +865,9 @@ fn an_edited_route_that_holds_separation_keeps_it_and_its_exempt_group() {
         let mut want = held.clone();
         want["resolution"] = serde_json::json!({"kind": "slack", "address": expected_target});
         assert_eq!(sent[0]["approval_routes"][name], want, "{name}: {}", sent[0]);
-        assert_eq!(
-            sent[0]["approval_routes"]["deal_desk"],
-            plain_route("C0EXAMPLE5"),
-            "{name}: {}",
+        assert!(
+            sent[0]["approval_routes"].get("deal_desk").is_none(),
+            "{name}: an untouched plain route is not carried: {}",
             sent[0]
         );
         assert_eq!(sent[0][ROUTES_EXPECTED], 3, "{name}: {}", sent[0]);
