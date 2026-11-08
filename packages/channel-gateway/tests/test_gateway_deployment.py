@@ -211,3 +211,19 @@ def test_gateway_replay_storage_uses_the_chart_storage_class(specific):
         and item["metadata"]["name"] == "acme-curie-channel-gateway-replay"
     )
     assert claim["spec"]["storageClassName"] == (specific or "acme-platform-storage")
+
+
+def test_gateway_settings_accept_the_chart_default_literal_environment():
+    from curie_channel_gateway.slack.read_server import GatewayConfig
+
+    result = render("dispatcher.slack.botTokenExistingSecret=acme-slack")
+    assert result.returncode == 0, result.stderr
+    gateway = next(
+        item for item in yaml.safe_load_all(result.stdout)
+        if item and item["kind"] == "Deployment"
+        and item["metadata"]["name"] == "acme-curie-channel-gateway"
+    )
+    env = gateway["spec"]["template"]["spec"]["containers"][0]["env"]
+    config = GatewayConfig(**{entry["name"]: entry["value"] for entry in env if "value" in entry})
+    assert config.max_file_bytes == 33554432
+    assert config.port == 8081
