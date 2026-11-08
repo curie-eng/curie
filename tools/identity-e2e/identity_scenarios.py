@@ -1216,12 +1216,15 @@ def control_step(
             answered_progress_demo(texts),
             f"{first}'s progress-demo turn never answered `{PROGRESS_DEMO_ANSWER}`",
         )
-        claims = [claim["name"] for claim in harness.claims(agent, float(sent["sent_at"]) - 2)]
+        # A new delivery may replace the warm sandbox (its state token cannot
+        # cover the new turn), so the first human's turn can open a claim of
+        # its own. The second human, who steers into that live turn, must not.
+        claims = [claim["name"] for claim in harness.claims(agent, since)]
         seen["claims"] = claims
         check(
-            claims == [observed.get("claim")],
-            f"the conversation should run on its one claim {observed.get('claim')}; "
-            f"claims since its first send: {claims}",
+            len(claims) <= 1,
+            f"{second} got a claim of their own on a flag-off agent; claims since "
+            f"{first}'s send: {claims}",
         )
         pending = worker_messages(harness, since, PENDING_MESSAGE)
         seen["pending"] = pending

@@ -198,9 +198,10 @@ step stops the run (the evidence records it under `aborted`):
    sends a warm `[fake:connector-call]` turn, whose token carries no
    principal, so the conversation's sandbox is booted. Then A sends
    `[fake:progress-demo]` and B writes one second later, as in H4. Both turns
-   must be delivered, A's reply must include `all done`, the conversation
-   must have run on exactly one claim, and the worker must have logged no
-   `requester handoff pending`. B's turn must complete before A's, which
+   must be delivered, A's reply must include `all done`, at most one claim
+   may be created after A's send (A's new delivery may replace the warm
+   sandbox, but B never gets a claim of its own), and the worker must have
+   logged no `requester handoff pending`. B's turn must complete before A's, which
    shows ordinary steering folded B into A's live turn.
 
 H4 only proves something when B reaches the worker while A's turn is live. If
