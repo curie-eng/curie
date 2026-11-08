@@ -102,3 +102,13 @@ def test_protected_process_refuses_provider_credentials_and_implicit_http(
         product().load_process_settings(str(tmp_path))
     assert "private-sentinel" not in str(error.value)
     assert error.value.__context__ is None
+
+
+def test_image_upgrade_refuses_schema_one_process_settings(tmp_path):
+    settings = value()
+    settings["schema_version"] = 1
+    del settings["channel_gateway"]
+    settings["slack"] = {"token": "xoxb-PLACEHOLDER"}
+    (tmp_path / "process.json").write_bytes(canonical(settings))
+    with pytest.raises(product().WorkerBootstrapInvalid):
+        product().load_process_settings(str(tmp_path))

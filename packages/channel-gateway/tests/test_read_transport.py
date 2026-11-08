@@ -80,9 +80,9 @@ def test_group_transport_authentication_freshness_and_narrowing():
 
 
 def test_gateway_requires_tls_and_separate_credentials():
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError, match="credential and a TLS endpoint"):
         GatewayClient(httpx.AsyncClient(), "http://example.com", "credential")
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError, match="distinct non-blank caller credentials"):
         gateway_application(
             replay=RequestReplayStore(":memory:"), tokens={"api": "shared", "worker": "shared"}
         )
@@ -600,5 +600,123 @@ def test_api_freshness_policy_rejects_revoked_cached_members(max_age_s):
                 await server.close()
                 verdict = await approvers.contains("U0EXAMPLE1", None)
                 assert not verdict.member and verdict.undetermined
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("best_effort", [False, True])
+def test_gateway_connection_failure_never_drops_a_reply(best_effort):
+    from channel_protocol import OutboundMessage, ReplyPost, ReplyTarget
+    from curie_channel_gateway.gateway_reply import GatewayReplyRoute, GatewayReplySink
+    from curie_channel_gateway.read_transport import GatewayUnavailableError
+
+    async def scenario():
+        server = TestServer(
+            gateway_application(
+                tokens={"api": "api", "worker": "worker"},
+                replay=RequestReplayStore(":memory:"),
+                allow_insecure_http=True,
+            )
+        )
+        await server.start_server()
+        endpoint = str(server.make_url(""))
+        await server.close()
+        sink = GatewayReplySink(endpoint, "worker", allow_insecure_http=True)
+        event = ReplyPost(
+            version="1.0",
+            event="reply.post",
+            target=ReplyTarget(
+                kind="slack", address="C0EXAMPLE1", conversation_id="thread", reply_ref=None
+            ),
+            message=OutboundMessage(version="1.0", text="resumed answer"),
+            requested_by="U0EXAMPLE1",
+        )
+        try:
+            with pytest.raises(GatewayUnavailableError, match="gateway unavailable"):
+                await sink.emit(
+                    event, route=GatewayReplyRoute(), best_effort_unreachable=best_effort
+                )
+        finally:
+            await sink.aclose()
+
+    asyncio.run(scenario())
+
+
+def test_file_reads_refuse_concurrent_buffers_and_release_capacity():
+    import threading
+
+    async def scenario():
+        entered = asyncio.Event()
+        release = threading.Event()
+        loop = asyncio.get_running_loop()
+        calls = []
+
+        class Files:
+            def fetch(self, file_id):
+                calls.append(file_id)
+                loop.call_soon_threadsafe(entered.set)
+                assert release.wait(5)
+                yield b"content"
+
+        app = gateway_application(
+            tokens={"api": "api", "worker": "worker"},
+            replay=RequestReplayStore(":memory:"),
+            files={"default": Files()},
+            allow_insecure_http=True,
+        )
+        async with TestServer(app) as server, httpx.AsyncClient() as http:
+            url = str(server.make_url("/v1/gateway/default/fetch/F0EXAMPLE1"))
+
+            async def get():
+                return await http.get(url, headers=request_headers("worker", "GET", url))
+
+            first = asyncio.create_task(get())
+            try:
+                await asyncio.wait_for(entered.wait(), 2)
+                refused = await get()
+                assert refused.status_code == 503
+                assert refused.json() == {"error": "file_capacity_exhausted"}
+                assert len(calls) == 1
+            finally:
+                release.set()
+                response = await first
+            assert response.status_code == 200 and response.content == b"content"
+            assert (await get()).content == b"content"
+            assert len(calls) == 2
+
+    asyncio.run(scenario())
+
+
+def test_file_capacity_is_held_until_a_slow_receiver_drains():
+    from curie_channel_gateway.read_transport import MAX_FILE_BYTES
+
+    async def scenario():
+        calls = []
+
+        class Files:
+            def fetch(self, file_id):
+                calls.append(file_id)
+                for _ in range(MAX_FILE_BYTES // 65536):
+                    yield b"x" * 65536
+
+        app = gateway_application(
+            tokens={"api": "api", "worker": "worker"},
+            replay=RequestReplayStore(":memory:"),
+            files={"default": Files()},
+            allow_insecure_http=True,
+        )
+        async with TestServer(app) as server, httpx.AsyncClient() as http:
+            url = str(server.make_url("/v1/gateway/default/fetch/F0EXAMPLE1"))
+            async with http.stream(
+                "GET", url, headers=request_headers("worker", "GET", url)
+            ) as first:
+                assert first.status_code == 200
+                refused = await http.get(url, headers=request_headers("worker", "GET", url))
+                assert refused.status_code == 503
+                assert calls == ["F0EXAMPLE1"]
+                size = 0
+                async for chunk in first.aiter_bytes():
+                    size += len(chunk)
+                assert size == MAX_FILE_BYTES
 
     asyncio.run(scenario())

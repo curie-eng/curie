@@ -9,12 +9,11 @@ from channel_protocol import ReplyAck, ReplyEvent
 from pydantic import TypeAdapter, ValidationError
 
 from .http_reply import GATEWAY_CLIENT_TIMEOUT_S
-from .read_transport import GatewayError, gateway_error, validate_endpoint
+from .read_transport import GatewayError, GatewayUnavailableError, gateway_error, validate_endpoint
 from .reply_delivery import UNREACHABLE_ACK_HEADER
 from .reply_errors import (
     IndeterminateReplyDeliveryError,
     MissingAdapterCredentialError,
-    ProviderReplyUnreachableError,
     ReplyPayloadTooLargeError,
     reply_error_from,
 )
@@ -97,11 +96,9 @@ class GatewayReplySink:
                 )
         except httpx.TimeoutException:
             raise IndeterminateReplyDeliveryError("reply_delivery_indeterminate") from None
-        except httpx.ConnectError:
-            if best_effort_unreachable:
-                return BestEffortUnreachableAck(ref=None)
-            raise ProviderReplyUnreachableError("reply_provider_unreachable") from None
-        except (httpx.HTTPError, ValidationError, json.JSONDecodeError):
+        except httpx.HTTPError:
+            raise GatewayUnavailableError("gateway unavailable") from None
+        except (ValidationError, json.JSONDecodeError):
             raise GatewayError("gateway reply unavailable") from None
 
 

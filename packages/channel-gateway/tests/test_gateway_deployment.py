@@ -84,6 +84,12 @@ def test_gateway_chart_clients_match_the_listener(tls_secret, allow_http, scheme
             entry["value"] for entry in env if entry["name"] == "CURIE_CHANNEL_GATEWAY_URL"
         )
         assert endpoint == f"{scheme}://acme-curie-channel-gateway:8081"
+        insecure = next(
+            entry["value"]
+            for entry in env
+            if entry["name"] == "CURIE_CHANNEL_GATEWAY_ALLOW_INSECURE"
+        )
+        assert insecure == str(scheme == "http").lower()
     listener = deployments["acme-curie-channel-gateway"]["spec"]["template"]["spec"]["containers"][
         0
     ]
@@ -99,3 +105,41 @@ def test_compose_only_provider_services_hold_slack_tokens():
         names = set(env) if isinstance(env, dict) else {item.split("=", 1)[0] for item in env}
         assert not {"SLACK_BOT_TOKEN", "SLACK_APP_TOKEN", "SLACK_USER_TOKEN"} & names
         assert "CURIE_CHANNEL_GATEWAY_TOKEN" in names
+
+
+@pytest.mark.parametrize("identity", ["inline", "reference", "listed"])
+def test_slack_upgrade_requires_a_gateway(identity):
+    settings = {
+        "inline": [
+            "dispatcher.slack.botToken=xoxb-PLACEHOLDER",
+            "dispatcher.slack.appToken=xapp-PLACEHOLDER",
+        ],
+        "reference": ["dispatcher.slack.botTokenExistingSecret=acme-slack"],
+        "listed": [
+            "dispatcher.slack.identities[0].name=default",
+            "dispatcher.slack.identities[0].botTokenExistingSecret=acme-slack",
+            "dispatcher.slack.identities[0].appTokenExistingSecret=acme-slack",
+        ],
+    }[identity]
+    result = render(*settings)
+    assert result.returncode != 0
+    assert "Slack identities require channelGateway.deploy or channelGateway.url" in result.stderr
+    assert render(*settings, "channelGateway.url=https://gateway.example.com").returncode == 0
+    assert (
+        render(
+            *settings, "channelGateway.deploy=true", "channelGateway.tlsSecret=acme-tls"
+        ).returncode
+        == 0
+    )
+
+
+@pytest.mark.parametrize("deploy", [False, True])
+def test_gateway_tls_secret_rejects_an_explicit_http_url(deploy):
+    result = render(
+        f"channelGateway.deploy={str(deploy).lower()}",
+        "channelGateway.tlsSecret=acme-tls",
+        "channelGateway.allowInsecure=true",
+        "channelGateway.url=http://gateway.example.com",
+    )
+    assert result.returncode != 0
+    assert "channelGateway.url must use https when channelGateway.tlsSecret is set" in result.stderr
