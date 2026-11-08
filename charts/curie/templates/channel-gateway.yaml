@@ -80,7 +80,7 @@ spec:
             - name: CURIE_SLACK_TRUSTED_ORIGINS
               value: {{ .Values.worker.slackTrustedOrigins | quote }}
             - name: CURIE_CHANNEL_GATEWAY_MAX_FILE_BYTES
-              value: {{ .Values.worker.attachments.maxFileBytes | quote }}
+              value: {{ .Values.worker.attachments.maxFileBytes | int64 | quote }}
             - name: SLACK_USERGROUP_CACHE_TTL_S
               value: {{ $gateway.groupCacheTtlSeconds | quote }}
             {{- range $caller := list "api" "worker" }}
