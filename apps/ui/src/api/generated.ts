@@ -4924,6 +4924,8 @@ export interface components {
             approval_routes?: {
                 [key: string]: components["schemas"]["ApprovalRouteBinding"];
             } | null;
+            /** Approval Routes Expected Version */
+            approval_routes_expected_version?: number | null;
             /** Connector Requester Identity */
             connector_requester_identity?: boolean | null;
             /** Connector Requester Identity Expected Version */
@@ -5575,27 +5577,55 @@ export interface components {
          *     ``notification`` may make the pending request visible elsewhere, but its
          *     message carries no interaction. ``approvers`` continues to narrow WHO may
          *     act through the resolution card path and is never inferred from notification
-         *     recipients.
+         *     recipients. ``approver_ticket`` registers a per-request approver selector and
+         *     ``separation`` its requester exclusion (ADR 0271).
          */
         ApprovalRouteBinding: {
+            approver_ticket?: components["schemas"]["ApproverTicketRegistration"] | null;
             approvers?: components["schemas"]["ApprovalApprovers"] | null;
             /** Expires In Seconds */
             expires_in_seconds?: number | null;
             notification?: components["schemas"]["ApprovalNotificationTarget"] | null;
             /** Resolution */
             resolution: components["schemas"]["ApprovalResolutionTarget"] | components["schemas"]["ApprovalRequestingSurfaceTarget"];
+            separation?: components["schemas"]["ApprovalSeparation"] | null;
         };
         /**
          * ApprovalRouteBindingOut
          * @description The required resolution plus optional, redacted visibility policy.
+         *
+         *     ``approver_ticket`` and ``separation`` are omitted, not null, on a route
+         *     without a selector, so every existing route reads back exactly as before.
          */
         ApprovalRouteBindingOut: {
+            approver_ticket?: components["schemas"]["ApproverTicketOut"] | null;
             approvers?: components["schemas"]["ApprovalApproversOut"] | null;
             /** Expires In Seconds */
             expires_in_seconds?: number | null;
             notification?: components["schemas"]["ApprovalTargetOut"] | null;
             /** Resolution */
             resolution: components["schemas"]["ApprovalTargetOut"] | components["schemas"]["ApprovalRequestingSurfaceTargetOut"];
+            separation?: components["schemas"]["ApprovalSeparationOut"] | null;
+        };
+        /**
+         * ApprovalSeparation
+         * @description Requester exclusion for a registered selector route (ADR 0271).
+         *
+         *     Omitted on write stores ``{"exclude_requester": true}``; ``false`` is the
+         *     audited opt-out. ``exempt_group`` lands with its enforcement (0271b), so it
+         *     is refused here rather than stored unenforced.
+         */
+        ApprovalSeparation: {
+            /** Exclude Requester */
+            exclude_requester: boolean;
+        };
+        /**
+         * ApprovalSeparationOut
+         * @description Read projection of the stored, effective requester exclusion.
+         */
+        ApprovalSeparationOut: {
+            /** Exclude Requester */
+            exclude_requester?: boolean | null;
         };
         /**
          * ApprovalTargetOut
@@ -5610,6 +5640,90 @@ export interface components {
             address: string;
             /** Kind */
             kind: string;
+        };
+        /**
+         * ApproverTicketCeiling
+         * @description The operator ceiling a selector chooses inside (ADR 0271 decision 1).
+         *
+         *     ``approver_role_version`` names the agent access-policy version whose
+         *     approver role the operator approves. ``approver_role`` is server-owned: the
+         *     platform pins that role's canonical JSON on write and returns it on
+         *     readback, and a write may echo it back unchanged or omit it.
+         */
+        ApproverTicketCeiling: {
+            /** Approver Role */
+            approver_role?: string | null;
+            /** Approver Role Version */
+            approver_role_version: number;
+            /** Users */
+            users?: components["schemas"]["ApproverTicketCeilingUser"][] | null;
+        };
+        /**
+         * ApproverTicketCeilingOut
+         * @description Read projection of a registration ceiling, including the server-owned pin.
+         */
+        ApproverTicketCeilingOut: {
+            /** Approver Role */
+            approver_role?: string | null;
+            /** Approver Role Version */
+            approver_role_version?: number | null;
+            /** Users */
+            users?: components["schemas"]["ApproverTicketCeilingUserOut"][] | null;
+        };
+        /**
+         * ApproverTicketCeilingUser
+         * @description One exact canonical person the operator allows inside the pinned role.
+         */
+        ApproverTicketCeilingUser: {
+            /** Issuer */
+            issuer: string;
+            /** Subject */
+            subject: string;
+        };
+        /**
+         * ApproverTicketCeilingUserOut
+         * @description Read projection of one ceiling user; tolerant for repair.
+         */
+        ApproverTicketCeilingUserOut: {
+            /** Issuer */
+            issuer?: string | null;
+            /** Subject */
+            subject?: string | null;
+        };
+        /**
+         * ApproverTicketOut
+         * @description Read projection of a selector registration (ADR 0271). The public key is
+         *     public material and reads back so a readback can be written back.
+         */
+        ApproverTicketOut: {
+            ceiling?: components["schemas"]["ApproverTicketCeilingOut"] | null;
+            /** Connector */
+            connector?: string | null;
+            /** Key Id */
+            key_id?: string | null;
+            /** Public Key */
+            public_key?: string | null;
+            /** Tool */
+            tool?: string | null;
+        };
+        /**
+         * ApproverTicketRegistration
+         * @description A selector registered on one approval route (ADR 0271 decision 1).
+         *
+         *     One hosted connector and one exact upstream tool, the Ed25519 public key
+         *     (unpadded base64url of 32 bytes) and key id its tickets are verified with,
+         *     and the mandatory ceiling. The private key never reaches the platform.
+         */
+        ApproverTicketRegistration: {
+            ceiling: components["schemas"]["ApproverTicketCeiling"];
+            /** Connector */
+            connector: string;
+            /** Key Id */
+            key_id: string;
+            /** Public Key */
+            public_key: string;
+            /** Tool */
+            tool: string;
         };
         /**
          * Attachment

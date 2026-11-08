@@ -57,7 +57,8 @@ def test_candidate_does_not_rewrite_released_windows() -> None:
     # Workspace recovery reads require the 0141 outcome ledger.
     # 0149 stores webhook provenance and a wake-key generation.
     # @spec CONNECTOR-REQUESTER-1: agent ORM reads require the 0151 requester columns.
-    candidate = {"schema_min": "0152", "schema_head": "0152"}
+    # Approval ORM reads require the 0153 dynamic approval selection columns.
+    candidate = {"schema_min": "0153", "schema_head": "0153"}
     assert catalog["windows"]["0.12.0"] == released
     assert catalog["windows"]["0.12.0-rc.1"] == released
     assert catalog["windows"]["0.12.1"] == stable
@@ -65,7 +66,7 @@ def test_candidate_does_not_rewrite_released_windows() -> None:
     assert catalog["windows"]["0.12.3"] == {"schema_min": "0076", "schema_head": "0093"}
     assert catalog["candidate"] == candidate
     assert catalog["windows"]["0.13.0"] == released_0130
-    assert catalog["revisions"][-35:] == [
+    assert catalog["revisions"][-36:] == [
         "0095",
         "0096",
         "0097",
@@ -101,6 +102,7 @@ def test_candidate_does_not_rewrite_released_windows() -> None:
         "0149",
         "0151",
         "0152",
+        "0153",
     ]
     assert "0074" not in catalog["revisions"]
     prior_windows = json.loads(

@@ -498,6 +498,52 @@ def _requester_identity_write_shape(update: "AgentUpdate") -> "AgentUpdate":
     return update
 
 
+ROUTES_EXPECTED_VERSION = "approval_routes_expected_version"
+
+
+def _routes_expected_version_shape(update: "AgentUpdate") -> "AgentUpdate":
+    """The route map's expected configuration version travels only with it.
+
+    ADR 0271 decision 1: a selector route write compare-and-sets on
+    ``connector_requester_identity_version``. For the same reason as the flag
+    write above, nothing but ``approval_routes`` may share that PATCH: every
+    other field block commits on its own, so a sibling field could persist from
+    a request whose route write lost the compare-and-set. Explicit null is the
+    same as omitting it.
+    """
+
+    if update.approval_routes_expected_version is None:
+        return update
+    if update.approval_routes is None:
+        raise ValueError(
+            "approval_routes_expected_version is sent only with the approval_routes it guards"
+        )
+    if update.model_fields_set - {"approval_routes", ROUTES_EXPECTED_VERSION}:
+        raise ValueError(
+            "approval_routes_write_must_be_alone: send approval_routes and "
+            "approval_routes_expected_version in a PATCH of their own"
+        )
+    return update
+
+
+def _no_selector_at_creation(
+    value: "dict[str, ApprovalRouteBinding] | None",
+) -> "dict[str, ApprovalRouteBinding] | None":
+    """No approver_ticket on AgentCreate (ADR 0271 decision 1).
+
+    A new agent's requester identity flag is off, and a selector needs it on,
+    so a registration here could only ever be refused later at its first use.
+    """
+
+    if value is not None and any(b.approver_ticket is not None for b in value.values()):
+        raise ValueError(
+            "approver_ticket cannot be registered when an agent is created: the "
+            "agent's connector_requester_identity flag starts off. Create the agent, "
+            "enable the flag, then register the selector with PATCH approval_routes"
+        )
+    return value
+
+
 def _validate_publication_policy_value(value: str | None) -> str | None:
     if value is None:
         return None
@@ -569,6 +615,7 @@ class AgentCreate(BaseModel):
     _check_thinking = field_validator("thinking")(validate_thinking_override)
     _check_approval_tools = field_validator("approval_required_tools")(_validate_tool_names)
     _check_approval_routes = field_validator("approval_routes")(_validate_route_names)
+    _no_selector = field_validator("approval_routes")(_no_selector_at_creation)
     _check_secrets = field_validator("secrets")(_validate_secret_map)
     _check_hook_partitions = field_validator("hook_partitions")(_validate_hook_partitions)
     _check_source_bindings = field_validator("source_bindings")(_validate_source_bindings)
@@ -664,6 +711,13 @@ class AgentUpdate(BaseModel):
     connector_requester_identity_expected_version: (
         Annotated[int, Field(strict=True, ge=1, le=MAX_REQUESTER_IDENTITY_EXPECTED_VERSION)] | None
     ) = None
+    # The shared configuration version (ADR 0271 decision 1) the route map
+    # replacement expects: required when the stored or proposed map carries an
+    # ``approver_ticket`` selector, compared whenever sent, and sent only with
+    # ``approval_routes``.
+    approval_routes_expected_version: (
+        Annotated[int, Field(strict=True, ge=1, le=MAX_REQUESTER_IDENTITY_EXPECTED_VERSION)] | None
+    ) = None
 
     _check_reviewer_model = field_validator("reviewer_model")(
         nullable_override_validator("reviewer_model", "a reviewer model id like 'claude-opus-5-5'")
@@ -688,6 +742,7 @@ class AgentUpdate(BaseModel):
     _reject_retired_channel_key = model_validator(mode="before")(_reject_retired_update_binding_key)
     _reject_null_publication = model_validator(mode="before")(_reject_null_publication_switches)
     _requester_identity_alone = model_validator(mode="after")(_requester_identity_write_shape)
+    _routes_expected_version_alone = model_validator(mode="after")(_routes_expected_version_shape)
 
 
 class AgentOut(BaseModel):

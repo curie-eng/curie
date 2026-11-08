@@ -67,7 +67,8 @@ CONTRACT = "0041"
 # The 0145 join requires both the stable deadline backport (0140) and 0144.
 # The UI evidence tables and deleted-issue cancellation meet at 0148.
 # @spec CONNECTOR-REQUESTER-1: agent ORM reads require the 0151 columns.
-APP_SCHEMA_MIN = "0152"
+# Approval ORM reads require the 0153 dynamic approval selection columns.
+APP_SCHEMA_MIN = "0153"
 REVIEW_SCHEMA_MIN = "0063"
 PREV = "0040"
 
@@ -177,6 +178,7 @@ def test_upgrade_from_either_train_applies_the_missing_sibling_and_preserves_row
             "0149",
             "0151",
             "0152",
+            "0153",
         } <= pending
         assert not pending & {"0091", "0092", "0093"}
     else:
@@ -216,8 +218,9 @@ def test_upgrade_from_either_train_applies_the_missing_sibling_and_preserves_row
             "0149",
             "0151",
             "0152",
+            "0153",
         }
-    assert current_revision() == "0152"
+    assert current_revision() == "0153"
     assert sql_rows("SELECT name FROM curie.agents WHERE id=:id", {"id": agent_id}) == [
         ("merge-example",)
     ]
@@ -317,8 +320,9 @@ def test_agent_reads_refuse_the_schema_before_deploy_notification_expand() -> No
     # also requires the stable deadline backport (0140). The 0148 join
     # includes UI evidence and deleted-issue cancellation.
     # 0149 stores webhook provenance and a wake-key generation. Agent ORM
-    # reads require the 0151 connector requester identity columns.
-    for revision in sorted(known - {"0152"}):
+    # reads require the 0151 connector requester identity columns, and
+    # Approval ORM reads require the 0153 approval selection columns.
+    for revision in sorted(known - {"0153"}):
         assert can_serve(revision, window, known) is False
     assert can_serve("0140", window, known) is False
     assert can_serve("0141", window, known) is False
@@ -330,7 +334,7 @@ def test_agent_reads_refuse_the_schema_before_deploy_notification_expand() -> No
     assert can_serve("0148", window, known) is False
     assert can_serve("0149", window, known) is False
     assert can_serve("0151", window, known) is False
-    assert can_serve("0152", window, known) is True
+    assert can_serve("0153", window, known) is True
 
 
 def test_planner_refuses_irreversible_before_mutation() -> None:

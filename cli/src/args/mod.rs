@@ -97,7 +97,7 @@ pub(crate) struct RequesterIdentityArgs {
             "gate", "clear", "list", "resolve", "reject", "note",
             "mint_operator_principal", "mint_remediation_principal", "mint_console_login_code",
             "route_resolution", "route_approvers", "routes_from", "list_routes", "clear_routes",
-            "report_identity", "recover", "reason", "recovery_key",
+            "report_identity", "recover", "reason", "recovery_key", "routes_expected_version",
         ]
     )]
     pub(crate) requester_identity: Option<commands::RequesterIdentityMode>,
@@ -111,6 +111,22 @@ pub(crate) struct RequesterIdentityArgs {
         value_parser = clap::value_parser!(u64).range(1..)
     )]
     pub(crate) expected_version: Option<u64>,
+}
+
+/// The route-write compare-and-set version on `<tier> approvals` (ADR 0271).
+/// Valid only beside a route write flag; the command refuses it otherwise.
+#[derive(Args, Debug, Clone, Default)]
+pub(crate) struct ApprovalRoutesVersionArgs {
+    /// The connector requester identity version a route write compares
+    /// against, as `--requester-identity show` reports it. Omit to use the
+    /// version read from the agent in the same command. Only valid with
+    /// --route-resolution, --route-approvers, --routes-from or --clear-routes.
+    #[arg(
+        long = "routes-expected-version",
+        value_name = "N",
+        value_parser = clap::value_parser!(u64).range(1..)
+    )]
+    pub(crate) routes_expected_version: Option<u64>,
 }
 
 #[derive(Args, Debug, Clone)]

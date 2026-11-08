@@ -1601,6 +1601,19 @@
             ],
             "title": "Approval Routes"
           },
+          "approval_routes_expected_version": {
+            "anyOf": [
+              {
+                "maximum": 2147483646.0,
+                "minimum": 1.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Approval Routes Expected Version"
+          },
           "connector_requester_identity": {
             "anyOf": [
               {
@@ -3335,8 +3348,18 @@
       },
       "ApprovalRouteBinding": {
         "additionalProperties": false,
-        "description": "One strict workspace binding for a declared approval route (#1460).\n\n``resolution`` is the single verified-identity action surface: a fixed\nSlack channel, or the conversation that asked (ADR-0177).\n``notification`` may make the pending request visible elsewhere, but its\nmessage carries no interaction. ``approvers`` continues to narrow WHO may\nact through the resolution card path and is never inferred from notification\nrecipients.",
+        "description": "One strict workspace binding for a declared approval route (#1460).\n\n``resolution`` is the single verified-identity action surface: a fixed\nSlack channel, or the conversation that asked (ADR-0177).\n``notification`` may make the pending request visible elsewhere, but its\nmessage carries no interaction. ``approvers`` continues to narrow WHO may\nact through the resolution card path and is never inferred from notification\nrecipients. ``approver_ticket`` registers a per-request approver selector and\n``separation`` its requester exclusion (ADR 0271).",
         "properties": {
+          "approver_ticket": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ApproverTicketRegistration"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
           "approvers": {
             "anyOf": [
               {
@@ -3380,6 +3403,16 @@
               }
             ],
             "title": "Resolution"
+          },
+          "separation": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ApprovalSeparation"
+              },
+              {
+                "type": "null"
+              }
+            ]
           }
         },
         "required": [
@@ -3389,8 +3422,18 @@
         "type": "object"
       },
       "ApprovalRouteBindingOut": {
-        "description": "The required resolution plus optional, redacted visibility policy.",
+        "description": "The required resolution plus optional, redacted visibility policy.\n\n``approver_ticket`` and ``separation`` are omitted, not null, on a route\nwithout a selector, so every existing route reads back exactly as before.",
         "properties": {
+          "approver_ticket": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ApproverTicketOut"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
           "approvers": {
             "anyOf": [
               {
@@ -3432,12 +3475,55 @@
               }
             ],
             "title": "Resolution"
+          },
+          "separation": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ApprovalSeparationOut"
+              },
+              {
+                "type": "null"
+              }
+            ]
           }
         },
         "required": [
           "resolution"
         ],
         "title": "ApprovalRouteBindingOut",
+        "type": "object"
+      },
+      "ApprovalSeparation": {
+        "additionalProperties": false,
+        "description": "Requester exclusion for a registered selector route (ADR 0271).\n\nOmitted on write stores ``{\"exclude_requester\": true}``; ``false`` is the\naudited opt-out. ``exempt_group`` lands with its enforcement (0271b), so it\nis refused here rather than stored unenforced.",
+        "properties": {
+          "exclude_requester": {
+            "title": "Exclude Requester",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "exclude_requester"
+        ],
+        "title": "ApprovalSeparation",
+        "type": "object"
+      },
+      "ApprovalSeparationOut": {
+        "description": "Read projection of the stored, effective requester exclusion.",
+        "properties": {
+          "exclude_requester": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Exclude Requester"
+          }
+        },
+        "title": "ApprovalSeparationOut",
         "type": "object"
       },
       "ApprovalTargetOut": {
@@ -3457,6 +3543,238 @@
           "address"
         ],
         "title": "ApprovalTargetOut",
+        "type": "object"
+      },
+      "ApproverTicketCeiling": {
+        "additionalProperties": false,
+        "description": "The operator ceiling a selector chooses inside (ADR 0271 decision 1).\n\n``approver_role_version`` names the agent access-policy version whose\napprover role the operator approves. ``approver_role`` is server-owned: the\nplatform pins that role's canonical JSON on write and returns it on\nreadback, and a write may echo it back unchanged or omit it.",
+        "properties": {
+          "approver_role": {
+            "anyOf": [
+              {
+                "minLength": 2,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Approver Role"
+          },
+          "approver_role_version": {
+            "maximum": 2147483647.0,
+            "minimum": 1.0,
+            "title": "Approver Role Version",
+            "type": "integer"
+          },
+          "users": {
+            "anyOf": [
+              {
+                "items": {
+                  "$ref": "#/components/schemas/ApproverTicketCeilingUser"
+                },
+                "maxItems": 128,
+                "minItems": 1,
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Users"
+          }
+        },
+        "required": [
+          "approver_role_version"
+        ],
+        "title": "ApproverTicketCeiling",
+        "type": "object"
+      },
+      "ApproverTicketCeilingOut": {
+        "description": "Read projection of a registration ceiling, including the server-owned pin.",
+        "properties": {
+          "approver_role": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Approver Role"
+          },
+          "approver_role_version": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Approver Role Version"
+          },
+          "users": {
+            "anyOf": [
+              {
+                "items": {
+                  "$ref": "#/components/schemas/ApproverTicketCeilingUserOut"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Users"
+          }
+        },
+        "title": "ApproverTicketCeilingOut",
+        "type": "object"
+      },
+      "ApproverTicketCeilingUser": {
+        "additionalProperties": false,
+        "description": "One exact canonical person the operator allows inside the pinned role.",
+        "properties": {
+          "issuer": {
+            "title": "Issuer",
+            "type": "string"
+          },
+          "subject": {
+            "title": "Subject",
+            "type": "string"
+          }
+        },
+        "required": [
+          "issuer",
+          "subject"
+        ],
+        "title": "ApproverTicketCeilingUser",
+        "type": "object"
+      },
+      "ApproverTicketCeilingUserOut": {
+        "description": "Read projection of one ceiling user; tolerant for repair.",
+        "properties": {
+          "issuer": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Issuer"
+          },
+          "subject": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Subject"
+          }
+        },
+        "title": "ApproverTicketCeilingUserOut",
+        "type": "object"
+      },
+      "ApproverTicketOut": {
+        "description": "Read projection of a selector registration (ADR 0271). The public key is\npublic material and reads back so a readback can be written back.",
+        "properties": {
+          "ceiling": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ApproverTicketCeilingOut"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "connector": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Connector"
+          },
+          "key_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Key Id"
+          },
+          "public_key": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Public Key"
+          },
+          "tool": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Tool"
+          }
+        },
+        "title": "ApproverTicketOut",
+        "type": "object"
+      },
+      "ApproverTicketRegistration": {
+        "additionalProperties": false,
+        "description": "A selector registered on one approval route (ADR 0271 decision 1).\n\nOne hosted connector and one exact upstream tool, the Ed25519 public key\n(unpadded base64url of 32 bytes) and key id its tickets are verified with,\nand the mandatory ceiling. The private key never reaches the platform.",
+        "properties": {
+          "ceiling": {
+            "$ref": "#/components/schemas/ApproverTicketCeiling"
+          },
+          "connector": {
+            "title": "Connector",
+            "type": "string"
+          },
+          "key_id": {
+            "title": "Key Id",
+            "type": "string"
+          },
+          "public_key": {
+            "title": "Public Key",
+            "type": "string"
+          },
+          "tool": {
+            "title": "Tool",
+            "type": "string"
+          }
+        },
+        "required": [
+          "connector",
+          "tool",
+          "key_id",
+          "public_key",
+          "ceiling"
+        ],
+        "title": "ApproverTicketRegistration",
         "type": "object"
       },
       "Attachment": {

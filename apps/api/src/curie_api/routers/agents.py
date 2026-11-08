@@ -48,7 +48,7 @@ from curie_api.schemas.channels import (
 from curie_api.schemas.deployments import ConnectorManifests
 from curie_api.schemas.versions import BundleFile, BundleFiles, VersionCreate, VersionOut
 
-from .. import bundles, deploy, hook_signing
+from .. import approver_tickets, bundles, deploy, hook_signing
 from ..action_forward import RESTORE_TOOL
 from ..auth import require_api_key
 from ..config import get_settings
@@ -366,7 +366,21 @@ async def update_agent(
     # single fetch.
     if data.approval_routes is not None:
         proposed = {name: b.model_dump() for name, b in data.approval_routes.items()}
-        for version in await crud_deployments.list_active_deployment_versions(session, agent_id):
+        # ADR 0271 decision 1: refuse a selector write early, before any field
+        # commits; `update_agent_approval_routes` repeats the version checks
+        # under the agent row lock, where they are authoritative.
+        _preflight_selector_write(agent, data, proposed)
+        versions = await crud_deployments.list_active_deployment_versions(session, agent_id)
+        if not versions and approver_tickets.has_selector(proposed):
+            raise HTTPException(
+                status.HTTP_422_UNPROCESSABLE_ENTITY,
+                {
+                    "code": approver_tickets.NO_SERVING_BUNDLE,
+                    "message": "an approver_ticket registration needs at least one active "
+                    "deployment whose bundle gates the registered connector tool on its route",
+                },
+            )
+        for version in versions:
             try:
                 await deploy.check_approval_route_bindings(store, version, proposed)
             except deploy.BundleTooLarge as exc:
@@ -380,6 +394,10 @@ async def update_agent(
                 raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, str(exc)) from exc
             except deploy.ApprovalRoutesUnbound as exc:
                 raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, str(exc)) from exc
+            except approver_tickets.BundleGateMismatch as exc:
+                raise HTTPException(
+                    status.HTTP_422_UNPROCESSABLE_ENTITY, {"code": exc.code, "message": str(exc)}
+                ) from exc
     # Same preflight shape (#3209). The helpers below each commit on their own,
     # so a quota refusal after `model` or `thinking` would persist those fields
     # on a request this handler answered 422.
@@ -439,11 +457,15 @@ async def update_agent(
         # Only the write: the preflight at the top of this handler has already
         # judged this same map against every active deployment's declared routes
         # (#2436), because by here four other fields are already committed.
-        agent = await crud_agents.update_agent_approval_routes(
-            session,
-            agent,
-            {name: b.model_dump() for name, b in data.approval_routes.items()},
-        )
+        try:
+            agent = await crud_agents.update_agent_approval_routes(
+                session,
+                agent,
+                {name: b.model_dump() for name, b in data.approval_routes.items()},
+                expected_version=data.approval_routes_expected_version,
+            )
+        except crud_agents.ApprovalRoutesRefused as exc:
+            raise HTTPException(exc.status, {"code": exc.code, "message": str(exc)}) from exc
     if data.repo_full_name is not None:
         # Binds this agent to a repository so git-flow can route pushes to it
         # (ADR-0091). Several agents may share one, so this cannot collide.
@@ -488,6 +510,42 @@ async def update_agent(
                 },
             ) from exc
     return AgentOut.model_validate(agent)
+
+
+def _preflight_selector_write(agent: Agent, data: AgentUpdate, proposed: dict[str, Any]) -> None:
+    """The early half of the ADR 0271 route write checks, against the loaded row.
+
+    Version presence and equality, then one owning route per connector tool,
+    all before the bundle gate and before any sibling field could commit.
+    """
+
+    expected = data.approval_routes_expected_version
+    selector = approver_tickets.has_selector(agent.approval_routes) or (
+        approver_tickets.has_selector(proposed)
+    )
+    if selector and expected is None:
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            {
+                "code": approver_tickets.EXPECTED_VERSION_REQUIRED,
+                "message": "this route map write involves an approver_ticket selector: send "
+                "approval_routes_expected_version",
+            },
+        )
+    if expected is not None and expected != agent.connector_requester_identity_version:
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            {
+                "code": approver_tickets.VERSION_CONFLICT,
+                "message": f"approval_routes_expected_version {expected} is not the stored "
+                f"configuration version {agent.connector_requester_identity_version}",
+            },
+        )
+    assert data.approval_routes is not None
+    try:
+        approver_tickets.check_pair_conflicts(data.approval_routes)
+    except approver_tickets.ApproverTicketRefusal as exc:
+        raise HTTPException(exc.status, {"code": exc.code, "message": str(exc)}) from exc
 
 
 @router.delete("/{agent_id}", status_code=status.HTTP_204_NO_CONTENT)

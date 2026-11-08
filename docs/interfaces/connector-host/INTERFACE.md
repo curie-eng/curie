@@ -498,9 +498,10 @@ Deployment shape for capability probes to become eligible.
 
 This section freezes the wire contract for
 [ADR 0271](../../adr/0271-per-request-approver-sets-and-separation-of-duties.md).
-The pure signer and verifier are available; approval creation, policy, nonce
-storage and proxy header wiring are separate implementation slices. These
-contracts do not claim that those paths already enforce this policy.
+The pure signer and verifier are available, and the API now enforces
+registration, the route lock and creation verification (see "What the API
+enforces today" below). Answer and resume authority, separation enforcement and
+the proxy verified-grant header are later slices and are not enforced yet.
 
 The connector helper is
 `packages/curie-internal/src/curie_internal/approver_ticket.py`.
@@ -516,8 +517,98 @@ These helpers perform no database, route, current identity, key registration,
 requester-association, ceiling or nonce-spend checks. Creation owners must add
 those checks atomically, including comparison of the signed tenant, agent,
 connector, exact tool and route with the verified creation context. A parsed
-ticket is not execution authorization. JSONB numeric round-trip refusal belongs
-to the creation slice, not this pure contract.
+ticket is not execution authorization. JSONB numeric round-trip refusal is a
+creation-time check in the API, not part of this pure contract.
+
+### What the API enforces today
+
+The creation slice wires the pure verifier into the platform. Each item below is
+enforced by the API; none of it changes the wire contract in this document.
+
+1. Registration. An operator registers a selector on an approval route through
+   the agent's `approval_routes` write: connector, exact upstream tool, key id,
+   Ed25519 public key and a ceiling that pins the restricted approver role at a
+   named access-policy version. Registration requires the agent's requester
+   identity flag, a restricted approver role, and at least one active
+   deployment. Every active deployment's effective route map must gate the exact
+   connector tool on that route. The write is a compare-and-set on the agent's
+   shared configuration version, the same version the requester identity flag
+   uses, so a selector write and a flag change cannot both commit from one
+   read. The flag cannot be turned off while any selector is registered. The
+   operator procedure is in [approvals](../../approvals.md#per-request-approver-selection-adr-0271).
+2. Route lock. Once a connector tool is registered on a route, an approval for
+   that tool is accepted only on that route and only carrying a top-level
+   `approval_ticket`. A looser route, no route, or an empty route name is
+   refused whatever `gate_kind` says. A ticket on a route or tool with no
+   registration is refused.
+3. Creation verification. A dynamic approval is created only through
+   `POST /v1/internal/identity/approvals`. The API checks the complete grant
+   size, verifies the ticket with the registered key, compares the signed
+   tenant, agent, connector, tool and route with the verified creation context,
+   and requires the signed requester to equal the original human requester. It
+   then checks that every selected approver is an active human known to the
+   platform and inside the pinned ceiling. It also refuses duplicate recipient
+   accounts, and re-checks that the active serving bundles still gate the pair
+   on the route.
+4. Ceiling proof at creation. Only an exact canonical identity proves ceiling
+   membership: each selected approver must be named by issuer and subject in the
+   pinned role and, when `ceiling.users` is set, also listed there.
+   `ceiling.users` narrows the pinned role and never admits someone the role
+   does not name. Group entries and surface-account entries never match at
+   creation, because nothing can establish them for a person who is not
+   present. A pinned role that names approvers only by group therefore cannot
+   raise a dynamic approval, even when `ceiling.users` names the selected
+   people, until a subject-keyed identity lookup exists.
+5. Nonce single use. The ticket nonce is spent per agent in the same transaction
+   that stores the approval, so a replay under any dedupe key is refused. An
+   identical retry under the same dedupe key returns the original receipt, and a
+   conflicting retry under that key is refused.
+6. JSONB round trip. The stored arguments must canonicalize to the same bytes
+   as the arguments in the request. Otherwise creation rolls back with
+   `approval_ticket_arguments_unstable`.
+7. Legacy boundary. `POST /approvals` never creates a dynamic approval. A
+   request there that carries a ticket, or that names a registered tool, is
+   refused `approval_ticket_requires_http_creation`. The route lock applies to
+   it unchanged.
+
+A dynamic approval records the selected approver set, the signed requester, the
+key id, the nonce, and the arguments digest, all covered by the approval's
+integrity seal. Ordinary approvals and their existing seals are unchanged.
+
+What does not exist yet. Answer and resume authority (checking the person who
+answers or resumes against the selected set, the ceiling and fresh identity
+facts) and separation of duties enforcement land in a later slice. Until then a
+dynamic approval cannot be approved or rejected through any answer path; it can
+only expire or be recovered administratively. The proxy verified-grant header
+and the connector's refusal of a direct execution call without it also land in a
+later slice, as does rendering the stored arguments to the approver.
+
+Creation refusals. All are JSON error responses with the code in `detail`.
+
+| Status | Code | Condition |
+| --- | --- | --- |
+| 409 | `approval_route_locked` | The tool is registered on a route and the request names another route, none, or an empty one. |
+| 409 | `approval_ticket_route_mismatch` | On the owning route, but the granted tool is not that route's registered tool. |
+| 409 | `approval_ticket_required` | On the owning route and tool, but the grant arguments carry no top-level string `approval_ticket`. |
+| 409 | `approval_ticket_unregistered` | A top-level ticket is present but the route has no registration for this tool. |
+| 409 | `approver_ticket_requires_requester_identity` | A registration exists while the agent's requester identity flag is off. |
+| 409 | `approver_ticket_state_invalid` | The stored registration is malformed or duplicates a pair. Creation fails closed. |
+| 409 | `approval_ticket_replayed` | The nonce was already spent for this agent. |
+| 409 | `approval_provenance_conflict` | A different request reuses an existing dedupe key. |
+| 409 | `approval_ticket_requires_http_creation` | A dynamic request or a ticket arrived on legacy `POST /approvals`. |
+| 409 | `approver_ticket.bundle_gate_mismatch` | An active serving bundle does not gate the registered tool on its route. |
+| 422 | `approval_ticket_<code>` | The ticket failed verification. `<code>` is a frozen refusal code below (`invalid_ticket`, `arguments_mismatch`, `grant_too_large` and the rest), or `scope_mismatch`, `requester_mismatch` or `recipient_duplicate`. |
+| 422 | `approval_ticket_approver_inactive` | A selected approver is unknown, not human, or not active. |
+| 422 | `approval_ticket_outside_ceiling` | A selected approver is not proven inside the pinned ceiling by exact identity. |
+| 422 | `approval_ticket_arguments_unstable` | The stored arguments do not round trip to the same canonical bytes. |
+| 503 | `authority_unavailable` | The bundle store was unavailable, or the registration, flag, deployment or bundle changed between the preparation and commit phases. |
+
+Registration refusals (the operator write, not creation) are 409
+`approval_routes.version_conflict`, 409 `approval_routes.expected_version_required`,
+409 `stale_role_policy_version`, 422 `approver_ticket_requires_requester_identity`,
+422 `approver_ticket_ceiling_invalid`, 422 `approver_ticket_pair_conflict`,
+422 `approver_ticket.bundle_gate_mismatch`, 422 `approver_ticket.no_serving_bundle`
+and 422 `requester_identity_selector_registered` when disabling the flag.
 
 ### Ticket bytes and payload
 

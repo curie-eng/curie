@@ -1,6 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://schemas.curietech.ai/cli/approvals/v2.5.json",
+  "$id": "https://schemas.curietech.ai/cli/approvals/v2.6.json",
   "title": "curie <tier> approvals --json",
   "description": "The agent-facing payload of `curie <tier> approvals <agent>`: the dry-run plan; the gate list (`manifest_unreadable` non-null when the deployed manifest could not be read); the pending approval records (`truncated` true when the server page cap was hit); a single resolved record; one-time operator-principal or console-login-code delivery; or the agent's approval route bindings. Each binding separates its verified interactive Slack `resolution`, optional text-only `notification`, and optional `approvers` authority. Administrative recovery (#2753) adds two further shapes: `identity_report`, the installation-wide report of approval identity FACTS (`facts`, a string array per row) plus the `declarations` skeleton, forwarded verbatim from the API so an unknown field still reaches the operator; and `recovered`, one approval administratively rejected under the recovery grant. The connector requester identity readback (ADR 0270 decision 1) adds one more: the agent's name and id, whether its hosted connector calls carry the verified requester (`connector_requester_identity`), and the version its next compare-and-set write must name (`connector_requester_identity_version`).",
   "$defs": {
@@ -181,6 +181,88 @@
               }
             }
           }
+        },
+        "approver_ticket": {
+          "type": [
+            "object",
+            "null"
+          ],
+          "additionalProperties": false,
+          "description": "ADR 0271 approver-ticket selector registered on this route. Absent on a route with none. `ceiling.approver_role` is the server-owned pinned copy of the agent's approver role configuration at `approver_role_version`, opaque to the CLI.",
+          "properties": {
+            "connector": {
+              "type": "string"
+            },
+            "tool": {
+              "type": "string"
+            },
+            "key_id": {
+              "type": "string"
+            },
+            "public_key": {
+              "type": "string"
+            },
+            "ceiling": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "approver_role_version": {
+                  "type": "integer"
+                },
+                "users": {
+                  "type": [
+                    "array",
+                    "null"
+                  ],
+                  "items": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "properties": {
+                      "issuer": {
+                        "type": "string"
+                      },
+                      "subject": {
+                        "type": "string"
+                      }
+                    },
+                    "required": [
+                      "issuer",
+                      "subject"
+                    ]
+                  }
+                },
+                "approver_role": {
+                  "description": "Server-owned pinned approver role configuration, opaque JSON."
+                }
+              },
+              "required": [
+                "approver_role_version"
+              ]
+            }
+          },
+          "required": [
+            "connector",
+            "tool",
+            "key_id",
+            "public_key",
+            "ceiling"
+          ]
+        },
+        "separation": {
+          "type": [
+            "object",
+            "null"
+          ],
+          "additionalProperties": false,
+          "description": "ADR 0271 stored separation policy for the route's selector.",
+          "properties": {
+            "exclude_requester": {
+              "type": "boolean"
+            }
+          },
+          "required": [
+            "exclude_requester"
+          ]
         }
       },
       "required": [

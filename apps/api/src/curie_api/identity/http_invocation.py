@@ -934,6 +934,17 @@ class CurrentHttpInvocation:
             _unavailable()
         return resolved_identity(self._facts)
 
+    def require_original_requester(self) -> None:
+        """The original requester, freshly resolved, active and unchanged, or a refusal.
+
+        Valid only while the boundary is open. @spec REQUEST-APPROVAL-4.
+        """
+        if not self._open or not self.session.in_transaction():
+            _unavailable()
+        original_requester_current(
+            self._facts, self._application.principal_id is not None, self._original,
+        )
+
     def publication_window(self) -> tuple[str, DeliveryValidityWindow]:
         """The stable fence read under this open reader and its T1 window.
 
@@ -1229,6 +1240,29 @@ def resolved_identity(facts: ValidatedFacts) -> codec.ContextCanonicalV1 | None:
     return codec.ContextCanonicalV1(issuer=identity.issuer, subject=identity.subject)
 
 
+def original_requester_current(
+    facts: ValidatedFacts, principal_applied: bool, original: codec.InvocationContextV1 | None,
+) -> None:
+    """Refuse unless a fresh lookup names the original requester as an active human.
+
+    ``source_permission`` admits a migrated raw-account sender whose lookup is
+    unresolved or inactive, or whose canonical association changed since the
+    original invocation. A creation that carries an approver ticket never
+    relies on that exception: the fresh lookup must resolve (which the wire
+    contract makes an active account) to a human with an applied principal
+    whose canonical identity equals the one the original invocation sealed.
+    Anything else refuses as ``caller_not_allowed``. @spec REQUEST-APPROVAL-4.
+    """
+    identity = facts.identity
+    canonical = None if original is None else original.canonical
+    if (
+        facts.outcome != "resolved" or identity is None or identity.kind != "human"
+        or identity.account_status != "active" or not principal_applied or canonical is None
+        or (identity.issuer, identity.subject) != (canonical.issuer, canonical.subject)
+    ):
+        _deny()
+
+
 class RequesterIdentityStateInvalid(Exception):
     """The agent row is missing, or its opt-in is not a stored boolean.
 
@@ -1484,9 +1518,15 @@ async def current_http_approval_caller(
 
 
 async def revalidate_http_approval_caller(
-    request: Request, writer: AsyncSession, caller: CurrentHttpInvocation,
+    request: Request, writer: AsyncSession, caller: CurrentHttpInvocation, *,
+    original_requester: bool,
 ) -> None:
-    """No external I/O; only the separate borrowed writer. @spec HTTP-APPROVAL-CONTINUITY-9."""
+    """No external I/O; only the separate borrowed writer. @spec HTTP-APPROVAL-CONTINUITY-9.
+
+    ``original_requester`` (an approver-ticket creation) rechecks, in this same
+    writer transaction and after the principal row is reread, that the caller
+    is still the original requester. @spec REQUEST-APPROVAL-4.
+    """
     if caller._open or not writer.in_transaction():
         _unavailable()
     if (
@@ -1517,3 +1557,7 @@ async def revalidate_http_approval_caller(
         current, binding, facts,
         independent_human(caller._registration, current.sender.native_id), caller._original,
     )
+    if original_requester:
+        original_requester_current(
+            facts, caller._application.principal_id is not None, caller._original,
+        )

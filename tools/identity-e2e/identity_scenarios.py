@@ -22,11 +22,16 @@ from __future__ import annotations
 import contextlib
 import json
 import re
+import sys
 import time
+import uuid
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from typing import Any
 
+import approver_ticket_driver as tickets
+from identity_assets import ed25519_pair
 from identity_e2e import Api, Harness, HarnessError, epoch, turn_summary
+from identity_target import REPO, http, write_private
 
 # The fake model's test-only directive: the turn dials every hosted connector
 # of the agent through the runner's caller header path and answers one line
@@ -1451,3 +1456,1352 @@ def requester_handoff(harness: Harness, args: Any, evidence: Evidence) -> None:
             wait=wait,
         ),
     )
+
+
+# --- approver-ticket-creation -----------------------------------------------------------
+
+# The bundle every agent `up` deploys; the scenario derives its gated versions from it.
+TICKET_BUNDLE = REPO / "examples" / "weather"
+# The worker's log line for a turn refused before any execution (kernel/lifecycle.py).
+HTTP_REFUSED_MESSAGE = "http invocation refused"
+NEGATIVE_CONTROL_WAIT_S = 60.0
+# A CLI failure that names a refusal, when the API refused the turn at ingress.
+_REFUSAL_WORDS = ("refus", "identity", "forbidden", "403", "401")
+# (label, who sends it). The approver's turn gives them a canonical principals
+# row; each requester turn gives the creation steps one fresh dedupe key.
+TICKET_TURNS = (
+    ("approver", "approver"),
+    ("valid", "requester"),
+    ("refuse", "requester"),
+    ("race", "requester"),
+    ("bypass", "requester"),
+)
+
+
+def refused_with(status: int, body: Any, wanted: int, code: str) -> bool:
+    """A refusal with this status whose body names ``code`` (as a detail or a code field)."""
+
+    return status == wanted and code in json.dumps(body)
+
+
+def api_revision(harness: Harness) -> dict[str, Any]:
+    """What API build answered: the image tag's commit when it names one, and the image ids.
+
+    kubectl cannot read an image's labels, so the tag stands in for
+    ``org.opencontainers.image.revision``; the running pods' image ids pin the
+    exact digest.
+    """
+
+    target = harness.target
+    image = target.api_image()
+    deployment = target.kubectl_json("get", "deployment", target.component("api"))
+    labels = deployment["spec"]["selector"]["matchLabels"]
+    selector = ",".join(f"{key}={value}" for key, value in sorted(labels.items()))
+    image_ids = sorted(
+        {
+            str(status["imageID"])
+            for pod in target.kubectl_json("get", "pod", "-l", selector)["items"]
+            for status in (pod.get("status", {}).get("containerStatuses") or [])
+            if status.get("name") == "api" and status.get("imageID")
+        }
+    )
+    revision = tickets.revision_from_image(image)
+    return {
+        "api_revision": revision or image,
+        "api_revision_source": "image tag" if revision else "image reference",
+        "api_image": image,
+        "api_image_ids": image_ids,
+    }
+
+
+class TicketScenario:
+    """One ``approver-ticket-creation`` run on one agent, and what it must put back.
+
+    ``changes`` records each thing actually changed, as it changes, so
+    :meth:`restore` undoes exactly those even when the run stops part way.
+    """
+
+    def __init__(self, harness: Harness, args: Any, evidence: Evidence) -> None:
+        self.harness, self.args, self.evidence = harness, args, evidence
+        names = list(harness.data.get("agents", {}))
+        self.agent = str(args.flag_agent or (names[0] if names else ""))
+        if not self.agent:
+            raise HarnessError("no agent in the harness state; run `up --agent agent-a ...` first")
+        self.agent_id = str(harness.agent_entry(self.agent)["agent_id"])
+        self.control = args.control_agent or next((n for n in names if n != self.agent), None)
+        self.tenant_id = str(harness.data["tenant_id"])
+        self.issuer = str(harness.data["issuer"])
+        requester, approver = args.sender.lower(), args.second_sender.lower()
+        if requester == approver:
+            raise HarnessError(
+                "the requester (--sender) and approver (--second-sender) must differ"
+            )
+        self.senders = {"requester": requester, "approver": approver}
+        self.requester = {"issuer": self.issuer, "subject": roster_subject(harness, requester)}
+        self.approver = {"issuer": self.issuer, "subject": roster_subject(harness, approver)}
+        roster = harness.data.get("roster") or {}
+        self.ceiling = tickets.ceiling_subjects(roster)
+        # Other verified humans, each named as a ticket's requester in turn.
+        self.others: dict[str, dict[str, str]] = {}
+        for address, entry in sorted((roster.get("senders") or {}).items()):
+            if address == requester or str(entry.get("subject")) not in self.ceiling:
+                continue
+            self.others[address.split("@", 1)[0]] = {
+                "issuer": self.issuer,
+                "subject": str(entry["subject"]),
+            }
+            if len(self.others) == 2:
+                break
+        self.stamp = time.strftime("%Y%m%d%H%M%S", time.gmtime())
+        self.key: dict[str, str] = {}
+        self.nonces: dict[str, str] = {}
+        self.turns: dict[str, dict[str, Any]] = {}
+        self.valid: dict[str, Any] = {}
+        self.original: dict[str, Any] = {}
+        self.base: dict[str, Any] = {}
+        self.changes: dict[str, Any] = {
+            "routes": False,
+            "flag": False,
+            "approver_role": False,
+            "versions": [],
+            "deployments": [],
+            "ended": [],
+        }
+
+    # platform API and pod helpers -----------------------------------------------------
+
+    def drive(self, action: str, **params: Any) -> dict[str, Any]:
+        """One action of the in-pod driver; a refusal raises :class:`HarnessError`."""
+
+        started = time.monotonic()
+        print(f"approver-ticket-creation: driver {action} started", file=sys.stderr, flush=True)
+        try:
+            result = self.harness.target.pod_python(
+                tickets.POD_BOOTSTRAP, tickets.pod_params(action, **params)
+            )
+        finally:
+            print(
+                f"approver-ticket-creation: driver {action} ended after "
+                f"{time.monotonic() - started:.1f}s",
+                file=sys.stderr,
+                flush=True,
+            )
+        if not isinstance(result, dict) or "error" in result:
+            error = result.get("error") if isinstance(result, dict) else result
+            raise HarnessError(f"the in-pod ticket driver ({action}) refused: {error}")
+        return result
+
+    def configuration(self, api: Api) -> tuple[Any, Any, dict[str, Any]]:
+        """The requester flag, the shared configuration version and the routes, as read back."""
+
+        out = api.ok("GET", f"/agents/{self.agent_id}")
+        check(
+            "connector_requester_identity" in out and "connector_requester_identity_version" in out,
+            "AgentOut has no connector_requester_identity fields; is the candidate installed?",
+        )
+        return (
+            out["connector_requester_identity"],
+            out["connector_requester_identity_version"],
+            dict(out.get("approval_routes") or {}),
+        )
+
+    def patch(self, api: Api, body: Mapping[str, Any]) -> tuple[int, Any]:
+        return api.call("PATCH", f"/agents/{self.agent_id}", dict(body))
+
+    def routes(
+        self, registered: Mapping[str, Any] | None = None, *, route: str = tickets.TICKET_ROUTE
+    ) -> dict[str, Any]:
+        return tickets.routes_with(self.base, registered, route=route)
+
+    def registration(self, api: Api, *, tool: str = tickets.TOOL) -> dict[str, Any]:
+        """This run's selector, naming the access policy version as its ceiling."""
+
+        version = int(api.ok("GET", f"/agents/{self.agent_id}/access-policy")["version"])
+        return tickets.registration(
+            key_id=self.key["key_id"],
+            public_key=self.key["public_key"],
+            role_version=version,
+            tool=tool,
+        )
+
+    def write_routes(self, api: Api, routes: Mapping[str, Any]) -> tuple[int, Any]:
+        """A route write, versioned when the stored or proposed map names a selector (plan D2)."""
+
+        body: dict[str, Any] = {"approval_routes": dict(routes)}
+        _, version, stored = self.configuration(api)
+        if tickets.has_registration(stored) or tickets.has_registration(routes):
+            body["approval_routes_expected_version"] = version
+        return self.patch(api, body)
+
+    def active_deployments(self, api: Api) -> list[dict[str, Any]]:
+        return [
+            dict(item)
+            for item in api.ok("GET", f"/deployments?agent_id={self.agent_id}")
+            if item.get("status") == "active"
+        ]
+
+    def environments(self) -> list[dict[str, Any]]:
+        """The newest original active deployment of each environment."""
+
+        latest: dict[str, dict[str, Any]] = {}
+        for item in sorted(self.original["deployments"], key=lambda d: str(d.get("deployed_at"))):
+            latest[str(item["environment"])] = item
+        return [latest[name] for name in sorted(latest)]
+
+    def deploy_version(self, api: Api, label: str, route: str) -> tuple[str, list[tuple[int, Any]]]:
+        """A new version of examples/weather gating the pair on ``route``, deployed per environment.
+
+        The bundle is uploaded (it must be accepted: an inactive version's
+        bundle is not route-checked), then ``POST /deployments`` runs once per
+        environment the agent serves in; the answers are returned unjudged.
+        """
+
+        manifest = json.loads((TICKET_BUNDLE / tickets.MANIFEST_PATH).read_text())
+        gate = tickets.live_tool(tickets.CONNECTOR, tickets.TOOL)
+        data = tickets.bundle_archive(
+            TICKET_BUNDLE, tickets.gated_manifest(manifest, [(gate, route)])
+        )
+        write_private(self.harness.state.directory / f"approver-ticket-{label}.tar.gz", data)
+        version = api.ok(
+            "POST",
+            f"/agents/{self.agent_id}/versions",
+            {"version_label": f"identity-e2e-{label}-{self.stamp}", "created_by": "identity-e2e"},
+        )
+        version_id = str(version["id"])
+        self.changes["versions"].append(version_id)
+        body, content_type = tickets.multipart("file", "bundle.tar.gz", data, "application/gzip")
+        status, payload = http(
+            "PUT",
+            f"{api.base}/agents/{self.agent_id}/versions/{version_id}/bundle",
+            raw=body,
+            headers={
+                "X-API-Key": self.harness.target.platform_key(),
+                "Content-Type": content_type,
+            },
+        )
+        if status != 201:
+            raise HarnessError(
+                f"uploading the {label} bundle answered {status}: {json.dumps(payload)[:400]}"
+            )
+        results = []
+        for template in self.environments():
+            status, payload = api.call(
+                "POST",
+                "/deployments",
+                {
+                    "agent_id": self.agent_id,
+                    "version_id": version_id,
+                    "environment": template["environment"],
+                    "workspace_enabled": bool(template.get("workspace_enabled")),
+                },
+            )
+            if 200 <= status < 300 and isinstance(payload, dict):
+                self.changes["deployments"].append(str(payload["id"]))
+            results.append((status, payload))
+        return version_id, results
+
+    def ensure_registered(self, api: Api) -> None:
+        """The flag on and this run's selector registered, whatever the steps before left."""
+
+        flag, version, stored = self.configuration(api)
+        if flag is not True:
+            self.changes["flag"] = True
+            status, body = self.patch(
+                api,
+                {
+                    "connector_requester_identity": True,
+                    "connector_requester_identity_expected_version": version,
+                },
+            )
+            if status != 200:
+                raise HarnessError(
+                    f"enabling the flag answered {status}: {tickets.detail_code(body)}"
+                )
+            flag, version, stored = self.configuration(api)
+        current = (stored.get(tickets.TICKET_ROUTE) or {}).get("approver_ticket") or {}
+        if current.get("key_id") != self.key["key_id"]:
+            status, body = self.patch(
+                api,
+                {
+                    "approval_routes": self.routes(self.registration(api)),
+                    "approval_routes_expected_version": version,
+                },
+            )
+            if status != 200:
+                raise HarnessError(
+                    f"registering the selector answered {status}: {tickets.detail_code(body)}"
+                )
+
+    def create(
+        self,
+        seen: dict[str, Any],
+        cases: Sequence[Mapping[str, Any]],
+        *,
+        count_turns: Sequence[str] = (),
+        count_dedupe: Sequence[str] = (),
+        count_nonces: Sequence[str] = (),
+        facts_turns: Sequence[str] = (),
+        facts_dedupe: Sequence[str] = (),
+    ) -> dict[str, Any]:
+        """Send ``cases`` from the API pod; record answers, row counts and spent nonces."""
+
+        used = tickets.nonce_labels(cases)
+        for label in [*used, *count_nonces]:
+            self.nonces.setdefault(label, tickets.new_nonce())
+        labels = tickets.turn_labels(cases)
+        missing = [label for label in labels if label not in self.turns]
+        if missing:
+            raise HarnessError(f"no captured turn for {missing}")
+        dedupe = {label: self.turns[label]["event_id"] for label in count_turns}
+        result = self.drive(
+            "create",
+            agent_id=self.agent_id,
+            key={"seed_hex": self.key["seed_hex"], "key_id": self.key["key_id"]},
+            registered={
+                "connector": tickets.CONNECTOR,
+                "tool": tickets.TOOL,
+                "route": tickets.TICKET_ROUTE,
+            },
+            approvers=[self.approver],
+            nonces={label: self.nonces[label] for label in used},
+            turns={
+                label: {
+                    "stream_id": self.turns[label]["stream_id"],
+                    "event_id": self.turns[label]["event_id"],
+                }
+                for label in labels
+            },
+            cases=[dict(item) for item in cases],
+            count_dedupe=[*dedupe.values(), *count_dedupe],
+            count_nonces={label: self.nonces[label] for label in count_nonces},
+            facts=[*(self.turns[label]["event_id"] for label in facts_turns), *facts_dedupe],
+        )
+        seen["cases"] = [
+            {
+                key: item.get(key)
+                for key in (
+                    "name",
+                    "endpoint",
+                    "route",
+                    "gate_kind",
+                    "granted_tool",
+                    "ticket",
+                    "expected",
+                    "results",
+                )
+            }
+            for item in result["cases"]
+        ]
+        rows = result.get("rows") or {}
+        seen["rows"] = {label: rows.get(event) for label, event in dedupe.items()}
+        seen["rows"].update({key: rows.get(key) for key in count_dedupe})
+        seen["spent_nonces"] = dict(result.get("nonces") or {})
+        return result
+
+    # setup and restore ---------------------------------------------------------------
+
+    def prepare(self) -> None:
+        """Preconditions, the API revision and the snapshot restore returns to; changes nothing."""
+
+        setup: dict[str, Any] = {}
+        self.evidence.data["setup"] = setup
+        require_install_ready(self.harness, setup, (self.agent,))
+        check(
+            tickets.CONNECTOR in setup["connectors"][self.agent],
+            f"{self.agent} has no hosted connector {tickets.CONNECTOR}; deploy it from "
+            "examples/weather with `up --bundle examples/weather`",
+        )
+        check(
+            self.approver["subject"] in self.ceiling and self.requester["subject"] in self.ceiling,
+            "the requester and approver must both be active humans in the roster",
+        )
+        self.evidence.data.update(api_revision(self.harness))
+        with self.harness.api() as api:
+            flag, version, _ = self.configuration(api)
+            check(isinstance(flag, bool), f"the requester flag reads {flag!r}")
+            self.original.update(flag=flag, version=version)
+            active = self.active_deployments(api)
+            check(bool(active), f"{self.agent} has no active deployment")
+            self.original["deployments"] = active
+            policy = api.ok("GET", f"/agents/{self.agent_id}/access-policy")
+            check(
+                int(policy["version"]) >= 1,
+                f"{self.agent} has no stored access policy; rerun `up`",
+            )
+        stored = self.drive("agent_routes", agent_id=self.agent_id)["routes"]
+        check(
+            not tickets.has_registration(stored),
+            f"{self.agent} already stores a selector registration; a previous run did not "
+            "restore, so remove it with a versioned route write first",
+        )
+        self.original["routes"] = stored
+        self.base = tickets.base_routes(stored)
+        self.original["approver_role"] = self.drive(
+            "approver_role", tenant_id=self.tenant_id, agent_id=self.agent_id
+        )
+        seed, public = ed25519_pair(self.harness.state.directory)
+        key = tickets.selector_key(seed, public)
+        key["key_id"] = tickets.key_id_for(self.stamp)
+        write_private(
+            self.harness.state.directory / "approver-selector.json",
+            json.dumps(key, sort_keys=True).encode(),
+        )
+        self.key = key
+        role = self.original["approver_role"]
+        setup.update(
+            key_id=key["key_id"],
+            ceiling_subjects=self.ceiling,
+            original={
+                "flag": flag,
+                "version": version,
+                "routes": sorted(stored or {}),
+                "deployments": [
+                    {key: item.get(key) for key in ("id", "version_id", "environment")}
+                    for item in active
+                ],
+                "approver_role": {
+                    key: role.get(key)
+                    for key in ("version", "row", "configured", "had_role", "legacy_state")
+                },
+            },
+        )
+
+    def install(self) -> None:
+        """Bind both owned routes, serve only the gated bundle, and restrict the approver role.
+
+        Both routes are bound before the gated version is deployed, because a
+        deployment is refused while its bundle declares a route the agent has
+        not bound. Every original active deployment is then ended, because a
+        registration needs every active version to gate the pair (plan D5).
+        """
+
+        setup = self.evidence.data["setup"]
+        with self.harness.api() as api:
+            self.changes["routes"] = True
+            status, body = self.write_routes(api, self.routes())
+            if status != 200:
+                raise HarnessError(
+                    f"binding {list(tickets.OWNED_ROUTES)} answered {status}: "
+                    f"{tickets.detail_code(body)}"
+                )
+            version_id, results = self.deploy_version(api, "gate", tickets.TICKET_ROUTE)
+            setup["gated_version"] = version_id
+            refused = [
+                (status, tickets.detail_code(body)) for status, body in results if status != 201
+            ]
+            if refused:
+                raise HarnessError(f"deploying the gated version answered {refused}")
+            for item in self.original["deployments"]:
+                api.ok("DELETE", f"/deployments/{item['id']}")
+                self.changes["ended"].append(item)
+            serving = sorted({str(item["version_id"]) for item in self.active_deployments(api)})
+            setup["serving_versions"] = serving
+            if serving != [version_id]:
+                raise HarnessError(f"{self.agent} serves {serving}, not only {version_id}")
+        self.changes["approver_role"] = True
+        role = self.drive(
+            "approver_role",
+            tenant_id=self.tenant_id,
+            agent_id=self.agent_id,
+            filter=tickets.approver_filter(self.issuer, self.ceiling),
+        )
+        setup["approver_role"] = {key: role.get(key) for key in ("action", "version")}
+
+    def restore(self) -> None:
+        """Put back what ``changes`` records; a failure fails the run, naming what is left."""
+
+        report: dict[str, Any] = {"done": [], "failed": []}
+        self.evidence.data["restore"] = report
+
+        def attempt(name: str, action: Callable[[], Any]) -> None:
+            try:
+                report["done"].append({"action": name, "result": action()})
+            except (HarnessError, StepFailed, KeyError, TypeError, ValueError) as exc:
+                report["failed"].append({"action": name, "error": str(exc)[:400]})
+
+        changes = self.changes
+        if changes["routes"] or changes["flag"] or changes["deployments"] or changes["ended"]:
+            try:
+                with self.harness.api() as api:
+                    attempt("remove the registration", lambda: self._drop_registration(api))
+                    if changes["flag"]:
+                        attempt("requester flag", lambda: self._restore_flag(api))
+                    if changes["deployments"] or changes["ended"]:
+                        attempt("deployments", lambda: self._restore_deployments(api))
+                    if changes["routes"]:
+                        attempt("approval routes", lambda: self._restore_routes(api))
+                    attempt("verify", lambda: self._verify_restored(api))
+            except HarnessError as exc:
+                report["failed"].append({"action": "port-forward", "error": str(exc)[:400]})
+        if changes["approver_role"]:
+            attempt("approver role", self._restore_role)
+        report["left"] = (
+            f"approvals this run created stay pending until they expire "
+            f"({tickets.APPROVAL_TTL_S} s); the run's agent versions stay, undeployed"
+        )
+        if report["failed"]:
+            failed = "; ".join(f"{item['action']}: {item['error']}" for item in report["failed"])
+            self.evidence.data.setdefault("aborted", f"restore incomplete: {failed}")
+
+    def _drop_registration(self, api: Api) -> str:
+        _, version, stored = self.configuration(api)
+        if not tickets.has_registration(stored):
+            return "no registration stored"
+        status, body = self.patch(
+            api, {"approval_routes": self.routes(), "approval_routes_expected_version": version}
+        )
+        if status != 200:
+            raise HarnessError(f"answered {status}: {tickets.detail_code(body)}")
+        return f"removed at version {version}"
+
+    def _restore_flag(self, api: Api) -> str:
+        flag, version, _ = self.configuration(api)
+        wanted = self.original["flag"]
+        if flag == wanted:
+            return "unchanged"
+        status, body = self.patch(
+            api,
+            {
+                "connector_requester_identity": wanted,
+                "connector_requester_identity_expected_version": version,
+            },
+        )
+        if status != 200:
+            raise HarnessError(f"answered {status}: {tickets.detail_code(body)}")
+        return f"set back to {wanted}"
+
+    def _restore_deployments(self, api: Api) -> dict[str, Any]:
+        recreated = []
+        for item in sorted(self.changes["ended"], key=lambda d: str(d.get("deployed_at"))):
+            body = {
+                "agent_id": self.agent_id,
+                "version_id": str(item["version_id"]),
+                "environment": item["environment"],
+                "workspace_enabled": bool(item.get("workspace_enabled")),
+            }
+            if item.get("commit_sha"):
+                body["commit_sha"] = item["commit_sha"]
+            recreated.append(str(api.ok("POST", "/deployments", body)["id"]))
+        self.changes["ended"] = []
+        ended = []
+        for item in self.active_deployments(api):
+            if str(item["version_id"]) in self.changes["versions"]:
+                api.ok("DELETE", f"/deployments/{item['id']}")
+                ended.append(str(item["id"]))
+        self.changes["deployments"] = []
+        return {"recreated": recreated, "ended": ended}
+
+    def _restore_routes(self, api: Api) -> list[str]:
+        original = self.original.get("routes")
+        routes = dict(original) if isinstance(original, dict) else {}
+        status, body = self.write_routes(api, routes)
+        if status != 200:
+            raise HarnessError(f"answered {status}: {tickets.detail_code(body)}")
+        return sorted(routes)
+
+    def _restore_role(self) -> dict[str, Any]:
+        """Back to the original approver role, or to none when the agent had none.
+
+        An absent approver role and a ``filter: null`` one evaluate differently
+        (not configured against unrestricted), so a role the run added is
+        removed, not left unrestricted.
+        """
+
+        original = self.original["approver_role"]
+        if original.get("had_role"):
+            params: dict[str, Any] = {"filter": original.get("filter")}
+        else:
+            params = {"remove": True, "configured": bool(original.get("configured"))}
+        result = self.drive(
+            "approver_role", tenant_id=self.tenant_id, agent_id=self.agent_id, **params
+        )
+        now = self.drive("approver_role", tenant_id=self.tenant_id, agent_id=self.agent_id)
+        wrong = [
+            key
+            for key in ("configured", "had_role", "legacy_state", "filter")
+            if now.get(key) != original.get(key)
+        ]
+        if wrong:
+            raise HarnessError(f"the approver role differs from the original in {wrong}")
+        return {"action": result.get("action"), "version": now.get("version")}
+
+    def _verify_restored(self, api: Api) -> dict[str, Any]:
+        flag, _, stored = self.configuration(api)
+        serving = sorted({str(item["version_id"]) for item in self.active_deployments(api)})
+        original = sorted({str(item["version_id"]) for item in self.original["deployments"]})
+        result = {
+            "flag": flag == self.original["flag"],
+            "routes": sorted(stored) == sorted(self.original.get("routes") or {}),
+            "no_registration": not tickets.has_registration(stored),
+            "deployments": serving == original,
+        }
+        wrong = [name for name, ok in result.items() if not ok]
+        if wrong:
+            raise HarnessError(f"not restored: {wrong}")
+        return result
+
+    # registration steps ---------------------------------------------------------------
+
+    def registration_refused_flag_off(self) -> None:
+        with (
+            self.evidence.step(
+                "registration-refused-flag-off",
+                "with requester transport off, a selector registration is refused",
+            ) as seen,
+            self.harness.api() as api,
+        ):
+            self.changes["flag"] = True
+            flag, version = set_requester_flag(api, self.agent_id, False, what="disabling the flag")
+            check(flag is False, f"the flag reads {flag!r} after disabling it")
+            routes = self.routes(self.registration(api))
+            seen["registration"] = tickets.redacted(routes[tickets.TICKET_ROUTE])
+            status, body = self.patch(
+                api, {"approval_routes": routes, "approval_routes_expected_version": version}
+            )
+            seen["write"] = {"status": status, "detail": tickets.detail_code(body)}
+            check(
+                refused_with(status, body, 422, tickets.FLAG_REQUIRED),
+                f"registering with the flag off answered {status} {tickets.detail_code(body)!r}, "
+                f"not 422 {tickets.FLAG_REQUIRED}",
+            )
+            after = self.configuration(api)
+            seen["after"] = {"flag": after[0], "version": after[1]}
+            check(
+                after[0] is False
+                and after[1] == version
+                and not tickets.has_registration(after[2]),
+                "the refused registration changed the flag, its version or the routes",
+            )
+
+    def registration_bundle_gate_refused(self) -> None:
+        with (
+            self.evidence.step(
+                "registration-bundle-gate-refused",
+                "a registration whose serving bundle gate is elsewhere or missing is refused",
+            ) as seen,
+            self.harness.api() as api,
+        ):
+            self.changes["flag"] = True
+            flag, version = set_requester_flag(api, self.agent_id, True, what="enabling the flag")
+            check(flag is True, f"the flag reads {flag!r} after enabling it")
+            variants = {
+                # The serving bundle gates the pair on the owning route, not this one.
+                "gate-points-elsewhere": self.routes(
+                    self.registration(api), route=tickets.LOOSER_ROUTE
+                ),
+                # The serving bundle gates no such tool at all.
+                "gate-missing": self.routes(self.registration(api, tool=tickets.OTHER_TOOL)),
+            }
+            for name, routes in variants.items():
+                status, body = self.patch(
+                    api, {"approval_routes": routes, "approval_routes_expected_version": version}
+                )
+                seen[name] = {"status": status, "detail": tickets.detail_code(body)}
+                check(
+                    refused_with(status, body, 422, tickets.BUNDLE_GATE_MISMATCH),
+                    f"{name} answered {status} {tickets.detail_code(body)!r}, not 422 "
+                    f"{tickets.BUNDLE_GATE_MISMATCH}",
+                )
+            after = self.configuration(api)
+            seen["after"] = {"flag": after[0], "version": after[1]}
+            check(
+                after[0] is True and after[1] == version and not tickets.has_registration(after[2]),
+                "a refused registration changed the flag, its version or the routes",
+            )
+
+    def registration_accepted(self) -> None:
+        with (
+            self.evidence.step(
+                "registration-accepted",
+                "a registration with the flag on, a restricted approver role and a gating "
+                "bundle is stored, pinned and versioned",
+            ) as seen,
+            self.harness.api() as api,
+        ):
+            self.changes["flag"] = True
+            flag, version = set_requester_flag(api, self.agent_id, True, what="enabling the flag")
+            written = self.registration(api)
+            status, body = self.patch(
+                api,
+                {
+                    "approval_routes": self.routes(written),
+                    "approval_routes_expected_version": version,
+                },
+            )
+            seen["write"] = {"status": status, "detail": tickets.detail_code(body)}
+            check(status == 200, f"the registration answered {status}: {tickets.detail_code(body)}")
+            flag_after, version_after, stored = self.configuration(api)
+            binding = stored.get(tickets.TICKET_ROUTE) or {}
+            readback = binding.get("approver_ticket") or {}
+            ceiling = readback.get("ceiling") or {}
+            seen["readback"] = tickets.redacted(binding)
+            seen["version"] = {"before": version, "after": version_after}
+            seen["public_key_read_back"] = (
+                readback.get("public_key") == self.key["public_key"]
+                if "public_key" in readback
+                else None
+            )
+            check(flag_after is True, "the flag is no longer on")
+            check(
+                version_after == version + 1,
+                f"the configuration version went {version} -> {version_after}, not up by one",
+            )
+            check(
+                all(readback.get(key) == written[key] for key in ("connector", "tool", "key_id")),
+                "the read-back registration names another connector, tool or key id",
+            )
+            check(
+                ceiling.get("approver_role_version") == written["ceiling"]["approver_role_version"],
+                "the read-back ceiling names another approver role version",
+            )
+            check(
+                ceiling.get("approver_role") is not None
+                and self.approver["subject"] in json.dumps(ceiling.get("approver_role")),
+                "the read-back ceiling has no pinned approver role naming the approver",
+            )
+            check(
+                binding.get("separation") == {"exclude_requester": True},
+                f"the stored separation is {binding.get('separation')!r}, not the default "
+                "exclude_requester true",
+            )
+        require_passed(self.evidence)
+
+    def flag_disable_refused_while_registered(self) -> None:
+        with (
+            self.evidence.step(
+                "flag-disable-refused-while-registered",
+                "the requester flag cannot be turned off while a selector is registered",
+            ) as seen,
+            self.harness.api() as api,
+        ):
+            flag, version, stored = self.configuration(api)
+            check(flag is True and tickets.has_registration(stored), "no registration to defend")
+            status, body = self.patch(
+                api,
+                {
+                    "connector_requester_identity": False,
+                    "connector_requester_identity_expected_version": version,
+                },
+            )
+            seen["write"] = {"status": status, "detail": tickets.detail_code(body)}
+            check(
+                refused_with(status, body, 422, tickets.SELECTOR_REGISTERED),
+                f"disabling answered {status} {tickets.detail_code(body)!r}, not 422 "
+                f"{tickets.SELECTOR_REGISTERED}",
+            )
+            after = self.configuration(api)
+            seen["after"] = {"flag": after[0], "version": after[1]}
+            check(
+                after[0] is True and after[1] == version and tickets.has_registration(after[2]),
+                "the refused disable changed the flag, its version or the registration",
+            )
+
+    def concurrent_flag_and_registration(self) -> None:
+        """Each round: from (flag on, nothing registered) at version v, a disable and a
+        registration both naming v race. Exactly one commits, the version moves to v+1,
+        and the stored pair is never (flag off, registration present)."""
+
+        with (
+            self.evidence.step(
+                "concurrent-flag-and-registration",
+                "a racing flag disable and registration at one version: exactly one commits",
+            ) as seen,
+            self.harness.api() as api,
+        ):
+            self.changes["flag"] = True
+            rounds: list[dict[str, Any]] = []
+            seen["rounds"] = rounds
+            for index in range(tickets.RACE_ROUNDS):
+                flag, version, stored = self.configuration(api)
+                if tickets.has_registration(stored):
+                    status, body = self.patch(
+                        api,
+                        {
+                            "approval_routes": self.routes(),
+                            "approval_routes_expected_version": version,
+                        },
+                    )
+                    check(status == 200, f"removing the registration answered {status}")
+                    flag, version, stored = self.configuration(api)
+                if flag is not True:
+                    self.changes["flag"] = True
+                    flag, version = set_requester_flag(
+                        api, self.agent_id, True, what="enabling the flag"
+                    )
+                raced = self.drive(
+                    "race_flag",
+                    agent_id=self.agent_id,
+                    version=version,
+                    routes=self.routes(self.registration(api)),
+                )["results"]
+                flag_after, version_after, stored_after = self.configuration(api)
+                registered = tickets.has_registration(stored_after)
+                winners = sorted(name for name, result in raced.items() if result["http"] == 200)
+                entry = {
+                    "round": index + 1,
+                    "version": version,
+                    "results": raced,
+                    "winners": winners,
+                    "after": {
+                        "flag": flag_after,
+                        "version": version_after,
+                        "registered": registered,
+                    },
+                }
+                rounds.append(entry)
+                check(len(winners) == 1, f"round {index + 1}: {len(winners)} writers committed")
+                check(
+                    version_after == version + 1,
+                    f"round {index + 1}: the version went {version} -> {version_after}",
+                )
+                check(
+                    not (flag_after is False and registered),
+                    f"round {index + 1}: the stored state is the flag off with a registration",
+                )
+                if winners == ["flag_off"]:
+                    check(
+                        flag_after is False and not registered, "the disable won but did not land"
+                    )
+                    loser, codes = (
+                        raced["register"],
+                        (
+                            tickets.ROUTES_VERSION_CONFLICT,
+                            tickets.FLAG_REQUIRED,
+                        ),
+                    )
+                else:
+                    check(
+                        flag_after is True and registered, "the registration won but did not land"
+                    )
+                    loser, codes = (
+                        raced["flag_off"],
+                        (
+                            tickets.FLAG_VERSION_CONFLICT,
+                            tickets.SELECTOR_REGISTERED,
+                        ),
+                    )
+                check(
+                    loser["http"] in (409, 422)
+                    and any(code in str(loser.get("detail")) for code in codes),
+                    f"round {index + 1}: the losing write answered {loser}, not one of {codes}",
+                )
+
+    def deploy_breaking_gate_refused(self) -> None:
+        with (
+            self.evidence.step(
+                "deploy-breaking-gate-refused",
+                "deploying a version whose bundle moves the registered gate is refused",
+            ) as seen,
+            self.harness.api() as api,
+        ):
+            self.ensure_registered(api)
+            before = sorted(str(item["id"]) for item in self.active_deployments(api))
+            version_id, results = self.deploy_version(api, "moved-gate", tickets.LOOSER_ROUTE)
+            seen["moved_gate_version"] = version_id
+            seen["deployments"] = [
+                {"status": status, "detail": tickets.detail_code(body)} for status, body in results
+            ]
+            check(
+                bool(results)
+                and all(
+                    refused_with(status, body, 422, tickets.BUNDLE_GATE_MISMATCH)
+                    for status, body in results
+                ),
+                f"deploying the moved gate answered {seen['deployments']}, not 422 "
+                f"{tickets.BUNDLE_GATE_MISMATCH}",
+            )
+            after = sorted(str(item["id"]) for item in self.active_deployments(api))
+            seen["active_deployments"] = {"before": before, "after": after}
+            check(after == before, "a refused deployment changed the active deployments")
+            check(
+                tickets.has_registration(self.configuration(api)[2]),
+                "the registration is gone after the refused deployment",
+            )
+
+    # turns and creation steps -----------------------------------------------------------
+
+    def send_turns(self) -> None:
+        """Real email turns whose ingress capsules the creation steps use.
+
+        The approver writes first, so they have a canonical principals row; then
+        the requester writes once per dedupe key the steps need. No step waits
+        for any of these turns' sandboxes: creation reads only the ingress
+        capsule and payload in the runs stream.
+        """
+
+        with self.harness.api() as api:
+            self.ensure_registered(api)
+        for label, who in TICKET_TURNS:
+            sent = self.harness.send(
+                self.agent, self.senders[who], f"approver-ticket-creation: {label} turn"
+            )
+            response = sent.get("response") if isinstance(sent.get("response"), dict) else {}
+            if (
+                sent.get("http_status") != 200
+                or not response.get("event_id")
+                or not response.get("stream_id")
+            ):
+                raise HarnessError(f"the {label} turn was not enqueued: {send_summary(sent)}")
+            self.turns[label] = {
+                "event_id": str(response["event_id"]),
+                "stream_id": str(response["stream_id"]),
+                "sender": self.senders[who],
+            }
+        captured = self.drive(
+            "capture",
+            turns={
+                label: {"stream_id": turn["stream_id"], "event_id": turn["event_id"]}
+                for label, turn in self.turns.items()
+            },
+        )["turns"]
+        for label, who in TICKET_TURNS:
+            facts = captured[label]
+            wanted = self.requester if who == "requester" else self.approver
+            if (
+                facts.get("canonical") != wanted
+                or not facts.get("principal_present")
+                or (facts.get("scope") or {}).get("agent_id") != self.agent_id
+            ):
+                raise HarnessError(
+                    f"the {label} turn's capsule does not name {self.senders[who]} as a "
+                    f"verified human on {self.agent}: {facts}"
+                )
+            self.turns[label]["capsule_facts"] = facts
+        rows = self.drive(
+            "principal",
+            tenant_id=self.tenant_id,
+            issuer=self.issuer,
+            subject=self.approver["subject"],
+        )["rows"]
+        self.evidence.data["turns"] = self.turns
+        self.evidence.data["approver_principal"] = rows
+        if not any(row.get("type") == "human" and row.get("status") == "active" for row in rows):
+            raise HarnessError(
+                f"{self.senders['approver']} has no active human principals row after their turn"
+            )
+
+    def creation_valid(self) -> None:
+        with self.evidence.step(
+            "creation-valid",
+            "a valid ticket creates one dynamic approval through the HTTP creation boundary",
+        ) as seen:
+            result = self.create(
+                seen,
+                tickets.valid_cases(),
+                count_turns=["valid"],
+                count_nonces=["valid"],
+                facts_turns=["valid"],
+            )
+            problems = tickets.case_mismatches(result["cases"])
+            check(not problems, "; ".join(problems))
+            made = result["cases"][0]
+            answer = made["results"][0]
+            self.valid = {"id": answer.get("id"), "issued_at": made.get("issued_at")}
+            check(answer.get("approval_status") == "pending", f"the approval is {answer}")
+            check(seen["rows"]["valid"] == 1, f"{seen['rows']['valid']} rows for the valid turn")
+            check(seen["spent_nonces"]["valid"] == 1, "the valid ticket's nonce is not spent once")
+            stored = result["facts"][self.turns["valid"]["event_id"]]
+            check(len(stored) == 1, f"{len(stored)} rows carry the valid turn's dedupe key")
+            row = stored[0]
+            seen["row"] = row
+            check(row.get("id") == answer.get("id"), "the stored row is not the created approval")
+            check(
+                row.get("selection_mode") == "dynamic"
+                and row.get("selection_key_id") == self.key["key_id"]
+                and row.get("selection_connector") == tickets.CONNECTOR
+                and row.get("selection_tool") == tickets.TOOL,
+                "the row does not record a dynamic selection by this run's key and pair",
+            )
+            check(
+                row.get("route") == tickets.TICKET_ROUTE
+                and row.get("gate_kind") == "permission"
+                and row.get("granted_tool") == tickets.live_tool(tickets.CONNECTOR, tickets.TOOL),
+                "the row does not hold the owning route, the permission gate and the pair",
+            )
+            check(
+                bool(row.get("nonce_stored") and row.get("ticket_stored") and row.get("sealed")),
+                "the row lacks its nonce, its stored ticket argument or its seal",
+            )
+            check(
+                self.approver["subject"] in json.dumps(row.get("selected_approvers"))
+                and self.requester["subject"] in json.dumps(row.get("selection_requester")),
+                "the row does not name the selected approver and the verified requester",
+            )
+            with self.harness.api() as api:
+                status, public = api.call("GET", f"/approvals/{answer.get('id')}")
+            shown = public if isinstance(public, dict) else {}
+            seen["public"] = {
+                "status": status,
+                **{
+                    key: shown.get(key)
+                    for key in ("status", "route", "gate_kind", "granted_tool", "card_channel")
+                },
+            }
+            check(
+                status == 200 and shown.get("status") == "pending",
+                "the approval does not read back",
+            )
+            check("identity_context" not in shown, "the public approval exposes its seal")
+
+    def refusal_step(
+        self, step_id: str, title: str, cases: Sequence[Mapping[str, Any]], *, turn: str = "refuse"
+    ) -> None:
+        """Every case refused with its code, no approval row on ``turn``, no nonce spent."""
+
+        with self.evidence.step(step_id, title) as seen:
+            check(bool(cases), "the step has no case to send (is the roster missing humans?)")
+            used = tickets.nonce_labels(cases)
+            result = self.create(seen, cases, count_turns=[turn], count_nonces=used)
+            problems = tickets.case_mismatches(result["cases"])
+            check(not problems, "; ".join(problems))
+            check(seen["rows"][turn] == 0, f"refusals left {seen['rows'][turn]} rows on {turn}")
+            spent = sorted(label for label, count in seen["spent_nonces"].items() if count)
+            check(not spent, f"a refused ticket spent its nonce: {spent}")
+
+    def creation_nonce_replay(self) -> None:
+        with self.evidence.step(
+            "creation-nonce-replay",
+            "the valid ticket's spent nonce is refused under a second dedupe key, which a fresh "
+            "nonce then creates",
+        ) as seen:
+            check(bool(self.valid.get("id")), "creation-valid spent no nonce to replay")
+            result = self.create(
+                seen,
+                tickets.nonce_replay_cases(),
+                count_turns=["refuse"],
+                count_nonces=["valid", "refuse-ok"],
+            )
+            problems = tickets.case_mismatches(result["cases"])
+            check(not problems, "; ".join(problems))
+            check(
+                seen["rows"]["refuse"] == 1,
+                f"{seen['rows']['refuse']} rows on the second dedupe key, not only the fresh one",
+            )
+            check(
+                seen["spent_nonces"] == {"valid": 1, "refuse-ok": 1},
+                f"spent nonces are {seen['spent_nonces']}",
+            )
+
+    def creation_conflicting_dedupe(self) -> None:
+        with self.evidence.step(
+            "creation-conflicting-dedupe",
+            "under the valid approval's dedupe key an identical retry returns the original "
+            "receipt and a conflicting one is refused",
+        ) as seen:
+            check(
+                bool(self.valid.get("id")) and self.valid.get("issued_at") is not None,
+                "creation-valid created nothing to retry",
+            )
+            result = self.create(
+                seen,
+                tickets.conflicting_dedupe_cases(int(self.valid["issued_at"])),
+                count_turns=["valid"],
+                count_nonces=["valid", "conflict"],
+            )
+            problems = tickets.case_mismatches(result["cases"])
+            check(not problems, "; ".join(problems))
+            identical = result["cases"][0]["results"][0]
+            check(
+                identical.get("id") == self.valid["id"],
+                "the identical retry did not return the original approval (its seal over the "
+                "stored dynamic row did not verify)",
+            )
+            check(seen["rows"]["valid"] == 1, f"{seen['rows']['valid']} rows for the valid turn")
+            check(
+                seen["spent_nonces"] == {"valid": 1, "conflict": 0},
+                f"spent nonces are {seen['spent_nonces']}",
+            )
+
+    def creation_identical_race(self) -> None:
+        with self.evidence.step(
+            "creation-identical-race",
+            f"{tickets.RACE_POSTS} identical creations at once leave one row and one spent nonce",
+        ) as seen:
+            result = self.create(
+                seen, tickets.race_cases(), count_turns=["race"], count_nonces=["race"]
+            )
+            race, retry = result["cases"]
+            answers = race["results"]
+            created = [answer for answer in answers if answer["http"] == 201]
+            seen["answers"] = [(answer["http"], answer.get("detail")) for answer in answers]
+            check(len(created) == 1, f"{len(created)} identical creations answered 201")
+            winner = created[0].get("id")
+            odd = [
+                answer
+                for answer in answers
+                if answer is not created[0]
+                and not (
+                    answer["http"] == 200
+                    and answer.get("duplicate") is True
+                    and answer.get("id") == winner
+                )
+                and not (answer["http"] == 503 and answer.get("detail") == tickets.UNAVAILABLE)
+            ]
+            check(not odd, f"a losing creation answered neither the receipt nor 503: {odd}")
+            again = retry["results"][0]
+            check(
+                again["http"] == 200
+                and again.get("duplicate") is True
+                and again.get("id") == winner,
+                f"the identical retry after the race answered {again}",
+            )
+            check(seen["rows"]["race"] == 1, f"{seen['rows']['race']} rows for the raced turn")
+            check(seen["spent_nonces"]["race"] == 1, "the raced nonce is not spent exactly once")
+
+    def legacy_new_policy_refused(self) -> None:
+        with self.evidence.step(
+            "legacy-new-policy-refused",
+            "POST /approvals cannot create on the registered pair, even with a valid ticket",
+        ) as seen:
+            dedupe = {
+                name: f"identity-e2e-ticket-legacy-{uuid.uuid4().hex[:12]}-{name}"
+                for name in tickets.LEGACY_POLICY_NAMES
+            }
+            result = self.create(
+                seen,
+                tickets.legacy_policy_cases("bypass", dedupe),
+                count_dedupe=list(dedupe.values()),
+                count_nonces=["legacy"],
+            )
+            problems = tickets.case_mismatches(result["cases"])
+            check(not problems, "; ".join(problems))
+            left = {key: count for key, count in seen["rows"].items() if count}
+            check(not left, f"the legacy boundary stored {left}")
+            check(seen["spent_nonces"]["legacy"] == 0, "a legacy request spent the ticket's nonce")
+
+    def _control_slack_approval(self) -> tuple[dict[str, Any] | None, str]:
+        if self.control is None:
+            return None, "no second agent in the harness state (`up --agent A --agent B`)"
+        control_id = str(self.harness.agent_entry(self.control)["agent_id"])
+        with self.harness.api() as api:
+            out = api.ok("GET", f"/agents/{control_id}")
+        slack = [item for item in out.get("channels") or [] if item.get("kind") == "slack"]
+        if not slack:
+            return None, f"{self.control} has no Slack binding for an ordinary legacy approval"
+        adapter = slack[0].get("adapter")
+        return (
+            tickets.slack_ordinary_approval(
+                agent_id=control_id,
+                channel=str(slack[0]["address"]),
+                adapter=None if adapter in (None, "default") else str(adapter),
+                dedupe_key=f"identity-e2e-ticket-ordinary-{uuid.uuid4().hex[:12]}",
+            ),
+            "",
+        )
+
+    def legacy_ordinary_unchanged(self) -> None:
+        with self.evidence.step(
+            "legacy-ordinary-unchanged",
+            "ordinary legacy creation answers as before: refused on the HTTP-selected binding, "
+            "created and idempotent on a legacy binding",
+        ) as seen:
+            selected = f"identity-e2e-ticket-selected-{uuid.uuid4().hex[:12]}"
+            slack, why = self._control_slack_approval()
+            seen["control_agent"] = self.control
+            facts = [str(slack["dedupe_key"])] if slack is not None else []
+            result = self.create(
+                seen,
+                tickets.legacy_ordinary_cases(turn="bypass", selected_dedupe=selected, slack=slack),
+                count_dedupe=[selected, *facts],
+                facts_dedupe=facts,
+            )
+            problems = tickets.case_mismatches(result["cases"])
+            check(not problems, "; ".join(problems))
+            check(seen["rows"][selected] == 0, "the refused ordinary request stored a row")
+            check(slack is not None, why)
+            assert slack is not None
+            created = result["cases"][1]["results"][0]
+            again = result["cases"][2]["results"][0]
+            check(
+                created.get("agent_id") == slack["agent_id"]
+                and created.get("route") is None
+                and created.get("gate_kind") == "permission"
+                and created.get("granted_tool") == slack["granted_tool"]
+                and created.get("dedupe_key") == slack["dedupe_key"]
+                and created.get("approval_status") == "pending",
+                f"the ordinary legacy approval reads back as {created}",
+            )
+            check(again.get("id") == created.get("id"), "the legacy retry made a second approval")
+            rows = result["facts"][slack["dedupe_key"]]
+            seen["row"] = rows
+            check(
+                len(rows) == 1
+                and rows[0].get("selection_mode") == "ordinary"
+                and not rows[0].get("nonce_stored")
+                and rows[0].get("selection_key_id") is None,
+                "the ordinary legacy row is not stored as an ordinary selection",
+            )
+
+    def route_bypass_refused(self) -> None:
+        with self.evidence.step(
+            "route-bypass-refused",
+            "the registered pair cannot be approved off its owning route or without its "
+            "ticket, whatever the gate kind; an unrelated tool still can",
+        ) as seen:
+            refusals: dict[str, Any] = {}
+            seen["refusals"] = refusals
+            cases = tickets.route_bypass_cases()
+            used = tickets.nonce_labels(cases)
+            result = self.create(refusals, cases, count_turns=["bypass"], count_nonces=used)
+            problems = tickets.case_mismatches(result["cases"])
+            check(not problems, "; ".join(problems))
+            check(refusals["rows"]["bypass"] == 0, "a bypass attempt stored an approval row")
+            spent = sorted(label for label, count in refusals["spent_nonces"].items() if count)
+            check(not spent, f"a bypass attempt spent a nonce: {spent}")
+            liveness: dict[str, Any] = {}
+            seen["liveness"] = liveness
+            result = self.create(
+                liveness,
+                tickets.route_bypass_liveness(),
+                count_turns=["bypass"],
+                facts_turns=["bypass"],
+            )
+            problems = tickets.case_mismatches(result["cases"])
+            check(not problems, "; ".join(problems))
+            rows = result["facts"][self.turns["bypass"]["event_id"]]
+            liveness["row"] = rows
+            check(
+                len(rows) == 1 and rows[0].get("selection_mode") == "ordinary",
+                "the unrelated tool's approval is not one ordinary row",
+            )
+
+    def cluster_message_negative_control(self) -> None:
+        with self.evidence.step(
+            "cluster-message-negative-control",
+            f"`curie cluster message` to {self.agent} is refused and creates no approval",
+        ) as seen:
+            before = int(self.drive("count_agent", agent_id=self.agent_id)["count"])
+            started = time.time()
+            wait = int(min(float(self.args.wait), NEGATIVE_CONTROL_WAIT_S))
+            result = self.harness.target.curie(
+                "cluster",
+                "message",
+                "--agent",
+                self.agent,
+                "--timeout-secs",
+                str(wait),
+                "--json",
+                "approver-ticket-creation: negative control",
+                timeout=wait + 120,
+            )
+            try:
+                reply = json.loads(result.stdout)
+            except ValueError:
+                reply = None
+            text = reply.get("reply") if isinstance(reply, dict) else None
+            answered = isinstance(text, str) and bool(text.strip())
+            tail = [
+                line[:200] for line in (result.stderr or result.stdout).strip().splitlines()[-3:]
+            ]
+            seen["cluster_message"] = {
+                "exit": result.returncode,
+                "answered": answered,
+                "tail": tail,
+            }
+            deadline = time.monotonic() + NEGATIVE_CONTROL_WAIT_S
+            refusals = worker_messages(self.harness, started - CLOCK_SKEW_S, HTTP_REFUSED_MESSAGE)
+            while not refusals and result.returncode == 0 and time.monotonic() < deadline:
+                time.sleep(3)
+                refusals = worker_messages(
+                    self.harness, started - CLOCK_SKEW_S, HTTP_REFUSED_MESSAGE
+                )
+            seen["worker_refusals"] = refusals[:5]
+            cli_refused = result.returncode != 0 and any(
+                word in " ".join(tail).lower() for word in _REFUSAL_WORDS
+            )
+            seen["refused_by"] = "worker" if refusals else "ingress" if cli_refused else None
+            after = int(self.drive("count_agent", agent_id=self.agent_id)["count"])
+            seen["approvals"] = {"before": before, "after": after}
+            check(not answered, "curie cluster message got a reply, so the turn ran")
+            check(
+                bool(refusals) or cli_refused,
+                "neither the worker logged `HTTP invocation refused` nor did the CLI report a "
+                "refusal",
+            )
+            check(after == before, f"{after - before} approval rows appeared for {self.agent}")
+
+
+@scenario(tickets.SCENARIO)
+def approver_ticket_creation(harness: Harness, args: Any, evidence: Evidence) -> None:
+    """ADR 0271 evidence items 1 and 2 for slice 0271a, on one agent of a live install.
+
+    The agent is ``--flag-agent`` (default: the first agent ``up`` registered);
+    ``--sender`` is the requester and ``--second-sender`` the selected approver;
+    ``--control-agent`` (default: the other agent) supplies a legacy-evaluable
+    Slack binding for the ordinary legacy control.
+
+    Setup, changing nothing: preconditions, the API revision, and a snapshot of
+    the flag, the stored route map, the active deployments and the approver
+    role. Then it binds two requesting-surface routes, deploys a version of
+    examples/weather that gates ``mcp__netpol-probe__search_dashboards`` on the
+    owning route (ending the original deployments), and restricts the approver
+    role to the roster's active humans by issuer and subject. Registration
+    steps go through ``PATCH /agents/{id}`` and ``POST /deployments``; then
+    real email turns are sent, and every creation step builds its requests in
+    the API pod from a turn's ingress capsule in the runs stream and posts them
+    to ``/v1/internal/identity/approvals`` (worker token) or ``/approvals``
+    (platform key). Each step records status and refusal codes, row counts and
+    spent nonces from Postgres. ``finally`` restores the registration, the
+    flag, the deployments, the routes and the role, and a failed restore fails
+    the run.
+
+    The item 2 check of a direct execution call without the verified-grant
+    header needs the 0271c proxy header and is carried there (plan D16).
+    """
+
+    run = TicketScenario(harness, args, evidence)
+    evidence.data.update(
+        agent=run.agent,
+        control_agent=run.control,
+        requester=run.senders["requester"],
+        approver=run.senders["approver"],
+        carried={
+            "direct-execution-without-verified-grant-header": "0271c (plan D16)",
+        },
+    )
+    run.prepare()
+    try:
+        run.install()
+        run.registration_refused_flag_off()
+        run.registration_bundle_gate_refused()
+        run.registration_accepted()
+        run.flag_disable_refused_while_registered()
+        run.concurrent_flag_and_registration()
+        run.deploy_breaking_gate_refused()
+        run.send_turns()
+        run.creation_valid()
+        run.refusal_step(
+            "creation-bad-signature",
+            "a ticket signed by another key, with a tampered signature, or naming an "
+            "unregistered key id is refused",
+            tickets.bad_signature_cases(),
+        )
+        run.refusal_step(
+            "creation-scope-change",
+            "a ticket for another tenant, agent, connector, tool or route is refused",
+            tickets.scope_change_cases(),
+        )
+        run.refusal_step(
+            "creation-requester-change",
+            "a ticket naming another human than the turn's verified requester is refused",
+            tickets.requester_change_cases(run.others),
+        )
+        run.refusal_step(
+            "creation-argument-change",
+            "arguments changed after signing are refused",
+            tickets.argument_change_cases(),
+        )
+        run.refusal_step(
+            "creation-expired",
+            "an expired or not yet valid preparation is refused",
+            tickets.expired_cases(),
+        )
+        run.creation_nonce_replay()
+        run.creation_conflicting_dedupe()
+        run.creation_identical_race()
+        run.legacy_new_policy_refused()
+        run.legacy_ordinary_unchanged()
+        run.route_bypass_refused()
+        run.cluster_message_negative_control()
+    finally:
+        run.restore()
