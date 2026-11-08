@@ -260,8 +260,10 @@ async def _start_turn_under_hook_control(
             if not allowed:
                 raise failures.HookPaused("cron hook paused before runner start")
             try:
-                # ADR 0270 decision 3: the last point before the runner start.
-                self._require_requester_window(handle, remaining_s)
+                # ADR 0270 decision 3: immediately before the runner start, the
+                # window the token has left caps (or refuses) the turn once more.
+                remaining_s, rebound = self._bound_requester_turn(handle, remaining_s)
+                window_bound = window_bound or rebound
                 turn = await self._runner.start_turn(
                     handle.base_url,
                     event,
@@ -281,8 +283,10 @@ async def _start_turn_under_hook_control(
             memory._note_live_memory_turn(turn)
             return turn
     try:
-        # ADR 0270 decision 3: the last point before the runner start.
-        self._require_requester_window(handle, remaining_s)
+        # ADR 0270 decision 3: immediately before the runner start, the
+        # window the token has left caps (or refuses) the turn once more.
+        remaining_s, rebound = self._bound_requester_turn(handle, remaining_s)
+        window_bound = window_bound or rebound
         turn = await self._runner.start_turn(
             handle.base_url,
             event,

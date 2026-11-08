@@ -966,7 +966,11 @@ class _WindowRunner:
 def _window_kernel() -> SimpleNamespace:
     """A kernel double with no owned work item. @spec CONNECTOR-REQUESTER-3."""
     needed_exp = _kernel_helper("_requester_needed_exp")
-    kernel = SimpleNamespace(_runner=_WindowRunner(), _work_item_runs={})
+    kernel = SimpleNamespace(
+        _runner=_WindowRunner(),
+        _work_item_runs={},
+        _substrate=SimpleNamespace(claim_timeout_seconds=90.0),
+    )
     kernel._requester_needed_exp = lambda remaining_s, run: needed_exp(kernel, remaining_s, run)
     return kernel
 
@@ -985,11 +989,14 @@ def _call(helper: Callable[..., Any], *args: Any) -> Any:
 
 # @spec CONNECTOR-REQUESTER-3
 def test_requester_window_rule(monkeypatch: pytest.MonkeyPatch) -> None:
-    """A requester turn starts only while its cct outlives the turn's bound plus grace.
+    """A requester turn runs within what its cct has left, or refuses below 5 s.
 
-    Needed is now plus the turn's runtime bound plus the boot grace, lowered to
-    the run's execution deadline when the delivery owns one. Only a digest
-    handle is checked; ``"none"``, ``"absent"`` and an unrecorded route skip.
+    Needed (for warm-route replacement) is now plus the turn's runtime bound
+    plus the boot grace, lowered to the run's execution deadline when the
+    delivery owns one. At start the bound is capped at the token's expiry less
+    now and grace; only a window under the minimum attempt budget refuses.
+    Only a digest handle is checked; ``"none"``, ``"absent"`` and an
+    unrecorded route skip.
     """
     _freeze_kernel_clock(monkeypatch, _T + 0.75)
     needed_exp = _kernel_helper("_requester_needed_exp")
@@ -1011,28 +1018,30 @@ def test_requester_window_rule(monkeypatch: pytest.MonkeyPatch) -> None:
     assert needed_exp(kernel, None, run(_T + 5000)) == _T + 600 + grace
     assert needed_exp(kernel, None, run(None)) == _T + 600 + grace
 
-    window = _kernel_helper("_require_requester_window")
+    bound = _kernel_helper("_bound_requester_turn")
     short = getattr(kernel_failures, "RequesterTokenWindowShort", None)
     assert isinstance(short, type) and issubclass(short, RunnerError)
-    needed = _T + 600 + grace
-    _call(window, kernel, _requester_handle(caller_requester=_A, caller_token_exp=needed), None)
+
+    def bound_for(requester: str | None, exp: int | None) -> Any:
+        handle = _requester_handle(caller_requester=requester, caller_token_exp=exp)
+        return _call(bound, kernel, handle, None)
+
+    # The token covers the whole 600 s bound plus grace: the turn is unchanged.
+    assert bound_for(_A, _T + 600 + grace + 1) == (None, False)
+    # A slow claim and preparation leave 299.25 s after grace: the turn is
+    # capped there instead of being refused.
+    budget, capped = bound_for(_A, _T + 300 + grace)
+    assert capped is True
+    assert budget == pytest.approx(299.25)
+    # Less than the 5 s minimum attempt budget left, or an unknown expiry:
+    # the window cannot be lowered into, so the turn refuses (retryably).
     with pytest.raises(short):
-        _call(
-            window,
-            kernel,
-            _requester_handle(caller_requester=_A, caller_token_exp=needed - 1),
-            None,
-        )
+        bound_for(_A, _T + grace + 5)
     with pytest.raises(short):
-        _call(window, kernel, _requester_handle(caller_requester=_A, caller_token_exp=None), None)
+        bound_for(_A, None)
     for requester in ("none", "absent", None):
         for exp in (_T + 1, None):
-            _call(
-                window,
-                kernel,
-                _requester_handle(caller_requester=requester, caller_token_exp=exp),
-                None,
-            )
+            assert bound_for(requester, exp) == (None, False)
 
 
 _DEADLINE_RESIGN_CASES = [

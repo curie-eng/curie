@@ -1470,30 +1470,27 @@ def test_interrupt_thread_with_expected_refuses_a_changed_route(make_harness) ->
 
 
 @pytest.mark.parametrize(
-    ("claim_delay_s", "recovers_on_retry"),
+    ("claim_delay_s", "capped"),
     [(200.0, True), (30.0, False)],
     ids=["slow-claim", "control-30s-claim"],
 )
-def test_a_slow_first_claim_refuses_admission_then_recovers(
+def test_a_slow_first_claim_caps_the_turn_instead_of_refusing(
     make_harness,
     monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
     claim_delay_s: float,
-    recovers_on_retry: bool,
+    capped: bool,
 ) -> None:
-    """@spec CONNECTOR-REQUESTER-3 [D4]: admission at the last point before start.
+    """@spec CONNECTOR-REQUESTER-3 [D4]: admission caps at what the token has left.
 
     Runner bound 3400 s. The first claim spends 200 s after the minter ran, so
-    the claim-time token (exp mint + 3600) cannot cover start + 3400 + 60:
-    attempt 1 opens nothing (``RequesterTokenWindowShort``). Attempt 2 replaces
-    the short sandbox with a token minted at its own claim, the same principal
-    byte for byte and a later expiry, and opens once. The delivery's boot env
-    is built once; only the claim re-mints. Control: a 30 s claim starts on
-    attempt 1.
+    the claim-time token (exp mint + 3600) leaves 3340 s after the 60 s grace,
+    beyond the 90 s claim reserve. The turn starts on attempt 1, on that one
+    sandbox, bounded to the token's remaining window rather than refused.
+    Control: a 30 s claim leaves more than the bound, so nothing is capped.
     """
     require_execution_interface()
     require_requester_interface()
-    short_cls = window_short()
     clock = install_clock(monkeypatch)
     caplog.set_level(logging.DEBUG, logger="curie_worker")
 
@@ -1510,30 +1507,21 @@ def test_a_slow_first_claim_refuses_admission_then_recovers(
 
             envs = h.fake_k8s.claim_envs
             assert len(binding.boot_ccts) == 1, "the boot env was rebuilt per attempt"
+            assert len(envs) == 1, "a slow claim was replaced instead of capped"
             first = cct_claims(cct_of(envs[0]))
             assert first["principal"] == principal_dict(alice)
             assert cct_of(envs[0]) == binding.minter_runs[0].cct
-            if recovers_on_retry:
-                assert outcomes == [short_cls, "started"]
-                assert logged(caplog, "requester_token_window_short")
-                assert len(envs) == 2, "the short sandbox was not replaced"
-                second_cct = cct_of(envs[1])
-                second = cct_claims(second_cct)
-                assert canonical(second["principal"]) == canonical(first["principal"])
-                assert second["exp"] > first["exp"]
-                run = binding.minter_runs[1]
-                assert run.cct == second_cct, "the claim did not carry a claim-time token"
-                assert int(run.before) + _REQUESTER_TTL_S <= second["exp"]
-                assert second["exp"] <= int(run.after) + _REQUESTER_TTL_S
-                assert_signed_by(second_cct, binding.signing_key)
+            assert outcomes == ["started"]
+            assert not logged(caplog, "requester_token_window_short")
+            bounded = logged(caplog, "by the requester token window")
+            if capped:
+                assert bounded, "the slow claim's cap was applied silently"
+                # 3600 - 200 claim - 60 grace, less the little the start takes.
+                assert any("bounded to 33" in line for line in bounded), bounded
             else:
-                assert outcomes == ["started"]
-                assert len(envs) == 1
+                assert not bounded
             handle = route(h, thread_key(event))
-            assert recorded(handle) == (
-                requester_digest(alice),
-                cct_claims(cct_of(envs[-1]))["exp"],
-            )
+            assert recorded(handle) == (requester_digest(alice), first["exp"])
             assert runner_at(h, handle).opened == [event.text]
             assert all_opened(h) == [event.text]
             assert await is_done(h, event)
@@ -1541,11 +1529,15 @@ def test_a_slow_first_claim_refuses_admission_then_recovers(
     asyncio.run(run())
 
 
-def test_every_attempt_short_never_starts(make_harness, monkeypatch: pytest.MonkeyPatch) -> None:
-    """@spec CONNECTOR-REQUESTER-3 [D4]: every claim spends 200 s; no turn starts.
+def test_a_claim_leaving_under_the_minimum_attempt_never_starts(
+    make_harness, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """@spec CONNECTOR-REQUESTER-3 [D4]: a window too small to lower into refuses.
 
-    Each attempt replaces the short sandbox and is refused again; after
-    ``max_attempts`` the delivery escalates through the existing path.
+    Every claim spends 3537 s of its token's hour, leaving 3 s after the 60 s
+    grace, under the 5 s minimum attempt budget. Each attempt is refused before
+    any runner request (``RequesterTokenWindowShort``) and replaces the
+    sandbox; no turn ever starts and the delivery ends visibly.
     """
     require_execution_interface()
     require_requester_interface()
@@ -1557,13 +1549,13 @@ def test_every_attempt_short_never_starts(make_harness, monkeypatch: pytest.Monk
         async with make_harness(
             binding=binding, identity_authority=core, per_sandbox_runners=3, **_LONG_TURN_KNOBS
         ) as h:
-            delay_claims(h, clock, lambda: 200.0)
+            delay_claims(h, clock, lambda: 3537.0)
             outcomes = observe_starts(h)
             event = qevent("never fits", thread="always-short")
             await process(h, event)
 
             attempts = h.config.max_attempts
-            assert all_opened(h) == [], "a turn started on a token that could not cover it"
+            assert all_opened(h) == [], "a turn started on a token with no window left"
             assert outcomes == [short_cls] * attempts
             assert len(h.fake_k8s.claim_envs) == attempts
             assert await is_done(h, event)

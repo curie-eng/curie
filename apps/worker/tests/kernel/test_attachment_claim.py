@@ -2319,28 +2319,25 @@ def _retained_file_turn(thread: str) -> QueuedTurn:
 
 
 @pytest.mark.parametrize(
-    ("first_handoff_delay_s", "recovers_on_retry"),
-    [(200.0, True), (0.0, False)],
+    "first_handoff_delay_s",
+    [200.0, 0.0],
     ids=["delayed-attempt", "timely-control"],
 )
-def test_a_retained_attachment_turn_recovers_after_a_delayed_attempt(
+def test_a_retained_attachment_turn_starts_once_on_a_claim_time_token(
     make_harness,
     monkeypatch: pytest.MonkeyPatch,
     first_handoff_delay_s: float,
-    recovers_on_retry: bool,
 ) -> None:
     """[D5] ADR 0270 decision 3: the retained-file handoff gets a claim-time token.
 
     The retained attachment path hands an idle route off with the delivery's
     own boot env, so the requester ``cct`` is refreshed only by the claim-time
-    minter. The first handoff's claim spends 200 s with a 3400 s runner bound,
-    so admission refuses that sandbox (``RequesterTokenWindowShort``); the
-    second attempt hands off again with a token minted at its own claim: the
-    same principal field for field, an expiry at most its mint time plus one
-    hour and later than the refused token's. The file turn opens exactly once.
-    Control (``timely-control``, the plan's
-    ``test_a_timely_retained_attachment_turn_starts_once``): no delay, one
-    handoff, one start, expiry exactly its mint time plus one hour.
+    minter. The handoff's token carries the same principal field for field and
+    an expiry of exactly its mint time plus one hour. When the handoff's claim
+    spends 200 s with a 3400 s runner bound, admission caps the turn at what
+    that token has left instead of refusing it, so the file turn still opens
+    exactly once on the one handed-off sandbox. Control (``timely-control``):
+    no delay, the same single handoff and start.
     """
     handoff = _requester_handoff()
     short_cls = handoff.window_short()
@@ -2380,16 +2377,10 @@ def test_a_retained_attachment_turn_recovers_after_a_delayed_attempt(
             run = binding.minter_runs[len(envs) - 1]
             assert run.cct == started_cct, "the handoff did not carry a claim-time token"
             handoff.assert_signed_by(started_cct, binding.signing_key)
-            if recovers_on_retry:
-                assert outcomes == [short_cls, "started"]
-                assert len(envs) == 3, "the refused sandbox was not handed off again"
-                refused = handoff.cct_claims(handoff.cct_of(envs[1]))
-                assert started["exp"] <= int(run.after) + 3600
-                assert started["exp"] > refused["exp"]
-            else:
-                assert outcomes == ["started"]
-                assert len(envs) == 2
-                assert int(run.before) + 3600 <= started["exp"] <= int(run.after) + 3600
+            assert outcomes == ["started"], "a delayed handoff was refused instead of capped"
+            assert short_cls not in outcomes
+            assert len(envs) == 2
+            assert int(run.before) + 3600 <= started["exp"] <= int(run.after) + 3600
 
             opened = [text for runner in h.runners.values() for text in runner.opened]
             assert opened.count("read the file") == 1

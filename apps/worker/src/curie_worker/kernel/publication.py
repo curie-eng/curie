@@ -233,7 +233,6 @@ async def _continue_unpublished(
                 # ADR 0270 decision 3: a continuation on a principal-bearing
                 # route is capped at the requester window like any turn start.
                 left, window_bound = self._bound_requester_turn(handle, left)
-                self._require_requester_window(handle, left)
                 if event.tool_access is not None:
                     # @spec WORKER-TOOL-ACCESS-2: the continuation opens a turn too.
                     await self._require_tool_access(handle, event.tool_access, left)
@@ -246,6 +245,9 @@ async def _continue_unpublished(
                     event = await self._with_channel_read(
                         event, handle, left, grant=channel_read_grant, qevent=qevent
                     )
+                # ADR 0270 decision 3: immediately before the runner start.
+                left, rebound = self._bound_requester_turn(handle, left)
+                window_bound = window_bound or rebound
                 if attachment_turn is None:
                     turn = await self._runner.start_turn(
                         handle.base_url, event, token=handle.token or None, remaining_s=left

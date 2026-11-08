@@ -310,7 +310,6 @@ class Kernel:
     _requester_turn_budget = claim._requester_turn_budget
     _bound_requester_turn = claim._bound_requester_turn
     _requester_needed_exp = claim._requester_needed_exp
-    _require_requester_window = claim._require_requester_window
     _claim_or_resume = claim._claim_or_resume
     _keep_route_alive = claim._keep_route_alive
     _complete = completion._complete

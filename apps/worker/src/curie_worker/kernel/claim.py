@@ -202,8 +202,23 @@ def _requester_turn_budget(self: Kernel, remaining_s: float | None) -> float:
     and every credential minted from the same budget, to the window.
     """
 
-    cap = self._requester_turn_cap_s()
+    cap = _requester_turn_cap_s(self)
     return cap if remaining_s is None else min(remaining_s, cap)
+
+
+def _requester_window_s(handle: SandboxHandle) -> float | None:
+    """What the sandbox's requester token leaves for a turn opened now.
+
+    ADR 0270 decision 3: the token's expiry less now and the boot grace, or
+    None for a route that did not boot with a requester digest. A digest route
+    whose expiry is unknown has no window at all.
+    """
+
+    if not _is_requester_digest(handle.caller_requester):
+        return None
+    if handle.caller_token_exp is None:
+        return 0.0
+    return handle.caller_token_exp - clock.time.time() - BOOT_TOKEN_GRACE_SECONDS
 
 
 def _bound_requester_turn(
@@ -212,15 +227,28 @@ def _bound_requester_turn(
     """The budget a turn on ``handle`` opens with, and whether the window bounds it.
 
     ADR 0270 decision 3. A turn on a route that booted with a requester digest
-    runs for at most the requester window: its configured runtime bound is
-    capped there instead of refusing the turn. The INFO line names the thread
-    and the two bounds, never the requester. Any other route is unchanged.
+    runs for at most min(its configured bound, the static window cap, what the
+    sandbox's own token has left after the boot grace). A slow claim therefore
+    shortens the turn instead of refusing it. Only a window below the kernel's
+    minimum attempt budget (or an unknown expiry) refuses, with the retryable
+    ``RequesterTokenWindowShort``, whose retry boots a fresh token. Called
+    before the turn's credentials are minted and again immediately before the
+    runner start. Log lines name the thread and the bounds, never the
+    requester. Any other route is unchanged.
     """
 
-    if not _is_requester_digest(handle.caller_requester):
+    window = _requester_window_s(handle)
+    if window is None:
         return remaining_s, False
+    if window < constants._MIN_ATTEMPT_BUDGET_S:
+        logger.warning(
+            "turn start refused for thread %s before any runner request: "
+            "reason=requester_token_window_short",
+            handle.thread_key,
+        )
+        raise failures.RequesterTokenWindowShort()
     configured = self._runner.turn_deadline_s(remaining_s)
-    cap = self._requester_turn_cap_s()
+    cap = min(_requester_turn_cap_s(self), window)
     if configured <= cap:
         return remaining_s, False
     logger.info(
@@ -230,7 +258,7 @@ def _bound_requester_turn(
         cap,
         configured,
     )
-    return self._requester_turn_budget(remaining_s), True
+    return (cap if remaining_s is None else min(remaining_s, cap)), True
 
 
 def _requester_needed_exp(self: Kernel, remaining_s: float | None, run: WorkItemRun | None) -> int:
@@ -243,40 +271,13 @@ def _requester_needed_exp(self: Kernel, remaining_s: float | None, run: WorkItem
 
     needed = (
         int(clock.time.time())
-        + math.ceil(self._runner.turn_deadline_s(self._requester_turn_budget(remaining_s)))
+        + math.ceil(self._runner.turn_deadline_s(_requester_turn_budget(self, remaining_s)))
         + BOOT_TOKEN_GRACE_SECONDS
     )
     deadline = run.execution_deadline if run is not None else None
     if deadline is not None:
         needed = min(needed, int(deadline.timestamp()))
     return needed
-
-
-def _require_requester_window(
-    self: Kernel, handle: SandboxHandle, remaining_s: float | None
-) -> None:
-    """Refuse to start a turn the sandbox's requester token cannot cover.
-
-    ADR 0270 decision 3, the admission check at the last point before the
-    runner starts a turn. Only a route that booted with a requester digest is
-    checked; a principal-less or unrecorded route has no requester window.
-    The refusal is the retryable ``RequesterTokenWindowShort``: the retry
-    replaces this sandbox with one whose claim-time token covers the turn.
-    """
-
-    if not _is_requester_digest(handle.caller_requester):
-        return
-    owned_id = constants._OWNED_WORK_ITEM.get()
-    run = self._work_item_runs.get(owned_id) if owned_id is not None else None
-    needed = self._requester_needed_exp(remaining_s, run)
-    if handle.caller_token_exp is not None and handle.caller_token_exp >= needed:
-        return
-    logger.warning(
-        "turn start refused for thread %s before any runner request: "
-        "reason=requester_token_window_short",
-        handle.thread_key,
-    )
-    raise failures.RequesterTokenWindowShort()
 
 
 def _requester_handoff_pending(thread_key: str, queued_event_id: str) -> BaseException:
