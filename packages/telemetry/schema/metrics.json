@@ -109,7 +109,8 @@
           "expire",
           "suspend",
           "resume",
-          "observe"
+          "observe",
+          "dm_delivery"
         ],
         "outcome": [
           "requested",
@@ -126,7 +127,7 @@
           "curie-worker"
         ]
       },
-      "cardinality_bound": 96,
+      "cardinality_bound": 112,
       "description": "Approval lifecycle outcomes.",
       "monotonic": true,
       "type": "counter",
@@ -498,6 +499,7 @@
           "/v1/internal/attachment-access/complete",
           "/v1/internal/identity/turn-authority/check",
           "/v1/internal/identity/approvals",
+          "/v1/internal/identity/approvals/{approval_id}/card",
           "/v1/internal/identity/approval-grant/check",
           "/v1/internal/identity/binding-classification/check",
           "/channel-read",
@@ -649,7 +651,7 @@
           "OTHER"
         ]
       },
-      "cardinality_bound": 1680,
+      "cardinality_bound": 1688,
       "description": "Active HTTP server requests.",
       "monotonic": false,
       "type": "up_down_counter",
@@ -735,6 +737,7 @@
           "/v1/internal/attachment-access/complete",
           "/v1/internal/identity/turn-authority/check",
           "/v1/internal/identity/approvals",
+          "/v1/internal/identity/approvals/{approval_id}/card",
           "/v1/internal/identity/approval-grant/check",
           "/v1/internal/identity/binding-classification/check",
           "/channel-read",
@@ -893,7 +896,7 @@
           "OTHER"
         ]
       },
-      "cardinality_bound": 8400,
+      "cardinality_bound": 8440,
       "description": "HTTP server requests.",
       "monotonic": true,
       "type": "counter",
@@ -979,6 +982,7 @@
           "/v1/internal/attachment-access/complete",
           "/v1/internal/identity/turn-authority/check",
           "/v1/internal/identity/approvals",
+          "/v1/internal/identity/approvals/{approval_id}/card",
           "/v1/internal/identity/approval-grant/check",
           "/v1/internal/identity/binding-classification/check",
           "/channel-read",
@@ -1137,7 +1141,7 @@
           "OTHER"
         ]
       },
-      "cardinality_bound": 8400,
+      "cardinality_bound": 8440,
       "description": "HTTP server request duration.",
       "monotonic": false,
       "type": "histogram",

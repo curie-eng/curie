@@ -457,8 +457,20 @@
     },
     "ReplyAck": {
       "additionalProperties": false,
-      "description": "What an adapter answers with. ``ref`` is None when it mints no handle.",
+      "description": "What an adapter answers with. ``ref`` is None when it mints no handle.\n\n``channel`` is the conversation the provider says a new top-level post\nlanded in, when that differs from the address posted to (ADR 0272: a\nSlack post to a user id lands in the bot's DM with that user, a ``D...``\nid). None when the adapter reports no such conversation.",
       "properties": {
+        "channel": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Channel"
+        },
         "ref": {
           "anyOf": [
             {
