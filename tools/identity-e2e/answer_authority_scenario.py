@@ -13,15 +13,23 @@ step that proves an operator principal is refused. Each step records HTTP
 statuses, the row before and after, the new approval audit rows, identity audit
 events and resume check decisions; never a key, token, proof, capsule, nonce or
 ticket. See docs/testing/identity-e2e.md.
+
+The worker is kept quiescent while steps run: every lookup the API applies
+moves the tenant's lifecycle generation, and an answer's inline resume
+publication refuses when that moved under it. So the run waits until the
+worker has finished the turns it sent, and after each answer that publishes a
+wake, until it has finished the resumed turn. Each wait is recorded under
+``worker_waits``.
 """
 
 from __future__ import annotations
 
+import contextlib
 import copy
 import json
 import sys
 import time
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from typing import Any
 
 import answer_authority_driver as answers
@@ -79,6 +87,9 @@ class AnswerScenario(TicketScenario):
         self.free_turns: list[str] = []
         self.approvals: dict[str, str] = {}
         self.approved: set[str] = set()
+        # Every wait for the worker, in run order: counts and seconds only.
+        self.waits: list[dict[str, Any]] = []
+        evidence.data["worker_waits"] = self.waits
         self.route_state: dict[str, Any] = {
             "registration": {"key": "k1", "users": None},
             "separation": None,
@@ -173,6 +184,149 @@ class AnswerScenario(TicketScenario):
                 "events"
             ]
         )
+
+    # the worker's quiescence and people's principals -----------------------------------------
+
+    def await_worker(self, what: str, events: Sequence[str], budget: float) -> dict[str, Any]:
+        """Wait until the worker has finished every one of ``events``, for ``budget`` seconds.
+
+        One in-pod call waits up to ``answers.SETTLE_CALL_S``; the host repeats
+        it with what is still pending. Recorded in ``worker_waits``; a wait
+        that runs out raises :class:`HarnessError` naming what is pending.
+        """
+
+        started = time.monotonic()
+        pending, calls = list(events), 0
+        while pending:
+            remaining = budget - (time.monotonic() - started)
+            calls += 1
+            pending = list(
+                self.drive(
+                    "settled",
+                    events=pending,
+                    wait_s=max(0.0, min(answers.SETTLE_CALL_S, remaining)),
+                )["pending"]
+            )
+            if time.monotonic() - started >= budget:
+                break
+        report = {
+            "what": what,
+            "events": len(events),
+            "finished": len(events) - len(pending),
+            "seconds": round(time.monotonic() - started, 1),
+            "calls": calls,
+        }
+        self.waits.append(report)
+        if pending:
+            raise HarnessError(
+                f"the worker did not finish {len(pending)} of {len(events)} events ({what}) "
+                f"within {budget:.0f}s: {pending[:5]}"
+            )
+        return report
+
+    def await_wake(self, name: str, published: bool) -> dict[str, Any]:
+        """After an answer resolved ``name``: the worker's resumed turn, finished."""
+
+        if not published:
+            # The inline publication refused (a resume_refused row says why);
+            # the wake stays owed to the reconciler, so the worker runs nothing.
+            return {"published": False}
+        event = answers.resume_event_id(self.approval(name))
+        return {
+            "published": True,
+            **self.await_worker(f"the resumed turn of {name}", [event], answers.WAKE_SETTLE_S),
+        }
+
+    def principal_rows(self, *parts: str) -> dict[str, list[dict[str, Any]]]:
+        """Each person's canonical ``principals`` rows (type and status), by part."""
+
+        found = self.drive(
+            "principals",
+            tenant_id=self.tenant_id,
+            issuer=self.issuer,
+            subjects=[self.subjects[part] for part in parts],
+        )["rows"]
+        return {part: list(found.get(self.subjects[part]) or []) for part in parts}
+
+    def reactivate(self, part: str) -> dict[str, Any]:
+        """One fresh turn from ``part``, then the worker finishing it.
+
+        The ingress applies the person's principal from the directory as it
+        stands, so a principal an earlier lookup marked inactive is active again
+        once the directory is.
+        """
+
+        sent = self.harness.send(
+            self.agent, self.people[part], f"{answers.SCENARIO}: reactivate the {part}"
+        )
+        response = sent.get("response") if isinstance(sent.get("response"), dict) else {}
+        if sent.get("http_status") != 200 or not response.get("event_id"):
+            raise HarnessError(
+                f"the {part}'s reactivation turn was not enqueued: {send_summary(sent)}"
+            )
+        waited = self.await_worker(
+            f"the {part}'s reactivation turn", [str(response["event_id"])], answers.WAKE_SETTLE_S
+        )
+        return {"http": sent.get("http_status"), "worker": waited}
+
+    def ensure_active(self, *parts: str) -> dict[str, Any]:
+        """Each person's principal is an active human, as a creation selecting them needs.
+
+        One that is not (an earlier lookup applied them inactive) is reactivated
+        by a fresh turn; one still not active afterwards fails the step.
+        """
+
+        rows = self.principal_rows(*parts)
+        report: dict[str, Any] = {}
+        for part in parts:
+            entry: dict[str, Any] = {"rows": rows[part]}
+            report[self.people[part]] = entry
+            if answers.active_human(rows[part]):
+                continue
+            entry["reactivation"] = self.reactivate(part)
+            entry["rows_after"] = self.principal_rows(part)[part]
+            if not answers.active_human(entry["rows_after"]):
+                raise StepFailed(
+                    f"{self.people[part]}'s principals rows are {entry['rows_after']}, not an "
+                    "active human, even after a fresh turn from them (the directory serves "
+                    f"them as {self.provider_entry(part)!r}), so a creation selecting them "
+                    "would refuse approval_ticket_approver_inactive"
+                )
+        return report
+
+    def provider_entry(self, part: str) -> Any:
+        """The provider's current entry for ``part``, for a failure message."""
+
+        try:
+            return (self.provider_roster().get("senders") or {}).get(self.people[part])
+        except HarnessError as exc:
+            return f"unreadable: {exc}"
+
+    def restore_active(self, part: str) -> dict[str, Any]:
+        """``part``'s directory entry as `up` installed it, then their principal active again."""
+
+        return {"roster": self.restore_people(part), "principal": self.ensure_active(part)}
+
+    @contextlib.contextmanager
+    def restoring(
+        self, seen: dict[str, Any], key: str, action: Callable[[], Any]
+    ) -> Iterator[None]:
+        """Run ``action`` however the block ends and record its result under ``key``.
+
+        After a failure inside the block the restore is still attempted, its own
+        failure is recorded, and the block's failure propagates; after a clean
+        block a failed restore fails the step.
+        """
+
+        try:
+            yield
+        except BaseException:
+            try:
+                seen[key] = action()
+            except (HarnessError, StepFailed) as exc:
+                seen[key] = {"failed": str(exc)[:400]}
+            raise
+        seen[key] = action()
 
     # route and role state -----------------------------------------------------------------
 
@@ -390,7 +544,9 @@ class AnswerScenario(TicketScenario):
         """One approver turn (a canonical principals row), then one requester turn per approval.
 
         The requester's turns share one conversation, so the worker serves them
-        from one sandbox; the creations read only each turn's ingress capsule.
+        from one sandbox, one after another; the creations read only each turn's
+        ingress capsule. No step starts until the worker has finished all of
+        them, since each turn's checks move the tenant's lifecycle generation.
         """
 
         sends = [("approver", A, None)] + [
@@ -440,23 +596,20 @@ class AnswerScenario(TicketScenario):
             self.turns[label]["capsule_facts"] = facts
         self.free_turns = [label for label, _, thread in sends if thread]
         principals = {}
-        for part in (R, A):
-            rows = self.drive(
-                "principal",
-                tenant_id=self.tenant_id,
-                issuer=self.issuer,
-                subject=self.subjects[part],
-            )["rows"]
+        for part, rows in self.principal_rows(R, A).items():
             principals[self.people[part]] = rows
-            if not any(
-                row.get("type") == "human" and row.get("status") == "active" for row in rows
-            ):
+            if not answers.active_human(rows):
                 raise HarnessError(f"{self.people[part]} has no active human principals row")
         self.evidence.data["turns"] = {
             label: {key: turn.get(key) for key in ("event_id", "sender", "capsule_facts")}
             for label, turn in self.turns.items()
         }
         self.evidence.data["principals"] = principals
+        self.evidence.data["turns_settled"] = self.await_worker(
+            "the run's turns",
+            [turn["event_id"] for turn in self.turns.values()],
+            answers.TURNS_SETTLE_S,
+        )
 
     def restore(self) -> None:
         """Put back what ``changes`` records, roster first; a failure fails the run."""
@@ -559,9 +712,17 @@ class AnswerScenario(TicketScenario):
     def create(self, seen: dict[str, Any], step_id: str) -> dict[str, str]:
         """This step's approvals (``answers.APPROVALS``), one requester turn each.
 
-        A creation that met a concurrent identity change (503) is sent again.
+        Every person a dynamic approval selects is first made sure to be an
+        active human principal, since creation refuses anyone else. A creation
+        that met a concurrent identity change (503) is sent again.
         """
 
+        selected = sorted(
+            {part for _, _, parts in answers.APPROVALS[step_id] for part in parts},
+            key=answers.ROLES.index,
+        )
+        if selected:
+            seen["principals"] = self.ensure_active(*selected)
         pending: dict[str, dict[str, Any]] = {}
         for name, kind, parts in answers.APPROVALS[step_id]:
             if not self.free_turns:
@@ -668,7 +829,12 @@ class AnswerScenario(TicketScenario):
         address: str | None = None,
         retry: bool = True,
     ) -> dict[str, Any]:
-        """One email answer from ``part`` (or ``address``), forwarded as the mail adapter does."""
+        """One email answer from ``part`` (or ``address``), forwarded as the mail adapter does.
+
+        An answer that resolved the row returns only once the worker has
+        finished the turn it resumed from the published wake, so nothing after
+        it meets that turn's identity checks.
+        """
 
         approval_id = self.approval(name)
         sender = (address or self.people[part]).lower()
@@ -689,6 +855,8 @@ class AnswerScenario(TicketScenario):
                 break
         if result.get("http") == 200 and decision == "approved":
             self.approved.add(name)
+        if answers.publishes_wake(result):
+            result["worker"] = self.await_wake(name, bool(result.get("resumed")))
         return {"approval": name, "actor": part, "address": sender, "decision": decision, **result}
 
     def operator_answer(self, name: str) -> dict[str, Any]:
@@ -701,8 +869,12 @@ class AnswerScenario(TicketScenario):
         )
         return {"approval": name, "actor": "operator", "subject": answers.OPERATOR_USER, **result}
 
-    def resume(self, name: str) -> dict[str, Any]:
-        """Both current checks of the wake the API published for ``name``."""
+    def resume(self, name: str, *, retry: bool = True) -> dict[str, Any]:
+        """Both current checks of the wake the API published for ``name``.
+
+        An ``unavailable`` decision is checked again (a concurrent identity
+        change), unless ``retry`` is false: a check meant to meet an outage.
+        """
 
         check(
             name in self.approved,
@@ -712,7 +884,7 @@ class AnswerScenario(TicketScenario):
         for attempt in range(1, answers.ATTEMPTS + 1):
             result = self.drive("resume", approval_id=self.approval(name))
             result["attempts"] = attempt
-            if not answers.resume_transient(result):
+            if not retry or not answers.resume_transient(result):
                 break
         return {"approval": name, **result}
 
@@ -723,8 +895,10 @@ class AnswerScenario(TicketScenario):
         action = want["action"]
         return answers.newest(result.get("audit") or [], action)
 
-    def expect_resume(self, seen: dict[str, Any], key: str, name: str, decision: str) -> None:
-        result = self.resume(name)
+    def expect_resume(
+        self, seen: dict[str, Any], key: str, name: str, decision: str, *, retry: bool = True
+    ) -> None:
+        result = self.resume(name, retry=retry)
         seen[key] = result
         problems = answers.judge_resume(result, decision=decision)
         check(not problems, f"{key}: " + "; ".join(problems))
@@ -913,26 +1087,19 @@ class AnswerScenario(TicketScenario):
         ):
             seen["settle"] = self.settle_base(api)
             self.create(seen, step)
-            try:
+            # The refused answer applies A's principal as disabled, and nothing
+            # but a fresh lookup of A applies it active again; the creations
+            # after this step select A. So however the block ends, A's entry is
+            # restored and a fresh turn from A reactivates the principal.
+            with self.restoring(seen, "restored", lambda: self.restore_active(A)):
                 seen["roster"] = self.roster_change(
                     {"upsert": {self.people[A]: answers.deactivated(self.entry(A))}}
                 )
                 denied = self.refused(seen, "approver", self.answer("x6", A))
                 seen["refusal_code"] = answers.refusal_code(denied)
+                seen["approver_principal_inactive"] = self.principal_rows(A)[A]
                 self.expect_resume(seen, "resume", "x1", "refuse")
-            finally:
-                seen["roster_restored"] = self.restore_people(A)
-            # The fresh lookup also reapplies A's principal as active, which the
-            # creations after this step need.
             self.expect_resume(seen, "resume_after_reactivation", "x1", "continue")
-            rows = self.drive(
-                "principal", tenant_id=self.tenant_id, issuer=self.issuer, subject=self.subjects[A]
-            )["rows"]
-            seen["approver_principal"] = rows
-            check(
-                any(row.get("status") == "active" for row in rows),
-                "the approver's principal is not active again",
-            )
 
     def migrated_role_no_legacy_block(self) -> None:
         step = "migrated-role-no-legacy-block"
@@ -1183,28 +1350,39 @@ class AnswerScenario(TicketScenario):
         with (
             self.evidence.step(
                 step,
-                "with the requester's lookup unavailable, their self-answer is 503 and audited "
-                "denied with status 503",
+                "with the requester back in the exempt group and their lookup unavailable, their "
+                "self-answer is 503 and audited denied with status 503, and both current checks "
+                "of the exempt approval's resume answer unavailable with resume_refused audit "
+                "rows; with the lookup restored both continue",
             ) as seen,
             self.harness.api() as api,
         ):
             seen["settle"] = self.settle_base(api, separation=self.exempt_separation())
-            self.create(seen, step)
-            try:
-                seen["roster"] = self.roster_change(
-                    {"upsert": {self.people[R]: answers.unavailable(self.entry(R))}}
-                )
-                self.expect_answer(
-                    seen,
-                    "requester",
-                    self.answer("y5", R, retry=False),
-                    http=503,
-                    row_after="pending",
-                    action=answers.DENIED,
-                    status=503,
-                )
-            finally:
-                seen["roster_restored"] = self.restore_people(R)
+            exempt = {
+                self.people[R]: answers.with_groups(self.entry(R), add=[answers.EXEMPT_GROUP])
+            }
+            with self.restoring(seen, "roster_restored", lambda: self.restore_people(R)):
+                seen["roster_exempt"] = self.roster_change({"upsert": exempt})
+                self.create(seen, step)
+                with self.restoring(
+                    seen, "lookup_restored", lambda: self.roster_change({"upsert": exempt})
+                ):
+                    seen["roster_unavailable"] = self.roster_change(
+                        {"upsert": {self.people[R]: answers.unavailable(self.entry(R))}}
+                    )
+                    # Neither is retried: the outage is the point.
+                    self.expect_answer(
+                        seen,
+                        "requester",
+                        self.answer("y5", R, retry=False),
+                        http=503,
+                        row_after="pending",
+                        action=answers.DENIED,
+                        status=503,
+                    )
+                    self.expect_resume(seen, "resume", "y3", "unavailable", retry=False)
+                # Exempt and resolvable again, the step 14 self-approval continues.
+                self.expect_resume(seen, "resume_restored", "y3", "continue")
 
     def separation_exempt_unselected(self) -> None:
         step = "separation-exempt-unselected"
@@ -1389,14 +1567,16 @@ def run(harness: Harness, args: Any, evidence: Evidence) -> None:
     Setup, changing nothing: the creation scenario's preconditions and snapshot,
     the five people, a second selector key and the stored approver role. Then
     the creation scenario's install with the base approver role, the
-    registration, one approver turn and one requester turn per approval. Every
-    step settles the role and the owned routes it needs, creates its approvals
-    through ``/v1/internal/identity/approvals``, changes the directory through
-    the provider's roster override, and answers through
-    ``/approvals/{id}/resolve``. ``finally`` resets the roster, removes the
-    registration and the exclusion route, and restores the flag, the
-    deployments, the routes and the approver role, then checks them; a failed
-    restore fails the run.
+    registration, one approver turn and one requester turn per approval, and a
+    wait until the worker has finished them all. Every step settles the role and
+    the owned routes it needs, creates its approvals through
+    ``/v1/internal/identity/approvals`` once each selected person is an active
+    human principal, changes the directory through the provider's roster
+    override, and answers through ``/approvals/{id}/resolve``, waiting after a
+    resolving answer for the worker's resumed turn. ``finally`` resets the
+    roster, removes the registration and the exclusion route, and restores the
+    flag, the deployments, the routes and the approver role, then checks them;
+    a failed restore fails the run.
     """
 
     scenario = AnswerScenario(harness, args, evidence)

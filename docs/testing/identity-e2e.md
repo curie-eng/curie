@@ -777,15 +777,40 @@ It reuses the creation scenario's setup and restore, with these differences:
    the selector on the ticket route.
 4. It sends one approver turn and 20 requester turns on one conversation,
    one per approval the steps create, because an approval's dedupe key is its
-   turn's event id. Approvals are created with a 900 s expiry, so they outlive
-   the run.
-5. It changes the directory through the provider's roster override and undoes
-   each change in the step that made it.
+   turn's event id, and then waits until the worker has finished all of them
+   before the first step. Approvals are created with a 900 s expiry, so they
+   outlive the run.
+5. It changes the directory through the provider's roster override. A step
+   that changes the directory undoes the change however the step ends, even
+   when it fails part way, except the requester's exempt group from step 14,
+   which step 15 removes because that removal is what it tests.
+
+The worker is kept quiescent while steps run. Every lookup the API applies,
+including each of the worker's own turn checks, moves the tenant's lifecycle
+generation, and an approved answer's inline resume publication refuses with
+`authority_unavailable` when that generation moved between its capture and its
+writer. The wake then stays owed to the resume reconciler, which only
+re-enqueues it after its 900 s grace, so no later step would see it. So the
+run waits until the worker has finished each turn it sent, and every answer
+that resolves a row (approved or rejected) returns only once the worker has
+finished the turn it resumed from the published wake. Finished means the
+worker's done marker for the event id exists, which a refused turn writes too.
+The run uses the chart's default reconciler grace. Each wait is recorded under
+`worker_waits` (what it waited for, how many events, how many finished, and
+seconds), the initial one also under `turns_settled`, and each resolving
+answer records whether the API marked its wake published.
 
 Each step first brings the approver role and the owned routes to the state it
 needs, writing only when the stored map means something else, and re-pins the
-registration to the current role version. An answer, a creation or a resume
-check that met a concurrent identity change (503 with the row unchanged, or an
+registration to the current role version. Before creating its approvals it
+reads the `principals` row of every person they select: creation refuses
+`approval_ticket_approver_inactive` for anyone who is not an active human, and
+a lookup that saw a person disabled leaves their row disabled until a later
+lookup sees them active. A person who is not an active human is sent a fresh
+turn, whose ingress lookup applies them from the directory as it stands; the
+step fails with a message naming them if their row is still not active after
+it, and records any reactivation. An answer, a creation or a resume check
+that met a concurrent identity change (503 with the row unchanged, or an
 `unavailable` decision) is sent again, at most three times in all, and only
 the last attempt is judged. The steps run in this order, and each records its
 own evidence:
@@ -796,7 +821,7 @@ own evidence:
 4. `ceiling-member-revoked`: with the selected approver dropped from ceiling users, their answer is refused `selection_actor_outside_ceiling`, and the step 1 approval's resume refuses: both checks answer `refuse` with `caller_not_allowed`, and a new `resume_refused` audit row is written.
 5. `key-revoked`: with the registration replaced under the second key id, the answer is refused `selection_key_revoked` and the step 1 resume refuses.
 6. `registration-removed`: with the route bound but its registration removed, the answer is refused (the code is recorded) and the step 1 resume refuses.
-7. `canonical-inactive`: with the selected approver disabled in the directory, the answer is refused (the code is recorded) and the step 1 resume refuses. After the entry is restored, the step 1 resume continues and the approver's principal is active again.
+7. `canonical-inactive`: with the selected approver disabled in the directory, the answer is refused (the code is recorded), which applies the approver's principal as disabled (recorded), and the step 1 resume refuses. However the step ends, the entry is then restored and a fresh turn from the approver makes their principal active again, since later steps select them. The step 1 resume then continues.
 8. `migrated-role-no-legacy-block`: with the approver role migrated and no approvers block on the route, the second approver is refused and the selected approver approves.
 9. `raw-account-not-selected`: the role gains a raw email surface-account entry for the outsider, who is in it by no subject. The outsider's answer is refused, naming `selection_actor_not_selected` or `selection_actor_outside_ceiling`.
 10. `ceiling-widened`: with the role re-pinned to include the outsider, the outsider is refused `selection_actor_not_selected` and the selected approver approves. Ceiling users then drop the selected approver, whose answer on another approval is refused `selection_actor_outside_ceiling`.
@@ -805,7 +830,7 @@ own evidence:
 13. `separation-requester-rejection`: the requester rejects their own request: 200, and the row is rejected.
 14. `separation-exemption-member`: the operator writes an exempt group, which reads back. The requester, added to that group in the roster, approves their own request with `exemption_used` and requester equality true, and both resume checks continue. Any `approval_separation.changed` event is recorded, not required.
 15. `separation-exemption-removed`: with the requester out of the group, the step 14 approval's resume refuses and a new self-answer is refused `separation_requester_excluded`.
-16. `separation-exemption-unavailable`: with the requester's lookup unavailable, their self-answer is 503, the row stays pending, and the `denied` audit row records status 503. This answer is never retried.
+16. `separation-exemption-unavailable`: the requester is back in the exempt group, then their lookup is made unavailable. Their self-answer is 503, the row stays pending, and the `denied` audit row records status 503. Both current checks of the step 14 approval's published wake (the exempt self-approval) answer `unavailable` with `authority_unavailable`, never `continue`, and each writes a `resume_refused` audit row recording status 503 and `authority_unavailable`. Neither the answer nor these checks is retried. With the lookup restored (still exempt), both checks continue again; the requester's entry is then put back as `up` installed it, however the step ends.
 17. `separation-exempt-unselected`: a member of the exempt group who is not selected is refused `selection_actor_not_selected`.
 18. `separation-operator-opt-out`: an operator write of `exclude_requester: false` emits exactly one `approval_separation.changed` event by the operator, with old true, new false and the old and new configuration versions of that write. The opt-out reads back, and the requester's self-approval passes, recorded with exclusion false and requester equality true.
 19. `separation-agent-owned-opt-out-refused`: with exclusion back on, the agent-owned writer `PUT /agents/{id}/access-policy` carrying a `separation` or `approval_routes` opt-out is refused 422, and neither the stored separation nor the policy version changes.
@@ -817,7 +842,8 @@ exemption use but not their member names, so the judges read the first of
 several candidate names, and the evidence lists them under
 `setup.evidence_names`. The evidence keeps HTTP statuses, refusal codes,
 scrubbed audit rows, selected subjects and selection digests, identity audit
-events and key ids, never keys, tokens, proofs, capsules, nonces or tickets.
+events, principal statuses, worker wait counts and durations, and key ids,
+never keys, tokens, proofs, capsules, nonces or tickets.
 
 Restore runs in a `finally` block even after a failure, and a failed restore
 fails the run. It resets the roster and checks that nothing is overridden. It

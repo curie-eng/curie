@@ -17,7 +17,8 @@ judges and what the pod sends cannot drift apart:
    the sender as the actor, and an email answer proof signed with the receiver
    key the harness registered) or with an operator principal, and runs the
    resume current check and the grant check from the wake the API published,
-   all over loopback HTTP with the API's own credentials.
+   all over loopback HTTP with the API's own credentials. It also reads the
+   worker's done markers, so the host can wait until the worker is quiescent.
 
 Every product import is inside a function. Nothing either half returns carries
 a key, token, proof, capsule, nonce or ticket: results are statuses, refusal
@@ -127,6 +128,23 @@ NOTE = "identity-e2e approver-ticket-answer"
 # A concurrent identity lifecycle change (the worker's own turn checks) can
 # make one answer or check answer 503; it is retried this many times in all.
 ATTEMPTS = 3
+
+# Every lookup the API applies moves the tenant's lifecycle generation, and an
+# approved answer's inline resume publication refuses when it moved between
+# its capture and its writer, leaving the wake to the resume reconciler's 900 s
+# grace. So the agent's worker must be quiescent before an answer: the run
+# waits until the worker has finished every turn it sent, and after each answer
+# that publishes a wake, until it has finished the resumed turn. Finished means
+# the worker's done marker for the event id exists, which a refused turn also
+# writes (it sends no ``turn.completed``).
+RESOLVED_STATUSES = ("approved", "rejected")
+SETTLE_POLL_S = 1.0
+# One in-pod wait, inside ``Target.pod_python``'s 120 s timeout.
+SETTLE_CALL_S = 90.0
+# The run's 21 turns: 20 share one conversation, which the worker serves in order.
+TURNS_SETTLE_S = 900.0
+# One resumed turn, or one turn that reapplies a person's principal.
+WAKE_SETTLE_S = 240.0
 
 # Response details, routes and headers of the answer and resume boundaries.
 CALLER_NOT_ALLOWED = "caller_not_allowed"
@@ -290,6 +308,12 @@ def unavailable(entry: Mapping[str, Any]) -> dict[str, Any]:
     """A lookup the directory cannot answer (the recorded unavailable response)."""
 
     return {"subject": str(entry["subject"]), "sender_kind": "unknown", "outcome": "unavailable"}
+
+
+def active_human(rows: Iterable[Mapping[str, Any]] | None) -> bool:
+    """Whether a person's ``principals`` rows include an active human, as creation requires."""
+
+    return any(row.get("type") == "human" and row.get("status") == "active" for row in rows or ())
 
 
 # --- the approver role and the route map -----------------------------------------------------
@@ -741,26 +765,49 @@ def judge_answer(
     return problems
 
 
+RESUME_CHECKS = ("turn", "grant")
+
+
 def judge_resume(result: Mapping[str, Any], *, decision: str) -> list[str]:
-    """Both current checks of one published wake answer ``decision`` (refusals audited)."""
+    """Both current checks of one published wake answer ``decision``, refusals audited.
+
+    ``refuse`` needs ``caller_not_allowed`` and a new ``resume_refused`` row.
+    ``unavailable`` (a lookup the directory cannot answer) needs
+    ``authority_unavailable`` from both checks and one new ``resume_refused``
+    row per check recording status 503 and ``authority_unavailable``: the
+    composition audits every refusal on a canonical route, 503s included.
+    """
 
     if not result.get("wake"):
         return ["the API published no resume wake for the approval"]
     problems = []
-    for name in ("turn", "grant"):
+    reasons = {"refuse": CALLER_NOT_ALLOWED, "unavailable": AUTHORITY_UNAVAILABLE}
+    for name in RESUME_CHECKS:
         answer = result.get(name) or {}
         if answer.get("http") != 200 or answer.get("decision") != decision:
             problems.append(
                 f"the {name} check answered {answer.get('http')} "
                 f"{answer.get('decision')!r}/{answer.get('reason')!r}, not {decision}"
             )
-        elif decision == "refuse" and answer.get("reason") != CALLER_NOT_ALLOWED:
-            problems.append(f"the {name} check refused for {answer.get('reason')!r}")
-    if decision == "refuse" and newest(result.get("audit") or [], RESUME_REFUSED) is None:
+        elif decision in reasons and answer.get("reason") != reasons[decision]:
+            problems.append(f"the {name} check answered {decision} for {answer.get('reason')!r}")
+    audit = list(result.get("audit") or [])
+    refused = [row for row in audit if row.get("action") == RESUME_REFUSED]
+    if decision in reasons and not refused:
         problems.append(
-            f"no new {RESUME_REFUSED} audit row "
-            f"(new rows: {[row.get('action') for row in result.get('audit') or []]})"
+            f"no new {RESUME_REFUSED} audit row (new rows: {[row.get('action') for row in audit]})"
         )
+    if decision == "unavailable" and refused:
+        if len(refused) < len(RESUME_CHECKS):
+            problems.append(
+                f"{len(refused)} new {RESUME_REFUSED} audit rows, not one per current check"
+            )
+        for row in refused:
+            if refusal_status(row) != 503 or not names_code(row, AUTHORITY_UNAVAILABLE):
+                problems.append(
+                    f"a {RESUME_REFUSED} audit row records status {refusal_status(row)!r} "
+                    f"and reason {row.get('reason')!r}, not 503 {AUTHORITY_UNAVAILABLE}"
+                )
     return problems
 
 
@@ -828,8 +875,14 @@ def transient(result: Mapping[str, Any]) -> bool:
 
 def resume_transient(result: Mapping[str, Any]) -> bool:
     return any(
-        (result.get(name) or {}).get("decision") == "unavailable" for name in ("turn", "grant")
+        (result.get(name) or {}).get("decision") == "unavailable" for name in RESUME_CHECKS
     )
+
+
+def publishes_wake(result: Mapping[str, Any]) -> bool:
+    """An answer that resolved the row, after which the API owes the session a wake."""
+
+    return result.get("http") == 200 and result.get("status_after") in RESOLVED_STATUSES
 
 
 # --- inside the API pod -------------------------------------------------------------------------
@@ -1017,6 +1070,9 @@ def _answer(params: Mapping[str, Any]) -> dict[str, Any]:
         "POST", RESOLVE_PATH.format(approval_id=approval_id), body, headers
     )
     after = _public(approval_id)
+    # The resolve route publishes the wake before it answers and marks the row
+    # resumed once the append landed; a refused publication leaves it unmarked.
+    facts = _row_facts([approval_id]).get(approval_id) or {}
     return {
         "http": status,
         "detail": None if 200 <= status < 300 else tickets.detail_code(payload),
@@ -1024,7 +1080,64 @@ def _answer(params: Mapping[str, Any]) -> dict[str, Any]:
         "status_before": before["status"],
         "status_after": after["status"],
         "audit": _new_audit(before, after),
+        "resumed": bool(facts.get("resumed")),
     }
+
+
+def _settled(params: Mapping[str, Any]) -> dict[str, Any]:
+    """Which events the worker has finished: its done marker exists, for at most ``wait_s``.
+
+    The worker writes the marker for every terminal outcome, a refused turn
+    included; the API reads the same keyspace for terminal reviews.
+    """
+
+    import redis
+    from curie_internal.keyspace import done_key
+
+    settings = _settings()
+    events = [str(event) for event in params["events"]]
+    deadline = time.monotonic() + min(max(float(params.get("wait_s") or 0), 0.0), SETTLE_CALL_S)
+    client = redis.Redis.from_url(settings.valkey_dsn(), decode_responses=True)
+    try:
+        while True:
+            pipe = client.pipeline(transaction=False)
+            for event in events:
+                pipe.exists(done_key(settings.worker_key_prefix, event))
+            marked = pipe.execute()
+            pending = [event for event, found in zip(events, marked, strict=True) if not found]
+            if not pending or time.monotonic() >= deadline:
+                break
+            time.sleep(SETTLE_POLL_S)
+    finally:
+        client.close()
+    return {"pending": pending}
+
+
+def _principals(params: Mapping[str, Any]) -> dict[str, Any]:
+    """Each subject's canonical ``principals`` rows (type and status), in one read."""
+
+    from curie_api.db import SCHEMA
+    from sqlalchemy import text
+
+    subjects = [str(subject) for subject in params["subjects"]]
+
+    async def body(session: Any) -> list[dict[str, Any]]:
+        result = await session.execute(
+            text(
+                f'SELECT idp_subject AS subject, type, status FROM "{SCHEMA}".principals '
+                "WHERE tenant_id::text = :t AND idp_issuer = :i AND idp_subject = ANY(:s) "
+                "ORDER BY idp_subject, id"
+            ),
+            {"t": str(params["tenant_id"]), "i": str(params["issuer"]), "s": subjects},
+        )
+        return [dict(row._mapping) for row in result]
+
+    rows: dict[str, list[dict[str, Any]]] = {subject: [] for subject in subjects}
+    for row in tickets._sql(body):
+        rows.setdefault(str(row["subject"]), []).append(
+            {"type": row.get("type"), "status": row.get("status")}
+        )
+    return {"rows": rows}
 
 
 def _find_wake(client: Any, stream: str, event_id: str) -> tuple[str, str, str] | None:
@@ -1297,6 +1410,8 @@ _ACTIONS: dict[str, Callable[[Mapping[str, Any]], dict[str, Any]]] = {
     "rows": _rows,
     "answer": _answer,
     "resume": _resume,
+    "settled": _settled,
+    "principals": _principals,
     "identity_audits": _identity_audits,
     "role": _role,
     "role_raw": _role_raw,

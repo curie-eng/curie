@@ -5,6 +5,11 @@ the API's ``validate_lookup``; role filters, route bindings, the email answer
 proof and the resume check bodies by the models the API and worker parse; the
 judges and the evidence checker by tables. No cluster is involved.
 
+The worker waits, the principal guard before creation, the finally-style
+restores and the exemption outage step run the scenario's own methods against
+a fake in-pod driver that replays shapes recorded by a dry run on a disposable
+install, and check answers built with the wire models.
+
 The exempt-group separation shape and a separation on a route without a
 selector are the 0271b route schema; those cases fail until the API accepts
 them, which is the point.
@@ -13,13 +18,15 @@ them, which is the point.
 from __future__ import annotations
 
 import ast
+import contextlib
 import copy
 import hashlib
 import json
 import subprocess
 import sys
+import types
 import uuid
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -41,14 +48,17 @@ from curie_api.schemas.http_identity import (
     validate_lookup,
 )
 from curie_internal import identity_context as codec
+from curie_internal import keyspace
 from curie_internal.identity_approval import (
     ApprovalGrantAuthorityRequestV1,
+    ApprovalGrantAuthorityResponseV1,
     EmailApprovalAnswerProofV1,
     sign_email_approval_answer_proof,
     verify_email_approval_answer_proof,
 )
-from curie_internal.identity_authority import TurnAuthorityRequestV1
+from curie_internal.identity_authority import TurnAuthorityRequestV1, TurnAuthorityResponseV1
 from identity_assets import DEFAULT_ROSTER, DOMAIN, ISSUER, MEMBER_GROUP, VECTORS
+from identity_e2e import HarnessError
 
 # The step ids the 0271b task names, in its order.
 TASK_STEPS = (
@@ -647,6 +657,301 @@ def test_judge_resume_needs_both_checks_and_an_audited_refusal() -> None:
     ]
 
 
+# --- shapes a dry run on a disposable install recorded (its evidence and saved rows) -----------
+# Ids and key ids are that run's own; nothing here is a key, token, proof or ticket.
+
+RUN_TENANT = "00000000-0000-0000-0000-000000000001"
+RUN_AGENT = "5da96097-97af-46bf-bf72-ddfe4fe98864"
+RUN_BINDING = "00437647-e123-4079-90a1-f2f474178c97"
+RUN_KEY_ID = "identity-e2e-selector-20261108153443"
+X1_ID = "a5570a68-ba55-443c-9c05-1958dea5a950"
+X2_ID = "efb5a19a-55c5-4fea-8db4-d64d1c9578bd"
+X6_ID = "fdcaedc2-e0d8-497f-88bd-57eae238006e"
+ACTIVE_ROW = {"status": "active", "type": "human"}
+# The status the refused canonical-inactive answer applied (identity audit
+# ``identity.http_principal_observed``, authorization version 2).
+DISABLED_ROW = {"status": "disabled", "type": "human"}
+
+
+def selection_evidence(version: int) -> dict[str, Any]:
+    person = {"issuer": ISSUER, "tenant_id": RUN_TENANT}
+    return {
+        "actor": {**person, "subject": "identity-e2e-bob"},
+        "configuration_version": version,
+        "connector": "netpol-probe",
+        "decision": "approved",
+        "equality": False,
+        "exclusion": True,
+        "exempt_group": None,
+        "exemption_used": False,
+        "key_id": RUN_KEY_ID,
+        "kind": answers.SELECTION_KIND,
+        "mode": "dynamic",
+        "requester": {**person, "subject": "identity-e2e-alice"},
+        "route": tickets.TICKET_ROUTE,
+        "selected_count": 1,
+        "tool": "search_dashboards",
+    }
+
+
+def recorded_resolved(row_id: str, version: int, at: str) -> dict[str, Any]:
+    return {
+        "action": answers.RESOLVED,
+        "actor": "bob@example.test",
+        "authorized": True,
+        "authorizer": "HttpApprovalAnswer",
+        "created_at": at,
+        "decision": "approved",
+        "evidence": {
+            "authenticated_actor": {"adapter_bindings": [RUN_BINDING], "kind": "adapter"},
+            "kind": "http_approval_answer",
+            "route": {"kind": answers.SELECTION_KIND, "narrowing": "selected_set"},
+            "selection": selection_evidence(version),
+        },
+        "id": row_id,
+        "principal_kind": "adapter",
+        "principal_subject": None,
+        "reason": answers.NOTE,
+    }
+
+
+# Step 1's inline resume publication, refused when the worker's turn check
+# moved the tenant's lifecycle generation between its capture and its writer.
+RECORDED_PUBLICATION_REFUSED = {
+    "action": answers.RESUME_REFUSED,
+    "actor": "bob@example.test",
+    "authorized": False,
+    "authorizer": "HttpApprovalAnswer",
+    "created_at": "2026-11-08T15:35:40.295200",
+    "decision": "approved",
+    "evidence": {
+        "code": None,
+        "decision": "approved",
+        "detail": answers.AUTHORITY_UNAVAILABLE,
+        "key_id": RUN_KEY_ID,
+        "kind": answers.SELECTION_KIND,
+        "mode": "dynamic",
+        "route": tickets.TICKET_ROUTE,
+        "stage": "observe",
+        "status": 503,
+    },
+    "id": "6de9fda6-ffc6-48e6-a0f4-d1da79453b92",
+    "principal_kind": None,
+    "principal_subject": None,
+    "reason": answers.AUTHORITY_UNAVAILABLE,
+}
+# Step 1's answer: approved, its wake left owed (the row is not marked resumed).
+RECORDED_X1_ANSWER = {
+    "approval_status": "approved",
+    "audit": [
+        recorded_resolved("6784266a-043c-47fd-bca5-a3b919ed0b7e", 3, "2026-11-08T15:35:40.077319"),
+        RECORDED_PUBLICATION_REFUSED,
+    ],
+    "decision": "approved",
+    "detail": None,
+    "http": 200,
+    "status_after": "approved",
+    "status_before": "pending",
+    "resumed": False,
+}
+# Step 3's answer: approved with its wake published (the worker resumed it).
+RECORDED_X2_ANSWER = {
+    "approval_status": "approved",
+    "audit": [
+        recorded_resolved("c9c65b3a-44f7-450f-9f51-08f3bbb12b71", 4, "2026-11-08T15:35:59.375321")
+    ],
+    "decision": "approved",
+    "detail": None,
+    "http": 200,
+    "status_after": "approved",
+    "status_before": "pending",
+    "resumed": True,
+}
+# canonical-inactive: the disabled approver's answer, refused at recheck.
+RECORDED_X6_ANSWER = {
+    "approval_status": None,
+    "audit": [
+        {
+            "action": answers.DENIED,
+            "actor": "bob@example.test",
+            "authorized": False,
+            "authorizer": "HttpApprovalAnswer",
+            "created_at": "2026-11-08T15:36:39.207914",
+            "decision": "approved",
+            "evidence": {
+                "code": None,
+                "decision": "approved",
+                "detail": answers.CALLER_NOT_ALLOWED,
+                "key_id": RUN_KEY_ID,
+                "kind": answers.SELECTION_KIND,
+                "mode": "dynamic",
+                "route": tickets.TICKET_ROUTE,
+                "stage": "recheck",
+                "status": 403,
+            },
+            "id": "e6ab7a42-f143-49a8-92e5-7dc1dbd5bc98",
+            "principal_kind": "adapter",
+            "principal_subject": None,
+            "reason": answers.CALLER_NOT_ALLOWED,
+        }
+    ],
+    "decision": "approved",
+    "detail": answers.CALLER_NOT_ALLOWED,
+    "http": 403,
+    "status_after": "pending",
+    "status_before": "pending",
+    "resumed": False,
+}
+# The worker's own resume of step 3's approval after the ceiling dropped the
+# approver: the resume_refused row a refusing check writes.
+RECORDED_RESUME_REFUSED_CEILING = {
+    "action": answers.RESUME_REFUSED,
+    "actor": "bob@example.test",
+    "authorized": False,
+    "authorizer": "HttpApprovalAnswer",
+    "created_at": "2026-11-08T15:36:11.083681",
+    "decision": "approved",
+    "evidence": {
+        "code": answers.OUTSIDE_CEILING,
+        "kind": answers.SELECTION_KIND,
+        "mode": "dynamic",
+        "tool": "search_dashboards",
+        "actor": {"issuer": ISSUER, "subject": "identity-e2e-bob", "tenant_id": RUN_TENANT},
+        "route": tickets.TICKET_ROUTE,
+        "stage": "recheck",
+        "detail": answers.CALLER_NOT_ALLOWED,
+        "key_id": RUN_KEY_ID,
+        "status": 403,
+        "decision": "approved",
+        "equality": None,
+        "connector": "netpol-probe",
+        "exclusion": True,
+        "requester": None,
+        "exempt_group": None,
+        "exemption_used": False,
+        "selected_count": 1,
+        "configuration_version": 6,
+    },
+    "id": "dc5bebf8-231c-42c4-b049-0ee05a16bd13",
+    "principal_kind": None,
+    "principal_subject": None,
+    "reason": answers.CALLER_NOT_ALLOWED,
+}
+# A dry-run creation selecting the approver whose principal canonical-inactive
+# had left disabled: what the principal guard now prevents.
+RECORDED_X7_INACTIVE = {"http": 422, "detail": "approval_ticket_approver_inactive"}
+RECORDED_X6_ROW = {
+    "gate_kind": "permission",
+    "granted_tool": "mcp__netpol-probe__search_dashboards",
+    "id": X6_ID,
+    "requester": "identity-e2e-alice",
+    "resumed": False,
+    "route": tickets.TICKET_ROUTE,
+    "selected": ["identity-e2e-bob"],
+    "selected_sha256": "74899aa71df1f7662dfa55f6e0611cfd547948432807ac416d8fc2f2fca580cf",
+    "selection_key_id": RUN_KEY_ID,
+    "selection_mode": "dynamic",
+    "snapshot_sha256": "a54f3a23563c8c38b7818ecf00474cf677487a13ff4c396ea36e3596338ce738",
+    "status": "pending",
+}
+
+
+def outage_row(action: str, row_id: str, actor: str, principal_kind: str | None) -> dict[str, Any]:
+    """A 503 refusal at the observe stage, as the recorded publication refusal reads.
+
+    The product writes a refused answer's ``denied`` row and a refused check's
+    ``resume_refused`` row with the same function, so only these members differ.
+    """
+
+    row = copy.deepcopy(RECORDED_PUBLICATION_REFUSED)
+    row.update(action=action, id=row_id, actor=actor, principal_kind=principal_kind)
+    return row
+
+
+def check_response(decision: str, reason: str, stage: str) -> dict[str, Any]:
+    """A ``TurnAuthorityResponseV1`` body for one resume check, as the API answers it."""
+
+    return {
+        "schema_version": 1,
+        "request_id": str(uuid.uuid4()),
+        "stage": stage,
+        "event_id": answers.resume_event_id(APPROVAL_ID),
+        "context_sha256": hashlib.sha256(b"v1.synthetic-context").hexdigest(),
+        "scope": SCOPE,
+        "decision": decision,
+        "reason": reason,
+    }
+
+
+def check_answer(decision: str, reason: str) -> dict[str, Any]:
+    """The turn check's answer as the driver reads it, validated by the wire model first."""
+
+    body = check_response(decision, reason, answers.RESUME_STAGE)
+    parsed = TurnAuthorityResponseV1.model_validate_json(json.dumps(body))
+    return answers._decision(200, json.loads(parsed.model_dump_json()))
+
+
+def grant_answer(decision: str, reason: str) -> dict[str, Any]:
+    """The grant check's answer as the driver reads it (its ``check`` member)."""
+
+    body = {
+        "schema_version": 1,
+        "check": check_response(decision, reason, answers.GRANT_STAGE),
+        "grant_sha256": hashlib.sha256(b"grant").hexdigest(),
+    }
+    parsed = ApprovalGrantAuthorityResponseV1.model_validate_json(json.dumps(body))
+    return answers._decision(200, json.loads(parsed.model_dump_json())["check"])
+
+
+def wake_result(decision: str, reason: str, *rows: dict[str, Any]) -> dict[str, Any]:
+    """What the driver's ``resume`` action returns for one published wake."""
+
+    return {
+        "wake": True,
+        "stream_id": "1794152159532-0",
+        "wake_status": "approved",
+        "turn": check_answer(decision, reason),
+        "grant": grant_answer(decision, reason),
+        "audit": list(rows),
+        "resumed": True,
+    }
+
+
+UNAVAILABLE_WAKE = wake_result(
+    "unavailable",
+    answers.AUTHORITY_UNAVAILABLE,
+    outage_row(answers.RESUME_REFUSED, "r-turn", "alice@example.test", None),
+    outage_row(answers.RESUME_REFUSED, "r-grant", "alice@example.test", None),
+)
+
+
+def test_judge_resume_reads_an_outage_through_both_checks_and_their_audit_rows() -> None:
+    assert answers.judge_resume(UNAVAILABLE_WAKE, decision="unavailable") == []
+    assert answers.resume_transient(UNAVAILABLE_WAKE)
+    one = {**UNAVAILABLE_WAKE, "audit": UNAVAILABLE_WAKE["audit"][:1]}
+    assert any(
+        "not one per current check" in p for p in answers.judge_resume(one, decision="unavailable")
+    )
+    denied = copy.deepcopy(UNAVAILABLE_WAKE)
+    denied["audit"][1] = RECORDED_RESUME_REFUSED_CEILING
+    assert any("status 403" in p for p in answers.judge_resume(denied, decision="unavailable"))
+    unaudited = {**UNAVAILABLE_WAKE, "audit": []}
+    assert any(
+        "no new resume_refused" in p
+        for p in answers.judge_resume(unaudited, decision="unavailable")
+    )
+    allowed = wake_result("continue", "current_authority")
+    assert any(
+        "not unavailable" in p for p in answers.judge_resume(allowed, decision="unavailable")
+    )
+    assert answers.judge_resume(allowed, decision="continue") == []
+    refused = wake_result("refuse", answers.CALLER_NOT_ALLOWED, RECORDED_RESUME_REFUSED_CEILING)
+    assert answers.judge_resume(refused, decision="refuse") == []
+    assert any(
+        "not unavailable" in p for p in answers.judge_resume(refused, decision="unavailable")
+    )
+
+
 def test_selection_facts_read_top_level_or_nested_evidence() -> None:
     top = {"evidence": {"kind": answers.SELECTION_KIND, "requester_equal": True}}
     assert answers.evidence_fact(top, "equality") is True
@@ -730,6 +1035,397 @@ def test_creation_batches_group_by_selected_set_and_keep_static_ticketless() -> 
     assert batches[0]["cases"][0]["route"] == tickets.TICKET_ROUTE
 
 
+# --- the scenario's waits, principal guard and restores, against a fake driver --------------------
+
+
+class FakeDriver:
+    """The in-pod driver: each action answers its queued replies in order; every call is kept."""
+
+    def __init__(self, **replies: Sequence[Any]) -> None:
+        self.replies = {action: list(queue) for action, queue in replies.items()}
+        self.calls: list[tuple[str, dict[str, Any]]] = []
+
+    def __call__(self, action: str, **params: Any) -> dict[str, Any]:
+        self.calls.append((action, copy.deepcopy(params)))
+        queue = self.replies.get(action)
+        assert queue, f"unexpected driver call {action}"
+        reply = queue.pop(0)
+        return copy.deepcopy(reply(params) if callable(reply) else reply)
+
+    def actions(self) -> list[str]:
+        return [action for action, _ in self.calls]
+
+    def params(self, action: str) -> list[dict[str, Any]]:
+        return [params for name, params in self.calls if name == action]
+
+
+class FakeHarness:
+    """``send`` answers as the dry run's channel ingress did; ``api`` yields nothing used."""
+
+    def __init__(self) -> None:
+        self.sent: list[dict[str, Any]] = []
+
+    def send(
+        self, agent: str, sender: str, text: str, conversation: str | None = None
+    ) -> dict[str, Any]:
+        index = len(self.sent)
+        event = f"chn-{RUN_BINDING}-{index:016x}"
+        self.sent.append({"sender": sender, "conversation": conversation, "event_id": event})
+        return {
+            "agent": agent,
+            "sender": sender,
+            "delivery_id": f"<{index:032x}@identity-e2e.example.test>",
+            "conversation_id": conversation or f"<{index + 1:032x}@identity-e2e.example.test>",
+            "sent_at": 1794152099.4,
+            "http_status": 200,
+            "response": {"event_id": event, "stream_id": f"1794152099485-{index}"},
+        }
+
+    def api(self) -> Any:
+        return contextlib.nullcontext(None)
+
+
+SETTLED: dict[str, Any] = {"pending": []}
+RECEIVER = {"receiver_id": RECEIVER_ID, "generation": 1, "key": "unused-by-the-fake"}
+Y3_ID = APPROVAL_ID
+Y5_ID = "3b8e1f0a-6c2d-4e9b-8a7f-1d2c3b4a5e6f"
+X7_ID = "6a1d9c3e-2b4f-4d8a-9e7c-5f3b1a2d4c6e"
+
+
+def principals(**rows: Sequence[dict[str, Any]]) -> dict[str, Any]:
+    """A ``principals`` reply: each person's rows, named by first name."""
+
+    return {"rows": {f"identity-e2e-{name}": list(found) for name, found in rows.items()}}
+
+
+def created(name: str, approval_id: str) -> dict[str, Any]:
+    """A ``create`` reply: one 201 case and its row, the recorded x6 row under a new id."""
+
+    return {
+        "cases": [{"name": name, "results": [{"http": 201, "id": approval_id, "detail": None}]}],
+        "rows": {approval_id: {**RECORDED_X6_ROW, "id": approval_id}},
+    }
+
+
+def capture_reply(params: dict[str, Any]) -> dict[str, Any]:
+    """The ``capture`` facts the dry run recorded for its turns, per label."""
+
+    turns = {}
+    for label, turn in params["turns"].items():
+        subject = "identity-e2e-bob" if label == "approver" else "identity-e2e-alice"
+        turns[label] = {
+            "canonical": {"issuer": ISSUER, "subject": subject},
+            "event_id": turn["event_id"],
+            "outcome": "resolved",
+            "principal_present": True,
+            "reply_kind": "email",
+            "role_policy_version": 2,
+            "scope": {
+                "agent_id": RUN_AGENT,
+                "binding_generation": 1,
+                "binding_id": RUN_BINDING,
+                "provider": "email",
+                "tenant_id": RUN_TENANT,
+            },
+        }
+    return {"turns": turns}
+
+
+def fake_scenario(driver: FakeDriver, **attributes: Any) -> Any:
+    """An ``AnswerScenario`` whose driver, harness, roster override and settle are fakes."""
+
+    scenario: Any = object.__new__(answer_authority_scenario.AnswerScenario)
+    scenario.harness = FakeHarness()
+    scenario.evidence = identity_scenarios.Evidence(answers.SCENARIO)
+    scenario.drive = driver  # shadows the method, so nothing reaches a pod
+    scenario.agent, scenario.agent_id = "agent-a", RUN_AGENT
+    scenario.tenant_id, scenario.issuer = RUN_TENANT, ISSUER
+    scenario.people = dict(PEOPLE)
+    scenario.subjects = {
+        part: "identity-e2e-" + address.split("@")[0] for part, address in PEOPLE.items()
+    }
+    scenario.roster_data = copy.deepcopy(DEFAULT_ROSTER)
+    scenario.turns, scenario.free_turns, scenario.nonces = {}, [], {}
+    scenario.approvals, scenario.approved = {}, set()
+    scenario.keys = {"k1": {"seed_hex": "00" * 32, "key_id": RUN_KEY_ID}}
+    scenario.receiver, scenario.binding_id = RECEIVER, RUN_BINDING
+    scenario.waits = []
+    scenario.evidence.data["worker_waits"] = scenario.waits
+    roster: list[dict[str, Any]] = []
+
+    def roster_change(change: dict[str, Any]) -> dict[str, Any]:
+        roster.append(copy.deepcopy(change))
+        return {"overridden": sorted(change.get("upsert") or {}), "generation": len(roster)}
+
+    scenario.roster_change = roster_change
+    scenario.roster_log = roster
+    scenario.settle_base = lambda api, **changes: {"routes": {"written": False}}
+    for name, value in attributes.items():
+        setattr(scenario, name, value)
+    return scenario
+
+
+def stub_create(scenario: Any, **made: str) -> Callable[[dict[str, Any], str], dict[str, str]]:
+    def create(seen: dict[str, Any], step: str) -> dict[str, str]:
+        scenario.approvals.update(made)
+        return dict(made)
+
+    return create
+
+
+def test_no_step_starts_until_the_worker_finished_every_turn_the_run_sent() -> None:
+    driver = FakeDriver(
+        capture=[capture_reply],
+        principals=[principals(alice=[ACTIVE_ROW], bob=[ACTIVE_ROW])],
+        settled=[lambda params: {"pending": params["events"][-3:]}, SETTLED],
+    )
+    scenario = fake_scenario(driver)
+    scenario.send_turns()
+    sent = [turn["event_id"] for turn in scenario.harness.sent]
+    assert len(sent) == answers.TURN_COUNT + 1 == 21
+    assert driver.actions() == ["capture", "principals", "settled", "settled"]
+    first, second = driver.params("settled")
+    assert first["events"] == sent and second["events"] == sent[-3:]
+    assert first["wait_s"] == answers.SETTLE_CALL_S
+    settled = scenario.evidence.data["turns_settled"]
+    assert (settled["events"], settled["finished"], settled["calls"]) == (21, 21, 2)
+    assert scenario.evidence.data["worker_waits"] == [settled]
+    assert scenario.evidence.data["principals"] == {
+        PEOPLE[answers.REQUESTER]: [ACTIVE_ROW],
+        PEOPLE[answers.APPROVER]: [ACTIVE_ROW],
+    }
+    assert len(scenario.free_turns) == answers.TURN_COUNT
+
+
+def test_a_turn_the_worker_never_finishes_stops_the_run_naming_it(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(answers, "TURNS_SETTLE_S", 0.0)
+    driver = FakeDriver(
+        capture=[capture_reply],
+        principals=[principals(alice=[ACTIVE_ROW], bob=[ACTIVE_ROW])],
+        settled=[lambda params: {"pending": params["events"][:1]}],
+    )
+    scenario = fake_scenario(driver)
+    with pytest.raises(HarnessError, match="did not finish 1 of 21 events"):
+        scenario.send_turns()
+    assert driver.params("settled")[0]["wait_s"] == 0.0
+    assert scenario.waits[0]["finished"] == 20
+
+
+def test_an_answer_that_published_a_wake_returns_once_the_resumed_turn_finished() -> None:
+    driver = FakeDriver(answer=[RECORDED_X2_ANSWER], settled=[SETTLED])
+    scenario = fake_scenario(driver, approvals={"x2": X2_ID})
+    result = scenario.answer("x2", answers.APPROVER)
+    assert driver.actions() == ["answer", "settled"]
+    (settle,) = driver.params("settled")
+    assert settle["events"] == [f"approval-{X2_ID}-resolved"]
+    assert settle["wait_s"] == answers.SETTLE_CALL_S
+    assert result["worker"]["published"] is True and result["worker"]["finished"] == 1
+    assert "x2" in scenario.approved
+    assert scenario.waits == [{k: v for k, v in result["worker"].items() if k != "published"}]
+
+
+def test_an_owed_wake_or_a_refused_answer_waits_for_nothing() -> None:
+    driver = FakeDriver(answer=[RECORDED_X1_ANSWER, RECORDED_X6_ANSWER])
+    scenario = fake_scenario(driver, approvals={"x1": X1_ID, "x6": X6_ID})
+    owed = scenario.answer("x1", answers.APPROVER)
+    assert owed["worker"] == {"published": False}
+    refusal = answers.newest(owed["audit"], answers.RESUME_REFUSED)
+    assert refusal is not None and refusal["evidence"]["stage"] == "observe"
+    refused = scenario.answer("x6", answers.APPROVER)
+    assert "worker" not in refused
+    assert driver.actions() == ["answer", "answer"] and scenario.waits == []
+    assert answers.publishes_wake({**RECORDED_X2_ANSWER, "status_after": "rejected"})
+    assert not answers.publishes_wake(
+        {**RECORDED_X2_ANSWER, "http": 503, "status_after": "pending"}
+    )
+
+
+def test_a_creation_first_reactivates_a_selected_person_a_lookup_left_disabled() -> None:
+    """The dry run's x7, refused 422 because canonical-inactive left the approver disabled."""
+
+    driver = FakeDriver(
+        principals=[principals(bob=[DISABLED_ROW]), principals(bob=[ACTIVE_ROW])],
+        settled=[SETTLED],
+        create=[created("x7", X7_ID)],
+    )
+    scenario = fake_scenario(
+        driver,
+        free_turns=["r07"],
+        turns={"r07": {"stream_id": "1794152108167-0", "event_id": f"chn-{RUN_BINDING}-c1017df8"}},
+    )
+    seen: dict[str, Any] = {}
+    assert scenario.create(seen, "migrated-role-no-legacy-block") == {"x7": X7_ID}
+    assert driver.actions() == ["principals", "settled", "principals", "create"]
+    assert driver.params("principals")[0]["subjects"] == ["identity-e2e-bob"]
+    (turn,) = scenario.harness.sent
+    assert turn["sender"] == PEOPLE[answers.APPROVER] and turn["conversation"] is None
+    assert driver.params("settled")[0]["events"] == [turn["event_id"]]
+    report = seen["principals"][PEOPLE[answers.APPROVER]]
+    assert report["rows"] == [DISABLED_ROW] and report["rows_after"] == [ACTIVE_ROW]
+    assert report["reactivation"]["worker"]["finished"] == 1
+    assert seen["created"]["x7"]["http"] == 201
+
+
+def test_a_person_still_inactive_after_a_fresh_turn_fails_the_step_by_name() -> None:
+    driver = FakeDriver(
+        principals=[
+            principals(alice=[ACTIVE_ROW], bob=[DISABLED_ROW]),
+            principals(bob=[DISABLED_ROW]),
+        ],
+        settled=[SETTLED],
+    )
+    scenario = fake_scenario(driver, free_turns=["r11"])
+    scenario.provider_roster = lambda: {"senders": copy.deepcopy(DEFAULT_ROSTER["senders"])}
+    with pytest.raises(identity_scenarios.StepFailed, match="bob@example.test's principals") as err:
+        scenario.create({}, "separation-requester-excluded-alias")
+    assert RECORDED_X7_INACTIVE["detail"] in str(err.value)
+    assert "create" not in driver.actions()
+    assert driver.params("principals")[0]["subjects"] == ["identity-e2e-alice", "identity-e2e-bob"]
+    assert [turn["sender"] for turn in scenario.harness.sent] == [PEOPLE[answers.APPROVER]]
+
+
+def canonical_inactive_driver(*resumes: dict[str, Any]) -> FakeDriver:
+    return FakeDriver(
+        answer=[RECORDED_X6_ANSWER],
+        principals=[
+            principals(bob=[DISABLED_ROW]),
+            principals(bob=[DISABLED_ROW]),
+            principals(bob=[ACTIVE_ROW]),
+        ],
+        resume=list(resumes),
+        settled=[SETTLED],
+    )
+
+
+def test_canonical_inactive_restores_the_approver_when_its_resume_finds_no_wake() -> None:
+    """The dry run: step 1's wake was owed, the resume found none and the step failed."""
+
+    driver = canonical_inactive_driver({"wake": False, "audit": []})
+    scenario = fake_scenario(driver, approvals={"x1": X1_ID}, approved={"x1"})
+    scenario.create = stub_create(scenario, x6=X6_ID)
+    scenario.canonical_inactive()
+    (entry,) = scenario.evidence.data["steps"]
+    assert entry["passed"] is False
+    assert entry["failure"] == "resume: the API published no resume wake for the approval"
+    bob = PEOPLE[answers.APPROVER]
+    assert [sorted(change["upsert"]) for change in scenario.roster_log] == [[bob], [bob]]
+    assert scenario.roster_log[0]["upsert"][bob]["account_status"] == "disabled"
+    assert scenario.roster_log[1]["upsert"][bob] == answers.entry_of(DEFAULT_ROSTER, bob)
+    observed = entry["observed"]
+    assert observed["approver_principal_inactive"] == [DISABLED_ROW]
+    assert observed["restored"]["principal"][bob]["rows_after"] == [ACTIVE_ROW]
+    assert [turn["sender"] for turn in scenario.harness.sent] == [bob]
+    assert driver.actions() == [
+        "answer",
+        "principals",
+        "resume",
+        "principals",
+        "settled",
+        "principals",
+    ]
+
+
+def test_canonical_inactive_reactivates_the_approver_before_the_resume_continues() -> None:
+    refused = wake_result("refuse", answers.CALLER_NOT_ALLOWED, RECORDED_RESUME_REFUSED_CEILING)
+    driver = canonical_inactive_driver(refused, wake_result("continue", "current_authority"))
+    scenario = fake_scenario(driver, approvals={"x1": X1_ID}, approved={"x1"})
+    scenario.create = stub_create(scenario, x6=X6_ID)
+    scenario.canonical_inactive()
+    (entry,) = scenario.evidence.data["steps"]
+    assert entry["passed"] is True, entry.get("failure")
+    assert driver.actions() == [
+        "answer",
+        "principals",
+        "resume",
+        "principals",
+        "settled",
+        "principals",
+        "resume",
+    ]
+    assert entry["observed"]["resume_after_reactivation"]["turn"]["decision"] == "continue"
+
+
+OUTAGE_ANSWER = {
+    "approval_status": None,
+    "audit": [outage_row(answers.DENIED, "d-answer", "alice@example.test", "adapter")],
+    "decision": "approved",
+    "detail": answers.AUTHORITY_UNAVAILABLE,
+    "http": 503,
+    "status_after": "pending",
+    "status_before": "pending",
+    "resumed": False,
+}
+
+
+def outage_scenario(*resumes: dict[str, Any]) -> tuple[Any, FakeDriver]:
+    driver = FakeDriver(answer=[OUTAGE_ANSWER], resume=list(resumes))
+    scenario = fake_scenario(driver, approvals={"y3": Y3_ID}, approved={"y3"})
+    scenario.create = stub_create(scenario, y5=Y5_ID)
+    return scenario, driver
+
+
+def test_the_exemption_outage_reaches_answer_and_resume_and_is_never_retried() -> None:
+    scenario, driver = outage_scenario(
+        UNAVAILABLE_WAKE, wake_result("continue", "current_authority")
+    )
+    scenario.separation_exemption_unavailable()
+    (entry,) = scenario.evidence.data["steps"]
+    assert entry["passed"] is True, entry.get("failure")
+    observed = entry["observed"]
+    # Both outage calls answer as a concurrent change would, and neither is sent again.
+    assert driver.actions() == ["answer", "resume", "resume"]
+    assert observed["requester"]["attempts"] == 1 and observed["resume"]["attempts"] == 1
+    assert [params["approval_id"] for params in driver.params("resume")] == [Y3_ID, Y3_ID]
+    assert observed["resume_restored"]["grant"]["decision"] == "continue"
+    alice = PEOPLE[answers.REQUESTER]
+    base = answers.entry_of(DEFAULT_ROSTER, alice)
+    exempt = answers.with_groups(base, add=[answers.EXEMPT_GROUP])
+    assert [change["upsert"][alice] for change in scenario.roster_log] == [
+        exempt,
+        answers.unavailable(base),
+        exempt,
+        base,
+    ]
+
+
+def test_an_exemption_that_survives_the_outage_fails_the_step_and_still_restores() -> None:
+    scenario, driver = outage_scenario(wake_result("continue", "current_authority"))
+    scenario.separation_exemption_unavailable()
+    (entry,) = scenario.evidence.data["steps"]
+    assert entry["passed"] is False and "not unavailable" in entry["failure"]
+    assert driver.actions() == ["answer", "resume"]
+    alice = PEOPLE[answers.REQUESTER]
+    assert len(scenario.roster_log) == 4
+    assert scenario.roster_log[-1]["upsert"][alice] == answers.entry_of(DEFAULT_ROSTER, alice)
+    assert entry["observed"]["lookup_restored"]["generation"] == 3
+
+
+def test_a_restore_runs_however_the_block_ends_and_never_hides_its_failure() -> None:
+    scenario = fake_scenario(FakeDriver())
+    seen: dict[str, Any] = {}
+    with scenario.restoring(seen, "done", lambda: "put back"):
+        pass
+    assert seen == {"done": "put back"}
+
+    def fails() -> Any:
+        raise HarnessError("the provider refused a roster change (400): bad")
+
+    with (
+        pytest.raises(identity_scenarios.StepFailed, match="the step's own"),
+        scenario.restoring(seen, "after_failure", fails),
+    ):
+        raise identity_scenarios.StepFailed("the step's own failure")
+    assert seen["after_failure"] == {"failed": "the provider refused a roster change (400): bad"}
+    with (
+        pytest.raises(HarnessError, match="refused a roster change"),
+        scenario.restoring(seen, "clean", fails),
+    ):
+        pass
+    assert "clean" not in seen
+
+
 # --- the in-pod half ------------------------------------------------------------------------------
 
 
@@ -763,6 +1459,73 @@ def test_the_bootstrap_loads_both_drivers_and_refuses_without_echoing() -> None:
     assert "x" * 50 not in answer["error"]
     assert "ab" * 32 not in result.stdout + result.stderr
     assert len(answers.POD_BOOTSTRAP) < 1000
+
+
+def test_settled_reads_the_workers_done_markers(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The worker's ``done_key`` under the prefix both the API and the worker default to."""
+
+    prefix = keyspace.WORKER_KEY_PREFIX_DEFAULT
+    finished, resumed = f"chn-{RUN_BINDING}-e3df5871b629a009", f"approval-{X1_ID}-resolved"
+    marked = {keyspace.done_key(prefix, finished)}
+    asked: list[str] = []
+
+    class Pipeline:
+        def __init__(self) -> None:
+            self.keys: list[str] = []
+
+        def exists(self, key: str) -> None:
+            self.keys.append(key)
+            asked.append(key)
+
+        def execute(self) -> list[int]:
+            return [1 if key in marked else 0 for key in self.keys]
+
+    class Client:
+        def pipeline(self, transaction: bool) -> Pipeline:
+            assert transaction is False
+            return Pipeline()
+
+        def close(self) -> None:
+            pass
+
+    def from_url(dsn: str, decode_responses: bool) -> Client:
+        assert decode_responses is True
+        return Client()
+
+    monkeypatch.setitem(
+        sys.modules, "redis", types.SimpleNamespace(Redis=types.SimpleNamespace(from_url=from_url))
+    )
+    settings = types.SimpleNamespace(
+        valkey_dsn=lambda: "redis://valkey:6379/0", worker_key_prefix=prefix
+    )
+    monkeypatch.setattr(answers, "_settings", lambda: settings)
+    result = answers.dispatch({"action": "settled", "events": [finished, resumed], "wait_s": 0})
+    assert result == {"pending": [resumed]}
+    assert asked == [keyspace.done_key(prefix, event) for event in (finished, resumed)]
+    assert asked[1] == f"curie:worker:done:approval-{X1_ID}-resolved"
+
+
+def test_principals_reads_each_subjects_rows_and_names_one_without_any(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setitem(sys.modules, "curie_api.db", types.SimpleNamespace(SCHEMA="curie"))
+    monkeypatch.setattr(
+        tickets,
+        "_sql",
+        lambda body: [{"subject": "identity-e2e-bob", **DISABLED_ROW}],
+    )
+    result = answers.dispatch(
+        {
+            "action": "principals",
+            "tenant_id": RUN_TENANT,
+            "issuer": ISSUER,
+            "subjects": ["identity-e2e-alice", "identity-e2e-bob"],
+        }
+    )
+    assert result == {"rows": {"identity-e2e-alice": [], "identity-e2e-bob": [DISABLED_ROW]}}
+    assert answers.active_human([ACTIVE_ROW]) and not answers.active_human([DISABLED_ROW])
+    assert not answers.active_human([{"status": "active", "type": "agent"}])
+    assert not answers.active_human(None)
 
 
 def test_the_creation_drivers_actions_are_delegated(monkeypatch: pytest.MonkeyPatch) -> None:
