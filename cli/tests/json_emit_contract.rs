@@ -108,8 +108,20 @@ fn dry_run_verbs() -> Vec<(Vec<String>, Vec<String>)> {
                         continue;
                     }
                     let id = a.get("id").and_then(|i| i.as_str()).unwrap_or("");
+                    let sample = a
+                        .get("possible_values")
+                        .and_then(|values| values.as_array())
+                        .and_then(|values| values.first())
+                        .and_then(|value| value.as_str())
+                        .unwrap_or_else(|| {
+                            if id == "agent" && path.join(" ") == "cluster role-filter" {
+                                "00000000-0000-0000-0000-000000000001"
+                            } else {
+                                placeholder(id)
+                            }
+                        });
                     if a.get("positional").and_then(|p| p.as_bool()) == Some(true) {
-                        required.push(placeholder(id).to_string());
+                        required.push(sample.to_string());
                     } else {
                         let long = a
                             .get("long")
@@ -125,7 +137,7 @@ fn dry_run_verbs() -> Vec<(Vec<String>, Vec<String>)> {
                                     && values.iter().any(|value| value == "false")
                             });
                         if !boolean_switch {
-                            required.push(placeholder(id).to_string());
+                            required.push(sample.to_string());
                         }
                     }
                 }

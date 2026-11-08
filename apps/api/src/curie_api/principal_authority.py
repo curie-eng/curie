@@ -17,7 +17,12 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from . import identity_audit
 from .models import ConsoleSession, Principal, Tenant, TenantIdentityProvider
-from .schemas.http_authority import AuthorityConfigV1, HttpSelectionV1, LocalProjectionSelectionV1
+from .schemas.http_authority import (
+    AuthorityConfigV1,
+    DisabledSelectionV1,
+    HttpSelectionV1,
+    LocalProjectionSelectionV1,
+)
 from .schemas.http_identity import (
     MAX_RESPONSE_BYTES,
     FactsRefusal,
@@ -107,12 +112,18 @@ async def lock_scope(
 
 def stored_configuration(row: TenantIdentityProvider) -> AuthorityConfigV1:
     """@spec HTTP-PRINCIPAL-ADOPTION-V1-2. Corruption never selects local mode."""
-    selection: HttpSelectionV1 | LocalProjectionSelectionV1
+    selection: HttpSelectionV1 | LocalProjectionSelectionV1 | DisabledSelectionV1
     try:
         _integer(row.lifecycle_generation)
         if row.http_selection is not None:
-            selection = HttpSelectionV1.model_validate(row.http_selection)
-            if selection.issuer != row.issuer or row.lifecycle_generation < 1:
+            selection = (
+                DisabledSelectionV1.model_validate(row.http_selection)
+                if row.http_selection.get("mode") == "disabled"
+                else HttpSelectionV1.model_validate(row.http_selection)
+            )
+            if (
+                isinstance(selection, HttpSelectionV1) and selection.issuer != row.issuer
+            ) or row.lifecycle_generation < 1:
                 raise ValueError
         else:
             selection = LocalProjectionSelectionV1.model_validate(
@@ -341,7 +352,8 @@ async def guarded_principal(
         )
     if row is not None and row.http_selection is not None:
         config = stored_configuration(row)
-        assert isinstance(config.selection, HttpSelectionV1)
+        if not isinstance(config.selection, HttpSelectionV1):
+            raise PrincipalAuthorityRefusal("http_authority_required")
         if principal is None or principal.tenant_id != tenant_id:
             raise PrincipalAuthorityRefusal("http_principal_not_provisioned")
         if principal.idp_issuer != config.selection.issuer:

@@ -1221,3 +1221,9 @@ values. Regenerate the command manifests for the new flags. This feature does
 not change release versions or authorize contract migrations.
 
 Tracked by [#4319](https://github.com/curie-eng/curie/issues/4319).
+
+HTTP identity operators can adopt, inspect, replace and retire an external
+provider with `curie cluster identity-authority`, and manage issuer group
+role filters with `curie cluster role-filter`. See the
+[operator runbook](../docs/http-identity-operator.md) for protected credential
+registration, versioned requests and refusal recovery.

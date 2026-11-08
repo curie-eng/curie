@@ -31,7 +31,6 @@ from curie_api.models import (
 )
 from curie_api.schemas.approvals import ApprovalResolutionTarget, ApprovalRouteBinding
 from curie_api.schemas.channels import BUILTIN_CLUSTER_MESSAGE_ADAPTER
-from curie_api.schemas.http_authority import HttpSelectionV1
 
 from .http_invocation import (
     HttpInvocationRuntime,
@@ -153,8 +152,8 @@ async def _http_tenant(session: AsyncSession, tenant_id: uuid.UUID) -> bool:
     row, sql_null = result
     if not sql_null and row.http_selection is None:
         _refuse(503, "authority_unavailable")
-    configuration = principal_authority.stored_configuration(row)
-    return isinstance(configuration.selection, HttpSelectionV1)
+    principal_authority.stored_configuration(row)
+    return not sql_null
 
 
 async def _selected(
