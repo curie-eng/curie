@@ -104,6 +104,7 @@ class Shell:
         runner_command: str | None = RUNNER_COMMAND,
         env: dict[str, str] | None = None,
         network: str | None = None,
+        slot: str = "proof-0",
     ) -> None:
         self.tls = tls
         self.name = f"curie-shell-proof-{uuid.uuid4().hex[:8]}"
@@ -120,7 +121,7 @@ class Shell:
             "-p",
             f"127.0.0.1:{self.port}:8443",
             "-e",
-            "CURIE_SUPERVISOR_SLOT=proof-0",
+            f"CURIE_SUPERVISOR_SLOT={slot}",
             "-e",
             f"CURIE_SUPERVISOR_CONTROL_TOKEN={CONTROL_TOKEN}",
             "-e",
@@ -381,12 +382,54 @@ def crash_platform():
         assert not _docker("network", "ls", "-q", "--filter", f"name=^{network}$").strip()
 
 
+def _crash_valkey():
+    from curie_test_support.valkey import (
+        CONNECT_TIMEOUT_SECONDS,
+        NO_RETRY,
+        VALKEY_HOST,
+        VALKEY_PORT,
+        VALKEY_PW,
+        connect_or_skip,
+    )
+    from redis import Redis
+
+    if not REQUIRED:
+        return connect_or_skip(decode_responses=True)
+    client = Redis(
+        host=VALKEY_HOST,
+        port=VALKEY_PORT,
+        password=VALKEY_PW or None,
+        decode_responses=True,
+        socket_connect_timeout=CONNECT_TIMEOUT_SECONDS,
+        retry=NO_RETRY,
+    )
+    try:
+        client.ping()
+    except Exception:
+        client.close()
+        raise
+    return client
+
+
+def test_required_crash_proof_refuses_unavailable_valkey(monkeypatch) -> None:
+    from curie_test_support import valkey
+    from redis.exceptions import ConnectionError
+
+    with socket.socket() as listener:
+        listener.bind(("127.0.0.1", 0))
+        monkeypatch.setattr(valkey, "VALKEY_HOST", "127.0.0.1")
+        monkeypatch.setattr(valkey, "VALKEY_PORT", listener.getsockname()[1])
+        monkeypatch.setattr(sys.modules[__name__], "REQUIRED", True)
+        with pytest.raises(ConnectionError):
+            _crash_valkey()
+
+
 @pytest.fixture
 def crash_case(tls: ShellTls, tmp_path: Path, phase: str, crash_platform):
     from aci_protocol import QueuedTurn, ReplyHandle
     from aci_protocol.s3 import build_s3_client
     from curie_dispatcher.queue import to_stream_fields
-    from curie_test_support.valkey import VALKEY_HOST, VALKEY_PORT, VALKEY_PW, connect_or_skip
+    from curie_test_support.valkey import VALKEY_HOST, VALKEY_PORT, VALKEY_PW
     from curie_worker.bundle_store import BundleStore
     from curie_worker.config import WorkerConfig
     from curie_worker.kernel.routing import _thread_key_for
@@ -405,10 +448,10 @@ def crash_case(tls: ShellTls, tmp_path: Path, phase: str, crash_platform):
     provider = f"curie-crash-provider-{identity[:8]}"
     network = crash_platform["network"]
     port = free_port()
-    shell = None
+    shells: list[Shell] = []
     bucket_created = False
     workers = []
-    valkey = connect_or_skip(decode_responses=True)
+    valkey = _crash_valkey()
     config = WorkerConfig(
         valkey_host=VALKEY_HOST,
         valkey_port=VALKEY_PORT,
@@ -515,29 +558,33 @@ def crash_case(tls: ShellTls, tmp_path: Path, phase: str, crash_platform):
                 return False
 
         wait_until(provider_ready, 20, "model provider ready")
-        shell = Shell.__new__(Shell)
-        Shell.__init__(
-            shell,
-            tls,
-            runner_command=None,
-            network=network,
-            env={
-                "CURIE_SUPERVISOR_CHILD_ENV": "ANTHROPIC_API_KEY",
-                "ANTHROPIC_API_KEY": "sk-ant-PLACEHOLDER",
-                "CURIE_SUPERVISOR_CHILD_ENV_PUBLIC": (
-                    "ANTHROPIC_BASE_URL,CURIE_MODEL,CURIE_RUNNER_CLEANUP_TIMEOUT_S,"
-                    "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC,DISABLE_TELEMETRY,OTEL_SDK_DISABLED"
-                ),
-                "ANTHROPIC_BASE_URL": "http://crash-provider:8089",
-                "CURIE_MODEL": "claude-sonnet-5",
-                "CURIE_RUNNER_CLEANUP_TIMEOUT_S": "1",
-                "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1",
-                "DISABLE_TELEMETRY": "1",
-                "OTEL_SDK_DISABLED": "true",
-                "CURIE_SUPERVISOR_SETTLE_TIMEOUT_SECONDS": "1",
-            },
-        )
-        wait_until(shell.answers, 20, "shell ready")
+        for index in range(2 if phase == "before" else 1):
+            shell = Shell.__new__(Shell)
+            shells.append(shell)
+            Shell.__init__(
+                shell,
+                tls,
+                runner_command=None,
+                network=network,
+                slot=f"proof-{index}",
+                env={
+                    "CURIE_SUPERVISOR_CHILD_ENV": "ANTHROPIC_API_KEY",
+                    "ANTHROPIC_API_KEY": "sk-ant-PLACEHOLDER",
+                    "CURIE_SUPERVISOR_CHILD_ENV_PUBLIC": (
+                        "ANTHROPIC_BASE_URL,CURIE_MODEL,CURIE_RUNNER_CLEANUP_TIMEOUT_S,"
+                        "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC,DISABLE_TELEMETRY,OTEL_SDK_DISABLED"
+                    ),
+                    "ANTHROPIC_BASE_URL": "http://crash-provider:8089",
+                    "CURIE_MODEL": "claude-sonnet-5",
+                    "CURIE_RUNNER_CLEANUP_TIMEOUT_S": "1",
+                    "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1",
+                    "DISABLE_TELEMETRY": "1",
+                    "OTEL_SDK_DISABLED": "true",
+                    "CURIE_SUPERVISOR_SETTLE_TIMEOUT_SECONDS": "1",
+                },
+            )
+            wait_until(shell.answers, 20, "shell ready")
+        shell = shells[0]
         storage.create_bucket(Bucket=config.bundle_bucket)
         bucket_created = True
         raw = io.BytesIO()
@@ -550,7 +597,10 @@ def crash_case(tls: ShellTls, tmp_path: Path, phase: str, crash_platform):
             Bucket=config.bundle_bucket, Key="bundle.tar.gz", Body=gzip.compress(raw.getvalue())
         )
         client = StaticPoolSandboxClient(
-            slots=[StaticShellSlot("proof-0", "localhost", shell.port, "crash-pool")],
+            slots=[
+                StaticShellSlot(f"proof-{index}", "localhost", shell.port, "crash-pool")
+                for index, shell in enumerate(shells)
+            ],
             redis_client=valkey,
             control_token=CONTROL_TOKEN,
             ssl_context=shell_ssl_context(str(tls.ca)),
@@ -641,7 +691,7 @@ def crash_case(tls: ShellTls, tmp_path: Path, phase: str, crash_platform):
         handle = substrate.claim(_thread_key_for(event), env=boot)
         spec = {
             "config": config.model_dump(mode="json"),
-            "port": shell.port,
+            "ports": [shell.port for shell in shells],
             "ca": str(tls.ca),
             "control": CONTROL_TOKEN,
             "sandbox_prefix": prefix + ":sandbox",
@@ -672,7 +722,7 @@ def crash_case(tls: ShellTls, tmp_path: Path, phase: str, crash_platform):
                 except subprocess.TimeoutExpired:
                     process.kill()
                     process.wait(5)
-        if shell is not None:
+        for shell in shells:
             shell.remove()
         _docker("rm", "-f", provider, check=False)
         assert not _docker("ps", "-aq", "--filter", f"name=^/{provider}$").strip()
@@ -743,7 +793,16 @@ def test_worker_kill_recovers_one_reply_and_retires_the_shell(crash_case, phase,
                 "turn ended before the kill point: "
                 + (case["logs"] / "worker-0.log").read_text()[-4000:]
             )
-        return observed[phase]
+        if not observed[phase]:
+            return False
+        if phase == "before":
+            return True
+        code, status = case["shell"].request(
+            "GET",
+            proxy_base_path(case["claim"], 1) + "/v1/status",
+            token=case["handle"].token,
+        )
+        return code == 200 and status["side_effect_emitted"] is True
 
     wait_until(reached, 60, f"real tool reached {phase} kill point")
     observed = state("/state")
@@ -754,8 +813,16 @@ def test_worker_kill_recovers_one_reply_and_retires_the_shell(crash_case, phase,
     worker.kill()
     worker.wait(5)
     assert worker.returncode == -9
-    state("/release", "POST")
     replacement = case["restart"]()
+    wait_until(
+        lambda: (
+            case["valkey"].hget(case["prefix"] + ":sandbox:static:slot:proof-0", "state")
+            == "quarantined"
+        ),
+        45,
+        "abandoned child retired and shell quarantined",
+    )
+    state("/release", "POST")
 
     def recovered() -> bool:
         if replacement.poll() is not None:
@@ -774,8 +841,17 @@ def test_worker_kill_recovers_one_reply_and_retires_the_shell(crash_case, phase,
     finals = [r for r in replies if r["event"] == "turn.completed"]
     assert len(finals) == 1
     assert finals[0]["event_id"] == case["event_id"]
+    assert finals[0]["outcome"] == ("delivered" if phase == "before" else "escalated")
+    assert state("/state")["tool_starts"] == 1
     answers = [r for r in replies if r["event"] in {"reply.update", "reply.post"} and r.get("text")]
-    assert answers
+    expected = (
+        "recovered"
+        if phase == "before"
+        else "curie-turn-failure: prior-side-effect\n\n"
+        "A prior attempt may already have executed an action; not retrying automatically. "
+        "Flagging for a human."
+    )
+    assert answers[-1]["text"] == expected
     assert sum(r["text"] == answers[-1]["text"] for r in answers) == 1
     assert case["valkey"].xlen(case["config"].dead_letter_stream_name()) == 0
     assert (
@@ -786,6 +862,7 @@ def test_worker_kill_recovers_one_reply_and_retires_the_shell(crash_case, phase,
         case["shell"].request("GET", "/_curie/supervisor/v1/shell", token=CONTROL_TOKEN)[1]["claim"]
         is None
     )
+    assert case["shell"].request("GET", "/_curie/supervisor/healthz", token=CONTROL_TOKEN)[0] == 503
     children = _docker(
         "exec",
         "--user",

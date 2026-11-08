@@ -656,8 +656,15 @@ Valkey. Maintenance observes missing ownership and allows
 `CURIE_ABANDONED_TURN_GRACE_S` (90 seconds by default) before checking the exact
 claim under the thread lock. A runner that remains active, unreadable or unable
 to confirm durable history is retired through its backend. Static shells stop
-the child and run cleanup before releasing the slot, or quarantine on failure.
-Healthy idle claims retain their routes. The bound and runner cleanup settings
+the child and run cleanup, then always quarantine the shell for abandoned-turn
+retirement. Its 503 health response asks the platform to replace it; only that
+replacement restores the slot. Settled deliveries remove their recovery watch,
+and maintenance ignores terminal events, preserving idle runners with deferred
+history and their workspace handoff fence. Failed retirements retain their watch
+and do not block other maintenance. Before retirement, recovery persists the
+runner's retained side-effect marker so reclaim escalates instead of replaying.
+Turns started through the attachment handoff currently register no recovery
+watch and are a known gap in this bound. The bound and runner cleanup settings
 are described in [the static substrate reference](../../docs/static-pool-substrate.md).
 
 ### Capability audit: every owner verb and the fence that gates it

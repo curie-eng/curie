@@ -38,6 +38,7 @@ from aci_protocol import (
     Final,
     Interrupt,
     SessionStatus,
+    SideEffectFlag,
     ToolAccess,
     ToolNote,
     parse_ndjson_line,
@@ -591,7 +592,14 @@ class SessionRunner:
         # The cap and turn size of the last unboundable turn (#3301).
         self._capacity_detail: str | None = None
         self._active_state: TurnState | None = None
+        self._side_effect_emitted = False
         self._turn_ready = False
+
+    @property
+    def side_effect_emitted(self) -> bool:
+        return self._side_effect_emitted or (
+            self._active_state is not None and self._active_state.side_effect_emitted
+        )
 
     @property
     def final_answer_required(self) -> bool:
@@ -1431,6 +1439,7 @@ class SessionRunner:
                     if self._final_answer is not None else None
                 ),
             )
+            self._side_effect_emitted = False
             self._active_state = state
             attachment_opener = (
                 self._attachment_access.begin(event)
@@ -1639,7 +1648,10 @@ class SessionRunner:
                             return
                         self._turn_ready = True
                         async for line in self._drive_turn(event, state, tracker, gen):
-                            if isinstance(parse_ndjson_line(line), Final):
+                            frame = parse_ndjson_line(line)
+                            if isinstance(frame, SideEffectFlag):
+                                self._side_effect_emitted = True
+                            if isinstance(frame, Final):
                                 # The terminal decision is authoritative once the
                                 # Final reaches the consumer, even if it closes
                                 # without requesting the generator's next item.
@@ -1780,6 +1792,7 @@ class SessionRunner:
                         self._status.value,
                         int((time.monotonic() - start) * 1000),
                     )
+                self._side_effect_emitted = self.side_effect_emitted
                 self._active_state = None
                 if self._attachment_access is not None:
                     self._attachment_access.end(attachment_opener)

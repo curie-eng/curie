@@ -71,11 +71,14 @@ until the shell answers again.
 Each fenced turn records its claim and delivery lease before it starts. After
 that lease is first observed absent, `CURIE_ABANDONED_TURN_GRACE_S` allows
 90 seconds for cleanup, plus the maintenance cadence. Maintenance takes the
-thread lock and checks the exact claim again. An idle runner with durable
+thread lock and checks the exact claim again. Settling a delivery removes its
+watch; maintenance also discards watches whose event is terminal. An idle runner
+with deferred history from a completed delivery keeps its route and its existing
+workspace handoff fence. For unfinished deliveries, an idle runner with durable
 history keeps its route. An active, unreadable or non-durable runner is retired
-through the supervisor. The slot becomes free only after the supervisor confirms
-the child stopped and cleanup succeeded; failed settlement or cleanup quarantines
-it. This recovery also applies to Docker and Kubernetes through their normal
+through the supervisor. Abandoned-turn retirement always quarantines the static
+shell after stopping its child and running cleanup. Its health endpoint returns
+503; capacity returns only after the platform replaces the shell. This recovery also applies to Docker and Kubernetes through their normal
 claim retirement paths. An unreachable shell stays leased until retirement can
 be confirmed.
 
@@ -99,6 +102,14 @@ Recovery of an admitted capacity turn first quiesces its recorded runner epoch,
 then removes the exact predecessor watch before starting its replacement turn.
 A completed predecessor is recognized through the existing terminal ledger;
 other unfinished predecessors must still reach a durable handoff boundary.
+The runner retains whether its latest turn emitted a side effect in authenticated
+status. Recovery persists that marker before retiring the claim and checks it
+again after preflight, so an unacknowledged side effect escalates instead of
+replaying. Each failed retirement retains its watch for the next pass without
+preventing other maintenance.
+
+Known gap: turns started through the attachment handoff do not register a
+recovery watch. They do not receive this abandoned-turn retirement bound.
 
 When every slot of a pool is leased, a claim fails with
 `CapacityExhaustedError` carrying a capacity rejection for one `pods` unit in

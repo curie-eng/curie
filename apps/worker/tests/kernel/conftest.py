@@ -775,6 +775,7 @@ class FakeRunner:
         self.turn_ready = False
         self.admission_timeout_s = 5.0
         self.history_durable = True
+        self.side_effect_emitted = False
         self.session_status = "idle-awaiting-input"
         # When set, /status answers 500 so a test can drive the fail-closed
         # liveness read (an unreadable session must count as busy).
@@ -840,6 +841,7 @@ class FakeRunner:
             "status": self.session_status,
             "turn_active": self.turn_active,
             "history_durable": self.history_durable,
+            "side_effect_emitted": self.side_effect_emitted,
         }
         if self.tool_access_enforced is not None:
             body["tool_access"] = list(self.tool_access_enforced)

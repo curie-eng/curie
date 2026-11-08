@@ -3266,3 +3266,28 @@ def test_batched_reviewer_credit_refusal_cannot_replace_the_usage_limit_remedy()
     assert events[-1].status is SessionStatus.CLASSIFIED_FAILURE
     assert fake.interrupts >= 1
     assert all(sentinel not in getattr(event, "text", "") for event in events)
+
+
+def test_status_retains_abandoned_side_effect_until_the_next_turn() -> None:
+    scripts = iter((default_turn(), [m for m in default_turn() if isinstance(m, ResultMessage)]))
+
+    async def go() -> None:
+        runner, _fake = _runner(lambda: next(scripts))
+        async with TestClient(TestServer(create_app(runner))) as client:
+            await runner.start()
+            stream = runner.run_turn(Event(type="message", text="mutate", user="U", ts="1"))
+            async for line in stream:
+                if any(frame.type == "side_effect_flag" for frame in parse_ndjson(line)):
+                    break
+            assert (await (await client.get("/v1/status")).json())["side_effect_emitted"] is True
+            await stream.aclose()
+            status = await (await client.get("/v1/status")).json()
+            assert status["turn_active"] is False
+            assert status["side_effect_emitted"] is True
+            async for _line in runner.run_turn(
+                Event(type="message", text="clean", user="U", ts="2")
+            ):
+                pass
+            assert (await (await client.get("/v1/status")).json())["side_effect_emitted"] is False
+
+    anyio.run(go)
