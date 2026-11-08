@@ -10758,6 +10758,23 @@ export const commandManifest = {
           "name": "oidc-e2e"
         },
         {
+          "about": "Verify approval deadlines and reference retention in a disposable install",
+          "args": [
+            {
+              "global": false,
+              "id": "args",
+              "num_args": {
+                "max": 18446744073709552000,
+                "min": 1
+              },
+              "positional": true,
+              "required": true
+            }
+          ],
+          "hidden": false,
+          "name": "approval-schedule-e2e"
+        },
+        {
           "about": "Drive real HTTP identity turns against a disposable install (`python3 tools/identity-e2e/identity_e2e.py`). `up` overlays a TLS test identity provider, the API's HTTP identity runtime and one email binding per agent onto an existing release; `send` posts a signed email turn; `observe` decodes the turn's connector caller token with the signature redacted; `prove --scenario <name>` runs a scripted scenario and writes JSON evidence; `down` removes it all. Every action takes an explicit --context, --namespace, --release and --state-dir",
           "args": [
             {

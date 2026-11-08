@@ -3347,6 +3347,19 @@
               }
             ]
           },
+          "expires_in_seconds": {
+            "anyOf": [
+              {
+                "exclusiveMinimum": 0.0,
+                "maximum": 315360000.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Expires In Seconds"
+          },
           "notification": {
             "anyOf": [
               {
@@ -3387,6 +3400,17 @@
                 "type": "null"
               }
             ]
+          },
+          "expires_in_seconds": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Expires In Seconds"
           },
           "notification": {
             "anyOf": [

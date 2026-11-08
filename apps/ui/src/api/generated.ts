@@ -5508,6 +5508,8 @@ export interface components {
          */
         ApprovalRouteBinding: {
             approvers?: components["schemas"]["ApprovalApprovers"] | null;
+            /** Expires In Seconds */
+            expires_in_seconds?: number | null;
             notification?: components["schemas"]["ApprovalNotificationTarget"] | null;
             /** Resolution */
             resolution: components["schemas"]["ApprovalResolutionTarget"] | components["schemas"]["ApprovalRequestingSurfaceTarget"];
@@ -5518,6 +5520,8 @@ export interface components {
          */
         ApprovalRouteBindingOut: {
             approvers?: components["schemas"]["ApprovalApproversOut"] | null;
+            /** Expires In Seconds */
+            expires_in_seconds?: number | null;
             notification?: components["schemas"]["ApprovalTargetOut"] | null;
             /** Resolution */
             resolution: components["schemas"]["ApprovalTargetOut"] | components["schemas"]["ApprovalRequestingSurfaceTargetOut"];

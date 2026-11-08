@@ -223,7 +223,7 @@ pub(super) fn build_route_bindings(
                             "a route binding requires `resolution: {kind: \"slack\", \
                              address: \"C...\"}` or `resolution: {mode: \
                              \"requesting_surface\"}` and accepts optional `notification` and \
-                             `approvers` blocks, and nothing else. The retired `channel` key \
+                             `approvers` blocks and `expires_in_seconds` (positive integer or null). The retired `channel` key \
                              is not accepted",
                         ),
                     )
@@ -245,6 +245,7 @@ pub(super) fn build_route_bindings(
                 resolution: crate::api::ApprovalResolutionWrite::slack(channel),
                 notification: None,
                 approvers: None,
+                expires_in_seconds: None,
             });
     }
 

@@ -89,6 +89,8 @@ _NON_BOOT_ALLOWLIST: frozenset[str] = frozenset(
     {
         # The worker service's own settings (WorkerConfig validation_alias), read
         # from the WORKER's env at worker startup. Never a sandbox boot key.
+        # WorkerConfig gates ApprovalCardStore retention in the worker service.
+        "CURIE_APPROVAL_PENDING_RETENTION_ENABLED",
         # The inbound-attachment lane's operator envelope (#2567): the lane's own
         # off switch, the per-file size cap and the reference/retention TTLs,
         # read from the WORKER's env by WorkerConfig at startup and consumed by

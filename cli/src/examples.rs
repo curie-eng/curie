@@ -2667,6 +2667,7 @@ fn route_binding_as_write(
         // notification first (`refuse_unwritable_notifications`).
         notification: None,
         approvers: binding.approvers.clone(),
+        expires_in_seconds: binding.expires_in_seconds,
     }
 }
 
@@ -2699,6 +2700,9 @@ fn sre_approvals_route_map(
                 users: Some(approvers.to_vec()),
                 emails: None,
             }),
+            expires_in_seconds: existing
+                .and_then(|routes| routes.get(SRE_APPROVALS_ROUTE))
+                .and_then(|binding| binding.expires_in_seconds),
         },
     );
     map

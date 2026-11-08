@@ -1363,3 +1363,75 @@ async fn approver_emails_refuse_a_fixed_target_an_empty_list_and_a_display_name(
         assert!(message.contains(expected), "{expected}: {message}");
     }
 }
+
+#[tokio::test]
+async fn route_deadlines_preserve_omitted_positive_and_explicit_null() {
+    let bound = r#"{"omitted":{"resolution":{"kind":"slack","address":"C0EXAMPLE1"}},"finite":{"resolution":{"kind":"slack","address":"C0EXAMPLE1"},"expires_in_seconds":3600},"indefinite":{"resolution":{"kind":"slack","address":"C0EXAMPLE1"},"expires_in_seconds":null}}"#;
+    let vectors: serde_json::Value = serde_json::from_str(include_str!(
+        "../../tests/vectors/approval-route-deadlines.json"
+    ))
+    .unwrap();
+    let mut bindings: serde_json::Value = serde_json::from_str(bound).unwrap();
+    for (index, value) in vectors["valid"].as_array().unwrap().iter().enumerate() {
+        bindings[format!("deadline-{index}")] = serde_json::json!({
+            "resolution": {"kind": "slack", "address": "C0EXAMPLE1"},
+            "expires_in_seconds": value
+        });
+    }
+    let bound = bindings.to_string();
+    let server = router_stub("null");
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("routes.json");
+    std::fs::write(&path, &bound).unwrap();
+    let out = run(
+        &server,
+        ApprovalCmd {
+            routes_from: Some(path),
+            ..ApprovalCmd::default()
+        },
+    )
+    .await
+    .expect("all three deadline choices are valid");
+    let patch = patch_body(&server);
+    let expected: serde_json::Value = serde_json::from_str(&bound).unwrap();
+    assert_eq!(patch["approval_routes"], expected);
+    let rendered = out.to_json();
+    for (index, value) in vectors["valid"].as_array().unwrap().iter().enumerate() {
+        assert_eq!(
+            rendered["routes"][format!("deadline-{index}")]["expires_in_seconds"],
+            *value
+        );
+    }
+    assert_eq!(rendered["routes"]["finite"]["expires_in_seconds"], 3600);
+    assert_eq!(
+        rendered["routes"]["indefinite"]["expires_in_seconds"],
+        serde_json::Value::Null
+    );
+    assert!(rendered["routes"]["omitted"]
+        .get("expires_in_seconds")
+        .is_none());
+}
+
+#[tokio::test]
+async fn invalid_deadline_values_never_write_routes() {
+    let vectors: serde_json::Value = serde_json::from_str(include_str!(
+        "../../tests/vectors/approval-route-deadlines.json"
+    ))
+    .unwrap();
+    for value in vectors["invalid"].as_array().unwrap() {
+        let server = stub("null", "null");
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("routes.json");
+        std::fs::write(&path, format!(r#"{{"review":{{"resolution":{{"kind":"slack","address":"C0EXAMPLE1"}},"expires_in_seconds":{value}}}}}"#)).unwrap();
+        assert!(run(
+            &server,
+            ApprovalCmd {
+                routes_from: Some(path),
+                ..ApprovalCmd::default()
+            }
+        )
+        .await
+        .is_err());
+        assert_no_write(&server);
+    }
+}

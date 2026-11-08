@@ -23,14 +23,20 @@ workers rolled kept its live Approve/Reject buttons forever if it later EXPIRED
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
+from collections import deque
 from dataclasses import asdict, dataclass
-from typing import Any
+from datetime import datetime
+from typing import TYPE_CHECKING, Any
 
 from redis.asyncio import Redis
 
 from .config import WorkerConfig
+
+if TYPE_CHECKING:
+    from .approvals import ApprovalReader
 
 logger = logging.getLogger(__name__)
 
@@ -45,11 +51,46 @@ else
 end
 """
 
-# The card outlives the turn that posted it by however long the approval SLA runs
-# (hours to days), so its memory must too. A fixed, generous ceiling avoids a new
-# boot-env knob: an entry that outlives this is only ever cleaned up by TTL, and a
-# card whose memory lapsed simply is not auto-disabled (the resolve-click path
-# still heals it on the next interaction).
+_WRITE_REFERENCE_LUA = """
+local ending = redis.call('get', KEYS[2])
+if ARGV[5] == '1' and (not ending or redis.call('exists', KEYS[1]) == 1) then return 0 end
+local previous_ttl = redis.call('pttl', KEYS[1])
+if ending then
+    redis.call('set', KEYS[1], ARGV[1], 'PXAT', ending)
+elseif ARGV[3] == '1' or previous_ttl == -1 then
+    redis.call('set', KEYS[1], ARGV[1])
+else
+    redis.call('set', KEYS[1], ARGV[1], 'PX', ARGV[4])
+end
+if not ending then redis.call('sadd', KEYS[3], ARGV[2]) end
+return 1
+"""
+
+_SETTLE_REFERENCES_LUA = """
+local clock = redis.call('time')
+local now = tonumber(clock[1]) * 1000 + math.floor(tonumber(clock[2]) / 1000)
+local ending = tonumber(redis.call('get', KEYS[4]))
+if not ending then
+    ending = tonumber(ARGV[2])
+    if ending == 0 then ending = now + tonumber(ARGV[3]) end
+    if ending > now then redis.call('set', KEYS[4], ending, 'PXAT', ending) end
+end
+for i = 1, 3 do
+    if ending <= now then redis.call('del', KEYS[i])
+    else redis.call('pexpireat', KEYS[i], ending) end
+end
+redis.call('srem', KEYS[5], ARGV[1])
+return 1
+"""
+
+_PERSIST_PENDING_LUA = """
+if redis.call('exists', KEYS[4]) == 0 then
+    for i = 1, 3 do redis.call('persist', KEYS[i]) end
+end
+return 1
+"""
+
+# Terminal reference retention. Pending retention is controlled by the rollout gate.
 DEFAULT_CARD_TTL_S = 14 * 24 * 60 * 60
 
 # One SCAN page. The boot pass walks a single narrow prefix once, so this only
@@ -187,6 +228,8 @@ class ApprovalCardStore:
         self._redis = redis
         self._config = config
         self._ttl_s = ttl_s
+        self._retention_cursor = 0
+        self._retention_buffer: deque[str] = deque()
 
     async def remember(
         self,
@@ -215,64 +258,169 @@ class ApprovalCardStore:
         )
         await self._write(approval_id, ref)
 
-    async def _write(
-        self, key: str, ref: ApprovalCardRef, *, nx: bool = False
-    ) -> None:
-        payload = json.dumps(asdict(ref))
-        await self._redis.set(
-            self._config.approval_card_key(key), payload, ex=self._ttl_s, nx=nx
+    async def _write(self, key: str, ref: ApprovalCardRef) -> None:
+        await self._write_reference(
+            key, self._config.approval_card_key(key), json.dumps(asdict(ref))
         )
 
-    async def restore(self, key: str, ref: ApprovalCardRef) -> None:
-        """Restore a popped ref only when no newer ref replaced it."""
-
-        await self._write(key, ref, nx=True)
-
     async def pop(self, key: str) -> ApprovalCardRef | None:
-        """Atomically return and delete a remembered ref."""
-
+        """Bound terminal retention before taking a publication card for delivery."""
+        await self.settle(key)
         raw = await self._redis.getdel(self._config.approval_card_key(key))
-        if not raw:
-            return None
+        data = _load(raw) if raw else None
+        return _parse_ref(data) if data is not None else None
+
+    async def restore(self, key: str, ref: ApprovalCardRef) -> None:
+        """Restore an unsettled delivery within its original terminal window."""
+        await self._write_reference(
+            key,
+            self._config.approval_card_key(key),
+            json.dumps(asdict(ref)),
+            terminal_restore=True,
+        )
+
+    def _reference_keys(self, approval_id: str) -> list[str]:
+        return [
+            self._config.approval_card_key(approval_id),
+            self._config.approval_notice_ref_key(approval_id),
+            self._config.approval_reply_below_card_key(approval_id),
+        ]
+
+    async def _write_reference(
+        self,
+        approval_id: str,
+        key: str,
+        payload: str,
+        *,
+        terminal_restore: bool = False,
+    ) -> None:
+        await self._redis.eval(
+            _WRITE_REFERENCE_LUA,
+            3,
+            key,
+            self._config.approval_retention_key(approval_id),
+            self._config.approval_references_pending_key(),
+            payload,
+            approval_id,
+            int(self._config.approval_pending_retention_enabled),
+            self._ttl_s * 1000,
+            int(terminal_restore),
+        )
+
+    async def settle(self, approval_id: str, *, settled_at: datetime | None = None) -> None:
+        """Bound every surviving reference before terminal delivery. @spec APPROVAL-SCHEDULE-4."""
+        deadline_ms = int(settled_at.timestamp() * 1000) + self._ttl_s * 1000 if settled_at else 0
+        await self._redis.eval(
+            _SETTLE_REFERENCES_LUA,
+            5,
+            *self._reference_keys(approval_id),
+            self._config.approval_retention_key(approval_id),
+            self._config.approval_references_pending_key(),
+            approval_id,
+            deadline_ms,
+            self._ttl_s * 1000,
+        )
+
+    async def _reconcile_one(self, approval_id: str, reader: ApprovalReader) -> bool:
+        from .approvals import ApprovalMissing
+
+        if not any([await self._redis.exists(key) for key in self._reference_keys(approval_id)]):
+            await self._redis.srem(self._config.approval_references_pending_key(), approval_id)
+            return True
         try:
-            data = json.loads(raw)
-            return ApprovalCardRef(
-                channel=str(data["channel"]),
-                ts=str(data["ts"]),
-                summary=str(data["summary"]),
-                endpoint=data.get("endpoint"),
-                requested_by=str(data.get("requested_by") or ""),
-                kind=str(data.get("kind") or ""),
-                adapter=data.get("adapter"),
+            record = await reader.get(approval_id)
+        except ApprovalMissing:
+            await self.settle(approval_id)
+            return True
+        if record is None:
+            return False
+        if record.status in {"approved", "rejected", "expired"}:
+            when = record.resolved_at or (record.expires_at if record.status == "expired" else None)
+            await self.settle(approval_id, settled_at=when)
+        elif record.status == "pending" and self._config.approval_pending_retention_enabled:
+            await self._redis.eval(
+                _PERSIST_PENDING_LUA,
+                4,
+                *self._reference_keys(approval_id),
+                self._config.approval_retention_key(approval_id),
             )
-        except (ValueError, KeyError, TypeError):
-            return None
+        return True
+
+    async def reconcile_pending(self, reader: ApprovalReader, *, limit: int = 100) -> int:
+        """Visit a bounded page of the owned approval-id index, never the keyspace."""
+        if not self._retention_buffer:
+            self._retention_cursor, members = await self._redis.sscan(
+                self._config.approval_references_pending_key(),
+                self._retention_cursor,
+                count=limit,
+            )
+            self._retention_buffer.extend(
+                member.decode() if isinstance(member, bytes) else member for member in members
+            )
+        processed = 0
+        while self._retention_buffer and processed < limit:
+            await self._reconcile_one(self._retention_buffer.popleft(), reader)
+            processed += 1
+        return processed
+
+    async def reconcile_after_drain(self, reader: ApprovalReader, *, writers_drained: bool) -> int:
+        """One operator-invoked migration of surviving references after the writer roll."""
+        if not writers_drained or not self._config.approval_pending_retention_enabled:
+            raise ValueError("drained writers and enabled pending retention are required")
+        enrolled = 0
+        for segment in ("approval-card", "approval-notice-ref", "approval-reply-below-card"):
+            prefix = f"{self._config.key_prefix}:{segment}:"
+            async for key in self._redis.scan_iter(match=f"{prefix}*", count=_MIGRATION_SCAN_COUNT):
+                name = key.decode() if isinstance(key, bytes) else key
+                approval_id = name[len(prefix) :]
+                if approval_id:
+                    await self._redis.sadd(
+                        self._config.approval_references_pending_key(), approval_id
+                    )
+                    if not await self._reconcile_one(approval_id, reader):
+                        raise RuntimeError(
+                            "approval state unavailable; reconciliation is incomplete"
+                        )
+                    enrolled += 1
+        return enrolled
+
+    async def run_retention(self, reader: ApprovalReader, shutdown: asyncio.Event) -> None:
+        """Keep the reference index bounded, including when pending retention is disabled."""
+        while not shutdown.is_set():
+            try:
+                await self.reconcile_pending(reader)
+            except Exception:  # noqa: BLE001 - one dependency failure must not stop cleanup
+                logger.exception("approval reference retention pass failed")
+            try:
+                await asyncio.wait_for(shutdown.wait(), timeout=10.0)
+            except TimeoutError:
+                pass
 
     async def remember_notice_ref(self, approval_id: str, ref: str) -> None:
         """Remember the ref a pending notice minted for a ref-less row (#2721).
 
         The row is persisted before any delivery, so a placeholderless turn's
         record carries no ref; this is the only memory of the message the resume
-        should edit. Same TTL as the card, for the same SLA reason.
+        should edit. Shares the card retention owner.
         """
 
         if not approval_id:
             raise ValueError("approval_id is required to remember a notice ref")
-        await self._redis.set(
-            self._config.approval_notice_ref_key(approval_id), ref, ex=self._ttl_s
+        await self._write_reference(
+            approval_id, self._config.approval_notice_ref_key(approval_id), ref
         )
 
     async def remember_reply_below_card(self, approval_id: str) -> None:
         """Remember that this approval's resume answers below its card (ADR-0179).
 
         Kept apart from the card ref, which settling consumes, so a redelivered
-        resume still finds it. Same TTL as the card.
+        resume still finds it. Shares the card retention owner.
         """
 
         if not approval_id:
             raise ValueError("approval_id is required to remember a reply placement")
-        await self._redis.set(
-            self._config.approval_reply_below_card_key(approval_id), b"1", ex=self._ttl_s
+        await self._write_reference(
+            approval_id, self._config.approval_reply_below_card_key(approval_id), "1"
         )
 
     async def replies_below_card(self, approval_id: str) -> bool:
@@ -521,3 +669,38 @@ class ApprovalCardStore:
         # what protects a still-running old replica that rewrote it mid-pass.
         await self._consume_key(key, raw)
         return bool(written)
+
+
+async def _reconcile_main() -> None:
+    import argparse
+
+    import httpx
+
+    from .approvals import ApprovalClient
+
+    parser = argparse.ArgumentParser(
+        description="Reconcile surviving approval references after drain"
+    )
+    parser.add_argument("--writers-drained", action="store_true", required=True)
+    args = parser.parse_args()
+    config = WorkerConfig()
+    redis = Redis(**config.valkey_client_kwargs())
+    try:
+        async with httpx.AsyncClient() as http:
+            reader = ApprovalClient(
+                api_base_url=config.api_base_url,
+                api_key=config.api_key,
+                client=http,
+                read_timeout_s=2.0,
+            )
+            count = await ApprovalCardStore(redis, config).reconcile_after_drain(
+                reader,
+                writers_drained=args.writers_drained,
+            )
+            print(json.dumps({"references_reconciled": count}))
+    finally:
+        await redis.aclose()
+
+
+if __name__ == "__main__":
+    asyncio.run(_reconcile_main())

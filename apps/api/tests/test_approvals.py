@@ -1644,6 +1644,21 @@ def test_gate_kind_check_constraint_rejects_unknown_values(
         asyncio.run(_insert("bogus"))
 
 
+def _historical_unbound_route_approval(
+    client: TestClient, auth: dict[str, str], payload: dict[str, Any]
+) -> dict[str, Any]:
+    refused = client.post("/approvals", json=payload, headers=auth)
+    assert refused.status_code == 422, refused.text
+    assert refused.json()["detail"] == "approval route is missing or malformed"
+    created = client.post("/approvals", json={**payload, "route": None}, headers=auth)
+    assert created.status_code == 201, created.text
+    approval_id = created.json()["id"]
+    _requester_edit(approval_id, route=payload["route"])
+    record = client.get(f"/approvals/{approval_id}", headers=auth)
+    assert record.status_code == 200, record.text
+    return record.json()
+
+
 def test_route_bound_approval_with_no_agent_resolves_through_neither_channel(
     approvals_client: TestClient,
     auth_headers: dict[str, str],
@@ -1672,11 +1687,11 @@ def test_route_bound_approval_with_no_agent_resolves_through_neither_channel(
     authority.
     """
 
-    created = approvals_client.post(
-        "/approvals",
-        json=_payload(route="managers", card_channel="C_MGRS"),
-        headers=auth_headers,
-    ).json()
+    created = _historical_unbound_route_approval(
+        approvals_client,
+        auth_headers,
+        _payload(route="managers", card_channel="C_MGRS"),
+    )
     assert created["route"] == "managers"
     assert created["card_channel"] == "C_MGRS"
     assert created["agent_id"] is None
@@ -3108,9 +3123,9 @@ def test_agentless_routed_approval_fails_closed_without_a_binding(
     so a routed agentless approval fails closed too.
     """
 
-    created = approvals_client.post(
-        "/approvals", json=_routed_payload(None, author=_APPROVER), headers=auth_headers
-    ).json()
+    created = _historical_unbound_route_approval(
+        approvals_client, auth_headers, _routed_payload(None, author=_APPROVER)
+    )
     assert created["agent_id"] is None
     assert created["route"] == "managers"
 
@@ -3162,11 +3177,11 @@ def test_a_route_absent_from_the_map_is_unresolvable_and_borrows_no_other_route(
         auth_headers,
         {"legal": {"resolution": _slack_resolution(_ELSEWHERE), "approvers": {"users": [_LISTED]}}},
     )
-    created = approvals_client.post(
-        "/approvals",
-        json=_routed_payload(agent_id, author=_APPROVER),
-        headers=auth_headers,
-    ).json()
+    created = _historical_unbound_route_approval(
+        approvals_client,
+        auth_headers,
+        _routed_payload(agent_id, author=_APPROVER),
+    )
 
     # The OTHER route's allowlist must not leak onto this one -- and the reason
     # proves the legal binding was never consulted in the first place.
@@ -3886,7 +3901,12 @@ def test_requester_terminal_continuation_keeps_display_without_granting_approval
 ) -> None:
     from curie_api.resumequeue import resume_event_id
 
-    payload = _payload(author="U0EXAMPLE1")
+    agent_id = _agent_with_routes(
+        approvals_client,
+        auth_headers,
+        {"different-action": {"resolution": _slack_resolution("C0EXAMPLE1")}},
+    )
+    payload = _payload(author="U0EXAMPLE1", agent_id=agent_id)
     parent = _requester_create(approvals_client, auth_headers, payload)
     _requester_edit(
         parent["id"], status=terminal, resolved_by=None if terminal == "expired" else actor
@@ -4037,7 +4057,17 @@ def test_requester_gate_route_and_card_placement_do_not_identify_origin(
 ) -> None:
     from curie_api.resumequeue import resume_event_id
 
-    payload = _payload(author="U0EXAMPLE1", route="first-gate", card_channel="C0EXAMPLE1")
+    agent_id = _agent_with_routes(
+        approvals_client,
+        auth_headers,
+        {
+            "first-gate": {"resolution": _slack_resolution("C0EXAMPLE1")},
+            "next-gate": {"resolution": _slack_resolution("C0EXAMPLE2")},
+        },
+    )
+    payload = _payload(
+        author="U0EXAMPLE1", agent_id=agent_id, route="first-gate", card_channel="C0EXAMPLE1"
+    )
     parent = _requester_create(approvals_client, auth_headers, payload)
     _requester_edit(parent["id"], status="approved", resolved_by="U0EXAMPLE2")
     child = _requester_create(
@@ -4064,7 +4094,12 @@ def test_requester_terminal_record_must_prove_the_expected_resume_actor(
 ) -> None:
     from curie_api.resumequeue import resume_event_id
 
-    payload = _payload(author="U0EXAMPLE1")
+    agent_id = _agent_with_routes(
+        approvals_client,
+        auth_headers,
+        {"different-action": {"resolution": _slack_resolution("C0EXAMPLE1")}},
+    )
+    payload = _payload(author="U0EXAMPLE1", agent_id=agent_id)
     parent = _requester_create(approvals_client, auth_headers, payload)
     _requester_edit(parent["id"], status=status, resolved_by=resolver)
     child = _requester_create(approvals_client, auth_headers, {

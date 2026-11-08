@@ -157,7 +157,7 @@ def test_upgrade_table_lock_blocks_a_concurrent_agent_write(
         asyncio.run(run())
 
     with ThreadPoolExecutor(max_workers=1) as pool:
-        migration = pool.submit(command.upgrade, cfg, "head")
+        migration = pool.submit(command.upgrade, cfg, "0034")
         deadline = time.monotonic() + 3
         while not sql_rows(
             """
