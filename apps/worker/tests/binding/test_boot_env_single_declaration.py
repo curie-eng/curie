@@ -94,6 +94,10 @@ _NON_BOOT_ALLOWLIST: frozenset[str] = frozenset(
         "CURIE_STATIC_SHELLS",
         "CURIE_STATIC_SHELL_CA_FILE",
         "CURIE_STATIC_SHELL_CONTROL_TOKEN",
+        # Worker gateway clients read these; the caller token is filtered from claims.
+        "CURIE_CHANNEL_GATEWAY_URL",
+        "CURIE_CHANNEL_GATEWAY_TOKEN",
+        "CURIE_CHANNEL_GATEWAY_ALLOW_INSECURE",
         # The worker service's own settings (WorkerConfig validation_alias), read
         # from the WORKER's env at worker startup. Never a sandbox boot key.
         # The inbound-attachment lane's operator envelope (#2567): the lane's own
