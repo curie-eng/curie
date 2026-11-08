@@ -405,7 +405,7 @@ fn wake_operator_key_read_is_stable_on_local_and_cluster() {
         let body = body.clone();
         let path = path.clone();
         let server = serve(move |request| {
-            if let Some(refusal) = refuse_wake_admin_misuse(&request) {
+            if let Some(refusal) = refuse_wake_admin_misuse(request) {
                 return refusal;
             }
             let route = route_of(&request.path);
@@ -477,7 +477,7 @@ fn wake_operator_key_rotate_hides_the_secret_on_local_and_cluster() {
         let read_path = wake_secret_path();
         let rotate_path = wake_secret_rotate_path();
         let server = serve(move |request| {
-            if let Some(refusal) = refuse_wake_admin_misuse(&request) {
+            if let Some(refusal) = refuse_wake_admin_misuse(request) {
                 return refusal;
             }
             let route = route_of(&request.path);
@@ -804,7 +804,7 @@ fn wake_operator_key_outer_api_url_is_honored() {
         let agents = json!([agent_row()]).to_string();
         let rotate_path = wake_secret_rotate_path();
         let server = serve(move |request| {
-            if let Some(refusal) = refuse_wake_admin_misuse(&request) {
+            if let Some(refusal) = refuse_wake_admin_misuse(request) {
                 return refusal;
             }
             let route = route_of(&request.path);
@@ -883,64 +883,78 @@ fn wake_operator_admin_server_refuses_a_query_or_a_body() {
     assert!(refuse_wake_admin_misuse(&clean).is_none());
 }
 
+#[derive(Clone, Copy)]
+struct WakeRefusal {
+    status: u16,
+    detail: &'static str,
+    exit_code: i32,
+    needles: &'static [&'static str],
+    absent: &'static [&'static str],
+}
+
 #[test]
 fn wake_operator_key_refusals_name_the_reason_and_hide_the_secret() {
-    // status, detail, exit, phrases that must appear, phrases that must not.
-    let cases: &[(u16, &str, i32, &[&str], &[&str])] = &[
-        (
-            401,
-            "Unauthorized",
-            1,
-            &["verify --api-key or CURIE_API_KEY"],
-            &[],
-        ),
-        (
-            404,
-            "wake_not_declared",
-            1,
-            &["wake_not_declared", "wake: true", "in-force bundle"],
-            &[],
-        ),
-        (
-            409,
-            "wake_source_not_ordinary",
-            1,
-            &[
+    let cases = [
+        WakeRefusal {
+            status: 401,
+            detail: "Unauthorized",
+            exit_code: 1,
+            needles: &["verify --api-key or CURIE_API_KEY"],
+            absent: &[],
+        },
+        WakeRefusal {
+            status: 404,
+            detail: "wake_not_declared",
+            exit_code: 1,
+            needles: &["wake_not_declared", "wake: true", "in-force bundle"],
+            absent: &[],
+        },
+        WakeRefusal {
+            status: 409,
+            detail: "wake_source_not_ordinary",
+            exit_code: 1,
+            needles: &[
                 "wake_source_not_ordinary",
                 "source policy",
                 "unresolved source history",
             ],
-            &[],
-        ),
-        (
-            503,
-            "authority_unavailable",
-            3,
-            &["authority_unavailable"],
-            &["wake_generation_exhausted"],
-        ),
-        (
-            503,
-            "wake_generation_exhausted",
-            1,
-            &["wake_generation_exhausted", "was not rotated"],
-            &["authority_unavailable"],
-        ),
-        (
-            400,
-            "wake_query_forbidden",
-            2,
-            &["wake_query_forbidden"],
-            &[],
-        ),
-        (422, "wake_body_invalid", 2, &["wake_body_invalid"], &[]),
+            absent: &[],
+        },
+        WakeRefusal {
+            status: 503,
+            detail: "authority_unavailable",
+            exit_code: 3,
+            needles: &["authority_unavailable"],
+            absent: &["wake_generation_exhausted"],
+        },
+        WakeRefusal {
+            status: 503,
+            detail: "wake_generation_exhausted",
+            exit_code: 1,
+            needles: &["wake_generation_exhausted", "was not rotated"],
+            absent: &["authority_unavailable"],
+        },
+        WakeRefusal {
+            status: 400,
+            detail: "wake_query_forbidden",
+            exit_code: 2,
+            needles: &["wake_query_forbidden"],
+            absent: &[],
+        },
+        WakeRefusal {
+            status: 422,
+            detail: "wake_body_invalid",
+            exit_code: 2,
+            needles: &["wake_body_invalid"],
+            absent: &[],
+        },
     ];
-    for (status, detail, exit_code, needles, absent) in cases {
+    for case in cases {
         let agents = json!([agent_row()]).to_string();
         let path = wake_secret_path();
-        let body = json!({"detail": detail, "secret": SENTINEL}).to_string();
+        let body = json!({"detail": case.detail, "secret": SENTINEL}).to_string();
         let server = serve(move |request| {
-            if let Some(refusal) = refuse_wake_admin_misuse(&request) {
+            if let Some(refusal) = refuse_wake_admin_misuse(request) {
                 return refusal;
             }
             let route = route_of(&request.path);
@@ -948,28 +962,31 @@ fn wake_operator_key_refusals_name_the_reason_and_hide_the_secret() {
                 return Response::json(200, &agents);
             }
             if request.method == "GET" && route == path {
-                return Response::json(*status, &body);
+                return Response::json(case.status, &body);
             }
             Response::json(500, r#"{"detail":"unexpected"}"#)
         });
         let output = key_invoke("local", false, &server.base_url, &[]);
         assert_eq!(
             output.status.code(),
-            Some(*exit_code),
-            "{detail}: {}",
+            Some(case.exit_code),
+            "{}: {}",
+            case.detail,
             describe(&output)
         );
         let text = combined(&output);
-        for needle in *needles {
+        for needle in case.needles {
             assert!(
                 text.contains(needle),
-                "{detail}: message must contain {needle}: {text}"
+                "{}: message must contain {needle}: {text}",
+                case.detail
             );
         }
-        for phrase in *absent {
+        for phrase in case.absent {
             assert!(
                 !text.contains(phrase),
-                "{detail}: message must not contain {phrase}: {text}"
+                "{}: message must not contain {phrase}: {text}",
+                case.detail
             );
         }
         assert_no_sentinel(&stdout(&output));
