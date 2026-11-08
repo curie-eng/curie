@@ -27,7 +27,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-from aci_protocol import Budget, SessionConfig
+from aci_protocol import Budget, SessionConfig, SessionStatus
 from curie_shell_supervisor.protocol import claim_path, proxy_base_path
 from curie_test_support.static_shell import (
     CONTROL_TOKEN,
@@ -263,7 +263,7 @@ def test_runner_default_entrypoint_serves_authenticated_status(
 
     wait_until(ready, 60, "the runner image's default entrypoint to serve")
     status, body = _runner_status(port, token)
-    assert status == 200 and body["status"] == "idle"
+    assert status == 200 and body["status"] == SessionStatus.IDLE_AWAITING_INPUT.value
     assert _runner_status(port, None)[0] == 401
 
 
@@ -310,7 +310,11 @@ def test_shell_default_entrypoint_starts_the_real_runner(real_runner_shell: Shel
     status, answer = shell.request(
         "GET", proxy_base_path("runner-boot", 1) + "/v1/status", token=bearer
     )
-    assert status == 200 and answer["ready"] is True and answer["status"] == "idle", answer
+    assert (
+        status == 200
+        and answer["ready"] is True
+        and answer["status"] == SessionStatus.IDLE_AWAITING_INPUT.value
+    ), answer
 
 
 @pytest.fixture(scope="module")
