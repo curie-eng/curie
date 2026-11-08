@@ -4,6 +4,10 @@ from __future__ import annotations
 
 import os
 import subprocess
+import sys
+from pathlib import Path
+
+import pytest
 
 from curie_runner.subprocess_env import (
     BASH_CREDENTIAL_PRELUDE,
@@ -136,6 +140,39 @@ def test_a_declared_provider_credential_name_is_not_a_shell_variable() -> None:
     assert "provider-sentinel" not in "\n".join(child.values())
     assert child["CURIE_MODEL_ENV_KEY"] == "ACME_PROVIDER_KEY"
     assert child["PATH"] == "/usr/bin"
+
+
+@pytest.mark.parametrize("launcher", [False, True])
+def test_bundle_shell_can_read_upload_file_while_platform_tokens_stay_hidden(
+    tmp_path: Path, launcher: bool
+) -> None:
+    path = tmp_path / "uploads.json"
+    path.write_text('{"reviewer":"ccu.test.signature"}')
+    path.chmod(0o400)
+    source = {
+        "PATH": os.environ["PATH"],
+        "CURIE_CONNECTOR_UPLOAD_TOKENS_FILE": str(path),
+        "CURIE_RUNNER_TOKEN": "runner-sentinel",
+        "CURIE_CONNECTOR_CALLER_TOKEN": "cct.test.signature",
+        "CURIE_CONNECTOR_UPLOAD_TOKENS": "raw-token-sentinel",
+        "CURIE_OTHER_TOKEN_FILE": "other-token-sentinel",
+        "BASH_ENV": str(BASH_CREDENTIAL_PRELUDE),
+    }
+    command = (
+        'test -z "${CURIE_RUNNER_TOKEN-}${CURIE_CONNECTOR_CALLER_TOKEN-}'
+        '${CURIE_CONNECTOR_UPLOAD_TOKENS-}${CURIE_OTHER_TOKEN_FILE-}" '
+        '&& cat "$CURIE_CONNECTOR_UPLOAD_TOKENS_FILE"'
+    )
+    if launcher:
+        argv = [sys.executable, "-I", "-m", "curie_runner.shell_launcher", "-c", command]
+        env = source
+    else:
+        release_platform_credentials(source)
+        argv = ["bash", "-c", command]
+        env = shell_and_hook_env(source)
+    completed = subprocess.run(argv, env=env, capture_output=True, text=True, check=False)
+    assert completed.returncode == 0, completed.stderr
+    assert completed.stdout == path.read_text()
 
 
 class _EnvSnapshotSession:
