@@ -156,12 +156,12 @@ keeps serving the authority.
 
 ## The scripted directory
 
-The default roster in `identity_e2e.py` has, all in the reserved
+The default roster in `identity_assets.py` has, all in the reserved
 `example.test` domain:
 
-1. `alice@example.test` and `bob@example.test`, active humans in the group
-   `identity-e2e-members`.
-2. `dana@example.test`, an active human in no group.
+1. `alice@example.test`, `bob@example.test` and `erin@example.test`, active
+   humans in the group `identity-e2e-members`.
+2. `dana@example.test` and `frank@example.test`, active humans in no group.
 3. `carol@example.test`, a disabled human.
 4. `robot@example.test`, a service account.
 
@@ -171,6 +171,15 @@ of a recorded response from `tests/vectors/http-identity-v1.json` with only the
 request echo, issuer, subject, groups and observation times changed. The
 provider also serves the email reply endpoint and keeps a record of lookups and
 reply events, which `observe` reads.
+
+The provider's reply port also serves the roster while it runs. `GET /roster`
+returns the effective roster, the addresses that differ from the one `up`
+installed and a change counter. `POST /roster` with the adapter secret upserts,
+deletes or resets entries in one atomic change, and refuses with 400, changing
+nothing, an entry the recorded vectors cannot answer. Only
+`approver-ticket-answer` changes the roster, and it resets it when it ends. A
+provider started by an older `up` has no roster endpoint; rerun `up` to replace
+it.
 
 `up --role-filter` additionally sets an issuer group invocation filter on every
 agent. That makes every binding of the agent require HTTP identity, so the
@@ -719,6 +728,109 @@ two humans' subjects and `X-Curie-Principal` values, the ticket and the
 selector seed as the run's private values, and every ticket read back from the
 approval rows. As there, a rejected value is replaced before the evidence is
 written or printed, and the run fails, also when the run stops before S3.
+
+## What approver-ticket-answer proves
+
+ADR 0271 decisions 5 and 6 on a live install, which are its required evidence
+items 3 and 4: only a currently eligible, selected human may answer a dynamic
+approval, and the requester is excluded unless an operator says otherwise.
+Every answer a step expects to succeed goes the way the mail adapter forwards
+an email reply: `POST /approvals/{id}/resolve` with an adapter principal
+minted with the API's own key, the sender as the approval actor, and an email
+answer proof over the exact body, signed with the receiver key `up`
+registered. No answer uses the CLI's operator-principal resolution; the last
+step proves that an operator principal is refused. Resume is checked from the
+wake the API published: the step reads the sealed resume context from the
+runs stream and sends the worker's two current checks,
+`POST /v1/internal/identity/turn-authority/check` and
+`POST /v1/internal/identity/approval-grant/check`, with the worker token. Run
+it with:
+
+```bash
+curie dev identity-e2e -- prove $T --scenario approver-ticket-answer --evidence answer.json
+python3 tools/identity-e2e/check_answer_evidence.py answer.json
+```
+
+The checker exits 0 only when the evidence names this scenario, passed
+overall, has every step below passed, and records the candidate commit taken
+from the API image tag. Inside a git checkout it also requires that
+`git diff --name-only <candidate> HEAD` touches nothing under `apps/`,
+`packages/`, `runner/`, `cli/src/` or `charts/`, so the evidence came from the
+code the checkout holds. On a mismatch it prints what it observed.
+
+The scenario needs five active verified humans. `--sender` is the requester
+and `--second-sender` the selected approver; the second approver, the outsider
+and the exempt person are the remaining active humans in address order (with
+the default roster, `dana`, `erin` and `frank`). The agent needs the weather
+connector, as for `approver-ticket-creation`. An install brought up before
+this scenario existed needs `up` again, so the provider serves the roster
+endpoint and the roster has five active humans.
+
+It reuses the creation scenario's setup and restore, with these differences:
+
+1. It refuses to start if the agent already stores a selector registration or
+   a route with `separation`.
+2. It generates two selector key pairs, the second for `key-revoked`, and
+   records the stored approver role exactly, legacy state included.
+3. After the creation scenario's routes, gated version and approver role
+   (everyone but the outsider), it turns the requester flag on and registers
+   the selector on the ticket route.
+4. It sends one approver turn and 20 requester turns on one conversation,
+   one per approval the steps create, because an approval's dedupe key is its
+   turn's event id. Approvals are created with a 900 s expiry, so they outlive
+   the run.
+5. It changes the directory through the provider's roster override and undoes
+   each change in the step that made it.
+
+Each step first brings the approver role and the owned routes to the state it
+needs, writing only when the stored map means something else, and re-pins the
+registration to the current role version. An answer, a creation or a resume
+check that met a concurrent identity change (503 with the row unchanged, or an
+`unavailable` decision) is sent again, at most three times in all, and only
+the last attempt is judged. The steps run in this order, and each records its
+own evidence:
+
+1. `answer-selected-approver-allowed`: the selected approver approves. The answer is 200, the row is approved, one new `resolved` audit row is authorized and carries the selection evidence with requester equality false, and both current checks of the published wake answer `continue`.
+2. `answer-unselected-refused`: the second approver, inside the ceiling but not selected, is refused 403 with a `denied` audit row naming `selection_actor_not_selected`, and the row stays pending.
+3. `selection-fixed-after-source-change`: on the step 2 approval, the role is rewritten, the registration is re-pinned with ceiling users limited to the two approvers, and the roster gives both a new group. The stored selection digests are unchanged, the second approver is still refused and the selected one approves.
+4. `ceiling-member-revoked`: with the selected approver dropped from ceiling users, their answer is refused `selection_actor_outside_ceiling`, and the step 1 approval's resume refuses: both checks answer `refuse` with `caller_not_allowed`, and a new `resume_refused` audit row is written.
+5. `key-revoked`: with the registration replaced under the second key id, the answer is refused `selection_key_revoked` and the step 1 resume refuses.
+6. `registration-removed`: with the route bound but its registration removed, the answer is refused (the code is recorded) and the step 1 resume refuses.
+7. `canonical-inactive`: with the selected approver disabled in the directory, the answer is refused (the code is recorded) and the step 1 resume refuses. After the entry is restored, the step 1 resume continues and the approver's principal is active again.
+8. `migrated-role-no-legacy-block`: with the approver role migrated and no approvers block on the route, the second approver is refused and the selected approver approves.
+9. `raw-account-not-selected`: the role gains a raw email surface-account entry for the outsider, who is in it by no subject. The outsider's answer is refused, naming `selection_actor_not_selected` or `selection_actor_outside_ceiling`.
+10. `ceiling-widened`: with the role re-pinned to include the outsider, the outsider is refused `selection_actor_not_selected` and the selected approver approves. Ceiling users then drop the selected approver, whose answer on another approval is refused `selection_actor_outside_ceiling`.
+11. `separation-default-on-omission`: a registration written without `separation` reads back and is stored as `exclude_requester: true` with no exempt group.
+12. `separation-requester-excluded-alias`: with the requester selected, their answer from their own address and from a second address the roster maps to the same person is refused `separation_requester_excluded` with requester equality true; the other selected approver approves.
+13. `separation-requester-rejection`: the requester rejects their own request: 200, and the row is rejected.
+14. `separation-exemption-member`: the operator writes an exempt group, which reads back. The requester, added to that group in the roster, approves their own request with `exemption_used` and requester equality true, and both resume checks continue. Any `approval_separation.changed` event is recorded, not required.
+15. `separation-exemption-removed`: with the requester out of the group, the step 14 approval's resume refuses and a new self-answer is refused `separation_requester_excluded`.
+16. `separation-exemption-unavailable`: with the requester's lookup unavailable, their self-answer is 503, the row stays pending, and the `denied` audit row records status 503. This answer is never retried.
+17. `separation-exempt-unselected`: a member of the exempt group who is not selected is refused `selection_actor_not_selected`.
+18. `separation-operator-opt-out`: an operator write of `exclude_requester: false` emits exactly one `approval_separation.changed` event by the operator, with old true, new false and the old and new configuration versions of that write. The opt-out reads back, and the requester's self-approval passes, recorded with exclusion false and requester equality true.
+19. `separation-agent-owned-opt-out-refused`: with exclusion back on, the agent-owned writer `PUT /agents/{id}/access-policy` carrying a `separation` or `approval_routes` opt-out is refused 422, and neither the stored separation nor the policy version changes.
+20. `static-exclusion-route`: a third route without a selector lists the requester and the approver by email and an operator by Slack user, and excludes the requester. On an ordinary approval there, the requester is refused `separation_requester_excluded` and the approver approves.
+21. `operator-principal-refused`: an operator principal for the user that route lists is refused 403 on a dynamic approval and on a static exclusion approval, each with a `denied` audit row of principal kind `operator` naming `canonical_route_operator_refused`, and both rows stay pending.
+
+The plan names the selection evidence's requester equality, exclusion and
+exemption use but not their member names, so the judges read the first of
+several candidate names, and the evidence lists them under
+`setup.evidence_names`. The evidence keeps HTTP statuses, refusal codes,
+scrubbed audit rows, selected subjects and selection digests, identity audit
+events and key ids, never keys, tokens, proofs, capsules, nonces or tickets.
+
+Restore runs in a `finally` block even after a failure, and a failed restore
+fails the run. It resets the roster and checks that nothing is overridden. It
+removes the registration, the separation and the static route with a
+versioned route write, puts the flag back, ends the run's deployments and
+recreates the original ones, writes the original route map back, and checks
+all of them, including that no route carries `separation`. It writes the
+approver role back exactly as stored, legacy state included, directly in the
+API pod's database under the role policy's lock order with a version bump and
+an audit event, because the role-policy API cannot undo a migration, and then
+checks it. Approvals the run created stay pending until they expire, answered
+ones stay resolved with their resume wakes in the runs stream, and the run's
+agent versions stay, undeployed.
 
 ## Add a scenario
 

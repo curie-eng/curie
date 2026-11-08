@@ -73,6 +73,21 @@ DEFAULT_ROSTER: dict[str, Any] = {
             "account_status": "active",
             "groups": [],
         },
+        # Two more active humans, so approver-ticket-answer has a second
+        # approver, an outsider and an exempt person besides the requester and
+        # the selected approver.
+        "erin@example.test": {
+            "subject": "identity-e2e-erin",
+            "sender_kind": "human",
+            "account_status": "active",
+            "groups": [MEMBER_GROUP],
+        },
+        "frank@example.test": {
+            "subject": "identity-e2e-frank",
+            "sender_kind": "human",
+            "account_status": "active",
+            "groups": [],
+        },
         "carol@example.test": {
             "subject": "identity-e2e-carol",
             "sender_kind": "human",

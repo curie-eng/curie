@@ -481,7 +481,13 @@ def test_the_selector_key_converts_openssl_encodings() -> None:
 
 def test_the_approver_ceiling_is_a_restricted_role_naming_the_active_humans() -> None:
     subjects = tickets.ceiling_subjects(DEFAULT_ROSTER)
-    assert subjects == ["identity-e2e-alice", "identity-e2e-bob", "identity-e2e-dana"]
+    assert subjects == [
+        "identity-e2e-alice",
+        "identity-e2e-bob",
+        "identity-e2e-dana",
+        "identity-e2e-erin",
+        "identity-e2e-frank",
+    ]
     role = RoleFilterV1.model_validate(tickets.approver_filter(ISSUER, subjects))
     assert [entry.subject for entry in role.entries] == subjects
 

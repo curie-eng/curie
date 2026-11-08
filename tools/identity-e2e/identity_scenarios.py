@@ -3025,6 +3025,15 @@ def approver_ticket_creation(harness: Harness, args: Any, evidence: Evidence) ->
         run.restore()
 
 
+@scenario("approver-ticket-answer")
+def approver_ticket_answer(harness: Harness, args: Any, evidence: Evidence) -> None:
+    """ADR 0271 evidence items 3 and 4 for slice 0271b; see answer_authority_scenario.py."""
+
+    import answer_authority_scenario
+
+    answer_authority_scenario.run(harness, args, evidence)
+
+
 # The ADR 0270 slice 2 requester scenarios (requester-effect, requester-expiry,
 # requester-approval) and the ADR 0271 grant-attestation and stored-arguments-card
 # scenarios live in their own modules and register here, last, so every name they
