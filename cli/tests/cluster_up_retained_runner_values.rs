@@ -421,6 +421,44 @@ fn assert_no_set_lane_touches(argv: &[String], family: &str) {
 }
 
 #[test]
+fn sealed_up_preserves_gateway_configuration_and_honors_explicit_overrides() {
+    let mut recorded = recorded_values();
+    recorded["channelGateway"] = json!({
+        "deploy": true,
+        "allowInsecure": false,
+        "tlsSecret": "acme-gateway-tls",
+        "port": 8443,
+        "apiToken": "PLACEHOLDER-gateway-api",
+        "workerToken": "PLACEHOLDER-gateway-worker"
+    });
+    let helm = real_helm().expect("Helm is required to verify gateway configuration retention");
+    for override_http in [false, true] {
+        let fixture = Fixture::new(&recorded);
+        let arguments = if override_http {
+            vec!["--set", "channelGateway.allowInsecure=true"]
+        } else {
+            vec![]
+        };
+        let output = fixture.cluster_up_with_args(&[], &arguments);
+        fixture.assert_succeeded(&output);
+        let argv = fixture.upgrade_argv();
+        let effective = effective_captured_values(&helm, &fixture);
+        let mut expected = recorded["channelGateway"].clone();
+        expected["allowInsecure"] = json!(override_http);
+        assert_eq!(effective["channelGateway"], expected);
+        for token in ["PLACEHOLDER-gateway-api", "PLACEHOLDER-gateway-worker"] {
+            assert!(!argv.iter().any(|argument| argument.contains(token)));
+            assert!(!all_output(&output).contains(token));
+        }
+        let workloads = render(&helm, &value_arguments(&argv));
+        assert!(workloads.iter().any(|object| {
+            object["kind"] == "Deployment"
+                && object["metadata"]["name"] == format!("{TARGET_RELEASE}-curie-channel-gateway")
+        }));
+    }
+}
+
+#[test]
 fn sealed_up_keeps_recorded_runner_values_and_ignores_an_unrelated_saved_credential() {
     let recorded = recorded_values();
     let fixture = Fixture::new(&recorded);
