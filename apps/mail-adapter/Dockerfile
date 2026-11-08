@@ -32,6 +32,7 @@ COPY packages/protected-hooks/pyproject.toml packages/protected-hooks/
 COPY packages/plugin-format/pyproject.toml packages/plugin-format/
 COPY packages/telemetry-schema/pyproject.toml packages/telemetry-schema/
 COPY packages/upgrade-pause/pyproject.toml packages/upgrade-pause/
+COPY packages/shell-supervisor/pyproject.toml packages/shell-supervisor/
 COPY packages/test-support/pyproject.toml packages/test-support/
 COPY packages/telemetry/pyproject.toml packages/telemetry/
 COPY apps/api/pyproject.toml apps/api/

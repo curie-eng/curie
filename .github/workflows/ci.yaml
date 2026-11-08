@@ -2593,6 +2593,32 @@ jobs:
         env:
           CURIE_PROOF_EVIDENCE_DIR: ${{ runner.temp }}/repo-toolchain-proof
         run: uv run pytest runner/tests/test_repo_toolchain_proof.py -q --durations=25
+      # The static-pool shell image (packages/shell-supervisor/Dockerfile) on
+      # this run's runner image, run as a root container: a recycled shell
+      # holds nothing from the previous claim, and an image path the runner
+      # could write stops the shell before it serves.
+      - name: "Shell: Build the shell image on the runner image"
+        if: ${{ !cancelled() && needs.changes.outputs.images == 'true' }}
+        run: >-
+          docker build -f packages/shell-supervisor/Dockerfile
+          --build-arg RUNNER_IMAGE=curie-ci/runner:candidate
+          -t curie-ci/shell:candidate .
+      - name: "Shell: Absent image fails in required mode (negative control)"
+        if: ${{ !cancelled() && needs.changes.outputs.images == 'true' }}
+        env:
+          CURIE_SHELL_CONTAINER_PROOF: required
+        run: |
+          set -euo pipefail
+          if uv run pytest packages/shell-supervisor/tests/test_shell_container.py -q; then
+            echo "the shell container proof passed or skipped without an image" >&2
+            exit 1
+          fi
+      - name: "Shell: Recycled shells hold nothing from the previous claim"
+        if: ${{ !cancelled() && needs.changes.outputs.images == 'true' }}
+        env:
+          CURIE_SHELL_IMAGE: curie-ci/shell:candidate
+          CURIE_SHELL_CONTAINER_PROOF: required
+        run: uv run pytest packages/shell-supervisor/tests/test_shell_container.py -q
 
   # FALSIFIABILITY gate for the committed eval suites (issue #619). This is NOT
   # an E2E test: it never runs a real agent or makes a model call. It boots the

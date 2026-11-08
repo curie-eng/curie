@@ -21,6 +21,7 @@ import binascii
 import hashlib
 import json
 import logging
+import ssl
 import time
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
 from dataclasses import dataclass
@@ -486,9 +487,17 @@ class RunnerClient:
         interrupt_timeout_s: float = _DEFAULT_INTERRUPT_TIMEOUT_S,
         snapshot_patch_max_bytes: int = 900_000,
         session: aiohttp.ClientSession | None = None,
+        ssl_context: ssl.SSLContext | None = None,
     ) -> None:
+        """``ssl_context`` is the trust an ``https`` runner endpoint is verified
+        against (a static-pool shell's CA bundle); certificate and host name
+        are always checked. ``None`` keeps the platform default trust."""
         if snapshot_patch_max_bytes <= 0:
             raise ValueError("snapshot patch byte limit must be positive")
+        if ssl_context is not None and (
+            not ssl_context.check_hostname or ssl_context.verify_mode != ssl.CERT_REQUIRED
+        ):
+            raise ValueError("a runner TLS context must verify the certificate and host name")
         self._total_timeout_s = total_timeout_s
         self._own_session = session is None
         self._connect_timeout_s = connect_timeout_s
@@ -500,7 +509,10 @@ class RunnerClient:
         self._session = session or aiohttp.ClientSession(
             timeout=aiohttp.ClientTimeout(
                 total=total_timeout_s, connect=connect_timeout_s, sock_read=total_timeout_s
-            )
+            ),
+            connector=(
+                None if ssl_context is None else aiohttp.TCPConnector(ssl=ssl_context)
+            ),
         )
         # A per-request override, not folded into the session default above: it
         # replaces (not merges with) the session timeout for this one call, so

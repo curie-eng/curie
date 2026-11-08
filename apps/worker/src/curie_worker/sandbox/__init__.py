@@ -11,6 +11,12 @@ Public surface for F1 (the worker kernel):
 from .affinity import AffinityStore
 from .docker import DockerError, DockerSandboxClient, RunnerHardening
 from .k8s import KubernetesSandboxClient
+from .static import (
+    StaticPoolSandboxClient,
+    StaticShellSlot,
+    parse_static_shells,
+    shell_ssl_context,
+)
 from .substrate import HISTORY_ENV, SESSION_ENV, SandboxSubstrate
 from .types import (
     AGENT_LABEL,
@@ -73,6 +79,10 @@ __all__ = [
     "ClaimView",
     "DockerError",
     "DockerSandboxClient",
+    "StaticPoolSandboxClient",
+    "StaticShellSlot",
+    "parse_static_shells",
+    "shell_ssl_context",
     "KubernetesSandboxClient",
     "NoRouteError",
     "PressureCandidate",
