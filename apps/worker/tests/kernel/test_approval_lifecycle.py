@@ -636,7 +636,9 @@ def test_verified_lineage_at_materialized_route_head_reuses_existing_session(
 
             async def start_turn(self, *_args: object, **_kwargs: object) -> object:
                 self.starts += 1
-                return SimpleNamespace()
+                # A TurnStream's shape: the kernel records the opened turn's
+                # epoch for lease-loss fencing (ADR 0270 decision 3).
+                return SimpleNamespace(turn_epoch=None, close=lambda: None)
 
         async with make_harness() as h:
             substrate = Substrate()
@@ -784,7 +786,9 @@ def test_headless_visible_outcome_cold_reconciles_once_then_live_followup_steers
 
             async def start_turn(self, *_args: object, **_kwargs: object) -> object:
                 self.starts += 1
-                return SimpleNamespace()
+                # A TurnStream's shape: the kernel records the opened turn's
+                # epoch for lease-loss fencing (ADR 0270 decision 3).
+                return SimpleNamespace(turn_epoch=None, close=lambda: None)
 
         async with make_harness() as h:
             substrate = Substrate()
