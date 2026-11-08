@@ -658,9 +658,9 @@ claim under the thread lock. A runner that remains active, unreadable or unable
 to confirm durable history is retired through its backend. Static shells stop
 the child and verify cleanup. If the runner settled before the supervisor's
 check, the cleaned shell can be reused; otherwise it is quarantined and its 503
-health response asks the platform to replace it. Settled deliveries remove their
-recovery watch only after the runner is observed idle with durable history, or
-its claim is gone. Other watches remain for maintenance even after settlement.
+health response asks the platform to replace it. Settlement retains the recovery
+watch for maintenance, which removes it after observing the runner idle with
+durable history, confirming the claim is gone, or retiring it.
 Failed retirements retain their watch and do not block other maintenance. Before
 retirement or replacing an unfinished predecessor's watch for a follow-up,
 recovery persists the runner's retained side-effect marker so reclaim escalates
