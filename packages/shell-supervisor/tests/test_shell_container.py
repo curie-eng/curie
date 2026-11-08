@@ -27,6 +27,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from aci_protocol import Budget, SessionConfig
 from curie_shell_supervisor.protocol import claim_path, proxy_base_path
 from curie_test_support.static_shell import (
     CONTROL_TOKEN,
@@ -172,6 +173,20 @@ class Shell:
         assert not _docker("ps", "-aq", "--filter", f"name=^/{self.name}$").strip()
 
 
+def _runner_environment(token: str) -> dict[str, str]:
+    return {
+        **SessionConfig(
+            plugin_dir="/tmp/image-bundle",
+            session_id="image-proof",
+            sandbox_id="image-proof",
+            budget=Budget(max_output_tokens_per_run=1000, max_usd_per_day=1),
+        ).to_env(),
+        "CURIE_FAKE_MODEL": "1",
+        "CURIE_RUNNER_TOKEN": token,
+        "OTEL_SDK_DISABLED": "true",
+    }
+
+
 def _runner_status(port: int, token: str | None) -> tuple[int, dict[str, Any]]:
     connection = http.client.HTTPConnection("localhost", port, timeout=2)
     try:
@@ -188,6 +203,9 @@ def runner_container() -> Iterator[tuple[str, int, str]]:
     name = f"curie-runner-proof-{uuid.uuid4().hex[:8]}"
     port = free_port()
     token = f"runner-{uuid.uuid4().hex}"
+    environment = []
+    for key, value in _runner_environment(token).items():
+        environment.extend(("-e", f"{key}={value}"))
     raw = io.BytesIO()
     manifest = json.dumps({"name": "image-proof", "version": "0.0.0"}).encode()
     with tarfile.open(fileobj=raw, mode="w") as archive:
@@ -203,12 +221,7 @@ def runner_container() -> Iterator[tuple[str, int, str]]:
             f"curie.test.owner={name}",
             "-p",
             f"127.0.0.1:{port}:8080",
-            "-e",
-            "CURIE_FAKE_MODEL=1",
-            "-e",
-            f"CURIE_RUNNER_TOKEN={token}",
-            "-e",
-            "CURIE_PLUGIN_DIR=/tmp/image-bundle",
+            *environment,
             RUNNER_IMAGE,
         )
         _docker("cp", "-", f"{name}:/tmp/", stdin=raw.getvalue())
@@ -270,7 +283,7 @@ def test_shell_default_entrypoint_starts_the_real_runner(real_runner_shell: Shel
     archive = claim_archive(
         "runner-boot",
         1,
-        {"CURIE_FAKE_MODEL": "1", "CURIE_RUNNER_TOKEN": bearer},
+        _runner_environment(bearer),
         files={
             "bundle/.claude-plugin/plugin.json": json.dumps(
                 {"name": "image-proof", "version": "0.0.0"}
