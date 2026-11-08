@@ -327,6 +327,15 @@ async def create_approval(
     ) is None:
         raise await _refuse_rejected_reraise(session, data, rejected)
     try:
+        # The route lock again, on the agent row locked until create_approval
+        # commits, so a registration landing since the first check is judged.
+        if await approver_tickets.locked_tool_route(session, data) is not None:
+            raise approver_tickets.ApproverTicketRefusal(
+                status.HTTP_409_CONFLICT, approver_tickets.REQUIRES_HTTP_CREATION,
+            )
+    except approver_tickets.ApproverTicketRefusal as exc:
+        raise HTTPException(exc.status, exc.code) from None
+    try:
         approval = await crud_approvals.create_approval(session, data, traceparent=traceparent)
     except IntegrityError as exc:
         await session.rollback()

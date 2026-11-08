@@ -713,7 +713,10 @@ async def create_http_approval(
     phase one, its serving bundles are rechecked outside every transaction,
     and its selected people, nonce, row, seal and created audit entry are
     judged and committed together in the identity writer against an unchanged
-    snapshot. An identical retry stays historical before any of it.
+    snapshot. An identical retry stays historical before any of it. A dynamic
+    request also needs the original requester, freshly resolved, active and
+    unchanged, judged in the caller phase and again in the writer, never the
+    raw-account exception of ordinary admission.
     """
     runtime, original, resume = _original(request, body)
     factory, valkey = request.app.state.sessionmaker, request.app.state.valkey
@@ -765,11 +768,24 @@ async def create_http_approval(
                 _refuse(503, "authority_unavailable")
 
         async with current_http_approval_caller(request, original) as caller:
+            if registration is not None:
+                # Ordinary admission's raw-account exception is not enough here.
+                caller.require_original_requester()
             await unchanged(caller.session)
         # The read-only caller boundary is closed before acquiring the explicit write owner.
         async with identity_fence.mutation(factory, valkey) as writer:
             async with writer.begin():
-                await revalidate_http_approval_caller(request, writer, caller)
+                await revalidate_http_approval_caller(
+                    request, writer, caller, original_requester=registration is not None,
+                )
+                # Held to the commit: a registration cannot land between this
+                # judgement and the insert (@spec REQUEST-APPROVAL-2).
+                try:
+                    locked = await approver_tickets.locked_tool_route(writer, data)
+                except approver_tickets.ApproverTicketRefusal as error:
+                    _ticket_refusal(error)
+                if locked != registration:
+                    _refuse(503, "authority_unavailable")
                 await unchanged(writer)
                 existing = await approvals_crud.get_approval_by_dedupe_key(
                     writer, data.dedupe_key

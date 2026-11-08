@@ -517,6 +517,29 @@ def check_tool_route(agent: Agent | None, data: ApprovalRequest) -> StoredRegist
     return here
 
 
+async def locked_tool_route(
+    session: AsyncSession, data: ApprovalRequest,
+) -> StoredRegistration | None:
+    """``check_tool_route`` on the agent row locked in the inserting transaction.
+
+    Decision 2 holds at the final creation commit, not only at the first read:
+    ``crud.agents.update_agent_approval_routes`` takes this same row lock, so a
+    registration either commits before this read and is judged here, or waits
+    until the caller has inserted and committed. The caller holds the lock to
+    its commit. @spec REQUEST-APPROVAL-2.
+    """
+
+    agent = None
+    if data.agent_id is not None:
+        agent = await session.scalar(
+            select(Agent)
+            .where(Agent.id == data.agent_id)
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        )
+    return check_tool_route(agent, data)
+
+
 # --- creation (decision 4) -----------------------------------------------------------------
 
 

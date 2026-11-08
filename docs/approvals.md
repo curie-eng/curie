@@ -351,7 +351,10 @@ Prerequisites, all checked on write:
 4. A connector and tool pair is registered on at most one route (`approver_ticket_pair_conflict`).
 
 Once registered, the tool is locked to its route: an approval for it on any other route, or
-without a route, is refused `approval_route_locked`.
+without a route, is refused `approval_route_locked`. Both creation paths check the route map
+again on the agent row they lock for their final write and hold that lock until the approval
+is committed. The registration takes the same lock. A registration that lands while an
+approval is being created is therefore judged by that creation, or waits for it to commit.
 
 ### The shared configuration version
 
@@ -409,6 +412,35 @@ when `ceiling.users` names the selected people. Name approvers by issuer and sub
 approver role, and optionally narrow them with `ceiling.users`, until a subject-keyed
 identity lookup exists. The answer-time check will use fresh identity facts, so this limit
 applies to creation only.
+
+### The requester must be current at creation
+
+Ordinary approval creation admits a sender named by a surface-account entry of a migrated
+invocation role even when the fresh identity lookup does not resolve, finds the account
+inactive, or resolves it to a different person. A dynamic approval never relies on that
+exception. The fresh lookup at creation must resolve the sender to an active human whose
+issuer and subject equal the requester the original invocation sealed, and the final write
+rechecks that person in the same transaction. Anything else is refused
+`caller_not_allowed`, and nothing is stored or spent.
+
+### Older API versions and downgrades
+
+Migration 0154 is an expand, so an API from before it keeps serving during a rolling upgrade
+and after an application rollback. That version knows nothing of selectors, so the database
+itself refuses what it could otherwise do:
+
+1. Record the registered tool on a looser route, with no route, or as an ordinary approval.
+2. Turn the requester identity flag off while a selector is registered.
+3. Approve a dynamic approval. Until answer authority lands, no version can approve one.
+
+An older version sees these as failed writes, so the action fails closed. Removing a
+registration through an older API is not refused. It writes no selector audit, and the
+tool becomes ordinary again.
+
+Downgrading the database below 0154 is refused while any dynamic approval or registered
+selector exists. A downgrade would drop each dynamic approval's selection and its spent
+ticket nonce, so the row would read back ordinary and its ticket could be used again. Roll
+the application forward instead.
 
 ## Who may resolve
 
