@@ -24,7 +24,9 @@ exist at both revisions; the database itself is the oracle for each refusal.
 
 from __future__ import annotations
 
+import asyncio
 import json
+import time
 import uuid
 from pathlib import Path
 from typing import Any
@@ -39,8 +41,13 @@ from _migration_support import (
     stamped_revision,
 )
 from alembic import command
+from alembic.config import Config
 from alembic.script import ScriptDirectory
-from sqlalchemy.exc import IntegrityError
+from curie_api.config import get_settings
+from sqlalchemy import text
+from sqlalchemy.exc import DBAPIError, IntegrityError
+from sqlalchemy.ext.asyncio import AsyncConnection, create_async_engine
+from sqlalchemy.pool import NullPool
 
 BELOW = "0152"
 REVISION = "0153"
@@ -429,3 +436,93 @@ def test_0153_downgrade_refuses_while_a_registration_exists(
     assert _guards() == set()
     command.upgrade(config, REVISION)
     assert _guards() == GUARDS
+
+
+# --- the downgrade lock meets a reader it cannot be ordered against ---------------
+
+# The downgrade holds agents and waits on approvals behind the given reader.
+_DOWNGRADE_WAITS_ON = text(
+    "SELECT count(*) FROM pg_locks held "
+    "JOIN pg_class held_table ON held_table.oid = held.relation "
+    "JOIN pg_locks waiting ON waiting.pid = held.pid "
+    "JOIN pg_class waiting_table ON waiting_table.oid = waiting.relation "
+    "WHERE held_table.relname = 'agents' AND held.mode = 'AccessExclusiveLock' "
+    "AND held.granted AND waiting_table.relname = 'approvals' "
+    "AND waiting.mode = 'AccessExclusiveLock' AND NOT waiting.granted "
+    "AND CAST(:reader AS integer) = ANY(pg_blocking_pids(waiting.pid))"
+)
+
+
+async def _until_the_downgrade_waits_on(
+    probe: AsyncConnection, reader: int, downgrade: asyncio.Future[None]
+) -> None:
+    """Return once the downgrade holds agents and waits on the reader's approvals lock."""
+    deadline = time.monotonic() + 30
+    while not (await probe.execute(_DOWNGRADE_WAITS_ON, {"reader": reader})).scalar_one():
+        await probe.rollback()
+        assert not downgrade.done(), "the downgrade ended without waiting on the reader"
+        assert time.monotonic() < deadline, "the downgrade never waited on the reader"
+
+
+async def _downgrade_inside_a_reader_cycle(config: Config) -> dict[str, str | None]:
+    """HTTP creation's read order around a downgrade: approvals, then agents.
+
+    The reader reads approvals, the downgrade takes agents and waits on
+    approvals, then the reader reads agents and closes the cycle. Returns each
+    side's error, or None for the side that completed.
+    """
+    engine = create_async_engine(get_settings().database_url, poolclass=NullPool)
+    errors: dict[str, str | None] = {"reader": None, "downgrade": None}
+    try:
+        async with engine.connect() as reader, engine.connect() as probe:
+            pid = (await reader.execute(text("SELECT pg_backend_pid()"))).scalar_one()
+            await reader.execute(text("SELECT id FROM curie.approvals LIMIT 1"))
+            downgrade = asyncio.ensure_future(asyncio.to_thread(command.downgrade, config, BELOW))
+            await _until_the_downgrade_waits_on(probe, pid, downgrade)
+            try:
+                await reader.execute(text("SELECT id FROM curie.agents LIMIT 1"))
+            except DBAPIError as error:
+                errors["reader"] = str(error.orig)
+            await reader.rollback()
+            try:
+                await downgrade
+            except DBAPIError as error:
+                errors["downgrade"] = str(error.orig)
+    finally:
+        await engine.dispose()
+    return errors
+
+
+def test_0153_downgrade_in_a_reader_lock_cycle_aborts_one_side_and_changes_nothing(
+    isolated_migration_db: IsolatedMigrationDb,
+) -> None:
+    """@spec REQUEST-APPROVAL-1: no lock order excludes HTTP creation's reads.
+
+    PostgreSQL aborts one side of the cycle. The downgrade's lock is its first
+    statement, so an aborted downgrade leaves the revision, its guards, columns
+    and rows whole and completes when retried; an aborted reader is an ordinary
+    failed request and the downgrade completes behind it.
+    """
+    revision_ready()
+    config = alembic_config()
+    isolated_migration_db.at(BELOW)
+    agent = _agent()
+    command.upgrade(config, REVISION)
+    kept = _approval(agent, granted_tool="mcp__other__read", route=LOOSER)
+
+    errors = asyncio.run(_downgrade_inside_a_reader_cycle(config))
+
+    aborted = [side for side, error in errors.items() if error is not None]
+    assert len(aborted) == 1, errors
+    assert "deadlock detected" in str(errors[aborted[0]]), errors
+    if aborted == ["downgrade"]:
+        assert stamped_revision() == REVISION
+        assert _guards() == GUARDS
+        assert set(COLUMNS) <= column_names("approvals")
+        assert _selection(kept)["selection_mode"] == "ordinary"
+        command.downgrade(config, BELOW)
+    assert stamped_revision() == BELOW
+    assert _guards() == set()
+    assert sql_dicts(
+        "SELECT id FROM curie.approvals WHERE id = :id", {"id": kept}
+    ) == [{"id": kept}]

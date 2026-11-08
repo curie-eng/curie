@@ -51,6 +51,9 @@ down_revision: str = "0152"
 branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
 
+# The downgrade's bound on its lock wait, as revision 0101 sets for its fence.
+LOCK_TIMEOUT_MS = 15000
+
 SCHEMA = "curie"
 _SNAPSHOT_COLUMNS = (
     "selection_requester",
@@ -253,7 +256,22 @@ def downgrade() -> None:
     """
     bind = op.get_bind()
     # Held to the end of this migration's transaction, so nothing can create a
-    # dynamic approval or a registration between the counts and the drops.
+    # dynamic approval or a registration between the counts and the drops. It
+    # is the first statement, in the strongest mode the drops need, so no later
+    # step upgrades a lock and an abort here has changed nothing.
+    #
+    # The order is the writers': both creation owners lock the agent row and
+    # then insert the approval, and the registration and flag writers touch
+    # only agents, so the downgrade waits on such a writer before it holds
+    # anything. A reader cannot be ordered away: HTTP creation reads approvals
+    # (its dedupe lookup) and then agents. If the downgrade takes agents between
+    # those reads, PostgreSQL's deadlock detector aborts one side; an aborted
+    # downgrade is retried (the migrate Job's backoffLimit, or the operator),
+    # and an aborted creation is an ordinary failed request. migration_fence
+    # and revision 0101 accept the same cycle. The timeout bounds every other
+    # wait, so a long transaction refuses the downgrade instead of holding
+    # agents exclusively behind it.
+    op.execute(f"SET LOCAL lock_timeout = '{LOCK_TIMEOUT_MS}ms'")
     op.execute(f"LOCK TABLE {SCHEMA}.agents, {SCHEMA}.approvals IN ACCESS EXCLUSIVE MODE")
     dynamic = bind.execute(
         sa.text(f"SELECT count(*) FROM {SCHEMA}.approvals WHERE selection_mode = 'dynamic'")
