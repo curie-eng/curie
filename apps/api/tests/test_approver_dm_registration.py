@@ -20,7 +20,8 @@ import uuid
 from types import SimpleNamespace
 from typing import Any
 
-from approval_answer_support import NATIVE_A, NATIVE_B, ordinary
+from _migration_support import sql_rows
+from approval_answer_support import NATIVE_A, NATIVE_B, audit_rows, ordinary
 from approval_answer_support import synthetic_provider as synthetic_provider
 from approver_dm_support import (
     CARD_EVIDENCE_KEYS,
@@ -34,11 +35,13 @@ from approver_dm_support import (
     configured_dm,
     create,
     dm_created,
+    dm_routes,
     dm_row,
     expected_delivery,
     lapse,
     post_card,
     refused_exactly,
+    write_dm,
 )
 from approver_dm_support import dm_case as dm_case
 from approver_ticket_support import ingress, owner_verifies, worker_headers
@@ -317,3 +320,82 @@ def test_an_earlier_ordinary_approval_keeps_its_seal(dm_case: SimpleNamespace) -
     }))
     assert owner_verifies(case, str(plain["id"]))
     assert card_audits(plain["id"]) == []
+
+
+# --- R3: the stored record is verified before it is resealed --------------------------------
+
+
+def test_a_tampered_pending_row_is_never_resealed(dm_case: SimpleNamespace) -> None:
+    """@spec APPROVER-DM-2: registration verifies the sealed record before any mutation.
+
+    A digest-covered field (``summary``) of the pending DM row is changed
+    directly in SQL. Registration answers 409 ``approval_provenance_conflict``
+    and leaves the card channel, the sealed context and the audit log exactly
+    as they were, so the tamper is not laundered into a fresh seal. With the
+    field restored, the same registration succeeds.
+    """
+    case = dm_case
+    row, request, identity = _pending(case)
+    assert "summary" in RECORD_FIELDS
+    sql_rows(
+        "UPDATE curie.approvals SET summary = :summary WHERE id = :id",
+        {"summary": "Synthetic tampered summary", "id": uuid.UUID(str(row["id"]))},
+    )
+    tampered = _row(request)
+    audits = audit_rows(row["id"])
+
+    body = card_body(request, row["id"], card_identity=identity)
+    refused_exactly(post_card(case.client, row["id"], body), 409, "approval_provenance_conflict")
+    stored = _row(request)
+    assert stored["card_channel"] is None, stored
+    assert stored["identity_context"] == tampered["identity_context"] == row["identity_context"]
+    assert stored["summary"] == "Synthetic tampered summary"
+    assert audit_rows(row["id"]) == audits
+    assert card_audits(row["id"]) == []
+
+    sql_rows(
+        "UPDATE curie.approvals SET summary = :summary WHERE id = :id",
+        {"summary": row["summary"], "id": uuid.UUID(str(row["id"]))},
+    )
+    body = card_body(request, row["id"], card_identity=identity)
+    card_registered(post_card(case.client, row["id"], body), body)
+    assert len(card_audits(row["id"])) == 1
+
+
+# --- R4: retries are judged against the committed registration -------------------------------
+
+
+def test_retries_after_the_route_is_repointed_are_judged_by_the_committed_card(
+    dm_case: SimpleNamespace,
+) -> None:
+    """@spec APPROVER-DM-2: once registered, the current route is not consulted.
+
+    After a successful registration the operator repoints the owning route to
+    ``{"mode": "requesting_surface"}``. An identical registration retry still
+    answers 200 ``duplicate: true``; a retry differing in channel, bot identity
+    or recipient answers 409 ``approval_card_conflict`` (not a route mismatch).
+    Nothing is written by any retry.
+    """
+    case = dm_case
+    row, request, identity = _pending(case)
+    first = card_body(request, row["id"], card_identity=identity)
+    card_registered(post_card(case.client, row["id"], first), first)
+    sealed = _row(request)["identity_context"]
+
+    routes = dm_routes(case.scope, case.key, resolution={"mode": "requesting_surface"})
+    repointed = write_dm(case.client, case.scope, routes)
+    assert repointed.status_code == 200, repointed.text
+
+    retry = card_body(request, row["id"], card_identity=identity)
+    card_registered(post_card(case.client, row["id"], retry), retry, duplicate=True)
+    for changes in (
+        {"card_identity": identity, "channel": OTHER_DM_CHANNEL},
+        {"card_identity": case.scope["other"]["adapter"]},
+        {"card_identity": identity, "recipient": NATIVE_B},
+    ):
+        body = card_body(request, row["id"], **changes)
+        refused_exactly(post_card(case.client, row["id"], body), 409, "approval_card_conflict")
+    stored = _row(request)
+    assert (stored["card_channel"], stored["identity_context"]) == (DM_CHANNEL, sealed)
+    assert stored["status"] == "pending"
+    assert len(card_audits(row["id"])) == 1

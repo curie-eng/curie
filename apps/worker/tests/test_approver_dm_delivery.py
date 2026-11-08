@@ -331,7 +331,11 @@ def test_selected_dm_pause_posts_one_card_to_the_recipient_and_registers_the_ack
     async def run() -> None:
         creator, sink = DmCreator(identity=identity), DmSink()
         async with make_harness(
-            binding=dm_binding(identity), identity_authority=Core(), approvals=creator, sink=sink
+            binding=dm_binding(identity),
+            identity_authority=Core(),
+            approvals=creator,
+            sink=sink,
+            approval_pending_retention_enabled=True,
         ) as h:
             h.runner.default_script = awaiting_on_route()
             event = qevent("selected approver DM")
@@ -417,6 +421,7 @@ def test_terminal_registration_settles_the_known_dm_card_immediately(
             approvals=creator,
             approval_reader=reader,
             sink=sink,
+            approval_pending_retention_enabled=True,
         ) as h:
             h.runner.default_script = awaiting_on_route()
             event = qevent("decided before registration")
@@ -453,6 +458,7 @@ def test_pending_registration_leaves_the_dm_card_live(make_harness: Any) -> None
             approvals=creator,
             approval_reader=Reader(),
             sink=sink,
+            approval_pending_retention_enabled=True,
         ) as h:
             h.runner.default_script = awaiting_on_route()
             event = qevent("pending registration")
@@ -473,7 +479,11 @@ def test_duplicate_dm_creation_never_reposts_or_reregisters(make_harness: Any) -
     async def run() -> None:
         creator, sink = DmCreator(duplicate=True), DmSink()
         async with make_harness(
-            binding=dm_binding(), identity_authority=Core(), approvals=creator, sink=sink
+            binding=dm_binding(),
+            identity_authority=Core(),
+            approvals=creator,
+            sink=sink,
+            approval_pending_retention_enabled=True,
         ) as h:
             h.runner.default_script = awaiting_on_route()
             event = qevent("redelivered DM creation")
@@ -508,7 +518,11 @@ def test_failed_or_uncertain_dm_post_is_recorded_and_never_falls_back(
         metrics = metric_recorder(monkeypatch)
         creator, sink = DmCreator(), DmSink(mode)
         async with make_harness(
-            binding=dm_binding(), identity_authority=Core(), approvals=creator, sink=sink
+            binding=dm_binding(),
+            identity_authority=Core(),
+            approvals=creator,
+            sink=sink,
+            approval_pending_retention_enabled=True,
         ) as h:
             h.runner.default_script = awaiting_on_route()
             event = qevent("failed DM delivery")
@@ -558,7 +572,10 @@ def test_legacy_turn_on_a_dm_route_escalates_and_creates_nothing(
         legacy = RecordingApprovals()
         sink = DmSink()
         async with make_harness(
-            binding=dm_binding(required=False), approvals=legacy, sink=sink
+            binding=dm_binding(required=False),
+            approvals=legacy,
+            sink=sink,
+            approval_pending_retention_enabled=True,
         ) as h:
             h.runner.default_script = awaiting_on_route()
             event = qevent("legacy DM route")
@@ -573,6 +590,52 @@ def test_legacy_turn_on_a_dm_route_escalates_and_creates_nothing(
     assert any(
         "approval-route-unsupported" in record.getMessage() for record in caplog.records
     ), "the legacy DM turn did not escalate as approval-route-unsupported"
+
+
+# --- Item 5b (plan review R5): pending retention is a prerequisite ---------------
+
+
+@pytest.mark.parametrize("retention", [False, True], ids=["retention-off", "retention-on"])
+def test_selected_dm_turn_requires_pending_retention(
+    make_harness: Any, caplog: pytest.LogCaptureFixture, retention: bool
+) -> None:
+    """@spec APPROVER-DM-1: a DM card ref must outlive the 14-day terminal window, so
+    without ``approval_pending_retention_enabled`` a selected turn on a DM route
+    escalates ``approval-route-unsupported`` before creating anything; with it the
+    same turn creates, posts one DM card and registers it."""
+
+    async def run() -> None:
+        creator, sink = DmCreator(), DmSink()
+        async with make_harness(
+            binding=dm_binding(),
+            identity_authority=Core(),
+            approvals=creator,
+            sink=sink,
+            approval_pending_retention_enabled=retention,
+        ) as h:
+            h.runner.default_script = awaiting_on_route()
+            event = qevent(f"selected DM turn, retention {retention}")
+            await process(h, event, raw=raw_payload(event))
+            if retention:
+                assert len(creator.calls) == 1
+                assert len(sink.dm_attempts) == 1
+                assert len(creator.registrations) == 1
+                assert await h.card_store.read(APPROVAL_ID) is not None
+            else:
+                assert creator.calls == []
+                assert creator.registrations == []
+                assert sink.dm_attempts == []
+                assert interactive_posts(sink) == []
+                assert await h.card_store.read(APPROVAL_ID) is None
+
+    caplog.set_level(logging.WARNING)
+    asyncio.run(run())
+    escalated = any(
+        "approval-route-unsupported" in record.getMessage() for record in caplog.records
+    )
+    assert escalated is not retention, (
+        "retention off must escalate approval-route-unsupported; retention on must not"
+    )
 
 
 # --- Item 6: the ApprovalClient wire ---------------------------------------------
