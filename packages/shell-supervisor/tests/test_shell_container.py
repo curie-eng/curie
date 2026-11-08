@@ -791,7 +791,9 @@ def _assert_worker_kill_recovers(case, phase: str) -> None:
                 + json.dumps(
                     {
                         name: observed.get(name)
-                        for name in ("requests", "tool_starts", "upstream_statuses", "upstream_errors")
+                        for name in (
+                            "requests", "tool_starts", "upstream_statuses", "upstream_errors"
+                        )
                     }
                 )
                 + " "
