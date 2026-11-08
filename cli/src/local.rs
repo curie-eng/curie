@@ -40,6 +40,7 @@ const ISOLATION_ENV: &[&str] = &[
     "S3_ENDPOINT_URL",
     "CURIE_DOCKER_NETWORK",
     "CURIE_LOCAL_STUB_PORT",
+    "CURIE_LOCAL_GATEWAY_PORT",
     "CURIE_LOCAL_POSTGRES_HOST",
     "CURIE_LOCAL_POSTGRES_PORT",
     "CURIE_LOCAL_IMAGE_TAG",
@@ -58,6 +59,7 @@ pub struct LocalResources {
     pub s3_endpoint: String,
     pub docker_network: String,
     pub stub_port: u16,
+    pub gateway_port: u16,
     pub image_tag: String,
 }
 
@@ -75,6 +77,7 @@ impl LocalResources {
             s3_endpoint: "http://localhost:29000".to_string(),
             docker_network: DEFAULT_DOCKER_NETWORK.to_string(),
             stub_port: crate::message::DEFAULT_LOCAL_STUB_PORT,
+            gateway_port: 8081,
             image_tag: "dev".to_string(),
         }
     }
@@ -403,7 +406,7 @@ fn isolation_usage(missing: &[String]) -> anyhow::Error {
     .with_fix(
         "set COMPOSE_PROJECT_NAME with COMPOSE_FILE (base compose.dev.yaml then an override) \
          and the matching CURIE_API_URL, VALKEY_HOST, VALKEY_PORT, S3_ENDPOINT_URL, \
-         CURIE_DOCKER_NETWORK, CURIE_LOCAL_STUB_PORT, CURIE_LOCAL_POSTGRES_HOST, \
+         CURIE_DOCKER_NETWORK, CURIE_LOCAL_STUB_PORT, CURIE_LOCAL_GATEWAY_PORT, CURIE_LOCAL_POSTGRES_HOST, \
          CURIE_LOCAL_POSTGRES_PORT and CURIE_LOCAL_IMAGE_TAG",
     )
     .into()
@@ -532,6 +535,9 @@ pub fn resolve_local_resources(
         stub_port: get("CURIE_LOCAL_STUB_PORT").parse().map_err(|_| {
             crate::exit::CliError::usage("CURIE_LOCAL_STUB_PORT must be a TCP port")
         })?,
+        gateway_port: get("CURIE_LOCAL_GATEWAY_PORT").parse().map_err(|_| {
+            crate::exit::CliError::usage("CURIE_LOCAL_GATEWAY_PORT must be a TCP port")
+        })?,
         image_tag: get("CURIE_LOCAL_IMAGE_TAG"),
     };
     validate_isolated_override(&resources, build)?;
@@ -620,7 +626,6 @@ fn validate_isolated_override(resources: &LocalResources, build: bool) -> Result
         ("S3_ENDPOINT_URL", resources.s3_endpoint.clone()),
         ("CURIE_API_URL", resources.api_url.clone()),
         ("CURIE_DOCKER_NETWORK", resources.docker_network.clone()),
-        ("SLACK_API_BASE_URL", format!(":{}", resources.stub_port)),
     ];
     for (key, needle) in required {
         let value = worker.get(key).map(String::as_str).unwrap_or("");
@@ -631,10 +636,35 @@ fn validate_isolated_override(resources: &LocalResources, build: bool) -> Result
             ))
             .with_fix(
                 "override curie-worker environment (DATABASE_URL, VALKEY_HOST, VALKEY_PORT, \
-                 S3_ENDPOINT_URL, CURIE_API_URL, SLACK_API_BASE_URL, CURIE_DOCKER_NETWORK)",
+                 S3_ENDPOINT_URL, CURIE_API_URL, CURIE_CHANNEL_GATEWAY_URL, CURIE_DOCKER_NETWORK)",
             )
             .into());
         }
+    }
+    let api = service_environment(&config, "curie-api");
+    let gateway_port_matches = |env: &BTreeMap<String, String>| {
+        env.get("CURIE_CHANNEL_GATEWAY_URL")
+            .and_then(|value| reqwest::Url::parse(value).ok())
+            .and_then(|url| url.port_or_known_default())
+            == Some(resources.gateway_port)
+    };
+    if !gateway_port_matches(&worker) || !gateway_port_matches(&api) {
+        return Err(
+            crate::exit::CliError::usage("isolated callers must use their own gateway").into(),
+        );
+    }
+    let gateway = service_environment(&config, "curie-channel-gateway");
+    if gateway.get("CURIE_CHANNEL_GATEWAY_PORT") != Some(&resources.gateway_port.to_string())
+        || gateway
+            .get("SLACK_API_BASE_URL")
+            .and_then(|value| reqwest::Url::parse(value).ok())
+            .and_then(|url| url.port_or_known_default())
+            != Some(resources.stub_port)
+    {
+        return Err(crate::exit::CliError::usage(
+            "isolated override must rebind the gateway listener and its Slack stub endpoint",
+        )
+        .into());
     }
     let network_name = config["networks"]["curie_runner"]["name"]
         .as_str()
@@ -652,6 +682,7 @@ fn validate_isolated_override(resources: &LocalResources, build: bool) -> Result
             "curie-api",
             "curie-worker",
             "curie-dispatcher",
+            "curie-channel-gateway",
             "curie-runner",
             "curie-ui",
         ] {
@@ -3550,7 +3581,7 @@ mod tests {
         );
     }
 
-    /// The 8 services that must carry `profiles: *core_profiles`.
+    /// The services that must carry `profiles: *core_profiles`.
     const CORE_SERVICES: &[&str] = &[
         "postgres",
         "valkey",
@@ -3560,6 +3591,8 @@ mod tests {
         "curie-migrate",
         "curie-api",
         "curie-worker",
+        "curie-gateway-replay-perms",
+        "curie-channel-gateway",
     ];
 
     /// The 6 services that must carry `profiles: *full_profiles`.
@@ -3668,12 +3701,12 @@ mod tests {
     }
 
     #[test]
-    fn compose_file_makes_worker_slack_stub_overridable() {
+    fn compose_file_makes_gateway_slack_stub_overridable() {
         let compose = read_compose("compose.dev.yaml");
         assert!(compose.contains(
-            "      - SLACK_API_BASE_URL=${SLACK_API_BASE_URL-http://localhost:8155/api/}"
+            "      SLACK_API_BASE_URL: ${SLACK_API_BASE_URL-http://localhost:8155/api/}"
         ));
-        assert!(compose.contains("      - SLACK_BOT_TOKEN=${SLACK_BOT_TOKEN:-xoxb-dev}"));
+        assert!(compose.contains("      SLACK_BOT_TOKEN: ${SLACK_BOT_TOKEN:-xoxb-dev}"));
     }
 
     /// The dev trio of trusted Slack origins (ADR-0096 D4.4) must stay on the

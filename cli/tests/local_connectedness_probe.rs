@@ -3,7 +3,7 @@
 //!
 //! The unit tests in `message.rs` pin the pure predicate. What they cannot see
 //! is the wiring around it, which is where both shipped defects lived: the probe
-//! inspected a hardcoded `curie-worker`, a name no compose project ever produces
+//! inspected a hardcoded `curie-channel-gateway`, a name no compose project ever produces
 //! (`COMPOSE_PROJECT_NAME` prefixes it), so every `docker inspect` failed and the
 //! connected path was unreachable no matter what the predicate said.
 //!
@@ -23,11 +23,11 @@ use curie::slack::DEFAULT_API_BASE;
 
 /// A stack whose compose project is NOT the CLI's default `curie`, so a probe
 /// that resolves by name rather than by the compose service label finds nothing.
-const WORKER_CONTAINER: &str = "acme-staging-curie-worker-1";
-const SERVICE_LABEL: &str = "label=com.docker.compose.service=curie-worker";
+const GATEWAY_CONTAINER: &str = "acme-staging-curie-channel-gateway-1";
+const SERVICE_LABEL: &str = "label=com.docker.compose.service=curie-channel-gateway";
 
 /// A `docker` shim answering `ps` with `ps_stdout`, answering `inspect` of
-/// [`WORKER_CONTAINER`] with `env_stdout`, and failing any other `inspect` the
+/// [`GATEWAY_CONTAINER`] with `env_stdout`, and failing any other `inspect` the
 /// way a real daemon does. Every invocation appends its argv to `argv.log`, so
 /// the test asserts what the CLI asked for, not only what it got.
 fn docker_shim(dir: &Path, ps_stdout: &str, env_stdout: &str) -> PathBuf {
@@ -44,7 +44,7 @@ case "$1" in
     exit 0
     ;;
   inspect)
-    if [ "$2" = "{WORKER_CONTAINER}" ]; then
+    if [ "$2" = "{GATEWAY_CONTAINER}" ]; then
       cat "$d/env.out"
       exit 0
     fi
@@ -81,44 +81,47 @@ fn argv_log(path: &Path) -> String {
 fn inspected_the_bare_service_name(argv: &str) -> bool {
     argv.lines()
         .filter(|line| line.starts_with("inspect "))
-        .any(|line| line.split_whitespace().any(|token| token == "curie-worker"))
+        .any(|line| {
+            line.split_whitespace()
+                .any(|token| token == "curie-channel-gateway")
+        })
 }
 
 /// One test function, because PATH is process-global: the scenarios run in
 /// sequence, each pointing PATH at its own shim, under `support::ENV_LOCK`.
 #[tokio::test]
-async fn the_probe_resolves_the_worker_by_label_and_reads_empty_base_as_connected() {
+async fn the_probe_resolves_the_gateway_by_label_and_reads_empty_base_as_connected() {
     let temp = tempfile::tempdir().expect("create temporary directory");
     let _env = crate::support::ENV_LOCK.lock().await;
     let original_path = std::env::var_os("PATH");
 
     // ---- connected: the state `local comms --connect` leaves, on a non-default
-    // compose project. The worker holds an EMPTY SLACK_API_BASE_URL (this repo's
+    // compose project. The gateway holds an EMPTY SLACK_API_BASE_URL (this repo's
     // "talk to real Slack" signal) and a genuine workspace token.
     let connected_dir = temp.path().join("connected");
     let connected_log = docker_shim(
         &connected_dir,
-        &format!("{WORKER_CONTAINER}\n"),
+        &format!("{GATEWAY_CONTAINER}\n"),
         "PATH=/usr/local/bin\nSLACK_API_BASE_URL=\nSLACK_BOT_TOKEN=xoxb-real-workspace\n",
     );
     use_shim(&connected_dir, &original_path);
 
     let transport = local_connected_transport()
         .await
-        .expect("an empty SLACK_API_BASE_URL plus a real token is a CONNECTED worker");
+        .expect("an empty SLACK_API_BASE_URL plus a real token is a CONNECTED gateway");
     assert_eq!(transport.bot_token, "xoxb-real-workspace");
     assert_eq!(
         transport.api_base, DEFAULT_API_BASE,
-        "an empty base means no override, which for the worker is real Slack"
+        "an empty base means no override, which for the gateway is real Slack"
     );
 
     let argv = argv_log(&connected_log);
     assert!(
         argv.contains(SERVICE_LABEL),
-        "the worker must be resolved through the compose service label: {argv}"
+        "the gateway must be resolved through the compose service label: {argv}"
     );
     assert!(
-        argv.contains(&format!("inspect {WORKER_CONTAINER}")),
+        argv.contains(&format!("inspect {GATEWAY_CONTAINER}")),
         "the probe must inspect the container the selector resolved: {argv}"
     );
     assert!(
@@ -131,13 +134,13 @@ async fn the_probe_resolves_the_worker_by_label_and_reads_empty_base_as_connecte
     let stub_dir = temp.path().join("stub");
     let stub_log = docker_shim(
         &stub_dir,
-        &format!("{WORKER_CONTAINER}\n"),
+        &format!("{GATEWAY_CONTAINER}\n"),
         "SLACK_API_BASE_URL=http://localhost:8155/api/\nSLACK_BOT_TOKEN=xoxb-real-workspace\n",
     );
     use_shim(&stub_dir, &original_path);
     assert!(
         local_connected_transport().await.is_none(),
-        "a stub-wired worker is not connected however real its token looks"
+        "a stub-wired gateway is not connected however real its token looks"
     );
     assert!(
         argv_log(&stub_log).contains(SERVICE_LABEL),
@@ -151,7 +154,7 @@ async fn the_probe_resolves_the_worker_by_label_and_reads_empty_base_as_connecte
     use_shim(&empty_dir, &original_path);
     assert!(
         local_connected_transport().await.is_none(),
-        "no resolvable worker means the stub path, never a real post"
+        "no resolvable gateway means the stub path, never a real post"
     );
     assert!(
         !argv_log(&empty_log).contains("inspect"),

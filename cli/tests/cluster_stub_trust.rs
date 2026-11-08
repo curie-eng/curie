@@ -363,7 +363,10 @@ if args == [
 
 # Connected mode reads the worker's configured Slack origin. This read is not a
 # rollout/trust read and must remain on the connected branch.
-if "get deployment" in joined and "app.kubernetes.io/component=worker" in joined and "jsonpath=" in joined:
+if "get deployment" in joined and "app.kubernetes.io/component=channel-gateway" in joined and "jsonpath=" in joined:
+    if os.environ.get("CURIE_TEST_GATEWAY_MISSING") == "1":
+        sys.exit(0)
+    print("gateway")
     print(os.environ["CURIE_TEST_SLACK_BASE"])
     sys.exit(0)
 
@@ -900,6 +903,24 @@ fn transient_relay_503_retries_without_duplicate_enqueue_then_replies() {
     assert_eq!(state["worker_xacks"].as_array().map(Vec::len), Some(1));
     assert_eq!(state["xack_commands"], serde_json::json!([]));
     assert_no_worker_rollout(&fixture.log(), &state);
+}
+
+#[test]
+fn connected_message_refuses_a_missing_gateway_before_posting_a_placeholder() {
+    let fixture = Fixture::new();
+    let slack = serve(|_request| Response::json(200, r#"{"ok":true,"ts":"1717171717.000900"}"#));
+    let output = fixture
+        .command(fixture.state_home.path(), "connected", false)
+        .env("CURIE_TEST_CONNECTED", "1")
+        .env("CURIE_TEST_GATEWAY_MISSING", "1")
+        .env("CURIE_TEST_SLACK_BASE", &slack.base_url)
+        .env("CURIE_SLACK_BOT_TOKEN", "xoxb-example")
+        .output()
+        .expect("run connected message without a gateway");
+    assert!(!output.status.success(), "{}", describe(&output));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("channel gateway Deployment"));
+    assert!(slack.recorded().is_empty());
+    assert_eq!(fixture.state()["turns"].as_array().map(Vec::len), Some(0));
 }
 
 #[test]
