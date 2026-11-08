@@ -11,6 +11,7 @@ handed (ADR 0270). ``aci-protocol`` is never mocked.
 
 from __future__ import annotations
 
+import copy
 import hashlib
 import json
 import re
@@ -361,6 +362,22 @@ async def _dial_connector(config: Mapping[str, Any], timeout: float) -> int:
     return len(listed.tools)
 
 
+async def _retry_dial(dial: Callable[[float], Awaitable[Any]]) -> Any:
+    """Run one bounded dial, retrying transport failures before any answer."""
+
+    timeout = CONNECTOR_CALL_TIMEOUT_S
+    with anyio.fail_after(timeout):
+        attempt = 1
+        while True:
+            try:
+                return await dial(timeout)
+            except Exception as exc:  # noqa: BLE001 - classified below
+                if attempt >= CONNECTOR_CALL_ATTEMPTS or not _failed_before_answer(exc):
+                    raise
+                await anyio.sleep(_CONNECTOR_CALL_BACKOFF_S * attempt)
+                attempt += 1
+
+
 async def _call_connector(config: Mapping[str, Any]) -> str:
     """One bounded dial: ``ok tools=<n>`` or ``failed <reason>``.
 
@@ -369,22 +386,120 @@ async def _call_connector(config: Mapping[str, Any]) -> str:
     refusal or any answered protocol error is reported at once.
     """
 
-    timeout = CONNECTOR_CALL_TIMEOUT_S
     try:
-        with anyio.fail_after(timeout):
-            attempt = 1
-            while True:
-                try:
-                    tools = await _dial_connector(config, timeout)
-                    break
-                except Exception as exc:  # noqa: BLE001 - classified below
-                    if attempt >= CONNECTOR_CALL_ATTEMPTS or not _failed_before_answer(exc):
-                        raise
-                    await anyio.sleep(_CONNECTOR_CALL_BACKOFF_S * attempt)
-                    attempt += 1
+        tools = await _retry_dial(lambda timeout: _dial_connector(config, timeout))
     except Exception as exc:  # noqa: BLE001 - every failure is reported, none escapes
         return f"failed {_connector_failure(exc)}"
     return f"ok tools={tools}"
+
+
+# ``[fake:connector-tool <connector> <tool> <json-object-args>]`` dials exactly
+# one hosted connector, runs ``initialize`` then ``tools/call``, and answers one
+# line (ADR 0270 identity E2E):
+#
+#     connector-tool <connector>/<tool>: ok <first line of first text> caller=<fp>
+#     connector-tool <connector>/<tool>: refused <code> caller=<fp>
+#     connector-tool <connector>/<tool>: failed <reason> caller=<fp>
+#     connector-tool <connector>: failed unknown_connector
+#     connector-tool: failed bad_directive
+#
+# ``[fake:forge-principal <value>]`` adds the literal ``X-Curie-Principal``
+# header to that dial only, on a copy of the config.
+CONNECTOR_TOOL_MARKER = "[fake:connector-tool"
+_CONNECTOR_TOOL_RE = re.compile(r"\[fake:connector-tool (\S+) (\S+) (\{.*\})\]")
+_FORGE_PRINCIPAL_RE = re.compile(r"\[fake:forge-principal (\S+)\]")
+_FORGED_PRINCIPAL_HEADER = "X-Curie-Principal"
+
+
+@dataclass(frozen=True)
+class _ConnectorToolCall:
+    """A scripted single tool call, answered as the turn's closing text."""
+
+    connector: str | None
+    tool: str = ""
+    args: Mapping[str, Any] | None = None
+    forged_principal: str | None = None
+
+
+def connector_tool_turn(last: str) -> list[Any]:
+    """A turn that calls one connector tool as the person's message directs."""
+
+    match = _CONNECTOR_TOOL_RE.search(last)
+    call = _ConnectorToolCall(connector=None)
+    if match:
+        try:
+            args = json.loads(match.group(3))
+        except ValueError:
+            args = None
+        if isinstance(args, dict):
+            forge = _FORGE_PRINCIPAL_RE.search(last)
+            call = _ConnectorToolCall(
+                connector=match.group(1),
+                tool=match.group(2),
+                args=args,
+                forged_principal=forge.group(1) if forge else None,
+            )
+    return [_assistant(TextBlock(text="Calling the connector tool")), call]
+
+
+async def _dial_connector_tool(
+    config: Mapping[str, Any], tool: str, args: Mapping[str, Any], timeout: float
+) -> tuple[bool, str]:
+    async with server_streams(config, plugin_dir=None, inherited_env={}) as (
+        read_stream,
+        write_stream,
+    ):
+        async with ClientSession(
+            read_stream, write_stream, read_timeout_seconds=timeout
+        ) as session:
+            await session.initialize()
+            result = await session.call_tool(tool, dict(args))
+    content = getattr(result, "content", None) or []
+    first = next(
+        (
+            block.text
+            for block in content
+            if getattr(block, "type", None) == "text" and isinstance(block.text, str)
+        ),
+        "",
+    )
+    return bool(getattr(result, "is_error", False)), first.split("\n", 1)[0].strip()
+
+
+async def call_connector_tool(
+    servers: Mapping[str, Mapping[str, Any]], call: _ConnectorToolCall
+) -> str:
+    """The ``[fake:connector-tool]`` answer: exactly one line."""
+
+    if call.connector is None or call.args is None:
+        return "connector-tool: failed bad_directive"
+    base = servers.get(call.connector)
+    if base is None:
+        return f"connector-tool {call.connector}: failed unknown_connector"
+    config: Mapping[str, Any] = base
+    if call.forged_principal is not None:
+        forged = copy.deepcopy(dict(base))
+        headers = forged.get("headers")
+        forged["headers"] = {
+            **(dict(headers) if isinstance(headers, Mapping) else {}),
+            _FORGED_PRINCIPAL_HEADER: call.forged_principal,
+        }
+        config = forged
+    label = f"connector-tool {call.connector}/{call.tool}"
+    caller = _caller_fingerprint(config)
+    args = call.args
+    tool = call.tool
+    try:
+        is_error, first = await _retry_dial(
+            lambda timeout: _dial_connector_tool(config, tool, args, timeout)
+        )
+    except Exception as exc:  # noqa: BLE001 - every failure is reported, none escapes
+        return f"{label}: failed {_connector_failure(exc)} caller={caller}"
+    if not is_error:
+        return f"{label}: ok {first} caller={caller}"
+    if first.startswith("refused ") and len(first.split()) == 2:
+        return f"{label}: refused {first.split()[1]} caller={caller}"
+    return f"{label}: failed {first or 'tool_error'} caller={caller}"
 
 
 async def call_connectors(servers: Mapping[str, Mapping[str, Any]]) -> str:
@@ -446,9 +561,7 @@ class FakeModelSession:
         *,
         truncate_on_interrupt: bool = True,
         can_use_tool: CanUseTool | None = None,
-        pre_tool_use_hook: Callable[
-            [Any, str | None, Any], Awaitable[dict[str, Any]]
-        ]
+        pre_tool_use_hook: Callable[[Any, str | None, Any], Awaitable[dict[str, Any]]]
         | None = None,
         approval_gate: ApprovalGate | None = None,
         replay_messages: tuple[ConversationMessage, ...] = (),
@@ -507,6 +620,8 @@ class FakeModelSession:
             return reversible_turn()
         if PROGRESS_DEMO_MARKER in last:
             return progress_demo_turn()
+        if CONNECTOR_TOOL_MARKER in last:
+            return connector_tool_turn(last)
         if CONNECTOR_CALL_MARKER in last:
             return connector_call_turn()
         return default_turn()
@@ -539,6 +654,10 @@ class FakeModelSession:
                 # the dial expands in place into the turn's closing messages,
                 # which then take the same path as any scripted message.
                 answer = await call_connectors(self._connector_servers)
+                script.extendleft(reversed(_connector_call_answer(answer)))
+                continue
+            if isinstance(message, _ConnectorToolCall):
+                answer = await call_connector_tool(self._connector_servers, message)
                 script.extendleft(reversed(_connector_call_answer(answer)))
                 continue
             if isinstance(message, _Pause):

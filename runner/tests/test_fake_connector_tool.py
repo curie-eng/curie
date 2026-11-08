@@ -465,6 +465,7 @@ def test_a_403_with_the_frozen_caller_refusal_body_reads_failed_with_its_refusal
     vector: dict[str, Any],
 ) -> None:
     """Like ``[fake:connector-call]``: the proxy's own refusal code, e.g. ``expired``."""
+
     async def go() -> tuple[str, _Stub]:
         async with _refusing_proxy(str(vector["refusal"])) as stub:
             session = FakeModelSession(connector_servers={"weather": _server_config(stub.url)})
