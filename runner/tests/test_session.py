@@ -96,6 +96,9 @@ class _ProviderStallSession:
     async def close(self) -> None:
         self.release.set()
 
+    async def abort(self) -> None:
+        await self.close()
+
 
 class _ToolStallSession(_ProviderStallSession):
     async def receive_turn(self):
@@ -2455,6 +2458,55 @@ def test_abandoned_stream_interrupts_the_sdk() -> None:
 
     anyio.run(go)
     assert fake.interrupts >= 1
+
+
+@pytest.mark.parametrize("cancel_cleanup", [False, True])
+def test_abandoned_tool_stream_bounds_a_hung_interrupt(cancel_cleanup: bool) -> None:
+    class HungInterrupt(_ToolStallSession):
+        closed = False
+
+        async def interrupt(self) -> None:
+            self.interrupts += 1
+            self.entered.set()
+            await anyio.sleep_forever()
+
+        async def close(self) -> None:
+            self.closed = True
+            self.release.set()
+
+    async def go() -> None:
+        fake = HungInterrupt(anyio.Event(), anyio.Event())
+        runner = SessionRunner(
+            session_factory=lambda: fake,
+            ceiling=0,
+            max_usd_per_day=None,
+            tracer=RunTracer(None),
+            classifier=SideEffectClassifier(),
+            trace_name="cleanup",
+            held_secrets=frozenset(),
+            cleanup_timeout_s=0.05,
+        )
+        await runner.start()
+        gen = runner.run_turn(Event(type="message", text="read", user="U", ts="1"))
+        async for line in gen:
+            if any(event.type == "tool_note" for event in parse_ndjson(line)):
+                break
+        assert runner.turn_active
+        with anyio.fail_after(1):
+            if cancel_cleanup:
+                close = asyncio.create_task(gen.aclose())
+                await fake.entered.wait()
+                close.cancel()
+                with pytest.raises(asyncio.CancelledError):
+                    await close
+            else:
+                await gen.aclose()
+        assert fake.closed
+        assert not runner.turn_active
+        assert not runner.ready
+        assert not runner.history_durable
+
+    anyio.run(go)
 
 
 def test_cross_task_abandon_does_not_wedge_turn_lock() -> None:

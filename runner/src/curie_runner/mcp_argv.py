@@ -9,10 +9,13 @@ from __future__ import annotations
 
 import contextlib
 import os
+import signal
+import sys
 import tempfile
 from collections.abc import AsyncIterable
 from typing import Any
 
+import anyio
 from claude_agent_sdk import ClaudeAgentOptions
 from claude_agent_sdk._internal.transport.subprocess_cli import (
     SubprocessCLITransport as _SDKSubprocessCLITransport,
@@ -95,12 +98,35 @@ class CredentialSafeCLITransport(_SDKSubprocessCLITransport):
                 if new_val != cmd[i + 1]:
                     offloaded.append(new_val)
         self._mcp_config_tmps = offloaded
-        return rewritten
+        return [
+            sys.executable,
+            "-c",
+            "import os,sys; os.setsid(); os.execv(sys.argv[1], sys.argv[1:])",
+            *rewritten,
+        ]
+
+    async def stop_process_group(self) -> None:
+        process = self._process
+        if process is None:
+            return
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            with contextlib.suppress(ProcessLookupError):
+                process.kill()
+        with anyio.fail_after(5, shield=True):
+            await process.wait()
+        with contextlib.suppress(ProcessLookupError):
+            os.killpg(process.pid, signal.SIGKILL)
 
     async def close(self) -> None:
+        process = self._process
         try:
             await super().close()
         finally:
+            if process is not None:
+                with contextlib.suppress(ProcessLookupError):
+                    os.killpg(process.pid, signal.SIGKILL)
             # SDK returns early when no process was spawned; still unlink (#2635).
             self._unlink_mcp_config_tmps()
 

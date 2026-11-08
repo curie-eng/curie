@@ -412,7 +412,7 @@ async def _route_and_start(
             pending_publication_approval=pending_publication_approval,
         )
     ):
-        raise failures.ThreadBusyError(
+        raise failures.HandoffPending(
             f"thread {thread_key} has not reached a durable lineage handoff boundary"
         )
     if (
@@ -432,7 +432,7 @@ async def _route_and_start(
         and existing_handle.workspace_repo is None
         and not await self._workspace_handoff_ready(existing_handle, remaining_s=remaining_s)
     ):
-        raise failures.ThreadBusyError(
+        raise failures.HandoffPending(
             f"thread {thread_key} has not reached a durable workspace handoff boundary"
         )
     # Turn budget fence (#3071), generalized to a runner booted without a
@@ -460,7 +460,7 @@ async def _route_and_start(
         and existing_handle is not None
         and not await self._workspace_handoff_ready(existing_handle, remaining_s=remaining_s)
     ):
-        raise failures.ThreadBusyError(
+        raise failures.HandoffPending(
             f"thread {thread_key} has not reached a durable turn budget handoff boundary"
         )
     # @spec WORKER-TOOL-ACCESS-3: a restricted turn never gets a canned reply.
@@ -1009,6 +1009,16 @@ async def _route_and_start(
             remaining_s=remaining_s,
         )
         wait_budget_s = await check_capacity_before_request()
+        delivery_lease = constants._DELIVERY_LEASE.get()
+        if _is_fenced(delivery_lease):
+            assert delivery_lease is not None
+            previous = await self._markers.watched_turn(handle.claim_name)
+            if previous is not None and json.loads(previous)["owner"] != delivery_lease.owner:
+                if not await self._workspace_handoff_ready(handle, remaining_s=remaining_s):
+                    raise failures.HandoffPending(
+                        f"thread {thread_key} still has an unsettled leased turn"
+                    )
+            await self._markers.watch_turn(thread_key, handle.claim_name, delivery_lease)
         if wait is None:
             turn = await self._start_turn_under_hook_control(handle, event, remaining_s)
         elif wait_budget_s is None:
@@ -1300,7 +1310,7 @@ async def _claim_or_resume(
                     ),
                 )
                 if not ready:
-                    raise failures.ThreadBusyError(
+                    raise failures.HandoffPending(
                         f"thread {thread_key} lost its durable workspace "
                         "handoff boundary during preparation"
                     )

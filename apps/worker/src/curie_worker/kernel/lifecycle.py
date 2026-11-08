@@ -1096,14 +1096,9 @@ async def _process_event(
         # preflight is that check, and a marker must forbid replay before any
         # interrupt-and-rehydrate is contemplated) and BEFORE the first
         # attempt.
-        if claim._is_fenced(lease) and lease is not None and lease.generation > 1:
-            wait_scope = current_wait()
-            if wait_scope is None:
-                await self._preflight_reclaimed_delivery(thread_key, lease)
-            else:
-                record = await wait_scope[0].get(wait_scope[1])
-                if record is not None and record.grant_epoch is not None:
-                    await self._quiesce_capacity_epoch(thread_key, record.grant_epoch)
+        reclaim_preflight_pending = (
+            claim._is_fenced(lease) and lease is not None and lease.generation > 1
+        )
 
         # Retry carry for the inferred repository announcement (#2659); see
         # _WorkspaceInferenceCarry. Local to this delivery, never kernel state,
@@ -1126,6 +1121,7 @@ async def _process_event(
         termination_detail: str | None = None
         attempt = 0
         capacity_refusals = 0
+        handoff_refusals = 0
         capacity_wait_run: WorkItemRun | None = None
         dependency_deadline: float | None = None
         dependency_refusals = 0
@@ -1204,6 +1200,24 @@ async def _process_event(
                         ),
                     )
                     return
+            if reclaim_preflight_pending:
+                assert lease is not None
+                try:
+                    wait_scope = current_wait()
+                    if wait_scope is None:
+                        await self._preflight_reclaimed_delivery(thread_key, lease)
+                    else:
+                        record = await wait_scope[0].get(wait_scope[1])
+                        if record is not None and record.grant_epoch is not None:
+                            await self._quiesce_capacity_epoch(thread_key, record.grant_epoch)
+                except memory.ReclaimPreflightUnsafe:
+                    handoff_refusals += 1
+                    attempt -= 1
+                    await asyncio.sleep(
+                        min(self._backoff(handoff_refusals), max(0.0, lease.remaining_s()))
+                    )
+                    continue
+                reclaim_preflight_pending = False
             try:
                 outcome = await self._attempt(
                     qevent,
@@ -1265,6 +1279,15 @@ async def _process_event(
                         run.finished = True
                 return
             except failures.ThreadBusyError as busy:
+                if isinstance(busy, failures.HandoffPending) and claim._is_fenced(lease):
+                    assert lease is not None
+                    handoff_refusals += 1
+                    attempt -= 1
+                    logger.info("waiting for durable handoff for event %s", event_id)
+                    await asyncio.sleep(
+                        min(self._backoff(handoff_refusals), max(0.0, lease.remaining_s()))
+                    )
+                    continue
                 run = (
                     self._work_item_runs.get(owned_work_item_id)
                     if owned_work_item_id is not None

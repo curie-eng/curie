@@ -474,6 +474,8 @@ _NON_BOOT_ALLOWLIST: frozenset[str] = frozenset(
         # its own env to pick the active harness, unset selects the built-in
         # Claude. Not a boot contract key.
         "CURIE_HARNESS",
+        # RunnerConfig reads this local cleanup bound from the runner environment.
+        "CURIE_RUNNER_CLEANUP_TIMEOUT_S",
         # runner-local SDK deny list (#2429); read by the runner from its own env
         # via extraEnv, unset keeps every tool available. Not a boot contract key.
         "CURIE_DISALLOWED_TOOLS",
@@ -502,6 +504,8 @@ _NON_BOOT_ALLOWLIST: frozenset[str] = frozenset(
         #   CURIE_RECLAIM_MIN_IDLE_MS in the code above, worker-side policy
         #   decided before any sandbox exists.
         "CURIE_DELIVERY_BUDGET_S",
+        # WorkerConfig reads this maintenance bound; it never enters a claim.
+        "CURIE_ABANDONED_TURN_GRACE_S",
         # The factory turn budget (#3071): a worker setting whose VALUE the
         # worker writes into a work-item claim under the BootEnv key
         # CURIE_MAX_TURNS. This name itself never enters a sandbox.

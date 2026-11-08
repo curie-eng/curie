@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import uuid
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -416,7 +417,32 @@ async def _adopt_resumed_work_item(
 
 async def reap_orphans(self: Kernel) -> list[str]:
     """Periodic tick: delete substrate claims no live route references."""
-    reaped = await asyncio.to_thread(self._substrate.reap_orphans)
+    reaped: list[str] = []
+    for claim_name, expected in (await self._markers.watched_turns()).items():
+        thread_key = json.loads(expected)["thread_key"]
+        async with self._lock.hold(self._config.lock_key(thread_key)) as fence:
+            if not await self._markers.abandoned_turn(claim_name, expected):
+                continue
+            handle = await asyncio.to_thread(self._substrate.lookup, thread_key)
+            if handle is not None and handle.claim_name == claim_name:
+                try:
+                    status = await self._runner.status(
+                        handle.base_url, token=handle.token or None, remaining_s=5.0
+                    )
+                except Exception:  # noqa: BLE001 - unreadable children must be retired
+                    status = {}
+                if not (
+                    status.get("turn_active") is False and status.get("history_durable") is True
+                ):
+                    await fence.ensure_owned()
+                    retired = await asyncio.to_thread(
+                        self._substrate.release_if_claim, thread_key, claim_name
+                    )
+                    if retired:
+                        logger.warning("retired abandoned runner claim %s", claim_name)
+                        reaped.append(claim_name)
+            await self._markers.forget_watched_turn(claim_name, expected)
+    reaped.extend(await asyncio.to_thread(self._substrate.reap_orphans))
     if self._workspace is not None:
         expired_threads = await asyncio.to_thread(self._workspace.enumerate_expired)
         for thread_key in expired_threads:

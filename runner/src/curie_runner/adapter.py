@@ -66,6 +66,7 @@ from .history import (
     validate_assistant_groups,
     validate_group_provenance,
 )
+from .mcp_argv import CredentialSafeCLITransport
 from .mcp_argv import install as install_mcp_argv_offload
 from .personal_auth import (
     AuthMode,
@@ -507,6 +508,10 @@ class ModelSession(Protocol):
         """Tear down the session."""
         ...
 
+    async def abort(self) -> None:
+        """Stop the subprocess group without waiting for a control acknowledgement."""
+        ...
+
 
 @runtime_checkable
 class McpServerReconnector(Protocol):
@@ -877,6 +882,13 @@ class ClaudeAgentSession:
             config, self._personal_config = self._personal_config, None
             if config is not None:
                 config.remove()
+
+    async def abort(self) -> None:
+        transport = self._client._transport
+        if transport is not None:
+            if not isinstance(transport, CredentialSafeCLITransport):
+                raise RuntimeError("session transport does not own an isolated process group")
+            await transport.stop_process_group()
 
     async def export_replay_state(self) -> HarnessReplayState | None:
         """Export the provider transcript checkpoint/delta mirrored this turn."""

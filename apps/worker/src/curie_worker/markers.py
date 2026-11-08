@@ -67,6 +67,7 @@ from pydantic import BaseModel, Field
 from redis.asyncio import Redis
 
 from .config import WorkerConfig
+from .delivery_lease import DeliveryLease, LeaseLostError
 from .reply_sink import TargetRoute
 
 DoneMarkerValue = Literal["1", "history_capacity"]
@@ -420,6 +421,95 @@ class Markers:
         self._redis = redis
         self._config = config
         self._completion_sample_offset = 0
+
+    def _turn_recovery_key(self) -> str:
+        return f"{self._config.key_prefix}:turn-recovery"
+
+    async def watch_turn(self, thread_key: str, claim_name: str, lease: DeliveryLease) -> None:
+        lease.raise_if_lost()
+        value = json.dumps(
+            {
+                "thread_key": thread_key,
+                "lease_key": self._config.delivery_lease_key(
+                    lease.stream, lease.group, lease.entry_id
+                ),
+                "owner": lease.owner,
+            }
+        )
+        accepted = await self._redis.eval(
+            """
+            if redis.call('GET', KEYS[2]) ~= ARGV[2] then return 0 end
+            redis.call('HSET', KEYS[1], ARGV[1], ARGV[3])
+            redis.call('HDEL', KEYS[3], ARGV[1])
+            return 1
+            """,
+            3,
+            self._turn_recovery_key(),
+            self._config.delivery_lease_key(lease.stream, lease.group, lease.entry_id),
+            self._turn_recovery_key() + ":absent",
+            claim_name,
+            lease.owner,
+            value,
+        )
+        if not accepted:
+            raise LeaseLostError("turn recovery registration lost its delivery lease")
+
+    async def watched_turns(self) -> dict[str, str]:
+        rows = await self._redis.hgetall(self._turn_recovery_key())
+        return {
+            key.decode() if isinstance(key, bytes) else key: value.decode()
+            if isinstance(value, bytes)
+            else value
+            for key, value in rows.items()
+        }
+
+    async def watched_turn(self, claim_name: str) -> str | None:
+        value = await self._redis.hget(self._turn_recovery_key(), claim_name)
+        return value.decode() if isinstance(value, bytes) else value
+
+    async def abandoned_turn(self, claim_name: str, expected: str) -> bool:
+        return bool(
+            await self._redis.eval(
+                """
+            local value = redis.call('HGET', KEYS[1], ARGV[1])
+            if value ~= ARGV[2] then return 0 end
+            local record = cjson.decode(value)
+            if redis.call('GET', record.lease_key) == record.owner then
+              redis.call('HDEL', KEYS[2], ARGV[1])
+              return 0
+            end
+            local t = redis.call('TIME')
+            local now = t[1] * 1000 + math.floor(t[2] / 1000)
+            local since = redis.call('HGET', KEYS[2], ARGV[1])
+            if not since then
+              redis.call('HSET', KEYS[2], ARGV[1], now)
+              return 0
+            end
+            return now - tonumber(since) >= tonumber(ARGV[3]) and 1 or 0
+            """,
+                2,
+                self._turn_recovery_key(),
+                self._turn_recovery_key() + ":absent",
+                claim_name,
+                expected,
+                int(self._config.abandoned_turn_grace_s * 1000),
+            )
+        )
+
+    async def forget_watched_turn(self, claim_name: str, expected: str) -> None:
+        await self._redis.eval(
+            """
+            if redis.call('HGET', KEYS[1], ARGV[1]) ~= ARGV[2] then return 0 end
+            redis.call('HDEL', KEYS[1], ARGV[1])
+            redis.call('HDEL', KEYS[2], ARGV[1])
+            return 1
+            """,
+            2,
+            self._turn_recovery_key(),
+            self._turn_recovery_key() + ":absent",
+            claim_name,
+            expected,
+        )
 
     def _completion_storage_key(self, event_id: str, *, answer: CompletionNamespace = False) -> str:
         key = self._config.completion_key(event_id)

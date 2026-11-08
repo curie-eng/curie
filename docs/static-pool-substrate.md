@@ -68,6 +68,34 @@ with a new incarnation answers idle on that slot's address, and then returns
 the slot to the pool. A shell the worker cannot reach keeps its slot leased
 until the shell answers again.
 
+Each fenced turn records its claim and delivery lease before it starts. After
+that lease is first observed absent, `CURIE_ABANDONED_TURN_GRACE_S` allows
+90 seconds for cleanup, plus the maintenance cadence. Maintenance takes the
+thread lock and checks the exact claim again. An idle runner with durable
+history keeps its route. An active, unreadable or non-durable runner is retired
+through the supervisor. The slot becomes free only after the supervisor confirms
+the child stopped and cleanup succeeded; failed settlement or cleanup quarantines
+it. This recovery also applies to Docker and Kubernetes through their normal
+claim retirement paths. An unreachable shell stays leased until retirement can
+be confirmed.
+
+The runner-local `CURIE_RUNNER_CLEANUP_TIMEOUT_S` defaults to 30 seconds,
+matching the existing abandoned-turn drain window. Set it on shells through
+`CURIE_SUPERVISOR_CHILD_ENV_PUBLIC`. An abandoned stream allows that total time
+for a pending timeout interrupt and its own interrupt.
+If interruption fails or expires, the runner kills its isolated CLI process
+group and allows five seconds to reap the child. It reports the turn ended and
+the session unavailable without advancing the history durability fence. The
+existing unfinished-usage report adds at most 25 seconds. The default recovery
+grace covers these bounds with 30 seconds of margin: 30 + 5 + 25 = 60 seconds.
+Increase the grace alongside a larger runner cleanup timeout.
+
+A refused durable handoff waits with exponential backoff inside the same fenced
+delivery. The heartbeat retains the PEL entry without increasing its delivery
+count. The original delivery deadline bounds the wait across restarts, and an
+exhausted deadline produces the ordinary operator-visible delivery failure.
+Actual failed deliveries retain the existing maximum-delivery cap.
+
 When every slot of a pool is leased, a claim fails with
 `CapacityExhaustedError` carrying a capacity rejection for one `pods` unit in
 that pool, and the kernel parks the turn exactly as it does for a full

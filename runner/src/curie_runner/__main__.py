@@ -1503,6 +1503,7 @@ def build_runner(
     )
     return bind_status_attestation(
         SessionRunner(
+            cleanup_timeout_s=config.cleanup_timeout_s,
             session_factory=factory,
             final_answer=final_answer,
             ceiling=config.ceiling,
