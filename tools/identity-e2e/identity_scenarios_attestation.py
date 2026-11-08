@@ -64,7 +64,74 @@ from identity_scenarios import (
     send_summary,
     set_requester_flag,
 )
-from identity_target import b64url_decode, log
+from identity_target import POD_PRELUDE, b64url_decode, log
+
+# The runner's permission gate raises a routeless approval, so its email card
+# has no route approver list. On such a card only a migrated approver role is
+# the whole answer authority (ADR 0267 decision 3); a retained role keeps the
+# legacy card-channel default, which on email admits nobody (ADR 0177 amendment
+# A3, ``NoVerifiableApprovers``). G0 therefore migrates the approver role it
+# set, and G10 writes the exact stored configuration back: the role-policy API
+# has no operation that undoes a migration, so the restore writes the row under
+# the policy's lock order with the version bump and audit event a role change
+# records, refusing if the role changed since G0.
+APPROVER_LEGACY_SCRIPT = (
+    POD_PRELUDE
+    + """
+from sqlalchemy import func
+from curie_api import agent_role_policy, identity_audit
+from curie_api.schemas.agent_access import MigrateRoleV1
+
+async def body(session):
+    tenant, agent = uuid.UUID(P["tenant_id"]), uuid.UUID(P["agent_id"])
+    async with session.begin():
+        found, policy, _null = await agent_role_policy.lock_policy_rows(
+            session, tenant_id=tenant, agent_id=agent, require_active=False)
+        if found is None or policy is None:
+            return {"action": "refused", "reason": "the agent has no access policy row"}
+        stored = dict(policy.role_configuration or {}).get("approver")
+        version = policy.version
+        if P["operation"] == "migrate":
+            if stored is None:
+                return {"action": "refused", "reason": "the agent has no approver role",
+                        "version": version}
+            if stored.get("legacy_state") == "migrated":
+                return {"action": "unchanged", "legacy_state": "migrated", "version": version}
+        else:
+            previous = P["previous"]
+            if (stored is None or stored.get("legacy_state") != "migrated"
+                    or stored.get("filter") != previous.get("filter")):
+                return {"action": "refused", "reason": "the approver role changed since G0",
+                        "version": version}
+            roles = dict(policy.role_configuration or {})
+            roles["approver"] = previous
+            policy.role_configuration = roles
+            policy.version = version + 1
+            policy.updated_at = func.now()
+            identity_audit.record(
+                session, tenant_id=tenant, event_type="identity.agent_role_policy_changed",
+                actor="identity-e2e",
+                details={"agent_id": str(agent), "role": "approver",
+                         "operation": "identity_e2e_restore_legacy_state",
+                         "previous_version": version, "version": version + 1,
+                         "previous_legacy_state": "migrated",
+                         "legacy_state": previous.get("legacy_state")})
+            await session.flush()
+            return {"action": "restored", "legacy_state": previous.get("legacy_state"),
+                    "version": version + 1}
+    change = MigrateRoleV1.model_validate({
+        "schema_version": 1, "tenant_id": str(tenant), "agent_id": str(agent),
+        "expected_version": version, "role": "approver", "operation": "migrate_role",
+        "filter": stored.get("filter"), "raw_account_revocation": "separate_removal_required",
+    })
+    async with session.begin():
+        result = await agent_role_policy.apply_role_change(session, change=change)
+    return {"action": "migrated", "previous": stored,
+            "legacy_state": result.roles.approver.legacy_state, "version": result.version}
+
+emit(asyncio.run(_with_session(body)))
+"""
+)
 
 EFFECT_TOOL = "record_effect"
 ATTESTED_TOOL = "execute_attested"
@@ -1470,6 +1537,20 @@ def setup(
     restore["approver_role"], seen["approver_role"] = req_helpers.set_approver_role(
         harness, agent_id
     )
+    migrated = harness.target.pod_python(
+        APPROVER_LEGACY_SCRIPT,
+        {"tenant_id": harness.data["tenant_id"], "agent_id": agent_id, "operation": "migrate"},
+    )
+    if migrated.get("action") == "migrated":
+        restore["approver_legacy"] = migrated["previous"]
+    seen["approver_role"]["migration"] = {
+        key: migrated.get(key) for key in ("action", "legacy_state", "version", "reason")
+    }
+    check(
+        migrated.get("legacy_state") == "migrated",
+        f"the approver role was not migrated: {seen['approver_role']['migration']}, so the "
+        "routeless permission-gate card admits no email answer",
+    )
 
     stored = stored_approval_tools(harness, agent_id)
     restore["approval_tools"] = stored
@@ -1760,6 +1841,23 @@ def restore_grant_setup(
             seen["flag"] = flagged
             if flagged is None or bool(flagged["flag"]) != wanted:
                 failures.append(f"flag: not restored to {wanted}")
+        legacy = restore.get("approver_legacy")
+        if legacy is not None:
+            unmigrated = req_helpers._quietly(
+                evidence,
+                lambda: harness.target.pod_python(
+                    APPROVER_LEGACY_SCRIPT,
+                    {
+                        "tenant_id": harness.data["tenant_id"],
+                        "agent_id": agent_id,
+                        "operation": "restore",
+                        "previous": legacy,
+                    },
+                ),
+            )
+            seen["approver_legacy"] = unmigrated
+            if unmigrated is None or unmigrated.get("action") != "restored":
+                failures.append("approver role: its legacy state was not restored")
         previous_role = restore.get("approver_role")
         if previous_role is not None:
             seen["approver_role"], failure, residual = req_helpers.restore_approver_role(
