@@ -135,6 +135,7 @@ def series(pworker_service):
         if fixture is not None:
             fixture.principal.remove()
         (pworker_service.private / "users.acl").write_bytes(original)
+        pworker_service.copy_tls("users.acl")
         pworker_service.command("FLUSHDB")
 
 
@@ -281,6 +282,7 @@ def test_actual_broker_restart_retains_original_c_and_changes_observed_epoch(ser
             series.broker.private / "users.acl",
             "\n".join(row.decode() if isinstance(row, bytes) else row for row in rows) + "\n",
         )
+        series.broker.copy_tls("users.acl")
         series.broker.restart()
         try:
             with pytest.raises(module().EvidenceObservationRefused):
