@@ -40,7 +40,7 @@ from curie_api.deps import get_approver_sets
 from curie_api.main import create_app
 from curie_api.routers.console import SESSION_COOKIE
 from curie_api.slack_approvers import SlackApproverSetSelector
-from curie_api.slack_usergroups import SlackUserGroupClient
+from curie_channel_gateway.slack.groups import SlackUserGroupClient
 from fastapi.testclient import TestClient
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import create_async_engine

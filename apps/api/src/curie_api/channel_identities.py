@@ -11,10 +11,10 @@ token, not a proof: no syntax can show a string is not a secret.
 
 Today's statically configured Slack identities are each represented by one
 row created at API boot (``bootstrap_static_slack``): the legacy single app,
-named ``default`` and gated on ``settings.slack_bot_token``, and every
-identity ``settings.slack_identities`` declares (ADR 0168 decision 1), each
-gated on its own bot token env var being non-blank. A Slack-free install gets
-no rows, and an existing self-host install needs no manual step. Every
+named ``default`` and gated on ``settings.channel_gateway_url``, and every
+identity ``settings.slack_identities`` declares (ADR 0168 decision 1).
+Declarations reserve rows; the gateway and dispatcher attest provider availability.
+A Slack-free install gets no rows and needs no manual step. Every
 bootstrapped row is created unattached (``provider_installation_id`` is NULL,
 ADR 0193 decision 4): only the identity's own credential can later report
 which installation it belongs to (#3039), so attaching it -- finding or
@@ -28,7 +28,6 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-import os
 import re
 import time
 import uuid
@@ -358,17 +357,14 @@ class _DeclaredSlackIdentity:
 
 
 def _declared_slack_identities(settings: Settings) -> list[_DeclaredSlackIdentity]:
-    """Every Slack identity this install actually has a bot token for.
+    """Declarations identify gateway credentials without exposing their values.
 
-    The legacy ``default`` reads ``Settings`` directly (it predates
-    ``CURIE_SLACK_IDENTITIES`` and keeps its own fixed env names). Every other
-    declared identity's presence is read from the real environment the same
-    way ``identities.slack_bot_tokens`` does, so a row is bootstrapped exactly
-    when the dispatcher and worker would treat that identity as configured.
+    The gateway and dispatcher report provider availability independently. A
+    declaration can reserve a row even while its provider is unavailable.
     """
 
     declared: list[_DeclaredSlackIdentity] = []
-    if settings.slack_bot_token:
+    if settings.channel_gateway_url:
         declared.append(
             _DeclaredSlackIdentity(
                 DEFAULT_IDENTITY,
@@ -380,9 +376,6 @@ def _declared_slack_identities(settings: Settings) -> list[_DeclaredSlackIdentit
     for identity in settings.slack_identities:
         if identity.name == DEFAULT_IDENTITY:
             continue  # Already covered above, under the legacy env names.
-        token = os.environ.get(identity.bot_token_env) or ""
-        if not token.strip():
-            continue  # A blank declared token is not configured; no row for it.
         declared.append(
             _DeclaredSlackIdentity(
                 identity.name,

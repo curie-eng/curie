@@ -28,7 +28,7 @@ pinned in ``tests/kernel/test_thread_attachment_rebuild.py``):
         ``thread_max_files >= max_files`` (``ValueError``). No relation between
         ``thread_max_bytes`` and ``max_file_bytes`` is enforced here (the chart
         checks the budget against the attachments volume instead).
-    ``ChannelPortFileClient.bind_route(adapter, endpoint) -> AttachmentFilePort``:
+    ``ChannelPortFileClient.bind_route(adapter, endpoint) -> FileSource``:
         ``bind`` for a route read from the bindings rather than a reply handle,
         with the same two refusals (no endpoint: stage ``wiring``; no secret for
         the adapter: stage ``credential``).
@@ -96,6 +96,7 @@ from typing import Any
 
 import pytest
 from aci_protocol import Attachment, ReplyHandle
+from curie_channel_gateway.slack import files as slack_files
 
 # importlib import mode does not add this test directory to sys.path.
 sys.path.insert(0, str(Path(__file__).parent))
@@ -279,9 +280,7 @@ class _Transport:
         if isinstance(answer, BaseException):
             raise answer
         status, body = answer
-        return self._attachments.SlackFileResponse(
-            status=status, headers={}, chunks=iter([body])
-        )
+        return self._slack_files.FileResponse(status=status, headers={}, chunks=iter([body]))
 
 
 def _channel_files(
@@ -804,7 +803,7 @@ def _case_slack_timeout(attachments: Any, ledger: Any) -> dict[str, Any]:
 def _case_slack_refused(attachments: Any, ledger: Any) -> dict[str, Any]:
     return {
         "ref": _earlier(ledger, "BAD", b"x"),
-        "slack_failures": {"BAD": attachments.SlackFileError("file_not_found")},
+        "slack_failures": {"BAD": slack_files.SlackFileError("file_not_found")},
         "reason": "fetch_failed",
     }
 
@@ -936,7 +935,7 @@ def test_a_current_file_failure_refuses_the_set_and_leaves_nothing(
     attachments: Any, ledger: Any
 ) -> None:
     files = FakeSlackFiles({"C1": [b"ok"], "C2": [b"never"], "E1": [b"earlier"]})
-    files.failures["C2"] = attachments.SlackFileError("file_not_found")
+    files.failures["C2"] = slack_files.SlackFileError("file_not_found")
     coordinator, store, _clock = _coordinator(attachments, files=files)
 
     with pytest.raises(attachments.AttachmentResolutionError):

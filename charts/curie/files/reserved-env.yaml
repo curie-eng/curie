@@ -81,6 +81,9 @@ worker:
   CURIE_SEALING_PRIVATE_KEY: sealing.privateKeyExistingSecret
   CURIE_SHIMMER: worker.shimmer
   CURIE_SLACK_IDENTITIES: dispatcher.slack.identities
+  CURIE_CHANNEL_GATEWAY_URL: channelGateway.url
+  CURIE_CHANNEL_GATEWAY_TOKEN: channelGateway.apiToken or channelGateway.workerToken
+  CURIE_CHANNEL_GATEWAY_ALLOW_INSECURE: channelGateway.allowInsecure
   CURIE_SLACK_TRUSTED_ORIGINS: worker.slackTrustedOrigins
   CURIE_STATUS_TEXT: worker.statusText
   CURIE_STREAM_RETENTION_MIN_AGE_S: worker.streamRetention.minAgeSeconds
@@ -177,6 +180,9 @@ api:
   CURIE_SANDBOX_QUOTA_REQUESTS_CPU: resourceQuota.hard.requestsCpu
   CURIE_SANDBOX_QUOTA_REQUESTS_MEMORY: resourceQuota.hard.requestsMemory
   CURIE_SLACK_IDENTITIES: dispatcher.slack.identities
+  CURIE_CHANNEL_GATEWAY_URL: channelGateway.url
+  CURIE_CHANNEL_GATEWAY_TOKEN: channelGateway.apiToken or channelGateway.workerToken
+  CURIE_CHANNEL_GATEWAY_ALLOW_INSECURE: channelGateway.allowInsecure
   CURIE_TEST_INSTALLATION_DRIVERS: testInstallation.drivers
   CURIE_TEST_INSTALLATION_ENABLED: testInstallation.enabled
   DATABASE_URL: postgres.host / postgres.port / postgres.auth / postgres.sslMode

@@ -1,4 +1,4 @@
-"""The bot token each Slack identity speaks with on this worker (ADR-0168 decision 5).
+"""The bot token each Slack identity speaks with in this gateway (ADR-0168 decision 5).
 
 `aci_protocol.slack_identities` parses which identities the chart declares and
 the env name holding each bot token. This module reads those tokens once, at
@@ -11,15 +11,25 @@ import logging
 import os
 from collections.abc import Mapping
 
+from aci_protocol.slack_identities import SLACK_IDENTITIES_ENV, SlackIdentities
 from aci_protocol.turn import DEFAULT_IDENTITY, SLACK_KIND, slack_speaking_identity
+from pydantic import Field
+from pydantic_settings import BaseSettings, SettingsConfigDict
 
-from .config import WorkerConfig
+
+class SlackProviderConfig(BaseSettings):
+    model_config = SettingsConfigDict(
+        extra="ignore", hide_input_in_errors=True, populate_by_name=True
+    )
+    slack_bot_token: str = Field(default="", repr=False)
+    slack_identities: SlackIdentities = Field(default=(), validation_alias=SLACK_IDENTITIES_ENV)
+
 
 logger = logging.getLogger(__name__)
 
 
 def slack_bot_tokens(
-    config: WorkerConfig, *, environ: Mapping[str, str] | None = None
+    config: SlackProviderConfig, *, environ: Mapping[str, str] | None = None
 ) -> dict[str, str]:
     """Each identity's bot token, keyed by identity name.
 
@@ -39,7 +49,7 @@ def slack_bot_tokens(
         token = env.get(declared.bot_token_env) or ""
         if not token.strip():
             logger.error(
-                "Slack identity %s cannot reply from this worker: %s is empty",
+                "Slack identity %s cannot reply from this gateway: %s is empty",
                 declared.name,
                 declared.bot_token_env,
             )

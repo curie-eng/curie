@@ -43,7 +43,8 @@ from curie_worker.workspace import WorkspaceObjectStore
 # A non-secret placeholder. The lane only needs a bot token to be PRESENT --
 # nothing in build() calls Slack -- so keep it an obvious placeholder behind a
 # named constant, as test_run.py does for the model credential.
-_FAKE_BOT_TOKEN = "xoxb-PLACEHOLDER"
+_FAKE_GATEWAY_URL = "http://127.0.0.1:1"
+_GATEWAY_TOKEN = "worker-caller-credential"
 
 
 class _NoS3Client:
@@ -140,7 +141,11 @@ def built(monkeypatch: pytest.MonkeyPatch) -> Any:
         _KernelSpy.instances.clear()
 
         async def _drive() -> dict[str, Any]:
-            config = WorkerConfig(**config_overrides)
+            config = WorkerConfig(
+                channel_gateway_token=_GATEWAY_TOKEN,
+                channel_gateway_allow_insecure=True,
+                **config_overrides,
+            )
             runtime = run.build(config, dict(env or {}))
             try:
                 assert len(_KernelSpy.instances) == 1
@@ -188,7 +193,7 @@ def test_the_lane_ships_off_and_wires_nothing_at_all(built: Any) -> None:
     fails and nothing else in the suite does.
     """
 
-    kwargs = built(slack_bot_token=_FAKE_BOT_TOKEN)
+    kwargs = built(channel_gateway_url=_FAKE_GATEWAY_URL)
     assert kwargs.get("attachments") is None, (
         "the lane was wired with attachment_enabled at its default. The off "
         "switch does not switch anything off: the worker still downloads every "
@@ -202,7 +207,7 @@ def test_the_lane_ships_off_and_wires_nothing_at_all(built: Any) -> None:
 def test_the_default_config_ships_the_lane_off(built: Any) -> None:
     """Stated once, directly, so a default flip cannot be a silent diff."""
 
-    assert WorkerConfig(slack_bot_token=_FAKE_BOT_TOKEN).attachment_enabled is False
+    assert WorkerConfig(channel_gateway_url=_FAKE_GATEWAY_URL).attachment_enabled is False
 
 
 # --- the lane reaches the kernel -------------------------------------------
@@ -211,7 +216,7 @@ def test_the_default_config_ships_the_lane_off(built: Any) -> None:
 def test_build_hands_the_kernel_an_attachment_coordinator(built: Any) -> None:
     # THE test for S4. revert: drop `attachments=` from the Kernel(...) call in
     # run.build -> this fails and nothing else in the suite does.
-    kwargs = built(attachment_enabled=True, slack_bot_token=_FAKE_BOT_TOKEN)
+    kwargs = built(attachment_enabled=True, channel_gateway_url=_FAKE_GATEWAY_URL)
     assert isinstance(_lane(kwargs), AttachmentCoordinator)
 
 
@@ -219,7 +224,7 @@ def test_the_kernel_actually_holds_the_lane_it_was_handed(built: Any) -> None:
     # Passing the keyword is not enough: `attachments=None` would satisfy the
     # signature and leave the turn path untouched. Read the constructed kernel's
     # own state, which is what _handle_event branches on.
-    kwargs = built(attachment_enabled=True, slack_bot_token=_FAKE_BOT_TOKEN)
+    kwargs = built(attachment_enabled=True, channel_gateway_url=_FAKE_GATEWAY_URL)
     kernel = _KernelSpy.instances[0].inner
     assert kernel._attachments is _lane(kwargs)  # noqa: SLF001 -- the wiring IS the subject
 
@@ -234,7 +239,7 @@ def test_the_lane_downloads_through_the_bot_token_and_parks_in_the_private_store
     lane = _lane(
         built(
             attachment_enabled=True,
-            slack_bot_token=_FAKE_BOT_TOKEN,
+            channel_gateway_url=_FAKE_GATEWAY_URL,
             workspace_bucket="curie-workspaces",
         )
     )
@@ -250,7 +255,7 @@ def test_no_bot_token_leaves_the_lane_unwired_rather_than_half_wired(built: Any)
     # token (compose smoke, a mail-only install) must run every turn exactly as
     # it does today rather than failing on the first message with a file.
     # The switch on its own is not enough: both conditions still hold.
-    assert built(attachment_enabled=True, slack_bot_token="").get("attachments") is None
+    assert built(attachment_enabled=True, channel_gateway_url="").get("attachments") is None
 
 
 # --- ADR-0153: a channel-port adapter's credential is a lane credential too --
@@ -264,7 +269,7 @@ def test_adapter_credentials_alone_wire_the_lane_for_channel_port_turns(built: A
     lane = _lane(
         built(
             attachment_enabled=True,
-            slack_bot_token="",
+            channel_gateway_url="",
             adapter_credentials={"mail-adapter": "adapter-secret-placeholder"},
         )
     )
@@ -286,7 +291,7 @@ def test_adapter_credentials_alone_wire_the_lane_for_channel_port_turns(built: A
 
 
 def test_a_slack_only_worker_wires_no_channel_port_client(built: Any) -> None:
-    lane = _lane(built(attachment_enabled=True, slack_bot_token=_FAKE_BOT_TOKEN))
+    lane = _lane(built(attachment_enabled=True, channel_gateway_url=_FAKE_GATEWAY_URL))
     assert lane.files is not None
     assert lane.channel_files is None
 
@@ -310,7 +315,7 @@ def test_the_configured_limits_reach_the_wired_coordinator(built: Any) -> None:
     lane = _lane(
         built(
             attachment_enabled=True,
-            slack_bot_token=_FAKE_BOT_TOKEN,
+            channel_gateway_url=_FAKE_GATEWAY_URL,
             attachment_max_file_bytes=7 * 1024 * 1024,
             attachment_reference_ttl_seconds=120,
             attachment_retention_ttl_seconds=900,
@@ -324,7 +329,7 @@ def test_the_configured_limits_reach_the_wired_coordinator(built: Any) -> None:
 def test_an_unconfigured_deployment_gets_the_lane_defaults(built: Any) -> None:
     # The shipped envelope, read off the lane the kernel holds rather than off
     # the dataclass, so a wiring that quietly substitutes its own numbers fails.
-    lane = _lane(built(attachment_enabled=True, slack_bot_token=_FAKE_BOT_TOKEN))
+    lane = _lane(built(attachment_enabled=True, channel_gateway_url=_FAKE_GATEWAY_URL))
     default = AttachmentLimits()
     assert lane.limits.max_file_bytes == default.max_file_bytes
     assert lane.limits.reference_ttl_seconds == default.reference_ttl_seconds
@@ -375,7 +380,7 @@ def test_a_resolved_turn_delivers_the_capability_under_the_init_containers_key(
     # k8s substrate scopes to attachments-init. Driven through the WIRED lane's
     # own resolve so a build that hands over a differently-configured
     # coordinator cannot pass.
-    lane = _lane(built(attachment_enabled=True, slack_bot_token=_FAKE_BOT_TOKEN))
+    lane = _lane(built(attachment_enabled=True, channel_gateway_url=_FAKE_GATEWAY_URL))
 
     class _Objects:
         def put_stream(self, key: str, chunks: Any) -> None:
@@ -425,21 +430,21 @@ _OPS_BOT_TOKEN = "xoxb-OPS-PLACEHOLDER"
 def test_a_declared_identity_gets_its_own_file_client_from_builds_env(built: Any) -> None:
     lane = _lane(
         built(
-            env={"CURIE_SLACK_BOT_TOKEN__1": _OPS_BOT_TOKEN},
+            env={},
             attachment_enabled=True,
-            slack_bot_token=_FAKE_BOT_TOKEN,
+            channel_gateway_url=_FAKE_GATEWAY_URL,
             slack_identities=_DECLARED_OPS,
         )
     )
     assert set(lane._identity_files) == {"ops-bot"}  # noqa: SLF001
-    assert lane._identity_files["ops-bot"]._token == _OPS_BOT_TOKEN  # type: ignore[attr-defined]  # noqa: SLF001
-    assert lane.files._token == _FAKE_BOT_TOKEN  # type: ignore[attr-defined]  # noqa: SLF001
+    assert lane._identity_files["ops-bot"]._token == _GATEWAY_TOKEN  # type: ignore[attr-defined]  # noqa: SLF001
+    assert lane.files._token == _GATEWAY_TOKEN  # type: ignore[attr-defined]  # noqa: SLF001
 
 
 def test_build_hands_the_reply_sink_the_same_identities(built: Any) -> None:
     kwargs = built(
-        env={"CURIE_SLACK_BOT_TOKEN__1": _OPS_BOT_TOKEN},
-        slack_bot_token=_FAKE_BOT_TOKEN,
+        env={},
+        channel_gateway_url=_FAKE_GATEWAY_URL,
         slack_identities=_DECLARED_OPS,
     )
     sink = kwargs["sink"]
@@ -457,13 +462,13 @@ def test_a_named_only_token_enables_the_lane_with_no_default_token(built: Any) -
     # posted to that bot.
     lane = _lane(
         built(
-            env={"CURIE_SLACK_BOT_TOKEN__1": _OPS_BOT_TOKEN},
+            env={},
             attachment_enabled=True,
-            slack_bot_token="",
+            channel_gateway_url=_FAKE_GATEWAY_URL,
             slack_identities=_DECLARED_OPS,
         )
     )
-    assert lane._identity_files["ops-bot"]._token == _OPS_BOT_TOKEN  # type: ignore[attr-defined]  # noqa: SLF001
+    assert lane._identity_files["ops-bot"]._token == _GATEWAY_TOKEN  # type: ignore[attr-defined]  # noqa: SLF001
 
     # `default` holds no token on this worker. Its own fetch must be refused
     # before any object is written -- not answered with whatever an empty
@@ -480,8 +485,7 @@ def test_a_named_only_token_enables_the_lane_with_no_default_token(built: Any) -
             ],
             identity="default",
         )
-    assert excinfo.value.stage == "credential"
-    assert "default" in str(excinfo.value)
+    assert excinfo.value.stage == "fetch"
     assert objects.put_stream_calls == []
 
 
@@ -492,7 +496,7 @@ def test_no_identity_token_at_all_leaves_the_lane_unwired(built: Any) -> None:
         built(
             env={},
             attachment_enabled=True,
-            slack_bot_token="",
+            channel_gateway_url="",
             slack_identities=_DECLARED_OPS,
         ).get("attachments")
         is None

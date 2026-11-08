@@ -122,6 +122,13 @@ root_packages = [
 include_external_packages = true
 
 [[tool.importlinter.contracts]]
+name = "API and worker never import the Slack SDK"
+type = "forbidden"
+source_modules = ["curie_api", "curie_worker"]
+forbidden_modules = ["slack_sdk", "slack_bolt"]
+allow_indirect_imports = true
+
+[[tool.importlinter.contracts]]
 name = "Channel gateway ports stay provider and application independent"
 type = "forbidden"
 source_modules = ["curie_channel_gateway.ports"]
