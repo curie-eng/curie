@@ -88,7 +88,7 @@ def test_declared_http_driver_uses_configured_user_in_body_and_signed_evidence(
 @pytest.mark.parametrize("case", [
     "absent", "disabled", "unlisted", "wrong_channel", "own_bot", "own_user",
     "own_configured_user", "own_app",
-    "unmarked", "direct_message", "subtype", "approve", "reject",
+    "unmarked", "direct_message", "subtype", "approve", "reject", "Approve", "APPROVE",
 ])
 def test_http_driver_refusals_send_no_api_request(
     config: DispatcherConfig, redis_client: redis.Redis, case: str,

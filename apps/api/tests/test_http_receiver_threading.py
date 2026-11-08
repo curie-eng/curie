@@ -205,7 +205,7 @@ def _live_api(client: TestClient) -> Iterator[str]:
         assert future.done() and listener.fileno() == -1
 
 
-@pytest.mark.parametrize("command", ["act", "ping"])
+@pytest.mark.parametrize("command", ["act", "ping", "lost_receipts"])
 def test_declared_http_driver_reaches_real_group_admission(
     clean_db: None, valkey: redis.Redis, runs_stream: str,
     synthetic_provider: SimpleNamespace, command: str,
@@ -232,6 +232,10 @@ def test_declared_http_driver_reaches_real_group_admission(
             async def observe(result: httpx.Response) -> None:
                 requests.append(result.request)
                 responses.append((result.request.url.path, result.status_code))
+                if command == "lost_receipts" and result.request.url.path == "/channels/turns":
+                    raise httpx.ReadTimeout(
+                        "synthetic lost enqueue receipt", request=result.request,
+                    )
                 if result.status_code == 403:
                     await result.aread()
                     assert result.json() == {"detail": "caller_not_allowed"}
@@ -251,6 +255,7 @@ def test_declared_http_driver_reaches_real_group_admission(
                     "bot_user_id": membership.SENDER,
                 }],
                 dedupe_prefix="ut10:" + scope["binding"] + ":",
+                test_installation_thread_turn_limit=1,
             )
             runtime = build_http_receiver_runtime(
                 HttpReceiverScopeV1(
@@ -301,7 +306,7 @@ def test_declared_http_driver_reaches_real_group_admission(
             result = runtime.submit(
                 body=body, event=event, slack_identity=scope["adapter"], bot_user_id=BOT,
             )
-            assert result.status == "accepted"
+            assert result.status == ("unavailable" if command == "lost_receipts" else "accepted")
             entries = valkey.xrange(runs_stream)
             if command == "ping":
                 assert not entries
@@ -313,9 +318,30 @@ def test_declared_http_driver_reaches_real_group_admission(
                 assert len(entries) == 1
                 turn = QueuedTurn.model_validate_json(entries[0][1]["payload"])
                 assert turn.author == membership.SENDER
-                assert responses[-2:] == [
-                    ("/channels/turns/admission", 204), ("/channels/turns", 200),
-                ]
+                if command == "lost_receipts":
+                    assert responses[-3:] == [
+                        ("/channels/turns/admission", 204),
+                        ("/channels/turns", 200), ("/channels/turns", 200),
+                    ]
+                    duplicate = runtime.submit(
+                        body=body, event=event, slack_identity=scope["adapter"], bot_user_id=BOT,
+                    )
+                    assert duplicate.status == "accepted" and duplicate.duplicate
+                    assert duplicate.stream_id is None
+                    body["event_id"] = "EvDriverBudgetExhausted"
+                    exhausted = runtime.submit(
+                        body=body, event=event, slack_identity=scope["adapter"], bot_user_id=BOT,
+                    )
+                    assert exhausted.status == "refused"
+                    assert valkey.xrange(runs_stream) == entries
+                    slack.chat_postMessage.assert_called_once_with(
+                        channel=scope["address"], thread_ts=MESSAGE_TS,
+                        text="This installation does not accept test actions.",
+                    )
+                else:
+                    assert responses[-2:] == [
+                        ("/channels/turns/admission", 204), ("/channels/turns", 200),
+                    ]
             count = len(synthetic_provider.requests)
             original = requests[0]
             for tamper in ("body", "proof", "credential", "missing"):

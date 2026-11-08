@@ -122,12 +122,18 @@ without starting a turn. A threaded ping is refused. Driver turns reuse the
 legacy Valkey dedupe and ten-minute per-thread budget, including the configured
 `testInstallation.threadTurnLimit`; pings and duplicate deliveries spend no
 turn budget. With no declaration, the existing human intake and bot filters
-perform no additional API or Valkey operations.
+perform no additional API or Valkey operations. An unavailable enqueue result
+may have already queued the turn with a lost response. Its dedupe claim and
+turn budget remain reserved: releasing them could let a delivered turn escape
+the cap or repeat a visible placeholder.
 
 Approval replies are a remaining gap: `[test action] approve ...` and
 `[test action] reject ...` remain refused by selected HTTP receivers. They
 neither resolve approvals nor start turns. Existing human approval interactions
 keep their authenticated HTTP path.
+
+Known gap: preflight does not verify through `users.info` that each configured
+`bot_user_id` belongs to its `bot_id`; the operator must supply a matching pair.
 
 ## Authority and storage
 

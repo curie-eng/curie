@@ -453,7 +453,7 @@ class HttpReceiverRuntime:
                     and not (self._bot_ids.app_id and event.get("app_id") == self._bot_ids.app_id)
                 ):
                     command = text[len(MARK):].strip().split()
-                    if command and command[0] in {"approve", "reject"}:
+                    if command and command[0].lower() in {"approve", "reject"}:
                         return None
                     driver = candidate
             if (
