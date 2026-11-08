@@ -65,8 +65,22 @@ _REDIRECT_CAPTURE_KEYS = frozenset(
     {
         "HTTPS_PROXY",
         "HTTP_PROXY",
+        "ALL_PROXY",
+        "SSL_CERT_FILE",
+        "SSL_CERT_DIR",
         "NODE_EXTRA_CA_CERTS",
+        "NODE_TLS_REJECT_UNAUTHORIZED",
+        "NODE_OPTIONS",
         "ANTHROPIC_CUSTOM_HEADERS",
+        "https_proxy",
+        "http_proxy",
+        "all_proxy",
+        "ssl_cert_file",
+        "ssl_cert_dir",
+        "node_extra_ca_certs",
+        "node_tls_reject_unauthorized",
+        "node_options",
+        "anthropic_custom_headers",
     }
 )
 
