@@ -110,7 +110,9 @@ def test_handoff_refusals_wait_without_spending_deliveries(
                     entry_id,
                     consumer=h.config.consumer_name,
                 )
-                await h.kernel._markers.watch_turn(_thread_key_for(event), handle.claim_name, old)
+                await h.kernel._markers.watch_turn(
+                    _thread_key_for(event), handle.claim_name, old, event.event_id
+                )
                 await store.release(
                     old.stream,
                     old.group,
@@ -221,7 +223,7 @@ def test_expired_worker_retires_a_wedged_static_claim(
                 entry,
                 consumer=h.config.consumer_name,
             )
-            await h.kernel._markers.watch_turn(thread, handle.claim_name, lease)
+            await h.kernel._markers.watch_turn(thread, handle.claim_name, lease, event.event_id)
             async with RunnerClient(ssl_context=shell_ssl_context(str(tls.ca))) as runner:
                 h.kernel._runner = runner
                 assert await h.kernel.reap_orphans() == []

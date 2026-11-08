@@ -425,7 +425,9 @@ class Markers:
     def _turn_recovery_key(self) -> str:
         return f"{self._config.key_prefix}:turn-recovery"
 
-    async def watch_turn(self, thread_key: str, claim_name: str, lease: DeliveryLease) -> None:
+    async def watch_turn(
+        self, thread_key: str, claim_name: str, lease: DeliveryLease, event_id: str
+    ) -> None:
         lease.raise_if_lost()
         value = json.dumps(
             {
@@ -434,6 +436,7 @@ class Markers:
                     lease.stream, lease.group, lease.entry_id
                 ),
                 "owner": lease.owner,
+                "event_id": event_id,
             }
         )
         accepted = await self._redis.eval(
