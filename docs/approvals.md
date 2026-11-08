@@ -326,10 +326,11 @@ The platform checks the ticket when the approval is created. This section covers
 registering and reading back that selector. The wire format of the ticket is in the
 [connector host interface](interfaces/connector-host/INTERFACE.md#per-request-approval-tickets-adr-0271).
 
-Answer and resume authority and separation of duties are enforced. A dynamic approval is
-answered only through the HTTP identity answer path: a verified HTTP identity, or a
-registered receiver's signed answer proof such as the email reply. Slack, CLI operator
-principals and other legacy paths are refused. At answer, and again at resume, the answering
+Answer and resume authority and separation of duties are enforced. A dynamic approval, and
+a static route that enforces separation, is answered only through the HTTP identity answer
+path, which accepts a Slack answer or an email reply carrying its registered receiver's
+signed answer proof. The legacy approver-set resolution without that proof, and operator
+principals (including the CLI's operator-principal resolution), are refused. At answer, and again at resume, the answering
 human must be one of the stored selected approvers, still inside the route's registered
 ceiling (the pinned approver role plus `ceiling.users`), with the registration still present
 for the same connector, tool and key id, and with a canonical active identity. Selection never
