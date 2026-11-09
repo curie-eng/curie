@@ -126,10 +126,16 @@ def test_unreadable_configured_runtime_overhead_never_becomes_zero() -> None:
 # The runtime-class and quota reads sit on the admission footprint path but
 # outside _get, so they keep _get's transient classification themselves (#5406):
 # 5xx statuses and transport errors -- including a MaxRetryError whose reason is
-# not a timeout -- are KubeTransientError, 403/404 stay ApiException. A
-# NewConnectionError would not do for the connection case: it inherits urllib3's
-# TimeoutError, which _evaluate_admission already treats as transient.
-_RUNTIME_QUOTA_FAULTS = [
+# not a timeout -- are KubeTransientError. A NewConnectionError would not do for
+# the connection case: it inherits urllib3's TimeoutError, which
+# _evaluate_admission already treats as transient.
+#
+# Every case here must flip red when the product change is reversed: this node
+# is the issue's Fix pin, and the fix-pin verifier requires the whole node --
+# every parametrized case -- to fail on the base code. The 403/404 preservation
+# controls pass on the base by definition (the behavior is unchanged), so they
+# live in their own sibling test below instead of in the pinned node.
+_RUNTIME_QUOTA_TRANSIENT_FAULTS = [
     pytest.param(kube.ApiException(status=500), KubeTransientError, id="http-500"),
     pytest.param(kube.ApiException(status=502), KubeTransientError, id="http-502"),
     pytest.param(kube.ApiException(status=503), KubeTransientError, id="http-503"),
@@ -144,13 +150,11 @@ _RUNTIME_QUOTA_FAULTS = [
         KubeTransientError,
         id="sdk-retry",
     ),
-    pytest.param(kube.ApiException(status=403), kube.ApiException, id="http-403"),
-    pytest.param(kube.ApiException(status=404), kube.ApiException, id="http-404"),
 ]
 
 
 @pytest.mark.parametrize("read", ["runtime-class", "quota"])
-@pytest.mark.parametrize(("fault", "expected"), _RUNTIME_QUOTA_FAULTS)
+@pytest.mark.parametrize(("fault", "expected"), _RUNTIME_QUOTA_TRANSIENT_FAULTS)
 def test_runtime_class_and_quota_reads_raise_kube_transient_error(
     read: str, fault: BaseException, expected: type[BaseException]
 ) -> None:
@@ -163,6 +167,30 @@ def test_runtime_class_and_quota_reads_raise_kube_transient_error(
     else:
         api.quota_error = fault
         with pytest.raises(expected):
+            client.read_quota("acme-sandbox-quota", request_timeout_seconds=1.0)
+    assert api.created == api.patches == []
+
+
+_RUNTIME_QUOTA_CLIENT_FAULTS = [
+    pytest.param(kube.ApiException(status=403), id="http-403"),
+    pytest.param(kube.ApiException(status=404), id="http-404"),
+]
+
+
+@pytest.mark.parametrize("read", ["runtime-class", "quota"])
+@pytest.mark.parametrize("fault", _RUNTIME_QUOTA_CLIENT_FAULTS)
+def test_runtime_class_and_quota_reads_keep_client_errors_as_api_exception(
+    read: str, fault: BaseException
+) -> None:
+    api = InventoryAPI()
+    client = _footprint_client(api, runtime_class=True)
+    if read == "runtime-class":
+        api.runtime_error = fault
+        with pytest.raises(kube.ApiException):
+            _selected(client)
+    else:
+        api.quota_error = fault
+        with pytest.raises(kube.ApiException):
             client.read_quota("acme-sandbox-quota", request_timeout_seconds=1.0)
     assert api.created == api.patches == []
 
