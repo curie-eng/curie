@@ -449,7 +449,7 @@ receipts survive recovery.
 The [ADR 0156 implementation note](../../docs/adr/evidence/0156-adapter-self-rotation/README.md)
 records the realized decision and its tests without changing Accepted history.
 Run the minute-long real API check with
-`uv run pytest apps/mail-adapter/integration/test_self_rotation.py -n 0 -q --reruns 0`.
+`uv run pytest cli/tests/local/test_mail_self_rotation.py -n 0 -q --reruns 0`.
 It owns and removes its backing-service containers; the caller supplies Docker.
 
 ## Operations notes

@@ -31,7 +31,7 @@ their predecessors immediately.
 in-flight ingress, snapshot restore, storage failures, refusal and recovery.
 `apps/api/tests/test_adapter_principal.py` exercises real API authentication,
 subject and binding bounds, TTL bounds, expiry and audit identity.
-`apps/mail-adapter/integration/test_self_rotation.py` drives the adapter against a running
+`cli/tests/local/test_mail_self_rotation.py` drives the adapter against a running
 API and real Postgres, Valkey and object storage with one-minute credentials,
 two renewals, and ingress during both intervals.
 
