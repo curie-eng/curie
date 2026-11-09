@@ -367,9 +367,6 @@ from `apps/api/src/curie_api/approval_selection.py`:
 3. Separation: `separation_requester_unknown`, `separation_actor_unknown`,
    `separation_requester_excluded`, `separation_exemption_unavailable` (the 503 case).
 
-Decisions 7 and 8 of the ADR, the proxy verified-grant header and rendering the stored
-arguments to the approver, remain later work.
-
 A dynamic approval's card, the pending notice and the API's `display_summary` describe the
 tool and arguments the platform stored at creation, with the `approval_ticket` left out of
 the preview. A bundle's gate summary or the model's wording never replaces them. When an

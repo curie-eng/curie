@@ -665,13 +665,10 @@ A dynamic approval records the selected approver set, the signed requester, the
 key id, the nonce, and the arguments digest, all covered by the approval's
 integrity seal. Ordinary approvals and their existing seals are unchanged.
 
-What does not exist yet. The answer path now checks the answering human against the
+Answer and resume. The answer path checks the answering human against the
 stored selected approvers, the registered ceiling and fresh identity facts, and enforces
 separation of duties, at answer and again at resume; the detail is in
 [Per-request approver selection](../../approvals.md#per-request-approver-selection-adr-0271).
-The proxy verified-grant header and the connector's refusal of a direct execution call
-without it still land in a later slice, as does rendering the stored arguments to the
-approver.
 
 Creation refusals. All are JSON error responses with the code in `detail`.
 
