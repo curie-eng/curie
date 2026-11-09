@@ -380,7 +380,8 @@ Successful responses replace credentials in memory. A channel mint immediately
 revokes its predecessor, so the adapter finishes any current ingress HTTP request
 before minting and holds new ingress requests until the new token is installed.
 Approval requests can finish using the predecessor principal until it expires.
-This serialization can briefly delay ingress during renewal, without a restart.
+This serialization can delay ingress during renewal, without a restart. A turn's
+retry backoff does not delay credential renewal.
 
 Renewal failures log an ERROR with credential kind, HTTP status, time to expiry
 and retry delay, never the credential or response body. Backoff starts at one
