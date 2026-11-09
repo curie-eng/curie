@@ -15,10 +15,11 @@ writes through ``PATCH /agents/{id}``; creations through
 registrations through ``POST /v1/internal/identity/approvals/{id}/card`` with
 the worker token; answers through ``POST /approvals/{id}/resolve`` with a chat
 principal and a Slack receiver proof the harness signs, as the dispatcher
-forwards a click. The worker's post is scripted: no live turn creates a DM
-approval (the fake model cannot call a gated tool with a ticket), so the
-harness registers the DM channel and, for retention, remembers the card with
-the worker's own card store in the worker pod. Each step records statuses,
+forwards a click. The worker's post is scripted: the scenario predates the
+fake model's ``[fake:gated-connector-tool]`` directive and creates each DM
+approval itself, and the install has no Slack bot for a worker post to reach,
+so the harness registers the DM channel and, for retention, remembers the card
+with the worker's own card store in the worker pod. Each step records statuses,
 refusal codes, row facts, scrubbed audit rows and Valkey TTLs; never a key,
 token, proof, capsule, nonce or ticket. See docs/testing/identity-e2e.md.
 """

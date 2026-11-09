@@ -915,9 +915,9 @@ It reuses the answer scenario's setup and restore, with these differences:
 3. It sends one approver turn and five requester turns: one shared by the
    creation refusals and one per DM approval the later steps create.
 
-The worker's own DM post is scripted. No live turn makes the worker create a
-DM approval, because the fake model has no directive that calls a gated
-connector tool with an `approval_ticket` argument. So the harness creates
+The worker's own DM post is scripted. The scenario predates the fake model's
+`[fake:gated-connector-tool]` directive, and the install has no Slack bot for a
+worker post to reach. So the harness creates
 each approval at the internal creation boundary from a requester turn's
 ingress capsule, as `approver-ticket-creation` does, plays the worker's post
 by registering a synthetic DM channel id with the worker token, and, for
@@ -1027,14 +1027,14 @@ worker's bounded terminal TTL.
    any other private value) shorter than 8 characters, because the evidence
    could not be searched for it reliably. Use longer subjects in a custom
    roster.
-10. `approver-dm` cannot make the worker create, post or register a DM
-    approval in a live turn: the fake model has no directive that calls a
-    gated connector tool with an `approval_ticket` argument
-    (`runner/src/curie_runner/fake.py`), so a worker-created dynamic approval
-    needs a runner change. The scenario plays the worker's creation,
-    registration and card memory instead, and cannot observe the worker's
+10. `approver-dm` does not make the worker create, post or register a DM
+    approval in a live turn. It plays the worker's creation, registration and
+    card memory instead, so it does not observe the worker's
     `approver DM delivery failed` log line for a failed post; the evidence
-    carries that check. ADR 0272 item 2 (a real bot installation, Socket Mode
+    carries that check. A live turn through the fake model's
+    `[fake:gated-connector-tool]` directive (`runner/src/curie_runner/fake.py`)
+    could make the worker create the approval and attempt the post, which
+    fails on an install with no Slack bot; that step is not built yet. ADR 0272 item 2 (a real bot installation, Socket Mode
     button and note modal clicks, and the `im:history` card read) needs an
     authenticated Slack session and is not run here.
 11. The DM bot's Slack workspace namespace row has no product surface on an

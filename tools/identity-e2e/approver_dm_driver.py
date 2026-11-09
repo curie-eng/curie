@@ -56,10 +56,11 @@ STEP_IDS = (
 # What this scenario cannot observe on an unattended install, with the reason.
 CARRIED = {
     "worker-dm-post-failure-log": (
-        "the fake model has no directive that calls a gated connector tool with an "
-        "approval_ticket argument, so no live turn makes the worker create, post or "
-        "register a DM approval; creation, registration and the card reference are "
-        "played by the harness (runner/src/curie_runner/fake.py)"
+        "the scenario creates each DM approval at the internal creation boundary and "
+        "plays registration and the card reference; it does not yet drive a live turn "
+        "through the fake model's [fake:gated-connector-tool] directive, which would "
+        "make the worker create the approval and attempt a post that fails here "
+        "because the install has no Slack bot"
     ),
     "genuine-slack-dm-interactions": (
         "ADR 0272 item 2: a real bot installation, Socket Mode button and note modal "
