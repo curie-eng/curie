@@ -92,6 +92,7 @@ _NON_BOOT_ALLOWLIST: frozenset[str] = frozenset(
         # credential from the WORKER's env. The control credential is also a
         # host credential that filter_agent_child_env keeps off every claim.
         "CURIE_STATIC_SHELLS",
+        "CURIE_AGENT_CREDENTIAL_FILES",
         "CURIE_STATIC_SHELL_CA_FILE",
         "CURIE_STATIC_SHELL_CONTROL_TOKEN",
         # Worker gateway clients read these; the caller token is filtered from claims.

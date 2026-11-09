@@ -295,4 +295,5 @@ read verbatim from its `Status:` line. **Do not hand-edit it.** Run
 | 0273 | [Approval routes own expiry and reminders](0273-approval-routes-own-expiry-and-reminders.md) | Accepted |
 | 0274 | [A declared webhook wake skips overlap until the next poll](0274-a-declared-webhook-wake-skips-overlap-until-the-next-poll.md) | Accepted |
 | 0275 | [A channel gateway owns provider authentication and I/O](0275-channel-gateway-provider-boundary.md) | Draft |
+| 0276 | [Static shells share capacity and receive agent inputs per claim](0276-static-shells-share-capacity-and-receive-agent-inputs-per-claim.md) | Draft |
 <!-- END GENERATED: adr-index -->

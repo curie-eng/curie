@@ -869,22 +869,26 @@ def crash_case(tls: ShellTls, tmp_path: Path, phase: str, crash_platform):
         from curie_worker.binding import BindingResolver
         from sqlalchemy.ext.asyncio import create_async_engine
 
-        async def seed():
+        async def seed(bound_event, suffix):
             agent, version, deployment = uuid.uuid4(), uuid.uuid4(), uuid.uuid4()
+            agent_name = "acme-crash-" + suffix + "-" + identity
+            channel = bound_event.reply_handle.channel
             connection = await asyncpg.connect(crash_platform["database_url"])
             try:
                 await connection.execute(
-                    "INSERT INTO curie.agents (id,name,max_usd_per_day,max_output_tokens_per_run) "
-                    "VALUES ($1,$2,5,1000)",
+                    "INSERT INTO curie.agents "
+                    "(id,name,max_usd_per_day,max_output_tokens_per_run,secrets) "
+                    "VALUES ($1,$2,5,1000,$3::jsonb)",
                     agent,
-                    "acme-crash-" + identity,
+                    agent_name,
+                    json.dumps({"EXTERNAL_API_TOKEN": "claim-" + uuid.uuid4().hex}),
                 )
                 await connection.execute(
                     "INSERT INTO curie.agent_channels (id,agent_id,kind,address,endpoint,adapter) "
                     "VALUES ($1,$2,'crash-proof',$3,$4,'crash-proof')",
                     uuid.uuid4(),
                     agent,
-                    identity,
+                    channel,
                     f"http://localhost:{port}/reply",
                 )
                 await connection.execute(
@@ -906,21 +910,101 @@ def crash_case(tls: ShellTls, tmp_path: Path, phase: str, crash_platform):
             engine = create_async_engine(config.database_url)
             try:
                 binding = BindingResolver(engine, config)
-                resolved = await binding.resolve("crash-proof", "crash-proof", identity)
+                resolved = await binding.resolve("crash-proof", "crash-proof", channel)
                 assert resolved is not None
-                return binding.boot_env(
-                    resolved, _thread_key_for(event), kind="crash-proof", address=identity
-                ), binding
+                return (
+                    binding.boot_env(
+                        resolved, _thread_key_for(bound_event), kind="crash-proof", address=channel
+                    ),
+                    binding,
+                    agent_name,
+                )
             finally:
                 await engine.dispose()
 
         event = event.model_copy(
             update={"reply_handle": event.reply_handle.model_copy(update={"channel": identity})}
         )
-        boot, binding = asyncio.run(seed())
+        other_event = event.model_copy(
+            update={
+                "event_id": uuid.uuid4().hex,
+                "conversation_id": identity + "-other",
+                "reply_handle": event.reply_handle.model_copy(
+                    update={"channel": identity + "-other"}
+                ),
+            }
+        )
+        boot, binding, agent_name = asyncio.run(seed(event, "a"))
+        other_boot, other_binding, other_name = asyncio.run(seed(other_event, "b"))
+        from aci_protocol import Event
+        from curie_worker.runner_client import RunnerClient
+
+        for index, primed_shell in enumerate(shells):
+            priming_client = StaticPoolSandboxClient(
+                slots=[
+                    StaticShellSlot(f"proof-{index}", "localhost", primed_shell.port, "crash-pool")
+                ],
+                redis_client=valkey,
+                control_token=CONTROL_TOKEN,
+                ssl_context=shell_ssl_context(str(tls.ca)),
+                bundle_store=BundleStore(config),
+                key_prefix=prefix + ":sandbox",
+            )
+            priming_substrate = SandboxSubstrate(
+                priming_client,
+                AffinityStore(valkey, pressure_client=pressure, key_prefix=prefix + ":sandbox"),
+                SubstrateConfig(
+                    namespace="default",
+                    warm_pool="crash-pool",
+                    key_prefix=prefix + ":sandbox",
+                    claim_timeout_seconds=30,
+                ),
+            )
+            priming_substrate.set_boot_credential_minter(other_binding.fresh_boot_credential)
+            priming_substrate.set_boot_credential_revoker(
+                other_binding.release_boot_credential_sync
+            )
+            thread = _thread_key_for(other_event)
+            primed = priming_substrate.claim(
+                thread,
+                env={**other_boot, "CURIE_FAKE_MODEL": "1"},
+                agent_name=other_name,
+            )
+            try:
+
+                async def prime(primed=primed):
+                    async with RunnerClient(ssl_context=shell_ssl_context(str(tls.ca))) as runner:
+                        stream = await runner.start_turn(
+                            primed.base_url,
+                            Event(
+                                type="message",
+                                text="prime the shared shell",
+                                user="U0EXAMPLE1",
+                                ts="1",
+                                session_id=primed.session_id,
+                            ),
+                            primed.token,
+                        )
+                        async with stream:
+                            frames = [frame async for frame in stream]
+                    finals = [frame for frame in frames if getattr(frame, "type", None) == "final"]
+                    assert len(finals) == 1 and finals[0].status == SessionStatus.DONE
+
+                asyncio.run(prime())
+            finally:
+                assert priming_substrate.release(thread)
+            assert (
+                primed_shell.request(
+                    "GET",
+                    "/_curie/supervisor/v1/shell",
+                    token=CONTROL_TOKEN,
+                )[1]["claim"]
+                is None
+            )
+        assert provider_request("/state")["tool_starts"] == 0
         substrate.set_boot_credential_minter(binding.fresh_boot_credential)
         substrate.set_boot_credential_revoker(binding.release_boot_credential_sync)
-        handle = substrate.claim(_thread_key_for(event), env=boot)
+        handle = substrate.claim(_thread_key_for(event), env=boot, agent_name=agent_name)
         shell = next(shell for shell in shells if shell.port == urlsplit(handle.base_url).port)
         spec = {
             "config": config.model_dump(mode="json"),
@@ -1415,3 +1499,162 @@ def test_an_image_path_the_runner_could_write_stops_the_shell(tls: ShellTls) -> 
         assert "/opt" in broken.logs()
     finally:
         broken.remove()
+
+
+_PERMISSION_PROBE = b"""
+import hashlib, json, os, stat, sys
+from pathlib import Path
+bundle = Path(os.environ["CURIE_PLUGIN_DIR"])
+code = bundle / "immutable.py"
+result = {"bundle_uid": code.stat().st_uid}
+for operation in ("write", "chmod"):
+    try:
+        if operation == "write":
+            code.write_text("changed")
+        else:
+            code.chmod(0o700)
+    except PermissionError:
+        result[operation + "_refused"] = True
+    else:
+        result[operation + "_refused"] = False
+credential = Path(os.environ["HOME"]).parent / "runner-environment.json"
+info = credential.stat()
+value = json.loads(credential.read_text())["EXTERNAL_API_TOKEN"]
+result.update(credential_uid=info.st_uid, credential_mode=stat.S_IMODE(info.st_mode),
+              credential_read=(value == os.environ["EXTERNAL_API_TOKEN"]),
+              credential_digest=hashlib.sha256(value.encode()).hexdigest())
+Path(os.environ["HOME"], "permissions.json").write_text(json.dumps(result))
+os.execv(sys.executable, [sys.executable, "-m", "curie_runner"])
+"""
+
+
+def test_runner_cannot_modify_bundle_code_and_can_read_its_claim_credentials(
+    tls: ShellTls,
+    tmp_path: Path,
+    upload_store,
+) -> None:
+    import hashlib
+    import time
+
+    from curie_worker.config import WorkerConfig
+    from curie_worker.run import _sandbox_client
+    from curie_worker.sandbox import SubstrateConfig
+
+    source = tmp_path / "external-credential"
+    source.write_text("claim-" + uuid.uuid4().hex)
+    files = {
+        ".claude-plugin/plugin.json": b'{"name":"acme-permissions","version":"1.0.0"}',
+        "probe.py": _PERMISSION_PROBE,
+        "immutable.py": b"print('immutable')\n",
+    }
+    raw = io.BytesIO()
+    with tarfile.open(fileobj=raw, mode="w") as archive:
+        for name, data in files.items():
+            info = tarfile.TarInfo(name)
+            info.size = len(data)
+            archive.addfile(info, io.BytesIO(data))
+    upload_store._client.put_object(
+        Bucket=upload_store._bucket,
+        Key="bundle.tar.gz",
+        Body=gzip.compress(raw.getvalue()),
+    )
+    valkey = _crash_valkey()
+    prefix = "permission-proof-" + uuid.uuid4().hex
+    shell = Shell.__new__(Shell)
+    client = None
+    try:
+        shell.__init__(tls, runner_command="sh -c 'exec python \"$CURIE_PLUGIN_DIR/probe.py\"'")
+        wait_until(shell.answers, 60, "permission proof shell ready")
+        client = _sandbox_client(
+            WorkerConfig(
+                s3_endpoint_url=upload_store._client.meta.endpoint_url,
+                s3_access_key="rustfs",
+                s3_secret_key="rustfssecret",
+                bundle_bucket=upload_store._bucket,
+            ),
+            {
+                "CURIE_SANDBOX_SUBSTRATE": "static",
+                "CURIE_STATIC_SHELLS": json.dumps(
+                    [
+                        {
+                            "slot": shell.slot,
+                            "host": "localhost",
+                            "port": shell.port,
+                            "pool": "permissions-pool",
+                        }
+                    ]
+                ),
+                "CURIE_STATIC_SHELL_CA_FILE": str(tls.ca),
+                "CURIE_STATIC_SHELL_CONTROL_TOKEN": CONTROL_TOKEN,
+                "CURIE_AGENT_CREDENTIAL_FILES": json.dumps(
+                    {
+                        "acme-permissions": {"EXTERNAL_API_TOKEN": str(source)},
+                    }
+                ),
+            },
+            SubstrateConfig(namespace="default", warm_pool="permissions-pool", key_prefix=prefix),
+            redis_client=valkey,
+        )
+        client.create_claim(
+            "permissions",
+            pool="permissions-pool",
+            agent_name="acme-permissions",
+            deadline=time.monotonic() + 30,
+            env={
+                **_runner_environment("runner-" + uuid.uuid4().hex),
+                "CURIE_BUNDLE_REF": "bundle.tar.gz",
+            },
+        )
+
+        def ready() -> bool:
+            current = shell.request("GET", "/_curie/supervisor/v1/shell", token=CONTROL_TOKEN)[1]
+            assert current["claim"]["child_exit"] is None, shell.logs()
+            return current["claim"]["ready"] is True
+
+        wait_until(ready, 60, "permission proof runner ready")
+        result = json.loads(
+            _docker(
+                "exec",
+                "--user",
+                "1000:1000",
+                shell.name,
+                "python",
+                "-c",
+                "from pathlib import Path; "
+                "p=next(Path('/var/lib/curie-shell/claims').glob('*/home/permissions.json')); "
+                "print(p.read_text())",
+            )
+        )
+        assert result == {
+            "bundle_uid": 0,
+            "write_refused": True,
+            "chmod_refused": True,
+            "credential_uid": 1000,
+            "credential_mode": 0o400,
+            "credential_read": True,
+            "credential_digest": hashlib.sha256(source.read_bytes()).hexdigest(),
+        }
+        client.delete_claim("permissions", request_timeout_seconds=20)
+        assert (
+            _docker(
+                "exec",
+                "--user",
+                "0:0",
+                shell.name,
+                "python",
+                "-c",
+                "from pathlib import Path; "
+                "assert not list(Path('/var/lib/curie-shell/claims').iterdir())",
+            )
+            == ""
+        )
+    finally:
+        try:
+            if client is not None:
+                client.delete_claim("permissions", request_timeout_seconds=20)
+        finally:
+            if hasattr(shell, "name"):
+                shell.remove()
+            for key in valkey.scan_iter(match=prefix + "*"):
+                valkey.delete(key)
+            valkey.close()
