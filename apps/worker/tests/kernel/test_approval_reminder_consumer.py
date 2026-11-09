@@ -98,15 +98,72 @@ def test_policy_card_reminder_uses_slack_identity_from_a_relay_turn(
     asyncio.run(run())
 
 
+def test_consumer_requires_a_reminder_handler() -> None:
+    with pytest.raises(TypeError):
+        Consumer(
+            redis=object(),  # type: ignore[arg-type]
+            kernel=object(),  # type: ignore[arg-type]
+            config=object(),  # type: ignore[arg-type]
+            leases=object(),  # type: ignore[arg-type]
+        )
+
+
+def test_valid_reminder_is_delivered_and_acked(make_harness):
+    async def run():
+        seen: list[ApprovalReminderV1] = []
+
+        async def handler(reminder: ApprovalReminderV1) -> None:
+            seen.append(reminder)
+
+        async with make_harness() as h:
+            h.runner.default_script = [Final(text="healthy", status=SessionStatus.DONE)]
+            consumer = Consumer(
+                redis=h.async_redis,
+                kernel=h.kernel,
+                config=h.config,
+                leases=DeliveryLeaseStore(h.async_redis, h.config),
+                reminders=handler,
+            )
+            await consumer.ensure_group()
+            reminder = ApprovalReminderV1(
+                version=1, approval_id=str(uuid.uuid4()), claimed_due_at=datetime.now(UTC)
+            )
+            await h.async_redis.xadd(
+                h.config.stream, {APPROVAL_REMINDER_FIELD: reminder.model_dump_json()}
+            )
+            entries = await h.async_redis.xreadgroup(
+                h.config.consumer_group,
+                h.config.consumer_name,
+                {h.config.stream: ">"},
+                count=1,
+            )
+            entry_id, observed = entries[0][1][0]
+            await consumer._dispatch(entry_id, observed)
+            await asyncio.gather(*list(consumer._inflight))
+            assert [item.approval_id for item in seen] == [reminder.approval_id]
+            assert h.runner.opened == []
+            assert (await h.async_redis.xpending(h.config.stream, h.config.consumer_group))[
+                "pending"
+            ] == 0
+
+    asyncio.run(run())
+
+
 def test_normal_identity_turn_still_runs_through_reminder_capable_consumer(make_harness):
     async def run():
         authority = Core()
+        seen: list[ApprovalReminderV1] = []
+
+        async def handler(reminder: ApprovalReminderV1) -> None:
+            seen.append(reminder)
+
         async with make_harness(binding=Binding(), identity_authority=authority) as h:
             consumer = Consumer(
                 redis=h.async_redis,
                 kernel=h.kernel,
                 config=h.config,
                 leases=DeliveryLeaseStore(h.async_redis, h.config),
+                reminders=handler,
             )
             await consumer.ensure_group()
             fields = to_stream_fields(qevent("ordinary identity turn"))
@@ -132,6 +189,7 @@ def test_normal_identity_turn_still_runs_through_reminder_capable_consumer(make_
                 "pending"
             ] == 0
             assert await h.async_redis.xlen(h.config.dead_letter_stream_name()) == 0
+            assert seen == []
 
     asyncio.run(run())
 
@@ -143,11 +201,16 @@ def test_poison_reminder_dead_letters_without_turn_execution_and_group_progresse
     async def run():
         async with make_harness(max_delivery=2, reclaim_min_idle_ms=0) as h:
             h.runner.default_script = [Final(text="healthy", status=SessionStatus.DONE)]
+
+            async def handler(_reminder: ApprovalReminderV1) -> None:
+                raise AssertionError("reminder handler invoked")
+
             consumer = Consumer(
                 redis=h.async_redis,
                 kernel=h.kernel,
                 config=h.config,
                 leases=DeliveryLeaseStore(h.async_redis, h.config),
+                reminders=handler,
             )
             await consumer.ensure_group()
             reminder = ApprovalReminderV1(

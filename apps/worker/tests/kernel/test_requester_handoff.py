@@ -47,7 +47,7 @@ from curie_worker.binding import (
 )
 from curie_worker.capacity_wait import CapacityWaitStore
 from curie_worker.config import WorkerConfig
-from curie_worker.consumer import Consumer
+from curie_worker.consumer import Consumer, refuse_unconfigured_reminder
 from curie_worker.delivery_lease import DeliveryLeaseStore
 from curie_worker.kernel import failures, identity
 from curie_worker.kernel import routing as kernel_routing
@@ -1117,6 +1117,7 @@ def test_a_deferred_delivery_is_parked_then_runs_once(make_harness) -> None:
                 kernel=h.kernel,
                 config=h.config,
                 leases=leases,
+                reminders=refuse_unconfigured_reminder,
             )
             holds = hold_turns(h)
             alice_turn = qevent("alice is working", thread="consumer-defer")

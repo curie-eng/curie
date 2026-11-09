@@ -48,7 +48,7 @@ from curie_worker.attachment_broker import AttachmentBroker
 from curie_worker.attachments import SlackFileClient, SlackFileResponse
 from curie_worker.binding import BindingResolver
 from curie_worker.config import WorkerConfig
-from curie_worker.consumer import Consumer
+from curie_worker.consumer import Consumer, refuse_unconfigured_reminder
 from curie_worker.delivery_lease import DeliveryLeaseStore
 from redis import Redis as SyncRedis
 from redis.asyncio import Redis
@@ -424,6 +424,7 @@ def test_slack_ingress_to_attachment_tools_uses_worker_authority(
                             kernel=harness.kernel,
                             config=harness.config,
                             leases=DeliveryLeaseStore(harness.async_redis, harness.config),
+                            reminders=refuse_unconfigured_reminder,
                         )
                         await consumer.ensure_group()
                         consumer_task = asyncio.create_task(consumer.run())

@@ -46,7 +46,7 @@ import redis.exceptions
 from aci_protocol import Final, QueuedTurn, SessionStatus, SideEffectFlag, TextDelta
 from aiohttp import web
 from curie_dispatcher.queue import to_stream_fields
-from curie_worker.consumer import Consumer
+from curie_worker.consumer import Consumer, refuse_unconfigured_reminder
 from curie_worker.consumer_liveness import ConsumerLivenessStore, consumer_heartbeat_key
 from curie_worker.delivery_lease import DeliveryLeaseStore
 from curie_worker.kernel import attempt as kernel_attempt
@@ -103,7 +103,8 @@ def test_twenty_nine_second_ownership_outage_preserves_the_whole_live_turn(
         ) as h:
             leases = DeliveryLeaseStore(h.async_redis, h.config)
             consumer = Consumer(
-                redis=h.async_redis, kernel=h.kernel, config=h.config, leases=leases
+                redis=h.async_redis, kernel=h.kernel, config=h.config, leases=leases,
+                reminders=refuse_unconfigured_reminder,
             )
             liveness = consumer._liveness_store
             assert liveness is not None
@@ -285,8 +286,12 @@ def test_a_second_replica_is_refused_while_the_first_holds_a_live_lease(
             store = DeliveryLeaseStore(h.async_redis, h.config)
             cfg_a = h.config.model_copy(update={"consumer_name": "worker-a"})
             cfg_b = h.config.model_copy(update={"consumer_name": "worker-b"})
-            consumer_a = Consumer(redis=h.async_redis, kernel=h.kernel, config=cfg_a, leases=store)
-            consumer_b = Consumer(redis=h.async_redis, kernel=h.kernel, config=cfg_b, leases=store)
+            consumer_a = Consumer(redis=h.async_redis, kernel=h.kernel, config=cfg_a, leases=store,
+                                  reminders=refuse_unconfigured_reminder,
+                         )
+            consumer_b = Consumer(redis=h.async_redis, kernel=h.kernel, config=cfg_b, leases=store,
+                                  reminders=refuse_unconfigured_reminder,
+                         )
             await consumer_a.ensure_group()
             spy = _ProcessEventSpy(h.kernel)
 
@@ -359,8 +364,12 @@ def test_distinct_approval_resume_deliveries_run_once_while_first_turn_is_live(
             store = DeliveryLeaseStore(h.async_redis, h.config)
             cfg_a = h.config.model_copy(update={"consumer_name": "resume-worker-a"})
             cfg_b = h.config.model_copy(update={"consumer_name": "resume-worker-b"})
-            consumer_a = Consumer(redis=h.async_redis, kernel=h.kernel, config=cfg_a, leases=store)
-            consumer_b = Consumer(redis=h.async_redis, kernel=h.kernel, config=cfg_b, leases=store)
+            consumer_a = Consumer(redis=h.async_redis, kernel=h.kernel, config=cfg_a, leases=store,
+                                  reminders=refuse_unconfigured_reminder,
+                         )
+            consumer_b = Consumer(redis=h.async_redis, kernel=h.kernel, config=cfg_b, leases=store,
+                                  reminders=refuse_unconfigured_reminder,
+                         )
             await consumer_a.ensure_group()
 
             hold = asyncio.Event()
@@ -428,8 +437,12 @@ def test_approval_resume_claim_renews_then_releases_after_owner_failure(
             store = DeliveryLeaseStore(h.async_redis, h.config)
             cfg_a = h.config.model_copy(update={"consumer_name": "resume-failure-a"})
             cfg_b = h.config.model_copy(update={"consumer_name": "resume-failure-b"})
-            consumer_a = Consumer(redis=h.async_redis, kernel=h.kernel, config=cfg_a, leases=store)
-            consumer_b = Consumer(redis=h.async_redis, kernel=h.kernel, config=cfg_b, leases=store)
+            consumer_a = Consumer(redis=h.async_redis, kernel=h.kernel, config=cfg_a, leases=store,
+                                  reminders=refuse_unconfigured_reminder,
+                         )
+            consumer_b = Consumer(redis=h.async_redis, kernel=h.kernel, config=cfg_b, leases=store,
+                                  reminders=refuse_unconfigured_reminder,
+                         )
             await consumer_a.ensure_group()
 
             event_id = f"approval-{uuid.uuid4()}-resolved"
@@ -518,6 +531,7 @@ def test_reclaimed_sole_resume_entry_takes_over_a_stale_event_claim(
                 kernel=h.kernel,
                 config=replacement_config,
                 leases=store,
+                reminders=refuse_unconfigured_reminder,
             )
             await replacement.ensure_group()
 
@@ -589,7 +603,9 @@ def test_a_heartbeating_handler_holds_its_lease_without_burning_a_delivery(
     async def go() -> None:
         async with make_harness(**_LEASE_KNOBS) as h:
             store = DeliveryLeaseStore(h.async_redis, h.config)
-            consumer = Consumer(redis=h.async_redis, kernel=h.kernel, config=h.config, leases=store)
+            consumer = Consumer(redis=h.async_redis, kernel=h.kernel, config=h.config, leases=store,
+                                reminders=refuse_unconfigured_reminder,
+                       )
             await consumer.ensure_group()
 
             hold = asyncio.Event()
@@ -669,7 +685,9 @@ def test_a_dead_owners_delivery_transfers_only_after_expiry_and_keeps_its_deadli
     async def go() -> None:
         async with make_harness(**_LEASE_KNOBS) as h:
             store = DeliveryLeaseStore(h.async_redis, h.config)
-            consumer = Consumer(redis=h.async_redis, kernel=h.kernel, config=h.config, leases=store)
+            consumer = Consumer(redis=h.async_redis, kernel=h.kernel, config=h.config, leases=store,
+                                reminders=refuse_unconfigured_reminder,
+                       )
             await consumer.ensure_group()
             spy = _ProcessEventSpy(h.kernel)
             h.runner.default_script = [Final(text="recovered", status=DONE)]
@@ -742,7 +760,9 @@ def test_request_stop_stops_the_read_loop_but_never_the_heartbeat(make_harness) 
     async def go() -> None:
         async with make_harness(**_LEASE_KNOBS, reclaim_min_idle_ms=900000) as h:
             store = DeliveryLeaseStore(h.async_redis, h.config)
-            consumer = Consumer(redis=h.async_redis, kernel=h.kernel, config=h.config, leases=store)
+            consumer = Consumer(redis=h.async_redis, kernel=h.kernel, config=h.config, leases=store,
+                                reminders=refuse_unconfigured_reminder,
+                       )
             await consumer.ensure_group()
             spy = _ProcessEventSpy(h.kernel)
 
@@ -834,7 +854,9 @@ def test_a_hard_killed_owner_leaves_its_lease_to_expire_before_a_replacement_run
     async def go() -> None:
         async with make_harness(**_LEASE_KNOBS) as h:
             store = DeliveryLeaseStore(h.async_redis, h.config)
-            consumer = Consumer(redis=h.async_redis, kernel=h.kernel, config=h.config, leases=store)
+            consumer = Consumer(redis=h.async_redis, kernel=h.kernel, config=h.config, leases=store,
+                                reminders=refuse_unconfigured_reminder,
+                       )
             await consumer.ensure_group()
             spy = _ProcessEventSpy(h.kernel)
             h.runner.default_script = [Final(text="after the kill", status=DONE)]
@@ -894,7 +916,9 @@ def test_an_owner_that_loses_its_lease_refuses_the_terminal_ack(make_harness) ->
     async def go() -> None:
         async with make_harness(**_LEASE_KNOBS, reclaim_min_idle_ms=900000) as h:
             store = DeliveryLeaseStore(h.async_redis, h.config)
-            consumer = Consumer(redis=h.async_redis, kernel=h.kernel, config=h.config, leases=store)
+            consumer = Consumer(redis=h.async_redis, kernel=h.kernel, config=h.config, leases=store,
+                                reminders=refuse_unconfigured_reminder,
+                       )
             await consumer.ensure_group()
             spy = _ProcessEventSpy(h.kernel)
 
@@ -964,7 +988,9 @@ def test_a_transferred_delivery_inherits_the_remaining_budget_not_a_fresh_one(
     async def go() -> None:
         async with make_harness(**_LEASE_KNOBS) as h:
             store = DeliveryLeaseStore(h.async_redis, h.config)
-            consumer = Consumer(redis=h.async_redis, kernel=h.kernel, config=h.config, leases=store)
+            consumer = Consumer(redis=h.async_redis, kernel=h.kernel, config=h.config, leases=store,
+                                reminders=refuse_unconfigured_reminder,
+                       )
             await consumer.ensure_group()
             spy = _ProcessEventSpy(h.kernel)
             h.runner.default_script = [Final(text="ok", status=DONE)]
@@ -1074,7 +1100,9 @@ def test_an_already_expired_delivery_escalates_once_records_deadline_halted_and_
     async def go() -> None:
         async with make_harness(**_LEASE_KNOBS, reclaim_min_idle_ms=900000) as h:
             store = DeliveryLeaseStore(h.async_redis, h.config)
-            consumer = Consumer(redis=h.async_redis, kernel=h.kernel, config=h.config, leases=store)
+            consumer = Consumer(redis=h.async_redis, kernel=h.kernel, config=h.config, leases=store,
+                                reminders=refuse_unconfigured_reminder,
+                       )
             await consumer.ensure_group()
             h.runner.default_script = [Final(text="should-not-run", status=DONE)]
 
@@ -1148,7 +1176,9 @@ def test_a_deadline_halted_thread_accepts_a_followup_turn(make_harness) -> None:
     async def go() -> None:
         async with make_harness(**_LEASE_KNOBS, reclaim_min_idle_ms=900000) as h:
             store = DeliveryLeaseStore(h.async_redis, h.config)
-            consumer = Consumer(redis=h.async_redis, kernel=h.kernel, config=h.config, leases=store)
+            consumer = Consumer(redis=h.async_redis, kernel=h.kernel, config=h.config, leases=store,
+                                reminders=refuse_unconfigured_reminder,
+                       )
             await consumer.ensure_group()
             h.runner.default_script = [Final(text="should-not-run", status=DONE)]
 
@@ -1270,7 +1300,9 @@ async def _fenced_failing_consumer(h: Any) -> tuple[Consumer, DeliveryLeaseStore
     store at all) builds its own ``Consumer`` instead of calling this.
     """
     store = DeliveryLeaseStore(h.async_redis, h.config)
-    consumer = Consumer(redis=h.async_redis, kernel=h.kernel, config=h.config, leases=store)
+    consumer = Consumer(redis=h.async_redis, kernel=h.kernel, config=h.config, leases=store,
+                        reminders=refuse_unconfigured_reminder,
+               )
     await consumer.ensure_group()
     attempts = _failing_process_event(h)
     return consumer, store, attempts
@@ -1512,7 +1544,9 @@ def test_the_runs_lane_carries_the_configured_lease_expiry_threshold(
     async def go() -> None:
         async with make_harness(**_EXPIRY_KNOBS) as h:
             store = DeliveryLeaseStore(h.async_redis, h.config)
-            consumer = Consumer(redis=h.async_redis, kernel=h.kernel, config=h.config, leases=store)
+            consumer = Consumer(redis=h.async_redis, kernel=h.kernel, config=h.config, leases=store,
+                                reminders=refuse_unconfigured_reminder,
+                       )
 
             assert h.config.lease_expired_idle_ms_value() == _EXPIRY_IDLE_MS
             assert consumer._delivery.lease_expired_idle_ms == _EXPIRY_IDLE_MS
@@ -1654,8 +1688,12 @@ def test_two_replicas_reclaiming_the_same_expired_row_dispatch_it_once(
             store = DeliveryLeaseStore(h.async_redis, h.config)
             cfg_a = h.config.model_copy(update={"consumer_name": "worker-a"})
             cfg_b = h.config.model_copy(update={"consumer_name": "worker-b"})
-            consumer_a = Consumer(redis=h.async_redis, kernel=h.kernel, config=cfg_a, leases=store)
-            consumer_b = Consumer(redis=h.async_redis, kernel=h.kernel, config=cfg_b, leases=store)
+            consumer_a = Consumer(redis=h.async_redis, kernel=h.kernel, config=cfg_a, leases=store,
+                                  reminders=refuse_unconfigured_reminder,
+                         )
+            consumer_b = Consumer(redis=h.async_redis, kernel=h.kernel, config=cfg_b, leases=store,
+                                  reminders=refuse_unconfigured_reminder,
+                         )
             await consumer_a.ensure_group()
             attempts = _failing_process_event(h)
 
@@ -1714,8 +1752,12 @@ def test_a_dead_consumer_pass_does_not_steal_a_row_the_expiry_pass_just_claimed(
             store = DeliveryLeaseStore(h.async_redis, h.config)
             cfg_a = h.config.model_copy(update={"consumer_name": "worker-a"})
             cfg_b = h.config.model_copy(update={"consumer_name": "worker-b"})
-            consumer_a = Consumer(redis=h.async_redis, kernel=h.kernel, config=cfg_a, leases=store)
-            consumer_b = Consumer(redis=h.async_redis, kernel=h.kernel, config=cfg_b, leases=store)
+            consumer_a = Consumer(redis=h.async_redis, kernel=h.kernel, config=cfg_a, leases=store,
+                                  reminders=refuse_unconfigured_reminder,
+                         )
+            consumer_b = Consumer(redis=h.async_redis, kernel=h.kernel, config=cfg_b, leases=store,
+                                  reminders=refuse_unconfigured_reminder,
+                         )
             await consumer_a.ensure_group()
             spy = _ProcessEventSpy(h.kernel)
 
@@ -1797,8 +1839,12 @@ def test_a_delayed_handoff_loses_the_row_to_a_peer_without_a_double_run(
             store = DeliveryLeaseStore(h.async_redis, h.config)
             cfg_a = h.config.model_copy(update={"consumer_name": "worker-a"})
             cfg_b = h.config.model_copy(update={"consumer_name": "worker-b"})
-            consumer_a = Consumer(redis=h.async_redis, kernel=h.kernel, config=cfg_a, leases=store)
-            consumer_b = Consumer(redis=h.async_redis, kernel=h.kernel, config=cfg_b, leases=store)
+            consumer_a = Consumer(redis=h.async_redis, kernel=h.kernel, config=cfg_a, leases=store,
+                                  reminders=refuse_unconfigured_reminder,
+                         )
+            consumer_b = Consumer(redis=h.async_redis, kernel=h.kernel, config=cfg_b, leases=store,
+                                  reminders=refuse_unconfigured_reminder,
+                         )
             await consumer_a.ensure_group()
             attempts = _failing_process_event(h)
 
@@ -1882,6 +1928,7 @@ def test_a_saturated_consumer_claims_no_more_expired_rows_than_it_can_dispatch(
                 config=h.config,
                 max_concurrency=1,
                 leases=store,
+                reminders=refuse_unconfigured_reminder,
             )
             await consumer.ensure_group()
 
@@ -1993,6 +2040,7 @@ def test_the_expiry_pass_leaves_no_room_for_a_row_the_dead_pass_already_took(
                 config=h.config,
                 max_concurrency=1,
                 leases=store,
+                reminders=refuse_unconfigured_reminder,
             )
             await consumer.ensure_group()
             attempts = _failing_process_event(h)

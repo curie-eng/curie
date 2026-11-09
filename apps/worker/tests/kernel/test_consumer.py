@@ -45,7 +45,7 @@ from curie_worker.capacity_wait import (
     WAIT_TERMINAL_ONLY_FIELD,
     CapacityWaitStore,
 )
-from curie_worker.consumer import Consumer
+from curie_worker.consumer import Consumer, refuse_unconfigured_reminder
 from curie_worker.consumer_liveness import (
     ConsumerLivenessStore,
     consumer_heartbeat_capable_key,
@@ -123,7 +123,9 @@ _OUTAGE_KNOBS: dict[str, object] = {
 
 async def _outage_delivery(h: Any) -> tuple[Consumer, DeliveryLeaseStore, str, dict[str, str]]:
     store = DeliveryLeaseStore(h.async_redis, h.config)
-    consumer = Consumer(redis=h.async_redis, kernel=h.kernel, config=h.config, leases=store)
+    consumer = Consumer(redis=h.async_redis, kernel=h.kernel, config=h.config, leases=store,
+                        reminders=refuse_unconfigured_reminder,
+               )
     await consumer.ensure_group()
     await h.async_redis.xadd(
         h.config.stream, to_stream_fields(_qevent("outage", event_id=uuid.uuid4().hex))
@@ -991,6 +993,7 @@ def _capacity_consumer(h: Any) -> Consumer:
         kernel=h.kernel,
         config=h.config,
         leases=DeliveryLeaseStore(h.async_redis, h.config),
+        reminders=refuse_unconfigured_reminder,
     )
 
 
@@ -1078,6 +1081,7 @@ def test_consumes_stream_entry_end_to_end_and_acks(make_harness) -> None:
                 kernel=h.kernel,
                 config=h.config,
                 leases=DeliveryLeaseStore(h.async_redis, h.config),
+                reminders=refuse_unconfigured_reminder,
             )
             await consumer.ensure_group()
 
@@ -3291,6 +3295,7 @@ def test_reclaim_skips_this_consumers_own_inflight_entry(make_harness) -> None:
                 kernel=h.kernel,
                 config=h.config,
                 leases=DeliveryLeaseStore(h.async_redis, h.config),
+                reminders=refuse_unconfigured_reminder,
             )
             await consumer.ensure_group()
 
@@ -3328,6 +3333,7 @@ def test_dispatch_applies_backpressure_at_capacity(make_harness) -> None:
                 config=h.config,
                 max_concurrency=1,
                 leases=DeliveryLeaseStore(h.async_redis, h.config),
+                reminders=refuse_unconfigured_reminder,
             )
             await consumer.ensure_group()
 
@@ -3360,6 +3366,7 @@ def test_message_settlement_does_not_sample_queue_inventory(make_harness) -> Non
                 kernel=h.kernel,
                 config=h.config,
                 leases=DeliveryLeaseStore(h.async_redis, h.config),
+                reminders=refuse_unconfigured_reminder,
             )
             await consumer.ensure_group()
 
@@ -3406,6 +3413,7 @@ def test_maintenance_tick_samples_queue_inventory_once(make_harness) -> None:
                 kernel=h.kernel,
                 config=h.config,
                 leases=DeliveryLeaseStore(h.async_redis, h.config),
+                reminders=refuse_unconfigured_reminder,
             )
             calls: list[str] = []
 
@@ -3440,6 +3448,7 @@ def test_maintenance_tick_sweeps_the_progress_outbox_after_completions(make_harn
                 kernel=h.kernel,
                 config=h.config,
                 leases=DeliveryLeaseStore(h.async_redis, h.config),
+                reminders=refuse_unconfigured_reminder,
             )
             calls: list[str] = []
 
@@ -3483,6 +3492,7 @@ def test_a_failing_progress_sweep_does_not_stop_the_maintenance_tick(
                 kernel=h.kernel,
                 config=h.config,
                 leases=DeliveryLeaseStore(h.async_redis, h.config),
+                reminders=refuse_unconfigured_reminder,
             )
             calls: list[str] = []
 
@@ -3563,6 +3573,7 @@ def test_maintenance_tick_settles_pending_progress_without_a_deliverer(make_harn
                 kernel=h.kernel,
                 config=h.config,
                 leases=DeliveryLeaseStore(h.async_redis, h.config),
+                reminders=refuse_unconfigured_reminder,
             )
 
             async def observe() -> None:
@@ -3606,6 +3617,7 @@ def test_ensure_group_does_not_replay_preexisting_backlog(make_harness) -> None:
                 kernel=h.kernel,
                 config=h.config,
                 leases=DeliveryLeaseStore(h.async_redis, h.config),
+                reminders=refuse_unconfigured_reminder,
             )
             await consumer.ensure_group()
 
@@ -3633,6 +3645,7 @@ def test_read_loop_survives_transient_redis_timeout(make_harness, caplog) -> Non
                 kernel=h.kernel,
                 config=h.config,
                 leases=DeliveryLeaseStore(h.async_redis, h.config),
+                reminders=refuse_unconfigured_reminder,
             )
             await consumer.ensure_group()
 
@@ -3686,6 +3699,7 @@ def test_reclaims_and_reprocesses_a_dead_consumers_pending_entry(make_harness) -
                 kernel=h.kernel,
                 config=h.config,
                 leases=DeliveryLeaseStore(h.async_redis, h.config),
+                reminders=refuse_unconfigured_reminder,
             )
             await consumer.ensure_group()
 
@@ -3734,6 +3748,7 @@ def test_reclaims_a_dead_consumers_pending_entry_without_waiting_min_idle(
                 kernel=h.kernel,
                 config=h.config,
                 leases=DeliveryLeaseStore(h.async_redis, h.config),
+                reminders=refuse_unconfigured_reminder,
             )
             await consumer.ensure_group()
 
@@ -3808,12 +3823,14 @@ def test_prompt_reclaim_arbitrates_across_replicas_without_burning_delivery_budg
                 kernel=h.kernel,
                 config=first_config,
                 leases=DeliveryLeaseStore(h.async_redis, first_config),
+                reminders=refuse_unconfigured_reminder,
             )
             second = Consumer(
                 redis=h.async_redis,
                 kernel=h.kernel,
                 config=second_config,
                 leases=DeliveryLeaseStore(h.async_redis, second_config),
+                reminders=refuse_unconfigured_reminder,
             )
             await first.ensure_group()
 
@@ -3884,12 +3901,14 @@ def test_local_generation_bootstrap_contends_with_peer_transfer_lease(
                 kernel=h.kernel,
                 config=owner_config,
                 leases=DeliveryLeaseStore(h.async_redis, owner_config),
+                reminders=refuse_unconfigured_reminder,
             )
             peer = Consumer(
                 redis=h.async_redis,
                 kernel=h.kernel,
                 config=peer_config,
                 leases=DeliveryLeaseStore(h.async_redis, peer_config),
+                reminders=refuse_unconfigured_reminder,
             )
             owner._liveness_store = ConsumerLivenessStore(h.async_redis)
             peer._liveness_store = ConsumerLivenessStore(h.async_redis)
@@ -3973,6 +3992,7 @@ def test_reclaim_does_not_promptly_steal_from_unknown_peer_without_heartbeat_cap
                 kernel=h.kernel,
                 config=h.config,
                 leases=DeliveryLeaseStore(h.async_redis, h.config),
+                reminders=refuse_unconfigured_reminder,
             )
             await consumer.ensure_group()
 
@@ -4041,6 +4061,7 @@ def test_reclaim_does_not_steal_from_a_fresh_live_peer_when_min_idle_is_high(
                 kernel=h.kernel,
                 config=h.config,
                 leases=DeliveryLeaseStore(h.async_redis, h.config),
+                reminders=refuse_unconfigured_reminder,
             )
             await consumer.ensure_group()
 
@@ -4092,6 +4113,7 @@ def test_reclaim_does_not_steal_from_a_live_saturated_peer(make_harness) -> None
                 kernel=h.kernel,
                 config=h.config,
                 leases=DeliveryLeaseStore(h.async_redis, h.config),
+                reminders=refuse_unconfigured_reminder,
             )
             await consumer.ensure_group()
             ids = []
@@ -4149,6 +4171,7 @@ def test_graceful_stop_keeps_lease_through_two_ttls_of_inflight_drain(
                 kernel=h.kernel,
                 config=h.config,
                 leases=DeliveryLeaseStore(h.async_redis, h.config),
+                reminders=refuse_unconfigured_reminder,
             )
             await consumer.ensure_group()
             await h.async_redis.xadd(
@@ -4193,6 +4216,7 @@ def test_hang_renewals_during_inflight_turn_expire_liveness(make_harness) -> Non
                 kernel=h.kernel,
                 config=h.config,
                 leases=DeliveryLeaseStore(h.async_redis, h.config),
+                reminders=refuse_unconfigured_reminder,
             )
             consumer._liveness_store = _RenewalProbeStore(  # type: ignore[assignment]
                 ConsumerLivenessStore(h.async_redis), hang_renewals=True
@@ -4237,6 +4261,7 @@ def test_real_saturated_consumer_renews_lease_and_peer_cannot_prompt_claim(
                 config=h.config,
                 max_concurrency=1,
                 leases=DeliveryLeaseStore(h.async_redis, h.config),
+                reminders=refuse_unconfigured_reminder,
             )
             await peer.ensure_group()
             ids = [
@@ -4270,6 +4295,7 @@ def test_real_saturated_consumer_renews_lease_and_peer_cannot_prompt_claim(
                 kernel=h.kernel,
                 config=replacement_config,
                 leases=DeliveryLeaseStore(h.async_redis, replacement_config),
+                reminders=refuse_unconfigured_reminder,
             )
             assert await replacement._prompt_reclaim_once() == 0
             await asyncio.sleep(h.config.consumer_heartbeat_ttl_ms / 1000 + 0.015)
@@ -4298,6 +4324,7 @@ def test_alive_restoration_resets_two_absence_proof(make_harness) -> None:
                 kernel=h.kernel,
                 config=h.config,
                 leases=DeliveryLeaseStore(h.async_redis, h.config),
+                reminders=refuse_unconfigured_reminder,
             )
             await consumer.ensure_group()
             entry_id = await h.async_redis.xadd(
@@ -4365,6 +4392,7 @@ def test_disappeared_consumer_invalidates_first_absence_observation(make_harness
                 kernel=h.kernel,
                 config=h.config,
                 leases=DeliveryLeaseStore(h.async_redis, h.config),
+                reminders=refuse_unconfigured_reminder,
             )
             await consumer.ensure_group()
             entry_id = await h.async_redis.xadd(
@@ -4407,6 +4435,7 @@ def test_live_at_cap_peer_is_not_dead_lettered_by_prompt_path(make_harness) -> N
                 kernel=h.kernel,
                 config=h.config,
                 leases=DeliveryLeaseStore(h.async_redis, h.config),
+                reminders=refuse_unconfigured_reminder,
             )
             await consumer.ensure_group()
             entry_id = await h.async_redis.xadd(
@@ -4457,6 +4486,7 @@ def test_proven_dead_at_cap_peer_is_dead_lettered_without_xclaim(make_harness) -
                 kernel=h.kernel,
                 config=h.config,
                 leases=DeliveryLeaseStore(h.async_redis, h.config),
+                reminders=refuse_unconfigured_reminder,
             )
             await consumer.ensure_group()
             entry_id = await h.async_redis.xadd(
@@ -4521,6 +4551,7 @@ def test_transient_liveness_renewal_failure_recovers_before_lease_expiry(
                 kernel=h.kernel,
                 config=h.config,
                 leases=DeliveryLeaseStore(h.async_redis, h.config),
+                reminders=refuse_unconfigured_reminder,
             )
             probe = _RenewalProbeStore(ConsumerLivenessStore(h.async_redis), fail_renewals=1)
             consumer._liveness_store = probe  # type: ignore[assignment]
@@ -4556,6 +4587,7 @@ def test_timed_out_liveness_renewal_retries_before_lease_expiry(make_harness) ->
                 kernel=h.kernel,
                 config=h.config,
                 leases=DeliveryLeaseStore(h.async_redis, h.config),
+                reminders=refuse_unconfigured_reminder,
             )
             probe = _RenewalProbeStore(ConsumerLivenessStore(h.async_redis), timeout_renewals=1)
             consumer._liveness_store = probe  # type: ignore[assignment]
@@ -4595,6 +4627,7 @@ def test_terminal_liveness_failure_cancels_generation_and_clean_restart_recovers
                 config=h.config,
                 max_concurrency=1,
                 leases=DeliveryLeaseStore(h.async_redis, h.config),
+                reminders=refuse_unconfigured_reminder,
             )
             consumer._liveness_store = _RenewalProbeStore(  # type: ignore[assignment]
                 ConsumerLivenessStore(h.async_redis), hang_renewals=True
@@ -4683,6 +4716,7 @@ def test_prompt_selection_stays_timely_while_heavy_reclaim_waits_for_capacity(
                 config=h.config,
                 max_concurrency=1,
                 leases=DeliveryLeaseStore(h.async_redis, h.config),
+                reminders=refuse_unconfigured_reminder,
             )
             await consumer.ensure_group()
 
@@ -4811,6 +4845,7 @@ def test_next_turn_drains_queued_eval_reset_before_claiming(
                 kernel=h.kernel,
                 config=h.config,
                 leases=DeliveryLeaseStore(h.async_redis, h.config),
+                reminders=refuse_unconfigured_reminder,
             )
             await consumer.ensure_group()
             nxt = _qevent("eval-case-2", thread="tEval2", event_id="eval-2")
@@ -4865,6 +4900,7 @@ def test_next_turn_drains_reset_before_claiming_when_quota_is_full(
                 kernel=h.kernel,
                 config=h.config,
                 leases=DeliveryLeaseStore(h.async_redis, h.config),
+                reminders=refuse_unconfigured_reminder,
             )
             await consumer.ensure_group()
             nxt = _qevent("eval-case-2", thread="tEval2", event_id="eval-2-quota")
@@ -4902,6 +4938,7 @@ def test_sadd_of_bare_eval_conversation_id_does_not_release_scoped_sandbox(
                 kernel=h.kernel,
                 config=h.config,
                 leases=DeliveryLeaseStore(h.async_redis, h.config),
+                reminders=refuse_unconfigured_reminder,
             )
             await consumer.ensure_group()
             nxt = _qevent("follow-up", thread="tNext", event_id="eval-wrong-key")
@@ -4938,6 +4975,7 @@ def test_sadd_of_scoped_eval_isolate_key_releases_the_sandbox(
                 kernel=h.kernel,
                 config=h.config,
                 leases=DeliveryLeaseStore(h.async_redis, h.config),
+                reminders=refuse_unconfigured_reminder,
             )
             await consumer.ensure_group()
             nxt = _qevent("eval-case-2", thread="eval:1720000000.000200", event_id="eval-scoped")
@@ -4969,6 +5007,7 @@ def test_maintenance_tick_drains_pending_thread_reset_requests(
                 kernel=h.kernel,
                 config=h.config,
                 leases=DeliveryLeaseStore(h.async_redis, h.config),
+                reminders=refuse_unconfigured_reminder,
             )
             await h.async_redis.sadd(thread_reset_keys.requests, thread_key)
 
@@ -5003,6 +5042,7 @@ def test_maintenance_tick_thread_reset_failed_release_keeps_the_signal_pending(
                 kernel=h.kernel,
                 config=h.config,
                 leases=DeliveryLeaseStore(h.async_redis, h.config),
+                reminders=refuse_unconfigured_reminder,
             )
             await h.async_redis.sadd(thread_reset_keys.requests, "tFailRelease")
 
@@ -5065,6 +5105,7 @@ def test_thread_reset_drain_records_no_route_when_the_key_matched_no_route(
                 kernel=h.kernel,
                 config=h.config,
                 leases=DeliveryLeaseStore(h.async_redis, h.config),
+                reminders=refuse_unconfigured_reminder,
             )
             thread_key = "slack:C0EXAMPLE1:missing"
             assert h.substrate.lookup(thread_key) is None
@@ -5118,6 +5159,7 @@ def test_thread_reset_drain_records_released_when_a_route_existed(
                 kernel=h.kernel,
                 config=h.config,
                 leases=DeliveryLeaseStore(h.async_redis, h.config),
+                reminders=refuse_unconfigured_reminder,
             )
             await h.async_redis.sadd(thread_reset_keys.requests, thread_key)
 
@@ -5149,6 +5191,7 @@ def test_thread_reset_drain_records_failed_and_no_result_when_the_release_raises
                 kernel=h.kernel,
                 config=h.config,
                 leases=DeliveryLeaseStore(h.async_redis, h.config),
+                reminders=refuse_unconfigured_reminder,
             )
             thread_key = "tResultFailed"
             result_key = f"{thread_reset_keys.result_prefix}{thread_key}"
@@ -5202,6 +5245,7 @@ def test_maintenance_tick_thread_reset_is_not_stalled_by_a_wedged_runner(
                 kernel=h.kernel,
                 config=h.config,
                 leases=DeliveryLeaseStore(h.async_redis, h.config),
+                reminders=refuse_unconfigured_reminder,
             )
             await h.async_redis.sadd(thread_reset_keys.requests, thread_key)
 
@@ -5222,6 +5266,7 @@ def test_maintenance_tick_thread_reset_is_a_noop_when_nothing_pending(
                 kernel=h.kernel,
                 config=h.config,
                 leases=DeliveryLeaseStore(h.async_redis, h.config),
+                reminders=refuse_unconfigured_reminder,
             )
             await consumer._drain_thread_reset_requests()  # must not raise
 
@@ -5246,6 +5291,7 @@ def test_maintenance_tick_thread_reset_one_failure_does_not_block_the_rest(
                 kernel=h.kernel,
                 config=h.config,
                 leases=DeliveryLeaseStore(h.async_redis, h.config),
+                reminders=refuse_unconfigured_reminder,
             )
             await h.async_redis.sadd(thread_reset_keys.requests, "tBoom", "tOk")
 
@@ -5322,6 +5368,7 @@ def test_maintenance_tick_reset_drain_has_a_per_tick_budget_and_defers_the_rest(
                 kernel=h.kernel,
                 config=h.config,
                 leases=DeliveryLeaseStore(h.async_redis, h.config),
+                reminders=refuse_unconfigured_reminder,
             )
             await asyncio.wait_for(consumer._drain_thread_reset_requests(), timeout=5.0)
 
@@ -5374,6 +5421,7 @@ def test_maintenance_tick_thread_reset_is_not_stalled_by_a_hanging_substrate_rel
                 kernel=h.kernel,
                 config=h.config,
                 leases=DeliveryLeaseStore(h.async_redis, h.config),
+                reminders=refuse_unconfigured_reminder,
             )
             await h.async_redis.sadd(thread_reset_keys.requests, thread_key)
 
@@ -5507,6 +5555,7 @@ def test_failed_workspace_preparation_acks_the_entry_and_is_not_silent(
                 kernel=h.kernel,
                 config=h.config,
                 leases=DeliveryLeaseStore(h.async_redis, h.config),
+                reminders=refuse_unconfigured_reminder,
             )
             await consumer.ensure_group()
 
@@ -5701,6 +5750,7 @@ def test_maintenance_tick_thread_reset_claim_and_mark_is_atomic(
                     kernel=h.kernel,
                     config=h.config,
                     leases=DeliveryLeaseStore(h.async_redis, h.config),
+                    reminders=refuse_unconfigured_reminder,
                 )
                 task = asyncio.create_task(consumer._drain_thread_reset_requests())
                 await asyncio.wait_for(started.wait(), timeout=5.0)
@@ -5850,6 +5900,7 @@ def test_force_killed_worker_lock_is_stolen_and_cluster_message_reply_is_deliver
                 kernel=h.kernel,
                 config=h.config,
                 leases=DeliveryLeaseStore(h.async_redis, h.config),
+                reminders=refuse_unconfigured_reminder,
             )
             await consumer.ensure_group()
             qe = _qevent("crash-reclaim", thread=thread, event_id="e-2500-crash")
@@ -5944,6 +5995,7 @@ def test_live_worker_lock_still_serializes_a_replacement(make_harness) -> None:
                 kernel=h.kernel,
                 config=h.config,
                 leases=DeliveryLeaseStore(h.async_redis, h.config),
+                reminders=refuse_unconfigured_reminder,
             )
             await consumer.ensure_group()
             qe = _qevent("live-hold", thread=thread, event_id="e-2500-live")
@@ -6044,7 +6096,9 @@ class _LeaseLoss:
 
 def _loss_consumer(h: Any, monkeypatch: pytest.MonkeyPatch) -> tuple[Consumer, _LeaseLoss]:
     store = DeliveryLeaseStore(h.async_redis, h.config)
-    consumer = Consumer(redis=h.async_redis, kernel=h.kernel, config=h.config, leases=store)
+    consumer = Consumer(redis=h.async_redis, kernel=h.kernel, config=h.config, leases=store,
+                        reminders=refuse_unconfigured_reminder,
+               )
     return consumer, _LeaseLoss(consumer, store, monkeypatch)
 
 

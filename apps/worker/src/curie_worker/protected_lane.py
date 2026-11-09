@@ -27,7 +27,7 @@ from curie_protected_hooks.worker_verification import (
 )
 
 from .config import WorkerConfig
-from .consumer import Consumer
+from .consumer import Consumer, refuse_unconfigured_reminder
 from .delivery_lease import DeliveryLeaseStore
 from .kernel.core import Kernel
 from .protected_binding import protected_delivery_scope
@@ -238,6 +238,7 @@ class ProtectedConsumer(Consumer):
             kernel=cast(Kernel, _UnqualifiedKernel()),
             config=config,
             leases=DeliveryLeaseStore(runs, config),
+            reminders=refuse_unconfigured_reminder,
         )
         self._delivery = replace(self._spec, entry_eligibility=self._refusal_settlement_eligible)
 

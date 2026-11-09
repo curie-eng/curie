@@ -642,7 +642,7 @@ precedence is fixed: `users` beats `group` beats channel membership.
 | Declared | Set | Lookup | Eligible principal |
 |---|---|---|---|
 | nothing, and the route is bound (or the approval has no route at all) | `SlackChannelMembers` | none, the attested card channel is the proof | authenticated `chat` only |
-| nothing, and the approval names a route that is **not** bound | `UnboundRoute` — refuses everyone | none, there is no set to resolve | none |
+| nothing, and the approval names a route that is **not** bound | `UnboundRoute` refuses everyone. Creation against a missing route fails with 422 and the worker escalates to a human. Only a pre-0273 row, or a binding removed after creation, reaches this set. | none, there is no set to resolve | none |
 | `approvers.group: S...` | `SlackUserGroupMembers` | Slack `usergroups.users.list` | authenticated `chat` or `console` |
 | `approvers.users: [U...]` | `ExplicitUsers` | none, pure config | authenticated `chat`, `console`, or `operator` |
 

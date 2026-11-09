@@ -1595,7 +1595,7 @@ def test_retained_workspace_file_turn_refuses_without_mutating_any_owned_state(
 
     async def go() -> None:
         from curie_dispatcher.queue import to_stream_fields
-        from curie_worker.consumer import Consumer
+        from curie_worker.consumer import Consumer, refuse_unconfigured_reminder
         from curie_worker.delivery_lease import DeliveryLeaseStore
 
         deployment_id = uuid.uuid4()
@@ -1628,6 +1628,7 @@ def test_retained_workspace_file_turn_refuses_without_mutating_any_owned_state(
                 kernel=h.kernel,
                 config=h.config,
                 leases=store,
+                reminders=refuse_unconfigured_reminder,
             )
             await consumer.ensure_group()
             file_event = _qevent(

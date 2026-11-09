@@ -838,15 +838,11 @@ def build(
         config=config,
         leases=DeliveryLeaseStore(async_redis, config),
         drain=drain_gate,
-        reminders=(
-            partial(
-                deliver_reminder,
-                reader=approval_client,
-                cards=card_store,
-                sink=ObservedReplySink(sink),
-            )
-            if approval_client is not None
-            else None
+        reminders=partial(
+            deliver_reminder,
+            reader=approval_client,
+            cards=card_store,
+            sink=ObservedReplySink(sink),
         ),
     )
 

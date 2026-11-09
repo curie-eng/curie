@@ -33,10 +33,6 @@ LIVE_PROVIDER_GAP = (
     "ADR 0274 live-provider connector/session gap: approved credential absent; "
     "Brian waived the live run on 2026-11-08 pending a test credential"
 )
-LOCAL_CONNECTOR_GAP = (
-    "ADR 0274 local hosted connector gap: local/skill bring-up cannot deliver "
-    "operator-managed SecretRefs; connector wake-key custody runs on cluster only"
-)
 
 
 class PrivateInput(str):
@@ -1724,8 +1720,3 @@ def test_hosted_connector_session(qualification, agent, provider_tier):
         if key.encode() in exported:
             raise AssertionError("wake credential escaped into telemetry")
     assert stack.slack_calls == []
-
-
-@pytest.mark.skip(reason=LOCAL_CONNECTOR_GAP)
-def test_local_hosted_connector_gap():
-    pass

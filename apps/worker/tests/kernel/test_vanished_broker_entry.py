@@ -17,7 +17,7 @@ from typing import Any
 
 from aci_protocol import QueuedTurn
 from curie_dispatcher.queue import to_stream_fields
-from curie_worker.consumer import Consumer
+from curie_worker.consumer import Consumer, refuse_unconfigured_reminder
 from curie_worker.delivery_lease import DeliveryLease, DeliveryLeaseStore
 
 from .conftest import _pending_rows
@@ -116,6 +116,7 @@ def test_a_deleted_stream_entry_graveyards_as_vanished_and_edits_the_placeholder
                 kernel=h.kernel,
                 config=h.config,
                 leases=DeliveryLeaseStore(h.async_redis, h.config),
+                reminders=refuse_unconfigured_reminder,
             )
             await consumer.ensure_group()
             try:
@@ -156,6 +157,7 @@ def test_a_pel_row_moved_to_another_consumer_is_not_a_vanished_entry(
                 kernel=h.kernel,
                 config=h.config,
                 leases=DeliveryLeaseStore(h.async_redis, h.config),
+                reminders=refuse_unconfigured_reminder,
             )
             await consumer.ensure_group()
             other = "other-owner"

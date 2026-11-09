@@ -23,7 +23,7 @@ import pytest
 import yaml
 from curie_worker.attachments import AttachmentLimits
 from curie_worker.config import WorkerConfig
-from curie_worker.consumer import Consumer
+from curie_worker.consumer import Consumer, refuse_unconfigured_reminder
 from curie_worker.delivery_lease import DeliveryLeaseStore
 from curie_worker.kernel.core import Kernel
 from nacl.signing import SigningKey
@@ -41,7 +41,8 @@ def test_default_ownership_clocks_share_a_thirty_five_second_failure_deadline(
         redis=None,
         kernel=None,
         config=config,
-        leases=store,  # type: ignore[arg-type]
+        leases=store,  # type: ignore[arg-type],
+        reminders=refuse_unconfigured_reminder,
     )
     assert config.consumer_heartbeat_ttl_ms == 45000
     assert config.delivery_lease_ttl_s == 45.0
@@ -55,7 +56,8 @@ def test_default_ownership_clocks_share_a_thirty_five_second_failure_deadline(
         redis=None,
         kernel=None,
         config=shorter,
-        leases=None,  # type: ignore[arg-type]
+        leases=None,  # type: ignore[arg-type],
+        reminders=refuse_unconfigured_reminder,
     )
     assert short_consumer._liveness_refresh_interval_s() == 3.0
     assert (
@@ -845,6 +847,7 @@ def test_explicit_consumer_concurrency_still_wins_over_config(
         config=config,
         leases=DeliveryLeaseStore(redis, config),
         max_concurrency=1,
+        reminders=refuse_unconfigured_reminder,
     )
 
     assert consumer._max_concurrency == 1
