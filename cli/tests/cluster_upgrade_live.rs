@@ -3557,6 +3557,29 @@ fn transient_record_5xx_then_success_completes() {
     );
     assert_ownership_released(&fixture);
     assert_eq!(fixture.helm_upgrades().len(), 1, "{:?}", fixture.argv());
+    let record_patches: Vec<_> = fixture
+        .patches()
+        .into_iter()
+        .filter(is_record_patch)
+        .collect();
+    assert!(
+        !record_patches.is_empty(),
+        "the refused record patch must be captured"
+    );
+    let first = &record_patches[0];
+    assert_eq!(
+        record_patches
+            .iter()
+            .filter(|patch| *patch == first)
+            .count(),
+        2,
+        "the refused record patch is retried once: {record_patches:?}"
+    );
+    assert!(
+        !visible(&output).to_ascii_lowercase().contains("conflict"),
+        "a retried record write must not report a conflict: {}",
+        visible(&output)
+    );
 }
 
 /// #5412: a record patch that commits and still returns 5xx is adopted from
@@ -3639,6 +3662,291 @@ fn transient_record_5xx_stops_after_three_attempts() {
         "a lost checkpoint before Apply must stop short of mutation: {:?}",
         fixture.argv()
     );
+}
+
+/// #5412: a committed record patch whose first read-back is also transient is
+/// adopted from the next read. The committed document is not patched again.
+#[test]
+fn transient_read_back_after_committed_record_is_adopted() {
+    let fixture = Fixture::new(None);
+    let output = fixture.local("record-committed-then-transient-read");
+    assert!(
+        output.status.success(),
+        "a transient read after a committed record must not abort: {}",
+        visible(&output)
+    );
+    let message = visible(&output);
+    assert!(
+        !message.to_ascii_lowercase().contains("conflict"),
+        "a transient read must not become a false conflict: {message}"
+    );
+    assert!(
+        !message.contains("could not persist"),
+        "a transient read must not fail the checkpoint: {message}"
+    );
+    let record_patches: Vec<_> = fixture
+        .patches()
+        .into_iter()
+        .filter(is_record_patch)
+        .collect();
+    assert!(
+        !record_patches.is_empty(),
+        "the committed record patch must be captured"
+    );
+    let first = &record_patches[0];
+    assert_eq!(
+        record_patches
+            .iter()
+            .filter(|patch| *patch == first)
+            .count(),
+        1,
+        "the committed record must not be patched again: {record_patches:?}"
+    );
+    let record = fixture.last_record();
+    assert_eq!(record["status"], "succeeded", "{record}");
+    assert!(record_completed(&record, "commit"), "{record}");
+    assert_ownership_released(&fixture);
+}
+
+/// #5412: acquiring a checkpoint that already holds a record adopts a
+/// committed ownership patch. The patch leaves that record in place.
+#[test]
+fn committed_acquire_with_existing_record_is_adopted() {
+    let existing = serde_json::json!({
+        "target_version": "0.9.0",
+        "from_version": "0.8.6",
+        "known_good_version": "0.8.6",
+        "completed": [],
+        "status": "succeeded",
+        "plan": [],
+        "drain_completed": false,
+        "convergence": null,
+        "canary": null,
+        "fail_forward": null,
+        "resumed": false,
+    });
+    let fixture = Fixture::new(None).checkpoint(&existing);
+    let output = fixture.local("acquire-committed-then-5xx");
+    assert!(
+        output.status.success(),
+        "a committed acquire must be adopted: {}",
+        visible(&output)
+    );
+    let message = visible(&output);
+    assert!(
+        !message.to_ascii_lowercase().contains("conflict"),
+        "adopting an existing record must not report a conflict: {message}"
+    );
+    assert!(
+        !message.contains("could not acquire"),
+        "adopting an existing record must not fail ownership: {message}"
+    );
+    let acquires: Vec<_> = fixture
+        .patches()
+        .into_iter()
+        .filter(|patch| {
+            !is_record_patch(patch)
+                && !is_release_patch(patch)
+                && patch_has(patch, "add", "/metadata/annotations")
+        })
+        .collect();
+    assert_eq!(
+        acquires.len(),
+        1,
+        "the committed acquire must not be repeated: {acquires:?}"
+    );
+    assert_ownership_released(&fixture);
+    let record = fixture.last_record();
+    assert_eq!(record["status"], "succeeded", "{record}");
+}
+
+/// #5412: taking over a checkpoint that already holds a record adopts a
+/// committed takeover patch instead of aborting while this run holds it.
+#[test]
+fn committed_takeover_with_existing_record_is_adopted() {
+    let durable = checkpoint_through(
+        &[
+            "plan",
+            "validate",
+            "drain_preflight",
+            "checkpoint",
+            "migrate",
+        ],
+        true,
+    );
+    let fixture = stale_holder_fixture(Some(&durable));
+    let output = fixture.run_with(
+        "takeover-committed-then-5xx",
+        "0.9.0",
+        "charts/curie",
+        &["--take-over", STALE_HOLDER],
+    );
+    assert!(
+        output.status.success(),
+        "a committed takeover must be adopted: {}",
+        visible(&output)
+    );
+    let message = visible(&output);
+    assert!(
+        !message.to_ascii_lowercase().contains("conflict"),
+        "adopting the existing record must not report a conflict: {message}"
+    );
+    assert!(
+        !message.contains("could not take over"),
+        "adopting the existing record must not fail takeover: {message}"
+    );
+    let takeovers: Vec<_> = fixture
+        .patches()
+        .into_iter()
+        .filter(|patch| {
+            patch_has(
+                patch,
+                "replace",
+                "/metadata/annotations/curietech.ai~1upgrade-holder",
+            )
+        })
+        .collect();
+    assert_eq!(
+        takeovers.len(),
+        1,
+        "the committed takeover must not be repeated: {takeovers:?}"
+    );
+    assert_ownership_released(&fixture);
+}
+
+fn assert_reread_before_second_write(fixture: &Fixture, verb: &str) {
+    let calls = fixture.argv();
+    let writes: Vec<_> = calls
+        .iter()
+        .enumerate()
+        .filter_map(|(index, call)| {
+            (call.first().is_some_and(|part| part == "kubectl")
+                && call.get(1).is_some_and(|part| part == verb))
+            .then_some(index)
+        })
+        .collect();
+    assert!(writes.len() >= 2, "{calls:?}");
+    let rereads = calls[writes[0] + 1..writes[1]]
+        .iter()
+        .filter(|call| {
+            call.len() >= 4
+                && call[..4] == ["kubectl", "get", "configmap", "rel-upgrade-checkpoint"]
+        })
+        .count();
+    assert_eq!(
+        rereads, 2,
+        "a failed read must be retried before another write: {calls:?}"
+    );
+}
+
+#[test]
+fn checkpoint_retry_record_after_transient_read_waits_for_safe_observation() {
+    let fixture = Fixture::new(None);
+    let output = fixture.local("record-transient-then-transient-read");
+    assert!(output.status.success(), "{}", visible(&output));
+    assert_reread_before_second_write(&fixture, "patch");
+    let patches: Vec<_> = fixture
+        .patches()
+        .into_iter()
+        .filter(is_record_patch)
+        .collect();
+    assert_eq!(
+        patches.iter().filter(|patch| *patch == &patches[0]).count(),
+        2
+    );
+    assert_eq!(fixture.last_record()["status"], "succeeded");
+    assert_ownership_released(&fixture);
+}
+
+#[test]
+fn checkpoint_retry_record_transient_reads_exhaust_without_second_write() {
+    let fixture = Fixture::new(None);
+    let output = fixture.local("record-transient-reads-exhausted");
+    let message = visible(&output);
+    assert!(!output.status.success(), "{message}");
+    assert!(message.contains("after 3 attempts"), "{message}");
+    assert!(message.contains("i/o timeout"), "{message}");
+    assert_eq!(
+        fixture
+            .patches()
+            .iter()
+            .filter(|patch| is_record_patch(patch))
+            .count(),
+        1
+    );
+    assert!(fixture.helm_upgrades().is_empty());
+}
+
+#[test]
+fn checkpoint_retry_last_committed_record_attempt_is_adopted() {
+    let fixture = Fixture::new(None);
+    let output = fixture.local("record-third-committed-then-5xx");
+    assert!(output.status.success(), "{}", visible(&output));
+    let patches: Vec<_> = fixture
+        .patches()
+        .into_iter()
+        .filter(is_record_patch)
+        .collect();
+    assert_eq!(
+        patches.iter().filter(|patch| *patch == &patches[0]).count(),
+        3
+    );
+    assert_eq!(fixture.last_record()["status"], "succeeded");
+    assert_ownership_released(&fixture);
+}
+
+#[test]
+fn checkpoint_retry_committed_create_after_transient_read_is_adopted() {
+    let fixture = Fixture::new(None);
+    let output = fixture.local("create-committed-then-transient-read");
+    assert!(output.status.success(), "{}", visible(&output));
+    assert_eq!(
+        fixture.captured_paths("created").len(),
+        1,
+        "a committed create must not be repeated"
+    );
+    assert_eq!(fixture.last_record()["status"], "succeeded");
+    assert_ownership_released(&fixture);
+}
+
+#[test]
+fn checkpoint_retry_create_after_transient_read_waits_for_absence() {
+    let fixture = Fixture::new(None);
+    let output = fixture.local("create-transient-then-transient-read");
+    assert!(output.status.success(), "{}", visible(&output));
+    assert_reread_before_second_write(&fixture, "create");
+    assert_eq!(fixture.captured_paths("created").len(), 2);
+    assert_eq!(fixture.last_record()["status"], "succeeded");
+    assert_ownership_released(&fixture);
+}
+
+#[test]
+fn checkpoint_retry_create_transient_reads_exhaust_without_second_write() {
+    let fixture = Fixture::new(None);
+    let output = fixture.local("create-transient-reads-exhausted");
+    let message = visible(&output);
+    assert!(!output.status.success(), "{message}");
+    assert!(message.contains("after 3 attempts"), "{message}");
+    assert!(message.contains("i/o timeout"), "{message}");
+    assert_eq!(fixture.captured_paths("created").len(), 1);
+    assert!(fixture.helm_upgrades().is_empty());
+}
+
+#[test]
+fn checkpoint_retry_committed_release_after_transient_read_is_adopted() {
+    let fixture = Fixture::new(None);
+    let output = fixture.local("release-committed-then-transient-read");
+    assert!(output.status.success(), "{}", visible(&output));
+    assert_eq!(
+        fixture
+            .patches()
+            .iter()
+            .filter(|patch| is_release_patch(patch))
+            .count(),
+        1
+    );
+    assert_eq!(fixture.last_record()["status"], "succeeded");
+    assert_ownership_released(&fixture);
 }
 
 // T8(b) -- plan edge 10. Only the checkpoint write that FOLLOWS a failed

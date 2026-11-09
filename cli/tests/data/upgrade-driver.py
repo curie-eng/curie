@@ -117,15 +117,27 @@ WORKLOADS = "deployments,statefulsets,daemonsets,pods,jobs"
 #                     convergence sub-flag goes false.
 #   checkpoint_patch_fails  False | "always" | "after-converge" |
 #                           "transient-once" | "committed-then-5xx" |
-#                           "always-transient".
+#                           "always-transient" | "committed-then-transient-read" |
+#                           "committed-on-third-5xx".
 #                           "always" and "after-converge" exit nonzero with a
 #                           non-transient stderr. "transient-once" returns one
 #                           apiserver 5xx on the first record patch and does not
 #                           commit it. "committed-then-5xx" applies that first
 #                           record patch, then returns the same 5xx.
 #                           "always-transient" returns that 5xx for every record
-#                           patch and never commits it. The 5xx line is the
-#                           apiserver text from issue #5412.
+#                           patch and never commits it.
+#                           "committed-then-transient-read" applies that first
+#                           record patch, returns the 5xx, and makes the next
+#                           checkpoint read return a transport timeout once.
+#                           "committed-on-third-5xx" rejects two patches, then
+#                           commits the third and answers 5xx.
+#                           The 5xx line is the apiserver text from issue #5412.
+#   ownership_patch_fails  None | "committed-then-5xx" |
+#                           "release-committed-then-5xx". Apply the first
+#                           acquire/takeover or release patch, then return 5xx.
+#   ownership_create_fails None | "transient-once" | "committed-then-5xx".
+#   checkpoint_read_failures  Reads failing after the injected write error:
+#                           0 disables, a positive count is finite, -1 persists.
 #   acquire_conflict  None | "create" | "patch". The selected ownership write
 #                     loses to a deterministic external holder.
 #   stale_record_cas  an external writer advances resourceVersion and installs
@@ -213,6 +225,9 @@ BASE = {
     "selector_drift": False,
     "terminal": False,
     "checkpoint_patch_fails": False,
+    "ownership_patch_fails": None,
+    "ownership_create_fails": None,
+    "checkpoint_read_failures": 0,
     "acquire_conflict": None,
     "stale_record_cas": False,
     "release_conflict": False,
@@ -442,6 +457,42 @@ SCENARIOS = {
     "record-committed-then-5xx": {"checkpoint_patch_fails": "committed-then-5xx"},
     # Every record patch answers 5xx and leaves the object unchanged.
     "record-transient-always": {"checkpoint_patch_fails": "always-transient"},
+    # Commit the first record patch, lose its response, then time out one read.
+    "record-committed-then-transient-read": {
+        "checkpoint_patch_fails": "committed-then-transient-read",
+    },
+    "record-transient-then-transient-read": {
+        "checkpoint_patch_fails": "transient-once",
+        "checkpoint_read_failures": 1,
+    },
+    "record-transient-reads-exhausted": {
+        "checkpoint_patch_fails": "transient-once",
+        "checkpoint_read_failures": -1,
+    },
+    "record-third-committed-then-5xx": {
+        "checkpoint_patch_fails": "committed-on-third-5xx",
+    },
+    "create-committed-then-transient-read": {
+        "ownership_create_fails": "committed-then-5xx",
+        "checkpoint_read_failures": 1,
+    },
+    "create-transient-then-transient-read": {
+        "ownership_create_fails": "transient-once",
+        "checkpoint_read_failures": 1,
+    },
+    "create-transient-reads-exhausted": {
+        "ownership_create_fails": "transient-once",
+        "checkpoint_read_failures": -1,
+    },
+    "release-committed-then-transient-read": {
+        "ownership_patch_fails": "release-committed-then-5xx",
+        "checkpoint_read_failures": 1,
+    },
+    "acquire-committed-then-5xx": {"ownership_patch_fails": "committed-then-5xx"},
+    "takeover-committed-then-5xx": {
+        "pending_status": "pending-upgrade",
+        "ownership_patch_fails": "committed-then-5xx",
+    },
     # Only the checkpoint write that FOLLOWS a failed Converge fails. The
     # convergence failure is the real verdict; the persist error must travel
     # beside it rather than replace it.
@@ -788,17 +839,30 @@ TRANSIENT_APISERVER_5XX = (
 )
 
 
-def record_patches_captured():
-    """Record patches already copied, including the one this call just captured."""
+def patches_captured(kinds):
+    """Patches of the named kinds already copied, including this call's patch."""
     count = 0
     for path in captured("patch", ".json"):
         try:
             operations = json.loads(path.read_text())
         except (OSError, json.JSONDecodeError):
             continue
-        if patch_kind(operations) == "record":
+        if patch_kind(operations) in kinds:
             count += 1
     return count
+
+
+def record_patches_captured():
+    """Record patches already copied, including the one this call just captured."""
+    return patches_captured({"record"})
+
+
+def transient_failure(read_failures=None):
+    remaining = scenario["checkpoint_read_failures"] if read_failures is None else read_failures
+    if remaining:
+        (root / "transient-checkpoint-read").write_text(str(remaining))
+    print(TRANSIENT_APISERVER_5XX, file=sys.stderr)
+    sys.exit(1)
 
 
 def conflict(message):
@@ -1575,12 +1639,18 @@ if program == "kubectl":
         if manifest is None:
             print("error: create requires -f", file=sys.stderr)
             sys.exit(64)
+        first_create = len(captured("created", ".json")) == 1
+        if first_create and scenario["ownership_create_fails"] == "transient-once":
+            transient_failure()
         created = json.loads(Path(manifest).read_text())
         metadata = created.setdefault("metadata", {})
         metadata.setdefault("name", CHECKPOINT)
         metadata.setdefault("namespace", NAMESPACE)
         metadata["resourceVersion"] = "100"
-        emit(save_checkpoint(created))
+        created = save_checkpoint(created)
+        if first_create and scenario["ownership_create_fails"] == "committed-then-5xx":
+            transient_failure()
+        emit(created)
     if args[0] == "patch" and args[1:3] == ["configmap", CHECKPOINT]:
         patch_file = flag_value("--patch-file")
         if patch_file is None:
@@ -1611,8 +1681,7 @@ if program == "kubectl":
             conflict("the object has been modified")
         fails = scenario["checkpoint_patch_fails"]
         if kind == "record" and fails == "transient-once" and record_patches_captured() == 1:
-            print(TRANSIENT_APISERVER_5XX, file=sys.stderr)
-            sys.exit(1)
+            transient_failure()
         if kind == "record" and fails == "committed-then-5xx" and record_patches_captured() == 1:
             try:
                 committed = apply_patch(current, operations)
@@ -1622,6 +1691,38 @@ if program == "kubectl":
             save_checkpoint(committed)
             print(TRANSIENT_APISERVER_5XX, file=sys.stderr)
             sys.exit(1)
+        if kind == "record" and fails == "committed-on-third-5xx":
+            if record_patches_captured() < 3:
+                transient_failure()
+            if record_patches_captured() == 3:
+                committed = apply_patch(current, operations)
+                committed["metadata"]["resourceVersion"] = next_resource_version(current)
+                save_checkpoint(committed)
+                transient_failure()
+        if (
+            (
+                kind == "record"
+                and fails == "committed-then-transient-read"
+                and record_patches_captured() == 1
+            )
+            or (
+                kind in {"acquire", "takeover"}
+                and scenario["ownership_patch_fails"] == "committed-then-5xx"
+                and patches_captured({"acquire", "takeover"}) == 1
+            )
+            or (
+                kind == "release"
+                and scenario["ownership_patch_fails"] == "release-committed-then-5xx"
+                and patches_captured({"release"}) == 1
+            )
+        ):
+            try:
+                committed = apply_patch(current, operations)
+            except (KeyError, TypeError, ValueError) as error:
+                conflict(str(error))
+            committed["metadata"]["resourceVersion"] = next_resource_version(current)
+            save_checkpoint(committed)
+            transient_failure(1 if kind == "record" else None)
         if kind == "record" and fails == "always-transient":
             print(TRANSIENT_APISERVER_5XX, file=sys.stderr)
             sys.exit(1)
@@ -1652,6 +1753,15 @@ if program == "kubectl":
                     f'Error from server (NotFound): namespaces "{NAMESPACE}" not found',
                     file=sys.stderr,
                 )
+                sys.exit(1)
+            marker = root / "transient-checkpoint-read"
+            if marker.exists():
+                remaining = int(marker.read_text())
+                if remaining == 1:
+                    marker.unlink()
+                elif remaining > 1:
+                    marker.write_text(str(remaining - 1))
+                print("error: i/o timeout", file=sys.stderr)
                 sys.exit(1)
             checkpoint = read_checkpoint()
             if checkpoint is not None:

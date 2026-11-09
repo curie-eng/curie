@@ -2140,7 +2140,8 @@ fn create_lost_race(stderr: &str) -> bool {
         || reason.contains("object has been modified")
 }
 
-/// Attempts for one checkpoint write, including the first. Pauses sit between
+/// Attempts for one checkpoint write, including the first. A transient read
+/// consumes one attempt and does not issue another write. Pauses sit between
 /// attempts: 2s after the first transient failure, 4s after the second (#5412).
 const CHECKPOINT_WRITE_ATTEMPTS: u32 = 3;
 const CHECKPOINT_RETRY_PAUSES: [Duration; 2] = [Duration::from_secs(2), Duration::from_secs(4)];
@@ -2184,7 +2185,7 @@ struct CheckpointFailure {
 enum CheckpointReread {
     Found(CheckpointObservation),
     Absent,
-    Transient,
+    Transient(String),
     Fatal(String),
 }
 
@@ -2732,9 +2733,15 @@ impl LiveHost {
     }
 
     /// An ownership patch or create landed when the holder is ours and the
-    /// record is unchanged. Create writes no record.
-    fn ownership_write_landed(&self, observation: &CheckpointObservation) -> bool {
-        self.holds_written_ownership(observation) && observation.record == self.checkpoint_record
+    /// record still equals the record observed before that write. Create
+    /// writes no record, so its expected record stays empty. This host has
+    /// not adopted the pre-write record yet (#5412).
+    fn ownership_write_landed(
+        &self,
+        observation: &CheckpointObservation,
+        expected_record: &Option<serde_json::Value>,
+    ) -> bool {
+        self.holds_written_ownership(observation) && &observation.record == expected_record
     }
 
     fn release_landed(&self, observation: &CheckpointObservation) -> bool {
@@ -2757,7 +2764,7 @@ impl LiveHost {
                 return CheckpointReread::Absent;
             }
             if checkpoint_stderr_is_transient(&err) {
-                return CheckpointReread::Transient;
+                return CheckpointReread::Transient(super::verbs::failure_reason(&err).to_string());
             }
             return CheckpointReread::Fatal(super::verbs::failure_reason(&err).to_string());
         }
@@ -2782,9 +2789,10 @@ impl LiveHost {
     /// One JSON patch of the checkpoint. A transient 5xx or transport error is
     /// ambiguous: the `test` ops make a blind retry report a false conflict if
     /// the first write committed. Reread first. Adopt when the holder and
-    /// record match what this run wrote. Retry the same patch only while the
-    /// resourceVersion is still the one the patch tested. Anything else is the
-    /// existing conflict (#5412).
+    /// record match what this run wrote. Retry the same patch only after a
+    /// read shows the resourceVersion is still the one the patch tested. A
+    /// transient read is retried by itself and never authorizes another patch.
+    /// Anything else is the existing conflict (#5412).
     fn write_checkpoint_patch(
         &mut self,
         patch: &serde_json::Value,
@@ -2792,33 +2800,39 @@ impl LiveHost {
         matches: impl Fn(&Self, &CheckpointObservation) -> bool,
     ) -> Result<CheckpointWrite> {
         let mut last_reason = String::new();
+        let mut reread_only = false;
         for attempt in 1..=CHECKPOINT_WRITE_ATTEMPTS {
-            let (ok, out, err) = self.run_checkpoint_patch(patch)?;
-            if ok {
-                return Ok(CheckpointWrite::Response(out));
-            }
-            let reason = super::verbs::failure_reason(&err).to_string();
-            if !checkpoint_stderr_is_transient(&err) {
-                return Ok(CheckpointWrite::Failed(
-                    self.checkpoint_failure_from(&reason, false),
-                ));
-            }
-            last_reason = reason;
-            if attempt == CHECKPOINT_WRITE_ATTEMPTS {
-                break;
+            if !reread_only {
+                let (ok, out, err) = self.run_checkpoint_patch(patch)?;
+                if ok {
+                    return Ok(CheckpointWrite::Response(out));
+                }
+                let reason = super::verbs::failure_reason(&err).to_string();
+                if !checkpoint_stderr_is_transient(&err) {
+                    return Ok(CheckpointWrite::Failed(
+                        self.checkpoint_failure_from(&reason, false),
+                    ));
+                }
+                last_reason = reason;
             }
             match self.reread_checkpoint() {
                 CheckpointReread::Found(observation) if matches(self, &observation) => {
                     return Ok(CheckpointWrite::Adopted(observation));
                 }
                 CheckpointReread::Found(observation)
-                    if observation.resource_version == tested_resource_version => {}
+                    if observation.resource_version == tested_resource_version =>
+                {
+                    reread_only = false;
+                }
                 CheckpointReread::Found(_) | CheckpointReread::Absent => {
                     return Ok(CheckpointWrite::Failed(
                         self.checkpoint_failure_from(&last_reason, false),
                     ));
                 }
-                CheckpointReread::Transient => {}
+                CheckpointReread::Transient(reason) => {
+                    last_reason = reason;
+                    reread_only = true;
+                }
                 CheckpointReread::Fatal(message) => {
                     return Ok(CheckpointWrite::Failed(CheckpointFailure {
                         reason: message,
@@ -2827,7 +2841,9 @@ impl LiveHost {
                     }));
                 }
             }
-            std::thread::sleep(CHECKPOINT_RETRY_PAUSES[(attempt as usize) - 1]);
+            if attempt < CHECKPOINT_WRITE_ATTEMPTS {
+                std::thread::sleep(CHECKPOINT_RETRY_PAUSES[(attempt as usize) - 1]);
+            }
         }
         Ok(CheckpointWrite::Failed(
             self.checkpoint_failure_from(&last_reason, true),
@@ -3025,8 +3041,9 @@ impl LiveHost {
                     "value": self.ownership_action(),
                 },
             ]);
+            let expected_record = observed.record.clone();
             let outcome = self.write_checkpoint_patch(&patch, &tested, |host, observation| {
-                host.ownership_write_landed(observation)
+                host.ownership_write_landed(observation, &expected_record)
             })?;
             let observation = self.finish_checkpoint_write(
                 outcome,
@@ -3085,8 +3102,9 @@ impl LiveHost {
                 ])
             }
         };
+        let expected_record = observed.record.clone();
         let outcome = self.write_checkpoint_patch(&patch, &tested, |host, observation| {
-            host.ownership_write_landed(observation)
+            host.ownership_write_landed(observation, &expected_record)
         })?;
         let observation = self.finish_checkpoint_write(
             outcome,
@@ -3135,88 +3153,80 @@ impl LiveHost {
         );
         let mut last_reason = String::new();
         let mut saw_transient = false;
+        let mut reread_only = false;
+        let mut lost = false;
         for attempt in 1..=CHECKPOINT_WRITE_ATTEMPTS {
-            let (ok, out, err) = self.run(&cmd)?;
-            if ok {
-                let observation = parse_checkpoint_observation(&out, "upgrade ownership create")
-                    .context(
-                        "ownership may remain because the server response cannot be trusted",
-                    )?;
-                self.validate_owned_observation(&observation, "upgrade ownership create", None)
-                    .context(
-                        "ownership may remain because the server response cannot be trusted",
-                    )?;
-                self.adopt_checkpoint_observation(observation);
-                return Ok(());
-            }
-            if namespace_is_absent(&err, &self.opts.common.namespace) {
-                let reason = super::verbs::failure_reason(&err);
-                bail!(
-                    "namespace {} does not exist, so upgrade ownership cannot be created: {reason}; establish the install with `curie cluster up` first",
-                    self.opts.common.namespace,
-                );
-            }
-            let reason = super::verbs::failure_reason(&err).to_string();
-            let transient = checkpoint_stderr_is_transient(&err);
-            let lost = create_lost_race(&err);
-            // A first-try AlreadyExists is still the old single-shot race.
-            // AlreadyExists after a transient 5xx is ambiguous and uses the reread.
-            if lost && !saw_transient {
-                let diagnostic = self.checkpoint_diagnostic();
-                bail!(
-                    "could not acquire upgrade ownership: {reason}; {diagnostic}; wait for the current upgrade to finish, or verify that its holder has stopped before manual recovery"
-                );
-            }
-            if !transient && !lost {
-                bail!("could not create upgrade ownership: {reason}");
-            }
-            if transient {
-                saw_transient = true;
-                last_reason = reason.clone();
-                if attempt == CHECKPOINT_WRITE_ATTEMPTS {
-                    break;
+            if !reread_only {
+                let (ok, out, err) = self.run(&cmd)?;
+                if ok {
+                    let observation =
+                        parse_checkpoint_observation(&out, "upgrade ownership create").context(
+                            "ownership may remain because the server response cannot be trusted",
+                        )?;
+                    self.validate_owned_observation(&observation, "upgrade ownership create", None)
+                        .context(
+                            "ownership may remain because the server response cannot be trusted",
+                        )?;
+                    self.adopt_checkpoint_observation(observation);
+                    return Ok(());
                 }
-            }
-            let adopted = match self.reread_checkpoint() {
-                CheckpointReread::Found(observation)
-                    if self.ownership_write_landed(&observation) =>
-                {
-                    Some(observation)
+                if namespace_is_absent(&err, &self.opts.common.namespace) {
+                    let reason = super::verbs::failure_reason(&err);
+                    bail!(
+                        "namespace {} does not exist, so upgrade ownership cannot be created: {reason}; establish the install with `curie cluster up` first",
+                        self.opts.common.namespace,
+                    );
                 }
-                CheckpointReread::Found(_) | CheckpointReread::Absent if lost => {
+                let reason = super::verbs::failure_reason(&err).to_string();
+                let transient = checkpoint_stderr_is_transient(&err);
+                lost = create_lost_race(&err);
+                if lost && !saw_transient {
                     let diagnostic = self.checkpoint_diagnostic();
                     bail!(
                         "could not acquire upgrade ownership: {reason}; {diagnostic}; wait for the current upgrade to finish, or verify that its holder has stopped before manual recovery"
                     );
                 }
-                CheckpointReread::Found(_) => {
+                if !transient && !lost {
+                    bail!("could not create upgrade ownership: {reason}");
+                }
+                saw_transient |= transient;
+                last_reason = reason;
+            }
+            match self.reread_checkpoint() {
+                CheckpointReread::Found(observation)
+                    if self.ownership_write_landed(&observation, &None) =>
+                {
+                    self.validate_owned_observation(&observation, "upgrade ownership create", None)
+                        .context(
+                            "ownership may remain because the server response cannot be trusted",
+                        )?;
+                    self.adopt_checkpoint_observation(observation);
+                    return Ok(());
+                }
+                CheckpointReread::Found(_) | CheckpointReread::Absent if lost => {
                     let diagnostic = self.checkpoint_diagnostic();
-                    let shown = if last_reason.is_empty() {
-                        reason
-                    } else {
-                        last_reason.clone()
-                    };
                     bail!(
-                        "could not acquire upgrade ownership: {shown}; {diagnostic}; wait for the current upgrade to finish, or verify that its holder has stopped before manual recovery"
+                        "could not acquire upgrade ownership: {last_reason}; {diagnostic}; wait for the current upgrade to finish, or verify that its holder has stopped before manual recovery"
                     );
                 }
-                CheckpointReread::Absent | CheckpointReread::Transient => None,
+                CheckpointReread::Found(_) => {
+                    let diagnostic = self.checkpoint_diagnostic();
+                    bail!(
+                        "could not acquire upgrade ownership: {last_reason}; {diagnostic}; wait for the current upgrade to finish, or verify that its holder has stopped before manual recovery"
+                    );
+                }
+                CheckpointReread::Absent => reread_only = false,
+                CheckpointReread::Transient(reason) => {
+                    last_reason = reason;
+                    reread_only = true;
+                }
                 CheckpointReread::Fatal(message) => {
                     bail!("could not create upgrade ownership: {message}");
                 }
-            };
-            if let Some(observation) = adopted {
-                self.validate_owned_observation(&observation, "upgrade ownership create", None)
-                    .context(
-                        "ownership may remain because the server response cannot be trusted",
-                    )?;
-                self.adopt_checkpoint_observation(observation);
-                return Ok(());
             }
-            if attempt == CHECKPOINT_WRITE_ATTEMPTS {
-                break;
+            if attempt < CHECKPOINT_WRITE_ATTEMPTS {
+                std::thread::sleep(CHECKPOINT_RETRY_PAUSES[(attempt as usize) - 1]);
             }
-            std::thread::sleep(CHECKPOINT_RETRY_PAUSES[(attempt as usize) - 1]);
         }
         let failure = self.checkpoint_failure_from(&last_reason, true);
         Err(checkpoint_write_error(
