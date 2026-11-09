@@ -499,32 +499,52 @@ pub async fn local_comms(opts: LocalCommsOpts) -> Result<CommsOutput> {
 #[cfg(test)]
 #[test]
 fn slack_token_consumers_match_chart() {
-    let templates =
-        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../charts/curie/templates");
+    let chart = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../charts/curie");
+    let output = std::process::Command::new("helm")
+        .arg("template")
+        .arg("acme")
+        .arg(chart)
+        .args([
+            "--set",
+            "security.allowDevDefaults=true",
+            "--set",
+            "dispatcher.slack.appToken=xapp-example",
+            "--set",
+            "dispatcher.slack.botToken=xoxb-example",
+            "--set",
+            "channelGateway.deploy=true",
+            "--set",
+            "channelGateway.allowInsecure=true",
+        ])
+        .output()
+        .expect("helm is required to verify the rendered Slack token consumers");
+    assert!(
+        output.status.success(),
+        "helm template failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let rendered = String::from_utf8(output.stdout).expect("UTF-8 chart render");
     let mut chart_consumers = std::collections::BTreeSet::new();
-    for entry in std::fs::read_dir(templates).expect("chart templates directory") {
-        let path = entry.expect("chart template entry").path();
-        if path.extension() != Some(std::ffi::OsStr::new("yaml")) {
+    for document in rendered.split("\n---") {
+        if !document.lines().any(|line| line == "kind: Deployment") {
             continue;
         }
-        let template = std::fs::read_to_string(&path).expect("chart template source");
-        for expression in template.split("{{").skip(1) {
-            let expression = expression.split("}}").next().expect("template expression");
-            let tokens: Vec<_> = expression.split_whitespace().collect();
-            for (index, token) in tokens.iter().enumerate() {
-                if *token != "include" || tokens.get(index + 1) != Some(&"\"curie.env.slack\"") {
-                    continue;
-                }
-                let workload = tokens[index + 2..]
-                    .windows(2)
-                    .find(|pair| pair[0] == "\"workload\"")
-                    .expect("Slack helper call supplies its workload")[1]
-                    .strip_prefix('"')
-                    .and_then(|value| value.split_once('"').map(|(workload, _)| workload))
-                    .expect("Slack workload is a quoted literal");
-                chart_consumers.insert(workload.to_string());
-            }
+        let holds_token = document.lines().any(|line| {
+            line.trim_start()
+                .strip_prefix("- name: ")
+                .is_some_and(|name| {
+                    name == "SLACK_BOT_TOKEN" || name.starts_with("CURIE_SLACK_BOT_TOKEN__")
+                })
+        });
+        if !holds_token {
+            continue;
         }
+        let workload = document
+            .lines()
+            .find_map(|line| line.strip_prefix("  name: "))
+            .and_then(|name| name.strip_prefix("acme-curie-"))
+            .expect("token consumer has the chart's deployment name");
+        chart_consumers.insert(workload.to_string());
     }
     let matches_chart = |consumers: &[SlackTokenConsumer]| {
         consumers
@@ -538,14 +558,14 @@ fn slack_token_consumers_match_chart() {
         "rollout consumers must match chart Slack env consumers: {chart_consumers:?}"
     );
 
-    let without_api: Vec<_> = SLACK_TOKEN_CONSUMERS
+    let without_gateway: Vec<_> = SLACK_TOKEN_CONSUMERS
         .iter()
         .copied()
-        .filter(|consumer| consumer.workload != "api")
+        .filter(|consumer| consumer.workload != "channel-gateway")
         .collect();
     assert!(
-        !matches_chart(&without_api),
-        "removing the API must fail the same chart equality check"
+        !matches_chart(&without_gateway),
+        "removing the gateway must fail the same chart equality check"
     );
 }
 

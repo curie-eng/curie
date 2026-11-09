@@ -8,7 +8,7 @@ from datetime import UTC, datetime
 
 import pytest
 from aci_protocol import Final, SessionStatus
-from curie_dispatcher.queue import to_stream_fields
+from curie_internal.turn_queue import to_stream_fields
 from curie_internal.approval_reminder import APPROVAL_REMINDER_FIELD, ApprovalReminderV1
 from curie_worker.approval_reminders import deliver_reminder
 from curie_worker.approvals import CreatedApproval

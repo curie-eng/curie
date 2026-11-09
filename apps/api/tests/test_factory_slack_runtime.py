@@ -1329,7 +1329,7 @@ async def _factory_gateway(
                     "bot_token_env": "CURIE_SLACK_BOT_TOKEN__0",
                     "app_token_env": "CURIE_SLACK_APP_TOKEN__0",
                     "signing_secret_env": None,
-                }
+                },
             ],
         )
         with pytest.MonkeyPatch.context() as provider_env:
@@ -1564,7 +1564,8 @@ async def _run_production_worker(
     lane it launches (runs, evals, heartbeat, cron and the rest), over this
     stack's Postgres and Valkey, posting to the Slack stand-in. The factory
     identity's token reaches the gateway through its declared env var, and
-    the worker uses its authenticated gateway reply sink. Nothing is called on the progress loop.
+    the worker uses its authenticated gateway reply sink. Nothing calls the
+    progress loop directly.
     It runs until the Slack stand-in sets ``signal`` or ``within_s`` passes, in
     one wait raced against the runtime's own return, then shuts down through
     the resources owner, as ``run._run`` does.

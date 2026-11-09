@@ -2529,7 +2529,7 @@ def test_retained_attachment_handoff_recovers_without_repeating_action(
     import signal
 
     from aci_protocol import SideEffectFlag
-    from curie_dispatcher.queue import to_stream_fields
+    from curie_internal.turn_queue import to_stream_fields
     from curie_worker.consumer import Consumer
     from curie_worker.delivery_lease import DeliveryLeaseStore
     from curie_worker.kernel.routing import _thread_key_for
@@ -2643,7 +2643,7 @@ def test_retained_attachment_handoff_recovers_without_repeating_action(
 def test_attachment_handoff_checks_marker_recovered_during_fetch(
     make_harness, side_effect: bool
 ) -> None:
-    from curie_dispatcher.queue import to_stream_fields
+    from curie_internal.turn_queue import to_stream_fields
     from curie_worker.consumer import Consumer
     from curie_worker.delivery_lease import DeliveryLeaseStore
     from curie_worker.kernel.routing import _thread_key_for
