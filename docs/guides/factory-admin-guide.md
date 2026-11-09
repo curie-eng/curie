@@ -23,9 +23,9 @@ flowchart LR
 2. Follow the [quickstart](dark-factory-quickstart.md) for that pairing.
    For GitHub, its first command prints a GitHub App registration link.
    Create the App, save its key, install it on the repository, then
-   [rerun with the App](dark-factory-quickstart.md#rerun-with-the-app).
-3. Confirm `Factory quickstart ready` names the right context, repository,
-   label, and runner. Run a small trial issue and read its final status and
+   [rerun with the App](dark-factory-quickstart.md#github-issues-and-github-prs).
+3. Confirm setup names the right context, repository, label, and runner.
+   Run a small trial issue and read its final status and
    PR. On GitHub, a user with repository write or admin access adds the
    default `curie-factory` label.
 
