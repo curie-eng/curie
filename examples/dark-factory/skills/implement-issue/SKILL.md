@@ -434,14 +434,22 @@ The plan review runs once, the diff review loop at most 5 completed rounds,
 and the `wait_ci` loop at most 3 rounds. A diff review rejection returns to
 step 6 (implement), never to the plan. When the diff reviewer still answers
 `VERDICT: CHANGES` on round 5, a review stays unavailable, or the hook stops
-the run, do not publish:
+the run, do not publish.
 
-End your final reply with `Could not complete:`, one sentence naming the loop
-that did not converge (or the review that failed, or the hook's stop reason),
-and the reviewer's unresolved findings and open questions as a short bulleted
-list a maintainer can answer. Every hook refusal or stop text carries the
-unresolved findings the hook retained; put them after `Could not complete:`.
-The platform posts that reply on the issue; you post nothing there yourself.
+The final reply is only the no pull request handoff. The first characters are
+`Could not complete:`. Copy this shape and fill the slots. The whole reply is
+under 1500 characters:
+
+Could not complete: <one sentence naming why the run stopped>
+Decisions needed:
+1. <one question a maintainer can answer>
+Settled:
+1. <one fact a rerun can reuse>
+
+Use at most 3 numbered questions and at most 3 numbered facts, each one
+sentence. A bullet list of review findings is not this reply. Do not recount
+earlier review rounds, and do not paste the reviewer's findings. The platform
+posts that reply on the issue; you post nothing there yourself.
 
 ## 8. Finish (phase `publish`)
 
@@ -485,10 +493,19 @@ pull request this run continues counts as a follow-up. Your final reply begins w
 `No changes needed:` and gives the reason. Do not call
 `mcp__curie__publish_changes`.
 
-**Stop with a stated reason** in every other case. Your final reply begins
-with `Could not complete:` and then gives the reason in one sentence, what you
-tried, and what a maintainer must provide or decide. Do not call
-`mcp__curie__publish_changes`.
+**Stop with a stated reason** in every other case. Do not call
+`mcp__curie__publish_changes`. The final reply is the same no pull request
+handoff as "Loop cap". Copy that shape and nothing else. The first characters
+are `Could not complete:`. The whole reply is under 1500 characters:
+
+Could not complete: <one sentence naming why the run stopped>
+Decisions needed:
+1. <one question a maintainer can answer>
+Settled:
+1. <one fact a rerun can reuse>
+
+At most 3 numbered questions and at most 3 numbered facts. No bullet list of
+findings and no account of earlier review rounds.
 
 ## 9. Wait for CI (phase `wait_ci`)
 

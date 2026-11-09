@@ -133,9 +133,10 @@ The diff loop (`implement` and
 `implement` at most 3. A round counts only when the reviewer returns a
 verdict. When the diff reviewer still asks for changes on round 5, a reviewer
 stays unavailable, or the review gate stops the run, the run publishes
-nothing. It ends its reply with `Could not complete:` and the reviewer's
-unresolved findings and open questions, and the platform's status comment on
-the issue carries that result.
+nothing. Its final reply starts with `Could not complete:` and stays under
+1,500 characters, with at most three numbered maintainer questions under
+`Decisions needed:` and three reusable facts under `Settled:`; the platform's
+status comment on the issue carries that handoff.
 
 A reviewer tags every finding `blocking` (the change would be incorrect or
 unverifiable, or misses a criterion) or `note` (an improvement that does not
@@ -188,7 +189,8 @@ observed is unfinished, so its check is never reported as passed, it supports
 no verification claim, and nothing is published on it. A checkout
 the diff reviewer approved may still be published until the deadline. Every
 stop or refusal carries the unresolved reviewer findings the hook retained, so
-the final reply can list them; those findings never reach the pod log.
+the final reply can summarize the decisions and settled facts; those findings
+never reach the pod log.
 
 A run continues across prompts. Its state is keyed by `CURIE_SESSION_ID`
 (else the hook's own session id) plus the workspace, the root of the checkout
@@ -258,9 +260,8 @@ out-of-credits cause and the review is not retried.
   its comments, its link, the execution's absolute UTC `execution_deadline`
   and total duration in seconds as `execution_seconds`. It stores nothing.
   The sandbox holds no tracker credential at all.
-  A failed or capped review ends the reply with `Could not complete:` and the
-  unresolved findings, and the platform's factory status comment on the issue
-  carries that result.
+  A failed or capped review produces the short `Could not complete:` handoff,
+  and the platform's factory status comment on the issue carries that result.
 - **Publication.** The built-in `mcp__curie__publish_changes` tool. The platform
   captures the patch and publishes it from a separate trusted job. The agent
   never pushes.

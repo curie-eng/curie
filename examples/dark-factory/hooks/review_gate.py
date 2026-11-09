@@ -59,8 +59,9 @@ Findings. A completed ``CHANGES`` keeps the reviewer's reply after its
 A wait_ci round keeps the failing check names and states from its CI JSON
 (each cut to 200 characters), else the message text after its marker line. A
 diff ``APPROVE`` clears them. Every stop text, and every timing, no progress
-and cap refusal, carries them, so the final ``Could not complete:`` reply can
-list them. Findings, ticket text and command text never reach the pod log.
+and cap refusal, carries them, so the final no-pull-request reply can turn
+them into the short handoff the implement-issue skill specifies. Findings,
+ticket text and command text never reach the pod log.
 
 One script handles every hook event the bundle registers:
 
@@ -1304,9 +1305,14 @@ def _with_findings(reason: str, state: dict[str, Any]) -> str:
 
 def _stop_text(reason: str, state: dict[str, Any]) -> str:
     return (
-        f"STOP. {reason} Do not publish. End your reply with `Could not complete:` "
-        "and the reviewer's unresolved findings and open questions as a list; "
-        "the platform posts that reply on the issue.\n\n"
+        f"STOP. {reason} Do not publish. Your entire final reply must be under "
+        "1500 characters, beginning with `Could not complete:` and one sentence "
+        "naming why. Then `Decisions needed:` with at most 3 numbered questions "
+        "a maintainer can answer, each one sentence, and `Settled:` with at most "
+        "3 numbered facts a rerun can reuse, each one sentence. Use the unresolved "
+        "findings below to identify those decisions and facts; do not paste the "
+        "findings or recount earlier review rounds. The platform posts that reply "
+        "on the issue.\n\n"
         f"{_findings_block(state) or NO_FINDINGS}"
     )
 
