@@ -322,6 +322,116 @@ def test_a_killed_supervisor_takes_its_runner_child_with_it(
     assert wait_gone(child, 5), "the runner child outlived its supervisor"
 
 
+def test_restart_removes_an_interrupted_upload_before_accepting_a_claim(
+    supervisor: SupervisorProcess, records: Path
+) -> None:
+    unrelated = [
+        supervisor.state_root / name
+        for name in (
+            "notes",
+            ".upload-not-an-archive",
+            ".upload-abcdefgh.tar",
+            ".upload-ABCDEFGH",
+            ".upload-abcdefg",
+            ".upload-abcdefghi",
+        )
+    ]
+    for path in unrelated:
+        path.write_bytes(b"keep")
+    nested = supervisor.state_root / "unrelated" / ".upload-abcdefgh"
+    nested.parent.mkdir()
+    nested.write_bytes(b"keep")
+    body = claim_archive(
+        "claim-a",
+        1,
+        _env(records, supervisor, ACME_UPLOAD_TOKEN="placeholder-upload-token"),
+        files={"bundle/padding": b"x" * 128_000},
+    )
+    connection = http.client.HTTPSConnection(
+        supervisor.host, supervisor.port, timeout=10, context=client_context(supervisor.tls)
+    )
+    try:
+        connection.putrequest("PUT", claim_path("claim-a", 1))
+        connection.putheader("Authorization", f"Bearer {CONTROL_TOKEN}")
+        connection.putheader("Content-Length", str(len(body)))
+        connection.endheaders()
+        connection.send(body[:65_536])
+
+        def uploaded() -> bool:
+            archives = set(supervisor.state_root.glob(".upload-*")) - set(unrelated)
+            return len(archives) == 1 and next(iter(archives)).stat().st_size >= 65_536
+
+        wait_until(uploaded, 10, "the partial archive reaching disk")
+        archive = next(iter(set(supervisor.state_root.glob(".upload-*")) - set(unrelated)))
+        assert supervisor.process is not None
+        supervisor.process.kill()
+        supervisor.process.wait(timeout=5)
+    finally:
+        connection.close()
+    assert archive.is_file()
+    assert archive.stat().st_size < len(body)
+    supervisor.start()
+    assert not archive.exists()
+    assert all(path.read_bytes() == b"keep" for path in [*unrelated, nested])
+    assert "removed 1 stale upload archives" in supervisor.log_path.read_text()
+    _start(supervisor, records)
+
+
+def test_startup_unlinks_upload_symlinks_without_touching_their_targets(
+    supervisor: SupervisorProcess, records: Path, tmp_path: Path
+) -> None:
+    supervisor.stop()
+    target = tmp_path / "credential-file"
+    target.write_bytes(b"placeholder-upload-token")
+    directory = tmp_path / "credential-directory"
+    directory.mkdir()
+    nested = directory / ".upload-abcdefgh"
+    nested.write_bytes(b"keep")
+    links = [
+        supervisor.state_root / f".upload-{suffix}"
+        for suffix in ("abcdefgh", "ijklmnop", "qrstuvwx")
+    ]
+    links[0].symlink_to(target)
+    links[1].symlink_to(directory, target_is_directory=True)
+    links[2].symlink_to(tmp_path / "absent")
+    unreadable = supervisor.state_root / ".upload-0123_abz"
+    unreadable.write_bytes(b"placeholder-upload-token")
+    unreadable.chmod(0)
+    supervisor.start()
+    assert all(not path.exists() and not path.is_symlink() for path in [*links, unreadable])
+    assert target.read_bytes() == b"placeholder-upload-token"
+    assert nested.read_bytes() == b"keep"
+    logs = supervisor.log_path.read_text()
+    assert "removed 4 stale upload archives" in logs
+    assert "placeholder-upload-token" not in logs
+    assert all(path.name not in logs and str(path) not in logs for path in [*links, unreadable])
+    _start(supervisor, records)
+
+
+def test_startup_refuses_to_serve_when_an_upload_cannot_be_removed(
+    supervisor: SupervisorProcess, records: Path
+) -> None:
+    supervisor.stop()
+    obstacle = supervisor.state_root / ".upload-abcdefgh"
+    obstacle.mkdir()
+    contents = obstacle / "credential-file"
+    contents.write_bytes(b"placeholder-upload-token")
+    with pytest.raises(RuntimeError, match="stale upload cleanup failed.*Is a directory"):
+        supervisor.start()
+    assert supervisor.process is not None
+    assert supervisor.process.wait(timeout=5) == 78
+    with pytest.raises(OSError):
+        _create(supervisor, "claim-a", 1, claim_archive("claim-a", 1, _env(records, supervisor)))
+    assert contents.read_bytes() == b"placeholder-upload-token"
+    logs = supervisor.log_path.read_text()
+    assert "refusing to serve" in logs
+    assert "placeholder-upload-token" not in logs
+    assert obstacle.name not in logs and str(obstacle) not in logs
+    obstacle.rename(supervisor.state_root / "unrelated")
+    supervisor.start()
+    _start(supervisor, records)
+
+
 _FAULT_SCRIPT = textwrap.dedent(
     """
     import asyncio, sys
