@@ -77,7 +77,7 @@ from curie_channel_gateway.slack.relevance import DropReason
 if TYPE_CHECKING:
     from redis import Redis
 
-logger = logging.getLogger(__name__)
+logger = logging.getLogger("curie_dispatcher.admission")
 
 #: The only channel kind this dispatcher serves. Stated, never configured, for
 #: the same reason ``handlers._mint_turn`` states it: a Slack dispatcher that

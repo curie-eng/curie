@@ -17,7 +17,7 @@ import logging
 import threading
 from pathlib import Path
 
-_logger = logging.getLogger(__name__)
+_logger = logging.getLogger("curie_dispatcher.heartbeat")
 
 
 def start_heartbeat(path: str, interval_s: float) -> threading.Event:

@@ -608,7 +608,7 @@ def test_an_api_that_predates_the_endpoint_admits_and_says_so_once(
     admission_api.predates = True
     clock = _Clock()
     gate = _gate(admission_api, clock, store)
-    with caplog.at_level(logging.WARNING, logger="curie_channel_gateway.slack.admission"):
+    with caplog.at_level(logging.WARNING, logger="curie_dispatcher.admission"):
         assert gate.refusal(address=CHANNEL, adapter=None, callers=[STRANGER]) is None
         clock.now += TTL
         assert gate.refusal(address="C0EXAMPLE9", adapter=None, callers=[OTHER]) is None

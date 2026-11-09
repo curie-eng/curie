@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import io
+import json
 import os
 import subprocess
 import sys
@@ -149,6 +150,11 @@ def test_main_without_otlp_endpoint_prints_only_the_stream_id(
         capture_output=True, text=True, check=False, timeout=10,
     )
     assert result.returncode == 0, result.stderr
+    records = [json.loads(line) for line in result.stderr.splitlines() if line.startswith("{")]
+    assert any(
+        record.get("severity") == "INFO" and record.get("service.name") == "curie-dispatcher"
+        for record in records
+    )
     stream_id = result.stdout.strip()
     milliseconds, sequence = stream_id.split("-", maxsplit=1)
     assert milliseconds.isdigit()
