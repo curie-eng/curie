@@ -52,27 +52,43 @@ SCOPED_PATHS = frozenset(
     )
 )
 FLAG = re.compile(r"--(?:kube-)?context\b")
-TOKEN = re.compile(r""""(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*'|<[^<>\n]+>|[^\s,;)\]`"']+""")
+TOKEN = re.compile(
+    r""""(?:[^"\n\\]|\\.)*"|'(?:[^'\n\\]|\\.)*'|`(?:[^`\n\\]|\\.)*`|<[^<>\n]+>|[^\s,;)\]`"']+"""
+)
 DYNAMIC = re.compile(r"\$(?:[A-Za-z_0-9({])|\{[^}]*\}|<[^<>]+>|%(?:s|[a-z]|\([^)]+\)[a-z])")
 
 
-def problems(text: str) -> list[int]:
+def problems(text: str, *, yaml_values: bool = False, shell_values: bool = False) -> list[int]:
     found = []
     # Escaped quotes inside string literals carry the same argument boundary.
     normalized = text.replace('\\"', '"').replace("\\'", "'")
     for match in FLAG.finditer(normalized):
         rest = normalized[match.end() :]
+        shell_argument = shell_values and bool(
+            re.search(
+                r"(?:\b[A-Za-z_]\w*=\([^)]*|\b(?:kubectl|helm|curie)\b[^\n]*)$",
+                normalized[: match.start()],
+            )
+        )
+        literal_words = yaml_values or shell_argument
+        boundary = r",\s*|\)\s*\.arg\(\s*|\s+(?=[\"'`])"
+        if shell_argument:
+            boundary += r"|\s+"
         array = re.match(
-            r"[\"'](?:\.(?:into|to_string|to_owned)\(\))?\s*"
-            r"(?:,\s*|\)\s*\.arg\(\s*|\s+(?=[\"']))",
+            r"[\"'`](?:\.(?:into|to_string|to_owned)\(\))?\s*"
+            rf"(?:{boundary})",
             rest,
         )
-        if array:
+        yaml_item = re.match(r"[\"']?[ \t]*\n[ \t]*-[ \t]+", rest) if yaml_values else None
+        if yaml_item:
+            rest = rest[yaml_item.end() :]
+        elif array:
             rest = rest[array.end() :]
-            literal = re.match(r"(?:[frb]+)?([\"'])", rest)
-            if not literal:
+            literal = re.match(r"(?:&\s*)?(?:[frb]+\#*)?([\"'`])", rest)
+            if literal:
+                rest = rest[literal.end() - 1 :]
+            elif not literal_words:
                 continue  # A language expression supplies the argument.
-            rest = rest[literal.end() - 1 :]
         elif rest.startswith("="):
             rest = rest[1:]
         elif rest[:1].isspace():
@@ -82,8 +98,8 @@ def problems(text: str) -> list[int]:
         token = TOKEN.match(rest)
         if token is None:
             continue
-        value = token.group().strip("\"'")
-        if not value or value.startswith(("--", "(", ")", "[", "]", "|")):
+        value = token.group().strip("\"'`")
+        if not value or value.startswith(("--", "(", ")", "[", "]", "|", "&&", ">")):
             continue
         if not DYNAMIC.search(value):
             found.append(normalized.count("\n", 0, match.start()) + 1)
@@ -103,7 +119,11 @@ def check(root: Path) -> int:
         data = (root / name).read_bytes()
         if b"\0" in data:
             continue
-        for line in problems(data.decode("utf-8")):
+        for line in problems(
+            data.decode("utf-8"),
+            yaml_values=Path(name).suffix in {".yaml", ".yml"},
+            shell_values=Path(name).suffix in {".sh", ".yaml", ".yml", ".md"},
+        ):
             failures.append(
                 f"{name}:{line}: context flag requires a variable or <context> placeholder"
             )
@@ -145,28 +165,41 @@ def self_test() -> int:
     with tempfile.TemporaryDirectory(prefix="curie-context-policy-") as directory:
         root = Path(directory)
         subprocess.run(["git", "init", "--quiet", str(root)], check=True)
-        fixture = root / "examples/curie.yaml"
-        fixture.parent.mkdir()
-        fixture.touch()
-        subprocess.run(["git", "add", "examples/curie.yaml"], cwd=root, check=True)
-        for expected, examples in ((1, rejected), (0, accepted)):
-            for example in examples:
-                fixture.write_text(example + "\n")
-                observed = subprocess.run(
-                    [sys.executable, str(Path(__file__).resolve()), "--root", str(root)],
-                    capture_output=True,
-                    text=True,
-                    check=False,
+        cases = [(1, "tools/factory-e2e/tests/test_acceptance.py", item) for item in rejected]
+        cases += [(0, "tools/factory-e2e/tests/test_acceptance.py", item) for item in accepted]
+        cases += [
+            (1, "cli/src/installation.rs", f'.arg("{flag}").arg(r#"fixed-cluster"#)'),
+            (1, "apps/ui/src/generated/commandManifest.ts", f'["{flag}", `fixed-cluster`]'),
+            (1, "examples/curie.yaml", f'args: ["{flag}", fixed-cluster]'),
+            (1, "examples/curie.yaml", f'args:\n  - "{flag}"\n  - fixed-cluster'),
+            (1, "scripts/e2e-mail-adapter.sh", f'args=("{flag}" fixed-cluster)'),
+            (0, "cli/src/installation.rs", f'.arg("{flag}").arg(r#"{{context}}"#)'),
+            (0, "apps/ui/src/generated/commandManifest.ts", f'["{flag}", `${{context}}`]'),
+            (0, "examples/curie.yaml", f'args: ["{flag}", "<context>"]'),
+            (0, "examples/curie.yaml", f'args:\n  - "{flag}"\n  - "$CONTEXT"'),
+            (0, "scripts/e2e-mail-adapter.sh", f'args=("{flag}" $CONTEXT)'),
+        ]
+        for expected, filename, example in cases:
+            fixture = root / filename
+            fixture.parent.mkdir(parents=True, exist_ok=True)
+            fixture.write_text(example + "\n")
+            subprocess.run(["git", "add", filename], cwd=root, check=True)
+            observed = subprocess.run(
+                [sys.executable, str(Path(__file__).resolve()), "--root", str(root)],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            fixture.write_text("")
+            if observed.returncode != expected:
+                print(
+                    f"Policy self-test failed: {example!r}: {observed.stdout}{observed.stderr}",
+                    file=sys.stderr,
                 )
-                if observed.returncode != expected:
-                    print(
-                        f"Policy self-test failed: {example!r}: {observed.stdout}{observed.stderr}",
-                        file=sys.stderr,
-                    )
-                    return 1
+                return 1
     print(
-        f"Kube-context policy self-test passed: {len(rejected)} literals rejected, "
-        f"{len(accepted)} variables/placeholders accepted"
+        f"Kube-context policy self-test passed: {sum(case[0] == 1 for case in cases)} "
+        f"literals rejected, {sum(case[0] == 0 for case in cases)} variables/placeholders accepted"
     )
     return 0
 
