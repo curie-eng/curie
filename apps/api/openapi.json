@@ -828,6 +828,7 @@
         "type": "object"
       },
       "AdapterPrincipalRotate": {
+        "additionalProperties": false,
         "description": "Self-rotation request: only the next credential's lifetime is chosen.",
         "properties": {
           "ttl_s": {

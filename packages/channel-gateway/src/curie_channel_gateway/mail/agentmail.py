@@ -179,6 +179,7 @@ def request(
     *,
     max_response_bytes: int = 1_048_576,
     opener: urllib.request.OpenerDirector | None = None,
+    timeout_seconds: float = HTTP_TIMEOUT_SECONDS,
 ) -> HttpResult:
     """One bounded HTTP round trip; status 0 is transport failure.
 
@@ -196,7 +197,7 @@ def request(
     for key, value in (headers or {}).items():
         req.add_header(key, value)
     try:
-        with (opener or _OPENER).open(req, timeout=HTTP_TIMEOUT_SECONDS) as response:
+        with (opener or _OPENER).open(req, timeout=timeout_seconds) as response:
             raw_bytes = response.read(max_response_bytes + 1)
             status = int(response.status)
             response_headers = dict(response.headers.items())

@@ -516,6 +516,8 @@ class AdapterPrincipalMint(BaseModel):
 class AdapterPrincipalRotate(BaseModel):
     """Self-rotation request: only the next credential's lifetime is chosen."""
 
+    model_config = ConfigDict(extra="forbid")
+
     ttl_s: int = Field(
         default=adapter_principal.DEFAULT_TTL_SECONDS,
         gt=0,

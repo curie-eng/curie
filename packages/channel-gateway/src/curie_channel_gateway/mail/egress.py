@@ -159,6 +159,7 @@ class EgressHandler(BaseHTTPRequestHandler):
                 and self.adapter.state.healthy()
                 and status["channel_token"]["state"] in {"ok", "expiring", "disabled"}
                 and status["discovery"]["state"] != "unreachable"
+                and status.get("self_rotation", {}).get("ready", True)
             )
             return self._respond(
                 200 if ready else 503,

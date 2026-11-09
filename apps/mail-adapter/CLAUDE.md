@@ -10,7 +10,7 @@ the enforceable-rule summary.
   database access.** Its credentials are `CURIE_CHANNEL_TOKEN` (presented as
   `X-API-Key` on ingress), `CURIE_EGRESS_SECRET` (checked on every inbound POST),
   `AGENTMAIL_API_KEY`, and the optional `CURIE_ADAPTER_PRINCIPAL` (ADR-0156,
-  presented only on `POST /approvals/{id}/resolve` when carrying an answer). The
+  presented on approval answers and opt-in self-rotation). The
   optional `CURIE_MAIL_RECEIVER_KEY` is its email receiver key (ADR 0260): it
   signs the sender of each turn through the shared
   `curie_internal.identity_context` signer and authorizes nothing alone. It also
@@ -19,9 +19,11 @@ the enforceable-rule summary.
   add a second canonicalisation or MAC here, and never post a turn or an answer unsigned when
   the receiver is configured. Do not add `CURIE_API_KEY`, a Valkey client, or a DB
   session to the platform here; a capability the adapter does not hold cannot be
-  stolen from it, and re-minting an expired `chn` token is an operator step for
-  exactly that reason. Its local SQLite file is delivery state, not a platform
-  capability, and must never contain any of the three credentials.
+  stolen from it. `CURIE_MAIL_SELF_ROTATE` is off by default. When enabled,
+  `credential_rotation.py` renews both scoped credentials, serializes channel mint and
+  ingress, and stores them in a separate owner-only SQLite snapshot beside the
+  journal. The delivery journal must never contain credentials. Treat the
+  snapshot, its volume and backups as bearer-credential storage.
 - **Reply text and its send target are owned at `(conversation_id, reply_ref)`.**
   Every update and completion uses that exact durable pair, and the send target
   is only the event's `target.reply_ref`. Never derive a target or accumulated

@@ -204,9 +204,9 @@ DMARC success, a copied reference, and membership in either allowlist cannot
 resolve an approval. Use another supported channel for approval answers while
 AgentMail sender authentication remains unverifiable.
 
-The adapter principal is not rotated by the adapter yet. Re-mint it with `POST
-/approvals/principals/adapter` before it expires, the same operator step as
-`CURIE_CHANNEL_TOKEN`.
+With self-rotation disabled, renew the adapter principal administratively with
+`POST /approvals/principals/adapter` before expiry. Opt-in self-rotation below
+renews both credentials without an operator or restart.
 
 ## Config surface (env vars)
 
@@ -222,7 +222,11 @@ stray generic `PORT` or `POLL_INTERVAL` in the pod environment cannot reach one.
 | `CURIE_API_URL` | `http://localhost:8000` | platform API the ingress POST goes to (in-cluster: `http://curie-api:8000`). `CURIE_API_BASE_URL` is a deprecated alias |
 | `CURIE_CHANNEL_TOKEN` | "" | the scoped `chn` token, sent as `X-API-Key` on ingress. Required |
 | `CURIE_EGRESS_SECRET` | "" | shared secret the platform presents on `X-Curie-Adapter-Secret`. Required |
-| `CURIE_ADAPTER_PRINCIPAL` | "" | the adapter principal credential (ADR 0156), sent as `X-Curie-Adapter-Principal` when carrying an admitted approval answer. Every AgentMail answer currently fails sender authentication before this credential is used (see "Approvals by email") |
+| `CURIE_ADAPTER_PRINCIPAL` | "" | adapter principal (ADR 0156), used for admitted approval answers and opt-in credential renewal |
+| `CURIE_MAIL_SELF_ROTATE` | `false` | renew channel and adapter credentials in memory and persist them beside the journal |
+| `CURIE_MAIL_CHANNEL_TOKEN_TTL_SECONDS` | `3600` | requested channel token lifetime when self-rotation is enabled; 1 through 604800 seconds |
+| `CURIE_MAIL_PRINCIPAL_TTL_SECONDS` | `86400` | requested adapter principal lifetime when self-rotation is enabled; 1 through 604800 seconds |
+| `CURIE_MAIL_CHANNEL_ADAPTER` | "" | channel route identity sent on renewal; set when the inbox has several bindings |
 | `ADAPTER_INGRESS_ENABLED` | `true` | gates the poller only, never the egress server |
 | `CURIE_MAIL_POLL_INTERVAL_SECONDS` | `5.0` | seconds between listings; must be greater than zero. A transport failure or any 4xx refusal arms bounded exponential backoff on top, up to 60s; a successful 200 listing resets it, while 5xx responses retain their existing semantics and neither arm nor clear an already armed delay |
 | `CURIE_MAIL_INGRESS_ATTEMPTS` | `3` | short in-process attempts for transport ambiguity and retryable status; durable retry continues after this budget |
@@ -339,7 +343,8 @@ ingress HTTP status since process start. It never returns the token or its
 channel identity. The adapter cannot verify the signature: `ok` means the
 decoded expiry is in the future and no 401 has been observed, not proof that
 the platform will accept the token. A 401 latches rejection until a successful
-ingress response or process restart. `POST` to a probe path still requires the
+ingress response, installation of a replacement token by self-rotation, or
+process restart. `POST` to a probe path still requires the
 egress secret like every other POST.
 
 `curie cluster status --json` includes these diagnostics on the mail pod and
@@ -357,6 +362,96 @@ key supplying `CURIE_CHANNEL_TOKEN`, rolls the mail-adapter Deployment, and
 prints `exp` without printing the token. `curie doctor` reports the same `exp`
 and names that verb as the fix. No platform signing key is given to the adapter.
 
+## Self-rotation
+
+Set `CURIE_MAIL_SELF_ROTATE=true`, supply the initial `CURIE_CHANNEL_TOKEN` and
+`CURIE_ADAPTER_PRINCIPAL`, and keep `CURIE_MAIL_STATE_PATH` on the existing
+persistent journal volume. The principal must serve the channel token's binding.
+Set `CURIE_MAIL_CHANNEL_ADAPTER` to the binding's adapter identity when the inbox
+has more than one route. No platform key is given to the adapter. The default is
+`false`, which preserves manual renewal and creates no credential snapshot.
+
+The renewal loop starts independently of provider discovery and continues while
+ingress is disabled or the provider is unavailable. The principal renews when
+half its requested lifetime remains, leaving twelve hours for retries with the
+default 24-hour lifetime. The channel token renews when half its requested
+lifetime remains, up to five minutes before expiry.
+`POST /approvals/principals/adapter/rotate` presents the current principal alone;
+`POST /channels/token` presents that principal with `channels:token` scope.
+Successful responses replace credentials in memory. A channel mint immediately
+revokes its predecessor, so the adapter finishes any current ingress HTTP request
+before minting and holds new ingress requests until the new token is installed.
+Approval requests can finish using the predecessor principal until it expires.
+This serialization can delay ingress during renewal, without a restart. A turn's
+retry backoff does not delay credential renewal.
+The principal may lose deleted bindings when it rotates, provided its subject
+is unchanged, no binding is added, and it still serves the channel's binding.
+
+Renewal failures log an ERROR with credential kind, HTTP status, time to expiry
+and retry delay, never the credential or response body. Backoff starts at one
+second, doubles to sixty seconds, and is bounded by a quarter of the remaining
+lifetime. Renewal HTTP calls time out after five seconds. An expired principal
+cannot rotate itself; administrative recovery is required. `/readyz` returns 503
+when the channel token expires and, with self-rotation enabled, when the principal
+expires. `/healthz` stays 200. `/statusz` adds `self_rotation` with enabled state,
+principal expiry, readiness and `persistence_pending`. Provider sender checks are
+unchanged; self-rotation supplies no sender authentication.
+
+The snapshot is a separate SQLite file named by appending `.credentials.sqlite3`
+to `CURIE_MAIL_STATE_PATH`. Its file mode is 0600 and its owner must match the
+adapter process. Writes use SQLite's rollback journal and full synchronous commit;
+the delivery journal never stores credentials. On restart a valid snapshot for
+the same API, provider, inbox, binding and principal identity takes precedence:
+channel generation chooses the newer channel token, and expiry chooses the newer
+principal. An expired snapshot falls back to the supplied bootstrap credential.
+The restored principal may have fewer bindings than the bootstrap principal,
+under the same subject and channel-binding checks used during renewal.
+The adapter decodes claims for scheduling and identity matching only; the API
+verifies their signature and current generation. An unreadable, malformed,
+identity-mismatched or permissively readable snapshot refuses startup.
+
+The journal volume now holds bearer credentials. Restrict access to its directory,
+mounts, backups and snapshots as strictly as the original Secret. Anyone who can
+read it can act as this adapter; anyone who can write it is trusted to replace its
+credentials. Owner-only file permissions do not protect against a volume
+administrator. Keep one process per journal, including on a network filesystem.
+After a successful channel mint, a disk failure keeps the new token in memory
+because its predecessor is already revoked and reports `persistence_pending`.
+Storage retries use a quarter-second SQLite busy timeout. Further channel mints
+wait for a durable snapshot, while principal renewal continues because it
+revokes no predecessor. While a save is pending, storage retry backoff is also
+limited by the channel token's remaining lifetime: a quarter of the remaining
+positive lifetime, with a 0.1-second floor. After channel expiry, retries use the
+ordinary bounded backoff. A crash before durable commit can require administrative
+renewal if no persisted principal is still valid. Do not restore an older volume
+snapshot and assume its channel token is still current.
+
+The external Secret is a bootstrap input and is not patched. Updating an external
+secret store is optional and outside this feature. To recover administratively,
+stop the adapter, provision current credentials and remove only its credential
+snapshot before restarting; do not remove its delivery journal.
+
+On restore, the snapshot principal's bindings must be a subset of the startup
+principal's bindings. If an administrator reissues the startup principal without
+a binding still present in the snapshot, startup is refused. Stop the adapter,
+provision current credentials for its intended binding, and reset only the
+credential snapshot and its SQLite rollback journal before restarting:
+
+```bash
+rm -f -- "${CURIE_MAIL_STATE_PATH:?}.credentials.sqlite3" \
+  "${CURIE_MAIL_STATE_PATH:?}.credentials.sqlite3-journal"
+```
+
+Set `CURIE_MAIL_STATE_PATH` to the adapter's configured journal path before
+running this command. Preserve that delivery journal so pending deliveries and
+receipts survive recovery.
+
+The [ADR 0156 implementation note](../../docs/adr/evidence/0156-adapter-self-rotation/README.md)
+records the realized decision and its tests without changing Accepted history.
+Run the minute-long real API check with
+`uv run pytest apps/mail-adapter/integration/test_self_rotation.py -n 0 -q --reruns 0`.
+It owns and removes its backing-service containers; the caller supplies Docker.
+
 ## Operations notes
 
 - **Only first boot primes.** A new SQLite file lists the inbox and durably
@@ -367,8 +462,8 @@ and names that verb as the fix. No platform signing key is given to the adapter.
 - **Ingress is durable until terminal success.** Transport ambiguity, 202, 429
   (honoring `Retry-After`), 401 and server errors leave the same `delivery_id`
   pending. A documented terminal 200, including a 200 duplicate receipt, settles
-  it. Token rotation therefore restarts the single replica and resumes the
-  original row rather than losing it.
+  it. Manual token replacement restarts the single replica and resumes the
+  original row; opt-in self-rotation swaps credentials without restarting.
 - **A caller-list refusal is final; any other 403 is not.** The channel port
   answers 403 with `{"detail": "caller_not_allowed"}` when the binding's own
   caller list does not admit the sender (ADR 0175). The adapter settles that
@@ -404,9 +499,13 @@ and names that verb as the fix. No platform signing key is given to the adapter.
   bytes and SQLite pages are bounded before allocation. At capacity the adapter
   does not mark the provider message seen or evict older unresolved work; it
   leaves the message recoverable and logs back pressure.
-- **The `chn` token expires.** The adapter cannot re-mint it (that would need a
-  platform key it must not hold). It persists the ingress 401 and keeps the mail
-  pending; the operator re-mints the scoped token and rolls the pod.
+
+**Scoped credentials expire.** Self-rotation uses the adapter principal to renew
+its channel token and its own successor without a platform key. With the default
+manual mode, an ingress 401 leaves mail pending until the operator replaces the
+token and restarts the adapter. An expired principal needs administrative renewal
+in either mode.
+
 - **Logs are single-line JSON on stderr, and export is opt-in.** The adapter
   bootstraps the shared `curie-telemetry` service logger at start, so its output
   is one JSON object per record on stderr carrying `service.name:
@@ -429,13 +528,15 @@ and names that verb as the fix. No platform signing key is given to the adapter.
 
 The SQLite volume is sensitive application data. It can contain email addresses,
 provider message/thread identifiers, message or reply text needed for recovery,
-security decisions, and terminal delivery receipts. It contains no AgentMail
-key, channel token, egress secret, platform key, or platform database credential.
-Access to the PVC, its snapshots, and node-level backups is therefore access to
-mail content even though it is not credential access.
+security decisions, and terminal delivery receipts. The delivery journal contains
+no credentials. With self-rotation enabled, its separate credential snapshot on
+the same volume contains the channel token and adapter principal. Access to the
+volume, its snapshots and backups therefore grants access to both mail content
+and those bearer credentials. The AgentMail key, egress secret, platform key and
+platform database credentials are not persisted there.
 
 The application bounds live state by count and bytes, but the PVC and its backup
-retention are operator policy. Back up the SQLite file only with a
+retention are operator policy. Back up both SQLite files with a
 SQLite-consistent snapshot or after stopping the one writer. Restore the PVC
 before starting the Deployment. Rolling back to a binary older than the on-disk
 schema is refused; restore the pre-upgrade volume snapshot or roll forward
