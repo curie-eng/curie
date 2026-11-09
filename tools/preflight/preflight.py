@@ -736,20 +736,18 @@ def render_command(root: Path, check: Check, base: str, head: str) -> str:
     if check.job == "gitleaks":
         workflow = load_workflow(root, "gitleaks.yaml")
         image = workflow["jobs"]["gitleaks"]["env"]["GITLEAKS_IMAGE"]
-        command = command.replace('"${{ github.workspace }}:/repo"', shlex.quote(f"{root}:/repo"))
-        command = command.replace('"$GITLEAKS_IMAGE"', shlex.quote(image))
-        command = command.replace(
-            '${GITLEAKS_LOG_OPTS:+"$GITLEAKS_LOG_OPTS"}', shlex.quote(f"--log-opts={range_}")
+        return shlex.join(
+            [
+                "python3",
+                "tools/preflight/scan_history.py",
+                "--base",
+                base,
+                "--head",
+                head,
+                "--image",
+                image,
+            ]
         )
-        # A linked worktree's .git file points outside its checkout. Preserve
-        # those paths inside the scanner container so Git reads the same refs.
-        git_dir = Path(git(root, "rev-parse", "--absolute-git-dir"))
-        common_dir = Path(git(root, "rev-parse", "--path-format=absolute", "--git-common-dir"))
-        if git_dir != root / ".git":
-            mounts = " ".join(
-                f"-v {shlex.quote(f'{path}:{path}:ro')}" for path in sorted({git_dir, common_dir})
-            )
-            command = command.replace("docker run --rm", f"docker run --rm {mounts}", 1)
     return command
 
 
