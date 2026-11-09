@@ -756,14 +756,14 @@ jobs:
         run: uv lock --check
       - name: Sync workspace
         run: uv sync
-      - name: Explicit kube-context policy
-        run: |
-          uv run python3 scripts/check-kube-contexts.py --self-test
-          uv run python3 scripts/check-kube-contexts.py
       - name: API private import boundaries
         run: |
           uv run python3 scripts/check-private-imports.py --self-test
           uv run python3 scripts/check-private-imports.py
+      - name: Explicit kube-context policy
+        run: |
+          uv run python3 scripts/check-kube-contexts.py --self-test
+          uv run python3 scripts/check-kube-contexts.py
       # The CLI pytest list is generated from every test file, so a path
       # filter cannot tell when it is stale. This job has no if and feeds
       # the required Python aggregate. A stale list fails here, and the
