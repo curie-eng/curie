@@ -80,6 +80,8 @@ _RECOVERY_AUDIT_ACTION = approvals_crud.RECOVERY_AUDIT_ACTION
 _RECOVERY_AUTHORIZER = "approval_recovery"
 _AUTHORIZER = "HttpApprovalAnswer"
 _RESUME_REFUSED: Literal["resume_refused"] = "resume_refused"
+_RESUME_AUTHORITY_ATTEMPTS = 3
+_RESUME_AUTHORITY_BACKOFF_S = 0.05
 # The transaction-local setting and value that let a dynamic approval become
 # ``approved`` in storage. Only this owner's final commit sets it, after the
 # canonical-route judgment. Migration 0156 (``0156_dynamic_approval_answer_gate``,
@@ -111,6 +113,13 @@ def _deny() -> NoReturn:
 def _unavailable() -> NoReturn:
     """@spec HTTP-APPROVAL-CONTINUITY-9."""
     _refuse(503, "authority_unavailable")
+
+
+class _LifecycleGenerationConflict(HTTPException):
+    """A final verification found lifecycle churn before publication was authorized."""
+
+    def __init__(self) -> None:
+        super().__init__(503, "authority_unavailable", headers={"Cache-Control": "no-store"})
 
 
 def _definitive_refusal(group: BaseExceptionGroup[Any]) -> HTTPException | None:
@@ -745,11 +754,12 @@ class _Composition:
             current, binding = await _recapture(session, subject, writer=writer)
             if (
                 current.fingerprint != subject.capture.fingerprint
-                or current.authority.lifecycle_generation != self.final
                 or state.http_identity_runtime is not self.runtime
                 or state.http_identity_client is not self.client
             ):
                 _unavailable()
+            if current.authority.lifecycle_generation != self.final:
+                raise _LifecycleGenerationConflict()
             observed = source_facts(subject.response_bytes, subject.lookup, subject.credential)
             await _check_principal(session, subject, observed, self.applications[subject.role])
             source_permission(
@@ -1218,8 +1228,17 @@ def approved_resume_authority(state: Any) -> ApprovedResumeAuthority:
     @asynccontextmanager
     async def authority(saved: wire.ApprovalContextV1) -> AsyncIterator[CurrentResumeAuthority]:
         """@spec HTTP-APPROVAL-CONTINUITY-8/9/11."""
-        async with observe(saved) as current:
-            yield current.authority
+        for attempt in range(_RESUME_AUTHORITY_ATTEMPTS):
+            entered = False
+            try:
+                async with observe(saved) as current:
+                    entered = True
+                    yield current.authority
+                    return
+            except _LifecycleGenerationConflict:
+                if entered or attempt == _RESUME_AUTHORITY_ATTEMPTS - 1:
+                    raise
+            await asyncio.sleep(_RESUME_AUTHORITY_BACKOFF_S * (attempt + 1))
 
     return authority
 

@@ -824,6 +824,12 @@ settled sessions, and the resume reconciler re-drives resolutions whose resume
 turn never landed. Historical approvals with a null `expires_at` remain pending
 until settlement.
 
+An approved HTTP identity resume retries a final lifecycle-generation conflict with up to
+three complete fresh authority checks inline, waiting 50 ms then 100 ms between attempts;
+these retries end before any append is attempted. Exhausted pre-append refusals remain
+owed to the grace-based reconciler, while uncertain appends retain #4016 recovery on
+the next reconciler pass before grace; grace applies to the remaining owed wakes.
+
 - **A paused turn holds nothing.** The queue entry is acknowledged when the turn
   suspends; the resolution arrives later as its own queued turn. No stream entry, thread
   lock, or worker slot is held across a human's lunch break.
