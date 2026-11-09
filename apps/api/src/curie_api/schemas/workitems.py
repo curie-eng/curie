@@ -1,9 +1,9 @@
 import uuid
 from datetime import datetime
 from decimal import Decimal
-from typing import Literal
+from typing import Any, Literal
 
-from pydantic import AwareDatetime, BaseModel, ConfigDict
+from pydantic import AwareDatetime, BaseModel, ConfigDict, Field
 
 
 class IssueReadContextMint(BaseModel):
@@ -224,3 +224,56 @@ class WorkItemOutcomeList(BaseModel):
     items: list[WorkItemOutcomeOut]
     limit: int
     truncated: bool
+
+
+# Every answer the factory Slack steering route gives (#5414). Each refusal is
+# final for its delivery; only an unavailable code host answers 503.
+FactorySlackSteerOutcome = Literal[
+    "admitted",
+    "not_mapped",
+    "receipt_mismatch",
+    "sender_unverified",
+    "code_host_identity_missing",
+    "code_host_identity_ambiguous",
+    "code_host_identity_unsupported",
+    "code_host_mismatch",
+    "repository_mismatch",
+    "not_authorized",
+    "work_item_cancelled",
+    "lineage_closed",
+    "no_pull_request",
+    "pull_request_not_open",
+    "pull_request_branch_mismatch",
+    "authority_changed",
+    "objective_too_large",
+    "admission_refused",
+]
+
+
+class FactorySlackSteerIn(BaseModel):
+    """One threaded Slack mention in a factory run's root, as the worker consumed it.
+
+    ``receipt`` is the dispatcher's verified mention receipt
+    (``curie_internal.slack_mention_receipt.SlackMentionReceipt``), validated by
+    the route so a malformed one is a refusal, not a retry. ``author`` is the
+    turn's Slack user id; the receipt must name the same delivery, route and
+    sender.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    delivery_id: str = Field(min_length=1, max_length=256)
+    channel_identity: str = Field(min_length=1, max_length=256)
+    channel: str = Field(min_length=1, max_length=64)
+    root_ts: str = Field(min_length=1, max_length=64)
+    author: str = Field(min_length=1, max_length=64)
+    receipt: dict[str, Any]
+
+
+class FactorySlackSteerOut(BaseModel):
+    outcome: FactorySlackSteerOutcome
+    request_id: str | None = None
+    request_status: str | None = None
+    replayed: bool = False
+    pull_request_url: str | None = None
+    reason: str | None = None

@@ -99,8 +99,10 @@ def test_bitbucket_config_jira_pairs_and_github_refuses(kind: str) -> None:
 @pytest.mark.parametrize("kind", KINDS)
 def test_bitbucket_config_capabilities_are_exact(kind: str) -> None:
     adapter = _adapter(_entry(kind))
+    # Code host account login reads are GitHub only (#5414).
+    expected = {**EXPECTED_CAPABILITIES, Operation.ACCOUNT_LOGIN: Support.UNSUPPORTED}
 
-    assert dict(adapter.capabilities) == EXPECTED_CAPABILITIES
+    assert dict(adapter.capabilities) == expected
     assert dict(adapter.marked_comments.capabilities) == dict.fromkeys(
         MARKED_COMMENT_OPERATIONS, Support.SUPPORTED
     )

@@ -591,6 +591,13 @@ class GitHubRepositoryFake:
         self.review_comments: list[dict[str, Any]] = []
         self.reviews: list[dict[str, Any]] = []
         self.permissions: dict[str, tuple[int, str]] = {}
+        # Requested account id -> the `GET /user/{account_id}` payload (#5414).
+        # https://docs.github.com/en/rest/users/users#get-a-user-using-their-id
+        self.accounts: dict[str, dict[str, Any]] = {}
+        # The immutable id GitHub reports for this repository on both pull
+        # request sides (``head.repo.id``, ``base.repo.id``).
+        # https://docs.github.com/en/rest/pulls/pulls#get-a-pull-request
+        self.repository_id = REPO_ID
         self.branches: dict[str, str] = {}
         self.commits: dict[str, dict[str, Any]] = {}
         self.pulls: dict[int, dict[str, Any]] = {}
@@ -868,7 +875,7 @@ class GitHubRepositoryFake:
 
     def _pull_payload(self, number: int) -> dict[str, Any]:
         pull = self.pulls[number]
-        side = {"repo": {"id": REPO_ID, "full_name": REPO}}
+        side = {"repo": {"id": self.repository_id, "full_name": REPO}}
         return {
             "number": number,
             "node_id": f"PR_fixture_{number}",
@@ -920,6 +927,12 @@ class GitHubRepositoryFake:
         return self._read(request, path) or self._read_code(request, path)
 
     def _read(self, request: httpx.Request, path: str) -> httpx.Response | None:
+        account = re.fullmatch(r"/user/(\d+)", path)
+        if account:
+            payload = self.accounts.get(account[1])
+            if payload is None:
+                return httpx.Response(404, json={"message": "Not Found"})
+            return httpx.Response(200, json=payload)
         if path == f"/repos/{REPO}/issues/events":
             return self._page(request, sorted(self.events, key=lambda e: -e["id"]))
         if path == f"/repos/{REPO}/issues/comments":
