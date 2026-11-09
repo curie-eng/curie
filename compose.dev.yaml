@@ -753,6 +753,7 @@ services:
   # Use one dispatcher per app. This is why the service is behind the `slack`
   # profile and disabled by default.
   curie-gateway-replay-perms:
+    restart: "no"
     profiles: *core_profiles
     image: ${CURIE_DISPATCHER_IMAGE:-ghcr.io/curie-eng/curie-dispatcher:latest}
     user: "0:0"

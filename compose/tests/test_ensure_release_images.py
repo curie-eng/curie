@@ -51,13 +51,16 @@ class TestImageListIsDerivedFromCompose:
         assert "curie-api" in names
         assert "curie-worker-local" in names
 
-    def test_full_without_slack_does_not_require_dispatcher(self) -> None:
-        images = ensure.curie_images_for_profiles(
-            generated_compose(), profiles=("full",)
-        )
+    @pytest.mark.parametrize("profile", ["core", "full"])
+    def test_base_profile_requires_gateway_image_without_slack(self, profile: str) -> None:
+        compose = generated_compose()
+        images = ensure.curie_images_for_profiles(compose, profiles=(profile,))
         names = {ensure.image_short_name(image) for image in images}
-        assert "curie-dispatcher" not in names
-        assert "curie-ui" in names
+        assert "curie-dispatcher" in names
+        assert ("curie-ui" in names) == (profile == "full")
+        services = yaml.safe_load(compose)["services"]
+        assert profile in services["curie-channel-gateway"]["profiles"]
+        assert services["curie-dispatcher"]["profiles"] == ["slack"]
 
     def test_every_listed_image_has_a_build_spec(self) -> None:
         images = ensure.required_release_images(
