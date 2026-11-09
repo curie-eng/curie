@@ -14,9 +14,10 @@ build. The provider is [`tools/identity-e2e/fake_idp.py`](../../tools/identity-e
 and the scenarios are in [`tools/identity-e2e/identity_scenarios.py`](../../tools/identity-e2e/identity_scenarios.py),
 [`tools/identity-e2e/identity_scenarios_requester.py`](../../tools/identity-e2e/identity_scenarios_requester.py)
 and [`tools/identity-e2e/identity_scenarios_attestation.py`](../../tools/identity-e2e/identity_scenarios_attestation.py).
-The same scenarios on the Docker substrate, against an isolated `curie local up`
-stack, are in [Identity E2E on Docker](identity-e2e-docker.md), except
-`grant-attestation`, which needs the Kubernetes caller proxy.
+The Docker substrate runs one scenario, `requester-handoff-docker`, against an
+isolated `curie local up` stack; see [Identity E2E on Docker](identity-e2e-docker.md).
+Every other scenario here runs only on Kubernetes: the local tier has no caller
+proxy, and these scenarios reach the install through `kubectl`.
 
 ## What you need
 
@@ -24,6 +25,10 @@ stack, are in [Identity E2E on Docker](identity-e2e-docker.md), except
    fake model. Never use a shared or production context.
 2. `kubectl`, `helm`, `openssl` and `python3` on the host, and a `curie`
    binary (set `CURIE_BIN`, or have one on `PATH`). A source build works.
+   `openssl` must be OpenSSL 3 or later: the harness generates Ed25519 keys,
+   and the LibreSSL `openssl` that ships with macOS cannot, so `up` and
+   `tools/identity-e2e/tests` fail with `openssl genpkey -algorithm ed25519
+   exited 1`. Put an OpenSSL 3 binary first on `PATH`.
 3. The release's API, worker and runner images from the code under test.
 
 Every action takes `--context`, `--namespace`, `--release` and `--state-dir`.
