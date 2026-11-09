@@ -419,7 +419,10 @@ After a successful channel mint, a disk failure keeps the new token in memory
 because its predecessor is already revoked and reports `persistence_pending`.
 Storage retries use a quarter-second SQLite busy timeout. Further channel mints
 wait for a durable snapshot, while principal renewal continues because it
-revokes no predecessor. A crash before durable commit can require administrative
+revokes no predecessor. While a save is pending, storage retry backoff is also
+limited by the channel token's remaining lifetime: a quarter of the remaining
+positive lifetime, with a 0.1-second floor. After channel expiry, retries use the
+ordinary bounded backoff. A crash before durable commit can require administrative
 renewal if no persisted principal is still valid. Do not restore an older volume
 snapshot and assume its channel token is still current.
 
@@ -427,6 +430,21 @@ The external Secret is a bootstrap input and is not patched. Updating an externa
 secret store is optional and outside this feature. To recover administratively,
 stop the adapter, provision current credentials and remove only its credential
 snapshot before restarting; do not remove its delivery journal.
+
+On restore, the snapshot principal's bindings must be a subset of the startup
+principal's bindings. If an administrator reissues the startup principal without
+a binding still present in the snapshot, startup is refused. Stop the adapter,
+provision current credentials for its intended binding, and reset only the
+credential snapshot and its SQLite rollback journal before restarting:
+
+```bash
+rm -f -- "${CURIE_MAIL_STATE_PATH:?}.credentials.sqlite3" \
+  "${CURIE_MAIL_STATE_PATH:?}.credentials.sqlite3-journal"
+```
+
+Set `CURIE_MAIL_STATE_PATH` to the adapter's configured journal path before
+running this command. Preserve that delivery journal so pending deliveries and
+receipts survive recovery.
 
 The [ADR 0156 implementation note](../../docs/adr/evidence/0156-adapter-self-rotation/README.md)
 records the realized decision and its tests without changing Accepted history.
