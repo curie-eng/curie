@@ -17,13 +17,18 @@ class CaseIsolationError(RuntimeError):
     """The shared install is not in its verified clean baseline state."""
 
 
-LANGFUSE_EVENT_STREAMS = frozenset(
-    {"bull:ingestion-queue:events", "bull:otel-ingestion-queue:events"}
-)
+# The chart points Langfuse at the platform Valkey (REDIS_HOST, no key
+# prefix), and its BullMQ queues use BullMQ's default "bull:" keyspace. Those
+# keys belong to the trace backend, which writes them asynchronously while a
+# finished case's traces are ingested: a queue's event stream first appears
+# when a job is enqueued on it, which can land after a reset. They are not
+# factory state, and deleting them would corrupt Langfuse's queues. Curie
+# writes nothing under this prefix.
+TRACE_BACKEND_KEY_PREFIX = "bull:"
 
 
 def case_owned_streams(keys: set[str]) -> frozenset[str]:
-    return frozenset(keys) - LANGFUSE_EVENT_STREAMS
+    return frozenset(key for key in keys if not key.startswith(TRACE_BACKEND_KEY_PREFIX))
 
 
 @dataclass(frozen=True)

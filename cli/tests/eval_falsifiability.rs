@@ -128,6 +128,7 @@ fn done_turn(text: &str) -> Vec<OutboundEvent> {
 #[derive(Debug, Deserialize)]
 struct Fixtures {
     exemplars: BTreeMap<String, String>,
+    exemplar_tools: BTreeMap<String, Vec<String>>,
     paraphrases: BTreeMap<String, Vec<String>>,
     counterexamples: BTreeMap<String, Vec<String>>,
     input_satisfiable_baseline: BTreeSet<String>,
@@ -271,7 +272,8 @@ fn no_committed_case_is_input_satisfiable_beyond_the_baseline() {
 /// must have an exemplar, and every exemplar must map to a real case.
 #[test]
 fn every_grader_greens_on_its_known_good_exemplar() {
-    let exemplars = fixtures().exemplars;
+    let fixtures = fixtures();
+    let exemplars = &fixtures.exemplars;
     let mut keys: BTreeSet<String> = BTreeSet::new();
     let mut red: Vec<String> = Vec::new();
 
@@ -282,9 +284,19 @@ fn every_grader_greens_on_its_known_good_exemplar() {
             let Some(exemplar) = exemplars.get(&key) else {
                 continue; // missing-exemplar completeness is asserted below
             };
-            // Grade the exemplar through the same pass condition the runner path
-            // uses (a completed `done` turn whose final text is the exemplar).
-            if !turn_passes(case, &done_turn(exemplar)) {
+            // Text and tool-note fixtures use the same completed-turn grader as live evals.
+            let mut events = done_turn(exemplar);
+            for tool in fixtures.exemplar_tools.get(&key).into_iter().flatten() {
+                events.insert(
+                    0,
+                    OutboundEvent::ToolNote {
+                        version: PROTOCOL_VERSION.into(),
+                        text: format!("calling {tool}"),
+                        tool: Some(tool.clone()),
+                    },
+                );
+            }
+            if !turn_passes(case, &events) {
                 red.push(format!(
                     "{key} -> exemplar {exemplar:?} does NOT satisfy its grader"
                 ));
