@@ -169,7 +169,7 @@ async def _check_credential_current(request: Request, agent_id: uuid.UUID, cred:
         return
     if not isinstance(cred, str) or _CREDENTIAL_ID.fullmatch(cred) is None:
         raise HTTPException(status.HTTP_403_FORBIDDEN, "sandbox credential is not recognized")
-    client: redis.Redis = request.app.state.valkey
+    client: redis.Redis = request.app.state.credential_valkey
     try:
         for attempt in range(4):
             try:

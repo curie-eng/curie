@@ -177,6 +177,8 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     app.state.pod_lister = build_lazy_pod_lister(settings.kube_config_path)
     valkey: redis.Redis = AsyncRedis.from_url(settings.valkey_dsn())
     app.state.valkey = valkey
+    credential_valkey = AsyncRedis.from_url(settings.valkey_dsn(), retry_reads=False)
+    app.state.credential_valkey = credential_valkey
     app.state.kill_switch = KillSwitch(valkey)
     app.state.thread_reset_requests = ThreadResetRequests(valkey)
     app.state.eval_queue = EvalQueue(valkey)
@@ -474,6 +476,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
                 except asyncio.CancelledError:
                     pass
             try:
+                await credential_valkey.aclose()
                 await valkey.aclose()
                 await http_client.aclose()
                 await engine.dispose()

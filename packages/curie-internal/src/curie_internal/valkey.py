@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import time
-from typing import Any
+from typing import Any, Self, cast
 
 import redis
 import redis.asyncio as aioredis
@@ -133,6 +133,12 @@ class AsyncRedis(aioredis.Redis):
         super().__init__(*args, **kwargs)
         self.set_retry(AsyncRetry(NoBackoff(), 0))
         self._retry_reads = retry_reads
+
+    @classmethod
+    def from_url(cls, url: str, *, retry_reads: bool = True, **kwargs: Any) -> Self:
+        client = cast(Self, super().from_url(url, **kwargs))
+        client._retry_reads = retry_reads
+        return client
 
     async def execute_command(self, *args: Any, **options: Any) -> Any:
         retries = len(_BACKOFF_S) if self._retry_reads and _is_read(args) else 0
