@@ -564,7 +564,7 @@ class SourceCapture:
     policy: AgentRolePolicyV1 | None
     policy_version: int | None
     retained_group: tuple[str, str] | None
-    identity_independent: bool
+    allows_unavailable_identity: bool
 
 
 @dataclass(frozen=True)
@@ -817,7 +817,7 @@ async def capture_source(
         group = (idp.issuer, team.external_id)
         team_state = (str(team.id), team.managed_by, team.external_id, team.epoch, team.digest,
                       team.last_synced_at.isoformat())
-    identity_independent = (
+    allows_unavailable_identity = (
         role == "invocation" and group is None
         and (role_config is None or role_config.filter is None)
         and agent.connector_requester_identity is False
@@ -836,13 +836,13 @@ async def capture_source(
         "invocation_team": str(team_id),
         "approver_team": None if policy_row is None else str(policy_row.approver_team_id),
         "sql_null": sql_null, "team": team_state,
-        "identity_independent": identity_independent,
+        "allows_unavailable_identity": allows_unavailable_identity,
         "registration": registration.model_dump(mode="json"),
     }, sort_keys=True, separators=(",", ":"))
     return SourceCapture(
         principal_authority.AuthorityCapture(config, idp.lifecycle_generation), agent.id,
         fingerprint, source.sender, policy,
-        None if policy_row is None else policy_row.version, group, identity_independent,
+        None if policy_row is None else policy_row.version, group, allows_unavailable_identity,
     ), binding
 
 
@@ -889,15 +889,14 @@ def source_permission(
     """@spec HTTP-INVOCATION-EXECUTION-5/15 HTTP-APPROVAL-CONTINUITY-8."""
     if not admission.admit(binding, [capture.sender.native_id]).allowed:
         _deny()
-    if (
-        role_name == "invocation" and capture.identity_independent
-        and (original is None or original.canonical is None)
-    ):
-        if capture.policy_version is None:
+    if facts is None:
+        if (
+            role_name != "invocation" or not capture.allows_unavailable_identity
+            or (original is not None and original.canonical is not None)
+            or capture.policy_version is None
+        ):
             _unavailable()
         return
-    if facts is None:
-        _unavailable()
     role = None if capture.policy is None else getattr(capture.policy.roles, role_name)
     raw = role is not None and role.legacy_state == "migrated" and role.filter is not None and any(
         isinstance(entry, SurfaceAccountSelectorV1)
@@ -919,7 +918,10 @@ def source_permission(
         )
         if result.status != "match":
             _deny()
-    if original is not None and facts.outcome == "resolved":
+    if original is not None and facts.outcome == "resolved" and not (
+        role_name == "invocation" and capture.allows_unavailable_identity
+        and original.canonical is None
+    ):
         identity = facts.identity
         assert identity is not None
         association_matches = original.canonical is not None and (
@@ -954,8 +956,8 @@ class CurrentHttpInvocation:
     _stable: str = field(repr=False)
     _validity: DeliveryValidityWindow = field(repr=False)
     _response_bytes: bytes = field(repr=False)
-    _lookup: LookupRequestV1 | None = field(repr=False)
-    _credential: ResolvedProviderCredential | None = field(repr=False)
+    _lookup: LookupRequestV1 = field(repr=False)
+    _credential: ResolvedProviderCredential = field(repr=False)
     _source: AuthenticatedSource = field(repr=False)
     _client: HttpIdentityClient = field(repr=False)
     _original: codec.InvocationContextV1 | None = field(repr=False)
@@ -1157,33 +1159,31 @@ async def current_source_authority(
                 async with factory() as session, session.begin():
                     await identity_fence.lock_identity_reader(session)
                     captured, _ = await capture_source(session, registration, source)
-                    credential: ResolvedProviderCredential | None = None
-                    if not captured.identity_independent or (
+                    resolved = runtime._providers.resolve(captured.authority.configuration)
+                    if not isinstance(resolved, ResolvedProviderCredential):
+                        _unavailable()
+                    credential = resolved
+                lookup = lookup_request(registration, captured, credential, purpose="invocation")
+                observed = await client.lookup(
+                    target=credential.target, bearer=credential.bearer, request=lookup,
+                    limits=credential.limits, deadline=deadline,
+                )
+                observation: HttpIdentityObservation | None
+                if isinstance(observed, HttpIdentityObservation):
+                    observation = observed
+                elif (
+                    isinstance(observed, FactsRefusal) and observed.code == "unavailable"
+                    and loop.time() < deadline
+                ):
+                    if _attempt + 1 < _COMPOSITION_ATTEMPTS:
+                        continue
+                    if not captured.allows_unavailable_identity or (
                         original is not None and original.canonical is not None
                     ):
-                        resolved = runtime._providers.resolve(captured.authority.configuration)
-                        if not isinstance(resolved, ResolvedProviderCredential):
-                            _unavailable()
-                        credential = resolved
-                lookup = None
-                observation: HttpIdentityObservation | None = None
-                if credential is not None:
-                    lookup = lookup_request(
-                        registration, captured, credential, purpose="invocation",
-                    )
-                    observed = await client.lookup(
-                        target=credential.target, bearer=credential.bearer, request=lookup,
-                        limits=credential.limits, deadline=deadline,
-                    )
-                    if not isinstance(observed, HttpIdentityObservation):
-                        if (
-                            isinstance(observed, FactsRefusal)
-                            and observed.code == "unavailable"
-                            and loop.time() < deadline
-                        ):
-                            continue
                         _unavailable()
-                    observation = observed
+                    observation = None
+                else:
+                    _unavailable()
                 async with identity_fence.mutation(factory, valkey) as writer:
                     async with writer.begin():
                         current, _ = await capture_source(
@@ -1196,7 +1196,6 @@ async def current_source_authority(
                                 "unresolved", None, None, current.authority.lifecycle_generation,
                             )
                         else:
-                            assert lookup is not None and credential is not None
                             source_facts(observation.response_bytes, lookup, credential)
                             application = await principal_authority.apply_http_principal(
                                 writer, capture=captured.authority, request=lookup,
@@ -1230,7 +1229,6 @@ async def current_source_authority(
                         raise _StaleCapture
                     facts = None
                     if observation is not None:
-                        assert lookup is not None and credential is not None
                         facts = source_facts(observation.response_bytes, lookup, credential)
                     if application.principal_id is not None:
                         principal = await session.get(Principal, application.principal_id)
@@ -1265,7 +1263,6 @@ async def current_source_authority(
                             seconds, micros, seconds + upper_seconds, upper_micros,
                         )
                     else:
-                        assert credential is not None
                         validity = identity_delivery_window(facts, credential.limits)
                     principal_ref = None
                     if application.principal_id is not None:
@@ -1616,8 +1613,6 @@ async def revalidate_http_approval_caller(
         if original_requester:
             _unavailable()
         return
-    if caller._lookup is None or caller._credential is None:
-        _unavailable()
     facts = source_facts(caller._response_bytes, caller._lookup, caller._credential)
     if caller._application.principal_id is not None:
         principal = await writer.get(

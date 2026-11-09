@@ -95,7 +95,7 @@ def synthetic_provider(tmp_path: Path) -> Iterator[SimpleNamespace]:
     stop, ready = threading.Event(), threading.Event()
     provider = SimpleNamespace(
         member=True, requests=[], responses=[], errors=[], during_lookup=None, unavailable=False,
-        unavailable_purpose=None,
+        unavailable_purpose=None, result_case=None,
     )
 
     async def serve() -> None:
@@ -146,6 +146,25 @@ def synthetic_provider(tmp_path: Path) -> Iterator[SimpleNamespace]:
                         "observation": observation,
                     },
                 )
+                if provider.result_case is not None:
+                    if provider.result_case == "conflicting_kind":
+                        response["identity"]["kind"] = "service"
+                    else:
+                        shape = next(case["response"] for case in VECTORS["cases"]
+                                     if case["name"] == provider.result_case)
+                        response["outcome"] = shape["outcome"]
+                        response["sender_kind"] = shape["sender_kind"]
+                        if shape["identity"] is None:
+                            response["identity"] = None
+                        else:
+                            response["identity"].update(
+                                kind=shape["identity"]["kind"],
+                                account_status=shape["identity"]["account_status"],
+                            )
+                        if shape["membership"] is None:
+                            response["membership"] = None
+                        if shape["identity_observation"] is None:
+                            response["identity_observation"] = None
                 provider.requests.append(request)
                 provider.responses.append(copy.deepcopy(response))
                 writer.write(harness.wire(json.dumps(response).encode()))
@@ -719,6 +738,12 @@ def test_unavailable_directory_only_blocks_group_restricted_invocation(
                 assert valkey.xlen(runs_stream) == 0
                 assert _keys(valkey, scope["binding"]) == set()
                 assert provider.requests
+                provider.unavailable = False
+                recovered = _post(client, token, *_submission(scope))
+                assert recovered.status_code == 200, recovered.text
+                entries = valkey.xrange(runs_stream)
+                assert len(entries) == 1
+                assert QueuedTurn.model_validate_json(entries[0][1]["payload"]).author_principal
             else:
                 assert result.status_code == 200, result.text
                 entries = valkey.xrange(runs_stream)
@@ -726,7 +751,7 @@ def test_unavailable_directory_only_blocks_group_restricted_invocation(
                 queued = QueuedTurn.model_validate_json(entries[0][1]["payload"])
                 assert queued.author == SENDER
                 assert queued.author_principal is None
-                assert provider.requests == []
+                assert 2 <= len(provider.requests) <= 3
                 from apps.api.tests import test_http_turn_authority as authority
 
                 fields = entries[0][1]
@@ -742,16 +767,19 @@ def test_unavailable_directory_only_blocks_group_restricted_invocation(
                     payload=fields["payload"],
                 )
                 check = authority.request_for(invocation)
+                before = len(provider.requests)
                 authority.assert_response(
                     authority.post_check(client, check), check,
                     decision="continue", reason="current_authority",
                 )
+                assert len(provider.requests) > before
                 from apps.api.tests import test_http_approval_creation as creation
 
                 invocation.request = creation.request_for(invocation)
+                before = len(provider.requests)
                 pending = creation.accepted(creation.post(invocation), invocation.request)
                 assert pending["status"] == "pending"
-                assert provider.requests == []
+                assert len(provider.requests) > before
                 from apps.api.tests import test_http_approval_answers as answers
 
                 invocation.row = creation.rows(invocation.request["approval"]["dedupe_key"])[0]
@@ -834,13 +862,105 @@ def test_open_invocation_keeps_other_authorization_requirements(
             if restriction == "native":
                 assert result.status_code == 403, result.text
                 assert result.json() == {"detail": "caller_not_allowed"}
-                assert provider.requests == []
+                assert provider.requests
             else:
                 assert result.status_code == 503, result.text
                 assert result.json() == {"detail": "identity_authority_unavailable"}
                 assert provider.requests
             assert valkey.xlen(runs_stream) == 0
             assert _keys(valkey, scope["binding"]) == set()
+    finally:
+        keys = _keys(valkey, scope["binding"])
+        if keys:
+            valkey.delete(*keys)
+
+
+@pytest.mark.parametrize("result_case,status", [
+    ("unresolved-human", 403),
+    ("unresolved-unknown", 403),
+    ("inactive-human-disabled", 403),
+    ("inactive-human-revoked", 403),
+    ("resolved-service-active", 403),
+    ("resolved-agent-active", 403),
+    ("conflicting_kind", 503),
+    ("resolved-human-active", 200),
+])
+def test_open_binding_honors_definitive_directory_facts(
+    clean_db: None, valkey: redis.Redis, runs_stream: str,
+    synthetic_provider: SimpleNamespace, result_case: str, status: int,
+) -> None:
+    provider = synthetic_provider
+    provider.result_case = result_case
+    scope = _scope(provider.url, group_role="approver")
+    try:
+        with TestClient(create_app(
+            http_identity_runtime=_runtime(_runtime_api(), scope),
+            http_identity_client=HttpIdentityClient(tls_context=provider.tls),
+        )) as client:
+            credential = _credential(client, scope)
+            result = _post(client, credential, *_submission(scope))
+            assert result.status_code == status, result.text
+            assert len(provider.requests) == 1
+            if status == 200:
+                entries = valkey.xrange(runs_stream)
+                assert len(entries) == 1
+                queued = QueuedTurn.model_validate_json(entries[0][1]["payload"])
+                assert queued.author_principal is not None
+            else:
+                assert valkey.xlen(runs_stream) == 0
+                assert _keys(valkey, scope["binding"]) == set()
+    finally:
+        keys = _keys(valkey, scope["binding"])
+        if keys:
+            valkey.delete(*keys)
+
+
+@pytest.mark.parametrize("surface", ["partner", "email"])
+def test_open_trusted_surface_requires_a_directory_human(
+    clean_db: None, valkey: redis.Redis, runs_stream: str,
+    synthetic_provider: SimpleNamespace, surface: str,
+) -> None:
+    from apps.api.tests import test_http_email_receivers as email
+    from apps.api.tests import test_http_trusted_partner_namespaces as partner
+
+    provider = synthetic_provider
+    if surface == "email":
+        scope = email._email_scope(provider.url)
+
+        async def open_invocation(factory: async_sessionmaker[AsyncSession]) -> None:
+            async with factory() as session, session.begin():
+                await agent_role_policy.apply_role_change(session, change=change(
+                    uuid.UUID(scope["tenant"]), uuid.UUID(scope["agent"]),
+                    version=scope["slack"]["role_version"], filter=None,
+                ))
+
+        run(open_invocation)
+        runtime = email._email_runtime(_runtime_api(), scope)
+    else:
+        scope = _scope(provider.url, group_role="approver")
+        scope["trusted"] = (partner.partner_entry(),)
+        runtime = _runtime(_runtime_api(), scope)
+    try:
+        with TestClient(create_app(
+            http_identity_runtime=runtime,
+            http_identity_client=HttpIdentityClient(tls_context=provider.tls),
+        )) as client:
+            credential = (
+                email._email_credential(client, scope) if surface == "email"
+                else _credential(client, scope)
+            )
+            for result_case, status in (("unresolved-human", 403), ("resolved-human-active", 200)):
+                provider.result_case = result_case
+                if surface == "email":
+                    body = email._body()
+                    result = email._post(client, credential, body, email._proof(scope, body))
+                else:
+                    result = _post(client, credential, *_submission(
+                        scope, slack=partner.connect_mention(),
+                    ))
+                assert result.status_code == status, result.text
+                assert valkey.xlen(runs_stream) == (1 if status == 200 else 0)
+            assert len(provider.requests) == 2
     finally:
         keys = _keys(valkey, scope["binding"])
         if keys:
