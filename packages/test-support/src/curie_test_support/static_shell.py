@@ -49,7 +49,7 @@ def claim_archive(
     body = dict(
         manifest
         or {
-            "v": 1,
+            "v": 2,
             "claim": claim,
             "generation": generation,
             "env": dict(env),

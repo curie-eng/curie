@@ -1502,7 +1502,7 @@ def test_an_image_path_the_runner_could_write_stops_the_shell(tls: ShellTls) -> 
 
 
 _PERMISSION_PROBE = b"""
-import hashlib, json, os, stat, sys
+import hashlib, json, os, sys
 from pathlib import Path
 bundle = Path(os.environ["CURIE_PLUGIN_DIR"])
 code = bundle / "immutable.py"
@@ -1517,11 +1517,9 @@ for operation in ("write", "chmod"):
         result[operation + "_refused"] = True
     else:
         result[operation + "_refused"] = False
-credential = Path(os.environ["HOME"]).parent / "runner-environment.json"
-info = credential.stat()
-value = json.loads(credential.read_text())["EXTERNAL_API_TOKEN"]
-result.update(credential_uid=info.st_uid, credential_mode=stat.S_IMODE(info.st_mode),
-              credential_read=(value == os.environ["EXTERNAL_API_TOKEN"]),
+credential = Path(os.environ["HOME"]) / "runner-environment.json"
+value = os.environ["EXTERNAL_API_TOKEN"]
+result.update(bootstrap_consumed=not credential.exists(),
               credential_digest=hashlib.sha256(value.encode()).hexdigest())
 Path(os.environ["HOME"], "permissions.json").write_text(json.dumps(result))
 os.execv(sys.executable, [sys.executable, "-m", "curie_runner"])
@@ -1630,9 +1628,7 @@ def test_runner_cannot_modify_bundle_code_and_can_read_its_claim_credentials(
             "runner_uid": 1000,
             "write_refused": True,
             "chmod_refused": True,
-            "credential_uid": 1000,
-            "credential_mode": 0o400,
-            "credential_read": True,
+            "bootstrap_consumed": True,
             "credential_digest": hashlib.sha256(source.read_bytes()).hexdigest(),
         }
         client.delete_claim("permissions", request_timeout_seconds=20)

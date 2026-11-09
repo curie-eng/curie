@@ -255,7 +255,7 @@ def prepare(
         for private in (home, tmp):
             private.mkdir()
             _own(private, uid, gid, dir_mode=0o700, file_mode=0o600)
-        environment = root / CLAIM_ENV_FILE
+        environment = home / CLAIM_ENV_FILE
         fd = os.open(environment, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o400)
         with os.fdopen(fd, "w", encoding="utf-8") as stream:
             json.dump({k: v for k, v in manifest.env.items() if k not in _OWNED_ENV}, stream)

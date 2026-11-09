@@ -1,4 +1,4 @@
-"""Load this claim's private environment, then execute its runner command."""
+"""Consume this claim's private environment, then execute its runner command."""
 
 from __future__ import annotations
 
@@ -32,6 +32,7 @@ def claim_environment(environ: dict[str, str]) -> dict[str, str]:
     ):
         raise ValueError("claim environment must contain environment names and string values")
     env = {k: v for k, v in environ.items() if k != CLAIM_ENV_FILE_ENV}
+    path.unlink()
     return {**env, **value}
 
 

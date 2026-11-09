@@ -29,7 +29,7 @@ PROXY_PREFIX = "/c"
 # size on disk, so no decompression ratio has to be trusted.
 ARCHIVE_MEDIA_TYPE = "application/x-tar"
 MANIFEST_NAME = "claim.json"
-MANIFEST_VERSION = 1
+MANIFEST_VERSION = 2
 BUNDLE_DIR = "bundle"
 WORKSPACE_DIR = "workspace"
 ATTACHMENTS_DIR = "attachments"

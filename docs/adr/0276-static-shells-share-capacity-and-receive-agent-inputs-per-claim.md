@@ -25,8 +25,16 @@ selection and credential handling remain unchanged.
 
 The worker sends agent-specific runtime configuration and credentials in each
 claim archive. The root supervisor writes runner-owned mode `0400` files in
-the fresh claim tree. Its launcher restores a new environment before executing
-the runner, which retains the existing BootEnv parser and held-secret inventory.
+the fresh claim tree. Its launcher reads and unlinks the bootstrap file before
+executing the runner, which retains the existing BootEnv parser and held-secret
+inventory. The bootstrap lives under the private claim home so the runner UID
+can unlink it. Keeping it would let same-UID bundle subprocesses recover
+platform caller and route tokens after the runner removed their environment
+names. Scoped upload token files remain available for bundle upload commands.
+Claim manifest version 2 requires matched worker and supervisor implementations.
+Older peers reject it rather than serving a shared claim through old shell
+credential defaults. Version 1 is not retained as a compatibility path.
+
 The worker's `CURIE_AGENT_CREDENTIAL_FILES` declaration supplies named external
 tool credentials from files without changing the frozen bundle format.
 
