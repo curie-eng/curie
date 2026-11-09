@@ -736,11 +736,15 @@ def _implementer_tool_call(
     )
 
 
-def _nested_reviewer_message(parent_call_id: str) -> AssistantMessage:
+def _nested_reviewer_message(
+    parent_call_id: str,
+    *,
+    usage: dict[str, Any] | None = _REVIEWER_USAGE,
+) -> AssistantMessage:
     return AssistantMessage(
         content=[TextBlock(text=_REVIEWER_TEXT)],
         model=_REVIEWER_MODEL,
-        usage=_REVIEWER_USAGE,
+        usage=usage,
         parent_tool_use_id=parent_call_id,
     )
 
@@ -949,54 +953,78 @@ def test_reviewer_generation_exports_during_agent_tool() -> None:
         assert private_value not in material
 
 
-def test_result_only_usage_with_reviewer_exports_implementer_total_minus_nested() -> None:
-    """Review feedback on #5206: reviewer usage must not hide the implementer's.
+def test_result_only_usage_with_reviewer_exports_implementer_total_in_full() -> None:
+    """Review feedback on #5206: the ResultMessage total is main-loop only.
 
-    The implementer's provider sends no per-message usage, so the turn's tokens
-    reach the trace only through the ResultMessage fallback. A nested reviewer
-    generation with its own counts never suppresses that fallback; the stamped
-    total excludes the reviewer tokens already exported on the nested span,
-    because the SDK's ResultMessage turn total includes nested subagent usage
-    (the same semantics ``usage_report._split`` books by). Nothing is counted
-    twice: the generation spans sum to the ResultMessage total.
+    The implementer's provider sends no per-message usage, so the turn's
+    main-loop tokens reach the trace only through the ResultMessage fallback.
+    A nested reviewer generation with its own counts never suppresses that
+    fallback, and the stamped total is the ResultMessage total unchanged:
+    ``ResultMessage.usage`` is a main-loop-only total -- the bundled CLI's turn
+    accumulator skips nested assistant messages carrying
+    ``parent_tool_use_id`` before accumulating, and the Python SDK forwards
+    the stamped accumulator unchanged -- so no reviewer count is subtracted
+    and nothing is clamped, even where the reviewer reported more than the
+    implementer (the cache counters below). The reviewer span keeps its own
+    counts, so the exported generations sum to the implementer total plus the
+    reviewer counts. All four counters are covered.
     """
 
+    reviewer_usage: dict[str, Any] = {
+        "input_tokens": 20,
+        "output_tokens": 2,
+        "cache_read_input_tokens": 8,
+        "cache_creation_input_tokens": 6,
+    }
+    implementer_total: dict[str, Any] = {
+        "input_tokens": 30,
+        "output_tokens": 5,
+        "cache_read_input_tokens": 3,
+        "cache_creation_input_tokens": 4,
+    }
     script: list[object] = [
         _implementer_tool_call(_AGENT_CALL_ID, "Agent", usage=None),
-        _nested_reviewer_message(_AGENT_CALL_ID),
+        _nested_reviewer_message(_AGENT_CALL_ID, usage=reviewer_usage),
         _tool_result(_AGENT_CALL_ID),
         AssistantMessage(
             content=[TextBlock(text="final answer")],
             model="observed-model",
             usage=None,
         ),
-        _result(text="done", usage={"input_tokens": 30, "output_tokens": 5}),
+        _result(text="done", usage=implementer_total),
     ]
     _, finished = _export_turn(_adapter_session_factory(script))
     generations = _spans_by_name(finished)["llm.generation"]
 
     assert len(generations) == 3
     implementer_first, reviewer, implementer_second = generations
-    assert reviewer.attributes["gen_ai.usage.input_tokens"] == 20
-    assert reviewer.attributes["gen_ai.usage.output_tokens"] == 2
+    for field, expected in reviewer_usage.items():
+        assert reviewer.attributes[f"gen_ai.usage.{field}"] == expected
     # The first implementer round saw no usage at all; only the final
     # generation receives the ResultMessage fallback stamp.
     assert not any(key.startswith("gen_ai.usage.") for key in implementer_first.attributes)
     assert _SCOPE not in implementer_first.attributes
     assert _SCOPE not in reviewer.attributes
-    assert implementer_second.attributes["gen_ai.usage.input_tokens"] == 10
-    assert implementer_second.attributes["gen_ai.usage.output_tokens"] == 3
+    # The main-loop total is stamped in full: no subtraction, no clamp, even
+    # though the reviewer reported more cache tokens than the implementer did.
+    for field, expected in implementer_total.items():
+        assert implementer_second.attributes[f"gen_ai.usage.{field}"] == expected
     assert implementer_second.attributes[_SCOPE] == "turn"
-    # No double counting: the exported generations sum to the turn total.
+    # The reviewer's own counts are exported once, on their own span, so the
+    # generations sum to the implementer total plus the reviewer counts.
     assert (
         sum(
             span.attributes.get("gen_ai.usage.input_tokens", 0) for span in generations
         )
-        == 30
+        == implementer_total["input_tokens"] + reviewer_usage["input_tokens"]
     )
     assert (
-        sum(span.attributes.get("gen_ai.usage.output_tokens", 0) for span in generations)
-        == 5
+        sum(
+            span.attributes.get("gen_ai.usage.cache_creation_input_tokens", 0)
+            for span in generations
+        )
+        == implementer_total["cache_creation_input_tokens"]
+        + reviewer_usage["cache_creation_input_tokens"]
     )
 
 
