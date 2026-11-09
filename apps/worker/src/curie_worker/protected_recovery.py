@@ -723,6 +723,7 @@ _WAIT_HASH_FIELDS = frozenset(
         "notice_pending",
         "expiry_notice_pending",
         "ever_granted",
+        "wait_reason",
     }
 )
 

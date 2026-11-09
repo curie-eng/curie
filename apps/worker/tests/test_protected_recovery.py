@@ -67,6 +67,15 @@ def test_delivery_graveyard_is_closed_diagnostic_preserving_original_strings():
         parse_graveyard_fields({**fields, "dl_dl_authority": "unrecognized"})
 
 
+def test_wait_reason_is_an_allowlisted_scheduling_field():
+    from curie_worker.protected_recovery import _WAIT_HASH_FIELDS
+
+    assert "wait_reason" in _WAIT_HASH_FIELDS
+    recorded = {name: "1" for name in _WAIT_HASH_FIELDS}
+    assert set(recorded) <= _WAIT_HASH_FIELDS
+    assert not set(recorded | {"unexpected": "1"}) <= _WAIT_HASH_FIELDS
+
+
 def test_graveyard_without_complete_original_bytes_is_not_replayable():
     from curie_worker.protected_recovery import parse_graveyard_fields
     with pytest.raises(RecoveryUnavailable):

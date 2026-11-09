@@ -5962,3 +5962,110 @@ def test_live_worker_lock_still_serializes_a_replacement(make_harness) -> None:
             await live_lock.release(h.config.lock_key(_thread_key(thread)), live_token)
 
     asyncio.run(go())
+
+_PREDECESSOR_NOTICE = "Your request is queued while an earlier message on this thread finishes."
+_ADMISSION_NOTICE = "Your request is queued while sandbox admission is pending."
+
+
+async def _wake_parked(h: Any, consumer: Consumer, event_id: str) -> tuple[str, dict[str, str]]:
+    await h.async_redis.zadd(consumer._waits._due, {event_id: 0})
+    assert await consumer._waits.wake_due() == 1
+    rows = await h.async_redis.xreadgroup(
+        h.config.consumer_group,
+        h.config.consumer_name,
+        {h.config.stream: ">"},
+        count=1,
+    )
+    assert len(rows[0][1]) == 1
+    return rows[0][1][0]
+
+
+def test_predecessor_wait_notice_names_the_earlier_message(make_harness) -> None:
+    async def go() -> None:
+        async with make_harness(
+            slack_no_edit_streaming=True,
+            claim_timeout_seconds=0.05,
+        ) as h:
+            consumer = _capacity_consumer(h)
+            await consumer.ensure_group()
+            first = _qevent("first", event_id="predecessor-first")
+            second = _qevent("second", event_id="predecessor-second", placeholder="p-2")
+            await _pending_local_entry(h, first)
+            entry, fields = await _pending_local_entry(h, second)
+            await consumer._sem.acquire()
+            await consumer._handle(entry, fields)
+            record = await consumer._waits.get(second.event_id)
+            assert record is not None
+            assert record.state == "waiting"
+            assert h.sink.updates[-1] == ("C1", "p-2", _PREDECESSOR_NOTICE)
+            assert "sandbox admission" not in h.sink.updates[-1][2]
+            assert record.wait_reason == "thread_predecessor"
+            assert record.cause == ""
+            assert record.deferrals == 1
+            assert record.first_wait_ms < record.deadline_ms
+            assert h.runner.opened == []
+            assert not await h.async_redis.exists(h.config.done_key(second.event_id))
+
+    asyncio.run(go())
+
+
+def test_wait_cause_change_updates_the_notice_until_the_answer(make_harness) -> None:
+    async def go() -> None:
+        async with make_harness(
+            slack_no_edit_streaming=True,
+            claim_timeout_seconds=0.05,
+        ) as h:
+            consumer = _capacity_consumer(h)
+            await consumer.ensure_group()
+            first = _qevent("first", event_id="cause-first")
+            second = _qevent("second", event_id="cause-second", placeholder="p-2")
+            first_entry, first_fields = await _pending_local_entry(h, first)
+            second_entry, second_fields = await _pending_local_entry(h, second)
+            await consumer._sem.acquire()
+            await consumer._handle(second_entry, second_fields)
+            parked = await consumer._waits.get(second.event_id)
+            assert parked is not None
+            assert h.sink.updates[-1] == ("C1", "p-2", _PREDECESSOR_NOTICE)
+            assert parked.wait_reason == "thread_predecessor"
+            deadline = parked.deadline_ms
+
+            h.runner.default_script = [Final(text="first answer", status=DONE)]
+            await consumer._sem.acquire()
+            await consumer._handle(first_entry, first_fields)
+            assert h.sink.last_text == "first answer"
+            await asyncio.to_thread(
+                h.substrate.release, kernel_routing._thread_key_for(first)
+            )
+
+            h.fake_k8s.quota_rejection = QuotaRejection(
+                quota_name="curie-sandbox-quota",
+                requested={"pods": "1"},
+                used={"pods": "2"},
+                hard={"pods": "2"},
+            )
+            wake_entry, wake_fields = await _wake_parked(h, consumer, second.event_id)
+            await consumer._sem.acquire()
+            await consumer._handle(wake_entry, wake_fields)
+            admitted = await consumer._waits.get(second.event_id)
+            assert admitted is not None
+            assert admitted.state == "waiting"
+            assert admitted.wait_reason == "sandbox_admission"
+            assert admitted.cause == ""
+            assert admitted.deadline_ms == deadline
+            assert admitted.deferrals == 2
+            assert h.sink.updates[-1] == ("C1", "p-2", _ADMISSION_NOTICE)
+            assert h.runner.opened == ["first"]
+
+            h.fake_k8s.quota_rejection = None
+            h.runner.default_script = [Final(text="second answer", status=DONE)]
+            answer_entry, answer_fields = await _wake_parked(h, consumer, second.event_id)
+            await consumer._sem.acquire()
+            await consumer._handle(answer_entry, answer_fields)
+            assert h.sink.last_text == "second answer"
+            assert h.sink.updates[-1][:2] == ("C1", "p-2")
+            done = await consumer._waits.get(second.event_id)
+            assert done is not None and done.state == "done"
+            assert done.cause == ""
+            assert done.deadline_ms == deadline
+
+    asyncio.run(go())
