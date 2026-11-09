@@ -30,6 +30,7 @@ from aci_protocol.turn import SLACK_KIND
 
 from curie_api.schemas.channels import EMAIL_KIND, SLACK_CHANNEL_ID
 
+from .approver_dm import DmCard, dm_route
 from .models import Approval
 
 # The audit vocabulary is FROZEN, and each set pins its own ``audit_name`` to the
@@ -256,9 +257,20 @@ def card_on_requesting_surface(approval: Approval, binding: Any) -> bool:
     adapter may answer. Every other routed record whose card sits at the asking
     address was shown there: fixed targets are Slack channel IDs, so a
     non-Slack asking address can only hold a requesting_surface card.
+
+    An approver-DM card (ADR 0272) is never the asking conversation's. Once
+    registered its DM ``card_channel`` differs from the asking address. Before
+    registration nothing is recorded: an HTTP-selected row always stores its
+    card target, so one without it, or a row on an ``approver_dm`` route, is
+    read as an unregistered DM card that no adapter lists or answers.
+    @spec APPROVER-DM-3.
     """
 
     if approval.card_channel is not None and approval.card_channel != approval.reply_channel:
+        return False
+    if approval.card_channel is None and (
+        approval.identity_context is not None or dm_route(binding) is not None
+    ):
         return False
     if not approval.route:
         return True
@@ -449,9 +461,15 @@ class ApproverSetSelector(Protocol):
     ``binding`` is ``Any`` because it is a raw JSONB value read straight from the
     route map: an implementation narrows it itself and fails a non-object closed
     rather than trusting it to be a mapping.
+
+    ``dm`` is the approval's registered approver-DM card (``approver_dm.card``),
+    loaded once by the caller; a set read through a bot identity reads it
+    through the DM card's identity instead of the reply identity. @spec APPROVER-DM-3.
     """
 
-    def __call__(self, approval: Approval, binding: Any) -> ApproverSet: ...
+    def __call__(
+        self, approval: Approval, binding: Any, dm: DmCard | None = None,
+    ) -> ApproverSet: ...
 
 
 class IdpTeamApprovers:

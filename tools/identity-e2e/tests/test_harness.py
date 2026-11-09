@@ -250,6 +250,7 @@ class _OrderTarget:
         self.values: dict[str, Any] = {}
         self.private_config = ""
         self.deployed_with: list[Any] = []
+        self.applied: list[Any] = []
 
     def api_image(self) -> str:
         return "registry.example.test/curie-api:candidate"
@@ -257,8 +258,10 @@ class _OrderTarget:
     def component(self, component: str) -> str:
         return f"rel-curie-{component}"
 
-    def kubectl(self, *args: str, **_kwargs: Any) -> Any:
+    def kubectl(self, *args: str, **kwargs: Any) -> Any:
         self.ops.append(("kubectl", args[0]))
+        if kwargs.get("input_text"):
+            self.applied.append(json.loads(kwargs["input_text"]))
         return subprocess.CompletedProcess(args, 0, "", "")
 
     def rollout(self, *deployments: str, restart: bool = False, timeout: str = "600s") -> None:
@@ -308,6 +311,13 @@ class _OrderApi:
         return {name: {"id": str(uuid.uuid4()), "name": name} for name in deployed}
 
     def ok(self, method: str, path: str, body: Any = None) -> Any:
+        self._target.ops.append(("api", (method, path.split("?", 1)[0])))
+        if method == "GET" and path.startswith(("/provider-installations", "/channel-identities")):
+            return []
+        if method == "POST" and path == "/provider-installations":
+            return {"id": str(uuid.uuid4()), "status": "connected", "authority": "", **body}
+        if method == "POST" and path == "/channel-identities":
+            return {"id": str(uuid.uuid4()), "status": "active", **body}
         return {"version": 1}
 
     def mint_channel_token(self, address: str) -> dict[str, Any]:
@@ -456,3 +466,72 @@ def test_parse_proxy_decision_grant_refusal_has_no_attested() -> None:
     assert parsed["outcome"] == "grant_required"
     assert parsed["grant"] == "not_spent"
     assert parsed["attested"] is None
+
+
+def test_up_registers_the_dm_receivers_and_turns_pending_retention_on(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The DM bot's installation and identity go through the admin API, the runtime
+    document the API's initializer loads carries both Slack receivers, and the worker
+    gets ADR 0273 decision 4's pending retention without losing other extraEnv."""
+
+    def fake_certificates(directory: Path, hosts: Any) -> None:
+        for name in ("ca.pem", "server.pem", "server.key"):
+            (directory / name).write_bytes(b"synthetic")
+
+    monkeypatch.setattr(harness, "make_certificates", fake_certificates)
+    monkeypatch.setattr(harness, "ed25519_pair", lambda _directory: ("seed", "verify"))
+    target = _OrderTarget()
+    target.values = {"worker": {"extraEnv": [{"name": "OTHER", "value": "kept"}]}}
+    monkeypatch.setattr(
+        harness.Harness,
+        "api",
+        contextlib.contextmanager(lambda self: (yield _OrderApi(target))),
+    )
+    bundle = tmp_path / "bundle"
+    bundle.mkdir()
+    subject = harness.Harness(target, harness.State(tmp_path / "state"))  # type: ignore[arg-type]
+
+    result = subject.up(["agent-a"], bundle, assets.DEFAULT_ROSTER)
+
+    posted = [op[1] for op in target.ops if op[0] == "api" and op[1][0] == "POST"]
+    assert ("POST", "/provider-installations") in posted
+    assert ("POST", "/channel-identities") in posted
+    slack = subject.data["slack"]
+    assert slack["dm"]["installation_created"] and slack["dm"]["identity_created"]
+    assert result["dm_receivers"]["identity"] == assets.DM_IDENTITY
+    secrets_applied = [
+        item
+        for item in target.applied
+        if item.get("kind") == "Secret" and item["metadata"]["name"].endswith("-api-runtime")
+    ]
+    document = json.loads(
+        base64.b64decode(secrets_applied[-1]["data"]["api-runtime.json"]).decode()
+    )
+    names = sorted(
+        entry["registration"]["channel_identity_name"] for entry in document["receivers"]
+    )
+    assert names == sorted([assets.DM_IDENTITY, assets.DM_FOREIGN_IDENTITY])
+    path = tmp_path / "runtime"
+    path.mkdir()
+    (path / "api-runtime.json").write_text(json.dumps(document))
+    os.chmod(path / "api-runtime.json", 0o440)
+    runtime = load_http_identity_runtime(str(path), platform_key="synthetic-platform-key")
+    registered = {item.channel_identity_name: item for item in runtime._receivers.values()}
+    dm = registered[assets.DM_IDENTITY]
+    assert dm.channel_identity_id == slack["dm"]["identity_id"]
+    assert dm.provider_installation_id == slack["dm"]["installation_id"]
+    assert dm.namespace.id == slack["dm"]["namespace_id"]
+    assert set(assets.SLACK_HUMANS) <= set(dm.human_native_ids)
+    assert target.values["worker"]["extraEnv"] == [
+        {"name": "OTHER", "value": "kept"},
+        {"name": assets.PENDING_RETENTION_ENV, "value": "true"},
+    ]
+    assert subject.data["helm_previous"]["worker.extraEnv"] == [{"name": "OTHER", "value": "kept"}]
+
+    # A second `up` keeps one pending retention entry.
+    subject.up(["agent-a"], bundle, assets.DEFAULT_ROSTER)
+    assert [entry["name"] for entry in target.values["worker"]["extraEnv"]] == [
+        "OTHER",
+        assets.PENDING_RETENTION_ENV,
+    ]

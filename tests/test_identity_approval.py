@@ -776,10 +776,12 @@ def receipt_v2() -> dict[str, Any]:
 
 
 def test_v2_receipt_requires_every_field_and_is_closed_frozen_and_not_permission() -> None:
-    """@spec REQUEST-APPROVAL-4 HTTP-APPROVAL-CONTINUITY-2: strict and closed like V1."""
+    """@spec REQUEST-APPROVAL-4 HTTP-APPROVAL-CONTINUITY-2 APPROVER-DM-2: strict and closed
+    like V1; the only optional field is an approver-DM row's ``delivery``, absent here."""
     model = receipt_api().ApprovalCreationResponseV2
     body = receipt_v2()
-    assert set(model.model_fields) == set(V2_RECEIPT_FIELDS) == set(body)
+    assert set(model.model_fields) == set(V2_RECEIPT_FIELDS) | {"delivery"}
+    assert set(V2_RECEIPT_FIELDS) == set(body)
     value = model.model_validate(body)
     assert value.model_dump(mode="json") == body
     assert model.model_validate_json(value.model_dump_json()) == value

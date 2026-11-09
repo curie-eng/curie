@@ -576,6 +576,63 @@ selector exists. A downgrade would drop each dynamic approval's selection and it
 ticket nonce, so the row would read back ordinary and its ticket could be used again. Roll
 the application forward instead.
 
+## Delivering the card to the selected approver's DM (ADR 0272)
+
+A dynamic route can send its one card to the selected approver's Slack DM instead of a
+channel. [ADR 0272](adr/0272-approver-dm-delivery-uses-one-selected-recipient.md) adds a
+third `resolution` form:
+
+```json
+{ "mode": "approver_dm", "identity": "default" }
+```
+
+`identity` names the Slack bot identity that posts the card (`default` is the default app,
+and is stored as written). The route write refuses, with a 422 whose detail carries the code:
+
+1. `approver_dm_static_route`: the same route registers no `approver_ticket`. Only a
+   dynamic approval has one selected person to deliver to.
+2. `approver_dm_notification`: the route carries a `notification`. The card goes only to the DM.
+3. `approver_dm_receiver_missing`: the tenant has no active Slack identity of that name, or
+   the API registers no receiver for it.
+
+At creation the worker sends `card_channel: null`, and the API requires exactly one selected
+approver with exactly one recipient account on the receiver's installation and Slack
+workspace. It looks that account up through the HTTP identity provider (purpose `approval`)
+and requires it to resolve to the selected person as an active human. The final write
+rechecks the receiver registration, its identity, installation and namespace rows, the
+provider configuration and the recipient facts, which must still be inside their freshness
+window. Creation refuses `approver_dm_requires_dynamic`, `approver_dm_recipient_count`,
+`approver_dm_account_missing`, `approver_dm_wrong_installation`,
+`approver_dm_account_unresolved` or `approver_dm_receiver_missing`, a change between the
+lookup and the write answers 503 `authority_unavailable`, and nothing is stored or spent.
+The creation response carries `delivery` (mode, identity, installation and the recipient's
+Slack user id). The key is present only for a DM approval, and a duplicate creation
+recomputes it from the stored row.
+
+The worker posts one card with the recipient's user id as the channel and registers the DM
+channel Slack returns through `POST /v1/internal/identity/approvals/{id}/card` (worker token
+only). Registration binds the approval id, the original creation context, the bot identity
+and the recipient. It stores the channel in `card_channel`, reseals the row's continuity
+context (only the record digest changes) and writes one `card_registered` audit row, all in
+one commit. An identical retry answers `duplicate: true`; a different channel, identity or
+recipient answers 409 `approval_card_conflict`, judged against the committed registration,
+not the current route. A row that already settled answers its status without writing, so the
+worker settles the posted card at once. A row whose sealed record no longer matches answers
+409 `approval_provenance_conflict` and is never resealed.
+
+Until registration, `card_channel` is unset and every answer refuses; there is no fallback to
+the requester's thread. After it, an answer must come from the registered DM channel, through
+the recorded bot installation, by the selected person, under every ADR 0271 check. Operator
+principals and email replies are refused. The requester's thread gets a non-interactive
+pending notice and the outcome.
+
+Rollout is readers first. API, worker, dispatcher and CLI versions from before ADR 0272
+refuse the mode, so roll the release out everywhere and drain old card writers before any
+operator writes an `approver_dm` route. The worker creates a DM approval only when
+`CURIE_APPROVAL_PENDING_RETENTION_ENABLED` is on and the ADR 0273 decision 4 reconciliation
+has completed, because a pending DM card reference must outlive the 14-day default. A
+rollback first needs every DM route removed and every pending DM approval settled.
+
 ## Who may resolve
 
 One authorizer decides, and the swappable part behind it is the approver set

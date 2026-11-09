@@ -636,7 +636,7 @@ def registered_sender(
     return sender[1], namespace
 
 
-async def _current_slack_scope(
+async def current_slack_scope(
     session: AsyncSession, registration: ReceiverRegistrationV1, tenant_id: uuid.UUID,
 ) -> None:
     """The registered Slack identity, installation and namespace rows, current.
@@ -798,7 +798,7 @@ async def capture_source(
         policy_row, sql_null, tenant_id=tenant_id, agent_id=agent.id,
     )
     if isinstance(registration, ReceiverRegistrationV1):
-        await _current_slack_scope(session, registration, tenant_id)
+        await current_slack_scope(session, registration, tenant_id)
     role_config = None if policy is None else getattr(policy.roles, role)
     team_id = None if policy_row is None else (
         policy_row.invocation_team_id if role == "invocation" else policy_row.approver_team_id

@@ -539,17 +539,18 @@ class AnswerScenario(TicketScenario):
             self.ensure_flag(api)
             setup["registration"] = self.write_state(api)
 
-    def send_turns(self) -> None:
-        """One approver turn (a canonical principals row), then one requester turn per approval.
+    def send_turns(self, count: int = answers.TURN_COUNT) -> None:
+        """One approver turn (a canonical principals row), then ``count`` requester turns.
 
-        The requester's turns share one conversation, so the worker serves them
-        from one sandbox, one after another; the creations read only each turn's
-        ingress capsule. No step starts until the worker has finished all of
-        them, since each turn's checks move the tenant's lifecycle generation.
+        One requester turn per approval by default. The requester's turns share
+        one conversation, so the worker serves them from one sandbox, one after
+        another; the creations read only each turn's ingress capsule. No step
+        starts until the worker has finished all of them, since each turn's
+        checks move the tenant's lifecycle generation.
         """
 
         sends = [("approver", A, None)] + [
-            (f"r{index:02d}", R, "requester") for index in range(1, answers.TURN_COUNT + 1)
+            (f"r{index:02d}", R, "requester") for index in range(1, count + 1)
         ]
         conversation: str | None = None
         for label, part, thread in sends:

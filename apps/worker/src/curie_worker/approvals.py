@@ -31,9 +31,12 @@ from aci_protocol import READER_CONTEXT, ApprovalRequest, PublicationContext, Qu
 from channel_protocol import MessageField, OutboundMessage
 from curie_dispatcher.approval_actions import parse_decision_time
 from curie_internal.identity_approval import (
+    ApprovalCardRegistrationRequestV1,
+    ApprovalCardRegistrationResponseV1,
     ApprovalCreationIdentityV1,
     ApprovalCreationRequestV1,
     ApprovalCreationResponseV2,
+    ApprovalDmDeliveryV1,
     creation_receipt,
 )
 from curie_telemetry import inject_trace_context
@@ -127,6 +130,7 @@ def _rejected_reraise_refusal(response: httpx.Response) -> str | None:
 
 __all__ = [
     "ApprovalBackendError",
+    "ApprovalCardRegistrar",
     "ApprovalClient",
     "ApprovalCreator",
     "ApprovalReader",
@@ -152,6 +156,10 @@ class CreatedApproval:
     approval, ADR 0271 decisions 4 and 8): the persisted grant, ticket
     included, and the selected people. The pause renders them instead of the
     run's own summary. Every other creation leaves them None and empty.
+    ``delivery`` is the server-verified approver DM recipient (ADR 0272), set
+    only from a V2 receipt whose route resolves to one selected approver's DM.
+    ``duplicate`` is the API's own "this creation adopted an existing row"
+    answer; a duplicate never posts a second DM card.
     """
 
     id: str
@@ -161,6 +169,8 @@ class CreatedApproval:
     granted_tool: str | None = None
     granted_arguments: dict[str, Any] | None = None
     selected_approvers: tuple[dict[str, str], ...] = ()
+    delivery: ApprovalDmDeliveryV1 | None = None
+    duplicate: bool = False
 
 
 @dataclass(frozen=True)
@@ -465,6 +475,26 @@ class PublicationCreator(Protocol):
     ) -> uuid.UUID: ...
 
 
+class ApprovalCardRegistrar(Protocol):
+    """Records an approver DM card's provider channel on its approval (ADR 0272).
+
+    Separate from ``ApprovalCreator`` for the reason ``ApprovalReader`` is: only
+    the DM pause needs it, and a creator fake should not have to grow it.
+    """
+
+    async def register_card(
+        self,
+        *,
+        approval_id: str,
+        dedupe_key: str,
+        identity: ApprovalCreationIdentityV1,
+        card_identity: str,
+        recipient: str,
+        channel: str,
+        budget_s: float = DEFAULT_BUDGET_S,
+    ) -> ApprovalCardRegistrationResponseV1: ...
+
+
 class ApprovalReader(Protocol):
     """Read one settled record back. Separate from ``ApprovalCreator`` because
     the kernel's pause path needs only the create half, and a fake for it should
@@ -710,7 +740,7 @@ class ApprovalClient:
             if type(receipt) is not ApprovalCreationResponseV2:
                 return CreatedApproval(
                     id=receipt.id, status=receipt.status, requested_by=receipt.requested_by,
-                    requester_known=True,
+                    requester_known=True, duplicate=receipt.duplicate,
                 )
             # The V2 model admits only the canonical text of a JSON object.
             return CreatedApproval(
@@ -720,7 +750,93 @@ class ApprovalClient:
                 selected_approvers=tuple(
                     person.model_dump(mode="json") for person in receipt.selected_approvers
                 ),
+                delivery=receipt.delivery, duplicate=receipt.duplicate,
             )
+        except ApprovalContinuityRefused:
+            raise
+        except Exception:  # noqa: BLE001 - source, effect and credential data stay private.
+            raise TurnAuthorityUnavailable() from None
+
+    async def register_card(
+        self,
+        *,
+        approval_id: str,
+        dedupe_key: str,
+        identity: ApprovalCreationIdentityV1,
+        card_identity: str,
+        recipient: str,
+        channel: str,
+        budget_s: float = DEFAULT_BUDGET_S,
+    ) -> ApprovalCardRegistrationResponseV1:
+        """Record the DM channel an approver card landed in (ADR 0272 decision 2).
+
+        Worker token only, one attempt, the creation's own identity block. A
+        coded refusal (a conflicting or mismatched registration, a provenance
+        conflict) is definitive and raises ``ApprovalContinuityRefused``; any
+        other outcome is unknown and raises ``TurnAuthorityUnavailable``.
+        Neither is retried here: the caller owns what an unregistered card means.
+        """
+        try:
+            if (
+                type(identity) is not ApprovalCreationIdentityV1
+                or type(budget_s) not in {int, float}
+                or not math.isfinite(budget_s)
+                or budget_s <= 0
+            ):
+                raise ValueError
+            captured = ApprovalCardRegistrationRequestV1.model_validate(
+                {
+                    "schema_version": 1,
+                    "request_id": str(uuid.uuid4()),
+                    "approval_id": approval_id,
+                    "dedupe_key": dedupe_key,
+                    "identity": ApprovalCreationIdentityV1.model_validate(identity),
+                    "card_identity": card_identity,
+                    "recipient": recipient,
+                    "channel": channel,
+                }
+            )
+            payload = captured.model_dump_json().encode("utf-8")
+            if len(payload) > 2_097_152:
+                raise ValueError
+            budget = min(5.0, budget_s)
+        except (ValueError, TypeError, AttributeError, RecursionError, OverflowError):
+            raise ValueError("invalid_approval_card_registration") from None
+        try:
+            if not self._worker_headers:
+                raise ValueError
+            headers = {**self._worker_headers, "Content-Type": "application/json"}
+            inject_trace_context(headers)
+            outgoing = httpx.Request(
+                "POST",
+                f"{self._identity_url}/{captured.approval_id}/card",
+                content=payload,
+                headers=headers,
+                extensions={"timeout": httpx.Timeout(budget).as_dict()},
+            )
+            status, body = await exchange_identity_json(self._client, outgoing, budget_s=budget)
+            denials = {
+                403: {"caller_not_allowed"},
+                409: {
+                    "approval_card_conflict",
+                    "approval_card_mismatch",
+                    "approval_provenance_conflict",
+                },
+                413: {"body_too_large"},
+                422: {"invalid_approval_context"},
+            }
+            if status in denials and set(body) == {"detail"} and body["detail"] in denials[status]:
+                raise ApprovalContinuityRefused()
+            if status != 200:
+                raise ValueError
+            receipt = ApprovalCardRegistrationResponseV1.model_validate(body)
+            if (
+                receipt.request_id != captured.request_id
+                or receipt.approval_id != captured.approval_id
+                or (receipt.status == "pending" and receipt.card_channel != captured.channel)
+            ):
+                raise ValueError
+            return receipt
         except ApprovalContinuityRefused:
             raise
         except Exception:  # noqa: BLE001 - source, effect and credential data stay private.

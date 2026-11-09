@@ -50,6 +50,27 @@ REFERENCE_BOOTSTRAP = (
 # The renderer substitutes these in a connector's args and env values.
 PLACEHOLDER = "${"
 
+# ADR 0272 approver DMs. `up` registers two Slack receivers: the DM bot
+# identity the `approver-dm` scenario routes to, and a second bot on another
+# installation and workspace whose proofs must never answer a DM card. Only
+# synthetic, reserved-shape Slack ids are used. No binding has either
+# identity as its adapter; each registration lists one synthetic binding id
+# that names no binding, because a registration must list at least one and
+# an email-registered binding may not be listed by a Slack one.
+DM_IDENTITY = "identity-e2e-dm"
+DM_ACCOUNT = "T0EXAMPLEDM"
+DM_FOREIGN_IDENTITY = "identity-e2e-dm-foreign"
+DM_FOREIGN_ACCOUNT = "T0EXAMPLEFRGN"
+DM_BOT_USER = "U0EXAMPLEBOT"
+# The Slack user ids the scenario maps to roster people while it runs.
+SLACK_APPROVER = "U0EXAMPLEDMAPPR"
+SLACK_OTHER = "U0EXAMPLEDMOTHER"
+SLACK_UNKNOWN = "U0EXAMPLEDMNONE"
+SLACK_HUMANS = (SLACK_APPROVER, SLACK_OTHER)
+# The worker setting ADR 0272 needs before any DM approval is created (ADR
+# 0273 decision 4's pending reference retention).
+PENDING_RETENTION_ENV = "CURIE_APPROVAL_PENDING_RETENTION_ENABLED"
+
 # domain; no real directory is named.
 DEFAULT_ROSTER: dict[str, Any] = {
     "issuer": ISSUER,
@@ -496,6 +517,86 @@ def reference_bundle(
     return dest
 
 
+def slack_namespace(namespace_id: str, account: str) -> dict[str, Any]:
+    """An ordinary Slack workspace namespace descriptor (``NamespaceV1``)."""
+
+    return {"id": namespace_id, "authority": "", "kind": "slack_workspace", "key": account}
+
+
+def slack_registration(
+    *,
+    tenant_id: str,
+    receiver_id: str,
+    identity_id: str,
+    identity_name: str,
+    installation_id: str,
+    namespace_id: str,
+    account: str,
+    binding_id: str,
+    humans: Sequence[str] = SLACK_HUMANS,
+) -> dict[str, Any]:
+    """One Slack ``ReceiverRegistrationV1`` in its JSON wire form."""
+
+    return {
+        "schema_version": 1,
+        "receiver_id": receiver_id,
+        "generation": 1,
+        "tenant_id": tenant_id,
+        "channel_identity_id": identity_id,
+        "channel_identity_name": identity_name,
+        "provider_installation_id": installation_id,
+        "namespace": slack_namespace(namespace_id, account),
+        "installation_account": account,
+        "bot_user_id": DM_BOT_USER,
+        "binding_ids": [binding_id],
+        "human_native_ids": list(humans),
+    }
+
+
+def dm_receivers(tenant_id: str, slack: Mapping[str, Any]) -> list[dict[str, Any]]:
+    """The ``receivers`` entries for the state ``up`` keeps under ``slack``.
+
+    ``slack`` holds ``binding_id`` and, for ``dm`` and ``foreign``, the
+    receiver id, key, identity, installation and namespace ids. The ``dm``
+    identity and installation ids name rows ``up`` created; the ``foreign``
+    ones name nothing.
+    """
+
+    entries = []
+    for part, name, account in (
+        ("dm", DM_IDENTITY, DM_ACCOUNT),
+        ("foreign", DM_FOREIGN_IDENTITY, DM_FOREIGN_ACCOUNT),
+    ):
+        item = slack[part]
+        entries.append(
+            {
+                "registration": slack_registration(
+                    tenant_id=tenant_id,
+                    receiver_id=item["receiver_id"],
+                    identity_id=item["identity_id"],
+                    identity_name=name,
+                    installation_id=item["installation_id"],
+                    namespace_id=item["namespace_id"],
+                    account=account,
+                    binding_id=slack["binding_id"],
+                ),
+                "key": item["key"],
+            }
+        )
+    return entries
+
+
+def with_env(entries: Any, name: str, value: str) -> list[dict[str, Any]]:
+    """A workload ``extraEnv`` list with ``name`` set to ``value`` and nothing else changed."""
+
+    kept = [
+        copy.deepcopy(dict(entry))
+        for entry in (entries if isinstance(entries, list) else [])
+        if not (isinstance(entry, Mapping) and entry.get("name") == name)
+    ]
+    return [*kept, {"name": name, "value": value}]
+
+
 def runtime_document(
     *,
     tenant_id: str,
@@ -504,6 +605,7 @@ def runtime_document(
     registration: Mapping[str, Any],
     receiver_key: str,
     context_key: str,
+    slack_receivers: Sequence[Mapping[str, Any]] = (),
 ) -> dict[str, Any]:
     """The protected api-runtime.json (identity/http_initializer.py)."""
 
@@ -520,7 +622,7 @@ def runtime_document(
                 "bearer": bearer,
             }
         ],
-        "receivers": [],
+        "receivers": [copy.deepcopy(dict(entry)) for entry in slack_receivers],
         "email_receivers": [{"registration": dict(registration), "key": receiver_key}],
         "context_keys": [{"key_id": CONTEXT_KEY_ID, "generation": 1, "key": context_key}],
         "signing_key": {"key_id": CONTEXT_KEY_ID, "generation": 1},

@@ -536,6 +536,17 @@ _ROUTE_WHITESPACE = re.compile(r"\s")
 # ``ApprovalRequestingSurfaceTarget`` (``schemas.approvals.REQUESTING_SURFACE_MODE``).
 _REQUESTING_SURFACE = {"mode": "requesting_surface"}
 
+# ADR 0272 decision 1: the third form of a route's resolution, exactly
+# ``{"mode": "approver_dm", "identity": <slug>}``. The card goes to the one
+# approver the request's ticket selected, in that person's DM with the named
+# bot identity. Mirrors the API's ``schemas.approvals.APPROVER_DM_MODE``.
+_APPROVER_DM_MODE = "approver_dm"
+
+# A DM channel id as ``chat.postMessage`` answers for a post to a user id. The
+# registration endpoint accepts only this shape, and the worker checks it before
+# registering, so a user id echoed back or a public channel is a failed delivery.
+_APPROVER_DM_CHANNEL = re.compile(r"^D[A-Z0-9]{8,}$")
+
 # ADR-0177 amendment: the channels whose approvals are answered from a route's approver
 # ``emails``. Only email today: the mail adapter's kind, and the API's
 # ``schemas.channels.EMAIL_KIND``. A set rather than a comparison, because the question

@@ -79,7 +79,15 @@ T="--context kind-identity-e2e --namespace identity-e2e --release identity-e2e -
    API's `api-runtime.json` Secret listing those bindings in an email receiver
    registration, and runs `helm upgrade --reuse-values` to mount it and to set
    the email adapter's reply secret. It then rolls the API and worker and mints a channel token per
-   binding. It is safe to run again, for example to add an agent. Use
+   binding. For `approver-dm` the same document also registers two Slack
+   receivers: the DM bot identity `identity-e2e-dm`, whose Slack installation
+   and channel identity rows `up` creates through the admin API
+   (`/provider-installations`, `/channel-identities`) when the tenant has
+   none, and a second bot on another installation that names no rows. No
+   binding uses either identity, and each registration lists one synthetic
+   binding id that names no binding. The helm upgrade also adds
+   `CURIE_APPROVAL_PENDING_RETENTION_ENABLED=true` to `worker.extraEnv`,
+   keeping any other entry. It is safe to run again, for example to add an agent. Use
    `examples/weather` for `requester-claim` and `requester-handoff`: its one
    hosted connector, `netpol-probe`, is what the scenarios' turns call. `--bundle` only deploys
    agents that do not exist yet, so an agent deployed earlier from a bundle
@@ -112,7 +120,9 @@ T="--context kind-identity-e2e --namespace identity-e2e --release identity-e2e -
    `dana@example.test`), a verified human outside the authority group.
    `--wait` (default 240) bounds each wait for a claim or a reply.
 5. `curie dev identity-e2e -- down $T` deletes the agents and bindings `up`
-   created, restores the helm values it changed, deletes the provider and
+   created, the DM bot's channel identity and installation when `up` created
+   them (and a DM namespace row an interrupted `approver-dm` run left),
+   restores the helm values it changed, deletes the provider and
    runtime objects, removes the tenant HTTP selection row when `up` created it,
    rolls the API and worker, deletes the rendered reference bundle, and
    verifies that nothing it labelled remains. Delete the cluster or namespace
@@ -176,10 +186,12 @@ The provider's reply port also serves the roster while it runs. `GET /roster`
 returns the effective roster, the addresses that differ from the one `up`
 installed and a change counter. `POST /roster` with the adapter secret upserts,
 deletes or resets entries in one atomic change, and refuses with 400, changing
-nothing, an entry the recorded vectors cannot answer. Only
-`approver-ticket-answer` changes the roster, and it resets it when it ends. A
-provider started by an older `up` has no roster endpoint; rerun `up` to replace
-it.
+nothing, an entry the recorded vectors cannot answer. A roster key is a
+lowercase email address or a lowercased Slack user id, since a Slack sender is
+looked up by its user id. Only `approver-ticket-answer` and `approver-dm`
+change the roster, and each resets it when it ends. A provider started by an
+older `up` has no roster endpoint, or refuses Slack user ids; rerun `up` to
+replace it.
 
 `up --role-filter` additionally sets an issuer group invocation filter on every
 agent. That makes every binding of the agent require HTTP identity, so the
@@ -860,6 +872,87 @@ checks it. Approvals the run created stay pending until they expire, answered
 ones stay resolved with their resume wakes in the runs stream, and the run's
 agent versions stay, undeployed.
 
+## What approver-dm proves
+
+ADR 0272 on a live install, its required evidence items 1, 3 and 4: a dynamic
+route may send its card to the one selected approver's DM, an unregistered DM
+card cannot be answered anywhere, the worker's card registration is
+idempotent and judged against what it committed, only the selected person in
+the registered DM through the route's bot can answer, and the pending card
+reference has no TTL until the approval settles. Run it with:
+
+```bash
+curie dev identity-e2e -- prove $T --scenario approver-dm --evidence dm.json
+python3 tools/identity-e2e/check_approver_dm_evidence.py dm.json
+```
+
+The checker is `check_answer_evidence.py`'s judge with this scenario's step
+ids: it exits 0 only when the evidence names `approver-dm`, passed overall,
+has every step below passed, and records the candidate commit, and inside a
+git checkout it requires that `git diff --name-only <candidate> HEAD` touches
+no runtime path.
+
+It needs what `approver-ticket-answer` needs, plus an install brought up (or
+brought up again) by a `up` that registers the Slack receivers and sets the
+worker's pending retention. Setup refuses to start when the DM bot's channel
+identity or installation row is missing or inactive, when the agent already
+stores an `approver_dm` route, or when the worker reports
+`CURIE_APPROVAL_PENDING_RETENTION_ENABLED` off. It records the identity,
+installation and namespace ids, the synthetic Slack people and the worker
+setting under `setup.dm`.
+
+It reuses the answer scenario's setup and restore, with these differences:
+
+1. It inserts the DM bot's Slack workspace namespace row with the id `up`
+   recorded, directly in the API pod's database, because no product surface
+   writes one on an HTTP-selected tenant (directory namespace provisioning
+   refuses with `authority_owned_by_http`). Restore deletes it, and `down`
+   deletes one an interrupted run left.
+2. Through the provider's roster override it maps one synthetic Slack user
+   to the selected approver (`--second-sender`) and another to the second
+   approver. A third synthetic Slack user stays unknown, so its lookup is
+   unresolved.
+3. It sends one approver turn and five requester turns: one shared by the
+   creation refusals and one per DM approval the later steps create.
+
+The worker's own DM post is scripted. The scenario predates the fake model's
+`[fake:gated-connector-tool]` directive, and the install has no Slack bot for a
+worker post to reach. So the harness creates
+each approval at the internal creation boundary from a requester turn's
+ingress capsule, as `approver-ticket-creation` does, plays the worker's post
+by registering a synthetic DM channel id with the worker token, and, for
+retention, remembers the card with the worker's own `ApprovalCardStore` and
+settings in the worker pod. Answers are scripted Slack clicks: a chat
+approval principal minted with the API's attester secret, as the dispatcher
+mints it, and an `ApprovalAnswerProofV1` signed with the Slack receiver key
+`up` registered. The answer scenario's quiescence rule holds: before each
+answer that settles a row the run waits until the worker has finished every
+turn and resumed wake it knows of, and after it, the resumed turn.
+
+The steps run in this order, and each records its own evidence:
+
+1. `dm-route-write-refusals`: through `PATCH /agents/{id}`, a DM resolution without a selector (on the ticket route with the registration removed, and on the unregistered route) is refused 422 `approver_dm_static_route`, a DM with a notification 422 `approver_dm_notification`, and a DM naming an identity with no registered receiver 422 `approver_dm_receiver_missing`, each leaving the stored routes and configuration version unchanged. A DM on the ticket route is then accepted and reads back exactly `{"mode": "approver_dm", "identity": "identity-e2e-dm"}` through the API and in the stored row, with no notification. The run stops if this step fails.
+2. `dm-creation-refusals`: on one requester turn, creations selecting two approvers (422 `approver_dm_recipient_count`), an approver with no recipient account (422 `approver_dm_account_missing`), an account only on the other installation (422 `approver_dm_wrong_installation`), an account the directory resolves to another person or does not resolve (422 `approver_dm_account_unresolved`, twice), and a worker-chosen card channel (409 `unsupported_approval`) are refused. The route is then stored out of band, in the API pod's database, naming an identity with no registered receiver, which no operator write can store; a creation is refused 409 `approver_dm_receiver_missing`, and the route is put back exactly however that ends. No row exists for the turn and no ticket nonce is spent.
+3. `dm-unregistered-unanswerable`: a valid creation answers 201 with the pinned `delivery` (identity, installation, and the selected approver's synthetic Slack user as recipient), and the row is pending with no card channel and no `card_registered` audit row. The selected approver's email reply on the origin thread, and their Slack click on the origin channel and in an unregistered DM, are refused, and the row stays pending with no card.
+4. `dm-card-registration`: the first registration of a synthetic DM channel id answers 200 with the channel and `duplicate: false`, an identical retry 200 with `duplicate: true`, and a conflicting channel 409 `approval_card_conflict`. With the route repointed to `requesting_surface`, the identical retry is still a duplicate and the conflict still 409. The row ends pending on that DM channel with exactly one `card_registered` audit row by the system naming the DM, the identity and the recipient. The DM route is written back however the step ends.
+5. `dm-answer-authority`: with the route's `approvers.users` listing the operator user and the selected approver's Slack id, a registered DM approval refuses a click from another DM, from another person in the registered DM, through the other installation's receiver, and from a copied card on the origin channel and on a public channel; an operator principal is refused 403 with a `denied` audit row of principal kind `operator` naming `canonical_route_operator_refused`; the selected approver's email reply is refused. The row stays pending on its DM after each. Once the worker is idle, two identical valid clicks are sent at once: exactly one answers 200, the other 409 or 503, the row is approved with one `resolved` audit row by the selected approver's Slack user, and both current checks of the published wake answer `continue`.
+6. `dm-pending-retention`: for a registered pending DM approval, the card reference the worker's store remembers carries no TTL (PTTL -1) and is in the worker's retention index, read in the worker pod with the worker's settings. After the selected approver approves in the DM and the worker finishes the resumed turn, the run polls until the reference carries a TTL bounded by the worker's 14 day terminal window, or is gone while its retention marker carries that bounded TTL (exact deletion), and is out of the index.
+
+The evidence lists what the scenario cannot observe under `carried`: the
+worker's own post and its `approver DM delivery failed` log line, for the
+reason above, and ADR 0272 item 2's genuine Slack interactions. It keeps
+statuses, refusal codes, synthetic Slack and DM ids, row facts, scrubbed
+audit rows and TTLs, never keys, tokens, proofs, capsules, nonces or tickets;
+a route write keeps its status, code and whether it stored anything, never
+its body, because a validation refusal echoes its input.
+
+Restore runs in a `finally` block even after a failure, and a failed restore
+fails the run. It does what the answer scenario's restore does, which also
+removes the DM resolution with the registration, and then deletes the
+namespace row. Approvals the run created stay pending until they expire,
+answered ones stay resolved, and the card references it remembered keep the
+worker's bounded terminal TTL.
+
 ## Add a scenario
 
 1. Write a function in `identity_scenarios.py` and register it with
@@ -934,3 +1027,16 @@ agent versions stay, undeployed.
    any other private value) shorter than 8 characters, because the evidence
    could not be searched for it reliably. Use longer subjects in a custom
    roster.
+10. `approver-dm` does not make the worker create, post or register a DM
+    approval in a live turn. It plays the worker's creation, registration and
+    card memory instead, so it does not observe the worker's
+    `approver DM delivery failed` log line for a failed post; the evidence
+    carries that check. A live turn through the fake model's
+    `[fake:gated-connector-tool]` directive (`runner/src/curie_runner/fake.py`)
+    could make the worker create the approval and attempt the post, which
+    fails on an install with no Slack bot; that step is not built yet. ADR 0272 item 2 (a real bot installation, Socket Mode
+    button and note modal clicks, and the `im:history` card read) needs an
+    authenticated Slack session and is not run here.
+11. The DM bot's Slack workspace namespace row has no product surface on an
+    HTTP-selected tenant, so `approver-dm` writes and deletes it in the API
+    pod's database.

@@ -271,6 +271,7 @@ class Kernel:
     _adopt_remembered_notice_ref = approval._adopt_remembered_notice_ref
     _approval_run_abandoned = approval._approval_run_abandoned
     _pause_for_approval = approval._pause_for_approval
+    _deliver_approver_dm_card = approval._deliver_approver_dm_card
     _escalate_unanswerable_email_approval = approval._escalate_unanswerable_email_approval
     _is_approval_resume = staticmethod(approval_key._is_approval_resume)
     _route_attachment_and_start = attachments._route_attachment_and_start

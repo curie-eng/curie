@@ -70,15 +70,17 @@ def step_results(evidence: Mapping[str, Any]) -> dict[str, list[Mapping[str, Any
     return found
 
 
-def judge(evidence: Any) -> list[str]:
+def judge(
+    evidence: Any, *, scenario: str = SCENARIO, steps: Sequence[str] = STEP_IDS
+) -> list[str]:
     """Every way the evidence falls short, one line each; empty when it passes."""
 
     if not isinstance(evidence, Mapping):
         return [f"the evidence is a JSON {type(evidence).__name__}, not an object"]
     problems = []
-    scenario = evidence.get("scenario")
-    if scenario != SCENARIO:
-        problems.append(f"the evidence names scenario {scenario!r}, not {SCENARIO}")
+    named = evidence.get("scenario")
+    if named != scenario:
+        problems.append(f"the evidence names scenario {named!r}, not {scenario}")
     if evidence.get("passed") is not True:
         aborted = evidence.get("aborted")
         problems.append(
@@ -86,10 +88,10 @@ def judge(evidence: Any) -> list[str]:
             + (f"; aborted: {str(aborted)[:FAILURE_LIMIT]}" if aborted else "")
         )
     found = step_results(evidence)
-    missing = [step for step in STEP_IDS if step not in found]
+    missing = [step for step in steps if step not in found]
     if missing:
         problems.append(f"{len(missing)} required steps are missing: {', '.join(missing)}")
-    for step in STEP_IDS:
+    for step in steps:
         for entry in found.get(step, []):
             if entry.get("passed") is not True:
                 failure = str(entry.get("failure") or "no failure recorded")[:FAILURE_LIMIT]
@@ -149,8 +151,16 @@ def checkout_problems(repo: Path, candidate: str | None, git: GitRunner) -> tupl
     )
 
 
-def main(argv: Sequence[str] | None = None, *, git: GitRunner = run_git) -> int:
-    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+def main(
+    argv: Sequence[str] | None = None,
+    *,
+    git: GitRunner = run_git,
+    scenario: str = SCENARIO,
+    steps: Sequence[str] = STEP_IDS,
+    complete: str = "ADR 0271 items 3 and 4 evidence is complete",
+    description: str | None = None,
+) -> int:
+    parser = argparse.ArgumentParser(description=description or __doc__.splitlines()[0])
     parser.add_argument("evidence", type=Path)
     parser.add_argument(
         "--repo",
@@ -164,7 +174,7 @@ def main(argv: Sequence[str] | None = None, *, git: GitRunner = run_git) -> int:
     except (OSError, ValueError) as exc:
         print(f"{args.evidence}: unreadable evidence ({type(exc).__name__}: {exc})")
         return 2
-    problems = judge(evidence)
+    problems = judge(evidence, scenario=scenario, steps=steps)
     data = evidence if isinstance(evidence, Mapping) else {}
     candidate = candidate_commit(data)
     line, more = checkout_problems(args.repo, candidate, git)
@@ -172,11 +182,11 @@ def main(argv: Sequence[str] | None = None, *, git: GitRunner = run_git) -> int:
     found = step_results(data)
     passed = sum(
         1
-        for step in STEP_IDS
+        for step in steps
         if found.get(step) and all(entry.get("passed") is True for entry in found[step])
     )
     print(f"{args.evidence}: scenario {data.get('scenario')!r}, passed {data.get('passed')!r}")
-    print(f"steps: {passed} of {len(STEP_IDS)} required steps passed")
+    print(f"steps: {passed} of {len(steps)} required steps passed")
     print(f"candidate commit: {candidate or 'none recorded'}")
     print(line)
     if problems:
@@ -184,7 +194,7 @@ def main(argv: Sequence[str] | None = None, *, git: GitRunner = run_git) -> int:
         for index, problem in enumerate(problems, 1):
             print(f"{index}. {problem}")
         return 1
-    print("OK: ADR 0271 items 3 and 4 evidence is complete")
+    print(f"OK: {complete}")
     return 0
 
 

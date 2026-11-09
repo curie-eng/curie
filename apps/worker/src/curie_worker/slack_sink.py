@@ -175,6 +175,12 @@ _TrustedOrigin = tuple[str, str, int | None]
 # Slack names a thread by its parent message's timestamp: `<seconds>.<micros>`.
 _SLACK_TS = re.compile(r"^\d+\.\d+$")
 
+# A Slack user id (``U...``, or ``W...`` on Enterprise Grid). Posting a card to
+# one opens the user's App Home DM, which is how the worker delivers an approver
+# DM card (ADR 0272 decision 2); it is the only top-level approval card whose
+# address is a user id.
+_SLACK_USER_ID = re.compile(r"^[UW][A-Z0-9]{8,}$")
+
 
 def _thread_ts(conversation_id: str | None) -> str | None:
     """The Slack thread this conversation id names, or None when it names none.
@@ -311,6 +317,21 @@ def _adopt_posted_ts(response: Mapping[str, Any] | AsyncSlackResponse | None) ->
         return None
     ts = response.get("ts")
     return str(ts) if ts else None
+
+
+def _posted_channel(response: Mapping[str, Any] | AsyncSlackResponse | None) -> str | None:
+    """The conversation a top-level ``chat.postMessage`` landed in, or None.
+
+    Provider contract: https://docs.slack.dev/reference/methods/chat.postMessage/
+    A post whose ``channel`` is a user id begins a conversation in that user's
+    App Home, and the response's ``channel`` names that DM (``D...``), not the
+    user id posted to (ADR 0272 decision 2). Read for every top-level post; a
+    caller that needs a DM id checks its shape itself.
+    """
+    if response is None:
+        return None
+    channel = response.get("channel")
+    return channel if isinstance(channel, str) and channel else None
 
 
 async def _post_with_block_fallback(
@@ -511,7 +532,7 @@ class SlackReplyAdapter:
                     identity=identity,
                 )
                 return ReplyAck(ref=ref)
-            ref = await self._post(
+            return await self._post(
                 channel=target.address,
                 message=event.message,
                 requested_by=event.requested_by,
@@ -520,7 +541,6 @@ class SlackReplyAdapter:
                 identity=identity,
                 delivery_id=event.delivery_id,
             )
-            return ReplyAck(ref=ref)
         if isinstance(event, TurnCompleted):
             return ReplyAck(ref=None)
         raise AssertionError(f"unmodelled reply event {event!r}")
@@ -975,7 +995,7 @@ class SlackReplyAdapter:
         endpoint: str | None = None,
         identity: str = DEFAULT_IDENTITY,
         delivery_id: str | None = None,
-    ) -> str | None:
+    ) -> ReplyAck:
         # Render the channel-neutral message into Block Kit HERE, below the seam
         # (ADR-0020): the kernel emits a Confirm intent, the Slack adapter turns it
         # into the approval card's Approve/Reject buttons. A message with no
@@ -1004,6 +1024,17 @@ class SlackReplyAdapter:
         # A rejected Block Kit payload falls back to text-only, mirroring
         # ``update``: the card is the resolve UI, but a plain-text notice still
         # beats losing the message (the API resolve path works regardless).
+        # Not for an approver DM card (ADR 0272 decision 2): a top-level approval
+        # card addressed to a user id. Its buttons are the only way the selected
+        # approver answers, and the worker registers the DM a post answers with,
+        # so a buttonless DM would bind the approval to a card nobody can click.
+        # The error propagates instead and the worker records a DM delivery
+        # failure, including for an ambiguous ``internal_error``.
+        dm_card = (
+            isinstance(intent, ConfirmIntent)
+            and thread_ts is None
+            and _SLACK_USER_ID.fullmatch(channel) is not None
+        )
         response = await self._with_transport_fallback(
             endpoint,
             lambda client: _post_with_block_fallback(
@@ -1013,12 +1044,16 @@ class SlackReplyAdapter:
                 blocks=blocks,
                 thread_ts=thread_ts,
                 client_msg_id=client_msg_id,
+                allow_block_fallback=not dm_card,
             ),
             describe="chat_postMessage",
             operation="post",
             identity=identity,
         )
-        return _adopt_posted_ts(response)
+        return ReplyAck(
+            ref=_adopt_posted_ts(response),
+            channel=None if thread_ts else _posted_channel(response),
+        )
 
     async def _post_progress(
         self,
