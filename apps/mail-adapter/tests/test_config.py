@@ -15,7 +15,7 @@ from pathlib import Path
 
 import pytest
 from curie_channel_gateway.mail.config import MailAdapterConfig
-from pydantic import AliasChoices
+from pydantic import AliasChoices, ValidationError
 
 README = Path(__file__).resolve().parent.parent / "README.md"
 
@@ -226,3 +226,29 @@ def test_the_readme_config_table_matches_the_code() -> None:
         assert documented.intersection(names), f"{name} is read from {names} but undocumented"
 
     assert documented <= readable, f"documented but never read: {sorted(documented - readable)}"
+
+
+@pytest.mark.parametrize(
+    "env_name,field",
+    [
+        ("CURIE_MAIL_CHANNEL_TOKEN_TTL_SECONDS", "channel_token_ttl_seconds"),
+        ("CURIE_MAIL_PRINCIPAL_TTL_SECONDS", "principal_ttl_seconds"),
+    ],
+)
+@pytest.mark.parametrize(
+    "raw,valid", [("0", False), ("1", True), ("604800", True), ("604801", False)]
+)
+def test_rotation_ttls_are_bounded_at_config_loading(
+    monkeypatch: pytest.MonkeyPatch,
+    env_name: str,
+    field: str,
+    raw: str,
+    valid: bool,
+) -> None:
+    _clear_all_config_env(monkeypatch)
+    monkeypatch.setenv(env_name, raw)
+    if valid:
+        assert getattr(MailAdapterConfig(), field) == int(raw)
+    else:
+        with pytest.raises(ValidationError):
+            MailAdapterConfig()
