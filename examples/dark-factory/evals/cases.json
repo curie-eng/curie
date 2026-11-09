@@ -12,10 +12,10 @@
     },
     {
       "id": "knows-the-execution-bound",
-      "input": "How do you determine how long the platform allows this factory run before stopping it? Reply with the issue-read tool and its two returned timing fields, rather than a fixed number of seconds.",
+      "input": "How do you determine how long the platform allows this factory run before stopping it? Reply with exactly one line containing only the issue-read tool identifier and its two returned timing field names, separated by spaces. Do not include values, formulas or a fixed number of seconds.",
       "grader": {
         "kind": "regex",
-        "expected": "(?s)(?:get_issue.*execution_deadline.*execution_seconds|get_issue.*execution_seconds.*execution_deadline|execution_deadline.*get_issue.*execution_seconds|execution_deadline.*execution_seconds.*get_issue|execution_seconds.*get_issue.*execution_deadline|execution_seconds.*execution_deadline.*get_issue)",
+        "expected": "(?s)^[^\\d]*(?:get_issue[^\\d]*execution_deadline[^\\d]*execution_seconds|get_issue[^\\d]*execution_seconds[^\\d]*execution_deadline|execution_deadline[^\\d]*get_issue[^\\d]*execution_seconds|execution_deadline[^\\d]*execution_seconds[^\\d]*get_issue|execution_seconds[^\\d]*get_issue[^\\d]*execution_deadline|execution_seconds[^\\d]*execution_deadline[^\\d]*get_issue)[^\\d]*$",
         "case_sensitive": true
       }
     },
@@ -214,6 +214,33 @@
       "grader": {
         "kind": "contains",
         "expected": "Decisions needed:",
+        "case_sensitive": true
+      }
+    },
+    {
+      "id": "no-pr-handoff-keeps-blockers-open",
+      "input": "The diff reviewer returned round 3 VERDICT: CHANGES with three findings: the migration down path is missing, the new test passes on the old source, and the pull request body has no verification table. This run ends with no pull request. Write only the final reply. In the handoff's Settled section, include the established fact that no pull request was opened; no other reusable fact has been established.",
+      "grader": {
+        "kind": "regex",
+        "expected": "(?is)^Could not complete:[^\\n]*\\nDecisions needed:\\n1\\.[^\\n]*\\?\\n2\\.[^\\n]*\\?\\n3\\.[^\\n]*\\?\\nSettled:\\s*1\\.\\s*(?:No (?:pull request|PR) (?:was |has been )?(?:opened|created|published)|(?:The )?(?:pull request|PR) (?:was |has been )?not (?:opened|created|published))(?: in this run)?\\.?\\s*$",
+        "case_sensitive": false
+      }
+    },
+    {
+      "id": "no-pr-handoff-counts-omitted-blockers",
+      "input": "The final diff review leaves seven unresolved maintainer decisions: rollback behavior, the regression assertion, verification evidence, timeout budget, API error status, duplicate request semantics, and data retention period. This run ends with no pull request. Write only the final reply.",
+      "grader": {
+        "kind": "regex",
+        "expected": "(?is)^Could not complete:[^\\n]*\\nDecisions needed:\\n1\\.[^\\n]*\\?\\n2\\.[^\\n]*\\?\\n3\\.[^\\n]*\\?\\n4 additional unresolved blockers omitted\\.\\nSettled:",
+        "case_sensitive": false
+      }
+    },
+    {
+      "id": "ordinary-delivery-starts-factory",
+      "input": "Implement https://github.com/acme-corp/acme-bot/issues/1.",
+      "grader": {
+        "kind": "tool_called",
+        "expected": "Skill",
         "case_sensitive": true
       }
     }

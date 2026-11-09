@@ -135,8 +135,10 @@ verdict. When the diff reviewer still asks for changes on round 5, a reviewer
 stays unavailable, or the review gate stops the run, the run publishes
 nothing. Its final reply starts with `Could not complete:` and stays under
 1,500 characters, with at most three numbered maintainer questions under
-`Decisions needed:` and three reusable facts under `Settled:`; the platform's
-status comment on the issue carries that handoff.
+`Decisions needed:` and three reusable facts under `Settled:`. Unresolved
+blockers appear only as independent maintainer decisions; omitted blockers
+are counted explicitly. Settled facts cover completed work, verified results
+or run metadata. The platform's status comment on the issue carries that handoff.
 
 A reviewer tags every finding `blocking` (the change would be incorrect or
 unverifiable, or misses a criterion) or `note` (an improvement that does not

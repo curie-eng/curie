@@ -447,11 +447,20 @@ Settled:
 1. <one fact a rerun can reuse>
 
 Use at most 3 numbered questions and at most 3 numbered facts, each one
-sentence. Preserve every unresolved blocker in the questions or facts, and
-include only facts established in this run. A bullet list of review findings
-is not this reply. Do not recount earlier review rounds, and do not paste the
-reviewer's findings. The platform
-posts that reply on the issue; you post nothing there yourself.
+sentence. Put unresolved blockers only under `Decisions needed:`, one per
+question, asking for a concrete maintainer choice such as rollback behavior,
+the behavior a regression test must prove, or the evidence a required check
+must supply. Do not bundle several blockers into a yes/no request to fix them.
+When more than 3 blockers remain, select the 3 highest-impact decisions and
+add an unnumbered line in that section: `<N> additional unresolved blockers
+omitted.`, where N is the total minus the number represented by questions.
+Also count omissions if the length limit requires fewer questions.
+
+`Settled:` contains only completed work, verified results or established run
+metadata that a rerun can reuse. Never put an unresolved defect, missing check,
+requirement or planned fix there; if no such facts exist, write `None.`.
+Do not recount earlier review rounds or paste the reviewer's findings. The
+platform posts that reply on the issue; you post nothing there yourself.
 
 ## 8. Finish (phase `publish`)
 
@@ -506,8 +515,11 @@ Decisions needed:
 Settled:
 1. <one fact a rerun can reuse>
 
-At most 3 numbered questions and at most 3 numbered facts. No bullet list of
-findings and no account of earlier review rounds.
+Use the same decision, fact and overflow rules as "Loop cap": at most 3
+independent maintainer questions, unresolved blockers only under `Decisions
+needed:`, and only completed or verified work and run metadata under `Settled:`.
+Report the count of omitted blockers in an unnumbered line under `Decisions
+needed:`. No account of earlier review rounds.
 
 ## 9. Wait for CI (phase `wait_ci`)
 
