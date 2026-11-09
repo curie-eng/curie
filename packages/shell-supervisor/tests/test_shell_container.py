@@ -1071,7 +1071,7 @@ def test_crash_proof_control_completes_a_tool_and_persists_history(crash_case) -
     assert any(r.get("text") == "recovered" for r in state("/state")["replies"])
     status, body = case["shell"].request(
         "GET",
-        proxy_base_path(case["claim"], 1) + "/v1/status",
+        case["handle"].base_path + "/v1/status",
         token=case["handle"].token,
     )
     assert status == 200 and body["turn_active"] is False and body["history_durable"] is True
@@ -1115,7 +1115,7 @@ def test_worker_kill_recovers_one_reply_and_retires_the_shell(crash_case, phase,
             return True
         code, status = case["shell"].request(
             "GET",
-            proxy_base_path(case["claim"], 1) + "/v1/status",
+            case["handle"].base_path + "/v1/status",
             token=case["handle"].token,
         )
         return code == 200 and status["side_effect_emitted"] is True
