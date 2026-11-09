@@ -11254,8 +11254,17 @@ export const commandManifest = {
           "about": "Runtime E2E the Helm chart on a local cluster: install a trimmed slice, seed a bundle into RustFS, run the sandbox bundle-fetch init pair, and exec-assert the runner's view -- the one-command way to satisfy a chart/sandbox runtime acceptance criterion static checks cannot (#199, `bash scripts/chart-runtime-e2e.sh`)",
           "args": [
             {
+              "env": "CURIE_E2E_KUBE_CONTEXT",
               "global": false,
-              "help": "Allow running against a kube context other than `k8scratch`",
+              "help": "Explicit disposable cluster context",
+              "id": "context",
+              "long": "context",
+              "positional": false,
+              "required": true
+            },
+            {
+              "global": false,
+              "help": "Confirm use of a context outside the disposable-cluster patterns",
               "id": "force",
               "long": "force",
               "positional": false,
@@ -11268,6 +11277,25 @@ export const commandManifest = {
           ],
           "hidden": false,
           "name": "chart-runtime-e2e"
+        },
+        {
+          "about": "Reject hardcoded kube-context flag values in the context-policy sources",
+          "args": [
+            {
+              "global": false,
+              "help": "Exercise rejecting literals and accepting caller variables",
+              "id": "self_test",
+              "long": "self-test",
+              "positional": false,
+              "possible_values": [
+                "true",
+                "false"
+              ],
+              "required": false
+            }
+          ],
+          "hidden": false,
+          "name": "kube-context-check"
         },
         {
           "about": "Lint the interface catalog docs (`bash scripts/check-docs.sh`)",
@@ -11346,8 +11374,17 @@ export const commandManifest = {
               "required": false
             },
             {
+              "env": "CURIE_E2E_KUBE_CONTEXT",
               "global": false,
-              "help": "Allow a kube context other than `k8scratch` (cluster surface only)",
+              "help": "Explicit context for the cluster surface",
+              "id": "context",
+              "long": "context",
+              "positional": false,
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "Confirm use of a context outside the disposable-cluster patterns",
               "id": "force",
               "long": "force",
               "positional": false,
