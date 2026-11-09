@@ -66,7 +66,13 @@ if logs["receivers"] != ["otlp", "k8sobjects/events"]:
     fail(f"logs pipeline receivers: {logs['receivers']}")
 if "otlphttp/logs-sink" not in logs["exporters"]:
     fail("events do not reach the operator's log exporter")
-for sig in ("traces", "metrics"):
+trace_pipelines = [
+    name for name in cfg["service"]["pipelines"]
+    if name == "traces" or name.startswith("traces/")
+]
+if not trace_pipelines:
+    fail("no traces pipeline")
+for sig in [*trace_pipelines, "metrics"]:
     if cfg["service"]["pipelines"][sig]["receivers"] != ["otlp"]:
         fail(f"{sig} pipeline gained the events receiver")
 

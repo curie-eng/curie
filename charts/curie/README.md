@@ -355,14 +355,33 @@ chart's OTLP write path.
 
 `otelCollector.extraProcessors` defines additional Collector processors by
 component ID. `otelCollector.extraTracePipelineProcessors` selects their IDs in
-execution order for the traces pipeline. Selected processors run after
-`memory_limiter` and before `batch`; with both values empty, the rendered
-Collector configuration and all three pipelines retain their existing defaults.
-An upgrade using `--reuse-values` from a release whose values predate these
-keys also treats the omitted keys as empty. An explicitly supplied non-map
-`extraProcessors` or non-list `extraTracePipelineProcessors` is rejected.
-For example, an operator can suppress routine spans before batching and export
-while retaining user, state, and action spans:
+execution order. Selected processors run after `memory_limiter` and before
+`batch` on every trace pipeline. With both values empty, logs and metrics keep
+their processor lists, and `traces/langfuse` runs `memory_limiter`,
+`filter/langfuse_platform_noise`, then `batch`.
+
+The chart always renders `traces/langfuse`. It receives OTLP, runs
+`memory_limiter`, any selected extra processors, the built-in
+`filter/langfuse_platform_noise`, and `batch`, and exports only to
+`otlphttp/langfuse`. The filter uses `error_mode: ignore` and drops spans
+named `http.server.request`, spans whose names match `^curie\.background\.`,
+and spans named `curie.sandbox.cleanup`. Agent run spans stay.
+
+A second pipeline named `traces` renders only when `debugExporter.enabled` is
+true or `extraPipelineExporters` is non-empty. It runs `memory_limiter`, the
+selected extra processors, and `batch`, and exports to the debug exporter and
+`extraPipelineExporters`. It does not export to Langfuse and it does not run
+the platform noise filter, so an operator backend still receives the spans
+Langfuse drops.
+
+`filter/langfuse_platform_noise` is a built-in processor name. An
+`extraProcessors` entry with that name is refused, as is selecting it from
+`extraTracePipelineProcessors`. An upgrade using `--reuse-values` from a
+release whose values predate the extra processor keys still renders the
+built-in filter. An explicitly supplied non-map `extraProcessors` or non-list
+`extraTracePipelineProcessors` is rejected. For example, an operator can
+suppress further routine spans before batching and export while retaining
+user, state, and action spans:
 
 ```yaml
 otelCollector:
@@ -378,7 +397,8 @@ otelCollector:
 The chart refuses an extra processor that replaces a built-in processor, a
 malformed component ID or non-map configuration, an undefined pipeline
 reference, a duplicate selected ID, or a selected built-in ID. The selection
-affects traces only; logs and metrics keep their existing processor order.
+affects trace pipelines only; logs and metrics keep their existing processor
+order. The built-in platform noise filter is not part of that selection.
 The operator owns the filter expression and must validate it against the
 pinned Collector image and representative spans before applying it. On
 Collector contrib 0.119.0, `otelcol-contrib validate --config=...` accepted

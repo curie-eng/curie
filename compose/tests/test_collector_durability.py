@@ -55,6 +55,20 @@ def test_compose_collector_limits_and_persists_every_enabled_signal() -> None:
     assert telemetry["level"] != "none"
     assert telemetry["address"] == "0.0.0.0:8888"
     assert "debug" in config["exporters"]
+    noise = config["processors"]["filter/langfuse_platform_noise"]
+    assert noise["error_mode"] == "ignore"
+    assert noise["traces"]["span"] == [
+        'name == "http.server.request"',
+        'IsMatch(name, "^curie\\\\.background\\\\.")',
+        'name == "curie.sandbox.cleanup"',
+    ]
+    assert pipelines["traces"]["processors"] == [
+        "memory_limiter",
+        "filter/langfuse_platform_noise",
+        "batch",
+    ]
+    assert "filter/langfuse_platform_noise" not in pipelines["logs"]["processors"]
+    assert "filter/langfuse_platform_noise" not in pipelines["metrics"]["processors"]
 
 
 def test_compose_collector_volume_is_writable_by_non_root() -> None:

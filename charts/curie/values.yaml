@@ -1140,9 +1140,11 @@ otelCollector:
   # sending queue. The chart rejects an exporter that omits either protection.
   extraExporters: {}
   # @spec charts/curie/README.md: Optional trace processors.
-  # Additional Collector processor definitions. Select IDs for traces below;
-  # selected processors run after memory_limiter and before batch. Built-in
-  # names are reserved and both keys default to no change in any pipeline.
+  # Additional Collector processor definitions. Select IDs for the trace
+  # pipelines below. Selected processors run after memory_limiter and before
+  # batch on traces/langfuse and, when it renders, on traces. The built-in
+  # filter/langfuse_platform_noise runs after those IDs and before batch on
+  # traces/langfuse only. Built-in names are reserved.
   extraProcessors: {}
   extraTracePipelineProcessors: []
   # Only awsemf exporters may bypass exporterhelper validation on contrib
@@ -1150,8 +1152,11 @@ otelCollector:
   # exporter and checked Collector version. Other network exporters retain
   # the bounded retry and queue requirements.
   exportersWithoutExporterHelper: {}
-  # Exporter names appended in order to the traces pipeline. Each name must
-  # identify an exporter configured above or in extraExporters.
+  # Exporter names for the unfiltered traces pipeline, in order, after debug
+  # when that exporter is enabled. The pipeline renders only when this list is
+  # non-empty or debugExporter is enabled. It does not export to Langfuse and
+  # does not run filter/langfuse_platform_noise. Each name must identify an
+  # exporter configured above or in extraExporters.
   extraPipelineExporters: []
   # Signal-specific exporter lists for the logs and metrics pipelines. Until
   # #1765 supplies their production backends, these pipelines retain nop

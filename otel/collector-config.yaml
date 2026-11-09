@@ -20,6 +20,15 @@ processors:
     limit_percentage: 75
     spike_limit_percentage: 20
   batch: {}
+  # Drops single-span platform traces before Langfuse. Compose has one traces
+  # pipeline, so the local debug exporter sees the same filtered stream.
+  filter/langfuse_platform_noise:
+    error_mode: ignore
+    traces:
+      span:
+        - 'name == "http.server.request"'
+        - 'IsMatch(name, "^curie\\.background\\.")'
+        - 'name == "curie.sandbox.cleanup"'
 
 exporters:
   otlphttp/langfuse:
@@ -64,7 +73,7 @@ service:
   pipelines:
     traces:
       receivers: [otlp]
-      processors: [memory_limiter, batch]
+      processors: [memory_limiter, filter/langfuse_platform_noise, batch]
       exporters: [otlphttp/langfuse, debug]
     logs:
       receivers: [otlp]
