@@ -27,6 +27,7 @@ apps/worker/tests/test_completion_outbox_vector.py
 apps/worker/tests/test_delivery_lease.py
 apps/worker/tests/test_hook_approval_proof_thread_key.py
 apps/worker/tests/test_progress.py
+apps/worker/tests/test_protected_process_migration.py
 apps/worker/tests/test_publication_validation.py
 apps/worker/tests/test_stream_retention.py
 apps/worker/tests/test_workspace_recovery_storage.py
@@ -73,6 +74,7 @@ runner/tests/test_dark_factory_runner_toolchain.py
 runner/tests/test_dockerfile_registry_layer.py
 runner/tests/test_factory_preflight.py
 runner/tests/test_hooks.py
+runner/tests/test_mcp_argv.py
 runner/tests/test_preflight_blocked.py
 runner/tests/test_repository_verification.py
 runner/tests/test_route_callers.py
@@ -177,5 +179,6 @@ tools/identity-e2e/tests/test_stored_card_checks.py
 tools/p0-closes-ci/tests/test_p0_closes_ci.py
 tools/preflight/tests/test_full_preflight.py
 tools/preflight/tests/test_preflight.py
+tools/preflight/tests/test_scan_history.py
 tools/runtime-assertion-gate/tests/test_runtime_assertion_gate.py
 tools/test-env/test_webhook_wake_connector.py
