@@ -67,6 +67,7 @@ from typing import TYPE_CHECKING, Any
 
 from aci_protocol import Attachment, QueuedTurn, ReplyHandle, TurnSource
 from aci_protocol.turn import DEFAULT_IDENTITY
+from curie_internal.slack_mention_receipt import SlackMentionReceipt, write_receipt
 from curie_internal.turn_queue import claim_event, enqueue
 from curie_telemetry import operation_span, record_metric
 from opentelemetry.trace import SpanKind
@@ -639,6 +640,64 @@ def _delivery_canary(
     return False
 
 
+def _write_mention_receipt(
+    *,
+    redis_client: "Redis",
+    config: DispatcherConfig,
+    body: dict[str, Any],
+    event: dict[str, Any],
+    lane: Lane,
+    driver_declared: bool,
+    delivery_id: str,
+    channel: str,
+    slack_identity: str,
+    text: str,
+) -> None:
+    """Record a threaded human mention's receipt; every other delivery writes none.
+
+    Only the native Socket Mode lane calls this. A root mention, a direct
+    message, a bot or marked test action, and a subtyped message cannot steer a
+    factory run, so they leave no receipt for the worker to find.
+    """
+
+    if lane != "mention" or driver_declared:
+        return
+    user = event.get("user")
+    thread_ts = event.get("thread_ts")
+    message_ts = event.get("ts")
+    if (
+        not isinstance(user, str)
+        or not user
+        or event.get("bot_id")
+        or event.get("subtype")
+        or event.get("channel_type") == "im"
+        or not isinstance(thread_ts, str)
+        or not thread_ts
+        or not isinstance(message_ts, str)
+        or not message_ts
+        or thread_ts == message_ts
+    ):
+        return
+    evidence = slack_evidence(body)
+    if evidence is None:
+        return
+    write_receipt(
+        redis_client,
+        SlackMentionReceipt(
+            version=1,
+            delivery_id=delivery_id,
+            channel_identity=minted_adapter(slack_identity),
+            channel=channel,
+            root_ts=thread_ts,
+            message_ts=message_ts,
+            user_id=user,
+            body=text,
+            evidence=evidence,
+        ),
+        ttl_s=config.mention_receipt_ttl_seconds,
+    )
+
+
 def process_event(
     *,
     body: dict[str, Any],
@@ -721,8 +780,10 @@ def process_event(
 
     bots = identity_bots or {}
     # Derive the full Block Kit/attachment body before reading the mark; a
-    # non-empty top-level text remains byte-identical (#2006).
-    text = _strip_self_mention(derive_text(event), bot_user_id)
+    # non-empty top-level text remains byte-identical (#2006). The raw body
+    # feeds only the factory steering receipt; every other use is normalized.
+    raw_text = derive_text(event)
+    text = _strip_self_mention(raw_text, bot_user_id)
     marked = lane == "mention" and bool(event.get("bot_id")) and text.startswith(MARK)
     driver = declared_driver(config, event) if marked else None
     reason = classify(
@@ -770,6 +831,25 @@ def process_event(
             web_client=web_client,
         ):
             return None
+        # Factory steering evidence (#5414): a human's mention replying in a
+        # channel thread records what was said, and who said it, under the
+        # delivery id. Before the claim, so a crash between the two leaves a
+        # redelivery that still finds it; NX, so a redelivery never rewrites
+        # it. The body is the derived event text exactly as Slack delivered it,
+        # before the self-mention strip and any thread context or DM continuity
+        # rewrite. A Valkey failure here raises like the claim's.
+        _write_mention_receipt(
+            redis_client=redis_client,
+            config=config,
+            body=body,
+            event=event,
+            lane=lane,
+            driver_declared=driver is not None,
+            delivery_id=delivery_id,
+            channel=channel,
+            slack_identity=slack_identity,
+            text=raw_text,
+        )
         if not claim_event(redis_client, config, delivery_id):
             drop(log, DropReason.DUPLICATE_DELIVERY, event_id=delivery_id)
             return None

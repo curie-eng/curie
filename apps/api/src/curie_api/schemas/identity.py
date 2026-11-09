@@ -7,6 +7,7 @@ answer is not evidence, and a string ``"false"`` is not ``false``.
 """
 
 import uuid
+from datetime import datetime
 from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field
@@ -61,3 +62,38 @@ class SlackReportOut(BaseModel):
     provider_installation_id: uuid.UUID
     namespace_id: uuid.UUID
     installation_mismatch: bool
+
+
+# A GitHub numeric user id (ADR 0198: GitHub's native id), never a login.
+GITHUB_ACCOUNT_ID_PATTERN = r"^[1-9][0-9]{0,19}$"
+# A canonical lowercase hostname, optionally with a port: github.com or a GHES host.
+CODE_HOST_HOST_PATTERN = (
+    r"^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)*"
+    r"(?::[0-9]{1,5})?$"
+)
+
+
+class CodeHostLinkIn(BaseModel):
+    """An operator's assertion that a principal holds one code host account (#5414).
+
+    Recorded as an ``admin_mapped`` link in the host's ``github_host``
+    namespace (ADR 0198 decision 8). The account is named by its immutable id.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    principal_id: uuid.UUID
+    code_host_kind: Literal["github"]
+    host: str = Field(max_length=255, pattern=CODE_HOST_HOST_PATTERN)
+    account_id: str = Field(pattern=GITHUB_ACCOUNT_ID_PATTERN)
+    created_by_principal_id: uuid.UUID
+
+
+class CodeHostLinkOut(BaseModel):
+    link_id: uuid.UUID
+    identity_namespace_id: uuid.UUID
+
+
+class IdentityLinkRevokedOut(BaseModel):
+    link_id: uuid.UUID
+    revoked_at: datetime

@@ -331,6 +331,12 @@ class CodeHost(Protocol):
         """Optional: whether ``actor`` may write to ``repository``."""
         ...
 
+    async def account_login(self, repository: RepositoryRef, account_id: str) -> str | None:
+        """Optional: the current login of the account with immutable id
+        ``account_id``, read now with ``repository``'s credential. None when the
+        host knows no such account or answers for another one (#5414)."""
+        ...
+
     async def store_evidence(
         self,
         repository: RepositoryRef,

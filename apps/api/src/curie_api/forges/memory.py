@@ -558,6 +558,8 @@ class InMemoryCodeHost(_Declared):
         if declared is None:
             declared = all_supported(CODE_HOST_OPERATIONS)
             declared[Operation.REQUIRED_CHECKS] = Support.UNSUPPORTED
+            # Account ids map to logins only on GitHub (ADR 0198, #5414).
+            declared[Operation.ACCOUNT_LOGIN] = Support.UNSUPPORTED
         self.capabilities = _declared(declared, CODE_HOST_OPERATIONS)
         self.ledger = ledger or WriteLedger()
         self.faults = faults or PageFaults()
@@ -570,6 +572,8 @@ class InMemoryCodeHost(_Declared):
         self._excerpts: dict[tuple[str, str], str] = {}
         self._feedback: dict[PullRequestRef, list[_Feedback]] = {}
         self._writers: dict[RepositoryRef, set[str]] = {}
+        # Immutable account id -> current login, for a declared account_login.
+        self._logins: dict[str, str] = {}
         # UI evidence refs: (project id, key) -> commit. Every stored commit's
         # files stay readable by URL, as a host keeps objects.
         self._evidence: dict[tuple[str, str], str] = {}
@@ -607,6 +611,9 @@ class InMemoryCodeHost(_Declared):
     def grant(self, repository: RepositoryRef, actor: Actor, allowed: bool = True) -> None:
         writers = self._writers[repository]
         (writers.add if allowed else writers.discard)(actor.id)
+
+    def seed_account(self, account_id: str, login: str) -> None:
+        self._logins[account_id] = login
 
     def push(
         self,
@@ -1026,6 +1033,11 @@ class InMemoryCodeHost(_Declared):
     async def user_can_write(self, repository: RepositoryRef, actor: Actor) -> bool:
         self._gate(Operation.USER_CAN_WRITE)
         return actor.id in self._writers.get(self._repository(repository), set())
+
+    async def account_login(self, repository: RepositoryRef, account_id: str) -> str | None:
+        self._gate(Operation.ACCOUNT_LOGIN)
+        self._repository(repository)
+        return self._logins.get(account_id)
 
 
 def _conforms(

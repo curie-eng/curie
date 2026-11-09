@@ -56,6 +56,7 @@ class Operation(enum.StrEnum):
     CI_DIAGNOSTICS = "code_host.ci_diagnostics"
     RERUN_FAILED = "code_host.rerun_failed"
     USER_CAN_WRITE = "code_host.user_can_write"
+    ACCOUNT_LOGIN = "code_host.account_login"
     LIST_FACTORY_PUBLICATIONS = "code_host.list_factory_publications"
     REQUIRED_CHECKS = "code_host.required_checks"
     STORE_EVIDENCE = "code_host.store_evidence"
@@ -88,6 +89,7 @@ OPTIONAL_OPERATIONS: frozenset[Operation] = frozenset(
         Operation.CI_DIAGNOSTICS,
         Operation.RERUN_FAILED,
         Operation.USER_CAN_WRITE,
+        Operation.ACCOUNT_LOGIN,
         Operation.REQUIRED_CHECKS,
         Operation.STORE_EVIDENCE,
         Operation.DELETE_EVIDENCE,

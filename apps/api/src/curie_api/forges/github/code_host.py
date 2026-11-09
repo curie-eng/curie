@@ -884,11 +884,22 @@ class GitHubCodeHost:
             raise Unavailable("pull_request_mismatch")
         for side in (head, base):
             repo = side.get("repo")
-            if repo is None and not require_sides:
+            # A captured immutable id needs both sides' evidence; only a
+            # path-only row may skip an absent side.
+            if repo is None and not require_sides and not repository.project_id.isdigit():
                 continue
             name = repo.get("full_name") if isinstance(repo, dict) else None
             if not isinstance(name, str) or name.casefold() != repository.path.casefold():
                 raise Unavailable("pull_request_mismatch")
+            # A captured immutable id must equal the one GitHub reports: a path
+            # can be taken over by another repository after the original
+            # moved. A missing, null or malformed id is no evidence and is
+            # refused like a different one. A row without a captured id names
+            # its path only (``PATH_ID_PREFIX``).
+            if repository.project_id.isdigit():
+                reported = repo.get("id") if isinstance(repo, dict) else None
+                if type(reported) is not int or str(reported) != repository.project_id:
+                    raise Unavailable("pull_request_mismatch")
         head_sha, head_ref, base_ref = head.get("sha"), head.get("ref"), base.get("ref")
         if (
             not isinstance(head_sha, str)
@@ -1475,3 +1486,24 @@ class GitHubCodeHost:
         if not isinstance(user, dict) or str(user.get("id")) != actor.id:
             return False
         return payload.get("permission") in ("write", "admin")
+
+    async def account_login(self, repository: RepositoryRef, account_id: str) -> str | None:
+        """The current login of the account with immutable id ``account_id``.
+
+        https://docs.github.com/en/rest/users/users#get-a-user-using-their-id
+        The login is trusted only when the payload's own id is the one asked
+        for; an unknown account is no login.
+        """
+
+        if not account_id.isascii() or not account_id.isdigit():
+            return None
+        try:
+            payload = await self._json(
+                "GET", f"/user/{int(account_id)}", token=await self._token(repository.path)
+            )
+        except NotFound:
+            return None
+        if not isinstance(payload, dict) or str(payload.get("id")) != account_id:
+            return None
+        login = payload.get("login")
+        return login if isinstance(login, str) and login else None

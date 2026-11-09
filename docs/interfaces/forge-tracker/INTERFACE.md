@@ -83,9 +83,12 @@ adapter fills it, every other adapter leaves it None);
 `retarget_pull_request` and `read_pull_request`; `list_factory_publications`;
 `observe_ci` on an exact head; `list_review_feedback` since a cursor and
 `verify_feedback`. Optional:
-`ci_diagnostics`, `rerun_failed`, `user_can_write`, `required_checks`,
-`store_evidence` and `delete_evidence` (GitHub only among the shipped code
-hosts; GitLab and both Bitbucket adapters raise `Unsupported`).
+`ci_diagnostics`, `rerun_failed`, `user_can_write`, `account_login`,
+`required_checks`, `store_evidence` and `delete_evidence` (GitHub only among
+the shipped code hosts; GitLab and both Bitbucket adapters raise
+`Unsupported`). `account_login(repository, account_id)` returns the account's
+current login for a numeric id, which factory Slack steering uses to apply pull
+request write authority.
 
 UI evidence. `store_evidence(repository, *, key, files, message, stamp)` hosts
 image files (`EvidenceFile`: a path, its bytes and their sha256) outside every
