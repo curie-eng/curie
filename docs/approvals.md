@@ -831,6 +831,8 @@ owed to the grace-based reconciler, while uncertain appends retain #4016 recover
 the next reconciler pass before grace; grace applies to the remaining owed wakes.
 A resume that succeeds on a retry still keeps one `resume_refused` audit row for each
 failed attempt on a canonical route.
+An approved resume refuses and leaves the wake owed when the stored principal was
+observed disabled or revoked after the approval's saved capture.
 
 - **A paused turn holds nothing.** The queue entry is acknowledged when the turn
   suspends; the resolution arrives later as its own queued turn. No stream entry, thread

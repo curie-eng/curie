@@ -180,13 +180,14 @@ class _RefusalAudit:
 
 async def _audit_refusal(
     factory: Any, row: Approval, who: _RefusalAudit, refusal: HTTPException, stage: str,
+    *, code: str | None = None,
 ) -> None:
     """One audit row for a 403 or 503 refusal on a canonical route, in its own short transaction.
 
     Any other status writes nothing. Called only after every reader, writer and
     identity fence of the refused operation has closed, never under one. The
-    evidence names the public status and detail, the stage and, when the
-    selection policy refused, its code and selection evidence. A failure to
+    evidence names the public status and detail, the stage, a principal refusal
+    code and any selection evidence. A failure to
     write it is logged and never changes the refusal. @spec REQUEST-APPROVAL-5/6.
     """
     if refusal.status_code not in (403, 503):
@@ -194,7 +195,7 @@ async def _audit_refusal(
     evidence: dict[str, Any] = {
         "kind": approval_selection.EVIDENCE_KIND, "mode": row.selection_mode,
         "route": row.route, "key_id": row.selection_key_id, "decision": who.decision,
-        "code": None,
+        "code": code,
     }
     if isinstance(refusal, SelectionRefused):
         evidence.update(refusal.evidence)
@@ -728,7 +729,7 @@ class _Composition:
                             Principal.tenant_id == uuid.UUID(subject.registration.tenant_id),
                             Principal.idp_issuer == facts.identity.issuer,
                             Principal.idp_subject == facts.identity.subject,
-                        ).with_for_update().execution_options(populate_existing=True))
+                        ).execution_options(populate_existing=True))
                         if principal is not None and principal.status in {"disabled", "revoked"}:
                             raise principal_authority.PrincipalAuthorityRefusal(
                                 "principal_inactive",
@@ -1194,14 +1195,14 @@ async def check_http_approval_actor(
         # bound to a local, so no frame-exception cycle outlives the check.
         if audited is not None:
             await _audit_resume_refusal(
-                factory, *audited, _boundary_refusal(error),
+                factory, *audited, error,
                 "capture" if composition is None else composition.stage,
             )
         raise _boundary_refusal(error) from None
 
 
 async def _audit_resume_refusal(
-    factory: Any, row: Approval, saved: wire.ApprovalContextV1, refusal: HTTPException,
+    factory: Any, row: Approval, saved: wire.ApprovalContextV1, error: BaseException,
     stage: str,
 ) -> None:
     """One ``resume_refused`` row naming the preserved answering actor, no principal kind.
@@ -1211,10 +1212,15 @@ async def _audit_resume_refusal(
     @spec REQUEST-APPROVAL-5/6.
     """
     scope = saved.actor_scope
+    code = (
+        "principal_inactive"
+        if isinstance(error, principal_authority.PrincipalAuthorityRefusal)
+        and error.code == "principal_inactive" else None
+    )
     await _audit_refusal(factory, row, _RefusalAudit(
         _RESUME_REFUSED, scope.native_id if scope is not None else (row.resolved_by or ""),
         None if scope is None else scope.actor_channel, None, False, saved.status,
-    ), refusal, stage)
+    ), _boundary_refusal(error), stage, code=code)
 
 
 @dataclass(frozen=True)
@@ -1380,7 +1386,7 @@ def approved_resume_current(
             if entered or audited is None:
                 raise
             await _audit_resume_refusal(
-                factory, audited, saved, _boundary_refusal(error),
+                factory, audited, saved, error,
                 "capture" if composition is None else composition.stage,
             )
             raise

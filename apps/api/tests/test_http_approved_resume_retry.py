@@ -410,7 +410,12 @@ def test_an_approved_resume_preserves_an_independent_http_revocation(
     assert (principal["status"], principal["authorization_version"]) == (
         status, recorded[0].authorization_version,
     )
-    assert resume_refusals(row["id"])[-1]["evidence"]["stage"] == "observe"
+    refusal = resume_refusals(row["id"])[-1]
+    assert refusal["reason"] == "authority_unavailable"
+    assert {key: refusal["evidence"][key] for key in ("stage", "status", "detail", "code")} == {
+        "stage": "observe", "status": 503, "detail": "authority_unavailable",
+        "code": "principal_inactive",
+    }
 
 
 @pytest.mark.parametrize("cause", ["approver_fingerprint", "route"])
