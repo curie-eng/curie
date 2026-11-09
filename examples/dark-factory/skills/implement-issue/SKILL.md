@@ -447,8 +447,10 @@ Settled:
 1. <one fact a rerun can reuse>
 
 Use at most 3 numbered questions and at most 3 numbered facts, each one
-sentence. A bullet list of review findings is not this reply. Do not recount
-earlier review rounds, and do not paste the reviewer's findings. The platform
+sentence. Preserve every unresolved blocker in the questions or facts, and
+include only facts established in this run. A bullet list of review findings
+is not this reply. Do not recount earlier review rounds, and do not paste the
+reviewer's findings. The platform
 posts that reply on the issue; you post nothing there yourself.
 
 ## 8. Finish (phase `publish`)
