@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import json
 import os
+import runpy
+import shlex
 import subprocess
 import sys
 import uuid
@@ -16,6 +18,21 @@ ROOT = Path(__file__).resolve().parents[3]
 TOOL = ROOT / "tools/preflight/scan_history.py"
 LABEL = "io.curie.preflight.scan"
 MARKER = "TRANSPORT_CONTROL_VIOLATION"
+
+
+def test_scanner_detect_arguments_match_the_workflow() -> None:
+    workflow = yaml.safe_load((ROOT / ".github/workflows/gitleaks.yaml").read_text())
+    step = next(
+        step for step in workflow["jobs"]["gitleaks"]["steps"] if step.get("name") == "Run gitleaks"
+    )
+    command = shlex.split(step["run"].replace("\\\n", ""))
+    expected = command[command.index("detect") :]
+    expansion = "${GITLEAKS_LOG_OPTS:+$GITLEAKS_LOG_OPTS}"
+    expected[expected.index(expansion)] = "--log-opts=base..head"
+    arguments = runpy.run_path(str(TOOL))["detect_arguments"]("base", "head")
+    config_index = arguments.index("--config")
+    assert arguments[config_index + 1] == "/repo/.gitleaks.toml"
+    assert arguments[:config_index] + arguments[config_index + 2 :] == expected
 
 
 def run(root: Path, *args: str, check: bool = True) -> subprocess.CompletedProcess[str]:

@@ -111,6 +111,23 @@ def owned(root: Path, name: str, owner: str) -> list[str]:
     )
 
 
+def detect_arguments(base_sha: str, head_sha: str) -> list[str]:
+    return [
+        "detect",
+        "--source",
+        "/repo",
+        "--config",
+        "/repo/.gitleaks.toml",
+        "--redact",
+        "--verbose",
+        "--exit-code",
+        "1",
+        "--report-path",
+        "/repo/gitleaks-report.json",
+        f"--log-opts={base_sha}..{head_sha}",
+    ]
+
+
 def scan(root: Path, *, base: str, head: str, image: str, owner: str) -> int:
     directory = root / ".projects/preflight"
     directory.mkdir(parents=True, exist_ok=True)
@@ -132,18 +149,7 @@ def scan(root: Path, *, base: str, head: str, image: str, owner: str) -> int:
                     "--label",
                     f"{LABEL}={owner}",
                     image,
-                    "detect",
-                    "--source",
-                    "/repo",
-                    "--config",
-                    "/repo/.gitleaks.toml",
-                    "--redact",
-                    "--verbose",
-                    "--exit-code",
-                    "1",
-                    "--report-path",
-                    "/repo/gitleaks-report.json",
-                    f"--log-opts={base_sha}..{head_sha}",
+                    *detect_arguments(base_sha, head_sha),
                 ],
             )
             checked(root, ["docker", "cp", str(candidate) + "/.", name + ":/repo"])

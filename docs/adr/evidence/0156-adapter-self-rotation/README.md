@@ -9,7 +9,9 @@ The existing `rotate_adapter_principal` route in
 `apps/api/src/curie_api/routers/approvals.py` already accepts only a live adapter
 principal, preserves its subject, never widens its binding set, caps the requested
 TTL, and refuses the platform key. Explicit subject or binding overrides are
-refused. Rotation emits a credential-free audit log naming the adapter, following
+refused. Deleted bindings may be dropped from the successor. The adapter accepts
+and restores that narrower principal only while it still serves its channel.
+Rotation emits a credential-free audit log naming the adapter, following
 the existing channel-mint audit convention. Approval decisions retain their
 separate durable `approval_audit` rows.
 
@@ -21,6 +23,9 @@ The mail adapter's turn submission and channel mint share a lock because the API
 revokes a predecessor channel token immediately. Principal predecessors remain
 valid until expiry. The adapter holds no platform key and updates no external
 secret store.
+Principal renewal starts at half-life and continues during a snapshot write
+failure. Only channel mints wait for persistence to recover, since they revoke
+their predecessors immediately.
 
 `apps/mail-adapter/tests/test_self_rotation.py` exercises scheduling, overlap with
 in-flight ingress, snapshot restore, storage failures, refusal and recovery.
