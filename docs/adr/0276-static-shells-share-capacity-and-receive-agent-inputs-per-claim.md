@@ -74,6 +74,12 @@ Workers need access to per-agent credential source files. Credentials are read
 on each new claim; rotating a file does not update an already-running claim.
 Explicit dedicated pools retain an isolation option without changing defaults.
 
+The current public-environment check is a blocklist, and `CURIE_MODEL_ENV_KEY`
+can declare any credential name. Operators must ensure shell-level names and
+values are deployment-wide. Replacing these checks with an allowlist of
+deployment-wide material is a follow-up; the present checks do not prove that
+classification.
+
 Supervisor tests exercise private claim files, malformed input refusals and
 wipe. Static qualification alternates agents on one shell and drives the real
 runner with a scripted model to check configuration and redaction. Container

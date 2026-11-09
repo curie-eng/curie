@@ -567,12 +567,19 @@ def test_two_agents_with_secrets_alternate_on_the_generic_shell(
         asyncio.run(pressure.aclose())
 
 
+@pytest.mark.parametrize("ending", ["", "\n", "\r\n"])
 def test_agent_credential_files_are_read_fresh_and_never_shared(
-    valkey: redis.Redis, prefix: str, tls: ShellTls, shells: ShellFactory, tmp_path: Path
+    valkey: redis.Redis,
+    prefix: str,
+    tls: ShellTls,
+    shells: ShellFactory,
+    tmp_path: Path,
+    ending: str,
 ) -> None:
     shell = shells("shared")
     source = tmp_path / "credential"
-    source.write_text("first-" + uuid.uuid4().hex)
+    credential = "first-" + uuid.uuid4().hex
+    source.write_bytes((credential + ending).encode())
     client = StaticPoolSandboxClient(
         slots=[StaticShellSlot(shell.slot, "localhost", shell.port, POOL)],
         redis_client=valkey,
@@ -594,13 +601,14 @@ def test_agent_credential_files_are_read_fresh_and_never_shared(
             _await_ready(client, name)
             child = json.loads((records / "env.json").read_text())
             if agent == "acme-a":
-                assert child["EXTERNAL_API_TOKEN"] == source.read_text()
+                assert child["EXTERNAL_API_TOKEN"] == credential
                 assert "EXTERNAL_API_TOKEN" in child["CURIE_CONNECTOR_SECRET_KEYS"].split(",")
             else:
                 assert "EXTERNAL_API_TOKEN" not in child
         finally:
             client.delete_claim(name, request_timeout_seconds=20)
-        source.write_text("next-" + uuid.uuid4().hex)
+        credential = "next-" + uuid.uuid4().hex
+        source.write_bytes((credential + ending).encode())
     source.unlink()
     with pytest.raises(SandboxError, match="missing or unreadable"):
         client.create_claim(
@@ -743,3 +751,70 @@ def test_a_withheld_credential_file_never_reaches_a_static_shell(
         )
     assert valkey.exists(f"{prefix}:static:claim:withheld") == 0
     assert valkey.exists(f"{prefix}:static:slot:unused") == 0
+
+
+@pytest.mark.parametrize(
+    "edges",
+    [(" ", ""), ("", " "), ("", "\n\n"), ("", "\r"), ("", "\t\n"), ("\n", "\n")],
+)
+def test_credential_edge_whitespace_is_refused_without_disclosing_the_value(
+    valkey: redis.Redis, prefix: str, tls: ShellTls, tmp_path: Path, edges: tuple[str, str]
+) -> None:
+    source = tmp_path / "credential"
+    secret = "claim-" + uuid.uuid4().hex
+    source.write_bytes((edges[0] + secret + edges[1]).encode())
+    client = StaticPoolSandboxClient(
+        slots=[StaticShellSlot("unused", "localhost", 1, POOL)],
+        redis_client=valkey,
+        control_token=CONTROL_TOKEN,
+        ssl_context=shell_ssl_context(str(tls.ca)),
+        bundle_store=_NoBundles(),
+        key_prefix=prefix,
+        agent_credential_files={"acme-a": {"EXTERNAL_API_TOKEN": str(source)}},
+    )
+    with pytest.raises(SandboxError, match="whitespace") as error:
+        client.create_claim(
+            "invalid-space",
+            pool=POOL,
+            env={"CURIE_RUNNER_TOKEN": _bearer()},
+            agent_name="acme-a",
+            deadline=time.monotonic() + 5,
+        )
+    assert str(source) in str(error.value)
+    assert secret not in str(error.value)
+    assert valkey.exists(f"{prefix}:static:claim:invalid-space") == 0
+
+
+def test_worker_startup_cleans_only_abandoned_claim_archives(
+    valkey: redis.Redis, tls: ShellTls, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import fcntl
+    import tempfile
+
+    from curie_worker.config import WorkerConfig
+    from curie_worker.run import _sandbox_client
+
+    monkeypatch.setattr(tempfile, "tempdir", str(tmp_path))
+    stale = tmp_path / "curie-shell-stage-abandoned.tar"
+    live = tmp_path / "curie-shell-stage-live.tar"
+    unrelated = tmp_path / "unrelated.tar"
+    for path in (stale, live, unrelated):
+        path.write_bytes(b"synthetic claim data")
+    env = {
+        "CURIE_SANDBOX_SUBSTRATE": "static",
+        "CURIE_STATIC_SHELLS": json.dumps(
+            [{"slot": "unused", "host": "localhost", "port": 1, "pool": POOL}]
+        ),
+        "CURIE_STATIC_SHELL_CA_FILE": str(tls.ca),
+        "CURIE_STATIC_SHELL_CONTROL_TOKEN": CONTROL_TOKEN,
+    }
+    config = SubstrateConfig(namespace="default", warm_pool=POOL)
+    worker = WorkerConfig(s3_access_key="rustfs", s3_secret_key="rustfssecret")
+    with live.open("rb") as held:
+        fcntl.flock(held, fcntl.LOCK_EX)
+        _sandbox_client(worker, env, config, redis_client=valkey)
+        assert not stale.exists()
+        assert live.exists() and unrelated.exists()
+    _sandbox_client(worker, env, config, redis_client=valkey)
+    assert not live.exists()
+    assert unrelated.exists()

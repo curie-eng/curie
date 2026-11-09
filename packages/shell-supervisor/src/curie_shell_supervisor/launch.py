@@ -13,14 +13,18 @@ from .protocol import CLAIM_ENV_FILE_ENV
 
 def claim_environment(environ: dict[str, str]) -> dict[str, str]:
     path = Path(environ[CLAIM_ENV_FILE_ENV])
-    info = path.lstat()
-    if (
-        not stat.S_ISREG(info.st_mode)
-        or stat.S_IMODE(info.st_mode) != 0o400
-        or info.st_uid != os.getuid()
-    ):
-        raise ValueError("claim environment must be a runner-owned regular file with mode 0400")
-    value = json.loads(path.read_text(encoding="utf-8"))
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    with os.fdopen(fd, "r", encoding="utf-8") as stream:
+        info = os.fstat(stream.fileno())
+        if (
+            not stat.S_ISREG(info.st_mode)
+            or stat.S_IMODE(info.st_mode) != 0o400
+            or info.st_uid != os.getuid()
+        ):
+            raise ValueError(
+                "claim environment must be a runner-owned regular file with mode 0400"
+            )
+        value = json.load(stream)
     if not isinstance(value, dict) or not all(
         isinstance(k, str)
         and k

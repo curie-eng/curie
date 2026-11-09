@@ -309,6 +309,7 @@ class Supervisor:
                 child = await RunnerChild.spawn(
                     (
                         sys.executable,
+                        "-I",
                         "-m",
                         "curie_shell_supervisor.launch",
                         *self._config.runner_command,

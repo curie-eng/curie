@@ -577,7 +577,7 @@ seen = {
     "bootstrap_consumed": not (Path(os.environ["HOME"]) / "runner-environment.json").exists(),
 }
 Path(os.environ["PROBE_RECORD_DIR"], "seen.json").write_text(json.dumps(seen))
-text = ("current=" + os.environ["EXTERNAL_API_TOKEN"]
+text = ("current=" + os.environ["EXTERNAL_API_TOKEN"].strip()
         + " agent=" + os.environ["CURIE_CONNECTOR_AGENT"])
 def script():
     return [AssistantMessage(content=[TextBlock(text=text)], model="fake-model"),
@@ -588,8 +588,9 @@ boot.main()
 """
 
 
+@pytest.mark.parametrize("ending", ["\n", "\r\n"])
 def test_alternating_agents_have_private_config_credentials_and_redaction(
-    tmp_path: Path, valkey: redis.Redis, prefix: str, tls: ShellTls, state: _StateApi
+    tmp_path: Path, valkey: redis.Redis, prefix: str, tls: ShellTls, state: _StateApi, ending: str
 ) -> None:
     from curie_worker.bundle_store import BundleStore
     from curie_worker.config import WorkerConfig
@@ -608,7 +609,7 @@ def test_alternating_agents_have_private_config_credentials_and_redaction(
     sources = {}
     for agent in agents:
         path = tmp_path / (agent + ".credential")
-        path.write_text(credentials[agent])
+        path.write_bytes((credentials[agent] + ending).encode())
         sources[agent] = {"EXTERNAL_API_TOKEN": str(path)}
     shell = SupervisorProcess(
         slot="shared-proof",
