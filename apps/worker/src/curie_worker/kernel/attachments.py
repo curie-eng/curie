@@ -40,7 +40,7 @@ if TYPE_CHECKING:
     from .core import Kernel
 
 from ..ledger_client import LedgerNotDeployed
-from . import clock, constants, failures, log, routing, workspace
+from . import claim, clock, constants, failures, log, routing, workspace
 from .log import logger
 
 
@@ -303,6 +303,9 @@ async def _route_attachment_and_start(
                             handle=handle,
                             run=self._run_for_event(qevent.event_id),
                             remaining_s=remaining_s,
+                        )
+                        await claim._watch_turn_before_start(
+                            self, thread_key, handle, qevent.event_id, remaining_s
                         )
                         turn = await self._start_turn_under_hook_control(handle, event, remaining_s)
                     except BaseException:  # noqa: BLE001 - broad catch kept at a failure boundary
