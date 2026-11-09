@@ -272,6 +272,13 @@ chart_scenarios:
         - apps/worker/src/curie_worker/connector_k8s.py
         - pyproject.toml
         - uv.lock
+    metrics-alerts:
+      step: Retained metrics and absent-data runtime
+      leg: chart
+      inputs:
+        - charts/curie/ci/runtime/metrics-alerts-runtime.sh
+        - examples/sre-bot/observability/curie-values.yaml
+        - examples/sre-bot/observability/prometheus-values.yaml
     connector-apply-race:
       step: Connector apply survives a concurrent reconciler create
       leg: workload

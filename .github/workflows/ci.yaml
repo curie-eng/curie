@@ -4025,6 +4025,18 @@ jobs:
           set -euo pipefail
           bash tools/runtime-assertion-gate/run.sh \
             charts/curie/ci/runtime/connector-readiness-runtime.sh
+      - name: Retained metrics and absent-data runtime
+        if: ${{ matrix.leg == 'chart' && contains(fromJSON(needs.changes.outputs.chart_scenarios), 'metrics-alerts') }}
+        env:
+          CURIE_2428_CONTEXT: kind-curie-e2e
+          CURIE_2428_NAMESPACE: metrics-${{ github.run_id }}-${{ github.run_attempt }}
+          CURIE_2428_OBS_NAMESPACE: metrics-obs-${{ github.run_id }}-${{ github.run_attempt }}
+          CURIE_2428_RELEASE: metrics-${{ github.run_id }}-${{ github.run_attempt }}
+          CURIE_2428_PROM_RELEASE: metrics-prom-${{ github.run_id }}-${{ github.run_attempt }}
+        run: |
+          set -euo pipefail
+          bash tools/runtime-assertion-gate/run.sh \
+            charts/curie/ci/runtime/metrics-alerts-runtime.sh
       # Runner BYO egress (#2369). Render assertions prove the CIDRs land in
       # NetworkPolicy YAML; this proves a runner-labelled pod can actually
       # reach each declared peer (rustfs, sts, otel, api) and that an

@@ -107,7 +107,9 @@ def problems(text: str, *, yaml_values: bool = False, shell_values: bool = False
             continue
         if value.startswith("-") and not equals_value:
             continue
-        if re.match(r"(?:dir|git|tar|https?)://", value):
+        statement_prefix = normalized[: match.start()].rsplit("\n\n", 1)[-1]
+        kube_consumer = re.search(r"\b(?:kubectl|helm|curie)\b", statement_prefix)
+        if value.startswith("dir://") and kube_consumer is None:
             continue
         if value in EXAMPLE_CONTEXTS or re.fullmatch(r"kind-[A-Za-z0-9_-]+", value):
             continue
@@ -251,6 +253,9 @@ PY''',
             (1, "new-context-driver.sh", f"kubectl {flag} was get pods"),
             (1, "new-context-driver.sh", f"kubectl {flag} flag get pods"),
             (1, "new-context-driver.sh", f"kubectl {flag}=-fixed-cluster get pods"),
+            (1, "new-context-driver.sh", f"kubectl {flag}=https://cluster.example.com get pods"),
+            (1, "new-context-driver.sh", f"kubectl {flag}=dir:///workspace get pods"),
+            (1, "new-context-driver.py", f'argv = ["kubectl",\n    "{flag}", "dir:///workspace"]'),
             (0, "new-context-driver.py", f'if token in ("{flag}", "-n", "--namespace"): pass'),
             (0, "new-context-driver.py", f'if token.startswith(("{flag}=", "--namespace=")): pass'),
             (

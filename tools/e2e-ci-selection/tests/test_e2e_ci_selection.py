@@ -281,6 +281,15 @@ CHART_SCENARIOS: dict[str, _ChartScenario] = {
         ],
         "leg": "chart",
     },
+    "metrics-alerts": {
+        "step": "Retained metrics and absent-data runtime",
+        "inputs": [
+            "charts/curie/ci/runtime/metrics-alerts-runtime.sh",
+            "examples/sre-bot/observability/curie-values.yaml",
+            "examples/sre-bot/observability/prometheus-values.yaml",
+        ],
+        "leg": "chart",
+    },
     "connector-apply-race": {
         "step": "Connector apply survives a concurrent reconciler create",
         "inputs": [
