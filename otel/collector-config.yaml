@@ -29,19 +29,21 @@ processors:
         - >-
           name == "http.server.request" and
           attributes["service.name"] == "curie-api" and
-          attributes["source"] == "GET" and
-          (attributes["operation"] == "/health" or
-          attributes["operation"] == "/ready" or
-          attributes["operation"] == "/agents" or
-          attributes["operation"] == "/agents/{agent_id}" or
-          attributes["operation"] == "/approvals" or
-          attributes["operation"] == "/approvals/{approval_id}" or
-          attributes["operation"] == "/approvals/{approval_id}/audit" or
-          attributes["operation"] == "/langfuse/traces" or
-          attributes["operation"] == "/langfuse/traces/{trace_id}" or
-          attributes["operation"] == "/observability/metrics/summary" or
-          attributes["operation"] == "/observability/metrics/series" or
-          attributes["operation"] == "/observability/runners")
+          attributes["curie.source"] == "GET" and
+          (attributes["curie.operation"] == "/health" or
+          attributes["curie.operation"] == "/ready" or
+          attributes["curie.operation"] == "/agents" or
+          attributes["curie.operation"] == "/agents/{agent_id}" or
+          attributes["curie.operation"] == "/approvals" or
+          attributes["curie.operation"] == "/approvals/{approval_id}" or
+          attributes["curie.operation"] == "/approvals/{approval_id}/audit" or
+          attributes["curie.operation"] == "/langfuse/traces" or
+          attributes["curie.operation"] == "/langfuse/traces/{trace_id}" or
+          attributes["curie.operation"] == "/observability/metrics/summary" or
+          attributes["curie.operation"] == "/observability/metrics/series" or
+          attributes["curie.operation"] == "/observability/runners" or
+          attributes["curie.operation"] == "/cluster-message-replies/{reply_ref}" or
+          attributes["curie.operation"] == "/v1/internal/work-items/runtime-owners")
         - 'IsMatch(name, "^curie\\.background\\.")'
         - 'name == "curie.sandbox.cleanup"'
 

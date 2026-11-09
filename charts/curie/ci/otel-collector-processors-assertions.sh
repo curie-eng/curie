@@ -57,19 +57,21 @@ expected_spans = [
     (
         'name == "http.server.request" and '
         'attributes["service.name"] == "curie-api" and '
-        'attributes["source"] == "GET" and '
-        '(attributes["operation"] == "/health" or '
-        'attributes["operation"] == "/ready" or '
-        'attributes["operation"] == "/agents" or '
-        'attributes["operation"] == "/agents/{agent_id}" or '
-        'attributes["operation"] == "/approvals" or '
-        'attributes["operation"] == "/approvals/{approval_id}" or '
-        'attributes["operation"] == "/approvals/{approval_id}/audit" or '
-        'attributes["operation"] == "/langfuse/traces" or '
-        'attributes["operation"] == "/langfuse/traces/{trace_id}" or '
-        'attributes["operation"] == "/observability/metrics/summary" or '
-        'attributes["operation"] == "/observability/metrics/series" or '
-        'attributes["operation"] == "/observability/runners")'
+        'attributes["curie.source"] == "GET" and '
+        '(attributes["curie.operation"] == "/health" or '
+        'attributes["curie.operation"] == "/ready" or '
+        'attributes["curie.operation"] == "/agents" or '
+        'attributes["curie.operation"] == "/agents/{agent_id}" or '
+        'attributes["curie.operation"] == "/approvals" or '
+        'attributes["curie.operation"] == "/approvals/{approval_id}" or '
+        'attributes["curie.operation"] == "/approvals/{approval_id}/audit" or '
+        'attributes["curie.operation"] == "/langfuse/traces" or '
+        'attributes["curie.operation"] == "/langfuse/traces/{trace_id}" or '
+        'attributes["curie.operation"] == "/observability/metrics/summary" or '
+        'attributes["curie.operation"] == "/observability/metrics/series" or '
+        'attributes["curie.operation"] == "/observability/runners" or '
+        'attributes["curie.operation"] == "/cluster-message-replies/{reply_ref}" or '
+        'attributes["curie.operation"] == "/v1/internal/work-items/runtime-owners")'
     ),
     'IsMatch(name, "^curie\\\\.background\\\\.")',
     'name == "curie.sandbox.cleanup"',
@@ -160,6 +162,8 @@ cases = [
     ("http.server.request", "GET", "/ready", False),
     ("http.server.request", "GET", "/approvals", False),
     ("http.server.request", "GET", "/langfuse/traces", False),
+    ("http.server.request", "GET", "/cluster-message-replies/{reply_ref}", False),
+    ("http.server.request", "GET", "/v1/internal/work-items/runtime-owners", False),
     ("http.server.request", "POST", "/channels/turns", True),
     ("curie.queue.enqueue", "POST", "/channels/turns", True),
     ("http.server.request", "POST", "/approvals/{approval_id}/resolve", True),
@@ -177,18 +181,18 @@ spans, expected = [], []
 now = time.time_ns()
 for index, (name, method, route, keep) in enumerate(cases, 1):
     span_id = f"{index:016x}"
-    attributes = {"service.name": "curie-api", "source": method}
+    attributes = {"service.name": "curie-api", "curie.source": method}
     if route is not None:
-        attributes["operation"] = route
+        attributes["curie.operation"] = route
     span = {
-        "traceId": f"{1 if index == 6 else index:032x}", "spanId": span_id,
+        "traceId": f"{index:032x}", "spanId": span_id,
         "name": name, "kind": 2, "startTimeUnixNano": str(now),
         "endTimeUnixNano": str(now + 1000),
         "attributes": [{"key": key, "value": {"stringValue": value}} for key, value in attributes.items()],
     }
-    if index == 6:
-        span["traceId"] = f"{5:032x}"
-        span["parentSpanId"] = f"{5:016x}"
+    if name == "curie.queue.enqueue":
+        span["traceId"] = f"{index - 1:032x}"
+        span["parentSpanId"] = f"{index - 1:016x}"
     spans.append(span)
     if keep:
         expected.append(span_id)
