@@ -2075,6 +2075,7 @@ jobs:
         ports:
           - 26379:6379
         options: >-
+          --restart unless-stopped
           --health-cmd "valkey-cli ping"
           --health-interval 5s
           --health-timeout 3s
