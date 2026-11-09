@@ -7,7 +7,7 @@ It waits for the worker scheduler; it never invokes a manual hook fire.
 
 Required environment:
 
-CURIE_CRON_APPROVAL_CONTEXT       k8 or kind-test-2940
+CURIE_CRON_APPROVAL_CONTEXT       Explicit disposable Kubernetes context
 CURIE_NAMESPACE                   test-2940
 CURIE_RELEASE                     test-2940
 CURIE_BIN                         Candidate curie binary
@@ -65,8 +65,6 @@ class CronProof(BaseProof):
             self.timeout = int(os.environ.get("CURIE_CRON_APPROVAL_TIMEOUT_SECONDS", "600"))
         except ValueError as exc:
             raise ProofError("CURIE_CRON_APPROVAL_TIMEOUT_SECONDS must be an integer") from exc
-        if self.context not in {"k8", "kind-test-2940"}:
-            raise ProofError("proof context must be k8 or kind-test-2940")
         if self.namespace != "test-2940" or self.release != "test-2940":
             raise ProofError("proof namespace and release must both be test-2940")
         if self.timeout < 120 or self.timeout > 1800:

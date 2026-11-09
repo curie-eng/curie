@@ -3,7 +3,7 @@ version: 1
 install:
   namespace: acme-bot
   release: acme-bot
-  # context: k8
+  # context: <context>
 
 platform:
   ui: false

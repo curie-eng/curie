@@ -1002,25 +1002,28 @@ fn dev_subcommands_parse() {
         _ => panic!("dev identity-e2e parsed as another command"),
     }
     assert!(try_parse_from(["curie", "dev", "identity-e2e"]).is_err());
-    let cli = try_parse_from(["curie", "dev", "chart-runtime-e2e"])
-        .expect("dev chart-runtime-e2e should parse");
-    assert!(matches!(
-        cli.command,
-        Some(Command::Dev {
-            action: DevAction::ChartRuntimeE2e { force: false }
-        })
-    ));
-    // The script's context guard names `--force` as its only override, so the
-    // flag has to survive the `curie dev` hop or the guard is unoverridable
-    // through the documented entry point.
-    let cli = try_parse_from(["curie", "dev", "chart-runtime-e2e", "--force"])
-        .expect("dev chart-runtime-e2e --force should parse");
-    assert!(matches!(
-        cli.command,
-        Some(Command::Dev {
-            action: DevAction::ChartRuntimeE2e { force: true }
-        })
-    ));
+    let context = "scratch-cluster";
+    assert!(try_parse_from(["curie", "dev", "chart-runtime-e2e"]).is_err());
+    for force in [false, true] {
+        let mut args = vec!["curie", "dev", "chart-runtime-e2e", "--context", context];
+        if force {
+            args.push("--force");
+        }
+        let cli = try_parse_from(args).expect("explicit chart context should parse");
+        match cli.command {
+            Some(Command::Dev {
+                action:
+                    DevAction::ChartRuntimeE2e {
+                        context: parsed,
+                        force: parsed_force,
+                    },
+            }) => {
+                assert_eq!(parsed, context);
+                assert_eq!(parsed_force, force);
+            }
+            _ => panic!("expected chart-runtime-e2e"),
+        }
+    }
     let cli =
         try_parse_from(["curie", "dev", "restore-drill"]).expect("dev restore-drill should parse");
     assert!(matches!(
@@ -1073,6 +1076,8 @@ fn dev_subcommands_parse() {
         "worker-death",
         "--bound-seconds",
         "120",
+        "--context",
+        context,
         "--force",
     ])
     .expect("dev recovery-drill flags should parse");
@@ -1083,12 +1088,14 @@ fn dev_subcommands_parse() {
                     surface,
                     scenario,
                     bound_seconds,
+                    context: parsed_context,
                     force,
                 },
         }) => {
             assert_eq!(surface, "cluster");
             assert_eq!(scenario, "worker-death");
             assert_eq!(bound_seconds, 120);
+            assert_eq!(parsed_context.as_deref(), Some(context));
             assert!(force);
         }
         _ => panic!("expected recovery-drill"),

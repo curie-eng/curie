@@ -5,12 +5,12 @@
 # carries the delete bound. This script does not.
 #
 # Usage:
-#   bash cli/scripts/cluster-down-namespace-bound.sh [--keep]
+#   bash cli/scripts/cluster-down-namespace-bound.sh --kind-cluster <name> [--keep]
 #   bash cli/scripts/cluster-down-namespace-bound.sh --self-test
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
-KIND_CLUSTER=test-4017-cluster-down
+KIND_CLUSTER="${CURIE_E2E_KIND_CLUSTER:-}"
 NS=test-4017-down
 RELEASE=t4017
 KUBECONFIG="$REPO_ROOT/.projects/4017/kubeconfig"
@@ -37,14 +37,14 @@ SELF_TEST=0
 CREATED=0
 DOWN_SECONDS=0
 
-for arg in "$@"; do
-  case "$arg" in
-    --self-test) SELF_TEST=1 ;;
-    --keep) KEEP=1 ;;
-    *)
-      echo "unknown argument: $arg" >&2
-      exit 2
-      ;;
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --self-test) SELF_TEST=1; shift ;;
+    --keep) KEEP=1; shift ;;
+    --kind-cluster)
+      [[ $# -ge 2 && -n "$2" ]] || { echo "--kind-cluster needs a value" >&2; exit 2; }
+      KIND_CLUSTER="$2"; shift 2 ;;
+    *) echo "unknown argument: $1" >&2; exit 2 ;;
   esac
 done
 
@@ -53,7 +53,6 @@ self_test() {
   for needle in \
     "example.com/hold" \
     "330" \
-    "test-4017-cluster-down" \
     "test-4017-down" \
     "t4017" \
     "kind delete"
@@ -70,8 +69,11 @@ if [[ "$SELF_TEST" -eq 1 ]]; then
   self_test
 fi
 
+[[ -n "$KIND_CLUSTER" ]] || { echo "--kind-cluster or CURIE_E2E_KIND_CLUSTER is required" >&2; exit 2; }
+KUBE_CONTEXT="kind-$KIND_CLUSTER"
+
 case "$KIND_CLUSTER" in
-  k8|Prod*|Staging*)
+  Prod*|Staging*)
     echo "refusing context $KIND_CLUSTER" >&2
     exit 1
     ;;
@@ -118,18 +120,11 @@ fi
 
 CREATED=1
 kind create cluster --name "$KIND_CLUSTER" --kubeconfig "$KUBECONFIG" --wait 180s
-kubectl --kubeconfig "$KUBECONFIG" config rename-context "kind-${KIND_CLUSTER}" "$KIND_CLUSTER"
-current="$(kubectl --kubeconfig "$KUBECONFIG" config current-context)"
-if [[ "$current" != "$KIND_CLUSTER" ]]; then
-  echo "isolated kubeconfig current context is $current, expected $KIND_CLUSTER" >&2
+current="$(kubectl --kubeconfig "$KUBECONFIG" --context "$KUBE_CONTEXT" config current-context)"
+if [[ "$current" != "$KUBE_CONTEXT" ]]; then
+  echo "isolated kubeconfig current context is $current, expected $KUBE_CONTEXT" >&2
   exit 1
 fi
-case "$current" in
-  k8|Prod*|Staging*)
-    echo "refusing context $current" >&2
-    exit 1
-    ;;
-esac
 
 LOG_DIR="$(mktemp -d)"
 
@@ -141,7 +136,7 @@ run_down() {
   # An external watchdog so a missing sweep bound fails this scenario instead
   # of leaving the process waiting. 330s is the acceptance ceiling.
   timeout 330 "$CURIE_BIN" cluster down \
-    --context "$KIND_CLUSTER" \
+    --context "$KUBE_CONTEXT" \
     --namespace "$NS" \
     --release "$RELEASE" \
     --yes \
@@ -157,7 +152,7 @@ plain_install() {
   # `cluster up` has no values-file flag. On a kind node with no RuntimeClass
   # it infers security.gvisor.mode=off itself.
   "$CURIE_BIN" cluster up \
-    --context "$KIND_CLUSTER" \
+    --context "$KUBE_CONTEXT" \
     --namespace "$NS" \
     --release "$RELEASE" \
     --chart "$REPO_ROOT/charts/curie" \
@@ -167,19 +162,19 @@ plain_install() {
 }
 
 assert_release_gone() {
-  if kubectl --context "$KIND_CLUSTER" get namespace "$NS" >/dev/null 2>&1; then
+  if kubectl --context "$KUBE_CONTEXT" get namespace "$NS" >/dev/null 2>&1; then
     echo "namespace $NS is still present" >&2
     exit 1
   fi
   local owned claims
-  owned="$(kubectl --context "$KIND_CLUSTER" get namespace \
+  owned="$(kubectl --context "$KUBE_CONTEXT" get namespace \
     -l "curietech.ai/created-by=${RELEASE},curietech.ai/created-in=${NS}" \
     -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}')"
   if [[ -n "$owned" ]]; then
     echo "owned namespaces remain: $owned" >&2
     exit 1
   fi
-  claims="$(kubectl --context "$KIND_CLUSTER" get pv \
+  claims="$(kubectl --context "$KUBE_CONTEXT" get pv \
     -o jsonpath='{range .items[*]}{.spec.claimRef.namespace}{"\n"}{end}')"
   if printf '%s\n' "$claims" | grep -Fxq -- "$NS"; then
     echo "a PersistentVolume claimRef.namespace is still $NS" >&2
@@ -196,8 +191,8 @@ fi
 assert_release_gone
 
 plain_install
-kubectl --context "$KIND_CLUSTER" -n "$NS" create configmap hold --from-literal=keep=yes
-kubectl --context "$KIND_CLUSTER" -n "$NS" patch configmap hold --type=json \
+kubectl --context "$KUBE_CONTEXT" -n "$NS" create configmap hold --from-literal=keep=yes
+kubectl --context "$KUBE_CONTEXT" -n "$NS" patch configmap hold --type=json \
   --patch='[{"op":"add","path":"/metadata/finalizers","value":["example.com/hold"]}]'
 
 stuck_rc=0
@@ -217,12 +212,12 @@ if ! grep -q hold "$LOG_DIR/stuck-down.txt"; then
   cat "$LOG_DIR/stuck-down.txt" >&2
   exit 1
 fi
-phase="$(kubectl --context "$KIND_CLUSTER" get namespace "$NS" -o jsonpath='{.status.phase}')"
+phase="$(kubectl --context "$KUBE_CONTEXT" get namespace "$NS" -o jsonpath='{.status.phase}')"
 if [[ "$phase" != "Terminating" ]]; then
   echo "namespace $NS phase is $phase, expected Terminating" >&2
   exit 1
 fi
-finalizers="$(kubectl --context "$KIND_CLUSTER" -n "$NS" get configmap hold -o jsonpath='{.metadata.finalizers}')"
+finalizers="$(kubectl --context "$KUBE_CONTEXT" -n "$NS" get configmap hold -o jsonpath='{.metadata.finalizers}')"
 case "$finalizers" in
   *example.com/hold*) ;;
   *)
@@ -231,7 +226,7 @@ case "$finalizers" in
     ;;
 esac
 
-kubectl --context "$KIND_CLUSTER" -n "$NS" patch configmap hold --type=json \
+kubectl --context "$KUBE_CONTEXT" -n "$NS" patch configmap hold --type=json \
   --patch='[{"op":"replace","path":"/metadata/finalizers","value":[]}]'
 if ! run_down "$LOG_DIR/cleared-down.txt"; then
   echo "cluster down after the test removed the finalizer failed" >&2
