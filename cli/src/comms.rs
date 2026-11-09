@@ -497,14 +497,15 @@ pub async fn local_comms(opts: LocalCommsOpts) -> Result<CommsOutput> {
 }
 
 #[cfg(test)]
-#[test]
-fn slack_token_consumers_match_chart() {
+#[tokio::test]
+async fn slack_token_consumers_match_chart() {
     let chart = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../charts/curie");
-    let output = std::process::Command::new("helm")
-        .arg("template")
-        .arg("acme")
-        .arg(chart)
-        .args([
+    let command = OpsCommand::new(
+        "helm",
+        [
+            "template",
+            "acme",
+            chart.to_str().expect("UTF-8 chart path"),
             "--set",
             "security.allowDevDefaults=true",
             "--set",
@@ -515,15 +516,15 @@ fn slack_token_consumers_match_chart() {
             "channelGateway.deploy=true",
             "--set",
             "channelGateway.allowInsecure=true",
-        ])
-        .output()
-        .expect("helm is required to verify the rendered Slack token consumers");
-    assert!(
-        output.status.success(),
-        "helm template failed: {}",
-        String::from_utf8_lossy(&output.stderr)
+        ]
+        .into_iter()
+        .map(plain)
+        .collect(),
     );
-    let rendered = String::from_utf8(output.stdout).expect("UTF-8 chart render");
+    let (ok, rendered, stderr) = crate::ops::run_capture(&command)
+        .await
+        .expect("helm is required to verify the rendered Slack token consumers");
+    assert!(ok, "helm template failed: {stderr}");
     let mut chart_consumers = std::collections::BTreeSet::new();
     for document in rendered.split("\n---") {
         if !document.lines().any(|line| line == "kind: Deployment") {
