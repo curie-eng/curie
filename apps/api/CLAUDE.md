@@ -108,7 +108,7 @@ worker, Postgres, RustFS/S3, Langfuse, and GitHub.
   stored bundle manifest, cached by digest), the binding and provider membership.
   Authorization is surface neutral; a kind is readable only through a
   `channel_read/readers.py` reader that advertises `history-read`, and Slack
-  reads live only in `channel_read/slack_reads.py`. A turn may spend
+  reads live only in `packages/channel-gateway/src/curie_channel_gateway/slack/reads.py`. A turn may spend
   8 pages, a window is at most 7 days, and `limit` defaults to 50 with a 100
   maximum. Refusals are named `channel_read.*` codes; a 429 carries
   `Retry-After`. It stores no message body. State, issue read
@@ -122,7 +122,7 @@ worker, Postgres, RustFS/S3, Langfuse, and GitHub.
   download or edit, charges one page per successful operation, and edits only
   a table cell a read recorded in the same logical turn
   (`channel_read/canvas_sections.py`). Slack canvas calls live only in
-  `channel_read/slack_canvas.py`. Each edit is written to
+  `packages/channel-gateway/src/curie_channel_gateway/slack/canvas.py`. Each edit is written to
   `channel_canvas_edits` (attempted, then applied or failed; an unconfirmed
   outcome stays attempted) before and after the Slack call. Retrieved canvas
   content is not stored.

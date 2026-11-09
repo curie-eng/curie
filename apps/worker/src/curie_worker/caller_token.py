@@ -28,6 +28,7 @@ from nacl.signing import SigningKey
 PREFIX = "cct"
 # A route token (ADR 0240 decision 2): the caller's claims plus one connector.
 ROUTE_PREFIX = "ccr"
+UPLOAD_PREFIX = "ccu"
 
 # ADR 0270 decision 3: the requester fact a sandbox route records for the cct
 # it booted with. ``REQUESTER_ABSENT`` is a boot env with no cct at all,
@@ -179,6 +180,16 @@ def _check_run_pair(run: str | None, work_item: str | None) -> None:
         _UUID.fullmatch(run) is None or _UUID.fullmatch(work_item or "") is None
     ):
         raise ValueError("run and work_item must be lowercase hyphenated uuids")
+
+
+def mint_upload(signing_key_text: str, *, agent: str, connector: str, exp: int) -> str:
+    """Sign an upload-only capability, never accepted by the MCP or route listeners."""
+
+    if not agent or not connector or type(exp) is not int:
+        raise ValueError("an upload token requires agent, connector and integer expiry")
+    return _signed(
+        signing_key_text, UPLOAD_PREFIX, {"agent": agent, "connector": connector, "exp": exp}
+    )
 
 
 def _signed(signing_key_text: str, prefix: str, body: dict[str, object]) -> str:

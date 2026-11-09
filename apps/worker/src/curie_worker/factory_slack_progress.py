@@ -58,10 +58,11 @@ from typing import Any, Final
 
 from channel_protocol import MESSAGE_VERSION, OutboundMessage
 from channel_protocol.reply import PROGRESS_REPLY_WIRE_VERSION, ReplyPost, ReplyTarget
+from curie_channel_gateway.reply_errors import InvalidReplyTargetError
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncEngine
 
-from .reply_sink import InvalidReplyTargetError, ReplySink, TargetRoute
+from .reply_sink import ReplySink, TargetRoute
 
 logger = logging.getLogger(__name__)
 

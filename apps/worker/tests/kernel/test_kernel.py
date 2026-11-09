@@ -3156,7 +3156,7 @@ def test_active_file_turn_with_a_real_delivery_lease_settles_once(
     """A refused active file turn is delivered, acknowledged, and never reclaimed."""
 
     async def go() -> None:
-        from curie_dispatcher.queue import to_stream_fields
+        from curie_internal.turn_queue import to_stream_fields
         from curie_worker.consumer import Consumer, refuse_unconfigured_reminder
         from curie_worker.delivery_lease import DeliveryLeaseStore
 
@@ -7286,7 +7286,7 @@ async def _leased_entry(h: Any, store: Any, *, event_id: str, generation: int) -
     and only signal the reclaim preflight keys on (a distributed-state fact, not
     a sniff of the message text: kernel rule 3 stands).
     """
-    from curie_dispatcher.queue import to_stream_fields
+    from curie_internal.turn_queue import to_stream_fields
 
     await h.async_redis.xadd(
         h.config.stream, to_stream_fields(qevent("reclaimed", event_id=event_id))
@@ -7337,7 +7337,7 @@ def test_a_long_turn_keeps_accepting_steers_and_a_finished_one_opens_a_new_turn(
     ``h.runner.opened`` is the negative control on the steering half: a steer
     that silently became a second turn shows up there.
     """
-    from curie_dispatcher.queue import to_stream_fields
+    from curie_internal.turn_queue import to_stream_fields
     from curie_worker.consumer import Consumer, refuse_unconfigured_reminder
 
     # Imported inside the test on purpose: ``delivery_lease`` does not exist
@@ -7541,25 +7541,11 @@ def test_a_reclaimed_delivery_interrupts_a_still_active_retained_runner(
     asyncio.run(go())
 
 
-def test_an_unreadable_runner_fails_closed_and_leaves_a_reclaimed_delivery_pending(
+def test_an_unreadable_runner_keeps_a_reclaimed_delivery_pending_until_recovery(
     make_harness,
 ) -> None:
-    """Reclaim preflight rule 3: an unreadable runner FAILS CLOSED.
-
-    ``_turn_active`` already reports busy on an unreadable answer, so the bounded
-    poll can never clear and the preflight must raise -- leaving the stream entry
-    PENDING rather than running a replacement beside a turn whose liveness nobody
-    can read. Asserted at the consumer, because "left pending" is the observable
-    contract and does not depend on which exception type the preflight raises.
-
-    Red on making the preflight fail OPEN (proceeding when liveness is
-    unreadable), which is the failure mode a "just retry it" simplification
-    reaches for.
-
-    The negative control is the second delivery, with the status endpoint
-    healthy again: the same reclaimed entry then runs and acks.
-    """
-    from curie_dispatcher.queue import to_stream_fields
+    """An unreadable predecessor holds the same delivery until liveness recovers."""
+    from curie_internal.turn_queue import to_stream_fields
     from curie_worker.consumer import Consumer, refuse_unconfigured_reminder
 
     # Imported inside the test on purpose: ``delivery_lease`` does not exist
@@ -7605,25 +7591,32 @@ def test_an_unreadable_runner_fails_closed_and_leaves_a_reclaimed_delivery_pendi
 
             h.runner.status_fails = True
             await consumer._dispatch(entry_id, dict(fields))
-            await asyncio.gather(*list(consumer._inflight), return_exceptions=True)
+            inflight = list(consumer._inflight)
+            try:
+                await wait_until(lambda: h.runner.interrupts >= 2, timeout=15.0)
+                assert all(not task.done() for task in inflight)
 
-            assert h.runner.opened == ["first"], (
-                "a replacement ran beside a runner whose liveness could not be read"
-            )
-            summary = await h.async_redis.xpending(h.config.stream, h.config.consumer_group)
-            assert summary["pending"] == 1, "an unreadable runner did not leave the entry pending"
+                assert h.runner.opened == ["first"], (
+                    "a replacement ran beside a runner whose liveness could not be read"
+                )
+                summary = await h.async_redis.xpending(h.config.stream, h.config.consumer_group)
+                assert summary["pending"] == 1
+                assert await h.async_redis.xlen(h.config.dead_letter_stream_name()) == 0
 
-            # NEGATIVE CONTROL: the status endpoint recovers and the same
-            # reclaimed entry runs to an ACK.
-            h.runner.status_fails = False
-            h.runner.turn_active = False
-            h.runner.default_script = [Final(text="two", status=DONE)]
-            await consumer._dispatch(entry_id, dict(fields))
-            await asyncio.gather(*list(consumer._inflight), return_exceptions=True)
+                h.runner.status_fails = False
+                h.runner.turn_active = False
+                h.runner.default_script = [Final(text="two", status=DONE)]
+                async with asyncio.timeout(10):
+                    await asyncio.gather(*inflight)
 
-            assert h.runner.opened == ["first", "second"]
-            summary = await h.async_redis.xpending(h.config.stream, h.config.consumer_group)
-            assert summary["pending"] == 0
+                assert h.runner.opened == ["first", "second"]
+                summary = await h.async_redis.xpending(h.config.stream, h.config.consumer_group)
+                assert summary["pending"] == 0
+            finally:
+                consumer.request_stop()
+                for task in inflight:
+                    task.cancel()
+                await asyncio.gather(*inflight, return_exceptions=True)
 
     asyncio.run(go())
 

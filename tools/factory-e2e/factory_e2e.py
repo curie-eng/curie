@@ -129,7 +129,7 @@ log shows a TLS verification failure.
 `repo-runner` (repo_runner.py) installs the operator's three repository
 bindings, two with runners and one without, in its own namespace under release
 `factory-tools` on the cluster named by an explicit --context (for example
-k8-scratch). A local scripted Messages endpoint requests the image tool
+throwaway-cluster). A local scripted Messages endpoint requests the image tool
 manifest on each of seven turns: X and Y on their runners, the unconfigured
 repository on the agent image, Y refused with workspace.selection_conflict on
 X's thread, X after a runner change on that thread, and both refusal faults on
@@ -6597,7 +6597,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         help="preflight, then one scenario driver",
         description=(
             "repo-runner: needs an explicit --context (a throwaway cluster such as "
-            "k8-scratch), release factory-tools, local scripted model. Set "
+            "throwaway-cluster), release factory-tools, local scripted model. Set "
             "CURIE_FACTORY_REPO_RUNNER_PLAN (three chart bindings and seven turns) and "
             "CURIE_LOCAL_STUB_HOST. docker: run --scenario docker --context <context> with "
             "CURIE_LOCAL_STUB_HOST and no model credential; builds the worktree HEAD into a "

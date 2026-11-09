@@ -164,7 +164,7 @@ def test_a_turn_runs_end_to_end_and_acks_under_the_worker_role(
     sandbox affinity and the reply, from an entry written by the enqueue role,
     @spec PROTECTED-HOOK-LANE-3 PROTECTED-HOOK-LANE-7."""
     from aci_protocol import Final, SessionStatus, TextDelta
-    from curie_dispatcher.queue import to_stream_fields
+    from curie_internal.turn_queue import to_stream_fields
     from curie_worker.consumer import Consumer, refuse_unconfigured_reminder
     from curie_worker.delivery_lease import DeliveryLeaseStore
     from queue_fixtures import qevent, wait_until
@@ -261,7 +261,7 @@ def test_a_crashed_consumers_pending_entry_is_reclaimed_and_run_under_the_role(
     """XAUTOCLAIM, the lease transfer script, the reclaim lock and the idle-owner
     checks, @spec PROTECTED-HOOK-LANE-3 PROTECTED-HOOK-LANE-6."""
     from aci_protocol import Final, SessionStatus
-    from curie_dispatcher.queue import to_stream_fields
+    from curie_internal.turn_queue import to_stream_fields
     from curie_worker.consumer import Consumer, refuse_unconfigured_reminder
     from curie_worker.delivery_lease import DeliveryLeaseStore
     from queue_fixtures import qevent, wait_until

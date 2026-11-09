@@ -11,6 +11,7 @@ resolution-markers = [
 members = [
     "aci-protocol",
     "curie-api",
+    "curie-channel-gateway",
     "curie-channel-protocol",
     "curie-discord-adapter",
     "curie-dispatcher",
@@ -20,6 +21,7 @@ members = [
     "curie-mail-adapter",
     "curie-protected-hooks",
     "curie-runner",
+    "curie-shell-supervisor",
     "curie-telemetry",
     "curie-telemetry-schema",
     "curie-test-support",
@@ -786,6 +788,7 @@ dependencies = [
     { name = "asyncpg" },
     { name = "boto3" },
     { name = "boto3-stubs", extra = ["s3"] },
+    { name = "curie-channel-gateway" },
     { name = "curie-channel-protocol" },
     { name = "curie-internal" },
     { name = "curie-protected-hooks" },
@@ -813,6 +816,7 @@ requires-dist = [
     { name = "asyncpg", specifier = ">=0.30" },
     { name = "boto3", specifier = ">=1.43.55" },
     { name = "boto3-stubs", extras = ["s3"], specifier = ">=1.43.57" },
+    { name = "curie-channel-gateway", editable = "packages/channel-gateway" },
     { name = "curie-channel-protocol", editable = "packages/channel-protocol" },
     { name = "curie-internal", editable = "packages/curie-internal" },
     { name = "curie-protected-hooks", editable = "packages/protected-hooks" },
@@ -831,6 +835,39 @@ requires-dist = [
     { name = "redis", specifier = ">=5.0" },
     { name = "sqlalchemy", extras = ["asyncio"], specifier = ">=2.0" },
     { name = "uvicorn", extras = ["standard"], specifier = ">=0.51.0" },
+]
+
+[[package]]
+name = "curie-channel-gateway"
+version = "0.1.0"
+source = { editable = "packages/channel-gateway" }
+dependencies = [
+    { name = "aci-protocol" },
+    { name = "aiohttp" },
+    { name = "curie-channel-protocol" },
+    { name = "curie-internal" },
+    { name = "curie-telemetry" },
+    { name = "curie-upgrade-pause" },
+    { name = "httpx" },
+    { name = "pydantic" },
+    { name = "pydantic-settings" },
+    { name = "redis" },
+    { name = "slack-bolt" },
+]
+
+[package.metadata]
+requires-dist = [
+    { name = "aci-protocol", editable = "packages/aci-protocol" },
+    { name = "aiohttp", specifier = ">=3.11" },
+    { name = "curie-channel-protocol", editable = "packages/channel-protocol" },
+    { name = "curie-internal", editable = "packages/curie-internal" },
+    { name = "curie-telemetry", editable = "packages/telemetry" },
+    { name = "curie-upgrade-pause", editable = "packages/upgrade-pause" },
+    { name = "httpx", specifier = ">=0.28" },
+    { name = "pydantic", specifier = ">=2.10" },
+    { name = "pydantic-settings", specifier = ">=2.15.0" },
+    { name = "redis", specifier = ">=5.2" },
+    { name = "slack-bolt", specifier = ">=1.30.0" },
 ]
 
 [[package]]
@@ -874,29 +911,11 @@ name = "curie-dispatcher"
 version = "0.0.0"
 source = { editable = "apps/dispatcher" }
 dependencies = [
-    { name = "aci-protocol" },
-    { name = "curie-internal" },
-    { name = "curie-telemetry" },
-    { name = "curie-upgrade-pause" },
-    { name = "httpx" },
-    { name = "pydantic" },
-    { name = "pydantic-settings" },
-    { name = "redis" },
-    { name = "slack-bolt" },
+    { name = "curie-channel-gateway" },
 ]
 
 [package.metadata]
-requires-dist = [
-    { name = "aci-protocol", editable = "packages/aci-protocol" },
-    { name = "curie-internal", editable = "packages/curie-internal" },
-    { name = "curie-telemetry", editable = "packages/telemetry" },
-    { name = "curie-upgrade-pause", editable = "packages/upgrade-pause" },
-    { name = "httpx", specifier = ">=0.28" },
-    { name = "pydantic", specifier = ">=2.10" },
-    { name = "pydantic-settings", specifier = ">=2.15.0" },
-    { name = "redis", specifier = ">=5.2" },
-    { name = "slack-bolt", specifier = ">=1.30.0" },
-]
+requires-dist = [{ name = "curie-channel-gateway", editable = "packages/channel-gateway" }]
 
 [[package]]
 name = "curie-doclint"
@@ -936,6 +955,7 @@ version = "0.0.0"
 source = { editable = "packages/curie-internal" }
 dependencies = [
     { name = "aci-protocol" },
+    { name = "curie-telemetry" },
     { name = "pydantic" },
     { name = "pynacl" },
     { name = "redis" },
@@ -945,6 +965,7 @@ dependencies = [
 [package.metadata]
 requires-dist = [
     { name = "aci-protocol", editable = "packages/aci-protocol" },
+    { name = "curie-telemetry", editable = "packages/telemetry" },
     { name = "pydantic", specifier = ">=2.9" },
     { name = "pynacl", specifier = ">=1.5" },
     { name = "redis", specifier = ">=5.2" },
@@ -957,6 +978,7 @@ version = "0.0.0"
 source = { editable = "apps/mail-adapter" }
 dependencies = [
     { name = "aci-protocol" },
+    { name = "curie-channel-gateway" },
     { name = "curie-channel-protocol" },
     { name = "curie-internal" },
     { name = "curie-telemetry" },
@@ -968,6 +990,7 @@ dependencies = [
 [package.metadata]
 requires-dist = [
     { name = "aci-protocol", editable = "packages/aci-protocol" },
+    { name = "curie-channel-gateway", editable = "packages/channel-gateway" },
     { name = "curie-channel-protocol", editable = "packages/channel-protocol" },
     { name = "curie-internal", editable = "packages/curie-internal" },
     { name = "curie-telemetry", editable = "packages/telemetry" },
@@ -1006,8 +1029,10 @@ dependencies = [
     { name = "aiohttp" },
     { name = "anyio" },
     { name = "claude-agent-sdk" },
+    { name = "curie-internal" },
     { name = "curie-telemetry" },
     { name = "curie-telemetry-schema" },
+    { name = "httpx2" },
     { name = "mcp" },
     { name = "opentelemetry-sdk" },
     { name = "plugin-format" },
@@ -1019,12 +1044,25 @@ requires-dist = [
     { name = "aiohttp", specifier = ">=3.14.3" },
     { name = "anyio", specifier = ">=4.6" },
     { name = "claude-agent-sdk", specifier = ">=0.2.158" },
+    { name = "curie-internal", editable = "packages/curie-internal" },
     { name = "curie-telemetry", editable = "packages/telemetry" },
     { name = "curie-telemetry-schema", editable = "packages/telemetry-schema" },
+    { name = "httpx2", specifier = ">=2.0" },
     { name = "mcp", specifier = ">=1.28.1" },
     { name = "opentelemetry-sdk", specifier = ">=1.44.0" },
     { name = "plugin-format", editable = "packages/plugin-format" },
 ]
+
+[[package]]
+name = "curie-shell-supervisor"
+version = "0.0.0"
+source = { editable = "packages/shell-supervisor" }
+dependencies = [
+    { name = "aiohttp" },
+]
+
+[package.metadata]
+requires-dist = [{ name = "aiohttp", specifier = ">=3.11" }]
 
 [[package]]
 name = "curie-telemetry"
@@ -1055,7 +1093,10 @@ name = "curie-test-support"
 version = "0.0.0"
 source = { editable = "packages/test-support" }
 dependencies = [
+    { name = "aiohttp" },
     { name = "asyncpg" },
+    { name = "cryptography" },
+    { name = "curie-channel-gateway" },
     { name = "pytest" },
     { name = "redis" },
     { name = "sqlalchemy", extra = ["asyncio"] },
@@ -1063,7 +1104,10 @@ dependencies = [
 
 [package.metadata]
 requires-dist = [
+    { name = "aiohttp", specifier = ">=3.11" },
     { name = "asyncpg", specifier = ">=0.30" },
+    { name = "cryptography", specifier = ">=50.0.2" },
+    { name = "curie-channel-gateway", editable = "packages/channel-gateway" },
     { name = "pytest", specifier = ">=8.3" },
     { name = "redis", specifier = ">=8.1.0" },
     { name = "sqlalchemy", extras = ["asyncio"], specifier = ">=2.0" },
@@ -1096,11 +1140,12 @@ dependencies = [
     { name = "boto3" },
     { name = "cronsim" },
     { name = "cryptography" },
+    { name = "curie-channel-gateway" },
     { name = "curie-channel-protocol" },
-    { name = "curie-dispatcher" },
     { name = "curie-e2e-connector" },
     { name = "curie-internal" },
     { name = "curie-protected-hooks" },
+    { name = "curie-shell-supervisor" },
     { name = "curie-telemetry" },
     { name = "curie-upgrade-pause" },
     { name = "httpx" },
@@ -1111,7 +1156,6 @@ dependencies = [
     { name = "pynacl" },
     { name = "pyyaml" },
     { name = "redis" },
-    { name = "slack-sdk" },
     { name = "sqlalchemy", extra = ["asyncio"] },
 ]
 
@@ -1123,11 +1167,12 @@ requires-dist = [
     { name = "boto3", specifier = ">=1.43.55" },
     { name = "cronsim", specifier = "==2.7" },
     { name = "cryptography", specifier = ">=50.0.2" },
+    { name = "curie-channel-gateway", editable = "packages/channel-gateway" },
     { name = "curie-channel-protocol", editable = "packages/channel-protocol" },
-    { name = "curie-dispatcher", editable = "apps/dispatcher" },
     { name = "curie-e2e-connector", editable = "apps/e2e-connector" },
     { name = "curie-internal", editable = "packages/curie-internal" },
     { name = "curie-protected-hooks", editable = "packages/protected-hooks" },
+    { name = "curie-shell-supervisor", editable = "packages/shell-supervisor" },
     { name = "curie-telemetry", editable = "packages/telemetry" },
     { name = "curie-upgrade-pause", editable = "packages/upgrade-pause" },
     { name = "httpx", specifier = ">=0.28" },
@@ -1138,7 +1183,6 @@ requires-dist = [
     { name = "pynacl", specifier = ">=1.5" },
     { name = "pyyaml", specifier = ">=6.0" },
     { name = "redis", specifier = ">=5.2" },
-    { name = "slack-sdk", specifier = ">=3.43" },
     { name = "sqlalchemy", extras = ["asyncio"], specifier = ">=2.0.51" },
 ]
 
@@ -1149,6 +1193,7 @@ source = { virtual = "." }
 dependencies = [
     { name = "aci-protocol" },
     { name = "curie-api" },
+    { name = "curie-channel-gateway" },
     { name = "curie-channel-protocol" },
     { name = "curie-discord-adapter" },
     { name = "curie-dispatcher" },
@@ -1157,6 +1202,7 @@ dependencies = [
     { name = "curie-mail-adapter" },
     { name = "curie-protected-hooks" },
     { name = "curie-runner" },
+    { name = "curie-shell-supervisor" },
     { name = "curie-telemetry" },
     { name = "curie-telemetry-schema" },
     { name = "curie-upgrade-pause" },
@@ -1185,6 +1231,7 @@ dev = [
 requires-dist = [
     { name = "aci-protocol", editable = "packages/aci-protocol" },
     { name = "curie-api", editable = "apps/api" },
+    { name = "curie-channel-gateway", editable = "packages/channel-gateway" },
     { name = "curie-channel-protocol", editable = "packages/channel-protocol" },
     { name = "curie-discord-adapter", editable = "adapters/discord" },
     { name = "curie-dispatcher", editable = "apps/dispatcher" },
@@ -1193,6 +1240,7 @@ requires-dist = [
     { name = "curie-mail-adapter", editable = "apps/mail-adapter" },
     { name = "curie-protected-hooks", editable = "packages/protected-hooks" },
     { name = "curie-runner", editable = "runner" },
+    { name = "curie-shell-supervisor", editable = "packages/shell-supervisor" },
     { name = "curie-telemetry", editable = "packages/telemetry" },
     { name = "curie-telemetry-schema", editable = "packages/telemetry-schema" },
     { name = "curie-upgrade-pause", editable = "packages/upgrade-pause" },

@@ -62,6 +62,29 @@ export const commandManifest = {
   "name": "curie",
   "subcommands": [
     {
+      "about": "Migrate a protected worker process.json from v1 to v2 offline",
+      "args": [
+        {
+          "global": false,
+          "help": "Directory containing the stopped worker's process.json",
+          "id": "runtime_dir",
+          "long": "runtime-dir",
+          "positional": false,
+          "required": true
+        },
+        {
+          "global": false,
+          "help": "Private v2 channel_gateway JSON object",
+          "id": "gateway_config",
+          "long": "gateway-config",
+          "positional": false,
+          "required": true
+        }
+      ],
+      "hidden": false,
+      "name": "migrate-protected-process"
+    },
+    {
       "about": "Scaffold a keyless first reply, using a saved or environment model credential when available",
       "args": [
         {
@@ -7064,6 +7087,203 @@ export const commandManifest = {
           "hidden": false,
           "long_about": "Show or change which IdP teams may invoke the agent and approve for it (`GET`/`PUT /agents/{id}/access-policy`, ADR 0220).\n\nWith no team flag this shows the policy. A team is named by its id, as `GET /teams` lists it, and must be an IdP group team of the agent's tenant. A role left unmentioned keeps its team. The write sends back the version it read, so a concurrent change is refused rather than overwritten. Each configured role is enforced on every channel.",
           "name": "access-policy"
+        },
+        {
+          "about": "Adopt, inspect, replace or retire a tenant HTTP identity authority",
+          "args": [
+            {
+              "global": false,
+              "id": "action",
+              "positional": true,
+              "possible_values": [
+                "list",
+                "get",
+                "adopt",
+                "replace",
+                "retire"
+              ],
+              "required": true
+            },
+            {
+              "global": false,
+              "id": "tenant",
+              "long": "tenant",
+              "positional": false,
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "Mutation JSON with request_id and expected versions. Never a literal bearer",
+              "id": "apply",
+              "long": "apply",
+              "positional": false,
+              "required": false
+            },
+            {
+              "global": false,
+              "id": "after",
+              "long": "after",
+              "positional": false,
+              "required": false
+            },
+            {
+              "env": "CURIE_API_URL",
+              "global": false,
+              "help": "Platform API base URL. Omit to self-plumb a loopback tunnel to the release API",
+              "id": "api_url",
+              "long": "api-url",
+              "positional": false,
+              "required": false
+            },
+            {
+              "env": "CURIE_API_KEY",
+              "global": false,
+              "help": "Platform API key. Omit to read the release's `api.apiKey` from its Secret",
+              "id": "api_key",
+              "long": "api-key",
+              "positional": false,
+              "required": false
+            },
+            {
+              "default_values": [
+                "curie"
+              ],
+              "env": "CURIE_NAMESPACE",
+              "global": false,
+              "help": "Kubernetes namespace of the release. Default: curie",
+              "id": "namespace",
+              "long": "namespace",
+              "positional": false,
+              "required": false
+            },
+            {
+              "default_values": [
+                "curie"
+              ],
+              "global": false,
+              "help": "Helm release name. Default: curie",
+              "id": "release",
+              "long": "release",
+              "positional": false,
+              "required": false
+            },
+            {
+              "global": false,
+              "id": "dry_run",
+              "long": "dry-run",
+              "positional": false,
+              "possible_values": [
+                "true",
+                "false"
+              ],
+              "required": false
+            }
+          ],
+          "hidden": false,
+          "name": "identity-authority"
+        },
+        {
+          "about": "Set, inspect or remove issuer group filters for an agent role",
+          "args": [
+            {
+              "global": false,
+              "id": "action",
+              "positional": true,
+              "possible_values": [
+                "list",
+                "set",
+                "remove"
+              ],
+              "required": true
+            },
+            {
+              "global": false,
+              "id": "tenant",
+              "long": "tenant",
+              "positional": false,
+              "required": true
+            },
+            {
+              "global": false,
+              "id": "agent",
+              "long": "agent",
+              "positional": false,
+              "required": true
+            },
+            {
+              "global": false,
+              "id": "role",
+              "long": "role",
+              "positional": false,
+              "possible_values": [
+                "invocation",
+                "approver"
+              ],
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "Mutation JSON with request_id, expected_version and groups for set",
+              "id": "apply",
+              "long": "apply",
+              "positional": false,
+              "required": false
+            },
+            {
+              "env": "CURIE_API_URL",
+              "global": false,
+              "help": "Platform API base URL. Omit to self-plumb a loopback tunnel to the release API",
+              "id": "api_url",
+              "long": "api-url",
+              "positional": false,
+              "required": false
+            },
+            {
+              "env": "CURIE_API_KEY",
+              "global": false,
+              "help": "Platform API key. Omit to read the release's `api.apiKey` from its Secret",
+              "id": "api_key",
+              "long": "api-key",
+              "positional": false,
+              "required": false
+            },
+            {
+              "default_values": [
+                "curie"
+              ],
+              "env": "CURIE_NAMESPACE",
+              "global": false,
+              "help": "Kubernetes namespace of the release. Default: curie",
+              "id": "namespace",
+              "long": "namespace",
+              "positional": false,
+              "required": false
+            },
+            {
+              "default_values": [
+                "curie"
+              ],
+              "global": false,
+              "help": "Helm release name. Default: curie",
+              "id": "release",
+              "long": "release",
+              "positional": false,
+              "required": false
+            },
+            {
+              "global": false,
+              "id": "dry_run",
+              "long": "dry-run",
+              "positional": false,
+              "possible_values": [
+                "true",
+                "false"
+              ],
+              "required": false
+            }
+          ],
+          "hidden": false,
+          "name": "role-filter"
         },
         {
           "about": "Inspect tenant identities or apply IdP configuration, namespace or team JSON. Writes use the API's expected-version contract; links and people are read-only",

@@ -15,10 +15,13 @@ import uuid
 from collections.abc import Callable, Mapping
 from typing import Any
 
+import pytest
 from aci_protocol import Final, QueuedTurn, ReplyHandle, SessionStatus
 from aci_protocol.turn import CLUSTER_MESSAGE_ADAPTER, route_identity
 from aiohttp import web
 from aiohttp.test_utils import TestServer
+from curie_channel_gateway.slack.senders import SlackSenderIdentities
+from curie_test_support.channel_gateway import reply_gateway
 from curie_worker.behaviorpacks import BehaviorPacks
 from curie_worker.binding import (
     BUDGET_ENV,
@@ -39,7 +42,6 @@ from curie_worker.sibling_turns import (
     SIBLING_OPEN_LIMIT,
     SIBLING_TURN_LIMIT,
     SiblingTurnLimit,
-    SlackSenderIdentities,
 )
 from redis.asyncio import Redis as AsyncRedis
 
@@ -208,20 +210,30 @@ def _mail_turn(text: str, *, to: str, adapter: str, author: str, thread: str, po
     )
 
 
+_reply_gateways = []
+
+
+@pytest.fixture(autouse=True)
+def owned_reply_gateways():
+    try:
+        yield
+    finally:
+        while _reply_gateways:
+            _reply_gateways.pop().__exit__(None, None, None)
+
+
 def _slack_sink(port: int) -> ReplySinkRouter:
-    return build_reply_sink(
-        WorkerConfig(
-            slack_bot_token=_DEFAULT_TOKEN,
-            slack_api_base_url=f"http://127.0.0.1:{port}/slack/api/",
-        ),
-        slack_tokens={"default": _DEFAULT_TOKEN, "ops-bot": _OPS_TOKEN},
+    gateway = reply_gateway(
+        {"default": _DEFAULT_TOKEN, "ops-bot": _OPS_TOKEN}, f"http://127.0.0.1:{port}/slack/api/"
     )
+    values = gateway.__enter__()
+    _reply_gateways.append(gateway)
+    return build_reply_sink(WorkerConfig(**values))
 
 
 def _mail_sink() -> ReplySinkRouter:
     return build_reply_sink(
-        WorkerConfig(adapter_credentials={"mail-a": "secret-a", "mail-b": "secret-b"}),
-        slack_tokens={"default": ""},
+        WorkerConfig(adapter_credentials={"mail-a": "secret-a", "mail-b": "secret-b"})
     )
 
 

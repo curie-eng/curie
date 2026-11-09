@@ -5,11 +5,12 @@ from __future__ import annotations
 import logging
 import time
 from collections.abc import Callable
+from pathlib import Path
 
 import pytest
 from _support import IngressState, MailState, get
 from curie_api.channel_token import CHANNEL_ENQUEUE_SCOPE, mint
-from curie_mail_adapter.adapter import MailAdapter
+from curie_channel_gateway.mail.adapter import MailAdapter
 
 
 def token(exp: int) -> str:
@@ -68,7 +69,7 @@ def test_platform_rejection_degrades_probe_and_success_recovers(
         url = serve_egress(adapter)
         turn = {"delivery_id": "msg-rejected", "conversation_id": "thr-rejected"}
         ingress.response = (401, {"detail": "invalid token"})
-        with caplog.at_level(logging.WARNING, logger="curie_mail_adapter.adapter"):
+        with caplog.at_level(logging.WARNING, logger="curie_channel_gateway.mail.adapter"):
             adapter.post_turn(turn)
             adapter.post_turn(turn)
         assert get(url + "/readyz") == (503, {"status": "starting"})
@@ -93,6 +94,48 @@ def test_platform_rejection_degrades_probe_and_success_recovers(
         assert get(url + "/statusz")[1]["last_ingress_status"] == 200
     finally:
         adapter.close()
+
+
+def test_rejected_credential_health_and_warnings_are_scoped_to_each_adapter(
+    make_adapter: Callable[..., MailAdapter],
+    serve_egress: Callable[[MailAdapter], str],
+    ingress: IngressState,
+    caplog: pytest.LogCaptureFixture,
+    tmp_path: Path,
+) -> None:
+    secret = token(int(time.time()) + 3600)
+    ingress.response = (401, {"detail": "invalid token"})
+    adapters: list[MailAdapter] = []
+    urls: list[str] = []
+    try:
+        with caplog.at_level(logging.WARNING, logger="curie_channel_gateway.mail.adapter"):
+            for name in ("first", "second"):
+                adapter = make_adapter(
+                    channel_token=secret, state_path=str(tmp_path / f"{name}.sqlite3")
+                )
+                adapters.append(adapter)
+                adapter.startup()
+                url = serve_egress(adapter)
+                urls.append(url)
+                turn = {"delivery_id": "rejected-credential", "conversation_id": "thread"}
+                adapter.post_turn(turn)
+                adapter.post_turn(turn)
+                body = get(url + "/statusz")[1]
+                assert body["channel_token"]["state"] == "rejected"
+                assert secret not in str(body)
+        warnings = [
+            record.getMessage() for record in caplog.records
+            if "channel token rejected" in record.getMessage()
+        ]
+        assert len(warnings) == 2
+        assert secret not in "\n".join(warnings)
+        ingress.response = (200, {"queued": True})
+        assert adapters[0].post_turn(turn) == "accepted"
+        assert get(urls[0] + "/statusz")[1]["channel_token"]["state"] == "ok"
+        assert get(urls[1] + "/statusz")[1]["channel_token"]["state"] == "rejected"
+    finally:
+        for adapter in adapters:
+            adapter.close()
 
 
 @pytest.mark.parametrize("secret", ["", "opaque", "chn.eyJleHAiOnRydWV9.signature"])

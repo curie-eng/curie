@@ -13,6 +13,8 @@ if [ -n "${CURIE_MODEL_ENV_KEY-}" ]; then
 fi
 while IFS= read -r name; do
   case $name in
+    CURIE_CONNECTOR_UPLOAD_TOKENS_FILE)
+      ;;
     CURIE_*TOKEN*)
       unset -- "$name"
       ;;

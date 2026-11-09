@@ -1,0 +1,19 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.curietech.ai/cli/migrate-protected-process/v1.json",
+  "title": "curie migrate-protected-process --json",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "schema_version": {
+      "const": 2
+    },
+    "migrated": {
+      "const": true
+    }
+  },
+  "required": [
+    "schema_version",
+    "migrated"
+  ]
+}

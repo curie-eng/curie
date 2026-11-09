@@ -1,11 +1,14 @@
 {
-  "comment": "The connector caller token wire (ADR-0168 decision 7, extended by ADR 0178 and ADR 0270 decision 2). The worker mints one per sandbox boot (apps/worker/src/curie_worker/caller_token.py) and the runner presents it to each hosted connector in the X-Curie-Caller header. A verifier holds only the public half, so what it checks must be exactly what the worker signs, and this file freezes that. The token is `cct.<payload>.<signature>`: payload is the base64url, unpadded, of the compact JSON object {agent, exp} with optional {run, work_item} (both or neither) and optional principal, sorted keys at every level and ASCII escapes; signature is the base64url, unpadded, of the 64-byte Ed25519 signature over the ASCII bytes of `cct.<payload>`. `agent` is the stored agent name, verbatim. `exp` is absolute unix seconds. `run` and `work_item` are lowercase hyphenated UUIDs. `principal` (ADR 0270) is the verified human requester, an object with exactly `tenant_id` (a lowercase hyphenated UUID), `issuer` (1 to 2048 characters) and `subject` (1 to 256 characters), compared exactly; these are the bounds of packages/curie-internal/src/curie_internal/identity_context.py ContextCanonicalV1 (`Issuer` and `Identifier`, text that encodes to UTF-8, so a lone surrogate refuses and a control character is carried as a JSON escape) and of its canonical UUID for the tenant, so a principal valid for HTTP identity is valid in the token; it is complete or absent. Each vector carries `seed` (standard base64 of the 32-byte Ed25519 seed the chart's Secret holds), `public` (standard base64 of its 32-byte public key), the claims (a `principal` key holds the three fields), and `minted`. Ed25519 signing is deterministic, so a minter must reproduce `minted` byte for byte. `malformed_principals` are tokens signed under the first vector's seed whose `payload` is the exact JSON text signed, so a duplicate key can be written down; each signature verifies and each token is refused as invalid for its claims. `tampered_principals` are a_human_requester's token with its payload re-encoded after one change, named by `field` (a principal field, or `principal` when it was removed), under the original signature; each is refused as invalid. `forged_principal_headers` names the header only the caller proxy may set (`header`) and requests that forge it on an agent-only token of `token_kind` cct or ccr; `inbound` is the list of [name, value] pairs sent, values fake base64url text. The proxy admits each request and strips every copy before the connector. Readers: apps/worker/tests/test_connector_caller_token.py (the minter: reproduces every `vectors` token, checks the corpus with the primitive, and rejects an unknown key at every level, so a key added for one reader cannot pass vacuously); apps/worker/tests/test_connector_caller_verify.py (the verifier: `vectors`, `malformed_principals`, `tampered_principals`); apps/worker/tests/test_connector_proxy.py (agent-only and principal-bearing vectors by name, sent over a real socket, and the cct `forged_principal_headers` cases); apps/worker/tests/test_connector_proxy_routes.py (a_plain_agent_name's seed and key, a_human_requester's principal, and the ccr `forged_principal_headers` cases); apps/worker/tests/test_connector_proxy_upstream_host.py (a_plain_agent_name); cli/tests/connector_caller_keys.rs (every vector's seed and public).",
+  "comment": "The connector caller token wire (ADR-0168 decision 7, extended by ADR 0178 and ADR 0270 decision 2). The worker mints one per sandbox boot (apps/worker/src/curie_worker/caller_token.py) and the runner presents it to each hosted connector in the X-Curie-Caller header. A verifier holds only the public half, so what it checks must be exactly what the worker signs, and this file freezes that. The token is `cct.<payload>.<signature>`: payload is the base64url, unpadded, of the compact JSON object {agent, exp} with optional {run, work_item} (both or neither) and optional principal, sorted keys at every level and ASCII escapes; signature is the base64url, unpadded, of the 64-byte Ed25519 signature over the ASCII bytes of `cct.<payload>`. `agent` is the stored agent name, verbatim. `exp` is absolute unix seconds. `run` and `work_item` are lowercase hyphenated UUIDs. `principal` (ADR 0270) is the verified human requester, an object with exactly `tenant_id` (a lowercase hyphenated UUID), `issuer` (1 to 2048 characters) and `subject` (1 to 256 characters), compared exactly; these are the bounds of packages/curie-internal/src/curie_internal/identity_context.py ContextCanonicalV1 (`Issuer` and `Identifier`, text that encodes to UTF-8, so a lone surrogate refuses and a control character is carried as a JSON escape) and of its canonical UUID for the tenant, so a principal valid for HTTP identity is valid in the token; it is complete or absent. Each vector carries `seed_range` (the start and exclusive end of sequential bytes encoded at runtime as the 32-byte Ed25519 seed), `public` (standard base64 of its 32-byte public key), the claims (a `principal` key holds the three fields), and `minted`. Ed25519 signing is deterministic, so a minter must reproduce `minted` byte for byte. `malformed_principals` are tokens signed under the first vector's seed whose `payload` is the exact JSON text signed, so a duplicate key can be written down; each signature verifies and each token is refused as invalid for its claims. `tampered_principals` are a_human_requester's token with its payload re-encoded after one change, named by `field` (a principal field, or `principal` when it was removed), under the original signature; each is refused as invalid. `forged_principal_headers` names the header only the caller proxy may set (`header`) and requests that forge it on an agent-only token of `token_kind` cct or ccr; `inbound` is the list of [name, value] pairs sent, values fake base64url text. The proxy admits each request and strips every copy before the connector. Readers: apps/worker/tests/test_connector_caller_token.py (the minter: reproduces every `vectors` token, checks the corpus with the primitive, and rejects an unknown key at every level, so a key added for one reader cannot pass vacuously); apps/worker/tests/test_connector_caller_verify.py (the verifier: `vectors`, `malformed_principals`, `tampered_principals`); apps/worker/tests/test_connector_proxy.py (agent-only and principal-bearing vectors by name, sent over a real socket, and the cct `forged_principal_headers` cases); apps/worker/tests/test_connector_proxy_routes.py (a_plain_agent_name's seed and key, a_human_requester's principal, and the ccr `forged_principal_headers` cases); apps/worker/tests/test_connector_proxy_upstream_host.py (a_plain_agent_name); cli/tests/connector_caller_keys.rs (every vector's seed range and public).",
   "prefix": "cct",
   "vectors": [
     {
       "name": "a_plain_agent_name",
       "why": "The common case: a deploy.yaml-shaped agent name and a far expiry.",
-      "seed": "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=",
+      "seed_range": [
+        0,
+        32
+      ],
       "public": "A6EHv/POEL4dcN0Y50vAmWfk1jCbpQ1fHdyGZBJVMbg=",
       "agent": "acme-dev",
       "exp": 1790000000,
@@ -14,7 +17,10 @@
     {
       "name": "the_same_claims_under_another_seed",
       "why": "The payload is identical and only the signature moves, so a verifier that checked the payload and skipped the signature would accept both.",
-      "seed": "ICEiIyQlJicoKSorLC0uLzAxMjM0NTY3ODk6Ozw9Pj8=",
+      "seed_range": [
+        32,
+        64
+      ],
       "public": "Kay64UG8yvCyLhqU000LxzYeUm0L/hLIl5S8kyKWbdc=",
       "agent": "acme-dev",
       "exp": 1790000000,
@@ -23,16 +29,22 @@
     {
       "name": "a_stored_name_outside_the_bundle_shape_is_carried_verbatim",
       "why": "The API stores agent names wider than deploy.yaml accepts. The claim carries the stored name as it is, and the JSON escapes pin one encoding of it.",
-      "seed": "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=",
+      "seed_range": [
+        0,
+        32
+      ],
       "public": "A6EHv/POEL4dcN0Y50vAmWfk1jCbpQ1fHdyGZBJVMbg=",
-      "agent": "Acme Café",
+      "agent": "Acme Caf\u00e9",
       "exp": 1790000000,
       "minted": "cct.eyJhZ2VudCI6IkFjbWUgQ2FmXHUwMGU5IiwiZXhwIjoxNzkwMDAwMDAwfQ.199INA_vpUCEox4gfZt2cwG0r_sTxQjrNl0v4HALgpJHTFlX2DjnAks8ojQ-khUAqU9V244TbBIUrxzbIhLdDg"
     },
     {
       "name": "a_work_item_run",
       "why": "ADR 0178: run and work_item ride with agent and exp. A verifier that skipped run would not see this payload differ from the next vector.",
-      "seed": "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=",
+      "seed_range": [
+        0,
+        32
+      ],
       "public": "A6EHv/POEL4dcN0Y50vAmWfk1jCbpQ1fHdyGZBJVMbg=",
       "agent": "acme-dev",
       "exp": 1790000000,
@@ -43,7 +55,10 @@
     {
       "name": "the_same_work_item_under_another_run",
       "why": "The payload differs from a_work_item_run only in run, so a verifier that ignored the new claim would accept both.",
-      "seed": "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=",
+      "seed_range": [
+        0,
+        32
+      ],
       "public": "A6EHv/POEL4dcN0Y50vAmWfk1jCbpQ1fHdyGZBJVMbg=",
       "agent": "acme-dev",
       "exp": 1790000000,
@@ -54,7 +69,6 @@
     {
       "name": "a_human_requester",
       "why": "ADR 0270 decision 2: an opted-in human request adds principal, the canonical tenant, issuer and subject, beside agent and exp. The principal object's keys are sorted like the top level's.",
-      "seed": "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=",
       "public": "A6EHv/POEL4dcN0Y50vAmWfk1jCbpQ1fHdyGZBJVMbg=",
       "agent": "acme-dev",
       "exp": 1790000000,
@@ -63,12 +77,15 @@
         "issuer": "https://idp.example.test",
         "subject": "user-0001"
       },
-      "minted": "cct.eyJhZ2VudCI6ImFjbWUtZGV2IiwiZXhwIjoxNzkwMDAwMDAwLCJwcmluY2lwYWwiOnsiaXNzdWVyIjoiaHR0cHM6Ly9pZHAuZXhhbXBsZS50ZXN0Iiwic3ViamVjdCI6InVzZXItMDAwMSIsInRlbmFudF9pZCI6IjQ0NDQ0NDQ0LTQ0NDQtNDQ0NC04NDQ0LTQ0NDQ0NDQ0NDQ0NCJ9fQ.O70DRD9xNIvgdLapbS27SxTGZjY1zsHpo0RindpnzGwNIEBy1ZlR6_Ey4ZTepuAopQik2lEYdB3tXNyd8h13Aw"
+      "minted": "cct.eyJhZ2VudCI6ImFjbWUtZGV2IiwiZXhwIjoxNzkwMDAwMDAwLCJwcmluY2lwYWwiOnsiaXNzdWVyIjoiaHR0cHM6Ly9pZHAuZXhhbXBsZS50ZXN0Iiwic3ViamVjdCI6InVzZXItMDAwMSIsInRlbmFudF9pZCI6IjQ0NDQ0NDQ0LTQ0NDQtNDQ0NC04NDQ0LTQ0NDQ0NDQ0NDQ0NCJ9fQ.O70DRD9xNIvgdLapbS27SxTGZjY1zsHpo0RindpnzGwNIEBy1ZlR6_Ey4ZTepuAopQik2lEYdB3tXNyd8h13Aw",
+      "seed_range": [
+        0,
+        32
+      ]
     },
     {
       "name": "the_same_requester_on_a_work_item_run",
       "why": "The run pair and the principal ride together; neither displaces the other.",
-      "seed": "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=",
       "public": "A6EHv/POEL4dcN0Y50vAmWfk1jCbpQ1fHdyGZBJVMbg=",
       "agent": "acme-dev",
       "exp": 1790000000,
@@ -79,12 +96,15 @@
         "issuer": "https://idp.example.test",
         "subject": "user-0001"
       },
-      "minted": "cct.eyJhZ2VudCI6ImFjbWUtZGV2IiwiZXhwIjoxNzkwMDAwMDAwLCJwcmluY2lwYWwiOnsiaXNzdWVyIjoiaHR0cHM6Ly9pZHAuZXhhbXBsZS50ZXN0Iiwic3ViamVjdCI6InVzZXItMDAwMSIsInRlbmFudF9pZCI6IjQ0NDQ0NDQ0LTQ0NDQtNDQ0NC04NDQ0LTQ0NDQ0NDQ0NDQ0NCJ9LCJydW4iOiIxMTExMTExMS0xMTExLTQxMTEtODExMS0xMTExMTExMTExMTEiLCJ3b3JrX2l0ZW0iOiIyMjIyMjIyMi0yMjIyLTQyMjItODIyMi0yMjIyMjIyMjIyMjIifQ.Ha6NfaYTLhTW28_ae3xL3gzHoeWeWeLwYVojWQ1ncBPOG7D8YzvrL_PrhaAqrgwKZZ8-CG11cPLAkePjnOzAAQ"
+      "minted": "cct.eyJhZ2VudCI6ImFjbWUtZGV2IiwiZXhwIjoxNzkwMDAwMDAwLCJwcmluY2lwYWwiOnsiaXNzdWVyIjoiaHR0cHM6Ly9pZHAuZXhhbXBsZS50ZXN0Iiwic3ViamVjdCI6InVzZXItMDAwMSIsInRlbmFudF9pZCI6IjQ0NDQ0NDQ0LTQ0NDQtNDQ0NC04NDQ0LTQ0NDQ0NDQ0NDQ0NCJ9LCJydW4iOiIxMTExMTExMS0xMTExLTQxMTEtODExMS0xMTExMTExMTExMTEiLCJ3b3JrX2l0ZW0iOiIyMjIyMjIyMi0yMjIyLTQyMjItODIyMi0yMjIyMjIyMjIyMjIifQ.Ha6NfaYTLhTW28_ae3xL3gzHoeWeWeLwYVojWQ1ncBPOG7D8YzvrL_PrhaAqrgwKZZ8-CG11cPLAkePjnOzAAQ",
+      "seed_range": [
+        0,
+        32
+      ]
     },
     {
       "name": "another_subject_under_the_same_issuer",
       "why": "The payload differs from a_human_requester only in subject, so a verifier that ignored subject would accept both as the same human.",
-      "seed": "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=",
       "public": "A6EHv/POEL4dcN0Y50vAmWfk1jCbpQ1fHdyGZBJVMbg=",
       "agent": "acme-dev",
       "exp": 1790000000,
@@ -93,26 +113,32 @@
         "issuer": "https://idp.example.test",
         "subject": "user-0002"
       },
-      "minted": "cct.eyJhZ2VudCI6ImFjbWUtZGV2IiwiZXhwIjoxNzkwMDAwMDAwLCJwcmluY2lwYWwiOnsiaXNzdWVyIjoiaHR0cHM6Ly9pZHAuZXhhbXBsZS50ZXN0Iiwic3ViamVjdCI6InVzZXItMDAwMiIsInRlbmFudF9pZCI6IjQ0NDQ0NDQ0LTQ0NDQtNDQ0NC04NDQ0LTQ0NDQ0NDQ0NDQ0NCJ9fQ.WFsyKMfve1zjA36myUga4962ZqiEJ3C9qcCZ9_LYKM7qsxrpHCYitrCFF6tRmXxl7pw4riOtgHap4EU97dG5BQ"
+      "minted": "cct.eyJhZ2VudCI6ImFjbWUtZGV2IiwiZXhwIjoxNzkwMDAwMDAwLCJwcmluY2lwYWwiOnsiaXNzdWVyIjoiaHR0cHM6Ly9pZHAuZXhhbXBsZS50ZXN0Iiwic3ViamVjdCI6InVzZXItMDAwMiIsInRlbmFudF9pZCI6IjQ0NDQ0NDQ0LTQ0NDQtNDQ0NC04NDQ0LTQ0NDQ0NDQ0NDQ0NCJ9fQ.WFsyKMfve1zjA36myUga4962ZqiEJ3C9qcCZ9_LYKM7qsxrpHCYitrCFF6tRmXxl7pw4riOtgHap4EU97dG5BQ",
+      "seed_range": [
+        0,
+        32
+      ]
     },
     {
       "name": "a_non_ascii_subject_is_carried_escaped",
       "why": "Subjects are compared exactly and carried verbatim; the JSON escapes pin one encoding of a subject outside ASCII.",
-      "seed": "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=",
       "public": "A6EHv/POEL4dcN0Y50vAmWfk1jCbpQ1fHdyGZBJVMbg=",
       "agent": "acme-dev",
       "exp": 1790000000,
       "principal": {
         "tenant_id": "44444444-4444-4444-8444-444444444444",
         "issuer": "https://idp.example.test",
-        "subject": "renée@example.test"
+        "subject": "ren\u00e9e@example.test"
       },
-      "minted": "cct.eyJhZ2VudCI6ImFjbWUtZGV2IiwiZXhwIjoxNzkwMDAwMDAwLCJwcmluY2lwYWwiOnsiaXNzdWVyIjoiaHR0cHM6Ly9pZHAuZXhhbXBsZS50ZXN0Iiwic3ViamVjdCI6InJlblx1MDBlOWVAZXhhbXBsZS50ZXN0IiwidGVuYW50X2lkIjoiNDQ0NDQ0NDQtNDQ0NC00NDQ0LTg0NDQtNDQ0NDQ0NDQ0NDQ0In19.dOHXFEdURJpXRYgR5Pqq29r_pHNxCU0KO4E231oOnlUJPk0_Qii5Res3BuEGJkggprSOmLIr_b2B0u4T2bM8Cw"
+      "minted": "cct.eyJhZ2VudCI6ImFjbWUtZGV2IiwiZXhwIjoxNzkwMDAwMDAwLCJwcmluY2lwYWwiOnsiaXNzdWVyIjoiaHR0cHM6Ly9pZHAuZXhhbXBsZS50ZXN0Iiwic3ViamVjdCI6InJlblx1MDBlOWVAZXhhbXBsZS50ZXN0IiwidGVuYW50X2lkIjoiNDQ0NDQ0NDQtNDQ0NC00NDQ0LTg0NDQtNDQ0NDQ0NDQ0NDQ0In19.dOHXFEdURJpXRYgR5Pqq29r_pHNxCU0KO4E231oOnlUJPk0_Qii5Res3BuEGJkggprSOmLIr_b2B0u4T2bM8Cw",
+      "seed_range": [
+        0,
+        32
+      ]
     },
     {
       "name": "a_principal_at_its_field_bounds",
       "why": "The bounds are identity_context ContextCanonicalV1's: an issuer of exactly 2048 characters and a subject of exactly 256 are admitted, and the token stays within the verifier's 4096 characters. The malformed entries one character past each bound refuse.",
-      "seed": "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=",
       "public": "A6EHv/POEL4dcN0Y50vAmWfk1jCbpQ1fHdyGZBJVMbg=",
       "agent": "acme-dev",
       "exp": 1790000000,
@@ -121,12 +147,15 @@
         "issuer": "https://idp.example.test/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
         "subject": "uuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuu"
       },
-      "minted": "cct.eyJhZ2VudCI6ImFjbWUtZGV2IiwiZXhwIjoxNzkwMDAwMDAwLCJwcmluY2lwYWwiOnsiaXNzdWVyIjoiaHR0cHM6Ly9pZHAuZXhhbXBsZS50ZXN0L2FhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWEiLCJzdWJqZWN0IjoidXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dSIsInRlbmFudF9pZCI6IjQ0NDQ0NDQ0LTQ0NDQtNDQ0NC04NDQ0LTQ0NDQ0NDQ0NDQ0NCJ9fQ.vugVbtT1JqLYPk9MdBRNrxWe0vC4HRvegX-mET_qvWufN-xSNL795iEVlHnEsgCRYwU2pxLkl2_aSSri1egVAg"
+      "minted": "cct.eyJhZ2VudCI6ImFjbWUtZGV2IiwiZXhwIjoxNzkwMDAwMDAwLCJwcmluY2lwYWwiOnsiaXNzdWVyIjoiaHR0cHM6Ly9pZHAuZXhhbXBsZS50ZXN0L2FhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWEiLCJzdWJqZWN0IjoidXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dSIsInRlbmFudF9pZCI6IjQ0NDQ0NDQ0LTQ0NDQtNDQ0NC04NDQ0LTQ0NDQ0NDQ0NDQ0NCJ9fQ.vugVbtT1JqLYPk9MdBRNrxWe0vC4HRvegX-mET_qvWufN-xSNL795iEVlHnEsgCRYwU2pxLkl2_aSSri1egVAg",
+      "seed_range": [
+        0,
+        32
+      ]
     },
     {
       "name": "a_control_character_is_carried_escaped",
       "why": "A principal valid for HTTP identity is valid here, and identity_context admits any text that encodes to UTF-8, control characters included. The JSON escapes pin one encoding of the tab, so no raw control byte is signed.",
-      "seed": "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=",
       "public": "A6EHv/POEL4dcN0Y50vAmWfk1jCbpQ1fHdyGZBJVMbg=",
       "agent": "acme-dev",
       "exp": 1790000000,
@@ -135,7 +164,11 @@
         "issuer": "https://idp.example.test",
         "subject": "user\t0001"
       },
-      "minted": "cct.eyJhZ2VudCI6ImFjbWUtZGV2IiwiZXhwIjoxNzkwMDAwMDAwLCJwcmluY2lwYWwiOnsiaXNzdWVyIjoiaHR0cHM6Ly9pZHAuZXhhbXBsZS50ZXN0Iiwic3ViamVjdCI6InVzZXJcdDAwMDEiLCJ0ZW5hbnRfaWQiOiI0NDQ0NDQ0NC00NDQ0LTQ0NDQtODQ0NC00NDQ0NDQ0NDQ0NDQifX0.2OHgZAtbluy8YJuTudeUWWCyeT23OXqjaSV2kpoRBu_hz7VYB7JDVgXvB-xCNKC0usTT6UTUaNpJZXJRDpKwCA"
+      "minted": "cct.eyJhZ2VudCI6ImFjbWUtZGV2IiwiZXhwIjoxNzkwMDAwMDAwLCJwcmluY2lwYWwiOnsiaXNzdWVyIjoiaHR0cHM6Ly9pZHAuZXhhbXBsZS50ZXN0Iiwic3ViamVjdCI6InVzZXJcdDAwMDEiLCJ0ZW5hbnRfaWQiOiI0NDQ0NDQ0NC00NDQ0LTQ0NDQtODQ0NC00NDQ0NDQ0NDQ0NDQifX0.2OHgZAtbluy8YJuTudeUWWCyeT23OXqjaSV2kpoRBu_hz7VYB7JDVgXvB-xCNKC0usTT6UTUaNpJZXJRDpKwCA",
+      "seed_range": [
+        0,
+        32
+      ]
     }
   ],
   "malformed_principals": [
@@ -349,8 +382,8 @@
         "why": "Non-ASCII text is carried as raw UTF-8, not as a JSON escape: the issuer's e-acute is the two bytes c3 a9 before the base64url step.",
         "principal": {
           "tenant_id": "44444444-4444-4444-8444-444444444444",
-          "issuer": "https://idp.example.test/ré",
-          "subject": "usuário-ü"
+          "issuer": "https://idp.example.test/r\u00e9",
+          "subject": "usu\u00e1rio-\u00fc"
         },
         "header": "eyJpc3N1ZXIiOiJodHRwczovL2lkcC5leGFtcGxlLnRlc3QvcsOpIiwic3ViamVjdCI6InVzdcOhcmlvLcO8IiwidGVuYW50X2lkIjoiNDQ0NDQ0NDQtNDQ0NC00NDQ0LTg0NDQtNDQ0NDQ0NDQ0NDQ0In0"
       },
@@ -359,8 +392,8 @@
         "why": "Chosen so the value contains both - and _, so a reader on the standard base64 alphabet would refuse a genuine header.",
         "principal": {
           "tenant_id": "44444444-4444-4444-8444-444444444444",
-          "issuer": "https://idp.example.test/r?é",
-          "subject": "usu~ário-ü"
+          "issuer": "https://idp.example.test/r?\u00e9",
+          "subject": "usu~\u00e1rio-\u00fc"
         },
         "header": "eyJpc3N1ZXIiOiJodHRwczovL2lkcC5leGFtcGxlLnRlc3Qvcj_DqSIsInN1YmplY3QiOiJ1c3V-w6FyaW8tw7wiLCJ0ZW5hbnRfaWQiOiI0NDQ0NDQ0NC00NDQ0LTQ0NDQtODQ0NC00NDQ0NDQ0NDQ0NDQifQ"
       },
@@ -370,7 +403,7 @@
         "principal": {
           "tenant_id": "44444444-4444-4444-8444-444444444444",
           "issuer": "https://idp.example.test",
-          "subject": "renée@example.test"
+          "subject": "ren\u00e9e@example.test"
         },
         "header": "eyJpc3N1ZXIiOiJodHRwczovL2lkcC5leGFtcGxlLnRlc3QiLCJzdWJqZWN0IjoicmVuw6llQGV4YW1wbGUudGVzdCIsInRlbmFudF9pZCI6IjQ0NDQ0NDQ0LTQ0NDQtNDQ0NC04NDQ0LTQ0NDQ0NDQ0NDQ0NCJ9"
       },
@@ -427,7 +460,7 @@
       {
         "name": "a_header_with_a_non_ascii_character",
         "why": "the_human_requester_header with its first character replaced by a fullwidth e, which NFKC normalization would fold back to the canonical value.",
-        "value": "ｅyJpc3N1ZXIiOiJodHRwczovL2lkcC5leGFtcGxlLnRlc3QiLCJzdWJqZWN0IjoidXNlci0wMDAxIiwidGVuYW50X2lkIjoiNDQ0NDQ0NDQtNDQ0NC00NDQ0LTg0NDQtNDQ0NDQ0NDQ0NDQ0In0"
+        "value": "\uff45yJpc3N1ZXIiOiJodHRwczovL2lkcC5leGFtcGxlLnRlc3QiLCJzdWJqZWN0IjoidXNlci0wMDAxIiwidGVuYW50X2lkIjoiNDQ0NDQ0NDQtNDQ0NC00NDQ0LTg0NDQtNDQ0NDQ0NDQ0NDQ0In0"
       },
       {
         "name": "a_header_with_inner_whitespace",

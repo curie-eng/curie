@@ -4,8 +4,8 @@ import logging
 import threading
 
 import pytest
-from curie_dispatcher.app import SocketModeConnection
-from curie_dispatcher.supervisor import BackoffPolicy, Supervisor
+from curie_channel_gateway.slack.app import SocketModeConnection
+from curie_channel_gateway.slack.supervisor import BackoffPolicy, Supervisor
 from slack_bolt import App
 
 from .conftest import _authorize

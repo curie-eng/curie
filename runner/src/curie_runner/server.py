@@ -363,6 +363,7 @@ async def _status(request: web.Request) -> web.Response:
         body[CHANNEL_READ_STATUS_FIELD] = True
     if request.path == "/v1/status":
         body["turn_epoch"] = runner.active_turn_epoch
+        body["side_effect_emitted"] = runner.side_effect_emitted
         body["capacity_admission"] = True
         admission_epoch = request.headers.get(_TURN_EPOCH_HEADER)
         if admission_epoch is not None:

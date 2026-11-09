@@ -125,6 +125,33 @@ def executor_withheld_names(env: Mapping[str, str]) -> frozenset[str]:
     return EXECUTOR_WITHHELD_ENVS | declared_model_env_keys(env.get(_MODEL_ENV_KEY_ENV, ""))
 
 
+# Names the connector secret values the claim env carries.
+_CONNECTOR_SECRET_MARKER_ENV = BootEnv.env_key("connector_secret_keys")
+
+
+def executor_claim_env(env: dict[str, str], secret_names: frozenset[str]) -> dict[str, str]:
+    """An executor claim's container env (@spec ACTION-EXECUTOR-5).
+
+    The Docker and static-pool tiers have no pool template, so the stripping
+    the Kubernetes per-claim template applies is applied to the env itself: no
+    model credential, no model env-key declaration or name it declares, and no
+    connector secret value outside ``secret_names``. The connector-secret
+    marker is narrowed to match.
+    """
+
+    marker = env.get(_CONNECTOR_SECRET_MARKER_ENV, "")
+    marked = {name for name in marker.split(",") if name}
+    dropped = executor_withheld_names(env) | (marked - secret_names)
+    kept = {key: value for key, value in env.items() if key not in dropped}
+    if _CONNECTOR_SECRET_MARKER_ENV in kept:
+        narrowed = ",".join(name for name in marker.split(",") if name in secret_names)
+        if narrowed:
+            kept[_CONNECTOR_SECRET_MARKER_ENV] = narrowed
+        else:
+            del kept[_CONNECTOR_SECRET_MARKER_ENV]
+    return kept
+
+
 _SECRET_SUFFIX = "-tokens"
 # Where a Docker-enabled runner reads its daemon client files (ADR 0217):
 # ca.pem, cert.pem and key.pem from the per-claim token Secret, read-only.

@@ -25,7 +25,7 @@ from _support import (
     settled_card,
     update,
 )
-from curie_mail_adapter.adapter import (
+from curie_channel_gateway.mail.adapter import (
     APPROVAL_CARD_REF_PREFIX,
     APPROVAL_INSTRUCTIONS,
     APPROVAL_REF_PATTERN,
@@ -131,7 +131,7 @@ def test_reminder_with_missing_card_reference_is_acknowledged_without_sending(
     url: str,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    caplog.set_level("INFO", logger="curie_mail_adapter.adapter")
+    caplog.set_level("INFO", logger="curie_channel_gateway.mail.adapter")
     event = reply_post("Still awaiting your decision")
     event["target"]["reply_ref"] = CARD_REF
     assert post_event(url, event)[0] == 200

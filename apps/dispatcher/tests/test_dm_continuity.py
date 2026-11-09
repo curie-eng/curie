@@ -15,7 +15,7 @@ apps/api/tests/test_channel_read.py.
 A root direct message often has no thread_ts. Slack also echoes thread_ts equal
 to ts on a root. A reply is the only case where thread_ts differs from ts.
 is_ext_shared_channel is a field of the event callback envelope, not of the
-message event. slack_evidence in apps/dispatcher/src/curie_dispatcher/identity.py
+message event. slack_evidence in the gateway Slack identity module
 reads it from the body. The admitted direct message in
 test_identity_dispatch.test_a_direct_message_to_an_identity_mints_that_identity
 has neither field on the event.
@@ -32,8 +32,8 @@ from unittest.mock import MagicMock
 
 import pytest
 import redis
-from curie_dispatcher.config import DispatcherConfig
-from curie_dispatcher.dm_continuity import (
+from curie_channel_gateway.slack.config import DispatcherConfig
+from curie_channel_gateway.slack.dm_continuity import (
     SlackDmContinuity,
     render_dm_continuity,
     select_dm_messages,

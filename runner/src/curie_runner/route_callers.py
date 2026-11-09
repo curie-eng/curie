@@ -38,9 +38,10 @@ import anyio
 import anyio.abc
 import anyio.to_thread
 import mcp.types
+from curie_internal.connector_endpoints import ConnectorEndpointBinding
 from mcp.shared.message import SessionMessage
-from plugin_format.connector_render import service_dns
 
+from .connector_endpoints import endpoint_resolver
 from .connectors import declared_connectors
 from .subprocess_env import shell_and_hook_env
 
@@ -119,17 +120,20 @@ def connector_urls(
     release: str | None,
     agent: str | None,
     namespace: str | None,
+    endpoints: ConnectorEndpointBinding | None = None,
 ) -> dict[str, str]:
-    """Each hosted route connector's base URL: the Service its MCP entry dials.
+    """Each hosted route connector's base URL from the shared endpoint resolver.
 
-    Empty without the connector scope, the same rule ``derive_mcp_servers``
-    applies: there is no Service to point at.
+    Empty without static endpoints or Kubernetes scope, matching the MCP entries.
     """
 
-    if not (release and agent and namespace):
+    resolver = endpoint_resolver(
+        release=release, agent=agent, namespace=namespace, endpoints=endpoints
+    )
+    if resolver is None:
         return {}
     return {
-        name: f"http://{service_dns(release, agent, name, namespace)}:{spec.port}"
+        name: resolver.base_url(name, spec)
         for name, spec in declared_connectors(plugin_dir, agent=agent).items()
         if spec.is_hosted and spec.routes
     }

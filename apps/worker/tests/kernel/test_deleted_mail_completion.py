@@ -13,13 +13,13 @@ import pytest
 from aci_protocol import Final, SessionStatus
 from aiohttp import web
 from aiohttp.test_utils import TestServer
-from curie_mail_adapter.adapter import MailAdapter
-from curie_mail_adapter.config import MailAdapterConfig
-from curie_mail_adapter.egress import make_server
+from curie_channel_gateway.mail.adapter import MailAdapter
+from curie_channel_gateway.mail.config import MailAdapterConfig
+from curie_channel_gateway.mail.egress import make_server
+from curie_channel_gateway.reply_transport import HttpReplyAdapter
 from curie_worker.consumer import Consumer, refuse_unconfigured_reminder
 from curie_worker.delivery_lease import DeliveryLeaseStore
 from curie_worker.markers import Markers
-from curie_worker.reply_sink import HttpReplyAdapter
 
 from .test_completion_outbox import (
     _dispatch_and_settle,
@@ -141,7 +141,7 @@ def test_admitted_mail_completion_dead_letters_deleted_thread_only(
                         mail.deleted_threads.add("th-1")
                     else:
                         mail.fail_next_thread = 500
-                    from curie_dispatcher.queue import to_stream_fields
+                    from curie_internal.turn_queue import to_stream_fields
 
                     await h.async_redis.xadd(h.config.stream, to_stream_fields(qe))
                     entry, fields = await _read_one(h, h.config.consumer_name)
@@ -180,7 +180,8 @@ def test_admitted_mail_completion_dead_letters_deleted_thread_only(
     lines = [
         r.getMessage()
         for r in caplog.records
-        if r.name == "curie_mail_adapter.adapter" and "thread deleted at provider" in r.getMessage()
+        if r.name == "curie_channel_gateway.mail.adapter"
+        and "thread deleted at provider" in r.getMessage()
     ]
     assert len(lines) == (1 if deleted else 0)
 
@@ -225,7 +226,7 @@ def test_refused_provider_connection_persists_completion_cause(
                             }
                         )
                         h.runner.default_script = [Final(text="answer", status=SessionStatus.DONE)]
-                        from curie_dispatcher.queue import to_stream_fields
+                        from curie_internal.turn_queue import to_stream_fields
 
                         await h.async_redis.xadd(h.config.stream, to_stream_fields(qe))
                         entry, fields = await _read_one(h, h.config.consumer_name)
@@ -291,7 +292,7 @@ def test_egress_refusal_cause_refuses_stale_generation(make_harness) -> None:
 
 
 def test_fenced_settle_clears_cause_only_for_current_owner(make_harness) -> None:
-    from curie_dispatcher.queue import to_stream_fields
+    from curie_internal.turn_queue import to_stream_fields
 
     async def go() -> None:
         async with make_harness(shimmer=False) as h:
@@ -375,7 +376,7 @@ def test_fenced_settle_clears_cause_only_for_current_owner(make_harness) -> None
 def test_generic_retry_failure_clears_refusal_cause_without_clearing_completion(
     make_harness,
 ) -> None:
-    from curie_dispatcher.queue import to_stream_fields
+    from curie_internal.turn_queue import to_stream_fields
 
     async def go() -> None:
         completion_calls = 0

@@ -98,6 +98,7 @@ class CronProof(BaseProof):
         for kind, name in (
             ("deployment", f"{self.release}-api"),
             ("deployment", f"{self.release}-worker"),
+            ("deployment", f"{self.release}-channel-gateway"),
             ("statefulset", f"{self.release}-postgres"),
             ("statefulset", f"{self.release}-valkey"),
         ):
@@ -125,25 +126,38 @@ class CronProof(BaseProof):
             raise ProofError("proof release must disable the fake model")
         if not env.get("CURIE_CREDENTIALS", {}).get("valueFrom", {}).get("secretKeyRef"):
             raise ProofError("proof release must reference model credentials")
-        if env.get("CURIE_SLACK_TRUSTED_ORIGINS", {}).get("value") != OFFLINE_ENDPOINT:
-            raise ProofError("proof release must trust only the offline Slack endpoint")
-        if env.get("SLACK_API_BASE_URL", {}).get("value") != OFFLINE_ENDPOINT:
-            raise ProofError("proof release must route Slack only to the receipt fixture")
-        fake_token = self.kubectl(
-            [
-                "exec",
-                f"deployment/{self.release}-worker",
-                "-c",
-                "worker",
-                "--",
-                "sh",
-                "-c",
-                'test -n "$SLACK_BOT_TOKEN" && test -z "$SLACK_APP_TOKEN"',
-            ],
-            check=False,
+        gateway = self.kubectl_json(["get", "deployment", f"{self.release}-channel-gateway"])
+        gateway_container = next(
+            item
+            for item in gateway["spec"]["template"]["spec"]["containers"]
+            if item.get("name") == "channel-gateway"
         )
-        if fake_token.returncode != 0:
-            raise ProofError("proof release needs only a fake Slack bot token")
+        gateway_env = {item.get("name"): item for item in gateway_container.get("env", [])}
+        if gateway_env.get("CURIE_SLACK_TRUSTED_ORIGINS", {}).get("value") != OFFLINE_ENDPOINT:
+            raise ProofError("proof gateway must trust only the offline Slack endpoint")
+        if gateway_env.get("SLACK_API_BASE_URL", {}).get("value") != OFFLINE_ENDPOINT:
+            raise ProofError("proof gateway must route Slack only to the receipt fixture")
+        for workload in ("api", "worker", "channel-gateway"):
+            condition = (
+                'test -n "$SLACK_BOT_TOKEN" && test -z "$SLACK_APP_TOKEN"'
+                if workload == "channel-gateway"
+                else 'test -z "$SLACK_BOT_TOKEN$SLACK_APP_TOKEN$SLACK_USER_TOKEN"'
+            )
+            result = self.kubectl(
+                [
+                    "exec",
+                    f"deployment/{self.release}-{workload}",
+                    "-c",
+                    workload,
+                    "--",
+                    "sh",
+                    "-c",
+                    condition,
+                ],
+                check=False,
+            )
+            if result.returncode != 0:
+                raise ProofError("proof release must keep Slack tokens in the gateway")
         api = self.kubectl_json(["get", "deployment", f"{self.release}-api"])
         api_container = next(
             (
@@ -201,7 +215,7 @@ class CronProof(BaseProof):
                     "matchLabels": {
                         "app.kubernetes.io/name": self.app_name,
                         "app.kubernetes.io/instance": self.release,
-                        "app.kubernetes.io/component": "worker",
+                        "app.kubernetes.io/component": "channel-gateway",
                     }
                 }
             }

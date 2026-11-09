@@ -844,7 +844,7 @@ def test_actual_runner_dockerfile_rejects_unpinned_pip_requirements() -> None:
     ) in _find_violations(_UV_LOCK.read_text(encoding="utf-8"), mutated)
 
 
-def test_prechange_drift_reports_all_six_violations() -> None:
+def test_prechange_drift_reports_all_violations() -> None:
     lock_text = _UV_LOCK.read_text(encoding="utf-8")
     expected = _locked_runner_dependencies(lock_text)
     # The opentelemetry-sdk pin tracks the lock so it stays the one matching pin.
@@ -880,6 +880,10 @@ RUN /app/.venv/bin/pip install \\
             "claude-agent-sdk",
             "expected lock version "
             f"{expected['claude-agent-sdk']}, found Dockerfile version 0.2.115",
+        ),
+        Violation(
+            "httpx2",
+            f"missing exact Dockerfile pin for lock version {expected['httpx2']}",
         ),
         Violation(
             "mcp",

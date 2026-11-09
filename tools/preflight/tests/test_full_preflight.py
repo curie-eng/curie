@@ -81,6 +81,7 @@ def repository(tmp_path: Path) -> Path:
     shutil.copytree(ROOT / ".github/workflows", root / ".github/workflows")
     shutil.copy2(ROOT / ".github/e2e-selection.yaml", root / ".github")
     for relative in (
+        "tools/preflight/scan_history.py",
         "scripts/check-pr-body.sh",
         "scripts/check-commit-messages.sh",
         "tools/fix-pin-ci/check.py",

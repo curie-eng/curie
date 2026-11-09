@@ -862,7 +862,7 @@ def test_slack_sink_top_level_post_to_a_user_id_acks_the_dm_conversation_id() ->
     Home; the response's ``channel`` is the DM conversation id (``D...``), not the
     user id that was posted to. The recorded body below is that documented shape.
     """
-    from curie_worker.slack_sink import SlackReplyAdapter
+    from curie_channel_gateway.slack.slack_sink import SlackReplyAdapter
     from slack_sdk.web.async_slack_response import AsyncSlackResponse
 
     from apps.worker.tests.test_slack_sink import _approval_message
@@ -918,6 +918,71 @@ def test_slack_sink_top_level_post_to_a_user_id_acks_the_dm_conversation_id() ->
     assert calls[0]["channel"] == RECIPIENT
     assert calls[0].get("thread_ts") is None
     assert ack == ReplyAck.model_validate({"ref": CARD_TS, "channel": DM_CHANNEL})
+
+
+def test_selected_approver_dm_registers_its_channel_through_the_gateway(
+    make_harness: Any, tmp_path: Any
+) -> None:
+    from aiohttp import web
+    from aiohttp.test_utils import TestServer
+    from curie_channel_gateway.slack.read_server import GatewayConfig, application
+    from curie_channel_gateway.slack.tokens import SlackProviderConfig
+    from curie_worker.config import WorkerConfig
+    from curie_worker.reply_sink import build_reply_sink
+
+    async def run() -> None:
+        creator = DmCreator()
+        posts: list[dict[str, Any]] = []
+
+        async def provider(request: web.Request) -> web.Response:
+            posts.append(await request.json())
+            return web.json_response(POSTED_DM)
+
+        external_app = web.Application()
+        external_app.router.add_post("/chat.postMessage", provider)
+        async with TestServer(external_app) as external:
+            gateway_config = GatewayConfig(
+                CURIE_CHANNEL_GATEWAY_API_TOKEN="test-api-credential",
+                CURIE_CHANNEL_GATEWAY_WORKER_TOKEN="test-worker-credential",
+                CURIE_CHANNEL_GATEWAY_ALLOW_INSECURE=True,
+                CURIE_CHANNEL_GATEWAY_REPLAY_DB=str(tmp_path / "approval-dm.sqlite3"),
+                slack_api_base_url=str(external.make_url("/")),
+            )
+            gateway_app = await application(
+                gateway_config, SlackProviderConfig(slack_bot_token="xoxb-test")
+            )
+            async with TestServer(gateway_app) as gateway:
+                sink = build_reply_sink(
+                    WorkerConfig(
+                        api_key="",
+                        channel_gateway_url=str(gateway.make_url("/")),
+                        channel_gateway_token="test-worker-credential",
+                        channel_gateway_allow_insecure=True,
+                    )
+                )
+                try:
+                    async with make_harness(
+                        binding=dm_binding(),
+                        identity_authority=Core(),
+                        approvals=creator,
+                        sink=sink,
+                        approval_pending_retention_enabled=True,
+                    ) as h:
+                        h.runner.default_script = awaiting_on_route()
+                        event = qevent("send the selected approval card through the gateway")
+                        await process(h, event, raw=raw_payload(event))
+                        assert [item["channel"] for item in creator.registrations] == [DM_CHANNEL]
+                        stored = await h.card_store.read(APPROVAL_ID)
+                        assert stored is not None and stored[0].channel == DM_CHANNEL
+                        assert stored[0].ts == CARD_TS
+                    assert len(posts) == 1
+                    assert posts[0]["channel"] == RECIPIENT
+                    assert posts[0]["blocks"]
+                    assert "thread_ts" not in posts[0]
+                finally:
+                    await sink.aclose()
+
+    asyncio.run(run())
 
 
 # --- Item 7b (review r1 F2): no text-only DM card through the real Slack adapter --
@@ -989,7 +1054,7 @@ class RealSlackDmSink(FakeSink):
     channel); every other event is recorded by ``FakeSink`` as usual."""
 
     def __init__(self, error: str | None) -> None:
-        from curie_worker.slack_sink import SlackReplyAdapter
+        from curie_channel_gateway.slack.slack_sink import SlackReplyAdapter
 
         super().__init__()
         self.adapter = SlackReplyAdapter("xoxb-test")
@@ -1092,7 +1157,7 @@ def test_an_ordinary_card_keeps_its_text_only_fallback() -> None:
     """Existing behavior: a channel approval card rejected for its blocks still
     falls back to a text-only post in the thread (the API resolve path works
     regardless). Only the DM card loses the fallback."""
-    from curie_worker.slack_sink import SlackReplyAdapter
+    from curie_channel_gateway.slack.slack_sink import SlackReplyAdapter
 
     from apps.worker.tests.test_slack_sink import _approval_message
 

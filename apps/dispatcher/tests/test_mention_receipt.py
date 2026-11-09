@@ -26,13 +26,13 @@ from unittest.mock import MagicMock
 
 import pytest
 import redis
-from curie_dispatcher.admission import IDENTITY_FENCE_KEY
-from curie_dispatcher.app import build_app
-from curie_dispatcher.config import DispatcherConfig
-from curie_dispatcher.identities import SlackIdentityCredentials, delivery_key
-from curie_dispatcher.identity import slack_evidence
-from curie_dispatcher.queue import from_stream_fields
+from curie_channel_gateway.slack.admission import IDENTITY_FENCE_KEY
+from curie_channel_gateway.slack.app import build_app
+from curie_channel_gateway.slack.config import DispatcherConfig
+from curie_channel_gateway.slack.identities import SlackIdentityCredentials, delivery_key
+from curie_channel_gateway.slack.identity import slack_evidence
 from curie_internal.driver_declaration import DeclaredDriver
+from curie_internal.turn_queue import from_stream_fields
 from slack_bolt.adapter.socket_mode import SocketModeHandler
 from slack_sdk.socket_mode.request import SocketModeRequest
 from slack_sdk.web import WebClient

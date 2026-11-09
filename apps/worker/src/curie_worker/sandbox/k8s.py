@@ -286,6 +286,8 @@ def _sandbox_view(obj: dict[str, Any]) -> SandboxView:
         ready=_conditions_ready(status),
         service_fqdn=status.get("serviceFQDN") or None,
         operating_mode=str((obj.get("spec") or {}).get("operatingMode", "Running")),
+        # The in-cluster headless Service: plain HTTP at the root.
+        transport="http",
     )
 
 

@@ -79,7 +79,7 @@ from typing import Any
 import aiohttp
 import pytest
 from aci_protocol import Final, SessionStatus, TextDelta
-from curie_dispatcher.queue import to_stream_fields
+from curie_internal.turn_queue import to_stream_fields
 from curie_worker.consumer import Consumer, refuse_unconfigured_reminder
 from curie_worker.delivery_lease import DeliveryLeaseStore
 

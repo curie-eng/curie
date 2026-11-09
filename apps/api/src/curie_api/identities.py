@@ -6,16 +6,12 @@ ADR-0193 decision 4). An out-of-process adapter's name cannot be listed by
 the API, so other kinds keep the slug rule the write schema already applies.
 """
 
-import logging
-import os
-from collections.abc import Mapping
-
+import httpx
 from aci_protocol.slack_identities import declared_slack_identity_names
-from aci_protocol.turn import DEFAULT_IDENTITY, SLACK_KIND
+from aci_protocol.turn import SLACK_KIND
+from curie_channel_gateway.read_transport import GatewayClient
 
 from .config import Settings, get_settings
-
-logger = logging.getLogger(__name__)
 
 
 def declared_identities(kind: str) -> frozenset[str] | None:
@@ -47,32 +43,14 @@ def refuse_undeclared(kind: str, identity: str | None) -> None:
     )
 
 
-def slack_bot_tokens(
-    settings: Settings, *, environ: Mapping[str, str] | None = None
-) -> dict[str, str]:
-    """Each Slack identity's bot token, keyed by name (ADR-0168 decision 5).
-
-    ``default`` comes from ``SLACK_BOT_TOKEN`` and is absent when that is
-    blank, the normal Slack-free install. A stock install reads no other
-    environment. A named identity whose token is blank is logged and left out.
-    """
-
-    tokens: dict[str, str] = {}
-    if settings.slack_bot_token:
-        tokens[DEFAULT_IDENTITY] = settings.slack_bot_token
-    if not settings.slack_identities:
-        return tokens
-    env: Mapping[str, str] = os.environ if environ is None else environ
-    for declared in settings.slack_identities:
-        if declared.name == DEFAULT_IDENTITY:
-            continue
-        token = env.get(declared.bot_token_env) or ""
-        if not token.strip():
-            logger.error(
-                "Slack identity %s cannot resolve approver groups: %s is empty",
-                declared.name,
-                declared.bot_token_env,
-            )
-            continue
-        tokens[declared.name] = token
-    return tokens
+def gateway_client(settings: Settings, http: httpx.AsyncClient) -> GatewayClient | None:
+    if not settings.channel_gateway_url:
+        return None
+    names = tuple(identity.name for identity in settings.slack_identities) or ("default",)
+    return GatewayClient(
+        http,
+        settings.channel_gateway_url,
+        settings.channel_gateway_token,
+        allow_insecure_http=settings.channel_gateway_allow_insecure,
+        identities=names,
+    )

@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Any
 
 from aci_protocol import Final, SessionStatus
-from curie_dispatcher.queue import to_stream_fields
+from curie_internal.turn_queue import to_stream_fields
 from curie_worker.capacity_wait import CapacityWaitStore
 from curie_worker.consumer import Consumer, refuse_unconfigured_reminder
 from curie_worker.delivery_lease import DeliveryLeaseStore

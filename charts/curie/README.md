@@ -2335,12 +2335,12 @@ dispatcher:
         botTokenExistingSecret: slack-sales      # key defaults to slackBotToken
 ```
 
-With no entries the chart renders exactly the objects it rendered before the
-key existed. With entries, the dispatcher, worker and API each receive
-`CURIE_SLACK_IDENTITIES`, which names every identity and the env vars holding
-its tokens, from one helper (`templates/_slack-identities.tpl`). Entry `n`'s bot
-token is `CURIE_SLACK_BOT_TOKEN__<n>` in all three, and the dispatcher also
-gets `CURIE_SLACK_APP_TOKEN__<n>` and, when set, `CURIE_SLACK_SIGNING_SECRET__<n>`.
+With entries, the dispatcher, gateway, worker and API each receive
+`CURIE_SLACK_IDENTITIES` from `templates/_slack-identities.tpl`. This declares
+identity names and token environment names; the API and worker receive no token
+values. Entry `n`'s bot token is `CURIE_SLACK_BOT_TOKEN__<n>` in the dispatcher
+and gateway. Only the dispatcher gets `CURIE_SLACK_APP_TOKEN__<n>` and, when set,
+`CURIE_SLACK_SIGNING_SECRET__<n>`.
 `default` always keeps the `SLACK_*` names. The render refuses a duplicate
 name, a name that is not lowercase letters and digits in runs joined by single
 hyphens (at most 40 characters, so every name is one a binding's `adapter` can
@@ -2348,6 +2348,63 @@ carry), a name of `curie-cluster-message` (reserved for the platform's
 built-in cluster-message reply adapter), a missing token reference, `default`
 configured twice or not at all, and an `extraEnv` entry naming any of these
 variables. `charts/curie/ci/slack-identities-assertions.sh` pins all of it.
+
+### Channel gateway upgrade
+
+An existing Slack install upgrades with the same values file and Secret objects.
+`channelGateway.deploy: null` automatically deploys the gateway when Slack is
+configured and `channelGateway.url` is empty. Setting `deploy: false` explicitly
+requires an external URL; the render refuses otherwise and names both fixes.
+Installs without Slack do not deploy a gateway automatically. The gateway adds
+one Deployment and a 1Gi replay PVC by default; its storage class follows
+`global.storageClass` unless `channelGateway.replayStorageClass` is configured.
+
+The chart moves Slack bot-token references from the API and worker into the
+gateway, preserving their Secret names and keys. The dispatcher retains its
+intake credentials. The API and worker receive distinct caller credentials,
+generated and persisted in the chart Secret, and use verified internal TLS.
+No operator token changes are needed for a chart-managed install. Custom launchers
+must remove raw Slack tokens from API and worker environments because both
+applications now reject them. This is a runtime credential-custody change.
+
+With no `channelGateway.tlsSecret`, Helm creates
+`<fullname>-channel-gateway-tls` containing `ca.crt`, `tls.crt` and `tls.key`.
+The server certificate covers this release's service DNS names. Both it and the
+signing CA last ten years. Helm `lookup` preserves the complete
+Secret across upgrades. Use a Helm client with Kubernetes API access; offline
+renderers cannot persist generated certificates and must instead provide a
+managed `channelGateway.tlsSecret` containing the certificate and key, plus
+`ca.crt` for a private CA. Publicly trusted certificates may omit `ca.crt`; callers
+then use their system trust roots. API and worker
+mount only `ca.crt`; the gateway alone mounts the server key. The added CA is
+trusted by the API request and undo recovery clients, worker shared client,
+reply sink and file-download transports, scoped to the configured gateway origin.
+The protected worker receives its CA path from its launcher environment.
+
+Rotate before the server certificate expires. For operator-managed certificates,
+replace the named Secret's certificate and key, and CA when private.
+For chart-managed certificates, schedule a brief Slack delivery maintenance
+window, delete only this release's gateway TLS Secret, and run `helm upgrade`
+with the unchanged values file so Helm generates a new CA and certificate.
+TLS data checksums roll the gateway, API and worker together during the upgrade
+so all use the new certificate and trust bundle; then verify delivery.
+After changing an operator-managed Secret, run `helm upgrade` with API access
+to refresh those checksums. Rotation is explicit;
+ordinary upgrades never silently rotate the certificate. Do not delete the
+replay PVC during rotation.
+
+An external gateway uses `channelGateway.url`; configure separate
+`channelGateway.apiToken` and `channelGateway.workerToken`. For a private CA,
+`channelGateway.tlsSecret` supplies `ca.crt` to callers. For a chart-deployed
+gateway it also supplies `tls.crt` and `tls.key`. Explicit
+`channelGateway.allowInsecure: true` permits HTTP on a development network.
+A supplied TLS Secret always selects HTTPS. Its single replica and Recreate
+strategy keep the persistent SQLite replay ledger under one owner.
+
+Protected-worker provisioners must migrate `process.json` v1 once before
+starting the upgraded image; see the
+[one-shot process migration](../../packages/channel-gateway/README.md#protected-worker-process-files).
+The runtime continues rejecting v1; there is no dual-version startup path.
 
 A plain `curie cluster up` re-supplies a recorded list along with the
 `dispatcher.slack` token fields, so an operator does not need to pass it again
@@ -2360,13 +2417,12 @@ stores it on the binding, so a declared identity can be bound to any channel,
 including one another identity already answers in (ADR-0168 decision 3).
 
 Each identity's bot token is also the one its turns are answered with. The
-worker sets the assistant status, edits the reply, posts and settles approval
-cards and downloads attached files with the token of the identity a turn
-arrived on, and the API resolves an approval's Slack user-group approvers with
-it, so each Slack app needs its own `files:read` and `usergroups:read` scopes.
-A worker holding no token for the identity a turn names drops the turn before
-it runs, logs the identity, and leaves the placeholder as the dispatcher posted
-it: it never answers as another bot.
+worker delegates assistant status, replies, approval cards and attached-file
+fetches to that identity's gateway ports. The API asks the same identity's
+membership source for approval authorization. Each Slack app therefore needs
+its own `files:read` and `usergroups:read` scopes. An undeclared identity is
+refused before a turn runs; missing provider credentials refuse at the gateway.
+Neither application borrows another bot's identity.
 
 A second identity also puts a rate limit on fan-out between siblings (ADR-0168
 decision 6): 5 sibling-written turns per session key, and 5 conversations
@@ -2577,3 +2633,19 @@ and teardown. The local runner receives a claim-owned writable named tmpfs cache
 `536870912`, or `512Mi`). Its contents consume effective memory resources, so
 a file below the volume capacity can still fail when the runner's memory limit
 is exhausted. Claim deletion removes only that claim's volume.
+
+
+## Declared Slack test drivers
+
+`testInstallation.enabled` defaults to `false`. The existing
+`testInstallation.drivers` entries name `channel_id`, `bot_id` and
+`bot_user_id`, plus `agent` for a sibling driver; `testInstallation.threadTurnLimit`
+bounds driver turns per thread in ten minutes. The chart passes the same values
+to the dispatcher for legacy and selected HTTP intake. Existing production,
+published-secret and driver-identity checks apply to both paths.
+
+Selected HTTP intake admits only listed, marked bot mentions, attributes them
+to the configured driver user, and applies normal API identity admission.
+Root pings reply without a turn; bot direct messages and test-driver approval
+replies remain refused. See the
+[gateway implementation notes](../../packages/channel-gateway/README.md#adr-0202-implementation-declared-http-test-drivers).

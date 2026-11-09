@@ -16,9 +16,9 @@ from __future__ import annotations
 
 from typing import Any
 
-from curie_mail_adapter.agentmail import AgentMailClient, AgentMailProvider
-from curie_mail_adapter.config import MailAdapterConfig
-from curie_mail_adapter.provider import UNVERIFIABLE, SenderVerdict
+from curie_channel_gateway.mail.agentmail import AgentMailClient, AgentMailProvider
+from curie_channel_gateway.mail.config import MailAdapterConfig
+from curie_channel_gateway.mail.provider import UNVERIFIABLE, SenderVerdict
 
 
 class VerifyingTestProvider(AgentMailProvider):

@@ -276,7 +276,7 @@ def test_invariants_preserved_from_dev():
 
     assert "x-core-profiles: &core_profiles [core, full]" in out
     assert "x-full-profiles: &full_profiles [full]" in out
-    assert out.count("profiles: *core_profiles") == 8
+    assert out.count("profiles: *core_profiles") == 10
     assert out.count("profiles: *full_profiles") == 6
 
     # No service is added or dropped by the transforms.
@@ -1049,6 +1049,7 @@ def test_release_compose_init_containers_adopted():
 
 # One-shot jobs that run to completion and must not be restarted.
 ONESHOT_SERVICES = {
+    "curie-gateway-replay-perms",
     "rustfs-init",
     "rustfs-perms",
     "ollama-pull",

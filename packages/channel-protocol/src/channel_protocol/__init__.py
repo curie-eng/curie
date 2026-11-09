@@ -1,5 +1,6 @@
 """Rendering-neutral messages shared by Curie channel adapters."""
 
+from .formatted import Reply
 from .identity import (
     ScopedConversation,
     hook_conversation_id,
@@ -69,6 +70,7 @@ __all__ = [
     "ProgressCommand",
     "ProgressMilestone",
     "ProgressState",
+    "Reply",
     "ReplyAck",
     "ReplyEvent",
     "ReplyPost",

@@ -18,11 +18,15 @@ import pytest
 import redis
 from channel_protocol.reply import ReplyPost
 from curie_api.config import get_settings
+from curie_channel_gateway.mail.adapter import (
+    APPROVAL_INSTRUCTIONS,
+    APPROVAL_REF_PATTERN,
+    MailAdapter,
+)
+from curie_channel_gateway.mail.config import MailAdapterConfig
+from curie_channel_gateway.mail.egress import make_server
 from curie_internal.approval_reminder import ApprovalReminderV1
 from curie_internal.keyspace import cluster_reply_keys
-from curie_mail_adapter.adapter import APPROVAL_INSTRUCTIONS, APPROVAL_REF_PATTERN, MailAdapter
-from curie_mail_adapter.config import MailAdapterConfig
-from curie_mail_adapter.egress import make_server
 from curie_worker.approval_cards import ApprovalCardStore
 from curie_worker.approval_reminders import deliver_reminder
 from curie_worker.approvals import ApprovalClient

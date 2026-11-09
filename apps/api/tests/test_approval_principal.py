@@ -57,7 +57,7 @@ def test_operator_principal_round_trip_and_claim_shape() -> None:
     assert claims.approval_id is None
 
 
-def test_chat_principal_carries_attested_channel() -> None:
+def test_chat_principal_carries_actor_channel() -> None:
     token = approval_principal.mint(
         get_settings().approval_chat_attester_secret,
         subject=SUBJECT,
@@ -236,7 +236,7 @@ def test_operator_principal_mint_rejects_blank_subject(
 
 
 def test_test_driver_attestation_is_bound_and_matches_dispatcher_codec() -> None:
-    from curie_dispatcher import approval_principal as dispatcher_codec
+    from curie_channel_gateway.slack import approval_principal as dispatcher_codec
 
     token = dispatcher_codec.mint_test_driver_principal(
         "test-attester-secret",

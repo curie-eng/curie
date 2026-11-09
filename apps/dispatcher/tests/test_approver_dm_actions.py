@@ -22,14 +22,14 @@ from unittest.mock import MagicMock
 import httpx
 import pytest
 import redis
-from curie_dispatcher.approval_actions import (
+from curie_channel_gateway.slack.approval_actions import (
     APPROVE_ACTION_ID,
     APPROVE_NOTE_ACTION_ID,
     NOTE_MODAL_CALLBACK_ID,
     _fetch_card_message,
 )
-from curie_dispatcher.config import DispatcherConfig
-from curie_dispatcher.preflight import check_slack_channel_capabilities
+from curie_channel_gateway.slack.config import DispatcherConfig
+from curie_channel_gateway.slack.preflight import check_slack_channel_capabilities
 from slack_bolt.adapter.socket_mode import SocketModeHandler
 from slack_sdk.errors import SlackApiError
 from slack_sdk.socket_mode.request import SocketModeRequest

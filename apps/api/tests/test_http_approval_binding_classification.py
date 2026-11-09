@@ -682,6 +682,27 @@ def test_route_policy_moves_legacy_creation_to_the_selected_path(
     assert synthetic_provider.requests == []
 
 
+def test_disabled_authority_does_not_make_an_exclusion_route_legacy(
+    synthetic_provider: SimpleNamespace,  # noqa: F811 - the reused fixture.
+) -> None:
+    scope = _scope(synthetic_provider.url)
+    sibling = _sibling(scope)
+    _route_policy(sibling, {"separation": {"exclude_requester": True}})
+    sql_rows(
+        f'UPDATE "{SCHEMA}".tenant_identity_providers '
+        "SET http_selection = CAST(:selection AS jsonb) WHERE tenant_id = :tenant",
+        {"selection": json.dumps({"mode": "disabled"}), "tenant": uuid.UUID(scope["tenant"])},
+    )
+    assert _classified(sibling["binding"], None) is True
+    with TestClient(_app(scope, synthetic_provider, initialized=False)) as client:
+        body = _body(sibling, route=POLICY_ROUTE)
+        refused = _create(client, body)
+        assert refused.status_code == 409, refused.text
+        assert refused.json() == {"detail": "unsupported_approval"}
+        assert _stored(body["dedupe_key"]) == []
+    assert synthetic_provider.requests == []
+
+
 def test_route_policy_classifies_only_in_a_selecting_tenant(
     synthetic_provider: SimpleNamespace,  # noqa: F811 - the reused fixture.
 ) -> None:

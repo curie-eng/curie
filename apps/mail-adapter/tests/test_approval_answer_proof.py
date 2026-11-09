@@ -29,10 +29,10 @@ from _support import (
     update,
 )
 from _verifying_provider import VerifyingTestProvider, verified
+from curie_channel_gateway.mail.adapter import APPROVAL_REF_PATTERN, MailAdapter
+from curie_channel_gateway.mail.config import MailAdapterConfig
 from curie_internal import identity_approval
 from curie_internal import identity_context as codec
-from curie_mail_adapter.adapter import APPROVAL_REF_PATTERN, MailAdapter
-from curie_mail_adapter.config import MailAdapterConfig
 
 PRINCIPAL = "adp.test-payload.test-signature"
 APPROVER = "approver@example.com"
@@ -173,7 +173,7 @@ def test_without_a_receiver_the_answer_is_carried_as_before_and_logged(
 ) -> None:
     """Legacy installs see the resolve they always saw, and the log says it is unsigned."""
     adapter = make_verifying(channel_token=CHANNEL_TOKEN)
-    with caplog.at_level(logging.INFO, logger="curie_mail_adapter"):
+    with caplog.at_level(logging.INFO, logger="curie_channel_gateway.mail"):
         _answer(mail, adapter, serve_egress(adapter) + "/", APPROVAL, "APPROVE")
 
     ((path, headers, body),) = ingress.resolves

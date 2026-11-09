@@ -18,7 +18,7 @@ import logging
 import threading
 from collections.abc import Callable
 
-import curie_mail_adapter.adapter as adapter_module
+import curie_channel_gateway.mail.adapter as adapter_module
 import pytest
 from _support import (
     AGENTMAIL_API_KEY,
@@ -28,8 +28,8 @@ from _support import (
     MailState,
     wait_until,
 )
-from curie_mail_adapter.adapter import MailAdapter
-from curie_mail_adapter.agentmail import AgentMailProvider
+from curie_channel_gateway.mail.adapter import MailAdapter
+from curie_channel_gateway.mail.agentmail import AgentMailProvider
 
 FAILURE_PREFIX = "poll: list failed"
 
@@ -63,7 +63,7 @@ def test_a_dropped_list_call_records_a_bounded_safe_cause(
     """
     mail.drop_next_lists = 1
 
-    with caplog.at_level(logging.WARNING, logger="curie_mail_adapter.adapter"):
+    with caplog.at_level(logging.WARNING, logger="curie_channel_gateway.mail.adapter"):
         status = adapter.poll_once()
 
     assert status == 0, f"a dropped connection must surface as a transport failure, got {status}"
@@ -170,7 +170,7 @@ def test_a_provider_error_body_is_replaced_by_a_bounded_status_token(
     mail.injected_body = {"error": "Subject: payroll spreadsheet; body: SSN 123-45-6789"}
     mail.fail_next_list = http_status
 
-    with caplog.at_level(logging.WARNING, logger="curie_mail_adapter.adapter"):
+    with caplog.at_level(logging.WARNING, logger="curie_channel_gateway.mail.adapter"):
         observed_status = adapter.poll_once()
 
     # The provider maps the status to a neutral kind (a 4xx is ``refused``, a 5xx
@@ -292,7 +292,7 @@ def test_repeated_list_transport_failures_back_off_then_reset_on_recovery(
     would cost minutes of suite time for a property that is about ordering, not
     absolute seconds. Only those two numeric bounds are rebound, for the
     duration of this test: no function, class or I/O path inside
-    `curie_mail_adapter` is replaced, and every request still crosses the real
+    `curie_channel_gateway.mail` is replaced, and every request still crosses the real
     fake AgentMail server, so the cadence under test is the production one,
     observed as wall-clock arrival times of real requests at the provider seam.
 

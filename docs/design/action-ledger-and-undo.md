@@ -71,7 +71,7 @@ of not discarding what is already computed.
   evidence blob."
 
 - **Cards with buttons on a channel already work.** `ApprovalCardStore` and
-  `apps/worker/src/curie_worker/blocks.py` in the worker render and track interactive cards, and the API
+  `packages/channel-gateway/src/curie_channel_gateway/slack/blocks.py` in the worker render and track interactive cards, and the API
   exposes `GET /{approval_id}`, `GET /{approval_id}/audit`, and
   `POST /{approval_id}/resolve`. A receipt with an Undo button is that machinery
   pointed at a different row.

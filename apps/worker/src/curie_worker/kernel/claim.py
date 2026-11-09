@@ -95,6 +95,36 @@ def _is_fenced(lease: DeliveryLease | None) -> bool:
     return lease is not None and lease.generation > 0 and bool(lease.owner)
 
 
+async def _watch_turn_before_start(
+    self: Kernel,
+    thread_key: str,
+    handle: SandboxHandle,
+    queued_event_id: str,
+    remaining_s: float | None,
+) -> None:
+    delivery_lease = constants._DELIVERY_LEASE.get()
+    if not _is_fenced(delivery_lease):
+        return
+    assert delivery_lease is not None
+    previous = await self._markers.watched_turn(handle.claim_name)
+    if previous is not None:
+        predecessor = json.loads(previous)
+        if predecessor["owner"] != delivery_lease.owner:
+            if not await self._markers.is_terminal(
+                predecessor["event_id"]
+            ) and not await self._workspace_handoff_ready(
+                handle,
+                remaining_s=remaining_s,
+                predecessor_event_id=predecessor["event_id"],
+            ):
+                raise failures.HandoffPending(
+                    f"thread {thread_key} still has an unsettled leased turn"
+                )
+    if await self._markers.saw_side_effect(queued_event_id):
+        raise failures.PriorSideEffectObserved()
+    await self._markers.watch_turn(thread_key, handle.claim_name, delivery_lease, queued_event_id)
+
+
 def _remaining_budget(lease: DeliveryLease | None) -> float | None:
     """Seconds of delivery budget left, or ``None`` for a caller with no budget.
 
@@ -608,7 +638,7 @@ async def _route_and_start(
             pending_publication_approval=pending_publication_approval,
         )
     ):
-        raise failures.ThreadBusyError(
+        raise failures.HandoffPending(
             f"thread {thread_key} has not reached a durable lineage handoff boundary"
         )
     if (
@@ -633,7 +663,7 @@ async def _route_and_start(
             lineage_reconciliation=resume_replaces,
         )
     ):
-        raise failures.ThreadBusyError(
+        raise failures.HandoffPending(
             f"thread {thread_key} has not reached a durable workspace handoff boundary"
         )
     # ADR 0270 decision 3: a different requester never steers into, adopts or
@@ -691,7 +721,7 @@ async def _route_and_start(
             lineage_reconciliation=resume_replaces,
         )
     ):
-        raise failures.ThreadBusyError(
+        raise failures.HandoffPending(
             f"thread {thread_key} has not reached a durable turn budget handoff boundary"
         )
     # @spec WORKER-TOOL-ACCESS-3: a restricted turn never gets a canned reply.
@@ -1128,6 +1158,14 @@ async def _route_and_start(
             # fallback as a 409; never send a null-authority steer to a live turn.
             steered = False
         else:
+            lease = constants._DELIVERY_LEASE.get()
+            if (
+                _is_fenced(lease)
+                and lease is not None
+                and lease.generation > 1
+                and await self._markers.saw_side_effect(queued_event_id)
+            ):
+                raise failures.PriorSideEffectObserved()
             steered = await self._runner.steer(
                 handle.base_url, steer_event, token=handle.token or None, remaining_s=remaining_s
             )
@@ -1270,6 +1308,7 @@ async def _route_and_start(
             remaining_s=remaining_s,
         )
         wait_budget_s = await check_capacity_before_request()
+        await _watch_turn_before_start(self, thread_key, handle, queued_event_id, remaining_s)
         if wait is None:
             turn = await self._start_turn_under_hook_control(handle, event, remaining_s)
         elif wait_budget_s is None:
@@ -1578,7 +1617,7 @@ async def _claim_or_resume(
                     ),
                 )
                 if not ready:
-                    raise failures.ThreadBusyError(
+                    raise failures.HandoffPending(
                         f"thread {thread_key} lost its durable workspace "
                         "handoff boundary during preparation"
                     )

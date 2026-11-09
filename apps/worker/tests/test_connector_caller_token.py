@@ -35,7 +35,7 @@ _FILE_KEYS = {
     "principal_headers",
     "malformed_principal_headers",
 }
-_VECTOR_KEYS = {"name", "why", "seed", "public", "agent", "exp", "minted"}
+_VECTOR_KEYS = {"name", "why", "seed_range", "public", "agent", "exp", "minted"}
 _RUN_KEYS = {"run", "work_item"}
 _PRINCIPAL_KEY = "principal"
 _PRINCIPAL_FIELDS = {"tenant_id", "issuer", "subject"}
@@ -165,7 +165,7 @@ def test_the_worker_mints_exactly_the_frozen_token(vector: dict[str, object]) ->
     # An agent-only vector passes no principal at all, so the call is today's.
     extra.update(_principal_kwargs(vector))
     minted = caller_token.mint(
-        str(vector["seed"]),
+        base64.b64encode(bytes(range(*vector["seed_range"]))).decode(),
         agent=str(vector["agent"]),
         exp=int(str(vector["exp"])),
         **extra,
@@ -177,7 +177,7 @@ def test_the_worker_mints_exactly_the_frozen_token(vector: dict[str, object]) ->
 def test_every_frozen_token_verifies_under_its_public_key(vector: dict[str, object]) -> None:
     # The corpus has to be right before a verifier is written against it, so
     # the signature and the claims are checked here with the primitive itself.
-    seed = base64.b64decode(str(vector["seed"]))
+    seed = bytes(range(*vector["seed_range"]))
     public = base64.b64decode(str(vector["public"]))
     assert bytes(SigningKey(seed).verify_key) == public
 
@@ -426,7 +426,7 @@ def test_a_token_past_the_verifier_bound_is_refused_without_echoing_the_principa
     # Every field is inside its own bound, but the ASCII escapes (six bytes
     # per character) push the token past what the verifier reads. ADR 0270
     # decision 2: refused before boot, not minted for the verifier to drop.
-    seed = str(_vectors()[0]["seed"])
+    seed = base64.b64encode(bytes(range(*_vectors()[0]["seed_range"]))).decode()
     issuer = "https://idp.example.test/" + "é" * 2000
     subject = "é" * 256
     assert len(issuer) <= 2048 and len(subject) <= 256
@@ -447,7 +447,7 @@ def test_the_minter_bounds_a_token_at_the_verifiers_4096_characters() -> None:
 
 
 def test_a_principal_at_its_field_bounds_still_mints_under_the_token_bound() -> None:
-    seed = str(_vectors()[0]["seed"])
+    seed = base64.b64encode(bytes(range(*_vectors()[0]["seed_range"]))).decode()
     principal = caller_token.CallerPrincipal(
         tenant_id="44444444-4444-4444-8444-444444444444",
         issuer="https://idp.example.test/" + "a" * (2048 - 25),
@@ -473,7 +473,7 @@ def test_a_principal_at_its_field_bounds_still_mints_under_the_token_bound() -> 
 def test_a_route_token_never_takes_a_principal() -> None:
     # ADR 0270 decision 2: a ccr stays an agent/run credential without human
     # authority, so its minter has no way to be handed one.
-    seed = str(_vectors()[0]["seed"])
+    seed = base64.b64encode(bytes(range(*_vectors()[0]["seed_range"]))).decode()
     principal = caller_token.CallerPrincipal(**_by_name(_HUMAN)[_PRINCIPAL_KEY])
     with pytest.raises(TypeError):
         caller_token.mint_route(  # type: ignore[call-arg]
@@ -484,13 +484,18 @@ def test_a_route_token_never_takes_a_principal() -> None:
 def test_an_omitted_principal_keeps_the_agent_only_bytes() -> None:
     plain = _by_name("a_plain_agent_name")
     assert (
-        caller_token.mint(str(plain["seed"]), agent="acme-dev", exp=1790000000, principal=None)
+        caller_token.mint(
+            base64.b64encode(bytes(range(*plain["seed_range"]))).decode(),
+            agent="acme-dev",
+            exp=1790000000,
+            principal=None,
+        )
         == plain["minted"]
     )
 
 
 def test_one_of_the_run_pair_is_refused_without_echoing_it() -> None:
-    seed = str(_vectors()[0]["seed"])
+    seed = base64.b64encode(bytes(range(*_vectors()[0]["seed_range"]))).decode()
     run = "11111111-1111-4111-8111-111111111111"
     work_item = "22222222-2222-4222-8222-222222222222"
     with pytest.raises(ValueError, match="present together") as caught:
@@ -515,7 +520,7 @@ def test_the_refusal_never_echoes_the_key() -> None:
 
 def test_surrounding_whitespace_in_a_mounted_key_is_ignored() -> None:
     # A Secret written with `echo` carries a trailing newline.
-    seed = str(_vectors()[0]["seed"])
+    seed = base64.b64encode(bytes(range(*_vectors()[0]["seed_range"]))).decode()
     assert caller_token.mint(seed + "\n", agent="acme-dev", exp=1790000000) == _vectors()[0][
         "minted"
     ]
@@ -753,7 +758,7 @@ def test_every_principal_header_principal_mints_a_caller_token(case: dict[str, A
     # has to fit the token bound; the header is shorter than its token.
     first = _vectors()[0]
     token = caller_token.mint(
-        str(first["seed"]),
+        base64.b64encode(bytes(range(*first["seed_range"]))).decode(),
         agent=str(first["agent"]),
         exp=int(first["exp"]),
         principal=caller_token.CallerPrincipal(**case["principal"]),

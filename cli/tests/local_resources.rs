@@ -179,6 +179,7 @@ fn ordered_compose_files_and_project_reach_dry_run_argv() {
         .env("S3_ENDPOINT_URL", "http://127.0.0.1:39000")
         .env("CURIE_DOCKER_NETWORK", "curie-check-2780-a_runner")
         .env("CURIE_LOCAL_STUB_PORT", "18155")
+        .env("CURIE_LOCAL_GATEWAY_PORT", "18081")
         .env("CURIE_LOCAL_POSTGRES_HOST", "127.0.0.1")
         .env("CURIE_LOCAL_POSTGRES_PORT", "35432")
         .env("CURIE_LOCAL_IMAGE_TAG", "dev-2780-a")

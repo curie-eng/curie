@@ -42,7 +42,7 @@ from approver_dm_support import (
 from approver_dm_support import dm_case as dm_case
 from approver_ticket_support import APPROVER_A
 from curie_api.slack_approvers import SlackApproverSetSelector
-from curie_api.usergroups import UserGroupMembership
+from curie_channel_gateway.group_models import UserGroupMembership
 
 GROUP = "S0EXAMPLE1"
 CONTINUE = ("continue", "current_authority")

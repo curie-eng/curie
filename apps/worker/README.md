@@ -497,7 +497,7 @@ The floor of 2 is enforced because `max_delivery=1` would dead-letter every
 ordinary worker crash on its first reclaim; values below 3 undermine the crash
 recovery of ADR-0013.
 
-Config surface (`WorkerConfig`): `VALKEY_*`, `SLACK_BOT_TOKEN`,
+Config surface (`WorkerConfig`): `VALKEY_*`, `CURIE_CHANNEL_GATEWAY_URL`, `CURIE_CHANNEL_GATEWAY_TOKEN`,
 `CURIE_STREAM` / `CURIE_CONSUMER_GROUP` / `CURIE_CONSUMER_NAME`,
 `CURIE_WORKER_MAX_CONCURRENCY` (turns one worker runs at once, default `16`,
 `1` through `256`; chart `worker.maxConcurrency`),
@@ -586,7 +586,8 @@ source without a container rebuild -- point it at the stack's exposed ports:
 export CLAUDE_CODE_OAUTH_TOKEN=...        # or ANTHROPIC_API_KEY=... / CURIE_CREDENTIALS=...
 env CURIE_SANDBOX_SUBSTRATE=docker \
     VALKEY_HOST=localhost VALKEY_PORT=26379 VALKEY_PASSWORD=valkeypass \
-    SLACK_API_BASE_URL=http://localhost:8155/api/ SLACK_BOT_TOKEN=xoxb-dev \
+    CURIE_CHANNEL_GATEWAY_URL=http://localhost:8081 CURIE_CHANNEL_GATEWAY_ALLOW_INSECURE=true \
+    CURIE_CHANNEL_GATEWAY_TOKEN=curie-dev-gateway-worker \
     CURIE_DOCKER_NETWORK=curie_default \
     OTEL_EXPORTER_OTLP_ENDPOINT=http://otel-collector:4318 \
     uv run python -m curie_worker &
@@ -606,10 +607,16 @@ env CURIE_SANDBOX_SUBSTRATE=docker \
   failure).
 - `CURIE_RUNNER_IMAGE` overrides the runner image tag (default
   `curie-runner`).
-- `VALKEY_HOST`/`VALKEY_PORT`/`VALKEY_PASSWORD` and `SLACK_BOT_TOKEN` point at
-  the compose stack's exposed ports and dev bot token (see `compose.dev.yaml`);
-  `SLACK_API_BASE_URL` points at the stack's Slack stub instead of real
-  slack.com.
+- `VALKEY_HOST`/`VALKEY_PORT`/`VALKEY_PASSWORD` point at the compose stores.
+  The worker uses a gateway caller credential for provider operations;
+  configure `SLACK_API_BASE_URL` on the gateway to select the stack's Slack stub.
+
+The protected worker's `process.json` uses schema version 2 and a
+`channel_gateway` object with `url`, `token`, `allow_insecure_http` and
+`identities`. Its token authenticates this worker to the gateway. TLS is required
+unless `allow_insecure_http` is explicitly true. Empty URL, token and identities
+disable Slack delivery. Both worker entry points refuse ambient Slack tokens,
+and the protected worker rejects the former provider-credential configuration.
 
 Drive a turn the normal way once it's up (`curie local deploy` / `curie
 local message`, pinned at whichever API port you brought up) -- the hand-run
@@ -637,6 +644,67 @@ fencing generation (`delivery_lease.py`, driven by the shared lifecycle in
 heartbeat renews it; a renewal that Valkey cannot confirm fails **closed** —
 the owner is lease-lost, its runner is interrupted through the bounded control
 path, and it may no longer settle anything.
+
+A retained turn that has not reached a durable handoff boundary waits with
+exponential backoff inside its fenced delivery. These refusals consume the
+original delivery deadline, without consuming attempts or increasing the PEL
+delivery count. Reclaim preflight waits use the same rule. Deadline exhaustion
+still emits an operator-visible delivery failure.
+
+Before starting a turn, the worker records the claim and its delivery owner in
+Valkey. Maintenance observes missing ownership and allows
+`CURIE_ABANDONED_TURN_GRACE_S` (90 seconds by default) before checking the exact
+claim under the thread lock. For an unfinished delivery, a runner that remains
+active, unreadable or unable to confirm durable history is retired through its
+backend. A terminal delivery's runner is retired only when status reports an
+active turn. An idle terminal runner keeps its route even if its history is
+non-durable; its watch is removed. An unreadable terminal runner keeps its watch
+for a later status read. Three unreadable status probes remove that terminal
+watch without retiring the runner, bounding probes to 15 seconds across ticks
+and worker restarts while allowing two transient failures. An unreadable
+unfinished runner latches the action marker before retirement. Static shells stop
+the child and verify cleanup. If the runner settled before the supervisor's
+check, the cleaned shell can be reused; otherwise it is quarantined and its 503
+health response asks the platform to replace it. Settlement retains the recovery
+watch for maintenance, which removes it after an eligible idle status,
+confirming the claim is gone, or retiring it.
+Failed retirements retain their watch and do not block other maintenance. Before
+retirement or replacing an unfinished predecessor's watch for a follow-up,
+recovery persists the runner's retained side-effect marker so reclaim escalates
+instead of replaying. Reclaim waits without interrupting a different delivery's
+live watched turn. The runner flag is not tied to an event, so a change in
+delivery ownership can conservatively escalate a delivery that performed no action.
+Turns started through the attachment handoff currently register no recovery
+watch and are a known gap in this bound. The bound and runner cleanup settings
+are described in [the static substrate reference](../../docs/static-pool-substrate.md).
+
+### Shared static shells
+
+With `CURIE_SANDBOX_SUBSTRATE=static`, agents share `CURIE_WARM_POOL` by default.
+Size that pool for concurrent claims. `CURIE_AGENT_SANDBOX_POOLS` and
+`CURIE_AGENT_CONNECTOR_SECRET_POOLS` remain explicit isolation opt-ins and
+require matching inventory entries. Connector credentials alone do not force
+an agent into its own pool.
+
+Agent identity, connector endpoints, caller credentials, bundle inputs and
+connector secrets arrive per claim. `CURIE_AGENT_CREDENTIAL_FILES` maps an
+agent to credential environment names and absolute UTF-8 source file paths
+on the worker, for example an external tool server's bearer. The worker reads
+those files afresh on each claim, removes one final LF or CRLF, and refuses any
+other leading or trailing whitespace. Missing, unreadable, empty, reserved or
+withheld inputs fail closed. Their values join the runner's held-secret
+inventory before it serves. Shells retain only deployment-wide model
+credentials and shared connector trust material.
+
+The supervisor stages runtime configuration and credentials as runner-owned
+`0400` files, consumes and unlinks the bootstrap environment file before exec,
+and wipes the complete claim tree after stopping all claim processes. Removing
+the bootstrap file preserves the runner's existing caller-token shielding
+from bundle subprocesses. Bundle code stays root-owned and read only.
+A stale retirement targets its exact claim and generation, never another
+agent's later lease. Kubernetes pool selection and Secret delivery are
+unchanged. See [the static substrate reference](../../docs/static-pool-substrate.md)
+for configuration and recovery behavior.
 
 ### Capability audit: every owner verb and the fence that gates it
 

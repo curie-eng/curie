@@ -18,8 +18,8 @@ from typing import Any
 
 import httpx
 import pytest
-from curie_api.slack_usergroups import SlackUserGroupClient
-from curie_api.usergroups import UserGroupLookupError, UserGroupMembership
+from curie_channel_gateway.group_models import UserGroupLookupError, UserGroupMembership
+from curie_channel_gateway.slack.groups import SlackUserGroupClient
 
 _GROUP = "S0MGRS001"
 _OTHER_GROUP = "S0LEGAL01"

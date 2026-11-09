@@ -20,6 +20,8 @@ Required Helm values for the installed release:
 
 worker.slackApiBaseUrl: "http://127.0.0.1:1"
 worker.slackTrustedOrigins: ""
+channelGateway.deploy: true
+channelGateway.allowInsecure: true
 
 Build the receipt fixture from ``cli/scripts/fixtures/mcp-receipt/Dockerfile``
 with ``cli/scripts/fixtures/mcp-receipt`` as the Docker build context, import
@@ -28,12 +30,12 @@ through ``CURIE_HOOK_APPROVAL_RECEIPT_IMAGE``. The checked in fixture serves
 ``/mcp`` on port 8000, exposes ``receipt_read``, and writes the exact line
 ``MCP_RECEIPT tools/call`` for each accepted tool call.
 
-The worker must have no ``SLACK_BOT_TOKEN`` so no human Slack transport takes
+The gateway must have no ``SLACK_BOT_TOKEN`` so no human Slack transport takes
 part in the proof; preflight checks that condition. Slack acknowledges the
 ``TurnCompleted`` event without a transport call, so the proof requires the
 initial completion hash to be absent after the done marker appears.
 
-The agent binds the channel under the default identity. The worker's own Slack
+The agent binds the channel under the default identity. The gateway's own Slack
 origin is the refusing endpoint, so the initial stream fails loudly there, and
 the empty bot token never reaches a reachable Slack.
 
@@ -101,14 +103,14 @@ class ProofError(RuntimeError):
     pass
 
 
-def check_offline_slack_origin(worker_env: dict[str, Any]) -> None:
-    """The worker's own Slack origin is the refusing endpoint, and nothing else is trusted."""
-    origin = worker_env.get("SLACK_API_BASE_URL", {})
+def check_offline_slack_origin(gateway_env: dict[str, Any]) -> None:
+    """The gateway's Slack origin refuses connections, with no extra trusted origin."""
+    origin = gateway_env.get("SLACK_API_BASE_URL", {})
     if origin.get("value") != OFFLINE_ENDPOINT or "valueFrom" in origin:
         raise ProofError(
             "proof release must set worker.slackApiBaseUrl to the offline endpoint"
         )
-    trusted = worker_env.get("CURIE_SLACK_TRUSTED_ORIGINS")
+    trusted = gateway_env.get("CURIE_SLACK_TRUSTED_ORIGINS")
     if trusted is not None and (
         trusted.get("value") not in {None, ""} or "valueFrom" in trusted
     ):
@@ -284,6 +286,7 @@ class Proof:
         for kind, name in (
             ("deployment", f"{self.release}-api"),
             ("deployment", f"{self.release}-worker"),
+            ("deployment", f"{self.release}-channel-gateway"),
             ("statefulset", f"{self.release}-postgres"),
             ("statefulset", f"{self.release}-valkey"),
         ):
@@ -338,13 +341,20 @@ class Proof:
         }
         if not all(self.platform_images.values()):
             raise ProofError("proof release has an empty candidate image reference")
-        check_offline_slack_origin(worker_env)
+        gateway = self.kubectl_json(["get", "deployment", f"{self.release}-channel-gateway"])
+        gateway_container = next(
+            item
+            for item in gateway["spec"]["template"]["spec"]["containers"]
+            if item.get("name") == "channel-gateway"
+        )
+        gateway_env = {item.get("name"): item for item in gateway_container.get("env", [])}
+        check_offline_slack_origin(gateway_env)
         slack_check = self.kubectl(
             [
                 "exec",
-                f"deployment/{self.release}-worker",
+                f"deployment/{self.release}-channel-gateway",
                 "-c",
-                "worker",
+                "channel-gateway",
                 "--",
                 "sh",
                 "-c",
@@ -357,9 +367,9 @@ class Proof:
         offline_check = self.kubectl(
             [
                 "exec",
-                f"deployment/{self.release}-worker",
+                f"deployment/{self.release}-channel-gateway",
                 "-c",
-                "worker",
+                "channel-gateway",
                 "--",
                 "python",
                 "-c",
@@ -372,7 +382,7 @@ class Proof:
             check=False,
         )
         if offline_check.returncode != 0:
-            raise ProofError("proof offline endpoint must refuse connections in the worker")
+            raise ProofError("proof offline endpoint must refuse connections in the gateway")
 
         for kind, name in (
             ("deployment", FIXTURE),

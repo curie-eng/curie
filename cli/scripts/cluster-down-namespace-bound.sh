@@ -14,7 +14,24 @@ KIND_CLUSTER=test-4017-cluster-down
 NS=test-4017-down
 RELEASE=t4017
 KUBECONFIG="$REPO_ROOT/.projects/4017/kubeconfig"
-CURIE_BIN="${CURIE_BIN:-/home/theconnman/.cargo/shared-targets/agentos/debug/curie}"
+# A set CURIE_BIN wins. Otherwise take the first executable checkout build,
+# caller cargo layout, or curie on PATH.
+if [[ -z "${CURIE_BIN:-}" ]]; then
+  for candidate in \
+    "$REPO_ROOT/cli/target/debug/curie" \
+    "$REPO_ROOT/cli/target/release/curie" \
+    "${CARGO_TARGET_DIR:-}/debug/curie" \
+    "$HOME/.cargo/shared-targets/agentos/debug/curie"
+  do
+    if [[ -n "$candidate" && -x "$candidate" ]]; then
+      CURIE_BIN="$candidate"
+      break
+    fi
+  done
+fi
+if [[ -z "${CURIE_BIN:-}" ]]; then
+  CURIE_BIN="$(command -v curie || true)"
+fi
 KEEP=0
 SELF_TEST=0
 CREATED=0
@@ -60,6 +77,10 @@ case "$KIND_CLUSTER" in
     ;;
 esac
 
+if [[ -z "${CURIE_BIN:-}" ]]; then
+  echo "build the CLI first (cargo build -p curie) or set CURIE_BIN" >&2
+  exit 1
+fi
 if [[ ! -x "$CURIE_BIN" ]]; then
   echo "cluster up is missing: $CURIE_BIN is not executable" >&2
   exit 1

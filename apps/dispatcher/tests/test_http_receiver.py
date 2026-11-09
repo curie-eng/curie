@@ -38,7 +38,7 @@ SENDER = "U0EXAMPLE1"
 
 def api() -> Any:
     """@spec HTTP-INVOCATION-EXECUTION-19: fail during execution, never collection."""
-    name = "curie_dispatcher.http_receiver"
+    name = "curie_channel_gateway.slack.http_receiver"
     try:
         module = importlib.import_module(name)
     except ModuleNotFoundError as exc:

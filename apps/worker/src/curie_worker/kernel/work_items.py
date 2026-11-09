@@ -1,8 +1,8 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import uuid
-from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING
@@ -11,9 +11,10 @@ from aci_protocol import (
     QueuedTurn,
 )
 
-from ..binding import FactoryWake, caller_requester_facts
+from ..binding import FactoryWake
 from ..delivery_lease import DeliveryLease
 from ..killswitch import KillSwitch
+from ..sandbox.types import SandboxHandle
 from ..threadlock import LockLeaseLost
 from ..workitem_dispatch import (
     TerminationObservation,
@@ -24,11 +25,12 @@ from ..workitem_dispatch import (
 )
 
 if TYPE_CHECKING:
-    from ..sandbox.types import SandboxHandle
     from .core import Kernel
 
 from . import claim, clock, constants, failures, memory, routing
 from .log import logger
+
+_TERMINAL_WATCH_STATUS_READ_LIMIT = 3
 
 
 async def _settle_sleep(delay: float) -> None:
@@ -418,7 +420,51 @@ async def _adopt_resumed_work_item(
 
 async def reap_orphans(self: Kernel) -> list[str]:
     """Periodic tick: delete substrate claims no live route references."""
-    reaped = await asyncio.to_thread(self._substrate.reap_orphans)
+    reaped: list[str] = []
+    for claim_name, expected in (await self._markers.watched_turns()).items():
+        try:
+            record = json.loads(expected)
+            thread_key = record["thread_key"]
+            async with self._lock.hold(self._config.lock_key(thread_key)) as fence:
+                if not await self._markers.abandoned_turn(claim_name, expected):
+                    continue
+                terminal = await self._markers.is_terminal(record["event_id"])
+                handle = await asyncio.to_thread(self._substrate.lookup, thread_key)
+                if handle is not None and handle.claim_name == claim_name:
+                    try:
+                        status = await self._runner.status(
+                            handle.base_url, token=handle.token or None, remaining_s=5.0
+                        )
+                    except Exception:  # noqa: BLE001 - maintenance retries unavailable status
+                        status = {}
+                    if status.get("side_effect_emitted") is True:
+                        await self._markers.mark_side_effect(record["event_id"])
+                    if (
+                        status.get("turn_active") is not True
+                        and status.get("turn_active") is not False
+                    ):
+                        if terminal:
+                            await self._markers.note_terminal_status_failure(
+                                claim_name, expected, limit=_TERMINAL_WATCH_STATUS_READ_LIMIT
+                            )
+                            continue
+                        await self._markers.mark_side_effect(record["event_id"])
+                    retire = status.get("turn_active") is True if terminal else not (
+                        status.get("turn_active") is False
+                        and status.get("history_durable") is True
+                    )
+                    if retire:
+                        await fence.ensure_owned()
+                        retired = await asyncio.to_thread(
+                            self._substrate.release_if_claim, thread_key, claim_name
+                        )
+                        if retired:
+                            logger.warning("retired abandoned runner claim %s", claim_name)
+                            reaped.append(claim_name)
+                await self._markers.forget_watched_turn(claim_name, expected)
+        except Exception:  # noqa: BLE001 - one unavailable claim must not starve maintenance
+            logger.warning("could not reap watched runner claim %s", claim_name, exc_info=True)
+    reaped.extend(await asyncio.to_thread(self._substrate.reap_orphans))
     if self._workspace is not None:
         expired_threads = await asyncio.to_thread(self._workspace.enumerate_expired)
         for thread_key in expired_threads:
@@ -471,18 +517,15 @@ async def _preflight_reclaimed_delivery(
     lease: DeliveryLease,
     *,
     event_id: str,
-    boot_env: Mapping[str, str] | None,
+    desired_requester: str,
     requester_enforced: bool,
 ) -> None:
     """Prove a TRANSFERRED delivery is safe to re-execute, or refuse it.
 
-    ADR-0131's reclaim rules 2, 3 and 4, in that order. Rule 1 -- "a
-    side-effect marker forbids replay and settles to human escalation" -- is
-    the existing ``saw_side_effect`` check in ``_process_event``, which runs
-    BEFORE this and needs no code here; that ordering is load-bearing and is
-    pinned by a test rather than duplicated as a second check, because a
-    preflight that interrupted, waited and then rehydrated could otherwise
-    re-execute a half-done non-idempotent action.
+    A persisted side-effect marker forbids replay. A watched predecessor
+    must become durable and idle or be retired before its watch is cleared.
+    Escalation may settle first when the delivery budget expires. Runner status
+    recovers a marker lost between emission and the previous worker's Valkey write.
 
     Rule 2: a runner that still reports an active turn is interrupted and
     must become idle (or disappear) before the retry. The interrupt goes
@@ -490,16 +533,16 @@ async def _preflight_reclaimed_delivery(
     second mechanism, and never a bare task cancel, which would skip the
     runner-side stop.
 
-    Rule 3: an unreadable runner FAILS CLOSED. ``_turn_active`` already
-    reports busy when liveness cannot be read, so an unreadable runner
+    Rule 3: an unreadable runner FAILS CLOSED. A status probe reports busy
+    when liveness cannot be read, so an unreadable runner
     exhausts the bounded poll and this raises, leaving the stream entry
     pending. A replacement never runs beside a possibly-active turn -- the
     "just retry it" simplification is precisely the failure mode this
     refuses.
 
     Rule 4 is what falling off the end of this method means: old authority is
-    fenced (the lease generation moved), the old runner is inactive, and no
-    side-effect marker exists.
+    fenced (the lease generation moved) and the old runner is inactive. The
+    caller rechecks side-effect markers before opening another turn.
 
     This deliberately diverges from the ordinary route, which STEERS into a
     retained live turn: this is the same event being retried, not a follow-up.
@@ -525,7 +568,7 @@ async def _preflight_reclaimed_delivery(
     # one transferred delivery can never eat the whole deadline.
     #
     # Exhausting the window is not a silent pass: a probe cut short by it
-    # fails closed (``_turn_active`` reports busy on any unreadable answer)
+    # fails closed (a status probe reports busy on any unreadable answer)
     # and the loop falls through to the raise below, which is exactly rule
     # 3's refusal.
     deadline = clock.time.monotonic() + min(
@@ -535,20 +578,49 @@ async def _preflight_reclaimed_delivery(
     def _left() -> float:
         return max(0.0, deadline - clock.time.monotonic())
 
-    desired_requester, _desired_exp = caller_requester_facts(boot_env)
     interrupted: SandboxHandle | None = None
     while True:
         handle = await asyncio.to_thread(self._substrate.lookup, thread_key)
         if handle is None:
-            # No retained sandbox: the previous owner's runner is gone, which
-            # is the "or disappear" half of rule 2.
             return
-        if not await self._turn_active(handle, remaining_s=_left()):
+        active = await self._turn_active(handle, remaining_s=_left())
+        watched = await self._markers.watched_turn(handle.claim_name)
+        watched_side_effect = False
+        durable = False
+        if watched is not None:
+            watched_event = json.loads(watched)["event_id"]
+            try:
+                status = await self._runner.status(
+                    handle.base_url, token=handle.token or None, remaining_s=_left()
+                )
+            except Exception as exc:  # noqa: BLE001 - an unreadable predecessor is a handoff wait
+                raise memory.ReclaimPreflightUnsafe(
+                    "watched predecessor status is unreadable"
+                ) from exc
+            if json.loads(watched)["lease_key"] != self._config.delivery_lease_key(
+                lease.stream, lease.group, lease.entry_id
+            ) and await self._markers.watched_turn_live(handle.claim_name, watched):
+                raise memory.ReclaimPreflightUnsafe(
+                    "a different delivery still owns the watched turn"
+                )
+            if status.get("side_effect_emitted") is True:
+                await self._markers.mark_side_effect(watched_event)
+            watched_side_effect = await self._markers.saw_side_effect(watched_event)
+            active = status.get("turn_active") is not False
+            durable = status.get("history_durable") is True
+        if not active and (not watched_side_effect or durable):
             return
         if claim._requester_change(
             handle.caller_requester, desired_requester, enforced=requester_enforced
         ):
             raise claim._requester_handoff_pending(thread_key, event_id)
+        if watched_side_effect:
+            await self.interrupt_thread(
+                thread_key, "side effect from an abandoned delivery", expected=handle
+            )
+            raise memory.ReclaimPreflightUnsafe(
+                "side-effecting predecessor has not reached a durable handoff boundary"
+            )
         if handle != interrupted:
             logger.warning(
                 "reclaimed delivery for thread %s (generation %d) found a live turn "
@@ -556,16 +628,11 @@ async def _preflight_reclaimed_delivery(
                 thread_key,
                 lease.generation,
             )
-            # The interrupt is deliberately NOT given this window: it keeps
-            # its own independent control-plane timeout, because a fence
-            # derived from a budget that may already be spent could not stop
-            # the runner it fenced. It reaches only the route just checked.
             if await self.interrupt_thread(
                 thread_key, "fenced transfer of a reclaimed delivery", expected=handle
             ):
                 interrupted = handle
             elif clock.time.monotonic() < deadline:
-                # The route changed after the check: check the new one now.
                 continue
         if clock.time.monotonic() >= deadline:
             break

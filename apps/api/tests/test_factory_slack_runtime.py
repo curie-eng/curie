@@ -32,6 +32,7 @@ import logging
 import secrets
 import socket
 import sys
+import tempfile
 import threading
 import time
 import urllib.parse
@@ -56,6 +57,10 @@ from curie_api.main import create_app
 from curie_api.models import Approval, Publication
 from curie_api.workitem_dispatch import Admission, admit_revision
 from curie_api.workitems import lifecycle
+from curie_channel_gateway.slack.slack_sink import (
+    SlackReplyAdapter,
+    UnconfiguredSlackIdentityError,
+)
 from curie_internal import sandbox_token
 from curie_test_support.valkey import connect_or_skip
 from curie_worker.factory_slack_progress import (
@@ -64,7 +69,6 @@ from curie_worker.factory_slack_progress import (
 )
 from curie_worker.reply_sink import build_reply_sink
 from curie_worker.run import _build_factory_slack_progress
-from curie_worker.slack_sink import SlackReplyAdapter, UnconfiguredSlackIdentityError
 from fastapi.testclient import TestClient
 from sqlalchemy import func, text
 from sqlalchemy.ext.asyncio import (
@@ -1396,36 +1400,76 @@ def test_a_ci_report_on_an_ended_request_does_not_hide_the_running_revisions_pha
 # --- the worker switch -----------------------------------------------------------------
 
 
+@contextlib.asynccontextmanager
+async def _factory_gateway(
+    slack_url: str, identity: str, factory_token: str
+) -> AsyncIterator[str]:
+    from curie_channel_gateway.slack.read_server import GatewayConfig, application
+    from curie_channel_gateway.slack.tokens import SlackProviderConfig
+
+    with tempfile.TemporaryDirectory() as directory:
+        config = GatewayConfig(
+            CURIE_CHANNEL_GATEWAY_API_TOKEN="test-api-credential",
+            CURIE_CHANNEL_GATEWAY_WORKER_TOKEN="test-worker-credential",
+            CURIE_CHANNEL_GATEWAY_ALLOW_INSECURE=True,
+            CURIE_CHANNEL_GATEWAY_REPLAY_DB=str(Path(directory) / "factory-replies.sqlite3"),
+            slack_api_base_url=slack_url,
+        )
+        provider = SlackProviderConfig(
+            slack_bot_token=DEFAULT_TOKEN,
+            slack_identities=[
+                {
+                    "name": "default",
+                    "bot_token_env": "SLACK_BOT_TOKEN",
+                    "app_token_env": "SLACK_APP_TOKEN",
+                    "signing_secret_env": None,
+                },
+                {
+                    "name": identity,
+                    "bot_token_env": "CURIE_SLACK_BOT_TOKEN__0",
+                    "app_token_env": "CURIE_SLACK_APP_TOKEN__0",
+                    "signing_secret_env": None,
+                },
+            ],
+        )
+        with pytest.MonkeyPatch.context() as provider_env:
+            provider_env.setenv("CURIE_SLACK_BOT_TOKEN__0", factory_token)
+            app = await application(config, provider)
+        async with TestServer(app) as gateway:
+            yield str(gateway.make_url("/"))
+
+
 async def _switched_progress_pass(
     worker: Worker, slack_url: str, identity: str, factory_token: str, *, enabled: bool
 ) -> bool:
     """One pass by the loop ``run.build`` assembles, or False when it builds none."""
 
-    tag = secrets.token_hex(3)
-    names = {
-        "stream": f"test:curie:factory-slack:{tag}:runs",
-        "group": f"test:curie:factory-slack:{tag}:runs:group",
-        "prefix": f"test:curie:factory-slack:{tag}:worker",
-    }
-    config = make_config(
-        names,
-        slack_api_base_url=slack_url,
-        slack_bot_token=DEFAULT_TOKEN,
-        factory_slack_progress_enabled=enabled,
-    )
-    # The production sink: the factory identity's token answers its posts.
-    sink = build_reply_sink(config, slack_tokens={identity: factory_token})
-    try:
-        loop = _build_factory_slack_progress(config, worker.engine, sink)
-        if loop is None:
-            return False
-        await loop.run_pass()
-        for _ in range(100):
-            if not await loop.deliver_once():
-                break
-        return True
-    finally:
-        await sink.aclose()
+    async with _factory_gateway(slack_url, identity, factory_token) as gateway_url:
+        tag = secrets.token_hex(3)
+        names = {
+            "stream": f"test:curie:factory-slack:{tag}:runs",
+            "group": f"test:curie:factory-slack:{tag}:runs:group",
+            "prefix": f"test:curie:factory-slack:{tag}:worker",
+        }
+        config = make_config(
+            names,
+            channel_gateway_url=gateway_url,
+            channel_gateway_token="test-worker-credential",
+            channel_gateway_allow_insecure=True,
+            factory_slack_progress_enabled=enabled,
+        )
+        sink = build_reply_sink(config)
+        try:
+            loop = _build_factory_slack_progress(config, worker.engine, sink)
+            if loop is None:
+                return False
+            await loop.run_pass()
+            for _ in range(100):
+                if not await loop.deliver_once():
+                    break
+            return True
+        finally:
+            await sink.aclose()
 
 
 def test_the_switch_off_posts_nothing_and_a_worker_with_it_on_posts_what_is_owed(
@@ -1619,8 +1663,9 @@ async def _run_production_worker(
     This is ``run._run`` minus its schema assertion: the real runtime with every
     lane it launches (runs, evals, heartbeat, cron and the rest), over this
     stack's Postgres and Valkey, posting to the Slack stand-in. The factory
-    identity's token reaches the sink the way a deployed worker gets it, from
-    the declared identity's env var. Nothing is called on the progress loop.
+    identity's token reaches the gateway through its declared env var, and
+    the worker uses its authenticated gateway reply sink. Nothing calls the
+    progress loop directly.
     It runs until the Slack stand-in sets ``signal`` or ``within_s`` passes, in
     one wait raced against the runtime's own return, then shuts down through
     the resources owner, as ``run._run`` does.
@@ -1633,66 +1678,70 @@ async def _run_production_worker(
     from curie_worker.worker_lifecycle import WorkerResources
     from redis.asyncio import Redis as AsyncValkey
 
-    tag = secrets.token_hex(3)
-    base = f"test:curie:factory-slack:{tag}"
-    # The switch is read from the environment, as a deployed worker reads it.
-    config = WorkerConfig(
-        database_url=get_settings().database_url,
-        db_schema=get_settings().db_schema,
-        valkey_host=VALKEY_HOST,
-        valkey_port=VALKEY_PORT,
-        valkey_password=VALKEY_PW,
-        stream=f"{base}:runs",
-        eval_stream=f"{base}:evals",
-        consumer_group=f"{base}:group",
-        consumer_name=f"factory-slack-runtime-{tag}",
-        key_prefix=f"{base}:worker",
-        read_block_ms=100,
-        internal_worker_token="",
-        workspace_enabled=False,
-        publication_enabled=False,
-        slack_api_base_url=stack.slack.base_url,
-        slack_bot_token=DEFAULT_TOKEN,
-        factory_slack_interval_s=0.05,
-        heartbeat_file=str(heartbeat),
-    )
-    env = {"CURIE_SANDBOX_SUBSTRATE": "kubernetes", "CURIE_SLACK_BOT_TOKEN__0": stack.factory_token}
-    owner = WorkerResources()
-    prior = set(asyncio.all_tasks())
-    # No cluster exists here, so its in-cluster configuration is the external
-    # boundary skipped at build, as the worker composition tests do. The runs
-    # lane's orphan reap then fails its cluster list each maintenance tick and
-    # logs it; no lane this test observes depends on a cluster.
-    monkeypatch.setattr(k8s_config, "load_incluster_config", lambda: None)
-    runtime = run.build(config, env, resources=owner)
-    task = asyncio.create_task(run._run_runtime(runtime, config, owner))
-    waiter = asyncio.ensure_future(asyncio.to_thread(signal.wait, within_s))
-    try:
-        done, _ = await asyncio.wait(
-            {task, waiter}, timeout=within_s + 5, return_when=asyncio.FIRST_COMPLETED
+    async with _factory_gateway(
+        stack.slack.base_url, stack.identity, stack.factory_token
+    ) as gateway_url:
+        tag = secrets.token_hex(3)
+        base = f"test:curie:factory-slack:{tag}"
+        # The switch is read from the environment, as a deployed worker reads it.
+        config = WorkerConfig(
+            database_url=get_settings().database_url,
+            db_schema=get_settings().db_schema,
+            valkey_host=VALKEY_HOST,
+            valkey_port=VALKEY_PORT,
+            valkey_password=VALKEY_PW,
+            stream=f"{base}:runs",
+            eval_stream=f"{base}:evals",
+            consumer_group=f"{base}:group",
+            consumer_name=f"factory-slack-runtime-{tag}",
+            key_prefix=f"{base}:worker",
+            read_block_ms=100,
+            internal_worker_token="",
+            workspace_enabled=False,
+            publication_enabled=False,
+            channel_gateway_url=gateway_url,
+            channel_gateway_token="test-worker-credential",
+            channel_gateway_allow_insecure=True,
+            factory_slack_interval_s=0.05,
+            heartbeat_file=str(heartbeat),
         )
-        if task in done:
-            await task
-            raise AssertionError("the worker runtime returned before shutdown")
-        lanes = {
-            task_.get_name()
-            for task_ in asyncio.all_tasks()
-            if task_ not in prior and task_.get_name().startswith("curie-worker:")
-        }
-        return _RuntimeRun(lanes, heartbeat.exists(), signal.is_set())
-    finally:
-        await waiter
+        env = {"CURIE_SANDBOX_SUBSTRATE": "kubernetes"}
+        owner = WorkerResources()
+        prior = set(asyncio.all_tasks())
+        # No cluster exists here, so its in-cluster configuration is the external
+        # boundary skipped at build, as the worker composition tests do. The runs
+        # lane's orphan reap then fails its cluster list each maintenance tick and
+        # logs it; no lane this test observes depends on a cluster.
+        monkeypatch.setattr(k8s_config, "load_incluster_config", lambda: None)
+        runtime = run.build(config, env, resources=owner)
+        task = asyncio.create_task(run._run_runtime(runtime, config, owner))
+        waiter = asyncio.ensure_future(asyncio.to_thread(signal.wait, within_s))
         try:
-            await owner.aclose()
-            await asyncio.wait_for(task, 15)
+            done, _ = await asyncio.wait(
+                {task, waiter}, timeout=within_s + 5, return_when=asyncio.FIRST_COMPLETED
+            )
+            if task in done:
+                await task
+                raise AssertionError("the worker runtime returned before shutdown")
+            lanes = {
+                task_.get_name()
+                for task_ in asyncio.all_tasks()
+                if task_ not in prior and task_.get_name().startswith("curie-worker:")
+            }
+            return _RuntimeRun(lanes, heartbeat.exists(), signal.is_set())
         finally:
-            valkey = AsyncValkey(**config.valkey_client_kwargs())
+            await waiter
             try:
-                doomed = [key async for key in valkey.scan_iter(match=f"{base}*")]
-                if doomed:
-                    await valkey.delete(*doomed)
+                await owner.aclose()
+                await asyncio.wait_for(task, 15)
             finally:
-                await valkey.aclose()
+                valkey = AsyncValkey(**config.valkey_client_kwargs())
+                try:
+                    doomed = [key async for key in valkey.scan_iter(match=f"{base}*")]
+                    if doomed:
+                        await valkey.delete(*doomed)
+                finally:
+                    await valkey.aclose()
 
 
 def test_the_production_worker_runtime_posts_owed_progress_only_with_the_switch_on(
@@ -2431,17 +2480,10 @@ async def _hops(
         await api._client.aclose()
 
 
-def _drops_for_one_failed_call() -> int:
-    """How many dropped connections one failed call of the worker's Valkey client takes.
+def _drops_for_one_failed_call(*, read: bool = True) -> int:
+    """Standalone reads get four attempts; pipelines and writes get one."""
 
-    The worker's runs client keeps redis-py's default retry (``run.build``), so a
-    call fails only after its first attempt and every retry each lost the
-    connection. Read from a client built the way ``run.build`` builds it.
-    """
-
-    from redis.asyncio import Redis as AsyncValkey
-
-    return 1 + int(AsyncValkey(host="127.0.0.1", socket_timeout=5.0).get_retry().get_retries())
+    return 4 if read else 1
 
 
 # --- the steering stack ---------------------------------------------------------------
@@ -2527,42 +2569,44 @@ async def _steering_worker(
     from curie_worker.config import WorkerConfig
     from curie_worker.worker_lifecycle import WorkerResources
 
-    config = WorkerConfig(
-        database_url=stack.worker_database_url,
-        db_schema=get_settings().db_schema,
-        valkey_host="127.0.0.1",
-        valkey_port=stack.valkey_hop.port,
-        valkey_password=VALKEY_PW,
-        stream=stack.names["stream"],
-        eval_stream=f"{stack.names['base']}:evals",
-        consumer_group=stack.names["group"],
-        consumer_name=consumer_name,
-        key_prefix=stack.names["prefix"],
-        read_block_ms=100,
-        internal_worker_token=WORKER_TOKEN if token else "",
-        api_base_url=stack.api_hop.url,
-        workspace_enabled=False,
-        publication_enabled=False,
-        slack_api_base_url=stack.slack.base_url,
-        slack_bot_token=DEFAULT_TOKEN,
-        slack_edit_min_interval_s=0.0,
-        # A pending entry is redelivered by the next reclaim pass, with no wait.
-        reclaim_min_idle_ms=0,
-    )
-    env = {
-        "CURIE_SANDBOX_SUBSTRATE": "kubernetes",
-        # The factory identity's token, from its declared env var.
-        "CURIE_SLACK_BOT_TOKEN__0": stack.factory_token,
-        # Every sandbox listens on the fleet-wide port; here, the stand-in address's.
-        "CURIE_RUNNER_PORT": str(stack.k8s.sandbox_address.port),
-    }
-    owner = WorkerResources()
-    try:
-        runtime = run.build(config, env, resources=owner)
-        await runtime.consumer.ensure_group()
-        yield SteeringWorker(runtime, config)
-    finally:
-        await owner.aclose()
+    async with _factory_gateway(
+        stack.slack.base_url, stack.identity, stack.factory_token
+    ) as gateway_url:
+        config = WorkerConfig(
+            database_url=stack.worker_database_url,
+            db_schema=get_settings().db_schema,
+            valkey_host="127.0.0.1",
+            valkey_port=stack.valkey_hop.port,
+            valkey_password=VALKEY_PW,
+            stream=stack.names["stream"],
+            eval_stream=f"{stack.names['base']}:evals",
+            consumer_group=stack.names["group"],
+            consumer_name=consumer_name,
+            key_prefix=stack.names["prefix"],
+            read_block_ms=100,
+            internal_worker_token=WORKER_TOKEN if token else "",
+            api_base_url=stack.api_hop.url,
+            workspace_enabled=False,
+            publication_enabled=False,
+            channel_gateway_url=gateway_url,
+            channel_gateway_token="test-worker-credential",
+            channel_gateway_allow_insecure=True,
+            slack_edit_min_interval_s=0.0,
+            # A pending entry is redelivered by the next reclaim pass, with no wait.
+            reclaim_min_idle_ms=0,
+        )
+        env = {
+            "CURIE_SANDBOX_SUBSTRATE": "kubernetes",
+            # Every sandbox listens on the fleet-wide port; here, the stand-in address's.
+            "CURIE_RUNNER_PORT": str(stack.k8s.sandbox_address.port),
+        }
+        owner = WorkerResources()
+        try:
+            runtime = run.build(config, env, resources=owner)
+            await runtime.consumer.ensure_group()
+            yield SteeringWorker(runtime, config)
+        finally:
+            await owner.aclose()
 
 
 async def _consume_one(worker: SteeringWorker) -> str | None:
@@ -2723,8 +2767,8 @@ class SteeringStack(Stack):
     # Slack ingress: the real Bolt app the dispatcher builds ---------------------
 
     def _deliver(self, event: dict[str, Any], event_id: str) -> None:
-        from curie_dispatcher.app import build_app
-        from curie_dispatcher.identities import SlackIdentityCredentials
+        from curie_channel_gateway.slack.app import build_app
+        from curie_channel_gateway.slack.identities import SlackIdentityCredentials
         from slack_bolt.adapter.socket_mode import SocketModeHandler
         from slack_bolt.authorization import AuthorizeResult
         from slack_sdk.socket_mode.request import SocketModeRequest
@@ -2792,7 +2836,7 @@ class SteeringStack(Stack):
         ``raw`` it is the event's whole ``text``, leading mention included.
         """
 
-        from curie_dispatcher.identities import delivery_key
+        from curie_channel_gateway.slack.identities import delivery_key
 
         event_id = event_id or f"Ev0{self.tag.upper()}{uuid.uuid4().hex[:8].upper()}"
         delivery_id = delivery_key(event_id, self.identity)
@@ -2838,10 +2882,10 @@ class SteeringStack(Stack):
         """
 
         from aci_protocol import QueuedTurn, ReplyHandle, TurnSource
-        from curie_dispatcher.identities import delivery_key, minted_adapter
-        from curie_dispatcher.identity import slack_evidence
-        from curie_dispatcher.queue import enqueue
+        from curie_channel_gateway.slack.identities import delivery_key, minted_adapter
+        from curie_channel_gateway.slack.identity import slack_evidence
         from curie_internal.slack_mention_receipt import SlackMentionReceipt, write_receipt
+        from curie_internal.turn_queue import enqueue
         from slack_sdk.web import WebClient
 
         event_id = f"Ev0{self.tag.upper()}{uuid.uuid4().hex[:8].upper()}"
@@ -3119,14 +3163,15 @@ def _seed_receiving_identity(identity: str) -> None:
                 kind="slack_workspace",
                 key=TEAM,
             )
-            session.add(
-                ChannelIdentity(
-                    tenant_id=DEFAULT_TENANT_ID,
-                    provider="slack",
-                    name=identity,
-                    provider_installation_id=installation.id,
+            receiving = await session.scalar(
+                select(ChannelIdentity).where(
+                    ChannelIdentity.tenant_id == DEFAULT_TENANT_ID,
+                    ChannelIdentity.provider == "slack",
+                    ChannelIdentity.name == identity,
                 )
             )
+            assert receiving is not None, "the declared gateway identity was not bootstrapped"
+            receiving.provider_installation_id = installation.id
             await session.commit()
 
     _db(go)
@@ -3165,7 +3210,7 @@ def _set_mapping_readable(stack: SteeringStack, readable: bool) -> None:
 def _steering_stack(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, *, token: bool = True
 ) -> Iterator[SteeringStack]:
-    from curie_dispatcher.config import DispatcherConfig
+    from curie_channel_gateway.slack.config import DispatcherConfig
     from curie_test_support.valkey import VALKEY_HOST, VALKEY_PORT, VALKEY_PW
     from curie_worker.sandbox.k8s import k8s_config
     from kubernetes import client as k8s_client
@@ -4587,7 +4632,7 @@ def test_a_redelivery_whose_done_check_fails_after_a_lost_answer_never_invites_a
     answers = len(stack.api_hop.steer_answers())
     rule = stack.valkey_hop.drop(
         lambda command: command[0].upper() == "EXISTS" and command[1:] == [done_key],
-        times=_drops_for_one_failed_call(),
+        times=_drops_for_one_failed_call(read=False),
     )
     assert stack.reclaim(worker) == 1
     assert rule.remaining == 0, "attempt 2 never read the done-check"
@@ -4627,7 +4672,7 @@ def test_a_queued_steering_turn_whose_intent_cannot_be_recorded_sends_nothing(
         rules.append(
             stack.valkey_hop.drop(
                 lambda command: command[0].upper() == "SET" and command[1:2] == [key],
-                times=_drops_for_one_failed_call(),
+                times=_drops_for_one_failed_call(read=False),
             )
         )
 

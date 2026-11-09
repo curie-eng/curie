@@ -21,6 +21,29 @@ use crate::ops::{
 /// Environment variable carrying the webhook secret value.
 pub const WEBHOOK_SECRET_ENV: &str = "CURIE_GITHUB_WEBHOOK_SECRET";
 
+fn repository_rollout_commands(
+    namespace: &str,
+    fullname: &crate::ops::ReleaseFullname,
+) -> Vec<OpsCommand> {
+    let mut commands = Vec::new();
+    for action in ["restart", "status"] {
+        for component in ["worker", "api"] {
+            let mut args = vec![
+                plain("-n"),
+                plain(namespace),
+                plain("rollout"),
+                plain(action),
+                plain(format!("deployment/{}", fullname.resource(component))),
+            ];
+            if action == "status" {
+                args.push(plain("--timeout=120s"));
+            }
+            commands.push(OpsCommand::new("kubectl", args));
+        }
+    }
+    commands
+}
+
 #[derive(Debug, Clone)]
 pub struct FactoryIntakeOpts {
     pub common: CommonOpts,
@@ -1541,8 +1564,7 @@ async fn update_repositories(opts: FactoryIntakeOpts) -> Result<Box<dyn crate::u
             .display(),
         );
         lines.extend(
-            crate::comms::rollout_commands(
-                true,
+            repository_rollout_commands(
                 &opts.common.namespace,
                 &crate::ops::chart_fullname(&opts.common.release),
             )
@@ -1641,9 +1663,7 @@ async fn update_repositories(opts: FactoryIntakeOpts) -> Result<Box<dyn crate::u
         ))
         .into());
     }
-    // The comms Slack consumer table's disconnect subset is worker and API;
-    // both consume repository runner configuration and must restart and wait.
-    for command in crate::comms::rollout_commands(true, &opts.common.namespace, &fullname) {
+    for command in repository_rollout_commands(&opts.common.namespace, &fullname) {
         crate::ui::ui().plumbing(&format!("+ {}", command.display()));
         let component = command
             .argv()

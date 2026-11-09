@@ -17,6 +17,7 @@ import time
 from dataclasses import dataclass
 from typing import Any, Final
 
+from curie_internal.valkey import AsyncRedis
 from curie_telemetry import record_metric
 from redis.asyncio import Redis
 
@@ -236,7 +237,7 @@ async def observe_completion_outbox(
 
 
 async def _read_status(config: WorkerConfig) -> CompletionOutboxSnapshot:
-    redis = Redis(**config.valkey_client_kwargs())
+    redis = AsyncRedis(**config.valkey_client_kwargs())
     try:
         markers = Markers(redis, config)
         return await snapshot_completion_outbox(markers, redis, config)

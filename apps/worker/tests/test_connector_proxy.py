@@ -9,6 +9,7 @@ tests/vectors/connector-caller-refusal.json, which the runner reads too.
 from __future__ import annotations
 
 import asyncio
+import base64
 import gzip
 import json
 import logging
@@ -37,7 +38,7 @@ _REFUSAL = json.loads(
 _VECTOR = next(v for v in _TOKENS["vectors"] if v["name"] == "a_plain_agent_name")
 _TOKEN = str(_VECTOR["minted"])
 _BEFORE_EXPIRY = int(_VECTOR["exp"]) - 10
-_GRANT_SEED = "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8="
+_GRANT_SEED = base64.b64encode(bytes(range(32))).decode()
 _GATED_TOOLS = ("github/merge_pull_request",)
 _CONNECTOR = "github"
 _MERGE_CALL = (
@@ -1150,6 +1151,69 @@ def test_a_replayed_grant_logs_not_spent(caplog: pytest.LogCaptureFixture) -> No
     assert lines[1].endswith(f"grant={server.GRANT_NOT_SPENT}")
 
 
+def test_static_resolver_headers_enforce_one_shot_grants_with_real_valkey(
+    tmp_path: Path,
+    sync_redis: Any,
+) -> None:
+    import uuid
+    from urllib.parse import quote
+
+    from curie_internal.connector_endpoints import ConnectorEndpointBinding
+    from curie_runner.connectors import derive_mcp_servers, materialize_connector_caller_headers
+
+    connection = sync_redis.connection_pool.connection_kwargs
+    password = quote(connection.get("password") or "", safe="")
+    auth = f":{password}@" if password else ""
+    store_url = f"redis://{auth}{connection['host']}:{connection['port']}/0"
+    jti = str(uuid.uuid4())
+    (tmp_path / "connectors.yaml").write_text(
+        "connectors:\n  github:\n    image: example/connector:1\n"
+    )
+
+    async def go() -> None:
+        async with _gated(grant_store=server._ValkeyGrantStore(store_url)) as (upstream, proxy):
+            binding = ConnectorEndpointBinding.model_validate(
+                {
+                    "version": 1,
+                    "agent": "acme-dev",
+                    "connectors": {"github": {"base_url": str(proxy.make_url("/")).rstrip("/")}},
+                }
+            )
+            env = {"CURIE_CONNECTOR_CALLER_TOKEN": _TOKEN}
+            entries = derive_mcp_servers(
+                tmp_path,
+                release=None,
+                agent="acme-dev",
+                namespace=None,
+                endpoints=binding,
+                caller_header=True,
+                env=env,
+            )
+            materialize_connector_caller_headers(entries, env)
+            entry = entries["github"]
+            headers = {**entry["headers"], "Content-Type": "application/json"}
+            async with aiohttp.ClientSession() as client:
+
+                async def call() -> int:
+                    async with client.post(
+                        entry["url"], data=_MERGE_CALL, headers=headers
+                    ) as response:
+                        return response.status
+
+                assert await call() == 403
+                assert not upstream.seen
+                headers[server.GRANT_HEADER] = _mint_grant("merge_pull_request", {"n": 1}, jti=jti)
+                assert await call() == 201
+                assert await call() == 403
+                assert len(upstream.seen) == 1
+                assert sync_redis.exists(f"connector-grant:{jti}") == 1
+
+    try:
+        _run(go)
+    finally:
+        sync_redis.delete(f"connector-grant:{jti}")
+
+
 # --------------------------------------------------------------------------- #
 # ADR 0270 decision 4: only the proxy supplies X-Curie-Principal. After every
 # admission and grant check it sets exactly one, from the verified principal,
@@ -1171,7 +1235,10 @@ def _mint_caller(principal: dict[str, Any] | None) -> str:
     if principal is not None:
         extra["principal"] = caller_token.CallerPrincipal(**principal)
     return caller_token.mint(
-        str(_VECTOR["seed"]), agent="acme-dev", exp=int(_VECTOR["exp"]), **extra
+        base64.b64encode(bytes(range(*_VECTOR["seed_range"]))).decode(),
+        agent="acme-dev",
+        exp=int(_VECTOR["exp"]),
+        **extra,
     )
 
 
@@ -1319,7 +1386,10 @@ def test_a_route_token_never_sets_a_principal_and_a_cct_beside_the_route_does() 
     from curie_worker import caller_token
 
     route_token = caller_token.mint_route(
-        str(_VECTOR["seed"]), agent="acme-dev", connector=_CONNECTOR, exp=int(_VECTOR["exp"])
+        base64.b64encode(bytes(range(*_VECTOR["seed_range"]))).decode(),
+        agent="acme-dev",
+        connector=_CONNECTOR,
+        exp=int(_VECTOR["exp"]),
     )
     forged = _forged_principals(_HUMAN_HEADER)
 

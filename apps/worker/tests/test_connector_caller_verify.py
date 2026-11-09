@@ -200,7 +200,7 @@ def test_a_principal_never_carries_an_agent_past_admission(vector: dict[str, Any
 
 
 def _signed_route(claims: dict[str, object]) -> str:
-    seed = base64.b64decode(str(_SIGNER["seed"]))
+    seed = bytes(range(*_SIGNER["seed_range"]))
     payload = json.dumps(claims, separators=(",", ":"), sort_keys=True).encode("ascii")
     head = f"ccr.{_b64url(payload)}"
     signature = SigningKey(seed).sign(head.encode("ascii")).signature
@@ -250,7 +250,10 @@ def test_a_principal_at_its_field_bounds_crosses_from_minter_to_verifier() -> No
         subject="s" * 256,
     )
     token = caller_token.mint(
-        str(_SIGNER["seed"]), agent="acme-dev", exp=_exp(_SIGNER), principal=principal
+        base64.b64encode(bytes(range(*_SIGNER["seed_range"]))).decode(),
+        agent="acme-dev",
+        exp=_exp(_SIGNER),
+        principal=principal,
     )
     decision = _decide(_SIGNER, token, admits={"acme-dev"}, now=_exp(_SIGNER) - 1)
     assert decision.admitted
@@ -370,7 +373,7 @@ def _tampered() -> list[tuple[str, str]]:
     vector = _BY_NAME["a_plain_agent_name"]
     minted = str(vector["minted"])
     prefix, payload, signature = minted.split(".")
-    seed = base64.b64decode(str(vector["seed"]))
+    seed = bytes(range(*vector["seed_range"]))
 
     def signed(claims: bytes, *, head: str = "cct") -> str:
         segment = _b64url(claims)
@@ -616,7 +619,10 @@ def test_the_widest_principal_a_caller_token_carries_is_readable() -> None:
         subject="\U0001d11e" * 52 + "u" * (256 - 52),
     )
     token = caller_token.mint(
-        str(_SIGNER["seed"]), agent="acme-dev", exp=_exp(_SIGNER), principal=principal
+        base64.b64encode(bytes(range(*_SIGNER["seed_range"]))).decode(),
+        agent="acme-dev",
+        exp=_exp(_SIGNER),
+        principal=principal,
     )
     assert len(token) <= caller_token.MAX_TOKEN_CHARS
     decision = _decide(_SIGNER, token, admits={"acme-dev"}, now=_exp(_SIGNER) - 1)

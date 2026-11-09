@@ -625,14 +625,7 @@ def test_expiry_during_binding_lock(stack: TestClient) -> None:
     # A first publication for the thread, so creation takes the agent_channels
     # row lock (binding_for_route for_update) on its way to a new lineage.
     case = _case("binding-lock")
-    # SQL boundary fixture: live running request whose lease ends ~2 s from
-    # now on the database clock; the deadline is later.
     _sql_running(case, "running")
-    _sql(
-        "UPDATE curie.execution_requests SET runtime_heartbeat_expires_at = "
-        "clock_timestamp() + interval '2 seconds' WHERE id = :id",
-        {"id": case.request_id},
-    )
     assert not _rows(
         "SELECT id FROM curie.thread_publication_lineages "
         "WHERE agent_id = :agent AND conversation_id = :conversation",
@@ -665,6 +658,13 @@ def test_expiry_during_binding_lock(stack: TestClient) -> None:
                         {"address": case.address},
                     )
                     blocker_pid = await blocker.scalar(text("SELECT pg_backend_pid()"))
+                    # Start the short lease after snapshots and the binding blocker are ready.
+                    await asyncio.to_thread(
+                        _sql,
+                        "UPDATE curie.execution_requests SET runtime_heartbeat_expires_at = "
+                        "clock_timestamp() + interval '2 seconds' WHERE id = :id",
+                        {"id": case.request_id},
+                    )
                     worker.start()
                     observed: list[dict[str, Any]] = []
                     waited_from = time.monotonic()

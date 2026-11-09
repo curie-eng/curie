@@ -17,11 +17,11 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Literal
 
+from curie_channel_gateway.read_errors import ChannelReadRefused
+from curie_channel_gateway.read_models import ResolvedWindow, epoch_micros, from_epoch_micros
 from curie_internal import sandbox_token
 from curie_internal.channel_read_ledger import turn_key
 from curie_internal.sandbox_token import b64url, b64url_decode
-
-from .errors import ChannelReadRefused
 
 Operation = Literal["history", "thread", "message"]
 
@@ -32,10 +32,6 @@ _CURSOR_PREFIX = "chc"
 _EPOCH = datetime(1970, 1, 1, tzinfo=UTC)
 
 
-@dataclass(frozen=True)
-class ResolvedWindow:
-    oldest: datetime
-    latest: datetime
 
 
 @dataclass(frozen=True)
@@ -60,13 +56,8 @@ def _cursor_invalid() -> ChannelReadRefused:
     )
 
 
-def epoch_micros(moment: datetime) -> int:
-    delta = moment - _EPOCH
-    return (delta.days * 86_400 + delta.seconds) * 1_000_000 + delta.microseconds
 
 
-def from_epoch_micros(value: int) -> datetime:
-    return _EPOCH + timedelta(microseconds=value)
 
 
 def parse_rfc3339(value: str) -> datetime:

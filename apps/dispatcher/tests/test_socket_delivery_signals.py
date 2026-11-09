@@ -15,11 +15,14 @@ from collections.abc import Callable, Iterator
 
 import pytest
 import redis
-from curie_dispatcher import run
-from curie_dispatcher.app import SocketModeConnection
-from curie_dispatcher.config import DispatcherConfig
-from curie_dispatcher.identities import SlackIdentityCredentials, default_identity_credentials
-from curie_dispatcher.preflight import PreflightedIdentity
+from curie_channel_gateway.slack import run
+from curie_channel_gateway.slack.app import SocketModeConnection
+from curie_channel_gateway.slack.config import DispatcherConfig
+from curie_channel_gateway.slack.identities import (
+    SlackIdentityCredentials,
+    default_identity_credentials,
+)
+from curie_channel_gateway.slack.preflight import PreflightedIdentity
 from curie_telemetry import build_resource, configure_meter_provider
 from curie_telemetry import metrics as telemetry_metrics
 from opentelemetry.sdk.metrics import MeterProvider

@@ -1869,6 +1869,30 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/channels/turns/admission": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Check Receiver Admission
+         * @description Apply the turn's authenticated HTTP identity admission without claiming a delivery.
+         *
+         *     ADR 0202 pings and bounded driver turns ask before any reply or budget write.
+         *     The same receiver proof, channel credential and live authority checks as
+         *     enqueue apply; no caller or directory decision is made by the gateway.
+         */
+        post: operations["check_receiver_admission_channels_turns_admission_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/cluster-message-replies/{reply_ref}": {
         parameters: {
             query?: never;
@@ -2657,6 +2681,75 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/identity/authorities": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** List Authorities */
+        get: operations["list_authorities_identity_authorities_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/identity/authorities/{tenant_id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Get Authority */
+        get: operations["get_authority_identity_authorities__tenant_id__get"];
+        /** Adopt Authority */
+        put: operations["adopt_authority_identity_authorities__tenant_id__put"];
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/identity/authorities/{tenant_id}/replace": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Replace Authority */
+        post: operations["replace_authority_identity_authorities__tenant_id__replace_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/identity/authorities/{tenant_id}/retire": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Retire Authority */
+        post: operations["retire_authority_identity_authorities__tenant_id__retire_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/identity/connect/{token}": {
         parameters: {
             query?: never;
@@ -2703,6 +2796,41 @@ export interface paths {
         /** Resolve */
         post: operations["resolve_identity_resolve_post"];
         delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/identity/roles/{tenant_id}/{agent_id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** List Role Filters */
+        get: operations["list_role_filters_identity_roles__tenant_id___agent_id__get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/identity/roles/{tenant_id}/{agent_id}/{role}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        /** Set Group Filter */
+        put: operations["set_group_filter_identity_roles__tenant_id___agent_id___role__put"];
+        post?: never;
+        /** Remove Group Filter */
+        delete: operations["remove_group_filter_identity_roles__tenant_id___agent_id___role__delete"];
         options?: never;
         head?: never;
         patch?: never;
@@ -6053,6 +6181,31 @@ export interface components {
             /** Size Bytes */
             size_bytes?: number | null;
         };
+        /** AuthorityMutation */
+        AuthorityMutation: {
+            /** Expected Lifecycle Generation */
+            expected_lifecycle_generation: number;
+            /** Expected Version */
+            expected_version: number;
+            /**
+             * Request Id
+             * Format: uuid
+             */
+            request_id: string;
+        };
+        /** AuthoritySelectionMutation */
+        AuthoritySelectionMutation: {
+            /** Expected Lifecycle Generation */
+            expected_lifecycle_generation: number;
+            /** Expected Version */
+            expected_version: number;
+            /**
+             * Request Id
+             * Format: uuid
+             */
+            request_id: string;
+            selection: components["schemas"]["HttpSelectionV1"];
+        };
         /**
          * BehaviorPacksConfig
          * @description An agent's opt-in behavior packs. Validated on write and stored as JSON on
@@ -6879,6 +7032,16 @@ export interface components {
          * @enum {string}
          */
         CredentialHeader: "authorization_basic" | "authorization_bearer" | "private_token";
+        /**
+         * CredentialReferenceV1
+         * @description @spec HTTP-AUTHORITY-CONFIG-V1-4.
+         */
+        CredentialReferenceV1: {
+            /** Generation */
+            generation: number;
+            /** Id */
+            id: string;
+        };
         /** Declaration */
         Declaration: {
             /** Loops */
@@ -7893,6 +8056,31 @@ export interface components {
              */
             reply?: string;
         };
+        /** GroupFilterMutation */
+        GroupFilterMutation: {
+            /** Expected Version */
+            expected_version: number;
+            /** Groups */
+            groups: components["schemas"]["GroupV1"][];
+            /**
+             * Request Id
+             * Format: uuid
+             */
+            request_id: string;
+        };
+        /**
+         * GroupV1
+         * @description @spec HTTP-IDENTITY-V1-2.
+         */
+        GroupV1: {
+            /** Id */
+            id: string;
+            /**
+             * Issuer
+             * @description Structural HTTPS issuer constraints preserve exact-string URL parsing compatibility. Unicode NFKC netloc checks require semantic validation with the pure facts validator; schema validation alone is insufficient.
+             */
+            issuer: string;
+        };
         /** HTTPValidationError */
         HTTPValidationError: {
             /** Detail */
@@ -8235,6 +8423,30 @@ export interface components {
             hook: string;
             /** Secret */
             secret: string;
+        };
+        /**
+         * HttpSelectionV1
+         * @description @spec HTTP-AUTHORITY-CONFIG-V1-1.
+         *
+         *     @spec HTTP-AUTHORITY-CONFIG-V1-3 to HTTP-AUTHORITY-CONFIG-V1-5.
+         */
+        HttpSelectionV1: {
+            credential_ref: components["schemas"]["CredentialReferenceV1"];
+            /** Issuer */
+            issuer: string;
+            /** Lookup Url */
+            lookup_url: string;
+            /** Max Clock Skew Ms */
+            max_clock_skew_ms: number;
+            /** Max Identity Age Ms */
+            max_identity_age_ms: number;
+            /** Max Membership Age Ms */
+            max_membership_age_ms: number;
+            /**
+             * Mode
+             * @constant
+             */
+            mode: "http";
         };
         /** IdentityLinkRevokedOut */
         IdentityLinkRevokedOut: {
@@ -8634,6 +8846,16 @@ export interface components {
             usageDetails?: {
                 [key: string]: unknown;
             } | null;
+        };
+        /** OperatorMutation */
+        OperatorMutation: {
+            /** Expected Version */
+            expected_version: number;
+            /**
+             * Request Id
+             * Format: uuid
+             */
+            request_id: string;
         };
         /** Owner */
         Owner: {
@@ -16119,6 +16341,36 @@ export interface operations {
             };
         };
     };
+    check_receiver_admission_channels_turns_admission_post: {
+        parameters: {
+            query?: never;
+            header?: {
+                "x-api-key"?: string | null;
+                "x-curie-receiver-proof"?: string | null;
+            };
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
     get_cluster_message_replies_cluster_message_replies__reply_ref__get: {
         parameters: {
             query?: {
@@ -17547,6 +17799,198 @@ export interface operations {
             };
         };
     };
+    list_authorities_identity_authorities_get: {
+        parameters: {
+            query?: {
+                limit?: number;
+                after?: string | null;
+            };
+            header?: {
+                "x-api-key"?: string | null;
+            };
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        [key: string]: unknown;
+                    };
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    get_authority_identity_authorities__tenant_id__get: {
+        parameters: {
+            query?: never;
+            header?: {
+                "x-api-key"?: string | null;
+            };
+            path: {
+                tenant_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        [key: string]: unknown;
+                    };
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    adopt_authority_identity_authorities__tenant_id__put: {
+        parameters: {
+            query?: {
+                dry_run?: boolean;
+            };
+            header?: {
+                "x-api-key"?: string | null;
+            };
+            path: {
+                tenant_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["AuthoritySelectionMutation"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        [key: string]: unknown;
+                    };
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    replace_authority_identity_authorities__tenant_id__replace_post: {
+        parameters: {
+            query?: {
+                dry_run?: boolean;
+            };
+            header?: {
+                "x-api-key"?: string | null;
+            };
+            path: {
+                tenant_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["AuthoritySelectionMutation"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        [key: string]: unknown;
+                    };
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    retire_authority_identity_authorities__tenant_id__retire_post: {
+        parameters: {
+            query?: never;
+            header?: {
+                "x-api-key"?: string | null;
+            };
+            path: {
+                tenant_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["AuthorityMutation"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        [key: string]: unknown;
+                    };
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
     identity_connect_page_identity_connect__token__get: {
         parameters: {
             query?: never;
@@ -17635,6 +18079,124 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["PrincipalResolutionOut"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    list_role_filters_identity_roles__tenant_id___agent_id__get: {
+        parameters: {
+            query?: never;
+            header?: {
+                "x-api-key"?: string | null;
+            };
+            path: {
+                tenant_id: string;
+                agent_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        [key: string]: unknown;
+                    };
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    set_group_filter_identity_roles__tenant_id___agent_id___role__put: {
+        parameters: {
+            query?: never;
+            header?: {
+                "x-api-key"?: string | null;
+            };
+            path: {
+                tenant_id: string;
+                agent_id: string;
+                role: "invocation" | "approver";
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["GroupFilterMutation"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        [key: string]: unknown;
+                    };
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    remove_group_filter_identity_roles__tenant_id___agent_id___role__delete: {
+        parameters: {
+            query?: never;
+            header?: {
+                "x-api-key"?: string | null;
+            };
+            path: {
+                tenant_id: string;
+                agent_id: string;
+                role: "invocation" | "approver";
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["OperatorMutation"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        [key: string]: unknown;
+                    };
                 };
             };
             /** @description Validation Error */

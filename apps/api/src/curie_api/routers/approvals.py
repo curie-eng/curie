@@ -16,6 +16,7 @@ point remains here, on the server that owns the record, never in the sandbox.
 """
 
 import logging
+import time
 import uuid
 from datetime import UTC, datetime, timedelta
 from typing import Annotated
@@ -253,14 +254,20 @@ async def rotate_adapter_principal(
     """
 
     remaining = await crud_channels.existing_channel_binding_ids(session, claims.bindings)
-    if not remaining:
+    if not remaining or claims.exp <= int(time.time()):
         raise HTTPException(
             status.HTTP_401_UNAUTHORIZED,
             "missing or invalid adapter principal",
             headers={"Cache-Control": "no-store"},
         )
     ttl_s = data.ttl_s if data is not None else adapter_principal.DEFAULT_TTL_SECONDS
-    return _issue_adapter_principal(claims.subject, remaining, ttl_s, response)
+    successor = _issue_adapter_principal(claims.subject, remaining, ttl_s, response)
+    logger.info(
+        "adapter principal rotated principal_kind=adapter subject=%s binding_count=%d",
+        claims.subject,
+        len(remaining),
+    )
+    return successor
 
 
 def _expired(approval: Approval) -> bool:

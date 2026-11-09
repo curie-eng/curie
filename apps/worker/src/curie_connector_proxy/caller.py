@@ -22,6 +22,7 @@ import re
 from collections.abc import Sequence
 from dataclasses import dataclass
 
+from nacl.bindings import crypto_core_ed25519_is_valid_point
 from nacl.exceptions import BadSignatureError
 from nacl.signing import VerifyKey
 
@@ -44,6 +45,7 @@ GRANT_PREFIX = "ccg"
 # A route token (ADR 0240 decision 2): the caller's claims plus the one
 # connector whose declared routes it is good for.
 ROUTE_PREFIX = "ccr"
+UPLOAD_PREFIX = "ccu"
 
 _KEY_BYTES = 32
 _SIGNATURE_BYTES = 64
@@ -127,6 +129,8 @@ def public_key(text: str) -> VerifyKey:
             f"a caller public key decodes to {len(raw)} bytes; an Ed25519 public key "
             f"is {_KEY_BYTES}"
         )
+    if not crypto_core_ed25519_is_valid_point(raw):
+        raise ValueError("a caller public key is not a valid Ed25519 point")
     return VerifyKey(raw)
 
 
@@ -415,14 +419,41 @@ def decide_route(
     another connector are all ``invalid``. Never raises on its input.
     """
 
+    return _decide_scoped(keys, token, ROUTE_PREFIX, connector=connector, admits=admits, now=now)
+
+
+def decide_upload(
+    keys: Sequence[VerifyKey],
+    token: str | None,
+    *,
+    connector: str,
+    admits: frozenset[str],
+    now: int,
+) -> Decision:
+    """Admit only the upload scope, bound to this connector and an admitted agent."""
+
+    return _decide_scoped(keys, token, UPLOAD_PREFIX, connector=connector, admits=admits, now=now)
+
+
+def _decide_scoped(
+    keys: Sequence[VerifyKey],
+    token: str | None,
+    prefix: str,
+    *,
+    connector: str,
+    admits: frozenset[str],
+    now: int,
+) -> Decision:
     if not token:
         return Decision(agent=None, refusal=MISSING)
-    parsed = _opened(keys, token, ROUTE_PREFIX, unique_keys=True)
+    parsed = _opened(keys, token, prefix, unique_keys=True)
     if parsed is None:
         return Decision(agent=None, refusal=INVALID)
     # Closed: a ``principal`` here is invalid. ADR 0270 decision 2 keeps a
     # route an agent/run credential without human authority.
     present = set(parsed)
+    if prefix == UPLOAD_PREFIX and present != _ROUTE_CLAIMS:
+        return Decision(agent=None, refusal=INVALID)
     if present != _ROUTE_CLAIMS and present != _ROUTE_CLAIMS | _RUN_CLAIMS:
         return Decision(agent=None, refusal=INVALID)
     agent, named, exp = parsed["agent"], parsed["connector"], parsed["exp"]

@@ -13,7 +13,7 @@ production deployments.
 import json
 from functools import lru_cache
 from typing import Annotated, Any, Literal
-from urllib.parse import urlsplit, urlunsplit
+from urllib.parse import quote, urlsplit, urlunsplit
 
 from aci_protocol import (
     DEAD_LETTER_STREAM_ENV,
@@ -24,6 +24,7 @@ from aci_protocol import (
     derive_dead_letter_stream_name,
 )
 from aci_protocol.slack_identities import SLACK_IDENTITIES_ENV, SlackIdentities
+from curie_channel_gateway.token_custody import refuse_slack_tokens
 from curie_internal.driver_declaration import (
     PUBLISHED_DEFAULT_API_KEY,
     PUBLISHED_DEFAULT_APPROVAL_CHAT_ATTESTER_SECRET,
@@ -684,15 +685,20 @@ class Settings(BaseSettings):
         validation_alias=AliasChoices("CURIE_CONSUMER_GROUP", "RUNS_CONSUMER_GROUP"),
     )
 
-    # The Slack bot token the API uses for its OWN user-group lookups (#420),
-    # rather than trusting a caller's claim about who is in a group. The same
-    # token the dispatcher and worker already hold; empty is the normal state
-    # for a Slack-free install. Empty does NOT relax anything: a route that
-    # declares an approvers group then fails closed at resolve time, while
-    # channel and user-list authorizers are unaffected. Left out of the #57 prod
-    # boot gate deliberately -- Slack is optional, and that resolve-time denial
-    # is the enforcement.
-    slack_bot_token: str = ""
+    # Provider credentials stay in the gateway; this is the API caller capability.
+    channel_gateway_url: str = Field(default="", validation_alias="CURIE_CHANNEL_GATEWAY_URL")
+    channel_gateway_token: str = Field(
+        default="", validation_alias="CURIE_CHANNEL_GATEWAY_TOKEN", repr=False
+    )
+    channel_gateway_allow_insecure: bool = Field(
+        default=False, validation_alias="CURIE_CHANNEL_GATEWAY_ALLOW_INSECURE"
+    )
+
+    @model_validator(mode="before")
+    @classmethod
+    def _refuse_slack_credentials(cls, values: object) -> object:
+        return refuse_slack_tokens(values)
+
     # The Slack identities the chart declares (ADR-0168 decision 1), which
     # `identities.declared_identities` checks a binding against; see
     # `aci_protocol.slack_identities.declared_slack_identity_names` for what
@@ -1027,7 +1033,8 @@ class Settings(BaseSettings):
         # `rediss://` alone, so this one character is what carries valkey_tls
         # through from_url to the pool (#2315).
         scheme = "rediss" if self.valkey_tls else "redis"
-        return f"{scheme}://:{self.valkey_password}@{self.valkey_host}:{self.valkey_port}/0"
+        password = quote(self.valkey_password, safe="")
+        return f"{scheme}://:{password}@{self.valkey_host}:{self.valkey_port}/0"
 
     def upgrade_quiesce_key(self) -> str:
         return authoritative_key(self.worker_key_prefix, self.installation_id)

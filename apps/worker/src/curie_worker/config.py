@@ -1,7 +1,7 @@
 """Typed configuration for the worker kernel, read from the environment.
 
 The kernel needs a Valkey connection (the stream it consumes plus its locks and
-markers), a Slack bot token (to edit the placeholder in place), the stream and
+markers), a gateway caller credential (to edit the placeholder in place), the stream and
 consumer-group identity, and the tunables for retry, per-thread locking, and
 crash-recovery reclaim. Substrate wiring (namespace, warm pool, runner port)
 lives in ``SubstrateConfig`` and is assembled separately by the entrypoint.
@@ -37,7 +37,9 @@ from aci_protocol.service_config import (
     warn_if_deprecated_api_url_env,
 )
 from aci_protocol.slack_identities import SLACK_IDENTITIES_ENV, SlackIdentities
+from curie_channel_gateway.token_custody import refuse_slack_tokens
 from curie_internal import keyspace
+from curie_internal.connector_endpoints import StaticConnectorEndpoints, parse_endpoint_json
 from curie_upgrade_pause import authoritative_key, legacy_key
 from pydantic import AliasChoices, BeforeValidator, Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
@@ -218,21 +220,26 @@ class WorkerConfig(BaseSettings):
     valkey_tls: bool = False
 
     # Slack
-    slack_bot_token: str = ""
-    # The Slack identities the chart declares (ADR-0168 decision 1). Parsed
-    # here so a malformed declaration refuses boot; `slack_tokens` reads each
-    # one's bot token for its replies and file downloads (decision 5).
-    slack_identities: SlackIdentities = Field(default=(), validation_alias=SLACK_IDENTITIES_ENV)
-    # The worker's DEFAULT Slack Web API base URL: the endpoint used to finalize a
-    # turn whose reply handle carries no per-turn endpoint (issue #19). Unset = the
-    # real Slack API. A turn that carries its own reply endpoint (e.g. a CLI stub)
-    # overrides this per turn, so a real workspace and a no-Slack CLI stub can
-    # coexist on one worker instead of contending for this single setting.
-    slack_api_base_url: str = ""
+    channel_gateway_url: str = Field(default="", validation_alias="CURIE_CHANNEL_GATEWAY_URL")
+    channel_gateway_token: str = Field(
+        default="", validation_alias="CURIE_CHANNEL_GATEWAY_TOKEN", repr=False
+    )
+    channel_gateway_allow_insecure: bool = Field(
+        default=False, validation_alias="CURIE_CHANNEL_GATEWAY_ALLOW_INSECURE"
+    )
 
+    @model_validator(mode="before")
+    @classmethod
+    def _refuse_slack_credentials(cls, values: object) -> object:
+        return refuse_slack_tokens(values)
+
+    # The Slack identities the chart declares (ADR-0168 decision 1). Parsed
+    # here so a malformed declaration refuses boot. The gateway holds tokens
+    # and routes replies and downloads by these names (decision 5).
+    slack_identities: SlackIdentities = Field(default=(), validation_alias=SLACK_IDENTITIES_ENV)
     # ADDITIONAL Slack origins a per-turn reply endpoint may name (ADR-0096
     # D4.4), comma-separated. Empty by default, which leaves the configured
-    # ``slack_api_base_url`` (or real Slack) as the only trusted origin. This
+    # gateway's default origin (or real Slack) as the only trusted origin. This
     # exists for the dev/CLI stub: `local message` advertises
     # ``host.docker.internal`` and `cluster message` a routable host, neither of
     # which the single default base URL can also name, so the origin pin would
@@ -314,6 +321,10 @@ class WorkerConfig(BaseSettings):
     # scope that names a Service which cannot exist.
     connector_release: str = Field(default="", validation_alias="CURIE_RELEASE")
     connector_namespace: str = Field(default="", validation_alias="CURIE_NAMESPACE")
+    connector_endpoints: Annotated[
+        StaticConnectorEndpoints | None, NoDecode, BeforeValidator(parse_endpoint_json)
+    ] = Field(default=None, validation_alias="CURIE_CONNECTOR_ENDPOINTS")
+    sandbox_substrate: str = Field(default="kubernetes", validation_alias="CURIE_SANDBOX_SUBSTRATE")
 
     # The Ed25519 seed that signs each sandbox's connector caller token
     # (ADR-0168 decision 7), standard base64. Empty mints no token. The chart
@@ -478,6 +489,12 @@ class WorkerConfig(BaseSettings):
     dead_letter_maxlen: int = Field(
         default=10000, ge=1, validation_alias="CURIE_DEAD_LETTER_MAXLEN"
     )
+
+    @model_validator(mode="after")
+    def _static_endpoints_exclude_action_executor(self) -> WorkerConfig:
+        if self.connector_endpoints is not None and self.action_executor_enabled:
+            raise ValueError("static connector endpoints do not support the action executor")
+        return self
 
     @model_validator(mode="after")
     def _remediation_requires_the_executor(self) -> WorkerConfig:
@@ -964,6 +981,12 @@ class WorkerConfig(BaseSettings):
     )
     delivery_lease_ttl_s: float = Field(
         default=45.0, gt=0, validation_alias="CURIE_DELIVERY_LEASE_TTL_S"
+    )
+    abandoned_turn_grace_s: float = Field(
+        default=90.0,
+        gt=0,
+        allow_inf_nan=False,
+        validation_alias="CURIE_ABANDONED_TURN_GRACE_S",
     )
     delivery_lease_heartbeat_s: float = Field(
         default=10.0, gt=0, validation_alias="CURIE_DELIVERY_LEASE_HEARTBEAT_S"

@@ -7,15 +7,19 @@ import math
 import time
 
 from channel_protocol.reply import ReplyAck, ReplyEvent, TurnCompleted
+from curie_channel_gateway.reply_errors import (
+    DeletedReplyTargetError,
+)
+from curie_channel_gateway.reply_transport import (
+    BestEffortUnreachableAck,
+    HttpReplyAdapter,
+)
 
 from .protected_markers import ProtectedMarkers, ProtectedSettlementError
 from .reply_sink import (
-    DeletedReplyTargetError,
-    HttpReplyAdapter,
     ReplySink,
     ReplySinkRouter,
     TargetRoute,
-    _BestEffortUnreachableAck,
 )
 
 
@@ -62,7 +66,7 @@ class ProtectedReplySink:
         except DeletedReplyTargetError:
             self._markers._deleted[(event.event_id, generation)] = owed
             raise
-        if not isinstance(ack, ReplyAck) or isinstance(ack, _BestEffortUnreachableAck):
+        if not isinstance(ack, ReplyAck) or isinstance(ack, BestEffortUnreachableAck):
             raise ProtectedSettlementError("protected completion unconfirmed")
         self._markers._confirmed[(event.event_id, generation)] = owed
         return ack

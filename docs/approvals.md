@@ -154,7 +154,7 @@ Three independent axes, and keeping them separate is the point:
   members are the approvers, which is the zero-setup default. Notification recipients never
   become approvers merely by receiving the ping.
 
-A Slack notification can use the worker's default transport. Any other notification kind
+A Slack notification can use the gateway's default Slack identity. Any other notification kind
 must store both `endpoint` and `adapter`; those transport details are write-only and are
 redacted from API and `--list-routes` output. The target's `kind` and `address` remain visible.
 A fixed resolution target stays Slack-only, and a notification never resolves anything.
@@ -710,14 +710,13 @@ Four properties worth knowing before you design around this:
   outage, reports "could not verify approver group membership" and refuses. It never falls back to channel
   membership, because that would silently widen the set an operator narrowed.
 
-Resolving a group-bound route needs `SLACK_BOT_TOKEN` on the API with the
-`usergroups:read` scope. Both requirements are stated in
-[ADR-0034](adr/0034-approval-authorizers-resolve-membership-in-the-api.md) and
-`.env.example`; `apps/api/src/curie_api/slack_usergroups.py` is the lookup that
-consumes them and names neither, so it is the wrong place to send a reader
-checking the claim. The scope needs the Slack app reinstalled. Without the
-token, such a route fails closed: every resolution reports `could not verify approver
-group membership`.
+Resolving a group-bound route requires an authenticated channel gateway whose
+Slack bot has the `usergroups:read` scope. Reinstall the Slack app after adding
+the scope. The API keeps the membership freshness policy and receives only a
+per-caller gateway credential. Slack tokens belong in the gateway or dispatcher;
+the API and worker refuse to start when one is present. Without gateway access,
+every group-bound resolution fails closed with `could not verify approver group
+membership`.
 
 ## What your skill must handle on resume
 
@@ -868,7 +867,7 @@ observed disabled or revoked after the approval's saved capture.
 | `403 you are not an approver` | The selected set does not admit the authenticated principal. Check the `approvers` block and current membership. Requester equality does not bypass or veto that check. |
 | `403 could not verify approvers` | The declared `approvers` block is malformed and cannot be evaluated. Correct its `users` or `group` value, then replace the complete route map. |
 | `403 could not verify approvers: ... route is no longer bound` | The approval named a route whose binding was cleared or rewritten while it was pending — `--clear-routes`, a `--routes-from` file that omits the route, or any `--route` write, since a write is a full replacement. A pending approval is resolvable only through its own route's binding (ADR-0123), so it fails closed rather than widening to card-channel membership. Restore the binding and the approval resolves normally; it is not lost. |
-| `403 could not verify approver group membership` | Slack group membership could not be verified. This fails closed and does not name its cause. Check the API `SLACK_BOT_TOKEN`, its `usergroups:read` scope and reinstallation, and Slack availability. It never falls back to channel membership. |
+| `403 could not verify approver group membership` | Slack group membership could not be verified. This fails closed and does not name its cause. Check gateway connectivity, its Slack bot’s `usergroups:read` scope and reinstallation, and Slack availability. It never falls back to channel membership. |
 | `409 already resolved by ...` | Someone else won the claim. The decision stands. |
 | `410 expired` | The record passed its deadline. The session was already woken down its timeout branch. |
 | Thread says "Not requesting approval again: ... was rejected by ..." | The agent re-raised an approval a person rejected in this thread, with nobody asking since (`409 approval.rejected_in_thread`). Expected. To try again, ask for it in the thread. |
@@ -1000,7 +999,7 @@ upgrade, because a guessed reply route is a silent misroute.
 | Raising a request, and the tool gate | `runner/src/curie_runner/approval.py` |
 | Pausing, routing the card, suspending | `apps/worker/src/curie_worker/kernel/core.py` |
 | Remembering the card so an expiry can disable it | `apps/worker/src/curie_worker/approval_cards.py` |
-| Click to resolve, and rendering the verdict | `apps/dispatcher/src/curie_dispatcher/approval_actions.py` |
+| Click to resolve, and rendering the verdict | `packages/channel-gateway/src/curie_channel_gateway/slack/approval_actions.py` |
 | The resolve endpoint, claim, and audit | `apps/api/src/curie_api/routers/approvals.py` |
 | Break-glass recovery | `apps/api/src/curie_api/routers/approval_recovery.py` |
 | Who may resolve | `apps/api/src/curie_api/authorizer.py`, `apps/api/src/curie_api/approvers.py`, `apps/api/src/curie_api/slack_approvers.py` |

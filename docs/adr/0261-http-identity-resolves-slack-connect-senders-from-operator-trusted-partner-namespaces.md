@@ -10,7 +10,7 @@ code path in one combined pull request. The realizing code path is
 `curie_api.identity.slack.derive_registered_sender`,
 `curie_api.identity.http_invocation.ReceiverRegistrationV1.trusted_namespaces`
 with `recorded_namespace` and `capture_source`, and the dispatcher evidence
-copier `curie_dispatcher.identity.slack_evidence`. The CODEOWNERS approving review by TheConnMan was
+copier `curie_channel_gateway.slack.identity.slack_evidence`. The CODEOWNERS approving review by TheConnMan was
 not obtained before merge.
 
 ## Context

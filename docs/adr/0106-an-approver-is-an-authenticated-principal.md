@@ -74,7 +74,7 @@ not only stored, it is model visible.
 
 Only one of the three callers has any authentication behind the name at all.
 The dispatcher runs in Socket Mode, where interactions arrive over Slack's own
-authenticated websocket (`apps/dispatcher/src/curie_dispatcher/app.py:24-27`),
+authenticated websocket (`packages/channel-gateway/src/curie_channel_gateway/slack/app.py:24-27`),
 so Slack really did authenticate the click and the dispatcher really is relaying
 a proven user id. But the API cannot tell that relayed id apart from a typed
 one, because both arrive as the same field on the same credential. **The one

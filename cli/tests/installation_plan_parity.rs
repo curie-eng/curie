@@ -488,8 +488,7 @@ case "$verb $object" in
         unexpected
     fi
     case "$all" in
-        '-n parity rollout restart deployment/parity-curie-worker'|\
-        '-n parity rollout restart deployment/parity-curie-api'|\
+        '-n parity rollout restart deployment/parity-curie-channel-gateway'|\
         '-n parity rollout restart deployment/parity-curie-dispatcher') : ;;
         *) unexpected ;;
     esac
@@ -499,8 +498,7 @@ case "$verb $object" in
         unexpected
     fi
     case "$all" in
-        '-n parity rollout status deployment/parity-curie-worker --timeout=120s'|\
-        '-n parity rollout status deployment/parity-curie-api --timeout=120s'|\
+        '-n parity rollout status deployment/parity-curie-channel-gateway --timeout=120s'|\
         '-n parity rollout status deployment/parity-curie-dispatcher --timeout=120s') : ;;
         *) unexpected ;;
     esac
@@ -2458,7 +2456,7 @@ fn declarative_comms_replaces_byo_sources_in_diff_and_apply_but_omission_preserv
             "the follow-up comms upgrade must consume the declared Slack replacement"
         );
     }
-    for component in ["worker", "api", "dispatcher"] {
+    for component in ["channel-gateway", "dispatcher"] {
         for (action, suffix) in [("restart", ""), ("status", " --timeout=120s")] {
             let expected = format!(
                 "KUBECTL_CALL: -n parity rollout {action} deployment/parity-curie-{component}{suffix}"
@@ -2468,6 +2466,11 @@ fn declarative_comms_replaces_byo_sources_in_diff_and_apply_but_omission_preserv
                 "the follow-up comms apply must {action} the {component} deployment:\n{calls}"
             );
         }
+    }
+    for component in ["worker", "api"] {
+        assert!(!calls.contains(&format!(
+            "rollout restart deployment/parity-curie-{component}"
+        )));
     }
 
     let retained = HelmFixture::new(

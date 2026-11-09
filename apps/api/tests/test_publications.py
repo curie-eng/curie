@@ -85,7 +85,7 @@ from test_factory_terminus import (
 )
 
 REPO = "acme-corp/acme-bot"
-WORKER_TOKEN = "remote-dev-publication-worker-token"
+WORKER_TOKEN = "example-publication-worker-token"
 WORKER_HEADERS = {"X-Curie-Worker-Token": WORKER_TOKEN}
 PATCH_LIMIT = 900_000
 BASE_SHA = "0123456789abcdef0123456789abcdef01234567"
@@ -1167,8 +1167,8 @@ def test_publication_splits_scoped_thread_identity_from_slack_reply_identity(
     auth_headers: dict[str, str],
     clean_db: None,
 ) -> None:
+    from curie_channel_gateway.slack.slack_sink import _thread_ts
     from curie_worker.publication_store import PostgresPublicationStore
-    from curie_worker.slack_sink import _thread_ts
 
     client, _ = publication_stack
     deployment = _create_deployment(client, auth_headers)
@@ -2980,6 +2980,7 @@ def test_coder_path_reaches_the_publication_boundary_through_real_runner_and_api
                 "history_durable": True,
                 "status": "idle-awaiting-input",
                 "turn_epoch": None,
+                "side_effect_emitted": False,
                 "capacity_admission": True,
                 # RUNNER-TOOL-ACCESS-5: this test's runner session is built
                 # without tool access enforcement, so it advertises none.

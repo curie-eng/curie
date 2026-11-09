@@ -133,6 +133,7 @@ mod guide;
 mod hook_fire;
 mod hook_wake;
 mod hooks_operator;
+mod identity_operator;
 mod installation_plan_parity;
 mod json_contract;
 mod json_emit_contract;

@@ -493,7 +493,29 @@ def _path_needs_images(path: str) -> bool:
     name = path.rsplit("/", 1)[-1]
     if path in {"uv.lock", "pyproject.toml"} or name in {"uv.lock", "pyproject.toml"}:
         return True
+    if path.startswith((
+        "packages/shell-supervisor/",
+        "runner/src/curie_runner/",
+        "apps/worker/src/curie_worker/kernel/",
+        "apps/worker/src/curie_worker/sandbox/",
+    )) or path in {
+        "apps/worker/src/curie_worker/markers.py",
+        "apps/worker/src/curie_worker/delivery_lease.py",
+        "apps/worker/src/curie_worker/stream_consumer.py",
+        "apps/worker/src/curie_worker/runner_client.py",
+        "apps/worker/src/curie_worker/threadlock.py",
+    }:
+        return True
     return "Dockerfile" in name or name.endswith(".dockerfile")
+
+
+def test_a_shell_supervisor_change_runs_the_image_proofs() -> None:
+    # The shell container proof runs only in the image job, so a supervisor
+    # source change must select it even with no Dockerfile in the diff.
+    assert _SELECTOR_MODULE._needs_images(
+        ["packages/shell-supervisor/src/curie_shell_supervisor/isolation.py"]
+    )
+    assert not _SELECTOR_MODULE._needs_images(["packages/telemetry/src/x.py"])
 
 
 def _path_needs_cli_release(path: str) -> bool:
@@ -1893,7 +1915,8 @@ def test_genuine_documentation_only_selects_no_runtime_e2e_tiers(
     [
         ("apps/ui/package.json", True),
         ("apps/ui/pnpm-lock.yaml", True),
-        ("apps/dispatcher/src/curie_dispatcher/app.py", True),
+        ("packages/channel-gateway/src/curie_channel_gateway/slack/valkey.py", True),
+        ("packages/channel-gateway/src/curie_channel_gateway/slack/app.py", True),
         # Rule-ignored paths still run their impact readers on a pull request.
         ("scripts/README.md", True),
         ("scripts/check-docs.sh", True),
@@ -2911,6 +2934,14 @@ IMAGE_PROOF_GROUPS = {
         "Tag the runner image as the harness default (curie-runner)",
         "Repository toolchain proof",
     ),
+    # The static-pool shell image, layered on the runner image the toolchain
+    # group loaded, proven as a root container.
+    "Shell: ": (
+        "Load the API image for the crash proof",
+        "Build the shell image on the runner image",
+        "Absent image fails in required mode (negative control)",
+        "Recycled shells hold nothing from the previous claim",
+    ),
 }
 
 
@@ -2932,10 +2963,14 @@ def _assert_image_proofs(workflow: dict[str, Any]) -> None:
     assert job["runs-on"] == "ubuntu-24.04"
     assert job["needs"] == ["changes", "ci-images"]
     assert job["if"] == IMAGE_PROOFS_IF
-    assert job["env"] == {"CURIE_REPO_TOOLCHAIN_PROOF": "required"}
+    assert job["env"] == {
+        "CURIE_REPO_TOOLCHAIN_PROOF": "required",
+        "CI_REQUIRE_VALKEY_TESTS": "1",
+        "TEST_VALKEY_PW": "",
+    }
     assert not {"defaults", "continue-on-error", "timeout-minutes"} & job.keys()
     steps = job["steps"]
-    assert len(steps) == 40
+    assert len(steps) == 44
     assert [step["name"] for step in steps] == [
         prefix + name for prefix, names in IMAGE_PROOF_GROUPS.items() for name in names
     ], "all former steps must retain group order, with UI before Toolchain"
@@ -2952,8 +2987,11 @@ def _assert_image_proofs(workflow: dict[str, Any]) -> None:
             ("UI: ", "ui"),
             ("Toolchain: ", "runner"),
         )
-    ]
+    ] + [("Shell: Load the API image for the crash proof", "api")]
     for prefix in IMAGE_PROOF_GROUPS:
+        if prefix == "Shell: ":
+            # Runs in the toolchain group's checkout.
+            continue
         checkout = by_name[prefix + "Checkout"]
         assert checkout["uses"].startswith("actions/checkout@")
         assert checkout["with"] == (
@@ -6354,3 +6392,36 @@ def test_platform_runner_upgrade_stages_candidate_artifacts_before_own_lifecycle
         "Stage the workspace diagnostic images in kind",
     ):
         assert steps[positions[staging]]["if"] == WORKLOAD_STAGING_IF
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "runner/src/curie_runner/session.py",
+        "runner/src/curie_runner/server.py",
+        "runner/src/curie_runner/history.py",
+        "runner/src/curie_runner/preflight/check.py",
+        "packages/shell-supervisor/src/curie_shell_supervisor/server.py",
+        "apps/worker/src/curie_worker/kernel/claim.py",
+        "apps/worker/src/curie_worker/kernel/completion.py",
+        "apps/worker/src/curie_worker/kernel/work_items.py",
+        "apps/worker/src/curie_worker/kernel/recovery/check.py",
+        "apps/worker/src/curie_worker/sandbox/static.py",
+        "apps/worker/src/curie_worker/sandbox/substrate.py",
+        "apps/worker/src/curie_worker/threadlock.py",
+        "apps/worker/src/curie_worker/markers.py",
+        "apps/worker/src/curie_worker/delivery_lease.py",
+        "apps/worker/src/curie_worker/stream_consumer.py",
+        "apps/worker/src/curie_worker/runner_client.py",
+    ],
+)
+def test_runner_recovery_changes_select_image_proofs(tmp_path: Path, path: str) -> None:
+    completed, output = _invoke_selector(tmp_path, path)
+    assert completed.returncode == 0, completed.stderr
+    assert "images=true" in output.splitlines()
+
+
+def test_unrelated_source_does_not_select_image_proofs(tmp_path: Path) -> None:
+    completed, output = _invoke_selector(tmp_path, "packages/telemetry/src/x.py")
+    assert completed.returncode == 0, completed.stderr
+    assert "images=false" in output.splitlines()

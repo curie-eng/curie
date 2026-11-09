@@ -141,6 +141,7 @@ async def _cold_handoff_readiness(
     handle: SandboxHandle,
     *,
     remaining_s: float | None = None,
+    predecessor_event_id: str | None = None,
 ) -> str:
     """Classify whether an authenticated retained runner can be replaced."""
 
@@ -159,6 +160,8 @@ async def _cold_handoff_readiness(
     except Exception as exc:  # noqa: BLE001 - broad catch kept at a failure boundary
         logger.warning("could not read cold handoff fence at %s: %r", handle.base_url, exc)
         return "unsafe"
+    if predecessor_event_id is not None and status.get("side_effect_emitted") is True:
+        await self._markers.mark_side_effect(predecessor_event_id)
     active = status.get("turn_active")
     if active is True:
         return "active"
@@ -185,6 +188,7 @@ async def _workspace_handoff_ready(
     remaining_s: float | None = None,
     lineage_reconciliation: bool = False,
     pending_publication_approval: bool = False,
+    predecessor_event_id: str | None = None,
 ) -> bool:
     """Fail closed unless the old runner is idle with durable replay state.
 
@@ -210,6 +214,8 @@ async def _workspace_handoff_ready(
     except Exception as exc:  # noqa: BLE001 - unreadable is never safe to replace
         logger.warning("could not read workspace handoff fence at %s: %r", handle.base_url, exc)
         return False
+    if predecessor_event_id is not None and status.get("side_effect_emitted") is True:
+        await self._markers.mark_side_effect(predecessor_event_id)
     return (
         status.get("turn_active") is False
         and status.get("history_durable") is True

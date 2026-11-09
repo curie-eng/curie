@@ -17,7 +17,7 @@ from typing import Any, cast
 
 import pytest
 from aci_protocol import Final, SessionStatus
-from curie_dispatcher.queue import to_stream_fields
+from curie_internal.turn_queue import to_stream_fields
 from curie_worker import stream_consumer as stream_consumer_module
 from curie_worker.consumer import Consumer, refuse_unconfigured_reminder
 from curie_worker.delivery_lease import DeliveryLeaseStore

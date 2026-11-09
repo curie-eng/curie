@@ -96,6 +96,9 @@ class _ProviderStallSession:
     async def close(self) -> None:
         self.release.set()
 
+    async def abort(self) -> None:
+        await self.close()
+
 
 class _ToolStallSession(_ProviderStallSession):
     async def receive_turn(self):
@@ -2457,6 +2460,55 @@ def test_abandoned_stream_interrupts_the_sdk() -> None:
     assert fake.interrupts >= 1
 
 
+@pytest.mark.parametrize("cancel_cleanup", [False, True])
+def test_abandoned_tool_stream_bounds_a_hung_interrupt(cancel_cleanup: bool) -> None:
+    class HungInterrupt(_ToolStallSession):
+        closed = False
+
+        async def interrupt(self) -> None:
+            self.interrupts += 1
+            self.entered.set()
+            await anyio.sleep_forever()
+
+        async def close(self) -> None:
+            self.closed = True
+            self.release.set()
+
+    async def go() -> None:
+        fake = HungInterrupt(anyio.Event(), anyio.Event())
+        runner = SessionRunner(
+            session_factory=lambda: fake,
+            ceiling=0,
+            max_usd_per_day=None,
+            tracer=RunTracer(None),
+            classifier=SideEffectClassifier(),
+            trace_name="cleanup",
+            held_secrets=frozenset(),
+            cleanup_timeout_s=0.05,
+        )
+        await runner.start()
+        gen = runner.run_turn(Event(type="message", text="read", user="U", ts="1"))
+        async for line in gen:
+            if any(event.type == "tool_note" for event in parse_ndjson(line)):
+                break
+        assert runner.turn_active
+        with anyio.fail_after(1):
+            if cancel_cleanup:
+                close = asyncio.create_task(gen.aclose())
+                await fake.entered.wait()
+                close.cancel()
+                with pytest.raises(asyncio.CancelledError):
+                    await close
+            else:
+                await gen.aclose()
+        assert fake.closed
+        assert not runner.turn_active
+        assert not runner.ready
+        assert not runner.history_durable
+
+    anyio.run(go)
+
+
 def test_cross_task_abandon_does_not_wedge_turn_lock() -> None:
     # Client-disconnect mid-stream (#679): the server drives run_turn and, when
     # response.write() raises on disconnect, the suspended generator is finalized
@@ -3214,3 +3266,28 @@ def test_batched_reviewer_credit_refusal_cannot_replace_the_usage_limit_remedy()
     assert events[-1].status is SessionStatus.CLASSIFIED_FAILURE
     assert fake.interrupts >= 1
     assert all(sentinel not in getattr(event, "text", "") for event in events)
+
+
+def test_status_retains_abandoned_side_effect_until_the_next_turn() -> None:
+    scripts = iter((default_turn(), [m for m in default_turn() if isinstance(m, ResultMessage)]))
+
+    async def go() -> None:
+        runner, _fake = _runner(lambda: next(scripts))
+        async with TestClient(TestServer(create_app(runner))) as client:
+            await runner.start()
+            stream = runner.run_turn(Event(type="message", text="mutate", user="U", ts="1"))
+            async for line in stream:
+                if any(frame.type == "side_effect_flag" for frame in parse_ndjson(line)):
+                    break
+            assert (await (await client.get("/v1/status")).json())["side_effect_emitted"] is True
+            await stream.aclose()
+            status = await (await client.get("/v1/status")).json()
+            assert status["turn_active"] is False
+            assert status["side_effect_emitted"] is True
+            async for _line in runner.run_turn(
+                Event(type="message", text="clean", user="U", ts="2")
+            ):
+                pass
+            assert (await (await client.get("/v1/status")).json())["side_effect_emitted"] is False
+
+    anyio.run(go)

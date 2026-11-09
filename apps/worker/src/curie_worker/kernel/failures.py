@@ -269,6 +269,14 @@ class ThreadBusyError(RuntimeError):
     """
 
 
+class HandoffPending(ThreadBusyError):
+    """A retained turn has not reached its durable handoff boundary."""
+
+
+class PriorSideEffectObserved(Exception):
+    """The delivery's replay fence was recovered while routing its retry."""
+
+
 class ToolAccessUnenforced(Exception):
     """The runner a restricted turn would go to does not enforce its access.
 

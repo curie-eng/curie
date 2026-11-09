@@ -176,7 +176,7 @@ mounts and kind's `/dev/kmsg` mount still refer to daemon-host resources.
   `curie cluster comms --slack` uses the same `SecretSet` masking for
   `SLACK_APP_TOKEN` and `SLACK_BOT_TOKEN`, while `--disconnect --dry-run`
   prints only the empty clears. After the Helm upgrade it rolls every Slack
-  token consumer, the worker and API plus the dispatcher on connect, via
+  token consumer, the channel gateway and dispatcher on connect, via
   `kubectl rollout restart` + `rollout status` so the Secret-backed tokens go live.
 - **`local comms` shares the same Slack flag surface, but tokens travel through
   compose env, not argv.** `curie local comms --slack` reads

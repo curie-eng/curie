@@ -10,7 +10,7 @@ the enforceable-rule summary.
   database access.** Its credentials are `CURIE_CHANNEL_TOKEN` (presented as
   `X-API-Key` on ingress), `CURIE_EGRESS_SECRET` (checked on every inbound POST),
   `AGENTMAIL_API_KEY`, and the optional `CURIE_ADAPTER_PRINCIPAL` (ADR-0156,
-  presented only on `POST /approvals/{id}/resolve` when carrying an answer). The
+  presented on approval answers and opt-in self-rotation). The
   optional `CURIE_MAIL_RECEIVER_KEY` is its email receiver key (ADR 0260): it
   signs the sender of each turn through the shared
   `curie_internal.identity_context` signer and authorizes nothing alone. It also
@@ -19,9 +19,11 @@ the enforceable-rule summary.
   add a second canonicalisation or MAC here, and never post a turn or an answer unsigned when
   the receiver is configured. Do not add `CURIE_API_KEY`, a Valkey client, or a DB
   session to the platform here; a capability the adapter does not hold cannot be
-  stolen from it, and re-minting an expired `chn` token is an operator step for
-  exactly that reason. Its local SQLite file is delivery state, not a platform
-  capability, and must never contain any of the three credentials.
+  stolen from it. `CURIE_MAIL_SELF_ROTATE` is off by default. When enabled,
+  `credential_rotation.py` renews both scoped credentials, serializes channel mint and
+  ingress, and stores them in a separate owner-only SQLite snapshot beside the
+  journal. The delivery journal must never contain credentials. Treat the
+  snapshot, its volume and backups as bearer-credential storage.
 - **Reply text and its send target are owned at `(conversation_id, reply_ref)`.**
   Every update and completion uses that exact durable pair, and the send target
   is only the event's `target.reply_ref`. Never derive a target or accumulated
@@ -65,7 +67,7 @@ the enforceable-rule summary.
   content into the cluster log-retention system.
 - **Every log record leaves through the shared service logger, and that filter
   is a backstop, not a licence.** `main()` calls `bootstrap_service_telemetry`
-  on the *package* logger `curie_mail_adapter`, which installs one redacting
+  on the *package* logger `curie_channel_gateway.mail`, which installs one redacting
   single-line-JSON stderr handler and sets `propagate=False` there; `run`,
   `adapter` and `egress` each hold a `getLogger(__name__)` child, so one
   bootstrap covers all three and nothing walks past it to a root handler. Do not
@@ -89,6 +91,8 @@ the enforceable-rule summary.
   Every poller and egress transaction uses the adapter-owned lock. Adding a
   second replica or changing `Recreate` to rolling update creates two writers;
   horizontal scale needs a separately accepted shared-store design.
+  `CURIE_MAIL_EXCLUSIVE_WAL` (default off) is the single-process network-volume
+  opt-in: exclusive locking before the first WAL access, still one writer.
 
 ## Inbound gate
 
@@ -166,7 +170,7 @@ both providers.
 
 Only the two external dependencies are faked, both as real local
 `ThreadingHTTPServer` instances: AgentMail's API and the platform's channel
-ingress. Nothing inside `curie_mail_adapter` is patched. The fake AgentMail
+ingress. Nothing inside `curie_channel_gateway.mail` is patched. The fake AgentMail
 server exercises the adapter's own admission decision, including unlabelled
 spoofed mail, allowlisted senders without verifiable verdicts, and approval
 answers. Provider filtering cannot stand in for that decision. A new test that

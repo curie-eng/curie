@@ -249,6 +249,10 @@ real replies.
 
 **3. Connect Slack.**
 
+Slack delivery requires a configured
+[provider gateway](apps/dispatcher/README.md#provider-gateway).
+Complete its TLS and caller-credential setup before connecting the workspace.
+
 ```bash
 read -rsp 'Slack app-level token: ' SLACK_APP_TOKEN
 printf '\n'

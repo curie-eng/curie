@@ -32,7 +32,7 @@ _TOKENS = json.loads(
     (_ROOT / "tests" / "vectors" / "connector-caller-token.json").read_text(encoding="utf-8")
 )
 _VECTOR = next(v for v in _TOKENS["vectors"] if v["name"] == "a_plain_agent_name")
-_SEED = str(_VECTOR["seed"])
+_SEED = base64.b64encode(bytes(range(*_VECTOR["seed_range"]))).decode()
 _EXP = int(_VECTOR["exp"])
 _NOW = _EXP - 10
 _CALLER_TOKEN = str(_VECTOR["minted"])

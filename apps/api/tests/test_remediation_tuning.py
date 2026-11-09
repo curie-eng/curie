@@ -352,7 +352,7 @@ async def deliver_cards(times: int = 1) -> list[dict[str, Any]]:
     fake Slack client; returns what was posted."""
 
     cards = importlib.import_module("curie_worker.remediation_cards")
-    from curie_worker.slack_sink import SlackReplyAdapter
+    from curie_channel_gateway.slack.slack_sink import SlackReplyAdapter
 
     posts: list[dict[str, Any]] = []
 

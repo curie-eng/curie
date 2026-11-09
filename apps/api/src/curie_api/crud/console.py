@@ -346,7 +346,8 @@ async def resolve_principal(
         if tenant.status != "active":
             raise principal_authority.PrincipalAuthorityRefusal("tenant_unavailable")
         authority = principal_authority.stored_configuration(config)
-        assert isinstance(authority.selection, HttpSelectionV1)
+        if not isinstance(authority.selection, HttpSelectionV1):
+            raise principal_authority.PrincipalAuthorityRefusal("http_authority_required")
         if claims.issuer != authority.selection.issuer:
             raise principal_authority.PrincipalAuthorityRefusal("authority_scope_mismatch")
     principal = await session.scalar(

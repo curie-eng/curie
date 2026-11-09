@@ -478,7 +478,8 @@ def env(settings_reset: None, monkeypatch: pytest.MonkeyPatch) -> pytest.MonkeyP
 @contextmanager
 def _app(env: pytest.MonkeyPatch, token: str) -> Iterator[TestClient]:
     """Boot the real app (lifespan included) with ``SLACK_BOT_TOKEN=token``."""
-    env.setenv("SLACK_BOT_TOKEN", token)
+    env.setenv("CURIE_CHANNEL_GATEWAY_URL", "https://gateway.example.com" if token else "")
+    env.setenv("CURIE_CHANNEL_GATEWAY_TOKEN", "api-caller-credential" if token else "")
     get_settings.cache_clear()
     try:
         with TestClient(create_app()) as test_client:
@@ -1136,7 +1137,6 @@ def test_declared_identity_gets_its_own_row(
     clean_identities: None, env: pytest.MonkeyPatch, auth_headers: dict[str, str]
 ) -> None:
     env.setenv("CURIE_SLACK_IDENTITIES", _IDENTITIES_WITH_SUPPORT_BOT)
-    env.setenv("CURIE_SLACK_BOT_TOKEN__1", "xapp-support-TOKEN")
     with _app(env, CANARY) as app:
         response = app.get(BASE, params={"provider": "slack"}, headers=auth_headers)
     assert response.status_code == 200
@@ -1155,16 +1155,15 @@ def test_declared_identity_gets_its_own_row(
     assert support_row["attributes"] == {"app_token_ref": "env:CURIE_SLACK_APP_TOKEN__1"}
 
 
-def test_declared_identity_without_bot_token_gets_no_row(
+def test_declared_identity_bootstraps_without_api_token_access(
     clean_identities: None, env: pytest.MonkeyPatch, auth_headers: dict[str, str]
 ) -> None:
     env.setenv("CURIE_SLACK_IDENTITIES", _IDENTITIES_WITH_SUPPORT_BOT)
     # Declared, but its bot token env var is blank: no row, same as
-    # identities.slack_bot_tokens would treat it as unconfigured.
-    env.setenv("CURIE_SLACK_BOT_TOKEN__1", "")
+    # the gateway would treat its provider credential as unconfigured.
     with _app(env, CANARY) as app:
         response = app.get(BASE, params={"provider": "slack"}, headers=auth_headers)
-    assert [row["name"] for row in response.json()] == ["default"]
+    assert {row["name"] for row in response.json()} == {"default", "support-bot"}
 
 
 def test_operator_created_named_row_suppresses_only_that_name(
@@ -1177,7 +1176,6 @@ def test_operator_created_named_row_suppresses_only_that_name(
             app, auth_headers, name="support-bot", credential_ref="env:MY_TOKEN"
         )
     env.setenv("CURIE_SLACK_IDENTITIES", _IDENTITIES_WITH_SUPPORT_BOT)
-    env.setenv("CURIE_SLACK_BOT_TOKEN__1", "xapp-support-TOKEN")
     with _app(env, CANARY) as app:
         listed = app.get(BASE, params={"provider": "slack"}, headers=auth_headers).json()
     rows = {row["name"]: row for row in listed}
@@ -1200,7 +1198,6 @@ def test_concurrent_bootstrap_of_named_identity_yields_one_row(
     from curie_api.channel_identities import bootstrap_static_slack
     from curie_api.db import create_sessionmaker
 
-    env.setenv("CURIE_SLACK_BOT_TOKEN__1", CANARY)
     identities = (
         SlackIdentity(
             name="default",
@@ -1219,7 +1216,7 @@ def test_concurrent_bootstrap_of_named_identity_yields_one_row(
     async def bootstrap_once() -> bool:
         # No SLACK_BOT_TOKEN: isolates this race to the named identity alone.
         settings = get_settings().model_copy(
-            update={"slack_bot_token": "", "slack_identities": identities}
+            update={"channel_gateway_url": "", "slack_identities": identities}
         )
         engine = create_async_engine(settings.database_url)
         try:
@@ -1243,7 +1240,9 @@ async def _bootstrap_once(token: str) -> bool:
     from curie_api.channel_identities import bootstrap_static_slack
     from curie_api.db import create_sessionmaker
 
-    settings = get_settings().model_copy(update={"slack_bot_token": token})
+    settings = get_settings().model_copy(
+        update={"channel_gateway_url": "https://gateway.example.com" if token else ""}
+    )
     engine = create_async_engine(settings.database_url)
     try:
         return await bootstrap_static_slack(create_sessionmaker(engine), settings)

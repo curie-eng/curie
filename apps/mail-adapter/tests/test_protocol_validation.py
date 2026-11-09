@@ -23,9 +23,9 @@ from _support import (
     update,
     wait_until,
 )
-from curie_mail_adapter import egress
-from curie_mail_adapter.adapter import MailAdapter
-from curie_mail_adapter.egress import MAX_CONCURRENT_REQUESTS
+from curie_channel_gateway.mail import egress
+from curie_channel_gateway.mail.adapter import MailAdapter
+from curie_channel_gateway.mail.egress import MAX_CONCURRENT_REQUESTS
 
 
 def _seed(mail: MailState, adapter: MailAdapter) -> None:

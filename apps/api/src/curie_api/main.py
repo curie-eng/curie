@@ -14,6 +14,8 @@ from functools import partial
 
 import httpx
 import redis.asyncio as redis
+from curie_channel_gateway.tls import gateway_http_mounts
+from curie_internal.valkey import AsyncRedis
 from curie_protected_hooks.source_policy_sql import SourceGate
 from curie_telemetry import (
     TRACEPARENT_STREAM_FIELD,
@@ -102,6 +104,7 @@ from .routers import (
     identity_approvals,
     identity_authority,
     identity_connect,
+    identity_operator,
     memory,
     observability,
     provider_installations,
@@ -159,7 +162,10 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     app.state.forges = forges_registry(settings)
     # The shared client reaches the code host, so it trusts the operator's
     # code host CA bundle as well as the public roots (#3831).
-    http_client = httpx.AsyncClient(timeout=10.0, verify=code_host_verify(settings))
+    http_client = httpx.AsyncClient(
+        timeout=10.0, verify=code_host_verify(settings),
+        mounts=gateway_http_mounts(settings.channel_gateway_url),
+    )
     app.state.http_client = http_client
     app.state.langfuse = LangfuseClient(settings, http_client)
     store = BundleStore(settings)
@@ -170,8 +176,10 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     # for a proxy most runs never touch.
     app.state.pod_log_reader = build_lazy_pod_log_reader(settings.kube_config_path)
     app.state.pod_lister = build_lazy_pod_lister(settings.kube_config_path)
-    valkey: redis.Redis = redis.from_url(settings.valkey_dsn())
+    valkey: redis.Redis = AsyncRedis.from_url(settings.valkey_dsn())
     app.state.valkey = valkey
+    credential_valkey = AsyncRedis.from_url(settings.valkey_dsn(), retry_reads=False)
+    app.state.credential_valkey = credential_valkey
     app.state.kill_switch = KillSwitch(valkey)
     app.state.thread_reset_requests = ThreadResetRequests(valkey)
     app.state.eval_queue = EvalQueue(valkey)
@@ -215,24 +223,10 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         and settings.github_review_reconciler_interval_s > 0
         else None
     )
-    # The composition root for approvals (#420, ADR-0034): the only place that
-    # names Slack to build the approver-set selector, so the authorizer and the
-    # resolve endpoint depend on ports rather than on a provider. Each Slack
-    # identity's usergroup client shares the app's httpx client (ADR-0168
-    # decision 5); with no bot token there is none, the normal Slack-free
-    # deployment, and a route that declares an approvers group then fails
-    # closed at resolve time rather than silently widening.
+    # Authorization and freshness policy use authenticated gateway membership ports.
     app.state.approver_sets = build_approver_set_selector(http_client, settings)
-    # Every configured Slack identity as one unattached channel identity
-    # (#2909, ADR 0168 decision 1, as scoped by ADR 0193 decision 4): the
-    # legacy default plus every CURIE_SLACK_IDENTITIES entry with a non-blank
-    # bot token, each behind its own token gate, so a Slack-free install gets
-    # no row. Attaching it to a provider_installations row is #3039's job, not
-    # boot's -- only the identity's own credential can later report which
-    # installation it belongs to. Never fails boot; if this image started
-    # below this migration it keeps retrying in the background. identities.py
-    # still reads CURIE_SLACK_IDENTITIES directly to validate a binding's
-    # declared name, not from this table, pending #2911.
+    # Declarations reserve identities; only the gateway or dispatcher can later
+    # attest provider availability. Bootstrap never reads a provider token.
     app.state.static_slack_bootstrap_task = await start_static_slack_bootstrap(
         app.state.sessionmaker, settings
     )
@@ -483,6 +477,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
                 except asyncio.CancelledError:
                     pass
             try:
+                await credential_valkey.aclose()
                 await valkey.aclose()
                 await http_client.aclose()
                 await engine.dispose()
@@ -758,6 +753,7 @@ def create_app(
     app.include_router(provider_installations.router)
     app.include_router(channel_identities.router)
     app.include_router(identity_admin.router)
+    app.include_router(identity_operator.router)
     app.include_router(identity_authority.router)
     app.include_router(identity_authority.grant_router)
     app.include_router(identity_authority.classification_router)

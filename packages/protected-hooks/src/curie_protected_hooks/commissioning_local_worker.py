@@ -134,7 +134,7 @@ def worker_files(
     m = manifest.as_dict()
     host = "." + namespace + ".svc.cluster.local"
     process = {
-        "schema_version": 1,
+        "schema_version": 2,
         "database_url": "postgresql+asyncpg://postgres:"
         + secrets.postgres_password
         + "@curie-postgres"
@@ -144,7 +144,12 @@ def worker_files(
         "api_base_url": "http://" + API_NAME + host + ":8000",
         "internal_worker_token": secrets.internal_worker_token,
         "adapter_credentials": {},
-        "slack": {"token": "", "base_url": "", "trusted_origins": [], "identity_tokens": {}},
+        "channel_gateway": {
+            "url": "",
+            "token": "",
+            "allow_insecure_http": False,
+            "identities": [],
+        },
         "launch_tls": {
             "origin": f"https://{launch.server_name}:{MEDIATOR_PORT}",
             "ca_file": RUNTIME_DIR + "/launch-ca.pem",

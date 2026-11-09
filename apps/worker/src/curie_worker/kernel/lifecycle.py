@@ -39,6 +39,7 @@ from ..binding import (
     FactoryBindingRefused,
     FactoryWake,
     binding_adapter_for_handle,
+    caller_requester_facts,
 )
 from ..capacity_wait import current_wait
 from ..delivery_lease import DeliveryLease
@@ -587,24 +588,7 @@ async def _process_event(
 
         # Crash-safety: prior observed or unconfirmed execution latched the
         # retry fence but never reached done. Do not auto-retry the action.
-        if await self._markers.saw_side_effect(event_id):
-            # This path is NOT silent: it is the one message a human most
-            # needs to see. It runs before binding resolution, so it emits
-            # over the server-minted handle's route, verbatim -- never a
-            # lookup it cannot reach and never a default standing in for a
-            # missing adapter.
-            #
-            # And it is a DURABLE TERMINAL OUTCOME, so it completes through
-            # the same ordering every other terminal path uses (driver
-            # adjudication, superseding the earlier "suppress the completion
-            # here" wording). Marking done without a completion is only
-            # survivable on an edit-in-place channel: a BUFFERED adapter
-            # accumulates the reply and flushes on ``turn.completed``, so a
-            # suppressed completion writes the escalation, marks the turn
-            # done, and never delivers it -- silently, on exactly the channel
-            # with nobody watching a thread. The handle-derived route is what
-            # the record stores, so a sweeper re-emits over the same
-            # transport the escalation text went to.
+        async def halt_prior_side_effect() -> None:
             escalation_update = await self._escalate(
                 qevent,
                 route,
@@ -622,6 +606,55 @@ async def _process_event(
                 hook_outcome="failed",
                 hook_reason="prior_side_effect",
             )
+
+        prior_side_effect = await self._markers.saw_side_effect(event_id)
+        predecessor_watch = None
+        if lease is not None and lease.generation > 1:
+            predecessor = await asyncio.to_thread(self._substrate.lookup, thread_key)
+            if predecessor is not None:
+                predecessor_watch = await self._markers.watched_turn(predecessor.claim_name)
+                if (
+                    predecessor_watch is not None
+                    and json.loads(predecessor_watch)["event_id"] == event_id
+                ):
+                    try:
+                        status = await self._runner.status(
+                            predecessor.base_url,
+                            token=predecessor.token or None,
+                            remaining_s=min(5.0, max(0.0, lease.remaining_s())),
+                        )
+                    except Exception:  # noqa: BLE001 - preflight keeps unreadable runners fenced
+                        status = {}
+                    if status.get("side_effect_emitted") is True:
+                        await self._markers.mark_side_effect(event_id)
+                        prior_side_effect = True
+                else:
+                    predecessor_watch = None
+        if prior_side_effect:
+            if predecessor_watch is not None:
+                assert lease is not None
+                handoff_refusals = 0
+                while lease.remaining_s() > constants._MIN_ATTEMPT_BUDGET_S:
+                    lease.raise_if_lost()
+                    try:
+                        assert predecessor is not None
+                        await self._preflight_reclaimed_delivery(
+                            thread_key,
+                            lease,
+                            event_id=event_id,
+                            desired_requester=(
+                                predecessor.caller_requester
+                                or caller_requester_facts(None)[0]
+                            ),
+                            requester_enforced=False,
+                        )
+                        break
+                    except memory.ReclaimPreflightUnsafe:
+                        handoff_refusals += 1
+                        await asyncio.sleep(
+                            min(self._backoff(handoff_refusals), max(0.0, lease.remaining_s()))
+                        )
+            await halt_prior_side_effect()
             return
 
         # ADR-0168 decision 6: a turn one of this installation's own
@@ -1189,24 +1222,11 @@ async def _process_event(
         # message text, so kernel rule 3 stands -- may not simply route: the
         # ordinary path would STEER into a retained live turn, which is right
         # for a follow-up and wrong for a retry of the same event. Placed
-        # deliberately AFTER the side-effect check above (rule 1 of the
-        # preflight is that check, and a marker must forbid replay before any
-        # interrupt-and-rehydrate is contemplated) and BEFORE the first
-        # attempt.
-        if claim._is_fenced(lease) and lease is not None and lease.generation > 1:
-            wait_scope = current_wait()
-            if wait_scope is None:
-                await self._preflight_reclaimed_delivery(
-                    thread_key,
-                    lease,
-                    event_id=event_id,
-                    boot_env=boot_env,
-                    requester_enforced=identity.requester_enforced(),
-                )
-            else:
-                record = await wait_scope[0].get(wait_scope[1])
-                if record is not None and record.grant_epoch is not None:
-                    await self._quiesce_capacity_epoch(thread_key, record.grant_epoch)
+        # before the first attempt. Maintenance retains the recovery watch
+        # if a side-effect escalation settles before its predecessor quiesces.
+        reclaim_preflight_pending = (
+            claim._is_fenced(lease) and lease is not None and lease.generation > 1
+        )
 
         # Retry carry for the inferred repository announcement (#2659); see
         # _WorkspaceInferenceCarry. Local to this delivery, never kernel state,
@@ -1229,6 +1249,7 @@ async def _process_event(
         termination_detail: str | None = None
         attempt = 0
         capacity_refusals = 0
+        handoff_refusals = 0
         capacity_wait_run: WorkItemRun | None = None
         dependency_deadline: float | None = None
         dependency_refusals = 0
@@ -1307,6 +1328,49 @@ async def _process_event(
                         ),
                     )
                     return
+            if reclaim_preflight_pending:
+                assert lease is not None
+                try:
+                    wait_scope = current_wait()
+                    if wait_scope is None:
+                        await self._preflight_reclaimed_delivery(
+                            thread_key,
+                            lease,
+                            event_id=event_id,
+                            desired_requester=caller_requester_facts(boot_env)[0],
+                            requester_enforced=identity.requester_enforced(),
+                        )
+                    else:
+                        record = await wait_scope[0].get(wait_scope[1])
+                        if record is not None and record.grant_epoch is not None:
+                            previous_handle = await asyncio.to_thread(
+                                self._substrate.lookup, thread_key
+                            )
+                            previous_watch = (
+                                await self._markers.watched_turn(previous_handle.claim_name)
+                                if previous_handle is not None
+                                else None
+                            )
+                            await self._quiesce_capacity_epoch(thread_key, record.grant_epoch)
+                            if (
+                                previous_handle is not None
+                                and previous_watch is not None
+                                and json.loads(previous_watch)["event_id"] == event_id
+                            ):
+                                await self._markers.forget_watched_turn(
+                                    previous_handle.claim_name, previous_watch
+                                )
+                except memory.ReclaimPreflightUnsafe:
+                    handoff_refusals += 1
+                    attempt -= 1
+                    await asyncio.sleep(
+                        min(self._backoff(handoff_refusals), max(0.0, lease.remaining_s()))
+                    )
+                    continue
+                reclaim_preflight_pending = False
+            if await self._markers.saw_side_effect(event_id):
+                await halt_prior_side_effect()
+                return
             try:
                 outcome = await self._attempt(
                     qevent,
@@ -1325,6 +1389,9 @@ async def _process_event(
                     memory_grant=memory_grant,
                     channel_read_grant=channel_read_grant,
                 )
+            except failures.PriorSideEffectObserved:
+                await halt_prior_side_effect()
+                return
             except failures._WorkItemDeferred:
                 return
             except failures.SweepClaimGone as exc:
@@ -1368,6 +1435,15 @@ async def _process_event(
                         run.finished = True
                 return
             except failures.ThreadBusyError as busy:
+                if isinstance(busy, failures.HandoffPending) and claim._is_fenced(lease):
+                    assert lease is not None
+                    handoff_refusals += 1
+                    attempt -= 1
+                    logger.info("waiting for durable handoff for event %s", event_id)
+                    await asyncio.sleep(
+                        min(self._backoff(handoff_refusals), max(0.0, lease.remaining_s()))
+                    )
+                    continue
                 run = (
                     self._work_item_runs.get(owned_work_item_id)
                     if owned_work_item_id is not None

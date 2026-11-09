@@ -1,5 +1,16 @@
 # apps/dispatcher
 
+The dispatcher image is the deployment shell for gateway-owned Slack intake.
+Its command is `python -m curie_channel_gateway.slack.run`. Admission caching,
+Redis/Valkey construction and heartbeat live in the gateway's `slack/` package;
+shared stream encoding, publication and dedupe live in
+`curie_internal.turn_queue`. The one-shot CLI producer runs
+`python -m curie_channel_gateway.slack.enqueue_once`. `curie_dispatcher` contains
+only deployment metadata. An import-linter independence contract forbids either
+package from importing the other, including indirectly and under `TYPE_CHECKING`.
+The behavior below is implemented by the gateway with the existing storage keys,
+admission ordering and heartbeat timings.
+
 The Slack dispatcher: Slack Bolt for Python in Socket Mode.
 On an `app_mention` (channel) or direct `message` (DM) for the bot it acks the
 Socket Mode envelope fast, posts an in-thread placeholder reply, and enqueues a
@@ -221,10 +232,10 @@ parenthetical is what the Slack adapter maps onto each one:
 | `received_at` | ISO-8601 UTC timestamp the adapter received it |
 
 The worker reconstructs it with `from_stream_fields(fields)`, a module-level
-helper in `curie_dispatcher.queue`. The model lives in the frozen `aci_protocol`
+helper in `curie_internal.turn_queue`. The model lives in the frozen `aci_protocol`
 package (promoted out of the dispatcher in issue #7) so the producer and the
 Rust/TS consumers share one schema-gated contract instead of a hand-mirrored copy;
-the dispatcher's queue module owns only the Stream transport of it. The
+the shared queue module owns only the Stream transport of it. The
 single-`payload`-field encoding keeps the seam explicit and lets fields be added
 without reshaping the Stream schema.
 
@@ -466,7 +477,7 @@ the Console, or operators.
 ## Run it
 
 ```bash
-python -m curie_dispatcher
+python -m curie_channel_gateway.slack.run
 ```
 
 ## Runbook: point it at a real Slack workspace (once one exists)
@@ -482,7 +493,7 @@ python -m curie_dispatcher
 2. Generate an App-Level Token with `connections:write` -> `SLACK_APP_TOKEN`
    (`xapp-...`); copy the Bot User OAuth Token -> `SLACK_BOT_TOKEN` (`xoxb-...`).
 3. Set both env vars (plus `VALKEY_*` for the target Valkey) and run
-   `python -m curie_dispatcher`. @-mention the bot in a channel it is in, or DM
+   `python -m curie_channel_gateway.slack.run`. @-mention the bot in a channel it is in, or DM
    it: you should see the placeholder reply appear and one entry land on the
    Stream (`XLEN curie:runs`). The worker consumes from there.
 
@@ -502,3 +513,48 @@ uv run pytest apps/dispatcher/tests -q
 event-filtering cases; `tests/test_queue.py` covers the seam and dedupe against
 real Valkey; `tests/test_supervisor.py` covers backoff, reconnect, and graceful
 shutdown with a fake connection.
+
+
+## Provider gateway
+
+Run `python -m curie_channel_gateway.slack.read_server` alongside the dispatcher
+for provider reads, group membership, attachment fetches, sender identities and
+worker replies. Only these processes receive Slack credentials. The dispatcher
+retains the chat attester key; the read gateway does not mint approval evidence.
+
+Set distinct `CURIE_CHANNEL_GATEWAY_API_TOKEN` and
+`CURIE_CHANNEL_GATEWAY_WORKER_TOKEN` on the gateway. Each application receives
+its own value as `CURIE_CHANNEL_GATEWAY_TOKEN`, plus `CURIE_CHANNEL_GATEWAY_URL`.
+API credentials authorize channel, canvas and membership operations; worker
+credentials authorize files, sender lookup and replies. Provider identities are
+configured at the gateway; reply origins pass its origin policy. File responses
+are capped at 32 MiB by default on both sides. Helm derives
+the gateway cap from `worker.attachments.maxFileBytes`; standalone gateways use
+`CURIE_CHANNEL_GATEWAY_MAX_FILE_BYTES`.
+
+The listener requires `CURIE_CHANNEL_GATEWAY_TLS_CERT` and
+`CURIE_CHANNEL_GATEWAY_TLS_KEY`. Clients verify the certificate using their
+system trust store, including an operator-supplied `SSL_CERT_FILE`.
+`CURIE_CHANNEL_GATEWAY_ALLOW_INSECURE=true` explicitly permits HTTP on both ends;
+Compose uses that opt-out only for its local development listener.
+
+Existing installations must remove bot, user and app token environment variables
+from API and worker before upgrading, including named identity token variables.
+Both applications refuse those credentials at boot. In Helm, enable
+`channelGateway.deploy` with a trusted `channelGateway.tlsSecret`, or explicitly
+opt out of TLS with `channelGateway.allowInsecure`. Set `channelGateway.url` to
+use an external gateway. The gateway is opt-in because the chart cannot choose
+or trust an operator's server certificate. Until configured, provider-dependent
+operations fail closed; authorization never borrows a different identity or
+widens group membership when a gateway answer is missing.
+
+Gateway requests carry a signed timestamp and nonce as well as the caller
+credential. The replay ledger consumes each nonce once, survives restart and
+rejects stale or altered requests. Set `CURIE_CHANNEL_GATEWAY_REPLAY_DB` to a
+persistent SQLite file; Helm and Compose mount a dedicated volume. The chart
+uses one gateway replica with Recreate so the SQLite volume has one owner.
+
+Reply delivery uses the shared durable delivery claims as well as request replay
+protection. A retry of identical bytes at the same identity and provider route
+returns its confirmed result. An unconfirmed claim refuses after restart.
+Distinct posts with identical content require distinct delivery IDs.

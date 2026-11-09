@@ -35,7 +35,7 @@ from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 REPO = "acme-corp/acme-bot"
 OTHER_REPO = "attacker/other-bot"
-WORKER_TOKEN = "remote-dev-worker-test-token"
+WORKER_TOKEN = "example-worker-test-token"
 WORKER_HEADERS = {"X-Curie-Worker-Token": WORKER_TOKEN}
 _SELECTION_REFUSAL_VECTORS: list[dict[str, Any]] = json.loads(
     (

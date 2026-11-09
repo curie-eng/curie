@@ -184,7 +184,10 @@ def _route_token() -> str:
     from curie_worker import caller_token
 
     return caller_token.mint_route(
-        str(_VECTOR["seed"]), agent="acme-dev", connector=_CONNECTOR, exp=int(_VECTOR["exp"])
+        base64.b64encode(bytes(range(*_VECTOR["seed_range"]))).decode(),
+        agent="acme-dev",
+        connector=_CONNECTOR,
+        exp=int(_VECTOR["exp"]),
     )
 
 

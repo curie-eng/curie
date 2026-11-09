@@ -405,7 +405,7 @@ def test_email_approver_team_uses_exact_authenticated_mailbox(team_client, liste
 
 @pytest.mark.parametrize("change", ["membership", "route", "policy_added"])
 def test_team_and_explicit_route_are_rechecked_after_external_group_lookup(team_client, change):
-    from curie_api.usergroups import UserGroupMembership
+    from curie_channel_gateway.group_models import UserGroupMembership
 
     client, world = team_client
 

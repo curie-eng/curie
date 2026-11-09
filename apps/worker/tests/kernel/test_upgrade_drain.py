@@ -58,7 +58,7 @@ from aci_protocol import (
     SideEffectFlag,
     TextDelta,
 )
-from curie_dispatcher.queue import to_stream_fields
+from curie_internal.turn_queue import to_stream_fields
 from curie_worker.config import WorkerConfig
 from curie_worker.consumer import Consumer, refuse_unconfigured_reminder
 from curie_worker.consumer_liveness import ConsumerLivenessStore

@@ -23,6 +23,7 @@ from datetime import UTC, datetime
 from typing import Any, cast
 
 from curie_internal.streams import ensure_group
+from curie_internal.valkey import is_failover_error
 from curie_telemetry import operation_span, record_metric
 from opentelemetry.trace import SpanKind, StatusCode
 from redis.exceptions import (
@@ -295,10 +296,11 @@ class StreamConsumer:
                 spec.logger.debug(spec.timeout_msg, exc)
                 await self._sleep_or_stop(spec.backoff_s)
                 continue
-            except RedisConnectionError as exc:
-                # A real connection fault (a Valkey failover, pod-to-pod blip):
-                # transient but worth a WARNING. Back off and retry; redis-py
-                # reconnects on the next attempt.
+            except (RedisConnectionError, ResponseError) as exc:
+                if not is_failover_error(exc):
+                    raise
+                # The shared client invalidates stale pooled sockets. Keep the
+                # read loop alive while the primary endpoint converges.
                 spec.logger.warning(spec.connection_msg, exc)
                 await self._sleep_or_stop(spec.backoff_s)
                 continue

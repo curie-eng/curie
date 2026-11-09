@@ -412,7 +412,7 @@ PY
 # Round-trip the EXACT rendered string through the REAL dispatcher parser (D4).
 # Re-implementing ThreadedBotAdmission's regexes here and checking the template
 # against our own copy would prove nothing about drift; running the value through
-# curie_dispatcher.config.DispatcherConfig means a change to the model or to the
+# curie_channel_gateway.slack.config.DispatcherConfig means a change to the model or to the
 # NoDecode/_decode_threaded_bot_allowlist env decoding breaks this chart gate.
 # `uv run` must start from the repo root: apps/dispatcher is a workspace member,
 # while this script's own paths are relative to $CHART.
@@ -440,7 +440,7 @@ os.environ["CURIE_APPROVAL_CHAT_ATTESTER_SECRET"] = "example-attester-secret"
 
 from pydantic import ValidationError
 
-from curie_dispatcher.config import DispatcherConfig, ThreadedBotAdmission
+from curie_channel_gateway.slack.config import DispatcherConfig, ThreadedBotAdmission
 
 os.environ[NAME] = rendered
 config = DispatcherConfig()
