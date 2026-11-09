@@ -9,7 +9,7 @@ runner container on the Docker daemon (``CURIE_SANDBOX_SUBSTRATE=docker``).
 Actions (``python3 tools/identity-e2e/identity_compose.py <action> --project P
 --state-dir DIR``):
 
-1. ``build`` builds candidate api, worker and runner images from a source
+1. ``build`` builds candidate api, worker, gateway and runner images from a source
    tarball or directory (``--build-context``) under ``--image-repo-prefix``.
 2. ``up`` writes a compose override into the state directory, brings the
    isolated stack up with ``curie local up --minimal`` (project ``P``, the base
@@ -149,6 +149,7 @@ COMPOSE_SERVICE_LABEL = "com.docker.compose.service"
 CANDIDATES = (
     ("api", "curie-api", "apps/api/Dockerfile"),
     ("worker", "curie-worker", "apps/worker/Dockerfile"),
+    ("gateway", "curie-dispatcher", "apps/dispatcher/Dockerfile"),
     ("runner", "curie-runner", "runner/Dockerfile"),
 )
 # Shell variables the child CLI and compose must not inherit: model
@@ -229,6 +230,10 @@ class Ports:
         return self.base + 7
 
     @property
+    def gateway(self) -> int:
+        return self.base + 8
+
+    @property
     def extra_start(self) -> int:
         return self.base + 20
 
@@ -251,6 +256,7 @@ class Images:
 
     api: str
     worker: str
+    gateway: str
     runner: str
     ui: str
     worker_local: str
@@ -259,6 +265,7 @@ class Images:
         return {
             "api": self.api,
             "worker": self.worker,
+            "gateway": self.gateway,
             "runner": self.runner,
             "ui": self.ui,
             "worker_local": self.worker_local,
@@ -306,6 +313,7 @@ def resolve_images(
     prefix: str = DEFAULT_IMAGE_PREFIX,
     api_repo: str | None = None,
     worker_repo: str | None = None,
+    gateway_repo: str | None = None,
     runner_repo: str | None = None,
     ui_repo: str | None = None,
 ) -> Images:
@@ -321,6 +329,7 @@ def resolve_images(
     return Images(
         api=ref(api_repo, "curie-api"),
         worker=ref(worker_repo, "curie-worker"),
+        gateway=ref(gateway_repo, "curie-dispatcher"),
         runner=ref(runner_repo, "curie-runner"),
         ui=ref(ui_repo, "curie-ui"),
         worker_local=check_image(f"{check_project(project)}/curie-worker-local:{tag}"),
@@ -363,6 +372,7 @@ def isolation_env(
         "S3_ENDPOINT_URL": f"http://127.0.0.1:{ports.s3}",
         "CURIE_DOCKER_NETWORK": runner_network(project),
         "CURIE_LOCAL_STUB_PORT": str(ports.stub),
+        "CURIE_LOCAL_GATEWAY_PORT": str(ports.gateway),
         "CURIE_LOCAL_POSTGRES_HOST": "127.0.0.1",
         "CURIE_LOCAL_POSTGRES_PORT": str(ports.postgres),
         "CURIE_LOCAL_IMAGE_TAG": image_tag,
@@ -428,6 +438,7 @@ def worker_environment(ports: Ports, project: str, runner_image: str) -> dict[st
         "VALKEY_PORT": str(ports.valkey),
         "S3_ENDPOINT_URL": f"http://127.0.0.1:{ports.s3}",
         "CURIE_API_URL": ports.api_url,
+        "CURIE_CHANNEL_GATEWAY_URL": f"http://127.0.0.1:{ports.gateway}",
         "SLACK_API_BASE_URL": f"http://127.0.0.1:{ports.stub}/api/",
         "CURIE_DOCKER_NETWORK": runner_network(project),
         "CURIE_RUNNER_IMAGE": compose_escape(runner_image),
@@ -484,6 +495,13 @@ def override_document(
     service("curie-migrate")["image"] = compose_escape(images.api)
     service(API_SERVICE)["image"] = compose_escape(images.api)
     service("curie-ui")["image"] = compose_escape(images.ui)
+    service("curie-gateway-replay-perms")["image"] = compose_escape(images.gateway)
+    gateway = service("curie-channel-gateway")
+    gateway["image"] = compose_escape(images.gateway)
+    gateway["environment"] = {
+        "CURIE_CHANNEL_GATEWAY_PORT": str(ports.gateway),
+        "SLACK_API_BASE_URL": f"http://127.0.0.1:{ports.stub}/api/",
+    }
     worker = service(WORKER_SERVICE)
     worker["build"] = Tagged(
         "!override",
@@ -1100,13 +1118,18 @@ class ComposeHarness:
     # build ------------------------------------------------------------------------
 
     def build(self, context: Path, images: Images) -> list[str]:
-        """Build candidate api, worker and runner images from ``context``.
+        """Build candidate api, worker, gateway and runner images from ``context``.
 
         ``context`` is a tarball (``git archive``) or a source directory, which
         is tarred without VCS data, build outputs or credential files.
         """
 
-        refs = {"api": images.api, "worker": images.worker, "runner": images.runner}
+        refs = {
+            "api": images.api,
+            "worker": images.worker,
+            "gateway": images.gateway,
+            "runner": images.runner,
+        }
         for ref in refs.values():
             if ref.startswith(PUBLISHED_PREFIX):
                 raise HarnessError(
@@ -1896,6 +1919,7 @@ def _images(args: argparse.Namespace) -> Images:
         prefix=args.image_repo_prefix,
         api_repo=args.api_repo,
         worker_repo=args.worker_repo,
+        gateway_repo=args.gateway_repo,
         runner_repo=args.runner_repo,
         ui_repo=args.ui_repo,
     )
@@ -1923,12 +1947,14 @@ def build_parser() -> argparse.ArgumentParser:
         default=DEFAULT_IMAGE_PREFIX,
         help="registry/namespace for curie-api, curie-worker, curie-runner and curie-ui",
     )
-    for component in ("api", "worker", "runner", "ui"):
+    for component in ("api", "worker", "gateway", "runner", "ui"):
         images.add_argument(f"--{component}-repo", help=f"override the {component} repository")
     actions = parser.add_subparsers(dest="action", required=True)
 
     build = actions.add_parser(
-        "build", parents=[common, images], help="build candidate api, worker and runner images"
+        "build",
+        parents=[common, images],
+        help="build candidate api, worker, gateway and runner images",
     )
     build.add_argument("--build-context", required=True, type=Path)
 
@@ -1944,7 +1970,7 @@ def build_parser() -> argparse.ArgumentParser:
     up.add_argument(
         "--build-context",
         type=Path,
-        help="build the api, worker and runner images from this tarball or directory first",
+        help="build api, worker, gateway and runner images from this tarball or directory first",
     )
 
     send = actions.add_parser("send", parents=[common], help="post one signed email turn")

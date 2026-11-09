@@ -124,6 +124,7 @@ def test_worker_environment_rebinds_what_the_cli_validates(tmp_path: Path) -> No
         "VALKEY_PORT": env["VALKEY_PORT"],
         "S3_ENDPOINT_URL": env["S3_ENDPOINT_URL"],
         "CURIE_API_URL": env["CURIE_API_URL"],
+        "CURIE_CHANNEL_GATEWAY_URL": f":{env['CURIE_LOCAL_GATEWAY_PORT']}",
         "CURIE_DOCKER_NETWORK": env["CURIE_DOCKER_NETWORK"],
         "SLACK_API_BASE_URL": f":{env['CURIE_LOCAL_STUB_PORT']}",
     }
@@ -237,6 +238,7 @@ def test_worker_overlay_refuses_a_dockerfile_it_does_not_recognise() -> None:
 def test_resolve_images_names_candidates_and_the_overlay_under_the_project() -> None:
     images = compose.resolve_images(project=PROJECT, tag="cand1", prefix="example-cand/")
     assert images.api == "example-cand/curie-api:cand1"
+    assert images.gateway == "example-cand/curie-dispatcher:cand1"
     assert images.runner == "example-cand/curie-runner:cand1"
     assert images.worker_local == f"{PROJECT}/curie-worker-local:cand1"
     pinned = compose.resolve_images(project=PROJECT, tag="latest", api_repo="other/api")
