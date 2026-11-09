@@ -135,8 +135,24 @@ class AsyncRedis(aioredis.Redis):
         self._retry_reads = retry_reads
 
     @classmethod
-    def from_url(cls, url: str, *, retry_reads: bool = True, **kwargs: Any) -> Self:
-        client = cast(Self, super().from_url(url, **kwargs))
+    def from_url(
+        cls,
+        url: str,
+        single_connection_client: bool = False,
+        auto_close_connection_pool: bool | None = None,
+        *,
+        retry_reads: bool = True,
+        **kwargs: Any,
+    ) -> Self:
+        client = cast(
+            Self,
+            super().from_url(
+                url,
+                single_connection_client=single_connection_client,
+                auto_close_connection_pool=auto_close_connection_pool,
+                **kwargs,
+            ),
+        )
         client._retry_reads = retry_reads
         return client
 
