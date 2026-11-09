@@ -98,6 +98,7 @@ def test_the_declared_capabilities_follow_decisions_14_and_19() -> None:
     assert dict(code_host.capabilities) == {
         **dict.fromkeys(CODE_HOST_OPERATIONS, Support.SUPPORTED),
         Operation.REQUIRED_CHECKS: Support.UNSUPPORTED,
+        Operation.ACCOUNT_LOGIN: Support.UNSUPPORTED,
         # UI evidence hosting is GitHub only.
         Operation.STORE_EVIDENCE: Support.UNSUPPORTED,
         Operation.DELETE_EVIDENCE: Support.UNSUPPORTED,

@@ -59,8 +59,9 @@ def test_candidate_does_not_rewrite_released_windows() -> None:
     # @spec CONNECTOR-REQUESTER-1: agent ORM reads require the 0151 requester columns.
     # Approval ORM reads require the 0153 dynamic approval selection columns,
     # and dynamic approval answers require the 0156 answer gate. The factory
-    # Slack progress loop reads the 0157 tables.
-    candidate = {"schema_min": "0157", "schema_head": "0157"}
+    # Slack progress loop reads the 0157 tables, and the code host link route
+    # writes the github_host kind 0158 allows.
+    candidate = {"schema_min": "0158", "schema_head": "0158"}
     assert catalog["windows"]["0.12.0"] == released
     assert catalog["windows"]["0.12.0-rc.1"] == released
     assert catalog["windows"]["0.12.1"] == stable
@@ -68,7 +69,7 @@ def test_candidate_does_not_rewrite_released_windows() -> None:
     assert catalog["windows"]["0.12.3"] == {"schema_min": "0076", "schema_head": "0093"}
     assert catalog["candidate"] == candidate
     assert catalog["windows"]["0.13.0"] == released_0130
-    assert catalog["revisions"][-39:] == [
+    assert catalog["revisions"][-40:] == [
         "0095",
         "0096",
         "0097",
@@ -108,6 +109,7 @@ def test_candidate_does_not_rewrite_released_windows() -> None:
         "0154",
         "0156",
         "0157",
+        "0158",
     ]
     assert "0074" not in catalog["revisions"]
     prior_windows = json.loads(
