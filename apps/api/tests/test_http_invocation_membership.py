@@ -95,7 +95,7 @@ def synthetic_provider(tmp_path: Path) -> Iterator[SimpleNamespace]:
     stop, ready = threading.Event(), threading.Event()
     provider = SimpleNamespace(
         member=True, requests=[], responses=[], errors=[], during_lookup=None, unavailable=False,
-        unavailable_purpose=None, result_case=None,
+        unavailable_purpose=None, result_case=None, timeout=False,
     )
 
     async def serve() -> None:
@@ -111,6 +111,9 @@ def synthetic_provider(tmp_path: Path) -> Iterator[SimpleNamespace]:
                 request = json.loads(raw)
                 if provider.unavailable or provider.unavailable_purpose == request["purpose"]:
                     provider.requests.append(request)
+                    if provider.timeout:
+                        await _reader.read()
+                        return
                     writer.write(harness.wire(b"", status=b"503 Service Unavailable"))
                     await writer.drain()
                     return
@@ -814,6 +817,40 @@ def test_unavailable_directory_only_blocks_group_restricted_invocation(
                     decision="unavailable", reason="authority_unavailable",
                 )
                 assert provider.requests
+    finally:
+        keys = _keys(valkey, scope["binding"])
+        if keys:
+            valkey.delete(*keys)
+
+
+@pytest.mark.parametrize("callers_group", [False, True], ids=["open", "group"])
+def test_directory_timeout_preserves_open_admission_and_group_recovery(
+    clean_db: None, valkey: redis.Redis, runs_stream: str,
+    synthetic_provider: SimpleNamespace, callers_group: bool,
+) -> None:
+    provider = synthetic_provider
+    scope = _scope(provider.url, group_role="invocation" if callers_group else "approver")
+    provider.unavailable = provider.timeout = True
+    try:
+        with TestClient(create_app(
+            http_identity_runtime=_runtime(_runtime_api(), scope),
+            http_identity_client=HttpIdentityClient(tls_context=provider.tls),
+        )) as client:
+            token = _credential(client, scope)
+            result = _post(client, token, *_submission(scope))
+            assert result.status_code == (503 if callers_group else 200), result.text
+            assert len(provider.requests) >= 2
+            entries = valkey.xrange(runs_stream)
+            assert len(entries) == (0 if callers_group else 1)
+            if not callers_group:
+                queued = QueuedTurn.model_validate_json(entries[0][1]["payload"])
+                assert queued.author_principal is None
+            provider.unavailable = False
+            recovered = _post(client, token, *_submission(scope))
+            assert recovered.status_code == 200, recovered.text
+            entries = valkey.xrange(runs_stream)
+            assert len(entries) == (1 if callers_group else 2)
+            assert QueuedTurn.model_validate_json(entries[-1][1]["payload"]).author_principal
     finally:
         keys = _keys(valkey, scope["binding"])
         if keys:

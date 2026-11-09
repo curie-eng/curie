@@ -1134,6 +1134,7 @@ _COMPOSITION_ATTEMPTS = 3
 # enqueue after it. Authority is never yielded after the caller gave up.
 _COMPOSITION_MARGIN_SECONDS = 1.0
 _COMPOSITION_BUDGET_SECONDS = IDENTITY_CALLER_WAIT_SECONDS - _COMPOSITION_MARGIN_SECONDS
+_UNAVAILABLE_SETTLEMENT_SECONDS = 1.0
 
 
 @asynccontextmanager
@@ -1164,9 +1165,15 @@ async def current_source_authority(
                         _unavailable()
                     credential = resolved
                 lookup = lookup_request(registration, captured, credential, purpose="invocation")
+                allows_unavailable = captured.allows_unavailable_identity and (
+                    original is None or original.canonical is None
+                )
+                lookup_deadline = (
+                    deadline - _UNAVAILABLE_SETTLEMENT_SECONDS if allows_unavailable else deadline
+                )
                 observed = await client.lookup(
                     target=credential.target, bearer=credential.bearer, request=lookup,
-                    limits=credential.limits, deadline=deadline,
+                    limits=credential.limits, deadline=lookup_deadline,
                 )
                 observation: HttpIdentityObservation | None
                 if isinstance(observed, HttpIdentityObservation):
@@ -1177,9 +1184,7 @@ async def current_source_authority(
                 ):
                     if _attempt + 1 < _COMPOSITION_ATTEMPTS:
                         continue
-                    if not captured.allows_unavailable_identity or (
-                        original is not None and original.canonical is not None
-                    ):
+                    if not allows_unavailable:
                         _unavailable()
                     observation = None
                 else:
