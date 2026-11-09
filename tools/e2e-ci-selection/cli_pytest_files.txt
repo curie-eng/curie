@@ -176,3 +176,4 @@ tools/p0-closes-ci/tests/test_p0_closes_ci.py
 tools/preflight/tests/test_full_preflight.py
 tools/preflight/tests/test_preflight.py
 tools/runtime-assertion-gate/tests/test_runtime_assertion_gate.py
+tools/test-env/test_webhook_wake_connector.py

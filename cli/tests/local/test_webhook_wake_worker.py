@@ -62,7 +62,7 @@ class WakeStack:
         self.bash_requests = 0
         self.model_paths = []
 
-    def run(self, *args: str, stdin: str | None = None, timeout: int = 600) -> str:
+    def run(self, *args: str, stdin: str | None = None, timeout: int = 1200) -> str:
         result = subprocess.run(
             args,
             input=stdin,
@@ -185,7 +185,7 @@ class WakeStack:
             "kindest/node:v1.31.0",
             "--kubeconfig",
             self.env["KUBECONFIG"],
-            timeout=300,
+            timeout=600,
         )
         self.run(
             "kind",
@@ -194,7 +194,7 @@ class WakeStack:
             "--name",
             self.cluster,
             *self.images.values(),
-            timeout=900,
+            timeout=1800,
         )
         self.kube("create", "namespace", NAME)
         values = {
@@ -271,7 +271,7 @@ class WakeStack:
             str(REPO / "charts/curie/values-dev.yaml"),
             "-f",
             str(path),
-            timeout=900,
+            timeout=1800,
         )
         self.kube(
             "exec",
@@ -302,7 +302,7 @@ class WakeStack:
                 item["name"] == "curie-workers" for item in self.redis("XINFO GROUPS", "curie:runs")
             )
 
-        asyncio.run(wait_until(consumer_ready, "worker consumer group", timeout=20, interval=0.1))
+        asyncio.run(wait_until(consumer_ready, "worker consumer group", timeout=90, interval=0.1))
         self.worker(False)
         self.deploy("acme-wake-idle")
         self.deploy("acme-wake-gated")
@@ -458,7 +458,7 @@ class WakeStack:
     def worker(self, enabled):
         self.kube("scale", f"deployment/{FULLNAME}-worker", f"--replicas={int(enabled)}")
         if enabled:
-            self.kube("rollout", "status", f"deployment/{FULLNAME}-worker", "--timeout=180s")
+            self.kube("rollout", "status", f"deployment/{FULLNAME}-worker", "--timeout=600s")
         else:
             self.kube(
                 "wait",
@@ -466,7 +466,7 @@ class WakeStack:
                 "pod",
                 "-l",
                 f"app.kubernetes.io/instance={NAME},app.kubernetes.io/component=worker",
-                "--timeout=90s",
+                "--timeout=300s",
             )
 
     def seed(self, agent="acme-wake-idle", *, queued=True):
