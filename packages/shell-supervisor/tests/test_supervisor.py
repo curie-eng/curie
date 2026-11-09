@@ -295,7 +295,7 @@ def test_staging_refusals_leave_the_shell_idle(
             "claim-a",
             5,
             env,
-            manifest={"v": 1, "claim": "claim-zzz", "generation": 5, "env": env},
+            manifest={"v": 2, "claim": "claim-zzz", "generation": 5, "env": env},
         ),
         claim_archive("claim-a", 6, {**env, "CURIE_RUNNER_TOKEN": CONTROL_TOKEN}),
     ]
@@ -430,3 +430,28 @@ def test_retirement_cuts_every_open_stream_before_it_answers(
     except (http.client.IncompleteRead, ConnectionError, ssl.SSLError):
         pass
     connection.close()
+
+
+def test_legacy_claim_manifests_are_refused_before_starting_a_runner(
+    supervisor: SupervisorProcess, records: Path
+) -> None:
+    env = _env(records, supervisor)
+    body = claim_archive(
+        "claim-a",
+        1,
+        env,
+        manifest={
+            "v": 1,
+            "claim": "claim-a",
+            "generation": 1,
+            "env": env,
+        },
+    )
+    status, _ = _create(supervisor, "claim-a", 1, body)
+    assert status == 400
+    current = supervisor.shell()
+    assert current["state"] == "idle" and current["claim"] is None
+    assert not (records / "env.json").exists()
+    status, _ = _create(supervisor, "claim-a", 2, claim_archive("claim-a", 2, env))
+    assert status == 201
+    wait_until(lambda: supervisor.shell()["claim"]["ready"], 10, "current manifest starts a runner")

@@ -696,8 +696,10 @@ inventory before it serves. Shells retain only deployment-wide model
 credentials and shared connector trust material.
 
 The supervisor stages runtime configuration and credentials as runner-owned
-`0400` files, launches a fresh environment, and wipes the complete claim tree
-after stopping all claim processes. Bundle code stays root-owned and read only.
+`0400` files, consumes and unlinks the bootstrap environment file before exec,
+and wipes the complete claim tree after stopping all claim processes. Removing
+the bootstrap file preserves the runner's existing caller-token shielding
+from bundle subprocesses. Bundle code stays root-owned and read only.
 A stale retirement targets its exact claim and generation, never another
 agent's later lease. Kubernetes pool selection and Secret delivery are
 unchanged. See [the static substrate reference](../../docs/static-pool-substrate.md)
