@@ -2,26 +2,29 @@
 
 <a id="dark-factory-quickstart"></a>
 
-Try the factory on a laptop. Choose GitHub issues and GitHub PRs, Jira Cloud
-issues and GitHub PRs, or GitLab issues and GitLab merge requests. For an
-organizational installation, use the [administrator guide](factory-admin-guide.md).
+Try the factory on a laptop. This article covers GitHub, GitLab, and Jira Cloud
+issues with their supported PR or merge request hosts. For an organizational
+installation, use the [administrator guide](factory-admin-guide.md).
 
 ```mermaid
 flowchart LR
-    A["Choose tracker and code host"] --> B["Start local factory"]
-    B --> C["Label a small issue"]
-    C --> D["Review PR or merge request"]
+    A["Choose code host"] --> B["Choose issue source"]
+    B --> C["Start local factory"]
+    C --> D["Label issue"]
+    D --> E["Review PR or merge request"]
 ```
 
 ## Choose your tracker and code host
 
-| Issues | Code and result | Local path |
-| --- | --- | --- |
-| GitHub | GitHub PR | [GitHub](#github-issues-and-github-prs) |
-| Jira Cloud | GitHub PR | [Jira and GitHub](#jira-cloud-issues-and-github-prs) |
-| GitLab | GitLab merge request | [GitLab](#gitlab-issues-and-merge-requests) |
-| Jira Cloud | Bitbucket Cloud or Data Center PR | [Bitbucket reference](factory-quickstart-reference.md#run-quickstart-for-bitbucket) |
+Pick where code lives, then where issues live:
 
+| Code and result | Issue source | Setup below |
+| --- | --- | --- |
+| GitHub PR | GitHub issues | [GitHub](#github-issues-and-github-prs) |
+| GitHub PR | Jira Cloud issues | [Jira and GitHub](#jira-cloud-issues-and-github-prs) |
+| GitLab merge request | GitLab issues | [GitLab](#gitlab-issues-and-merge-requests) |
+
+Jira Cloud can also pair with [Bitbucket](factory-quickstart-reference.md#run-quickstart-for-bitbucket).
 Jira Cloud with GitLab has [no supported installation path](../capabilities.md#workspaces-and-integrations).
 
 ## What you need
@@ -30,12 +33,6 @@ Jira Cloud with GitLab has [no supported installation path](../capabilities.md#w
   kubectl, Helm, and a released Curie CLI.
 - An Anthropic or OpenRouter model credential with available credit.
 - A small code repository with an initial commit and a passing baseline.
-
-| Path | Additional setup |
-| --- | --- |
-| GitHub | An account that can create and install a GitHub App on the repository. |
-| Jira and GitHub | GitHub App access, a [Jira factory account and token file](factory-jira-github-quickstart.md#prepare-the-repository-jira-account-and-tools), and an authorized human's Jira `accountId`. |
-| GitLab | Issues enabled; a [token file](factory-gitlab-quickstart.md#prepare-the-project-and-tools) with `api` and `write_repository` scopes from a user with Developer access or higher. |
 
 Use interactive Bash. Keep the same terminal and trial variables through
 cleanup. Each path uses polling, so no webhook or tunnel is needed. See
@@ -87,16 +84,39 @@ read -r -p "Code repository path: " CURIE_REPO
 
 Do not repeat this initialization when retrying a setup command.
 
-## GitHub issues and GitHub PRs
+## Set up the code host
+
+**GitHub PRs:** Use an account that can create and install a GitHub App on the
+repository. The first quickstart command prints a prefilled App link. Create
+the App, generate its private key, and install it on the repository. The second
+command finishes setup with the App ID and key.
+
+**GitLab merge requests:** Enable issues on the project. Save a token from a
+user with Developer access or higher in a file outside the repository. It needs
+`api` and `write_repository` scopes. GitLab does not need a GitHub App. See
+[GitLab setup](factory-gitlab-quickstart.md) for self-managed servers.
+
+## Set up the issue source
+
+| Issues | What to prepare |
+| --- | --- |
+| GitHub | Use the same repository as the PR. An authorized human will add the `curie-factory` label. |
+| Jira Cloud | Prepare a [Jira factory account and token file](factory-jira-github-quickstart.md#prepare-the-repository-jira-account-and-tools) plus an authorized human's Jira `accountId`. |
+| GitLab | Use the same project as the merge request. An authorized human will add the `curie-factory` label. |
+
+## Start the factory
+
+Run **one** of these paths with the repository and cluster variables above.
+
+### GitHub issues and GitHub PRs
 
 ```bash
 curie factory quickstart --repo "$CURIE_REPO" \
   --kind-name "$CURIE_KIND_NAME" --model "$CURIE_MODEL"
 ```
 
-Confirm the printed context equals `$CURIE_CONTEXT`. Open the prefilled
-GitHub App link, create the App, generate its private key, and install it on
-the repository. Then complete setup:
+Confirm the printed context equals `$CURIE_CONTEXT`. Create and install the
+App using the printed link, then complete setup:
 
 ```bash
 read -r -p "GitHub App ID: " CURIE_APP_ID
@@ -106,7 +126,7 @@ curie factory quickstart --repo "$CURIE_REPO" --context "$CURIE_CONTEXT" \
   --private-key-file "$CURIE_APP_KEY_FILE"
 ```
 
-## Jira Cloud issues and GitHub PRs
+### Jira Cloud issues and GitHub PRs
 
 Prepare the Jira factory account, token file, and authorized human
 [as described here](factory-jira-github-quickstart.md#prepare-the-repository-jira-account-and-tools).
@@ -130,9 +150,8 @@ curie factory quickstart --tracker jira-cloud --code-host github \
   --model "$CURIE_MODEL"
 ```
 
-Confirm the printed context equals `$CURIE_CONTEXT`. Create and install
-the GitHub App on the repository. Then enter its ID and key path and finish
-setup with the same Jira values:
+Confirm the printed context equals `$CURIE_CONTEXT`. Create and install the
+App using the printed link. Then enter its ID and key path:
 
 ```bash
 read -r -p "GitHub App ID: " CURIE_APP_ID
@@ -145,7 +164,7 @@ curie factory quickstart --tracker jira-cloud --code-host github \
   --private-key-file "$CURIE_APP_KEY_FILE"
 ```
 
-## GitLab issues and merge requests
+### GitLab issues and merge requests
 
 Save a GitLab token with the required scopes in a file outside the repository.
 Use its web base URL, such as `https://gitlab.com`:
@@ -160,9 +179,7 @@ curie factory quickstart --code-host gitlab --tracker gitlab \
   --model "$CURIE_MODEL"
 ```
 
-Confirm the printed context equals `$CURIE_CONTEXT`. GitLab needs no
-GitHub App. See [GitLab setup](factory-gitlab-quickstart.md) for token and
-self-managed server details.
+Confirm the printed context equals `$CURIE_CONTEXT`.
 
 ## Check the result
 
