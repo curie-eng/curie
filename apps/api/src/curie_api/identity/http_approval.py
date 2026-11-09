@@ -47,9 +47,9 @@ from .http_credential_registry import ResolvedProviderCredential
 from .http_invocation import (
     HttpInvocationRuntime,
     ReceiverRegistrationV1,
-    _current_slack_scope,
     binding_requires_http_identity,
     current_http_approval_caller,
+    current_slack_scope,
     revalidate_http_approval_caller,
     source_facts,
 )
@@ -845,7 +845,7 @@ async def _capture_dm(
     if registration is None or not dm_serves_origin(registration, *origin):
         _refuse(409, APPROVER_DM_RECEIVER_MISSING)
     try:
-        await _current_slack_scope(session, registration, tenant)
+        await current_slack_scope(session, registration, tenant)
     except HTTPException:
         _refuse(409, APPROVER_DM_RECEIVER_MISSING)
     approver = ticket.approvers[0]
@@ -956,7 +956,7 @@ async def _recheck_dm(
     if not dm_serves_origin(capture.registration, *capture.origin):
         _refuse(503, "authority_unavailable")
     try:
-        await _current_slack_scope(writer, capture.registration, capture.tenant_id)
+        await current_slack_scope(writer, capture.registration, capture.tenant_id)
     except HTTPException:
         _refuse(503, "authority_unavailable")
     version, reference, issuer, _ = await _provider_configuration(writer, capture.tenant_id)
@@ -1350,7 +1350,7 @@ async def _first_registration(
     ):
         _refuse(409, APPROVAL_CARD_MISMATCH)
     try:
-        await _current_slack_scope(writer, registration, agent.tenant_id)
+        await current_slack_scope(writer, registration, agent.tenant_id)
     except HTTPException:
         _refuse(409, APPROVAL_CARD_MISMATCH)
     return registration
