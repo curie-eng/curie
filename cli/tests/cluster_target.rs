@@ -132,6 +132,22 @@ fn cluster_cases() -> Vec<ClusterCase> {
             args: &["access-policy", "acme-bot", "--dry-run"],
         },
         ClusterCase {
+            name: "identity-authority",
+            args: &["identity-authority", "list", "--dry-run"],
+        },
+        ClusterCase {
+            name: "role-filter",
+            args: &[
+                "role-filter",
+                "list",
+                "--tenant",
+                "00000000-0000-0000-0000-000000000001",
+                "--agent",
+                "00000000-0000-0000-0000-000000000002",
+                "--dry-run",
+            ],
+        },
+        ClusterCase {
             name: "directory",
             args: &[
                 "directory",
@@ -331,7 +347,7 @@ fn coverage_inventory_names_every_cluster_verb() {
     let covered_names: BTreeSet<&str> = cluster_cases().iter().map(|case| case.name).collect();
 
     assert_eq!(covered_names, manifest_names);
-    assert_eq!(covered_names.len(), 38);
+    assert_eq!(covered_names.len(), 40);
 }
 
 #[test]
