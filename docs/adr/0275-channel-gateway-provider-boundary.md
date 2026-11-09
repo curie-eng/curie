@@ -24,6 +24,21 @@ imports from these ports. It is exercised with violating imports as well as the
 valid package. Provider composition lives in
 `curie_channel_gateway.slack.read_server.application`.
 
+Slack intake is fully owned by `curie_channel_gateway.slack`: admission caching,
+Redis/Valkey construction, process heartbeat and the one-shot CLI producer live
+there alongside the handlers. The dispatcher image starts
+`python -m curie_channel_gateway.slack.run`; its Python package retains only
+deployment metadata. The shared stream codec, publication and dedupe transport
+live in `curie_internal.turn_queue`, so worker consumers need no provider import.
+The `QueueConfig` protocol consumes the existing stream, dedupe key and TTL
+settings without importing Slack configuration. Admission rules, cache and queue
+keys, heartbeat timings and Redis/Valkey construction are preserved.
+
+The import-linter independence contract forbids imports in either direction
+between `curie_channel_gateway` and `curie_dispatcher`, including indirect and
+`TYPE_CHECKING` imports. The existing lint and pre-push paths run it. Executable
+controls exercise both directions and a valid shared-package dependency.
+
 The gateway authenticates Slack via signature verification or Socket Mode. It
 mints the chat-attester principal and signs receiver answer proofs over exact
 resolve bytes and that principal. The API verifies those signatures and the

@@ -1,17 +1,25 @@
 # Channel gateway
 
 `curie_channel_gateway` owns provider connections, intake, rendering, clicks,
-egress and provider reads. This extraction is behavior-neutral. Slack intake and connections live in `slack/`;
-mail intake, provider I/O and durable delivery state live in `mail/`. The
-dispatcher retains its Valkey construction, admission cache and queue transport,
-and the standalone mail executable delegates to this package.
+egress and provider reads. Slack intake and connections live in `slack/`,
+including admission caching, Redis/Valkey construction and process heartbeat.
+Mail intake, provider I/O and durable delivery state live in `mail/`.
 
-Slack intentionally imports dispatcher helpers while the dispatcher depends on
-this package: Redis construction, queue publication, admission caching and the
-existing approval client retain their owners until those extractions land.
-This reverse dependency is temporary. Mail must remain independently installable;
-the import-linter contract forbids `curie_channel_gateway.mail` from importing
-`curie_channel_gateway.slack` or `curie_dispatcher`, including indirectly.
+The Slack process starts with `python -m curie_channel_gateway.slack.run`;
+the Slack-free CLI producer uses `curie_channel_gateway.slack.enqueue_once`.
+The dispatcher image installs and runs this package. `curie_dispatcher` retains
+only deployment package metadata and imports no gateway implementation.
+Neither package imports the other, including under `TYPE_CHECKING`; the
+independence contract in `pyproject.toml` rejects direct and indirect imports
+through the existing `uv run lint-imports` lint and pre-push check.
+
+`curie_internal.turn_queue` owns the shared stream codec, producer and dedupe
+transport used by Slack intake and worker consumers. Its `QueueConfig` protocol
+requires only the existing stream, dedupe key and TTL settings. Admission still
+asks the platform API before dedupe, placeholder and enqueue; cache keys,
+queue keys, heartbeat cadence and Redis construction are unchanged. The API
+retains admission authority. Mail remains independently installable; its
+import contract also forbids Slack and dispatcher dependencies.
 
 The boundary proposal is recorded in
 [ADR 0275](../../docs/adr/0275-channel-gateway-provider-boundary.md).
@@ -210,8 +218,8 @@ exactly-once submission cases are included in the argument file.
 The Helm chart automatically deploys the gateway when Slack is configured and
 no gateway URL is supplied. Keep the same values file and Secret objects. The
 chart moves bot-token references from the API and worker to the gateway. Slack
-intake remains in the dispatcher. Separate gateway caller credentials and
-internal TLS are provisioned automatically. Other optional capabilities remain
+intake runs gateway-owned code in the dispatcher image. Separate gateway caller
+credentials and internal TLS are provisioned automatically. Other optional capabilities remain
 subject to their existing configuration switches. See the chart's
 [upgrade and certificate rotation guide](../../charts/curie/README.md#channel-gateway-upgrade).
 

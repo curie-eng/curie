@@ -141,6 +141,11 @@ source_modules = ["curie_channel_gateway.mail"]
 forbidden_modules = ["curie_channel_gateway.slack", "curie_dispatcher"]
 
 [[tool.importlinter.contracts]]
+name = "Channel gateway and dispatcher stay independent"
+type = "independence"
+modules = ["curie_channel_gateway", "curie_dispatcher"]
+
+[[tool.importlinter.contracts]]
 name = "Channel gateway implementations stay independent of API and worker"
 type = "forbidden"
 source_modules = ["curie_channel_gateway"]

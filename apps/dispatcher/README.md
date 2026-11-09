@@ -1,5 +1,16 @@
 # apps/dispatcher
 
+The dispatcher image is the deployment shell for gateway-owned Slack intake.
+Its command is `python -m curie_channel_gateway.slack.run`. Admission caching,
+Redis/Valkey construction and heartbeat live in the gateway's `slack/` package;
+shared stream encoding, publication and dedupe live in
+`curie_internal.turn_queue`. The one-shot CLI producer runs
+`python -m curie_channel_gateway.slack.enqueue_once`. `curie_dispatcher` contains
+only deployment metadata. An import-linter independence contract forbids either
+package from importing the other, including indirectly and under `TYPE_CHECKING`.
+The behavior below is implemented by the gateway with the existing storage keys,
+admission ordering and heartbeat timings.
+
 The Slack dispatcher: Slack Bolt for Python in Socket Mode.
 On an `app_mention` (channel) or direct `message` (DM) for the bot it acks the
 Socket Mode envelope fast, posts an in-thread placeholder reply, and enqueues a
@@ -221,10 +232,10 @@ parenthetical is what the Slack adapter maps onto each one:
 | `received_at` | ISO-8601 UTC timestamp the adapter received it |
 
 The worker reconstructs it with `from_stream_fields(fields)`, a module-level
-helper in `curie_dispatcher.queue`. The model lives in the frozen `aci_protocol`
+helper in `curie_internal.turn_queue`. The model lives in the frozen `aci_protocol`
 package (promoted out of the dispatcher in issue #7) so the producer and the
 Rust/TS consumers share one schema-gated contract instead of a hand-mirrored copy;
-the dispatcher's queue module owns only the Stream transport of it. The
+the shared queue module owns only the Stream transport of it. The
 single-`payload`-field encoding keeps the seam explicit and lets fields be added
 without reshaping the Stream schema.
 
@@ -465,7 +476,7 @@ the Console, or operators.
 ## Run it
 
 ```bash
-python -m curie_dispatcher
+python -m curie_channel_gateway.slack.run
 ```
 
 ## Runbook: point it at a real Slack workspace (once one exists)
@@ -481,7 +492,7 @@ python -m curie_dispatcher
 2. Generate an App-Level Token with `connections:write` -> `SLACK_APP_TOKEN`
    (`xapp-...`); copy the Bot User OAuth Token -> `SLACK_BOT_TOKEN` (`xoxb-...`).
 3. Set both env vars (plus `VALKEY_*` for the target Valkey) and run
-   `python -m curie_dispatcher`. @-mention the bot in a channel it is in, or DM
+   `python -m curie_channel_gateway.slack.run`. @-mention the bot in a channel it is in, or DM
    it: you should see the placeholder reply appear and one entry land on the
    Stream (`XLEN curie:runs`). The worker consumes from there.
 

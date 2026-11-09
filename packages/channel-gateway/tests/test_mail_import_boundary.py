@@ -1,4 +1,4 @@
-"""Mail remains independently installable while Slack retains dispatcher helpers."""
+"""Mail remains independently installable without Slack intake."""
 
 import json
 import os
