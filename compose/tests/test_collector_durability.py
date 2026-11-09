@@ -58,7 +58,23 @@ def test_compose_collector_limits_and_persists_every_enabled_signal() -> None:
     noise = config["processors"]["filter/langfuse_platform_noise"]
     assert noise["error_mode"] == "ignore"
     assert noise["traces"]["span"] == [
-        'name == "http.server.request"',
+        (
+            'name == "http.server.request" and '
+            'attributes["service.name"] == "curie-api" and '
+            'attributes["source"] == "GET" and '
+            '(attributes["operation"] == "/health" or '
+            'attributes["operation"] == "/ready" or '
+            'attributes["operation"] == "/agents" or '
+            'attributes["operation"] == "/agents/{agent_id}" or '
+            'attributes["operation"] == "/approvals" or '
+            'attributes["operation"] == "/approvals/{approval_id}" or '
+            'attributes["operation"] == "/approvals/{approval_id}/audit" or '
+            'attributes["operation"] == "/langfuse/traces" or '
+            'attributes["operation"] == "/langfuse/traces/{trace_id}" or '
+            'attributes["operation"] == "/observability/metrics/summary" or '
+            'attributes["operation"] == "/observability/metrics/series" or '
+            'attributes["operation"] == "/observability/runners")'
+        ),
         'IsMatch(name, "^curie\\\\.background\\\\.")',
         'name == "curie.sandbox.cleanup"',
     ]

@@ -364,8 +364,16 @@ The chart always renders `traces/langfuse`. It receives OTLP, runs
 `memory_limiter`, any selected extra processors, the built-in
 `filter/langfuse_platform_noise`, and `batch`, and exports only to
 `otlphttp/langfuse`. The filter uses `error_mode: ignore` and drops spans
-named `http.server.request`, spans whose names match `^curie\.background\.`,
-and spans named `curie.sandbox.cleanup`. Agent run spans stay.
+named `curie.sandbox.cleanup` and spans whose names start with `curie.background.`.
+It drops `http.server.request` only when `service.name` is `curie-api`, `source`
+is `GET`, and `operation` is one of: `/health`, `/ready`, `/agents`,
+`/agents/{agent_id}`, `/approvals`, `/approvals/{approval_id}`,
+`/approvals/{approval_id}/audit`, `/langfuse/traces`, `/langfuse/traces/{trace_id}`,
+`/observability/metrics/summary`, `/observability/metrics/series`, or
+`/observability/runners`. These probe and polling handlers read state without
+emitting child spans. The API middleware sets the route template in `operation`
+and the method in `source`. Unknown routes, missing attributes, other services,
+and write requests stay, preserving HTTP parents of ingress, approvals, and webhooks.
 
 A second pipeline named `traces` renders only when `debugExporter.enabled` is
 true or `extraPipelineExporters` is non-empty. It runs `memory_limiter`, the
