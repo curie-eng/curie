@@ -1135,9 +1135,28 @@ def test_commissioning_crash_case_is_required_without_a_shard_budget(
     result, argv = _record_uv_step(tmp_path, step, environment={}, exit_code=exit_code)
     assert result.returncode == exit_code
     assert argv == [
-        "run", "pytest", "-q", "-n", "0", "--durations=25",
+        "run", "python", "-m", "pytest", "-q", "-n", "0", "--durations=25",
         "cli/tests/local/test_commissioning_claim_execution.py",
     ]
+
+
+def test_commissioning_crash_step_collects_without_pythonpath() -> None:
+    step = _named_steps(CONTAINER_JOB)["Protected commissioning crash recovery"]
+    environment = os.environ.copy()
+    environment.pop("PYTHONPATH", None)
+    result = subprocess.run(
+        [*shlex.split(_string(step, "run")), "--collect-only"],
+        cwd=REPO_ROOT,
+        env=environment,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert (
+        "cli/tests/local/test_commissioning_claim_execution.py::"
+        "test_a_hard_killed_executor_is_not_replayed_by_a_fresh_os_process"
+    ) in result.stdout
 
 
 def test_dry_run_job_matches_container_setup_and_runs_only_its_file() -> None:

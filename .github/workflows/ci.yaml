@@ -622,7 +622,7 @@ jobs:
           uv run pytest -q -n 2 --dist loadgroup --reruns 1 -rsR --durations=25 "${selected_files[@]}"
 
       - name: Protected commissioning crash recovery
-        run: uv run pytest -q -n 0 --durations=25 cli/tests/local/test_commissioning_claim_execution.py
+        run: uv run python -m pytest -q -n 0 --durations=25 cli/tests/local/test_commissioning_claim_execution.py
 
   python-dry-run-fixture:
     name: Python dry run fixture (pytest)
