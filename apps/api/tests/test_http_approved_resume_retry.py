@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import time
 import uuid
 from collections.abc import Callable
@@ -12,6 +13,7 @@ from typing import Any
 
 import pytest
 import redis
+from _migration_support import sql_dicts, sql_rows
 from aci_protocol import QueuedTurn
 from approval_answer_support import (
     NATIVE_A,
@@ -28,10 +30,19 @@ from approval_answer_support import (
 )
 from approval_answer_support import selection_case as selection_case
 from approval_answer_support import synthetic_provider as synthetic_provider
-from approver_ticket_support import APPROVER_A, APPROVER_B
-from curie_api import resumereconciler
+from approver_ticket_support import (
+    APPROVER_A,
+    APPROVER_B,
+    APPROVER_GROUP,
+    CEILING_FILTER,
+    add_team,
+    join_team,
+    set_idp_managed_by,
+)
+from curie_api import identity_fence, principal_authority, resumereconciler
 from curie_api.config import get_settings
 from curie_api.identity import http_approval_answer as answers
+from curie_api.identity.http_transport import HttpIdentityObservation
 from curie_api.models import ApprovalStatus
 from curie_api.resumereconciler import ResumeReconciler
 from curie_worker.config import WorkerConfig
@@ -276,3 +287,171 @@ def one_resume_claim(case: SimpleNamespace, event_id: str) -> list[bool]:
 
     assert case.client.portal is not None
     return list(case.client.portal.call(claim))
+
+
+async def independent_http_status(
+    case: SimpleNamespace, composition: Any, role: str, status: str,
+) -> Any:
+    """Apply a separate real TLS observation, then restore the directory's active answer."""
+    subject = next(item for item in composition.subjects if item.role == role)
+    native = subject.source.sender.native_id
+    previous = case.provider.roster.get(native)
+    facts = answers.source_facts(subject.response_bytes, subject.lookup, subject.credential)
+    assert facts.identity is not None
+    case.provider.roster[native] = person(facts.identity.subject, status=status)
+    try:
+        capture = await principal_authority.capture_http_authority(
+            composition.factory, tenant_id=uuid.UUID(subject.registration.tenant_id),
+        )
+        lookup = subject.lookup.model_copy(update={"request_id": str(uuid.uuid4())})
+        observation = await composition.client.lookup(
+            target=subject.credential.target, bearer=subject.credential.bearer,
+            request=lookup, limits=subject.credential.limits,
+        )
+        assert isinstance(observation, HttpIdentityObservation)
+        async with identity_fence.mutation(composition.factory, composition.valkey) as writer:
+            async with writer.begin():
+                application = await principal_authority.apply_http_principal(
+                    writer, capture=capture, request=lookup,
+                    response_bytes=observation.response_bytes,
+                )
+                await writer.commit()
+        assert application.outcome == "inactive"
+        return application
+    finally:
+        if previous is None:
+            case.provider.roster.pop(native, None)
+        else:
+            case.provider.roster[native] = previous
+
+
+REVOCATION_WINDOWS = [
+    (moment, status, role)
+    for moment in ("after_apply", "backoff", "reconciler")
+    for status in ("disabled", "revoked")
+    for role in ("invocation", "approver")
+] + [("none", "active", "approver")]
+
+
+@pytest.mark.parametrize(("moment", "status", "role"), REVOCATION_WINDOWS)
+def test_an_approved_resume_preserves_an_independent_http_revocation(
+    selection_case: SimpleNamespace, monkeypatch: pytest.MonkeyPatch,
+    moment: str, status: str, role: str,
+) -> None:
+    case = selection_case
+    configured(case)
+    row = dynamic(case, (APPROVER_A,))
+    original = answers._Composition.observe_and_apply
+    attempts: list[Any] = []
+    refused: list[str] = []
+    backoffs: list[float] = []
+    recorded: list[Any] = []
+
+    async def observe(composition: Any) -> None:
+        approved = composition.row.status == ApprovalStatus.approved
+        if approved:
+            attempts.append(composition)
+        try:
+            await original(composition)
+        except principal_authority.PrincipalAuthorityRefusal as error:
+            refused.append(error.code)
+            raise
+        if not approved:
+            return
+        if moment == "after_apply" and len(attempts) == 1:
+            recorded.append(await independent_http_status(case, composition, role, status))
+        elif moment in {"backoff", "reconciler"} and len(attempts) <= (
+            3 if moment == "reconciler" else 1
+        ):
+            concurrent = await asyncio.to_thread(post_check, case.client, request_for(case))
+            assert concurrent.status_code == 200, concurrent.text
+            assert concurrent.json()["decision"] == "continue", concurrent.text
+
+    async def backoff(delay: float) -> None:
+        backoffs.append(delay)
+        if moment == "backoff" and len(backoffs) == 1:
+            recorded.append(await independent_http_status(case, attempts[-1], role, status))
+
+    monkeypatch.setattr(answers._Composition, "observe_and_apply", observe)
+    monkeypatch.setattr(answers, "asyncio", SimpleNamespace(
+        TaskGroup=asyncio.TaskGroup, sleep=backoff,
+    ))
+    response = answer_as(case, row, NATIVE_A)
+    assert response.status_code == 200, response.text
+    if moment == "none":
+        assert len(attempts) == 1
+        assert backoffs == [] and refused == []
+        assert approval_row(row["id"])["resumed_at"] is not None
+        entry = published(case, row["id"])
+        assert turn_check(case, entry, row["id"]) == ("continue", "current_authority")
+        return
+    if moment == "reconciler":
+        assert len(attempts) == 3
+        no_wake(case, row["id"])
+        assert reconcile(case) == 0
+        assert case.client.portal is not None
+        recorded.append(case.client.portal.call(
+            independent_http_status, case, attempts[-1], role, status,
+        ))
+        monkeypatch.setattr(resumereconciler, "datetime", SimpleNamespace(
+            now=lambda *_: datetime.now(UTC) + timedelta(seconds=GRACE_SECONDS + 1),
+        ))
+        assert reconcile(case) == 0
+    no_wake(case, row["id"])
+    assert approval_row(row["id"])["resumed_at"] is None
+    assert refused == ["principal_inactive"]
+    assert len(attempts) == (4 if moment == "reconciler" else 2)
+    assert backoffs == ([0.05, 0.1] if moment == "reconciler" else [0.05])
+    assert len(recorded) == 1
+    principal = sql_dicts(
+        "SELECT status, authorization_version FROM curie.principals WHERE id = :id",
+        {"id": recorded[0].principal_id},
+    )[0]
+    assert (principal["status"], principal["authorization_version"]) == (
+        status, recorded[0].authorization_version,
+    )
+    assert resume_refusals(row["id"])[-1]["evidence"]["stage"] == "observe"
+
+
+@pytest.mark.parametrize("cause", ["approver_fingerprint", "route"])
+def test_a_real_change_with_a_lifecycle_bump_refuses_without_retry(
+    selection_case: SimpleNamespace, monkeypatch: pytest.MonkeyPatch, cause: str,
+) -> None:
+    case = selection_case
+    if cause == "approver_fingerprint":
+        set_idp_managed_by(case.scope["tenant"], "synthetic-directory")
+        team = add_team(case.scope["tenant"], APPROVER_GROUP, synced=True)
+        join_team(case.scope["tenant"], case.scope["principals"][APPROVER_A], team)
+        sql_rows(
+            "UPDATE curie.agent_access_policies SET approver_team_id = :team, "
+            "role_configuration = jsonb_set(role_configuration, '{approver}', "
+            "CAST(:role AS jsonb)) WHERE agent_id = :agent",
+            {"team": team, "agent": uuid.UUID(case.scope["agent"]), "role": json.dumps({
+                "schema_version": 1, "legacy_state": "retained", "filter": CEILING_FILTER,
+            })},
+        )
+        case.provider.roster[NATIVE_A] = person(APPROVER_A, groups=(APPROVER_GROUP,))
+    configured(case, approvers={"users": [NATIVE_A]})
+    row = dynamic(case, (APPROVER_A,))
+
+    def change() -> None:
+        if cause == "route":
+            configured(case, approvers={"users": [NATIVE_A]}, users=[APPROVER_A])
+        else:
+            sql_rows(
+                "UPDATE curie.teams SET epoch = epoch + 1, digest = :digest, "
+                "last_synced_at = now() WHERE id = :id",
+                {"id": team, "digest": "cd" * 32},
+            )
+
+    attempts = publication_window(case, monkeypatch, conflicts=1, change=change)
+    response = answer_as(case, row, NATIVE_A)
+    assert response.status_code == 200, response.text
+    no_wake(case, row["id"])
+    assert len(attempts) == 1
+    assert approval_row(row["id"])["resumed_at"] is None
+    refusals = resume_refusals(row["id"])
+    assert len(refusals) == 1
+    assert (refusals[0]["reason"], refusals[0]["evidence"]["stage"]) == (
+        "authority_unavailable", "recheck",
+    )

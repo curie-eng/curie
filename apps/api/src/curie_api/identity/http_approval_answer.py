@@ -666,6 +666,7 @@ class _Composition:
     selection_evidence: dict[str, Any] | None = None
     stage: str = "capture"
     dm: DmCard | None = None
+    preserve_inactive: bool = False
 
     async def _observe(self, subject: _Subject) -> _Subject:
         """Phase 2 for one subject. @spec HTTP-APPROVAL-CONTINUITY-9."""
@@ -719,6 +720,19 @@ class _Composition:
                     # Contradictory canonical observations for one sender refuse.
                     if observed.setdefault(key, facts.identity) != facts.identity:
                         _unavailable()
+                    if (
+                        self.preserve_inactive and facts.identity is not None
+                        and facts.identity.account_status == "active"
+                    ):
+                        principal = await writer.scalar(select(Principal).where(
+                            Principal.tenant_id == uuid.UUID(subject.registration.tenant_id),
+                            Principal.idp_issuer == facts.identity.issuer,
+                            Principal.idp_subject == facts.identity.subject,
+                        ).with_for_update().execution_options(populate_existing=True))
+                        if principal is not None and principal.status in {"disabled", "revoked"}:
+                            raise principal_authority.PrincipalAuthorityRefusal(
+                                "principal_inactive",
+                            )
                 lifecycle = self.subjects[0].capture.authority
                 for subject in self.subjects:
                     application = await principal_authority.apply_http_principal(
@@ -750,6 +764,8 @@ class _Composition:
         """
         current_facts: dict[str, ValidatedFacts] = {}
         state = self.request.app.state
+        captures: list[tuple[_Subject, SourceCapture, Any]] = []
+        lifecycle_conflict = False
         for subject in self.subjects:
             current, binding = await _recapture(session, subject, writer=writer)
             if (
@@ -758,8 +774,13 @@ class _Composition:
                 or state.http_identity_client is not self.client
             ):
                 _unavailable()
-            if current.authority.lifecycle_generation != self.final:
-                raise _LifecycleGenerationConflict()
+            lifecycle_conflict |= current.authority.lifecycle_generation != self.final
+            captures.append((subject, current, binding))
+        if await approvals_crud.get_approval_route_binding(session, self.row) != self.route_binding:
+            _unavailable()
+        if lifecycle_conflict:
+            raise _LifecycleGenerationConflict()
+        for subject, current, binding in captures:
             observed = source_facts(subject.response_bytes, subject.lookup, subject.credential)
             await _check_principal(session, subject, observed, self.applications[subject.role])
             source_permission(
@@ -767,8 +788,6 @@ class _Composition:
                 self.associations.get(subject.role), role_name=subject.role,
             )
             current_facts[subject.role] = observed
-        if await approvals_crud.get_approval_route_binding(session, self.row) != self.route_binding:
-            _unavailable()
         await self._judge_selection(session, current_facts)
         return current_facts
 
@@ -1223,7 +1242,7 @@ def approved_resume_authority(state: Any) -> ApprovedResumeAuthority:
 
     @spec HTTP-APPROVAL-CONTINUITY-8/9/11.
     """
-    observe = approved_resume_current(state)
+    observe = approved_resume_current(state, preserve_inactive=True)
 
     @asynccontextmanager
     async def authority(saved: wire.ApprovalContextV1) -> AsyncIterator[CurrentResumeAuthority]:
@@ -1243,7 +1262,9 @@ def approved_resume_authority(state: Any) -> ApprovedResumeAuthority:
     return authority
 
 
-def approved_resume_current(state: Any) -> ApprovedResumeInvokerAuthority:
+def approved_resume_current(
+    state: Any, *, preserve_inactive: bool = False,
+) -> ApprovedResumeInvokerAuthority:
     """The two-subject current check an approved selected resume publishes under.
 
     Fresh original-invoker (purpose=invocation) and preserved answering-actor
@@ -1256,6 +1277,10 @@ def approved_resume_current(state: Any) -> ApprovedResumeInvokerAuthority:
 
     It also yields the invocation role's freshly verified identity, which the
     turn current check projects for an opted-in agent. @spec CONNECTOR-REQUESTER-1.
+
+    Publication sets ``preserve_inactive`` so its own active observation cannot
+    reactivate a stored disabled or revoked principal. Other current checks
+    retain ordinary HTTP observation lifecycle semantics.
 
     It serves approved-resume publication, ``turn-authority/check`` and
     ``approval-grant/check``. On a canonical route the preserved answering
@@ -1315,7 +1340,7 @@ def approved_resume_current(state: Any) -> ApprovedResumeInvokerAuthority:
                 request, runtime, client, factory, valkey, approval_id, snapshot, row,
                 route_binding, state.approver_sets, actor.source.sender.native_id,
                 actor.channel, [caller, approver], {"invocation": saved, "approver": association},
-                saved, preserved=True, dm=dm,
+                saved, preserved=True, dm=dm, preserve_inactive=preserve_inactive,
             )
             # Phases 2 and 3: lookups and route membership outside SQL, then lifecycle.
             await composition.observe_and_apply()
