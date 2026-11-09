@@ -18,7 +18,7 @@ import re
 import socket
 import threading
 import time
-from collections.abc import Iterator, Mapping
+from collections.abc import Callable, Iterator, Mapping
 from contextlib import contextmanager
 from dataclasses import replace
 from datetime import UTC, datetime
@@ -175,6 +175,28 @@ def _resource_map(raw: str) -> dict[str, str] | None:
             return None
         values[key] = value
     return values or None
+
+
+def _transient_read[T](plural: str, name: str, read: Callable[[], T]) -> T:
+    """A typed single-object read with ``_get``'s transient classification.
+
+    The runtime-class and quota reads sit on the same footprint observation
+    path as ``_get`` but call the typed APIs directly (#5406), so they share
+    its classification instead of letting a 5xx or transport fault escape as
+    ``ApiException``/``MaxRetryError`` past the admission-wait handler. A
+    ``MaxRetryError`` is a urllib3 ``HTTPError``, so the transport branch also
+    covers it when its reason is not a timeout. 403/404 stay ``ApiException``.
+    """
+    try:
+        return read()
+    except k8s_client.ApiException as exc:
+        if exc.status in _TRANSIENT_STATUSES:
+            raise KubeTransientError(f"kube API {exc.status} reading {plural}/{name}") from exc
+        raise
+    except Urllib3HTTPError as exc:
+        raise KubeTransientError(
+            f"kube API transport error reading {plural}/{name}: {type(exc).__name__}"
+        ) from exc
 
 
 def _quota_rejection(status: dict[str, Any]) -> QuotaRejection | None:
@@ -848,8 +870,12 @@ class KubernetesSandboxClient:
         runtime_class = pod.get("runtimeClassName")
         if runtime_class and not pod.get("overhead"):
             if runtime_class not in runtime_class_overheads:
-                runtime = self._node_api.read_runtime_class(
-                    runtime_class, _request_timeout=request_timeout_seconds
+                runtime = _transient_read(
+                    "runtimeclasses",
+                    runtime_class,
+                    lambda: self._node_api.read_runtime_class(
+                        runtime_class, _request_timeout=request_timeout_seconds
+                    ),
                 )
                 overhead = getattr(runtime, "overhead", None)
                 runtime_class_overheads[runtime_class] = (
@@ -1026,8 +1052,12 @@ class KubernetesSandboxClient:
     def read_quota(
         self, quota_name: str, *, request_timeout_seconds: float
     ) -> QuotaStatus:
-        quota = self._core_api.read_namespaced_resource_quota(
-            quota_name, self._namespace, _request_timeout=request_timeout_seconds
+        quota = _transient_read(
+            "resourcequotas",
+            quota_name,
+            lambda: self._core_api.read_namespaced_resource_quota(
+                quota_name, self._namespace, _request_timeout=request_timeout_seconds
+            ),
         )
         metadata = cast(k8s_client.V1ObjectMeta, quota.metadata)
         spec = cast(k8s_client.V1ResourceQuotaSpec, quota.spec)
