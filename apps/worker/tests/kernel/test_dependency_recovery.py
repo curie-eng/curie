@@ -1253,3 +1253,98 @@ def test_unverified_http_capacity_expiry_never_emits_workspace_failure(make_harn
             ] == 0
 
     asyncio.run(go())
+
+_DEPENDENCY_NOTICE = "Your request is queued while workspace dependency recovery finishes."
+_ADMISSION_NOTICE = "Your request is queued while sandbox admission is pending."
+
+
+@pytest.mark.parametrize("initial_notice_failed", [False, True])
+def test_dependency_recovery_updates_the_waiting_notice(
+    make_harness, initial_notice_failed
+) -> None:
+    async def go() -> None:
+        deployment = uuid.uuid4()
+        unavailable_until = 0.0
+        outage_active = False
+        failed_reads = 0
+        observed: dict[str, Any] = {}
+
+        async def selection(_request: web.Request) -> web.Response:
+            nonlocal failed_reads
+            if outage_active and (failed_reads < 4 or time.monotonic() < unavailable_until):
+                failed_reads += 1
+                if failed_reads == 2:
+                    observed["updates"] = list(h.sink.text_posts + h.sink.updates)
+                    observed["record"] = await consumer._waits.get(event.event_id)
+                return web.Response(status=503)
+            return web.json_response({"repo_full_name": None})
+
+        app = web.Application()
+        app.router.add_post(f"/v1/internal/workspaces/{deployment}/selection", selection)
+        async with TestServer(app) as server:
+            credentials = WorkspaceCredentialClient(
+                api_url=str(server.make_url("")),
+                worker_token="example-worker-token",
+            )
+            async with make_harness(
+                binding=_workspace_binding(deployment),
+                slack_no_edit_streaming=True,
+                claim_timeout_seconds=0.02,
+                max_attempts=1,
+                workspace_total_timeout_seconds=1,
+            ) as h:
+                h.kernel._workspace = WorkspaceClaimCoordinator(
+                    preparer=SimpleNamespace(credentials=credentials),
+                    substrate=h.substrate,
+                )
+                consumer = _capacity_consumer(h)
+                await consumer.ensure_group()
+                event = _qevent(
+                    "original",
+                    event_id="dependency-notice",
+                    placeholder=None if initial_notice_failed else "p-1",
+                )
+                if initial_notice_failed:
+                    h.sink.fail_events.add("reply.update")
+                await _park(h, consumer, event)
+                original = await consumer._waits.get(event.event_id)
+                assert original is not None
+                if initial_notice_failed:
+                    assert not h.sink.text_posts
+                    h.sink.fail_events.clear()
+                else:
+                    assert h.sink.updates[-1][2] == _ADMISSION_NOTICE
+                outage_active = True
+                unavailable_until = time.monotonic() + 0.03
+                h.runner.default_script = [Final(text="recovered", status=SessionStatus.DONE)]
+                entry, fields = await _wake(h, consumer, event.event_id)
+                await consumer._sem.acquire()
+                await asyncio.wait_for(consumer._handle(entry, fields), timeout=5)
+                during = observed["record"]
+                assert during is not None
+                assert observed["updates"][-1][2] == _DEPENDENCY_NOTICE
+                assert "sandbox admission" not in observed["updates"][-1][2]
+                assert during.deferrals == original.deferrals == 1
+                assert during.deadline_ms == original.deadline_ms
+                assert during.wait_reason == "workspace_dependency"
+                record = await consumer._waits.get(event.event_id)
+                assert record is not None and record.state == "done"
+                assert record.deadline_ms == original.deadline_ms
+                assert record.deferrals == 1
+                assert record.wait_reason == "workspace_dependency"
+                assert record.cause == ""
+                assert h.runner.opened == ["original"]
+                assert h.sink.last_text == "recovered"
+                texts = [text for _, _, text in h.sink.updates]
+                if initial_notice_failed:
+                    assert len(h.sink.text_posts) == 1
+                    assert h.sink.text_posts[0][2] == _DEPENDENCY_NOTICE
+                    ref = h.sink.text_posts[0][1]
+                    assert during.reply_ref == ref
+                    assert record.reply_ref == ref
+                    assert h.sink.updates[-1][1:] == (ref, "recovered")
+                else:
+                    assert _ADMISSION_NOTICE in texts
+                    assert _DEPENDENCY_NOTICE in texts
+
+    asyncio.run(go())

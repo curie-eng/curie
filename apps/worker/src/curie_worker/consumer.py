@@ -370,7 +370,9 @@ class Consumer(StreamConsumer):
                 )
             async with asyncio.timeout(capacity_wait_module._NOTICE_SEND_TIMEOUT_S):
                 ack = await self._kernel.notify_capacity_queued(
-                    qevent, wait_reply_ref=record.reply_ref
+                    qevent,
+                    wait_reply_ref=record.reply_ref,
+                    wait_reason=record.wait_reason or capacity_wait_module.WAIT_REASON_ADMISSION,
                 )
             reply_ref = ack.ref
             delivered = True
@@ -843,12 +845,13 @@ class Consumer(StreamConsumer):
                                         qevent, recovered_wait.grant_epoch
                                     )
                                 await self._kernel.process_event(
-                                    qevent, lease=lease, **identity_arguments,
+                                    qevent,
+                                    lease=lease,
+                                    **identity_arguments,
                                 )
-                                if (
-                                    self._kernel._can_park(qevent)
-                                    and await self._kernel._markers.is_terminal(qevent.event_id)
-                                ):
+                                if self._kernel._can_park(
+                                    qevent
+                                ) and await self._kernel._markers.is_terminal(qevent.event_id):
                                     try:
                                         await self._waits.finish_order(
                                             _thread_key_for(qevent),
@@ -877,7 +880,7 @@ class Consumer(StreamConsumer):
                                 entry_id, qevent, wait_generation, lease
                             )
                             return
-                        except CapacityWaitRequested:
+                        except CapacityWaitRequested as requested:
                             try:
                                 record = await self._waits.park(
                                     entry_id,
@@ -889,6 +892,7 @@ class Consumer(StreamConsumer):
                                         if self._kernel._can_park(qevent)
                                         else None
                                     ),
+                                    wait_reason=requested.wait_reason,
                                 )
                             except Exception:
                                 logger.exception(

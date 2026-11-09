@@ -61,6 +61,7 @@ if TYPE_CHECKING:
     from .core import Kernel
 
 from . import (
+    capacity,
     channel_read,
     claim,
     clock,
@@ -1378,6 +1379,7 @@ async def _process_event(
                 dependency_refusals = 0
             dependency_remaining = 0.0
             if dependency_retry:
+                await capacity.refresh_dependency_wait_notice(self, qevent)
                 if dependency_deadline is None:
                     dependency_deadline = (
                         clock.time.monotonic() + self._config.workspace_total_timeout_seconds
