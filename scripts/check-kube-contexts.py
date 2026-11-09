@@ -42,6 +42,12 @@ EXAMPLE_CONTEXTS = frozenset(
         "fixture-context",
         "stub-context",
         "ctx",
+        "kind-quickstart",
+        "kind-curie-factory",
+        "kind-ci-fixture",
+        "kind-curie-e2e",
+        "kind-identity-e2e",
+        "kind-x",
     }
 )
 FORBIDDEN_CONTEXT = re.compile(r"\bk[8](?:-?scratch)?\b")
@@ -111,7 +117,7 @@ def problems(text: str, *, yaml_values: bool = False, shell_values: bool = False
         kube_consumer = re.search(r"\b(?:kubectl|helm|curie)\b", statement_prefix)
         if value.startswith("dir://") and kube_consumer is None:
             continue
-        if value in EXAMPLE_CONTEXTS or re.fullmatch(r"kind-[A-Za-z0-9_-]+", value):
+        if value in EXAMPLE_CONTEXTS:
             continue
         if not DYNAMIC.search(value):
             found.append(normalized.count("\n", 0, match.start()) + 1)
@@ -178,6 +184,7 @@ def self_test() -> int:
     rejected = [
         f"kubectl {flag} fixed-cluster get pods",
         f"kubectl {flag}=fixed-cluster get pods",
+        f"kubectl {flag} kind-unlisted-context get pods",
         f'helm {kube_flag} "fixed-cluster" list',
         f'("{flag}", "fixed-cluster")',
         f'["{kube_flag}",\n    "fixed-cluster"]',
