@@ -25,7 +25,8 @@ Pick where code lives, then where issues live:
 | GitLab merge request | GitLab issues | [GitLab](#gitlab-issues-and-merge-requests) |
 
 Jira Cloud can also pair with [Bitbucket](factory-quickstart-reference.md#run-quickstart-for-bitbucket).
-Jira Cloud with GitLab has [no supported installation path](../capabilities.md#workspaces-and-integrations).
+The current factory quickstart does not support Jira Cloud issues with GitLab
+merge requests. See the [capability status](../capabilities.md#workspaces-and-integrations).
 
 ## What you need
 
