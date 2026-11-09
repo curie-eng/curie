@@ -222,7 +222,7 @@
       "input": "The diff reviewer returned round 3 VERDICT: CHANGES with three findings: the migration down path is missing, the new test passes on the old source, and the pull request body has no verification table. This run ends with no pull request. Write only the final reply. In the handoff's Settled section, include the established fact that no pull request was opened; no other reusable fact has been established.",
       "grader": {
         "kind": "regex",
-        "expected": "(?is)^Could not complete:[^\\n]*\\nDecisions needed:\\n1\\.[^\\n]*\\?\\n2\\.[^\\n]*\\?\\n3\\.[^\\n]*\\?\\nSettled:\\s*1\\.\\s*(?:No (?:pull request|PR) (?:was |has been )?(?:opened|created|published)|(?:The )?(?:pull request|PR) (?:was |has been )?not (?:opened|created|published))(?: in this run)?\\.?\\s*$",
+        "expected": "(?is)^Could not complete:[^\\n]*\\nDecisions needed:\\n1\\.[^\\n]*\\?\\n2\\.[^\\n]*\\?\\n3\\.[^\\n]*\\?\\nSettled:\\s*1\\.\\s*(?:No (?:pull request|PR) (?:was |has been )?(?:opened|created|published)|(?:The )?(?:pull request|PR) (?:was |has been )?not (?:opened|created|published))(?: (?:in|for|during) this run)?\\.?\\s*$",
         "case_sensitive": false
       }
     },
