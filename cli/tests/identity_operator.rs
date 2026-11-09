@@ -6,6 +6,52 @@ const TENANT: &str = "00000000-0000-0000-0000-000000000001";
 const AGENT: &str = "00000000-0000-0000-0000-000000000002";
 
 #[test]
+fn malformed_operator_mutations_are_refused_before_http_without_echoing_inputs() {
+    for (verb, action) in [
+        ("identity-authority", "adopt"),
+        ("identity-authority", "replace"),
+        ("identity-authority", "retire"),
+        ("role-filter", "set"),
+        ("role-filter", "remove"),
+    ] {
+        let server = serve(|_| Response::json(200, r#"{"tenant_id":"example","version":8}"#));
+        let directory = tempfile::tempdir().unwrap();
+        let file = directory.path().join("request.json");
+        std::fs::write(
+            &file,
+            json!({"request_id":"00000000-0000-4000-8000-000000000003",
+                "expected_version":7,"unknown":"PRIVATE_BODY_MARKER"})
+            .to_string(),
+        )
+        .unwrap();
+        let mut command = Command::new(env!("CARGO_BIN_EXE_curie"));
+        command
+            .env_clear()
+            .env("PATH", std::env::var_os("PATH").unwrap())
+            .current_dir(directory.path())
+            .args(["cluster", verb, action, "--tenant", TENANT, "--apply"])
+            .arg(&file)
+            .args([
+                "--api-url",
+                &server.base_url,
+                "--api-key",
+                "synthetic-platform-key",
+                "--json",
+            ]);
+        if verb == "role-filter" {
+            command.args(["--agent", AGENT, "--role", "invocation"]);
+        }
+        let output = command.output().unwrap();
+        assert!(!output.status.success());
+        assert!(server.recorded().is_empty());
+        let result: Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert!(result["error"].is_string());
+        assert!(!String::from_utf8_lossy(&output.stdout).contains("PRIVATE_BODY_MARKER"));
+        assert!(!String::from_utf8_lossy(&output.stderr).contains("PRIVATE_BODY_MARKER"));
+    }
+}
+
+#[test]
 fn compiled_operator_verbs_send_exact_method_scope_and_cas_body() {
     for (verb, action, method, suffix) in [
         (
@@ -43,8 +89,20 @@ fn compiled_operator_verbs_send_exact_method_scope_and_cas_body() {
             serve(|_| Response::json(200, &json!({"tenant_id":TENANT,"version":8}).to_string()));
         let directory = tempfile::tempdir().unwrap();
         let file = directory.path().join("request.json");
-        let body =
+        let mut body =
             json!({"request_id":"00000000-0000-4000-8000-000000000003","expected_version":7});
+        if verb == "identity-authority" {
+            body["expected_lifecycle_generation"] = json!(0);
+            if action != "retire" {
+                body["selection"] = json!({
+                    "mode":"http", "issuer":"https://identity.example.com", "lookup_url":"https://identity.example.com/lookup",
+                    "credential_ref":{"id":"synthetic-provider","generation":1},
+                    "max_identity_age_ms":60000,"max_membership_age_ms":60000,"max_clock_skew_ms":1000
+                });
+            }
+        } else if action == "set" {
+            body["groups"] = json!([{"issuer":"https://identity.example.com","id":"authors"}]);
+        }
         std::fs::write(&file, body.to_string()).unwrap();
         let mut command = Command::new(env!("CARGO_BIN_EXE_curie"));
         command
@@ -102,7 +160,9 @@ fn authority_dry_runs_validate_registered_credentials_without_exposing_inputs() 
             let file = directory.path().join("request.json");
             let body = json!({"request_id":"00000000-0000-4000-8000-000000000003",
                 "expected_version":0,"expected_lifecycle_generation":0,
-                "selection":{"credential_ref":{"id":"PRIVATE_REFERENCE_MARKER","generation":1}}});
+                "selection":{"credential_ref":{"id":"PRIVATE_REFERENCE_MARKER","generation":1},
+                    "mode":"http","issuer":"https://identity.example.com","lookup_url":"https://identity.example.com/lookup",
+                    "max_identity_age_ms":60000,"max_membership_age_ms":60000,"max_clock_skew_ms":1000}});
             std::fs::write(&file, body.to_string()).unwrap();
             let output = Command::new(env!("CARGO_BIN_EXE_curie"))
                 .env_clear()

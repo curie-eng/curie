@@ -10,9 +10,10 @@ use serde::{Deserialize, Serialize};
 
 use crate::api_requests::{
     ActionUndo, AgentAccessPolicyWrite, AgentCreate, AgentUpdate, ApprovalPrincipalMint,
-    ApprovalRecover, ApprovalResolve, ChannelBindingWrite, ChannelCallersWrite,
-    ChannelTokenRequest, ConsoleLoginCodeMint, DeploymentCreate, DirectoryConfigIn,
-    DirectoryNamespaceIn, DirectoryTeamIn, EvalTriggerRequest, MemoryEntryCreate, MemoryGuidanceIn,
+    ApprovalRecover, ApprovalResolve, AuthorityMutation, AuthoritySelectionMutation,
+    ChannelBindingWrite, ChannelCallersWrite, ChannelTokenRequest, ConsoleLoginCodeMint,
+    DeploymentCreate, DirectoryConfigIn, DirectoryNamespaceIn, DirectoryTeamIn, EvalTriggerRequest,
+    GroupFilterMutation, MemoryEntryCreate, MemoryGuidanceIn, OperatorMutation,
     RemediationBreakerClose, RemediationPolicyMutation, RemediationPolicyWrite,
     RemediationQualificationWrite, RemediationVerifierRunStart, ResolveTargetRequest,
     RoutingCheckRequest, VersionCreate,
@@ -2635,14 +2636,179 @@ impl ApiClient {
         path: &str,
         body: Option<&serde_json::Value>,
     ) -> Result<serde_json::Value> {
-        let mut request = self
-            .http
-            .request(method, format!("{}{path}", self.base_url))
-            .header("X-API-Key", &self.api_key);
-        if let Some(body) = body {
-            request = request.json(body);
+        if method == reqwest::Method::GET {
+            return self.directory_admin_read(path).await;
         }
-        let response = request.send().await.context("identity operator request")?;
+        let (path, query) = path.split_once('?').unwrap_or((path, ""));
+        let dry_run = match query {
+            "" => false,
+            "dry_run=true" => true,
+            _ => bail!("invalid identity operator query"),
+        };
+        let body = body.context("identity operator mutation requires a body")?;
+        fn decode<T: serde::de::DeserializeOwned>(body: &serde_json::Value) -> Result<T> {
+            serde_json::from_value(body.clone())
+                .map_err(|_| anyhow::anyhow!("invalid identity operator request"))
+        }
+        let segments: Vec<&str> = path.trim_matches('/').split('/').collect();
+        match segments.as_slice() {
+            ["identity", "authorities", tenant_id] if method == reqwest::Method::PUT => {
+                self.adopt_http_authority(tenant_id, &decode(body)?, dry_run)
+                    .await
+            }
+            ["identity", "authorities", tenant_id, "replace"]
+                if method == reqwest::Method::POST =>
+            {
+                self.replace_http_authority(tenant_id, &decode(body)?, dry_run)
+                    .await
+            }
+            ["identity", "authorities", tenant_id, "retire"]
+                if method == reqwest::Method::POST && !dry_run =>
+            {
+                self.retire_http_authority(tenant_id, &decode(body)?).await
+            }
+            ["identity", "roles", tenant_id, agent_id, role]
+                if method == reqwest::Method::PUT && !dry_run =>
+            {
+                self.set_http_role_filter(tenant_id, agent_id, role, &decode(body)?)
+                    .await
+            }
+            ["identity", "roles", tenant_id, agent_id, role]
+                if method == reqwest::Method::DELETE && !dry_run =>
+            {
+                self.remove_http_role_filter(tenant_id, agent_id, role, &decode(body)?)
+                    .await
+            }
+            _ => bail!("invalid identity operator mutation"),
+        }
+    }
+
+    async fn adopt_http_authority(
+        &self,
+        tenant_id: &str,
+        body: &AuthoritySelectionMutation,
+        dry_run: bool,
+    ) -> Result<serde_json::Value> {
+        let response = self
+            .http
+            .put(format!(
+                "{}/identity/authorities/{tenant_id}",
+                self.base_url
+            ))
+            .header("X-API-Key", &self.api_key)
+            .query(
+                &dry_run
+                    .then_some(("dry_run", true))
+                    .into_iter()
+                    .collect::<Vec<_>>(),
+            )
+            .json::<AuthoritySelectionMutation>(body)
+            .send()
+            .await
+            .context("identity operator request")?;
+        Self::expect_ok(response, "identity operator request")
+            .await?
+            .json()
+            .await
+            .context("decoding identity operator response")
+    }
+
+    async fn replace_http_authority(
+        &self,
+        tenant_id: &str,
+        body: &AuthoritySelectionMutation,
+        dry_run: bool,
+    ) -> Result<serde_json::Value> {
+        let response = self
+            .http
+            .post(format!(
+                "{}/identity/authorities/{tenant_id}/replace",
+                self.base_url
+            ))
+            .header("X-API-Key", &self.api_key)
+            .query(
+                &dry_run
+                    .then_some(("dry_run", true))
+                    .into_iter()
+                    .collect::<Vec<_>>(),
+            )
+            .json::<AuthoritySelectionMutation>(body)
+            .send()
+            .await
+            .context("identity operator request")?;
+        Self::expect_ok(response, "identity operator request")
+            .await?
+            .json()
+            .await
+            .context("decoding identity operator response")
+    }
+
+    async fn retire_http_authority(
+        &self,
+        tenant_id: &str,
+        body: &AuthorityMutation,
+    ) -> Result<serde_json::Value> {
+        let response = self
+            .http
+            .post(format!(
+                "{}/identity/authorities/{tenant_id}/retire",
+                self.base_url
+            ))
+            .header("X-API-Key", &self.api_key)
+            .json::<AuthorityMutation>(body)
+            .send()
+            .await
+            .context("identity operator request")?;
+        Self::expect_ok(response, "identity operator request")
+            .await?
+            .json()
+            .await
+            .context("decoding identity operator response")
+    }
+
+    async fn set_http_role_filter(
+        &self,
+        tenant_id: &str,
+        agent_id: &str,
+        role: &str,
+        body: &GroupFilterMutation,
+    ) -> Result<serde_json::Value> {
+        let response = self
+            .http
+            .put(format!(
+                "{}/identity/roles/{tenant_id}/{agent_id}/{role}",
+                self.base_url
+            ))
+            .header("X-API-Key", &self.api_key)
+            .json::<GroupFilterMutation>(body)
+            .send()
+            .await
+            .context("identity operator request")?;
+        Self::expect_ok(response, "identity operator request")
+            .await?
+            .json()
+            .await
+            .context("decoding identity operator response")
+    }
+
+    async fn remove_http_role_filter(
+        &self,
+        tenant_id: &str,
+        agent_id: &str,
+        role: &str,
+        body: &OperatorMutation,
+    ) -> Result<serde_json::Value> {
+        let response = self
+            .http
+            .delete(format!(
+                "{}/identity/roles/{tenant_id}/{agent_id}/{role}",
+                self.base_url
+            ))
+            .header("X-API-Key", &self.api_key)
+            .json::<OperatorMutation>(body)
+            .send()
+            .await
+            .context("identity operator request")?;
         Self::expect_ok(response, "identity operator request")
             .await?
             .json()

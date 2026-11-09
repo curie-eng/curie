@@ -30,6 +30,64 @@ use serde::Serialize;
 
 use crate::api::{ApprovalRouteBindingWrite, HookPartitionInput, SourceBindingInput};
 
+#[derive(Clone, serde::Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct AuthoritySelectionMutation {
+    pub expected_lifecycle_generation: u64,
+    pub expected_version: u64,
+    pub request_id: uuid::Uuid,
+    pub selection: HttpSelectionV1,
+}
+
+#[derive(Clone, serde::Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct HttpSelectionV1 {
+    pub credential_ref: CredentialReferenceV1,
+    pub issuer: String,
+    pub lookup_url: String,
+    pub max_clock_skew_ms: u64,
+    pub max_identity_age_ms: u64,
+    pub max_membership_age_ms: u64,
+    pub mode: String,
+}
+
+#[derive(Clone, serde::Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct CredentialReferenceV1 {
+    pub generation: u64,
+    pub id: String,
+}
+
+#[derive(Clone, serde::Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct GroupV1 {
+    pub id: String,
+    pub issuer: String,
+}
+
+#[derive(Clone, serde::Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct AuthorityMutation {
+    pub expected_lifecycle_generation: u64,
+    pub expected_version: u64,
+    pub request_id: uuid::Uuid,
+}
+
+#[derive(Clone, serde::Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct OperatorMutation {
+    pub expected_version: u64,
+    pub request_id: uuid::Uuid,
+}
+
+#[derive(Clone, serde::Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct GroupFilterMutation {
+    pub expected_version: u64,
+    pub groups: Vec<GroupV1>,
+    pub request_id: uuid::Uuid,
+}
+
 /// `PUT /directory/config/{tenant_id}` (`DirectoryConfigIn`).
 #[derive(Clone, serde::Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
