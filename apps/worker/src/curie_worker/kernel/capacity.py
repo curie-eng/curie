@@ -144,7 +144,7 @@ async def refresh_dependency_wait_notice(self: Kernel, qevent: QueuedTurn) -> No
             }
         )
     try:
-        await self.notify_capacity_queued(
+        ack = await self.notify_capacity_queued(
             notice_event,
             wait_reply_ref=record.reply_ref,
             wait_reason=WAIT_REASON_DEPENDENCY,
@@ -158,10 +158,13 @@ async def refresh_dependency_wait_notice(self: Kernel, qevent: QueuedTurn) -> No
             exc_info=True,
         )
         return
+    self._adopt_ref(qevent, ack)
     if await _wait_is_terminal(self, qevent):
         return
     try:
-        await store.remember_wait_reason(event_id, generation, WAIT_REASON_DEPENDENCY)
+        await store.remember_wait_reason(
+            event_id, generation, WAIT_REASON_DEPENDENCY, reply_ref=ack.ref
+        )
     except asyncio.CancelledError:
         raise
     except Exception:  # noqa: BLE001 - a failed remember retries on the next loop

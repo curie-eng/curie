@@ -6069,3 +6069,51 @@ def test_wait_cause_change_updates_the_notice_until_the_answer(make_harness) -> 
             assert done.deadline_ms == deadline
 
     asyncio.run(go())
+
+
+@pytest.mark.parametrize("wait_reason", ["thread_predecessor", "sandbox_admission"])
+def test_old_wait_notice_is_corrected_on_first_new_park(make_harness, wait_reason) -> None:
+    async def go() -> None:
+        async with make_harness(slack_no_edit_streaming=True) as h:
+            consumer = _capacity_consumer(h)
+            await consumer.ensure_group()
+            first = _qevent("first", event_id="old-cause-first")
+            second = _qevent("second", event_id="old-cause-second", placeholder="p-2")
+            first_entry, first_fields = await _pending_local_entry(h, first)
+            entry, fields = await _pending_local_entry(h, second)
+            await consumer._sem.acquire()
+            await consumer._handle(entry, fields)
+            original = await consumer._waits.get(second.event_id)
+            assert original is not None
+            await h.async_redis.hdel(consumer._waits._record(second.event_id), "wait_reason")
+            await h.async_redis.delete(f"{consumer._waits._prefix}:reason:{second.event_id}")
+            h.sink.updates.clear()
+            if wait_reason == "sandbox_admission":
+                h.runner.default_script = [Final(text="first answer", status=DONE)]
+                await consumer._sem.acquire()
+                await consumer._handle(first_entry, first_fields)
+                await asyncio.to_thread(h.substrate.release, kernel_routing._thread_key_for(first))
+                h.fake_k8s.quota_rejection = QuotaRejection(
+                    quota_name="acme-quota",
+                    requested={"pods": "1"},
+                    used={"pods": "1"},
+                    hard={"pods": "1"},
+                )
+            entry, fields = await _wake_parked(h, consumer, second.event_id)
+            await consumer._sem.acquire()
+            await consumer._handle(entry, fields)
+            expected = (
+                _PREDECESSOR_NOTICE if wait_reason == "thread_predecessor" else _ADMISSION_NOTICE
+            )
+            assert h.sink.updates[-1] == ("C1", "p-2", expected)
+            corrected = await consumer._waits.get(second.event_id)
+            assert corrected is not None and corrected.wait_reason == wait_reason
+            assert corrected.deadline_ms == original.deadline_ms
+            assert corrected.deferrals == 2
+            count = len(h.sink.updates)
+            entry, fields = await _wake_parked(h, consumer, second.event_id)
+            await consumer._sem.acquire()
+            await consumer._handle(entry, fields)
+            assert len(h.sink.updates) == count
+
+    asyncio.run(go())

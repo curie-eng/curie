@@ -282,9 +282,9 @@ local retained_until = deadline + retention_ms
 local grant_confirmed = redis.call('HGET', record, 'grant_confirmed') == '1'
 local grant_unknown = redis.call('HGET', record, 'grant_unknown') == '1'
 local notice_delivered = redis.call('HGET', record, 'notice_pending') == '0'
-local previous_reason = redis.call('HGET', record, 'wait_reason') or ''
+local previous_reason = redis.call('GET', KEYS[12]) or ''
 local next_reason = ARGV[15]
-local reason_changed = previous_reason ~= '' and previous_reason ~= next_reason
+local reason_changed = previous_reason ~= next_reason
 local suppress_notice = state and notice_delivered and (not grant_confirmed)
   and (not grant_unknown) and (not reason_changed)
 local notice_flag = '0'
@@ -293,7 +293,8 @@ if not state then redis.call('HSET', record, 'fields', payload) end
 redis.call('HSET', record,
   'state', 'waiting', 'generation', generation, 'first_wait_ms', first,
   'deadline_ms', deadline, 'due_ms', next_due, 'deferrals', deferrals,
-  'cause', '', 'notice_pending', notice_flag, 'wait_reason', next_reason)
+  'cause', '', 'notice_pending', notice_flag)
+redis.call('SET', KEYS[12], next_reason, 'PXAT', retained_until)
 redis.call('PEXPIREAT', record, retained_until)
 redis.call('ZADD', due, next_due, ARGV[11])
 redis.call('ZADD', waiting, retained_until, ARGV[11])
@@ -309,8 +310,6 @@ return {1, generation, first, deadline, next_due, deferrals}
 """
 
 
-# The waiting reason can change while a wake is still inside its deadline.
-# This writes only that field. Deadline, deferrals, fencing and cause stay put.
 _REMEMBER_WAIT_REASON_LUA = """
 if redis.call('HGET', KEYS[1], 'generation') ~= ARGV[1] then return 0 end
 local state = redis.call('HGET', KEYS[1], 'state')
@@ -319,8 +318,10 @@ if redis.call('HGET', KEYS[1], 'terminal_only') == '1' then return 0 end
 if redis.call('EXISTS', KEYS[2]) == 1 or redis.call('HGET', KEYS[3], 'done') == '1' then
   return 0
 end
-if redis.call('HGET', KEYS[1], 'wait_reason') == ARGV[2] then return 0 end
-redis.call('HSET', KEYS[1], 'wait_reason', ARGV[2])
+local ttl = redis.call('PTTL', KEYS[1])
+if ttl <= 0 then return 0 end
+redis.call('SET', KEYS[4], ARGV[2], 'PX', ttl)
+if ARGV[3] ~= '' then redis.call('HSET', KEYS[1], 'reply_ref', ARGV[3]) end
 return 1
 """
 
@@ -728,6 +729,9 @@ class CapacityWaitStore:
     def _record(self, event_id: str) -> str:
         return f"{self._prefix}:record:{event_id}"
 
+    def _reason(self, event_id: str) -> str:
+        return f"{self._prefix}:reason:{event_id}"
+
     def _notice_lock(self, event_id: str) -> str:
         return f"{self._prefix}:notice_lock:{event_id}"
 
@@ -760,6 +764,7 @@ class CapacityWaitStore:
 
         if not val("state"):
             return None
+        reason = await self._redis.get(self._reason(event_id))
         return CapacityWaitRecord(
             event_id=event_id,
             fields=json.loads(val("fields", "{}")),
@@ -777,7 +782,7 @@ class CapacityWaitStore:
             grant_epoch=val("grant_epoch") or None,
             grant_confirmed=val("grant_confirmed") == "1",
             grant_unknown=val("grant_unknown") == "1",
-            wait_reason=val("wait_reason"),
+            wait_reason=reason.decode() if isinstance(reason, bytes) else str(reason or ""),
         )
 
     def _thread_order(self, thread_key: str) -> str:
@@ -962,7 +967,7 @@ class CapacityWaitStore:
         lease.raise_if_lost()
         raw = await self._redis.eval(
             _PARK_LUA,
-            11,
+            12,
             self._record(event_id),
             self._due,
             self._waiting,
@@ -974,6 +979,7 @@ class CapacityWaitStore:
             self._config.delivery_state_key(lease.stream, lease.group, entry_id),
             self._flight,
             self._thread_order(thread_key or ""),
+            self._reason(event_id),
             lease.stream,
             lease.group,
             entry_id,
@@ -998,19 +1004,21 @@ class CapacityWaitStore:
         return record
 
     async def remember_wait_reason(
-        self, event_id: str, generation: int, wait_reason: str
+        self, event_id: str, generation: int, wait_reason: str, *, reply_ref: str | None = None
     ) -> bool:
         """Record the current waiting reason without parking again."""
         if wait_reason not in _DURABLE_WAIT_NOTICES:
             raise CapacityWaitRefused("unknown durable wait reason")
         changed = await self._redis.eval(
             _REMEMBER_WAIT_REASON_LUA,
-            3,
+            4,
             self._record(event_id),
             self._config.done_key(event_id),
             self._config.completion_key(event_id),
+            self._reason(event_id),
             str(generation),
             wait_reason,
+            reply_ref or "",
         )
         return int(changed) == 1
 

@@ -1258,7 +1258,10 @@ _DEPENDENCY_NOTICE = "Your request is queued while workspace dependency recovery
 _ADMISSION_NOTICE = "Your request is queued while sandbox admission is pending."
 
 
-def test_dependency_recovery_updates_the_waiting_notice(make_harness) -> None:
+@pytest.mark.parametrize("initial_notice_failed", [False, True])
+def test_dependency_recovery_updates_the_waiting_notice(
+    make_harness, initial_notice_failed
+) -> None:
     async def go() -> None:
         deployment = uuid.uuid4()
         unavailable_until = 0.0
@@ -1271,7 +1274,7 @@ def test_dependency_recovery_updates_the_waiting_notice(make_harness) -> None:
             if outage_active and (failed_reads < 4 or time.monotonic() < unavailable_until):
                 failed_reads += 1
                 if failed_reads == 2:
-                    observed["updates"] = list(h.sink.updates)
+                    observed["updates"] = list(h.sink.text_posts + h.sink.updates)
                     observed["record"] = await consumer._waits.get(event.event_id)
                 return web.Response(status=503)
             return web.json_response({"repo_full_name": None})
@@ -1296,11 +1299,21 @@ def test_dependency_recovery_updates_the_waiting_notice(make_harness) -> None:
                 )
                 consumer = _capacity_consumer(h)
                 await consumer.ensure_group()
-                event = _qevent("original", event_id="dependency-notice")
+                event = _qevent(
+                    "original",
+                    event_id="dependency-notice",
+                    placeholder=None if initial_notice_failed else "p-1",
+                )
+                if initial_notice_failed:
+                    h.sink.fail_events.add("reply.update")
                 await _park(h, consumer, event)
                 original = await consumer._waits.get(event.event_id)
                 assert original is not None
-                assert h.sink.updates[-1][2] == _ADMISSION_NOTICE
+                if initial_notice_failed:
+                    assert not h.sink.text_posts
+                    h.sink.fail_events.clear()
+                else:
+                    assert h.sink.updates[-1][2] == _ADMISSION_NOTICE
                 outage_active = True
                 unavailable_until = time.monotonic() + 0.03
                 h.runner.default_script = [Final(text="recovered", status=SessionStatus.DONE)]
@@ -1323,7 +1336,15 @@ def test_dependency_recovery_updates_the_waiting_notice(make_harness) -> None:
                 assert h.runner.opened == ["original"]
                 assert h.sink.last_text == "recovered"
                 texts = [text for _, _, text in h.sink.updates]
-                assert _ADMISSION_NOTICE in texts
-                assert _DEPENDENCY_NOTICE in texts
+                if initial_notice_failed:
+                    assert len(h.sink.text_posts) == 1
+                    assert h.sink.text_posts[0][2] == _DEPENDENCY_NOTICE
+                    ref = h.sink.text_posts[0][1]
+                    assert during.reply_ref == ref
+                    assert record.reply_ref == ref
+                    assert h.sink.updates[-1][1:] == (ref, "recovered")
+                else:
+                    assert _ADMISSION_NOTICE in texts
+                    assert _DEPENDENCY_NOTICE in texts
 
     asyncio.run(go())
