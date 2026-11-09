@@ -113,6 +113,7 @@ DRY_RUN_FILE = "tools/factory-e2e/tests/test_c4_dry_run.py"
 SHARD_NEIGHBOR = "tools/factory-e2e/tests/test_c4_reinstall_publication.py"
 PRIVATE_IMPORT_STEP = "API private import boundaries"
 ALWAYS_RUN_PYTHON_STEPS = (
+    "Explicit kube-context policy",
     "Alembic revision gate",
     "Ruff",
     "Mypy",
@@ -594,6 +595,7 @@ def test_static_job_holds_exactly_the_moved_gates_in_order() -> None:
         "Lockfile is up to date",
         "Sync workspace",
         PRIVATE_IMPORT_STEP,
+        "Explicit kube-context policy",
         "CLI pytest file list",
         *MOVED_STATIC_STEPS[1:4],
         # ADR 0232 (#4610) added this gate after the move.

@@ -5274,13 +5274,13 @@ mod tests {
         let mut opts = MessageOpts::default();
         match mode.as_str() {
             "cluster-short" => {
-                opts.context = Some("pin-ctx".into());
+                opts.context = Some("scratch-cluster".into());
                 opts.namespace = "acme-platform".into();
                 opts.release = "acme-prod".into();
                 persist_and_hint(&opts, TurnVerb::Cluster, "C0EXAMPLE1", "1700000000.000100");
             }
             "cluster-fallback" => {
-                opts.context = Some("pin-ctx".into());
+                opts.context = Some("scratch-cluster".into());
                 opts.namespace = "acme-platform".into();
                 opts.release = "acme-prod".into();
                 std::fs::write(".curie", "blocks the state directory")
@@ -5411,11 +5411,11 @@ mod tests {
             let text = captured_stderr(&output);
             assert!(output.status.success(), "{mode}: {text}");
             assert!(text.contains(
-                "curie cluster message --context pin-ctx --namespace acme-platform --release acme-prod"
+                "curie cluster message --context scratch-cluster --namespace acme-platform --release acme-prod"
             ), "{mode}: {text}");
             if mode == "cluster-short" {
                 assert!(text.contains("--continue"), "{text}");
-                assert_eq!(state.unwrap()["context"], "pin-ctx");
+                assert_eq!(state.unwrap()["context"], "scratch-cluster");
             } else {
                 assert!(text.contains("could not save turn context"), "{text}");
                 assert!(
@@ -5451,9 +5451,10 @@ mod tests {
             let output = capture_persist_hint(mode);
             let text = captured_stderr(&output);
             assert!(output.status.success(), "{mode}: {text}");
-            assert!(text.contains(
-                r"curie cluster message --context 'ctx '\''$;\name' --namespace 'ns space;$' --release 'rel'\''quote'"
-            ), "{mode}: {text}");
+            assert!(text.contains(&format!(
+                r"curie cluster message --context {} --namespace 'ns space;$' --release 'rel'\''quote'",
+                r"'ctx '\''$;\name'"
+            )), "{mode}: {text}");
         }
     }
 

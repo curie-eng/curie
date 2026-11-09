@@ -8,7 +8,7 @@ the caller.
 
 Required environment:
 
-CURIE_HOOK_APPROVAL_CONTEXT       k8 or kind-test-2765
+CURIE_HOOK_APPROVAL_CONTEXT       Explicit disposable Kubernetes context
 CURIE_NAMESPACE                   test-2765
 CURIE_RELEASE                     test-2765
 CURIE_BIN                         Path to the candidate curie binary
@@ -184,8 +184,6 @@ class Proof:
             )
         except ValueError as exc:
             raise ProofError("CURIE_HOOK_APPROVAL_TIMEOUT_SECONDS must be an integer") from exc
-        if self.context not in {"k8", "kind-test-2765"}:
-            raise ProofError("proof context must be k8 or kind-test-2765")
         if self.namespace != "test-2765" or self.release != "test-2765":
             raise ProofError("proof namespace and release must both be test-2765")
         if not self.curie_bin.is_file() or not os.access(self.curie_bin, os.X_OK):

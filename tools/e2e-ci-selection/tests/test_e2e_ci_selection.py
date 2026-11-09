@@ -281,6 +281,15 @@ CHART_SCENARIOS: dict[str, _ChartScenario] = {
         ],
         "leg": "chart",
     },
+    "metrics-alerts": {
+        "step": "Retained metrics and absent-data runtime",
+        "inputs": [
+            "charts/curie/ci/runtime/metrics-alerts-runtime.sh",
+            "examples/sre-bot/observability/curie-values.yaml",
+            "examples/sre-bot/observability/prometheus-values.yaml",
+        ],
+        "leg": "chart",
+    },
     "connector-apply-race": {
         "step": "Connector apply survives a concurrent reconciler create",
         "inputs": [
@@ -3713,10 +3722,15 @@ fi"""
     existing_smoke = [
         step
         for step in existing_cluster_steps
-        if step.get("run") == "bash cli/scripts/e2e-ladder.sh"
+        if "bash cli/scripts/e2e-ladder.sh" in step.get("run", "").splitlines()
     ]
     assert len(existing_smoke) == 1
     assert existing_smoke[0]["env"]["CURIE_E2E_TIERS"] == "cluster"
+    for cluster_smoke in (smoke, existing_smoke[0]):
+        assert (
+            'export CURIE_E2E_KUBE_CONTEXT="$(kubectl config current-context)"'
+            in cluster_smoke["run"]
+        )
 
     assert named_steps["Tear down the disposable upgrade cluster"]["if"] == "always()"
 

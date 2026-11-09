@@ -288,7 +288,7 @@ def test_burst_quota_snapshot_at_fetch_completion(
         sys=sys,
         time=time,
         datetime=datetime,
-        kube=["kubectl", "--context", "acme", "-n", "acme"],
+        kube=["kubectl", "--context", "fixture-context", "-n", "acme"],
         fullname="acme",
     )
     exec(compile(helpers, "<quota-scenario-driver>", "exec"), namespace)

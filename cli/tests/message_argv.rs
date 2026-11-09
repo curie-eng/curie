@@ -35,9 +35,9 @@ fn run_with_kubeconfig(args: &[&str]) -> Output {
         &kubeconfig,
         r#"apiVersion: v1
 kind: Config
-current-context: test-ctx
+current-context: test-context
 contexts:
-- name: test-ctx
+- name: test-context
   context:
     cluster: test-cluster
     user: test-user
@@ -259,7 +259,7 @@ fn cluster_message_separated_context_single_text_dry_run_succeeds() {
         "cluster",
         "message",
         "--context",
-        "test-ctx",
+        "test-context",
         ISSUE_TEXT,
         "--dry-run",
     ]);
@@ -269,7 +269,7 @@ fn cluster_message_separated_context_single_text_dry_run_succeeds() {
         "separated --context <ctx> single-text --dry-run must succeed\n{text}"
     );
     assert!(
-        text.contains("Kubernetes context: test-ctx"),
+        text.contains("Kubernetes context: test-context"),
         "the named kubeconfig context must be resolved\n{text}"
     );
     assert!(
@@ -288,7 +288,7 @@ fn cluster_message_separated_context_two_positionals_keep_agent_refusal() {
         "cluster",
         "message",
         "--context",
-        "test-ctx",
+        "test-context",
         ISSUE_AGENT,
         ISSUE_TEXT,
     ]);
@@ -297,7 +297,7 @@ fn cluster_message_separated_context_two_positionals_keep_agent_refusal() {
 
 #[test]
 fn local_message_context_is_clap_error_not_agent_refusal() {
-    let output = run(&["local", "message", "--context", "test-ctx", ISSUE_TEXT]);
+    let output = run(&["local", "message", "--context", "test-context", ISSUE_TEXT]);
     let text = combined(&output);
     assert_eq!(
         output.status.code(),

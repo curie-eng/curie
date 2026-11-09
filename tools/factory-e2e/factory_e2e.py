@@ -128,8 +128,8 @@ log shows a TLS verification failure.
 
 `repo-runner` (repo_runner.py) installs the operator's three repository
 bindings, two with runners and one without, in its own namespace under release
-`factory-tools` on the cluster named by an explicit --context (for example
-throwaway-cluster). A local scripted Messages endpoint requests the image tool
+`factory-tools` on the cluster named by an explicit --context <context>.
+A local scripted Messages endpoint requests the image tool
 manifest on each of seven turns: X and Y on their runners, the unconfigured
 repository on the agent image, Y refused with workspace.selection_conflict on
 X's thread, X after a runner change on that thread, and both refusal faults on
@@ -3050,7 +3050,7 @@ class Preflight:
         return token
 
     def _curie(self, args: list[str], env: Mapping[str, str], secrets: list[str | None]) -> None:
-        # --context is an option of `curie cluster`, so it follows that word.
+        # `--context` is an option of `curie cluster`, so it follows that word.
         argv = [self.config.curie_bin, args[0], "--context", self.config.kube_context, *args[1:]]
         result = subprocess.run(
             argv, capture_output=True, text=True, env={**os.environ, **env}, check=False
@@ -6596,8 +6596,8 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         parents=[common],
         help="preflight, then one scenario driver",
         description=(
-            "repo-runner: needs an explicit --context (a throwaway cluster such as "
-            "throwaway-cluster), release factory-tools, local scripted model. Set "
+            "repo-runner: needs an explicit --context <context> for a throwaway cluster, "
+            "release factory-tools, local scripted model. Set "
             "CURIE_FACTORY_REPO_RUNNER_PLAN (three chart bindings and seven turns) and "
             "CURIE_LOCAL_STUB_HOST. docker: run --scenario docker --context <context> with "
             "CURIE_LOCAL_STUB_HOST and no model credential; builds the worktree HEAD into a "

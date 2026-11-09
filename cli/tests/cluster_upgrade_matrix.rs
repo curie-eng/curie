@@ -505,10 +505,10 @@ fn self_test_checks_shard_coverage_and_timing() {
         "per-scenario timing recorded",
         "apply-kill-takeover uses the binary without harness recovery",
         "apply-kill-takeover sends SIGKILL to every descendant",
-        "apply-kill-takeover pins its private kind cluster to context k8",
-        "adopted named kind cluster prepared private context k8",
-        "invalid kind kubeconfig refused before selecting k8",
-        "mismatched kind server refused before selecting k8",
+        "apply-kill-takeover retains its verified private kind context",
+        "adopted named kind cluster retained its private context",
+        "invalid kind kubeconfig refused before runtime calls",
+        "mismatched kind server refused before runtime calls",
         "terminal-pods runs in setup shard s19",
         "terminal-pods asserts healthy status with terminal pods, a succeeded upgrade, and the surplus refusal",
         "shard coverage refused a dropped terminal-pods",
@@ -800,11 +800,14 @@ fn apply_kill_takeover_dry_plan_accepts_prose_and_rejects_reversed_recovery_comm
             .output()
             .expect("run the matrix explicit helm plan helper")
     };
+    let context = "example-context";
+    let rollback_plan =
+        format!("helm --kube-context {context} rollback acme-release 2 -n ns --wait --timeout 15m");
     let mut plan = [
         "phase plan: 0.10.0 -> 0.10.1",
         "phase validate: configuration overlay migration and pre-mutation refusals",
         "take over upgrade ownership from example-holder",
-        "helm --kube-context example-context rollback acme-release 2 -n ns --wait --timeout 15m",
+        rollback_plan.as_str(),
         "phase drain_preflight: confirm the worker workload is reachable; the worker upgrade drain gate itself runs later, inside Apply's Helm pre-upgrade hook (issue 2010)",
         "phase checkpoint: persist recoverable release state",
         "phase migrate: checkpoint boundary only; the chart's pre-upgrade hook Job performs schema migration during apply",
@@ -827,12 +830,14 @@ fn apply_kill_takeover_dry_plan_accepts_prose_and_rejects_reversed_recovery_comm
         output_text(&valid)
     );
 
+    let context_prefix = format!("--kube-context {context} ");
+    let context_argument = format!("--kube-context {context}");
     for (original, replacement) in [
         ("rollback acme-release", "rollback acme-other-release"),
         ("acme-release 2", "acme-release 9"),
         ("-n ns", "-n acme-other-namespace"),
-        ("--kube-context example-context ", ""),
-        ("--kube-context example-context", "--kube-context ''"),
+        (context_prefix.as_str(), ""),
+        (context_argument.as_str(), "--kube-context ''"),
         ("--wait ", ""),
         ("--wait", "--wait=false"),
         (" --timeout 15m", ""),
@@ -851,7 +856,7 @@ fn apply_kill_takeover_dry_plan_accepts_prose_and_rejects_reversed_recovery_comm
 
     let prefixed_upgrade = plan[7].replace(
         "helm upgrade",
-        "helm --kube-context example-context upgrade",
+        &format!("helm --kube-context {context} upgrade"),
     );
     let mut invalid_plan = plan;
     invalid_plan[7] = &prefixed_upgrade;
@@ -1155,4 +1160,21 @@ fn load_kind_images_refuses_a_node_without_a_cri_snapshotter() {
     assert!(!run.output.status.success(), "{text}");
     assert!(text.contains("no CRI snapshotter"), "{text}");
     assert!(!run.log.contains("import "), "{}", run.log);
+}
+
+#[test]
+fn matrix_refuses_missing_kind_cluster_before_invoking_dependencies() {
+    let output = Command::new("bash")
+        .arg(script())
+        .env_remove("CURIE_E2E_KIND_CLUSTER")
+        .env("CURIE_E2E_NAMESPACE", "test-explicit-context")
+        .env("CURIE_E2E_RELEASE", "acme-context")
+        .output()
+        .expect("run the matrix without a named kind cluster");
+    assert!(!output.status.success(), "missing cluster must be refused");
+    let text = output_text(&output);
+    assert!(
+        text.contains("CURIE_E2E_KIND_CLUSTER is required"),
+        "{text}"
+    );
 }

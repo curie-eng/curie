@@ -265,8 +265,8 @@ Two things to know:
 Copy [`examples/curie.yaml`](../examples/curie.yaml) into your repository as
 `curie.yaml` and customize it, or write the same starter from a released binary
 with `curie apply --init`. Credential fields contain credential names, not
-secret values. `install.context` (and `curie apply --context` / `curie diff
---context`, which win over the file) selects the kube context; `curie diff`
+secret values. `install.context` (and `curie apply --context <context>` / `curie diff
+--context <context>`, which win over the file) selects the kube context; `curie diff`
 prints the cluster that context names. Shared-cluster singleton opt-outs are
 modeled as `platform.sandbox_controller` and `platform.priority_classes.platform`
 / `sandbox`. `platform.gvisor` is `auto`, `require`, or `off` and controls

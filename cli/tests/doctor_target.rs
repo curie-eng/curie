@@ -150,7 +150,7 @@ fn explicit_context_keeps_the_file_model_remedy_on_curie_apply() {
         &tools.join("kubectl"),
         r#"#!/bin/sh
 case "$*" in
-  "config current-context") printf '%s\n' 'explicit-context' ;;
+  "config current-context") printf '%s\n' 'other-context' ;;
   *"get deployments,statefulsets"*) printf '%s\n' '{"items":[{"kind":"Deployment","status":{"readyReplicas":1}}]}' ;;
   *) exit 1 ;;
 esac
@@ -177,7 +177,7 @@ esac
     let kubeconfig = temp.path().join("kubeconfig");
     fs::write(
         &kubeconfig,
-        "apiVersion: v1\nkind: Config\ncurrent-context: file-context\ncontexts:\n- name: file-context\n  context:\n    cluster: file-cluster\n- name: explicit-context\n  context:\n    cluster: explicit-cluster\n",
+        "apiVersion: v1\nkind: Config\ncurrent-context: file-context\ncontexts:\n- name: file-context\n  context:\n    cluster: file-cluster\n- name: other-context\n  context:\n    cluster: explicit-cluster\n",
     )
     .expect("write kubeconfig");
 
@@ -192,7 +192,7 @@ esac
             "--release",
             "acme-bot",
             "--context",
-            "explicit-context",
+            "other-context",
         ])
         .env("PATH", &tools)
         .env("HOME", temp.path())
@@ -226,7 +226,7 @@ esac
     );
     assert!(
         fix.contains("curie apply --context")
-            && fix.contains("explicit-context")
+            && fix.contains("other-context")
             && fix.contains("agentSandbox.runner.model")
             && fix.contains("set:"),
         "the fix must preserve the selected context and name the file key: {fix}"

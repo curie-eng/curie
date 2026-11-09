@@ -1,6 +1,7 @@
 """Proof that the factory runner layer installs this repository's toolchains.
 
-Set CURIE_FACTORY_RUNNER_IMAGE to an image reachable by the k8 cluster. Set
+Set CURIE_FACTORY_RUNNER_IMAGE to an image reachable by the cluster and
+CURIE_FACTORY_KUBE_CONTEXT to its explicit context. Set
 CURIE_FACTORY_RUNNER_PROOF=required when this proof is a required gate; missing
 configuration, a missing image, or an unreachable cluster then fails.
 """
@@ -22,7 +23,8 @@ import pytest
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 SKILL = REPO_ROOT / "examples/dark-factory/skills/implement-issue/SKILL.md"
-CONTEXT = "k8"
+CONTEXT_ENV = "CURIE_FACTORY_KUBE_CONTEXT"
+CONTEXT = os.environ.get(CONTEXT_ENV, "").strip()
 NAMESPACE = "test-3499-factory-runner-checks"
 POD = "factory-runner-toolchain"
 IMAGE_ENV = "CURIE_FACTORY_RUNNER_IMAGE"
@@ -313,6 +315,8 @@ def test_factory_runner_pod_resolves_repository_lockfiles() -> None:
     image = os.environ.get(IMAGE_ENV, "").strip()
     if not image:
         _unavailable(f"set {IMAGE_ENV} to the built factory runner layer image")
+    if not CONTEXT:
+        pytest.fail(f"set {CONTEXT_ENV} to the explicit throwaway cluster context")
     if shutil.which("kubectl") is None or shutil.which("git") is None:
         _unavailable("kubectl and git are required for the factory runner pod proof")
     cidrs = _registry_cidrs()

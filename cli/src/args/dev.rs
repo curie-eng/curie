@@ -227,14 +227,18 @@ pub(crate) enum DevAction {
     /// chart/sandbox runtime acceptance criterion static checks cannot (#199,
     /// `bash scripts/chart-runtime-e2e.sh`).
     ChartRuntimeE2e {
-        /// Allow running against a kube context other than `k8scratch`.
-        ///
-        /// The script refuses a non-`k8scratch` context and names `--force` as
-        /// the override. Without this passthrough that override was unreachable
-        /// from the `curie` surface, so a contributor whose scratch context has
-        /// another name could not run this gate the documented way at all.
+        /// Explicit disposable cluster context.
+        #[arg(long, env = "CURIE_E2E_KUBE_CONTEXT")]
+        context: String,
+        /// Confirm use of a context outside the disposable-cluster patterns.
         #[arg(long)]
         force: bool,
+    },
+    /// Reject hardcoded kube-context flag values in the context-policy sources.
+    KubeContextCheck {
+        /// Exercise rejecting literals and accepting caller variables.
+        #[arg(long)]
+        self_test: bool,
     },
     /// Lint the interface catalog docs (`bash scripts/check-docs.sh`).
     DocsLint,
@@ -282,7 +286,10 @@ pub(crate) enum DevAction {
         /// Recovery bound in seconds after a healthy worker replacement is available.
         #[arg(long, default_value_t = 120)]
         bound_seconds: u32,
-        /// Allow a kube context other than `k8scratch` (cluster surface only).
+        /// Explicit context for the cluster surface.
+        #[arg(long, env = "CURIE_E2E_KUBE_CONTEXT")]
+        context: Option<String>,
+        /// Confirm use of a context outside the disposable-cluster patterns.
         #[arg(long)]
         force: bool,
     },

@@ -760,6 +760,10 @@ jobs:
         run: |
           uv run python3 scripts/check-private-imports.py --self-test
           uv run python3 scripts/check-private-imports.py
+      - name: Explicit kube-context policy
+        run: |
+          uv run python3 scripts/check-kube-contexts.py --self-test
+          uv run python3 scripts/check-kube-contexts.py
       # The CLI pytest list is generated from every test file, so a path
       # filter cannot tell when it is stale. This job has no if and feeds
       # the required Python aggregate. A stale list fails here, and the
@@ -3397,7 +3401,9 @@ jobs:
         env:
           CURIE_BIN: cli/target/release/curie
           CURIE_E2E_TIERS: cluster
-        run: bash cli/scripts/e2e-ladder.sh
+        run: |
+          export CURIE_E2E_KUBE_CONTEXT="$(kubectl config current-context)"
+          bash cli/scripts/e2e-ladder.sh
       # Rail 1 (ADR-0067) is a load-bearing security control that nothing else
       # here asserts ENFORCES -- only that its policies exist (#1153). Runs
       # after the round trip so a genuine turn failure surfaces first, and is
@@ -4008,8 +4014,7 @@ jobs:
         uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
         with:
           python-version: "3.13"
-      # Connector readiness (#3338). The script defaults to k8scratch; this
-      # job's kube context is kind-curie-e2e and must be passed explicitly.
+      # Connector readiness (#3338) takes the job-owned context explicitly.
       # The namespace is this run's id so a retry does not reuse a leftover.
       - name: Connector that never listens stays not-Ready until it binds
         if: ${{ matrix.leg == 'chart' && contains(fromJSON(needs.changes.outputs.chart_scenarios), 'connector-readiness') }}
@@ -4020,6 +4025,18 @@ jobs:
           set -euo pipefail
           bash tools/runtime-assertion-gate/run.sh \
             charts/curie/ci/runtime/connector-readiness-runtime.sh
+      - name: Retained metrics and absent-data runtime
+        if: ${{ matrix.leg == 'chart' && contains(fromJSON(needs.changes.outputs.chart_scenarios), 'metrics-alerts') }}
+        env:
+          CURIE_2428_CONTEXT: kind-curie-e2e
+          CURIE_2428_NAMESPACE: metrics-${{ github.run_id }}-${{ github.run_attempt }}
+          CURIE_2428_OBS_NAMESPACE: metrics-obs-${{ github.run_id }}-${{ github.run_attempt }}
+          CURIE_2428_RELEASE: metrics-${{ github.run_id }}-${{ github.run_attempt }}
+          CURIE_2428_PROM_RELEASE: metrics-prom-${{ github.run_id }}-${{ github.run_attempt }}
+        run: |
+          set -euo pipefail
+          bash tools/runtime-assertion-gate/run.sh \
+            charts/curie/ci/runtime/metrics-alerts-runtime.sh
       # Runner BYO egress (#2369). Render assertions prove the CIDRs land in
       # NetworkPolicy YAML; this proves a runner-labelled pod can actually
       # reach each declared peer (rustfs, sts, otel, api) and that an
@@ -4179,8 +4196,9 @@ jobs:
       - name: Dump cluster diagnostics after lifecycle retry failure
         if: failure()
         run: |
-          kubectl --context kind-curie-e2e get pods -A -o wide || true
-          kubectl --context kind-curie-e2e get events -A --sort-by=.lastTimestamp | tail -50 || true
+          context="$(kubectl config current-context)"
+          kubectl --context "$context" get pods -A -o wide || true
+          kubectl --context "$context" get events -A --sort-by=.lastTimestamp | tail -50 || true
       - name: Delete the job-owned kind cluster
         if: always()
         run: |
@@ -5166,6 +5184,7 @@ jobs:
           kubectl rollout status deploy/curie-worker -n curie --timeout=600s
           kubectl rollout status deploy/curie-ui -n curie --timeout=600s
           kubectl rollout status daemonset/curie-runner-prewarm -n curie --timeout=600s
+          export CURIE_E2E_KUBE_CONTEXT="$(kubectl config current-context)"
           bash cli/scripts/e2e-ladder.sh
       - name: Delete the historical upgrade cluster before factory migration
         run: |

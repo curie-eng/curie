@@ -329,7 +329,7 @@ passes=$((passes + 1))
 # parent a client picks resolves inside the container's scope. (3) A container
 # started in the daemon sees 0::/ as its cgroup.
 #
-# Observed on the image before cgroup-isolate existed (2026-10-12, k8 engine,
+# Observed on the image before cgroup-isolate existed (2026-10-12, a builder,
 # cgroup v2), the failing state, read from the host namespace:
 #   0::/dockerlimit.slice/docker-<full container id>.scope
 docker run -d --privileged --cgroupns=host --name "$iso" "$image" dockerd "$@" >/dev/null

@@ -6,7 +6,7 @@
 ``extensions.agents.x-k8s.io`` for ``SandboxClaim``) via the official client's
 CustomObjectsApi. Unit tests use an in-memory fake of the protocol (the K8s
 control plane is an external service); the real implementation is exercised by
-the k8scratch e2e test.
+the env-gated cluster e2e tests.
 """
 
 from __future__ import annotations

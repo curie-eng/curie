@@ -137,6 +137,7 @@ mod identity_operator;
 mod installation_plan_parity;
 mod json_contract;
 mod json_emit_contract;
+mod kube_context_policy;
 mod kube_spawn_inventory;
 mod lease_expiry_cluster_proof;
 mod local_connectedness_probe;

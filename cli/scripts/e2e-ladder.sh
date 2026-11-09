@@ -81,6 +81,7 @@
 #   CURIE_E2E_HOOK_APPROVAL
 #                          1 = run the standalone hook approval proof and exit
 #                            before the ordinary ladder setup.
+#   CURIE_E2E_KUBE_CONTEXT Explicit Kubernetes context required by the cluster rung.
 #   CURIE_NAMESPACE        Kubernetes namespace the cluster rung targets.
 #                            Default curie when unset on the regular path
 #                            (empty-but-set does not default). Forwarded as
@@ -131,6 +132,11 @@ fi
 
 TIERS="${CURIE_E2E_TIERS:-skill,local}"
 LIVE="${CURIE_E2E_LIVE:-0}"
+KUBE_CONTEXT="${CURIE_E2E_KUBE_CONTEXT:-}"
+case ",$TIERS," in
+    *,cluster,*|*,all,*)
+        [[ -n "$KUBE_CONTEXT" ]] || { echo "error: cluster rung requires CURIE_E2E_KUBE_CONTEXT" >&2; exit 2; } ;;
+esac
 # Fixed, not an env knob: the ladder asserts PLUMBING, so the bundle it ships is
 # a fixed input of the test rather than something a caller varies.
 BUNDLE_SRC="$REPO_ROOT/examples/weather"
@@ -836,7 +842,7 @@ product_stream_json() {
             ;;
         cluster)
             local pod
-            pod="$(kubectl -n "$CURIE_NAMESPACE" get pods \
+            pod="$(kubectl --context "$KUBE_CONTEXT" -n "$CURIE_NAMESPACE" get pods \
                 -l "app.kubernetes.io/instance=$CURIE_RELEASE,app.kubernetes.io/name=valkey" \
                 -o json | python3 -c '
 import json, sys
@@ -849,7 +855,7 @@ if len(ready) != 1:
     raise SystemExit("expected exactly one Ready product Valkey pod")
 print(ready[0])
 ')" || return 1
-            kubectl -n "$CURIE_NAMESPACE" exec "$pod" -- sh -c \
+            kubectl --context "$KUBE_CONTEXT" -n "$CURIE_NAMESPACE" exec "$pod" -- sh -c \
                 'exec valkey-cli --no-auth-warning -a "$VALKEY_PASSWORD" --json "$@"' \
                 sh "$@"
             ;;
@@ -2217,7 +2223,7 @@ cluster_worker_deploy() {
 cluster_reply_timeout_seconds() {
     local deployment deployment_json
     deployment="$(cluster_worker_deploy)"
-    if ! deployment_json="$(kubectl -n "$CURIE_NAMESPACE" get "deployment/$deployment" -o json)"; then
+    if ! deployment_json="$(kubectl --context "$KUBE_CONTEXT" -n "$CURIE_NAMESPACE" get "deployment/$deployment" -o json)"; then
         echo "cluster: Deployment/$deployment field CURIE_DELIVERY_BUDGET_S could not be read" >&2
         return 1
     fi
@@ -2278,7 +2284,7 @@ print(timeout)
 probe_cluster_fake_model() {
     # Defaults remain curie when unset. The probe follows the selected
     # namespace and the chart fullname worker.
-    kubectl -n "$CURIE_NAMESPACE" get "deployment/$(cluster_worker_deploy)" \
+    kubectl --context "$KUBE_CONTEXT" -n "$CURIE_NAMESPACE" get "deployment/$(cluster_worker_deploy)" \
         -o 'jsonpath={.spec.template.spec.containers[*].env[?(@.name=="CURIE_FAKE_MODEL")].value}'
 }
 
@@ -2986,7 +2992,7 @@ mcp_receipt_call_count() {
             count="$(docker logs "$container" 2>&1 | awk '$0 == "MCP_RECEIPT tools/call" { count++ } END { print count + 0 }')"
             ;;
         cluster)
-            pod="$(kubectl -n "$CURIE_NAMESPACE" get pods \
+            pod="$(kubectl --context "$KUBE_CONTEXT" -n "$CURIE_NAMESPACE" get pods \
                 -l "app.kubernetes.io/instance=$CURIE_RELEASE,curietech.ai/component=connector" \
                 -o json | python3 -c '
 import json, sys
@@ -2997,7 +3003,7 @@ if len(matches) != 1:
     raise SystemExit("expected exactly one MCP receipt connector pod")
 print(matches[0])
 ' "$MCP_RECEIPT_CONNECTOR")" || return 1
-            count="$(kubectl -n "$CURIE_NAMESPACE" logs "$pod" 2>/dev/null | awk '$0 == "MCP_RECEIPT tools/call" { count++ } END { print count + 0 }')"
+            count="$(kubectl --context "$KUBE_CONTEXT" -n "$CURIE_NAMESPACE" logs "$pod" 2>/dev/null | awk '$0 == "MCP_RECEIPT tools/call" { count++ } END { print count + 0 }')"
             ;;
         *)
             echo "unknown MCP receipt tier" >&2
@@ -3183,7 +3189,7 @@ assert_connector_parity() {
             echo "$label: $connector is up as $container on $url"
             [[ "$connector" == "tempo" ]] && host_ref="$container"
         else
-            if ! kubectl -n "$namespace" get "deployment/$object" >/dev/null 2>&1; then
+            if ! kubectl --context "$KUBE_CONTEXT" -n "$namespace" get "deployment/$object" >/dev/null 2>&1; then
                 echo "$label: no Deployment $object exists in namespace $namespace, so the connector the runner would dial at $url is not running." >&2
                 return 1
             fi
@@ -3192,11 +3198,11 @@ assert_connector_parity() {
             # which is exactly the race that sent the MCP probe below
             # "Connection refused" against a live cluster. Wait for the
             # rollout to finish before this connector is dialed.
-            if ! kubectl -n "$namespace" rollout status "deployment/$object" --timeout=120s; then
+            if ! kubectl --context "$KUBE_CONTEXT" -n "$namespace" rollout status "deployment/$object" --timeout=120s; then
                 echo "$label: deployment/$object in namespace $namespace did not become available within 120s, so the MCP probe that follows would race pod startup." >&2
                 return 1
             fi
-            image="$(kubectl -n "$namespace" get "deployment/$object" -o 'jsonpath={.spec.template.spec.containers[*].image}')"
+            image="$(kubectl --context "$KUBE_CONTEXT" -n "$namespace" get "deployment/$object" -o 'jsonpath={.spec.template.spec.containers[*].image}')"
             echo "$label: $connector is up as deployment/$object on $url"
             [[ "$connector" == "tempo" ]] && host_ref="$object"
         fi
@@ -3232,15 +3238,15 @@ assert_connector_parity() {
     # satisfy, so only the kubectl kind needs this stand-in.
     if [[ "$kind" != "docker" ]]; then
         probe_pod="$release-$agent-mcp-probe"
-        kubectl -n "$namespace" delete pod "$probe_pod" --ignore-not-found --wait=true >/dev/null 2>&1 || true
-        kubectl -n "$namespace" run "$probe_pod" \
+        kubectl --context "$KUBE_CONTEXT" -n "$namespace" delete pod "$probe_pod" --ignore-not-found --wait=true >/dev/null 2>&1 || true
+        kubectl --context "$KUBE_CONTEXT" -n "$namespace" run "$probe_pod" \
             --image="$(connector_image tempo)" \
             --restart=Never \
             --labels="app.kubernetes.io/name=curie,app.kubernetes.io/instance=$release,app.kubernetes.io/component=runner-sandbox" \
             --command -- sleep 300
-        if ! kubectl -n "$namespace" wait --for=condition=Ready "pod/$probe_pod" --timeout=60s; then
+        if ! kubectl --context "$KUBE_CONTEXT" -n "$namespace" wait --for=condition=Ready "pod/$probe_pod" --timeout=60s; then
             echo "$label: the runner-shaped probe pod $probe_pod never became Ready, so the MCP probe cannot run from it." >&2
-            kubectl -n "$namespace" delete pod "$probe_pod" --ignore-not-found --wait=false >/dev/null 2>&1 || true
+            kubectl --context "$KUBE_CONTEXT" -n "$namespace" delete pod "$probe_pod" --ignore-not-found --wait=false >/dev/null 2>&1 || true
             return 1
         fi
     fi
@@ -3264,9 +3270,9 @@ assert_connector_parity() {
                 return 1
             }
         else
-            probe_out="$(kubectl -n "$namespace" exec -i "$probe_pod" -- python - "${probe_args[@]}" < "$WORKDIR/mcp_probe.py")" || {
+            probe_out="$(kubectl --context "$KUBE_CONTEXT" -n "$namespace" exec -i "$probe_pod" -- python - "${probe_args[@]}" < "$WORKDIR/mcp_probe.py")" || {
                 echo "$label: the MCP probe against $connector failed." >&2
-                kubectl -n "$namespace" delete pod "$probe_pod" --ignore-not-found --wait=false >/dev/null 2>&1 || true
+                kubectl --context "$KUBE_CONTEXT" -n "$namespace" delete pod "$probe_pod" --ignore-not-found --wait=false >/dev/null 2>&1 || true
                 return 1
             }
         fi
@@ -3276,7 +3282,7 @@ assert_connector_parity() {
     echo "$label: the write verb was NOT exercised, deliberately: an approval round trip needs a second human actor, which no automated rung can supply without faking the thing under test. It is proved by the example's hands-on walkthrough instead."
 
     if [[ -n "$probe_pod" ]]; then
-        kubectl -n "$namespace" delete pod "$probe_pod" --ignore-not-found --wait=false >/dev/null 2>&1 || true
+        kubectl --context "$KUBE_CONTEXT" -n "$namespace" delete pod "$probe_pod" --ignore-not-found --wait=false >/dev/null 2>&1 || true
     fi
 
     assert_connector_entries "$label" "$entries"
@@ -3568,7 +3574,7 @@ case_connector_registry_missing_cluster() {
     local object before after good bad out code=0
 
     object="$(connector_object_name "$release" "$agent" tempo)" || return 1
-    before="$(kubectl -n "$namespace" get "deployment/$object" -o 'jsonpath={.spec.template.spec.containers[*].image}')"
+    before="$(kubectl --context "$KUBE_CONTEXT" -n "$namespace" get "deployment/$object" -o 'jsonpath={.spec.template.spec.containers[*].image}')"
     if [[ -z "$before" ]]; then
         echo "cluster: deployment/$object reports no container image, so there is no before-and-after to compare the refused deploy against." >&2
         return 1
@@ -3622,7 +3628,7 @@ case_connector_registry_missing_cluster() {
     fi
     echo "cluster: cluster deploy refused the unresolvable image with exit 2"
 
-    after="$(kubectl -n "$namespace" get "deployment/$object" -o 'jsonpath={.spec.template.spec.containers[*].image}')"
+    after="$(kubectl --context "$KUBE_CONTEXT" -n "$namespace" get "deployment/$object" -o 'jsonpath={.spec.template.spec.containers[*].image}')"
     if [[ "$after" != "$before" ]]; then
         echo "cluster: the refused deploy still moved deployment/$object from '$before' to '$after'. A preflight that refuses after touching the cluster has already broken the release it was meant to protect." >&2
         return 1
@@ -5423,7 +5429,7 @@ preflight_cluster_product_observability() {
     inventory="$(mktemp "$WORKDIR/cluster-product-status.XXXXXX")"
     # Persist only the component label, Ready condition, and runtime image IDs.
     # A complete pod JSON document can contain environment values from spec.
-    kubectl -n "$namespace" get pods \
+    kubectl --context "$KUBE_CONTEXT" -n "$namespace" get pods \
         -l "app.kubernetes.io/instance=$release" \
         -o go-template='{{range .items}}{{index .metadata.labels "app.kubernetes.io/component"}}{{"\t"}}{{range .status.conditions}}{{if eq .type "Ready"}}{{.status}}{{end}}{{end}}{{"\t"}}{{range .status.containerStatuses}}{{.imageID}}{{" "}}{{end}}{{"\n"}}{{end}}' \
         > "$inventory" || {
@@ -5505,7 +5511,7 @@ PY
 
 cluster_collector_metric_value() {
     local metric="$1"
-    kubectl get --raw \
+    kubectl --context "$KUBE_CONTEXT" get --raw \
         "/api/v1/namespaces/$CURIE_NAMESPACE/services/http:$CURIE_RELEASE-otel-collector:8888/proxy/metrics" \
         | python3 -c '
 import re, sys
@@ -5815,6 +5821,7 @@ PYCLAIM
 }
 
 rung_cluster() {
+    [[ -n "$KUBE_CONTEXT" ]] || { echo "error: cluster rung requires CURIE_E2E_KUBE_CONTEXT" >&2; return 2; }
     # A key ensure_local_api_key generated belongs to the local stack only.
     if (( LADDER_OWNS_API_KEY )); then
         unset CURIE_API_KEY
@@ -5826,7 +5833,7 @@ rung_cluster() {
     fi
     validate_cluster_dns_label CURIE_NAMESPACE "${CURIE_NAMESPACE-}" || return 1
     validate_cluster_helm_release CURIE_RELEASE "${CURIE_RELEASE-}" || return 1
-    ns_rel=(--namespace "$CURIE_NAMESPACE" --release "$CURIE_RELEASE")
+    ns_rel=(--context "$KUBE_CONTEXT" --namespace "$CURIE_NAMESPACE" --release "$CURIE_RELEASE")
 
     if [[ "$PRODUCT_OBSERVABILITY" == "1" ]]; then
         rung_cluster_product
@@ -5856,8 +5863,8 @@ except Exception:
 print("yes" if isinstance(d, dict) and d.get("release_found") is True else "no")
 ' || echo "no")"
     if [[ "$found" != "yes" ]]; then
-        echo "error: CURIE_E2E_TIERS named the cluster rung, but no installed release was reported by \`curie --json cluster status --namespace $CURIE_NAMESPACE --release $CURIE_RELEASE\`." >&2
-        echo "fix: install a release with \`curie cluster up --namespace $CURIE_NAMESPACE --release $CURIE_RELEASE --fake-model\` (or point kubectl at the right context), or drop cluster from CURIE_E2E_TIERS." >&2
+        echo "error: CURIE_E2E_TIERS named the cluster rung, but no installed release was reported by \`curie --json cluster status --context $KUBE_CONTEXT --namespace $CURIE_NAMESPACE --release $CURIE_RELEASE\`." >&2
+        echo "fix: install a release with \`curie cluster up --context $KUBE_CONTEXT --namespace $CURIE_NAMESPACE --release $CURIE_RELEASE --fake-model\` (or select the correct CURIE_E2E_KUBE_CONTEXT), or drop cluster from CURIE_E2E_TIERS." >&2
         return 1
     fi
     local cluster_reply_timeout_seconds
@@ -5932,9 +5939,9 @@ print("yes" if isinstance(d, dict) and d.get("release_found") is True else "no")
         # -- it is the namespace the release is installed into -- which is why
         # the pinned entry set excludes it.
         local cluster_release cluster_namespace
-        cluster_release="$(kubectl -n "$CURIE_NAMESPACE" get "deployment/$(cluster_worker_deploy)" \
+        cluster_release="$(kubectl --context "$KUBE_CONTEXT" -n "$CURIE_NAMESPACE" get "deployment/$(cluster_worker_deploy)" \
             -o 'jsonpath={.spec.template.spec.containers[*].env[?(@.name=="CURIE_RELEASE")].value}')"
-        cluster_namespace="$(kubectl -n "$CURIE_NAMESPACE" get "deployment/$(cluster_worker_deploy)" \
+        cluster_namespace="$(kubectl --context "$KUBE_CONTEXT" -n "$CURIE_NAMESPACE" get "deployment/$(cluster_worker_deploy)" \
             -o 'jsonpath={.spec.template.spec.containers[*].env[?(@.name=="CURIE_NAMESPACE")].value}')"
         assert_connector_parity "cluster" kubectl "$cluster_release" "$agent_name" "$cluster_namespace"
         case_connector_registry_missing_cluster "$cluster_release" "$agent_name" "$cluster_namespace"
@@ -5949,7 +5956,7 @@ print("yes" if isinstance(d, dict) and d.get("release_found") is True else "no")
     # CURIE_E2E_LISTEN_HOST (optional): the host the in-cluster worker uses to
     # reach this run's reply stub, forwarded verbatim as `cluster message
     # --listen-host`. Leave it UNSET for a cluster whose kubeconfig points at a
-    # routable API server (k8scratch, a real cloud cluster): `cluster message`
+    # routable API server (for example, a cloud cluster): `cluster message`
     # then auto-detects the local IP the kernel would use to reach that API and
     # advertises it, and the worker posts its reply there. SET it only where that
     # auto-detection cannot produce a pod-reachable host -- most importantly a
@@ -6030,8 +6037,8 @@ print("yes" if isinstance(d, dict) and d.get("release_found") is True else "no")
         fi
     done
     local retention_thread retention_context retention_surfaces retention_channel
-    retention_context="$(kubectl config current-context)" || return 1
-    retention_surfaces="$("$BIN" --json cluster --context "$retention_context" surfaces "$agent_id" "${ns_rel[@]}")" || return 1
+    retention_context="$KUBE_CONTEXT"
+    retention_surfaces="$("$BIN" --json cluster --context "$retention_context" surfaces "$agent_id" --namespace "$CURIE_NAMESPACE" --release "$CURIE_RELEASE")" || return 1
     retention_channel="$(python3 -c '
 import json, sys
 surfaces = json.loads(sys.argv[1]).get("surfaces")
@@ -6046,8 +6053,7 @@ if not isinstance(address, str) or not address or address != address.strip():
 print(address)
 ' "$retention_surfaces")" || return 1
     retention_thread="$(python3 -c 'import time; now = time.time_ns(); print(f"{now // 1_000_000_000}.{(now // 1_000) % 1_000_000:06d}")')"
-    local retention_args=(--json cluster --context "$retention_context" message)
-    retention_args+=("${ns_rel[@]}")
+    local retention_args=(--json cluster --context "$retention_context" message --namespace "$CURIE_NAMESPACE" --release "$CURIE_RELEASE")
     retention_args+=("$PROMPT" --channel "$retention_channel")
     retention_args+=(--thread "$retention_thread" --timeout-secs "$cluster_reply_timeout_seconds")
     if [[ -n "${CURIE_E2E_LISTEN_HOST:-}" ]]; then

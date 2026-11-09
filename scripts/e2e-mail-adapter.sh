@@ -4,7 +4,7 @@
 # external E2E prerequisite, never a skip or a green result.
 set -euo pipefail
 
-CONTEXT="k8"
+CONTEXT=""
 IMAGE="${CURIE_MAIL_E2E_IMAGE:-}"
 KEEP=0
 SECRET_NAMESPACE="monitoring"
@@ -12,18 +12,20 @@ SECRET_NAME="agentmail-api"
 SECRET_KEY="password"
 
 usage() {
-  echo "Usage: scripts/e2e-mail-adapter.sh --context k8 --image <candidate-image> [--keep]" >&2
+  echo "Usage: scripts/e2e-mail-adapter.sh --context <context> --image <candidate-image> [--keep]" >&2
 }
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --context) CONTEXT="$2"; shift 2 ;;
+    --context)
+      [[ $# -ge 2 && -n "$2" ]] || { echo "FAIL: context flag needs a value" >&2; exit 2; }
+      CONTEXT="$2"; shift 2 ;;
     --image) IMAGE="$2"; shift 2 ;;
     --keep) KEEP=1; shift ;;
     --help|-h) usage; exit 0 ;;
     *) usage; exit 2 ;;
   esac
 done
-[[ "$CONTEXT" == "k8" ]] || { echo "FAIL: this harness is pinned to context k8" >&2; exit 1; }
+[[ -n "$CONTEXT" ]] || { echo "FAIL: --context <context> is required" >&2; exit 2; }
 [[ -n "$IMAGE" ]] || { echo "FAIL: --image (or CURIE_MAIL_E2E_IMAGE) is required" >&2; exit 1; }
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -72,8 +74,6 @@ cleanup() {
 }
 trap cleanup EXIT INT TERM
 
-[[ "$(kubectl config current-context)" == "$CONTEXT" ]] \
-  || fail "current kube context is not k8; select it explicitly before running"
 kubectl --context "$CONTEXT" get secret "$SECRET_NAME" -n "$SECRET_NAMESPACE" >/dev/null \
   || fail "external E2E unmet: Kubernetes Secret $SECRET_NAMESPACE/$SECRET_NAME is absent"
 umask 077

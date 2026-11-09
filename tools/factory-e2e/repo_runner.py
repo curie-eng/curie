@@ -7,8 +7,8 @@ Synthetic samples prove the judge's contract only; they are not live
 evidence of repository routing or a tool manifest.
 
 ``curie dev factory-e2e run --scenario repo-runner --context <context>`` needs
-an explicit throwaway cluster context, for example ``throwaway-cluster``; there is no
-default and no environment fallback. It reads the ordinary operator GitHub App
+an explicit throwaway cluster context; there is no default and no environment
+fallback. It reads the ordinary operator GitHub App
 and fixture settings, refuses model keys and external model URLs, and serves
 its own scripted endpoint without forwarding. Set ``CURIE_LOCAL_STUB_HOST`` to
 an IPv4 the cluster can reach, and ``CURIE_FACTORY_REPO_RUNNER_PLAN`` to an
@@ -874,8 +874,7 @@ def load_repo_runner_config(env: Mapping[str, str], *, context: str | None) -> f
         raise fe.ConfigError("repo-runner refuses model credentials and external model endpoints")
     if not context or not context.strip():
         raise fe.ConfigError(
-            "repo-runner requires an explicit --context (the throwaway cluster, for example "
-            "throwaway-cluster)"
+            "repo-runner requires an explicit --context <context> for a throwaway cluster"
         )
     host = env.get("CURIE_LOCAL_STUB_HOST", "")
     try:
@@ -1463,7 +1462,7 @@ class RepoRunnerRun:
         p = self.p
         if not (p.config.kube_context or "").strip() or p.config.model_api_key != SCRIPTED_KEY:
             raise fe.ConfigError(
-                "repo-runner requires an explicit --context and its owned scripted model "
+                "repo-runner requires an explicit `--context` and its owned scripted model "
                 "configuration"
             )
         if p.config.repo not in self.repositories:

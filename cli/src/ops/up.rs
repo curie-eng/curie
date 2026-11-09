@@ -6472,8 +6472,8 @@ mod tests {
     #[test]
     fn cluster_up_status_hint_context() {
         assert_eq!(
-            status_hint("target-ns", "target-release", Some("pin-ctx")),
-            "Run `curie cluster status --context pin-ctx --namespace target-ns --release target-release` for pod health and URLs.",
+            status_hint("target-ns", "target-release", Some("scratch-cluster")),
+            "Run `curie cluster status --context scratch-cluster --namespace target-ns --release target-release` for pod health and URLs.",
         );
         assert_eq!(
             status_hint("target-ns", "target-release", None),
@@ -6481,7 +6481,10 @@ mod tests {
         );
         assert_eq!(
             status_hint("ns space;$", "rel'quote", Some("ctx '$;\\name")),
-            r"Run `curie cluster status --context 'ctx '\''$;\name' --namespace 'ns space;$' --release 'rel'\''quote'` for pod health and URLs.",
+            format!(
+                r"Run `curie cluster status --context {} --namespace 'ns space;$' --release 'rel'\''quote'` for pod health and URLs.",
+                r"'ctx '\''$;\name'"
+            ),
         );
     }
 
@@ -10835,7 +10838,7 @@ mod tests {
         let hint = adoption_hint(
             NamespaceHintAudience::ClusterUp,
             "acme-dev",
-            Some("acme-cluster"),
+            Some("scratch-cluster"),
             Some(&keys),
         );
         let message = foreign_labels_message("acme-dev", &keys, &hint);
@@ -10852,12 +10855,12 @@ mod tests {
         let hint = adoption_hint(
             NamespaceHintAudience::Quickstart,
             "acme-dev",
-            Some("acme-cluster"),
+            Some("scratch-cluster"),
             Some(&keys),
         );
         let message = foreign_labels_message("acme-dev", &keys, &hint);
         assert!(
-            message.contains("kubectl --context acme-cluster label namespace acme-dev foo-"),
+            message.contains("kubectl --context scratch-cluster label namespace acme-dev foo-"),
             "{message}"
         );
         assert!(message.contains("--namespace"), "{message}");
@@ -10869,13 +10872,13 @@ mod tests {
         let ownership = adoption_hint(
             NamespaceHintAudience::Quickstart,
             "acme-dev",
-            Some("acme-cluster"),
+            Some("scratch-cluster"),
             None,
         );
         let contents = adoption_hint(
             NamespaceHintAudience::Quickstart,
             "acme-dev",
-            Some("acme-cluster"),
+            Some("scratch-cluster"),
             None,
         );
         assert_eq!(ownership, "; rerun with a different --namespace");
@@ -10886,7 +10889,7 @@ mod tests {
             adoption_hint(
                 NamespaceHintAudience::ClusterUp,
                 "acme-dev",
-                Some("acme-cluster"),
+                Some("scratch-cluster"),
                 None,
             ),
             ADOPT_HINT
