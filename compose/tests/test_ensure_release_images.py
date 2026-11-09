@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -30,6 +31,42 @@ def load_module(path: Path, name: str):
 
 ensure = load_module(SCRIPT, "ensure_release_images")
 generate = load_module(GENERATE, "generate_release_compose")
+
+
+def test_oidc_stack_uses_the_candidate_gateway_on_its_private_network(tmp_path: Path) -> None:
+    driver = load_module(REPO_ROOT / "tools/oidc-e2e/oidc_e2e.py", "oidc_e2e_image_check")
+    settings = driver.Settings(
+        project="acme-oidc",
+        api_port=28400,
+        ui_port=28480,
+        dex_port=25556,
+        image_tag="acme-candidate",
+        ui_image="ghcr.io/curie-eng/curie-ui:acme-candidate",
+        curie_bin=None,
+        workdir=tmp_path,
+    )
+    env = driver.Stack(settings)._env(driver.oidc_on(settings))
+    env["CURIE_LOCAL_GATEWAY_PORT"] = "38081"
+    config = subprocess.run(
+        [
+            "docker", "compose", "--profile", "core",
+            "-f", str(REPO_ROOT / "compose.dev.yaml"),
+            "-f", str(driver.COMPOSE_OVERLAY), "config", "--format", "json",
+        ],
+        env={**os.environ, **env},
+        text=True, capture_output=True, check=True,
+    )
+    services = json.loads(config.stdout)["services"]
+    for name in ("curie-channel-gateway", "curie-gateway-replay-perms"):
+        assert services[name]["image"] == "ghcr.io/curie-eng/curie-dispatcher:acme-candidate"
+    gateway = services["curie-channel-gateway"]
+    assert not gateway.get("network_mode")
+    assert set(gateway["networks"]) == {"default"}
+    assert not gateway.get("ports")
+    assert gateway["environment"]["CURIE_CHANNEL_GATEWAY_PORT"] == "8081"
+    assert services["curie-api"]["environment"]["CURIE_CHANNEL_GATEWAY_URL"] == (
+        "http://curie-channel-gateway:8081"
+    )
 
 
 def generated_compose() -> str:

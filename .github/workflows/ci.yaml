@@ -2901,12 +2901,13 @@ jobs:
       - name: Load the images built by the ci-images job
         uses: ./.github/actions/load-ci-images
         with:
-          images: "{api,ui}"
-      - name: Tag the candidate API and console UI for the driver
+          images: "{api,ui,dispatcher}"
+      - name: Tag the candidate API, console UI and gateway for the driver
         run: |
           set -euo pipefail
           docker tag curie-ci/api:candidate ghcr.io/curie-eng/curie-api:oidc-e2e
           docker tag curie-ci/ui:candidate ghcr.io/curie-eng/curie-ui:oidc-e2e
+          docker tag curie-ci/dispatcher:candidate ghcr.io/curie-eng/curie-dispatcher:oidc-e2e
       - name: OIDC end to end (real Dex, isolated compose project)
         env:
           CURIE_BIN: cli/target/release/curie
