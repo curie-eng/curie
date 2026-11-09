@@ -7,8 +7,6 @@ built-in provider (``agentmail.AgentMailProvider``).
 
 from __future__ import annotations
 
-import base64
-import binascii
 import email.utils
 import hashlib
 import json
@@ -31,6 +29,7 @@ from curie_channel_gateway.ports.intake import ApprovalResolution, TurnSubmissio
 
 from .agentmail import AgentMailClient, AgentMailProvider, HttpResult, request
 from .config import MailAdapterConfig
+from .credential_rotation import CredentialRotation, claims, expiry
 from .provider import Failure, MailProvider, Message, MessageSummary
 from .state import MailState
 
@@ -198,6 +197,9 @@ class MailAdapter:
         )
         try:
             self.state.bind_provider(self.provider.name)
+            self.credentials = CredentialRotation(
+                config, provider=self.provider.name, inbox=self.provider.inbox_address
+            )
         except BaseException:
             self.state.close()
             raise
@@ -207,6 +209,7 @@ class MailAdapter:
         self.owner = secrets.token_hex(16)
         self.last_ingress_status: int | None = None
         self.channel_token_rejected = False
+        self._rejected_channel_fingerprint: str | None = None
         self.seen: OrderedDict[str, bool] = OrderedDict()
         for message_id in self.state.known_message_ids():
             self._mark_seen(message_id)
@@ -229,10 +232,12 @@ class MailAdapter:
 
     def status(self) -> dict[str, Any]:
         """Report diagnostic claims only; the adapter cannot verify the signature."""
-        token = self.config.channel_token
+        token = self.credentials.channel_token
         exp = _token_expiry(token)
         with self.lock:
-            rejected = self.channel_token_rejected
+            rejected = self.channel_token_rejected and self._rejected_channel_fingerprint == (
+                hashlib.sha256(token.encode()).hexdigest()
+            )
             last_status = self.last_ingress_status
             discovery = self._discovery_snapshot()
         now = time.time()
@@ -249,12 +254,15 @@ class MailAdapter:
             state = "rejected"
         elif exp <= now + 300:
             state = "expiring"
-        return {
+        result = {
             "status": "ready" if self.ready.is_set() else "starting",
             "channel_token": {"present": bool(token), "exp": exp, "state": state},
             "last_ingress_status": last_status,
             "discovery": discovery,
         }
+        if self.config.self_rotate:
+            result["self_rotation"] = self.credentials.status()
+        return result
 
     def _discovery_snapshot(self) -> dict[str, Any]:
         since = self.discovery_failing_since
@@ -300,6 +308,7 @@ class MailAdapter:
 
     def startup(self) -> None:
         """Complete the one-time prime or restart confirmation, then become ready."""
+        self.credentials.start(self.shutdown)
         self.prime()
         if not self.shutdown.is_set():
             self.ready.set()
@@ -483,8 +492,10 @@ class MailAdapter:
         for credential in (
             self.config.agentmail_api_key,
             self.config.channel_token,
-            self.config.egress_secret,
             self.config.adapter_principal,
+            self.credentials.channel_token,
+            self.config.egress_secret,
+            self.credentials.adapter_principal,
         ):
             if credential:
                 cause = cause.replace(credential, "[redacted]")
@@ -623,7 +634,7 @@ class MailAdapter:
         if rejection is not None:
             return self._refuse_inbound(message_id, rejection)
         sender = message.senders[0]
-        if self.config.adapter_principal:
+        if self.credentials.adapter_principal:
             handled = self._handle_approval_reply(message_id, conversation_id, sender, message)
             if handled is not None:
                 return handled
@@ -682,6 +693,14 @@ class MailAdapter:
         return False
 
     def post_turn(self, turn: dict[str, Any]) -> IngressOutcome:
+        # A channel mint revokes its predecessor at the API commit. Keep the
+        # entire HTTP submission inside the same lock as mint and local swap.
+        if not self.config.self_rotate:
+            return self._post_turn(turn)
+        with self.credentials.lock:
+            return self._post_turn(turn)
+
+    def _post_turn(self, turn: dict[str, Any]) -> IngressOutcome:
         """Post one turn to the channel port and classify the platform's answer.
 
         Returns:
@@ -693,7 +712,7 @@ class MailAdapter:
             which leaves the delivery pending under the same stable id.
         """
         url = f"{self.config.api_base_url.rstrip('/')}/channels/turns"
-        headers = {"X-API-Key": self.config.channel_token}
+        headers = {"X-API-Key": self.credentials.channel_token}
         body: dict[str, Any] | bytes = turn
         if self.receiver_keys is not None:
             signed = self._signed_turn(turn, self.receiver_keys)
@@ -715,20 +734,32 @@ class MailAdapter:
             )
             with self.lock:
                 self.last_ingress_status = result.status
-                was_rejected = self.channel_token_rejected
+                fingerprint = hashlib.sha256(self.credentials.channel_token.encode()).hexdigest()
+                was_rejected = self.channel_token_rejected and (
+                    self._rejected_channel_fingerprint == fingerprint
+                )
                 if result.status == 401:
                     self.channel_token_rejected = True
+                    self._rejected_channel_fingerprint = fingerprint
+                    self.credentials.channel_rejected()
                 elif result.status == 200:
                     self.channel_token_rejected = False
             if result.status == 401 and not was_rejected:
-                exp = _token_expiry(self.config.channel_token)
+                exp = _token_expiry(self.credentials.channel_token)
                 expires = datetime.fromtimestamp(exp, UTC).isoformat() if exp else "unknown"
-                logger.warning(
-                    "channel token rejected by the platform (exp %s); re-mint with "
-                    "POST /channels/token using the platform X-API-Key and install the "
-                    "replacement CURIE_CHANNEL_TOKEN, then restart the adapter",
-                    expires,
-                )
+                if self.config.self_rotate:
+                    logger.error(
+                        "channel token rejected by the platform (exp %s); "
+                        "self-rotation is retrying; inspect credential renewal failures",
+                        expires,
+                    )
+                else:
+                    logger.warning(
+                        "channel token rejected by the platform (exp %s); re-mint with "
+                        "POST /channels/token using the platform X-API-Key and install the "
+                        "replacement CURIE_CHANNEL_TOKEN, then restart the adapter",
+                        expires,
+                    )
             if result.status == 0:
                 logger.warning("ingress transport failure on attempt=%d", attempt)
                 if attempt < self.config.ingress_attempts:
@@ -771,7 +802,7 @@ class MailAdapter:
         own. @spec HTTP-INVOCATION-EXECUTION-30.
         """
         payload = json.dumps(turn, sort_keys=True, separators=(",", ":")).encode()
-        binding = _token_claims(self.config.channel_token).get("channel_id")
+        binding = _token_claims(self.credentials.channel_token).get("channel_id")
         if not isinstance(binding, str):
             return None
         try:
@@ -803,7 +834,7 @@ class MailAdapter:
         @spec HTTP-APPROVAL-CONTINUITY-15.
         """
         payload = json.dumps(body, sort_keys=True, separators=(",", ":")).encode()
-        binding = _token_claims(self.config.channel_token).get("channel_id")
+        binding = _token_claims(self.credentials.channel_token).get("channel_id")
         if not isinstance(binding, str):
             return None
         try:
@@ -1016,7 +1047,7 @@ class MailAdapter:
             text, exactly as before, and no ref is returned: nothing here could
             carry an answer, so nothing invites one.
         """
-        if not self.config.adapter_principal:
+        if not self.credentials.adapter_principal:
             return self.record_text(conversation_id, None, text, append=True), None
         refs = self.state.live_reply_refs(conversation_id)
         if len(refs) != 1:
@@ -1331,6 +1362,8 @@ class MailAdapter:
                 self.seen.popitem(last=False)
 
     def close(self) -> None:
+        self.shutdown.set()
+        self.credentials.close()
         self.state.close()
 
 
@@ -1491,32 +1524,12 @@ def _token_claims(token: str) -> dict[str, Any]:
     Reading them gives the adapter no platform signing key. Only the platform
     ingress response can establish credential acceptance.
     """
-    if len(token) > 16_384:
-        return {}
-    parts = token.split(".")
-    if len(parts) != 3 or parts[0] != "chn" or not parts[2]:
-        return {}
-    try:
-        payload = json.loads(
-            base64.b64decode(
-                parts[1] + "=" * (-len(parts[1]) % 4),
-                altchars=b"-_",
-                validate=True,
-            )
-        )
-    except (ValueError, UnicodeDecodeError, binascii.Error):
-        return {}
-    return payload if isinstance(payload, dict) else {}
+    return claims(token, "chn")
 
 
 def _token_expiry(token: str) -> int | None:
     """Read an unverified exp from the channel token, to diagnose expiry."""
-    exp = _token_claims(token).get("exp")
-    # bool is an int subclass, and timestamps outside datetime's range cannot
-    # be safely formatted in the operator diagnosis.
-    if isinstance(exp, int) and not isinstance(exp, bool) and 0 < exp < 253_402_300_800:
-        return exp
-    return None
+    return expiry(token, "chn")
 
 
 class MailTurnSubmission:
@@ -1552,7 +1565,7 @@ class MailApprovalResolution:
             body["note"] = note
         correlation = str((evidence or {}).get("correlation", ""))
         headers = {
-            ADAPTER_PRINCIPAL_HEADER: self._adapter.config.adapter_principal,
+            ADAPTER_PRINCIPAL_HEADER: self._adapter.credentials.adapter_principal,
             APPROVAL_ACTOR_HEADER: actor,
         }
         payload: dict[str, Any] | bytes = body
