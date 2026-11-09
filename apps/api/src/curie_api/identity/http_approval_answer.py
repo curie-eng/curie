@@ -80,6 +80,8 @@ _RECOVERY_AUDIT_ACTION = approvals_crud.RECOVERY_AUDIT_ACTION
 _RECOVERY_AUTHORIZER = "approval_recovery"
 _AUTHORIZER = "HttpApprovalAnswer"
 _RESUME_REFUSED: Literal["resume_refused"] = "resume_refused"
+_RESUME_AUTHORITY_ATTEMPTS = 3
+_RESUME_AUTHORITY_BACKOFF_S = 0.05
 # The transaction-local setting and value that let a dynamic approval become
 # ``approved`` in storage. Only this owner's final commit sets it, after the
 # canonical-route judgment. Migration 0156 (``0156_dynamic_approval_answer_gate``,
@@ -111,6 +113,13 @@ def _deny() -> NoReturn:
 def _unavailable() -> NoReturn:
     """@spec HTTP-APPROVAL-CONTINUITY-9."""
     _refuse(503, "authority_unavailable")
+
+
+class _LifecycleGenerationConflict(HTTPException):
+    """A final verification found lifecycle churn before publication was authorized."""
+
+    def __init__(self) -> None:
+        super().__init__(503, "authority_unavailable", headers={"Cache-Control": "no-store"})
 
 
 def _definitive_refusal(group: BaseExceptionGroup[Any]) -> HTTPException | None:
@@ -171,13 +180,14 @@ class _RefusalAudit:
 
 async def _audit_refusal(
     factory: Any, row: Approval, who: _RefusalAudit, refusal: HTTPException, stage: str,
+    *, code: str | None = None,
 ) -> None:
     """One audit row for a 403 or 503 refusal on a canonical route, in its own short transaction.
 
     Any other status writes nothing. Called only after every reader, writer and
     identity fence of the refused operation has closed, never under one. The
-    evidence names the public status and detail, the stage and, when the
-    selection policy refused, its code and selection evidence. A failure to
+    evidence names the public status and detail, the stage, a principal refusal
+    code and any selection evidence. A failure to
     write it is logged and never changes the refusal. @spec REQUEST-APPROVAL-5/6.
     """
     if refusal.status_code not in (403, 503):
@@ -185,7 +195,7 @@ async def _audit_refusal(
     evidence: dict[str, Any] = {
         "kind": approval_selection.EVIDENCE_KIND, "mode": row.selection_mode,
         "route": row.route, "key_id": row.selection_key_id, "decision": who.decision,
-        "code": None,
+        "code": code,
     }
     if isinstance(refusal, SelectionRefused):
         evidence.update(refusal.evidence)
@@ -657,6 +667,7 @@ class _Composition:
     selection_evidence: dict[str, Any] | None = None
     stage: str = "capture"
     dm: DmCard | None = None
+    preserve_inactive: bool = False
 
     async def _observe(self, subject: _Subject) -> _Subject:
         """Phase 2 for one subject. @spec HTTP-APPROVAL-CONTINUITY-9."""
@@ -710,6 +721,19 @@ class _Composition:
                     # Contradictory canonical observations for one sender refuse.
                     if observed.setdefault(key, facts.identity) != facts.identity:
                         _unavailable()
+                    if (
+                        self.preserve_inactive and facts.identity is not None
+                        and facts.identity.account_status == "active"
+                    ):
+                        principal = await writer.scalar(select(Principal).where(
+                            Principal.tenant_id == uuid.UUID(subject.registration.tenant_id),
+                            Principal.idp_issuer == facts.identity.issuer,
+                            Principal.idp_subject == facts.identity.subject,
+                        ).execution_options(populate_existing=True))
+                        if principal is not None and principal.status in {"disabled", "revoked"}:
+                            raise principal_authority.PrincipalAuthorityRefusal(
+                                "principal_inactive",
+                            )
                 lifecycle = self.subjects[0].capture.authority
                 for subject in self.subjects:
                     application = await principal_authority.apply_http_principal(
@@ -741,15 +765,23 @@ class _Composition:
         """
         current_facts: dict[str, ValidatedFacts] = {}
         state = self.request.app.state
+        captures: list[tuple[_Subject, SourceCapture, Any]] = []
+        lifecycle_conflict = False
         for subject in self.subjects:
             current, binding = await _recapture(session, subject, writer=writer)
             if (
                 current.fingerprint != subject.capture.fingerprint
-                or current.authority.lifecycle_generation != self.final
                 or state.http_identity_runtime is not self.runtime
                 or state.http_identity_client is not self.client
             ):
                 _unavailable()
+            lifecycle_conflict |= current.authority.lifecycle_generation != self.final
+            captures.append((subject, current, binding))
+        if await approvals_crud.get_approval_route_binding(session, self.row) != self.route_binding:
+            _unavailable()
+        if lifecycle_conflict:
+            raise _LifecycleGenerationConflict()
+        for subject, current, binding in captures:
             observed = source_facts(subject.response_bytes, subject.lookup, subject.credential)
             await _check_principal(session, subject, observed, self.applications[subject.role])
             source_permission(
@@ -757,8 +789,6 @@ class _Composition:
                 self.associations.get(subject.role), role_name=subject.role,
             )
             current_facts[subject.role] = observed
-        if await approvals_crud.get_approval_route_binding(session, self.row) != self.route_binding:
-            _unavailable()
         await self._judge_selection(session, current_facts)
         return current_facts
 
@@ -1165,14 +1195,14 @@ async def check_http_approval_actor(
         # bound to a local, so no frame-exception cycle outlives the check.
         if audited is not None:
             await _audit_resume_refusal(
-                factory, *audited, _boundary_refusal(error),
+                factory, *audited, error,
                 "capture" if composition is None else composition.stage,
             )
         raise _boundary_refusal(error) from None
 
 
 async def _audit_resume_refusal(
-    factory: Any, row: Approval, saved: wire.ApprovalContextV1, refusal: HTTPException,
+    factory: Any, row: Approval, saved: wire.ApprovalContextV1, error: BaseException,
     stage: str,
 ) -> None:
     """One ``resume_refused`` row naming the preserved answering actor, no principal kind.
@@ -1182,10 +1212,15 @@ async def _audit_resume_refusal(
     @spec REQUEST-APPROVAL-5/6.
     """
     scope = saved.actor_scope
+    code = (
+        "principal_inactive"
+        if isinstance(error, principal_authority.PrincipalAuthorityRefusal)
+        and error.code == "principal_inactive" else None
+    )
     await _audit_refusal(factory, row, _RefusalAudit(
         _RESUME_REFUSED, scope.native_id if scope is not None else (row.resolved_by or ""),
         None if scope is None else scope.actor_channel, None, False, saved.status,
-    ), refusal, stage)
+    ), _boundary_refusal(error), stage, code=code)
 
 
 @dataclass(frozen=True)
@@ -1213,18 +1248,29 @@ def approved_resume_authority(state: Any) -> ApprovedResumeAuthority:
 
     @spec HTTP-APPROVAL-CONTINUITY-8/9/11.
     """
-    observe = approved_resume_current(state)
+    observe = approved_resume_current(state, preserve_inactive=True)
 
     @asynccontextmanager
     async def authority(saved: wire.ApprovalContextV1) -> AsyncIterator[CurrentResumeAuthority]:
         """@spec HTTP-APPROVAL-CONTINUITY-8/9/11."""
-        async with observe(saved) as current:
-            yield current.authority
+        for attempt in range(_RESUME_AUTHORITY_ATTEMPTS):
+            entered = False
+            try:
+                async with observe(saved) as current:
+                    entered = True
+                    yield current.authority
+                    return
+            except _LifecycleGenerationConflict:
+                if entered or attempt == _RESUME_AUTHORITY_ATTEMPTS - 1:
+                    raise
+            await asyncio.sleep(_RESUME_AUTHORITY_BACKOFF_S * (attempt + 1))
 
     return authority
 
 
-def approved_resume_current(state: Any) -> ApprovedResumeInvokerAuthority:
+def approved_resume_current(
+    state: Any, *, preserve_inactive: bool = False,
+) -> ApprovedResumeInvokerAuthority:
     """The two-subject current check an approved selected resume publishes under.
 
     Fresh original-invoker (purpose=invocation) and preserved answering-actor
@@ -1237,6 +1283,10 @@ def approved_resume_current(state: Any) -> ApprovedResumeInvokerAuthority:
 
     It also yields the invocation role's freshly verified identity, which the
     turn current check projects for an opted-in agent. @spec CONNECTOR-REQUESTER-1.
+
+    Publication sets ``preserve_inactive`` so its own active observation cannot
+    reactivate a stored disabled or revoked principal. Other current checks
+    retain ordinary HTTP observation lifecycle semantics.
 
     It serves approved-resume publication, ``turn-authority/check`` and
     ``approval-grant/check``. On a canonical route the preserved answering
@@ -1296,7 +1346,7 @@ def approved_resume_current(state: Any) -> ApprovedResumeInvokerAuthority:
                 request, runtime, client, factory, valkey, approval_id, snapshot, row,
                 route_binding, state.approver_sets, actor.source.sender.native_id,
                 actor.channel, [caller, approver], {"invocation": saved, "approver": association},
-                saved, preserved=True, dm=dm,
+                saved, preserved=True, dm=dm, preserve_inactive=preserve_inactive,
             )
             # Phases 2 and 3: lookups and route membership outside SQL, then lifecycle.
             await composition.observe_and_apply()
@@ -1336,7 +1386,7 @@ def approved_resume_current(state: Any) -> ApprovedResumeInvokerAuthority:
             if entered or audited is None:
                 raise
             await _audit_resume_refusal(
-                factory, audited, saved, _boundary_refusal(error),
+                factory, audited, saved, error,
                 "capture" if composition is None else composition.stage,
             )
             raise

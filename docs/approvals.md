@@ -824,6 +824,16 @@ settled sessions, and the resume reconciler re-drives resolutions whose resume
 turn never landed. Historical approvals with a null `expires_at` remain pending
 until settlement.
 
+An approved HTTP identity resume retries a final lifecycle-generation conflict with up to
+three attempts in total (two retries), waiting 50 ms then 100 ms, with complete fresh
+authority checks before any append is attempted. Exhausted pre-append refusals remain
+owed to the grace-based reconciler, while uncertain appends retain #4016 recovery on
+the next reconciler pass before grace; grace applies to the remaining owed wakes.
+A resume that succeeds on a retry still keeps one `resume_refused` audit row for each
+failed attempt on a canonical route.
+An approved resume refuses and leaves the wake owed when the stored principal was
+observed disabled or revoked after the approval's saved capture.
+
 - **A paused turn holds nothing.** The queue entry is acknowledged when the turn
   suspends; the resolution arrives later as its own queued turn. No stream entry, thread
   lock, or worker slot is held across a human's lunch break.
