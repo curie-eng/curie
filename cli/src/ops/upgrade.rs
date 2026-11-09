@@ -2147,8 +2147,7 @@ const CHECKPOINT_WRITE_ATTEMPTS: u32 = 3;
 const CHECKPOINT_RETRY_PAUSES: [Duration; 2] = [Duration::from_secs(2), Duration::from_secs(4)];
 
 /// Transient apiserver and transport failures from `kubectl` (#5412 decision 1).
-/// Conflict, Forbidden, NotFound, and a failed JSON Patch `test` stay fatal:
-/// those mean another writer, not a blip. `was refused` is kubectl's dial
+/// Only the final diagnosis is classified. `was refused` is kubectl's dial
 /// wording for the same connection failure as `connection refused`.
 fn checkpoint_stderr_is_transient(stderr: &str) -> bool {
     let reason = super::verbs::failure_reason(stderr);
@@ -2173,7 +2172,7 @@ fn checkpoint_stderr_is_transient(stderr: &str) -> bool {
         "i/o timeout",
         "unexpected EOF",
     ];
-    PHRASES.iter().any(|phrase| stderr.contains(phrase))
+    PHRASES.iter().any(|phrase| reason.contains(phrase))
 }
 
 struct CheckpointFailure {
@@ -2801,6 +2800,7 @@ impl LiveHost {
     ) -> Result<CheckpointWrite> {
         let mut last_reason = String::new();
         let mut reread_only = false;
+        let mut saw_transient = false;
         for attempt in 1..=CHECKPOINT_WRITE_ATTEMPTS {
             if !reread_only {
                 let (ok, out, err) = self.run_checkpoint_patch(patch)?;
@@ -2809,11 +2809,23 @@ impl LiveHost {
                 }
                 let reason = super::verbs::failure_reason(&err).to_string();
                 if !checkpoint_stderr_is_transient(&err) {
+                    if saw_transient {
+                        match self.reread_checkpoint() {
+                            CheckpointReread::Found(observation) if matches(self, &observation) => {
+                                return Ok(CheckpointWrite::Adopted(observation));
+                            }
+                            _ => {}
+                        }
+                    }
                     return Ok(CheckpointWrite::Failed(
                         self.checkpoint_failure_from(&reason, false),
                     ));
                 }
+                saw_transient = true;
                 last_reason = reason;
+            }
+            if attempt < CHECKPOINT_WRITE_ATTEMPTS {
+                std::thread::sleep(CHECKPOINT_RETRY_PAUSES[(attempt as usize) - 1]);
             }
             match self.reread_checkpoint() {
                 CheckpointReread::Found(observation) if matches(self, &observation) => {
@@ -2840,9 +2852,6 @@ impl LiveHost {
                         exhausted_transient: false,
                     }));
                 }
-            }
-            if attempt < CHECKPOINT_WRITE_ATTEMPTS {
-                std::thread::sleep(CHECKPOINT_RETRY_PAUSES[(attempt as usize) - 1]);
             }
         }
         Ok(CheckpointWrite::Failed(
@@ -3192,6 +3201,9 @@ impl LiveHost {
                 saw_transient |= transient;
                 last_reason = reason;
             }
+            if attempt < CHECKPOINT_WRITE_ATTEMPTS {
+                std::thread::sleep(CHECKPOINT_RETRY_PAUSES[(attempt as usize) - 1]);
+            }
             match self.reread_checkpoint() {
                 CheckpointReread::Found(observation)
                     if self.ownership_write_landed(&observation, &None) =>
@@ -3223,9 +3235,6 @@ impl LiveHost {
                 CheckpointReread::Fatal(message) => {
                     bail!("could not create upgrade ownership: {message}");
                 }
-            }
-            if attempt < CHECKPOINT_WRITE_ATTEMPTS {
-                std::thread::sleep(CHECKPOINT_RETRY_PAUSES[(attempt as usize) - 1]);
             }
         }
         let failure = self.checkpoint_failure_from(&last_reason, true);
@@ -6739,6 +6748,17 @@ mod checkpoint_retry_tests {
                 !checkpoint_stderr_is_transient(sample),
                 "expected permanent: {sample}"
             );
+        }
+    }
+
+    #[test]
+    fn earlier_transient_warning_does_not_override_the_final_permanent_error() {
+        for error in [
+            "Error from server (BadRequest): invalid JSON patch",
+            "Error from server (Invalid): ConfigMap is invalid (422)",
+        ] {
+            let stderr = format!("warning: connection refused on an earlier attempt\n{error}\n");
+            assert!(!checkpoint_stderr_is_transient(&stderr), "{stderr}");
         }
     }
 

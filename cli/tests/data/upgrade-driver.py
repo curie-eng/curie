@@ -138,6 +138,10 @@ WORKLOADS = "deployments,statefulsets,daemonsets,pods,jobs"
 #   ownership_create_fails None | "transient-once" | "committed-then-5xx".
 #   checkpoint_read_failures  Reads failing after the injected write error:
 #                           0 disables, a positive count is finite, -1 persists.
+#   late_checkpoint_patch  None | "record" | "release". Return 5xx, then
+#                           commit after the next checkpoint read snapshots
+#                           the old state, before returning that old state.
+#   late_checkpoint_foreign  Commit a different holder and sentinel record.
 #   acquire_conflict  None | "create" | "patch". The selected ownership write
 #                     loses to a deterministic external holder.
 #   stale_record_cas  an external writer advances resourceVersion and installs
@@ -228,6 +232,8 @@ BASE = {
     "ownership_patch_fails": None,
     "ownership_create_fails": None,
     "checkpoint_read_failures": 0,
+    "late_checkpoint_patch": None,
+    "late_checkpoint_foreign": False,
     "acquire_conflict": None,
     "stale_record_cas": False,
     "release_conflict": False,
@@ -453,6 +459,12 @@ SCENARIOS = {
     "persist-fails": {"checkpoint_patch_fails": "always"},
     # One apiserver 5xx on the first record patch, then the same patch succeeds.
     "record-transient-once": {"checkpoint_patch_fails": "transient-once"},
+    "record-commit-after-read": {"late_checkpoint_patch": "record"},
+    "release-commit-after-read": {"late_checkpoint_patch": "release"},
+    "record-foreign-commit-after-read": {
+        "late_checkpoint_patch": "record",
+        "late_checkpoint_foreign": True,
+    },
     # The first record patch commits and the apiserver still answers 5xx.
     "record-committed-then-5xx": {"checkpoint_patch_fails": "committed-then-5xx"},
     # Every record patch answers 5xx and leaves the object unchanged.
@@ -1679,6 +1691,17 @@ if program == "kubectl":
             save_checkpoint(external)
             (root / "sentinel-record.txt").write_text(SENTINEL_RECORD)
             conflict("the object has been modified")
+        if kind == scenario["late_checkpoint_patch"] and patches_captured({kind}) == 1:
+            committed = apply_patch(current, operations)
+            committed["metadata"]["resourceVersion"] = next_resource_version(current)
+            if scenario["late_checkpoint_foreign"]:
+                committed.setdefault("data", {})["record"] = SENTINEL_RECORD
+                committed["metadata"]["annotations"] = {
+                    HOLDER_ANNOTATION: PATCH_WINNER,
+                    ACTION_ANNOTATION: WINNING_ACTION,
+                }
+            (root / "late-checkpoint-write.json").write_text(json.dumps(committed))
+            transient_failure()
         fails = scenario["checkpoint_patch_fails"]
         if kind == "record" and fails == "transient-once" and record_patches_captured() == 1:
             transient_failure()
@@ -1764,6 +1787,10 @@ if program == "kubectl":
                 print("error: i/o timeout", file=sys.stderr)
                 sys.exit(1)
             checkpoint = read_checkpoint()
+            pending = root / "late-checkpoint-write.json"
+            if pending.exists():
+                save_checkpoint(json.loads(pending.read_text()))
+                pending.unlink()
             if checkpoint is not None:
                 emit(checkpoint)
             print(

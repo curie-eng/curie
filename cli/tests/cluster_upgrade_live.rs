@@ -3814,6 +3814,71 @@ fn committed_takeover_with_existing_record_is_adopted() {
     assert_ownership_released(&fixture);
 }
 
+#[test]
+fn checkpoint_retry_late_record_commit_is_adopted_after_conflict() {
+    let fixture = Fixture::new(None);
+    let output = fixture.local("record-commit-after-read");
+    assert!(output.status.success(), "{}", visible(&output));
+    let patches: Vec<_> = fixture
+        .patches()
+        .into_iter()
+        .filter(is_record_patch)
+        .collect();
+    assert_eq!(
+        patches.iter().filter(|patch| *patch == &patches[0]).count(),
+        2
+    );
+    assert_eq!(fixture.last_record()["status"], "succeeded");
+    assert!(record_completed(&fixture.last_record(), "commit"));
+    assert_ownership_released(&fixture);
+}
+
+#[test]
+fn checkpoint_retry_late_release_commit_is_adopted_after_conflict() {
+    let fixture = Fixture::new(None);
+    let output = fixture.local("release-commit-after-read");
+    assert!(output.status.success(), "{}", visible(&output));
+    assert_eq!(
+        fixture
+            .patches()
+            .iter()
+            .filter(|patch| is_release_patch(patch))
+            .count(),
+        2
+    );
+    assert_eq!(fixture.last_record()["status"], "succeeded");
+    assert_ownership_released(&fixture);
+}
+
+#[test]
+fn checkpoint_retry_late_foreign_commit_stays_a_conflict() {
+    let fixture = Fixture::new(None);
+    let output = fixture.local("record-foreign-commit-after-read");
+    let message = visible(&output);
+    assert!(!output.status.success(), "{message}");
+    assert!(message.contains("Conflict"), "{message}");
+    assert_eq!(
+        fixture
+            .patches()
+            .iter()
+            .filter(|patch| is_record_patch(patch))
+            .count(),
+        2
+    );
+    let checkpoint: Value = serde_json::from_str(
+        &fs::read_to_string(fixture.0.path().join("checkpoint.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        checkpoint["metadata"]["annotations"][HOLDER_ANNOTATION],
+        PATCH_WINNER
+    );
+    let record: Value =
+        serde_json::from_str(checkpoint["data"]["record"].as_str().unwrap()).unwrap();
+    assert_eq!(record["status"], "external_sentinel");
+    assert!(fixture.helm_upgrades().is_empty());
+}
+
 fn assert_reread_before_second_write(fixture: &Fixture, verb: &str) {
     let calls = fixture.argv();
     let writes: Vec<_> = calls
