@@ -10,7 +10,7 @@ to the worker, and wipes everything the claim left behind before the shell
 takes another claim.
 
 The default is one shared pool for every agent, sized for concurrent claims.
-Agents do not reserve idle shells. An operator may explicitly assign an agent
+Agents do not each reserve a separate pool. An operator may explicitly assign an agent
 its own pool for isolation; credentials do not require a dedicated pool.
 A shell has no agent-specific secrets or runtime configuration between claims.
 
@@ -221,10 +221,12 @@ The child environment is built, never inherited. It holds the image's
 `PATH`, `LANG`, `LC_ALL`, `TZ`, `SSL_CERT_FILE`, `PYTHONUNBUFFERED` and
 `CURIE_PROC_DUMPABLE_PRELOAD` and the deployment-wide names listed above.
 The supervisor writes the worker's filtered boot environment to
-`runner-environment.json` inside the fresh claim directory with mode `0400`,
+`runner-environment.json` inside the claim's private `HOME` with mode `0400`,
 owned by the runner UID (1000 in the standard image). A shell-owned launcher
-reads that file and constructs the fresh environment before executing the
-configured runner command. The runner still consumes its existing BootEnv
+reads and unlinks that file, then constructs the fresh environment before
+executing the configured runner command. A later bundle process cannot read
+platform caller or route tokens back from the bootstrap file after the runner
+has removed those names from its subprocess environment. The runner still consumes its existing BootEnv
 contract; no frozen protocol or bundle format changes. The supervisor sets
 `HOME`, `TMPDIR`, `CURIE_PLUGIN_DIR`,
 `CURIE_SANDBOX_ID` and `CURIE_RUNNER_PORT` itself. No `CURIE_SUPERVISOR_`
@@ -249,6 +251,12 @@ Every control call carries `Authorization: Bearer <control credential>`.
 | `DELETE /_curie/supervisor/v1/claims/<claim>/<generation>?mode=retire` or `mode=suspend` | 200 with `outcome` `cleaned`, `quarantined` or `absent`; 409 with `absent` when another claim holds the shell. Retiring a generation the shell never started fences it, so a late create for it is refused. |
 | `* /c/<claim>/<generation>/<runner path>` | The runner's own interface, with the claim's runner bearer. 410 for a claim or generation the shell is not serving, 401 for any other bearer, 503 once the child has exited. Responses stream through unbuffered, so NDJSON turns, turn epochs, timeouts and disconnect cancellation behave as they do on a direct connection. |
 
+Workers and supervisors must use claim manifest version 2. Version 1 is refused;
+there is no environment-default delivery path for older peers. Upgrade both
+worker and shell images before admitting shared claims. In particular, do not
+relabel old agent-specific shells into the generic inventory while they still
+carry agent credentials.
+
 The archive holds `claim.json` (the manifest: claim, generation, boot env,
 executor secret names, withheld names, attachment mode) and the `bundle/`,
 `workspace/` and `attachments/` trees. The supervisor deletes the manifest
@@ -270,8 +278,9 @@ and must differ from the control credential. Each claim gets a new directory,
 `HOME` and `TMPDIR`. Bundle code and its immutable plugin templates are delivered
 per claim, remain root-owned and read only, and retain executable permissions
 where needed. The runner cannot write them or chmod them. Mutable runtime
-configuration and credentials are separate runner-owned `0400` claim files.
-Root supervision wipes both kinds of files at claim end. Nothing from a prior
+configuration and credentials use a separate runner-owned `0400` bootstrap
+file, consumed before exec. Upload token files remain available for bundle
+upload commands. Root supervision wipes the complete claim tree at claim end. Nothing from a prior
 claim is inherited into the next runner process.
 
 When the bound agent has configured upload listeners, the worker mints `ccu`

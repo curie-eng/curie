@@ -36,7 +36,7 @@ def _config(tmp_path: Path, **overrides: object) -> SupervisorConfig:
 def _stage(tmp_path: Path, **manifest: object) -> tuple[stage.StagedClaim, stage.Manifest]:
     config = _config(tmp_path)
     body = {
-        "v": 1,
+        "v": 2,
         "claim": "claim-a",
         "generation": 1,
         "env": {"CURIE_RUNNER_TOKEN": BEARER, "HOME": "/elsewhere", "CURIE_FLAG": "1"},
@@ -275,3 +275,24 @@ def test_claim_environment_loader_refuses_missing_or_public_files(tmp_path: Path
     source.chmod(0o444)
     with pytest.raises(ValueError, match="0400"):
         claim_environment({"CURIE_SHELL_CLAIM_ENV_FILE": str(source)})
+
+
+def test_the_launcher_consumes_platform_credentials_before_executing_bundle_code(
+    tmp_path: Path,
+) -> None:
+    from curie_shell_supervisor.launch import claim_environment
+
+    caller = "caller-" + "a" * 32
+    staged, manifest = _stage(
+        tmp_path,
+        env={
+            "CURIE_RUNNER_TOKEN": BEARER,
+            "CURIE_CONNECTOR_CALLER_TOKEN": caller,
+        },
+    )
+    env = stage.child_environment(manifest, staged, config=_config(tmp_path), environ={})
+    source = Path(env["CURIE_SHELL_CLAIM_ENV_FILE"])
+    restored = claim_environment(env)
+    assert restored["CURIE_CONNECTOR_CALLER_TOKEN"] == caller
+    assert restored["CURIE_RUNNER_TOKEN"] == BEARER
+    assert not source.exists(), "bundle processes must not recover platform credentials from a file"

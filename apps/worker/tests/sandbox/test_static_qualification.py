@@ -564,7 +564,7 @@ def test_connector_endpoint_settings_reach_the_runner_on_a_shell(
 
 
 _ALTERNATING_BOOT = b"""
-import json, os, stat
+import json, os
 from pathlib import Path
 from functools import partial
 from claude_agent_sdk import AssistantMessage, ResultMessage, TextBlock
@@ -574,7 +574,7 @@ seen = {
     "env": dict(os.environ),
     "config": json.loads((Path(os.environ["CURIE_PLUGIN_DIR"]) / "agent.json").read_text()),
     "files": {str(p.relative_to(root)): p.read_text() for p in root.rglob("*") if p.is_file()},
-    "mode": stat.S_IMODE((root / "runner-environment.json").stat().st_mode),
+    "bootstrap_consumed": not (Path(os.environ["HOME"]) / "runner-environment.json").exists(),
 }
 Path(os.environ["PROBE_RECORD_DIR"], "seen.json").write_text(json.dumps(seen))
 text = ("current=" + os.environ["EXTERNAL_API_TOKEN"]
@@ -699,7 +699,7 @@ def test_alternating_agents_have_private_config_credentials_and_redaction(
                 seen = json.loads((record / "seen.json").read_text())
                 assert seen["env"]["EXTERNAL_API_TOKEN"] == credentials[agent]
                 assert seen["config"] == {"agent": agent}
-                assert seen["mode"] == 0o400
+                assert seen["bootstrap_consumed"] is True
                 other = next(name for name in agents if name != agent)
                 assert credentials[other] not in json.dumps(seen)
                 assert credentials[other] not in str(frames)
