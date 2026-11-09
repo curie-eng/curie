@@ -23,10 +23,8 @@ async def retained_ref_reply():
     """External Slack alone is synthetic; adapter and reply router are real."""
     from aiohttp import web
     from curie_channel_gateway.reply_transport import HttpReplyAdapter
-    from curie_worker.reply_sink import (
-        ReplySinkRouter,
-        SlackReplyAdapter,
-    )
+    from curie_channel_gateway.slack.slack_sink import SlackReplyAdapter
+    from curie_worker.reply_sink import ReplySinkRouter
 
     calls = []
     posted = 0
