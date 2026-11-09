@@ -722,8 +722,40 @@ class ApprovalClient:
             status, body = await exchange_identity_json(self._client, outgoing, budget_s=budget)
             denials = {
                 403: {"caller_not_allowed"},
-                409: {"approval_provenance_conflict", "unsupported_approval"},
-                413: {"body_too_large"}, 422: {"invalid_approval_context"},
+                409: {
+                    "approval_provenance_conflict",
+                    "approval_route_locked",
+                    "approval_ticket_replayed",
+                    "approval_ticket_required",
+                    "approval_ticket_route_mismatch",
+                    "approval_ticket_unregistered",
+                    "approver_dm_receiver_missing",
+                    "approver_dm_requires_dynamic",
+                    "approver_ticket.bundle_gate_mismatch",
+                    "approver_ticket_requires_requester_identity",
+                    "approver_ticket_state_invalid",
+                    "unsupported_approval",
+                },
+                413: {"body_too_large"},
+                422: {
+                    "approval deadline exceeds the supported timestamp range",
+                    "approval_ticket_approver_inactive",
+                    "approval_ticket_arguments_mismatch",
+                    "approval_ticket_arguments_unstable",
+                    "approval_ticket_grant_too_large",
+                    "approval_ticket_invalid_ticket",
+                    "approval_ticket_key_mismatch",
+                    "approval_ticket_outside_ceiling",
+                    "approval_ticket_preparation_expired",
+                    "approval_ticket_recipient_duplicate",
+                    "approval_ticket_requester_mismatch",
+                    "approval_ticket_scope_mismatch",
+                    "approver_dm_account_missing",
+                    "approver_dm_account_unresolved",
+                    "approver_dm_recipient_count",
+                    "approver_dm_wrong_installation",
+                    "invalid_approval_context",
+                },
             }
             if status in denials and set(body) == {"detail"} and body["detail"] in denials[status]:
                 raise ApprovalContinuityRefused()

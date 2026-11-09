@@ -17,7 +17,7 @@ from curie_channel_gateway.mail.adapter import MailAdapter
 from curie_channel_gateway.mail.config import MailAdapterConfig
 from curie_channel_gateway.mail.egress import make_server
 from curie_channel_gateway.reply_transport import HttpReplyAdapter
-from curie_worker.consumer import Consumer
+from curie_worker.consumer import Consumer, refuse_unconfigured_reminder
 from curie_worker.delivery_lease import DeliveryLeaseStore
 from curie_worker.markers import Markers
 
@@ -122,6 +122,7 @@ def test_admitted_mail_completion_dead_letters_deleted_thread_only(
                         kernel=h.kernel,
                         config=h.config,
                         leases=DeliveryLeaseStore(h.async_redis, h.config),
+                        reminders=refuse_unconfigured_reminder,
                     )
                     await consumer.ensure_group()
                     qe = _qevent(event_id="deleted-completion").model_copy(
@@ -210,6 +211,7 @@ def test_refused_provider_connection_persists_completion_cause(
                             kernel=h.kernel,
                             config=h.config,
                             leases=DeliveryLeaseStore(h.async_redis, h.config),
+                            reminders=refuse_unconfigured_reminder,
                         )
                         await consumer.ensure_group()
                         qe = _qevent(event_id=f"refused-{refusal_stage}").model_copy(
@@ -297,7 +299,8 @@ def test_fenced_settle_clears_cause_only_for_current_owner(make_harness) -> None
             markers = Markers(h.async_redis, h.config)
             leases = DeliveryLeaseStore(h.async_redis, h.config)
             consumer = Consumer(
-                redis=h.async_redis, kernel=h.kernel, config=h.config, leases=leases
+                redis=h.async_redis, kernel=h.kernel, config=h.config, leases=leases,
+                reminders=refuse_unconfigured_reminder,
             )
             await consumer.ensure_group()
 
@@ -404,6 +407,7 @@ def test_generic_retry_failure_clears_refusal_cause_without_clearing_completion(
                     kernel=h.kernel,
                     config=h.config,
                     leases=DeliveryLeaseStore(h.async_redis, h.config),
+                    reminders=refuse_unconfigured_reminder,
                 )
                 await consumer.ensure_group()
                 qe = _qevent(event_id="refusal-then-fault").model_copy(

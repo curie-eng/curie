@@ -14,13 +14,14 @@ import json
 import uuid
 from typing import Any
 
+import httpx
 import pytest
 from aci_protocol import Final, SessionStatus
 from curie_internal.identity_approval import ApprovalCreationIdentityV1
-from curie_worker.approvals import ApprovalContinuityRefused, CreatedApproval
+from curie_worker.approvals import ApprovalClient, ApprovalContinuityRefused, CreatedApproval
 from curie_worker.binding import GRANT_ARGUMENTS_ENV, GRANT_TOOL_ENV
 from curie_worker.capacity_wait import WAIT_REPLY_REF_FIELD
-from curie_worker.consumer import Consumer
+from curie_worker.consumer import Consumer, refuse_unconfigured_reminder
 from curie_worker.delivery_lease import DeliveryLeaseStore
 from curie_worker.identity_authority import TurnAuthorityUnavailable
 from curie_worker.kernel import identity
@@ -136,6 +137,7 @@ def test_park_wake_reclaim_keeps_original_bytes_through_actual_approval_pause(
             leases = DeliveryLeaseStore(h.async_redis, h.config)
             consumer = Consumer(
                 redis=h.async_redis, kernel=h.kernel, config=h.config, leases=leases,
+                reminders=refuse_unconfigured_reminder,
             )
             entry_id, observed = await pending_entry(h, consumer, fields)
             lease = await leases.acquire(
@@ -372,6 +374,7 @@ def test_identity_creation_outcome_never_uses_legacy_escalation_or_unverified_re
             leases = DeliveryLeaseStore(h.async_redis, h.config)
             consumer = Consumer(
                 redis=h.async_redis, kernel=h.kernel, config=h.config, leases=leases,
+                reminders=refuse_unconfigured_reminder,
             )
             entry_id, observed = await pending_entry(h, consumer, {
                 "payload": raw, "curie_identity_context_v1": CAPSULE,
@@ -431,6 +434,7 @@ def test_selected_email_turn_without_approver_emails_reaches_identity_creation(
             leases = DeliveryLeaseStore(h.async_redis, h.config)
             consumer = Consumer(
                 redis=h.async_redis, kernel=h.kernel, config=h.config, leases=leases,
+                reminders=refuse_unconfigured_reminder,
             )
             entry_id, observed = await pending_entry(h, consumer, {
                 "payload": raw, "curie_identity_context_v1": CAPSULE,
@@ -440,4 +444,62 @@ def test_selected_email_turn_without_approver_emails_reaches_identity_creation(
             assert request.reply_kind == "email"
             assert request.route is None
             assert request.card_channel == "acme-agent@example.com"
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize(
+    ("status", "detail", "settled"),
+    [
+        (422, "approval_ticket_preparation_expired", True),
+        (422, "approver_dm_recipient_count", True),
+        (503, "authority_unavailable", False),
+    ],
+)
+def test_definite_creation_refusal_settles_the_turn(
+    make_harness: Any, status: int, detail: str, settled: bool,
+) -> None:
+    """A coded creation refusal ACKs the turn. Availability failure stays pending."""
+
+    async def run() -> None:
+        async def handle(_request: httpx.Request) -> httpx.Response:
+            return httpx.Response(status, json={"detail": detail})
+
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handle)) as http:
+            approvals = ApprovalClient(
+                api_base_url="https://core.example.test",
+                api_key="SyntheticPlatformKey",
+                client=http,
+                read_timeout_s=30,
+                worker_token="SyntheticPrivateWorkerToken",
+            )
+            async with make_harness(
+                binding=Binding(), identity_authority=Core(), approvals=approvals,
+            ) as h:
+                h.runner.default_script = awaiting()
+                event = qevent("synthetic creation refusal")
+                raw = raw_payload(event)
+                consumer = Consumer(
+                    redis=h.async_redis,
+                    kernel=h.kernel,
+                    config=h.config,
+                    leases=DeliveryLeaseStore(h.async_redis, h.config),
+                    reminders=refuse_unconfigured_reminder,
+                )
+                entry_id, observed = await pending_entry(h, consumer, {
+                    "payload": raw, "curie_identity_context_v1": CAPSULE,
+                })
+                await consumer._handle(entry_id, observed)
+                pending = await h.async_redis.xpending(
+                    h.config.stream, h.config.consumer_group,
+                )
+                done = bool(await h.async_redis.exists(h.config.done_key(event.event_id)))
+                assert pending["pending"] == (0 if settled else 1)
+                assert done is settled
+                assert await h.async_redis.xlen(h.config.dead_letter_stream_name()) == 0
+                assert h.sink.events == []
+                assert all(
+                    item.operating_mode != "Suspended"
+                    for item in h.fake_k8s.sandboxes.values()
+                )
+
     asyncio.run(run())

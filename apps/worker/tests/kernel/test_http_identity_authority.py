@@ -21,7 +21,7 @@ from curie_internal.identity_authority import TurnAuthorityRequestV1, TurnAuthor
 from curie_worker import workspace as workspace_module
 from curie_worker.binding import HttpIdentityBinding
 from curie_worker.capacity_wait import WAIT_REPLY_REF_FIELD
-from curie_worker.consumer import Consumer
+from curie_worker.consumer import Consumer, refuse_unconfigured_reminder
 from curie_worker.delivery_lease import DeliveryLeaseStore
 from curie_worker.hook_runs import HookRunRecorderError
 from curie_worker.identity_authority import HttpTurnAuthorityClient, TurnAuthorityUnavailable
@@ -540,6 +540,7 @@ def test_consumer_keeps_original_hash_and_all_fields_across_capacity_placeholder
             leases = DeliveryLeaseStore(h.async_redis, h.config)
             consumer = Consumer(
                 redis=h.async_redis, kernel=h.kernel, config=h.config, leases=leases,
+                reminders=refuse_unconfigured_reminder,
             )
             entry_id, observed = await pending_entry(h, consumer, fields)
             lease = await leases.acquire(
@@ -601,6 +602,7 @@ def test_unavailable_http_delivery_stays_pending_until_the_existing_cap_dead_let
             leases = DeliveryLeaseStore(h.async_redis, h.config)
             consumer = Consumer(
                 redis=h.async_redis, kernel=h.kernel, config=h.config, leases=leases,
+                reminders=refuse_unconfigured_reminder,
             )
             raw = qevent("unavailable current authority").model_dump_json()
             fields = {"payload": raw, "curie_identity_context_v1": CAPSULE}
@@ -835,6 +837,7 @@ def test_capacity_queued_notice_suppresses_unverified_http_without_faking_delive
             leases = DeliveryLeaseStore(h.async_redis, h.config)
             consumer = Consumer(
                 redis=h.async_redis, kernel=h.kernel, config=h.config, leases=leases,
+                reminders=refuse_unconfigured_reminder,
             )
             legacy = qevent("legacy courtesy", thread="legacy-courtesy")
             _, legacy_record = await park_notice_record(
@@ -864,6 +867,7 @@ def test_capacity_expiry_repair_suppresses_unverified_http_and_keeps_original_fi
             leases = DeliveryLeaseStore(h.async_redis, h.config)
             consumer = Consumer(
                 redis=h.async_redis, kernel=h.kernel, config=h.config, leases=leases,
+                reminders=refuse_unconfigured_reminder,
             )
             event = qevent("unverified repaired expiry", thread="http-expiry-repair")
             fields, _ = await park_notice_record(h, consumer, leases, event, recognized=True)
@@ -890,6 +894,7 @@ def test_expired_http_wait_delivery_settles_without_an_unverified_reply(make_har
             leases = DeliveryLeaseStore(h.async_redis, h.config)
             consumer = Consumer(
                 redis=h.async_redis, kernel=h.kernel, config=h.config, leases=leases,
+                reminders=refuse_unconfigured_reminder,
             )
             event = qevent("unverified expired delivery", thread="http-expired-wait")
             fields, _ = await park_notice_record(h, consumer, leases, event, recognized=True)
@@ -965,6 +970,7 @@ def test_completed_workspace_failure_retries_with_current_authority_in_the_same_
             leases = DeliveryLeaseStore(h.async_redis, h.config)
             consumer = Consumer(
                 redis=h.async_redis, kernel=h.kernel, config=h.config, leases=leases,
+                reminders=refuse_unconfigured_reminder,
             )
             event = qevent("Use https://github.com/acme-corp/acme-bot", thread="retry-workspace")
             fields = {"payload": event.model_dump_json(), "curie_identity_context_v1": CAPSULE}

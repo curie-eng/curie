@@ -13,7 +13,7 @@ from curie_channel_gateway.reply_transport import HttpReplyAdapter
 from curie_worker.binding import BindingResolver
 from curie_worker.bundle_store import BundleStore
 from curie_worker.config import WorkerConfig
-from curie_worker.consumer import Consumer
+from curie_worker.consumer import Consumer, refuse_unconfigured_reminder
 from curie_worker.delivery_lease import DeliveryLeaseStore
 from curie_worker.kernel.core import Kernel
 from curie_worker.markers import Markers
@@ -85,7 +85,11 @@ async def main() -> None:
                 ),
             )
             consumer = Consumer(
-                redis=store, kernel=kernel, config=config, leases=DeliveryLeaseStore(store, config)
+                redis=store,
+                kernel=kernel,
+                config=config,
+                leases=DeliveryLeaseStore(store, config),
+                reminders=refuse_unconfigured_reminder,
             )
             asyncio.get_running_loop().add_signal_handler(signal.SIGTERM, consumer.request_stop)
             try:

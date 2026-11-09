@@ -30,7 +30,7 @@ from typing import Any
 import pytest
 from curie_worker import protected_recovery
 from curie_worker.capacity_wait import CapacityWaitRequested, CapacityWaitStore
-from curie_worker.consumer import Consumer
+from curie_worker.consumer import Consumer, refuse_unconfigured_reminder
 from curie_worker.delivery_lease import DeliveryLeaseStore
 
 from ..queue_fixtures import qevent, wait_until
@@ -82,6 +82,7 @@ def consumer_for(h: Any) -> Consumer:
         kernel=h.kernel,
         config=h.config,
         leases=DeliveryLeaseStore(h.async_redis, h.config),
+        reminders=refuse_unconfigured_reminder,
     )
 
 

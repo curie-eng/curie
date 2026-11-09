@@ -1596,7 +1596,7 @@ def test_retained_workspace_file_turn_refuses_without_mutating_any_owned_state(
 
     async def go() -> None:
         from curie_internal.turn_queue import to_stream_fields
-        from curie_worker.consumer import Consumer
+        from curie_worker.consumer import Consumer, refuse_unconfigured_reminder
         from curie_worker.delivery_lease import DeliveryLeaseStore
 
         deployment_id = uuid.uuid4()
@@ -1629,6 +1629,7 @@ def test_retained_workspace_file_turn_refuses_without_mutating_any_owned_state(
                 kernel=h.kernel,
                 config=h.config,
                 leases=store,
+                reminders=refuse_unconfigured_reminder,
             )
             await consumer.ensure_group()
             file_event = _qevent(
@@ -2304,7 +2305,7 @@ def test_a_channel_port_turn_hands_the_lane_the_binding_it_arrived_on(make_harne
 @pytest.mark.parametrize("side_effect", [False, True])
 def test_attachment_handoff_preserves_predecessor_action_marker(make_harness, side_effect) -> None:
     from curie_internal.turn_queue import to_stream_fields
-    from curie_worker.consumer import Consumer
+    from curie_worker.consumer import Consumer, refuse_unconfigured_reminder
     from curie_worker.delivery_lease import DeliveryLeaseStore
     from curie_worker.kernel.routing import _thread_key_for
 
@@ -2321,7 +2322,13 @@ def test_attachment_handoff_preserves_predecessor_action_marker(make_harness, si
                 },
             )
             store = DeliveryLeaseStore(h.async_redis, h.config)
-            consumer = Consumer(redis=h.async_redis, kernel=h.kernel, config=h.config, leases=store)
+            consumer = Consumer(
+                redis=h.async_redis,
+                kernel=h.kernel,
+                config=h.config,
+                leases=store,
+                reminders=refuse_unconfigured_reminder,
+            )
             await consumer.ensure_group()
             await h.async_redis.xadd(h.config.stream, to_stream_fields(first))
             rows = await h.async_redis.xreadgroup(
@@ -2466,7 +2473,7 @@ def _run_attachment_handoff_worker(
 ) -> None:
     import redis
     from curie_test_support.valkey import VALKEY_HOST, VALKEY_PORT, VALKEY_PW
-    from curie_worker.consumer import Consumer
+    from curie_worker.consumer import Consumer, refuse_unconfigured_reminder
     from curie_worker.delivery_lease import DeliveryLeaseStore
     from curie_worker.markers import Markers
     from curie_worker.runner_client import RunnerClient
@@ -2514,6 +2521,7 @@ def _run_attachment_handoff_worker(
             kernel=kernel,
             config=config,
             leases=DeliveryLeaseStore(broker, config),
+            reminders=refuse_unconfigured_reminder,
         )
         await worker._dispatch(entry, fields)
         await asyncio.gather(*list(worker._inflight))
@@ -2530,7 +2538,7 @@ def test_retained_attachment_handoff_recovers_without_repeating_action(
 
     from aci_protocol import SideEffectFlag
     from curie_internal.turn_queue import to_stream_fields
-    from curie_worker.consumer import Consumer
+    from curie_worker.consumer import Consumer, refuse_unconfigured_reminder
     from curie_worker.delivery_lease import DeliveryLeaseStore
     from curie_worker.kernel.routing import _thread_key_for
 
@@ -2572,7 +2580,13 @@ def test_retained_attachment_handoff_recovers_without_repeating_action(
             thread = _thread_key_for(event)
             retained = h.substrate.claim(thread, env=binding.boot_env(binding.resolved, thread))
             store = DeliveryLeaseStore(h.async_redis, h.config)
-            consumer = Consumer(redis=h.async_redis, kernel=h.kernel, config=h.config, leases=store)
+            consumer = Consumer(
+                redis=h.async_redis,
+                kernel=h.kernel,
+                config=h.config,
+                leases=store,
+                reminders=refuse_unconfigured_reminder,
+            )
             await consumer.ensure_group()
             await h.async_redis.xadd(h.config.stream, to_stream_fields(event))
             rows = await h.async_redis.xreadgroup(
@@ -2620,7 +2634,11 @@ def test_retained_attachment_handoff_recovers_without_repeating_action(
                 attachments=_FakeAttachmentLane(),
             )
             recovered = Consumer(
-                redis=h.async_redis, kernel=recovered_kernel, config=h.config, leases=store
+                redis=h.async_redis,
+                kernel=recovered_kernel,
+                config=h.config,
+                leases=store,
+                reminders=refuse_unconfigured_reminder,
             )
             await recovered._dispatch(entry, fields)
             await asyncio.gather(*list(recovered._inflight))
@@ -2644,7 +2662,7 @@ def test_attachment_handoff_checks_marker_recovered_during_fetch(
     make_harness, side_effect: bool
 ) -> None:
     from curie_internal.turn_queue import to_stream_fields
-    from curie_worker.consumer import Consumer
+    from curie_worker.consumer import Consumer, refuse_unconfigured_reminder
     from curie_worker.delivery_lease import DeliveryLeaseStore
     from curie_worker.kernel.routing import _thread_key_for
 
@@ -2659,7 +2677,13 @@ def test_attachment_handoff_checks_marker_recovered_during_fetch(
             thread = _thread_key_for(event)
             retained = h.substrate.claim(thread, env=binding.boot_env(binding.resolved, thread))
             store = DeliveryLeaseStore(h.async_redis, h.config)
-            consumer = Consumer(redis=h.async_redis, kernel=h.kernel, config=h.config, leases=store)
+            consumer = Consumer(
+                redis=h.async_redis,
+                kernel=h.kernel,
+                config=h.config,
+                leases=store,
+                reminders=refuse_unconfigured_reminder,
+            )
             await consumer.ensure_group()
             await h.async_redis.xadd(h.config.stream, to_stream_fields(event))
             rows = await h.async_redis.xreadgroup(

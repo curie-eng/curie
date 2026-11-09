@@ -33,7 +33,7 @@ from aci_protocol import (
     parse_ndjson_line,
 )
 from curie_internal.turn_queue import to_stream_fields
-from curie_worker.consumer import Consumer
+from curie_worker.consumer import Consumer, refuse_unconfigured_reminder
 from curie_worker.delivery_lease import DeliveryLeaseStore
 from curie_worker.kernel.routing import _thread_key_for
 
@@ -124,6 +124,7 @@ def test_an_old_runner_leaves_the_entry_pending_and_completes_nothing(
                 kernel=h.kernel,
                 config=h.config,
                 leases=DeliveryLeaseStore(h.async_redis, h.config),
+                reminders=refuse_unconfigured_reminder,
             )
             await consumer.ensure_group()
 
