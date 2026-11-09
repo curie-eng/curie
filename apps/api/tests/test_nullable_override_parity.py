@@ -82,6 +82,7 @@ KNOWN_BODY_MODULES = frozenset(
     {
         "curie_api.schemas.directory",
         "curie_api.routers.identity_connect",
+        "curie_api.routers.identity_operator",
         "curie_api.factory_progress",
         "curie_api.factory_usage",
         "curie_api.schemas.action_executions",
@@ -101,6 +102,8 @@ KNOWN_BODY_MODULES = frozenset(
         "curie_api.schemas.deployments",
         "curie_api.schemas.evals",
         "curie_api.schemas.identity",
+        "curie_api.schemas.http_authority",
+        "curie_api.schemas.http_identity",
         "curie_api.schemas.observability",
         "curie_api.schemas.provider_installations",
         "curie_api.schemas.publications",
