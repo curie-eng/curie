@@ -25,7 +25,8 @@ def _config(tmp_path: Path, **overrides: object) -> SupervisorConfig:
         "CURIE_SUPERVISOR_TLS_CERT_FILE": "cert.pem",
         "CURIE_SUPERVISOR_TLS_KEY_FILE": "key.pem",
         "CURIE_SUPERVISOR_STATE_ROOT": str(tmp_path / "state"),
-        "CURIE_SUPERVISOR_CHILD_ENV": "MODEL_KEY,CONNECTOR_A,CONNECTOR_B",
+        "CURIE_SUPERVISOR_CHILD_ENV": "MODEL_KEY",
+        "CURIE_MODEL_ENV_KEY": "MODEL_KEY",
         "CURIE_SUPERVISOR_CHILD_ENV_PUBLIC": "OTEL_EXPORTER_OTLP_ENDPOINT",
         **{key: str(value) for key, value in overrides.items()},
     }
@@ -35,7 +36,7 @@ def _config(tmp_path: Path, **overrides: object) -> SupervisorConfig:
 def _stage(tmp_path: Path, **manifest: object) -> tuple[stage.StagedClaim, stage.Manifest]:
     config = _config(tmp_path)
     body = {
-        "v": 1,
+        "v": 2,
         "claim": "claim-a",
         "generation": 1,
         "env": {"CURIE_RUNNER_TOKEN": BEARER, "HOME": "/elsewhere", "CURIE_FLAG": "1"},
@@ -91,8 +92,13 @@ def test_the_child_environment_is_built_name_by_name(tmp_path: Path) -> None:
         "OTEL_EXPORTER_OTLP_ENDPOINT": "http://collector",
         "UNLISTED": "never",
     }
-    env = stage.child_environment(manifest, staged, config=_config(tmp_path), environ=environ)
-    assert env["MODEL_KEY"] == "model-secret" and env["CONNECTOR_A"] == "a-secret"
+    from curie_shell_supervisor.launch import claim_environment
+
+    env = claim_environment(
+        stage.child_environment(manifest, staged, config=_config(tmp_path), environ=environ)
+    )
+    assert env["MODEL_KEY"] == "model-secret"
+    assert "CONNECTOR_A" not in env
     assert env["OTEL_EXPORTER_OTLP_ENDPOINT"] == "http://collector"
     assert "UNLISTED" not in env
     # The claim env reaches the child, except names the supervisor owns.
@@ -105,13 +111,15 @@ def test_the_child_environment_is_built_name_by_name(tmp_path: Path) -> None:
 
 
 def test_an_executor_claim_gets_only_the_secrets_it_names(tmp_path: Path) -> None:
-    staged, manifest = _stage(
-        tmp_path, executor_secret_names=["CONNECTOR_A"], withheld_env=["MODEL_KEY"]
-    )
+    staged, manifest = _stage(tmp_path, executor_secret_names=["MODEL_KEY"], withheld_env=[])
     environ = {"MODEL_KEY": "m", "CONNECTOR_A": "a", "CONNECTOR_B": "b"}
-    env = stage.child_environment(manifest, staged, config=_config(tmp_path), environ=environ)
-    assert env.get("CONNECTOR_A") == "a"
-    assert "CONNECTOR_B" not in env and "MODEL_KEY" not in env
+    from curie_shell_supervisor.launch import claim_environment
+
+    env = claim_environment(
+        stage.child_environment(manifest, staged, config=_config(tmp_path), environ=environ)
+    )
+    assert env.get("MODEL_KEY") == "m"
+    assert "CONNECTOR_B" not in env and "CONNECTOR_A" not in env
 
 
 def test_the_bundle_is_read_only_and_home_is_private(tmp_path: Path) -> None:
@@ -205,3 +213,103 @@ def test_a_credential_file_the_child_could_read_is_refused(tmp_path: Path) -> No
         key.chmod(mode)
         with pytest.raises(ConfigError, match="readable by the runner child"):
             check_private(key, child_uid=uid, child_gid=gid)
+
+
+def test_claim_environment_is_a_private_file_and_not_shell_configuration(tmp_path: Path) -> None:
+    secret = "claim-value-" + "a" * 32
+    staged, manifest = _stage(
+        tmp_path,
+        env={
+            "CURIE_RUNNER_TOKEN": BEARER,
+            "CURIE_CONNECTOR_AGENT": "acme-a",
+            "CURIE_CONNECTOR_SECRET_KEYS": "EXTERNAL_API_TOKEN",
+            "EXTERNAL_API_TOKEN": secret,
+        },
+    )
+    env = stage.child_environment(manifest, staged, config=_config(tmp_path), environ={})
+    path = Path(env["CURIE_SHELL_CLAIM_ENV_FILE"])
+    assert path.is_relative_to(staged.root)
+    assert stat.S_IMODE(path.stat().st_mode) == 0o400
+    assert path.stat().st_uid == os.getuid()
+    assert json.loads(path.read_text())["EXTERNAL_API_TOKEN"] == secret
+    assert "EXTERNAL_API_TOKEN" not in env
+    assert "CURIE_CONNECTOR_AGENT" not in env
+    assert stage.wipe(staged.root)
+    assert not path.exists()
+
+
+@pytest.mark.parametrize(
+    "override",
+    [
+        {"CURIE_SUPERVISOR_CHILD_ENV": "EXTERNAL_API_TOKEN"},
+        {"CURIE_SUPERVISOR_CHILD_ENV_PUBLIC": "CURIE_CONNECTOR_AGENT"},
+        {"CURIE_SUPERVISOR_CHILD_ENV_PUBLIC": "CURIE_CONNECTOR_CALLER_TOKEN"},
+        {"CURIE_SUPERVISOR_CHILD_ENV_PUBLIC": "CURIE_HOSTED_CONNECTOR_ENDPOINTS"},
+    ],
+)
+def test_agent_material_in_shell_configuration_is_refused(
+    tmp_path: Path, override: dict[str, str]
+) -> None:
+    with pytest.raises(ConfigError, match="per claim"):
+        _config(tmp_path, **override)
+
+
+@pytest.mark.parametrize("value", [[], {"NAME": 1}, {"BAD=NAME": "value"}, {"NAME": "bad\0value"}])
+def test_claim_environment_loader_refuses_malformed_files(tmp_path: Path, value: object) -> None:
+    from curie_shell_supervisor.launch import claim_environment
+
+    source = tmp_path / "environment.json"
+    source.write_text(json.dumps(value))
+    source.chmod(0o400)
+    with pytest.raises(ValueError):
+        claim_environment({"CURIE_SHELL_CLAIM_ENV_FILE": str(source)})
+
+
+def test_claim_environment_loader_refuses_missing_or_public_files(tmp_path: Path) -> None:
+    from curie_shell_supervisor.launch import claim_environment
+
+    source = tmp_path / "environment.json"
+    with pytest.raises(OSError):
+        claim_environment({"CURIE_SHELL_CLAIM_ENV_FILE": str(source)})
+    source.write_text("{}")
+    source.chmod(0o444)
+    with pytest.raises(ValueError, match="0400"):
+        claim_environment({"CURIE_SHELL_CLAIM_ENV_FILE": str(source)})
+
+
+def test_the_launcher_consumes_platform_credentials_before_executing_bundle_code(
+    tmp_path: Path,
+) -> None:
+    from curie_shell_supervisor.launch import claim_environment
+
+    caller = "caller-" + "a" * 32
+    staged, manifest = _stage(
+        tmp_path,
+        env={
+            "CURIE_RUNNER_TOKEN": BEARER,
+            "CURIE_CONNECTOR_CALLER_TOKEN": caller,
+        },
+    )
+    env = stage.child_environment(manifest, staged, config=_config(tmp_path), environ={})
+    source = Path(env["CURIE_SHELL_CLAIM_ENV_FILE"])
+    restored = claim_environment(env)
+    assert restored["CURIE_CONNECTOR_CALLER_TOKEN"] == caller
+    assert restored["CURIE_RUNNER_TOKEN"] == BEARER
+    assert not source.exists(), "bundle processes must not recover platform credentials from a file"
+
+
+def test_claim_environment_refuses_a_symlink_and_nonregular_file(tmp_path: Path) -> None:
+    from curie_shell_supervisor.launch import claim_environment
+
+    target = tmp_path / "target"
+    target.write_text("{}")
+    target.chmod(0o400)
+    source = tmp_path / "bootstrap"
+    source.symlink_to(target)
+    with pytest.raises((OSError, ValueError)):
+        claim_environment({"CURIE_SHELL_CLAIM_ENV_FILE": str(source)})
+    assert target.read_text() == "{}"
+    source.unlink()
+    os.mkfifo(source, 0o400)
+    with pytest.raises((OSError, ValueError)):
+        claim_environment({"CURIE_SHELL_CLAIM_ENV_FILE": str(source)})

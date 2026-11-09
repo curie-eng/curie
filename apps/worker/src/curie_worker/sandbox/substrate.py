@@ -1989,6 +1989,13 @@ class SandboxSubstrate:
             return config.warm_pool
         if runner is not None:
             return runner.pool
+        if isinstance(self._k8s, StaticPoolSandboxClient):
+            dedicated = config.agent_pools | config.connector_secret_pools
+            return (
+                agent_warm_pool_name(config.warm_pool, agent_name)
+                if agent_name in dedicated
+                else config.warm_pool
+            )
         pool = claim_warm_pool(
             config.warm_pool,
             env,
