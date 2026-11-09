@@ -23,6 +23,7 @@ import json
 import logging
 import os
 import signal
+import sys
 import tempfile
 import time
 from collections.abc import Callable
@@ -306,7 +307,12 @@ class Supervisor:
                     manifest, staged, config=self._config, environ=self._environ
                 )
                 child = await RunnerChild.spawn(
-                    self._config.runner_command,
+                    (
+                        sys.executable,
+                        "-m",
+                        "curie_shell_supervisor.launch",
+                        *self._config.runner_command,
+                    ),
                     env=env,
                     cwd=staged.home,
                     uid=self._config.child_uid,
@@ -650,10 +656,14 @@ class Supervisor:
                 if upstream.content_length is not None:
                     response.content_length = upstream.content_length
                 await response.prepare(request)
-                async for chunk in upstream.content.iter_any():
+                async for chunk in upstream.content.iter_chunked(65536):
                     await response.write(chunk)
                 await response.write_eof()
                 return response
+        except asyncio.CancelledError:
+            if request.transport is not None:
+                request.transport.abort()
+            raise
         except (aiohttp.ClientConnectionError, TimeoutError) as exc:
             # A worker that went away surfaces as a reset on write; leaving the
             # context above already closed the upstream connection, which is

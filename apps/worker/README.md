@@ -678,6 +678,31 @@ Turns started through the attachment handoff currently register no recovery
 watch and are a known gap in this bound. The bound and runner cleanup settings
 are described in [the static substrate reference](../../docs/static-pool-substrate.md).
 
+### Shared static shells
+
+With `CURIE_SANDBOX_SUBSTRATE=static`, agents share `CURIE_WARM_POOL` by default.
+Size that pool for concurrent claims. `CURIE_AGENT_SANDBOX_POOLS` and
+`CURIE_AGENT_CONNECTOR_SECRET_POOLS` remain explicit isolation opt-ins and
+require matching inventory entries. Connector credentials alone do not force
+an agent into its own pool.
+
+Agent identity, connector endpoints, caller credentials, bundle inputs and
+connector secrets arrive per claim. `CURIE_AGENT_CREDENTIAL_FILES` maps an
+agent to credential environment names and absolute UTF-8 source file paths
+on the worker, for example an external tool server's bearer. The worker reads
+those files afresh on each claim. Missing, unreadable, empty, reserved or
+withheld inputs fail closed. Their values join the runner's held-secret
+inventory before it serves. Shells retain only deployment-wide model
+credentials and shared connector trust material.
+
+The supervisor stages runtime configuration and credentials as runner-owned
+`0400` files, launches a fresh environment, and wipes the complete claim tree
+after stopping all claim processes. Bundle code stays root-owned and read only.
+A stale retirement targets its exact claim and generation, never another
+agent's later lease. Kubernetes pool selection and Secret delivery are
+unchanged. See [the static substrate reference](../../docs/static-pool-substrate.md)
+for configuration and recovery behavior.
+
 ### Capability audit: every owner verb and the fence that gates it
 
 One row per verb a delivery owner can perform that produces a durable or
