@@ -44,20 +44,23 @@ at worker start (``run.py``).
 
 from __future__ import annotations
 
+import fcntl
 import http.client
 import io
 import json
 import logging
+import os
 import random
 import re
 import socket
 import ssl
+import stat
 import tarfile
 import tempfile
 import time
 import uuid
-from collections.abc import Mapping, Sequence
-from contextlib import AbstractContextManager
+from collections.abc import Iterator, Mapping, Sequence
+from contextlib import AbstractContextManager, contextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -375,6 +378,23 @@ def _selector(label_selector: str) -> dict[str, str]:
 # -- the client ----------------------------------------------------------------
 
 
+def cleanup_stale_archives() -> None:
+    for path in Path(tempfile.gettempdir()).glob("curie-shell-stage-*.tar"):
+        try:
+            fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        except FileNotFoundError:
+            continue
+        with os.fdopen(fd, "rb") as archive:
+            info = os.fstat(archive.fileno())
+            if not stat.S_ISREG(info.st_mode) or info.st_uid != os.geteuid():
+                continue
+            try:
+                fcntl.flock(archive.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                continue
+            path.unlink(missing_ok=True)
+
+
 def parse_agent_credential_files(raw: str | None) -> dict[str, dict[str, str]]:
     try:
         value = json.loads(raw) if raw is not None else {}
@@ -637,12 +657,25 @@ class StaticPoolSandboxClient(ClaimInputStaging):
         credentials: dict[str, str] = {}
         for key, source in files.items():
             try:
-                value = Path(source).read_text(encoding="utf-8")
+                with Path(source).open(encoding="utf-8", newline="") as stream:
+                    value = stream.read()
             except (OSError, UnicodeError):
-                raise SandboxError("agent credential file is missing or unreadable") from None
+                raise SandboxError(
+                    f"agent credential file {source} is missing or unreadable"
+                ) from None
+            value = (
+                value.removesuffix("\r\n")
+                if value.endswith("\r\n")
+                else value.removesuffix("\n")
+            )
             if not value or "\0" in value:
                 raise SandboxError(
-                    "agent credential file must contain a nonempty environment value"
+                    f"agent credential file {source} must contain a nonempty environment value"
+                )
+            if value != value.strip():
+                raise SandboxError(
+                    f"agent credential file {source} has leading or trailing whitespace; "
+                    "only one final LF or CRLF is allowed"
                 )
             credentials[key] = value
         declared = {key for key in env.get(CONNECTOR_SECRET_KEYS_ENV, "").split(",") if key}
@@ -678,13 +711,10 @@ class StaticPoolSandboxClient(ClaimInputStaging):
             name, pool=pool, labels=claim_labels, bundle_ref=env.get(BUNDLE_REF_ENV)
         )
         attempt = uuid.uuid4().hex
-        archive = self._build_archive(
+        with self._build_archive(
             attempt, name, lease.generation, env, executor_secret_names, withheld
-        )
-        try:
+        ) as archive:
             self._start_on_shell(name, lease, archive, deadline)
-        finally:
-            archive.unlink(missing_ok=True)
 
     def _accepts(self, shell: Mapping[str, Any]) -> bool:
         return shell.get("isolated") is True or self._allow_unisolated
@@ -770,6 +800,7 @@ class StaticPoolSandboxClient(ClaimInputStaging):
         )
         return outcome == OUTCOME_CLEANED
 
+    @contextmanager
     def _build_archive(
         self,
         attempt: str,
@@ -778,7 +809,7 @@ class StaticPoolSandboxClient(ClaimInputStaging):
         env: Mapping[str, str],
         executor_secret_names: frozenset[str] | None,
         withheld: frozenset[str],
-    ) -> Path:
+    ) -> Iterator[Path]:
         """Stage the claim's inputs on the worker and pack them for the shell."""
 
         try:
@@ -825,23 +856,25 @@ class StaticPoolSandboxClient(ClaimInputStaging):
             handle, path = tempfile.mkstemp(prefix="curie-shell-stage-", suffix=".tar")
             archive = Path(path)
             try:
-                with open(handle, "wb") as raw, tarfile.open(fileobj=raw, mode="w") as tar:
-                    data = json.dumps(manifest, sort_keys=True).encode("utf-8")
-                    info = tarfile.TarInfo(MANIFEST_NAME)
-                    info.size = len(data)
-                    info.mode = 0o600
-                    tar.addfile(info, io.BytesIO(data))
-                    for arcname, root in (
-                        (BUNDLE_DIR, bundle),
-                        (WORKSPACE_DIR, workspace),
-                        (ATTACHMENTS_DIR, attachments),
-                    ):
-                        if root is not None:
-                            tar.add(root, arcname=arcname)
-            except BaseException:
+                with open(handle, "wb") as raw:
+                    fcntl.flock(raw.fileno(), fcntl.LOCK_EX)
+                    with tarfile.open(fileobj=raw, mode="w") as tar:
+                        data = json.dumps(manifest, sort_keys=True).encode("utf-8")
+                        info = tarfile.TarInfo(MANIFEST_NAME)
+                        info.size = len(data)
+                        info.mode = 0o600
+                        tar.addfile(info, io.BytesIO(data))
+                        for arcname, root in (
+                            (BUNDLE_DIR, bundle),
+                            (WORKSPACE_DIR, workspace),
+                            (ATTACHMENTS_DIR, attachments),
+                        ):
+                            if root is not None:
+                                tar.add(root, arcname=arcname)
+                    raw.flush()
+                    yield archive
+            finally:
                 archive.unlink(missing_ok=True)
-                raise
-            return archive
         finally:
             self._cleanup_staged_inputs(attempt)
 

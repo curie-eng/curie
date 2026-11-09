@@ -296,3 +296,20 @@ def test_the_launcher_consumes_platform_credentials_before_executing_bundle_code
     assert restored["CURIE_CONNECTOR_CALLER_TOKEN"] == caller
     assert restored["CURIE_RUNNER_TOKEN"] == BEARER
     assert not source.exists(), "bundle processes must not recover platform credentials from a file"
+
+
+def test_claim_environment_refuses_a_symlink_and_nonregular_file(tmp_path: Path) -> None:
+    from curie_shell_supervisor.launch import claim_environment
+
+    target = tmp_path / "target"
+    target.write_text("{}")
+    target.chmod(0o400)
+    source = tmp_path / "bootstrap"
+    source.symlink_to(target)
+    with pytest.raises((OSError, ValueError)):
+        claim_environment({"CURIE_SHELL_CLAIM_ENV_FILE": str(source)})
+    assert target.read_text() == "{}"
+    source.unlink()
+    os.mkfifo(source, 0o400)
+    with pytest.raises((OSError, ValueError)):
+        claim_environment({"CURIE_SHELL_CLAIM_ENV_FILE": str(source)})

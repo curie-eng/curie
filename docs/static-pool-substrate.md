@@ -171,8 +171,10 @@ provided without a hosted connector or a new bundle-format field:
 ```
 
 Set this object as `CURIE_AGENT_CREDENTIAL_FILES` on the worker. Files contain
-the exact nonempty UTF-8 credential value, without a trailing newline. Bundle
-MCP headers can reference `${EXTERNAL_API_TOKEN}` through their existing
+a nonempty UTF-8 credential value. The worker removes exactly one final LF or
+CRLF line ending, so files written by `echo` work as expected. Any other leading
+or trailing whitespace is refused with the source filename, never the value.
+Bundle MCP headers can reference `${EXTERNAL_API_TOKEN}` through their existing
 environment substitution. These names join `CURIE_CONNECTOR_SECRET_KEYS`, so
 the runner records their values in its held-secret and outbound-redaction
 inventory before serving. Reserved platform names and withheld credentials
@@ -216,6 +218,10 @@ The supervisor reads its settings from its own environment.
 | `CURIE_SUPERVISOR_SETTLE_TIMEOUT_SECONDS` | `15` | How long retirement waits for an idle runner with durable history. |
 | `CURIE_SUPERVISOR_STOP_GRACE_SECONDS` | `10` | How long a stopped child has after SIGTERM before SIGKILL. |
 | `CURIE_SUPERVISOR_MAX_STAGE_BYTES`, `CURIE_SUPERVISOR_MAX_STAGE_MEMBERS` | 2 GiB, 200000 | Upload limits. |
+
+At worker startup, abandoned `curie-shell-stage-*.tar` archives are deleted from
+the worker's private temporary directory. Active uploads retain an exclusive
+file lock and are left alone. Keep each worker deployment's `TMPDIR` private.
 
 The child environment is built, never inherited. It holds the image's
 `PATH`, `LANG`, `LC_ALL`, `TZ`, `SSL_CERT_FILE`, `PYTHONUNBUFFERED` and
@@ -307,6 +313,12 @@ substrates.
 The 3600-second cap is enforced at mint time only; the listener checks expiry
 only, which is safe because only the worker holds the signing key. On Kubernetes
 or Docker, the worker warns at binding time when upload URLs are configured.
+
+Shells must run with Docker's default seccomp profile or an equivalent policy
+that blocks keyring operations (`keyctl`, `add_key`, and `request_key`).
+Unconfined `keyctl` can leave key names in UID 1000
+keyrings across containers. Filesystem and process cleanup does not remove
+that kernel state; seccomp is an operator requirement.
 
 Before it serves, the supervisor walks the whole filesystem (virtual
 filesystems excepted) and refuses to start, with exit code 78, when the child

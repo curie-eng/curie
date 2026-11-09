@@ -690,7 +690,8 @@ Agent identity, connector endpoints, caller credentials, bundle inputs and
 connector secrets arrive per claim. `CURIE_AGENT_CREDENTIAL_FILES` maps an
 agent to credential environment names and absolute UTF-8 source file paths
 on the worker, for example an external tool server's bearer. The worker reads
-those files afresh on each claim. Missing, unreadable, empty, reserved or
+those files afresh on each claim, removes one final LF or CRLF, and refuses any
+other leading or trailing whitespace. Missing, unreadable, empty, reserved or
 withheld inputs fail closed. Their values join the runner's held-secret
 inventory before it serves. Shells retain only deployment-wide model
 credentials and shared connector trust material.

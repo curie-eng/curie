@@ -109,7 +109,7 @@ from .sandbox import (
     shell_ssl_context,
 )
 from .sandbox.quota import parse_admission_config
-from .sandbox.static import parse_agent_credential_files
+from .sandbox.static import cleanup_stale_archives, parse_agent_credential_files
 from .schema_startup import assert_worker_schema
 from .sibling_turns import build_sibling_limit
 from .stream_retention import StreamRetention, build_stream_retention
@@ -445,6 +445,7 @@ def _static_pool_client(
             "their own shells will be refused",
             sub_config.warm_pool,
         )
+    cleanup_stale_archives()
     return StaticPoolSandboxClient(
         slots=slots,
         redis_client=redis_client,
