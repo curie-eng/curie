@@ -221,3 +221,27 @@ pub fn run(runtime: &Path, gateway_path: &Path) -> Result<MigrationOutput> {
     })?;
     Ok(MigrationOutput)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::MigrationOutput;
+    use crate::ui::CliOutput;
+
+    #[test]
+    fn migration_result_matches_its_schema_and_rejects_invalid_results() {
+        let schema = serde_json::from_str(include_str!(
+            "../schema/migrate-protected-process.schema.json"
+        ))
+        .unwrap();
+        let validator = jsonschema::validator_for(&schema).unwrap();
+        assert!(validator.is_valid(&MigrationOutput.to_json()));
+        for invalid in [
+            serde_json::json!({"schema_version": 1, "migrated": true}),
+            serde_json::json!({"schema_version": 2, "migrated": false}),
+            serde_json::json!({"schema_version": 2}),
+            serde_json::json!({"schema_version": 2, "migrated": true, "extra": 0}),
+        ] {
+            assert!(!validator.is_valid(&invalid), "{invalid}");
+        }
+    }
+}

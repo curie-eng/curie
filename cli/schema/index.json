@@ -274,6 +274,12 @@
       "version": "2.2"
     },
     {
+      "result": "MigrationOutput",
+      "kind": "CliOutput",
+      "schema": "migrate-protected-process.schema.json",
+      "version": "1.0"
+    },
+    {
       "result": "MemoryOutput",
       "kind": "CliOutput",
       "schema": "memory.schema.json",
