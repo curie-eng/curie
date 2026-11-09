@@ -89,7 +89,9 @@ def graph_payload() -> dict[str, Any]:
         ("0153", False),
         ("0154", False),
         # Dynamic approval answers require the 0156 answer gate.
-        ("0156", True),
+        ("0156", False),
+        # The candidate minimum is 0157, the factory Slack tables the worker reads.
+        ("0157", True),
         ("0000", True),
         ("future-expand", True),
     ],
@@ -112,15 +114,16 @@ def test_installed_candidate_decision_preserves_unknown_revision_policy(
     )
 
 
-def test_candidate_window_raises_the_floor_to_0156() -> None:
+def test_candidate_window_raises_the_floor_to_0157() -> None:
     """@spec CONNECTOR-REQUESTER-1: agent ORM reads require the 0151 requester columns.
 
     Approval ORM reads require the 0154 reminder cursor, and dynamic approval
-    answers require the 0156 answer gate, so 0156 is the floor.
+    answers require the 0156 answer gate. The factory Slack progress loop reads
+    the 0157 tables, so 0157 is the floor.
     """
     window = shared().load_metadata().window
-    assert window.schema_min == "0156"
-    assert window.schema_head == "0156"
+    assert window.schema_min == "0157"
+    assert window.schema_head == "0157"
 
 
 @pytest.mark.parametrize("mutation", ["bounds", "parent", "cycle", "duplicate", "type"])
