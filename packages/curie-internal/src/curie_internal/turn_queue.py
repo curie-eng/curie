@@ -37,7 +37,7 @@ from aci_protocol import STREAM_PAYLOAD_FIELD, QueuedTurn, parse_queued_turn
 from curie_telemetry import inject_trace_context, operation_span, record_metric
 from opentelemetry.trace import SpanKind, StatusCode
 
-logger = logging.getLogger(__name__)
+logger = logging.getLogger("curie_dispatcher.queue")
 
 
 class QueueConfig(Protocol):

@@ -23,7 +23,7 @@ from curie_channel_gateway.slack.valkey import build_redis
 
 from .. import __version__
 
-_LOG = logging.getLogger("curie_channel_gateway.slack.enqueue_once")
+_LOG = logging.getLogger("curie_dispatcher.enqueue_once")
 
 
 def enqueue_payload(

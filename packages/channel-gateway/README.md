@@ -17,7 +17,8 @@ through the existing `uv run lint-imports` lint and pre-push check.
 transport used by Slack intake and worker consumers. Its `QueueConfig` protocol
 requires only the existing stream, dedupe key and TTL settings. Admission still
 asks the platform API before dedupe, placeholder and enqueue; cache keys,
-queue keys, heartbeat cadence and Redis construction are unchanged. The API
+queue keys, heartbeat cadence and Redis construction are unchanged. The existing
+dispatcher service and logger identities are retained for telemetry. The API
 retains admission authority. Mail remains independently installable; its
 import contract also forbids Slack and dispatcher dependencies.
 
