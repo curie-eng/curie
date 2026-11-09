@@ -472,9 +472,13 @@ It owns and removes its backing-service containers; the caller supplies Docker.
   bytes and SQLite pages are bounded before allocation. At capacity the adapter
   does not mark the provider message seen or evict older unresolved work; it
   leaves the message recoverable and logs back pressure.
-- **The `chn` token expires.** The adapter cannot re-mint it (that would need a
-  platform key it must not hold). It persists the ingress 401 and keeps the mail
-  pending; the operator re-mints the scoped token and rolls the pod.
+
+**Scoped credentials expire.** Self-rotation uses the adapter principal to renew
+its channel token and its own successor without a platform key. With the default
+manual mode, an ingress 401 leaves mail pending until the operator replaces the
+token and restarts the adapter. An expired principal needs administrative renewal
+in either mode.
+
 - **Logs are single-line JSON on stderr, and export is opt-in.** The adapter
   bootstraps the shared `curie-telemetry` service logger at start, so its output
   is one JSON object per record on stderr carrying `service.name:
@@ -497,13 +501,15 @@ It owns and removes its backing-service containers; the caller supplies Docker.
 
 The SQLite volume is sensitive application data. It can contain email addresses,
 provider message/thread identifiers, message or reply text needed for recovery,
-security decisions, and terminal delivery receipts. It contains no AgentMail
-key, channel token, egress secret, platform key, or platform database credential.
-Access to the PVC, its snapshots, and node-level backups is therefore access to
-mail content even though it is not credential access.
+security decisions, and terminal delivery receipts. The delivery journal contains
+no credentials. With self-rotation enabled, its separate credential snapshot on
+the same volume contains the channel token and adapter principal. Access to the
+volume, its snapshots and backups therefore grants access to both mail content
+and those bearer credentials. The AgentMail key, egress secret, platform key and
+platform database credentials are not persisted there.
 
 The application bounds live state by count and bytes, but the PVC and its backup
-retention are operator policy. Back up the SQLite file only with a
+retention are operator policy. Back up both SQLite files with a
 SQLite-consistent snapshot or after stopping the one writer. Restore the PVC
 before starting the Deployment. Rolling back to a binary older than the on-disk
 schema is refused; restore the pre-upgrade volume snapshot or roll forward

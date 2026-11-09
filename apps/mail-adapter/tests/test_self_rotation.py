@@ -4,7 +4,10 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import sqlite3
+import subprocess
+import sys
 import threading
 import time
 from collections.abc import Callable, Iterator
@@ -388,3 +391,78 @@ def test_rejected_channel_is_renewed_early_and_probe_recovers_before_new_mail(
         assert adapter.post_turn({"delivery_id": "after-recovery"}) == "accepted"
     finally:
         adapter.close()
+
+
+@pytest.fixture
+def rotating_main(
+    rotation_api: RotationAPI,
+    tmp_path: Path,
+) -> Iterator[tuple[subprocess.Popen[str], Path]]:
+    path = tmp_path / "main-state.sqlite3"
+    environment = {
+        "PATH": os.environ.get("PATH", ""),
+        "CURIE_API_URL": rotation_api.url,
+        "CURIE_CHANNEL_TOKEN": rotation_api.channel,
+        "CURIE_ADAPTER_PRINCIPAL": rotation_api.principal,
+        "CURIE_EGRESS_SECRET": "main-test-egress-secret",
+        "AGENTMAIL_API_KEY": "main-test-provider-key",
+        "AGENTMAIL_INBOX": "acme@example.test",
+        "ADAPTER_INGRESS_ENABLED": "false",
+        "CURIE_MAIL_SELF_ROTATE": "true",
+        "CURIE_MAIL_STATE_PATH": str(path),
+        "CURIE_MAIL_PORT": "0",
+    }
+    initial = (rotation_api.channel, rotation_api.principal)
+    process = subprocess.Popen(
+        [sys.executable, "-m", "curie_mail_adapter"],
+        env=environment,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    try:
+        yield process, path
+    finally:
+        if process.poll() is None:
+            process.terminate()
+        try:
+            _out, logs = process.communicate(timeout=10)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.communicate(timeout=5)
+            raise RuntimeError("mail adapter process did not stop") from None
+        assert all(
+            token not in logs for token in (*initial, rotation_api.channel, rotation_api.principal)
+        )
+        assert process.returncode == 0
+
+
+def test_process_entrypoint_rotates_with_ingress_disabled(
+    rotating_main: tuple[subprocess.Popen[str], Path],
+    rotation_api: RotationAPI,
+) -> None:
+    process, path = rotating_main
+    deadline = time.monotonic() + 10
+    snapshot = Path(str(path) + ".credentials.sqlite3")
+    while True:
+        assert process.poll() is None, "mail adapter exited before credential renewal"
+        assert time.monotonic() < deadline, "mail adapter did not persist independent renewal"
+        if len(rotation_api.calls) >= 2:
+            with sqlite3.connect(snapshot) as db:
+                channel, principal = db.execute(
+                    "SELECT channel, principal FROM credentials"
+                ).fetchone()
+            if rotation_api.generation >= 2 and (channel, principal) == (
+                rotation_api.channel,
+                rotation_api.principal,
+            ):
+                break
+        threading.Event().wait(0.02)
+    assert channel_token.verify(
+        channel,
+        KEY,
+        channel_id=BINDING,
+        generation=rotation_api.generation,
+        scope=channel_token.CHANNEL_ENQUEUE_SCOPE,
+    )
+    assert adapter_principal.verify(principal, KEY, scope="channels:token") is not None
