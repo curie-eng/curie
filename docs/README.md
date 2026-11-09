@@ -13,13 +13,13 @@ they are not substitutes for a supported quickstart.
 
 ## Get started
 
-- [Software Factory user guide](guides/factory-user-guide.md): prepare an issue,
-  select it for the factory, and verify the resulting GitHub PR.
-- [Software Factory administrator guide](guides/factory-admin-guide.md): set up
-  a factory, onboard repositories, and improve it from observed outcomes.
+- [Software Factory local quickstart](guides/dark-factory-quickstart.md): try
+  the factory on a laptop.
+- [Software Factory administrator guide](guides/factory-admin-guide.md): install
+  it for your organization's repository and tune it.
+- [Software Factory user guide](guides/factory-user-guide.md): use an installed
+  factory to prepare an issue and verify the resulting GitHub PR.
 - [Software Factory overview](software-factory.md): workflow, review and CI limits.
-- [Factory quickstart](guides/dark-factory-quickstart.md): provider-specific
-  installation and recovery procedures.
 - [Bring your agent](bring-your-agent.md): compatibility and reuse of supported
   skills and tools.
 - [SRE co-worker](../examples/sre-bot/README.md): investigate Kubernetes workloads

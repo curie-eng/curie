@@ -21,8 +21,9 @@ agent's instructions and tools to the same platform.
 
 | Start here | First outcome |
 | --- | --- |
-| [Software Factory user guide](docs/guides/factory-user-guide.md) | Prepare an issue, start the factory, and verify a GitHub PR. |
-| [Software Factory administrator guide](docs/guides/factory-admin-guide.md) | Set up a factory and improve repository environments. |
+| [Software Factory local quickstart](docs/guides/dark-factory-quickstart.md) | Try the factory on a laptop. |
+| [Software Factory administrator guide](docs/guides/factory-admin-guide.md) | Install it for your organization's repository and tune it. |
+| [Software Factory user guide](docs/guides/factory-user-guide.md) | Use an installed factory to prepare an issue and verify its PR. |
 | [SRE co-worker](#sre-co-worker-on-your-laptop) | Ask about your local cluster in Slack; approve configured mutations. |
 | [Bring your existing agent](#make-your-existing-agent-a-co-worker) | Reuse its instructions and tools, then connect it to a workspace. |
 
@@ -51,10 +52,9 @@ available in a supported deployment.
   <img src="https://i.vimeocdn.com/video/2206199274-0dcf4f345f0dfb2733cf53dfbdb85b3441e3f593dcd23cfdce0c45bb50d46146-d?f=webp&amp;region=us" width="720" alt="Watch the Curie Software Factory demo: GitHub issues to reviewed pull requests.">
 </a>
 
-[Watch the Software Factory demo](https://vimeo.com/1231115133/eadc6eb936), then
-follow the [user guide](docs/guides/factory-user-guide.md) or
-[administrator guide](docs/guides/factory-admin-guide.md). The video features
-GitHub; the guides also cover supported GitLab and Jira Cloud paths.
+[Watch the Software Factory demo](https://vimeo.com/1231115133/eadc6eb936),
+then choose the laptop trial, administrator, or user path below. The video
+features GitHub; the guides also cover supported GitLab and Jira Cloud paths.
 
 ## Quickstart
 
@@ -93,14 +93,16 @@ export CURIE_MODEL
 
 ### Software Factory on your laptop
 
-Use the [factory user guide](docs/guides/factory-user-guide.md) for one complete
-example, from local issue preparation and the factory label through PR testing
-and feedback. Use the [factory administrator guide](docs/guides/factory-admin-guide.md)
-to install the factory, onboard a repository, and improve its runner environment.
+If you want a quick local test on your laptop to get a feel for the factory,
+follow the [factory quickstart](docs/guides/dark-factory-quickstart.md).
 
-For the exact local installation commands and provider-specific setup, follow
-the [factory quickstart](docs/guides/dark-factory-quickstart.md). The
-[factory overview](docs/software-factory.md) explains review and CI limits.
+If you want to install it for your organization's repository and tune it,
+follow the [factory administrator guide](docs/guides/factory-admin-guide.md).
+
+If the factory is already installed and you want to use it, follow the
+[factory user guide](docs/guides/factory-user-guide.md) to prepare an issue
+and verify its PR. The [factory overview](docs/software-factory.md) explains
+review and CI limits.
 
 ### SRE co-worker on your laptop
 
