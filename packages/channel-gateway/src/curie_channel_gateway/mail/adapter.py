@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import email.utils
 import hashlib
+import hmac
 import json
 import logging
 import re
@@ -210,6 +211,7 @@ class MailAdapter:
         self.owner = secrets.token_hex(16)
         self.last_ingress_status: int | None = None
         self.channel_token_rejected = False
+        self._channel_fingerprint_key = secrets.token_bytes(32)
         self._rejected_channel_fingerprint: str | None = None
         self.seen: OrderedDict[str, bool] = OrderedDict()
         for message_id in self.state.known_message_ids():
@@ -231,13 +233,16 @@ class MailAdapter:
         """The provider's inbox: every turn's address and the reply wire's target."""
         return self.provider.inbox_address
 
+    def _channel_fingerprint(self, token: str) -> str:
+        return hmac.new(self._channel_fingerprint_key, token.encode(), "sha256").hexdigest()
+
     def status(self) -> dict[str, Any]:
         """Report diagnostic claims only; the adapter cannot verify the signature."""
         token = self.credentials.channel_token
         exp = _token_expiry(token)
         with self.lock:
             rejected = self.channel_token_rejected and self._rejected_channel_fingerprint == (
-                hashlib.sha256(token.encode()).hexdigest()
+                self._channel_fingerprint(token)
             )
             last_status = self.last_ingress_status
             discovery = self._discovery_snapshot()
@@ -731,7 +736,7 @@ class MailAdapter:
                 )
                 with self.lock:
                     self.last_ingress_status = result.status
-                    fingerprint = hashlib.sha256(headers["X-API-Key"].encode()).hexdigest()
+                    fingerprint = self._channel_fingerprint(headers["X-API-Key"])
                     was_rejected = self.channel_token_rejected and (
                         self._rejected_channel_fingerprint == fingerprint
                     )

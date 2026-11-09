@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 import time
 from collections.abc import Callable
+from pathlib import Path
 
 import pytest
 from _support import IngressState, MailState, get
@@ -93,6 +94,45 @@ def test_platform_rejection_degrades_probe_and_success_recovers(
         assert get(url + "/statusz")[1]["last_ingress_status"] == 200
     finally:
         adapter.close()
+
+
+def test_rejected_credential_fingerprints_are_scoped_to_each_adapter(
+    make_adapter: Callable[..., MailAdapter],
+    serve_egress: Callable[[MailAdapter], str],
+    ingress: IngressState,
+    caplog: pytest.LogCaptureFixture,
+    tmp_path: Path,
+) -> None:
+    secret = token(int(time.time()) + 3600)
+    ingress.response = (401, {"detail": "invalid token"})
+    adapters: list[MailAdapter] = []
+    try:
+        with caplog.at_level(logging.WARNING, logger="curie_channel_gateway.mail.adapter"):
+            for name in ("first", "second"):
+                adapter = make_adapter(
+                    channel_token=secret, state_path=str(tmp_path / f"{name}.sqlite3")
+                )
+                adapters.append(adapter)
+                adapter.startup()
+                url = serve_egress(adapter)
+                turn = {"delivery_id": "rejected-credential", "conversation_id": "thread"}
+                adapter.post_turn(turn)
+                adapter.post_turn(turn)
+                body = get(url + "/statusz")[1]
+                assert body["channel_token"]["state"] == "rejected"
+                assert secret not in str(body)
+        fingerprints = [adapter._rejected_channel_fingerprint for adapter in adapters]
+        assert all(fingerprint is not None for fingerprint in fingerprints)
+        assert len(set(fingerprints)) == 2
+        warnings = [
+            record.getMessage() for record in caplog.records
+            if "channel token rejected" in record.getMessage()
+        ]
+        assert len(warnings) == 2
+        assert secret not in "\n".join(warnings)
+    finally:
+        for adapter in adapters:
+            adapter.close()
 
 
 @pytest.mark.parametrize("secret", ["", "opaque", "chn.eyJleHAiOnRydWV9.signature"])
