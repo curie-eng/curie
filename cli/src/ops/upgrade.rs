@@ -2140,6 +2140,78 @@ fn create_lost_race(stderr: &str) -> bool {
         || reason.contains("object has been modified")
 }
 
+/// Attempts for one checkpoint write, including the first. Pauses sit between
+/// attempts: 2s after the first transient failure, 4s after the second (#5412).
+const CHECKPOINT_WRITE_ATTEMPTS: u32 = 3;
+const CHECKPOINT_RETRY_PAUSES: [Duration; 2] = [Duration::from_secs(2), Duration::from_secs(4)];
+
+/// Transient apiserver and transport failures from `kubectl` (#5412 decision 1).
+/// Conflict, Forbidden, NotFound, and a failed JSON Patch `test` stay fatal:
+/// those mean another writer, not a blip. `was refused` is kubectl's dial
+/// wording for the same connection failure as `connection refused`.
+fn checkpoint_stderr_is_transient(stderr: &str) -> bool {
+    let reason = super::verbs::failure_reason(stderr);
+    let permanent = reason.to_ascii_lowercase();
+    if permanent.contains("conflict")
+        || permanent.contains("forbidden")
+        || permanent.contains("notfound")
+        || permanent.contains("not found")
+        || permanent.contains("test failed")
+        || permanent.contains("test operation")
+    {
+        return false;
+    }
+    const PHRASES: &[&str] = &[
+        "InternalError",
+        "ServiceUnavailable",
+        "the server is currently unable to handle the request",
+        "etcdserver: request timed out",
+        "the server was unable to return a response in the time allotted",
+        "connection refused",
+        "was refused",
+        "i/o timeout",
+        "unexpected EOF",
+    ];
+    PHRASES.iter().any(|phrase| stderr.contains(phrase))
+}
+
+struct CheckpointFailure {
+    reason: String,
+    diagnostic: String,
+    exhausted_transient: bool,
+}
+
+enum CheckpointReread {
+    Found(CheckpointObservation),
+    Absent,
+    Transient,
+    Fatal(String),
+}
+
+enum CheckpointWrite {
+    /// kubectl returned the patched object.
+    Response(String),
+    /// The write's stdout was lost, but a reread shows this run's bytes.
+    Adopted(CheckpointObservation),
+    Failed(CheckpointFailure),
+}
+
+fn checkpoint_write_error(
+    prefix: &str,
+    suffix: &str,
+    failure: &CheckpointFailure,
+) -> anyhow::Error {
+    let head = if failure.exhausted_transient {
+        format!("{prefix} after {CHECKPOINT_WRITE_ATTEMPTS} attempts")
+    } else {
+        prefix.to_string()
+    };
+    anyhow::Error::msg(format!(
+        "{head}: {}; {}{suffix}",
+        failure.reason, failure.diagnostic
+    ))
+}
+
 fn manifest_images(manifest: &str, default_namespace: &str) -> Result<BTreeMap<String, String>> {
     fn collect_container_images(
         value: &serde_json::Value,
@@ -2631,6 +2703,178 @@ impl LiveHost {
         self.run(&cmd)
     }
 
+    fn annotation_text<'a>(observation: &'a CheckpointObservation, key: &str) -> Option<&'a str> {
+        observation
+            .annotations
+            .as_ref()
+            .and_then(|annotations| annotations.get(key))
+            .and_then(serde_json::Value::as_str)
+    }
+
+    fn holds_written_ownership(&self, observation: &CheckpointObservation) -> bool {
+        let action = self.ownership_action();
+        Self::annotation_text(observation, UPGRADE_HOLDER_ANNOTATION) == Some(self.holder.as_str())
+            && Self::annotation_text(observation, UPGRADE_ACTION_ANNOTATION)
+                == Some(action.as_str())
+    }
+
+    /// Holder, action, and record equal the bytes this run just tried to write.
+    fn intended_record_landed(&self, observation: &CheckpointObservation, record: &str) -> bool {
+        self.holds_written_ownership(observation)
+            && Self::annotation_text_record(observation) == Some(record)
+    }
+
+    fn annotation_text_record(observation: &CheckpointObservation) -> Option<&str> {
+        observation
+            .record
+            .as_ref()
+            .and_then(serde_json::Value::as_str)
+    }
+
+    /// An ownership patch or create landed when the holder is ours and the
+    /// record is unchanged. Create writes no record.
+    fn ownership_write_landed(&self, observation: &CheckpointObservation) -> bool {
+        self.holds_written_ownership(observation) && observation.record == self.checkpoint_record
+    }
+
+    fn release_landed(&self, observation: &CheckpointObservation) -> bool {
+        let annotations = observation.annotations.as_ref();
+        let holder_gone = annotations
+            .is_none_or(|annotations| !annotations.contains_key(UPGRADE_HOLDER_ANNOTATION));
+        let action_gone = annotations
+            .is_none_or(|annotations| !annotations.contains_key(UPGRADE_ACTION_ANNOTATION));
+        holder_gone && action_gone && observation.record == self.checkpoint_record
+    }
+
+    fn reread_checkpoint(&self) -> CheckpointReread {
+        let checkpoint = checkpoint_name(&self.opts.common.release);
+        let (ok, out, err) = match self.run(&self.checkpoint_get_command()) {
+            Ok(result) => result,
+            Err(error) => return CheckpointReread::Fatal(format!("{error:#}")),
+        };
+        if !ok {
+            if checkpoint_is_absent(&err, &checkpoint) {
+                return CheckpointReread::Absent;
+            }
+            if checkpoint_stderr_is_transient(&err) {
+                return CheckpointReread::Transient;
+            }
+            return CheckpointReread::Fatal(super::verbs::failure_reason(&err).to_string());
+        }
+        match parse_checkpoint_observation(&out, "upgrade checkpoint reread") {
+            Ok(observation) => CheckpointReread::Found(observation),
+            Err(error) => CheckpointReread::Fatal(format!("{error:#}")),
+        }
+    }
+
+    fn checkpoint_failure_from(
+        &self,
+        reason: &str,
+        exhausted_transient: bool,
+    ) -> CheckpointFailure {
+        CheckpointFailure {
+            reason: reason.to_string(),
+            diagnostic: self.checkpoint_diagnostic(),
+            exhausted_transient,
+        }
+    }
+
+    /// One JSON patch of the checkpoint. A transient 5xx or transport error is
+    /// ambiguous: the `test` ops make a blind retry report a false conflict if
+    /// the first write committed. Reread first. Adopt when the holder and
+    /// record match what this run wrote. Retry the same patch only while the
+    /// resourceVersion is still the one the patch tested. Anything else is the
+    /// existing conflict (#5412).
+    fn write_checkpoint_patch(
+        &mut self,
+        patch: &serde_json::Value,
+        tested_resource_version: &str,
+        matches: impl Fn(&Self, &CheckpointObservation) -> bool,
+    ) -> Result<CheckpointWrite> {
+        let mut last_reason = String::new();
+        for attempt in 1..=CHECKPOINT_WRITE_ATTEMPTS {
+            let (ok, out, err) = self.run_checkpoint_patch(patch)?;
+            if ok {
+                return Ok(CheckpointWrite::Response(out));
+            }
+            let reason = super::verbs::failure_reason(&err).to_string();
+            if !checkpoint_stderr_is_transient(&err) {
+                return Ok(CheckpointWrite::Failed(
+                    self.checkpoint_failure_from(&reason, false),
+                ));
+            }
+            last_reason = reason;
+            if attempt == CHECKPOINT_WRITE_ATTEMPTS {
+                break;
+            }
+            match self.reread_checkpoint() {
+                CheckpointReread::Found(observation) if matches(self, &observation) => {
+                    return Ok(CheckpointWrite::Adopted(observation));
+                }
+                CheckpointReread::Found(observation)
+                    if observation.resource_version == tested_resource_version => {}
+                CheckpointReread::Found(_) | CheckpointReread::Absent => {
+                    return Ok(CheckpointWrite::Failed(
+                        self.checkpoint_failure_from(&last_reason, false),
+                    ));
+                }
+                CheckpointReread::Transient => {}
+                CheckpointReread::Fatal(message) => {
+                    return Ok(CheckpointWrite::Failed(CheckpointFailure {
+                        reason: message,
+                        diagnostic: self.checkpoint_diagnostic(),
+                        exhausted_transient: false,
+                    }));
+                }
+            }
+            std::thread::sleep(CHECKPOINT_RETRY_PAUSES[(attempt as usize) - 1]);
+        }
+        Ok(CheckpointWrite::Failed(
+            self.checkpoint_failure_from(&last_reason, true),
+        ))
+    }
+
+    fn redact_failure(&self, failure: CheckpointFailure) -> CheckpointFailure {
+        CheckpointFailure {
+            reason: self.redact(&failure.reason),
+            diagnostic: self.redact(&failure.diagnostic),
+            exhausted_transient: failure.exhausted_transient,
+        }
+    }
+
+    fn finish_checkpoint_write(
+        &self,
+        outcome: CheckpointWrite,
+        parse_as: &str,
+        parse_context: Option<&str>,
+        failure_prefix: &str,
+        failure_suffix: &str,
+        redact: bool,
+    ) -> Result<CheckpointObservation> {
+        match outcome {
+            CheckpointWrite::Response(out) => {
+                let parsed = parse_checkpoint_observation(&out, parse_as);
+                match parse_context {
+                    Some(context) => parsed.context(context.to_string()),
+                    None => parsed,
+                }
+            }
+            CheckpointWrite::Adopted(observation) => Ok(observation),
+            CheckpointWrite::Failed(failure) => {
+                let failure = if redact {
+                    self.redact_failure(failure)
+                } else {
+                    failure
+                };
+                Err(checkpoint_write_error(
+                    failure_prefix,
+                    failure_suffix,
+                    &failure,
+                ))
+            }
+        }
+    }
+
     /// Real and dry runs make the same ownership and takeover checks. This
     /// read never creates or patches the checkpoint.
     fn read_ownership(&self) -> Result<Option<CheckpointObservation>> {
@@ -2757,17 +3001,18 @@ impl LiveHost {
         let Some(observed) = self.read_ownership()? else {
             return self.create_ownership();
         };
-        if let Some(holder) = &self.opts.take_over {
+        if let Some(holder) = self.opts.take_over.clone() {
+            let tested = observed.resource_version.clone();
             let patch = serde_json::json!([
                 {
                     "op": "test",
                     "path": "/metadata/resourceVersion",
-                    "value": observed.resource_version,
+                    "value": tested.clone(),
                 },
                 {
                     "op": "test",
                     "path": UPGRADE_HOLDER_POINTER,
-                    "value": holder,
+                    "value": holder.clone(),
                 },
                 {
                     "op": "replace",
@@ -2780,16 +3025,17 @@ impl LiveHost {
                     "value": self.ownership_action(),
                 },
             ]);
-            let (ok, out, err) = self.run_checkpoint_patch(&patch)?;
-            if !ok {
-                let diagnostic = self.checkpoint_diagnostic();
-                bail!(
-                    "could not take over upgrade ownership from {holder}: {}; {diagnostic}; inspect the current holder before retrying",
-                    super::verbs::failure_reason(&err)
-                );
-            }
-            let observation = parse_checkpoint_observation(&out, "upgrade ownership takeover")
-                .context("ownership may remain because the server response cannot be trusted")?;
+            let outcome = self.write_checkpoint_patch(&patch, &tested, |host, observation| {
+                host.ownership_write_landed(observation)
+            })?;
+            let observation = self.finish_checkpoint_write(
+                outcome,
+                "upgrade ownership takeover",
+                Some("ownership may remain because the server response cannot be trusted"),
+                &format!("could not take over upgrade ownership from {holder}"),
+                "; inspect the current holder before retrying",
+                false,
+            )?;
             self.validate_owned_observation(&observation, "upgrade ownership takeover", None)
                 .context("ownership may remain because the server response cannot be trusted")?;
             self.recovery_plan
@@ -2797,12 +3043,13 @@ impl LiveHost {
             self.adopt_checkpoint_observation(observation);
             return Ok(());
         }
+        let tested = observed.resource_version.clone();
         let patch = match observed.annotations.as_ref() {
             None => serde_json::json!([
                 {
                     "op": "test",
                     "path": "/metadata/resourceVersion",
-                    "value": observed.resource_version,
+                    "value": tested.clone(),
                 },
                 {
                     "op": "add",
@@ -2818,7 +3065,7 @@ impl LiveHost {
                     {
                         "op": "test",
                         "path": "/metadata/resourceVersion",
-                        "value": observed.resource_version,
+                        "value": tested.clone(),
                     },
                     {
                         "op": "test",
@@ -2838,16 +3085,17 @@ impl LiveHost {
                 ])
             }
         };
-        let (ok, out, err) = self.run_checkpoint_patch(&patch)?;
-        if !ok {
-            let diagnostic = self.checkpoint_diagnostic();
-            bail!(
-                "could not acquire upgrade ownership: {}; {diagnostic}; wait for the current upgrade to finish, or verify that its holder has stopped before manual recovery",
-                super::verbs::failure_reason(&err)
-            );
-        }
-        let observation = parse_checkpoint_observation(&out, "upgrade ownership patch")
-            .context("ownership may remain because the server response cannot be trusted")?;
+        let outcome = self.write_checkpoint_patch(&patch, &tested, |host, observation| {
+            host.ownership_write_landed(observation)
+        })?;
+        let observation = self.finish_checkpoint_write(
+            outcome,
+            "upgrade ownership patch",
+            Some("ownership may remain because the server response cannot be trusted"),
+            "could not acquire upgrade ownership",
+            "; wait for the current upgrade to finish, or verify that its holder has stopped before manual recovery",
+            false,
+        )?;
         self.validate_owned_observation(&observation, "upgrade ownership patch", None)
             .context("ownership may remain because the server response cannot be trusted")?;
         self.adopt_checkpoint_observation(observation);
@@ -2885,8 +3133,22 @@ impl LiveHost {
                 plain("json"),
             ],
         );
-        let (ok, out, err) = self.run(&cmd)?;
-        if !ok {
+        let mut last_reason = String::new();
+        let mut saw_transient = false;
+        for attempt in 1..=CHECKPOINT_WRITE_ATTEMPTS {
+            let (ok, out, err) = self.run(&cmd)?;
+            if ok {
+                let observation = parse_checkpoint_observation(&out, "upgrade ownership create")
+                    .context(
+                        "ownership may remain because the server response cannot be trusted",
+                    )?;
+                self.validate_owned_observation(&observation, "upgrade ownership create", None)
+                    .context(
+                        "ownership may remain because the server response cannot be trusted",
+                    )?;
+                self.adopt_checkpoint_observation(observation);
+                return Ok(());
+            }
             if namespace_is_absent(&err, &self.opts.common.namespace) {
                 let reason = super::verbs::failure_reason(&err);
                 bail!(
@@ -2894,24 +3156,74 @@ impl LiveHost {
                     self.opts.common.namespace,
                 );
             }
-            if create_lost_race(&err) {
+            let reason = super::verbs::failure_reason(&err).to_string();
+            let transient = checkpoint_stderr_is_transient(&err);
+            let lost = create_lost_race(&err);
+            // A first-try AlreadyExists is still the old single-shot race.
+            // AlreadyExists after a transient 5xx is ambiguous and uses the reread.
+            if lost && !saw_transient {
                 let diagnostic = self.checkpoint_diagnostic();
                 bail!(
-                    "could not acquire upgrade ownership: {}; {diagnostic}; wait for the current upgrade to finish, or verify that its holder has stopped before manual recovery",
-                    super::verbs::failure_reason(&err)
+                    "could not acquire upgrade ownership: {reason}; {diagnostic}; wait for the current upgrade to finish, or verify that its holder has stopped before manual recovery"
                 );
             }
-            bail!(
-                "could not create upgrade ownership: {}",
-                super::verbs::failure_reason(&err)
-            );
+            if !transient && !lost {
+                bail!("could not create upgrade ownership: {reason}");
+            }
+            if transient {
+                saw_transient = true;
+                last_reason = reason.clone();
+                if attempt == CHECKPOINT_WRITE_ATTEMPTS {
+                    break;
+                }
+            }
+            let adopted = match self.reread_checkpoint() {
+                CheckpointReread::Found(observation)
+                    if self.ownership_write_landed(&observation) =>
+                {
+                    Some(observation)
+                }
+                CheckpointReread::Found(_) | CheckpointReread::Absent if lost => {
+                    let diagnostic = self.checkpoint_diagnostic();
+                    bail!(
+                        "could not acquire upgrade ownership: {reason}; {diagnostic}; wait for the current upgrade to finish, or verify that its holder has stopped before manual recovery"
+                    );
+                }
+                CheckpointReread::Found(_) => {
+                    let diagnostic = self.checkpoint_diagnostic();
+                    let shown = if last_reason.is_empty() {
+                        reason
+                    } else {
+                        last_reason.clone()
+                    };
+                    bail!(
+                        "could not acquire upgrade ownership: {shown}; {diagnostic}; wait for the current upgrade to finish, or verify that its holder has stopped before manual recovery"
+                    );
+                }
+                CheckpointReread::Absent | CheckpointReread::Transient => None,
+                CheckpointReread::Fatal(message) => {
+                    bail!("could not create upgrade ownership: {message}");
+                }
+            };
+            if let Some(observation) = adopted {
+                self.validate_owned_observation(&observation, "upgrade ownership create", None)
+                    .context(
+                        "ownership may remain because the server response cannot be trusted",
+                    )?;
+                self.adopt_checkpoint_observation(observation);
+                return Ok(());
+            }
+            if attempt == CHECKPOINT_WRITE_ATTEMPTS {
+                break;
+            }
+            std::thread::sleep(CHECKPOINT_RETRY_PAUSES[(attempt as usize) - 1]);
         }
-        let observation = parse_checkpoint_observation(&out, "upgrade ownership create")
-            .context("ownership may remain because the server response cannot be trusted")?;
-        self.validate_owned_observation(&observation, "upgrade ownership create", None)
-            .context("ownership may remain because the server response cannot be trusted")?;
-        self.adopt_checkpoint_observation(observation);
-        Ok(())
+        let failure = self.checkpoint_failure_from(&last_reason, true);
+        Err(checkpoint_write_error(
+            "could not create upgrade ownership",
+            "",
+            &failure,
+        ))
     }
 
     fn target_chart_metadata(&self) -> Result<serde_json::Value> {
@@ -3962,26 +4274,26 @@ impl LiveHost {
         }
         let resource_version = self
             .checkpoint_resource_version
-            .as_ref()
+            .clone()
             .context("upgrade checkpoint ownership has no trusted resourceVersion")?;
         let record_operation = if self.checkpoint_data_present {
             serde_json::json!({
                 "op": "add",
                 "path": "/data/record",
-                "value": json,
+                "value": json.clone(),
             })
         } else {
             serde_json::json!({
                 "op": "add",
                 "path": "/data",
-                "value": {"record": json},
+                "value": {"record": json.clone()},
             })
         };
         let patch = serde_json::json!([
             {
                 "op": "test",
                 "path": "/metadata/resourceVersion",
-                "value": resource_version,
+                "value": resource_version.clone(),
             },
             {
                 "op": "test",
@@ -3990,13 +4302,18 @@ impl LiveHost {
             },
             record_operation,
         ]);
-        let (ok, out, err) = self.run_checkpoint_patch(&patch)?;
-        if !ok {
-            let reason = self.redact(super::verbs::failure_reason(&err));
-            let diagnostic = self.redact(&self.checkpoint_diagnostic());
-            bail!("could not persist the upgrade checkpoint: {reason}; {diagnostic}");
-        }
-        let observation = parse_checkpoint_observation(&out, "upgrade checkpoint persistence")?;
+        let outcome =
+            self.write_checkpoint_patch(&patch, &resource_version, |host, observation| {
+                host.intended_record_landed(observation, &json)
+            })?;
+        let observation = self.finish_checkpoint_write(
+            outcome,
+            "upgrade checkpoint persistence",
+            None,
+            "could not persist the upgrade checkpoint",
+            "",
+            true,
+        )?;
         self.validate_owned_observation(
             &observation,
             "upgrade checkpoint persistence",
@@ -4009,13 +4326,13 @@ impl LiveHost {
     fn release_ownership(&mut self) -> Result<()> {
         let resource_version = self
             .checkpoint_resource_version
-            .as_ref()
+            .clone()
             .context("upgrade ownership has no trusted resourceVersion for release")?;
         let patch = serde_json::json!([
             {
                 "op": "test",
                 "path": "/metadata/resourceVersion",
-                "value": resource_version,
+                "value": resource_version.clone(),
             },
             {
                 "op": "test",
@@ -4031,19 +4348,30 @@ impl LiveHost {
                 "path": UPGRADE_HOLDER_POINTER,
             },
         ]);
-        let (ok, out, err) = self.run_checkpoint_patch(&patch)?;
-        if !ok {
-            let reason = self.redact(super::verbs::failure_reason(&err));
-            let diagnostic = self.redact(&self.checkpoint_diagnostic());
-            bail!("could not release upgrade ownership: {reason}; {diagnostic}");
-        }
-        let observation = match parse_checkpoint_observation(&out, "upgrade ownership release") {
-            Ok(observation) => observation,
-            Err(error) => {
-                let diagnostic = self.redact(&self.checkpoint_diagnostic());
-                bail!(
-                    "could not confirm upgrade ownership release from the server response: {error:#}; {diagnostic}"
-                );
+        let outcome =
+            self.write_checkpoint_patch(&patch, &resource_version, |host, observation| {
+                host.release_landed(observation)
+            })?;
+        let observation = match outcome {
+            CheckpointWrite::Response(out) => {
+                match parse_checkpoint_observation(&out, "upgrade ownership release") {
+                    Ok(observation) => observation,
+                    Err(error) => {
+                        let diagnostic = self.redact(&self.checkpoint_diagnostic());
+                        bail!(
+                            "could not confirm upgrade ownership release from the server response: {error:#}; {diagnostic}"
+                        );
+                    }
+                }
+            }
+            CheckpointWrite::Adopted(observation) => observation,
+            CheckpointWrite::Failed(failure) => {
+                let failure = self.redact_failure(failure);
+                return Err(checkpoint_write_error(
+                    "could not release upgrade ownership",
+                    "",
+                    &failure,
+                ));
             }
         };
         if let Some(annotations) = observation.annotations.as_ref() {
@@ -6352,5 +6680,62 @@ mod factory_refusal_tests {
             None
         );
         assert_eq!(factory_refusal("{}"), None);
+    }
+}
+
+#[cfg(test)]
+mod checkpoint_retry_tests {
+    use super::checkpoint_stderr_is_transient;
+
+    /// #5412 decision 1. Each phrase is the whole stderr or sits inside a
+    /// longer kubectl line. `was refused` is kubectl's dial wording for the
+    /// same failure as `connection refused`.
+    #[test]
+    fn each_listed_apiserver_and_transport_phrase_is_transient() {
+        let samples = [
+            "Error from server (InternalError): an error on the server (\"\") has prevented the request from succeeding",
+            "Error from server (ServiceUnavailable): apiserver is restarting",
+            "Error from server (ServiceUnavailable): the server is currently unable to handle the request",
+            "Error from server: etcdserver: request timed out",
+            "Error from server (Timeout): the server was unable to return a response in the time allotted",
+            "dial tcp 10.0.0.1:6443: connect: connection refused",
+            "The connection to the server 10.0.0.1:6443 was refused - did you specify the right host or port?",
+            "net/http: request canceled (Client.Timeout exceeded while awaiting headers): i/o timeout",
+            "http2: server sent GOAWAY and closed the connection; unexpected EOF",
+        ];
+        for sample in samples {
+            assert!(
+                checkpoint_stderr_is_transient(sample),
+                "expected transient: {sample}"
+            );
+        }
+    }
+
+    /// Conflict, Forbidden, NotFound, and a failed JSON Patch test stay fatal
+    /// even when the wording is only the driver's short patch error.
+    #[test]
+    fn conflict_forbidden_notfound_and_a_failed_test_op_are_permanent() {
+        let samples = [
+            "Error from server (Conflict): Operation cannot be fulfilled on configmaps \"rel-upgrade-checkpoint\": the object has been modified",
+            "Error from server (Forbidden): configmaps \"rel-upgrade-checkpoint\" is forbidden: User cannot patch resource \"configmaps\"",
+            "Error from server (NotFound): configmaps \"rel-upgrade-checkpoint\" not found",
+            "Error from server (Conflict): the JSON Patch test operation failed at /metadata/resourceVersion",
+            "the request failed because a test operation did not succeed",
+            "test failed at /metadata/resourceVersion",
+            "error: could not patch the checkpoint ConfigMap",
+        ];
+        for sample in samples {
+            assert!(
+                !checkpoint_stderr_is_transient(sample),
+                "expected permanent: {sample}"
+            );
+        }
+    }
+
+    /// A conflict line that also mentions a 5xx phrase is still a conflict.
+    #[test]
+    fn a_permanent_reason_wins_over_a_transient_phrase_in_the_same_stderr() {
+        let stderr = "warning: retrying\nError from server (Conflict): InternalError was already applied by another writer\n";
+        assert!(!checkpoint_stderr_is_transient(stderr));
     }
 }

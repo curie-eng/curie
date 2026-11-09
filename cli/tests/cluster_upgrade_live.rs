@@ -3513,6 +3513,132 @@ fn checkpoint_persist_failure_fails_the_command() {
         "a checkpoint lost before Apply must stop short of mutation: {:?}",
         fixture.argv()
     );
+    assert_eq!(
+        fixture
+            .patches()
+            .iter()
+            .filter(|patch| is_record_patch(patch))
+            .count(),
+        1,
+        "a non-transient checkpoint failure writes one patch document: {:?}",
+        fixture.patches()
+    );
+    let message = visible(&output);
+    assert!(
+        message.contains(
+            "could not persist the upgrade checkpoint: error: could not patch the checkpoint ConfigMap"
+        ),
+        "existing error text changed: {message}"
+    );
+    assert!(
+        !message.contains("after 3 attempts"),
+        "a non-transient failure must not be retried: {message}"
+    );
+}
+
+/// #5412: one apiserver 5xx on the first record patch is retried, and the
+/// upgrade still finishes with the succeeded record.
+#[test]
+fn transient_record_5xx_then_success_completes() {
+    let fixture = Fixture::new(None);
+    let output = fixture.local("record-transient-once");
+    assert!(
+        output.status.success(),
+        "one transient checkpoint 5xx must not abort the upgrade: {}",
+        visible(&output)
+    );
+    let body = json(&output);
+    assert_eq!(body["status"], "succeeded", "{body}");
+    let record = fixture.last_record();
+    assert_eq!(record["status"], "succeeded", "{record}");
+    assert!(
+        record_completed(&record, "commit"),
+        "the final record must include commit: {record}"
+    );
+    assert_ownership_released(&fixture);
+    assert_eq!(fixture.helm_upgrades().len(), 1, "{:?}", fixture.argv());
+}
+
+/// #5412: a record patch that commits and still returns 5xx is adopted from
+/// the reread. The copied patch document for that write stays one, and the
+/// run does not report a false conflict.
+#[test]
+fn committed_record_5xx_is_adopted_on_read_back() {
+    let fixture = Fixture::new(None);
+    let output = fixture.local("record-committed-then-5xx");
+    assert!(
+        output.status.success(),
+        "a committed record write must be adopted: {}",
+        visible(&output)
+    );
+    let message = visible(&output);
+    assert!(
+        !message.to_ascii_lowercase().contains("conflict"),
+        "read-back must not report a false conflict: {message}"
+    );
+    assert!(
+        !message.contains("could not persist"),
+        "read-back must not fail the checkpoint: {message}"
+    );
+    let record_patches: Vec<_> = fixture
+        .patches()
+        .into_iter()
+        .filter(is_record_patch)
+        .collect();
+    assert!(
+        !record_patches.is_empty(),
+        "the committed record patch must be captured"
+    );
+    let first = &record_patches[0];
+    assert_eq!(
+        record_patches
+            .iter()
+            .filter(|patch| *patch == first)
+            .count(),
+        1,
+        "exactly one patch document may carry that committed record: {record_patches:?}"
+    );
+    let record = fixture.last_record();
+    assert_eq!(record["status"], "succeeded", "{record}");
+    assert!(record_completed(&record, "commit"), "{record}");
+    assert_ownership_released(&fixture);
+}
+
+/// #5412: three transient failures on one record write abort, and the error
+/// names the attempt count and the last apiserver reason.
+#[test]
+fn transient_record_5xx_stops_after_three_attempts() {
+    let fixture = Fixture::new(None);
+    let output = fixture.local("record-transient-always");
+    assert!(
+        !output.status.success(),
+        "exhausted checkpoint retries must fail: {}",
+        visible(&output)
+    );
+    let message = visible(&output);
+    assert!(
+        message.contains("after 3 attempts"),
+        "the error must name the attempt count: {message}"
+    );
+    assert!(
+        message.contains("InternalError"),
+        "the error must include the last transient reason: {message}"
+    );
+    assert_eq!(
+        fixture
+            .patches()
+            .iter()
+            .filter(|patch| is_record_patch(patch))
+            .count(),
+        3,
+        "the write stops after three attempts: {:?}",
+        fixture.patches()
+    );
+    assert!(
+        fixture.helm_upgrades().is_empty(),
+        "a lost checkpoint before Apply must stop short of mutation: {:?}",
+        fixture.argv()
+    );
 }
 
 // T8(b) -- plan edge 10. Only the checkpoint write that FOLLOWS a failed

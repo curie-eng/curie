@@ -115,8 +115,17 @@ WORKLOADS = "deployments,statefulsets,daemonsets,pods,jobs"
 #                     once instead of retrying to its 300s deadline. This is a
 #                     Rollout-facet issue: it must not be the reason any named
 #                     convergence sub-flag goes false.
-#   checkpoint_patch_fails  False | "always" | "after-converge". A record
-#                           patch exits nonzero at the selected moment.
+#   checkpoint_patch_fails  False | "always" | "after-converge" |
+#                           "transient-once" | "committed-then-5xx" |
+#                           "always-transient".
+#                           "always" and "after-converge" exit nonzero with a
+#                           non-transient stderr. "transient-once" returns one
+#                           apiserver 5xx on the first record patch and does not
+#                           commit it. "committed-then-5xx" applies that first
+#                           record patch, then returns the same 5xx.
+#                           "always-transient" returns that 5xx for every record
+#                           patch and never commits it. The 5xx line is the
+#                           apiserver text from issue #5412.
 #   acquire_conflict  None | "create" | "patch". The selected ownership write
 #                     loses to a deterministic external holder.
 #   stale_record_cas  an external writer advances resourceVersion and installs
@@ -427,6 +436,12 @@ SCENARIOS = {
     # Every checkpoint write fails, starting with the first one before any
     # mutation.
     "persist-fails": {"checkpoint_patch_fails": "always"},
+    # One apiserver 5xx on the first record patch, then the same patch succeeds.
+    "record-transient-once": {"checkpoint_patch_fails": "transient-once"},
+    # The first record patch commits and the apiserver still answers 5xx.
+    "record-committed-then-5xx": {"checkpoint_patch_fails": "committed-then-5xx"},
+    # Every record patch answers 5xx and leaves the object unchanged.
+    "record-transient-always": {"checkpoint_patch_fails": "always-transient"},
     # Only the checkpoint write that FOLLOWS a failed Converge fails. The
     # convergence failure is the real verdict; the persist error must travel
     # beside it rather than replace it.
@@ -764,6 +779,26 @@ def patch_kind(operations):
     if any(patch_adds_holder(operation) for operation in operations):
         return "acquire"
     return "unknown"
+
+
+# kubectl's apiserver 5xx line, as reported for a checkpoint patch (#5412).
+TRANSIENT_APISERVER_5XX = (
+    'Error from server (InternalError): an error on the server ("") '
+    "has prevented the request from succeeding"
+)
+
+
+def record_patches_captured():
+    """Record patches already copied, including the one this call just captured."""
+    count = 0
+    for path in captured("patch", ".json"):
+        try:
+            operations = json.loads(path.read_text())
+        except (OSError, json.JSONDecodeError):
+            continue
+        if patch_kind(operations) == "record":
+            count += 1
+    return count
 
 
 def conflict(message):
@@ -1575,6 +1610,21 @@ if program == "kubectl":
             (root / "sentinel-record.txt").write_text(SENTINEL_RECORD)
             conflict("the object has been modified")
         fails = scenario["checkpoint_patch_fails"]
+        if kind == "record" and fails == "transient-once" and record_patches_captured() == 1:
+            print(TRANSIENT_APISERVER_5XX, file=sys.stderr)
+            sys.exit(1)
+        if kind == "record" and fails == "committed-then-5xx" and record_patches_captured() == 1:
+            try:
+                committed = apply_patch(current, operations)
+            except (KeyError, TypeError, ValueError) as error:
+                conflict(str(error))
+            committed["metadata"]["resourceVersion"] = next_resource_version(current)
+            save_checkpoint(committed)
+            print(TRANSIENT_APISERVER_5XX, file=sys.stderr)
+            sys.exit(1)
+        if kind == "record" and fails == "always-transient":
+            print(TRANSIENT_APISERVER_5XX, file=sys.stderr)
+            sys.exit(1)
         if kind == "record" and (
             fails == "always" or (fails == "after-converge" and converged)
         ):
