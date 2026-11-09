@@ -34,6 +34,8 @@ class RotationAPI:
         self.calls: list[str] = []
         self.turns: list[tuple[str, int]] = []
         self.fail = False
+        self.rate_limit_next = False
+        self.rate_limited = threading.Event()
         self.entered = threading.Event()
         self.release = threading.Event()
         self.release.set()
@@ -78,6 +80,10 @@ def rotation_api() -> Iterator[RotationAPI]:
                     now=api.now,
                 )
                 code = 200 if accepted else 401
+                if api.rate_limit_next:
+                    api.rate_limit_next = False
+                    code = 429
+                    api.rate_limited.set()
                 api.turns.append((data["delivery_id"], code))
             elif api.fail:
                 code = 503
@@ -103,6 +109,8 @@ def rotation_api() -> Iterator[RotationAPI]:
             encoded = json.dumps(body).encode()
             self.send_response(code)
             self.send_header("Content-Length", str(len(encoded)))
+            if code == 429:
+                self.send_header("Retry-After", "10")
             self.end_headers()
             self.wfile.write(encoded)
 
@@ -466,3 +474,29 @@ def test_process_entrypoint_rotates_with_ingress_disabled(
         scope=channel_token.CHANNEL_ENQUEUE_SCOPE,
     )
     assert adapter_principal.verify(principal, KEY, scope="channels:token") is not None
+
+
+def test_ingress_backoff_does_not_block_credential_renewal(
+    make_adapter: Callable[..., MailAdapter],
+    rotation_api: RotationAPI,
+) -> None:
+    api = rotation_api
+    adapter = rotating(make_adapter, api)
+    api.rate_limit_next = True
+    try:
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            pending = pool.submit(adapter.post_turn, {"delivery_id": "quota-backoff"})
+            assert api.rate_limited.wait(5)
+            api.now += 30
+            renewal = pool.submit(adapter.credentials.renew_once, now=api.now)
+            try:
+                renewal.result(timeout=2)
+                assert not pending.done()
+                assert api.generation == 2
+                assert adapter.credentials.channel_token == api.channel
+                assert adapter.credentials.adapter_principal == api.principal
+            finally:
+                adapter.shutdown.set()
+            assert pending.result(timeout=5) == "retry"
+    finally:
+        adapter.close()

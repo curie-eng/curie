@@ -18,6 +18,7 @@ import time
 import urllib.parse
 from collections import OrderedDict
 from collections.abc import Iterable, Mapping, Sequence
+from contextlib import nullcontext
 from datetime import UTC, datetime
 from typing import Any, ClassVar, Literal, cast
 
@@ -693,14 +694,6 @@ class MailAdapter:
         return False
 
     def post_turn(self, turn: dict[str, Any]) -> IngressOutcome:
-        # A channel mint revokes its predecessor at the API commit. Keep the
-        # entire HTTP submission inside the same lock as mint and local swap.
-        if not self.config.self_rotate:
-            return self._post_turn(turn)
-        with self.credentials.lock:
-            return self._post_turn(turn)
-
-    def _post_turn(self, turn: dict[str, Any]) -> IngressOutcome:
         """Post one turn to the channel port and classify the platform's answer.
 
         Returns:
@@ -712,7 +705,7 @@ class MailAdapter:
             which leaves the delivery pending under the same stable id.
         """
         url = f"{self.config.api_base_url.rstrip('/')}/channels/turns"
-        headers = {"X-API-Key": self.credentials.channel_token}
+        headers: dict[str, str] = {}
         body: dict[str, Any] | bytes = turn
         if self.receiver_keys is not None:
             signed = self._signed_turn(turn, self.receiver_keys)
@@ -725,27 +718,31 @@ class MailAdapter:
                 return "refused"
             body, headers[RECEIVER_PROOF_HEADER] = signed
         for attempt in range(1, self.config.ingress_attempts + 1):
-            result = request(
-                "POST",
-                url,
-                body,
-                headers,
-                max_response_bytes=self.config.max_body_bytes,
-            )
-            with self.lock:
-                self.last_ingress_status = result.status
-                fingerprint = hashlib.sha256(self.credentials.channel_token.encode()).hexdigest()
-                was_rejected = self.channel_token_rejected and (
-                    self._rejected_channel_fingerprint == fingerprint
+            # Mint revokes the old token at the API commit. Finish each wire
+            # attempt before swapping; retry delays must leave renewal runnable.
+            with self.credentials.lock if self.config.self_rotate else nullcontext():
+                headers["X-API-Key"] = self.credentials.channel_token
+                result = request(
+                    "POST",
+                    url,
+                    body,
+                    headers,
+                    max_response_bytes=self.config.max_body_bytes,
                 )
-                if result.status == 401:
-                    self.channel_token_rejected = True
-                    self._rejected_channel_fingerprint = fingerprint
-                    self.credentials.channel_rejected()
-                elif result.status == 200:
-                    self.channel_token_rejected = False
+                with self.lock:
+                    self.last_ingress_status = result.status
+                    fingerprint = hashlib.sha256(headers["X-API-Key"].encode()).hexdigest()
+                    was_rejected = self.channel_token_rejected and (
+                        self._rejected_channel_fingerprint == fingerprint
+                    )
+                    if result.status == 401:
+                        self.channel_token_rejected = True
+                        self._rejected_channel_fingerprint = fingerprint
+                        self.credentials.channel_rejected()
+                    elif result.status == 200:
+                        self.channel_token_rejected = False
             if result.status == 401 and not was_rejected:
-                exp = _token_expiry(self.credentials.channel_token)
+                exp = _token_expiry(headers["X-API-Key"])
                 expires = datetime.fromtimestamp(exp, UTC).isoformat() if exp else "unknown"
                 if self.config.self_rotate:
                     logger.error(
