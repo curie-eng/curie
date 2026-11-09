@@ -16,11 +16,12 @@ from collections.abc import Callable, Mapping
 from typing import Any
 
 import redis
-from curie_dispatcher.admission import AdmissionGate
 from curie_telemetry import record_metric
 from slack_bolt import App
 from slack_bolt.adapter.socket_mode import SocketModeHandler
 from slack_sdk.web import WebClient
+
+from curie_channel_gateway.slack.admission import AdmissionGate
 
 from .config import DispatcherConfig, release_identity
 from .handlers import Clock, register_handlers

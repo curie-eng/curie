@@ -44,7 +44,7 @@ from contextlib import nullcontext
 from datetime import UTC, datetime
 
 from aci_protocol import STREAM_PAYLOAD_FIELD, QueuedTurn
-from curie_dispatcher.queue import from_stream_fields
+from curie_internal.turn_queue import from_stream_fields
 from curie_telemetry import (
     TRACEPARENT_STREAM_FIELD,
     channel_event_id_scope,

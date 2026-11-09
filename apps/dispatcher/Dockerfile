@@ -56,4 +56,4 @@ WORKDIR /app
 COPY --from=builder --chown=app:app /app/.venv /app/.venv
 ENV PATH="/app/.venv/bin:$PATH"
 USER 1000
-CMD ["python", "-m", "curie_dispatcher"]
+CMD ["python", "-m", "curie_channel_gateway.slack.run"]

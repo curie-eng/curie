@@ -344,10 +344,10 @@ sequenceDiagram
 
 The pieces, cited:
 
-- **Dedupe + placeholder + enqueue** live in the dispatcher:
-  - dedupe `SET NX` at [`apps/dispatcher/src/curie_dispatcher/queue.py::claim_event`](apps/dispatcher/src/curie_dispatcher/queue.py)
+- **Dedupe + placeholder + enqueue** run in the gateway-owned Slack intake process:
+  - dedupe `SET NX` at [`packages/curie-internal/src/curie_internal/turn_queue.py::claim_event`](packages/curie-internal/src/curie_internal/turn_queue.py)
   - placeholder post at [`packages/channel-gateway/src/curie_channel_gateway/slack/handlers.py::process_event`](packages/channel-gateway/src/curie_channel_gateway/slack/handlers.py)
-  - `XADD curie:runs` at [`apps/dispatcher/src/curie_dispatcher/queue.py::enqueue`](apps/dispatcher/src/curie_dispatcher/queue.py)
+  - `XADD curie:runs` at [`packages/curie-internal/src/curie_internal/turn_queue.py::enqueue`](packages/curie-internal/src/curie_internal/turn_queue.py)
 
   The Socket Mode handler is at [`packages/channel-gateway/src/curie_channel_gateway/slack/app.py::SocketModeConnection`](packages/channel-gateway/src/curie_channel_gateway/slack/app.py). The stream name is configured on [`packages/channel-gateway/src/curie_channel_gateway/slack/config.py::DispatcherConfig`](packages/channel-gateway/src/curie_channel_gateway/slack/config.py) (default `curie:runs`), and the payload model is the channel-neutral [`packages/aci-protocol/src/aci_protocol/turn.py::QueuedTurn`](packages/aci-protocol/src/aci_protocol/turn.py).
 - **The kernel** consumes at [`apps/worker/src/curie_worker/consumer.py::Consumer.run`](apps/worker/src/curie_worker/consumer.py) and processes at [`apps/worker/src/curie_worker/kernel/core.py::Kernel.process_event`](apps/worker/src/curie_worker/kernel/core.py). It talks to the runner over `POST /v1/event`, `/v1/steer`, `/v1/interrupt` ([`apps/worker/src/curie_worker/runner_client.py::RunnerClient`](apps/worker/src/curie_worker/runner_client.py)). These are the same routes the runner serves at [`runner/src/curie_runner/server.py::create_app`](runner/src/curie_runner/server.py).

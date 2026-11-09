@@ -12,11 +12,11 @@ from unittest.mock import MagicMock
 
 import pytest
 import redis
+from curie_channel_gateway.slack.admission import build_admission
 from curie_channel_gateway.slack.config import DispatcherConfig
 from curie_channel_gateway.slack.handlers import process_event
-from curie_dispatcher.admission import build_admission
-from curie_dispatcher.queue import from_stream_fields
 from curie_internal.driver_declaration import DeclaredDriver
+from curie_internal.turn_queue import from_stream_fields
 from pydantic import ValidationError
 
 from .conftest import FakeAdmissionApi, person_rooted_thread

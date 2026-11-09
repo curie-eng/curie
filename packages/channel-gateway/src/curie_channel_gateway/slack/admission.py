@@ -63,6 +63,9 @@ from urllib.parse import urlsplit
 
 import httpx
 import redis
+from curie_internal.keyspace import ADMISSION_KEY_PREFIX_DEFAULT
+from curie_telemetry import inject_trace_context
+
 from curie_channel_gateway.ports.admission import (
     AdmissionAnswer,
     AdmissionClient,
@@ -70,8 +73,6 @@ from curie_channel_gateway.ports.admission import (
 )
 from curie_channel_gateway.slack.config import DispatcherConfig
 from curie_channel_gateway.slack.relevance import DropReason
-from curie_internal.keyspace import ADMISSION_KEY_PREFIX_DEFAULT
-from curie_telemetry import inject_trace_context
 
 if TYPE_CHECKING:
     from redis import Redis

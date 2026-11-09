@@ -12,13 +12,14 @@ from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Any, Literal, Never
 
-from curie_dispatcher.app import build_redis
 from curie_internal.operator_file import (
     OperatorFileRefusal,
     decode_key_material,
     read_operator_json,
 )
 from slack_sdk.web import WebClient
+
+from curie_channel_gateway.slack.valkey import build_redis
 
 from .config import DispatcherConfig
 from .http_receiver import (

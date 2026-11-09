@@ -19,7 +19,7 @@ import pytest
 import redis
 from curie_api import identity_fence
 from curie_api.config import get_settings
-from curie_dispatcher import admission
+from curie_channel_gateway.slack import admission
 
 DEFAULT = "curie:identity:admission-fence"
 
@@ -161,7 +161,7 @@ def test_copied_child_environment_and_actual_factory_agree(
     env = overlay(import_env(), identity_fence.FENCE_KEY)
     code = (
         "import json,identity_fence_support as h;from curie_api import identity_fence as w;"
-        "from curie_dispatcher import admission as r;from fastapi import FastAPI;"
+        "from curie_channel_gateway.slack import admission as r;from fastapi import FastAPI;"
         "from curie_api.main import create_app;baseline=create_app();"
         "app=h.create_namespaced_app();"
         "print(json.dumps([w.FENCE_KEY,r.IDENTITY_FENCE_KEY,"
@@ -188,7 +188,7 @@ def test_fresh_unmodified_imports_and_missing_child_key_preserve_wire_defaults()
     env.pop("CURIE_TEST_IDENTITY_FENCE_KEY", None)
     code = (
         "import json,identity_fence_support;from curie_api import identity_fence as w;"
-        "from curie_dispatcher import admission as r;"
+        "from curie_channel_gateway.slack import admission as r;"
         "print(json.dumps([w.FENCE_KEY,r.IDENTITY_FENCE_KEY]))"
     )
     result = subprocess.run(

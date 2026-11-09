@@ -45,7 +45,7 @@ import pytest
 import redis.exceptions
 from aci_protocol import Final, QueuedTurn, SessionStatus, SideEffectFlag, TextDelta
 from aiohttp import web
-from curie_dispatcher.queue import to_stream_fields
+from curie_internal.turn_queue import to_stream_fields
 from curie_worker.consumer import Consumer
 from curie_worker.consumer_liveness import ConsumerLivenessStore, consumer_heartbeat_key
 from curie_worker.delivery_lease import DeliveryLeaseStore

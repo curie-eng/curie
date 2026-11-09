@@ -660,7 +660,7 @@ def test_required_crash_proof_refuses_unavailable_valkey(monkeypatch) -> None:
 def crash_case(tls: ShellTls, tmp_path: Path, phase: str, crash_platform):
     from aci_protocol import QueuedTurn, ReplyHandle
     from aci_protocol.s3 import build_s3_client
-    from curie_dispatcher.queue import to_stream_fields
+    from curie_internal.turn_queue import to_stream_fields
     from curie_test_support.valkey import VALKEY_HOST, VALKEY_PORT, VALKEY_PW
     from curie_worker.bundle_store import BundleStore
     from curie_worker.config import WorkerConfig

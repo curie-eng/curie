@@ -30,7 +30,7 @@ from aci_protocol import (
 )
 from curie_api.config import Settings
 from curie_api.workitem_reconciler import WorkItemReconciler
-from curie_dispatcher.queue import to_stream_fields
+from curie_internal.turn_queue import to_stream_fields
 from curie_protected_hooks.source_policy_sql import SourceGate
 from curie_telemetry import tracing as telemetry_tracing
 from curie_test_support.valkey import VALKEY_HOST, VALKEY_PORT, VALKEY_PW

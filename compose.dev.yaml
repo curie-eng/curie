@@ -790,7 +790,7 @@ services:
 
   curie-dispatcher:
     # Its own variable, same reasoning as curie-ui above (#1915). This one bit
-    # hardest locally: the CLI invoked `curie_dispatcher.enqueue_once`, the
+    # hardest locally: the CLI invoked `curie_channel_gateway.slack.enqueue_once`, the
     # published image predated that module, and the failure surfaced as a bare
     # `No module named` from inside a container.
     image: ${CURIE_DISPATCHER_IMAGE:-ghcr.io/curie-eng/curie-dispatcher:latest}

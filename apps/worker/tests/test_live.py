@@ -53,7 +53,7 @@ from curie_channel_gateway.slack.blocks import (
 )
 from curie_channel_gateway.slack.files import SlackFileClient, SlackFileError
 from curie_channel_gateway.slack.slack_sink import SlackReplyAdapter
-from curie_dispatcher.queue import to_stream_fields
+from curie_internal.turn_queue import to_stream_fields
 from curie_worker.reply_sink import TargetRoute
 from redis import Redis
 from redis.exceptions import RedisError

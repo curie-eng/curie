@@ -14,10 +14,10 @@ from unittest.mock import MagicMock
 import httpx
 import pytest
 import redis
+from curie_channel_gateway.slack.admission import build_admission
 from curie_channel_gateway.slack.approval_actions import ApprovalResolveClient
 from curie_channel_gateway.slack.handlers import process_event
 from curie_channel_gateway.slack.marked_actions import reserve_turn
-from curie_dispatcher.admission import build_admission
 
 from .conftest import FakeAdmissionApi
 from .test_test_actions import DRIVER, _configured
@@ -429,8 +429,8 @@ def test_owner_probe_exception_is_retryable() -> None:
 def test_socket_mode_caller_denial_and_unknown_never_probe_or_claim(
     config: Any, redis_client: redis.Redis, allowed: bool | None
 ) -> None:
+    from curie_channel_gateway.slack.admission import AdmissionGate, SlackAdmissionClient
     from curie_channel_gateway.slack.app import build_app
-    from curie_dispatcher.admission import AdmissionGate, SlackAdmissionClient
     from slack_bolt.adapter.socket_mode import SocketModeHandler
 
     from .conftest import FakeSocketClient, _authorize, deliver_once
@@ -498,8 +498,8 @@ def test_socket_mode_deadline_saturation_and_late_read_cannot_ack_or_resolve(
     import threading
     import time
 
+    from curie_channel_gateway.slack.admission import AdmissionGate, SlackAdmissionClient
     from curie_channel_gateway.slack.app import build_app
-    from curie_dispatcher.admission import AdmissionGate, SlackAdmissionClient
     from slack_bolt.adapter.socket_mode import SocketModeHandler
 
     from .conftest import FakeSocketClient, _authorize

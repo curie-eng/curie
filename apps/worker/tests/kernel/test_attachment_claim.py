@@ -1594,7 +1594,7 @@ def test_retained_workspace_file_turn_refuses_without_mutating_any_owned_state(
     """The v0.9.1 workspace boundary is visible, terminal, and mutation free."""
 
     async def go() -> None:
-        from curie_dispatcher.queue import to_stream_fields
+        from curie_internal.turn_queue import to_stream_fields
         from curie_worker.consumer import Consumer
         from curie_worker.delivery_lease import DeliveryLeaseStore
 
@@ -2302,7 +2302,7 @@ def test_a_channel_port_turn_hands_the_lane_the_binding_it_arrived_on(make_harne
 
 @pytest.mark.parametrize("side_effect", [False, True])
 def test_attachment_handoff_preserves_predecessor_action_marker(make_harness, side_effect) -> None:
-    from curie_dispatcher.queue import to_stream_fields
+    from curie_internal.turn_queue import to_stream_fields
     from curie_worker.consumer import Consumer
     from curie_worker.delivery_lease import DeliveryLeaseStore
     from curie_worker.kernel.routing import _thread_key_for

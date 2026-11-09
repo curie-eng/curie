@@ -32,6 +32,7 @@ import httpx
 import pytest
 import redis
 from curie_channel_gateway.slack import identity as identity_module
+from curie_channel_gateway.slack.admission import build_admission
 from curie_channel_gateway.slack.app import build_app
 from curie_channel_gateway.slack.approval_actions import (
     APPROVE_ACTION_ID,
@@ -46,7 +47,6 @@ from curie_channel_gateway.slack.identity import (
     shutdown_identity_lookups,
     slack_evidence,
 )
-from curie_dispatcher.admission import build_admission
 from slack_bolt import App
 from slack_bolt.adapter.socket_mode import SocketModeHandler
 from slack_sdk.socket_mode.request import SocketModeRequest

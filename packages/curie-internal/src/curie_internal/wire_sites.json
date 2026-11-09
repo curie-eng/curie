@@ -52,7 +52,7 @@
       "language": "lua",
       "purpose": "Runs enqueue with a durable wake marker"
     },
-    "apps/dispatcher/src/curie_dispatcher/queue.py:enqueue:1": {
+    "packages/curie-internal/src/curie_internal/turn_queue.py:enqueue:1": {
       "language": "python",
       "purpose": "Runs enqueue after dispatcher placeholder publication"
     },
@@ -142,7 +142,7 @@
       "value": "f'curie:publication-labels:{publication.id}'",
       "reason": "Successful per-publication pull request labeling marker with a 30-day TTL"
     },
-    "apps/dispatcher/src/curie_dispatcher/admission.py:module:1": {
+    "packages/channel-gateway/src/curie_channel_gateway/slack/admission.py:module:1": {
       "value": "curie:identity:admission-fence",
       "reason": "Admission cache reads the shared identity generation fence before reusing or storing decisions"
     },

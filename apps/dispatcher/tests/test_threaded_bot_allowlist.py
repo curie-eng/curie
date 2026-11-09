@@ -14,7 +14,7 @@ import pytest
 import redis
 from curie_channel_gateway.slack.config import DispatcherConfig
 from curie_channel_gateway.slack.relevance import DropReason
-from curie_dispatcher.queue import from_stream_fields
+from curie_internal.turn_queue import from_stream_fields
 from pydantic import ValidationError
 from pydantic_settings.exceptions import SettingsError
 

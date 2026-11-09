@@ -1571,7 +1571,7 @@ def test_real_review_consumer_waits_for_active_turn_and_revalidates_before_new_t
     import uvicorn
     from aci_protocol import Final, QueuedTurn, ReplyHandle, SessionStatus, TextDelta
     from aci_protocol.s3 import build_s3_client
-    from curie_dispatcher.queue import to_stream_fields
+    from curie_internal.turn_queue import to_stream_fields
     from curie_worker.approvals import ApprovalClient
     from curie_worker.binding import BindingResolver
     from curie_worker.consumer import Consumer
@@ -2016,7 +2016,7 @@ def test_reserved_review_keeps_ordinary_slack_routing(
         TurnSource,
     )
     from aci_protocol.s3 import build_s3_client
-    from curie_dispatcher.queue import to_stream_fields
+    from curie_internal.turn_queue import to_stream_fields
     from curie_worker.approvals import ApprovalClient
     from curie_worker.binding import BindingResolver
     from curie_worker.consumer import Consumer

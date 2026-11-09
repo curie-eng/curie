@@ -1,8 +1,9 @@
-"""Dispatcher-owned Valkey client construction."""
+"""Gateway-owned Slack Valkey client construction."""
 
 import redis
-from curie_channel_gateway.slack.config import DispatcherConfig
 from curie_internal.valkey import Redis
+
+from curie_channel_gateway.slack.config import DispatcherConfig
 
 
 def build_redis(config: DispatcherConfig) -> redis.Redis:
