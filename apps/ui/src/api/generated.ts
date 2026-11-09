@@ -8424,19 +8424,6 @@ export interface components {
             /** Secret */
             secret: string;
         };
-        /** IdentityLinkRevokedOut */
-        IdentityLinkRevokedOut: {
-            /**
-             * Link Id
-             * Format: uuid
-             */
-            link_id: string;
-            /**
-             * Revoked At
-             * Format: date-time
-             */
-            revoked_at: string;
-        };
         /**
          * HttpSelectionV1
          * @description @spec HTTP-AUTHORITY-CONFIG-V1-1.
@@ -8460,6 +8447,19 @@ export interface components {
              * @constant
              */
             mode: "http";
+        };
+        /** IdentityLinkRevokedOut */
+        IdentityLinkRevokedOut: {
+            /**
+             * Link Id
+             * Format: uuid
+             */
+            link_id: string;
+            /**
+             * Revoked At
+             * Format: date-time
+             */
+            revoked_at: string;
         };
         /**
          * IssueReadContext
