@@ -100,6 +100,21 @@ fn no_current_context_is_not_refused_without_a_terminal() {
     assert!(!text.contains("must confirm"), "{text}");
 }
 
+/// `cluster status` prints the console at 127.0.0.1:30080 and Langfuse at
+/// 127.0.0.1:30000. A kind node publishes no NodePort to the host unless the
+/// cluster is created with `extraPortMappings`, so the plan creates it with them.
+#[test]
+fn the_kind_cluster_is_created_with_the_console_ports_published() {
+    let planned = quickstart_plan(&plan_input()).expect("no context proceeds");
+    let text = describe(&planned).join("\n");
+    assert!(
+        text.contains("kind create cluster --name curie-factory --config"),
+        "{text}"
+    );
+    assert!(text.contains("127.0.0.1:30080"), "{text}");
+    assert!(text.contains("127.0.0.1:30000"), "{text}");
+}
+
 #[test]
 fn an_explicit_context_is_not_refused_without_a_terminal() {
     let mut input = plan_input();

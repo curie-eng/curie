@@ -5,7 +5,7 @@
 infer repository toolchains before Helm from App-authenticated workflows and manifests; compare requirements with observed tools after selecting the runner image
 Kubernetes context: kind-curie-factory because no current context is set, so a kind cluster is created
 model credential: use CURIE_CREDENTIALS (no prompt)
-kind create cluster --name curie-factory
+kind create cluster --name curie-factory --config <kind config: 127.0.0.1:30080 for the UI, 127.0.0.1:30000 for Langfuse>
 kubectl --context kind-curie-factory -n kube-system scale deployment/coredns --replicas=1
 curie cluster up --context kind-curie-factory --namespace curie --release curie --model z-ai/glm-5.3-flash --chart charts/curie --set security.gvisor.mode=off
 configure factory intake factory.intake=poll for acme/widgets with --app-id 12345 --private-key-file /keys/app.pem and no webhook secret; the same helm upgrade binds the dark factory runner image

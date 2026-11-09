@@ -193,7 +193,11 @@ What it does:
 
 1. When no kubeconfig context is targeted, it creates kind cluster
    `curie-factory` (context `kind-curie-factory`) and scales CoreDNS to one
-   replica. A current kind context skips creating a cluster and does not ask.
+   replica. It publishes the console (port 30080) and Langfuse (port 30000) on
+   `127.0.0.1` of the host. If a host port is in use it creates the cluster
+   without them and says so, and `kubectl port-forward` reaches the console.
+   A cluster created earlier keeps the ports it was created with. A current
+   kind context skips creating a cluster and does not ask.
    A current context that is not kind, including a remote cluster, is not
    used until you confirm it in a terminal. Without a terminal the command
    stops and names the explicit context flag as the way to proceed. An explicit
