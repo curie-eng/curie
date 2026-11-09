@@ -87,3 +87,34 @@ def test_a_malformed_shell_inventory_is_refused(raw: str | None) -> None:
 def test_the_shell_inventory_defaults_to_the_supervisor_port() -> None:
     (slot,) = parse_static_shells('[{"slot": "sre-0", "host": "shell.internal", "pool": "p"}]')
     assert (slot.slot, slot.host, slot.port, slot.pool) == ("sre-0", "shell.internal", 8443, "p")
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        "not-json",
+        "[]",
+        '{"acme-a": []}',
+        '{"": {}}',
+        '{"acme-a": {"CURIE_RUNNER_TOKEN": "/run/credentials/token"}}',
+        '{"acme-a": {"EXTERNAL_API_TOKEN": "relative"}}',
+        '{"acme-a": {"BAD=NAME": "/run/credentials/token"}}',
+        '{"acme-a": {"EXTERNAL_API_TOKEN": 1}}',
+    ],
+)
+def test_malformed_agent_credential_files_are_refused(raw: str) -> None:
+    from curie_worker.sandbox.static import parse_agent_credential_files
+
+    with pytest.raises(ValueError, match="CURIE_AGENT_CREDENTIAL_FILES"):
+        parse_agent_credential_files(raw)
+
+
+def test_agent_credential_files_are_optional_and_keep_agent_scope() -> None:
+    from curie_worker.sandbox.static import parse_agent_credential_files
+
+    assert parse_agent_credential_files(None) == {}
+    assert parse_agent_credential_files("{}") == {}
+    declaration = {"acme-a": {"EXTERNAL_API_TOKEN": "/run/credentials/token"}, "acme-b": {}}
+    import json
+
+    assert parse_agent_credential_files(json.dumps(declaration)) == declaration

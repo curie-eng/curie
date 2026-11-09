@@ -8,6 +8,7 @@ name in ``stage.child_environment``.
 
 from __future__ import annotations
 
+import json
 import os
 import shlex
 import stat
@@ -187,6 +188,51 @@ class SupervisorConfig:
         secret = _names(env.get("CURIE_SUPERVISOR_CHILD_ENV"))
         if any(name.startswith("CURIE_SUPERVISOR_") for name in (*public, *secret)):
             raise ConfigError("supervisor settings are never forwarded to the child")
+        model_names = {
+            "ANTHROPIC_API_KEY",
+            "CLAUDE_CODE_OAUTH_TOKEN",
+            "ANTHROPIC_AUTH_TOKEN",
+            "CURIE_CREDENTIALS",
+        }
+        declared_model = env.get("CURIE_MODEL_ENV_KEY", "")
+        if declared_model:
+            try:
+                declared = (
+                    json.loads(declared_model)
+                    if declared_model.startswith("[")
+                    else [declared_model]
+                )
+            except ValueError:
+                raise ConfigError(
+                    "CURIE_MODEL_ENV_KEY must declare model environment names"
+                ) from None
+            if not isinstance(declared, list) or not all(
+                isinstance(name, str) for name in declared
+            ):
+                raise ConfigError("CURIE_MODEL_ENV_KEY must declare model environment names")
+            model_names.update(declared)
+        if set(secret) - model_names:
+            raise ConfigError(
+                "shell secrets may contain only deployment-wide model credentials; "
+                "deliver agent secrets per claim"
+            )
+        agent_names = {
+            "CURIE_SESSION_ID",
+            "CURIE_PLUGIN_DIR",
+            "CURIE_BUNDLE_REF",
+            "CURIE_BUNDLE_VERSION",
+            "CURIE_AGENT_ID",
+        }
+        if any(
+            name in agent_names
+            or name.startswith(
+                ("CURIE_HOSTED_CONNECTOR_", "CURIE_HISTORY_", "CURIE_MEMORY_", "CURIE_STATE_")
+            )
+            or name.startswith("CURIE_CONNECTOR_")
+            and name != "CURIE_CONNECTOR_CA_FILE"
+            for name in public
+        ):
+            raise ConfigError("agent configuration must be delivered per claim")
         return cls(
             slot=slot,
             incarnation=env.get("CURIE_SUPERVISOR_INCARNATION") or uuid.uuid4().hex,

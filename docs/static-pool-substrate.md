@@ -9,6 +9,11 @@ process for one claim at a time, proxies the runner's agent control interface
 to the worker, and wipes everything the claim left behind before the shell
 takes another claim.
 
+The default is one shared pool for every agent, sized for concurrent claims.
+Agents do not reserve idle shells. An operator may explicitly assign an agent
+its own pool for isolation; credentials do not require a dedicated pool.
+A shell has no agent-specific secrets or runtime configuration between claims.
+
 Select it on the worker with `CURIE_SANDBOX_SUBSTRATE=static`. The worker
 refuses any value other than `kubernetes` (the default), `docker` and `static`.
 
@@ -146,15 +151,36 @@ be read, a claim fails with `AdmissionUnavailableError` instead.
 | `CURIE_STATIC_SHELLS` | The shell inventory, a JSON array described below. Required. |
 | `CURIE_STATIC_SHELL_CA_FILE` | Path to the PEM bundle of the CA that signs every shell certificate. Required. The worker verifies each shell's certificate and host name against it. |
 | `CURIE_STATIC_SHELL_CONTROL_TOKEN` | The control credential the shells accept, at least 32 characters. Required. It is a host credential and never reaches a runner. |
-| `CURIE_WARM_POOL` | The generic pool name, `curie-runner-pool` by default. Shells in this pool serve agents without their own pool. |
-| `CURIE_AGENT_SANDBOX_POOLS`, `CURIE_AGENT_CONNECTOR_SECRET_POOLS` | Agents with their own shells. Each named agent's pool is derived as on Kubernetes (`<prefix>-agent-<agent>-runner-pool`), and the worker refuses to start when no inventory entry serves it. |
+| `CURIE_WARM_POOL` | The generic pool name, `curie-runner-pool` by default. Shells in this pool serve every agent unless explicitly assigned its own pool. |
+| `CURIE_AGENT_SANDBOX_POOLS`, `CURIE_AGENT_CONNECTOR_SECRET_POOLS` | Explicit isolation opt-ins for agents with their own shells. Each named agent's pool is derived as on Kubernetes (`<prefix>-agent-<agent>-runner-pool`), and the worker refuses to start when no inventory entry serves it. |
+| `CURIE_AGENT_CREDENTIAL_FILES` | Optional JSON object mapping agent names to credential environment names and absolute worker-side UTF-8 file paths. Read fresh for each claim, never mounted on shells. Missing, unreadable or empty files refuse the claim. |
 | `CURIE_ROUTE_TTL_SECONDS`, `CURIE_SUSPENDED_ROUTE_TTL_SECONDS`, `CURIE_CLAIM_TIMEOUT_SECONDS` | Route lifetimes and the claim bind timeout, as for the other substrates. |
 
 Leases live in the worker's Valkey under the substrate key prefix. The static
 substrate refuses `CURIE_REPO_RUNNER_POOLS` and the Kubernetes admission
 settings at startup. Repository publication runs only on Kubernetes.
 
-The inventory names each shell once:
+The inventory names each shell once. Shared slots all use the generic pool;
+add a dedicated pool only when naming its agent in an isolation opt-in.
+
+For example, credentials for a declared external HTTP or MCP server can be
+provided without a hosted connector or a new bundle-format field:
+
+```json
+{"acme-bot": {"EXTERNAL_API_TOKEN": "/run/credentials/acme-bot-api-token"}}
+```
+
+Set this object as `CURIE_AGENT_CREDENTIAL_FILES` on the worker. Files contain
+the exact nonempty UTF-8 credential value, without a trailing newline. Bundle
+MCP headers can reference `${EXTERNAL_API_TOKEN}` through their existing
+environment substitution. These names join `CURIE_CONNECTOR_SECRET_KEYS`, so
+the runner records their values in its held-secret and outbound-redaction
+inventory before serving. Reserved platform names and withheld credentials
+are refused. An explicit file declaration takes precedence over an agent's
+stored value for the same name. The worker needs access to the source files;
+a shell never does.
+
+An inventory with one shared slot and one optional dedicated slot is:
 
 ```json
 [
@@ -181,8 +207,8 @@ The supervisor reads its settings from its own environment.
 | `CURIE_SUPERVISOR_CHILD_PORT` | `8080` | The runner child's port. |
 | `CURIE_SUPERVISOR_RUNNER_COMMAND` | `python -m curie_runner` | The child command line. |
 | `CURIE_SUPERVISOR_CHILD_UID`, `CURIE_SUPERVISOR_CHILD_GID` | `1000` | The child's uid and gid, never 0. The supervisor must run as root, or it refuses to start. |
-| `CURIE_SUPERVISOR_CHILD_ENV` | empty | Comma separated names of secrets in the shell environment that the child receives, such as the model credential and connector secrets. An executor claim receives only the names its claim allows. |
-| `CURIE_SUPERVISOR_CHILD_ENV_PUBLIC` | empty | Comma separated names of non-secret settings the child receives, such as telemetry endpoints or connector endpoint maps set on the shell. |
+| `CURIE_SUPERVISOR_CHILD_ENV` | empty | Comma separated deployment-wide model credential names in the shell environment that the child receives. Agent credentials are refused here and must arrive per claim. Custom model credential names must also be declared by `CURIE_MODEL_ENV_KEY`. |
+| `CURIE_SUPERVISOR_CHILD_ENV_PUBLIC` | empty | Comma separated names of non-secret settings the child receives, such as deployment-wide telemetry endpoints and the connector CA file. Agent identity, connector endpoint maps and caller credentials must arrive per claim. |
 | `CURIE_SUPERVISOR_STATE_ROOT` | `/var/lib/curie-shell` | Where claim directories are staged. |
 | `CURIE_SUPERVISOR_WORKSPACE_PATH`, `CURIE_SUPERVISOR_ATTACHMENTS_PATH` | `/workspace`, `/attachments` | Links the supervisor points at the claim's workspace and attachments. Each must be absent, a link or an empty directory. |
 | `CURIE_SUPERVISOR_SCRUB_PATHS` | `/tmp,/var/tmp,/dev/shm,/run/lock,/dev/mqueue` | The scratch roots: the only places outside its claim directory the child may write. Each is returned to its startup contents at every retirement. |
@@ -193,10 +219,16 @@ The supervisor reads its settings from its own environment.
 
 The child environment is built, never inherited. It holds the image's
 `PATH`, `LANG`, `LC_ALL`, `TZ`, `SSL_CERT_FILE`, `PYTHONUNBUFFERED` and
-`CURIE_PROC_DUMPABLE_PRELOAD`, the names listed above, and the claim's boot env
-from the worker. The supervisor sets `HOME`, `TMPDIR`, `CURIE_PLUGIN_DIR`,
+`CURIE_PROC_DUMPABLE_PRELOAD` and the deployment-wide names listed above.
+The supervisor writes the worker's filtered boot environment to
+`runner-environment.json` inside the fresh claim directory with mode `0400`,
+owned by the runner UID (1000 in the standard image). A shell-owned launcher
+reads that file and constructs the fresh environment before executing the
+configured runner command. The runner still consumes its existing BootEnv
+contract; no frozen protocol or bundle format changes. The supervisor sets
+`HOME`, `TMPDIR`, `CURIE_PLUGIN_DIR`,
 `CURIE_SANDBOX_ID` and `CURIE_RUNNER_PORT` itself. No `CURIE_SUPERVISOR_`
-variable can be forwarded. The claim's boot env passes through unchanged
+variable can be forwarded. The claim's boot env reaches the runner unchanged
 otherwise, so the caller and route tokens and the connector endpoint variables
 (`CURIE_HOSTED_CONNECTOR_ENDPOINTS`, `CURIE_CONNECTOR_UPLOAD_ENDPOINTS`) reach
 the runner as they do on the other substrates.
@@ -225,12 +257,22 @@ before the child starts.
 ## Trust boundaries
 
 The worker holds the control credential and the CA. A shell holds its own
-certificate and key, the control credential, and the secrets it passes to its
-child by name. The supervisor runs as root and the runner child runs as an
+certificate and key, the control credential, and an optional deployment-wide
+model credential. A shared model credential authenticates the deployment's
+model service, rather than selecting an agent. The connector CA is shared
+public trust material for that deployment's connector certificates; it grants
+no agent identity or caller authority. A shell-level model
+credential must be common to every agent served by that shell. The supervisor
+runs as root and the runner child runs as an
 unprivileged uid, so the child cannot read the supervisor's environment,
 certificate key or other claims' directories. The runner bearer is per claim
 and must differ from the control credential. Each claim gets a new directory,
-`HOME` and `TMPDIR`, and its bundle is read only.
+`HOME` and `TMPDIR`. Bundle code and its immutable plugin templates are delivered
+per claim, remain root-owned and read only, and retain executable permissions
+where needed. The runner cannot write them or chmod them. Mutable runtime
+configuration and credentials are separate runner-owned `0400` claim files.
+Root supervision wipes both kinds of files at claim end. Nothing from a prior
+claim is inherited into the next runner process.
 
 When the bound agent has configured upload listeners, the worker mints `ccu`
 tokens only for its declared and allowed hosted connectors with an `upload_url`.
@@ -290,8 +332,10 @@ claim after its supervisor is gone.
    readable by its group, or readable by everyone.
 3. One control credential shared by the workers and the shells, delivered as a
    secret.
-4. The secrets each pool's agents need (the model credential and connector
-   secrets) in the shell environment, named in `CURIE_SUPERVISOR_CHILD_ENV`.
+4. Only deployment-wide model credentials in the shell environment, named in
+   `CURIE_SUPERVISOR_CHILD_ENV`. Bind agent secrets on the worker through the
+   existing per-agent secret values or `CURIE_AGENT_CREDENTIAL_FILES`; do not
+   install agent credentials, identities or connector endpoint maps on shells.
 5. A health check on `/_curie/supervisor/healthz` that replaces an unhealthy
    container, and a restart policy that starts a new supervisor incarnation.
 6. A Valkey shared by every worker.
@@ -299,6 +343,16 @@ claim after its supervisor is gone.
    with the container runtime's default `/dev/mqueue` mount and its own IPC
    namespace. The Dockerfile hands the runner image's home to root and strips
    setuid and setgid bits, so the startup check passes.
+
+## Kubernetes behavior
+
+This changes only static shells. Kubernetes still selects its chart-rendered
+per-agent pools for connector-secret claims, obtains their connector secrets
+through `secretKeyRef`, and uses its existing per-claim Secret and template
+handling for scoped caller and runner tokens. A claim needing environment
+injection may cold-create a pod. None of those Kubernetes paths or Helm values
+change. The static inventory and credential-file declaration are worker
+configuration and have no dedicated Helm values surface.
 
 ## What the static pool does not support
 

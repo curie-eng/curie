@@ -109,6 +109,7 @@ from .sandbox import (
     shell_ssl_context,
 )
 from .sandbox.quota import parse_admission_config
+from .sandbox.static import parse_agent_credential_files
 from .schema_startup import assert_worker_schema
 from .sibling_turns import build_sibling_limit
 from .stream_retention import StreamRetention, build_stream_retention
@@ -457,6 +458,9 @@ def _static_pool_client(
         workspace_limits=_workspace_limits(config),
         attachment_limits=_attachment_limits(config),
         connector_upload_signing_key=config.connector_caller_signing_key,
+        agent_credential_files=parse_agent_credential_files(
+            env.get("CURIE_AGENT_CREDENTIAL_FILES")
+        ),
     )
 
 
