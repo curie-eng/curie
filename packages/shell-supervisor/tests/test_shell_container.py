@@ -1506,7 +1506,7 @@ import hashlib, json, os, stat, sys
 from pathlib import Path
 bundle = Path(os.environ["CURIE_PLUGIN_DIR"])
 code = bundle / "immutable.py"
-result = {"bundle_uid": code.stat().st_uid}
+result = {"bundle_uid": code.stat().st_uid, "runner_uid": os.getuid()}
 for operation in ("write", "chmod"):
     try:
         if operation == "write":
@@ -1616,7 +1616,7 @@ def test_runner_cannot_modify_bundle_code_and_can_read_its_claim_credentials(
             _docker(
                 "exec",
                 "--user",
-                "1000:1000",
+                "0:0",
                 shell.name,
                 "python",
                 "-c",
@@ -1627,6 +1627,7 @@ def test_runner_cannot_modify_bundle_code_and_can_read_its_claim_credentials(
         )
         assert result == {
             "bundle_uid": 0,
+            "runner_uid": 1000,
             "write_refused": True,
             "chmod_refused": True,
             "credential_uid": 1000,
