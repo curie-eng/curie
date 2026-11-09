@@ -242,6 +242,12 @@ Required repository policies can impose stricter evidence. The detailed
 [factory operations reference](operations.md#admitting-a-labelled-github-issue)
 is authoritative for base-branch failures, required Python checks, and timeouts.
 
+## Follow a run's progress in Slack
+
+A factory agent can name one Slack channel for run progress. Set it with `PATCH /agents/{agent_id}` and `{"factory_slack_channel": "C0EXAMPLE1"}`; `null` clears it. The agent must already have exactly one Slack channel binding for that channel, and that binding's app identity posts. Otherwise the API answers 409 `factory_slack_channel_unbound`. Runs that are live at or after that moment get one Slack root message per WorkItem, kept across revisions, with phase reports, the pull request link and each run's terminal outcome posted in its thread. A WorkItem keeps its thread when the channel changes: later revisions still post in the channel its root went to, and only WorkItems that start afterwards root in the new channel. Tracker status comments are unchanged. Delivery is at least once, a rejected post stays owed and retries, and a late-committed phase report can arrive out of order.
+
+Steering a run from its Slack thread is not available yet. A mention of the app in a run thread is handled as ordinary chat. Worker settings are in the [operations reference](operations.md#factory-slack-progress).
+
 ## Operate and evaluate
 
 Use [measuring factory outcomes](guides/measuring-factory-outcomes.md) to
