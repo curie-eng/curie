@@ -11,7 +11,26 @@ import pytest
 from .test_protected_process_settings import product, value
 
 ROOT = Path(__file__).resolve().parents[3]
-CLI = Path(os.environ.get("CURIE_BIN", ROOT / "cli/target/debug/curie"))
+
+
+@pytest.fixture(scope="session")
+def migration_cli() -> Path:
+    supplied = os.environ.get("CURIE_BIN")
+    if supplied:
+        binary = Path(supplied).resolve()
+    else:
+        subprocess.run(["cargo", "build", "--locked"], cwd=ROOT / "cli", check=True)
+        metadata = subprocess.run(
+            ["cargo", "metadata", "--format-version", "1", "--no-deps"],
+            cwd=ROOT / "cli",
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        binary = Path(json.loads(metadata.stdout)["target_directory"]) / "debug/curie"
+    if not binary.is_file() or not os.access(binary, os.X_OK):
+        raise RuntimeError("migration tests require an executable candidate CLI")
+    return binary
 
 
 def old_settings():
@@ -28,7 +47,7 @@ def old_settings():
     return settings, gateway
 
 
-def run(tmp_path, settings, gateway):
+def run(tmp_path, settings, gateway, migration_cli):
     runtime = tmp_path / "runtime"
     runtime.mkdir()
     process = runtime / "process.json"
@@ -37,7 +56,7 @@ def run(tmp_path, settings, gateway):
     config.write_text(json.dumps(gateway))
     result = subprocess.run(
         [
-            str(CLI),
+            str(migration_cli),
             "migrate-protected-process",
             "--json",
             "--runtime-dir",
@@ -54,11 +73,11 @@ def run(tmp_path, settings, gateway):
     return runtime, process, result
 
 
-def test_migration_removes_raw_credentials_and_runtime_accepts_result(tmp_path):
+def test_migration_removes_raw_credentials_and_runtime_accepts_result(tmp_path, migration_cli):
     settings, gateway = old_settings()
     expected = {key: member for key, member in settings.items() if key != "slack"}
     expected.update(schema_version=2, channel_gateway=gateway)
-    runtime, process, result = run(tmp_path, settings, gateway)
+    runtime, process, result = run(tmp_path, settings, gateway, migration_cli)
     assert result.returncode == 0, result.stderr
     assert json.loads(result.stdout) == {"schema_version": 2, "migrated": True}
     assert json.loads(process.read_bytes()) == expected
@@ -73,7 +92,9 @@ def test_migration_removes_raw_credentials_and_runtime_accepts_result(tmp_path):
     "mutation",
     ["v2", "bad-url", "raw-token", "missing-identity", "unknown-field", "malformed-source"],
 )
-def test_migration_refuses_invalid_inputs_without_changing_source(tmp_path, mutation):
+def test_migration_refuses_invalid_inputs_without_changing_source(
+    tmp_path, mutation, migration_cli
+):
     settings, gateway = old_settings()
     if mutation == "v2":
         settings["schema_version"] = 2
@@ -87,7 +108,7 @@ def test_migration_refuses_invalid_inputs_without_changing_source(tmp_path, muta
         settings["unexpected"] = "private-migration-sentinel"
     else:
         settings["slack"]["identity_tokens"] = []
-    _, process, result = run(tmp_path, settings, gateway)
+    _, process, result = run(tmp_path, settings, gateway, migration_cli)
     assert result.returncode == 1
     assert json.loads(result.stdout)["fix"]
     assert json.loads(process.read_bytes()) == settings
@@ -97,9 +118,11 @@ def test_migration_refuses_invalid_inputs_without_changing_source(tmp_path, muta
 @pytest.mark.parametrize(
     "mutation", ["symlink", "duplicate", "duplicate-map", "oversized", "malformed"]
 )
-def test_cli_migration_refuses_unsafe_source_and_preserves_bytes(tmp_path, mutation):
+def test_cli_migration_refuses_unsafe_source_and_preserves_bytes(
+    tmp_path, mutation, migration_cli
+):
     settings, gateway = old_settings()
-    runtime, process, result = run(tmp_path, settings, gateway)
+    runtime, process, result = run(tmp_path, settings, gateway, migration_cli)
     assert result.returncode == 0
     raw = json.dumps(settings)
     if mutation == "duplicate":
@@ -116,7 +139,7 @@ def test_cli_migration_refuses_unsafe_source_and_preserves_bytes(tmp_path, mutat
         process.rename(target)
         process.symlink_to(target)
     result = subprocess.run([
-        str(CLI), "migrate-protected-process", "--json", "--runtime-dir", str(runtime),
+        str(migration_cli), "migrate-protected-process", "--json", "--runtime-dir", str(runtime),
         "--gateway-config", str(tmp_path / "gateway.json"),
     ], capture_output=True, text=True, env={"PATH": os.defpath})
     assert result.returncode == 1
