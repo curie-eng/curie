@@ -508,10 +508,7 @@ jobs:
   python-container-fixtures:
     name: Python container fixtures (pytest)
     needs: [changes]
-    if: >-
-      ${{ needs.changes.outputs.pytest == 'true' &&
-          (!contains(format(',{0},', needs.changes.outputs.pytest_deselect), ',tools/factory-e2e/tests/test_c4_tracker_scope.py,') ||
-           !contains(format(',{0},', needs.changes.outputs.pytest_deselect), ',examples/tests/test_sre_bot_observability_runtime.py,')) }}
+    if: ${{ needs.changes.outputs.pytest == 'true' }}
     runs-on: ubuntu-24.04
     permissions:
       contents: read
@@ -580,6 +577,10 @@ jobs:
           node_image: kindest/node:v1.31.4@sha256:2cb39f7295fe7eafee0842b1052a599a4fb0f8bcf3f83d96c7f4864c357c6c30
           install_only: true
       - name: Pytest
+        if: >-
+          ${{ needs.changes.outputs.pytest == 'true' &&
+              (!contains(format(',{0},', needs.changes.outputs.pytest_deselect), ',tools/factory-e2e/tests/test_c4_tracker_scope.py,') ||
+               !contains(format(',{0},', needs.changes.outputs.pytest_deselect), ',examples/tests/test_sre_bot_observability_runtime.py,')) }}
         env:
           PYTEST_DESELECT: ${{ needs.changes.outputs.pytest_deselect }}
           PYTEST_SCOPE: ${{ needs.changes.outputs.pytest_scope }}
@@ -619,6 +620,9 @@ jobs:
           fi
           unset PYTEST_SCOPE
           uv run pytest -q -n 2 --dist loadgroup --reruns 1 -rsR --durations=25 "${selected_files[@]}"
+
+      - name: Protected commissioning crash recovery
+        run: uv run pytest -q -n 0 --durations=25 cli/tests/local/test_commissioning_claim_execution.py
 
   python-dry-run-fixture:
     name: Python dry run fixture (pytest)
@@ -906,10 +910,7 @@ jobs:
           CONTAINER_RESULT: ${{ needs.python-container-fixtures.result }}
           CI_POLICY_SELECTED: ${{ needs.changes.outputs.ci_policy }}
           CI_POLICY_RESULT: ${{ needs.ci-policy.result }}
-          CONTAINER_SELECTED: >-
-            ${{ needs.changes.outputs.pytest == 'true' &&
-                (!contains(format(',{0},', needs.changes.outputs.pytest_deselect), ',tools/factory-e2e/tests/test_c4_tracker_scope.py,') ||
-                 !contains(format(',{0},', needs.changes.outputs.pytest_deselect), ',examples/tests/test_sre_bot_observability_runtime.py,')) }}
+          CONTAINER_SELECTED: ${{ needs.changes.outputs.pytest == 'true' }}
           DRY_RUN_RESULT: ${{ needs.python-dry-run-fixture.result }}
           DRY_RUN_SELECTED: >-
             ${{ needs.changes.outputs.pytest == 'true' &&
