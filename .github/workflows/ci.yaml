@@ -1788,14 +1788,17 @@ jobs:
       # `curie local up` the `full` profile; assert the release stack renders
       # exactly those service counts so a profile regression cannot silently
       # start the wrong set.
-      - name: Core profile renders 8 services
+      - name: Core profile renders 10 services
         run: |
-          count=$(docker compose -f compose.release.yaml --profile core config --services | wc -l)
-          [ "$count" -eq 8 ] || { echo "core profile must render 8 services, got $count" >&2; exit 1; }
-      - name: Full profile renders 14 services
+          services=$(docker compose -f compose.release.yaml --profile core config --services)
+          count=$(printf '%s\n' "$services" | wc -l)
+          [ "$count" -eq 10 ] || { echo "core profile must render 10 services, got $count" >&2; exit 1; }
+          printf '%s\n' "$services" | grep -qx curie-channel-gateway
+          printf '%s\n' "$services" | grep -qx curie-gateway-replay-perms
+      - name: Full profile renders 16 services
         run: |
           count=$(docker compose -f compose.release.yaml --profile full config --services | wc -l)
-          [ "$count" -eq 14 ] || { echo "full profile must render 14 services, got $count" >&2; exit 1; }
+          [ "$count" -eq 16 ] || { echo "full profile must render 16 services, got $count" >&2; exit 1; }
 
   # Build every image CI runs exactly once per workflow run, in one job, and
   # hand the result to every consumer as an artifact. Before this job the same
