@@ -19,6 +19,10 @@ Env mapping:
     CURIE_CHANNEL_TOKEN                     -> channel_token
     CURIE_EGRESS_SECRET                     -> egress_secret
     CURIE_ADAPTER_PRINCIPAL                 -> adapter_principal
+    CURIE_MAIL_SELF_ROTATE                  -> self_rotate
+    CURIE_MAIL_CHANNEL_TOKEN_TTL_SECONDS    -> channel_token_ttl_seconds
+    CURIE_MAIL_PRINCIPAL_TTL_SECONDS        -> principal_ttl_seconds
+    CURIE_MAIL_CHANNEL_ADAPTER              -> channel_adapter
     ADAPTER_INGRESS_ENABLED                 -> ingress_enabled
     CURIE_MAIL_POLL_INTERVAL_SECONDS        -> poll_interval_seconds
     CURIE_MAIL_INGRESS_ATTEMPTS             -> ingress_attempts
@@ -114,6 +118,15 @@ class MailAdapterConfig(BaseSettings):
     # platform's resolver. Empty keeps approvals as they were: shown, never
     # answerable by email, expiring.
     adapter_principal: str = Field(default="", validation_alias="CURIE_ADAPTER_PRINCIPAL")
+
+    self_rotate: bool = Field(default=False, validation_alias="CURIE_MAIL_SELF_ROTATE")
+    channel_token_ttl_seconds: int = Field(
+        default=3600, gt=0, le=604800, validation_alias="CURIE_MAIL_CHANNEL_TOKEN_TTL_SECONDS"
+    )
+    principal_ttl_seconds: int = Field(
+        default=86400, gt=0, le=604800, validation_alias="CURIE_MAIL_PRINCIPAL_TTL_SECONDS"
+    )
+    channel_adapter: str = Field(default="", validation_alias="CURIE_MAIL_CHANNEL_ADAPTER")
 
     # The neutral adapter-pattern name, documented in
     # docs/guides/building-a-channel-adapter.md; it gates the poller only, never

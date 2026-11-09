@@ -139,6 +139,7 @@ def main() -> None:
         signal.signal(signal.SIGTERM, _handle_signal)
 
         try:
+            adapter.credentials.start(adapter.shutdown)
             if config.ingress_enabled:
                 adapter.poll_loop()
             else:
