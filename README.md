@@ -23,7 +23,7 @@ agent's instructions and tools to the same platform.
 | --- | --- |
 | [Software Factory local quickstart](docs/guides/dark-factory-quickstart.md) | Try the factory on a laptop. |
 | [Software Factory administrator guide](docs/guides/factory-admin-guide.md) | Install it for your organization's repository and tune it. |
-| [Software Factory user guide](docs/guides/factory-user-guide.md) | Use an installed factory to prepare an issue and verify its PR. |
+| [Software Factory user guide](docs/guides/factory-user-guide.md) | Use an installed factory to prepare an issue and verify its pull request or merge request. |
 | [SRE co-worker](#sre-co-worker-on-your-laptop) | Ask about your local cluster in Slack; approve configured mutations. |
 | [Bring your existing agent](#make-your-existing-agent-a-co-worker) | Reuse its instructions and tools, then connect it to a workspace. |
 
@@ -58,14 +58,25 @@ features GitHub; the guides also cover supported GitLab and Jira Cloud paths.
 
 ## Quickstart
 
-The Software Factory guide and SRE walkthrough use **local kind clusters** for
-their trials. Both can later run on your own Kubernetes infrastructure.
+### Choose a Software Factory path
 
-You need Docker running, kind, kubectl, Helm, and an Anthropic or OpenRouter
-model credential. Use a Bash terminal and keep the variables in that session.
-Allow enough Docker memory and disk for the trial you choose.
-The [factory prerequisites](docs/guides/dark-factory-quickstart.md#what-you-need)
-list supported machines and tools.
+If you want a quick local test on your laptop to get a feel for the factory,
+follow the [factory quickstart](docs/guides/dark-factory-quickstart.md).
+
+If you want to install it for your organization's repository and tune it,
+follow the [factory administrator guide](docs/guides/factory-admin-guide.md).
+
+If the factory is already installed and you want to use it, follow the
+[factory user guide](docs/guides/factory-user-guide.md) to prepare an issue
+and verify its pull request or merge request. The
+[factory overview](docs/software-factory.md) explains review and CI limits.
+
+### Set up the SRE and existing-agent examples
+
+The examples below use the released CLI and an Anthropic or OpenRouter model
+credential. The SRE trial also needs Docker, kind, kubectl, Helm, and enough
+Docker memory and disk for its observability stack. Use a Bash terminal and
+keep the variables in that session.
 
 Install the released CLI:
 
@@ -90,19 +101,6 @@ export CURIE_CREDENTIALS
 read -rp 'Model ID: ' CURIE_MODEL
 export CURIE_MODEL
 ```
-
-### Software Factory on your laptop
-
-If you want a quick local test on your laptop to get a feel for the factory,
-follow the [factory quickstart](docs/guides/dark-factory-quickstart.md).
-
-If you want to install it for your organization's repository and tune it,
-follow the [factory administrator guide](docs/guides/factory-admin-guide.md).
-
-If the factory is already installed and you want to use it, follow the
-[factory user guide](docs/guides/factory-user-guide.md) to prepare an issue
-and verify its PR. The [factory overview](docs/software-factory.md) explains
-review and CI limits.
 
 ### SRE co-worker on your laptop
 
