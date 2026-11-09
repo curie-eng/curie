@@ -208,9 +208,14 @@ keys:
   `[tool_use NAME]` markers. The text of an assistant message reporting a provider
   error is never recorded. Tool arguments and tool results are never recorded.
   `curie.usage.scope` marks the ResultMessage usage fallback: when no generation in the
-  turn received nonzero per-message usage, the turn total is stamped on the final generation
-  with scope `turn`, earlier generations receive none of that total, and if no generation is active
-  at the result the root gets scope `unrecorded`. Per-message usage sets no scope key.
+  turn received nonzero implementer per-message usage, the turn total is stamped on the final
+  generation with scope `turn`, earlier generations receive none of that total, and if no
+  generation is active at the result the root gets scope `unrecorded`. Nested reviewer
+  counts never suppress the fallback: the ResultMessage turn total includes nested subagent
+  usage (the semantics `runner/src/curie_runner/usage_report.py` books by when it splits
+  per-model totals), so the stamped total is the ResultMessage total minus the reviewer
+  counts already exported on nested generation spans, floored at zero per count.
+  Implementer per-message usage sets no scope key.
   `SPAN_ATTRIBUTE_VALUE_TYPES`
   (`runner/src/curie_runner/otel.py::SPAN_ATTRIBUTE_VALUE_TYPES`) declares each key's
   value type: the four usage counts, generation TTFT, generation round, bounded tool
@@ -261,18 +266,21 @@ keys:
   reviewer model and that message's own token counts, opens and closes inside the
   surrounding `execute_tool` interval, and never becomes the implementer's active
   generation. It carries no `curie.generation.round`, no implementer provider wait opens
-  while the tool runs, and its positive counts count as per-message usage for the
-  `curie.usage.scope` fallback rule. Tool call IDs, the `parent_tool_use_id`, and the
-  message text are never exported.
+  while the tool runs, and its counts never suppress the `curie.usage.scope` fallback:
+  they are already exported on the nested span, and the fallback subtracts them from the
+  turn total it stamps, so reviewer tokens appear exactly once. Tool call IDs, the
+  `parent_tool_use_id`, and the message text are never exported.
 8. **Generation data belongs to its round.** The configured model, or the first non-empty
   model reported by an `AssistantMessage`, stamps `gen_ai.request.model` and the bare
   `model` once on that generation. The four usage attributes accumulate only the
   non-negative integer increments on `AssistantMessage` objects in that round;
   `ResultMessage.usage` is a whole-turn total. When no generation received any nonzero
-  per-message count, `record_result_usage` stamps that total on the active final
+  implementer per-message count, `record_result_usage` stamps that total on the active final
   generation with `curie.usage.scope=turn`, or marks the root `unrecorded` if no
-  generation is active. Zero per-message placeholders do not disable this fallback;
-  any nonzero count does, preventing double counting. When the real SDK supplies an allowlisted `message_start` or
+  generation is active. Nested reviewer counts never disable this fallback; the total
+  includes them, so the stamp is the total minus the reviewer counts already exported on
+  nested spans, floored at zero per count. Zero per-message placeholders do not disable
+  this fallback; any nonzero implementer count does, preventing double counting. When the real SDK supplies an allowlisted `message_start` or
   `content_block_start` partial boundary, the adapter strips it to payload-free evidence
   and the active generation records `curie.generation.ttft_ms` once. TTFT is omitted when
   no such boundary is available: direct compatibility setters may populate model or

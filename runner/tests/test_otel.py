@@ -723,6 +723,8 @@ _UNIQUE_TURN_PROMPT = "unique-turn-prompt-PLACEHOLDER"
 def _implementer_tool_call(
     call_id: str,
     name: str,
+    *,
+    usage: dict[str, Any] | None = _IMPLEMENTER_USAGE,
 ) -> AssistantMessage:
     return AssistantMessage(
         content=[
@@ -730,7 +732,7 @@ def _implementer_tool_call(
             ToolUseBlock(id=call_id, name=name, input={"path": _TOOL_ARGUMENT}),
         ],
         model="observed-model",
-        usage=_IMPLEMENTER_USAGE,
+        usage=usage,
     )
 
 
@@ -945,6 +947,105 @@ def test_reviewer_generation_exports_during_agent_tool() -> None:
         _REVIEWER_TEXT,
     ):
         assert private_value not in material
+
+
+def test_result_only_usage_with_reviewer_exports_implementer_total_minus_nested() -> None:
+    """Review feedback on #5206: reviewer usage must not hide the implementer's.
+
+    The implementer's provider sends no per-message usage, so the turn's tokens
+    reach the trace only through the ResultMessage fallback. A nested reviewer
+    generation with its own counts never suppresses that fallback; the stamped
+    total excludes the reviewer tokens already exported on the nested span,
+    because the SDK's ResultMessage turn total includes nested subagent usage
+    (the same semantics ``usage_report._split`` books by). Nothing is counted
+    twice: the generation spans sum to the ResultMessage total.
+    """
+
+    script: list[object] = [
+        _implementer_tool_call(_AGENT_CALL_ID, "Agent", usage=None),
+        _nested_reviewer_message(_AGENT_CALL_ID),
+        _tool_result(_AGENT_CALL_ID),
+        AssistantMessage(
+            content=[TextBlock(text="final answer")],
+            model="observed-model",
+            usage=None,
+        ),
+        _result(text="done", usage={"input_tokens": 30, "output_tokens": 5}),
+    ]
+    _, finished = _export_turn(_adapter_session_factory(script))
+    generations = _spans_by_name(finished)["llm.generation"]
+
+    assert len(generations) == 3
+    implementer_first, reviewer, implementer_second = generations
+    assert reviewer.attributes["gen_ai.usage.input_tokens"] == 20
+    assert reviewer.attributes["gen_ai.usage.output_tokens"] == 2
+    # The first implementer round saw no usage at all; only the final
+    # generation receives the ResultMessage fallback stamp.
+    assert not any(key.startswith("gen_ai.usage.") for key in implementer_first.attributes)
+    assert _SCOPE not in implementer_first.attributes
+    assert _SCOPE not in reviewer.attributes
+    assert implementer_second.attributes["gen_ai.usage.input_tokens"] == 10
+    assert implementer_second.attributes["gen_ai.usage.output_tokens"] == 3
+    assert implementer_second.attributes[_SCOPE] == "turn"
+    # No double counting: the exported generations sum to the turn total.
+    assert (
+        sum(
+            span.attributes.get("gen_ai.usage.input_tokens", 0) for span in generations
+        )
+        == 30
+    )
+    assert (
+        sum(span.attributes.get("gen_ai.usage.output_tokens", 0) for span in generations)
+        == 5
+    )
+
+
+def test_per_message_implementer_usage_with_reviewer_keeps_result_total_suppressed() -> None:
+    """Review feedback on #5206: with implementer per-message usage, no change.
+
+    A nonzero implementer per-message count still suppresses the ResultMessage
+    fallback, reviewer or not: the reviewer span keeps its own counts, the
+    implementer generations keep their per-message accumulation, and the turn
+    total (which would double count both) is stamped nowhere.
+    """
+
+    script: list[object] = [
+        _implementer_tool_call(_AGENT_CALL_ID, "Agent"),
+        _nested_reviewer_message(_AGENT_CALL_ID),
+        _tool_result(_AGENT_CALL_ID),
+        AssistantMessage(
+            content=[TextBlock(text="final answer")],
+            model="observed-model",
+            usage={"input_tokens": 4, "output_tokens": 1},
+        ),
+        _result(text="done", usage={"input_tokens": 30, "output_tokens": 6}),
+    ]
+    _, finished = _export_turn(_adapter_session_factory(script))
+    generations = _spans_by_name(finished)["llm.generation"]
+
+    assert len(generations) == 3
+    implementer_first, reviewer, implementer_second = generations
+    assert reviewer.attributes["gen_ai.usage.input_tokens"] == 20
+    assert reviewer.attributes["gen_ai.usage.output_tokens"] == 2
+    assert implementer_first.attributes["gen_ai.usage.input_tokens"] == 3
+    assert implementer_first.attributes["gen_ai.usage.output_tokens"] == 2
+    assert implementer_second.attributes["gen_ai.usage.input_tokens"] == 4
+    assert implementer_second.attributes["gen_ai.usage.output_tokens"] == 1
+    for span in generations:
+        assert _SCOPE not in span.attributes
+        assert span.attributes.get("gen_ai.usage.input_tokens") != 30
+        assert span.attributes.get("gen_ai.usage.output_tokens") != 6
+    # Only the per-message counts are exported, once each.
+    assert (
+        sum(
+            span.attributes.get("gen_ai.usage.input_tokens", 0) for span in generations
+        )
+        == 27
+    )
+    assert (
+        sum(span.attributes.get("gen_ai.usage.output_tokens", 0) for span in generations)
+        == 5
+    )
 
 
 @pytest.mark.parametrize("repeat_final_blocks", (False, True), ids=("stream-only", "dedupe"))

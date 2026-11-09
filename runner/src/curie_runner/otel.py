@@ -501,6 +501,11 @@ class _GenerationSpan:
         self._pending_input: list[str] = []
         self._tool_names: dict[str, str] = {}
         self._turn_usage_observed = False
+        # Nested (reviewer) counts exported during this turn, per usage field.
+        # Tracked apart from ``_turn_usage_observed`` so reviewer usage never
+        # suppresses the ResultMessage fallback; the fallback subtracts these
+        # from the turn total it stamps (#5206 review revision).
+        self._nested_generation_usage: dict[str, int] = {}
         self._prompts: list[str] = []
 
     @property
@@ -602,11 +607,16 @@ class _GenerationSpan:
     def record_result_usage(self, usage: Mapping[str, Any] | None) -> None:
         """Stamp a ResultMessage turn total for result-only providers (#3128).
 
-        Runs only when no generation in the turn received per-message usage, so
-        the turn total is never double counted. The total lands on the final
-        generation (the one active now) with ``curie.usage.scope = "turn"``;
-        earlier generations get nothing fabricated. With no active generation
-        the root is marked ``"unrecorded"`` so the gap stays visible.
+        Runs only when no generation in the turn received nonzero implementer
+        per-message usage, so the turn total is never double counted. Nested
+        reviewer usage never suppresses this fallback: the reviewer's counts
+        are already exported on their own spans, and the ResultMessage turn
+        total includes them (the semantics ``usage_report._split`` books by),
+        so the total is stamped minus those nested counts, floored at zero per
+        field. The result lands on the final generation (the one active now)
+        with ``curie.usage.scope = "turn"``; earlier generations get nothing
+        fabricated. With no active generation the root is marked
+        ``"unrecorded"`` so the gap stays visible.
         """
 
         if self._turn_usage_observed or not usage:
@@ -619,7 +629,17 @@ class _GenerationSpan:
         if self._active_generation is None:
             _set(self._root, SpanAttributeKey.USAGE_SCOPE, "unrecorded")
             return
-        self._record_usage(usage)
+        implementer_usage = {
+            field: max(
+                value - self._nested_generation_usage.get(field, 0),
+                0,
+            )
+            for field in _USAGE_ATTRIBUTE_KEYS
+            if (value := usage.get(field)) is not None
+            and type(value) is int
+            and value >= 0
+        }
+        self._record_usage(implementer_usage)
         _set(self._active_generation, SpanAttributeKey.USAGE_SCOPE, "turn")
 
     def set_succeeded(self) -> None:
@@ -934,11 +954,14 @@ class _GenerationSpan:
                 if type(value) is not int or value < 0:
                     continue
                 _set(span, attribute_key, value)
-                if value > 0:
-                    # Same anti-double-count rule as ``_record_usage``: this
-                    # generation received per-message usage, so the turn total
-                    # must not also be stamped over it.
-                    self._turn_usage_observed = True
+                # Nested counts are tracked apart from the implementer's
+                # per-message usage (#5206 review revision): they never
+                # suppress the ResultMessage fallback, but the fallback must
+                # not stamp them again, so it subtracts what accumulates here
+                # from the turn total it stamps.
+                self._nested_generation_usage[usage_field] = (
+                    self._nested_generation_usage.get(usage_field, 0) + value
+                )
         _set(span, SpanAttributeKey.PHASE_END_KIND, "nested_assistant_observed")
         span.set_status(StatusCode.OK)
         span.end()
