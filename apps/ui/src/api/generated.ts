@@ -4856,6 +4856,8 @@ export interface components {
             deploy_notifications: boolean;
             /** Execution Deadline Seconds */
             execution_deadline_seconds?: number | null;
+            /** Factory Slack Channel */
+            factory_slack_channel?: string | null;
             /** Hook Partitions */
             hook_partitions: {
                 [key: string]: components["schemas"]["HookPartitionConfig"];
@@ -4959,6 +4961,8 @@ export interface components {
             deploy_notifications?: boolean | null;
             /** Execution Deadline Seconds */
             execution_deadline_seconds?: number | null;
+            /** Factory Slack Channel */
+            factory_slack_channel?: string | null;
             /** Hook Partitions */
             hook_partitions?: {
                 [key: string]: components["schemas"]["HookPartitionConfig"];

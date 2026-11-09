@@ -1362,6 +1362,17 @@
             ],
             "title": "Execution Deadline Seconds"
           },
+          "factory_slack_channel": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Factory Slack Channel"
+          },
           "hook_partitions": {
             "anyOf": [
               {
@@ -1661,6 +1672,18 @@
               }
             ],
             "title": "Execution Deadline Seconds"
+          },
+          "factory_slack_channel": {
+            "anyOf": [
+              {
+                "pattern": "^[CG][A-Z0-9]{6,}$",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Factory Slack Channel"
           },
           "hook_partitions": {
             "anyOf": [
