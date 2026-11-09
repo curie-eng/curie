@@ -187,7 +187,9 @@ def free_port() -> int:
 
 
 def client_context(tls: ShellTls) -> ssl.SSLContext:
-    return ssl.create_default_context(cafile=str(tls.ca))
+    context = ssl.create_default_context(cafile=str(tls.ca))
+    context.minimum_version = ssl.TLSVersion.TLSv1_2
+    return context
 
 
 @dataclass
