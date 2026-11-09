@@ -16,18 +16,43 @@ flowchart LR
 
 ## Set up the factory
 
-1. Choose a [supported tracker and code host](dark-factory-quickstart.md#choose-your-tracker-and-code-host).
-   For a local trial, you need Docker, kind, kubectl, Helm, a released Curie
-   CLI, and an Anthropic or OpenRouter credential. Allocate at least 16 GiB
-   to Docker Desktop.
-2. Follow the [quickstart](dark-factory-quickstart.md) for that pairing.
-   For GitHub, its first command prints a GitHub App registration link.
-   Create the App, save its key, install it on the repository, then
-   [rerun with the App](dark-factory-quickstart.md#github-issues-and-github-prs).
-3. Confirm setup names the right context, repository, label, and runner.
-   Run a small trial issue and read its final status and
-   PR. On GitHub, a user with repository write or admin access adds the
-   default `curie-factory` label.
+Choose a [supported issue tracker and code host](dark-factory-quickstart.md#choose-your-tracker-and-code-host).
+For a laptop trial, follow the [local quickstart](dark-factory-quickstart.md).
+It creates an isolated kind cluster and needs at least 16 GiB of Docker memory.
+
+For an organizational install, choose the repository and an **existing**
+Kubernetes context. Complete the quickstart's [CLI installation and model-key
+steps](dark-factory-quickstart.md#install-curie), then keep your normal
+kubeconfig. Check the context before installing:
+
+```bash
+kubectl config get-contexts
+read -r -p "Factory Kubernetes context: " CURIE_CONTEXT
+kubectl --context "$CURIE_CONTEXT" cluster-info
+read -r -p "Code repository path: " CURIE_REPO
+CURIE_NAMESPACE=curie
+CURIE_RELEASE=curie
+```
+
+Use your existing namespace and release names if Curie is already installed.
+Follow the matching provider commands in the [quickstart](dark-factory-quickstart.md#start-the-factory),
+but skip its isolated kubeconfig and kind-name block. Replace `--kind-name`
+with `--context "$CURIE_CONTEXT"` on the first pass, keep `--context` on
+later passes, and add
+`--namespace "$CURIE_NAMESPACE" --release "$CURIE_RELEASE"` to every pass.
+The [existing-cluster example](factory-quickstart-reference.md#choose-the-target-and-run-the-command)
+shows both GitHub App passes. Jira Cloud also needs its own account and token;
+GitLab needs a project token. The provider sections give their exact flags.
+
+Confirm the setup names the intended context, repository, label, and runner:
+
+```bash
+curie cluster status --context "$CURIE_CONTEXT" \
+  --namespace "$CURIE_NAMESPACE" --release "$CURIE_RELEASE"
+```
+
+Run one small issue with an authorized labeler. Read its final status and linked
+PR or merge request before onboarding more repositories.
 
 Use [operations](../operations.md) and the
 [factory bundle reference](../../examples/dark-factory/README.md#deploy-it-as-the-factory-agent)
