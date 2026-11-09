@@ -1165,7 +1165,7 @@ def test_static_resolver_headers_enforce_one_shot_grants_with_real_valkey(
     password = quote(connection.get("password") or "", safe="")
     auth = f":{password}@" if password else ""
     store_url = f"redis://{auth}{connection['host']}:{connection['port']}/0"
-    jti = uuid.uuid4().hex
+    jti = str(uuid.uuid4())
     (tmp_path / "connectors.yaml").write_text(
         "connectors:\n  github:\n    image: example/connector:1\n"
     )
