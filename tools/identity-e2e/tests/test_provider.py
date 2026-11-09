@@ -229,6 +229,144 @@ def test_the_reply_sink_requires_the_adapter_secret_and_records_no_secret(
     assert ADAPTER_SECRET not in text and BEARER not in text
 
 
+def roster_post(
+    provider: SimpleNamespace,
+    change: Any,
+    *,
+    secret: str = ADAPTER_SECRET,
+    raw: bytes | None = None,
+) -> tuple[int, Any]:
+    return sink(
+        provider,
+        "POST",
+        "/roster",
+        body=raw if raw is not None else json.dumps(change).encode(),
+        headers={"X-Curie-Adapter-Secret": secret, "Content-Type": "application/json"},
+    )
+
+
+def roster_view(provider: SimpleNamespace) -> dict[str, Any]:
+    status, view = sink(provider, "GET", "/roster")
+    assert status == 200
+    return dict(view)
+
+
+def outcome_of(provider: SimpleNamespace, native_id: str) -> tuple[str, str | None]:
+    result = facts(provider, native_id)
+    assert isinstance(result, ValidatedFacts), result
+    subject = None if result.identity is None else result.identity.subject
+    return result.outcome, subject
+
+
+def test_the_roster_view_is_the_starting_roster(provider: SimpleNamespace) -> None:
+    view = roster_view(provider)
+    assert view == {
+        "issuer": assets.ISSUER,
+        "unknown": "unresolved",
+        "senders": assets.DEFAULT_ROSTER["senders"],
+        "overridden": [],
+        "generation": 0,
+    }
+
+
+def test_a_roster_change_needs_the_adapter_secret(provider: SimpleNamespace) -> None:
+    status, body = roster_post(provider, {"delete": ["alice@example.test"]}, secret="wrong")
+    assert status == 401
+    assert ADAPTER_SECRET not in json.dumps(body)
+    assert roster_view(provider)["generation"] == 0
+    assert outcome_of(provider, "alice@example.test") == ("resolved", "identity-e2e-alice")
+    recorded = [r for r in provider.state.records() if r["type"] == "roster"]
+    assert [(r["status"], set(r)) for r in recorded] == [(401, {"type", "status", "at"})]
+
+
+def test_roster_upserts_deletes_and_reset_change_the_lookup(provider: SimpleNamespace) -> None:
+    senders = assets.DEFAULT_ROSTER["senders"]
+    disabled = {**senders["alice@example.test"], "account_status": "disabled"}
+    alias = "bob-alias@example.test"
+    status, view = roster_post(
+        provider,
+        {
+            "upsert": {"alice@example.test": disabled, alias: senders["bob@example.test"]},
+            "delete": ["dana@example.test"],
+        },
+    )
+    assert status == 200, view
+    assert view["overridden"] == sorted(["alice@example.test", alias, "dana@example.test"])
+    assert view["generation"] == 1
+    assert outcome_of(provider, "alice@example.test") == ("inactive", "identity-e2e-alice")
+    assert outcome_of(provider, alias) == ("resolved", "identity-e2e-bob")
+    assert outcome_of(provider, "dana@example.test")[0] == "unresolved"
+
+    status, view = roster_post(provider, {"reset": True, "delete": ["erin@example.test"]})
+    assert status == 200, view
+    assert (view["overridden"], view["generation"]) == (["erin@example.test"], 2)
+    assert outcome_of(provider, "alice@example.test") == ("resolved", "identity-e2e-alice")
+    assert outcome_of(provider, "dana@example.test") == ("resolved", "identity-e2e-dana")
+
+    status, view = roster_post(provider, {"reset": True})
+    assert (status, view["overridden"], view["generation"]) == (200, [], 3)
+    assert roster_view(provider)["senders"] == senders
+    recorded = [r for r in provider.state.records() if r["type"] == "roster"]
+    assert [(r["status"], r["reset"], r["deleted"]) for r in recorded] == [
+        (200, False, ["dana@example.test"]),
+        (200, True, ["erin@example.test"]),
+        (200, True, []),
+    ]
+
+
+@pytest.mark.parametrize(
+    ("change", "raw"),
+    [
+        ({}, None),
+        ({"replace": {}}, None),
+        ({"reset": "yes"}, None),
+        ({"delete": [1]}, None),
+        ({"upsert": {"Alice@example.test": {"subject": "identity-e2e-alice"}}}, None),
+        ({"upsert": {"alice@example.test": {"subject": "x", "admin": True}}}, None),
+        ({"upsert": {"alice@example.test": {"subject": ""}}}, None),
+        ({"upsert": {"alice@example.test": {"subject": "x", "groups": "members"}}}, None),
+        ({"upsert": {"alice@example.test": {"subject": "x", "account_status": "frozen"}}}, None),
+        ({"upsert": {"alice@example.test": {"subject": "x", "outcome": "maybe"}}}, None),
+        # One entry the vectors cannot answer refuses the whole change.
+        (
+            {
+                "upsert": {"bob@example.test": {"subject": "x", "sender_kind": "robot"}},
+                "delete": ["alice@example.test"],
+            },
+            None,
+        ),
+        (None, b"{"),
+    ],
+)
+def test_an_invalid_roster_change_is_refused_and_changes_nothing(
+    provider: SimpleNamespace, change: Any, raw: bytes | None
+) -> None:
+    status, body = roster_post(provider, change, raw=raw)
+    assert status == 400, body
+    view = roster_view(provider)
+    assert (view["overridden"], view["generation"]) == ([], 0)
+    assert outcome_of(provider, "alice@example.test") == ("resolved", "identity-e2e-alice")
+
+
+def test_the_lookup_listener_does_not_serve_the_roster(provider: SimpleNamespace) -> None:
+    connection = http.client.HTTPSConnection(
+        "localhost", provider.lookup_port, context=provider.tls, timeout=10
+    )
+    try:
+        connection.request(
+            "POST",
+            "/roster",
+            body=json.dumps({"reset": True}).encode(),
+            headers={"X-Curie-Adapter-Secret": ADAPTER_SECRET, "Authorization": "Bearer " + BEARER},
+        )
+        response = connection.getresponse()
+        assert response.status == 404
+        response.read()
+    finally:
+        connection.close()
+    assert roster_view(provider)["generation"] == 0
+
+
 def test_the_provider_main_serves_from_its_files(tmp_path: Path) -> None:
     """The in-cluster entry point: files in, both listeners up, clean shutdown."""
 

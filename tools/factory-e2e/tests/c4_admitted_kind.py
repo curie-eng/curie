@@ -30,6 +30,7 @@ import scripted_kind as sk
 from aci_protocol import RUNS_STREAM_DEFAULT, STREAM_PAYLOAD_FIELD, QueuedTurn
 from c4_admitted_http import gitlab, jira, marker_model_type, tracker_stub_type
 from c4_shared_install import (
+    TRACE_BACKEND_KEY_PREFIX,
     CaseIsolationError,
     InstallSnapshot,
     case_owned_streams,
@@ -85,12 +86,6 @@ PERSISTENT_KEYS_SCRIPT = (
     "if redis.call('TTL', key) == -1 then found[#found + 1] = key end end "
     "until cursor == '0' return found"
 )
-# The chart points Langfuse at the platform Valkey (REDIS_HOST, no key
-# prefix), and its BullMQ ingestion queues use BullMQ's default "bull:"
-# keyspace. Those keys belong to the trace backend, which writes them
-# asynchronously while a finished case's traces are ingested. They are not
-# factory state, and deleting them would corrupt Langfuse's queues.
-TRACE_BACKEND_KEY_PREFIX = "bull:"
 EVIDENCE_LOG_LINES = 400
 EVIDENCE_TEXT_LIMIT = 32768
 

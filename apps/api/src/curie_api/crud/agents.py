@@ -264,11 +264,29 @@ async def check_requester_identity_invariant(
                 "selector is registered on this agent; remove every registration first",
             )
         return
-    if not await tenant_selects_http_identity(session, agent.tenant_id):
+    missing = await http_identity_shortfall(session, agent, runtime=runtime)
+    if missing is not None:
         raise RequesterIdentityRefused(
             REQUESTER_IDENTITY_REQUIRES_HTTP_IDENTITY,
-            "enabling connector requester identity requires the tenant's HTTP identity selection",
+            f"enabling connector requester identity requires {missing}",
         )
+
+
+async def http_identity_shortfall(
+    session: AsyncSession, agent: Agent, *, runtime: object
+) -> str | None:
+    """What the agent lacks for verified requester identity, or None.
+
+    The one prerequisite shared by the requester identity flag (ADR 0270
+    decision 1) and by enabling requester exclusion or an exemption on any
+    approval route (ADR 0271 decision 6): the tenant's HTTP identity selection,
+    and at least one of the agent's bindings listed in an operator receiver
+    registration of the live runtime. Callers judge it inside the transaction
+    that holds the agent row lock and refuse with their own code.
+    """
+
+    if not await tenant_selects_http_identity(session, agent.tenant_id):
+        return "the tenant's HTTP identity selection"
     registered = registered_binding_ids(runtime, agent.tenant_id)
     bindings = await session.scalars(
         select(AgentChannel.id).where(
@@ -276,11 +294,8 @@ async def check_requester_identity_invariant(
         )
     )
     if not any(str(binding) in registered for binding in bindings):
-        raise RequesterIdentityRefused(
-            REQUESTER_IDENTITY_REQUIRES_HTTP_IDENTITY,
-            "enabling connector requester identity requires an operator receiver "
-            "registration that lists one of this agent's bindings",
-        )
+        return "an operator receiver registration that lists one of this agent's bindings"
+    return None
 
 
 async def update_agent_connector_requester_identity(
@@ -383,20 +398,24 @@ async def update_agent_approval_routes(
     routes: dict[str, Any],
     *,
     expected_version: int | None = None,
+    runtime: object,
 ) -> Agent:
     """Set the agent's approval route bindings (#247). An empty dict clears
     them (stored as NULL: unbound routes escalate rather than inventing a
     resolution surface).
 
-    ADR 0271 decision 1 (plan D1, D2): the agent row is locked and re-read
-    first. ``expected_version``, when sent, must equal the stored
+    ADR 0271 decisions 1 and 6 (plan D1, D2): the agent row is locked and
+    re-read first. ``expected_version``, when sent, must equal the stored
     ``connector_requester_identity_version``. A write whose stored or proposed
-    map carries any ``approver_ticket`` key must send it, pins every
-    registration's ceiling, bumps the version and writes one identity audit row
-    per changed registration or exclusion, all in this one commit. The flag
-    writer takes the same row lock, so two writers that read one version cannot
-    both commit. Selector-free writes keep the unversioned behavior and do not
-    bump. Raises ``ApprovalRoutesRefused``.
+    map carries any ``approver_ticket`` or ``separation`` key must send it,
+    pins every registration's ceiling, bumps the version and writes one
+    identity audit row per changed registration or exclusion, all in this one
+    commit. A written map holding static exclusion or an exemption on any
+    route, kept or newly enabled, also needs ``http_identity_shortfall`` to
+    find nothing missing against ``runtime``. The flag writer takes the same
+    row lock, so two writers that read one version cannot both commit. Writes
+    with neither key keep the unversioned behavior and do not bump. Raises
+    ``ApprovalRoutesRefused``.
     """
 
     locked = await session.scalar(
@@ -416,8 +435,8 @@ async def update_agent_approval_routes(
                 f"configuration version {current}; read the agent again",
             )
         if not (
-            approver_tickets.has_selector(locked.approval_routes)
-            or approver_tickets.has_selector(routes)
+            approver_tickets.needs_configuration_version(locked.approval_routes)
+            or approver_tickets.needs_configuration_version(routes)
         ):
             locked.approval_routes = routes or None
         else:
@@ -426,7 +445,8 @@ async def update_agent_approval_routes(
                     409,
                     approver_tickets.EXPECTED_VERSION_REQUIRED,
                     "this route map write registers, replaces, removes or keeps an "
-                    "approver_ticket selector: send approval_routes_expected_version",
+                    "approver_ticket selector or a separation: send "
+                    "approval_routes_expected_version",
                 )
             try:
                 written, audits = await approver_tickets.prepare_selector_write(
@@ -437,6 +457,15 @@ async def update_agent_approval_routes(
                 )
             except approver_tickets.ApproverTicketRefusal as exc:
                 raise ApprovalRoutesRefused(exc.status, exc.code, str(exc)) from None
+            if approver_tickets.separation_needs_http_identity(written):
+                missing = await http_identity_shortfall(session, locked, runtime=runtime)
+                if missing is not None:
+                    raise ApprovalRoutesRefused(
+                        422,
+                        approver_tickets.SEPARATION_REQUIRES_HTTP_IDENTITY,
+                        "enabling requester exclusion or an exempt_group on an approval "
+                        f"route requires {missing}",
+                    )
             locked.approval_routes = written or None
             locked.connector_requester_identity_version = current + 1
             for audit in audits:

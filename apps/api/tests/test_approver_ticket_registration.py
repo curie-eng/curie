@@ -269,34 +269,50 @@ def test_explicit_exclusion_opt_out_is_stored_and_audited(
     assert events_of(scope["tenant"], REPLACED) == []
 
 
-def test_separation_needs_a_registration_and_exempt_group_is_refused(
+def test_separation_without_a_selector_is_static_exclusion_and_an_exemption_needs_exclusion(
     operator_case: SimpleNamespace,
 ) -> None:
-    """@spec REQUEST-APPROVAL-1: no unenforced separation policy is stored before 0271b."""
+    """@spec REQUEST-APPROVAL-6: separation outside a selector, and the exempt group's rules.
+
+    In a selecting tenant whose runtime registers the receiver binding, a route
+    without a selector stores ``separation`` as static exclusion. An
+    ``exempt_group`` beside ``exclude_requester: false``, or as a route-level
+    key, is refused 422 and nothing is stored; beside ``exclude_requester:
+    true`` it is stored and the readback returns it.
+    """
     case = operator_case
     client, scope, agent = case.client, case.scope, case.scope["agent"]
     prepare(client, scope)
+    exclude = {"exclude_requester": True}
+    static = write_routes(client, agent, route_map(scope["address"], separation=exclude),
+                          expected=scope["config_version"])
+    assert static.status_code == 200, static.text
+    scope["config_version"] = static.json()[CONFIG_VERSION]
+    stored = agent_state(agent)["approval_routes"][ROUTE]
+    assert stored["separation"] == exclude and "approver_ticket" not in stored
+
     before = agent_state(agent)
     ticket = registration(case.key, scope["role_version"])
     group = {"issuer": "https://identity.example.test/directory", "id": "SyntheticExempt"}
-    bare = route_map(scope["address"], separation={"exclude_requester": True})
-    refused_with(write_routes(client, agent, bare), 422, "separation")
-    refused_with(write_routes(client, agent, bare, expected=before["version"]), 422, "separation")
-    inside = route_map(scope["address"], ticket=ticket,
-                       separation={"exclude_requester": True, "exempt_group": group})
+    loose = route_map(scope["address"], ticket=ticket,
+                      separation={"exclude_requester": False, "exempt_group": group})
     beside = route_map(scope["address"], ticket=ticket)
     beside[ROUTE]["exempt_group"] = group
-    for routes in (inside, beside):
-        response = write_routes(client, agent, routes, expected=before["version"])
+    for routes in (loose, beside):
+        response = write_routes(client, agent, routes, expected=scope["config_version"])
         assert response.status_code == 422, response.text
         assert "exempt_group" in response.text
     assert agent_state(agent) == before
+
+    exempted = {"exclude_requester": True, "exempt_group": group}
     accepted = write_routes(
-        client, agent,
-        route_map(scope["address"], ticket=ticket, separation={"exclude_requester": True}),
-        expected=before["version"],
+        client, agent, route_map(scope["address"], ticket=ticket, separation=exempted),
+        expected=scope["config_version"],
     )
     assert accepted.status_code == 200, accepted.text
+    assert agent_state(agent)["approval_routes"][ROUTE]["separation"] == exempted
+    echoed = readback(client, agent)["approval_routes"][ROUTE]["separation"]
+    assert echoed["exclude_requester"] is True and echoed["exempt_group"] == group
 
 
 def test_one_pair_on_two_routes_refuses(operator_case: SimpleNamespace) -> None:

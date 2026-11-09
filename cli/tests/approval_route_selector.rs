@@ -647,3 +647,241 @@ fn run_ok(api: &Api, file: &str) -> Run {
         &["--routes-from", file, "--json"],
     ))
 }
+
+// ADR 0271 decision 6: `separation.exempt_group` and static exclusion routes
+// (a `separation` block with no `approver_ticket`).
+
+const EXEMPT_ISSUER: &str = "https://idp.example.test";
+
+fn exempt_group() -> serde_json::Value {
+    serde_json::json!({"issuer": EXEMPT_ISSUER, "id": "group-admins"})
+}
+
+fn separation_with_exempt_group() -> serde_json::Value {
+    serde_json::json!({"exclude_requester": true, "exempt_group": exempt_group()})
+}
+
+/// A static exclusion route: separation with no approver ticket.
+fn static_route(channel: &str) -> serde_json::Value {
+    serde_json::json!({
+        "resolution": {"kind": "slack", "address": channel},
+        "separation": separation_with_exempt_group(),
+    })
+}
+
+fn ticket_route_with_exempt_group(readback: bool) -> serde_json::Value {
+    serde_json::json!({
+        "resolution": {"kind": "slack", "address": "C0EXAMPLE1"},
+        "approver_ticket": if readback { registration_readback() } else { registration() },
+        "separation": separation_with_exempt_group(),
+    })
+}
+
+#[test]
+fn routes_file_sends_exempt_group_and_static_separation_verbatim_with_the_version_read() {
+    let api = api(serde_json::Value::Null, 5, false);
+    let dir = tempfile::tempdir().expect("tempdir");
+    let routes = serde_json::json!({
+        "ledger_post": ticket_route_with_exempt_group(false),
+        "refund_static": static_route("C0EXAMPLE2"),
+        "plain_static": {
+            "resolution": {"kind": "slack", "address": "C0EXAMPLE3"},
+            "separation": {"exclude_requester": true},
+        },
+    });
+    let file = write_routes(&dir, &routes);
+
+    let run = run(&args(&api.server.base_url, &["--routes-from", &file]));
+    assert_eq!(run.code, 0, "{}{}", run.stdout, run.stderr);
+    assert_eq!(
+        patches(&api.server),
+        vec![serde_json::json!({"approval_routes": routes, ROUTES_EXPECTED: 5})]
+    );
+}
+
+#[test]
+fn an_unknown_key_in_separation_or_exempt_group_is_refused_locally_naming_the_route() {
+    type Mutate = fn(&mut serde_json::Value);
+    let cases: [(&str, Mutate); 4] = [
+        ("exempt_groups", |route| {
+            route["separation"]["exempt_groups"] = serde_json::json!([]);
+        }),
+        ("exclude_everyone", |route| {
+            route["separation"]["exclude_everyone"] = serde_json::json!(true);
+        }),
+        ("email", |route| {
+            route["separation"]["exempt_group"]["email"] = serde_json::json!("admins@example.test");
+        }),
+        ("name", |route| {
+            route["separation"]["exempt_group"]["name"] = serde_json::json!("admins");
+        }),
+    ];
+    for (unknown, mutate) in cases {
+        for (route_name, base) in [
+            ("ledger_post", ticket_route_with_exempt_group(false)),
+            ("refund_static", static_route("C0EXAMPLE2")),
+        ] {
+            let label = format!("{unknown} on {route_name}");
+            let dir = tempfile::tempdir().expect("tempdir");
+
+            // The neighboring valid file writes.
+            let valid_api = api(serde_json::Value::Null, 1, false);
+            let valid = write_routes(&dir, &serde_json::json!({route_name: base.clone()}));
+            let ok = run(&args(
+                &valid_api.server.base_url,
+                &["--routes-from", &valid],
+            ));
+            assert_eq!(ok.code, 0, "{label}: {}{}", ok.stdout, ok.stderr);
+            assert_eq!(patches(&valid_api.server).len(), 1, "{label}");
+
+            // One unknown key is refused before any HTTP write.
+            let refused_api = api(serde_json::Value::Null, 1, false);
+            let mut route = base.clone();
+            mutate(&mut route);
+            let bad = write_routes(&dir, &serde_json::json!({route_name: route}));
+            let refused = run(&args(
+                &refused_api.server.base_url,
+                &["--routes-from", &bad],
+            ));
+            assert_ne!(
+                refused.code, 0,
+                "{label}: {}{}",
+                refused.stdout, refused.stderr
+            );
+            assert!(
+                patches(&refused_api.server).is_empty(),
+                "{label}: a refused file must send no PATCH"
+            );
+            let text = format!("{}{}", refused.stdout, refused.stderr);
+            assert!(
+                text.contains(unknown),
+                "{label}: the refusal must name the unknown key:\n{text}"
+            );
+            assert!(
+                text.contains(route_name),
+                "{label}: the refusal must name the route:\n{text}"
+            );
+        }
+    }
+}
+
+#[test]
+fn list_routes_json_reads_back_exempt_group_and_a_static_route_and_matches_the_schema() {
+    let stored = serde_json::json!({
+        "ledger_post": ticket_route_with_exempt_group(true),
+        "refund_static": static_route("C0EXAMPLE2"),
+        "deal_desk": plain_route("C0EXAMPLE3"),
+    });
+    let api = api(stored, 4, false);
+    let run = run(&args(&api.server.base_url, &["--list-routes", "--json"]));
+    assert_eq!(run.code, 0, "{}{}", run.stdout, run.stderr);
+    let value = one_json(&run);
+
+    assert_eq!(
+        value["routes"]["ledger_post"]["separation"],
+        separation_with_exempt_group(),
+        "{value}"
+    );
+    assert_eq!(
+        value["routes"]["refund_static"]["separation"],
+        separation_with_exempt_group(),
+        "{value}"
+    );
+    assert!(
+        value["routes"]["refund_static"]
+            .get("approver_ticket")
+            .is_none(),
+        "a static route has no ticket: {value}"
+    );
+    assert_matches_schema(approvals_schema(), &value);
+    assert!(patches(&api.server).is_empty(), "a list must never write");
+}
+
+#[test]
+fn a_flag_only_edit_carries_forward_every_selector_and_separation_route_field_by_field() {
+    let ticket = ticket_route_with_exempt_group(true);
+    let static_sep = static_route("C0EXAMPLE2");
+    let api = api(
+        serde_json::json!({
+            "ledger_post": ticket.clone(),
+            "refund_static": static_sep.clone(),
+            "plain_static": {
+                "resolution": {"kind": "slack", "address": "C0EXAMPLE4"},
+                "separation": {"exclude_requester": true},
+            },
+            "deal_desk": plain_route("C0EXAMPLE5"),
+        }),
+        6,
+        false,
+    );
+    let run = run(&args(
+        &api.server.base_url,
+        &["--route-resolution", "deal_desk=C0EXAMPLE6"],
+    ));
+    assert_eq!(run.code, 0, "{}{}", run.stdout, run.stderr);
+
+    let sent = patches(&api.server);
+    assert_eq!(sent.len(), 1, "{sent:?}");
+    let routes = &sent[0]["approval_routes"];
+    assert_eq!(routes["ledger_post"], ticket, "{}", sent[0]);
+    assert_eq!(routes["refund_static"], static_sep, "{}", sent[0]);
+    assert_eq!(
+        routes["refund_static"]["separation"]["exempt_group"],
+        exempt_group(),
+        "{}",
+        sent[0]
+    );
+    assert_eq!(
+        routes["plain_static"],
+        serde_json::json!({
+            "resolution": {"kind": "slack", "address": "C0EXAMPLE4"},
+            "separation": {"exclude_requester": true},
+        }),
+        "{}",
+        sent[0]
+    );
+    assert_eq!(
+        routes["deal_desk"],
+        plain_route("C0EXAMPLE6"),
+        "{}",
+        sent[0]
+    );
+    assert_eq!(sent[0][ROUTES_EXPECTED], 6, "{}", sent[0]);
+}
+
+#[test]
+fn an_edited_route_that_holds_separation_keeps_it_and_its_exempt_group() {
+    for (name, held, expected_target) in [
+        ("refund_static", static_route("C0EXAMPLE2"), "C0EXAMPLE7"),
+        (
+            "ledger_post",
+            ticket_route_with_exempt_group(true),
+            "C0EXAMPLE7",
+        ),
+    ] {
+        let api = api(
+            serde_json::json!({name: held.clone(), "deal_desk": plain_route("C0EXAMPLE5")}),
+            3,
+            false,
+        );
+        let edit = format!("{name}={expected_target}");
+        let run = run(&args(&api.server.base_url, &["--route-resolution", &edit]));
+        assert_eq!(run.code, 0, "{name}: {}{}", run.stdout, run.stderr);
+
+        let sent = patches(&api.server);
+        assert_eq!(sent.len(), 1, "{name}: {sent:?}");
+        let mut want = held.clone();
+        want["resolution"] = serde_json::json!({"kind": "slack", "address": expected_target});
+        assert_eq!(
+            sent[0]["approval_routes"][name], want,
+            "{name}: {}",
+            sent[0]
+        );
+        assert!(
+            sent[0]["approval_routes"].get("deal_desk").is_none(),
+            "{name}: an untouched plain route is not carried: {}",
+            sent[0]
+        );
+        assert_eq!(sent[0][ROUTES_EXPECTED], 3, "{name}: {}", sent[0]);
+    }
+}

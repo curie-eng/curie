@@ -20,6 +20,7 @@ import asyncio
 from typing import Any
 
 import httpx
+import pytest
 from curie_api.approvers import ApproverSet, EmailApprovers, ExplicitUsers, MembershipVerdict
 from curie_api.authorizer import AuthzDecision, authorize_approval
 from curie_api.models import Approval
@@ -54,10 +55,12 @@ def _authorize(
     binding: Any = None,
     group_client: GroupMembershipSource | None = None,
     principal_kind: str = "chat",
+    canonical_owner: bool = False,
 ) -> tuple[str | None, AuthzDecision]:
     """The resolve endpoint's exact shape: select a set from the binding, then
     authorize on it. Selection is real, so these stay end-to-end tests of the
-    binding-to-decision path rather than of the authorizer in isolation."""
+    binding-to-decision path rather than of the authorizer in isolation. The
+    same binding is the route binding the authorizer judges (ADR 0271)."""
 
     select = SlackApproverSetSelector(group_client)
     return asyncio.run(
@@ -67,6 +70,8 @@ def _authorize(
             actor_channel,
             approver_set=select(approval, binding),
             principal_kind=principal_kind,
+            route_binding=binding,
+            canonical_owner=canonical_owner,
         )
     )
 
@@ -867,6 +872,7 @@ def test_test_driver_resolves_only_explicit_users() -> None:
             _CARD_CHANNEL,
             approver_set=approvers,
             principal_kind="test_driver",
+            route_binding=None,
         )
         return verdict
 
@@ -884,3 +890,206 @@ def test_test_driver_resolves_only_explicit_users() -> None:
         assert not verdict.allowed
         assert verdict.evidence is not None
         assert verdict.evidence["principal_kind"] == "test_driver"
+
+
+# --- ADR 0271 decisions 5 and 6: canonical routes -----------------------------
+#
+# A canonical route is a dynamic approval, or a route binding whose separation
+# enables requester exclusion; any malformed separation counts. Only the HTTP
+# answer composition holds the canonical facts such a route needs, so the one
+# authorizer refuses an operator principal first, then every caller that is not
+# that composition (``canonical_owner``), before any set's eligibility shortcut.
+
+_SELECTOR_ROUTE = "access_review"
+_EXEMPT = {"issuer": "https://identity.example.test/directory", "id": "SyntheticExemptGroup"}
+
+
+def _dynamic() -> Approval:
+    """A dynamic approval as the HTTP creation owner stores it (ADR 0271 decision 4)."""
+
+    approval = _bound_approval(route=_SELECTOR_ROUTE)
+    approval.selection_mode = "dynamic"
+    return approval
+
+
+def _ordinary(**changes: Any) -> Approval:
+    """An ordinary routed approval, with the stored mode a real row carries."""
+
+    approval = _bound_approval(**changes)
+    approval.selection_mode = "ordinary"
+    return approval
+
+
+def _users(*users: str, **extra: Any) -> dict[str, Any]:
+    """A route binding with an explicit user list, which an operator is eligible for."""
+
+    return {"channel": _CARD_CHANNEL, "approvers": {"users": list(users)}, **extra}
+
+
+_CANONICAL_BINDINGS: dict[str, dict[str, Any]] = {
+    "exclusion": _users(_LISTED, separation={"exclude_requester": True}),
+    "exemption": _users(
+        _LISTED, separation={"exclude_requester": True, "exempt_group": _EXEMPT}
+    ),
+    "exemption-without-exclusion": _users(
+        _LISTED, separation={"exclude_requester": False, "exempt_group": _EXEMPT}
+    ),
+    "string-flag": _users(_LISTED, separation={"exclude_requester": "false"}),
+    "empty": _users(_LISTED, separation={}),
+    "null": _users(_LISTED, separation=None),
+    "not-an-object": _users(_LISTED, separation="off"),
+}
+_ORDINARY_BINDINGS: dict[str, dict[str, Any]] = {
+    "no-separation": _users(_LISTED),
+    "opted-out": _users(_LISTED, separation={"exclude_requester": False}),
+}
+
+
+def test_canonical_route_classifies_rows_and_bindings_and_never_raises() -> None:
+    """@spec REQUEST-APPROVAL-5 REQUEST-APPROVAL-6: dynamic rows and enforced separation only."""
+
+    from curie_api.approval_selection import canonical_route
+
+    for binding in (None, {}, _users(_LISTED), "C0CARD001", 123):
+        assert canonical_route(_dynamic(), binding) is True, binding
+    for label, binding in _CANONICAL_BINDINGS.items():
+        assert canonical_route(_ordinary(), binding) is True, label
+        assert canonical_route(_bound_approval(), binding) is True, label
+    for label, binding in _ORDINARY_BINDINGS.items():
+        assert canonical_route(_ordinary(), binding) is False, label
+    for binding in (None, {}, "C0CARD001", ["U0LISTED1"], 123, True):
+        assert canonical_route(_ordinary(), binding) is False, binding
+    assert canonical_route(_approval(), None) is False
+
+
+@pytest.mark.parametrize("canonical_owner", [False, True])
+def test_an_operator_is_refused_first_on_a_dynamic_approval(canonical_owner: bool) -> None:
+    """@spec REQUEST-APPROVAL-5: before eligibility, even by an operator-eligible list naming it.
+
+    ``ExplicitUsers`` is operator eligible and lists the operator, so only the
+    canonical-route rule can refuse it; a missing route must not mask it.
+    """
+
+    for binding in (_users(_LISTED), None):
+        _name, decision = _authorize(
+            _dynamic(), _LISTED, None, binding=binding, principal_kind="operator",
+            canonical_owner=canonical_owner,
+        )
+        assert not decision.allowed, binding
+        assert decision.evidence is not None
+        assert decision.evidence["kind"] == "canonical_route_operator_refused", decision.evidence
+
+    _name, ordinary = _authorize(
+        _ordinary(), _LISTED, None, binding=_users(_LISTED), principal_kind="operator",
+    )
+    assert ordinary.allowed
+
+
+@pytest.mark.parametrize("label", sorted(_CANONICAL_BINDINGS))
+def test_an_operator_is_refused_on_every_separation_enforcing_binding(label: str) -> None:
+    """@spec REQUEST-APPROVAL-6: static exclusion, an exemption or malformed separation.
+
+    The explicit user list names the operator; the route still refuses it.
+    """
+
+    for canonical_owner in (False, True):
+        _name, decision = _authorize(
+            _ordinary(), _LISTED, None, binding=_CANONICAL_BINDINGS[label],
+            principal_kind="operator", canonical_owner=canonical_owner,
+        )
+        assert not decision.allowed, (label, canonical_owner)
+        assert decision.evidence is not None
+        assert decision.evidence["kind"] == "canonical_route_operator_refused", decision.evidence
+
+
+@pytest.mark.parametrize("label", sorted(_ORDINARY_BINDINGS))
+def test_ordinary_routes_keep_operator_eligibility_and_self_confirmation(label: str) -> None:
+    """@spec REQUEST-APPROVAL-6: a route without enforced exclusion answers exactly as before."""
+
+    binding = _ORDINARY_BINDINGS[label]
+    name, listed = _authorize(
+        _ordinary(), _LISTED, None, binding=binding, principal_kind="operator",
+    )
+    assert (name, listed.allowed) == ("ExplicitUserListAuthorizer", True)
+    assert listed.evidence is not None and listed.evidence["kind"] == "user_list"
+    _name, outsider = _authorize(
+        _ordinary(), _OUTSIDER, None, binding=binding, principal_kind="operator",
+    )
+    assert not outsider.allowed
+    assert outsider.evidence is not None and outsider.evidence["kind"] == "user_list"
+    # ADR 0106: a listed requester confirms its own action on an ordinary route.
+    _name, author = _authorize(_ordinary(author=_LISTED), _LISTED, _CARD_CHANNEL, binding=binding)
+    assert author.allowed
+
+
+@pytest.mark.parametrize("kind", ["chat", "console", "test_driver", "adapter"])
+def test_a_caller_other_than_the_http_answer_is_refused_on_a_canonical_route(kind: str) -> None:
+    """@spec REQUEST-APPROVAL-5 REQUEST-APPROVAL-6: only the HTTP answer has canonical facts."""
+
+    for approval, binding in (
+        (_dynamic(), _users(_LISTED)),
+        (_dynamic(), {"channel": _CARD_CHANNEL}),
+        (_ordinary(), _CANONICAL_BINDINGS["exclusion"]),
+    ):
+        _name, decision = _authorize(
+            approval, _LISTED, _CARD_CHANNEL, binding=binding, principal_kind=kind,
+        )
+        assert not decision.allowed, binding
+        assert decision.evidence is not None
+        assert decision.evidence["kind"] == "canonical_route_requires_http_answer", (
+            decision.evidence
+        )
+
+
+def test_the_http_answer_is_judged_by_the_route_set_on_a_canonical_route() -> None:
+    """@spec REQUEST-APPROVAL-5 REQUEST-APPROVAL-6: ``canonical_owner`` reaches the route's set.
+
+    A retained explicit list still narrows; a dynamic route declaring no
+    ``approvers`` is narrowed by its selected set, which the composition
+    judges and which only a chat click or an adapter may answer; a missing
+    route still refuses.
+    """
+
+    exclusion = _CANONICAL_BINDINGS["exclusion"]
+    name, listed = _authorize(
+        _ordinary(), _LISTED, _CARD_CHANNEL, binding=exclusion, canonical_owner=True,
+    )
+    assert (name, listed.allowed) == ("ExplicitUserListAuthorizer", True)
+    _name, outsider = _authorize(
+        _ordinary(), _OUTSIDER, _CARD_CHANNEL, binding=exclusion, canonical_owner=True,
+    )
+    assert not outsider.allowed
+    assert outsider.evidence is not None and outsider.evidence["kind"] == "user_list"
+
+    _name, retained = _authorize(
+        _dynamic(), _OUTSIDER, _CARD_CHANNEL, binding=_users(_LISTED), canonical_owner=True,
+    )
+    assert not retained.allowed
+    assert retained.evidence is not None and retained.evidence["kind"] == "user_list"
+    _name, member = _authorize(
+        _dynamic(), _LISTED, _CARD_CHANNEL, binding=_users(_LISTED), canonical_owner=True,
+    )
+    assert member.allowed
+
+    bare = {"channel": _CARD_CHANNEL}
+    for kind in ("chat", "adapter"):
+        _name, selected = _authorize(
+            _dynamic(), _OUTSIDER, "C0WRONG01", binding=bare, principal_kind=kind,
+            canonical_owner=True,
+        )
+        assert selected.allowed, kind
+        assert selected.evidence == {"kind": "approval_selection", "narrowing": "selected_set"}
+    for kind in ("console", "test_driver"):
+        _name, ineligible = _authorize(
+            _dynamic(), _LISTED, _CARD_CHANNEL, binding=bare, principal_kind=kind,
+            canonical_owner=True,
+        )
+        assert not ineligible.allowed, kind
+        assert ineligible.evidence is not None
+        assert ineligible.evidence["kind"] == "principal_set_eligibility", ineligible.evidence
+
+    name, unbound = _authorize(
+        _dynamic(), _LISTED, _CARD_CHANNEL, binding=None, canonical_owner=True,
+    )
+    assert (name, unbound.allowed) == ("UnboundRouteBinding", False)
+    assert unbound.evidence is not None and unbound.evidence["kind"] == "route_binding"

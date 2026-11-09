@@ -19,6 +19,16 @@ Python interpreter (the harness uses the API image). Two listeners:
    what was recorded (lookup scopes and outcomes, reply events, authority
    decisions and admin changes), never a bearer or adapter secret.
    ``GET /healthz`` answers readiness.
+   ``POST /roster`` changes the scripted directory while it runs, so a
+   scenario can deactivate a person, change a group or make a lookup
+   unavailable: ``{"upsert": {address: entry}, "delete": [address],
+   "reset": true}``, each part optional. ``reset`` starts again from the
+   roster the provider was started with; deletes and then upserts apply on
+   top. It requires the same ``X-Curie-Adapter-Secret``, and an entry the
+   recorded vectors cannot answer is refused with 400 before anything
+   changes. ``GET /roster`` returns the effective roster, the addresses that
+   differ from the starting one and a change counter. The roster carries no
+   secret.
 
 The sink listener also serves current downstream authority for the reference
 human-restricted connector (ADR 0270 decision 5), when an authority bearer is
@@ -79,6 +89,8 @@ OUTCOMES = frozenset({"resolved", "inactive", "unresolved", "unavailable"})
 DEFAULT_AUTHORITY_GROUP = "identity-e2e-members"
 PRINCIPAL_FIELDS = frozenset({"tenant_id", "issuer", "subject"})
 _TENANT = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
+ENTRY_KEYS = frozenset({"subject", "sender_kind", "account_status", "groups", "outcome"})
+MAX_ADDRESS = 256
 
 
 class RosterError(ValueError):
@@ -179,6 +191,39 @@ def answer(
     return response
 
 
+def check_entry(address: Any, entry: Any, vectors: Mapping[str, Any]) -> None:
+    """Refuse a roster entry the recorded vectors cannot answer, before it is stored."""
+
+    if (
+        not isinstance(address, str)
+        or not 0 < len(address) <= MAX_ADDRESS
+        or address != address.lower()
+        or address.count("@") != 1
+        or any(character.isspace() for character in address)
+    ):
+        raise RosterError("a roster address is one lowercase email address")
+    if not isinstance(entry, dict) or not set(entry) <= ENTRY_KEYS:
+        raise RosterError(f"a roster entry is an object with keys from {sorted(ENTRY_KEYS)}")
+    subject = entry.get("subject")
+    if subject is not None and (not isinstance(subject, str) or not subject):
+        raise RosterError("a roster subject is a non-empty string")
+    groups = entry.get("groups")
+    if groups is not None and (
+        not isinstance(groups, list) or not all(isinstance(g, str) and g for g in groups)
+    ):
+        raise RosterError("roster groups are a list of non-empty strings")
+    kind = entry.get("sender_kind", "human")
+    if not isinstance(kind, str):
+        raise RosterError("a roster sender_kind is a string")
+    outcome = _outcome(entry)
+    status = (
+        None
+        if outcome in {"unresolved", "unavailable"}
+        else entry.get("account_status", "active")
+    )
+    template_for(vectors, outcome, kind, status)
+
+
 class Provider:
     """Shared state for both listeners."""
 
@@ -207,12 +252,73 @@ class Provider:
         self.vectors = vectors
         self.tenant = tenant
         self.authority_group = authority_group
+        self._original = copy.deepcopy(dict(roster))
+        self._generation = 0
         self._bearer = bearer
         self._adapter_secret = adapter_secret
         self._authority_bearer = authority_bearer
         self._authority_available = True
         self._lock = threading.Lock()
         self._records: list[dict[str, Any]] = []
+
+    def override(self, change: Any) -> dict[str, Any]:
+        """Apply one roster change atomically; a refused change alters nothing.
+
+        Lookups read ``self.roster`` once per answer, and it is replaced by a
+        new object here rather than edited in place, so a lookup never sees a
+        half-applied change.
+        """
+
+        if not isinstance(change, dict) or not change or not set(change) <= {
+            "upsert",
+            "delete",
+            "reset",
+        }:
+            raise RosterError("a roster change names upsert, delete or reset")
+        upsert = change.get("upsert") or {}
+        delete = change.get("delete") or []
+        reset = change.get("reset", False)
+        if not isinstance(upsert, dict) or not isinstance(delete, list) or type(reset) is not bool:
+            raise RosterError("upsert is an object, delete a list and reset a boolean")
+        for address in delete:
+            if not isinstance(address, str):
+                raise RosterError("a deleted roster address is a string")
+        for address, entry in upsert.items():
+            check_entry(address, entry, self.vectors)
+        with self._lock:
+            base = self._original if reset else self.roster
+            roster = copy.deepcopy(dict(base))
+            senders = dict(roster.get("senders") or {})
+            for address in delete:
+                senders.pop(address, None)
+            for address, entry in upsert.items():
+                senders[address] = copy.deepcopy(entry)
+            roster["senders"] = senders
+            self.roster = roster
+            self._generation += 1
+            return self._view(roster)
+
+    def roster_view(self) -> dict[str, Any]:
+        with self._lock:
+            return self._view(self.roster)
+
+    def _view(self, roster: Mapping[str, Any]) -> dict[str, Any]:
+        """The effective roster, what differs from the starting one, and the change counter."""
+
+        senders = roster.get("senders") or {}
+        original = self._original.get("senders") or {}
+        changed = sorted(
+            address
+            for address in set(senders) | set(original)
+            if senders.get(address) != original.get(address)
+        )
+        return {
+            "issuer": roster.get("issuer"),
+            "unknown": roster.get("unknown", "unresolved"),
+            "senders": copy.deepcopy(dict(senders)),
+            "overridden": changed,
+            "generation": self._generation,
+        }
 
     def record(self, entry: dict[str, Any]) -> None:
         entry["at"] = datetime.now(UTC).isoformat()
@@ -325,6 +431,8 @@ def _handler(provider: Provider, *, lookup: bool) -> type[BaseHTTPRequestHandler
                 self._send(200, {"ok": True})
             elif self.path == "/records" and not lookup:
                 self._send(200, {"records": provider.records()})
+            elif self.path == "/roster" and not lookup:
+                self._send(200, provider.roster_view())
             else:
                 self._send(404, {"error": "not_found"})
 
@@ -340,8 +448,35 @@ def _handler(provider: Provider, *, lookup: bool) -> type[BaseHTTPRequestHandler
                 self._authority(raw)
             elif not lookup and self.path in {"/admin/membership", "/admin/authority"}:
                 self._admin(self.path, raw)
+            elif not lookup and self.path == "/roster":
+                self._roster(raw)
             else:
                 self._send(404, {"error": "not_found"})
+
+        def _roster(self, raw: bytes) -> None:
+            if not provider.adapter_ok(self.headers.get(ADAPTER_SECRET_HEADER)):
+                provider.record({"type": "roster", "status": 401})
+                self._send(401, {"error": "unauthorized"})
+                return
+            try:
+                change = json.loads(raw)
+                view = provider.override(change)
+            except (ValueError, RosterError) as exc:
+                # RosterError is a ValueError; its text names a rule, never a secret.
+                provider.record({"type": "roster", "status": 400, "error": str(exc)[:200]})
+                self._send(400, {"error": "bad_request", "detail": str(exc)[:200]})
+                return
+            provider.record(
+                {
+                    "type": "roster",
+                    "status": 200,
+                    "reset": bool(change.get("reset")),
+                    "upserted": sorted(change.get("upsert") or {}),
+                    "deleted": sorted(change.get("delete") or []),
+                    "generation": view["generation"],
+                }
+            )
+            self._send(200, view)
 
         def _lookup(self, raw: bytes) -> None:
             if not provider.bearer_ok(self.headers.get("Authorization")):

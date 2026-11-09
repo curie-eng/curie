@@ -52,15 +52,17 @@ from ..admission import admit
 from ..approval_auth import (
     APPROVAL_PRINCIPAL_HEADER,
     ApprovalPrincipalDep,
+    AuthenticatedApprovalPrincipal,
     platform_key_or_adapter,
     require_adapter_principal,
 )
+from ..approval_selection import canonical_route
 from ..approval_teams import (
     approval_team_decision,
     authenticated_actor_evidence,
     team_restriction,
 )
-from ..approvers import IdpTeamApprovers, card_on_requesting_surface
+from ..approvers import ApproverSetSelector, IdpTeamApprovers, card_on_requesting_surface
 from ..auth import require_api_key, require_platform_key
 from ..authorizer import AuthzDecision, authorize_approval
 from ..config import get_settings
@@ -536,6 +538,57 @@ async def _admit_adapter_answer(session: AsyncSession, approval: Approval, sende
         raise HTTPException(status.HTTP_403_FORBIDDEN, CALLER_NOT_ALLOWED_DETAIL)
 
 
+async def _refuse_off_composition(
+    session: AsyncSession,
+    approval: Approval,
+    principal: AuthenticatedApprovalPrincipal,
+    approver_sets: ApproverSetSelector,
+    data: ApprovalResolve,
+) -> None:
+    """A selected row's canonical route judges a principal the HTTP answer cannot carry.
+
+    ADR 0271 decisions 5 and 6: an operator, console or test-driver principal
+    on a dynamic or requester-excluding route is refused by the shared
+    authorizer (an operator first, before any set's eligibility), audited
+    ``denied`` with its evidence, and answered 403 with the authorizer's
+    reason. Any other route returns, keeping today's bare refusal.
+    @spec REQUEST-APPROVAL-5 REQUEST-APPROVAL-6.
+
+    Raises:
+        HTTPException: 403 with the authorizer's reason on a canonical route.
+    """
+
+    binding = await crud_approvals.get_approval_route_binding(session, approval)
+    if not canonical_route(approval, binding):
+        return
+    name, decision = await authorize_approval(
+        approval,
+        principal.subject,
+        principal.actor_channel,
+        approver_set=approver_sets(approval, binding),
+        principal_kind=principal.kind,
+        route_binding=binding,
+    )
+    if decision.allowed:  # Unreachable: only the HTTP answer owns a canonical route.
+        return
+    await crud_approvals.append_approval_audit(
+        session,
+        approval_id=approval.id,
+        action="denied",
+        actor=principal.subject,
+        actor_channel=principal.actor_channel,
+        principal_kind=principal.kind,
+        authenticated=True,
+        principal_subject=principal.adapter,
+        decision=data.decision,
+        authorizer=name,
+        authorized=False,
+        reason=decision.reason,
+        evidence=decision.evidence,
+    )
+    raise HTTPException(status.HTTP_403_FORBIDDEN, decision.reason)
+
+
 @router.post("/{approval_id}/resolve", response_model=ApprovalOut)
 async def resolve_approval(
     approval_id: uuid.UUID,
@@ -552,7 +605,10 @@ async def resolve_approval(
     The authorizer runs first, server-side (#246): the route's approvers decide
     whether the authenticated principal belongs -- an explicit user list, a
     Slack user group, or (declaring none) the card channel's members (#420).
-    Requester equality neither grants nor vetoes membership. Then exactly one
+    Requester equality neither grants nor vetoes membership, except on a
+    canonical route (ADR 0271: dynamic selection or requester exclusion), which
+    only the HTTP answer composition may answer; every other principal there is
+    refused and audited, an operator first. Then exactly one
     authorized resolver wins
     the conditional UPDATE; a loser gets 409 naming who resolved it, and a
     past-SLA record flips to expired and returns 410 while still enqueuing the
@@ -603,6 +659,8 @@ async def resolve_approval(
         # no chat attestation. @spec HTTP-APPROVAL-CONTINUITY-15.
         emailed = principal.kind == "adapter" and proof is not None
         if proof is None or (not emailed and (attestation is None or principal.kind != "chat")):
+            if principal.kind not in ("chat", "adapter"):
+                await _refuse_off_composition(session, approval, principal, approver_sets, data)
             # 403, not 409: a 409 reads as settled and would retire a card whose
             # row is still pending. Only a receiver-proved answer qualifies.
             raise HTTPException(status.HTTP_403_FORBIDDEN, "unsupported_approval")
@@ -663,6 +721,7 @@ async def resolve_approval(
         principal.actor_channel,
         approver_set=approver_set,
         principal_kind=principal.kind,
+        route_binding=binding,
     )
 
     if principal.kind == "test_driver" and not team_decision.restricted:

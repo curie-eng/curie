@@ -232,6 +232,18 @@ async def create_agent(data: AgentCreate, session: SessionDep) -> AgentOut:
     # Reject oversized behavior packs (#936) before we touch the DB.
     if data.behavior_packs is not None:
         enforce_behavior_packs_size(data.behavior_packs)
+    # ADR 0271 decision 6: a route's separation is written only by the
+    # versioned, audited route write, and enabling it needs one of the agent's
+    # bindings in an operator receiver registration, which a binding created by
+    # this request cannot be.
+    if data.approval_routes is not None and any(
+        binding.separation is not None for binding in data.approval_routes.values()
+    ):
+        raise HTTPException(
+            status.HTTP_422_UNPROCESSABLE_ENTITY,
+            "separation cannot be set when an agent is created: create the agent, then "
+            "write it with PATCH approval_routes and approval_routes_expected_version",
+        )
     # name and repo_full_name are unique. A collision is a caller conflict (409),
     # not a server fault: catch the DB IntegrityError and map it, rather than
     # letting it bubble as an opaque 500. A non-unique violation (NOT NULL, FK)
@@ -463,6 +475,7 @@ async def update_agent(
                 agent,
                 {name: b.model_dump() for name, b in data.approval_routes.items()},
                 expected_version=data.approval_routes_expected_version,
+                runtime=getattr(request.app.state, "http_identity_runtime", None),
             )
         except crud_agents.ApprovalRoutesRefused as exc:
             raise HTTPException(exc.status, {"code": exc.code, "message": str(exc)}) from exc
@@ -516,20 +529,21 @@ def _preflight_selector_write(agent: Agent, data: AgentUpdate, proposed: dict[st
     """The early half of the ADR 0271 route write checks, against the loaded row.
 
     Version presence and equality, then one owning route per connector tool,
-    all before the bundle gate and before any sibling field could commit.
+    all before the bundle gate and before any sibling field could commit. A
+    selector or a ``separation`` on either side makes the write versioned.
     """
 
     expected = data.approval_routes_expected_version
-    selector = approver_tickets.has_selector(agent.approval_routes) or (
-        approver_tickets.has_selector(proposed)
+    versioned = approver_tickets.needs_configuration_version(agent.approval_routes) or (
+        approver_tickets.needs_configuration_version(proposed)
     )
-    if selector and expected is None:
+    if versioned and expected is None:
         raise HTTPException(
             status.HTTP_409_CONFLICT,
             {
                 "code": approver_tickets.EXPECTED_VERSION_REQUIRED,
-                "message": "this route map write involves an approver_ticket selector: send "
-                "approval_routes_expected_version",
+                "message": "this route map write involves an approver_ticket selector or a "
+                "separation: send approval_routes_expected_version",
             },
         )
     if expected is not None and expected != agent.connector_requester_identity_version:

@@ -2501,6 +2501,55 @@
         "title": "ApprovalCreationResponseV2",
         "type": "object"
       },
+      "ApprovalExemptGroup": {
+        "additionalProperties": false,
+        "description": "The one identity provider group exempt from requester exclusion (ADR 0271).\n\nNamed by canonical issuer and stable group id, compared byte for byte with\nthe requester's current directory groups at answer time.",
+        "properties": {
+          "id": {
+            "title": "Id",
+            "type": "string"
+          },
+          "issuer": {
+            "title": "Issuer",
+            "type": "string"
+          }
+        },
+        "required": [
+          "issuer",
+          "id"
+        ],
+        "title": "ApprovalExemptGroup",
+        "type": "object"
+      },
+      "ApprovalExemptGroupOut": {
+        "description": "Read projection of a stored exempt group; tolerant for repair.",
+        "properties": {
+          "id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Id"
+          },
+          "issuer": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Issuer"
+          }
+        },
+        "title": "ApprovalExemptGroupOut",
+        "type": "object"
+      },
       "ApprovalGrantAuthorityRequestV1": {
         "additionalProperties": false,
         "description": "@spec HTTP-APPROVAL-CONTINUITY-12.",
@@ -3426,7 +3475,7 @@
       },
       "ApprovalRouteBinding": {
         "additionalProperties": false,
-        "description": "One strict workspace binding for a declared approval route (#1460).\n\n``resolution`` is the single verified-identity action surface: a fixed\nSlack channel, or the conversation that asked (ADR-0177).\n``notification`` may make the pending request visible elsewhere, but its\nmessage carries no interaction. ``approvers`` continues to narrow WHO may\nact through the resolution card path and is never inferred from notification\nrecipients. ``approver_ticket`` registers a per-request approver selector and\n``separation`` its requester exclusion (ADR 0271).",
+        "description": "One strict workspace binding for a declared approval route (#1460).\n\n``resolution`` is the single verified-identity action surface: a fixed\nSlack channel, or the conversation that asked (ADR-0177).\n``notification`` may make the pending request visible elsewhere, but its\nmessage carries no interaction. ``approvers`` continues to narrow WHO may\nact through the resolution card path and is never inferred from notification\nrecipients. ``approver_ticket`` registers a per-request approver selector and\n``separation`` the route's requester exclusion, with or without a selector\n(ADR 0271).",
         "properties": {
           "approver_ticket": {
             "anyOf": [
@@ -3597,11 +3646,21 @@
       },
       "ApprovalSeparation": {
         "additionalProperties": false,
-        "description": "Requester exclusion for a registered selector route (ADR 0271).\n\nOmitted on write stores ``{\"exclude_requester\": true}``; ``false`` is the\naudited opt-out. ``exempt_group`` lands with its enforcement (0271b), so it\nis refused here rather than stored unenforced.",
+        "description": "Requester exclusion on an approval route (ADR 0271 decision 6).\n\nOn a route that registers an ``approver_ticket`` selector, omitting it\nstores ``{\"exclude_requester\": true}`` and ``false`` is the audited opt-out.\nOn any other route it is stored as written: ``true`` enables static\nexclusion, and omitting it keeps ordinary ADR 0106 self-confirmation.\n``exempt_group`` is valid only beside ``exclude_requester: true``.",
         "properties": {
           "exclude_requester": {
             "title": "Exclude Requester",
             "type": "boolean"
+          },
+          "exempt_group": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ApprovalExemptGroup"
+              },
+              {
+                "type": "null"
+              }
+            ]
           }
         },
         "required": [
@@ -3611,7 +3670,7 @@
         "type": "object"
       },
       "ApprovalSeparationOut": {
-        "description": "Read projection of the stored, effective requester exclusion.",
+        "description": "Read projection of the stored, effective requester exclusion.\n\n``exempt_group`` is omitted, not null, when the route stores none, so a\nroute without one reads back exactly as before.",
         "properties": {
           "exclude_requester": {
             "anyOf": [
@@ -3623,6 +3682,16 @@
               }
             ],
             "title": "Exclude Requester"
+          },
+          "exempt_group": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ApprovalExemptGroupOut"
+              },
+              {
+                "type": "null"
+              }
+            ]
           }
         },
         "title": "ApprovalSeparationOut",
@@ -24449,7 +24518,7 @@
     },
     "/approvals/{approval_id}/resolve": {
       "post": {
-        "description": "Claim the resolution (resolve-once) and wake the suspended session.\n\nThe authorizer runs first, server-side (#246): the route's approvers decide\nwhether the authenticated principal belongs -- an explicit user list, a\nSlack user group, or (declaring none) the card channel's members (#420).\nRequester equality neither grants nor vetoes membership. Then exactly one\nauthorized resolver wins\nthe conditional UPDATE; a loser gets 409 naming who resolved it, and a\npast-SLA record flips to expired and returns 410 while still enqueuing the\nexpiry resume turn so the suspended session wakes down its timeout branch.\nThe winner's response is sent only after the resume turn is enqueued.",
+        "description": "Claim the resolution (resolve-once) and wake the suspended session.\n\nThe authorizer runs first, server-side (#246): the route's approvers decide\nwhether the authenticated principal belongs -- an explicit user list, a\nSlack user group, or (declaring none) the card channel's members (#420).\nRequester equality neither grants nor vetoes membership, except on a\ncanonical route (ADR 0271: dynamic selection or requester exclusion), which\nonly the HTTP answer composition may answer; every other principal there is\nrefused and audited, an operator first. Then exactly one\nauthorized resolver wins\nthe conditional UPDATE; a loser gets 409 naming who resolved it, and a\npast-SLA record flips to expired and returns 410 while still enqueuing the\nexpiry resume turn so the suspended session wakes down its timeout branch.\nThe winner's response is sent only after the resume turn is enqueued.",
         "operationId": "resolve_approval_approvals__approval_id__resolve_post",
         "parameters": [
           {

@@ -33,6 +33,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from curie_api import (
     admission,
     agent_role_policy,
+    approval_selection,
     channel_token,
     identity_fence,
     principal_authority,
@@ -466,6 +467,10 @@ async def binding_requires_http_identity(
     evaluate. Turn ingress, the worker's classification route and approval
     continuity all ask this. @spec HTTP-INVOCATION-EXECUTION-22
     HTTP-APPROVAL-CONTINUITY-14.
+
+    So does every binding of an agent whose route map registers a selector,
+    enforces requester exclusion or an exemption, or cannot be read: only HTTP
+    facts can judge those routes (ADR 0271 decision 5). @spec REQUEST-APPROVAL-5/6.
     """
     if not await tenant_selects_http_identity(session, binding.tenant_id):
         return False
@@ -473,7 +478,21 @@ async def binding_requires_http_identity(
         runtime, tenant_id=binding.tenant_id, kind=binding.kind, adapter=binding.adapter,
     ):
         return True
+    if await _routes_need_http_facts(session, binding):
+        return True
     return await _roles_need_http_facts(session, binding)
+
+
+async def _routes_need_http_facts(session: AsyncSession, binding: AgentChannel) -> bool:
+    """The binding's agent has a canonical or unreadable approval route.
+
+    Read fresh by agent id; a missing agent row reads as not required, as the
+    role check does. @spec REQUEST-APPROVAL-5/6.
+    """
+    routes = await session.scalar(
+        select(Agent.approval_routes).where(Agent.id == binding.agent_id),
+    )
+    return approval_selection.routes_require_http(routes)
 
 
 async def _roles_need_http_facts(session: AsyncSession, binding: AgentChannel) -> bool:

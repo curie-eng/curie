@@ -39,6 +39,7 @@ from approver_ticket_support import (
     OTHER_CONNECTOR,
     OTHER_ROUTE,
     OUTSIDER,
+    REQUESTER,
     ROUTE,
     TOOL,
     add_principal,
@@ -797,44 +798,53 @@ def test_ordinary_http_approval_keeps_its_record_digest_and_seal(
     assert owner_verifies(case, created["id"])
 
 
-# --- answer interlock until decision 5 (plan D15) ----------------------------------
+# --- answer authority (decision 5) replaces the 0271a interlock -------------------
 
 
-def test_dynamic_approval_cannot_be_answered_before_answer_authority_lands(
+def test_dynamic_approval_is_answered_by_a_selected_approver_and_refused_to_others(
     ticket_case: SimpleNamespace,
 ) -> None:
-    """@spec REQUEST-APPROVAL-4: no answer path accepts a selected set it cannot enforce.
+    """@spec REQUEST-APPROVAL-5: the selected set decides; the creation-era interlock is gone.
 
-    The approver role is migrated and the owning route declares no legacy
-    approver restriction, the shape in which the receiver answer path skips the
-    shared authorizer. An ordinary approval in the same configuration is
-    answered by the same human as the liveness neighbor.
+    This suite's directory resolves every account to the requester, so the
+    requester is the one canonical person who can answer here. Selected (with
+    the operator's audited exclusion opt-out, decision 6) its answer approves
+    the dynamic row; unselected it is refused, audited and the row stays
+    pending, and an operator principal stays refused. The role is migrated and
+    the owning route declares no legacy ``approvers`` block.
     """
     case = ticket_case
-    enroll(case)
-    ordinary = request_for(case)
-    accepted(create(case.client, ordinary), ordinary)
-    answered = SimpleNamespace(
-        client=case.client, scope=case.scope, row=rows(ordinary["approval"]["dedupe_key"])[0],
-    )
-    approved = resolve(answered, *answer(answered))
-    assert approved.status_code == 200, approved.text
-    assert approved.json()["status"] == "approved"
+    enroll(case, separation={"exclude_requester": False})
 
-    second = ingress(case)
-    request = dynamic_request(second, carried(case, ARGS))
+    request = dynamic_request(case, carried(case, ARGS, approvers=(APPROVER_A,)))
     receipt(create(case.client, request), request)
     row = rows(request["approval"]["dedupe_key"])[0]
-    target = SimpleNamespace(client=case.client, scope=case.scope, row=row)
-    for decision in ("approved", "rejected"):
-        body = json.dumps({"decision": decision}, separators=(",", ":")).encode()
-        response = resolve(target, *answer(target, body=body))
-        assert response.status_code == 403, response.text
-        operator = case.client.post(
-            f"/approvals/{row['id']}/resolve", json={"decision": decision},
-            headers=operator_headers(),
-        )
-        assert operator.status_code == 403, operator.text
+    unselected = SimpleNamespace(client=case.client, scope=case.scope, row=row)
+    response = resolve(unselected, *answer(unselected))
+    assert response.status_code == 403, response.text
+    assert response.json() == {"detail": "caller_not_allowed"}
+    operator = case.client.post(
+        f"/approvals/{row['id']}/resolve", json={"decision": "approved"},
+        headers=operator_headers(),
+    )
+    assert operator.status_code == 403, operator.text
     stored = rows(request["approval"]["dedupe_key"])[0]
     assert (stored["status"], stored["resolved_by"]) == ("pending", None)
-    assert [entry for entry in approval_audits(row["id"]) if entry["action"] == "resolved"] == []
+    audits = approval_audits(row["id"])
+    assert [entry for entry in audits if entry["action"] == "resolved"] == []
+    assert [entry["action"] for entry in audits].count("denied") >= 1
+
+    second = ingress(case)
+    request = dynamic_request(second, carried(case, ARGS, approvers=(REQUESTER,)))
+    receipt(create(case.client, request), request)
+    row = rows(request["approval"]["dedupe_key"])[0]
+    selected = SimpleNamespace(client=case.client, scope=case.scope, row=row)
+    approved = resolve(selected, *answer(selected))
+    assert approved.status_code == 200, approved.text
+    assert approved.json()["status"] == "approved"
+    stored = rows(request["approval"]["dedupe_key"])[0]
+    assert stored["status"] == "approved"
+    assert stored["selected_approvers"] == row["selected_approvers"]
+    resolved = [entry for entry in approval_audits(row["id"]) if entry["action"] == "resolved"]
+    assert len(resolved) == 1, resolved
+    assert resolved[0]["evidence"]["selection"]["kind"] == "approval_selection"

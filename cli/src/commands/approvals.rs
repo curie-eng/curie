@@ -320,28 +320,29 @@ pub(super) fn build_route_bindings(
     Ok(bindings)
 }
 
-/// Carry the routes that hold an approver-ticket selector into a flag-only
-/// route edit (ADR 0271). The write replaces the whole map and the response is
-/// never a writer, so each such route is rebuilt field by field from the
-/// readback, echoing the server-owned pin. An edited route keeps its own
-/// selector, separation and stored deadline; removing one takes an explicit
-/// `--routes-from`.
+/// Carry the routes that hold an approver-ticket selector or a separation
+/// block into a flag-only route edit (ADR 0271). The write replaces the whole
+/// map and the response is never a writer, so each such route is rebuilt field
+/// by field from the readback, echoing the server-owned pin. An edited route
+/// keeps its own selector, separation and stored deadline; removing one takes
+/// an explicit `--routes-from`.
 fn carry_over_selector_routes(
     existing: Option<&BTreeMap<String, crate::api::ApprovalRouteBindingResponse>>,
     bindings: &mut BTreeMap<String, crate::api::ApprovalRouteBindingWrite>,
 ) -> Result<()> {
     use crate::api::{
         ApprovalSeparationWrite, ApproverCeilingWrite, ApproverTicketWrite, ApproverUserWrite,
+        ExemptGroupWrite,
     };
     for (name, current) in existing.into_iter().flatten() {
-        let Some(ticket) = &current.approver_ticket else {
+        if current.approver_ticket.is_none() && current.separation.is_none() {
             continue;
-        };
+        }
         if current.notification.is_some() {
             return Err(crate::exit::CliError::usage(format!(
-                "route {name:?} carries an approver_ticket and a notification; the API \
-                 redacts a notification's transport, so this edit cannot write the route \
-                 back faithfully"
+                "route {name:?} carries an approver_ticket or separation and a notification; \
+                 the API redacts a notification's transport, so this edit cannot write the \
+                 route back faithfully"
             ))
             .with_fix("write the whole route map, notification included, with --routes-from")
             .into());
@@ -349,47 +350,63 @@ fn carry_over_selector_routes(
         let incomplete = || {
             anyhow::Error::from(
                 crate::exit::CliError::usage(format!(
-                    "route {name:?}: the API's approver_ticket readback is missing a field, \
-                     so this edit cannot write the route back faithfully"
+                    "route {name:?}: the API's approver_ticket or separation readback is \
+                     missing a field, so this edit cannot write the route back faithfully"
                 ))
                 .with_fix("write the whole route map with --routes-from"),
             )
         };
-        let ceiling = ticket.ceiling.as_ref().ok_or_else(incomplete)?;
-        let users = match &ceiling.users {
+        let ticket = match &current.approver_ticket {
             None => None,
-            Some(users) => Some(
-                users
-                    .iter()
-                    .map(|user| {
-                        Ok(ApproverUserWrite {
-                            issuer: user.issuer.clone().ok_or_else(incomplete)?,
-                            subject: user.subject.clone().ok_or_else(incomplete)?,
-                        })
-                    })
-                    .collect::<Result<Vec<_>>>()?,
-            ),
-        };
-        let ticket = ApproverTicketWrite {
-            connector: ticket.connector.clone().ok_or_else(incomplete)?,
-            tool: ticket.tool.clone().ok_or_else(incomplete)?,
-            key_id: ticket.key_id.clone().ok_or_else(incomplete)?,
-            public_key: ticket.public_key.clone().ok_or_else(incomplete)?,
-            ceiling: ApproverCeilingWrite {
-                approver_role_version: ceiling.approver_role_version.ok_or_else(incomplete)?,
-                users,
-                approver_role: ceiling.approver_role.clone(),
-            },
+            Some(ticket) => {
+                let ceiling = ticket.ceiling.as_ref().ok_or_else(incomplete)?;
+                let users = match &ceiling.users {
+                    None => None,
+                    Some(users) => Some(
+                        users
+                            .iter()
+                            .map(|user| {
+                                Ok(ApproverUserWrite {
+                                    issuer: user.issuer.clone().ok_or_else(incomplete)?,
+                                    subject: user.subject.clone().ok_or_else(incomplete)?,
+                                })
+                            })
+                            .collect::<Result<Vec<_>>>()?,
+                    ),
+                };
+                Some(ApproverTicketWrite {
+                    connector: ticket.connector.clone().ok_or_else(incomplete)?,
+                    tool: ticket.tool.clone().ok_or_else(incomplete)?,
+                    key_id: ticket.key_id.clone().ok_or_else(incomplete)?,
+                    public_key: ticket.public_key.clone().ok_or_else(incomplete)?,
+                    ceiling: ApproverCeilingWrite {
+                        approver_role_version: ceiling
+                            .approver_role_version
+                            .ok_or_else(incomplete)?,
+                        users,
+                        approver_role: ceiling.approver_role.clone(),
+                    },
+                })
+            }
         };
         let separation = match &current.separation {
             None => None,
             Some(separation) => Some(ApprovalSeparationWrite {
                 exclude_requester: separation.exclude_requester.ok_or_else(incomplete)?,
+                exempt_group: match &separation.exempt_group {
+                    None => None,
+                    Some(group) => Some(ExemptGroupWrite {
+                        issuer: group.issuer.clone().ok_or_else(incomplete)?,
+                        id: group.id.clone().ok_or_else(incomplete)?,
+                    }),
+                },
             }),
         };
         match bindings.get_mut(name) {
             Some(edited) => {
-                edited.approver_ticket.get_or_insert(ticket);
+                if edited.approver_ticket.is_none() {
+                    edited.approver_ticket = ticket;
+                }
                 if edited.separation.is_none() {
                     edited.separation = separation;
                 }
@@ -411,7 +428,7 @@ fn carry_over_selector_routes(
                         approvers: current.approvers.clone(),
                         expires_in_seconds: current.expires_in_seconds,
                         remind_every_s: current.remind_every_s,
-                        approver_ticket: Some(ticket),
+                        approver_ticket: ticket,
                         separation,
                     },
                 );
