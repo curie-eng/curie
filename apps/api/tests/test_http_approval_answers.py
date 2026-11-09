@@ -584,3 +584,33 @@ def test_failed_resume_publication_with_a_reconciler_stays_recoverable(
     added = valkey.xrange(runs_stream)[len(case.stream_before):]
     assert len(added) == 1 and "curie_identity_context_v1" in added[0][1]
     assert rows(case.row["dedupe_key"])[0]["resumed_at"] is not None
+
+
+@pytest.mark.parametrize("approver_member", [False, True])
+def test_open_invocation_does_not_bypass_unavailable_approver_group(
+    answer_case: SimpleNamespace, approver_member: bool,
+) -> None:
+    case = answer_case
+
+    async def open_invocation(factory: async_sessionmaker[AsyncSession]) -> None:
+        async with factory() as session, session.begin():
+            await agent_role_policy.apply_role_change(session, change=change(
+                uuid.UUID(case.scope["tenant"]), uuid.UUID(case.scope["agent"]),
+                version=case.scope["role_version"], filter=None,
+            ))
+
+    run(open_invocation)
+    case.provider.unavailable = True
+    before = len(case.provider.requests)
+    refused = resolve(case, *answer(case))
+    assert refused.status_code == 503, refused.text
+    assert refused.json() == {"detail": "authority_unavailable"}
+    assert rows(case.row["dedupe_key"]) == [case.row]
+    assert any(r["purpose"] == "approval" for r in case.provider.requests[before:])
+    case.provider.unavailable = False
+    case.provider.member = approver_member
+    resumed = resolve(case, *answer(case))
+    assert resumed.status_code == (200 if approver_member else 403), resumed.text
+    assert rows(case.row["dedupe_key"])[0]["status"] == (
+        "approved" if approver_member else "pending"
+    )

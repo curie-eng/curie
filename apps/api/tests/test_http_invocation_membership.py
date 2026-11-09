@@ -34,6 +34,7 @@ from curie_api.identity.http_transport import (
 )
 from curie_api.main import create_app
 from curie_api.models import (
+    Agent,
     AgentChannel,
     ChannelIdentity,
     IdentityNamespace,
@@ -93,7 +94,7 @@ def synthetic_provider(tmp_path: Path) -> Iterator[SimpleNamespace]:
     harness = _transport_harness()
     stop, ready = threading.Event(), threading.Event()
     provider = SimpleNamespace(
-        member=True, requests=[], responses=[], errors=[], during_lookup=None,
+        member=True, requests=[], responses=[], errors=[], during_lookup=None, unavailable=False,
     )
 
     async def serve() -> None:
@@ -107,6 +108,11 @@ def synthetic_provider(tmp_path: Path) -> Iterator[SimpleNamespace]:
                 """@spec HTTP-INVOCATION-EXECUTION-4/15: echo actual request scope/version."""
                 first, headers, raw = listener.requests[-1]
                 request = json.loads(raw)
+                if provider.unavailable:
+                    provider.requests.append(request)
+                    writer.write(harness.wire(b"", status=b"503 Service Unavailable"))
+                    await writer.drain()
+                    return
                 if provider.during_lookup is not None:
                     # Lookups run outside SQL, where another writer may commit meanwhile.
                     joined(provider.during_lookup)
@@ -190,7 +196,9 @@ def _runtime_api() -> ModuleType:
     return module
 
 
-def _scope(endpoint: str, *, grid: bool = False) -> dict[str, Any]:
+def _scope(
+    endpoint: str, *, grid: bool = False, group_role: str = "invocation",
+) -> dict[str, Any]:
     """@spec HTTP-INVOCATION-EXECUTION-4/5/15/21: real adopted scope, no legacy projections."""
     account = GRID_WORKSPACE if grid else ACCOUNT
     kind, key = ("slack_enterprise", GRID_ORG) if grid else ("slack_workspace", ACCOUNT)
@@ -267,6 +275,7 @@ def _scope(endpoint: str, *, grid: bool = False) -> dict[str, Any]:
                     tenant,
                     agent,
                     operation="migrate_role",
+                    target=group_role,
                     filter={
                         "entries": [
                             {"kind": "issuer_group", "group": {"issuer": ISSUER, "id": GROUP}}
@@ -678,6 +687,142 @@ def test_grid_workspace_member_queues_one_organisation_context_and_outsiders_ref
             assert observed["scope"]["sender"]["namespace"] == organisation
             assert observed["scope"]["sender"]["native_id"] == SENDER
             assert QueuedTurn.model_validate_json(entry[1]["payload"]).author == SENDER
+    finally:
+        keys = _keys(valkey, scope["binding"])
+        if keys:
+            valkey.delete(*keys)
+
+
+@pytest.mark.parametrize("callers_group", [False, True], ids=["open", "group"])
+def test_unavailable_directory_only_blocks_group_restricted_invocation(
+    clean_db: None,
+    valkey: redis.Redis,
+    runs_stream: str,
+    synthetic_provider: SimpleNamespace,
+    callers_group: bool,
+) -> None:
+    provider = synthetic_provider
+    scope = _scope(provider.url, group_role="invocation" if callers_group else "approver")
+    provider.unavailable = True
+    try:
+        with TestClient(create_app(
+            http_identity_runtime=_runtime(_runtime_api(), scope),
+            http_identity_client=HttpIdentityClient(tls_context=provider.tls),
+        )) as client:
+            token = _credential(client, scope)
+            body, proof = _submission(scope)
+            result = _post(client, token, body, proof)
+            if callers_group:
+                assert result.status_code == 503, result.text
+                assert result.json() == {"detail": "identity_authority_unavailable"}
+                assert valkey.xlen(runs_stream) == 0
+                assert _keys(valkey, scope["binding"]) == set()
+                assert provider.requests
+            else:
+                assert result.status_code == 200, result.text
+                entries = valkey.xrange(runs_stream)
+                assert len(entries) == 1
+                queued = QueuedTurn.model_validate_json(entries[0][1]["payload"])
+                assert queued.author == SENDER
+                assert queued.author_principal is None
+                assert provider.requests == []
+                from apps.api.tests import test_http_turn_authority as authority
+
+                fields = entries[0][1]
+                ring = codec.build_identity_keyring(
+                    "context", (("synthetic-context", 1, scope["context_key"]),),
+                )
+                context = codec.open_invocation_context(fields["curie_identity_context_v1"], ring)
+                assert isinstance(context, codec.InvocationContextV1)
+                assert context.canonical is None and context.principal is None
+                invocation = SimpleNamespace(
+                    client=client, scope=scope,
+                    capsule=fields["curie_identity_context_v1"], context=context,
+                    payload=fields["payload"],
+                )
+                check = authority.request_for(invocation)
+                authority.assert_response(
+                    authority.post_check(client, check), check,
+                    decision="continue", reason="current_authority",
+                )
+                from apps.api.tests import test_http_approval_creation as creation
+
+                invocation.request = creation.request_for(invocation)
+                pending = creation.accepted(creation.post(invocation), invocation.request)
+                assert pending["status"] == "pending"
+                assert provider.requests == []
+
+                async def restrict(factory: async_sessionmaker[AsyncSession]) -> None:
+                    async with factory() as session, session.begin():
+                        await agent_role_policy.apply_role_change(session, change=change(
+                            uuid.UUID(scope["tenant"]), uuid.UUID(scope["agent"]),
+                            version=scope["role_version"], operation="migrate_role",
+                            filter={"entries": [{
+                                "kind": "issuer_group", "group": {"issuer": ISSUER, "id": GROUP},
+                            }]},
+                        ))
+
+                run(restrict)
+                authority.assert_response(
+                    authority.post_check(client, check), check,
+                    decision="unavailable", reason="authority_unavailable",
+                )
+                assert provider.requests
+    finally:
+        keys = _keys(valkey, scope["binding"])
+        if keys:
+            valkey.delete(*keys)
+
+
+@pytest.mark.parametrize("restriction", ["native", "empty_filter", "requester", "separation"])
+def test_open_invocation_keeps_other_authorization_requirements(
+    clean_db: None, valkey: redis.Redis, runs_stream: str,
+    synthetic_provider: SimpleNamespace, restriction: str,
+) -> None:
+    provider = synthetic_provider
+    scope = _scope(provider.url)
+
+    async def configure(factory: async_sessionmaker[AsyncSession]) -> None:
+        async with factory() as session, session.begin():
+            await agent_role_policy.apply_role_change(session, change=change(
+                uuid.UUID(scope["tenant"]), uuid.UUID(scope["agent"]),
+                version=scope["role_version"],
+                filter={"entries": []} if restriction == "empty_filter" else None,
+            ))
+            agent = await session.get(Agent, uuid.UUID(scope["agent"]))
+            assert agent is not None
+            if restriction == "requester":
+                agent.connector_requester_identity = True
+            elif restriction == "separation":
+                agent.approval_routes = {"sensitive_tool": {
+                    "resolution": {"kind": "slack", "address": "C0EXAMPLE"},
+                    "approvers": {"users": [SENDER]},
+                    "separation": {"exclude_requester": True},
+                }}
+            elif restriction == "native":
+                binding = await session.get(AgentChannel, uuid.UUID(scope["binding"]))
+                assert binding is not None
+                binding.allowed_callers = ["U0EXAMPLEOTHER"]
+
+    run(configure)
+    provider.unavailable = True
+    try:
+        with TestClient(create_app(
+            http_identity_runtime=_runtime(_runtime_api(), scope),
+            http_identity_client=HttpIdentityClient(tls_context=provider.tls),
+        )) as client:
+            token = _credential(client, scope)
+            result = _post(client, token, *_submission(scope))
+            if restriction == "native":
+                assert result.status_code == 403, result.text
+                assert result.json() == {"detail": "caller_not_allowed"}
+                assert provider.requests == []
+            else:
+                assert result.status_code == 503, result.text
+                assert result.json() == {"detail": "identity_authority_unavailable"}
+                assert provider.requests
+            assert valkey.xlen(runs_stream) == 0
+            assert _keys(valkey, scope["binding"]) == set()
     finally:
         keys = _keys(valkey, scope["binding"])
         if keys:

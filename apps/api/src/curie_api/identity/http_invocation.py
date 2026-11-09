@@ -9,7 +9,7 @@ import uuid
 from collections.abc import AsyncIterator, Mapping
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from types import MappingProxyType
 from typing import Annotated, Any, Literal, Never, Protocol, Self, SupportsIndex
 
@@ -564,6 +564,7 @@ class SourceCapture:
     policy: AgentRolePolicyV1 | None
     policy_version: int | None
     retained_group: tuple[str, str] | None
+    identity_independent: bool
 
 
 @dataclass(frozen=True)
@@ -829,12 +830,18 @@ async def capture_source(
         "invocation_team": str(team_id),
         "approver_team": None if policy_row is None else str(policy_row.approver_team_id),
         "sql_null": sql_null, "team": team_state,
+        "requester_identity": agent.connector_requester_identity,
+        "approval_routes": agent.approval_routes,
         "registration": registration.model_dump(mode="json"),
     }, sort_keys=True, separators=(",", ":"))
     return SourceCapture(
         principal_authority.AuthorityCapture(config, idp.lifecycle_generation), agent.id,
         fingerprint, source.sender, policy,
         None if policy_row is None else policy_row.version, group,
+        role == "invocation" and group is None
+        and (role_config is None or role_config.filter is None)
+        and agent.connector_requester_identity is False
+        and not approval_selection.routes_require_http(agent.approval_routes),
     ), binding
 
 
@@ -873,13 +880,20 @@ def source_facts(
 
 
 def source_permission(
-    capture: SourceCapture, binding: AgentChannel, facts: ValidatedFacts, independent_human: bool,
+    capture: SourceCapture, binding: AgentChannel, facts: ValidatedFacts | None,
+    independent_human: bool,
     original: codec.InvocationContextV1 | OriginalAssociation | None = None,
     *, role_name: Role = "invocation",
 ) -> None:
     """@spec HTTP-INVOCATION-EXECUTION-5/15 HTTP-APPROVAL-CONTINUITY-8."""
     if not admission.admit(binding, [capture.sender.native_id]).allowed:
         _deny()
+    if facts is None:
+        if role_name != "invocation" or not capture.identity_independent:
+            _unavailable()
+        if capture.policy_version is None:
+            _unavailable()
+        return
     role = None if capture.policy is None else getattr(capture.policy.roles, role_name)
     raw = role is not None and role.legacy_state == "migrated" and role.filter is not None and any(
         isinstance(entry, SurfaceAccountSelectorV1)
@@ -931,13 +945,13 @@ class CurrentHttpInvocation:
     _runtime: HttpInvocationRuntime = field(repr=False)
     _registration: AnyReceiverRegistration = field(repr=False)
     _capture: SourceCapture = field(repr=False)
-    _facts: ValidatedFacts = field(repr=False)
+    _facts: ValidatedFacts | None = field(repr=False)
     _application: principal_authority.PrincipalApplication = field(repr=False)
     _stable: str = field(repr=False)
     _validity: DeliveryValidityWindow = field(repr=False)
     _response_bytes: bytes = field(repr=False)
-    _lookup: LookupRequestV1 = field(repr=False)
-    _credential: ResolvedProviderCredential = field(repr=False)
+    _lookup: LookupRequestV1 | None = field(repr=False)
+    _credential: ResolvedProviderCredential | None = field(repr=False)
     _source: AuthenticatedSource = field(repr=False)
     _client: HttpIdentityClient = field(repr=False)
     _original: codec.InvocationContextV1 | None = field(repr=False)
@@ -951,7 +965,7 @@ class CurrentHttpInvocation:
         """
         if not self._open or not self.session.in_transaction():
             _unavailable()
-        return resolved_identity(self._facts)
+        return None if self._facts is None else resolved_identity(self._facts)
 
     def require_original_requester(self) -> None:
         """The original requester, freshly resolved, active and unchanged, or a refusal.
@@ -959,6 +973,8 @@ class CurrentHttpInvocation:
         Valid only while the boundary is open. @spec REQUEST-APPROVAL-4.
         """
         if not self._open or not self.session.in_transaction():
+            _unavailable()
+        if self._facts is None:
             _unavailable()
         original_requester_current(
             self._facts, self._application.principal_id is not None, self._original,
@@ -984,7 +1000,7 @@ class CurrentHttpInvocation:
         config = self._capture.authority.configuration
         selection = config.selection
         assert isinstance(selection, HttpSelectionV1)
-        identity = self._facts.identity
+        identity = None if self._facts is None else self._facts.identity
         sender = self._capture.sender
         principal = self.principal_ref
         policy_version = self._capture.policy_version
@@ -1137,23 +1153,33 @@ async def current_source_authority(
                 async with factory() as session, session.begin():
                     await identity_fence.lock_identity_reader(session)
                     captured, _ = await capture_source(session, registration, source)
-                    credential = runtime._providers.resolve(captured.authority.configuration)
-                    if not isinstance(credential, ResolvedProviderCredential):
-                        _unavailable()
-                lookup = lookup_request(registration, captured, credential, purpose="invocation")
-                observation = await client.lookup(
-                    target=credential.target, bearer=credential.bearer, request=lookup,
-                    limits=credential.limits, deadline=deadline,
-                )
-                if not isinstance(observation, HttpIdentityObservation):
-                    # Continue before _unavailable(); that helper's HTTPException is re-raised.
-                    if (
-                        isinstance(observation, FactsRefusal)
-                        and observation.code == "unavailable"
-                        and loop.time() < deadline
+                    credential: ResolvedProviderCredential | None = None
+                    if not captured.identity_independent or (
+                        original is not None and original.canonical is not None
                     ):
-                        continue
-                    _unavailable()
+                        resolved = runtime._providers.resolve(captured.authority.configuration)
+                        if not isinstance(resolved, ResolvedProviderCredential):
+                            _unavailable()
+                        credential = resolved
+                lookup = None
+                observation: HttpIdentityObservation | None = None
+                if credential is not None:
+                    lookup = lookup_request(
+                        registration, captured, credential, purpose="invocation",
+                    )
+                    observed = await client.lookup(
+                        target=credential.target, bearer=credential.bearer, request=lookup,
+                        limits=credential.limits, deadline=deadline,
+                    )
+                    if not isinstance(observed, HttpIdentityObservation):
+                        if (
+                            isinstance(observed, FactsRefusal)
+                            and observed.code == "unavailable"
+                            and loop.time() < deadline
+                        ):
+                            continue
+                        _unavailable()
+                    observation = observed
                 async with identity_fence.mutation(factory, valkey) as writer:
                     async with writer.begin():
                         current, _ = await capture_source(
@@ -1161,11 +1187,17 @@ async def current_source_authority(
                         )
                         if current != captured:
                             raise _StaleCapture
-                        source_facts(observation.response_bytes, lookup, credential)
-                        application = await principal_authority.apply_http_principal(
-                            writer, capture=captured.authority, request=lookup,
-                            response_bytes=observation.response_bytes,
-                        )
+                        if observation is None:
+                            application = principal_authority.PrincipalApplication(
+                                "unresolved", None, None, current.authority.lifecycle_generation,
+                            )
+                        else:
+                            assert lookup is not None and credential is not None
+                            source_facts(observation.response_bytes, lookup, credential)
+                            application = await principal_authority.apply_http_principal(
+                                writer, capture=captured.authority, request=lookup,
+                                response_bytes=observation.response_bytes,
+                            )
                         await writer.commit()
                 # Leaving the writer successfully acknowledges stable settlement as well as
                 # COMMIT.
@@ -1192,9 +1224,13 @@ async def current_source_authority(
                         or generation != application.lifecycle_generation
                     ):
                         raise _StaleCapture
-                    facts = source_facts(observation.response_bytes, lookup, credential)
+                    facts = None
+                    if observation is not None:
+                        assert lookup is not None and credential is not None
+                        facts = source_facts(observation.response_bytes, lookup, credential)
                     if application.principal_id is not None:
                         principal = await session.get(Principal, application.principal_id)
+                        assert facts is not None
                         identity = facts.identity
                         if (
                             principal is None
@@ -1217,7 +1253,16 @@ async def current_source_authority(
                     if type(stable) is not str or not stable.startswith("stable:"):
                         _unavailable()
                     uuid.UUID(stable.removeprefix("stable:"))
-                    validity = identity_delivery_window(facts, credential.limits)
+                    if facts is None:
+                        now = datetime.now(UTC)
+                        expiry = now + timedelta(seconds=max(0, deadline - loop.time()))
+                        validity = DeliveryValidityWindow(
+                            int(now.timestamp()), now.microsecond,
+                            int(expiry.timestamp()), expiry.microsecond,
+                        )
+                    else:
+                        assert credential is not None
+                        validity = identity_delivery_window(facts, credential.limits)
                     principal_ref = None
                     if application.principal_id is not None:
                         assert application.authorization_version is not None
@@ -1230,7 +1275,8 @@ async def current_source_authority(
                     live = CurrentHttpInvocation(
                         binding, session, intent_digest, principal_ref, runtime, registration,
                         current, facts, application, stable, validity,
-                        observation.response_bytes, lookup, credential, source, client,
+                        b"" if observation is None else observation.response_bytes,
+                        lookup, credential, source, client,
                         original, _sealable=original is None,
                     )
             except _StaleCapture:
@@ -1557,6 +1603,16 @@ async def revalidate_http_approval_caller(
         writer, caller._registration, caller._source, writer_agent=caller._capture.agent_id,
     )
     if current != caller._capture:
+        _unavailable()
+    if caller._facts is None:
+        source_permission(
+            current, binding, None,
+            independent_human(caller._registration, current.sender.native_id), caller._original,
+        )
+        if original_requester:
+            _unavailable()
+        return
+    if caller._lookup is None or caller._credential is None:
         _unavailable()
     facts = source_facts(caller._response_bytes, caller._lookup, caller._credential)
     if caller._application.principal_id is not None:
