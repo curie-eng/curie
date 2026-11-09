@@ -86,6 +86,19 @@ def _principal_identity(token: str) -> tuple[str, tuple[str, ...]] | None:
     return None
 
 
+def _principal_can_follow(current: str, candidate: str, channel_token: str) -> bool:
+    old, new = _principal_identity(current), _principal_identity(candidate)
+    channel = _channel_identity(channel_token)
+    return (
+        old is not None
+        and new is not None
+        and channel is not None
+        and new[0] == old[0]
+        and set(new[1]) <= set(old[1])
+        and channel[0] in new[1]
+    )
+
+
 class CredentialRotation:
     def __init__(self, config: MailAdapterConfig, *, provider: str, inbox: str) -> None:
         self.config = config
@@ -122,7 +135,7 @@ class CredentialRotation:
                     raise ValueError("unsafe credential file")
             finally:
                 os.close(fd)
-            self._db = sqlite3.connect(path, check_same_thread=False)
+            self._db = sqlite3.connect(path, timeout=0.25, check_same_thread=False)
             self._db.execute("PRAGMA journal_mode=DELETE")
             self._db.execute("PRAGMA synchronous=FULL")
             self._db.execute(
@@ -159,7 +172,7 @@ class CredentialRotation:
             old_channel is None
             or old_principal is None
             or new_channel[0] != old_channel[0]
-            or new_principal != old_principal
+            or not _principal_can_follow(self.adapter_principal, principal, channel)
         ):
             raise ValueError("credential snapshot identity mismatch")
         now = time.time()
@@ -177,6 +190,14 @@ class CredentialRotation:
             )
         self._dirty = False
         self._failures["storage"] = 0
+
+    def _persist_pending(self, now: float) -> None:
+        if now < self._retry_at["storage"]:
+            return
+        try:
+            self._persist()
+        except sqlite3.Error:
+            self._failed("storage", now, expiry(self.channel_token, "chn"))
 
     def _failed(self, kind: str, now: float, exp: int | None, *, status: int = 0) -> None:
         self._failures[kind] += 1
@@ -200,20 +221,17 @@ class CredentialRotation:
         with self.lock:
             at = time.time() if now is None else now
             if self._dirty:
-                if at < self._retry_at["storage"]:
-                    return
-                try:
-                    self._persist()
-                except sqlite3.Error:
-                    self._failed("storage", at, expiry(self.channel_token, "chn"))
-                    return
+                self._persist_pending(at)
             for kind, ttl in (
                 ("adp", self.config.principal_ttl_seconds),
                 ("chn", self.config.channel_token_ttl_seconds),
             ):
+                if kind == "chn" and self._dirty:
+                    continue
                 current = self.adapter_principal if kind == "adp" else self.channel_token
                 exp = expiry(current, kind)
-                due = exp is not None and at >= exp - min(300, ttl / 2)
+                lead = ttl / 2 if kind == "adp" else min(300, ttl / 2)
+                due = exp is not None and at >= exp - lead
                 if kind == "chn" and self._channel_rejected:
                     due = True
                 if not due or at < self._retry_at[kind]:
@@ -237,7 +255,7 @@ class CredentialRotation:
                         body,
                         {ADAPTER_HEADER: self.adapter_principal},
                         max_response_bytes=MAX_TOKEN_BYTES + 4096,
-                        timeout_seconds=10.0,
+                        timeout_seconds=5.0,
                     )
                 except (OSError, ValueError, http.client.HTTPException):
                     self._failed(kind, at, exp)
@@ -258,11 +276,7 @@ class CredentialRotation:
                 self._failures[kind] = 0
                 self._retry_at[kind] = 0.0
                 self._dirty = True
-                try:
-                    self._persist()
-                except sqlite3.Error:
-                    self._failed("storage", at, expiry(candidate, kind))
-                    return
+                self._persist_pending(at)
                 logger.info(
                     "credential renewed kind=%s expires_in_seconds=%.0f",
                     kind,
@@ -273,7 +287,7 @@ class CredentialRotation:
         if (expiry(candidate, kind) or 0) <= now:
             return False
         if kind == "adp":
-            return _principal_identity(candidate) == _principal_identity(current) and (
+            return _principal_can_follow(current, candidate, self.channel_token) and (
                 expiry(candidate, kind) or 0
             ) > (expiry(current, kind) or 0)
         old, new = _channel_identity(current), _channel_identity(candidate)

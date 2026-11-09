@@ -372,8 +372,10 @@ has more than one route. No platform key is given to the adapter. The default is
 `false`, which preserves manual renewal and creates no credential snapshot.
 
 The renewal loop starts independently of provider discovery and continues while
-ingress is disabled or the provider is unavailable. Each credential is renewed
-when half its requested lifetime remains, up to five minutes before expiry.
+ingress is disabled or the provider is unavailable. The principal renews when
+half its requested lifetime remains, leaving twelve hours for retries with the
+default 24-hour lifetime. The channel token renews when half its requested
+lifetime remains, up to five minutes before expiry.
 `POST /approvals/principals/adapter/rotate` presents the current principal alone;
 `POST /channels/token` presents that principal with `channels:token` scope.
 Successful responses replace credentials in memory. A channel mint immediately
@@ -382,11 +384,13 @@ before minting and holds new ingress requests until the new token is installed.
 Approval requests can finish using the predecessor principal until it expires.
 This serialization can delay ingress during renewal, without a restart. A turn's
 retry backoff does not delay credential renewal.
+The principal may lose deleted bindings when it rotates, provided its subject
+is unchanged, no binding is added, and it still serves the channel's binding.
 
 Renewal failures log an ERROR with credential kind, HTTP status, time to expiry
 and retry delay, never the credential or response body. Backoff starts at one
 second, doubles to sixty seconds, and is bounded by a quarter of the remaining
-lifetime. Renewal HTTP calls time out after ten seconds. An expired principal
+lifetime. Renewal HTTP calls time out after five seconds. An expired principal
 cannot rotate itself; administrative recovery is required. `/readyz` returns 503
 when the channel token expires and, with self-rotation enabled, when the principal
 expires. `/healthz` stays 200. `/statusz` adds `self_rotation` with enabled state,
@@ -400,6 +404,8 @@ the delivery journal never stores credentials. On restart a valid snapshot for
 the same API, provider, inbox, binding and principal identity takes precedence:
 channel generation chooses the newer channel token, and expiry chooses the newer
 principal. An expired snapshot falls back to the supplied bootstrap credential.
+The restored principal may have fewer bindings than the bootstrap principal,
+under the same subject and channel-binding checks used during renewal.
 The adapter decodes claims for scheduling and identity matching only; the API
 verifies their signature and current generation. An unreadable, malformed,
 identity-mismatched or permissively readable snapshot refuses startup.
@@ -409,11 +415,13 @@ mounts, backups and snapshots as strictly as the original Secret. Anyone who can
 read it can act as this adapter; anyone who can write it is trusted to replace its
 credentials. Owner-only file permissions do not protect against a volume
 administrator. Keep one process per journal, including on a network filesystem.
-After a successful mint, a disk failure keeps the new token in memory because
-its predecessor is already revoked, reports `persistence_pending`, and retries
-storage before another mint. A crash before durable commit can require
-administrative renewal. Do not restore an older volume snapshot and assume its
-channel token is still current.
+After a successful channel mint, a disk failure keeps the new token in memory
+because its predecessor is already revoked and reports `persistence_pending`.
+Storage retries use a quarter-second SQLite busy timeout. Further channel mints
+wait for a durable snapshot, while principal renewal continues because it
+revokes no predecessor. A crash before durable commit can require administrative
+renewal if no persisted principal is still valid. Do not restore an older volume
+snapshot and assume its channel token is still current.
 
 The external Secret is a bootstrap input and is not patched. Updating an external
 secret store is optional and outside this feature. To recover administratively,

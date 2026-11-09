@@ -22,6 +22,7 @@ from curie_api import adapter_principal, channel_token
 from curie_channel_gateway.mail.adapter import MailAdapter
 
 BINDING = "00000000-0000-4000-8000-000000000001"
+OTHER_BINDING = "00000000-0000-4000-8000-000000000002"
 KEY = "rotation-test-signing-key"
 SUBJECT = "acme-mail-adapter"
 HEADER = "X-Curie-Adapter-Principal"
@@ -41,10 +42,15 @@ class RotationAPI:
         self.release.set()
         self.principal = self.adp(self.now + 60)
         self.channel = self.chn(self.now + 60)
+        self.successor_bindings = [BINDING]
+        self.principal_response: str | None = None
+        self.channel_response: str | None = None
         self.url = ""
 
-    def adp(self, exp: int, *, subject: str = SUBJECT) -> str:
-        return adapter_principal.mint(KEY, subject=subject, bindings=[BINDING], exp=exp)
+    def adp(self, exp: int, *, subject: str = SUBJECT, bindings: list[str] | None = None) -> str:
+        return adapter_principal.mint(
+            KEY, subject=subject, bindings=bindings if bindings is not None else [BINDING], exp=exp
+        )
 
     def chn(self, exp: int) -> str:
         return channel_token.mint(
@@ -97,12 +103,14 @@ def rotation_api() -> Iterator[RotationAPI]:
                 if claims is None:
                     code = 401
                 elif self.path == "/approvals/principals/adapter/rotate":
-                    api.principal = api.adp(api.now + data["ttl_s"])
+                    api.principal = api.principal_response or api.adp(
+                        api.now + data["ttl_s"], bindings=api.successor_bindings
+                    )
                     code, body = 201, {"token": api.principal}
                 elif self.path == "/channels/token":
                     assert data["kind"] == "email"
                     api.generation += 1
-                    api.channel = api.chn(api.now + data["ttl_s"])
+                    api.channel = api.channel_response or api.chn(api.now + data["ttl_s"])
                     body = {"token": api.channel}
                 else:
                     code = 404
@@ -132,15 +140,16 @@ def rotating(
     api: RotationAPI,
     **kwargs: Any,
 ) -> MailAdapter:
-    return make_adapter(
+    settings: dict[str, Any] = dict(
         channel_token=api.channel,
         adapter_principal=api.principal,
         api_base_url=api.url,
         self_rotate=True,
         channel_token_ttl_seconds=60,
         principal_ttl_seconds=60,
-        **kwargs,
     )
+    settings.update(kwargs)
+    return make_adapter(**settings)
 
 
 def test_rotation_is_opt_in(make_adapter: Callable[..., MailAdapter], tmp_path: Path) -> None:
@@ -499,4 +508,193 @@ def test_ingress_backoff_does_not_block_credential_renewal(
                 adapter.shutdown.set()
             assert pending.result(timeout=5) == "retry"
     finally:
+        adapter.close()
+
+
+def test_narrowed_principal_rotates_and_restores_while_serving_the_channel(
+    make_adapter: Callable[..., MailAdapter], rotation_api: RotationAPI
+) -> None:
+    api = rotation_api
+    api.principal = api.adp(api.now + 60, bindings=[BINDING, OTHER_BINDING])
+    initial_principal, initial_channel = api.principal, api.channel
+    adapter = rotating(make_adapter, api)
+    path = adapter.config.state_path
+    try:
+        api.now += 30
+        adapter.credentials.renew_once(now=api.now)
+        narrowed = adapter.credentials.adapter_principal
+        verified = adapter_principal.verify(narrowed, KEY, scope="channels:token", now=api.now)
+        assert verified is not None and {str(value) for value in verified.bindings} == {BINDING}
+        assert adapter.post_turn({"delivery_id": "after-narrowing"}) == "accepted"
+    finally:
+        adapter.close()
+    restored = rotating(
+        make_adapter,
+        api,
+        channel_token=initial_channel,
+        adapter_principal=initial_principal,
+        state_path=path,
+    )
+    try:
+        assert restored.credentials.adapter_principal == narrowed
+        assert restored.post_turn({"delivery_id": "after-narrowed-restart"}) == "accepted"
+        api.now += 30
+        restored.credentials.renew_once(now=api.now)
+        assert restored.credentials.adapter_principal == api.principal != narrowed
+    finally:
+        restored.close()
+
+
+def test_day_long_principal_renews_at_half_life(
+    make_adapter: Callable[..., MailAdapter], rotation_api: RotationAPI
+) -> None:
+    api = rotation_api
+    api.principal = api.adp(api.now + 86400)
+    api.channel = api.chn(api.now + 604800)
+    adapter = rotating(make_adapter, api, principal_ttl_seconds=86400)
+    initial = api.principal
+    try:
+        adapter.credentials.renew_once(now=api.now + 43199)
+        assert api.calls == []
+        api.now += 43200
+        adapter.credentials.renew_once(now=api.now)
+        assert api.calls == ["/approvals/principals/adapter/rotate"]
+        assert adapter.credentials.adapter_principal == api.principal != initial
+    finally:
+        adapter.close()
+
+
+@pytest.mark.parametrize("damage", ["subject", "wider", "unserved"])
+def test_invalid_principal_successor_is_refused(
+    make_adapter: Callable[..., MailAdapter],
+    rotation_api: RotationAPI,
+    damage: str,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    api = rotation_api
+    api.channel = api.chn(api.now + 600)
+    bindings = [BINDING, OTHER_BINDING] if damage == "wider" else [BINDING]
+    if damage == "unserved":
+        api.principal = api.adp(api.now + 60, bindings=[BINDING, OTHER_BINDING])
+        bindings = [OTHER_BINDING]
+    api.principal_response = api.adp(
+        api.now + 90,
+        subject="other-adapter" if damage == "subject" else SUBJECT,
+        bindings=bindings,
+    )
+    adapter = rotating(make_adapter, api)
+    original = adapter.credentials.adapter_principal
+    try:
+        api.now += 30
+        with caplog.at_level(logging.ERROR):
+            adapter.credentials.renew_once(now=api.now)
+        assert adapter.credentials.adapter_principal == original
+        with sqlite3.connect(adapter.config.state_path + ".credentials.sqlite3") as db:
+            assert db.execute("SELECT principal FROM credentials").fetchone()[0] == original
+        assert "kind=adp" in caplog.text
+        assert original not in caplog.text and api.principal_response not in caplog.text
+    finally:
+        adapter.close()
+
+
+@pytest.mark.parametrize("damage", ["lower-generation", "same-generation", "binding"])
+def test_invalid_channel_successor_is_refused(
+    make_adapter: Callable[..., MailAdapter],
+    rotation_api: RotationAPI,
+    damage: str,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    api = rotation_api
+    api.generation = 2
+    api.channel = api.chn(api.now + 60)
+    api.principal = api.adp(api.now + 600)
+    api.channel_response = channel_token.mint(
+        KEY,
+        channel_id=OTHER_BINDING if damage == "binding" else BINDING,
+        generation={"lower-generation": 1, "same-generation": 2, "binding": 3}[damage],
+        scope=channel_token.CHANNEL_ENQUEUE_SCOPE,
+        exp=api.now + 90,
+    )
+    adapter = rotating(make_adapter, api)
+    original = adapter.credentials.channel_token
+    try:
+        api.now += 30
+        with caplog.at_level(logging.ERROR):
+            adapter.credentials.renew_once(now=api.now)
+        assert adapter.credentials.channel_token == original
+        with sqlite3.connect(adapter.config.state_path + ".credentials.sqlite3") as db:
+            assert db.execute("SELECT channel FROM credentials").fetchone()[0] == original
+        assert "kind=chn" in caplog.text
+        assert original not in caplog.text and api.channel_response not in caplog.text
+    finally:
+        adapter.close()
+
+
+def test_symlinked_snapshot_refuses_boot_without_touching_target(
+    make_adapter: Callable[..., MailAdapter], rotation_api: RotationAPI
+) -> None:
+    api = rotation_api
+    adapter = rotating(make_adapter, api)
+    path = Path(adapter.config.state_path + ".credentials.sqlite3")
+    adapter.close()
+    target = path.with_name("outside.sqlite3")
+    path.replace(target)
+    original = target.read_bytes()
+    path.symlink_to(target.name)
+    with pytest.raises(RuntimeError, match="credential storage"):
+        rotating(make_adapter, api)
+    assert path.is_symlink()
+    assert target.read_bytes() == original
+
+
+@pytest.mark.parametrize("damage", ["wider", "unserved"])
+def test_snapshot_cannot_widen_principal_or_drop_the_channel_binding(
+    make_adapter: Callable[..., MailAdapter], rotation_api: RotationAPI, damage: str
+) -> None:
+    api = rotation_api
+    if damage == "unserved":
+        api.principal = api.adp(api.now + 60, bindings=[BINDING, OTHER_BINDING])
+    adapter = rotating(make_adapter, api)
+    path = adapter.config.state_path + ".credentials.sqlite3"
+    adapter.close()
+    bindings = [BINDING, OTHER_BINDING] if damage == "wider" else [OTHER_BINDING]
+    with sqlite3.connect(path) as db:
+        db.execute(
+            "UPDATE credentials SET principal=?", (api.adp(api.now + 90, bindings=bindings),)
+        )
+    with pytest.raises(RuntimeError, match="credential storage"):
+        rotating(make_adapter, api)
+
+
+def test_storage_failure_does_not_prevent_principal_renewal(
+    make_adapter: Callable[..., MailAdapter], rotation_api: RotationAPI
+) -> None:
+    api = rotation_api
+    adapter = rotating(make_adapter, api)
+    initial_channel, initial_principal = api.channel, api.principal
+    path = adapter.config.state_path + ".credentials.sqlite3"
+    blocker = sqlite3.connect(path)
+    try:
+        blocker.execute("BEGIN EXCLUSIVE")
+        api.now += 30
+        adapter.credentials.renew_once(now=api.now)
+        first = adapter.credentials.adapter_principal
+        assert first != initial_principal
+        assert adapter.credentials.channel_token == initial_channel
+        assert adapter.credentials.status()["persistence_pending"] is True
+        api.now += 30
+        adapter.credentials.renew_once(now=api.now)
+        assert adapter.credentials.adapter_principal == api.principal != first
+        assert api.calls.count("/approvals/principals/adapter/rotate") == 2
+        assert "/channels/token" not in api.calls
+        blocker.rollback()
+        adapter.credentials.renew_once(now=api.now + 1)
+        assert adapter.credentials.status()["persistence_pending"] is True
+        adapter.credentials.renew_once(now=api.now + 2)
+        assert adapter.credentials.status()["persistence_pending"] is False
+        assert adapter.credentials.channel_token == api.channel != initial_channel
+        with sqlite3.connect(path) as db:
+            assert db.execute("SELECT principal FROM credentials").fetchone()[0] == api.principal
+    finally:
+        blocker.close()
         adapter.close()
