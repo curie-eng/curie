@@ -9,7 +9,7 @@ import uuid
 from collections.abc import AsyncIterator, Mapping
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime
 from types import MappingProxyType
 from typing import Annotated, Any, Literal, Never, Protocol, Self, SupportsIndex
 
@@ -817,6 +817,12 @@ async def capture_source(
         group = (idp.issuer, team.external_id)
         team_state = (str(team.id), team.managed_by, team.external_id, team.epoch, team.digest,
                       team.last_synced_at.isoformat())
+    identity_independent = (
+        role == "invocation" and group is None
+        and (role_config is None or role_config.filter is None)
+        and agent.connector_requester_identity is False
+        and not approval_selection.routes_require_http(agent.approval_routes)
+    )
     fingerprint = json.dumps({
         "role": role,
         "configuration": config.model_dump(mode="json"),
@@ -830,18 +836,13 @@ async def capture_source(
         "invocation_team": str(team_id),
         "approver_team": None if policy_row is None else str(policy_row.approver_team_id),
         "sql_null": sql_null, "team": team_state,
-        "requester_identity": agent.connector_requester_identity,
-        "approval_routes": agent.approval_routes,
+        "identity_independent": identity_independent,
         "registration": registration.model_dump(mode="json"),
     }, sort_keys=True, separators=(",", ":"))
     return SourceCapture(
         principal_authority.AuthorityCapture(config, idp.lifecycle_generation), agent.id,
         fingerprint, source.sender, policy,
-        None if policy_row is None else policy_row.version, group,
-        role == "invocation" and group is None
-        and (role_config is None or role_config.filter is None)
-        and agent.connector_requester_identity is False
-        and not approval_selection.routes_require_http(agent.approval_routes),
+        None if policy_row is None else policy_row.version, group, identity_independent,
     ), binding
 
 
@@ -1257,11 +1258,11 @@ async def current_source_authority(
                         _unavailable()
                     uuid.UUID(stable.removeprefix("stable:"))
                     if facts is None:
-                        now = datetime.now(UTC)
-                        expiry = now + timedelta(seconds=max(0, deadline - loop.time()))
+                        seconds, micros = await valkey.time()
+                        remaining_us = max(0, int((deadline - loop.time()) * 1_000_000))
+                        upper_seconds, upper_micros = divmod(micros + remaining_us, 1_000_000)
                         validity = DeliveryValidityWindow(
-                            int(now.timestamp()), now.microsecond,
-                            int(expiry.timestamp()), expiry.microsecond,
+                            seconds, micros, seconds + upper_seconds, upper_micros,
                         )
                     else:
                         assert credential is not None
