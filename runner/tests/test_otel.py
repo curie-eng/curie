@@ -2,7 +2,7 @@
 
 import os
 import time
-from collections import defaultdict
+from collections import Counter, defaultdict
 from collections.abc import AsyncIterator, Callable, Iterator
 from typing import Any
 
@@ -47,7 +47,7 @@ from opentelemetry.exporter.otlp.proto.http.trace_exporter import (
     OTLPSpanExporter as HttpOTLPSpanExporter,
 )
 from opentelemetry.sdk.resources import Resource
-from opentelemetry.sdk.trace import ReadableSpan, TracerProvider
+from opentelemetry.sdk.trace import ReadableSpan, Span, SpanProcessor, TracerProvider
 from opentelemetry.sdk.trace.export import BatchSpanProcessor, SimpleSpanProcessor
 from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
 from opentelemetry.trace import (
@@ -126,6 +126,7 @@ def _export_turn(
     model: str | None = "configured-model",
     collector_endpoint: str | None = None,
     prompt: str = "go",
+    extra_processor: SpanProcessor | None = None,
 ) -> tuple[list[object], list[ReadableSpan]]:
     exporter = InMemorySpanExporter()
     resource = (
@@ -137,6 +138,8 @@ def _export_turn(
     if collector_endpoint:
         provider.add_span_processor(_SchemaValidatingSpanProcessor())
     provider.add_span_processor(SimpleSpanProcessor(exporter))
+    if extra_processor is not None:
+        provider.add_span_processor(extra_processor)
     if collector_endpoint:
         provider.add_span_processor(
             SimpleSpanProcessor(HttpOTLPSpanExporter(endpoint=collector_endpoint))
@@ -706,6 +709,241 @@ def test_raw_stream_tool_payloads_and_provider_ids_never_reach_otel() -> None:
     material = _span_wire_material(finished) + repr(anyio.run(adapter_output))
 
     for private_value in _PRIVATE_OTEL_VALUES:
+        assert private_value not in material
+
+
+_AGENT_CALL_ID = "agent-tool-call-id-PLACEHOLDER"
+_REVIEWER_MODEL = "reviewer-model-PLACEHOLDER"
+_REVIEWER_TEXT = "reviewer-verdict-text-PLACEHOLDER"
+_REVIEWER_USAGE = {"input_tokens": 20, "output_tokens": 2}
+_IMPLEMENTER_USAGE = {"input_tokens": 3, "output_tokens": 2}
+_UNIQUE_TURN_PROMPT = "unique-turn-prompt-PLACEHOLDER"
+
+
+def _implementer_tool_call(
+    call_id: str,
+    name: str,
+) -> AssistantMessage:
+    return AssistantMessage(
+        content=[
+            TextBlock(text="using tool"),
+            ToolUseBlock(id=call_id, name=name, input={"path": _TOOL_ARGUMENT}),
+        ],
+        model="observed-model",
+        usage=_IMPLEMENTER_USAGE,
+    )
+
+
+def _nested_reviewer_message(parent_call_id: str) -> AssistantMessage:
+    return AssistantMessage(
+        content=[TextBlock(text=_REVIEWER_TEXT)],
+        model=_REVIEWER_MODEL,
+        usage=_REVIEWER_USAGE,
+        parent_tool_use_id=parent_call_id,
+    )
+
+
+def _agent_tool_script(*, with_result: bool) -> list[object]:
+    """One implementer Agent call with a nested reviewer message inside it."""
+
+    script: list[object] = [
+        _implementer_tool_call(_AGENT_CALL_ID, "Agent"),
+        _nested_reviewer_message(_AGENT_CALL_ID),
+    ]
+    if with_result:
+        script.extend(
+            [
+                _tool_result(_AGENT_CALL_ID),
+                AssistantMessage(
+                    content=[TextBlock(text="final answer")],
+                    model="observed-model",
+                ),
+                _result(text="done"),
+            ]
+        )
+    else:
+        # The turn fails while the Agent interval is still open.
+        script.append(_result(is_error=True, terminal_reason="aborted_tools"))
+    return script
+
+
+def _reviewer_generation(spans: list[ReadableSpan]) -> ReadableSpan:
+    """The single exported generation span carrying the reviewer model."""
+
+    matches = [
+        span
+        for span in spans
+        if span.attributes is not None
+        and span.attributes.get("gen_ai.request.model") == _REVIEWER_MODEL
+    ]
+    assert len(matches) == 1
+    return matches[0]
+
+
+class _SpanLifecycleProbe(SpanProcessor):
+    """Count started and ended spans so a span left open fails the test."""
+
+    def __init__(self) -> None:
+        self.started: Counter[str] = Counter()
+        self.ended: Counter[str] = Counter()
+
+    def on_start(self, span: Span, parent_context: Context | None = None) -> None:
+        self.started[span.name] += 1
+
+    def on_end(self, span: ReadableSpan) -> None:
+        self.ended[span.name] += 1
+
+    def shutdown(self) -> None:
+        return None
+
+    def force_flush(self, timeout_millis: int = 30000) -> bool:
+        return True
+
+
+def _interrupted_agent_turn() -> tuple[
+    list[ReadableSpan], _SpanLifecycleProbe, dict[str, list[ReadableSpan]]
+]:
+    """Run the failed Agent script to an operator-interrupted terminal."""
+
+    exporter = InMemorySpanExporter()
+    provider = TracerProvider()
+    probe = _SpanLifecycleProbe()
+    provider.add_span_processor(probe)
+    provider.add_span_processor(SimpleSpanProcessor(exporter))
+    runner = SessionRunner(
+        max_usd_per_day=None,
+        held_secrets=frozenset(),
+        session_factory=_adapter_session_factory(_agent_tool_script(with_result=False)),
+        ceiling=0,
+        tracer=RunTracer(provider),
+        classifier=SideEffectClassifier(),
+        trace_name="curie-run:test",
+        model="configured-model",
+    )
+    events: list[object] = []
+
+    async def go() -> None:
+        await runner.start()
+        turn = runner.run_turn(
+            Event(type="message", text=_UNIQUE_TURN_PROMPT, user="U0EXAMPLE1", ts="1")
+        )
+        events.append(parse_ndjson_line(await anext(turn)))
+        await runner.interrupt("operator stop")
+        async for line in turn:
+            events.append(parse_ndjson_line(line))
+        await runner.close()
+
+    anyio.run(go)
+    finished = list(exporter.get_finished_spans())
+    return finished, probe, _spans_by_name(finished)
+
+
+def test_reviewer_generation_exports_during_agent_tool() -> None:
+    # Completed ending: the reviewer generation is exported inside the Agent
+    # tool interval, as its own span on the run root's trace.
+    probe = _SpanLifecycleProbe()
+    _, finished = _export_turn(
+        _adapter_session_factory(_agent_tool_script(with_result=True)),
+        prompt=_UNIQUE_TURN_PROMPT,
+        extra_processor=probe,
+    )
+    spans = _spans_by_name(finished)
+    root = spans["agent.run"][0]
+    tool = spans["execute_tool"][0]
+    generations = spans["llm.generation"]
+
+    assert len(generations) == 3
+    implementer_first, reviewer, implementer_second = generations
+    assert tool.attributes["gen_ai.tool.name"] == "Agent"
+    assert tool.attributes["curie.tool.call.index"] == 1
+    assert reviewer.context is not None
+    assert reviewer.context.trace_id == root.context.trace_id
+    assert reviewer.parent is not None
+    assert reviewer.parent.span_id == root.context.span_id
+    assert reviewer.attributes["gen_ai.request.model"] == _REVIEWER_MODEL
+    assert reviewer.attributes["model"] == _REVIEWER_MODEL
+    assert reviewer.attributes["gen_ai.usage.input_tokens"] == 20
+    assert reviewer.attributes["gen_ai.usage.output_tokens"] == 2
+    assert "curie.generation.round" not in reviewer.attributes
+    assert implementer_first.attributes["curie.generation.round"] == 1
+    assert implementer_second.attributes["curie.generation.round"] == 2
+    for implementer in (implementer_first, implementer_second):
+        assert implementer.attributes["gen_ai.request.model"] == "configured-model"
+    # The implementer rounds end before the Agent interval starts, the
+    # reviewer generation lives inside it, and no implementer provider wait
+    # reopens until the tool result closes the interval.
+    assert implementer_first.end_time is not None
+    assert implementer_first.end_time <= tool.start_time
+    assert tool.start_time <= reviewer.start_time
+    assert reviewer.end_time is not None
+    assert reviewer.end_time <= tool.end_time
+    assert implementer_second.start_time >= tool.end_time
+    assert tool.attributes["curie.phase.end_kind"] == "tool_result_inferred"
+    assert root.attributes["curie.terminal.cause"] == "completed"
+    assert probe.started == probe.ended
+    assert probe.started["llm.generation"] == 3
+
+    # A normal tool wait with no nested assistant message adds no generation.
+    probe = _SpanLifecycleProbe()
+    _, finished = _export_turn(
+        _adapter_session_factory(
+            [
+                _implementer_tool_call(_TOOL_CALL_ID, "Read"),
+                _tool_result(_TOOL_CALL_ID),
+                AssistantMessage(
+                    content=[TextBlock(text="final answer")],
+                    model="observed-model",
+                ),
+                _result(text="done"),
+            ]
+        ),
+        extra_processor=probe,
+    )
+    generations = _spans_by_name(finished)["llm.generation"]
+    assert [span.attributes["curie.generation.round"] for span in generations] == [1, 2]
+    assert all(
+        span.attributes["gen_ai.request.model"] == "configured-model"
+        for span in generations
+    )
+    assert probe.started == probe.ended
+    assert probe.started["llm.generation"] == 2
+
+    # Failed ending: the reviewer span is closed and no generation stays open.
+    probe = _SpanLifecycleProbe()
+    _, failed_finished = _export_turn(
+        _adapter_session_factory(_agent_tool_script(with_result=False)),
+        prompt=_UNIQUE_TURN_PROMPT,
+        extra_processor=probe,
+    )
+    failed_spans = _spans_by_name(failed_finished)
+    root = failed_spans["agent.run"][0]
+    reviewer = _reviewer_generation(failed_spans["llm.generation"])
+    assert root.attributes["curie.terminal.cause"] == "aborted_tools"
+    assert root.attributes["curie.terminal.status"] == "failed"
+    assert reviewer.attributes["gen_ai.usage.input_tokens"] == 20
+    assert reviewer.attributes["gen_ai.usage.output_tokens"] == 2
+    assert probe.started == probe.ended
+
+    # Interrupted ending: the same script, closed by the operator interrupt.
+    interrupted_finished, probe, interrupted_spans = _interrupted_agent_turn()
+    root = interrupted_spans["agent.run"][0]
+    reviewer = _reviewer_generation(interrupted_spans["llm.generation"])
+    assert root.attributes["curie.terminal.cause"] == "interrupt_requested"
+    assert root.attributes["curie.terminal.status"] == "cancelled"
+    assert reviewer.attributes["gen_ai.usage.input_tokens"] == 20
+    assert reviewer.attributes["gen_ai.usage.output_tokens"] == 2
+    assert probe.started == probe.ended
+
+    # The wire shape carries neither the parent tool id (the Agent call id),
+    # the prompt text, tool bodies, nor the reviewer message text.
+    material = _span_wire_material(finished + failed_finished + interrupted_finished)
+    for private_value in (
+        _AGENT_CALL_ID,
+        _UNIQUE_TURN_PROMPT,
+        _TOOL_ARGUMENT,
+        _TOOL_RESULT,
+        _REVIEWER_TEXT,
+    ):
         assert private_value not in material
 
 

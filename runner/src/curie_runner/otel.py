@@ -537,9 +537,20 @@ class _GenerationSpan:
         self,
         model: str | None,
         usage: Mapping[str, Any] | None,
+        *,
+        nested: bool = False,
     ) -> None:
-        """Accumulate one assistant message's model and token usage."""
+        """Accumulate one assistant message's model and token usage.
 
+        A nested (subagent) message arriving while a tool interval is active
+        is a generation of its own: it is exported and closed immediately as
+        its own ``llm.generation`` span (#5206), never folded into -- or
+        promoted to -- the implementer's active generation.
+        """
+
+        if nested and self._active_tools:
+            self._export_nested_generation(model, usage)
+            return
         if self._active_generation is None:
             return
         self._record_model(model)
@@ -891,6 +902,47 @@ class _GenerationSpan:
                 # ResultMessage fallback (adding the total to zeros cannot
                 # double count).
                 self._turn_usage_observed = True
+
+    def _export_nested_generation(
+        self,
+        model: str | None,
+        usage: Mapping[str, Any] | None,
+    ) -> None:
+        """Export one nested (reviewer) assistant message as its own generation.
+
+        The span opens and closes here, before the surrounding tool interval
+        continues: a nested message never becomes the implementer's active
+        generation, so no provider wait is fabricated for the parent while its
+        Agent tool is still running (#5206). Only allowlisted, redacted keys are
+        attached; the SDK's opaque tool/call ids stay off the wire.
+        """
+
+        span = self._tracer.start_span(
+            "llm.generation",
+            context=self._root_context,
+            record_exception=False,
+            set_status_on_exception=False,
+        )
+        _set(span, SpanAttributeKey.PHASE, "provider_wait")
+        _set(span, SpanAttributeKey.PHASE_START_KIND, "nested_assistant_observed")
+        if isinstance(model, str) and model:
+            _set(span, SpanAttributeKey.REQUEST_MODEL, model)
+            _set(span, SpanAttributeKey.MODEL, model)
+        if usage:
+            for usage_field, attribute_key in _USAGE_ATTRIBUTE_KEYS.items():
+                value = usage.get(usage_field)
+                if type(value) is not int or value < 0:
+                    continue
+                _set(span, attribute_key, value)
+                if value > 0:
+                    # Same anti-double-count rule as ``_record_usage``: this
+                    # generation received per-message usage, so the turn total
+                    # must not also be stamped over it.
+                    self._turn_usage_observed = True
+        _set(span, SpanAttributeKey.PHASE_END_KIND, "nested_assistant_observed")
+        span.set_status(StatusCode.OK)
+        span.end()
+        self._has_activity = True
 
     def _close_deferred_generation(self) -> None:
         end_time_ns = self._deferred_generation_end_ns

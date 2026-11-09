@@ -255,6 +255,15 @@ keys:
   is also a direct child of `agent.run`, never a generation child, so provider and tool
   phases are root siblings rather than a legacy monolithic generation containing
   zero-duration tool markers.
+- **Nested reviewer generations export inside the tool interval (#5206).** A nested
+  `AssistantMessage` (`parent_tool_use_id` set) that arrives while a tool interval is
+  active exports as its own `llm.generation` direct child of `agent.run`: it carries the
+  reviewer model and that message's own token counts, opens and closes inside the
+  surrounding `execute_tool` interval, and never becomes the implementer's active
+  generation. It carries no `curie.generation.round`, no implementer provider wait opens
+  while the tool runs, and its positive counts count as per-message usage for the
+  `curie.usage.scope` fallback rule. Tool call IDs, the `parent_tool_use_id`, and the
+  message text are never exported.
 8. **Generation data belongs to its round.** The configured model, or the first non-empty
   model reported by an `AssistantMessage`, stamps `gen_ai.request.model` and the bare
   `model` once on that generation. The four usage attributes accumulate only the
@@ -269,9 +278,10 @@ keys:
   no such boundary is available: direct compatibility setters may populate model or
   usage attributes, but never claim TTFT without that allowlisted partial boundary.
   Partial bodies, arguments, provider identifiers, and results never enter telemetry.
-- **Boundary confidence is explicit.** Generation start kinds are `query_observed` or
-  `tool_result_inferred`; end kinds are `tool_use_observed`, `result_observed`, or
-  `terminal_inferred`. An `execute_tool` span starts when the adapter observes either a
+- **Boundary confidence is explicit.** Generation start kinds are `query_observed`,
+  `tool_result_inferred`, or `nested_assistant_observed`; end kinds are
+  `tool_use_observed`, `result_observed`, `terminal_inferred`, or
+  `nested_assistant_observed`. An `execute_tool` span starts when the adapter observes either a
   streamed SDK tool-use boundary or an SDK tool-use block, with
   `curie.phase.start_kind=tool_use_inferred`. A streamed boundary still produces this
   payload-free observation when no final `AssistantMessage` tool-use block arrives: tool
