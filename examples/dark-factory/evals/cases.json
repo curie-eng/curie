@@ -12,11 +12,11 @@
     },
     {
       "id": "knows-the-execution-bound",
-      "input": "How many seconds does the platform allow one factory run before it stops the run? Reply with the number only.",
+      "input": "How do you determine how long the platform allows this factory run before stopping it? Reply with the issue-read tool and its two returned timing fields, rather than a fixed number of seconds.",
       "grader": {
-        "kind": "contains",
-        "expected": "10800",
-        "case_sensitive": false
+        "kind": "regex",
+        "expected": "(?s)(?:get_issue.*execution_deadline.*execution_seconds|get_issue.*execution_seconds.*execution_deadline|execution_deadline.*get_issue.*execution_seconds|execution_deadline.*execution_seconds.*get_issue|execution_seconds.*get_issue.*execution_deadline|execution_seconds.*execution_deadline.*get_issue)",
+        "case_sensitive": true
       }
     },
     {
