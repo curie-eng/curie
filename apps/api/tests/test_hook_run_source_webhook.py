@@ -54,4 +54,7 @@ def test_schedule_history_stays_schedule_and_manual() -> None:
     source = (ROOT / "apps/api/src/curie_api/routers/schedules.py").read_text(encoding="utf-8")
     assert 'latest.get((name, "schedule"))' in source
     assert 'latest.get((name, "manual"))' in source
-    assert "webhook" not in source
+    # The pause resolver names wake hooks (ADR 0274), but the listing never
+    # reads webhook run history as a schedule's.
+    assert 'latest.get((name, "webhook"))' not in source
+    assert "'webhook'" not in source

@@ -50,6 +50,7 @@ from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime, timedelta
 from typing import Any, cast
 
+from curie_internal.approval_reminder import ApprovalReminderV1
 from curie_telemetry import operation_span, record_metric
 from fastapi import HTTPException
 from opentelemetry.trace import SpanKind, StatusCode
@@ -80,6 +81,26 @@ logger = logging.getLogger(__name__)
 # Pages a pass may read past selected rows before it stops for this interval.
 _LEGACY_PAGES = 10
 _monotonic = time.monotonic
+
+
+async def sweep_due_reminders(
+    session: AsyncSession,
+    enqueue: Callable[[ApprovalReminderV1], Awaitable[None]],
+    *,
+    limit: int = 100,
+) -> int:
+    claimed = await crud_approvals.claim_due_reminders(session, limit=limit)
+    sent = 0
+    for reminder in claimed:
+        try:
+            await enqueue(reminder)
+        except Exception:
+            logger.exception(
+                "approval reminder publish failed after claim for %s", reminder.approval_id
+            )
+        else:
+            sent += 1
+    return sent
 
 
 async def observe_pending_approvals(
@@ -342,6 +363,7 @@ async def run_expiry_sweeper(
     remediation_admissions: Callable[[AsyncSession], Awaitable[int]] | None = None,
     http_expiry: Callable[[uuid.UUID], Awaitable[Approval | None]] | None = None,
     identity_runtime: HttpInvocationRuntime | None = None,
+    reminder_enqueue: Callable[[ApprovalReminderV1], Awaitable[None]] | None = None,
 ) -> None:
     """Periodic loop driving ``sweep_expired_approvals`` until ``stop`` is set.
 
@@ -395,6 +417,8 @@ async def run_expiry_sweeper(
                     if identity_runtime is not None:
                         options.update(identity_runtime=identity_runtime)
                     await sweep_expired_approvals(session, resume_queue, **options)
+                    if reminder_enqueue is not None:
+                        await sweep_due_reminders(session, reminder_enqueue)
                     await crud_publications.reap_terminal_publication_patches(
                         session,
                         terminal_before=datetime.now(UTC).replace(tzinfo=None)

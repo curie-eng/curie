@@ -2,7 +2,9 @@
 
 Date: 2026-11-07
 
-Status: Draft
+Status: Accepted
+
+Approved by the maintainer on 2026-11-09.
 
 ## Context
 
@@ -82,9 +84,6 @@ Protected-worker process files require the offline
 only v2 and names the migration when rejecting v1. Custom launchers must move
 provider credentials into the gateway and configure their caller credentials.
 This is not a behavior-neutral runtime upgrade for those launchers.
-
-This Draft records the proposed durable boundary for review. It does not accept
-the decision or authorize subsequent runtime rewiring by itself.
 
 ## Rejected alternatives
 

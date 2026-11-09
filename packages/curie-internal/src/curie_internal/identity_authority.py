@@ -1,4 +1,8 @@
-"""Boundary observations. @spec HTTP-INVOCATION-EXECUTION-8/16."""
+"""Boundary observations. @spec HTTP-INVOCATION-EXECUTION-8/16.
+
+Version 2 of the current-check answer adds the verified original requester for
+an opted-in agent. @spec CONNECTOR-REQUESTER-1.
+"""
 
 from __future__ import annotations
 
@@ -11,6 +15,7 @@ from curie_internal.identity_context import (
     ChannelGeneration,
     Digest,
     Identifier,
+    Issuer,
     Version,
 )
 
@@ -64,6 +69,25 @@ class TurnAuthorityRequestV1(_Observation):
     approval_id: CanonicalUUID | None
 
 
+Decision = Literal["continue", "refuse", "unavailable"]
+Reason = Literal[
+    "current_authority", "caller_not_allowed", "invalid_context", "unsupported_resume",
+    "authority_unavailable",
+]
+_REASONS: dict[str, frozenset[str]] = {
+    "continue": frozenset({"current_authority"}),
+    "refuse": frozenset({"caller_not_allowed", "invalid_context", "unsupported_resume"}),
+    "unavailable": frozenset({"authority_unavailable"}),
+}
+
+
+def _version_two(value: object) -> int:
+    """No reader guesses between versions. @spec CONNECTOR-REQUESTER-1."""
+    if type(value) is not int or value != 2:
+        raise ValueError("invalid_turn_authority_version")
+    return value
+
+
 class TurnAuthorityResponseV1(_Observation):
     """@spec HTTP-INVOCATION-EXECUTION-16."""
 
@@ -73,22 +97,57 @@ class TurnAuthorityResponseV1(_Observation):
     event_id: Identifier
     context_sha256: Digest
     scope: TurnAuthorityScopeV1
-    decision: Literal["continue", "refuse", "unavailable"]
-    reason: Literal[
-        "current_authority", "caller_not_allowed", "invalid_context", "unsupported_resume",
-        "authority_unavailable",
-    ]
+    decision: Decision
+    reason: Reason
 
     @model_validator(mode="after")
     def coherent_decision(self) -> Self:
         """@spec HTTP-INVOCATION-EXECUTION-16."""
-        reasons = {
-            "continue": {"current_authority"},
-            "refuse": {"caller_not_allowed", "invalid_context", "unsupported_resume"},
-            "unavailable": {"authority_unavailable"},
-        }
-        if self.reason not in reasons[self.decision]:
+        if self.reason not in _REASONS[self.decision]:
             raise ValueError("invalid_turn_authority_decision")
+        return self
+
+
+class TurnRequesterV1(_Observation):
+    """The verified original requester: tenant and canonical issuer and subject only.
+
+    Compared exactly; never normalized. @spec CONNECTOR-REQUESTER-1.
+    """
+
+    tenant_id: CanonicalUUID
+    issuer: Issuer
+    subject: Identifier
+
+
+class TurnAuthorityResponseV2(_Observation):
+    """Every version 1 field plus the required-nullable requester projection.
+
+    The API answers version 2 only for a continue on an agent that opted in to
+    connector requester identity; a null requester means no verified human. A
+    requester is bound to this answer's own checked scope and never rides a
+    refused or unavailable answer. @spec CONNECTOR-REQUESTER-1.
+    """
+
+    schema_version: Annotated[Literal[2], BeforeValidator(_version_two)]
+    request_id: CanonicalUUID
+    stage: Stage
+    event_id: Identifier
+    context_sha256: Digest
+    scope: TurnAuthorityScopeV1
+    decision: Decision
+    reason: Reason
+    requester: TurnRequesterV1 | None
+
+    @model_validator(mode="after")
+    def coherent_projection(self) -> Self:
+        """@spec CONNECTOR-REQUESTER-1 HTTP-INVOCATION-EXECUTION-16."""
+        if self.reason not in _REASONS[self.decision]:
+            raise ValueError("invalid_turn_authority_decision")
+        requester = self.requester
+        if requester is not None and (
+            self.decision != "continue" or requester.tenant_id != self.scope.tenant_id
+        ):
+            raise ValueError("invalid_turn_authority_requester")
         return self
 
 

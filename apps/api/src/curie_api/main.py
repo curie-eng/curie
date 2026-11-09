@@ -34,6 +34,7 @@ from starlette.types import ASGIApp, Message, Receive, Scope, Send
 from curie_api.crud import agents as crud_agents
 
 from . import __version__, oidc
+from .approval_reminders import enqueue_reminder
 from .channel_identities import start_static_slack_bootstrap
 from .code_host_trust import code_host_verify
 from .commitpoller import CommitPoller, GitHubBranchTip
@@ -95,6 +96,7 @@ from .routers import (
     github_reviews,
     hook_fire,
     hook_source_policy,
+    hook_wake,
     hooks,
     identity,
     identity_admin,
@@ -286,6 +288,11 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
                 publication_patch_retention_seconds=(settings.publication_patch_retention_seconds),
                 http_expiry=app.state.http_approval_expiry,
                 identity_runtime=identity_runtime(app.state),
+                reminder_enqueue=(
+                    partial(enqueue_reminder, valkey, settings.runs_stream)
+                    if settings.approval_reminders_enabled
+                    else None
+                ),
                 remediation_admissions=(
                     partial(
                         reconcile_admissions,
@@ -701,6 +708,7 @@ def create_app(
     app.include_router(runs.router)
     app.include_router(schedules.router)
     app.include_router(hook_fire.router)
+    app.include_router(hook_wake.admin_router)
     app.include_router(state.router)
     app.include_router(state.internal_router)
     app.include_router(state.released_router)
@@ -751,6 +759,7 @@ def create_app(
     app.include_router(teams.router)
     app.include_router(agent_access.router)
     app.include_router(hooks.router)
+    app.include_router(hook_wake.router)
 
     # @spec IDENTITY-WRITER-LIFETIME-V1-8. Telemetry stays outside preparation.
     app.add_middleware(IdentityFenceMiddleware)

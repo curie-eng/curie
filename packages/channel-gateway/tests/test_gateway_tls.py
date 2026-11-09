@@ -18,6 +18,83 @@ API_TOKEN = "test-gateway-api-credential"
 WORKER_TOKEN = "test-gateway-worker-credential"
 
 
+@pytest.mark.parametrize("address", ["U0EXAMPLE1", "D0EXAMPLE1"])
+def test_gateway_reply_preserves_the_approver_dm_channel(tmp_path, address):
+    from aiohttp import web
+    from aiohttp.test_utils import TestServer
+    from channel_protocol import Action, ConfirmIntent, OutboundMessage, ReplyPost, ReplyTarget
+    from curie_channel_gateway.gateway_reply import GatewayReplyRoute, GatewayReplySink
+    from curie_channel_gateway.read_transport import GatewayAuthenticationError
+    from curie_channel_gateway.slack.read_server import GatewayConfig, application
+    from curie_channel_gateway.slack.tokens import SlackProviderConfig
+
+    async def scenario():
+        posts = []
+
+        async def provider(request):
+            posts.append(await request.json())
+            # https://docs.slack.dev/reference/methods/chat.postMessage/ returns channel and ts.
+            return web.json_response({"ok": True, "channel": "D0EXAMPLE1", "ts": "1700.000200"})
+
+        slack = web.Application()
+        slack.router.add_post("/chat.postMessage", provider)
+        async with TestServer(slack) as external:
+            config = GatewayConfig(
+                CURIE_CHANNEL_GATEWAY_API_TOKEN=API_TOKEN,
+                CURIE_CHANNEL_GATEWAY_WORKER_TOKEN=WORKER_TOKEN,
+                CURIE_CHANNEL_GATEWAY_ALLOW_INSECURE=True,
+                CURIE_CHANNEL_GATEWAY_REPLAY_DB=str(tmp_path / "dm.sqlite3"),
+                slack_api_base_url=str(external.make_url("/")),
+            )
+            app = await application(config, SlackProviderConfig(slack_bot_token="xoxb-test"))
+            async with TestServer(app) as gateway:
+                event = ReplyPost(
+                    version="1.0",
+                    event="reply.post",
+                    target=ReplyTarget(
+                        kind="slack", address=address, conversation_id=None, reply_ref=None
+                    ),
+                    message=OutboundMessage(
+                        version="1.0",
+                        text="Approve the requested operation",
+                        interaction=ConfirmIntent(
+                            kind="confirm",
+                            id="11111111-1111-4111-8111-111111111111",
+                            prompt="Approve the requested operation",
+                            confirm=Action(label="Approve", value="approve"),
+                            cancel=Action(label="Reject", value="reject"),
+                        ),
+                    ),
+                    requested_by="example requester",
+                )
+                route = GatewayReplyRoute()
+                denied = GatewayReplySink(
+                    str(gateway.make_url("/")), "wrong-token", allow_insecure_http=True
+                )
+                try:
+                    with pytest.raises(GatewayAuthenticationError):
+                        await denied.emit(event, route=route)
+                    assert posts == []
+                finally:
+                    await denied.aclose()
+                sink = GatewayReplySink(
+                    str(gateway.make_url("/")), WORKER_TOKEN, allow_insecure_http=True
+                )
+                try:
+                    for _ in range(2):
+                        ack = await sink.emit(event, route=route)
+                        assert ack.ref == "1700.000200"
+                        assert ack.channel == "D0EXAMPLE1"
+                    assert len(posts) == 1
+                    assert posts[0]["channel"] == address
+                    assert "thread_ts" not in posts[0]
+                    assert posts[0]["blocks"]
+                finally:
+                    await sink.aclose()
+
+    asyncio.run(scenario())
+
+
 @pytest.fixture(scope="module", params=(False, True))
 def tls_gateway(tmp_path_factory, request):
     directory = tmp_path_factory.mktemp("gateway-tls")

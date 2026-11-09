@@ -341,8 +341,17 @@ ReplyEvent = Annotated[
 
 
 class ReplyAck(BaseModel):
-    """What an adapter answers with. ``ref`` is None when it mints no handle."""
+    """What an adapter answers with. ``ref`` is None when it mints no handle.
+
+    ``channel`` is the conversation the provider says a new top-level post
+    landed in, when that differs from the address posted to (ADR 0272: a
+    Slack post to a user id lands in the bot's DM with that user, a ``D...``
+    id). None when the adapter reports no such conversation, and then omitted
+    from the wire, so a strict reader that predates the field reads every
+    other ack unchanged.
+    """
 
     model_config = _STRICT
 
     ref: str | None = None
+    channel: str | None = Field(default=None, exclude_if=lambda value: value is None)

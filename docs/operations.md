@@ -2039,7 +2039,8 @@ first line of the channel reply, `curie-turn-failure: <class>`, so a consumer
 that sees only the delivered text can tell the turn from a successful reply.
 Other escalations use that same first line with their own token
 (`delivery-deadline`, `prior-side-effect`, `approval-route-unbound`,
-`approval-approvers-unverifiable`, `approval-no-email-approvers`, `approval-backend-missing`,
+`approval-approvers-unverifiable`, `approval-route-unsupported`, `approval-no-email-approvers`,
+`approval-backend-missing`,
 `publication-unavailable`, or `approval-create-failed`). A failed run whose cause is `runner_escalated`,
 `sandbox_terminated`, `publication_unrecorded`, `unclassified`, `max_turns`, or `ci_failed`
 still shows as needing a person.
@@ -2522,6 +2523,11 @@ The path, and what an operator can check on each hop:
 The fake model is network-free, including when progress headers are present.
 Use a live model or the API/worker integration fixture to exercise the ingress;
 `[fake:progress-demo]` is only a deterministic long turn for steering tests.
+Its one network directive, `[fake:connector-call]`, sends one MCP `initialize`
+and one `tools/list` to each hosted connector behind the caller proxy and
+answers one `connector-call <name>: ok tools=<n> caller=<fp>` or
+`... failed <reason> caller=<fp>` line each; `<fp>` is a sha256 prefix of the
+caller token, never the token.
 
 With an integration turn, inspect the durable result with:
 

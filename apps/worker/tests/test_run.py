@@ -1094,6 +1094,9 @@ class _FakeCardStore:
         self._raises = raises
         self._stall_s = stall_s
 
+    async def run_retention(self, reader: Any, shutdown: asyncio.Event) -> None:
+        self._events.append("approval-reference-retention")
+
     async def migrate_legacy_thread_keyed_refs(self) -> None:
         # Recorded before the stall so the ordering assertion still holds on the
         # budget-overrun path, where the call is cancelled rather than returning.
@@ -1159,6 +1162,7 @@ class _FakeRuntime:
 
     def __init__(self, card_store: _FakeCardStore, events: list[str]) -> None:
         self.card_store = card_store
+        self.approval_reference_reader = object()
         self.consumer = _FakeSupervisedTask(events, "runs")
         self.killswitch = _FakeSupervisedTask(events, "killswitch")
         self.eval_consumer = _FakeSupervisedTask(events, "evals")
@@ -1328,6 +1332,7 @@ def test_run_migrates_legacy_card_refs_once_at_boot(
     # Exactly once: it is a boot migration, not something supervised or retried,
     # and a second pass would re-walk the keyspace on every restart for nothing.
     assert events.count("migrate") == 1
+    assert events.count("approval-reference-retention") == 1
 
 
 def test_run_migrates_legacy_card_refs_before_the_consumers_start(

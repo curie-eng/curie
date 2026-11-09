@@ -1333,6 +1333,16 @@
             "title": "Channels",
             "type": "array"
           },
+          "connector_requester_identity": {
+            "default": false,
+            "title": "Connector Requester Identity",
+            "type": "boolean"
+          },
+          "connector_requester_identity_version": {
+            "default": 1,
+            "title": "Connector Requester Identity Version",
+            "type": "integer"
+          },
           "created_at": {
             "format": "date-time",
             "title": "Created At",
@@ -1592,6 +1602,43 @@
             ],
             "title": "Approval Routes"
           },
+          "approval_routes_expected_version": {
+            "anyOf": [
+              {
+                "maximum": 2147483646.0,
+                "minimum": 1.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Approval Routes Expected Version"
+          },
+          "connector_requester_identity": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Connector Requester Identity"
+          },
+          "connector_requester_identity_expected_version": {
+            "anyOf": [
+              {
+                "maximum": 2147483646.0,
+                "minimum": 1.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Connector Requester Identity Expected Version"
+          },
           "deploy_notifications": {
             "anyOf": [
               {
@@ -1792,6 +1839,47 @@
           "org_name"
         ],
         "title": "AppConfig",
+        "type": "object"
+      },
+      "ApprovalApproverDmTarget": {
+        "additionalProperties": false,
+        "description": "Deliver the one card to the selected approver's DM (ADR 0272 decision 1).\n\nThe third form of a route's ``resolution``. ``identity`` names the Slack\nbot identity (the same lowercase slug as a notification target's\n``adapter``; ``default`` is the default app and is stored as written) whose\ninstallation posts the card to the one canonical person an approver ticket\nselected. Valid only on a route that also registers ``approver_ticket``, and\nnever with a ``notification``; the route writer checks the first and that\nthe identity has a registered receiver. Strict, like the requesting-surface\nform: no ``kind``, ``address`` or recipient may ride beside it.",
+        "properties": {
+          "identity": {
+            "title": "Identity",
+            "type": "string"
+          },
+          "mode": {
+            "const": "approver_dm",
+            "title": "Mode",
+            "type": "string"
+          }
+        },
+        "required": [
+          "mode",
+          "identity"
+        ],
+        "title": "ApprovalApproverDmTarget",
+        "type": "object"
+      },
+      "ApprovalApproverDmTargetOut": {
+        "description": "Read projection of ``ApprovalApproverDmTarget`` (ADR 0272); tolerant for repair.",
+        "properties": {
+          "identity": {
+            "title": "Identity",
+            "type": "string"
+          },
+          "mode": {
+            "const": "approver_dm",
+            "title": "Mode",
+            "type": "string"
+          }
+        },
+        "required": [
+          "mode",
+          "identity"
+        ],
+        "title": "ApprovalApproverDmTargetOut",
         "type": "object"
       },
       "ApprovalApprovers": {
@@ -2052,6 +2140,118 @@
           "created_at"
         ],
         "title": "ApprovalAuditOut",
+        "type": "object"
+      },
+      "ApprovalCardRegistrationRequestV1": {
+        "additionalProperties": false,
+        "description": "Register the provider-returned DM channel of one approver-DM card.\n\n``identity`` is the same block the creation sent; ``card_identity`` and\n``recipient`` the delivery the creation returned; ``channel`` the DM\nchannel id the provider answered the post with, never the user id the post\nnamed. @spec APPROVER-DM-2.",
+        "properties": {
+          "approval_id": {
+            "title": "Approval Id",
+            "type": "string"
+          },
+          "card_identity": {
+            "maxLength": 256,
+            "minLength": 1,
+            "title": "Card Identity",
+            "type": "string"
+          },
+          "channel": {
+            "maxLength": 64,
+            "pattern": "^D[A-Z0-9]{8,}$",
+            "title": "Channel",
+            "type": "string"
+          },
+          "dedupe_key": {
+            "maxLength": 256,
+            "minLength": 1,
+            "title": "Dedupe Key",
+            "type": "string"
+          },
+          "identity": {
+            "$ref": "#/components/schemas/ApprovalCreationIdentityV1"
+          },
+          "recipient": {
+            "maxLength": 256,
+            "minLength": 1,
+            "title": "Recipient",
+            "type": "string"
+          },
+          "request_id": {
+            "title": "Request Id",
+            "type": "string"
+          },
+          "schema_version": {
+            "const": 1,
+            "title": "Schema Version",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "schema_version",
+          "request_id",
+          "approval_id",
+          "dedupe_key",
+          "identity",
+          "card_identity",
+          "recipient",
+          "channel"
+        ],
+        "title": "ApprovalCardRegistrationRequestV1",
+        "type": "object"
+      },
+      "ApprovalCardRegistrationResponseV1": {
+        "additionalProperties": false,
+        "description": "The approval's status and stored card channel after a registration.\n\nA terminal status means the card was never registered and the worker\nsettles the posted card now. @spec APPROVER-DM-2.",
+        "properties": {
+          "approval_id": {
+            "title": "Approval Id",
+            "type": "string"
+          },
+          "card_channel": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Card Channel"
+          },
+          "duplicate": {
+            "title": "Duplicate",
+            "type": "boolean"
+          },
+          "request_id": {
+            "title": "Request Id",
+            "type": "string"
+          },
+          "schema_version": {
+            "const": 1,
+            "title": "Schema Version",
+            "type": "integer"
+          },
+          "status": {
+            "enum": [
+              "pending",
+              "approved",
+              "rejected",
+              "expired"
+            ],
+            "title": "Status",
+            "type": "string"
+          }
+        },
+        "required": [
+          "schema_version",
+          "request_id",
+          "approval_id",
+          "status",
+          "card_channel",
+          "duplicate"
+        ],
+        "title": "ApprovalCardRegistrationResponseV1",
         "type": "object"
       },
       "ApprovalCreateOut": {
@@ -2375,6 +2575,178 @@
           "requested_by"
         ],
         "title": "ApprovalCreationResponseV1",
+        "type": "object"
+      },
+      "ApprovalCreationResponseV2": {
+        "additionalProperties": false,
+        "description": "A dynamic approval's receipt: V1 plus the persisted grant and selection.\n\n``granted_arguments`` is the canonical JSON text of the stored object, the\nopaque ``approval_ticket`` included; the worker renders these stored values,\nnever its original model summary. Display data, never a permit.\n``delivery`` is present only for an approver-DM approval (ADR 0272), which\nis always dynamic, and is omitted, not null, otherwise.\n@spec REQUEST-APPROVAL-4 REQUEST-APPROVAL-8 HTTP-APPROVAL-CONTINUITY-3 APPROVER-DM-2.",
+        "properties": {
+          "delivery": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ApprovalDmDeliveryV1"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "duplicate": {
+            "title": "Duplicate",
+            "type": "boolean"
+          },
+          "granted_arguments": {
+            "title": "Granted Arguments",
+            "type": "string"
+          },
+          "granted_tool": {
+            "maxLength": 256,
+            "minLength": 1,
+            "title": "Granted Tool",
+            "type": "string"
+          },
+          "id": {
+            "title": "Id",
+            "type": "string"
+          },
+          "request_id": {
+            "title": "Request Id",
+            "type": "string"
+          },
+          "requested_by": {
+            "anyOf": [
+              {
+                "maxLength": 256,
+                "minLength": 1,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Requested By"
+          },
+          "schema_version": {
+            "const": 2,
+            "title": "Schema Version",
+            "type": "integer"
+          },
+          "selected_approvers": {
+            "items": {
+              "$ref": "#/components/schemas/SelectedApproverV1"
+            },
+            "maxItems": 16,
+            "minItems": 1,
+            "title": "Selected Approvers",
+            "type": "array"
+          },
+          "status": {
+            "enum": [
+              "pending",
+              "approved",
+              "rejected",
+              "expired"
+            ],
+            "title": "Status",
+            "type": "string"
+          }
+        },
+        "required": [
+          "schema_version",
+          "request_id",
+          "id",
+          "status",
+          "duplicate",
+          "requested_by",
+          "granted_tool",
+          "granted_arguments",
+          "selected_approvers"
+        ],
+        "title": "ApprovalCreationResponseV2",
+        "type": "object"
+      },
+      "ApprovalDmDeliveryV1": {
+        "additionalProperties": false,
+        "description": "The server-verified single recipient of an approver-DM card (ADR 0272).\n\n``identity`` is the Slack bot identity that posts the card,\n``provider_installation_id`` its installation, ``recipient`` the selected\napprover's native user id there. @spec APPROVER-DM-2.",
+        "properties": {
+          "identity": {
+            "maxLength": 256,
+            "minLength": 1,
+            "title": "Identity",
+            "type": "string"
+          },
+          "mode": {
+            "const": "approver_dm",
+            "title": "Mode",
+            "type": "string"
+          },
+          "provider_installation_id": {
+            "title": "Provider Installation Id",
+            "type": "string"
+          },
+          "recipient": {
+            "maxLength": 256,
+            "minLength": 1,
+            "title": "Recipient",
+            "type": "string"
+          }
+        },
+        "required": [
+          "mode",
+          "identity",
+          "provider_installation_id",
+          "recipient"
+        ],
+        "title": "ApprovalDmDeliveryV1",
+        "type": "object"
+      },
+      "ApprovalExemptGroup": {
+        "additionalProperties": false,
+        "description": "The one identity provider group exempt from requester exclusion (ADR 0271).\n\nNamed by canonical issuer and stable group id, compared byte for byte with\nthe requester's current directory groups at answer time.",
+        "properties": {
+          "id": {
+            "title": "Id",
+            "type": "string"
+          },
+          "issuer": {
+            "title": "Issuer",
+            "type": "string"
+          }
+        },
+        "required": [
+          "issuer",
+          "id"
+        ],
+        "title": "ApprovalExemptGroup",
+        "type": "object"
+      },
+      "ApprovalExemptGroupOut": {
+        "description": "Read projection of a stored exempt group; tolerant for repair.",
+        "properties": {
+          "id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Id"
+          },
+          "issuer": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Issuer"
+          }
+        },
+        "title": "ApprovalExemptGroupOut",
         "type": "object"
       },
       "ApprovalGrantAuthorityRequestV1": {
@@ -3302,8 +3674,18 @@
       },
       "ApprovalRouteBinding": {
         "additionalProperties": false,
-        "description": "One strict workspace binding for a declared approval route (#1460).\n\n``resolution`` is the single verified-identity action surface: a fixed\nSlack channel, or the conversation that asked (ADR-0177).\n``notification`` may make the pending request visible elsewhere, but its\nmessage carries no interaction. ``approvers`` continues to narrow WHO may\nact through the resolution card path and is never inferred from notification\nrecipients.",
+        "description": "One strict workspace binding for a declared approval route (#1460).\n\n``resolution`` is the single verified-identity action surface: a fixed\nSlack channel, the conversation that asked (ADR-0177), or the one selected\napprover's DM (ADR 0272).\n``notification`` may make the pending request visible elsewhere, but its\nmessage carries no interaction. ``approvers`` continues to narrow WHO may\nact through the resolution card path and is never inferred from notification\nrecipients. ``approver_ticket`` registers a per-request approver selector and\n``separation`` the route's requester exclusion, with or without a selector\n(ADR 0271).",
         "properties": {
+          "approver_ticket": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ApproverTicketRegistration"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
           "approvers": {
             "anyOf": [
               {
@@ -3313,6 +3695,19 @@
                 "type": "null"
               }
             ]
+          },
+          "expires_in_seconds": {
+            "anyOf": [
+              {
+                "exclusiveMinimum": 0.0,
+                "maximum": 315360000.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Expires In Seconds"
           },
           "notification": {
             "anyOf": [
@@ -3324,6 +3719,19 @@
               }
             ]
           },
+          "remind_every_s": {
+            "anyOf": [
+              {
+                "exclusiveMinimum": 0.0,
+                "maximum": 2147483647.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Remind Every S"
+          },
           "resolution": {
             "anyOf": [
               {
@@ -3331,9 +3739,22 @@
               },
               {
                 "$ref": "#/components/schemas/ApprovalRequestingSurfaceTarget"
+              },
+              {
+                "$ref": "#/components/schemas/ApprovalApproverDmTarget"
               }
             ],
             "title": "Resolution"
+          },
+          "separation": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ApprovalSeparation"
+              },
+              {
+                "type": "null"
+              }
+            ]
           }
         },
         "required": [
@@ -3343,8 +3764,18 @@
         "type": "object"
       },
       "ApprovalRouteBindingOut": {
-        "description": "The required resolution plus optional, redacted visibility policy.",
+        "description": "The required resolution plus optional, redacted visibility policy.\n\n``approver_ticket`` and ``separation`` are omitted, not null, on a route\nwithout a selector, so every existing route reads back exactly as before.",
         "properties": {
+          "approver_ticket": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ApproverTicketOut"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
           "approvers": {
             "anyOf": [
               {
@@ -3354,6 +3785,17 @@
                 "type": "null"
               }
             ]
+          },
+          "expires_in_seconds": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Expires In Seconds"
           },
           "notification": {
             "anyOf": [
@@ -3365,22 +3807,99 @@
               }
             ]
           },
+          "remind_every_s": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Remind Every S"
+          },
           "resolution": {
             "anyOf": [
               {
                 "$ref": "#/components/schemas/ApprovalTargetOut"
               },
               {
+                "$ref": "#/components/schemas/ApprovalApproverDmTargetOut"
+              },
+              {
                 "$ref": "#/components/schemas/ApprovalRequestingSurfaceTargetOut"
               }
             ],
             "title": "Resolution"
+          },
+          "separation": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ApprovalSeparationOut"
+              },
+              {
+                "type": "null"
+              }
+            ]
           }
         },
         "required": [
           "resolution"
         ],
         "title": "ApprovalRouteBindingOut",
+        "type": "object"
+      },
+      "ApprovalSeparation": {
+        "additionalProperties": false,
+        "description": "Requester exclusion on an approval route (ADR 0271 decision 6).\n\nOn a route that registers an ``approver_ticket`` selector, omitting it\nstores ``{\"exclude_requester\": true}`` and ``false`` is the audited opt-out.\nOn any other route it is stored as written: ``true`` enables static\nexclusion, and omitting it keeps ordinary ADR 0106 self-confirmation.\n``exempt_group`` is valid only beside ``exclude_requester: true``.",
+        "properties": {
+          "exclude_requester": {
+            "title": "Exclude Requester",
+            "type": "boolean"
+          },
+          "exempt_group": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ApprovalExemptGroup"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "required": [
+          "exclude_requester"
+        ],
+        "title": "ApprovalSeparation",
+        "type": "object"
+      },
+      "ApprovalSeparationOut": {
+        "description": "Read projection of the stored, effective requester exclusion.\n\n``exempt_group`` is omitted, not null, when the route stores none, so a\nroute without one reads back exactly as before.",
+        "properties": {
+          "exclude_requester": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Exclude Requester"
+          },
+          "exempt_group": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ApprovalExemptGroupOut"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "title": "ApprovalSeparationOut",
         "type": "object"
       },
       "ApprovalTargetOut": {
@@ -3400,6 +3919,238 @@
           "address"
         ],
         "title": "ApprovalTargetOut",
+        "type": "object"
+      },
+      "ApproverTicketCeiling": {
+        "additionalProperties": false,
+        "description": "The operator ceiling a selector chooses inside (ADR 0271 decision 1).\n\n``approver_role_version`` names the agent access-policy version whose\napprover role the operator approves. ``approver_role`` is server-owned: the\nplatform pins that role's canonical JSON on write and returns it on\nreadback, and a write may echo it back unchanged or omit it.",
+        "properties": {
+          "approver_role": {
+            "anyOf": [
+              {
+                "minLength": 2,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Approver Role"
+          },
+          "approver_role_version": {
+            "maximum": 2147483647.0,
+            "minimum": 1.0,
+            "title": "Approver Role Version",
+            "type": "integer"
+          },
+          "users": {
+            "anyOf": [
+              {
+                "items": {
+                  "$ref": "#/components/schemas/ApproverTicketCeilingUser"
+                },
+                "maxItems": 128,
+                "minItems": 1,
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Users"
+          }
+        },
+        "required": [
+          "approver_role_version"
+        ],
+        "title": "ApproverTicketCeiling",
+        "type": "object"
+      },
+      "ApproverTicketCeilingOut": {
+        "description": "Read projection of a registration ceiling, including the server-owned pin.",
+        "properties": {
+          "approver_role": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Approver Role"
+          },
+          "approver_role_version": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Approver Role Version"
+          },
+          "users": {
+            "anyOf": [
+              {
+                "items": {
+                  "$ref": "#/components/schemas/ApproverTicketCeilingUserOut"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Users"
+          }
+        },
+        "title": "ApproverTicketCeilingOut",
+        "type": "object"
+      },
+      "ApproverTicketCeilingUser": {
+        "additionalProperties": false,
+        "description": "One exact canonical person the operator allows inside the pinned role.",
+        "properties": {
+          "issuer": {
+            "title": "Issuer",
+            "type": "string"
+          },
+          "subject": {
+            "title": "Subject",
+            "type": "string"
+          }
+        },
+        "required": [
+          "issuer",
+          "subject"
+        ],
+        "title": "ApproverTicketCeilingUser",
+        "type": "object"
+      },
+      "ApproverTicketCeilingUserOut": {
+        "description": "Read projection of one ceiling user; tolerant for repair.",
+        "properties": {
+          "issuer": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Issuer"
+          },
+          "subject": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Subject"
+          }
+        },
+        "title": "ApproverTicketCeilingUserOut",
+        "type": "object"
+      },
+      "ApproverTicketOut": {
+        "description": "Read projection of a selector registration (ADR 0271). The public key is\npublic material and reads back so a readback can be written back.",
+        "properties": {
+          "ceiling": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ApproverTicketCeilingOut"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "connector": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Connector"
+          },
+          "key_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Key Id"
+          },
+          "public_key": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Public Key"
+          },
+          "tool": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Tool"
+          }
+        },
+        "title": "ApproverTicketOut",
+        "type": "object"
+      },
+      "ApproverTicketRegistration": {
+        "additionalProperties": false,
+        "description": "A selector registered on one approval route (ADR 0271 decision 1).\n\nOne hosted connector and one exact upstream tool, the Ed25519 public key\n(unpadded base64url of 32 bytes) and key id its tickets are verified with,\nand the mandatory ceiling. The private key never reaches the platform.",
+        "properties": {
+          "ceiling": {
+            "$ref": "#/components/schemas/ApproverTicketCeiling"
+          },
+          "connector": {
+            "title": "Connector",
+            "type": "string"
+          },
+          "key_id": {
+            "title": "Key Id",
+            "type": "string"
+          },
+          "public_key": {
+            "title": "Public Key",
+            "type": "string"
+          },
+          "tool": {
+            "title": "Tool",
+            "type": "string"
+          }
+        },
+        "required": [
+          "connector",
+          "tool",
+          "key_id",
+          "public_key",
+          "ceiling"
+        ],
+        "title": "ApproverTicketRegistration",
         "type": "object"
       },
       "Attachment": {
@@ -8202,6 +8953,114 @@
           "reason"
         ],
         "title": "HookSupportOut",
+        "type": "object"
+      },
+      "HookWakeCoalescedOut": {
+        "additionalProperties": false,
+        "description": "200: the wake joined a live open run, or its delivery id was already reserved.",
+        "properties": {
+          "status": {
+            "const": "coalesced",
+            "title": "Status",
+            "type": "string"
+          }
+        },
+        "required": [
+          "status"
+        ],
+        "title": "HookWakeCoalescedOut",
+        "type": "object"
+      },
+      "HookWakeErrorOut": {
+        "additionalProperties": false,
+        "description": "Every wake and wake-key refusal: exactly one reason string.",
+        "properties": {
+          "detail": {
+            "title": "Detail",
+            "type": "string"
+          }
+        },
+        "required": [
+          "detail"
+        ],
+        "title": "HookWakeErrorOut",
+        "type": "object"
+      },
+      "HookWakeQueuedOut": {
+        "additionalProperties": false,
+        "description": "202: one webhook run was admitted and its turn enqueued.",
+        "properties": {
+          "run_id": {
+            "format": "uuid",
+            "title": "Run Id",
+            "type": "string"
+          },
+          "status": {
+            "const": "queued",
+            "title": "Status",
+            "type": "string"
+          }
+        },
+        "required": [
+          "status",
+          "run_id"
+        ],
+        "title": "HookWakeQueuedOut",
+        "type": "object"
+      },
+      "HookWakeRotationOut": {
+        "additionalProperties": false,
+        "description": "The generation a rotation committed. Carries no key.",
+        "properties": {
+          "agent_id": {
+            "title": "Agent Id",
+            "type": "string"
+          },
+          "generation": {
+            "title": "Generation",
+            "type": "integer"
+          },
+          "hook": {
+            "title": "Hook",
+            "type": "string"
+          }
+        },
+        "required": [
+          "agent_id",
+          "hook",
+          "generation"
+        ],
+        "title": "HookWakeRotationOut",
+        "type": "object"
+      },
+      "HookWakeSecretOut": {
+        "additionalProperties": false,
+        "description": "The current wake key of one agent hook. Served with ``Cache-Control: no-store``.",
+        "properties": {
+          "agent_id": {
+            "title": "Agent Id",
+            "type": "string"
+          },
+          "generation": {
+            "title": "Generation",
+            "type": "integer"
+          },
+          "hook": {
+            "title": "Hook",
+            "type": "string"
+          },
+          "secret": {
+            "title": "Secret",
+            "type": "string"
+          }
+        },
+        "required": [
+          "agent_id",
+          "hook",
+          "generation",
+          "secret"
+        ],
+        "title": "HookWakeSecretOut",
         "type": "object"
       },
       "HttpSelectionV1": {
@@ -13750,6 +14609,35 @@
         "title": "ScheduleListOut",
         "type": "object"
       },
+      "SelectedApproverV1": {
+        "additionalProperties": false,
+        "description": "One verified selected person, projected to canonical identity. @spec REQUEST-APPROVAL-4.",
+        "properties": {
+          "issuer": {
+            "maxLength": 2048,
+            "minLength": 1,
+            "title": "Issuer",
+            "type": "string"
+          },
+          "subject": {
+            "maxLength": 256,
+            "minLength": 1,
+            "title": "Subject",
+            "type": "string"
+          },
+          "tenant_id": {
+            "title": "Tenant Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "tenant_id",
+          "issuer",
+          "subject"
+        ],
+        "title": "SelectedApproverV1",
+        "type": "object"
+      },
       "Selection": {
         "additionalProperties": false,
         "properties": {
@@ -15075,6 +15963,87 @@
         "title": "TurnAuthorityResponseV1",
         "type": "object"
       },
+      "TurnAuthorityResponseV2": {
+        "additionalProperties": false,
+        "description": "Every version 1 field plus the required-nullable requester projection.\n\nThe API answers version 2 only for a continue on an agent that opted in to\nconnector requester identity; a null requester means no verified human. A\nrequester is bound to this answer's own checked scope and never rides a\nrefused or unavailable answer. @spec CONNECTOR-REQUESTER-1.",
+        "properties": {
+          "context_sha256": {
+            "title": "Context Sha256",
+            "type": "string"
+          },
+          "decision": {
+            "enum": [
+              "continue",
+              "refuse",
+              "unavailable"
+            ],
+            "title": "Decision",
+            "type": "string"
+          },
+          "event_id": {
+            "maxLength": 256,
+            "minLength": 1,
+            "title": "Event Id",
+            "type": "string"
+          },
+          "reason": {
+            "enum": [
+              "current_authority",
+              "caller_not_allowed",
+              "invalid_context",
+              "unsupported_resume",
+              "authority_unavailable"
+            ],
+            "title": "Reason",
+            "type": "string"
+          },
+          "request_id": {
+            "title": "Request Id",
+            "type": "string"
+          },
+          "requester": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/TurnRequesterV1"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "schema_version": {
+            "const": 2,
+            "title": "Schema Version",
+            "type": "integer"
+          },
+          "scope": {
+            "$ref": "#/components/schemas/TurnAuthorityScopeV1"
+          },
+          "stage": {
+            "enum": [
+              "prepare",
+              "claim_or_resume",
+              "start",
+              "steer"
+            ],
+            "title": "Stage",
+            "type": "string"
+          }
+        },
+        "required": [
+          "schema_version",
+          "request_id",
+          "stage",
+          "event_id",
+          "context_sha256",
+          "scope",
+          "decision",
+          "reason",
+          "requester"
+        ],
+        "title": "TurnAuthorityResponseV2",
+        "type": "object"
+      },
       "TurnAuthorityScopeV1": {
         "additionalProperties": false,
         "description": "@spec HTTP-INVOCATION-EXECUTION-16.",
@@ -15165,6 +16134,35 @@
           "seq"
         ],
         "title": "TurnProgressBody",
+        "type": "object"
+      },
+      "TurnRequesterV1": {
+        "additionalProperties": false,
+        "description": "The verified original requester: tenant and canonical issuer and subject only.\n\nCompared exactly; never normalized. @spec CONNECTOR-REQUESTER-1.",
+        "properties": {
+          "issuer": {
+            "maxLength": 2048,
+            "minLength": 1,
+            "title": "Issuer",
+            "type": "string"
+          },
+          "subject": {
+            "maxLength": 256,
+            "minLength": 1,
+            "title": "Subject",
+            "type": "string"
+          },
+          "tenant_id": {
+            "title": "Tenant Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "tenant_id",
+          "issuer",
+          "subject"
+        ],
+        "title": "TurnRequesterV1",
         "type": "object"
       },
       "TurnSource": {
@@ -20162,6 +21160,222 @@
         ]
       }
     },
+    "/agents/{agent_id}/hooks/{hook}/wake-secret": {
+      "get": {
+        "description": "Read the current wake key of one declared webhook wake hook.\n\nRepeated reads return the same key until rotation. Provision it into the\nconnector's operator-managed secret as ``CURIE_HOOK_WAKE_KEY``.",
+        "operationId": "get_wake_secret_agents__agent_id__hooks__hook__wake_secret_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "agent_id",
+            "required": true,
+            "schema": {
+              "title": "Agent Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "hook",
+            "required": true,
+            "schema": {
+              "title": "Hook",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-api-key",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Api-Key"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HookWakeSecretOut"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HookWakeErrorOut"
+                }
+              }
+            },
+            "description": "wake_query_forbidden"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HookWakeErrorOut"
+                }
+              }
+            },
+            "description": "wake_not_declared"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HookWakeErrorOut"
+                }
+              }
+            },
+            "description": "wake_source_not_ordinary"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HookWakeErrorOut"
+                }
+              }
+            },
+            "description": "wake_body_invalid"
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HookWakeErrorOut"
+                }
+              }
+            },
+            "description": "authority_unavailable or wake_declaration_unavailable"
+          }
+        },
+        "summary": "Get Wake Secret",
+        "tags": [
+          "hooks"
+        ]
+      }
+    },
+    "/agents/{agent_id}/hooks/{hook}/wake-secret/rotate": {
+      "post": {
+        "description": "Rotate one hook's wake key; the previous key stops working at once.\n\nThe answer carries the new generation and no key; read the key back with\nthe GET. Rotation does not cancel an admitted run.",
+        "operationId": "rotate_wake_secret_agents__agent_id__hooks__hook__wake_secret_rotate_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "agent_id",
+            "required": true,
+            "schema": {
+              "title": "Agent Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "hook",
+            "required": true,
+            "schema": {
+              "title": "Hook",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-api-key",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Api-Key"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HookWakeRotationOut"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HookWakeErrorOut"
+                }
+              }
+            },
+            "description": "wake_query_forbidden"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HookWakeErrorOut"
+                }
+              }
+            },
+            "description": "wake_not_declared"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HookWakeErrorOut"
+                }
+              }
+            },
+            "description": "wake_source_not_ordinary"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HookWakeErrorOut"
+                }
+              }
+            },
+            "description": "wake_body_invalid"
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HookWakeErrorOut"
+                }
+              }
+            },
+            "description": "authority_unavailable, wake_declaration_unavailable or wake_generation_exhausted"
+          }
+        },
+        "summary": "Rotate Wake Secret",
+        "tags": [
+          "hooks"
+        ]
+      }
+    },
     "/agents/{agent_id}/hooks/{name}/fire": {
       "post": {
         "description": "Run one named cron hook now and return its run record.",
@@ -23712,7 +24926,7 @@
     },
     "/approvals/{approval_id}/resolve": {
       "post": {
-        "description": "Claim the resolution (resolve-once) and wake the suspended session.\n\nThe authorizer runs first, server-side (#246): the route's approvers decide\nwhether the authenticated principal belongs -- an explicit user list, a\nSlack user group, or (declaring none) the card channel's members (#420).\nRequester equality neither grants nor vetoes membership. Then exactly one\nauthorized resolver wins\nthe conditional UPDATE; a loser gets 409 naming who resolved it, and a\npast-SLA record flips to expired and returns 410 while still enqueuing the\nexpiry resume turn so the suspended session wakes down its timeout branch.\nThe winner's response is sent only after the resume turn is enqueued.",
+        "description": "Claim the resolution (resolve-once) and wake the suspended session.\n\nThe authorizer runs first, server-side (#246): the route's approvers decide\nwhether the authenticated principal belongs -- an explicit user list, a\nSlack user group, or (declaring none) the card channel's members (#420).\nRequester equality neither grants nor vetoes membership, except on a\ncanonical route (ADR 0271: dynamic selection or requester exclusion), which\nonly the HTTP answer composition may answer; every other principal there is\nrefused and audited, an operator first. Then exactly one\nauthorized resolver wins\nthe conditional UPDATE; a loser gets 409 naming who resolved it, and a\npast-SLA record flips to expired and returns 410 while still enqueuing the\nexpiry resume turn so the suspended session wakes down its timeout branch.\nThe winner's response is sent only after the resume turn is enqueued.",
         "operationId": "resolve_approval_approvals__approval_id__resolve_post",
         "parameters": [
           {
@@ -27159,6 +28373,138 @@
         ]
       }
     },
+    "/hooks/{agent_id}/{hook}/wake": {
+      "post": {
+        "description": "Admit one targetless run of a declared webhook wake hook.\n\nThe body is exactly ``{}``, signed with the hook's wake key; there are no\nquery parameters. 202 ``queued`` names the admitted run; 200 ``coalesced``\nmeans a run was already open or this delivery id was already reserved, so\npoll again later with a fresh delivery id if work remains.",
+        "operationId": "wake_hook_hooks__agent_id___hook__wake_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "agent_id",
+            "required": true,
+            "schema": {
+              "title": "Agent Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "hook",
+            "required": true,
+            "schema": {
+              "title": "Hook",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HookWakeCoalescedOut"
+                }
+              }
+            },
+            "description": "Joined a live open run, or the delivery id is already reserved"
+          },
+          "202": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HookWakeQueuedOut"
+                }
+              }
+            },
+            "description": "One webhook run admitted and enqueued"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HookWakeErrorOut"
+                }
+              }
+            },
+            "description": "wake_query_forbidden"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HookWakeErrorOut"
+                }
+              }
+            },
+            "description": "invalid_wake_signature"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HookWakeErrorOut"
+                }
+              }
+            },
+            "description": "wake_not_declared"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HookWakeErrorOut"
+                }
+              }
+            },
+            "description": "wake_source_not_ordinary, hook_paused or agent_killed"
+          },
+          "413": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HookWakeErrorOut"
+                }
+              }
+            },
+            "description": "hook body exceeds the maximum size"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HookWakeErrorOut"
+                }
+              }
+            },
+            "description": "wake_body_invalid"
+          },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HookWakeErrorOut"
+                }
+              }
+            },
+            "description": "budget_exhausted"
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HookWakeErrorOut"
+                }
+              }
+            },
+            "description": "authority_unavailable, wake_declaration_unavailable, wake_dedupe_unavailable or wake_enqueue_unavailable"
+          }
+        },
+        "summary": "Wake Hook",
+        "tags": [
+          "hooks"
+        ]
+      }
+    },
     "/identity/admin/{tenant_id}/{resource}": {
       "get": {
         "operationId": "identity_view_identity_admin__tenant_id___resource__get",
@@ -29501,7 +30847,7 @@
     },
     "/schedules/{agent}/{name}/pause": {
       "post": {
-        "description": "Pause a named cron hook without changing its in force bundle.",
+        "description": "Pause a named cron or webhook wake hook without changing its in force bundle.",
         "operationId": "pause_schedule_schedules__agent___name__pause_post",
         "parameters": [
           {
@@ -29569,7 +30915,7 @@
     },
     "/schedules/{agent}/{name}/resume": {
       "post": {
-        "description": "Resume a named cron hook with one bounded catch up opportunity.",
+        "description": "Resume a named hook: a cron hook gets one bounded catch up, a wake none.",
         "operationId": "resume_schedule_schedules__agent___name__resume_post",
         "parameters": [
           {
@@ -30492,7 +31838,7 @@
     },
     "/v1/internal/identity/approvals": {
       "post": {
-        "description": "@spec HTTP-APPROVAL-CONTINUITY-3.",
+        "description": "V2 only for a dynamic approval. @spec HTTP-APPROVAL-CONTINUITY-3 REQUEST-APPROVAL-4.",
         "operationId": "create_identity_approval_v1_internal_identity_approvals_post",
         "parameters": [
           {
@@ -30527,7 +31873,15 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/ApprovalCreationResponseV1"
+                  "anyOf": [
+                    {
+                      "$ref": "#/components/schemas/ApprovalCreationResponseV1"
+                    },
+                    {
+                      "$ref": "#/components/schemas/ApprovalCreationResponseV2"
+                    }
+                  ],
+                  "title": "Response Create Identity Approval V1 Internal Identity Approvals Post"
                 }
               }
             },
@@ -30545,6 +31899,76 @@
           }
         },
         "summary": "Create Identity Approval",
+        "tags": [
+          "internal-identity-authority"
+        ]
+      }
+    },
+    "/v1/internal/identity/approvals/{approval_id}/card": {
+      "post": {
+        "description": "Register the provider-returned DM channel of one approver-DM card.\n\n@spec APPROVER-DM-2.",
+        "operationId": "register_identity_approval_card_v1_internal_identity_approvals__approval_id__card_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "approval_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "Approval Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "X-Curie-Worker-Token",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Curie-Worker-Token"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ApprovalCardRegistrationRequestV1"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApprovalCardRegistrationResponseV1"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Register Identity Approval Card",
         "tags": [
           "internal-identity-authority"
         ]
@@ -30612,7 +32036,7 @@
     },
     "/v1/internal/identity/turn-authority/check": {
       "post": {
-        "description": "@spec HTTP-INVOCATION-EXECUTION-8/16.",
+        "description": "@spec HTTP-INVOCATION-EXECUTION-8/16 CONNECTOR-REQUESTER-1.",
         "operationId": "check_turn_authority_v1_internal_identity_turn_authority_check_post",
         "parameters": [
           {
@@ -30647,7 +32071,15 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/TurnAuthorityResponseV1"
+                  "anyOf": [
+                    {
+                      "$ref": "#/components/schemas/TurnAuthorityResponseV1"
+                    },
+                    {
+                      "$ref": "#/components/schemas/TurnAuthorityResponseV2"
+                    }
+                  ],
+                  "title": "Response Check Turn Authority V1 Internal Identity Turn Authority Check Post"
                 }
               }
             },

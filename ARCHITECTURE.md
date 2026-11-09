@@ -407,10 +407,12 @@ never assumed across a suspend. The `thread_ts -> sandbox_id` affinity store
 ([`apps/worker/src/curie_worker/sandbox/affinity.py`](apps/worker/src/curie_worker/sandbox/affinity.py))
 is what routes a thread back to its sandbox.
 
-Two TTLs, and the difference matters:
-
-- **`route_ttl_seconds: int = 3600`** — the live route, one hour ([`apps/worker/src/curie_worker/sandbox/types.py`](apps/worker/src/curie_worker/sandbox/types.py)).
-- **`suspended_route_ttl_seconds: int = 86400`** — a **suspended** route survives 24 hours, which is the real budget a human has to click Approve ([`apps/worker/src/curie_worker/sandbox/substrate.py`](apps/worker/src/curie_worker/sandbox/substrate.py) applies it on suspend).
+The live affinity route lasts one hour (`route_ttl_seconds = 3600`), and its
+suspended form lasts 24 hours (`suspended_route_ttl_seconds = 86400`). These
+locate a sandbox; the approval's separately stored decision deadline determines
+how long it may remain pending. A later resume can cold-create a fresh claim.
+See [`SubstrateConfig`](apps/worker/src/curie_worker/sandbox/types.py) and the
+[suspend owner](apps/worker/src/curie_worker/sandbox/substrate.py).
 
 Two background loops close the loop rather than trusting the click to arrive:
 

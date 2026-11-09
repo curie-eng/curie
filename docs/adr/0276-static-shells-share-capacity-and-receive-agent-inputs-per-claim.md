@@ -2,11 +2,12 @@
 
 Date: 2026-11-08
 
-Status: Draft
+Status: Accepted
+
+Approved by the maintainer on 2026-11-09.
 
 Amends [ADR 0009](0009-per-agent-connector-auth.md) for the static substrate only.
-This Draft needs maintainer acceptance. The implementation follows the explicit
-maintainer ruling to share static capacity while preserving immutable bundle code.
+The implementation follows the explicit maintainer ruling to share static capacity while preserving immutable bundle code.
 
 ## Context
 

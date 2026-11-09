@@ -1,0 +1,617 @@
+"""ADR 0272 decision 1 and 2: create one DM approval for one verified recipient.
+
+@spec APPROVER-DM-1 APPROVER-DM-2.
+
+Every creation goes through ``POST /v1/internal/identity/approvals`` with a real
+ingress capsule and a ticket signed over the exact arguments, against the
+roster TLS directory of ``approval_answer_support`` (each Slack account
+resolves to its own canonical person), Postgres and Valkey. The owning route's
+resolution is the DM mode, written through the real operator route. Each
+refusal answers its pinned status and code, stores no approval for the event
+and leaves the ticket nonce unspent; each is followed by the valid neighbor on
+the same agent, which must create. Synthetic, reserved example values only.
+"""
+
+from __future__ import annotations
+
+import copy
+import uuid
+from collections.abc import Callable
+from datetime import UTC, datetime, timedelta
+from types import MappingProxyType, SimpleNamespace
+from typing import Any
+
+import approval_answer_support
+import pytest
+import redis.asyncio as redis_async
+from approval_answer_support import (
+    NATIVE_A,
+    NATIVE_B,
+    NATIVE_UNRESOLVED,
+    person,
+)
+from approval_answer_support import synthetic_provider as synthetic_provider
+from approver_dm_support import (
+    DM_CHANNEL,
+    account,
+    configured_dm,
+    create,
+    dm_answer,
+    dm_created,
+    dm_request,
+    dm_routes,
+    email_answer,
+    expected_delivery,
+    nonce_uses,
+    refused_creation,
+    selected,
+    set_identity_status,
+    unauthenticated,
+)
+from approver_dm_support import dm_case as dm_case
+from approver_ticket_support import APPROVER_A, APPROVER_B, ROUTE, agent_state, store_routes
+from curie_api import identity_fence, principal_authority
+from curie_api.config import get_settings
+from curie_api.identity import http_invocation
+from curie_api.schemas.http_identity import NamespaceV1
+from principal_adoption_support import selection
+from role_policy_support import run
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+
+from apps.api.tests import test_http_invocation_membership as membership
+from apps.api.tests.test_http_approval_creation import accepted, request_for, rows
+
+
+def _created(case: SimpleNamespace, receiver: str = "main") -> tuple[dict, dict]:
+    """The valid neighbor: approver A, one account on the route identity's receiver.
+
+    @spec APPROVER-DM-1 APPROVER-DM-2.
+    """
+    scope = case.scope
+    request, payload = dm_request(
+        case, [selected(case, APPROVER_A, account(scope[receiver], NATIVE_A))],
+    )
+    body = dm_created(create(case.client, request), request, expected_delivery(scope[receiver]))
+    assert nonce_uses(scope["agent"], payload["nonce"]) == 1
+    return body, request
+
+
+# --- liveness and the response contract ---------------------------------------------------
+
+
+def test_one_selected_recipient_creates_a_pending_dm_approval_with_its_delivery(
+    dm_case: SimpleNamespace,
+) -> None:
+    """@spec APPROVER-DM-1/2: 201, card unset, the server-verified recipient returned.
+
+    The recipient account is looked up through the HTTP identity owner with
+    purpose ``approval``; the stored row keeps ``card_channel`` null until a
+    card is registered; an identical retry is historical with the same
+    delivery, recomputed from the stored row.
+    """
+    case = dm_case
+    configured_dm(case)
+    before = len(case.provider.requests)
+    body, request = _created(case)
+    row = rows(request["approval"]["dedupe_key"])
+    assert len(row) == 1, row
+    stored = row[0]
+    assert str(stored["id"]) == body["id"]
+    assert (stored["status"], stored["card_channel"], stored["route"]) == ("pending", None, ROUTE)
+    assert stored["selection_mode"] == "dynamic"
+    looked_up = [
+        item for item in case.provider.requests[before:]
+        if item["scope"]["sender"]["native_id"] == NATIVE_A
+    ]
+    assert looked_up and all(item["purpose"] == "approval" for item in looked_up), looked_up
+
+    retry = copy.deepcopy(request)
+    retry["request_id"] = str(uuid.uuid4())
+    again = dm_created(
+        create(case.client, retry), retry, expected_delivery(case.scope["main"]), duplicate=True,
+    )
+    assert again["id"] == body["id"]
+    assert len(rows(request["approval"]["dedupe_key"])) == 1
+
+
+def test_an_ordinary_creation_response_carries_no_delivery_key(
+    dm_case: SimpleNamespace,
+) -> None:
+    """@spec APPROVER-DM-2: old strict readers never see ``delivery`` on a non-DM row.
+
+    ``accepted`` pins the exact ordinary key set; a ``delivery`` key, even null,
+    fails it. A DM approval on the same agent then carries it.
+    """
+    case = dm_case
+    configured_dm(case)
+    request = request_for(case)
+    case.turn_used = True
+    body = accepted(create(case.client, request), request)
+    assert "delivery" not in body
+    retry = copy.deepcopy(request)
+    retry["request_id"] = str(uuid.uuid4())
+    assert "delivery" not in accepted(create(case.client, retry), retry, duplicate=True)
+    _created(case)
+
+
+# --- selection and recipient refusals -----------------------------------------------------
+
+
+def test_several_selected_approvers_refuse(dm_case: SimpleNamespace) -> None:
+    """@spec APPROVER-DM-1: exactly one selected person (``approver_dm_recipient_count``)."""
+    case = dm_case
+    configured_dm(case)
+    main = case.scope["main"]
+    request, payload = dm_request(case, [
+        selected(case, APPROVER_A, account(main, NATIVE_A)),
+        selected(case, APPROVER_B, account(main, NATIVE_B)),
+    ])
+    refused_creation(case, request, payload, 422, "approver_dm_recipient_count")
+    _created(case)
+
+
+def test_an_approver_without_recipient_accounts_refuses(dm_case: SimpleNamespace) -> None:
+    """@spec APPROVER-DM-1: no candidate account at all (``approver_dm_account_missing``)."""
+    case = dm_case
+    configured_dm(case)
+    request, payload = dm_request(case, [selected(case, APPROVER_A)])
+    refused_creation(case, request, payload, 422, "approver_dm_account_missing")
+    _created(case)
+
+
+def test_accounts_only_on_another_installation_or_namespace_refuse(
+    dm_case: SimpleNamespace,
+) -> None:
+    """@spec APPROVER-DM-1: none on the receiver's installation and namespace.
+
+    An account on another registered installation and workspace, one on the
+    right installation in another namespace, and one on an installation the
+    tenant does not have each refuse with ``approver_dm_wrong_installation``.
+    """
+    case = dm_case
+    configured_dm(case)
+    scope = case.scope
+    main, foreign = scope["main"], scope["foreign"]
+    elsewhere = NamespaceV1(
+        id=foreign["namespace"].id, authority="", kind="slack_workspace",
+        key=foreign["namespace"].key,
+    )
+    for wrong in (
+        account(foreign, NATIVE_A),
+        account(main, NATIVE_A, namespace=elsewhere),
+        account(main, NATIVE_A, installation=str(uuid.uuid4())),
+    ):
+        request, payload = dm_request(case, [selected(case, APPROVER_A, wrong)])
+        refused_creation(case, request, payload, 422, "approver_dm_wrong_installation")
+    _created(case)
+
+
+def test_a_recipient_account_the_directory_does_not_prove_refuses(
+    dm_case: SimpleNamespace,
+) -> None:
+    """@spec APPROVER-DM-1: resolved, the selected person, an active human.
+
+    The directory reports the account unresolved, resolves it to another
+    canonical person, or reports the selected person inactive: each refuses
+    with ``approver_dm_account_unresolved``. The ticket's claim is never
+    enough on its own.
+    """
+    case = dm_case
+    configured_dm(case)
+    main = case.scope["main"]
+    for native in (NATIVE_UNRESOLVED, NATIVE_B):
+        request, payload = dm_request(case, [selected(case, APPROVER_A, account(main, native))])
+        refused_creation(case, request, payload, 422, "approver_dm_account_unresolved")
+    saved = case.provider.roster[NATIVE_A]
+    case.provider.roster[NATIVE_A] = person(APPROVER_A, status="disabled")
+    try:
+        request, payload = dm_request(case)
+        refused_creation(case, request, payload, 422, "approver_dm_account_unresolved")
+    finally:
+        case.provider.roster[NATIVE_A] = saved
+    _created(case)
+
+
+# --- route, receiver and request refusals --------------------------------------------------
+
+
+def test_a_route_identity_whose_receiver_is_not_current_refuses(
+    dm_case: SimpleNamespace,
+) -> None:
+    """@spec APPROVER-DM-1: the receiver's identity row must be current at creation.
+
+    The route names the second bot identity on the binding's installation; it
+    creates. Taken out of service, the next creation refuses with 409
+    ``approver_dm_receiver_missing``; back in service it creates again.
+    """
+    case = dm_case
+    configured_dm(case, identity=case.scope["other"]["adapter"])
+    _created(case, receiver="other")
+    set_identity_status(case.scope["other"]["identity"], "disabled")
+    try:
+        request, payload = dm_request(case, [
+            selected(case, APPROVER_A, account(case.scope["other"], NATIVE_A)),
+        ])
+        refused_creation(case, request, payload, 409, "approver_dm_receiver_missing")
+    finally:
+        set_identity_status(case.scope["other"]["identity"], "active")
+    _created(case, receiver="other")
+
+
+def test_a_stored_route_naming_an_unregistered_identity_refuses(
+    dm_case: SimpleNamespace,
+) -> None:
+    """@spec APPROVER-DM-1: stored state no operator write produces still fails closed.
+
+    The DM route is stored naming an identity the tenant has but the API does
+    not receive for: 409 ``approver_dm_receiver_missing``.
+    """
+    case = dm_case
+    scope = case.scope
+    configured_dm(case)
+    routes = copy.deepcopy(agent_state(scope["agent"])["approval_routes"])
+    assert "approver_ticket" in routes[ROUTE], routes
+    routes[ROUTE]["resolution"] = {
+        "mode": "approver_dm", "identity": scope["unregistered"]["adapter"],
+    }
+    store_routes(scope["agent"], routes)
+    request, payload = dm_request(case, [
+        selected(case, APPROVER_A, account(scope["main"], NATIVE_A)),
+    ])
+    refused_creation(case, request, payload, 409, "approver_dm_receiver_missing")
+
+
+def test_a_dm_route_without_a_selector_registration_refuses(dm_case: SimpleNamespace) -> None:
+    """@spec APPROVER-DM-1: a DM route stored out of band with no selector.
+
+    An ordinary request on that route refuses with 409
+    ``approver_dm_requires_dynamic`` and stores nothing.
+    """
+    case = dm_case
+    scope = case.scope
+    store_routes(scope["agent"], dm_routes(scope, case.key, ticket=False))
+    request = request_for(case)
+    case.turn_used = True
+    request["approval"].update(route=ROUTE, card_channel=None)
+    refused_creation(case, request, None, 409, "approver_dm_requires_dynamic")
+
+
+def test_a_dm_request_naming_a_card_channel_refuses(dm_case: SimpleNamespace) -> None:
+    """@spec APPROVER-DM-2: the worker never chooses the DM card's channel.
+
+    The requester's reply channel, a DM-shaped channel and the approver's user
+    id each refuse with 409 ``unsupported_approval``.
+    """
+    case = dm_case
+    configured_dm(case)
+    for channel in (case.scope["address"], DM_CHANNEL, NATIVE_A):
+        request, payload = dm_request(case)
+        request["approval"]["card_channel"] = channel
+        refused_creation(case, request, payload, 409, "unsupported_approval")
+    _created(case)
+
+
+def test_a_route_identity_whose_receiver_does_not_serve_the_origin_refuses(
+    dm_case: SimpleNamespace,
+) -> None:
+    """@spec APPROVER-DM-1 (review r1 F3): the DM bot must be able to answer for the origin.
+
+    The route names ``detached``: an active bot identity on the binding's
+    installation and namespace with a registered receiver, so the route write
+    is accepted, but that receiver's ``binding_ids`` do not list the turn's
+    binding. Every click on a card it delivered would fail the answer's origin
+    check, so creation refuses before the ticket is spent: 409
+    ``approver_dm_receiver_missing`` (the existing "no usable receiver for the
+    identity" code), no row, nonce unspent. Repointed to the binding's own
+    receiver, the same agent creates.
+    """
+    case = dm_case
+    scope = case.scope
+    detached = scope["detached"]
+    assert scope["binding"] not in detached["binding_ids"]
+    configured_dm(case, identity=detached["adapter"])
+    request, payload = dm_request(case, [
+        selected(case, APPROVER_A, account(detached, NATIVE_A)),
+    ])
+    refused_creation(case, request, payload, 409, "approver_dm_receiver_missing")
+    configured_dm(case)
+    _created(case)
+
+
+# --- an unregistered DM is never answered on its origin -----------------------------------
+
+
+def test_an_unregistered_dm_approval_cannot_be_answered_on_its_origin(
+    dm_case: SimpleNamespace,
+) -> None:
+    """@spec APPROVER-DM-2: unset ``card_channel`` means every answer refuses.
+
+    The selected approver presents a receiver-signed interaction in the
+    requester's reply channel (where an ordinary routeless card lives): 401
+    with no effect. An email reply forwarded for the origin binding is refused
+    too. The row stays pending with its card unset and nothing is published.
+    """
+    case = dm_case
+    configured_dm(case)
+    body, _ = _created(case)
+    approval_id = body["id"]
+    response = dm_answer(case, approval_id, NATIVE_A, channel=case.scope["address"])
+    unauthenticated(case, approval_id, response, card_channel=None)
+    emailed = email_answer(case, approval_id)
+    assert emailed.status_code in (401, 403, 404), emailed.text
+    unauthenticated(
+        case, approval_id,
+        dm_answer(case, approval_id, NATIVE_A, channel=DM_CHANNEL), card_channel=None,
+    )
+
+
+# --- R2: the recipient captured in phase one is still current at the writer ----------------
+
+
+class _OnRecipientLookup(dict[str, Any]):
+    """The provider's roster, running ``action`` once while the recipient is looked up.
+
+    The synthetic directory reads its roster for the account each lookup
+    names; only the DM recipient lookup names ``native`` during a creation (the
+    ingress author is outside the roster). ``action`` runs on a joined thread
+    while that lookup is in flight, after phase one and before the identity
+    writer.
+    @spec APPROVER-DM-1.
+    """
+
+    def __init__(
+        self, roster: dict[str, Any], native: str, action: Callable[[], None],
+    ) -> None:
+        super().__init__(roster)
+        self.native, self.action, self.fired = native, action, 0
+
+    def get(self, key: str, default: Any = None) -> Any:  # type: ignore[override]
+        """@spec APPROVER-DM-1."""
+        if key == self.native:
+            self.fired += 1
+            if self.fired == 1:
+                membership.joined(self.action)
+        return super().get(key, default)
+
+
+def _during_recipient_lookup(
+    case: SimpleNamespace, request: dict[str, Any], action: Callable[[], None],
+) -> tuple[Any, _OnRecipientLookup]:
+    """Create with ``action`` committed mid-lookup; returns the response and the hook.
+
+    @spec APPROVER-DM-1.
+    """
+    saved = case.provider.roster
+    hook = _OnRecipientLookup(saved, NATIVE_A, action)
+    case.provider.roster = hook
+    try:
+        return create(case.client, request), hook
+    finally:
+        case.provider.roster = saved
+
+
+def _refused_unavailable(
+    case: SimpleNamespace, request: dict[str, Any], payload: dict[str, Any], response: Any,
+) -> None:
+    """@spec APPROVER-DM-1: 503 ``authority_unavailable``, no row, the nonce unspent."""
+    assert response.status_code == 503, response.text
+    assert response.headers["cache-control"] == "no-store"
+    assert response.json() == {"detail": "authority_unavailable"}, response.text
+    assert rows(request["approval"]["dedupe_key"]) == []
+    assert nonce_uses(case.scope["agent"], payload["nonce"]) == 0
+
+
+def _other_request(case: SimpleNamespace) -> tuple[dict[str, Any], dict[str, Any]]:
+    """@spec APPROVER-DM-1: approver A with one account on the second bot's receiver."""
+    return dm_request(case, [selected(case, APPROVER_A, account(case.scope["other"], NATIVE_A))])
+
+
+def test_an_unchanged_state_during_the_recipient_lookup_creates(
+    dm_case: SimpleNamespace,
+) -> None:
+    """@spec APPROVER-DM-1: liveness for the writer recheck.
+
+    The hook fires on the recipient lookup and changes nothing: 201 with the
+    delivery, so the refusals below are caused by their change alone.
+    """
+    case = dm_case
+    configured_dm(case, identity=case.scope["other"]["adapter"])
+    request, payload = _other_request(case)
+    response, hook = _during_recipient_lookup(case, request, lambda: None)
+    assert hook.fired >= 1, "the recipient account was never looked up"
+    dm_created(response, request, expected_delivery(case.scope["other"]))
+    assert nonce_uses(case.scope["agent"], payload["nonce"]) == 1
+
+
+def test_a_receiver_set_change_during_the_recipient_lookup_refuses(
+    dm_case: SimpleNamespace,
+) -> None:
+    """@spec APPROVER-DM-1: the phase-one registration object must still be registered.
+
+    While the recipient lookup is in flight the route identity's receiver
+    registration leaves the API's receiver set (the binding's own receiver,
+    which carried the invocation, stays). The writer recheck refuses 503
+    ``authority_unavailable`` with no row and the nonce unspent. With the
+    registration back, the next creation succeeds.
+    """
+    case = dm_case
+    configured_dm(case, identity=case.scope["other"]["adapter"])
+    runtime = case.client.app.state.http_identity_runtime
+    original = runtime._receivers
+    removed = case.scope["other"]["receiver_id"]
+    assert any(key[0] == removed for key in original), original
+
+    def withdraw() -> None:
+        """@spec APPROVER-DM-1: the operator registration set changes mid-creation."""
+        object.__setattr__(runtime, "_receivers", MappingProxyType({
+            key: value for key, value in original.items() if key[0] != removed
+        }))
+
+    request, payload = _other_request(case)
+    try:
+        response, hook = _during_recipient_lookup(case, request, withdraw)
+    finally:
+        object.__setattr__(runtime, "_receivers", original)
+    assert hook.fired >= 1, "the recipient account was never looked up"
+    _refused_unavailable(case, request, payload, response)
+    _created(case, receiver="other")
+
+
+def test_a_provider_configuration_change_during_the_recipient_lookup_refuses(
+    dm_case: SimpleNamespace,
+) -> None:
+    """@spec APPROVER-DM-1: the phase-one IdP configuration must be unchanged at the writer.
+
+    While the recipient lookup is in flight an identity writer replaces the
+    tenant's HTTP configuration (a new ``configuration.version``). The writer
+    recheck refuses 503 ``authority_unavailable`` with no row and the nonce
+    unspent; the facts gathered under the old configuration are never written.
+    """
+    case = dm_case
+    configured_dm(case)
+    tenant = uuid.UUID(case.scope["tenant"])
+    versions: list[int] = []
+
+    def replace() -> None:
+        """@spec APPROVER-DM-1: a committed configuration replacement."""
+
+        async def write(factory: async_sessionmaker[AsyncSession]) -> None:
+            """@spec APPROVER-DM-1."""
+            client = redis_async.Redis.from_url(get_settings().valkey_dsn())
+            try:
+                async with identity_fence.mutation(factory, client) as writer, writer.begin():
+                    _, current = await principal_authority.lock_scope(writer, tenant)
+                    assert current is not None
+                    result = await principal_authority.replace_http_configuration(
+                        writer, tenant_id=tenant, expected_version=current.version,
+                        expected_lifecycle_generation=current.lifecycle_generation,
+                        selection=selection(
+                            lookup_url=case.provider.url, max_identity_age_ms=2500,
+                        ),
+                    )
+                    versions.append(result.configuration.version)
+            finally:
+                await client.aclose()
+
+        run(write)
+
+    request, payload = dm_request(case)
+    response, hook = _during_recipient_lookup(case, request, replace)
+    assert hook.fired >= 1, "the recipient account was never looked up"
+    assert len(versions) == 1 and versions[0] > case.scope["configuration"].version, versions
+    _refused_unavailable(case, request, payload, response)
+
+
+def test_recipient_facts_already_expired_refuse(
+    dm_case: SimpleNamespace, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """@spec APPROVER-DM-1: the recipient's facts must be inside their delivery window.
+
+    The directory answers the recipient lookup with an observation five
+    minutes old (the tenant's identity age limit is two seconds). The creation
+    refuses, stores nothing and leaves the nonce unspent; a fresh observation
+    then creates. The refusal code is not pinned by the plan, so either the
+    lookup owner's unavailability or the recipient refusal is accepted.
+    """
+    case = dm_case
+    configured_dm(case)
+    original = approval_answer_support._observation
+
+    def stale(provider: SimpleNamespace, lookup: dict[str, Any]) -> dict[str, Any]:
+        """@spec APPROVER-DM-1: only the recipient's observation is aged."""
+        response = original(provider, lookup)
+        if lookup["scope"]["sender"]["native_id"] == NATIVE_A:
+            old = (datetime.now(UTC) - timedelta(minutes=5)).isoformat()
+            response["identity_observation"] = {**response["identity_observation"], "as_of": old}
+            if response.get("membership"):
+                response["membership"]["observation"] = {
+                    **response["membership"]["observation"], "as_of": old,
+                }
+        return response
+
+    request, payload = dm_request(case)
+    with monkeypatch.context() as patch:
+        patch.setattr(approval_answer_support, "_observation", stale)
+        response = create(case.client, request)
+    assert (response.status_code, response.json()) in [
+        (422, {"detail": "approver_dm_account_unresolved"}),
+        (503, {"detail": "authority_unavailable"}),
+        (503, {"detail": "identity_authority_unavailable"}),
+    ], response.text
+    assert rows(request["approval"]["dedupe_key"]) == []
+    assert nonce_uses(case.scope["agent"], payload["nonce"]) == 0
+    _created(case)
+
+
+class _AfterRecipientLookup(dict[str, Any]):
+    """The provider's roster, flagging when the caller phase's own lookup begins.
+
+    The recipient (``native``) is looked up first; the creation's original
+    requester is looked up after it. ``caller_began`` turns true on the first
+    roster read for any other account once the recipient was read.
+    @spec APPROVER-DM-1.
+    """
+
+    def __init__(self, roster: dict[str, Any], native: str) -> None:
+        super().__init__(roster)
+        self.native, self.recipient_read, self.caller_began = native, False, False
+
+    def get(self, key: str, default: Any = None) -> Any:  # type: ignore[override]
+        """@spec APPROVER-DM-1."""
+        if key == self.native:
+            self.recipient_read = True
+        elif self.recipient_read:
+            self.caller_began = True
+        return super().get(key, default)
+
+
+def _caller_phase_clock(
+    case: SimpleNamespace, monkeypatch: pytest.MonkeyPatch, *, jump: timedelta,
+) -> _AfterRecipientLookup:
+    """Move the facts clock ``jump`` ahead for the recipient's facts once the caller phase starts.
+
+    Only ``http_invocation.source_facts`` validation of the recipient's
+    account reads the shifted clock; the caller's own facts and the first
+    recipient validation see real time. No sleeping.
+    @spec APPROVER-DM-1.
+    """
+    hook = _AfterRecipientLookup(case.provider.roster, NATIVE_A)
+    case.provider.roster = hook
+    original = http_invocation.validate_lookup
+
+    def shifted(response: bytes, lookup: Any, limits: Any, *, now: datetime) -> Any:
+        """@spec APPROVER-DM-1."""
+        if lookup.scope.sender.native_id == NATIVE_A and hook.caller_began:
+            now = now + jump
+        return original(response, lookup, limits, now=now)
+
+    monkeypatch.setattr(http_invocation, "validate_lookup", shifted)
+    return hook
+
+
+def test_recipient_facts_expiring_during_the_caller_phase_refuse(
+    dm_case: SimpleNamespace, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """@spec APPROVER-DM-1: the writer revalidates the recipient facts against their window.
+
+    The recipient's facts are valid when looked up. The creation's own
+    original-requester lookup follows; by the time the identity writer runs,
+    the recipient's delivery window has closed (the facts clock reads ten
+    seconds later for that account, against a two second age limit). The
+    creation refuses 503 ``authority_unavailable``, stores no approval and
+    leaves the nonce unspent. With the clock unmoved the same request creates.
+    """
+    case = dm_case
+    configured_dm(case)
+    saved = case.provider.roster
+    request, payload = dm_request(case)
+    with monkeypatch.context() as patch:
+        hook = _caller_phase_clock(case, patch, jump=timedelta(seconds=10))
+        try:
+            response = create(case.client, request)
+        finally:
+            case.provider.roster = saved
+    assert hook.caller_began, "the caller phase never looked the requester up"
+    _refused_unavailable(case, request, payload, response)
+    # Liveness: the same shape with no clock movement creates.
+    _created(case)

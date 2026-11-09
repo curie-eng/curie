@@ -19,6 +19,7 @@ from channel_protocol.reply import (
     ReplyUpdate,
 )
 
+from ..capacity_wait import current_wait
 from ..delivery_lease import DeliveryLease, LeaseLostError
 from ..receipt import TurnReceiptMode, render_receipt
 from ..reply_sink import (
@@ -28,10 +29,14 @@ from ..reply_sink import (
 )
 
 if TYPE_CHECKING:
+    from ..sandbox.types import SandboxHandle
     from .core import Kernel
 
 from . import clock, constants, routing, workspace
 from .log import logger
+
+# A status answer that carries no ``turn_epoch`` key at all.
+_UNREPORTED = object()
 
 
 def _join_reply_blocks(*parts: str | None) -> str:
@@ -504,13 +509,96 @@ async def notify_broker_entry_vanished(
         )
 
 
-async def interrupt_thread(self: Kernel, thread_key: str, reason: str) -> bool:
-    """Hard-stop the thread's live turn. True if a live runner was signalled."""
+async def interrupt_thread(
+    self: Kernel, thread_key: str, reason: str, *, expected: SandboxHandle | None = None
+) -> bool:
+    """Hard-stop the thread's live turn. True if a live runner was signalled.
+
+    ``expected`` fences the signal to one checked route (ADR 0270 decision 3):
+    the route is read again, and unless it still equals ``expected`` in every
+    field (claim, generation and requester included) nothing is sent and this
+    returns False. Otherwise the signal goes to ``expected``'s own address with
+    its own token, never to whatever a fresh lookup would name.
+    """
     handle = await asyncio.to_thread(self._substrate.lookup, thread_key)
     if handle is None:
         return False
+    if expected is not None:
+        if handle != expected:
+            return False
+        handle = expected
     await self._runner.interrupt(handle.base_url, reason, token=handle.token or None)
     return True
+
+
+async def _own_execution(self: Kernel, handle: SandboxHandle, turn_epoch: object) -> None:
+    """Record a turn this delivery opened or steered into (ADR 0270 decision 3).
+
+    Only a fenced delivery records anything, and a capacity wake never does:
+    its admitted epoch is owned by the wait record and stopped through it.
+    When the lease is already lost (the loss fired while ``start_turn`` was
+    in flight, before there was anything to stop), the turn is stopped here
+    at once.
+    """
+    holder = constants._OWNED_EXECUTIONS.get()
+    if holder is None or current_wait() is not None:
+        return
+    entry = constants.OwnedExecution(
+        handle=handle, turn_epoch=turn_epoch if isinstance(turn_epoch, str) else None
+    )
+    holder.entries.append(entry)
+    if holder.lease.lost.is_set():
+        await _stop_owned_entries(self, [entry], "delivery lease lost")
+
+
+async def stop_owned_execution(self: Kernel, owner: str, reason: str) -> None:
+    """Stop only the turns the lease acquisition ``owner`` opened or steered into.
+
+    ADR 0270 decision 3 [D2]. Never a thread lookup: each stop goes to the
+    sandbox the delivery recorded, and only while that runner still reports
+    the recorded turn live. A delivery that opened or steered nothing (it lost
+    its lease while waiting on the order lock, the authority answer or a
+    liveness probe) stops nothing, so it can never end another person's turn.
+    """
+    holder = self._owned_executions.get(owner)
+    if holder is None:
+        return
+    await _stop_owned_entries(self, list(reversed(holder.entries)), reason)
+
+
+async def _stop_owned_entries(
+    self: Kernel, entries: list[constants.OwnedExecution], reason: str
+) -> None:
+    for entry in entries:
+        if entry.stopped:
+            continue
+        entry.stopped = True
+        handle = entry.handle
+        token = handle.token or None
+        try:
+            status = await self._runner.status(handle.base_url, token=token)
+            if status.get("turn_active") is not True:
+                continue
+            # A runner that reports an epoch must report the recorded one. One
+            # that reports none (an older or unauthenticated status), or a turn
+            # recorded without one, is matched by the recorded address alone.
+            reported = status.get("turn_epoch", _UNREPORTED)
+            if (
+                entry.turn_epoch is not None
+                and reported is not _UNREPORTED
+                and reported != entry.turn_epoch
+            ):
+                continue
+            await self._runner.interrupt(handle.base_url, reason, token=token)
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001 - a failed stop must not mask the lease loss
+            logger.warning(
+                "could not stop an owned turn at %s after its delivery lease was lost; "
+                "the fence still refuses every terminal write",
+                handle.base_url,
+                exc_info=True,
+            )
 
 
 async def release_thread(self: Kernel, thread_key: str) -> bool:

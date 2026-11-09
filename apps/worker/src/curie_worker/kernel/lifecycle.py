@@ -22,6 +22,7 @@ from ..behaviorpacks import (
     BehaviorPacks,
 )
 from ..binding import (
+    BOOT_TOKEN_GRACE_SECONDS,
     DECISION_ENV,
     DEFAULT_EXECUTION_DEADLINE_SECONDS,
     GRANT_ARGUMENTS_ENV,
@@ -31,12 +32,14 @@ from ..binding import (
     MAX_TURNS_ENV,
     PROGRESS_TOKEN_ENV,
     PROGRESS_URL_ENV,
+    REQUESTER_CALLER_TOKEN_TTL_SECONDS,
     RESUMED_KIND_ENV,
     SANDBOX_TOKEN_TTL_SECONDS,
     AmbiguousRoute,
     FactoryBindingRefused,
     FactoryWake,
     binding_adapter_for_handle,
+    caller_requester_facts,
 )
 from ..capacity_wait import current_wait
 from ..delivery_lease import DeliveryLease
@@ -100,6 +103,17 @@ async def process_event(
     identity_token = identity.CURRENT.set(identity_carry)
     hook_token = constants._HOOK_RUN_CARRY.set(hooks._HookRunCarry())
     lease_token = constants._DELIVERY_LEASE.set(lease)
+    # ADR 0270 decision 3 [D2]: what this lease acquisition opens or steers
+    # into, so a lost lease stops exactly that and nothing else. The owner
+    # token is unique per acquisition.
+    owned = (
+        constants.OwnedExecutions(lease=lease)
+        if lease is not None and claim._is_fenced(lease)
+        else None
+    )
+    owned_executions_token = constants._OWNED_EXECUTIONS.set(owned)
+    if owned is not None:
+        self._owned_executions[owned.lease.owner] = owned
     termination_carry = constants._SandboxTerminationCarry()
     termination_token = constants._SANDBOX_TERMINATION_CARRY.set(termination_carry)
     # A redelivery must never inherit an earlier delivery's terminal-send mark
@@ -206,6 +220,9 @@ async def process_event(
             constants._LIFECYCLE_SPAN.reset(token)
             constants._HOOK_RUN_CARRY.reset(hook_token)
             constants._DELIVERY_LEASE.reset(lease_token)
+            constants._OWNED_EXECUTIONS.reset(owned_executions_token)
+            if owned is not None and self._owned_executions.get(owned.lease.owner) is owned:
+                del self._owned_executions[owned.lease.owner]
             constants._SANDBOX_TERMINATION_CARRY.reset(termination_token)
     if error is not None:
         raise error
@@ -577,7 +594,17 @@ async def _process_event(
                 while lease.remaining_s() > constants._MIN_ATTEMPT_BUDGET_S:
                     lease.raise_if_lost()
                     try:
-                        await self._preflight_reclaimed_delivery(thread_key, lease)
+                        assert predecessor is not None
+                        await self._preflight_reclaimed_delivery(
+                            thread_key,
+                            lease,
+                            event_id=event_id,
+                            desired_requester=(
+                                predecessor.caller_requester
+                                or caller_requester_facts(None)[0]
+                            ),
+                            requester_enforced=False,
+                        )
                         break
                     except memory.ReclaimPreflightUnsafe:
                         handoff_refusals += 1
@@ -936,11 +963,49 @@ async def _process_event(
                 if selected and qevent.tool_access is None
                 else None
             )
-            boot_env = self._binding.boot_env(
-                resolved,
-                thread_key,
-                **boot_env_kwargs,
+            # @spec CONNECTOR-REQUESTER-1/2: an HTTP-context turn reads the
+            # operator opt-in here, immediately before boot. The verified
+            # requester rides the cct only for an opted-in agent; an invalid
+            # opt-in, or a requester without it, refuses before any claim.
+            principal = (
+                await identity.requester_principal(self, resolved.agent_id) if selected else None
             )
+            if principal is not None:
+                # ADR 0270 decision 3: a requester cct lives one hour from its
+                # claim-time mint. The turn's runtime bound is capped at what
+                # is left of that hour after the boot grace and a cold claim,
+                # so the boot token is minted from the capped budget. Only a
+                # bound that cannot be lowered that far (the runner's minimum
+                # request time) still refuses before boot: no opted-in turn
+                # runs longer than the window.
+                boot_env_kwargs["token_ttl_s"] = self._runner.turn_deadline_s(
+                    self._requester_turn_budget(claim._remaining_budget(lease))
+                )
+                window_s = (
+                    float(boot_env_kwargs["token_ttl_s"])
+                    + BOOT_TOKEN_GRACE_SECONDS
+                    + self._substrate.claim_timeout_seconds
+                )
+                if window_s > REQUESTER_CALLER_TOKEN_TTL_SECONDS:
+                    logger.info(
+                        "requester turn %s refused before boot: its runtime bound "
+                        "cannot be lowered into the requester token window",
+                        event_id,
+                    )
+                    raise identity.HttpIdentityRefused()
+                boot_env_kwargs["caller_principal"] = principal
+            try:
+                boot_env = self._binding.boot_env(
+                    resolved,
+                    thread_key,
+                    **boot_env_kwargs,
+                )
+            except ValueError:
+                if principal is None:
+                    raise
+                # The minter refused the principal (a token over the verifier
+                # bound): the turn refuses before any sandbox claim.
+                raise identity.HttpIdentityRefused() from None
             # The deployment id is the server-side authority used to select
             # and redeem a repository at initial claim time.  The legacy
             # per-deployment workspace_enabled bit is deliberately not a
@@ -1225,7 +1290,13 @@ async def _process_event(
                 try:
                     wait_scope = current_wait()
                     if wait_scope is None:
-                        await self._preflight_reclaimed_delivery(thread_key, lease)
+                        await self._preflight_reclaimed_delivery(
+                            thread_key,
+                            lease,
+                            event_id=event_id,
+                            desired_requester=caller_requester_facts(boot_env)[0],
+                            requester_enforced=identity.requester_enforced(),
+                        )
                     else:
                         record = await wait_scope[0].get(wait_scope[1])
                         if record is not None and record.grant_epoch is not None:
@@ -1390,6 +1461,23 @@ async def _process_event(
                         )
                         await asyncio.sleep(backoff_s)
                         continue
+                carry = constants._HOOK_RUN_CARRY.get()
+                if (
+                    isinstance(busy, failures.HookPaused)
+                    and carry is not None
+                    and carry.state is not None
+                    and carry.state.source == "webhook"
+                ):
+                    await self._complete(
+                        qevent,
+                        route,
+                        "dropped",
+                        telemetry_outcome="interrupted",
+                        lease=lease,
+                        hook_outcome="blocked",
+                        hook_reason="hook_paused",
+                    )
+                    return
                 if qevent.source is TurnSource.CRON and (
                     isinstance(busy, failures.HookPaused)
                     or (
@@ -1401,7 +1489,7 @@ async def _process_event(
                     # under the per-thread lock. Record the fire deferred and
                     # settle this delivery; the scheduler reopens the slot on
                     # a later tick or ages it out, so stream reclaim never
-                    # holds a cron turn. A targetless hook is never deferred.
+                    # holds a cron turn.
                     # A retry past its catch-up bound, busy or not, is
                     # skipped rather than deferred again.
                     expiry = retry_expiry(event_id)

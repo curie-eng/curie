@@ -199,7 +199,10 @@ it sets `X-Curie-Agent` from the verified token. When the token also carries
 `run` and `work_item` (ADR 0178), it sets `X-Curie-Run` and
 `X-Curie-Work-Item` from those claims. Inbound copies of the three headers
 are dropped first, so a caller cannot supply them. A token without the pair
-sets no run headers. A connector trusts the identity headers only on this
+sets no run headers. An admitted `cct` that carries a requester also gets one
+`X-Curie-Principal`, described below
+(`apps/worker/src/curie_connector_proxy/server.py::_identity_headers`). A
+connector trusts the identity headers only on this
 loopback forward. The `-direct` Service skips the proxy, so a connector
 reached there has no run. It checks every
 path the same way, the MCP client's OAuth discovery and registration requests
@@ -213,9 +216,13 @@ has not expired, and names this agent, this connector, this tool and the call's
 canonical arguments
 (`apps/worker/src/curie_connector_proxy/server.py::_grant_refused`). The grant's
 `jti` is then spent once in Valkey with `SET NX EX`, so a replayed grant, a
-missing grant store or a failed spend refuses the call. A body with two or more
-gated calls is refused before any grant is spent. The grant header is stripped
-before the forward. A refused grant check answers with the JSON-RPC refusal
+missing grant store or a failed spend refuses the call. A grant whose `jti` is
+not a canonical lowercase hyphenated UUID is refused as invalid. A body with two
+or more gated calls is refused before any grant is spent, and so is a JSON-RPC
+batch carrying a gated call or a call that matches the presented grant
+(sub-reason `batched_call`). The grant header is stripped before the forward,
+and a spent grant is attested to the connector as described under
+`X-Curie-Grant-Verified` below. A refused grant check answers with the JSON-RPC refusal
 below, reason `grant_required`
 (`apps/worker/src/curie_connector_proxy/caller.py::GRANT_REQUIRED`). On a path
 the connector does not declare as a route, a body over 1 MiB is refused with a
@@ -286,6 +293,141 @@ worker and the proxy ship in the same release, so during the upgrade that gives
 an install its key this covers every runner from before it and any runner a
 worker pod the roll has not replaced yet boots; `charts/curie/README.md` says
 how long that window lasts.
+
+A `cct` may also carry `principal`, the verified human who made the request
+([ADR 0270](../../adr/0270-hosted-connectors-receive-the-verified-requester-as-a-signed-caller-claim.md)
+decision 2). It is an object with exactly `tenant_id`, a lowercase hyphenated
+UUID, `issuer`, 1 to 2048 characters, and `subject`, 1 to 256 characters. Each
+is a string that encodes to UTF-8 (a lone surrogate is refused), compared
+exactly. The `cct` key sets are closed: `agent` and `exp`, optionally the `run` and `work_item` pair, and
+optionally `principal`. A principal is complete or absent, so a null, empty,
+partial, extra-key or wrongly typed one, and a duplicate key at any depth of
+the payload, is `invalid`
+(`apps/worker/src/curie_connector_proxy/caller.py::claims`). The worker
+refuses before boot to build a principal that breaks these rules or to mint a
+token past the verifier's 4096 characters
+(`apps/worker/src/curie_worker/caller_token.py::CallerPrincipal`,
+`apps/worker/src/curie_worker/caller_token.py::MAX_TOKEN_CHARS`). The proxy
+returns the principal only on an admitted decision
+(`apps/worker/src/curie_connector_proxy/caller.py::Principal`), never on an
+`expired` or `not_admitted` refusal, and never logs it. Its decision log line
+ends `principal=present` or `principal=absent` on an admitted `cct` and has no
+principal field on a refusal or a `ccr`. A requester adds no
+admission: `admits` still judges only the agent. A `ccr` never carries a
+principal, and one that does is `invalid`
+(`apps/worker/src/curie_connector_proxy/caller.py::decide_route`), so a route
+holds no human authority.
+
+The worker mints a principal only for an agent whose operator flag
+`connector_requester_identity` is on. It is off by default, and every other
+agent's token keeps its exact bytes. The proxy drops every inbound
+`X-Curie-Principal` header
+(`apps/worker/src/curie_connector_proxy/caller.py::PRINCIPAL_HEADER`), in any
+letter case and however often it repeats, on `cct` and `ccr` paths alike,
+before the forward
+(`apps/worker/src/curie_connector_proxy/server.py::_NOT_FORWARDED`). Then,
+after the signature, expiry, agent admission and any required tool-grant check
+have passed, it sets exactly one `X-Curie-Principal` from the verified
+principal of the admitted `cct`
+(`apps/worker/src/curie_connector_proxy/server.py::_identity_headers`, ADR 0270
+decision 4). The value is the unpadded base64url (`A-Z`, `a-z`, `0-9`, `-` and
+`_`, no `=`) of the UTF-8 bytes of the principal as JSON with exactly the keys
+`issuer`, `subject` and `tenant_id`, sorted, separated by `,` and `:` with no
+whitespace and no ASCII escaping, so non-ASCII text is raw UTF-8 while a
+control character, quote or backslash keeps its JSON escape
+(`apps/worker/src/curie_connector_proxy/caller.py::principal_header_value`).
+One principal has one spelling; the `principal_headers` section of
+`tests/vectors/connector-caller-token.json` freezes it. A principal-less `cct`,
+a `ccr` route request and a refused request carry no principal header. The
+caller token itself is never forwarded, and the proxy never logs the header's
+value.
+
+A connector reads the header with a bounded strict reader and treats a value
+it refuses as no requester. The reader checks the length before any decoding:
+at most 18535 characters, the longest value any principal within the field
+bounds encodes to. It then admits only the unpadded base64url alphabet and its
+one canonical spelling (no stray trailing bits), decodes strict UTF-8, parses
+JSON that refuses a repeated key, NaN and Infinity, requires exactly the three
+fields under the rules above, and last requires the value to equal the
+encoding of the principal it parsed. A second spelling of a principal, such as
+unsorted keys, spaced JSON, escaped non-ASCII, an escaped solidus or a byte
+order mark, is therefore refused even where a JSON parser accepts it. The proxy
+package's reader is
+`apps/worker/src/curie_connector_proxy/caller.py::read_principal_header`, and
+the reference connector `tools/identity-e2e/human_restricted_connector.py`
+carries its own. The `malformed_principal_headers` section of the same corpus
+lists values every reader refuses.
+
+The header is an identity the proxy attests, not a portable credential. A
+connector trusts it only on the loopback forward from its own caller proxy,
+like the other identity headers (ADR 0178 decision 6). The `-direct` Service
+bypasses the proxy, so a request there cannot establish a human with this
+header, whatever it sends. The decoded principal belongs to one HTTP request:
+the connector keeps it in that request's context and never takes it from a
+process global, an MCP session id or a previous request.
+
+The principal names the original human within the configured receiver and
+identity provider trust boundary. It carries no group membership, role,
+entitlement or exemption (ADR 0270 decision 5). A tool that requires a human
+refuses a principal-less call with a named `missing_requester` reason and never
+substitutes an argument, a previous request or a service account. Before its
+effect, it checks current downstream authority for the exact `tenant_id`,
+`issuer` and `subject`, and refuses when that authority is unavailable.
+Model-written flags and names supply no authority.
+
+Nothing revokes a copied `cct` early. It stays admissible until its signed
+expiry, at most one hour after it was minted, even after the requester hands
+off or the sandbox that held it is suspended or terminated. This replay window
+is accepted (ADR 0270 decision 3). Expiry refuses later admission and does not
+cancel an effect already in progress.
+
+`connector_requester_identity` is experimental in this release and should stay
+off outside test installs. When it is on, an opted-in agent's hosted-connector
+caller tokens carry the verified human requester, the connector proxy verifies
+it, and the proxy passes it to the agent's admitted hosted connectors as
+`X-Curie-Principal`. With it off, no token carries a principal and no
+connector receives the header. The worker
+replaces a sandbox before serving a different requester and never runs one
+person's message under another person's token. A different person's message
+that arrives during a live turn waits for that turn to end. A message that can
+park waits in a durable capacity wait record for up to the capacity wait budget
+(24 hours by default) and ends without running if the turn outlasts it; an
+HTTP identity delivery gets no notice when that happens. A delivery that cannot
+park, such as an approval resume, keeps the redelivery budget and is settled
+visibly without running. The local tier runs no caller proxy, so its hosted
+connectors never receive the header.
+
+As a precondition, the api, the worker and the agent's connector proxies must
+all run this release, and the agent must be redeployed first if its connector
+proxies predate it. A mixed state fails closed rather than leaking or widening
+authority: an older worker cannot read the turn authority answer that carries
+the requester and refuses the turn, and an older proxy refuses a
+principal-bearing `cct` as `invalid`, so the agent's connector calls are
+refused until the rollout completes. An older proxy also never sets
+`X-Curie-Principal`, so a connector tool that requires a human refuses
+`missing_requester` behind it until the rollout completes.
+
+After a grant check spends a grant, the proxy attests it to the connector with
+exactly one `X-Curie-Grant-Verified` whose value is the spent grant's `jti`
+(`apps/worker/src/curie_connector_proxy/caller.py::GRANT_VERIFIED_HEADER`,
+ADR 0271 decision 7). It drops every inbound copy with the other identity
+headers, in any letter case and however often it repeats, on every path
+(`apps/worker/src/curie_connector_proxy/server.py::_NOT_FORWARDED`), and sets
+its own beside `X-Curie-Principal` only on a `tools/call` forward whose grant
+check returned an attestation
+(`apps/worker/src/curie_connector_proxy/server.py::_identity_headers`). A
+gated call attests the grant it spent. An ungated call attests only a grant
+whose signature, connector, tool and canonical arguments match it, after the
+same expiry and agent checks and a successful spend; a matching grant that has
+expired, names another agent or is already spent refuses `grant_required`, and
+any other incidental grant is stripped and the call forwarded unattested with
+nothing spent (`apps/worker/src/curie_connector_proxy/server.py::_grant_refused`).
+The runner's static `X-Curie-Connector-Grant` on every hosted entry therefore
+spends nothing on an unrelated call after an approved resume or on warm reuse.
+The decision log line ends ` attested=present` on an attested forward and never
+carries the value. The contract is under "Verified spent-grant header" below.
+The local tier runs no caller proxy, so no connector there receives the header,
+and a protected execution tool refuses every call there.
 
 ## Implementations today
 
@@ -444,9 +586,12 @@ Deployment shape for capability probes to become eligible.
 
 This section freezes the wire contract for
 [ADR 0271](../../adr/0271-per-request-approver-sets-and-separation-of-duties.md).
-The pure signer and verifier are available; approval creation, policy, nonce
-storage and proxy header wiring are separate implementation slices. These
-contracts do not claim that those paths already enforce this policy.
+The pure signer and verifier are available, and the API now enforces
+registration, the route lock and creation verification (see "What the API
+enforces today" below), and the connector proxy sets the verified-grant header
+(see "Verified spent-grant header" below). Answer and resume authority and
+separation of duties are enforced (see
+[Per-request approver selection](../../approvals.md#per-request-approver-selection-adr-0271)).
 
 The connector helper is
 `packages/curie-internal/src/curie_internal/approver_ticket.py`.
@@ -462,8 +607,95 @@ These helpers perform no database, route, current identity, key registration,
 requester-association, ceiling or nonce-spend checks. Creation owners must add
 those checks atomically, including comparison of the signed tenant, agent,
 connector, exact tool and route with the verified creation context. A parsed
-ticket is not execution authorization. JSONB numeric round-trip refusal belongs
-to the creation slice, not this pure contract.
+ticket is not execution authorization. JSONB numeric round-trip refusal is a
+creation-time check in the API, not part of this pure contract.
+
+### What the API enforces today
+
+The creation slice wires the pure verifier into the platform. Each item below is
+enforced by the API; none of it changes the wire contract in this document.
+
+1. Registration. An operator registers a selector on an approval route through
+   the agent's `approval_routes` write: connector, exact upstream tool, key id,
+   Ed25519 public key and a ceiling that pins the restricted approver role at a
+   named access-policy version. Registration requires the agent's requester
+   identity flag, a restricted approver role, and at least one active
+   deployment. Every active deployment's effective route map must gate the exact
+   connector tool on that route. The write is a compare-and-set on the agent's
+   shared configuration version, the same version the requester identity flag
+   uses, so a selector write and a flag change cannot both commit from one
+   read. The flag cannot be turned off while any selector is registered. The
+   operator procedure is in [approvals](../../approvals.md#per-request-approver-selection-adr-0271).
+2. Route lock. Once a connector tool is registered on a route, an approval for
+   that tool is accepted only on that route and only carrying a top-level
+   `approval_ticket`. A looser route, no route, or an empty route name is
+   refused whatever `gate_kind` says. A ticket on a route or tool with no
+   registration is refused.
+3. Creation verification. A dynamic approval is created only through
+   `POST /v1/internal/identity/approvals`. The API checks the complete grant
+   size, verifies the ticket with the registered key, compares the signed
+   tenant, agent, connector, tool and route with the verified creation context,
+   and requires the signed requester to equal the original human requester. It
+   then checks that every selected approver is an active human known to the
+   platform and inside the pinned ceiling. It also refuses duplicate recipient
+   accounts, and re-checks that the active serving bundles still gate the pair
+   on the route.
+4. Ceiling proof at creation. Only an exact canonical identity proves ceiling
+   membership: each selected approver must be named by issuer and subject in the
+   pinned role and, when `ceiling.users` is set, also listed there.
+   `ceiling.users` narrows the pinned role and never admits someone the role
+   does not name. Group entries and surface-account entries never match at
+   creation, because nothing can establish them for a person who is not
+   present. A pinned role that names approvers only by group therefore cannot
+   raise a dynamic approval, even when `ceiling.users` names the selected
+   people, until a subject-keyed identity lookup exists.
+5. Nonce single use. The ticket nonce is spent per agent in the same transaction
+   that stores the approval, so a replay under any dedupe key is refused. An
+   identical retry under the same dedupe key returns the original receipt, and a
+   conflicting retry under that key is refused.
+6. JSONB round trip. The stored arguments must canonicalize to the same bytes
+   as the arguments in the request. Otherwise creation rolls back with
+   `approval_ticket_arguments_unstable`.
+7. Legacy boundary. `POST /approvals` never creates a dynamic approval. A
+   request there that carries a ticket, or that names a registered tool, is
+   refused `approval_ticket_requires_http_creation`. The route lock applies to
+   it unchanged.
+
+A dynamic approval records the selected approver set, the signed requester, the
+key id, the nonce, and the arguments digest, all covered by the approval's
+integrity seal. Ordinary approvals and their existing seals are unchanged.
+
+Answer and resume. The answer path checks the answering human against the
+stored selected approvers, the registered ceiling and fresh identity facts, and enforces
+separation of duties, at answer and again at resume; the detail is in
+[Per-request approver selection](../../approvals.md#per-request-approver-selection-adr-0271).
+
+Creation refusals. All are JSON error responses with the code in `detail`.
+
+| Status | Code | Condition |
+| --- | --- | --- |
+| 409 | `approval_route_locked` | The tool is registered on a route and the request names another route, none, or an empty one. |
+| 409 | `approval_ticket_route_mismatch` | On the owning route, but the granted tool is not that route's registered tool. |
+| 409 | `approval_ticket_required` | On the owning route and tool, but the grant arguments carry no top-level string `approval_ticket`. |
+| 409 | `approval_ticket_unregistered` | A top-level ticket is present but the route has no registration for this tool. |
+| 409 | `approver_ticket_requires_requester_identity` | A registration exists while the agent's requester identity flag is off. |
+| 409 | `approver_ticket_state_invalid` | The stored registration is malformed or duplicates a pair. Creation fails closed. |
+| 409 | `approval_ticket_replayed` | The nonce was already spent for this agent. |
+| 409 | `approval_provenance_conflict` | A different request reuses an existing dedupe key. |
+| 409 | `approval_ticket_requires_http_creation` | A dynamic request or a ticket arrived on legacy `POST /approvals`. |
+| 409 | `approver_ticket.bundle_gate_mismatch` | An active serving bundle does not gate the registered tool on its route. |
+| 422 | `approval_ticket_<code>` | The ticket failed verification. `<code>` is a frozen refusal code below (`invalid_ticket`, `arguments_mismatch`, `grant_too_large` and the rest), or `scope_mismatch`, `requester_mismatch` or `recipient_duplicate`. |
+| 422 | `approval_ticket_approver_inactive` | A selected approver is unknown, not human, or not active. |
+| 422 | `approval_ticket_outside_ceiling` | A selected approver is not proven inside the pinned ceiling by exact identity. |
+| 422 | `approval_ticket_arguments_unstable` | The stored arguments do not round trip to the same canonical bytes. |
+| 503 | `authority_unavailable` | The bundle store was unavailable, or the registration, flag, deployment or bundle changed between the preparation and commit phases. |
+
+Registration refusals (the operator write, not creation) are 409
+`approval_routes.version_conflict`, 409 `approval_routes.expected_version_required`,
+409 `stale_role_policy_version`, 422 `approver_ticket_requires_requester_identity`,
+422 `approver_ticket_ceiling_invalid`, 422 `approver_ticket_pair_conflict`,
+422 `approver_ticket.bundle_gate_mismatch`, 422 `approver_ticket.no_serving_bundle`
+and 422 `requester_identity_selector_registered` when disabling the flag.
 
 ### Ticket bytes and payload
 
@@ -705,3 +937,18 @@ from the proxy's gated list. The connector also checks its ticket and current
 local policy before the effect. API answer and resume checks own selected actor
 and separation policy; this header supplies no second approval policy or result
 lookup API. An uncertain upstream outcome never permits replay of a spent grant.
+
+The proxy implements this in
+`apps/worker/src/curie_connector_proxy/server.py`: `_forwardable` drops inbound
+copies, `_grant_refused` judges the gated and ungated cases and returns the
+attestation, `_grant_spent` performs the single-use spend before any forward,
+and `_handle` passes the attestation to `_identity_headers`. The worker mints
+the grant for exactly the approved tool and arguments with a fresh UUID `jti`
+(`apps/worker/src/curie_worker/kernel/claim.py::_connector_tool_grant`). The
+reference connector `tools/identity-e2e/human_restricted_connector.py` shows a
+protected execution handler: its `execute_attested` and `execute_approved`
+tools refuse a missing or malformed attestation and a grant id already used,
+then check the requester and, for `execute_approved`, the ticket's signature,
+scope, requester and argument digest, before current downstream authority and
+the effect. The proxy exists only on Kubernetes, so the header is only ever set
+there.

@@ -1155,6 +1155,17 @@ async def _consume(
                 if exc.timeout_result == "accepted"
                 else "runner-timeout-unconfirmed"
             )
+            if getattr(turn, "requester_window_bound", False) is True:
+                # ADR 0270 decision 3: the requester window, not the configured
+                # bound, ended this turn. Visible and not retried; an
+                # unconfirmed stop keeps its own classification.
+                logger.info(
+                    "requester turn %s ended at the requester token window (stop %s)",
+                    qevent.event_id,
+                    exc.timeout_result,
+                )
+                if exc.timeout_result == "accepted":
+                    classification = constants.REQUESTER_WINDOW_CLASSIFICATION
         else:
             classification = "runner-error"
             if stream_reading and isinstance(exc, aiohttp.ClientError):

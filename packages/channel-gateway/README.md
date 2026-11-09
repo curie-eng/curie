@@ -14,7 +14,7 @@ the import-linter contract forbids `curie_channel_gateway.mail` from importing
 `curie_channel_gateway.slack` or `curie_dispatcher`, including indirectly.
 
 The boundary proposal is recorded in
-[Draft ADR 0275](../../docs/adr/0275-channel-gateway-provider-boundary.md).
+[ADR 0275](../../docs/adr/0275-channel-gateway-provider-boundary.md).
 
 ## Ports
 

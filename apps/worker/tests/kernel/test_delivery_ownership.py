@@ -2558,7 +2558,10 @@ def test_followup_preserves_crashed_predecessor_retry_fence(
                         h.config.stream, h.config.consumer_group, entry, consumer="reclaim-worker"
                     )
                     with pytest.raises(ReclaimPreflightUnsafe):
-                        await worker_c._kernel._preflight_reclaimed_delivery(thread, reclaimed)
+                        await worker_c._kernel._preflight_reclaimed_delivery(
+                            thread, reclaimed, event_id=first.event_id,
+                            desired_requester="absent", requester_enforced=False,
+                        )
                     assert h.runner.interrupts == 0
                     await store.release(
                         reclaimed.stream,
@@ -2639,7 +2642,10 @@ def test_reclaimed_turn_cannot_replay_an_action_started_during_interrupt(
                 reclaimed = await store.acquire(
                     h.config.stream, h.config.consumer_group, entry, consumer=h.config.consumer_name
                 )
-                await h.kernel._preflight_reclaimed_delivery(thread, reclaimed)
+                await h.kernel._preflight_reclaimed_delivery(
+                    thread, reclaimed, event_id=event.event_id,
+                    desired_requester="absent", requester_enforced=False,
+                )
                 assert await h.kernel._markers.saw_side_effect(event.event_id)
                 await store.release(
                     reclaimed.stream,
@@ -2861,5 +2867,104 @@ def test_terminal_unreadable_watch_stops_probing_after_three_failures(make_harne
                 owner=next_lease.owner,
                 resume_event_id=None,
             )
+
+    asyncio.run(go())
+
+
+@pytest.mark.parametrize("same_requester", [False, True])
+@pytest.mark.parametrize("side_effect", [False, True])
+def test_reclaimed_watch_keeps_requester_and_side_effect_fences(
+    make_harness, same_requester: bool, side_effect: bool
+) -> None:
+    import base64
+
+    from curie_worker import caller_token
+    from curie_worker.binding import caller_requester_facts
+    from curie_worker.kernel.failures import RequesterHandoffPending
+    from curie_worker.kernel.memory import ReclaimPreflightUnsafe
+
+    from .conftest import FakeRunner
+
+    def boot(subject: str) -> dict[str, str]:
+        return {
+            "CURIE_RUNNER_TOKEN": "recovery-test-token",
+            "CURIE_CONNECTOR_CALLER_TOKEN": caller_token.mint(
+                base64.b64encode(bytes(range(32))).decode(),
+                agent="acme-dev",
+                exp=int(time.time()) + 3600,
+                principal=caller_token.CallerPrincipal(
+                    tenant_id="44444444-4444-4444-8444-444444444444",
+                    issuer="https://identity.example.com",
+                    subject=subject,
+                ),
+            ),
+        }
+
+    class StoppingRunner(FakeRunner):
+        async def _interrupt(self, request):
+            self.turn_active = False
+            return await super()._interrupt(request)
+
+    async def go() -> None:
+        runner = StoppingRunner()
+        async with make_harness(runner_app=runner.app) as h:
+            event = _qevent("recover the watched turn", event_id="requester-watch-transfer")
+            thread = _thread_key_for(event)
+            predecessor_env = boot("first-requester")
+            desired_env = boot("first-requester" if same_requester else "second-requester")
+            handle = h.substrate.claim(thread, env=predecessor_env)
+            assert handle.caller_requester == caller_requester_facts(predecessor_env)[0]
+            store = DeliveryLeaseStore(h.async_redis, h.config)
+            consumer = Consumer(redis=h.async_redis, kernel=h.kernel, config=h.config, leases=store)
+            await consumer.ensure_group()
+            await h.async_redis.xadd(h.config.stream, to_stream_fields(event))
+            entry, _fields = await _read_one(h, h.config.consumer_name)
+            previous = await store.acquire(
+                h.config.stream, h.config.consumer_group, entry, consumer=h.config.consumer_name
+            )
+            assert previous is not None
+            await h.kernel._markers.watch_turn(thread, handle.claim_name, previous, event.event_id)
+            await store.release(
+                previous.stream,
+                previous.group,
+                previous.entry_id,
+                owner=previous.owner,
+                resume_event_id=None,
+            )
+            await h.async_redis.xclaim(
+                h.config.stream, h.config.consumer_group, "reclaim-worker", 0, [entry]
+            )
+            reclaimed = await store.acquire(
+                h.config.stream, h.config.consumer_group, entry, consumer="reclaim-worker"
+            )
+            assert reclaimed is not None
+            runner.turn_active = True
+            runner.side_effect_emitted = side_effect
+
+            async def preflight() -> None:
+                await h.kernel._preflight_reclaimed_delivery(
+                    thread,
+                    reclaimed,
+                    event_id=event.event_id,
+                    desired_requester=caller_requester_facts(desired_env)[0],
+                    requester_enforced=True,
+                )
+
+            if not same_requester:
+                with pytest.raises(RequesterHandoffPending):
+                    await preflight()
+                assert runner.interrupts == 0
+                assert runner.turn_active
+            else:
+                if side_effect:
+                    with pytest.raises(ReclaimPreflightUnsafe):
+                        await preflight()
+                await preflight()
+                assert runner.interrupts == 1
+                assert not runner.turn_active
+            assert runner.opened == []
+            assert await h.kernel._markers.saw_side_effect(event.event_id) is side_effect
+            assert await h.kernel._markers.watched_turn(handle.claim_name) is not None
+            assert h.substrate.lookup(thread) == handle
 
     asyncio.run(go())

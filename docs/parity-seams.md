@@ -94,14 +94,26 @@ as a whole; remembered only):
   (`apps/worker/src/curie_worker/caller_token.py`) and `decide`
   (`apps/worker/src/curie_connector_proxy/caller.py`) run in different pods,
   and the proxy may not import the worker, so both read one frozen corpus; the
-  CLI derives its generated public keys against the same seeds.
+  CLI derives its generated public keys against the same seeds. The corpus also
+  pins the optional requester `principal` (ADR 0270): principal-bearing tokens
+  the minter reproduces and the verifier admits, malformed and tampered
+  principals the verifier refuses as invalid, and forged `X-Curie-Principal`
+  headers the proxy strips on `cct` and `ccr` paths. Its `principal_headers`
+  and `malformed_principal_headers` sections freeze the one header spelling the
+  proxy sets (`principal_header_value`) and the values a reader refuses, read by
+  both header readers: the proxy package's `read_principal_header`
+  (`apps/worker/src/curie_connector_proxy/caller.py`) and the reference
+  connector's reader (`tools/identity-e2e/human_restricted_connector.py`).
   [vector: `tests/vectors/connector-caller-token.json`]
   The upload-only minter and verifier use the distinct `ccu` scope and share
   [vector: `tests/vectors/connector-upload-token.json`].
 21. connector proxy refusal vs runner diagnosis -- the proxy's refusal body
   (`apps/worker/src/curie_connector_proxy/server.py`) and the runner's
   `caller_refused` reason (`runner/src/curie_runner/mcp_tool_capability.py`)
-  ship in different images, so they are frozen together.
+  ship in different images, so they are frozen together. Its
+  `principal_refusals` show a principal-bearing token refused as `invalid`,
+  `not_admitted` or `expired` gets the same body as any other token, so the
+  runner names it the same way.
   [vector: `tests/vectors/connector-caller-refusal.json`]
 22. worker vs runner vs API deliberate progress capability (ADR-0130) -- the
   runner control headers and `turn.progress` token scope the worker mints

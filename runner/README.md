@@ -187,9 +187,13 @@ result the model can correct, still without failing the turn. The call is
 platform-owned and idempotent (`PLATFORM_IDEMPOTENT_TOOLS`), so it raises no
 `side_effect_flag` and never lands on the turn's receipt.
 
-The fake model is unconditionally network-free, including when progress headers
-are present. `[fake:progress-demo]` remains a deterministic long-running turn
-for steering tests, but it does not call the ingress. API/worker integration
+The fake model is network-free, including when progress headers are present.
+`[fake:progress-demo]` remains a deterministic long-running turn
+for steering tests, but it does not call the ingress. The one exception is
+`[fake:connector-call]` (ADR 0270 evidence): it dials each hosted connector the
+caller proxy fronts with one `initialize` and one `tools/list`, and answers one
+`connector-call` line per connector that names the outcome and a sha256 prefix
+of the caller token, never the token. API/worker integration
 tests and live-provider tests exercise the real progress handler instead.
 
 ## Per-turn tool access

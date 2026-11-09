@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import re
 import uuid
 from dataclasses import dataclass
 from datetime import datetime
@@ -27,13 +28,15 @@ from channel_protocol.reply import (
     ReplyUpdate,
     SettledOutcome,
 )
+from curie_internal.identity_approval import ApprovalCreationIdentityV1
 from curie_telemetry.redact import redact_text
 from opentelemetry.trace import SpanKind, StatusCode
 from pydantic import ValidationError
 
-from ..approval_wording import approval_display
+from ..approval_wording import approval_display, describe_approval
 from ..approvals import (
     ApprovalBackendError,
+    ApprovalCardRegistrar,
     ApprovalContinuityRefused,
     ApprovalRefused,
     ApprovalRequest,
@@ -43,6 +46,7 @@ from ..approvals import (
     approver_fields,
     decided_field,
 )
+from ..binding import binding_adapter_for_handle
 from ..reply_sink import (
     CLUSTER_MESSAGE_ADAPTER,
     TargetRoute,
@@ -132,9 +136,20 @@ def _approver_emails(binding: Any) -> list[str]:
     return list(emails)
 
 
+@dataclass(frozen=True)
+class ApproverDmTarget:
+    """A route resolved to one selected approver's DM (ADR 0272 decision 1).
+
+    ``identity`` is the Slack bot identity that posts the card; the recipient
+    is not known until the API verifies the request's selection at creation.
+    """
+
+    identity: str
+
+
 def _parse_approval_targets(
     binding: Any,
-) -> tuple[tuple[str, str] | None, tuple[str, str, TargetRoute] | None] | None:
+) -> tuple[tuple[str, str] | ApproverDmTarget | None, tuple[str, str, TargetRoute] | None] | None:
     """Parse one stored approval binding, or fail closed with ``None``.
 
     The first element is the fixed card target, or ``None`` when the route's
@@ -143,12 +158,21 @@ def _parse_approval_targets(
     one key, and it carries no notification, since the card already joins the
     thread that asked; a mix of the mode and a fixed target is refused.
 
+    ``{"mode": "approver_dm", "identity": <slug>}`` (ADR 0272) answers an
+    ``ApproverDmTarget``: the card goes to the one approver the request selects.
+    It is exactly those two keys with a slug identity, it carries no
+    notification, and it is valid only beside an ``approver_ticket``, since only
+    a per-request selection names the one recipient.
+
     The API owns complete config validation. This worker boundary independently
     reasserts the authority-bearing envelope and Slack resolution-ID shape
     because JSONB may be written out of band: the retired ``channel`` key, a
     non-Slack resolver, an unknown target field, a half-configured transport,
     or duplicate targets must not produce a durable approval with ambiguous
-    authority.
+    authority. The operator-owned route keys ``approvers``,
+    ``approver_ticket`` and ``separation`` (ADR-0271 decision 1) are accepted
+    but never interpreted here: card targets come only from ``resolution`` and
+    ``notification``, and every other unknown route key is refused.
 
     ADR-0168 decision 3: a Slack notification names its identity in
     ``adapter``, or none for the default, and has no endpoint; any other kind
@@ -161,7 +185,18 @@ def _parse_approval_targets(
         "resolution",
         "notification",
         "approvers",
+        "expires_in_seconds",
+        "approver_ticket",
+        "separation",
+        "remind_every_s",
     }:
+        return None
+
+    duration = binding.get("expires_in_seconds")
+    if duration is not None and (type(duration) is not int or not 0 < duration <= 315_360_000):
+        return None
+    interval = binding.get("remind_every_s")
+    if interval is not None and (type(interval) is not int or not 0 < interval <= 2**31 - 1):
         return None
 
     resolution = binding.get("resolution")
@@ -169,6 +204,18 @@ def _parse_approval_targets(
         if binding.get("notification") is not None:
             return None
         return None, None
+    if isinstance(resolution, dict) and resolution.get("mode") == constants._APPROVER_DM_MODE:
+        dm_identity = resolution.get("identity")
+        if (
+            set(resolution) != {"mode", "identity"}
+            or not isinstance(dm_identity, str)
+            or constants._CHANNEL_SLUG.fullmatch(dm_identity) is None
+            or dm_identity == CLUSTER_MESSAGE_ADAPTER
+            or binding.get("notification") is not None
+            or binding.get("approver_ticket") is None
+        ):
+            return None
+        return ApproverDmTarget(identity=dm_identity), None
     if (
         not isinstance(resolution, dict)
         or set(resolution) != {"kind", "address"}
@@ -221,6 +268,67 @@ def _parse_approval_targets(
     ):
         return None
     return resolution_pair, (kind, address, TargetRoute(endpoint=endpoint, adapter=adapter))
+
+
+def _approval_card_message(
+    approval_id: str, summary: str, *, approver_emails: list[str]
+) -> OutboundMessage:
+    """The approval card as a channel-neutral message (#246, ADR-0010/0020).
+
+    A Confirm intent (Approve/Reject) emitted WITHOUT any Block Kit: the Slack
+    adapter renders it into the card's buttons below the seam. The confirm and
+    cancel actions carry the durable record id so a click resolves exactly this
+    approval through the API's server-side authorizer. The models validate on
+    construction, so callers build it inside their best-effort card delivery.
+    """
+
+    return OutboundMessage(
+        version=MESSAGE_VERSION,
+        text=summary,
+        # ADR-0177 amendment A5: an email card in the asking thread names
+        # who can approve. Display only; the platform decides who may.
+        fields=approver_fields(approver_emails),
+        interaction=ConfirmIntent(
+            kind="confirm",
+            id=approval_id,
+            prompt=summary,
+            confirm=Action(label="Approve", value=approval_id),
+            cancel=Action(label="Reject", value=approval_id),
+            # An approval decision may carry a reason (#1053). This says
+            # only that, semantically; each adapter decides how to
+            # collect it (ADR-0020: the interaction is the port, the
+            # widget is the adapter). Slack renders a dialog on the
+            # click, the terminal renderer a typed reply. The note is
+            # optional in every rendering, and the note the approver
+            # leaves already reaches the requester -- the API stores it
+            # on the record and build_resume_turn interpolates it into
+            # the platform-authored resume text.
+            #
+            # UNCONDITIONAL, and that is the decision rather than an
+            # oversight (#1076). It costs an approver who wants no note
+            # one extra click, on every approval, in every deployment,
+            # so it was worth stating rather than leaving as the only
+            # reachable arm of a branch that looked configurable.
+            #
+            # Rejected: exposing a per-agent or env toggle. A reason is
+            # the half of a rejection the requester actually needs, and
+            # the dialog is what makes leaving one the default rather
+            # than a thing you remember to do from the CLI. A toggle
+            # would also keep TWO settled-card render paths alive
+            # permanently, which is what #1073 and #1084 exist to
+            # collapse into one. And the evidence for whether operators
+            # want the opt-out does not exist yet: discussion #1061
+            # settles that the approval plane's plumbing gets fixed
+            # first and governance knobs are decided from evidence
+            # after, which applies to this knob as much as to #1054's.
+            #
+            # If that evidence arrives, this field is still the one flip
+            # -- but the flip needs an operator-written source, never a
+            # bundle-declared one (the #520 anti-hollow-out rule: an
+            # agent must not widen how its own approvals are collected).
+            allow_free_text=True,
+        ),
+    )
 
 
 def _settled_outcome(
@@ -360,6 +468,7 @@ async def _settle_remembered_card(
     """
 
     assert self._card_store is not None
+    await self._card_store.settle(approval_id)
     entry = await self._card_store.read(approval_id)
     if entry is None:
         return
@@ -637,6 +746,9 @@ async def _pause_for_approval(
     # A5), so the mail adapter can tell the requester who can approve. Set
     # only on the email branch below, where the list was just required.
     card_approver_emails: list[str] = []
+    # ADR 0272: the route resolves to the one selected approver's DM. The card
+    # has no address until the API names the verified recipient at creation.
+    dm_target: ApproverDmTarget | None = None
     if route_name:
         binding = (approval_routes or {}).get(route_name)
         targets = _parse_approval_targets(binding)
@@ -658,7 +770,31 @@ async def _pause_for_approval(
             )
             return _ApprovalPause(created=False, escalation_update=escalation_update)
         fixed_target, notification_target = targets
-        if fixed_target is not None:
+        if isinstance(fixed_target, ApproverDmTarget):
+            # Only a selected (HTTP identity) turn carries the per-request
+            # selection that names the one recipient, and a DM card ref must
+            # outlive the terminal window, which needs pending retention (ADR
+            # 0273 decision 4). Either missing: nothing is created.
+            if not selected or not self._config.approval_pending_retention_enabled:
+                logger.warning(
+                    "approval route %r resolves to an approver DM, which this turn "
+                    "cannot deliver (selected=%s, pending retention=%s); escalating",
+                    route_name,
+                    selected,
+                    self._config.approval_pending_retention_enabled,
+                )
+                escalation_update = await self._escalate(
+                    qevent,
+                    route,
+                    f"The run requested approval via route {route_name!r}, which "
+                    "delivers its card to one selected approver's direct messages; "
+                    "this request cannot be delivered there, so no approval was "
+                    "created. Flagging for a human.",
+                    failure_class="approval-route-unsupported",
+                )
+                return _ApprovalPause(created=False, escalation_update=escalation_update)
+            dm_target = fixed_target
+        elif fixed_target is not None:
             card_kind, card_channel = fixed_target
         elif handle.kind in constants._APPROVER_EMAIL_KINDS:
             card_approver_emails = _approver_emails(binding)
@@ -734,6 +870,9 @@ async def _pause_for_approval(
     )
     if self._approval_run_abandoned(qevent):
         return _ApprovalPause(created=False, abandoned=True)
+    # The selected creation's identity block, which a DM card's registration
+    # repeats verbatim (ADR 0272).
+    creation: dict[str, ApprovalCreationIdentityV1] = {}
     try:
         if is_publication:
             publication_creator = self._publication_creator
@@ -834,9 +973,7 @@ async def _pause_for_approval(
             assert self._approvals is not None
             # @spec HTTP-APPROVAL-CONTINUITY-3/4: only the live owner supplies identity.
             # A legacy creator keeps its exact call shape.
-            creation = (
-                {"identity": identity.creation_identity()} if selected else {}
-            )
+            creation = {"identity": identity.creation_identity()} if selected else {}
             created = await self._approvals.create(
                 ApprovalRequest(
                     agent_id=agent_id,
@@ -871,7 +1008,9 @@ async def _pause_for_approval(
                     ),
                     dedupe_key=qevent.event_id,
                     route=route_name,
-                    card_channel=card_channel,
+                    # A DM card's channel is unknown until the provider answers
+                    # the post; the registration records it (ADR 0272).
+                    card_channel=None if dm_target is not None else card_channel,
                     # The ACI ``final`` frame types this as a bare ``str``, so an
                     # unrecognized value only fails when the shared model
                     # validates it (#492/#544: it is authority-bearing, so it is
@@ -880,7 +1019,13 @@ async def _pause_for_approval(
                     gate_kind=cast("GateKind | None", outcome.approval_gate_kind),
                     granted_tool=outcome.approval_granted_tool,
                     granted_arguments=outcome.approval_granted_arguments,
-                    expires_in_seconds=constants._SESSION_APPROVAL_EXPIRES_IN_SECONDS,
+                    expires_in_seconds=(
+                        binding["expires_in_seconds"]
+                        if route_name
+                        and isinstance(binding, dict)
+                        and "expires_in_seconds" in binding
+                        else constants._SESSION_APPROVAL_EXPIRES_IN_SECONDS
+                    ),
                 ),
                 budget_s=routing._api_write_budget_s(),
                 **creation,
@@ -952,6 +1097,12 @@ async def _pause_for_approval(
         if selected:
             raise identity.HttpIdentityRefused() from None
         raise
+    if created.granted_tool is not None:
+        # ADR 0271 decision 8 (@spec REQUEST-APPROVAL-8): a V2 receipt returned
+        # the persisted grant, so the card, prompt, notice, notification and the
+        # summary remembered for settlement describe those stored values. The
+        # runner's display and the model's own arguments cannot replace them.
+        display_summary = describe_approval(created.granted_tool, created.granted_arguments)
     if self._approval_run_abandoned(qevent):
         # #4331: the thread route may now name a successor's claim, so this
         # worker neither touches the workspace nor suspends.
@@ -1056,17 +1207,19 @@ async def _pause_for_approval(
     # within its kind: two bindings may carry the same address string under
     # different kinds, and comparing addresses alone would hand a non-Slack
     # turn's transport to a Slack policy card that merely shares its address.
-    in_requesting_channel = (card_kind, card_channel) == (
+    in_requesting_channel = dm_target is None and (card_kind, card_channel) == (
         handle.kind,
         handle.channel,
     )
     card_endpoint = handle.endpoint if in_requesting_channel else None
-    # A policy route names only a channel. A Slack turn lends its adapter
-    # so a named identity posts the card under that same identity. An adapter
-    # from another kind cannot carry a Slack policy card.
-    card_adapter = (
-        None if not in_requesting_channel and handle.kind != SLACK_KIND else route.adapter
-    )
+    # A policy route names only a channel. A Slack turn lends its bot identity;
+    # the relay's delivery adapter and other channel kinds cannot carry it.
+    if in_requesting_channel:
+        card_adapter = route.adapter
+    elif handle.kind == SLACK_KIND:
+        card_adapter = binding_adapter_for_handle(handle)
+    else:
+        card_adapter = None
     # The relay (#2883) carries the card on the turn's own ref, so no card
     # message follows the notice there, and its reader parses the approval id
     # out of the notice text.
@@ -1147,6 +1300,17 @@ async def _pause_for_approval(
     else:
         requested_by = qevent.author
 
+    if dm_target is not None:
+        await self._deliver_approver_dm_card(
+            qevent,
+            created,
+            creation_identity=creation["identity"],
+            summary=display_summary,
+            requested_by=requested_by,
+        )
+        logger.info("thread %s suspended awaiting approval %s", thread_key, created.id)
+        return _ApprovalPause(created=True)
+
     # The approval interaction (#246, ADR-0010/0020): a channel-neutral
     # Confirm intent (Approve/Reject) emitted WITHOUT any Block Kit -- the
     # Slack adapter renders it into the approval card's buttons below the
@@ -1157,52 +1321,8 @@ async def _pause_for_approval(
     # pause -- the durable record and the resume path -- stands with or without
     # the card, exactly as before.
     try:
-        card_message = OutboundMessage(
-            version=MESSAGE_VERSION,
-            text=display_summary,
-            # ADR-0177 amendment A5: an email card in the asking thread names
-            # who can approve. Display only; the platform decides who may.
-            fields=approver_fields(card_approver_emails),
-            interaction=ConfirmIntent(
-                kind="confirm",
-                id=created.id,
-                prompt=display_summary,
-                confirm=Action(label="Approve", value=created.id),
-                cancel=Action(label="Reject", value=created.id),
-                # An approval decision may carry a reason (#1053). This says
-                # only that, semantically; each adapter decides how to
-                # collect it (ADR-0020: the interaction is the port, the
-                # widget is the adapter). Slack renders a dialog on the
-                # click, the terminal renderer a typed reply. The note is
-                # optional in every rendering, and the note the approver
-                # leaves already reaches the requester -- the API stores it
-                # on the record and build_resume_turn interpolates it into
-                # the platform-authored resume text.
-                #
-                # UNCONDITIONAL, and that is the decision rather than an
-                # oversight (#1076). It costs an approver who wants no note
-                # one extra click, on every approval, in every deployment,
-                # so it was worth stating rather than leaving as the only
-                # reachable arm of a branch that looked configurable.
-                #
-                # Rejected: exposing a per-agent or env toggle. A reason is
-                # the half of a rejection the requester actually needs, and
-                # the dialog is what makes leaving one the default rather
-                # than a thing you remember to do from the CLI. A toggle
-                # would also keep TWO settled-card render paths alive
-                # permanently, which is what #1073 and #1084 exist to
-                # collapse into one. And the evidence for whether operators
-                # want the opt-out does not exist yet: discussion #1061
-                # settles that the approval plane's plumbing gets fixed
-                # first and governance knobs are decided from evidence
-                # after, which applies to this knob as much as to #1054's.
-                #
-                # If that evidence arrives, this field is still the one flip
-                # -- but the flip needs an operator-written source, never a
-                # bundle-declared one (the #520 anti-hollow-out rule: an
-                # agent must not widen how its own approvals are collected).
-                allow_free_text=True,
-            ),
+        card_message = _approval_card_message(
+            created.id, display_summary, approver_emails=card_approver_emails
         )
         # The card's own target: a policy-routed card belongs to no
         # conversation (it posts top-level in a channel that never asked),
@@ -1254,6 +1374,15 @@ async def _pause_for_approval(
                     # the live card did, and once the sandbox is gone this
                     # is the worker's only copy of it (#1084).
                     requested_by=requested_by,
+                    conversation_id=(
+                        (
+                            thread
+                            if in_requesting_channel and re.fullmatch(r"\d+\.\d+", thread)
+                            else card_ts
+                        )
+                        if card_kind == "slack"
+                        else thread
+                    ),
                 )
                 registered = True
             except Exception as exc:  # noqa: BLE001 - best-effort memory
@@ -1304,6 +1433,130 @@ async def _pause_for_approval(
             logger.warning("approval notification post failed for %s: %s", created.id, exc)
     logger.info("thread %s suspended awaiting approval %s", thread_key, created.id)
     return _ApprovalPause(created=True)
+
+
+def _approver_dm_failed(approval_id: str, step: str, reason: str) -> None:
+    """Log and meter one approver DM card that was not posted or not registered.
+
+    Both are one ``dm_delivery`` failure: either way no answer can reach the
+    approval through a registered DM, and only the log line names the step.
+    """
+
+    logger.warning("approver DM %s failed for approval %s: %s", step, approval_id, reason)
+    log.record_metric(
+        "curie.approval.lifecycle",
+        attributes={
+            "service.name": "curie-worker",
+            "operation": "dm_delivery",
+            "outcome": "failure",
+        },
+    )
+
+
+async def _deliver_approver_dm_card(
+    self: Kernel,
+    qevent: QueuedTurn,
+    created: CreatedApproval,
+    *,
+    creation_identity: ApprovalCreationIdentityV1,
+    summary: str,
+    requested_by: str,
+) -> None:
+    """Post one approval card to the selected approver's DM and register it.
+
+    ADR 0272 decision 2. The record and its selected recipient exist before
+    this runs; its ``card_channel`` is unset, so every answer refuses until the
+    registration records the DM the provider actually opened. A post to the
+    recipient's user id lands in that DM, and the Slack adapter reports the
+    ``D...`` id ``chat.postMessage`` answered with in ``ReplyAck.channel``.
+
+    One attempt only. A duplicate creation adopted an earlier row, whose card
+    was that creation's to post, so it posts nothing. A failed or uncertain
+    post is logged and metered and never retried as a second card or moved to
+    the requesting thread: an unknown outcome is not proof nothing posted.
+
+    The card ref is remembered before the registration, so a decision that
+    lands after the registration still finds a card to settle; a record that
+    is already terminal (a decision racing the registration) settles it now.
+    """
+
+    if created.duplicate:
+        logger.info(
+            "approval %s adopted an existing record; its approver DM card is not posted again",
+            created.id,
+        )
+        return
+    delivery = created.delivery
+    if delivery is None:
+        _approver_dm_failed(created.id, "delivery", "the creation named no recipient")
+        return
+    card_adapter = None if delivery.identity == DEFAULT_IDENTITY else delivery.identity
+    try:
+        ack = await self._sink.emit(
+            ReplyPost(
+                version=REPLY_WIRE_VERSION,
+                event="reply.post",
+                target=ReplyTarget(
+                    kind=constants.POLICY_CARD_KIND,
+                    address=delivery.recipient,
+                    conversation_id=None,
+                    reply_ref=None,
+                ),
+                message=_approval_card_message(created.id, summary, approver_emails=[]),
+                requested_by=requested_by,
+            ),
+            route=TargetRoute(endpoint=None, adapter=card_adapter),
+        )
+    except Exception as exc:  # noqa: BLE001 - the pause stands without the card
+        _approver_dm_failed(created.id, "delivery", type(exc).__name__)
+        return
+    channel = ack.channel
+    if channel is None or constants._APPROVER_DM_CHANNEL.fullmatch(channel) is None:
+        # A user id echoed back, a public channel, or nothing: not the DM, so
+        # registering it would bind the approval to the wrong conversation.
+        _approver_dm_failed(created.id, "delivery", "the provider named no DM channel")
+        return
+
+    remembered = False
+    if ack.ref and self._card_store is not None:
+        try:
+            await self._card_store.remember(
+                created.id,
+                channel=channel,
+                ts=ack.ref,
+                summary=summary,
+                endpoint=None,
+                kind=constants.POLICY_CARD_KIND,
+                adapter=card_adapter,
+                requested_by=requested_by,
+                conversation_id=ack.ref,
+            )
+            remembered = True
+        except Exception as exc:  # noqa: BLE001 - best-effort memory
+            logger.warning("remembering approval card for %s failed: %s", created.id, exc)
+
+    registrar = cast("ApprovalCardRegistrar", self._approvals)
+    try:
+        registration = await registrar.register_card(
+            approval_id=created.id,
+            dedupe_key=qevent.event_id,
+            identity=creation_identity,
+            card_identity=delivery.identity,
+            recipient=delivery.recipient,
+            channel=channel,
+            budget_s=routing._api_write_budget_s(),
+        )
+    except Exception as exc:  # noqa: BLE001 - the posted card stays; answers refuse
+        _approver_dm_failed(created.id, "registration", type(exc).__name__)
+    else:
+        if registration.status != "pending":
+            logger.info(
+                "approval %s was %s before its DM card was registered",
+                created.id,
+                registration.status,
+            )
+    if remembered:
+        await self._settle_if_decided_before_registration(created.id, qevent)
 
 
 async def _escalate_unanswerable_email_approval(

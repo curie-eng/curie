@@ -95,6 +95,25 @@ class ApprovalCreationRequestV1(ApprovalWireModel):
     identity: ApprovalCreationIdentityV1 = Field(repr=False)
 
 
+class ApprovalDmDeliveryV1(ApprovalWireModel):
+    """The server-verified single recipient of an approver-DM card (ADR 0272).
+
+    ``identity`` is the Slack bot identity that posts the card,
+    ``provider_installation_id`` its installation, ``recipient`` the selected
+    approver's native user id there. @spec APPROVER-DM-2.
+    """
+
+    mode: Literal["approver_dm"]
+    identity: codec.Identifier
+    provider_installation_id: codec.CanonicalUUID
+    recipient: codec.Identifier
+
+
+def _absent(value: object) -> bool:
+    """@spec APPROVER-DM-2: an ordinary response never carries the key."""
+    return value is None
+
+
 class ApprovalCreationResponseV1(ApprovalWireModel):
     """@spec HTTP-APPROVAL-CONTINUITY-3."""
 
@@ -104,6 +123,105 @@ class ApprovalCreationResponseV1(ApprovalWireModel):
     status: Literal["pending", "approved", "rejected", "expired"]
     duplicate: bool
     requested_by: codec.Identifier | None
+
+
+_DM_CHANNEL = r"^D[A-Z0-9]{8,}$"
+
+
+class ApprovalCardRegistrationRequestV1(ApprovalWireModel):
+    """Register the provider-returned DM channel of one approver-DM card.
+
+    ``identity`` is the same block the creation sent; ``card_identity`` and
+    ``recipient`` the delivery the creation returned; ``channel`` the DM
+    channel id the provider answered the post with, never the user id the post
+    named. @spec APPROVER-DM-2.
+    """
+
+    schema_version: codec.Version
+    request_id: codec.CanonicalUUID
+    approval_id: codec.CanonicalUUID
+    dedupe_key: codec.Identifier
+    identity: ApprovalCreationIdentityV1 = Field(repr=False)
+    card_identity: codec.Identifier
+    recipient: codec.Identifier
+    channel: Annotated[str, Field(pattern=_DM_CHANNEL, max_length=64)]
+
+
+class ApprovalCardRegistrationResponseV1(ApprovalWireModel):
+    """The approval's status and stored card channel after a registration.
+
+    A terminal status means the card was never registered and the worker
+    settles the posted card now. @spec APPROVER-DM-2.
+    """
+
+    schema_version: codec.Version
+    request_id: codec.CanonicalUUID
+    approval_id: codec.CanonicalUUID
+    status: Literal["pending", "approved", "rejected", "expired"]
+    card_channel: str | None
+    duplicate: bool
+
+
+def _version_two(value: object) -> int:
+    """@spec REQUEST-APPROVAL-4: exactly the integer 2, never a coerced spelling."""
+    if type(value) is not int or value != 2:
+        raise ValueError("invalid_context_version")
+    return value
+
+
+def _approvers(value: object) -> object:
+    """@spec REQUEST-APPROVAL-4: a JSON array, kept immutable; nothing else is coerced."""
+    return tuple(value) if type(value) is list else value
+
+
+class SelectedApproverV1(ApprovalWireModel):
+    """One verified selected person, projected to canonical identity. @spec REQUEST-APPROVAL-4."""
+
+    tenant_id: codec.CanonicalUUID
+    issuer: codec.Issuer
+    subject: codec.Identifier
+
+
+class ApprovalCreationResponseV2(ApprovalWireModel):
+    """A dynamic approval's receipt: V1 plus the persisted grant and selection.
+
+    ``granted_arguments`` is the canonical JSON text of the stored object, the
+    opaque ``approval_ticket`` included; the worker renders these stored values,
+    never its original model summary. Display data, never a permit.
+    ``delivery`` is present only for an approver-DM approval (ADR 0272), which
+    is always dynamic, and is omitted, not null, otherwise.
+    @spec REQUEST-APPROVAL-4 REQUEST-APPROVAL-8 HTTP-APPROVAL-CONTINUITY-3 APPROVER-DM-2.
+    """
+
+    schema_version: Annotated[Literal[2], BeforeValidator(_version_two)]
+    request_id: codec.CanonicalUUID
+    id: codec.CanonicalUUID
+    status: Literal["pending", "approved", "rejected", "expired"]
+    duplicate: bool
+    requested_by: codec.Identifier | None
+    granted_tool: codec.Identifier
+    granted_arguments: Annotated[str, BeforeValidator(_arguments)] = Field(repr=False)
+    selected_approvers: Annotated[
+        tuple[SelectedApproverV1, ...],
+        Field(min_length=1, max_length=16, repr=False),
+        BeforeValidator(_approvers),
+    ]
+    delivery: ApprovalDmDeliveryV1 | None = Field(default=None, exclude_if=_absent)
+
+
+def creation_receipt(value: object) -> ApprovalCreationResponseV1 | ApprovalCreationResponseV2:
+    """Read a creation receipt as exactly the version it names; never guess one.
+
+    @spec REQUEST-APPROVAL-4 HTTP-APPROVAL-CONTINUITY-3.
+    """
+    if type(value) is not dict:
+        raise ValueError("invalid_approval_receipt")
+    version = value.get("schema_version")
+    if type(version) is int and version == 1:
+        return ApprovalCreationResponseV1.model_validate(value)
+    if type(version) is int and version == 2:
+        return ApprovalCreationResponseV2.model_validate(value)
+    raise ValueError("invalid_approval_receipt")
 
 
 class ApprovalActorScopeV1(ApprovalWireModel):

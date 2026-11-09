@@ -774,6 +774,52 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/agents/{agent_id}/hooks/{hook}/wake-secret": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Get Wake Secret
+         * @description Read the current wake key of one declared webhook wake hook.
+         *
+         *     Repeated reads return the same key until rotation. Provision it into the
+         *     connector's operator-managed secret as ``CURIE_HOOK_WAKE_KEY``.
+         */
+        get: operations["get_wake_secret_agents__agent_id__hooks__hook__wake_secret_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/agents/{agent_id}/hooks/{hook}/wake-secret/rotate": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Rotate Wake Secret
+         * @description Rotate one hook's wake key; the previous key stops working at once.
+         *
+         *     The answer carries the new generation and no key; read the key back with
+         *     the GET. Rotation does not cancel an admitted run.
+         */
+        post: operations["rotate_wake_secret_agents__agent_id__hooks__hook__wake_secret_rotate_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/agents/{agent_id}/hooks/{name}/fire": {
         parameters: {
             query?: never;
@@ -1561,7 +1607,10 @@ export interface paths {
          *     The authorizer runs first, server-side (#246): the route's approvers decide
          *     whether the authenticated principal belongs -- an explicit user list, a
          *     Slack user group, or (declaring none) the card channel's members (#420).
-         *     Requester equality neither grants nor vetoes membership. Then exactly one
+         *     Requester equality neither grants nor vetoes membership, except on a
+         *     canonical route (ADR 0271: dynamic selection or requester exclusion), which
+         *     only the HTTP answer composition may answer; every other principal there is
+         *     refused and audited, an operator first. Then exactly one
          *     authorized resolver wins
          *     the conditional UPDATE; a loser gets 409 naming who resolved it, and a
          *     past-SLA record flips to expired and returns 410 while still enqueuing the
@@ -2523,6 +2572,31 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/hooks/{agent_id}/{hook}/wake": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Wake Hook
+         * @description Admit one targetless run of a declared webhook wake hook.
+         *
+         *     The body is exactly ``{}``, signed with the hook's wake key; there are no
+         *     query parameters. 202 ``queued`` names the admitted run; 200 ``coalesced``
+         *     means a run was already open or this delivery id was already reserved, so
+         *     poll again later with a fresh delivery id if work remains.
+         */
+        post: operations["wake_hook_hooks__agent_id___hook__wake_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/identity/admin/{tenant_id}/{resource}": {
         parameters: {
             query?: never;
@@ -2911,7 +2985,7 @@ export interface paths {
         put?: never;
         /**
          * Pause Schedule
-         * @description Pause a named cron hook without changing its in force bundle.
+         * @description Pause a named cron or webhook wake hook without changing its in force bundle.
          */
         post: operations["pause_schedule_schedules__agent___name__pause_post"];
         delete?: never;
@@ -2931,7 +3005,7 @@ export interface paths {
         put?: never;
         /**
          * Resume Schedule
-         * @description Resume a named cron hook with one bounded catch up opportunity.
+         * @description Resume a named hook: a cron hook gets one bounded catch up, a wake none.
          */
         post: operations["resume_schedule_schedules__agent___name__resume_post"];
         delete?: never;
@@ -3195,9 +3269,31 @@ export interface paths {
         put?: never;
         /**
          * Create Identity Approval
-         * @description @spec HTTP-APPROVAL-CONTINUITY-3.
+         * @description V2 only for a dynamic approval. @spec HTTP-APPROVAL-CONTINUITY-3 REQUEST-APPROVAL-4.
          */
         post: operations["create_identity_approval_v1_internal_identity_approvals_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/internal/identity/approvals/{approval_id}/card": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Register Identity Approval Card
+         * @description Register the provider-returned DM channel of one approver-DM card.
+         *
+         *     @spec APPROVER-DM-2.
+         */
+        post: operations["register_identity_approval_card_v1_internal_identity_approvals__approval_id__card_post"];
         delete?: never;
         options?: never;
         head?: never;
@@ -3237,7 +3333,7 @@ export interface paths {
         put?: never;
         /**
          * Check Turn Authority
-         * @description @spec HTTP-INVOCATION-EXECUTION-8/16.
+         * @description @spec HTTP-INVOCATION-EXECUTION-8/16 CONNECTOR-REQUESTER-1.
          */
         post: operations["check_turn_authority_v1_internal_identity_turn_authority_check_post"];
         delete?: never;
@@ -4742,6 +4838,16 @@ export interface components {
             /** Channels */
             channels: components["schemas"]["ChannelBindingOut"][];
             /**
+             * Connector Requester Identity
+             * @default false
+             */
+            connector_requester_identity?: boolean;
+            /**
+             * Connector Requester Identity Version
+             * @default 1
+             */
+            connector_requester_identity_version?: number;
+            /**
              * Created At
              * Format: date-time
              */
@@ -4843,6 +4949,12 @@ export interface components {
             approval_routes?: {
                 [key: string]: components["schemas"]["ApprovalRouteBinding"];
             } | null;
+            /** Approval Routes Expected Version */
+            approval_routes_expected_version?: number | null;
+            /** Connector Requester Identity */
+            connector_requester_identity?: boolean | null;
+            /** Connector Requester Identity Expected Version */
+            connector_requester_identity_expected_version?: number | null;
             /** Deploy Notifications */
             deploy_notifications?: boolean | null;
             /** Execution Deadline Seconds */
@@ -4889,6 +5001,41 @@ export interface components {
         AppConfig: {
             /** Org Name */
             org_name: string;
+        };
+        /**
+         * ApprovalApproverDmTarget
+         * @description Deliver the one card to the selected approver's DM (ADR 0272 decision 1).
+         *
+         *     The third form of a route's ``resolution``. ``identity`` names the Slack
+         *     bot identity (the same lowercase slug as a notification target's
+         *     ``adapter``; ``default`` is the default app and is stored as written) whose
+         *     installation posts the card to the one canonical person an approver ticket
+         *     selected. Valid only on a route that also registers ``approver_ticket``, and
+         *     never with a ``notification``; the route writer checks the first and that
+         *     the identity has a registered receiver. Strict, like the requesting-surface
+         *     form: no ``kind``, ``address`` or recipient may ride beside it.
+         */
+        ApprovalApproverDmTarget: {
+            /** Identity */
+            identity: string;
+            /**
+             * Mode
+             * @constant
+             */
+            mode: "approver_dm";
+        };
+        /**
+         * ApprovalApproverDmTargetOut
+         * @description Read projection of ``ApprovalApproverDmTarget`` (ADR 0272); tolerant for repair.
+         */
+        ApprovalApproverDmTargetOut: {
+            /** Identity */
+            identity: string;
+            /**
+             * Mode
+             * @constant
+             */
+            mode: "approver_dm";
         };
         /**
          * ApprovalApprovers
@@ -4975,6 +5122,62 @@ export interface components {
             team_epoch?: number | null;
             /** Team Id */
             team_id?: string | null;
+        };
+        /**
+         * ApprovalCardRegistrationRequestV1
+         * @description Register the provider-returned DM channel of one approver-DM card.
+         *
+         *     ``identity`` is the same block the creation sent; ``card_identity`` and
+         *     ``recipient`` the delivery the creation returned; ``channel`` the DM
+         *     channel id the provider answered the post with, never the user id the post
+         *     named. @spec APPROVER-DM-2.
+         */
+        ApprovalCardRegistrationRequestV1: {
+            /** Approval Id */
+            approval_id: string;
+            /** Card Identity */
+            card_identity: string;
+            /** Channel */
+            channel: string;
+            /** Dedupe Key */
+            dedupe_key: string;
+            identity: components["schemas"]["ApprovalCreationIdentityV1"];
+            /** Recipient */
+            recipient: string;
+            /** Request Id */
+            request_id: string;
+            /**
+             * Schema Version
+             * @constant
+             */
+            schema_version: 1;
+        };
+        /**
+         * ApprovalCardRegistrationResponseV1
+         * @description The approval's status and stored card channel after a registration.
+         *
+         *     A terminal status means the card was never registered and the worker
+         *     settles the posted card now. @spec APPROVER-DM-2.
+         */
+        ApprovalCardRegistrationResponseV1: {
+            /** Approval Id */
+            approval_id: string;
+            /** Card Channel */
+            card_channel: string | null;
+            /** Duplicate */
+            duplicate: boolean;
+            /** Request Id */
+            request_id: string;
+            /**
+             * Schema Version
+             * @constant
+             */
+            schema_version: 1;
+            /**
+             * Status
+             * @enum {string}
+             */
+            status: "pending" | "approved" | "rejected" | "expired";
         };
         /**
          * ApprovalCreateOut
@@ -5084,6 +5287,88 @@ export interface components {
              * @enum {string}
              */
             status: "pending" | "approved" | "rejected" | "expired";
+        };
+        /**
+         * ApprovalCreationResponseV2
+         * @description A dynamic approval's receipt: V1 plus the persisted grant and selection.
+         *
+         *     ``granted_arguments`` is the canonical JSON text of the stored object, the
+         *     opaque ``approval_ticket`` included; the worker renders these stored values,
+         *     never its original model summary. Display data, never a permit.
+         *     ``delivery`` is present only for an approver-DM approval (ADR 0272), which
+         *     is always dynamic, and is omitted, not null, otherwise.
+         *     @spec REQUEST-APPROVAL-4 REQUEST-APPROVAL-8 HTTP-APPROVAL-CONTINUITY-3 APPROVER-DM-2.
+         */
+        ApprovalCreationResponseV2: {
+            delivery?: components["schemas"]["ApprovalDmDeliveryV1"] | null;
+            /** Duplicate */
+            duplicate: boolean;
+            /** Granted Arguments */
+            granted_arguments: string;
+            /** Granted Tool */
+            granted_tool: string;
+            /** Id */
+            id: string;
+            /** Request Id */
+            request_id: string;
+            /** Requested By */
+            requested_by: string | null;
+            /**
+             * Schema Version
+             * @constant
+             */
+            schema_version: 2;
+            /** Selected Approvers */
+            selected_approvers: components["schemas"]["SelectedApproverV1"][];
+            /**
+             * Status
+             * @enum {string}
+             */
+            status: "pending" | "approved" | "rejected" | "expired";
+        };
+        /**
+         * ApprovalDmDeliveryV1
+         * @description The server-verified single recipient of an approver-DM card (ADR 0272).
+         *
+         *     ``identity`` is the Slack bot identity that posts the card,
+         *     ``provider_installation_id`` its installation, ``recipient`` the selected
+         *     approver's native user id there. @spec APPROVER-DM-2.
+         */
+        ApprovalDmDeliveryV1: {
+            /** Identity */
+            identity: string;
+            /**
+             * Mode
+             * @constant
+             */
+            mode: "approver_dm";
+            /** Provider Installation Id */
+            provider_installation_id: string;
+            /** Recipient */
+            recipient: string;
+        };
+        /**
+         * ApprovalExemptGroup
+         * @description The one identity provider group exempt from requester exclusion (ADR 0271).
+         *
+         *     Named by canonical issuer and stable group id, compared byte for byte with
+         *     the requester's current directory groups at answer time.
+         */
+        ApprovalExemptGroup: {
+            /** Id */
+            id: string;
+            /** Issuer */
+            issuer: string;
+        };
+        /**
+         * ApprovalExemptGroupOut
+         * @description Read projection of a stored exempt group; tolerant for repair.
+         */
+        ApprovalExemptGroupOut: {
+            /** Id */
+            id?: string | null;
+            /** Issuer */
+            issuer?: string | null;
         };
         /**
          * ApprovalGrantAuthorityRequestV1
@@ -5486,27 +5771,72 @@ export interface components {
          * @description One strict workspace binding for a declared approval route (#1460).
          *
          *     ``resolution`` is the single verified-identity action surface: a fixed
-         *     Slack channel, or the conversation that asked (ADR-0177).
+         *     Slack channel, the conversation that asked (ADR-0177), or the one selected
+         *     approver's DM (ADR 0272).
          *     ``notification`` may make the pending request visible elsewhere, but its
          *     message carries no interaction. ``approvers`` continues to narrow WHO may
          *     act through the resolution card path and is never inferred from notification
-         *     recipients.
+         *     recipients. ``approver_ticket`` registers a per-request approver selector and
+         *     ``separation`` the route's requester exclusion, with or without a selector
+         *     (ADR 0271).
          */
         ApprovalRouteBinding: {
+            approver_ticket?: components["schemas"]["ApproverTicketRegistration"] | null;
             approvers?: components["schemas"]["ApprovalApprovers"] | null;
+            /** Expires In Seconds */
+            expires_in_seconds?: number | null;
             notification?: components["schemas"]["ApprovalNotificationTarget"] | null;
+            /** Remind Every S */
+            remind_every_s?: number | null;
             /** Resolution */
-            resolution: components["schemas"]["ApprovalResolutionTarget"] | components["schemas"]["ApprovalRequestingSurfaceTarget"];
+            resolution: components["schemas"]["ApprovalResolutionTarget"] | components["schemas"]["ApprovalRequestingSurfaceTarget"] | components["schemas"]["ApprovalApproverDmTarget"];
+            separation?: components["schemas"]["ApprovalSeparation"] | null;
         };
         /**
          * ApprovalRouteBindingOut
          * @description The required resolution plus optional, redacted visibility policy.
+         *
+         *     ``approver_ticket`` and ``separation`` are omitted, not null, on a route
+         *     without a selector, so every existing route reads back exactly as before.
          */
         ApprovalRouteBindingOut: {
+            approver_ticket?: components["schemas"]["ApproverTicketOut"] | null;
             approvers?: components["schemas"]["ApprovalApproversOut"] | null;
+            /** Expires In Seconds */
+            expires_in_seconds?: number | null;
             notification?: components["schemas"]["ApprovalTargetOut"] | null;
+            /** Remind Every S */
+            remind_every_s?: number | null;
             /** Resolution */
-            resolution: components["schemas"]["ApprovalTargetOut"] | components["schemas"]["ApprovalRequestingSurfaceTargetOut"];
+            resolution: components["schemas"]["ApprovalTargetOut"] | components["schemas"]["ApprovalApproverDmTargetOut"] | components["schemas"]["ApprovalRequestingSurfaceTargetOut"];
+            separation?: components["schemas"]["ApprovalSeparationOut"] | null;
+        };
+        /**
+         * ApprovalSeparation
+         * @description Requester exclusion on an approval route (ADR 0271 decision 6).
+         *
+         *     On a route that registers an ``approver_ticket`` selector, omitting it
+         *     stores ``{"exclude_requester": true}`` and ``false`` is the audited opt-out.
+         *     On any other route it is stored as written: ``true`` enables static
+         *     exclusion, and omitting it keeps ordinary ADR 0106 self-confirmation.
+         *     ``exempt_group`` is valid only beside ``exclude_requester: true``.
+         */
+        ApprovalSeparation: {
+            /** Exclude Requester */
+            exclude_requester: boolean;
+            exempt_group?: components["schemas"]["ApprovalExemptGroup"] | null;
+        };
+        /**
+         * ApprovalSeparationOut
+         * @description Read projection of the stored, effective requester exclusion.
+         *
+         *     ``exempt_group`` is omitted, not null, when the route stores none, so a
+         *     route without one reads back exactly as before.
+         */
+        ApprovalSeparationOut: {
+            /** Exclude Requester */
+            exclude_requester?: boolean | null;
+            exempt_group?: components["schemas"]["ApprovalExemptGroupOut"] | null;
         };
         /**
          * ApprovalTargetOut
@@ -5521,6 +5851,90 @@ export interface components {
             address: string;
             /** Kind */
             kind: string;
+        };
+        /**
+         * ApproverTicketCeiling
+         * @description The operator ceiling a selector chooses inside (ADR 0271 decision 1).
+         *
+         *     ``approver_role_version`` names the agent access-policy version whose
+         *     approver role the operator approves. ``approver_role`` is server-owned: the
+         *     platform pins that role's canonical JSON on write and returns it on
+         *     readback, and a write may echo it back unchanged or omit it.
+         */
+        ApproverTicketCeiling: {
+            /** Approver Role */
+            approver_role?: string | null;
+            /** Approver Role Version */
+            approver_role_version: number;
+            /** Users */
+            users?: components["schemas"]["ApproverTicketCeilingUser"][] | null;
+        };
+        /**
+         * ApproverTicketCeilingOut
+         * @description Read projection of a registration ceiling, including the server-owned pin.
+         */
+        ApproverTicketCeilingOut: {
+            /** Approver Role */
+            approver_role?: string | null;
+            /** Approver Role Version */
+            approver_role_version?: number | null;
+            /** Users */
+            users?: components["schemas"]["ApproverTicketCeilingUserOut"][] | null;
+        };
+        /**
+         * ApproverTicketCeilingUser
+         * @description One exact canonical person the operator allows inside the pinned role.
+         */
+        ApproverTicketCeilingUser: {
+            /** Issuer */
+            issuer: string;
+            /** Subject */
+            subject: string;
+        };
+        /**
+         * ApproverTicketCeilingUserOut
+         * @description Read projection of one ceiling user; tolerant for repair.
+         */
+        ApproverTicketCeilingUserOut: {
+            /** Issuer */
+            issuer?: string | null;
+            /** Subject */
+            subject?: string | null;
+        };
+        /**
+         * ApproverTicketOut
+         * @description Read projection of a selector registration (ADR 0271). The public key is
+         *     public material and reads back so a readback can be written back.
+         */
+        ApproverTicketOut: {
+            ceiling?: components["schemas"]["ApproverTicketCeilingOut"] | null;
+            /** Connector */
+            connector?: string | null;
+            /** Key Id */
+            key_id?: string | null;
+            /** Public Key */
+            public_key?: string | null;
+            /** Tool */
+            tool?: string | null;
+        };
+        /**
+         * ApproverTicketRegistration
+         * @description A selector registered on one approval route (ADR 0271 decision 1).
+         *
+         *     One hosted connector and one exact upstream tool, the Ed25519 public key
+         *     (unpadded base64url of 32 bytes) and key id its tickets are verified with,
+         *     and the mandatory ceiling. The private key never reaches the platform.
+         */
+        ApproverTicketRegistration: {
+            ceiling: components["schemas"]["ApproverTicketCeiling"];
+            /** Connector */
+            connector: string;
+            /** Key Id */
+            key_id: string;
+            /** Public Key */
+            public_key: string;
+            /** Tool */
+            tool: string;
         };
         /**
          * Attachment
@@ -7600,6 +8014,67 @@ export interface components {
             source_generation: string | null;
             /** Supported */
             supported: boolean;
+        };
+        /**
+         * HookWakeCoalescedOut
+         * @description 200: the wake joined a live open run, or its delivery id was already reserved.
+         */
+        HookWakeCoalescedOut: {
+            /**
+             * Status
+             * @constant
+             */
+            status: "coalesced";
+        };
+        /**
+         * HookWakeErrorOut
+         * @description Every wake and wake-key refusal: exactly one reason string.
+         */
+        HookWakeErrorOut: {
+            /** Detail */
+            detail: string;
+        };
+        /**
+         * HookWakeQueuedOut
+         * @description 202: one webhook run was admitted and its turn enqueued.
+         */
+        HookWakeQueuedOut: {
+            /**
+             * Run Id
+             * Format: uuid
+             */
+            run_id: string;
+            /**
+             * Status
+             * @constant
+             */
+            status: "queued";
+        };
+        /**
+         * HookWakeRotationOut
+         * @description The generation a rotation committed. Carries no key.
+         */
+        HookWakeRotationOut: {
+            /** Agent Id */
+            agent_id: string;
+            /** Generation */
+            generation: number;
+            /** Hook */
+            hook: string;
+        };
+        /**
+         * HookWakeSecretOut
+         * @description The current wake key of one agent hook. Served with ``Cache-Control: no-store``.
+         */
+        HookWakeSecretOut: {
+            /** Agent Id */
+            agent_id: string;
+            /** Generation */
+            generation: number;
+            /** Hook */
+            hook: string;
+            /** Secret */
+            secret: string;
         };
         /**
          * IssueReadContext
@@ -10009,6 +10484,18 @@ export interface components {
             /** Schedules */
             schedules: components["schemas"]["AgentSchedulesOut"][];
         };
+        /**
+         * SelectedApproverV1
+         * @description One verified selected person, projected to canonical identity. @spec REQUEST-APPROVAL-4.
+         */
+        SelectedApproverV1: {
+            /** Issuer */
+            issuer: string;
+            /** Subject */
+            subject: string;
+            /** Tenant Id */
+            tenant_id: string;
+        };
         /** Selection */
         Selection: {
             /**
@@ -10572,6 +11059,45 @@ export interface components {
             stage: "prepare" | "claim_or_resume" | "start" | "steer";
         };
         /**
+         * TurnAuthorityResponseV2
+         * @description Every version 1 field plus the required-nullable requester projection.
+         *
+         *     The API answers version 2 only for a continue on an agent that opted in to
+         *     connector requester identity; a null requester means no verified human. A
+         *     requester is bound to this answer's own checked scope and never rides a
+         *     refused or unavailable answer. @spec CONNECTOR-REQUESTER-1.
+         */
+        TurnAuthorityResponseV2: {
+            /** Context Sha256 */
+            context_sha256: string;
+            /**
+             * Decision
+             * @enum {string}
+             */
+            decision: "continue" | "refuse" | "unavailable";
+            /** Event Id */
+            event_id: string;
+            /**
+             * Reason
+             * @enum {string}
+             */
+            reason: "current_authority" | "caller_not_allowed" | "invalid_context" | "unsupported_resume" | "authority_unavailable";
+            /** Request Id */
+            request_id: string;
+            requester: components["schemas"]["TurnRequesterV1"] | null;
+            /**
+             * Schema Version
+             * @constant
+             */
+            schema_version: 2;
+            scope: components["schemas"]["TurnAuthorityScopeV1"];
+            /**
+             * Stage
+             * @enum {string}
+             */
+            stage: "prepare" | "claim_or_resume" | "start" | "steer";
+        };
+        /**
          * TurnAuthorityScopeV1
          * @description @spec HTTP-INVOCATION-EXECUTION-16.
          */
@@ -10612,6 +11138,20 @@ export interface components {
              * @constant
              */
             version: "1.0";
+        };
+        /**
+         * TurnRequesterV1
+         * @description The verified original requester: tenant and canonical issuer and subject only.
+         *
+         *     Compared exactly; never normalized. @spec CONNECTOR-REQUESTER-1.
+         */
+        TurnRequesterV1: {
+            /** Issuer */
+            issuer: string;
+            /** Subject */
+            subject: string;
+            /** Tenant Id */
+            tenant_id: string;
         };
         /**
          * TurnSource
@@ -12952,6 +13492,146 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["HookSourceRefusal"];
+                };
+            };
+        };
+    };
+    get_wake_secret_agents__agent_id__hooks__hook__wake_secret_get: {
+        parameters: {
+            query?: never;
+            header?: {
+                "x-api-key"?: string | null;
+            };
+            path: {
+                agent_id: string;
+                hook: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HookWakeSecretOut"];
+                };
+            };
+            /** @description wake_query_forbidden */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HookWakeErrorOut"];
+                };
+            };
+            /** @description wake_not_declared */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HookWakeErrorOut"];
+                };
+            };
+            /** @description wake_source_not_ordinary */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HookWakeErrorOut"];
+                };
+            };
+            /** @description wake_body_invalid */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HookWakeErrorOut"];
+                };
+            };
+            /** @description authority_unavailable or wake_declaration_unavailable */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HookWakeErrorOut"];
+                };
+            };
+        };
+    };
+    rotate_wake_secret_agents__agent_id__hooks__hook__wake_secret_rotate_post: {
+        parameters: {
+            query?: never;
+            header?: {
+                "x-api-key"?: string | null;
+            };
+            path: {
+                agent_id: string;
+                hook: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HookWakeRotationOut"];
+                };
+            };
+            /** @description wake_query_forbidden */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HookWakeErrorOut"];
+                };
+            };
+            /** @description wake_not_declared */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HookWakeErrorOut"];
+                };
+            };
+            /** @description wake_source_not_ordinary */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HookWakeErrorOut"];
+                };
+            };
+            /** @description wake_body_invalid */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HookWakeErrorOut"];
+                };
+            };
+            /** @description authority_unavailable, wake_declaration_unavailable or wake_generation_exhausted */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HookWakeErrorOut"];
                 };
             };
         };
@@ -16480,6 +17160,110 @@ export interface operations {
             };
         };
     };
+    wake_hook_hooks__agent_id___hook__wake_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                agent_id: string;
+                hook: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Joined a live open run, or the delivery id is already reserved */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HookWakeCoalescedOut"];
+                };
+            };
+            /** @description One webhook run admitted and enqueued */
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HookWakeQueuedOut"];
+                };
+            };
+            /** @description wake_query_forbidden */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HookWakeErrorOut"];
+                };
+            };
+            /** @description invalid_wake_signature */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HookWakeErrorOut"];
+                };
+            };
+            /** @description wake_not_declared */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HookWakeErrorOut"];
+                };
+            };
+            /** @description wake_source_not_ordinary, hook_paused or agent_killed */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HookWakeErrorOut"];
+                };
+            };
+            /** @description hook body exceeds the maximum size */
+            413: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HookWakeErrorOut"];
+                };
+            };
+            /** @description wake_body_invalid */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HookWakeErrorOut"];
+                };
+            };
+            /** @description budget_exhausted */
+            429: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HookWakeErrorOut"];
+                };
+            };
+            /** @description authority_unavailable, wake_declaration_unavailable, wake_dedupe_unavailable or wake_enqueue_unavailable */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HookWakeErrorOut"];
+                };
+            };
+        };
+    };
     identity_view_identity_admin__tenant_id___resource__get: {
         parameters: {
             query?: {
@@ -17903,7 +18687,44 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": components["schemas"]["ApprovalCreationResponseV1"];
+                    "application/json": components["schemas"]["ApprovalCreationResponseV1"] | components["schemas"]["ApprovalCreationResponseV2"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    register_identity_approval_card_v1_internal_identity_approvals__approval_id__card_post: {
+        parameters: {
+            query?: never;
+            header?: {
+                "X-Curie-Worker-Token"?: string | null;
+            };
+            path: {
+                approval_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ApprovalCardRegistrationRequestV1"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ApprovalCardRegistrationResponseV1"];
                 };
             };
             /** @description Validation Error */
@@ -17973,7 +18794,7 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": components["schemas"]["TurnAuthorityResponseV1"];
+                    "application/json": components["schemas"]["TurnAuthorityResponseV1"] | components["schemas"]["TurnAuthorityResponseV2"];
                 };
             };
             /** @description Validation Error */

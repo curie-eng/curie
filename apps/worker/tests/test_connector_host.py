@@ -21,6 +21,65 @@ _SEED = base64.b64encode(bytes(range(32))).decode()
 _PUBLIC = base64.b64encode(bytes(SigningKey(bytes(range(32))).verify_key)).decode()
 
 
+@pytest.mark.parametrize("with_principal", [False, True])
+def test_static_host_forwards_only_the_verified_requester(with_principal: bool) -> None:
+    async def run() -> None:
+        seen: list[list[str]] = []
+
+        async def implementation(request: web.Request) -> web.Response:
+            seen.append(request.headers.getall(caller.PRINCIPAL_HEADER, []))
+            assert caller.HEADER not in request.headers
+            assert request.headers[caller.AGENT_HEADER] == "acme-dev"
+            return web.json_response({"jsonrpc": "2.0", "id": 1, "result": {}})
+
+        app = web.Application()
+        app.router.add_post("/mcp", implementation)
+        async with TestServer(app) as upstream:
+            document = host_document()
+            document["implementation"]["port"] = upstream.port
+            config = hosting.HostConfig.model_validate(document)
+            main, _upload = config.proxy_configs({hosting.PASSWORD_ENV: "test-password"})
+            principal = caller_token.CallerPrincipal(
+                tenant_id="44444444-4444-4444-8444-444444444444",
+                issuer="https://identity.example.com",
+                subject="operator-example",
+            )
+            token = caller_token.mint(
+                _SEED,
+                agent="acme-dev",
+                exp=int(time.time()) + 60,
+                principal=principal if with_principal else None,
+            )
+            expected = caller.principal_header_value(
+                caller.Principal(
+                    tenant_id=principal.tenant_id,
+                    issuer=principal.issuer,
+                    subject=principal.subject,
+                )
+            )
+            async with TestServer(server.make_app(main)) as proxy:
+                async with aiohttp.ClientSession() as client:
+                    async with client.post(
+                        proxy.make_url("/mcp"),
+                        headers=[
+                            (caller.HEADER, token),
+                            (caller.PRINCIPAL_HEADER, "forged-principal"),
+                            ("x-CURIE-principal", expected),
+                        ],
+                        json={
+                            "jsonrpc": "2.0",
+                            "id": 1,
+                            "method": "tools/call",
+                            "params": {"name": "reviewer/read", "arguments": {}},
+                        },
+                    ) as response:
+                        assert response.status == 200
+                        assert await response.json() == {"jsonrpc": "2.0", "id": 1, "result": {}}
+            assert seen == [[expected] if with_principal else []]
+
+    asyncio.run(run())
+
+
 def test_upload_minter_and_verifier_share_the_wire_corpus() -> None:
     vector = json.loads(
         (

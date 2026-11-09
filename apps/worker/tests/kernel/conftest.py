@@ -139,7 +139,9 @@ def make_hook_run() -> Callable[..., contextlib.AbstractAsyncContextManager[Hook
     """Seed one migrated hook run and clean only rows owned by that seed."""
 
     @contextlib.asynccontextmanager
-    async def seed(*, outcome: str | None = None) -> AsyncIterator[HookRunSeed]:
+    async def seed(
+        *, outcome: str | None = None, source: str = "schedule"
+    ) -> AsyncIterator[HookRunSeed]:
         engine = create_async_engine(_DB_URL)
         token = uuid.uuid4().hex
         agent_id = uuid.uuid4()
@@ -174,9 +176,9 @@ def make_hook_run() -> Callable[..., contextlib.AbstractAsyncContextManager[Hook
                     text(
                         "INSERT INTO curie.hook_runs "
                         "(id, agent_id, name, slot_utc, version_id, outcome, "
-                        "started_at, ended_at) VALUES "
+                        "source, started_at, ended_at) VALUES "
                         "(:id, :agent_id, :name, :slot_utc, :version_id, :outcome, "
-                        "now(), :ended_at)"
+                        ":source, now(), :ended_at)"
                     ),
                     {
                         "id": run_id,
@@ -185,6 +187,7 @@ def make_hook_run() -> Callable[..., contextlib.AbstractAsyncContextManager[Hook
                         "slot_utc": slot,
                         "version_id": version_id,
                         "outcome": outcome,
+                        "source": source,
                         "ended_at": datetime.now(UTC) if outcome is not None else None,
                     },
                 )

@@ -251,7 +251,9 @@ _RUNNER_RPC_ATTRIBUTES = {
 }
 _APPROVAL_ATTRIBUTES = {
     "service.name": ["curie-api", "curie-worker"],
-    "operation": ["request", "resolve", "expire", "suspend", "resume", "observe"],
+    # ``dm_delivery``: an approver DM card that was not posted or not registered
+    # (ADR 0272); it records only ``failure``.
+    "operation": ["request", "resolve", "expire", "suspend", "resume", "observe", "dm_delivery"],
     "outcome": [
         "requested",
         "resolved",
@@ -356,6 +358,8 @@ _HTTP_OPERATIONS = [
     "/agents/{agent_id}/hooks/{hook}/remediation-policy/disarm",
     "/agents/{agent_id}/hooks/{hook}/remediation-policy/breakers",
     "/agents/{agent_id}/hooks/{hook}/remediation-policy/breakers/{breaker_id}/close",
+    "/agents/{agent_id}/hooks/{hook}/wake-secret",
+    "/agents/{agent_id}/hooks/{hook}/wake-secret/rotate",
     "/agents/{agent_id}/remediation-qualifications/{qualification_id}",
     "/agents/{agent_id}/remediation-qualifications/{qualification_id}/verifier-runs",
     "/agents/{agent_id}/remediation-qualifications/{qualification_id}/verifier-runs/{run_id}",
@@ -391,6 +395,8 @@ _HTTP_OPERATIONS = [
     "/v1/internal/identity/turn-authority/check",
     # @spec HTTP-APPROVAL-CONTINUITY-3
     "/v1/internal/identity/approvals",
+    # @spec APPROVER-DM-2
+    "/v1/internal/identity/approvals/{approval_id}/card",
     # @spec HTTP-APPROVAL-CONTINUITY-12
     "/v1/internal/identity/approval-grant/check",
     # @spec HTTP-INVOCATION-EXECUTION-22
@@ -423,6 +429,7 @@ _HTTP_OPERATIONS = [
     "/ready",
     "/hooks/{agent_id}/{hook}",
     "/hooks/{agent_id}/{hook}/support",
+    "/hooks/{agent_id}/{hook}/wake",
     "/langfuse/traces",
     "/langfuse/traces/{trace_id}",
     "/langfuse/traces/{trace_id}/eval-case",

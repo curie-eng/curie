@@ -5,7 +5,7 @@ import logging
 import re
 import uuid
 from contextvars import ContextVar
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
 from aci_protocol import (
@@ -23,7 +23,7 @@ from ..turn_progress import (
 from . import attachment_access, channel_read, hooks, memory
 
 if TYPE_CHECKING:
-    from ..sandbox.types import SandboxTermination
+    from ..sandbox.types import SandboxHandle, SandboxTermination
 
 logger = logging.getLogger(__name__)
 
@@ -261,6 +261,11 @@ PLATFORM_ERROR_CLASSIFICATIONS = frozenset(
 
 UNCLASSIFIED_ERROR_CLASSIFICATION = "unclassified"
 
+#: ADR 0270 decision 3: a principal-bearing turn ran until the requester token
+#: window ended it. Worker local, and not retryable: a retry would run the same
+#: person's request past the window on a fresh token.
+REQUESTER_WINDOW_CLASSIFICATION = "requester-window"
+
 WORKER_LOCAL_DISPLAY_CLASSIFICATIONS = frozenset(
     {
         "ownership-store-unavailable",
@@ -272,6 +277,7 @@ WORKER_LOCAL_DISPLAY_CLASSIFICATIONS = frozenset(
         # does not advertise channel read enforcement. Worker local, so a
         # runner ErrorEvent naming it is not trusted. Not retryable.
         CHANNEL_READ_UNENFORCED_CLASSIFICATION,
+        REQUESTER_WINDOW_CLASSIFICATION,
     }
 )
 
@@ -313,6 +319,11 @@ _ESCALATION_CAUSES = {
 # Operator guidance appended to an escalation lead for classifications whose
 # fix is a known knob (#3071). Keyed by the displayed classification token.
 _CLASSIFICATION_GUIDANCE = {
+    REQUESTER_WINDOW_CLASSIFICATION: (
+        "The turn reached the one-hour limit of the requester's connector credential "
+        "(connector requester identity is on for this agent) and was stopped. Work "
+        "already performed may have side effects; split the request into shorter turns."
+    ),
     "history-persistence-error": (
         "Conversation history capacity exceeded. Work already performed may have side "
         "effects; inspect the result. The run can be retried; if one turn is over the "
@@ -525,6 +536,17 @@ _ROUTE_WHITESPACE = re.compile(r"\s")
 # ``ApprovalRequestingSurfaceTarget`` (``schemas.approvals.REQUESTING_SURFACE_MODE``).
 _REQUESTING_SURFACE = {"mode": "requesting_surface"}
 
+# ADR 0272 decision 1: the third form of a route's resolution, exactly
+# ``{"mode": "approver_dm", "identity": <slug>}``. The card goes to the one
+# approver the request's ticket selected, in that person's DM with the named
+# bot identity. Mirrors the API's ``schemas.approvals.APPROVER_DM_MODE``.
+_APPROVER_DM_MODE = "approver_dm"
+
+# A DM channel id as ``chat.postMessage`` answers for a post to a user id. The
+# registration endpoint accepts only this shape, and the worker checks it before
+# registering, so a user id echoed back or a public channel is a failed delivery.
+_APPROVER_DM_CHANNEL = re.compile(r"^D[A-Z0-9]{8,}$")
+
 # ADR-0177 amendment: the channels whose approvals are answered from a route's approver
 # ``emails``. Only email today: the mail adapter's kind, and the API's
 # ``schemas.channels.EMAIL_KIND``. A set rather than a comparison, because the question
@@ -597,6 +619,41 @@ _OWNED_WORK_ITEM: ContextVar[uuid.UUID | None] = ContextVar(
 
 _DELIVERY_LEASE: ContextVar[DeliveryLease | None] = ContextVar(
     "curie_worker_delivery_lease", default=None
+)
+
+
+@dataclass
+class OwnedExecution:
+    """One runner turn a delivery opened or steered into (ADR 0270 decision 3).
+
+    The claimed sandbox and the raw turn epoch the runner reported for that
+    turn, or None from a runner that reports none. The epoch is the turn's
+    private timeout credential: it lives in process memory only and is never
+    logged or written to Valkey, hence no repr.
+    """
+
+    handle: SandboxHandle = field(repr=False)
+    turn_epoch: str | None = field(default=None, repr=False)
+    # Set once a stop was attempted, so the lease-lost callback and the
+    # recorder never both stop one turn.
+    stopped: bool = False
+
+
+@dataclass
+class OwnedExecutions:
+    """What one fenced lease acquisition opened or steered into, newest last.
+
+    A lost lease stops exactly these turns, at the sandbox each recorded, and
+    nothing else: a delivery that opened or steered nothing stops nothing.
+    """
+
+    lease: DeliveryLease = field(repr=False)
+    entries: list[OwnedExecution] = field(default_factory=list, repr=False)
+
+
+# Per delivery, set by ``process_event`` for a fenced lease only.
+_OWNED_EXECUTIONS: ContextVar[OwnedExecutions | None] = ContextVar(
+    "curie_worker_owned_executions", default=None
 )
 
 _PUBLICATION_CONTEXT: ContextVar[PublicationContext | None] = ContextVar(

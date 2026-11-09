@@ -383,7 +383,12 @@ def _collect_slack_destinations(
             # channel of its own; it lands in one of the agent's own bindings,
             # which the loop above already collected.
             requesting_surface = resolution == {"mode": "requesting_surface"}
-            targets = [] if requesting_surface else [resolution]
+            # ADR 0272: a card in the one selected approver's DM names no
+            # channel either; the DM is known only once the card is posted.
+            approver_dm = (
+                isinstance(resolution, Mapping) and resolution.get("mode") == "approver_dm"
+            )
+            targets = [] if requesting_surface or approver_dm else [resolution]
             notification = route.get("notification")
             if notification is not None:
                 targets.append(notification)

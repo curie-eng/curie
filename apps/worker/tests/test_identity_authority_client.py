@@ -598,3 +598,308 @@ def test_one_total_five_second_deadline_covers_headers_and_blocked_stream() -> N
             assert len(seen) == 1 and not http.is_closed
 
     asyncio.run(go())
+
+
+# -- Version 2: the verified requester projection. ---------------------------------------
+# ADR 0270 decision 1. The handler replays the exact shape the API route emits
+# for an opted-in agent (apps/api/tests/test_http_requester_projection.py):
+# every version 1 field, schema_version 2 and a required-nullable requester.
+
+REQUESTER = {
+    "tenant_id": UUID,
+    "issuer": "https://identity.example.test/directory",
+    "subject": "SyntheticRequesterSubject",
+}
+
+
+def echo_v2(request: dict[str, Any], *, human: bool = True, **changes: Any) -> dict[str, Any]:
+    """@spec CONNECTOR-REQUESTER-1: the API's V2 answer for this exact submitted request."""
+    return {
+        **echo(request),
+        "schema_version": 2,
+        "requester": copy.deepcopy(REQUESTER) if human else None,
+        **changes,
+    }
+
+
+def answered(body: Any, *, raw: bytes | None = None) -> Any:
+    """@spec CONNECTOR-REQUESTER-1: one check against a handler that derives its answer."""
+    module = api()
+    dto = contract()
+    outcome: dict[str, Any] = {}
+
+    async def go() -> None:
+        """@spec CONNECTOR-REQUESTER-1."""
+        seen = []
+
+        async def handler(request: httpx.Request) -> httpx.Response:
+            seen.append(request)
+            if raw is not None:
+                return httpx.Response(200, content=raw)
+            return httpx.Response(200, json=body(json.loads(request.content)))
+
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http:
+            client = module.HttpTurnAuthorityClient(
+                api_base_url=BASE, worker_token=TOKEN, client=http
+            )
+            try:
+                outcome["result"] = await client.check(
+                    dto.TurnAuthorityRequestV1.model_validate(wire_request()),
+                )
+            except module.TurnAuthorityUnavailable as error:
+                outcome["error"] = error
+        assert len(seen) == 1
+
+    asyncio.run(go())
+    return outcome
+
+
+def assert_unavailable(outcome: dict[str, Any]) -> None:
+    """@spec CONNECTOR-REQUESTER-1: a fixed unavailable, never a parsed observation."""
+    assert "result" not in outcome, outcome
+    error = outcome["error"]
+    assert str(error) == "identity_authority_unavailable"
+    assert error.__cause__ is None
+    assert error.__context__ is None or error.__suppress_context__
+
+
+@pytest.mark.parametrize("human", [True, False], ids=["human", "no-human"])
+@pytest.mark.parametrize("stage", ["prepare", "claim_or_resume", "start", "steer"])
+def test_a_v2_answer_is_returned_as_v2_by_its_explicit_schema_version(
+    human: bool, stage: str,
+) -> None:
+    """@spec CONNECTOR-REQUESTER-1: the body's schema_version selects the model."""
+    module = api()
+    dto = contract()
+
+    async def go() -> None:
+        """@spec CONNECTOR-REQUESTER-1."""
+
+        async def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(200, json=echo_v2(json.loads(request.content), human=human))
+
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http:
+            client = module.HttpTurnAuthorityClient(
+                api_base_url=BASE, worker_token=TOKEN, client=http
+            )
+            wire = {**wire_request(), "stage": stage}
+            result = await client.check(dto.TurnAuthorityRequestV1.model_validate(wire))
+            assert type(result) is dto.TurnAuthorityResponseV2
+            assert result.model_dump(mode="json") == echo_v2(wire, human=human)
+            if human:
+                assert type(result.requester) is dto.TurnRequesterV1
+                assert result.requester.model_dump() == REQUESTER
+            else:
+                assert result.requester is None
+            with pytest.raises(TypeError):
+                bool(result)
+
+    asyncio.run(go())
+
+
+def test_a_v1_answer_is_still_returned_as_exactly_v1() -> None:
+    """@spec CONNECTOR-REQUESTER-1 HTTP-INVOCATION-EXECUTION-16: version 1 is unchanged."""
+    dto = contract()
+    outcome = answered(echo)
+    result = outcome["result"]
+    assert type(result) is dto.TurnAuthorityResponseV1
+    assert "requester" not in result.model_dump()
+
+
+@pytest.mark.parametrize(
+    ("decision", "reason"),
+    [
+        ("refuse", "caller_not_allowed"),
+        ("refuse", "invalid_context"),
+        ("refuse", "unsupported_resume"),
+        ("unavailable", "authority_unavailable"),
+    ],
+)
+def test_a_v2_refusal_carries_no_requester_and_stays_an_observation(
+    decision: str, reason: str,
+) -> None:
+    """@spec CONNECTOR-REQUESTER-1: a refused V2 answer parses, a requester on it does not."""
+    dto = contract()
+    live = answered(lambda request: echo_v2(request, human=False, decision=decision, reason=reason))
+    assert type(live["result"]) is dto.TurnAuthorityResponseV2
+    assert live["result"].decision == decision and live["result"].requester is None
+    assert_unavailable(
+        answered(lambda request: echo_v2(request, decision=decision, reason=reason)),
+    )
+
+
+@pytest.mark.parametrize("version", [3, 0, "2", 2.0, True, None, "missing"])
+@pytest.mark.parametrize("human", [True, False], ids=["human", "no-human"])
+def test_any_other_schema_version_is_unavailable(version: Any, human: bool) -> None:
+    """@spec CONNECTOR-REQUESTER-1: no reader guesses between versions."""
+
+    def body(request: dict[str, Any]) -> dict[str, Any]:
+        """@spec CONNECTOR-REQUESTER-1."""
+        value = echo_v2(request, human=human)
+        if version == "missing":
+            del value["schema_version"]
+        else:
+            value["schema_version"] = version
+        return value
+
+    assert_unavailable(answered(body))
+
+
+@pytest.mark.parametrize(
+    "path,value",
+    [
+        ("request_id", OTHER),
+        ("stage", "start"),
+        ("event_id", "different-event"),
+        ("context_sha256", "b" * 64),
+        ("scope.tenant_id", OTHER),
+        ("scope.agent_id", UUID),
+        ("scope.binding_id", OTHER),
+        ("scope.binding_generation", 8),
+    ],
+)
+def test_each_v2_echo_component_must_match_the_exact_current_request(
+    path: str, value: Any,
+) -> None:
+    """@spec CONNECTOR-REQUESTER-1: a valid V2 answer to another request projects nothing."""
+
+    def body(request: dict[str, Any]) -> dict[str, Any]:
+        """@spec CONNECTOR-REQUESTER-1."""
+        response = echo_v2(request)
+        node = response
+        pieces = path.split(".")
+        for piece in pieces[:-1]:
+            node = node[piece]
+        node[pieces[-1]] = value
+        if path == "scope.tenant_id":
+            # Keep the projection bound to the changed scope, so only the echo differs.
+            response["requester"]["tenant_id"] = value
+        return response
+
+    assert_unavailable(answered(body))
+
+
+@pytest.mark.parametrize(
+    "damage",
+    [
+        "requester-other-tenant",
+        "requester-missing",
+        "requester-empty",
+        "requester-extra",
+        "requester-partial",
+        "requester-string",
+        "v1-with-requester",
+        "v1-with-null-requester",
+    ],
+)
+def test_a_malformed_requester_projection_is_unavailable(damage: str) -> None:
+    """@spec CONNECTOR-REQUESTER-1: the worker never uses an unbound or partial projection."""
+
+    def body(request: dict[str, Any]) -> dict[str, Any]:
+        """@spec CONNECTOR-REQUESTER-1."""
+        response = echo_v2(request)
+        if damage == "requester-other-tenant":
+            response["requester"]["tenant_id"] = OTHER
+        elif damage == "requester-missing":
+            del response["requester"]
+        elif damage == "requester-empty":
+            response["requester"] = {}
+        elif damage == "requester-extra":
+            response["requester"]["groups"] = [MARKER]
+        elif damage == "requester-partial":
+            del response["requester"]["subject"]
+        elif damage == "requester-string":
+            response["requester"] = REQUESTER["subject"]
+        elif damage == "v1-with-requester":
+            response["schema_version"] = 1
+        else:
+            response["schema_version"] = 1
+            response["requester"] = None
+        return response
+
+    assert_unavailable(answered(body))
+
+
+@pytest.mark.parametrize("where", ["root", "requester"])
+def test_a_duplicate_key_in_a_v2_answer_is_unavailable(where: str) -> None:
+    """@spec CONNECTOR-REQUESTER-1: strict decoding precedes version selection."""
+    request = wire_request()
+    encoded = json.dumps(echo_v2(request), separators=(",", ":")).encode()
+    if where == "root":
+        raw = encoded[:-1] + b',"schema_version":2}'
+    else:
+        subject = b'"subject":"SyntheticRequesterSubject"'
+        assert subject in encoded
+        raw = encoded.replace(subject, subject + b',"subject":"SyntheticOtherSubject"')
+    assert json.loads(raw)["schema_version"] == 2
+    assert_unavailable(answered(None, raw=raw))
+
+
+GRANT_PATH = "/v1/internal/identity/approval-grant/check"
+
+
+def grant_wire() -> dict[str, Any]:
+    """@spec HTTP-APPROVAL-CONTINUITY-12: a complete grant request for a resume context."""
+    return {
+        "schema_version": 1,
+        "check": {**wire_request(), "approval_id": UUID},
+        "grant": {
+            "approval_id": UUID,
+            "agent_id": OTHER,
+            "conversation_id": "synthetic-conversation",
+            "gate_kind": "permission",
+            "granted_tool": "synthetic_read",
+            "granted_arguments_json": "{}",
+        },
+    }
+
+
+@pytest.mark.parametrize("check", ["v1", "v2-human", "v2-no-human"])
+def test_the_grant_reader_accepts_only_a_v1_check(check: str) -> None:
+    """@spec CONNECTOR-REQUESTER-1 HTTP-APPROVAL-CONTINUITY-12: a V2 check is unavailable there.
+
+    The API never projects a requester through the grant check; a reader that
+    only knows version 1 maps a V2 body to unavailable rather than continue.
+    """
+    module = api()
+    dto = importlib.import_module("curie_internal.identity_approval")
+    outcome: dict[str, Any] = {}
+
+    async def go() -> None:
+        """@spec HTTP-APPROVAL-CONTINUITY-12."""
+        seen = []
+
+        async def handler(request: httpx.Request) -> httpx.Response:
+            seen.append(request)
+            submitted = json.loads(request.content)
+            answer = echo(submitted["check"]) if check == "v1" else echo_v2(
+                submitted["check"], human=check == "v2-human",
+            )
+            grant = json.dumps(
+                submitted["grant"], ensure_ascii=False, sort_keys=True, separators=(",", ":"),
+                allow_nan=False,
+            ).encode()
+            return httpx.Response(200, json={
+                "schema_version": 1, "check": answer,
+                "grant_sha256": hashlib.sha256(grant).hexdigest(),
+            })
+
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http:
+            client = module.HttpTurnAuthorityClient(
+                api_base_url=BASE, worker_token=TOKEN, client=http
+            )
+            request = dto.ApprovalGrantAuthorityRequestV1.model_validate(grant_wire())
+            try:
+                outcome["result"] = await client.check_grant(request)
+            except module.TurnAuthorityUnavailable as error:
+                outcome["error"] = error
+        assert len(seen) == 1
+        assert str(seen[0].url) == BASE + GRANT_PATH
+
+    asyncio.run(go())
+    if check == "v1":
+        result = outcome["result"]
+        assert type(result) is dto.ApprovalGrantAuthorityResponseV1
+        assert result.check.schema_version == 1 and result.check.decision == "continue"
+    else:
+        assert_unavailable(outcome)

@@ -1235,6 +1235,7 @@ fn deploy_output_json_shape_is_pinned() {
             deployment_environment: "dev".to_string(),
             deployment_status: "active".to_string(),
             cron_triggers: Vec::new(),
+            wake_triggers: Vec::new(),
             warnings: Vec::new(),
         }
         .to_json(),
@@ -2031,6 +2032,7 @@ fn expected_deploy(target: &str) -> serde_json::Value {
             "status": "active"
         },
         "cron_triggers": [],
+        "wake_triggers": [],
         "warnings": []
     })
 }

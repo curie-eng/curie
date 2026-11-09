@@ -1,5 +1,5 @@
 {
-  "comment": "What a hosted connector's caller proxy answers when it refuses a caller (ADR-0168 decision 7), and what the runner reads back to name the refusal. The proxy (apps/worker/src/curie_connector_proxy/server.py) answers every refusal with `status` and a JSON-RPC error body, never contacts the connector, and sends no WWW-Authenticate: a 401 sends the bundled Claude CLI into OAuth discovery and client registration against the connector, and a 403 does not. The MCP client surfaces a JSON-RPC error body at a non-2xx status as the request's error, so the runner (runner/src/curie_runner/mcp_tool_capability.py) finds `error.data.curie_caller` and reports the refusal by name. `header` is the request header the token travels in. Read by apps/worker/tests/test_connector_proxy.py and runner/tests/test_mcp_tool_capability_caller.py, which reject an unknown key so a key added for one reader cannot pass vacuously.",
+  "comment": "What a hosted connector's caller proxy answers when it refuses a caller (ADR-0168 decision 7), and what the runner reads back to name the refusal. The proxy (apps/worker/src/curie_connector_proxy/server.py) answers every refusal with `status` and a JSON-RPC error body, never contacts the connector, and sends no WWW-Authenticate: a 401 sends the bundled Claude CLI into OAuth discovery and client registration against the connector, and a 403 does not. The MCP client surfaces a JSON-RPC error body at a non-2xx status as the request's error, so the runner (runner/src/curie_runner/mcp_tool_capability.py) finds `error.data.curie_caller` and reports the refusal by name. `header` is the request header the token travels in. `principal_refusals` (ADR 0270 decision 2) are signed cct tokens that carry or attempt a requester principal, each with `name`, `why`, `token` and the `refusal` the proxy answers it with; a principal never changes a refusal's body, so the body is the `vectors` entry for that refusal. They are signed under the first seed in tests/vectors/connector-caller-token.json, the key the proxy's tests configure. Read by apps/worker/tests/test_connector_proxy.py (each token answers its refusal's body) and runner/tests/test_mcp_tool_capability_caller.py (each refusal's body is reported by name), which reject an unknown key so a key added for one reader cannot pass vacuously.",
   "header": "X-Curie-Caller",
   "status": 403,
   "content_type": "application/json",
@@ -28,6 +28,26 @@
     {
       "refusal": "grant_required",
       "body": {"jsonrpc": "2.0", "id": null, "error": {"code": -32000, "message": "caller refused: the connector tool call has no matching grant", "data": {"curie_caller": "grant_required"}}}
+    }
+  ],
+  "principal_refusals": [
+    {
+      "name": "a_malformed_principal_is_invalid",
+      "why": "A signed token whose principal carries a duplicate subject key is malformed and refused as invalid, the same body as any malformed token.",
+      "token": "cct.eyJhZ2VudCI6ImFjbWUtZGV2IiwiZXhwIjoxNzkwMDAwMDAwLCJwcmluY2lwYWwiOnsiaXNzdWVyIjoiaHR0cHM6Ly9pZHAuZXhhbXBsZS50ZXN0Iiwic3ViamVjdCI6InVzZXItMDAwMSIsInN1YmplY3QiOiJ1c2VyLTAwMDIiLCJ0ZW5hbnRfaWQiOiI0NDQ0NDQ0NC00NDQ0LTQ0NDQtODQ0NC00NDQ0NDQ0NDQ0NDQifX0.1V7qPjb8aMnl_EywVtBJ1qlTgrFxqp-Ac87aHnmvyj1Fzh-UT63MvgIPYNjJWn2SMvTWvxHIV2m5WDVTVvOoCA",
+      "refusal": "invalid"
+    },
+    {
+      "name": "a_requester_on_an_agent_the_connector_does_not_admit",
+      "why": "A well-formed principal adds no admission: agent admission is judged first, and a requester cannot carry an agent past it.",
+      "token": "cct.eyJhZ2VudCI6InNvbWVvbmUtZWxzZSIsImV4cCI6MTc5MDAwMDAwMCwicHJpbmNpcGFsIjp7Imlzc3VlciI6Imh0dHBzOi8vaWRwLmV4YW1wbGUudGVzdCIsInN1YmplY3QiOiJ1c2VyLTAwMDEiLCJ0ZW5hbnRfaWQiOiI0NDQ0NDQ0NC00NDQ0LTQ0NDQtODQ0NC00NDQ0NDQ0NDQ0NDQifX0.-iz26I1PQG0wFksTqBsDtZ24XB-HKzfSJaWOqrMED3vavTBEC2_Fn6YPTZz16RHiUOIYJtn6NeNgMi0CF9U3Ag",
+      "refusal": "not_admitted"
+    },
+    {
+      "name": "an_expired_token_with_a_requester",
+      "why": "A principal-bearing token past its exp is expired like any other.",
+      "token": "cct.eyJhZ2VudCI6ImFjbWUtZGV2IiwiZXhwIjoxNzAwMDAwMDAwLCJwcmluY2lwYWwiOnsiaXNzdWVyIjoiaHR0cHM6Ly9pZHAuZXhhbXBsZS50ZXN0Iiwic3ViamVjdCI6InVzZXItMDAwMSIsInRlbmFudF9pZCI6IjQ0NDQ0NDQ0LTQ0NDQtNDQ0NC04NDQ0LTQ0NDQ0NDQ0NDQ0NCJ9fQ.T2qZRFwyGie8OMsI_EZ7sNaGSaMYufvQ38WVoAT6WjKIbI_kzw5W8gnWOfobSsmoCHSR5Vo5L-LVXM5YC-qpDw",
+      "refusal": "expired"
     }
   ]
 }

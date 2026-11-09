@@ -1,5 +1,9 @@
 {
   "producers": {
+    "apps/api/src/curie_api/approval_reminders.py:enqueue_reminder:1": {
+      "language": "python",
+      "purpose": "payload-less approval reminder side-field on the runs stream"
+    },
     "apps/api/src/curie_api/delivery.py:module:1": {
       "language": "lua",
       "purpose": "Guarded invocation enqueue with sealed context and transport identity"
@@ -133,6 +137,10 @@
     "apps/api/src/curie_api/factory_notices.py:module:4": {
       "value": "curie:needs-human",
       "reason": "Accepted legacy factory state label, not a Valkey key"
+    },
+    "apps/api/src/curie_api/hook_wake_signing.py:module:1": {
+      "value": "curie:hook-wake:v1",
+      "reason": "Webhook wake delivery reservation namespace, written with SET NX EX and a bounded TTL to dedupe signed deliveries"
     },
     "apps/api/src/curie_api/identity_fence.py:module:1": {
       "value": "curie:identity:admission-fence",

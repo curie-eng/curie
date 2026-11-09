@@ -64,6 +64,7 @@ from curie_api.e2e_connector import (
 __all__ = [
     "UnsupportedArchive",
     "bundle_root",
+    "declared_approval_route_map",
     "declared_approval_routes",
     "detect_format",
     "extract_and_validate",
@@ -273,6 +274,17 @@ def extract_stored_bundle(
 def declared_approval_routes(root: Path) -> set[str] | None:
     """The approval routes a bundle DECLARES, or ``None`` when it declares poison.
 
+    Exactly the values of ``declared_approval_route_map`` (ADR 0271 decision 2),
+    so the declared set and the per-tool gate map cannot drift apart.
+    """
+
+    route_map = declared_approval_route_map(root)
+    return None if route_map is None else set(route_map.values())
+
+
+def declared_approval_route_map(root: Path) -> dict[str, str] | None:
+    """The effective ``{stripped gate: stripped route}`` map, or ``None`` for poison.
+
     The deploy-time half of the declared/bound approval-route join (#2436). The
     runtime counterpart is
     ``runner/src/curie_runner/approval.py::resolve_approval_policy``, and this
@@ -283,9 +295,10 @@ def declared_approval_routes(root: Path) -> set[str] | None:
     sides. Drift here is the #453/#544 fail-open shape: a bundle passes the
     configuration gate and then boots with a different set of gates.
 
-    The declared set is ``set(route_by_tool.values())`` of the loader's LAST-WINS
-    ``{stripped gate: stripped route}`` map, deliberately NOT the union of every
-    gate's route value. Two gates naming one tool are a last-wins duplicate
+    The declared set (``declared_approval_routes``) is the values of this
+    LAST-WINS map, deliberately NOT the union of every gate's route value, and
+    the per-tool lookup ADR 0271 registrations are judged against is the map
+    itself. Two gates naming one tool are a last-wins duplicate
     ``validate_bundle`` accepts and the runner boots, and the earlier route can
     never be raised at runtime -- so unioning would refuse a deploy over a route
     that does not exist.
@@ -300,7 +313,7 @@ def declared_approval_routes(root: Path) -> set[str] | None:
     configuration time, a bundle the runner will not run. The caller turns
     ``None`` into a refusal (``deploy.check_routes_from_bytes``).
 
-    An empty set is reserved for the honest cases AC4 rests on: no manifest, no
+    An empty map is reserved for the honest cases AC4 rests on: no manifest, no
     ``approvalPolicy``, or an explicitly empty ``gates`` list.
     """
 
@@ -308,14 +321,14 @@ def declared_approval_routes(root: Path) -> set[str] | None:
     if manifest_path is None:
         # `validate_bundle` already refuses a manifestless bundle at every
         # storage entry point, so this is the defensive branch, not a real one.
-        return set()
+        return {}
     try:
         raw = json.loads(manifest_path.read_text(encoding="utf-8"))
     except (json.JSONDecodeError, OSError):
         # A manifest that will not parse cannot prove it declares no policy.
         return None
     if not isinstance(raw, dict) or raw.get("approvalPolicy") is None:
-        return set()
+        return {}
     try:
         manifest = PluginManifest.model_validate(raw)
         policy = ApprovalPolicy.model_validate(manifest.approvalPolicy)
@@ -333,7 +346,7 @@ def declared_approval_routes(root: Path) -> set[str] | None:
     declared_names = {gate.gate.strip() for gate in policy.gates if isinstance(gate.gate, str)}
     if declared_names - set(routes):
         return None
-    return set(routes.values())
+    return routes
 
 
 def read_connectors(root: Path) -> ConnectorsFile:

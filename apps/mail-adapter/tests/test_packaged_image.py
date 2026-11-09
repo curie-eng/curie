@@ -87,7 +87,7 @@ def _cleanup_containers(owner: str) -> None:
 @pytest.fixture(scope="module")
 def packaged_image(request: pytest.FixtureRequest) -> str:
     if sys.platform != "linux":
-        raise RuntimeError("the packaged mail proof requires Linux")
+        raise RuntimeError("the packaged mail proof requires a Linux test host")
     for tool in ("docker", "openssl"):
         if shutil.which(tool) is None:
             raise RuntimeError(f"the packaged mail proof requires {tool}")
@@ -165,7 +165,7 @@ class ExternalApis:
 
 @pytest.fixture
 def external_apis(request: pytest.FixtureRequest, tmp_path: Path) -> ExternalApis:
-    callback_host = os.environ.get("CURIE_LOCAL_STUB_HOST", "127.0.0.1")
+    callback_host = str(ipaddress.IPv4Address(os.environ.get("CURIE_LOCAL_STUB_HOST", "127.0.0.1")))
     certificate = tmp_path / "provider-ca.pem"
     private_key = tmp_path / "provider-key.pem"
     _require(

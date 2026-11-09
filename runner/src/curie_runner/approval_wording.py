@@ -73,10 +73,13 @@ def _value(value: Any) -> str:
 def describe_approval(tool: object, arguments: dict[str, Any] | None) -> str:
     """Render values without deriving approval authority from display wording."""
     text = f"Approve {action_label(tool)}."
-    if arguments:
+    # ADR 0271 decision 8: the top-level approval_ticket is opaque metadata. It
+    # stays in the stored, grant-bound arguments and out of the rendered details.
+    shown = {k: v for k, v in (arguments or {}).items() if k != "approval_ticket"}
+    if shown:
         details = "; ".join(
             f"{action_label(key).capitalize()}: {_value(value)}"
-            for key, value in sorted(arguments.items())
+            for key, value in sorted(shown.items())
         )
         text += " " + details
     elif arguments is None:
