@@ -911,31 +911,11 @@ name = "curie-dispatcher"
 version = "0.0.0"
 source = { editable = "apps/dispatcher" }
 dependencies = [
-    { name = "aci-protocol" },
     { name = "curie-channel-gateway" },
-    { name = "curie-internal" },
-    { name = "curie-telemetry" },
-    { name = "curie-upgrade-pause" },
-    { name = "httpx" },
-    { name = "pydantic" },
-    { name = "pydantic-settings" },
-    { name = "redis" },
-    { name = "slack-bolt" },
 ]
 
 [package.metadata]
-requires-dist = [
-    { name = "aci-protocol", editable = "packages/aci-protocol" },
-    { name = "curie-channel-gateway", editable = "packages/channel-gateway" },
-    { name = "curie-internal", editable = "packages/curie-internal" },
-    { name = "curie-telemetry", editable = "packages/telemetry" },
-    { name = "curie-upgrade-pause", editable = "packages/upgrade-pause" },
-    { name = "httpx", specifier = ">=0.28" },
-    { name = "pydantic", specifier = ">=2.10" },
-    { name = "pydantic-settings", specifier = ">=2.15.0" },
-    { name = "redis", specifier = ">=5.2" },
-    { name = "slack-bolt", specifier = ">=1.30.0" },
-]
+requires-dist = [{ name = "curie-channel-gateway", editable = "packages/channel-gateway" }]
 
 [[package]]
 name = "curie-doclint"
@@ -975,6 +955,7 @@ version = "0.0.0"
 source = { editable = "packages/curie-internal" }
 dependencies = [
     { name = "aci-protocol" },
+    { name = "curie-telemetry" },
     { name = "pydantic" },
     { name = "pynacl" },
     { name = "redis" },
@@ -984,6 +965,7 @@ dependencies = [
 [package.metadata]
 requires-dist = [
     { name = "aci-protocol", editable = "packages/aci-protocol" },
+    { name = "curie-telemetry", editable = "packages/telemetry" },
     { name = "pydantic", specifier = ">=2.9" },
     { name = "pynacl", specifier = ">=1.5" },
     { name = "redis", specifier = ">=5.2" },
@@ -1160,7 +1142,6 @@ dependencies = [
     { name = "cryptography" },
     { name = "curie-channel-gateway" },
     { name = "curie-channel-protocol" },
-    { name = "curie-dispatcher" },
     { name = "curie-e2e-connector" },
     { name = "curie-internal" },
     { name = "curie-protected-hooks" },
@@ -1188,7 +1169,6 @@ requires-dist = [
     { name = "cryptography", specifier = ">=50.0.2" },
     { name = "curie-channel-gateway", editable = "packages/channel-gateway" },
     { name = "curie-channel-protocol", editable = "packages/channel-protocol" },
-    { name = "curie-dispatcher", editable = "apps/dispatcher" },
     { name = "curie-e2e-connector", editable = "apps/e2e-connector" },
     { name = "curie-internal", editable = "packages/curie-internal" },
     { name = "curie-protected-hooks", editable = "packages/protected-hooks" },

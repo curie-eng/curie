@@ -51,7 +51,7 @@ from channel_protocol.reply import (
     ReplyUpdate,
     TurnCompleted,
 )
-from curie_dispatcher.queue import to_stream_fields
+from curie_internal.turn_queue import to_stream_fields
 from curie_worker.config import WorkerConfig
 from curie_worker.consumer import Consumer
 from curie_worker.delivery_lease import DeliveryLeaseStore

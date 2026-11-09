@@ -44,7 +44,7 @@ def pytest_sessionfinish(session: Any, exitstatus: int) -> None:
     """@spec IDENTITY-WRITER-LIFETIME-V1-10. Observe teardown before another suite runs."""
     if os.environ.get("FENCE_ISOLATION_PURE_PROBE") == "1":
         from curie_api import identity_fence
-        from curie_dispatcher import admission
+        from curie_channel_gateway.slack import admission
 
         if (identity_fence.FENCE_KEY, admission.IDENTITY_FENCE_KEY) != (
             "curie:identity:admission-fence",

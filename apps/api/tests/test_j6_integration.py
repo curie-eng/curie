@@ -22,7 +22,7 @@ from curie_api.models import (
     Tenant,
     TenantIdentityProvider,
 )
-from curie_dispatcher.admission import AdmissionGate, SlackAdmissionClient
+from curie_channel_gateway.slack.admission import AdmissionGate, SlackAdmissionClient
 from sqlalchemy import delete
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 from sqlalchemy.pool import NullPool

@@ -11,11 +11,11 @@ import redis
 from aci_protocol import QueuedTurn, ReplyHandle, TurnSource
 from aci_protocol.turn import DEFAULT_IDENTITY
 from curie_channel_gateway.slack import handlers as handlers_module
+from curie_channel_gateway.slack.admission import build_admission
 from curie_channel_gateway.slack.config import DispatcherConfig
 from curie_channel_gateway.slack.handlers import process_action, process_event
-from curie_dispatcher import queue as queue_module
-from curie_dispatcher.admission import build_admission
-from curie_dispatcher.queue import (
+from curie_internal import turn_queue as queue_module
+from curie_internal.turn_queue import (
     claim_event,
     enqueue,
     from_stream_fields,

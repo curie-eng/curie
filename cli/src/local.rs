@@ -820,9 +820,9 @@ pub struct SourceImage {
 /// symmetry for its own sake. The compose profile governs the long-running
 /// dispatcher service, but `curie local message` runs a ONE-SHOT container from
 /// the same image on every invocation (`message.rs`'s
-/// `curie_dispatcher.enqueue_once`), outside any profile. Keying the build set on
+/// `curie_channel_gateway.slack.enqueue_once`), outside any profile. Keying the build set on
 /// profiles alone left the main dev-loop verb still failing with
-/// `No module named curie_dispatcher.enqueue_once` -- observed, not theorised.
+/// `No module named curie_channel_gateway.slack.enqueue_once` -- observed, not theorised.
 ///
 /// `curie-api` covers `curie-migrate` too: same image, and that one-shot is the
 /// compose upgrade phase (`python -m curie_api.schema_compat upgrade`, #2300).
@@ -3833,7 +3833,7 @@ mod tests {
 
     /// Regression: keying the build set on the `slack` PROFILE left
     /// `curie local message` failing with `No module named
-    /// curie_dispatcher.enqueue_once`, because that verb runs a one-shot
+    /// curie_channel_gateway.slack.enqueue_once`, because that verb runs a one-shot
     /// container from the dispatcher image on every invocation, profile or not.
     #[test]
     fn the_dispatcher_is_built_even_without_the_slack_profile() {

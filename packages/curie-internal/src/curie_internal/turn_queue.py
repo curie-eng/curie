@@ -34,11 +34,22 @@ import logging
 from typing import Any, Protocol, cast, runtime_checkable
 
 from aci_protocol import STREAM_PAYLOAD_FIELD, QueuedTurn, parse_queued_turn
-from curie_channel_gateway.slack.config import DispatcherConfig
 from curie_telemetry import inject_trace_context, operation_span, record_metric
 from opentelemetry.trace import SpanKind, StatusCode
 
 logger = logging.getLogger(__name__)
+
+
+class QueueConfig(Protocol):
+    """Settings consumed by the channel-neutral stream producer."""
+
+    @property
+    def stream(self) -> str: ...
+
+    @property
+    def dedupe_ttl_seconds(self) -> int: ...
+
+    def dedupe_key(self, event_id: str) -> str: ...
 
 
 @runtime_checkable
@@ -81,7 +92,7 @@ def from_stream_fields(fields: dict[str, str]) -> QueuedTurn:
     return parse_queued_turn(fields[STREAM_PAYLOAD_FIELD])
 
 
-def claim_event(redis_client: "StreamPublisher", config: "DispatcherConfig", event_id: str) -> bool:
+def claim_event(redis_client: "StreamPublisher", config: "QueueConfig", event_id: str) -> bool:
     """Claim a Slack event id for processing, returning True on the first claim.
 
     Uses ``SET NX EX`` so exactly one delivery of a given event id wins; retries
@@ -113,7 +124,7 @@ def claim_event(redis_client: "StreamPublisher", config: "DispatcherConfig", eve
 
 
 def release_event(
-    redis_client: "StreamPublisher", config: "DispatcherConfig", event_id: str
+    redis_client: "StreamPublisher", config: "QueueConfig", event_id: str
 ) -> None:
     """Release the dedupe claim on ``event_id`` so a Slack redelivery can retry.
 
@@ -134,7 +145,7 @@ def release_event(
     redis_client.delete(config.dedupe_key(event_id))
 
 
-def enqueue(redis_client: "StreamPublisher", config: "DispatcherConfig", turn: QueuedTurn) -> str:
+def enqueue(redis_client: "StreamPublisher", config: "QueueConfig", turn: QueuedTurn) -> str:
     """Append the normalized turn to the Valkey Stream, returning its Stream id."""
     attributes = {"service.name": "curie-dispatcher", "source": "dispatcher"}
     error: Exception | None = None

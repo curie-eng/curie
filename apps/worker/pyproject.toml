@@ -23,7 +23,6 @@ dependencies = [
     "curie-channel-gateway",
     "plugin-format",
     "curie-e2e-connector",
-    "curie-dispatcher",
     "aiohttp>=3.11",
     "httpx>=0.28",
     # Sealed connector credentials (ADR-0094). libsodium sealed boxes, the same

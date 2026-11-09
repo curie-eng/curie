@@ -3156,7 +3156,7 @@ def test_active_file_turn_with_a_real_delivery_lease_settles_once(
     """A refused active file turn is delivered, acknowledged, and never reclaimed."""
 
     async def go() -> None:
-        from curie_dispatcher.queue import to_stream_fields
+        from curie_internal.turn_queue import to_stream_fields
         from curie_worker.consumer import Consumer
         from curie_worker.delivery_lease import DeliveryLeaseStore
 
@@ -7284,7 +7284,7 @@ async def _leased_entry(h: Any, store: Any, *, event_id: str, generation: int) -
     and only signal the reclaim preflight keys on (a distributed-state fact, not
     a sniff of the message text: kernel rule 3 stands).
     """
-    from curie_dispatcher.queue import to_stream_fields
+    from curie_internal.turn_queue import to_stream_fields
 
     await h.async_redis.xadd(
         h.config.stream, to_stream_fields(qevent("reclaimed", event_id=event_id))
@@ -7335,7 +7335,7 @@ def test_a_long_turn_keeps_accepting_steers_and_a_finished_one_opens_a_new_turn(
     ``h.runner.opened`` is the negative control on the steering half: a steer
     that silently became a second turn shows up there.
     """
-    from curie_dispatcher.queue import to_stream_fields
+    from curie_internal.turn_queue import to_stream_fields
     from curie_worker.consumer import Consumer
 
     # Imported inside the test on purpose: ``delivery_lease`` does not exist
@@ -7541,7 +7541,7 @@ def test_an_unreadable_runner_keeps_a_reclaimed_delivery_pending_until_recovery(
     make_harness,
 ) -> None:
     """An unreadable predecessor holds the same delivery until liveness recovers."""
-    from curie_dispatcher.queue import to_stream_fields
+    from curie_internal.turn_queue import to_stream_fields
     from curie_worker.consumer import Consumer
 
     # Imported inside the test on purpose: ``delivery_lease`` does not exist

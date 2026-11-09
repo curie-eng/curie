@@ -46,7 +46,7 @@ from typing import Any
 import curie_worker.consumer as consumer_module
 import pytest
 from aci_protocol import Final, QueuedTurn, SessionStatus
-from curie_dispatcher.queue import to_stream_fields
+from curie_internal.turn_queue import to_stream_fields
 from curie_worker.config import WorkerConfig
 from curie_worker.consumer import Consumer
 from curie_worker.dead_letter_alert import install_dead_letter_alerting
@@ -176,7 +176,7 @@ def test_permanently_failing_entry_is_dead_lettered_at_the_cap_and_group_progres
                 assert dl["dl_dead_lettered_at"]
                 # The original entry fields survive so a human can inspect/replay.
                 # The frozen #7 wire encoding is a single JSON blob under
-                # "payload" (curie_dispatcher.queue.to_stream_fields), not
+                # "payload" (curie_internal.turn_queue.to_stream_fields), not
                 # flat top-level fields, so decode it before asserting.
                 payload = json.loads(dl["payload"])
                 assert payload["event_id"] == "poison"

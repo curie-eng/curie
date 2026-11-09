@@ -25,7 +25,7 @@ from curie_channel_gateway.slack.identities import (
 )
 from curie_channel_gateway.slack.preflight import PreflightedIdentity
 from curie_channel_gateway.slack.relevance import DropReason, classify
-from curie_dispatcher.queue import from_stream_fields
+from curie_internal.turn_queue import from_stream_fields
 from slack_bolt.adapter.socket_mode import SocketModeHandler
 from slack_sdk.web import WebClient
 

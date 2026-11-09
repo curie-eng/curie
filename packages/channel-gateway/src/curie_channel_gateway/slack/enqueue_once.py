@@ -14,16 +14,16 @@ import os
 import sys
 
 from aci_protocol import QueuedTurn, parse_queued_turn
-from curie_channel_gateway.slack.config import DispatcherConfig
+from curie_internal.turn_queue import StreamPublisher, enqueue
 from curie_telemetry import bootstrap_service_telemetry, operation_span
 from opentelemetry.trace import SpanKind
 
-from curie_dispatcher.app import build_redis
+from curie_channel_gateway.slack.config import DispatcherConfig
+from curie_channel_gateway.slack.valkey import build_redis
 
-from . import __version__
-from .queue import StreamPublisher, enqueue
+from .. import __version__
 
-_LOG = logging.getLogger("curie_dispatcher.enqueue_once")
+_LOG = logging.getLogger("curie_channel_gateway.slack.enqueue_once")
 
 
 def enqueue_payload(

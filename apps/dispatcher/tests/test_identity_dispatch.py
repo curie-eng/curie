@@ -25,7 +25,7 @@ from curie_channel_gateway.slack.approval_actions import (
 from curie_channel_gateway.slack.config import DispatcherConfig
 from curie_channel_gateway.slack.handlers import process_action, process_event
 from curie_channel_gateway.slack.identities import SlackIdentityCredentials
-from curie_dispatcher.queue import from_stream_fields
+from curie_internal.turn_queue import from_stream_fields
 from slack_bolt import App
 from slack_bolt.adapter.socket_mode import SocketModeHandler
 from slack_bolt.authorization import AuthorizeResult

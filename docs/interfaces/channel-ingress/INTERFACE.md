@@ -65,7 +65,7 @@ satisfying the egress Protocol, or out of process over the HTTP wire.
   adapter identity whose credential authenticates the reply). The Slack adapter
   currently supplies the pre-posted reply ts that the worker edits in place. The
   dispatcher serializes the turn to a single Stream field via `to_stream_fields`
-  (`apps/dispatcher/src/curie_dispatcher/queue.py::to_stream_fields`), keyed by
+  (`packages/curie-internal/src/curie_internal/turn_queue.py::to_stream_fields`), keyed by
   `STREAM_PAYLOAD_FIELD = "payload"`. That key is not the dispatcher's: it is frozen-package
   contract in
   `packages/aci-protocol/src/aci_protocol/service_config.py::STREAM_PAYLOAD_FIELD`, imported
@@ -175,7 +175,7 @@ satisfying the egress Protocol, or out of process over the HTTP wire.
   and `{"detail": "caller_not_allowed"}`, which every adapter treats as final (a
   403 without that code stays retryable). The Slack dispatcher has no database, so it
   asks `POST /channels/admission` (platform key only) through `AdmissionGate`
-  (`apps/dispatcher/src/curie_dispatcher/admission.py::AdmissionGate`) after its
+  (`packages/channel-gateway/src/curie_channel_gateway/slack/admission.py::AdmissionGate`) after its
   own filters and before `claim_event`, on mentions, direct messages and
   turn-starting clicks, with the sender (plus the bot id when a bot sent it) or the
   clicking user. It caches answers per route for 30 seconds in memory and in

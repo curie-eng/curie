@@ -539,7 +539,7 @@ class HttpReceiverRuntime:
 
     def admit_test_driver(self, prepared: PreparedSubmission) -> ReceiverSubmission | None:
         """Check normal identity before the shared ADR 0202 claim, ping and turn budget."""
-        from curie_dispatcher.queue import claim_event
+        from curie_internal.turn_queue import claim_event
 
         driver = prepared._driver
         if driver is None or prepared._driver_admitted:

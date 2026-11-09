@@ -1613,7 +1613,7 @@ fn diagnostics_with_claim_wait(diagnostics: String, reason: Option<&str>) -> Str
 
 const COMPOSE_CONFIG_FILES_LABEL: &str = "com.docker.compose.project.config_files";
 const COMPOSE_DISPATCHER_SERVICE: &str = "curie-dispatcher";
-const DISPATCHER_ENQUEUE_MODULE: &str = "curie_dispatcher.enqueue_once";
+const DISPATCHER_ENQUEUE_MODULE: &str = "curie_channel_gateway.slack.enqueue_once";
 const DISPATCHER_ENQUEUE_TIMEOUT: Duration = Duration::from_secs(30);
 // The one-shot dispatcher shares the runner's bridge network, not the
 // worker's host network. Inspect this separately; it is never forwarded as a
@@ -1689,7 +1689,7 @@ fn compose_config_files(label: &str) -> Result<Vec<String>> {
 ///   invocation. Compose substitutes its variables from each caller's own
 ///   environment, so after `local up --build` the stack ran `:dev` while this
 ///   verb resolved `:latest` and died on `No module named
-///   curie_dispatcher.enqueue_once`.
+///   curie_channel_gateway.slack.enqueue_once`.
 /// - Checked, because a tag that exists for the platform images need not exist
 ///   for the dispatcher. CI runs the ladder with `CURIE_BASE_TAG=ci-local` and
 ///   builds its dispatcher as `:latest`, so pointing this at `:ci-local` asked
@@ -8545,7 +8545,7 @@ mod tests {
     /// Compose substitutes its variables from each invocation's own environment,
     /// so after `local up --build` the stack ran `:dev` while `local message`
     /// resolved `:latest` and died on `No module named
-    /// curie_dispatcher.enqueue_once` -- the module the published image predates.
+    /// curie_channel_gateway.slack.enqueue_once` -- the module the published image predates.
     #[test]
     fn the_one_shot_producer_runs_the_stacks_dispatcher_image() {
         let cmd = dispatcher_enqueue_command(

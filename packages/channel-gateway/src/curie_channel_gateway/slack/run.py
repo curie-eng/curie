@@ -4,7 +4,7 @@ This is the top-level composition. It reads the environment, runs the boot
 gates, builds one Bolt app and Socket Mode supervisor per Slack identity that
 passed preflight (ADR-0168 decision 2), installs SIGINT/SIGTERM handlers for
 graceful shutdown, and runs the supervisors together. Run it with
-``python -m curie_dispatcher``.
+``python -m curie_channel_gateway.slack.run``.
 """
 
 import logging
@@ -16,13 +16,14 @@ from dataclasses import dataclass
 from typing import Any
 
 import redis
-from curie_dispatcher import __version__
-from curie_dispatcher.admission import build_admission
-from curie_dispatcher.app import build_redis
-from curie_dispatcher.heartbeat import start_heartbeat
 from curie_telemetry import bootstrap_service_telemetry, configure_service_logging
 from slack_bolt import App
 from slack_sdk.web import WebClient
+
+from curie_channel_gateway import __version__
+from curie_channel_gateway.slack.admission import build_admission
+from curie_channel_gateway.slack.heartbeat import start_heartbeat
+from curie_channel_gateway.slack.valkey import build_redis
 
 from .app import SocketModeConnection, build_app, build_web_client
 from .config import DispatcherConfig

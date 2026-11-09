@@ -34,7 +34,7 @@ from pathlib import Path
 import pytest
 from aci_protocol import Final, SessionStatus
 from channel_protocol.reply import REPLY_WIRE_VERSION, ReplyTarget, TurnCompleted
-from curie_dispatcher.queue import to_stream_fields
+from curie_internal.turn_queue import to_stream_fields
 from curie_worker.consumer import Consumer
 from curie_worker.delivery_lease import DeliveryLeaseStore, LeaseLostError
 from curie_worker.markers import CompletionRecord, Markers
