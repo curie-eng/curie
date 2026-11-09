@@ -4,13 +4,13 @@
 #
 # WHY THIS EXISTS
 # ---------------
-# `helm --kube-context "$KUBE_CONTEXT" lint` and `helm --kube-context "$KUBE_CONTEXT" template` render manifests but NEVER run a container.
+# `helm lint` and `helm template` render manifests but NEVER run a container.
 # They cannot catch a bug that only manifests when an init container executes --
 # for example issue #56, where the bundle fetch client wrote the S3 credential
 # in cleartext to a config file,
 # and that dir sat on the `bundles` emptyDir the untrusted `runner` container
 # also mounts. The acceptance criterion is a RUNTIME exec:
-#   kubectl --context "$KUBE_CONTEXT" exec <sandbox> -c runner -- find /bundles -name config.json   # empty
+#   kubectl exec <sandbox> -c runner -- find /bundles -name config.json   # empty
 # This harness makes that check and the API Service NodePort contract one
 # command.
 #
@@ -23,12 +23,12 @@
 #    (CURIE_BUNDLE_REF pointing at the seeded object) and apply it -- so the
 #    real bundle-fetch/bundle-extract init containers actually run.
 # 5. Wait for the init pair to complete and the runner container to be Running.
-# 6. `kubectl --context "$KUBE_CONTEXT" exec` into the runner and ASSERT on what it can see.
+# 6. `kubectl exec` into the runner and ASSERT on what it can see.
 #
 # HOW TO ADD ANOTHER RUNTIME ASSERTION
 # ------------------------------------
 # The generic seam is "render template -> bind bundle -> exec runner -> assert".
-# To add a new runtime check, add a new `kubectl --context "$KUBE_CONTEXT" exec e2e-bound-sandbox -c runner
+# To add a new runtime check, add a new `kubectl exec e2e-bound-sandbox -c runner
 # -- <cmd>` inside run_assertions() and fold its result into the PASS/FAIL logic.
 # Reuse exec_echo() so the command and its raw output are auditable in the log.
 #
@@ -202,7 +202,7 @@ trap teardown EXIT
 # Helpers
 # --------------------------------------------------------------------------
 
-# exec_echo <label> <exec-args...> : run a kubectl --context "$KUBE_CONTEXT" exec, echo the command, its
+# exec_echo <label> <exec-args...> : run a kubectl exec, echo the command, its
 # exit code, and its stdout/stderr SEPARATELY. Captures stdout into the global
 # EXEC_OUT, stderr into EXEC_ERR, and the exit code into EXEC_RC for the caller.
 # Verdicts MUST key on EXEC_OUT (stdout) only -- folding stderr into the captured
@@ -211,7 +211,7 @@ trap teardown EXIT
 exec_echo() {
   local label="$1"; shift
   echo "--- $label"
-  echo "\$ kubectl --context "$KUBE_CONTEXT" exec $POD_NAME -n $NAMESPACE $*"
+  echo "\$ kubectl exec $POD_NAME -n $NAMESPACE $*"
   local out_file err_file
   out_file="$(mktemp /tmp/e2e-exec-out.XXXXXX)"
   err_file="$(mktemp /tmp/e2e-exec-err.XXXXXX)"
@@ -1105,7 +1105,7 @@ install_chart() {
 # A shared disposable cluster can have API churn: a spurious "namespaces not found" at
 # install is usually API churn, so retry ONCE before failing.
 if ! install_chart; then
-  echo "helm --kube-context "$KUBE_CONTEXT" install failed once (likely transient API churn on shared node); retrying in 5s..."
+  echo "helm install failed once (likely transient API churn on shared node); retrying in 5s..."
   sleep 5
   kubectl --context "$KUBE_CONTEXT" delete priorityclass \
     "$PLATFORM_PRIORITY_CLASS" "$SANDBOX_PRIORITY_CLASS" \
@@ -1116,7 +1116,7 @@ if ! install_chart; then
   fi
   create_owned_ns "$NAMESPACE"
   create_otlp_probe_resources
-  install_chart || fail "helm --kube-context "$KUBE_CONTEXT" install failed twice"
+  install_chart || fail "helm install failed twice"
 fi
 
 banner "WAIT durable OTel Collector Running"
@@ -1381,7 +1381,7 @@ fi
 # literally `e2e-sandboxtemplate.XXXXXX.json`: no randomization, a predictable
 # /tmp path, and a second run of this script fails for the life of the machine
 # with `mkstemp failed ...: File exists`. `mktemp -d` with the X's last is
-# portable, keeps the .json names the kubectl --context "$KUBE_CONTEXT" calls below read better with, and
+# portable, keeps the .json names the kubectl calls below read better with, and
 # gives teardown one thing to remove.
 JSON_DIR="$(mktemp -d /tmp/e2e-json.XXXXXX)"
 TEMPLATE_JSON="$JSON_DIR/sandboxtemplate.json"

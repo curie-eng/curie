@@ -14,9 +14,6 @@ fn context_policy_exercises_literal_rejection_and_variable_acceptance_through_cl
         String::from_utf8_lossy(&output.stderr)
     );
     let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(stdout.contains("literals rejected"), "{stdout}");
-    assert!(
-        stdout.contains("variables/placeholders accepted"),
-        "{stdout}"
-    );
+    assert!(stdout.contains("invalid cases rejected"), "{stdout}");
+    assert!(stdout.contains("valid cases accepted"), "{stdout}");
 }

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Require caller-supplied context flag values in the context-policy source set."""
+"""Reject deployment-specific kube contexts throughout tracked source and docs."""
 
 from __future__ import annotations
 
@@ -10,52 +10,50 @@ import sys
 import tempfile
 from pathlib import Path
 
-# The source set covers the tracked text files in the context-removal contract.
-SCOPED_PATHS = frozenset(
-    (
-        ".github/workflows/ci.yaml",
-        "apps/docker-daemon/tests/e2e.sh",
-        "apps/e2e-connector/tests/test_workload.py",
-        "apps/ui/src/generated/commandManifest.ts",
-        "apps/worker/src/curie_worker/sandbox/k8s.py",
-        "apps/worker/tests/sandbox/conftest.py",
-        "charts/curie/CLAUDE.md",
-        "charts/curie/ci/cron-operator-approval-proof.py",
-        "charts/curie/ci/hook-approval-proof.py",
-        "charts/curie/ci/runner-images-assertions.sh",
-        "charts/curie/ci/runtime/connector-readiness-runtime.sh",
-        "charts/curie/ci/runtime/metrics-alerts-runtime.sh",
-        "cli/scripts/cluster-down-namespace-bound.sh",
-        "cli/scripts/cluster-upgrade-matrix.sh",
-        "cli/scripts/e2e-cluster-idle-route-reclamation.sh",
-        "cli/scripts/e2e-ladder.sh",
-        "cli/scripts/recovery-drill.sh",
-        "cli/src/args/dev.rs",
-        "cli/src/factory_quickstart/mod.rs",
-        "cli/src/installation.rs",
-        "cli/tests/cluster_upgrade_matrix.rs",
-        "cli/tests/repo_runner.rs",
-        "compose/tests/test_scripts_bash_3_2.py",
-        "examples/curie.yaml",
-        "examples/sre-bot/observability/reliability-alerts.test.yaml",
-        "runner/tests/test_dark_factory_runner_toolchain.py",
-        "scripts/chart-runtime-e2e.sh",
-        "scripts/e2e-mail-adapter.sh",
-        "tools/factory-e2e/factory_e2e.py",
-        "tools/factory-e2e/repo_runner.py",
-        "tools/factory-e2e/tests/test_acceptance.py",
-        "tools/factory-e2e/tests/test_factory_e2e.py",
-        "tools/factory-e2e/tests/test_factory_e2e_loop.py",
-        "tools/factory-e2e/tests/test_gitlab_acceptance.py",
-        "tools/factory-e2e/tests/test_repo_runner.py",
-        "tools/factory-e2e/tests/test_tls_code_host.py",
-    )
+SOURCE_SUFFIXES = frozenset(
+    {
+        ".sh",
+        ".bash",
+        ".ksh",
+        ".fish",
+        ".bats",
+        ".zsh",
+        ".py",
+        ".pyi",
+        ".pyw",
+        ".rs",
+        ".ts",
+        ".tsx",
+        ".mts",
+        ".cts",
+        ".yaml",
+        ".yml",
+        ".md",
+        ".markdown",
+        ".mdx",
+    }
 )
+EXAMPLE_CONTEXTS = frozenset(
+    {
+        "scratch-cluster",
+        "test-context",
+        "other-context",
+        "missing-context",
+        "fixture-context",
+        "stub-context",
+        "ctx",
+    }
+)
+FORBIDDEN_CONTEXT = re.compile(r"\bk[8](?:-?scratch)?\b")
 FLAG = re.compile(r"--(?:kube-)?context\b")
 TOKEN = re.compile(
     r""""(?:[^"\n\\]|\\.)*"|'(?:[^'\n\\]|\\.)*'|`(?:[^`\n\\]|\\.)*`|<[^<>\n]+>|[^\s,;)\]`"']+"""
 )
 DYNAMIC = re.compile(r"\$(?:[A-Za-z_0-9({])|\{[^}]*\}|<[^<>]+>|%(?:s|[a-z]|\([^)]+\)[a-z])")
+PROSE_AFTER_FLAG = re.compile(
+    r"\s+(?:was passed\b|must (?:be|remain|not)\b|sees (?:that|the)\b|"
+    r"to every\b|and reads\b|flag(?:[,\.]|\s+(?:is|so|has|must)\b)|is an? (?:option|flag)\b)"
+)
 
 
 def problems(text: str, *, yaml_values: bool = False, shell_values: bool = False) -> list[int]:
@@ -64,9 +62,12 @@ def problems(text: str, *, yaml_values: bool = False, shell_values: bool = False
     normalized = text.replace('\\"', '"').replace("\\'", "'")
     for match in FLAG.finditer(normalized):
         rest = normalized[match.end() :]
+        equals_value = rest.startswith("=")
+        if PROSE_AFTER_FLAG.match(rest):
+            continue
         shell_argument = shell_values and bool(
             re.search(
-                r"(?:\b[A-Za-z_]\w*=\([^)]*|\b(?:kubectl|helm|curie)\b[^\n]*)$",
+                r"(?:^|[\s;])(?:[A-Za-z_]\w*=\([^)]*|(?:kubectl|helm|curie)\s+[^\n]*)$",
                 normalized[: match.start()],
             )
         )
@@ -90,6 +91,9 @@ def problems(text: str, *, yaml_values: bool = False, shell_values: bool = False
             elif not literal_words:
                 continue  # A language expression supplies the argument.
         elif rest.startswith("="):
+            preceding = normalized[match.start() - 1 : match.start()]
+            if preceding in {'"', "'", "`"} and rest[1:2] == preceding:
+                continue
             rest = rest[1:]
         elif rest[:1].isspace():
             rest = re.sub(r"^(?:\s|\\\n)+", "", rest)
@@ -99,7 +103,13 @@ def problems(text: str, *, yaml_values: bool = False, shell_values: bool = False
         if token is None:
             continue
         value = token.group().strip("\"'`")
-        if not value or value.startswith(("--", "(", ")", "[", "]", "|", "&&", ">")):
+        if not value or value.startswith(("(", ")", "[", "]", "|", "&&", ">")):
+            continue
+        if value.startswith("-") and not equals_value:
+            continue
+        if re.match(r"(?:dir|git|tar|https?)://", value):
+            continue
+        if value in EXAMPLE_CONTEXTS or re.fullmatch(r"kind-[A-Za-z0-9_-]+", value):
             continue
         if not DYNAMIC.search(value):
             found.append(normalized.count("\n", 0, match.start()) + 1)
@@ -113,16 +123,42 @@ def check(root: Path) -> int:
         .split("\0")
     )
     failures = []
-    for name in sorted(set(tracked) & SCOPED_PATHS):
-        if "changelog" in name.lower():
+    for name in sorted(filter(None, tracked)):
+        path = Path(name)
+        if path.name.lower() in {"changelog", "changelog.md", "changelog.rst", "changelog.txt"}:
             continue
-        data = (root / name).read_bytes()
+        data = (root / path).read_bytes()
+        shebang = data.split(b"\n", 1)[0] if data.startswith(b"#!") else b""
+        suffix = path.suffix.lower()
+        if re.search(rb"\bpython[0-9.]*\b", shebang):
+            suffix = ".py"
+        elif re.search(rb"\b(?:bash|sh|zsh|ksh|fish)\b", shebang):
+            suffix = ".sh"
+        if suffix not in SOURCE_SUFFIXES:
+            continue
         if b"\0" in data:
             continue
+        text = data.decode("utf-8")
+        for match in FORBIDDEN_CONTEXT.finditer(text):
+            line = text.count("\n", 0, match.start()) + 1
+            failures.append(f"{name}:{line}: developer kube-context names are forbidden")
         for line in problems(
-            data.decode("utf-8"),
-            yaml_values=Path(name).suffix in {".yaml", ".yml"},
-            shell_values=Path(name).suffix in {".sh", ".yaml", ".yml", ".md"},
+            text,
+            yaml_values=suffix in {".yaml", ".yml"},
+            shell_values=suffix
+            in {
+                ".sh",
+                ".bash",
+                ".zsh",
+                ".ksh",
+                ".fish",
+                ".bats",
+                ".yaml",
+                ".yml",
+                ".md",
+                ".markdown",
+                ".mdx",
+            },
         ):
             failures.append(
                 f"{name}:{line}: context flag requires a variable or <context> placeholder"
@@ -178,7 +214,61 @@ def self_test() -> int:
             (0, "examples/curie.yaml", f'args: ["{flag}", "<context>"]'),
             (0, "examples/curie.yaml", f'args:\n  - "{flag}"\n  - "$CONTEXT"'),
             (0, "scripts/e2e-mail-adapter.sh", f'args=("{flag}" $CONTEXT)'),
+            (1, "new-context-driver.sh", f"kubectl {flag} fixed-cluster get pods"),
+            (1, "docs/new-context-guide.md", f"Use `kubectl {flag} fixed-cluster get pods`."),
+            (1, "new-context-driver.py", f'["kubectl", "{flag}", "fixed-cluster"]'),
+            (1, "new-context-driver.rs", f'.arg("{flag}").arg("fixed-cluster")'),
+            (1, "new-context-driver.ts", f'["kubectl", "{flag}", "fixed-cluster"]'),
+            (1, "new-context-driver.tsx", f'["kubectl", "{flag}", "fixed-cluster"]'),
+            (
+                1,
+                ".github/workflows/new-context-driver.yml",
+                f"run: kubectl {flag} fixed-cluster get pods",
+            ),
+            (
+                1,
+                ".githooks/new-context-hook",
+                f'#!/usr/bin/env bash\nargs=("{flag}" fixed-cluster)',
+            ),
+            (1, "docs/changelog-tool.py", f'["kubectl", "{flag}", "fixed-cluster"]'),
+            (
+                0,
+                "new-context-driver.sh",
+                f'''python3 - <<'PY'
+def kc(context, namespace, args):
+    return run(["kubectl", "{flag}", context, "-n", namespace, *args])
+PY''',
+            ),
+            (0, "new-context-driver.py", f'args = ["{flag}", context]'),
+            (
+                0,
+                ".github/workflows/new-context-driver.yaml",
+                f"run: kubectl {flag} kind-ci-fixture get pods",
+            ),
+            (0, "new-context-driver.py", f'assert "{flag}=dir:///workspace" in build_args'),
+            (0, "docs/new-context-guide.md", "The context flag selects a cluster."),
+            (0, "new-context-driver.rs", f'let note = "no {flag} was passed";'),
+            (1, "new-context-driver.sh", f"kubectl {flag} was get pods"),
+            (1, "new-context-driver.sh", f"kubectl {flag} flag get pods"),
+            (1, "new-context-driver.sh", f"kubectl {flag}=-fixed-cluster get pods"),
+            (0, "new-context-driver.py", f'if token in ("{flag}", "-n", "--namespace"): pass'),
+            (0, "new-context-driver.py", f'if token.startswith(("{flag}=", "--namespace=")): pass'),
+            (
+                0,
+                "docs/new-context-guide.md",
+                f"The `{flag}` and `{kube_flag}` flags select a cluster.",
+            ),
         ]
+        cases += [
+            (0, "new-context-driver.py", f'["{flag}", "{name}"]')
+            for name in sorted(EXAMPLE_CONTEXTS)
+        ]
+        short_name = "k" + str(8)
+        cases += [
+            (1, "docs/new-context-guide.md", f"Do not use {name} as a cluster name.")
+            for name in (short_name, short_name + "scratch", short_name + "-scratch")
+        ]
+        cases.append((0, "CHANGELOG.md", f"Historical context: {short_name}"))
         for expected, filename, example in cases:
             fixture = root / filename
             fixture.parent.mkdir(parents=True, exist_ok=True)
@@ -193,13 +283,14 @@ def self_test() -> int:
             fixture.write_text("")
             if observed.returncode != expected:
                 print(
-                    f"Policy self-test failed: {example!r}: {observed.stdout}{observed.stderr}",
+                    f"Policy self-test failed: {filename}: expected exit {expected}, "
+                    f"got {observed.returncode}: {observed.stdout}{observed.stderr}",
                     file=sys.stderr,
                 )
                 return 1
     print(
         f"Kube-context policy self-test passed: {sum(case[0] == 1 for case in cases)} "
-        f"literals rejected, {sum(case[0] == 0 for case in cases)} variables/placeholders accepted"
+        f"invalid cases rejected, {sum(case[0] == 0 for case in cases)} valid cases accepted"
     )
     return 0
 

@@ -1031,7 +1031,7 @@ fn context_reason(
     kind_cluster: Option<&str>,
 ) -> String {
     if explicit.is_some() {
-        format!("Kubernetes context: {context} because `--context` was passed")
+        format!("Kubernetes context: {context} because --context was passed")
     } else if let Some(name) = current {
         if is_kind_context(name) {
             format!("Kubernetes context: {context} because the current context is a kind context")
@@ -3132,7 +3132,7 @@ mod tests {
         // The complete ordered single-repository plan, retaining the stable deadline fix.
         let expected: Vec<String> = vec![
             crate::factory_toolchain::PLAN_NOTE.to_string(),
-            format!("Kubernetes context: {KIND_CONTEXT} because `--context` was passed"),
+            format!("Kubernetes context: {KIND_CONTEXT} because --context was passed"),
             "model credential: use CURIE_CREDENTIALS (no prompt)".to_string(),
             format!("kubectl --context {KIND_CONTEXT} -n kube-system scale deployment/coredns --replicas=1"),
             format!("curie cluster up --context {KIND_CONTEXT} --namespace curie --release curie --model z-ai/glm-5.3-flash --chart charts/curie --set security.gvisor.mode=off"),

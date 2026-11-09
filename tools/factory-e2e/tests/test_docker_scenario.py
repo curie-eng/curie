@@ -1682,7 +1682,7 @@ def test_probe_accepts_ipv4_and_bracketed_ipv6_targets(tmp_path: Path, fake_bin:
 
 def _collect_argv(out: Path) -> list[str]:
     flags = {
-        "context": "scratch-ctx", "namespace": DAEMON_NAMESPACE, "pod": DAEMON_NAME,
+        "context": "scratch-cluster", "namespace": DAEMON_NAMESPACE, "pod": DAEMON_NAME,
         "runner-namespace": RUNNER_NAMESPACE, "runner-pod": RUNNER_POD, "nonce": NONCE,
         "since": "1792669432", "until": "1792669451",
     }  # fmt: skip
@@ -1753,12 +1753,12 @@ def test_collect_replays_recordings(
         for key in CLIENT_KEYS
     ]
     for call in calls:
-        assert call[call.index("--context") + 1] == "scratch-ctx", call
+        assert call[call.index("--context") + 1] == "scratch-cluster", call
         namespace = call[call.index("-n") + 1]
         rest = call[call.index("-n") + 2 :]
         assert namespace == (RUNNER_NAMESPACE if rest in runner_side else DAEMON_NAMESPACE), call
     assert _secret_reads(calls) == [
-        ["--context", "scratch-ctx", "-n", RUNNER_NAMESPACE, *read] for read in runner_side[1:]
+        ["--context", "scratch-cluster", "-n", RUNNER_NAMESPACE, *read] for read in runner_side[1:]
     ]
     assert ["get", "service", DAEMON_NAME, "-o", "json"] in [c[4:] for c in calls]
     assert ["get", "pod", DAEMON_NAME, "-o", "json"] in [c[4:] for c in calls]
@@ -2050,7 +2050,7 @@ def test_collect_removes_the_staged_directory_when_the_staging_ack_is_lost(
     monkeypatch.setenv("FAKE_STAGE_ACK_FAIL", "1")
     with pytest.raises(docker_scenario.CommandError) as exc:
         docker_scenario.collect(
-            "scratch-ctx", DAEMON_NAMESPACE, DAEMON_NAME, RUNNER_NAMESPACE, RUNNER_POD,
+            "scratch-cluster", DAEMON_NAMESPACE, DAEMON_NAME, RUNNER_NAMESPACE, RUNNER_POD,
             NONCE, "1792669432", "1792669451",
         )  # fmt: skip
     assert "unexpected EOF" in str(exc.value)

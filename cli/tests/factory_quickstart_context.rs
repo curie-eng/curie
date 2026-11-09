@@ -75,7 +75,7 @@ fn refusal_names_context(name: &str) {
 
 #[test]
 fn a_non_kind_current_context_is_refused_without_a_terminal() {
-    refusal_names_context("work-cluster");
+    refusal_names_context("scratch-cluster");
 }
 
 #[test]
@@ -103,11 +103,11 @@ fn no_current_context_is_not_refused_without_a_terminal() {
 #[test]
 fn an_explicit_context_is_not_refused_without_a_terminal() {
     let mut input = plan_input();
-    input.explicit_context = Some("work-cluster".into());
+    input.explicit_context = Some("scratch-cluster".into());
     input.current_context = Some("other-cluster".into());
     let planned = quickstart_plan(&input).expect("explicit context never prompts");
     let text = describe(&planned).join("\n");
-    assert!(text.contains("--context work-cluster"), "{text}");
+    assert!(text.contains("--context scratch-cluster"), "{text}");
     assert!(text.contains("because --context was passed"), "{text}");
     assert!(!text.contains("must confirm"), "{text}");
     assert!(!text.contains("kind "), "{text}");
@@ -116,11 +116,11 @@ fn an_explicit_context_is_not_refused_without_a_terminal() {
 #[test]
 fn a_non_kind_current_context_is_not_refused_when_interactive() {
     let mut input = plan_input();
-    input.current_context = Some("work-cluster".into());
+    input.current_context = Some("scratch-cluster".into());
     input.interactive = true;
     let planned = quickstart_plan(&input).expect("a terminal may confirm");
     let text = describe(&planned).join("\n");
-    assert!(text.contains("--context work-cluster"), "{text}");
+    assert!(text.contains("--context scratch-cluster"), "{text}");
     assert!(text.contains("must confirm"), "{text}");
     assert!(!text.contains("kind create"), "{text}");
 }
@@ -128,12 +128,12 @@ fn a_non_kind_current_context_is_not_refused_when_interactive() {
 #[test]
 fn dry_run_plan_states_why_each_context_is_used() {
     let mut remote = plan_input();
-    remote.current_context = Some("work-cluster".into());
+    remote.current_context = Some("scratch-cluster".into());
     remote.interactive = true;
     let remote_text = describe(&quickstart_plan(&remote).unwrap()).join("\n");
     assert!(
         remote_text.contains(
-            "Kubernetes context: work-cluster because it is the current context and it is not a kind context"
+            "Kubernetes context: scratch-cluster because it is the current context and it is not a kind context"
         ),
         "{remote_text}"
     );
@@ -157,10 +157,10 @@ fn dry_run_plan_states_why_each_context_is_used() {
     );
 
     let mut explicit = plan_input();
-    explicit.explicit_context = Some("chosen".into());
+    explicit.explicit_context = Some("other-context".into());
     let explicit_text = describe(&quickstart_plan(&explicit).unwrap()).join("\n");
     assert!(
-        explicit_text.contains("Kubernetes context: chosen because --context was passed"),
+        explicit_text.contains("Kubernetes context: other-context because --context was passed"),
         "{explicit_text}"
     );
 
@@ -245,7 +245,7 @@ fn kubeconfig(current: &str) -> (KubeDir, PathBuf) {
     fs::write(
         &path,
         format!(
-            "apiVersion: v1\nkind: Config\n{current_line}\ncontexts:\n- name: work-cluster\n  context:\n    cluster: work\n    user: work\n- name: kind-curie-factory\n  context:\n    cluster: kind\n    user: kind\n- name: chosen\n  context:\n    cluster: chosen\n    user: chosen\nclusters:\n- name: work\n  cluster:\n    server: https://127.0.0.1:9\n- name: kind\n  cluster:\n    server: https://127.0.0.1:9\n- name: chosen\n  cluster:\n    server: https://127.0.0.1:9\nusers:\n- name: work\n  user: {{}}\n- name: kind\n  user: {{}}\n- name: chosen\n  user: {{}}\n"
+            "apiVersion: v1\nkind: Config\n{current_line}\ncontexts:\n- name: scratch-cluster\n  context:\n    cluster: work\n    user: work\n- name: kind-curie-factory\n  context:\n    cluster: kind\n    user: kind\n- name: other-context\n  context:\n    cluster: other-context\n    user: other-context\nclusters:\n- name: work\n  cluster:\n    server: https://127.0.0.1:9\n- name: kind\n  cluster:\n    server: https://127.0.0.1:9\n- name: other-context\n  cluster:\n    server: https://127.0.0.1:9\nusers:\n- name: work\n  user: {{}}\n- name: kind\n  user: {{}}\n- name: other-context\n  user: {{}}\n"
         ),
     )
     .unwrap();
@@ -392,12 +392,12 @@ fn run_on_terminal(tools: &ToolDir, kubeconfig: &PathBuf, answer: &str) -> (i32,
 #[test]
 fn the_cli_refuses_a_non_kind_context_without_a_terminal_before_helm() {
     let tools = ToolDir::new();
-    let (dir, config) = kubeconfig("work-cluster");
+    let (dir, config) = kubeconfig("scratch-cluster");
     let (code, stdout, stderr) = run_piped(&tools, &config, &[]);
     let shown = format!("{stdout}\n{stderr}");
     assert_eq!(code, 2, "{shown}");
     assert!(
-        shown.contains("--context work-cluster"),
+        shown.contains("--context scratch-cluster"),
         "the CLI refusal must name the flag: {shown}"
     );
     assert!(
@@ -415,12 +415,12 @@ fn the_cli_refuses_a_non_kind_context_without_a_terminal_before_helm() {
 #[test]
 fn the_cli_dry_run_states_the_context_without_a_terminal_or_helm() {
     let tools = ToolDir::new();
-    let (dir, config) = kubeconfig("work-cluster");
+    let (dir, config) = kubeconfig("scratch-cluster");
     let (code, stdout, stderr) = run_piped(&tools, &config, &["--dry-run"]);
     let shown = format!("{stdout}\n{stderr}");
     assert_eq!(code, 0, "{shown}");
     assert!(
-        stdout.contains("Kubernetes context: work-cluster because it is the current context and it is not a kind context"),
+        stdout.contains("Kubernetes context: scratch-cluster because it is the current context and it is not a kind context"),
         "{shown}"
     );
     assert!(!tools.log().contains("helm"), "{}", tools.log());
@@ -450,12 +450,16 @@ fn the_cli_does_not_prompt_for_kind_absent_or_explicit_contexts() {
     }
 
     let tools = ToolDir::new();
-    let (dir, config) = kubeconfig("work-cluster");
-    let (code, stdout, stderr) = run_piped(&tools, &config, &["--context", "chosen", "--dry-run"]);
+    let (dir, config) = kubeconfig("scratch-cluster");
+    let (code, stdout, stderr) = run_piped(
+        &tools,
+        &config,
+        &["--context", "other-context", "--dry-run"],
+    );
     let shown = format!("{stdout}\n{stderr}");
     assert_eq!(code, 0, "{shown}");
     assert!(
-        stdout.contains("Kubernetes context: chosen because --context was passed"),
+        stdout.contains("Kubernetes context: other-context because --context was passed"),
         "{shown}"
     );
     assert!(!shown.contains("must confirm"), "{shown}");
@@ -466,16 +470,16 @@ fn the_cli_does_not_prompt_for_kind_absent_or_explicit_contexts() {
 #[test]
 fn the_cli_terminal_accepts_yes_and_reaches_helm_and_no_stops_first() {
     let tools = ToolDir::new();
-    let (dir, config) = kubeconfig("work-cluster");
+    let (dir, config) = kubeconfig("scratch-cluster");
     let (code, shown) = run_on_terminal(&tools, &config, "n\n");
     assert_eq!(code, 2, "{shown}");
     assert!(shown.contains("[y/N]"), "{shown}");
-    assert!(shown.contains("--context work-cluster"), "{shown}");
+    assert!(shown.contains("--context scratch-cluster"), "{shown}");
     assert!(!tools.log().contains("helm"), "{}", tools.log());
     drop(dir);
 
     let tools = ToolDir::new();
-    let (dir, config) = kubeconfig("work-cluster");
+    let (dir, config) = kubeconfig("scratch-cluster");
     let (code, shown) = run_on_terminal(&tools, &config, "y\n");
     assert_ne!(code, 0, "{shown}");
     assert!(shown.contains("[y/N]"), "{shown}");
@@ -499,10 +503,10 @@ fn the_cli_terminal_accepts_yes_and_reaches_helm_and_no_stops_first() {
 fn the_cli_targeted_dry_run_plans_cluster_up_conditionally() {
     let run = |json: bool| {
         let tools = ToolDir::new();
-        let (dir, config) = kubeconfig("work-cluster");
+        let (dir, config) = kubeconfig("scratch-cluster");
         let config_dir = tools.root.join("curie-config");
         fs::create_dir_all(&config_dir).unwrap();
-        let mut args = vec!["--context", "chosen", "--dry-run"];
+        let mut args = vec!["--context", "other-context", "--dry-run"];
         if json {
             args.push("--json");
         }
@@ -577,7 +581,7 @@ fn the_cli_targeted_dry_run_plans_cluster_up_conditionally() {
     let up = &plan[otherwise[0]];
     assert!(
         up.starts_with(
-            "otherwise: curie cluster up --context chosen --namespace curie --release curie "
+            "otherwise: curie cluster up --context other-context --namespace curie --release curie "
         ),
         "{up}"
     );
