@@ -869,6 +869,7 @@ def test_acceptance_2(qualification):
     for body in (b'{"prompt":"override"}', b'{"target":null}', b" {}", b"[]"):
         stack.assert_refused(422, "wake_body_invalid", body=body)
     stack.pause("acme-wake-idle", True)
+    stack.assert_refused(401, "invalid_wake_signature", key="incorrect-key")
     stack.assert_refused(409, "hook_paused")
     stack.pause("acme-wake-idle", False)
     agent = stack.agents["acme-wake-idle"]
@@ -886,7 +887,30 @@ def test_acceptance_2(qualification):
         assert answer["status"] == 401
         assert answer["body"] == {"detail": "missing or invalid API key"}
         assert answer["cache"] == "no-store"
-    run = stack.queued()
+    bundle = stack.root / "acme-wake-idle"
+    manifest_path = bundle / ".claude-plugin/plugin.json"
+    manifest = json.loads(manifest_path.read_text())
+    manifest["triggers"].append(
+        {
+            "type": "webhook",
+            "wake": True,
+            "name": "queue-secondary",
+            "path": "secondary",
+            "prompt": "Read pending secondary items.",
+        }
+    )
+    manifest_path.write_text(json.dumps(manifest))
+    stack.redeploy("acme-wake-idle", bundle, "second-wake-hook")
+    stack.assert_refused(401, "invalid_wake_signature", key=stack.key(hook="queue-secondary"))
+    wake_path = f"/hooks/{agent}/{HOOK}/wake"
+    saved = {
+        "method": "POST",
+        "body": BODY.decode(),
+        "headers": signed_headers(key, agent, HOOK, uuid.uuid4().hex, int(time.time())),
+    }
+    admitted = stack.http(wake_path, **saved)[0]
+    assert admitted["status"] == 202
+    run = admitted["body"]["run_id"]
     rotated = stack.http(
         f"/agents/{agent}/hooks/{HOOK}/wake-secret/rotate", method="POST", admin=True
     )[0]
@@ -895,6 +919,11 @@ def test_acceptance_2(qualification):
     if stack.key() == key:
         raise AssertionError("rotation did not replace the current wake key")
     stack.assert_refused(401, "invalid_wake_signature", key=key)
+    before_replay = stack.snapshot()
+    replay = stack.http(wake_path, **saved)[0]
+    assert replay["status"] == 401
+    assert replay["body"] == {"detail": "invalid_wake_signature"}
+    assert stack.snapshot() == before_replay
     stack.worker(True)
     stack.settled(run, "ran")
 
@@ -972,6 +1001,7 @@ def test_source_controls(qualification, guard):
         )[0]
         assert updated["status"] == 200
     before = stack.snapshot()
+    stack.assert_refused(401, "invalid_wake_signature", agent=agent, key="incorrect-key")
     stack.assert_refused(409, "wake_source_not_ordinary", agent=agent, key=key)
     route = f"/agents/{agent_id}/hooks/{HOOK}/wake-secret"
     for path, method in ((route, "GET"), (route + "/rotate", "POST")):
@@ -1245,6 +1275,7 @@ def test_stale_delivery_and_operator_controls(qualification):
     assert stack.http(f"/agents/{agent}/kill", method="POST", admin=True)[0]["body"] == {
         "killed": True
     }
+    stack.assert_refused(401, "invalid_wake_signature", key="incorrect-key")
     stack.assert_refused(409, "agent_killed")
     stack.worker(True)
     stack.settled(queued, "blocked", "agent_killed")
@@ -1666,12 +1697,22 @@ def test_hosted_connector_session(qualification, agent, provider_tier):
             "for p in Path(os.environ['CURIE_PLUGIN_DIR']).rglob('*.json')}}))",
         )
         assert_no_key(json.loads(inspection), key)
-        assert "CURIE_HOOK_WAKE_KEY" not in json.loads(inspection)["env"]
-        assert_no_key(stack.kube("logs", pod, "-c", "runner"), key)
+        wake_key_present = "CURIE_HOOK_WAKE_KEY" in json.loads(inspection)["env"]
+        assert not wake_key_present
+        spec = json.loads(stack.kube("get", "pod", pod, "-o", "json"))["spec"]
+        for container in spec["containers"] + spec.get("initContainers", []):
+            assert_no_key(stack.kube("logs", pod, "-c", container["name"]), key)
     for role in ("api", "worker"):
         assert_no_key(stack.kube("logs", f"deployment/{FULLNAME}-{role}"), key)
-    for role in ("server", "caller-proxy"):
-        assert_no_key(stack.kube("logs", f"deployment/{connector}", "-c", role), key)
+    connector_pods = [
+        pod
+        for pod in json.loads(stack.kube("get", "pods", "-o", "json"))["items"]
+        if pod["metadata"]["name"].startswith(connector + "-")
+    ]
+    assert connector_pods
+    for pod in connector_pods:
+        for container in pod["spec"]["containers"] + pod["spec"].get("initContainers", []):
+            assert_no_key(stack.kube("logs", pod["metadata"]["name"], "-c", container["name"]), key)
     snapshot = stack.wait_telemetry()
     assert snapshot["wakes"]
     assert any(
