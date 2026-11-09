@@ -96,7 +96,7 @@ def test_platform_rejection_degrades_probe_and_success_recovers(
         adapter.close()
 
 
-def test_rejected_credential_fingerprints_are_scoped_to_each_adapter(
+def test_rejected_credential_health_and_warnings_are_scoped_to_each_adapter(
     make_adapter: Callable[..., MailAdapter],
     serve_egress: Callable[[MailAdapter], str],
     ingress: IngressState,
@@ -106,6 +106,7 @@ def test_rejected_credential_fingerprints_are_scoped_to_each_adapter(
     secret = token(int(time.time()) + 3600)
     ingress.response = (401, {"detail": "invalid token"})
     adapters: list[MailAdapter] = []
+    urls: list[str] = []
     try:
         with caplog.at_level(logging.WARNING, logger="curie_channel_gateway.mail.adapter"):
             for name in ("first", "second"):
@@ -115,21 +116,23 @@ def test_rejected_credential_fingerprints_are_scoped_to_each_adapter(
                 adapters.append(adapter)
                 adapter.startup()
                 url = serve_egress(adapter)
+                urls.append(url)
                 turn = {"delivery_id": "rejected-credential", "conversation_id": "thread"}
                 adapter.post_turn(turn)
                 adapter.post_turn(turn)
                 body = get(url + "/statusz")[1]
                 assert body["channel_token"]["state"] == "rejected"
                 assert secret not in str(body)
-        fingerprints = [adapter._rejected_channel_fingerprint for adapter in adapters]
-        assert all(fingerprint is not None for fingerprint in fingerprints)
-        assert len(set(fingerprints)) == 2
         warnings = [
             record.getMessage() for record in caplog.records
             if "channel token rejected" in record.getMessage()
         ]
         assert len(warnings) == 2
         assert secret not in "\n".join(warnings)
+        ingress.response = (200, {"queued": True})
+        assert adapters[0].post_turn(turn) == "accepted"
+        assert get(urls[0] + "/statusz")[1]["channel_token"]["state"] == "ok"
+        assert get(urls[1] + "/statusz")[1]["channel_token"]["state"] == "rejected"
     finally:
         for adapter in adapters:
             adapter.close()

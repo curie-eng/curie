@@ -211,8 +211,7 @@ class MailAdapter:
         self.owner = secrets.token_hex(16)
         self.last_ingress_status: int | None = None
         self.channel_token_rejected = False
-        self._channel_fingerprint_key = secrets.token_bytes(32)
-        self._rejected_channel_fingerprint: str | None = None
+        self._rejected_channel_token: bytes | None = None
         self.seen: OrderedDict[str, bool] = OrderedDict()
         for message_id in self.state.known_message_ids():
             self._mark_seen(message_id)
@@ -233,16 +232,13 @@ class MailAdapter:
         """The provider's inbox: every turn's address and the reply wire's target."""
         return self.provider.inbox_address
 
-    def _channel_fingerprint(self, token: str) -> str:
-        return hmac.new(self._channel_fingerprint_key, token.encode(), "sha256").hexdigest()
-
     def status(self) -> dict[str, Any]:
         """Report diagnostic claims only; the adapter cannot verify the signature."""
         token = self.credentials.channel_token
         exp = _token_expiry(token)
         with self.lock:
-            rejected = self.channel_token_rejected and self._rejected_channel_fingerprint == (
-                self._channel_fingerprint(token)
+            rejected = self.channel_token_rejected and hmac.compare_digest(
+                self._rejected_channel_token or b"", token.encode()
             )
             last_status = self.last_ingress_status
             discovery = self._discovery_snapshot()
@@ -736,16 +732,17 @@ class MailAdapter:
                 )
                 with self.lock:
                     self.last_ingress_status = result.status
-                    fingerprint = self._channel_fingerprint(headers["X-API-Key"])
-                    was_rejected = self.channel_token_rejected and (
-                        self._rejected_channel_fingerprint == fingerprint
+                    sent_token = headers["X-API-Key"].encode()
+                    was_rejected = self.channel_token_rejected and hmac.compare_digest(
+                        self._rejected_channel_token or b"", sent_token
                     )
                     if result.status == 401:
                         self.channel_token_rejected = True
-                        self._rejected_channel_fingerprint = fingerprint
+                        self._rejected_channel_token = sent_token
                         self.credentials.channel_rejected()
                     elif result.status == 200:
                         self.channel_token_rejected = False
+                        self._rejected_channel_token = None
             if result.status == 401 and not was_rejected:
                 exp = _token_expiry(headers["X-API-Key"])
                 expires = datetime.fromtimestamp(exp, UTC).isoformat() if exp else "unknown"
