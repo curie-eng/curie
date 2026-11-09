@@ -39,7 +39,7 @@ import uuid
 from collections.abc import AsyncIterator, Awaitable, Callable, Iterator
 from contextlib import ExitStack
 from dataclasses import dataclass, field
-from datetime import timedelta
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -2824,6 +2824,104 @@ class SteeringStack(Stack):
         placeholder = placeholders[-1].response["ts"] if placeholders else None
         return Delivery(event_id, delivery_id, message_ts, placeholder, event["text"])
 
+    def queued_mention(
+        self, user: str, text_: str, *, thread_ts: str, receipt: bool = True
+    ) -> Delivery:
+        """One threaded human mention handed to the worker at the queue boundary.
+
+        The inputs a native delivery leaves for the worker, built by the
+        production code that writes them, without the Bolt envelope or the
+        dispatcher's principal and channel admission calls: the placeholder
+        (``chat.postMessage``), the ``SlackMentionReceipt`` (``slack_evidence``
+        and ``write_receipt``) unless ``receipt`` is False, and the
+        ``QueuedTurn`` appended by the dispatcher's ``enqueue``.
+        """
+
+        from aci_protocol import QueuedTurn, ReplyHandle, TurnSource
+        from curie_dispatcher.identities import delivery_key, minted_adapter
+        from curie_dispatcher.identity import slack_evidence
+        from curie_dispatcher.queue import enqueue
+        from curie_internal.slack_mention_receipt import SlackMentionReceipt, write_receipt
+        from slack_sdk.web import WebClient
+
+        event_id = f"Ev0{self.tag.upper()}{uuid.uuid4().hex[:8].upper()}"
+        delivery_id = delivery_key(event_id, self.identity)
+        self.base.doomed_keys.append(_receipt_key(delivery_id))
+        message_ts = f"1800000500.{next(self._ts):06d}"
+        event: dict[str, Any] = {
+            "type": "app_mention",
+            "channel": CHANNEL,
+            "text": f"<@{FACTORY_BOT_USER}> {text_}",
+            "ts": message_ts,
+            "thread_ts": thread_ts,
+            "team": TEAM,
+            "user": user,
+            "user_team": TEAM,
+        }
+        body = {"type": "event_callback", "event_id": event_id, "team_id": TEAM, "event": event}
+        posted = WebClient(token=self.factory_token, base_url=self.slack.base_url).chat_postMessage(
+            channel=CHANNEL, thread_ts=thread_ts, text=self.dispatcher_config.placeholder_text
+        )
+        placeholder = str(posted["ts"])
+        if receipt:
+            evidence = slack_evidence(body)
+            assert evidence is not None, "the event names no sender"
+            assert write_receipt(
+                self.valkey,
+                SlackMentionReceipt(
+                    version=1,
+                    delivery_id=delivery_id,
+                    channel_identity=minted_adapter(self.identity),
+                    channel=CHANNEL,
+                    root_ts=thread_ts,
+                    message_ts=message_ts,
+                    user_id=user,
+                    body=event["text"],
+                    evidence=evidence,
+                ),
+                ttl_s=self.dispatcher_config.mention_receipt_ttl_seconds,
+            )
+        enqueue(
+            self.valkey,
+            self.dispatcher_config,
+            QueuedTurn(
+                event_id=delivery_id,
+                conversation_id=thread_ts,
+                author=user,
+                text=text_,
+                source=TurnSource.SLACK,
+                reply_handle=ReplyHandle(
+                    kind="slack",
+                    channel=CHANNEL,
+                    placeholder=placeholder,
+                    adapter=minted_adapter(self.identity),
+                ),
+                received_at=datetime.now(UTC).isoformat(),
+                attachments=[],
+            ),
+        )
+        return Delivery(event_id, delivery_id, message_ts, placeholder, event["text"])
+
+    def steer_queued(
+        self,
+        user: str,
+        text_: str,
+        *,
+        thread_ts: str,
+        receipt: bool = True,
+        before_consume: Callable[[Delivery], None] | None = None,
+    ) -> Attempt:
+        """``steer`` from the queue boundary: ``queued_mention``, then one consume."""
+
+        known = {row["id"] for row in self.requests()}
+        replies = len(self.api_hop.steer_answers())
+        calls = len(self.slack.calls)
+        delivery = self.queued_mention(user, text_, thread_ts=thread_ts, receipt=receipt)
+        if before_consume is not None:
+            before_consume(delivery)
+        assert self.consume() is not None, "the queued turn was not read"
+        return self._attempt(delivery, known, replies, calls)
+
     def plain_reply(self, user: str, body: str, *, thread_ts: str) -> None:
         """A thread reply that mentions no one: a ``message`` event, never ``app_mention``."""
 
@@ -3777,34 +3875,38 @@ def test_a_worker_without_the_internal_token_refuses_a_mapped_root_locally(
 # --- control 3: the diversion settles through the kernel's fenced terminal path ------
 
 
-def test_a_diverted_refusal_completes_with_the_kernels_completion_record(
+def test_a_queued_refusal_and_admission_each_settle_through_one_fenced_completion(
     steering: SteeringStack,
 ) -> None:
-    """A refusal and an admission both settle: done marker, acked, nothing owed.
+    """A queued refusal and the admission after it each settle exactly once.
 
-    Each settles through the lease-fenced completion (the next test proves the
-    fence); the entry is acked only after the done marker is written.
+    Driven from the queue boundary (``queued_mention``): a mapped turn with no
+    stored mention receipt is refused, and its single fenced settle carries a
+    ``dropped`` completion record, writes the done marker, empties the
+    completion outbox and acks. A valid queued turn in the same root then
+    admits and settles ``delivered``. The native ingress that writes the
+    receipt is covered by the composed cases.
     """
 
     stack = steering
     writer = stack.person()
     run = stack.open_steered_run()
 
-    refused = stack.steer(
-        writer.slack_user,
-        "Rename it.",
-        thread_ts=run.root_ts,
-        before_consume=lambda d: stack.valkey.delete(_receipt_key(d.delivery_id)),
+    refused = stack.steer_queued(
+        writer.slack_user, "Rename it.", thread_ts=run.root_ts, receipt=False
     )
     _worker_refused(refused)
     assert _settled_completion(stack, refused.delivery) == "dropped"
     assert stack.is_terminal(refused.delivery.delivery_id)
     assert stack.pending() == 0
+    assert stack.revisions(run) == []
 
-    admitted = stack.steer(writer.slack_user, "Please rename it.", thread_ts=run.root_ts)
+    admitted = stack.steer_queued(writer.slack_user, "Please rename it.", thread_ts=run.root_ts)
     _admitted(admitted)
+    assert _settled_completion(stack, admitted.delivery) == "delivered"
     assert stack.is_terminal(admitted.delivery.delivery_id)
     assert stack.pending() == 0
+    assert stack.revisions(run) == [stack.expected_request_id(admitted.delivery)]
     _assert_no_sandbox(stack)
 
 
@@ -4501,17 +4603,18 @@ def test_a_redelivery_whose_done_check_fails_after_a_lost_answer_never_invites_a
 # --- control 4: no steering request leaves before its intent is durable ----------------
 
 
-def test_a_steering_attempt_whose_intent_cannot_be_recorded_sends_nothing(
+def test_a_queued_steering_turn_whose_intent_cannot_be_recorded_sends_nothing(
     steering: SteeringStack,
 ) -> None:
     """A failed steering-sent marker write sends nothing and keeps the delivery pending.
 
-    The marker is what later attempts trust to keep the resend invitation off
-    a thread whose admission may have committed, so no request leaves without
-    it: the steering route is never called, no revision is admitted, and the
-    generic notice is not posted either. A healthy reclaim then records the
-    intent, admits once and settles, and the marker outlives it as long as the
-    done marker does.
+    Driven from the queue boundary (``queued_mention``). The marker is what
+    later attempts trust to keep the resend invitation off a thread whose
+    admission may have committed, so no request leaves without it: the
+    steering route is never called, no revision is admitted, nothing is
+    settled and the generic notice is not posted. The consumer's own reclaim
+    then records the intent, admits the deterministic revision once and
+    settles, and the marker outlives it as long as the done marker does.
     """
 
     stack = steering
@@ -4528,7 +4631,7 @@ def test_a_steering_attempt_whose_intent_cannot_be_recorded_sends_nothing(
             )
         )
 
-    attempt = stack.steer(
+    attempt = stack.steer_queued(
         writer.slack_user,
         "Please rename the helper.",
         thread_ts=run.root_ts,
@@ -4536,13 +4639,14 @@ def test_a_steering_attempt_whose_intent_cannot_be_recorded_sends_nothing(
     )
     delivery = attempt.delivery
     (rule,) = rules
-    assert rule.remaining == 0, "the steering-sent marker was never written"
+    assert rule.remaining == 0, "the steering-sent marker write was never attempted"
     assert stack.api_hop.steer_answers() == [], "the request left without its intent"
     assert stack.api_hop.dropped == []
     assert stack.revisions(run) == [], "a revision was admitted without its intent recorded"
     assert stack.pending() == 1
     assert not stack.is_terminal(delivery.delivery_id)
     assert stack.resend_invitations() == [], "the generic notice invited a resend"
+    _assert_no_sandbox(stack)
 
     answers = len(stack.api_hop.steer_answers())
     assert stack.reclaim() == 1
@@ -4552,6 +4656,7 @@ def test_a_steering_attempt_whose_intent_cannot_be_recorded_sends_nothing(
     assert admitted["request_id"] == str(stack.expected_request_id(delivery))
     texts = stack.placeholder_texts(delivery.placeholder)
     assert texts[-1] == _steering().render_reply("admitted", pull_request_url=run.pr_url), texts
+    assert _settled_completion(stack, delivery) == "delivered"
     assert stack.is_terminal(delivery.delivery_id)
     assert stack.pending() == 0
     assert stack.revisions(run) == [stack.expected_request_id(delivery)]
