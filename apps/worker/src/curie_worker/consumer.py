@@ -189,6 +189,11 @@ return claimed
 _THREAD_RESET_DRAIN_BUDGET_S = 30.0
 
 
+async def refuse_unconfigured_reminder(_reminder: ApprovalReminderV1) -> None:
+    """Fail closed for a lane that has no card delivery."""
+    raise RuntimeError("approval reminder delivery is not configured")
+
+
 class Consumer(StreamConsumer):
     """Runs the read loop and the periodic reclaim/reap maintenance loop."""
 
@@ -199,9 +204,9 @@ class Consumer(StreamConsumer):
         kernel: Kernel,
         config: WorkerConfig,
         leases: DeliveryLeaseStore,
+        reminders: Callable[[ApprovalReminderV1], Awaitable[None]],
         max_concurrency: int | None = None,
         drain: UpgradeDrainGate | None = None,
-        reminders: Callable[[ApprovalReminderV1], Awaitable[None]] | None = None,
     ) -> None:
         # Capacity parking requires a real delivery fence, so every runs
         # consumer supplies the same lease store the production entry point uses.
@@ -604,8 +609,6 @@ class Consumer(StreamConsumer):
                         return
 
                     if reminder is not None:
-                        if self._reminders is None:
-                            raise RuntimeError("approval reminder delivery is not configured")
                         lease.raise_if_lost()
                         await self._reminders(reminder)
                         lease.raise_if_lost()

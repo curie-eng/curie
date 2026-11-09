@@ -3157,7 +3157,7 @@ def test_active_file_turn_with_a_real_delivery_lease_settles_once(
 
     async def go() -> None:
         from curie_dispatcher.queue import to_stream_fields
-        from curie_worker.consumer import Consumer
+        from curie_worker.consumer import Consumer, refuse_unconfigured_reminder
         from curie_worker.delivery_lease import DeliveryLeaseStore
 
         class AttachmentLane:
@@ -3177,6 +3177,7 @@ def test_active_file_turn_with_a_real_delivery_lease_settles_once(
                 kernel=h.kernel,
                 config=h.config,
                 leases=store,
+                reminders=refuse_unconfigured_reminder,
             )
             await consumer.ensure_group()
 
@@ -7122,7 +7123,7 @@ def test_marker_deadline_returns_ownership_store_unavailable_while_liveness_is_h
 ) -> None:
     """A real runner turn reaches the existing consume timeout outcome path."""
 
-    from curie_worker.consumer import Consumer
+    from curie_worker.consumer import Consumer, refuse_unconfigured_reminder
     from curie_worker.delivery_lease import DeliveryLeaseStore
 
     async def go() -> None:
@@ -7134,6 +7135,7 @@ def test_marker_deadline_returns_ownership_store_unavailable_while_liveness_is_h
                 kernel=h.kernel,
                 config=h.config,
                 leases=DeliveryLeaseStore(h.async_redis, h.config),
+                reminders=refuse_unconfigured_reminder,
             )
             await consumer._publish_liveness()
             initial_liveness = consumer._last_liveness_renewal
@@ -7336,7 +7338,7 @@ def test_a_long_turn_keeps_accepting_steers_and_a_finished_one_opens_a_new_turn(
     that silently became a second turn shows up there.
     """
     from curie_dispatcher.queue import to_stream_fields
-    from curie_worker.consumer import Consumer
+    from curie_worker.consumer import Consumer, refuse_unconfigured_reminder
 
     # Imported inside the test on purpose: ``delivery_lease`` does not exist
     # until this ticket lands, and a module-level import would fail COLLECTION
@@ -7346,7 +7348,9 @@ def test_a_long_turn_keeps_accepting_steers_and_a_finished_one_opens_a_new_turn(
     async def go() -> None:
         async with make_harness(**_LEASE_KNOBS, reclaim_min_idle_ms=900000) as h:
             store = DeliveryLeaseStore(h.async_redis, h.config)
-            consumer = Consumer(redis=h.async_redis, kernel=h.kernel, config=h.config, leases=store)
+            consumer = Consumer(redis=h.async_redis, kernel=h.kernel, config=h.config, leases=store,
+                                reminders=refuse_unconfigured_reminder,
+                       )
             await consumer.ensure_group()
 
             hold = asyncio.Event()
@@ -7556,7 +7560,7 @@ def test_an_unreadable_runner_fails_closed_and_leaves_a_reclaimed_delivery_pendi
     healthy again: the same reclaimed entry then runs and acks.
     """
     from curie_dispatcher.queue import to_stream_fields
-    from curie_worker.consumer import Consumer
+    from curie_worker.consumer import Consumer, refuse_unconfigured_reminder
 
     # Imported inside the test on purpose: ``delivery_lease`` does not exist
     # until this ticket lands, and a module-level import would fail COLLECTION
@@ -7566,7 +7570,9 @@ def test_an_unreadable_runner_fails_closed_and_leaves_a_reclaimed_delivery_pendi
     async def go() -> None:
         async with make_harness(**_LEASE_KNOBS, reclaim_min_idle_ms=900000) as h:
             store = DeliveryLeaseStore(h.async_redis, h.config)
-            consumer = Consumer(redis=h.async_redis, kernel=h.kernel, config=h.config, leases=store)
+            consumer = Consumer(redis=h.async_redis, kernel=h.kernel, config=h.config, leases=store,
+                                reminders=refuse_unconfigured_reminder,
+                       )
             await consumer.ensure_group()
 
             # A first turn so the thread retains a sandbox to be read.

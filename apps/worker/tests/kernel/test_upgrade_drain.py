@@ -60,7 +60,7 @@ from aci_protocol import (
 )
 from curie_dispatcher.queue import to_stream_fields
 from curie_worker.config import WorkerConfig
-from curie_worker.consumer import Consumer
+from curie_worker.consumer import Consumer, refuse_unconfigured_reminder
 from curie_worker.consumer_liveness import ConsumerLivenessStore
 from curie_worker.delivery_lease import DeliveryLeaseStore
 from curie_worker.eval import EvalStreamConsumer
@@ -212,8 +212,12 @@ def test_a_rollout_over_an_accepted_side_effecting_turn_escalates_it(make_harnes
             store = DeliveryLeaseStore(h.async_redis, h.config)
             old_cfg = h.config.model_copy(update={"consumer_name": "worker-old"})
             new_cfg = h.config.model_copy(update={"consumer_name": "worker-new"})
-            old = Consumer(redis=h.async_redis, kernel=h.kernel, config=old_cfg, leases=store)
-            new = Consumer(redis=h.async_redis, kernel=h.kernel, config=new_cfg, leases=store)
+            old = Consumer(redis=h.async_redis, kernel=h.kernel, config=old_cfg, leases=store,
+                           reminders=refuse_unconfigured_reminder,
+                  )
+            new = Consumer(redis=h.async_redis, kernel=h.kernel, config=new_cfg, leases=store,
+                           reminders=refuse_unconfigured_reminder,
+                  )
             _admit_side_effecting_turn(h, old)
 
             # The group is created at ``$``, so it must exist before the enqueue.
@@ -284,6 +288,7 @@ def test_the_pre_upgrade_gate_refuses_the_roll_and_the_turn_completes_once(make_
                 config=old_cfg,
                 leases=store,
                 drain=gate,
+                reminders=refuse_unconfigured_reminder,
             )
             hold = _admit_side_effecting_turn(h, old)
 
@@ -392,6 +397,7 @@ def test_a_leftover_install_flag_cannot_pause_a_fresh_install(
                 config=h.config,
                 leases=store,
                 drain=fresh_gate,
+                reminders=refuse_unconfigured_reminder,
             )
             await current.ensure_group()
             await fresh_gate.request_quiesce()
@@ -440,6 +446,7 @@ def test_a_leftover_install_flag_cannot_pause_a_fresh_install(
                     config=fresh_replacement_config,
                     leases=store,
                     drain=UpgradeDrainGate(h.async_redis, fresh_replacement_config),
+                    reminders=refuse_unconfigured_reminder,
                 )
                 replacement_task = asyncio.create_task(replacement.run())
                 await _wait_until(
@@ -583,6 +590,7 @@ def test_current_marker_pauses_runs_prompt_reclaim_without_charging_delivery(
                 config=consumer_config,
                 leases=store,
                 drain=gate,
+                reminders=refuse_unconfigured_reminder,
             )
             await consumer.ensure_group()
             entry_id = await h.async_redis.xadd(
@@ -858,6 +866,7 @@ def test_mixed_version_refusal_allows_a_pre_fix_consumer_to_claim_again(
                 config=legacy_config,
                 leases=store,
                 drain=legacy_gate,
+                reminders=refuse_unconfigured_reminder,
             )
             h.runner.default_script = [Final(text="pre-fix worker resumed", status=DONE)]
             await consumer.ensure_group()
@@ -938,6 +947,7 @@ def test_a_quiesced_consumer_claims_nothing_and_resumes_when_released(make_harne
                 config=h.config,
                 leases=store,
                 drain=gate,
+                reminders=refuse_unconfigured_reminder,
             )
             h.runner.default_script = [Final(text="handled", status=DONE)]
 
@@ -990,6 +1000,7 @@ def test_a_quiesced_consumer_does_not_reclaim_a_departed_replicas_entry(make_har
                 config=h.config,
                 leases=store,
                 drain=gate,
+                reminders=refuse_unconfigured_reminder,
             )
             h.runner.default_script = [Final(text="handled", status=DONE)]
 
@@ -1051,6 +1062,7 @@ def test_a_consumer_stays_paused_through_drain_attest_and_hold_then_resumes(
                 config=config,
                 leases=DeliveryLeaseStore(h.async_redis, config),
                 drain=gate,
+                reminders=refuse_unconfigured_reminder,
             )
             h.runner.default_script = [Final(text="handled after the roll", status=DONE)]
             await consumer.ensure_group()
@@ -1116,6 +1128,7 @@ def test_an_expired_pause_is_not_recreated_and_the_consumer_can_claim(
                 config=h.config,
                 leases=DeliveryLeaseStore(h.async_redis, h.config),
                 drain=gate,
+                reminders=refuse_unconfigured_reminder,
             )
             h.runner.default_script = [Final(text="resumed after expiry", status=DONE)]
             await consumer.ensure_group()
@@ -1172,6 +1185,7 @@ def test_a_foreign_pause_survives_refusal_until_its_owner_releases_it(
                 config=h.config,
                 leases=DeliveryLeaseStore(h.async_redis, h.config),
                 drain=gate,
+                reminders=refuse_unconfigured_reminder,
             )
             h.runner.default_script = [Final(text="resumed by the owner", status=DONE)]
             await consumer.ensure_group()

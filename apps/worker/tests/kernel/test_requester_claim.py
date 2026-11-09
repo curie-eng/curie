@@ -28,7 +28,7 @@ from aci_protocol import Final, SessionStatus
 from curie_internal.identity_authority import TurnAuthorityRequestV1, TurnAuthorityScopeV1
 from curie_worker import binding as binding_module
 from curie_worker import caller_token
-from curie_worker.consumer import Consumer
+from curie_worker.consumer import Consumer, refuse_unconfigured_reminder
 from curie_worker.delivery_lease import DeliveryLeaseStore
 from curie_worker.identity_authority import TurnAuthorityUnavailable
 from curie_worker.kernel import identity
@@ -576,6 +576,7 @@ def test_a_flag_read_failure_stays_pending_and_the_redelivery_runs_once(
             leases = DeliveryLeaseStore(h.async_redis, h.config)
             consumer = Consumer(
                 redis=h.async_redis, kernel=h.kernel, config=h.config, leases=leases,
+                reminders=refuse_unconfigured_reminder,
             )
             event = qevent("flag read recovers")
             fields = {"payload": event.model_dump_json(), "curie_identity_context_v1": CAPSULE}

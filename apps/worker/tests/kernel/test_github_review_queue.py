@@ -8,7 +8,7 @@ import uuid
 from aci_protocol import Final, QueuedTurn, ReplyHandle, SessionStatus
 from channel_protocol.reply import REPLY_WIRE_VERSION, ReplyTarget, TurnCompleted
 from curie_dispatcher.queue import to_stream_fields
-from curie_worker.consumer import Consumer
+from curie_worker.consumer import Consumer, refuse_unconfigured_reminder
 from curie_worker.delivery_lease import DeliveryLeaseStore
 from curie_worker.markers import CompletionRecord, Markers
 from curie_worker.reply_sink import TargetRoute
@@ -41,6 +41,7 @@ def test_busy_verified_review_delivery_stays_pending_then_runs_once_idle(
                 kernel=h.kernel,
                 config=h.config,
                 leases=DeliveryLeaseStore(h.async_redis, h.config),
+                reminders=refuse_unconfigured_reminder,
             )
             await consumer.ensure_group()
             entry_id = await h.async_redis.xadd(h.config.stream, to_stream_fields(turn))

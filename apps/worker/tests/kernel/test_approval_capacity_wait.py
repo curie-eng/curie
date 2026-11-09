@@ -32,7 +32,7 @@ from curie_worker.capacity_wait import (
     WAIT_GENERATION_FIELD,
     CapacityWaitRefused,
 )
-from curie_worker.consumer import Consumer
+from curie_worker.consumer import Consumer, refuse_unconfigured_reminder
 from curie_worker.delivery_lease import DeliveryLeaseStore
 from curie_worker.sandbox import QuotaRejection
 from sqlalchemy.engine import make_url
@@ -1278,6 +1278,7 @@ def test_approval_copy_checks_wait_after_winning_the_resume_claim(
                     kernel=h.kernel,
                     config=h.config,
                     leases=paused,
+                    reminders=refuse_unconfigured_reminder,
                 )
                 task = asyncio.create_task(_handle(duplicate, raw))
                 try:
@@ -1373,6 +1374,7 @@ def test_raw_approval_orphan_adoption_refuses_a_lost_delivery_fence(
                 kernel=h.kernel,
                 config=h.config,
                 leases=leases,
+                reminders=refuse_unconfigured_reminder,
             )
             await _handle(recovery, raw)
             assert leases.claimed
