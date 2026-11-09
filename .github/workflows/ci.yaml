@@ -5458,9 +5458,8 @@ jobs:
       - name: Collect safe namespace cleanup evidence
         if: failure()
         run: |
-          context="$(kubectl config current-context)"
           python3 tools/released-upgrade/namespace_cleanup_evidence.py \
-            --context "$context" \
+            --context kind-curie-upgrade-negative \
             --namespace curie-negative --namespace curie-profile \
             > namespace-cleanup-evidence.json || true
           cat namespace-cleanup-evidence.json

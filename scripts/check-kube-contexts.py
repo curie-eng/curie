@@ -46,6 +46,7 @@ EXAMPLE_CONTEXTS = frozenset(
         "kind-curie-factory",
         "kind-ci-fixture",
         "kind-curie-e2e",
+        "kind-curie-upgrade-negative",
         "kind-identity-e2e",
         "kind-x",
     }
