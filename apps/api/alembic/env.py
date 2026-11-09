@@ -14,7 +14,8 @@ from alembic import context
 from curie_api import models  # noqa: F401  (register tables on the metadata)
 from curie_api.config import get_settings
 from curie_api.db import SCHEMA, Base
-from sqlalchemy import pool
+from curie_api.migration_schema import create_schema_if_absent
+from sqlalchemy import pool, text
 from sqlalchemy.engine import Connection
 from sqlalchemy.ext.asyncio import async_engine_from_config
 
@@ -37,12 +38,13 @@ def _relocate_legacy_version_table(connection: Connection) -> None:
     public_tbl = connection.exec_driver_sql(
         "SELECT to_regclass('public.alembic_version')"
     ).scalar()
-    schema_tbl = connection.exec_driver_sql(
-        f"SELECT to_regclass('{SCHEMA}.alembic_version')"
+    quoted_schema = '"' + SCHEMA.replace('"', '""') + '"'
+    schema_tbl = connection.execute(
+        text("SELECT to_regclass(:table)"), {"table": f"{quoted_schema}.alembic_version"}
     ).scalar()
     if public_tbl is not None and schema_tbl is None:
         connection.exec_driver_sql(
-            f'ALTER TABLE public.alembic_version SET SCHEMA "{SCHEMA}"'
+            f"ALTER TABLE public.alembic_version SET SCHEMA {quoted_schema}"
         )
 
 
@@ -52,7 +54,7 @@ def do_run_migrations(connection: Connection) -> None:
     # Commit that setup so each later revision can open its own transaction
     # (the crash-retry boundary in #2300).
     with connection.begin():
-        connection.exec_driver_sql(f'CREATE SCHEMA IF NOT EXISTS "{SCHEMA}"')
+        connection.exec_driver_sql(create_schema_if_absent(SCHEMA))
         _relocate_legacy_version_table(connection)
     context.configure(
         connection=connection,
@@ -86,7 +88,7 @@ def run_migrations_offline() -> None:
         # Emit the schema creation before anything else so the generated SQL
         # creates curie.alembic_version into an existing schema (Alembic writes
         # the version table before migration 0001's CREATE SCHEMA would run).
-        context.execute(f'CREATE SCHEMA IF NOT EXISTS "{SCHEMA}"')
+        context.execute(create_schema_if_absent(SCHEMA))
         context.run_migrations()
 
 
