@@ -751,6 +751,21 @@ def test_unavailable_directory_only_blocks_group_restricted_invocation(
                 pending = creation.accepted(creation.post(invocation), invocation.request)
                 assert pending["status"] == "pending"
                 assert provider.requests == []
+                from apps.api.tests import test_http_approval_answers as answers
+
+                invocation.row = creation.rows(invocation.request["approval"]["dedupe_key"])[0]
+                refused = answers.resolve(invocation, *answers.answer(invocation))
+                assert refused.status_code == 503, refused.text
+                assert any(r["purpose"] == "approval" for r in provider.requests)
+                provider.unavailable = False
+                provider.member = False
+                denied = answers.resolve(invocation, *answers.answer(invocation))
+                assert denied.status_code == 403, denied.text
+                provider.member = True
+                approved = answers.resolve(invocation, *answers.answer(invocation))
+                assert approved.status_code == 200, approved.text
+                assert approved.json()["status"] == "approved"
+                provider.unavailable = True
 
                 async def restrict(factory: async_sessionmaker[AsyncSession]) -> None:
                     async with factory() as session, session.begin():

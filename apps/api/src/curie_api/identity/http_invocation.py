@@ -888,12 +888,15 @@ def source_permission(
     """@spec HTTP-INVOCATION-EXECUTION-5/15 HTTP-APPROVAL-CONTINUITY-8."""
     if not admission.admit(binding, [capture.sender.native_id]).allowed:
         _deny()
-    if facts is None:
-        if role_name != "invocation" or not capture.identity_independent:
-            _unavailable()
+    if (
+        role_name == "invocation" and capture.identity_independent
+        and (original is None or original.canonical is None)
+    ):
         if capture.policy_version is None:
             _unavailable()
         return
+    if facts is None:
+        _unavailable()
     role = None if capture.policy is None else getattr(capture.policy.roles, role_name)
     raw = role is not None and role.legacy_state == "migrated" and role.filter is not None and any(
         isinstance(entry, SurfaceAccountSelectorV1)
