@@ -95,6 +95,7 @@ def synthetic_provider(tmp_path: Path) -> Iterator[SimpleNamespace]:
     stop, ready = threading.Event(), threading.Event()
     provider = SimpleNamespace(
         member=True, requests=[], responses=[], errors=[], during_lookup=None, unavailable=False,
+        unavailable_purpose=None,
     )
 
     async def serve() -> None:
@@ -108,7 +109,7 @@ def synthetic_provider(tmp_path: Path) -> Iterator[SimpleNamespace]:
                 """@spec HTTP-INVOCATION-EXECUTION-4/15: echo actual request scope/version."""
                 first, headers, raw = listener.requests[-1]
                 request = json.loads(raw)
-                if provider.unavailable:
+                if provider.unavailable or provider.unavailable_purpose == request["purpose"]:
                     provider.requests.append(request)
                     writer.write(harness.wire(b"", status=b"503 Service Unavailable"))
                     await writer.drain()
@@ -754,10 +755,12 @@ def test_unavailable_directory_only_blocks_group_restricted_invocation(
                 from apps.api.tests import test_http_approval_answers as answers
 
                 invocation.row = creation.rows(invocation.request["approval"]["dedupe_key"])[0]
+                provider.unavailable = False
+                provider.unavailable_purpose = "approval"
                 refused = answers.resolve(invocation, *answers.answer(invocation))
                 assert refused.status_code == 503, refused.text
                 assert any(r["purpose"] == "approval" for r in provider.requests)
-                provider.unavailable = False
+                provider.unavailable_purpose = None
                 provider.member = False
                 denied = answers.resolve(invocation, *answers.answer(invocation))
                 assert denied.status_code == 403, denied.text
