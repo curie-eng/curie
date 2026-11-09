@@ -22,6 +22,7 @@ import hmac
 import json
 import logging
 import os
+import re
 import signal
 import sys
 import tempfile
@@ -75,6 +76,7 @@ _HOP_HEADERS = frozenset(
 )
 _STATUS_MAX_BYTES = 64 * 1024
 _STREAM_CHUNK = 64 * 1024
+_UPLOAD_NAME = re.compile(r"\.upload-[a-z0-9_]{8}")
 
 
 @dataclass
@@ -165,6 +167,24 @@ class Supervisor:
     # -- lifecycle --------------------------------------------------------------
 
     async def start(self) -> None:
+        removed = 0
+        try:
+            self._config.state_root.mkdir(parents=True, exist_ok=True, mode=0o711)
+            root_fd = os.open(self._config.state_root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+            try:
+                with os.scandir(root_fd) as entries:
+                    for entry in entries:
+                        if _UPLOAD_NAME.fullmatch(entry.name):
+                            os.unlink(entry.name, dir_fd=root_fd)
+                            removed += 1
+            finally:
+                os.close(root_fd)
+        except OSError as exc:
+            raise isolation.IsolationError(
+                f"stale upload cleanup failed after removing {removed} archives "
+                f"({exc.strerror}); refusing to serve"
+            ) from None
+        logger.info("removed %d stale upload archives", removed)
         self._http = aiohttp.ClientSession(
             timeout=aiohttp.ClientTimeout(total=None, sock_connect=5.0),
             auto_decompress=False,
