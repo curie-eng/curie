@@ -44,20 +44,23 @@ at worker start (``run.py``).
 
 from __future__ import annotations
 
+import fcntl
 import http.client
 import io
 import json
 import logging
+import os
 import random
 import re
 import socket
 import ssl
+import stat
 import tarfile
 import tempfile
 import time
 import uuid
-from collections.abc import Mapping, Sequence
-from contextlib import AbstractContextManager
+from collections.abc import Iterator, Mapping, Sequence
+from contextlib import AbstractContextManager, contextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -85,9 +88,15 @@ from plugin_format import (
     DEFAULT_MAX_MEMBERS,
     DEFAULT_MAX_UNCOMPRESSED_BYTES,
 )
+from plugin_format.reserved_env import SECRET_NAME_RE, is_reserved_boot_env_name
 
 from ..attachments import ATTACHMENTS_REF_ENV, AttachmentLimits
-from ..binding import BUNDLE_REF_ENV, CONNECTOR_SECRET_KEYS_ENV, RUNNER_TOKEN_ENV
+from ..binding import (
+    BUNDLE_REF_ENV,
+    CONNECTOR_SECRET_KEYS_ENV,
+    RUNNER_TOKEN_ENV,
+    inject_connector_secrets,
+)
 from ..bundle_store import BundleReader
 from ..connector_uploads import mint_claim_upload_tokens
 from ..workspace import WORKSPACE_REF_ENV, WORKSPACE_SHA256_ENV, WorkspaceLimits
@@ -369,6 +378,50 @@ def _selector(label_selector: str) -> dict[str, str]:
 # -- the client ----------------------------------------------------------------
 
 
+def cleanup_stale_archives() -> None:
+    for path in Path(tempfile.gettempdir()).glob("curie-shell-stage-*.tar"):
+        try:
+            fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        except FileNotFoundError:
+            continue
+        with os.fdopen(fd, "rb") as archive:
+            info = os.fstat(archive.fileno())
+            if not stat.S_ISREG(info.st_mode) or info.st_uid != os.geteuid():
+                continue
+            try:
+                fcntl.flock(archive.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                continue
+            path.unlink(missing_ok=True)
+
+
+def parse_agent_credential_files(raw: str | None) -> dict[str, dict[str, str]]:
+    try:
+        value = json.loads(raw) if raw is not None else {}
+    except ValueError:
+        raise ValueError("CURIE_AGENT_CREDENTIAL_FILES must be a JSON object") from None
+    if not isinstance(value, dict) or not all(
+        isinstance(agent, str)
+        and agent
+        and isinstance(files, dict)
+        and all(
+            isinstance(key, str)
+            and SECRET_NAME_RE.fullmatch(key)
+            and not is_reserved_boot_env_name(key)
+            and isinstance(path, str)
+            and "\0" not in path
+            and Path(path).is_absolute()
+            for key, path in files.items()
+        )
+        for agent, files in value.items()
+    ):
+        raise ValueError(
+            "CURIE_AGENT_CREDENTIAL_FILES must map agents to credential environment names "
+            "and absolute worker-side file paths; reserved names are forbidden"
+        )
+    return value
+
+
 class StaticPoolSandboxClient(ClaimInputStaging):
     """SandboxClient backed by a fixed pool of supervisor-managed shells."""
 
@@ -389,6 +442,7 @@ class StaticPoolSandboxClient(ClaimInputStaging):
         retire_timeout_seconds: float = 60.0,
         allow_unisolated_shells: bool = False,
         connector_upload_signing_key: str = "",
+        agent_credential_files: Mapping[str, Mapping[str, str]] | None = None,
     ) -> None:
         if not slots:
             raise ValueError("a static pool needs at least one shell")
@@ -403,6 +457,9 @@ class StaticPoolSandboxClient(ClaimInputStaging):
         self._prefix = f"{key_prefix}:static"
         self._retire_timeout_s = retire_timeout_seconds
         self._connector_upload_signing_key = connector_upload_signing_key
+        self._agent_credential_files = parse_agent_credential_files(
+            json.dumps(agent_credential_files or {})
+        )
         # Only tests run shells without a separate child uid; a deployment's
         # shell that reports no isolation is never leased.
         self._allow_unisolated = allow_unisolated_shells
@@ -590,17 +647,54 @@ class StaticPoolSandboxClient(ClaimInputStaging):
             raise SandboxError(_NO_TOOL_DAEMON)
         if not protocol.valid_claim_name(name):
             raise SandboxError("a static claim name is a DNS-1123 label")
+        env = dict(env or {})
+        if agent_name:
+            identity_key = BootEnv.env_key("connector_agent")
+            if env.get(identity_key, agent_name) != agent_name:
+                raise SandboxError("static claim agent identity does not match its binding")
+            env[identity_key] = agent_name
+        files = self._agent_credential_files.get(agent_name or "", {})
+        credentials: dict[str, str] = {}
+        for key, source in files.items():
+            try:
+                with Path(source).open(encoding="utf-8", newline="") as stream:
+                    value = stream.read()
+            except (OSError, UnicodeError):
+                raise SandboxError(
+                    f"agent credential file {source} is missing or unreadable"
+                ) from None
+            value = (
+                value.removesuffix("\r\n")
+                if value.endswith("\r\n")
+                else value.removesuffix("\n")
+            )
+            if not value or "\0" in value:
+                raise SandboxError(
+                    f"agent credential file {source} must contain a nonempty environment value"
+                )
+            if value != value.strip():
+                raise SandboxError(
+                    f"agent credential file {source} has leading or trailing whitespace; "
+                    "only one final LF or CRLF is allowed"
+                )
+            credentials[key] = value
+        declared = {key for key in env.get(CONNECTOR_SECRET_KEYS_ENV, "").split(",") if key}
+        injected: dict[str, str] = {}
+        inject_connector_secrets(injected, credentials, agent_label=agent_name or "unbound")
+        if set(credentials) - set(injected):
+            raise SandboxError("agent credential file declaration names a withheld credential")
+        env.update(credentials)
+        declared.update(credentials)
+        if credentials:
+            env[CONNECTOR_SECRET_KEYS_ENV] = ",".join(sorted(declared))
         env = filter_agent_child_env(env)
         withheld: frozenset[str] = frozenset()
         if executor_secret_names is not None:
             withheld = executor_withheld_names(env)
             env = executor_claim_env(env, executor_secret_names)
-        # Connector secret values never leave the worker: the shell supplies
-        # them from its own environment by name, as a pool template does on
-        # Kubernetes. The marker (names only) still reaches the runner so it
-        # redacts whatever the shell supplies under those names.
         secret_names = {key for key in env.get(CONNECTOR_SECRET_KEYS_ENV, "").split(",") if key}
-        env = {key: value for key, value in env.items() if key not in secret_names}
+        if any(not env.get(key) for key in secret_names):
+            raise SandboxError("static claims require values for every declared connector secret")
         if not env.get(RUNNER_TOKEN_ENV):
             # The bearer is what fences one claim's requests from the next
             # claim's child on the same shell; a claim without one is refused.
@@ -617,13 +711,10 @@ class StaticPoolSandboxClient(ClaimInputStaging):
             name, pool=pool, labels=claim_labels, bundle_ref=env.get(BUNDLE_REF_ENV)
         )
         attempt = uuid.uuid4().hex
-        archive = self._build_archive(
+        with self._build_archive(
             attempt, name, lease.generation, env, executor_secret_names, withheld
-        )
-        try:
+        ) as archive:
             self._start_on_shell(name, lease, archive, deadline)
-        finally:
-            archive.unlink(missing_ok=True)
 
     def _accepts(self, shell: Mapping[str, Any]) -> bool:
         return shell.get("isolated") is True or self._allow_unisolated
@@ -709,6 +800,7 @@ class StaticPoolSandboxClient(ClaimInputStaging):
         )
         return outcome == OUTCOME_CLEANED
 
+    @contextmanager
     def _build_archive(
         self,
         attempt: str,
@@ -717,7 +809,7 @@ class StaticPoolSandboxClient(ClaimInputStaging):
         env: Mapping[str, str],
         executor_secret_names: frozenset[str] | None,
         withheld: frozenset[str],
-    ) -> Path:
+    ) -> Iterator[Path]:
         """Stage the claim's inputs on the worker and pack them for the shell."""
 
         try:
@@ -741,9 +833,6 @@ class StaticPoolSandboxClient(ClaimInputStaging):
                 "v": MANIFEST_VERSION,
                 "claim": name,
                 "generation": generation,
-                # Everything the worker did not redeem itself reaches the
-                # child unchanged; the shell's own env supplies the model
-                # credential and connector secrets, as a pool template does.
                 "env": {k: v for k, v in env.items() if k not in WORKER_OWNED_ENV},
                 "executor_secret_names": (
                     None if executor_secret_names is None else sorted(executor_secret_names)
@@ -767,23 +856,25 @@ class StaticPoolSandboxClient(ClaimInputStaging):
             handle, path = tempfile.mkstemp(prefix="curie-shell-stage-", suffix=".tar")
             archive = Path(path)
             try:
-                with open(handle, "wb") as raw, tarfile.open(fileobj=raw, mode="w") as tar:
-                    data = json.dumps(manifest, sort_keys=True).encode("utf-8")
-                    info = tarfile.TarInfo(MANIFEST_NAME)
-                    info.size = len(data)
-                    info.mode = 0o600
-                    tar.addfile(info, io.BytesIO(data))
-                    for arcname, root in (
-                        (BUNDLE_DIR, bundle),
-                        (WORKSPACE_DIR, workspace),
-                        (ATTACHMENTS_DIR, attachments),
-                    ):
-                        if root is not None:
-                            tar.add(root, arcname=arcname)
-            except BaseException:
+                with open(handle, "wb") as raw:
+                    fcntl.flock(raw.fileno(), fcntl.LOCK_EX)
+                    with tarfile.open(fileobj=raw, mode="w") as tar:
+                        data = json.dumps(manifest, sort_keys=True).encode("utf-8")
+                        info = tarfile.TarInfo(MANIFEST_NAME)
+                        info.size = len(data)
+                        info.mode = 0o600
+                        tar.addfile(info, io.BytesIO(data))
+                        for arcname, root in (
+                            (BUNDLE_DIR, bundle),
+                            (WORKSPACE_DIR, workspace),
+                            (ATTACHMENTS_DIR, attachments),
+                        ):
+                            if root is not None:
+                                tar.add(root, arcname=arcname)
+                    raw.flush()
+                    yield archive
+            finally:
                 archive.unlink(missing_ok=True)
-                raise
-            return archive
         finally:
             self._cleanup_staged_inputs(attempt)
 

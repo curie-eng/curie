@@ -327,7 +327,13 @@ def test_suspend_returns_the_slot_and_an_old_tombstone_never_releases_a_later_le
 ) -> None:
     shell = shells("s0")
     client = _client(valkey, prefix, tls, [shell])
-    _create(client, "claim-a", _env(records))
+    client.create_claim(
+        "claim-a",
+        pool=POOL,
+        env=_env(records, CURIE_CONNECTOR_AGENT="acme-a"),
+        agent_name="acme-a",
+        deadline=time.monotonic() + 30,
+    )
     _await_ready(client, "claim-a")
     client.set_sandbox_mode("claim-a", "Suspended")
     suspended = client.get_sandbox("claim-a", request_timeout_seconds=5)
@@ -335,13 +341,30 @@ def test_suspend_returns_the_slot_and_an_old_tombstone_never_releases_a_later_le
     assert _slot(valkey, prefix, "s0")["state"] == "free"
     assert shell.shell()["state"] == "idle"
 
-    _create(client, "claim-b", _env(records))
+    client.create_claim(
+        "claim-b",
+        pool=POOL,
+        env=_env(records, CURIE_CONNECTOR_AGENT="acme-b"),
+        agent_name="acme-b",
+        deadline=time.monotonic() + 30,
+    )
     _await_ready(client, "claim-b")
     client.delete_claim("claim-a", request_timeout_seconds=5)  # the old tombstone
     assert client.get_claim("claim-a", request_timeout_seconds=5) is None
     slot = _slot(valkey, prefix, "s0")
     assert (slot["state"], slot["claim"]) == ("leased", "claim-b")
     assert shell.shell()["claim"]["name"] == "claim-b"
+
+    with pytest.raises(CapacityExhaustedError):
+        client.create_claim(
+            "reclaim-a",
+            pool=POOL,
+            env=_env(records),
+            agent_name="acme-a",
+            deadline=time.monotonic() + 30,
+        )
+    assert shell.shell()["claim"]["name"] == "claim-b"
+    assert json.loads((records / "env.json").read_text())["CURIE_CONNECTOR_AGENT"] == "acme-b"
 
 
 def test_a_shell_without_isolation_is_never_leased(
@@ -403,13 +426,12 @@ def test_unsupported_profiles_and_missing_inputs_are_refused(
     assert valkey.exists(f"{prefix}:static:claim:c") == 0
 
 
-def test_connector_secrets_come_from_the_shell_and_never_from_the_worker(
+def test_connector_secrets_are_delivered_by_the_worker_for_each_claim(
     valkey: redis.Redis, prefix: str, tls: ShellTls, shells: ShellFactory, tmp_path: Path
 ) -> None:
     shell_env = {
-        "CURIE_SUPERVISOR_CHILD_ENV": "KEEP_SECRET,DROP_SECRET,MODEL_KEY",
-        "KEEP_SECRET": "shell-k",
-        "DROP_SECRET": "shell-d",
+        "CURIE_SUPERVISOR_CHILD_ENV": "MODEL_KEY",
+        "CURIE_MODEL_ENV_KEY": "MODEL_KEY",
         "MODEL_KEY": "shell-model",
     }
     client = _client(valkey, prefix, tls, [shells("s0", env=shell_env)])
@@ -432,9 +454,8 @@ def test_connector_secrets_come_from_the_shell_and_never_from_the_worker(
     )
     _await_ready(client, "agent-claim")
     child = json.loads((ordinary / "env.json").read_text())
-    assert (child["KEEP_SECRET"], child["DROP_SECRET"]) == ("shell-k", "shell-d")
+    assert (child["KEEP_SECRET"], child["DROP_SECRET"]) == ("worker-k", "worker-d")
     assert child["MODEL_KEY"] == "shell-model"
-    # The names still reach the runner, so it redacts what the shell supplied.
     assert child["CURIE_CONNECTOR_SECRET_KEYS"] == "KEEP_SECRET,DROP_SECRET"
     for absent in ("CURIE_CREDENTIALS", "VALKEY_PASSWORD"):
         assert absent not in child
@@ -449,7 +470,7 @@ def test_connector_secrets_come_from_the_shell_and_never_from_the_worker(
     )
     _await_ready(client, "action-claim")
     child = json.loads((action / "env.json").read_text())
-    assert child["KEEP_SECRET"] == "shell-k"
+    assert child["KEEP_SECRET"] == "worker-k"
     for absent in ("DROP_SECRET", "MODEL_KEY", "CURIE_CREDENTIALS", "VALKEY_PASSWORD"):
         assert absent not in child
 
@@ -495,3 +516,305 @@ def _now() -> Any:
     from datetime import UTC, datetime
 
     return datetime.now(UTC)
+
+
+def test_two_agents_with_secrets_alternate_on_the_generic_shell(
+    valkey: redis.Redis, prefix: str, tls: ShellTls, shells: ShellFactory, tmp_path: Path
+) -> None:
+    shell = shells("shared")
+    client = _client(valkey, prefix, tls, [shell])
+    pressure = AsyncRedis(host=VALKEY_HOST, port=VALKEY_PORT, password=VALKEY_PW)
+    substrate = SandboxSubstrate(
+        client,
+        AffinityStore(valkey, pressure_client=pressure, key_prefix=prefix),
+        SubstrateConfig(namespace="default", warm_pool=POOL, key_prefix=prefix),
+    )
+    previous_root = None
+    previous_secrets: set[str] = set()
+    handles = []
+    try:
+        for index, agent in enumerate(("acme-a", "acme-b", "acme-a")):
+            records = tmp_path / f"records-{index}"
+            records.mkdir()
+            secret = "claim-" + uuid.uuid4().hex
+            env = _env(
+                records,
+                CURIE_CONNECTOR_AGENT=agent,
+                CURIE_CONNECTOR_SECRET_KEYS="EXTERNAL_API_TOKEN",
+                EXTERNAL_API_TOKEN=secret,
+            )
+            handle = substrate.claim(f"thread-{index}", env=env, agent_name=agent)
+            handles.append(handle)
+            _await_ready(client, handle.claim_name)
+            child = json.loads((records / "env.json").read_text())
+            root = Path(child["HOME"]).parent
+            assert child["EXTERNAL_API_TOKEN"] == secret
+            assert child["CURIE_CONNECTOR_AGENT"] == agent
+            assert "CURIE_SHELL_CLAIM_ENV_FILE" not in child
+            if previous_root is not None:
+                assert not previous_root.exists()
+                assert not (set(child.values()) & previous_secrets)
+            previous_secrets = {secret}
+            assert substrate.release(f"thread-{index}")
+            assert not root.exists()
+            previous_root = root
+        assert len({(h.service_fqdn, h.port) for h in handles}) == 1
+        assert len({h.claim_name for h in handles}) == 3
+        assert _slot(valkey, prefix, "shared")["state"] == "free"
+    finally:
+        for index in range(len(handles)):
+            substrate.release(f"thread-{index}")
+        asyncio.run(pressure.aclose())
+
+
+@pytest.mark.parametrize("ending", ["", "\n", "\r\n"])
+def test_agent_credential_files_are_read_fresh_and_never_shared(
+    valkey: redis.Redis,
+    prefix: str,
+    tls: ShellTls,
+    shells: ShellFactory,
+    tmp_path: Path,
+    ending: str,
+) -> None:
+    shell = shells("shared")
+    source = tmp_path / "credential"
+    credential = "first-" + uuid.uuid4().hex
+    source.write_bytes((credential + ending).encode())
+    client = StaticPoolSandboxClient(
+        slots=[StaticShellSlot(shell.slot, "localhost", shell.port, POOL)],
+        redis_client=valkey,
+        control_token=CONTROL_TOKEN,
+        ssl_context=shell_ssl_context(str(tls.ca)),
+        bundle_store=_NoBundles(),
+        key_prefix=prefix,
+        allow_unisolated_shells=True,
+        agent_credential_files={"acme-a": {"EXTERNAL_API_TOKEN": str(source)}},
+    )
+    for index, agent in enumerate(("acme-a", "acme-b", "acme-a")):
+        records = tmp_path / f"files-{index}"
+        records.mkdir()
+        name = f"claim-{index}"
+        client.create_claim(
+            name, pool=POOL, env=_env(records), agent_name=agent, deadline=time.monotonic() + 30
+        )
+        try:
+            _await_ready(client, name)
+            child = json.loads((records / "env.json").read_text())
+            if agent == "acme-a":
+                assert child["EXTERNAL_API_TOKEN"] == credential
+                assert "EXTERNAL_API_TOKEN" in child["CURIE_CONNECTOR_SECRET_KEYS"].split(",")
+            else:
+                assert "EXTERNAL_API_TOKEN" not in child
+        finally:
+            client.delete_claim(name, request_timeout_seconds=20)
+        credential = "next-" + uuid.uuid4().hex
+        source.write_bytes((credential + ending).encode())
+    source.unlink()
+    with pytest.raises(SandboxError, match="missing or unreadable"):
+        client.create_claim(
+            "missing",
+            pool=POOL,
+            env=_env(tmp_path),
+            agent_name="acme-a",
+            deadline=time.monotonic() + 30,
+        )
+    assert _slot(valkey, prefix, "shared")["state"] == "free"
+
+
+@pytest.mark.parametrize("contents", [None, b"", b"\xff", b"value\0value"])
+def test_agent_credential_file_failures_never_lease_a_shell(
+    valkey: redis.Redis, prefix: str, tls: ShellTls, tmp_path: Path, contents: bytes | None
+) -> None:
+    source = tmp_path / "credential"
+    if contents is not None:
+        source.write_bytes(contents)
+    client = StaticPoolSandboxClient(
+        slots=[StaticShellSlot("unused", "localhost", 1, POOL)],
+        redis_client=valkey,
+        control_token=CONTROL_TOKEN,
+        ssl_context=shell_ssl_context(str(tls.ca)),
+        bundle_store=_NoBundles(),
+        key_prefix=prefix,
+        agent_credential_files={"acme-a": {"EXTERNAL_API_TOKEN": str(source)}},
+    )
+    with pytest.raises(SandboxError, match="credential file"):
+        client.create_claim(
+            "invalid-file",
+            pool=POOL,
+            env={"CURIE_RUNNER_TOKEN": _bearer()},
+            agent_name="acme-a",
+            deadline=time.monotonic() + 5,
+        )
+    assert valkey.exists(f"{prefix}:static:claim:invalid-file") == 0
+    assert valkey.exists(f"{prefix}:static:slot:unused") == 0
+
+
+def test_a_static_claim_refuses_an_agent_identity_mismatch(
+    valkey: redis.Redis, prefix: str, tls: ShellTls
+) -> None:
+    client = StaticPoolSandboxClient(
+        slots=[StaticShellSlot("unused", "localhost", 1, POOL)],
+        redis_client=valkey,
+        control_token=CONTROL_TOKEN,
+        ssl_context=shell_ssl_context(str(tls.ca)),
+        bundle_store=_NoBundles(),
+        key_prefix=prefix,
+    )
+    with pytest.raises(SandboxError, match="agent identity"):
+        client.create_claim(
+            "wrong-agent",
+            pool=POOL,
+            env={"CURIE_RUNNER_TOKEN": _bearer(), "CURIE_CONNECTOR_AGENT": "acme-b"},
+            agent_name="acme-a",
+            deadline=time.monotonic() + 5,
+        )
+    assert valkey.exists(f"{prefix}:static:claim:wrong-agent") == 0
+    assert valkey.exists(f"{prefix}:static:slot:unused") == 0
+
+
+@pytest.mark.parametrize("connector_pool", [False, True])
+def test_static_dedicated_pool_is_an_explicit_isolation_option(
+    valkey: redis.Redis,
+    prefix: str,
+    tls: ShellTls,
+    shells: ShellFactory,
+    tmp_path: Path,
+    connector_pool: bool,
+) -> None:
+    generic, dedicated = shells("generic"), shells("dedicated")
+    dedicated_pool = "curie-agent-acme-a-runner-pool"
+    client = StaticPoolSandboxClient(
+        slots=[
+            StaticShellSlot(generic.slot, "localhost", generic.port, POOL),
+            StaticShellSlot(dedicated.slot, "localhost", dedicated.port, dedicated_pool),
+        ],
+        redis_client=valkey,
+        control_token=CONTROL_TOKEN,
+        ssl_context=shell_ssl_context(str(tls.ca)),
+        bundle_store=_NoBundles(),
+        key_prefix=prefix,
+        allow_unisolated_shells=True,
+    )
+    pressure = AsyncRedis(host=VALKEY_HOST, port=VALKEY_PORT, password=VALKEY_PW)
+    config = SubstrateConfig(
+        namespace="default",
+        warm_pool=POOL,
+        key_prefix=prefix,
+        agent_pools=frozenset() if connector_pool else frozenset({"acme-a"}),
+        connector_secret_pools=frozenset({"acme-a"}) if connector_pool else frozenset(),
+    )
+    substrate = SandboxSubstrate(
+        client,
+        AffinityStore(valkey, pressure_client=pressure, key_prefix=prefix),
+        config,
+    )
+    try:
+        ports = {}
+        for agent in ("acme-a", "acme-b"):
+            record = tmp_path / agent
+            record.mkdir()
+            env = _env(
+                record,
+                CURIE_CONNECTOR_SECRET_KEYS="EXTERNAL_API_TOKEN",
+                EXTERNAL_API_TOKEN="claim-" + uuid.uuid4().hex,
+            )
+            handle = substrate.claim(agent, env=env, agent_name=agent)
+            ports[agent] = handle.port
+        assert ports == {"acme-a": dedicated.port, "acme-b": generic.port}
+    finally:
+        for agent in ("acme-a", "acme-b"):
+            substrate.release(agent)
+        asyncio.run(pressure.aclose())
+
+
+def test_a_withheld_credential_file_never_reaches_a_static_shell(
+    valkey: redis.Redis, prefix: str, tls: ShellTls, tmp_path: Path
+) -> None:
+    source = tmp_path / "credential"
+    source.write_text("claim-" + uuid.uuid4().hex)
+    client = StaticPoolSandboxClient(
+        slots=[StaticShellSlot("unused", "localhost", 1, POOL)],
+        redis_client=valkey,
+        control_token=CONTROL_TOKEN,
+        ssl_context=shell_ssl_context(str(tls.ca)),
+        bundle_store=_NoBundles(),
+        key_prefix=prefix,
+        agent_credential_files={"acme-a": {"E2E_CLUSTER_KUBECONFIG": str(source)}},
+    )
+    with pytest.raises(SandboxError, match="withheld credential"):
+        client.create_claim(
+            "withheld",
+            pool=POOL,
+            env={"CURIE_RUNNER_TOKEN": _bearer()},
+            agent_name="acme-a",
+            deadline=time.monotonic() + 5,
+        )
+    assert valkey.exists(f"{prefix}:static:claim:withheld") == 0
+    assert valkey.exists(f"{prefix}:static:slot:unused") == 0
+
+
+@pytest.mark.parametrize(
+    "edges",
+    [(" ", ""), ("", " "), ("", "\n\n"), ("", "\r"), ("", "\t\n"), ("\n", "\n")],
+)
+def test_credential_edge_whitespace_is_refused_without_disclosing_the_value(
+    valkey: redis.Redis, prefix: str, tls: ShellTls, tmp_path: Path, edges: tuple[str, str]
+) -> None:
+    source = tmp_path / "credential"
+    secret = "claim-" + uuid.uuid4().hex
+    source.write_bytes((edges[0] + secret + edges[1]).encode())
+    client = StaticPoolSandboxClient(
+        slots=[StaticShellSlot("unused", "localhost", 1, POOL)],
+        redis_client=valkey,
+        control_token=CONTROL_TOKEN,
+        ssl_context=shell_ssl_context(str(tls.ca)),
+        bundle_store=_NoBundles(),
+        key_prefix=prefix,
+        agent_credential_files={"acme-a": {"EXTERNAL_API_TOKEN": str(source)}},
+    )
+    with pytest.raises(SandboxError, match="whitespace") as error:
+        client.create_claim(
+            "invalid-space",
+            pool=POOL,
+            env={"CURIE_RUNNER_TOKEN": _bearer()},
+            agent_name="acme-a",
+            deadline=time.monotonic() + 5,
+        )
+    assert str(source) in str(error.value)
+    assert secret not in str(error.value)
+    assert valkey.exists(f"{prefix}:static:claim:invalid-space") == 0
+
+
+def test_worker_startup_cleans_only_abandoned_claim_archives(
+    valkey: redis.Redis, tls: ShellTls, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import fcntl
+    import tempfile
+
+    from curie_worker.config import WorkerConfig
+    from curie_worker.run import _sandbox_client
+
+    monkeypatch.setattr(tempfile, "tempdir", str(tmp_path))
+    stale = tmp_path / "curie-shell-stage-abandoned.tar"
+    live = tmp_path / "curie-shell-stage-live.tar"
+    unrelated = tmp_path / "unrelated.tar"
+    for path in (stale, live, unrelated):
+        path.write_bytes(b"synthetic claim data")
+    env = {
+        "CURIE_SANDBOX_SUBSTRATE": "static",
+        "CURIE_STATIC_SHELLS": json.dumps(
+            [{"slot": "unused", "host": "localhost", "port": 1, "pool": POOL}]
+        ),
+        "CURIE_STATIC_SHELL_CA_FILE": str(tls.ca),
+        "CURIE_STATIC_SHELL_CONTROL_TOKEN": CONTROL_TOKEN,
+    }
+    config = SubstrateConfig(namespace="default", warm_pool=POOL)
+    worker = WorkerConfig(s3_access_key="rustfs", s3_secret_key="rustfssecret")
+    with live.open("rb") as held:
+        fcntl.flock(held, fcntl.LOCK_EX)
+        _sandbox_client(worker, env, config, redis_client=valkey)
+        assert not stale.exists()
+        assert live.exists() and unrelated.exists()
+    _sandbox_client(worker, env, config, redis_client=valkey)
+    assert not live.exists()
+    assert unrelated.exists()

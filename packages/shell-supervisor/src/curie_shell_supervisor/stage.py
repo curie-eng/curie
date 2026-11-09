@@ -35,6 +35,8 @@ from .protocol import (
     ATTACHMENT_MODES,
     ATTACHMENTS_DIR,
     BUNDLE_DIR,
+    CLAIM_ENV_FILE,
+    CLAIM_ENV_FILE_ENV,
     MANIFEST_NAME,
     MANIFEST_VERSION,
     RUNNER_TOKEN_ENV,
@@ -59,6 +61,7 @@ _OWNED_ENV = frozenset(
         SANDBOX_ID_ENV,
         RUNNER_PORT_ENV,
         UPLOAD_TOKENS_ENV,
+        CLAIM_ENV_FILE_ENV,
         "LD_PRELOAD",
         "LD_LIBRARY_PATH",
         "PYTHONPATH",
@@ -97,6 +100,7 @@ class StagedClaim:
     home: Path
     tmp: Path
     upload_tokens: Path | None
+    environment: Path
 
 
 def _parse_manifest(raw: bytes, claim: str, generation: int) -> Manifest:
@@ -251,6 +255,12 @@ def prepare(
         for private in (home, tmp):
             private.mkdir()
             _own(private, uid, gid, dir_mode=0o700, file_mode=0o600)
+        environment = home / CLAIM_ENV_FILE
+        fd = os.open(environment, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o400)
+        with os.fdopen(fd, "w", encoding="utf-8") as stream:
+            json.dump({k: v for k, v in manifest.env.items() if k not in _OWNED_ENV}, stream)
+            if uid is not None:
+                os.fchown(stream.fileno(), uid, gid if gid is not None else -1)
         upload_tokens: Path | None = None
         if manifest.connector_upload_tokens:
             upload_tokens = root / UPLOAD_TOKENS_FILE
@@ -262,7 +272,9 @@ def prepare(
     except BaseException:
         wipe(root)
         raise
-    return StagedClaim(root, bundle, workspace, attachments, home, tmp, upload_tokens), manifest
+    return StagedClaim(
+        root, bundle, workspace, attachments, home, tmp, upload_tokens, environment
+    ), manifest
 
 
 def child_environment(
@@ -281,7 +293,7 @@ def child_environment(
         secret_names &= manifest.executor_secret_names
     secret_names -= manifest.withheld_env
     env.update({name: environ[name] for name in secret_names if name in environ})
-    env.update({k: v for k, v in manifest.env.items() if k not in _OWNED_ENV})
+    env[CLAIM_ENV_FILE_ENV] = str(staged.environment)
     env.pop(UPLOAD_TOKENS_ENV, None)
     if staged.upload_tokens is not None:
         env[UPLOAD_TOKENS_ENV] = str(staged.upload_tokens)

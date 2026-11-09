@@ -29,7 +29,7 @@ PROXY_PREFIX = "/c"
 # size on disk, so no decompression ratio has to be trusted.
 ARCHIVE_MEDIA_TYPE = "application/x-tar"
 MANIFEST_NAME = "claim.json"
-MANIFEST_VERSION = 1
+MANIFEST_VERSION = 2
 BUNDLE_DIR = "bundle"
 WORKSPACE_DIR = "workspace"
 ATTACHMENTS_DIR = "attachments"
@@ -57,6 +57,8 @@ RUNNER_TOKEN_ENV = "CURIE_RUNNER_TOKEN"
 UPLOAD_TOKENS_ENV = "CURIE_CONNECTOR_UPLOAD_TOKENS_FILE"
 UPLOAD_TOKENS_FIELD = "connector_upload_tokens"
 UPLOAD_TOKENS_FILE = "connector-upload-tokens.json"
+CLAIM_ENV_FILE = "runner-environment.json"
+CLAIM_ENV_FILE_ENV = "CURIE_SHELL_CLAIM_ENV_FILE"
 
 # The claim names the worker mints (``curie-thread-<hash>-<nonce>``) are DNS
 # labels; anything else never reaches a path or a directory name.

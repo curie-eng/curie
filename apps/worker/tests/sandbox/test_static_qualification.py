@@ -17,6 +17,7 @@ import dataclasses
 import gzip
 import io
 import json
+import os
 import sys
 import tarfile
 import threading
@@ -560,3 +561,169 @@ def test_connector_endpoint_settings_reach_the_runner_on_a_shell(
         assert not upload_file.exists()
     finally:
         shell.stop()
+
+
+_ALTERNATING_BOOT = b"""
+import json, os
+from pathlib import Path
+from functools import partial
+from claude_agent_sdk import AssistantMessage, ResultMessage, TextBlock
+from curie_runner import __main__ as boot
+root = Path(os.environ["HOME"]).parent
+seen = {
+    "env": dict(os.environ),
+    "config": json.loads((Path(os.environ["CURIE_PLUGIN_DIR"]) / "agent.json").read_text()),
+    "files": {str(p.relative_to(root)): p.read_text() for p in root.rglob("*") if p.is_file()},
+    "bootstrap_consumed": not (Path(os.environ["HOME"]) / "runner-environment.json").exists(),
+}
+Path(os.environ["PROBE_RECORD_DIR"], "seen.json").write_text(json.dumps(seen))
+text = ("current=" + os.environ["EXTERNAL_API_TOKEN"].strip()
+        + " agent=" + os.environ["CURIE_CONNECTOR_AGENT"])
+def script():
+    return [AssistantMessage(content=[TextBlock(text=text)], model="fake-model"),
+            ResultMessage(subtype="success", duration_ms=1, duration_api_ms=1,
+                          is_error=False, num_turns=1, session_id="fake-session", result=text)]
+boot.FakeModelSession = partial(boot.FakeModelSession, script_factory=script)
+boot.main()
+"""
+
+
+@pytest.mark.parametrize("ending", ["\n", "\r\n"])
+def test_alternating_agents_have_private_config_credentials_and_redaction(
+    tmp_path: Path, valkey: redis.Redis, prefix: str, tls: ShellTls, state: _StateApi, ending: str
+) -> None:
+    from curie_worker.bundle_store import BundleStore
+    from curie_worker.config import WorkerConfig
+
+    store = BundleStore(
+        WorkerConfig(
+            s3_endpoint_url=os.environ.get("TEST_S3_ENDPOINT_URL", "http://127.0.0.1:29000"),
+            s3_access_key="rustfs",
+            s3_secret_key="rustfssecret",
+            bundle_bucket="shared-proof-" + uuid.uuid4().hex,
+        )
+    )
+    agents = ("acme-a", "acme-b")
+    refs = {agent: agent + ".tar.gz" for agent in agents}
+    credentials = {agent: "claim-value-" + uuid.uuid4().hex for agent in agents}
+    sources = {}
+    for agent in agents:
+        path = tmp_path / (agent + ".credential")
+        path.write_bytes((credentials[agent] + ending).encode())
+        sources[agent] = {"EXTERNAL_API_TOKEN": str(path)}
+    shell = SupervisorProcess(
+        slot="shared-proof",
+        tls=tls,
+        root=tmp_path / "shell",
+        runner_command=f"sh -c 'exec {sys.executable} \"$CURIE_PLUGIN_DIR/boot.py\"'",
+    )
+    pressure = AsyncRedis(host=VALKEY_HOST, port=VALKEY_PORT, password=VALKEY_PW)
+    client = None
+    bucket_created = False
+    try:
+        store._client.create_bucket(Bucket=store._bucket)
+        bucket_created = True
+        for agent in agents:
+            store._client.put_object(
+                Bucket=store._bucket,
+                Key=refs[agent],
+                Body=_bundle(
+                    {
+                        "boot.py": _ALTERNATING_BOOT,
+                        "agent.json": json.dumps({"agent": agent}).encode(),
+                        ".mcp.json": json.dumps(
+                            {
+                                "mcpServers": {
+                                    "external": {
+                                        "type": "http",
+                                        "url": "https://tools.example.com/mcp",
+                                        "headers": {
+                                            "Authorization": "Bearer ${EXTERNAL_API_TOKEN}"
+                                        },
+                                    }
+                                }
+                            }
+                        ).encode(),
+                    }
+                ),
+            )
+        shell.start()
+        client = StaticPoolSandboxClient(
+            slots=[StaticShellSlot(shell.slot, "localhost", shell.port, POOL)],
+            redis_client=valkey,
+            control_token=CONTROL_TOKEN,
+            ssl_context=shell_ssl_context(str(tls.ca)),
+            bundle_store=store,
+            key_prefix=prefix,
+            allow_unisolated_shells=True,
+            agent_credential_files=sources,
+        )
+        substrate = SandboxSubstrate(
+            client,
+            AffinityStore(valkey, pressure_client=pressure, key_prefix=prefix),
+            SubstrateConfig(namespace="default", warm_pool=POOL, key_prefix=prefix),
+        )
+        for index, agent in enumerate(("acme-a", "acme-b", "acme-a")):
+            thread = "alternating-" + str(index)
+            record = tmp_path / thread
+            record.mkdir()
+            env = {
+                **_boot_env(state, thread),
+                "CURIE_BUNDLE_REF": refs[agent],
+                "CURIE_CONNECTOR_AGENT": agent,
+                "PROBE_RECORD_DIR": str(record),
+            }
+            handle = substrate.claim(thread, env=env, agent_name=agent)
+            try:
+
+                async def turn(handle=handle):
+                    async with RunnerClient(ssl_context=shell_ssl_context(str(tls.ca))) as runner:
+                        stream = await runner.start_turn(
+                            handle.base_url,
+                            Event(
+                                type="message",
+                                text="report",
+                                user="U0EXAMPLE1",
+                                ts="1",
+                                session_id=handle.session_id,
+                            ),
+                            handle.token,
+                        )
+                        async with stream:
+                            return [frame async for frame in stream]
+
+                frames = asyncio.run(turn())
+                finals = [frame for frame in frames if getattr(frame, "type", None) == "final"]
+                assert len(finals) == 1 and finals[0].status == SessionStatus.DONE
+                assert "[REDACTED:held_secret]" in finals[0].text
+                assert credentials[agent] not in finals[0].text
+                seen = json.loads((record / "seen.json").read_text())
+                assert seen["env"]["EXTERNAL_API_TOKEN"] == credentials[agent]
+                assert seen["config"] == {"agent": agent}
+                assert seen["bootstrap_consumed"] is True
+                other = next(name for name in agents if name != agent)
+                assert credentials[other] not in json.dumps(seen)
+                assert credentials[other] not in str(frames)
+                root = Path(seen["env"]["HOME"]).parent
+            finally:
+                assert substrate.release(thread)
+            assert not root.exists()
+            assert list((shell.state_root / "claims").iterdir()) == []
+            assert _slot(valkey, prefix, shell.slot)["state"] == "free"
+    finally:
+        try:
+            if client is not None:
+                selector = "curietech.ai/managed-by=curie-sandbox-substrate"
+                for name in client.list_claims(label_selector=selector):
+                    client.delete_claim(name.name, request_timeout_seconds=30)
+        finally:
+            try:
+                shell.stop()
+            finally:
+                try:
+                    asyncio.run(pressure.aclose())
+                finally:
+                    if bucket_created:
+                        for ref in refs.values():
+                            store._client.delete_object(Bucket=store._bucket, Key=ref)
+                        store._client.delete_bucket(Bucket=store._bucket)
