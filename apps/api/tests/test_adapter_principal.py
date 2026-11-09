@@ -970,10 +970,15 @@ def test_rotation_refuses_principal_that_expires_while_binding_read_is_blocked(
                 )
             )
             deadline = time.monotonic() + 2
-            while not await connection.fetchval(
-                "SELECT EXISTS (SELECT 1 FROM pg_stat_activity WHERE wait_event_type='Lock' "
-                "AND query LIKE '%agent_channels%' AND pid <> pg_backend_pid())"
-            ):
+            while True:
+                # Activity query text is cached for this transaction even while
+                # wait events change; refresh it before identifying the reader.
+                await connection.execute("SELECT pg_stat_clear_snapshot()")
+                if await connection.fetchval(
+                    "SELECT EXISTS (SELECT 1 FROM pg_stat_activity WHERE wait_event_type='Lock' "
+                    "AND query LIKE '%agent_channels%' AND pid <> pg_backend_pid())"
+                ):
+                    break
                 assert time.monotonic() < deadline, "rotation did not reach its binding read"
                 await asyncio.to_thread(threading.Event().wait, 0.01)
             await asyncio.to_thread(threading.Event().wait, max(0, exp - time.time()) + 0.05)
