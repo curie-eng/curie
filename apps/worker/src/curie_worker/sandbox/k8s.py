@@ -40,10 +40,12 @@ from ..workspace import (
 )
 from .claim_tokens import (
     CLAIM_LABEL,
+    MODEL_AUTH_MODE_ENV,
     ClaimObjectNames,
     claim_object_names,
     claim_template_spec,
     executor_withheld_names,
+    personal_withheld_names,
     split_claim_tokens,
 )
 from .quota import ADMISSION_DIMENSIONS, quota_has_live_headroom, quota_rejection_is_valid
@@ -715,8 +717,9 @@ class KubernetesSandboxClient:
         executor_secret_names: frozenset[str] | None = None,
         executor_withheld: frozenset[str] = frozenset(),
         tool_daemon: ToolDaemonMount | None = None,
-    ) -> ClaimObjectNames:
-        """Write the per-claim template, token Secret and pool; return their names.
+        personal_mode: bool = False,
+    ) -> tuple[ClaimObjectNames, frozenset[str]]:
+        """Write the claim objects; return names and personal credential names.
 
         The source template is the one ``pool``'s ``sandboxTemplateRef`` names,
         so per-agent connector ``secretKeyRef`` entries (#1488) survive the copy.
@@ -733,6 +736,9 @@ class KubernetesSandboxClient:
         source_spec = self._source_template_spec(
             source_name, request_timeout_seconds=_claim_timeout(deadline)
         )
+        personal_withheld = (
+            personal_withheld_names(source_spec) if personal_mode else frozenset()
+        )
         spec = claim_template_spec(
             source_spec,
             secret_name=names.secret,
@@ -742,6 +748,7 @@ class KubernetesSandboxClient:
             executor_secret_names=executor_secret_names,
             executor_withheld=executor_withheld,
             tool_daemon=tool_daemon,
+            personal_mode=personal_mode,
         )
         labels = {MANAGED_BY_LABEL: MANAGED_BY_VALUE, CLAIM_LABEL: claim}
         try:
@@ -798,7 +805,7 @@ class KubernetesSandboxClient:
         except Exception:
             self._rollback_delete("sandboxtemplates", names.template)
             raise
-        return names
+        return names, personal_withheld
 
     def _pool_template_name(self, pool: str, *, request_timeout_seconds: float) -> str:
         """The template ``pool``'s ``sandboxTemplateRef`` names; a missing pool refuses."""
@@ -1065,25 +1072,33 @@ class KubernetesSandboxClient:
         _claim_timeout(deadline)  # a spent deadline refuses before any write
         env = filter_agent_child_env(env)
         executor = executor_secret_names is not None
+        personal_mode = not executor and env.get(MODEL_AUTH_MODE_ENV) == "personal"
         withheld: frozenset[str] = frozenset()
+        if executor or personal_mode:
+            withheld = executor_withheld_names(env)
+        tokens, env = split_claim_tokens(env)
         if executor:
+            tokens = {k: v for k, v in tokens.items() if k not in withheld}
+        if executor or personal_mode:
             # @spec ACTION-EXECUTOR-5: no model credential, its env-key
             # declaration, or a name that declaration points at reaches an
             # executor runner, by claim or template.
-            withheld = executor_withheld_names(env)
             env = {k: v for k, v in env.items() if k not in withheld}
+        if personal_mode:
+            env.pop(MODEL_AUTH_MODE_ENV, None)
         # Scoped tokens never ride the value-only claim (#3842): they go to a
         # per-claim Secret read by a per-claim template copy, which also
         # carries any runner resources override. A token-free claim keeps the
         # chart pool or the per-agent resources pool. An executor claim always
         # takes the per-claim path: claim env cannot remove what the pool
         # template carries, so only its own stripped copy can (ACTION-EXECUTOR-5).
+        # Personal mode always takes a stripped copy, even without a grant, so
+        # the runner cannot inherit the installation's model credential.
         # A Docker-enabled claim takes it too: its daemon client files ride the
         # per-claim Secret, mounted read-only on the runner (ADR 0217).
-        tokens, env = split_claim_tokens(env)
         claim_template: str | None = None
-        if tokens or executor or tool_daemon is not None:
-            claim_names = self._claim_scoped_pool(
+        if tokens or executor or personal_mode or tool_daemon is not None:
+            claim_names, personal_withheld = self._claim_scoped_pool(
                 name,
                 pool,
                 tokens,
@@ -1092,7 +1107,10 @@ class KubernetesSandboxClient:
                 executor_secret_names,
                 withheld,
                 tool_daemon,
+                personal_mode=personal_mode,
             )
+            if personal_mode:
+                env = {k: v for k, v in env.items() if k not in personal_withheld}
             pool = claim_names.pool
             claim_template = claim_names.template
         elif runner_resources is not None:
