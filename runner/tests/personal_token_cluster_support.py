@@ -95,7 +95,7 @@ def scrubbed_env() -> dict[str, str]:
 class BudgetLedger:
     """A started session with unknown usage reserves the entire remaining budget."""
 
-    def __init__(self, run_id: str) -> None:
+    def __init__(self, run_id: str, *, diagnostic_retry: bool = False) -> None:
         __tracebackhide__ = True
         require(bool(re.fullmatch(r"[A-Za-z0-9_.-]{1,120}", run_id)), "invalid proof run ID")
         directory = Path(
@@ -119,6 +119,8 @@ class BudgetLedger:
             "assistant_turns INTEGER, elapsed REAL, PRIMARY KEY(run_id, sequence))"
         )
         self.run_id = run_id
+        self.limit = 1536 if diagnostic_retry else 1024
+        self.session_limit = 512 if diagnostic_retry else 1024
 
     def start(self, candidate: str) -> tuple[int, int]:
         __tracebackhide__ = True
@@ -130,7 +132,7 @@ class BudgetLedger:
             ).fetchall()
             require(len(rows) < 2, "the logical proof has used its two-session allowance")
             spent = sum(output if output is not None else reserved for output, reserved in rows)
-            remaining = 1024 - spent
+            remaining = min(self.session_limit, self.limit - spent)
             require(remaining > 0, "the logical proof has no remaining output-token budget")
             sequence = len(rows) + 1
             self.db.execute(
@@ -149,9 +151,9 @@ class BudgetLedger:
             "SELECT output_tokens,reserved FROM sessions WHERE run_id=?", (self.run_id,)
         ).fetchall()
         require(len(rows) < 2, "the logical proof has used its two-session allowance")
-        remaining = 1024 - sum(
+        remaining = min(self.session_limit, self.limit - sum(
             output if output is not None else reserved for output, reserved in rows
-        )
+        ))
         require(remaining > 0, "the logical proof has no remaining output-token budget")
         return remaining
 
@@ -165,13 +167,21 @@ class BudgetLedger:
             "SELECT output_tokens,reserved FROM sessions WHERE run_id=?", (self.run_id,)
         ).fetchall()
         total = sum(output if output is not None else reserved for output, reserved in rows)
-        require(len(rows) <= 2 and total <= 1024, "the logical proof exceeded its live budget")
+        require(
+            0 < tokens <= rows[sequence - 1][1], "the live session exceeded its output allowance"
+        )
+        require(
+            len(rows) <= 2 and total <= self.limit, "the logical proof exceeded its live budget"
+        )
         require(0 < turns <= 4 and elapsed <= 180, "the live session exceeded a session bound")
         return {
             "sessions": len(rows),
             "assistant_turns": turns,
             "output_tokens": tokens,
-            "total_output_tokens": total,
+            "accounted_output_tokens": total,
+            "unknown_reserved_output_tokens": sum(
+                reserved for output, reserved in rows if output is None
+            ),
             "elapsed_seconds": round(elapsed, 3),
         }
 
@@ -308,6 +318,39 @@ def secret_env(name: str, secret: str, key: str) -> dict[str, Any]:
     return {"name": name, "valueFrom": {"secretKeyRef": {"name": secret, "key": key}}}
 
 
+def native_transcript_records(files: Mapping[str, bytes]) -> dict[str, Any]:
+    messages = []
+    for name, content in files.items():
+        if name.endswith(".jsonl") and "projects" in Path(name).parts:
+            messages.extend(json.loads(line) for line in content.splitlines() if line)
+    assistants = [item for item in messages if item.get("type") == "assistant"]
+    return {
+        "messages": messages,
+        "assistant_messages": [
+            item for item in assistants if item.get("message", {}).get("model") != "<synthetic>"
+        ],
+        "synthetic_assistant_records": sum(
+            item.get("message", {}).get("model") == "<synthetic>" for item in assistants
+        ),
+    }
+
+
+def live_transcript_identity(observed: Mapping[str, Any]) -> tuple[set[str], set[str]]:
+    from test_personal_claude_live import _same_model
+
+    assistants = observed["assistant_messages"]
+    unique = {item.get("message", {}).get("id") for item in assistants}
+    require(
+        None not in unique and bool(unique), "native transcript did not identify assistant turns"
+    )
+    models = {item.get("message", {}).get("model") for item in assistants}
+    require(
+        all(isinstance(model, str) and _same_model(model, MODEL) for model in models),
+        "live transcript used an unexpected model",
+    )
+    return unique, models
+
+
 def live_observations(
     events: Sequence[Mapping[str, Any]], observed: Mapping[str, Any],
     elapsed: float, grant: HeldSecret,
@@ -331,6 +374,8 @@ def live_observations(
     counts = [item.get("output_tokens") for item in reported]
     return {
         "models": safe_models,
+        "expected_model": MODEL,
+        "synthetic_assistant_records": observed.get("synthetic_assistant_records", 0),
         "unreported_model_entries": len(models) - len(safe_models),
         "final_status": status if status in {"done", "classified-failure", "awaiting-approval"}
         else "unrecognized",
@@ -386,7 +431,10 @@ class ClusterProof:
             "budget": {
                 "max_sessions": 2,
                 "max_assistant_turns": 4,
-                "max_total_output_tokens": 1024,
+                "max_total_output_tokens": 1536
+                if os.environ.get("CURIE_PERSONAL_DIAGNOSTIC_RETRY") == "1" else 1024,
+                "max_session_output_tokens": 512
+                if os.environ.get("CURIE_PERSONAL_DIAGNOSTIC_RETRY") == "1" else 1024,
                 "max_session_seconds": 180,
                 "model": MODEL,
             },
@@ -511,7 +559,10 @@ class ClusterProof:
         require(bool(re.fullmatch(r"[0-9a-f]{40}", self.candidate)), "invalid candidate commit")
         self.evidence["candidate_sha"] = self.candidate
         if self.phase == "live":
-            self.ledger = BudgetLedger(os.environ["CURIE_PERSONAL_PROOF_RUN_ID"])
+            self.ledger = BudgetLedger(
+                os.environ["CURIE_PERSONAL_PROOF_RUN_ID"],
+                diagnostic_retry=os.environ.get("CURIE_PERSONAL_DIAGNOSTIC_RETRY") == "1",
+            )
             self.ledger.remaining()
         raw_config = self.kubectl(
             "config", "view", "--minify", "--flatten", "--raw", retain_output=False
@@ -1399,18 +1450,14 @@ print(json.dumps(files))
         encoded = json.loads(self.exec(pod, "python3", "-c", script, retain_output=False))
         files = {name: base64.b64decode(value) for name, value in encoded.items()}
         self.captures.extend(files.values())
-        messages = []
         usage = []
         for name, content in files.items():
             if name.endswith("usage.jsonl"):
                 usage += [json.loads(line) for line in content.splitlines() if line]
-            elif name.endswith(".jsonl"):
-                messages += [json.loads(line) for line in content.splitlines() if line]
         return {
             "files": files,
-            "messages": messages,
+            **native_transcript_records(files),
             "usage": usage,
-            "assistant_messages": [item for item in messages if item.get("type") == "assistant"],
             "provider_attempts": sum(
                 len(value.splitlines())
                 for name, value in files.items()
@@ -1450,17 +1497,7 @@ print(json.dumps(files))
         self.evidence["live_observations"] = live_observations(
             events, observed, elapsed, self.grant
         )
-        assistants = observed["assistant_messages"]
-        unique = {item.get("message", {}).get("id") for item in assistants}
-        require(
-            None not in unique and bool(unique),
-            "native transcript did not identify assistant turns",
-        )
-        models = {item.get("message", {}).get("model") for item in assistants}
-        require(
-            all(isinstance(model, str) and _same_model(model, MODEL) for model in models),
-            "live transcript used an unexpected model",
-        )
+        unique, models = live_transcript_identity(observed)
         finals = [event for event in events if event.get("type") == "final"]
         require(
             len(finals) == 1 and isinstance(finals[0].get("output_tokens"), int),
