@@ -570,11 +570,14 @@ carries `Jira: <KEY> <issue URL>`.
 
 ### The factory account
 
-Create a dedicated Atlassian account for the factory and an API token for it
-at <https://id.atlassian.com/manage-profile/security/api-tokens>. Write the
-token to a file; quickstart reads it from there and stores it in a Secret
-that only the API mounts (see [Names and reruns](#names-and-reruns)). Give the
-account these permissions:
+Create a dedicated Atlassian account for the factory. A regular account uses
+a [personal API token](https://id.atlassian.com/manage-profile/security/api-tokens).
+A [service account](https://support.atlassian.com/user-management/docs/manage-api-tokens-for-service-accounts/)
+uses its service-account email and a scoped token. Give the service account
+Jira app access and select `read:jira-user`, `read:jira-work`, and
+`write:jira-work` for the token. Write the token to a file; quickstart reads
+it from there and stores it in a Secret that only the API mounts (see
+[Names and reruns](#names-and-reruns)). Give the account these permissions:
 
 1. Browse Projects, on the projects the factory should serve and no others.
 2. Add Comments.
@@ -586,7 +589,10 @@ account these permissions:
 Scope comes from Jira's permissions, not from Curie configuration. The factory
 sees every issue the factory account can browse that carries the label, and
 there is no project list to set. To keep the factory out of a project, do not
-grant the account Browse Projects on it.
+grant the account Browse Projects on it. [Jira Free cannot customize project
+permissions](https://support.atlassian.com/jira-cloud-administration/docs/permissions-and-issue-level-security-in-free-plans/).
+On a shared Free site, check that no other visible issue has the trigger label
+and reserve that label for the trial.
 
 A classic API token uses the site root as `--forge-url`, for example
 `https://example.atlassian.net`. A scoped token uses the API gateway,

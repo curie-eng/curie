@@ -26,14 +26,22 @@ a unittest under `tests/` checking `greet("Ada")`. Run
 command if you want the trial to produce CI evidence; the factory cannot
 publish changes under `.github/`.
 
-Create a dedicated Atlassian factory account and an
-[API token](https://id.atlassian.com/manage-profile/security/api-tokens).
-Give it Browse Projects only on trial projects, Add Comments, Edit Own
-Comments, Edit Issues and Link Issues. This account sees every labelled issue
-it can browse; there is no separate project allowlist. Save its token in a
-local file outside the repository using your editor. Keep the token out of
-command arguments, commits and chat. Quickstart stores it in the API's
-Kubernetes Secret.
+Create a dedicated Atlassian factory account. A regular account uses a
+[personal API token](https://id.atlassian.com/manage-profile/security/api-tokens).
+A [service account](https://support.atlassian.com/user-management/docs/manage-api-tokens-for-service-accounts/)
+uses its service-account email and a scoped token. Give the service account
+Jira app access and select the `read:jira-user`, `read:jira-work`, and
+`write:jira-work` token scopes.
+
+Give the account Browse Projects only on trial projects, Add Comments, Edit
+Own Comments, Edit Issues, and Link Issues. Jira Free cannot customize project
+permissions. On a shared Free site, check that no other visible issue has the
+trigger label and reserve that label for this trial. The factory sees every
+labelled issue it can browse; there is no separate project allowlist.
+
+Save the token in a local file outside the repository using your editor. Keep
+it out of command arguments, commits, and chat. Quickstart stores it in the
+API's Kubernetes Secret.
 Curie never mints or rotates this token; to replace it, follow
 [Replace a static token](factory-quickstart-reference.md#replace-a-static-token).
 
