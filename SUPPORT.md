@@ -14,6 +14,11 @@ of help you need.
 
 ## Where to get help
 
+**Contributor conversation.** Join the
+[Curie Discord community](https://discord.gg/YZASub2d5B) to talk with the
+team and other contributors. Keep decisions and resolved answers in GitHub
+Discussions so they remain searchable.
+
 **Usage questions and how-to help.** Ask in
 [GitHub Discussions](https://github.com/curie-eng/curie/discussions). Use the
 **Q&A** category for a question you want answered, and **Ideas** for a proposal
