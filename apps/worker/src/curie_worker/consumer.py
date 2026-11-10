@@ -616,12 +616,7 @@ class Consumer(StreamConsumer):
                                 lease,
                                 identify=identify_predecessor,
                             )
-                            local_order = self._kernel._order_locks.get(thread_key)
-                            if (
-                                order_blocked
-                                and local_order is not None
-                                and local_order.lock.locked()
-                            ):
+                            if order_blocked:
                                 local_order = self._kernel._acquire_order_entry(thread_key)
                                 try:
                                     async with local_order.lock:
