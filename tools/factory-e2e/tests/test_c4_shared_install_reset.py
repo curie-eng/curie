@@ -10,11 +10,15 @@ those two reads holds work_items and waits for agent_channels, and the poll
 then waits for work_items: a lock cycle that Postgres breaks by aborting one
 side after deadlock_timeout.
 
-The test drives that interleaving deterministically on a database migrated to
-head. The reset text is the harness's own (reset_sql inside transaction_sql,
-the command text write_sql hands psql), sent as one simple query as psql
-sends it. The poll side is the product's read helpers, in the order and the
-single transaction the poll pass uses.
+The first test drives that interleaving deterministically on a database
+migrated to head. The reset text is the harness's own (reset_sql inside
+transaction_sql, the command text write_sql hands psql), sent as one simple
+query as psql sends it. The poll side is the product's read helpers, in the
+order and the single transaction the poll pass uses.
+
+The harness keeps psql's error text in a private diagnostics database, so a
+failed reset reached CI only as an opaque infrastructure error. The last test
+pins what such a failure now shows: its SQLSTATE and nothing else.
 """
 
 from __future__ import annotations
@@ -23,6 +27,7 @@ import asyncio
 import json
 import os
 import secrets
+import sqlite3
 import sys
 import time
 from collections.abc import Iterator
@@ -42,6 +47,7 @@ sys.path.insert(0, str(HERE))
 
 from _migration_support import admin_execute, alembic_config, render_url  # noqa: E402
 from alembic import command  # noqa: E402
+from c4_admitted_kind import AdmittedKind  # noqa: E402
 from c4_shared_install import (  # noqa: E402
     TABLE_ROWS_QUERY,
     inventoried_table_rows,
@@ -63,6 +69,21 @@ RESET_WAITS_ON = (
     "SELECT EXISTS (SELECT 1 FROM pg_locks WHERE pid = $1 AND NOT granted "
     "AND locktype = 'relation' AND relation = $2::regclass)"
 )
+# psql 16.15 (the chart's pinned image) with -v VERBOSITY=verbose, reporting
+# this reset deadlock, then the line kubectl exec adds when its command exits
+# 1. Both recorded from the real tools.
+DEADLOCK_REPORT = (
+    "ERROR:  40P01: deadlock detected\n"
+    "DETAIL:  Process 118 waits for AccessExclusiveLock on relation 16499 of database "
+    "16384; blocked by process 111.\n"
+    "Process 111 waits for AccessShareLock on relation 16784 of database 16384; blocked "
+    "by process 118.\n"
+    "HINT:  See server log for query details.\n"
+    "LOCATION:  DeadLockReport, deadlock.c:1130\n"
+    "command terminated with exit code 1\n"
+)
+# kubectl exec refusing before psql runs, recorded from the real tool.
+EXEC_REFUSAL = "error: container nosuch is not valid for pod pg out of: pg\n"
 
 
 @pytest.fixture
@@ -179,3 +200,36 @@ def test_reset_completes_when_the_live_poll_intake_closes_a_lock_cycle(
     reset_database: str,
 ) -> None:
     asyncio.run(reset_beside_poll(reset_database))
+
+
+PSQL_EXEC = ("exec", "statefulset/curie-postgres", "--", "psql", "-c", "SELECT 1")
+
+
+@pytest.mark.parametrize(
+    ("argv", "stderr", "category"),
+    [
+        pytest.param(PSQL_EXEC, DEADLOCK_REPORT, " with SQLSTATE 40P01", id="database-error"),
+        pytest.param(PSQL_EXEC, EXEC_REFUSAL, "", id="exec-refusal"),
+        # Only psql's own report is parsed; other tools' text is never quoted.
+        pytest.param(("get", "pods"), DEADLOCK_REPORT, "", id="not-psql"),
+    ],
+)
+def test_failed_psql_command_shows_only_its_sqlstate(
+    tmp_path: Path, argv: tuple[str, ...], stderr: str, category: str
+) -> None:
+    report = tmp_path / "stderr.txt"
+    report.write_text(stderr)
+    kubectl = tmp_path / "kubectl"
+    kubectl.write_text(f"#!/bin/sh\ncat '{report}' >&2\nexit 1\n")
+    kubectl.chmod(0o755)
+    run = AdmittedKind(tmp_path / "install", Path(sys.executable))
+    run.root.mkdir()
+    with pytest.raises(RuntimeError) as failure:
+        run.command(str(kubectl), "--context", "kind-acme", *argv)
+    assert str(failure.value) == (
+        f"candidate infrastructure command kubectl --context failed{category}; "
+        "redacted details retained in the private fixture diagnostics database"
+    )
+    with sqlite3.connect(run.diagnostic_path) as diagnostics:
+        (detail,) = diagnostics.execute("SELECT detail FROM failures").fetchone()
+    assert stderr.splitlines()[0] in detail

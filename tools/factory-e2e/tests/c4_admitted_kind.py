@@ -8,6 +8,7 @@ import hashlib
 import hmac
 import json
 import os
+import re
 import selectors
 import shutil
 import sqlite3
@@ -64,6 +65,11 @@ SCENARIO_ISSUE = 3815
 # WorkItems that dedupe them are truncated; 4 s allows several polls of each.
 RETIRE_OBSERVE_SECONDS = 4
 VALUE_FROM_KINDS = frozenset({"secretKeyRef", "configMapKeyRef", "fieldRef", "resourceFieldRef"})
+# psql runs with VERBOSITY=verbose, so a server error report opens with its
+# SQLSTATE, as in "ERROR:  40P01: deadlock detected". The five character code
+# is the one part of a database error a visible failure message carries; the
+# redacted report itself stays in the private diagnostics database.
+PSQL_ERROR_CODE = re.compile(r"\b(?:ERROR|FATAL|PANIC):\s+([0-9A-Z]{5}):")
 # Every key with no TTL (TTL -1), read in one round trip.
 PERSISTENT_KEYS_SCRIPT = (
     "local cursor = '0' local found = {} repeat "
@@ -569,9 +575,11 @@ except (httpx.HTTPError, OSError, ValueError, TypeError, KeyError) as exc:
             if sk.registry_bind_rejected(str(exc)):
                 raise sk.ScriptedScenarioError("registry port is already allocated") from None
             self.record_failure(f"{Path(argv[0]).name} {argv[1]}", exc)
+            code = PSQL_ERROR_CODE.search(str(exc)) if "psql" in argv else None
             raise RuntimeError(
-                f"candidate infrastructure command {Path(argv[0]).name} {argv[1]} failed; "
-                "redacted details retained in the private fixture diagnostics database"
+                f"candidate infrastructure command {Path(argv[0]).name} {argv[1]} failed"
+                + (f" with SQLSTATE {code.group(1)}" if code else "")
+                + "; redacted details retained in the private fixture diagnostics database"
             ) from None
 
     def prerequisites(self) -> None:
@@ -1557,14 +1565,14 @@ except (httpx.HTTPError, OSError, ValueError, TypeError, KeyError) as exc:
         self.kubectl(
             "-n", self.namespace, "exec", "statefulset/curie-postgres", "--",
             "psql", "-U", "postgres", "-d", "postgres", "-At",
-            "-v", "ON_ERROR_STOP=1", "-c", transaction_sql(query),
+            "-v", "ON_ERROR_STOP=1", "-v", "VERBOSITY=verbose", "-c", transaction_sql(query),
         )
 
     def check_violation(self, query: str) -> Any:
         output = self.kubectl(
             "-n", self.namespace, "exec", "statefulset/curie-postgres", "--",
             "psql", "-U", "postgres", "-d", "postgres", "-qAt",
-            "-v", "ON_ERROR_STOP=1", "-c",
+            "-v", "ON_ERROR_STOP=1", "-v", "VERBOSITY=verbose", "-c",
             "BEGIN; CREATE TEMP TABLE c4_refusal (code text, reason text) ON COMMIT DROP; "
             "DO $c4$ BEGIN " + query + "; "
             "EXCEPTION WHEN check_violation THEN "

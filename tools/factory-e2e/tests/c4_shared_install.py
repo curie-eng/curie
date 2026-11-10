@@ -33,6 +33,19 @@ TABLE_ROWS_QUERY = (
     "FROM information_schema.tables t "
     "WHERE t.table_schema = 'curie' AND t.table_type = 'BASE TABLE'"
 )
+# The reset's own deadlock_timeout. The API keeps running through a reset, and
+# its reads can close a lock cycle with the TRUNCATE: the GitHub poll intake
+# reads agent_channels and then work_items in one transaction, while the
+# TRUNCATE locks work_items first and agent_channels later. Each backend
+# checks for a cycle once, deadlock_timeout into a lock wait, and Postgres
+# aborts the backend whose check finds it. The reset began waiting first, so
+# at the shared 1 s default its check ran first and the reset was aborted.
+# The API keeps that default, so the live transaction now finds the cycle and
+# is aborted instead, and its loop repeats the pass. The reset waits on lock
+# holders exactly as before. Only a cycle whose live members already ran their
+# one check before it closed still ends in the reset's abort, after a minute,
+# well inside the reset's 300 s psql command budget.
+RESET_DEADLOCK_TIMEOUT = "1min"
 
 
 class CaseIsolationError(RuntimeError):
@@ -109,7 +122,8 @@ def reset_sql(table_rows: tuple[tuple[str, int], ...], tenants: frozenset[str]) 
     github_review_deliveries; no case asserts on them. Every other
     table that was empty in the baseline is truncated too, so a row a
     case created anywhere else is removed. A table with baseline rows is
-    not cleaned: the verification snapshot reports a changed count.
+    not cleaned: the verification snapshot reports a changed count. The text
+    runs inside transaction_sql, so its SET LOCAL lasts for the reset alone.
     """
 
     kept = ", ".join(f"'{uuid.UUID(tenant)}'" for tenant in sorted(tenants))
@@ -126,6 +140,7 @@ def reset_sql(table_rows: tuple[tuple[str, int], ...], tenants: frozenset[str]) 
         f'curie."{table}"' for table in sorted(INTAKE_CURSOR_TABLES | set(empty_tables))
     ]
     return (
+        f"SET LOCAL deadlock_timeout = '{RESET_DEADLOCK_TIMEOUT}'; "
         "TRUNCATE " + ", ".join(swept) + " CASCADE; "
         "DELETE FROM curie.tenants" + (f" WHERE id NOT IN ({kept})" if kept else "")
     )
