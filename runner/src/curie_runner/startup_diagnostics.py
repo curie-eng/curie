@@ -18,11 +18,9 @@ fixed phase, the outcome, monotonic elapsed milliseconds, the SDK version and,
 on failure only, the exception class. Never options, env, prompts, or
 exception text: the SDK's message text can carry a header value.
 
-Redaction is per callback line, plus the private key block tracker and the
-stop after a line long enough to be a forced partial flush. A value whose
-recognizable prefix and payload arrive in different callbacks (for example a
-flush whose pending text ends in whitespace, which the SDK strips) is not
-redacted here, the same as anywhere else that reads CLI stderr.
+Held values and supported encodings are scrubbed before forwarding or retention.
+An unfinished held-value prefix is retained between callbacks; private key
+blocks are tracked across lines. Diagnostics remain byte bounded.
 """
 
 from __future__ import annotations
@@ -35,7 +33,12 @@ import time
 from collections.abc import Callable, Iterator
 
 import anyio
-from curie_telemetry.redact import REDACTION_RULES, redact_text
+from curie_telemetry.redact import (
+    REDACTION_RULES,
+    held_secret_literals,
+    redact_text,
+    registered_held_secrets,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -56,7 +59,7 @@ CAPTURE_STOPPED_MARKER = "[stderr capture stopped: a line reached the SDK buffer
 
 
 class StderrTail:
-    """Forward every CLI stderr line; retain a redacted tail while capturing."""
+    """Redact CLI stderr before forwarding and retaining a bounded tail."""
 
     def __init__(
         self, passthrough: Callable[[str], None] | None, *, partial_line_chars: int
@@ -74,54 +77,57 @@ class StderrTail:
         self._in_private_key = False
         self._stopped = False
         self._buffer = bytearray()
+        self._pending = ""
 
     @property
     def passthrough(self) -> Callable[[str], None] | None:
         return self._passthrough
 
     def __call__(self, line: str) -> None:
-        # Retain before forwarding: the SDK swallows a raising callback, and a
-        # caller's passthrough failing must not cost the diagnostic.
-        if self._capturing:
-            self._retain(line)
-        if self._passthrough is not None:
-            self._passthrough(line)
-        else:
-            # The SDK hands lines without their newline. Unpiped, the CLI wrote
-            # straight to the inherited fd 2, so keep that output shape.
-            sys.stderr.write(line + "\n")
+        raw = self._pending + line
+        self._pending = ""
+        literals = held_secret_literals(registered_held_secrets())
+        # Replace complete values before looking for an unfinished suffix, so
+        # overlapping prefixes never retain part of a complete credential.
+        for literal in literals:
+            raw = raw.replace(literal, "[REDACTED:held_secret]")
+        keep = max(
+            (size for literal in literals for size in range(1, min(len(raw), len(literal) - 1) + 1)
+             if raw.endswith(literal[:size])),
+            default=0,
+        )
+        if keep:
+            self._pending = raw[-keep:]
+            raw = raw[:-keep]
+        if raw:
+            self._emit(self._sanitize(raw), partial=len(line) >= self._partial_line_chars)
 
-    def _retain(self, line: str) -> None:
-        # A line this long may be a forced partial flush whose remainder
-        # arrives as the next line, so neither part can be redacted. Keep a
-        # fixed marker and nothing more until the next capture window.
-        if self._stopped:
+    def _emit(self, text: str, *, partial: bool = False) -> None:
+        if self._capturing and not self._stopped:
+            if partial:
+                self._stopped = True
+                self._append(CAPTURE_STOPPED_MARKER.encode("utf-8") + b"\n")
+            elif text:
+                self._append(text.encode("utf-8") + b"\n")
+        if not text:
             return
-        if len(line) >= self._partial_line_chars:
-            self._stopped = True
-            self._append(CAPTURE_STOPPED_MARKER.encode("utf-8") + b"\n")
-            return
-        # Redact before the text is retained anywhere. A private key block
-        # spans lines: everything from an unclosed BEGIN marker through the
-        # matching END marker is replaced by one placeholder.
+        if self._passthrough is not None:
+            self._passthrough(text)
+        else:
+            sys.stderr.write(text + "\n")
+
+    def _sanitize(self, line: str) -> str:
         if self._in_private_key:
             end = _PEM_END.search(line)
             if end is None:
-                return
+                return ""
             self._in_private_key = False
             line = line[end.end() :]
-            if not line:
-                return
-        # Find block boundaries on the raw line: a generic rule such as
-        # secret_assignment can consume the BEGIN marker itself. Only the last
-        # BEGIN can be unclosed; redact_text replaces any complete block.
         begin = next(reversed(list(_PEM_BEGIN.finditer(line))), None)
         if begin is not None and _PEM_END.search(line, begin.end()) is None:
             self._in_private_key = True
-            text = redact_text(line[: begin.start()]) + _PEM_PLACEHOLDER
-        else:
-            text = redact_text(line)
-        self._append(text.encode("utf-8") + b"\n")
+            return redact_text(line[: begin.start()]) + _PEM_PLACEHOLDER
+        return redact_text(line)
 
     def _append(self, encoded: bytes) -> None:
         # Keep the newest bytes without the buffer ever exceeding the limit. A
@@ -150,7 +156,6 @@ class StderrTail:
         """Stop capturing and hand back the retained tail, clearing it."""
 
         self._capturing = False
-        self._in_private_key = False
         self._stopped = False
         tail = self._buffer.decode("utf-8").rstrip("\n")
         self._buffer.clear()
@@ -158,7 +163,6 @@ class StderrTail:
 
     def discard(self) -> None:
         self._capturing = False
-        self._in_private_key = False
         self._stopped = False
         self._buffer.clear()
 

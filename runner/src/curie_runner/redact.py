@@ -17,9 +17,11 @@ from curie_telemetry.redact import (
     REDACTION_RULES,
     RedactingLogFilter,
     RedactionRule,
+    held_secret_literals,
     install_stdout_redaction,
     redact_span_attribute,
     redact_text,
+    register_held_secrets,
 )
 
 from .config import RunnerConfig
@@ -159,6 +161,7 @@ def collect_held_secrets(
                             _collect_header_value(values, normalized, expanded)
                 else:
                     _collect_header_value(values, normalized, raw)
+    register_held_secrets(values)
     return frozenset(values)
 
 
@@ -188,7 +191,6 @@ _BLOCK_BREAK = "\n\n"
 _MAX_REJECTED_BREAKS = 4
 # Encodings shorter than this match ordinary text. A 4 character value
 # encodes to 8 characters; shorter values stay exact matches only.
-_HELD_ENCODING_MIN_LENGTH = 8
 
 
 # @spec ACTION-EXECUTOR-9: the sealed envelope grammar, frozen in
@@ -229,23 +231,7 @@ def is_sealed_envelope(value: object) -> bool:
 
 
 def _held_literals(held_secrets: Collection[str]) -> tuple[str, ...]:
-    """Exact held values plus standard and URL-safe base64 of the longer ones."""
-
-    literals: set[str] = set()
-    for value in held_secrets:
-        if not value:
-            continue
-        literals.add(value)
-        encoded = value.encode()
-        for raw in (
-            base64.standard_b64encode(encoded),
-            base64.urlsafe_b64encode(encoded),
-        ):
-            text = raw.decode()
-            for form in (text, text.rstrip("=")):
-                if form and form != value and len(form) >= _HELD_ENCODING_MIN_LENGTH:
-                    literals.add(form)
-    return tuple(sorted(literals, key=lambda item: (-len(item), item)))
+    return held_secret_literals(held_secrets)
 
 
 class OutboundRedactor:
@@ -582,4 +568,5 @@ __all__ = [
     "install_stdout_redaction",
     "redact_span_attribute",
     "redact_text",
+    "register_held_secrets",
 ]

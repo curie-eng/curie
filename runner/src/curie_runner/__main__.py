@@ -144,7 +144,7 @@ from .progress import (
     resolve_progress,
 )
 from .publication_precheck import PublicationPrecheck
-from .redact import collect_held_secrets, install_stdout_redaction
+from .redact import collect_held_secrets, install_stdout_redaction, register_held_secrets
 from .route_callers import (
     connector_urls,
     mount_route_callers,
@@ -2054,6 +2054,7 @@ def _serve() -> None:
 
 def main() -> None:
     lock_process_environ()
+    register_held_secrets([os.environ.get("CLAUDE_CODE_OAUTH_TOKEN", "")])
     install_stdout_redaction()
     telemetry = bootstrap_service_telemetry(
         "curie-runner",

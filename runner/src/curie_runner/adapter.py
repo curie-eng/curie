@@ -49,13 +49,13 @@ from claude_agent_sdk._internal.session_store import project_key_for_directory
 from claude_agent_sdk._internal.transport.subprocess_cli import _DEFAULT_MAX_BUFFER_SIZE
 from claude_agent_sdk.types import (
     CanUseTool,
-    McpSdkServerConfig,
     PermissionMode,
     SessionKey,
     SessionStore,
     SessionStoreEntry,
     SettingSource,
 )
+from curie_telemetry.redact import register_held_secrets
 from plugin_format.approval_policy import connector_tool_prefix
 
 from .history import (
@@ -576,7 +576,7 @@ def build_options(
     task_budget_hint: int | None = None,
     env: dict[str, str] | None = None,
     hooks: dict[str, list[HookMatcher]] | None = None,
-    mcp_servers: dict[str, McpSdkServerConfig] | None = None,
+    mcp_servers: dict[str, Any] | None = None,
     can_use_tool: CanUseTool | None = None,
     cwd: str | None = None,
     web_search_enabled: bool = True,
@@ -723,6 +723,14 @@ class ClaudeAgentSession:
     """ModelSession backed by a real claude-agent-sdk streaming-input session."""
 
     def __init__(self, options: ClaudeAgentOptions) -> None:
+        from .subprocess_env import platform_credential_names
+
+        initial_env = {**os.environ, **options.env}
+        denied = platform_credential_names(os.environ) | platform_credential_names(initial_env)
+        register_held_secrets([
+            value for source in (os.environ, options.env)
+            for name, value in source.items() if name in denied
+        ])
         # Install the stderr tail before the client exists: the SDK copies
         # options at connect and its transport keeps that copy, so the tail
         # must already be on every copy to keep forwarding after connect.
@@ -753,10 +761,19 @@ class ClaudeAgentSession:
         )
 
         snapshot = dict(os.environ)
+        from .mcp_stdio import sanitize_mcp_servers
+
+        combined_env = {**snapshot, **self._options.env}
+        denied = platform_credential_names(snapshot) | platform_credential_names(combined_env)
+        register_held_secrets(
+            [value for name, value in combined_env.items() if name in denied]
+        )
+        self._options.mcp_servers = sanitize_mcp_servers(
+            self._options.mcp_servers, combined_env, denied_names=denied,
+        )
         if effective_auth_mode(snapshot, self._options.env) is AuthMode.PERSONAL:
             await self._connect_personal(snapshot)
             return
-        denied = platform_credential_names({**snapshot, **self._options.env})
         for key in list(self._options.env):
             if key in denied and key not in CLI_PARENT_MODEL_KEYS:
                 self._options.env.pop(key, None)
@@ -767,8 +784,10 @@ class ClaudeAgentSession:
         # record is written only after the process env is the snapshot again.
         with sdk_initialize_diagnostics(self._stderr_tail, _SDK_VERSION):
             try:
+                parent = cli_parent_env(snapshot)
+                self._options.env["LD_PRELOAD"] = parent["LD_PRELOAD"]
                 os.environ.clear()
-                os.environ.update(cli_parent_env(snapshot))
+                os.environ.update(parent)
                 await self._client.connect()
             finally:
                 os.environ.clear()
@@ -802,10 +821,12 @@ class ClaudeAgentSession:
         try:
             with sdk_initialize_diagnostics(self._stderr_tail, _SDK_VERSION):
                 try:
+                    parent = cli_parent_env(snapshot)
+                    options_env["LD_PRELOAD"] = parent["LD_PRELOAD"]
                     os.environ.clear()
                     os.environ.update(
                         personal_cli_env(
-                            cli_parent_env(snapshot),
+                            parent,
                             options_env,
                             grant=grant,
                             config=config,

@@ -1183,11 +1183,9 @@ def test_optional_binding_is_projected_before_hosted_secret_cleanup(
     runner = build_runner(config, fake_model=False, sdk_env=spawn)
     session = initialized_session_sync(runner)
     assert isinstance(session, _CapturedSession)
-    # Bound is judged at boot, before hosted credential custody removes the
-    # process variable. Preserve existing stdio placeholder semantics; this is
-    # not a claim that sharing hosted/stdio credentials authenticates stdio.
+    # Materialize the stdio binding before hosted custody removes its source.
     servers = session.options.mcp_servers
-    assert servers["plugin:b:stdio"]["env"]["TOKEN"] == "${GITHUB_PERSONAL_ACCESS_TOKEN}"
+    assert servers["plugin:b:stdio"]["env"]["TOKEN"] == "example-shared-token"
     assert servers["github"]["headers"]["Authorization"] == "Bearer example-shared-token"
     assert "GITHUB_PERSONAL_ACCESS_TOKEN" not in spawn
     assert "GITHUB_PERSONAL_ACCESS_TOKEN" not in os.environ

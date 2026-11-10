@@ -25,6 +25,7 @@ from collections.abc import Mapping, MutableMapping
 from pathlib import Path
 
 from curie_internal.connector_endpoints import UPLOAD_TOKENS_FILE_ENV
+from curie_telemetry.redact import held_secret_literals
 
 from .sdk_auth import (
     API_KEY_ENV,
@@ -133,10 +134,14 @@ def shell_and_hook_env(
     denied = platform_credential_names(source)
     if extra:
         denied = denied | platform_credential_names({**source, **extra})
-    child = {key: value for key, value in source.items() if key not in denied}
+    held = held_secret_literals([value for key, value in source.items() if key in denied and value])
+    child = {
+        key: value for key, value in source.items()
+        if key not in denied and not any(secret in value for secret in held)
+    }
     if extra:
         for key, value in extra.items():
-            if key not in denied:
+            if key not in denied and not any(secret in value for secret in held):
                 child[key] = value
     return child
 
@@ -180,7 +185,7 @@ def proc_dumpable_library(source: Mapping[str, str]) -> str:
     library = library_dir / "libproc_dumpable.so"
     c_source = Path(__file__).with_name("proc_dumpable.c")
     # connect has already cleared os.environ. gcc needs PATH to find cc1.
-    compile_env = dict(source)
+    compile_env = shell_and_hook_env(source)
     compile_env.setdefault("PATH", "/usr/bin:/bin")
     subprocess.run(
         ["gcc", "-shared", "-fPIC", "-O2", "-o", str(library), str(c_source)],

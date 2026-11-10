@@ -134,7 +134,7 @@ def _assert_late_line_forwarded_not_retained(
     callback = session._options.stderr  # noqa: SLF001
     assert callback is not None
     callback(f"late diagnostic after connect {_BEARER}")
-    assert capsys.readouterr().err == f"late diagnostic after connect {_BEARER}\n"
+    assert capsys.readouterr().err == "late diagnostic after connect [REDACTED:bearer_token]\n"
     assert len(caplog.records) == before
     assert session._stderr_tail.finish() == ""  # noqa: SLF001
 
@@ -158,7 +158,7 @@ def test_successful_connect_records_timing_and_discards_stderr(
     assert _tails(caplog) == []
     assert not [r for r in caplog.records if r.levelno >= logging.WARNING]
     # Every line still reaches stderr, as the inherited fd 2 did before.
-    assert capsys.readouterr().err == f"startup noise {_BEARER}\n"
+    assert capsys.readouterr().err == "startup noise [REDACTED:bearer_token]\n"
     _assert_late_line_forwarded_not_retained(session, caplog, capsys)
 
 
@@ -631,8 +631,8 @@ def test_real_sdk_post_connect_stderr_reaches_stderr_through_the_options_copy(
 
     seen = anyio.run(scenario)
 
-    assert f"during initialize {_BEARER}\n" in seen
-    assert f"after connect {_BEARER}\n" in seen
+    assert "during initialize [REDACTED:bearer_token]\n" in seen
+    assert "after connect [REDACTED:bearer_token]\n" in seen
     (finish,) = _finishes(caplog)
     _assert_record_shape(finish, "success")
     assert _tails(caplog) == []

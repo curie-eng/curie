@@ -432,23 +432,13 @@ async def server_streams(
 
     command = config.get("command")
     if isinstance(command, str) and command:
-        configured_env = config.get("env")
-        from .subprocess_env import shell_and_hook_env
+        from .mcp_stdio import sanitize_stdio_server
 
-        expanded_config_env: dict[str, str] = {}
-        if isinstance(configured_env, Mapping):
-            expanded_config_env = {
-                str(key): _expand(str(value), interpolation_env)
-                for key, value in configured_env.items()
-            }
-        child_env = shell_and_hook_env(interpolation_env, extra=expanded_config_env)
-        args = config.get("args")
+        sanitized = sanitize_stdio_server(config, inherited_env, plugin_dir=plugin_dir)
         parameters = StdioServerParameters(
-            command=_expand(command, interpolation_env),
-            args=[_expand(str(arg), interpolation_env) for arg in args]
-            if isinstance(args, list)
-            else [],
-            env=child_env,
+            command=sanitized["command"],
+            args=sanitized["args"],
+            env=sanitized["env"],
             cwd=plugin_dir,
         )
         async with stdio_client(parameters) as streams:
