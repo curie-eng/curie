@@ -23,7 +23,11 @@ from personal_token_cluster_support import (
 )
 
 __tracebackhide__ = True
-_GRANT = HeldSecret(os.environ.pop("CLAUDE_CODE_OAUTH_TOKEN", ""))
+_GRANT = HeldSecret(
+    os.environ.pop("CLAUDE_CODE_OAUTH_TOKEN", "")
+    if os.environ.get("CURIE_PERSONAL_LIVE") == "1"
+    else ""
+)
 
 
 @pytest.fixture
