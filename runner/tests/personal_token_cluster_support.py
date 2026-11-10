@@ -363,6 +363,7 @@ class ClusterProof:
         data: bytes | None = None,
         timeout: float = 120,
         check: bool = True,
+        retain_output: bool = True,
     ) -> subprocess.CompletedProcess[bytes]:
         __tracebackhide__ = True
         for secret in (self.grant, self.runner_auth, self.progress_auth):
@@ -395,8 +396,8 @@ class ClusterProof:
             from curie_telemetry.redact import held_secret_literals
 
             outputs = [result.stdout, result.stderr]
-            if "config" in argv and "--raw" in argv:
-                outputs = [b"[private kubeconfig omitted]", b""]
+            if not retain_output:
+                outputs = [b"[private proof output omitted]", b""]
             for secret in held_secret_literals(
                 [
                     self.grant.reveal(),
@@ -476,7 +477,9 @@ class ClusterProof:
         if self.phase == "live":
             self.ledger = BudgetLedger(os.environ["CURIE_PERSONAL_PROOF_RUN_ID"])
             self.ledger.remaining()
-        raw_config = self.kubectl("config", "view", "--minify", "--flatten", "--raw").stdout
+        raw_config = self.kubectl(
+            "config", "view", "--minify", "--flatten", "--raw", retain_output=False
+        ).stdout
         fd, self.private_config = tempfile.mkstemp(prefix="curie-private-kube-", suffix=".yaml")
         with os.fdopen(fd, "wb") as stream:
             stream.write(raw_config)
@@ -1029,9 +1032,13 @@ class ClusterProof:
         )
         return name, self.wait_pod(f"custody-step={name}")
 
-    def exec(self, pod: str, *args: str, data: bytes | None = None, timeout: float = 120) -> bytes:
+    def exec(
+        self, pod: str, *args: str, data: bytes | None = None,
+        timeout: float = 120, retain_output: bool = True,
+    ) -> bytes:
         return self.kubectl(
-            "exec", "-i", pod, "--container", "runner", "--", *args, data=data, timeout=timeout
+            "exec", "-i", pod, "--container", "runner", "--", *args,
+            data=data, timeout=timeout, retain_output=retain_output,
         ).stdout
 
     def synthetic(self) -> None:
@@ -1353,7 +1360,7 @@ for name in ('hook.marker','helper.marker','mcp.marker'):
  if path.is_file(): files[name]=base64.b64encode(path.read_bytes()).decode()
 print(json.dumps(files))
 """
-        encoded = json.loads(self.exec(pod, "python3", "-c", script))
+        encoded = json.loads(self.exec(pod, "python3", "-c", script, retain_output=False))
         files = {name: base64.b64decode(value) for name, value in encoded.items()}
         self.captures.extend(files.values())
         messages = []
