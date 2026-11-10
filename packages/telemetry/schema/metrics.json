@@ -607,6 +607,8 @@
           "/v1/internal/work-items/admissions",
           "/v1/internal/work-items/requests/{request_id}",
           "/v1/internal/work-items/{work_item_id}/cancel",
+          "/v1/internal/work-items/{work_item_id}/personal-context",
+          "/v1/internal/work-items/{work_item_id}/personal-context/revalidate",
           "/v1/internal/work-items/requests/{request_id}/acquire",
           "/v1/internal/work-items/requests/{request_id}/defer",
           "/v1/internal/work-items/requests/{request_id}/start",
@@ -661,7 +663,7 @@
           "OTHER"
         ]
       },
-      "cardinality_bound": 1768,
+      "cardinality_bound": 1784,
       "description": "Active HTTP server requests.",
       "monotonic": false,
       "type": "up_down_counter",
@@ -855,6 +857,8 @@
           "/v1/internal/work-items/admissions",
           "/v1/internal/work-items/requests/{request_id}",
           "/v1/internal/work-items/{work_item_id}/cancel",
+          "/v1/internal/work-items/{work_item_id}/personal-context",
+          "/v1/internal/work-items/{work_item_id}/personal-context/revalidate",
           "/v1/internal/work-items/requests/{request_id}/acquire",
           "/v1/internal/work-items/requests/{request_id}/defer",
           "/v1/internal/work-items/requests/{request_id}/start",
@@ -916,7 +920,7 @@
           "OTHER"
         ]
       },
-      "cardinality_bound": 8840,
+      "cardinality_bound": 8920,
       "description": "HTTP server requests.",
       "monotonic": true,
       "type": "counter",
@@ -1110,6 +1114,8 @@
           "/v1/internal/work-items/admissions",
           "/v1/internal/work-items/requests/{request_id}",
           "/v1/internal/work-items/{work_item_id}/cancel",
+          "/v1/internal/work-items/{work_item_id}/personal-context",
+          "/v1/internal/work-items/{work_item_id}/personal-context/revalidate",
           "/v1/internal/work-items/requests/{request_id}/acquire",
           "/v1/internal/work-items/requests/{request_id}/defer",
           "/v1/internal/work-items/requests/{request_id}/start",
@@ -1171,7 +1177,7 @@
           "OTHER"
         ]
       },
-      "cardinality_bound": 8840,
+      "cardinality_bound": 8920,
       "description": "HTTP server request duration.",
       "monotonic": false,
       "type": "histogram",

@@ -90,10 +90,11 @@ def graph_payload() -> dict[str, Any]:
         ("0154", False),
         # Dynamic approval answers require the 0156 answer gate.
         ("0156", False),
-        # 0157 is the factory Slack tables. The candidate minimum is 0158,
-        # the GitHub host namespaces.
+        # 0157 adds factory Slack tables, 0158 adds GitHub host namespaces,
+        # and 0159 adds the execution owner columns this candidate reads.
         ("0157", False),
-        ("0158", True),
+        ("0158", False),
+        ("0159", True),
         ("0000", True),
         ("future-expand", True),
     ],
@@ -116,17 +117,17 @@ def test_installed_candidate_decision_preserves_unknown_revision_policy(
     )
 
 
-def test_candidate_window_raises_the_floor_to_0158() -> None:
+def test_candidate_window_raises_the_floor_to_0159() -> None:
     """@spec CONNECTOR-REQUESTER-1: agent ORM reads require the 0151 requester columns.
 
     Approval ORM reads require the 0154 reminder cursor, and dynamic approval
     answers require the 0156 answer gate. The factory Slack progress loop reads
     the 0157 tables, and the code host link route writes the github_host kind
-    0158 allows, so 0158 is the floor.
+    0158 allows. Execution owner reads require 0159, which is the floor.
     """
     window = shared().load_metadata().window
-    assert window.schema_min == "0158"
-    assert window.schema_head == "0158"
+    assert window.schema_min == "0159"
+    assert window.schema_head == "0159"
 
 
 @pytest.mark.parametrize("mutation", ["bounds", "parent", "cycle", "duplicate", "type"])

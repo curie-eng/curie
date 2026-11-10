@@ -1,6 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://schemas.curietech.ai/cli/work-items/v2.json",
+  "$id": "https://schemas.curietech.ai/cli/work-items/v2.1.json",
   "title": "curie <tier> work-items --json",
   "description": "The agent-facing payload of `curie <tier> work-items [ID]`: the dry-run plan, the factory work item list (`items`, `limit`, `truncated`), or one work item under `item` with live CI. `state` and `actionable_cause` are the platform API's strings, never derived by the CLI.",
   "$defs": {
@@ -91,6 +91,35 @@
         "last_deferral_reason": {
           "type": [
             "string",
+            "null"
+          ]
+        },
+        "tenant_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "model_auth_mode": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "enum": [
+            "service",
+            "personal",
+            null
+          ]
+        },
+        "owner_principal_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "enrollment_generation": {
+          "type": [
+            "integer",
             "null"
           ]
         }
@@ -363,6 +392,35 @@
           "items": {
             "$ref": "#/$defs/request"
           }
+        },
+        "tenant_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "model_auth_mode": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "enum": [
+            "service",
+            "personal",
+            null
+          ]
+        },
+        "owner_principal_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "enrollment_generation": {
+          "type": [
+            "integer",
+            "null"
+          ]
         }
       }
     },
