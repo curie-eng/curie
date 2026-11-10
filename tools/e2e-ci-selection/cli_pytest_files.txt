@@ -182,3 +182,4 @@ tools/preflight/tests/test_preflight.py
 tools/preflight/tests/test_scan_history.py
 tools/runtime-assertion-gate/tests/test_runtime_assertion_gate.py
 tools/test-env/test_webhook_wake_connector.py
+tools/test-env/test_webhook_wake_live_tier.py

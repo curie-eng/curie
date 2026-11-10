@@ -5,6 +5,8 @@ The sibling worker fixture owns a real kind install and verifies teardown.
 This suite moves admission to HTTP, using an independent contract signer.
 Hosted cases use a connector-only SecretRef. The live cases require
 ``WAKE_TEST_MODEL_CREDENTIAL`` and otherwise record an explicit acceptance gap.
+The live key replaces the scripted placeholder in ``CURIE_CREDENTIALS``.
+``WAKE_TEST_MODEL_BASE_URL`` (default Anthropic) selects the endpoint.
 Local hosted sessions remain a gap because local/skill bring-up cannot deliver
 operator-managed SecretRefs. The two transport cases wait about 150 seconds
 per stack for real lease expiry on the database clock.
@@ -33,6 +35,27 @@ LIVE_PROVIDER_GAP = (
     "ADR 0274 live-provider connector/session gap: approved credential absent; "
     "Brian waived the live run on 2026-11-08 pending a test credential"
 )
+
+
+def provider_tier_values(*, base_url, model, credential_secret):
+    """Helm values one provider tier layers over the install with ``--reuse-values``.
+
+    The tier's credential replaces the install's scripted placeholder as the
+    runner credential reference (``CURIE_CREDENTIALS``). A key carried only in
+    ``ANTHROPIC_API_KEY`` loses to that placeholder once a base URL is set,
+    because the runner reads the declared credential key first.
+    """
+    extra = [{"name": "CURIE_MODEL_BASE_URL", "value": base_url}] if base_url else []
+    runner = {
+        "fakeModel": False,
+        "extraEnv": list(extra),
+        "credentialsExistingSecret": credential_secret,
+        "credentialsExistingSecretKey": "key",
+    }
+    if model:
+        runner["model"] = model
+    values = {"agentSandbox": {"runner": runner}, "worker": {"extraEnv": list(extra)}}
+    return values
 
 
 class PrivateInput(str):
@@ -1420,9 +1443,6 @@ def test_hosted_connector_session(qualification, agent, provider_tier):
     stack = qualification
     live = provider_tier == "live"
     credential = os.environ.get("WAKE_TEST_MODEL_CREDENTIAL", "") if live else "not-needed"
-    credential_name = os.environ.get("WAKE_TEST_MODEL_ENV_KEY", "ANTHROPIC_API_KEY")
-    if credential_name not in {"CURIE_CREDENTIALS", "CLAUDE_CODE_OAUTH_TOKEN", "ANTHROPIC_API_KEY"}:
-        raise RuntimeError("approved test model credential uses an unsupported environment key")
     agent_id = stack.agents[agent]
     stack.worker(True)
     warm_run = stack.queued(agent)
@@ -1459,32 +1479,15 @@ def test_hosted_connector_session(qualification, agent, provider_tier):
                 }
             ),
         )
-    extra = []
     base_url = os.environ.get("WAKE_TEST_MODEL_BASE_URL", "") if live else stack.model_url
-    if base_url:
-        extra.append({"name": "CURIE_MODEL_BASE_URL", "value": base_url})
     values_path = stack.root / "live.yaml"
-    runner = {"fakeModel": False, "extraEnv": extra}
-    if credential_name == "CURIE_CREDENTIALS":
-        runner.update(
-            credentialsExistingSecret="acme-model-credential",
-            credentialsExistingSecretKey="key",
-        )
-    else:
-        extra.append(
-            {
-                "name": credential_name,
-                "valueFrom": {"secretKeyRef": {"name": "acme-model-credential", "key": "key"}},
-            }
-        )
-    if live and os.environ.get("WAKE_TEST_MODEL"):
-        runner["model"] = os.environ["WAKE_TEST_MODEL"]
     values_path.write_text(
         yaml.safe_dump(
-            {
-                "agentSandbox": {"runner": runner},
-                "worker": {"extraEnv": extra},
-            }
+            provider_tier_values(
+                base_url=base_url,
+                model=os.environ.get("WAKE_TEST_MODEL", "") if live else "",
+                credential_secret="acme-model-credential",
+            )
         )
     )
     from test_webhook_wake_worker import REPO
