@@ -133,8 +133,9 @@ the flag to a watched delivery and escalate even when that delivery performed no
 action. Each failed retirement retains its watch for the next pass without
 preventing other maintenance.
 
-Known gap: turns started through the attachment handoff do not register a
-recovery watch. They do not receive this abandoned-turn retirement bound.
+A turn started through the retained attachment handoff installs the same
+recovery watch as the ordinary start path, so it receives the same
+abandoned-turn retirement bound.
 
 When every slot of a pool is leased, a claim fails with
 `CapacityExhaustedError` carrying a capacity rejection for one `pods` unit in
