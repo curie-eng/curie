@@ -9057,7 +9057,7 @@ mod tests {
         };
         const PAGE: &str = r#"{"events":[{"event":"reply.update","text":"curie-turn-failure: identity-refused\n\nThe worker refused this turn before running it."},{"event":"turn.completed","outcome":"dropped"}],"next_cursor":2,"terminal":true}"#;
         let api = ApiClient::new(&hint_stub_api(200, PAGE).await, HINT_API_KEY).expect("client");
-        let stream = format!("curie:test:eval-identity-refusal:{}", uuid::Uuid::new_v4());
+        let stream = format!("test:eval-identity-refusal:{}", uuid::Uuid::new_v4());
         let mut opts = eval_opts(false, Some("C0EXAMPLE1"));
         opts.dry_run = false;
         opts.stream = stream.clone();
