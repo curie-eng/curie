@@ -63,7 +63,7 @@ signal-hook = "0.4"
 tar = "0.4"
 tempfile = "3"
 time = { version = "0.3", features = ["formatting", "parsing"] }
-uuid = { version = "1", features = ["v4"] }
+uuid = { version = "1", features = ["v4", "serde"] }
 # OS CSPRNG for generating strong per-release chart secrets (cluster up). Same
 # 0.2 line uuid already pulls in; the free `getrandom::getrandom` fill API.
 getrandom = "0.4"
