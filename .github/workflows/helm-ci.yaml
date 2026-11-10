@@ -793,6 +793,14 @@ jobs:
           set -euo pipefail
           bash charts/curie/ci/dispatcher-api-wiring-assertions.sh
 
+      # The dispatcher is a Slack Socket Mode client, and Slack delivers each
+      # event to only one connected client, so the chart refuses more than one
+      # dispatcher replica (issue #2944).
+      - name: helm render assertions (dispatcher single replica)
+        run: |
+          set -euo pipefail
+          bash charts/curie/ci/dispatcher-single-replica-assertions.sh
+
       - name: helm render assertions (approval principal wiring)
         run: |
           set -euo pipefail

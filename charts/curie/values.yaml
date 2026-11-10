@@ -1753,7 +1753,8 @@ dispatcher:
   # every rollout, from the old pod exiting until the new pod reconnects, in
   # which Slack retries events it could not deliver instead of splitting them.
   # For the same reason keep replicas at 1: each extra replica is another
-  # client on the same tokens.
+  # client on the same tokens. The chart refuses any value above 1 while the
+  # dispatcher is deployed.
   replicas: 1
   # Optional PodDisruptionBudget (#1574), off by default. The dispatcher is
   # one replica with strategy Recreate by design (see replicas above), so a
