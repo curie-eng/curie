@@ -348,7 +348,7 @@ def test_a_service_request_projects_service_mode_with_no_owner_or_generation() -
 
 
 def test_a_legacy_shaped_service_request_projects_with_no_tenant_snapshot() -> None:
-    # Migration 0148 is an expand: an older application inside the schema
+    # Migration 0159 is an expand: an older application inside the schema
     # window still inserts WorkItems and requests that name none of the four
     # owner columns, so tenant_id stays NULL and the mode defaults to service.
     # Such a row must still project, as the API read already shows it.

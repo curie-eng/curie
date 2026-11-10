@@ -921,7 +921,7 @@ class ThreadPublicationLineage(Base):
 
 
 # The execution owner tuple shared by work_items and execution_requests (#5376,
-# ADR 0268). Migration 0148 carries a frozen copy. A service row names no owner
+# ADR 0268). Migration 0159 carries a frozen copy. A service row names no owner
 # or generation; a personal row names its tenant, owner and a positive
 # generation. ``IS TRUE`` keeps an UNKNOWN from passing.
 MODEL_AUTH_MODE_CHECK = "model_auth_mode IN ('service', 'personal')"
@@ -998,7 +998,7 @@ class WorkItem(Base):
             "base_source IS NULL OR base_source IN ('label', 'default')",
             name="work_items_base_source_ck",
         ),
-        # The execution owner tuple (#5376, migration 0148).
+        # The execution owner tuple (#5376, migration 0159).
         CheckConstraint(MODEL_AUTH_MODE_CHECK, name="work_items_model_auth_mode_ck"),
         CheckConstraint(OWNER_TUPLE_CHECK, name="work_items_owner_tuple_ck"),
         ForeignKeyConstraint(
@@ -1288,7 +1288,7 @@ class ExecutionRequest(Base):
             LAST_START_FAILURE_DETAIL_CHECK,
             name="execution_requests_last_start_failure_detail_ck",
         ),
-        # The owner snapshot (#5376, migration 0148). MATCH SIMPLE skips a
+        # The owner snapshot (#5376, migration 0159). MATCH SIMPLE skips a
         # composite key with a NULL member, so three keys bind it to its
         # WorkItem: the mode (never NULL), the tenant, and the owner.
         CheckConstraint(MODEL_AUTH_MODE_CHECK, name="execution_requests_model_auth_mode_ck"),

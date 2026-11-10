@@ -69,9 +69,9 @@ CONTRACT = "0041"
 # @spec CONNECTOR-REQUESTER-1: agent ORM reads require the 0151 columns.
 # Approval ORM reads require the 0153 dynamic approval selection columns, and
 # dynamic approval answers require the 0156 answer gate. The factory Slack
-# progress loop reads the 0157 thread tables. GitHub host namespaces are the
-# 0158 candidate minimum.
-APP_SCHEMA_MIN = "0158"
+# progress loop reads the 0157 thread tables. GitHub host namespaces require
+# 0158; owner tuple reads require 0159.
+APP_SCHEMA_MIN = "0159"
 REVIEW_SCHEMA_MIN = "0063"
 PREV = "0040"
 
@@ -186,6 +186,7 @@ def test_upgrade_from_either_train_applies_the_missing_sibling_and_preserves_row
             "0156",
             "0157",
             "0158",
+            "0159",
         } <= pending
         assert not pending & {"0091", "0092", "0093"}
     else:
@@ -230,8 +231,9 @@ def test_upgrade_from_either_train_applies_the_missing_sibling_and_preserves_row
             "0156",
             "0157",
             "0158",
+            "0159",
         }
-    assert current_revision() == "0158"
+    assert current_revision() == "0159"
     assert sql_rows("SELECT name FROM curie.agents WHERE id=:id", {"id": agent_id}) == [
         ("merge-example",)
     ]
@@ -334,8 +336,9 @@ def test_agent_reads_refuse_the_schema_before_deploy_notification_expand() -> No
     # reads require the 0151 connector requester identity columns, and
     # Approval ORM reads require the 0153 approval selection columns, and
     # dynamic approval answers require the 0156 answer gate. Factory Slack
-    # progress reads the 0157 tables. GitHub host namespaces require 0158.
-    for revision in sorted(known - {"0158"}):
+    # progress reads the 0157 tables. GitHub host namespaces require 0158, and
+    # execution owner reads require 0159.
+    for revision in sorted(known - {"0159"}):
         assert can_serve(revision, window, known) is False
     assert can_serve("0140", window, known) is False
     assert can_serve("0141", window, known) is False
@@ -352,7 +355,8 @@ def test_agent_reads_refuse_the_schema_before_deploy_notification_expand() -> No
     assert can_serve("0154", window, known) is False
     assert can_serve("0156", window, known) is False
     assert can_serve("0157", window, known) is False
-    assert can_serve("0158", window, known) is True
+    assert can_serve("0158", window, known) is False
+    assert can_serve("0159", window, known) is True
 
 
 def test_planner_refuses_irreversible_before_mutation() -> None:
@@ -1233,9 +1237,6 @@ def test_moved_postgres_wait_extracts_ssl_without_forwarding_it_as_a_server_sett
 def test_deleted_issue_migration_refuses_to_discard_cancellation_records(
     isolated_migration_db: IsolatedMigrationDb, deleted_rows: bool
 ) -> None:
-    from curie_api.workitems import lifecycle
-    from test_workitems import _agent, _item, _request, with_session
-
     isolated_migration_db.at("0145")
     original_shape = sql_rows(
         "SELECT pg_get_constraintdef(oid) FROM pg_constraint "
@@ -1245,19 +1246,30 @@ def test_deleted_issue_migration_refuses_to_discard_cancellation_records(
     command.upgrade(alembic_config(), "0147")
     if deleted_rows:
 
-        async def cancel_deleted(session):
-            agent = await _agent(session)
-            waiting = await _request(session, (await _item(session, agent)).work_item)
-            cancelled = await lifecycle.request_cancellation(
-                session,
-                work_item_id=waiting.work_item.id,
-                expected_work_item_version=waiting.work_item.version,
-                cause="issue_deleted",
-            )
-            assert isinstance(cancelled, lifecycle.WorkItemOutcome)
-            assert cancelled.request.terminal_cause == "issue_deleted"
-
-        with_session(cancel_deleted)
+        agent_id, item_id, request_id = uuid.uuid4(), uuid.uuid4(), uuid.uuid4()
+        _exec(
+            "INSERT INTO curie.agents (id, name) VALUES (:id, 'acme-deleted-issue')",
+            {"id": agent_id},
+        )
+        _exec(
+            "INSERT INTO curie.work_items (id, tracker_kind, tracker_host, tracker_scope_id, "
+            "tracker_issue_id, code_host_kind, code_host_host, repository_project_id, "
+            "code_host_installation_id, agent_id, repository_path, conversation_id) "
+            "VALUES (:id, 'github', 'github.com', '101', '2573', 'github', 'github.com', "
+            "'101', 202, :agent, 'acme-corp/acme-bot', 'acme-deleted-issue')",
+            {"id": item_id, "agent": agent_id},
+        )
+        _exec(
+            "INSERT INTO curie.execution_requests "
+            "(id, work_item_id, sequence, status, wait_deadline, terminal_at, terminal_cause) "
+            "VALUES (:id, :item, 1, 'cancelled', clock_timestamp() + interval '1 hour', "
+            "clock_timestamp(), 'issue_deleted')",
+            {"id": request_id, "item": item_id},
+        )
+        assert sql_rows(
+            "SELECT terminal_cause FROM curie.execution_requests WHERE id = :id",
+            {"id": request_id},
+        ) == [("issue_deleted",)]
         with pytest.raises(RuntimeError, match="cannot downgrade"):
             command.downgrade(alembic_config(), "0145")
         assert current_revision() == "0147"

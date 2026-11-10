@@ -1,6 +1,6 @@
-"""Migration 0148 binds executions to tenant principals and enrollments (#5376 AC6).
+"""Migration 0159 binds executions to tenant principals and enrollments (#5376 AC6).
 
-An expand revision above 0146. It adds ``curie.personal_claude_enrollments``
+An expand revision above 0158. It adds ``curie.personal_claude_enrollments``
 and the owner tuple (``tenant_id``, ``model_auth_mode``, ``owner_principal_id``,
 ``enrollment_generation``) on ``work_items`` and ``execution_requests``.
 Existing rows upgrade as service rows with ``tenant_id`` backfilled from their
@@ -30,8 +30,8 @@ from _migration_support import (
 from alembic import command
 from sqlalchemy.exc import IntegrityError
 
-REVISION = "0148"
-BELOW = "0146"
+REVISION = "0159"
+BELOW = "0158"
 DEFAULT_TENANT = UUID("00000000-0000-0000-0000-000000000001")
 OWNER_COLUMNS = {"tenant_id", "model_auth_mode", "owner_principal_id", "enrollment_generation"}
 WAIT_DEADLINE = datetime(2026, 11, 5, 13, 0, tzinfo=UTC)
@@ -160,7 +160,7 @@ def _row(table: str, row_id: UUID) -> dict[str, Any]:
 
 
 def _seed_service_rows() -> dict[str, Any]:
-    """At 0146: a non-default tenant's agent and a default-tenant agent, each
+    """At 0158: a non-default tenant's agent and a default-tenant agent, each
     with a WorkItem holding one terminal and one waiting request."""
 
     tenant = _tenant()
@@ -197,7 +197,7 @@ def _seed_service_rows() -> dict[str, Any]:
     return seeded
 
 
-def test_0148_upgrade_backfills_service_rows_enforces_the_tuple_and_guards_downgrade(
+def test_0159_upgrade_backfills_service_rows_enforces_the_tuple_and_guards_downgrade(
     isolated_migration_db: IsolatedMigrationDb,
 ) -> None:
     config = alembic_config()

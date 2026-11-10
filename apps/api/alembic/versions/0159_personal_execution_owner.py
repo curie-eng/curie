@@ -26,8 +26,8 @@ references it. They keep the default NO ACTION on update, so only
 The downgrade refuses while any personal WorkItem, personal request or
 enrollment remains.
 
-Revision ID: 0148
-Revises: 0146
+Revision ID: 0159
+Revises: 0158
 """
 
 from collections.abc import Sequence
@@ -36,8 +36,8 @@ import sqlalchemy as sa
 from alembic import op
 from sqlalchemy.dialects import postgresql
 
-revision: str = "0148"
-down_revision: str = "0146"
+revision: str = "0159"
+down_revision: str = "0158"
 branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
 S = "curie"
@@ -47,7 +47,7 @@ S = "curie"
 LOCK_TIMEOUT_MS = 15000
 
 MODE_CHECK = "model_auth_mode IN ('service', 'personal')"
-# Frozen copy of the owner tuple shape at 0148.
+# Frozen copy of the owner tuple shape at 0159.
 TUPLE_CHECK = (
     "((model_auth_mode = 'service' AND owner_principal_id IS NULL "
     "AND enrollment_generation IS NULL) "

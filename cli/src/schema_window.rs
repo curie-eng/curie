@@ -770,9 +770,9 @@ print(json.dumps(graph))
         // interval and the 0153 selection columns. Dynamic approval answers require
         // the 0156 answer gate. The factory Slack progress loop reads the tables
         // 0157 introduces, and the code host link route writes the github_host
-        // kind 0158 allows.
-        assert_eq!(candidate.schema_min, "0158");
-        assert_eq!(candidate.schema_head, "0158");
+        // kind 0158 allows. Owner tuple reads require 0159.
+        assert_eq!(candidate.schema_min, "0159");
+        assert_eq!(candidate.schema_head, "0159");
         assert_eq!(
             candidate.schema_head.as_str(),
             catalog().revisions.last().unwrap()
@@ -819,7 +819,8 @@ print(json.dumps(graph))
         assert!(!live_in_window("0154", &current));
         assert!(!live_in_window("0156", &current));
         assert!(!live_in_window("0157", &current));
-        assert!(live_in_window("0158", &current));
+        assert!(!live_in_window("0158", &current));
+        assert!(live_in_window("0159", &current));
         assert!(!live_in_window("0075", &current));
         assert!(!live_in_window("0076", &current));
         let retained = window_for("0.12.0").expect("published foundation remains catalogued");
