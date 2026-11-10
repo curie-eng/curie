@@ -21,7 +21,11 @@ from curie_runner.sdk_auth import resolve_sdk_env
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "cli/tests/local"))
 
-from test_webhook_wake_qualification import provider_tier_values  # noqa: E402
+from test_webhook_wake_qualification import (  # noqa: E402
+    ANTHROPIC_API_CIDR,
+    live_model_egress,
+    provider_tier_values,
+)
 
 RELEASE = "wake-live"
 SECRET = "acme-model-credential"
@@ -109,6 +113,22 @@ def model_key(env):
     return (override or env).get("ANTHROPIC_API_KEY")
 
 
+def runner_egress(docs):
+    """(cidr, port) pairs the runner sandbox may dial from security.networkPolicy.allowedEgress."""
+    [policy] = [
+        doc
+        for doc in docs
+        if doc["kind"] == "NetworkPolicy"
+        and doc["metadata"]["name"].endswith("-runner-allow-egress")
+    ]
+    return {
+        (peer["ipBlock"]["cidr"], port["port"])
+        for rule in policy["spec"]["egress"]
+        for peer in rule["to"]
+        for port in rule["ports"]
+    }
+
+
 @pytest.mark.parametrize("base_url", ["", "https://api.anthropic.com"])
 def test_live_key_replaces_the_scripted_placeholder(tmp_path, base_url):
     # Negative control, the shape the live tier used before: the key in
@@ -128,8 +148,42 @@ def test_live_key_replaces_the_scripted_placeholder(tmp_path, base_url):
             "not-needed"
         }
 
-    tier = provider_tier_values(base_url=base_url, model="", credential_secret=SECRET)
+    tier = provider_tier_values(
+        base_url=base_url,
+        model="",
+        credential_secret=SECRET,
+        allowed_egress=None,
+    )
     for env in runner_envs(render(tmp_path, INSTALL, tier)):
         assert env["CURIE_CREDENTIALS"] == LIVE_KEY
         assert env.get("CURIE_MODEL_BASE_URL", "") == base_url
         assert model_key(env) == LIVE_KEY
+
+
+def test_live_tier_opens_runner_egress_to_the_model(tmp_path):
+    assert (ANTHROPIC_API_CIDR, 443) not in runner_egress(render(tmp_path, INSTALL))
+
+    egress = [STUB, *live_model_egress("", "")]
+    tier = provider_tier_values(
+        base_url="",
+        model="",
+        credential_secret=SECRET,
+        allowed_egress=egress,
+    )
+    allowed = runner_egress(render(tmp_path, INSTALL, tier))
+    assert (ANTHROPIC_API_CIDR, 443) in allowed
+    assert ("192.0.2.10/32", 18080) in allowed
+
+
+def test_live_model_egress_is_declared_never_resolved():
+    assert live_model_egress("https://api.anthropic.com/", "") == [
+        {"cidr": ANTHROPIC_API_CIDR, "ports": [{"protocol": "TCP", "port": 443}]}
+    ]
+    assert live_model_egress(
+        "http://model.example.test:8443/v1", "198.51.100.7/32, 2001:db8::/48"
+    ) == [
+        {"cidr": "198.51.100.7/32", "ports": [{"protocol": "TCP", "port": 8443}]},
+        {"cidr": "2001:db8::/48", "ports": [{"protocol": "TCP", "port": 8443}]},
+    ]
+    with pytest.raises(RuntimeError, match="WAKE_TEST_MODEL_EGRESS_CIDRS"):
+        live_model_egress("https://model.example.test", "")
