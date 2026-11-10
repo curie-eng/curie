@@ -816,7 +816,18 @@ class ClusterProof:
                     "env": model_env,
                     "envFrom": [{"secretRef": {"name": "opaque-model"}}],
                     "volumeMounts": [mounts[0], seed],
-                    "readinessProbe": {"tcpSocket": {"port": SINK_PORT}, "periodSeconds": 1},
+                    "readinessProbe": {
+                        "exec": {
+                            "command": [
+                                "python3",
+                                "-c",
+                                "import socket; "
+                                f"socket.create_connection(('127.0.0.1', {SINK_PORT}), "
+                                "timeout=1).close()",
+                            ]
+                        },
+                        "periodSeconds": 1,
+                    },
                 },
             ],
         }
