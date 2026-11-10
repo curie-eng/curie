@@ -8,6 +8,14 @@
 {{- if le $startupFailureCutoff $startupApplicationBudget -}}
 {{- fail (printf "dispatcher.apiPreflightTimeoutSeconds (%g) gives a maximum application startup envelope of %g seconds (API health budget + fresh discovery/Slack budget + the final bounded 2-second Slack call), which must be less than the startupProbe earliest failure cutoff (%g seconds = %g + (%g - 1) * %g). Raise dispatcher.startupProbe.initialDelaySeconds, dispatcher.startupProbe.periodSeconds, or dispatcher.startupProbe.failureThreshold, or lower dispatcher.apiPreflightTimeoutSeconds." $apiPreflightTimeout $startupApplicationBudget $startupFailureCutoff $startupInitialDelay $startupFailureThreshold $startupPeriod) -}}
 {{- end -}}
+{{- /* Every dispatcher replica is another Socket Mode client on the same Slack
+app token, and Slack hands each event to only one connected client, so a
+second replica splits and drops events (issue #2944). The dispatcher renders
+only when Slack credentials are configured (curie.dispatcher.enabled), so no
+supported mode needs more than one replica. */ -}}
+{{- if gt (int .Values.dispatcher.replicas) 1 -}}
+{{- fail (printf "dispatcher.replicas is %d, but the dispatcher must run as a single replica: each replica is another Slack Socket Mode client on the same app token, and Slack delivers an event to only one connected client, so extra replicas split and lose events (issue #2944). Set dispatcher.replicas to 1, or set dispatcher.deploy=false to not run a dispatcher." (int .Values.dispatcher.replicas)) -}}
+{{- end -}}
 {{/*
 The dispatcher runs Slack in Socket Mode: it dials Slack outbound over a
 websocket, so there is no inbound port and therefore no Service and no HTTP
