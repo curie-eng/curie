@@ -1039,7 +1039,7 @@ class ClusterProof:
         self.assert_hardening(spec)
         archive = io.BytesIO()
         with tarfile.open(fileobj=archive, mode="w") as tar:
-            for name in ("pytest", "_pytest", "pluggy", "iniconfig", "packaging", "pygments"):
+            for name in ("pytest", "_pytest", "pluggy", "iniconfig", "packaging", "pygments", "py"):
                 found = importlib.util.find_spec(name)
                 require(
                     found is not None and found.origin is not None,
