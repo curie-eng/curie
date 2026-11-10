@@ -769,7 +769,7 @@ class ClaudeAgentSession:
             [value for name, value in combined_env.items() if name in denied]
         )
         self._options.mcp_servers = sanitize_mcp_servers(
-            self._options.mcp_servers, combined_env, denied_names=denied,
+            self._options.mcp_servers, combined_env, denied_names=denied, inherited_env=snapshot,
         )
         if effective_auth_mode(snapshot, self._options.env) is AuthMode.PERSONAL:
             await self._connect_personal(snapshot)

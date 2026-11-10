@@ -22,6 +22,7 @@ import tarfile
 import tempfile
 import threading
 import time
+import xml.etree.ElementTree as ET
 from collections.abc import Iterator, Mapping, Sequence
 from pathlib import Path
 from typing import Any
@@ -1083,7 +1084,8 @@ class ClusterProof:
             "python3",
             "-m",
             "pytest",
-            "/app/runner/tests/test_personal_token_containment.py::test_native_personal_token_containment",
+            "/app/runner/tests/test_personal_token_containment.py",
+            "--junitxml=/tmp/custody-results.xml",
             "-q",
             "-o",
             "addopts=",
@@ -1092,14 +1094,40 @@ class ClusterProof:
             timeout=600,
         )
         require(
-            bool(re.search(rb"\b28 passed\b", output)),
-            "candidate did not pass every native containment case",
-        )
-        require(
             not re.search(rb"\b(?:skipped|xfailed|xpassed)\b", output),
             "candidate containment corpus omitted a required case",
         )
-        self.evidence["synthetic"] = {"passed": 28, "required": 28, "candidate_image": True}
+        report = ET.fromstring(self.exec(pod, "cat", "/tmp/custody-results.xml"))
+        cases = list(report.iter("testcase"))
+        require(
+            all(
+                child.tag not in {"failure", "error", "skipped"}
+                for case in cases for child in case
+            ),
+            "candidate custody suite reported a failure, error or skipped case",
+        )
+        native = [
+            case for case in cases
+            if case.get("name", "").startswith("test_native_personal_token_containment[")
+        ]
+        require(len(native) == 28, "candidate did not execute every native containment case")
+        required_tests = (
+            "test_stdio_configuration_is_scrubbed_at_actual_sdk_cli_boundary",
+            "test_remote_mcp_credentials_are_refused_before_sdk_serialization",
+            "test_remote_mcp_probe_refuses_credentials_before_network_effects",
+            "test_remote_mcp_public_connector_is_live_through_probe_and_native_cli",
+            "test_tokenless_service_flag_preserves_digits_and_public_child_values",
+            "test_redaction_through_native_cli_http_aci_and_exported_spans",
+        )
+        for name in required_tests:
+            require(
+                any(case.get("name", "").split("[", 1)[0] == name for case in cases),
+                "candidate custody suite omitted a required regression or liveness control",
+            )
+        self.evidence["synthetic"] = {
+            "passed": 28, "required": 28, "candidate_image": True,
+            "all_custody_cases_passed": len(cases), "review_regressions_observed": True,
+        }
 
     def refusal(self) -> None:
         __tracebackhide__ = True

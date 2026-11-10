@@ -114,6 +114,29 @@ def test_shell_and_hook_env_also_drops_the_model_key() -> None:
     assert "cct.example-caller" not in rendered
 
 
+@pytest.mark.parametrize("name", ("CURIE_STATE_TOKEN1", "CURIE_STATE_TOKEN_1"))
+def test_indexed_credentials_leave_public_digit_values_usable(name: str) -> None:
+    child = shell_and_hook_env(
+        {
+            name: "indexed-platform-credential-placeholder",
+            "CURIE_RUNNER_ALLOW_TOKENLESS": "1",
+            "ACME_PUBLIC_VALUE": "public/v1",
+        }
+    )
+    observed = subprocess.run(
+        [sys.executable, "-c", "import json,os; print(json.dumps(dict(os.environ)))"],
+        env=child,
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    payload = json.loads(observed.stdout)
+    assert payload["ACME_PUBLIC_VALUE"] == "public/v1"
+    assert name not in payload
+    exposed = "indexed-platform-credential-placeholder" in observed.stdout
+    assert not exposed
+
+
 def test_bash_prelude_unsets_platform_credentials_before_the_command() -> None:
     assert BASH_CREDENTIAL_PRELUDE.is_file()
     env = os.environ.copy()

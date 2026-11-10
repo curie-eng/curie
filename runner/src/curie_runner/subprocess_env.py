@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import ctypes
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -94,26 +95,37 @@ CLI_PARENT_MODEL_KEYS = frozenset(
 )
 
 
+_PLATFORM_TOKEN_NAME = re.compile(r"(?:^|_)TOKENS?(?:_|[0-9]|$)")
+
+
+def model_credential_names(source: Mapping[str, str]) -> frozenset[str]:
+    """Model credentials, including the installation's declared targets."""
+
+    names = set(CLI_PARENT_MODEL_KEYS) | {CREDENTIALS_ENV}
+    try:
+        names.update(resolve_credential_env_keys(dict(source)))
+    except (InvalidEnvKeyError, ValueError):
+        pass
+    return frozenset(names)
+
+
 def platform_credential_names(source: Mapping[str, str]) -> frozenset[str]:
     """Env names a shell or hook must not receive.
 
-    ``CURIE_*TOKEN*`` covers runner, state, memory, history, progress, and
+    Token name components cover runner, state, memory, history, progress, and
     caller tokens, including indexed names. The upload credential file path
     stays available to bundle clients. Model credential variables and
     any name ``CURIE_MODEL_ENV_KEY`` points at are included too.
     """
 
-    names: set[str] = set(CLI_PARENT_MODEL_KEYS)
-    names.add(CREDENTIALS_ENV)
+    names = set(model_credential_names(source))
     names.update(
         key
         for key in source
-        if key.startswith("CURIE_") and "TOKEN" in key and key != UPLOAD_TOKENS_FILE_ENV
+        if key.startswith("CURIE_")
+        and _PLATFORM_TOKEN_NAME.search(key)
+        and key != UPLOAD_TOKENS_FILE_ENV
     )
-    try:
-        names.update(resolve_credential_env_keys(dict(source)))
-    except (InvalidEnvKeyError, ValueError):
-        pass
     return frozenset(names)
 
 

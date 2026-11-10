@@ -31,7 +31,12 @@ from curie_runner.adapter import ClaudeAgentSession
 from curie_runner.config import RunnerConfig
 from curie_runner.hooks import _merge_pre_tool_use_hooks, load_bundle_hooks
 from curie_runner.mcp_stdio import UnsafeStdioConfiguration
-from curie_runner.mcp_tool_capability import server_streams
+from curie_runner.mcp_tool_capability import (
+    ConnectorCapabilityFailure,
+    probe_mcp_tool_capability,
+    reprobe_connector_failures,
+    server_streams,
+)
 from curie_runner.otel import RunTracer, build_tracer_provider
 from curie_runner.plugin import bundle_mcp_servers
 from curie_runner.redact import OutboundRedactor, collect_held_secrets
@@ -47,9 +52,12 @@ from personal_auth_support import (
     IMPLEMENTER_MODEL,
     OWNER_GRANT,
     REVIEWER_MODEL,
+    SERVICE_API_KEY,
     TURN_TIMEOUT_S,
     ErrorReply,
+    RecordedRequest,
     TextReply,
+    ToolCall,
     assert_owner_grant_only,
     installed,
     wire_session,
@@ -306,6 +314,9 @@ _UNSAFE_STDIO = (
     "args-literal",
     "declared-model-target",
     "nested-reference",
+    "extra-reference",
+    "extra-literal",
+    "extra-key-reference",
 )
 
 
@@ -329,6 +340,12 @@ def _unsafe_stdio(kind: str) -> dict[str, object]:
         entry["env"] = {"CURIE_MODEL_ENV_KEY": "ACME_PROVIDER", "ACME_PROVIDER": "replacement"}
     elif kind == "nested-reference":
         entry["args"] = ["${ACME_MISSING:-${CLAUDE_CODE_OAUTH_TOKEN}}"]
+    elif kind == "extra-reference":
+        entry["note"] = {"nested": ["${CLAUDE_CODE_OAUTH_TOKEN}"]}
+    elif kind == "extra-literal":
+        entry["note"] = {"nested": [OWNER_GRANT]}
+    elif kind == "extra-key-reference":
+        entry["note"] = {"${CLAUDE_CODE_OAUTH_TOKEN}": "public"}
     else:
         raise ValueError(kind)
     return entry
@@ -411,6 +428,306 @@ def test_stdio_sdk_env_cannot_hide_an_inherited_model_credential_declaration(
         with pytest.raises(UnsafeStdioConfiguration):
             anyio.run(scenario)
         assert installation.proxy.all_requests() == []
+
+
+def _remote_control_app(observed: list[dict[str, str]]) -> web.Application:
+    async def handle(request: web.Request) -> web.Response:
+        observed.append({"path": request.raw_path, **dict(request.headers)})
+        if request.method != "POST":
+            return web.Response(status=405)
+        message = await request.json()
+        if "id" not in message:
+            return web.Response(status=202)
+        method = message["method"]
+        # MCP initialization and tools shapes: https://modelcontextprotocol.io/specification/2025-11-25
+        if method == "initialize":
+            result: dict[str, object] = {
+                "protocolVersion": message["params"]["protocolVersion"],
+                "capabilities": {"tools": {}},
+                "serverInfo": {"name": "public-control", "version": "1"},
+            }
+        elif method == "tools/list":
+            result = {
+                "tools": [
+                    {
+                        "name": "read_public",
+                        "description": "Read the public marker",
+                        "inputSchema": {"type": "object", "properties": {}},
+                        "annotations": {"readOnlyHint": True},
+                    }
+                ]
+            }
+        elif method == "tools/call":
+            if request.headers.get("X-Acme-Connector") != CONNECTOR_VALUE:
+                return web.Response(status=403)
+            result = {"content": [{"type": "text", "text": PUBLIC_MARKER}], "isError": False}
+        else:
+            result = {}
+        return web.json_response({"jsonrpc": "2.0", "id": message["id"], "result": result})
+
+    app = web.Application()
+    app.router.add_route("*", "/{tail:.*}", handle)
+    return app
+
+
+def _remote_entry(url: str, kind: str = "permitted", transport: str = "http") -> dict[str, object]:
+    entry: dict[str, object] = {
+        "type": transport,
+        "url": url,
+        "headers": {"X-Acme-Connector": "${ACME_CONNECTOR_SECRET}"},
+    }
+    if kind == "header-reference":
+        entry["headers"] = {"X-Probe": "${CLAUDE_CODE_OAUTH_TOKEN}"}
+    elif kind == "header-literal":
+        entry["headers"] = {"X-Probe": OWNER_GRANT}
+    elif kind == "url-reference":
+        entry["url"] = url + "/${CLAUDE_CODE_OAUTH_TOKEN}"
+    elif kind == "url-literal":
+        entry["url"] = url + "/" + OWNER_GRANT
+    elif kind == "extra-literal":
+        entry["note"] = {"nested": [OWNER_GRANT]}
+    elif kind == "alias-reference":
+        entry["headers"] = {"X-Probe": "${ACME_MODEL_ALIAS}"}
+    elif kind != "permitted":
+        raise ValueError(kind)
+    return entry
+
+
+@pytest.mark.parametrize("source", ("bundle", "direct", "file"))
+@pytest.mark.parametrize(
+    "kind",
+    (
+        "header-reference",
+        "header-literal",
+        "url-reference",
+        "url-literal",
+        "extra-literal",
+        "alias-reference",
+    ),
+)
+def test_remote_mcp_credentials_are_refused_before_sdk_serialization(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    source: str,
+    kind: str,
+) -> None:
+    with installed(tmp_path, monkeypatch) as installation:
+        monkeypatch.setenv("CURIE_MODEL_AUTH_MODE", "personal")
+        monkeypatch.setenv("CLAUDE_CODE_OAUTH_TOKEN", OWNER_GRANT)
+        monkeypatch.setenv("ACME_MODEL_ALIAS", OWNER_GRANT)
+        monkeypatch.setenv("NO_PROXY", "127.0.0.1,localhost")
+        observed: list[dict[str, str]] = []
+
+        async def scenario() -> None:
+            async with TestServer(_remote_control_app(observed)) as server:
+                entry = _remote_entry(str(server.make_url("/mcp")), kind)
+                if source == "bundle":
+                    root = installation.workspace / "bundle"
+                    write_json(
+                        root / ".claude-plugin/plugin.json",
+                        {
+                            "name": "remote-control",
+                            "mcpServers": {"probe": entry},
+                        },
+                    )
+                    bundle_mcp_servers(str(root))
+                    return
+                servers: object = {"probe": entry}
+                if source == "file":
+                    servers = write_json(
+                        installation.workspace / "servers.json", {"mcpServers": servers}
+                    )
+                session = ClaudeAgentSession(_direct_options(installation.workspace, servers))
+                try:
+                    with anyio.fail_after(TURN_TIMEOUT_S):
+                        await session.connect()
+                finally:
+                    await session.close()
+
+        with pytest.raises(UnsafeStdioConfiguration):
+            anyio.run(scenario)
+        transport_opened = bool(observed)
+        assert not transport_opened, "unsafe MCP configuration reached the remote transport"
+        assert not installation.proxy.all_requests()
+
+
+@pytest.mark.parametrize("consumer", ("bundle", "derived", "reprobe"))
+@pytest.mark.parametrize("transport", ("http", "sse"))
+@pytest.mark.parametrize(
+    "kind", ("header-reference", "header-literal", "url-reference", "url-literal")
+)
+def test_remote_mcp_probe_refuses_credentials_before_network_effects(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    consumer: str,
+    transport: str,
+    kind: str,
+) -> None:
+    monkeypatch.setenv("CURIE_MODEL_AUTH_MODE", "personal")
+    monkeypatch.setenv("CLAUDE_CODE_OAUTH_TOKEN", OWNER_GRANT)
+    monkeypatch.setenv("NO_PROXY", "127.0.0.1,localhost")
+    observed: list[dict[str, str]] = []
+
+    async def scenario() -> None:
+        async with TestServer(_remote_control_app(observed)) as server:
+            entry = _remote_entry(str(server.make_url("/mcp")), kind, transport)
+            if consumer == "bundle":
+                root = tmp_path / "bundle"
+                write_json(
+                    root / ".claude-plugin/plugin.json",
+                    {
+                        "name": "remote-control",
+                        "mcpServers": {"probe": entry},
+                    },
+                )
+                result = await probe_mcp_tool_capability(root, {})
+                assert not result.complete and result.tool_count == 0
+            elif consumer == "derived":
+                result = await probe_mcp_tool_capability(None, {"probe": entry})
+                assert not result.complete and result.tool_count == 0
+            else:
+                failure = ConnectorCapabilityFailure(
+                    connector="probe",
+                    credential_names=(),
+                    reason="probe_failed",
+                )
+                assert await reprobe_connector_failures((failure,), {"probe": entry}) == (failure,)
+
+    anyio.run(scenario)
+    transport_opened = bool(observed)
+    assert not transport_opened, "capability probing sent a request carrying a credential"
+
+
+@pytest.mark.parametrize("source", ("bundle", "direct"))
+def test_remote_mcp_public_connector_is_live_through_probe_and_native_cli(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    native_prerequisites: str,
+    source: str,
+) -> None:
+    responder = ContainmentResponder()
+    with installed(tmp_path, monkeypatch, responder) as installation:
+        monkeypatch.setenv("CURIE_MODEL_AUTH_MODE", "personal")
+        monkeypatch.setenv("CLAUDE_CODE_OAUTH_TOKEN", OWNER_GRANT)
+        monkeypatch.setenv("CURIE_PROC_DUMPABLE_PRELOAD", native_prerequisites)
+        monkeypatch.setenv("ACME_CONNECTOR_SECRET", CONNECTOR_VALUE)
+        monkeypatch.setenv("NO_PROXY", "127.0.0.1,localhost")
+        observed: list[dict[str, str]] = []
+
+        async def scenario() -> None:
+            async with TestServer(_remote_control_app(observed)) as server:
+                entry = _remote_entry(str(server.make_url("/mcp")))
+                key = "probe"
+                if source == "bundle":
+                    root = installation.workspace / "bundle"
+                    write_json(
+                        root / ".claude-plugin/plugin.json",
+                        {
+                            "name": "remote-control",
+                            "mcpServers": {key: entry},
+                        },
+                    )
+                    result = await probe_mcp_tool_capability(root, {})
+                    servers = bundle_mcp_servers(str(root))
+                    key = "plugin:remote-control:probe"
+                else:
+                    result = await probe_mcp_tool_capability(None, {key: entry})
+                    servers = {key: entry}
+                assert result.complete and result.tool_count == 1
+                failure = ConnectorCapabilityFailure(
+                    connector="probe",
+                    credential_names=(),
+                    reason="probe_failed",
+                )
+                assert not await reprobe_connector_failures((failure,), {"probe": entry})
+                session = ClaudeAgentSession(_direct_options(installation.workspace, servers))
+                responder.calls = [(f"mcp__{key.replace(':', '_')}__read_public", {})]
+                try:
+                    with anyio.fail_after(TURN_TIMEOUT_S):
+                        await session.connect()
+                        await session.query("Read the independent public marker.")
+                        async for _message in session.receive_turn():
+                            pass
+                finally:
+                    await session.close()
+
+        anyio.run(scenario)
+        assert PUBLIC_MARKER in "\n".join(responder.raw_results)
+        assert any(item.get("X-Acme-Connector") == CONNECTOR_VALUE for item in observed)
+        assert not any(OWNER_GRANT in json.dumps(item) for item in observed)
+        assert_owner_grant_only(installation.proxy)
+
+
+def test_tokenless_service_flag_preserves_digits_and_public_child_values(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    native_prerequisites: str,
+) -> None:
+    public = "10+1=11 public/v1"
+    results: list[str] = []
+    issued = False
+
+    def respond(request: RecordedRequest) -> TextReply | ToolCall:
+        nonlocal issued
+        results.append(request.tool_result_text())
+        if not issued:
+            issued = True
+            return ToolCall(
+                "Bash", {"command": "printf '%s' \"$ACME_PUBLIC_VALUE\""}, "toolu_public"
+            )
+        return TextReply(public)
+
+    with installed(tmp_path, monkeypatch, respond) as installation:
+        monkeypatch.setenv("CURIE_MODEL_AUTH_MODE", "service")
+        monkeypatch.setenv("ANTHROPIC_API_KEY", SERVICE_API_KEY)
+        monkeypatch.setenv("CURIE_RUNNER_ALLOW_TOKENLESS", "1")
+        monkeypatch.setenv("ACME_PUBLIC_VALUE", public)
+        monkeypatch.setenv("CURIE_PROC_DUMPABLE_PRELOAD", native_prerequisites)
+        wiring = wire_session(installation)
+        session = ClaudeAgentSession(wiring.options)
+        capture = io.StringIO()
+        handler = logging.StreamHandler(capture)
+        handler.addFilter(RedactingLogFilter())
+        record = logging.LogRecord("public-control", logging.INFO, __file__, 1, public, (), None)
+        handler.handle(record)
+        assert capture.getvalue().strip() == public
+
+        async def scenario() -> str:
+            runner = SessionRunner(
+                held_secrets=frozenset(),
+                session_factory=lambda: session,
+                ceiling=0,
+                max_usd_per_day=None,
+                tracer=RunTracer(None),
+                classifier=SideEffectClassifier(),
+                trace_name="curie-run:service-control",
+                session_id="session-PLACEHOLDER",
+                model=wiring.options.model,
+                tool_access=wiring.access,
+            )
+            try:
+                with anyio.fail_after(TURN_TIMEOUT_S):
+                    async with TestClient(TestServer(create_app(runner))) as client:
+                        response = await client.post(
+                            "/v1/event",
+                            json=Event(
+                                type="message",
+                                text="Read the public child value.",
+                                user="U0EXAMPLE1",
+                                ts="1",
+                            ).model_dump(mode="json"),
+                        )
+                        assert response.status == 200
+                        return await response.text()
+            finally:
+                await runner.close()
+
+        raw = anyio.run(scenario)
+        assert public in raw
+        assert public in "\n".join(results)
+        assert any(
+            request.api_key == "service api key" for request in installation.proxy.model_requests()
+        )
 
 
 _OPAQUE_GRANT = "custody-opaque-synthetic-value-000000???"

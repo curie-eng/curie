@@ -1,4 +1,4 @@
-"""Resolve stdio declarations before they reach any process launcher."""
+"""Validate MCP declarations before configuration or transport delivery."""
 
 from __future__ import annotations
 
@@ -10,14 +10,44 @@ from typing import Any
 
 from curie_telemetry.redact import held_secret_literals
 
-from .subprocess_env import platform_credential_names, shell_and_hook_env
+from .subprocess_env import (
+    model_credential_names,
+    platform_credential_names,
+    shell_and_hook_env,
+)
 
 _REFERENCE = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)(?::-([^}]*))?\}")
 _REFERENCE_NAME = re.compile(r"\$(?:\{)?([A-Za-z_][A-Za-z0-9_]*)")
 
 
 class UnsafeStdioConfiguration(ValueError):
-    """A stdio declaration tries to carry a model or platform credential."""
+    """An MCP declaration tries to carry a protected credential."""
+
+
+def _refuse_credentials(
+    value: Any,
+    denied: Collection[str],
+    held: Collection[str],
+    source_env: Mapping[str, str],
+) -> None:
+    if isinstance(value, str):
+        expanded = _REFERENCE.sub(
+            lambda match: source_env.get(match.group(1))
+            or (match.group(2) if match.group(2) is not None else match.group(0)),
+            value,
+        )
+        for text in (value, expanded):
+            if any(secret in text for secret in held):
+                raise UnsafeStdioConfiguration("MCP configuration contains a held credential")
+            if any(name in denied for name in _REFERENCE_NAME.findall(text)):
+                raise UnsafeStdioConfiguration("MCP configuration references a credential")
+    elif isinstance(value, Mapping):
+        for key, item in value.items():
+            _refuse_credentials(key, denied, held, source_env)
+            _refuse_credentials(item, denied, held, source_env)
+    elif isinstance(value, (list, tuple)):
+        for item in value:
+            _refuse_credentials(item, denied, held, source_env)
 
 
 def sanitize_stdio_server(
@@ -26,13 +56,14 @@ def sanitize_stdio_server(
     *,
     plugin_dir: Path | None = None,
     denied_names: Collection[str] = (),
+    held_values: Collection[str] = (),
 ) -> dict[str, Any]:
     """Materialize permitted references from a scrubbed source, with explicit env."""
 
     result = dict(entry)
     command = result.get("command")
     if not isinstance(command, str):
-        return result
+        raise UnsafeStdioConfiguration("stdio command must be a string")
     raw_env = result.get("env", {})
     if not isinstance(raw_env, Mapping) or not all(
         isinstance(key, str) and isinstance(value, str) for key, value in raw_env.items()
@@ -46,7 +77,9 @@ def sanitize_stdio_server(
     )
     held = held_secret_literals(
         [value for name, value in source_env.items() if name in denied and value]
+        + list(held_values)
     )
+    _refuse_credentials(entry, denied, held, source_env)
     interpolation = {
         name: value
         for name, value in shell_and_hook_env(source_env).items()
@@ -98,6 +131,8 @@ def sanitize_mcp_servers(
     source_env: Mapping[str, str],
     *,
     denied_names: Collection[str] = (),
+    inherited_env: Mapping[str, str] | None = None,
+    plugin_dir: Path | None = None,
 ) -> dict[str, Any]:
     if isinstance(servers, (str, Path)):
         try:
@@ -116,9 +151,21 @@ def sanitize_mcp_servers(
         servers = decoded.get("mcpServers", decoded)
         if not isinstance(servers, dict):
             raise UnsafeStdioConfiguration("MCP servers must be an object")
+    sources = (source_env, inherited_env or {})
+    model_names = frozenset().union(*(model_credential_names(env) for env in sources))
+    model_values = {
+        value for env in sources for name, value in env.items() if name in model_names and value
+    }
+    _refuse_credentials(servers, model_names, held_secret_literals(model_values), source_env)
     return {
-        name: sanitize_stdio_server(entry, source_env, denied_names=denied_names)
-        if isinstance(entry, Mapping)
+        name: sanitize_stdio_server(
+            entry,
+            source_env,
+            denied_names=denied_names,
+            held_values=model_values,
+            plugin_dir=plugin_dir,
+        )
+        if isinstance(entry, Mapping) and ("command" in entry or entry.get("type") == "stdio")
         else entry
         for name, entry in servers.items()
     }
