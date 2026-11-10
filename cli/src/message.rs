@@ -578,6 +578,40 @@ pub(crate) const CLUSTER_MESSAGE_RELAY_ADAPTER: &str = "curie-cluster-message";
 const CLUSTER_EVAL_RELAY_TIMEOUT: &str =
     "the cluster message relay did not deliver a reply before the deadline";
 
+/// The failure class the worker writes on the cluster message relay when it
+/// refuses a turn that carries no HTTP identity (HTTP-INVOCATION-EXECUTION-31,
+/// #5518). Frozen with the worker in `tests/vectors/turn-failure-reply.json`.
+const IDENTITY_REFUSED_FAILURE_CLASS: &str = "identity-refused";
+
+/// The error that ends a cluster eval when the worker refused a case for lack
+/// of an HTTP identity, or `None` for any outcome that is graded as usual.
+///
+/// A cluster eval turn is enqueued with no HTTP identity, so on a binding that
+/// requires one the worker refuses every case the same way. Grading the rest
+/// would only repeat that refusal, so the suite stops with the reason and the
+/// tiers that can evaluate the bundle instead (#5518).
+fn identity_refusal_stop(outcome: &Outcome, channel: &str) -> Option<anyhow::Error> {
+    match outcome {
+        Outcome::Failed { class, .. } if class == IDENTITY_REFUSED_FAILURE_CLASS => {
+            Some(anyhow::Error::from(
+                crate::exit::CliError::failure(format!(
+                    "cluster eval cannot reach the binding on channel {channel}: the worker \
+                     refused the turn because the binding requires a verified HTTP identity, \
+                     and cluster eval turns carry none"
+                ))
+                .with_fix(
+                    "evaluate the bundle where no HTTP identity is required: `curie skill up` \
+                     then `curie skill eval` in the bundle directory, or `curie local eval` \
+                     against a local stack; or deploy it to the cluster as a separate eval \
+                     agent whose binding is not on the HTTP identity lane and run \
+                     `curie cluster eval --agent <that agent>`",
+                ),
+            ))
+        }
+        _ => None,
+    }
+}
+
 /// The kubectl read behind `dispatcher_connected_strict`, extracted pure so the
 /// Deployment NAME is unit-testable without a cluster (#1533).
 ///
@@ -4089,6 +4123,11 @@ async fn run_eval_turns(
                 // path so a three-case suite run twice cannot pin eight
                 // curie-thread-* claims against the default ResourceQuota (#1534).
                 queue_thread_reset(conn, &thread_key).await?;
+                // A refused case means every case on this binding is refused:
+                // stop with the reason rather than grade the rest (#5518).
+                if let Some(stop) = identity_refusal_stop(&outcome, channel) {
+                    return Err(stop);
+                }
                 let elapsed = started.elapsed().as_secs_f64();
                 let output = match &outcome {
                     Outcome::Replied(reply) | Outcome::Failed { reply, .. } => reply.clone(),
@@ -8925,6 +8964,167 @@ mod tests {
         }
     }
 
+    /// The two events the worker writes on the relay when it refuses a turn
+    /// that carries no HTTP identity (HTTP-INVOCATION-EXECUTION-31, #5518).
+    fn identity_refusal_page() -> Vec<ClusterMessageReplyEvent> {
+        vec![
+            relay_event(
+                "reply.update",
+                Some(
+                    "curie-turn-failure: identity-refused\n\nThe worker refused this turn \
+                     before running it.",
+                ),
+                None,
+            ),
+            relay_event("turn.completed", None, Some("dropped")),
+        ]
+    }
+
+    /// #5518: the worker's refusal pair is a failed turn carrying its class,
+    /// not a reply the grader could match and not a reason to keep polling.
+    #[test]
+    fn an_identity_refusal_on_the_relay_is_a_failed_turn_with_its_class() {
+        let mut latest = None;
+        let outcome =
+            cluster_relay_page_outcome(&identity_refusal_page(), true, &mut latest, &mut |_| {})
+                .expect("refusal classification")
+                .expect("a refusal is terminal");
+        match outcome {
+            Outcome::Failed { class, .. } => assert_eq!(class, IDENTITY_REFUSED_FAILURE_CLASS),
+            other => panic!("expected Failed, got {other:?}"),
+        }
+    }
+
+    /// #5518: only the identity refusal class stops a suite; any other outcome,
+    /// another failure class included, is graded as before.
+    #[test]
+    fn only_an_identity_refusal_stops_a_cluster_eval() {
+        let refused = Outcome::Failed {
+            class: IDENTITY_REFUSED_FAILURE_CLASS.to_string(),
+            reply: "curie-turn-failure: identity-refused".to_string(),
+        };
+        let err = identity_refusal_stop(&refused, "C0EXAMPLE1").expect("a refusal stops the eval");
+        let cli = err
+            .downcast_ref::<crate::exit::CliError>()
+            .expect("a structured CLI error");
+        assert!(matches!(cli.class, crate::exit::ExitClass::Failure));
+        assert!(cli.message.contains("C0EXAMPLE1"), "{}", cli.message);
+        assert!(cli.message.contains("HTTP identity"), "{}", cli.message);
+        let fix = cli.fix.as_deref().expect("a fix");
+        assert!(
+            fix.contains("curie skill eval") && fix.contains("curie local eval"),
+            "{fix}"
+        );
+        assert!(
+            !looks_like_enqueue_timeout(&err),
+            "the stop must not be rewritten as an enqueue timeout"
+        );
+
+        let other_failure = Outcome::Failed {
+            class: "max-turns".to_string(),
+            reply: "curie-turn-failure: max-turns".to_string(),
+        };
+        for outcome in [
+            other_failure,
+            Outcome::Replied("pong".to_string()),
+            Outcome::CompletedNoEdit,
+            Outcome::TimedOut,
+        ] {
+            assert!(
+                identity_refusal_stop(&outcome, "C0EXAMPLE1").is_none(),
+                "{outcome:?} must be graded, not stop the suite"
+            );
+        }
+    }
+
+    /// #5518, through the real eval loop: a real Valkey stream and a stand-in
+    /// API whose relay answers every bucket with the worker's refusal pair. The
+    /// suite stops after its first case with the structured error, instead of
+    /// enqueueing every case and waiting out each one's deadline.
+    #[tokio::test]
+    async fn cluster_eval_stops_at_the_first_identity_refusal() {
+        let url = std::env::var("TEST_VALKEY_URL")
+            .unwrap_or_else(|_| "redis://:valkeypass@localhost:26379".to_string());
+        let mut conn = match connect(&url).await {
+            Ok(conn) => conn,
+            Err(err) => {
+                if std::env::var_os("CI_REQUIRE_VALKEY_TESTS").is_some() {
+                    panic!("required Valkey is not reachable at {url}: {err}");
+                }
+                eprintln!("skipping: Valkey not reachable at {url}: {err}");
+                return;
+            }
+        };
+        const PAGE: &str = r#"{"events":[{"event":"reply.update","text":"curie-turn-failure: identity-refused\n\nThe worker refused this turn before running it."},{"event":"turn.completed","outcome":"dropped"}],"next_cursor":2,"terminal":true}"#;
+        let api = ApiClient::new(&hint_stub_api(200, PAGE).await, HINT_API_KEY).expect("client");
+        let stream = format!("curie:test:eval-identity-refusal:{}", uuid::Uuid::new_v4());
+        let mut opts = eval_opts(false, Some("C0EXAMPLE1"));
+        opts.dry_run = false;
+        opts.stream = stream.clone();
+        opts.timeout_secs = 30;
+        let mut second = eval_case(GraderKind::Contains, "pong");
+        second.id = "c2".into();
+        let suite = EvalSuite {
+            name: "identity-refusal".into(),
+            cases: vec![eval_case(GraderKind::Contains, "pong"), second],
+        };
+
+        let started = Instant::now();
+        let result = run_eval_turns(
+            &opts,
+            "C0EXAMPLE1",
+            None,
+            &suite,
+            &mut conn,
+            EvalReplyTransport::Relay(&api),
+        )
+        .await;
+
+        let enqueued: Vec<(String, std::collections::HashMap<String, String>)> =
+            redis::cmd("XRANGE")
+                .arg(&stream)
+                .arg("-")
+                .arg("+")
+                .query_async(&mut conn)
+                .await
+                .expect("XRANGE");
+        let mut released = Vec::new();
+        for (_, fields) in &enqueued {
+            let turn: QueuedTurn =
+                serde_json::from_str(&fields[curie_aci_protocol::STREAM_PAYLOAD_FIELD])
+                    .expect("turn");
+            released.push(thread_key_for_turn(&turn));
+        }
+        let _: i64 = redis::cmd("DEL")
+            .arg(&stream)
+            .query_async(&mut conn)
+            .await
+            .expect("DEL");
+        for key in &released {
+            let _: i64 = redis::cmd("SREM")
+                .arg(crate::queue::THREAD_RESET_SET)
+                .arg(key)
+                .query_async(&mut conn)
+                .await
+                .expect("SREM");
+        }
+
+        let err = match result {
+            Ok(report) => panic!("the suite ran to the end: {:?}", report.rows),
+            Err(err) => err,
+        };
+        let cli = err
+            .downcast_ref::<crate::exit::CliError>()
+            .unwrap_or_else(|| panic!("not a structured CLI error: {err:#}"));
+        assert!(cli.message.contains("HTTP identity"), "{}", cli.message);
+        assert_eq!(enqueued.len(), 1, "only the first case may be enqueued");
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "the refusal must end the wait, not the deadline: {:?}",
+            started.elapsed()
+        );
+    }
+
     #[test]
     fn cluster_relay_page_keeps_waiting_on_card_post_without_result() {
         let mut latest = None;
@@ -9034,6 +9234,7 @@ mod tests {
         let allowed = [
             "comment",
             "reply_prefix",
+            "identity_refused_class",
             "factory_class_line_prefix",
             "examples",
         ];
@@ -9046,6 +9247,10 @@ mod tests {
         assert!(unknown.is_empty(), "unknown vector keys: {unknown:?}");
         let prefix = vector["reply_prefix"].as_str().expect("reply_prefix");
         assert_eq!(prefix, crate::chat::TURN_FAILURE_REPLY_PREFIX);
+        assert_eq!(
+            vector["identity_refused_class"].as_str(),
+            Some(IDENTITY_REFUSED_FAILURE_CLASS)
+        );
         for example in vector["examples"].as_array().expect("examples") {
             let line = example["reply_first_line"].as_str().expect("line");
             let class = example["classification"].as_str().expect("class");

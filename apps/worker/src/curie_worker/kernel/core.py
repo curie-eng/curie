@@ -370,6 +370,7 @@ class Kernel:
     _adopt_ref = routing._adopt_ref
     _reply_for = routing._reply_for
     _drop_with_message = routing._drop_with_message
+    _settle_relay_after_refusal = routing._settle_relay_after_refusal
     _drop_ambiguous_route = routing._drop_ambiguous_route
     _drop_sibling_turn = routing._drop_sibling_turn
     _reply = routing._reply

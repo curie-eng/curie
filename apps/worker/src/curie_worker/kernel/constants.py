@@ -348,6 +348,19 @@ _RUNNER_DEFAULT_MAX_TURNS = 20
 # model sentence cannot satisfy the parser by mentioning the prefix.
 TURN_FAILURE_REPLY_PREFIX = "curie-turn-failure:"
 
+# The failure class a refused cluster message or cluster eval turn reports on
+# its relay (HTTP-INVOCATION-EXECUTION-31, #5518). Frozen with the CLI reader in
+# tests/vectors/turn-failure-reply.json.
+IDENTITY_REFUSED_FAILURE_CLASS = "identity-refused"
+
+# The relay text under that class. It names no person and no identity: only
+# that the binding needs a verified HTTP identity that this turn lacks.
+IDENTITY_REFUSED_RELAY_NOTICE = (
+    "The worker refused this turn before running it: its binding requires a "
+    "verified HTTP identity, and a cluster message or cluster eval turn carries "
+    "none."
+)
+
 # The floor of remaining DELIVERY budget below which a fresh attempt is not
 # started (ADR-0131). The runner cannot claim a sandbox, open a turn and stream a
 # final in a couple of seconds, so an attempt started under this floor is
