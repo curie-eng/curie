@@ -49,31 +49,32 @@ SELECTOR = re.compile(
     r"|runner/tests/(?:[A-Za-z0-9_-]+/)*[A-Za-z0-9_-]+\.py::"
     r"(?:[A-Za-z_][A-Za-z0-9_]*::)*"
     r"test[A-Za-z0-9_]*(?:\[[A-Za-z0-9_.-]+\])?"
+    r"|tools/factory-e2e/tests/(?:[A-Za-z0-9_-]+/)*[A-Za-z0-9_-]+\.py::"
+    r"(?:[A-Za-z_][A-Za-z0-9_]*::)*"
+    r"test[A-Za-z0-9_]*(?:\[[A-Za-z0-9_.-]+\])?"
     r"|cli/tests/local/test_[A-Za-z0-9_-]+\.py::"
     r"(?:[A-Za-z_][A-Za-z0-9_]*::)*"
     r"test[A-Za-z0-9_]*(?:\[[A-Za-z0-9_.-]+\])?"
     r"|cli/tests/[A-Za-z0-9_-]+\.rs::[A-Za-z_][A-Za-z0-9_]*"
-    r"|charts/curie/ci/[A-Za-z0-9_-]+\.sh"
+    r"|charts/curie/ci/(?:[A-Za-z0-9_-]+/)*[A-Za-z0-9_-]+\.sh"
     r")"
 )
-BUG_LABEL = "bug"
-# Discovery surfaces and pin tiers share this order. A pin whose location maps
-# below the closed issue's found:* label fails unless the body also carries
-# `Fix pin waiver: <reason>`. Location, not prose, decides the pin tier:
-# cli/tests/local/test_*.py -> local, */test_live.py -> live,
-# charts/curie/ci/* -> cluster, everything else that the selector grammar
-# admits -> unit.
-TIERS = ("unit", "local", "cluster", "live")
-TIER_RANK = {name: index for index, name in enumerate(TIERS)}
-FOUND_LABELS = {f"found:{name}": name for name in TIERS}
-# GitHub issue forms render the required dropdown as a heading plus the
-# selected option. Scan only that section so a narrative "not found:live" in
-# the reproduction notes cannot raise the floor.
-DISCOVERY_FIELD = re.compile(
-    r"^### Discovery surface[ \t]*\r?\n+(?:[ \t]*\r?\n)*found:(?P<tier>unit|local|cluster|live)\b",
-    re.MULTILINE,
+FACTORY_UPGRADE_MODULE = "tools/factory-e2e/tests/test_c4_upgrade_migration.py"
+HELD_CANCELLATION_MODULE = "tools/factory-e2e/tests/test_c4_held_cancellation.py"
+FORGE_INSTANCES_MODULE = "tools/factory-e2e/tests/test_c4_forge_instances.py"
+# Pins in these modules run against an owned kind cluster, not the dev stack.
+KIND_MODULES = frozenset(
+    {
+        "charts/curie/ci/notes-release-target-assertions.sh",
+        "tools/factory-e2e/tests/test_c4_initial_binding.py",
+        "tools/factory-e2e/tests/test_c4_admitted_agent.py",
+        "tools/factory-e2e/tests/test_c4_static_token_rotation.py",
+        FACTORY_UPGRADE_MODULE,
+        HELD_CANCELLATION_MODULE,
+        FORGE_INSTANCES_MODULE,
+    }
 )
-WAIVER = re.compile(r"^Fix pin waiver:\s*(?P<reason>.*)$")
+BUG_LABEL = "bug"
 ISSUE_JQ = "{labels:[.labels[].name],body:.body}"
 
 
@@ -101,7 +102,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--needs-curie",
         action="store_true",
-        help="report whether this body would invoke the curie binary",
+        help="report whether this body needs the curie binary, dev stack, or kind",
     )
     return parser
 
@@ -157,9 +158,7 @@ def _effective_train(event: dict[str, object]) -> str:
     if base_ref in {"main", "next"}:
         return base_ref
     if not base_ref.startswith("task/"):
-        raise ValueError(
-            f"pull request base {base_ref!r} is not main, next, or a task branch"
-        )
+        raise ValueError(f"pull request base {base_ref!r} is not main, next, or a task branch")
 
     pull_request = event.get("pull_request")
     if not isinstance(pull_request, dict):
@@ -247,9 +246,7 @@ def _effective_train(event: dict[str, object]) -> str:
 
 def _declaration(body: str) -> Declaration:
     uncommented = COMMENT.sub("", body)
-    attempts = [
-        line for line in uncommented.splitlines() if DECLARATION_ATTEMPT.search(line)
-    ]
+    attempts = [line for line in uncommented.splitlines() if DECLARATION_ATTEMPT.search(line)]
     if not attempts:
         return Declaration()
 
@@ -260,9 +257,7 @@ def _declaration(body: str) -> Declaration:
         rest = NOT_APPLICABLE_REASON.fullmatch(excused.group("rest"))
         reason = rest.group("reason").strip() if rest is not None else ""
         if not reason:
-            raise ValueError(
-                "Fix pin: n/a must state why, as `Fix pin: n/a - <reason>`"
-            )
+            raise ValueError("Fix pin: n/a must state why, as `Fix pin: n/a - <reason>`")
         return Declaration(not_applicable=reason)
 
     if (match := DECLARATION.fullmatch(attempts[0])) is None:
@@ -274,54 +269,21 @@ def _declaration(body: str) -> Declaration:
     return Declaration(selector=selector)
 
 
-def _waiver(body: str) -> str | None:
-    uncommented = COMMENT.sub("", body)
-    reasons = [
-        match.group("reason").strip()
-        for line in uncommented.splitlines()
-        if (match := WAIVER.fullmatch(line)) is not None
-    ]
-    if not reasons:
-        return None
-    if len(reasons) != 1:
-        raise ValueError("Fix pin waiver must be exactly one unindented line")
-    if not reasons[0]:
-        raise ValueError("Fix pin waiver must state why, as `Fix pin waiver: <reason>`")
-    return reasons[0]
-
-
-def _pin_tier(selector: str) -> str:
-    path = selector.split("::", 1)[0]
-    filename = path.rsplit("/", 1)[-1]
-    # Location only. test_live.py is the live pin the ticket names; the Python
-    # CI job does not currently export CURIE_E2E_LIVE, so a live selector still
-    # has to survive verify-fix-pin on its own. Until that job can run live
-    # tests, a found:live bug is expected to use a lower-tier pin plus
-    # `Fix pin waiver:`.
-    if path.startswith("cli/tests/local/"):
-        return "local"
-    if filename == "test_live.py":
-        return "live"
-    if path.startswith("charts/curie/ci/"):
-        return "cluster"
-    return "unit"
-
-
-def _discovery_tier(labels: Sequence[str], body: str = "") -> str | None:
-    found = [FOUND_LABELS[label] for label in labels if label in FOUND_LABELS]
-    if (field := DISCOVERY_FIELD.search(body)) is not None:
-        found.append(field.group("tier"))
-    if not found:
-        return None
-    return max(found, key=lambda tier: TIER_RANK[tier])
-
-
-def _needs_curie(body: str) -> bool:
-    """True iff ``main`` would invoke the curie binary for this body."""
+def _pin_requirements(body: str) -> dict[str, bool]:
     try:
-        return _declaration(body).selector is not None
+        selector = _declaration(body).selector
     except ValueError:
-        return False
+        selector = None
+    needed = selector is not None
+    module = selector.split("::", 1)[0] if selector is not None else None
+    needs_factory_upgrade = module == FACTORY_UPGRADE_MODULE
+    needs_kind = module in KIND_MODULES
+    return {
+        "needed": needed,
+        "needs_stack": needed and not needs_kind,
+        "needs_kind": needs_kind,
+        "needs_factory_upgrade": needs_factory_upgrade,
+    }
 
 
 def _report_needs_curie(event_path: Path) -> int:
@@ -331,21 +293,22 @@ def _report_needs_curie(event_path: Path) -> int:
         return 1
 
     try:
-        needed = _needs_curie(_body(_event(event_path)))
+        requirements = _pin_requirements(_body(_event(event_path)))
     except ValueError as error:
         print(f"Fix pin declaration error: {error}", file=sys.stderr)
         return 1
 
-    line = f"needed={'true' if needed else 'false'}\n"
+    lines = "".join(
+        f"{key}={'true' if value else 'false'}\n" for key, value in requirements.items()
+    )
     try:
         with Path(output_path).open("a", encoding="utf-8") as stream:
-            stream.write(line)
+            stream.write(lines)
     except OSError as error:
         print(f"Fix pin cargo guard error: could not write GITHUB_OUTPUT: {error}", file=sys.stderr)
         return 1
-    sys.stdout.write(line)
+    sys.stdout.write(lines)
     return 0
-
 
 
 def _closed_issues(body: str) -> list[int]:
@@ -404,9 +367,7 @@ def _issue_record(repository: str | None, issue: int) -> IssueRecord:
     )
 
 
-def _closed_issue_records(
-    event: dict[str, object], body: str
-) -> list[tuple[int, IssueRecord]]:
+def _closed_issue_records(event: dict[str, object], body: str) -> list[tuple[int, IssueRecord]]:
     issues = _closed_issues(body)
     if not issues:
         return []
@@ -416,26 +377,8 @@ def _closed_issue_records(
 
 def _closed_bugs(event: dict[str, object], body: str) -> list[int]:
     return [
-        issue
-        for issue, record in _closed_issue_records(event, body)
-        if BUG_LABEL in record.labels
+        issue for issue, record in _closed_issue_records(event, body) if BUG_LABEL in record.labels
     ]
-
-
-def _required_discovery(
-    event: dict[str, object], body: str
-) -> str | None:
-    """Highest found:* label or body field among closed bug issues."""
-    found: list[str] = []
-    for _issue, record in _closed_issue_records(event, body):
-        if BUG_LABEL not in record.labels:
-            continue
-        tier = _discovery_tier(record.labels, record.body)
-        if tier is not None:
-            found.append(tier)
-    if not found:
-        return None
-    return max(found, key=lambda tier: TIER_RANK[tier])
 
 
 def _print_verification_failure_guidance() -> None:
@@ -469,15 +412,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         event = _event(arguments.event)
         body = _body(event)
         declaration = _declaration(body)
-        waiver = _waiver(body)
     except ValueError as error:
-        message = str(error)
-        prefix = (
-            "Fix pin waiver error"
-            if message.startswith("Fix pin waiver")
-            else "Fix pin declaration error"
-        )
-        print(f"{prefix}: {message}", file=sys.stderr)
+        print(f"Fix pin declaration error: {error}", file=sys.stderr)
         return 1
 
     try:
@@ -514,22 +450,6 @@ def main(argv: Sequence[str] | None = None) -> int:
             return 1
         print("SKIPPED: no Fix pin declaration")
         return 0
-
-    try:
-        required = _required_discovery(event, body)
-    except ValueError as error:
-        print(f"Fix pin requirement error: {error}", file=sys.stderr)
-        return 1
-    if required is not None:
-        pin = _pin_tier(declaration.selector)
-        if TIER_RANK[pin] < TIER_RANK[required] and waiver is None:
-            print(
-                f"Fix pin tier error: selector {declaration.selector} is a {pin} "
-                f"pin, which is below the discovery surface found:{required}. "
-                f"Pin at found:{required} or add a `Fix pin waiver: <reason>` line.",
-                file=sys.stderr,
-            )
-            return 1
 
     completed = subprocess.run(
         [arguments.curie, "dev", "verify-fix-pin", arguments.ref, declaration.selector],

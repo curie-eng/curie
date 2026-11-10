@@ -52,6 +52,21 @@ async def pre_identity_thread_key_for(
     return old if adapters == [parsed.identity] else None
 
 
+def transcript_binding(thread_key: str) -> str | None:
+    """The binding a transcript key belongs to, as a credential's ``binding`` claim names it.
+
+    ``"{kind}:{address}"`` for any key ``scoped_conversation_id`` could have
+    built, the same string as ``workflow_state_entries.binding_scope``. The
+    identity segment is ignored: every identity on one kind/address pair shares
+    that pair's binding. A targetless cron's key (``%40cron:<agent>:<conv>``)
+    comes back as ``"@cron:<agent>"``. None for a key no producer builds, which
+    the state router refuses to a sandbox credential (#3767).
+    """
+
+    parsed = parse_scoped_conversation_id(thread_key)
+    return None if parsed is None else f"{parsed.kind}:{parsed.address}"
+
+
 def route_thread_key(
     kind: str, adapter: str | None, address: str, conversation_id: str
 ) -> str:

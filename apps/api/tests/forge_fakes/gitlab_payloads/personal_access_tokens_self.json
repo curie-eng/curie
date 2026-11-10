@@ -1,0 +1,19 @@
+{
+  "active": true,
+  "created_at": "2026-10-13T11:03:56.989Z",
+  "description": null,
+  "expires_at": "2026-11-12",
+  "granular": false,
+  "id": 2,
+  "last_used_at": "2026-10-13T11:44:27.325Z",
+  "last_used_ips": [
+    "192.0.2.10"
+  ],
+  "name": "curie-factory",
+  "revoked": false,
+  "scopes": [
+    "api",
+    "write_repository"
+  ],
+  "user_id": 4
+}

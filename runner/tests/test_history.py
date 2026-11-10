@@ -9,11 +9,13 @@ a real turn through the SessionRunner with the fake model.
 
 import hashlib
 import json
+from pathlib import Path
 
 import anyio
 import pytest
 from aiohttp import web
 from aiohttp.test_utils import TestServer
+from curie_runner import __main__ as boot
 from curie_runner.adapter import ClaudeAgentSession, build_options, build_structured_resume
 from curie_runner.history import (
     HISTORY_APPEND_RESERVE_BYTES,
@@ -31,10 +33,23 @@ from curie_runner.history import (
     build_conversation_replay,
     resolve_history,
 )
+from curie_runner.sender_frame import frame_user_turn
+from runner_boot_session import initialized_session_sync
 from runner_state_fake import CappedCasState
 
 _STATE_VALUE_MAX_BYTES = 65_536
 _TRANSCRIPT_CAP_HEADERS = {"X-Curie-Transcript-Max-Bytes": str(_STATE_VALUE_MAX_BYTES)}
+
+
+@pytest.fixture(autouse=True)
+def _isolated_boot_declarations(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Keep host image and daemon declarations out of these prompt expectations."""
+
+    monkeypatch.setattr(
+        boot, "TOOL_MANIFEST_PATH", tmp_path / "tool-manifest.json", raising=False
+    )
+    monkeypatch.delenv("DOCKER_HOST", raising=False)
+    monkeypatch.delenv("DOCKER_PUBLISHED_HOST", raising=False)
 
 
 def _assert_digest_marker(value: object, original: str) -> None:
@@ -455,6 +470,7 @@ def test_runner_resets_native_export_after_bounded_state_api_write(tmp_path) -> 
                 str(server.make_url("/agents/A/state/transcript/t1")), token=None
             )
             runner = SessionRunner(
+                max_usd_per_day=None,
                 held_secrets=frozenset(),
                 session_factory=lambda: AdapterBackedFake(default_turn),
                 ceiling=0,
@@ -901,6 +917,7 @@ def test_oversized_first_turn_is_bounded_before_append_and_cold_replays_in_order
             history_store = StateApiTranscriptStore(key_url, token=None)
             assert await history_store.load() == []
             runner = SessionRunner(
+                max_usd_per_day=None,
                 held_secrets=frozenset(),
                 session_factory=lambda: session,
                 ceiling=0,
@@ -1144,6 +1161,7 @@ def _recording_runner(store: TranscriptStore, *, script=None, ceiling: int = 0):
     from curie_runner.session import SessionRunner
 
     return SessionRunner(
+        max_usd_per_day=None,
         held_secrets=frozenset(),
         session_factory=lambda: FakeModelSession(script or default_turn),
         ceiling=ceiling,
@@ -1275,7 +1293,8 @@ def test_accepted_steer_is_persisted_in_ordered_structured_history() -> None:
     steers = [
         message
         for message in messages
-        if message.role == "user" and message.content == "authorized steering state"
+        if message.role == "user"
+        and message.content == frame_user_turn("message", "", "authorized steering state", None)
     ]
     assert len(steers) == 1
 
@@ -1457,7 +1476,7 @@ def test_build_runner_forwards_configured_model_to_session_prompt(tmp_path) -> N
         }
     )
     runner = build_runner(config, fake_model=False)
-    session = runner._factory()
+    session = initialized_session_sync(runner)
     assert isinstance(session, ClaudeAgentSession)
     options = session._options
 
@@ -1480,6 +1499,7 @@ def test_record_turn_swallows_store_failure() -> None:
             raise HistoryError("state API unavailable")
 
     runner = SessionRunner(
+        max_usd_per_day=None,
         held_secrets=frozenset(),
         session_factory=lambda: None,  # type: ignore[arg-type,return-value]
         ceiling=0,

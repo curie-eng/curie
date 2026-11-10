@@ -27,23 +27,25 @@ import redis.asyncio as aioredis
 from _migration_support import IsolatedMigrationDb, alembic_config
 from aci_protocol import QueuedTurn
 from alembic import command
-from curie_api import approval_principal, crud
+from channel_protocol import scoped_conversation_id
+from curie_api import approval_principal
 from curie_api import sweeper as sweeper_module
 from curie_api.config import get_settings
+from curie_api.crud import approvals as crud_approvals
 from curie_api.deps import get_approver_sets
 from curie_api.main import create_app
 from curie_api.models import Approval
 from curie_api.resumequeue import ResumeQueue
 from curie_api.resumereconciler import ResumeReconciler
 from curie_api.routers import approvals as approvals_module
-from curie_api.sandbox_token import mint
 from curie_api.slack_approvers import SlackApproverSetSelector
-from curie_api.slack_usergroups import SlackUserGroupClient
 from curie_api.sweeper import (
     observe_pending_approvals,
     run_expiry_sweeper,
     sweep_expired_approvals,
 )
+from curie_channel_gateway.slack.groups import SlackUserGroupClient
+from curie_internal.sandbox_token import mint
 from curie_telemetry import (
     TRACEPARENT_STREAM_FIELD,
     extract_trace_context,
@@ -357,6 +359,89 @@ def _read_approval_traceparent(approval_id: str) -> str | None:
     return asyncio.run(_run())
 
 
+def _read_reply_route(approval_id: str) -> tuple[str | None, str | None]:
+    async def read() -> tuple[str | None, str | None]:
+        engine = create_async_engine(get_settings().database_url)
+        try:
+            async with engine.connect() as conn:
+                result = await conn.execute(
+                    text(
+                        "SELECT reply_identity, reply_adapter FROM curie.approvals WHERE id = :id"
+                    ),
+                    {"id": uuid.UUID(approval_id)},
+                )
+                row = result.one()
+                return row[0], row[1]
+        finally:
+            await engine.dispose()
+
+    return asyncio.run(read())
+
+
+@pytest.mark.parametrize(
+    ("reply_adapter", "requested_identity", "reply_identity"),
+    [
+        ("curie-cluster-message", "acme-named", "acme-named"),
+        ("curie-cluster-message", None, None),
+        ("curie-cluster-message", "default", None),
+        ("acme-named", "acme-named", None),
+    ],
+)
+@pytest.mark.parametrize("outcome", ["approved", "expired"])
+def test_reply_identity_survives_http_creation_and_resume(
+    approvals_client: TestClient,
+    auth_headers: dict[str, str],
+    clean_db: None,
+    valkey: redis.Redis,
+    runs_stream: str,
+    reply_adapter: str,
+    requested_identity: str | None,
+    reply_identity: str | None,
+    outcome: str,
+) -> None:
+    """A durable pause retains the binding separately from relay delivery."""
+    payload = _payload(
+        reply_adapter=reply_adapter,
+        reply_placeholder=str(uuid.uuid4()),
+        expires_in_seconds=600,
+    )
+    if requested_identity is not None:
+        payload["reply_identity"] = requested_identity
+    response = approvals_client.post("/approvals", json=payload, headers=auth_headers)
+    assert response.status_code == 201, response.text
+    approval_id = response.json()["id"]
+    assert _read_reply_route(approval_id) == (reply_identity, reply_adapter)
+
+    if outcome == "approved":
+        resolved = approvals_client.post(
+            f"/approvals/{approval_id}/resolve",
+            json={"decision": "approved"},
+            headers=_chat_resolve_headers(approval_id, "U9", "C1", base=auth_headers),
+        )
+        assert resolved.status_code == 200, resolved.text
+    else:
+        async def expire() -> int:
+            async with _sweeper_stack(runs_stream) as (sessionmaker, queue, _client):
+                async with sessionmaker() as session:
+                    return await sweep_expired_approvals(session, queue, now=_naive_utc(601))
+
+        assert asyncio.run(expire()) == 1
+
+    entries = valkey.xrange(runs_stream)
+    assert len(entries) == 1
+    turn = QueuedTurn.model_validate(json.loads(entries[0][1]["payload"]))
+    assert turn.event_id == f"approval-{approval_id}-resolved"
+    assert turn.conversation_id == payload["conversation_id"]
+    assert turn.reply_handle.identity == reply_identity
+    assert turn.reply_handle.adapter == reply_adapter
+    assert turn.reply_handle.placeholder == payload["reply_placeholder"]
+    assert turn.reply_handle.endpoint is None
+    stored = approvals_client.get(f"/approvals/{approval_id}", headers=auth_headers)
+    assert stored.status_code == 200, stored.text
+    assert stored.json()["status"] == outcome
+    assert _read_resumed_at(approval_id) is not None
+
+
 def test_resolve_endpoint_stays_200_when_enqueue_fails(
     approvals_client: TestClient,
     auth_headers: dict[str, str],
@@ -464,6 +549,78 @@ def test_failed_inline_enqueue_then_reconciler_keeps_the_stored_parent(
     ).get_span_context()
     assert carried.trace_id == _TRACE_ID
     assert carried.span_id == enqueue.context.span_id
+    assert _read_resumed_at(created["id"]) is not None
+
+
+def test_resolve_during_valkey_restart_is_resumed_by_the_next_reconciler_pass(
+    approvals_client: TestClient,
+    auth_headers: dict[str, str],
+    clean_db: None,
+    valkey: redis.Redis,
+    runs_stream: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#4016: the resolve that hit a just-restarted Valkey is resumed on the next
+    reconciler pass, not three hours later.
+
+    The fault is the app's own Valkey client raising ``ConnectionError`` on its
+    first ``xadd`` to the runs stream (the first command after the store
+    restarted), BELOW ``ResumeQueue.enqueue``, so the queue's failure handling
+    runs exactly as in production. The resolve still returns 200 with nothing
+    on the stream. A reconciler built on the SAME app resume queue, with the
+    production grace (10860 s, from the chart), then delivers the resume even
+    though the approval was resolved seconds ago.
+    """
+
+    created = approvals_client.post(
+        "/approvals", json=_payload(), headers=auth_headers
+    ).json()
+    app_state = approvals_client.app.state
+    app_valkey = app_state.valkey
+    real_xadd = app_valkey.xadd
+    failed: list[str] = []
+
+    async def _xadd_after_restart(
+        name: Any, fields: Any, *args: Any, **kwargs: Any
+    ) -> Any:
+        if name == runs_stream and not failed:
+            failed.append(json.loads(fields["payload"])["event_id"])
+            raise redis.exceptions.ConnectionError(
+                "Error -3 connecting to valkey:6379. Temporary failure in name resolution."
+            )
+        return await real_xadd(name, fields, *args, **kwargs)
+
+    monkeypatch.setattr(app_valkey, "xadd", _xadd_after_restart)
+
+    resolved = approvals_client.post(
+        f"/approvals/{created['id']}/resolve",
+        json={"decision": "approved"},
+        headers=_chat_resolve_headers(created["id"], "U9", "C1", base=auth_headers),
+    )
+    assert resolved.status_code == 200, resolved.text
+    assert resolved.json()["status"] == "approved"
+    event_id = f"approval-{created['id']}-resolved"
+    assert failed == [event_id]  # the inline resume hit the fault
+    assert valkey.xrange(runs_stream) == []
+    assert _read_resumed_at(created["id"]) is None
+
+    reconciler = ResumeReconciler(
+        app_state.sessionmaker,
+        app_state.resume_queue,
+        interval_seconds=30,
+        grace_seconds=10860,
+        batch_limit=100,
+    )
+    # The app's engine and Valkey pool are bound to the TestClient's loop.
+    portal = approvals_client.portal
+    assert portal is not None
+    count = portal.call(reconciler.reconcile_once)
+
+    assert count == 1
+    entries = valkey.xrange(runs_stream)
+    assert len(entries) == 1
+    turn = QueuedTurn.model_validate(json.loads(entries[0][1]["payload"]))
+    assert turn.event_id == event_id
     assert _read_resumed_at(created["id"]) is not None
 
 
@@ -902,6 +1059,144 @@ def test_resolve_once_and_enqueue_resume_turn(
     assert "already resolved by U9" in second.json()["detail"]
     # And no second resume turn was enqueued.
     assert len(valkey.xrange(runs_stream)) == 1
+
+
+@pytest.mark.parametrize("reply_adapter", [None, "default"])
+def test_stored_factory_approval_resume_wake_adopts_the_same_running_request(
+    approvals_client: TestClient,
+    auth_headers: dict[str, str],
+    clean_db: None,
+    valkey: redis.Redis,
+    runs_stream: str,
+    monkeypatch: pytest.MonkeyPatch,
+    reply_adapter: str | None,
+) -> None:
+    worker = {"X-Curie-Worker-Token": "factory-approval-worker"}
+    monkeypatch.setenv("INTERNAL_WORKER_TOKEN", worker["X-Curie-Worker-Token"])
+    monkeypatch.setenv("GITHUB_REPO_ALLOWLIST", '["acme-corp/*"]')
+    get_settings.cache_clear()
+    try:
+        address, conversation = "C0EXAMPLE1", "1700000000.000100"
+        repository = "acme-corp/widgets"
+        agent = approvals_client.post(
+            "/agents",
+            json={
+                "name": f"acme-factory-{uuid.uuid4().hex[:8]}",
+                "repo_full_name": repository,
+                "channel": {"kind": "slack", "address": address},
+            },
+            headers=auth_headers,
+        )
+        assert agent.status_code == 201, agent.text
+        request_id = str(uuid.uuid4())
+        admitted = approvals_client.post(
+            "/v1/internal/work-items/admissions",
+            json={
+                "agent_id": agent.json()["id"],
+                "kind": "slack", "address": address,
+                "reply_conversation_id": conversation,
+                "tracker": {
+                    "kind": "github", "host": "github.com",
+                    "scope_id": "101", "issue_id": "4619",
+                },
+                "repository": {
+                    "code_host_kind": "github", "host": "github.com",
+                    "project_id": "101", "path": repository,
+                },
+                "code_host_installation_id": 202,
+                "objective": "Implement the admitted work item",
+                "requester": "U1", "request_id": request_id,
+            },
+            headers=worker,
+        )
+        assert admitted.status_code == 200, admitted.text
+        path = f"/v1/internal/work-items/requests/{request_id}"
+        acquired = approvals_client.post(
+            f"{path}/acquire",
+            json={
+                "owner": "factory-worker", "generation": 1, "context": None,
+                "wake": {
+                    "kind": "slack", "address": address,
+                    "adapter": reply_adapter, "conversation_id": conversation,
+                },
+            },
+            headers=worker,
+        )
+        assert acquired.status_code == 200, acquired.text
+        started = approvals_client.post(
+            f"{path}/start",
+            json={
+                "owner": "factory-worker", "generation": 1,
+                "claim_name": "acme-factory-claim", "sandbox_name": "acme-factory-sandbox",
+                "context": acquired.json()["context"],
+            },
+            headers=worker,
+        )
+        assert started.status_code == 200, started.text
+        held = approvals_client.post(
+            f"{path}/hold-approval", json={"runtime_epoch": started.json()["runtime_epoch"]},
+            headers=worker,
+        )
+        assert held.status_code == 200, held.text
+        created = approvals_client.post(
+            "/approvals",
+            json=_payload(
+                agent_id=agent.json()["id"], conversation_id=conversation,
+                reply_kind="slack", reply_channel=address, reply_adapter=reply_adapter,
+                dedupe_key=f"work-item-{request_id}-execute-1",
+            ),
+            headers=auth_headers,
+        )
+        assert created.status_code == 201, created.text
+        approval_id = created.json()["id"]
+        resolved = approvals_client.post(
+            f"/approvals/{approval_id}/resolve",
+            json={"decision": "approved"},
+            headers=_chat_resolve_headers(approval_id, "U9", address, base=auth_headers),
+        )
+        assert resolved.status_code == 200, resolved.text
+        entries = valkey.xrange(runs_stream)
+        assert len(entries) == 1
+        turn = QueuedTurn.model_validate_json(entries[0][1]["payload"])
+        assert turn.event_id == f"approval-{approval_id}-resolved"
+        assert turn.conversation_id == conversation
+        handle = turn.reply_handle
+        assert handle is not None
+        assert (handle.kind, handle.channel, handle.adapter) == (
+            "slack", address, reply_adapter
+        )
+        params = {
+            "conversation_id": scoped_conversation_id(
+                handle.kind, handle.channel, turn.conversation_id
+            ),
+            "wake_kind": handle.kind, "wake_address": handle.channel,
+            "wake_adapter": handle.adapter or "",
+            "wake_conversation_id": turn.conversation_id,
+        }
+        wrong = approvals_client.get(
+            "/v1/internal/work-items/running",
+            params={**params, "wake_conversation_id": "1700000000.000999"}, headers=worker,
+        )
+        assert wrong.status_code == 409, wrong.text
+        assert wrong.json()["detail"]["code"] == "factory_wake_mismatch"
+        running = approvals_client.get(
+            "/v1/internal/work-items/running", params=params, headers=worker,
+        )
+        assert running.status_code == 200, running.text
+        result = running.json()
+        assert result["request_id"] == request_id
+        assert result["work_item_id"] == admitted.json()["work_item"]["id"]
+        assert result["agent_id"] == agent.json()["id"]
+        for field in (
+            "generation", "conversation_id", "wait_deadline", "repository_path", "context"
+        ):
+            assert result[field] == acquired.json()[field]
+        assert result["runtime_epoch"] == started.json()["runtime_epoch"]
+        assert result["execution_deadline"] == started.json()["execution_deadline"]
+        assert result["lease_held_to_deadline"] is True
+        assert result["refusal"] is None
+    finally:
+        get_settings.cache_clear()
 
 
 def test_concurrent_resolvers_yield_exactly_one_winner(
@@ -1349,6 +1644,21 @@ def test_gate_kind_check_constraint_rejects_unknown_values(
         asyncio.run(_insert("bogus"))
 
 
+def _historical_unbound_route_approval(
+    client: TestClient, auth: dict[str, str], payload: dict[str, Any]
+) -> dict[str, Any]:
+    refused = client.post("/approvals", json=payload, headers=auth)
+    assert refused.status_code == 422, refused.text
+    assert refused.json()["detail"] == "approval route is missing or malformed"
+    created = client.post("/approvals", json={**payload, "route": None}, headers=auth)
+    assert created.status_code == 201, created.text
+    approval_id = created.json()["id"]
+    _requester_edit(approval_id, route=payload["route"])
+    record = client.get(f"/approvals/{approval_id}", headers=auth)
+    assert record.status_code == 200, record.text
+    return record.json()
+
+
 def test_route_bound_approval_with_no_agent_resolves_through_neither_channel(
     approvals_client: TestClient,
     auth_headers: dict[str, str],
@@ -1377,11 +1687,11 @@ def test_route_bound_approval_with_no_agent_resolves_through_neither_channel(
     authority.
     """
 
-    created = approvals_client.post(
-        "/approvals",
-        json=_payload(route="managers", card_channel="C_MGRS"),
-        headers=auth_headers,
-    ).json()
+    created = _historical_unbound_route_approval(
+        approvals_client,
+        auth_headers,
+        _payload(route="managers", card_channel="C_MGRS"),
+    )
     assert created["route"] == "managers"
     assert created["card_channel"] == "C_MGRS"
     assert created["agent_id"] is None
@@ -1861,7 +2171,7 @@ def test_resolve_path_expiry_returns_410_when_the_resumed_mark_fails(
     assert created["expires_at"] is not None
     lapsed_at = _lapse(created["id"])
 
-    real_mark = crud.mark_approval_resumed
+    real_mark = crud_approvals.mark_approval_resumed
 
     async def _failing_mark(session: Any, approval_id: uuid.UUID) -> Any:
         # Wrap the real collaborator: only this record's mark fails (a DB blip),
@@ -1870,7 +2180,7 @@ def test_resolve_path_expiry_returns_410_when_the_resumed_mark_fails(
             raise RuntimeError("postgres unreachable")
         return await real_mark(session, approval_id)
 
-    monkeypatch.setattr(crud, "mark_approval_resumed", _failing_mark)
+    monkeypatch.setattr(crud_approvals, "mark_approval_resumed", _failing_mark)
 
     # Observe the real 500 the error middleware would return in production rather
     # than letting TestClient re-raise it -- the regression pinned here is
@@ -2046,7 +2356,7 @@ def test_run_expiry_sweeper_loop_sweeps_and_stops(
                     )
                     await asyncio.sleep(0.1)
                     async with sessionmaker() as session:
-                        record = await crud.get_approval(session, approval_id)
+                        record = await crud_approvals.get_approval(session, approval_id)
                         assert record is not None
                         status = record.status
                 # The loop also enqueued the expiry resume turn -- but the flip
@@ -2813,9 +3123,9 @@ def test_agentless_routed_approval_fails_closed_without_a_binding(
     so a routed agentless approval fails closed too.
     """
 
-    created = approvals_client.post(
-        "/approvals", json=_routed_payload(None, author=_APPROVER), headers=auth_headers
-    ).json()
+    created = _historical_unbound_route_approval(
+        approvals_client, auth_headers, _routed_payload(None, author=_APPROVER)
+    )
     assert created["agent_id"] is None
     assert created["route"] == "managers"
 
@@ -2867,11 +3177,11 @@ def test_a_route_absent_from_the_map_is_unresolvable_and_borrows_no_other_route(
         auth_headers,
         {"legal": {"resolution": _slack_resolution(_ELSEWHERE), "approvers": {"users": [_LISTED]}}},
     )
-    created = approvals_client.post(
-        "/approvals",
-        json=_routed_payload(agent_id, author=_APPROVER),
-        headers=auth_headers,
-    ).json()
+    created = _historical_unbound_route_approval(
+        approvals_client,
+        auth_headers,
+        _routed_payload(agent_id, author=_APPROVER),
+    )
 
     # The OTHER route's allowlist must not leak onto this one -- and the reason
     # proves the legal binding was never consulted in the first place.
@@ -3591,7 +3901,12 @@ def test_requester_terminal_continuation_keeps_display_without_granting_approval
 ) -> None:
     from curie_api.resumequeue import resume_event_id
 
-    payload = _payload(author="U0EXAMPLE1")
+    agent_id = _agent_with_routes(
+        approvals_client,
+        auth_headers,
+        {"different-action": {"resolution": _slack_resolution("C0EXAMPLE1")}},
+    )
+    payload = _payload(author="U0EXAMPLE1", agent_id=agent_id)
     parent = _requester_create(approvals_client, auth_headers, payload)
     _requester_edit(
         parent["id"], status=terminal, resolved_by=None if terminal == "expired" else actor
@@ -3742,7 +4057,17 @@ def test_requester_gate_route_and_card_placement_do_not_identify_origin(
 ) -> None:
     from curie_api.resumequeue import resume_event_id
 
-    payload = _payload(author="U0EXAMPLE1", route="first-gate", card_channel="C0EXAMPLE1")
+    agent_id = _agent_with_routes(
+        approvals_client,
+        auth_headers,
+        {
+            "first-gate": {"resolution": _slack_resolution("C0EXAMPLE1")},
+            "next-gate": {"resolution": _slack_resolution("C0EXAMPLE2")},
+        },
+    )
+    payload = _payload(
+        author="U0EXAMPLE1", agent_id=agent_id, route="first-gate", card_channel="C0EXAMPLE1"
+    )
     parent = _requester_create(approvals_client, auth_headers, payload)
     _requester_edit(parent["id"], status="approved", resolved_by="U0EXAMPLE2")
     child = _requester_create(
@@ -3769,7 +4094,12 @@ def test_requester_terminal_record_must_prove_the_expected_resume_actor(
 ) -> None:
     from curie_api.resumequeue import resume_event_id
 
-    payload = _payload(author="U0EXAMPLE1")
+    agent_id = _agent_with_routes(
+        approvals_client,
+        auth_headers,
+        {"different-action": {"resolution": _slack_resolution("C0EXAMPLE1")}},
+    )
+    payload = _payload(author="U0EXAMPLE1", agent_id=agent_id)
     parent = _requester_create(approvals_client, auth_headers, payload)
     _requester_edit(parent["id"], status=status, resolved_by=resolver)
     child = _requester_create(approvals_client, auth_headers, {
@@ -3796,3 +4126,109 @@ def test_requester_valid_immediate_link_does_not_hide_an_invalid_older_link(
         **payload, "author": "U0EXAMPLE3", "dedupe_key": resume_event_id(second["id"]),
     })
     assert "requested_by" in third and third["requested_by"] is None
+
+
+def test_plain_approval_display_round_trips_without_rewriting_grant_data(
+    approvals_client: TestClient, auth_headers: dict[str, str], clean_db: None
+) -> None:
+    tool = "mcp__plugin_acme_files__file_attachment"
+    arguments = {"file_name": "example.pdf", "destination": "Approved"}
+    summary = "Tool call awaiting approval: " + tool + " " + json.dumps(arguments)
+    payload = _payload(
+        summary=summary, gate_kind="permission", granted_tool=tool, granted_arguments=arguments
+    )
+    created = approvals_client.post("/approvals", json=payload, headers=auth_headers)
+    assert created.status_code == 201, created.text
+    body = created.json()
+    for record in [
+        body,
+        approvals_client.get(f"/approvals/{body['id']}", headers=auth_headers).json(),
+    ]:
+        assert record["display_summary"] == (
+            "Approve file attachment. Destination: Approved; File name: example.pdf"
+        )
+        assert record["summary"] == summary
+        assert record["granted_tool"] == tool and record["status"] == "pending"
+        assert "granted_arguments" not in record
+    assert _read_provenance(uuid.UUID(body["id"])) == ("permission", tool)
+
+
+_REMEDIATION_MINT = "/approvals/principals/remediation-operator"
+
+
+def test_remediation_operator_mint_issues_a_remediation_scoped_operator_token(
+    approvals_client: TestClient, auth_headers: dict[str, str], clean_db: None
+) -> None:
+    """#4228: the remediation mint answers 201, no-store, the subject echoed, and
+    a token that verifies only under ``remediation.administer``, never under the
+    approval resolution scope."""
+
+    minted = approvals_client.post(
+        _REMEDIATION_MINT, json={"subject": "U0EXAMPLE1"}, headers=auth_headers
+    )
+
+    assert minted.status_code == 201, minted.text
+    assert minted.headers["cache-control"] == "no-store"
+    body = minted.json()
+    assert body["subject"] == "U0EXAMPLE1"
+    assert body["expires_at"]
+    api_key = get_settings().api_key
+    token = body["token"]
+    claims = approval_principal.verify_claims(
+        token, api_key, scope=approval_principal.REMEDIATION_ADMIN_SCOPE
+    )
+    assert claims is not None
+    assert claims.kind == "operator"
+    assert claims.subject == "U0EXAMPLE1"
+    assert claims.approval_id is None
+    assert (
+        approval_principal.verify_claims(token, api_key, scope=approval_principal.APPROVE_SCOPE)
+        is None
+    )
+
+
+def test_approval_operator_mint_token_does_not_carry_the_remediation_scope(
+    approvals_client: TestClient, auth_headers: dict[str, str], clean_db: None
+) -> None:
+    """#4228: the scopes separate both ways; an ``approval.resolve`` operator token
+    is not a remediation administrator."""
+
+    minted = approvals_client.post(
+        "/approvals/principals/operator", json={"subject": "U0EXAMPLE1"}, headers=auth_headers
+    )
+
+    assert minted.status_code == 201, minted.text
+    api_key = get_settings().api_key
+    token = minted.json()["token"]
+    assert (
+        approval_principal.verify_claims(token, api_key, scope=approval_principal.APPROVE_SCOPE)
+        is not None
+    )
+    assert (
+        approval_principal.verify_claims(
+            token, api_key, scope=approval_principal.REMEDIATION_ADMIN_SCOPE
+        )
+        is None
+    )
+
+
+def test_remediation_operator_mint_needs_the_platform_key_as_the_operator_mint_does(
+    approvals_client: TestClient, auth_headers: dict[str, str], clean_db: None
+) -> None:
+    """#4228: the remediation mint is refused exactly as the operator mint is,
+    for a missing, blank or wrong platform key, and refuses a blank subject."""
+
+    for headers in ({}, {"X-API-Key": ""}, {"X-API-Key": "   "}, {"X-API-Key": "wrong"}):
+        operator = approvals_client.post(
+            "/approvals/principals/operator", json={"subject": "U0EXAMPLE1"}, headers=headers
+        )
+        remediation = approvals_client.post(
+            _REMEDIATION_MINT, json={"subject": "U0EXAMPLE1"}, headers=headers
+        )
+        assert operator.status_code == 401, operator.text
+        assert remediation.status_code == operator.status_code, remediation.text
+        assert remediation.json() == operator.json()
+        assert "token" not in remediation.json()
+
+    blank = approvals_client.post(_REMEDIATION_MINT, json={"subject": "   "}, headers=auth_headers)
+    assert blank.status_code == 422, blank.text

@@ -1389,6 +1389,13 @@ def _other_routes() -> list[tuple[str, str]]:
         "/github/webhook",
         "/console/session",
         "/v1/factory/cards/{token}.svg",
+        # The OIDC login redirect and IdP callback are unauthenticated by design:
+        # the state cookie and the IdP's authorization code are the credential.
+        "/console/oidc/login",
+        "/console/oidc/callback",
+        # Logout takes no credential beyond the session cookie it revokes, and
+        # always answers 204 so it is not an oracle for which tokens are live.
+        "/console/logout",
     }
     routes: list[tuple[str, str]] = []
     for route in _walk(create_app().routes):
@@ -1464,7 +1471,15 @@ def test_a_channel_token_is_refused_on_every_other_router(
     if method not in {"GET", "DELETE"}:
         kwargs["json"] = {}
     resp = channels_client.request(method, concrete, **kwargs)
-    assert resp.status_code == 401, resp.text
+    if (method, path) == ("GET", "/identity/connect/{token}"):
+        # This public browser landing page authenticates its single-use path
+        # token, not X-API-Key. A channel credential cannot turn the invalid
+        # path into an account connection. Confirmation remains in the 401
+        # sweep and requires its independently scoped browser proof.
+        assert resp.status_code == 400, resp.text
+        assert resp.json()["detail"] == "invalid or expired account connection"
+    else:
+        assert resp.status_code == 401, resp.text
 
 
 # --- the token dies with the binding it names ---------------------------------
@@ -1661,7 +1676,13 @@ def test_a_route_less_binding_is_legal_at_rest_and_unmintable(
         # identity, only an unset egress credential.
         read_adapter = "default" if kind == "slack" else None
         assert created.json()["channels"] == [
-            {"kind": kind, "address": address, "adapter": read_adapter, "allowed_callers": None}
+            {
+                "kind": kind,
+                "address": address,
+                "adapter": read_adapter,
+                "allowed_callers": None,
+                "trigger_label": None,
+            }
         ]
 
         row = _binding_row(created.json()["id"])
@@ -1801,6 +1822,7 @@ def test_the_builtin_cluster_message_adapter_is_reserved_on_every_binding_write(
             "address": "ordinary@example.test",
             "adapter": EMAIL_ADAPTER,
             "allowed_callers": None,
+            "trigger_label": None,
         }
     ]
     row = _binding_row(agent_id)
@@ -1837,6 +1859,7 @@ def test_a_valid_route_stores_the_endpoint_and_reads_back_only_the_identity(
             "address": "routed@example.test",
             "adapter": EMAIL_ADAPTER,
             "allowed_callers": None,
+            "trigger_label": None,
         }
     ]
 

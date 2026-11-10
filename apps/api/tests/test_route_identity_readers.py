@@ -21,11 +21,12 @@ from typing import Any
 
 import pytest
 from alembic import command
-from curie_api import crud
 from curie_api.config import get_settings
+from curie_api.crud import channels as crud_channels
+from curie_api.crud import publications as crud_publications
 from curie_api.migration_fence import DECLARATIONS_ENV, HONORED_ACTION, load_declarations
 from curie_api.routers import approval_recovery
-from curie_api.schemas import PublicationCreate
+from curie_api.schemas.publications import PublicationCreate
 from fastapi.testclient import TestClient
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
@@ -99,7 +100,7 @@ def test_channel_ingress_resolves_slack_none_address_to_the_default_row(
         try:
             sessionmaker = async_sessionmaker(engine, expire_on_commit=False)
             async with sessionmaker() as session:
-                return await crud.binding_for_route(session, "slack", None, "C0EXAMPLE1")
+                return await crud_channels.binding_for_route(session, "slack", None, "C0EXAMPLE1")
         finally:
             await engine.dispose()
 
@@ -226,7 +227,7 @@ def test_create_publication_keeps_the_binding_when_reply_adapter_names_none(
         try:
             sessionmaker = async_sessionmaker(engine, expire_on_commit=False)
             async with sessionmaker() as session:
-                publication, created = await crud.create_publication(
+                publication, created = await crud_publications.create_publication(
                     session, data, patch=data.decoded_patch(), metadata_check=_no_metadata_check
                 )
                 assert created is True
@@ -287,7 +288,7 @@ def test_review_revision_accepts_an_omitted_reply_adapter(
         try:
             sessionmaker = async_sessionmaker(engine, expire_on_commit=False)
             async with sessionmaker() as session:
-                publication, created = await crud.create_publication(
+                publication, created = await crud_publications.create_publication(
                     session, data, patch=data.decoded_patch(), metadata_check=_no_metadata_check
                 )
                 await session.commit()

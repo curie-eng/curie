@@ -18,8 +18,7 @@
 //!
 //! Env is set per child `Command` (never process env), so tests run in parallel.
 
-#[path = "support/executable.rs"]
-mod test_executable;
+use crate::support::executable as test_executable;
 
 use std::fs;
 use std::path::Path;
@@ -85,7 +84,7 @@ fn run_curie(args: &[&str], ambient_helm_ctx: Option<&str>) -> Run {
     let kubeconfig = home.join(".kube").join("config");
     fs::write(
         &kubeconfig,
-        "apiVersion: v1\nkind: Config\ncurrent-context: prod-ctx\ncontexts:\n- name: prod-ctx\n  context:\n    cluster: prod-cluster\n    user: prod-user\n- name: test-ctx\n  context:\n    cluster: test-cluster\n    user: test-user\nclusters: []\nusers: []\n",
+        "apiVersion: v1\nkind: Config\ncurrent-context: prod-ctx\ncontexts:\n- name: prod-ctx\n  context:\n    cluster: prod-cluster\n    user: prod-user\n- name: test-context\n  context:\n    cluster: test-cluster\n    user: test-user\nclusters: []\nusers: []\n",
     )
     .unwrap();
     let log = tmp.path().join("calls.log");
@@ -148,8 +147,8 @@ fn assert_all_pinned(run: &Run, ctx: &str) {
 #[test]
 fn explicit_context_pins_every_helm_and_kubectl_call() {
     for args in [
-        ["cluster", "--context", "test-ctx", "down", "--yes"],
-        ["cluster", "down", "--yes", "--context", "test-ctx"],
+        ["cluster", "--context", "test-context", "down", "--yes"],
+        ["cluster", "down", "--yes", "--context", "test-context"],
     ] {
         let run = run_curie(&args, None);
         assert!(
@@ -158,10 +157,10 @@ fn explicit_context_pins_every_helm_and_kubectl_call() {
             run.out.status,
             run.stderr()
         );
-        assert_all_pinned(&run, "test-ctx");
+        assert_all_pinned(&run, "test-context");
         let err = run.stderr();
         assert!(
-            err.contains("test-ctx"),
+            err.contains("test-context"),
             "stderr must name the context: {err}"
         );
         assert!(
@@ -173,9 +172,16 @@ fn explicit_context_pins_every_helm_and_kubectl_call() {
 
 #[test]
 fn unknown_context_refuses_before_any_mutation() {
-    let run = run_curie(&["cluster", "down", "--yes", "--context", "nope"], None);
+    let run = run_curie(
+        &["cluster", "down", "--yes", "--context", "missing-context"],
+        None,
+    );
     assert!(!run.out.status.success(), "unknown context must fail");
-    assert!(run.stderr().contains("nope"), "stderr: {}", run.stderr());
+    assert!(
+        run.stderr().contains("missing-context"),
+        "stderr: {}",
+        run.stderr()
+    );
     assert!(
         run.log.is_empty(),
         "no helm or non-config kubectl call may run: {:?}",
@@ -186,15 +192,15 @@ fn unknown_context_refuses_before_any_mutation() {
 #[test]
 fn explicit_context_overrides_ambient_helm_kubecontext() {
     let run = run_curie(
-        &["cluster", "down", "--yes", "--context", "test-ctx"],
+        &["cluster", "down", "--yes", "--context", "test-context"],
         Some("prod-ctx"),
     );
     assert!(run.out.status.success(), "stderr={}", run.stderr());
     let helm: Vec<_> = run.log.iter().filter(|l| l.0 == "helm").collect();
     assert!(!helm.is_empty(), "helm must run: {:?}", run.log);
     for (_, cur, helm_ctx, args) in helm {
-        assert_eq!(helm_ctx, "test-ctx", "helm {args} kept ambient context");
-        assert_eq!(cur, "test-ctx", "helm {args} kubeconfig not pinned");
+        assert_eq!(helm_ctx, "test-context", "helm {args} kept ambient context");
+        assert_eq!(cur, "test-context", "helm {args} kubeconfig not pinned");
     }
 }
 
@@ -214,7 +220,7 @@ fn no_context_pins_current_context() {
 // that no context resolved and suggest `--context`, not blame convergence and
 // recommend a mutating `cluster up`.
 
-const NO_CURRENT_CONTEXT: &str = "apiVersion: v1\nkind: Config\ncontexts:\n- name: test-ctx\n  context:\n    cluster: test-cluster\n    user: test-user\nclusters: []\nusers: []\n";
+const NO_CURRENT_CONTEXT: &str = "apiVersion: v1\nkind: Config\ncontexts:\n- name: test-context\n  context:\n    cluster: test-cluster\n    user: test-user\nclusters: []\nusers: []\n";
 
 /// Fakes where the cluster is unreachable (`unreachable`) or reachable with a
 /// deployed release whose only pod is not ready.
@@ -289,7 +295,10 @@ fn status_without_resolvable_context_suggests_context_not_cluster_up() {
         "names the missing context: {err}"
     );
     assert!(err.contains("--context"), "suggests --context: {err}");
-    assert!(err.contains("test-ctx"), "lists available contexts: {err}");
+    assert!(
+        err.contains("test-context"),
+        "lists available contexts: {err}"
+    );
     assert!(
         !err.contains("cluster up"),
         "must not suggest an install: {err}"
@@ -302,7 +311,7 @@ fn status_without_resolvable_context_suggests_context_not_cluster_up() {
 
 #[test]
 fn status_with_explicit_context_keeps_the_convergence_diagnosis() {
-    let out = run_status(&["--context", "test-ctx"], true);
+    let out = run_status(&["--context", "test-context"], true);
     let err = String::from_utf8_lossy(&out.stderr);
     assert!(
         !out.status.success(),
@@ -330,7 +339,7 @@ fn example_sre_bot_explicit_context_pins_every_helm_and_kubectl_call() {
         [
             "example",
             "--context",
-            "test-ctx",
+            "test-context",
             "sre-bot",
             "provision-observability",
             "--chart",
@@ -343,16 +352,16 @@ fn example_sre_bot_explicit_context_pins_every_helm_and_kubectl_call() {
             "--chart",
             ".",
             "--context",
-            "test-ctx",
+            "test-context",
         ],
     ] {
         let run = run_curie(&args, Some("prod-ctx"));
         // The fake kubectl returns no node list, so the capacity preflight stops the
         // run after the first helm and kubectl calls; both must already be pinned.
-        assert_all_pinned(&run, "test-ctx");
+        assert_all_pinned(&run, "test-context");
         let err = run.stderr();
         assert!(
-            err.contains("test-ctx"),
+            err.contains("test-context"),
             "stderr must name the context: {err}"
         );
         assert!(
@@ -372,7 +381,7 @@ fn example_sre_bot_without_context_pins_current_context() {
             "--chart",
             ".",
         ],
-        Some("test-ctx"),
+        Some("test-context"),
     );
     assert_all_pinned(&run, "prod-ctx");
 }
@@ -387,12 +396,16 @@ fn example_sre_bot_unknown_context_refuses_before_any_call() {
             "--chart",
             ".",
             "--context",
-            "nope",
+            "missing-context",
         ],
         None,
     );
     assert!(!run.out.status.success(), "unknown context must fail");
-    assert!(run.stderr().contains("nope"), "stderr: {}", run.stderr());
+    assert!(
+        run.stderr().contains("missing-context"),
+        "stderr: {}",
+        run.stderr()
+    );
     assert!(
         run.log.is_empty(),
         "no helm or kubectl call may run: {:?}",
@@ -411,7 +424,7 @@ fn example_sre_bot_dry_run_names_the_context_and_prints_the_argv() {
             "--observability-only",
             "--dry-run",
             "--context",
-            "test-ctx",
+            "test-context",
         ],
         None,
     );
@@ -423,7 +436,7 @@ fn example_sre_bot_dry_run_names_the_context_and_prints_the_argv() {
     );
     let err = run.stderr();
     assert!(
-        err.contains("test-ctx") && err.contains("test-cluster"),
+        err.contains("test-context") && err.contains("test-cluster"),
         "{err}"
     );
     let plan: serde_json::Value = serde_json::from_slice(&run.out.stdout).expect("JSON plan");
@@ -434,12 +447,388 @@ fn example_sre_bot_dry_run_names_the_context_and_prints_the_argv() {
         .filter_map(serde_json::Value::as_str)
         .collect();
     for expected in [
-        "helm repo add grafana https://grafana.github.io/helm-charts --force-update",
-        "kubectl rollout status statefulset/tempo --namespace observability --timeout=10m",
+        "helm --kube-context test-context repo add grafana https://grafana.github.io/helm-charts --force-update",
+        "kubectl --context test-context rollout status statefulset/tempo --namespace observability --timeout=10m",
     ] {
         assert!(
             lines.contains(&expected),
             "plan must carry the argv {expected:?}: {lines:#?}"
         );
     }
+}
+
+fn run_context_case(
+    args: &[&str],
+    current: Option<&str>,
+    state: Option<&serde_json::Value>,
+    failure: &str,
+) -> Run {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tmp.path().join("home");
+    let bin_dir = tmp.path().join("bin");
+    fs::create_dir_all(home.join(".kube")).unwrap();
+    fs::create_dir_all(&bin_dir).unwrap();
+    let kubeconfig = home.join(".kube/config");
+    let body = NO_CURRENT_CONTEXT.replace("test-context", "scratch-cluster");
+    let body = body.replace(
+        "clusters: []\nusers: []\n",
+        "- name: other-ctx\n  context:\n    cluster: other-cluster\n    user: other-user\nclusters: []\nusers: []\n",
+    );
+    let body = match current {
+        Some(name) => format!("current-context: {name}\n{body}"),
+        None => body,
+    };
+    fs::write(&kubeconfig, &body).unwrap();
+    if let Some(state) = state {
+        fs::create_dir(tmp.path().join(".curie")).unwrap();
+        fs::write(tmp.path().join(".curie/last-turn.json"), state.to_string()).unwrap();
+    }
+    let log = tmp.path().join("calls.log");
+    // Reuse the external refusal recorded by the #2864 status fixtures above.
+    for program in ["helm", "kubectl"] {
+        test_executable::install_in(
+            &bin_dir,
+            program,
+            &format!(
+                r#"{LOG_PREFIX}printf '{program}\t%s\t%s\t%s\n' "$cur" "$HELM_KUBECONTEXT" "$*" >> '{}'
+if [ -z "$CURIE_TEST_CLUSTER_FAILURE" ]; then exit 0; fi
+echo "$CURIE_TEST_CLUSTER_FAILURE" >&2
+exit 1
+"#,
+                log.display(),
+            ),
+        );
+    }
+    let mut paths = vec![bin_dir];
+    paths.extend(std::env::split_paths(
+        &std::env::var_os("PATH").unwrap_or_default(),
+    ));
+    let out = Command::new(env!("CARGO_BIN_EXE_curie"))
+        .args(args)
+        .arg("--chart")
+        .arg(Path::new(env!("CARGO_MANIFEST_DIR")).join("../charts/curie"))
+        .current_dir(tmp.path())
+        .env("PATH", std::env::join_paths(paths).unwrap())
+        .env("HOME", &home)
+        .env("TMPDIR", tmp.path())
+        .env("KUBECONFIG", &kubeconfig)
+        .env("CURIE_TEST_ORIGINAL_KUBECONFIG", &kubeconfig)
+        .env("CURIE_TEST_CLUSTER_FAILURE", failure)
+        .env("NO_COLOR", "1")
+        .env_remove("CURIE_API_KEY")
+        .env_remove("CURIE_VALKEY_PASSWORD")
+        .env_remove("CURIE_MODEL_CREDENTIALS")
+        .env_remove("HELM_KUBECONTEXT")
+        .output()
+        .expect("spawn curie");
+    assert_eq!(fs::read_to_string(kubeconfig).unwrap(), body);
+    let log = fs::read_to_string(log)
+        .unwrap_or_default()
+        .lines()
+        .map(|line| {
+            let mut fields = line.splitn(4, '\t').map(str::to_string);
+            (
+                fields.next().unwrap(),
+                fields.next().unwrap(),
+                fields.next().unwrap(),
+                fields.next().unwrap(),
+            )
+        })
+        .collect();
+    Run { out, log }
+}
+
+fn recorded_context_turn(context: Option<&str>, verb: &str) -> serde_json::Value {
+    let mut state = serde_json::json!({
+        "verb": verb, "channel": "C0EXAMPLE1", "thread_ts": "9.9",
+        "namespace": "recorded-ns", "release": "recorded-release",
+        "chart": "charts/curie", "listen_host": null, "timeout_secs": 1,
+        "api_url": null, "api_key_env": null,
+    });
+    if let Some(context) = context {
+        state["context"] = context.into();
+    }
+    state
+}
+
+#[test]
+fn cluster_up_dry_run_prints_pinned_context() {
+    let run = run_context_case(
+        &[
+            "cluster",
+            "up",
+            "--context",
+            "scratch-cluster",
+            "--namespace",
+            "n",
+            "--release",
+            "r",
+            "--dry-run",
+        ],
+        None,
+        None,
+        "unexpected external command",
+    );
+    assert!(run.out.status.success(), "{}", run.stderr());
+    let stdout = String::from_utf8_lossy(&run.out.stdout);
+    let helm: Vec<_> = stdout
+        .lines()
+        .filter(|line| line.starts_with("helm "))
+        .collect();
+    assert!(!helm.is_empty(), "missing Helm plan: {stdout}");
+    for line in helm {
+        assert!(
+            line.contains("--kube-context scratch-cluster"),
+            "Helm plan lost pinned context: {line}"
+        );
+    }
+    assert!(
+        run.log.is_empty(),
+        "dry run spawned commands: {:?}",
+        run.log
+    );
+}
+
+#[test]
+fn dry_run_context_kubectl_and_json() {
+    let secret_values_file = regex::Regex::new(r"<secret values file: [^>]+>").unwrap();
+    let generated_secret = regex::Regex::new(concat!(
+        r"((?:postgres\.auth\.password|valkey\.password|",
+        r"clickhouse\.auth\.password|rustfs\.auth\.rootPassword|",
+        r"langfuse\.(?:salt|encryptionKey|nextauthSecret)|",
+        r"api\.(?:apiKey|githubWebhookSecret))=)[0-9a-f]{8}\*{3}",
+    ))
+    .unwrap();
+    let mut plans = Vec::new();
+    for json in [false, true] {
+        let mut args = vec![
+            "cluster",
+            "up",
+            "--context",
+            "scratch-cluster",
+            "--namespace",
+            "n",
+            "--release",
+            "r",
+            "--dry-run",
+        ];
+        if json {
+            args.insert(0, "--json");
+        }
+        let run = run_context_case(&args, None, None, "unexpected external command");
+        assert!(run.out.status.success(), "{}", run.stderr());
+        assert!(
+            run.log.is_empty(),
+            "dry run spawned commands: {:?}",
+            run.log
+        );
+        let lines: Vec<String> = if json {
+            let value: serde_json::Value = serde_json::from_slice(&run.out.stdout).unwrap();
+            value["plan"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|line| line.as_str().unwrap().to_string())
+                .collect()
+        } else {
+            String::from_utf8(run.out.stdout)
+                .unwrap()
+                .lines()
+                .map(str::to_string)
+                .collect()
+        };
+        let mut commands = Vec::new();
+        for (program, flag) in [
+            ("helm ", "--kube-context scratch-cluster"),
+            ("kubectl ", "--context scratch-cluster"),
+        ] {
+            let matching: Vec<_> = lines
+                .iter()
+                .filter(|line| line.starts_with(program))
+                .collect();
+            assert!(!matching.is_empty(), "missing {program} plan: {lines:?}");
+            for line in matching {
+                assert!(line.contains(flag), "missing {flag}: {line}");
+                commands.push(
+                    secret_values_file
+                        .replace_all(line, |placeholder: &regex::Captures<'_>| {
+                            generated_secret
+                                .replace_all(&placeholder[0], "${1}GENERATED***")
+                                .into_owned()
+                        })
+                        .into_owned(),
+                );
+            }
+        }
+        plans.push(commands);
+    }
+    assert_eq!(plans[0], plans[1], "human and JSON commands must agree");
+}
+
+#[test]
+fn continue_uses_recorded_context_before_secret_discovery() {
+    for (current, explicit, recorded, expected) in [
+        (None, None, Some("scratch-cluster"), "scratch-cluster"),
+        (
+            Some("other-ctx"),
+            None,
+            Some("scratch-cluster"),
+            "scratch-cluster",
+        ),
+        (
+            None,
+            Some("other-ctx"),
+            Some("scratch-cluster"),
+            "other-ctx",
+        ),
+        (None, Some("other-ctx"), Some("unknown-ctx"), "other-ctx"),
+        (Some("other-ctx"), None, None, "other-ctx"),
+    ] {
+        let state = recorded_context_turn(recorded, "cluster");
+        let mut args = vec!["cluster", "message", "--continue", "probe"];
+        if let Some(context) = explicit {
+            args.extend(["--context", context]);
+        }
+        let run = run_context_case(
+            &args,
+            current,
+            Some(&state),
+            "The connection to the server localhost:8080 was refused",
+        );
+        assert!(!run.out.status.success());
+        assert!(
+            run.stderr().contains("could not inspect Helm state"),
+            "{}",
+            run.stderr()
+        );
+        assert_all_pinned(&run, expected);
+        assert!(
+            run.log.iter().any(|call| call.3.contains("secret")),
+            "must reach credential discovery: {:?}",
+            run.log
+        );
+    }
+    for (context, verb, diagnostic) in [
+        ("unknown-ctx", "cluster", "unknown-ctx"),
+        ("scratch-cluster", "local", "last turn was 'local message'"),
+    ] {
+        let state = recorded_context_turn(Some(context), verb);
+        let run = run_context_case(
+            &["cluster", "message", "--continue", "probe"],
+            None,
+            Some(&state),
+            "unexpected external command",
+        );
+        assert!(!run.out.status.success());
+        assert!(run.stderr().contains(diagnostic), "{}", run.stderr());
+        assert!(
+            run.log.is_empty(),
+            "refusal must precede cluster children: {:?}",
+            run.log
+        );
+    }
+}
+
+#[test]
+fn cluster_message_without_context_suggests_context() {
+    for explicit_credentials in [false, true] {
+        let mut args = vec!["cluster", "message", "probe"];
+        if explicit_credentials {
+            args.extend([
+                "--api-key",
+                "fixture-api",
+                "--valkey-password",
+                "fixture-valkey",
+            ]);
+        }
+        let run = run_context_case(
+            &args,
+            None,
+            None,
+            "The connection to the server localhost:8080 was refused",
+        );
+        let err = run.stderr();
+        assert!(!run.out.status.success(), "{err}");
+        assert!(err.contains("no Kubernetes context resolved (the kubeconfig has no current-context) and the cluster could not be reached"), "{err}");
+        assert!(
+            err.contains("rerun with an explicit context: `curie cluster --context <name> status`"),
+            "{err}"
+        );
+        assert!(
+            err.contains("scratch-cluster") && err.contains("other-ctx"),
+            "{err}"
+        );
+        assert!(
+            !run.log.is_empty(),
+            "diagnosis must follow a cluster attempt"
+        );
+    }
+}
+
+#[test]
+fn unresolved_context_message_controls_preserve_resolved_and_rbac_errors() {
+    for explicit_credentials in [false, true] {
+        for (context, failure) in [
+            (
+                Some("scratch-cluster"),
+                "The connection to the server localhost:8080 was refused",
+            ),
+            (
+                None,
+                "Error from server (Forbidden): deployments.apps is forbidden",
+            ),
+        ] {
+            let mut args = vec!["cluster", "message", "probe"];
+            if explicit_credentials {
+                args.extend([
+                    "--api-key",
+                    "fixture-api",
+                    "--valkey-password",
+                    "fixture-valkey",
+                ]);
+            }
+            if let Some(context) = context {
+                args.extend(["--context", context]);
+            }
+            let run = run_context_case(&args, None, None, failure);
+            let err = run.stderr();
+            assert!(!run.out.status.success(), "{err}");
+            assert!(err.contains(failure), "original error lost: {err}");
+            assert!(!err.contains("no Kubernetes context resolved"), "{err}");
+            assert!(!run.log.is_empty());
+        }
+    }
+}
+
+#[test]
+fn unresolved_context_reachable_bootstrap_reaches_port_forward() {
+    let run = run_context_case(
+        &[
+            "cluster",
+            "message",
+            "probe",
+            "--api-key",
+            "fixture-api",
+            "--valkey-password",
+            "fixture-valkey",
+        ],
+        None,
+        None,
+        "",
+    );
+    let err = run.stderr();
+    assert!(
+        !run.out.status.success(),
+        "the fixture ends at port-forward readiness"
+    );
+    assert!(
+        run.log.iter().any(|call| call.3.contains("port-forward")),
+        "bootstrap must reach relay setup: {:?}; {err}",
+        run.log
+    );
+    assert!(
+        err.contains("kubectl closed stdout before reporting"),
+        "{err}"
+    );
+    assert!(!err.contains("no Kubernetes context resolved"), "{err}");
 }

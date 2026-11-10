@@ -20,8 +20,7 @@
 //! ingress-only advice and the assertion below fails. Do not "clean this up"
 //! by importing the delivery module -- that would unpin the fix.
 
-#[path = "support/executable.rs"]
-mod test_executable;
+use crate::support::executable as test_executable;
 
 use std::ffi::OsString;
 use std::fs;

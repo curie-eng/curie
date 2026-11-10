@@ -7,8 +7,7 @@
 //! registry served, refuses bytes that do not hash to a requested digest, and
 //! names the reference when the registry does not know it.
 
-#[path = "support/oci_registry_stub.rs"]
-mod oci_registry_stub;
+use crate::support::oci_registry_stub;
 
 use curie::oci_registry::{fetch_manifest, parse};
 use oci_registry_stub::{

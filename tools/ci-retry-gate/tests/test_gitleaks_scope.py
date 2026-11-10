@@ -300,7 +300,7 @@ def test_scheduled_and_manual_scans_stay_unscoped() -> None:
     assert setters, "the workflow must scope at least one event"
     for step in setters:
         condition = str(step.get("if", ""))
-        assert "pull_request" in condition or "push" in condition, (
+        assert any(event in condition for event in ("pull_request", "merge_group", "push")), (
             f"step {step.get('name')!r} narrows the log range without a pull request or push "
             "guard, which would also narrow the scheduled sweep and manual dispatches"
         )
@@ -530,3 +530,244 @@ def test_repository_identifier_rules_preserve_case_and_clone_verdicts(
     assert scan.returncode == (1 if expected_rules else 0), _scan_diagnostics(scan)
     findings = json.loads((repo / "findings.json").read_text(encoding="utf-8"))
     assert {finding["RuleID"] for finding in findings} == expected_rules
+
+
+FACTORY_FIXTURE_COMMIT = "5f98d1bce852a94c4545c27a599d24a314a23f59"
+SYNTHETIC_CHANNEL_COMMIT = "f0c43984edaf749321d5aa0bbc0854160ba15fbf"
+UNBOUND_LEGACY_COMMIT = "b0dc00db025319d7e5dd38a62c4d9c5b3f246484"
+UNBOUND_CREATION_COMMIT = "340c09720fd79c2229a64d3d7702fc8882f7c7c9"
+UNBOUND_LEGACY_REWRITE_COMMIT = "526a02e9a0c949022c3f46000d7e9b477068abcd"
+UNBOUND_CREATION_REWRITE_COMMIT = "ecbf8115d60ff9188826637e4c52995d6204bf25"
+FACTORY_FIXTURE_PATHS = (
+    r"^tools/factory-e2e/tests/test_acceptance\.py$",
+    r"^tools/factory-e2e/tests/test_factory_e2e_loop\.py$",
+    r"^tools/factory-e2e/tests/test_gitlab_acceptance\.py$",
+)
+SYNTHETIC_CHANNEL_PATH = r"^apps/worker/src/curie_worker/eval/learning\.py$"
+UNBOUND_LEGACY_PATH = r"^apps/api/tests/test_http_approval_legacy_writers\.py$"
+UNBOUND_CREATION_PATH = r"^apps/api/tests/test_http_approval_creation\.py$"
+
+
+def _rule(rule_id: str) -> dict[str, Any]:
+    rules = _gitleaks_config()["rules"]
+    assert isinstance(rules, list)
+    matches = [rule for rule in rules if isinstance(rule, dict) and rule.get("id") == rule_id]
+    assert len(matches) == 1, rule_id
+    rule = matches[0]
+    assert isinstance(rule, dict)
+    return rule
+
+
+def test_historical_fixture_allowlist_stays_pinned_to_commit_and_path() -> None:
+    """History-only fixture hits are excused by commit and path together.
+
+    A path-wide or pattern-wide excuse would hide the same text if it came back.
+    The global commit list would hide every other finding in those commits.
+    """
+    factory_lists = _rule("cross-repo-issue-ref").get("allowlists")
+    assert isinstance(factory_lists, list)
+    factory_pinned = [
+        item
+        for item in factory_lists
+        if isinstance(item, dict)
+        and item.get("condition") == "AND"
+        and item.get("commits") == [FACTORY_FIXTURE_COMMIT]
+    ]
+    assert len(factory_pinned) == 1
+    assert tuple(factory_pinned[0].get("paths")) == FACTORY_FIXTURE_PATHS
+    assert not factory_pinned[0].get("regexes")
+    assert not factory_pinned[0].get("stopwords")
+    own_repo = [item for item in factory_lists if isinstance(item, dict) and item.get("regexes")]
+    assert own_repo
+    assert all(item.get("condition") in (None, "", "OR") for item in own_repo)
+
+    slack_lists = _rule("slack-conversation-id").get("allowlists")
+    assert isinstance(slack_lists, list)
+    slack_pinned = [
+        item
+        for item in slack_lists
+        if isinstance(item, dict)
+        and item.get("condition") == "AND"
+        and item.get("commits") == [SYNTHETIC_CHANNEL_COMMIT]
+    ]
+    assert len(slack_pinned) == 1
+    assert tuple(slack_pinned[0].get("paths")) == (SYNTHETIC_CHANNEL_PATH,)
+    assert not slack_pinned[0].get("regexes")
+    assert not slack_pinned[0].get("stopwords")
+    unbound_pins = {
+        UNBOUND_LEGACY_COMMIT: (UNBOUND_LEGACY_PATH,),
+        UNBOUND_CREATION_COMMIT: (UNBOUND_CREATION_PATH,),
+        UNBOUND_LEGACY_REWRITE_COMMIT: (UNBOUND_LEGACY_PATH,),
+        UNBOUND_CREATION_REWRITE_COMMIT: (UNBOUND_CREATION_PATH,),
+    }
+    for commit, paths in unbound_pins.items():
+        pinned = [
+            item
+            for item in slack_lists
+            if isinstance(item, dict)
+            and item.get("condition") == "AND"
+            and item.get("commits") == [commit]
+        ]
+        assert len(pinned) == 1
+        assert tuple(pinned[0].get("paths")) == paths
+        assert not pinned[0].get("regexes")
+        assert not pinned[0].get("stopwords")
+
+    global_commits = set(_gitleaks_config()["allowlist"].get("commits") or [])
+    assert FACTORY_FIXTURE_COMMIT not in global_commits
+    assert SYNTHETIC_CHANNEL_COMMIT not in global_commits
+    assert UNBOUND_LEGACY_COMMIT not in global_commits
+    assert UNBOUND_CREATION_COMMIT not in global_commits
+    assert UNBOUND_LEGACY_REWRITE_COMMIT not in global_commits
+    assert UNBOUND_CREATION_REWRITE_COMMIT not in global_commits
+
+
+def test_new_commits_of_the_fixture_shapes_still_match(tmp_path: Path) -> None:
+    """The pinned commits do not excuse the same fixture text anywhere else."""
+    repo, base_sha = _new_repo(tmp_path / "repo")
+    (repo / ".gitleaks.toml").write_bytes(GITLEAKS_CONFIG_PATH.read_bytes())
+    display_key = "".join(("acme", "/fixture#", "7"))
+    channel = "".join(("C0", "SYNTHETIC"))
+    unbound = "".join(("C0", "UNBOUND"))
+
+    def repo_path(*parts: str) -> str:
+        return "/".join(parts)
+
+    factory_paths = (
+        repo_path("tools", "factory-e2e", "tests", "test_acceptance.py"),
+        repo_path("tools", "factory-e2e", "tests", "test_factory_e2e_loop.py"),
+        repo_path("tools", "factory-e2e", "tests", "test_gitlab_acceptance.py"),
+        repo_path("tools", "factory-e2e", "tests", "other_probe.py"),
+    )
+    for relative in factory_paths:
+        path = repo / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(f'display_key = "{display_key}"\n', encoding="utf-8")
+    learning_rel = repo_path("apps", "worker", "src", "curie_worker", "eval", "learning.py")
+    learning = repo / learning_rel
+    learning.parent.mkdir(parents=True, exist_ok=True)
+    learning.write_text(
+        f'SYNTHETIC_CHANNEL = "{channel}"\nreply_channel = "{unbound}"\n',
+        encoding="utf-8",
+    )
+    other_rel = repo_path("apps", "worker", "src", "curie_worker", "eval", "other.py")
+    other = repo / other_rel
+    other.write_text(
+        f'SYNTHETIC_CHANNEL = "{channel}"\nreply_channel = "{unbound}"\n',
+        encoding="utf-8",
+    )
+    head_sha = _commit(repo, "reintroduce fixture shapes")
+
+    scan = _scan(repo, f"{base_sha}..{head_sha}", report_path="/repo/findings.json")
+
+    assert scan.returncode == 1, _scan_diagnostics(scan)
+    findings = json.loads((repo / "findings.json").read_text(encoding="utf-8"))
+    by_file: dict[str, set[str]] = {}
+    for finding in findings:
+        by_file.setdefault(str(finding["File"]), set()).add(str(finding["RuleID"]))
+    for relative in factory_paths:
+        assert "cross-repo-issue-ref" in by_file.get(relative, set()), by_file
+    assert "slack-conversation-id" in by_file.get(learning_rel, set()), by_file
+    assert "slack-conversation-id" in by_file.get(other_rel, set()), by_file
+
+
+def _path_allowlist() -> list[re.Pattern[str]]:
+    paths = _gitleaks_config()["allowlist"]["paths"]
+    assert isinstance(paths, list)
+    return [re.compile(str(pattern)) for pattern in paths]
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "cli/target/release/curie",
+        "cli/target-linux-arm64/x",
+        "apps/ui/node_modules/a/b.js",
+        "apps/ui/dist/index.js",
+        ".venv/lib/x.py",
+        "dist/checksums.txt",
+        "build/x",
+        "node_modules/x",
+        "packages/telemetry/build/lib/x.py",
+        "apps/api/.venv/x",
+        "runner/dist/x.whl",
+        ".pytest_cache/v/x",
+        "uv.lock",
+        "cli/Cargo.lock",
+        "apps/ui/pnpm-lock.yaml",
+        "packages/aci-protocol/generated/x.py",
+        ".gitleaks.toml",
+    ],
+)
+def test_path_allowlist_skips_known_generated_roots(path: str) -> None:
+    assert any(pattern.search(path) for pattern in _path_allowlist()), (
+        f"{path} is a known generated root and must be skipped by the scan"
+    )
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "docs/build/notes.md",
+        "examples/sre-bot/dist/config.yaml",
+        "charts/curie/target/values.yaml",
+        "apps/ui/src/build/x.ts",
+        "cli/src/target/x.rs",
+        "docs/node_modules/x",
+        "examples/x/.venv/y",
+        "packages/telemetry/src/build/x.py",
+        "deep/nested/dist/x",
+        "release/target-linux-amd64/x",
+    ],
+)
+def test_path_allowlist_does_not_skip_tracked_source_at_depth(path: str) -> None:
+    matching = [p.pattern for p in _path_allowlist() if p.search(path)]
+    assert matching == [], f"{path} is not a generated root but is skipped by {matching}"
+
+
+def _aws_account_probe() -> str:
+    # Built at runtime so this source never holds a literal the aws-account-id
+    # rule matches. The digits are random and never the 000000000000 placeholder.
+    digits = "".join(secrets.choice(string.digits[1:]) for _ in range(12))
+    return "role: " + "arn:aws:" + "iam::" + digits + ":role/probe\n"
+
+
+@pytest.mark.parametrize(
+    ("relative_path", "expected_findings"),
+    [
+        ("docs/build/leak.txt", 1),
+        ("cli/target/leak.txt", 0),
+    ],
+)
+def test_path_allowlist_scopes_the_scanner_to_generated_roots(
+    tmp_path: Path, relative_path: str, expected_findings: int
+) -> None:
+    repo, base_sha = _new_repo(tmp_path / "repo")
+    (repo / ".gitleaks.toml").write_bytes(GITLEAKS_CONFIG_PATH.read_bytes())
+    leak = repo / relative_path
+    leak.parent.mkdir(parents=True)
+    leak.write_text(_aws_account_probe(), encoding="utf-8")
+    head_sha = _commit(repo, "add probe")
+
+    scan = _scan(repo, f"{base_sha}..{head_sha}", report_path="/repo/findings.json")
+
+    assert scan.returncode == (1 if expected_findings else 0), _scan_diagnostics(scan)
+    findings = json.loads((repo / "findings.json").read_text(encoding="utf-8"))
+    assert len(findings) == expected_findings
+    assert {finding["RuleID"] for finding in findings} <= {"aws-account-id"}
+
+
+def test_merge_group_scans_only_the_event_commit_range(tmp_path: Path) -> None:
+    steps = _gitleaks_job()["steps"]
+    scope = next(step for step in steps
+                 if step.get("if") == "github.event_name == 'merge_group'")
+    script = scope["run"]
+    base, head = "a" * 40, "b" * 40
+    script = script.replace("${{ github.event.merge_group.base_sha }}", base)
+    script = script.replace("${{ github.event.merge_group.head_sha }}", head)
+    assert "${{" not in script
+    output = tmp_path / "env"
+    result = subprocess.run(["bash", "-e", "-c", script],
+                            env={"GITHUB_ENV": str(output)}, capture_output=True, text=True)
+    assert result.returncode == 0, result.stderr
+    assert output.read_text().strip() == f"GITLEAKS_LOG_OPTS=--log-opts={base}..{head}"

@@ -6,10 +6,9 @@
 //! both flags or the handler refused to look them up. These run the real
 //! binary against stubbed kubectl/helm and a wire-level platform API.
 
-mod support;
+use crate::support;
 
-#[path = "support/executable.rs"]
-mod test_executable;
+use crate::support::executable as test_executable;
 
 use std::ffi::OsString;
 use std::fs;

@@ -1,0 +1,57 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.curietech.ai/cli/directory/v1.json",
+  "title": "curie cluster directory --json",
+  "description": "A directory administration dry-run plan or the selected tenant/resource and unmodified platform API result. The API owns nested result validation; config and admin pages are objects, while team listings are arrays.",
+  "oneOf": [
+    {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "dry_run": {
+          "const": true
+        },
+        "plan": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      },
+      "required": [
+        "dry_run",
+        "plan"
+      ]
+    },
+    {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "tenant_id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "resource": {
+          "enum": [
+            "config",
+            "people",
+            "links",
+            "namespaces",
+            "teams"
+          ]
+        },
+        "result": {
+          "type": [
+            "object",
+            "array"
+          ]
+        }
+      },
+      "required": [
+        "tenant_id",
+        "resource",
+        "result"
+      ]
+    }
+  ]
+}

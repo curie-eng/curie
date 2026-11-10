@@ -6,7 +6,7 @@
   "keywords": ["template", "mcp", "stdio", "engine"],
   "starterPrompts": [
     "Explain what text analysis tools you have.",
-    "Count the words and sentences in: Curie makes agents portable.",
+    "Count the words and characters in: Curie makes agents portable.",
     "Analyze the readability of: Clear tools make complex work easier."
   ]
 }

@@ -1,5 +1,7 @@
-# This bundle's stdio MCP servers ship in its own runner layer (ADR 0173), not
-# in the platform runner. Build it before deploying:
+# This bundle's repository toolchains ship in its own runner layer (ADR 0173), not
+# in the platform runner. Each Curie release publishes it, and
+# `curie example dark-factory render` locks its digest. After editing
+# runner.Dockerfile, rebuild it:
 #   curie build --plugin-dir <this directory> --registry <ref>
 connectors: {}
 runner:

@@ -17,19 +17,16 @@ which is the same client/server drift #1212 exists to correct. It is read-only
 
 from fastapi import APIRouter, Depends
 
-from .. import crud
+from curie_api.crud import agents as crud_agents
+from curie_api.gitflow import target_agent_name
+from curie_api.schemas.deployments import RoutingCheck, RoutingCheckProblem, RoutingCheckRequest
+
 from ..auth import require_api_key
 from ..config import get_settings
 from ..deploy_target_parsing import parse_deploy_targets
 from ..deps import SessionDep
-from ..gitflow import (
-    TargetUnresolved,
-    _target_agent_name,
-    environment_for_ref,
-    resolve_target_agent,
-)
+from ..gitflow import TargetUnresolved, environment_for_ref, resolve_target_agent
 from ..models import Environment
-from ..schemas import RoutingCheck, RoutingCheckProblem, RoutingCheckRequest
 
 router = APIRouter(tags=["git-flow"], dependencies=[Depends(require_api_key)])
 
@@ -80,7 +77,7 @@ async def check_git_flow_routing(body: RoutingCheckRequest, session: SessionDep)
     on exactly the shape the ADR asks operators to adopt.
     """
 
-    repo_agents = await crud.get_agents_by_repo(session, body.repo_full_name)
+    repo_agents = await crud_agents.get_agents_by_repo(session, body.repo_full_name)
 
     # Parsing happens before the empty-repo_agents short-circuit below,
     # deliberately: whether the body is well-formed is request validation, and
@@ -107,9 +104,9 @@ async def check_git_flow_routing(body: RoutingCheckRequest, session: SessionDep)
 
     unresolvable: list[RoutingCheckProblem] = []
     for environment in _reachable_environments():
-        named = _target_agent_name(targets, environment)
+        named = target_agent_name(targets, environment)
         named_elsewhere = (
-            await crud.get_agent_by_name(session, named)
+            await crud_agents.get_agent_by_name(session, named)
             if named and not any(a.name == named for a in repo_agents)
             else None
         )

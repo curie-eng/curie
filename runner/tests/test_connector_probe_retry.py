@@ -230,7 +230,8 @@ def test_probe_does_not_retry_a_deterministic_misconfiguration() -> None:
     assert len(failures) == 1
     failure = failures[0]
     assert failure.reason == "probe_misconfigured"
-    assert "misconfigured" in failure.caller_message()
+    assert "connection settings" in failure.caller_message()
+    assert "misconfigured" in failure.diagnostic_message()
     assert "capability probe failed" not in failure.caller_message()
 
 

@@ -1,0 +1,102 @@
+{
+  "expand": "renderedFields,names,schema,operations,editmeta,changelog,versionedRepresentations,customfield_10010.requestTypePractice",
+  "id": "10002",
+  "self": "https://acme.atlassian.example/rest/api/3/issue/10002",
+  "key": "ED-1",
+  "fields": {
+    "summary": "Main order flow broken",
+    "description": null,
+    "labels": [],
+    "status": {
+      "self": "https://acme.atlassian.example/rest/api/3/status/10000",
+      "description": "",
+      "iconUrl": "https://acme.atlassian.example/",
+      "name": "To Do",
+      "id": "10000",
+      "statusCategory": {
+        "self": "https://acme.atlassian.example/rest/api/3/statuscategory/2",
+        "id": 2,
+        "key": "new",
+        "colorName": "blue-gray",
+        "name": "To Do"
+      }
+    },
+    "components": [],
+    "updated": "2026-03-08T01:59:30.000-0500",
+    "created": "2026-03-08T01:00:00.000-0500",
+    "issuetype": {
+      "self": "https://acme.atlassian.example/rest/api/3/issuetype/10001",
+      "id": "10001",
+      "description": "A small, distinct piece of work.",
+      "iconUrl": "https://acme.atlassian.example/rest/api/2/universal_avatar/view/type/issuetype/avatar/10318?size=medium",
+      "name": "Task",
+      "subtask": false,
+      "avatarId": 10318,
+      "entityId": "00000000-0000-4000-8000-0000000000e1",
+      "hierarchyLevel": 0
+    },
+    "project": {
+      "self": "https://acme.atlassian.example/rest/api/3/project/10000",
+      "id": "10000",
+      "key": "ED",
+      "name": "Example Delivery",
+      "projectTypeKey": "software",
+      "simplified": true,
+      "avatarUrls": {
+        "48x48": "https://avatar-management.example/initials/CF-5.png?size=48",
+        "24x24": "https://avatar-management.example/initials/CF-5.png?size=24",
+        "16x16": "https://avatar-management.example/initials/CF-5.png?size=16",
+        "32x32": "https://avatar-management.example/initials/CF-5.png?size=32"
+      }
+    },
+    "priority": {
+      "self": "https://acme.atlassian.example/rest/api/3/priority/3",
+      "iconUrl": "https://acme.atlassian.example/images/icons/priorities/medium.svg",
+      "name": "Medium",
+      "id": "3"
+    },
+    "resolution": null,
+    "resolutiondate": null,
+    "assignee": null,
+    "reporter": {
+      "self": "https://acme.atlassian.example/rest/api/3/user?accountId=5b10a0000000000000000001",
+      "accountId": "5b10a0000000000000000001",
+      "accountType": "atlassian",
+      "emailAddress": "mia@example.com",
+      "avatarUrls": {
+        "48x48": "https://avatar-management.example/initials/CF-5.png?size=48",
+        "24x24": "https://avatar-management.example/initials/CF-5.png?size=24",
+        "16x16": "https://avatar-management.example/initials/CF-5.png?size=16",
+        "32x32": "https://avatar-management.example/initials/CF-5.png?size=32"
+      },
+      "displayName": "Mia Krystof",
+      "active": true,
+      "timeZone": "Australia/Sydney",
+      "locale": "en_US"
+    },
+    "creator": {
+      "self": "https://acme.atlassian.example/rest/api/3/user?accountId=5b10a0000000000000000001",
+      "accountId": "5b10a0000000000000000001",
+      "accountType": "atlassian",
+      "emailAddress": "mia@example.com",
+      "avatarUrls": {
+        "48x48": "https://avatar-management.example/initials/CF-5.png?size=48",
+        "24x24": "https://avatar-management.example/initials/CF-5.png?size=24",
+        "16x16": "https://avatar-management.example/initials/CF-5.png?size=16",
+        "32x32": "https://avatar-management.example/initials/CF-5.png?size=32"
+      },
+      "displayName": "Mia Krystof",
+      "active": true,
+      "timeZone": "Australia/Sydney",
+      "locale": "en_US"
+    },
+    "watches": {
+      "self": "https://acme.atlassian.example/rest/api/3/issue/ED-1/watchers",
+      "watchCount": 1,
+      "isWatching": false
+    },
+    "lastViewed": null,
+    "environment": null,
+    "duedate": null
+  }
+}

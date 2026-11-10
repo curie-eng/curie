@@ -37,9 +37,11 @@ a bundle stays safe to commit.
 
 from __future__ import annotations
 
+import ipaddress
 import re
+from decimal import Decimal
 from pathlib import PurePosixPath
-from typing import Any
+from typing import Any, Final
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -49,6 +51,7 @@ from .reserved_env import SECRET_NAME_RE, is_reserved_boot_env_name
 # (the deploy validator, the approval-policy gate-name derivation, the API's
 # bundle reader) names one constant rather than its own copy of the string.
 CONNECTORS_FILE = "connectors.yaml"
+HOOK_WAKE_KEY_ENV: Final = "CURIE_HOOK_WAKE_KEY"
 
 # A connector name becomes a Kubernetes object name and a DNS label, so it is
 # held to the stricter of those: lowercase alphanumeric and dashes, starting and
@@ -73,7 +76,9 @@ class SecretRef(BaseModel):
 
     # The env var the connector reads.
     name: str
-    # The Kubernetes Secret holding it, provisioned out of band.
+    # The Kubernetes Secret holding it, provisioned out of band. May carry
+    # `${CURIE_AGENT}`, expanded at render to the deploying agent's name, so
+    # one bundle deployed as several agents can give each its own Secret.
     from_secret: str
     # The key within that Secret. Defaults to the env var name, which is the
     # common case and saves repeating it.
@@ -111,6 +116,223 @@ class ConnectorBuild(BaseModel):
     # default would pick an architecture on the author's behalf without saying
     # so.
     platforms: list[str]
+
+
+def is_loopback_upstream_host(text: str) -> bool:
+    """Whether ``text`` may be ``proxy_upstream_host`` (ADR 0229).
+
+    ``localhost`` or a loopback address in its canonical spelling, with no port
+    or brackets. The proxy forwards to loopback only, so a loopback Host is the
+    only one that is true of the connection.
+    """
+
+    if text == "localhost":
+        return True
+    try:
+        address = ipaddress.ip_address(text)
+    except ValueError:
+        return False
+    return address.is_loopback and str(address) == text
+
+
+class ConnectorResourceQuantities(BaseModel):
+    """CPU and memory for one side (``requests`` or ``limits``) of ``resources``.
+
+    Strings, as Kubernetes writes them (``100m``, ``1Gi``). A key left out keeps
+    the server container's default for that key.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    cpu: str | None = None
+    memory: str | None = None
+
+
+class ConnectorResources(BaseModel):
+    """A hosted connector's server-container ``resources``, merged per key.
+
+    Each declared value replaces only its own key in
+    ``DEFAULT_SERVER_RESOURCES``, so ``limits: {memory: 1Gi}`` keeps the other
+    three defaults. The caller proxy's resources are not configurable here.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    requests: ConnectorResourceQuantities | None = None
+    limits: ConnectorResourceQuantities | None = None
+
+
+class ConnectorScratch(BaseModel):
+    """A hosted connector's bounded writable scratch volume (#5415).
+
+    A disk-backed ``emptyDir`` with ``size_limit`` as its ``sizeLimit``,
+    mounted read-write at ``path`` on the server container alone. Both keys are
+    required: an unbounded scratch volume could fill the node's disk.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    path: str
+    size_limit: str
+
+
+# The server container's resources when a connector declares none. Owned here
+# rather than in the renderer so validation compares a declared request with
+# the limit it will actually run under.
+DEFAULT_SERVER_RESOURCES: Final[dict[str, dict[str, str]]] = {
+    "requests": {"cpu": "10m", "memory": "64Mi"},
+    "limits": {"cpu": "500m", "memory": "256Mi"},
+}
+
+# A positive Kubernetes quantity: digits with an optional fraction, then an
+# optional binary or decimal suffix or a decimal exponent. A subset of what
+# Kubernetes parses: no sign and no bare leading dot, which no connector needs.
+_QUANTITY_RE = re.compile(
+    r"(?P<number>[0-9]+(?:\.[0-9]+)?)"
+    r"(?:(?P<suffix>Ki|Mi|Gi|Ti|Pi|Ei|n|u|m|k|M|G|T|P|E)|[eE](?P<exponent>[+-]?[0-9]+))?"
+)
+_QUANTITY_SCALE: Final[dict[str, Decimal]] = {
+    "Ki": Decimal(2**10),
+    "Mi": Decimal(2**20),
+    "Gi": Decimal(2**30),
+    "Ti": Decimal(2**40),
+    "Pi": Decimal(2**50),
+    "Ei": Decimal(2**60),
+    "n": Decimal("1e-9"),
+    "u": Decimal("1e-6"),
+    "m": Decimal("1e-3"),
+    "k": Decimal("1e3"),
+    "M": Decimal("1e6"),
+    "G": Decimal("1e9"),
+    "T": Decimal("1e12"),
+    "P": Decimal("1e15"),
+    "E": Decimal("1e18"),
+}
+
+
+def parse_quantity(text: str) -> Decimal | None:
+    """The value of a positive Kubernetes quantity, or None when malformed."""
+
+    match = _QUANTITY_RE.fullmatch(text)
+    if match is None:
+        return None
+    if match["exponent"] is not None:
+        # Built from the string, not multiplied, so a large exponent cannot
+        # overflow the decimal context.
+        value = Decimal(f"{match['number']}e{match['exponent']}")
+    else:
+        value = Decimal(match["number"]) * _QUANTITY_SCALE.get(match["suffix"] or "", Decimal(1))
+    return value if value > 0 else None
+
+
+def is_valid_readiness_path(text: str) -> bool:
+    """Whether ``text`` may be ``readiness_path``.
+
+    An absolute HTTP path, printable ASCII with no whitespace, no query and no
+    fragment: the kubelet sends it as the request target verbatim.
+    """
+
+    return (
+        text.startswith("/")
+        and all("!" <= ch <= "~" for ch in text)
+        and "?" not in text
+        and "#" not in text
+    )
+
+
+# `scratch.size_limit`: whole bytes with an optional binary suffix, bounded.
+# Narrower than a Kubernetes quantity so the CLI's local tier, which must turn
+# it into a tmpfs size, reads it exactly as this module does; the shared
+# reading is tests/vectors/connector-scratch-size.json.
+_SCRATCH_SIZE_RE = re.compile(r"(?P<number>[1-9][0-9]*)(?P<suffix>Ki|Mi|Gi)?")
+_SCRATCH_SIZE_SCALE: Final[dict[str, int]] = {"": 1, "Ki": 2**10, "Mi": 2**20, "Gi": 2**30}
+SCRATCH_MIN_BYTES: Final = 2**20
+# Spool space on the node's ephemeral disk, not storage.
+SCRATCH_MAX_BYTES: Final = 64 * 2**30
+# Mounting over these would shadow the image's or the runtime's own files.
+SCRATCH_RESERVED_DIRS: Final = (
+    "/bin",
+    "/boot",
+    "/dev",
+    "/etc",
+    "/lib",
+    "/lib64",
+    "/proc",
+    "/run",
+    "/sbin",
+    "/sys",
+    "/usr",
+)
+_SCRATCH_SEGMENT_RE = re.compile(r"[A-Za-z0-9._-]+")
+
+
+def scratch_size_bytes(text: str) -> int | None:
+    """The bytes a ``scratch.size_limit`` means, or None when it is refused."""
+
+    match = _SCRATCH_SIZE_RE.fullmatch(text)
+    if match is None:
+        return None
+    size = int(match["number"]) * _SCRATCH_SIZE_SCALE[match["suffix"] or ""]
+    return size if SCRATCH_MIN_BYTES <= size <= SCRATCH_MAX_BYTES else None
+
+
+def _is_at_or_under(path: str, directory: str) -> bool:
+    return path == directory or path.startswith(directory + "/")
+
+
+def is_valid_scratch_path(text: str) -> bool:
+    """Whether ``text`` may be ``scratch.path``: a dedicated absolute directory."""
+
+    if not text.startswith("/") or text == "/":
+        return False
+    segments = text[1:].split("/")
+    if not all(
+        _SCRATCH_SEGMENT_RE.fullmatch(segment) is not None and segment not in {".", ".."}
+        for segment in segments
+    ):
+        return False
+    return not any(_is_at_or_under(text, reserved) for reserved in SCRATCH_RESERVED_DIRS)
+
+
+# ADR 0240 decision 1. The MCP path every hosted entry dials
+# (``connector_render.mcp_entry``); a route may not shadow it.
+MCP_PATH: Final = "/mcp"
+ROUTE_METHODS: Final = ("POST", "PUT")
+ROUTE_MAX_BODY_BYTES_CEILING: Final = 256 * 1024 * 1024
+_ROUTE_SEGMENT_RE = re.compile(r"[A-Za-z0-9._~-]+")
+
+
+def is_valid_route_path(text: str) -> bool:
+    """Whether ``text`` may be a declared route's ``path`` (ADR 0240 decision 1).
+
+    Absolute, matched exactly, so only unreserved characters and ``/``: no
+    empty, ``.`` or ``..`` segment, no percent encoding, and nothing at or
+    under the MCP path.
+    """
+
+    if not text.startswith("/") or text == MCP_PATH or text.startswith(MCP_PATH + "/"):
+        return False
+    segments = text[1:].split("/")
+    return all(
+        _ROUTE_SEGMENT_RE.fullmatch(segment) is not None and segment not in {".", ".."}
+        for segment in segments
+    )
+
+
+class ConnectorRoute(BaseModel):
+    """One non-MCP route a hosted connector serves its bundle's stdio servers.
+
+    ADR 0240 decision 1. ``callers`` names stdio servers in the bundle's own MCP
+    config; ``validate_bundle`` checks them, because this file cannot see that
+    config.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    path: str
+    methods: list[str] = Field(default_factory=lambda: ["POST"])
+    max_body_bytes: int = Field(strict=True)
+    callers: list[str]
 
 
 class ConnectorSpec(BaseModel):
@@ -158,6 +380,32 @@ class ConnectorSpec(BaseModel):
     # `self` too. Entries are carried as written; nothing resolves `self` here.
     admits: list[str] | None = None
 
+    # The Host the caller proxy presents to the server on requests it has
+    # admitted (ADR 0229). None forwards the caller's Host, which an
+    # allowed-hosts server needs. A loopback host is for a server that refuses
+    # a non-loopback Host on a loopback connection, as the proxy's forward is.
+    # Rendered into the proxy alone; direct requests keep their own Host.
+    proxy_upstream_host: str | None = None
+
+    # An HTTP path the server answers once it can serve. Set, the server
+    # container's readiness probe is an `httpGet` on it instead of the default
+    # `tcpSocket` check; a probe carries exactly one handler. None keeps the
+    # `tcpSocket` probe. The caller proxy's probe never changes.
+    readiness_path: str | None = None
+
+    # Non-MCP routes the caller proxy admits a connector-scoped route token on,
+    # each with its own body limit and the bundle stdio servers that may call
+    # it (ADR 0240). Empty leaves the proxy exactly as it is.
+    routes: list[ConnectorRoute] = Field(default_factory=list)
+
+    # The server container's requests and limits, merged per key over
+    # DEFAULT_SERVER_RESOURCES. None renders the defaults unchanged.
+    resources: ConnectorResources | None = None
+
+    # A bounded writable volume for the server container (#5415). None mounts
+    # nothing writable, which keeps the render unchanged.
+    scratch: ConnectorScratch | None = None
+
     # -- remote form --
     url: str | None = None
     headers: dict[str, str] = Field(default_factory=dict)
@@ -193,6 +441,17 @@ class ConnectorSpec(BaseModel):
     #                                         set this rather than silently
     #                                         using secrets[0] (#2559).
     bearer_secret: str | None = None
+
+    #   no_client_auth: <reason>              The server authenticates no
+    #                                         client, so Curie derives no
+    #                                         Authorization header and binds
+    #                                         no secret name into the sandbox.
+    #                                         Hosted form only. The text is a
+    #                                         reviewer-facing reason, must be
+    #                                         non-empty, and is never rendered.
+    #                                         Declared secrets keep their
+    #                                         pod-side secretKeyRef delivery.
+    no_client_auth: str | None = None
 
     #   sealed_secrets:                       The bundle CARRIES the credential,
     #     TOKEN: AgBv3n2K...                  encrypted to the cluster that will
@@ -233,6 +492,18 @@ class ConnectorSpec(BaseModel):
     # place for a credential and an emptyDir there would shadow the mount.
     secret_files: dict[str, str] = Field(default_factory=dict)
 
+    #   config: [FOLDER_PATH, CHANNEL_ID]     Per-agent NON-secret settings.
+    #
+    # Some servers need a per-agent value that is not a credential -- a folder
+    # path, a channel id. `env` is static per bundle, so before this the only
+    # per-agent channel was `secrets:`, and a setting declared there counted
+    # toward `bearer_secret_required` and could become the derived
+    # Authorization header. A `config` name resolves from the same per-agent
+    # store and renders the same secretKeyRef on the connector pod, but it is
+    # never a credential: it never derives the Bearer, never reaches the
+    # sandbox, and stays out of `secret_names()`. Hosted form only.
+    config: list[str] = Field(default_factory=list)
+
     def secret_names(self) -> list[str]:
         """Env var names this connector needs, any form."""
 
@@ -266,7 +537,20 @@ class ConnectorSpec(BaseModel):
         """
 
         named = [s for s in self.secrets if isinstance(s, str)]
-        return named + list(self.secret_files)
+        # `config` values live in the same per-agent Secret and the renderer
+        # points secretKeyRefs at them, so the deploy path must write them too.
+        return named + list(self.secret_files) + list(self.config)
+
+    def server_resources(self) -> dict[str, dict[str, str]]:
+        """The server container's resources: the defaults, overridden per key."""
+
+        merged = {side: dict(values) for side, values in DEFAULT_SERVER_RESOURCES.items()}
+        if self.resources is not None:
+            for side in ("requests", "limits"):
+                declared = getattr(self.resources, side)
+                if declared is not None:
+                    merged[side].update(declared.model_dump(exclude_none=True))
+        return merged
 
     @property
     def is_hosted(self) -> bool:
@@ -302,29 +586,30 @@ class ConnectorsFile(BaseModel):
 
 _NAME_RE = re.compile(r"[a-z0-9]([a-z0-9-]*[a-z0-9])?")
 
-# The two keys Curie's own platform MCP servers occupy on
-# ``ClaudeAgentOptions.mcp_servers``: the approval server and the durable
-# state server. A connector declaring one of these names replaces a platform
-# server in the agent's session -- silently, since both ride the same map a
-# declared connector rides -- and the agent loses ``request_approval`` or the
-# state tools with nothing logged until a skill calls one.
+# Reserve the existing approval and durable state server keys, plus the
+# channel read capability identity. A connector declaring a reserved name
+# could replace the platform server in the session's MCP map and displace
+# the capability named below.
 #
-# The fence is these two exact names, not the ``curie-`` prefix, so a
-# legitimate connector called ``curie-docs`` stays legal.
+# The fence matches exact names, so ``curie-docs`` remains legal.
 #
-# The real owners are ``runner/src/curie_runner/approval.py``
+# The existing active server owners are ``runner/src/curie_runner/approval.py``
 # ``APPROVAL_SERVER_NAME`` and ``runner/src/curie_runner/state.py``
 # ``STATE_SERVER_NAME``. ``runner`` depends on ``plugin-format``, never the
 # reverse, so this validator cannot import those constants and re-enumerates
 # them instead. ``runner/tests/test_connectors.py`` is the drift pin that
-# keeps this copy honest.
+# keeps the existing active server names honest. Reservation alone does not
+# imply that a server is mounted or exempt from tool policy.
 #
 # What each reserved name would displace, keyed by name, so the reserved-name
 # error message and the reserved set share one source instead of two hand
 # maintained copies.
+CHANNEL_READ_SERVER_NAME: Final = "curie-slack"
+
 _RESERVED_CONNECTOR_DISPLACES: dict[str, str] = {
     "curie": "`request_approval`",
     "curie-state": "the durable-state tools",
+    CHANNEL_READ_SERVER_NAME: "the granted platform Slack capability (channel read and canvases)",
 }
 RESERVED_CONNECTOR_NAMES: frozenset[str] = frozenset(_RESERVED_CONNECTOR_DISPLACES)
 
@@ -346,6 +631,50 @@ def _known_placeholders() -> frozenset[str]:
     from .connector_render import PLACEHOLDERS
 
     return frozenset(PLACEHOLDERS)
+
+
+def _validate_secret_ref_template(
+    where: str, declared: SecretRef, errors: list[tuple[str, str]]
+) -> None:
+    """Check a ``from_secret`` that carries a placeholder.
+
+    Only ``${CURIE_AGENT}`` is substituted there, and it must expand to a
+    Kubernetes Secret name for EVERY valid agent name, because the same bundle
+    deploys as agents the author never saw. An agent name is an RFC 1123 label
+    of at most ``_NAME_MAX`` characters, so substituting the longest such label
+    decides both the shape and the length for all of them. A literal value is
+    not checked here: its validation is unchanged.
+    """
+
+    from .connector_render import SECRET_REF_PLACEHOLDERS, is_secret_name
+
+    remainder = declared.from_secret
+    for placeholder in SECRET_REF_PLACEHOLDERS:
+        remainder = remainder.replace(f"${{{placeholder}}}", "")
+    if "${" in remainder:
+        known = ", ".join(f"${{{p}}}" for p in SECRET_REF_PLACEHOLDERS)
+        errors.append(
+            (
+                "connectors.secret_ref_unknown_placeholder",
+                f"{where}: `{declared.name}` sets `from_secret: {declared.from_secret}`, "
+                f"but a Secret name may carry only {known}. Anything else would reach "
+                "the cluster as literal text in the Secret name.",
+            )
+        )
+        return
+    widest = declared.from_secret
+    for placeholder in SECRET_REF_PLACEHOLDERS:
+        widest = widest.replace(f"${{{placeholder}}}", "a" * _NAME_MAX)
+    if not is_secret_name(widest):
+        errors.append(
+            (
+                "connectors.secret_ref_bad_name",
+                f"{where}: `{declared.name}` sets `from_secret: {declared.from_secret}`, "
+                "which does not expand to a Kubernetes Secret name for every agent name "
+                "(lowercase alphanumeric, `-` or `.`, starting and ending alphanumeric, "
+                f"at most 253 characters with a {_NAME_MAX}-character agent name).",
+            )
+        )
 
 
 def _forges_the_render_join(name: str) -> bool:
@@ -418,6 +747,86 @@ def _escapes(path: str) -> bool:
     return False
 
 
+def _validate_scratch(
+    where: str, spec: ConnectorSpec, scratch: ConnectorScratch, errors: list[tuple[str, str]]
+) -> None:
+    if spec.url is not None:
+        errors.append(
+            (
+                "connectors.remote_has_scratch",
+                f"{where}: `scratch` mounts a volume into a container Curie starts; a `url` "
+                "connector is already running elsewhere, so it would mount nothing",
+            )
+        )
+        return
+    if not is_valid_scratch_path(scratch.path):
+        errors.append(
+            (
+                "connectors.bad_scratch_path",
+                f"{where}: scratch.path is {scratch.path!r}; it must be an absolute path of "
+                "letters, digits, `.`, `_`, `-` and `/` with no empty, `.` or `..` segment, "
+                f"not `/` and not at or under {', '.join(SCRATCH_RESERVED_DIRS)}",
+            )
+        )
+    else:
+        for name, mount in sorted(spec.secret_files.items()):
+            if _is_at_or_under(mount, scratch.path) or _is_at_or_under(scratch.path, mount):
+                errors.append(
+                    (
+                        "connectors.scratch_overlaps_secret_file",
+                        f"{where}: scratch.path {scratch.path} overlaps secret_files[{name}] "
+                        f"at {mount}; a credential does not belong in writable scratch space, "
+                        "and either mount would shadow the other",
+                    )
+                )
+    if scratch_size_bytes(scratch.size_limit) is None:
+        errors.append(
+            (
+                "connectors.bad_scratch_size",
+                f"{where}: scratch.size_limit is {scratch.size_limit!r}; it must be a whole "
+                "number of bytes with an optional Ki, Mi or Gi suffix, from 1Mi to 64Gi",
+            )
+        )
+
+
+def _validate_resources(
+    where: str, spec: ConnectorSpec, resources: ConnectorResources, errors: list[tuple[str, str]]
+) -> None:
+    """Each declared quantity parses, and each merged request fits its limit."""
+
+    malformed = False
+    for side in ("requests", "limits"):
+        declared = getattr(resources, side)
+        if declared is None:
+            continue
+        for key, value in declared.model_dump(exclude_none=True).items():
+            if parse_quantity(value) is None:
+                malformed = True
+                errors.append(
+                    (
+                        "connectors.bad_resources",
+                        f"{where}: resources.{side}.{key} is {value!r}; it must be a "
+                        "positive Kubernetes quantity such as `250m`, `1` or `512Mi`",
+                    )
+                )
+    if malformed:
+        return
+    merged = spec.server_resources()
+    for key in ("cpu", "memory"):
+        request = parse_quantity(merged["requests"][key])
+        limit = parse_quantity(merged["limits"][key])
+        if request is not None and limit is not None and request > limit:
+            errors.append(
+                (
+                    "connectors.bad_resources",
+                    f"{where}: the {key} request {merged['requests'][key]} exceeds the "
+                    f"{key} limit {merged['limits'][key]} (an omitted value is the "
+                    f"default: requests {DEFAULT_SERVER_RESOURCES['requests'][key]}, "
+                    f"limits {DEFAULT_SERVER_RESOURCES['limits'][key]})",
+                )
+            )
+
+
 def _validate_build(
     where: str, build: ConnectorBuild, errors: list[tuple[str, str]]
 ) -> None:
@@ -467,6 +876,40 @@ def _validate_build(
             )
 
 
+def _validate_wake_key_role(where: str, spec: ConnectorSpec, errors: list[tuple[str, str]]) -> None:
+    if spec.bearer_secret == HOOK_WAKE_KEY_ENV:
+        errors.append(
+            ("connectors.wake_key_bearer", f"{where}: the wake key cannot be an MCP bearer")
+        )
+    invalid_secret = any(
+        (isinstance(secret, str) and secret == HOOK_WAKE_KEY_ENV)
+        or (
+            isinstance(secret, SecretRef)
+            and secret.name == HOOK_WAKE_KEY_ENV
+            and not spec.is_hosted
+        )
+        for secret in spec.secrets
+    )
+    expanded = [spec.url or "", spec.unhosted_url or "", *spec.headers.values()]
+    if spec.bearer_secret != HOOK_WAKE_KEY_ENV:
+        expanded.append(spec.bearer_secret or "")
+    if (
+        invalid_secret
+        or HOOK_WAKE_KEY_ENV in spec.secret_files
+        or HOOK_WAKE_KEY_ENV in spec.sealed_secrets
+        or HOOK_WAKE_KEY_ENV in spec.config
+        or HOOK_WAKE_KEY_ENV in spec.env
+        or any(HOOK_WAKE_KEY_ENV in text for text in expanded)
+    ):
+        errors.append(
+            (
+                "connectors.wake_key_delivery",
+                f"{where}: deliver the wake key only through a hosted secrets SecretRef; "
+                "it cannot enter client configuration or the per-agent secret store",
+            )
+        )
+
+
 def validate_connectors(data: Any) -> tuple[ConnectorsFile | None, list[tuple[str, str]]]:
     """Validate parsed ``connectors.yaml`` content.
 
@@ -484,7 +927,7 @@ def validate_connectors(data: Any) -> tuple[ConnectorsFile | None, list[tuple[st
 
     try:
         parsed = ConnectorsFile.model_validate(data)
-    except Exception as exc:  # pydantic ValidationError -- surface it verbatim
+    except Exception as exc:  # noqa: BLE001 - pydantic ValidationError -- surface it verbatim
         return None, [("connectors.invalid", str(exc)[:400])]
 
     hosted = {name for name, spec in parsed.connectors.items() if spec.is_hosted}
@@ -505,9 +948,8 @@ def validate_connectors(data: Any) -> tuple[ConnectorsFile | None, list[tuple[st
                 (
                     "connectors.reserved_name",
                     f"{where}: `{name}` is reserved for Curie's own platform MCP server "
-                    "(the approval server / the durable state server), so a connector "
-                    "declaring it would replace that server in the agent's session and "
-                    f"the agent would lose {lost} -- rename the connector",
+                    "so a connector declaring it would replace that server in the "
+                    f"agent's session and the agent would lose {lost}; rename the connector",
                 )
             )
         # A separate `if`, never an `elif` on the shape check above: a name can
@@ -653,6 +1095,83 @@ def validate_connectors(data: Any) -> tuple[ConnectorsFile | None, list[tuple[st
                     "the places it can leak from for no benefit",
                 )
             )
+        if spec.url and spec.config:
+            errors.append(
+                (
+                    "connectors.remote_has_config",
+                    f"{where}: `config` is delivered to a container Curie starts; a `url` "
+                    "connector is already running elsewhere, so the setting would go nowhere",
+                )
+            )
+        if spec.no_client_auth is not None and not spec.no_client_auth.strip():
+            errors.append(
+                (
+                    "connectors.bad_no_client_auth",
+                    f"{where}: `no_client_auth` must state a non-empty reason. The "
+                    "reason is what a reviewer reads to judge why no client credential "
+                    "is derived, so a blank declaration carries no justification",
+                )
+            )
+        if spec.url and spec.no_client_auth is not None:
+            errors.append(
+                (
+                    "connectors.remote_has_no_client_auth",
+                    f"{where}: `no_client_auth` applies to a connector Curie hosts; a "
+                    "`url` connector is already running elsewhere and Curie derives no "
+                    "Authorization header for it, so the declaration would change nothing",
+                )
+            )
+        if spec.no_client_auth is not None and spec.bearer_secret is not None:
+            errors.append(
+                (
+                    "connectors.no_client_auth_with_bearer_secret",
+                    f"{where}: `no_client_auth` and `bearer_secret` contradict each "
+                    "other: one says no Authorization header is derived, the other "
+                    "names the secret that header expands. Set exactly one",
+                )
+            )
+        credential_names = set(spec.secret_names())
+        seen_config: set[str] = set()
+        for config_name in spec.config:
+            if config_name in seen_config:
+                errors.append(
+                    (
+                        "connectors.duplicate_config",
+                        f"{where}: config lists `{config_name}` more than once",
+                    )
+                )
+                continue
+            seen_config.add(config_name)
+            if config_name in credential_names:
+                errors.append(
+                    (
+                        "connectors.config_is_secret",
+                        f"{where}: {config_name} is declared in both `config` and a secret "
+                        "form. Pick one: a credential must not lose its credential handling, "
+                        "and a setting must not become a Bearer candidate",
+                    )
+                )
+            # The same shape and reserved fence a secret name gets, for the same
+            # reason: the value is resolved from the operator's store and handed
+            # to the bundle's own container.
+            if not SECRET_NAME_RE.match(config_name):
+                errors.append(
+                    (
+                        "connectors.config_name_invalid",
+                        f"{where}: config name {config_name!r} must be an env-var-style "
+                        "name (uppercase letters, digits, underscore; not starting with a "
+                        "digit) -- it is delivered as an environment variable",
+                    )
+                )
+            elif is_reserved_boot_env_name(config_name):
+                errors.append(
+                    (
+                        "connectors.config_name_reserved",
+                        f"{where}: config name {config_name!r} is reserved: it is a "
+                        "platform boot-env, model-credential, or redirect/capture-capable "
+                        "key and cannot be used for connector config",
+                    )
+                )
         if spec.is_hosted and spec.headers:
             errors.append(
                 (
@@ -661,6 +1180,59 @@ def validate_connectors(data: Any) -> tuple[ConnectorsFile | None, list[tuple[st
                     "connector with `env` and `args` instead",
                 )
             )
+        if spec.proxy_upstream_host is not None:
+            if spec.url is not None:
+                errors.append(
+                    (
+                        "connectors.remote_has_proxy_upstream_host",
+                        f"{where}: `proxy_upstream_host` is the Host Curie's caller proxy "
+                        "presents to a connector it hosts; a `url` connector has no such "
+                        "proxy",
+                    )
+                )
+            elif not is_loopback_upstream_host(spec.proxy_upstream_host):
+                errors.append(
+                    (
+                        "connectors.bad_proxy_upstream_host",
+                        f"{where}: `proxy_upstream_host` must be `localhost`, an IPv4 "
+                        "loopback address or `::1`, with no port (the proxy adds the "
+                        f"server's port), got {spec.proxy_upstream_host!r}",
+                    )
+                )
+        if spec.readiness_path is not None:
+            if spec.url is not None:
+                errors.append(
+                    (
+                        "connectors.remote_has_readiness_path",
+                        f"{where}: `readiness_path` sets the readiness probe of a container "
+                        "Curie starts; a `url` connector is already running elsewhere, so it "
+                        "would probe nothing",
+                    )
+                )
+            elif not is_valid_readiness_path(spec.readiness_path):
+                errors.append(
+                    (
+                        "connectors.bad_readiness_path",
+                        f"{where}: `readiness_path` must start with `/` and be printable "
+                        "ASCII with no whitespace, `?` or `#`, got "
+                        f"{spec.readiness_path!r}",
+                    )
+                )
+        if spec.routes:
+            _validate_routes(where, spec, errors)
+        if spec.resources is not None:
+            if spec.url is not None:
+                errors.append(
+                    (
+                        "connectors.remote_has_resources",
+                        f"{where}: `resources` size a container Curie starts; a `url` "
+                        "connector is already running elsewhere, so they would size nothing",
+                    )
+                )
+            else:
+                _validate_resources(where, spec, spec.resources, errors)
+        if spec.scratch is not None:
+            _validate_scratch(where, spec, spec.scratch, errors)
         if spec.admits is not None and spec.url is not None:
             errors.append(
                 (
@@ -707,6 +1279,8 @@ def validate_connectors(data: Any) -> tuple[ConnectorsFile | None, list[tuple[st
                         "API server rejects at apply -- long after the deploy looked fine.",
                     )
                 )
+            elif "${" in declared.from_secret:
+                _validate_secret_ref_template(where, declared, errors)
         for env_name, blob in spec.sealed_secrets.items():
             if not env_name.strip():
                 errors.append(
@@ -742,9 +1316,16 @@ def validate_connectors(data: Any) -> tuple[ConnectorsFile | None, list[tuple[st
         # credential resolved from their environment or vault and handed to the
         # bundle's own container, and at the skill tier that happens before this
         # validator ever runs.
-        declared_names = [s if isinstance(s, str) else s.name for s in spec.secrets]
-        declared_names += list(spec.secret_files)
-        for declared_name in declared_names:
+        _validate_wake_key_role(where, spec, errors)
+        declared_names = [
+            (
+                s if isinstance(s, str) else s.name,
+                isinstance(s, SecretRef) and s.name == HOOK_WAKE_KEY_ENV and spec.is_hosted,
+            )
+            for s in spec.secrets
+        ]
+        declared_names += [(name, False) for name in spec.secret_files]
+        for declared_name, connector_only_wake_key in declared_names:
             if not SECRET_NAME_RE.match(declared_name):
                 errors.append(
                     (
@@ -755,7 +1336,7 @@ def validate_connectors(data: Any) -> tuple[ConnectorsFile | None, list[tuple[st
                         "outside that shape can never bind",
                     )
                 )
-            elif is_reserved_boot_env_name(declared_name):
+            elif is_reserved_boot_env_name(declared_name) and not connector_only_wake_key:
                 errors.append(
                     (
                         "connectors.secret_name_reserved",
@@ -777,7 +1358,11 @@ def validate_connectors(data: Any) -> tuple[ConnectorsFile | None, list[tuple[st
                             "would expand empty.",
                         )
                     )
-            elif len(secret_env_names) > 1 and any(isinstance(s, str) for s in spec.secrets):
+            elif (
+                spec.no_client_auth is None
+                and len(secret_env_names) > 1
+                and any(isinstance(s, str) for s in spec.secrets)
+            ):
                 # All-`SecretRef` connectors are exempt (#3057): a `SecretRef` is
                 # the server's own upstream credential, delivered only to the pod
                 # under ADR-0090, so it implies no client auth and there is no
@@ -828,3 +1413,72 @@ def validate_connectors(data: Any) -> tuple[ConnectorsFile | None, list[tuple[st
         _validate_build("runner", parsed.runner.build, errors)
 
     return (parsed if not errors else None), errors
+
+
+def _validate_routes(where: str, spec: ConnectorSpec, errors: list[tuple[str, str]]) -> None:
+    """ADR 0240 decision 1, for everything this file can see."""
+
+    if spec.url is not None:
+        errors.append(
+            (
+                "connectors.remote_has_routes",
+                f"{where}: `routes` are served through the caller proxy Curie puts in "
+                "front of a connector it hosts; a `url` connector has no such proxy",
+            )
+        )
+        return
+    seen_paths: set[str] = set()
+    for index, route in enumerate(spec.routes):
+        at = f"{where}.routes[{index}]"
+        if not is_valid_route_path(route.path):
+            errors.append(
+                (
+                    "connectors.bad_route_path",
+                    f"{at}: `path` must start with `/` and hold only letters, digits, "
+                    "`.`, `_`, `~`, `-` and `/`, with no empty, `.` or `..` segment, and "
+                    f"must not be or sit under {MCP_PATH}, got {route.path!r}",
+                )
+            )
+        elif route.path == spec.readiness_path:
+            errors.append(
+                (
+                    "connectors.route_is_readiness_path",
+                    f"{at}: `path` {route.path!r} is the connector's `readiness_path`",
+                )
+            )
+        if route.path in seen_paths:
+            errors.append(
+                (
+                    "connectors.duplicate_route",
+                    f"{at}: `path` {route.path!r} is declared more than once",
+                )
+            )
+        seen_paths.add(route.path)
+        if (
+            not route.methods
+            or len(set(route.methods)) != len(route.methods)
+            or any(method not in ROUTE_METHODS for method in route.methods)
+        ):
+            errors.append(
+                (
+                    "connectors.bad_route_methods",
+                    f"{at}: `methods` must be a non-empty list drawn from "
+                    f"{', '.join(ROUTE_METHODS)} with no repeats, got {route.methods!r}",
+                )
+            )
+        if not 0 < route.max_body_bytes <= ROUTE_MAX_BODY_BYTES_CEILING:
+            errors.append(
+                (
+                    "connectors.bad_route_max_body_bytes",
+                    f"{at}: `max_body_bytes` must be a positive integer no larger than "
+                    f"{ROUTE_MAX_BODY_BYTES_CEILING}, got {route.max_body_bytes!r}",
+                )
+            )
+        if not route.callers or any(not caller for caller in route.callers):
+            errors.append(
+                (
+                    "connectors.route_without_callers",
+                    f"{at}: `callers` must name at least one of the bundle's stdio "
+                    "servers, and no name may be empty",
+                )
+            )

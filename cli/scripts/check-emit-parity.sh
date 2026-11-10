@@ -7,4 +7,4 @@
 # cli/tests/api_emit_parity.rs.
 set -euo pipefail
 
-cargo test --manifest-path cli/Cargo.toml --test api_emit_parity -- --nocapture
+cargo test --manifest-path cli/Cargo.toml --test integration api_emit_parity:: -- --nocapture

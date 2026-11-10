@@ -32,6 +32,40 @@ pipeline, and it fails closed on either of two questions:
             it is itself an in-progress check-run on the tagged SHA and
             would otherwise wait on itself forever.
 
+            One exception (ADR-0195, issue #3858): a release-preparation
+            commit that changes only version identity may borrow an
+            ancestor's green CI. When the tagged commit's own required checks
+            are absent or still running, and none of them concluded
+            non-passing, the gate walks the commit's first-parent ancestors,
+            nearest first and at most VERSION_ONLY_PROOF_DEPTH deep. Each
+            candidate is considered only if the whole diff from it to the
+            tagged commit stays inside `release/atlas.py`'s
+            `version_only_paths` for this tag; the first path outside that set
+            ends the walk. The first candidate whose own required checks are
+            all green is the proof commit. Any contrary evidence on the tagged
+            commit itself, any other path in the delta, or no green candidate
+            within the depth refuses exactly as before.
+
+            ADR-0247
+            (docs/adr/0247-a-tree-identical-parent-or-a-schema-window-registration-reuses-checks.md,
+            issue #4862) amends that exception with two rules under the same
+            precondition. First, before the walk, every parent of the tagged
+            commit (in parent order, a merge's second parent included) whose
+            tree is byte-identical to the tagged commit's tree is a proof
+            candidate: its CI ran on these exact bytes, so the first such
+            parent with all required checks green is the proof commit. A
+            release-PR merge on an unmoved base is proved by its PR head this
+            way. A parent with a different tree is never consulted by this
+            rule. Second, inside the walk, a delta that also touches
+            the schema-window catalog still counts as version-only when the
+            only change to that JSON document is registering this tag's schema
+            window: a new `windows` key (the tag without its `v`) whose value
+            equals the candidate's `candidate` entry, with every other key and
+            window unchanged. Any other edit to that file ends the walk.
+            ADR-0257 moves that rule into `release/atlas.py`
+            (`version_only_extra`) so the atlas pin gate and the CI selector
+            apply it too.
+
 Both live as separately-testable functions so the negative case -- an
 unreviewed or check-less commit is refused -- is an ordinary pytest assertion
 against a constructed fixture, not a manual demonstration against the real
@@ -48,23 +82,42 @@ import os
 import re
 import subprocess
 import sys
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from pathlib import Path
+from types import ModuleType
+from typing import NamedTuple
 
 
-def _load_nightly():
-    path = Path(__file__).resolve().parent / "nightly.py"
-    spec = importlib.util.spec_from_file_location("release_nightly", path)
+def _load_sibling(filename: str, module_name: str) -> ModuleType:
+    """Load a module that sits next to this file, by path.
+
+    The release workflows run this script as `python3 release/authorize.py`
+    with no package on the import path, so siblings are loaded by file.
+    """
+    path = Path(__file__).resolve().parent / filename
+    spec = importlib.util.spec_from_file_location(module_name, path)
     assert spec is not None and spec.loader is not None
     module = importlib.util.module_from_spec(spec)
-    sys.modules["release_nightly"] = module
+    sys.modules[module_name] = module
     spec.loader.exec_module(module)
     return module
 
 
-_nightly = _load_nightly()
+_nightly = _load_sibling("nightly.py", "release_nightly")
+_atlas = _load_sibling("atlas.py", "release_atlas")
 
 PASSING_CONCLUSIONS = {"success", "neutral"}
+
+# How many first-parent ancestors the version-only proof walk may consult
+# (ADR-0195, issue #3858). A release preparation is normally one commit, or a
+# merge of one, on top of green CI; ten leaves room for a few stacked bumps
+# without letting the walk wander arbitrarily far back.
+VERSION_ONLY_PROOF_DEPTH = 10
+
+# The two rules that may stand a proof commit's checks in for the tagged
+# commit's own, as `Proof.path` labels (ADR-0195 as amended by ADR-0247).
+TREE_IDENTICAL_PARENT = "tree-identical parent"
+VERSION_ONLY_ANCESTOR = "version-only ancestor"
 
 # The check-run names that must be present and green before a tag may
 # publish (issue #733). These are the job `name:` fields from
@@ -72,9 +125,9 @@ PASSING_CONCLUSIONS = {"success", "neutral"}
 # a reviewed branch, restricted to jobs that speak to release confidence: the
 # three language/test jobs, the generated-artifact drift checks, the
 # release-compose validation, every first-party image actually building
-# (the one ci-images job, which includes the worker-local overlay, plus the
-# dispatcher's own import smoke-test), and the behavioral gates (eval falsifiability, the E2E
-# parity ladder, the repository-toolchain proof) that ci.yaml's own
+# (ci-images, including the worker-local overlay, and the example connector
+# builds), and the behavioral gates (image-proofs, eval falsifiability, and the
+# E2E parity ladder) that ci.yaml's own
 # comments describe as catching bug classes no unit test does. Checks
 # from other workflows (CodeQL, the
 # dependency/secret scanners, release.yaml's own jobs) are deliberately
@@ -100,7 +153,9 @@ PASSING_CONCLUSIONS = {"success", "neutral"}
 # it, while the CLI binaries and the GitHub Release -- which hang off
 # `authorize-release` alone -- publish regardless. The release ships binaries
 # whose images have per-arch blobs pushed by digest and no pullable manifest
-# tag anywhere.
+# tag anywhere. The per-run Docker daemon image (`apps/docker-daemon`, ADR
+# 0217) is a `build` matrix row in exactly the same position, so its ci.yaml
+# group in "Image proofs (smoke, Docker daemon, toolchain)" is required too.
 #
 # The subset test below cannot see that direction: it asserts every required
 # name is a real job, so ADDING a connector build to ci.yaml and forgetting it
@@ -118,8 +173,11 @@ REQUIRED_CHECK_NAMES = frozenset(
         "Build CI images (no push)",
         "Build sre-bot-tempo image (no push)",
         "Build sre-bot-self-upgrade image (no push)",
-        "Dispatcher image imports resolve",
-        "Repository toolchain proof (runner image)",
+        "Build sre-bot-scaler image (no push)",
+        "Build sre-bot-restarter image (no push)",
+        "Build sre-bot-metrics image (no push)",
+        "Build github-activity-github image (no push)",
+        "Image proofs (smoke, Docker daemon, toolchain)",
         "Eval falsifiability gate (fake model, offline)",
         "E2E parity ladder (skill + local, fake model)",
         "E2E parity ladder (local-release, fake model)",
@@ -130,6 +188,17 @@ REQUIRED_CHECK_NAMES = frozenset(
 
 class AuthorizationError(Exception):
     """A tagged commit is not authorized to publish a release."""
+
+
+class Proof(NamedTuple):
+    """A commit whose green required checks stand in for the tagged commit's.
+
+    `path` names the rule that admitted it: TREE_IDENTICAL_PARENT or
+    VERSION_ONLY_ANCESTOR.
+    """
+
+    commit: str
+    path: str
 
 
 # Semver 2.0.0 with an optional leading `v`. A non-empty prerelease
@@ -199,30 +268,71 @@ def commit_is_on_reviewed_branch(
     )
 
 
+def _current_attempts(
+    runs: list[dict[str, object]],
+) -> list[dict[str, object]] | None:
+    """The latest attempts of one name, or None when they cannot be ordered.
+
+    None means at least one payload has no `completed_at` and no
+    `started_at`. Callers then fail closed instead of guessing which
+    attempt is current.
+    """
+    recencies = [_check_run_recency(run) for run in runs]
+    ordered = [recency for recency in recencies if recency is not None]
+    if len(ordered) != len(recencies):
+        return None
+    latest = max(ordered)
+    return [
+        run
+        for run, recency in zip(runs, recencies, strict=True)
+        if recency == latest
+    ]
+
+
+def _check_run_recency(run: dict[str, object]) -> str | None:
+    """When this check-run became the current attempt, if the payload says.
+
+    A finished run is ordered by `completed_at`. A run that has not finished
+    is ordered by `started_at`, so a later attempt that is still going blocks
+    an earlier success, and an earlier unfinished run does not outrank a
+    later finished one. Payloads with neither field cannot be ordered.
+    """
+    completed = run.get("completed_at")
+    if isinstance(completed, str) and completed:
+        return completed
+    started = run.get("started_at")
+    if isinstance(started, str) and started:
+        return started
+    return None
+
+
 def missing_required_checks(
     check_runs: list[dict[str, object]],
     required_names: frozenset[str] | None = None,
 ) -> set[str]:
-    """Which `required_names` have no passing check-run for this commit?
+    """Which `required_names` are not satisfied by their current check-run?
 
-    A name only counts as satisfied if some check-run with that exact `name`
-    concluded `success`/`neutral` AND no check-run with that name is
-    still running, failed, skipped, or otherwise non-passing. `skipped` is not
-    a pass for a required name (issue #1470): GitHub records that conclusion
-    both when a job-level `if:` excludes the job and when a job in its
-    `needs:` failed, so treating it as passing authorized releases whose chart
-    was never rendered, linted, or kubeconform-validated, and whose ladder
-    jobs never ran because their upstream build failed. A required name with two
-    check-runs -- one success and one failure (a re-run with mixed states) --
-    is left in the returned set: for a fail-closed release gate any non-passing
-    run of a required name masks nothing and blocks the tag. A same-named entry
-    that is still running, failed, or never ran at all thus leaves its name in
-    the returned set. Names outside `required_names` are ignored entirely -- an
-    unrelated check-run, passing or not, has no bearing on this gate (issue
-    #733): the point is asserting the checks that matter actually ran and
-    passed, not that everything present happened to be green. That still holds
-    for a `skipped` NON-required check-run, which is ignored like any other
-    non-required entry; only a skipped *required* name blocks.
+    The current check-run for a name is the latest one that payload can
+    order, by `completed_at` or else `started_at`. That run must have
+    concluded `success` or `neutral`. An earlier failure, cancellation, or
+    skip does not block once a later run of the same name passed: GitHub
+    keeps every attempt, and a release push re-runs CI on the same commit.
+    The latest attempt is what "current and green" means. A later failure
+    after an earlier success still blocks (issue #811). `skipped` is not a
+    pass when it is the current conclusion (issue #1470): a job-level `if:`
+    or a failed `needs:` job records that conclusion, and a chart that was
+    never rendered must not authorize a release.
+
+    When any run of a required name has no `completed_at` and no
+    `started_at`, that name cannot be ordered. It then fails closed: any
+    non-passing run of the name blocks, and so does a name with no passing
+    run at all.
+
+    Names outside `required_names` are ignored entirely. An unrelated
+    check-run, passing or not, has no bearing on this gate (issue #733).
+    A `skipped` non-required check-run is ignored the same way. Only a
+    skipped required name blocks, and only when that skip is current or
+    the runs cannot be ordered.
 
     `required_names` defaults to the module-level `REQUIRED_CHECK_NAMES`,
     looked up here rather than bound as the parameter's default value so that
@@ -231,18 +341,22 @@ def missing_required_checks(
     """
     if required_names is None:
         required_names = REQUIRED_CHECK_NAMES
-    passed_names = {
-        run.get("name") for run in check_runs if run.get("conclusion") in PASSING_CONCLUSIONS
-    }
-    non_passing_required = {
-        name
-        for name in required_names
-        if any(
-            run.get("name") == name and run.get("conclusion") not in PASSING_CONCLUSIONS
-            for run in check_runs
-        )
-    }
-    return (set(required_names) - passed_names) | non_passing_required
+    grouped: dict[str, list[dict[str, object]]] = {name: [] for name in required_names}
+    for run in check_runs:
+        name = run.get("name")
+        if isinstance(name, str) and name in grouped:
+            grouped[name].append(run)
+
+    missing: set[str] = set()
+    for name, runs in grouped.items():
+        if not runs:
+            missing.add(name)
+            continue
+        current = _current_attempts(runs)
+        considered = runs if current is None else current
+        if any(run.get("conclusion") not in PASSING_CONCLUSIONS for run in considered):
+            missing.add(name)
+    return missing
 
 
 def exclude_current_workflow_run(
@@ -269,6 +383,150 @@ def exclude_current_workflow_run(
     ]
 
 
+def _git_output(args: Sequence[str], *, cwd: Path | None, purpose: str) -> str:
+    """Run a read-only git command for the proof walk; any failure refuses."""
+    try:
+        result = subprocess.run(
+            ["git", *args],
+            cwd=cwd,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+    except OSError as exc:
+        raise AuthorizationError(f"could not {purpose}: {exc}") from exc
+    if result.returncode != 0:
+        detail = result.stderr.strip()
+        suffix = f": {detail}" if detail else ""
+        raise AuthorizationError(
+            f"could not {purpose}; git returned {result.returncode}{suffix}"
+        )
+    return result.stdout
+
+
+def _has_contrary_required_evidence(
+    check_runs: list[dict[str, object]], required_names: frozenset[str]
+) -> bool:
+    """Did the current attempt of a required name conclude non-passing?
+
+    Uses the same attempt selection as `missing_required_checks`. An earlier
+    failure, cancellation, or skip is not contrary once a later attempt of
+    that name passed, so a version-only proof walk can still borrow an
+    ancestor when some other required name is absent or still running. A
+    later non-passing attempt is contrary and blocks that walk (issue #811).
+    A null conclusion (still running) is not evidence either way. `skipped`
+    counts as contrary when it is current, or when the attempts cannot be
+    ordered (issue #1470).
+    """
+    grouped: dict[str, list[dict[str, object]]] = {name: [] for name in required_names}
+    for run in check_runs:
+        name = run.get("name")
+        if isinstance(name, str) and name in grouped:
+            grouped[name].append(run)
+    for runs in grouped.values():
+        if not runs:
+            continue
+        current = _current_attempts(runs)
+        considered = runs if current is None else current
+        if any(
+            run.get("conclusion") is not None
+            and run.get("conclusion") not in PASSING_CONCLUSIONS
+            for run in considered
+        ):
+            return True
+    return False
+
+
+def find_tree_identical_parent_proof(
+    sha: str,
+    fetch_check_runs: Callable[[str], list[dict[str, object]]],
+    *,
+    cwd: Path | None = None,
+    exclude_run_id: str | None = None,
+    required_names: frozenset[str] | None = None,
+) -> str | None:
+    """The first parent of `sha` with the same tree and green required checks.
+
+    Parents are consulted in parent order, a merge's second parent included
+    (ADR-0247, issue #4862). Only a parent whose tree object equals `sha`'s is
+    fetched; identical trees mean its CI ran on these exact bytes. Returns
+    None when no such parent is green. Git failures raise AuthorizationError.
+    """
+    tree = _git_output(
+        ["rev-parse", f"{sha}^{{tree}}"],
+        cwd=cwd,
+        purpose=f"resolve the tree of {sha}",
+    ).strip()
+    parents = _git_output(
+        ["rev-list", "--parents", "-n", "1", sha],
+        cwd=cwd,
+        purpose=f"list the parents of {sha}",
+    ).split()[1:]
+    for parent in parents:
+        parent_tree = _git_output(
+            ["rev-parse", f"{parent}^{{tree}}"],
+            cwd=cwd,
+            purpose=f"resolve the tree of {parent}",
+        ).strip()
+        if parent_tree != tree:
+            continue
+        runs = exclude_current_workflow_run(fetch_check_runs(parent), exclude_run_id)
+        if not missing_required_checks(runs, required_names):
+            return parent
+    return None
+
+
+def find_version_only_proof(
+    sha: str,
+    tag: str,
+    fetch_check_runs: Callable[[str], list[dict[str, object]]],
+    *,
+    cwd: Path | None = None,
+    exclude_run_id: str | None = None,
+    required_names: frozenset[str] | None = None,
+) -> str | None:
+    """The nearest first-parent ancestor whose green CI also proves `sha`.
+
+    Walks at most VERSION_ONLY_PROOF_DEPTH first-parent ancestors, nearest
+    first. The diff from each candidate to `sha` is checked against
+    `release/atlas.py`'s `version_only_extra` for `tag` before that
+    candidate's check-runs are fetched; the first candidate outside it ends
+    the walk. A delta that also touches the schema-window catalog stays
+    inside only when that change registers this tag's schema window
+    (ADR-0247, ADR-0257). Returns None when no candidate qualifies. Git
+    failures raise AuthorizationError.
+    """
+    version = tag.strip().removeprefix("refs/tags/")
+    ancestors = _git_output(
+        [
+            "rev-list",
+            "--first-parent",
+            f"--max-count={VERSION_ONLY_PROOF_DEPTH + 1}",
+            sha,
+        ],
+        cwd=cwd,
+        purpose=f"list the first-parent ancestors of {sha}",
+    ).split()
+    for candidate in ancestors[1:]:
+        changed = _git_output(
+            ["diff", "--no-renames", "--name-only", candidate, sha],
+            cwd=cwd,
+            purpose=f"diff {candidate} against {sha}",
+        ).splitlines()
+        try:
+            extra = _atlas.version_only_extra(
+                [path for path in changed if path], version, candidate, sha, cwd=cwd
+            )
+        except _atlas.AtlasError as exc:
+            raise AuthorizationError(str(exc)) from exc
+        if extra:
+            return None
+        runs = exclude_current_workflow_run(fetch_check_runs(candidate), exclude_run_id)
+        if not missing_required_checks(runs, required_names):
+            return candidate
+    return None
+
+
 def authorize(
     sha: str,
     check_runs: list[dict[str, object]],
@@ -281,8 +539,15 @@ def authorize(
     allow_red_nightly: bool = False,
     require_nightly: bool = False,
     tag: str | None = None,
-) -> None:
+    fetch_proof_check_runs: Callable[[str], list[dict[str, object]]] | None = None,
+) -> Proof | None:
     """Raise AuthorizationError unless `sha` may publish a release.
+
+    Returns the Proof whose commit's checks stood in for `sha`'s own, or None
+    when `sha`'s own required checks were green. A tree-identical parent is
+    tried first, then the version-only walk (see the module docstring,
+    ADR-0195 as amended by ADR-0247). Either needs both `tag` and
+    `fetch_proof_check_runs`; without either the gate is unchanged.
 
     `tag` is the pushed tag name (`v0.7.0`, `v0.7.0-rc.1`). A missing tag
     is treated as final (fail closed) so omitting the class cannot widen
@@ -316,9 +581,39 @@ def authorize(
                 f"merge the reviewed branch into {primary_ref}, then tag. "
                 "Refusing to authorize this tag"
             )
+    if required_names is None:
+        required_names = REQUIRED_CHECK_NAMES
     other_runs = exclude_current_workflow_run(check_runs, exclude_run_id)
     missing = missing_required_checks(other_runs, required_names)
-    if missing:
+    proof: Proof | None = None
+    if (
+        missing
+        and tag is not None
+        and fetch_proof_check_runs is not None
+        and not _has_contrary_required_evidence(other_runs, required_names)
+    ):
+        # Identical bytes are the stronger evidence, so they are tried first.
+        parent = find_tree_identical_parent_proof(
+            sha,
+            fetch_proof_check_runs,
+            cwd=cwd,
+            exclude_run_id=exclude_run_id,
+            required_names=required_names,
+        )
+        if parent is not None:
+            proof = Proof(parent, TREE_IDENTICAL_PARENT)
+        else:
+            ancestor = find_version_only_proof(
+                sha,
+                tag,
+                fetch_proof_check_runs,
+                cwd=cwd,
+                exclude_run_id=exclude_run_id,
+                required_names=required_names,
+            )
+            if ancestor is not None:
+                proof = Proof(ancestor, VERSION_ONLY_ANCESTOR)
+    if missing and proof is None:
         raise AuthorizationError(
             f"commit {sha} is missing {len(missing)} required check-run(s) "
             f"({len(other_runs)} check-runs found for the commit, excluding "
@@ -332,6 +627,7 @@ def authorize(
         )
         if reason:
             raise AuthorizationError(reason)
+    return proof
 
 
 def fetch_check_runs(
@@ -416,6 +712,14 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     branch = "main"
     nightly_conclusion: str | None = None
+    proof: Proof | None = None
+    proof_runs: dict[str, list[dict[str, object]]] = {}
+
+    def fetch_proof_check_runs(candidate: str) -> list[dict[str, object]]:
+        # Both authorize() calls below consult the same commits; fetch each once.
+        if candidate not in proof_runs:
+            proof_runs[candidate] = fetch_check_runs(candidate, args.repo)
+        return proof_runs[candidate]
 
     try:
         check_runs = fetch_check_runs(args.sha, args.repo)
@@ -428,6 +732,7 @@ def main(argv: list[str] | None = None) -> int:
             args.reviewed_ref,
             exclude_run_id=args.run_id,
             tag=args.tag,
+            fetch_proof_check_runs=fetch_proof_check_runs,
         )
         matching = [
             ref
@@ -452,12 +757,13 @@ def main(argv: list[str] | None = None) -> int:
                 file=sys.stderr,
             )
             return 1
-        authorize(
+        proof = authorize(
             args.sha,
             check_runs,
             args.reviewed_ref,
             exclude_run_id=args.run_id,
             tag=args.tag,
+            fetch_proof_check_runs=fetch_proof_check_runs,
             nightly_conclusion=nightly_conclusion,
             allow_red_nightly=_nightly.allow_red_nightly_from_bodies(bodies),
             require_nightly=True,
@@ -487,9 +793,17 @@ def main(argv: list[str] | None = None) -> int:
             f"the latest nightly on {branch} concluded {nightly_conclusion!r} "
             "with --allow-red-nightly recorded in an associated pull request body"
         )
+    if proof is None:
+        checked_note = "checked"
+    else:
+        checked_note = (
+            f"checked via {proof.path} {proof.commit} "
+            "(its required checks stand in for this commit's, ADR-0195 as "
+            "amended by ADR-0247)"
+        )
     print(
         f"OK: {args.sha} is reachable from a reviewed ref "
-        f"({checked_refs}), checked, and {nightly_note}; authorized"
+        f"({checked_refs}), {checked_note}, and {nightly_note}; authorized"
     )
     return 0
 

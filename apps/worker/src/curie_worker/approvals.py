@@ -16,9 +16,12 @@ second pending record for one human decision.
 from __future__ import annotations
 
 import base64
+import json
 import logging
+import math
 import re
 import uuid
+from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any, Protocol
@@ -26,15 +29,35 @@ from typing import Any, Protocol
 import httpx
 from aci_protocol import READER_CONTEXT, ApprovalRequest, PublicationContext, QueuedTurn
 from channel_protocol import MessageField, OutboundMessage
-from curie_dispatcher.approval_actions import parse_decision_time
+from curie_channel_gateway.slack.approval_actions import parse_decision_time
+from curie_internal.identity_approval import (
+    ApprovalCardRegistrationRequestV1,
+    ApprovalCardRegistrationResponseV1,
+    ApprovalCreationIdentityV1,
+    ApprovalCreationRequestV1,
+    ApprovalCreationResponseV2,
+    ApprovalDmDeliveryV1,
+    creation_receipt,
+)
 from curie_telemetry import inject_trace_context
 
+from .api_retry import DEFAULT_BUDGET_S, post_with_retry
+from .identity_authority import TurnAuthorityUnavailable, exchange_identity_json
+from .ui_evidence import UiEvidenceCapture, upload_capture
 from .workspace import WorkspaceSelectionRefused
 
 # Re-exported so this module stays the kernel-facing seam for the approval
 # payload: ``ApprovalRequest`` is now the shared wire model (#492), not a
 # lane-local mirror of the API's schema.
 logger = logging.getLogger(__name__)
+
+
+class ApprovalContinuityRefused(RuntimeError):
+    """@spec HTTP-APPROVAL-CONTINUITY-3."""
+
+    def __init__(self) -> None:
+        """@spec HTTP-APPROVAL-CONTINUITY-3."""
+        super().__init__("identity_approval_refused")
 
 _PUBLICATION_REFUSAL_CODES = {
     "publication.github_unavailable",
@@ -83,6 +106,7 @@ def _publication_refusal(response: httpx.Response) -> str | None:
         return detail
     return None
 
+
 def _rejected_reraise_refusal(response: httpx.Response) -> str | None:
     """The thread message of an API re-raise refusal (#2885), or None.
 
@@ -106,6 +130,7 @@ def _rejected_reraise_refusal(response: httpx.Response) -> str | None:
 
 __all__ = [
     "ApprovalBackendError",
+    "ApprovalCardRegistrar",
     "ApprovalClient",
     "ApprovalCreator",
     "ApprovalReader",
@@ -117,6 +142,7 @@ __all__ = [
     "PublicationCreateRequest",
     "PublicationCreator",
     "PublicationLineage",
+    "PullRequestNotAdopted",
     "ReviewAuthorityUnavailable",
     "VerifiedReviewFeedback",
 ]
@@ -124,12 +150,27 @@ __all__ = [
 
 @dataclass(frozen=True)
 class CreatedApproval:
-    """Record identity plus display metadata; never an authorization principal."""
+    """Record identity plus display metadata; never an authorization principal.
+
+    The stored fields come only from a V2 creation receipt (a dynamic
+    approval, ADR 0271 decisions 4 and 8): the persisted grant, ticket
+    included, and the selected people. The pause renders them instead of the
+    run's own summary. Every other creation leaves them None and empty.
+    ``delivery`` is the server-verified approver DM recipient (ADR 0272), set
+    only from a V2 receipt whose route resolves to one selected approver's DM.
+    ``duplicate`` is the API's own "this creation adopted an existing row"
+    answer; a duplicate never posts a second DM card.
+    """
 
     id: str
     status: str
     requested_by: str | None = None
     requester_known: bool = False
+    granted_tool: str | None = None
+    granted_arguments: dict[str, Any] | None = None
+    selected_approvers: tuple[dict[str, str], ...] = ()
+    delivery: ApprovalDmDeliveryV1 | None = None
+    duplicate: bool = False
 
 
 @dataclass(frozen=True)
@@ -154,6 +195,7 @@ class PublicationCreateRequest:
     title: str
     body: str
     reply_conversation_id: str | None = None
+    reply_identity: str | None = None
     max_patch_bytes: int = 900_000
     review_origin_key: str | None = None
     route: str | None = None
@@ -190,6 +232,8 @@ class PublicationCreateRequest:
         }
         if self.reply_conversation_id is not None:
             payload["reply_conversation_id"] = self.reply_conversation_id
+        if self.reply_identity is not None:
+            payload["reply_identity"] = self.reply_identity
         if self.review_origin_key is not None:
             payload["review_origin_key"] = self.review_origin_key
         if self.route is not None:
@@ -252,6 +296,10 @@ class ApprovalBackendError(Exception):
         self.refusal = refusal
 
 
+class PullRequestNotAdopted(Exception):
+    """An existing conversation PR cannot be continued; retrying cannot fix it."""
+
+
 def _coded_refusal(response: httpx.Response) -> str | None:
     """``"<code>: <message>"`` from an API ``{"detail": {code, message}}`` body."""
 
@@ -311,6 +359,11 @@ class SettledApproval:
     resolution_note: str | None
     # When the decision was recorded, aware UTC; None when the record omits it.
     resolved_at: datetime | None = None
+    expires_at: datetime | None = None
+
+
+class ApprovalMissing(Exception):
+    """The API definitively reports that this approval no longer exists."""
 
 
 # The settle message's decision time (ADR-0179). ``SettledOutcome`` is decoded
@@ -327,6 +380,32 @@ def decided_field(resolved_at: datetime) -> MessageField:
     return MessageField(label=DECIDED_FIELD_LABEL, value=instant.astimezone(UTC).isoformat())
 
 
+# The addresses that may answer an email card (ADR-0177 amendment A5), one field
+# per address, riding the card's ``fields`` for the same reason as
+# ``DECIDED_FIELD_LABEL``: the card's models are decoded strictly out of
+# process. The mail adapter reads them only to word the request email (who can
+# approve, and whether any of them is on the thread). They decide nothing: the
+# platform re-reads the route's list when an answer arrives.
+APPROVER_FIELD_LABEL = "Approver"
+
+
+def approver_fields(emails: Sequence[str]) -> list[MessageField]:
+    """The card fields naming the route's listed approver addresses.
+
+    Args:
+        emails: the route's ``approvers.emails``, as the worker read them.
+
+    Returns:
+        One ``Approver`` field per address, lowercased, in list order, with
+        repeats dropped.
+    """
+
+    seen: dict[str, None] = {}
+    for email in emails:
+        seen.setdefault(email.strip().lower(), None)
+    return [MessageField(label=APPROVER_FIELD_LABEL, value=email) for email in seen if email]
+
+
 def decided_at(message: OutboundMessage) -> datetime | None:
     """The decision time a settle message carries, or None when it has none."""
 
@@ -339,7 +418,10 @@ def decided_at(message: OutboundMessage) -> datetime | None:
 class ApprovalCreator(Protocol):
     """The kernel-facing seam; tests supply a recording fake."""
 
-    async def create(self, request: ApprovalRequest) -> CreatedApproval: ...
+    async def create(
+        self, request: ApprovalRequest, *, budget_s: float = DEFAULT_BUDGET_S,
+        identity: ApprovalCreationIdentityV1 | None = None,
+    ) -> CreatedApproval: ...
 
 
 @dataclass(frozen=True)
@@ -358,7 +440,9 @@ class VerifiedReviewFeedback:
 class PublicationCreator(Protocol):
     """Atomic trusted write seam used only for exact publish provenance."""
 
-    async def create_publication(self, request: PublicationCreateRequest) -> CreatedPublication: ...
+    async def create_publication(
+        self, request: PublicationCreateRequest, *, budget_s: float = DEFAULT_BUDGET_S
+    ) -> CreatedPublication: ...
 
     async def get_publication_lineage(
         self,
@@ -391,6 +475,26 @@ class PublicationCreator(Protocol):
     ) -> uuid.UUID: ...
 
 
+class ApprovalCardRegistrar(Protocol):
+    """Records an approver DM card's provider channel on its approval (ADR 0272).
+
+    Separate from ``ApprovalCreator`` for the reason ``ApprovalReader`` is: only
+    the DM pause needs it, and a creator fake should not have to grow it.
+    """
+
+    async def register_card(
+        self,
+        *,
+        approval_id: str,
+        dedupe_key: str,
+        identity: ApprovalCreationIdentityV1,
+        card_identity: str,
+        recipient: str,
+        channel: str,
+        budget_s: float = DEFAULT_BUDGET_S,
+    ) -> ApprovalCardRegistrationResponseV1: ...
+
+
 class ApprovalReader(Protocol):
     """Read one settled record back. Separate from ``ApprovalCreator`` because
     the kernel's pause path needs only the create half, and a fake for it should
@@ -413,6 +517,7 @@ class ApprovalClient:
         review_timeout_s: float = 30.0,
     ) -> None:
         self._url = f"{api_base_url.rstrip('/')}/approvals"
+        self._identity_url = f"{api_base_url.rstrip('/')}/v1/internal/identity/approvals"
         self._publication_url = f"{api_base_url.rstrip('/')}/v1/internal/publications"
         self._review_url = f"{api_base_url.rstrip('/')}/v1/internal/github/reviews"
         self._headers = {"X-API-Key": api_key} if api_key else {}
@@ -429,13 +534,9 @@ class ApprovalClient:
         """Ask the trusted API to match this complete turn to fresh authority."""
 
         refusal = (
-            "GitHub feedback could not be verified for this conversation; "
-            "no model turn started."
+            "GitHub feedback could not be verified for this conversation; no model turn started."
         )
-        if (
-            not self._worker_headers
-            or _REVIEW_EVENT_ID_RE.fullmatch(turn.event_id) is None
-        ):
+        if not self._worker_headers or _REVIEW_EVENT_ID_RE.fullmatch(turn.event_id) is None:
             raise WorkspaceSelectionRefused(refusal)
         headers = {**self._worker_headers, "Content-Type": "application/json"}
         inject_trace_context(headers)
@@ -455,9 +556,7 @@ class ApprovalClient:
                 "GitHub feedback verification transport unavailable"
             ) from None
         if response.status_code in {401, 403, 404, 429} or response.status_code >= 500:
-            raise ApprovalBackendError(
-                "GitHub feedback verification temporarily unavailable"
-            )
+            raise ApprovalBackendError("GitHub feedback verification temporarily unavailable")
         if response.status_code != 200:
             # Never reflect an API/provider body into the conversation. A 409 is
             # a definitive authority refusal; rollout/auth/availability statuses
@@ -491,9 +590,7 @@ class ApprovalClient:
                 origin_key=origin_key,
                 lineage_version=lineage_version,
                 reservation_id=(
-                    uuid.UUID(str(reservation_value))
-                    if reservation_value is not None
-                    else None
+                    uuid.UUID(str(reservation_value)) if reservation_value is not None else None
                 ),
             )
         except (KeyError, TypeError, ValueError):
@@ -535,42 +632,43 @@ class ApprovalClient:
                 timeout=_REVIEW_RESERVE_HTTP_TIMEOUT_S,
             )
         except httpx.HTTPError:
-            raise ApprovalBackendError(
-                "GitHub review reservation transport unavailable"
-            ) from None
+            raise ApprovalBackendError("GitHub review reservation transport unavailable") from None
         if response.status_code in {401, 403, 404, 429} or response.status_code >= 500:
-            raise ApprovalBackendError(
-                "GitHub review reservation temporarily unavailable"
-            )
+            raise ApprovalBackendError("GitHub review reservation temporarily unavailable")
         if response.status_code != 200:
-            raise WorkspaceSelectionRefused(
-                "GitHub feedback revision is no longer executable."
-            )
+            raise WorkspaceSelectionRefused("GitHub feedback revision is no longer executable.")
         try:
             body = response.json()
             if body["origin_key"] != turn.event_id:
                 raise ValueError("wrong review origin")
             reservation_id = uuid.UUID(str(body["reservation_id"]))
-            if (
-                verified.reservation_id is not None
-                and reservation_id != verified.reservation_id
-            ):
+            if verified.reservation_id is not None and reservation_id != verified.reservation_id:
                 raise ValueError("wrong review reservation")
             return reservation_id
         except (KeyError, TypeError, ValueError):
             raise WorkspaceSelectionRefused(refusal) from None
 
-    async def create(self, request: ApprovalRequest) -> CreatedApproval:
+    async def create(
+        self, request: ApprovalRequest, *, budget_s: float = DEFAULT_BUDGET_S,
+        identity: ApprovalCreationIdentityV1 | None = None,
+    ) -> CreatedApproval:
+        # @spec HTTP-APPROVAL-CONTINUITY-3: never retry selected transport via legacy.
+        if identity is not None:
+            return await self._create_with_identity(request, identity, budget_s=budget_s)
         headers = {**self._headers, "Content-Type": "application/json"}
         inject_trace_context(headers)
         try:
-            response = await self._client.post(
+            response = await post_with_retry(
+                self._client,
                 self._url,
                 content=request.model_dump_json(),
                 headers=headers,
+                budget_s=budget_s,
             )
         except httpx.HTTPError as exc:
-            raise ApprovalBackendError(f"approval create failed: {exc}") from exc
+            raise ApprovalBackendError(
+                f"approval create failed: {type(exc).__name__}: {exc}"
+            ) from exc
         refusal = _rejected_reraise_refusal(response)
         if refusal is not None:
             raise ApprovalRefused(refusal)
@@ -587,13 +685,200 @@ class ApprovalClient:
             requester_known="requested_by" in body,
         )
 
+    async def _create_with_identity(
+        self, request: ApprovalRequest, identity: ApprovalCreationIdentityV1, *, budget_s: float,
+    ) -> CreatedApproval:
+        """@spec HTTP-APPROVAL-CONTINUITY-3."""
+        try:
+            if (
+                type(request) is not ApprovalRequest
+                or type(identity) is not ApprovalCreationIdentityV1
+                or type(budget_s) not in {int, float}
+                or not math.isfinite(budget_s) or budget_s <= 0
+            ):
+                raise ValueError
+            captured = ApprovalCreationRequestV1(
+                schema_version=1, request_id=str(uuid.uuid4()),
+                approval=ApprovalRequest.model_validate_json(
+                    request.model_dump_json(), context=READER_CONTEXT,
+                ),
+                identity=ApprovalCreationIdentityV1.model_validate(identity),
+            )
+            payload = captured.model_dump_json().encode("utf-8")
+            if len(payload) > 2_097_152:
+                raise ValueError
+            budget = min(5.0, budget_s)
+        except (ValueError, TypeError, AttributeError, RecursionError, OverflowError):
+            raise ValueError("invalid_approval_creation_request") from None
+        try:
+            if not self._worker_headers:
+                raise ValueError
+            headers = {**self._worker_headers, "Content-Type": "application/json"}
+            inject_trace_context(headers)
+            outgoing = httpx.Request(
+                "POST", self._identity_url, content=payload, headers=headers,
+                extensions={"timeout": httpx.Timeout(budget).as_dict()},
+            )
+            status, body = await exchange_identity_json(self._client, outgoing, budget_s=budget)
+            denials = {
+                403: {"caller_not_allowed"},
+                409: {
+                    "approval_provenance_conflict",
+                    "approval_route_locked",
+                    "approval_ticket_replayed",
+                    "approval_ticket_required",
+                    "approval_ticket_route_mismatch",
+                    "approval_ticket_unregistered",
+                    "approver_dm_receiver_missing",
+                    "approver_dm_requires_dynamic",
+                    "approver_ticket.bundle_gate_mismatch",
+                    "approver_ticket_requires_requester_identity",
+                    "approver_ticket_state_invalid",
+                    "unsupported_approval",
+                },
+                413: {"body_too_large"},
+                422: {
+                    "approval deadline exceeds the supported timestamp range",
+                    "approval_ticket_approver_inactive",
+                    "approval_ticket_arguments_mismatch",
+                    "approval_ticket_arguments_unstable",
+                    "approval_ticket_grant_too_large",
+                    "approval_ticket_invalid_ticket",
+                    "approval_ticket_key_mismatch",
+                    "approval_ticket_outside_ceiling",
+                    "approval_ticket_preparation_expired",
+                    "approval_ticket_recipient_duplicate",
+                    "approval_ticket_requester_mismatch",
+                    "approval_ticket_scope_mismatch",
+                    "approver_dm_account_missing",
+                    "approver_dm_account_unresolved",
+                    "approver_dm_recipient_count",
+                    "approver_dm_wrong_installation",
+                    "invalid_approval_context",
+                },
+            }
+            if status in denials and set(body) == {"detail"} and body["detail"] in denials[status]:
+                raise ApprovalContinuityRefused()
+            if status not in {200, 201}:
+                raise ValueError
+            # @spec REQUEST-APPROVAL-4: exactly the version the receipt names.
+            receipt = creation_receipt(body)
+            if (
+                receipt.request_id != captured.request_id
+                or receipt.duplicate is not (status == 200)
+                or status == 201 and receipt.status != "pending"
+            ):
+                raise ValueError
+            if type(receipt) is not ApprovalCreationResponseV2:
+                return CreatedApproval(
+                    id=receipt.id, status=receipt.status, requested_by=receipt.requested_by,
+                    requester_known=True, duplicate=receipt.duplicate,
+                )
+            # The V2 model admits only the canonical text of a JSON object.
+            return CreatedApproval(
+                id=receipt.id, status=receipt.status, requested_by=receipt.requested_by,
+                requester_known=True, granted_tool=receipt.granted_tool,
+                granted_arguments=json.loads(receipt.granted_arguments),
+                selected_approvers=tuple(
+                    person.model_dump(mode="json") for person in receipt.selected_approvers
+                ),
+                delivery=receipt.delivery, duplicate=receipt.duplicate,
+            )
+        except ApprovalContinuityRefused:
+            raise
+        except Exception:  # noqa: BLE001 - source, effect and credential data stay private.
+            raise TurnAuthorityUnavailable() from None
+
+    async def register_card(
+        self,
+        *,
+        approval_id: str,
+        dedupe_key: str,
+        identity: ApprovalCreationIdentityV1,
+        card_identity: str,
+        recipient: str,
+        channel: str,
+        budget_s: float = DEFAULT_BUDGET_S,
+    ) -> ApprovalCardRegistrationResponseV1:
+        """Record the DM channel an approver card landed in (ADR 0272 decision 2).
+
+        Worker token only, one attempt, the creation's own identity block. A
+        coded refusal (a conflicting or mismatched registration, a provenance
+        conflict) is definitive and raises ``ApprovalContinuityRefused``; any
+        other outcome is unknown and raises ``TurnAuthorityUnavailable``.
+        Neither is retried here: the caller owns what an unregistered card means.
+        """
+        try:
+            if (
+                type(identity) is not ApprovalCreationIdentityV1
+                or type(budget_s) not in {int, float}
+                or not math.isfinite(budget_s)
+                or budget_s <= 0
+            ):
+                raise ValueError
+            captured = ApprovalCardRegistrationRequestV1.model_validate(
+                {
+                    "schema_version": 1,
+                    "request_id": str(uuid.uuid4()),
+                    "approval_id": approval_id,
+                    "dedupe_key": dedupe_key,
+                    "identity": ApprovalCreationIdentityV1.model_validate(identity),
+                    "card_identity": card_identity,
+                    "recipient": recipient,
+                    "channel": channel,
+                }
+            )
+            payload = captured.model_dump_json().encode("utf-8")
+            if len(payload) > 2_097_152:
+                raise ValueError
+            budget = min(5.0, budget_s)
+        except (ValueError, TypeError, AttributeError, RecursionError, OverflowError):
+            raise ValueError("invalid_approval_card_registration") from None
+        try:
+            if not self._worker_headers:
+                raise ValueError
+            headers = {**self._worker_headers, "Content-Type": "application/json"}
+            inject_trace_context(headers)
+            outgoing = httpx.Request(
+                "POST",
+                f"{self._identity_url}/{captured.approval_id}/card",
+                content=payload,
+                headers=headers,
+                extensions={"timeout": httpx.Timeout(budget).as_dict()},
+            )
+            status, body = await exchange_identity_json(self._client, outgoing, budget_s=budget)
+            denials = {
+                403: {"caller_not_allowed"},
+                409: {
+                    "approval_card_conflict",
+                    "approval_card_mismatch",
+                    "approval_provenance_conflict",
+                },
+                413: {"body_too_large"},
+                422: {"invalid_approval_context"},
+            }
+            if status in denials and set(body) == {"detail"} and body["detail"] in denials[status]:
+                raise ApprovalContinuityRefused()
+            if status != 200:
+                raise ValueError
+            receipt = ApprovalCardRegistrationResponseV1.model_validate(body)
+            if (
+                receipt.request_id != captured.request_id
+                or receipt.approval_id != captured.approval_id
+                or (receipt.status == "pending" and receipt.card_channel != captured.channel)
+            ):
+                raise ValueError
+            return receipt
+        except ApprovalContinuityRefused:
+            raise
+        except Exception:  # noqa: BLE001 - source, effect and credential data stay private.
+            raise TurnAuthorityUnavailable() from None
+
     async def get(self, approval_id: str) -> SettledApproval | None:
         """The record's settled outcome, or None when it cannot be read (#1084).
 
-        Never raises. Its only caller is best-effort card teardown on a resume
-        turn: the resolution already happened and the session is already waking,
-        so a failed read costs a stamped card and nothing else. Raising here
-        would turn a cosmetic gap into a dead-lettered resume.
+        Raises ApprovalMissing only for the API's definitive missing-row reply.
+        Unavailable or unusable reads return None and preserve references.
         """
 
         headers = dict(self._headers)
@@ -607,6 +892,12 @@ class ApprovalClient:
         except httpx.HTTPError as exc:
             logger.warning("approval read failed for %s: %s", approval_id, exc)
             return None
+        if response.status_code == 404:
+            try:
+                if response.json() == {"detail": "approval not found"}:
+                    raise ApprovalMissing(approval_id)
+            except ValueError:
+                pass
         if response.status_code != 200:
             logger.warning(
                 "approval read failed for %s: HTTP %s", approval_id, response.status_code
@@ -619,17 +910,24 @@ class ApprovalClient:
                 resolved_by=body.get("resolved_by"),
                 resolution_note=body.get("resolution_note"),
                 resolved_at=parse_decision_time(body.get("resolved_at")),
+                expires_at=parse_decision_time(body.get("expires_at")),
             )
         except (ValueError, KeyError) as exc:
             logger.warning("approval read returned an unusable body for %s: %s", approval_id, exc)
             return None
 
-    async def create_publication(self, request: PublicationCreateRequest) -> CreatedPublication:
+    async def create_publication(
+        self, request: PublicationCreateRequest, *, budget_s: float = DEFAULT_BUDGET_S
+    ) -> CreatedPublication:
         """Atomically persist the approval and its private patch.
 
         The ordinary platform API key is intentionally not accepted on this
         route.  If the dedicated worker credential is absent, fail before any
         request so a local/non-cluster install cannot create a stranded card.
+
+        The route is replay safe on ``dedupe_key`` (an exact replay answers
+        200), so transient transport faults and 5xx are retried within
+        ``budget_s``. A 4xx is never retried.
         """
 
         if not self._worker_headers:
@@ -639,10 +937,12 @@ class ApprovalClient:
         headers = {**self._worker_headers, "Content-Type": "application/json"}
         inject_trace_context(headers)
         try:
-            response = await self._client.post(
+            response = await post_with_retry(
+                self._client,
                 self._publication_url,
                 json=request.to_json(),
                 headers=headers,
+                budget_s=budget_s,
             )
         except httpx.HTTPError as exc:
             raise ApprovalBackendError(f"publication create failed: {exc}") from exc
@@ -650,9 +950,18 @@ class ApprovalClient:
         if refusal is not None:
             raise WorkspaceSelectionRefused(refusal)
         if response.status_code not in (200, 201):
+            refusal = _coded_refusal(response)
+            if (
+                response.status_code == 409
+                and refusal is not None
+                and refusal.startswith("publication.issue_deleted:")
+            ):
+                refusal = "publication.work_item_cancelled:" + refusal.removeprefix(
+                    "publication.issue_deleted:"
+                )
             raise ApprovalBackendError(
                 f"publication create failed: HTTP {response.status_code}: {response.text}",
-                refusal=_coded_refusal(response),
+                refusal=refusal,
             )
         try:
             body = response.json()
@@ -663,6 +972,22 @@ class ApprovalClient:
             )
         except (ValueError, KeyError) as exc:
             raise ApprovalBackendError("publication create returned an unusable body") from exc
+
+    async def upload_ui_evidence(
+        self, publication_id: str, capture: UiEvidenceCapture, *, budget_s: float
+    ) -> None:
+        """Upload a created publication's optional UI evidence with the worker credential."""
+
+        if not self._worker_headers:
+            raise ApprovalBackendError("ui evidence upload requires internal worker auth")
+        await upload_capture(
+            self._client,
+            self._publication_url,
+            self._worker_headers,
+            publication_id,
+            capture,
+            budget_s=budget_s,
+        )
 
     async def get_publication_precheck_context(
         self,
@@ -699,12 +1024,19 @@ class ApprovalClient:
             # Only the authenticated API can establish first publication
             # absence. Auth, provider and authority errors are never absence.
             return None
+        if response.status_code == 409:
+            try:
+                detail = response.json()["detail"]
+            except (KeyError, TypeError, ValueError):
+                detail = None
+            if isinstance(detail, dict) and detail.get("code") == "pull_request_not_adopted":
+                raise PullRequestNotAdopted(
+                    "an earlier pull request on this issue could not be continued"
+                )
         if response.status_code != 200:
             raise ApprovalBackendError("publication context unavailable")
         try:
-            context = PublicationContext.model_validate(
-                response.json(), context=READER_CONTEXT
-            )
+            context = PublicationContext.model_validate(response.json(), context=READER_CONTEXT)
         except (TypeError, ValueError):
             # Validation errors can contain the capability. Do not propagate
             # their body or chain into the worker's ordinary error logging.

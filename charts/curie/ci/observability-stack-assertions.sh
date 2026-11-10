@@ -1350,8 +1350,10 @@ if [[ -z "$promtool_bin" || ! -x "$promtool_bin" ]]; then
   esac
   os="$(uname -s | tr '[:upper:]' '[:lower:]')"
   tarball="prometheus-${PROM_VERSION}.${os}-${arch}.tar.gz"
-  curl -fsSL "https://github.com/prometheus/prometheus/releases/download/v${PROM_VERSION}/${tarball}" \
-    | tar -xz -C "$TMP" --strip-components=1 "prometheus-${PROM_VERSION}.${os}-${arch}/promtool"
+  # Download to a file so a retried transfer cannot hand tar a truncated stream.
+  curl -fsSL --retry 5 --retry-all-errors --retry-delay 5 -o "$TMP/$tarball" \
+    "https://github.com/prometheus/prometheus/releases/download/v${PROM_VERSION}/${tarball}"
+  tar -xzf "$TMP/$tarball" -C "$TMP" --strip-components=1 "prometheus-${PROM_VERSION}.${os}-${arch}/promtool"
   promtool_bin="$TMP/promtool"
 fi
 [[ -x "$promtool_bin" ]] || fail "promtool is not executable"
@@ -1508,8 +1510,10 @@ else
   esac
   os="$(uname -s | tr '[:upper:]' '[:lower:]')"
   tarball="alertmanager-${AM_VERSION}.${os}-${arch}.tar.gz"
-  curl -fsSL "https://github.com/prometheus/alertmanager/releases/download/v${AM_VERSION}/${tarball}" \
-    | tar -xz -C "$TMP" --strip-components=1 "alertmanager-${AM_VERSION}.${os}-${arch}/amtool"
+  # Download to a file so a retried transfer cannot hand tar a truncated stream.
+  curl -fsSL --retry 5 --retry-all-errors --retry-delay 5 -o "$TMP/$tarball" \
+    "https://github.com/prometheus/alertmanager/releases/download/v${AM_VERSION}/${tarball}"
+  tar -xzf "$TMP/$tarball" -C "$TMP" --strip-components=1 "alertmanager-${AM_VERSION}.${os}-${arch}/amtool"
   amtool_bin="$TMP/amtool"
 fi
 [[ -x "$amtool_bin" ]] || fail "amtool is not executable"

@@ -34,11 +34,27 @@ spec:
                 secretKeyRef:
                   name: alert-signer-hook
                   key: CURIE_HOOK_URL
+            # An ordinary source holds CURIE_HOOK_SECRET. A protected source
+            # holds CURIE_HOOK_SOURCE_MODE=protected and CURIE_HOOK_SOURCE_SECRET
+            # instead; the signer refuses to start on any other combination.
             - name: CURIE_HOOK_SECRET
               valueFrom:
                 secretKeyRef:
                   name: alert-signer-hook
                   key: CURIE_HOOK_SECRET
+                  optional: true
+            - name: CURIE_HOOK_SOURCE_MODE
+              valueFrom:
+                secretKeyRef:
+                  name: alert-signer-hook
+                  key: CURIE_HOOK_SOURCE_MODE
+                  optional: true
+            - name: CURIE_HOOK_SOURCE_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: alert-signer-hook
+                  key: CURIE_HOOK_SOURCE_SECRET
+                  optional: true
             - name: CURIE_SIGNER_TOKEN
               valueFrom:
                 secretKeyRef:

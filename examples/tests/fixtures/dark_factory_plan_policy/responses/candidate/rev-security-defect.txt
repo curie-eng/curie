@@ -1,0 +1,8 @@
+REVIEWER: plan-reviewer
+VERDICT: CHANGES
+- Plan step 1 (AC1), blocking: building the SQL with an f-string around `request.args['q']` opens a SQL injection hole, and any `q` that contains a quote (for example `o'ring`) breaks the query. Use the DB-API parameter binding from widgets/db.py instead, e.g. `cursor.execute("SELECT id, name FROM widgets WHERE name LIKE ?", (f"%{q}%",))` with the placeholder style the driver uses, and escape `%`, `_` and the escape character in `q` so the match is a literal "contains".
+- Plan step 3 (AC1), blocking: the only test uses `q=gear`, so it would pass against the injectable query and does not check the fix. Add cases to tests/test_search.py showing that a `q` with a single quote returns the matching widget and no error, and that an injection payload such as `' OR '1'='1` returns no rows.
+OPEN QUESTIONS:
+- none
+VERIFICATION:
+- AC1: sandbox python -m pytest tests/test_search.py

@@ -66,6 +66,34 @@ beforeEach(() => {
 });
 
 describe("WiredEvals (#868)", () => {
+  it("renders the grid when optional model summaries are omitted", async () => {
+    // apps/api/openapi.json requires only suite, versions, cases, and rows.
+    vi.mocked(getEvalMatrix).mockResolvedValue({
+      suite: MATRIX.suite,
+      versions: MATRIX.versions,
+      cases: MATRIX.cases,
+      rows: MATRIX.rows,
+    } as EvalMatrix);
+    renderView();
+
+    expect(await screen.findAllByTestId("matrix-row")).toHaveLength(2);
+    expect(screen.queryByTestId("model-summary-row")).toBeNull();
+  });
+
+  it("uses declared defaults for omitted completion and plumbing counters", async () => {
+    // EvalModelSummary defaults completed and plumbing to zero in openapi.json.
+    vi.mocked(getEvalMatrix).mockResolvedValue({
+      ...MATRIX,
+      model_summaries: [{ model: "example-model", passed: 0, total: 2 }],
+    } as EvalMatrix);
+    renderView();
+
+    const row = await screen.findByTestId("model-summary-row");
+    expect(within(row).getByText("never ran")).toBeInTheDocument();
+    expect(within(row).getAllByText("0/2")).toHaveLength(2);
+    expect(within(row).queryByText(/not graded/)).toBeNull();
+  });
+
   it("renders the matrix grid: one row per case, cells per version", async () => {
     vi.mocked(getEvalMatrix).mockResolvedValue(MATRIX);
     renderView();

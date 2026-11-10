@@ -3,12 +3,18 @@
 from __future__ import annotations
 
 import re
+from decimal import Decimal
 from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 _DIMENSIONS = ("cpu", "memory", "ephemeral-storage")
 _CPU = re.compile(r"^(\d+)(m)?$")
+# The quota settings carry whatever Kubernetes accepts in
+# `resourceQuota.hard.*`, including every decimal spelling: "2.5", "0.5",
+# ".5" and "2." are all valid quantities (#3719). Only the quota side parses
+# with this grammar; override values keep `_CPU`.
+_QUOTA_CPU = re.compile(r"^(\d+(?:\.\d*)?|\.\d+)(m)?$")
 _MEMORY = re.compile(r"^(\d+)(Ki|Mi|Gi|Ti)?$")
 _MEMORY_SCALE = {"Ki": 1024, "Mi": 1024**2, "Gi": 1024**3, "Ti": 1024**4}
 
@@ -80,6 +86,12 @@ def quota_refusal(
     All four settings unset skips the check. Any missing or blank setting is
     incomplete. Otherwise each override quantity is compared directly to the
     matching hard quota. Init containers do not add.
+
+    The two sides parse with different grammars (#3719). An override value
+    keeps the whole-core grammar of `_parse`; a quota ceiling carries whatever
+    Kubernetes accepts in `resourceQuota.hard.*`, so a decimal core like "2.5"
+    compares in millicores exactly like "2500m". A quota value that does not
+    parse refuses naming the quota setting, never the request.
     """
 
     settings = (requests_cpu, requests_memory, limits_cpu, limits_memory)
@@ -95,14 +107,48 @@ def quota_refusal(
     }
     for (side, dimension), ceiling in hard.items():
         assert ceiling is not None
+        setting = f"CURIE_SANDBOX_QUOTA_{side.upper()}_{dimension.upper()}"
         got = str(value[side][dimension])
-        if _parse(dimension, got) > _parse(dimension, ceiling):
+        # The override parses first with its own stricter grammar, so an
+        # invalid override value stays a request error even when the quota
+        # ceiling is also unparseable.
+        requested = _parse(dimension, got)
+        if requested > _quota_ceiling(dimension, ceiling, setting):
             kind = "request" if side == "requests" else "limit"
             return (
                 f"{dimension} {kind} {got} cannot fit sandbox quota hard {ceiling}; "
                 "lower the override or raise resourceQuota.hard"
             )
     return None
+
+
+def _quota_ceiling(dimension: str, raw: str, setting: str) -> int:
+    """Parse a quota ceiling with the quota grammar, not the override grammar.
+
+    The chart renders `resourceQuota.hard.*` straight into the
+    `CURIE_SANDBOX_QUOTA_*` settings, so a quota value may be any Kubernetes
+    CPU quantity, decimal cores included. An unparseable quota is operator
+    configuration, so the refusal names the setting, never the request.
+    """
+
+    text = raw.strip()
+    if dimension == "cpu":
+        match = _QUOTA_CPU.fullmatch(text)
+        if match is None:
+            raise RunnerResourcesError(
+                f"sandbox quota setting {setting} value {raw!r} is not a valid cpu quantity"
+            )
+        # Decimal, not float: a quota like 9007199254740993m must stay exact so
+        # an override equal to its quota still fits. A fractional millicore
+        # ceiling ("2.5m") truncates toward zero, which only tightens it.
+        amount = Decimal(match.group(1))
+        return int(amount) if match.group(2) else int(amount * 1000)
+    try:
+        return _parse(dimension, text)
+    except RunnerResourcesError:
+        raise RunnerResourcesError(
+            f"sandbox quota setting {setting} value {raw!r} is not a valid {dimension} quantity"
+        ) from None
 
 
 def _parse(dimension: str, raw: str) -> int:

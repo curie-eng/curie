@@ -120,7 +120,7 @@ async fn red_cluster_eval_exit_reaps_kubectl_child_and_frees_its_port() {
     let output = Command::new(&exe)
         .args([
             "--exact",
-            "red_cluster_eval_exit_reaps_kubectl_child_and_frees_its_port",
+            "eval_portforward_cleanup::red_cluster_eval_exit_reaps_kubectl_child_and_frees_its_port",
         ])
         .env(CHILD_FLAG, "1")
         .env(META_FLAG, &meta)

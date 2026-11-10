@@ -19,17 +19,19 @@ from fastapi import HTTPException
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from curie_api.factory_admission import ignored
+from curie_api.forges.github.identity import delivery_uuid
+from curie_api.github_factory import IGNORED, admission_result
+from curie_api.schemas.deployments import WebhookResult
+
 from . import workitem_dispatch
 from .config import Settings
 from .factory_reply_target import feedback_url
-from .github_factory import (
-    _IGNORED,
-    _admission_result,
-    _delivery_uuid,
-    _Facts,
-    _ignored,
-    lock_issue,
-)
+from .forges.hosts import factory_code_host_entry, factory_tracker, github_host
+from .forges.registry import forges_registry
+from .forges.trackers import reply_route
+from .forges.types import GITHUB, PullRequestRef, ReplyTarget
+from .github_factory import lock_issue
 from .github_factory_events import mentions_login
 from .github_review_audit import claim_review_delivery, settle_review_delivery
 from .github_review_events import (
@@ -39,23 +41,27 @@ from .github_review_events import (
     parse_feedback,
 )
 from .github_review_store import feedback_provenance
-from .github_review_truth import BoundReviewLineage, verify_feedback_truth
+from .github_review_truth import (
+    BoundReviewLineage,
+    VerifiedRepository,
+    verify_feedback_in_repository,
+    verify_feedback_truth,
+)
 from .models import ThreadPublicationLineage, WorkItem
-from .schemas import WebhookResult
+from .workitem_dispatch import Admission
 from .workspace_policy import repository_is_allowed
 
 logger = logging.getLogger(__name__)
 
 _MAX_OBJECTIVE = 65536
 # Payload-shape refusals the review ingress also treats as ignorable.
-_REVIEW_IGNORED = _IGNORED | {
+_REVIEW_IGNORED = IGNORED | {
     "unsupported_action",
     "non_actionable_review",
     "empty_feedback",
     "edited_feedback",
     "not_pull_request",
 }
-
 
 
 def _payload_pull_request(event: str, payload: Any) -> tuple[int, int] | None:
@@ -76,8 +82,9 @@ def _payload_pull_request(event: str, payload: Any) -> tuple[int, int] | None:
 
 
 async def _owner(
-    session: AsyncSession, repository_id: int, pr_number: int
+    session: AsyncSession, settings: Settings, repository_id: int, pr_number: int
 ) -> tuple[WorkItem, ThreadPublicationLineage] | None:
+    host, project_id = github_host(settings), str(repository_id)
     row = (
         await session.execute(
             select(WorkItem, ThreadPublicationLineage)
@@ -86,9 +93,13 @@ async def _owner(
                 ThreadPublicationLineage.id == WorkItem.publication_lineage_id,
             )
             .where(
-                ThreadPublicationLineage.github_repository_id == repository_id,
+                ThreadPublicationLineage.code_host_kind == GITHUB,
+                ThreadPublicationLineage.code_host_host == host,
+                ThreadPublicationLineage.repository_project_id == project_id,
                 ThreadPublicationLineage.pr_number == pr_number,
-                WorkItem.github_repository_id == repository_id,
+                WorkItem.code_host_kind == GITHUB,
+                WorkItem.code_host_host == host,
+                WorkItem.repository_project_id == project_id,
             )
             .order_by(ThreadPublicationLineage.created_at.desc())
             .limit(1)
@@ -99,13 +110,15 @@ async def _owner(
     return row[0], row[1]
 
 
-async def factory_owns(session: AsyncSession, event: str, payload: Any) -> bool:
+async def factory_owns(
+    session: AsyncSession, settings: Settings, event: str, payload: Any
+) -> bool:
     """True when a WorkItem owns the lineage for the payload's pull request."""
 
     claimed = _payload_pull_request(event, payload)
     if claimed is None:
         return False
-    return await _owner(session, *claimed) is not None
+    return await _owner(session, settings, *claimed) is not None
 
 
 def is_actionable_feedback(
@@ -120,9 +133,24 @@ def is_actionable_feedback(
     return True
 
 
-def _objective(feedback: UnverifiedFeedback, settings: Settings, repo_full_name: str) -> str:
+def _feedback_url(feedback: UnverifiedFeedback, settings: Settings, repo_full_name: str) -> str:
     fragment = feedback.url.split("#", 1)[1]
-    url = feedback_url(settings.github_html_base, repo_full_name, feedback.pr_number, fragment)
+    return feedback_url(settings.github_html_base, repo_full_name, feedback.pr_number, fragment)
+
+
+def _reply_target(feedback: UnverifiedFeedback, work_item: WorkItem) -> ReplyTarget:
+    """An inline review comment is answered in its thread; a PR comment or a
+    submitted review in the pull request conversation."""
+
+    pull_request = PullRequestRef(work_item.repository, str(feedback.pr_number))
+    if feedback.event == "pull_request_review_comment":
+        return ReplyTarget.on_thread(pull_request, str(feedback.feedback_id))
+    return ReplyTarget.on_pull_request(pull_request)
+
+
+def _objective(feedback: UnverifiedFeedback, url: str) -> str:
+    # The feedback URL opens the objective for the agent's benefit only; the
+    # reply target is stored typed on the request.
     provenance = feedback_provenance(feedback)
     return (
         f"{url}\n\n"
@@ -136,9 +164,10 @@ def _bound(lineage: ThreadPublicationLineage) -> BoundReviewLineage:
     if (
         lineage.pr_number is None
         or lineage.head_sha is None
-        or lineage.github_repository_id is None
-        or lineage.github_installation_id is None
-        or lineage.github_pr_node_id is None
+        or lineage.code_host_kind != GITHUB
+        or lineage.repository_project_id is None
+        or lineage.code_host_installation_id is None
+        or lineage.code_host_pr_id is None
         or lineage.base_ref is None
     ):
         raise FeedbackIgnored("lineage_authority_unproved")
@@ -147,30 +176,39 @@ def _bound(lineage: ThreadPublicationLineage) -> BoundReviewLineage:
         lineage.pr_number,
         lineage.branch,
         lineage.head_sha,
-        lineage.github_repository_id,
-        lineage.github_installation_id,
-        lineage.github_pr_node_id,
+        int(lineage.repository_project_id),
+        lineage.code_host_installation_id,
+        lineage.code_host_pr_id,
         lineage.base_ref,
     )
 
 
-async def _admit(
+async def admit_parsed_feedback(
     session: AsyncSession,
     feedback: UnverifiedFeedback,
     *,
     settings: Settings,
     client: httpx.AsyncClient,
+    verified: VerifiedRepository | None,
 ) -> WebhookResult:
-    if not mentions_login(feedback.body, settings.github_factory_mention):
+    """Admit one piece of review feedback.
+
+    ``verified`` is the poll pass's repository read with its freshly verified
+    installation token, reused for every piece of feedback in that pass; a
+    webhook delivery passes None and verifies its own.
+    """
+
+    registry = forges_registry(settings)
+    if not mentions_login(feedback.body, factory_tracker(registry).config.mention):
         raise FeedbackIgnored("ordinary_comment")
     if not repository_is_allowed(feedback.repo_full_name, settings.github_repo_allowlist):
         raise FeedbackIgnored("repository_not_allowed")
-    owner = await _owner(session, feedback.repository_id, feedback.pr_number)
+    owner = await _owner(session, settings, feedback.repository_id, feedback.pr_number)
     if owner is None:
         raise FeedbackIgnored("lineage_unbound")
     work_item = owner[0]
     # Serialize with issue cancellation, then re-read under the lock.
-    await lock_issue(session, work_item.github_repository_id, work_item.github_issue_number)
+    await lock_issue(session, work_item.tracker_issue)
     await session.refresh(work_item)
     lineage = await session.get(ThreadPublicationLineage, owner[1].id, populate_existing=True)
     if lineage is None or work_item.publication_lineage_id != lineage.id:
@@ -181,11 +219,24 @@ async def _admit(
         raise FeedbackIgnored("work_item_cancelled")
     bound = _bound(lineage)
     if (
-        feedback.installation_id != work_item.github_installation_id
+        feedback.installation_id != work_item.code_host_installation_id
         or feedback.installation_id != bound.installation_id
     ):
         raise FeedbackIgnored("installation_mismatch")
-    await verify_feedback_truth(feedback, bound, settings=settings, client=client)
+    if verified is None:
+        code_host = factory_code_host_entry(registry)
+        await verify_feedback_truth(
+            feedback,
+            bound,
+            settings=settings,
+            client=client,
+            credentials=code_host.credentials.credentials,
+            api_url=code_host.config.api_url,
+        )
+    else:
+        await verify_feedback_in_repository(
+            feedback, bound, verified, settings=settings, client=client
+        )
     # Provider verification can overlap another WorkItem or lineage writer.
     # Keep both current rows locked through admission and reject changed proof.
     current_item = await session.scalar(
@@ -215,24 +266,36 @@ async def _admit(
     if current_item.cancelled_at is not None:
         raise FeedbackIgnored("work_item_cancelled")
     work_item = current_item
-    objective = _objective(feedback, settings, work_item.repo_full_name)
+    url = _feedback_url(feedback, settings, work_item.repository_path)
+    objective = _objective(feedback, url)
     if len(objective) > _MAX_OBJECTIVE:
         raise FeedbackIgnored("feedback_too_large")
-    facts = _Facts(
+    kind, address, conversation = reply_route(
+        registry, work_item.tracker_issue, work_item.repository_path
+    )
+    facts = Admission(
         agent_id=work_item.agent_id,
-        kind="github",
-        address=work_item.repo_full_name,
-        reply_conversation_id=f"issue-{work_item.github_issue_number}",
-        repo_full_name=work_item.repo_full_name,
-        github_repository_id=work_item.github_repository_id,
-        github_issue_number=work_item.github_issue_number,
-        github_installation_id=work_item.github_installation_id,
+        kind=kind,
+        address=address,
+        reply_conversation_id=conversation,
+        issue=work_item.tracker_issue,
+        repository=work_item.repository,
+        code_host_installation_id=work_item.code_host_installation_id,
         objective=objective,
         requester=f"github:{feedback.sender_id}:{feedback.sender_login}",
         request_id=uuid.uuid5(uuid.NAMESPACE_URL, feedback.event_id),
+        reply_target=_reply_target(feedback, work_item),
+        reply_url=url,
     )
-    result = await workitem_dispatch.admit_revision(session, facts)
-    return _admission_result(result, facts.request_id)
+    # Keep dispatch commits inside savepoints so the caller's issue lock remains
+    # held until admission and delivery settlement commit together.
+    async with AsyncSession(
+        bind=await session.connection(),
+        join_transaction_mode="create_savepoint",
+        expire_on_commit=False,
+    ) as admission:
+        result = await workitem_dispatch.admit_revision(admission, facts)
+        return admission_result(result, facts.request_id)
 
 
 async def handle_factory_review_delivery(
@@ -247,25 +310,27 @@ async def handle_factory_review_delivery(
 ) -> WebhookResult:
     """Admit, ignore, or refuse one signed review delivery on a factory PR."""
 
-    parsed_delivery = _delivery_uuid(delivery_id)
+    parsed_delivery = delivery_uuid(delivery_id)
     audit, conflict = await claim_review_delivery(
         session, delivery_id=parsed_delivery, event=event, body=body, payload=payload
     )
     if conflict:
         await session.commit()
-        return _ignored("delivery_identity_conflict")
+        return ignored("delivery_identity_conflict")
     if audit.status == "accepted":
         await session.commit()
         return WebhookResult(status="factory_duplicate")
     if audit.status in {"ignored", "rejected"}:
         assert audit.reason is not None
         await session.commit()
-        return _ignored(audit.reason)
+        return ignored(audit.reason)
     try:
         feedback = parse_feedback(
             event, payload, delivery_id, github_html_base=settings.github_html_base
         )
-        outcome = await _admit(session, feedback, settings=settings, client=client)
+        outcome = await admit_parsed_feedback(
+            session, feedback, settings=settings, client=client, verified=None
+        )
     except FeedbackUnavailable as exc:
         settle_review_delivery(audit, "retryable", exc.code)
         await session.commit()
@@ -277,7 +342,7 @@ async def handle_factory_review_delivery(
         settle_review_delivery(audit, disposition, exc.code)
         await session.commit()
         logger.info("factory review delivery ignored: %s", exc.code)
-        return _ignored(exc.code)
+        return ignored(exc.code)
     if outcome.status == "factory_ignored":
         code = outcome.errors[0]["code"] if outcome.errors else "ignored"
         settle_review_delivery(audit, "ignored" if code in _REVIEW_IGNORED else "rejected", code)

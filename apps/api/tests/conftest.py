@@ -14,14 +14,22 @@ import secrets
 import sys
 import uuid
 from collections.abc import Iterator
+from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
 
 import asyncpg
 import pytest
 import redis
 from alembic import command
+from botocore.exceptions import (
+    ConnectionClosedError,
+    ConnectTimeoutError,
+    EndpointConnectionError,
+    ReadTimeoutError,
+)
 from curie_api.config import get_settings
 from curie_api.main import create_app
 from curie_test_support.valkey import connect_or_skip
@@ -33,6 +41,9 @@ from sqlalchemy.sql import text
 
 # Test modules import shared helpers from this directory; see _migration_support.
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+# The shared forge fakes hold fixtures and asserts that lived in test modules;
+# keep pytest's assertion detail for them.
+pytest.register_assert_rewrite("forge_fakes")
 
 from _migration_support import (  # noqa: E402
     IsolatedMigrationDb,
@@ -41,6 +52,24 @@ from _migration_support import (  # noqa: E402
     alembic_config,
     render_url,
 )
+from identity_fence_support import (  # noqa: E402
+    fence_key_for_worker,
+    installed_fence_key,
+)
+
+
+@pytest.fixture(scope="session")
+def identity_fence_key(testrun_uid: str, worker_id: str) -> str:
+    """@spec IDENTITY-WRITER-LIFETIME-V1-10."""
+    return fence_key_for_worker(testrun_uid, worker_id)
+
+
+@pytest.fixture(autouse=True)
+def identity_fence_backend(identity_fence_key: str) -> Iterator[str]:
+    """@spec IDENTITY-WRITER-LIFETIME-V1-10."""
+    with installed_fence_key(identity_fence_key):
+        yield identity_fence_key
+
 
 # The object-store credential the suite talks to compose's RustFS with. The code
 # default in `curie_api.config` is deliberately empty so that omitting these
@@ -55,6 +84,10 @@ os.environ.setdefault("S3_SECRET_KEY", "rustfssecret")
 # Production enables the work-item reconciler. Suite create_app() must not:
 # a 5s pass races TRUNCATE on the shared engine. Loop tests construct it.
 os.environ.setdefault("CURIE_WORK_ITEM_RECONCILER_ENABLED", "false")
+# The deploy notice outbox reconciler likewise: its 5s pass holds pooled
+# connections from the TestClient's loop, which a test driving the same app
+# from its own loop then receives (#1331). Its tests call reconcile_once.
+os.environ.setdefault("CURIE_DEPLOY_NOTICE_RECONCILER_ENABLED", "false")
 get_settings.cache_clear()
 # A dedicated placeholder attester key for authenticated chat approval tests.
 # It is intentionally distinct from the platform key: sharing those keys would
@@ -62,6 +95,13 @@ get_settings.cache_clear()
 # requires the dispatcher alone to attest.
 os.environ.setdefault(
     "CURIE_APPROVAL_CHAT_ATTESTER_SECRET", "approval-chat-attester-test-secret"
+)
+# A dedicated placeholder remediation authority key (ADR 0231) for the policy
+# bind and arm routes. It is intentionally distinct from the platform key: the
+# point of the key is that a holder of the platform key (every worker) cannot
+# satisfy it, so a test suite where the two match would prove nothing.
+os.environ.setdefault(
+    "CURIE_REMEDIATION_AUTHORITY_KEY", "remediation-authority-test-secret"
 )
 
 DB_PREFIX = "curie_test_"
@@ -71,13 +111,19 @@ TS_FORMAT = "%Y%m%d%H%M%S"
 async def _admin_connect(base: URL) -> asyncpg.Connection:
     """Connect to the `postgres` maintenance DB to run CREATE/DROP DATABASE."""
 
-    return await asyncpg.connect(
-        user=base.username,
-        password=base.password,
-        host=base.host,
-        port=base.port,
-        database="postgres",
-    )
+    try:
+        return await asyncpg.connect(
+            user=base.username,
+            password=base.password,
+            host=base.host,
+            port=base.port,
+            database="postgres",
+        )
+    except OSError as exc:
+        exc.add_note(
+            f"could not connect to Postgres at {base.host}:{base.port}: start the compose stack"
+        )
+        raise
 
 
 def _stale(datname: str, cutoff: datetime) -> bool:
@@ -165,9 +211,11 @@ async def _truncate() -> None:
             await conn.execute(
                 text(
                     "TRUNCATE curie.execution_requests, curie.work_items, "
+                    "curie.deploy_notice_outbox, "
                     "curie.approvals, curie.deployments, "
                     "curie.agent_versions, curie.agents, "
-                    "curie.console_sessions CASCADE"
+                    "curie.console_sessions, curie.github_review_deliveries, "
+                    "curie.factory_poll_cursors, curie.tenant_identity_providers CASCADE"
                 )
             )
     finally:
@@ -183,8 +231,33 @@ def clean_db(migrated: None) -> None:
 def client(_disposable_db: Any) -> Any:
     # Depends on _disposable_db so the app engine is built against the disposable
     # DB (the app lifespan already requires the compose stack: RustFS, Valkey).
-    with TestClient(create_app()) as test_client:
+    # Give each fixture instance its own client address so a session request in
+    # one test cannot consume another test's Valkey rate limit budget.
+    suffix = secrets.token_hex(8)
+    address = "2001:db8::" + ":".join(
+        suffix[index : index + 4] for index in range(0, 16, 4)
+    )
+    with _test_client(TestClient(create_app(), client=(address, 5000))) as test_client:
         yield test_client
+
+
+@contextmanager
+def _test_client(client: TestClient) -> Iterator[TestClient]:
+    try:
+        with client:
+            yield client
+    except (
+        EndpointConnectionError,
+        ConnectionClosedError,
+        ConnectTimeoutError,
+        ReadTimeoutError,
+    ) as exc:
+        endpoint = urlsplit(get_settings().s3_endpoint_url)
+        port = endpoint.port or (443 if endpoint.scheme == "https" else 80)
+        exc.add_note(
+            f"could not connect to RustFS at {endpoint.hostname}:{port}: start the compose stack"
+        )
+        raise
 
 
 # --- hook ingress fixtures (test_hooks.py, test_hook_partition.py) -------------
@@ -218,7 +291,7 @@ def valkey(runs_stream: str) -> Iterator[redis.Redis]:
 @pytest.fixture
 def hooks_client(_disposable_db: Any, runs_stream: str) -> Iterator[TestClient]:
     # Built AFTER runs_stream so the app reads the per-test stream name.
-    with TestClient(create_app()) as test_client:
+    with _test_client(TestClient(create_app())) as test_client:
         yield test_client
 
 

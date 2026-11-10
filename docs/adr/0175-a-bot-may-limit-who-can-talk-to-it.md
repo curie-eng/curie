@@ -4,6 +4,11 @@ Date: 2026-09-24
 
 Status: Accepted
 
+Partially superseded by [ADR 0246](0246-common-admission-resolves-an-optional-http-identity-before-authorized-enqueue.md):
+decision 2's migrated Slack composition/cache authority, decision 6's caller/link
+migration assumption, and decision 7's first-paragraph stale-allow timing. Other
+clauses and unmigrated local behavior remain unchanged.
+
 Accepted with explicit maintainer approval from Brian Conn in the review of
 [#3148](https://github.com/curie-eng/curie/pull/3148), the pull request that
 published this status, before implementation.
@@ -175,7 +180,7 @@ fixed by editing the list.
 5. `apps/dispatcher`: an admission client and cache; the call in `handlers.py`
    after `relevance.classify` and before `claim_event`; the two drop reasons in
    `relevance.py`.
-6. `apps/mail-adapter/src/curie_mail_adapter/adapter.py`: 403 is final.
+6. `packages/channel-gateway/src/curie_channel_gateway/mail/adapter.py`: 403 is final.
 7. `cli/src/main.rs` and `cli/src/commands.rs`: a `curie` subcommand to set,
    show and clear a list.
 8. `docs/interfaces/channel-ingress/INTERFACE.md` and

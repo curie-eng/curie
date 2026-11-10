@@ -38,7 +38,7 @@ from plugin_format.yaml_loader import safe_load_unique
 
 from .adapter import build_options
 from .connectors import derive_mcp_servers
-from .plugin import PluginBundleError, bundle_mcp_servers, load_plugins
+from .plugin import PluginBundleError, bundle_mcp_servers, bundle_skill_names, load_plugins
 
 logger = logging.getLogger(__name__)
 
@@ -46,6 +46,7 @@ logger = logging.getLogger(__name__)
 # generated `env_keys::CURIE_PLUGIN_DIR`) when it runs this check, so the
 # consumer side reads it from the declaration too rather than retyping it (#488).
 PLUGIN_DIR_ENV = BootEnv.env_key("plugin_dir")
+REVIEWER_MODEL_ENV = BootEnv.env_key("reviewer_model")
 
 CHECK_NAME = "mcp-load"
 CHECK_VERSION = 1
@@ -588,7 +589,7 @@ async def run_check(plugin_dir: str) -> dict[str, Any]:
         registered = await asyncio.wait_for(_connect_and_poll(plugins, plugin_dir), timeout_s)
     except TimeoutError:
         return _red_result(plugin_dir, declared, f"MCP init did not complete within {timeout_s}s")
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001 - existing broad catch retained
         # A non-timeout failure while setting up the MCP client (Claude CLI
         # subprocess fails to start, an incompatible --image, an SDK error)
         # would otherwise escape main() before any JSON is printed, and the CLI
@@ -655,6 +656,10 @@ async def _connect_and_poll(plugins: list[Any], plugin_dir: str) -> list[dict[st
         max_turns=1,
         max_budget_usd=None,
         resume=None,
+        # Parity with the session entry point (ADR-0189); this check runs no query.
+        # The reviewer is read as RunnerConfig reads it, unset when empty.
+        reviewer_model=os.environ.get(REVIEWER_MODEL_ENV) or None,
+        skills=bundle_skill_names(plugin_dir),
     )
     client = ClaudeSDKClient(options)
     await client.connect()

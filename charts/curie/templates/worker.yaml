@@ -4,6 +4,7 @@
        agent-sandbox.yaml renders only for the chart's own base name, and only
        while agentSandbox.deploy renders pools at all (#2943). */}}
 {{- $perAgentPools := and .Values.agentSandbox.deploy (eq $warmPool (printf "%s-runner-pool" (include "curie.fullname" .))) }}
+{{- $repoRunners := include "curie.factory.repoRunnerDescriptors" . | fromJsonArray }}
 {{- $workspaceStageBudget := add .Values.worker.workspace.cloneTimeoutSeconds .Values.worker.workspace.archiveTimeoutSeconds .Values.worker.workspace.uploadTimeoutSeconds }}
 {{- $publicationPullSecrets := list }}
 {{- range .Values.agentSandbox.runner.imagePullSecrets }}
@@ -16,13 +17,34 @@
      inconsistent. Refuse it before creating a worker Pod; the worker boot
      validator remains the backstop outside Helm. */}}
 {{- include "curie.worker.validateRunnerBudget" . }}
+{{- $checksumExtraEnv := include "curie.extraEnv" (dict "root" . "workload" "worker" "env" .Values.worker.extraEnv "additionalReserved" (merge (dict "S3_REGION" "rustfs.region") (include "curie.slack.reservedEnv" (dict "root" . "workload" "worker") | fromJson))) -}}
+{{- $checksumRefs := list
+  (dict "name" (include "curie.storeSecretName" (dict "root" $ "store" $.Values.langfuse)) "key" "langfuseInitProjectSecretKey")
+  (include "curie.secretRef" (dict "root" $ "existingSecret" $.Values.sealing.privateKeyExistingSecret "existingSecretKey" $.Values.sealing.privateKeyExistingSecretKey "defaultKey" "sealingPrivateKey") | fromYaml)
+  (include "curie.secretRef" (dict "root" $ "existingSecret" $.Values.sealing.previousPrivateKeyExistingSecret "existingSecretKey" $.Values.sealing.previousPrivateKeyExistingSecretKey "defaultKey" "sealingPreviousPrivateKey") | fromYaml)
+  (include "curie.secretRef" (dict "root" $ "existingSecret" $.Values.worker.adapterCredentialsExistingSecret "existingSecretKey" $.Values.worker.adapterCredentialsExistingSecretKey "defaultKey" "adapterCredentials") | fromYaml)
+  (include "curie.secretRef" (dict "root" $ "existingSecret" (get ($.Values.connectorCaller | default dict) "existingSecret") "existingSecretKey" ((get ($.Values.connectorCaller | default dict) "signingKeyKey") | default "signingKey") "defaultKey" "connectorCallerSigningKey") | fromYaml)
+-}}
+{{- $checksumHasApiKey := false -}}
+{{- range $.Values.worker.extraEnv -}}
+{{- if eq .name "CURIE_API_KEY" -}}{{- $checksumHasApiKey = true -}}{{- end -}}
+{{- end -}}
+{{- if not $checksumHasApiKey -}}
+{{- $checksumRefs = append $checksumRefs (dict "name" (include "curie.secretName" $) "key" "apiKey") -}}
+{{- end -}}
+{{- if include "curie.rustfs.staticCredentials" $ -}}
+{{- $checksumRefs = append $checksumRefs (dict "name" (include "curie.storeSecretName" (dict "root" $ "store" $.Values.rustfs)) "key" "rustfsSecretKey") -}}
+{{- end -}}
+{{- if and (or $.Values.agentSandbox.runner.credentials $.Values.agentSandbox.runner.credentialsExistingSecret) (not (and $.Values.agentSandbox.runner.fakeModel (not $.Values.inference.deploy))) -}}
+{{- $checksumRefs = append $checksumRefs (include "curie.secretRef" (dict "root" $ "existingSecret" $.Values.agentSandbox.runner.credentialsExistingSecret "existingSecretKey" $.Values.agentSandbox.runner.credentialsExistingSecretKey "defaultKey" "agentCredentials") | fromYaml) -}}
+{{- end -}}
 {{- if .Values.worker.serviceAccount.create }}
 {{/*
 The worker drives the Kubernetes API to claim and manage agent-sandbox custom
 resources (the substrate's SandboxClient). It gets a namespaced Role scoped to
 exactly the CRD verbs KubernetesSandboxClient uses -- SandboxClaims it
-creates/reads/deletes/lists, Sandboxes it reads and patches (suspend/resume) --
-and nothing else. RBAC does not require the CRDs to be installed for the Role to
+creates/reads/deletes/lists, Sandboxes it reads and patches (suspend/resume).
+RBAC does not require the CRDs to be installed for the Role to
 apply, so this is valid even when agentSandbox.deploy is false.
 */}}
 apiVersion: v1
@@ -60,21 +82,53 @@ rules:
     resources: ["resourcequotas"]
     verbs: ["get"]
   {{- if .Values.agentSandbox.deploy }}
-  # Per-agent runner resources (#3209). get reads the chart template. create
-  # and patch write only the worker-owned copy. list and delete stay absent.
-  # The ValidatingAdmissionPolicy in runner-resources-admission.yaml is rendered
-  # on the same condition and refuses any name that is not that copy, so this
-  # grant cannot rewrite the shared template. Kubernetes older than 1.30 fails
-  # that template, which fails this render before the grant is installed.
+  # Per-agent runner resources (#3209) and per-claim token templates (#3842).
+  # get reads the chart template and the source warm pool. create and patch
+  # write only worker-owned copies. Templates also need delete (rollback of a
+  # half-built per-claim set) and list (the reaper sweep of per-claim templates
+  # whose claim is gone); warm pools are never listed or deleted by the worker,
+  # because Kubernetes GC removes a per-claim pool with its template.
+  # The ValidatingAdmissionPolicies in runner-resources-admission.yaml render on
+  # the same condition: they refuse any name that is not a worker-owned copy,
+  # any template shape the chart does not render, and any delete of a template
+  # without the curietech.ai/sandbox-claim label, so this grant cannot rewrite
+  # or remove the shared template. Kubernetes older than 1.30 fails that
+  # template, which fails this render before the grant is installed.
   - apiGroups: ["extensions.agents.x-k8s.io"]
-    resources: ["sandboxtemplates", "sandboxwarmpools"]
+    resources: ["sandboxtemplates"]
+    verbs: ["get", "create", "patch", "list", "delete"]
+  - apiGroups: ["extensions.agents.x-k8s.io"]
+    resources: ["sandboxwarmpools"]
     verbs: ["get", "create", "patch"]
+  # Per-claim token Secret (#3842): the claim's scoped tokens reach the runner
+  # by secretKeyRef instead of riding the SandboxClaim spec. create only; no
+  # get, list, or watch, so this grant cannot read any Secret back. The
+  # worker-secrets admission policy admits only an Opaque `*-tokens` Secret
+  # carrying curietech.ai/sandbox-claim in this namespace.
+  - apiGroups: [""]
+    resources: ["secrets"]
+    verbs: ["create"]
   {{- end }}
-  # The worker reads the exact sandbox pod for capacity and stream failure
-  # diagnosis. It lists only events for that named pod after a stream drop.
+  # Stream failure diagnosis reads the exact sandbox Pod and its events.
   - apiGroups: [""]
     resources: ["pods"]
     verbs: ["get"]
+  # A claim that never became Ready logs the runner's last 8 KB before cleanup.
+  - apiGroups: [""]
+    resources: ["pods/log"]
+    verbs: ["get"]
+{{- if eq (include "curie.actionExecutorConnectorReads" .) "true" }}
+{{/*
+#4800, ACTION-EXECUTOR-12/-14 as amended: the executor's own connector reads,
+with the connector reconciler off. The same single-object `get` on Deployments
+the executor gains beside the reconciler, in its own rule, and none of the
+reconciler's create/list/patch/delete rules. No `list`, no `watch`, no other
+kind. The helper refuses this with the executor off or the reconciler on.
+*/}}
+  - apiGroups: ["apps"]
+    resources: ["deployments"]
+    verbs: ["get"]
+{{- end }}
   - apiGroups: [""]
     resources: ["events"]
     verbs: ["list"]
@@ -92,7 +146,8 @@ that does not exist yet is authorized as a create, so a Role with only `patch`
 lets the reconciler update existing connectors while failing to create any --
 the first-run path, and the one most likely to be exercised. Verified with
 `kubectl apply --server-side --as=<the worker SA>`, which is forbidden without
-it. No `get` (nothing reads a single object), no cluster scope, no other kinds.
+it. No `get` unless the action executor is enabled, when one separate rule adds
+only `get` on Deployments for digest attribution; no cluster scope, no other kinds.
 
 This is a genuine privilege increase over the CRD-only rules above -- it
 includes delete on Secrets -- which is why it renders only when the reconciler
@@ -101,6 +156,19 @@ is actually enabled.
   - apiGroups: ["apps"]
     resources: ["deployments"]
     verbs: ["create", "list", "patch", "delete"]
+{{- if eq (include "curie.actionExecutorEnabled" .) "true" }}
+{{/*
+ACTION-EXECUTOR-12/-14: the action executor reads the connector's owned
+Deployment by name to record the digest it ran at and to check a pinned digest.
+A single-object `get` on Deployments only, in its own rule so it cannot spill
+onto another kind; granted only with the executor and this reconciler both
+enabled. With the executor off this Role is unchanged and actions record no
+digest. No `watch`, no other kind.
+*/}}
+  - apiGroups: ["apps"]
+    resources: ["deployments"]
+    verbs: ["get"]
+{{- end }}
   - apiGroups: [""]
     resources: ["services", "secrets"]
     verbs: ["create", "list", "patch", "delete"]
@@ -141,6 +209,16 @@ spec:
   template:
     metadata:
       annotations:
+        {{- with (include "curie.channelGateway.tlsChecksum" .) }}
+        checksum/gateway-tls: {{ . | quote }}
+        {{- end }}
+        {{- with (include "curie.secretChecksum" (dict
+        "root" $
+        "keys" (list "internalWorkerToken" "installationId")
+        "refs" $checksumRefs
+        "env" (printf "%s\n%s\n%s\n%s\n%s\n%s" (include "curie.env.postgres" $) (include "curie.env.valkey" $) (include "curie.env.slack" (dict "root" $ "workload" "worker")) (include "curie.env.channelGateway" (dict "root" $ "caller" "worker")) (include "curie.env.otel" (dict "root" $ "extraEnv" $.Values.worker.extraEnv)) $checksumExtraEnv))) }}
+        checksum/secret: {{ . }}
+        {{- end }}
         {{- with (include "curie.placement.annotations" (dict "root" $ "class" "platform")) }}
         {{- . | nindent 8 }}
         {{- end }}
@@ -204,6 +282,7 @@ spec:
       {{- $hasWorkerApiKey = true }}
       {{- end }}
       {{- end }}
+      enableServiceLinks: false
       containers:
         - name: worker
           image: {{ include "curie.image" (dict "repository" .Values.worker.image.repository "tag" .Values.worker.image.tag "digest" .Values.worker.image.digest "defaultTag" .Chart.AppVersion) | quote }}
@@ -241,6 +320,10 @@ spec:
               value: {{ .Values.worker.workspace.maxCheckoutBytes | int64 | quote }}
             - name: CURIE_WORKSPACE_MAX_ARCHIVE_BYTES
               value: {{ .Values.worker.workspace.maxArchiveBytes | int64 | quote }}
+            # Workspace recovery capture (ADR 0251). The API renders the same
+            # value from the same helper.
+            - name: CURIE_WORKSPACE_RECOVERY_ENABLED
+              value: {{ include "curie.workspaceRecoveryEnabled" . | quote }}
             - name: CURIE_WORKSPACE_MAX_MEMBERS
               value: {{ .Values.worker.workspace.maxMembers | quote }}
             - name: CURIE_WORKSPACE_MAX_COMPRESSION_RATIO
@@ -260,6 +343,16 @@ spec:
             python reads 3.3554432e+07 as the number -- so the two sides are
             compared NUMERICALLY by ci/attachment-init-assertions.sh.
             */}}
+            - name: CURIE_ATTACHMENT_MODE
+              value: {{ .Values.worker.attachments.mode | default "eager" | quote }}
+            - name: CURIE_ATTACHMENT_BROKER_HOST
+              value: "0.0.0.0"
+            - name: CURIE_ATTACHMENT_BROKER_PORT
+              value: {{ (dig "broker" "port" 8093 .Values.worker.attachments) | quote }}
+            - name: CURIE_ATTACHMENT_BROKER_MAX_CONCURRENT
+              value: {{ (dig "broker" "maxConcurrent" 8 .Values.worker.attachments) | quote }}
+            - name: CURIE_ATTACHMENT_TRANSFER_TIMEOUT_SECONDS
+              value: {{ (dig "broker" "transferTimeoutSeconds" 300 .Values.worker.attachments) | quote }}
             - name: CURIE_ATTACHMENT_ENABLED
               value: {{ .Values.worker.attachments.enabled | quote }}
             - name: CURIE_ATTACHMENT_MAX_FILE_BYTES
@@ -268,6 +361,28 @@ spec:
               value: {{ .Values.worker.attachments.referenceTtlSeconds | quote }}
             - name: CURIE_ATTACHMENT_RETENTION_TTL_SECONDS
               value: {{ .Values.worker.attachments.retentionTtlSeconds | quote }}
+            {{- /*
+            ADR 0205 decision 7: the per-thread file count and byte budget one
+            boot materializes. The byte budget has to fit the attachments
+            emptyDir the init container writes into, or the thread's files
+            overflow it and the pod is evicted mid-boot; the chart refuses the
+            values instead. Defaulted here as well as in values.yaml: under
+            `helm upgrade --reuse-values` from a release that predates the keys
+            they are nil, and a nil budget would render "0".
+            */}}
+            {{- $threadMaxFiles := .Values.worker.attachments.threadMaxFiles | default 20 | int64 }}
+            {{- $threadMaxBytes := .Values.worker.attachments.threadMaxBytes | default 268435456 | int64 }}
+            {{- $runnerAttachments := .Values.agentSandbox.runner.attachments | default dict }}
+            {{- if and .Values.worker.attachments.enabled $runnerAttachments.enabled (ne (.Values.worker.attachments.mode | default "eager") "lazy") }}
+            {{- $volumeBytes := include "curie.capacity.memBytes" $runnerAttachments.sizeLimit | int64 }}
+            {{- if gt $threadMaxBytes $volumeBytes }}
+            {{- fail (printf "worker.attachments.threadMaxBytes (%d) exceeds agentSandbox.runner.attachments.sizeLimit (%s, %d bytes): one boot of a thread's files would overflow the sandbox's attachments volume. Lower threadMaxBytes or raise sizeLimit (ADR 0205 decision 7)." $threadMaxBytes (toString $runnerAttachments.sizeLimit) $volumeBytes) }}
+            {{- end }}
+            {{- end }}
+            - name: CURIE_ATTACHMENT_THREAD_MAX_FILES
+              value: {{ $threadMaxFiles | quote }}
+            - name: CURIE_ATTACHMENT_THREAD_MAX_BYTES
+              value: {{ $threadMaxBytes | quote }}
             - name: CURIE_PUBLICATION_ENABLED
               value: {{ .Values.worker.publication.enabled | quote }}
             - name: CURIE_PUBLICATION_NAMESPACE
@@ -276,6 +391,8 @@ spec:
               value: {{ .Values.worker.publication.patchMaxBytes | quote }}
             - name: CURIE_PUBLICATION_PROTECTED_PATHS
               value: {{ .Values.worker.publication.protectedPaths | default list | toJson | quote }}
+            - name: CURIE_PUBLICATION_ALLOW_DEPENDENCY_ADDITIONS
+              value: {{ .Values.worker.publication.allowDependencyAdditions | default false | quote }}
             - name: CURIE_PUBLICATION_RESULT_MAX_ATTEMPTS
               value: {{ .Values.worker.publication.resultMaxAttempts | quote }}
             - name: CURIE_PUBLICATION_RECONCILE_MAX_ATTEMPTS
@@ -284,8 +401,12 @@ spec:
               value: {{ .Values.worker.publication.jobActiveDeadlineSeconds | quote }}
             - name: CURIE_PUBLICATION_GIT_COMMAND_TIMEOUT_SECONDS
               value: {{ .Values.worker.publication.gitCommandTimeoutSeconds | quote }}
-            - name: CURIE_PUBLICATION_GITHUB_API_URL
-              value: {{ .Values.api.githubApiUrl | quote }}
+            {{- if include "curie.codeHostTrust.name" . }}
+            # Copied into each publication Job's own ConfigMap (ADR 0197): the
+            # Job runs in the publication namespace, where this ConfigMap is absent.
+            - name: CURIE_CODE_HOST_CA_BUNDLE
+              value: {{ include "curie.codeHostTrust.path" . | quote }}
+            {{- end }}
             - name: CURIE_PUBLICATION_RECONCILE_INTERVAL_SECONDS
               value: {{ .Values.worker.publication.reconcileIntervalSeconds | quote }}
             - name: CURIE_PUBLICATION_LEASE_SECONDS
@@ -318,10 +439,9 @@ spec:
               value: {{ index .Values.worker.publication.resources.requests "ephemeral-storage" | quote }}
             - name: CURIE_PUBLICATION_EPHEMERAL_LIMIT
               value: {{ index .Values.worker.publication.resources.limits "ephemeral-storage" | quote }}
-            # Every Slack identity's bot token, from the one helper api.yaml and
-            # dispatcher.yaml also render (curie.env.slack), so the three cannot
-            # drift apart.
+            # Identity declarations select gateway ports without mounting provider credentials.
             {{- include "curie.env.slack" (dict "root" . "workload" "worker") | trim | nindent 12 }}
+            {{- include "curie.env.channelGateway" (dict "root" . "caller" "worker") | nindent 12 }}
             # The sealing keys (ADR-0094). The connector reconciler runs here,
             # so this is the only workload that needs to DECRYPT a sealed
             # value; nothing else in the release gets them. Both are optional:
@@ -341,6 +461,19 @@ spec:
               valueFrom:
                 secretKeyRef:
                   {{- include "curie.secretRef" (dict "root" . "existingSecret" (get (.Values.connectorCaller | default dict) "existingSecret") "existingSecretKey" ((get (.Values.connectorCaller | default dict) "signingKeyKey") | default "signingKey") "defaultKey" "connectorCallerSigningKey") | nindent 18 }}
+            # The action executor switch (ACTION-EXECUTOR-1). The API renders
+            # the same value from the same helper; the two must never differ.
+            - name: CURIE_ACTION_EXECUTOR_ENABLED
+              value: {{ include "curie.actionExecutorEnabled" . | quote }}
+            # The installation-wide executor sandbox cap (AUTOMATED-REMEDIATION-12,
+            # executor amendment E9): the executor loop runs up to this many at
+            # once. The API renders the same value from the same helper.
+            - name: CURIE_ACTION_EXECUTOR_MAX_CONCURRENT_SANDBOXES
+              value: {{ include "curie.actionExecutorMaxConcurrentSandboxes" . | quote }}
+            # The automated remediation switch (AUTOMATED-REMEDIATION-1). The API
+            # renders the same value from the same helper; the two must never differ.
+            - name: CURIE_REMEDIATION_ENABLED
+              value: {{ include "curie.remediationEnabled" . | quote }}
             # Substrate wiring: which namespace to claim sandboxes in, the warm
             # pool to claim from, and the ACI port on each claimed sandbox.
             - name: CURIE_NAMESPACE
@@ -360,6 +493,16 @@ spec:
                   name: {{ include "curie.secretName" . }}
                   key: installationId
                   optional: false
+{{- if eq (include "curie.actionExecutorConnectorReads" .) "true" }}
+            # The executor's own connector reads (#4800): the worker reads the
+            # acting connector's Deployment by name and the in-force digest
+            # with the reconcile loop off. The app name is part of the render
+            # the in-force digest comes from, as for the reconciler below.
+            - name: CURIE_ACTION_EXECUTOR_CONNECTOR_READS
+              value: "true"
+            - name: CURIE_CONNECTOR_APP_NAME
+              value: {{ include "curie.name" . | quote }}
+{{- end }}
 {{- if .Values.worker.connectorReconciler.enabled }}
             # Connector reconciler (ADR-0090, #1184). It reuses CURIE_NAMESPACE
             # and CURIE_RELEASE above deliberately: the runner dials a connector
@@ -376,6 +519,33 @@ spec:
             - name: CURIE_CONNECTOR_RECONCILE_INTERVAL_S
               value: {{ .Values.worker.connectorReconciler.intervalSeconds | quote }}
 {{- end }}
+{{- $e2e := .Values.e2eConnector }}
+{{- if $e2e.enabled }}
+{{- if not .Values.worker.connectorReconciler.enabled }}
+{{- fail "e2eConnector.enabled requires worker.connectorReconciler.enabled: the end to end namespace reaper reads the test cluster kubeconfig from the connector Secret through the reconciler's Secret list grant" }}
+{{- end }}
+            # End to end namespace reaper (#3245, ADR 0176 decision 4). The same
+            # scope the API hands env_create, so the worker deletes only what
+            # the connector creates. It reads the test cluster kubeconfig from
+            # each agent's connector Secret through the reconciler's Secret
+            # list grant; nothing new is mounted.
+            - name: CURIE_E2E_CONNECTOR_ENABLED
+              value: "true"
+            - name: CURIE_E2E_NAMESPACE_PREFIX
+              value: {{ $e2e.namespacePrefix | quote }}
+            - name: CURIE_E2E_OWNER_LABEL_KEY
+              value: {{ $e2e.ownerLabel.key | quote }}
+            - name: CURIE_E2E_OWNER_LABEL_VALUE
+              value: {{ $e2e.ownerLabel.value | quote }}
+            - name: CURIE_E2E_REAPER_INTERVAL_S
+              value: {{ $e2e.reaperIntervalSeconds | quote }}
+            - name: CURIE_E2E_REGISTRY
+              value: {{ $e2e.registry | default "" | quote }}
+            - name: CURIE_E2E_REGISTRY_INSECURE
+              value: {{ $e2e.registryInsecure | default false | quote }}
+            - name: CURIE_E2E_REGISTRY_TOKEN_HOSTS
+              value: {{ join "," ($e2e.registryTokenHosts | default list) | quote }}
+{{- end }}
             - name: LANGFUSE_HOST
               value: {{ include "curie.langfuse.url" . }}
             - name: LANGFUSE_PUBLIC_KEY
@@ -387,6 +557,10 @@ spec:
                   key: langfuseInitProjectSecretKey
             - name: CURIE_WARM_POOL
               value: {{ $warmPool | quote }}
+            {{- if and .Values.agentSandbox.deploy .Values.resourceQuota.enabled }}
+            - name: CURIE_SANDBOX_ADMISSION
+              value: {{ include "curie.sandboxAdmission" . | quote }}
+            {{- end }}
             # Every agent agent-sandbox.yaml renders a per-agent pool for
             # (connectorSecrets, registryEgress, #3083, and runnerImages,
             # ADR-0173), or none when worker.warmPool is overridden and the
@@ -395,6 +569,10 @@ spec:
             # pool nothing rendered (#2943).
             - name: CURIE_AGENT_SANDBOX_POOLS
               value: {{ ternary (include "curie.agentSandboxPoolAgents" . | fromJsonArray | join ",") "" $perAgentPools | quote }}
+            {{- if $repoRunners }}
+            - name: CURIE_REPO_RUNNER_POOLS
+              value: {{ include "curie.factory.repoRunnerPoolsJson" $repoRunners | quote }}
+            {{- end }}
             # The subset whose pool template carries connector secretKeyRefs; a
             # claim whose bundle declares connector secrets needs one (#2943).
             - name: CURIE_AGENT_CONNECTOR_SECRET_POOLS
@@ -428,6 +606,13 @@ spec:
             # cleanup.
             - name: CURIE_DELIVERY_BUDGET_S
               value: {{ .Values.worker.deliveryBudgetSeconds | quote }}
+            # Optional cron claim lease. Null or omitted leaves it unset, so
+            # the worker uses the delivery budget. The API renders the same
+            # value from worker.hookClaimLeaseSeconds.
+            {{- if .Values.worker.hookClaimLeaseSeconds }}
+            - name: CURIE_HOOK_CLAIM_LEASE_S
+              value: {{ .Values.worker.hookClaimLeaseSeconds | quote }}
+            {{- end }}
             # Per-request runner ceiling within the overall delivery budget.
             - name: CURIE_RUNNER_TOTAL_TIMEOUT_S
               value: {{ .Values.worker.runnerTotalTimeoutSeconds | quote }}
@@ -471,7 +656,7 @@ spec:
             # values omit this key, so an absent or coalesced null value uses
             # the same default as a fresh install.
             - name: CURIE_TURN_RECEIPT
-              value: {{ (.Values.worker.turnReceipt | default "all") | quote }}
+              value: {{ (.Values.worker.turnReceipt | default "off") | quote }}
             # Runner model passthrough: the worker injects these into every claim
             # (fake model needs no credential; a real credential comes from the
             # chart Secret and is only wired when one is configured and the
@@ -501,14 +686,6 @@ spec:
                   {{- /* BYO (issue #1759): the referenced key must already
                          hold the JSON-encoded map. */}}
                   {{- include "curie.secretRef" (dict "root" . "existingSecret" .Values.worker.adapterCredentialsExistingSecret "existingSecretKey" .Values.worker.adapterCredentialsExistingSecretKey "defaultKey" "adapterCredentials") | nindent 18 }}
-            # No-Slack egress routing: when set, the worker's Slack sink posts its
-            # placeholder edits at this base URL (the `curie cluster message` CLI stub)
-            # instead of real Slack. Empty (the default) leaves the sink on real
-            # Slack. Rendered only when non-empty (values-not-templates).
-            {{- if .Values.worker.slackApiBaseUrl }}
-            - name: SLACK_API_BASE_URL
-              value: {{ .Values.worker.slackApiBaseUrl | quote }}
-            {{- end }}
             # Extra trusted Slack origins (ADR-0096 D4.4), a DEV-ONLY widening of
             # where the bot token may be sent. Empty (the default) renders
             # nothing, leaving the configured Slack origin as the only trusted
@@ -537,6 +714,8 @@ spec:
             # agree. ci/worker-object-store-assertions.sh asserts they do.
             - name: S3_ENDPOINT_URL
               value: {{ include "curie.rustfs.endpoint" . }}
+            - name: S3_REGION
+              value: {{ .Values.rustfs.region | quote }}
             {{- if include "curie.rustfs.staticCredentials" . }}
             - name: S3_ACCESS_KEY
               value: {{ .Values.rustfs.auth.accessKey | quote }}
@@ -549,18 +728,24 @@ spec:
             - name: BUNDLE_BUCKET
               value: {{ .Values.agentSandbox.runner.bundleFetch.bucket | quote }}
             {{- include "curie.env.otel" (dict "root" . "extraEnv" .Values.worker.extraEnv) | nindent 12 }}
-            {{- include "curie.extraEnv" (dict "root" . "workload" "worker" "env" .Values.worker.extraEnv "additionalReserved" (include "curie.slack.reservedEnv" (dict "root" . "workload" "worker") | fromJson)) | nindent 12 }}
-          # No HTTP port on the worker, so an exec probe checks a heartbeat file
+            {{- $checksumExtraEnv | nindent 12 }}
+          # Liveness uses an exec heartbeat file; the optional private attachment
+          # broker is a separate control-plane listener, not a liveness endpoint.
+          # The exec probe checks a heartbeat file
           # the asyncio event loop touches each tick. A wedged loop stops
           # touching it -> the file goes stale -> the probe fails -> restart.
           {{- include "curie.heartbeatProbes" . | nindent 10 }}
           resources:
             {{- toYaml .Values.worker.resources | nindent 12 }}
           volumeMounts:
+            {{- include "curie.channelGateway.clientMount" . | nindent 12 }}
             - name: workspace-clone
               mountPath: {{ .Values.worker.workspace.mountPath | quote }}
+            {{- include "curie.codeHostTrust.volumeMount" . | nindent 12 }}
       volumes:
+        {{- include "curie.channelGateway.clientVolume" . | nindent 8 }}
         - name: workspace-clone
           emptyDir:
             sizeLimit: {{ .Values.worker.workspace.cloneVolumeSize | quote }}
+        {{- include "curie.codeHostTrust.volume" . | nindent 8 }}
 {{- end }}

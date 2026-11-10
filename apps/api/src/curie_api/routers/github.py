@@ -2,8 +2,11 @@
 
 Authenticated by the HMAC signature GitHub sends (not the platform API key), so
 it lives outside the X-API-Key dependency. A push to the dev branch deploys, a
-push to the prod branch promotes. Review events and, when enabled, factory
-issue events are separate arms. Every other event is acknowledged and ignored.
+push to the prod branch promotes. A push delivery is claimed once by its
+`X-GitHub-Delivery` id (#3820): a replay of a delivery that already deployed or
+promoted answers `push_duplicate` and does nothing. Review events and, when
+enabled, factory issue events are separate arms. Every other event is
+acknowledged and ignored.
 """
 
 import json
@@ -11,6 +14,8 @@ import logging
 import uuid
 
 from fastapi import APIRouter, Header, HTTPException, Request, status
+
+from curie_api.schemas.deployments import WebhookResult
 
 from ..config import get_settings
 from ..deps import EvalQueueDep, SessionDep, StoreDep
@@ -22,7 +27,12 @@ from ..github_factory_review import (
     handle_factory_review_delivery,
     is_actionable_feedback,
 )
-from ..github_review_audit import claim_review_delivery, settle_review_delivery
+from ..github_review_audit import (
+    claim_push_delivery,
+    claim_review_delivery,
+    settle_push_delivery,
+    settle_review_delivery,
+)
 from ..github_review_events import (
     FeedbackHeld,
     FeedbackIgnored,
@@ -31,12 +41,22 @@ from ..github_review_events import (
 )
 from ..github_review_store import admit_feedback, hold_feedback
 from ..models import GitHubReviewFeedback
-from ..schemas import WebhookResult
 from ..wirebody import read_bounded_body
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/github", tags=["github"])
+
+
+def _delivery_id(header: str) -> uuid.UUID:
+    """Parse a canonical `X-GitHub-Delivery` UUID, or refuse with 400 invalid_delivery."""
+    try:
+        delivery_id = uuid.UUID(header)
+        if str(delivery_id) != header.lower():
+            raise ValueError("noncanonical delivery")
+    except (ValueError, AttributeError):
+        raise HTTPException(400, {"code": "invalid_delivery"}) from None
+    return delivery_id
 
 
 @router.post("/webhook", response_model=WebhookResult)
@@ -63,7 +83,7 @@ async def github_webhook(
         "pull_request_review_comment",
         "pull_request_review",
     }
-    factory_enabled = settings.github_factory_ingress_enabled
+    factory_enabled = settings.factory_enabled
     # Disabled factory intake must keep ignoring issue events before JSON parsing.
     # test_unrelated_event_remains_ignored_without_parsing posts a non-JSON body.
     if x_github_event == "issues" and not factory_enabled:
@@ -95,7 +115,7 @@ async def github_webhook(
         # it disabled, actionable PR feedback reaches the factory's unbound guard.
         review_enabled = settings.github_review_ingress_enabled
         if factory_enabled and (
-            await factory_owns(session, x_github_event, payload)
+            await factory_owns(session, settings, x_github_event, payload)
             or (
                 not review_enabled
                 and is_actionable_feedback(
@@ -117,12 +137,7 @@ async def github_webhook(
             )
         if not review_enabled:
             return WebhookResult(status="feedback_disabled")
-        try:
-            delivery_id = uuid.UUID(x_github_delivery)
-            if str(delivery_id) != x_github_delivery.lower():
-                raise ValueError("noncanonical delivery")
-        except (ValueError, AttributeError):
-            raise HTTPException(400, {"code": "invalid_delivery"}) from None
+        delivery_id = _delivery_id(x_github_delivery)
         audit, conflict = await claim_review_delivery(
             session,
             delivery_id=delivery_id,
@@ -179,7 +194,7 @@ async def github_webhook(
                     traceparent=request.headers.get("traceparent"),
                     settings=settings,
                 )
-            except Exception:
+            except Exception:  # noqa: BLE001 - existing broad catch retained
                 # Without Valkey the hold cannot be durable; degrade to the
                 # pre-#2962 refusal rather than acknowledge a lost review.
                 logger.warning("GitHub review hold unavailable; refusing held feedback")
@@ -233,6 +248,75 @@ async def github_webhook(
         await session.refresh(row)
         return WebhookResult(status=f"feedback_{row.status}")
 
+    delivery_id = _delivery_id(x_github_delivery)
+    # Claim and settle each run as one short transaction on a session of their
+    # own, and no connection or row lock is held across `process_push`. The
+    # committed `pending` receipt is the in-flight marker: an overlapping POST
+    # with the same id answers `unsettled` instead of parking on a row lock
+    # with a pooled connection while this request still needs one.
+    sessionmaker = request.app.state.sessionmaker
+    claim = await claim_push_delivery(
+        sessionmaker,
+        delivery_id=delivery_id,
+        event=x_github_event,
+        body=body,
+        payload=payload,
+    )
+    if claim == "conflict":
+        return WebhookResult(
+            status="ignored",
+            errors=[{"code": "delivery_identity_conflict"}],
+        )
+    if claim == "duplicate":
+        return WebhookResult(status="push_duplicate")
+    if claim == "unsettled":
+        return WebhookResult(status="push_duplicate", errors=[{"code": "delivery_unsettled"}])
+    # If `process_push` raises, the receipt is deliberately left `pending`.
+    # It may have raised after the deployment row committed (an eval enqueue
+    # failure on a dev deploy, say), and nothing here can tell, so every later
+    # delivery under this id answers `delivery_unsettled` and cannot deploy
+    # twice. The cost: GitHub's Redeliver cannot repair a delivery that crashed
+    # mid-flight, because it reuses the id. A new push, or the commit poller,
+    # deploys that commit instead.
     result = await process_push(session, store, settings, eval_queue, payload)
     log_push_outcome(result, payload, source="github webhook")
+    notice_error: Exception | None = None
+    try:
+        await request.app.state.deploy_notice_queue.publish(session, result, payload, settings)
+    except Exception as exc:  # noqa: BLE001 - existing broad catch retained
+        # A Valkey failure is retained in the SQL outbox and returns normally.
+        # A persistence failure still settles the known push outcome before
+        # returning the notice error, so a rejected delivery stays retryable.
+        logger.exception("could not persist git-flow deploy notice")
+        notice_error = exc
+    # Return the request session's connection to the pool before settling.
+    # `process_push` can leave a transaction open (the refresh after a
+    # deployment commits, or the reads of an ignored or rejected push), and the
+    # settle needs a connection of its own; under a full pool each request
+    # would otherwise hold one while waiting for another. Nothing below reads
+    # the request session, and `result` is a plain response model.
+    await session.close()
+    # Only a delivery that deployed or promoted is spent. An ignored or
+    # rejected one stays retryable under the same id: the #2436 repair is
+    # "bind the missing route, redeliver the same sha", and GitHub's
+    # Redeliver button reuses the original X-GitHub-Delivery id.
+    disposition = "ignored"
+    reason: str | None = "push_ignored"
+    if result.status in {"deployed", "promoted"}:
+        disposition, reason = "accepted", None
+    elif result.status == "rejected":
+        code = (result.errors or [{}])[0].get("code")
+        reason = code if isinstance(code, str) and code else "push_rejected"
+        disposition = "rejected"
+    await settle_push_delivery(
+        sessionmaker, delivery_id=delivery_id, status=disposition, reason=reason
+    )
+    if notice_error is not None:
+        raise HTTPException(
+            503,
+            {
+                "code": "git.notice_outbox_unavailable",
+                "result": result.model_dump(mode="json"),
+            },
+        ) from notice_error
     return result

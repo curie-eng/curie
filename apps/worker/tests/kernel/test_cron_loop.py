@@ -17,7 +17,7 @@ import asyncio
 import contextlib
 import logging
 import uuid
-from collections.abc import AsyncIterator, Awaitable, Callable
+from collections.abc import AsyncIterator, Awaitable, Callable, Iterator
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Any
@@ -25,9 +25,17 @@ from typing import Any
 import pytest
 import redis
 from aci_protocol import QueuedTurn, TurnSource
+from curie_protected_hooks.source_policy_sql import SourceGate
 from curie_telemetry import record_metric
+from curie_telemetry import tracing as telemetry_tracing
 from curie_worker import cron_loop as cron_loop_module
 from curie_worker.cron_loop import CronSchedulerLoop, _Target
+from curie_worker.hook_source_guard import CronHookSourceGuard
+from opentelemetry import trace
+from opentelemetry.sdk.trace import TracerProvider
+from opentelemetry.sdk.trace.export import SimpleSpanProcessor
+from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
+from opentelemetry.trace import SpanKind
 from redis.asyncio import Redis as AsyncRedis
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
@@ -42,6 +50,20 @@ LEASE_S = 300.0
 IDENTITY = "second-bot"
 
 
+@pytest.fixture
+def cron_spans(
+    monkeypatch: pytest.MonkeyPatch,
+) -> Iterator[tuple[TracerProvider, InMemorySpanExporter]]:
+    exporter = InMemorySpanExporter()
+    provider = TracerProvider()
+    provider.add_span_processor(SimpleSpanProcessor(exporter))
+    monkeypatch.setattr(telemetry_tracing, "_tracer", provider.get_tracer("curie-telemetry"))
+    try:
+        yield provider, exporter
+    finally:
+        provider.shutdown()
+
+
 def _slot() -> datetime:
     """A slot one minute behind the real clock, so a loop comparing against
     either the passed ``now`` or the database clock sees the same picture."""
@@ -54,6 +76,9 @@ def _schedule(slot: datetime) -> str:
 
 @dataclass
 class _Seed:
+    """@spec PROTECTED-HOOK-SOURCE-2."""
+
+    source_gate: SourceGate
     engine: AsyncEngine
     agent_id: uuid.UUID
     version_id: uuid.UUID
@@ -68,7 +93,8 @@ class _Seed:
                 (
                     await conn.execute(
                         text(
-                            "SELECT id, outcome, slot_utc, ended_at, started_at, lease_expires_at "
+                            "SELECT id, outcome, slot_utc, ended_at, started_at, "
+                            "lease_expires_at, source "
                             "FROM curie.hook_runs "
                             "WHERE agent_id = :a AND name = :n ORDER BY slot_utc"
                         ),
@@ -136,8 +162,9 @@ class _Seed:
 
 @contextlib.asynccontextmanager
 async def _seed(*, max_usd_per_day: float | None = None) -> AsyncIterator[_Seed]:
-    """One agent with one version, one active prod deployment and one binding."""
+    """@spec PROTECTED-HOOK-SOURCE-2."""
     engine = create_async_engine(_DB_URL)
+    gate_engine = create_async_engine(_DB_URL, pool_size=4, max_overflow=0, pool_timeout=30)
     token = uuid.uuid4().hex
     agent_id, version_id, deployment_id, channel_id = (uuid.uuid4() for _ in range(4))
     address = f"C{token[:10].upper()}"
@@ -186,6 +213,7 @@ async def _seed(*, max_usd_per_day: float | None = None) -> AsyncIterator[_Seed]
                 },
             )
         yield _Seed(
+            SourceGate(gate_engine),
             engine,
             agent_id,
             version_id,
@@ -209,6 +237,7 @@ async def _seed(*, max_usd_per_day: float | None = None) -> AsyncIterator[_Seed]
                 text("DELETE FROM curie.agent_versions WHERE id = :id"), {"id": version_id}
             )
             await conn.execute(text("DELETE FROM curie.agents WHERE id = :id"), {"id": agent_id})
+        await gate_engine.dispose()
         await engine.dispose()
 
 
@@ -255,10 +284,13 @@ def _loop(
     stream: str,
     slot: datetime,
     *,
+    source_gate: SourceGate,
     is_killed: Callable[[uuid.UUID], Awaitable[bool]] | None = None,
     started_at: datetime | None = None,
 ) -> CronSchedulerLoop:
+    """@spec PROTECTED-HOOK-SOURCE-2."""
     return CronSchedulerLoop(
+        source_guard=CronHookSourceGuard(source_gate, engine),
         engine=engine,
         redis=client,
         source=source,
@@ -283,9 +315,7 @@ def _entries(sync_redis: redis.Redis, stream: str) -> list[QueuedTurn]:
 def _capture_fire_metrics(monkeypatch: pytest.MonkeyPatch) -> list[dict[str, str]]:
     recorded: list[dict[str, str]] = []
 
-    def capture(
-        name: str, value: float = 1, *, attributes: dict[str, str] | None = None
-    ) -> None:
+    def capture(name: str, value: float = 1, *, attributes: dict[str, str] | None = None) -> None:
         record_metric(name, value, attributes=attributes)
         if name == "curie.schedule.fire":
             assert value == 1
@@ -306,9 +336,18 @@ async def _pass_once(
     trigger: dict[str, Any],
     **kwargs: Any,
 ) -> None:
+    """@spec PROTECTED-HOOK-SOURCE-2."""
     client = _async_redis()
     try:
-        loop = _loop(seed.engine, client, _Triggers(seed, trigger), stream, seed.slot, **kwargs)
+        loop = _loop(
+            seed.engine,
+            client,
+            _Triggers(seed, trigger),
+            stream,
+            seed.slot,
+            **kwargs,
+            source_gate=seed.source_gate,
+        )
         await loop.one_pass(now=seed.slot + timedelta(seconds=30))
     finally:
         await client.aclose()
@@ -321,6 +360,7 @@ async def _pass_triggers(
     *,
     started_at: datetime | None = None,
 ) -> None:
+    """@spec PROTECTED-HOOK-SOURCE-2."""
     client = _async_redis()
     try:
         loop = _loop(
@@ -330,10 +370,72 @@ async def _pass_triggers(
             stream,
             seed.slot,
             started_at=started_at,
+            source_gate=seed.source_gate,
         )
         await loop.one_pass(now=seed.slot + timedelta(seconds=30))
     finally:
         await client.aclose()
+
+
+@pytest.mark.parametrize("deferred", [False, True], ids=["fresh", "deferred"])
+def test_cron_enqueue_carrier_names_the_recorded_producer_span(
+    sync_redis: redis.Redis,
+    names: dict[str, str],
+    cron_spans: tuple[TracerProvider, InMemorySpanExporter],
+    deferred: bool,
+) -> None:
+    provider, exporter = cron_spans
+
+    async def body() -> None:
+        async with _seed() as seed:
+            with provider.get_tracer("test-scheduler").start_as_current_span("test.scheduler"):
+                if deferred:
+                    await seed.add_run(seed.slot, seed.slot, outcome="deferred")
+                    await _later_pass(
+                        seed, names["stream"], _trigger(seed), seed.slot + timedelta(minutes=5)
+                    )
+                else:
+                    await _pass_once(seed, names["stream"], _trigger(seed))
+                    await _pass_once(seed, names["stream"], _trigger(seed))
+            rows = sync_redis.xrange(names["stream"])
+            assert len(rows) == 1
+            fields = rows[0][1]
+            turn = QueuedTurn.model_validate_json(fields["payload"])
+            assert turn.source is TurnSource.CRON
+            assert turn.text == PROMPT
+            assert "traceparent" not in turn.model_dump()
+            carrier = fields["traceparent"].split("-")
+            spans = exporter.get_finished_spans()
+            scheduler = next(span for span in spans if span.name == "test.scheduler")
+            enqueue = [span for span in spans if span.name == "curie.queue.enqueue"]
+            assert len(enqueue) == 1
+            assert enqueue[0].kind is SpanKind.PRODUCER
+            assert enqueue[0].attributes["curie.source"] == "worker"
+            assert enqueue[0].parent.span_id == scheduler.context.span_id
+            assert enqueue[0].context.trace_id == scheduler.context.trace_id == int(carrier[1], 16)
+            assert enqueue[0].context.span_id == int(carrier[2], 16)
+
+    asyncio.run(body())
+
+
+def test_cron_enqueue_without_a_tracer_has_only_the_frozen_payload(
+    sync_redis: redis.Redis,
+    names: dict[str, str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(telemetry_tracing, "_tracer", trace.NoOpTracerProvider().get_tracer("test"))
+
+    async def body() -> None:
+        async with _seed() as seed:
+            await _pass_once(seed, names["stream"], _trigger(seed))
+            entries = sync_redis.xrange(names["stream"])
+            assert len(entries) == 1
+            assert set(entries[0][1]) == {"payload"}
+            turn = QueuedTurn.model_validate_json(entries[0][1]["payload"])
+            assert turn.text == PROMPT
+            assert turn.source is TurnSource.CRON
+
+    asyncio.run(body())
 
 
 def test_two_loops_sharing_one_db_and_stream_fire_a_slot_exactly_once(
@@ -346,8 +448,22 @@ def test_two_loops_sharing_one_db_and_stream_fire_a_slot_exactly_once(
             client_a, client_b = _async_redis(), _async_redis()
             try:
                 stream = names["stream"]
-                a = _loop(seed.engine, client_a, _Triggers(seed, trigger), stream, seed.slot)
-                b = _loop(engine_b, client_b, _Triggers(seed, trigger), stream, seed.slot)
+                a = _loop(
+                    seed.engine,
+                    client_a,
+                    _Triggers(seed, trigger),
+                    stream,
+                    seed.slot,
+                    source_gate=seed.source_gate,
+                )
+                b = _loop(
+                    engine_b,
+                    client_b,
+                    _Triggers(seed, trigger),
+                    stream,
+                    seed.slot,
+                    source_gate=seed.source_gate,
+                )
                 now = seed.slot + timedelta(seconds=30)
                 await asyncio.gather(a.one_pass(now=now), b.one_pass(now=now))
             finally:
@@ -380,7 +496,12 @@ def test_a_pass_that_loses_the_slot_race_logs_the_loss_at_info(
             client = _async_redis()
             try:
                 loser = _loop(
-                    seed.engine, client, _Triggers(seed, trigger), names["stream"], seed.slot
+                    seed.engine,
+                    client,
+                    _Triggers(seed, trigger),
+                    names["stream"],
+                    seed.slot,
+                    source_gate=seed.source_gate,
                 )
                 with caplog.at_level(logging.DEBUG, logger="curie_worker.cron_loop"):
                     caplog.clear()
@@ -418,6 +539,7 @@ def test_killed_agent_records_blocked_and_enqueues_nothing(
     sync_redis: redis.Redis, names: dict[str, str], monkeypatch: pytest.MonkeyPatch
 ) -> None:
     fires = _capture_fire_metrics(monkeypatch)
+
     async def killed(_agent_id: uuid.UUID) -> bool:
         return True
 
@@ -485,7 +607,12 @@ def test_claim_past_its_lease_is_reclaimed_and_the_new_slot_admitted(
             client = _async_redis()
             try:
                 loop = _loop(
-                    seed.engine, client, _Triggers(seed, _trigger(seed)), names["stream"], seed.slot
+                    seed.engine,
+                    client,
+                    _Triggers(seed, _trigger(seed)),
+                    names["stream"],
+                    seed.slot,
+                    source_gate=seed.source_gate,
                 )
                 summary = await loop.one_pass(now=seed.slot + timedelta(seconds=30))
             finally:
@@ -674,6 +801,7 @@ def test_target_not_bound_to_the_agent_records_failed(
     sync_redis: redis.Redis, names: dict[str, str], monkeypatch: pytest.MonkeyPatch
 ) -> None:
     fires = _capture_fire_metrics(monkeypatch)
+
     async def body() -> None:
         async with _seed() as seed:
             unbound = f"C{uuid.uuid4().hex[:10].upper()}"
@@ -713,6 +841,7 @@ def test_a_replica_that_loses_a_terminal_slot_counts_it_lost(
                     names["stream"],
                     seed.slot,
                     **kwargs,
+                    source_gate=seed.source_gate,
                 )
                 loser = _loop(
                     seed.engine,
@@ -721,6 +850,7 @@ def test_a_replica_that_loses_a_terminal_slot_counts_it_lost(
                     names["stream"],
                     seed.slot,
                     **kwargs,
+                    source_gate=seed.source_gate,
                 )
                 first = await winner.one_pass(now=now)
                 second = await loser.one_pass(now=now)
@@ -796,9 +926,7 @@ def test_a_target_bound_under_several_identities_none_default_records_failed(
     asyncio.run(body())
 
 
-async def _extra_binding(
-    seed: Any, kind: str, adapter: str | None
-) -> uuid.UUID:
+async def _extra_binding(seed: Any, kind: str, adapter: str | None) -> uuid.UUID:
     extra = uuid.uuid4()
     async with seed.engine.begin() as conn:
         await conn.execute(
@@ -889,8 +1017,22 @@ def test_loops_resolving_adjacent_slots_of_one_hook_admit_exactly_once(
             client_a, client_b = _async_redis(), _async_redis()
             try:
                 stream = names["stream"]
-                a = _loop(seed.engine, client_a, _Triggers(seed, trigger), stream, earlier)
-                b = _loop(engine_b, client_b, _Triggers(seed, trigger), stream, seed.slot)
+                a = _loop(
+                    seed.engine,
+                    client_a,
+                    _Triggers(seed, trigger),
+                    stream,
+                    earlier,
+                    source_gate=seed.source_gate,
+                )
+                b = _loop(
+                    engine_b,
+                    client_b,
+                    _Triggers(seed, trigger),
+                    stream,
+                    seed.slot,
+                    source_gate=seed.source_gate,
+                )
                 await asyncio.gather(
                     a.one_pass(now=earlier + timedelta(seconds=30)),
                     b.one_pass(now=seed.slot + timedelta(seconds=30)),
@@ -925,6 +1067,7 @@ def test_a_raising_hook_does_not_stop_the_agents_later_hooks(
                     _Triggers(seed, bad, _trigger(seed)),
                     names["stream"],
                     seed.slot,
+                    source_gate=seed.source_gate,
                 )
                 summary = await loop.one_pass(now=seed.slot + timedelta(seconds=30))
             finally:
@@ -965,7 +1108,14 @@ def test_bundle_attached_later_is_read_on_the_next_pass(
 
             client = _async_redis()
             try:
-                loop = _loop(seed.engine, client, _CountingSource(), names["stream"], seed.slot)
+                loop = _loop(
+                    seed.engine,
+                    client,
+                    _CountingSource(),
+                    names["stream"],
+                    seed.slot,
+                    source_gate=seed.source_gate,
+                )
                 assert await loop._cron_triggers(_target(None)) == []
                 assert calls == []
 
@@ -1103,7 +1253,10 @@ def test_a_deployment_after_the_watermark_fires_no_slot_from_before_it(
 
 async def _later_pass(seed: _Seed, stream: str, trigger: dict[str, Any], now: datetime) -> None:
     """A pass whose window starts after the deferred slot, so only the retry
-    path, never first admission, can put that slot back on the stream."""
+    path, never first admission, can put that slot back on the stream.
+
+    @spec PROTECTED-HOOK-SOURCE-2.
+    """
     client = _async_redis()
     try:
         loop = _loop(
@@ -1113,6 +1266,7 @@ async def _later_pass(seed: _Seed, stream: str, trigger: dict[str, Any], now: da
             stream,
             seed.slot,
             started_at=now - timedelta(seconds=30),
+            source_gate=seed.source_gate,
         )
         await loop.one_pass(now=now)
     finally:
@@ -1211,9 +1365,7 @@ def test_paused_trigger_does_not_fire_while_another_hook_keeps_running(
 
             assert await seed.runs(HOOK) == []
             other_rows = await seed.runs("independent")
-            assert [(row.slot_utc, row.outcome) for row in other_rows] == [
-                (seed.slot, None)
-            ]
+            assert [(row.slot_utc, row.outcome) for row in other_rows] == [(seed.slot, None)]
             entries = _entries(sync_redis, names["stream"])
             assert len(entries) == 1
             assert entries[0].hook_run is not None
@@ -1243,9 +1395,7 @@ def test_resumed_hook_catches_up_one_slot_after_a_worker_restart(
                 started_at=seed.slot - timedelta(seconds=10),
             )
 
-            assert [
-                (row.slot_utc, row.outcome) for row in await seed.runs(HOOK)
-            ] == [
+            assert [(row.slot_utc, row.outcome) for row in await seed.runs(HOOK)] == [
                 (seed.slot - timedelta(hours=3), "skipped"),
                 (seed.slot - timedelta(hours=2), "skipped"),
                 (seed.slot - timedelta(hours=1), "skipped"),
@@ -1279,12 +1429,19 @@ def test_old_pass_cannot_clear_a_newer_resume_gap() -> None:
                 await conn.execute(
                     text(
                         "UPDATE curie.schedule_controls "
-                            "SET generation = generation + 2 "
-                            "WHERE agent_id = :agent_id AND name = :name"
+                        "SET generation = generation + 2 "
+                        "WHERE agent_id = :agent_id AND name = :name"
                     ),
                     {"agent_id": seed.agent_id, "name": HOOK},
                 )
-            loop = _loop(seed.engine, _async_redis(), _Triggers(seed), "unused", seed.slot)
+            loop = _loop(
+                seed.engine,
+                _async_redis(),
+                _Triggers(seed),
+                "unused",
+                seed.slot,
+                source_gate=seed.source_gate,
+            )
             try:
                 async with seed.engine.begin() as conn:
                     result = await conn.execute(
@@ -1315,7 +1472,12 @@ def test_pause_during_first_admission_keeps_slot_for_resume(
             try:
                 trigger = _trigger(seed)
                 loop = _loop(
-                    seed.engine, client, _Triggers(seed, trigger), names["stream"], seed.slot
+                    seed.engine,
+                    client,
+                    _Triggers(seed, trigger),
+                    names["stream"],
+                    seed.slot,
+                    source_gate=seed.source_gate,
                 )
                 original = loop._admit
 
@@ -1349,17 +1511,13 @@ def test_paused_queued_slot_retries_once_after_resume(
                 HOOK, paused_at=seed.slot + timedelta(seconds=1), resume_from=None
             )
             trigger = _trigger(seed)
-            await _later_pass(
-                seed, names["stream"], trigger, seed.slot + timedelta(seconds=20)
-            )
+            await _later_pass(seed, names["stream"], trigger, seed.slot + timedelta(seconds=20))
             assert (await seed.runs())[0].outcome == "deferred"
 
             await seed.set_control(
                 HOOK, paused_at=None, resume_from=seed.slot + timedelta(seconds=1)
             )
-            await _later_pass(
-                seed, names["stream"], trigger, seed.slot + timedelta(seconds=30)
-            )
+            await _later_pass(seed, names["stream"], trigger, seed.slot + timedelta(seconds=30))
             assert (await seed.runs())[0].outcome is None
             entries = _entries(sync_redis, names["stream"])
             assert len(entries) == 1
@@ -1383,9 +1541,7 @@ def test_resume_slot_waits_for_a_pre_pause_fire_to_finish(
                 HOOK, paused_at=None, resume_from=seed.slot - timedelta(minutes=30)
             )
             trigger = _trigger(seed, schedule=f"{seed.slot.minute} * * * *")
-            await _later_pass(
-                seed, names["stream"], trigger, seed.slot + timedelta(seconds=30)
-            )
+            await _later_pass(seed, names["stream"], trigger, seed.slot + timedelta(seconds=30))
             assert [(row.slot_utc, row.outcome) for row in await seed.runs()] == [
                 (earlier, None),
                 (seed.slot, "deferred"),
@@ -1396,11 +1552,141 @@ def test_resume_slot_waits_for_a_pre_pause_fire_to_finish(
                     text("UPDATE curie.hook_runs SET outcome = 'ran' WHERE id = :id"),
                     {"id": earlier_id},
                 )
-            await _later_pass(
-                seed, names["stream"], trigger, seed.slot + timedelta(seconds=40)
-            )
+            await _later_pass(seed, names["stream"], trigger, seed.slot + timedelta(seconds=40))
             assert (await seed.runs())[-1].outcome is None
             assert len(_entries(sync_redis, names["stream"])) == 1
             assert fires == [_fire_labels("deferred")]
+
+    asyncio.run(body())
+
+
+async def _hook_run_reason(seed: Any, slot: datetime) -> tuple[str | None, str | None]:
+    async with seed.engine.connect() as conn:
+        row = (
+            await conn.execute(
+                text(
+                    "SELECT outcome, reason FROM curie.hook_runs "
+                    "WHERE agent_id = :agent AND slot_utc = :slot"
+                ),
+                {"agent": seed.agent_id, "slot": slot},
+            )
+        ).one()
+    return row.outcome, row.reason
+
+
+def test_hook_run_reason_agent_killed(sync_redis: redis.Redis, names: dict[str, str]) -> None:
+    async def killed(_agent_id: uuid.UUID) -> bool:
+        return True
+
+    async def body() -> None:
+        async with _seed() as seed:
+            await _pass_once(seed, names["stream"], _trigger(seed), is_killed=killed)
+            assert await _hook_run_reason(seed, seed.slot) == ("blocked", "agent_killed")
+
+    asyncio.run(body())
+
+
+def test_hook_run_reason_budget_exhausted(sync_redis: redis.Redis, names: dict[str, str]) -> None:
+    async def body() -> None:
+        async with _seed(max_usd_per_day=0) as seed:
+            await _pass_once(seed, names["stream"], _trigger(seed))
+            assert await _hook_run_reason(seed, seed.slot) == ("blocked", "budget_exhausted")
+
+    asyncio.run(body())
+
+
+def test_hook_run_reason_target_unbound(sync_redis: redis.Redis, names: dict[str, str]) -> None:
+    async def body() -> None:
+        async with _seed() as seed:
+            unbound = "C0EXAMPLE9"
+            await _pass_once(seed, names["stream"], _trigger(seed, target=unbound))
+            assert await _hook_run_reason(seed, seed.slot) == ("failed", "target_unbound")
+
+    asyncio.run(body())
+
+
+def test_hook_run_reason_run_in_flight(sync_redis: redis.Redis, names: dict[str, str]) -> None:
+    async def body() -> None:
+        async with _seed() as seed:
+            now = seed.slot + timedelta(seconds=30)
+            previous = seed.slot - timedelta(days=1)
+            await seed.add_run(previous, now - timedelta(seconds=10))
+            await _pass_once(seed, names["stream"], _trigger(seed))
+            assert await _hook_run_reason(seed, seed.slot) == ("skipped", "run_in_flight")
+
+    asyncio.run(body())
+
+
+def test_hook_run_reason_catch_up_expired(sync_redis: redis.Redis, names: dict[str, str]) -> None:
+    async def body() -> None:
+        async with _seed() as seed:
+            last = seed.slot - timedelta(hours=3)
+            await seed.add_run(last, last)
+            async with seed.engine.begin() as conn:
+                await conn.execute(
+                    text(
+                        "UPDATE curie.hook_runs SET outcome = 'ran', ended_at = now() "
+                        "WHERE agent_id = :a"
+                    ),
+                    {"a": seed.agent_id},
+                )
+            trigger = _trigger(seed, schedule=f"{seed.slot.minute} * * * *")
+            await _pass_once(seed, names["stream"], trigger)
+            skipped = seed.slot - timedelta(hours=1)
+            assert await _hook_run_reason(seed, skipped) == ("skipped", "catch_up_expired")
+
+    asyncio.run(body())
+
+
+def test_hook_run_reason_deferred_expired(sync_redis: redis.Redis, names: dict[str, str]) -> None:
+    async def body() -> None:
+        async with _seed() as seed:
+            now = seed.slot + timedelta(hours=25)
+            dow = (seed.slot.weekday() + 1) % 7
+            trigger = _trigger(seed, schedule=f"{seed.slot.minute} {seed.slot.hour} * * {dow}")
+            await seed.add_run(seed.slot, seed.slot, outcome="deferred")
+            await _later_pass(seed, names["stream"], trigger, now)
+            assert await _hook_run_reason(seed, seed.slot) == ("skipped", "deferred_expired")
+
+    asyncio.run(body())
+
+
+def test_hook_run_source_regular_and_blocked_rows_are_schedule(
+    sync_redis: redis.Redis, names: dict[str, str]
+) -> None:
+    async def killed(_agent_id: uuid.UUID) -> bool:
+        return True
+
+    async def body() -> None:
+        async with _seed() as seed:
+            await _pass_once(seed, names["stream"], _trigger(seed))
+            rows = await seed.runs()
+            assert len(rows) == 1
+            assert rows[0].outcome is None
+            assert rows[0].source == "schedule"
+        async with _seed() as seed:
+            await _pass_once(seed, names["stream"], _trigger(seed), is_killed=killed)
+            rows = await seed.runs()
+            assert len(rows) == 1
+            assert rows[0].outcome == "blocked"
+            assert rows[0].source == "schedule"
+
+    asyncio.run(body())
+
+
+def test_hook_run_source_expired_catch_up_rows_are_schedule(
+    sync_redis: redis.Redis, names: dict[str, str]
+) -> None:
+    async def body() -> None:
+        async with _seed() as seed:
+            last = seed.slot - timedelta(hours=3)
+            await seed.add_run(last, last, outcome="ran")
+            await _pass_once(
+                seed, names["stream"], _trigger(seed, schedule=f"{seed.slot.minute} * * * *")
+            )
+            rows = await seed.runs()
+            skipped = [row for row in rows if row.outcome == "skipped"]
+            assert skipped
+            assert all(row.source == "schedule" for row in rows)
 
     asyncio.run(body())

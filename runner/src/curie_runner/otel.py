@@ -103,6 +103,8 @@ SPAN_ATTRIBUTE_VALUE_TYPES: Mapping[SpanAttributeKey, str] = {
     SpanAttributeKey.PHASE_END_KIND: "str",
     SpanAttributeKey.TERMINAL_CAUSE: "str",
     SpanAttributeKey.TERMINAL_STATUS: "str",
+    SpanAttributeKey.TERMINAL_CLASSIFICATION: "str",
+    SpanAttributeKey.BUDGET_OUTPUT_CEILING: "int",
     SpanAttributeKey.GENERATION_TTFT_MS: "int",
     SpanAttributeKey.GENERATION_ROUND: "int",
     SpanAttributeKey.TOOL_CALL_INDEX: "int",
@@ -309,7 +311,7 @@ def _bounded_provider_call(provider: TracerProvider, method: str, timeout_millis
                 function(timeout_millis=timeout_millis) if method == "force_flush" else function()
             )
             succeeded = result is not False
-        except BaseException:
+        except BaseException:  # noqa: BLE001 - existing broad catch retained
             succeeded = False
         finally:
             complete.set()
@@ -351,6 +353,7 @@ class RunTracer:
             if provider is not None
             else trace.get_tracer("curie-runner")
         )
+        self._live_generation: _GenerationSpan | None = None
 
     @contextmanager
     def run_span(
@@ -404,17 +407,48 @@ class RunTracer:
                 if approval_decision:
                     _set(root, SpanAttributeKey.APPROVAL_DECISION, approval_decision)
                 span = _GenerationSpan(self._tracer, root, model)
+                self._live_generation = span
                 try:
-                    yield span
-                except BaseException:
-                    span.set_abandoned()
-                    raise
-                else:
-                    span.finish_if_needed()
+                    try:
+                        yield span
+                    except BaseException:
+                        span.set_abandoned()
+                        raise
+                    else:
+                        span.finish_if_needed()
+                finally:
+                    span.stamp_terminal_classification()
+                    self._live_generation = None
             except BaseException:
                 if span is None:
                     root.set_status(StatusCode.ERROR)
                 raise
+
+    def remember_turn_prompt(self, text: str, framed: str) -> None:
+        """Redact a prompt that joined the live turn, such as a steer.
+
+        No-op when no turn span is open. The user text is the recorded size.
+        An echo of the framed query is redacted without a second input record.
+        """
+
+        gen = self._live_generation
+        if gen is None:
+            return
+        gen.observe_prompt(text)
+        if framed != text:
+            gen.remember_echo(framed)
+
+    def observe_error_classification(self, classification: str, *, output_ceiling: int) -> None:
+        """Remember the live turn's latest mapped ErrorEvent classification (#4940).
+
+        No-op when no turn span is open. The caller maps the raw value into the
+        closed platform set first; the message text never reaches this method.
+        """
+
+        gen = self._live_generation
+        if gen is None:
+            return
+        gen.observe_error_classification(classification, output_ceiling=output_ceiling)
 
     def force_flush(self, *, timeout_millis: int = _EXPORT_TIMEOUT_MILLIS) -> bool:
         """Flush current spans within a hard wall clock bound."""
@@ -458,6 +492,9 @@ class _GenerationSpan:
         self._result_observed = False
         self._result_abort_cause: str | None = None
         self._terminal = False
+        self._terminal_cause: str | None = None
+        self._failure_classification: str | None = None
+        self._output_ceiling: int | None = None
         self._has_activity = False
         self._generation_input: list[str] = []
         self._generation_output: list[str] = []
@@ -534,6 +571,16 @@ class _GenerationSpan:
             self._prompts.append(text)
         self.observe_input(_prompt_placeholder(text))
 
+    def remember_echo(self, text: str) -> None:
+        """Redact an exact echo of ``text`` without recording it as input.
+
+        The generation input stays the user text. The framed query is longer,
+        and a model that repeats that whole query must not export it either.
+        """
+
+        if text and text not in self._prompts:
+            self._prompts.append(text)
+
     def observe_output(self, text: str) -> None:
         """Buffer assistant text or a ``[tool_use NAME]`` marker as output."""
 
@@ -578,6 +625,32 @@ class _GenerationSpan:
         """Close unfinished phases after an exception or generator abandonment."""
 
         self._finish("abandoned", "abandoned", failed=True)
+
+    def observe_error_classification(self, classification: str, *, output_ceiling: int) -> None:
+        """Keep the latest classification; the last ErrorEvent wins, as in the worker."""
+
+        self._failure_classification = classification
+        self._output_ceiling = output_ceiling
+
+    def stamp_terminal_classification(self) -> None:
+        """Stamp the observed classification on a classified-failure root (#4940).
+
+        Runs as the root closes rather than in ``_finish`` because several paths
+        settle the terminal cause before they yield the ErrorEvent that carries
+        the classification. The value is already mapped into the closed set.
+        """
+
+        classification = self._failure_classification
+        if self._terminal_cause != "classified_failure" or not classification:
+            return
+        _set(self._root, SpanAttributeKey.TERMINAL_CLASSIFICATION, classification)
+        ceiling = self._output_ceiling
+        if (
+            classification == "budget-exceeded"
+            and type(ceiling) is int
+            and 1 <= ceiling <= 1_000_000
+        ):
+            _set(self._root, SpanAttributeKey.BUDGET_OUTPUT_CEILING, ceiling)
 
     def finish_if_needed(self) -> None:
         """Complete direct instrumentation while leaving an empty root lazy."""
@@ -886,6 +959,7 @@ class _GenerationSpan:
                 outcome="cancelled",
                 failed=failed,
             )
+        self._terminal_cause = cause
         _set(self._root, SpanAttributeKey.TERMINAL_CAUSE, cause)
         _set(self._root, SpanAttributeKey.TERMINAL_STATUS, status)
         self._root.set_status(StatusCode.ERROR if failed else StatusCode.OK)

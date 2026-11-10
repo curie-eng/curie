@@ -13,6 +13,10 @@ from pydantic.json_schema import models_json_schema
 from .connector_lock import ConnectorLockEntry, ConnectorLockFile, RunnerLockEntry
 from .connectors import (
     ConnectorBuild,
+    ConnectorResourceQuantities,
+    ConnectorResources,
+    ConnectorRoute,
+    ConnectorScratch,
     ConnectorsFile,
     ConnectorSpec,
     RunnerSpec,
@@ -51,6 +55,10 @@ _MODELS = (
     ConnectorsFile,
     ConnectorSpec,
     ConnectorBuild,
+    ConnectorResources,
+    ConnectorResourceQuantities,
+    ConnectorScratch,
+    ConnectorRoute,
     SecretRef,
     RunnerSpec,
     ConnectorLockFile,

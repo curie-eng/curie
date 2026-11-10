@@ -43,8 +43,10 @@ from claude_agent_sdk import (
     ToolUseBlock,
     UserMessage,
 )
+from claude_agent_sdk import __version__ as _SDK_VERSION
 from claude_agent_sdk._cli_version import __cli_version__
 from claude_agent_sdk._internal.session_store import project_key_for_directory
+from claude_agent_sdk._internal.transport.subprocess_cli import _DEFAULT_MAX_BUFFER_SIZE
 from claude_agent_sdk.types import (
     CanUseTool,
     McpSdkServerConfig,
@@ -52,7 +54,9 @@ from claude_agent_sdk.types import (
     SessionKey,
     SessionStore,
     SessionStoreEntry,
+    SettingSource,
 )
+from plugin_format.approval_policy import connector_tool_prefix
 
 from .history import (
     ConversationMessage,
@@ -60,8 +64,21 @@ from .history import (
     HistoryError,
     reduce_unprovable_overlap_turns,
     validate_assistant_groups,
+    validate_group_provenance,
 )
+from .mcp_argv import CredentialSafeCLITransport
 from .mcp_argv import install as install_mcp_argv_offload
+from .personal_auth import (
+    AuthMode,
+    PersonalConfigDirs,
+    effective_auth_mode,
+    inspect_managed_policy,
+    inspect_workspace_settings,
+    personal_cli_env,
+    require_claude_reviewer_model,
+    require_owner_grant,
+)
+from .startup_diagnostics import StderrTail, sdk_initialize_diagnostics
 
 install_mcp_argv_offload()
 
@@ -121,8 +138,10 @@ def _recover_assistant_groups(
         ):
             return messages, False
         group = _assistant_group(payload.get("id")) if message.role == "assistant" else None
-        if message.role == "assistant" and group is None and (
-            message.assistant_group is not None or payload.get("id") is not None
+        if (
+            message.role == "assistant"
+            and group is None
+            and (message.assistant_group is not None or payload.get("id") is not None)
         ):
             # Exact content is insufficient when the native envelope cannot
             # represent the portable grouping. Rebuild its IDs from portable.
@@ -141,13 +160,21 @@ def _recover_assistant_groups(
     recovered = tuple(
         replace(
             message,
-            assistant_group=message.assistant_group or (
-                native_to_portable.get(group, group) if group is not None else None
-            ),
+            assistant_group=message.assistant_group
+            or (native_to_portable.get(group, group) if group is not None else None),
         )
         for message, group in pairs
     )
+    try:
+        validate_group_provenance(recovered)
+    except HistoryError:
+        # A native ID shared across a genuine user boundary, such as the first
+        # call after a declined approval, would join the earlier group. That
+        # correspondence proves nothing, so neither its groups nor the
+        # checkpoint are used.
+        return messages, False
     return recovered, native_eligible
+
 
 # The CLI's built-in instructions tell the model to end commits with a
 # "Co-Authored-By: Claude" trailer and PR bodies with the "Generated with
@@ -159,6 +186,10 @@ def _recover_assistant_groups(
 # Claude or otherwise -- ever sees one.
 _SDK_ATTRIBUTION_OFF_SETTINGS = json.dumps({"attribution": {"commit": "", "pr": ""}})
 _SDK_TITLE_MODEL_ENV = "ANTHROPIC_DEFAULT_HAIKU_MODEL"
+_SDK_REVIEWER_MODEL_ENV = "ANTHROPIC_DEFAULT_OPUS_MODEL"
+# The settings the CLI loads, passed explicitly (#3766, ADR-0189). Today's
+# loading, kept on purpose: ``[]`` would also stop a workspace ``CLAUDE.md``.
+_SETTING_SOURCES: tuple[SettingSource, ...] = ("user", "project", "local")
 _SDK_DISABLE_TERMINAL_TITLE_ENV = "CLAUDE_CODE_DISABLE_TERMINAL_TITLE"
 
 
@@ -335,9 +366,9 @@ def build_structured_resume(
         entry_uuid = str(uuid.uuid5(uuid.UUID(session_id), f"{index}:{canonical}"))
         provider_message = {"role": message.role, "content": message.to_dict()["content"]}
         if message.assistant_group is not None:
-            provider_message["id"] = "msg_curie_" + uuid.uuid5(
-                uuid.UUID(session_id), message.assistant_group
-            ).hex
+            provider_message["id"] = (
+                "msg_curie_" + uuid.uuid5(uuid.UUID(session_id), message.assistant_group).hex
+            )
         entry = cast(
             "SessionStoreEntry",
             {
@@ -400,8 +431,17 @@ def _content_block_to_dict(block: object) -> dict[str, Any] | None:
 
 
 def model_message_to_conversation(message: object) -> ConversationMessage | None:
-    """Project one SDK message into Curie's portable role/content shape."""
+    """Project one SDK message into Curie's portable role/content shape.
 
+    A subagent's messages (those with a parent tool call) are not portable
+    history: the parent's ``Agent`` call and its result already carry what the
+    parent saw (RUNNER-HISTORY-GROUP-4).
+    """
+
+    if isinstance(message, UserMessage | AssistantMessage) and (
+        message.parent_tool_use_id is not None
+    ):
+        return None
     if isinstance(message, UserMessage):
         if isinstance(message.content, str):
             content: str | list[dict[str, Any]] = message.content
@@ -413,13 +453,14 @@ def model_message_to_conversation(message: object) -> ConversationMessage | None
             ]
         return ConversationMessage(role="user", content=content)
     if isinstance(message, AssistantMessage):
+        content = [
+            projected
+            for block in message.content
+            if (projected := _content_block_to_dict(block)) is not None
+        ]
         return ConversationMessage(
             role="assistant",
-            content=[
-                projected
-                for block in message.content
-                if (projected := _content_block_to_dict(block)) is not None
-            ],
+            content=content,
         )
     return None
 
@@ -467,6 +508,10 @@ class ModelSession(Protocol):
         """Tear down the session."""
         ...
 
+    async def abort(self) -> None:
+        """Stop the subprocess group without waiting for a control acknowledgement."""
+        ...
+
 
 @runtime_checkable
 class McpServerReconnector(Protocol):
@@ -484,6 +529,38 @@ class McpServerReconnector(Protocol):
         ...
 
 
+def hidden_restore_tools(
+    connectors: Iterable[str],
+    observed_tools: frozenset[str],
+    failed_connectors: frozenset[str],
+    *,
+    probe_complete: bool,
+) -> tuple[str, ...]:
+    """The connector ``restore`` tools to keep out of the model catalogue.
+
+    @spec ACTION-EXECUTOR-8. A connector that advertises both ``restore`` and
+    ``observe_version`` (from the boot ``tools/list``) has its
+    ``mcp__<connector>__restore`` hidden, since the executor alone calls it.
+    Hiding fails closed: a connector whose boot probe failed, or that an
+    incomplete probe never observed, has it hidden too, because a paired
+    ``restore`` must never be visible while the proxy may not yet gate it. A
+    lone ``restore`` on a probed connector stays an ordinary tool, and
+    ``observe_version`` is never hidden.
+    """
+
+    hidden: list[str] = []
+    for connector in sorted(set(connectors)):
+        prefix = connector_tool_prefix(connector)
+        restore = f"{prefix}restore"
+        paired = restore in observed_tools and f"{prefix}observe_version" in observed_tools
+        unobserved = not probe_complete and not any(
+            tool.startswith(prefix) for tool in observed_tools
+        )
+        if paired or connector in failed_connectors or unobserved:
+            hidden.append(restore)
+    return tuple(hidden)
+
+
 def build_options(
     *,
     plugins: list[SdkPluginConfig],
@@ -494,6 +571,7 @@ def build_options(
     resume: str | None,
     session_id: str | None = None,
     session_store: SessionStore | None = None,
+    reviewer_model: str | None = None,
     thinking: dict[str, Any] | None = None,
     task_budget_hint: int | None = None,
     env: dict[str, str] | None = None,
@@ -504,6 +582,8 @@ def build_options(
     web_search_enabled: bool = True,
     policy_disallowed_tools: Iterable[str] = (),
     disallowed_tools: list[str] | tuple[str, ...] | None = None,
+    skills: list[str] | None = None,
+    hidden_restore_tools: Iterable[str] = (),
 ) -> ClaudeAgentOptions:
     """Assemble ClaudeAgentOptions for the session.
 
@@ -517,6 +597,11 @@ def build_options(
     ``task_budget`` so the model self-paces (ACI section 6b, a soft hint, not a
     ceiling); and the hard per-run output-token ceiling is enforced by the runner
     itself (see budget.py).
+
+    ``skills`` is the bundle's own skill list (``plugin.bundle_skill_names``).
+    It is always passed to the SDK as a list, ``[]`` when there are none:
+    leaving it unset would keep every built-in Claude Code CLI skill in the
+    model's listing (#3766, ADR-0189).
     """
 
     task_budget = TaskBudget(total=task_budget_hint) if task_budget_hint else None
@@ -540,9 +625,11 @@ def build_options(
     # both sources deny without changing the operator's declared order.
     explicit_disallowed = list(dict.fromkeys(disallowed_tools or ()))
     explicit_names = set(explicit_disallowed)
+    # @spec ACTION-EXECUTOR-8: a paired (or unprobed) connector ``restore`` is
+    # the executor's verb, never the model's; it joins the sorted policy tail.
     disallowed_tools = [
         *explicit_disallowed,
-        *sorted(set(policy_disallowed_tools) - explicit_names),
+        *sorted((set(policy_disallowed_tools) | set(hidden_restore_tools)) - explicit_names),
     ]
     if not web_search_enabled:
         disallowed_tools = [
@@ -550,6 +637,24 @@ def build_options(
             *(tool_name for tool_name in disallowed_tools if tool_name != "WebSearch"),
         ]
     sdk_env = dict(env or {})
+    # Reviewers use the Opus alias so install overrides do not require
+    # rebuilding the bundle (#4120); the CLI resolves it through this env.
+    if effective_auth_mode(os.environ, sdk_env) is AuthMode.PERSONAL:
+        # The explicit Claude reviewer only; a credential prefix is not a mode
+        # or an owner, so it never picks the default (#5373, ADR 0268).
+        sdk_env[_SDK_REVIEWER_MODEL_ENV] = require_claude_reviewer_model(reviewer_model)
+    else:
+        # Auth has already been resolved at boot. An explicit SDK env value,
+        # including an empty value that fences inherited auth, wins over the
+        # process env.
+        credential = sdk_env.get(
+            "CLAUDE_CODE_OAUTH_TOKEN", os.environ.get("CLAUDE_CODE_OAUTH_TOKEN", "")
+        ) or sdk_env.get("ANTHROPIC_API_KEY", os.environ.get("ANTHROPIC_API_KEY", ""))
+        sdk_env[_SDK_REVIEWER_MODEL_ENV] = (
+            reviewer_model
+            if reviewer_model is not None
+            else ("claude-opus-5-5" if credential.startswith("sk-ant-") else "openai/gpt-6.1-sol")
+        )
     title_model = sdk_env.get(_SDK_TITLE_MODEL_ENV, os.environ.get(_SDK_TITLE_MODEL_ENV, ""))
     if not title_model.strip():
         sdk_env[_SDK_DISABLE_TERMINAL_TITLE_ENV] = "1"
@@ -569,6 +674,14 @@ def build_options(
         # https://platform.claude.com/docs/en/agents-and-tools/tool-use/web-search-tool
         # https://github.com/anthropics/claude-agent-sdk-python#using-tools
         disallowed_tools=disallowed_tools,
+        # Only the bundle's own skills reach the model's listing (#3766,
+        # ADR-0189). ``None`` would mean "every skill the CLI has", built-ins
+        # such as ``update-config`` included, so it is never passed.
+        skills=list(skills or []),
+        # Explicit, because with ``skills`` set the SDK otherwise fills in
+        # ``["user", "project"]`` and quietly drops ``local``. This keeps the
+        # settings loading the runner had before ``skills`` was passed.
+        setting_sources=list(_SETTING_SOURCES),
         **thinking_option,
         **cwd_option,
         system_prompt=system_prompt,
@@ -598,6 +711,8 @@ def build_options(
         # pass the bundle's servers in ``mcp_servers`` themselves.
         strict_mcp_config=True,
         include_partial_messages=True,
+        # Observe usage on subagents whose replies contain no tool blocks.
+        forward_subagent_text=True,
         # Commit/PR attribution off for every session this runner builds
         # (#3193); see _SDK_ATTRIBUTION_OFF_SETTINGS above.
         settings=_SDK_ATTRIBUTION_OFF_SETTINGS,
@@ -608,33 +723,105 @@ class ClaudeAgentSession:
     """ModelSession backed by a real claude-agent-sdk streaming-input session."""
 
     def __init__(self, options: ClaudeAgentOptions) -> None:
-        self._options = options
-        self._client = ClaudeSDKClient(options)
+        # Install the stderr tail before the client exists: the SDK copies
+        # options at connect and its transport keeps that copy, so the tail
+        # must already be on every copy to keep forwarding after connect.
+        self._stderr_tail = StderrTail(
+            options.stderr,
+            partial_line_chars=(
+                options.max_buffer_size
+                if options.max_buffer_size is not None
+                else _DEFAULT_MAX_BUFFER_SIZE
+            ),
+        )
+        self._options = replace(options, stderr=self._stderr_tail)
+        self._client = ClaudeSDKClient(self._options)
+        # The fresh CLI config a personal connect created; close() removes it.
+        self._personal_config: PersonalConfigDirs | None = None
 
     async def connect(self) -> None:
         # The SDK copies os.environ into the CLI at spawn. Install the parent
         # env (model key kept, platform tokens removed) for that copy, then
         # restore the process env so in-process clients keep what they captured.
-        # BASH_ENV points at an unset prelude so the Bash tool drops the model
-        # key before the command runs. The CLI parent still has the key.
+        # The mandatory shell launcher drops the model key before user startup
+        # files and SDK snapshots run. The CLI parent still authenticates.
         from .subprocess_env import (
             CLI_PARENT_MODEL_KEYS,
             cli_parent_env,
             platform_credential_names,
+            sdk_shell_env,
         )
 
         snapshot = dict(os.environ)
+        if effective_auth_mode(snapshot, self._options.env) is AuthMode.PERSONAL:
+            await self._connect_personal(snapshot)
+            return
         denied = platform_credential_names({**snapshot, **self._options.env})
         for key in list(self._options.env):
             if key in denied and key not in CLI_PARENT_MODEL_KEYS:
                 self._options.env.pop(key, None)
+        # SDK options override inherited env at spawn. Pin authority last in
+        # both maps so options cannot select an unsanitized shell/interpreter.
+        self._options.env.update(sdk_shell_env())
+        # The env restore runs inside the diagnostics window, so the finish
+        # record is written only after the process env is the snapshot again.
+        with sdk_initialize_diagnostics(self._stderr_tail, _SDK_VERSION):
+            try:
+                os.environ.clear()
+                os.environ.update(cli_parent_env(snapshot))
+                await self._client.connect()
+            finally:
+                os.environ.clear()
+                os.environ.update(snapshot)
+
+    async def _connect_personal(self, snapshot: dict[str, str]) -> None:
+        """Launch with the owner grant as the only model credential (#5373, ADR 0268).
+
+        Every refusal raises here, before ``ClaudeSDKClient.connect`` starts any
+        subprocess. The CLI then gets fresh config dirs and an env with every
+        competing source removed; the shell pin and credential scrubbing stay.
+        """
+
+        from .subprocess_env import cli_parent_env, platform_credential_names, sdk_shell_env
+
+        options_env = self._options.env
+        # An explicit value, including an empty one, fences the inherited grant.
+        grant = require_owner_grant({**snapshot, **options_env})
+        inspect_workspace_settings(self._options.cwd or os.getcwd())
+        inspect_managed_policy(
+            implementer_model=self._options.model,
+            reviewer_model=options_env.get(_SDK_REVIEWER_MODEL_ENV),
+        )
+        removed = platform_credential_names(snapshot) | platform_credential_names(
+            {**snapshot, **options_env}
+        )
+        # Pin authority before the env is built, as the service path does.
+        options_env.update(sdk_shell_env())
+        config = PersonalConfigDirs.create()
+        self._personal_config = config
         try:
-            os.environ.clear()
-            os.environ.update(cli_parent_env(snapshot))
-            await self._client.connect()
-        finally:
-            os.environ.clear()
-            os.environ.update(snapshot)
+            with sdk_initialize_diagnostics(self._stderr_tail, _SDK_VERSION):
+                try:
+                    os.environ.clear()
+                    os.environ.update(
+                        personal_cli_env(
+                            cli_parent_env(snapshot),
+                            options_env,
+                            grant=grant,
+                            config=config,
+                            removed=removed,
+                        )
+                    )
+                    await self._client.connect()
+                finally:
+                    os.environ.clear()
+                    os.environ.update(snapshot)
+        except BaseException:
+            # The SDK has already stopped the CLI; the original error stands.
+            self._personal_config = None
+            with contextlib.suppress(OSError):
+                config.remove()
+            raise
 
     async def query(self, text: str) -> None:
         await self._client.query(text)
@@ -689,7 +876,19 @@ class ClaudeAgentSession:
         await self._client.interrupt()
 
     async def close(self) -> None:
-        await self._client.disconnect()
+        try:
+            await self._client.disconnect()
+        finally:
+            config, self._personal_config = self._personal_config, None
+            if config is not None:
+                config.remove()
+
+    async def abort(self) -> None:
+        transport = self._client._transport
+        if transport is not None:
+            if not isinstance(transport, CredentialSafeCLITransport):
+                raise RuntimeError("session transport does not own an isolated process group")
+            await transport.stop_process_group()
 
     async def export_replay_state(self) -> HarnessReplayState | None:
         """Export the provider transcript checkpoint/delta mirrored this turn."""

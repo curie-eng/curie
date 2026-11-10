@@ -2,7 +2,7 @@
 
 ADR-0168 decision 2. The Slack transport is recorded, never opened: Bolt's App,
 the Web client and the Socket Mode handler are replaced with recorders at the
-module seam `curie_dispatcher.app` builds them through.
+module seam `curie_channel_gateway.slack.app` builds them through.
 """
 
 from __future__ import annotations
@@ -15,15 +15,15 @@ from typing import Any
 
 import pytest
 import redis
-from curie_dispatcher import app as app_module
-from curie_dispatcher.app import SocketModeConnection
-from curie_dispatcher.config import DispatcherConfig
-from curie_dispatcher.identities import (
+from curie_channel_gateway.slack import app as app_module
+from curie_channel_gateway.slack.app import SocketModeConnection
+from curie_channel_gateway.slack.config import DispatcherConfig
+from curie_channel_gateway.slack.identities import (
     SlackBotIds,
     SlackIdentityCredentials,
     default_identity_credentials,
 )
-from curie_dispatcher.preflight import PreflightedIdentity
+from curie_channel_gateway.slack.preflight import PreflightedIdentity
 from slack_bolt import App
 from slack_sdk.web import WebClient
 
@@ -31,6 +31,7 @@ from .conftest import _authorize, _set_run_env, _TestTelemetry
 
 OPS = SlackIdentityCredentials(name="ops-bot", app_token="xapp-ops", bot_token="xoxb-ops")
 _STOCK_APP_KWARGS = {
+    "process_before_response": False,
     "signing_secret": "unused-in-socket-mode",
     "token": "xoxb-test",
     "token_verification_enabled": False,
@@ -51,7 +52,8 @@ def recorded(monkeypatch: pytest.MonkeyPatch) -> SimpleNamespace:
         return WebClient(**kwargs)
 
     class RecordingHandler:
-        def __init__(self, app: App, app_token: str) -> None:
+        def __init__(self, app: App, app_token: str, logger: Any = None) -> None:
+            del logger
             calls.handlers.append((app, app_token))
             self.client = SimpleNamespace(
                 message_listeners=[],
@@ -87,26 +89,46 @@ def _run_connection_and_capture(
     logger_name: str,
     caplog: pytest.LogCaptureFixture,
 ) -> list[str]:
-    """Drive the extra-clients warning and the connected line, without blocking.
-
-    The recorded ``SocketModeHandler.connect``/``close`` are no-ops, so ``run``
-    reaches its log line and then would block on ``self._closed.wait()``
-    forever; a handler whose own connect never blocks is exactly what a real
-    Socket Mode connection is not, so the wait is the one piece worth faking.
-    """
+    """Capture identity logs, then close the running connection within 2 s."""
     sm_connection = connection.connect()
     listener = sm_connection._handler.client.message_listeners[-1]
+    connected = threading.Event()
+    errors: list[BaseException] = []
+
+    class ConnectedLog(logging.Handler):
+        def emit(self, record: logging.LogRecord) -> None:
+            if record.getMessage().startswith("socket mode connected identity="):
+                connected.set()
+
+    def run() -> None:
+        try:
+            sm_connection.run()
+        except BaseException as exc:  # noqa: BLE001 - report thread failures to the test
+            errors.append(exc)
+
+    logger = logging.getLogger(logger_name)
+    connected_log = ConnectedLog()
+    thread = threading.Thread(target=run, name="test-identity-socket-run", daemon=True)
     with caplog.at_level(logging.INFO, logger=logger_name):
-        listener(sm_connection._handler.client, {"type": "hello", "num_connections": 2}, "")
-        sm_connection._closed.wait = lambda *_a, **_k: True  # type: ignore[method-assign]
-        sm_connection.run()
+        logger.addHandler(connected_log)
+        try:
+            listener(sm_connection._handler.client, {"type": "hello", "num_connections": 2}, "")
+            thread.start()
+            assert connected.wait(2), "Socket Mode connection did not log its identity"
+        finally:
+            sm_connection.close()
+            if thread.ident is not None:
+                thread.join(timeout=2.0)
+            logger.removeHandler(connected_log)
+            assert not thread.is_alive(), "Socket Mode run thread survived cleanup"
+    assert errors == []
     return [record.getMessage() for record in caplog.records]
 
 
 def test_a_stock_config_builds_one_connection_from_the_legacy_settings(
     config: DispatcherConfig, redis_client: redis.Redis, recorded: SimpleNamespace
 ) -> None:
-    from curie_dispatcher.run import build_identity_connections, build_supervisor
+    from curie_channel_gateway.slack.run import build_identity_connections, build_supervisor
 
     (connection,) = build_identity_connections(
         config,
@@ -128,7 +150,7 @@ def test_a_stock_config_builds_one_connection_from_the_legacy_settings(
 def test_two_identities_build_two_connections_each_from_its_own_tokens(
     config: DispatcherConfig, redis_client: redis.Redis, recorded: SimpleNamespace
 ) -> None:
-    from curie_dispatcher.run import build_identity_connections
+    from curie_channel_gateway.slack.run import build_identity_connections
 
     ids = SlackBotIds(team_id="T1", app_id=None, bot_id="B0OPS", bot_user_id="U0OPS")
     connections = build_identity_connections(
@@ -174,7 +196,7 @@ def test_a_lone_survivor_of_a_declared_pair_still_names_its_identity(
     Two identities are declared and only ``ops-bot`` is admitted; its
     connection is still built as one of a pair, not as a lone stock survivor.
     """
-    from curie_dispatcher.run import build_identity_connections
+    from curie_channel_gateway.slack.run import build_identity_connections
 
     (connection,) = build_identity_connections(
         config,
@@ -191,7 +213,7 @@ def test_a_lone_survivor_of_a_declared_pair_still_names_its_identity(
 def test_build_supervisor_with_two_identities_builds_two_labelled_members(
     config: DispatcherConfig, recorded: SimpleNamespace
 ) -> None:
-    from curie_dispatcher.run import build_supervisor
+    from curie_channel_gateway.slack.run import build_supervisor
 
     group = build_supervisor(
         config,
@@ -219,7 +241,7 @@ def test_a_stock_connections_log_lines_name_no_identity(
     monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    from curie_dispatcher.run import build_identity_connections
+    from curie_channel_gateway.slack.run import build_identity_connections
 
     monkeypatch.setenv("CURIE_RELEASE_IDENTITY", "curie-run-identities-stock")
     logger_name = "test-run-stock-lines"
@@ -248,7 +270,7 @@ def test_two_identities_log_lines_each_name_their_own_identity(
     monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    from curie_dispatcher.run import build_identity_connections
+    from curie_channel_gateway.slack.run import build_identity_connections
 
     monkeypatch.setenv("CURIE_RELEASE_IDENTITY", "curie-run-identities-two")
     logger_name = "test-run-two-lines"
@@ -284,7 +306,7 @@ def test_two_identities_log_lines_each_name_their_own_identity(
 def test_run_main_connects_only_the_identities_that_passed_preflight(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    from curie_dispatcher import run
+    from curie_channel_gateway.slack import run
 
     _set_run_env(monkeypatch)
     monkeypatch.setenv("SLACK_APP_TOKEN", "xapp-default")
@@ -392,7 +414,7 @@ def test_the_shutdown_signal_handler_takes_no_lock_the_interrupted_thread_may_ho
     landing inside the supervisor's critical section would. Every acquire is
     bounded, so a handler that takes the lock itself fails here, not hangs.
     """
-    from curie_dispatcher import run
+    from curie_channel_gateway.slack import run
 
     _set_run_env(monkeypatch)
     monkeypatch.setenv("SLACK_APP_TOKEN", "xapp-default")

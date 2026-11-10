@@ -7,7 +7,9 @@ image imported. Asserts the full G1 lifecycle against real machinery:
 
 1. warm-pool claim binds a ready sandbox in under a second,
 2. the claimed sandbox answers ``/healthz`` and round-trips an ACI event
-   (fake-model NDJSON stream ending in a ``final``),
+   (fake-model NDJSON stream ending in a ``final``), authenticated with the
+   bearer the runner enforces (the chart's warm-pod token for a warm claim,
+   #3821),
 3. consecutive turns land on the SAME pod/process (the cache-affinity
    invariant the substrate owns: no rebind between turns),
 4. suspend deletes the pod; resume creates a NEW claim whose pod carries
@@ -22,14 +24,17 @@ Out-of-cluster reachability uses ``kubectl port-forward`` to the sandbox pod
 from __future__ import annotations
 
 import asyncio
+import base64
 import contextlib
 import json
 import os
 import socket
 import subprocess
+import sys
 import time
 import urllib.request
 from collections.abc import Iterator
+from pathlib import Path
 
 import pytest
 import redis
@@ -45,6 +50,11 @@ from redis.asyncio import Redis as AsyncRedis
 from redis.asyncio.retry import Retry as AsyncRetry
 from redis.backoff import NoBackoff
 from redis.maint_notifications import MaintNotificationsConfig
+
+# importlib import mode does not add this test directory to sys.path.
+sys.path.insert(0, str(Path(__file__).parent))
+
+from resilience_harness import runner_token_secret_ref  # noqa: E402
 
 pytestmark = pytest.mark.skipif(
     os.environ.get("CURIE_SANDBOX_E2E") != "1",
@@ -100,12 +110,34 @@ def _get_json(base: str, path: str) -> dict[str, object]:
         return dict(json.loads(resp.read()))
 
 
-def _post_event(base: str, text: str) -> list[dict[str, object]]:
+def _runner_bearer(handle: SandboxHandle) -> str:
+    """The bearer the claimed runner enforces (#3821).
+
+    A claim that minted a per-claim token carries it on the handle; a warm claim
+    carries none, so its runner enforces the chart-owned warm-pod token, read
+    from the Secret its pod references.
+    """
+
+    if handle.token.strip():
+        return handle.token
+    ref = runner_token_secret_ref(_pod_of_sandbox(handle.sandbox_name))
+    assert ref is not None, (
+        f"sandbox {handle.sandbox_name} runner carries no CURIE_RUNNER_TOKEN; "
+        "a cluster runner must always enforce a bearer (#3821)"
+    )
+    name, key = ref
+    encoded = _kubectl("get", "secret", name, "-o", f"jsonpath={{.data.{key}}}")
+    return base64.b64decode(encoded).decode("utf-8")
+
+
+def _post_event(base: str, text: str, *, token: str) -> list[dict[str, object]]:
     body = json.dumps(
         {"kind": "event", "type": "message", "text": text, "user": "U-e2e", "ts": "1.0"}
     ).encode()
     request = urllib.request.Request(
-        f"{base}/v1/event", data=body, headers={"Content-Type": "application/json"}
+        f"{base}/v1/event",
+        data=body,
+        headers={"Content-Type": "application/json", "Authorization": f"Bearer {token}"},
     )
     with urllib.request.urlopen(request, timeout=60) as resp:
         return [json.loads(line) for line in resp.read().splitlines() if line.strip()]
@@ -175,16 +207,17 @@ def test_full_lifecycle_on_cluster(substrate: SandboxSubstrate) -> None:
     pod_before = _pod_of_sandbox(handle.sandbox_name)
     uid_before = pod_before["metadata"]["uid"]  # type: ignore[index]
 
+    bearer = _runner_bearer(handle)
     with _port_forward(handle.sandbox_name, handle.port) as base:
         # 2. Health + ACI event round-trip through the real runner image.
         assert _get_json(base, "/healthz") == {"ok": True}
-        frames = _post_event(base, "hello from the G1 e2e")
+        frames = _post_event(base, "hello from the G1 e2e", token=bearer)
         types = [f.get("type") for f in frames]
         print(f"EVIDENCE first_turn_frames={types}")
         assert types[-1] == "final"
 
         # 3. Consecutive turn, same claim -> same pod, same process.
-        frames2 = _post_event(base, "second turn, same session")
+        frames2 = _post_event(base, "second turn, same session", token=bearer)
         assert [f.get("type") for f in frames2][-1] == "final"
         again = substrate.claim(thread)
         assert again.sandbox_name == handle.sandbox_name

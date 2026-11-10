@@ -1,0 +1,114 @@
+[
+  {
+    "name": "mixed-case",
+    "value": {"Acme-Corp/Acme-Bot": ["SMOKE"]},
+    "valid": true,
+    "expected": {"acme-corp/acme-bot": ["SMOKE"]}
+  },
+  {
+    "name": "repository-punctuation",
+    "value": {
+      "acme-corp/.github": ["SMOKE"],
+      "acme-corp/_cache": ["SMOKE"],
+      "acme-corp/name.": ["SMOKE"],
+      "acme-corp/--": ["SMOKE"]
+    },
+    "valid": true,
+    "expected": {
+      "acme-corp/.github": ["SMOKE"],
+      "acme-corp/_cache": ["SMOKE"],
+      "acme-corp/name.": ["SMOKE"],
+      "acme-corp/--": ["SMOKE"]
+    }
+  },
+  {
+    "name": "empty-mapping",
+    "value": {},
+    "valid": true,
+    "expected": {}
+  },
+  {
+    "name": "empty-label-list",
+    "value": {"acme-corp/acme-bot": []},
+    "valid": true,
+    "expected": {"acme-corp/acme-bot": []}
+  },
+  {
+    "name": "literal-space-label",
+    "value": {"acme-corp/acme-bot": [" "]},
+    "valid": true,
+    "expected": {"acme-corp/acme-bot": [" "]}
+  },
+  {
+    "name": "maximum-label-length",
+    "value": {"acme-corp/acme-bot": ["12345678901234567890123456789012345678901234567890"]},
+    "valid": true,
+    "expected": {"acme-corp/acme-bot": ["12345678901234567890123456789012345678901234567890"]}
+  },
+  {
+    "name": "maximum-label-count",
+    "value": {"acme-corp/acme-bot": ["0", "1", "2", "3", "4", "5", "6", "7", "8", "9"]},
+    "valid": true,
+    "expected": {"acme-corp/acme-bot": ["0", "1", "2", "3", "4", "5", "6", "7", "8", "9"]}
+  },
+  {
+    "name": "owner-trailing-hyphen",
+    "value": {"acme-/acme-bot": ["SMOKE"]},
+    "valid": false,
+    "key": "acme-/acme-bot"
+  },
+  {
+    "name": "wildcard",
+    "value": {"acme-corp/*": ["SMOKE"]},
+    "valid": false,
+    "key": "acme-corp/*"
+  },
+  {
+    "name": "dot-repository",
+    "value": {"acme-corp/.": ["SMOKE"]},
+    "valid": false,
+    "key": "acme-corp/."
+  },
+  {
+    "name": "dot-dot-repository",
+    "value": {"acme-corp/..": ["SMOKE"]},
+    "valid": false,
+    "key": "acme-corp/.."
+  },
+  {
+    "name": "empty-label",
+    "value": {"acme-corp/acme-bot": [""]},
+    "valid": false,
+    "key": "acme-corp/acme-bot"
+  },
+  {
+    "name": "label-too-long",
+    "value": {"acme-corp/acme-bot": ["123456789012345678901234567890123456789012345678901"]},
+    "valid": false,
+    "key": "acme-corp/acme-bot"
+  },
+  {
+    "name": "too-many-labels",
+    "value": {"acme-corp/acme-bot": ["0", "1", "2", "3", "4", "5", "6", "7", "8", "9", "10"]},
+    "valid": false,
+    "key": "acme-corp/acme-bot"
+  },
+  {
+    "name": "label-list-required",
+    "value": {"acme-corp/acme-bot": "SMOKE"},
+    "valid": false,
+    "key": "acme-corp/acme-bot"
+  },
+  {
+    "name": "string-label-required",
+    "value": {"acme-corp/acme-bot": [7]},
+    "valid": false,
+    "key": "acme-corp/acme-bot"
+  },
+  {
+    "name": "object-required",
+    "value": [],
+    "valid": false,
+    "key": "CURIE_FACTORY_PUBLICATION_LABELS"
+  }
+]

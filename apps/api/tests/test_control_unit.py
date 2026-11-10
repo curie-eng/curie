@@ -4,9 +4,25 @@ import uuid
 
 import pytest
 from curie_api.config import Settings
-from curie_api.killswitch import KILL_CHANNEL, kill_key
-from curie_api.schemas import BudgetConfig
+from curie_api.schemas.control import BudgetConfig
+from curie_internal.keyspace import KILL_CHANNEL, kill_key
 from pydantic import ValidationError
+
+
+@pytest.mark.parametrize(
+    "password", ["example#token", "example+token", "example%2Ftoken", "example/?@token"]
+)
+def test_valkey_dsn_preserves_reserved_password_characters(password: str) -> None:
+    from redis.connection import parse_url
+
+    settings = Settings(
+        valkey_host="localhost", valkey_port=26379, valkey_password=password, valkey_url=""
+    )
+    parsed = parse_url(settings.valkey_dsn())
+    assert parsed["password"] == password
+    assert parsed["host"] == "localhost"
+    assert parsed["port"] == 26379
+    assert parsed["db"] == 0
 
 
 def test_valkey_dsn_honors_the_password_override() -> None:

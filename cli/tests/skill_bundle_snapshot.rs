@@ -9,7 +9,7 @@
 //! `state` type (or, for the pre-#1087 case, from the literal bytes such a file
 //! carries on disk), and the only thing mocked is the runner's HTTP peer.
 
-mod support;
+use crate::support;
 
 use std::path::Path;
 use std::process::{Command, Output};

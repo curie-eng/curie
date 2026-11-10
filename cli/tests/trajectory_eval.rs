@@ -4,7 +4,7 @@
 //! final answer is deliberately made irrelevant to each expected verdict. Only
 //! the ordered `tool_note` observations may determine the result.
 
-mod support;
+use crate::support;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};

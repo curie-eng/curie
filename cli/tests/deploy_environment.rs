@@ -3,9 +3,8 @@
 
 #![cfg(unix)]
 
-mod support;
-#[path = "support/executable.rs"]
-mod test_executable;
+use crate::support;
+use crate::support::executable as test_executable;
 
 use curie::scaffold::scaffold;
 use serde_json::{json, Value};
@@ -91,6 +90,9 @@ fn response(req: &Request, first_deploy: bool) -> Response {
                 .as_str()
                 .expect("environment is a string");
             Response::json(201, &deployment(environment, VERSION_ID).to_string())
+        }
+        ("PATCH", path) if path == format!("/agents/{AGENT_ID}") => {
+            Response::json(200, &agent().to_string())
         }
         ("GET", path) if path.contains("/versions/") && path.contains("/connectors?") => {
             Response::json(

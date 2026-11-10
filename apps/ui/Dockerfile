@@ -1,17 +1,17 @@
 # syntax=docker/dockerfile:1
 # Curie UI image: static Vite build served by non-root nginx.
 #
-# BUILD FROM THE REPO ROOT, not from apps/ui/, because the UI resolves the frozen
-# ACI TypeScript types through a path alias (@aci -> ../../packages/aci-protocol/
-# generated/ts, in both tsconfig and vite), which lives outside apps/ui. The repo
-# layout is replicated in the build stage so that relative alias resolves:
+# BUILD FROM THE REPO ROOT, not from apps/ui/, because the UI reads the shared
+# wording vector (tests/vectors/user-action-wording.json), which lives outside
+# apps/ui. The repo layout is replicated in the build stage so that relative path
+# resolves:
 #
 #   docker build -f apps/ui/Dockerfile -t curie-ui .
 #
 # apps/ui/Dockerfile.dockerignore (BuildKit honors <dockerfile>.dockerignore over
-# the context-root one) trims the root context to the UI plus that one
-# cross-package tree.
-FROM node:22.23.2-slim@sha256:83f487e0a63425e5b4d146fb5e5be574bcbe1b7b843d3ebafdd95eaf7767a7e5 AS build
+# the context-root one) trims the root context to the UI plus that vector. The
+# API types (src/api/generated.ts) are committed; nothing is generated here.
+FROM node:22.23.4-slim@sha256:de170b39439eb0e5a3444ad7d60b015614a381e10fecae2e30ec9e735122f38d AS build
 WORKDIR /app
 # Pin pnpm explicitly: package.json has no packageManager field, so corepack
 # would otherwise pull whatever pnpm is latest. pnpm 10+ turns a dependency with
@@ -24,10 +24,10 @@ RUN corepack enable && corepack prepare pnpm@9.15.9 --activate
 COPY apps/ui/package.json apps/ui/pnpm-lock.yaml ./apps/ui/
 WORKDIR /app/apps/ui
 RUN pnpm install --frozen-lockfile
-# The frozen ACI types the @aci alias points at, then the UI sources. Both land
-# at their repo-relative paths so `../../packages/...` resolves from apps/ui.
+# The shared wording vector, then the UI sources. Both land at their
+# repo-relative paths so `../../tests/...` resolves from apps/ui.
 WORKDIR /app
-COPY packages/aci-protocol/generated ./packages/aci-protocol/generated
+COPY tests/vectors/user-action-wording.json ./tests/vectors/user-action-wording.json
 COPY apps/ui ./apps/ui
 WORKDIR /app/apps/ui
 RUN pnpm build
@@ -60,6 +60,34 @@ server {
     }
     location ^~ /api/v1/internal/ {
         return 404;
+    }
+
+    # These URLs carry account capabilities or OIDC codes/state. Both access
+    # and upstream-error logs otherwise include the raw request URI, including
+    # when the API is unavailable and cannot set its own privacy headers.
+    location ^~ /api/identity/connect/ {
+        access_log off;
+        error_log /dev/null;
+        add_header Cache-Control "private, no-store" always;
+        add_header Referrer-Policy "no-referrer" always;
+        gzip off;
+        proxy_pass ${CURIE_API_TARGET}/identity/connect/;
+        proxy_set_header Host $http_host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+    }
+    location = /api/console/oidc/callback {
+        access_log off;
+        error_log /dev/null;
+        add_header Cache-Control "private, no-store" always;
+        add_header Referrer-Policy "no-referrer" always;
+        gzip off;
+        proxy_pass ${CURIE_API_TARGET}/console/oidc/callback;
+        proxy_set_header Host $http_host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
     }
 
     # Reverse-proxy operator API calls, stripping the /api prefix.

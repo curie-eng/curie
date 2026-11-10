@@ -32,6 +32,11 @@ async def pg_connect_or_skip(engine: AsyncEngine) -> None:
             pass
     except (SQLAlchemyError, OSError) as exc:
         if "CI_REQUIRE_POSTGRES_TESTS" in os.environ:
+            if isinstance(exc, OSError):
+                exc.add_note(
+                    f"could not connect to Postgres at {engine.url.host}:{engine.url.port}: "
+                    "start the compose stack"
+                )
             raise
         url = engine.url.render_as_string(hide_password=True)
         pytest.skip(f"Postgres not reachable at {url}: {exc}")

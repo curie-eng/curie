@@ -126,6 +126,10 @@ fn plan_for(
         registry,
         host,
         metadata_dir,
+        &platforms
+            .iter()
+            .map(|p| (*p).to_string())
+            .collect::<Vec<_>>(),
     )
     .unwrap_or_else(|error| panic!("build_plan for {connector}: {error}"))
 }
@@ -670,6 +674,7 @@ fn a_context_without_a_dockerfile_fails_planning_and_writes_no_lock() {
         None,
         "linux/amd64",
         meta.path(),
+        &["linux/amd64".to_string()],
     )
     .expect_err("a context with no Dockerfile cannot be planned");
     assert!(
@@ -708,6 +713,7 @@ fn a_symlinked_dockerfile_is_refused_during_planning() {
             None,
             "linux/amd64",
             meta.path(),
+            &["linux/amd64".to_string()],
         )
         .is_err(),
         "a symlink out of the bundle must be refused, not dereferenced"

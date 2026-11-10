@@ -7,7 +7,7 @@ toggles, the three preflights) plus the security rails as chart defaults.
 
 The chart is a direct port of the proven `compose.dev.yaml` dev stack: same
 images and the same headless-bootstrapped Langfuse dev project. The chart
-ClickHouse default is `:25.12.11.4` (AVX required, coupled to
+ClickHouse default is `:25.12.11.4` (AVX required on x86, coupled to
 `langfuse.image.tag`) while compose stays on `:24.8.14.39` so an SSE4.2-only
 developer host can still boot the local stack; both sides name a patch build
 rather than a moving `25.12` / `24.8` alias (#2319). Rather than vendoring the upstream Langfuse chart and its
@@ -109,6 +109,12 @@ marker in place, so a successful release Job means release processing completed;
 confirm the actual claim state with `curie cluster status`. The marker TTL is a
 last-resort expiry, not a promise of prompt convergence for a current pause.
 
+The drain, attest and release hook Jobs share `worker.upgradeDrain.resources`.
+Worker dependency imports peaked at approximately `148Mi` in subprocess
+measurements, so the default memory request and limit are both `384Mi`, giving
+more than twice that peak. When overriding this block, size both the memory
+request and limit to at least twice the deployed worker image's measured peak.
+
 **Step 2 -- connect Slack + a real model.** When you have Slack tokens and a
 model credential, upgrade in place (the exact command is also printed in
 `NOTES.txt` after step 1):
@@ -166,7 +172,7 @@ of these containers the liveness cutoff must strictly exceed the readiness
 cutoff -- otherwise a container still legitimately booting (WAL recovery,
 Prisma/ClickHouse boot migrations, API warm-up) gets killed and restarted back
 into the same boot path instead of being given time to finish it.
-`ci/probe-window-assertions.sh` enforces this ordering render-wide.
+policy P3 in `ci/policy/` enforces this ordering render-wide.
 
 | Value | Default | Meaning |
 | --- | --- | --- |
@@ -345,6 +351,41 @@ are operator-configured collector exporters; installing Grafana, Loki, Tempo,
 Prometheus, or another retained backend is deliberately separate from this
 chart's OTLP write path.
 
+### Optional trace processors
+
+`otelCollector.extraProcessors` defines additional Collector processors by
+component ID. `otelCollector.extraTracePipelineProcessors` selects their IDs in
+execution order for the traces pipeline. Selected processors run after
+`memory_limiter` and before `batch`; with both values empty, the rendered
+Collector configuration and all three pipelines retain their existing defaults.
+An upgrade using `--reuse-values` from a release whose values predate these
+keys also treats the omitted keys as empty. An explicitly supplied non-map
+`extraProcessors` or non-list `extraTracePipelineProcessors` is rejected.
+For example, an operator can suppress routine spans before batching and export
+while retaining user, state, and action spans:
+
+```yaml
+otelCollector:
+  extraProcessors:
+    filter/routine_spans:
+      error_mode: ignore
+      traces:
+        span:
+          - 'IsMatch(name, "^(health|background)")'
+  extraTracePipelineProcessors: [filter/routine_spans]
+```
+
+The chart refuses an extra processor that replaces a built-in processor, a
+malformed component ID or non-map configuration, an undefined pipeline
+reference, a duplicate selected ID, or a selected built-in ID. The selection
+affects traces only; logs and metrics keep their existing processor order.
+The operator owns the filter expression and must validate it against the
+pinned Collector image and representative spans before applying it. On
+Collector contrib 0.119.0, `otelcol-contrib validate --config=...` accepted
+the example filter; an OTLP/HTTP input with `health.check`,
+`background.poll`, `user.message`, `state.update`, and `action.execute`
+produced exactly the final three spans at a detailed debug exporter.
+
 The SRE bot Prometheus overlay includes alerts for dead lettered messages,
 slow sandbox claims, refused capacity reclamation, and transcript persistence
 failures. It counts a counter's first observed sample so failures are visible
@@ -488,7 +529,7 @@ pipeline and environment are applied on `helm upgrade`.
 | Langfuse web + worker | `langfuse/langfuse:3.225.5`, `langfuse/langfuse-worker:3.225.5` | Observability + eval backbone. Headless-bootstrapped dev org/project. Web and worker stay on one reviewed migration set; do not replace the version with floating `:3`. Both Deployments use Recreate, so a Langfuse image change is a brief outage while boot migrations run. |
 | Postgres | `postgres:16.15-alpine@sha256:cf78e766...` | Langfuse transactional store + app state. StatefulSet. Digest-pinned: PostgreSQL's version is two components, and `postgres.podSecurityContext.fsGroup` (70) is the `postgres` gid read out of those exact bytes. |
 | Valkey | `valkey/valkey:8.1.10-alpine` | Langfuse cache/queue + dispatcher Streams queue. Same pin as `compose.dev.yaml` and the CI rust job's Valkey service. |
-| ClickHouse | `clickhouse/clickhouse-server:25.12.11.4` | Langfuse OLAP store. Coupled to `langfuse.image.tag` 3.225.5; chart default requires AVX (see preflight). `compose.dev.yaml` deliberately stays on the SSE4.2-safe `24.8.14.39`. |
+| ClickHouse | `clickhouse/clickhouse-server:25.12.11.4` | Langfuse OLAP store. Coupled to `langfuse.image.tag` 3.225.5; chart default requires AVX on x86 (see preflight). Native ARM64 does not require x86 AVX. `compose.dev.yaml` deliberately stays on the SSE4.2-safe `24.8.14.39`. |
 | RustFS | `rustfs/rustfs:1.0.0-beta.12` plus `amazon/aws-cli:2.32.6` init | Langfuse object storage; BYO real S3 in prod. |
 | OTel Collector | `otel/opentelemetry-collector-contrib:0.119.0` | Bounded OTLP gateway (gRPC+HTTP), durable queue by default; traces -> Langfuse over HTTP, logs/metrics -> configured exporters. |
 | Mail adapter | `ghcr.io/curie-eng/curie-mail-adapter` | Off by default. One `Recreate` replica with durable SQLite on single-writer storage; no platform key/database credential or ServiceAccount token. The only first-party workload with its own egress NetworkPolicy, so its OTLP export needs an explicit peer (see below). |
@@ -803,7 +844,7 @@ rather than a sizing knob. On each container the liveness failure cutoff
 (`initialDelaySeconds + (failureThreshold - 1) * periodSeconds`) outlasts the
 readiness cutoff by design -- 370 seconds against 310 -- so the kubelet cannot
 restart a container that is still inside the boot window readiness was sized to
-tolerate. `charts/curie/ci/probe-window-assertions.sh` pins that ordering for
+tolerate. policy P3 in `charts/curie/ci/policy/` pins that ordering for
 every container in the rendered chart.
 
 `langfuse-worker` also carries its own `readinessProbe` (`httpGet /api/ready`)
@@ -816,13 +857,35 @@ those migrations against a store that is still recovering — the crash-loop
 class this gate exists to prevent.
 
 Secrets: all credentials are written to one `<release>-secrets` Secret. A sealed
-`helm install` (the default) generates strong random values for all thirteen
+`helm install` (the default) generates strong random values for all fourteen
 chart owned credentials: the backing store passwords, Langfuse
 salt/encryptionKey/nextauthSecret, the two Langfuse init credentials, the
-api/webhook keys, `worker.internalWorkerToken`, and
-`api.approvalChatAttesterSecret`. Set `security.allowDevDefaults: true`
+api/webhook keys, `worker.internalWorkerToken`,
+`api.approvalChatAttesterSecret`, and `api.remediationAuthorityKey` (mounted
+into the API Deployment only, and refused at render when it equals
+`api.apiKey`). Set `security.allowDevDefaults: true`
 (values-dev.yaml, i.e. `curie cluster up --dev`) to keep the deterministic
 published defaults for dev/CI.
+
+Each Deployment, StatefulSet and DaemonSet that consumes chart-owned Secret
+keys carries a `checksum/secret` pod-template annotation. It hashes only that
+pod's consumed keys from the same once-per-render plaintext content emitted by
+the Secret, including rendered `extraEnv` references. A `helm upgrade` that
+changes a consumed key rolls its consumers; unchanged Secret content, unrelated
+keys, replica counts and image tags leave the checksum unchanged. The first
+upgrade onto this chart adds the annotation and rolls each current consumer
+once, including all four backing StatefulSets when they use chart-owned
+credentials. Pods that consume no chart-owned keys, chart Jobs and the
+SandboxTemplate carry no such annotation. Foreign `existingSecret` contents are
+excluded, so rotating one in place still needs a manual restart; existing
+component-specific rotation mechanisms continue to apply. Restarting a store
+does not rotate the password in its persisted database; coordinate that
+database-side change separately.
+
+Dev installs derive their installation identity from the namespace and release
+name so identical inputs render identical checksums (#1135, ADR-0144). Reinstalling
+that same namespace/release in dev reuses the identity. Sealed fresh installs
+still mint unique random identities, and upgrades preserve the stored identity.
 
 The eleven non init credentials persist through `lookup`, so `helm upgrade`
 re-uses them. Their explicit `--set` overrides and per store `existingSecret`
@@ -887,6 +950,50 @@ the chart collector without setting `otelCollector.endpoint` or
 `otelCollector.telemetryDisabled=true`, so a production install cannot silently
 drop every workload's OTLP destination. It is off by default so the zero-secret
 bare install stays green.
+
+### In-chart RustFS storage
+
+The in-chart RustFS volume claim defaults to `rustfs.persistence.size: 10Gi`.
+Every Langfuse event upload costs about three inodes, and 10Gi on ext4 holds
+655,360 of them, well past the 2-day event retention window. The earlier 3Gi
+default could run out of inodes long before it ran out of bytes (#4408).
+
+A StatefulSet's volume claim template cannot change after creation, so an
+existing install keeps its claim size on upgrade: the chart reads the size back
+from the live RustFS StatefulSet's `data` claim template with Helm `lookup` and
+renders that instead of the default. To grow an existing volume on a storage
+class with `allowVolumeExpansion: true`, patch the claim directly:
+
+```bash
+kubectl patch pvc data-<release>-curie-rustfs-0 -n <namespace> \
+  -p '{"spec":{"resources":{"requests":{"storage":"10Gi"}}}}'
+```
+
+The StatefulSet's claim template keeps the old size after that, which is fine:
+it only applies to claims that do not exist yet.
+
+`lookup` is empty when the chart is rendered without cluster access (`helm
+template`, Argo CD). Those renders get the 10Gi default, which Kubernetes
+refuses on an existing StatefulSet with a different size, so pin
+`rustfs.persistence.size` to the size the StatefulSet's `data` claim template
+requests, not the size of the PVC, which is larger once patched as above:
+
+```bash
+kubectl get statefulset <release>-curie-rustfs -n <namespace> \
+  -o jsonpath='{.spec.volumeClaimTemplates[0].spec.resources.requests.storage}'
+```
+
+A `storage-guard` init container checks the volume. When free inodes or free
+bytes are under 10%, it deletes the event objects under `<rustfs.bucket>/events/`
+that have not changed within `langfuse.eventUpload.retentionDays`, the same
+objects the bucket's lifecycle rule expires, because RustFS exits on a full
+volume before its own expiry can run. It touches nothing outside that prefix, and `retentionDays: 0` disables it.
+
+Because it is an init container, the guard runs when the pod starts (install,
+an upgrade that changes the pod, a reschedule, `kubectl delete pod`), not when
+only the RustFS container restarts. A RustFS container already crash-looping on
+a full volume recovers after `kubectl delete pod <release>-curie-rustfs-0 -n
+<namespace>`, which recreates the pod and runs the guard.
 
 ### Key-free object store auth
 
@@ -960,8 +1067,8 @@ The bundle fetch uses path style addressing, so it appends
 `agentSandbox.runner.bundleFetch.bucket` to this endpoint. For another AWS
 region, change the region in `rustfs.host` and set `rustfs.region` to control
 the SigV4 signing region used by the bundle fetch init container and by
-Langfuse's event/media uploads. This setting does not configure the API or
-worker S3 clients.
+Langfuse's event/media uploads. This setting also sets `S3_REGION` for the API
+and worker S3 clients.
 
 **Runner egress is a separate required list.** Rail 1 default-denies the
 sandbox, and the in-chart `runner-allow-rustfs` policy is a pod selector on
@@ -1046,17 +1153,18 @@ All three are re-runnable via that same `helm test` command.
 **(a) CPU-AVX / ClickHouse-pin check** (`preflights.avxCheck`). A pre-install /
 pre-upgrade hook Job.
 
-- ClickHouse >= 25.x is compiled for AVX and SIGILLs with exit 132 on
-  SSE4.2-only CPUs -- a crash-looping pod is a confusing way to learn that.
-- Chart defaults require AVX: `clickhouse.image.tag` is `25.12.11.4` because
+- The x86 build of ClickHouse >= 25.x requires AVX and SIGILLs with exit 132 on
+  SSE4.2-only x86 CPUs. The native ARM64 build does not require x86 AVX.
+- Chart defaults require AVX on x86: `clickhouse.image.tag` is `25.12.11.4` because
   `langfuse.image.tag` 3.225.5's migration set from 39 onward cannot apply on
   24.8, and the 25.12 line is not in `clickhouse.sse42SafeTags`.
-- The Job reads the node's `/proc/cpuinfo`; if the node lacks AVX it FAILS
+- The default-on Job first detects the architecture. Native ARM64 passes;
+  unsupported architectures fail. On x86, it reads `/proc/cpuinfo`; if the node lacks AVX it FAILS
   the install unless the operator pins a tag in `clickhouse.sse42SafeTags`
   (`24.8`, `24.3`, `23.8`). That override cannot apply the current Langfuse
   migration set. Skipped when `clickhouse.deploy: false`.
-- Test knob `preflights.avxCheck.forceNoAvx: true` exercises the AVX-required
-  failure branch on an AVX-capable node when the default tag is set.
+- Test knob `preflights.avxCheck.forceNoAvx: true` simulates an x86 node without
+  AVX on either supported architecture, exercising the failure branch for the default tag.
 - Read the verdict: `kubectl logs -n <ns> job/<release>-preflight-avx`.
 
 **(b) NetworkPolicy-enforcement probe** (`preflights.networkPolicyProbe`). A
@@ -1072,21 +1180,43 @@ egress is actually blocked, and `enforcement=false` (fails loudly) otherwise.
 post-upgrade hook Job, also re-runnable via `helm test`. Default `enabled:
 true`, gated also on `agentSandbox.controller.deploy` (also default true).
 
-- The vendored agent-sandbox controller runs a cluster-scope NetworkPolicy
-  informer. If its RBAC cannot satisfy that cluster LIST, the manager
-  crash-loops and no SandboxClaim ever binds. The Deployment has no
-  readiness probe, so `rollout status` can pass while the manager still
-  blocks on cache sync. The load-bearing signal is the "Starting workers"
-  log line.
-- The Job fails the Helm operation unless the controller becomes Available
-  and logs "Starting workers" within
-  `preflights.controllerReady.timeoutSeconds` (default 180).
-- An upgrade over a crash-looping controller may need a manual pod delete
-  plus `helm test`, because the hook waits for a healthy controller that
-  never arrives.
-- Skipped when `agentSandbox.controller.deploy: false` (BYO controller) or
-  `preflights.controllerReady.enabled: false`.
-- Read the verdict: `kubectl logs -n <ns> job/<release>-preflight-controller`.
+1. The vendored agent-sandbox controller runs a cluster-scope NetworkPolicy
+   informer. If its RBAC cannot satisfy that cluster LIST, the manager
+   crash-loops and no SandboxClaim ever binds. The Deployment has no
+   readiness probe, so `rollout status` can pass while the manager still
+   blocks on cache sync.
+2. Each poll first fails on a forbidden-NetworkPolicy line in the current
+   controller log.
+3. It then passes on a stable serving leader (issue #4197): the controller
+   Deployment has finished rolling out its current generation, the
+   leader-election Lease names a current Running, Ready, non-terminating
+   controller pod, the same holder has led for at least
+   `preflights.controllerReady.stableLeaderSeconds` (default 180, minimum 150),
+   and it renews the Lease while the hook watches. A manager whose informer
+   caches cannot sync exits after the 120s controller-runtime cache-sync
+   timeout and loses the lease, so a longer continuous term proves sync. This
+   is what lets an upgrade that does not restart the controller pass, even
+   when its startup log has rotated away, its metrics port is unreachable
+   from the control plane, or it restarted long before the upgrade. Both lease
+   timestamps come from the controller, so the hook node's clock does not
+   matter.
+4. Otherwise it checks pod restarts and previous logs. A lost leader-election
+   lease or a pod restart fails the gate with its existing cause-specific
+   diagnostic. A controller this upgrade restarted holds a fresh lease, so it
+   is judged here.
+5. The Job then passes when it observes "Starting workers" or a positive sum of
+   `controller_runtime_reconcile_total` samples with `result="success"` from
+   the current Running controller pod. It reads metrics on port 8080 through
+   the Kubernetes pod proxy. Successful reconciles require synced informer
+   caches, and their counter persists when the startup log rotates away.
+   Failed metrics requests and zero successful reconciles keep polling within
+   `preflights.controllerReady.timeoutSeconds` (default 180).
+6. An upgrade over a crash-looping controller may need a manual pod delete
+   plus `helm test`, because the hook waits for a healthy controller that
+   never arrives.
+7. Skipped when `agentSandbox.controller.deploy: false` (BYO controller) or
+   `preflights.controllerReady.enabled: false`.
+8. Read the verdict: `kubectl logs -n <ns> job/<release>-preflight-controller`.
 
 ## Single-node footprint (measured on a disposable single-node k3s cluster, 4 GB / 4 core)
 
@@ -1167,9 +1297,90 @@ explicit `sizeLimit`:
 |---|---|---|
 | `bundles` (fetched archive + extracted plugin dir) | `agentSandbox.runner.bundleFetch.sizeLimit` | `2Gi` |
 | `aws-config` (init only AWS CLI path addressing config) | `agentSandbox.runner.bundleFetch.awsConfigSizeLimit` | `16Mi` |
-| One per `agentSandbox.runner.hardening.writablePaths` entry (`/tmp`, `/home/runner` by default) | `agentSandbox.runner.hardening.writablePathSizeLimit` | `512Mi` |
-| `workspace` (the managed repository checkout at `/workspace`) | `agentSandbox.runner.workspace.sizeLimit`, or per agent `agentSandbox.workspaceSizeLimits.<agent>` | `1Gi`; per agent: none, the agent inherits the default |
+| One per `agentSandbox.runner.hardening.writablePaths` entry (`/tmp`, `/home/runner` by default) | `agentSandbox.resourceProfiles.<profile>.<field>`, or the generic `agentSandbox.runner.hardening.writablePathSizeLimit` (sets every writable path) | `standard`: `512Mi` each; `factory`: home `15Gi`, tmp `4Gi`, other paths `512Mi` |
+| `workspace` (the managed repository checkout at `/workspace`) | per agent `agentSandbox.workspaceSizeLimits.<agent>`, the generic `agentSandbox.runner.workspace.sizeLimit`, or the profile's workspace field | `standard`: `1Gi`; `factory`: `15Gi`; per agent: none |
 | `attachments` (one turn's inbound attachments) | `agentSandbox.runner.attachments.sizeLimit` | `512Mi` |
+
+### Resource profiles
+
+`agentSandbox.resourceProfiles` defines two named envelopes. The generic keys
+`agentSandbox.runner.resources`, `agentSandbox.runner.workspace.sizeLimit` and
+`agentSandbox.runner.hardening.writablePathSizeLimit` are empty by default, so
+the selected profile supplies the values.
+
+| Field | `standard` | `factory` |
+|---|---|---|
+| Memory request / limit | `192Mi` / `768Mi` | `8Gi` / `8Gi` |
+| CPU request / limit | `50m` / `1` | `50m` / `2` |
+| Ephemeral storage request / limit | `512Mi` / `4Gi` | `10Gi` / `20Gi` |
+| Workspace volume | `1Gi` | `15Gi` |
+| Home volume | `512Mi` | `15Gi` |
+| Tmp volume | `512Mi` | `4Gi` |
+| Other writable paths | `512Mi` | `512Mi` |
+
+An agent with `factory.sandboxEgress.<agent>: true` while `factory.enabled` is
+true uses `factory`. The generic template and every other agent use `standard`.
+`agentSandbox.agentResourceProfiles.<agent>: standard|factory` overrides that
+choice, either to opt a factory agent back to the lightweight envelope or to opt
+another agent in. The dark-factory example values select `factory` for
+`dark-factory` explicitly.
+
+Precedence, highest first:
+
+1. `agentSandbox.workspaceSizeLimits.<agent>`, which sets that agent's workspace
+   only.
+2. An explicitly set generic key. For `agentSandbox.runner.resources` this works
+   per resource pair: setting either the request or the limit of cpu, memory or
+   ephemeral-storage takes that resource's pair from the generic side, with the
+   unset side filled from `standard`. `agentSandbox.runner.workspace.sizeLimit`
+   sets the workspace. `agentSandbox.runner.hardening.writablePathSizeLimit`
+   sets every writable path.
+3. The selected profile's field, which you can change with
+   `agentSandbox.resourceProfiles.<profile>.<field>`.
+
+The worker's per-agent API override, `curie cluster overrides <agent>
+--runner-resources`, still applies on top of the rendered envelope at claim time.
+
+Read the factory envelope as five separate bounds: RAM (the 8Gi memory limit),
+the workspace volume, the home volume, the tmp volume, and aggregate ephemeral
+disk (the 20Gi ephemeral-storage limit). The volume ceilings are independent
+upper bounds, not reservations. Their sum, 15 + 15 + 4 = 34Gi, can exceed the
+shared 20Gi ephemeral-storage limit, which is an additional constraint on their
+combined use. The 10Gi ephemeral-storage request is what the scheduler reserves.
+A pod is evicted when any single volume passes its own ceiling or when the total
+passes 20Gi, and the eviction message names the volume.
+
+Capacity consequences of the factory profile:
+
+1. The 8Gi memory request means a factory sandbox needs a node with 8Gi of
+   unrequested allocatable memory.
+2. The default `resourceQuota.hard.requestsMemory` of `8Gi` admits exactly one
+   factory sandbox at a time. Raise `resourceQuota.hard.*` for concurrency, or
+   opt the agent to `standard` with `agentSandbox.agentResourceProfiles` on a
+   small trial cluster.
+3. Existing sandbox pods keep the volume limits and resources they were created
+   with. Kubernetes cannot resize an `emptyDir` `sizeLimit` in place, so new
+   limits apply to sandboxes created after the upgrade.
+4. `helm upgrade --reuse-values` from a release made by an older chart carries
+   that chart's computed defaults forward as values, so the factory agent keeps
+   the old envelope on that path. `curie cluster upgrade` (or
+   `--reset-then-reuse-values`) picks up the profile, and explicit operator
+   values survive `curie cluster upgrade`.
+
+`helm install` prints every effective envelope together in the NOTES under
+"Sandbox resource envelopes".
+
+The profiles also carry one install-wide field, `apiMemoryLimit`: the API
+container's memory limit, which the schema-migrate Job shares. It is `512Mi` in
+`standard` and `2Gi` in `factory`, and the install uses `factory` when
+`factory.enabled` is true, else `standard`. It applies only while
+`api.resources.limits.memory` is unset, which is the chart default. Any explicit
+`api.resources.limits.memory`, including `512Mi`, wins for every install, and a
+release made by an older chart keeps the `512Mi` it stored when upgraded with
+`--reuse-values`. The API memory request (`256Mi`) and CPU (`100m` / `1`) do
+not change with the profile. The factory `2Gi` is headroom, not a measured
+need: after #4895 the factory publication listing over 231 pages peaked near
+170 MB under both a `512Mi` and a `2Gi` limit.
 
 `agentSandbox.workspaceSizeLimits` maps an agent name to that agent's workspace
 ceiling, for example `dark-factory: 24Gi`, so one build-heavy agent can compile
@@ -1205,12 +1416,152 @@ sandbox and renders whenever an in-chart store is deployed.
 
 | Rail | What ships | Values |
 |---|---|---|
-| 1. Default-deny egress + metadata block | NetworkPolicies selecting `component: runner-sandbox`: default-deny egress, allow-DNS, an operator-declared egress allowlist, and (optional) ingress lock. Arbitrary internet AND `169.254.169.254` are denied by construction. | `security.networkPolicy.*` |
-| 2. Per agent secret isolation | Per agent SandboxTemplates inject connector credentials through `secretKeyRef` environment entries. The release runner ServiceAccount has no bound Role or mounted Kubernetes API token by default. The control plane does not create per agent Roles. | `agentSandbox.connectorSecrets`, `agentSandbox.runner.serviceAccount.*` |
+| 1. Default-deny egress + metadata block | NetworkPolicies selecting `component: runner-sandbox`: default-deny egress, allow-DNS, an operator-declared egress allowlist, and (optional) ingress lock that admits only this release's worker pods to the runner port. Arbitrary internet, `169.254.169.254`, and private ranges reached through a broad route are denied by construction. | `security.networkPolicy.*` |
+| 2. Per agent secret isolation | Per agent SandboxTemplates inject connector credentials through `secretKeyRef` environment entries, and each claim's scoped tokens ride a per-claim Secret instead of the SandboxClaim. The release runner ServiceAccount has no bound Role, and no runner pod mounts a Kubernetes API token (`automountToken` must stay `false`; the render fails otherwise). The control plane does not create per agent Roles. | `agentSandbox.connectorSecrets`, `agentSandbox.runner.serviceAccount.*` |
 | 3. Non-root / read-only rootfs | Pod + container securityContext on the runner: `runAsNonRoot`, uid 1000, `readOnlyRootFilesystem`, drop ALL caps, no privilege escalation, RuntimeDefault seccomp, plus writable emptyDir scratch (`/tmp`, `/home/runner`) and `HOME`. | `agentSandbox.runner.hardening.*` |
 | 4. gVisor kernel isolation | `runtimeClassName` on runner pods, driven by the `security.gvisor.mode` tri-state (`auto`/`require`/`off`) + a preflight that fails the install if the RuntimeClass is missing or downgraded, firing in `require` (always) and in `auto` for real-model runs + an optional RuntimeClass object. | `security.gvisor.*`, `security.gvisorPreflight.*` |
 | 5. Data-tier ingress isolation | Per deployed store (Postgres, RustFS, ClickHouse, Valkey): a default-deny-ingress NetworkPolicy plus a scoped-allow that permits ingress on the store's ports ONLY from this release's app pods (`name`+`instance` label). Blocks any co-tenant pod from opening `Postgres:5432` etc. | `security.dataTierNetworkPolicy.*` |
 | 6. Tenant capacity ceiling | A `ResourceQuota` bounding aggregate cpu/memory and sandbox pod count (scoped to the sandbox PriorityClass; a scoped quota cannot constrain ephemeral-storage, so per-pod disk is bounded by the `LimitRange`/pod limits times the pod-count cap), plus a `LimitRange` supplying per-container defaults so a sandbox pod created outside this chart's own templates still inherits a ceiling. Renders whenever `agentSandbox.deploy: true`. | `resourceQuota.*`, `limitRange.*` |
+
+**Runner template admission and per-claim tokens (#3842).** A `SandboxClaim`
+env entry is plain text in etcd, so the worker keeps the scoped tokens (runner,
+history, memory, state, progress, issue-read and connector-caller) off the claim.
+For a claim that carries them it writes a per-claim Secret, a per-claim copy of
+the pool's SandboxTemplate whose runner container reads each token by
+`secretKeyRef`, and a `replicas: 0` warm pool. The Secret and pool are owned by
+the template and the template by the claim, so Kubernetes garbage collection
+removes all three when the claim goes. The worker's reaper also deletes
+per-claim templates whose claim no longer exists. The worker's Role grants
+Secret `create` only (no read, list, or watch), and `list` and `delete` on
+SandboxTemplates. Three ValidatingAdmissionPolicies bound to the worker
+ServiceAccount enforce the shape (Kubernetes 1.30 or newer, rendered with
+`agentSandbox.deploy`):
+
+- `<fullname>-runner-resources` admits a SandboxTemplate only with no `hostPath`
+  volume, no host network, PID or IPC, no mounted ServiceAccount token (pod
+  `automountServiceAccountToken: false`, no projected token), the chart runner
+  ServiceAccount, no privileged container, added capability or host port, and
+  only images the chart renders (the runner image, each
+  `agentSandbox.runnerImages` entry, repository runner images from
+  `factory.bindings[].repos[].runner.image`, the bundle-fetch images when enabled) plus
+  `agentSandbox.runner.admission.extraImages`.
+- `<fullname>-runner-claim-cleanup` lets the worker delete only SandboxTemplates
+  labelled `curietech.ai/sandbox-claim`, never the chart's.
+- `<fullname>-worker-secrets` lets the worker create only Opaque `*-tokens`
+  Secrets labelled `curietech.ai/sandbox-claim` in the release namespace.
+
+The chart also refuses a runner `eks.amazonaws.com/role-arn` that equals the api,
+worker, or langfuse ServiceAccount's. It cannot see the role's IAM policy or an
+EKS Pod Identity association, so keep the runner role read-only on the bundle
+bucket. The Docker substrate is unchanged: it has no Secret and still passes
+tokens in the container env.
+
+**Factory repository runner resources (ADR 0216).** Repository `runner`
+declarations under `factory.bindings[].repos[]` add one SandboxTemplate and
+SandboxWarmPool per factory agent and distinct image index digest. Repositories
+sharing a digest share the pair. The runner, workspace-init and attachments-init
+containers use the repository image while preserving the agent's connector
+Secret references, label, workspace limit, placement and security settings.
+The chart prewarms these images and includes them in runner admission.
+
+When repository runners are configured, the current repository-keyed map requires
+exactly one true agent in `factory.sandboxEgress`, `agentSandbox.deploy: true`,
+and the chart-managed `worker.warmPool`. Template names are
+`<fullname>-agent-<agent>-img-<first12-indexhex>-runner`, with `-pool` appended
+for pools. Pool names must fit 63 characters. Conflicting duplicate repository
+declarations, conflicting image identities and digest-prefix or ordinary-agent
+name collisions fail rendering.
+
+The chart produces `CURIE_REPO_RUNNER_POOLS` only when repository runners exist.
+It maps repository paths to pool names, index and platform digests, base digest,
+Docker setting and egress. Worker `extraEnv` cannot set this reserved name.
+Worker repository routing remains deferred.
+
+**Factory Docker daemons (ADR 0217).** When a repository runner sets
+`docker.enabled: true` and `worker.deploy` is true,
+`templates/docker-daemon.yaml` renders the fixed boundary for per-run Docker
+daemons and includes a `daemon` object in each Docker repository's
+`CURIE_REPO_RUNNER_POOLS` entry. It carries the resolved namespace, pinned image,
+integer port, release selector labels and individual Pod settings. Resource
+requests default to `500m` CPU, `1Gi` memory and `10Gi` ephemeral storage; limits
+default to `2`, `4Gi` and `20Gi`. `factory.docker.storageSizeLimit` defaults to
+`20Gi`, `maxClaimLifetimeSeconds` to `86400` and `pingTimeoutSeconds` to `2`.
+Missing new leaves on retained releases receive these defaults. Namespace quota
+and LimitRange remain separate. The worker
+(`apps/worker/src/curie_worker/sandbox/tool_daemon.py`) creates each Docker
+claim's daemon Pod, headless Service, ingress NetworkPolicy and per-claim mTLS
+Secret before the claim, reuses a retained route only after an authenticated
+ping, and deletes those objects on every retirement path, with an orphan sweep
+for objects older than the claim timeout. With `factory.docker.createNamespace`
+false, removing the last Docker repository also removes the worker's Role here,
+so daemon objects alive at that upgrade are left for the operator: each Pod
+stops at its `activeDeadlineSeconds`, while its Service, Secret and
+NetworkPolicy remain until deleted by hand.
+
+1. A daemon namespace, `factory.docker.namespace` or
+   `<release-namespace>-<fullname>-docker` by default. The chart creates it
+   with `pod-security.kubernetes.io/enforce: privileged` unless
+   `factory.docker.createNamespace` is false, in which case the operator
+   creates it with that label.
+2. A Role and RoleBinding there for the worker ServiceAccount: create, get,
+   list and delete on pods, services and networkpolicies, get on pods/log,
+   create and get on pods/portforward, create and delete on secrets.
+3. A ResourceQuota from `factory.docker.quota.hard` and a Container LimitRange
+   from `factory.docker.limitRange` (`max`, `min`, `default`,
+   `defaultRequest`). All are required.
+4. NetworkPolicies in the daemon namespace: default-deny ingress and egress,
+   DNS to `security.networkPolicy.dnsNamespace`, and one egress policy per
+   class. Pods labelled `curietech.ai/docker-egress: public` reach
+   `0.0.0.0/0` and `::/0` on TCP 80 and 443 with the metadata, private and
+   `security.networkPolicy.clusterCidrs` ranges excepted. A repository with
+   `docker.egressAllowlist` gets the class `repo-<first 16 hex of
+   sha256(path)>` and only its allowlist, validated like the other one-peer
+   egress lists.
+5. With Rail 1 on, `<fullname>-runner-allow-docker-daemon` lets the factory
+   agent's runner sandboxes (`curietech.ai/agent` set to the one factory agent
+   repository runners belong to) dial daemon pods on the full TCP range 1
+   through 65535 (`port: 1`, `endPort: 65535`). Other agents' sandboxes get no
+   such allow. Daemon ingress stays default-deny until the worker's per-run
+   policy admits the sandbox with the same `curietech.ai/sandbox-claim`
+   value, so a sandbox reaches only its own daemon. The runner uses
+   `DOCKER_PUBLISHED_HOST` to reach ports published by containers on its
+   daemon. The Docker API remains on `factory.docker.port` (2376) with
+   unchanged per-claim mTLS.
+6. Three ValidatingAdmissionPolicies with Deny bindings, which need
+   Kubernetes 1.30 or newer:
+   `<fullname>-docker-daemon-pods` admits only a worker-created pod with one
+   `dockerd` container on `factory.docker.daemonImage` (digest required), the
+   exact ordered arguments `dockerd`, `--userns-remap=default`,
+   `--authorization-plugin=curie-authz`,
+   `--host=tcp://0.0.0.0:<factory.docker.port>`, `--tlsverify`,
+   `--tlscacert=/certs/ca.pem`, `--tlscert=/certs/server-cert.pem`,
+   `--tlskey=/certs/server-key.pem`, the
+   claim, managed-by, selector and egress-class labels, no added
+   capabilities on dockerd, no init or ephemeral containers (it also matches
+   `pods/ephemeralcontainers`), no lifecycle hooks or exec probes, mounts only
+   at `/var/lib/docker` and `/certs` with no `volumeDevices`, no `env` or
+   `envFrom` (a caller environment could point the entrypoint's PATH into a
+   mounted Secret), no ServiceAccount token, only `emptyDir` volumes with a
+   positive `sizeLimit` or `secret` volumes, no host namespaces or ports,
+   positive cpu, memory and ephemeral-storage requests and limits, and
+   `activeDeadlineSeconds`.
+   `<fullname>-docker-daemon-objects` holds the worker's Services to
+   ClusterIP, its Secrets to Opaque or TLS, and its NetworkPolicies to
+   ingress-only policies selecting their own claim. Every peer must be in
+   the release namespace, with `app.kubernetes.io/component: runner-sandbox`,
+   this release's `app.kubernetes.io/instance`, and
+   `curietech.ai/sandbox-claim` exactly equal to the policy's metadata claim
+   label. Each ingress rule requires nonempty peer and port lists, no
+   `ipBlock`, and TCP `port: 1` with `endPort: 65535`.
+   `<fullname>-docker-daemon-cleanup` lets the worker delete only
+   NetworkPolicies labelled `curietech.ai/sandbox-claim`, never the chart's.
+
+**Upgrade note.** Existing claims retain their old ingress policies until
+reclaimed. New admission refuses older workers' ingress policies until the
+worker rollout completes.
+
+Opting a repository into Docker widens that repository's egress to what its
+class allows. Runner admission is unchanged.
 
 **Credential access.** A sandbox can inspect credentials injected into its own
 process, including any explicitly configured shared model credential. Operators
@@ -1261,10 +1612,29 @@ rule at index `[0]` and without weakening it; the raw helm equivalent is `--set
 because the model entry is `[0]`; use index `[0]` instead when installing sealed
 with no model credential, so the array has no gap). This is the platform enablement the weather
 example (#36) depends on -- its skill answers via a live web search, which the
-sealed default denies. `--allow-web-egress 0.0.0.0/0` opens the open internet
-(still minus the `169.254.169.254` metadata endpoint the chart carves out of
-`0.0.0.0/0`); narrow the CIDR to a specific provider for a tighter posture. Omit
-the flag and the install stays fully sealed.
+sealed default denies. `--allow-web-egress 0.0.0.0/0` opens the public internet
+(minus the `169.254.169.254` metadata endpoint and the private ranges below, all
+carved out of the broad route); narrow the CIDR to a specific provider for a
+tighter posture. Omit the flag and the install stays fully sealed.
+
+Every egress entry also excepts each private range it strictly contains:
+`10.0.0.0/8`, `100.64.0.0/10`, `169.254.0.0/16`, `172.16.0.0/12`,
+`192.168.0.0/16`, `fc00::/7`, `fe80::/10`, and each
+`security.networkPolicy.clusterCidrs` entry (pod or Service CIDRs outside those
+ranges). A runner cannot reach a pod, Service, or VPC host through a broad route.
+To re-allow a private peer, add a narrow `allowedEgress` entry for it, such as
+`10.20.0.5/32`; an entry equal to or inside a private range gets no except.
+Upgrade note: an install that reached private endpoints through `0.0.0.0/0`
+loses that access and needs those narrow entries.
+
+**Pod Security Admission.** `curie cluster up` labels a namespace it creates with
+`pod-security.kubernetes.io/enforce=baseline` and `warn` and `audit` at
+`restricted`. Labels are not applied to a namespace that already exists, or one
+created with raw `helm --create-namespace`. Label it yourself:
+
+```bash
+kubectl label namespace <namespace> pod-security.kubernetes.io/enforce=baseline pod-security.kubernetes.io/warn=restricted pod-security.kubernetes.io/audit=restricted --overwrite
+```
 
 **Data-tier ingress isolation.** The backing stores hold every credential and all
 trace/app data, so `security.dataTierNetworkPolicy.enabled` (default `true`)
@@ -1276,6 +1646,17 @@ and exfiltrate. BYO stores (`<store>.deploy: false`) are external and get no
 policy. Claim 5 of the security probe verifies it empirically (an app-labeled pod
 reaches each store while a non-app-labeled pod is blocked), which also catches a
 non-enforcing CNI.
+
+The Valkey allow-ingress policy also admits MCP connector pods so connector
+proxies can spend one-shot grants. Set
+`security.dataTierNetworkPolicy.allowMcpConnectorValkeyIngress: false` when
+those proxies do not need this release's in-chart Valkey. The default is
+`true`, preserving the current policy for fresh installs and older release
+values reused during upgrade. This removes only the MCP connector peer and its
+Valkey port rule; the release app peer, Valkey default-deny policy, and all
+other NetworkPolicies remain. The value must be a boolean. It does not replace
+caller-proxy preflight or the chart's NetworkPolicy verification. See
+[issue #4318](https://github.com/curie-eng/curie/issues/4318).
 
 **gVisor needs runsc on the node**, and `security.gvisor.mode` is a tri-state
 (default `auto`):
@@ -1416,6 +1797,25 @@ CURIE_E2E_IDENTITY_CONTEXT=<test cluster context> \
 ```
 
 It creates only objects named from its run id and deletes them on exit.
+
+## End to end connector on the factory cluster (ADR 0176)
+
+`e2eConnector.enabled` defaults to false. A factory bundle may declare a hosted connector named `e2e` (see `apps/e2e-connector/README.md`). While the flag is false the API renders no end to end connector and deploy is refused with `e2e_connector_not_configured`.
+
+Turn it on only when a separate test cluster already has the identity above. Set `serviceAccount`, `serviceAccountNamespace`, and `workerClusterRole` to that identity, and set `ownerLabel.value` to the same value the test cluster admission policy expects. The connector process uses the factory worker image. `E2E_CLUSTER_KUBECONFIG`, plus the optional `E2E_REGISTRY_PUSH_CONFIG` and `E2E_BUILD_CACHE_CONFIG` (both docker `config.json` files), are supplied with `curie secrets`, mounted on the connector, and omitted from the sandbox template and from the per agent sandbox Secret.
+
+`e2eConnector.enabled` also turns on the worker's end to end namespace reaper (#3245). Every `e2eConnector.reaperIntervalSeconds` (default 60, minimum 10) it deletes each namespace in the `namespacePrefix` and `ownerLabel` scope whose TTL has passed or whose run has finished, whether or not the agent called `env_destroy`. It reads `E2E_CLUSTER_KUBECONFIG` from each agent's connector Secret through the connector reconciler's Secret list grant, so `e2eConnector.enabled` also requires `worker.connectorReconciler.enabled`; the chart refuses to render without it. A worker started without that grant or without the internal worker token still runs the reaper, and every pass fails, so the stalled alert fires. The worker exports three gauges, `curie_e2e_reaper_last_success_seconds`, `curie_e2e_namespaces_expired`, and `curie_e2e_namespaces_overdue`, and the SRE example pages on `CurieE2EReaperStalled`, `CurieE2EReaperSignalAbsent`, and `CurieE2EExpiredNamespacesAccumulating`. See `apps/e2e-connector/README.md` for what each one means and how a refused child delete is handled.
+
+The `image_build` tool (#3246) builds a commit that is fetchable by SHA from an allowlisted https host, with kaniko, in a Job in the run's own namespace, and pushes it with crane. These values configure it:
+
+1. `e2eConnector.registry` is the registry prefix, such as `registry.test:5000/e2e`; a trailing `/` is ignored by both the connector and the worker. Images land at `<registry>/<namespace>/<name>`. Empty makes `image_build` refuse with `e2e_registry_not_configured`. The push credential `E2E_REGISTRY_PUSH_CONFIG` exists only in the connector and in a per build Secret on the test cluster, never in the sandbox or in the container that runs Dockerfile `RUN` steps. It must hold basic `user:password` credentials; an `identitytoken` or `registrytoken` config is refused with `e2e_connector_misconfigured`.
+2. `e2eConnector.buildCacheRepo` defaults to `null`, which renders `<registry>/cache`. An explicit empty string disables the cache. The cache is used only when this value is non empty and `E2E_BUILD_CACHE_CONFIG` is stored, so an authenticated registry needs that config to cache at all.
+3. **Cache credential warning.** `E2E_BUILD_CACHE_CONFIG` is mounted in the build container, so Dockerfile `RUN` steps can read it. Scope it to the cache repository only and never give it push access to run repositories. The shared cache can also be poisoned between runs; that affects only test images, which never ship.
+4. `e2eConnector.registryInsecure` allows plain http to the registry and cache. `e2eConnector.registryTokenHosts` lists hosts besides the registry whose https token realm may receive the push credential; an entry without a port means 443.
+5. `e2eConnector.builderImage`, `gitImage` and `pushImage` override the connector's pinned defaults when empty strings are left alone. `e2eConnector.buildTimeoutSeconds` (default 1200, 60 to 3600) bounds one build. `e2eConnector.sourceHosts` (default `github.com`) lists the https hosts a build may fetch from.
+6. The worker receives `CURIE_E2E_REGISTRY`, `CURIE_E2E_REGISTRY_INSECURE` and `CURIE_E2E_REGISTRY_TOKEN_HOSTS` so teardown retention can list and delete the images a run pushed before it deletes the namespace.
+
+**Registry delete and garbage collection requirement.** Teardown deletes every image digest a run pushed, so the registry must allow manifest deletes (a 405 fails the namespace and keeps it). Deleting a manifest does not free blobs. The registry needs its own garbage collection, and `registry:2` requires an operator to run it. The same applies to the cache repository, which this chart never garbage collects. The build pod runs with baseline Pod Security (kaniko is root but not privileged), so an installation with `podSecurity: restricted` refuses `image_build`.
 
 ## Uninstalling and CRD lifecycle
 
@@ -1726,6 +2126,46 @@ the changed files with the repository's Actions secrets before a person
 reviews the pull request. Keep those secrets in GitHub environments that
 require reviewers.
 
+The publication Job only pushes, using the origin, header form and CA path in
+the API's push credential. The API opens or updates the pull request (ADR 0197).
+
+### Code host CA bundle
+
+A self-managed code host whose certificate no public root covers needs one PEM
+bundle, supplied as a ConfigMap you create:
+
+```yaml
+codeHostTrust:
+  caBundle:
+    configMapRef:
+      name: corp-code-host-ca
+      key: ca.crt
+```
+
+The chart mounts that key read-only at `/etc/curie/code-host-trust/ca.crt` in
+the api, the worker and every sandbox runner. The api adds it to the public
+roots for its code host HTTP clients. git (`GIT_SSL_CAINFO`, `http.sslCAInfo`)
+and the sandbox's `SSL_CERT_FILE` and `REQUESTS_CA_BUNDLE` use it as their
+whole store, so include the public roots if the sandbox reaches public HTTPS
+hosts through them. Create the ConfigMap in the release namespace only. A
+publication Job runs in the publication namespace, so the worker copies the PEM
+it has mounted (`CURIE_CODE_HOST_CA_BUNDLE`) into that Job's own ConfigMap and
+mounts it read-only at the path the push credential names.
+
+The worker also refuses new third-party dependency names by default, including
+new transitive lockfile entries. It compares `pyproject.toml`, `uv.lock`,
+`Cargo.toml`, `Cargo.lock`, `package.json`, `pnpm-lock.yaml` and
+`package-lock.json` by basename at any repository depth after applying the patch
+to the base tree. Version changes to existing names are allowed. Path, workspace,
+editable, virtual and directory sources are ignored; Git sources count as
+third-party. A new file has an empty dependency set before the patch, and an
+in-scope file that cannot be parsed is refused. Set
+`worker.publication.allowDependencyAdditions: true` to allow additions across
+every publication in the install, including factory work and human-approved
+requests. The default is `false`, rendered as
+`CURIE_PUBLICATION_ALLOW_DEPENDENCY_ADDITIONS` on the worker. This opt-in keeps
+the `.github/` and `worker.publication.protectedPaths` refusals.
+
 One allowed root `https://github.com/owner/repository` URL in the initial
 message establishes the thread's selection and causes the worker to acquire its
 managed workspace at claim time. An initial message without a repository URL
@@ -1895,12 +2335,12 @@ dispatcher:
         botTokenExistingSecret: slack-sales      # key defaults to slackBotToken
 ```
 
-With no entries the chart renders exactly the objects it rendered before the
-key existed. With entries, the dispatcher, worker and API each receive
-`CURIE_SLACK_IDENTITIES`, which names every identity and the env vars holding
-its tokens, from one helper (`templates/_slack-identities.tpl`). Entry `n`'s bot
-token is `CURIE_SLACK_BOT_TOKEN__<n>` in all three, and the dispatcher also
-gets `CURIE_SLACK_APP_TOKEN__<n>` and, when set, `CURIE_SLACK_SIGNING_SECRET__<n>`.
+With entries, the dispatcher, gateway, worker and API each receive
+`CURIE_SLACK_IDENTITIES` from `templates/_slack-identities.tpl`. This declares
+identity names and token environment names; the API and worker receive no token
+values. Entry `n`'s bot token is `CURIE_SLACK_BOT_TOKEN__<n>` in the dispatcher
+and gateway. Only the dispatcher gets `CURIE_SLACK_APP_TOKEN__<n>` and, when set,
+`CURIE_SLACK_SIGNING_SECRET__<n>`.
 `default` always keeps the `SLACK_*` names. The render refuses a duplicate
 name, a name that is not lowercase letters and digits in runs joined by single
 hyphens (at most 40 characters, so every name is one a binding's `adapter` can
@@ -1908,6 +2348,63 @@ carry), a name of `curie-cluster-message` (reserved for the platform's
 built-in cluster-message reply adapter), a missing token reference, `default`
 configured twice or not at all, and an `extraEnv` entry naming any of these
 variables. `charts/curie/ci/slack-identities-assertions.sh` pins all of it.
+
+### Channel gateway upgrade
+
+An existing Slack install upgrades with the same values file and Secret objects.
+`channelGateway.deploy: null` automatically deploys the gateway when Slack is
+configured and `channelGateway.url` is empty. Setting `deploy: false` explicitly
+requires an external URL; the render refuses otherwise and names both fixes.
+Installs without Slack do not deploy a gateway automatically. The gateway adds
+one Deployment and a 1Gi replay PVC by default; its storage class follows
+`global.storageClass` unless `channelGateway.replayStorageClass` is configured.
+
+The chart moves Slack bot-token references from the API and worker into the
+gateway, preserving their Secret names and keys. The dispatcher retains its
+intake credentials. The API and worker receive distinct caller credentials,
+generated and persisted in the chart Secret, and use verified internal TLS.
+No operator token changes are needed for a chart-managed install. Custom launchers
+must remove raw Slack tokens from API and worker environments because both
+applications now reject them. This is a runtime credential-custody change.
+
+With no `channelGateway.tlsSecret`, Helm creates
+`<fullname>-channel-gateway-tls` containing `ca.crt`, `tls.crt` and `tls.key`.
+The server certificate covers this release's service DNS names. Both it and the
+signing CA last ten years. Helm `lookup` preserves the complete
+Secret across upgrades. Use a Helm client with Kubernetes API access; offline
+renderers cannot persist generated certificates and must instead provide a
+managed `channelGateway.tlsSecret` containing the certificate and key, plus
+`ca.crt` for a private CA. Publicly trusted certificates may omit `ca.crt`; callers
+then use their system trust roots. API and worker
+mount only `ca.crt`; the gateway alone mounts the server key. The added CA is
+trusted by the API request and undo recovery clients, worker shared client,
+reply sink and file-download transports, scoped to the configured gateway origin.
+The protected worker receives its CA path from its launcher environment.
+
+Rotate before the server certificate expires. For operator-managed certificates,
+replace the named Secret's certificate and key, and CA when private.
+For chart-managed certificates, schedule a brief Slack delivery maintenance
+window, delete only this release's gateway TLS Secret, and run `helm upgrade`
+with the unchanged values file so Helm generates a new CA and certificate.
+TLS data checksums roll the gateway, API and worker together during the upgrade
+so all use the new certificate and trust bundle; then verify delivery.
+After changing an operator-managed Secret, run `helm upgrade` with API access
+to refresh those checksums. Rotation is explicit;
+ordinary upgrades never silently rotate the certificate. Do not delete the
+replay PVC during rotation.
+
+An external gateway uses `channelGateway.url`; configure separate
+`channelGateway.apiToken` and `channelGateway.workerToken`. For a private CA,
+`channelGateway.tlsSecret` supplies `ca.crt` to callers. For a chart-deployed
+gateway it also supplies `tls.crt` and `tls.key`. Explicit
+`channelGateway.allowInsecure: true` permits HTTP on a development network.
+A supplied TLS Secret always selects HTTPS. Its single replica and Recreate
+strategy keep the persistent SQLite replay ledger under one owner.
+
+Protected-worker provisioners must migrate `process.json` v1 once before
+starting the upgraded image; see the
+[one-shot process migration](../../packages/channel-gateway/README.md#protected-worker-process-files).
+The runtime continues rejecting v1; there is no dual-version startup path.
 
 A plain `curie cluster up` re-supplies a recorded list along with the
 `dispatcher.slack` token fields, so an operator does not need to pass it again
@@ -1920,13 +2417,12 @@ stores it on the binding, so a declared identity can be bound to any channel,
 including one another identity already answers in (ADR-0168 decision 3).
 
 Each identity's bot token is also the one its turns are answered with. The
-worker sets the assistant status, edits the reply, posts and settles approval
-cards and downloads attached files with the token of the identity a turn
-arrived on, and the API resolves an approval's Slack user-group approvers with
-it, so each Slack app needs its own `files:read` and `usergroups:read` scopes.
-A worker holding no token for the identity a turn names drops the turn before
-it runs, logs the identity, and leaves the placeholder as the dispatcher posted
-it: it never answers as another bot.
+worker delegates assistant status, replies, approval cards and attached-file
+fetches to that identity's gateway ports. The API asks the same identity's
+membership source for approval authorization. Each Slack app therefore needs
+its own `files:read` and `usergroups:read` scopes. An undeclared identity is
+refused before a turn runs; missing provider credentials refuse at the gateway.
+Neither application borrows another bot's identity.
 
 A second identity also puts a rate limit on fan-out between siblings (ADR-0168
 decision 6): 5 sibling-written turns per session key, and 5 conversations
@@ -2004,8 +2500,14 @@ one. Keep any agent-specific runner image on this release too.
 The first upgrade that gives the release a caller key rolls every hosted
 connector pod once, because its rendered Deployment gains the proxy. That is
 the `curie cluster up` upgrade of a release recording none. `curie cluster
-upgrade` generates no key, so a release it upgrades without one cannot deploy
-a hosted connector until a later `cluster up` or a key of your own. Upgrade note: a keep-alive Job that dialled the
+upgrade` generates no key and refuses an installed release unless its recorded
+values name a nonblank `connectorCaller.existingSecret` or supply both nonblank
+`connectorCaller.signingKey` and `connectorCaller.verifyKey`. The refusal names
+`connector_caller_pair_required` before drain, schema mutation or Helm apply,
+including dry run, same version and resume. Chart development defaults do not
+satisfy this recorded configuration requirement. Run the printed `curie cluster
+up` command without `--dev` to generate a missing pair; repair a partial pair
+by supplying both halves or a named Secret before retrying. Upgrade note: a keep-alive Job that dialled the
 connector Service now dials `<name>-direct`, keeping its port, because the
 connector Service lands on the proxy, which refuses a caller without a token.
 Its peer-ingress policy keeps naming the server's port.
@@ -2024,6 +2526,60 @@ still running, and that pod can take turns until it is replaced. Upgrading
 first with no key and generating one later does not remove this: the second
 upgrade rolls workers that do not yet hold the key in the same way.
 
+### HTTP identity operator files
+
+HTTP identity (ADR 0246,
+[criterion 20](../../docs/superpowers/specs/2026-10-26-http-invocation-execution-v1.md), section 20)
+is off by default and the default render is unchanged. Two values select it,
+each naming a Secret the operator creates; the chart never creates, reads or
+checksums either one.
+
+| Value | Secret key | Mounted into | Environment |
+| --- | --- | --- | --- |
+| `api.httpIdentity.existingSecret` | `api-runtime.json` | the `api` container only, at `/var/run/curie/http-identity` | `CURIE_HTTP_IDENTITY_DIR` |
+| `api.httpIdentity.providerCaBundle: true` (with the Secret above) | `provider-ca.pem` (optional) | the same `api` volume, beside `api-runtime.json` | `CURIE_HTTP_IDENTITY_DIR` |
+| `dispatcher.httpIdentity.existingSecret` | `receivers.json` | the `dispatcher` container only, at `/var/run/curie/http-receiver` | `CURIE_HTTP_RECEIVER_DIR` |
+
+Each file is mounted read-only with mode 0440 and the pod's `fsGroup` set to
+the image's group, and the process refuses a file that is group-writable or
+grants any permission to other users. Selecting the dispatcher without the API
+fails the render, because the API holds the receiver registrations it verifies.
+Both environment names are reserved even while unselected. The worker, runner,
+bundles and agent Secrets never receive either file; the worker uses its
+existing internal worker token and API URL for current-authority checks.
+
+`api-runtime.json` holds, as strict JSON with no unknown or missing members:
+`schema_version` 1; `providers`, each the tenant's complete HTTP authority
+configuration and its lookup bearer; `receivers`, each an exact receiver
+registration and that receiver's key; `context_keys`, each a core sealing key
+with its key ID and generation; and `signing_key`, the key ID and generation
+used to seal. `receivers.json` holds `schema_version` 1 and `receivers`, each a
+receiver scope, its bindings with their pinned channel credentials, and the same
+receiver key. Every key is an independently generated 32 bytes in unpadded
+base64url, never derived from or reused as another credential.
+
+`provider-ca.pem` is for a provider whose TLS certificate comes from a private
+CA, such as a cluster issuer. When it is mounted, its certificates are the only
+trust anchors for every provider lookup of that API: no system or environment
+CAs are mixed in, hostname verification stays on and TLS 1.2 is the minimum.
+Providers that need different anchors in one installation are not supported.
+The file holds one through 16 PEM `CERTIFICATE` blocks, each a CA certificate
+(basicConstraints CA true), separated only by newlines, at most 262,144 ASCII
+bytes. An empty, malformed or non-CA bundle stops the API. Leaving
+`providerCaBundle` false keeps the default verified trust store.
+
+All of these files are read once at startup. A missing, unsafe or invalid file stops
+the process with a fixed message naming only the failing stage, and a selected
+dispatcher identity that did not pass Slack preflight or whose `auth.test` does
+not match its registration stops the dispatcher rather than starting that
+identity on the legacy path. Changing a Secret takes effect only when the
+workload is rolled. No chart NetworkPolicy selects the API pods, so selecting
+HTTP identity needs no egress value: the API reaches an in-cluster provider
+Service or an external HTTPS host on 443 as it does today. `api.egress` is the
+runner's route to an external API and does not apply here; an egress control
+outside the chart must allow the lookup itself. Rendering these mounts is wiring; key custody, the effective
+mounts on a real cluster and activation remain separate qualification.
+
 ### Reserved environment variables
 
 Every workload accepting `extraEnv` uses the reserved names and replacement
@@ -2038,3 +2594,58 @@ The existing OTEL overrides and worker `CURIE_API_URL` / `CURIE_API_KEY`
 overrides remain supported: their helpers omit the chart entry, so each name
 appears once. Repeating any name within `extraEnv` itself is refused. Workloads
 without an `extraEnv` surface cannot append entries to their chart-owned env.
+
+### Opting into on-demand attachments
+
+The default `worker.attachments.enabled: false` keeps the lane off. Operators
+may opt in with `worker.attachments.enabled: true` and
+`worker.attachments.mode: lazy` after installing compatible API, worker and
+runner images. Activation is an explicit operator choice. Lazy mode requires
+a real runner (`agentSandbox.runner.fakeModel: false`) and the existing
+attachments cache mount. The chart creates an internal broker Service on
+`worker.attachments.broker.port` (default `8093`) and permits ingress only from
+the API pods. It supplies the API facade settings and worker transfer budgets
+from the same values. There is no new external ingress.
+
+The runner retains a writable attachments `emptyDir` with the finite
+`agentSandbox.runner.attachments.sizeLimit` (default `512Mi`) and existing
+sandbox resource limits. Lazy mode renders no eager `attachments-init`
+container. Listing references does not materialize their bytes. A requested file
+must fit the available cache; storage exhaustion is an explicit fetch failure.
+Legacy `maxFileBytes` and `threadMaxBytes` apply only in `mode: eager`.
+
+For an isolated source-built local stack, export
+`CURIE_ATTACHMENT_ENABLED=true`, `CURIE_ATTACHMENT_MODE=lazy` and
+`CURIE_ATTACHMENT_ACCESS_ENABLED=true` before `curie local up --build`, together
+with the existing real-model settings. Choose a unique
+`CURIE_ATTACHMENT_BROKER_PORT` for each simultaneous local stack (default
+`28093`). The broker binds loopback by default. The API reaches the host-network worker
+through `host.docker.internal` where Docker Desktop forwards that loopback
+listener. Native Linux or other topologies may require
+`CURIE_ATTACHMENT_BROKER_HOST` set to a verified private Docker bridge/gateway
+interface and `CURIE_ATTACHMENT_BROKER_URL` set to the matching API-reachable
+origin. A refused/unreachable broker blocks lazy activation. Do not broaden the
+bind to a LAN-facing interface to hide a networking error. Internal authentication
+is required on every broker request. Keep the
+existing Compose project, override files and endpoints consistent for startup
+and teardown. The local runner receives a claim-owned writable named tmpfs cache volume;
+`CURIE_ATTACHMENT_CACHE_SIZE_BYTES` controls its finite capacity (default
+`536870912`, or `512Mi`). Its contents consume effective memory resources, so
+a file below the volume capacity can still fail when the runner's memory limit
+is exhausted. Claim deletion removes only that claim's volume.
+
+
+## Declared Slack test drivers
+
+`testInstallation.enabled` defaults to `false`. The existing
+`testInstallation.drivers` entries name `channel_id`, `bot_id` and
+`bot_user_id`, plus `agent` for a sibling driver; `testInstallation.threadTurnLimit`
+bounds driver turns per thread in ten minutes. The chart passes the same values
+to the dispatcher for legacy and selected HTTP intake. Existing production,
+published-secret and driver-identity checks apply to both paths.
+
+Selected HTTP intake admits only listed, marked bot mentions, attributes them
+to the configured driver user, and applies normal API identity admission.
+Root pings reply without a turn; bot direct messages and test-driver approval
+replies remain refused. See the
+[gateway implementation notes](../../packages/channel-gateway/README.md#adr-0202-implementation-declared-http-test-drivers).

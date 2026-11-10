@@ -1,0 +1,72 @@
+[
+  {
+    "id": "6df15bef7df729ab14c6657717ed534fb1d31bb1",
+    "individual_note": false,
+    "notes": [
+      {
+        "author": {
+          "avatar_url": "https://gitlab.example/uploads/-/system/user/avatar/placeholder/avatar.png",
+          "id": 2,
+          "locked": false,
+          "name": "Developer",
+          "public_email": null,
+          "state": "active",
+          "username": "developer",
+          "web_url": "https://gitlab.example/developer"
+        },
+        "body": "Why this way?",
+        "commands_changes": {},
+        "confidential": false,
+        "created_at": "2026-10-13T11:39:28.655Z",
+        "id": 37,
+        "imported": false,
+        "imported_from": "none",
+        "internal": false,
+        "noteable_id": 26,
+        "noteable_iid": 26,
+        "noteable_type": "MergeRequest",
+        "project_id": 1,
+        "resolvable": true,
+        "resolved": false,
+        "resolved_at": null,
+        "resolved_by": null,
+        "system": false,
+        "type": "DiscussionNote",
+        "updated_at": "2026-10-13T11:39:28.655Z"
+      },
+      {
+        "author": {
+          "avatar_url": "https://gitlab.example/uploads/-/system/user/avatar/placeholder/avatar.png",
+          "id": 4,
+          "locked": false,
+          "name": "Factory Bot",
+          "public_email": null,
+          "state": "active",
+          "username": "factory-bot",
+          "web_url": "https://gitlab.example/factory-bot"
+        },
+        "body": "Because of the new spec.\n\n<!-- curie-factory-status:00000000-0000-4000-8000-0000000000ab -->",
+        "commands_changes": {},
+        "confidential": false,
+        "created_at": "2026-10-13T11:39:28.857Z",
+        "id": 38,
+        "imported": false,
+        "imported_from": "none",
+        "internal": false,
+        "noteable_id": 26,
+        "noteable_iid": 26,
+        "noteable_type": "MergeRequest",
+        "project_id": 1,
+        "resolvable": true,
+        "resolved": false,
+        "resolved_at": null,
+        "resolved_by": null,
+        "system": false,
+        "type": "DiscussionNote",
+        "updated_at": "2026-10-13T11:39:29.101Z"
+      }
+    ],
+    "resolvable": true,
+    "resolved": false
+  }
+]

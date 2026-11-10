@@ -1,0 +1,1438 @@
+"""Authenticated answers to HTTP-selected approvals.
+
+The answering actor is authenticated from the existing chat attestation plus a
+receiver-signed proof over the exact submitted bytes, then the original invoker
+and the actor are checked independently and the operation commits through one
+explicit owner. @spec HTTP-APPROVAL-CONTINUITY-7/8/9/10.
+
+On a canonical route (a dynamic approval, or a route enforcing requester
+exclusion) the approver subject is also judged by ``approval_selection`` from
+the same fresh facts, at the answer, the final commit, approved-resume
+publication and the resume and grant current checks. Every refusal there is
+audited once, in its own short transaction after every reader, writer and
+identity fence of the refused operation has closed. @spec REQUEST-APPROVAL-5/6.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import hashlib
+import hmac
+import logging
+import uuid
+from collections.abc import AsyncIterator, Callable
+from contextlib import AbstractAsyncContextManager, asynccontextmanager
+from dataclasses import dataclass, field
+from datetime import UTC, datetime
+from types import SimpleNamespace
+from typing import Any, Literal, NoReturn, cast
+
+from curie_internal import identity_approval as wire
+from curie_internal import identity_context as codec
+from fastapi import HTTPException, Request
+from sqlalchemy import select, text
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from curie_api import approval_selection, approver_dm, identity_fence, principal_authority
+from curie_api.approval_auth import AuthenticatedApprovalPrincipal
+from curie_api.approval_selection import SelectionRefused
+from curie_api.approval_teams import authenticated_actor_evidence, team_restriction
+from curie_api.approver_dm import DmCard
+from curie_api.authorizer import authorize_approval
+from curie_api.crud import approvals as approvals_crud
+from curie_api.models import Agent, Approval, ApprovalAuditEntry, ApprovalStatus, Principal
+from curie_api.resumequeue import ApprovalResumeRefused, approval_trace_context
+from curie_api.schemas.http_authority import HttpSelectionV1
+from curie_api.schemas.http_identity import LookupRequestV1, NamespaceV1, SenderV1, ValidatedFacts
+from curie_api.slack_approvers import SlackUserGroupMembers, approval_token_identity
+
+from .delivery_validity import identity_delivery_window
+from .http_approval import approval_record_digest, verified_capsule
+from .http_credential_registry import ResolvedProviderCredential
+from .http_invocation import (
+    AnyReceiverRegistration,
+    AuthenticatedSource,
+    EmailReceiverRegistrationV1,
+    HttpInvocationRuntime,
+    ReceiverRegistrationV1,
+    SourceCapture,
+    capture_source,
+    lookup_request,
+    registered_sender,
+    resolved_identity,
+    source_facts,
+    source_permission,
+    turn_invocation_source,
+)
+from .http_resume_publication import (
+    ApprovedResumeAuthority,
+    CurrentResumeAuthority,
+    ResumeWindow,
+)
+from .http_transport import HttpIdentityClient, HttpIdentityObservation
+from .slack import INTERACTION_DELIVERIES, SlackEvidence
+
+logger = logging.getLogger(__name__)
+
+PROOF_HEADER = "X-Curie-Approval-Receiver-Proof"
+_INVALID_PRINCIPAL = "missing or invalid approval principal"
+_RECOVERY_AUDIT_ACTION = approvals_crud.RECOVERY_AUDIT_ACTION
+_RECOVERY_AUTHORIZER = "approval_recovery"
+_AUTHORIZER = "HttpApprovalAnswer"
+_RESUME_REFUSED: Literal["resume_refused"] = "resume_refused"
+_RESUME_AUTHORITY_ATTEMPTS = 3
+_RESUME_AUTHORITY_BACKOFF_S = 0.05
+# The transaction-local setting and value that let a dynamic approval become
+# ``approved`` in storage. Only this owner's final commit sets it, after the
+# canonical-route judgment. Migration 0156 (``0156_dynamic_approval_answer_gate``,
+# ``GATE_SETTING``/``GATE_VALUE``) holds the frozen copy its trigger compares.
+# @spec REQUEST-APPROVAL-5.
+SELECTION_ENFORCED = ("curie.approval_selection_enforced", "v1")
+
+
+def _error(status: int, code: str) -> HTTPException:
+    """@spec HTTP-APPROVAL-CONTINUITY-7/10."""
+    return HTTPException(status, code, headers={"Cache-Control": "no-store"})
+
+
+def _refuse(status: int, code: str) -> NoReturn:
+    """Fixed details only; no submitted value is echoed. @spec HTTP-APPROVAL-CONTINUITY-7/10."""
+    raise _error(status, code)
+
+
+def _invalid() -> NoReturn:
+    """@spec HTTP-APPROVAL-CONTINUITY-7."""
+    _refuse(401, _INVALID_PRINCIPAL)
+
+
+def _deny() -> NoReturn:
+    """@spec HTTP-APPROVAL-CONTINUITY-8."""
+    _refuse(403, "caller_not_allowed")
+
+
+def _unavailable() -> NoReturn:
+    """@spec HTTP-APPROVAL-CONTINUITY-9."""
+    _refuse(503, "authority_unavailable")
+
+
+class _LifecycleGenerationConflict(HTTPException):
+    """A final verification found lifecycle churn before publication was authorized."""
+
+    def __init__(self) -> None:
+        super().__init__(503, "authority_unavailable", headers={"Cache-Control": "no-store"})
+
+
+def _definitive_refusal(group: BaseExceptionGroup[Any]) -> HTTPException | None:
+    """The first definitive refusal raised inside a TaskGroup, if any.
+
+    A domain refusal (any non-5xx ``HTTPException``) decides the outcome even when
+    a sibling failed or was cancelled because of it; only a group without one
+    stays unavailable. @spec HTTP-APPROVAL-CONTINUITY-8/9.
+    """
+    for error in group.exceptions:
+        if isinstance(error, BaseExceptionGroup):
+            nested = _definitive_refusal(error)
+            if nested is not None:
+                return nested
+        elif isinstance(error, HTTPException) and error.status_code < 500:
+            return error
+    return None
+
+
+def _boundary_refusal(error: BaseException) -> HTTPException:
+    """What a failure of the shared phases reads as at a boundary, fixed details only.
+
+    A definitive refusal keeps its precedence inside a TaskGroup; a receiver
+    that no longer matches is a denial; any other failure, grouped or not, is
+    unavailable. A ``SelectionRefused`` keeps its code and evidence.
+    @spec HTTP-APPROVAL-CONTINUITY-8/9 REQUEST-APPROVAL-5.
+    """
+    if isinstance(error, BaseExceptionGroup):
+        found = _definitive_refusal(error)
+        if found is None:
+            return _error(503, "authority_unavailable")
+        error = found
+    if isinstance(error, SelectionRefused):
+        return error
+    if isinstance(error, HTTPException):
+        if error.detail == "invalid_http_receiver":
+            return _error(403, "caller_not_allowed")
+        if error.status_code == 503:
+            return _error(503, "authority_unavailable")
+        return error
+    return _error(503, "authority_unavailable")
+
+
+@dataclass(frozen=True)
+class _RefusalAudit:
+    """Who a refused canonical-route operation names in its audit row.
+
+    @spec REQUEST-APPROVAL-5/6.
+    """
+
+    action: Literal["denied", "resume_refused"]
+    actor: str
+    actor_channel: str | None
+    principal_kind: str | None
+    authenticated: bool
+    decision: str
+
+
+async def _audit_refusal(
+    factory: Any, row: Approval, who: _RefusalAudit, refusal: HTTPException, stage: str,
+    *, code: str | None = None,
+) -> None:
+    """One audit row for a 403 or 503 refusal on a canonical route, in its own short transaction.
+
+    Any other status writes nothing. Called only after every reader, writer and
+    identity fence of the refused operation has closed, never under one. The
+    evidence names the public status and detail, the stage, a principal refusal
+    code and any selection evidence. A failure to
+    write it is logged and never changes the refusal. @spec REQUEST-APPROVAL-5/6.
+    """
+    if refusal.status_code not in (403, 503):
+        return
+    evidence: dict[str, Any] = {
+        "kind": approval_selection.EVIDENCE_KIND, "mode": row.selection_mode,
+        "route": row.route, "key_id": row.selection_key_id, "decision": who.decision,
+        "code": code,
+    }
+    if isinstance(refusal, SelectionRefused):
+        evidence.update(refusal.evidence)
+    evidence.update(status=refusal.status_code, detail=refusal.detail, stage=stage)
+    try:
+        async with factory() as session, session.begin():
+            session.add(ApprovalAuditEntry(
+                approval_id=row.id, action=who.action, actor=who.actor,
+                actor_channel=who.actor_channel, principal_kind=who.principal_kind,
+                authenticated=who.authenticated, principal_subject=None, decision=who.decision,
+                authorizer=_AUTHORIZER, authorized=False, reason=str(refusal.detail),
+                evidence=evidence,
+            ))
+    except Exception:  # noqa: BLE001 - the refusal stands without its audit row.
+        logger.warning("approval %s refusal audit row could not be written", row.id)
+
+
+def _sha256(data: bytes) -> str:
+    """@spec HTTP-APPROVAL-CONTINUITY-7."""
+    return hashlib.sha256(data).hexdigest()
+
+
+@dataclass(frozen=True)
+class ApprovalAnswer:
+    """One authenticated resolve or recover request, as submitted.
+
+    @spec HTTP-APPROVAL-CONTINUITY-7/10.
+    """
+
+    operation: Literal["resolve", "recover"]
+    decision: Literal["approved", "rejected"]
+    note: str | None
+    body: bytes
+    attestation: str
+    proof: str
+    recovery_key: str | None = None
+    recovery_facts: tuple[str, ...] = ()
+
+
+class ApprovalSettled(Exception):  # noqa: N818 - a settled outcome, not a failure.
+    """The row was no longer pending at the CAS. @spec HTTP-APPROVAL-CONTINUITY-10."""
+
+    def __init__(self, status: str, resolved_by: str | None, expires_at: datetime | None) -> None:
+        super().__init__(status)
+        self.status = status
+        self.resolved_by = resolved_by
+        self.expires_at = expires_at
+
+
+@dataclass(frozen=True)
+class _Actor:
+    """Receiving scope of an authenticated answering actor.
+
+    @spec HTTP-APPROVAL-CONTINUITY-7/15.
+    """
+
+    registration: AnyReceiverRegistration
+    source: AuthenticatedSource
+    channel: str
+
+
+def _serves_origin(
+    registration: ReceiverRegistrationV1, row: Approval, saved: wire.ApprovalContextV1,
+) -> bool:
+    """Whether an answering Slack registration may answer for this approval's origin.
+
+    A Slack origin keeps the explicit registration restriction. No Slack
+    registration lists an email binding, so an email turn's approval with a
+    fixed Slack card is bound instead to that stored card; the caller checks the
+    proved channel and identity against it. @spec HTTP-APPROVAL-CONTINUITY-7.
+    """
+    if saved.scope.provider == "email":
+        return (
+            row.reply_kind == "email" and row.card_channel is not None
+            and row.card_channel != row.reply_channel
+        )
+    return saved.scope.binding_id in registration.binding_ids
+
+
+def _email_namespace(
+    registration: EmailReceiverRegistrationV1, sender: str,
+) -> NamespaceV1 | None:
+    """The registration's domain descriptor a lowercase sender falls in.
+
+    @spec HTTP-APPROVAL-CONTINUITY-15 HTTP-INVOCATION-EXECUTION-29.
+    """
+    domain = sender.rpartition("@")[2]
+    return next((item for item in registration.domains if item.key == domain), None)
+
+
+def _authenticate_email_actor(
+    runtime: HttpInvocationRuntime,
+    row: Approval,
+    saved: wire.ApprovalContextV1,
+    principal: AuthenticatedApprovalPrincipal,
+    answer: ApprovalAnswer,
+) -> _Actor:
+    """An email reply forwarded by the mail adapter with its signed answer proof.
+
+    The proof binds purpose, approval, binding, sender and the exact body, so it
+    cannot move to another approval, decision or sender, or serve as an
+    invocation proof. Only a card shown in the email thread is answered here.
+    @spec HTTP-APPROVAL-CONTINUITY-15.
+    """
+    if (
+        principal.kind != "adapter" or type(answer.body) is not bytes
+        or answer.operation != "resolve" or row.reply_kind != "email"
+        or row.card_channel != row.reply_channel
+    ):
+        _invalid()
+    proof = wire.verify_email_approval_answer_proof(answer.proof, runtime._email_keys)
+    if not isinstance(proof, wire.EmailApprovalAnswerProofV1):
+        _invalid()
+    registration = runtime._email_receivers.get((proof.receiver_id, proof.receiver_generation))
+    namespace = None if registration is None else _email_namespace(registration, proof.sender)
+    if (
+        registration is None or namespace is None
+        or proof.approval_id != str(row.id)
+        or not hmac.compare_digest(proof.body_sha256, _sha256(answer.body))
+        or proof.sender != principal.subject.strip().lower()
+        or proof.binding_id != saved.scope.binding_id
+        or proof.binding_id not in registration.binding_ids
+        or registration.tenant_id != saved.scope.tenant_id
+    ):
+        _invalid()
+    return _Actor(
+        registration,
+        AuthenticatedSource(
+            saved.scope.binding_id, saved.scope.binding_generation,
+            SenderV1(
+                provider="email", channel_identity_id=registration.channel_identity_id,
+                provider_installation_id=registration.provider_installation_id,
+                namespace=namespace, native_id=proof.sender,
+            ),
+            agent_id=saved.scope.agent_id,
+        ),
+        row.reply_channel,
+    )
+
+
+def _authenticate_actor(
+    runtime: HttpInvocationRuntime,
+    row: Approval,
+    saved: wire.ApprovalContextV1,
+    principal: AuthenticatedApprovalPrincipal,
+    answer: ApprovalAnswer,
+    dm: DmCard | None,
+) -> _Actor:
+    """Exact bytes, both signatures and equal Slack evidence. @spec HTTP-APPROVAL-CONTINUITY-7.
+
+    The proved channel is the row's stored ``card_channel``, never the reply
+    channel: every HTTP-selected row stores its card target, so one without it
+    is an approver-DM card not yet registered, which nothing can answer. A
+    registered DM card (``dm``) is answered only through the receiver identity
+    and installation its record names, by its recorded recipient, in its
+    registered DM. @spec APPROVER-DM-3.
+    """
+    slack = principal.slack
+    if (
+        principal.kind != "chat" or slack is None or principal.actor_channel is None
+        or slack.delivery not in INTERACTION_DELIVERIES or not slack.interaction_user_team_id
+        or type(answer.attestation) is not str or type(answer.body) is not bytes
+    ):
+        _invalid()
+    proof = wire.verify_approval_answer_proof(answer.proof, runtime._receiver_keys)
+    if not isinstance(proof, wire.ApprovalAnswerProofV1):
+        _invalid()
+    registration = runtime._receivers.get((proof.receiver_id, proof.receiver_generation))
+    try:
+        attestation = _sha256(answer.attestation.encode("ascii"))
+        signed = SlackEvidence.model_validate(proof.slack.model_dump(mode="json"))
+    except (UnicodeEncodeError, ValueError):
+        _invalid()
+    target = row.card_channel
+    if (
+        target is None or registration is None
+        or proof.operation != answer.operation or proof.approval_id != str(row.id)
+        or not hmac.compare_digest(proof.body_sha256, _sha256(answer.body))
+        or not hmac.compare_digest(proof.attestation_sha256, attestation)
+        or proof.channel_identity_id != registration.channel_identity_id
+        or proof.provider_installation_id != registration.provider_installation_id
+        or proof.native_channel_id != principal.actor_channel or proof.native_channel_id != target
+        or signed != slack or signed.user_id != principal.subject
+        # The answering receiver may differ from the invoker's; the server-resolved
+        # approval target names the identity it must be, and the originating
+        # binding must be one this registration explicitly serves.
+        or registration.channel_identity_name != approval_token_identity(row, dm)
+        or registration.tenant_id != saved.scope.tenant_id
+        or not _serves_origin(registration, row, saved)
+        or dm is not None and (
+            registration.provider_installation_id != dm.provider_installation_id
+            or proof.native_channel_id != dm.channel
+        )
+    ):
+        _invalid()
+    # The registered-sender owner: an ordinary workspace keeps the existing
+    # derivation; a Grid workspace resolves in its organisation and only from
+    # its own workspace (@spec HTTP-INVOCATION-EXECUTION-21); a trusted partner
+    # resolves in its own entry (@spec HTTP-INVOCATION-EXECUTION-24).
+    try:
+        native_id, namespace = registered_sender(registration, signed)
+    except HTTPException:
+        _invalid()
+    if native_id != principal.subject or (dm is not None and native_id != dm.recipient):
+        _invalid()
+    return _Actor(
+        registration,
+        AuthenticatedSource(
+            saved.scope.binding_id, saved.scope.binding_generation,
+            SenderV1(
+                provider="slack", channel_identity_id=registration.channel_identity_id,
+                provider_installation_id=registration.provider_installation_id,
+                namespace=namespace, native_id=native_id,
+            ),
+            agent_id=saved.scope.agent_id,
+        ),
+        proof.native_channel_id,
+    )
+
+
+@dataclass(frozen=True)
+class _Subject:
+    """One subject's captured scope and external observation. @spec HTTP-APPROVAL-CONTINUITY-9."""
+
+    role: Literal["invocation", "approver"]
+    registration: AnyReceiverRegistration
+    source: AuthenticatedSource
+    capture: SourceCapture
+    credential: ResolvedProviderCredential
+    lookup: LookupRequestV1
+    response_bytes: bytes = b""
+
+    def independent_human(self) -> bool:
+        """Registered evidence only, never inferred.
+
+        An email sender is never an independent human (invocation criterion 29).
+        @spec HTTP-APPROVAL-CONTINUITY-7/8/15 HTTP-INVOCATION-EXECUTION-29.
+        """
+        if not isinstance(self.registration, ReceiverRegistrationV1):
+            return False
+        return self.source.sender.native_id in self.registration.human_native_ids
+
+
+async def _prepare(
+    session: AsyncSession, runtime: HttpInvocationRuntime,
+    role: Literal["invocation", "approver"], registration: AnyReceiverRegistration,
+    source: AuthenticatedSource,
+) -> _Subject:
+    """Phase 1 for one subject: capture and a fresh role-purpose lookup request.
+
+    @spec HTTP-APPROVAL-CONTINUITY-8/9.
+    """
+    captured, _ = await capture_source(
+        session, registration, source, role=role, binding_identity=role == "invocation",
+    )
+    credential = runtime._providers.resolve(captured.authority.configuration)
+    if not isinstance(credential, ResolvedProviderCredential):
+        _unavailable()
+    purpose: Literal["invocation", "approval"] = (
+        "invocation" if role == "invocation" else "approval"
+    )
+    return _Subject(
+        role, registration, source, captured, credential,
+        lookup_request(registration, captured, credential, purpose=purpose),
+    )
+
+
+async def _recapture(
+    session: AsyncSession, subject: _Subject, *, writer: bool,
+) -> tuple[SourceCapture, Any]:
+    """@spec HTTP-APPROVAL-CONTINUITY-8/9."""
+    return await capture_source(
+        session, subject.registration, subject.source,
+        writer_agent=subject.capture.agent_id if writer else None, role=subject.role,
+        binding_identity=subject.role == "invocation",
+    )
+
+
+async def _check_principal(
+    session: AsyncSession, subject: _Subject, facts: ValidatedFacts,
+    application: principal_authority.PrincipalApplication,
+) -> None:
+    """The applied principal is still the observed human. @spec HTTP-APPROVAL-CONTINUITY-9."""
+    if application.principal_id is None:
+        return
+    principal = await session.get(Principal, application.principal_id, populate_existing=True)
+    if (
+        principal is None or facts.identity is None or principal.type != "human"
+        or str(principal.tenant_id) != subject.registration.tenant_id
+        or principal.idp_issuer != facts.identity.issuer
+        or principal.idp_subject != facts.identity.subject
+        or principal.status != facts.identity.account_status
+        or principal.authorization_version != application.authorization_version
+    ):
+        _unavailable()
+
+
+async def _route_decision(
+    row: Approval, route_binding: Any, actor: _Subject, approver_sets: Any,
+    subject: str, channel: str, dm: DmCard | None,
+) -> dict[str, Any] | None:
+    """Explicit route restrictions through their existing owner, freshly.
+
+    A migrated approver role does not acquire the legacy card-channel default as
+    an additional restriction; a nonmigrated role keeps it. @spec HTTP-APPROVAL-CONTINUITY-8.
+
+    This composition is the canonical owner the shared authorizer admits on a
+    canonical route (ADR 0271). The selected set, ceiling and separation are
+    judged in ``_Composition.verify`` from fresh facts, so the migrated-role
+    early return here skips only the retained route restrictions, never them.
+    @spec REQUEST-APPROVAL-5/6.
+
+    A registered approver-DM card's sets are read through its recorded
+    identity (``dm``). @spec APPROVER-DM-3.
+    """
+    role = None if actor.capture.policy is None else actor.capture.policy.roles.approver
+    if role is not None and role.legacy_state == "migrated" and not team_restriction(
+        row, route_binding,
+    ):
+        return None
+    approver_set = approver_sets(row, route_binding, dm)
+    if isinstance(approver_set, SlackUserGroupMembers):
+        approver_set = approver_set.fresh()
+    # An email actor answers as its mail adapter's principal, so a declared
+    # route email list narrows it. @spec HTTP-APPROVAL-CONTINUITY-15.
+    kind: Literal["chat", "adapter"] = (
+        "adapter" if actor.source.sender.provider == "email" else "chat"
+    )
+    _, decision = await authorize_approval(
+        row, subject, channel, approver_set=approver_set, principal_kind=kind,
+        route_binding=route_binding, canonical_owner=True,
+    )
+    if not decision.allowed:
+        if isinstance(decision.evidence, dict) and decision.evidence.get("lookup_failed"):
+            _unavailable()
+        _deny()
+    return decision.evidence
+
+
+def _settled(row: Approval) -> NoReturn:
+    """@spec HTTP-APPROVAL-CONTINUITY-10."""
+    raise ApprovalSettled(str(row.status), row.resolved_by, row.expires_at)
+
+
+def _pending(
+    row: Approval | None, digest: str | None = None, *, status: str = ApprovalStatus.pending,
+) -> Approval:
+    """Pending, unexpired and unchanged since capture; a read-only check of a
+    settled row instead requires its status unchanged. @spec HTTP-APPROVAL-CONTINUITY-9/10.
+    """
+    if row is None:
+        _unavailable()
+    if status != ApprovalStatus.pending:
+        if row.status != status or (
+            digest is not None and approval_record_digest(row) != digest
+        ):
+            _unavailable()
+        return row
+    if row.status != ApprovalStatus.pending:
+        _settled(row)
+    if row.expires_at is not None and row.expires_at <= datetime.now(UTC).replace(tzinfo=None):
+        raise ApprovalSettled("expired", None, row.expires_at)
+    if digest is not None and approval_record_digest(row) != digest:
+        _unavailable()
+    return row
+
+
+def _reseal(
+    runtime: HttpInvocationRuntime, saved: wire.ApprovalContextV1, row: Approval,
+    actor: _Subject, channel: str, facts: ValidatedFacts,
+    application: principal_authority.PrincipalApplication, lifecycle: int,
+) -> str:
+    """Status, actor provenance and row digest together. @spec HTTP-APPROVAL-CONTINUITY-6/9."""
+    config = actor.capture.authority.configuration
+    selection = config.selection
+    assert isinstance(selection, HttpSelectionV1)
+    sender = actor.source.sender
+    identity = facts.identity
+    values = saved.model_dump()
+    values.update(
+        status=str(row.status),
+        key_id=runtime._signing_key[0],
+        key_generation=runtime._signing_key[1],
+        approval_record_sha256=approval_record_digest(row),
+        actor_scope=wire.ApprovalActorScopeV1(
+            tenant_id=actor.registration.tenant_id,
+            channel_identity_id=sender.channel_identity_id,
+            provider_installation_id=sender.provider_installation_id,
+            provider=sender.provider, native_id=sender.native_id, actor_channel=channel,
+            namespace=codec.ContextNamespaceV1.model_validate(sender.namespace.model_dump()),
+        ),
+        actor_receiver_id=actor.registration.receiver_id,
+        actor_receiver_generation=actor.registration.generation,
+        actor_independent_human=actor.independent_human(),
+        actor_provider_issuer=selection.issuer,
+        actor_provider_version=config.version,
+        actor_provider_credential_id=selection.credential_ref.id,
+        actor_provider_credential_generation=selection.credential_ref.generation,
+        actor_lifecycle_generation=lifecycle,
+        actor_role_policy_version=actor.capture.policy_version,
+        actor_outcome=application.outcome,
+        actor_canonical=None if identity is None or application.outcome == "unresolved"
+        else codec.ContextCanonicalV1(issuer=identity.issuer, subject=identity.subject),
+        actor_principal=None if (
+            application.principal_id is None or application.authorization_version is None
+        ) else codec.ContextPrincipalV1(
+            principal_id=str(application.principal_id),
+            authorization_version=application.authorization_version,
+        ),
+    )
+    return wire.seal_approval_context(
+        wire.ApprovalContextV1.model_validate(values), runtime._context_keys,
+    )
+
+
+@dataclass(frozen=True)
+class _PreservedAssociation:
+    """A sealed subject's canonical association, checked like the invoker's.
+
+    @spec HTTP-APPROVAL-CONTINUITY-8.
+    """
+
+    scope: codec.InvocationScopeV1
+    receiver_id: str
+    receiver_generation: int
+    independent_human: bool
+    canonical: codec.ContextCanonicalV1 | None
+
+
+@dataclass
+class _Composition:
+    """Phases 2 to 4 for the required subjects; phase 5 belongs to the operation.
+
+    Route restrictions are evaluated for the approver subject only.
+    @spec HTTP-APPROVAL-CONTINUITY-8/9.
+
+    ``saved`` is the row's sealed capsule, ``decision`` the answer judged (an
+    approved resume judges ``approved``) and ``preserved`` whether the approver
+    subject is the answering actor sealed with the row rather than a new
+    answer. ``selection_evidence`` holds the last canonical-route judgment.
+    @spec REQUEST-APPROVAL-5/6.
+
+    ``dm`` is the row's registered approver-DM card, loaded once in phase 1.
+    @spec APPROVER-DM-3.
+    """
+
+    request: Request
+    runtime: HttpInvocationRuntime
+    client: HttpIdentityClient
+    factory: Any
+    valkey: Any
+    approval_id: uuid.UUID
+    snapshot: str
+    row: Approval
+    route_binding: Any
+    approver_sets: Any
+    actor_native: str
+    actor_channel: str
+    subjects: list[_Subject]
+    associations: dict[str, Any]
+    saved: wire.ApprovalContextV1
+    decision: str = "approved"
+    preserved: bool = False
+    applications: dict[str, principal_authority.PrincipalApplication] = field(
+        default_factory=dict,
+    )
+    final: int = 0
+    route_evidence: dict[str, Any] | None = None
+    selection_evidence: dict[str, Any] | None = None
+    stage: str = "capture"
+    dm: DmCard | None = None
+    preserve_inactive: bool = False
+
+    async def _observe(self, subject: _Subject) -> _Subject:
+        """Phase 2 for one subject. @spec HTTP-APPROVAL-CONTINUITY-9."""
+        observation = await self.client.lookup(
+            target=subject.credential.target, bearer=subject.credential.bearer,
+            request=subject.lookup, limits=subject.credential.limits,
+        )
+        if not isinstance(observation, HttpIdentityObservation):
+            _unavailable()
+        return _Subject(
+            subject.role, subject.registration, subject.source, subject.capture,
+            subject.credential, subject.lookup, observation.response_bytes,
+        )
+
+    async def observe_and_apply(self) -> None:
+        """Phases 2 and 3: lookups outside SQL, then chained lifecycle application.
+
+        @spec HTTP-APPROVAL-CONTINUITY-8/9.
+        """
+        self.stage = "observe"
+        if len({subject.capture.authority for subject in self.subjects}) != 1:
+            _unavailable()
+        actor = next((item for item in self.subjects if item.role == "approver"), None)
+        try:
+            async with asyncio.TaskGroup() as group:
+                tasks = [group.create_task(self._observe(subject)) for subject in self.subjects]
+                route = None if actor is None else group.create_task(_route_decision(
+                    self.row, self.route_binding, actor, self.approver_sets,
+                    self.actor_native, self.actor_channel, self.dm,
+                ))
+        except BaseExceptionGroup as group_error:
+            # The group wraps a route denial and cancels pending lookups; the
+            # denial keeps its own status and reason rather than reading as
+            # unavailable. Anything else stays unavailable at the boundary.
+            refusal = _definitive_refusal(group_error)
+            if refusal is not None:
+                raise refusal from None
+            raise
+        self.subjects = [task.result() for task in tasks]
+        self.route_evidence = None if route is None else route.result()
+        async with identity_fence.mutation(self.factory, self.valkey) as writer:
+            async with writer.begin():
+                for subject in self.subjects:
+                    current, _ = await _recapture(writer, subject, writer=True)
+                    if current != subject.capture:
+                        _unavailable()
+                observed: dict[tuple[str, str], Any] = {}
+                for subject in self.subjects:
+                    facts = source_facts(subject.response_bytes, subject.lookup, subject.credential)
+                    key = (subject.source.sender.native_id, subject.source.sender.namespace.id)
+                    # Contradictory canonical observations for one sender refuse.
+                    if observed.setdefault(key, facts.identity) != facts.identity:
+                        _unavailable()
+                    if (
+                        self.preserve_inactive and facts.identity is not None
+                        and facts.identity.account_status == "active"
+                    ):
+                        principal = await writer.scalar(select(Principal).where(
+                            Principal.tenant_id == uuid.UUID(subject.registration.tenant_id),
+                            Principal.idp_issuer == facts.identity.issuer,
+                            Principal.idp_subject == facts.identity.subject,
+                        ).execution_options(populate_existing=True))
+                        if principal is not None and principal.status in {"disabled", "revoked"}:
+                            raise principal_authority.PrincipalAuthorityRefusal(
+                                "principal_inactive",
+                            )
+                lifecycle = self.subjects[0].capture.authority
+                for subject in self.subjects:
+                    application = await principal_authority.apply_http_principal(
+                        writer, capture=lifecycle, request=subject.lookup,
+                        response_bytes=subject.response_bytes,
+                    )
+                    self.applications[subject.role] = application
+                    lifecycle = principal_authority.AuthorityCapture(
+                        lifecycle.configuration, application.lifecycle_generation,
+                    )
+                _pending(
+                    await writer.get(Approval, self.approval_id, populate_existing=True),
+                    self.snapshot, status=self.row.status,
+                )
+                await writer.commit()
+        self.final = lifecycle.lifecycle_generation
+
+    async def verify(self, session: AsyncSession, *, writer: bool) -> dict[str, ValidatedFacts]:
+        """Phases 4 and 5 repeat every comparison and each permission.
+
+        Requester equality neither grants nor vetoes: each subject is judged by
+        its own role against its own preserved association, if any.
+        @spec HTTP-APPROVAL-CONTINUITY-8/9.
+
+        On a canonical route the approver subject is then judged by
+        ``approval_selection.check_answer`` from the same fresh facts, after
+        its own permission, with the configuration version read in this same
+        session. @spec REQUEST-APPROVAL-5/6.
+        """
+        current_facts: dict[str, ValidatedFacts] = {}
+        state = self.request.app.state
+        captures: list[tuple[_Subject, SourceCapture, Any]] = []
+        lifecycle_conflict = False
+        for subject in self.subjects:
+            current, binding = await _recapture(session, subject, writer=writer)
+            if (
+                current.fingerprint != subject.capture.fingerprint
+                or state.http_identity_runtime is not self.runtime
+                or state.http_identity_client is not self.client
+            ):
+                _unavailable()
+            lifecycle_conflict |= current.authority.lifecycle_generation != self.final
+            captures.append((subject, current, binding))
+        if await approvals_crud.get_approval_route_binding(session, self.row) != self.route_binding:
+            _unavailable()
+        if lifecycle_conflict:
+            raise _LifecycleGenerationConflict()
+        for subject, current, binding in captures:
+            observed = source_facts(subject.response_bytes, subject.lookup, subject.credential)
+            await _check_principal(session, subject, observed, self.applications[subject.role])
+            source_permission(
+                current, binding, observed, subject.independent_human(),
+                self.associations.get(subject.role), role_name=subject.role,
+            )
+            current_facts[subject.role] = observed
+        await self._judge_selection(session, current_facts)
+        return current_facts
+
+    async def _judge_selection(
+        self, session: AsyncSession, facts: dict[str, ValidatedFacts],
+    ) -> None:
+        """The canonical-route check of the approver subject, if any.
+
+        Pure apart from the configuration version this session reads.
+        @spec REQUEST-APPROVAL-5/6.
+        """
+        self.selection_evidence = None
+        if "approver" not in facts or not approval_selection.canonical_route(
+            self.row, self.route_binding,
+        ):
+            return
+        version = await session.scalar(
+            select(Agent.connector_requester_identity_version).where(
+                Agent.id == self.row.agent_id,
+            )
+        )
+        self.selection_evidence = approval_selection.check_answer(
+            self.row, self.route_binding, saved=self.saved, facts=facts["approver"],
+            principal_applied=self.applications["approver"].principal_id is not None,
+            decision=self.decision, configuration_version=version, preserved=self.preserved,
+        )
+
+    async def recheck(self) -> None:
+        """Phase 4: a clean read-only reader. @spec HTTP-APPROVAL-CONTINUITY-9."""
+        self.stage = "recheck"
+        async with self.factory() as session, session.begin():
+            await identity_fence.lock_identity_reader(session)
+            await self.verify(session, writer=False)
+            _pending(
+                await session.get(Approval, self.approval_id, populate_existing=True),
+                self.snapshot, status=self.row.status,
+            )
+
+
+def _preserved_actor(
+    runtime: HttpInvocationRuntime, row: Approval, saved: wire.ApprovalContextV1,
+    dm: DmCard | None,
+) -> tuple[_Actor, _PreservedAssociation]:
+    """The sealed answering actor, under its still-current registration.
+
+    @spec HTTP-APPROVAL-CONTINUITY-7/8/15.
+
+    A registered approver-DM card (``dm``) keeps the rules that admitted its
+    answer: the recorded identity and installation, the recorded recipient and
+    the registered DM. @spec APPROVER-DM-3.
+    """
+    scope = saved.actor_scope
+    if scope is not None and scope.provider == "email":
+        if dm is not None:
+            _deny()
+        return _preserved_email_actor(runtime, row, saved)
+    registration = None if scope is None or saved.actor_receiver_id is None else (
+        runtime._receivers.get((saved.actor_receiver_id, saved.actor_receiver_generation or 0))
+    )
+    # Own or trusted entry exactly. @spec HTTP-INVOCATION-EXECUTION-24.
+    namespace = None if scope is None or registration is None else (
+        registration.recorded_namespace(scope.namespace)
+    )
+    if (
+        scope is None or registration is None or namespace is None
+        or registration.tenant_id != scope.tenant_id or scope.tenant_id != saved.scope.tenant_id
+        or registration.channel_identity_id != scope.channel_identity_id
+        or registration.provider_installation_id != scope.provider_installation_id
+        or registration.channel_identity_name != approval_token_identity(row, dm)
+        or not _serves_origin(registration, row, saved)
+        or scope.provider != "slack"
+        or (scope.native_id in registration.human_native_ids) != saved.actor_independent_human
+        or dm is not None and (
+            registration.provider_installation_id != dm.provider_installation_id
+            or scope.native_id != dm.recipient or scope.actor_channel != dm.channel
+            or row.card_channel != dm.channel
+        )
+    ):
+        _deny()
+    return _Actor(
+        registration,
+        AuthenticatedSource(
+            saved.scope.binding_id, saved.scope.binding_generation,
+            SenderV1(
+                provider="slack", channel_identity_id=registration.channel_identity_id,
+                provider_installation_id=registration.provider_installation_id,
+                namespace=namespace, native_id=scope.native_id,
+            ),
+            agent_id=saved.scope.agent_id,
+        ),
+        scope.actor_channel,
+    ), _PreservedAssociation(
+        saved.scope, registration.receiver_id, registration.generation,
+        scope.native_id in registration.human_native_ids, saved.actor_canonical,
+    )
+
+
+def _preserved_email_actor(
+    runtime: HttpInvocationRuntime, row: Approval, saved: wire.ApprovalContextV1,
+) -> tuple[_Actor, _PreservedAssociation]:
+    """A sealed email actor, under its still-current email registration.
+
+    The same rules that admitted the answer: listed originating binding, tenant,
+    ids, a domain the registration lists and a sender inside it, an email-thread
+    card, never an independent human. @spec HTTP-APPROVAL-CONTINUITY-15.
+    """
+    scope = saved.actor_scope
+    registration = None if scope is None or saved.actor_receiver_id is None else (
+        runtime._email_receivers.get(
+            (saved.actor_receiver_id, saved.actor_receiver_generation or 0),
+        )
+    )
+    namespace = None if scope is None or registration is None else (
+        _email_namespace(registration, scope.native_id)
+    )
+    if (
+        scope is None or registration is None or namespace is None
+        or namespace.model_dump() != scope.namespace.model_dump()
+        or registration.tenant_id != scope.tenant_id or scope.tenant_id != saved.scope.tenant_id
+        or registration.channel_identity_id != scope.channel_identity_id
+        or registration.provider_installation_id != scope.provider_installation_id
+        or saved.scope.binding_id not in registration.binding_ids
+        or not codec.is_email_sender(scope.native_id)
+        or row.reply_kind != "email" or row.card_channel != row.reply_channel
+        or saved.actor_independent_human is not False
+    ):
+        _deny()
+    return _Actor(
+        registration,
+        AuthenticatedSource(
+            saved.scope.binding_id, saved.scope.binding_generation,
+            SenderV1(
+                provider="email", channel_identity_id=registration.channel_identity_id,
+                provider_installation_id=registration.provider_installation_id,
+                namespace=namespace, native_id=scope.native_id,
+            ),
+            agent_id=saved.scope.agent_id,
+        ),
+        scope.actor_channel,
+    ), _PreservedAssociation(
+        saved.scope, registration.receiver_id, registration.generation, False,
+        saved.actor_canonical,
+    )
+
+
+async def answer_http_approval(
+    request: Request,
+    approval_id: uuid.UUID,
+    *,
+    principal: AuthenticatedApprovalPrincipal,
+    answer: ApprovalAnswer,
+    approver_sets: Any,
+) -> Approval:
+    """The operation-specific approval commit owner for resolve and recover.
+
+    Phases, in order: a short reader capture; independent bounded lookups and
+    route membership outside SQL; lifecycle application under the ordered
+    boundary; a clean read-only recheck; then one mutation that repeats every
+    comparison before the pending-only CAS, reseal and audit commit together.
+    No external call runs under a transaction or fence, and the wake stays owed.
+    @spec HTTP-APPROVAL-CONTINUITY-8/9/10.
+    """
+    runtime = getattr(request.app.state, "http_identity_runtime", None)
+    client = getattr(request.app.state, "http_identity_client", None)
+    if type(runtime) is not HttpInvocationRuntime or not isinstance(client, HttpIdentityClient):
+        _unavailable()
+    factory, valkey = request.app.state.sessionmaker, request.app.state.valkey
+    try:
+        return await _answer(
+            request, runtime, client, factory, valkey, approval_id,
+            principal=principal, answer=answer, approver_sets=approver_sets,
+        )
+    except ApprovalSettled:
+        raise
+    except HTTPException as error:
+        # The shared phases name their own refusals; this route keeps fixed ones.
+        if error.detail == "invalid_http_receiver":
+            _deny()
+        if error.status_code == 503:
+            _unavailable()
+        raise
+    except Exception:  # noqa: BLE001 - provider, credential and SQL details never cross.
+        _unavailable()
+
+
+async def _answer(
+    request: Request, runtime: HttpInvocationRuntime, client: HttpIdentityClient,
+    factory: Any, valkey: Any, approval_id: uuid.UUID, *,
+    principal: AuthenticatedApprovalPrincipal, answer: ApprovalAnswer, approver_sets: Any,
+) -> Approval:
+    """Phases 1 to 5 of one answer. @spec HTTP-APPROVAL-CONTINUITY-9.
+
+    On a canonical route every refusal raised once the actor has authenticated
+    is audited once, at the phase 1 capture as at every later stage; an actor
+    that never authenticated is refused unaudited. @spec REQUEST-APPROVAL-5/6.
+    """
+    audited: Approval | None = None
+    composition: _Composition | None = None
+    try:
+        # Phase 1: short reader capture of every required source.
+        async with factory() as session, session.begin():
+            await identity_fence.lock_identity_reader(session)
+            row = _pending(await session.get(Approval, approval_id, populate_existing=True))
+            saved = verified_capsule(runtime, row)
+            if saved is None or saved.status != "pending" or row.purpose != "session":
+                _refuse(403, "unsupported_approval")
+            route_binding = await approvals_crud.get_approval_route_binding(session, row)
+            # Detached while fully loaded, so a rollback of this reader cannot
+            # expire it: the capture refusal audit below reads it exactly as the
+            # phases after a committed capture do. @spec REQUEST-APPROVAL-5/6.
+            # The registered DM card, read once under this reader. @spec APPROVER-DM-3.
+            dm = await approver_dm.card(session, row)
+            session.expunge(row)
+            actor_scope = (
+                _authenticate_email_actor(runtime, row, saved, principal, answer)
+                if principal.kind == "adapter"
+                else _authenticate_actor(runtime, row, saved, principal, answer, dm)
+            )
+            if approval_selection.canonical_route(row, route_binding):
+                audited = row
+            try:
+                caller_registration, caller_source = turn_invocation_source(runtime, saved)
+            except HTTPException:
+                _deny()
+            caller = await _prepare(
+                session, runtime, "invocation", caller_registration, caller_source,
+            )
+            actor = await _prepare(
+                session, runtime, "approver", actor_scope.registration, actor_scope.source,
+            )
+            snapshot = approval_record_digest(row)
+        composition = _Composition(
+            request, runtime, client, factory, valkey, approval_id, snapshot, row,
+            route_binding, approver_sets, principal.subject, actor_scope.channel,
+            [caller, actor], {"invocation": saved, "approver": None}, saved,
+            decision=answer.decision, dm=dm,
+        )
+        return await _decide(composition, principal, answer, actor_scope)
+    except ApprovalSettled:
+        raise
+    except (Exception, BaseExceptionGroup) as error:  # noqa: BLE001 - normalized below.
+        # @spec REQUEST-APPROVAL-5/6: every refusal on a canonical route after the
+        # actor authenticated is audited once, after the phase that raised it has
+        # closed its reader, writer and fence: the phase 1 capture as every later
+        # phase. A grouped or unexpected failure reads as unavailable unless a
+        # definitive denial is inside it. A non-canonical route, or a failure
+        # before authentication, propagates unchanged and unaudited.
+        if audited is None:
+            raise
+        # The normalized refusal is never bound to a local: a frame holding the
+        # exception that holds the frame would keep both alive until a GC pass.
+        await _audit_answer_refusal(
+            factory, audited, principal, answer, _boundary_refusal(error),
+            "capture" if composition is None else composition.stage,
+        )
+        raise _boundary_refusal(error) from None
+
+
+async def _audit_answer_refusal(
+    factory: Any, row: Approval, principal: AuthenticatedApprovalPrincipal,
+    answer: ApprovalAnswer, refusal: HTTPException, stage: str,
+) -> None:
+    """One ``denied`` row naming the authenticated actor, for a 403 or 503 refusal.
+
+    @spec REQUEST-APPROVAL-5/6.
+    """
+    await _audit_refusal(factory, row, _RefusalAudit(
+        "denied", principal.subject, principal.actor_channel, principal.kind, True,
+        answer.decision,
+    ), refusal, stage)
+
+
+async def _decide(
+    composition: _Composition, principal: AuthenticatedApprovalPrincipal,
+    answer: ApprovalAnswer, actor_scope: _Actor,
+) -> Approval:
+    """Phases 2 to 5 of one answer. @spec HTTP-APPROVAL-CONTINUITY-9 REQUEST-APPROVAL-5."""
+    runtime, factory, valkey = composition.runtime, composition.factory, composition.valkey
+    approval_id, snapshot, saved = composition.approval_id, composition.snapshot, composition.saved
+    await composition.observe_and_apply()
+    await composition.recheck()
+    actor = composition.subjects[1]
+
+    # Phase 5: the one mutation; no external call here.
+    composition.stage = "commit"
+    async with identity_fence.mutation(factory, valkey) as writer:
+        async with writer.begin():
+            current_facts = await composition.verify(writer, writer=True)
+            if (
+                answer.decision == ApprovalStatus.approved
+                and composition.row.selection_mode == "dynamic"
+                and composition.selection_evidence is not None
+            ):
+                # @spec REQUEST-APPROVAL-5: the selection was judged in this same
+                # transaction just above, so open the 0156 storage gate for it alone.
+                await writer.execute(
+                    text("SELECT set_config(:name, :value, true)"),
+                    {"name": SELECTION_ENFORCED[0], "value": SELECTION_ENFORCED[1]},
+                )
+            locked = (await writer.execute(
+                select(Approval).where(Approval.id == approval_id).with_for_update()
+                .execution_options(populate_existing=True)
+            )).scalar_one_or_none()
+            locked = _pending(locked, snapshot)
+            locked.status = ApprovalStatus(answer.decision)
+            locked.next_remind_at = None
+            locked.resolved_by = principal.subject
+            locked.resolution_note = answer.note
+            locked.resolved_at = datetime.now(UTC).replace(tzinfo=None)
+            await writer.flush()
+            await writer.refresh(locked)
+            locked.identity_context = _reseal(
+                runtime, saved, locked, actor, actor_scope.channel, current_facts["approver"],
+                composition.applications["approver"], composition.final,
+            )
+            authenticated = authenticated_actor_evidence(principal)
+            recovery = answer.operation == "recover"
+            writer.add(ApprovalAuditEntry(
+                approval_id=locked.id,
+                action=_RECOVERY_AUDIT_ACTION if recovery else "resolved",
+                actor=principal.subject, actor_channel=principal.actor_channel,
+                principal_kind=principal.kind, authenticated=True, principal_subject=None,
+                decision=answer.decision,
+                authorizer=_RECOVERY_AUTHORIZER if recovery else _AUTHORIZER, authorized=True,
+                reason=answer.note,
+                evidence={
+                    "kind": "administrative_recovery", "recovery_key": answer.recovery_key,
+                    "facts": list(answer.recovery_facts), "authenticated_actor": authenticated,
+                    # @spec REQUEST-APPROVAL-5/6: a recovery on a canonical route
+                    # records the same judgment as an ordinary answer.
+                    **({} if composition.selection_evidence is None
+                       else {"selection": composition.selection_evidence}),
+                } if recovery else {
+                    "kind": "http_approval_answer", "authenticated_actor": authenticated,
+                    "route": composition.route_evidence,
+                    # @spec REQUEST-APPROVAL-5/6: the canonical-route judgment.
+                    **({} if composition.selection_evidence is None
+                       else {"selection": composition.selection_evidence}),
+                },
+            ))
+            await writer.flush()
+            await writer.commit()
+    return locked
+
+
+async def check_http_approval_actor(
+    request: Request, approval_id: uuid.UUID, *, approver_sets: Any,
+) -> None:
+    """Independent current approver authority of the preserved answering actor.
+
+    For a current boundary after resolution, such as approved-resume publication
+    or a grant check: purpose=approval and role=approver, against the actor and
+    canonical association sealed with the approved row, never the requester.
+    Read-only phases 1 to 4; phase 5 is absent. Returns None on current
+    authority. Raises ``HTTPException``: 403 ``caller_not_allowed`` when the
+    actor is denied or its registration no longer matches, 403
+    ``unsupported_approval`` when the row is not a sealed approved selected
+    session approval, 503 ``authority_unavailable`` otherwise.
+    @spec HTTP-APPROVAL-CONTINUITY-8/9.
+
+    On a canonical route the preserved actor must also still be the same
+    canonical person and pass ``approval_selection``; each refusal there
+    writes one ``resume_refused`` audit row once its readers have closed.
+    @spec REQUEST-APPROVAL-5/6.
+    """
+    runtime = getattr(request.app.state, "http_identity_runtime", None)
+    client = getattr(request.app.state, "http_identity_client", None)
+    if type(runtime) is not HttpInvocationRuntime or not isinstance(client, HttpIdentityClient):
+        _unavailable()
+    factory, valkey = request.app.state.sessionmaker, request.app.state.valkey
+    audited: tuple[Approval, wire.ApprovalContextV1] | None = None
+    composition: _Composition | None = None
+    try:
+        async with factory() as session, session.begin():
+            await identity_fence.lock_identity_reader(session)
+            row = await session.get(Approval, approval_id, populate_existing=True)
+            saved = None if row is None else verified_capsule(runtime, row)
+            if (
+                row is None or saved is None or row.status != ApprovalStatus.approved
+                or saved.status != "approved" or row.purpose != "session"
+            ):
+                _refuse(403, "unsupported_approval")
+            route_binding = await approvals_crud.get_approval_route_binding(session, row)
+            dm = await approver_dm.card(session, row)
+            # Detached while fully loaded, so a rollback of this reader cannot
+            # expire it: the capture refusal audit reads it as after a commit.
+            session.expunge(row)
+            if approval_selection.canonical_route(row, route_binding):
+                audited = (row, saved)
+            actor, association = _preserved_actor(runtime, row, saved, dm)
+            subject = await _prepare(
+                session, runtime, "approver", actor.registration, actor.source,
+            )
+            snapshot = approval_record_digest(row)
+        composition = _Composition(
+            request, runtime, client, factory, valkey, approval_id, snapshot, row,
+            route_binding, approver_sets, actor.source.sender.native_id, actor.channel,
+            [subject], {"approver": association}, saved, preserved=True, dm=dm,
+        )
+        await composition.observe_and_apply()
+        await composition.recheck()
+    except (Exception, BaseExceptionGroup) as error:  # noqa: BLE001 - normalized below.
+        # Provider, credential and SQL details never cross. The refusal is never
+        # bound to a local, so no frame-exception cycle outlives the check.
+        if audited is not None:
+            await _audit_resume_refusal(
+                factory, *audited, error,
+                "capture" if composition is None else composition.stage,
+            )
+        raise _boundary_refusal(error) from None
+
+
+async def _audit_resume_refusal(
+    factory: Any, row: Approval, saved: wire.ApprovalContextV1, error: BaseException,
+    stage: str,
+) -> None:
+    """One ``resume_refused`` row naming the preserved answering actor, no principal kind.
+
+    Only for a canonical route and a 403 or 503 refusal, after every reader of
+    the refused check has closed. A retried check adds a row per refusal.
+    @spec REQUEST-APPROVAL-5/6.
+    """
+    scope = saved.actor_scope
+    code = (
+        "principal_inactive"
+        if isinstance(error, principal_authority.PrincipalAuthorityRefusal)
+        and error.code == "principal_inactive" else None
+    )
+    await _audit_refusal(factory, row, _RefusalAudit(
+        _RESUME_REFUSED, scope.native_id if scope is not None else (row.resolved_by or ""),
+        None if scope is None else scope.actor_channel, None, False, saved.status,
+    ), _boundary_refusal(error), stage, code=code)
+
+
+@dataclass(frozen=True)
+class ApprovedResumeCurrent:
+    """An approved resume's final reader plus its freshly verified original invoker.
+
+    ``invoker`` is the invocation role's canonical identity from this same
+    composition, or None when its fresh outcome is not resolved;
+    ``invoker_human`` says whether that application carried a human
+    principal. Never the approver's. @spec CONNECTOR-REQUESTER-1 HTTP-APPROVAL-CONTINUITY-8.
+    """
+
+    authority: CurrentResumeAuthority
+    invoker: codec.ContextCanonicalV1 | None = field(repr=False)
+    invoker_human: bool = field(repr=False)
+
+
+ApprovedResumeInvokerAuthority = Callable[
+    [wire.ApprovalContextV1], AbstractAsyncContextManager[ApprovedResumeCurrent]
+]
+
+
+def approved_resume_authority(state: Any) -> ApprovedResumeAuthority:
+    """The current check publication uses: only the final reader and its windows.
+
+    @spec HTTP-APPROVAL-CONTINUITY-8/9/11.
+    """
+    observe = approved_resume_current(state, preserve_inactive=True)
+
+    @asynccontextmanager
+    async def authority(saved: wire.ApprovalContextV1) -> AsyncIterator[CurrentResumeAuthority]:
+        """@spec HTTP-APPROVAL-CONTINUITY-8/9/11."""
+        for attempt in range(_RESUME_AUTHORITY_ATTEMPTS):
+            entered = False
+            try:
+                async with observe(saved) as current:
+                    entered = True
+                    yield current.authority
+                    return
+            except _LifecycleGenerationConflict:
+                if entered or attempt == _RESUME_AUTHORITY_ATTEMPTS - 1:
+                    raise
+            await asyncio.sleep(_RESUME_AUTHORITY_BACKOFF_S * (attempt + 1))
+
+    return authority
+
+
+def approved_resume_current(
+    state: Any, *, preserve_inactive: bool = False,
+) -> ApprovedResumeInvokerAuthority:
+    """The two-subject current check an approved selected resume publishes under.
+
+    Fresh original-invoker (purpose=invocation) and preserved answering-actor
+    (purpose=approval, role=approver) authority, each against its sealed
+    association, through the same read-only phases 1 to 4 as
+    ``check_http_approval_actor``. Every lookup and route-membership decision
+    finishes before the final read-only reader opens; that reader is yielded
+    with the stable fence read under it and one T1 window per role, and it
+    writes nothing. Phase 5 is absent. @spec HTTP-APPROVAL-CONTINUITY-8/9/11.
+
+    It also yields the invocation role's freshly verified identity, which the
+    turn current check projects for an opted-in agent. @spec CONNECTOR-REQUESTER-1.
+
+    Publication sets ``preserve_inactive`` so its own active observation cannot
+    reactivate a stored disabled or revoked principal. Other current checks
+    retain ordinary HTTP observation lifecycle semantics.
+
+    It serves approved-resume publication, ``turn-authority/check`` and
+    ``approval-grant/check``. On a canonical route the preserved answering
+    actor must still be the same canonical person and pass
+    ``approval_selection``; each refusal before the yield writes one
+    ``resume_refused`` audit row, in its own transaction once this check's
+    readers have closed, and the refusal then propagates unchanged.
+    @spec REQUEST-APPROVAL-5/6.
+    """
+
+    @asynccontextmanager
+    async def authority(saved: wire.ApprovalContextV1) -> AsyncIterator[ApprovedResumeCurrent]:
+        """@spec HTTP-APPROVAL-CONTINUITY-8/9/11 CONNECTOR-REQUESTER-1."""
+        runtime = getattr(state, "http_identity_runtime", None)
+        client = getattr(state, "http_identity_client", None)
+        if type(runtime) is not HttpInvocationRuntime or not isinstance(
+            client, HttpIdentityClient,
+        ):
+            _unavailable()
+        request = cast(Request, SimpleNamespace(app=SimpleNamespace(state=state)))
+        factory, valkey = state.sessionmaker, state.valkey
+        approval_id = uuid.UUID(saved.approval_id)
+        audited: Approval | None = None
+        composition: _Composition | None = None
+        entered = False
+        try:
+            # Phase 1: a short reader capture of both subjects; released before lookups.
+            async with factory() as session, session.begin():
+                await identity_fence.lock_identity_reader(session)
+                row = await session.get(Approval, approval_id, populate_existing=True)
+                if (
+                    row is None or row.status != ApprovalStatus.approved
+                    or row.purpose != "session"
+                    or verified_capsule(runtime, row) != saved or saved.status != "approved"
+                ):
+                    _refuse(403, "unsupported_approval")
+                route_binding = await approvals_crud.get_approval_route_binding(session, row)
+                dm = await approver_dm.card(session, row)
+                # Detached while fully loaded, so a rollback of this reader cannot
+                # expire it: the capture refusal audit reads it as after a commit.
+                session.expunge(row)
+                if approval_selection.canonical_route(row, route_binding):
+                    audited = row
+                actor, association = _preserved_actor(runtime, row, saved, dm)
+                try:
+                    caller_registration, caller_source = turn_invocation_source(runtime, saved)
+                except HTTPException:
+                    _deny()
+                caller = await _prepare(
+                    session, runtime, "invocation", caller_registration, caller_source,
+                )
+                approver = await _prepare(
+                    session, runtime, "approver", actor.registration, actor.source,
+                )
+                snapshot = approval_record_digest(row)
+            composition = _Composition(
+                request, runtime, client, factory, valkey, approval_id, snapshot, row,
+                route_binding, state.approver_sets, actor.source.sender.native_id,
+                actor.channel, [caller, approver], {"invocation": saved, "approver": association},
+                saved, preserved=True, dm=dm, preserve_inactive=preserve_inactive,
+            )
+            # Phases 2 and 3: lookups and route membership outside SQL, then lifecycle.
+            await composition.observe_and_apply()
+            # Phase 4: the final clean reader, held open across the guarded append.
+            composition.stage = "recheck"
+            async with factory() as session, session.begin():
+                await identity_fence.lock_identity_reader(session)
+                facts = await composition.verify(session, writer=False)
+                _pending(
+                    await session.get(Approval, approval_id, populate_existing=True),
+                    snapshot, status=row.status,
+                )
+                stable = await valkey.get(identity_fence.FENCE_KEY)
+                if isinstance(stable, bytes):
+                    stable = stable.decode("ascii")
+                if type(stable) is not str or not stable.startswith("stable:"):
+                    _unavailable()
+                windows: dict[Literal["invocation", "approver"], ResumeWindow] = {}
+                for subject in composition.subjects:
+                    validity = identity_delivery_window(
+                        facts[subject.role], subject.credential.limits,
+                    )
+                    windows[subject.role] = ResumeWindow(
+                        validity.lower_seconds * 1_000_000 + validity.lower_microseconds,
+                        validity.upper_seconds * 1_000_000 + validity.upper_microseconds,
+                    )
+                current = ApprovedResumeCurrent(
+                    CurrentResumeAuthority(session=session, stable_fence=stable, windows=windows),
+                    invoker=resolved_identity(facts["invocation"]),
+                    invoker_human=composition.applications["invocation"].principal_id is not None,
+                )
+                entered = True
+                yield current
+        except (Exception, BaseExceptionGroup) as error:  # noqa: BLE001 - audited, re-raised.
+            # The caller's body and every non-canonical route keep their own
+            # failure; each boundary maps it exactly as before.
+            if entered or audited is None:
+                raise
+            await _audit_resume_refusal(
+                factory, audited, saved, error,
+                "capture" if composition is None else composition.stage,
+            )
+            raise
+
+    return authority
+
+
+async def publish_answered_resume(
+    session: AsyncSession, resume_queue: Any, row: Approval, *, reconciler_enabled: bool,
+) -> None:
+    """Publish the wake a committed selected answer owes, after its commit.
+
+    Called only once the commit owner has positively acknowledged the
+    resolution: never inside the mutation or under a row lock. A refusal
+    appends nothing and leaves the wake owed; any other failure is not marked
+    either, and the committed resolution still stands. Leaving it owed is safe
+    only when ``reconciler_enabled`` names a backstop that will retry it;
+    without one the failure is re-raised so the caller sees it, matching the
+    legacy resolver. @spec HTTP-APPROVAL-CONTINUITY-10/11.
+    """
+    try:
+        await resume_queue.enqueue_approval(row.id, parent=approval_trace_context(row))
+    except ApprovalResumeRefused as refused:
+        logger.warning(
+            "approval %s resolved; selected resume refused (%s), %s",
+            row.id, refused.code, _owed(reconciler_enabled),
+        )
+        if not reconciler_enabled:
+            raise
+        return
+    except Exception:  # the resolution committed; the wake stays owed.
+        logger.warning(
+            "approval %s resolved; selected resume enqueue failed, %s",
+            row.id, _owed(reconciler_enabled),
+        )
+        if not reconciler_enabled:
+            raise
+        return
+    try:
+        await approvals_crud.mark_approval_resumed(session, row.id)
+    except Exception:  # noqa: BLE001 - a duplicate wake is absorbed by the done-marker.
+        logger.warning("approval %s resume appended; marking it resumed failed", row.id)
+
+
+def _owed(reconciler_enabled: bool) -> str:
+    """@spec HTTP-APPROVAL-CONTINUITY-11."""
+    if reconciler_enabled:
+        return "the wake stays owed to the resume reconciler"
+    return "nothing will retry it (resume reconciler disabled)"

@@ -433,6 +433,7 @@ def test_the_orm_declares_the_route_key_and_check() -> None:
     key = next(
         c for c in table.constraints if isinstance(c, UniqueConstraint) and c.name == ROUTE_KEY
     )
-    assert [col.name for col in key.columns] == ["kind", "address", "adapter"]
+    # 0105 widens the key with the trigger label (#4361).
+    assert [col.name for col in key.columns] == ["kind", "address", "adapter", "trigger_label"]
     assert key.dialect_options["postgresql"]["nulls_not_distinct"] is True
     assert any(isinstance(c, CheckConstraint) and c.name == ROUTE_CK for c in table.constraints)

@@ -11,13 +11,20 @@ from __future__ import annotations
 import uuid
 
 import httpx
-from fastapi import APIRouter, Depends, HTTPException, Query, Response, status
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response, status
 
-from .. import crud, factory_usage, workitem_outcomes
+from curie_api.crud import agents as crud_agents
+from curie_api.schemas.workitems import WorkItemOutcomeList, WorkItemOutcomeOut, WorkItemUsageOut
+
+from .. import factory_ci, factory_usage, workitem_outcomes
 from ..auth import require_api_key
+from ..code_host_trust import code_host_verify
 from ..config import get_settings
 from ..deps import SessionDep
-from ..schemas import WorkItemOutcomeList, WorkItemOutcomeOut, WorkItemUsageOut
+from ..forges.errors import Unavailable
+from ..forges.ports import CodeHost
+from ..forges.registry import ForgeRegistry
+from ..forges.trackers import code_host_for_repository, stored_repository
 
 router = APIRouter(
     prefix="/work-items",
@@ -36,7 +43,7 @@ async def list_work_items(
     limit: int = Query(50, ge=1, le=200),
 ) -> WorkItemOutcomeList:
     response.headers["Cache-Control"] = "no-store"
-    if agent_id is not None and await crud.get_agent(session, agent_id) is None:
+    if agent_id is not None and await crud_agents.get_agent(session, agent_id) is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, _NOT_FOUND)
     items, truncated = await workitem_outcomes.load_outcomes(
         session, agent_id=agent_id, limit=limit, settings=get_settings()
@@ -47,6 +54,7 @@ async def list_work_items(
 @router.get("/{work_item_id}", response_model=WorkItemOutcomeOut)
 async def get_work_item(
     work_item_id: uuid.UUID,
+    request: Request,
     session: SessionDep,
     response: Response,
     agent_id: uuid.UUID | None = None,
@@ -59,8 +67,35 @@ async def get_work_item(
     if loaded is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, _NOT_FOUND)
     view, item, lineage = loaded
-    async with httpx.AsyncClient() as client:
-        view.ci = await workitem_outcomes.observe_ci(lineage, item, settings, client)
+    registry: ForgeRegistry = request.app.state.forges
+    # The code host entry the lineage (or the WorkItem alone) recorded, never
+    # the install's GitHub accessor (#4358 plan D14).
+    repository = stored_repository(
+        settings,
+        kind=(lineage.code_host_kind if lineage is not None else None) or item.code_host_kind,
+        host=(lineage.code_host_host if lineage is not None else None) or item.code_host_host,
+        path=(lineage.repo_full_name if lineage is not None else None) or item.repository_path,
+        project_id=(lineage.repository_project_id if lineage is not None else None)
+        or item.repository_project_id,
+    )
+    async with httpx.AsyncClient(verify=code_host_verify(settings)) as client:
+        code_host: CodeHost | None
+        try:
+            code_host = code_host_for_repository(
+                registry,
+                client,
+                repository,
+                installations=factory_ci.stored_installation(lineage, item),
+            )
+        except Unavailable:
+            code_host = None
+        view.ci = await workitem_outcomes.observe_ci(
+            code_host,
+            settings,
+            lineage,
+            item,
+            repository=repository,
+        )
     return view
 
 

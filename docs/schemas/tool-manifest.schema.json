@@ -1,0 +1,73 @@
+{
+  "$defs": {
+    "ManifestTool": {
+      "additionalProperties": false,
+      "description": "A tool whose executable and version were observed during image build.",
+      "properties": {
+        "name": {
+          "minLength": 1,
+          "pattern": "\\S",
+          "title": "Name",
+          "type": "string"
+        },
+        "path": {
+          "minLength": 1,
+          "pattern": "\\S",
+          "title": "Path",
+          "type": "string"
+        },
+        "source": {
+          "enum": [
+            "catalog",
+            "probe"
+          ],
+          "title": "Source",
+          "type": "string"
+        },
+        "version": {
+          "minLength": 1,
+          "pattern": "\\S",
+          "title": "Version",
+          "type": "string"
+        }
+      },
+      "required": [
+        "name",
+        "version",
+        "path",
+        "source"
+      ],
+      "title": "ManifestTool",
+      "type": "object"
+    }
+  },
+  "$id": "https://curietech.ai/schemas/tool-manifest.schema.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "description": "The future CLI-produced, runner-read tool manifest carried in an image.",
+  "properties": {
+    "docker_cli": {
+      "title": "Docker Cli",
+      "type": "boolean"
+    },
+    "schema_version": {
+      "const": 1,
+      "title": "Schema Version",
+      "type": "integer"
+    },
+    "tools": {
+      "items": {
+        "$ref": "#/$defs/ManifestTool"
+      },
+      "title": "Tools",
+      "type": "array"
+    }
+  },
+  "required": [
+    "schema_version",
+    "tools",
+    "docker_cli"
+  ],
+  "title": "ToolManifest",
+  "type": "object"
+}

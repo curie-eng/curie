@@ -1,0 +1,16 @@
+{
+  "size": 1,
+  "limit": 25,
+  "isLastPage": true,
+  "values": [
+    {
+      "id": "refs/heads/curie/demo-change",
+      "displayId": "curie/demo-change",
+      "type": "BRANCH",
+      "latestCommit": "7a3f0c9e1d2b4a5f6e7d8c9b0a1f2e3d4c5b6a79",
+      "latestChangeset": "7a3f0c9e1d2b4a5f6e7d8c9b0a1f2e3d4c5b6a79",
+      "isDefault": false
+    }
+  ],
+  "start": 0
+}

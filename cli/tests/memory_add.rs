@@ -1,7 +1,7 @@
 //! Integration: `curie <tier> memory --add` posts through the memory surface
 //! (`POST /agents/{id}/memory`, #1904), not the reserved state-append path.
 
-mod support;
+use crate::support;
 
 use std::process::{Command, Stdio};
 

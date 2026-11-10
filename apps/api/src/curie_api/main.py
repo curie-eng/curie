@@ -9,10 +9,14 @@ import logging
 import os
 import time
 from collections.abc import AsyncIterator
-from contextlib import asynccontextmanager
+from contextlib import AsyncExitStack, asynccontextmanager
+from functools import partial
 
 import httpx
 import redis.asyncio as redis
+from curie_channel_gateway.tls import gateway_http_mounts
+from curie_internal.valkey import AsyncRedis
+from curie_protected_hooks.source_policy_sql import SourceGate
 from curie_telemetry import (
     TRACEPARENT_STREAM_FIELD,
     bootstrap_service_telemetry,
@@ -25,27 +29,57 @@ from curie_telemetry import (
 from fastapi import FastAPI, HTTPException, Request
 from opentelemetry.trace import SpanKind, StatusCode
 from starlette.routing import Match
+from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
-from . import __version__, crud
+from curie_api.crud import agents as crud_agents
+
+from . import __version__, oidc
+from .approval_reminders import enqueue_reminder
+from .channel_identities import start_static_slack_bootstrap
+from .code_host_trust import code_host_verify
 from .commitpoller import CommitPoller, GitHubBranchTip
 from .config import get_settings
-from .db import create_engine, create_sessionmaker
+from .db import (
+    create_engine,
+    create_liveness_engine,
+    create_sessionmaker,
+    create_source_gate_engine,
+)
 from .evalqueue import EvalQueue
+from .forges.registry import forges_registry
 from .github_app import credentials_for, log_credential_path
 from .github_checks import GitHubStatusReporter
 from .github_review_store import GitHubReviewReconciler
 from .graveyardwatcher import GraveyardWatcher
+from .identity.http_approval import http_expiry_owner, identity_runtime
+from .identity.http_approval_answer import approved_resume_authority
+from .identity.http_initializer import (
+    configured_http_identity_runtime,
+    load_provider_tls_context,
+)
+from .identity.http_invocation import HttpInvocationRuntime
+from .identity.http_resume_publication import http_resume_owner
+from .identity.http_transport import HttpIdentityClient
+from .identity_fence import IdentityFenceMiddleware
 from .k8s import build_lazy_pod_lister, build_lazy_pod_log_reader
 from .killswitch import KillSwitch
 from .langfuse import LangfuseClient
+from .lineage_reconciler import start_lineage_reconciler
+from .protected_reconciler import ProtectedAdmissionReconciler
+from .remediation_admission import reconcile_admissions
 from .resumequeue import ResumeQueue
 from .resumereconciler import ResumeReconciler
 from .routers import (
+    action_executions,
     actions,
+    agent_access,
     agents,
     approval_recovery,
     approvals,
+    attachment_access,
     bundles,
+    channel_identities,
+    channel_read,
     channels,
     cluster_message_replies,
     config,
@@ -53,23 +87,46 @@ from .routers import (
     control,
     deploy_targets,
     deployments,
+    directory,
     evals,
+    factory_slack,
     factory_status,
+    forge_credential_health,
     gitflow_routing,
     github,
     github_reviews,
     hook_fire,
+    hook_source_policy,
+    hook_wake,
     hooks,
+    identity,
+    identity_admin,
+    identity_approvals,
+    identity_authority,
+    identity_connect,
+    identity_operator,
     memory,
     observability,
+    provider_installations,
+    publication_code_host,
     publication_precheck,
+    publication_ui_evidence,
     publications,
+    remediation_nominations,
+    remediation_policy,
+    remediation_qualifications,
+    remediation_receipts,
     runs,
     schedules,
     state,
+    teams,
+    thread_attachments,
     turn_progress,
+    work_item_issue,
     work_item_outcomes,
     work_items,
+    workspace_recovery,
+    workspace_recovery_access,
     workspaces,
 )
 from .schema_compat import assert_servable
@@ -77,13 +134,22 @@ from .slack_approvers import build_approver_set_selector
 from .storage import BundleStore
 from .sweeper import run_expiry_sweeper
 from .threadreset import ThreadResetRequests
+from .ui_evidence_reconciler import start_ui_evidence_reconciler
 from .workitem_reconciler import WorkItemReconciler
 
 _LOG = logging.getLogger("curie_api")
 
 
+def _validate_forwarded_allow_ips() -> None:
+    """Require socket peer identity for every console request budget."""
+    if os.environ.get("FORWARDED_ALLOW_IPS", ""):
+        raise RuntimeError("FORWARDED_ALLOW_IPS must be empty")
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
+    """@spec PROTECTED-HOOK-SOURCE-2/10."""
+    _validate_forwarded_allow_ips()
     settings = get_settings()
     # Fail closed when this image cannot serve the live schema. Migrations are
     # applied by the upgrade Job / curie-migrate, never here (#2300).
@@ -91,7 +157,15 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     engine = create_engine()
     app.state.engine = engine
     app.state.sessionmaker = create_sessionmaker(engine)
-    http_client = httpx.AsyncClient(timeout=10.0)
+    # The factory's forge registry, built once from CURIE_FORGES (#4397), so a
+    # config the registry refuses fails boot rather than the first factory pass.
+    app.state.forges = forges_registry(settings)
+    # The shared client reaches the code host, so it trusts the operator's
+    # code host CA bundle as well as the public roots (#3831).
+    http_client = httpx.AsyncClient(
+        timeout=10.0, verify=code_host_verify(settings),
+        mounts=gateway_http_mounts(settings.channel_gateway_url),
+    )
     app.state.http_client = http_client
     app.state.langfuse = LangfuseClient(settings, http_client)
     store = BundleStore(settings)
@@ -102,11 +176,25 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     # for a proxy most runs never touch.
     app.state.pod_log_reader = build_lazy_pod_log_reader(settings.kube_config_path)
     app.state.pod_lister = build_lazy_pod_lister(settings.kube_config_path)
-    valkey: redis.Redis = redis.from_url(settings.valkey_dsn())
+    valkey: redis.Redis = AsyncRedis.from_url(settings.valkey_dsn())
     app.state.valkey = valkey
+    credential_valkey = AsyncRedis.from_url(settings.valkey_dsn(), retry_reads=False)
+    app.state.credential_valkey = credential_valkey
     app.state.kill_switch = KillSwitch(valkey)
     app.state.thread_reset_requests = ThreadResetRequests(valkey)
     app.state.eval_queue = EvalQueue(valkey)
+    from .deploy_notice import DeployNoticeQueue
+
+    app.state.deploy_notice_queue = DeployNoticeQueue(
+        valkey, settings.deploy_notice_stream_name(), app.state.sessionmaker
+    )
+    app.state.deploy_notice_reconciler_task = (
+        asyncio.create_task(
+            app.state.deploy_notice_queue.run_forever(settings.deploy_notice_reconciler_interval_s)
+        )
+        if settings.deploy_notice_reconciler_enabled
+        else None
+    )
     # resume_dead_letter_stream stays the narrower override that wins when set;
     # its fallback is now the unified graveyard name (which honors
     # CURIE_DEAD_LETTER_STREAM / CURIE_STREAM via the shared derivation, #668)
@@ -116,7 +204,13 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         valkey,
         stream=settings.runs_stream,
         dead_letter_stream=settings.resume_dead_letter_stream or settings.dead_letter_stream_name(),
+        # @spec HTTP-APPROVAL-CONTINUITY-8/11: selected resumes are built and
+        # authorized by the API owner; an approved row also needs the preserved
+        # answering actor's fresh approver authority.
+        approvals=http_resume_owner(app.state, approved=approved_resume_authority(app.state)),
     )
+    # @spec HTTP-APPROVAL-CONTINUITY-10: the only writer that may expire a selected row.
+    app.state.http_approval_expiry = http_expiry_owner(app.state)
     app.state.github_review_reconciler = GitHubReviewReconciler(
         app.state.sessionmaker,
         valkey,
@@ -129,14 +223,13 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         and settings.github_review_reconciler_interval_s > 0
         else None
     )
-    # The composition root for approvals (#420, ADR-0034): the only place that
-    # names Slack to build the approver-set selector, so the authorizer and the
-    # resolve endpoint depend on ports rather than on a provider. Each Slack
-    # identity's usergroup client shares the app's httpx client (ADR-0168
-    # decision 5); with no bot token there is none, the normal Slack-free
-    # deployment, and a route that declares an approvers group then fails
-    # closed at resolve time rather than silently widening.
+    # Authorization and freshness policy use authenticated gateway membership ports.
     app.state.approver_sets = build_approver_set_selector(http_client, settings)
+    # Declarations reserve identities; only the gateway or dispatcher can later
+    # attest provider availability. Bootstrap never reads a provider token.
+    app.state.static_slack_bootstrap_task = await start_static_slack_bootstrap(
+        app.state.sessionmaker, settings
+    )
     app.state.github_reporter = GitHubStatusReporter(
         http_client,
         api_url=settings.github_api_url,
@@ -153,6 +246,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         grace_seconds=settings.resume_reconciler_grace_seconds,
         batch_limit=settings.resume_reconciler_batch_limit,
         dead_letter_scan_limit=settings.resume_dead_letter_scan_limit,
+        identity_runtime=identity_runtime(app.state),
     )
     app.state.resume_reconciler = reconciler
     work_item_reconciler = WorkItemReconciler(
@@ -166,10 +260,21 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         if settings.work_item_reconciler_enabled
         else None
     )
+    app.state.work_item_status_comments_task = (
+        asyncio.create_task(work_item_reconciler.run_status_comments_forever())
+        if settings.work_item_reconciler_enabled
+        else None
+    )
     app.state.resume_reconciler_task = (
         asyncio.create_task(reconciler.run_forever())
         if settings.resume_reconciler_enabled
         else None
+    )
+    app.state.lineage_reconciler_task = start_lineage_reconciler(
+        app.state.sessionmaker, settings, http_client
+    )
+    app.state.ui_evidence_reconciler_task = start_ui_evidence_reconciler(
+        app.state.sessionmaker, settings, http_client
     )
     # The expiry sweeper (#412) flips lapsed pending approvals and resumes their
     # stranded sessions. It shares this lifecycle's resources (sessionmaker,
@@ -184,6 +289,23 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
                 settings.approval_sweep_interval_s,
                 sweeper_stop,
                 publication_patch_retention_seconds=(settings.publication_patch_retention_seconds),
+                http_expiry=app.state.http_approval_expiry,
+                identity_runtime=identity_runtime(app.state),
+                reminder_enqueue=(
+                    partial(enqueue_reminder, valkey, settings.runs_stream)
+                    if settings.approval_reminders_enabled
+                    else None
+                ),
+                remediation_admissions=(
+                    partial(
+                        reconcile_admissions,
+                        store=app.state.bundle_store,
+                        kill_switch=app.state.kill_switch,
+                        identity_runtime=identity_runtime(app.state),
+                    )
+                    if settings.remediation_enabled and settings.action_executor_enabled
+                    else None
+                ),
             )
         )
     else:
@@ -214,6 +336,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
             store=app.state.bundle_store,
             settings=settings,
             eval_queue=app.state.eval_queue,
+            notice_queue=app.state.deploy_notice_queue,
             tips=GitHubBranchTip(settings, credentials_for(settings)),
             interval_seconds=settings.commit_poll_interval_s,
         )
@@ -228,6 +351,13 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         environ=os.environ,
         level=settings.log_level.upper(),
     )
+    # Keep access and error records at INFO on the shared telemetry handlers.
+    configure_service_logging(
+        logging.getLogger("uvicorn"),
+        service_name="curie-api",
+        logger_provider=telemetry.logger_provider,
+        level=logging.INFO,
+    )
     app.state.telemetry = telemetry
     for limit in ("value", "namespace"):
         record_metric(
@@ -240,67 +370,119 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
                 "limit": limit,
             },
         )
-    try:
-        yield
-    finally:
-        review_task = getattr(app.state, "github_review_reconciler_task", None)
-        if review_task is not None:
-            review_task.cancel()
-            try:
-                await review_task
-            except asyncio.CancelledError:
-                pass
-        # Both background loops enqueue via resume_queue (which uses the valkey
-        # client) and read via the sessionmaker, so both are stopped BEFORE
-        # valkey.aclose()/engine.dispose() below.
-        work_item_task = getattr(app.state, "work_item_reconciler_task", None)
-        if work_item_task is not None:
-            work_item_task.cancel()
-            try:
-                await work_item_task
-            except asyncio.CancelledError:
-                pass
-        task = getattr(app.state, "resume_reconciler_task", None)
-        if task is not None:
-            task.cancel()
-            try:
-                await task
-            except asyncio.CancelledError:
-                pass
-        # Stop the sweeper BEFORE closing valkey/engine so an in-flight pass does
-        # not race the closed clients. The wait-first loop wakes immediately on
-        # stop.set(); wait_for already cancels on timeout, so suppressing
-        # TimeoutError/CancelledError is the whole teardown.
-        if sweeper_stop is not None:
-            sweeper_stop.set()
-            try:
-                await asyncio.wait_for(app.state.sweeper_task, 5.0)
-            except (TimeoutError, asyncio.CancelledError):
-                pass
-        # Read-only, so simply cancel it before closing valkey.
-        watcher_task = getattr(app.state, "graveyard_watcher_task", None)
-        if watcher_task is not None:
-            watcher_task.cancel()
-            try:
-                await watcher_task
-            except asyncio.CancelledError:
-                pass
-        # Cancelled before engine.dispose(): a poll pass mid-deploy holds a
-        # session, and disposing the engine underneath it would raise on the
-        # way out rather than shutting down cleanly.
-        poller_task = getattr(app.state, "commit_poller_task", None)
-        if poller_task is not None:
-            poller_task.cancel()
-            try:
-                await poller_task
-            except asyncio.CancelledError:
-                pass
+    async with AsyncExitStack() as source_resources:
+        liveness_engine = create_liveness_engine()
+        source_resources.push_async_callback(liveness_engine.dispose)
+        app.state.liveness_engine = liveness_engine
+        app.state.liveness_sessionmaker = create_sessionmaker(liveness_engine)
+        source_gate_engine = create_source_gate_engine()
+        source_resources.push_async_callback(source_gate_engine.dispose)
+        app.state.source_gate = SourceGate(source_gate_engine)
+        # @spec PROTECTED-HOOK-LANE-4: one admission reconciler per process, inside
+        # the source resource scope, stopped before Valkey and the engines close.
+        protected_reconciler = ProtectedAdmissionReconciler(
+            lambda: get_settings().protected_runtime_dir
+        )
+        app.state.protected_admission_reconciler = protected_reconciler
+        protected_reconciler.start()
         try:
-            await valkey.aclose()
-            await http_client.aclose()
-            await engine.dispose()
+            yield
         finally:
-            telemetry.shutdown()
+            await protected_reconciler.stop()
+            notice_task = app.state.deploy_notice_reconciler_task
+            if notice_task is not None:
+                notice_task.cancel()
+                try:
+                    await notice_task
+                except asyncio.CancelledError:
+                    pass
+            # Holds a session while it retries, so it stops before engine.dispose().
+            bootstrap_task = getattr(app.state, "static_slack_bootstrap_task", None)
+            if bootstrap_task is not None:
+                bootstrap_task.cancel()
+                try:
+                    await bootstrap_task
+                except asyncio.CancelledError:
+                    pass
+            review_task = getattr(app.state, "github_review_reconciler_task", None)
+            if review_task is not None:
+                review_task.cancel()
+                try:
+                    await review_task
+                except asyncio.CancelledError:
+                    pass
+            # These background loops use Valkey and the database, so stop them
+            # before closing either resource.
+            status_task = getattr(app.state, "work_item_status_comments_task", None)
+            if status_task is not None:
+                status_task.cancel()
+                try:
+                    await status_task
+                except asyncio.CancelledError:
+                    pass
+            work_item_task = getattr(app.state, "work_item_reconciler_task", None)
+            if work_item_task is not None:
+                work_item_task.cancel()
+                try:
+                    await work_item_task
+                except asyncio.CancelledError:
+                    pass
+            evidence_task = getattr(app.state, "ui_evidence_reconciler_task", None)
+            if evidence_task is not None:
+                evidence_task.cancel()
+                try:
+                    await evidence_task
+                except asyncio.CancelledError:
+                    pass
+            lineage_task = getattr(app.state, "lineage_reconciler_task", None)
+            if lineage_task is not None:
+                lineage_task.cancel()
+                try:
+                    await lineage_task
+                except asyncio.CancelledError:
+                    pass
+            task = getattr(app.state, "resume_reconciler_task", None)
+            if task is not None:
+                task.cancel()
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass
+            # Stop the sweeper BEFORE closing valkey/engine so an in-flight pass does
+            # not race the closed clients. The wait-first loop wakes immediately on
+            # stop.set(); wait_for already cancels on timeout, so suppressing
+            # TimeoutError/CancelledError is the whole teardown.
+            if sweeper_stop is not None:
+                sweeper_stop.set()
+                try:
+                    await asyncio.wait_for(app.state.sweeper_task, 5.0)
+                except (TimeoutError, asyncio.CancelledError):
+                    pass
+            # Read-only, so simply cancel it before closing valkey.
+            watcher_task = getattr(app.state, "graveyard_watcher_task", None)
+            if watcher_task is not None:
+                watcher_task.cancel()
+                try:
+                    await watcher_task
+                except asyncio.CancelledError:
+                    pass
+            # Cancelled before engine.dispose(): a poll pass mid-deploy holds a
+            # session, and disposing the engine underneath it would raise on the
+            # way out rather than shutting down cleanly.
+            poller_task = getattr(app.state, "commit_poller_task", None)
+            if poller_task is not None:
+                poller_task.cancel()
+                try:
+                    await poller_task
+                except asyncio.CancelledError:
+                    pass
+            try:
+                await credential_valkey.aclose()
+                await valkey.aclose()
+                await http_client.aclose()
+                await engine.dispose()
+            finally:
+                telemetry.shutdown()
 
 
 def configure_logging(level: str | None = None) -> logging.Logger:
@@ -364,72 +546,17 @@ def _metric_http_method(method: str) -> str:
     return normalized if normalized in _HTTP_METHOD_DOMAIN else "OTHER"
 
 
-def create_app() -> FastAPI:
-    configure_logging()
-    # Which credential the platform will clone with (ADR-0092, #1262). One
-    # line, no secret, and a warning when the App is set up only halfway.
-    log_credential_path(get_settings())
-    app = FastAPI(title="Curie API", version="0.1.0", lifespan=lifespan)
+class HttpTelemetryMiddleware:
+    def __init__(self, app: ASGIApp, *, application: FastAPI) -> None:
+        self.app = app
+        self.application = application
 
-    @app.get("/health", tags=["health"])
-    async def health() -> dict[str, str]:
-        return {"status": "ok"}
-
-    @app.get(
-        "/ready",
-        tags=["health"],
-        responses={503: {"description": "Database is unavailable"}},
-    )
-    async def ready(request: Request) -> dict[str, str]:
-        try:
-            async with asyncio.timeout(2):
-                async with request.app.state.sessionmaker() as session:
-                    await crud.list_agents(session)
-        except Exception:
-            raise HTTPException(
-                status_code=503,
-                detail="Database is unavailable",
-            ) from None
-        return {"status": "ok"}
-
-    app.include_router(config.router)
-    app.include_router(console.router)
-    app.include_router(agents.router)
-    app.include_router(deployments.router)
-    app.include_router(bundles.router)
-    app.include_router(deploy_targets.router)
-    app.include_router(github.router)
-    app.include_router(github_reviews.router)
-    app.include_router(gitflow_routing.router)
-    app.include_router(observability.router)
-    app.include_router(control.router)
-    app.include_router(evals.router)
-    app.include_router(runs.router)
-    app.include_router(schedules.router)
-    app.include_router(hook_fire.router)
-    app.include_router(state.router)
-    app.include_router(memory.router)
-    # BEFORE approvals.router: GET /approvals/identity-report would otherwise
-    # be matched by GET /approvals/{approval_id} and fail as a bad uuid.
-    app.include_router(approval_recovery.router)
-    app.include_router(approvals.router)
-    app.include_router(actions.router)
-    app.include_router(publication_precheck.router)
-    app.include_router(publications.router)
-    app.include_router(publications.internal_router)
-    app.include_router(work_items.router)
-    app.include_router(factory_status.router)
-    app.include_router(turn_progress.router)
-    app.include_router(work_item_outcomes.router)
-    app.include_router(cluster_message_replies.router)
-    app.include_router(cluster_message_replies.internal_router)
-    app.include_router(workspaces.router)
-    app.include_router(channels.router)
-    app.include_router(hooks.router)
-
-    @app.middleware("http")
-    async def observe_http(request: Request, call_next):  # type: ignore[no-untyped-def]
-        operation = _route_template(app, request)
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+        request = Request(scope)
+        operation = _route_template(self.application, request)
         inbound_traceparent = request.headers.get(TRACEPARENT_STREAM_FIELD)
         canonical_traceparent = canonicalize_traceparent(inbound_traceparent)
         parent = extract_trace_context(
@@ -462,17 +589,22 @@ def create_app() -> FastAPI:
             ) as span:
                 if diagnostic is not None:
                     span.add_event(diagnostic)
-                response = await call_next(request)
-                status_code = response.status_code
-                if status_code >= 500 and hasattr(span, "set_status"):
-                    span.set_status(StatusCode.ERROR)
-                _LOG.info(
-                    "http request completed method=%s route=%s status_class=%s",
-                    _metric_http_method(request.method),
-                    operation,
-                    f"{status_code // 100}xx",
-                )
-                return response
+
+                async def observe_send(message: Message) -> None:
+                    nonlocal status_code
+                    if message["type"] == "http.response.start":
+                        status_code = message["status"]
+                        if status_code >= 500 and hasattr(span, "set_status"):
+                            span.set_status(StatusCode.ERROR)
+                        _LOG.info(
+                            "http request completed method=%s route=%s status_class=%s",
+                            _metric_http_method(request.method),
+                            operation,
+                            f"{status_code // 100}xx",
+                        )
+                    await send(message)
+
+                await self.app(scope, receive, observe_send)
         finally:
             outcome = f"{status_code // 100}xx" if 100 <= status_code < 600 else "5xx"
             completed_attributes = {**active_attributes, "outcome": outcome}
@@ -484,7 +616,181 @@ def create_app() -> FastAPI:
             )
             record_metric("curie.http.server.active", -1, attributes=active_attributes)
 
+
+# @spec HTTP-INVOCATION-EXECUTION-15
+def create_app(
+    *, http_identity_runtime: HttpInvocationRuntime | None = None,
+    http_identity_client: HttpIdentityClient | None = None,
+) -> FastAPI:
+    if (
+        (
+            http_identity_runtime is not None
+            and type(http_identity_runtime) is not HttpInvocationRuntime
+        )
+        or (
+            http_identity_client is not None
+            and type(http_identity_client) is not HttpIdentityClient
+        )
+        or (http_identity_client is not None and http_identity_runtime is None)
+    ):
+        raise ValueError("invalid_http_invocation_runtime") from None
+
+    @asynccontextmanager
+    async def initialized_lifespan(app: FastAPI) -> AsyncIterator[None]:
+        """@spec HTTP-INVOCATION-EXECUTION-15."""
+        client = http_identity_client
+        if http_identity_runtime is not None and client is None:
+            client = HttpIdentityClient()
+        app.state.http_identity_runtime = http_identity_runtime
+        app.state.http_identity_client = client
+        async with AsyncExitStack() as resources:
+            if client is not None:
+                await resources.enter_async_context(client)
+            async with lifespan(app):
+                yield
+
+    configure_logging()
+    # Which credential the platform will clone with (ADR-0092, #1262). One
+    # line, no secret, and a warning when the App is set up only halfway.
+    log_credential_path(get_settings())
+    # And whether an enabled OIDC login admits everyone its IdP signs in.
+    oidc.log_admission_policy(get_settings())
+    # Curie owns the redacted, closed-vocabulary HTTP telemetry below. FastAPI's
+    # native telemetry otherwise inserts a second server/operation span and
+    # configures independent exporters around that boundary (#4410).
+    app = FastAPI(
+        title="Curie API",
+        version="0.1.0",
+        lifespan=initialized_lifespan,
+        telemetry={
+            "tracing": False,
+            "metrics": False,
+            "logs": False,
+            "operation_spans": False,
+            "auto_configure": False,
+        },
+    )
+
+    @app.get("/health", tags=["health"])
+    async def health() -> dict[str, str]:
+        return {"status": "ok"}
+
+    @app.get(
+        "/ready",
+        tags=["health"],
+        responses={503: {"description": "Database is unavailable"}},
+    )
+    async def ready(request: Request) -> dict[str, str]:
+        try:
+            async with asyncio.timeout(2):
+                async with request.app.state.liveness_sessionmaker() as session:
+                    await crud_agents.list_agents(session)
+        except Exception:  # noqa: BLE001 - existing broad catch retained
+            raise HTTPException(
+                status_code=503,
+                detail="Database is unavailable",
+            ) from None
+        return {"status": "ok"}
+
+    app.include_router(config.router)
+    app.include_router(console.router)
+    app.include_router(agents.router)
+    app.include_router(hook_source_policy.router)
+    app.include_router(remediation_policy.router)
+    app.include_router(remediation_nominations.router)
+    app.include_router(remediation_qualifications.router)
+    app.include_router(remediation_receipts.router)
+    app.include_router(deployments.router)
+    app.include_router(bundles.router)
+    app.include_router(deploy_targets.router)
+    app.include_router(github.router)
+    app.include_router(github_reviews.router)
+    app.include_router(gitflow_routing.router)
+    app.include_router(observability.router)
+    app.include_router(control.router)
+    app.include_router(evals.router)
+    app.include_router(runs.router)
+    app.include_router(schedules.router)
+    app.include_router(hook_fire.router)
+    app.include_router(hook_wake.admin_router)
+    app.include_router(state.router)
+    app.include_router(state.internal_router)
+    app.include_router(state.released_router)
+    app.include_router(thread_attachments.internal_router)
+    app.include_router(memory.router)
+    # BEFORE approvals.router: GET /approvals/identity-report would otherwise
+    # be matched by GET /approvals/{approval_id} and fail as a bad uuid.
+    app.include_router(approval_recovery.router)
+    app.include_router(approvals.router)
+    app.include_router(actions.router)
+    app.include_router(actions.undo_router)
+    app.include_router(action_executions.probe_router)
+    app.include_router(action_executions.router)
+    app.include_router(action_executions.receipt_router)
+    app.include_router(publication_precheck.router)
+    app.include_router(publications.router)
+    app.include_router(publications.internal_router)
+    app.include_router(publication_code_host.router)
+    app.include_router(publication_ui_evidence.router)
+    app.include_router(work_item_issue.router)
+    app.include_router(work_item_issue.internal_router)
+    app.include_router(factory_slack.internal_router)
+    app.include_router(attachment_access.router)
+    app.include_router(attachment_access.internal_router)
+    app.include_router(channel_read.router)
+    app.include_router(channel_read.internal_router)
+    app.include_router(work_items.router)
+    app.include_router(factory_status.router)
+    app.include_router(forge_credential_health.router)
+    app.include_router(turn_progress.router)
+    app.include_router(work_item_outcomes.router)
+    app.include_router(cluster_message_replies.router)
+    app.include_router(cluster_message_replies.internal_router)
+    app.include_router(workspace_recovery.router)
+    app.include_router(workspace_recovery_access.router)
+    app.include_router(workspaces.router)
+    app.include_router(channels.router)
+    app.include_router(provider_installations.router)
+    app.include_router(channel_identities.router)
+    app.include_router(identity_admin.router)
+    app.include_router(identity_operator.router)
+    app.include_router(identity_authority.router)
+    app.include_router(identity_authority.grant_router)
+    app.include_router(identity_authority.classification_router)
+    app.include_router(identity_approvals.router)
+    app.include_router(directory.router)
+    app.include_router(identity_connect.router)
+    app.include_router(identity.router)
+    app.include_router(teams.router)
+    app.include_router(agent_access.router)
+    app.include_router(hooks.router)
+    app.include_router(hook_wake.router)
+
+    # @spec IDENTITY-WRITER-LIFETIME-V1-8. Telemetry stays outside preparation.
+    app.add_middleware(IdentityFenceMiddleware)
+
+    app.add_middleware(HttpTelemetryMiddleware, application=app)
+
     return app
 
 
-app = create_app()
+def create_configured_app() -> FastAPI:
+    """The served app; operator HTTP identity only when configured.
+
+    @spec HTTP-INVOCATION-EXECUTION-20: unconfigured startup calls create_app() exactly as
+    before, and a configured directory either initializes completely or stops startup.
+    """
+    settings = get_settings()
+    runtime = configured_http_identity_runtime(settings)
+    if runtime is None or settings.http_identity_dir is None:
+        return create_app()
+    # The optional private trust anchor is the only one for provider lookups.
+    tls = load_provider_tls_context(settings.http_identity_dir)
+    if tls is None:
+        return create_app(http_identity_runtime=runtime)
+    return create_app(
+        http_identity_runtime=runtime, http_identity_client=HttpIdentityClient(tls_context=tls),
+    )
+
+
+app = create_configured_app()

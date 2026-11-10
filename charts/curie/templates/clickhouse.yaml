@@ -22,7 +22,7 @@ data:
 apiVersion: v1
 kind: Service
 metadata:
-  name: {{ include "curie.fullname" . }}-clickhouse
+  name: {{ include "curie.checkedObjectName" (dict "kind" "Service" "name" (printf "%s-clickhouse" (include "curie.fullname" .))) }}
   labels:
     {{- include "curie.labels" . | nindent 4 }}
 spec:
@@ -40,7 +40,7 @@ spec:
 apiVersion: apps/v1
 kind: StatefulSet
 metadata:
-  name: {{ include "curie.fullname" . }}-clickhouse
+  name: {{ include "curie.checkedObjectName" (dict "kind" "StatefulSet" "name" (printf "%s-clickhouse" (include "curie.fullname" .))) }}
   labels:
     {{- include "curie.labels" . | nindent 4 }}
 spec:
@@ -52,6 +52,13 @@ spec:
   template:
     metadata:
       annotations:
+        {{- with (include "curie.secretChecksum" (dict
+        "root" $
+        "keys" (list )
+        "refs" (list (dict "name" (include "curie.storeSecretName" (dict "root" $ "store" $.Values.clickhouse)) "key" "clickhousePassword"))
+        "env" "")) }}
+        checksum/secret: {{ . }}
+        {{- end }}
         {{- with (include "curie.placement.annotations" (dict "root" $ "class" "data")) }}
         {{- . | nindent 8 }}
         {{- end }}
@@ -83,6 +90,7 @@ spec:
         - name: data
           emptyDir: {}
         {{- end }}
+      enableServiceLinks: false
       containers:
         - name: clickhouse
           # Pinned tag (coupled to langfuse.image.tag); the AVX preflight

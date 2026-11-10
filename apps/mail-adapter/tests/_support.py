@@ -8,7 +8,7 @@ resolves in every test module, and holds the fixtures that wire what is here.
 
 Only the two EXTERNAL dependencies are faked, both as real local
 `ThreadingHTTPServer` instances: AgentMail's HTTP API and the platform's
-channel-ingress endpoint. Everything inside `curie_mail_adapter` runs for real,
+channel-ingress endpoint. Everything inside `curie_channel_gateway.mail` runs for real,
 including its own egress HTTP server, the poll path, and both halves of the
 completion dedupe. Nothing internal is patched.
 
@@ -21,6 +21,7 @@ about production. See `MailState.visible` for the behavior and its sources.
 from __future__ import annotations
 
 import base64
+import email.utils
 import http.client
 import json
 import os
@@ -38,7 +39,8 @@ from contextlib import contextmanager
 from http.server import BaseHTTPRequestHandler, HTTPServer, ThreadingHTTPServer
 from typing import Any, cast
 
-from curie_mail_adapter.egress import ADAPTER_SECRET_HEADER
+from curie_channel_gateway.mail.egress import ADAPTER_SECRET_HEADER
+from curie_channel_gateway.mail.state import MailState as DurableMailState
 
 INBOX = "sandbox@agentmail.to"
 AGENTMAIL_API_KEY = "amk-tst"
@@ -69,6 +71,36 @@ WITHHELD_LABELS = ("spam", "blocked", "unauthenticated")
 _PROCESS_STATE_ROOT = tempfile.TemporaryDirectory(prefix="curie-mail-tests-")
 
 
+def seed_historical_reply(
+    mail: MailState,
+    state: DurableMailState,
+    message_id: str = "msg-1",
+    thread_id: str = "thr-1",
+    **kwargs: Any,
+) -> dict[str, Any]:
+    """Persist a turn accepted before upgrade for independent egress tests.
+
+    This fixture exercises the real SQLite store. It never supplies an
+    authentication verdict and never makes new provider mail admissible.
+    """
+    summary = mail.add_inbound(message_id, thread_id, **kwargs)
+    assert state.admit(summary) == "admitted"
+    state.store_turn(
+        message_id,
+        {
+            "kind": "email",
+            "address": INBOX,
+            "delivery_id": message_id,
+            "conversation_id": thread_id,
+            "author": email.utils.parseaddr(str(summary["from"]))[1].lower(),
+            "text": f"{summary['subject']}\n\n{kwargs.get('text', 'body text')}",
+            "reply_ref": message_id,
+        },
+    )
+    state.accept_ingress(message_id)
+    return summary
+
+
 # --- the fake AgentMail API ---------------------------------------------------
 
 
@@ -82,6 +114,10 @@ class MailState:
         self.threads: dict[str, list[dict[str, Any]]] = {}
         self.deleted_threads: set[str] = set()
         self.replies: list[tuple[str, str]] = []  # (in_reply_to_message_id, text)
+        # Who each reply reached, as the provider addresses it: the sender of
+        # the message replied to, or with `reply_all` everyone on it (From, To,
+        # Cc) but this inbox. (in_reply_to_message_id, recipients, text).
+        self.deliveries: list[tuple[str, frozenset[str], str]] = []
         self.list_calls = 0
         # time.monotonic() per list call, so the retry CADENCE is observable at
         # the real external seam rather than inferred from the adapter's logs.
@@ -99,6 +135,9 @@ class MailState:
         # failure). One-shot rather than sticky because the failures these model
         # are transient, and the recovery is half of what each test pins.
         self.fail_next_reply: int | None = None
+        # One-shot: answer the next reply to this one message id with a 503,
+        # so a test can fail one send of several and watch the rest.
+        self.fail_next_reply_to: str | None = None
         self.fail_next_list: int | None = None
         self.fail_next_body: int | None = None
         self.fail_next_thread: int | None = None
@@ -142,6 +181,15 @@ class MailState:
         # message_id -> how many times its body has been fetched. The retry
         # budget is only observable as a count that stops growing.
         self.body_calls: dict[str, int] = {}
+        # The receiving mail system's own authentication result per message id,
+        # served beside the body as `receiving_verdict`. Only a test sets it,
+        # never `add_inbound`'s sender-shaped arguments, because it stands for
+        # evidence the sender cannot write (ADR 0228 decision 3). Only the
+        # verifying test provider reads it; AgentMail's provider ignores it.
+        self.verdicts: dict[str, dict[str, str]] = {}
+        self.list_gate = threading.Event()
+        self.list_gate.set()
+        self.list_entered = threading.Event()
         self.reply_gate = threading.Event()
         self.reply_gate.set()
         self.reply_entered = threading.Event()
@@ -155,8 +203,21 @@ class MailState:
         subject: str = "Hello",
         text: str | None = "body text",
         labels: list[str] | None = None,
+        full_text: str | None = None,
+        headers: dict[str, str] | None = None,
+        to: list[str] | None = None,
+        cc: list[str] | None = None,
     ) -> dict[str, Any]:
         """Seed one inbound message.
+
+        ``to`` defaults to this inbox alone and ``cc`` to nobody; Get Message
+        serves both as "Addresses of recipients. In format `username@domain.com`
+        or `Display Name <username@domain.com>`".
+
+        ``full_text`` is the whole plain-text body, quoted history included,
+        where the provider serves one beside ``extracted_text`` (the new text
+        alone). ``headers`` is the provider's optional header map
+        (https://docs.agentmail.to/api-reference/inboxes/messages/get).
 
         `text=None` seeds a body with no plain-text part at all, which is what
         Gmail and Outlook forwards look like: "Some email clients - particularly
@@ -175,6 +236,13 @@ class MailState:
         body = dict(summary)
         if text is not None:
             body["extracted_text"] = text
+        if full_text is not None:
+            body["text"] = full_text
+        if headers is not None:
+            body["headers"] = dict(headers)
+        body["to"] = list(to if to is not None else [INBOX])
+        if cc is not None:
+            body["cc"] = list(cc)
         self.bodies[message_id] = body
         self.threads.setdefault(thread_id, []).append(self.bodies[message_id])
         return summary
@@ -227,6 +295,14 @@ class MailState:
             self.next_page_token_override_once = None
         return page
 
+    def hold_lists(self) -> None:
+        """Make list requests block inside the provider until `release_lists`."""
+        self.list_entered.clear()
+        self.list_gate.clear()
+
+    def release_lists(self) -> None:
+        self.list_gate.set()
+
     def hold_replies(self) -> None:
         """Make the next reply block inside the provider until `release_replies`."""
         self.reply_entered.clear()
@@ -238,6 +314,28 @@ class MailState:
     def replies_to(self, message_id: str) -> list[str]:
         return [text for mid, text in self.replies if mid == message_id]
 
+    def received_by(self, address: str) -> list[str]:
+        """Every reply that reached ``address``, oldest first."""
+        return [text for _mid, recipients, text in self.deliveries if address in recipients]
+
+    def recipients(self, message_id: str, reply_all: bool) -> frozenset[str]:
+        """Who a reply to ``message_id`` reaches, as Reply To Message documents.
+
+        "reply_all (boolean, optional): Reply to all recipients of the original
+        message"; without it, the original's sender.
+        https://docs.agentmail.to/api-reference/inboxes/messages/reply
+        """
+        original = self.bodies[message_id]
+        fields = ("from", "to", "cc") if reply_all else ("from",)
+        found: set[str] = set()
+        for field in fields:
+            value = original.get(field) or []
+            for entry in value if isinstance(value, list) else [value]:
+                found.add(email.utils.parseaddr(str(entry))[1].lower())
+        found.discard(INBOX)
+        found.discard("")
+        return frozenset(found)
+
 
 class IngressState:
     """The fake platform ingress: what it received and what it answers."""
@@ -245,6 +343,7 @@ class IngressState:
     def __init__(self) -> None:
         self.url = ""
         self.requests: list[tuple[Any, dict[str, Any]]] = []  # (headers, body)
+        self.raw_bodies: list[bytes] = []  # the exact bytes of each recorded turn
         self.attempts = 0  # includes the ones dropped mid-flight
         self.attempt_times: list[float] = []
         self.drop_next = 0  # simulate N transport failures before answering
@@ -253,6 +352,11 @@ class IngressState:
             {"event_id": "chn-1-abc", "stream_id": "1-0", "duplicate": False},
         )
         self.responses: list[tuple[int, dict[str, Any] | str, dict[str, str]]] = []
+        # The platform's approval resolver, on the same API base (ADR-0177):
+        # every resolve call as (path, headers, body), and what to answer.
+        self.resolves: list[tuple[str, Any, dict[str, Any]]] = []
+        self.resolve_responses: list[tuple[int, dict[str, Any]]] = []
+        self.resolve_raw_bodies: list[bytes] = []  # the exact bytes of each resolve
 
     def delivery_ids(self) -> list[str]:
         return [body["delivery_id"] for _headers, body in self.requests]
@@ -325,6 +429,9 @@ class MailHandler(_JsonHandler):
             state.list_times.append(time.monotonic())
             state.list_queries.append(query)
             state.list_authorization.append(self.headers.get("Authorization") or "")
+            if not state.list_gate.is_set():
+                state.list_entered.set()
+                state.list_gate.wait()
             if state.drop_next_lists > 0:
                 state.drop_next_lists -= 1
                 # `list_times` was appended above, so this is that call's index.
@@ -346,7 +453,10 @@ class MailHandler(_JsonHandler):
             body = state.bodies.get(parts[4])
             if body is None:
                 return self._send(404, {"detail": "no such message"})
-            return self._send(200, body)
+            served = dict(body)
+            if parts[4] in state.verdicts:
+                served["receiving_verdict"] = dict(state.verdicts[parts[4]])
+            return self._send(200, served)
         # /v0/inboxes/{inbox}/threads/{thread_id}
         if len(parts) == 5 and parts[3] == "threads":
             state.thread_calls += 1
@@ -364,10 +474,14 @@ class MailHandler(_JsonHandler):
         # /v0/inboxes/{inbox}/messages/{message_id}/reply
         if len(parts) == 6 and parts[3] == "messages" and parts[5] == "reply":
             message_id = parts[4]
-            text = self._read_body().get("text", "")
+            request_body = self._read_body()
+            text = request_body.get("text", "")
             state.reply_entered.set()
             state.reply_gate.wait(30)
             failure = state.fail_next_reply
+            if failure is None and state.fail_next_reply_to == message_id:
+                state.fail_next_reply_to = None
+                failure = 503
             if failure is not None:
                 state.fail_next_reply = None
                 if failure == 0:
@@ -375,6 +489,8 @@ class MailHandler(_JsonHandler):
                     return
                 return self._send(failure, {"detail": "injected provider failure"})
             state.replies.append((message_id, text))
+            reply_all = request_body.get("reply_all") is True
+            state.deliveries.append((message_id, state.recipients(message_id, reply_all), text))
             thread_id = state.bodies[message_id]["thread_id"]
             reply_id = f"{message_id}-reply-{len(state.replies)}"
             state.threads.setdefault(thread_id, []).append(
@@ -400,13 +516,25 @@ class IngressHandler(_JsonHandler):
 
     def do_POST(self) -> None:
         state = self.state
+        if self.path.startswith("/approvals/"):
+            raw = self.rfile.read(int(self.headers.get("Content-Length") or 0))
+            state.resolve_raw_bodies.append(raw)
+            body = json.loads(raw.decode()) if raw else {}
+            state.resolves.append((self.path, self.headers, body))
+            if state.resolve_responses:
+                status, payload = state.resolve_responses.pop(0)
+            else:
+                status, payload = 200, {"status": body.get("decision")}
+            return self._send(status, payload)
         state.attempts += 1
         state.attempt_times.append(time.monotonic())
         if state.drop_next > 0:
             state.drop_next -= 1
             self.close_connection = True  # a real transport failure at the client
             return
-        body = self._read_body()
+        raw = self.rfile.read(int(self.headers.get("Content-Length") or 0))
+        state.raw_bodies.append(raw)
+        body = json.loads(raw.decode()) if raw else {}
         # Kept as the parsed message so header lookups stay case-insensitive,
         # exactly as HTTP (and Starlette on the platform side) treats them.
         state.requests.append((self.headers, body))
@@ -588,6 +716,61 @@ def reply_post(text: str, conversation_id: str = "thr-1") -> dict[str, Any]:
     }
 
 
+def approval_card(
+    approval_id: str,
+    text: str = "Send the quote",
+    conversation_id: str = "thr-1",
+    requested_by: str = "human@example.com",
+    approvers: list[str] | None = None,
+) -> dict[str, Any]:
+    """The worker's approval card: a `reply.post` carrying a Confirm intent.
+
+    The shape `_pause_for_approval` in `apps/worker/src/curie_worker/kernel.py`
+    emits: the approval id on the intent and both actions, a note allowed, and
+    `requested_by` the turn's author. `approvers` are the route's listed
+    addresses, as the `Approver` fields that kernel attaches (ADR-0177 amendment
+    A5); None leaves them off, as a worker before that sends.
+    """
+    event = reply_post(text, conversation_id)
+    event["requested_by"] = requested_by
+    if approvers is not None:
+        event["message"]["fields"] = [
+            {"label": "Approver", "value": address} for address in approvers
+        ]
+    event["message"]["interaction"] = {
+        "kind": "confirm",
+        "id": approval_id,
+        "prompt": text,
+        "confirm": {"label": "Approve", "value": approval_id},
+        "cancel": {"label": "Reject", "value": approval_id},
+        "allow_free_text": True,
+    }
+    return event
+
+
+def settled_card(
+    card_ref: str,
+    *,
+    decision: str | None,
+    resolver: str | None = None,
+    note: str | None = None,
+    conversation_id: str = "thr-1",
+) -> dict[str, Any]:
+    """The worker's settled-card update at the card's own ref (ADR-0177 decision 6)."""
+    return {
+        "version": "1.0",
+        "event": "reply.update",
+        "target": target(conversation_id, reply_ref=card_ref),
+        "message": {"version": "1.0", "text": "Send the quote"},
+        "settled": {
+            "requested_by": "human@example.com",
+            "decision": decision,
+            "resolver": resolver,
+            "note": note,
+        },
+    }
+
+
 def progress_post(
     summary: str,
     conversation_id: str = "thr-1",
@@ -602,8 +785,13 @@ def progress_post(
     the mail adapter must not append it to the reply it is buffering.
     """
     progress: dict[str, Any] = (
-        {"kind": "card", "state": "investigating", "summary": summary, "revision": 1,
-         "terminal": False}
+        {
+            "kind": "card",
+            "state": "investigating",
+            "summary": summary,
+            "revision": 1,
+            "terminal": False,
+        }
         if kind == "card"
         else {"kind": "milestone", "milestone": "evidence", "summary": summary, "ordinal": 1}
     )

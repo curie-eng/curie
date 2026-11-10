@@ -1,0 +1,73 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.curietech.ai/cli/access-policy/v1.json",
+  "title": "curie cluster access-policy --json",
+  "description": "The agent-facing payload of `curie cluster access-policy <agent>`: the dry-run plan, or the agent's access policy as the API stored it (ADR 0220). `invocation_team_id` and `approver_team_id` are null when that role names no team and keeps today's behavior. `version` is 0 when the agent has no policy. `changed` is false for a show (no team flag) and true when this invocation wrote. Nothing enforces the policy yet.",
+  "$defs": {
+    "dryRun": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "dry_run": {
+          "const": true
+        },
+        "plan": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      },
+      "required": [
+        "dry_run",
+        "plan"
+      ]
+    }
+  },
+  "oneOf": [
+    {
+      "$ref": "#/$defs/dryRun"
+    },
+    {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "agent": {
+          "type": "string"
+        },
+        "agent_id": {
+          "type": "string"
+        },
+        "invocation_team_id": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "The IdP group team whose members may start a turn with the agent, or null when none is set."
+        },
+        "approver_team_id": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "The IdP group team whose members may resolve the agent's approvals, or null when none is set."
+        },
+        "version": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "changed": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "agent",
+        "agent_id",
+        "invocation_team_id",
+        "approver_team_id",
+        "version",
+        "changed"
+      ]
+    }
+  ]
+}

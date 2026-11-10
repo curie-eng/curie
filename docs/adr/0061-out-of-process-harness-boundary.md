@@ -2,7 +2,7 @@
 
 Date: 2026-07-21
 
-Status: Draft
+Status: Draft; program stopped under [ADR 0140](0140-curie-supports-one-model-harness-until-a-second-one-exists.md) before its prerequisite spike ran
 
 Together with [ADR-0060](0060-the-harness-is-a-declared-package.md) this replaces
 the Proposed [ADR-0031](0031-harness-neutral-runner-seams.md). 0059 decides

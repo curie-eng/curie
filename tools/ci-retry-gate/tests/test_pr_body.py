@@ -287,3 +287,12 @@ def test_pr_body_self_test_covers_the_patch_release_half() -> None:
     combined = f"{completed.stdout}\n{completed.stderr}"
     assert "Trigger" in combined, _diagnostics(completed)
     assert "Live proof" in combined, _diagnostics(completed)
+
+
+def test_pr_body_needs_no_tier_rows_or_path_metadata(tmp_path: Path) -> None:
+    completed = _check_body(
+        tmp_path,
+        "## Verification\n\nLocally: focused guard tests passed.\n"
+        "CI results are read from CI. No external proof is needed.\n",
+    )
+    assert completed.returncode == 0, _diagnostics(completed)

@@ -18,11 +18,19 @@ fn production_src_files() -> Vec<(String, String)> {
     paths.sort();
     let mut out = Vec::new();
     for path in paths {
+        // Keyed by the path under `cli/src`, so `commands/dev.rs` and a
+        // same-named file in another module stay distinct.
         let name = path
-            .file_name()
-            .and_then(|n| n.to_string_lossy().into_owned().into())
+            .strip_prefix(&dir)
+            .map(|rel| rel.to_string_lossy().replace('\\', "/"))
             .unwrap_or_default();
         if name == "connector_build.rs" {
+            continue;
+        }
+        // A test module split into its own file (`commands/tests.rs`,
+        // `main_tests.rs`) is all test code, the same as a stripped inline
+        // `#[cfg(test)] mod` block.
+        if name.ends_with("/tests.rs") || name.ends_with("_tests.rs") {
             continue;
         }
         let text = std::fs::read_to_string(&path)
@@ -246,7 +254,7 @@ fn exactly_one_function_invokes_docker_build_for_a_platform_image() {
     let found = platform_docker_build_functions();
     assert_eq!(
         found,
-        vec![("commands.rs".to_string(), "build_image".to_string())],
+        vec![("commands/dev.rs".to_string(), "build_image".to_string())],
         "exactly one function may shell `docker build` for a platform image; \
          found {found:?}. Extract new sites into `commands::build_image`."
     );
@@ -255,7 +263,7 @@ fn exactly_one_function_invokes_docker_build_for_a_platform_image() {
 /// Both product paths must call that function, not shell docker themselves.
 #[test]
 fn curie_build_and_local_up_build_route_through_build_image() {
-    let build = function_body("commands.rs", "build");
+    let build = function_body("commands/dev.rs", "build");
     assert!(
         build.contains("build_image("),
         "`curie build` must call build_image; body was: {build}"
@@ -310,7 +318,7 @@ fn runner_tags_are_one_identity_across_both_paths() {
         "build_source_images must not inline a second copy of the ghcr ref; body: {source_builds}"
     );
 
-    let builder = function_body("commands.rs", "build_image");
+    let builder = function_body("commands/dev.rs", "build_image");
     assert!(
         builder.contains("RUNNER_IMAGE") || builder.contains("platform_image_tags("),
         "build_image must reconcile the short runner name; body: {builder}"
@@ -324,7 +332,7 @@ fn runner_tags_are_one_identity_across_both_paths() {
 
     // The relationship itself: building the runner Dockerfile under either
     // identity applies both tags. platform_image_tags is the named decision.
-    let tags_fn = function_body("commands.rs", "platform_image_tags");
+    let tags_fn = function_body("commands/dev.rs", "platform_image_tags");
     assert!(
         tags_fn.contains("RUNNER_IMAGE"),
         "platform_image_tags must name the short runner identity"
@@ -355,13 +363,13 @@ fn one_shot_dispatcher_image_uses_the_shared_running_stack_resolver() {
 /// Sanity: the scanner still sees the files it claims to police.
 #[test]
 fn scanner_sees_the_two_callers() {
-    let names: Vec<String> = function_items(&file_src("commands.rs"))
+    let names: Vec<String> = function_items(&file_src("commands/dev.rs"))
         .into_iter()
         .map(|(n, _)| n)
         .collect();
     assert!(
         names.contains(&"build".to_string()),
-        "commands.rs must still define build; scanner broken if not"
+        "commands/dev.rs must still define build; scanner broken if not"
     );
     let local_names: Vec<String> = function_items(&file_src("local.rs"))
         .into_iter()

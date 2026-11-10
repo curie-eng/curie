@@ -9,6 +9,8 @@ from fastapi import APIRouter, Depends, Header, HTTPException, Request, Response
 from redis.asyncio import Redis
 from redis.exceptions import RedisError
 
+from curie_api.schemas.publications import PublicationPrecheck, PublicationPrecheckResult
+
 from ..config import get_settings
 from ..deps import SessionDep
 from ..publication_precheck_token import (
@@ -24,7 +26,6 @@ from ..publication_truth import (
     read_publication_authority,
     read_publication_metadata,
 )
-from ..schemas import PublicationPrecheck, PublicationPrecheckResult
 
 router = APIRouter(prefix="/publications", tags=["publications"])
 

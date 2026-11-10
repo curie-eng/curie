@@ -32,18 +32,63 @@ redefine them.
 
 ## Current contract
 
-A second implementation is an **ACI server**, an HTTP process serving eight authenticated
-control routes. The seven POST endpoints (`runner/src/curie_runner/server.py`): `POST /v1/event` opens a
+A second implementation is an **ACI server**, an HTTP process serving eight required authenticated
+control routes (seven POSTs and `GET /v1/status`) plus four optional runner-private routes. The 11 POST endpoints (`runner/src/curie_runner/server.py`, seven every
+server serves plus four optional runner-private routes: the executor route, the checkpoint route and the two UI evidence routes): `POST /v1/event` opens a
 turn, `POST /v1/steer` injects into the live turn (409 if none running),
 `POST /v1/interrupt` hard-stops it, `POST /v1/reset` discards the conversation so the
 next turn starts fresh (409 while a turn is active), `POST /v1/snapshot` captures a
 bounded managed-workspace snapshot for publication, `POST /v1/timeout` stops the
 exact open turn named by the event response epoch, and `POST /v1/turn-admit` grants or denies
-the exact waiting turn epoch. Two GETs sit alongside them and stay
+the exact waiting turn epoch; only in executor mode, the optional `POST /v1/execute` runs one
+connector action for the worker's executor, the optional `POST /v1/checkpoint` captures the
+managed workspace against a worker-supplied trusted base commit, and the optional
+`POST /v1/ui-evidence/index` and `POST /v1/ui-evidence/image` return the validated index
+and the raw bytes of one indexed PNG from the gitignored `.curie/ui-evidence/` directory.
+The two evidence routes are bearer-authenticated, carry no ACI frame, answer `409` without a
+managed workspace and in executor mode, and a server without them answers `404`, which the
+worker records as unavailable evidence without changing publication. Two GETs sit alongside them and stay
 unauthenticated, `GET /healthz` and `GET /status`, because the chart's readiness probe
 sends no auth header. The eighth authenticated control route, `GET /v1/status`, returns
 the credential-free boot attestation (`session_id`, `sandbox_id`, `managed_workspace`,
-`cwd`) plus `history_durable` for the worker's replacement-authority check. The timeout
+`cwd`) plus `history_durable` for the worker's replacement-authority check,
+`turn_epoch` for the active turn, and `capacity_admission: true`. When the request
+supplies a valid `X-Curie-Turn-Epoch` header, it also returns that epoch's
+`capacity_admission_result`: `pending`, `granted`, `denied` or `unknown`
+(`runner/src/curie_runner/server.py::_status`,
+`runner/src/curie_runner/session.py::SessionRunner.admission_result`).
+`POST /v1/execute` is an optional, runner-private,
+bearer-authenticated route served only by a runner booted with `CURIE_RUNNER_MODE=execute`
+(ACTION-EXECUTOR-6, -24): it runs one connector action's `list`, `observe`, `call` and `read` phases
+for the worker's executor, carries no ACI frame (like `/v1/turn-admit`) and changes no frozen
+contract (ACTION-EXECUTOR-25, AUTOMATED-REMEDIATION-27). The `read` phase
+(AUTOMATED-REMEDIATION-12, executor amendments E3 and E4;
+[`runner/src/curie_runner/executor.py::sample_of`](../../../runner/src/curie_runner/executor.py))
+is one sample for an automated-remediation precondition or verifier: after `list`, exactly one
+`tools/call` of a declared read tool with no grant, whose request adds an RFC 6901 `pointer` that
+no other phase carries. The runner answers only `{phase, sample, value}`: the scalar at the pointer
+(of at most 256 characters) in the structured content, or in the strict JSON of the result's one
+and only text block, never the result itself. Any other shape is an unsuccessful `sample`
+(`result_unstructured`, `pointer_absent`, `not_scalar`, `value_too_long`, `tool_error`). A tool the
+sandbox's own `list` did not advertise with `readOnlyHint: true` is refused `tool_not_read_only`
+before any dial; the hint is a fail-closed refusal on top of the policy that declares the read,
+never an authorization. In one sandbox the accepted orders are `list`; `list`, `observe`, then a
+restore `call`; `list` then a forward `call`; `list` then one `read`; and `list` then one
+`observe` with no `call`, which an automated-remediation verifier uses to see whether another
+change superseded its action. The request shape and refusal codes are frozen in `tests/vectors/runner-execute.json`, and
+the sample kinds and the predicate they feed in `tests/vectors/remediation-predicate.json`. In that mode the runner serves only `/healthz`, `/status`,
+`/v1/status` and `/v1/execute`, and answers every other control route `409` naming the mode.
+`run_conformance` does not cover it, and a server without it answers `404`, which the worker
+maps to `runner_unavailable`. `POST /v1/checkpoint` is likewise an optional, runner-private,
+bearer-authenticated control route, like `/v1/turn-admit` and `/v1/execute`: it carries no ACI
+frame and changes no ACI wire frame. It captures the managed workspace against a worker-supplied
+trusted base commit within a budget of at most 60 seconds and returns a patch and a manifest,
+bounded at 900000 and 1048576 bytes, with `409` when the session has no managed workspace. It
+stores nothing and conveys no credentials or authority
+([ADR 0251](../../adr/0251-a-failed-factory-run-keeps-a-private-recovery-checkpoint-that-only-explicit-restoration-reads.md));
+`run_conformance` does not cover it, a server without it answers `404`, and executor mode answers
+`409` naming the mode
+([`runner/src/curie_runner/workspace_checkpoint.py`](../../../runner/src/curie_runner/workspace_checkpoint.py)). The timeout
 and `/v1/status` are runner-private, bearer-authenticated control routes. A server that
 omits the epoch response header is simply not notified, and worker timeout classification
 remains unaffected. `/v1/reset` carries no ACI wire frame (it is a runner control route,
@@ -121,6 +166,23 @@ ordinary turns on the same install are untouched.
   comparing consumer models, so a field that grants authority must be modelled
   by that consumer before any worker acts on it.
 
+### Per-turn memory credential (MEMORY-TOKEN)
+
+The worker mints a short-lived write credential for each turn and carries it to
+the runner on the `Event`, so the runner's memory tools can present it. The
+credential stays out of the sandbox env, `BootEnv`, and hook or subprocess
+input, but the ACI server that receives the `Event` runs inside the sandbox, so
+it does reach the in-sandbox runner process (ADR-0188 decision 5).
+
+- **MEMORY-TOKEN-1:** `Event` carries an optional `memory_token`, a string or
+  null, defaulting to null. Null means the turn carries no memory write
+  credential. It is never a `BootEnv` key or an env var.
+- **MEMORY-TOKEN-2:** A producer sends `memory_token` only on the runner POST,
+  `POST /v1/event` and `POST /v1/steer`.
+- **MEMORY-TOKEN-3:** A consumer must not place `memory_token` in env, logs,
+  hook or subprocess input, or persisted state. The reference model declares it
+  with `repr=False`, so `repr(event)` and a log's `%r` never show it.
+
 ## Implementations today
 
 The reference runner enforces and advertises `read-only` (RUNNER-TOOL-ACCESS
@@ -150,8 +212,8 @@ keys are rejected at construction), while a consumer tolerates unknown fields an
 
 ## Cross-links
 
-- **Guide:** [implementing-an-aci-server.md](./implementing-an-aci-server.md) — stand up a conformant second ACI server, driven from the conformance suite (#256).
-- **Epic(s):** [#25](https://github.com/curie-eng/curie/issues/25) — write the "implement an ACI server" guide from the conformance suite so the port is documented, not just enforced
-- **Epic(s):** [#47](https://github.com/curie-eng/curie/issues/47) — telemetry as part of the ACI (OTEL carried in `SessionConfig`)
-- **Vision doc:** [architecture-vision.md](../../architecture-vision.md) — Job 1 (Harness / runtime), grade A-
-- **ADR(s):** [ADR-0005](../../adr/0005-claude-agent-sdk-adapter-and-frozen-aci.md) — claude-agent-sdk adapter behind a frozen ACI session contract
+1. **Guide:** [implementing-an-aci-server.md](./implementing-an-aci-server.md): stand up a conformant second ACI server, driven from the conformance suite (#256).
+2. **Epic(s):** [#25](https://github.com/curie-eng/curie/issues/25) tracks a second harness implementation. The ACI server guide is #256.
+3. **Epic(s):** [#47](https://github.com/curie-eng/curie/issues/47): telemetry as part of the ACI (OTEL carried in `SessionConfig`)
+4. **Vision doc:** [architecture-vision.md](../../architecture-vision.md): Job 1 (Harness / runtime), grade A-
+5. **ADR(s):** [ADR-0005](../../adr/0005-claude-agent-sdk-adapter-and-frozen-aci.md): claude-agent-sdk adapter behind a frozen ACI session contract

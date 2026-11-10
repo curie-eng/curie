@@ -1,0 +1,238 @@
+#!/usr/bin/env bash
+# #4017 cluster proof: a plain cluster down removes the release and its owned
+# namespaces, and a ConfigMap finalizer makes that down exit 3 within the
+# bound while leaving the finalizer in place (#707, #767, #768). The CLI
+# carries the delete bound. This script does not.
+#
+# Usage:
+#   bash cli/scripts/cluster-down-namespace-bound.sh --kind-cluster <name> [--keep]
+#   bash cli/scripts/cluster-down-namespace-bound.sh --self-test
+set -euo pipefail
+
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+KIND_CLUSTER="${CURIE_E2E_KIND_CLUSTER:-}"
+NS=test-4017-down
+RELEASE=t4017
+KUBECONFIG="$REPO_ROOT/.projects/4017/kubeconfig"
+# A set CURIE_BIN wins. Otherwise take the first executable checkout build,
+# caller cargo layout, or curie on PATH.
+if [[ -z "${CURIE_BIN:-}" ]]; then
+  for candidate in \
+    "$REPO_ROOT/cli/target/debug/curie" \
+    "$REPO_ROOT/cli/target/release/curie" \
+    "${CARGO_TARGET_DIR:-}/debug/curie" \
+    "$HOME/.cargo/shared-targets/agentos/debug/curie"
+  do
+    if [[ -n "$candidate" && -x "$candidate" ]]; then
+      CURIE_BIN="$candidate"
+      break
+    fi
+  done
+fi
+if [[ -z "${CURIE_BIN:-}" ]]; then
+  CURIE_BIN="$(command -v curie || true)"
+fi
+KEEP=0
+SELF_TEST=0
+CREATED=0
+DOWN_SECONDS=0
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --self-test) SELF_TEST=1; shift ;;
+    --keep) KEEP=1; shift ;;
+    --kind-cluster)
+      [[ $# -ge 2 && -n "$2" ]] || { echo "--kind-cluster needs a value" >&2; exit 2; }
+      KIND_CLUSTER="$2"; shift 2 ;;
+    *) echo "unknown argument: $1" >&2; exit 2 ;;
+  esac
+done
+
+self_test() {
+  local needle missing=0
+  for needle in \
+    "example.com/hold" \
+    "330" \
+    "test-4017-down" \
+    "t4017" \
+    "kind delete"
+  do
+    if ! grep -q -F -- "$needle" "$0"; then
+      echo "self-test: $0 does not contain $needle" >&2
+      missing=1
+    fi
+  done
+  exit "$missing"
+}
+
+if [[ "$SELF_TEST" -eq 1 ]]; then
+  self_test
+fi
+
+[[ -n "$KIND_CLUSTER" ]] || { echo "--kind-cluster or CURIE_E2E_KIND_CLUSTER is required" >&2; exit 2; }
+KUBE_CONTEXT="kind-$KIND_CLUSTER"
+
+case "$KIND_CLUSTER" in
+  Prod*|Staging*)
+    echo "refusing context $KIND_CLUSTER" >&2
+    exit 1
+    ;;
+esac
+
+if [[ -z "${CURIE_BIN:-}" ]]; then
+  echo "build the CLI first (cargo build -p curie) or set CURIE_BIN" >&2
+  exit 1
+fi
+if [[ ! -x "$CURIE_BIN" ]]; then
+  echo "cluster up is missing: $CURIE_BIN is not executable" >&2
+  exit 1
+fi
+if ! "$CURIE_BIN" cluster up --help >/dev/null 2>&1; then
+  echo "cluster up is missing from $CURIE_BIN" >&2
+  exit 1
+fi
+if ! command -v kubectl >/dev/null 2>&1; then
+  echo "kubectl is missing" >&2
+  exit 1
+fi
+if ! command -v kind >/dev/null 2>&1; then
+  echo "kind is missing" >&2
+  exit 1
+fi
+
+mkdir -p "$(dirname "$KUBECONFIG")"
+rm -f "$KUBECONFIG"
+export KUBECONFIG
+
+cleanup() {
+  local status=$?
+  if [[ "$KEEP" -eq 0 && "$CREATED" -eq 1 ]]; then
+    kind delete cluster --name "$KIND_CLUSTER" >/dev/null 2>&1 || true
+  fi
+  exit "$status"
+}
+trap cleanup EXIT
+
+if kind get clusters 2>/dev/null | grep -Fxq "$KIND_CLUSTER"; then
+  echo "kind cluster $KIND_CLUSTER already exists; refusing to adopt or delete it" >&2
+  exit 1
+fi
+
+CREATED=1
+kind create cluster --name "$KIND_CLUSTER" --kubeconfig "$KUBECONFIG" --wait 180s
+current="$(kubectl --kubeconfig "$KUBECONFIG" --context "$KUBE_CONTEXT" config current-context)"
+if [[ "$current" != "$KUBE_CONTEXT" ]]; then
+  echo "isolated kubeconfig current context is $current, expected $KUBE_CONTEXT" >&2
+  exit 1
+fi
+
+LOG_DIR="$(mktemp -d)"
+
+run_down() {
+  local out="$1"
+  local start end rc
+  start="$(date +%s)"
+  set +e
+  # An external watchdog so a missing sweep bound fails this scenario instead
+  # of leaving the process waiting. 330s is the acceptance ceiling.
+  timeout 330 "$CURIE_BIN" cluster down \
+    --context "$KUBE_CONTEXT" \
+    --namespace "$NS" \
+    --release "$RELEASE" \
+    --yes \
+    >"$out" 2>&1
+  rc=$?
+  set -e
+  end="$(date +%s)"
+  DOWN_SECONDS="$((end - start))"
+  return "$rc"
+}
+
+plain_install() {
+  # `cluster up` has no values-file flag. On a kind node with no RuntimeClass
+  # it infers security.gvisor.mode=off itself.
+  "$CURIE_BIN" cluster up \
+    --context "$KUBE_CONTEXT" \
+    --namespace "$NS" \
+    --release "$RELEASE" \
+    --chart "$REPO_ROOT/charts/curie" \
+    --dev \
+    --fake-model \
+    --no-expose
+}
+
+assert_release_gone() {
+  if kubectl --context "$KUBE_CONTEXT" get namespace "$NS" >/dev/null 2>&1; then
+    echo "namespace $NS is still present" >&2
+    exit 1
+  fi
+  local owned claims
+  owned="$(kubectl --context "$KUBE_CONTEXT" get namespace \
+    -l "curietech.ai/created-by=${RELEASE},curietech.ai/created-in=${NS}" \
+    -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}')"
+  if [[ -n "$owned" ]]; then
+    echo "owned namespaces remain: $owned" >&2
+    exit 1
+  fi
+  claims="$(kubectl --context "$KUBE_CONTEXT" get pv \
+    -o jsonpath='{range .items[*]}{.spec.claimRef.namespace}{"\n"}{end}')"
+  if printf '%s\n' "$claims" | grep -Fxq -- "$NS"; then
+    echo "a PersistentVolume claimRef.namespace is still $NS" >&2
+    exit 1
+  fi
+}
+
+plain_install
+if ! run_down "$LOG_DIR/plain-down.txt"; then
+  echo "cluster down after a plain install failed" >&2
+  cat "$LOG_DIR/plain-down.txt" >&2
+  exit 1
+fi
+assert_release_gone
+
+plain_install
+kubectl --context "$KUBE_CONTEXT" -n "$NS" create configmap hold --from-literal=keep=yes
+kubectl --context "$KUBE_CONTEXT" -n "$NS" patch configmap hold --type=json \
+  --patch='[{"op":"add","path":"/metadata/finalizers","value":["example.com/hold"]}]'
+
+stuck_rc=0
+run_down "$LOG_DIR/stuck-down.txt" || stuck_rc=$?
+echo "held cluster down exited ${stuck_rc} in ${DOWN_SECONDS}s"
+if [[ "$stuck_rc" -ne 3 ]]; then
+  echo "expected exit 3 when a finalizer holds the namespace, got $stuck_rc after ${DOWN_SECONDS}s" >&2
+  cat "$LOG_DIR/stuck-down.txt" >&2
+  exit 1
+fi
+if [[ "$DOWN_SECONDS" -gt 330 ]]; then
+  echo "cluster down took ${DOWN_SECONDS}s, which is over the 330s bound" >&2
+  exit 1
+fi
+if ! grep -q hold "$LOG_DIR/stuck-down.txt"; then
+  echo "cluster down output did not name hold" >&2
+  cat "$LOG_DIR/stuck-down.txt" >&2
+  exit 1
+fi
+phase="$(kubectl --context "$KUBE_CONTEXT" get namespace "$NS" -o jsonpath='{.status.phase}')"
+if [[ "$phase" != "Terminating" ]]; then
+  echo "namespace $NS phase is $phase, expected Terminating" >&2
+  exit 1
+fi
+finalizers="$(kubectl --context "$KUBE_CONTEXT" -n "$NS" get configmap hold -o jsonpath='{.metadata.finalizers}')"
+case "$finalizers" in
+  *example.com/hold*) ;;
+  *)
+    echo "configmap hold finalizers no longer contain example.com/hold: $finalizers" >&2
+    exit 1
+    ;;
+esac
+
+kubectl --context "$KUBE_CONTEXT" -n "$NS" patch configmap hold --type=json \
+  --patch='[{"op":"replace","path":"/metadata/finalizers","value":[]}]'
+if ! run_down "$LOG_DIR/cleared-down.txt"; then
+  echo "cluster down after the test removed the finalizer failed" >&2
+  cat "$LOG_DIR/cleared-down.txt" >&2
+  exit 1
+fi
+assert_release_gone
+
+echo "PASS cluster down namespace bound ($NS / $RELEASE)"

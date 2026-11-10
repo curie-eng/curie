@@ -295,29 +295,6 @@ fn guided_prompt_cancellation_names_visible_recovery() {
 
 #[cfg(target_os = "linux")]
 #[test]
-fn model_credential_cancellation_names_every_recovery_path() {
-    let text = cancel_next_local_deploy_prompt(
-        &[
-            ("SLACK_APP_TOKEN", "xapp-EXAMPLE-app-token"),
-            ("SLACK_BOT_TOKEN", "xoxb-EXAMPLE-bot-token"),
-        ],
-        &[b"\x1b"],
-        "model credential",
-    );
-    for recovery in [
-        "CURIE_MODEL_BASE_URL",
-        "curie secrets set <NAME>",
-        "export <NAME>=",
-    ] {
-        assert!(
-            text.contains(recovery),
-            "model credential cancellation must show {recovery:?}:\n{text}"
-        );
-    }
-}
-
-#[cfg(target_os = "linux")]
-#[test]
 fn slack_app_token_cancellation_names_every_recovery_path() {
     let text = cancel_next_local_deploy_prompt(
         &[

@@ -1,0 +1,6 @@
+{
+  "type": "error",
+  "error": {
+    "message": "Token is invalid, expired, or not supported for this endpoint."
+  }
+}

@@ -1,11 +1,9 @@
 # Per-Dockerfile ignore (BuildKit honors <dockerfile>.dockerignore over the
 # context-root .dockerignore). The UI image builds from the REPO ROOT to reach
-# the frozen ACI generated TS the @aci alias points at, so this trims the root
-# context to what the Vite build needs -- the UI sources + lockfile and
-# packages/aci-protocol/generated stay; everything else (the Python trees, the
-# Rust CLI, the runner, docs, other packages, installed deps and build output)
-# is dropped.
-.git
+# the shared wording vector, so this trims the root context to what the Vite
+# build needs -- the UI sources + lockfile and that one vector stay; everything
+# else (the Python trees, the Rust CLI, the runner, docs, other packages,
+# installed deps and build output) is dropped.
 **/node_modules
 **/.venv
 **/__pycache__
@@ -27,10 +25,44 @@ prototypes
 charts
 otel
 scripts
-tests
-packages/plugin-format
-packages/aci-protocol/src
-packages/aci-protocol/tests
+tests/*
+!tests/vectors
+tests/vectors/*
+!tests/vectors/user-action-wording.json
+packages
 *.md
 **/*.md
 **/.env
+**/.env.*
+!**/.env.example
+!**/.env.sample
+!**/.env.template
+**/.ssh
+**/.aws
+**/*.key
+**/*.pem
+**/*.p12
+**/*.pfx
+**/id_rsa
+**/id_dsa
+**/id_ecdsa
+**/id_ed25519
+**/.git
+**/.curie
+**/.projects
+**/.worktrees
+**/.claude
+**/.claude.json*
+**/.agents
+**/.codex
+**/.t3
+**/.cache
+**/.config
+**/.local
+**/.npm
+**/.bun
+**/.netrc
+**/.npmrc
+**/.yarnrc
+**/.yarnrc.yml
+**/.mcp.json

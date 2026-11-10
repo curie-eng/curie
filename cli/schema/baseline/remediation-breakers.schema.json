@@ -1,0 +1,71 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.curietech.ai/cli/remediation-breakers/v1.0.json",
+  "title": "curie <tier> remediation-policy breakers --json",
+  "description": "The breakers of one hook (AUTOMATED-REMEDIATION-11), newest opened first, each exactly as the API's `RemediationBreakerOut` carries it. Refusals are the shared error object.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "breakers"
+  ],
+  "properties": {
+    "breakers": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "id",
+          "agent_id",
+          "connector",
+          "tool",
+          "target",
+          "opened_at",
+          "closed_at",
+          "closed_by",
+          "close_reason"
+        ],
+        "properties": {
+          "id": {
+            "type": "string"
+          },
+          "agent_id": {
+            "type": "string"
+          },
+          "connector": {
+            "type": "string"
+          },
+          "tool": {
+            "type": "string"
+          },
+          "target": {
+            "type": "string",
+            "description": "The canonical target the breaker holds open."
+          },
+          "opened_at": {
+            "type": "string"
+          },
+          "closed_at": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "closed_by": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The closing operator principal's subject, never its token."
+          },
+          "close_reason": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        }
+      }
+    }
+  }
+}

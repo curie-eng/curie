@@ -2,14 +2,17 @@
 
 from __future__ import annotations
 
+import io
 import json
 import re
 import subprocess
+import tarfile
 import time
 import urllib.request
 from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
+from uuid import uuid4
 
 import anyio
 import pytest
@@ -49,8 +52,10 @@ _RECONCILER_STEPS = [
     "settle_overdue_cancellations",
     "readmit_pending",
     "reconcile_missed_labels",
+    "poll_trackers",
     "sync_status_comments",
     "redispatch_lapsed_acquisitions",
+    "reconcile_base_transitions",
     "publish_execute_wakes",
 ]
 _RECONCILER_FAILURE_METRIC = "curie.work_item.reconciler.step.failure"
@@ -65,12 +70,13 @@ def _docker(
     *args: str,
     timeout: float = 30,
     check: bool = True,
+    input_data: bytes | None = None,
 ) -> subprocess.CompletedProcess[str]:
     try:
-        completed = subprocess.run(
+        result = subprocess.run(
             ["docker", *args],
             capture_output=True,
-            text=True,
+            input=input_data,
             timeout=timeout,
             check=False,
         )
@@ -78,6 +84,12 @@ def _docker(
         raise AssertionError("docker is required for the Collector translation proof") from exc
     except subprocess.TimeoutExpired as exc:
         raise AssertionError(f"docker {' '.join(args)} exceeded {timeout} seconds") from exc
+    completed = subprocess.CompletedProcess(
+        result.args,
+        result.returncode,
+        result.stdout.decode(errors="replace"),
+        result.stderr.decode(errors="replace"),
+    )
     if check:
         assert completed.returncode == 0, completed.stderr or completed.stdout
     return completed
@@ -204,7 +216,12 @@ def test_schedule_fire_counter_has_closed_run_outcome_and_trigger_domains() -> N
     domains = definition["attributes"]
     assert domains["service.name"] == ["curie-worker"]
     assert set(domains["outcome"]) == {
-        "ran", "deferred", "skipped", "blocked", "reclaimed", "failed"
+        "ran",
+        "deferred",
+        "skipped",
+        "blocked",
+        "reclaimed",
+        "failed",
     }
     assert set(domains["trigger"]) == {"cron", "bind", "webhook", "test"}
     assert set(domains) == {"service.name", "outcome", "trigger"}
@@ -284,8 +301,9 @@ def test_completion_outbox_inventory_is_bounded_and_has_no_identity_labels() -> 
 def test_slack_socket_identities_has_one_series_per_state_and_no_identity_label() -> None:
     """Two series per dispatcher, so ``connected < configured`` is one comparison.
 
-    Which identity is down stays in the dispatcher's own log; a Slack identity
-    name is an identifier and never a metric attribute.
+    Which identity is down stays in the dispatcher's own log; this gauge
+    carries no identity. The delivery counters below are where a bounded
+    identity dimension lives (#4960).
     """
     definition = _read(_MANIFEST)["metrics"]["curie.slack.socket.identities"]
     assert definition["type"] == "gauge"
@@ -294,6 +312,79 @@ def test_slack_socket_identities_has_one_series_per_state_and_no_identity_label(
         "state": ["configured", "connected"],
     }
     assert definition["cardinality_bound"] == 2
+
+
+_SLACK_IDENTITY_DIMENSION = {
+    "kind": "bounded",
+    "ceiling": 16,
+    "reserved": ["other"],
+    "overflow": "other",
+    "pattern": r"^[a-z0-9]+(-[a-z0-9]+)*$",
+}
+
+
+def test_slack_socket_envelopes_counts_frames_by_bounded_identity_and_type() -> None:
+    """Every frame Slack hands an identity's client, by Socket Mode type (#4960).
+
+    The identity is bounded like ``connector``: 16 slugs, then ``other``. Red on
+    an unbounded identity, a type value renamed or dropped, or a non-monotonic
+    instrument; an alert compares one identity's ``events_api`` rate with its
+    canary count.
+    """
+    definition = _read(_MANIFEST)["metrics"]["curie.slack.socket.envelopes"]
+    assert definition == {
+        "type": "counter",
+        "unit": "{envelope}",
+        "description": "Socket Mode frames Slack delivered, by Slack identity and frame type.",
+        "monotonic": True,
+        "attributes": {
+            "service.name": ["curie-dispatcher"],
+            "slack_identity": _SLACK_IDENTITY_DIMENSION,
+            "type": ["hello", "disconnect", "events_api", "interactive", "slash_commands", "other"],
+        },
+        "cardinality_bound": 17 * 6,
+    }
+
+
+def test_slack_delivery_canary_counts_handled_canary_mentions_by_identity() -> None:
+    definition = _read(_MANIFEST)["metrics"]["curie.slack.delivery_canary"]
+    assert definition == {
+        "type": "counter",
+        "unit": "{mention}",
+        "description": "Delivery-canary mentions the dispatcher handled, by Slack identity.",
+        "monotonic": True,
+        "attributes": {
+            "service.name": ["curie-dispatcher"],
+            "slack_identity": _SLACK_IDENTITY_DIMENSION,
+        },
+        "cardinality_bound": 17,
+    }
+
+
+def test_slack_identity_past_the_ceiling_or_not_a_slug_shares_other(
+    metrics: tuple[MeterProvider, InMemoryMetricReader],
+) -> None:
+    provider, reader = metrics
+    reset_bounded_labels()
+    names = [f"bot-{index}" for index in range(17)] + ["Not A Slug"]
+    for name in names:
+        record_metric(
+            "curie.slack.delivery_canary",
+            attributes={"service.name": "curie-dispatcher", "slack_identity": name},
+        )
+    assert provider.force_flush(timeout_millis=5000)
+    seen: dict[str, float] = {}
+    data = reader.get_metrics_data()
+    assert data is not None
+    for resource_metrics in data.resource_metrics:
+        for scope_metrics in resource_metrics.scope_metrics:
+            for metric in scope_metrics.metrics:
+                if metric.name == "curie.slack.delivery_canary":
+                    for point in metric.data.data_points:
+                        name = str(dict(point.attributes or {})["slack_identity"])
+                        seen[name] = float(point.value)
+    reset_bounded_labels()
+    assert seen == {**{f"bot-{index}": 1.0 for index in range(16)}, "other": 2.0}
 
 
 def test_last_success_age_has_one_series_across_failure_and_recovery(
@@ -343,9 +434,10 @@ def test_retry_metrics_separate_bounded_retry_causes(
             "workspace-error",
             "sandbox-terminated",
             "sandbox-capacity",
+            "model-unreachable",
         ],
     }
-    assert queue["cardinality_bound"] == 14
+    assert queue["cardinality_bound"] == 16
     record_metric(
         "curie.queue.retry",
         attributes={
@@ -468,21 +560,43 @@ service:
 
     container_id: str | None = None
     provider: MeterProvider | None = None
-    created = _docker(
-        "create",
-        "--pull=never",
-        "--publish",
-        "127.0.0.1::4318",
-        "--publish",
-        "127.0.0.1::8889",
-        "--volume",
-        f"{config.resolve()}:/etc/otel/collector-config.yaml:ro",
-        _COLLECTOR_IMAGE,
-        "--config=/etc/otel/collector-config.yaml",
-    )
-    container_id = created.stdout.strip()
+    collector_name = f"curie-test-history-collector-{uuid4().hex}"
+    collector_image = f"{collector_name}:fixture"
 
     try:
+        with io.BytesIO() as context:
+            with tarfile.open(fileobj=context, mode="w") as archive:
+                dockerfile = (
+                    f"FROM {_COLLECTOR_IMAGE}\n"
+                    "COPY collector.yaml /etc/otel/collector-config.yaml\n"
+                ).encode()
+                entry = tarfile.TarInfo("Dockerfile")
+                entry.size = len(dockerfile)
+                entry.mode = 0o644
+                archive.addfile(entry, io.BytesIO(dockerfile))
+                config_bytes = config.read_bytes()
+                entry = tarfile.TarInfo("collector.yaml")
+                entry.size = len(config_bytes)
+                entry.mode = 0o644
+                archive.addfile(entry, io.BytesIO(config_bytes))
+            _docker(
+                "build", "--tag", collector_image, "-", input_data=context.getvalue(), timeout=120
+            )
+        created = _docker(
+            "create",
+            "--pull=never",
+            "--name",
+            collector_name,
+            "--label",
+            f"curie.test.owner={collector_name}",
+            "--publish",
+            "127.0.0.1::4318",
+            "--publish",
+            "127.0.0.1::8889",
+            collector_image,
+            "--config=/etc/otel/collector-config.yaml",
+        )
+        container_id = created.stdout.strip()
         assert re.fullmatch(r"[0-9a-f]{64}", container_id), created.stdout
         _docker("start", container_id)
         otlp_port = _published_port(container_id, 4318)
@@ -553,9 +667,16 @@ service:
             try:
                 configure_meter_provider(module_provider)
             finally:
-                if container_id is not None:
-                    removed = _docker("rm", "--force", container_id, check=False)
-                    assert removed.returncode == 0, removed.stderr or removed.stdout
+                try:
+                    inspected = _docker("container", "inspect", collector_name, check=False)
+                    if inspected.returncode == 0:
+                        identity = json.loads(inspected.stdout)[0]
+                        assert identity["Config"]["Labels"]["curie.test.owner"] == collector_name
+                        removed = _docker("rm", "--force", identity["Id"], check=False)
+                        assert removed.returncode == 0, removed.stderr or removed.stdout
+                finally:
+                    if _docker("image", "inspect", collector_image, check=False).returncode == 0:
+                        _docker("image", "rm", collector_image)
 
 
 @pytest.mark.parametrize(
@@ -611,7 +732,40 @@ def test_deadline_halted_is_a_declared_terminal_turn_outcome(
             assert sibling in outcomes
         assert "capacity_wait_expired" in outcomes
         assert "fenced_out" not in outcomes
-        assert manifest[name]["cardinality_bound"] == 216
+        assert manifest[name]["cardinality_bound"] == 240
+
+
+def test_deploy_notice_suppressed_is_two_closed_series() -> None:
+    """Withheld git-flow notices are counted by reason, never by repository."""
+
+    definition = _read(_MANIFEST)["metrics"]["curie.deploy_notice.suppressed"]
+    assert definition["type"] == "counter"
+    assert definition["unit"] == "{outcome}"
+    assert definition["monotonic"] is True
+    assert definition["attributes"] == {
+        "service.name": ["curie-api"],
+        "reason": ["no_nonprod_recipient", "rate_limited"],
+    }
+    assert definition["cardinality_bound"] == 2
+
+
+def test_deploy_notice_suppressed_rejects_a_repository_label_by_execution(
+    metrics: tuple[MeterProvider, InMemoryMetricReader],
+) -> None:
+    del metrics
+    record_metric(
+        "curie.deploy_notice.suppressed",
+        attributes={"service.name": "curie-api", "reason": "rate_limited"},
+    )
+    with pytest.raises(ValueError, match="undeclared attribute"):
+        record_metric(
+            "curie.deploy_notice.suppressed",
+            attributes={
+                "service.name": "curie-api",
+                "reason": "rate_limited",
+                "repository": "acme-corp/acme-bot",
+            },
+        )
 
 
 def test_supervised_restart_metric_declares_closed_operation_domain() -> None:
@@ -630,14 +784,15 @@ def test_supervised_restart_metric_declares_closed_operation_domain() -> None:
             "heartbeat",
             "connectors",
             "publications",
+            "e2e-reaper",
             "other",
         ],
         "outcome": ["restart", "give_up"],
     }
-    assert definition["cardinality_bound"] == 14
+    assert definition["cardinality_bound"] == 16
 
 
-def test_reconciler_step_metrics_declare_only_the_api_and_eleven_steps() -> None:
+def test_reconciler_step_metrics_declare_only_the_api_and_thirteen_steps() -> None:
     manifest = _read(_MANIFEST)["metrics"]
     for name, instrument_type, monotonic in (
         (_RECONCILER_FAILURE_METRIC, "counter", True),
@@ -650,7 +805,7 @@ def test_reconciler_step_metrics_declare_only_the_api_and_eleven_steps() -> None
             "service.name": ["curie-api"],
             "step": _RECONCILER_STEPS,
         }
-        assert definition["cardinality_bound"] == 11
+        assert definition["cardinality_bound"] == 13
 
 
 def test_reconciler_step_metrics_export_failures_and_a_resettable_gauge(
@@ -841,8 +996,7 @@ def test_agent_turn_metric_keeps_a_named_agent_and_folds_past_the_ceiling(
     )
     assert provider.force_flush(timeout_millis=5000)
     labels = {
-        dict(point)["agent"]
-        for point in _exported_series(reader)["curie.agent.turn.completed"]
+        dict(point)["agent"] for point in _exported_series(reader)["curie.agent.turn.completed"]
     }
     assert "acme-0" in labels
     assert "acme-31" in labels
@@ -852,7 +1006,7 @@ def test_agent_turn_metric_keeps_a_named_agent_and_folds_past_the_ceiling(
     assert "not a slug" not in labels
     manifest = declared_metric_manifest()["metrics"]["curie.agent.turn.completed"]
     assert manifest["attributes"]["agent"]["ceiling"] == 32
-    assert manifest["cardinality_bound"] == 9 * (32 + 2)
+    assert manifest["cardinality_bound"] == 10 * (32 + 2)
 
 
 def test_record_metric_still_rejects_unknown_turn_outcome(
@@ -983,6 +1137,7 @@ def test_one_thousand_forbidden_ids_do_not_create_metric_series(
             sandbox_id = f"sandbox-example-{index}"
             forbidden_values.update((session_id, user_id, event_id, sandbox_id))
             runner = SessionRunner(
+                max_usd_per_day=None,
                 held_secrets=frozenset(),
                 session_factory=FakeModelSession,
                 ceiling=0,
@@ -1020,3 +1175,71 @@ def test_one_thousand_forbidden_ids_do_not_create_metric_series(
             assert point["source"] in manifest[metric_name]["attributes"]["source"]
             assert point["outcome"] in manifest[metric_name]["attributes"]["outcome"]
             assert forbidden_values.isdisjoint(point.values())
+
+
+def test_e2e_reaper_health_gauges_are_declared_with_one_worker_series_each() -> None:
+    """#3245: the reaper's liveness timestamp and its namespace counts (ADR 0176)."""
+
+    manifest = _read(_MANIFEST)["metrics"]
+    worker_only = {"service.name": ["curie-worker"]}
+
+    last_success = manifest["curie.e2e.reaper.last_success"]
+    assert last_success["type"] == "gauge"
+    assert last_success["unit"] == "s"
+    assert last_success["monotonic"] is False
+    assert last_success["attributes"] == worker_only
+    assert last_success["cardinality_bound"] == 1
+
+    expired = manifest["curie.e2e.namespaces.expired"]
+    assert expired["type"] == "gauge"
+    assert expired["unit"] == "{namespace}"
+    assert expired["monotonic"] is False
+    assert expired["attributes"] == worker_only
+    assert expired["cardinality_bound"] == 1
+
+    # Namespaces at least ten minutes past their TTL, or with none: what the
+    # page keys on, since a healthy reaper always sees a few just expired.
+    overdue = manifest["curie.e2e.namespaces.overdue"]
+    assert overdue["type"] == "gauge"
+    assert overdue["unit"] == "{namespace}"
+    assert overdue["monotonic"] is False
+    assert overdue["attributes"] == worker_only
+    assert overdue["cardinality_bound"] == 1
+
+    restart = manifest["curie.worker.supervised.restart"]["attributes"]["operation"]
+    assert "e2e-reaper" in restart
+
+
+def test_thread_attachment_ledger_append_is_a_closed_worker_counter() -> None:
+    """ADR 0205 (#4141): a failed append after install loses that message's
+    files from later boots without failing the turn, so it is counted.
+
+    Closed on purpose: no thread, agent or event label, only the outcome.
+    """
+
+    definition = _read(_MANIFEST)["metrics"]["curie.attachments.ledger.append"]
+    assert definition["type"] == "counter"
+    assert definition["monotonic"] is True
+    assert set(definition["attributes"]) == {"service.name", "outcome"}
+    assert definition["attributes"]["service.name"] == ["curie-worker"]
+    assert "failure" in definition["attributes"]["outcome"]
+    assert definition["cardinality_bound"] <= 2
+
+
+def test_thread_attachment_ledger_append_rejects_a_thread_label_by_execution(
+    metrics: tuple[MeterProvider, InMemoryMetricReader],
+) -> None:
+    del metrics
+    record_metric(
+        "curie.attachments.ledger.append",
+        attributes={"service.name": "curie-worker", "outcome": "failure"},
+    )
+    with pytest.raises(ValueError, match="undeclared attribute"):
+        record_metric(
+            "curie.attachments.ledger.append",
+            attributes={
+                "service.name": "curie-worker",
+                "outcome": "failure",
+                "thread_key": "slack:C1:1700000000.000100",
+            },
+        )

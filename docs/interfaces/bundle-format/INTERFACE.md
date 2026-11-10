@@ -24,10 +24,12 @@ The frozen bundle/plugin manifest format: the **Claude Code plugin shape verbati
 distribution wedge. What is swappable is the harness that consumes a bundle; what stays fixed is
 the shape a bundle must have to be accepted. The base is the Claude Code plugin shape, and the
 models are lenient (`extra="allow"`) rather than strict so any bundle written for Claude Code
-validates unchanged. On top of that base the package **does add six Curie authoring
-extensions** — `systemPrompt`, `starterPrompts`, `secrets`, `triggers`, `approvalPolicy`,
-`toolPolicy` on `packages/plugin-format/src/plugin_format/models.py::PluginManifest`, optional
-fields Claude Code does not define. Leniency is what lets the Claude Code base and these
+validates unchanged. On top of that base the package **does add eleven Curie authoring
+extensions**: `systemPrompt`, `starterPrompts`, `secrets`, `optionalSecrets`, `triggers`, `approvalPolicy`,
+`toolPolicy`, `channelRead`, `canvasList`, `canvasRead` and `canvasEdit` on `packages/plugin-format/src/plugin_format/models.py::PluginManifest`, optional
+fields Claude Code does not define. `secrets` names the secrets a deploy must bind;
+`optionalSecrets` (ADR 0210) names the ones it may leave unbound, validated the same
+way, and a name may not appear in both (`secrets.optional_overlap`). Leniency is what lets the Claude Code base and these
 extensions coexist; the earlier "does not invent format extensions" framing was wrong.
 
 The manifest is not the whole bundle either. Three **Curie-only root files** sit beside the Claude
@@ -39,12 +41,16 @@ all three parse under `extra="forbid"` (`packages/plugin-format/src/plugin_forma
 `packages/plugin-format/src/plugin_format/deploy_targets.py::DeployTarget`), because there is no
 external producer that could legitimately carry a key the models do not know, so an unrecognised key
 is a typo rather than a future Claude Code field. The lock is the one root file no human authors --
-`curie build` writes it and the bundle carries it -- but it is part of the format all the same,
+`curie build` writes it, `curie example dark-factory render` writes a `runner:` entry into it from a
+published tag, and the bundle carries it -- but it is part of the format all the same,
 because a second consumer that ignores it deploys a different image than the one the bundle's source
 was built into. What a bundle actually is, then, is the Claude Code
 plugin shape verbatim plus a strict Curie-only overlay, not a Claude Code plugin end to end.
 
 ## Current contract
+
+The optional-secret contract is recorded in
+[ADR 0210](../../adr/0210-a-bundle-may-declare-a-secret-optional.md) and #4129.
 
 `validate_bundle(path) -> ValidationResult` is the single entry point every deploy path calls
 (`packages/plugin-format/src/plugin_format/validate.py::validate_bundle`). It returns path-qualified
@@ -68,7 +74,7 @@ which also adds the second, non-default `agent-skills-strict` validation profile
 Those are the Claude-Code-shaped surfaces. `validate_bundle` also validates three **Curie-only root
 files**, each absent from a bundle that needs none, all three invisible to Claude Code:
 
-- `connectors.yaml` (ADR-0086, `packages/plugin-format/src/plugin_format/connectors.py::ConnectorsFile`)
+1. `connectors.yaml` (ADR-0086, `packages/plugin-format/src/plugin_format/connectors.py::ConnectorsFile`)
   declares the MCP servers Curie should run or reach on the bundle's behalf, keyed by connector name.
   Each entry is a `packages/plugin-format/src/plugin_format/connectors.py::ConnectorSpec` in exactly
   one of three mutually exclusive forms: hosted by reference (`image`, plus `args`/`env`/`port`
@@ -82,7 +88,81 @@ files**, each absent from a bundle that needs none, all three invisible to Claud
   `secrets` is `list[str | SecretRef]`
   (`packages/plugin-format/src/plugin_format/connectors.py::SecretRef`, with
   `name` / `from_secret` / `key`) and `secret_files` is by NAME only; neither form
-  carries a value. Intake refuses any `sealed_secrets` declaration with
+  carries a value. A `from_secret` without a placeholder is used as written. One that carries
+  `${CURIE_AGENT}` names a Secret per deploying agent: the renderer expands it to the agent's
+  name (`example-read-${CURIE_AGENT}` becomes `example-read-foo` for agent `foo` and
+  `example-read-foo-dev` for `foo-dev`), so agents deployed from one bundle into one namespace
+  read different out-of-band Secrets. It is the only placeholder a `from_secret` accepts
+  (`connectors.secret_ref_unknown_placeholder`), and the template must expand to a Kubernetes
+  Secret name for every valid agent name (`connectors.secret_ref_bad_name`); the render checks
+  the expanded name again. The local tiers have no out-of-band Secrets and refuse every
+  `from_secret` reference, templated or not. A hosted connector may also list `config`, env-var names for per-agent
+  NON-secret settings (a folder path, a channel id) the operator stores beside the connector's
+  credentials. Each `config` name resolves from the same per-agent store as a plain `secrets`
+  name and renders the same `secretKeyRef` env var on the connector pod, but it is never a
+  credential: it never derives the Bearer header, never counts toward
+  `connectors.bearer_secret_required`, and is never bound into the sandbox. A `config` name obeys
+  the secret name shape and reserved fence (`connectors.config_name_invalid`,
+  `connectors.config_name_reserved`), may not repeat (`connectors.duplicate_config`), may not also
+  appear in `secrets`, `secret_files` or `sealed_secrets` (`connectors.config_is_secret`), and a
+  `url` connector cannot declare `config` (`connectors.remote_has_config`). A hosted connector may
+  declare `proxy_upstream_host` ([ADR 0229](../../adr/0229-a-hosted-connector-may-declare-the-host-the-caller-proxy-presents-upstream.md)),
+  the Host its caller proxy presents to the server on admitted loopback requests.
+  It accepts `localhost` or a canonically spelled loopback IP address without a
+  port or brackets; the proxy adds the server port and brackets IPv6. Omission
+  preserves the caller's Host. Invalid values are `connectors.bad_proxy_upstream_host`,
+  and a `url` connector cannot declare it (`connectors.remote_has_proxy_upstream_host`).
+  The field renders only into the caller proxy, leaving direct requests unchanged.
+  A hosted connector may
+  declare `readiness_path`, an HTTP path the server answers when it can serve. Set, the server
+  container's readiness probe is exactly `httpGet` on that path and the `http` port
+  (`initialDelaySeconds: 2`, `periodSeconds: 10`, `timeoutSeconds: 5`, `failureThreshold: 3`) and
+  carries no `tcpSocket`; unset, it keeps the `tcpSocket` probe on the `http` port. The path starts
+  with `/` and is printable ASCII with no whitespace, `?` or `#` (`connectors.bad_readiness_path`),
+  and a `url` connector cannot declare it (`connectors.remote_has_readiness_path`). A hosted
+  connector may also declare `resources`, with optional `requests` and `limits`, each with optional
+  `cpu` and `memory` strings. Each value is merged per key over the server container's defaults
+  (`requests: {cpu: 10m, memory: 64Mi}`, `limits: {cpu: 500m, memory: 256Mi}`), so declaring only
+  `limits.memory` keeps the other three. Each value must be a positive Kubernetes quantity, and
+  after the merge each request must not exceed its limit (`connectors.bad_resources`); a `url`
+  connector cannot declare it (`connectors.remote_has_resources`). Neither field touches the caller
+  proxy container's probe or resources, and with both omitted the rendered Deployment is unchanged.
+  A consumer built before these fields refuses a bundle that sets either one as an unknown key.
+  A hosted connector may declare `scratch`, with a required `path` and a required `size_limit`,
+  for a server that must stage data on disk (for example a large upload it spools before streaming
+  it upstream). The pod gains one disk-backed `emptyDir` volume named `scratch` with that
+  `sizeLimit`, and the server container alone mounts it read-write at `path`; the root filesystem
+  stays read-only, the caller proxy container mounts nothing new, and `fsGroup` is unchanged. The
+  `path` is absolute, holds only letters, digits, `.`, `_`, `-` and `/`, has no empty, `.` or `..`
+  segment, is not `/`, and is not at or under `/bin`, `/boot`, `/dev`, `/etc`, `/lib`, `/lib64`,
+  `/proc`, `/run`, `/sbin`, `/sys` or `/usr` (`connectors.bad_scratch_path`). It is not equal to,
+  above or below any `secret_files` mount path (`connectors.scratch_overlaps_secret_file`). The
+  `size_limit` is a whole number of bytes with an optional `Ki`, `Mi` or `Gi` suffix, from 1Mi to
+  64Gi inclusive (`connectors.bad_scratch_size`), and
+  [`tests/vectors/connector-scratch-size.json`](../../../tests/vectors/connector-scratch-size.json)
+  is the shared reading of that grammar. A `url` connector cannot declare it
+  (`connectors.remote_has_scratch`). On the local docker tier the connector container instead gets
+  a tmpfs of `size_limit` bytes at `path` with mode `1777`. Omitted, the rendered Deployment and
+  the local container are unchanged, and a consumer built before the field refuses a bundle that
+  sets it as an unknown key.
+  A hosted connector may declare `routes`, the non-MCP HTTP routes its bundle's own stdio
+  servers call through the caller proxy (ADR 0240). Each entry has a `path`, matched exactly, that
+  starts with `/`, holds only letters, digits, `.`, `_`, `~`, `-` and `/`, has no empty, `.` or `..`
+  segment, and is neither `/mcp` nor under it (`connectors.bad_route_path`); it may not be the
+  connector's `readiness_path` (`connectors.route_is_readiness_path`) or repeat
+  (`connectors.duplicate_route`). `methods` is a non-empty subset of `POST` and `PUT`, defaulting to
+  `[POST]` (`connectors.bad_route_methods`). `max_body_bytes` is a required integer from 1 to
+  268435456, 256 MiB (`connectors.bad_route_max_body_bytes`). `callers` names at least one server
+  (`connectors.route_without_callers`), and bundle validation requires each to be a stdio server the
+  bundle's `.mcp.json` or manifest `mcpServers` declares (`connectors.route_caller_undeclared`,
+  `connectors.route_caller_not_stdio`). A `url` connector cannot declare `routes`
+  (`connectors.remote_has_routes`). A declared caller reads its routes once at start from the
+  descriptor `CURIE_CONNECTOR_ROUTES_FD` names, a JSON object from connector name to `{url, token}`,
+  and sends the token as `X-Curie-Caller` on the route; started without the name set, it has no
+  routes. Declare a caller as the program itself rather than a wrapper that forks (`sh -c`), since
+  the runner observes the lock only on the process it starts, and have it load what it needs at
+  start. A consumer built before the field refuses a bundle that sets it as an unknown key.
+  Intake refuses any `sealed_secrets` declaration with
   `connectors.sealed_secrets_unsupported` until a decrypt path exists (see
   [sealed-credential](../sealed-credential/INTERFACE.md)). For a hosted (`image`/`build`) connector
   with `secrets:` declared, the rendered `.mcp.json` entry derives
@@ -97,7 +177,31 @@ files**, each absent from a bundle that needs none, all three invisible to Claud
   with no `--secret`, so the `unhosted_url` fallback derives the same header (#2518). A hosted
   connector with several
   secrets, any of them a plain string, and no `bearer_secret` is `connectors.bearer_secret_required`;
-  one whose secrets are all `SecretRef`s is valid and derives no header (#3057). A hosted connector may
+  one whose secrets are all `SecretRef`s is valid and derives no header (#3057). A hosted connector
+  whose server authenticates no client may instead declare `no_client_auth: <reason>`, beside
+  `bearer_secret`: an optional string stating why no client credential exists. When it is set, no
+  `Authorization` header is derived in the hosted or `unhosted_url` entry, including the single
+  plain-secret shape, no secret name is bound into the sandbox, and
+  `connectors.bearer_secret_required` is not raised. Every declared secret keeps its pod-side
+  `secretKeyRef` delivery, and the rendered Deployment, Service and NetworkPolicy are unchanged,
+  because the reason text is never rendered. The reason must be non-empty after stripping
+  whitespace (`connectors.bad_no_client_auth`), it contradicts an explicit `bearer_secret`
+  (`connectors.no_client_auth_with_bearer_secret`), and a `url` connector cannot declare it
+  (`connectors.remote_has_no_client_auth`). The reachability boundary for such a server stays its
+  ingress NetworkPolicy (ADR-0086). For example:
+
+  ```yaml
+  connectors:
+    docs:
+      image: ghcr.io/example/docs-mcp:1
+      port: 8000
+      secrets: [UPSTREAM_CLIENT_ID, UPSTREAM_CLIENT_SECRET]
+      no_client_auth: >-
+        In-cluster MCP server reached over the pod network; it authenticates no
+        client and the boundary is its ingress NetworkPolicy.
+  ```
+
+  A hosted connector may
   declare `admits`, the agent names whose sandboxes may call it (ADR-0168 decision 7): a missing
   list admits the deploying agent alone, `[]` refuses everyone, and a list is exact, so it does
   not add the deploying agent. An entry is either the reserved name `self`, meaning the agent the
@@ -118,7 +222,7 @@ files**, each absent from a bundle that needs none, all three invisible to Claud
   `connectors.build_no_platforms`, `connectors.ambiguous_name` (a connector name that contains
   `-mcp-` or STARTS with `mcp-`, forging the `-mcp-` join used to render the connector's object
   name, so two different (agent, connector) pairs would render byte-identical objects — checked
-  only for a hosted connector, one declaring `image:`; a remote connector, declaring `url:`,
+  only for a hosted connector, one declaring `image:` or `build:`; a remote connector, declaring `url:`,
   derives no Kubernetes object name, since `render()` emits no objects for it and its `.mcp.json`
   entry is the authored URL, so its name is not checked), `connectors.direct_service_collision` (a
   hosted connector named `x-direct` beside a hosted `x`, whose direct Service behind a caller proxy
@@ -127,8 +231,10 @@ files**, each absent from a bundle that needs none, all three invisible to Claud
   silently replaced by the last YAML value.
 - `connectors.lock.yaml` (ADR-0113,
   `packages/plugin-format/src/plugin_format/connector_lock.py::ConnectorLockFile`) records what each
-  declared `build` resolved to. It is **generated, not authored**: `curie build` writes it and it is
-  packed into the bundle like any other file, so the platform holds the exact digest a version
+  declared `build` resolved to. It is **generated, not authored**: `curie build` writes it, and so does
+  `curie example dark-factory render`, which records a `runner:` entry for the published runner image
+  without building anything locally, so that entry trusts the release pipeline for the source-to-image
+  link rather than proving it. The lock is packed into the bundle like any other file, so the platform holds the exact digest a version
   deployed rather than that fact living in local CLI state. One
   `packages/plugin-format/src/plugin_format/connector_lock.py::ConnectorLockEntry` per built
   connector carries `image`, `delivery` (`registry` or `local-daemon`), the `platforms` the build
@@ -231,7 +337,7 @@ script from `.github/workflows/plugin-compat.yaml` on two triggers, because drif
 directions: a path-filtered `pull_request` trigger catches our own drift when we touch the bundles
 or the format models, and a nightly `schedule` catches Claude Code changing the format under us,
 which no PR of ours would ever surface. The check is deliberately not `--strict`: strict mode
-promotes unknown-field warnings to errors, and the six Curie authoring extensions are
+promotes unknown-field warnings to errors, and the eleven Curie authoring extensions are
 unknown-to-Claude-Code by design, so warnings are the expected steady state and only a non-zero
 exit is a failure.
 
@@ -280,9 +386,10 @@ Rust and is kept honest by `cli/plugin-format-mirrors.json` plus `curie dev fiel
 (`cli/scripts/check-field-parity.sh`). The export covers the three Curie-only root files as well
 as the Claude-Code-shaped ones, so a field change to `connectors.yaml`, `connectors.lock.yaml` or
 `deploy.yaml` fails the same drift gate, and the CLI's connector and lock structs are declared
-mirrors of those `$defs`. The TypeScript (UI)
-consumer remains a hand-written
-mirror. It also carries no `PROTOCOL_VERSION`; the
+mirrors of those `$defs`
+([ADR-0194](../../adr/0194-plugin-format-contract-is-the-frozen-schema-plus-a-parity-gate.md)
+records this as the contract). The UI's bundle writer (`apps/ui/src/api/bundle.ts`)
+is hand-written and relies on the server's plugin_format validator. It also carries no `PROTOCOL_VERSION`; the
 format is pinned to the Claude Code shape and the models are lenient by design so future Claude
 Code keys still validate.
 
@@ -290,16 +397,19 @@ Code keys still validate.
 
 By intent, the manifest, skill, and MCP surfaces are Claude-Code-shaped — that is the wedge, not a
 leak. What the wedge
-costs is asymmetric fidelity: a bundle loaded by Claude Code **validates but degrades**. All six
-Curie authoring extensions — `systemPrompt`, `starterPrompts`, `secrets`, `triggers`,
-`approvalPolicy`, `toolPolicy` — are unknown fields to Claude Code, which warns about each and then
-silently ignores it at load time. The manifest is accepted and the commands, agents, hooks, and MCP
-servers work; the agent's persona, its suggested openers, its secret declarations, its wake-up
-triggers, its approval gates, and its tool policy do not travel. That degradation is by design
+costs is asymmetric fidelity: a bundle loaded by Claude Code **validates but degrades**.
+All eleven Curie authoring extensions are unknown fields that Claude Code ignores:
+`systemPrompt`, `starterPrompts`, `secrets`, `optionalSecrets`, `triggers`,
+`approvalPolicy`, `toolPolicy`, `channelRead`, `canvasList`, `canvasRead` and
+`canvasEdit`. The manifest is accepted and the commands, agents, hooks and MCP
+servers work; the agent's persona, suggested openers, secret declarations,
+wake-up triggers, approval gates and tool policy do not travel. The four Slack
+grants also disappear, so they mount no platform history or canvas tools in
+Claude Code. That degradation is by design
 (there is nowhere in the Claude Code shape to put them), but it is silent from the operator's side,
 so it is documented here rather than discovered.
 
-`toolPolicy` degrades **worse than the other five**, and the difference is the reason it is
+`toolPolicy` degrades **worse than the other ten**, and the difference is the reason it is
 gated the way it is. The rest lose a capability: the agent is less useful. This one loses a
 **restriction**: a bundle whose tool surface is fenced by `toolPolicy`
 (`packages/plugin-format/src/plugin_format/models.py::ToolPolicy`) runs *unfenced* in Claude
@@ -313,27 +423,49 @@ nothing `plugin-format` ships applies a policy, which is why that handshake exis
 gap that no in-package mechanism can close: a platform built before this package version does not
 model the key at all, and the lenient models accept and silently ignore it.
 
-The two Curie-only root files degrade **more quietly still**, and they belong on the same list. A
+The three Curie-only root files degrade **more quietly still**, and they belong on the same list. A
 manifest extension at least draws a warning: `claude plugin validate examples/compat-fixture` (the
-fixture at `examples/compat-fixture/.claude-plugin/plugin.json`, which exists to carry all six)
+fixture at `examples/compat-fixture/.claude-plugin/plugin.json`, which carries the original six)
 reports one `Unknown field ... Claude Code ignores it at load time` warning per extension.
-`connectors.yaml` and `deploy.yaml` are not manifest fields at all, so Claude Code neither loads them
-nor mentions them: validating `examples/weather` (which carries `examples/weather/connectors.yaml`)
+`connectors.yaml`, `connectors.lock.yaml`, and `deploy.yaml` are not manifest fields at all, so
+Claude Code neither loads them nor mentions them: validating `examples/weather` (which carries `examples/weather/connectors.yaml`)
 warns only about the manifest's `starterPrompts` and says nothing about the connector file. A bundle
 whose tool surface is declared through `connectors.yaml` therefore loads in Claude Code with those
-servers simply absent, and with no signal at all that anything was dropped. `deploy.yaml` degrades
+servers simply absent, and with no signal at all that anything was dropped. `connectors.lock.yaml`
+loses something Curie treats as authoritative: the pinned connector identity. On Curie, the lock's
+resolved image digest is the only identity a `build:` connector deploys or starts under
+(`packages/plugin-format/src/plugin_format/connector_lock.py::apply_lock`), together with its
+delivery mode, platforms, and source digest. A Claude Code consumer ignores the file, so even a
+consumer that wired the connectors up by hand would get no digest pin and no guarantee it runs the
+image the bundle version was built and deployed with. `deploy.yaml` degrades
 harmlessly by comparison, since routing is Curie's concern and Claude Code has nothing to route.
 
+The runner also reads a strict Curie-only root sidecar, `curie.bundle.json`,
+outside `validate_bundle`
+(`runner/src/curie_runner/plugin.py::_load_bundle_config`). Its only accepted keys
+are `webSearch`, a JSON boolean defaulting to true
+([ADR 0138](../../adr/0138-provider-side-web-search-is-a-default-on-bundle-capability.md)),
+and `finalAnswer`, the opt-in versioned publication-validation policy
+([ADR 0227](../../adr/0227-opt-in-final-answer-publication-validation.md), parsed by
+`runner/src/curie_runner/final_answer.py::FinalAnswerPolicy.parse`). Unknown or
+duplicate keys, malformed content and invalid values fail runner loading; an
+absent file keeps the defaults. Claude Code ignores this sidecar, so neither
+Curie's web-search setting nor its final-answer publication gate travels with
+the bundle to that consumer. Passing `validate_bundle` alone does not validate
+this file.
+
 The outbound gate covers this unevenly, and the gap is worth naming.
-`examples/tests/test_plugin_compat_coverage.py` pins that each of the six manifest extensions
+`examples/tests/test_plugin_compat_coverage.py` pins that each of the original six manifest extensions
 appears in at least one discovered example bundle, so the gate cannot cover them vacuously, but it
-checks manifest FIELDS only. `connectors.yaml` is exercised incidentally because the weather bundle
+checks manifest FIELDS only. `optionalSecrets` and the four Slack grants
+(`channelRead`, `canvasList`, `canvasRead`, `canvasEdit`) are outside that coverage pin.
+`connectors.yaml` is exercised incidentally because the weather bundle
 happens to carry one. `examples/sre-bot` carries a `deploy.yaml`, so the outbound gate validates a
 bundle directory containing that file and proves Claude Code tolerates it. The separate
 `examples/tests/test_sre_bot_hygiene.py` suite also requires that file and validates its Curie
 semantics, so removing it does fail coverage. The remaining unevenness is that the generic plugin
-compatibility coverage pins manifest fields only: neither Curie-only root file belongs to Claude
-Code's manifest model, and this gate does not prove their presence or semantics across bundles.
+compatibility coverage pins manifest fields only: none of the three Curie-only root files belongs to
+Claude Code's manifest model, and this gate does not prove their presence or semantics across bundles.
 
 The `hooks`
 field is no longer dead: as of #272 it is validated at deploy time (`HookMatcherConfig` /
@@ -404,11 +536,33 @@ declarations rejected), but they differ in whether the runtime acts on them yet:
   takes an `enforces_tool_policy` handshake argument and REFUSES a policy-bearing bundle from any
   caller that does not name `curie/mcp-tool-policy@1`; `load_tool_policy` raises rather than
   returning a policy such a caller would not apply.
-  **Curie's own platform-owned MCP servers, `curie` and `curie-state`, are outside `toolPolicy`
-  scope entirely** (#2286, ADR-0139). A bundle cannot declare them as connectors
-  (`packages/plugin-format/src/plugin_format/connectors.py::RESERVED_CONNECTOR_NAMES`), so it
-  cannot express a policy over them, and the runtime exempts the tools those servers actually
-  published through `runner/src/curie_runner/approval.py::is_platform_owned_tool` before
+  **The existing platform servers `curie` and `curie-state` retain their `toolPolicy`
+  exemption** (#2286, ADR 0139). Their names are reserved against connectors;
+  a bundle may still plugin mount either name with the plugin infix and full
+  policy scope. Reservation does not imply mounting, publication or exemption.
+  The reserved `curie-slack` capability is fully governed by policy when the
+  manifest grants any platform Slack grant (`channelRead`, `canvasList`,
+  `canvasRead`, `canvasEdit`), and a bundle cannot declare it in any MCP
+  map or in `connectors.yaml`. Without the grant a literal policy pattern gets
+  `channel_read.grant_required`. A granted, real-model boot mounts it (#2877);
+  its tools are governed by policy like a connector's. The server carries three
+  read only tools, `read_channel_history`, `read_thread_replies` and
+  `read_channel_message`, over the agent's own bound Slack channels (a
+  `{kind, address}` selector such as `C0EXAMPLE1`, defaulting to the turn's
+  channel). Reads are bounded to a 7 day window, `limit` 50 by default and 100
+  at most, and 8 pages per logical turn. A refusal is a named code the model
+  sees, among them `channel_read.not_bound`, `channel_read.grant_revoked`,
+  `channel_read.turn_inactive`, `channel_read.window_too_wide`,
+  `channel_read.limit_invalid`, `channel_read.page_budget_exhausted` and
+  `channel_read.provider_rate_limited`. Three canvas tools share the server, each
+  present only with its own grant: `list_channel_canvases` (`canvasList`),
+  `read_canvas` (`canvasRead`) and `edit_canvas_cell` (`canvasEdit`). Each costs
+  one of the 8 pages, an edit is limited to one existing table cell whose section
+  id a read returned in the same logical turn, and every edit is audited
+  (ADR 0200). A granted turn on a runner that cannot
+  enforce the grant is refused with `channel-read-unenforced`. The runtime exempts
+  only exact platform tool names published by the existing two servers through
+  `runner/src/curie_runner/approval.py::is_platform_owned_tool` before
   `classify_tool` is ever consulted. The exemption is exact live tool names, not the
   `mcp__<server>__` prefix: `strict_mcp_config` is off, so the CLI also loads ambient project
   and user MCP servers, and a prefix match would exempt every tool of one keyed `curie__extra`
@@ -426,7 +580,7 @@ declarations rejected), but they differ in whether the runtime acts on them yet:
   configuration may add restrictions but may not hollow out operator or platform controls, and the
   same predicate decides both directions; platform-scope patterns for an operator-level need would
   be new semantics and belong to a future `@2` enforcement id. A bundle's own plugin-mounted
-  `mcpServers` entry named `curie` is a different server, carries the `plugin_<bundle>_` infix in
+  `mcpServers` entry named `curie` or `curie-state` is a different server, carries the `plugin_<bundle>_` infix in
   its live names, and stays fully in scope.
 
 Their validators live alongside the others in `validate.py` (`triggers.*` / `approval_policy.*` /

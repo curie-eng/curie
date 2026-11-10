@@ -8,7 +8,24 @@ secretKeyRef environment entries in each agent's SandboxTemplate, without
 control plane created per agent Roles. A runner can inspect credentials
 injected into its own process, including a configured shared model credential.
 Claim 2 tests this delivery path through real claims and bound runners.
+
+IRSA scope (#3842). NetworkPolicy selects pods, not containers, so the
+prompt-injectable runner can use any role the bundle-fetch init container can.
+The chart therefore refuses a runner `eks.amazonaws.com/role-arn` equal to the
+api, worker, or langfuse one: those identities read and write object storage.
+What is NOT enforced: the runner role's actual IAM policy (the chart cannot read
+IAM), and EKS Pod Identity associations, which live outside the chart.
 */}}
+{{- $roleKey := "eks.amazonaws.com/role-arn" }}
+{{- $runnerRole := index (.Values.agentSandbox.runner.serviceAccount.annotations | default dict) $roleKey | default "" | toString }}
+{{- if $runnerRole }}
+{{- range $owner := list "api" "worker" "langfuse" }}
+{{- $ownerRole := dig $owner "serviceAccount" "annotations" $roleKey "" $.Values.AsMap | toString }}
+{{- if eq $runnerRole $ownerRole }}
+{{- fail (printf "agentSandbox.runner.serviceAccount.annotations %s reuses the %s ServiceAccount role %q; the runner is prompt-injectable and can use any role its bundle-fetch init container can, so give it a separate read-only bundle-bucket role (#3842)" $roleKey $owner $runnerRole) }}
+{{- end }}
+{{- end }}
+{{- end }}
 apiVersion: v1
 kind: ServiceAccount
 metadata:
@@ -25,9 +42,11 @@ metadata:
   #
   # Scope this role to the bundle bucket, read-only. NetworkPolicy selects pods
   # and not containers, so any identity reachable by the bundle-fetch init
-  # container is also reachable by the runner, which is prompt-injectable.
+  # container is also reachable by the runner, which is prompt-injectable. The
+  # render refuses a role ARN shared with the api, worker, or langfuse SA.
   annotations:
     {{- toYaml . | nindent 4 }}
   {{- end }}
-automountServiceAccountToken: {{ .Values.agentSandbox.runner.serviceAccount.automountToken }}
+{{- /* agent-sandbox.yaml refuses any automountToken other than false. */}}
+automountServiceAccountToken: false
 {{- end }}

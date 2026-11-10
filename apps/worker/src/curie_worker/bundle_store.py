@@ -7,7 +7,7 @@ uses, so the env names line up.
 
 ``extract_bundle`` is the Docker-substrate counterpart to the Kubernetes
 bundle-fetch/extract init pair: with no init containers, the worker fetches and
-unpacks the bundle itself and bind-mounts the result as the runner's plugin dir.
+unpacks the bundle itself, then copies it into the runner's plugin volume.
 Its unwrap semantics mirror the API's ``bundles.bundle_root`` exactly (unwrap a
 single top-level wrapper dir when that subdir carries the plugin manifest), so
 the plugin root the runner sees matches the root the API validated on upload.

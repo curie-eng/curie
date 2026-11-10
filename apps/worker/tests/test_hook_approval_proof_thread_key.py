@@ -16,7 +16,7 @@ from pathlib import Path
 
 import pytest
 from aci_protocol import QueuedTurn, ReplyHandle
-from curie_worker.kernel import _thread_key_for
+from curie_worker.kernel.routing import _thread_key_for
 
 _SCRIPT_PATH = (
     Path(__file__).resolve().parents[3] / "charts" / "curie" / "ci" / "hook-approval-proof.py"
@@ -53,7 +53,7 @@ def test_the_rigs_thread_key_matches_the_workers_builder() -> None:
     assert proof._thread_key("hook:abc") == _thread_key_for(turn) == "slack:C0EXAMPLE1:hook%3Aabc"
 
 
-def test_the_rig_requires_the_workers_own_slack_origin_to_be_offline() -> None:
+def test_the_rig_requires_the_gateways_slack_origin_to_be_offline() -> None:
     proof = _load_proof_module()
     offline = {
         "SLACK_API_BASE_URL": {"name": "SLACK_API_BASE_URL", "value": proof.OFFLINE_ENDPOINT}

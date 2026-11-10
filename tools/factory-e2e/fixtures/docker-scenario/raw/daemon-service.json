@@ -1,0 +1,28 @@
+{
+ "apiVersion": "v1",
+ "kind": "Service",
+ "metadata": {
+  "name": "7bd5b54461f4",
+  "namespace": "fd-proof-d-e8ce1a8c",
+  "labels": {
+   "app.kubernetes.io/instance": "fd-proof",
+   "curietech.ai/sandbox-claim": "7bd5b54461f4"
+  }
+ },
+ "spec": {
+  "clusterIP": "None",
+  "selector": {
+   "app.kubernetes.io/component": "docker-daemon",
+   "app.kubernetes.io/instance": "fd-proof",
+   "curietech.ai/sandbox-claim": "7bd5b54461f4"
+  },
+  "ports": [
+   {
+    "name": "docker",
+    "port": 2376,
+    "protocol": "TCP",
+    "targetPort": 2376
+   }
+  ]
+ }
+}

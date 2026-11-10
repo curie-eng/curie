@@ -1,0 +1,5 @@
+[
+  {"name":"off", "enabled":false, "mode":"eager", "lazy":false, "volume":false, "eager_init":false},
+  {"name":"legacy", "enabled":true, "mode":"eager", "lazy":false, "volume":true, "eager_init":true},
+  {"name":"on_demand", "enabled":true, "mode":"lazy", "lazy":true, "volume":true, "eager_init":false}
+]

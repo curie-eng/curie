@@ -14,9 +14,13 @@ double is the boundary outside the box.
 from __future__ import annotations
 
 import asyncio
+import logging
+import subprocess
+import time
 import uuid
 from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -31,13 +35,24 @@ from aci_protocol import (
     ToolNote,
     TurnSource,
 )
-from curie_worker.approvals import ApprovalRequest, CreatedApproval
+from curie_worker.approvals import ApprovalRequest, CreatedApproval, PublicationLineage
 from curie_worker.behaviorpacks import BehaviorPacks
+from curie_worker.binding import FactoryContext, FactoryWake, HttpIdentityBinding
+from curie_worker.sandbox import SuspendedThreadError
 from curie_worker.workitem_dispatch import (
     WorkItemAcquireGrant,
     WorkItemConflict,
+    WorkItemRequestView,
+    WorkItemRunning,
     WorkItemStartGrant,
+    WorkItemTransportError,
 )
+
+from apps.worker.tests.kernel.test_work_item_workspace import (
+    _PR_NOT_ADOPTED_RESPONSE,
+    _HttpPrecheckApi,
+)
+from apps.worker.tests.queue_fixtures import factory_context, factory_conversation
 
 AGENT_ID = uuid.UUID("11111111-1111-4111-8111-111111111111")
 DEPLOYMENT_ID = uuid.UUID("22222222-2222-4222-8222-222222222222")
@@ -45,6 +60,7 @@ CHANNEL = "C0EXAMPLE1"
 WORK_ITEM_REPO = "acme-corp/widgets"
 ISSUE_URL = f"https://github.com/{WORK_ITEM_REPO}/issues/123"
 ISSUE_PROMPT = f"Resolve {ISSUE_URL}"
+PR_URL = f"https://github.com/{WORK_ITEM_REPO}/pull/77"
 PUBLISH_TOOL = "mcp__curie__publish_changes"
 PROGRESS_TOOL = "mcp__curie__report_progress"
 # A credential shape the shared redaction policy (curie_telemetry.redact
@@ -53,7 +69,20 @@ GITHUB_TOKEN = "gh" + "p_" + "A1b2C3d4" * 5
 
 
 class _Binding:
-    async def resolve(self, kind: str, adapter: str | None, channel: str) -> object:
+
+    async def identity_binding(
+        self, kind: str, adapter: str | None, address: str,
+    ) -> HttpIdentityBinding | None:
+        """@spec HTTP-INVOCATION-EXECUTION-18: explicit local fixture classification."""
+        agent_id = AGENT_ID
+        return HttpIdentityBinding(
+            tenant_id=uuid.UUID("00000000-0000-4000-8000-000000000001"),
+            agent_id=agent_id,
+            binding_id=uuid.uuid5(uuid.NAMESPACE_URL, repr((kind, adapter, address))),
+            binding_generation=1, http_identity_required=False,
+        )
+
+    def _deployment(self) -> object:
         return SimpleNamespace(
             agent_id=AGENT_ID,
             agent_name="acme-bot",
@@ -62,6 +91,13 @@ class _Binding:
             adapter=None,
             approval_routes=None,
         )
+
+    async def resolve(self, kind: str, adapter: str | None, channel: str) -> object:
+        return self._deployment()
+
+    async def resolve_factory(self, context: FactoryContext) -> object:
+        assert context.agent_id == AGENT_ID
+        return self._deployment()
 
     def boot_env(self, _resolved: object, thread_key: str, **_: object) -> dict[str, str]:
         return {
@@ -88,14 +124,25 @@ class _Workspace:
                 env=dict(kwargs.get("env") or {}),
                 workspace_repo=kwargs.get("repo_full_name"),
                 agent_name=kwargs.get("agent_name"),
+                caller_run=kwargs.get("caller_run"),
             )
             return SimpleNamespace(handle=handoff, prepared=None)
-        handle = self.substrate.claim(  # type: ignore[attr-defined]
-            str(kwargs["thread_key"]),
-            env=kwargs.get("env"),
-            agent_name=kwargs.get("agent_name"),
-            workspace_repo=kwargs.get("repo_full_name"),
-        )
+        try:
+            handle = self.substrate.claim(  # type: ignore[attr-defined]
+                str(kwargs["thread_key"]),
+                env=kwargs.get("env"),
+                agent_name=kwargs.get("agent_name"),
+                workspace_repo=kwargs.get("repo_full_name"),
+                caller_run=kwargs.get("caller_run"),
+            )
+        except SuspendedThreadError:
+            handle = self.substrate.resume(  # type: ignore[attr-defined]
+                str(kwargs["thread_key"]),
+                env=kwargs.get("env"),
+                agent_name=kwargs.get("agent_name"),
+                workspace_repo=kwargs.get("repo_full_name"),
+                caller_run=kwargs.get("caller_run"),
+            )
         return SimpleNamespace(handle=handle, prepared=None)
 
     def touch(self, _thread_key: str, *, ttl_seconds: int) -> bool:
@@ -104,42 +151,162 @@ class _Workspace:
     def release(self, _thread_key: str) -> None:
         return None
 
+    def current(self, _thread_key: str) -> object:
+        # The retained prepared base; matches the base _patch_snapshot returns.
+        return SimpleNamespace(repo_full_name=WORK_ITEM_REPO, base_sha="a1" * 20)
+
 
 class _WorkItems:
     """Dispatch double: records every finish the worker posts."""
 
-    def __init__(self, *, deadline_s: float = 3600.0) -> None:
+    def __init__(
+        self,
+        *,
+        deadline_s: float = 3600.0,
+        request_reads: list[str | float | BaseException] | None = None,
+    ) -> None:
         self.deadline_s = deadline_s
         self.calls: list[str] = []
         self.finishes: list[dict[str, object]] = []
+        self.acquisitions: dict[uuid.UUID, WorkItemAcquireGrant] = {}
+        self.starts: dict[uuid.UUID, WorkItemStartGrant] = {}
+        self.terminal_outcomes: dict[uuid.UUID, str] = {}
+        self.deadline_holds: set[uuid.UUID] = set()
         self.after_finish: Callable[[], Awaitable[None]] | None = None
+        # What each ``get_request`` answers, in order: a status, or an error to
+        # raise, or a number of seconds to hang before reading as ``running``.
+        # Once exhausted, reads return the recorded request state.
+        self.request_reads = list(request_reads or [])
 
     async def acquire(
-        self, request_id: uuid.UUID, *, owner: str, generation: int
+        self,
+        request_id: uuid.UUID,
+        *,
+        owner: str,
+        generation: int,
+        wake: FactoryWake,
+        context: FactoryContext | None,
     ) -> WorkItemAcquireGrant:
         self.calls.append("acquire")
-        return WorkItemAcquireGrant(
+        if request_id in self.starts or request_id in self.terminal_outcomes:
+            raise WorkItemConflict("not_dispatchable")
+        existing = self.acquisitions.get(request_id)
+        if existing is not None:
+            assert existing.generation == generation
+            assert context is None or context == existing.context
+            return existing
+        grant = WorkItemAcquireGrant(
             generation=generation,
             work_item_id=request_id,
-            conversation_id=f"work-item-{request_id}",
-            wait_deadline=(datetime.now(UTC) + timedelta(hours=1)).isoformat(),
-            repo_full_name=WORK_ITEM_REPO,
+            conversation_id=factory_conversation(wake),
+            wait_deadline=datetime.now(UTC) + timedelta(hours=1),
+            repository_path=WORK_ITEM_REPO,
+            context=factory_context(AGENT_ID, wake),
+        )
+        self.acquisitions[request_id] = grant
+        return grant
+
+    async def running_for_conversation(
+        self, conversation_id: str, *, wake: FactoryWake
+    ) -> WorkItemRunning | None:
+        self.calls.append("running_for_conversation")
+        matches = [
+            (request_id, grant)
+            for request_id, grant in self.acquisitions.items()
+            if grant.conversation_id == conversation_id
+        ]
+        if not matches:
+            return None
+        running = [
+            (request_id, grant, self.starts[request_id])
+            for request_id, grant in matches
+            if request_id in self.starts
+            and request_id not in self.terminal_outcomes
+            and self.starts[request_id].execution_deadline > datetime.now(UTC)
+        ]
+        if not running:
+            raise WorkItemConflict("execution_ended")
+        assert len(running) == 1
+        request_id, grant, started = running[0]
+        if factory_conversation(wake) != grant.conversation_id:
+            raise WorkItemConflict("factory_wake_mismatch")
+        return WorkItemRunning(
+            request_id=request_id,
+            work_item_id=grant.work_item_id,
+            agent_id=grant.agent_id,
+            generation=grant.generation,
+            conversation_id=grant.conversation_id,
+            wait_deadline=grant.wait_deadline,
+            repository_path=grant.repository_path,
+            runtime_epoch=started.runtime_epoch,
+            execution_deadline=started.execution_deadline,
+            lease_held_to_deadline=request_id in self.deadline_holds,
+            context=grant.context,
+            refusal=None,
         )
 
-    async def start(self, request_id: uuid.UUID, **_: object) -> WorkItemStartGrant:
+    async def start(
+        self, request_id: uuid.UUID, *, context: FactoryContext, **_: object
+    ) -> WorkItemStartGrant:
         self.calls.append("start")
-        return WorkItemStartGrant(
+        acquired = self.acquisitions[request_id]
+        assert context == acquired.context
+        assert request_id not in self.starts
+        assert request_id not in self.terminal_outcomes
+        started = WorkItemStartGrant(
             runtime_epoch=1,
             execution_deadline=datetime.now(UTC) + timedelta(seconds=self.deadline_s),
             remaining_s=self.deadline_s,
             heartbeat_interval_s=60.0,
         )
+        self.starts[request_id] = started
+        return started
 
-    async def finish(self, _request_id: uuid.UUID, **kwargs: object) -> None:
+    async def hold_for_approval(
+        self, request_id: uuid.UUID, *, runtime_epoch: int, **_: object,
+    ) -> None:
+        self.calls.append("hold_for_approval")
+        assert runtime_epoch == self.starts[request_id].runtime_epoch
+        assert request_id not in self.terminal_outcomes
+        self.deadline_holds.add(request_id)
+
+    async def finish(self, request_id: uuid.UUID, **kwargs: object) -> None:
         self.calls.append("finish")
+        started = self.starts[request_id]
+        assert kwargs["runtime_epoch"] == started.runtime_epoch
+        assert request_id not in self.terminal_outcomes
+        outcome = kwargs["outcome"]
+        assert outcome in {"completed", "failed"}
+        assert isinstance(outcome, str)
+        self.terminal_outcomes[request_id] = outcome
+        self.deadline_holds.discard(request_id)
         self.finishes.append(kwargs)
         if self.after_finish is not None:
             await self.after_finish()
+
+    async def issue_read_context(self, request_id: uuid.UUID) -> tuple[str, str]:
+        return "acme widgets issue 7", f"wir.capability-for-{request_id}"
+
+    async def get_request(self, request_id: uuid.UUID) -> WorkItemRequestView:
+        self.calls.append("get_request")
+        if request_id not in self.acquisitions:
+            raise WorkItemConflict("not_found")
+        started = self.starts.get(request_id)
+        status = self.terminal_outcomes.get(
+            request_id, "running" if started is not None else "waiting"
+        )
+        read = self.request_reads.pop(0) if self.request_reads else status
+        if isinstance(read, BaseException):
+            raise read
+        if isinstance(read, float):
+            await asyncio.sleep(read)
+            read = "running"
+        return WorkItemRequestView(
+            status=read,
+            runtime_epoch=started.runtime_epoch if started is not None else 0,
+            runtime_claim_name=None,
+            runtime_sandbox_name=None,
+        )
 
     def __getattr__(self, name: str):  # type: ignore[no-untyped-def]
         async def record(*_args: object, **_kwargs: object) -> None:
@@ -158,7 +325,7 @@ class _PublicationPendingWorkItems(_WorkItems):
 
 
 class _Approvals:
-    async def create(self, _request: ApprovalRequest) -> CreatedApproval:
+    async def create(self, _request: ApprovalRequest, *, budget_s: float = 120) -> CreatedApproval:
         return CreatedApproval(id="appr-1", status="pending")
 
 
@@ -301,6 +468,8 @@ def test_early_stop_and_unpublished_turns_get_different_continuation_prompts(
         )
 
         assert early[1] != worked[1]
+        assert "No changes needed:" in early[1]
+        assert "No changes needed:" in worked[1]
 
     asyncio.run(exercise())
 
@@ -365,7 +534,7 @@ def test_only_context_reads_end_as_early_stop(make_harness) -> None:
     ],
 )
 def test_the_unpublished_cause_follows_the_work_evidence(tools: frozenset[str], cause: str) -> None:
-    from curie_worker.kernel import _unpublished_cause
+    from curie_worker.kernel.failures import _unpublished_cause
 
     assert _unpublished_cause(tools) == cause
 
@@ -374,20 +543,74 @@ def test_the_unpublished_cause_follows_the_work_evidence(tools: frozenset[str], 
 
 
 class _PublicationApi:
-    def __init__(self) -> None:
+    def __init__(self, lineage: PublicationLineage | None = None) -> None:
         self.creates: list[object] = []
+        self.lineage = lineage
 
-    async def get_publication_lineage(self, *_args: object) -> None:
-        return None
+    async def get_publication_lineage(self, *_args: object) -> PublicationLineage | None:
+        return self.lineage
 
     async def get_publication_precheck_context(self, **_kwargs: object) -> None:
         return None
 
-    async def create_publication(self, request: object) -> object:
+    async def create_publication(self, request: object, *, budget_s: float = 120) -> object:
         from curie_worker.approvals import CreatedPublication
 
         self.creates.append(request)
         return CreatedPublication(id="publication-1", approval_id="approval-1", status="pending")
+
+
+def _revision_lineage(pr_url: str | None, conversation_id: str) -> PublicationLineage:
+    return PublicationLineage(
+        id=uuid.uuid4(),
+        deployment_id=DEPLOYMENT_ID,
+        conversation_id=conversation_id,
+        repo_full_name=WORK_ITEM_REPO,
+        base_sha="b" * 40,
+        branch="curie/thread-example",
+        pr_number=77,
+        pr_url=pr_url,
+        head_sha="a" * 40,
+        state="open",
+        version=2,
+        latest_revision=1,
+        has_pending_revision=False,
+        has_pending_outcome=False,
+        visible_outcome_revision=1,
+    )
+
+
+@pytest.mark.parametrize(
+    ("pr_url", "worked_cause"),
+    [
+        (PR_URL, "revision_unchanged"),
+        (None, "no_pull_request"),
+        ("", "no_pull_request"),
+        (" \t ", "no_pull_request"),
+    ],
+)
+@pytest.mark.parametrize("context_only", [False, True])
+def test_issue_4752_unpublished_revision_uses_the_recorded_pull_request(
+    make_harness, pr_url: str | None, worked_cause: str, context_only: bool
+) -> None:
+    async def exercise() -> None:
+        publications = _PublicationApi(_revision_lineage(pr_url, "1700000000.000001"))
+        detail = "checkout_changed_before_plan_approval"
+        opened, items, terminal = await _run_execute(
+            make_harness,
+            [[_tool("Read" if context_only else "Bash"), _done("Checking.")], [_done(detail)]],
+            publication_creator=publications,
+        )
+
+        assert len(opened) == 2
+        assert terminal
+        assert len(items.finishes) == 1
+        assert items.finishes[0]["outcome"] == "failed"
+        assert items.finishes[0]["cause"] == ("early_stop" if context_only else worked_cause)
+        assert items.finishes[0]["detail"] == detail
+        assert publications.creates == []
+
+    asyncio.run(exercise())
 
 
 def _patch_snapshot(h: object, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -406,7 +629,7 @@ def _patch_snapshot(h: object, monkeypatch: pytest.MonkeyPatch) -> None:
 
     monkeypatch.setattr(h.kernel._runner, "snapshot", snapshot)  # type: ignore[attr-defined]
     monkeypatch.setattr(
-        "curie_worker.kernel.validate_snapshot_against_base",
+        "curie_worker.kernel.attempt.validate_snapshot_against_base",
         lambda *_args, **_kwargs: None,
     )
 
@@ -450,7 +673,7 @@ def test_failed_publication_approval_finishes_factory_request_immediately(
     from curie_worker.approvals import ApprovalBackendError
 
     class FailedPublicationApi(_PublicationApi):
-        async def create_publication(self, request: object) -> object:
+        async def create_publication(self, request: object, *, budget_s: float = 120) -> object:
             self.creates.append(request)
             raise ApprovalBackendError("publication snapshot failed")
 
@@ -465,13 +688,9 @@ def test_failed_publication_approval_finishes_factory_request_immediately(
             h.kernel._work_items = items
             _patch_snapshot(h, monkeypatch)
             h.runner.turn_scripts = [[_tool(PUBLISH_TOOL), _publish_final()]]
-            await h.kernel.process_event(
-                _turn(f"work-item-{uuid.uuid4()}-execute-1", ISSUE_PROMPT)
-            )
+            await h.kernel.process_event(_turn(f"work-item-{uuid.uuid4()}-execute-1", ISSUE_PROMPT))
             assert len(publications.creates) == 1
-            assert [finish["cause"] for finish in items.finishes] == [
-                "approval_create_failed"
-            ]
+            assert [finish["cause"] for finish in items.finishes] == ["approval_create_failed"]
             assert "hold_for_approval" not in items.calls
 
     asyncio.run(exercise())
@@ -488,7 +707,7 @@ def test_a_coded_publication_refusal_names_its_cause_on_the_factory_run(
     message = "required Python CI does not select unitconv/convert.py"
 
     class RefusedPublicationApi(_PublicationApi):
-        async def create_publication(self, request: object) -> object:
+        async def create_publication(self, request: object, *, budget_s: float = 120) -> object:
             self.creates.append(request)
             error = ApprovalBackendError(f"publication create failed: HTTP 409: {message}")
             error.refusal = f"{code}: {message}"
@@ -505,9 +724,7 @@ def test_a_coded_publication_refusal_names_its_cause_on_the_factory_run(
             h.kernel._work_items = items
             _patch_snapshot(h, monkeypatch)
             h.runner.turn_scripts = [[_tool(PUBLISH_TOOL), _publish_final()]]
-            await h.kernel.process_event(
-                _turn(f"work-item-{uuid.uuid4()}-execute-1", ISSUE_PROMPT)
-            )
+            await h.kernel.process_event(_turn(f"work-item-{uuid.uuid4()}-execute-1", ISSUE_PROMPT))
             assert len(items.finishes) == 1
             finish = items.finishes[0]
             assert finish["cause"] == "approval_create_failed"
@@ -530,7 +747,7 @@ def test_a_thread_refusal_code_keeps_its_message_on_the_factory_run(
     message = "GitHub pull request head differs from the stored lineage"
 
     class StalePublicationApi(_PublicationApi):
-        async def create_publication(self, request: object) -> object:
+        async def create_publication(self, request: object, *, budget_s: float = 120) -> object:
             self.creates.append(request)
             raise WorkspaceSelectionRefused(message)
 
@@ -544,9 +761,7 @@ def test_a_thread_refusal_code_keeps_its_message_on_the_factory_run(
             h.kernel._work_items = items
             _patch_snapshot(h, monkeypatch)
             h.runner.turn_scripts = [[_tool(PUBLISH_TOOL), _publish_final()]]
-            await h.kernel.process_event(
-                _turn(f"work-item-{uuid.uuid4()}-execute-1", ISSUE_PROMPT)
-            )
+            await h.kernel.process_event(_turn(f"work-item-{uuid.uuid4()}-execute-1", ISSUE_PROMPT))
             assert len(items.finishes) == 1
             finish = items.finishes[0]
             assert finish["cause"] == "approval_create_failed"
@@ -565,7 +780,7 @@ def test_a_string_api_refusal_keeps_its_message_on_the_factory_run(
     message = "publication patch exceeds the 1048576-byte limit"
 
     class TooLargePublicationApi(_PublicationApi):
-        async def create_publication(self, request: object) -> object:
+        async def create_publication(self, request: object, *, budget_s: float = 120) -> object:
             self.creates.append(request)
             error = ApprovalBackendError("publication create failed: HTTP 413")
             error.refusal = message
@@ -581,15 +796,637 @@ def test_a_string_api_refusal_keeps_its_message_on_the_factory_run(
             h.kernel._work_items = items
             _patch_snapshot(h, monkeypatch)
             h.runner.turn_scripts = [[_tool(PUBLISH_TOOL), _publish_final()]]
-            await h.kernel.process_event(
-                _turn(f"work-item-{uuid.uuid4()}-execute-1", ISSUE_PROMPT)
-            )
+            await h.kernel.process_event(_turn(f"work-item-{uuid.uuid4()}-execute-1", ISSUE_PROMPT))
             finish = items.finishes[0]
             assert finish["cause"] == "approval_create_failed"
             assert isinstance(finish["detail"], str)
             assert message in finish["detail"]
 
     asyncio.run(exercise())
+
+
+def test_a_snapshot_base_mismatch_names_both_commits_on_the_factory_run(
+    make_harness, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # #4121: the real validator's message reaches the work item's detail.
+    from curie_worker.runner_client import RunnerWorkspaceSnapshot
+
+    snapshot_sha = "0123456789abcdef0123456789abcdef01234567"
+    retained_sha = "fedcba9876543210fedcba9876543210fedcba98"
+
+    class RetainedBaseWorkspace(_Workspace):
+        def current(self, _thread_key: str) -> object:
+            return SimpleNamespace(repo_full_name=WORK_ITEM_REPO, base_sha=retained_sha)
+
+    async def exercise() -> None:
+        publications = _PublicationApi()
+        async with make_harness(
+            binding=_Binding(),
+            workspace_factory=RetainedBaseWorkspace,
+            publication_creator=publications,
+        ) as h:
+            items = _WorkItems()
+            h.kernel._work_items = items
+
+            async def snapshot(*_args: object, **_kwargs: object) -> RunnerWorkspaceSnapshot:
+                return RunnerWorkspaceSnapshot(
+                    repo_full_name=WORK_ITEM_REPO,
+                    base_sha=snapshot_sha,
+                    patch=b"diff --git a/src/widget.py b/src/widget.py\n",
+                    changed_paths=("src/widget.py",),
+                    contains_workflow_files=False,
+                    publication_title="Fix the widget parser",
+                    publication_body="Fixes the parser.",
+                )
+
+            monkeypatch.setattr(h.kernel._runner, "snapshot", snapshot)
+            h.runner.turn_scripts = [[_tool(PUBLISH_TOOL), _publish_final()]]
+            await h.kernel.process_event(_turn(f"work-item-{uuid.uuid4()}-execute-1", ISSUE_PROMPT))
+            assert len(items.finishes) == 1
+            finish = items.finishes[0]
+            assert finish["outcome"] == "failed"
+            assert finish["cause"] == "approval_create_failed"
+            detail = finish["detail"]
+            assert isinstance(detail, str)
+            assert detail
+            assert "snapshot commit" in detail
+            assert snapshot_sha[:12] in detail
+            assert retained_sha[:12] in detail
+            assert publications.creates == []
+
+    asyncio.run(exercise())
+
+
+@pytest.fixture
+def dependency_publication_patch(tmp_path: Path) -> tuple[bytes, object]:
+    from curie_worker.runner_client import RunnerWorkspaceSnapshot
+
+    repo = tmp_path / "dependency-repository"
+    repo.mkdir()
+    subprocess.run(["git", "init", "--quiet"], cwd=repo, check=True)
+    subprocess.run(["git", "config", "user.email", "publisher@example.test"], cwd=repo, check=True)
+    subprocess.run(["git", "config", "user.name", "Publisher"], cwd=repo, check=True)
+    manifest = repo / "crates" / "acme-tool" / "Cargo.toml"
+    manifest.parent.mkdir(parents=True)
+    manifest.write_text(
+        '[package]\nname = "acme-tool"\nversion = "1.0.0"\n[dependencies]\nacme-base = "1.0.0"\n',
+        encoding="utf-8",
+    )
+    lockfile = manifest.with_name("Cargo.lock")
+    lockfile.write_text(
+        'version = 4\n[[package]]\nname = "acme-base"\nversion = "1.0.0"\n'
+        'source = "registry+https://github.com/rust-lang/crates.io-index"\n',
+        encoding="utf-8",
+    )
+    subprocess.run(["git", "add", "-A"], cwd=repo, check=True)
+    subprocess.run(["git", "commit", "--quiet", "-m", "base"], cwd=repo, check=True)
+    base_sha = subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=repo, capture_output=True, text=True, check=True
+    ).stdout.strip()
+    archive = subprocess.run(
+        ["git", "archive", "--format=tar.gz", "HEAD"],
+        cwd=repo,
+        capture_output=True,
+        check=True,
+    ).stdout
+    manifest.write_text(manifest.read_text() + 'acme-new = "1.0.0"\n', encoding="utf-8")
+    lockfile.write_text(
+        lockfile.read_text() + '[[package]]\nname = "acme-new"\nversion = "1.0.0"\n'
+        'source = "registry+https://github.com/rust-lang/crates.io-index"\n',
+        encoding="utf-8",
+    )
+    patch = subprocess.run(
+        ["git", "diff", "--binary", "--no-renames"],
+        cwd=repo,
+        capture_output=True,
+        check=True,
+    ).stdout
+    assert patch, "fixture must produce an actual Git patch"
+    return archive, RunnerWorkspaceSnapshot(
+        repo_full_name=WORK_ITEM_REPO,
+        base_sha=base_sha,
+        patch=patch,
+        changed_paths=("crates/acme-tool/Cargo.lock", "crates/acme-tool/Cargo.toml"),
+        contains_workflow_files=False,
+        publication_title="Update the widget implementation",
+        publication_body="Update the implementation and its dependency declarations.",
+    )
+
+
+@pytest.mark.parametrize("allow_dependency_additions", [False, True], ids=["default", "allow"])
+def test_dependency_publication_refusal_reaches_the_factory_finish(
+    make_harness,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    dependency_publication_patch: tuple[bytes, object],
+    allow_dependency_additions: bool,
+) -> None:
+    from curie_worker.runner_client import RunnerWorkspaceSnapshot
+
+    archive, candidate = dependency_publication_patch
+    assert isinstance(candidate, RunnerWorkspaceSnapshot)
+    delays = _patch_snapshot_backoff(monkeypatch)
+
+    class DependencyWorkspace(_Workspace):
+        def __init__(self, substrate: object) -> None:
+            super().__init__(substrate)
+            self.preparer = SimpleNamespace(
+                limits=SimpleNamespace(max_archive_bytes=len(archive) + 1)
+            )
+
+        def current(self, _thread_key: str) -> object:
+            return SimpleNamespace(repo_full_name=WORK_ITEM_REPO, base_sha=candidate.base_sha)
+
+        def stream_current_base(self, _thread_key: str) -> list[bytes]:
+            return [archive]
+
+    async def exercise() -> None:
+        publications = _PublicationApi()
+        async with make_harness(
+            binding=_Binding(),
+            workspace_factory=DependencyWorkspace,
+            publication_creator=publications,
+            publication_allow_dependency_additions=allow_dependency_additions,
+            workspace_scratch_root=str(tmp_path),
+        ) as h:
+            items = _WorkItems()
+            h.kernel._work_items = items
+            snapshot_calls = 0
+
+            async def snapshot(*_args: object, **_kwargs: object) -> RunnerWorkspaceSnapshot:
+                nonlocal snapshot_calls
+                snapshot_calls += 1
+                return candidate
+
+            monkeypatch.setattr(h.kernel._runner, "snapshot", snapshot)
+            h.runner.turn_scripts = [[_tool(PUBLISH_TOOL), _publish_final()]]
+            h.runner.default_script = [_done("default script must not run")]
+            event = _turn(f"work-item-{uuid.uuid4()}-execute-1", ISSUE_PROMPT)
+
+            await h.kernel.process_event(event)
+
+            assert snapshot_calls == 1
+            assert len(h.runner.opened) == 1
+            assert await h.kernel._markers.is_terminal(event.event_id)
+            if allow_dependency_additions:
+                assert len(publications.creates) == 1
+                assert items.finishes == []
+                assert "hold_for_approval" in items.calls
+            else:
+                assert publications.creates == []
+                assert "hold_for_approval" not in items.calls
+                assert len(items.finishes) == 1
+                finish = items.finishes[0]
+                assert finish["outcome"] == "failed"
+                assert finish["cause"] == "approval_create_failed"
+                detail = finish["detail"]
+                assert isinstance(detail, str)
+                assert detail.startswith("publication snapshot failed: ")
+                assert "dependency additions cannot be published by this capability" in detail
+                assert "crates/acme-tool/Cargo.toml" in detail
+                assert "acme-new" not in detail
+
+    asyncio.run(exercise())
+    assert delays == [], "a policy refusal must not retry the snapshot"
+    assert not list(tmp_path.glob("publication-validate-*")), "validator leaked its checkout"
+
+
+def _patch_snapshot_backoff(monkeypatch: pytest.MonkeyPatch) -> list[float]:
+    delays: list[float] = []
+    real_sleep = asyncio.sleep
+
+    async def without_backoff(delay: float, result: object = None) -> object:
+        if delay in {1.0, 2.0}:
+            delays.append(delay)
+            return await real_sleep(0, result)
+        return await real_sleep(delay, result)
+
+    monkeypatch.setattr("curie_worker.kernel.attempt.asyncio.sleep", without_backoff)
+    return delays
+
+
+def test_snapshot_read_retries_then_creates_exactly_one_publication_approval(
+    make_harness, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    from curie_worker.delivery_lease import unfenced_lease
+    from curie_worker.runner_client import RunnerSnapshotReadError
+
+    delays = _patch_snapshot_backoff(monkeypatch)
+
+    async def exercise() -> None:
+        publications = _PublicationApi()
+        async with make_harness(
+            binding=_Binding(),
+            workspace_factory=_Workspace,
+            publication_creator=publications,
+        ) as h:
+            items = _WorkItems()
+            h.kernel._work_items = items
+            _patch_snapshot(h, monkeypatch)
+            valid_snapshot = h.kernel._runner.snapshot
+            calls = 0
+            remaining_budgets: list[float] = []
+            validations: list[object] = []
+
+            async def snapshot(*args: object, **kwargs: object) -> object:
+                nonlocal calls
+                calls += 1
+                remaining = kwargs["remaining_s"]
+                assert isinstance(remaining, float)
+                remaining_budgets.append(remaining)
+                if calls <= 2:
+                    raise RunnerSnapshotReadError(
+                        "/v1/snapshot returned an invalid bounded payload after 4096 bytes: "
+                        "JSONDecodeError: incomplete JSON"
+                    )
+                return await valid_snapshot(*args, **kwargs)
+
+            monkeypatch.setattr(h.kernel._runner, "snapshot", snapshot)
+            monkeypatch.setattr(
+                "curie_worker.kernel.attempt.validate_snapshot_against_base",
+                lambda *_args, **kwargs: validations.append(kwargs["snapshot"]),
+            )
+            h.runner.turn_scripts = [[_tool(PUBLISH_TOOL), _publish_final()]]
+            event = _turn(f"work-item-{uuid.uuid4()}-execute-1", ISSUE_PROMPT)
+            with caplog.at_level(logging.WARNING, logger="curie_worker.kernel"):
+                await h.kernel.process_event(event, lease=unfenced_lease())
+
+            assert calls == 3
+            assert remaining_budgets[0] > remaining_budgets[1] > remaining_budgets[2] > 5.0
+            assert len(validations) == 1
+            assert len(publications.creates) == 1
+            assert items.calls.count("hold_for_approval") == 1
+            assert items.finishes == []
+            warnings = [
+                record.getMessage()
+                for record in caplog.records
+                if record.levelno == logging.WARNING and event.event_id in record.getMessage()
+            ]
+            for attempt in (1, 2):
+                matching = [warning for warning in warnings if f"attempt {attempt} of 3" in warning]
+                assert len(matching) == 1
+                assert "JSONDecodeError" in matching[0]
+
+    asyncio.run(exercise())
+    assert delays == [1.0, 2.0]
+
+
+@pytest.mark.parametrize("failure_kind", ["payload", "timeout", "client", "refusal"])
+def test_snapshot_read_failure_finishes_with_a_named_cause_and_bounded_retries(
+    make_harness,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    failure_kind: str,
+) -> None:
+    from aiohttp import ClientPayloadError
+    from curie_worker.runner_client import RunnerError, RunnerSnapshotReadError
+
+    delays = _patch_snapshot_backoff(monkeypatch)
+    payload_message = (
+        "/v1/snapshot returned an invalid bounded payload after 4096 bytes: "
+        "JSONDecodeError: incomplete JSON"
+    )
+    errors = {
+        "payload": RunnerSnapshotReadError(payload_message),
+        "timeout": TimeoutError(),
+        "client": ClientPayloadError("Response payload is not completed"),
+        "refusal": RunnerError("/v1/snapshot -> 403: forbidden"),
+    }
+    expected_failure_text = {
+        "payload": payload_message,
+        "timeout": "TimeoutError",
+        "client": "ClientPayloadError: Response payload is not completed",
+        "refusal": "/v1/snapshot -> 403: forbidden",
+    }[failure_kind]
+    expected_calls = 1 if failure_kind == "refusal" else 3
+
+    async def exercise() -> None:
+        publications = _PublicationApi()
+        async with make_harness(
+            binding=_Binding(),
+            workspace_factory=_Workspace,
+            publication_creator=publications,
+        ) as h:
+            items = _WorkItems()
+            h.kernel._work_items = items
+            calls = 0
+            validations: list[object] = []
+
+            async def snapshot(*_args: object, **_kwargs: object) -> object:
+                nonlocal calls
+                calls += 1
+                raise errors[failure_kind]
+
+            monkeypatch.setattr(h.kernel._runner, "snapshot", snapshot)
+            monkeypatch.setattr(
+                "curie_worker.kernel.attempt.validate_snapshot_against_base",
+                lambda *_args, **kwargs: validations.append(kwargs["snapshot"]),
+            )
+            h.runner.turn_scripts = [[_tool(PUBLISH_TOOL), _publish_final()]]
+            event = _turn(f"work-item-{uuid.uuid4()}-execute-1", ISSUE_PROMPT)
+            with caplog.at_level(logging.WARNING, logger="curie_worker.kernel"):
+                await h.kernel.process_event(event)
+
+            assert calls == expected_calls
+            assert validations == []
+            assert publications.creates == []
+            assert "hold_for_approval" not in items.calls
+            assert len(items.finishes) == 1
+            finish = items.finishes[0]
+            assert finish["outcome"] == "failed"
+            assert finish["cause"] == "approval_create_failed"
+            assert finish["detail"] == (
+                f"publication snapshot could not be read after {expected_calls} attempt(s): "
+                f"{expected_failure_text}"
+            )
+            warnings = [
+                record.getMessage()
+                for record in caplog.records
+                if record.levelno == logging.WARNING and event.event_id in record.getMessage()
+            ]
+            for attempt in range(1, expected_calls + 1):
+                matching = [warning for warning in warnings if f"attempt {attempt} of 3" in warning]
+                assert len(matching) == 1
+                assert expected_failure_text in matching[0]
+
+    asyncio.run(exercise())
+    assert delays == ([] if failure_kind == "refusal" else [1.0, 2.0])
+
+
+@pytest.mark.parametrize("remaining_after_failure", [5.0, 4.0])
+def test_snapshot_read_starts_no_retry_with_five_seconds_or_less_remaining(
+    make_harness, monkeypatch: pytest.MonkeyPatch, remaining_after_failure: float
+) -> None:
+    from curie_worker.delivery_lease import DeliveryBudget, unfenced_lease
+    from curie_worker.kernel import clock as kernel_clock
+    from curie_worker.runner_client import RunnerSnapshotReadError
+
+    _patch_snapshot_backoff(monkeypatch)
+
+    async def exercise() -> None:
+        lease = unfenced_lease()
+        lease.budget = DeliveryBudget(
+            deadline_ms=30_000,
+            anchor_server_ms=0,
+            anchor_monotonic=time.monotonic(),
+        )
+        elapsed = 0.0
+        # Move only the kernel's elapsed-time view. The event loop's clock and
+        # the real Valkey transport keep running normally.
+        monkeypatch.setattr(
+            kernel_clock,
+            "time",
+            SimpleNamespace(monotonic=lambda: time.monotonic() + elapsed, time=time.time),
+        )
+        publications = _PublicationApi()
+        async with make_harness(
+            binding=_Binding(),
+            workspace_factory=_Workspace,
+            publication_creator=publications,
+        ) as h:
+            items = _WorkItems()
+            h.kernel._work_items = items
+            calls: list[float] = []
+
+            async def snapshot(
+                *_args: object, remaining_s: float | None = None, **_kwargs: object
+            ) -> object:
+                nonlocal elapsed
+                assert remaining_s is not None and remaining_s > 5.0
+                calls.append(remaining_s)
+                elapsed += remaining_s - remaining_after_failure
+                lease.budget = DeliveryBudget(
+                    deadline_ms=int(remaining_after_failure * 1000),
+                    anchor_server_ms=0,
+                    anchor_monotonic=time.monotonic(),
+                )
+                raise RunnerSnapshotReadError("/v1/snapshot -> 503: unavailable")
+
+            monkeypatch.setattr(h.kernel._runner, "snapshot", snapshot)
+            h.runner.turn_scripts = [[_tool(PUBLISH_TOOL), _publish_final()]]
+            await h.kernel.process_event(
+                _turn(f"work-item-{uuid.uuid4()}-execute-1", ISSUE_PROMPT), lease=lease
+            )
+
+            assert lease.remaining_s() <= 5.0
+            assert len(calls) == 1
+            assert publications.creates == []
+            assert len(items.finishes) == 1
+            assert items.finishes[0]["cause"] == "approval_create_failed"
+            detail = items.finishes[0]["detail"]
+            assert isinstance(detail, str)
+            assert detail.startswith("publication snapshot could not be read after 1 attempt(s): ")
+
+    asyncio.run(exercise())
+
+
+@pytest.mark.parametrize("remaining_before_snapshot", [5.0, 4.0])
+def test_snapshot_read_starts_no_attempt_after_the_turn_spends_its_delivery_budget(
+    make_harness, monkeypatch: pytest.MonkeyPatch, remaining_before_snapshot: float
+) -> None:
+    from curie_worker.delivery_lease import DeliveryBudget, unfenced_lease
+    from curie_worker.kernel import clock as kernel_clock
+
+    delays = _patch_snapshot_backoff(monkeypatch)
+
+    async def exercise() -> None:
+        lease = unfenced_lease()
+        lease.budget = DeliveryBudget(
+            deadline_ms=30_000,
+            anchor_server_ms=0,
+            anchor_monotonic=time.monotonic(),
+        )
+        elapsed = 0.0
+        monkeypatch.setattr(
+            kernel_clock,
+            "time",
+            SimpleNamespace(monotonic=lambda: time.monotonic() + elapsed, time=time.time),
+        )
+        publications = _PublicationApi()
+        async with make_harness(
+            binding=_Binding(),
+            workspace_factory=_Workspace,
+            publication_creator=publications,
+        ) as h:
+            items = _WorkItems()
+            h.kernel._work_items = items
+            _patch_snapshot(h, monkeypatch)
+            valid_snapshot = h.kernel._runner.snapshot
+            real_continue = h.kernel._continue_unpublished
+            calls = 0
+
+            async def spend_turn_budget(*args: object, **kwargs: object) -> object:
+                nonlocal elapsed
+                outcome = await real_continue(*args, **kwargs)
+                remaining = kwargs["remaining_s"]
+                assert isinstance(remaining, float) and remaining > 5.0
+                elapsed += remaining - remaining_before_snapshot
+                lease.budget = DeliveryBudget(
+                    deadline_ms=int(remaining_before_snapshot * 1000),
+                    anchor_server_ms=0,
+                    anchor_monotonic=time.monotonic(),
+                )
+                return outcome
+
+            async def snapshot(*args: object, **kwargs: object) -> object:
+                nonlocal calls
+                calls += 1
+                return await valid_snapshot(*args, **kwargs)
+
+            monkeypatch.setattr(h.kernel, "_continue_unpublished", spend_turn_budget)
+            monkeypatch.setattr(h.kernel._runner, "snapshot", snapshot)
+            h.runner.turn_scripts = [[_tool(PUBLISH_TOOL), _publish_final()]]
+            await h.kernel.process_event(
+                _turn(f"work-item-{uuid.uuid4()}-execute-1", ISSUE_PROMPT), lease=lease
+            )
+
+            assert lease.remaining_s() <= 5.0
+            assert calls == 0
+            assert publications.creates == []
+            assert len(items.finishes) == 1
+            finish = items.finishes[0]
+            assert finish["cause"] == "approval_create_failed"
+            detail = finish["detail"]
+            assert isinstance(detail, str)
+            assert detail.startswith("publication snapshot could not be read after 0 attempt(s): ")
+
+    asyncio.run(exercise())
+    assert delays == []
+
+
+@pytest.mark.parametrize(
+    ("remaining_after_failures", "expected_delays"),
+    [
+        pytest.param((5.5,), [], id="first-backoff-would-cross-floor"),
+        pytest.param((6.0,), [], id="first-backoff-would-reach-floor"),
+        pytest.param((20.0, 6.5), [1.0], id="second-backoff-would-cross-floor"),
+    ],
+)
+def test_snapshot_read_skips_backoff_that_would_spend_its_five_second_reserve(
+    make_harness,
+    monkeypatch: pytest.MonkeyPatch,
+    remaining_after_failures: tuple[float, ...],
+    expected_delays: list[float],
+) -> None:
+    from curie_worker.delivery_lease import DeliveryBudget, unfenced_lease
+    from curie_worker.kernel import clock as kernel_clock
+    from curie_worker.runner_client import RunnerSnapshotReadError
+
+    delays = _patch_snapshot_backoff(monkeypatch)
+
+    async def exercise() -> None:
+        lease = unfenced_lease()
+        lease.budget = DeliveryBudget(
+            deadline_ms=30_000,
+            anchor_server_ms=0,
+            anchor_monotonic=time.monotonic(),
+        )
+        elapsed = 0.0
+        monkeypatch.setattr(
+            kernel_clock,
+            "time",
+            SimpleNamespace(monotonic=lambda: time.monotonic() + elapsed, time=time.time),
+        )
+        publications = _PublicationApi()
+        async with make_harness(
+            binding=_Binding(),
+            workspace_factory=_Workspace,
+            publication_creator=publications,
+        ) as h:
+            items = _WorkItems()
+            h.kernel._work_items = items
+            calls = 0
+
+            async def snapshot(
+                *_args: object, remaining_s: float | None = None, **_kwargs: object
+            ) -> object:
+                nonlocal calls, elapsed
+                assert remaining_s is not None and remaining_s > 5.0
+                assert calls < len(remaining_after_failures), "unexpected snapshot retry"
+                remaining_after_failure = remaining_after_failures[calls]
+                calls += 1
+                elapsed += remaining_s - remaining_after_failure
+                lease.budget = DeliveryBudget(
+                    deadline_ms=int(remaining_after_failure * 1000),
+                    anchor_server_ms=0,
+                    anchor_monotonic=time.monotonic(),
+                )
+                raise RunnerSnapshotReadError("/v1/snapshot -> 503: unavailable")
+
+            monkeypatch.setattr(h.kernel._runner, "snapshot", snapshot)
+            h.runner.turn_scripts = [[_tool(PUBLISH_TOOL), _publish_final()]]
+            await h.kernel.process_event(
+                _turn(f"work-item-{uuid.uuid4()}-execute-1", ISSUE_PROMPT), lease=lease
+            )
+
+            assert lease.remaining_s() > 5.0
+            assert calls == len(remaining_after_failures)
+            assert publications.creates == []
+            assert len(items.finishes) == 1
+            finish = items.finishes[0]
+            assert finish["cause"] == "approval_create_failed"
+            detail = finish["detail"]
+            assert isinstance(detail, str)
+            assert detail.startswith(
+                f"publication snapshot could not be read after {calls} attempt(s): "
+            )
+
+    asyncio.run(exercise())
+    assert delays == expected_delays
+
+
+def test_snapshot_validation_refusal_is_not_retried_and_keeps_its_prefix(
+    make_harness, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from curie_worker.workspace import WorkspacePreparationError
+
+    delays = _patch_snapshot_backoff(monkeypatch)
+
+    async def exercise() -> None:
+        publications = _PublicationApi()
+        async with make_harness(
+            binding=_Binding(),
+            workspace_factory=_Workspace,
+            publication_creator=publications,
+        ) as h:
+            items = _WorkItems()
+            h.kernel._work_items = items
+            _patch_snapshot(h, monkeypatch)
+            valid_snapshot = h.kernel._runner.snapshot
+            calls = 0
+            validations = 0
+
+            async def snapshot(*args: object, **kwargs: object) -> object:
+                nonlocal calls
+                calls += 1
+                return await valid_snapshot(*args, **kwargs)
+
+            def refuse(*_args: object, **_kwargs: object) -> None:
+                nonlocal validations
+                validations += 1
+                raise WorkspacePreparationError("publication-validation", "protected path blocked")
+
+            monkeypatch.setattr(h.kernel._runner, "snapshot", snapshot)
+            monkeypatch.setattr(
+                "curie_worker.kernel.attempt.validate_snapshot_against_base", refuse
+            )
+            h.runner.turn_scripts = [[_tool(PUBLISH_TOOL), _publish_final()]]
+            await h.kernel.process_event(_turn(f"work-item-{uuid.uuid4()}-execute-1", ISSUE_PROMPT))
+
+            assert calls == 1
+            assert validations == 1
+            assert publications.creates == []
+            assert len(items.finishes) == 1
+            finish = items.finishes[0]
+            assert finish["cause"] == "approval_create_failed"
+            detail = finish["detail"]
+            assert isinstance(detail, str)
+            assert detail.startswith("publication snapshot failed: ")
+            assert "protected path blocked" in detail
+            assert "could not be read" not in detail
+
+    asyncio.run(exercise())
+    assert delays == []
 
 
 # --- W4: bounded to one ------------------------------------------------------------
@@ -607,6 +1444,64 @@ def test_the_continuation_is_bounded_to_one(make_harness) -> None:
         assert items.finishes[0]["detail"] == "second"
 
     asyncio.run(exercise())
+
+
+# --- W-T1 (#3873): a preflight-blocked runner answers every turn offline -----------------
+
+# Replays the runner's PreflightBlockedSession shape (runner/src/curie_runner/
+# harness/claude/preflight_blocked.py, #3873) as seen through SessionRunner translation: a text
+# delta and a DONE final carrying the same explanation, and no ToolNote, on EVERY
+# turn, including the kernel's continuation. The kernel already ends this shape as
+# early_stop; this pins the terminus the runner change relies on.
+BLOCKED_EXPLANATION = (
+    "Could not complete: in-sandbox verification is unavailable before "
+    "implementation, so no model round ran. Blocked check: check-1 "
+    "(package_registry)."
+)
+
+
+def test_a_preflight_blocked_runner_ends_as_early_stop_and_releases_the_claim(
+    make_harness,
+) -> None:
+    from curie_worker.kernel.constants import _EARLY_STOP_PROMPT
+
+    def blocked_turn() -> list[OutboundEvent]:
+        return [TextDelta(text=BLOCKED_EXPLANATION), _done(BLOCKED_EXPLANATION)]
+
+    async def exercise() -> None:
+        publications = _PublicationApi()
+        async with make_harness(
+            binding=_Binding(),
+            workspace_factory=_Workspace,
+            publication_creator=publications,
+        ) as h:
+            items = _WorkItems()
+            h.kernel._work_items = items
+            h.runner.turn_scripts = [blocked_turn(), blocked_turn()]
+            h.runner.default_script = [_done("a third turn must never open")]
+
+            await h.kernel.process_event(_turn(f"work-item-{uuid.uuid4()}-execute-1", ISSUE_PROMPT))
+
+            assert len(h.runner.opened) == 2
+            assert h.runner.opened[0] == ISSUE_PROMPT
+            assert _EARLY_STOP_PROMPT in h.runner.opened[1]
+            assert len(items.finishes) == 1
+            finish = items.finishes[0]
+            assert finish["outcome"] == "failed"
+            assert finish["cause"] == "early_stop"
+            assert finish["detail"] == BLOCKED_EXPLANATION
+            assert publications.creates == []
+            assert "hold_for_approval" not in items.calls
+            assert h.fake_k8s.deleted_claims
+            assert h.fake_k8s.claims == {}
+
+    asyncio.run(exercise())
+
+
+# Liveness sibling: a turn that calls a work tool and ends without publishing
+# finishing as no_pull_request is already covered by
+# test_work_tools_without_a_progress_report_end_as_no_pull_request (W2b), so none
+# is added here.
 
 
 # --- W5 / W6 / W6b: the detail on the terminal record --------------------------------
@@ -720,13 +1615,21 @@ def test_publication_pending_on_an_early_stop_finish_settles_the_event(
 # --- W12: an approval-resume turn is never continued ---------------------------------
 
 
-def test_an_approval_resume_turn_is_not_continued(make_harness) -> None:
+@pytest.mark.parametrize(
+    ("pr_url", "cause"),
+    [(PR_URL, "revision_unchanged"), (None, "no_pull_request"), (" \t ", "no_pull_request")],
+)
+def test_an_approval_resume_turn_is_not_continued(
+    make_harness, pr_url: str | None, cause: str
+) -> None:
+    """#4752: approval resume keeps lineage and never opens an unpublished continuation."""
+
     async def exercise() -> None:
         async with make_harness(
             binding=_Binding(),
             workspace_factory=_Workspace,
             approvals=_Approvals(),
-            publication_creator=_PublicationApi(),
+            publication_creator=_PublicationApi(_revision_lineage(pr_url, "1700000000.000001")),
         ) as h:
             items = _WorkItems()
             h.kernel._work_items = items
@@ -756,7 +1659,7 @@ def test_an_approval_resume_turn_is_not_continued(make_harness) -> None:
 
             assert len(h.runner.opened) == 2
             assert len(items.finishes) == 1
-            assert items.finishes[0]["cause"] == "no_pull_request"
+            assert items.finishes[0]["cause"] == cause
             assert items.finishes[0]["detail"] == "Resumed. Nothing to publish."
 
     asyncio.run(exercise())
@@ -807,9 +1710,7 @@ def test_a_continuation_the_runner_refuses_keeps_the_runner_failure(make_harness
 
             h.kernel._runner.start_turn = start_turn  # type: ignore[method-assign]
 
-            await h.kernel.process_event(
-                _turn(f"work-item-{uuid.uuid4()}-execute-1", ISSUE_PROMPT)
-            )
+            await h.kernel.process_event(_turn(f"work-item-{uuid.uuid4()}-execute-1", ISSUE_PROMPT))
 
             assert len(opened) >= 2, "the continuation must have been attempted"
             assert "publish_changes" in opened[1]
@@ -818,5 +1719,204 @@ def test_a_continuation_the_runner_refuses_keeps_the_runner_failure(make_harness
             assert finish["outcome"] == "failed"
             assert finish["cause"] not in {"early_stop", "no_pull_request"}
             assert finish["cause"] in {"runner_failed", "runner_escalated"}
+
+    asyncio.run(exercise())
+
+
+# --- #4191: a cancelled request is not re-prompted or flagged -----------------------
+
+
+class _CountingPrecheckApi(_PublicationApi):
+    """Counts precheck-context reads; raises from read ``fail_from`` (1-based) on."""
+
+    def __init__(self, *, fail_from: int | None = None) -> None:
+        super().__init__()
+        self.prechecks = 0
+        self.fail_from = fail_from
+
+    async def get_publication_precheck_context(self, **_kwargs: object) -> None:
+        from curie_worker.approvals import ApprovalBackendError
+
+        self.prechecks += 1
+        if self.fail_from is not None and self.prechecks >= self.fail_from:
+            raise ApprovalBackendError("publication precheck context failed: HTTP 409")
+        return None
+
+
+# The first turn worked (Bash) and never published, so the continuation, when it
+# opens, carries the unpublished prompt.
+WORKED_TURN: list[OutboundEvent] = [_tool("Bash"), _done("Edited the parser.")]
+
+
+def test_an_existing_pr_refusal_stops_the_unpublished_continuation_after_one_mint(
+    make_harness, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The first turn ran; the refused continuation never reaches the runner."""
+
+    async def exercise() -> None:
+        publications = _HttpPrecheckApi([(204, None), _PR_NOT_ADOPTED_RESPONSE])
+        try:
+            opened, items, terminal = await _run_execute(
+                make_harness,
+                [WORKED_TURN, [_done("a refused continuation must not open")]],
+                publication_creator=publications,
+            )
+
+            assert opened == [ISSUE_PROMPT]
+            # One mint for the accepted first turn and one for the continuation.
+            # No further mint can be a retry of either entrypoint.
+            assert len(publications.mints) == 2
+            assert items.calls.count("start") == 1
+            assert items.calls.count("finish") == 1
+            assert items.finishes[0]["outcome"] == "failed"
+            assert items.finishes[0]["cause"] == "pull_request_not_adopted"
+            assert terminal
+            assert all("runner_escalated" not in record.getMessage() for record in caplog.records)
+            assert any(
+                "escalating event" in record.getMessage()
+                and "pull-request-not-adopted" in record.getMessage()
+                for record in caplog.records
+            )
+        finally:
+            await publications.aclose()
+
+    asyncio.run(exercise())
+
+
+def _continuation_noise(caplog: pytest.LogCaptureFixture) -> list[str]:
+    return [
+        r.getMessage()
+        for r in caplog.records
+        if "continuation failed to start" in r.getMessage() or "escalating event" in r.getMessage()
+    ]
+
+
+def test_a_cancelled_request_is_not_continued(
+    make_harness, caplog: pytest.LogCaptureFixture
+) -> None:
+    """#4191 AC3: the request reads ``cancellation_requested`` before the
+    continuation, so it is skipped: no second turn, no precheck, no flag."""
+
+    caplog.set_level("INFO", logger="curie_worker.kernel")
+
+    async def exercise() -> None:
+        publications = _CountingPrecheckApi()
+        opened, items, _ = await _run_execute(
+            make_harness,
+            [WORKED_TURN, [_done("a continuation must not open")]],
+            work_items=_WorkItems(request_reads=["cancellation_requested"]),
+            publication_creator=publications,
+        )
+
+        assert opened == [ISSUE_PROMPT]
+        # The one precheck read is the first turn's own; the continuation made none.
+        assert publications.prechecks == 1
+        assert items.calls.count("get_request") == 1
+        assert _continuation_noise(caplog) == []
+        assert any(
+            "work-item continuation skipped" in r.getMessage()
+            and "cancellation_requested" in r.getMessage()
+            for r in caplog.records
+        )
+
+    asyncio.run(exercise())
+
+
+@pytest.mark.parametrize("first_read", ["running", "unreachable", "timeout"])
+def test_a_cancel_landing_during_the_continuation_precheck_stops_quietly(
+    make_harness,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    first_read: str,
+) -> None:
+    """#4191 AC4: a cancelled request cannot pass the authoritative precheck.
+
+    The advisory status read may be running or unreadable. Fresh publication
+    authority still refuses before the continuation starts, without a traceback
+    or a flag.
+    """
+
+    caplog.set_level("INFO", logger="curie_worker.kernel")
+    initial_read: str | float | BaseException = "running"
+    if first_read == "unreachable":
+        initial_read = WorkItemTransportError("work-item status read unavailable")
+    elif first_read == "timeout":
+        monkeypatch.setattr("curie_worker.kernel.constants._REQUEST_STATUS_READ_TIMEOUT_S", 0.05)
+        initial_read = 30.0
+
+    async def exercise() -> None:
+        publications = _CountingPrecheckApi(fail_from=2)
+        opened, items, _ = await _run_execute(
+            make_harness,
+            [WORKED_TURN, [_done("a continuation must not open")]],
+            work_items=_WorkItems(request_reads=[initial_read, "cancellation_requested"]),
+            publication_creator=publications,
+        )
+
+        assert opened == [ISSUE_PROMPT]
+        assert publications.prechecks == 2
+        assert items.calls.count("get_request") == 2
+        continuation_records = [r for r in caplog.records if "continuation" in r.getMessage()]
+        assert continuation_records
+        assert all(r.exc_info is None for r in continuation_records)
+        assert _continuation_noise(caplog) == []
+        assert any(
+            "work-item continuation stopped" in r.getMessage()
+            and "cancellation_requested" in r.getMessage()
+            for r in caplog.records
+        )
+
+    asyncio.run(exercise())
+
+
+@pytest.mark.parametrize(
+    "case", ["read_unreachable", "read_hangs", "running", "running_precheck_fails"]
+)
+def test_a_running_or_unreadable_request_continues_as_before(
+    make_harness, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture, case: str
+) -> None:
+    """#4191 AC5: an unreadable or running request continues exactly as before;
+    a running request whose precheck fails is still today's runner failure."""
+
+    from curie_worker.kernel.constants import _UNPUBLISHED_PROMPT
+
+    caplog.set_level("INFO", logger="curie_worker.kernel")
+    reads: list[str | float | BaseException] = []
+    if case == "read_unreachable":
+        reads = [WorkItemTransportError("work-item dispatch endpoint is unreachable")]
+    elif case == "read_hangs":
+        monkeypatch.setattr("curie_worker.kernel.constants._REQUEST_STATUS_READ_TIMEOUT_S", 0.05)
+        reads = [30.0]
+
+    async def exercise() -> None:
+        publications = _CountingPrecheckApi(
+            fail_from=2 if case == "running_precheck_fails" else None
+        )
+        opened, items, _ = await _run_execute(
+            make_harness,
+            [WORKED_TURN, [_done("Still not publishing.")]],
+            work_items=_WorkItems(request_reads=reads),
+            publication_creator=publications,
+        )
+
+        if case == "running_precheck_fails":
+            assert opened[0] == ISSUE_PROMPT
+            assert any(
+                "continuation failed to start" in r.getMessage() and r.exc_info is not None
+                for r in caplog.records
+            )
+            escalations = [
+                r.getMessage() for r in caplog.records if "escalating event" in r.getMessage()
+            ]
+            assert any("runner-error" in text for text in escalations), escalations
+            assert len(items.finishes) == 1
+            assert items.finishes[0]["cause"] in {"runner_failed", "runner_escalated"}
+        else:
+            assert len(opened) == 2
+            assert opened[0] == ISSUE_PROMPT
+            assert _UNPUBLISHED_PROMPT in opened[1]
+            assert len(items.finishes) == 1
+            assert items.finishes[0]["cause"] == "no_pull_request"
+            assert items.finishes[0]["detail"] == "Still not publishing."
 
     asyncio.run(exercise())

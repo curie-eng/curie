@@ -12,17 +12,18 @@ down.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import logging
 import uuid
 from collections.abc import Awaitable, Callable
 
+from curie_internal.keyspace import KILL_CHANNEL, kill_key
 from redis.asyncio import Redis
+from redis.exceptions import ConnectionError as RedisConnectionError
+from redis.exceptions import TimeoutError as RedisTimeoutError
 
 logger = logging.getLogger(__name__)
-
-KILL_CHANNEL = "curie:kill-events"
-KILL_KEY_PREFIX = "curie:kill:"
 
 # How long one kill event's dispatch to ``on_kill`` gets before the read loop
 # gives up on it and moves on to the next pubsub message (#742). ``on_kill`` is
@@ -33,10 +34,6 @@ KILL_KEY_PREFIX = "curie:kill:"
 # behind it, which is exactly the failure the surrounding try/except was
 # guarding against without actually preventing.
 _ON_KILL_TIMEOUT_S = 15.0
-
-
-def kill_key(agent_id: uuid.UUID) -> str:
-    return f"{KILL_KEY_PREFIX}{agent_id}"
 
 
 class KillSwitch:
@@ -63,17 +60,21 @@ class KillSwitch:
     async def run(self) -> None:
         """Subscribe and dispatch kill events until asked to stop."""
         pubsub = self._redis.pubsub()
-        await pubsub.subscribe(KILL_CHANNEL)
         try:
             while not self._stop.is_set():
-                message = await pubsub.get_message(
-                    ignore_subscribe_messages=True, timeout=1.0
-                )
-                if message is None:
-                    continue
-                await self._handle(message)
+                try:
+                    await pubsub.subscribe(KILL_CHANNEL)
+                    while not self._stop.is_set():
+                        message = await pubsub.get_message(
+                            ignore_subscribe_messages=True, timeout=1.0
+                        )
+                        if message is not None:
+                            await self._handle(message)
+                except (RedisConnectionError, RedisTimeoutError):
+                    logger.warning("kill subscription disconnected; reconnecting", exc_info=True)
+                    with contextlib.suppress(TimeoutError):
+                        await asyncio.wait_for(self._stop.wait(), timeout=1.0)
         finally:
-            await pubsub.unsubscribe(KILL_CHANNEL)
             await pubsub.aclose()  # type: ignore[no-untyped-call]
 
     async def _handle(self, message: dict[str, object]) -> None:

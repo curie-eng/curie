@@ -4,6 +4,10 @@ Date: 2026-07-15
 
 Status: Accepted
 
+Superseded in part by [ADR 0188](0188-the-sandbox-memory-credential-is-scoped-to-its-own-channel.md)
+for memory namespace authority, credential claims, and API verification.
+The rest of this decision remains in force.
+
 Implements [#410](https://github.com/curie-eng/curie/issues/410).
 
 ## Context

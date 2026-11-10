@@ -4,10 +4,27 @@ from __future__ import annotations
 
 import asyncio
 import uuid
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from types import SimpleNamespace
 
+import pytest
+from curie_test_support.valkey import (
+    CONNECT_TIMEOUT_SECONDS,
+    VALKEY_HOST,
+    VALKEY_PORT,
+    VALKEY_PW,
+)
+from curie_worker.consumer_liveness import (
+    ConsumerLivenessStore,
+    ThreadLockOwnerLiveness,
+    consumer_heartbeat_capable_key,
+)
 from curie_worker.workitem_dispatch import WorkItemConflict, WorkItemTransportError
+from redis.asyncio import Redis
+from redis.asyncio.retry import Retry
+from redis.backoff import NoBackoff
 
 SELF = "w-old"  # a restarted container reuses hostname-pid
 PEER = "w-peer"
@@ -55,12 +72,19 @@ class FakeClient:
 
 
 class Liveness:
-    def __init__(self, alive: set[str]) -> None:
+    def __init__(self, *, capable: set[str], alive: set[str]) -> None:
+        self.capable = set(capable)
         self.alive = set(alive)
-        self.asked: list[str] = []
+        self.errors: set[str] = set()
 
-    async def __call__(self, owner: str) -> bool:
-        self.asked.append(owner)
+    async def is_capable(self, owner: str) -> bool:
+        if "is_capable" in self.errors:
+            raise ConnectionError("capability observation failed")
+        return owner in self.capable
+
+    async def is_alive(self, owner: str) -> bool:
+        if "is_alive" in self.errors:
+            raise ConnectionError("heartbeat observation failed")
         return owner in self.alive
 
 
@@ -74,7 +98,7 @@ class Clock:
 
 def _sweeper(
     client: FakeClient,
-    liveness: Liveness,
+    liveness: Liveness | ThreadLockOwnerLiveness,
     *,
     local: set[uuid.UUID] | None = None,
     clock: Clock | None = None,
@@ -104,7 +128,7 @@ def _sweep(sweeper: object) -> int:
 def test_same_name_restart_is_declared_on_the_first_sweep() -> None:
     orphan = _row(SELF, epoch=3)
     client = FakeClient(rows=[orphan])
-    assert _sweep(_sweeper(client, Liveness({SELF}))) == 1
+    assert _sweep(_sweeper(client, Liveness(capable={SELF}, alive={SELF}))) == 1
     assert client.declared == [(orphan.request_id, SELF, 3)]
 
 
@@ -112,7 +136,9 @@ def test_a_row_this_process_owns_is_never_declared() -> None:
     mine = _row(SELF)
     client = FakeClient(rows=[mine])
     clock = Clock()
-    sweeper = _sweeper(client, Liveness(set()), local={mine.request_id}, clock=clock)
+    sweeper = _sweeper(
+        client, Liveness(capable={PEER}, alive=set()), local={mine.request_id}, clock=clock,
+    )
     for _ in range(3):
         assert _sweep(sweeper) == 0
         clock.now += PROOF_S * 2
@@ -123,7 +149,7 @@ def test_a_dead_peer_is_declared_only_after_sustained_absence() -> None:
     orphan = _row(PEER, epoch=2)
     client = FakeClient(rows=[orphan])
     clock = Clock()
-    sweeper = _sweeper(client, Liveness(set()), clock=clock)
+    sweeper = _sweeper(client, Liveness(capable={PEER}, alive=set()), clock=clock)
     assert _sweep(sweeper) == 0  # first absent observation is recorded only
     clock.now += PROOF_S - 1
     assert _sweep(sweeper) == 0  # not yet absence_proof_s apart
@@ -137,7 +163,7 @@ def test_a_single_missed_heartbeat_then_live_never_declares() -> None:
     row = _row(PEER)
     client = FakeClient(rows=[row])
     clock = Clock()
-    liveness = Liveness(set())
+    liveness = Liveness(capable={PEER}, alive=set())
     sweeper = _sweeper(client, liveness, clock=clock)
     assert _sweep(sweeper) == 0  # missed once
     clock.now += PROOF_S / 2
@@ -154,54 +180,166 @@ def test_a_single_missed_heartbeat_then_live_never_declares() -> None:
 def test_a_live_peer_is_skipped() -> None:
     client = FakeClient(rows=[_row(PEER)])
     clock = Clock()
-    sweeper = _sweeper(client, Liveness({PEER}), clock=clock)
+    sweeper = _sweeper(client, Liveness(capable={PEER}, alive={PEER}), clock=clock)
     _sweep(sweeper)
     clock.now += PROOF_S * 2
     assert _sweep(sweeper) == 0
     assert client.declared == []
 
 
+@asynccontextmanager
+async def _liveness_store() -> AsyncIterator[tuple[Redis, ConsumerLivenessStore]]:
+    client = Redis(
+        host=VALKEY_HOST,
+        port=VALKEY_PORT,
+        password=VALKEY_PW or None,
+        decode_responses=True,
+        socket_connect_timeout=CONNECT_TIMEOUT_SECONDS,
+        retry=Retry(NoBackoff(), 0),
+    )
+    try:
+        yield client, ConsumerLivenessStore(client)
+    finally:
+        await client.aclose()
+
+
+@pytest.mark.parametrize("scope", ["unadvertised", "other_stream", "other_group"])
+def test_unknown_peer_is_never_declared_from_unqualified_absence(
+    names: dict[str, str], scope: str,
+) -> None:
+    async def go() -> None:
+        async with _liveness_store() as (_, store):
+            stream, group = names["prefix"] + ":runs", names["group"]
+            peer_stream = stream + ":peer" if scope == "other_stream" else stream
+            peer_group = group + ":peer" if scope == "other_group" else group
+            if scope != "unadvertised":
+                await store.publish(
+                    stream=peer_stream, group=peer_group, consumer=PEER,
+                    heartbeat_ttl_ms=60_000, capability_ttl_ms=120_000,
+                )
+                assert await store.is_alive(
+                    stream=peer_stream, group=peer_group, consumer=PEER,
+                )
+            liveness = ThreadLockOwnerLiveness(store, stream=stream, group=group)
+            assert not await liveness.is_capable(PEER)
+            assert not await liveness.is_alive(PEER)
+            row = _row(PEER)
+            client = FakeClient(rows=[row])
+            clock = Clock()
+            sweeper = _sweeper(client, liveness, clock=clock)
+            for _ in range(4):
+                assert await sweeper.sweep() == 0  # type: ignore[attr-defined]
+                clock.now += PROOF_S * 2
+            assert client.declared == []
+            assert client.rows == [row]
+
+    asyncio.run(go())
+
+
+def test_capability_loss_requires_a_full_new_absence_proof(names: dict[str, str]) -> None:
+    async def go() -> None:
+        async with _liveness_store() as (valkey, store):
+            stream, group = names["prefix"] + ":runs", names["group"]
+
+            async def known_dead() -> None:
+                await store.publish(
+                    stream=stream, group=group, consumer=PEER,
+                    heartbeat_ttl_ms=60_000, capability_ttl_ms=120_000,
+                )
+                await store.cleanup_alive(
+                    stream=stream, group=group, consumer=PEER, timeout_s=2,
+                )
+                assert await store.is_capable(stream=stream, group=group, consumer=PEER)
+                assert not await store.is_alive(stream=stream, group=group, consumer=PEER)
+
+            await known_dead()
+            row = _row(PEER, epoch=2)
+            client = FakeClient(rows=[row])
+            clock = Clock()
+            sweeper = _sweeper(
+                client, ThreadLockOwnerLiveness(store, stream=stream, group=group), clock=clock,
+            )
+            assert await sweeper.sweep() == 0  # type: ignore[attr-defined]
+            clock.now += PROOF_S - 1
+            await valkey.delete(consumer_heartbeat_capable_key(stream, group, PEER))
+            assert await sweeper.sweep() == 0  # type: ignore[attr-defined]
+            clock.now += PROOF_S + 1
+            await known_dead()
+            assert await sweeper.sweep() == 0  # type: ignore[attr-defined]
+            clock.now += PROOF_S - 1
+            assert await sweeper.sweep() == 0  # type: ignore[attr-defined]
+            assert client.declared == []
+            clock.now += 1
+            assert await sweeper.sweep() == 1  # type: ignore[attr-defined]
+            assert client.declared == [(row.request_id, PEER, 2)]
+
+    asyncio.run(go())
+
+
+@pytest.mark.parametrize("observation", ["is_capable", "is_alive"])
+def test_observation_error_requires_a_full_new_absence_proof(observation: str) -> None:
+    row = _row(PEER, epoch=2)
+    client = FakeClient(rows=[row])
+    clock = Clock()
+    liveness = Liveness(capable={PEER}, alive=set())
+    sweeper = _sweeper(client, liveness, clock=clock)
+    assert _sweep(sweeper) == 0
+    clock.now += PROOF_S - 1
+    liveness.errors.add(observation)
+    assert _sweep(sweeper) == 0
+    assert client.declared == []
+    clock.now += PROOF_S + 1
+    liveness.errors.clear()
+    assert _sweep(sweeper) == 0
+    clock.now += PROOF_S - 1
+    assert _sweep(sweeper) == 0
+    assert client.declared == []
+    clock.now += 1
+    assert _sweep(sweeper) == 1
+    assert client.declared == [(row.request_id, PEER, 2)]
+
+
 def test_sweep_pages_until_an_empty_page() -> None:
     rows = [_row(SELF) for _ in range(5)]
     client = FakeClient(rows=list(rows), page_size=2, conflicts={r.request_id for r in rows})
     # Conflicts keep every row listed so paging must advance by `after`.
-    assert _sweep(_sweeper(client, Liveness(set()))) == 0
+    assert _sweep(_sweeper(client, Liveness(capable={PEER}, alive=set()))) == 0
     ordered = sorted(r.request_id for r in rows)
     assert client.afters == [None, ordered[1], ordered[3], ordered[4]]
 
     fresh = [_row(SELF) for _ in range(5)]
     paged = FakeClient(rows=list(fresh), page_size=2)
-    assert _sweep(_sweeper(paged, Liveness(set()))) == 5
+    assert _sweep(_sweeper(paged, Liveness(capable={PEER}, alive=set()))) == 5
     assert sorted(_ids(paged)) == sorted(r.request_id for r in fresh)
 
 
 def test_a_conflict_on_one_row_does_not_stop_the_next() -> None:
     first, second = sorted([_row(SELF), _row(SELF)], key=lambda r: r.request_id)
     client = FakeClient(rows=[first, second], conflicts={first.request_id})
-    assert _sweep(_sweeper(client, Liveness(set()))) == 1
+    assert _sweep(_sweeper(client, Liveness(capable={PEER}, alive=set()))) == 1
     assert _ids(client) == [second.request_id]
 
 
 def test_a_transport_error_ends_the_sweep_without_raising() -> None:
     first, second = sorted([_row(SELF), _row(SELF)], key=lambda r: r.request_id)
     client = FakeClient(rows=[first, second], transport_fail_on={first.request_id})
-    assert _sweep(_sweeper(client, Liveness(set()))) == 0
+    assert _sweep(_sweeper(client, Liveness(capable={PEER}, alive=set()))) == 0
     assert client.declared == []
 
     down = FakeClient(rows=[_row(SELF)], list_fails=True)
-    assert _sweep(_sweeper(down, Liveness(set()))) == 0
+    assert _sweep(_sweeper(down, Liveness(capable={PEER}, alive=set()))) == 0
 
 
 def test_empty_owner_list_declares_nothing() -> None:
     client = FakeClient(rows=[])
-    assert _sweep(_sweeper(client, Liveness(set()))) == 0
+    assert _sweep(_sweeper(client, Liveness(capable={PEER}, alive=set()))) == 0
     assert client.afters == [None]
 
 
 def test_run_forever_recovers_a_peer_that_dies_later() -> None:
     later = _row(PEER)
     client = FakeClient(rows=[later])
-    liveness = Liveness({PEER})
+    liveness = Liveness(capable={PEER}, alive={PEER})
 
     async def go() -> None:
         shutdown = asyncio.Event()
@@ -228,7 +366,7 @@ def test_run_forever_does_not_declare_its_own_live_rows() -> None:
     async def go() -> None:
         shutdown = asyncio.Event()
         sweeper = _sweeper(
-            client, Liveness(set()), local={mine.request_id}, interval_s=0.01,
+            client, Liveness(capable={PEER}, alive=set()), local={mine.request_id}, interval_s=0.01,
             absence_proof_s=0.01,
         )
         task = asyncio.create_task(sweeper.run_forever(shutdown))  # type: ignore[attr-defined]

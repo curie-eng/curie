@@ -445,11 +445,49 @@ def substitute(value: str, subs: dict[str, str]) -> str:
     return value
 
 
+# Placeholders a `SecretRef.from_secret` may carry. Deliberately one, and
+# disjoint from `PLACEHOLDERS`: a Secret name is chosen by the operator who
+# provisions it out of band, so the only thing worth varying is which agent
+# reads it. One bundle deployed as `foo` and `foo-dev` in one namespace then
+# references `example-read-foo` and `example-read-foo-dev`. Re-exported for the
+# validator, so the accepted set and the substituted set are one list.
+SECRET_REF_PLACEHOLDERS = ("CURIE_AGENT",)
+
+
+def is_secret_name(name: str) -> bool:
+    """Whether ``name`` is a Kubernetes Secret name (a DNS-1123 subdomain)."""
+
+    return len(name) <= _SECRET_NAME_MAX and bool(_SECRET_NAME.fullmatch(name))
+
+
+def referenced_secret_name(from_secret: str, agent: str) -> str:
+    """The Secret a ``SecretRef`` points at when deployed as ``agent``.
+
+    A literal ``from_secret`` is returned unchanged, exactly as before
+    ``${CURIE_AGENT}`` existed. The validator proves a templated one expands to
+    a Secret name for every valid agent name; the agent arrives separately
+    here, so the expansion is checked again rather than handing the API server
+    a name it refuses at apply.
+    """
+
+    if "${" not in from_secret:
+        return from_secret
+    name = substitute(from_secret, {"CURIE_AGENT": agent})
+    if not is_secret_name(name):
+        raise ValueError(
+            f"`from_secret: {from_secret}` expands to `{name}` for agent `{agent}`, "
+            "which is not a Kubernetes Secret name (lowercase alphanumeric, `-` or "
+            f"`.`, starting and ending alphanumeric, at most {_SECRET_NAME_MAX} "
+            "characters). Rename the agent or the Secret template."
+        )
+    return name
+
+
 def _readiness_probe(port: str = "http") -> dict[str, Any]:
     """``tcpSocket`` on the named container port.
 
-    The connector spec declares no health path today, so the probe checks the
-    one thing every MCP server must do: accept a connection on its port. That
+    Without a declared ``readiness_path`` the probe checks the one thing every
+    MCP server must do: accept a connection on its port. That
     catches a server that hangs before binding, fails to bind, or listens on
     the wrong port (#3058). The caller proxy gets the same probe on its own
     port, because with a proxy that is the port the Service targets.
@@ -460,6 +498,24 @@ def _readiness_probe(port: str = "http") -> dict[str, Any]:
         "initialDelaySeconds": 2,
         "periodSeconds": 10,
         "timeoutSeconds": 3,
+        "failureThreshold": 3,
+    }
+
+
+def _server_readiness_probe(spec: ConnectorSpec) -> dict[str, Any]:
+    """The server container's probe: ``httpGet`` on a declared path, else TCP.
+
+    Exactly one handler either way, because the API server refuses a probe
+    that carries two.
+    """
+
+    if spec.readiness_path is None:
+        return _readiness_probe()
+    return {
+        "httpGet": {"path": spec.readiness_path, "port": "http"},
+        "initialDelaySeconds": 2,
+        "periodSeconds": 10,
+        "timeoutSeconds": 5,
         "failureThreshold": 3,
     }
 
@@ -482,7 +538,8 @@ def render_deployment(
     ]
     # Declared secrets arrive by reference, never as literals in the manifest.
     # A declared secret points either at the Secret Curie owns for this agent,
-    # or at one provisioned out of band (#1163). Both render the same shape --
+    # or at one provisioned out of band (#1163), whose name may carry
+    # `${CURIE_AGENT}` so each agent reads its own. Both render the same shape --
     # a secretKeyRef, never a literal -- so the container cannot tell them
     # apart and nothing downstream needs to.
     for declared in spec.secrets:
@@ -505,7 +562,7 @@ def render_deployment(
                     "name": declared.name,
                     "valueFrom": {
                         "secretKeyRef": {
-                            "name": declared.from_secret,
+                            "name": referenced_secret_name(declared.from_secret, agent),
                             "key": declared.secret_key(),
                             # Not optional: a referenced Secret that does not
                             # exist must stop the pod, not start it without the
@@ -515,6 +572,22 @@ def render_deployment(
                     },
                 }
             )
+    # `config` names are per-agent settings from the same per-agent Secret.
+    # Same delivery as a plain secret; only the credential handling differs,
+    # and that lives in the Bearer derivation, not here.
+    for config_name in spec.config:
+        env.append(
+            {
+                "name": config_name,
+                "valueFrom": {
+                    "secretKeyRef": {
+                        "name": secret_name,
+                        "key": config_name,
+                        "optional": False,
+                    }
+                },
+            }
+        )
     # secret_files project the SAME per-agent Secret as a file instead of an
     # env var, for servers that authenticate from disk (#1402). One volume per
     # file so each carries only its own key: a single volume with several items
@@ -554,6 +627,14 @@ def render_deployment(
             }
         )
 
+    # A declared scratch volume (#5415): disk-backed, so it never counts
+    # against the memory limit, bounded by its sizeLimit, and writable on the
+    # server container alone. An emptyDir is world-writable, so the non-root
+    # user writes it without the fsGroup that secret files need.
+    if spec.scratch is not None:
+        volumes.append({"name": "scratch", "emptyDir": {"sizeLimit": spec.scratch.size_limit}})
+        volume_mounts.append({"name": "scratch", "mountPath": spec.scratch.path})
+
     return {
         "apiVersion": "apps/v1",
         "kind": "Deployment",
@@ -592,16 +673,13 @@ def render_deployment(
                             # CurieConnectorNotReady can never see it (#3058).
                             # Readiness only, never liveness: a slow upstream
                             # leaves the Service, it is not restarted in a loop.
-                            "readinessProbe": _readiness_probe(),
+                            "readinessProbe": _server_readiness_probe(spec),
                             "securityContext": {
                                 "allowPrivilegeEscalation": False,
                                 "readOnlyRootFilesystem": True,
                                 "capabilities": {"drop": ["ALL"]},
                             },
-                            "resources": {
-                                "requests": {"cpu": "10m", "memory": "64Mi"},
-                                "limits": {"cpu": "500m", "memory": "256Mi"},
-                            },
+                            "resources": spec.server_resources(),
                         },
                         *(
                             [
@@ -666,6 +744,31 @@ def _proxy_container(
         )
     if grant_store_url:
         env.append({"name": "CURIE_CALLER_PROXY_GRANT_STORE", "value": grant_store_url})
+    # ADR 0229: the Host presented on admitted requests only. The server
+    # and both Services render unchanged, so a direct caller keeps its Host.
+    if spec.proxy_upstream_host is not None:
+        env.append(
+            {"name": "CURIE_CALLER_PROXY_UPSTREAM_HOST", "value": spec.proxy_upstream_host}
+        )
+    # ADR 0240 decision 3. `callers` stays out: the proxy cannot tell one
+    # sandbox process from another, so the runner enforces it.
+    if spec.routes:
+        env.append(
+            {
+                "name": "CURIE_CALLER_PROXY_ROUTES",
+                "value": json.dumps(
+                    [
+                        {
+                            "path": route.path,
+                            "methods": list(route.methods),
+                            "max_body_bytes": route.max_body_bytes,
+                        }
+                        for route in spec.routes
+                    ],
+                    separators=(",", ":"),
+                ),
+            }
+        )
     return {
         "name": CALLER_PROXY_CONTAINER,
         "image": proxy.image,
@@ -903,6 +1006,8 @@ def _derived_headers(spec: ConnectorSpec) -> dict[str, Any]:
     the runner can diagnose its missing sandbox value honestly.
     """
 
+    if spec.no_client_auth is not None:
+        return {}
     if spec.bearer_secret:
         name = spec.bearer_secret
     elif len(spec.secrets) == 1 and isinstance(spec.secrets[0], str):

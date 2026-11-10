@@ -7,7 +7,7 @@ The incident this file is written against, in full:
               rolled together
     11:16:31  the REPLACEMENT worker reclaimed the delivery, saw the durable
               side-effect marker, and emitted the designed escalation --
-              "A prior attempt started an action before the worker restarted;
+              "A prior attempt may already have executed an action;
               not retrying automatically. Flagging for a human."
     11:16:41  that reply was delivered
 
@@ -43,6 +43,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import functools
+import json
 import sys
 import time
 import uuid
@@ -50,15 +51,16 @@ from dataclasses import replace
 from pathlib import Path
 from typing import Any, cast
 
+import pytest
 from aci_protocol import (
     Final,
     SessionStatus,
     SideEffectFlag,
     TextDelta,
 )
-from curie_dispatcher.queue import to_stream_fields
+from curie_internal.turn_queue import to_stream_fields
 from curie_worker.config import WorkerConfig
-from curie_worker.consumer import Consumer
+from curie_worker.consumer import Consumer, refuse_unconfigured_reminder
 from curie_worker.consumer_liveness import ConsumerLivenessStore
 from curie_worker.delivery_lease import DeliveryLeaseStore
 from curie_worker.eval import EvalStreamConsumer
@@ -74,11 +76,11 @@ _wait_until = functools.partial(wait_until, timeout=20.0, interval=0.02)
 
 DONE = SessionStatus.DONE
 
-# The escalation the incident produced, verbatim from ``Kernel._process_one``.
+# The current escalation for the unsafe state, emitted by the kernel.
 # Byte-identical on purpose: these tests assert the FAILURE is reproduced in the
 # control and absent after the fix, and a paraphrase would pass both ways.
 ESCALATION = (
-    "A prior attempt started an action before the worker restarted; "
+    "A prior attempt may already have executed an action; "
     "not retrying automatically. Flagging for a human."
 )
 
@@ -210,8 +212,12 @@ def test_a_rollout_over_an_accepted_side_effecting_turn_escalates_it(make_harnes
             store = DeliveryLeaseStore(h.async_redis, h.config)
             old_cfg = h.config.model_copy(update={"consumer_name": "worker-old"})
             new_cfg = h.config.model_copy(update={"consumer_name": "worker-new"})
-            old = Consumer(redis=h.async_redis, kernel=h.kernel, config=old_cfg, leases=store)
-            new = Consumer(redis=h.async_redis, kernel=h.kernel, config=new_cfg, leases=store)
+            old = Consumer(redis=h.async_redis, kernel=h.kernel, config=old_cfg, leases=store,
+                           reminders=refuse_unconfigured_reminder,
+                  )
+            new = Consumer(redis=h.async_redis, kernel=h.kernel, config=new_cfg, leases=store,
+                           reminders=refuse_unconfigured_reminder,
+                  )
             _admit_side_effecting_turn(h, old)
 
             # The group is created at ``$``, so it must exist before the enqueue.
@@ -282,6 +288,7 @@ def test_the_pre_upgrade_gate_refuses_the_roll_and_the_turn_completes_once(make_
                 config=old_cfg,
                 leases=store,
                 drain=gate,
+                reminders=refuse_unconfigured_reminder,
             )
             hold = _admit_side_effecting_turn(h, old)
 
@@ -390,6 +397,7 @@ def test_a_leftover_install_flag_cannot_pause_a_fresh_install(
                 config=h.config,
                 leases=store,
                 drain=fresh_gate,
+                reminders=refuse_unconfigured_reminder,
             )
             await current.ensure_group()
             await fresh_gate.request_quiesce()
@@ -438,6 +446,7 @@ def test_a_leftover_install_flag_cannot_pause_a_fresh_install(
                     config=fresh_replacement_config,
                     leases=store,
                     drain=UpgradeDrainGate(h.async_redis, fresh_replacement_config),
+                    reminders=refuse_unconfigured_reminder,
                 )
                 replacement_task = asyncio.create_task(replacement.run())
                 await _wait_until(
@@ -581,6 +590,7 @@ def test_current_marker_pauses_runs_prompt_reclaim_without_charging_delivery(
                 config=consumer_config,
                 leases=store,
                 drain=gate,
+                reminders=refuse_unconfigured_reminder,
             )
             await consumer.ensure_group()
             entry_id = await h.async_redis.xadd(
@@ -856,6 +866,7 @@ def test_mixed_version_refusal_allows_a_pre_fix_consumer_to_claim_again(
                 config=legacy_config,
                 leases=store,
                 drain=legacy_gate,
+                reminders=refuse_unconfigured_reminder,
             )
             h.runner.default_script = [Final(text="pre-fix worker resumed", status=DONE)]
             await consumer.ensure_group()
@@ -936,6 +947,7 @@ def test_a_quiesced_consumer_claims_nothing_and_resumes_when_released(make_harne
                 config=h.config,
                 leases=store,
                 drain=gate,
+                reminders=refuse_unconfigured_reminder,
             )
             h.runner.default_script = [Final(text="handled", status=DONE)]
 
@@ -988,6 +1000,7 @@ def test_a_quiesced_consumer_does_not_reclaim_a_departed_replicas_entry(make_har
                 config=h.config,
                 leases=store,
                 drain=gate,
+                reminders=refuse_unconfigured_reminder,
             )
             h.runner.default_script = [Final(text="handled", status=DONE)]
 
@@ -1019,5 +1032,197 @@ def test_a_quiesced_consumer_does_not_reclaim_a_departed_replicas_entry(make_har
                 assert h.runner.opened == ["finish the thing"]
             finally:
                 await _stop(task, consumer)
+
+    asyncio.run(go())
+
+
+def test_a_consumer_stays_paused_through_drain_attest_and_hold_then_resumes(
+    make_harness,
+) -> None:  # noqa: ANN001
+    """Every hook keeps the same queued turn safe until the owned release."""
+
+    async def go() -> None:
+        knobs = {
+            **_KNOBS,
+            "installation_id": "acme-install",
+            "upgrade_revision": 4,
+            "upgrade_quiesce_ttl_s": 1800.0,
+        }
+        async with make_harness(**knobs) as h:
+            config = h.config.model_copy(
+                update={
+                    "eval_stream": f"{h.config.stream}:evals",
+                    "eval_consumer_group": f"{h.config.consumer_group}-evals",
+                }
+            )
+            gate = UpgradeDrainGate(h.async_redis, config)
+            consumer = Consumer(
+                redis=h.async_redis,
+                kernel=h.kernel,
+                config=config,
+                leases=DeliveryLeaseStore(h.async_redis, config),
+                drain=gate,
+                reminders=refuse_unconfigured_reminder,
+            )
+            h.runner.default_script = [Final(text="handled after the roll", status=DONE)]
+            await consumer.ensure_group()
+            task: asyncio.Task[None] | None = None
+            try:
+                assert await run_gate(config, mode="drain") == 0
+                key = config.upgrade_quiesce_key()
+                marker = await h.async_redis.get(key)
+                assert 299_000 <= await h.async_redis.pttl(key) <= 300_000
+                task = asyncio.create_task(consumer.run())
+                await h.async_redis.xadd(
+                    config.stream,
+                    to_stream_fields(
+                        _qevent("wait for the roll", thread="drain-handoff-1")
+                    ),
+                )
+                await asyncio.sleep(0.3)
+                assert h.runner.opened == [], "the consumer claimed after the clean drain"
+
+                await h.async_redis.pexpire(key, 1000)
+                assert await run_gate(config, mode="attest") == 0
+                assert 299_000 <= await h.async_redis.pttl(key) <= 300_000
+                await asyncio.sleep(0.3)
+                assert h.runner.opened == [], "the consumer claimed after attest"
+
+                assert await run_gate(config, mode="hold") == 0
+                assert 1_799_000 <= await h.async_redis.pttl(key) <= 1_800_000
+                assert await h.async_redis.get(key) == marker
+                await asyncio.sleep(0.3)
+                assert h.runner.opened == [], "the consumer claimed during the roll hold"
+
+                assert await run_gate(config, mode="release") == 0
+                await _wait_until(lambda: h.sink.last_text == "handled after the roll")
+                assert h.runner.opened == ["wait for the roll"]
+                assert not await h.async_redis.exists(key)
+            finally:
+                if task is not None:
+                    await _stop(task, consumer)
+                await h.async_redis.delete(
+                    config.upgrade_quiesce_key(),
+                    config.upgrade_drain_success_key(),
+                    config.eval_stream,
+                )
+
+    asyncio.run(go())
+
+
+@pytest.mark.parametrize("mode", ["attest", "hold"])
+def test_an_expired_pause_is_not_recreated_and_the_consumer_can_claim(
+    make_harness,
+    mode: str,
+) -> None:  # noqa: ANN001
+    """A stale success record does not let a late hook pause a serving fleet."""
+
+    async def go() -> None:
+        async with make_harness(
+            **_KNOBS, installation_id="acme-install", upgrade_revision=4
+        ) as h:
+            gate = UpgradeDrainGate(h.async_redis, h.config)
+            consumer = Consumer(
+                redis=h.async_redis,
+                kernel=h.kernel,
+                config=h.config,
+                leases=DeliveryLeaseStore(h.async_redis, h.config),
+                drain=gate,
+                reminders=refuse_unconfigured_reminder,
+            )
+            h.runner.default_script = [Final(text="resumed after expiry", status=DONE)]
+            await consumer.ensure_group()
+            task: asyncio.Task[None] | None = None
+            try:
+                await gate.request_quiesce(ttl_s=0.1)
+                await h.async_redis.set(
+                    h.config.upgrade_drain_success_key(),
+                    json.dumps({"revision": 4}),
+                    ex=60,
+                )
+                await asyncio.sleep(0.2)
+                assert not await h.async_redis.exists(h.config.upgrade_quiesce_key())
+                assert await run_gate(h.config, mode=mode) == 1
+                assert not await h.async_redis.exists(h.config.upgrade_quiesce_key())
+
+                task = asyncio.create_task(consumer.run())
+                await h.async_redis.xadd(
+                    h.config.stream,
+                    to_stream_fields(
+                        _qevent("claim after expiry", thread="drain-expired-1")
+                    ),
+                )
+                await _wait_until(lambda: h.sink.last_text == "resumed after expiry")
+                assert h.runner.opened == ["claim after expiry"]
+            finally:
+                if task is not None:
+                    await _stop(task, consumer)
+                await h.async_redis.delete(
+                    h.config.upgrade_quiesce_key(),
+                    h.config.upgrade_drain_success_key(),
+                )
+
+    asyncio.run(go())
+
+
+@pytest.mark.parametrize("mode", ["attest", "hold"])
+def test_a_foreign_pause_survives_refusal_until_its_owner_releases_it(
+    make_harness,
+    mode: str,
+) -> None:  # noqa: ANN001
+    """A delayed hook cannot resume or extend the next upgrade's fleet pause."""
+
+    async def go() -> None:
+        knobs = {**_KNOBS, "upgrade_quiesce_ttl_s": 1800.0}
+        async with make_harness(
+            **knobs, installation_id="acme-install", upgrade_revision=4
+        ) as h:
+            foreign = h.config.model_copy(update={"upgrade_revision": 5})
+            gate = UpgradeDrainGate(h.async_redis, h.config)
+            consumer = Consumer(
+                redis=h.async_redis,
+                kernel=h.kernel,
+                config=h.config,
+                leases=DeliveryLeaseStore(h.async_redis, h.config),
+                drain=gate,
+                reminders=refuse_unconfigured_reminder,
+            )
+            h.runner.default_script = [Final(text="resumed by the owner", status=DONE)]
+            await consumer.ensure_group()
+            task: asyncio.Task[None] | None = None
+            try:
+                await UpgradeDrainGate(h.async_redis, foreign).request_quiesce(ttl_s=60.0)
+                key = h.config.upgrade_quiesce_key()
+                marker = await h.async_redis.get(key)
+                ttl_before = await h.async_redis.pttl(key)
+                await h.async_redis.set(
+                    h.config.upgrade_drain_success_key(),
+                    json.dumps({"revision": 4}),
+                    ex=60,
+                )
+                assert await run_gate(h.config, mode=mode) == 1
+                assert await h.async_redis.get(key) == marker
+                assert 0 < await h.async_redis.pttl(key) <= ttl_before
+
+                task = asyncio.create_task(consumer.run())
+                await h.async_redis.xadd(
+                    h.config.stream,
+                    to_stream_fields(
+                        _qevent("claim after owned release", thread="drain-foreign-1")
+                    ),
+                )
+                await asyncio.sleep(0.3)
+                assert h.runner.opened == [], "the refused hook cleared foreign authority"
+
+                assert await run_gate(foreign, mode="release") == 0
+                await _wait_until(lambda: h.sink.last_text == "resumed by the owner")
+                assert h.runner.opened == ["claim after owned release"]
+            finally:
+                if task is not None:
+                    await _stop(task, consumer)
+                await h.async_redis.delete(
+                    h.config.upgrade_quiesce_key(),
+                    h.config.upgrade_drain_success_key(),
+                )
 
     asyncio.run(go())

@@ -8,11 +8,58 @@ is never written. Existing sandboxes are not in these dicts and are not patched.
 from __future__ import annotations
 
 import copy
+from decimal import Decimal
 from typing import Any
+
+from .quota import resource_vector
 
 _RUNNER_POOL_SUFFIX = "-runner-pool"
 _POOL_SUFFIX = "-pool"
+# Suffixes of the worker-owned resources template and its warm pool.
+RESOURCES_TEMPLATE_SUFFIX = "-resources"
+RESOURCES_POOL_SUFFIX = "-resources-pool"
 _DIMENSIONS = ("cpu", "memory", "ephemeral-storage")
+
+
+def _container_amount(container: dict[str, Any], side: str, dimension: str) -> Decimal:
+    resources = container.get("resources") or {}
+    values = resources.get(side) or {}
+    raw = values.get(dimension)
+    if raw is None and side == "requests":
+        raw = (resources.get("limits") or {}).get(dimension)
+    if raw is None:
+        raise ValueError(f"sandbox container lacks {side}.{dimension}")
+    key = f"{side}.{dimension}"
+    return Decimal(resource_vector({key: str(raw)})[key])
+
+
+def pod_resources(spec: dict[str, Any]) -> dict[str, str]:
+    """Effective Pod requests and limits, including init peaks and overhead."""
+
+    containers = spec.get("containers")
+    if not isinstance(containers, list) or not containers:
+        raise ValueError("sandbox Pod has no containers")
+    result = {"pods": "1"}
+    for side in ("requests", "limits"):
+        for dimension in ("cpu", "memory"):
+            running = sum(
+                (_container_amount(container, side, dimension) for container in containers),
+                Decimal(0),
+            )
+            sidecars = Decimal(0)
+            peak = Decimal(0)
+            for container in spec.get("initContainers", spec.get("init_containers")) or []:
+                value = _container_amount(container, side, dimension)
+                if container.get("restartPolicy", container.get("restart_policy")) == "Always":
+                    sidecars += value
+                    peak = max(peak, sidecars)
+                else:
+                    peak = max(peak, sidecars + value)
+            overhead = (spec.get("overhead") or {}).get(dimension, "0")
+            key = f"{side}.{dimension}"
+            extra = Decimal(resource_vector({key: str(overhead)})[key])
+            result[f"{side}.{dimension}"] = format(max(running + sidecars, peak) + extra, "f")
+    return resource_vector(result)
 
 
 def resources_object_name(kind: str, name: str) -> str:
@@ -23,9 +70,9 @@ def resources_object_name(kind: str, name: str) -> str:
     before a write, including the shared chart template.
     """
 
-    if kind == "template" and name.endswith("-resources"):
+    if kind == "template" and name.endswith(RESOURCES_TEMPLATE_SUFFIX):
         return name
-    if kind == "warmpool" and name.endswith("-resources-pool"):
+    if kind == "warmpool" and name.endswith(RESOURCES_POOL_SUFFIX):
         return name
     raise ValueError(f"{kind} name {name!r} is not a worker-owned resources object")
 
@@ -80,9 +127,7 @@ def prepare_resources_claim(
     owned_template, owned_pool = _owned_names(pool, agent_name)
     resources_object_name("template", owned_template)
     resources_object_name("warmpool", owned_pool)
-    copied = copy.deepcopy(templates[source_name])
-    _replace_resources(copied, resources)
-    templates[owned_template] = copied
+    templates[owned_template] = claim_resources_spec(templates[source_name], resources)
     warm_pools[owned_pool] = {
         "replicas": 0,
         "sandboxTemplateRef": {"name": owned_template},
@@ -90,12 +135,25 @@ def prepare_resources_claim(
     return owned_pool
 
 
+def claim_resources_spec(spec: dict[str, Any], resources: dict[str, Any]) -> dict[str, Any]:
+    """Return a copy of ``spec`` with ``resources`` on every container.
+
+    The shape is validated before the copy, so a refused override writes
+    nothing. ``spec`` itself is not changed.
+    """
+
+    _validate_resources(resources)
+    copied = copy.deepcopy(spec)
+    _replace_resources(copied, resources)
+    return copied
+
+
 def _owned_names(pool: str, agent_name: str) -> tuple[str, str]:
     stem = pool[: -len(_RUNNER_POOL_SUFFIX)]
     agent_suffix = f"-agent-{agent_name}"
     prefix = stem[: -len(agent_suffix)] if stem.endswith(agent_suffix) else stem
-    template = f"{prefix}-agent-{agent_name}-resources"
-    return template, f"{template}-pool"
+    template = f"{prefix}-agent-{agent_name}{RESOURCES_TEMPLATE_SUFFIX}"
+    return template, f"{template}{_POOL_SUFFIX}"
 
 
 def _validate_resources(resources: dict[str, Any]) -> None:

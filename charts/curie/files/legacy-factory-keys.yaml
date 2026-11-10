@@ -1,0 +1,11 @@
+# Removed api.* factory keys (#4397), named only here; use factory.* instead.
+- api.githubFactoryIngressEnabled
+- api.githubFactoryIntake
+- api.githubFactoryPollIntervalSeconds
+- api.githubFactoryLabel
+- api.githubFactoryMention
+- api.githubFactoryCardBaseUrl
+- api.githubFactoryCiWaitSeconds
+- api.githubFactoryPythonCi
+- api.githubFactoryBases
+- api.githubFactoryMetadataCi

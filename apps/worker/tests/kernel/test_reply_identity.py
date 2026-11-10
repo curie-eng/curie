@@ -17,12 +17,43 @@ from aci_protocol import Final, QueuedTurn, ReplyHandle, SessionStatus, TurnSour
 from aci_protocol.turn import route_identity
 from aiohttp import web
 from aiohttp.test_utils import TestServer
+from curie_test_support.channel_gateway import reply_gateway
 from curie_worker.approvals import CreatedApproval
 from curie_worker.behaviorpacks import BehaviorPacks
-from curie_worker.binding import BUDGET_ENV, BUNDLE_REF_ENV, PLUGIN_DIR_ENV, ResolvedDeployment
+from curie_worker.binding import (
+    BUDGET_ENV,
+    BUNDLE_REF_ENV,
+    PLUGIN_DIR_ENV,
+    FactoryContext,
+    FactoryWake,
+    HttpIdentityBinding,
+    ResolvedDeployment,
+)
 from curie_worker.config import WorkerConfig
-from curie_worker.reply_sink import ReplySinkRouter, build_reply_sink
+from curie_worker.reply_sink import ReplySinkRouter
+from curie_worker.reply_sink import build_reply_sink as production_reply_sink
 from curie_worker.workitem_dispatch import WorkItemRunning
+
+from apps.worker.tests.queue_fixtures import factory_context
+
+_gateways = []
+
+
+@pytest.fixture(autouse=True)
+def owned_gateways():
+    try:
+        yield
+    finally:
+        while _gateways:
+            _gateways.pop().__exit__(None, None, None)
+
+
+def build_reply_sink(config, *, provider_tokens, base_url=""):
+    gateway = reply_gateway(provider_tokens, base_url)
+    values = gateway.__enter__()
+    _gateways.append(gateway)
+    return production_reply_sink(config.model_copy(update=values))
+
 
 DONE = SessionStatus.DONE
 AWAITING = SessionStatus.AWAITING_APPROVAL
@@ -69,6 +100,22 @@ class _Capture:
 class _TripleBinding:
     """Canned resolutions keyed on the route triple, like the real resolver."""
 
+    async def identity_binding(
+        self, kind: str, adapter: str | None, address: str,
+    ) -> HttpIdentityBinding | None:
+        """@spec HTTP-INVOCATION-EXECUTION-18: explicit local fixture classification."""
+        resolved = self._routes.get((kind, route_identity(kind, adapter), address))
+        if resolved is None:
+            return None
+        agent_id = resolved.agent_id
+        return HttpIdentityBinding(
+            tenant_id=uuid.UUID("00000000-0000-4000-8000-000000000001"),
+            agent_id=agent_id,
+            binding_id=uuid.uuid5(uuid.NAMESPACE_URL, repr((kind, adapter, address))),
+            binding_generation=1, http_identity_required=False,
+        )
+
+
     def __init__(self, routes: dict[tuple[str, str | None, str], ResolvedDeployment]) -> None:
         self._routes = routes
 
@@ -76,6 +123,12 @@ class _TripleBinding:
         self, kind: str, adapter: str | None, address: str
     ) -> ResolvedDeployment | None:
         return self._routes.get((kind, route_identity(kind, adapter), address))
+
+    async def resolve_factory(self, context: FactoryContext) -> ResolvedDeployment | None:
+        resolved = self._routes.get((context.kind, context.adapter, context.address))
+        assert resolved is not None
+        assert resolved.agent_id == context.agent_id
+        return resolved
 
     def boot_env(
         self,
@@ -85,6 +138,7 @@ class _TripleBinding:
         kind: str | None = None,
         address: str | None = None,
         isolate_memory: bool = False,
+    **_: object,
     ) -> dict[str, str]:
         env = {
             BUDGET_ENV: '{"max_output_tokens_per_run":100000,"max_usd_per_day":10.0}',
@@ -126,11 +180,9 @@ def _qevent(text: str, *, adapter: str | None, thread: str) -> QueuedTurn:
 
 def _sink(port: int) -> ReplySinkRouter:
     return build_reply_sink(
-        WorkerConfig(
-            slack_bot_token=_DEFAULT_TOKEN,
-            slack_api_base_url=f"http://127.0.0.1:{port}/slack/api/",
-        ),
-        slack_tokens={"default": _DEFAULT_TOKEN, "ops-bot": _OPS_TOKEN},
+        WorkerConfig(),
+        base_url=f"http://127.0.0.1:{port}/slack/api/",
+        provider_tokens={"default": _DEFAULT_TOKEN, "ops-bot": _OPS_TOKEN},
     )
 
 
@@ -175,7 +227,7 @@ class _RecordingApprovals:
     def __init__(self) -> None:
         self.requests: list[object] = []
 
-    async def create(self, request: object) -> CreatedApproval:
+    async def create(self, request: object, *, budget_s: float = 120) -> CreatedApproval:
         self.requests.append(request)
         return CreatedApproval(id=f"appr-{len(self.requests)}", status="pending")
 
@@ -235,7 +287,8 @@ def test_a_turn_on_an_identity_this_worker_cannot_speak_as_is_dropped_before_it_
                 assert await h.async_redis.exists(h.config.done_key(ev.event_id))
             assert capture.requests == []
             text = "\n".join(caplog.messages)
-            assert ev.event_id in text and "'ghost'" in text
+            assert ev.event_id in text and "unconfigured" in text
+            assert "'ghost'" not in text
             assert _DEFAULT_TOKEN not in text and _OPS_TOKEN not in text
         finally:
             await server.close()
@@ -246,20 +299,39 @@ def test_a_turn_on_an_identity_this_worker_cannot_speak_as_is_dropped_before_it_
 class _CiWorkItems:
     """Names one already-running request, like a CI continuation's dispatch."""
 
-    def __init__(self, running: uuid.UUID) -> None:
+    def __init__(self, running: uuid.UUID, *, agent_id: uuid.UUID) -> None:
         self.running = running
+        self.agent_id = agent_id
+        self.execution_deadline = datetime.now(UTC) + timedelta(minutes=20)
+        self.runtime_heartbeat_expires_at = self.execution_deadline
         self.finishes: list[tuple[uuid.UUID, dict[str, object]]] = []
 
-    async def running_for_conversation(self, _conversation_id: str) -> WorkItemRunning:
+    async def running_for_conversation(
+        self, conversation_id: str, *, wake: FactoryWake
+    ) -> WorkItemRunning:
         return WorkItemRunning(
             request_id=self.running,
             work_item_id=self.running,
+            agent_id=self.agent_id,
+            generation=1,
+            conversation_id=conversation_id,
+            wait_deadline=datetime.now(UTC) + timedelta(hours=1),
+            repository_path="acme-corp/widgets",
+            context=factory_context(self.agent_id, wake),
+            refusal=None,
             runtime_epoch=1,
-            execution_deadline=datetime.now(UTC) + timedelta(minutes=20),
+            execution_deadline=self.execution_deadline,
+            lease_held_to_deadline=(
+                self.runtime_heartbeat_expires_at == self.execution_deadline
+                and self.execution_deadline > datetime.now(UTC)
+            ),
         )
 
     async def finish(self, request_id: uuid.UUID, **kwargs: object) -> None:
         self.finishes.append((request_id, kwargs))
+
+    async def issue_read_context(self, request_id: uuid.UUID) -> tuple[str, str]:
+        return "acme widgets issue 7", f"wir.capability-for-{request_id}"
 
     def __getattr__(self, name: str):  # type: ignore[no-untyped-def]
         async def record(*_args: object, **_kwargs: object) -> None:
@@ -293,9 +365,10 @@ def test_a_factory_work_item_turn_runs_on_an_untokened_identity(
             port = server.port
             assert port is not None
             request_id = uuid.uuid4()
-            binding = _TripleBinding({("slack", "ghost", _CHANNEL): _resolved("ghost")})
+            deployment = _resolved("ghost")
+            binding = _TripleBinding({("slack", "ghost", _CHANNEL): deployment})
             async with make_harness(binding=binding, sink=_sink(port)) as h:
-                h.kernel._work_items = _CiWorkItems(request_id)
+                h.kernel._work_items = _CiWorkItems(request_id, agent_id=deployment.agent_id)
                 h.runner.default_script = [Final(text="fixed it", status=DONE)]
                 ev = QueuedTurn(
                     event_id=f"work-item-{request_id}-ci-2",

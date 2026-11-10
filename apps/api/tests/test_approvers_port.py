@@ -32,6 +32,7 @@ class _EveryoneIsAMember:
     operator_eligible = True
     console_eligible = True
     adapter_eligible = True
+    test_driver_eligible = False
     chat_eligible = True
     ineligible_reason = None
 
@@ -44,6 +45,7 @@ class _NobodyIsAMember:
     operator_eligible = True
     console_eligible = True
     adapter_eligible = True
+    test_driver_eligible = False
     chat_eligible = True
     ineligible_reason = None
 
@@ -60,6 +62,7 @@ class _CannotTell:
     operator_eligible = True
     console_eligible = True
     adapter_eligible = True
+    test_driver_eligible = False
     chat_eligible = True
     ineligible_reason = None
 
@@ -95,18 +98,31 @@ def _approval(*, author: str = _AUTHOR) -> Approval:
     )
 
 
-def _authorize(approver_set: ApproverSet, actor: str) -> tuple[str, AuthzDecision]:
-    """The resolve endpoint's exact shape: select a set, then authorize on it."""
+def _authorize(
+    approver_set: ApproverSet,
+    actor: str,
+    *,
+    approval: Approval | None = None,
+    principal_kind: Any = "chat",
+    canonical_owner: bool = False,
+) -> tuple[str | None, AuthzDecision]:
+    """The resolve endpoint's exact shape: select a set, then authorize on it.
+
+    The fake selector reads no binding, so none is passed as the route binding
+    either (ADR 0271).
+    """
 
     select: ApproverSetSelector = _FakeSelector(approver_set)
-    approval = _approval()
+    approval = approval or _approval()
     return asyncio.run(
         authorize_approval(
             approval,
             actor,
             _CARD_CHANNEL,
             approver_set=select(approval, None),
-            principal_kind="chat",
+            principal_kind=principal_kind,
+            route_binding=None,
+            canonical_owner=canonical_owner,
         )
     )
 
@@ -150,3 +166,52 @@ def test_an_outsider_is_still_allowed_by_a_set_that_admits_everyone() -> None:
 
     _name, decision = _authorize(_EveryoneIsAMember(), _OUTSIDER)
     assert decision.allowed
+
+
+# --- ADR 0271 decision 5: a dynamic approval is answered only by the HTTP owner ---
+
+
+def _dynamic() -> Approval:
+    approval = _approval()
+    approval.selection_mode = "dynamic"
+    return approval
+
+
+def test_an_operator_eligible_set_never_answers_a_dynamic_approval_for_an_operator() -> None:
+    """@spec REQUEST-APPROVAL-5: operator refusal precedes every set-specific shortcut.
+
+    This set is operator eligible and admits everyone, so a refusal can come
+    only from the authorizer's canonical-route rule.
+    """
+
+    for canonical_owner in (False, True):
+        _name, decision = _authorize(
+            _EveryoneIsAMember(), _APPROVER, approval=_dynamic(), principal_kind="operator",
+            canonical_owner=canonical_owner,
+        )
+        assert not decision.allowed
+        assert decision.evidence is not None
+        assert decision.evidence["kind"] == "canonical_route_operator_refused"
+    _name, ordinary = _authorize(_EveryoneIsAMember(), _APPROVER, principal_kind="operator")
+    assert ordinary.allowed
+
+
+def test_only_the_http_answer_owner_reaches_the_set_on_a_dynamic_approval() -> None:
+    """@spec REQUEST-APPROVAL-5: any other caller is refused before the set is asked."""
+
+    for kind in ("chat", "console", "adapter"):
+        _name, decision = _authorize(
+            _EveryoneIsAMember(), _APPROVER, approval=_dynamic(), principal_kind=kind,
+        )
+        assert not decision.allowed, kind
+        assert decision.evidence is not None
+        assert decision.evidence["kind"] == "canonical_route_requires_http_answer"
+    _name, owner = _authorize(
+        _EveryoneIsAMember(), _APPROVER, approval=_dynamic(), canonical_owner=True,
+    )
+    assert owner.allowed
+    assert owner.evidence == {"kind": "fake", "actor": _APPROVER}
+    _name, refused = _authorize(
+        _NobodyIsAMember(), _APPROVER, approval=_dynamic(), canonical_owner=True,
+    )
+    assert not refused.allowed

@@ -28,9 +28,6 @@ pub const COMPOSE_PROJECT: &str = "curie";
 /// `{project}_runner`.
 pub const DEFAULT_DOCKER_NETWORK: &str = "curie_runner";
 
-/// Default host:container staging path the host-network worker bind-mounts.
-pub const DEFAULT_STAGING_DIR: &str = "/tmp/curie-bundles";
-
 /// Default published Postgres host port in `compose.dev.yaml`.
 pub const DEFAULT_POSTGRES_PORT: u16 = 25432;
 
@@ -43,9 +40,9 @@ const ISOLATION_ENV: &[&str] = &[
     "S3_ENDPOINT_URL",
     "CURIE_DOCKER_NETWORK",
     "CURIE_LOCAL_STUB_PORT",
+    "CURIE_LOCAL_GATEWAY_PORT",
     "CURIE_LOCAL_POSTGRES_HOST",
     "CURIE_LOCAL_POSTGRES_PORT",
-    "CURIE_LOCAL_STAGING_DIR",
     "CURIE_LOCAL_IMAGE_TAG",
 ];
 
@@ -62,7 +59,7 @@ pub struct LocalResources {
     pub s3_endpoint: String,
     pub docker_network: String,
     pub stub_port: u16,
-    pub staging_dir: String,
+    pub gateway_port: u16,
     pub image_tag: String,
 }
 
@@ -80,7 +77,7 @@ impl LocalResources {
             s3_endpoint: "http://localhost:29000".to_string(),
             docker_network: DEFAULT_DOCKER_NETWORK.to_string(),
             stub_port: crate::message::DEFAULT_LOCAL_STUB_PORT,
-            staging_dir: DEFAULT_STAGING_DIR.to_string(),
+            gateway_port: 8081,
             image_tag: "dev".to_string(),
         }
     }
@@ -409,8 +406,8 @@ fn isolation_usage(missing: &[String]) -> anyhow::Error {
     .with_fix(
         "set COMPOSE_PROJECT_NAME with COMPOSE_FILE (base compose.dev.yaml then an override) \
          and the matching CURIE_API_URL, VALKEY_HOST, VALKEY_PORT, S3_ENDPOINT_URL, \
-         CURIE_DOCKER_NETWORK, CURIE_LOCAL_STUB_PORT, CURIE_LOCAL_POSTGRES_HOST, \
-         CURIE_LOCAL_POSTGRES_PORT, CURIE_LOCAL_STAGING_DIR, and CURIE_LOCAL_IMAGE_TAG",
+         CURIE_DOCKER_NETWORK, CURIE_LOCAL_STUB_PORT, CURIE_LOCAL_GATEWAY_PORT, CURIE_LOCAL_POSTGRES_HOST, \
+         CURIE_LOCAL_POSTGRES_PORT and CURIE_LOCAL_IMAGE_TAG",
     )
     .into()
 }
@@ -538,7 +535,9 @@ pub fn resolve_local_resources(
         stub_port: get("CURIE_LOCAL_STUB_PORT").parse().map_err(|_| {
             crate::exit::CliError::usage("CURIE_LOCAL_STUB_PORT must be a TCP port")
         })?,
-        staging_dir: get("CURIE_LOCAL_STAGING_DIR"),
+        gateway_port: get("CURIE_LOCAL_GATEWAY_PORT").parse().map_err(|_| {
+            crate::exit::CliError::usage("CURIE_LOCAL_GATEWAY_PORT must be a TCP port")
+        })?,
         image_tag: get("CURIE_LOCAL_IMAGE_TAG"),
     };
     validate_isolated_override(&resources, build)?;
@@ -627,8 +626,6 @@ fn validate_isolated_override(resources: &LocalResources, build: bool) -> Result
         ("S3_ENDPOINT_URL", resources.s3_endpoint.clone()),
         ("CURIE_API_URL", resources.api_url.clone()),
         ("CURIE_DOCKER_NETWORK", resources.docker_network.clone()),
-        ("TMPDIR", resources.staging_dir.clone()),
-        ("SLACK_API_BASE_URL", format!(":{}", resources.stub_port)),
     ];
     for (key, needle) in required {
         let value = worker.get(key).map(String::as_str).unwrap_or("");
@@ -639,11 +636,35 @@ fn validate_isolated_override(resources: &LocalResources, build: bool) -> Result
             ))
             .with_fix(
                 "override curie-worker environment (DATABASE_URL, VALKEY_HOST, VALKEY_PORT, \
-                 S3_ENDPOINT_URL, CURIE_API_URL, SLACK_API_BASE_URL, TMPDIR, CURIE_DOCKER_NETWORK) \
-                 and the identical host:container staging mount",
+                 S3_ENDPOINT_URL, CURIE_API_URL, CURIE_CHANNEL_GATEWAY_URL, CURIE_DOCKER_NETWORK)",
             )
             .into());
         }
+    }
+    let api = service_environment(&config, "curie-api");
+    let gateway_port_matches = |env: &BTreeMap<String, String>| {
+        env.get("CURIE_CHANNEL_GATEWAY_URL")
+            .and_then(|value| reqwest::Url::parse(value).ok())
+            .and_then(|url| url.port_or_known_default())
+            == Some(resources.gateway_port)
+    };
+    if !gateway_port_matches(&worker) || !gateway_port_matches(&api) {
+        return Err(
+            crate::exit::CliError::usage("isolated callers must use their own gateway").into(),
+        );
+    }
+    let gateway = service_environment(&config, "curie-channel-gateway");
+    if gateway.get("CURIE_CHANNEL_GATEWAY_PORT") != Some(&resources.gateway_port.to_string())
+        || gateway
+            .get("SLACK_API_BASE_URL")
+            .and_then(|value| reqwest::Url::parse(value).ok())
+            .and_then(|url| url.port_or_known_default())
+            != Some(resources.stub_port)
+    {
+        return Err(crate::exit::CliError::usage(
+            "isolated override must rebind the gateway listener and its Slack stub endpoint",
+        )
+        .into());
     }
     let network_name = config["networks"]["curie_runner"]["name"]
         .as_str()
@@ -661,6 +682,7 @@ fn validate_isolated_override(resources: &LocalResources, build: bool) -> Result
             "curie-api",
             "curie-worker",
             "curie-dispatcher",
+            "curie-channel-gateway",
             "curie-runner",
             "curie-ui",
         ] {
@@ -798,9 +820,9 @@ pub struct SourceImage {
 /// symmetry for its own sake. The compose profile governs the long-running
 /// dispatcher service, but `curie local message` runs a ONE-SHOT container from
 /// the same image on every invocation (`message.rs`'s
-/// `curie_dispatcher.enqueue_once`), outside any profile. Keying the build set on
+/// `curie_channel_gateway.slack.enqueue_once`), outside any profile. Keying the build set on
 /// profiles alone left the main dev-loop verb still failing with
-/// `No module named curie_dispatcher.enqueue_once` -- observed, not theorised.
+/// `No module named curie_channel_gateway.slack.enqueue_once` -- observed, not theorised.
 ///
 /// `curie-api` covers `curie-migrate` too: same image, and that one-shot is the
 /// compose upgrade phase (`python -m curie_api.schema_compat upgrade`, #2300).
@@ -1453,12 +1475,13 @@ pub fn with_stack_secret_env(
 }
 
 /// The `local up` note naming where the install's API key lives. The key itself
-/// is never printed; the console needs it as `?api_key=`.
+/// is never printed, and the console never takes it: it signs in with a code
+/// minted by `curie local console login`.
 fn stack_key_note(path: &Path) -> String {
     format!(
         "This install's API key is the `api_key` field of {} (mode 0600). `curie local` \
-         verbs send it to localhost automatically; for the console, append \
-         `&api_key=<that key>` to its URL (`?api_key=<that key>` if it has no query).",
+         verbs send it to localhost automatically. To sign in to the console, run \
+         `curie local console login --subject <you>` and paste the code it prints.",
         path.display()
     )
 }
@@ -1870,40 +1893,19 @@ impl crate::ui::CliOutput for LocalDownOutput {
     }
 }
 
-/// The connector teardown `local down` runs, for a `down` invoked from `cwd`.
-///
-/// Container reaping stays label-scoped rather than file-scoped: `LocalDownOpts`
-/// carries no plugin directory, so a `down` run from anywhere must still reap
-/// what a `local deploy` started (ADR 0113, block B1-8). The staged credential
-/// tree can only be addressed by path, and the local tier records the deployed
-/// bundle's directory nowhere (`.curie/runner.json` is the skill tier's), so the
-/// honest resolution is the one `local deploy` itself defaults to: the current
-/// directory (`--plugin-dir .`). The wipe is added only when that directory
-/// actually holds a staged tree.
-///
-/// The limit that leaves: a `down` run from an unrelated directory, or after a
-/// deploy that pointed `--plugin-dir` elsewhere, still cannot find that bundle's
-/// tree. Accepted, because guessing at another bundle is worse than missing one
-/// -- the containers holding the credentials are reaped either way, and a `down`
-/// or `deploy` from the bundle's own directory clears the tree.
-pub fn connector_teardown_plan_for_down(
-    cwd: &Path,
-    project: &str,
-) -> Vec<docker::ConnectorTeardownStep> {
-    let staged = crate::connector_build::connector_secrets_root(cwd).is_dir();
-    docker::connector_teardown_plan(project, None, staged.then_some(cwd))
+/// Project-owned connectors and credential volumes are discoverable from any directory.
+pub fn connector_teardown_plan_for_down(project: &str) -> Vec<docker::ConnectorTeardownStep> {
+    docker::connector_teardown_plan(project, None)
 }
 
 pub async fn down(o: LocalDownOpts) -> Result<LocalDownOutput> {
     let ui = crate::ui::ui();
     let cmd = down_command(&o);
-    let cwd = std::env::current_dir().context("resolving the current directory")?;
-    let teardown = connector_teardown_plan_for_down(&cwd, o.common.project());
+    let teardown = connector_teardown_plan_for_down(o.common.project());
     if o.common.dry_run {
-        let mut lines = vec![
-            cmd.display(),
+        let lines = vec![
             format!(
-                "docker rm -f $(docker ps -a --filter label={} --filter network={} -q)",
+                "docker rm -f -v $(docker ps -a --filter label={} --filter network={} -q)",
                 docker::SANDBOX_LABEL,
                 o.common.resources.docker_network
             ),
@@ -1912,13 +1914,14 @@ pub async fn down(o: LocalDownOpts) -> Result<LocalDownOutput> {
                 docker::CONNECTOR_COMPONENT_LABEL,
                 docker::connector_project_label(o.common.project())
             ),
+            cmd.display(),
+            format!(
+                "reap claim input helpers and orphaned volumes with label={} and label={}={} after validating claim and attempt ownership",
+                docker::SANDBOX_LABEL,
+                docker::SANDBOX_STACK_LABEL_KEY,
+                o.common.resources.docker_network
+            ),
         ];
-        // A removal of files on disk must not be a surprise the plan omitted.
-        for step in &teardown {
-            if let docker::ConnectorTeardownStep::WipeSecrets(path) = step {
-                lines.push(format!("rm -rf {}", path.display()));
-            }
-        }
         return Ok(LocalDownOutput::DryRun(crate::ui::DryRunPlan { lines }));
     }
     if o.wipe {
@@ -1942,31 +1945,39 @@ pub async fn down(o: LocalDownOpts) -> Result<LocalDownOutput> {
     } else {
         "stopping stack"
     };
-    run_step(&cl, label, "stopped", &cmd).await?;
-    // Containers first, then this bundle's staged credential tree when the
-    // directory `down` was run from holds one -- see
-    // `connector_teardown_plan_for_down` for what that resolution can and
-    // cannot reach.
-    for problem in docker::run_connector_teardown(&teardown).await {
-        ui.warn(&problem);
-    }
     let report = docker::reap_filtered(&[
         ("label", docker::SANDBOX_LABEL),
         ("network", o.common.resources.docker_network.as_str()),
     ])
     .await;
+    for problem in docker::run_connector_teardown(&teardown).await {
+        ui.warn(&problem);
+    }
+    let mut problems = Vec::new();
     if let Some(err) = report.error {
-        // The stack stopped, but the runner reap did not complete cleanly. Fail
-        // loudly rather than report success with orphaned containers still
-        // holding ports and credentials (#613).
         let still = if report.still_present.is_empty() {
             "unknown".to_string()
         } else {
             report.still_present.join(", ")
         };
+        problems.push(format!(
+            "reaping runner containers did not complete cleanly: {err}. Containers still present: {still}"
+        ));
+    }
+    match run_step(&cl, label, "stopped", &cmd).await {
+        Ok(_) => {
+            if let Err(err) =
+                docker::cleanup_stack_claim_inputs(&o.common.resources.docker_network).await
+            {
+                problems.push(err.to_string());
+            }
+        }
+        Err(err) => problems.push(format!("stack teardown failed: {err}")),
+    }
+    if !problems.is_empty() {
         bail!(
-            "dev stack stopped, but reaping runner containers did not complete cleanly: {err}. \
-             Still running: {still}. Remove them with `docker rm -f <id>` before restarting."
+            "local teardown did not complete cleanly: {}",
+            problems.join("; ")
         );
     }
     Ok(LocalDownOutput::Down {
@@ -3485,7 +3496,9 @@ mod tests {
     fn stack_key_note_names_the_path_not_the_key() {
         let note = stack_key_note(Path::new("/cfg/local/curie.json"));
         assert!(note.contains("/cfg/local/curie.json"), "{note}");
-        assert!(note.contains("?api_key="), "{note}");
+        // #1047: the console signs in with a CLI-minted login code, never the key.
+        assert!(note.contains("curie local console login"), "{note}");
+        assert!(!note.contains("api_key="), "{note}");
     }
 
     #[test]
@@ -3568,7 +3581,7 @@ mod tests {
         );
     }
 
-    /// The 8 services that must carry `profiles: *core_profiles`.
+    /// The services that must carry `profiles: *core_profiles`.
     const CORE_SERVICES: &[&str] = &[
         "postgres",
         "valkey",
@@ -3578,6 +3591,8 @@ mod tests {
         "curie-migrate",
         "curie-api",
         "curie-worker",
+        "curie-gateway-replay-perms",
+        "curie-channel-gateway",
     ];
 
     /// The 6 services that must carry `profiles: *full_profiles`.
@@ -3611,7 +3626,7 @@ mod tests {
         &rest[..end]
     }
 
-    /// Assert the shared core(8)/full(6) profile binding in a compose file:
+    /// Assert the shared core/full profile binding in a compose file:
     /// the anchors are declared, the counts hold, AND each service block carries
     /// the anchor it should (so swapping a service's profile fails the test).
     fn assert_core_full_bindings(compose: &str, file: &str) {
@@ -3625,12 +3640,12 @@ mod tests {
         );
         assert_eq!(
             compose.matches("profiles: *core_profiles").count(),
-            8,
+            CORE_SERVICES.len(),
             "{file} core-profile count"
         );
         assert_eq!(
             compose.matches("profiles: *full_profiles").count(),
-            6,
+            FULL_SERVICES.len(),
             "{file} full-profile count"
         );
         for service in CORE_SERVICES {
@@ -3686,12 +3701,12 @@ mod tests {
     }
 
     #[test]
-    fn compose_file_makes_worker_slack_stub_overridable() {
+    fn compose_file_makes_gateway_slack_stub_overridable() {
         let compose = read_compose("compose.dev.yaml");
         assert!(compose.contains(
-            "      - SLACK_API_BASE_URL=${SLACK_API_BASE_URL-http://localhost:8155/api/}"
+            "      SLACK_API_BASE_URL: ${SLACK_API_BASE_URL-http://localhost:8155/api/}"
         ));
-        assert!(compose.contains("      - SLACK_BOT_TOKEN=${SLACK_BOT_TOKEN:-xoxb-dev}"));
+        assert!(compose.contains("      SLACK_BOT_TOKEN: ${SLACK_BOT_TOKEN:-xoxb-dev}"));
     }
 
     /// The dev trio of trusted Slack origins (ADR-0096 D4.4) must stay on the
@@ -3818,7 +3833,7 @@ mod tests {
 
     /// Regression: keying the build set on the `slack` PROFILE left
     /// `curie local message` failing with `No module named
-    /// curie_dispatcher.enqueue_once`, because that verb runs a one-shot
+    /// curie_channel_gateway.slack.enqueue_once`, because that verb runs a one-shot
     /// container from the dispatcher image on every invocation, profile or not.
     #[test]
     fn the_dispatcher_is_built_even_without_the_slack_profile() {

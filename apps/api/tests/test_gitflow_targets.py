@@ -15,7 +15,7 @@ from __future__ import annotations
 import uuid
 
 import pytest
-from curie_api.gitflow import TargetUnresolved, _target_agent_name, resolve_target_agent
+from curie_api.gitflow import TargetUnresolved, resolve_target_agent, target_agent_name
 from curie_api.models import Agent, AgentChannel, Environment
 from curie_test_support.scaffold import scaffolded_deploy_yaml
 from plugin_format.deploy_targets import DeployTarget, DeployTargetsFile, validate_deploy_targets
@@ -158,7 +158,7 @@ def test_a_missing_agent_is_reported_before_environment_ambiguity() -> None:
 def test_the_early_target_lookup_preserves_a_missing_agent() -> None:
     invalid = DeployTargetsFile(targets={"prod_target": DeployTarget(env="prod")})
 
-    assert _target_agent_name(invalid, Environment.prod) is None
+    assert target_agent_name(invalid, Environment.prod) is None
 
 
 # --------------------------------------------------------------------------- #

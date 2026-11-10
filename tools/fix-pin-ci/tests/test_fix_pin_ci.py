@@ -8,6 +8,7 @@ is never called cannot protect a merge.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
@@ -16,7 +17,7 @@ import subprocess
 import sys
 from collections.abc import Callable
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import pytest
 import yaml
@@ -37,12 +38,53 @@ PR_TEMPLATE = REPO_ROOT / ".github" / "PULL_REQUEST_TEMPLATE.md"
 BUG_REPORT = REPO_ROOT / ".github" / "ISSUE_TEMPLATE" / "bug_report.yml"
 PYPROJECT = REPO_ROOT / "pyproject.toml"
 VERIFY_FIX_PIN = REPO_ROOT / "cli" / "scripts" / "verify-fix-pin.sh"
+TEST_MODULE = REPO_ROOT / "tools" / "fix-pin-ci" / "tests" / "test_fix_pin_ci.py"
 
 VALID_SELECTOR = "apps/api/tests/test_fix_pin_ci_gate.py::test_exact_declaration"
+FACTORY_SELECTOR = (
+    "tools/factory-e2e/tests/test_scripted_driver.py::"
+    "test_scripted_driver_records_the_curie_bin_it_used"
+)
+INITIAL_BINDING_SELECTOR = (
+    "tools/factory-e2e/tests/test_c4_initial_binding.py::"
+    "test_second_factory_agent_uses_initial_tracker_binding"
+)
+ADMITTED_AGENT_SELECTOR = (
+    "tools/factory-e2e/tests/test_c4_admitted_agent.py::"
+    "test_labelled_agents_execute_as_admitted_agent"
+)
+STATIC_TOKEN_ROTATION_SELECTOR = (
+    "tools/factory-e2e/tests/test_c4_static_token_rotation.py::"
+    "test_secret_replacement_reports_rejection_and_recovers"
+)
+HELD_CANCELLATION_SELECTOR = (
+    "tools/factory-e2e/tests/test_c4_held_cancellation.py::"
+    "test_held_run_cancels_after_worker_replacement"
+)
+FACTORY_UPGRADE_SELECTOR = (
+    "tools/factory-e2e/tests/test_c4_upgrade_migration.py::"
+    "test_v0125_factory_upgrade_uses_supported_flow"
+)
+FACTORY_UPGRADE_NEAR_MISS_SELECTOR = (
+    "tools/factory-e2e/tests/test_c4_upgrade_migration_extra.py::"
+    "test_v0125_factory_upgrade_uses_supported_flow"
+)
+KIND_MODULES = (
+    "tools/factory-e2e/tests/test_c4_initial_binding.py",
+    "tools/factory-e2e/tests/test_c4_static_token_rotation.py",
+    "tools/factory-e2e/tests/test_c4_upgrade_migration.py",
+    "tools/factory-e2e/tests/test_c4_held_cancellation.py",
+    "tools/factory-e2e/tests/test_c4_cluster_up.py",
+    "tools/factory-e2e/tests/test_c4_forge_instances.py",
+)
+FORGE_INSTANCES_SELECTOR = (
+    "tools/factory-e2e/tests/test_c4_forge_instances.py::test_forge_instances_survive_upgrade"
+)
 LOCAL_SELECTOR = "cli/tests/local/test_deploy.py::test_deploy"
 LOCAL_LIVE_SELECTOR = "cli/tests/local/test_live.py::test_live"
 LIVE_SELECTOR = "runner/tests/test_live.py::test_example"
 CHART_SELECTOR = "charts/curie/ci/render-assertions.sh"
+NOTES_RELEASE_TARGET_SELECTOR = "charts/curie/ci/notes-release-target-assertions.sh"
 REPOSITORY = "curie-eng/curie"
 STACK_BRANCH = "task/local-deployment-fix-pin"
 BASE_SHA = "a" * 40
@@ -111,8 +153,7 @@ def _write_fake_binary(
                 "import os",
                 "from pathlib import Path",
                 "import sys",
-                f"Path(os.environ['{call_log_environment}']).write_text("
-                "json.dumps(sys.argv[1:]))",
+                f"Path(os.environ['{call_log_environment}']).write_text(json.dumps(sys.argv[1:]))",
                 f"print(os.environ.get('{output_environment}', {default_output!r}), "
                 f"end={print_end!r})",
                 f"raise SystemExit(int(os.environ.get('{exit_environment}', '0')))",
@@ -143,9 +184,7 @@ def _gh_issue_payload(
     """Return issue data, including milestone state that the gate must ignore."""
     parsed = json.loads(gh_labels)
     if isinstance(parsed, list):
-        return json.dumps(
-            {"labels": parsed, "body": gh_body, "milestone": gh_milestone}
-        )
+        return json.dumps({"labels": parsed, "body": gh_body, "milestone": gh_milestone})
     return gh_labels
 
 
@@ -259,8 +298,7 @@ def _gh_calls(tmp_path: Path) -> list[list[str]]:
     if not _gh_call_log(tmp_path).exists():
         return []
     return [
-        json.loads(line)
-        for line in _gh_call_log(tmp_path).read_text(encoding="utf-8").splitlines()
+        json.loads(line) for line in _gh_call_log(tmp_path).read_text(encoding="utf-8").splitlines()
     ]
 
 
@@ -346,7 +384,16 @@ def _run_needs_curie(
 
 
 def _needed_output(tmp_path: Path) -> str:
-    return _github_output(tmp_path).read_text(encoding="utf-8")
+    outputs = _probe_outputs(tmp_path)
+    return f"needed={outputs['needed']}\n"
+
+
+def _probe_outputs(tmp_path: Path) -> dict[str, str]:
+    lines = _github_output(tmp_path).read_text(encoding="utf-8").splitlines()
+    outputs = dict(line.split("=", 1) for line in lines)
+    assert len(lines) == len(outputs)
+    assert set(outputs) == {"needed", "needs_stack", "needs_kind", "needs_factory_upgrade"}
+    return outputs
 
 
 def _is_fix_pin_gate(step: dict[str, Any]) -> bool:
@@ -393,6 +440,29 @@ def test_exact_declaration_calls_the_verifier_with_one_argv_selector(tmp_path: P
 @pytest.mark.parametrize(
     "selector",
     [
+        FACTORY_SELECTOR,
+        INITIAL_BINDING_SELECTOR,
+        FACTORY_UPGRADE_SELECTOR,
+        FACTORY_UPGRADE_NEAR_MISS_SELECTOR,
+    ],
+)
+def test_factory_python_selector_calls_the_verifier_at_the_ci_boundary(
+    tmp_path: Path, selector: str
+) -> None:
+    completed, call_log = _run_checker(tmp_path, f"Fix pin: {selector}\n")
+
+    assert completed.returncode == 0, completed.stderr
+    assert json.loads(call_log.read_text(encoding="utf-8")) == [
+        "dev",
+        "verify-fix-pin",
+        "HEAD",
+        selector,
+    ]
+
+
+@pytest.mark.parametrize(
+    "selector",
+    [
         "apps/worker/tests/kernel/test_consumer.py::test_consumes_stream_entry_end_to_end_and_acks",
         "runner/tests/test_history.py::test_example",
         "runner/tests/history/test_history.py::test_example",
@@ -407,9 +477,7 @@ def test_exact_declaration_calls_the_verifier_with_one_argv_selector(tmp_path: P
         ),
     ],
 )
-def test_supported_nested_python_selectors_call_the_verifier(
-    tmp_path: Path, selector: str
-) -> None:
+def test_supported_nested_python_selectors_call_the_verifier(tmp_path: Path, selector: str) -> None:
     completed, call_log = _run_checker(tmp_path, f"Fix pin: {selector}")
 
     assert completed.returncode == 0, completed.stderr
@@ -437,9 +505,7 @@ def test_local_python_selector_calls_the_verifier_at_the_ci_boundary(
 
 
 def test_ordinary_fix_pin_prose_skips_without_calling_the_verifier(tmp_path: Path) -> None:
-    completed, call_log = _run_checker(
-        tmp_path, "This closes the fix pin-related enforcement gap"
-    )
+    completed, call_log = _run_checker(tmp_path, "This closes the fix pin-related enforcement gap")
 
     assert completed.returncode == 0, completed.stderr
     assert completed.stdout.strip() == "SKIPPED: no Fix pin declaration"
@@ -486,12 +552,19 @@ def test_invalid_or_duplicate_declarations_fail_closed_without_calling_curie(
         "-h",
         "cli/tests/verify_fix_pin.rs::--no-run",
         "tools/fix-pin-ci/tests/test_fix_pin_ci.py::test_not_supported",
+        "tools/other-tool/tests/test_pin.py::test_pin",
+        "tools/factory-e2e/test_pin.py::test_pin",
+        "tools/factory-e2e/tests/../test_pin.py::test_pin",
+        "tools/factory-e2e/tests/test_pin.py::helper",
         "apps/api/tests/test_fix_pin_ci_gate.py",
         "cli/tests/test_pin.py::test_pin",
         "cli/tests/local/nested/test_pin.py::test_pin",
         "cli/tests/local/../test_pin.py::test_pin",
         "cli/tests/local/pin.py::test_pin",
         "cli/tests/local/test_pin.py::helper",
+        "charts/curie/ci/../render-assertions.sh",
+        "charts/curie/ci/runtime/",
+        "charts/curie/ci/runtime/name.py",
     ],
 )
 def test_unsupported_selectors_fail_closed_without_calling_curie(
@@ -965,7 +1038,7 @@ def _load_ci() -> dict[str, Any]:
 
 
 def _workflow_trigger(document: dict[str, Any]) -> dict[str, Any]:
-    trigger = document.get("on", document.get(True))
+    trigger = document.get("on", cast(dict[object, Any], document).get(True))
     assert isinstance(trigger, dict), "ci.yaml must declare an on mapping"
     return trigger
 
@@ -982,7 +1055,11 @@ def test_required_workflows_reach_one_task_branch_without_widening_pushes() -> N
             assert push is None, f"{path.name} must remain pull request only"
         else:
             assert isinstance(push, dict), f"{path.name} must retain its push trigger"
-            assert push.get("branches") == ["main", "next"], path.name
+            expected = ["main", "next"]
+            if path.name in {"ci.yaml", "helm-ci.yaml"}:
+                # Maintenance backport branches cut from a release tag.
+                expected = ["main", "next", "backport/**"]
+            assert push.get("branches") == expected, path.name
 
 
 def _python_job(
@@ -1021,6 +1098,213 @@ def _fix_pin_job() -> tuple[dict[str, Any], list[dict[str, Any]]]:
     return job, [step for step in steps if isinstance(step, dict)]
 
 
+CI_DURATIONS_ARGUMENT = "--durations=25"
+REPORT_CHARS = set("fEsxXpPaAR")
+
+
+def _is_supported_reporting_argument(argument: str) -> bool:
+    """Whether the workflow command contract admits this reporting flag.
+
+    #2293 item 20: only a complete supported form may pass, validated the way
+    the pinned pytest CLI parses it. ``--durations`` takes an integer value,
+    ``--durations-min`` a float value, both only as ``--flag=value``, and ``-r``
+    a nonempty run of the report characters the pinned CLI documents. The old
+    ``--durations`` prefix match reported unknown suffixes, valueless flags and
+    malformed numbers green while the pinned parser exits 4 on them.
+    """
+    if argument.startswith("-r"):
+        return len(argument) > 2 and set(argument[2:]) <= REPORT_CHARS
+    option, separator, value = argument.partition("=")
+    if not separator or not value:
+        return False
+    if option == "--durations":
+        try:
+            int(value)
+        except ValueError:
+            return False
+        return True
+    if option == "--durations-min":
+        try:
+            float(value)
+        except ValueError:
+            return False
+        return True
+    return False
+
+
+def _runtime_exclusions() -> set[tuple[str, str]]:
+    """The exclusion arguments the full Python suite invocation must carry."""
+    exclusions = {("--ignore", module) for module in KIND_MODULES} | {
+        ("--deselect", ADMITTED_AGENT_SELECTOR.split("::", 1)[0]),
+        ("--ignore", "tools/factory-e2e/tests/test_c4_tracker_scope.py"),
+        ("--deselect", "tools/factory-e2e/tests/test_c4_dynamic_base.py"),
+        ("--ignore", "examples/tests/test_sre_bot_observability_runtime.py"),
+        ("--ignore", "tools/factory-e2e/tests/test_c4_dry_run.py"),
+        ("--ignore", "tools/ci-retry-gate"),
+        ("--ignore", "tools/ci-workflow-paths"),
+        ("--ignore", "tools/ci-release-target-parity"),
+        ("--ignore", "tools/e2e-ci-selection"),
+        ("--ignore", "tools/helm-ci-gate"),
+        ("--ignore", "tools/fix-pin-ci"),
+        ("--ignore", "tools/p0-closes-ci"),
+        ("--ignore", "tools/runtime-assertion-gate"),
+        ("--ignore", "tools/dependency-audit-paths"),
+        ("--ignore", "tools/close-on-next"),
+    }
+    return exclusions | {
+        ("--ignore-glob", f"{path}/tests/*")
+        for option, path in exclusions
+        if option == "--ignore" and not path.endswith(".py")
+    }
+
+
+def _shard_pytest_boundary(document: dict[str, Any]) -> tuple[int, str, dict[str, str]]:
+    """The python-pytest job's pytest step: index, script and env bindings.
+
+    This is the reader boundary the reporting flag contract drives: the
+    committed workflow and every alternate artifact go through the same YAML
+    reader, step lookup and ``${{ }}`` binding resolution.
+    """
+    _, steps = _python_job(document, "python-pytest")
+    pytest_index = _single_step_index(
+        steps,
+        lambda step: step.get("id") == "pytest",
+        "normal Python suite",
+    )
+    pytest_step = steps[pytest_index]
+    pytest_script = _string(pytest_step, "run")
+    assert "${{" not in pytest_script
+    pytest_env = pytest_step.get("env")
+    assert isinstance(pytest_env, dict)
+    bindings: dict[str, str] = {}
+    for meaning, expression in {
+        "shard": "${{ matrix.shard }}",
+        "deselect": "${{ steps.python-runtime.outputs.pytest_deselect }}",
+        "scope": "${{ steps.python-runtime.outputs.pytest_scope }}",
+        "shards": "${{ steps.python-runtime.outputs.pytest_shards }}",
+        "storage_shards": "${{ steps.python-runtime.outputs.pytest_storage_shards }}",
+        "full_shards": "${{ steps.python-runtime.outputs.pytest_full_shards }}",
+        "stack_tier": "${{ steps.python-runtime.outputs.stack_tier }}",
+        "event_name": "${{ github.event_name }}",
+    }.items():
+        names = [name for name, value in pytest_env.items() if value == expression]
+        assert len(names) == 1, expression
+        bindings[meaning] = names[0]
+    return pytest_index, pytest_script, bindings
+
+
+def _recorded_pytest_commands(
+    pytest_script: str, bindings: dict[str, str]
+) -> list[tuple[list[str], int, str]]:
+    """Record the argv the pytest step hands uv, per shard and deselect.
+
+    The unmodified shell script runs with a recording ``uv`` shell function at
+    its command boundary, so each recorded argv is the full invocation the
+    workflow would hand to the pinned pytest CLI.
+    """
+    recorded = []
+    for shard in range(1, 7):
+        for deselect in ("", "examples/tests/test_sre_bot_observability_runtime.py"):
+            environment = {
+                **os.environ,
+                "BASH_FUNC_uv%%": "() { printf '%s\\0' \"$@\"; }",
+                bindings["shard"]: str(shard),
+                bindings["deselect"]: deselect,
+                bindings["scope"]: "full",
+                bindings["shards"]: "6",
+                bindings["storage_shards"]: "6",
+                bindings["full_shards"]: "6",
+                bindings["stack_tier"]: "full",
+                bindings["event_name"]: "push",
+            }
+            result = subprocess.run(
+                ["bash", "--noprofile", "--norc", "-e", "-o", "pipefail", "-c", pytest_script],
+                env=environment,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            assert result.returncode == 0, result.stdout + result.stderr
+            pytest_command = result.stdout.split("\0")
+            assert pytest_command.pop() == ""
+            recorded.append((pytest_command, shard, deselect))
+    return recorded
+
+
+def _assert_full_suite(command: list[str], shard: int, deselect: str) -> None:
+    """Assert a recorded argv is exactly the full Python suite invocation."""
+    assert command[:3] == ["run", "pytest", "-q"]
+    if deselect:
+        assert command.count("--deselect") == 1
+        assert command[-2:] == ["--deselect", deselect]
+        command = command[:-2]
+    distribution = [
+        "-n",
+        "4",
+        "--dist",
+        "loadgroup",
+        "--ci-shard",
+        f"{shard}/6",
+        "--reruns",
+        "1",
+    ]
+    extra = command[3:]
+    assert extra[: len(distribution)] == distribution
+    arguments = iter(extra[len(distribution) :])
+    excluded = []
+    reporting = []
+    junit = []
+    for argument in arguments:
+        if argument in {"--ignore", "--ignore-glob", "--deselect"}:
+            path = next(arguments, None)
+            assert path is not None, f"{argument} requires a path"
+            excluded.append((argument, path))
+        elif argument.startswith(("--ignore=", "--ignore-glob=", "--deselect=")):
+            option, path = argument.split("=", 1)
+            excluded.append((option, path))
+        elif argument in {"--junitxml", "-o"}:
+            value = next(arguments, None)
+            assert value is not None, f"{argument} requires a value"
+            junit.append((argument, value))
+        else:
+            reporting.append(argument)
+    assert junit == [
+        ("--junitxml", "shard-result-durations/junit.xml"),
+        ("-o", "junit_family=xunit1"),
+    ], f"the full Python suite must write exactly the xunit1 duration report, got {junit!r}"
+    runtime_exclusions = _runtime_exclusions()
+    assert len(excluded) == len(runtime_exclusions) and set(excluded) == runtime_exclusions, (
+        "the Python suite must use exactly the required runtime and CI policy exclusions, "
+        f"got {excluded!r}"
+    )
+    assert all(
+        _is_supported_reporting_argument(argument) for argument in reporting
+    ), f"the full Python suite permits only supported reporting flags, got {command!r}"
+
+
+def _write_alternate_ci_workflow(tmp_path: Path, reporting_argument: str) -> Path:
+    """Write an anonymous ci.yaml whose pytest step carries one new flag.
+
+    The mutation stays inside the python-pytest job's pytest_args line, so the
+    artifact differs from the committed workflow by that one reporting token:
+    the reader, the shard bindings and the runtime exclusions all still apply,
+    and no path under the repository's .github is touched.
+    """
+    original = CI_WORKFLOW.read_text(encoding="utf-8")
+    anchor = f'--ci-shard "$SHARD/$PYTEST_SHARDS" --reruns 1 -rsR {CI_DURATIONS_ARGUMENT} '
+    assert original.count(anchor) == 1, "exactly one pytest step must carry the reporting flag"
+    path = tmp_path / "ci.yaml"
+    path.write_text(
+        original.replace(
+            anchor,
+            anchor.replace(CI_DURATIONS_ARGUMENT, reporting_argument),
+            1,
+        ),
+        encoding="utf-8",
+    )
+    return path
+
+
 def test_ci_keeps_the_required_python_status_and_keeps_the_fix_pin_gate_off_it() -> None:
     """The suite and the gate are both required, and no longer in series.
 
@@ -1045,12 +1329,25 @@ def test_ci_keeps_the_required_python_status_and_keeps_the_fix_pin_gate_off_it()
 
     job, required_steps = _python_job(document)
     assert job.get("name") == "Python (ruff + mypy + pytest)"
-    # The suite runs in the python-pytest shards; the required job only waits
-    # for them to aggregate their results, and always() keeps it from skipping.
-    assert job.get("needs") == "python-pytest"
+    # The suite runs in the python-pytest shards and the static gates in
+    # python-static; the required job only waits for them to aggregate their
+    # results, and always() keeps it from skipping.
+    assert job.get("needs") == [
+        "changes",
+        "python-pytest",
+        "python-container-fixtures",
+        "python-dry-run-fixture",
+        "python-static",
+        "ci-policy",
+    ]
     assert job.get("if") == "always()", "the required Python check must not be skippable"
     shard_job, steps = _python_job(document, "python-pytest")
-    assert "needs" not in shard_job and "if" not in shard_job
+    # #3858: the shards wait for the `changes` selection and run only when it
+    # selected pytest; the required job above still reports either way.
+    shard_needs = shard_job.get("needs")
+    shard_needs = [shard_needs] if isinstance(shard_needs, str) else list(shard_needs or [])
+    assert "changes" in shard_needs
+    assert shard_job.get("if") == "${{ needs.changes.outputs.pytest == 'true' }}"
 
     permissions = job.get("permissions")
     assert isinstance(permissions, dict), "the Python job must declare job level permissions"
@@ -1074,7 +1371,11 @@ def test_ci_keeps_the_required_python_status_and_keeps_the_fix_pin_gate_off_it()
 
     stack_index = _single_step_index(
         steps,
-        lambda step: "docker compose -f compose.dev.yaml up -d" in _string(step, "run"),
+        lambda step: (
+            _string(step, "run").strip()
+            == 'python3 scripts/wait-for-langfuse.py --start --tier "$STACK_TIER"'
+            " --timeout-seconds 480"
+        ),
         "dev stack startup",
     )
     migration_index = _single_step_index(
@@ -1082,48 +1383,51 @@ def test_ci_keeps_the_required_python_status_and_keeps_the_fix_pin_gate_off_it()
         lambda step: "uv run alembic upgrade head" in _string(step, "run"),
         "shared database migration",
     )
-    # Matched on the prefix, not on equality. What this assertion is for is that
-    # the normal suite runs, unfiltered; reporting flags like --durations do not
-    # bear on that, and pinning the exact string made a profiling flag look like
-    # a contract change.
-    pytest_index = _single_step_index(
-        steps,
-        lambda step: _string(step, "run").strip().startswith("uv run pytest -q"),
-        "normal Python suite",
-    )
-    pytest_command = shlex.split(_string(steps[pytest_index], "run").strip())
-    assert pytest_command[:4] == ["uv", "run", "pytest", "-q"]
-    # xdist distribution flags change where tests run, not which tests run, so
-    # they are allowed alongside reporting flags. Anything else could filter.
-    extra = pytest_command[4:]
-    # The shard flag and the one rerun are also allowed: the shards partition
-    # the unfiltered collection along xdist groups (asserted in
-    # tools/e2e-ci-selection/tests/test_python_pytest_selection.py), and a rerun
-    # changes how often a failing test runs, never which tests run.
-    distribution = [
-        "-n",
-        "4",
-        "--dist",
-        "loadgroup",
-        "--ci-shard",
-        # shlex splits the matrix expression `${{ matrix.shard }}/3`
-        "${{",
-        "matrix.shard",
-        "}}/3",
-        "--reruns",
-        "1",
-    ]
-    if extra[: len(distribution)] == distribution:
-        extra = extra[len(distribution) :]
-    report_chars = set("fEsxXpPaAR")
-    assert all(
-        argument.startswith("--durations")
-        or (argument.startswith("-r") and len(argument) > 2 and set(argument[2:]) <= report_chars)
-        for argument in extra
-    ), (
-        "the Python suite must run unfiltered: only reporting, sharding, rerun, and "
-        f"xdist distribution flags may be added to `uv run pytest -q`, got {pytest_command!r}"
-    )
+    # Dedicated kind runtime modules run through their own CI callers.
+    pytest_index, pytest_script, bindings = _shard_pytest_boundary(document)
+    # Run the unmodified Bash with a recording uv function at its command
+    # boundary, then hold every recorded argv to the full suite contract.
+    recorded = _recorded_pytest_commands(pytest_script, bindings)
+    for pytest_command, shard, deselect in recorded:
+        _assert_full_suite(pytest_command, shard, deselect)
+    # Every mutation the contract must refuse, checked against a real
+    # recorded shard 1 command: selection changes, an unsupported reporting
+    # flag (#2293 item 20), and the exclusion-reduction and option-swap
+    # controls below.
+    pytest_command, _, _ = recorded[0]
+    runtime_exclusions = _runtime_exclusions()
+    for mutation in (
+        ["--ignore", "apps/api/tests"],
+        ["--ignore=apps/api/tests"],
+        ["--ignore-glob=*"],
+        ["--deselect=apps/api/tests"],
+        ["--ci-shard-tiers", "6,6"],
+        ["--junitxml", "elsewhere/junit.xml"],
+        ["apps/api/tests/test_config.py"],
+        ["--durations-unsupported=30"],
+        list(sorted(runtime_exclusions)[0]),
+    ):
+        with pytest.raises(AssertionError):
+            _assert_full_suite([*pytest_command, *mutation], 1, "")
+    for missing_option, missing_path in runtime_exclusions:
+        reduced: list[str] = []
+        arguments = iter(pytest_command)
+        for argument in arguments:
+            if argument in {"--ignore", "--ignore-glob", "--deselect"}:
+                path = next(arguments)
+                if (argument, path) != (missing_option, missing_path):
+                    reduced.extend((argument, path))
+            elif argument != f"{missing_option}={missing_path}":
+                reduced.append(argument)
+        with pytest.raises(AssertionError):
+            _assert_full_suite(reduced, 1, "")
+        replaced = [
+            *reduced,
+            "--ignore" if missing_option == "--deselect" else "--deselect",
+            missing_path,
+        ]
+        with pytest.raises(AssertionError):
+            _assert_full_suite(replaced, 1, "")
     assert stack_index < migration_index < pytest_index
 
     # The half that keeps the win. Nothing about the gate may drift back into
@@ -1135,26 +1439,196 @@ def test_ci_keeps_the_required_python_status_and_keeps_the_fix_pin_gate_off_it()
     assert not any(_is_fix_pin_probe(step) for step in steps), (
         "the fix pin probe must not run inside the Python job again"
     )
-    assert not any(
-        "cargo" in _string(step, "run") for step in steps
-    ), "the Python job must not build Rust behind the suite"
+    assert not any("cargo" in _string(step, "run") for step in steps), (
+        "the Python job must not build Rust behind the suite"
+    )
 
     diagnostic_index = _single_step_index(
         steps,
         lambda step: "docker compose -f compose.dev.yaml logs" in _string(step, "run"),
         "failure stack diagnostic",
     )
-    diagnostic_if = _string(steps[diagnostic_index], "if")
+    diagnostic_if = _pull_request_condition(steps[diagnostic_index])
     assert "failure()" in diagnostic_if
     assert "steps.python-runtime.outputs.pytest == 'true'" in diagnostic_if
     assert pytest_index < diagnostic_index
+
+
+@pytest.mark.parametrize(
+    "reporting_argument",
+    [
+        pytest.param(CI_DURATIONS_ARGUMENT, id="the-committed-duration"),
+        pytest.param("--durations=10", id="another-supported-duration"),
+        pytest.param("--durations-min=30", id="supported-minimum-duration"),
+        pytest.param("--durations-min=0.5", id="supported-fractional-minimum"),
+        pytest.param("-rsR", id="supported-report-characters"),
+    ],
+)
+def test_ci_reporting_argument_contract_accepts_supported_reporting_arguments(
+    tmp_path: Path, reporting_argument: str
+) -> None:
+    """The contract keeps admitting every supported reporting form.
+
+    Each form reaches the validator through the real workflow reader and the
+    real full-shell recording, from an alternate artifact that differs from
+    the committed workflow by that one reporting token. #2293 item 20: fixing
+    the false green must not stop the contract admitting what it legitimately
+    admitted, including the committed ``--durations=25``.
+    """
+    workflow = _write_alternate_ci_workflow(tmp_path, reporting_argument)
+    _, pytest_script, bindings = _shard_pytest_boundary(_load_workflow(workflow))
+    for pytest_command, shard, deselect in _recorded_pytest_commands(pytest_script, bindings):
+        _assert_full_suite(pytest_command, shard, deselect)
+
+
+@pytest.mark.parametrize(
+    "reporting_argument",
+    [
+        pytest.param("--durations-unsupported=30", id="unknown-duration-suffix"),
+        pytest.param("--durations", id="duration-without-a-value"),
+        pytest.param("--durations=", id="empty-duration-value"),
+        pytest.param("--durations=bad", id="malformed-duration-integer"),
+        pytest.param("--durations-min", id="minimum-without-a-value"),
+        pytest.param("--durations-min=bad", id="malformed-minimum-number"),
+        pytest.param("--maxfail=1", id="a-pytest-option-that-is-no-reporting-flag"),
+    ],
+)
+def test_ci_reporting_argument_contract_rejects_unsupported_reporting_arguments(
+    tmp_path: Path, reporting_argument: str
+) -> None:
+    """Unknown suffixes, missing values and malformed numbers stay refused.
+
+    #2293 item 20: the prefix match reported exactly these green while the
+    pinned pytest parser exits 4 on the same flags. Each one still reaches the
+    validator through the real reader and the real full-shell recording, so
+    the rejection is the workflow command contract's, not a copied command's.
+    """
+    workflow = _write_alternate_ci_workflow(tmp_path, reporting_argument)
+    _, pytest_script, bindings = _shard_pytest_boundary(_load_workflow(workflow))
+    recorded = _recorded_pytest_commands(pytest_script, bindings)
+    assert recorded, "the pytest step must record a command"
+    for pytest_command, shard, deselect in recorded:
+        with pytest.raises(AssertionError, match="reporting"):
+            _assert_full_suite(pytest_command, shard, deselect)
+
+
+def _pinned_pytest_collects(argv_tail: list[str]) -> subprocess.CompletedProcess[str]:
+    """Parse one argv tail with the pinned pytest CLI, collecting no test.
+
+    Collect-only selects this test module and executes no test, so the exit
+    code is the parser's verdict on the arguments alone. The subprocess runs
+    the same interpreter and pinned pytest the suite runs, no other binary.
+    """
+    return subprocess.run(
+        [sys.executable, "-m", "pytest", "--collect-only", *argv_tail],
+        cwd=REPO_ROOT,
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=30,
+    )
+
+
+@pytest.mark.parametrize(
+    ("reporting_argument", "parser_exit", "parser_error", "admitted"),
+    [
+        pytest.param("--durations=25", 0, "", True, id="supported-duration"),
+        pytest.param("--durations-min=30", 0, "", True, id="supported-minimum-duration"),
+        pytest.param("--durations-min=0.5", 0, "", True, id="supported-fractional-minimum"),
+        pytest.param("-rsR", 0, "", True, id="supported-report-characters"),
+        pytest.param(
+            "--maxfail=1",
+            0,
+            "",
+            False,
+            id="parser-accepted-but-no-reporting-flag",
+        ),
+        pytest.param(
+            "--durations-unsupported=30",
+            4,
+            "unrecognized arguments",
+            False,
+            id="unknown-duration-suffix",
+        ),
+        pytest.param(
+            "--durations=bad",
+            4,
+            "invalid int value",
+            False,
+            id="malformed-duration-integer",
+        ),
+        pytest.param(
+            "--durations-min=bad",
+            4,
+            "invalid float value",
+            False,
+            id="malformed-minimum-number",
+        ),
+        pytest.param(
+            "--durations=",
+            4,
+            "invalid int value",
+            False,
+            id="empty-duration-value",
+        ),
+    ],
+)
+def test_ci_reporting_argument_parser_agreement(
+    reporting_argument: str, parser_exit: int, parser_error: str, admitted: bool
+) -> None:
+    """The contract admits exactly the reporting forms the parser admits.
+
+    Every example runs through the pinned pytest CLI in a bounded collect-only
+    subprocess, and the same example must get the verdict the table pins: the
+    supported forms pass the parser and the contract both, the malformed ones
+    fail both. ``--maxfail`` is the control in the other direction: the parser
+    accepts it, and the contract must still refuse it, because a pytest option
+    is not a reporting flag. #2293 item 20: the prefix match disagreed with the
+    parser on every malformed form here.
+    """
+    completed = _pinned_pytest_collects([reporting_argument, str(TEST_MODULE)])
+    assert completed.returncode == parser_exit, completed.stdout + completed.stderr
+    if parser_error:
+        assert parser_error in completed.stderr, completed.stderr
+    assert _is_supported_reporting_argument(reporting_argument) is admitted, (
+        f"the contract must {'admit' if admitted else 'refuse'} {reporting_argument!r}, "
+        "in agreement with the pinned parser"
+    )
+
+
+def test_ci_reporting_argument_parser_agreement_rejects_a_valueless_duration() -> None:
+    """A ``--durations`` without its value is a usage error, not a flag.
+
+    The valueless form only parses as a trailing token, so it cannot ride the
+    parametrize list: the parser must see it after the selected module. The
+    contract must refuse it exactly as the parser does.
+    """
+    completed = _pinned_pytest_collects([str(TEST_MODULE), "--durations"])
+    assert completed.returncode == 4, completed.stdout + completed.stderr
+    assert "expected one argument" in completed.stderr, completed.stderr
+    assert _is_supported_reporting_argument("--durations") is False, (
+        "the contract must refuse a duration flag without its value"
+    )
+
+
+def _pull_request_condition(step: dict[str, Any]) -> str:
+    condition = _string(step, "if")
+    if condition == "github.event_name != 'merge_group'":
+        return ""
+    prefix = "${{ github.event_name != 'merge_group' && ("
+    if condition.startswith(prefix):
+        assert condition.endswith(") }}")
+        return condition.removeprefix(prefix).removesuffix(") }}")
+    return condition
 
 
 def test_the_fix_pin_job_is_required_and_carries_the_whole_gate() -> None:
     """Everything the gate needs must be in the job that now runs it."""
     job, steps = _fix_pin_job()
     assert "needs" not in job, "the required fix pin check must not be skippable"
-    assert not _string(job, "if"), "the job must run for every configured pull request event"
+    assert not _pull_request_condition(job), (
+        "the job must run for every configured pull request event"
+    )
     trigger = _workflow_trigger(_load_workflow(FIX_PIN_WORKFLOW))["pull_request"]
     assert set(trigger["types"]) == {"opened", "synchronize", "reopened", "edited"}
 
@@ -1185,7 +1659,7 @@ def test_the_fix_pin_job_is_required_and_carries_the_whole_gate() -> None:
 
     probe = steps[probe_index]
     assert probe.get("id") == "fix-pin-curie"
-    assert not _string(probe, "if"), (
+    assert not _pull_request_condition(probe), (
         "the probe must run for every pull request, including bodies with no "
         "live selector; gating it on its own output would skip the decision"
     )
@@ -1217,32 +1691,55 @@ def test_the_fix_pin_job_is_required_and_carries_the_whole_gate() -> None:
 
     release_build_index = _single_step_index(
         steps,
-        lambda step: _string(step, "run").strip()
-        == "cargo build --release --locked --manifest-path cli/Cargo.toml",
+        lambda step: (
+            _string(step, "run").strip()
+            == "cargo build --release --locked --manifest-path cli/Cargo.toml"
+        ),
         "direct current release build",
     )
     helm_index = _single_step_index(
         steps,
-        lambda step: _string(step, "uses")
-        == "azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310"
-        and (step.get("with") or {}).get("version") == "v3.16.4",
+        lambda step: (
+            _string(step, "uses") == "azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310"
+            and (step.get("with") or {}).get("version") == "v3.16.4"
+        ),
         "pinned Helm setup",
     )
-    assert probe_index < release_build_index < helm_index < gate_index
+    cache_index = _single_step_index(
+        steps,
+        lambda step: _string(step, "uses").startswith("Swatinem/rust-cache@"),
+        "fix pin Cargo cache",
+    )
+    cache = steps[cache_index]
+    cache_action = "Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0"
+    assert cache.get("name") == "Cargo cache"
+    assert cache.get("uses") == cache_action
+    assert _pull_request_condition(cache) == CARGO_NEEDED_GUARD
+    assert cache.get("with") == {
+        "workspaces": "cli",
+        "shared-key": "curie-cli-release",
+        "cache-on-failure": True,
+    }
+    assert probe_index < cache_index < release_build_index < helm_index < gate_index
 
-    # The build stays direct. A `rust` selector makes verify-fix-pin.sh run
-    # `cargo test` out of CARGO_TARGET_DIR, so this build warms the directory
-    # the verification then compiles in; swapping it for rust-build's artifact
-    # would leave that selector to compile from cold.
-    assert not any(
-        _string(step, "uses") == "Swatinem/rust-cache@v2" for step in steps
-    ), "the fix pin job must build directly without a Cargo cache dependency"
+    # Both jobs restore the same dependency cache and still build curie directly.
+    rust_build_steps = _load_ci()["jobs"]["rust-build"]["steps"]
+    assert isinstance(rust_build_steps, list)
+    rust_build_cache = rust_build_steps[
+        _single_step_index(
+            rust_build_steps,
+            lambda step: _string(step, "uses").startswith("Swatinem/rust-cache@"),
+            "rust-build Cargo cache",
+        )
+    ]
+    assert rust_build_cache.get("uses") == cache_action
+    assert rust_build_cache.get("with", {}).get("shared-key") == "curie-cli-release"
     assert not any(
         _string(step, "uses").startswith("actions/download-artifact") for step in steps
     ), "the fix pin job must not download its curie binary"
-    assert not any(
-        "chmod +x cli/target/release/curie" in _string(step, "run") for step in steps
-    ), "the direct Cargo build creates the executable"
+    assert not any("chmod +x cli/target/release/curie" in _string(step, "run") for step in steps), (
+        "the direct Cargo build creates the executable"
+    )
 
     # Inside the Python job the gate inherited a booted stack. A `python`
     # selector naming an integration test dials Postgres and Valkey through
@@ -1255,7 +1752,10 @@ def test_the_fix_pin_job_is_required_and_carries_the_whole_gate() -> None:
     )
     stack_index = _single_step_index(
         steps,
-        lambda step: "docker compose -f compose.dev.yaml up -d" in _string(step, "run"),
+        lambda step: (
+            _string(step, "run").strip()
+            == "python3 scripts/wait-for-langfuse.py --start --timeout-seconds 480"
+        ),
         "dev stack startup",
     )
     migration_index = _single_step_index(
@@ -1266,7 +1766,7 @@ def test_the_fix_pin_job_is_required_and_carries_the_whole_gate() -> None:
     assert sync_index < probe_index
     assert helm_index < stack_index < migration_index < gate_index
     for index in (stack_index, migration_index):
-        assert CARGO_NEEDED_GUARD in _string(steps[index], "if"), (
+        assert STACK_NEEDED_GUARD in _pull_request_condition(steps[index]), (
             "a body with no live selector never reaches the verifier, so it "
             "must not pay for a compose stack either"
         )
@@ -1276,14 +1776,224 @@ def test_the_fix_pin_job_is_required_and_carries_the_whole_gate() -> None:
         lambda step: "compose.dev.yaml logs" in _string(step, "run"),
         "failure stack diagnostic",
     )
-    diagnostic_if = _string(steps[diagnostic_index], "if")
+    diagnostic_if = _pull_request_condition(steps[diagnostic_index])
     assert "failure()" in diagnostic_if
-    assert CARGO_NEEDED_GUARD in diagnostic_if
+    assert STACK_NEEDED_GUARD in diagnostic_if
     assert gate_index < diagnostic_index
+
+    readiness_index = _single_step_index(
+        steps,
+        lambda step: _string(step, "run").strip() == "python3 scripts/wait-for-langfuse.py",
+        "dev stack readiness",
+    )
+    assert STACK_NEEDED_GUARD in _pull_request_condition(steps[readiness_index])
+    assert stack_index < readiness_index < migration_index
+    kind_index = _single_step_index(
+        steps,
+        lambda step: (
+            _string(step, "uses").startswith("helm/kind-action@")
+            and _pull_request_condition(step) == KIND_NEEDED_GUARD
+        ),
+        "kind tools installation for the isolated registration pin",
+    )
+    assert steps[kind_index]["with"]["install_only"] is True
+    assert probe_index < kind_index < gate_index
+    disk_index = _single_step_index(
+        steps,
+        lambda step: "/usr/local/lib/android" in _string(step, "run"),
+        "disk reclaim for the four candidate images",
+    )
+    assert _pull_request_condition(steps[disk_index]) == KIND_NEEDED_GUARD
+    assert probe_index < disk_index < kind_index
 
 
 CARGO_NEEDED_GUARD = "steps.fix-pin-curie.outputs.needed == 'true'"
+STACK_NEEDED_GUARD = "steps.fix-pin-curie.outputs.needs_stack == 'true'"
+KIND_NEEDED_GUARD = "steps.fix-pin-curie.outputs.needs_kind == 'true'"
+FACTORY_UPGRADE_NEEDED_GUARD = "steps.fix-pin-curie.outputs.needs_factory_upgrade == 'true'"
 SUBSTRING_GUARD = "contains(github.event.pull_request.body, 'Fix pin:')"
+
+
+def _factory_upgrade_setup_steps() -> tuple[list[dict[str, Any]], int, int]:
+    _, steps = _fix_pin_job()
+    prepare_index = _single_step_index(
+        steps,
+        lambda step: (
+            "TMPDIR=" in _string(step, "run") and "CURIE_C4_RELEASE_ASSETS=" in _string(step, "run")
+        ),
+        "source-local factory upgrade preparation",
+    )
+    download_index = _single_step_index(
+        steps,
+        lambda step: "releases/download/v0.12.5" in _string(step, "run"),
+        "released factory upgrade asset download",
+    )
+    return steps, prepare_index, download_index
+
+
+def _run_factory_upgrade_setup_step(
+    step: dict[str, Any], environment: dict[str, str]
+) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        ["bash", "--noprofile", "--norc", "-e", "-o", "pipefail", "-c", _string(step, "run")],
+        cwd=environment["GITHUB_WORKSPACE"],
+        env=environment,
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=30,
+    )
+
+
+def _prepare_factory_upgrade_environment(tmp_path: Path) -> dict[str, str]:
+    workspace = tmp_path / "source checkout"
+    workspace.mkdir()
+    runner_temp = tmp_path / "runner temp"
+    runner_temp.mkdir()
+    github_env = runner_temp / "github-env"
+    github_env.touch()
+    environment = {
+        **os.environ,
+        "GITHUB_WORKSPACE": str(workspace),
+        "GITHUB_ENV": str(github_env),
+        "RUNNER_TEMP": str(runner_temp),
+    }
+    for name in ("TMPDIR", "CURIE_C4_RELEASE_ASSETS"):
+        environment.pop(name, None)
+    steps, prepare_index, _ = _factory_upgrade_setup_steps()
+    completed = _run_factory_upgrade_setup_step(steps[prepare_index], environment)
+    assert completed.returncode == 0, completed.stdout + completed.stderr
+    exported = dict(
+        line.split("=", 1) for line in github_env.read_text(encoding="utf-8").splitlines()
+    )
+    assert {"TMPDIR", "CURIE_C4_RELEASE_ASSETS"} <= exported.keys()
+    return {**environment, **exported}
+
+
+def test_factory_upgrade_workflow_prepares_assets_before_verification() -> None:
+    steps, prepare_index, download_index = _factory_upgrade_setup_steps()
+    probe_index = _single_step_index(steps, _is_fix_pin_probe, "fix pin requirements probe")
+    gate_index = _single_step_index(steps, _is_fix_pin_gate, "fix pin verification")
+    assert probe_index < prepare_index < download_index < gate_index
+    for index in (prepare_index, download_index):
+        step = steps[index]
+        assert _pull_request_condition(step) == FACTORY_UPGRADE_NEEDED_GUARD
+        assert step.get("continue-on-error", False) is False
+    assert not _pull_request_condition(steps[gate_index]), (
+        "every declaration must reach the policy gate"
+    )
+
+
+def test_factory_upgrade_setup_exports_source_local_paths(tmp_path: Path) -> None:
+    environment = _prepare_factory_upgrade_environment(tmp_path)
+    workspace = Path(environment["GITHUB_WORKSPACE"]).resolve()
+    for name in ("TMPDIR", "CURIE_C4_RELEASE_ASSETS"):
+        directory = Path(environment[name])
+        assert directory.is_absolute()
+        assert directory.is_dir(), f"{name} must exist before verification"
+        assert directory.resolve().is_relative_to(workspace / ".projects"), name
+
+    completed = subprocess.run(
+        ["mktemp", "-d"],
+        cwd=workspace,
+        env=environment,
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=10,
+    )
+    assert completed.returncode == 0, completed.stderr
+    temporary_root = Path(completed.stdout.strip()).resolve()
+    assert temporary_root.is_dir()
+    assert temporary_root.parent == Path(environment["TMPDIR"]).resolve()
+    assert (temporary_root / "worktree").is_relative_to(workspace / ".projects")
+
+
+@pytest.mark.parametrize(
+    ("corrupt_asset", "manifest_entries"),
+    [
+        pytest.param(None, "complete", id="verified-assets"),
+        pytest.param("curie-0.12.5.tgz", "complete", id="corrupt-chart"),
+        pytest.param("curie-x86_64-unknown-linux-gnu", "complete", id="corrupt-cli"),
+        pytest.param(None, "missing-cli", id="missing-checksum"),
+        pytest.param(None, "duplicate-cli", id="duplicate-checksum"),
+    ],
+)
+def test_factory_upgrade_downloads_only_verified_release_assets(
+    tmp_path: Path, corrupt_asset: str | None, manifest_entries: str
+) -> None:
+    environment = _prepare_factory_upgrade_environment(tmp_path)
+    release_url = "https://github.com/curie-eng/curie/releases/download/v0.12.5"
+    assets = {
+        "curie-0.12.5.tgz": "released chart fixture\n",
+        "curie-x86_64-unknown-linux-gnu": "released CLI fixture\n",
+    }
+    checksum_lines = [
+        f"{hashlib.sha256(content.encode()).hexdigest()}  {name}\n"
+        for name, content in assets.items()
+    ]
+    if manifest_entries == "missing-cli":
+        checksum_lines.pop()
+    elif manifest_entries == "duplicate-cli":
+        checksum_lines.append(checksum_lines[-1])
+    responses = {f"{release_url}/{name}": content for name, content in assets.items()}
+    responses[f"{release_url}/checksums.txt"] = "".join(checksum_lines)
+    if corrupt_asset is not None:
+        responses[f"{release_url}/{corrupt_asset}"] += "corrupted download\n"
+
+    # The public release serves these assets and their sha256sum manifest:
+    # https://github.com/curie-eng/curie/releases/tag/v0.12.5
+    # Replace GitHub responses while running the workflow's real checksum tools.
+    download_boundary = "\n".join(
+        [
+            "import json, os, sys",
+            "from pathlib import Path",
+            "arguments = sys.argv[1:]",
+            "urls = [value for value in arguments if value.startswith('https://')]",
+            "assert len(urls) == 1, arguments",
+            "url = urls[0]",
+            "output_flag = '-o' if '-o' in arguments else '--output'",
+            "destination = Path(arguments[arguments.index(output_flag) + 1])",
+            "responses = json.loads(os.environ['FIX_PIN_RELEASE_RESPONSES'])",
+            "assert url in responses, url",
+            "print('FIX_PIN_DOWNLOAD ' + json.dumps("
+            "{'url': url, 'destination': str(destination)}))",
+            "destination.write_text(responses[url], encoding='utf-8')",
+        ]
+    )
+    environment.update(
+        {
+            "FIX_PIN_RELEASE_RESPONSES": json.dumps(responses),
+            "BASH_FUNC_curl%%": (
+                f'() {{ {shlex.quote(sys.executable)} -c {shlex.quote(download_boundary)} "$@"; }}'
+            ),
+        }
+    )
+    steps, _, download_index = _factory_upgrade_setup_steps()
+    completed = _run_factory_upgrade_setup_step(steps[download_index], environment)
+    calls = [
+        json.loads(line.removeprefix("FIX_PIN_DOWNLOAD "))
+        for line in completed.stdout.splitlines()
+        if line.startswith("FIX_PIN_DOWNLOAD ")
+    ]
+    assert calls, completed.stdout + completed.stderr
+    assert calls[0]["url"] == f"{release_url}/checksums.txt"
+    asset_directory = Path(environment["CURIE_C4_RELEASE_ASSETS"])
+    for call in calls:
+        filename = call["url"].rsplit("/", 1)[-1]
+        assert Path(call["destination"]).resolve() == (asset_directory / filename).resolve()
+
+    if corrupt_asset is not None or manifest_entries != "complete":
+        assert completed.returncode != 0, completed.stdout + completed.stderr
+        if corrupt_asset is not None:
+            assert f"{corrupt_asset}: FAILED" in completed.stdout + completed.stderr
+        return
+
+    assert completed.returncode == 0, completed.stdout + completed.stderr
+    assert len(calls) == 3
+    assert {call["url"] for call in calls} == set(responses)
+    for name, content in assets.items():
+        assert (asset_directory / name).read_text(encoding="utf-8") == content
 
 
 def test_selector_tooling_builds_only_when_the_parser_would_invoke_curie() -> None:
@@ -1309,20 +2019,22 @@ def test_selector_tooling_builds_only_when_the_parser_would_invoke_curie() -> No
     for description, predicate in (
         (
             "direct current release build",
-            lambda step: _string(step, "run").strip()
-            == "cargo build --release --locked --manifest-path cli/Cargo.toml",
+            lambda step: (
+                _string(step, "run").strip()
+                == "cargo build --release --locked --manifest-path cli/Cargo.toml"
+            ),
         ),
         (
             "pinned Helm setup",
-            lambda step: _string(step, "uses")
-            == "azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310",
+            lambda step: (
+                _string(step, "uses") == "azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310"
+            ),
         ),
     ):
         step = steps[_single_step_index(steps, predicate, description)]
-        condition = _string(step, "if")
-        # The workflow runs only for pull requests, so these steps need only
-        # the parser's answer.
-        assert not _string(job, "if"), f"{description} must run on edited pull requests"
+        condition = _pull_request_condition(step)
+        # On PR events, these steps still depend only on the parser's answer.
+        assert not _pull_request_condition(job), f"{description} must run on edited pull requests"
         assert CARGO_NEEDED_GUARD in condition, (
             f"{description} must build only when the parser says the binary "
             f"is needed: {condition!r}"
@@ -1336,11 +2048,11 @@ def test_selector_tooling_builds_only_when_the_parser_would_invoke_curie() -> No
     # would turn the "closes a bug with no declaration" rejection into a
     # skipped step.
     gate = steps[_single_step_index(steps, _is_fix_pin_gate, "fix pin caller")]
-    assert CARGO_NEEDED_GUARD not in _string(gate, "if"), (
+    assert CARGO_NEEDED_GUARD not in _pull_request_condition(gate), (
         "the gate must still run for a body with no declaration, or the "
         "bug-without-declaration rejection can never fire"
     )
-    assert SUBSTRING_GUARD not in _string(gate, "if")
+    assert SUBSTRING_GUARD not in _pull_request_condition(gate)
 
 
 def test_default_template_body_does_not_need_curie(tmp_path: Path) -> None:
@@ -1401,6 +2113,157 @@ def test_needs_curie_fails_closed_without_github_output(tmp_path: Path) -> None:
 
     assert completed.returncode != 0
     assert "GITHUB_OUTPUT" in completed.stderr
+
+
+@pytest.mark.parametrize(
+    ("body", "needed", "stack", "kind", "factory_upgrade"),
+    [
+        (f"Fix pin: {ADMITTED_AGENT_SELECTOR}", True, False, True, False),
+        (
+            "Fix pin: tools/factory-e2e/tests/test_c4_admitted_agent.py::"
+            "test_execute_revalidates_current_authority[agent_tenant-factory_tenant_mismatch]",
+            True,
+            False,
+            True,
+            False,
+        ),
+        (f"Fix pin: {INITIAL_BINDING_SELECTOR}", True, False, True, False),
+        (f"Fix pin: {STATIC_TOKEN_ROTATION_SELECTOR}", True, False, True, False),
+        (f"Fix pin: {HELD_CANCELLATION_SELECTOR}", True, False, True, False),
+        (
+            "Fix pin: tools/factory-e2e/tests/test_c4_initial_binding.py::"
+            "test_quickstarts_are_idempotent_and_binding_guards_hold[gitlab]",
+            True,
+            False,
+            True,
+            False,
+        ),
+        (f"Fix pin: {FORGE_INSTANCES_SELECTOR}", True, False, True, False),
+        (
+            "Fix pin: tools/factory-e2e/tests/test_c4_forge_instances_extra.py::test_example",
+            True,
+            True,
+            False,
+            False,
+        ),
+        (f"Fix pin: {FACTORY_UPGRADE_SELECTOR}", True, False, True, True),
+        (f"Fix pin: {FACTORY_UPGRADE_SELECTOR}[secondary]", True, False, True, True),
+        (
+            "Fix pin: tools/factory-e2e/tests/test_c4_upgrade_migration.py::"
+            "TestUpgrade::test_secondary_path",
+            True,
+            False,
+            True,
+            True,
+        ),
+        (f"Fix pin: {VALID_SELECTOR}", True, True, False, False),
+        (f"Fix pin: {FACTORY_SELECTOR}", True, True, False, False),
+        (f"Fix pin: {LOCAL_SELECTOR}", True, True, False, False),
+        (f"Fix pin: {CHART_SELECTOR}", True, True, False, False),
+        (f"Fix pin: {NOTES_RELEASE_TARGET_SELECTOR}", True, False, True, False),
+        (
+            "Fix pin: charts/curie/ci/notes-release-target-extra-assertions.sh",
+            True,
+            True,
+            False,
+            False,
+        ),
+        (
+            "Fix pin: charts/curie/ci/runtime/notes-release-target-assertions.sh",
+            True,
+            True,
+            False,
+            False,
+        ),
+        ("Fix pin: cli/tests/verify_fix_pin.rs::ci_gate_pins", True, True, False, False),
+        (
+            "Fix pin: tools/factory-e2e/tests/test_c4_initial_binding_extra.py::test_example",
+            True,
+            True,
+            False,
+            False,
+        ),
+        (
+            "Fix pin: tools/factory-e2e/tests/test_c4_admitted_agent_extra.py::test_example",
+            True,
+            True,
+            False,
+            False,
+        ),
+        (
+            "Fix pin: tools/factory-e2e/tests/test_c4_static_token_rotation_extra.py::test_example",
+            True,
+            True,
+            False,
+            False,
+        ),
+        (
+            "Fix pin: tools/factory-e2e/tests/test_c4_held_cancellation_extra.py::test_example",
+            True,
+            True,
+            False,
+            False,
+        ),
+        (f"Fix pin: {FACTORY_UPGRADE_NEAR_MISS_SELECTOR}", True, True, False, False),
+        (
+            "Fix pin: tools/factory-e2e/tests/nested/test_c4_upgrade_migration.py::test_example",
+            True,
+            True,
+            False,
+            False,
+        ),
+        (None, False, False, False, False),
+        ("", False, False, False, False),
+        ("Fix pin: n/a - documentation only", False, False, False, False),
+        (f"<!-- Fix pin: {ADMITTED_AGENT_SELECTOR} -->", False, False, False, False),
+        (f" Fix pin: {ADMITTED_AGENT_SELECTOR}", False, False, False, False),
+        (f"Verified with Fix pin: {ADMITTED_AGENT_SELECTOR}", False, False, False, False),
+        (
+            "Fix pin: tools/factory-e2e/tests/test_c4_admitted_agent.py::",
+            False,
+            False,
+            False,
+            False,
+        ),
+        (f"<!-- Fix pin: {INITIAL_BINDING_SELECTOR} -->", False, False, False, False),
+        (f"<!-- Fix pin: {FACTORY_UPGRADE_SELECTOR} -->", False, False, False, False),
+        (f" Fix pin: {INITIAL_BINDING_SELECTOR}", False, False, False, False),
+        (f" Fix pin: {FACTORY_UPGRADE_SELECTOR}", False, False, False, False),
+        (
+            f"Fix pin: {INITIAL_BINDING_SELECTOR}\nFix pin: {VALID_SELECTOR}",
+            False,
+            False,
+            False,
+            False,
+        ),
+        (
+            f"Fix pin: {FACTORY_UPGRADE_SELECTOR}\nFix pin: {VALID_SELECTOR}",
+            False,
+            False,
+            False,
+            False,
+        ),
+        ("Fix pin: --help", False, False, False, False),
+    ],
+)
+def test_probe_selects_infrastructure_from_the_parsed_pin(
+    tmp_path: Path,
+    body: str | None,
+    needed: bool,
+    stack: bool,
+    kind: bool,
+    factory_upgrade: bool,
+) -> None:
+    completed = _run_needs_curie(tmp_path, body)
+    assert completed.returncode == 0, completed.stderr
+    expected = {
+        "needed": str(needed).lower(),
+        "needs_stack": str(stack).lower(),
+        "needs_kind": str(kind).lower(),
+        "needs_factory_upgrade": str(factory_upgrade).lower(),
+    }
+    assert _probe_outputs(tmp_path) == expected
+    assert dict(line.split("=", 1) for line in completed.stdout.splitlines()) == expected
 
 
 def test_pull_request_template_documents_the_required_declaration() -> None:
@@ -1508,9 +2371,7 @@ def test_not_applicable_without_a_reason_fails_closed_without_calling_curie(
 
 def test_bug_label_is_found_anywhere_in_the_label_list(tmp_path: Path) -> None:
     """The gate tests membership, not the first or only label."""
-    completed, call_log = _run_checker(
-        tmp_path, "Closes #12\n", gh_labels='["priority", "bug"]'
-    )
+    completed, call_log = _run_checker(tmp_path, "Closes #12\n", gh_labels='["priority", "bug"]')
 
     assert completed.returncode != 0, f"{completed.stdout}\n{completed.stderr}"
     assert "#12" in completed.stderr
@@ -1534,9 +2395,7 @@ def test_not_applicable_reason_without_a_dash_fails_closed_without_calling_curie
 def test_closing_a_non_bug_issue_without_a_declaration_keeps_the_existing_skip(
     tmp_path: Path,
 ) -> None:
-    completed, call_log = _run_checker(
-        tmp_path, "Closes #12\n", gh_labels='["enhancement"]'
-    )
+    completed, call_log = _run_checker(tmp_path, "Closes #12\n", gh_labels='["enhancement"]')
 
     assert completed.returncode == 0, completed.stderr
     assert completed.stdout.strip() == "SKIPPED: no Fix pin declaration"
@@ -1580,9 +2439,7 @@ def test_closing_keyword_variants_all_require_a_declaration(tmp_path: Path, body
         "Closes #",
     ],
 )
-def test_non_closing_references_are_not_looked_up_and_still_skip(
-    tmp_path: Path, body: str
-) -> None:
+def test_non_closing_references_are_not_looked_up_and_still_skip(tmp_path: Path, body: str) -> None:
     completed, call_log = _run_checker(tmp_path, body, gh_labels=BUG_LABELS)
 
     assert completed.returncode == 0, f"{completed.stdout}\n{completed.stderr}"
@@ -1607,260 +2464,35 @@ def test_missing_gh_fails_closed_without_calling_curie(tmp_path: Path) -> None:
     assert not call_log.exists(), "an unavailable label API must not open the gate"
 
 
-def test_unit_pin_for_a_found_live_issue_fails_without_a_waiver(tmp_path: Path) -> None:
-    """A unit selector cannot pin a defect found on a live surface (#2243)."""
+@pytest.mark.parametrize(
+    "labels", [FOUND_UNIT_LABELS, FOUND_LOCAL_LABELS, FOUND_CLUSTER_LABELS, FOUND_LIVE_LABELS]
+)
+@pytest.mark.parametrize(
+    "selector", [VALID_SELECTOR, LOCAL_SELECTOR, LIVE_SELECTOR, CHART_SELECTOR]
+)
+def test_reproducing_pin_is_verified_regardless_of_discovery_tier(
+    tmp_path: Path, labels: str, selector: str
+) -> None:
     completed, call_log = _run_checker(
         tmp_path,
-        f"Closes #12\n\nFix pin: {VALID_SELECTOR}\n",
-        gh_labels=FOUND_LIVE_LABELS,
+        f"Closes #12\n\nFix pin: {selector}\n",
+        gh_labels=labels,
     )
-    shown = f"{completed.stdout}\n{completed.stderr}"
-
-    assert completed.returncode != 0, shown
-    assert "found:live" in completed.stderr, shown
-    assert "unit" in completed.stderr, shown
-    assert "Fix pin waiver:" in completed.stderr, shown
-    assert not call_log.exists(), "a pin below the discovery surface must not reach curie"
-
-
-def test_unit_pin_for_a_found_live_issue_passes_with_a_waiver(tmp_path: Path) -> None:
-    """The explicit waiver is the only way a below-surface pin may proceed."""
-    completed, call_log = _run_checker(
-        tmp_path,
-        (
-            f"Closes #12\n\nFix pin: {VALID_SELECTOR}\n"
-            "Fix pin waiver: live retest is manual; the unit pin covers the regression\n"
-        ),
-        gh_labels=FOUND_LIVE_LABELS,
-    )
-
     assert completed.returncode == 0, completed.stderr
     assert json.loads(call_log.read_text(encoding="utf-8")) == [
-        "dev",
-        "verify-fix-pin",
-        "HEAD",
-        VALID_SELECTOR,
+        "dev", "verify-fix-pin", "HEAD", selector,
     ]
 
 
-def test_live_pin_for_a_found_live_issue_passes_without_a_waiver(tmp_path: Path) -> None:
-    completed, call_log = _run_checker(
-        tmp_path,
-        f"Closes #12\n\nFix pin: {LIVE_SELECTOR}\n",
-        gh_labels=FOUND_LIVE_LABELS,
-    )
-
-    assert completed.returncode == 0, completed.stderr
-    assert json.loads(call_log.read_text(encoding="utf-8")) == [
-        "dev",
-        "verify-fix-pin",
-        "HEAD",
-        LIVE_SELECTOR,
-    ]
-
-
-def test_helm_render_pin_for_a_found_live_issue_fails_without_a_waiver(
-    tmp_path: Path,
-) -> None:
-    completed, call_log = _run_checker(
-        tmp_path,
-        f"Closes #12\n\nFix pin: {CHART_SELECTOR}\n",
-        gh_labels=FOUND_LIVE_LABELS,
-    )
-    shown = f"{completed.stdout}\n{completed.stderr}"
-
-    assert completed.returncode != 0, shown
-    assert "found:live" in completed.stderr, shown
-    assert "cluster" in completed.stderr, shown
-    assert not call_log.exists(), "a helm-render pin must not pass for a live-found issue"
-
-
-def test_unit_pin_for_a_found_unit_issue_passes_without_a_waiver(tmp_path: Path) -> None:
-    completed, call_log = _run_checker(
-        tmp_path,
-        f"Closes #12\n\nFix pin: {VALID_SELECTOR}\n",
-        gh_labels=FOUND_UNIT_LABELS,
-    )
-
-    assert completed.returncode == 0, completed.stderr
-    assert call_log.exists(), "an at-surface pin must still be verified"
-
-
-def test_unit_pin_for_a_found_local_issue_fails_without_a_waiver(tmp_path: Path) -> None:
-    completed, call_log = _run_checker(
-        tmp_path,
-        f"Closes #12\n\nFix pin: {VALID_SELECTOR}\n",
-        gh_labels=FOUND_LOCAL_LABELS,
-    )
-    shown = f"{completed.stdout}\n{completed.stderr}"
-
-    assert completed.returncode != 0, shown
-    assert "found:local" in completed.stderr, shown
-    assert not call_log.exists(), "a unit pin must not pass for a local-found issue"
-
-
-@pytest.mark.parametrize("gh_labels", [FOUND_UNIT_LABELS, FOUND_LOCAL_LABELS])
-def test_local_pin_satisfies_unit_and_local_discovery_surfaces(
-    tmp_path: Path, gh_labels: str
-) -> None:
-    completed, call_log = _run_checker(
-        tmp_path,
-        f"Closes #12\n\nFix pin: {LOCAL_SELECTOR}\n",
-        gh_labels=gh_labels,
-    )
-
-    assert completed.returncode == 0, completed.stderr
-    assert call_log.exists(), "an at surface local pin must be verified"
-
-
-@pytest.mark.parametrize("gh_labels", [FOUND_CLUSTER_LABELS, FOUND_LIVE_LABELS])
-def test_local_pin_refuses_cluster_and_live_discovery_surfaces_without_a_waiver(
-    tmp_path: Path, gh_labels: str
-) -> None:
-    completed, call_log = _run_checker(
-        tmp_path,
-        f"Closes #12\n\nFix pin: {LOCAL_SELECTOR}\n",
-        gh_labels=gh_labels,
-    )
-    shown = f"{completed.stdout}\n{completed.stderr}"
-
-    assert completed.returncode != 0, shown
-    assert "local" in completed.stderr, shown
-    assert not call_log.exists(), "a below surface local pin must not reach curie"
-
-
-def test_local_test_live_filename_is_still_a_local_pin(tmp_path: Path) -> None:
-    completed, call_log = _run_checker(
-        tmp_path,
-        f"Closes #12\n\nFix pin: {LOCAL_LIVE_SELECTOR}\n",
-        gh_labels=FOUND_CLUSTER_LABELS,
-    )
-    shown = f"{completed.stdout}\n{completed.stderr}"
-
-    assert completed.returncode != 0, shown
-    assert "is a local pin" in completed.stderr, shown
-    assert not call_log.exists(), "a local path named test_live remains below cluster"
-
-
-def test_helm_render_pin_for_a_found_cluster_issue_passes_without_a_waiver(
-    tmp_path: Path,
-) -> None:
-    completed, call_log = _run_checker(
-        tmp_path,
-        f"Closes #12\n\nFix pin: {CHART_SELECTOR}\n",
-        gh_labels=FOUND_CLUSTER_LABELS,
-    )
-
-    assert completed.returncode == 0, completed.stderr
-    assert json.loads(call_log.read_text(encoding="utf-8")) == [
-        "dev",
-        "verify-fix-pin",
-        "HEAD",
-        CHART_SELECTOR,
-    ]
-
-
-def test_unlabeled_bug_with_a_unit_pin_keeps_no_tier_floor(tmp_path: Path) -> None:
-    """Existing bugs without a found:* label keep the pre-#2243 behaviour."""
-    completed, call_log = _run_checker(
-        tmp_path,
-        f"Closes #12\n\nFix pin: {VALID_SELECTOR}\n",
-        gh_labels=BUG_LABELS,
-    )
-
-    assert completed.returncode == 0, completed.stderr
-    assert call_log.exists(), "an unlabeled bug must still verify a declared selector"
-
-
-def test_waiver_without_a_reason_fails_closed_without_calling_curie(tmp_path: Path) -> None:
-    completed, call_log = _run_checker(
-        tmp_path,
-        f"Closes #12\n\nFix pin: {VALID_SELECTOR}\nFix pin waiver:\n",
-        gh_labels=FOUND_LIVE_LABELS,
-    )
-
-    assert completed.returncode != 0, f"{completed.stdout}\n{completed.stderr}"
-    assert "Fix pin waiver" in completed.stderr
-    assert not call_log.exists(), "an unexplained waiver must not reach curie"
-
-
-def test_duplicate_waiver_lines_fail_closed_without_calling_curie(tmp_path: Path) -> None:
-    completed, call_log = _run_checker(
-        tmp_path,
-        (
-            f"Closes #12\n\nFix pin: {VALID_SELECTOR}\n"
-            "Fix pin waiver: first\n"
-            "Fix pin waiver: second\n"
-        ),
-        gh_labels=FOUND_LIVE_LABELS,
-    )
-
-    assert completed.returncode != 0, f"{completed.stdout}\n{completed.stderr}"
-    assert "Fix pin waiver" in completed.stderr
-    assert not call_log.exists(), "duplicate waivers must not reach curie"
-
-
-def test_pin_tier_comes_from_selector_location_not_from_prose(tmp_path: Path) -> None:
-    completed, call_log = _run_checker(
-        tmp_path,
-        (
-            f"Closes #12\n\nThis pin is a live Slack test.\n"
-            f"Fix pin: {VALID_SELECTOR}\n"
-        ),
-        gh_labels=FOUND_LIVE_LABELS,
-    )
-    shown = f"{completed.stdout}\n{completed.stderr}"
-
-    assert completed.returncode != 0, shown
-    assert "unit" in completed.stderr, shown
-    assert not call_log.exists(), "prose claiming a higher tier must not raise the pin"
-
-
-def test_found_live_in_the_issue_body_without_the_label_still_raises_the_floor(
-    tmp_path: Path,
-) -> None:
-    completed, call_log = _run_checker(
-        tmp_path,
-        f"Closes #12\n\nFix pin: {VALID_SELECTOR}\n",
-        gh_labels=BUG_LABELS,
-        gh_body="### Discovery surface\n\nfound:live\n",
-    )
-    shown = f"{completed.stdout}\n{completed.stderr}"
-
-    assert completed.returncode != 0, shown
-    assert "found:live" in completed.stderr, shown
-    assert not call_log.exists()
-
-
-def test_found_live_mentioned_in_issue_prose_does_not_raise_the_floor(
-    tmp_path: Path,
-) -> None:
-    completed, call_log = _run_checker(
-        tmp_path,
-        f"Closes #12\n\nFix pin: {VALID_SELECTOR}\n",
-        gh_labels=BUG_LABELS,
-        gh_body=(
-            "### Discovery surface\n\nfound:unit\n\n"
-            "### What happened\n\nThis was not found:live; it failed in pytest.\n"
-        ),
-    )
-
-    assert completed.returncode == 0, completed.stderr
-    assert call_log.exists(), "narrative found:* mentions must not raise the floor"
-
-
-def test_strictest_found_label_across_closed_bugs_is_the_floor(tmp_path: Path) -> None:
-    """A fake gh returns one label list; the gate must still fail on found:live."""
+def test_issue_discovery_field_does_not_require_a_higher_pin(tmp_path: Path) -> None:
     completed, call_log = _run_checker(
         tmp_path,
         f"Closes #12, #13\n\nFix pin: {VALID_SELECTOR}\n",
         gh_labels='["bug", "found:unit", "found:live"]',
+        gh_body="### Discovery surface\n\nfound:live\n",
     )
-    shown = f"{completed.stdout}\n{completed.stderr}"
-
-    assert completed.returncode != 0, shown
-    assert "found:live" in completed.stderr, shown
-    assert not call_log.exists()
+    assert completed.returncode == 0, completed.stderr
+    assert call_log.exists()
 
 
 def test_python_suite_collects_the_fix_pin_gate_tests() -> None:
@@ -1874,10 +2506,6 @@ def test_bug_report_template_records_the_discovery_surface() -> None:
         assert label in template, f"bug template must name {label}"
 
 
-def test_pull_request_template_documents_the_tier_waiver() -> None:
-    template = PR_TEMPLATE.read_text(encoding="utf-8")
-    assert "Fix pin waiver: <reason>" in template
-    assert "found:live" in template
 
 
 MAIN_MILESTONE = "v0.8.5"
@@ -2003,9 +2631,7 @@ def _invalid_prerequisite_payload(case: str) -> str:
         "invalid json",
     ],
 )
-def test_invalid_direct_prerequisite_refuses_before_curie(
-    tmp_path: Path, case: str
-) -> None:
+def test_invalid_direct_prerequisite_refuses_before_curie(tmp_path: Path, case: str) -> None:
     completed, call_log = _run_checker(
         tmp_path,
         f"Closes #12\n\nFix pin: {LOCAL_SELECTOR}\n",

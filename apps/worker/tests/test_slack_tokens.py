@@ -1,6 +1,6 @@
 """Which bot token each Slack identity replies with (ADR-0168 decision 5).
 
-`slack_bot_tokens` reads the tokens the chart hands the worker, and
+`slack_bot_tokens` reads the tokens the chart hands the gateway, and
 `token_identity` names the identity a Slack route's calls authenticate as. No
 Slack and no Valkey.
 """
@@ -13,8 +13,7 @@ from collections.abc import Iterator, Mapping
 
 import pytest
 from aci_protocol.turn import CLUSTER_MESSAGE_ADAPTER
-from curie_worker.config import WorkerConfig
-from curie_worker.slack_tokens import slack_bot_tokens, token_identity
+from curie_channel_gateway.slack.tokens import SlackProviderConfig, slack_bot_tokens, token_identity
 
 _DEFAULT_TOKEN = "xoxb-default-sentinel"
 _OPS_TOKEN = "xoxb-ops-bot-sentinel"
@@ -59,11 +58,11 @@ class _RecordingEnv(Mapping[str, str]):
 
 def _config(
     *, declared: list[dict[str, object]] | None = None, default_token: str = _DEFAULT_TOKEN
-) -> WorkerConfig:
+) -> SlackProviderConfig:
     kwargs: dict[str, object] = {"slack_bot_token": default_token}
     if declared is not None:
         kwargs["slack_identities"] = json.dumps(declared)
-    return WorkerConfig(**kwargs)  # type: ignore[arg-type]
+    return SlackProviderConfig(**kwargs)  # type: ignore[arg-type]
 
 
 def test_a_stock_install_holds_the_default_token_alone_and_reads_no_env() -> None:
@@ -97,7 +96,7 @@ def test_an_identity_with_a_blank_bot_token_is_named_and_left_out(
 ) -> None:
     env = _RecordingEnv({"CURIE_SLACK_BOT_TOKEN__1": "  "})
 
-    with caplog.at_level(logging.ERROR, logger="curie_worker.slack_tokens"):
+    with caplog.at_level(logging.ERROR, logger="curie_channel_gateway.slack.tokens"):
         tokens = slack_bot_tokens(_config(declared=_DECLARED), environ=env)
 
     assert tokens == {"default": _DEFAULT_TOKEN}

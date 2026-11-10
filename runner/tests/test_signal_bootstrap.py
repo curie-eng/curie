@@ -40,7 +40,14 @@ def _wire_process_dependencies(monkeypatch: pytest.MonkeyPatch) -> None:
         model="fake-model",
         port=8080,
         harness="claude",
-        runner_token=None,
+        # A real token, not the dev flag: this drives production boot (#3821).
+        runner_token="runner-test-token",
+        allow_tokenless=False,
+        # _serve reads the workspace snapshotter's trusted origin off every
+        # RunnerConfig (config.py); mirror the fields so the stub keeps the
+        # production boot contract's shape.
+        repo_origin=None,
+        repo_path=None,
     )
     monkeypatch.setenv("CURIE_FAKE_MODEL", "1")
     monkeypatch.setattr(RunnerConfig, "from_env", lambda _env: config)
@@ -210,6 +217,7 @@ def test_runner_turn_records_declared_metrics_through_configured_provider() -> N
     provider = MeterProvider(metric_readers=[reader], shutdown_on_exit=False)
     configure_meter_provider(provider)
     runner = SessionRunner(
+        max_usd_per_day=None,
         held_secrets=frozenset(),
         session_factory=FakeModelSession,
         ceiling=0,

@@ -74,7 +74,14 @@ def _hook(client: TestClient, agent_id: str, query: str, delivery_id: str) -> An
     body = b"{}"
     secret = derive(get_settings().api_key, agent_id=agent_id, generation=0)
     timestamp = str(int(time.time()))
-    signature = sign(secret, timestamp=timestamp, delivery_id=delivery_id, body=body)
+    signature = sign(
+        secret,
+        timestamp=timestamp,
+        delivery_id=delivery_id,
+        hook="issues",
+        tool_access=None,
+        body=body,
+    )
     return client.post(
         f"/hooks/{agent_id}/issues?{query}",
         content=body,

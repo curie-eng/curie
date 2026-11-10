@@ -38,14 +38,20 @@ import time
 import uuid
 from dataclasses import replace
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
-from aci_protocol import Final, QueuedTurn, SessionStatus, TextDelta
-from curie_dispatcher.queue import to_stream_fields
-from curie_worker import kernel as kernel_module
-from curie_worker.consumer import Consumer
+import pytest
+import redis.exceptions
+from aci_protocol import Final, QueuedTurn, SessionStatus, SideEffectFlag, TextDelta
+from aiohttp import web
+from curie_internal.turn_queue import to_stream_fields
+from curie_worker.consumer import Consumer, refuse_unconfigured_reminder
 from curie_worker.consumer_liveness import ConsumerLivenessStore, consumer_heartbeat_key
 from curie_worker.delivery_lease import DeliveryLeaseStore
+from curie_worker.kernel import attempt as kernel_attempt
+from curie_worker.kernel import log as kernel_log
+from curie_worker.kernel.routing import _thread_key_for
 
 from .conftest import _failing_process_event, _pending_rows, _ProcessEventSpy
 
@@ -73,6 +79,357 @@ _LEASE_KNOBS: dict[str, object] = {
     "delivery_lease_heartbeat_s": _HEARTBEAT_S,
     "runner_total_timeout_s": 30.0,
 }
+
+
+@pytest.mark.parametrize("settles", [True, False])
+@pytest.mark.parametrize("previous_watch", [True, False])
+def test_handoff_refusals_wait_without_spending_deliveries(
+    make_harness, settles: bool, previous_watch: bool
+) -> None:
+    async def go() -> None:
+        async with make_harness(**_LEASE_KNOBS, max_delivery=2) as h:
+            store = DeliveryLeaseStore(h.async_redis, h.config)
+            consumer = Consumer(
+                redis=h.async_redis,
+                kernel=h.kernel,
+                config=h.config,
+                leases=store,
+                reminders=refuse_unconfigured_reminder,
+            )
+            await consumer.ensure_group()
+            event = _qevent("recover", thread="handoff-wait", event_id="handoff-wait")
+            handle = h.substrate.claim(
+                _thread_key_for(event),
+                env={
+                    "CURIE_RUNNER_TOKEN": "recovery-test-token",
+                    **({} if previous_watch else {"CURIE_MAX_TURNS": "1"}),
+                },
+            )
+            h.runner.history_durable = False
+            h.runner.session_status = DONE.value
+            await h.async_redis.xadd(h.config.stream, to_stream_fields(event))
+            entry_id, fields = await _read_one(h, h.config.consumer_name)
+            if previous_watch:
+                old = await store.acquire(
+                    h.config.stream,
+                    h.config.consumer_group,
+                    entry_id,
+                    consumer=h.config.consumer_name,
+                )
+                await h.kernel._markers.watch_turn(
+                    _thread_key_for(event), handle.claim_name, old, event.event_id
+                )
+                await store.release(
+                    old.stream,
+                    old.group,
+                    old.entry_id,
+                    owner=old.owner,
+                    resume_event_id=None,
+                )
+            watched = await h.kernel._markers.watched_turn(handle.claim_name)
+            seconds, micros = await h.async_redis.time()
+            await h.async_redis.hset(
+                h.config.delivery_state_key(h.config.stream, h.config.consumer_group, entry_id),
+                "deadline_ms",
+                seconds * 1000 + micros // 1000 + 6000,
+            )
+            await consumer._dispatch(entry_id, fields)
+            try:
+                await _wait_until(lambda: len(h.runner.status_headers) >= 8)
+                assert (await _pending_rows(h))[entry_id] == 1
+                assert await h.async_redis.xlen(h.config.dead_letter_stream_name()) == 0
+                assert h.runner.opened == []
+                assert await h.kernel._markers.watched_turn(handle.claim_name) == watched
+                if settles:
+                    h.runner.history_durable = True
+                    h.runner.default_script = [Final(text="recovered", status=DONE)]
+                await asyncio.wait_for(_settle(consumer), timeout=5)
+                assert await _pending_rows(h) == {}
+                assert await h.async_redis.xlen(h.config.dead_letter_stream_name()) == 0
+                if settles:
+                    assert h.runner.opened == ["recover"]
+                    assert h.sink.last_text == "recovered"
+                else:
+                    assert h.runner.opened == []
+                    assert "delivery deadline" in h.sink.last_text
+            finally:
+                consumer.request_stop()
+                await _settle(consumer)
+
+    asyncio.run(go())
+
+
+@pytest.mark.parametrize("durable", [True, False])
+def test_expired_worker_retires_a_wedged_static_claim(
+    make_harness, sync_redis, names, tmp_path: Path, durable: bool
+) -> None:
+    import json
+
+    from curie_test_support.static_shell import (
+        CONTROL_TOKEN,
+        FAKE_RUNNER_COMMAND,
+        SupervisorProcess,
+        make_shell_tls,
+        wait_gone,
+    )
+    from curie_worker.runner_client import RunnerClient
+    from curie_worker.sandbox import StaticPoolSandboxClient, StaticShellSlot, shell_ssl_context
+
+    class NoBundles:
+        def get(self, key: str) -> bytes:
+            raise AssertionError("this claim carries no bundle")
+
+    tls = make_shell_tls(tmp_path / "tls")
+    shell = SupervisorProcess(
+        slot="recovery",
+        tls=tls,
+        root=tmp_path / "shell",
+        runner_command=FAKE_RUNNER_COMMAND,
+        env={"CURIE_SUPERVISOR_SETTLE_TIMEOUT_SECONDS": "0.1"},
+    ).start()
+    client = StaticPoolSandboxClient(
+        slots=[StaticShellSlot("recovery", "localhost", shell.port, "test-pool")],
+        redis_client=sync_redis,
+        control_token=CONTROL_TOKEN,
+        ssl_context=shell_ssl_context(str(tls.ca)),
+        bundle_store=NoBundles(),
+        key_prefix=names["sandbox_prefix"],
+        allow_unisolated_shells=True,
+    )
+
+    async def go() -> None:
+        async with make_harness(
+            **_LEASE_KNOBS,
+            sandbox_client=client,
+            abandoned_turn_grace_s=0.05,
+        ) as h:
+            event = _qevent("wedged", event_id="wedged")
+            thread = _thread_key_for(event)
+            records = tmp_path / "records"
+            handle = await asyncio.to_thread(
+                h.substrate.claim,
+                thread,
+                env={
+                    "CURIE_RUNNER_TOKEN": "static-recovery-test-token",
+                    "FAKE_RECORD_DIR": str(records),
+                    "FAKE_DURABLE": "1" if durable else "0",
+                    "FAKE_STATUS_BODY": json.dumps(
+                        {"turn_active": True, "history_durable": durable}
+                    ),
+                },
+            )
+            store = DeliveryLeaseStore(h.async_redis, h.config)
+            consumer = Consumer(
+                redis=h.async_redis,
+                kernel=h.kernel,
+                config=h.config,
+                leases=store,
+                reminders=refuse_unconfigured_reminder,
+            )
+            await consumer.ensure_group()
+            await h.async_redis.xadd(h.config.stream, to_stream_fields(event))
+            entry, _fields = await _read_one(h, h.config.consumer_name)
+            lease = await store.acquire(
+                h.config.stream,
+                h.config.consumer_group,
+                entry,
+                consumer=h.config.consumer_name,
+            )
+            await h.kernel._markers.watch_turn(thread, handle.claim_name, lease, event.event_id)
+            async with RunnerClient(ssl_context=shell_ssl_context(str(tls.ca))) as runner:
+                h.kernel._runner = runner
+                assert await h.kernel.reap_orphans() == []
+                assert shell.shell()["claim"]["name"] == handle.claim_name
+                await store.release(
+                    lease.stream,
+                    lease.group,
+                    lease.entry_id,
+                    owner=lease.owner,
+                    resume_event_id=None,
+                )
+                assert await h.kernel.reap_orphans() == []
+                async with asyncio.timeout(10):
+                    while not await h.kernel.reap_orphans():
+                        pass
+                assert h.substrate.lookup(thread) is None
+                assert shell.shell()["state"] == "quarantined"
+                state = sync_redis.hget(f"{names['sandbox_prefix']}:static:slot:recovery", "state")
+                assert state == "quarantined"
+                assert wait_gone(int((records / "pid").read_text()), 5)
+                assert wait_gone(int((records / "grandchild").read_text()), 5)
+                assert await h.kernel._markers.watched_turns() == {}
+
+    try:
+        asyncio.run(go())
+    finally:
+        shell.stop()
+
+
+def test_twenty_nine_second_ownership_outage_preserves_the_whole_live_turn(
+    make_harness, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """ADR 0207: one live turn survives faults in all three ownership writes.
+
+    Production TTL/heartbeat/outage clocks are configured at scale 0.1.
+    Wrappers only raise transport errors; every successful write still reaches
+    real Valkey. This pin reaches the old raising-renewal and marker paths
+    without depending on any new implementation field.
+    """
+
+    async def go() -> None:
+        async with make_harness(
+            delivery_budget_s=60.0,
+            delivery_lease_ttl_s=4.5,
+            delivery_lease_heartbeat_s=1.0,
+            consumer_heartbeat_ttl_ms=4500,
+            consumer_capability_ttl_ms=9000,
+            runner_total_timeout_s=30.0,
+            read_block_ms=10,
+        ) as h:
+            leases = DeliveryLeaseStore(h.async_redis, h.config)
+            consumer = Consumer(
+                redis=h.async_redis, kernel=h.kernel, config=h.config, leases=leases,
+                reminders=refuse_unconfigured_reminder,
+            )
+            liveness = consumer._liveness_store
+            assert liveness is not None
+            spy = _ProcessEventSpy(h.kernel)
+            hold = asyncio.Event()
+            h.runner.hold = hold
+            h.runner.default_script = [TextDelta(text="working")]
+            h.runner.tail = [SideEffectFlag(tool="deploy"), Final(text="completed", status=DONE)]
+            until: float | None = None
+            outage_started: float | None = None
+            attempts = {"delivery": 0, "liveness": 0, "marker": 0}
+            failures = {"delivery": 0, "liveness": 0, "marker": 0}
+            recovered = {lane: asyncio.Event() for lane in attempts}
+            final_allowed = asyncio.Event()
+            ready = {lane: asyncio.Event() for lane in ("delivery", "liveness")}
+            renewals: dict[str, list[float]] = {lane: [] for lane in ready}
+            marker_entered = asyncio.Event()
+            actions = 0
+            real_heartbeat = leases.heartbeat
+            real_renew = liveness.renew
+            real_marker = h.kernel._markers.mark_side_effect
+            real_action = h.kernel._record_action
+            real_runner_write = web.StreamResponse.write
+            final_payload = (h.runner.tail[-1].model_dump_json() + "\n").encode("utf-8")
+
+            async def held_runner_final(response: Any, data: bytes) -> None:
+                # Keep the model's real HTTP stream open until both ownership
+                # renewals confirm recovery. Marker success may precede the
+                # next normal renewal, and must not end the test turn early.
+                if data == final_payload:
+                    await final_allowed.wait()
+                await real_runner_write(response, data)
+
+            def unavailable(lane: str) -> None:
+                attempts[lane] += 1
+                if lane in renewals:
+                    renewals[lane].append(time.monotonic())
+                if until is not None and time.monotonic() < until:
+                    failures[lane] += 1
+                    raise redis.exceptions.ConnectionError("injected 29s ownership outage")
+
+            async def delivery(*args: Any, **kwargs: Any) -> Any:
+                unavailable("delivery")
+                result = await real_heartbeat(*args, **kwargs)
+                if until is not None:
+                    recovered["delivery"].set()
+                    if recovered["liveness"].is_set():
+                        final_allowed.set()
+                else:
+                    ready["delivery"].set()
+                return result
+
+            async def alive(**kwargs: Any) -> bool:
+                unavailable("liveness")
+                result = await real_renew(**kwargs)
+                if until is not None:
+                    recovered["liveness"].set()
+                    if recovered["delivery"].is_set():
+                        final_allowed.set()
+                else:
+                    ready["liveness"].set()
+                return result
+
+            async def marker(event_id: str) -> None:
+                marker_entered.set()
+                assert actions == 0, "the frame applied while its marker was unavailable"
+                unavailable("marker")
+                await real_marker(event_id)
+                recovered["marker"].set()
+
+            async def action(*args: Any, **kwargs: Any) -> None:
+                nonlocal actions
+                assert await h.kernel._markers.saw_side_effect(event.event_id)
+                actions += 1
+                await real_action(*args, **kwargs)
+
+            async def scaled_marker_sleep(delay: float) -> None:
+                await asyncio.sleep(delay * 0.1)
+
+            monkeypatch.setattr(leases, "heartbeat", delivery)
+            monkeypatch.setattr(liveness, "renew", alive)
+            monkeypatch.setattr(h.kernel._markers, "mark_side_effect", marker)
+            monkeypatch.setattr(h.kernel, "_record_action", action)
+            monkeypatch.setattr(web.StreamResponse, "write", held_runner_final)
+            monkeypatch.setattr(
+                kernel_attempt,
+                "asyncio",
+                SimpleNamespace(**{**vars(asyncio), "sleep": scaled_marker_sleep}),
+            )
+            await consumer.ensure_group()
+            event = _qevent("ride through", thread="outage-ride-through", event_id=uuid.uuid4().hex)
+            entry_id = await h.async_redis.xadd(h.config.stream, to_stream_fields(event))
+            task = asyncio.create_task(consumer.run())
+            try:
+                await _wait_until(lambda: h.runner.turn_active)
+                await asyncio.wait_for(
+                    asyncio.gather(*(flag.wait() for flag in ready.values())), timeout=2.0
+                )
+                outage_started = time.monotonic()
+                until = outage_started + 2.9
+                # The side-effect frame arrives five seconds into the outage.
+                await asyncio.sleep(0.5)
+                hold.set()
+                await asyncio.wait_for(marker_entered.wait(), timeout=0.2)
+                assert actions == 0
+                await _wait_until(lambda: h.sink.last_text == "completed", timeout=8.0)
+                await _wait_until(lambda: not consumer._inflight_ids)
+                assert not task.done(), "the consumer canceled a healthy in-flight turn"
+                assert all(count >= 1 for count in failures.values())
+                assert failures["delivery"] == failures["liveness"] == 2
+                for lane in renewals:
+                    during = [
+                        instant - outage_started
+                        for instant in renewals[lane]
+                        if instant >= outage_started
+                    ]
+                    assert during[:3] == pytest.approx([1.0, 2.0, 3.0], abs=0.07)
+                assert all(flag.is_set() for flag in recovered.values())
+                assert actions == 1
+                held = spy.leases_for(event.event_id)
+                assert len(held) == 1 and held[0] is not None
+                assert not held[0].lost.is_set()
+                assert h.runner.opened == [event.text]
+                assert h.runner.interrupts == 0
+                assert await h.kernel._markers.saw_side_effect(event.event_id)
+                assert await h.async_redis.exists(h.config.done_key(event.event_id))
+                assert entry_id not in await _pending_rows(h)
+                completions = [c for c in h.sink.completions if c.event_id == event.event_id]
+                assert len(completions) == 1 and completions[0].outcome == "delivered"
+                assert not any(
+                    "ConsumerLivenessExpired" in message or "owner_lost" in message
+                    for message in caplog.messages
+                )
+            finally:
+                final_allowed.set()
+                hold.set()
+                consumer.request_stop()
+                await asyncio.wait_for(task, timeout=5.0)
+
+    asyncio.run(go())
 
 
 async def _read_one(h: Any, consumer_name: str) -> tuple[str, dict[str, str]]:
@@ -114,12 +471,12 @@ def test_a_second_replica_is_refused_while_the_first_holds_a_live_lease(
             store = DeliveryLeaseStore(h.async_redis, h.config)
             cfg_a = h.config.model_copy(update={"consumer_name": "worker-a"})
             cfg_b = h.config.model_copy(update={"consumer_name": "worker-b"})
-            consumer_a = Consumer(
-                redis=h.async_redis, kernel=h.kernel, config=cfg_a, leases=store
-            )
-            consumer_b = Consumer(
-                redis=h.async_redis, kernel=h.kernel, config=cfg_b, leases=store
-            )
+            consumer_a = Consumer(redis=h.async_redis, kernel=h.kernel, config=cfg_a, leases=store,
+                                  reminders=refuse_unconfigured_reminder,
+                         )
+            consumer_b = Consumer(redis=h.async_redis, kernel=h.kernel, config=cfg_b, leases=store,
+                                  reminders=refuse_unconfigured_reminder,
+                         )
             await consumer_a.ensure_group()
             spy = _ProcessEventSpy(h.kernel)
 
@@ -192,12 +549,12 @@ def test_distinct_approval_resume_deliveries_run_once_while_first_turn_is_live(
             store = DeliveryLeaseStore(h.async_redis, h.config)
             cfg_a = h.config.model_copy(update={"consumer_name": "resume-worker-a"})
             cfg_b = h.config.model_copy(update={"consumer_name": "resume-worker-b"})
-            consumer_a = Consumer(
-                redis=h.async_redis, kernel=h.kernel, config=cfg_a, leases=store
-            )
-            consumer_b = Consumer(
-                redis=h.async_redis, kernel=h.kernel, config=cfg_b, leases=store
-            )
+            consumer_a = Consumer(redis=h.async_redis, kernel=h.kernel, config=cfg_a, leases=store,
+                                  reminders=refuse_unconfigured_reminder,
+                         )
+            consumer_b = Consumer(redis=h.async_redis, kernel=h.kernel, config=cfg_b, leases=store,
+                                  reminders=refuse_unconfigured_reminder,
+                         )
             await consumer_a.ensure_group()
 
             hold = asyncio.Event()
@@ -205,15 +562,9 @@ def test_distinct_approval_resume_deliveries_run_once_while_first_turn_is_live(
             h.runner.default_script = [TextDelta(text="working")]
             h.runner.tail = [Final(text="approved work finished", status=DONE)]
             event_id = f"approval-{uuid.uuid4()}-resolved"
-            resume = _qevent(
-                "continue approved work", thread="resume-2832", event_id=event_id
-            )
-            first_id = await h.async_redis.xadd(
-                h.config.stream, to_stream_fields(resume)
-            )
-            second_id = await h.async_redis.xadd(
-                h.config.stream, to_stream_fields(resume)
-            )
+            resume = _qevent("continue approved work", thread="resume-2832", event_id=event_id)
+            first_id = await h.async_redis.xadd(h.config.stream, to_stream_fields(resume))
+            second_id = await h.async_redis.xadd(h.config.stream, to_stream_fields(resume))
             assert first_id != second_id
 
             read_first_id, first_fields = await _read_one(h, "resume-worker-a")
@@ -241,9 +592,7 @@ def test_distinct_approval_resume_deliveries_run_once_while_first_turn_is_live(
             assert first_id not in await _pending_rows(h)
             assert await h.async_redis.exists(h.config.done_key(event_id))
 
-            third_id = await h.async_redis.xadd(
-                h.config.stream, to_stream_fields(resume)
-            )
+            third_id = await h.async_redis.xadd(h.config.stream, to_stream_fields(resume))
             read_third_id, third_fields = await _read_one(h, cfg_b.consumer_name)
             assert read_third_id == third_id
             await consumer_b._dispatch(third_id, third_fields)
@@ -273,18 +622,16 @@ def test_approval_resume_claim_renews_then_releases_after_owner_failure(
             store = DeliveryLeaseStore(h.async_redis, h.config)
             cfg_a = h.config.model_copy(update={"consumer_name": "resume-failure-a"})
             cfg_b = h.config.model_copy(update={"consumer_name": "resume-failure-b"})
-            consumer_a = Consumer(
-                redis=h.async_redis, kernel=h.kernel, config=cfg_a, leases=store
-            )
-            consumer_b = Consumer(
-                redis=h.async_redis, kernel=h.kernel, config=cfg_b, leases=store
-            )
+            consumer_a = Consumer(redis=h.async_redis, kernel=h.kernel, config=cfg_a, leases=store,
+                                  reminders=refuse_unconfigured_reminder,
+                         )
+            consumer_b = Consumer(redis=h.async_redis, kernel=h.kernel, config=cfg_b, leases=store,
+                                  reminders=refuse_unconfigured_reminder,
+                         )
             await consumer_a.ensure_group()
 
             event_id = f"approval-{uuid.uuid4()}-resolved"
-            resume = _qevent(
-                "retry approved work", thread="resume-retry", event_id=event_id
-            )
+            resume = _qevent("retry approved work", thread="resume-retry", event_id=event_id)
             first_id = await h.async_redis.xadd(h.config.stream, to_stream_fields(resume))
             second_id = await h.async_redis.xadd(h.config.stream, to_stream_fields(resume))
             read_first_id, first_fields = await _read_one(h, cfg_a.consumer_name)
@@ -360,29 +707,22 @@ def test_reclaimed_sole_resume_entry_takes_over_a_stale_event_claim(
     """
 
     async def go() -> None:
-        async with make_harness(
-            **{**_LEASE_KNOBS, "delivery_lease_ttl_s": 5.0}
-        ) as h:
+        async with make_harness(**{**_LEASE_KNOBS, "delivery_lease_ttl_s": 5.0}) as h:
             store = DeliveryLeaseStore(h.async_redis, h.config)
             replacement_name = "resume-replacement"
-            replacement_config = h.config.model_copy(
-                update={"consumer_name": replacement_name}
-            )
+            replacement_config = h.config.model_copy(update={"consumer_name": replacement_name})
             replacement = Consumer(
                 redis=h.async_redis,
                 kernel=h.kernel,
                 config=replacement_config,
                 leases=store,
+                reminders=refuse_unconfigured_reminder,
             )
             await replacement.ensure_group()
 
             event_id = f"approval-{uuid.uuid4()}-resolved"
-            resume = _qevent(
-                "resume after crash", thread="resume-crash", event_id=event_id
-            )
-            entry_id = await h.async_redis.xadd(
-                h.config.stream, to_stream_fields(resume)
-            )
+            resume = _qevent("resume after crash", thread="resume-crash", event_id=event_id)
+            entry_id = await h.async_redis.xadd(h.config.stream, to_stream_fields(resume))
             read_id, fields = await _read_one(h, "crashed-owner")
             assert read_id == entry_id
             assert await h.async_redis.xlen(h.config.stream) == 1
@@ -394,17 +734,13 @@ def test_reclaimed_sole_resume_entry_takes_over_a_stale_event_claim(
                 consumer="crashed-owner",
             )
             assert await store.claim_resume(stale, event_id, consumer="crashed-owner")
-            claim_key = store._resume_key(
-                h.config.stream, h.config.consumer_group, event_id
-            )
+            claim_key = store._resume_key(h.config.stream, h.config.consumer_group, event_id)
             assert await h.async_redis.exists(claim_key)
 
             # A SIGKILL runs no release finally. Its delivery lease disappears,
             # while the separate event claim still names that dead owner.
             await h.async_redis.delete(
-                h.config.delivery_lease_key(
-                    h.config.stream, h.config.consumer_group, entry_id
-                )
+                h.config.delivery_lease_key(h.config.stream, h.config.consumer_group, entry_id)
             )
             assert await h.async_redis.exists(claim_key)
             await h.async_redis.xclaim(
@@ -452,9 +788,9 @@ def test_a_heartbeating_handler_holds_its_lease_without_burning_a_delivery(
     async def go() -> None:
         async with make_harness(**_LEASE_KNOBS) as h:
             store = DeliveryLeaseStore(h.async_redis, h.config)
-            consumer = Consumer(
-                redis=h.async_redis, kernel=h.kernel, config=h.config, leases=store
-            )
+            consumer = Consumer(redis=h.async_redis, kernel=h.kernel, config=h.config, leases=store,
+                                reminders=refuse_unconfigured_reminder,
+                       )
             await consumer.ensure_group()
 
             hold = asyncio.Event()
@@ -488,14 +824,13 @@ def test_a_heartbeating_handler_holds_its_lease_without_burning_a_delivery(
             # ~3x the lease TTL and ~10 heartbeat periods.
             deadline = time.monotonic() + 3.0
             while time.monotonic() < deadline:
-                assert await store.is_live(
-                    h.config.stream, h.config.consumer_group, renewed_id
-                ), "a healthy in-flight turn lost its lease: the heartbeat is not renewing"
+                assert await store.is_live(h.config.stream, h.config.consumer_group, renewed_id), (
+                    "a healthy in-flight turn lost its lease: the heartbeat is not renewing"
+                )
                 await asyncio.sleep(0.1)
 
             assert (
-                await store.is_live(h.config.stream, h.config.consumer_group, abandoned_id)
-                is False
+                await store.is_live(h.config.stream, h.config.consumer_group, abandoned_id) is False
             ), "the un-renewed sibling never expired, so the lease TTL is not real"
 
             after = (await _pending_rows(h))[renewed_id]
@@ -535,9 +870,9 @@ def test_a_dead_owners_delivery_transfers_only_after_expiry_and_keeps_its_deadli
     async def go() -> None:
         async with make_harness(**_LEASE_KNOBS) as h:
             store = DeliveryLeaseStore(h.async_redis, h.config)
-            consumer = Consumer(
-                redis=h.async_redis, kernel=h.kernel, config=h.config, leases=store
-            )
+            consumer = Consumer(redis=h.async_redis, kernel=h.kernel, config=h.config, leases=store,
+                                reminders=refuse_unconfigured_reminder,
+                       )
             await consumer.ensure_group()
             spy = _ProcessEventSpy(h.kernel)
             h.runner.default_script = [Final(text="recovered", status=DONE)]
@@ -567,9 +902,7 @@ def test_a_dead_owners_delivery_transfers_only_after_expiry_and_keeps_its_deadli
             assert entry_id in await _pending_rows(h)
 
             await asyncio.sleep(_TTL_S + 0.4)
-            assert (
-                await store.is_live(h.config.stream, h.config.consumer_group, entry_id) is False
-            )
+            assert await store.is_live(h.config.stream, h.config.consumer_group, entry_id) is False
 
             await consumer._dispatch(entry_id, dict(fields))
             await _settle(consumer)
@@ -612,9 +945,9 @@ def test_request_stop_stops_the_read_loop_but_never_the_heartbeat(make_harness) 
     async def go() -> None:
         async with make_harness(**_LEASE_KNOBS, reclaim_min_idle_ms=900000) as h:
             store = DeliveryLeaseStore(h.async_redis, h.config)
-            consumer = Consumer(
-                redis=h.async_redis, kernel=h.kernel, config=h.config, leases=store
-            )
+            consumer = Consumer(redis=h.async_redis, kernel=h.kernel, config=h.config, leases=store,
+                                reminders=refuse_unconfigured_reminder,
+                       )
             await consumer.ensure_group()
             spy = _ProcessEventSpy(h.kernel)
 
@@ -641,16 +974,12 @@ def test_request_stop_stops_the_read_loop_but_never_the_heartbeat(make_harness) 
             # requires. It must expire across the very same post-stop window, so
             # "the in-flight lease survived" is about the heartbeat.
             sibling_group = f"{h.config.consumer_group}-sib"
-            await h.async_redis.xgroup_create(
-                h.config.stream, sibling_group, id="0", mkstream=True
-            )
+            await h.async_redis.xgroup_create(h.config.stream, sibling_group, id="0", mkstream=True)
             sibling_rows = await h.async_redis.xreadgroup(
                 sibling_group, "sib-owner", {h.config.stream: ">"}, count=1
             )
             sibling_id = sibling_rows[0][1][0][0]
-            await store.acquire(
-                h.config.stream, sibling_group, sibling_id, consumer="sib-owner"
-            )
+            await store.acquire(h.config.stream, sibling_group, sibling_id, consumer="sib-owner")
 
             consumer.request_stop()
             # The read loop can still be parked inside a blocking XREADGROUP when
@@ -667,9 +996,9 @@ def test_request_stop_stops_the_read_loop_but_never_the_heartbeat(make_harness) 
             # ...while the in-flight lease is renewed across ~3 TTLs.
             deadline = time.monotonic() + 3.0
             while time.monotonic() < deadline:
-                assert await store.is_live(
-                    h.config.stream, h.config.consumer_group, entry_id
-                ), "request_stop() dropped the in-flight lease: the drain cannot finish"
+                assert await store.is_live(h.config.stream, h.config.consumer_group, entry_id), (
+                    "request_stop() dropped the in-flight lease: the drain cannot finish"
+                )
                 await asyncio.sleep(0.1)
 
             assert await store.is_live(h.config.stream, sibling_group, sibling_id) is False, (
@@ -710,9 +1039,9 @@ def test_a_hard_killed_owner_leaves_its_lease_to_expire_before_a_replacement_run
     async def go() -> None:
         async with make_harness(**_LEASE_KNOBS) as h:
             store = DeliveryLeaseStore(h.async_redis, h.config)
-            consumer = Consumer(
-                redis=h.async_redis, kernel=h.kernel, config=h.config, leases=store
-            )
+            consumer = Consumer(redis=h.async_redis, kernel=h.kernel, config=h.config, leases=store,
+                                reminders=refuse_unconfigured_reminder,
+                       )
             await consumer.ensure_group()
             spy = _ProcessEventSpy(h.kernel)
             h.runner.default_script = [Final(text="after the kill", status=DONE)]
@@ -751,7 +1080,7 @@ def test_a_hard_killed_owner_leaves_its_lease_to_expire_before_a_replacement_run
 # --- R6, the ACK half: a fenced-out owner may not settle ----------------------
 
 
-def test_an_owner_that_loses_its_lease_refuses_the_terminal_ack(make_harness) -> None:
+def test_an_owner_that_loses_its_lease_refuses_the_terminal_ack(make_harness, sync_redis) -> None:
     """AC4: lease loss prevents a stale owner ACKing.
 
     The ownership store is made to disagree with the owner mid-turn (the lease
@@ -772,9 +1101,9 @@ def test_an_owner_that_loses_its_lease_refuses_the_terminal_ack(make_harness) ->
     async def go() -> None:
         async with make_harness(**_LEASE_KNOBS, reclaim_min_idle_ms=900000) as h:
             store = DeliveryLeaseStore(h.async_redis, h.config)
-            consumer = Consumer(
-                redis=h.async_redis, kernel=h.kernel, config=h.config, leases=store
-            )
+            consumer = Consumer(redis=h.async_redis, kernel=h.kernel, config=h.config, leases=store,
+                                reminders=refuse_unconfigured_reminder,
+                       )
             await consumer.ensure_group()
             spy = _ProcessEventSpy(h.kernel)
 
@@ -789,7 +1118,9 @@ def test_an_owner_that_loses_its_lease_refuses_the_terminal_ack(make_harness) ->
             )
             entry_id, fields = await _read_one(h, h.config.consumer_name)
             await consumer._dispatch(entry_id, fields)
-            await _wait_until(lambda: h.runner.turn_active)
+            await _wait_until(
+                lambda: sync_redis.hget(consumer._waits._record("fence-1"), "order_started") == "1"
+            )
 
             lease = spy.leases_for("fence-1")[0]
             assert lease is not None, "the kernel was handed no lease"
@@ -806,9 +1137,7 @@ def test_an_owner_that_loses_its_lease_refuses_the_terminal_ack(make_harness) ->
 
             hold.set()
             await _settle(consumer)
-            assert entry_id in await _pending_rows(h), (
-                "a fenced-out owner acked the delivery"
-            )
+            assert entry_id in await _pending_rows(h), "a fenced-out owner acked the delivery"
 
             # POSITIVE CONTROL: an untouched delivery on the same consumer acks.
             h.runner.hold = None
@@ -846,9 +1175,9 @@ def test_a_transferred_delivery_inherits_the_remaining_budget_not_a_fresh_one(
     async def go() -> None:
         async with make_harness(**_LEASE_KNOBS) as h:
             store = DeliveryLeaseStore(h.async_redis, h.config)
-            consumer = Consumer(
-                redis=h.async_redis, kernel=h.kernel, config=h.config, leases=store
-            )
+            consumer = Consumer(redis=h.async_redis, kernel=h.kernel, config=h.config, leases=store,
+                                reminders=refuse_unconfigured_reminder,
+                       )
             await consumer.ensure_group()
             spy = _ProcessEventSpy(h.kernel)
             h.runner.default_script = [Final(text="ok", status=DONE)]
@@ -894,7 +1223,10 @@ def test_a_transferred_delivery_inherits_the_remaining_budget_not_a_fresh_one(
             # And the kernel receives the inherited budget, not a fresh one: the
             # replacement's delivery is what actually runs the turn.
             await store.release(
-                h.config.stream, h.config.consumer_group, entry_id, owner=lease_3.owner,
+                h.config.stream,
+                h.config.consumer_group,
+                entry_id,
+                owner=lease_3.owner,
                 resume_event_id=None,
             )
             await h.async_redis.xclaim(
@@ -944,38 +1276,32 @@ def test_an_already_expired_delivery_escalates_once_records_deadline_halted_and_
     """
 
     recorded: list[tuple[str, dict[str, str]]] = []
-    real_record_metric = kernel_module.record_metric
+    real_record_metric = kernel_log.record_metric
 
-    def spy(
-        name: str, value: float = 1, *, attributes: dict[str, str] | None = None
-    ) -> None:
+    def spy(name: str, value: float = 1, *, attributes: dict[str, str] | None = None) -> None:
         recorded.append((name, dict(attributes or {})))
         real_record_metric(name, value, attributes=attributes)
 
-    monkeypatch.setattr(kernel_module, "record_metric", spy)
+    monkeypatch.setattr(kernel_log, "record_metric", spy)
 
     async def go() -> None:
         async with make_harness(**_LEASE_KNOBS, reclaim_min_idle_ms=900000) as h:
             store = DeliveryLeaseStore(h.async_redis, h.config)
-            consumer = Consumer(
-                redis=h.async_redis, kernel=h.kernel, config=h.config, leases=store
-            )
+            consumer = Consumer(redis=h.async_redis, kernel=h.kernel, config=h.config, leases=store,
+                                reminders=refuse_unconfigured_reminder,
+                       )
             await consumer.ensure_group()
             h.runner.default_script = [Final(text="should-not-run", status=DONE)]
 
             await h.async_redis.xadd(
                 h.config.stream,
-                to_stream_fields(
-                    _qevent("expired", thread="deadline-1", event_id="deadline-1")
-                ),
+                to_stream_fields(_qevent("expired", thread="deadline-1", event_id="deadline-1")),
             )
             entry_id, fields = await _read_one(h, h.config.consumer_name)
             seconds, microseconds = await h.async_redis.time()
             now_ms = int(seconds) * 1000 + int(microseconds) // 1000
             await h.async_redis.hset(
-                h.config.delivery_state_key(
-                    h.config.stream, h.config.consumer_group, entry_id
-                ),
+                h.config.delivery_state_key(h.config.stream, h.config.consumer_group, entry_id),
                 mapping={"deadline_ms": str(now_ms - 1000)},
             )
 
@@ -991,22 +1317,14 @@ def test_an_already_expired_delivery_escalates_once_records_deadline_halted_and_
             assert [event.event for event, _route, _best in h.sink.events].count(
                 "turn.completed"
             ) == 1
-            assert [completion.outcome for completion in h.sink.completions] == [
-                "escalated"
-            ]
+            assert [completion.outcome for completion in h.sink.completions] == ["escalated"]
             assert await h.async_redis.exists(h.config.done_key("deadline-1"))
             assert entry_id not in await _pending_rows(h), (
                 "an expired delivery that already completed was left pending"
             )
 
-            completed = [
-                attrs
-                for name, attrs in recorded
-                if name == "curie.turn.completed"
-            ]
-            durations = [
-                attrs for name, attrs in recorded if name == "curie.turn.duration"
-            ]
+            completed = [attrs for name, attrs in recorded if name == "curie.turn.completed"]
+            durations = [attrs for name, attrs in recorded if name == "curie.turn.duration"]
             assert [attrs["outcome"] for attrs in completed] == ["deadline_halted"]
             assert [attrs["outcome"] for attrs in durations] == ["deadline_halted"]
 
@@ -1014,27 +1332,20 @@ def test_an_already_expired_delivery_escalates_once_records_deadline_halted_and_
             h.runner.default_script = [Final(text="fresh-ok", status=DONE)]
             await h.async_redis.xadd(
                 h.config.stream,
-                to_stream_fields(
-                    _qevent("fresh", thread="deadline-2", event_id="deadline-2")
-                ),
+                to_stream_fields(_qevent("fresh", thread="deadline-2", event_id="deadline-2")),
             )
             fresh_id, fresh_fields = await _read_one(h, h.config.consumer_name)
             await consumer._dispatch(fresh_id, fresh_fields)
             await _settle(consumer)
 
             assert h.sink.last_text == "fresh-ok"
-            assert [completion.outcome for completion in h.sink.completions][-1] == (
-                "delivered"
-            )
+            assert [completion.outcome for completion in h.sink.completions][-1] == ("delivered")
             assert fresh_id not in await _pending_rows(h)
             assert [
-                attrs["outcome"]
-                for name, attrs in recorded
-                if name == "curie.turn.completed"
+                attrs["outcome"] for name, attrs in recorded if name == "curie.turn.completed"
             ] == ["done"]
 
     asyncio.run(go())
-
 
 
 def test_a_deadline_halted_thread_accepts_a_followup_turn(make_harness) -> None:
@@ -1052,25 +1363,21 @@ def test_a_deadline_halted_thread_accepts_a_followup_turn(make_harness) -> None:
     async def go() -> None:
         async with make_harness(**_LEASE_KNOBS, reclaim_min_idle_ms=900000) as h:
             store = DeliveryLeaseStore(h.async_redis, h.config)
-            consumer = Consumer(
-                redis=h.async_redis, kernel=h.kernel, config=h.config, leases=store
-            )
+            consumer = Consumer(redis=h.async_redis, kernel=h.kernel, config=h.config, leases=store,
+                                reminders=refuse_unconfigured_reminder,
+                       )
             await consumer.ensure_group()
             h.runner.default_script = [Final(text="should-not-run", status=DONE)]
 
             await h.async_redis.xadd(
                 h.config.stream,
-                to_stream_fields(
-                    _qevent("expired", thread="deadline-follow", event_id="halted-1")
-                ),
+                to_stream_fields(_qevent("expired", thread="deadline-follow", event_id="halted-1")),
             )
             entry_id, fields = await _read_one(h, h.config.consumer_name)
             seconds, microseconds = await h.async_redis.time()
             now_ms = int(seconds) * 1000 + int(microseconds) // 1000
             await h.async_redis.hset(
-                h.config.delivery_state_key(
-                    h.config.stream, h.config.consumer_group, entry_id
-                ),
+                h.config.delivery_state_key(h.config.stream, h.config.consumer_group, entry_id),
                 mapping={"deadline_ms": str(now_ms - 1000)},
             )
 
@@ -1094,9 +1401,7 @@ def test_a_deadline_halted_thread_accepts_a_followup_turn(make_harness) -> None:
             assert h.sink.last_text == "follow-up-ok"
             assert await h.async_redis.exists(h.config.done_key("follow-1"))
             pending = await h.async_redis.scard(h.config.completions_pending_key())
-            assert int(pending) == 0, (
-                "the follow-up left owed completions on the delivery plane"
-            )
+            assert int(pending) == 0, "the follow-up left owed completions on the delivery plane"
 
     asyncio.run(go())
 
@@ -1182,7 +1487,9 @@ async def _fenced_failing_consumer(h: Any) -> tuple[Consumer, DeliveryLeaseStore
     store at all) builds its own ``Consumer`` instead of calling this.
     """
     store = DeliveryLeaseStore(h.async_redis, h.config)
-    consumer = Consumer(redis=h.async_redis, kernel=h.kernel, config=h.config, leases=store)
+    consumer = Consumer(redis=h.async_redis, kernel=h.kernel, config=h.config, leases=store,
+                        reminders=refuse_unconfigured_reminder,
+               )
     await consumer.ensure_group()
     attempts = _failing_process_event(h)
     return consumer, store, attempts
@@ -1203,11 +1510,12 @@ async def _lease_expired_row(
         to_stream_fields(_qevent(event_id, thread=event_id, event_id=event_id)),
     )
     entry_id, fields = await _read_one(h, owner)
-    lease = await store.acquire(
-        h.config.stream, h.config.consumer_group, entry_id, consumer=owner
-    )
+    lease = await store.acquire(h.config.stream, h.config.consumer_group, entry_id, consumer=owner)
     await store.release(
-        h.config.stream, h.config.consumer_group, entry_id, owner=lease.owner,
+        h.config.stream,
+        h.config.consumer_group,
+        entry_id,
+        owner=lease.owner,
         resume_event_id=None,
     )
     return entry_id, fields
@@ -1243,9 +1551,7 @@ async def _prove_peer_dead(h: Any, consumer: Consumer, peer: str) -> None:
     await asyncio.sleep(h.config.consumer_heartbeat_ttl_ms / 1000 + 0.02)
 
 
-def _synchronize_first_eligibility_read(
-    consumer: Consumer, barrier: asyncio.Barrier
-) -> None:
+def _synchronize_first_eligibility_read(consumer: Consumer, barrier: asyncio.Barrier) -> None:
     """Barrier the FIRST ``_lease_is_live`` per consumer; the re-read runs free.
 
     A plain ``asyncio.gather`` does not force the interleaving the AC4 tests are
@@ -1390,9 +1696,7 @@ def test_a_live_lease_is_never_reclaimed_by_the_expiry_pass(make_harness) -> Non
             )
             await h.async_redis.pexpire(lease_key, 60000)
             before = (await _pending_rows(h))[entry_id]
-            await _arm_pel_idle(
-                h, entry_id, owner="live-peer", idle_ms=_EXPIRY_IDLE_MS + 200
-            )
+            await _arm_pel_idle(h, entry_id, owner="live-peer", idle_ms=_EXPIRY_IDLE_MS + 200)
 
             assert await consumer._reclaim_once() == 0
             assert attempts == []
@@ -1427,9 +1731,9 @@ def test_the_runs_lane_carries_the_configured_lease_expiry_threshold(
     async def go() -> None:
         async with make_harness(**_EXPIRY_KNOBS) as h:
             store = DeliveryLeaseStore(h.async_redis, h.config)
-            consumer = Consumer(
-                redis=h.async_redis, kernel=h.kernel, config=h.config, leases=store
-            )
+            consumer = Consumer(redis=h.async_redis, kernel=h.kernel, config=h.config, leases=store,
+                                reminders=refuse_unconfigured_reminder,
+                       )
 
             assert h.config.lease_expired_idle_ms_value() == _EXPIRY_IDLE_MS
             assert consumer._delivery.lease_expired_idle_ms == _EXPIRY_IDLE_MS
@@ -1462,26 +1766,19 @@ def test_an_entry_with_no_delivery_state_stays_on_the_backstop(make_harness) -> 
 
             await h.async_redis.xadd(
                 h.config.stream,
-                to_stream_fields(
-                    _qevent("legacy", thread="legacy-1", event_id="legacy-1")
-                ),
+                to_stream_fields(_qevent("legacy", thread="legacy-1", event_id="legacy-1")),
             )
             legacy_id, _legacy_fields = await _read_one(h, "legacy-peer")
-            assert (
-                await store.peek(h.config.stream, h.config.consumer_group, legacy_id)
-                == {}
-            ), "the legacy row carries delivery state, so it is not the legacy shape"
+            assert await store.peek(h.config.stream, h.config.consumer_group, legacy_id) == {}, (
+                "the legacy row carries delivery state, so it is not the legacy shape"
+            )
 
             new_id, _new_fields = await _lease_expired_row(
                 h, store, event_id="new-1", owner="lease-aware-peer"
             )
             before = await _pending_rows(h)
-            await _arm_pel_idle(
-                h, legacy_id, owner="legacy-peer", idle_ms=_EXPIRY_IDLE_MS + 200
-            )
-            await _arm_pel_idle(
-                h, new_id, owner="lease-aware-peer", idle_ms=_EXPIRY_IDLE_MS + 200
-            )
+            await _arm_pel_idle(h, legacy_id, owner="legacy-peer", idle_ms=_EXPIRY_IDLE_MS + 200)
+            await _arm_pel_idle(h, new_id, owner="lease-aware-peer", idle_ms=_EXPIRY_IDLE_MS + 200)
 
             assert await consumer._reclaim_once() == 1
             await _settle(consumer)
@@ -1519,9 +1816,7 @@ def test_an_unreadable_delivery_state_read_leaves_the_entry_on_the_backstop(
                 h, store, event_id="unreadable-1", owner="peer-one"
             )
             before = (await _pending_rows(h))[entry_id]
-            await _arm_pel_idle(
-                h, entry_id, owner="peer-one", idle_ms=_EXPIRY_IDLE_MS + 200
-            )
+            await _arm_pel_idle(h, entry_id, owner="peer-one", idle_ms=_EXPIRY_IDLE_MS + 200)
 
             readable = store.has_state
 
@@ -1580,12 +1875,12 @@ def test_two_replicas_reclaiming_the_same_expired_row_dispatch_it_once(
             store = DeliveryLeaseStore(h.async_redis, h.config)
             cfg_a = h.config.model_copy(update={"consumer_name": "worker-a"})
             cfg_b = h.config.model_copy(update={"consumer_name": "worker-b"})
-            consumer_a = Consumer(
-                redis=h.async_redis, kernel=h.kernel, config=cfg_a, leases=store
-            )
-            consumer_b = Consumer(
-                redis=h.async_redis, kernel=h.kernel, config=cfg_b, leases=store
-            )
+            consumer_a = Consumer(redis=h.async_redis, kernel=h.kernel, config=cfg_a, leases=store,
+                                  reminders=refuse_unconfigured_reminder,
+                         )
+            consumer_b = Consumer(redis=h.async_redis, kernel=h.kernel, config=cfg_b, leases=store,
+                                  reminders=refuse_unconfigured_reminder,
+                         )
             await consumer_a.ensure_group()
             attempts = _failing_process_event(h)
 
@@ -1593,9 +1888,7 @@ def test_two_replicas_reclaiming_the_same_expired_row_dispatch_it_once(
                 h, store, event_id="race-1", owner="departed-peer"
             )
             before = (await _pending_rows(h))[entry_id]
-            await _arm_pel_idle(
-                h, entry_id, owner="departed-peer", idle_ms=_EXPIRY_IDLE_MS + 200
-            )
+            await _arm_pel_idle(h, entry_id, owner="departed-peer", idle_ms=_EXPIRY_IDLE_MS + 200)
 
             barrier = asyncio.Barrier(2)
             _synchronize_first_eligibility_read(consumer_a, barrier)
@@ -1646,12 +1939,12 @@ def test_a_dead_consumer_pass_does_not_steal_a_row_the_expiry_pass_just_claimed(
             store = DeliveryLeaseStore(h.async_redis, h.config)
             cfg_a = h.config.model_copy(update={"consumer_name": "worker-a"})
             cfg_b = h.config.model_copy(update={"consumer_name": "worker-b"})
-            consumer_a = Consumer(
-                redis=h.async_redis, kernel=h.kernel, config=cfg_a, leases=store
-            )
-            consumer_b = Consumer(
-                redis=h.async_redis, kernel=h.kernel, config=cfg_b, leases=store
-            )
+            consumer_a = Consumer(redis=h.async_redis, kernel=h.kernel, config=cfg_a, leases=store,
+                                  reminders=refuse_unconfigured_reminder,
+                         )
+            consumer_b = Consumer(redis=h.async_redis, kernel=h.kernel, config=cfg_b, leases=store,
+                                  reminders=refuse_unconfigured_reminder,
+                         )
             await consumer_a.ensure_group()
             spy = _ProcessEventSpy(h.kernel)
 
@@ -1666,9 +1959,7 @@ def test_a_dead_consumer_pass_does_not_steal_a_row_the_expiry_pass_just_claimed(
             before = (await _pending_rows(h))[entry_id]
 
             await _prove_peer_dead(h, consumer_a, "dying-peer")
-            await _arm_pel_idle(
-                h, entry_id, owner="dying-peer", idle_ms=_EXPIRY_IDLE_MS + 200
-            )
+            await _arm_pel_idle(h, entry_id, owner="dying-peer", idle_ms=_EXPIRY_IDLE_MS + 200)
 
             b_claimed = asyncio.Event()
             consumer_a._redis = _ClaimGate(  # type: ignore[assignment]
@@ -1735,12 +2026,12 @@ def test_a_delayed_handoff_loses_the_row_to_a_peer_without_a_double_run(
             store = DeliveryLeaseStore(h.async_redis, h.config)
             cfg_a = h.config.model_copy(update={"consumer_name": "worker-a"})
             cfg_b = h.config.model_copy(update={"consumer_name": "worker-b"})
-            consumer_a = Consumer(
-                redis=h.async_redis, kernel=h.kernel, config=cfg_a, leases=store
-            )
-            consumer_b = Consumer(
-                redis=h.async_redis, kernel=h.kernel, config=cfg_b, leases=store
-            )
+            consumer_a = Consumer(redis=h.async_redis, kernel=h.kernel, config=cfg_a, leases=store,
+                                  reminders=refuse_unconfigured_reminder,
+                         )
+            consumer_b = Consumer(redis=h.async_redis, kernel=h.kernel, config=cfg_b, leases=store,
+                                  reminders=refuse_unconfigured_reminder,
+                         )
             await consumer_a.ensure_group()
             attempts = _failing_process_event(h)
 
@@ -1748,9 +2039,7 @@ def test_a_delayed_handoff_loses_the_row_to_a_peer_without_a_double_run(
                 h, store, event_id="delayed-1", owner="departed-peer"
             )
             before = (await _pending_rows(h))[entry_id]
-            await _arm_pel_idle(
-                h, entry_id, owner="departed-peer", idle_ms=_EXPIRY_IDLE_MS + 200
-            )
+            await _arm_pel_idle(h, entry_id, owner="departed-peer", idle_ms=_EXPIRY_IDLE_MS + 200)
 
             released = asyncio.Event()
             dispatch_a = consumer_a._delivery.handler
@@ -1771,9 +2060,7 @@ def test_a_delayed_handoff_loses_the_row_to_a_peer_without_a_double_run(
 
                 # A's dispatch is still parked, so its claimed row is unleased and
                 # ages back past the threshold, exactly as a saturated node's does.
-                await _arm_pel_idle(
-                    h, entry_id, owner="worker-a", idle_ms=_EXPIRY_IDLE_MS + 200
-                )
+                await _arm_pel_idle(h, entry_id, owner="worker-a", idle_ms=_EXPIRY_IDLE_MS + 200)
                 assert await consumer_b._reclaim_once() == 1
                 await _settle(consumer_b)
 
@@ -1785,8 +2072,7 @@ def test_a_delayed_handoff_loses_the_row_to_a_peer_without_a_double_run(
                 f"the delayed handoff ran the turn more than once: {attempts}"
             )
             assert any(
-                "refused the delivery lease for entry" in message
-                for message in caplog.messages
+                "refused the delivery lease for entry" in message for message in caplog.messages
             ), "the late handler was not refused; it may have run beside the peer"
             assert entry_id in await _pending_rows(h), (
                 "the late owner acked a delivery it no longer held"
@@ -1829,6 +2115,7 @@ def test_a_saturated_consumer_claims_no_more_expired_rows_than_it_can_dispatch(
                 config=h.config,
                 max_concurrency=1,
                 leases=store,
+                reminders=refuse_unconfigured_reminder,
             )
             await consumer.ensure_group()
 
@@ -1867,12 +2154,8 @@ def test_a_saturated_consumer_claims_no_more_expired_rows_than_it_can_dispatch(
                 h, store, event_id="sat-2", owner="peer-two"
             )
             before = await _pending_rows(h)
-            await _arm_pel_idle(
-                h, first_id, owner="peer-one", idle_ms=_EXPIRY_IDLE_MS + 200
-            )
-            await _arm_pel_idle(
-                h, second_id, owner="peer-two", idle_ms=_EXPIRY_IDLE_MS + 200
-            )
+            await _arm_pel_idle(h, first_id, owner="peer-one", idle_ms=_EXPIRY_IDLE_MS + 200)
+            await _arm_pel_idle(h, second_id, owner="peer-two", idle_ms=_EXPIRY_IDLE_MS + 200)
 
             assert await consumer._reclaim_once() == 0
             after = await _pending_rows(h)
@@ -1897,9 +2180,7 @@ def test_a_saturated_consumer_claims_no_more_expired_rows_than_it_can_dispatch(
             # not this test's business.
             owners_now = await _pel_owners(h)
             deferred = [
-                row
-                for row in (first_id, second_id)
-                if owners_now[row] != h.config.consumer_name
+                row for row in (first_id, second_id) if owners_now[row] != h.config.consumer_name
             ]
             assert len(deferred) == 1, f"the bound claimed {2 - len(deferred)} rows"
             await _arm_pel_idle(
@@ -1946,15 +2227,14 @@ def test_the_expiry_pass_leaves_no_room_for_a_row_the_dead_pass_already_took(
                 config=h.config,
                 max_concurrency=1,
                 leases=store,
+                reminders=refuse_unconfigured_reminder,
             )
             await consumer.ensure_group()
             attempts = _failing_process_event(h)
 
             await h.async_redis.xadd(
                 h.config.stream,
-                to_stream_fields(
-                    _qevent("dead row", thread="budget-dead", event_id="dead-1")
-                ),
+                to_stream_fields(_qevent("dead row", thread="budget-dead", event_id="dead-1")),
             )
             dead_id, _dead_fields = await _read_one(h, "dying-peer")
             expiry_id, _expiry_fields = await _lease_expired_row(
@@ -1963,9 +2243,7 @@ def test_the_expiry_pass_leaves_no_room_for_a_row_the_dead_pass_already_took(
             before = await _pending_rows(h)
 
             await _prove_peer_dead(h, consumer, "dying-peer")
-            await _arm_pel_idle(
-                h, expiry_id, owner="other-peer", idle_ms=_EXPIRY_IDLE_MS + 200
-            )
+            await _arm_pel_idle(h, expiry_id, owner="other-peer", idle_ms=_EXPIRY_IDLE_MS + 200)
 
             assert await consumer._reclaim_once() == 1
             await _settle(consumer)
@@ -2009,9 +2287,7 @@ def test_the_running_consumer_redelivers_a_failed_turn_without_a_manual_reclaim(
 
             entry_id = await h.async_redis.xadd(
                 h.config.stream,
-                to_stream_fields(
-                    _qevent("lifecycle", thread="life-1", event_id="life-1")
-                ),
+                to_stream_fields(_qevent("lifecycle", thread="life-1", event_id="life-1")),
             )
 
             task = asyncio.create_task(consumer.run())
@@ -2031,11 +2307,788 @@ def test_the_running_consumer_redelivers_a_failed_turn_without_a_manual_reclaim(
             assert rows[entry_id] == len(delivered), (
                 "each redelivery must charge exactly one delivery of the budget"
             )
-            assert h.sink.updates == [
-                ("C1", "p-1", h.config.turn_not_started_text)
-            ] * len(delivered), (
+            assert h.sink.updates == [("C1", "p-1", h.config.turn_not_started_text)] * len(
+                delivered
+            ), (
                 "AC1 and AC2 must be observable together: the person is told on "
                 "every failed delivery while the redelivery is waited out"
             )
+
+    asyncio.run(go())
+
+
+@pytest.mark.parametrize(
+    "status_case", ["durable", "deferred-history", "history-loss", "unreadable", "slow-status"]
+)
+def test_settled_non_durable_runner_keeps_its_route(make_harness, status_case: str) -> None:
+    import json
+
+    async def go() -> None:
+        async with make_harness(**_LEASE_KNOBS, abandoned_turn_grace_s=0.001) as h:
+            event = _qevent("complete", event_id="settled-deferred-history")
+            thread = _thread_key_for(event)
+            store = DeliveryLeaseStore(h.async_redis, h.config)
+            consumer = Consumer(
+                redis=h.async_redis,
+                kernel=h.kernel,
+                config=h.config,
+                leases=store,
+                reminders=refuse_unconfigured_reminder,
+            )
+            await consumer.ensure_group()
+            h.runner.default_script = [TextDelta(text="working")]
+            h.runner.hold = asyncio.Event()
+            h.runner.tail = [Final(text="done", status=DONE)]
+            h.runner.history_durable = status_case == "durable"
+            await h.async_redis.xadd(h.config.stream, to_stream_fields(event))
+            entry, fields = await _read_one(h, h.config.consumer_name)
+            await consumer._dispatch(entry, fields)
+            await _wait_until(lambda: bool(h.runner.queried))
+            handle = h.substrate.lookup(thread)
+            assert handle is not None
+            expected = await h.kernel._markers.watched_turn(handle.claim_name)
+            assert expected is not None
+            assert json.loads(expected)["event_id"] == event.event_id
+            h.runner.hold.set()
+            await _settle(consumer)
+            assert await h.kernel._markers.is_terminal(event.event_id)
+            assert await h.kernel._markers.watched_turn(handle.claim_name) == expected
+            h.runner.status_fails = status_case == "unreadable"
+            h.runner.status_delay_seconds = 5.1 if status_case == "slow-status" else 0
+            status_reads = len(h.runner.status_headers)
+            async with asyncio.timeout(10):
+                while await h.kernel._markers.watched_turn(handle.claim_name) is not None:
+                    assert await h.kernel.reap_orphans() == []
+                    assert h.substrate.lookup(thread) == handle
+                    if (
+                        (h.runner.status_fails or h.runner.status_delay_seconds)
+                        and len(h.runner.status_headers) > status_reads
+                    ):
+                        watched = await h.kernel._markers.watched_turn(handle.claim_name)
+                        assert watched is not None
+                        assert json.loads(expected).items() <= json.loads(watched).items()
+                        h.runner.status_fails = False
+                        h.runner.status_delay_seconds = 0
+            assert await h.kernel._markers.watched_turns() == {}
+            if status_case == "deferred-history":
+                h.runner.history_durable = True
+            for _ in range(2):
+                assert await h.kernel.reap_orphans() == []
+                assert h.substrate.lookup(thread) == handle
+
+    asyncio.run(go())
+
+
+@pytest.mark.parametrize(
+    ("side_effect", "unreadable"), [(False, False), (True, False), (False, True)]
+)
+def test_reaper_persists_unacknowledged_side_effect_before_retirement(
+    make_harness, monkeypatch, sync_redis, side_effect: bool, unreadable: bool
+) -> None:
+    async def go() -> None:
+        async with make_harness(**_LEASE_KNOBS, abandoned_turn_grace_s=0.001) as h:
+            event = _qevent("recover", event_id="unacknowledged-action")
+            thread = _thread_key_for(event)
+            handle = h.substrate.claim(thread)
+            store = DeliveryLeaseStore(h.async_redis, h.config)
+            consumer = Consumer(
+                redis=h.async_redis,
+                kernel=h.kernel,
+                config=h.config,
+                leases=store,
+                reminders=refuse_unconfigured_reminder,
+            )
+            await consumer.ensure_group()
+            await h.async_redis.xadd(h.config.stream, to_stream_fields(event))
+            entry, fields = await _read_one(h, h.config.consumer_name)
+            lease = await store.acquire(
+                h.config.stream, h.config.consumer_group, entry, consumer=h.config.consumer_name
+            )
+            await h.kernel._markers.watch_turn(thread, handle.claim_name, lease, event.event_id)
+            h.runner.turn_active = True
+            h.runner.side_effect_emitted = side_effect
+            h.runner.status_fails = unreadable
+            original = h.substrate.release_if_claim
+            markers_at_retirement = []
+
+            def retire(*args):
+                markers_at_retirement.append(
+                    bool(sync_redis.exists(h.config.side_effect_key(event.event_id)))
+                )
+                return original(*args)
+
+            monkeypatch.setattr(h.substrate, "release_if_claim", retire)
+            await store.release(
+                lease.stream, lease.group, lease.entry_id, owner=lease.owner, resume_event_id=None
+            )
+            async with asyncio.timeout(5):
+                while not await h.kernel.reap_orphans():
+                    pass
+            assert markers_at_retirement == [side_effect or unreadable]
+            assert await h.kernel._markers.saw_side_effect(event.event_id) is (
+                side_effect or unreadable
+            )
+            h.runner.turn_active = False
+            h.runner.status_fails = False
+            await consumer._dispatch(entry, fields)
+            await _settle(consumer)
+            if side_effect or unreadable:
+                assert h.runner.opened == []
+                assert "A prior attempt may already have executed an action" in h.sink.last_text
+            else:
+                assert h.runner.opened == ["recover"]
+            assert await h.async_redis.xlen(h.config.dead_letter_stream_name()) == 0
+
+    asyncio.run(go())
+
+
+def test_failed_watch_retirement_does_not_starve_other_reaps(make_harness, monkeypatch) -> None:
+    async def go() -> None:
+        async with make_harness(**_LEASE_KNOBS, abandoned_turn_grace_s=0.001) as h:
+            markers = h.kernel._markers
+            store = DeliveryLeaseStore(h.async_redis, h.config)
+            consumer = Consumer(
+                redis=h.async_redis,
+                kernel=h.kernel,
+                config=h.config,
+                leases=store,
+                reminders=refuse_unconfigured_reminder,
+            )
+            await consumer.ensure_group()
+            claims = []
+            for name in ("unreachable", "reachable"):
+                event = _qevent(name, thread=name, event_id=name)
+                thread = _thread_key_for(event)
+                handle = h.substrate.claim(thread)
+                await h.async_redis.xadd(h.config.stream, to_stream_fields(event))
+                entry, _fields = await _read_one(h, h.config.consumer_name)
+                lease = await store.acquire(
+                    h.config.stream, h.config.consumer_group, entry, consumer=h.config.consumer_name
+                )
+                await markers.watch_turn(thread, handle.claim_name, lease, event.event_id)
+                await store.release(
+                    lease.stream,
+                    lease.group,
+                    lease.entry_id,
+                    owner=lease.owner,
+                    resume_event_id=None,
+                )
+                claims.append((thread, handle.claim_name))
+            h.runner.turn_active = True
+            original = h.substrate.release_if_claim
+
+            def retire(thread, name):
+                if name == claims[0][1]:
+                    raise RuntimeError("control endpoint unavailable")
+                return original(thread, name)
+
+            monkeypatch.setattr(h.substrate, "release_if_claim", retire)
+            orphan_reaps = []
+            original_reap = h.substrate.reap_orphans
+
+            def reap():
+                orphan_reaps.append(True)
+                return original_reap()
+
+            monkeypatch.setattr(h.substrate, "reap_orphans", reap)
+            async with asyncio.timeout(5):
+                while claims[1][1] not in await h.kernel.reap_orphans():
+                    pass
+            assert orphan_reaps
+            assert set(await markers.watched_turns()) == {claims[0][1]}
+            assert h.substrate.lookup(claims[0][0]) is not None
+            monkeypatch.setattr(h.substrate, "release_if_claim", original)
+            assert claims[0][1] in await h.kernel.reap_orphans()
+            assert await markers.watched_turns() == {}
+
+    asyncio.run(go())
+
+
+@pytest.mark.parametrize(("persisted", "reported"), [(False, True), (True, True), (True, False)])
+def test_reclaim_waits_for_side_effecting_predecessor_retirement(
+    make_harness, persisted: bool, reported: bool
+) -> None:
+    async def go() -> None:
+        async with make_harness(**_LEASE_KNOBS, abandoned_turn_grace_s=0.001) as h:
+            event = _qevent("do not replay", event_id="side-effect-before-preflight")
+            thread = _thread_key_for(event)
+            handle = h.substrate.claim(thread)
+            store = DeliveryLeaseStore(h.async_redis, h.config)
+            consumer = Consumer(
+                redis=h.async_redis,
+                kernel=h.kernel,
+                config=h.config,
+                leases=store,
+                reminders=refuse_unconfigured_reminder,
+            )
+            await consumer.ensure_group()
+            await h.async_redis.xadd(h.config.stream, to_stream_fields(event))
+            entry, fields = await _read_one(h, h.config.consumer_name)
+            lease = await store.acquire(
+                h.config.stream, h.config.consumer_group, entry, consumer=h.config.consumer_name
+            )
+            await h.kernel._markers.watch_turn(thread, handle.claim_name, lease, event.event_id)
+            await store.release(
+                lease.stream, lease.group, lease.entry_id, owner=lease.owner, resume_event_id=None
+            )
+            h.runner.turn_active = True
+            h.runner.history_durable = False
+            h.runner.side_effect_emitted = reported
+            if persisted:
+                await h.kernel._markers.mark_side_effect(event.event_id)
+            await consumer._dispatch(entry, fields)
+            try:
+                await _wait_until(lambda: bool(h.runner.interrupts))
+                assert h.sink.completions == []
+                assert await h.kernel._markers.watched_turn(handle.claim_name) is not None
+                async with asyncio.timeout(5):
+                    while not await h.kernel.reap_orphans():
+                        pass
+                await _settle(consumer)
+                assert h.runner.opened == []
+                assert h.substrate.lookup(thread) is None
+                assert h.sink.last_text == (
+                    "curie-turn-failure: prior-side-effect\n\n"
+                    "A prior attempt may already have executed an action; "
+                    "not retrying automatically. Flagging for a human."
+                )
+                assert [c.outcome for c in h.sink.completions] == ["escalated"]
+            finally:
+                consumer.request_stop()
+                await _settle(consumer)
+
+    asyncio.run(go())
+
+
+@pytest.mark.parametrize("side_effect", [False, True])
+def test_followup_preserves_crashed_predecessor_retry_fence(
+    make_harness, side_effect: bool
+) -> None:
+    import json
+
+    async def go() -> None:
+        async with make_harness(**_LEASE_KNOBS) as h:
+            first = _qevent("action A", event_id="crashed-A")
+            followup = _qevent("followup B", event_id="followup-B")
+            thread = _thread_key_for(first)
+            handle = h.substrate.claim(thread, env={"CURIE_RUNNER_TOKEN": "recovery-test-token"})
+            store = DeliveryLeaseStore(h.async_redis, h.config)
+            first_worker = Consumer(
+                redis=h.async_redis,
+                kernel=h.kernel,
+                config=h.config,
+                leases=store,
+                reminders=refuse_unconfigured_reminder,
+            )
+            await first_worker.ensure_group()
+            await h.async_redis.xadd(h.config.stream, to_stream_fields(first))
+            entry, fields = await _read_one(h, h.config.consumer_name)
+            crashed = await store.acquire(
+                h.config.stream, h.config.consumer_group, entry, consumer=h.config.consumer_name
+            )
+            await h.kernel._markers.watch_turn(thread, handle.claim_name, crashed, first.event_id)
+            # The runner completed A after its worker died before persisting the flag.
+            h.runner.side_effect_emitted = side_effect
+            h.runner.turn_active = False
+            h.runner.history_durable = True
+            assert not await h.kernel._markers.saw_side_effect(first.event_id)
+            assert await store.is_live(crashed.stream, crashed.group, crashed.entry_id)
+
+            assert not await first_worker._waits.has_predecessor(
+                thread, first.event_id, entry, crashed, identify=lambda _fields: None
+            )
+            await first_worker._waits.finish_order(thread, first.event_id, crashed, started=True)
+
+            def worker(name):
+                config = h.config.model_copy(update={"consumer_name": name})
+                kernel = type(h.kernel)(
+                    substrate=h.substrate,
+                    runner=h.kernel._runner,
+                    sink=h.sink,
+                    lock=h.kernel._lock,
+                    pressure_lock=h.kernel._pressure_lock,
+                    markers=h.kernel._markers,
+                    config=config,
+                )
+                assert kernel._order_locks is not h.kernel._order_locks
+                return Consumer(
+                    redis=h.async_redis,
+                    kernel=kernel,
+                    config=config,
+                    leases=store,
+                    reminders=refuse_unconfigured_reminder,
+                )
+
+            worker_b = worker("followup-worker")
+            h.runner.default_script = [TextDelta(text="B running")]
+            h.runner.hold = asyncio.Event()
+            h.runner.tail = [Final(text="B done", status=DONE)]
+            await h.async_redis.xadd(h.config.stream, to_stream_fields(followup))
+            entry_b, fields_b = await _read_one(h, "followup-worker")
+            await worker_b._dispatch(entry_b, fields_b)
+            try:
+                await _wait_until(lambda: h.runner.queried == ["followup B"])
+                watched_b = await h.kernel._markers.watched_turn(handle.claim_name)
+                assert watched_b is not None
+                assert json.loads(watched_b)["event_id"] == followup.event_id
+                # B reset the status while its watch replaced A's, before A's reclaim.
+                h.runner.side_effect_emitted = False
+                assert await h.kernel._markers.saw_side_effect(first.event_id) is side_effect
+                await store.release(
+                    crashed.stream,
+                    crashed.group,
+                    crashed.entry_id,
+                    owner=crashed.owner,
+                    resume_event_id=None,
+                )
+                await h.async_redis.xclaim(
+                    h.config.stream, h.config.consumer_group, "reclaim-worker", 0, [entry]
+                )
+                worker_c = worker("reclaim-worker")
+                if not side_effect:
+                    from curie_worker.kernel.memory import ReclaimPreflightUnsafe
+
+                    reclaimed = await store.acquire(
+                        h.config.stream, h.config.consumer_group, entry, consumer="reclaim-worker"
+                    )
+                    with pytest.raises(ReclaimPreflightUnsafe):
+                        await worker_c._kernel._preflight_reclaimed_delivery(
+                            thread, reclaimed, event_id=first.event_id,
+                            desired_requester="absent", requester_enforced=False,
+                        )
+                    assert h.runner.interrupts == 0
+                    await store.release(
+                        reclaimed.stream,
+                        reclaimed.group,
+                        reclaimed.entry_id,
+                        owner=reclaimed.owner,
+                        resume_event_id=None,
+                    )
+                status_reads = len(h.runner.status_headers)
+                await worker_c._dispatch(entry, fields)
+                if side_effect:
+                    await _settle(worker_c)
+                    assert h.runner.opened == ["followup B"]
+                    assert "A prior attempt may already have executed an action" in h.sink.last_text
+                    assert entry_b in worker_b._inflight_ids
+                    assert await h.kernel._markers.watched_turn(handle.claim_name) == watched_b
+                else:
+                    await _wait_until(lambda: len(h.runner.status_headers) > status_reads)
+                    assert h.runner.interrupts == 0
+                    assert h.runner.opened == ["followup B"]
+                    assert entry_b in worker_b._inflight_ids
+                    assert await store.is_live(
+                        h.config.stream, h.config.consumer_group, entry_b
+                    )
+                    h.runner.hold.set()
+                    await _settle(worker_b)
+                    await _settle(worker_c)
+                    assert h.runner.opened == ["followup B", "action A"]
+                    assert h.runner.interrupts == 0
+            finally:
+                h.runner.hold.set()
+                await _settle(worker_b)
+            assert await _pending_rows(h) == {}
+            assert await h.async_redis.xlen(h.config.dead_letter_stream_name()) == 0
+
+    asyncio.run(go())
+
+
+@pytest.mark.parametrize("tool_start", ["interrupt", "handoff"])
+def test_reclaimed_turn_cannot_replay_an_action_started_during_interrupt(
+    make_harness, tool_start: str
+) -> None:
+    from .conftest import FakeRunner
+
+    class InterruptingRunner(FakeRunner):
+        async def _interrupt(self, request):
+            self.turn_active = False
+            if tool_start == "interrupt":
+                self.side_effect_emitted = True
+            return await super()._interrupt(request)
+
+        async def _status(self, request):
+            response = await super()._status(request)
+            if self.interrupts and tool_start == "handoff":
+                self.side_effect_emitted = True
+            return response
+
+    async def go() -> None:
+        runner = InterruptingRunner()
+        async with make_harness(**_LEASE_KNOBS, runner_app=runner.app) as h:
+            event = _qevent("do not replay", event_id="action-during-interrupt")
+            thread = _thread_key_for(event)
+            handle = h.substrate.claim(thread, env={"CURIE_RUNNER_TOKEN": "recovery-test-token"})
+            store = DeliveryLeaseStore(h.async_redis, h.config)
+            consumer = Consumer(
+                redis=h.async_redis,
+                kernel=h.kernel,
+                config=h.config,
+                leases=store,
+                reminders=refuse_unconfigured_reminder,
+            )
+            await consumer.ensure_group()
+            await h.async_redis.xadd(h.config.stream, to_stream_fields(event))
+            entry, fields = await _read_one(h, h.config.consumer_name)
+            old = await store.acquire(
+                h.config.stream, h.config.consumer_group, entry, consumer=h.config.consumer_name
+            )
+            await h.kernel._markers.watch_turn(thread, handle.claim_name, old, event.event_id)
+            await store.release(
+                old.stream, old.group, old.entry_id, owner=old.owner, resume_event_id=None
+            )
+            runner.turn_active = True
+            if tool_start == "interrupt":
+                reclaimed = await store.acquire(
+                    h.config.stream, h.config.consumer_group, entry, consumer=h.config.consumer_name
+                )
+                await h.kernel._preflight_reclaimed_delivery(
+                    thread, reclaimed, event_id=event.event_id,
+                    desired_requester="absent", requester_enforced=False,
+                )
+                assert await h.kernel._markers.saw_side_effect(event.event_id)
+                await store.release(
+                    reclaimed.stream,
+                    reclaimed.group,
+                    reclaimed.entry_id,
+                    owner=reclaimed.owner,
+                    resume_event_id=None,
+                )
+            await consumer._dispatch(entry, fields)
+            await _settle(consumer)
+            assert runner.interrupts == 1
+            assert runner.opened == []
+            assert await h.kernel._markers.saw_side_effect(event.event_id)
+            assert [c.outcome for c in h.sink.completions] == ["escalated"]
+            assert "A prior attempt may already have executed an action" in h.sink.last_text
+            assert await _pending_rows(h) == {}
+            assert await h.async_redis.xlen(h.config.dead_letter_stream_name()) == 0
+
+    asyncio.run(go())
+
+
+@pytest.mark.parametrize("unreadable", [False, True])
+def test_late_side_effect_escalation_keeps_watch_until_retirement(make_harness, unreadable) -> None:
+    async def go() -> None:
+        async with make_harness(**_LEASE_KNOBS, abandoned_turn_grace_s=0.001) as h:
+            event = _qevent("do not replay", event_id="late-escalation")
+            thread = _thread_key_for(event)
+            handle = h.substrate.claim(thread)
+            store = DeliveryLeaseStore(h.async_redis, h.config)
+            consumer = Consumer(
+                redis=h.async_redis,
+                kernel=h.kernel,
+                config=h.config,
+                leases=store,
+                reminders=refuse_unconfigured_reminder,
+            )
+            await consumer.ensure_group()
+            await h.async_redis.xadd(h.config.stream, to_stream_fields(event))
+            entry, fields = await _read_one(h, h.config.consumer_name)
+            old = await store.acquire(
+                h.config.stream, h.config.consumer_group, entry, consumer=h.config.consumer_name
+            )
+            await h.kernel._markers.watch_turn(thread, handle.claim_name, old, event.event_id)
+            expected = await h.kernel._markers.watched_turn(handle.claim_name)
+            await h.kernel._markers.mark_side_effect(event.event_id)
+            await store.release(
+                old.stream, old.group, old.entry_id, owner=old.owner, resume_event_id=None
+            )
+            seconds, micros = await h.async_redis.time()
+            await h.async_redis.hset(
+                h.config.delivery_state_key(old.stream, old.group, old.entry_id),
+                "deadline_ms",
+                seconds * 1000 + micros // 1000 + 500,
+            )
+            h.runner.turn_active = True
+            h.runner.history_durable = False
+            h.runner.status_fails = unreadable
+            await consumer._dispatch(entry, fields)
+            await _settle(consumer)
+            assert h.runner.opened == []
+            assert [c.outcome for c in h.sink.completions] == ["escalated"]
+            assert await h.kernel._markers.watched_turn(handle.claim_name) == expected
+            assert h.substrate.lookup(thread) == handle
+            if unreadable:
+                assert await h.kernel.reap_orphans() == []
+                assert await h.kernel._markers.watched_turn(handle.claim_name) is not None
+                assert h.substrate.lookup(thread) == handle
+                h.runner.status_fails = False
+            async with asyncio.timeout(5):
+                while handle.claim_name not in await h.kernel.reap_orphans():
+                    pass
+            assert await h.kernel._markers.watched_turns() == {}
+            assert h.substrate.lookup(thread) is None
+            assert await _pending_rows(h) == {}
+            assert await h.async_redis.xlen(h.config.dead_letter_stream_name()) == 0
+
+    asyncio.run(go())
+
+
+def test_reclaim_cannot_steer_after_followup_recovers_its_action_marker(
+    make_harness, monkeypatch
+) -> None:
+    async def go() -> None:
+        async with make_harness(**_LEASE_KNOBS) as h:
+            first = _qevent("action A", event_id="reclaimed-before-followup")
+            followup = _qevent("followup B", event_id="followup-after-preflight")
+            thread = _thread_key_for(first)
+            handle = h.substrate.claim(thread, env={"CURIE_RUNNER_TOKEN": "recovery-test-token"})
+            store = DeliveryLeaseStore(h.async_redis, h.config)
+
+            def worker(name):
+                config = h.config.model_copy(update={"consumer_name": name})
+                kernel = type(h.kernel)(
+                    substrate=h.substrate,
+                    runner=h.kernel._runner,
+                    sink=h.sink,
+                    lock=h.kernel._lock,
+                    pressure_lock=h.kernel._pressure_lock,
+                    markers=h.kernel._markers,
+                    config=config,
+                )
+                return Consumer(
+                    redis=h.async_redis,
+                    kernel=kernel,
+                    config=config,
+                    leases=store,
+                    reminders=refuse_unconfigured_reminder,
+                )
+
+            reclaiming = worker("reclaim-worker")
+            following = worker("followup-worker")
+            crashed = worker("crashed-worker")
+            await reclaiming.ensure_group()
+            await h.async_redis.xadd(h.config.stream, to_stream_fields(first))
+            entry, fields = await _read_one(h, "crashed-worker")
+            old = await store.acquire(
+                h.config.stream, h.config.consumer_group, entry, consumer="crashed-worker"
+            )
+            await h.kernel._markers.watch_turn(thread, handle.claim_name, old, first.event_id)
+            assert not await crashed._waits.has_predecessor(
+                thread, first.event_id, entry, old, identify=lambda _fields: None
+            )
+            await crashed._waits.finish_order(thread, first.event_id, old, started=True)
+            await store.release(
+                old.stream, old.group, old.entry_id, owner=old.owner, resume_event_id=None
+            )
+            await h.async_redis.xclaim(
+                h.config.stream, h.config.consumer_group, "reclaim-worker", 0, [entry]
+            )
+            preflight_done = asyncio.Event()
+            proceed = asyncio.Event()
+            original = reclaiming._kernel._attempt
+
+            async def attempt(*args, **kwargs):
+                preflight_done.set()
+                await proceed.wait()
+                return await original(*args, **kwargs)
+
+            monkeypatch.setattr(reclaiming._kernel, "_attempt", attempt)
+            await reclaiming._dispatch(entry, fields)
+            try:
+                await asyncio.wait_for(preflight_done.wait(), 5)
+                assert not await h.kernel._markers.saw_side_effect(first.event_id)
+                h.runner.side_effect_emitted = True
+                h.runner.default_script = [TextDelta(text="B running")]
+                h.runner.hold = asyncio.Event()
+                h.runner.tail = [Final(text="B done", status=DONE)]
+                await h.async_redis.xadd(h.config.stream, to_stream_fields(followup))
+                entry_b, fields_b = await _read_one(h, "followup-worker")
+                await following._dispatch(entry_b, fields_b)
+                await _wait_until(lambda: h.runner.queried == ["followup B"])
+                h.runner.side_effect_emitted = False
+                assert await h.kernel._markers.saw_side_effect(first.event_id)
+                proceed.set()
+                await _settle(reclaiming)
+                assert h.runner.steers == []
+                assert h.runner.opened == ["followup B"]
+                assert [c.outcome for c in h.sink.completions if c.event_id == first.event_id] == [
+                    "escalated"
+                ]
+                assert entry_b in following._inflight_ids
+            finally:
+                proceed.set()
+                if h.runner.hold is not None:
+                    h.runner.hold.set()
+                await _settle(reclaiming)
+                await _settle(following)
+            assert await _pending_rows(h) == {}
+            assert await h.async_redis.xlen(h.config.dead_letter_stream_name()) == 0
+
+    asyncio.run(go())
+
+
+def test_terminal_unreadable_watch_stops_probing_after_three_failures(make_harness) -> None:
+    async def go() -> None:
+        async with make_harness(**_LEASE_KNOBS, abandoned_turn_grace_s=0.001) as h:
+            event = _qevent("finished", event_id="terminal-unreadable")
+            thread = _thread_key_for(event)
+            handle = h.substrate.claim(thread)
+            store = DeliveryLeaseStore(h.async_redis, h.config)
+            consumer = Consumer(
+                redis=h.async_redis,
+                kernel=h.kernel,
+                config=h.config,
+                leases=store,
+                reminders=refuse_unconfigured_reminder,
+            )
+            await consumer.ensure_group()
+            await h.async_redis.xadd(h.config.stream, to_stream_fields(event))
+            entry, _fields = await _read_one(h, h.config.consumer_name)
+            lease = await store.acquire(
+                h.config.stream, h.config.consumer_group, entry, consumer=h.config.consumer_name
+            )
+            await h.kernel._markers.watch_turn(thread, handle.claim_name, lease, event.event_id)
+            stale_watch = await h.kernel._markers.watched_turn(handle.claim_name)
+            assert stale_watch is not None
+            await h.kernel._markers.mark_done_without_completion(event.event_id)
+            await store.release(
+                lease.stream, lease.group, lease.entry_id, owner=lease.owner, resume_event_id=None
+            )
+            h.runner.status_fails = True
+            reads = len(h.runner.status_headers)
+            async with asyncio.timeout(5):
+                while len(h.runner.status_headers) == reads:
+                    assert await h.kernel.reap_orphans() == []
+            for _ in range(2):
+                h.kernel._markers = type(h.kernel._markers)(h.async_redis, h.config)
+                assert await h.kernel._markers.watched_turn(handle.claim_name) is not None
+                assert await h.kernel.reap_orphans() == []
+            assert await h.kernel._markers.watched_turn(handle.claim_name) is None
+            assert len(h.runner.status_headers) == reads + 3
+            assert h.substrate.lookup(thread) == handle
+            for _ in range(2):
+                assert await h.kernel.reap_orphans() == []
+            assert len(h.runner.status_headers) == reads + 3
+            followup = _qevent("followup", event_id="replacement-watch")
+            await h.async_redis.xadd(h.config.stream, to_stream_fields(followup))
+            next_entry, _fields = await _read_one(h, h.config.consumer_name)
+            next_lease = await store.acquire(
+                h.config.stream,
+                h.config.consumer_group,
+                next_entry,
+                consumer=h.config.consumer_name,
+            )
+            await h.kernel._markers.watch_turn(
+                thread, handle.claim_name, next_lease, followup.event_id
+            )
+            replacement_watch = await h.kernel._markers.watched_turn(handle.claim_name)
+            await h.kernel._markers.note_terminal_status_failure(
+                handle.claim_name, stale_watch, limit=3
+            )
+            assert await h.kernel._markers.watched_turn(handle.claim_name) == replacement_watch
+            await store.release(
+                next_lease.stream,
+                next_lease.group,
+                next_lease.entry_id,
+                owner=next_lease.owner,
+                resume_event_id=None,
+            )
+
+    asyncio.run(go())
+
+
+@pytest.mark.parametrize("same_requester", [False, True])
+@pytest.mark.parametrize("side_effect", [False, True])
+def test_reclaimed_watch_keeps_requester_and_side_effect_fences(
+    make_harness, same_requester: bool, side_effect: bool
+) -> None:
+    import base64
+
+    from curie_worker import caller_token
+    from curie_worker.binding import caller_requester_facts
+    from curie_worker.kernel.failures import RequesterHandoffPending
+    from curie_worker.kernel.memory import ReclaimPreflightUnsafe
+
+    from .conftest import FakeRunner
+
+    def boot(subject: str) -> dict[str, str]:
+        return {
+            "CURIE_RUNNER_TOKEN": "recovery-test-token",
+            "CURIE_CONNECTOR_CALLER_TOKEN": caller_token.mint(
+                base64.b64encode(bytes(range(32))).decode(),
+                agent="acme-dev",
+                exp=int(time.time()) + 3600,
+                principal=caller_token.CallerPrincipal(
+                    tenant_id="44444444-4444-4444-8444-444444444444",
+                    issuer="https://identity.example.com",
+                    subject=subject,
+                ),
+            ),
+        }
+
+    class StoppingRunner(FakeRunner):
+        async def _interrupt(self, request):
+            self.turn_active = False
+            return await super()._interrupt(request)
+
+    async def go() -> None:
+        runner = StoppingRunner()
+        async with make_harness(runner_app=runner.app) as h:
+            event = _qevent("recover the watched turn", event_id="requester-watch-transfer")
+            thread = _thread_key_for(event)
+            predecessor_env = boot("first-requester")
+            desired_env = boot("first-requester" if same_requester else "second-requester")
+            handle = h.substrate.claim(thread, env=predecessor_env)
+            assert handle.caller_requester == caller_requester_facts(predecessor_env)[0]
+            store = DeliveryLeaseStore(h.async_redis, h.config)
+            consumer = Consumer(
+                redis=h.async_redis,
+                kernel=h.kernel,
+                config=h.config,
+                leases=store,
+                reminders=refuse_unconfigured_reminder,
+            )
+            await consumer.ensure_group()
+            await h.async_redis.xadd(h.config.stream, to_stream_fields(event))
+            entry, _fields = await _read_one(h, h.config.consumer_name)
+            previous = await store.acquire(
+                h.config.stream, h.config.consumer_group, entry, consumer=h.config.consumer_name
+            )
+            assert previous is not None
+            await h.kernel._markers.watch_turn(thread, handle.claim_name, previous, event.event_id)
+            await store.release(
+                previous.stream,
+                previous.group,
+                previous.entry_id,
+                owner=previous.owner,
+                resume_event_id=None,
+            )
+            await h.async_redis.xclaim(
+                h.config.stream, h.config.consumer_group, "reclaim-worker", 0, [entry]
+            )
+            reclaimed = await store.acquire(
+                h.config.stream, h.config.consumer_group, entry, consumer="reclaim-worker"
+            )
+            assert reclaimed is not None
+            runner.turn_active = True
+            runner.side_effect_emitted = side_effect
+
+            async def preflight() -> None:
+                await h.kernel._preflight_reclaimed_delivery(
+                    thread,
+                    reclaimed,
+                    event_id=event.event_id,
+                    desired_requester=caller_requester_facts(desired_env)[0],
+                    requester_enforced=True,
+                )
+
+            if not same_requester:
+                with pytest.raises(RequesterHandoffPending):
+                    await preflight()
+                assert runner.interrupts == 0
+                assert runner.turn_active
+            else:
+                if side_effect:
+                    with pytest.raises(ReclaimPreflightUnsafe):
+                        await preflight()
+                await preflight()
+                assert runner.interrupts == 1
+                assert not runner.turn_active
+            assert runner.opened == []
+            assert await h.kernel._markers.saw_side_effect(event.event_id) is side_effect
+            assert await h.kernel._markers.watched_turn(handle.claim_name) is not None
+            assert h.substrate.lookup(thread) == handle
 
     asyncio.run(go())

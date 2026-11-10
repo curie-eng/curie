@@ -18,7 +18,7 @@
 //!   approval gate exists to prevent, so validation runs before the connection
 //!   is opened and the negative tests assert on `recorded()` being empty.
 
-mod support;
+use crate::support;
 
 use curie::commands::{approvals, AgentActionOpts, ApprovalCmd, ApprovalsOutput};
 use curie::credcheck::check_channel_id;
@@ -168,6 +168,9 @@ fn assert_routes_cleared(out: ApprovalsOutput, context: &str) {
         ApprovalsOutput::Resolved { .. } => panic!("expected the Routes output, not a resolution"),
         ApprovalsOutput::OperatorPrincipal { .. } => {
             panic!("expected the Routes output, not an operator-principal mint")
+        }
+        ApprovalsOutput::RemediationPrincipal { .. } => {
+            panic!("unexpected remediation-principal mint output")
         }
         ApprovalsOutput::ConsoleLoginCode { .. } => {
             panic!("expected the Routes output, not a console login-code mint")
@@ -341,6 +344,9 @@ async fn routes_from_builds_the_strict_split_route_shape() {
         ApprovalsOutput::OperatorPrincipal { .. } => {
             panic!("expected the Routes output, not an operator-principal mint")
         }
+        ApprovalsOutput::RemediationPrincipal { .. } => {
+            panic!("unexpected remediation-principal mint output")
+        }
         ApprovalsOutput::ConsoleLoginCode { .. } => {
             panic!("expected the Routes output, not a console login-code mint")
         }
@@ -446,6 +452,9 @@ async fn route_approvers_narrows_who_without_moving_where() {
         ApprovalsOutput::OperatorPrincipal { .. } => {
             panic!("expected the Routes output, not an operator-principal mint")
         }
+        ApprovalsOutput::RemediationPrincipal { .. } => {
+            panic!("unexpected remediation-principal mint output")
+        }
         ApprovalsOutput::ConsoleLoginCode { .. } => {
             panic!("expected the Routes output, not a console login-code mint")
         }
@@ -513,6 +522,9 @@ async fn list_routes_reads_without_writing() {
         ApprovalsOutput::Resolved { .. } => panic!("expected the Routes output, not a resolution"),
         ApprovalsOutput::OperatorPrincipal { .. } => {
             panic!("expected the Routes output, not an operator-principal mint")
+        }
+        ApprovalsOutput::RemediationPrincipal { .. } => {
+            panic!("unexpected remediation-principal mint output")
         }
         ApprovalsOutput::ConsoleLoginCode { .. } => {
             panic!("expected the Routes output, not a console login-code mint")
@@ -674,6 +686,9 @@ async fn the_dry_run_plan_names_the_payload_the_real_clear_sends() {
             }
             ApprovalsOutput::OperatorPrincipal { .. } => {
                 panic!("expected the DryRun output, not an operator-principal mint")
+            }
+            ApprovalsOutput::RemediationPrincipal { .. } => {
+                panic!("unexpected remediation-principal mint output")
             }
             ApprovalsOutput::ConsoleLoginCode { .. } => {
                 panic!("expected the DryRun output, not a console login-code mint")
@@ -1121,6 +1136,9 @@ async fn an_api_response_tolerates_a_field_the_cli_does_not_model() {
         ApprovalsOutput::OperatorPrincipal { .. } => {
             panic!("expected the Routes output, not an operator-principal mint")
         }
+        ApprovalsOutput::RemediationPrincipal { .. } => {
+            panic!("unexpected remediation-principal mint output")
+        }
         ApprovalsOutput::ConsoleLoginCode { .. } => {
             panic!("expected the Routes output, not a console login-code mint")
         }
@@ -1277,5 +1295,190 @@ async fn a_requesting_surface_route_refuses_a_notification_an_unknown_mode_and_a
         let message = rejected_routes_file(route, expected).await;
         assert!(message.contains("confirm"), "{expected}: {message}");
         assert!(message.contains(expected), "{expected}: {message}");
+    }
+}
+
+// --- ADR-0177 amendment: an email approval is answered only by a listed address ---
+
+#[tokio::test]
+async fn routes_from_forwards_approver_emails_beside_slack_users() {
+    let bound = r#"{"confirm":{"resolution":{"mode":"requesting_surface"},"approvers":{"users":["U0EXAMPLE1"],"emails":["approver@example.com"]}}}"#;
+    let server = stub(bound, bound);
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("routes.json");
+    std::fs::write(&path, bound).expect("write routes file");
+
+    run(
+        &server,
+        ApprovalCmd {
+            routes_from: Some(path),
+            ..ApprovalCmd::default()
+        },
+    )
+    .await
+    .expect("a requesting_surface route with approver emails should be written");
+
+    let body = patch_body(&server);
+    assert_eq!(
+        body["approval_routes"]["confirm"]["approvers"],
+        serde_json::json!({"users": ["U0EXAMPLE1"], "emails": ["approver@example.com"]}),
+        "the PATCH must forward the emails untouched, got {body:?}"
+    );
+}
+
+#[tokio::test]
+async fn approver_emails_refuse_a_fixed_target_an_empty_list_and_a_display_name() {
+    for (route, expected) in [
+        (
+            serde_json::json!({"finance": {
+                "resolution": {"kind": "slack", "address": "C0EXAMPLE1"},
+                "approvers": {"emails": ["approver@example.com"]}
+            }}),
+            "approvers emails need a requesting_surface resolution",
+        ),
+        (
+            serde_json::json!({"finance": {
+                "resolution": {"mode": "requesting_surface"},
+                "approvers": {"emails": []}
+            }}),
+            "must contain at least one address",
+        ),
+        (
+            serde_json::json!({"finance": {
+                "resolution": {"mode": "requesting_surface"},
+                "approvers": {"emails": ["Approver <approver@example.com>"]}
+            }}),
+            "is not one bare email address",
+        ),
+        (
+            serde_json::json!({"finance": {
+                "resolution": {"mode": "requesting_surface"},
+                "approvers": {"emails": ["*@example.com"]}
+            }}),
+            "is not one bare email address",
+        ),
+    ] {
+        let message = rejected_routes_file(route, expected).await;
+        assert!(message.contains("finance"), "{expected}: {message}");
+        assert!(message.contains(expected), "{expected}: {message}");
+    }
+}
+
+#[tokio::test]
+async fn route_deadlines_preserve_omitted_positive_and_explicit_null() {
+    let bound = r#"{"omitted":{"resolution":{"kind":"slack","address":"C0EXAMPLE1"}},"finite":{"resolution":{"kind":"slack","address":"C0EXAMPLE1"},"expires_in_seconds":3600},"indefinite":{"resolution":{"kind":"slack","address":"C0EXAMPLE1"},"expires_in_seconds":null}}"#;
+    let vectors: serde_json::Value = serde_json::from_str(include_str!(
+        "../../tests/vectors/approval-route-deadlines.json"
+    ))
+    .unwrap();
+    let mut bindings: serde_json::Value = serde_json::from_str(bound).unwrap();
+    for (index, value) in vectors["valid"].as_array().unwrap().iter().enumerate() {
+        bindings[format!("deadline-{index}")] = serde_json::json!({
+            "resolution": {"kind": "slack", "address": "C0EXAMPLE1"},
+            "expires_in_seconds": value
+        });
+    }
+    let bound = bindings.to_string();
+    let server = router_stub("null");
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("routes.json");
+    std::fs::write(&path, &bound).unwrap();
+    let out = run(
+        &server,
+        ApprovalCmd {
+            routes_from: Some(path),
+            ..ApprovalCmd::default()
+        },
+    )
+    .await
+    .expect("all three deadline choices are valid");
+    let patch = patch_body(&server);
+    let expected: serde_json::Value = serde_json::from_str(&bound).unwrap();
+    assert_eq!(patch["approval_routes"], expected);
+    let rendered = out.to_json();
+    for (index, value) in vectors["valid"].as_array().unwrap().iter().enumerate() {
+        assert_eq!(
+            rendered["routes"][format!("deadline-{index}")]["expires_in_seconds"],
+            *value
+        );
+    }
+    assert_eq!(rendered["routes"]["finite"]["expires_in_seconds"], 3600);
+    assert_eq!(
+        rendered["routes"]["indefinite"]["expires_in_seconds"],
+        serde_json::Value::Null
+    );
+    assert!(rendered["routes"]["omitted"]
+        .get("expires_in_seconds")
+        .is_none());
+}
+
+#[tokio::test]
+async fn invalid_deadline_values_never_write_routes() {
+    let vectors: serde_json::Value = serde_json::from_str(include_str!(
+        "../../tests/vectors/approval-route-deadlines.json"
+    ))
+    .unwrap();
+    for value in vectors["invalid"].as_array().unwrap() {
+        let server = stub("null", "null");
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("routes.json");
+        std::fs::write(&path, format!(r#"{{"review":{{"resolution":{{"kind":"slack","address":"C0EXAMPLE1"}},"expires_in_seconds":{value}}}}}"#)).unwrap();
+        assert!(run(
+            &server,
+            ApprovalCmd {
+                routes_from: Some(path),
+                ..ApprovalCmd::default()
+            }
+        )
+        .await
+        .is_err());
+        assert_no_write(&server);
+    }
+}
+
+#[tokio::test]
+async fn reminder_intervals_round_trip_and_invalid_values_never_write() {
+    let vectors: serde_json::Value = serde_json::from_str(include_str!(
+        "../../tests/vectors/approval-route-reminders.json"
+    ))
+    .unwrap();
+    for value in vectors["valid"].as_array().unwrap() {
+        let server = router_stub("{}");
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("routes.json");
+        std::fs::write(&path, format!(r#"{{"review":{{"resolution":{{"kind":"slack","address":"C0EXAMPLE1"}},"remind_every_s":{value}}}}}"#)).unwrap();
+        let output = run(
+            &server,
+            ApprovalCmd {
+                routes_from: Some(path),
+                ..ApprovalCmd::default()
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            patch_body(&server)["approval_routes"]["review"]["remind_every_s"],
+            *value
+        );
+        assert_eq!(
+            output.to_json()["routes"]["review"]["remind_every_s"],
+            *value
+        );
+    }
+    for value in vectors["invalid"].as_array().unwrap() {
+        let server = stub("null", "null");
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("routes.json");
+        std::fs::write(&path, format!(r#"{{"review":{{"resolution":{{"kind":"slack","address":"C0EXAMPLE1"}},"remind_every_s":{value}}}}}"#)).unwrap();
+        assert!(run(
+            &server,
+            ApprovalCmd {
+                routes_from: Some(path),
+                ..ApprovalCmd::default()
+            }
+        )
+        .await
+        .is_err());
+        assert_no_write(&server);
     }
 }

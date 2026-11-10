@@ -1,0 +1,1493 @@
+{
+  "spec": "AGENT-ROLE-FILTER-V1",
+  "cases": [
+    {
+      "name": "all-selectors-exact",
+      "target": "policy",
+      "input": {
+        "schema_version": 1,
+        "tenant_id": "11111111-1111-1111-1111-111111111111",
+        "agent_id": "22222222-2222-2222-2222-222222222222",
+        "version": 7,
+        "roles": {
+          "invocation": {
+            "schema_version": 1,
+            "legacy_state": "retained",
+            "filter": {
+              "entries": [
+                {
+                  "kind": "surface_account",
+                  "provider": "Sample-chat",
+                  "namespace": {
+                    "id": "33333333-3333-3333-3333-333333333333",
+                    "authority": "",
+                    "kind": "Workspace",
+                    "key": "SampleWorkspace"
+                  },
+                  "native_id": "SampleAccount"
+                },
+                {
+                  "kind": "issuer_subject",
+                  "issuer": "https://Identity.example.test/Exact%2fIssuer",
+                  "subject": "SampleSubject"
+                },
+                {
+                  "kind": "issuer_group",
+                  "group": {
+                    "issuer": "https://Identity.example.test/Exact%2fIssuer",
+                    "id": "SampleGroup"
+                  }
+                }
+              ]
+            }
+          }
+        }
+      },
+      "expected": "valid",
+      "schema_valid": true
+    },
+    {
+      "name": "existing-row-no-role-configuration",
+      "target": "policy",
+      "input": {
+        "schema_version": 1,
+        "tenant_id": "11111111-1111-1111-1111-111111111111",
+        "agent_id": "22222222-2222-2222-2222-222222222222",
+        "version": 7,
+        "roles": {}
+      },
+      "expected": "valid",
+      "schema_valid": true
+    },
+    {
+      "name": "invocation-null",
+      "target": "policy",
+      "input": {
+        "schema_version": 1,
+        "tenant_id": "11111111-1111-1111-1111-111111111111",
+        "agent_id": "22222222-2222-2222-2222-222222222222",
+        "version": 7,
+        "roles": {
+          "invocation": {
+            "schema_version": 1,
+            "legacy_state": "retained",
+            "filter": null
+          }
+        }
+      },
+      "expected": "valid",
+      "schema_valid": true
+    },
+    {
+      "name": "invocation-empty",
+      "target": "policy",
+      "input": {
+        "schema_version": 1,
+        "tenant_id": "11111111-1111-1111-1111-111111111111",
+        "agent_id": "22222222-2222-2222-2222-222222222222",
+        "version": 7,
+        "roles": {
+          "invocation": {
+            "schema_version": 1,
+            "legacy_state": "retained",
+            "filter": {
+              "entries": []
+            }
+          }
+        }
+      },
+      "expected": "valid",
+      "schema_valid": true
+    },
+    {
+      "name": "invocation-populated",
+      "target": "policy",
+      "input": {
+        "schema_version": 1,
+        "tenant_id": "11111111-1111-1111-1111-111111111111",
+        "agent_id": "22222222-2222-2222-2222-222222222222",
+        "version": 7,
+        "roles": {
+          "invocation": {
+            "schema_version": 1,
+            "legacy_state": "retained",
+            "filter": {
+              "entries": [
+                {
+                  "kind": "surface_account",
+                  "provider": "Sample-chat",
+                  "namespace": {
+                    "id": "33333333-3333-3333-3333-333333333333",
+                    "authority": "",
+                    "kind": "Workspace",
+                    "key": "SampleWorkspace"
+                  },
+                  "native_id": "SampleAccount"
+                },
+                {
+                  "kind": "issuer_subject",
+                  "issuer": "https://Identity.example.test/Exact%2fIssuer",
+                  "subject": "SampleSubject"
+                },
+                {
+                  "kind": "issuer_group",
+                  "group": {
+                    "issuer": "https://Identity.example.test/Exact%2fIssuer",
+                    "id": "SampleGroup"
+                  }
+                }
+              ]
+            }
+          }
+        }
+      },
+      "expected": "valid",
+      "schema_valid": true
+    },
+    {
+      "name": "invocation-set_filter",
+      "target": "change",
+      "input": {
+        "schema_version": 1,
+        "tenant_id": "11111111-1111-1111-1111-111111111111",
+        "agent_id": "22222222-2222-2222-2222-222222222222",
+        "expected_version": 0,
+        "role": "invocation",
+        "operation": "set_filter",
+        "filter": {
+          "entries": [
+            {
+              "kind": "surface_account",
+              "provider": "Sample-chat",
+              "namespace": {
+                "id": "33333333-3333-3333-3333-333333333333",
+                "authority": "",
+                "kind": "Workspace",
+                "key": "SampleWorkspace"
+              },
+              "native_id": "SampleAccount"
+            },
+            {
+              "kind": "issuer_subject",
+              "issuer": "https://Identity.example.test/Exact%2fIssuer",
+              "subject": "SampleSubject"
+            },
+            {
+              "kind": "issuer_group",
+              "group": {
+                "issuer": "https://Identity.example.test/Exact%2fIssuer",
+                "id": "SampleGroup"
+              }
+            }
+          ]
+        }
+      },
+      "expected": "valid",
+      "schema_valid": true
+    },
+    {
+      "name": "invocation-migrate_role",
+      "target": "change",
+      "input": {
+        "schema_version": 1,
+        "tenant_id": "11111111-1111-1111-1111-111111111111",
+        "agent_id": "22222222-2222-2222-2222-222222222222",
+        "expected_version": 0,
+        "role": "invocation",
+        "operation": "migrate_role",
+        "filter": {
+          "entries": [
+            {
+              "kind": "surface_account",
+              "provider": "Sample-chat",
+              "namespace": {
+                "id": "33333333-3333-3333-3333-333333333333",
+                "authority": "",
+                "kind": "Workspace",
+                "key": "SampleWorkspace"
+              },
+              "native_id": "SampleAccount"
+            },
+            {
+              "kind": "issuer_subject",
+              "issuer": "https://Identity.example.test/Exact%2fIssuer",
+              "subject": "SampleSubject"
+            },
+            {
+              "kind": "issuer_group",
+              "group": {
+                "issuer": "https://Identity.example.test/Exact%2fIssuer",
+                "id": "SampleGroup"
+              }
+            }
+          ]
+        },
+        "raw_account_revocation": "separate_removal_required"
+      },
+      "expected": "valid",
+      "schema_valid": true
+    },
+    {
+      "name": "approver-null",
+      "target": "policy",
+      "input": {
+        "schema_version": 1,
+        "tenant_id": "11111111-1111-1111-1111-111111111111",
+        "agent_id": "22222222-2222-2222-2222-222222222222",
+        "version": 7,
+        "roles": {
+          "approver": {
+            "schema_version": 1,
+            "legacy_state": "retained",
+            "filter": null
+          }
+        }
+      },
+      "expected": "valid",
+      "schema_valid": true
+    },
+    {
+      "name": "approver-empty",
+      "target": "policy",
+      "input": {
+        "schema_version": 1,
+        "tenant_id": "11111111-1111-1111-1111-111111111111",
+        "agent_id": "22222222-2222-2222-2222-222222222222",
+        "version": 7,
+        "roles": {
+          "approver": {
+            "schema_version": 1,
+            "legacy_state": "retained",
+            "filter": {
+              "entries": []
+            }
+          }
+        }
+      },
+      "expected": "valid",
+      "schema_valid": true
+    },
+    {
+      "name": "approver-populated",
+      "target": "policy",
+      "input": {
+        "schema_version": 1,
+        "tenant_id": "11111111-1111-1111-1111-111111111111",
+        "agent_id": "22222222-2222-2222-2222-222222222222",
+        "version": 7,
+        "roles": {
+          "approver": {
+            "schema_version": 1,
+            "legacy_state": "retained",
+            "filter": {
+              "entries": [
+                {
+                  "kind": "surface_account",
+                  "provider": "Sample-chat",
+                  "namespace": {
+                    "id": "33333333-3333-3333-3333-333333333333",
+                    "authority": "",
+                    "kind": "Workspace",
+                    "key": "SampleWorkspace"
+                  },
+                  "native_id": "SampleAccount"
+                },
+                {
+                  "kind": "issuer_subject",
+                  "issuer": "https://Identity.example.test/Exact%2fIssuer",
+                  "subject": "SampleSubject"
+                },
+                {
+                  "kind": "issuer_group",
+                  "group": {
+                    "issuer": "https://Identity.example.test/Exact%2fIssuer",
+                    "id": "SampleGroup"
+                  }
+                }
+              ]
+            }
+          }
+        }
+      },
+      "expected": "valid",
+      "schema_valid": true
+    },
+    {
+      "name": "approver-set_filter",
+      "target": "change",
+      "input": {
+        "schema_version": 1,
+        "tenant_id": "11111111-1111-1111-1111-111111111111",
+        "agent_id": "22222222-2222-2222-2222-222222222222",
+        "expected_version": 0,
+        "role": "approver",
+        "operation": "set_filter",
+        "filter": {
+          "entries": [
+            {
+              "kind": "surface_account",
+              "provider": "Sample-chat",
+              "namespace": {
+                "id": "33333333-3333-3333-3333-333333333333",
+                "authority": "",
+                "kind": "Workspace",
+                "key": "SampleWorkspace"
+              },
+              "native_id": "SampleAccount"
+            },
+            {
+              "kind": "issuer_subject",
+              "issuer": "https://Identity.example.test/Exact%2fIssuer",
+              "subject": "SampleSubject"
+            },
+            {
+              "kind": "issuer_group",
+              "group": {
+                "issuer": "https://Identity.example.test/Exact%2fIssuer",
+                "id": "SampleGroup"
+              }
+            }
+          ]
+        }
+      },
+      "expected": "valid",
+      "schema_valid": true
+    },
+    {
+      "name": "approver-migrate_role",
+      "target": "change",
+      "input": {
+        "schema_version": 1,
+        "tenant_id": "11111111-1111-1111-1111-111111111111",
+        "agent_id": "22222222-2222-2222-2222-222222222222",
+        "expected_version": 0,
+        "role": "approver",
+        "operation": "migrate_role",
+        "filter": {
+          "entries": [
+            {
+              "kind": "surface_account",
+              "provider": "Sample-chat",
+              "namespace": {
+                "id": "33333333-3333-3333-3333-333333333333",
+                "authority": "",
+                "kind": "Workspace",
+                "key": "SampleWorkspace"
+              },
+              "native_id": "SampleAccount"
+            },
+            {
+              "kind": "issuer_subject",
+              "issuer": "https://Identity.example.test/Exact%2fIssuer",
+              "subject": "SampleSubject"
+            },
+            {
+              "kind": "issuer_group",
+              "group": {
+                "issuer": "https://Identity.example.test/Exact%2fIssuer",
+                "id": "SampleGroup"
+              }
+            }
+          ]
+        },
+        "raw_account_revocation": "separate_removal_required"
+      },
+      "expected": "valid",
+      "schema_valid": true
+    },
+    {
+      "name": "independent-retained-and-migrated",
+      "target": "policy",
+      "input": {
+        "schema_version": 1,
+        "tenant_id": "11111111-1111-1111-1111-111111111111",
+        "agent_id": "22222222-2222-2222-2222-222222222222",
+        "version": 7,
+        "roles": {
+          "invocation": {
+            "schema_version": 1,
+            "legacy_state": "retained",
+            "filter": null
+          },
+          "approver": {
+            "schema_version": 1,
+            "legacy_state": "migrated",
+            "filter": {
+              "entries": [
+                {
+                  "kind": "surface_account",
+                  "provider": "Sample-chat",
+                  "namespace": {
+                    "id": "33333333-3333-3333-3333-333333333333",
+                    "authority": "",
+                    "kind": "Workspace",
+                    "key": "SampleWorkspace"
+                  },
+                  "native_id": "SampleAccount"
+                },
+                {
+                  "kind": "issuer_subject",
+                  "issuer": "https://Identity.example.test/Exact%2fIssuer",
+                  "subject": "SampleSubject"
+                },
+                {
+                  "kind": "issuer_group",
+                  "group": {
+                    "issuer": "https://Identity.example.test/Exact%2fIssuer",
+                    "id": "SampleGroup"
+                  }
+                }
+              ]
+            },
+            "raw_account_revocation": "separate_removal_required"
+          }
+        }
+      },
+      "expected": "valid",
+      "schema_valid": true
+    },
+    {
+      "name": "snapshot-counter-1",
+      "target": "policy",
+      "input": {
+        "schema_version": 1,
+        "tenant_id": "11111111-1111-1111-1111-111111111111",
+        "agent_id": "22222222-2222-2222-2222-222222222222",
+        "version": 1,
+        "roles": {
+          "invocation": {
+            "schema_version": 1,
+            "legacy_state": "retained",
+            "filter": {
+              "entries": [
+                {
+                  "kind": "surface_account",
+                  "provider": "Sample-chat",
+                  "namespace": {
+                    "id": "33333333-3333-3333-3333-333333333333",
+                    "authority": "",
+                    "kind": "Workspace",
+                    "key": "SampleWorkspace"
+                  },
+                  "native_id": "SampleAccount"
+                },
+                {
+                  "kind": "issuer_subject",
+                  "issuer": "https://Identity.example.test/Exact%2fIssuer",
+                  "subject": "SampleSubject"
+                },
+                {
+                  "kind": "issuer_group",
+                  "group": {
+                    "issuer": "https://Identity.example.test/Exact%2fIssuer",
+                    "id": "SampleGroup"
+                  }
+                }
+              ]
+            }
+          }
+        }
+      },
+      "expected": "valid",
+      "schema_valid": true
+    },
+    {
+      "name": "snapshot-counter-2147483647",
+      "target": "policy",
+      "input": {
+        "schema_version": 1,
+        "tenant_id": "11111111-1111-1111-1111-111111111111",
+        "agent_id": "22222222-2222-2222-2222-222222222222",
+        "version": 2147483647,
+        "roles": {
+          "invocation": {
+            "schema_version": 1,
+            "legacy_state": "retained",
+            "filter": {
+              "entries": [
+                {
+                  "kind": "surface_account",
+                  "provider": "Sample-chat",
+                  "namespace": {
+                    "id": "33333333-3333-3333-3333-333333333333",
+                    "authority": "",
+                    "kind": "Workspace",
+                    "key": "SampleWorkspace"
+                  },
+                  "native_id": "SampleAccount"
+                },
+                {
+                  "kind": "issuer_subject",
+                  "issuer": "https://Identity.example.test/Exact%2fIssuer",
+                  "subject": "SampleSubject"
+                },
+                {
+                  "kind": "issuer_group",
+                  "group": {
+                    "issuer": "https://Identity.example.test/Exact%2fIssuer",
+                    "id": "SampleGroup"
+                  }
+                }
+              ]
+            }
+          }
+        }
+      },
+      "expected": "valid",
+      "schema_valid": true
+    },
+    {
+      "name": "intent-counter-0",
+      "target": "change",
+      "input": {
+        "schema_version": 1,
+        "tenant_id": "11111111-1111-1111-1111-111111111111",
+        "agent_id": "22222222-2222-2222-2222-222222222222",
+        "expected_version": 0,
+        "role": "invocation",
+        "operation": "set_filter",
+        "filter": {
+          "entries": [
+            {
+              "kind": "surface_account",
+              "provider": "Sample-chat",
+              "namespace": {
+                "id": "33333333-3333-3333-3333-333333333333",
+                "authority": "",
+                "kind": "Workspace",
+                "key": "SampleWorkspace"
+              },
+              "native_id": "SampleAccount"
+            },
+            {
+              "kind": "issuer_subject",
+              "issuer": "https://Identity.example.test/Exact%2fIssuer",
+              "subject": "SampleSubject"
+            },
+            {
+              "kind": "issuer_group",
+              "group": {
+                "issuer": "https://Identity.example.test/Exact%2fIssuer",
+                "id": "SampleGroup"
+              }
+            }
+          ]
+        }
+      },
+      "expected": "valid",
+      "schema_valid": true
+    },
+    {
+      "name": "intent-counter-1",
+      "target": "change",
+      "input": {
+        "schema_version": 1,
+        "tenant_id": "11111111-1111-1111-1111-111111111111",
+        "agent_id": "22222222-2222-2222-2222-222222222222",
+        "expected_version": 1,
+        "role": "invocation",
+        "operation": "set_filter",
+        "filter": {
+          "entries": [
+            {
+              "kind": "surface_account",
+              "provider": "Sample-chat",
+              "namespace": {
+                "id": "33333333-3333-3333-3333-333333333333",
+                "authority": "",
+                "kind": "Workspace",
+                "key": "SampleWorkspace"
+              },
+              "native_id": "SampleAccount"
+            },
+            {
+              "kind": "issuer_subject",
+              "issuer": "https://Identity.example.test/Exact%2fIssuer",
+              "subject": "SampleSubject"
+            },
+            {
+              "kind": "issuer_group",
+              "group": {
+                "issuer": "https://Identity.example.test/Exact%2fIssuer",
+                "id": "SampleGroup"
+              }
+            }
+          ]
+        }
+      },
+      "expected": "valid",
+      "schema_valid": true
+    },
+    {
+      "name": "intent-counter-2147483647",
+      "target": "change",
+      "input": {
+        "schema_version": 1,
+        "tenant_id": "11111111-1111-1111-1111-111111111111",
+        "agent_id": "22222222-2222-2222-2222-222222222222",
+        "expected_version": 2147483647,
+        "role": "invocation",
+        "operation": "set_filter",
+        "filter": {
+          "entries": [
+            {
+              "kind": "surface_account",
+              "provider": "Sample-chat",
+              "namespace": {
+                "id": "33333333-3333-3333-3333-333333333333",
+                "authority": "",
+                "kind": "Workspace",
+                "key": "SampleWorkspace"
+              },
+              "native_id": "SampleAccount"
+            },
+            {
+              "kind": "issuer_subject",
+              "issuer": "https://Identity.example.test/Exact%2fIssuer",
+              "subject": "SampleSubject"
+            },
+            {
+              "kind": "issuer_group",
+              "group": {
+                "issuer": "https://Identity.example.test/Exact%2fIssuer",
+                "id": "SampleGroup"
+              }
+            }
+          ]
+        }
+      },
+      "expected": "valid",
+      "schema_valid": true
+    },
+    {
+      "name": "null-role",
+      "target": "policy",
+      "input": {
+        "schema_version": 1,
+        "tenant_id": "11111111-1111-1111-1111-111111111111",
+        "agent_id": "22222222-2222-2222-2222-222222222222",
+        "version": 7,
+        "roles": {
+          "invocation": null
+        }
+      },
+      "expected": "invalid_agent_role_configuration",
+      "schema_valid": false
+    },
+    {
+      "name": "missing-filter",
+      "target": "policy",
+      "input": {
+        "schema_version": 1,
+        "tenant_id": "11111111-1111-1111-1111-111111111111",
+        "agent_id": "22222222-2222-2222-2222-222222222222",
+        "version": 7,
+        "roles": {
+          "invocation": {
+            "schema_version": 1,
+            "legacy_state": "retained"
+          }
+        }
+      },
+      "expected": "invalid_agent_role_configuration",
+      "schema_valid": false
+    },
+    {
+      "name": "missing-disclosure",
+      "target": "policy",
+      "input": {
+        "schema_version": 1,
+        "tenant_id": "11111111-1111-1111-1111-111111111111",
+        "agent_id": "22222222-2222-2222-2222-222222222222",
+        "version": 7,
+        "roles": {
+          "invocation": {
+            "schema_version": 1,
+            "legacy_state": "migrated",
+            "filter": {
+              "entries": [
+                {
+                  "kind": "surface_account",
+                  "provider": "Sample-chat",
+                  "namespace": {
+                    "id": "33333333-3333-3333-3333-333333333333",
+                    "authority": "",
+                    "kind": "Workspace",
+                    "key": "SampleWorkspace"
+                  },
+                  "native_id": "SampleAccount"
+                },
+                {
+                  "kind": "issuer_subject",
+                  "issuer": "https://Identity.example.test/Exact%2fIssuer",
+                  "subject": "SampleSubject"
+                },
+                {
+                  "kind": "issuer_group",
+                  "group": {
+                    "issuer": "https://Identity.example.test/Exact%2fIssuer",
+                    "id": "SampleGroup"
+                  }
+                }
+              ]
+            }
+          }
+        }
+      },
+      "expected": "invalid_agent_role_configuration",
+      "schema_valid": false
+    },
+    {
+      "name": "retained-disclosure",
+      "target": "policy",
+      "input": {
+        "schema_version": 1,
+        "tenant_id": "11111111-1111-1111-1111-111111111111",
+        "agent_id": "22222222-2222-2222-2222-222222222222",
+        "version": 7,
+        "roles": {
+          "invocation": {
+            "schema_version": 1,
+            "legacy_state": "retained",
+            "filter": {
+              "entries": [
+                {
+                  "kind": "surface_account",
+                  "provider": "Sample-chat",
+                  "namespace": {
+                    "id": "33333333-3333-3333-3333-333333333333",
+                    "authority": "",
+                    "kind": "Workspace",
+                    "key": "SampleWorkspace"
+                  },
+                  "native_id": "SampleAccount"
+                },
+                {
+                  "kind": "issuer_subject",
+                  "issuer": "https://Identity.example.test/Exact%2fIssuer",
+                  "subject": "SampleSubject"
+                },
+                {
+                  "kind": "issuer_group",
+                  "group": {
+                    "issuer": "https://Identity.example.test/Exact%2fIssuer",
+                    "id": "SampleGroup"
+                  }
+                }
+              ]
+            },
+            "raw_account_revocation": "separate_removal_required"
+          }
+        }
+      },
+      "expected": "invalid_agent_role_configuration",
+      "schema_valid": false
+    },
+    {
+      "name": "snapshot-zero",
+      "target": "policy",
+      "input": {
+        "schema_version": 1,
+        "tenant_id": "11111111-1111-1111-1111-111111111111",
+        "agent_id": "22222222-2222-2222-2222-222222222222",
+        "version": 0,
+        "roles": {
+          "invocation": {
+            "schema_version": 1,
+            "legacy_state": "retained",
+            "filter": {
+              "entries": [
+                {
+                  "kind": "surface_account",
+                  "provider": "Sample-chat",
+                  "namespace": {
+                    "id": "33333333-3333-3333-3333-333333333333",
+                    "authority": "",
+                    "kind": "Workspace",
+                    "key": "SampleWorkspace"
+                  },
+                  "native_id": "SampleAccount"
+                },
+                {
+                  "kind": "issuer_subject",
+                  "issuer": "https://Identity.example.test/Exact%2fIssuer",
+                  "subject": "SampleSubject"
+                },
+                {
+                  "kind": "issuer_group",
+                  "group": {
+                    "issuer": "https://Identity.example.test/Exact%2fIssuer",
+                    "id": "SampleGroup"
+                  }
+                }
+              ]
+            }
+          }
+        }
+      },
+      "expected": "invalid_agent_role_configuration",
+      "schema_valid": false
+    },
+    {
+      "name": "snapshot-overflow",
+      "target": "policy",
+      "input": {
+        "schema_version": 1,
+        "tenant_id": "11111111-1111-1111-1111-111111111111",
+        "agent_id": "22222222-2222-2222-2222-222222222222",
+        "version": 2147483648,
+        "roles": {
+          "invocation": {
+            "schema_version": 1,
+            "legacy_state": "retained",
+            "filter": {
+              "entries": [
+                {
+                  "kind": "surface_account",
+                  "provider": "Sample-chat",
+                  "namespace": {
+                    "id": "33333333-3333-3333-3333-333333333333",
+                    "authority": "",
+                    "kind": "Workspace",
+                    "key": "SampleWorkspace"
+                  },
+                  "native_id": "SampleAccount"
+                },
+                {
+                  "kind": "issuer_subject",
+                  "issuer": "https://Identity.example.test/Exact%2fIssuer",
+                  "subject": "SampleSubject"
+                },
+                {
+                  "kind": "issuer_group",
+                  "group": {
+                    "issuer": "https://Identity.example.test/Exact%2fIssuer",
+                    "id": "SampleGroup"
+                  }
+                }
+              ]
+            }
+          }
+        }
+      },
+      "expected": "invalid_agent_role_configuration",
+      "schema_valid": false
+    },
+    {
+      "name": "intent-overflow",
+      "target": "change",
+      "input": {
+        "schema_version": 1,
+        "tenant_id": "11111111-1111-1111-1111-111111111111",
+        "agent_id": "22222222-2222-2222-2222-222222222222",
+        "expected_version": 2147483648,
+        "role": "invocation",
+        "operation": "set_filter",
+        "filter": {
+          "entries": [
+            {
+              "kind": "surface_account",
+              "provider": "Sample-chat",
+              "namespace": {
+                "id": "33333333-3333-3333-3333-333333333333",
+                "authority": "",
+                "kind": "Workspace",
+                "key": "SampleWorkspace"
+              },
+              "native_id": "SampleAccount"
+            },
+            {
+              "kind": "issuer_subject",
+              "issuer": "https://Identity.example.test/Exact%2fIssuer",
+              "subject": "SampleSubject"
+            },
+            {
+              "kind": "issuer_group",
+              "group": {
+                "issuer": "https://Identity.example.test/Exact%2fIssuer",
+                "id": "SampleGroup"
+              }
+            }
+          ]
+        }
+      },
+      "expected": "invalid_agent_role_configuration",
+      "schema_valid": false
+    },
+    {
+      "name": "migrate-missing-disclosure",
+      "target": "change",
+      "input": {
+        "schema_version": 1,
+        "tenant_id": "11111111-1111-1111-1111-111111111111",
+        "agent_id": "22222222-2222-2222-2222-222222222222",
+        "expected_version": 0,
+        "role": "invocation",
+        "operation": "migrate_role",
+        "filter": {
+          "entries": [
+            {
+              "kind": "surface_account",
+              "provider": "Sample-chat",
+              "namespace": {
+                "id": "33333333-3333-3333-3333-333333333333",
+                "authority": "",
+                "kind": "Workspace",
+                "key": "SampleWorkspace"
+              },
+              "native_id": "SampleAccount"
+            },
+            {
+              "kind": "issuer_subject",
+              "issuer": "https://Identity.example.test/Exact%2fIssuer",
+              "subject": "SampleSubject"
+            },
+            {
+              "kind": "issuer_group",
+              "group": {
+                "issuer": "https://Identity.example.test/Exact%2fIssuer",
+                "id": "SampleGroup"
+              }
+            }
+          ]
+        }
+      },
+      "expected": "invalid_agent_role_configuration",
+      "schema_valid": false
+    },
+    {
+      "name": "set-unexpected-disclosure",
+      "target": "change",
+      "input": {
+        "schema_version": 1,
+        "tenant_id": "11111111-1111-1111-1111-111111111111",
+        "agent_id": "22222222-2222-2222-2222-222222222222",
+        "expected_version": 0,
+        "role": "invocation",
+        "operation": "set_filter",
+        "filter": {
+          "entries": [
+            {
+              "kind": "surface_account",
+              "provider": "Sample-chat",
+              "namespace": {
+                "id": "33333333-3333-3333-3333-333333333333",
+                "authority": "",
+                "kind": "Workspace",
+                "key": "SampleWorkspace"
+              },
+              "native_id": "SampleAccount"
+            },
+            {
+              "kind": "issuer_subject",
+              "issuer": "https://Identity.example.test/Exact%2fIssuer",
+              "subject": "SampleSubject"
+            },
+            {
+              "kind": "issuer_group",
+              "group": {
+                "issuer": "https://Identity.example.test/Exact%2fIssuer",
+                "id": "SampleGroup"
+              }
+            }
+          ]
+        },
+        "raw_account_revocation": "separate_removal_required"
+      },
+      "expected": "invalid_agent_role_configuration",
+      "schema_valid": false
+    },
+    {
+      "name": "receiving-channel-selector",
+      "target": "policy",
+      "input": {
+        "schema_version": 1,
+        "tenant_id": "11111111-1111-1111-1111-111111111111",
+        "agent_id": "22222222-2222-2222-2222-222222222222",
+        "version": 7,
+        "roles": {
+          "invocation": {
+            "schema_version": 1,
+            "legacy_state": "retained",
+            "filter": {
+              "entries": [
+                {
+                  "kind": "surface_account",
+                  "provider": "Sample-chat",
+                  "namespace": {
+                    "id": "33333333-3333-3333-3333-333333333333",
+                    "authority": "",
+                    "kind": "Workspace",
+                    "key": "SampleWorkspace"
+                  },
+                  "native_id": "SampleAccount",
+                  "channel_identity_id": "22222222-2222-2222-2222-222222222222"
+                },
+                {
+                  "kind": "issuer_subject",
+                  "issuer": "https://Identity.example.test/Exact%2fIssuer",
+                  "subject": "SampleSubject"
+                },
+                {
+                  "kind": "issuer_group",
+                  "group": {
+                    "issuer": "https://Identity.example.test/Exact%2fIssuer",
+                    "id": "SampleGroup"
+                  }
+                }
+              ]
+            }
+          }
+        }
+      },
+      "expected": "invalid_agent_role_configuration",
+      "schema_valid": false
+    },
+    {
+      "name": "duplicate-exact-selector",
+      "target": "policy",
+      "input": {
+        "schema_version": 1,
+        "tenant_id": "11111111-1111-1111-1111-111111111111",
+        "agent_id": "22222222-2222-2222-2222-222222222222",
+        "version": 7,
+        "roles": {
+          "invocation": {
+            "schema_version": 1,
+            "legacy_state": "retained",
+            "filter": {
+              "entries": [
+                {
+                  "kind": "surface_account",
+                  "provider": "Sample-chat",
+                  "namespace": {
+                    "id": "33333333-3333-3333-3333-333333333333",
+                    "authority": "",
+                    "kind": "Workspace",
+                    "key": "SampleWorkspace"
+                  },
+                  "native_id": "SampleAccount"
+                },
+                {
+                  "kind": "surface_account",
+                  "provider": "Sample-chat",
+                  "namespace": {
+                    "id": "33333333-3333-3333-3333-333333333333",
+                    "authority": "",
+                    "kind": "Workspace",
+                    "key": "SampleWorkspace"
+                  },
+                  "native_id": "SampleAccount"
+                }
+              ]
+            }
+          }
+        }
+      },
+      "expected": "invalid_agent_role_configuration",
+      "schema_valid": false
+    },
+    {
+      "name": "schema-version-negative",
+      "target": "policy",
+      "input": {
+        "schema_version": -1,
+        "tenant_id": "11111111-1111-1111-1111-111111111111",
+        "agent_id": "22222222-2222-2222-2222-222222222222",
+        "version": 7,
+        "roles": {
+          "invocation": {
+            "schema_version": 1,
+            "legacy_state": "retained",
+            "filter": {
+              "entries": [
+                {
+                  "kind": "surface_account",
+                  "provider": "Sample-chat",
+                  "namespace": {
+                    "id": "33333333-3333-3333-3333-333333333333",
+                    "authority": "",
+                    "kind": "Workspace",
+                    "key": "SampleWorkspace"
+                  },
+                  "native_id": "SampleAccount"
+                },
+                {
+                  "kind": "issuer_subject",
+                  "issuer": "https://Identity.example.test/Exact%2fIssuer",
+                  "subject": "SampleSubject"
+                },
+                {
+                  "kind": "issuer_group",
+                  "group": {
+                    "issuer": "https://Identity.example.test/Exact%2fIssuer",
+                    "id": "SampleGroup"
+                  }
+                }
+              ]
+            }
+          }
+        }
+      },
+      "expected": "unsupported_agent_role_configuration_version",
+      "schema_valid": false
+    },
+    {
+      "name": "subject-insecure-issuer",
+      "target": "change",
+      "input": {
+        "schema_version": 1,
+        "tenant_id": "11111111-1111-1111-1111-111111111111",
+        "agent_id": "22222222-2222-2222-2222-222222222222",
+        "expected_version": 0,
+        "role": "invocation",
+        "operation": "set_filter",
+        "filter": {
+          "entries": [
+            {
+              "kind": "surface_account",
+              "provider": "Sample-chat",
+              "namespace": {
+                "id": "33333333-3333-3333-3333-333333333333",
+                "authority": "",
+                "kind": "Workspace",
+                "key": "SampleWorkspace"
+              },
+              "native_id": "SampleAccount"
+            },
+            {
+              "kind": "issuer_subject",
+              "issuer": "http://identity.example.test",
+              "subject": "SampleSubject"
+            },
+            {
+              "kind": "issuer_group",
+              "group": {
+                "issuer": "https://Identity.example.test/Exact%2fIssuer",
+                "id": "SampleGroup"
+              }
+            }
+          ]
+        }
+      },
+      "expected": "invalid_agent_role_configuration",
+      "schema_valid": false
+    },
+    {
+      "name": "integral-root-decimal",
+      "target": "policy",
+      "input": {
+        "schema_version": 1.0,
+        "tenant_id": "11111111-1111-1111-1111-111111111111",
+        "agent_id": "22222222-2222-2222-2222-222222222222",
+        "version": 7,
+        "roles": {
+          "invocation": {
+            "schema_version": 1,
+            "legacy_state": "retained",
+            "filter": {
+              "entries": [
+                {
+                  "kind": "surface_account",
+                  "provider": "Sample-chat",
+                  "namespace": {
+                    "id": "33333333-3333-3333-3333-333333333333",
+                    "authority": "",
+                    "kind": "Workspace",
+                    "key": "SampleWorkspace"
+                  },
+                  "native_id": "SampleAccount"
+                },
+                {
+                  "kind": "issuer_subject",
+                  "issuer": "https://Identity.example.test/Exact%2fIssuer",
+                  "subject": "SampleSubject"
+                },
+                {
+                  "kind": "issuer_group",
+                  "group": {
+                    "issuer": "https://Identity.example.test/Exact%2fIssuer",
+                    "id": "SampleGroup"
+                  }
+                }
+              ]
+            }
+          }
+        }
+      },
+      "expected": "invalid_agent_role_configuration",
+      "schema_valid": true,
+      "exception": "integer-token spelling"
+    },
+    {
+      "name": "integral-counter-decimal",
+      "target": "policy",
+      "input": {
+        "schema_version": 1,
+        "tenant_id": "11111111-1111-1111-1111-111111111111",
+        "agent_id": "22222222-2222-2222-2222-222222222222",
+        "version": 7.0,
+        "roles": {
+          "invocation": {
+            "schema_version": 1,
+            "legacy_state": "retained",
+            "filter": {
+              "entries": [
+                {
+                  "kind": "surface_account",
+                  "provider": "Sample-chat",
+                  "namespace": {
+                    "id": "33333333-3333-3333-3333-333333333333",
+                    "authority": "",
+                    "kind": "Workspace",
+                    "key": "SampleWorkspace"
+                  },
+                  "native_id": "SampleAccount"
+                },
+                {
+                  "kind": "issuer_subject",
+                  "issuer": "https://Identity.example.test/Exact%2fIssuer",
+                  "subject": "SampleSubject"
+                },
+                {
+                  "kind": "issuer_group",
+                  "group": {
+                    "issuer": "https://Identity.example.test/Exact%2fIssuer",
+                    "id": "SampleGroup"
+                  }
+                }
+              ]
+            }
+          }
+        }
+      },
+      "expected": "invalid_agent_role_configuration",
+      "schema_valid": true,
+      "exception": "integer-token spelling"
+    },
+    {
+      "name": "integral-role-decimal",
+      "target": "policy",
+      "input": {
+        "schema_version": 1,
+        "tenant_id": "11111111-1111-1111-1111-111111111111",
+        "agent_id": "22222222-2222-2222-2222-222222222222",
+        "version": 7,
+        "roles": {
+          "invocation": {
+            "schema_version": 1.0,
+            "legacy_state": "retained",
+            "filter": {
+              "entries": [
+                {
+                  "kind": "surface_account",
+                  "provider": "Sample-chat",
+                  "namespace": {
+                    "id": "33333333-3333-3333-3333-333333333333",
+                    "authority": "",
+                    "kind": "Workspace",
+                    "key": "SampleWorkspace"
+                  },
+                  "native_id": "SampleAccount"
+                },
+                {
+                  "kind": "issuer_subject",
+                  "issuer": "https://Identity.example.test/Exact%2fIssuer",
+                  "subject": "SampleSubject"
+                },
+                {
+                  "kind": "issuer_group",
+                  "group": {
+                    "issuer": "https://Identity.example.test/Exact%2fIssuer",
+                    "id": "SampleGroup"
+                  }
+                }
+              ]
+            }
+          }
+        }
+      },
+      "expected": "invalid_agent_role_configuration",
+      "schema_valid": true,
+      "exception": "integer-token spelling"
+    },
+    {
+      "name": "nfkc-netloc",
+      "target": "policy",
+      "input": {
+        "schema_version": 1,
+        "tenant_id": "11111111-1111-1111-1111-111111111111",
+        "agent_id": "22222222-2222-2222-2222-222222222222",
+        "version": 7,
+        "roles": {
+          "invocation": {
+            "schema_version": 1,
+            "legacy_state": "retained",
+            "filter": {
+              "entries": [
+                {
+                  "kind": "surface_account",
+                  "provider": "Sample-chat",
+                  "namespace": {
+                    "id": "33333333-3333-3333-3333-333333333333",
+                    "authority": "",
+                    "kind": "Workspace",
+                    "key": "SampleWorkspace"
+                  },
+                  "native_id": "SampleAccount"
+                },
+                {
+                  "kind": "issuer_subject",
+                  "issuer": "https://identity.example.test\uff1a443",
+                  "subject": "SampleSubject"
+                },
+                {
+                  "kind": "issuer_group",
+                  "group": {
+                    "issuer": "https://Identity.example.test/Exact%2fIssuer",
+                    "id": "SampleGroup"
+                  }
+                }
+              ]
+            }
+          }
+        }
+      },
+      "expected": "invalid_agent_role_configuration",
+      "schema_valid": true,
+      "exception": "inherited Issuer Unicode-NFKC validity"
+    },
+    {
+      "name": "unpaired-surrogate",
+      "target": "policy",
+      "input": {
+        "schema_version": 1,
+        "tenant_id": "11111111-1111-1111-1111-111111111111",
+        "agent_id": "22222222-2222-2222-2222-222222222222",
+        "version": 7,
+        "roles": {
+          "invocation": {
+            "schema_version": 1,
+            "legacy_state": "retained",
+            "filter": {
+              "entries": [
+                {
+                  "kind": "surface_account",
+                  "provider": "Sample-chat",
+                  "namespace": {
+                    "id": "33333333-3333-3333-3333-333333333333",
+                    "authority": "",
+                    "kind": "Workspace",
+                    "key": "SampleWorkspace"
+                  },
+                  "native_id": "SampleAccount"
+                },
+                {
+                  "kind": "issuer_subject",
+                  "issuer": "https://Identity.example.test/Exact%2fIssuer",
+                  "subject": "\ud800"
+                },
+                {
+                  "kind": "issuer_group",
+                  "group": {
+                    "issuer": "https://Identity.example.test/Exact%2fIssuer",
+                    "id": "SampleGroup"
+                  }
+                }
+              ]
+            }
+          }
+        }
+      },
+      "expected": "invalid_agent_role_configuration",
+      "schema_valid": true,
+      "exception": "unpaired-surrogate rejection"
+    },
+    {
+      "name": "policy-namespace-descriptor-contradiction",
+      "target": "policy",
+      "input": {
+        "schema_version": 1,
+        "tenant_id": "11111111-1111-1111-1111-111111111111",
+        "agent_id": "22222222-2222-2222-2222-222222222222",
+        "version": 7,
+        "roles": {
+          "invocation": {
+            "schema_version": 1,
+            "legacy_state": "retained",
+            "filter": {
+              "entries": [
+                {
+                  "kind": "surface_account",
+                  "provider": "Sample-chat",
+                  "namespace": {
+                    "id": "33333333-3333-3333-3333-333333333333",
+                    "authority": "",
+                    "kind": "Workspace",
+                    "key": "SampleWorkspace"
+                  },
+                  "native_id": "SampleAccount"
+                },
+                {
+                  "kind": "surface_account",
+                  "provider": "Sample-chat",
+                  "namespace": {
+                    "id": "33333333-3333-3333-3333-333333333333",
+                    "authority": "",
+                    "kind": "Workspace",
+                    "key": "OtherWorkspace"
+                  },
+                  "native_id": "SampleAccount"
+                }
+              ]
+            }
+          }
+        }
+      },
+      "expected": "invalid_agent_role_configuration",
+      "schema_valid": true,
+      "exception": "namespace consistency"
+    },
+    {
+      "name": "change-namespace-descriptor-contradiction",
+      "target": "change",
+      "input": {
+        "schema_version": 1,
+        "tenant_id": "11111111-1111-1111-1111-111111111111",
+        "agent_id": "22222222-2222-2222-2222-222222222222",
+        "expected_version": 0,
+        "role": "invocation",
+        "operation": "set_filter",
+        "filter": {
+          "entries": [
+            {
+              "kind": "surface_account",
+              "provider": "Sample-chat",
+              "namespace": {
+                "id": "33333333-3333-3333-3333-333333333333",
+                "authority": "",
+                "kind": "Workspace",
+                "key": "SampleWorkspace"
+              },
+              "native_id": "SampleAccount"
+            },
+            {
+              "kind": "surface_account",
+              "provider": "Sample-chat",
+              "namespace": {
+                "id": "33333333-3333-3333-3333-333333333333",
+                "authority": "",
+                "kind": "Workspace",
+                "key": "OtherWorkspace"
+              },
+              "native_id": "SampleAccount"
+            }
+          ]
+        }
+      },
+      "expected": "invalid_agent_role_configuration",
+      "schema_valid": true,
+      "exception": "namespace consistency"
+    }
+  ]
+}

@@ -23,9 +23,12 @@ order: 7
 ## The black line
 
 On the write side, observability is swapped at the OTLP wire, not in code. The API,
-dispatcher, worker, eval worker, mail adapter, and runner emit OTLP traces, logs, and metrics to an
-OpenTelemetry Collector; services never authenticate to or speak a storage backend
-directly. Standard `OTEL_EXPORTER_OTLP_*` endpoint, protocol, and header variables select
+dispatcher, worker, eval worker, mail adapter, Discord adapter, and runner use the
+shared OTLP telemetry path to an OpenTelemetry Collector. Eval result recording
+is a separate exception: `LangfuseEvalRecorder`
+(`apps/worker/src/curie_worker/eval/recorder.py::LangfuseEvalRecorder`) authenticates
+and posts directly to Langfuse's `/api/public/ingestion`; see the
+[evals seam](../evals/INTERFACE.md). Standard `OTEL_EXPORTER_OTLP_*` endpoint, protocol, and header variables select
 the wire transport independently per signal. With no endpoint a process keeps its JSON
 stderr diagnostics and uses no-op trace/log exporters rather than inventing a localhost
 destination.
@@ -59,8 +62,18 @@ than an open bag of `gen_ai.*` names.
   parentage and honest status for platform operations. Its caller vocabulary is closed
   to `service.name`, `operation`, `role`, `source`, `outcome`, `retry_class`, and
   `event_id`; custom keys export only as `curie.operation`, `curie.role`, `curie.source`,
-  `curie.outcome`, `curie.retry_class`, and `curie.channel.event_id`. `event_id` is the
-  one correlation identifier the vocabulary admits, and it is admitted on spans only:
+  `curie.outcome`, `curie.retry_class`, and `curie.channel.event_id`. The remediation
+  receipt span, `curie.remediation.receipt`
+  (`apps/worker/src/curie_worker/remediation_receipts.py`), may also carry `stage`,
+  `kind`, `authority`, `code`, and `nomination_id`, exported as
+  `curie.remediation.stage`, `curie.remediation.kind`, `curie.remediation.authority`,
+  `curie.remediation.code`, and `curie.remediation.nomination_id`. The worker's turn
+  span may also carry `termination_reason` and `termination_exit_code`, exported as
+  `curie.sandbox.termination.reason` and `curie.sandbox.termination.exit_code`, only for
+  a confirmed runner pod termination; the reason is one of `OOMKilled`, `Evicted`,
+  `Deleted`, or `Unknown`, the exit code is an int from 0 to 255, and termination detail
+  text is never exported. `event_id` and `nomination_id` are the
+  correlation identifiers the vocabulary admits, and they are admitted on spans only:
   the metric catalog stays closed to it, because `record_metric` enumerates a value
   domain per attribute and an identifier has none. Spans describing the turn's own
   request-path work carry `curie.channel.event_id`, so a query on that attribute never
@@ -90,14 +103,19 @@ than an open bag of `gen_ai.*` names.
 - The metric catalog in `packages/telemetry/schema/metrics.json` is the committed
   contract for operational counters, histograms, and gauges across turn, queue,
   thread-lock, sandbox, runner RPC, approval, completion-outbox, reply, HTTP,
-  background-loop, connector-reconcile skips, schedule fires, eval work,
-  transcript-capacity, state mutations, supervised-task restarts, tool results, and
-  Slack Socket Mode connection state.
+  background-loop, connector-reconcile skips, end to end namespace reaper health,
+  schedule fires, eval work,
+  transcript-capacity, capacity waits (`curie.capacity.wait`), state mutations,
+  legacy state-token use (`curie.state.legacy_token`), supervised-task restarts,
+  work-item reconciler step failures (`curie.work_item.reconciler.step.failure`), tool
+  results, Slack Socket Mode connection state, and Slack Socket Mode delivery
+  per identity (`curie.slack.socket.envelopes`, `curie.slack.delivery_canary`).
   `record_metric`
   (`packages/telemetry/src/curie_telemetry/metrics.py::record_metric`) rejects undeclared
   instruments, attribute keys, and enum values. Its allowlisted dimensions describe
   operation classes and outcomes, not event, run, session, sandbox, user, or
-  deployment identifiers. The one exception is `curie.agent.turn.completed`, whose
+  deployment identifiers. Three bounded identifier dimensions are declared:
+  `curie.agent.turn.completed`, whose
   `agent` label admits at most 32 distinct slugs per process and folds the rest,
   plus any name that is not a 1 to 63 character slug, into `other`
   (`packages/telemetry/src/curie_telemetry/metrics.py::record_metric`).
@@ -106,12 +124,32 @@ than an open bag of `gen_ai.*` names.
   `agent="other"` series means the ceiling or the slug rule is hiding a name.
   `unbound` is only a turn that never resolved an agent. A real agent named
   `other` or `unbound` shares `other`. Every other instrument refuses an
-  agent identifier. The application-defined series space remains bounded.
+  agent identifier. `curie.action_executor.execution` admits at most 16 distinct connector
+  slugs per process through its `connector` dimension, folding invalid names and
+  overflow into `other` (`packages/telemetry/src/curie_telemetry/metrics.py`).
+  `curie.slack.socket.envelopes` and `curie.slack.delivery_canary` admit at most
+  16 distinct Slack identity names per process through their `slack_identity`
+  dimension, folding names that are not an identity slug, and overflow, into
+  `other`. An install declares a handful of identities, and a silent identity
+  can only be found by name. `curie.slack.socket.identities` keeps no identity
+  dimension.
+  The application-defined series space remains bounded.
   Standard resource identity still contributes one anonymous `service.instance.id` per
   running process. It is independent of turn input and adds at most one resource series
   per live or restarted process, never one per event, session, user, or sandbox. The
   1,000-identifier regression exercises this production resource shape as well as the
   point attributes.
+- `curie.e2e.reaper.last_success` is the unix time of the worker's last clean end to
+  end namespace sweep, recorded every pass and 0 until one succeeds.
+  `curie.e2e.namespaces.expired` counts the scoped namespaces past their TTL, and
+  `curie.e2e.namespaces.overdue` the ones at least ten minutes past it or without a
+  readable TTL (`OVERDUE_GRACE_S` in
+  `apps/e2e-connector/src/curie_e2e_connector/reaper.py`). Both are recorded only by a
+  pass that listed every test cluster
+  (`apps/worker/src/curie_worker/e2e_reaper.py::E2EReaperLoop.sweep_once`, #3245). The
+  page keys on `overdue`, since a healthy reaper always sees a few namespaces just past
+  their TTL between sweeps. None of the three carries a namespace or run name; each reaped namespace logs one WARNING
+  naming it and whether the TTL or a terminal run status caused the delete.
 - `curie.tool.result` counts each tool result the runner sees close a call made in the
   same turn, by `origin` and `outcome`
   (`runner/src/curie_runner/session.py::SessionRunner._observe_tool_results`). The
@@ -143,7 +181,7 @@ its specialized trace provider in `runner/src/curie_runner/otel.py`. Per ADR-007
 generation spans use a closed, versioned attribute schema, not an open bag of `gen_ai.*`
 keys:
 
-- **The vocabulary is closed and committed.** `SpanAttributeKey`
+1. **The vocabulary is closed and committed.** `SpanAttributeKey`
   (`packages/telemetry-schema/src/curie_telemetry_schema/__init__.py::SpanAttributeKey`) is the only key set the runner
   may attach: `langfuse.trace.name`, `langfuse.session.id`, `langfuse.user.id`,
   `gen_ai.approval.decision`, `gen_ai.request.model`, a bare `model`,
@@ -154,20 +192,29 @@ keys:
   `curie.phase`, `curie.phase.start_kind`, `curie.phase.end_kind`,
   `curie.terminal.cause`, `curie.terminal.status`, `curie.generation.ttft_ms`,
   `curie.generation.round`, `curie.tool.call.index`, and `curie.tool.outcome`.
+  Failure telemetry adds two optional v1 keys on the `agent.run` root (#4940):
+  `curie.terminal.classification`, set only when `curie.terminal.cause` is
+  `classified_failure`, with a value from `PLATFORM_ERROR_CLASSIFICATIONS`
+  (`runner/src/curie_runner/translate.py::PLATFORM_ERROR_CLASSIFICATIONS`) or
+  `unclassified` (the last ErrorEvent classification of the turn; no classification
+  when the turn emitted none), and `curie.budget.output_ceiling`, the output token
+  ceiling from 1 to 1000000, set only when that classification is `budget-exceeded`.
+  Neither carries message text.
   Generation content adds `langfuse.observation.input` and `langfuse.observation.output`
   (#3128), on `llm.generation` spans only, redacted and then clipped to 8000 characters.
   Input is a `[user prompt: N chars]` placeholder (never the prompt text) or the names
   of the tool results that opened the round
   (`[tool_result NAME]`, `[tool_result NAME error]`); output is assistant text and
-  `[tool_use NAME]` markers. Tool arguments and tool results are never recorded.
+  `[tool_use NAME]` markers. The text of an assistant message reporting a provider
+  error is never recorded. Tool arguments and tool results are never recorded.
   `curie.usage.scope` marks the ResultMessage usage fallback: when no generation in the
-  turn received per-message usage, the turn total is stamped on the final generation
-  with scope `turn`, earlier generations carry no usage, and if no generation is active
+  turn received nonzero per-message usage, the turn total is stamped on the final generation
+  with scope `turn`, earlier generations receive none of that total, and if no generation is active
   at the result the root gets scope `unrecorded`. Per-message usage sets no scope key.
   `SPAN_ATTRIBUTE_VALUE_TYPES`
   (`runner/src/curie_runner/otel.py::SPAN_ATTRIBUTE_VALUE_TYPES`) declares each key's
-  value type: the four usage counts, generation TTFT, generation round, and bounded tool
-  call index are `int`; every other key is `str`.
+  value type: the four usage counts, generation TTFT, generation round, bounded tool
+  call index, and output token ceiling are `int`; every other key is `str`.
 - **The schema is versioned.** `SCHEMA_VERSION`
   (`runner/src/curie_runner/otel.py::SCHEMA_VERSION`) is `v1`, stamped on the resource as
   `schema.version`, and bumps only when a key is removed, renamed, or retyped; a new
@@ -208,12 +255,15 @@ keys:
   is also a direct child of `agent.run`, never a generation child, so provider and tool
   phases are root siblings rather than a legacy monolithic generation containing
   zero-duration tool markers.
-- **Generation data belongs to its round.** The configured model, or the first non-empty
+8. **Generation data belongs to its round.** The configured model, or the first non-empty
   model reported by an `AssistantMessage`, stamps `gen_ai.request.model` and the bare
   `model` once on that generation. The four usage attributes accumulate only the
   non-negative integer increments on `AssistantMessage` objects in that round;
-  `ResultMessage.usage` is a whole-turn total and is never copied onto the final
-  generation. When the real SDK supplies an allowlisted `message_start` or
+  `ResultMessage.usage` is a whole-turn total. When no generation received any nonzero
+  per-message count, `record_result_usage` stamps that total on the active final
+  generation with `curie.usage.scope=turn`, or marks the root `unrecorded` if no
+  generation is active. Zero per-message placeholders do not disable this fallback;
+  any nonzero count does, preventing double counting. When the real SDK supplies an allowlisted `message_start` or
   `content_block_start` partial boundary, the adapter strips it to payload-free evidence
   and the active generation records `curie.generation.ttft_ms` once. TTFT is omitted when
   no such boundary is available: direct compatibility setters may populate model or
@@ -283,12 +333,17 @@ create a recursive failure loop.
 ## Implementations today
 
 One trace backend: Langfuse, reached through the OTel Collector (which authenticates and
-forwards over HTTP because Langfuse OTLP ingest is HTTP-only). Every producer knows only
-OTLP. The chart injects one destination into the API, dispatcher, worker, eval worker,
+forwards over HTTP because Langfuse OTLP ingest is HTTP-only). Shared service
+telemetry uses OTLP; eval result recording uses Langfuse ingestion directly.
+The chart injects one destination into the API, dispatcher, worker, eval worker,
 mail adapter, and sandbox runner: the in-cluster collector, a chart-owned external endpoint, or nothing
 when telemetry is explicitly disabled. The local Compose profiles do the same for the
 services they start. The read side (trace list and tree reconstruction) remains a
 separate API concern.
+
+The Discord adapter also calls `bootstrap_service_telemetry` and flushes it on
+exit (`adapters/discord/src/curie_discord_adapter/main.py`); its OTLP destination
+comes from its environment.
 
 The default chart intentionally has no log or metric storage implementation: those
 pipelines terminate in named no-op exporters unless the operator adds durable backends.
@@ -297,17 +352,26 @@ installable observability stack tracked by #1765.
 
 ## Known leakage
 
-Three vendor-named attributes are set at the source on the root span rather than mapped in
+Eval results bypass the collector through the authenticated Langfuse ingestion
+API (`apps/worker/src/curie_worker/eval/recorder.py`). Swapping only the collector
+exporter does not replace this path; its write and read contracts are documented
+in the [evals seam](../evals/INTERFACE.md).
+
+Five vendor-named attributes are set at the source rather than mapped in
 the collector. `RunTracer.run_span` stamps `langfuse.trace.name`, `langfuse.session.id`,
 and `langfuse.user.id` (`runner/src/curie_runner/otel.py::RunTracer.run_span`) so Langfuse
-maps them to its name/Sessions/Users features. The collector trace pipeline is
-receivers/`memory_limiter`/`batch`/`otlphttp` with no attributes processor
-(`charts/curie/templates/_helpers.tpl`), so nothing downstream renames them. A clean seam
-would emit neutral attributes the collector maps to the vendor names; today all three
+maps them to its name/Sessions/Users features. Generation spans additionally
+stamp `langfuse.observation.input` and `langfuse.observation.output`. The default collector trace pipeline is
+receivers/`memory_limiter`/`batch`/`otlphttp` with no attributes processor.
+Operators may define `otelCollector.extraProcessors` and select ordered
+`otelCollector.extraTracePipelineProcessors` between `memory_limiter` and `batch`
+(`charts/curie/templates/_helpers.tpl`), including their own attribute mapping. No
+default mapping renames these source attributes. A clean seam
+would emit neutral attributes the collector maps to the vendor names; today all five
 vendor names are set at the source, and they are members of the closed schema, so a second
 backend inherits them.
 
-A fourth, subtler one: `record_model` stamps the bare `model` key alongside the
+Another source coupling: `record_model` stamps the bare `model` key alongside the
 semantic-convention `gen_ai.request.model`
 (`runner/src/curie_runner/otel.py::_GenerationSpan.record_model`). `model` is not a
 `gen_ai` semantic-convention key; it exists because the generation span has to carry a
@@ -325,8 +389,9 @@ The three hoist readers bind those keys through the closed enum:
 (`apps/api/src/curie_api/langfuse.py::_TOOL_NAME_ATTR`) is
 `SpanAttributeKey.TOOL_NAME.value` and is surfaced as `toolName` on each observation
 node. The remaining leak
-is the three `langfuse.*` writer attributes (`langfuse.trace.name`,
-`langfuse.session.id`, `langfuse.user.id`) and the `/langfuse` URL namespace.
+is the five `langfuse.*` writer attributes (`langfuse.trace.name`,
+`langfuse.session.id`, `langfuse.user.id`, `langfuse.observation.input`,
+`langfuse.observation.output`) and the `/langfuse` URL namespace.
 
 ## Cross-links
 

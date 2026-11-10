@@ -1,6 +1,6 @@
 {
   "schemaVersion": "1.0",
-  "defaultVersion": "v0.11.1",
+  "defaultVersion": "v0.15.3",
   "versions": [
     {
       "id": "v0.7.1",
@@ -209,6 +209,182 @@
       "date": "2026-10-01",
       "branch": "main",
       "commit": "276dd300fc807e448f73b59e141e6c09079df350"
+    },
+    {
+      "id": "v0.11.2",
+      "label": "v0.11.2",
+      "file": "snapshots/v0.11.2.json",
+      "date": "2026-10-02",
+      "branch": "main",
+      "commit": "1619a0a4f220f2058591497d89b0304a962c9b4e"
+    },
+    {
+      "id": "v0.12.0-rc.1",
+      "label": "v0.12.0-rc.1",
+      "file": "snapshots/v0.12.0-rc.1.json",
+      "date": "2026-10-02",
+      "branch": "next",
+      "commit": "43a53488fca082d5749eead2ffd47abc08b8867a"
+    },
+    {
+      "id": "v0.12.0",
+      "label": "v0.12.0",
+      "file": "snapshots/v0.12.0.json",
+      "date": "2026-10-02",
+      "branch": "next",
+      "commit": "1441ec9248ee38bb0f89ce0e6b43a18f08a733f2"
+    },
+    {
+      "id": "v0.12.1",
+      "label": "v0.12.1",
+      "file": "snapshots/v0.12.1.json",
+      "date": "2026-10-04",
+      "branch": "main",
+      "commit": "30c92418c889ef634a93b621994ac3450c17de50"
+    },
+    {
+      "id": "v0.12.2",
+      "label": "v0.12.2",
+      "file": "snapshots/v0.12.2.json",
+      "date": "2026-10-06",
+      "branch": "main",
+      "commit": "e2082c288ba8624e7a551a535cdd4cae0d3acb03"
+    },
+    {
+      "id": "v0.12.3",
+      "label": "v0.12.3",
+      "file": "snapshots/v0.12.3.json",
+      "date": "2026-10-08",
+      "branch": "main",
+      "commit": "b5162bb4367fdf0d370c500cb3b4a268acd67a94"
+    },
+    {
+      "id": "audit-2026-10-10-f66c4aa5",
+      "label": "Seam audit 2026-10-10 (f66c4aa5)",
+      "file": "snapshots/audit-2026-10-10-f66c4aa5.json",
+      "date": "2026-10-10",
+      "branch": "main",
+      "commit": "f66c4aa55523f474da50dc7261a3b9373ede988a"
+    },
+    {
+      "id": "v0.12.4",
+      "label": "v0.12.4",
+      "file": "snapshots/v0.12.4.json",
+      "date": "2026-10-11",
+      "branch": "main",
+      "commit": "0da08c943d930d17f3090d24934198f3253f17ec"
+    },
+    {
+      "id": "v0.12.5",
+      "label": "v0.12.5",
+      "file": "snapshots/v0.12.5.json",
+      "date": "2026-10-13",
+      "branch": "main",
+      "commit": "4ac7f1c10af3616f3ec50e04d42125891c8be145"
+    },
+    {
+      "id": "v0.13.0",
+      "label": "v0.13.0",
+      "file": "snapshots/v0.13.0.json",
+      "date": "2026-10-14",
+      "branch": "next",
+      "commit": "e0f795e531e658c448b6039e565339ca1c68f56f"
+    },
+    {
+      "id": "v0.13.1",
+      "label": "v0.13.1",
+      "file": "snapshots/v0.13.1.json",
+      "date": "2026-10-19",
+      "branch": "main",
+      "commit": "dd05941e371c268e0276e9f5e34a6f12345498ef"
+    },
+    {
+      "id": "v0.13.2",
+      "label": "v0.13.2",
+      "file": "snapshots/v0.13.2.json",
+      "date": "2026-10-20",
+      "branch": "main",
+      "commit": "87001977344e9b65deb82bf0c73be87cc6a7c6fb"
+    },
+    {
+      "id": "v0.14.0",
+      "label": "v0.14.0",
+      "file": "snapshots/v0.14.0.json",
+      "date": "2026-10-21",
+      "branch": "main",
+      "commit": "e93fad4b81243bdfe6e13c6f19650c91629f2260"
+    },
+    {
+      "id": "v0.14.1",
+      "label": "v0.14.1",
+      "file": "snapshots/v0.14.1.json",
+      "date": "2026-10-23",
+      "branch": "main",
+      "commit": "c587b8b2b0f9640139b40f0bbcdff04e2266f628"
+    },
+    {
+      "id": "v0.14.2",
+      "label": "v0.14.2",
+      "file": "snapshots/v0.14.2.json",
+      "date": "2026-10-26",
+      "branch": "main",
+      "commit": "0d02ef6fde59d3594bb335d975e4094ccd928074"
+    },
+    {
+      "id": "v0.14.3",
+      "label": "v0.14.3",
+      "file": "snapshots/v0.14.3.json",
+      "date": "2026-10-29",
+      "branch": "main",
+      "commit": "3289d24e75bf8829fb6ea933b5808ff8a64f82d4"
+    },
+    {
+      "id": "v0.14.4",
+      "label": "v0.14.4",
+      "file": "snapshots/v0.14.4.json",
+      "date": "2026-11-01",
+      "branch": "main",
+      "commit": "69a91ed7bf3ea5b462c52e5726a2c3b0002fd9eb"
+    },
+    {
+      "id": "v0.14.5",
+      "label": "v0.14.5",
+      "file": "snapshots/v0.14.5.json",
+      "date": "2026-11-02",
+      "branch": "main",
+      "commit": "2abd180e87fac8b260e7105c199a95013bddee3c"
+    },
+    {
+      "id": "v0.15.0",
+      "label": "v0.15.0",
+      "file": "snapshots/v0.15.0.json",
+      "date": "2026-11-03",
+      "branch": "main",
+      "commit": "cb07e45975c7bbc1dd60d1c766ad51ae13ccc8ad"
+    },
+    {
+      "id": "v0.15.1",
+      "label": "v0.15.1",
+      "file": "snapshots/v0.15.1.json",
+      "date": "2026-11-04",
+      "branch": "main",
+      "commit": "bf3c30900f8eaaed30c3d8e9b06e6c8ed8b44e3a"
+    },
+    {
+      "id": "v0.15.2",
+      "label": "v0.15.2",
+      "file": "snapshots/v0.15.2.json",
+      "date": "2026-11-04",
+      "branch": "main",
+      "commit": "1997a46218bbedbab19c419d4cda9cee408e4a0f"
+    },
+    {
+      "id": "v0.15.3",
+      "label": "v0.15.3",
+      "file": "snapshots/v0.15.3.json",
+      "date": "2026-11-05",
+      "branch": "main",
+      "commit": "a643b837d89205ac17f5f1e33584a239aeb1f4be"
     }
   ]
 }

@@ -1,0 +1,64 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.curietech.ai/cli/remediation-verifier-run/v1.0.json",
+  "title": "curie <tier> remediation-qualification start-run --json",
+  "description": "One qualification verifier run exactly as the API's `RemediationVerifierRunOut` carries it (AUTOMATED-REMEDIATION-22); `outcome` is null until it is decided. Refusals are the shared error object.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "id",
+    "qualification_id",
+    "hook",
+    "action",
+    "target",
+    "generation",
+    "started_by",
+    "started_at",
+    "outcome",
+    "decided_at"
+  ],
+  "properties": {
+    "id": {
+      "type": "string"
+    },
+    "qualification_id": {
+      "type": "string"
+    },
+    "hook": {
+      "type": "string"
+    },
+    "action": {
+      "type": "string"
+    },
+    "target": {
+      "type": [
+        "string",
+        "integer",
+        "number",
+        "boolean"
+      ]
+    },
+    "generation": {
+      "type": "string"
+    },
+    "started_by": {
+      "type": "string",
+      "description": "The operator principal's subject, never its token."
+    },
+    "started_at": {
+      "type": "string"
+    },
+    "outcome": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "decided_at": {
+      "type": [
+        "string",
+        "null"
+      ]
+    }
+  }
+}

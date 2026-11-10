@@ -19,6 +19,9 @@ from curie_runner.session import SessionRunner
 TOKEN = "runner-token-value"
 AUTH = {"Authorization": f"Bearer {TOKEN}"}
 REPO = "acme-corp/acme-bot"
+# The boot env's CURIE_REPO_ORIGIN for a github.com workspace (ADR 0197).
+GITHUB = "https://github.com"
+TRUSTED = {"trusted_origin": GITHUB, "repository_path": REPO}
 
 
 @pytest.fixture
@@ -66,7 +69,9 @@ def test_snapshot_captures_staged_unstaged_untracked_and_binary_changes(
 
     captured = snapshot.capture_workspace_snapshot(
         repo,
+        base_sha=base_sha,
         expected_repo=REPO,
+        **TRUSTED,
         publication_title="Update assets",
         publication_body="Keep the exact requested body.",
     )
@@ -83,6 +88,225 @@ def test_snapshot_captures_staged_unstaged_untracked_and_binary_changes(
     patch_file = tmp_path / "publication.patch"
     patch_file.write_bytes(captured.patch)
     _git(clean, "apply", "--check", "--binary", str(patch_file))
+
+
+def test_publication_snapshot_ignores_ignored_and_captures_untracked_mode(
+    snapshot: Any, tmp_path: Path
+) -> None:
+    repo, _ = _repo(tmp_path)
+    (repo / ".gitignore").write_text("ignored/\n")
+    _git(repo, "add", ".gitignore")
+    _git(
+        repo,
+        "-c",
+        "user.name=Curie Test",
+        "-c",
+        "user.email=curie@example.com",
+        "commit",
+        "--quiet",
+        "-m",
+        "Ignore ignored",
+    )
+    base_sha = _git(repo, "rev-parse", "HEAD")
+    clean = snapshot.capture_workspace_snapshot(
+        repo, base_sha=base_sha, expected_repo=REPO, **TRUSTED
+    )
+    (repo / "ignored").mkdir()
+    (repo / "ignored" / "local.txt").write_text("not published\n")
+    ignored = snapshot.capture_workspace_snapshot(
+        repo, base_sha=base_sha, expected_repo=REPO, **TRUSTED
+    )
+    assert ignored.patch == clean.patch
+    assert ignored.changed_paths == clean.changed_paths
+
+    untracked = repo / "new.py"
+    untracked.write_bytes(b"print(1)\n")
+    untracked.chmod(0o644)
+    plain = snapshot.capture_workspace_snapshot(
+        repo, base_sha=base_sha, expected_repo=REPO, **TRUSTED
+    )
+    untracked.chmod(0o755)
+    executable = snapshot.capture_workspace_snapshot(
+        repo, base_sha=base_sha, expected_repo=REPO, **TRUSTED
+    )
+    assert plain.changed_paths == ("new.py",)
+    assert executable.changed_paths == ("new.py",)
+    assert executable.patch != plain.patch
+    assert b"100755" in executable.patch
+
+
+@pytest.mark.parametrize("prefix", ["", "/forge"])
+def test_snapshot_accepts_a_ghes_origin_named_by_the_boot_env(
+    snapshot: Any, tmp_path: Path, prefix: str
+) -> None:
+    repo, base_sha = _repo(tmp_path)
+    html_base = f"https://github.example.com{prefix}"
+    _git(repo, "remote", "set-url", "origin", f"{html_base}/{REPO}.git")
+    (repo / "README.md").write_text("GHES change\n")
+
+    captured = snapshot.capture_workspace_snapshot(
+        repo,
+        base_sha=base_sha,
+        expected_repo=REPO,
+        trusted_origin=html_base,
+        repository_path=REPO,
+    )
+
+    assert captured.repo_full_name == REPO
+    assert captured.base_sha == base_sha
+    assert captured.changed_paths == ("README.md",)
+    assert b"GHES change" in captured.patch
+
+
+@pytest.mark.parametrize(
+    "origin",
+    [
+        f"https://github.com/{REPO}.git",
+        f"https://other.example.com/forge/{REPO}.git",
+        f"http://github.example.com/forge/{REPO}.git",
+        f"https://token@github.example.com/forge/{REPO}.git",
+        f"https://github.example.com/{REPO}.git",
+        f"https://github.example.com/forge/{REPO}",
+        f"https://github.example.com/forge/{REPO}.git/",
+        f"https://github.example.com/forge/{REPO}.git?download=1",
+        f"https://github.example.com/forge/{REPO}.git#HEAD",
+        "https://github.example.com/forge/acme-corp//acme-bot.git",
+        f"https://github.example.com:443/forge/{REPO}.git",
+    ],
+)
+def test_snapshot_refuses_noncanonical_or_foreign_origins(
+    snapshot: Any, tmp_path: Path, origin: str
+) -> None:
+    repo, base_sha = _repo(tmp_path)
+    _git(repo, "remote", "set-url", "origin", origin)
+    (repo / "README.md").write_text("must not publish\n")
+
+    with pytest.raises(
+        snapshot.WorkspaceSnapshotError,
+        match="workspace repository origin is not (credential-free trusted|the declared)",
+    ):
+        snapshot.capture_workspace_snapshot(
+            repo,
+            base_sha=base_sha,
+            expected_repo=REPO,
+            trusted_origin="https://github.example.com/forge",
+            repository_path=REPO,
+        )
+
+
+@pytest.mark.parametrize(
+    ("trusted_origin", "repository_path"), [(None, REPO), (GITHUB, None), (None, None)]
+)
+def test_snapshot_refuses_when_the_boot_env_names_no_origin_or_path(
+    snapshot: Any, tmp_path: Path, trusted_origin: str | None, repository_path: str | None
+) -> None:
+    # No GitHub default remains: a github.com workspace still needs
+    # CURIE_REPO_ORIGIN and CURIE_REPO_PATH from the worker.
+    repo, base_sha = _repo(tmp_path)
+    (repo / "README.md").write_text("must not publish\n")
+
+    with pytest.raises(snapshot.WorkspaceSnapshotError, match="names no trusted repository"):
+        snapshot.capture_workspace_snapshot(
+            repo,
+            base_sha=base_sha,
+            expected_repo=REPO,
+            trusted_origin=trusted_origin,
+            repository_path=repository_path,
+        )
+
+
+DEEP_ORIGIN = "https://gitlab.example.com/scm"
+DEEP_PATH = "platform/team/infra"
+
+
+@pytest.mark.parametrize("path", [DEEP_PATH, "acme/api", "a/b/c/d/e/project.name"])
+def test_snapshot_accepts_a_declared_path_of_any_depth_under_the_trusted_origin(
+    snapshot: Any, tmp_path: Path, path: str
+) -> None:
+    repo, base_sha = _repo(tmp_path)
+    _git(repo, "remote", "set-url", "origin", f"{DEEP_ORIGIN}/{path}.git")
+    (repo / "README.md").write_text("GitLab change\n")
+
+    captured = snapshot.capture_workspace_snapshot(
+        repo,
+        base_sha=base_sha,
+        expected_repo=path,
+        trusted_origin=f"{DEEP_ORIGIN}/",
+        repository_path=path,
+    )
+
+    assert captured.repo_full_name == path
+    assert captured.base_sha == base_sha
+    assert captured.changed_paths == ("README.md",)
+
+
+@pytest.mark.parametrize(
+    "origin",
+    [
+        # A different host, even one serving the same path.
+        f"https://gitlab.other.example.com/scm/{DEEP_PATH}.git",
+        # The configured GitHub host is no longer trusted once an origin is set.
+        f"https://github.com/{DEEP_PATH}.git",
+        # The trusted host without its base path.
+        f"https://gitlab.example.com/{DEEP_PATH}.git",
+        # Right host, a path other than the declared one.
+        f"{DEEP_ORIGIN}/platform/team/other.git",
+        f"{DEEP_ORIGIN}/platform/team.git",
+        f"{DEEP_ORIGIN}/platform/team/infra/extra.git",
+        # Noncanonical forms of the declared path.
+        f"http://gitlab.example.com/scm/{DEEP_PATH}.git",
+        f"https://bot@gitlab.example.com/scm/{DEEP_PATH}.git",
+        f"{DEEP_ORIGIN}/{DEEP_PATH}",
+        f"{DEEP_ORIGIN}/platform//team/infra.git",
+        f"{DEEP_ORIGIN}/{DEEP_PATH}.git?ref=main",
+    ],
+)
+def test_snapshot_refuses_any_origin_but_the_declared_path_on_the_trusted_host(
+    snapshot: Any, tmp_path: Path, origin: str
+) -> None:
+    repo, base_sha = _repo(tmp_path)
+    _git(repo, "remote", "set-url", "origin", origin)
+    (repo / "README.md").write_text("must not publish\n")
+
+    with pytest.raises(snapshot.WorkspaceSnapshotError, match="origin"):
+        snapshot.capture_workspace_snapshot(
+            repo, base_sha=base_sha, trusted_origin=DEEP_ORIGIN, repository_path=DEEP_PATH
+        )
+
+
+@pytest.mark.parametrize(
+    "trusted_origin",
+    [
+        "http://gitlab.example.com/scm",
+        "https://bot:secret@gitlab.example.com/scm",
+        "https://gitlab.example.com/scm?x=1",
+        "https://gitlab.example.com:notaport/scm",
+        "gitlab.example.com/scm",
+    ],
+)
+def test_snapshot_fails_closed_on_a_malformed_trusted_origin(
+    snapshot: Any, tmp_path: Path, trusted_origin: str
+) -> None:
+    repo, base_sha = _repo(tmp_path)
+    _git(repo, "remote", "set-url", "origin", f"{DEEP_ORIGIN}/{DEEP_PATH}.git")
+
+    with pytest.raises(snapshot.WorkspaceSnapshotError, match="origin is invalid"):
+        snapshot.capture_workspace_snapshot(
+            repo, base_sha=base_sha, trusted_origin=trusted_origin, repository_path=DEEP_PATH
+        )
+
+
+@pytest.mark.parametrize("declared", ["infra", "platform/../infra", "platform/./infra", ""])
+def test_snapshot_refuses_a_declared_path_that_is_not_a_repository_path(
+    snapshot: Any, tmp_path: Path, declared: str
+) -> None:
+    repo, base_sha = _repo(tmp_path)
+    _git(repo, "remote", "set-url", "origin", f"{DEEP_ORIGIN}/{declared}.git")
+
+    with pytest.raises(snapshot.WorkspaceSnapshotError, match="declared repository path"):
+        snapshot.capture_workspace_snapshot(
+            repo, base_sha=base_sha, trusted_origin=DEEP_ORIGIN, repository_path=declared
+        )
 
 
 def test_snapshot_preserves_real_top_level_a_and_b_paths_with_spaces(
@@ -105,10 +329,13 @@ def test_snapshot_preserves_real_top_level_a_and_b_paths_with_spaces(
         "-m",
         "Add path fixtures",
     )
+    base_sha = _git(repo, "rev-parse", "HEAD")
     (repo / "a" / "read me.md").write_text("changed a\n")
     (repo / "b" / "release notes.md").write_text("changed b\n")
 
-    captured = snapshot.capture_workspace_snapshot(repo, expected_repo=REPO)
+    captured = snapshot.capture_workspace_snapshot(
+        repo, base_sha=base_sha, expected_repo=REPO, **TRUSTED
+    )
 
     assert captured.changed_paths == ("a/read me.md", "b/release notes.md")
     assert b"diff --git a/a/read me.md b/a/read me.md" in captured.patch
@@ -134,9 +361,12 @@ def test_snapshot_represents_pure_rename_as_source_and_destination_with_spaces(
         "-m",
         "Add rename fixture",
     )
+    base_sha = _git(repo, "rev-parse", "HEAD")
     _git(repo, "mv", source, destination)
 
-    captured = snapshot.capture_workspace_snapshot(repo, expected_repo=REPO)
+    captured = snapshot.capture_workspace_snapshot(
+        repo, base_sha=base_sha, expected_repo=REPO, **TRUSTED
+    )
 
     assert captured.changed_paths == (destination, source)
     assert f"diff --git a/{source} b/{source}".encode() in captured.patch
@@ -201,21 +431,26 @@ def test_snapshot_refuses_missing_empty_and_wrong_repository(
     snapshot: Any, tmp_path: Path
 ) -> None:
     with pytest.raises(snapshot.WorkspaceSnapshotError, match="workspace"):
-        snapshot.capture_workspace_snapshot(tmp_path / "missing", expected_repo=REPO)
+        snapshot.capture_workspace_snapshot(
+            tmp_path / "missing", base_sha="a" * 40, expected_repo=REPO
+        )
 
     empty = tmp_path / "empty"
     empty.mkdir()
     with pytest.raises(snapshot.WorkspaceSnapshotError, match="git"):
-        snapshot.capture_workspace_snapshot(empty, expected_repo=REPO)
+        snapshot.capture_workspace_snapshot(empty, base_sha="a" * 40, expected_repo=REPO)
 
-    repo, _ = _repo(tmp_path / "wrong")
+    repo, base_sha = _repo(tmp_path / "wrong")
     with pytest.raises(snapshot.WorkspaceSnapshotError, match="repository"):
-        snapshot.capture_workspace_snapshot(repo, expected_repo="acme-corp/other")
+        snapshot.capture_workspace_snapshot(
+            repo, base_sha=base_sha, expected_repo="acme-corp/other", **TRUSTED
+        )
 
 
 def _runner() -> SessionRunner:
     fake = FakeModelSession()
     return SessionRunner(
+        max_usd_per_day=None,
         held_secrets=frozenset(),
         session_factory=lambda: fake,
         ceiling=0,
@@ -242,11 +477,15 @@ def test_snapshot_route_requires_runner_token_and_returns_base64_binary_patch(
         runner = _runner()
         await runner.start()
         async with TestClient(
-            TestServer(create_app(runner, token=TOKEN, snapshotter=lambda: captured))
+            TestServer(
+                create_app(runner, token=TOKEN, snapshotter=lambda _base_sha: captured)
+            )
         ) as client:
-            unauthenticated = await client.post("/v1/snapshot")
+            unauthenticated = await client.post("/v1/snapshot", json={"base_sha": "a" * 40})
             assert unauthenticated.status == 401
-            response = await client.post("/v1/snapshot", headers=AUTH)
+            response = await client.post(
+                "/v1/snapshot", headers=AUTH, json={"base_sha": "a" * 40}
+            )
             assert response.status == 200
             body = await response.json()
             assert base64.b64decode(body.pop("patch_base64")) == captured.patch
@@ -268,7 +507,9 @@ def test_snapshot_route_returns_intentional_conflict_without_managed_workspace()
         runner = _runner()
         await runner.start()
         async with TestClient(TestServer(create_app(runner, token=TOKEN))) as client:
-            response = await client.post("/v1/snapshot", headers=AUTH)
+            response = await client.post(
+                "/v1/snapshot", headers=AUTH, json={"base_sha": "a" * 40}
+            )
             assert response.status == 409
             body = await response.json()
             assert "no managed repository workspace" in body["error"]
@@ -290,3 +531,42 @@ def test_snapshot_json_never_contains_raw_binary_or_credential_material(snapshot
     assert "Authorization" not in encoded
     assert "GITHUB_TOKEN" not in encoded
     assert "github.com@" not in encoded
+
+
+@pytest.mark.parametrize(
+    ("path", "content"),
+    [
+        ("README.md", "edited after the paths were listed\n"),
+        (".github/workflows/ci.yml", "name: ci\n"),
+        ("late-untracked.txt", "new after the paths were listed\n"),
+    ],
+)
+def test_snapshot_refuses_a_workspace_that_changes_during_capture(
+    snapshot: Any, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, path: str, content: str
+) -> None:
+    # A write between the capture's git calls would patch a path the disclosed
+    # list omits, or drop a new file entirely; neither may reach an approver.
+    repo, base_sha = _repo(tmp_path)
+    (repo / "pre.txt").write_text("before capture\n")
+    original = snapshot._git
+    fired = False
+
+    def write_mid_capture(*args: Any, **kwargs: Any) -> Any:
+        # The hashing and scratch index stages all follow the first read of
+        # the working tree (whose own ``git diff`` listing comes before it),
+        # so a write there lands after the paths were read.
+        nonlocal fired
+        words: list[str] = []
+        for arg in args[1:]:
+            words.extend(map(str, arg) if isinstance(arg, list | tuple) else [str(arg)])
+        if not fired and {"hash-object", "update-index", "write-tree"} & set(words):
+            fired = True
+            target = repo / path
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(content)
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(snapshot, "_git", write_mid_capture)
+    with pytest.raises(snapshot.WorkspaceSnapshotError, match="changed during snapshot capture"):
+        snapshot.capture_workspace_snapshot(repo, base_sha=base_sha, **TRUSTED)
+    assert fired

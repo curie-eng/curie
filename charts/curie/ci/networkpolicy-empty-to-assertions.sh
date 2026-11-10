@@ -1,30 +1,29 @@
 #!/usr/bin/env bash
 #
-# Render-assertion test for issue #2321. A nil
-# worker.publication.githubHttpsCidrs makes the range in publication-owner.yaml
-# emit nothing, collapsing the GitHub HTTPS egress rule to an empty `to:`,
-# which in NetworkPolicy means every destination on TCP 443. The publication
-# job is tokenless; that isolation is the control that makes it safe.
-#
-# values.schema.json minItems:1 catches `[]` and not nil: Helm drops a
-# null-valued key during coalescing before schema validation runs, the same
-# gap #2008 recorded for placement.
+# Render-assertion test for issues #2321 and #4397. The publication Job's
+# HTTPS egress renders from the factory code host entries: each entry's own
+# egress, or the chart's built-in GitHub set for a github entry with none, and
+# the built-in set when no code host is configured. If that list came out
+# empty, a range over it would collapse the rule to an empty `to:`, which in
+# NetworkPolicy means every destination on that port. The publication job is
+# tokenless; that isolation is the control that makes it safe.
 #
 # This pins:
 #
 #   1. The default render, and the values-dev overlay, never emit a
 #      NetworkPolicy egress rule whose `to:` is missing or empty.
-#   2. `--set worker.publication.githubHttpsCidrs=null` fails the render and
-#      names worker.publication.githubHttpsCidrs, rather than shipping
-#      allow-all on 443.
-#   3. An explicit empty list is still refused (schema path), naming
-#      githubHttpsCidrs, a second independent refusal of "no ranges".
-#   4. Disabling publication still renders when the key is nulled: the guard
-#      is scoped to the job that would otherwise fail open, not a blanket
-#      required key.
-#   5. Negative control: strip the fail guard, render with the key nulled,
-#      and require the empty-`to:` checker to reject the result. An assert
-#      that has never been shown to fail is not pinning anything.
+#   2. A `--reuse-values` release with no factory key, and a release with a
+#      per-agent forge sandbox policy, emit no empty `to:` either.
+#   3. A code host that is not github and names no egress leaves publication
+#      nothing to reach: the render fails naming egress rather than shipping
+#      allow-all.
+#   4. Disabling publication still renders with that same code host: the
+#      guard is scoped to the job that would otherwise fail open, not a
+#      blanket required key.
+#   5. Negative control: strip the egress fail guard from
+#      publication-owner.yaml, render the same values, and require the render
+#      to succeed (the refusal is that guard's) and, when it emits an HTTPS
+#      rule, the empty-`to:` checker to reject it.
 #   6. Negative control: an empty NetworkPolicyPeer (`to: [{}]`) is the
 #      same allow-all form and must also be rejected.
 #
@@ -38,7 +37,8 @@ TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
 
 RELEASE=curie
-NIL_KEY='worker.publication.githubHttpsCidrs'
+# A code host the chart has no built-in set for, with no egress of its own.
+NO_EGRESS_HOST='factory.codeHosts=[{"name":"gl","kind":"gitlab","host":"gitlab.internal.example","apiUrl":"https://gitlab.internal.example/api/v4","credential":{"type":"static_token","existingSecret":"gl","existingSecretKey":"token","neverExpires":true}}]'
 
 fail() {
   echo "FAIL: $*" >&2
@@ -154,76 +154,82 @@ echo "=== Assertion 2: values-dev overlay has no empty NetworkPolicy egress to: 
 DEV_OUT="$(render_dir values-dev -f "$CHART/values-dev.yaml")"
 assert_no_empty_to "values-dev overlay" "$DEV_OUT"
 
-echo "=== Assertion 3: nil githubHttpsCidrs fails the render, naming the value ==="
-must_fail_naming \
-  "nil-githubHttpsCidrs" \
-  "$NIL_KEY" \
-  --set worker.publication.githubHttpsCidrs=null
+echo "=== Assertion 3: no-factory and forge sandbox renders have no empty to: ==="
+NULL_OUT="$(render_dir factory-null --set-json 'factory=null')"
+assert_no_empty_to "factory=null (--reuse-values) render" "$NULL_OUT"
+FORGE_OUT="$(render_dir forge-sandbox -f "$CHART/values-dev.yaml" \
+  --set agentSandbox.deploy=true --set agentSandbox.controller.deploy=false \
+  --set 'factory.sandboxEgress.dark-factory=true')"
+assert_no_empty_to "forge sandbox render" "$FORGE_OUT"
+grep -R -q 'allow-forge-egress' "$FORGE_OUT" \
+  || fail "factory.sandboxEgress.dark-factory=true rendered no forge egress policy"
+echo "ok: the built-in GitHub set fills publication with no factory key, and the forge sandbox policy has peers"
 
-echo "=== Assertion 4: empty-list githubHttpsCidrs is refused, naming the key ==="
-EMPTY_LIST="$TMP/empty-list.yaml"
-cat > "$EMPTY_LIST" <<'EOF'
-worker:
-  publication:
-    githubHttpsCidrs: []
-EOF
-must_fail_naming \
-  "empty-list-githubHttpsCidrs" \
-  "githubHttpsCidrs" \
-  -f "$EMPTY_LIST"
+echo "=== Assertion 4: a code host with no egress and no built-in set fails the render ==="
+must_fail_naming "no-egress-code-host" "egress" --set-json "$NO_EGRESS_HOST"
 
-echo "=== Assertion 5: publication disabled still renders when the key is nulled ==="
+echo "=== Assertion 5: publication disabled still renders with that code host ==="
 DISABLED_OUT="$(render_dir publication-disabled \
   --set worker.publication.enabled=false \
-  --set worker.publication.githubHttpsCidrs=null)"
+  --set-json "$NO_EGRESS_HOST")"
 assert_no_empty_to "publication-disabled render" "$DISABLED_OUT"
 if grep -R -q 'component: publication' "$DISABLED_OUT/curie/templates/publication-owner.yaml" 2>/dev/null; then
   fail "publication.enabled=false still rendered a publication NetworkPolicy"
 fi
-echo "ok: publication.enabled=false with a nulled CIDR list still renders"
+echo "ok: publication.enabled=false with a code host that has no egress still renders"
 
-echo "=== Assertion 6 negative control: empty-to checker rejects a nulled CIDR list ==="
+echo "=== Assertion 6 negative control: the refusal is publication-owner.yaml's empty-list guard ==="
 MUTANT="$TMP/mutant-chart"
 cp -a "$CHART" "$MUTANT"
 python3 - "$MUTANT/templates/publication-owner.yaml" <<'PY'
 import pathlib
+import re
 import sys
 
 path = pathlib.Path(sys.argv[1])
-lines = path.read_text().splitlines(keepends=True)
-out = []
-stripped = 0
-index = 0
-while index < len(lines):
-    if "if not .Values.worker.publication.githubHttpsCidrs" in lines[index]:
-        block = "".join(lines[index:index + 3])
-        if "fail" in block and "end" in block:
-            index += 3
-            stripped += 1
-            continue
-    out.append(lines[index])
-    index += 1
-if stripped > 1:
-    raise SystemExit("negative control found more than one githubHttpsCidrs fail guard")
-path.write_text("".join(out))
+text = path.read_text()
+# Every fail in this template that refuses missing egress; replace the call and
+# keep the surrounding if/end so the template still parses.
+pattern = re.compile(r'\{\{-?\s*fail\s+(\(printf\s+)?"[^"]*egress[^"]*"[^}]*\}\}')
+mutated, count = pattern.subn("{{- /* guard stripped by the negative control */ -}}", text)
+if count < 1:
+    raise SystemExit("negative control found no egress fail guard in publication-owner.yaml")
+path.write_text(mutated)
 PY
 MUTANT_OUT="$TMP/mutant-null"
 mkdir -p "$MUTANT_OUT"
 set +e
 helm template "$RELEASE" "$MUTANT" \
-  --set worker.publication.githubHttpsCidrs=null \
+  --set-json "$NO_EGRESS_HOST" \
   --output-dir "$MUTANT_OUT" >/dev/null 2>"$TMP/mutant-null.err"
 mutant_rc=$?
 set -e
 [ "$mutant_rc" -eq 0 ] \
-  || fail "negative-control mutant must render so the empty-to checker can reject it; helm said: $(cat "$TMP/mutant-null.err")"
-if python3 "$CHECKER" "$MUTANT_OUT" >/dev/null 2>"$TMP/mutant-check.err"; then
-  fail "negative control did not fire: a nulled githubHttpsCidrs list passed the empty-to checker"
+  || fail "with the publication-owner.yaml guard stripped the render still fails, so the refusal is not that guard's: $(cat "$TMP/mutant-null.err")"
+if python3 - "$MUTANT_OUT" <<'PY'
+import pathlib
+import sys
+
+import yaml
+
+for path in pathlib.Path(sys.argv[1]).rglob("publication-owner.yaml"):
+    for doc in yaml.safe_load_all(path.read_text()):
+        if isinstance(doc, dict) and doc.get("kind") == "NetworkPolicy":
+            for rule in (doc.get("spec") or {}).get("egress") or []:
+                if {p.get("port") for p in rule.get("ports") or []} != {53}:
+                    sys.exit(0)
+sys.exit(1)
+PY
+then
+  if python3 "$CHECKER" "$MUTANT_OUT" >/dev/null 2>"$TMP/mutant-check.err"; then
+    fail "negative control did not fire: an empty code host egress list passed the empty-to checker"
+  fi
+  grep -q "empty or missing to" "$TMP/mutant-check.err" \
+    || fail "empty-to negative control failed unexpectedly: $(cat "$TMP/mutant-check.err")"
+  echo "ok: without the guard the empty list renders an allow-all to:, which the checker rejects"
+else
+  echo "ok: without the guard the render succeeds (the refusal is the guard's) and emits no HTTPS rule"
 fi
-if ! grep -q "empty or missing to" "$TMP/mutant-check.err"; then
-  fail "empty-to negative control failed unexpectedly: $(cat "$TMP/mutant-check.err")"
-fi
-echo "ok: a nulled CIDR list is rejected by the empty-to checker (the assert can fail)"
 
 echo "=== Assertion 7 negative control: empty NetworkPolicyPeer to: [{}] is rejected ==="
 EMPTY_PEER="$TMP/empty-peer"
@@ -270,4 +276,4 @@ fi
 echo "ok: to: [{}] is rejected by the empty-to checker (the assert can fail)"
 
 echo
-echo "PASS: no rendered NetworkPolicy egress rule has an empty to:; a nil or empty worker.publication.githubHttpsCidrs fails closed naming the value; disabling publication still renders; the empty-to checker is proven to fire."
+echo "PASS: no rendered NetworkPolicy egress rule has an empty to:; a code host with no egress fails closed naming egress; disabling publication still renders; the empty-to checker is proven to fire."

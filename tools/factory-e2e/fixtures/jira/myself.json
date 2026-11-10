@@ -1,0 +1,15 @@
+{
+  "self": "https://example.atlassian.net/rest/api/3/user?accountId=557058:00000000-0000-4000-8000-0000000000a1",
+  "accountId": "557058:00000000-0000-4000-8000-0000000000a1",
+  "accountType": "atlassian",
+  "emailAddress": "labeler@example.com",
+  "avatarUrls": {
+    "48x48": "https://avatar-management.example.com/initials/FL-5.png"
+  },
+  "displayName": "Factory Labeler",
+  "active": true,
+  "timeZone": "America/New_York",
+  "locale": "en_US",
+  "groups": {"size": 2, "items": []},
+  "applicationRoles": {"size": 1, "items": []}
+}

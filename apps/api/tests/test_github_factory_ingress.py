@@ -19,105 +19,49 @@ import itertools
 import json
 import threading
 import uuid
+from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
 from typing import Any
 
 import httpx
 import pytest
 from curie_api.config import get_settings
-from curie_api.github_app import GitHubInstallationRefused
-from curie_api.github_factory import handle_factory_delivery
+from curie_api.forges.github.identity import issue_lock_keys_for
+from curie_api.forges.hosts import github_issue_ref
+from curie_api.github_factory import (
+    admit_notice,
+    handle_factory_delivery,
+    lock_issue,
+    verify_current,
+)
+from curie_api.github_factory_events import parse_factory_event
 from curie_api.main import create_app
 from curie_api.workitem_dispatch import DispatchConflict, acquire, start
 from fastapi.testclient import TestClient
+from forge_fakes import factory_wake
+from forge_fakes.github import (
+    INSTALLATION_ID,
+    LABEL,
+    MENTION,
+    REPO,
+    REPO_ID,
+    SENDER,
+    SENDER_ID,
+    GitHubAPI,
+    _comment_event,
+    _Credentials,
+    _issue_event,
+    _post,
+    _sender,
+    _signature,
+    factory_env,
+    fake_installation_tokens,
+)
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
-REPO = "acme-corp/acme-bot"
 OTHER_REPO = "attacker/other-bot"
-REPO_ID = 4401
-INSTALLATION_ID = 5501
-SENDER_ID = 6601
-SENDER = "octocat"
-LABEL = "factory"
-MENTION = "curie"
 _ISSUES = itertools.count(9100)
-
-_ENV = {
-    "GITHUB_FACTORY_INGRESS_ENABLED": "true",
-    "GITHUB_FACTORY_LABEL": LABEL,
-    "GITHUB_FACTORY_MENTION": MENTION,
-    "GITHUB_REVIEW_INGRESS_ENABLED": "false",
-    "GITHUB_APP_ID": "51",
-    "GITHUB_APP_PRIVATE_KEY": "example-private-key",
-    "GITHUB_WEBHOOK_SECRET": "example-factory-hmac-secret",
-    "GITHUB_REPO_ALLOWLIST": '["acme-corp/*"]',
-    "GITHUB_TOKEN": "",
-    "CURIE_WORK_ITEM_RECONCILER_ENABLED": "false",
-    "RESUME_RECONCILER_ENABLED": "false",
-    "APPROVAL_SWEEP_INTERVAL_S": "0",
-    "DEAD_LETTER_WATCH_INTERVAL_S": "0",
-}
-
-
-class GitHubAPI:
-    """In-process stand-in for the GitHub REST reads the intake verifier makes."""
-
-    def __init__(self) -> None:
-        self.issue_state = "open"
-        self.labels = [LABEL]
-        self.permission = "write"
-        self.permission_requests: list[httpx.Request] = []
-        self.permission_user_id = SENDER_ID
-        self.comment_body: str | None = None
-        self.comment_app: dict[str, Any] | None = None
-        self.repository_id = REPO_ID
-        self.issue_number = 0
-
-    def handle(self, request: httpx.Request) -> httpx.Response:
-        path = request.url.path
-        if path == f"/repos/{REPO}":
-            return httpx.Response(200, json={"id": self.repository_id, "full_name": REPO})
-        if path.startswith(f"/repos/{REPO}/issues/comments/"):
-            comment_id = int(path.rsplit("/", 1)[1])
-            return httpx.Response(
-                200,
-                json={
-                    "id": comment_id,
-                    "body": self.comment_body,
-                    "user": {"id": SENDER_ID, "login": SENDER, "type": "User"},
-                    "performed_via_github_app": self.comment_app,
-                    "issue_url": (
-                        f"https://api.github.com/repos/{REPO}/issues/{self.issue_number}"
-                    ),
-                },
-            )
-        if path.startswith(f"/repos/{REPO}/issues/"):
-            number = int(path.rsplit("/", 1)[1])
-            return httpx.Response(
-                200,
-                json={
-                    "number": number,
-                    "state": self.issue_state,
-                    "labels": [{"name": name} for name in self.labels],
-                },
-            )
-        if path == f"/repos/{REPO}/collaborators/{SENDER}/permission":
-            self.permission_requests.append(request)
-            return httpx.Response(
-                200,
-                json={
-                    "permission": self.permission,
-                    "user": {"id": self.permission_user_id, "login": SENDER},
-                },
-            )
-        return httpx.Response(404, json={"message": "missing fixture"})
-
-
-class _Credentials:
-    def token_for_verified_installation(self, repo: str, installation_id: int) -> str:
-        if repo != REPO or installation_id != INSTALLATION_ID:
-            raise GitHubInstallationRefused("installation was not rediscovered")
-        return "fixture-installation-token"
 
 
 def _rows(statement: str, params: dict[str, Any] | None = None) -> list[dict[str, Any]]:
@@ -133,81 +77,19 @@ def _rows(statement: str, params: dict[str, Any] | None = None) -> list[dict[str
     return asyncio.run(go())
 
 
-def _signature(body: bytes) -> str:
-    secret = get_settings().github_webhook_secret.encode()
-    return "sha256=" + hmac.new(secret, body, hashlib.sha256).hexdigest()
-
-
-def _post(
-    client: TestClient,
-    event: str,
-    payload: dict[str, Any],
-    *,
-    delivery: str | None = None,
-    signature: str | None = None,
-) -> httpx.Response:
-    body = json.dumps(payload).encode()
-    return client.post(
-        "/github/webhook",
-        content=body,
-        headers={
-            "X-GitHub-Delivery": delivery or str(uuid.uuid4()),
-            "X-GitHub-Event": event,
-            "X-Hub-Signature-256": signature if signature is not None else _signature(body),
-            "Content-Type": "application/json",
-        },
-    )
-
-
-def _sender(
-    sender_type: str = "User", login: str = SENDER, sender_id: int = SENDER_ID
-) -> dict[str, Any]:
-    return {"id": sender_id, "login": login, "type": sender_type}
-
-
-def _issue_event(action: str, number: int, **extra: Any) -> dict[str, Any]:
-    payload: dict[str, Any] = {
-        "action": action,
-        "installation": {"id": INSTALLATION_ID},
-        "repository": {"id": REPO_ID, "full_name": REPO},
-        "sender": _sender(),
-        "issue": {
-            "number": number,
-            "state": "open",
-            "body": "do not store this issue body",
-        },
-    }
-    payload.update(extra)
-    return payload
-
-
-def _comment_event(number: int, body: str, comment_id: int) -> dict[str, Any]:
-    return _issue_event(
-        "created",
-        number,
-        comment={
-            "id": comment_id,
-            "body": body,
-            "user": _sender(),
-            "performed_via_github_app": None,
-        },
-    )
-
-
 @pytest.fixture
 def github_api() -> GitHubAPI:
     return GitHubAPI()
 
 
 @pytest.fixture
-def factory_app(monkeypatch: pytest.MonkeyPatch, clean_db: None, github_api: GitHubAPI) -> Any:
-    for key, value in _ENV.items():
+def factory_app(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, clean_db: None, github_api: GitHubAPI
+) -> Any:
+    for key, value in factory_env(tmp_path).items():
         monkeypatch.setenv(key, value)
     get_settings.cache_clear()
-    monkeypatch.setattr(
-        "curie_api.github_factory.credentials_for",
-        lambda _settings: _Credentials(),
-    )
+    fake_installation_tokens(monkeypatch, _Credentials())
     with TestClient(create_app()) as client:
         external = httpx.AsyncClient(transport=httpx.MockTransport(github_api.handle))
         client.app.state.http_client = external
@@ -242,12 +124,12 @@ def _requests(number: int) -> list[dict[str, Any]]:
     return _rows(
         "SELECT r.id, r.status, r.terminal_cause, r.objective, r.requester, "
         "r.reply_kind, w.id AS work_item_id, w.cancelled_at, "
-        "w.publication_lineage_id, w.github_issue_number "
+        "w.publication_lineage_id, w.tracker_issue_id "
         "FROM curie.work_items w "
         "LEFT JOIN curie.execution_requests r ON r.work_item_id = w.id "
-        "WHERE w.github_repository_id = :repo AND w.github_issue_number = :number "
+        "WHERE w.tracker_scope_id = :repo AND w.tracker_issue_id = :number "
         "ORDER BY r.sequence",
-        {"repo": REPO_ID, "number": number},
+        {"repo": str(REPO_ID), "number": str(number)},
     )
 
 
@@ -293,10 +175,68 @@ def test_bad_signature_is_rejected_before_a_work_item_exists(
     assert _requests(number) == []
 
 
+def _signed_webhook(client: TestClient, secret: str) -> httpx.Response:
+    body = b'{"action":"labeled"}'
+    signature = "sha256=" + hmac.new(secret.encode(), body, hashlib.sha256).hexdigest()
+    return client.post(
+        "/github/webhook",
+        content=body,
+        headers={
+            "X-GitHub-Delivery": str(uuid.uuid4()),
+            "X-GitHub-Event": "issues",
+            "X-Hub-Signature-256": signature,
+            "Content-Type": "application/json",
+        },
+    )
+
+
+def test_empty_webhook_secret_rejects_its_own_hmac(
+    monkeypatch: pytest.MonkeyPatch, clean_db: None, valkey: object
+) -> None:
+    monkeypatch.setenv("ENVIRONMENT", "dev")
+    monkeypatch.setenv("FACTORY_ENABLED", "false")
+    monkeypatch.setenv("GITHUB_REVIEW_INGRESS_ENABLED", "false")
+    monkeypatch.setenv("GITHUB_WEBHOOK_SECRET", "")
+    monkeypatch.setenv("CURIE_WORK_ITEM_RECONCILER_ENABLED", "false")
+    monkeypatch.setenv("RESUME_RECONCILER_ENABLED", "false")
+    monkeypatch.setenv("APPROVAL_SWEEP_INTERVAL_S", "0")
+    monkeypatch.setenv("DEAD_LETTER_WATCH_INTERVAL_S", "0")
+    get_settings.cache_clear()
+    try:
+        with TestClient(create_app()) as client:
+            response = _signed_webhook(client, "")
+    finally:
+        get_settings.cache_clear()
+
+    assert response.status_code == 401, response.text
+
+
+def test_configured_webhook_secret_accepts_a_valid_signature(
+    monkeypatch: pytest.MonkeyPatch, clean_db: None, valkey: object
+) -> None:
+    monkeypatch.setenv("ENVIRONMENT", "dev")
+    monkeypatch.setenv("FACTORY_ENABLED", "false")
+    monkeypatch.setenv("GITHUB_REVIEW_INGRESS_ENABLED", "false")
+    monkeypatch.setenv("GITHUB_WEBHOOK_SECRET", "example-factory-hmac-secret")
+    monkeypatch.setenv("CURIE_WORK_ITEM_RECONCILER_ENABLED", "false")
+    monkeypatch.setenv("RESUME_RECONCILER_ENABLED", "false")
+    monkeypatch.setenv("APPROVAL_SWEEP_INTERVAL_S", "0")
+    monkeypatch.setenv("DEAD_LETTER_WATCH_INTERVAL_S", "0")
+    get_settings.cache_clear()
+    try:
+        with TestClient(create_app()) as client:
+            response = _signed_webhook(client, "example-factory-hmac-secret")
+    finally:
+        get_settings.cache_clear()
+
+    assert response.status_code == 200, response.text
+    assert response.json()["status"] == "ignored"
+
+
 def test_factory_disabled_issues_stay_ignored(
     client: TestClient, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    monkeypatch.setenv("GITHUB_FACTORY_INGRESS_ENABLED", "false")
+    monkeypatch.setenv("FACTORY_ENABLED", "false")
     monkeypatch.setenv("GITHUB_WEBHOOK_SECRET", "example-factory-hmac-secret")
     get_settings.cache_clear()
     body = b'{"action":"labeled"}'
@@ -343,7 +283,7 @@ def test_repository_outside_the_allowlist_does_not_admit(
 
     assert response.status_code == 200, response.text
     assert _code(response) == "repository_not_allowed"
-    assert _rows("SELECT id FROM curie.work_items WHERE github_repository_id = 999001") == []
+    assert _rows("SELECT id FROM curie.work_items WHERE tracker_scope_id = '999001'") == []
 
 
 def test_sender_without_write_permission_does_not_admit(
@@ -503,7 +443,7 @@ def test_closure_requests_termination_until_the_runtime_confirms_it(
         == "factory_admitted"
     )
     request_id = uuid.UUID(str(_requests(number)[0]["id"]))
-    _mark_running(request_id)
+    _mark_running(client, request_id)
     api.issue_state = "closed"
     closed = _post(client, "issues", _issue_event("closed", number))
 
@@ -547,10 +487,76 @@ def test_closure_after_the_channel_moves_still_cancels(
     assert _requests(number)[0]["status"] == "cancelled"
 
 
+def test_admission_retains_issue_lock_until_caller_commit(
+    factory_app: tuple[TestClient, GitHubAPI],
+) -> None:
+    number = next(_ISSUES)
+    notice = parse_factory_event(
+        "issues",
+        _issue_event("labeled", number, label={"name": LABEL}),
+        str(uuid.uuid4()),
+        labels={LABEL},
+        mention=MENTION,
+    )
+    classid, objid = issue_lock_keys_for(REPO_ID, number)
+    _, api = factory_app
+
+    async def go() -> None:
+        engine = create_async_engine(get_settings().database_url)
+        sessions = async_sessionmaker(engine, expire_on_commit=False)
+        try:
+            async with (
+                sessions() as session,
+                engine.connect() as observer,
+                httpx.AsyncClient(transport=httpx.MockTransport(api.handle)) as github,
+            ):
+                caller_pid = await session.scalar(text("SELECT pg_backend_pid()"))
+                await lock_issue(
+                    session,
+                    github_issue_ref(get_settings(), repository_id=REPO_ID, issue_number=number),
+                )
+                verified = await verify_current(notice, settings=get_settings(), client=github)
+                admitted = await admit_notice(
+                    session, notice, get_settings(), verified, client=github
+                )
+                assert admitted.status == "factory_admitted", admitted
+                assert not await observer.scalar(
+                    text(
+                        "SELECT EXISTS (SELECT 1 FROM curie.work_items "
+                        "WHERE tracker_scope_id = :repo AND tracker_issue_id = :number)"
+                    ),
+                    {"repo": str(REPO_ID), "number": str(number)},
+                )
+                request_visible = text(
+                    "SELECT EXISTS (SELECT 1 FROM curie.execution_requests WHERE id = :request_id)"
+                )
+                assert not await observer.scalar(request_visible, {"request_id": notice.request_id})
+                assert await observer.scalar(
+                    text(
+                        "SELECT EXISTS (SELECT 1 FROM pg_locks WHERE locktype = 'advisory' "
+                        "AND granted AND pid = :caller_pid AND objsubid = 2 "
+                        "AND classid::bigint = :classid AND objid::bigint = :objid "
+                        "AND database = (SELECT oid FROM pg_database "
+                        "WHERE datname = current_database()))"
+                    ),
+                    {
+                        "caller_pid": caller_pid,
+                        "classid": classid & 0xFFFFFFFF,
+                        "objid": objid & 0xFFFFFFFF,
+                    },
+                )
+                await session.commit()
+                assert await observer.scalar(request_visible, {"request_id": notice.request_id})
+        finally:
+            await engine.dispose()
+
+    asyncio.run(go())
+
+
 class _PermissionGate(httpx.AsyncBaseTransport):
     """Block the first permission read so a closure can arrive mid-admission."""
 
-    def __init__(self, api: GitHubAPI, entered: asyncio.Event, release: asyncio.Event) -> None:
+    def __init__(self, api: GitHubAPI, entered: threading.Event, release: asyncio.Event) -> None:
         self._api = api
         self._entered = entered
         self._release = release
@@ -575,7 +581,7 @@ def test_closure_during_admission_waits_and_then_cancels(
 
     async def go() -> tuple[Any, Any]:
         engine = create_async_engine(get_settings().database_url)
-        entered = asyncio.Event()
+        entered = threading.Event()
         release = asyncio.Event()
         sessions = async_sessionmaker(engine, expire_on_commit=False)
         try:
@@ -583,8 +589,14 @@ def test_closure_during_admission_waits_and_then_cancels(
                 transport=_PermissionGate(api, entered, release),
                 base_url="https://api.github.com",
             ) as http:
-                async with sessions() as admit_session, sessions() as cancel_session:
-                    admit_task = asyncio.create_task(
+                async with (
+                    sessions() as admit_session,
+                    sessions() as cancel_session,
+                    asyncio.TaskGroup() as deliveries,
+                ):
+                    admit_pid = await admit_session.scalar(text("SELECT pg_backend_pid()"))
+                    cancel_pid = await cancel_session.scalar(text("SELECT pg_backend_pid()"))
+                    admit_task = deliveries.create_task(
                         handle_factory_delivery(
                             admit_session,
                             settings=get_settings(),
@@ -597,10 +609,10 @@ def test_closure_during_admission_waits_and_then_cancels(
                             payload=_issue_event("labeled", number, label={"name": LABEL}),
                         )
                     )
-                    await asyncio.wait_for(entered.wait(), timeout=5)
+                    assert await asyncio.to_thread(entered.wait, 5)
                     api.issue_state = "closed"
                     api.labels = []
-                    cancel_task = asyncio.create_task(
+                    cancel_task = deliveries.create_task(
                         handle_factory_delivery(
                             cancel_session,
                             settings=get_settings(),
@@ -611,13 +623,19 @@ def test_closure_during_admission_waits_and_then_cancels(
                             payload=_issue_event("closed", number),
                         )
                     )
-                    done, _pending = await asyncio.wait({cancel_task}, timeout=1)
-                    still_waiting = cancel_task not in done
+                    # Observe the real issue lock, rather than inferring waiting
+                    # from how often the scheduler runs the cancellation task.
+                    async with engine.connect() as observer, asyncio.timeout(5):
+                        while not await observer.scalar(
+                            text("SELECT :admit_pid = ANY(pg_blocking_pids(:cancel_pid))"),
+                            {"admit_pid": admit_pid, "cancel_pid": cancel_pid},
+                        ):
+                            await asyncio.sleep(0.01)
+                    assert not cancel_task.done()
                     release.set()
                     admitted, cancelled = await asyncio.wait_for(
                         asyncio.gather(admit_task, cancel_task), timeout=10
                     )
-                    assert still_waiting
                     return admitted, cancelled
         finally:
             release.set()
@@ -625,8 +643,77 @@ def test_closure_during_admission_waits_and_then_cancels(
 
     admitted, cancelled = asyncio.run(go())
 
-    assert admitted.status == "factory_admitted"
-    assert cancelled.status == "factory_cancelled"
+    assert admitted.status == "factory_admitted", admitted
+    assert cancelled.status == "factory_cancelled", cancelled
+    assert _requests(number)[0]["status"] == "cancelled"
+
+
+def test_signed_closure_during_admission_waits_and_then_cancels(
+    factory_app: tuple[TestClient, GitHubAPI],
+) -> None:
+    client, api = factory_app
+    number = next(_ISSUES)
+    api.issue_number = number
+    entered = threading.Event()
+    release = asyncio.Event()
+    classid, objid = issue_lock_keys_for(REPO_ID, number)
+
+    async def observe_cancellation_blocked() -> None:
+        engine = create_async_engine(get_settings().database_url)
+        try:
+            async with engine.connect() as observer, asyncio.timeout(5):
+                while not await observer.scalar(
+                    text(
+                        "SELECT EXISTS (SELECT 1 FROM pg_locks waiting "
+                        "JOIN pg_locks holder ON holder.locktype = waiting.locktype "
+                        "AND holder.database = waiting.database "
+                        "AND holder.classid = waiting.classid "
+                        "AND holder.objid = waiting.objid "
+                        "AND holder.objsubid = waiting.objsubid "
+                        "WHERE waiting.locktype = 'advisory' AND NOT waiting.granted "
+                        "AND holder.granted AND waiting.objsubid = 2 "
+                        "AND waiting.database = (SELECT oid FROM pg_database "
+                        "WHERE datname = current_database()) "
+                        "AND waiting.classid::bigint = :classid "
+                        "AND waiting.objid::bigint = :objid "
+                        "AND holder.pid = ANY(pg_blocking_pids(waiting.pid)))"
+                    ),
+                    {"classid": classid & 0xFFFFFFFF, "objid": objid & 0xFFFFFFFF},
+                ):
+                    await asyncio.sleep(0.01)
+        finally:
+            await engine.dispose()
+
+    previous = client.app.state.http_client
+    github = httpx.AsyncClient(transport=_PermissionGate(api, entered, release))
+    client.app.state.http_client = github
+    try:
+        with ThreadPoolExecutor(max_workers=2) as deliveries:
+            try:
+                admission = deliveries.submit(
+                    _post, client, "issues", _issue_event("labeled", number, label={"name": LABEL})
+                )
+                assert entered.wait(5)
+                api.issue_state = "closed"
+                api.labels = []
+                cancellation = deliveries.submit(
+                    _post, client, "issues", _issue_event("closed", number)
+                )
+                asyncio.run(observe_cancellation_blocked())
+                assert not cancellation.done()
+                client.portal.call(release.set)
+                admitted = admission.result(timeout=10)
+                cancelled = cancellation.result(timeout=10)
+            finally:
+                client.portal.call(release.set)
+    finally:
+        client.app.state.http_client = previous
+        client.portal.call(github.aclose)
+
+    assert admitted.status_code == 200, admitted.text
+    assert admitted.json()["status"] == "factory_admitted", admitted.text
+    assert cancelled.status_code == 200, cancelled.text
+    assert cancelled.json()["status"] == "factory_cancelled", cancelled.text
     assert _requests(number)[0]["status"] == "cancelled"
 
 
@@ -652,54 +739,70 @@ def test_concurrent_label_deliveries_leave_one_active_execution(
     number = next(_ISSUES)
     api.issue_number = number
     payload = _issue_event("labeled", number, label={"name": LABEL})
-    responses: list[httpx.Response] = []
-    errors: list[BaseException] = []
+    body = json.dumps(payload).encode()
 
-    def post_once() -> None:
-        try:
-            responses.append(_post(client, "issues", payload, delivery=str(uuid.uuid4())))
-        except BaseException as exc:
-            errors.append(exc)
-
-    threads = [threading.Thread(target=post_once) for _ in range(2)]
-    for thread in threads:
-        thread.start()
-    for thread in threads:
-        thread.join()
-
-    assert errors == []
-    assert [response.status_code for response in responses] == [200, 200]
-    statuses = [response.json()["status"] for response in responses]
-    assert statuses == ["factory_admitted", "factory_admitted"]
-    rows = _requests(number)
-    assert len({row["work_item_id"] for row in rows}) == 1
-    assert [row["status"] for row in rows].count("waiting") == 1
-
-
-def _mark_running(request_id: uuid.UUID) -> None:
-    async def go() -> None:
+    async def go() -> list[str]:
         engine = create_async_engine(get_settings().database_url)
-        try:
-            async with AsyncSession(engine) as session:
-                acquired = await acquire(session, request_id, owner="factory-owner", generation=1)
-                assert not isinstance(acquired, DispatchConflict), acquired
-                started = await start(
+        maker = async_sessionmaker(engine, expire_on_commit=False)
+
+        async def deliver() -> str:
+            async with maker() as session:
+                result = await handle_factory_delivery(
                     session,
-                    request_id,
-                    owner="factory-owner",
-                    generation=1,
-                    claim_name="claim-factory",
-                    sandbox_name="sbx-factory",
+                    settings=get_settings(),
+                    client=client.app.state.http_client,
+                    event="issues",
+                    delivery_id=str(uuid.uuid4()),
+                    body=body,
+                    payload=payload,
                 )
-                assert not isinstance(started, DispatchConflict), started
+            return result.status
+
+        try:
+            return list(await asyncio.gather(deliver(), deliver()))
         finally:
             await engine.dispose()
 
-    asyncio.run(go())
+    statuses = asyncio.run(go())
+    # Both deliveries name the same timeline event, so they share one request.
+    assert "factory_admitted" in statuses, statuses
+    assert set(statuses) <= {"factory_admitted", "factory_duplicate"}
+    rows = _requests(number)
+    assert len({row["work_item_id"] for row in rows}) == 1
+    assert [row["status"] for row in rows].count("waiting") == 1, (statuses, rows)
+    assert len({row["id"] for row in rows}) == 1
+
+
+def _mark_running(client: TestClient, request_id: uuid.UUID) -> None:
+    async def go() -> None:
+        async with client.app.state.sessionmaker() as session:
+            acquired = await acquire(
+                session,
+                request_id,
+                owner="factory-owner",
+                generation=1,
+                wake=await factory_wake(session, request_id),
+                context=None,
+                client=client.app.state.http_client,
+            )
+            assert not isinstance(acquired, DispatchConflict), acquired
+            started = await start(
+                session,
+                request_id,
+                owner="factory-owner",
+                generation=1,
+                claim_name="claim-factory",
+                sandbox_name="sbx-factory",
+                context=acquired.context,
+            )
+            assert not isinstance(started, DispatchConflict), started
+
+    client.portal.call(go)
 
 
 def _assert_publication_refused(work_item_id: uuid.UUID) -> None:
-    from curie_api import crud
+    from curie_api.crud import errors as crud_errors
+    from curie_api.crud import publications as crud_publications
 
     async def go() -> None:
         engine = create_async_engine(get_settings().database_url)
@@ -713,8 +816,8 @@ def _assert_publication_refused(work_item_id: uuid.UUID) -> None:
                         {"id": work_item_id},
                     )
                 ).one()
-                with pytest.raises(crud.PublicationLineageConflict) as caught:
-                    await crud._refuse_fenced_work_item(
+                with pytest.raises(crud_errors.PublicationLineageConflict) as caught:
+                    await crud_publications._refuse_fenced_work_item(
                         session,
                         agent_id=row.agent_id,
                         conversation_id=row.conversation_id,

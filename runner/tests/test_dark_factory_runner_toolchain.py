@@ -1,6 +1,7 @@
 """Proof that the factory runner layer installs this repository's toolchains.
 
-Set CURIE_FACTORY_RUNNER_IMAGE to an image reachable by the k8 cluster. Set
+Set CURIE_FACTORY_RUNNER_IMAGE to an image reachable by the cluster and
+CURIE_FACTORY_KUBE_CONTEXT to its explicit context. Set
 CURIE_FACTORY_RUNNER_PROOF=required when this proof is a required gate; missing
 configuration, a missing image, or an unreachable cluster then fails.
 """
@@ -22,7 +23,8 @@ import pytest
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 SKILL = REPO_ROOT / "examples/dark-factory/skills/implement-issue/SKILL.md"
-CONTEXT = "k8"
+CONTEXT_ENV = "CURIE_FACTORY_KUBE_CONTEXT"
+CONTEXT = os.environ.get(CONTEXT_ENV, "").strip()
 NAMESPACE = "test-3499-factory-runner-checks"
 POD = "factory-runner-toolchain"
 IMAGE_ENV = "CURIE_FACTORY_RUNNER_IMAGE"
@@ -267,10 +269,54 @@ def test_factory_skill_allows_locked_installs_and_reports_service_gaps() -> None
     assert re.search(r"(?:pull request|PR) body", step, re.IGNORECASE)
 
 
+def test_factory_skill_names_registry_egress_cause_with_guidance() -> None:
+    """#3761: an unreachable registry is reported as a named environment cause."""
+    skill = SKILL.read_text(encoding="utf-8")
+    step = skill.split("## 6. Implement and check", 1)[1].split(
+        "## 7. Diff review", 1
+    )[0]
+    assert "registry_egress_unreachable" in step
+    # The probe distinguishes per-address reachability, which is what makes a
+    # partial CIDR allowlist visible.
+    assert "getent ahosts <host>" in step
+    assert "--resolve <host>:443:<address>" in step
+    assert "agentSandbox.registryEgress" in step
+    assert re.search(r"addresses, not hostnames", step)
+
+
+def test_factory_skill_budgets_against_the_reported_deadline() -> None:
+    skill = SKILL.read_text(encoding="utf-8")
+    budget = skill.split("## Time budget", 1)[1].split("## Trust boundary", 1)[0]
+    for required in ("get_issue", "execution_deadline", "execution_seconds", "date -u"):
+        assert required in budget
+    for obsolete in ("10800", "3 hours", "minute 15", "minute 150", "minute 165"):
+        assert obsolete not in skill
+    checkpoints = re.split(r"[.!?](?:\s+|$)", budget)
+    for formula, milestone in (
+        (r"S\s*/\s*12", r"acceptance criteria"),
+        (r"deadline\s*-\s*S\s*/\s*6", r"implement"),
+        (r"deadline\s*-\s*S\s*/\s*12", r"stop"),
+    ):
+        assert any(
+            re.search(formula, checkpoint) and re.search(milestone, checkpoint, re.IGNORECASE)
+            for checkpoint in checkpoints
+        ), (formula, milestone)
+    step = skill.split("## 6. Implement and check", 1)[1].split("## 7. Diff review", 1)[0]
+    probe = next(
+        block
+        for block in re.findall(r"```bash\n(.*?)\n```", step, re.DOTALL)
+        if "registry_host=" in block
+    )
+    for required in ("${execution_deadline:?", "${execution_seconds:?"):
+        assert required in probe
+
+
 def test_factory_runner_pod_resolves_repository_lockfiles() -> None:
     image = os.environ.get(IMAGE_ENV, "").strip()
     if not image:
         _unavailable(f"set {IMAGE_ENV} to the built factory runner layer image")
+    if not CONTEXT:
+        pytest.fail(f"set {CONTEXT_ENV} to the explicit throwaway cluster context")
     if shutil.which("kubectl") is None or shutil.which("git") is None:
         _unavailable("kubectl and git are required for the factory runner pod proof")
     cidrs = _registry_cidrs()
@@ -322,6 +368,7 @@ def test_factory_runner_pod_resolves_repository_lockfiles() -> None:
         assert re.match(r"^Python 3\.13\.", _exec("python3 --version"))
         for command in ("uv --version", "cargo --version", "pnpm --version"):
             assert _exec(command), command
+        assert re.match(r"^cargo-nextest 0\.9\.146\b", _exec("cargo nextest --version"))
 
         _exec(
             "cd /workspace && "

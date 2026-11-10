@@ -15,16 +15,17 @@ from typing import Any
 
 import curie_worker.binding as binding_module
 from aci_protocol import Final, SessionStatus, TextDelta, ToolAccess
+from curie_internal.keyspace import kill_key
 from curie_worker.behaviorpacks import BehaviorPacks
 from curie_worker.binding import (
     BUDGET_ENV,
     BUNDLE_REF_ENV,
     PLUGIN_DIR_ENV,
     BindingResolver,
+    HttpIdentityBinding,
     ResolvedDeployment,
 )
 from curie_worker.config import WorkerConfig
-from curie_worker.killswitch import kill_key
 from curie_worker.reply_sink import TargetRoute
 
 # importlib import mode does not add the test root to sys.path.
@@ -54,6 +55,24 @@ class StubBinding:
     ) -> None:
         self._by_route = by_route
         self._undeployed = undeployed or {}
+        self._local_tenant_id = uuid.uuid4()
+        self._local_binding_ids: dict[tuple[str, str], uuid.UUID] = {}
+
+    async def identity_binding(
+        self, kind: str, adapter: str | None, address: str
+    ) -> HttpIdentityBinding | None:
+        """@spec HTTP-INVOCATION-EXECUTION-18: these canned bindings are explicitly local."""
+        route = (kind, address)
+        resolved = self._by_route.get(route)
+        if resolved is None:
+            resolved = self._undeployed.get(route)
+        if resolved is None:
+            return None
+        binding_id = self._local_binding_ids.setdefault(route, uuid.uuid4())
+        return HttpIdentityBinding(
+            tenant_id=self._local_tenant_id, agent_id=resolved.agent_id,
+            binding_id=binding_id, binding_generation=1, http_identity_required=False,
+        )
 
     async def resolve(
         self, kind: str, adapter: str | None, address: str
@@ -74,6 +93,7 @@ class StubBinding:
         kind: str | None = None,
         address: str | None = None,
         isolate_memory: bool = False,
+    **_: object,
     ) -> dict[str, str]:
         env = {
             BUDGET_ENV: '{"max_output_tokens_per_run":100000,"max_usd_per_day":10.0}',
@@ -104,6 +124,7 @@ class RealBootEnvBinding(StubBinding):
         kind: str | None = None,
         address: str | None = None,
         isolate_memory: bool = False,
+    **_: object,
     ) -> dict[str, str]:
         resolver = BindingResolver.__new__(BindingResolver)
         resolver._config = WorkerConfig()
@@ -185,6 +206,12 @@ def test_unmapped_channel_with_legacy_binding_double_is_a_polite_drop(make_harne
     """Older binding doubles need not implement the diagnostic lookup."""
 
     class LegacyBinding:
+        async def identity_binding(
+            self, kind: str, adapter: str | None, address: str
+        ) -> None:
+            """@spec HTTP-INVOCATION-EXECUTION-18: genuinely absent route, no diagnostic lookup."""
+            return None
+
         async def resolve(self, kind: str, adapter: str | None, address: str) -> None:
             return None
 
@@ -293,6 +320,34 @@ def test_eval_isolate_turn_claims_without_ambient_memory(make_harness) -> None:
             assert plain_env is not None
             assert "CURIE_MEMORY_REF" in plain_env
             assert "CURIE_MEMORY_TOKEN" in plain_env
+
+    asyncio.run(go())
+
+
+def test_slack_channel_claim_marks_the_boot_env_channel_bound(make_harness) -> None:
+    """A slack claim with kind and address emits CURIE_CHANNEL_BOUND=1.
+
+    A direct boot without those coordinates omits the key. The flag is the
+    turn binding, not a second channel detector.
+    """
+
+    async def go() -> None:
+        agent_id = uuid.uuid4()
+        resolved = _resolved(agent_id, bundle="bundles/x.zip")
+        binding = RealBootEnvBinding({("slack", "C0EXAMPLE1"): resolved})
+        async with make_harness(binding=binding) as h:
+            h.runner.default_script = [Final(text="answer", status=DONE)]
+            await h.kernel.process_event(
+                _qevent("hi", channel="C0EXAMPLE1", thread="thread-1")
+            )
+            claim_env = h.fake_k8s.claim_envs[-1]
+            assert claim_env is not None
+            assert claim_env["CURIE_CHANNEL_BOUND"] == "1"
+
+        resolver = BindingResolver.__new__(BindingResolver)
+        resolver._config = WorkerConfig()  # type: ignore[attr-defined]
+        plain = resolver.boot_env(resolved, "thread-1")
+        assert "CURIE_CHANNEL_BOUND" not in plain
 
     asyncio.run(go())
 
@@ -572,8 +627,8 @@ _REPLY_WITH_BUTTONS = (
 
 def test_bound_agent_with_enabled_nav_gets_hub_button_on_final_reply(make_harness) -> None:
     from channel_protocol.reply import NavAffordance
+    from curie_channel_gateway.slack.blocks import render
     from curie_worker.behaviorpacks import NavPack
-    from curie_worker.blocks import render
 
     async def go() -> None:
         packs = {"nav": {"enabled": True, "hub_label": "Help", "hub_command": "help"}}
@@ -640,7 +695,7 @@ def test_malformed_packs_blob_still_completes_the_turn(make_harness) -> None:
 
 
 def test_bound_agent_without_nav_gets_no_hub_button(make_harness) -> None:
-    from curie_worker.blocks import render
+    from curie_channel_gateway.slack.blocks import render
 
     async def go() -> None:
         binding = StubBinding({("slack", "C-bound"): _resolved_with_packs({})})  # nav absent

@@ -5,12 +5,56 @@
 //! to `docker` keeps the CLI dependency-light: the target machine is a dev
 //! laptop that already has Docker if it can run the runner at all.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
 use curie_aci_protocol::env_keys;
 use tokio::process::Command;
+
+pub fn published_host(published: Option<&str>) -> &str {
+    published.unwrap_or("localhost")
+}
+
+pub fn published_endpoint(published: Option<&str>, port: u16) -> String {
+    let host = published_host(published);
+    if host.contains(':') && !host.starts_with('[') {
+        format!("http://[{host}]:{port}")
+    } else {
+        format!("http://{host}:{port}")
+    }
+}
+
+/// Validate the published address before creating Docker resources.
+pub fn published_host_setting() -> Result<Option<String>> {
+    let host = match std::env::var("DOCKER_PUBLISHED_HOST") {
+        Ok(host) => host,
+        Err(std::env::VarError::NotPresent) => return Ok(None),
+        Err(_) => {
+            return Err(crate::exit::usage(
+                "DOCKER_PUBLISHED_HOST must be valid text",
+            ))
+        }
+    };
+    let url = reqwest::Url::parse(&published_endpoint(Some(&host), 8080));
+    if host.is_empty()
+        || host.chars().any(char::is_whitespace)
+        || !url.is_ok_and(|url| {
+            url.host_str().is_some()
+                && url.username().is_empty()
+                && url.password().is_none()
+                && url.port() == Some(8080)
+                && url.path() == "/"
+                && url.query().is_none()
+                && url.fragment().is_none()
+        })
+    {
+        return Err(crate::exit::usage(
+            "DOCKER_PUBLISHED_HOST must be a hostname or IP address without a scheme or port",
+        ));
+    }
+    Ok(Some(host))
+}
 
 /// Everything `docker run` needs to boot a local runner container.
 #[derive(Debug, Clone)]
@@ -74,7 +118,7 @@ fn runner_hardening_args() -> Vec<String> {
 
 impl CheckSpec {
     /// The one shot check container argv (after the `docker` executable).
-    pub fn run_args(&self) -> Vec<String> {
+    pub fn run_args(&self, volume: &str) -> Vec<String> {
         let mut args: Vec<String> = vec![
             "run".into(),
             "--rm".into(),
@@ -91,11 +135,19 @@ impl CheckSpec {
         args.extend(runner_hardening_args());
         args.extend([
             "-v".into(),
-            format!("{}:/plugin:ro", self.plugin_dir),
+            format!("{volume}:/plugin:ro"),
             "-e".into(),
             format!("{}=/plugin", env_keys::CURIE_PLUGIN_DIR),
             "-e".into(),
             format!("CURIE_CHECK_TIMEOUT_S={}", self.timeout_s),
+        ]);
+        args.extend([
+            "--label".into(),
+            CLI_MANAGED_LABEL.into(),
+            "--label".into(),
+            format!("{SNAPSHOT_VOLUME_LABEL}={volume}"),
+        ]);
+        args.extend([
             self.image.clone(),
             "python".into(),
             "-m".into(),
@@ -105,9 +157,14 @@ impl CheckSpec {
     }
 }
 
+/// Runner-local dev flag, read by `runner/src/curie_runner/config.py`. Not a
+/// boot-env key (the ACI contract is frozen), so it is spelled here, not in
+/// `env_keys`.
+const RUNNER_ALLOW_TOKENLESS_ENV: &str = "CURIE_RUNNER_ALLOW_TOKENLESS";
+
 impl StartSpec {
     /// The `docker run` argument vector (after the `docker` executable).
-    pub fn run_args(&self) -> Vec<String> {
+    pub fn run_args(&self, volume: &str) -> Vec<String> {
         let mut args: Vec<String> = vec![
             "run".into(),
             "-d".into(),
@@ -116,7 +173,7 @@ impl StartSpec {
             "-p".into(),
             format!("{}:8080", self.host_port),
             "-v".into(),
-            format!("{}:/plugin:ro", self.plugin_dir.display()),
+            format!("{volume}:/plugin:ro"),
             "-e".into(),
             format!("{}=/plugin", env_keys::CURIE_PLUGIN_DIR),
             "-e".into(),
@@ -125,6 +182,13 @@ impl StartSpec {
             format!("{}={}", env_keys::CURIE_SANDBOX_ID, self.sandbox_id),
             "-e".into(),
             format!("{}={}", env_keys::CURIE_BUDGET, self.budget_json),
+            // Runner-local dev knob (#3821), not a boot-env key: the runner
+            // refuses to boot without CURIE_RUNNER_TOKEN, but the skill-tier
+            // runner is deliberately tokenless (the CLI dials it without a
+            // bearer), so every StartSpec runner opts in. CheckSpec does not
+            // serve and does not get it.
+            "-e".into(),
+            format!("{RUNNER_ALLOW_TOKENLESS_ENV}=1"),
         ];
         // Container isolation (#631): read-only rootfs + tmpfs, cap-drop ALL,
         // no-new-privileges. Mirrors the worker Docker substrate + K8s runner.
@@ -135,6 +199,8 @@ impl StartSpec {
         args.push(CLI_MANAGED_LABEL.into());
         args.push("--label".into());
         args.push(RUNNER_COMPONENT_LABEL.into());
+        args.push("--label".into());
+        args.push(format!("{SNAPSHOT_VOLUME_LABEL}={volume}"));
         if self.fake_model {
             args.push("-e".into());
             args.push(format!("{}=1", env_keys::CURIE_FAKE_MODEL));
@@ -230,6 +296,421 @@ pub async fn docker_capture_with_env(
         String::from_utf8_lossy(&output.stdout).trim().to_string(),
         String::from_utf8_lossy(&output.stderr).trim().to_string(),
     ))
+}
+
+const SNAPSHOT_COMPONENT_LABEL: &str = "curietech.ai/component=skill-snapshot";
+const SNAPSHOT_OWNER_LABEL: &str = "curietech.ai/snapshot-owner";
+const SNAPSHOT_VOLUME_LABEL: &str = "curietech.ai/snapshot-volume";
+const CONNECTOR_SECRET_COMPONENT_LABEL: &str = "curietech.ai/component=connector-secret";
+pub const CONNECTOR_SECRET_RUN_LABEL_KEY: &str = "curietech.ai/credential-run";
+pub const CONNECTOR_SECRET_VOLUME_LABEL_KEY: &str = "curietech.ai/credential-volume";
+
+enum VolumeInput<'a> {
+    Directory(&'a Path),
+    Archive(Vec<u8>),
+}
+
+async fn copy_archive_to_volume(archive: Vec<u8>, destination: &str) -> Result<()> {
+    use std::process::Stdio;
+    use tokio::io::AsyncWriteExt;
+
+    let mut child = Command::new("docker")
+        .args(["cp", "-a", "-", destination])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .kill_on_drop(true)
+        .spawn()
+        .context("could not start Docker credential copy")?;
+    let mut stdin = child
+        .stdin
+        .take()
+        .context("Docker credential copy has no stdin")?;
+    let write = stdin.write_all(&archive).await;
+    drop(stdin);
+    let status = child
+        .wait()
+        .await
+        .context("could not wait for Docker credential copy")?;
+    write.context("could not stream connector credentials to Docker")?;
+    if !status.success() {
+        bail!("Docker credential copy failed ({status})");
+    }
+    Ok(())
+}
+
+async fn seed_volume(
+    image: &str,
+    volume: &str,
+    target: &str,
+    user: &str,
+    labels: &[String],
+    input: VolumeInput<'_>,
+) -> Result<()> {
+    let helper = format!("{volume}-seed");
+    let mut create = vec!["volume".into(), "create".into()];
+    for label in labels {
+        create.extend(["--label".into(), label.clone()]);
+    }
+    create.push(volume.into());
+    docker(&create).await?;
+    let mut create = vec![
+        "create".into(),
+        "--name".into(),
+        helper.clone(),
+        "--network".into(),
+        "none".into(),
+        "--user".into(),
+        user.into(),
+        "--entrypoint".into(),
+        "/curie-copy-unused".into(),
+        "--read-only".into(),
+        "--cap-drop".into(),
+        "ALL".into(),
+        "--security-opt".into(),
+        "no-new-privileges".into(),
+    ];
+    for label in labels {
+        create.extend(["--label".into(), label.clone()]);
+    }
+    create.extend([
+        "--mount".into(),
+        format!("type=volume,source={volume},target={target},volume-nocopy"),
+        image.into(),
+    ]);
+    docker(&create).await?;
+    let copy = match input {
+        VolumeInput::Directory(directory) => docker(&[
+            "cp".into(),
+            format!("{}/.", directory.display()),
+            format!("{helper}:{target}"),
+        ])
+        .await
+        .map(|_| ()),
+        VolumeInput::Archive(archive) => {
+            copy_archive_to_volume(archive, &format!("{helper}:{target}")).await
+        }
+    };
+    let remove = docker(&["rm".into(), "-f".into(), "-v".into(), helper]).await;
+    copy?;
+    remove?;
+    Ok(())
+}
+
+/// Copy client-side snapshot bytes through Docker's API into a private volume.
+async fn prepare_snapshot_volume(image: &str, snapshot: &Path, owner: &str) -> Result<String> {
+    let volume = format!("curie-snapshot-{}", uuid::Uuid::new_v4());
+    let prepare = seed_volume(
+        image,
+        &volume,
+        "/plugin",
+        "0:0",
+        &[
+            CLI_MANAGED_LABEL.into(),
+            SNAPSHOT_COMPONENT_LABEL.into(),
+            format!("{SNAPSHOT_OWNER_LABEL}={owner}"),
+            format!("{SNAPSHOT_VOLUME_LABEL}={volume}"),
+        ],
+        VolumeInput::Directory(snapshot),
+    )
+    .await;
+    if let Err(err) = prepare {
+        let cleanup = cleanup_snapshot_volume(&volume).await;
+        return Err(match cleanup {
+            Ok(()) => err.context("copying the bundle snapshot to Docker"),
+            Err(cleanup) => err.context(format!(
+                "copying the bundle snapshot to Docker; cleanup failed: {cleanup}"
+            )),
+        });
+    }
+    Ok(volume)
+}
+
+/// Remove only a volume carrying both CLI ownership and snapshot component labels.
+async fn remove_snapshot_volume(volume: &str) -> Result<()> {
+    let (status, labels, stderr) = docker_capture(&[
+        "volume".into(),
+        "inspect".into(),
+        "--format".into(),
+        "{{index .Labels \"curietech.ai/managed-by\"}} {{index .Labels \"curietech.ai/component\"}}".into(),
+        volume.into(),
+    ])
+    .await?;
+    if !status.success() {
+        if stderr.to_ascii_lowercase().contains("no such volume") {
+            return Ok(());
+        }
+        bail!("could not inspect snapshot volume '{volume}': {stderr}");
+    }
+    if !snapshot_volume_owned(&labels) {
+        bail!("refusing to remove volume '{volume}' without snapshot ownership labels");
+    }
+    docker(&["volume".into(), "rm".into(), volume.into()])
+        .await
+        .map(|_| ())
+}
+
+fn snapshot_volume_owned(labels: &str) -> bool {
+    labels == "curie-cli skill-snapshot"
+}
+
+/// Release partial startup containers and their uniquely owned snapshot volume.
+async fn cleanup_snapshot_volume(volume: &str) -> Result<()> {
+    let report = reap_filtered(&[
+        ("label", CLI_MANAGED_LABEL),
+        ("label", &format!("{SNAPSHOT_VOLUME_LABEL}={volume}")),
+    ])
+    .await;
+    let removal = remove_snapshot_volume(volume).await;
+    if let Some(err) = report.error {
+        bail!("snapshot container cleanup failed: {err}; volume cleanup: {removal:?}");
+    }
+    removal
+}
+
+/// Discover a stopped runner's remaining volumes from its existing session identity.
+fn session_snapshot_volumes_args(owner: &str) -> Vec<String> {
+    vec![
+        "volume".into(),
+        "ls".into(),
+        "-q".into(),
+        "--filter".into(),
+        format!("label={CLI_MANAGED_LABEL}"),
+        "--filter".into(),
+        format!("label={SNAPSHOT_COMPONENT_LABEL}"),
+        "--filter".into(),
+        format!("label={SNAPSHOT_OWNER_LABEL}={owner}"),
+    ]
+}
+
+pub async fn remove_session_snapshot_volumes(owner: &str) -> Result<()> {
+    let volumes = docker(&session_snapshot_volumes_args(owner)).await?;
+    for volume in volumes.lines().filter(|line| !line.is_empty()) {
+        remove_snapshot_volume(volume).await?;
+    }
+    Ok(())
+}
+
+pub async fn prepare_connector_secret_volume(
+    volumes: &crate::connector_build::ConnectorSecretVolumes,
+    connector: &str,
+    spec: &crate::connector_build::ConnectorSpecDecl,
+    image: &str,
+    identity: &crate::connector_build::ConnectorScope,
+    project: &str,
+    secret_values: &std::collections::BTreeMap<String, String>,
+) -> Result<()> {
+    use crate::connector_build as cb;
+
+    let mounts = volumes.mounts(connector, spec)?;
+    let Some(first) = mounts.first() else {
+        return Ok(());
+    };
+    let mut archive = tar::Builder::new(Vec::new());
+    for ((key, _), mount) in spec.secret_files.iter().zip(&mounts) {
+        let value = secret_values
+            .get(key)
+            .ok_or_else(|| cb::missing_secrets_error(std::slice::from_ref(key)))?;
+        let mut header = tar::Header::new_gnu();
+        header.set_size(value.len() as u64);
+        header.set_mode(0o400);
+        header.set_uid(u64::from(cb::CONNECTOR_UID));
+        header.set_gid(u64::from(cb::CONNECTOR_UID));
+        header.set_mtime(0);
+        header.set_cksum();
+        archive
+            .append_data(&mut header, &mount.subpath, value.as_bytes())
+            .context("could not prepare connector credential transfer")?;
+    }
+    let archive = archive
+        .into_inner()
+        .context("could not finish connector credential transfer")?;
+    let mut labels = vec![
+        CLI_MANAGED_LABEL.into(),
+        CONNECTOR_SECRET_COMPONENT_LABEL.into(),
+        connector_project_label(project),
+    ];
+    labels.extend(
+        connector_identity_labels(
+            &identity.agent,
+            &cb::object_name(&identity.release, &identity.agent, connector),
+        )
+        .into_iter()
+        .chain(volumes.labels(connector))
+        .map(|(key, value)| format!("{key}={value}")),
+    );
+    seed_volume(
+        image,
+        &first.volume,
+        "/curie-secrets",
+        CONNECTOR_UID,
+        &labels,
+        VolumeInput::Archive(archive),
+    )
+    .await
+}
+
+async fn remove_connector_secret_volume(volume: &str) -> Result<()> {
+    let (status, labels, stderr) = docker_capture(&[
+        "volume".into(),
+        "inspect".into(),
+        "--format".into(),
+        "{{index .Labels \"curietech.ai/managed-by\"}} {{index .Labels \"curietech.ai/component\"}}".into(),
+        volume.into(),
+    ])
+    .await?;
+    if !status.success() {
+        if stderr.to_ascii_lowercase().contains("no such volume") {
+            return Ok(());
+        }
+        bail!("could not inspect connector credential volume '{volume}': {stderr}");
+    }
+    if labels != "curie-cli connector-secret" {
+        bail!("refusing to remove volume '{volume}' without connector credential ownership labels");
+    }
+    docker(&["volume".into(), "rm".into(), volume.into()]).await?;
+    Ok(())
+}
+
+async fn remove_connector_secret_volumes(
+    project: &str,
+    agent: Option<&str>,
+    run_id: Option<&str>,
+) -> Result<()> {
+    let mut args = vec![
+        "volume".into(),
+        "ls".into(),
+        "-q".into(),
+        "--filter".into(),
+        format!("label={CLI_MANAGED_LABEL}"),
+        "--filter".into(),
+        format!("label={CONNECTOR_SECRET_COMPONENT_LABEL}"),
+        "--filter".into(),
+        format!("label={}", connector_project_label(project)),
+    ];
+    if let Some(agent) = agent {
+        args.extend([
+            "--filter".into(),
+            format!("label={}", connector_agent_label(agent)),
+        ]);
+    }
+    if let Some(run_id) = run_id {
+        args.extend([
+            "--filter".into(),
+            format!("label={CONNECTOR_SECRET_RUN_LABEL_KEY}={run_id}"),
+        ]);
+    }
+    let volumes = docker(&args).await?;
+    let mut problems = Vec::new();
+    for volume in volumes.lines().filter(|line| !line.is_empty()) {
+        if let Err(err) = remove_connector_secret_volume(volume).await {
+            problems.push(err.to_string());
+        }
+    }
+    if !problems.is_empty() {
+        bail!(
+            "connector credential cleanup failed: {}",
+            problems.join("; ")
+        );
+    }
+    Ok(())
+}
+
+pub async fn cleanup_connector_run(project: &str, agent: &str, run_id: &str) -> Result<()> {
+    let report = reap_filtered(&[
+        ("label", CLI_MANAGED_LABEL),
+        ("label", &connector_project_label(project)),
+        ("label", &connector_agent_label(agent)),
+        (
+            "label",
+            &format!("{CONNECTOR_SECRET_RUN_LABEL_KEY}={run_id}"),
+        ),
+    ])
+    .await;
+    let volumes = remove_connector_secret_volumes(project, Some(agent), Some(run_id)).await;
+    if let Some(err) = report.error {
+        bail!("connector cleanup failed: {err}; credential volume cleanup: {volumes:?}");
+    }
+    volumes
+}
+
+pub async fn connector_secret_volumes_for_agent(project: &str, agent: &str) -> Result<Vec<String>> {
+    let listing = docker(&agent_connectors_argv(project, agent)).await?;
+    let mut volumes = std::collections::BTreeSet::new();
+    for container in parse_agent_connectors(&listing) {
+        if let Some(volume) = container_connector_secret_volume(&container.id).await? {
+            volumes.insert(volume);
+        }
+    }
+    Ok(volumes.into_iter().collect())
+}
+
+pub async fn release_unused_connector_secret_volumes(volumes: &[String]) -> Result<()> {
+    let mut problems = Vec::new();
+    for volume in volumes {
+        let removal = async {
+            let users = docker(&[
+                "ps".into(),
+                "-a".into(),
+                "-q".into(),
+                "--filter".into(),
+                format!("volume={volume}"),
+            ])
+            .await?;
+            if users.is_empty() {
+                remove_connector_secret_volume(volume).await?;
+            }
+            Ok::<(), anyhow::Error>(())
+        }
+        .await;
+        if let Err(err) = removal {
+            problems.push(err.to_string());
+        }
+    }
+    if !problems.is_empty() {
+        bail!(
+            "connector credential cleanup failed: {}",
+            problems.join("; ")
+        );
+    }
+    Ok(())
+}
+
+/// Boot with an immutable snapshot copied through Docker's API.
+pub async fn start_runner(spec: &StartSpec) -> Result<String> {
+    let volume = prepare_snapshot_volume(
+        &spec.image,
+        &spec.plugin_dir,
+        &format!("{}:{}", spec.container_name, spec.session_id),
+    )
+    .await?;
+    let result = docker_with_env(&spec.run_args(&volume), &spec.docker_env).await;
+    match result {
+        Ok(id) => Ok(id),
+        Err(err) => {
+            if let Err(cleanup) = cleanup_snapshot_volume(&volume).await {
+                return Err(err.context(format!("snapshot cleanup failed: {cleanup}")));
+            }
+            Err(err)
+        }
+    }
+}
+
+pub async fn run_check(spec: &CheckSpec) -> Result<(std::process::ExitStatus, String, String)> {
+    let volume = prepare_snapshot_volume(
+        &spec.image,
+        Path::new(&spec.plugin_dir),
+        &format!("check-{}", uuid::Uuid::new_v4()),
+    )
+    .await?;
+    let result = docker_capture(&spec.run_args(&volume)).await;
+    if let Err(cleanup) = cleanup_snapshot_volume(&volume).await {
+        return Err(match result {
+            Ok(_) => cleanup.context("releasing the check snapshot"),
+            Err(err) => err.context(format!("check snapshot cleanup failed: {cleanup}")),
+        });
+    }
+    result
 }
 
 /// The bounded window for resolving the actual Docker IDs of local Compose
@@ -1033,10 +1514,221 @@ pub async fn pull_model(container: &str, model: &str) -> Result<()> {
 }
 
 /// Best-effort container teardown (used for cleanup paths).
+async fn container_snapshot_volume(name_or_id: &str) -> Result<Option<String>> {
+    let (status, volume, stderr) = docker_capture(&[
+        "container".into(),
+        "inspect".into(),
+        "--format".into(),
+        "{{if eq (index .Config.Labels \"curietech.ai/managed-by\") \"curie-cli\"}}{{with index .Config.Labels \"curietech.ai/snapshot-volume\"}}{{.}}{{end}}{{end}}".into(),
+        name_or_id.into(),
+    ])
+    .await?;
+    if !status.success() && !stderr.contains("No such") {
+        bail!("could not inspect container '{name_or_id}' before teardown: {stderr}");
+    }
+    Ok((!volume.is_empty()).then_some(volume))
+}
+
+async fn container_connector_secret_volume(name_or_id: &str) -> Result<Option<String>> {
+    let (status, volume, stderr) = docker_capture(&[
+        "container".into(),
+        "inspect".into(),
+        "--format".into(),
+        format!("{{{{if eq (index .Config.Labels \"curietech.ai/managed-by\") \"curie-cli\"}}}}{{{{with index .Config.Labels \"{CONNECTOR_SECRET_VOLUME_LABEL_KEY}\"}}}}{{{{.}}}}{{{{end}}}}{{{{end}}}}"),
+        name_or_id.into(),
+    ]).await?;
+    if !status.success() && !stderr.contains("No such") {
+        bail!("could not inspect container '{name_or_id}' before teardown: {stderr}");
+    }
+    Ok((!volume.is_empty()).then_some(volume))
+}
+
+const CLAIM_LABEL_KEY: &str = "curietech.ai/claim";
+const CLAIM_ATTEMPT_LABEL_KEY: &str = "curietech.ai/claim-attempt";
+const COMPONENT_LABEL_KEY: &str = "curietech.ai/component";
+const CLAIM_INPUT_COMPONENTS: &[&str] = &["claim-bundle", "claim-workspace", "claim-attachments"];
+pub const SANDBOX_STACK_LABEL_KEY: &str = "curietech.ai/stack";
+
+struct ClaimInputOwner {
+    claim: String,
+    attempt: String,
+}
+
+impl ClaimInputOwner {
+    fn from_labels(labels: &serde_json::Value) -> Option<Self> {
+        let (managed_key, managed_value) = SANDBOX_LABEL.split_once('=')?;
+        if labels.get(managed_key)?.as_str()? != managed_value {
+            return None;
+        }
+        let claim = labels.get(CLAIM_LABEL_KEY)?.as_str()?;
+        let attempt = labels.get(CLAIM_ATTEMPT_LABEL_KEY)?.as_str()?;
+        if claim.trim().is_empty() || uuid::Uuid::parse_str(attempt).is_err() {
+            return None;
+        }
+        Some(Self {
+            claim: claim.to_string(),
+            attempt: attempt.to_string(),
+        })
+    }
+
+    fn matches(&self, other: &Self) -> bool {
+        self.claim == other.claim && self.attempt == other.attempt
+    }
+}
+
+struct ClaimContainerInputs {
+    labels: serde_json::Value,
+    volumes: Vec<String>,
+}
+
+fn named_volume(name: &str) -> bool {
+    name.starts_with(|c: char| c.is_ascii_alphanumeric())
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '-'))
+}
+
+async fn container_claim_inputs(name_or_id: &str) -> Result<Option<ClaimContainerInputs>> {
+    let (status, metadata, stderr) = docker_capture(&[
+        "container".into(),
+        "inspect".into(),
+        "--format".into(),
+        "{{json .}}".into(),
+        name_or_id.into(),
+    ])
+    .await?;
+    if !status.success() {
+        if stderr.to_ascii_lowercase().contains("no such container") {
+            return Ok(None);
+        }
+        bail!("could not inspect container '{name_or_id}' before claim input cleanup: {stderr}");
+    }
+    let metadata: serde_json::Value =
+        serde_json::from_str(&metadata).context("invalid container claim input metadata")?;
+    let labels = metadata
+        .pointer("/Config/Labels")
+        .context("container inspect omitted ownership labels")?
+        .clone();
+    let mounts = metadata
+        .get("Mounts")
+        .and_then(serde_json::Value::as_array)
+        .context("container inspect omitted mount metadata")?;
+    let volumes = mounts
+        .iter()
+        .filter(|mount| mount.get("Type").and_then(serde_json::Value::as_str) == Some("volume"))
+        .filter_map(|mount| mount.get("Name").and_then(serde_json::Value::as_str))
+        .filter(|name| named_volume(name))
+        .map(str::to_string)
+        .collect();
+    Ok(Some(ClaimContainerInputs { labels, volumes }))
+}
+
+async fn claim_input_volume_labels(volume: &str) -> Result<Option<serde_json::Value>> {
+    let (status, labels, stderr) = docker_capture(&[
+        "volume".into(),
+        "inspect".into(),
+        "--format".into(),
+        "{{json .Labels}}".into(),
+        volume.into(),
+    ])
+    .await?;
+    if !status.success() {
+        if stderr.to_ascii_lowercase().contains("no such volume") {
+            return Ok(None);
+        }
+        bail!("could not inspect claim input volume '{volume}': {stderr}");
+    }
+    serde_json::from_str(&labels)
+        .context("invalid claim input volume ownership labels")
+        .map(Some)
+}
+
+async fn remove_claim_input_volume(
+    volume: &str,
+    owner: &ClaimInputOwner,
+    stack: Option<&str>,
+) -> Result<()> {
+    if !named_volume(volume) {
+        return Ok(());
+    }
+    let Some(labels) = claim_input_volume_labels(volume).await? else {
+        return Ok(());
+    };
+    let Some(actual) = ClaimInputOwner::from_labels(&labels) else {
+        return Ok(());
+    };
+    if !owner.matches(&actual)
+        || !labels
+            .get(COMPONENT_LABEL_KEY)
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|component| CLAIM_INPUT_COMPONENTS.contains(&component))
+        || stack.is_some_and(|stack| {
+            labels
+                .get(SANDBOX_STACK_LABEL_KEY)
+                .and_then(serde_json::Value::as_str)
+                != Some(stack)
+        })
+    {
+        return Ok(());
+    }
+    // Inspect and rm are separate daemon calls. The worker's
+    // reap_claim_templates sweep volume-rms the same claim input once this
+    // process has removed the runner and the volume is older than the claim
+    // timeout plus grace. "no such volume" is that race already won by the
+    // other remover, which is the state this call wants.
+    let (status, _stdout, stderr) =
+        docker_capture(&["volume".into(), "rm".into(), volume.into()]).await?;
+    if status.success() || stderr.to_ascii_lowercase().contains("no such volume") {
+        return Ok(());
+    }
+    bail!("docker volume failed ({status}): {stderr}");
+}
+
+async fn remove_container_claim_inputs(inputs: ClaimContainerInputs) -> Result<()> {
+    if inputs
+        .labels
+        .get(COMPONENT_LABEL_KEY)
+        .and_then(serde_json::Value::as_str)
+        != Some("claim-runner")
+    {
+        return Ok(());
+    }
+    let Some(owner) = ClaimInputOwner::from_labels(&inputs.labels) else {
+        return Ok(());
+    };
+    let mut problems = Vec::new();
+    for volume in inputs.volumes {
+        if let Err(err) = remove_claim_input_volume(&volume, &owner, None).await {
+            problems.push(err.to_string());
+        }
+    }
+    if !problems.is_empty() {
+        bail!("claim input cleanup failed: {}", problems.join("; "));
+    }
+    Ok(())
+}
+
 pub async fn remove_container(name_or_id: &str) -> Result<()> {
-    docker(&["rm".into(), "-f".into(), name_or_id.to_string()])
-        .await
-        .map(|_| ())
+    let volume = container_snapshot_volume(name_or_id).await?;
+    let credentials = container_connector_secret_volume(name_or_id).await?;
+    let claim_inputs = container_claim_inputs(name_or_id).await?;
+    docker(&[
+        "rm".into(),
+        "-f".into(),
+        "-v".into(),
+        name_or_id.to_string(),
+    ])
+    .await?;
+    if let Some(volume) = volume {
+        remove_snapshot_volume(&volume).await?;
+    }
+    if let Some(volume) = credentials {
+        remove_connector_secret_volume(&volume).await?;
+    }
+    if let Some(inputs) = claim_inputs {
+        remove_container_claim_inputs(inputs).await?;
+    }
+    Ok(())
 }
 
 /// The outcome of reaping labeled containers: what was removed, what is still
@@ -1133,7 +1825,31 @@ pub async fn reap_filtered(filters: &[(&str, &str)]) -> ReapReport {
         };
     }
 
-    let mut rm_args: Vec<String> = vec!["rm".into(), "-f".into()];
+    let mut snapshot_volumes = Vec::new();
+    let mut snapshot_problems = Vec::new();
+    let mut credential_volumes = std::collections::BTreeSet::new();
+    let mut claim_inputs = Vec::new();
+    for candidate in &candidates {
+        match container_snapshot_volume(candidate).await {
+            Ok(Some(volume)) => snapshot_volumes.push(volume),
+            Ok(None) => {}
+            Err(err) => snapshot_problems.push(err.to_string()),
+        }
+        match container_connector_secret_volume(candidate).await {
+            Ok(Some(volume)) => {
+                credential_volumes.insert(volume);
+            }
+            Ok(None) => {}
+            Err(err) => snapshot_problems.push(err.to_string()),
+        }
+        match container_claim_inputs(candidate).await {
+            Ok(Some(inputs)) => claim_inputs.push((candidate, inputs)),
+            Ok(None) => {}
+            Err(err) => snapshot_problems.push(err.to_string()),
+        }
+    }
+
+    let mut rm_args: Vec<String> = vec!["rm".into(), "-f".into(), "-v".into()];
     rm_args.extend(candidates.iter().cloned());
     // Capture (not `docker`) so a nonzero exit keeps its stdout: `docker rm -f`
     // exits nonzero if ANY id fails, yet still echoes the ids it did remove.
@@ -1150,7 +1866,7 @@ pub async fn reap_filtered(filters: &[(&str, &str)]) -> ReapReport {
     };
 
     // Re-list for the ground truth of what is still running.
-    match labeled_container_ids_filtered(filters).await {
+    let mut report = match labeled_container_ids_filtered(filters).await {
         Ok(still_present) => reap_report(&rm_stdout, rm_error, still_present),
         Err(e) => ReapReport {
             removed: count_removed(&rm_stdout),
@@ -1160,7 +1876,125 @@ pub async fn reap_filtered(filters: &[(&str, &str)]) -> ReapReport {
                 None => format!("could not confirm teardown of containers {filters:?}: {e}"),
             }),
         },
+    };
+    for volume in snapshot_volumes {
+        if let Err(err) = remove_snapshot_volume(&volume).await {
+            snapshot_problems.push(err.to_string());
+        }
     }
+    for volume in credential_volumes {
+        if let Err(err) = remove_connector_secret_volume(&volume).await {
+            snapshot_problems.push(err.to_string());
+        }
+    }
+    for (candidate, inputs) in claim_inputs {
+        let removed = if rm_stdout
+            .lines()
+            .any(|removed| removed.trim() == candidate.as_str())
+        {
+            true
+        } else {
+            match container_claim_inputs(candidate).await {
+                Ok(None) => true,
+                Ok(Some(_)) => false,
+                Err(err) => {
+                    snapshot_problems.push(err.to_string());
+                    false
+                }
+            }
+        };
+        if removed {
+            if let Err(err) = remove_container_claim_inputs(inputs).await {
+                snapshot_problems.push(err.to_string());
+            }
+        }
+    }
+    if !snapshot_problems.is_empty() {
+        let problems = snapshot_problems.join("; ");
+        report.error = Some(match report.error {
+            Some(err) => format!("{err}; container volume cleanup: {problems}"),
+            None => format!("container volume cleanup: {problems}"),
+        });
+    }
+    report
+}
+
+/// Remove this stack's claim input helpers and orphaned named input volumes.
+pub async fn cleanup_stack_claim_inputs(stack: &str) -> Result<()> {
+    if stack.trim().is_empty() {
+        bail!("claim input orphan cleanup requires a nonempty stack identity");
+    }
+    let stack_label = format!("{SANDBOX_STACK_LABEL_KEY}={stack}");
+    let mut problems = Vec::new();
+    for component in CLAIM_INPUT_COMPONENTS {
+        let component_label = format!("{COMPONENT_LABEL_KEY}={component}");
+        let filters = [
+            ("label", SANDBOX_LABEL),
+            ("label", stack_label.as_str()),
+            ("label", component_label.as_str()),
+        ];
+        match labeled_container_ids_filtered(&filters).await {
+            Ok(helpers) => {
+                for helper in helpers {
+                    let inputs = match container_claim_inputs(&helper).await {
+                        Ok(Some(inputs)) => inputs,
+                        Ok(None) => continue,
+                        Err(err) => {
+                            problems.push(err.to_string());
+                            continue;
+                        }
+                    };
+                    if ClaimInputOwner::from_labels(&inputs.labels).is_none()
+                        || inputs
+                            .labels
+                            .get(COMPONENT_LABEL_KEY)
+                            .and_then(serde_json::Value::as_str)
+                            != Some(*component)
+                        || inputs
+                            .labels
+                            .get(SANDBOX_STACK_LABEL_KEY)
+                            .and_then(serde_json::Value::as_str)
+                            != Some(stack)
+                    {
+                        continue;
+                    }
+                    if let Err(err) = remove_container(&helper).await {
+                        problems.push(err.to_string());
+                    }
+                }
+            }
+            Err(err) => problems.push(err.to_string()),
+        }
+        let mut args = vec!["volume".into(), "ls".into(), "-q".into()];
+        for (key, value) in filters {
+            args.extend(["--filter".into(), format!("{key}={value}")]);
+        }
+        match docker(&args).await {
+            Ok(volumes) => {
+                for volume in volumes.lines().filter(|name| named_volume(name)) {
+                    let labels = match claim_input_volume_labels(volume).await {
+                        Ok(Some(labels)) => labels,
+                        Ok(None) => continue,
+                        Err(err) => {
+                            problems.push(err.to_string());
+                            continue;
+                        }
+                    };
+                    let Some(owner) = ClaimInputOwner::from_labels(&labels) else {
+                        continue;
+                    };
+                    if let Err(err) = remove_claim_input_volume(volume, &owner, Some(stack)).await {
+                        problems.push(err.to_string());
+                    }
+                }
+            }
+            Err(err) => problems.push(err.to_string()),
+        }
+    }
+    if !problems.is_empty() {
+        bail!("stack claim input cleanup failed: {}", problems.join("; "));
+    }
+    Ok(())
 }
 
 /// The number of containers `docker rm -f` confirmed removed: it echoes one
@@ -1403,6 +2237,8 @@ pub async fn container_logs(name_or_id: &str, tail: u32) -> String {
 mod tests {
     use super::*;
 
+    const SNAPSHOT_VOLUME: &str = "curie-snapshot-acme-test";
+
     #[test]
     fn count_removed_counts_actual_rm_output_not_the_candidate_set() {
         // `docker rm -f` echoes one removed id per line; that is the truthful
@@ -1514,6 +2350,262 @@ mod tests {
             passthrough_env: vec!["CURIE_TEST_ENV_THAT_DOES_NOT_EXIST".into()],
             docker_env: vec![],
         }
+    }
+
+    #[test]
+    fn snapshot_volume_requires_both_exact_ownership_labels() {
+        assert!(snapshot_volume_owned("curie-cli skill-snapshot"));
+        for labels in [
+            "",
+            "curie-cli",
+            "skill-snapshot",
+            "foreign-cli skill-snapshot",
+            "curie-cli foreign-component",
+            "curie-cli skill-snapshot-extra",
+        ] {
+            assert!(
+                !snapshot_volume_owned(labels),
+                "foreign or incomplete ownership must refuse volume removal: {labels:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn session_snapshot_volume_discovery_filters_the_exact_owner() {
+        for owner in [
+            "acme-runner:session-one",
+            "acme-runner:session-one-neighbor",
+        ] {
+            assert_eq!(
+                session_snapshot_volumes_args(owner),
+                vec![
+                    "volume".to_string(),
+                    "ls".to_string(),
+                    "-q".to_string(),
+                    "--filter".to_string(),
+                    "label=curietech.ai/managed-by=curie-cli".to_string(),
+                    "--filter".to_string(),
+                    "label=curietech.ai/component=skill-snapshot".to_string(),
+                    "--filter".to_string(),
+                    format!("label=curietech.ai/snapshot-owner={owner}"),
+                ],
+                "discovery must exclude unrelated volumes and neighboring sessions"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn published_host_does_not_infer_an_address_from_the_docker_host_scheme() {
+        let _guard = crate::PROCESS_ENV_LOCK.lock().await;
+        let original = std::env::var_os("DOCKER_HOST");
+        let original_published = std::env::var_os("DOCKER_PUBLISHED_HOST");
+        std::env::remove_var("DOCKER_PUBLISHED_HOST");
+        let schemes = [
+            "ssh://docker.example.com",
+            "tcp://docker.example.com:2376",
+            "unix:///var/run/docker.sock",
+        ];
+        let mut results = Vec::new();
+        for docker_host in schemes {
+            std::env::set_var("DOCKER_HOST", docker_host);
+            results.push((docker_host, published_host_setting()));
+        }
+        match original {
+            Some(value) => std::env::set_var("DOCKER_HOST", value),
+            None => std::env::remove_var("DOCKER_HOST"),
+        }
+        match original_published {
+            Some(value) => std::env::set_var("DOCKER_PUBLISHED_HOST", value),
+            None => std::env::remove_var("DOCKER_PUBLISHED_HOST"),
+        }
+        for (docker_host, result) in results {
+            assert_eq!(
+                result.expect("a transport without a published host uses the default address"),
+                None,
+                "DOCKER_HOST={docker_host} must not select the published address"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn published_host_setting_accepts_absence_hostnames_and_ip_addresses() {
+        let _guard = crate::PROCESS_ENV_LOCK.lock().await;
+        let original = std::env::var_os("DOCKER_PUBLISHED_HOST");
+        std::env::remove_var("DOCKER_PUBLISHED_HOST");
+        let absent = published_host_setting();
+        let hosts = [
+            "localhost",
+            "docker.example.com",
+            "192.0.2.10",
+            "2001:db8::10",
+            "[2001:db8::10]",
+        ];
+        let mut results = Vec::new();
+        for host in hosts {
+            std::env::set_var("DOCKER_PUBLISHED_HOST", host);
+            results.push((host, published_host_setting()));
+        }
+        match original {
+            Some(value) => std::env::set_var("DOCKER_PUBLISHED_HOST", value),
+            None => std::env::remove_var("DOCKER_PUBLISHED_HOST"),
+        }
+
+        assert_eq!(absent.expect("an absent setting selects local mode"), None);
+        for (host, result) in results {
+            assert_eq!(
+                result.expect("a hostname or IP address must be accepted"),
+                Some(host.to_string()),
+                "{host}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn published_host_setting_rejects_invalid_addresses_as_usage_errors() {
+        let _guard = crate::PROCESS_ENV_LOCK.lock().await;
+        let original = std::env::var_os("DOCKER_PUBLISHED_HOST");
+        let hosts = [
+            "",
+            " ",
+            "docker.example.com ",
+            "http://docker.example.com",
+            "ssh://docker.example.com",
+            "docker.example.com/plugin",
+            "docker.example.com:2376",
+            "[2001:db8::10]:2376",
+            "user@docker.example.com",
+            "docker.example.com?query=1",
+            "docker.example.com#fragment",
+        ];
+        let mut results = Vec::new();
+        for host in hosts {
+            std::env::set_var("DOCKER_PUBLISHED_HOST", host);
+            results.push((host, published_host_setting()));
+        }
+        match original {
+            Some(value) => std::env::set_var("DOCKER_PUBLISHED_HOST", value),
+            None => std::env::remove_var("DOCKER_PUBLISHED_HOST"),
+        }
+
+        for (host, result) in results {
+            let err = result.expect_err("invalid addresses must fail before Docker startup");
+            assert_eq!(
+                crate::exit::classify(&err).0,
+                crate::exit::ExitClass::Usage,
+                "{host:?}"
+            );
+            assert!(
+                err.to_string().contains("DOCKER_PUBLISHED_HOST"),
+                "the usage error must identify the setting: {err}"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn published_host_setting_rejects_non_unicode_as_a_usage_error() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let _guard = crate::PROCESS_ENV_LOCK.lock().await;
+        let original = std::env::var_os("DOCKER_PUBLISHED_HOST");
+        std::env::set_var(
+            "DOCKER_PUBLISHED_HOST",
+            std::ffi::OsString::from_vec(b"docker.\xff".to_vec()),
+        );
+        let result = published_host_setting();
+        match original {
+            Some(value) => std::env::set_var("DOCKER_PUBLISHED_HOST", value),
+            None => std::env::remove_var("DOCKER_PUBLISHED_HOST"),
+        }
+
+        let err = result.expect_err("a non-Unicode setting must not select local mode");
+        assert_eq!(crate::exit::classify(&err).0, crate::exit::ExitClass::Usage);
+        assert!(err.to_string().contains("DOCKER_PUBLISHED_HOST"));
+    }
+
+    #[test]
+    fn published_host_defaults_to_localhost_and_preserves_an_explicit_host() {
+        assert_eq!(published_host(None), "localhost");
+        for host in [
+            "docker.example.com",
+            "localhost",
+            "192.0.2.10",
+            "2001:db8::10",
+        ] {
+            assert_eq!(published_host(Some(host)), host);
+        }
+    }
+
+    #[test]
+    fn published_endpoint_uses_the_selected_host_and_brackets_ipv6() {
+        let cases = [
+            (None, "http://localhost:7245"),
+            (Some("docker.example.com"), "http://docker.example.com:7245"),
+            (Some("192.0.2.10"), "http://192.0.2.10:7245"),
+            (Some("2001:db8::10"), "http://[2001:db8::10]:7245"),
+            (Some("[2001:db8::10]"), "http://[2001:db8::10]:7245"),
+        ];
+        for (published, expected) in cases {
+            let endpoint = published_endpoint(published, 7245);
+            assert_eq!(endpoint, expected);
+            let url = reqwest::Url::parse(&endpoint).expect("a published endpoint must be a URL");
+            assert_eq!(url.port(), Some(7245));
+        }
+    }
+
+    #[test]
+    fn runner_args_mount_only_the_readonly_snapshot_volume() {
+        let snapshot = format!("/tmp/acme-bot/.curie/snapshots/{}", "b".repeat(64));
+        let runner = StartSpec {
+            plugin_dir: PathBuf::from(&snapshot),
+            ..spec()
+        };
+        let volume = "curie-snapshot-acme-runner";
+        let args = runner.run_args(volume);
+        let mounts: Vec<&str> = args
+            .windows(2)
+            .filter(|pair| pair[0] == "-v")
+            .map(|pair| pair[1].as_str())
+            .collect();
+
+        assert_eq!(mounts, vec!["curie-snapshot-acme-runner:/plugin:ro"]);
+        assert!(
+            !args.iter().any(|arg| arg.contains(&snapshot)),
+            "the client's snapshot path must not reach a remote daemon: {args:?}"
+        );
+        assert_eq!(args.last().map(String::as_str), Some("curie-runner"));
+        assert!(args
+            .windows(2)
+            .any(|pair| { pair == ["--label", &format!("{SNAPSHOT_VOLUME_LABEL}={volume}")] }));
+    }
+
+    #[test]
+    fn check_args_mount_only_the_readonly_snapshot_volume() {
+        let snapshot = format!("/tmp/acme-bot/.curie/snapshots/{}", "b".repeat(64));
+        let check = CheckSpec {
+            image: "curie-runner".into(),
+            plugin_dir: snapshot.clone(),
+            timeout_s: 30,
+        };
+        let args = check.run_args("curie-snapshot-acme-check");
+        let mounts: Vec<&str> = args
+            .windows(2)
+            .filter(|pair| pair[0] == "-v")
+            .map(|pair| pair[1].as_str())
+            .collect();
+
+        assert_eq!(mounts, vec!["curie-snapshot-acme-check:/plugin:ro"]);
+        assert!(
+            !args.iter().any(|arg| arg.contains(&snapshot)),
+            "the client's snapshot path must not reach a remote daemon: {args:?}"
+        );
+        assert!(args.windows(2).any(|pair| pair == ["--network", "none"]));
+        assert!(args.windows(2).any(|pair| {
+            pair == [
+                "--label",
+                "curietech.ai/snapshot-volume=curie-snapshot-acme-check",
+            ]
+        }));
     }
 
     #[test]
@@ -1912,10 +3004,10 @@ mod tests {
 
     #[test]
     fn run_args_carry_the_aci_boot_env() {
-        let args = spec().run_args();
+        let args = spec().run_args(SNAPSHOT_VOLUME);
         let joined = args.join(" ");
         assert!(joined.starts_with("run -d --name curie-runner-local -p 7245:8080"));
-        assert!(joined.contains("-v /tmp/deal-desk:/plugin:ro"));
+        assert!(joined.contains(&format!("-v {SNAPSHOT_VOLUME}:/plugin:ro")));
         assert!(joined.contains("-e CURIE_PLUGIN_DIR=/plugin"));
         assert!(joined.contains("-e CURIE_SESSION_ID=local-1"));
         assert!(joined.contains("-e CURIE_SANDBOX_ID=local"));
@@ -1928,19 +3020,14 @@ mod tests {
         assert_eq!(args.last().unwrap(), "curie-runner");
     }
 
-    /// #1087: the runner mounts whatever `plugin_dir` the spec carries, and
-    /// `skill up` now carries the materialized snapshot rather than the editable
-    /// source. Asserted on the argv the user's Docker daemon actually receives:
-    /// exactly one `-v ...:/plugin:ro`, naming the snapshot, with the bare source
-    /// path never mounted.
     #[test]
-    fn run_args_mount_whatever_plugin_dir_the_spec_carries() {
+    fn run_args_mount_the_volume_without_exposing_the_client_snapshot_path() {
         let snapshot = format!("/tmp/deal-desk/.curie/snapshots/{}", "b".repeat(64));
         let args = StartSpec {
             plugin_dir: PathBuf::from(&snapshot),
             ..spec()
         }
-        .run_args();
+        .run_args(SNAPSHOT_VOLUME);
 
         let mounts: Vec<String> = args
             .windows(2)
@@ -1949,12 +3036,12 @@ mod tests {
             .collect();
         assert_eq!(
             mounts,
-            vec![format!("{snapshot}:/plugin:ro")],
+            vec![format!("{SNAPSHOT_VOLUME}:/plugin:ro")],
             "the only bundle mount must be the snapshot: {args:?}"
         );
         assert!(
-            !args.join(" ").contains("-v /tmp/deal-desk:/plugin:ro"),
-            "the editable source must never be mounted alongside it: {args:?}"
+            !args.iter().any(|arg| arg.contains(&snapshot)),
+            "the client snapshot path must never reach the daemon: {args:?}"
         );
     }
 
@@ -1962,7 +3049,7 @@ mod tests {
     fn run_args_apply_container_hardening() {
         // Every local runner boots hardened (#631): read-only rootfs with tmpfs
         // for /tmp and HOME, all caps dropped, and no privilege escalation.
-        let joined = spec().run_args().join(" ");
+        let joined = spec().run_args(SNAPSHOT_VOLUME).join(" ");
         assert!(joined.contains("--read-only"), "{joined}");
         assert!(joined.contains("--tmpfs /tmp:rw,mode=1777"), "{joined}");
         assert!(
@@ -1981,7 +3068,7 @@ mod tests {
     #[test]
     fn run_args_label_the_container_as_cli_managed() {
         // CLI-booted runners are identifiable as ours (#747)...
-        let joined = spec().run_args().join(" ");
+        let joined = spec().run_args(SNAPSHOT_VOLUME).join(" ");
         assert!(
             joined.contains("--label curietech.ai/managed-by=curie-cli"),
             "{joined}"
@@ -2151,7 +3238,7 @@ driver failed programming external connectivity: port is already allocated."
             plugin_dir: "/tmp/deal-desk".into(),
             timeout_s: 30,
         };
-        let joined = spec.run_args().join(" ");
+        let joined = spec.run_args(SNAPSHOT_VOLUME).join(" ");
         assert!(joined.contains("--network none"), "{joined}");
         assert!(joined.contains("--read-only"), "{joined}");
         assert!(joined.contains("--cap-drop ALL"), "{joined}");
@@ -2169,7 +3256,7 @@ driver failed programming external connectivity: port is already allocated."
     fn unset_passthrough_env_is_not_forwarded_and_real_model_omits_fake_flag() {
         let mut s = spec();
         s.fake_model = false;
-        let joined = s.run_args().join(" ");
+        let joined = s.run_args(SNAPSHOT_VOLUME).join(" ");
         assert!(!joined.contains("CURIE_FAKE_MODEL"));
         assert!(!joined.contains("CURIE_TEST_ENV_THAT_DOES_NOT_EXIST"));
     }
@@ -2179,7 +3266,7 @@ driver failed programming external connectivity: port is already allocated."
         let mut s = spec();
         s.passthrough_env = vec!["GITHUB_PERSONAL_ACCESS_TOKEN".into()];
         s.docker_env = vec![("GITHUB_PERSONAL_ACCESS_TOKEN".into(), "ghp-secret".into())];
-        let joined = s.run_args().join(" ");
+        let joined = s.run_args(SNAPSHOT_VOLUME).join(" ");
         assert!(joined.contains("-e GITHUB_PERSONAL_ACCESS_TOKEN"));
         assert!(!joined.contains("ghp-secret"));
     }
@@ -2215,7 +3302,7 @@ driver failed programming external connectivity: port is already allocated."
             let mut s = spec();
             s.model = model.map(String::from);
             s.model_base_url = base_url.map(String::from);
-            let joined = s.run_args().join(" ");
+            let joined = s.run_args(SNAPSHOT_VOLUME).join(" ");
             assert_eq!(joined.contains(needle), present, "{name}: {joined}");
         }
     }
@@ -2225,9 +3312,138 @@ driver failed programming external connectivity: port is already allocated."
         let mut s = spec();
         s.fake_model = false;
         s.model_base_url = Some("http://x-ollama:11434".into());
-        let joined = s.run_args().join(" ");
+        let joined = s.run_args(SNAPSHOT_VOLUME).join(" ");
         assert!(joined.contains("-e ANTHROPIC_BASE_URL=http://x-ollama:11434"));
         assert!(!joined.contains("CURIE_FAKE_MODEL"));
+    }
+
+    const CLAIM_INPUT_VOLUME: &str = "curie-input-acme";
+
+    fn owned_claim_input_labels() -> serde_json::Value {
+        serde_json::json!({
+            "curietech.ai/managed-by": "curie-sandbox-substrate",
+            "curietech.ai/claim": "claim-acme",
+            "curietech.ai/claim-attempt": "11111111-1111-4111-8111-111111111111",
+            "curietech.ai/component": "claim-bundle",
+        })
+    }
+
+    struct VolumeDockerGuard {
+        path: Option<std::ffi::OsString>,
+        log: Option<std::ffi::OsString>,
+        labels: Option<std::ffi::OsString>,
+        rm_stderr: Option<std::ffi::OsString>,
+    }
+
+    impl Drop for VolumeDockerGuard {
+        fn drop(&mut self) {
+            for (name, previous) in [
+                ("PATH", &self.path),
+                ("CURIE_TEST_DOCKER_LOG", &self.log),
+                ("CURIE_TEST_VOLUME_LABELS", &self.labels),
+                ("CURIE_TEST_VOLUME_RM_STDERR", &self.rm_stderr),
+            ] {
+                match previous {
+                    Some(value) => std::env::set_var(name, value),
+                    None => std::env::remove_var(name),
+                }
+            }
+        }
+    }
+
+    /// Fake `docker` that answers claim-input inspect from the environment and
+    /// fails `volume rm` with the configured stderr. Records every argv line.
+    fn install_volume_rm_docker(
+        tools: &std::path::Path,
+        log: &std::path::Path,
+    ) -> VolumeDockerGuard {
+        let docker = tools.join("docker");
+        std::fs::write(
+            &docker,
+            "#!/bin/sh\n\
+             printf '%s\\n' \"$*\" >> \"$CURIE_TEST_DOCKER_LOG\"\n\
+             if [ \"$1\" = volume ] && [ \"$2\" = inspect ]; then\n\
+               printf '%s\\n' \"$CURIE_TEST_VOLUME_LABELS\"\n\
+               exit 0\n\
+             fi\n\
+             if [ \"$1\" = volume ] && [ \"$2\" = rm ]; then\n\
+               printf '%s\\n' \"$CURIE_TEST_VOLUME_RM_STDERR\" >&2\n\
+               exit 1\n\
+             fi\n\
+             printf 'unexpected docker command: %s\\n' \"$*\" >&2\n\
+             exit 91\n",
+        )
+        .expect("write fake docker");
+        use std::os::unix::fs::PermissionsExt;
+        let mut permissions = std::fs::metadata(&docker)
+            .expect("read fake docker metadata")
+            .permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&docker, permissions).expect("make fake docker runnable");
+        let guard = VolumeDockerGuard {
+            path: std::env::var_os("PATH"),
+            log: std::env::var_os("CURIE_TEST_DOCKER_LOG"),
+            labels: std::env::var_os("CURIE_TEST_VOLUME_LABELS"),
+            rm_stderr: std::env::var_os("CURIE_TEST_VOLUME_RM_STDERR"),
+        };
+        let mut path = vec![tools.to_path_buf()];
+        path.extend(std::env::split_paths(
+            &std::env::var_os("PATH").unwrap_or_default(),
+        ));
+        std::env::set_var("PATH", std::env::join_paths(path).expect("join test PATH"));
+        std::env::set_var("CURIE_TEST_DOCKER_LOG", log);
+        std::env::set_var(
+            "CURIE_TEST_VOLUME_LABELS",
+            owned_claim_input_labels().to_string(),
+        );
+        guard
+    }
+
+    async fn assert_claim_input_rm(stderr: &str) -> Result<()> {
+        let tools = tempfile::tempdir().expect("fake docker directory");
+        let log = tempfile::NamedTempFile::new().expect("docker argv log");
+        let _guard = install_volume_rm_docker(tools.path(), log.path());
+        std::env::set_var("CURIE_TEST_VOLUME_RM_STDERR", stderr);
+        let labels = owned_claim_input_labels();
+        let owner = ClaimInputOwner::from_labels(&labels).expect("fixture labels are owned");
+        let removal = remove_claim_input_volume(CLAIM_INPUT_VOLUME, &owner, None).await;
+        let recorded = std::fs::read_to_string(log.path()).expect("read docker argv log");
+        assert!(
+            recorded.contains(&format!(
+                "volume inspect --format {{{{json .Labels}}}} {CLAIM_INPUT_VOLUME}"
+            )),
+            "inspect must see the volume before rm: {recorded}"
+        );
+        assert!(
+            recorded.contains(&format!("volume rm {CLAIM_INPUT_VOLUME}")),
+            "rm must be attempted after a successful inspect: {recorded}"
+        );
+        removal
+    }
+
+    #[tokio::test]
+    async fn claim_input_volume_rm_treats_no_such_volume_as_already_removed() {
+        let _lock = crate::PROCESS_ENV_LOCK.lock().await;
+        assert_claim_input_rm(&format!(
+            "Error response from daemon: get {CLAIM_INPUT_VOLUME}: no such volume"
+        ))
+        .await
+        .expect("a volume another cleanup already removed is the desired end state");
+    }
+
+    #[tokio::test]
+    async fn claim_input_volume_rm_reports_a_volume_that_is_in_use() {
+        let _lock = crate::PROCESS_ENV_LOCK.lock().await;
+        let err = assert_claim_input_rm(&format!(
+            "Error response from daemon: remove {CLAIM_INPUT_VOLUME}: volume is in use"
+        ))
+        .await
+        .expect_err("a volume that is still mounted must stay an error");
+        let text = err.to_string();
+        assert!(
+            text.contains("volume is in use"),
+            "busy volume rm must surface: {text}"
+        );
     }
 }
 
@@ -2294,6 +3510,8 @@ pub fn agent_connectors_argv(project: &str, agent: &str) -> Vec<String> {
     vec![
         "ps".into(),
         "-a".into(),
+        "--filter".into(),
+        format!("label={CLI_MANAGED_LABEL}"),
         "--filter".into(),
         format!("label={CONNECTOR_COMPONENT_LABEL}"),
         "--filter".into(),
@@ -2362,17 +3580,15 @@ pub async fn reap_undesired_connectors(
         }
     };
     let stale = connectors_to_reap(&parse_agent_connectors(&listing), desired);
-    if stale.is_empty() {
-        return Vec::new();
+    let mut problems = Vec::new();
+    for id in stale {
+        if let Err(err) = remove_container(&id).await {
+            problems.push(format!(
+                "could not remove a connector container this bundle no longer declares: {err}"
+            ));
+        }
     }
-    let mut rm: Vec<String> = vec!["rm".into(), "-f".into()];
-    rm.extend(stale);
-    match docker(&rm).await {
-        Ok(_) => Vec::new(),
-        Err(err) => vec![format!(
-            "could not remove the connector containers this bundle no longer declares: {err}"
-        )],
-    }
+    problems
 }
 
 /// The uid a connector container runs as, mirroring `render_deployment`'s
@@ -2397,7 +3613,7 @@ pub struct ConnectorStartSpec {
     pub env: Vec<(String, String)>,
     /// Declared secret NAMES, forwarded as a bare `-e NAME`.
     pub secret_names: Vec<String>,
-    /// `host:container:ro` bind mounts for the staged credential files.
+    /// Named volume subpath mounts for the runtime credential files.
     pub mounts: Vec<String>,
     pub labels: Vec<String>,
     /// Resolved secret values handed to the Docker CLI child process only, so
@@ -2415,7 +3631,7 @@ impl ConnectorStartSpec {
         identity: &crate::connector_build::ConnectorScope,
         network: &str,
         project: &str,
-        plugin_dir: &std::path::Path,
+        secret_volumes: &crate::connector_build::ConnectorSecretVolumes,
         secret_values: &std::collections::BTreeMap<String, String>,
         caller_public_key: Option<&str>,
     ) -> Result<Self> {
@@ -2464,21 +3680,33 @@ impl ConnectorStartSpec {
                 })
                 .collect(),
             secret_names,
-            mounts: spec
-                .secret_files
-                .values()
-                .map(|declared_path| {
-                    format!(
-                        "{}:{declared_path}:ro",
-                        crate::connector_build::staged_secret_path(
-                            plugin_dir,
-                            connector,
-                            declared_path
-                        )
-                        .display()
-                    )
-                })
-                .collect(),
+            mounts: {
+                let mut mounts: Vec<String> = secret_volumes
+                    .mounts(connector, spec)?
+                    .iter()
+                    .map(crate::connector_build::ConnectorSecretMount::docker_mount)
+                    .collect();
+                // Where the rendered pod has its scratch emptyDir (#5415): the
+                // only writable path beside a read-only root, bounded, and
+                // writable by the non-root connector user.
+                if let Some(scratch) = &spec.scratch {
+                    let Some(bytes) =
+                        crate::connector_build::scratch_size_bytes(&scratch.size_limit)
+                    else {
+                        bail!(
+                            "connectors.bad_scratch_size: connector {connector} declares \
+                             scratch.size_limit {:?}; it must be a whole number of bytes with \
+                             an optional Ki, Mi or Gi suffix, from 1Mi to 64Gi",
+                            scratch.size_limit
+                        );
+                    };
+                    mounts.push(format!(
+                        "type=tmpfs,destination={},tmpfs-size={bytes},tmpfs-mode=1777",
+                        scratch.path
+                    ));
+                }
+                mounts
+            },
             labels: {
                 let mut labels = vec![
                     CLI_MANAGED_LABEL.to_string(),
@@ -2496,6 +3724,12 @@ impl ConnectorStartSpec {
                     )
                     .into_iter()
                     .map(|(key, value)| format!("{key}={value}")),
+                );
+                labels.extend(
+                    secret_volumes
+                        .labels(connector)
+                        .into_iter()
+                        .map(|(key, value)| format!("{key}={value}")),
                 );
                 labels
             },
@@ -2545,7 +3779,7 @@ impl ConnectorStartSpec {
             args.push(name.clone());
         }
         for mount in &self.mounts {
-            args.push("-v".into());
+            args.push("--mount".into());
             args.push(mount.clone());
         }
         args.push(self.image.clone());
@@ -2559,46 +3793,35 @@ impl ConnectorStartSpec {
 pub enum ConnectorTeardownStep {
     /// List the containers this project's connectors created, by label.
     ReapLabeled(crate::ops::OpsCommand),
+    RemoveSecretVolumes(String),
     RemoveNetwork(crate::ops::OpsCommand),
-    WipeSecrets(PathBuf),
 }
 
-/// Containers first, then the network, then the staged credential tree.
-///
-/// The order is the property: a network still attached to a running container
-/// cannot be removed, and a tree still bind-mounted into one cannot be wiped
-/// cleanly. Reaping is label-scoped rather than file-scoped because a `down`
-/// run from another directory carries no plugin directory and must still reap.
-pub fn connector_teardown_plan(
-    project: &str,
-    network: Option<&str>,
-    plugin_dir: Option<&std::path::Path>,
-) -> Vec<ConnectorTeardownStep> {
-    let mut steps = vec![ConnectorTeardownStep::ReapLabeled(
-        crate::connector_build::plain_command(
+/// Remove containers before their private credential volumes and network.
+pub fn connector_teardown_plan(project: &str, network: Option<&str>) -> Vec<ConnectorTeardownStep> {
+    let mut steps = vec![
+        ConnectorTeardownStep::ReapLabeled(crate::connector_build::plain_command(
             "docker",
             vec![
                 "ps".into(),
                 "-a".into(),
                 "-q".into(),
                 "--filter".into(),
+                format!("label={CLI_MANAGED_LABEL}"),
+                "--filter".into(),
                 format!("label={CONNECTOR_COMPONENT_LABEL}"),
                 "--filter".into(),
                 format!("label={}", connector_project_label(project)),
             ],
-        ),
-    )];
+        )),
+        ConnectorTeardownStep::RemoveSecretVolumes(project.to_string()),
+    ];
     if let Some(network) = network {
         steps.push(ConnectorTeardownStep::RemoveNetwork(
             crate::connector_build::plain_command(
                 "docker",
                 vec!["network".into(), "rm".into(), network.to_string()],
             ),
-        ));
-    }
-    if let Some(plugin_dir) = plugin_dir {
-        steps.push(ConnectorTeardownStep::WipeSecrets(
-            crate::connector_build::connector_secrets_root(plugin_dir),
         ));
     }
     steps
@@ -2624,27 +3847,34 @@ pub async fn run_connector_teardown(steps: &[ConnectorTeardownStep]) -> Vec<Stri
                     if ids.is_empty() {
                         continue;
                     }
-                    let mut rm: Vec<String> = vec!["rm".into(), "-f".into()];
-                    rm.extend(ids);
-                    if let Err(err) = docker(&rm).await {
-                        problems.push(format!("could not remove connector containers: {err}"));
+                    for id in ids {
+                        if let Err(err) = remove_container(&id).await {
+                            problems.push(format!("could not remove connector container: {err}"));
+                        }
                     }
                 }
                 Err(err) => problems.push(format!("could not list connector containers: {err}")),
             },
+            ConnectorTeardownStep::RemoveSecretVolumes(project) => {
+                let report = reap_filtered(&[
+                    ("label", CLI_MANAGED_LABEL),
+                    ("label", CONNECTOR_SECRET_COMPONENT_LABEL),
+                    ("label", &connector_project_label(project)),
+                ])
+                .await;
+                if let Some(err) = report.error {
+                    problems.push(format!("could not remove credential copy helpers: {err}"));
+                }
+                if let Err(err) = remove_connector_secret_volumes(project, None, None).await {
+                    problems.push(err.to_string());
+                }
+            }
             ConnectorTeardownStep::RemoveNetwork(command) => {
                 if let Err(err) = docker(&command.argv()).await {
                     let text = err.to_string();
                     if !text.contains("No such network") && !text.contains("not found") {
                         problems.push(format!("could not remove the connector network: {err}"));
                     }
-                }
-            }
-            ConnectorTeardownStep::WipeSecrets(root) => {
-                if let Err(err) = crate::connector_build::wipe_secrets_root(root) {
-                    problems.push(format!(
-                        "could not wipe staged connector credentials: {err}"
-                    ));
                 }
             }
         }

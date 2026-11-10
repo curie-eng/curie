@@ -13,9 +13,9 @@ from unittest.mock import MagicMock
 
 import pytest
 import redis
-from curie_dispatcher.app import build_app
-from curie_dispatcher.config import DispatcherConfig
-from curie_dispatcher.queue import from_stream_fields
+from curie_channel_gateway.slack.app import build_app
+from curie_channel_gateway.slack.config import DispatcherConfig
+from curie_internal.turn_queue import from_stream_fields
 from slack_bolt import App
 from slack_bolt.adapter.socket_mode import SocketModeHandler
 from slack_sdk.socket_mode.request import SocketModeRequest

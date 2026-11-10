@@ -16,15 +16,23 @@ from fnmatch import fnmatchcase
 from pathlib import Path
 from typing import Any
 
+from curie_internal.sealing_key import (
+    custody_reason,
+    is_sealing_key_name,
+    sealing_key_references,
+)
 from plugin_format import (
     DEFAULT_MAX_COMPRESSION_RATIO,
     DEFAULT_MAX_MEMBERS,
     DEFAULT_MAX_UNCOMPRESSED_BYTES,
     MANIFEST_LOCATIONS,
+    PLATFORM_SLACK_GRANT_FIELDS,
     TOOL_POLICY_ENFORCEMENT,
     ApprovalPolicy,
     PluginManifest,
+    TriggerDeclaration,
     UnsupportedArchive,
+    ValidationIssue,
     ValidationResult,
     bundle_root,
     connector_render,
@@ -39,8 +47,15 @@ from plugin_format.connector_lock import (
 )
 from plugin_format.connectors import CONNECTORS_FILE, ConnectorsFile, validate_connectors
 from plugin_format.deploy_targets import DeployTargetsFile, validate_deploy_targets
-from plugin_format.validate import DEPLOY_FILE
+from plugin_format.validate import DEPLOY_FILE, load_wake_triggers
 from plugin_format.yaml_loader import safe_load_unique
+
+from curie_api.e2e_connector import (
+    CONNECTOR_NAME,
+    E2EInstall,
+    pin_server_command,
+    prepare_connectors,
+)
 
 # Re-exported so existing catchers (gitflow.py, routers/bundles.py, tests) keep
 # resolving ``bundles.UnsupportedArchive`` after the extraction logic moved to
@@ -49,6 +64,7 @@ from plugin_format.yaml_loader import safe_load_unique
 __all__ = [
     "UnsupportedArchive",
     "bundle_root",
+    "declared_approval_route_map",
     "declared_approval_routes",
     "detect_format",
     "extract_and_validate",
@@ -117,10 +133,101 @@ def extract_and_validate(
     # classification code passes no enforcement id to its own `validate_bundle`,
     # so it refuses to BOOT a policy-bearing bundle. The failure mode of an old
     # runner meeting a new bundle is "will not start", never "starts unfenced".
-    result = validate_bundle(
-        bundle_root(dest), enforces_tool_policy=TOOL_POLICY_ENFORCEMENT
-    )
+    root = bundle_root(dest)
+    result = validate_bundle(root, enforces_tool_policy=TOOL_POLICY_ENFORCEMENT)
+    custody = sealing_key_custody_issues(root)
+    if custody:
+        result = ValidationResult(
+            valid=False, errors=[*result.errors, *custody], warnings=result.warnings
+        )
     return extension, content_type, result
+
+
+SEALING_KEY_CODE = "secrets.sealing_key_custody"
+
+
+def sealing_key_custody_issues(root: Path) -> list[ValidationIssue]:
+    """Every declaration of a reserved sealing key name other than a SecretRef.
+
+    @spec ACTION-EXECUTOR-16. ``SNAPSHOT_SEALING_KEY`` and
+    ``SNAPSHOT_SEALING_KEYS_RETAINED`` may reach only the hosted connector, so
+    the one accepted form is a ``SecretRef`` in ``connectors.yaml``. A plain
+    ``secrets`` name (Curie resolves and owns the value), a literal ``env``
+    value, a ``secret_files`` entry (the same per-agent Secret, as a file), a
+    ``sealed_secrets`` blob (the bundle carries the value), a ``config`` name
+    (the same per-agent Secret, as a setting) and a ``plugin.json``
+    ``secrets`` name (a sandbox secret) are each refused, naming the key. So
+    is naming the key for the sandbox to expand without declaring it: a
+    ``bearer_secret`` (the derived ``Authorization: Bearer ${NAME}`` header), or
+    a reference to it (``$NAME``, ``${NAME}`` and their variants, see
+    ``sealing_key_references``) in a remote connector's ``url`` or
+    ``headers``, or in a hosted connector's ``unhosted_url``. Each is expanded
+    from the sandbox environment by the MCP client, so each declares that the
+    sandbox holds the key.
+
+    Applied at API intake on top of the frozen ``validate_bundle``, so the
+    package's contract is unchanged. Reads the raw files leniently: a file that
+    does not parse is ``validate_bundle``'s to report, and this adds nothing.
+    """
+
+    issues: list[ValidationIssue] = []
+
+    def refuse(name: str, location: str) -> None:
+        issues.append(
+            ValidationIssue(code=SEALING_KEY_CODE, message=custody_reason(name), location=location)
+        )
+
+    manifest_path = resolve_manifest(root)
+    if manifest_path is not None:
+        try:
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError, UnicodeDecodeError):
+            manifest = None
+        declared = manifest.get("secrets") if isinstance(manifest, dict) else None
+        if isinstance(declared, list):
+            for i, name in enumerate(declared):
+                if isinstance(name, str) and is_sealing_key_name(name):
+                    refuse(name, f"plugin.json (secrets[{i}])")
+
+    path = root / CONNECTORS_FILE
+    if not path.is_file():
+        return issues
+    try:
+        parsed = ConnectorsFile.model_validate(
+            safe_load_unique(path.read_text(encoding="utf-8")) or {}
+        )
+    except Exception:  # noqa: BLE001 - validate_bundle reports a malformed file
+        return issues
+    for connector, spec in parsed.connectors.items():
+        where = f"{CONNECTORS_FILE} (connectors.{connector}"
+        for declared_secret in spec.secrets:
+            if isinstance(declared_secret, str) and is_sealing_key_name(declared_secret):
+                refuse(declared_secret, f"{where}.secrets)")
+        for form, names in (
+            ("env", spec.env),
+            ("secret_files", spec.secret_files),
+            ("sealed_secrets", spec.sealed_secrets),
+            ("config", spec.config),
+        ):
+            for name in names:
+                if is_sealing_key_name(name):
+                    refuse(name, f"{where}.{form})")
+        if spec.bearer_secret is not None:
+            bearer = spec.bearer_secret
+            named = [bearer] if is_sealing_key_name(bearer) else sealing_key_references(bearer)
+            for name in named:
+                refuse(name, f"{where}.bearer_secret)")
+        expanded = [(f"headers.{key}", value) for key, value in spec.headers.items()]
+        if spec.url is not None:
+            # `connector_render` writes it verbatim into `.mcp.json`, and the
+            # MCP client expands it like `headers`.
+            expanded.append(("url", spec.url))
+        if spec.unhosted_url is not None:
+            expanded.append(("unhosted_url", spec.unhosted_url))
+        for field, text in expanded:
+            for name in sealing_key_references(text):
+                refuse(name, f"{where}.{field})")
+    return issues
 
 
 def extract_stored_bundle(
@@ -167,6 +274,17 @@ def extract_stored_bundle(
 def declared_approval_routes(root: Path) -> set[str] | None:
     """The approval routes a bundle DECLARES, or ``None`` when it declares poison.
 
+    Exactly the values of ``declared_approval_route_map`` (ADR 0271 decision 2),
+    so the declared set and the per-tool gate map cannot drift apart.
+    """
+
+    route_map = declared_approval_route_map(root)
+    return None if route_map is None else set(route_map.values())
+
+
+def declared_approval_route_map(root: Path) -> dict[str, str] | None:
+    """The effective ``{stripped gate: stripped route}`` map, or ``None`` for poison.
+
     The deploy-time half of the declared/bound approval-route join (#2436). The
     runtime counterpart is
     ``runner/src/curie_runner/approval.py::resolve_approval_policy``, and this
@@ -177,9 +295,10 @@ def declared_approval_routes(root: Path) -> set[str] | None:
     sides. Drift here is the #453/#544 fail-open shape: a bundle passes the
     configuration gate and then boots with a different set of gates.
 
-    The declared set is ``set(route_by_tool.values())`` of the loader's LAST-WINS
-    ``{stripped gate: stripped route}`` map, deliberately NOT the union of every
-    gate's route value. Two gates naming one tool are a last-wins duplicate
+    The declared set (``declared_approval_routes``) is the values of this
+    LAST-WINS map, deliberately NOT the union of every gate's route value, and
+    the per-tool lookup ADR 0271 registrations are judged against is the map
+    itself. Two gates naming one tool are a last-wins duplicate
     ``validate_bundle`` accepts and the runner boots, and the earlier route can
     never be raised at runtime -- so unioning would refuse a deploy over a route
     that does not exist.
@@ -194,7 +313,7 @@ def declared_approval_routes(root: Path) -> set[str] | None:
     configuration time, a bundle the runner will not run. The caller turns
     ``None`` into a refusal (``deploy.check_routes_from_bytes``).
 
-    An empty set is reserved for the honest cases AC4 rests on: no manifest, no
+    An empty map is reserved for the honest cases AC4 rests on: no manifest, no
     ``approvalPolicy``, or an explicitly empty ``gates`` list.
     """
 
@@ -202,14 +321,14 @@ def declared_approval_routes(root: Path) -> set[str] | None:
     if manifest_path is None:
         # `validate_bundle` already refuses a manifestless bundle at every
         # storage entry point, so this is the defensive branch, not a real one.
-        return set()
+        return {}
     try:
         raw = json.loads(manifest_path.read_text(encoding="utf-8"))
     except (json.JSONDecodeError, OSError):
         # A manifest that will not parse cannot prove it declares no policy.
         return None
     if not isinstance(raw, dict) or raw.get("approvalPolicy") is None:
-        return set()
+        return {}
     try:
         manifest = PluginManifest.model_validate(raw)
         policy = ApprovalPolicy.model_validate(manifest.approvalPolicy)
@@ -227,7 +346,7 @@ def declared_approval_routes(root: Path) -> set[str] | None:
     declared_names = {gate.gate.strip() for gate in policy.gates if isinstance(gate.gate, str)}
     if declared_names - set(routes):
         return None
-    return set(routes.values())
+    return routes
 
 
 def read_connectors(root: Path) -> ConnectorsFile:
@@ -245,6 +364,19 @@ def read_connectors(root: Path) -> ConnectorsFile:
     if errors or parsed is None:  # pragma: no cover -- validate_bundle gates this
         return ConnectorsFile()
     return parsed
+
+
+def read_manifest_wake_triggers(root: Path) -> dict[str, TriggerDeclaration]:
+    """Read required wake authority, refusing missing or malformed declarations."""
+
+    try:
+        manifest_path = resolve_manifest(bundle_root(root))
+        if manifest_path is None:
+            raise ValueError("wake declaration manifest is missing")
+        manifest = PluginManifest.model_validate_json(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        raise ValueError("wake declaration manifest could not be read") from None
+    return load_wake_triggers(manifest)
 
 
 def read_manifest_triggers(root: Path) -> list[Any]:
@@ -327,6 +459,16 @@ def _manifest_object(root: Path) -> dict[str, Any]:
     return {}
 
 
+def declared_platform_slack_grants(root: Path) -> frozenset[str]:
+    """The platform Slack grants the bundle declares (ADR 0100, ADR 0200).
+
+    Only a literal true grants.
+    """
+
+    manifest = _manifest_object(root)
+    return frozenset(name for name in PLATFORM_SLACK_GRANT_FIELDS if manifest.get(name) is True)
+
+
 def approval_tool_patterns(root: Path, agent_tools: list[str] | None) -> tuple[str, ...]:
     """Approval tool names from the bundle and the agent row.
 
@@ -404,6 +546,7 @@ def render_connector_manifests(
     proxy: connector_render.ConnectorProxy | None = None,
     grant_store_url: str = "",
     gated_tools: Mapping[str, tuple[str, ...]] | None = None,
+    e2e: E2EInstall | None = None,
 ) -> list[dict[str, Any]]:
     """Kubernetes objects for a bundle's hosted connectors (ADR-0086, #1063).
 
@@ -415,6 +558,8 @@ def render_connector_manifests(
     authority stays where it already was.
     """
 
+    install = e2e or E2EInstall()
+    connectors = prepare_connectors(connectors, install)
     objects: list[dict[str, Any]] = []
     for name, spec in sorted(connectors.connectors.items()):
         tools = tuple(gated_tools.get(name, ())) if gated_tools is not None else ()
@@ -432,6 +577,8 @@ def render_connector_manifests(
                 grant_store_url=grant_store_url if proxy is not None else "",
             )
         )
+    if install.enabled and CONNECTOR_NAME in connectors.connectors:
+        pin_server_command(objects, install)
     return objects
 
 

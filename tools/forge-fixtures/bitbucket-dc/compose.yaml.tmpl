@@ -1,0 +1,75 @@
+# Rendered by tools/forge-fixtures/bitbucket-dc/fixture.py into the state
+# directory. Nothing is bind mounted, so the Docker daemon may be remote: the
+# nginx config, certificate and key are copied in with `docker compose cp`
+# between `create` and `start`. Secrets are interpolated from the environment
+# of `docker compose create` only and never written here.
+services:
+  postgres:
+    image: postgres:15.14-alpine
+    labels:
+      - curie.forge-fixture=bitbucket-dc
+    environment:
+      POSTGRES_DB: bitbucket
+      POSTGRES_USER: bitbucket
+      POSTGRES_PASSWORD: ${CURIE_BBDC_DB_PASSWORD:-}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U bitbucket -d bitbucket"]
+      interval: 2s
+      timeout: 5s
+      retries: 60
+    mem_limit: 512m
+
+  bitbucket:
+    image: atlassian/bitbucket:9.4.24
+    labels:
+      - curie.forge-fixture=bitbucket-dc
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      JDBC_DRIVER: org.postgresql.Driver
+      JDBC_URL: jdbc:postgresql://postgres:5432/bitbucket
+      JDBC_USER: bitbucket
+      JDBC_PASSWORD: ${CURIE_BBDC_DB_PASSWORD:-}
+      SETUP_DISPLAYNAME: Curie forge fixture
+      SETUP_BASEURL: "@@BASE_URL@@"
+      SETUP_LICENSE: ${CURIE_BBDC_LICENSE:-}
+      SETUP_SYSADMIN_USERNAME: admin
+      SETUP_SYSADMIN_PASSWORD: ${CURIE_BBDC_ADMIN_PASSWORD:-}
+      SETUP_SYSADMIN_DISPLAYNAME: Fixture Admin
+      SETUP_SYSADMIN_EMAILADDRESS: admin@example.invalid
+      SEARCH_ENABLED: "false"
+      SERVER_PROXY_NAME: "@@HOST@@"
+      SERVER_PROXY_PORT: "@@PORT@@"
+      SERVER_SCHEME: https
+      SERVER_SECURE: "true"
+      JVM_MINIMUM_MEMORY: 512m
+      JVM_MAXIMUM_MEMORY: 1g
+    volumes:
+      - bbdata:/var/atlassian/application-data/bitbucket
+    mem_limit: 3g
+
+  nginx:
+    image: nginx:1.27.5-alpine
+    labels:
+      - curie.forge-fixture=bitbucket-dc
+    depends_on:
+      - bitbucket
+    ports:
+      - "@@PORT@@:443"
+    mem_limit: 128m
+
+volumes:
+  pgdata:
+    labels:
+      - curie.forge-fixture=bitbucket-dc
+  bbdata:
+    labels:
+      - curie.forge-fixture=bitbucket-dc
+
+networks:
+  default:
+    labels:
+      - curie.forge-fixture=bitbucket-dc

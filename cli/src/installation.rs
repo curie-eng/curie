@@ -1034,10 +1034,10 @@ comms:
     #[test]
     fn install_context_is_accepted_and_empty_is_refused() {
         let cfg = Installation::parse(
-            "version: 1\ninstall:\n  namespace: a\n  release: a\n  context: k8\n",
+            "version: 1\ninstall:\n  namespace: a\n  release: a\n  context: scratch-cluster\n",
         )
         .expect("named context must parse");
-        assert_eq!(cfg.install.context.as_deref(), Some("k8"));
+        assert_eq!(cfg.install.context.as_deref(), Some("scratch-cluster"));
     }
 
     #[test]
@@ -1338,7 +1338,12 @@ fn plan_installation_inner(
         .as_ref()
         .and_then(|name| resolved.get(name).cloned());
     let up = crate::ops::UpOpts {
+        file_values: None,
         retained_mail_values: None,
+        retained_runner_values: None,
+        // The model credential is explicit here, named by `curie.yaml`; a
+        // saved local credential plays no part in apply (#3848).
+        saved_credentials: None,
         common: crate::ops::CommonOpts {
             namespace: cfg.install.namespace.clone(),
             release: cfg.install.release.clone(),
@@ -1348,6 +1353,7 @@ fn plan_installation_inner(
         no_expose: false,
         set: cfg.helm_sets(),
         set_string: cfg.helm_set_strings(),
+        set_json: vec![],
         allow_egress_host: cfg.egress_hosts(),
         resolved_egress_cidrs: vec![],
         allow_web_egress: vec![],
@@ -1415,6 +1421,10 @@ async fn complete_installation_plan(
     } else {
         None
     };
+    let prepared =
+        crate::ops::prepare_factory_migration(up, live, complete_live_state, false).await?;
+    let up = prepared.opts;
+    let live = prepared.existing;
     let preserves_undeclared_github_token = cfg.credentials.github_token.is_none()
         && !cfg.set.contains_key(crate::ops::GITHUB_TOKEN_KEY)
         && live
@@ -1425,10 +1435,11 @@ async fn complete_installation_plan(
             .is_some_and(|token| !token.is_empty());
     let up = crate::ops::complete_up_opts(
         up,
-        live.as_ref(),
+        prepared.effective.as_ref().or(live.as_ref()),
         github_token.as_deref(),
         false,
         complete_live_state,
+        &prepared.context,
     )?;
     let up_values = crate::ops::up_value_plan(&up);
     // Deliberately NOT gated on `complete_live_state`. `apply --dry-run` sets
@@ -2124,6 +2135,11 @@ pub fn diff_plan(
     }
 
     let mut entries: Vec<DiffEntry> = Vec::new();
+    // Apply drops a retained runner entry a declared key overrides, including
+    // the whole recorded list when one element of it is declared, so `diff`
+    // asks the same rule rather than calling every family key preserved (#3848).
+    let declared_keys: std::collections::HashSet<String> =
+        declared.keys().map(|key| key.trim().to_string()).collect();
 
     for (key, want) in declared {
         let kind = match current.get(key) {
@@ -2144,7 +2160,9 @@ pub fn diff_plan(
         if declared.contains_key(key) {
             continue;
         }
-        let kind = if crate::ops::is_preserved_by_up(key) {
+        let survives = !crate::ops::is_retained_runner_key(key)
+            || crate::ops::retained_runner_key_survives(key, &declared_keys);
+        let kind = if crate::ops::is_preserved_by_up(key) && survives {
             DiffKind::Preserved
         } else {
             DiffKind::Reset
@@ -2889,9 +2907,15 @@ mod diff_tests {
             up,
             github_token,
         } = local;
-        let up =
-            crate::ops::complete_up_opts(up, Some(live), github_token.as_deref(), false, false)
-                .expect("complete desired values");
+        let up = crate::ops::complete_up_opts(
+            up,
+            Some(live),
+            github_token.as_deref(),
+            false,
+            false,
+            &crate::config_migrate::FactoryMigrationContext::NotRequired,
+        )
+        .expect("complete desired values");
         let mut desired = crate::ops::up_value_plan(&up).effective_values();
         if cfg.credentials.model.is_some() {
             desired
@@ -3516,6 +3540,112 @@ mod diff_tests {
         assert!(entries[0].kind.is_change(), "a reset is a real change");
     }
 
+    fn retained_family_live() -> serde_json::Value {
+        live(serde_json::json!({
+            "agentSandbox": {
+                "runner": {"extraEnv": [
+                    {"name": "A", "value": "1"},
+                    {"name": "B", "value": "2"}
+                ]},
+                "connectorSecrets": {
+                    "acme-a": {"T": "x", "U": "y"},
+                    "acme-b": {"G": "z"}
+                }
+            }
+        }))
+    }
+
+    fn kinds_of(entries: &[DiffEntry], keys: &[&str]) -> Vec<(String, DiffKind)> {
+        keys.iter()
+            .map(|key| (key.to_string(), *kind_of(entries, key)))
+            .collect()
+    }
+
+    /// #3848: a declared key under the runner env LIST replaces the whole
+    /// recorded list on apply, so the undeclared live elements are resets,
+    /// not preserved.
+    #[test]
+    fn a_declared_runner_env_element_resets_the_undeclared_rest_of_the_list() {
+        let declared = BTreeMap::from([
+            (
+                "agentSandbox.runner.extraEnv[0].name".to_string(),
+                "C".to_string(),
+            ),
+            (
+                "agentSandbox.runner.extraEnv[0].value".to_string(),
+                "3".to_string(),
+            ),
+        ]);
+        let entries = diff_plan(&declared, Some(&retained_family_live()));
+        assert_eq!(
+            kinds_of(
+                &entries,
+                &[
+                    "agentSandbox.runner.extraEnv[1].name",
+                    "agentSandbox.runner.extraEnv[1].value",
+                ]
+            ),
+            vec![
+                (
+                    "agentSandbox.runner.extraEnv[1].name".to_string(),
+                    DiffKind::Reset
+                ),
+                (
+                    "agentSandbox.runner.extraEnv[1].value".to_string(),
+                    DiffKind::Reset
+                ),
+            ]
+        );
+    }
+
+    /// Liveness: a narrow connector secret override must not reset siblings.
+    #[test]
+    fn a_declared_connector_secret_leaf_leaves_its_siblings_preserved() {
+        let declared = BTreeMap::from([(
+            "agentSandbox.connectorSecrets.acme-a.T".to_string(),
+            "new".to_string(),
+        )]);
+        let entries = diff_plan(&declared, Some(&retained_family_live()));
+        for key in [
+            "agentSandbox.connectorSecrets.acme-a.U",
+            "agentSandbox.connectorSecrets.acme-b.G",
+        ] {
+            assert_eq!(kind_of(&entries, key), &DiffKind::Preserved, "{key}");
+        }
+    }
+
+    /// A declared whole-agent value replaces that agent's recorded map; other
+    /// agents stay retained.
+    #[test]
+    fn a_declared_whole_agent_connector_value_resets_only_that_agent() {
+        let declared = BTreeMap::from([(
+            "agentSandbox.connectorSecrets.acme-a".to_string(),
+            "{}".to_string(),
+        )]);
+        let entries = diff_plan(&declared, Some(&retained_family_live()));
+        for key in [
+            "agentSandbox.connectorSecrets.acme-a.T",
+            "agentSandbox.connectorSecrets.acme-a.U",
+        ] {
+            assert_eq!(kind_of(&entries, key), &DiffKind::Reset, "{key}");
+        }
+        assert_eq!(
+            kind_of(&entries, "agentSandbox.connectorSecrets.acme-b.G"),
+            &DiffKind::Preserved
+        );
+    }
+
+    /// Liveness: with nothing declared in the family, every recorded runner
+    /// env and connector secret key is carried forward.
+    #[test]
+    fn undeclared_retained_families_are_all_preserved() {
+        let entries = diff_plan(&BTreeMap::new(), Some(&retained_family_live()));
+        assert!(!entries.is_empty());
+        for entry in &entries {
+            assert_eq!(entry.kind, DiffKind::Preserved, "{}", entry.key);
+        }
+    }
+
     /// `helm get values` returns real passwords. None may reach the output.
     #[test]
     fn secret_values_are_never_rendered() {
@@ -3722,7 +3852,7 @@ mod diff_tests {
             unresolved_credentials: Vec::new(),
             namespace: "acme".into(),
             release: "acme".into(),
-            cluster: Some("k8scratch".into()),
+            cluster: Some("scratch-cluster".into()),
             release_exists: false,
             chart_deployed: None,
             chart_target: "0.6.0".into(),
@@ -3731,7 +3861,7 @@ mod diff_tests {
             migration: None,
         };
         let json = out.to_json();
-        assert_eq!(json["cluster"], serde_json::json!("k8scratch"));
+        assert_eq!(json["cluster"], serde_json::json!("scratch-cluster"));
     }
 }
 

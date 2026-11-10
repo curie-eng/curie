@@ -53,6 +53,21 @@ beforeEach(() => {
 });
 
 describe("WiredAgentMemory (#267)", () => {
+  it("renders entries whose optional provenance fields are omitted", async () => {
+    // MemoryProvenanceOut has no required properties in apps/api/openapi.json.
+    vi.mocked(listMemory).mockResolvedValue([{
+      index: 0,
+      version: 7,
+      content: "example lesson",
+      provenance: {},
+    }] as MemoryEntry[]);
+    renderPanel();
+
+    expect(await screen.findByText("example lesson")).toBeInTheDocument();
+    expect(screen.getByText(/no session.*no traces/)).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Edit" })).toBeEnabled();
+  });
+
   it("lists learned entries with their provenance", async () => {
     vi.mocked(listMemory).mockResolvedValue(ENTRIES);
     renderPanel();

@@ -1,0 +1,32 @@
+{
+  "type": "pullrequest",
+  "id": 7,
+  "title": "Add nautical miles to unitconv",
+  "description": "Adds a round trip unit test.",
+  "state": "OPEN",
+  "draft": false,
+  "created_on": "2026-10-12T00:00:00.000000+00:00",
+  "updated_on": "2026-10-12T00:05:00.000000+00:00",
+  "author": {
+    "type": "user",
+    "display_name": "Example Factory",
+    "account_id": "example-factory-account"
+  },
+  "source": {
+    "branch": {"name": "curie/kan-1"},
+    "commit": {"hash": "cccccccccccc"}
+  },
+  "destination": {
+    "branch": {"name": "main"},
+    "commit": {"hash": "aaaaaaaaaaaa"}
+  },
+  "links": {
+    "html": {"href": "https://bitbucket.example.invalid/example-workspace/example-repo/pull-requests/7"}
+  },
+  "summary": {
+    "type": "rendered",
+    "raw": "Adds a round trip unit test.",
+    "markup": "markdown",
+    "html": "<p>Adds a round trip unit test.</p>"
+  }
+}

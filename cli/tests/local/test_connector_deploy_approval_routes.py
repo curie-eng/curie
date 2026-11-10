@@ -191,17 +191,16 @@ def _kernel_picked_ports(count: int) -> list[int]:
 
 def _write_override(path: pathlib.Path, api_image: str, host_ports: dict[str, int]) -> None:
     worker_database = (
-        "postgresql+asyncpg://postgres:postgres@127.0.0.1:"
-        "${CURIE_LOCAL_POSTGRES_PORT}/postgres"
+        "postgresql+asyncpg://postgres:postgres@127.0.0.1:${CURIE_LOCAL_POSTGRES_PORT}/postgres"
     )
     path.write_text(
         f"""services:
   postgres:
-    ports: !override [\"127.0.0.1:{host_ports['postgres']}:5432\"]
+    ports: !override [\"127.0.0.1:{host_ports["postgres"]}:5432\"]
   valkey:
-    ports: !override [\"127.0.0.1:{host_ports['valkey']}:6379\"]
+    ports: !override [\"127.0.0.1:{host_ports["valkey"]}:6379\"]
   rustfs:
-    ports: !override [\"127.0.0.1:{host_ports['rustfs']}:9000\", \"127.0.0.1::9001\"]
+    ports: !override [\"127.0.0.1:{host_ports["rustfs"]}:9000\", \"127.0.0.1::9001\"]
   curie-migrate:
     image: {api_image}
     pull_policy: never
@@ -214,10 +213,9 @@ def _write_override(path: pathlib.Path, api_image: str, host_ports: dict[str, in
       GITHUB_APP_ID: \"\"
       GITHUB_APP_PRIVATE_KEY: \"\"
       GITHUB_WEBHOOK_SECRET: dev-webhook-secret
-      SLACK_BOT_TOKEN: \"\"
       OTEL_EXPORTER_OTLP_ENDPOINT: \"\"
       OTEL_EXPORTER_OTLP_PROTOCOL: \"\"
-    ports: !override [\"127.0.0.1:{host_ports['curie-api']}:8000\"]
+    ports: !override [\"127.0.0.1:{host_ports["curie-api"]}:8000\"]
   curie-worker:
     environment:
       DATABASE_URL: {worker_database}
@@ -225,12 +223,12 @@ def _write_override(path: pathlib.Path, api_image: str, host_ports: dict[str, in
       VALKEY_PORT: ${{VALKEY_PORT}}
       S3_ENDPOINT_URL: ${{S3_ENDPOINT_URL}}
       CURIE_API_URL: ${{CURIE_API_URL}}
-      SLACK_API_BASE_URL: http://127.0.0.1:${{CURIE_LOCAL_STUB_PORT}}/api/
-      TMPDIR: ${{CURIE_LOCAL_STAGING_DIR}}
       CURIE_DOCKER_NETWORK: ${{CURIE_DOCKER_NETWORK}}
     volumes: !override
       - /var/run/docker.sock:/var/run/docker.sock
-      - ${{CURIE_LOCAL_STAGING_DIR}}:${{CURIE_LOCAL_STAGING_DIR}}
+  curie-channel-gateway:
+    environment:
+      SLACK_API_BASE_URL: http://127.0.0.1:${{CURIE_LOCAL_STUB_PORT}}/api/
 networks:
   curie_runner:
     name: \"${{COMPOSE_PROJECT_NAME}}_runner\"
@@ -290,6 +288,7 @@ def local_case(request: pytest.FixtureRequest, tmp_path: pathlib.Path, source_ar
     binary, api_image = source_artifacts
     source = LADDER.read_text()
     suffix = uuid.uuid4().hex[:10]
+    candidate_api_image = f"ghcr.io/curie-eng/curie-api:test-{suffix}"
     project = f"curie-2762-{tier.replace('-', '')}-{suffix}"
     plugin_name = f"acme-2762-{suffix}"
     root = tmp_path
@@ -305,7 +304,7 @@ def local_case(request: pytest.FixtureRequest, tmp_path: pathlib.Path, source_ar
             strict=True,
         )
     )
-    _write_override(override, api_image, host_ports)
+    _write_override(override, candidate_api_image, host_ports)
     if tier == "local-release":
         generated = _run(["python3", "compose/generate_release_compose.py"])
         release.write_text(_require(generated, "generating release Compose"))
@@ -314,8 +313,6 @@ def local_case(request: pytest.FixtureRequest, tmp_path: pathlib.Path, source_ar
         base = REPO / "compose.dev.yaml"
 
     env = _clean_env()
-    staging = root / "staging"
-    staging.mkdir()
     env.update(
         {
             "COMPOSE_FILE": f"{base}:{override}",
@@ -326,8 +323,8 @@ def local_case(request: pytest.FixtureRequest, tmp_path: pathlib.Path, source_ar
             "CURIE_LOCAL_IMAGE_TAG": f"test-{suffix}",
             "CURIE_LOCAL_POSTGRES_HOST": "127.0.0.1",
             "CURIE_LOCAL_POSTGRES_PORT": str(host_ports["postgres"]),
-            "CURIE_LOCAL_STAGING_DIR": str(staging),
             "CURIE_LOCAL_STUB_PORT": "9",
+            "CURIE_LOCAL_GATEWAY_PORT": str(_kernel_picked_ports(1)[0]),
             "S3_ENDPOINT_URL": f"http://127.0.0.1:{host_ports['rustfs']}",
             "VALKEY_HOST": "127.0.0.1",
             "VALKEY_PORT": str(host_ports["valkey"]),
@@ -351,7 +348,15 @@ def local_case(request: pytest.FixtureRequest, tmp_path: pathlib.Path, source_ar
         f"curie-connector-{project}-{plugin_name}-tempo:build",
     ]
     teardown_errors: list[str] = []
+    candidate_api_owned = False
     try:
+        if _run(["docker", "image", "inspect", candidate_api_image]).returncode == 0:
+            raise RuntimeError(f"owned API tag already exists: {candidate_api_image}")
+        _require(
+            _run(["docker", "tag", api_image, candidate_api_image]),
+            "tagging the source API for this test's candidate",
+        )
+        candidate_api_owned = True
         rendered_result = _run(compose + ["config", "--format", "json"], env=env)
         rendered = json.loads(_require(rendered_result, "rendering private Compose"))
         # The host-network worker dials each of these at 127.0.0.1:<host port>.
@@ -431,6 +436,35 @@ def local_case(request: pytest.FixtureRequest, tmp_path: pathlib.Path, source_ar
         _api(api_url, "GET", "/agents")
         yield LocalCase(tier, root, bundle, binary, api_url, env)
     finally:
+        try:
+            cli_down = _run(
+                [
+                    str(binary),
+                    "--json",
+                    "local",
+                    "down",
+                    "--project",
+                    project,
+                    "-f",
+                    str(base),
+                    "-f",
+                    str(override),
+                    "--wipe",
+                    "--yes",
+                ],
+                env=env,
+                timeout=300,
+            )
+            if cli_down.returncode:
+                teardown_errors.append(f"CLI teardown failed: {cli_down.stdout}\n{cli_down.stderr}")
+        except (OSError, subprocess.TimeoutExpired) as error:
+            teardown_errors.append(f"CLI teardown failed: {error}")
+        sandbox_filters = [
+            "--filter",
+            "label=curietech.ai/managed-by=curie-sandbox-substrate",
+            "--filter",
+            f"label=curietech.ai/stack={project}_runner",
+        ]
         connector_ids = _run(
             [
                 "docker",
@@ -446,17 +480,7 @@ def local_case(request: pytest.FixtureRequest, tmp_path: pathlib.Path, source_ar
             removed = _run(["docker", "rm", "-f", *connector_ids])
             if removed.returncode:
                 teardown_errors.append(f"connector removal failed: {removed.stderr}")
-        runner_ids = _run(
-            [
-                "docker",
-                "ps",
-                "-aq",
-                "--filter",
-                "label=curietech.ai/managed-by=curie-sandbox-substrate",
-                "--filter",
-                f"network={project}_runner",
-            ]
-        ).stdout.split()
+        runner_ids = _run(["docker", "ps", "-aq", *sandbox_filters]).stdout.split()
         if runner_ids:
             removed = _run(["docker", "rm", "-f", *runner_ids])
             if removed.returncode:
@@ -472,18 +496,15 @@ def local_case(request: pytest.FixtureRequest, tmp_path: pathlib.Path, source_ar
         owned_source_tags = [
             tag
             for tag in local_source_tags
+            if tag != candidate_api_image or candidate_api_owned
             if _run(["docker", "image", "inspect", tag]).returncode == 0
         ]
         if owned_source_tags:
             image_rm = _run(["docker", "image", "rm", "-f", *owned_source_tags])
             if image_rm.returncode:
-                teardown_errors.append(
-                    f"source image cleanup failed: {image_rm.stderr}"
-                )
+                teardown_errors.append(f"source image cleanup failed: {image_rm.stderr}")
         existing_tags = [
-            tag
-            for tag in tags
-            if _run(["docker", "image", "inspect", tag]).returncode == 0
+            tag for tag in tags if _run(["docker", "image", "inspect", tag]).returncode == 0
         ]
         if existing_tags:
             image_rm = _run(["docker", "image", "rm", "-f", *existing_tags])
@@ -515,6 +536,15 @@ def local_case(request: pytest.FixtureRequest, tmp_path: pathlib.Path, source_ar
                 f"label=com.docker.compose.project={project}",
             ]
         ).stdout.split()
+        for resource, command in (
+            ("sandbox containers", ["docker", "ps", "-aq"]),
+            ("sandbox volumes", ["docker", "volume", "ls", "-q"]),
+        ):
+            inventory = _run([*command, *sandbox_filters])
+            if inventory.returncode:
+                teardown_errors.append(f"could not inventory owned {resource}: {inventory.stderr}")
+            elif inventory.stdout.split():
+                teardown_errors.append(f"owned {resource} survived: {inventory.stdout.split()}")
         if survivors or connector_survivors or networks or volumes:
             teardown_errors.append(
                 "owned resources survived: "
@@ -614,11 +644,7 @@ def _start_isolated_approval_seed_worker(case: LocalCase) -> None:
         timeout=1800,
     )
     _require(result, "starting the isolated local worker for the approval seed")
-    # The seed's `curie local message` enqueues through a one-shot container of
-    # the dispatcher image, which it takes from the running API's tag. This
-    # fixture runs a private API image, so no dispatcher exists at that tag and
-    # compose's own default applies: it must be the dispatcher `local up
-    # --build` just built, not whatever `curie-dispatcher:latest` is local.
+    # The one-shot dispatcher must use this test's source image tag.
     candidate = f"ghcr.io/curie-eng/curie-dispatcher:{case.env['CURIE_LOCAL_IMAGE_TAG']}"
     case.env["CURIE_DISPATCHER_IMAGE"] = candidate
     rendered = json.loads(
@@ -692,7 +718,7 @@ route = agent.get("approval_routes", {{}}).get("e2e")
 expected = {{
     "resolution": {{"kind": "slack", "address": channel}},
     "notification": None,
-    "approvers": {{"group": None, "users": ["U0EXAMPLE1"]}},
+    "approvers": {{"group": None, "users": ["U0EXAMPLE1"], "emails": None}},
 }}
 if agent.get("name", "").startswith("approval-seed-") is False:
     raise SystemExit("approval seed did not create an owned agent name")
@@ -817,16 +843,18 @@ def test_connector_local_deploy_binds_retained_routes_and_preserves_refusal_json
         "sre-approvals",
         EXISTING_ROUTE,
     }
-    assert seeded_agent["approval_routes"]["sre-approvals"] == before_approval_seed[
-        "approval_routes"
-    ]["sre-approvals"]
-    assert seeded_agent["approval_routes"][EXISTING_ROUTE] == before_approval_seed[
-        "approval_routes"
-    ][EXISTING_ROUTE]
+    assert (
+        seeded_agent["approval_routes"]["sre-approvals"]
+        == before_approval_seed["approval_routes"]["sre-approvals"]
+    )
+    assert (
+        seeded_agent["approval_routes"][EXISTING_ROUTE]
+        == before_approval_seed["approval_routes"][EXISTING_ROUTE]
+    )
     assert seeded_agent["approval_routes"]["e2e"] == {
         "resolution": {"kind": "slack", "address": "C0EXAMPLE1"},
         "notification": None,
-        "approvers": {"group": None, "users": ["U0EXAMPLE1"]},
+        "approvers": {"group": None, "users": ["U0EXAMPLE1"], "emails": None},
     }
 
     existing = {"resolution": {"kind": "slack", "address": "C0EXAMPLE2"}}
@@ -855,8 +883,7 @@ def test_connector_local_deploy_binds_retained_routes_and_preserves_refusal_json
         notification_refused.stdout + notification_refused.stderr
     )
     assert (
-        _api(local_case.api_url, "GET", f"/agents/{agent_id}")["approval_routes"]
-        == seeded_routes
+        _api(local_case.api_url, "GET", f"/agents/{agent_id}")["approval_routes"] == seeded_routes
     )
 
     _add_second_route(local_case.bundle)
@@ -873,9 +900,7 @@ def test_connector_local_deploy_binds_retained_routes_and_preserves_refusal_json
         f"/deployments?agent_id={agent_id}",
     )
     assert len(guarded_versions) == 1
-    assert {row["id"] for row in guarded_deployments} == {
-        stock_receipt["deployment"]["id"]
-    }
+    assert {row["id"] for row in guarded_deployments} == {stock_receipt["deployment"]["id"]}
 
     safe_retained = {
         "resolution": retained_with_notification["resolution"],
@@ -967,10 +992,13 @@ def test_dedicated_approval_seed_prepares_and_resumes_an_owned_local_agent(
         parity_agent = _api(local_case.api_url, "GET", f"/agents/{parity_agent_id}")
         assert parity_agent["approval_routes"] == before_routes
         assert _api(local_case.api_url, "GET", f"/agents/{parity_agent_id}/versions") == []
-        assert _api(
-            local_case.api_url,
-            "GET",
-            f"/deployments?agent_id={parity_agent_id}",
-        ) == []
+        assert (
+            _api(
+                local_case.api_url,
+                "GET",
+                f"/deployments?agent_id={parity_agent_id}",
+            )
+            == []
+        )
     finally:
         _api(local_case.api_url, "DELETE", f"/agents/{parity_agent_id}")

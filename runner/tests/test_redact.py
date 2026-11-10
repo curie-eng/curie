@@ -9,6 +9,7 @@ held credential inventory.
 
 from __future__ import annotations
 
+import base64
 import io
 import json
 import logging
@@ -76,13 +77,17 @@ FAKE_SECRET_ASSIGNMENT = "secret=" + "0000FAKEFAKEFAKEVALUE"
 FAKE_JSON_FIELD_SECRET = "0000FAKEJSONFIELDSECRET"
 FAKE_DICT_FIELD_SECRET = "0000FAKEDICTFIELDSECRET"
 FAKE_COLON_FIELD_SECRET = "0000FAKECOLONFIELDSECRET"
-FAKE_HOME_PATH = "/home/theconnman/.config/curie/settings.json"
+FAKE_HOME_PATH = "/home/example-user/.config/curie/settings.json"
 FAKE_CHANNEL_TOKEN = "chn." + "ZXhhbXBsZWNoYW5uZWxwYXlsb2Fk." + "FAKEFAKEFAKESIG0000"
 # The local token minters use base64url payload and signature segments.
-# See curie_api.sandbox_token.mint and curie_worker.caller_token.mint.
+# See curie_internal.sandbox_token.mint and curie_worker.caller_token.mint.
 FAKE_SANDBOX_TOKEN = "sbx." + "ZXhhbXBsZXNhbmRib3hwYXlsb2Fk." + "FAKEFAKEFAKESIG0000"
 FAKE_CONNECTOR_CALLER_TOKEN = "cct." + "ZXhhbXBsZWNhbGxlcnBheWxvYWQ." + "FAKEFAKEFAKESIG0000"
+FAKE_CHANNEL_READ_TOKEN = "chr." + "ZXhhbXBsZWNoYW5uZWxyZWFkcGF5bG9hZA." + "FAKEFAKEFAKESIG0000"
 FAKE_X_API_KEY_HEADER = "X-API-Key: " + "FAKEFAKEFAKEHEADERVALUE0000"
+FAKE_DIRECTORY_CREDENTIAL = "dir." + "ZXhhbXBsZWRpcmVjdG9yeQ." + "FAKEFAKEFAKESIG0000"
+FAKE_IDENTITY_CONNECT_TOKEN = "FAKEFAKEFAKEFAKEFAKEFAKEFAKEFAKEFAKEFAKE000"
+FAKE_OIDC_CALLBACK_QUERY = "code=FAKECODE0000&state=FAKESTATE0000"
 _FAKE_DISCORD_BOT_TOKEN = (
     "FAKEFAKEFAKEFAKEFAKE0000." + "FAKE00." + "FAKEFAKEFAKEFAKEFAKEFAKE000"
 )
@@ -121,7 +126,11 @@ SECRET_LITERALS: dict[str, str] = {
     "channel_token": FAKE_CHANNEL_TOKEN,
     "sandbox_token": FAKE_SANDBOX_TOKEN,
     "connector_caller_token": FAKE_CONNECTOR_CALLER_TOKEN,
+    "channel_read_token": FAKE_CHANNEL_READ_TOKEN,
     "x_api_key": FAKE_X_API_KEY_HEADER,
+    "directory_credential": FAKE_DIRECTORY_CREDENTIAL,
+    "identity_connect_token": FAKE_IDENTITY_CONNECT_TOKEN,
+    "oidc_callback_query": FAKE_OIDC_CALLBACK_QUERY,
     "discord_bot_authorization": FAKE_DISCORD_BOT_AUTHORIZATION,
     "discord_bot_token_assignment": FAKE_DISCORD_BOT_TOKEN_ASSIGNMENT,
     "discord_bot_token": FAKE_SHAPED_DISCORD_BOT_TOKEN,
@@ -131,6 +140,8 @@ SECRET_LITERALS: dict[str, str] = {
 # Non-secret text that must precede a literal for its rule to apply, for rules
 # whose redacted secret is only part of the matched value.
 _LITERAL_CARRIERS: dict[str, str] = {
+    "identity_connect_token": "/identity/connect/",
+    "oidc_callback_query": "/console/oidc/callback?",
     "discord_webhook_url": FAKE_DISCORD_WEBHOOK_PREFIX,
     "secret_json_field": '{"AWS_SECRET_ACCESS_KEY": "',
     "secret_dict_field": "{'MY_PRIVATE_KEY': '",
@@ -234,6 +245,7 @@ def _span_attributes(vector: str) -> dict[str, dict[str, object]]:
         ]
 
     runner = SessionRunner(
+        max_usd_per_day=None,
         held_secrets=frozenset(),
         session_factory=lambda: FakeModelSession(script_factory=script),
         ceiling=0,
@@ -583,6 +595,64 @@ def test_boot_http_scrubs_held_secrets_from_replies_and_tool_results(
 
 
 @pytest.mark.parametrize("source", ["process", "sdk"])
+def test_boot_http_redacts_upload_file_tokens_from_tool_results(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, source: str
+) -> None:
+    tokens = {
+        "reviewer": "ccu.FAKEUPLOADPAYLOAD0000.FAKESIGNATURE0000",
+        "uploads": "ccu.SECONDUPLOADPAYLOAD0000.FAKESIGNATURE0000",
+    }
+    path = tmp_path / "upload-tokens.json"
+    path.write_text(json.dumps(tokens))
+    path.chmod(0o400)
+    env = {"CURIE_CONNECTOR_UPLOAD_TOKENS_FILE": str(path)}
+    if source == "process":
+        monkeypatch.setenv("CURIE_CONNECTOR_UPLOAD_TOKENS_FILE", str(path))
+    runner = _boot_reply_runner(
+        tmp_path,
+        monkeypatch,
+        _reply_script(
+            "Upload complete.",
+            {
+                "bearers": list(tokens.values()),
+                "count": 2,
+                "cat": path.read_text(),
+                "header": f"Bearer {tokens['reviewer']}",
+            },
+        ),
+        sdk_env=env if source == "sdk" else None,
+    )
+    raw, frames = _http_reply(runner)
+    assert all(token not in raw for token in tokens.values())
+    result = next(frame["result"] for frame in frames if frame.get("result") is not None)
+    assert result == {
+        "bearers": ["[REDACTED:held_secret]", "[REDACTED:held_secret]"],
+        "count": 2,
+        "cat": json.dumps(dict.fromkeys(tokens, "[REDACTED:held_secret]")),
+        "header": "Bearer [REDACTED:held_secret]",
+    }
+    assert frames[-1]["status"] == "done"
+
+
+@pytest.mark.parametrize(
+    "failure", ["missing", "directory", "malformed", "nonmap", "nonstring", "unicode"]
+)
+def test_boot_refuses_an_unreadable_or_invalid_upload_token_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failure: str
+) -> None:
+    path = tmp_path / "upload-tokens.json"
+    if failure == "directory":
+        path.mkdir()
+    elif failure == "unicode":
+        path.write_bytes(b"\xff")
+    elif failure != "missing":
+        path.write_text({"malformed": "{", "nonmap": "[]", "nonstring": '{"reviewer": 3}'}[failure])
+    monkeypatch.setenv("CURIE_CONNECTOR_UPLOAD_TOKENS_FILE", str(path))
+    with pytest.raises(ValueError, match="CURIE_CONNECTOR_UPLOAD_TOKENS_FILE"):
+        _boot_reply_runner(tmp_path, monkeypatch, _reply_script("must not start"))
+
+
+@pytest.mark.parametrize("source", ["process", "sdk"])
 def test_boot_http_keeps_hosted_secret_protected_after_env_removal(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, source: str
 ) -> None:
@@ -644,9 +714,13 @@ def test_http_redacts_held_secret_split_at_every_offset(
     assert _SPLIT_SECRET not in _assistant_text(frames)
     assert _assistant_text(frames).startswith("Before [REDACTED:")
     assert _assistant_text(frames).endswith(" after.")
-    assert frames[-1]["text"] == _assistant_text(frames)
     if with_tool_note:
+        # Only post-tool text is the final candidate. The secret fragment at
+        # its boundary still needs the full stream's redaction context.
+        assert frames[-1]["text"] == "[REDACTED:held_secret] after."
         assert any(frame["type"] == "tool_note" for frame in frames)
+    else:
+        assert frames[-1]["text"] == _assistant_text(frames)
 
 
 def test_http_reply_keeps_a_paragraph_break_between_text_blocks(
@@ -654,8 +728,8 @@ def test_http_reply_keeps_a_paragraph_break_between_text_blocks(
 ) -> None:
     """#3694: two progress sentences around a tool call must not be glued.
 
-    Covers the stream and the empty-result final, which falls back to the
-    streamed text (#107).
+    The internal stream retains both sentences. An empty-result final now
+    selects only the post-tool candidate, without resurrecting the preamble.
     """
 
     messages: list[object] = [
@@ -667,7 +741,7 @@ def test_http_reply_keeps_a_paragraph_break_between_text_blocks(
     _, frames = _http_reply(_boot_reply_runner(tmp_path, monkeypatch, messages))
 
     assert _assistant_text(frames) == "Staging the files.\n\nAll three files staged."
-    assert frames[-1]["text"] == _assistant_text(frames)
+    assert frames[-1]["text"] == "All three files staged."
     assert frames[-1]["status"] == "done"
 
 
@@ -714,6 +788,25 @@ def _redacted_turn(
     )
     frames = [json.loads(line) for line in lines]
     return _assistant_text(frames), frames[-1]["text"]
+
+
+@pytest.mark.parametrize("notice", ["", "Connector unavailable.\n\n"])
+def test_final_suffix_redacts_cross_boundary_secret_without_restoring_narration(
+    notice: str,
+) -> None:
+    _, final = _redacted_turn(
+        frozenset({_OVERLAP_FIRST, _OVERLAP_SECOND}),
+        ["Provisional " + _OVERLAP_FIRST, "SECRETSUFFIX0000 after."],
+        notice + "SECRETSUFFIX0000 after.",
+    )
+    assert final == notice + "[REDACTED:held_secret] after."
+
+
+def test_final_suffix_retains_only_its_own_paragraph_breaks() -> None:
+    _, final = _redacted_turn(
+        frozenset(), ["Provisional.", "Final one.", "Final two."], "Final one.Final two."
+    )
+    assert final == "Final one.\n\nFinal two."
 
 
 def test_block_break_final_scrubs_a_pattern_cut_by_a_held_prefix() -> None:
@@ -1044,7 +1137,7 @@ def test_http_hides_overlapping_secret_spans_across_buffered_text_deltas(
     assert "FAKEPREFIX" not in raw
     assert "SECRETSUFFIX0000" not in raw
     assert any(frame["type"] == "tool_note" for frame in frames)
-    assert frames[-1]["text"] == text
+    assert frames[-1]["text"] == "[REDACTED:held_secret] after."
     assert frames[-1]["status"] == "done"
 
 
@@ -1442,3 +1535,49 @@ def test_turn_close_drops_pending_secret_text_and_followup_is_independent(
             await runner.close()
 
     anyio.run(go)
+
+
+def test_outbound_redactor_scrubs_base64_of_a_short_held_token() -> None:
+    """Encoded forms of a 10 character held token are replaced."""
+
+    secret = "acme-token"
+    encoded = base64.standard_b64encode(secret.encode()).decode()
+    redactor = OutboundRedactor(frozenset({secret}))
+    raw = json.dumps({"type": "text_delta", "text": f"before {encoded} after"})
+    emitted = redactor.push(raw + "\n")
+    assert encoded not in "".join(emitted)
+    assert "[REDACTED:held_secret]" in "".join(emitted)
+    finished = redactor.finish()
+    assert finished is None or encoded not in finished
+
+
+def test_http_reply_scrubs_base64_of_a_held_secret(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A reply scrubs both base64 forms of a held secret and keeps an unrelated blob."""
+
+    standard = "Pj4+PmhlbGQtc2VjcmV0LXZhbHVl"
+    urlsafe = "Pj4-PmhlbGQtc2VjcmV0LXZhbHVl"
+    unrelated = "QU5PTkVYRElGRkVSRU5U"
+    text = f"before {standard} middle {urlsafe} after b64:{unrelated}"
+    raw, frames = _http_reply(
+        _boot_reply_runner(
+            tmp_path,
+            monkeypatch,
+            [
+                AssistantMessage(content=[TextBlock(text=text)], model="fake-model"),
+                _result(text),
+            ],
+            config_env={"CURIE_RUNNER_TOKEN": ">>>>held-secret-value"},
+        )
+    )
+    assistant = _assistant_text(frames)
+    assert standard not in raw
+    assert urlsafe not in raw
+    assert standard not in assistant
+    assert urlsafe not in assistant
+    assert "[REDACTED:held_secret]" in raw
+    assert "[REDACTED:held_secret]" in assistant
+    assert unrelated in raw
+    assert unrelated in assistant
+    assert frames[-1]["status"] == "done"

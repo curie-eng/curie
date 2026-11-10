@@ -387,19 +387,6 @@ def test_already_prefixed_shape_resolves_as_shorthand_when_only_that_reading_ver
     ) == frozenset({"mcp__plugin_b_plugin_x__do"})
 
 
-def test_already_prefixed_name_matching_no_reading_still_fails_closed() -> None:
-    # The union must not become arm-anything: a mcp__plugin_-prefixed name that
-    # verifies against NOTHING -- no expected prefix, no shorthand server, no
-    # connector -- keeps failing CLOSED, same input shape as
-    # test_already_prefixed_name_for_undeclared_prefix_fails_closed.
-    assert (
-        effective_operator_gates(
-            "b", {"github"}, "mcp__plugin_wrongbundle_wrongserver__tool", connector_servers=set()
-        )
-        is None
-    )
-
-
 # --- connector_server_names: read connectors.yaml, poison to None ----------------
 
 

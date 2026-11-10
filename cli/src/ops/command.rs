@@ -34,6 +34,11 @@ pub struct OpsCommand {
 /// or the echoed command line). Note the value still lands in the process argv --
 /// acceptable only for low-sensitivity tokens that already live in a k8s Secret.
 ///
+/// `MaskedJsonSet` is a `helm --set-json key=<json>` carrying a migrated
+/// operator object (#4322). The JSON is executed verbatim but never rendered:
+/// it used to travel in a private values document, and a policy object has no
+/// meaningful masked prefix.
+///
 /// `SecretValuesFile` carries one or more secret `helm` values (dotted key ->
 /// value) that must **never** reach the process table. Before execution it is
 /// materialized into a private (0600) temporary values file and replaced by a
@@ -48,6 +53,10 @@ pub enum CmdArg {
         key: String,
         value: String,
     },
+    MaskedJsonSet {
+        key: String,
+        json: MaskedJson,
+    },
     SecretValuesFile(Vec<(String, String)>),
     PrivateJsonValuesFile(PrivateHelmValues),
     SecretPatchFile {
@@ -57,6 +66,17 @@ pub enum CmdArg {
     /// A whole helm values document that may hold secret material, delivered
     /// as a private `-f <path>` and never displayed.
     SecretValuesDocument(serde_json::Value),
+}
+
+/// The JSON of a [`CmdArg::MaskedJsonSet`]. Its `Debug` form is masked too, so
+/// a logged or asserted command cannot print the value.
+#[derive(Clone, PartialEq, Eq)]
+pub struct MaskedJson(pub String);
+
+impl std::fmt::Debug for MaskedJson {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("<masked json>")
+    }
 }
 
 impl CmdArg {
@@ -70,6 +90,7 @@ impl CmdArg {
             CmdArg::Plain(s) => vec![s.clone()],
             CmdArg::HelmSetExpression(expression) => vec![expression.clone()],
             CmdArg::SecretSet { key, value } => vec![format!("{key}={value}")],
+            CmdArg::MaskedJsonSet { key, json } => vec![format!("{key}={}", json.0)],
             CmdArg::SecretValuesFile(_)
             | CmdArg::PrivateJsonValuesFile(_)
             | CmdArg::SecretPatchFile { .. }
@@ -94,6 +115,7 @@ impl CmdArg {
                 vec![mask_helm_set_expression(expression)]
             }
             CmdArg::SecretSet { key, value } => vec![format!("{key}={}", mask_secret(value))],
+            CmdArg::MaskedJsonSet { key, .. } => vec![format!("{key}=<masked json>")],
             CmdArg::PrivateJsonValuesFile(values) => vec![
                 "-f".to_string(),
                 format!(
@@ -178,6 +200,10 @@ impl OpsCommand {
     /// The full shell-quoted command line with secrets masked, one line as it
     /// would be typed into a shell.
     pub fn display(&self) -> String {
+        self.display_with_context(crate::kube_context::pinned_context_name())
+    }
+
+    fn display_with_context(&self, context: Option<&str>) -> String {
         let mut env: Vec<String> = self
             .env
             .iter()
@@ -191,6 +217,21 @@ impl OpsCommand {
         env.sort();
         let mut parts: Vec<String> = env.iter().map(|item| shell_quote(item)).collect();
         parts.push(shell_quote(&self.program));
+        let flag = match self.program.as_str() {
+            "helm" => Some("--kube-context"),
+            "kubectl" => Some("--context"),
+            _ => None,
+        };
+        if let (Some(flag), Some(context)) = (flag, context) {
+            let explicit = self.args.iter().any(|arg| {
+                matches!(arg, CmdArg::Plain(value) if value == flag
+                    || value.strip_prefix(flag).is_some_and(|suffix| suffix.starts_with('=')))
+            });
+            if !explicit {
+                parts.push(flag.to_string());
+                parts.push(shell_quote(context));
+            }
+        }
         for a in &self.args {
             for token in a.masked_tokens() {
                 parts.push(shell_quote(&token));
@@ -394,6 +435,17 @@ impl SecretValuesFileGuard {
     /// world-readable.
     fn write(pairs: &[(String, String)]) -> Result<Self> {
         Self::write_document(&nest_dotted_keys(pairs))
+    }
+
+    /// Write a complete values document into a fresh private (0600) temp file
+    /// a caller passes to helm with `-f`. Removed on drop or signal.
+    pub(crate) fn private_document(doc: &serde_json::Value) -> Result<Self> {
+        Self::write_document(doc)
+    }
+
+    /// Where the private values file lives.
+    pub(crate) fn path(&self) -> &std::path::Path {
+        &self.path
     }
 
     fn write_document(doc: &serde_json::Value) -> Result<Self> {
@@ -710,6 +762,181 @@ mod tests {
     use super::*;
 
     use crate::ops::testsupport::*;
+
+    const OPS_DISPLAY_DRIVER: &str = "CURIE_TEST_OPS_DISPLAY_DRIVER";
+
+    fn assert_display_in_subprocess(mode: &str) {
+        let dir = tempfile::tempdir().expect("display fixture directory");
+        let kubeconfig = dir.path().join("config");
+        std::fs::write(
+            &kubeconfig,
+            "apiVersion: v1\nkind: Config\ncurrent-context: ambient-ctx\n\
+             contexts:\n\
+             - name: ambient-ctx\n  context:\n    cluster: ambient-cluster\n\
+             - name: scratch-cluster\n  context:\n    cluster: pinned-cluster\n",
+        )
+        .expect("write synthetic kubeconfig");
+        let output =
+            std::process::Command::new(std::env::current_exe().expect("current test binary"))
+                .args([
+                    "--exact",
+                    "ops::command::tests::dry_run_context_display_subprocess_driver",
+                    "--nocapture",
+                ])
+                .env(OPS_DISPLAY_DRIVER, mode)
+                .env("KUBECONFIG", &kubeconfig)
+                .env("HOME", dir.path())
+                .env("TMPDIR", dir.path())
+                .env_remove("HELM_KUBECONTEXT")
+                .current_dir(dir.path())
+                .output()
+                .expect("run display subprocess driver");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            output.status.success(),
+            "display driver {mode} failed: {}\nstdout:\n{stdout}\nstderr:\n{stderr}",
+            output.status
+        );
+        assert!(
+            stdout.contains(&format!("OPS_DISPLAY_DRIVER_OK={mode}")),
+            "display driver did not complete: {stdout}\n{stderr}"
+        );
+    }
+
+    #[test]
+    fn dry_run_context_unpinned_display_ignores_ambient_context() {
+        assert_display_in_subprocess("unpinned");
+    }
+
+    #[test]
+    fn dry_run_context_display_uses_pinned_target() {
+        assert_display_in_subprocess("pinned");
+    }
+
+    #[test]
+    fn dry_run_context_display_subprocess_driver() {
+        let Ok(mode) = std::env::var(OPS_DISPLAY_DRIVER) else {
+            return;
+        };
+        let kubeconfig = std::env::var_os("KUBECONFIG").expect("synthetic kubeconfig path");
+        assert_eq!(
+            crate::kube_context::current_context_name().as_deref(),
+            Some("ambient-ctx")
+        );
+        let assert_display = |context: Option<&str>| {
+            for (program, flag) in [("helm", "--kube-context"), ("kubectl", "--context")] {
+                let command = OpsCommand::new(program, vec![plain("version")]);
+                let expected = match context {
+                    Some(context) => format!("{program} {flag} {context} version"),
+                    None => format!("{program} version"),
+                };
+                assert_eq!(command.display(), expected);
+            }
+            assert_eq!(
+                OpsCommand::new("docker", vec![plain("ps")]).display(),
+                "docker ps"
+            );
+        };
+        match mode.as_str() {
+            "unpinned" => assert_display(None),
+            "pinned" => {
+                let target = crate::kube_context::pin_for_cluster_command(Some("scratch-cluster"))
+                    .expect("pin synthetic target")
+                    .expect("resolved target");
+                assert_eq!(target.context, "scratch-cluster");
+                assert_display(Some("scratch-cluster"));
+                std::env::set_var("KUBECONFIG", kubeconfig);
+                assert_eq!(
+                    crate::kube_context::current_context_name().as_deref(),
+                    Some("ambient-ctx")
+                );
+                assert_display(Some("scratch-cluster"));
+            }
+            _ => panic!("unknown display driver mode: {mode}"),
+        }
+        println!("OPS_DISPLAY_DRIVER_OK={mode}");
+    }
+
+    #[test]
+    fn dry_run_context_display_only() {
+        for (program, flag) in [("helm", "--kube-context"), ("kubectl", "--context")] {
+            let command = OpsCommand::new(program, vec![plain("version")])
+                .with_env(vec![("VISIBLE".into(), "yes".into())])
+                .with_secret_env(vec![("PRIVATE".into(), "private-value".into())]);
+            let before = command.clone();
+            let child_before = command.tokio_command();
+            assert_eq!(
+                command.display_with_context(Some("scratch-cluster")),
+                format!(
+                    "'PRIVATE=private-***' VISIBLE=yes {program} {flag} scratch-cluster version"
+                ),
+            );
+            assert_eq!(command, before);
+            assert_eq!(command.argv(), ["version"]);
+            let child_after = command.tokio_command();
+            assert_eq!(
+                child_before.as_std().get_args().collect::<Vec<_>>(),
+                child_after.as_std().get_args().collect::<Vec<_>>(),
+            );
+            assert_eq!(
+                child_before.as_std().get_envs().collect::<Vec<_>>(),
+                child_after.as_std().get_envs().collect::<Vec<_>>(),
+            );
+        }
+        let docker = OpsCommand::new("docker", vec![plain("ps")]);
+        assert_eq!(
+            docker.display_with_context(Some("scratch-cluster")),
+            "docker ps"
+        );
+        for program in ["helm", "kubectl"] {
+            let command = OpsCommand::new(program, vec![plain("version")]);
+            assert_eq!(
+                command.display_with_context(None),
+                format!("{program} version")
+            );
+        }
+    }
+
+    #[test]
+    fn dry_run_context_preserves_explicit_flags_and_masks_secrets() {
+        for (program, flag) in [("helm", "--kube-context"), ("kubectl", "--context")] {
+            for args in [
+                vec![plain("version"), plain(flag), plain("already-selected")],
+                vec![plain("version"), plain(format!("{flag}=already-selected"))],
+            ] {
+                let command = OpsCommand::new(program, args);
+                let rendered = command.display_with_context(Some("scratch-cluster"));
+                assert_eq!(rendered.matches(flag).count(), 1, "{rendered}");
+                assert!(rendered.contains("already-selected"), "{rendered}");
+                assert!(!rendered.contains("scratch-cluster"), "{rendered}");
+            }
+        }
+        let command = OpsCommand::new(
+            "helm",
+            vec![
+                plain("upgrade"),
+                plain("--set"),
+                CmdArg::HelmSetExpression("api.apiKey=regression-secret-value".into()),
+                CmdArg::SecretValuesFile(vec![(
+                    "valkey.password".into(),
+                    "private-password".into(),
+                )]),
+            ],
+        );
+        let rendered = command.display_with_context(Some("ctx '$;\\name"));
+        assert!(
+            rendered.starts_with(&format!(
+                "helm --kube-context {} upgrade",
+                r"'ctx '\''$;\name'"
+            )),
+            "{rendered}"
+        );
+        assert!(rendered.contains("***"), "{rendered}");
+        assert!(rendered.contains("secret values file"), "{rendered}");
+        assert!(!rendered.contains("regression-secret-value"), "{rendered}");
+        assert!(!rendered.contains("private-password"), "{rendered}");
+    }
 
     #[tokio::test]
     async fn spawn_failure_names_the_io_error_kind_and_cause() {

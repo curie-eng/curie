@@ -1,6 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://schemas.curietech.ai/cli/doctor/v2.1.json",
+  "$id": "https://schemas.curietech.ai/cli/doctor/v2.2.json",
   "title": "curie doctor --json",
   "description": "What is set up, what is missing, and the command that fixes it. Read-only. Credentials appear as the NAME of the variable holding them, never as a value.",
   "type": "object",
@@ -35,9 +35,10 @@
             "enum": [
               "ok",
               "missing",
-              "not_applicable"
+              "not_applicable",
+              "warn"
             ],
-            "description": "`not_applicable` means the check does not apply at this install's rung, not that it failed."
+            "description": "`not_applicable` means the check does not apply at this install's rung, not that it failed. `warn` is usable now but needs attention soon, such as a forge credential near expiry; like `ok`, it does not make the install unready."
           },
           "detail": {
             "type": "string",

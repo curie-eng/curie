@@ -4,10 +4,39 @@
 {{- $connectorProxyPullSecrets = append $connectorProxyPullSecrets .name }}
 {{- end }}
 {{- if .Values.api.deploy }}
+{{- $checksumExtraEnv := include "curie.extraEnv" (dict "root" . "workload" "api" "env" .Values.api.extraEnv "additionalReserved" (merge (dict "FORWARDED_ALLOW_IPS" "socket peer identity" "S3_REGION" "rustfs.region") (include "curie.slack.reservedEnv" (dict "root" . "workload" "api") | fromJson))) -}}
+{{- $checksumRefs := list
+  (dict "name" (include "curie.storeSecretName" (dict "root" $ "store" $.Values.langfuse)) "key" "langfuseInitProjectSecretKey")
+  (include "curie.secretRef" (dict "root" $ "existingSecret" $.Values.api.githubTokenExistingSecret "existingSecretKey" $.Values.api.githubTokenExistingSecretKey "defaultKey" "githubToken") | fromYaml)
+  (include "curie.secretRef" (dict "root" $ "existingSecret" $.Values.api.githubAppPrivateKeyExistingSecret "existingSecretKey" $.Values.api.githubAppPrivateKeyExistingSecretKey "defaultKey" "githubAppPrivateKey") | fromYaml)
+  (include "curie.secretRef" (dict "root" $ "existingSecret" (get ($.Values.connectorCaller | default dict) "existingSecret") "existingSecretKey" ((get ($.Values.connectorCaller | default dict) "verifyKeyKey") | default "verifyKey") "defaultKey" "connectorCallerVerifyKey") | fromYaml)
+-}}
+{{- if include "curie.rustfs.staticCredentials" $ -}}
+{{- $checksumRefs = append $checksumRefs (dict "name" (include "curie.storeSecretName" (dict "root" $ "store" $.Values.rustfs)) "key" "rustfsSecretKey") -}}
+{{- end -}}
+{{- $githubAppId := .Values.api.githubAppId }}
+{{- $githubAppIdDigits := "" }}
+{{- $githubAppIdError := "api.githubAppId must be an empty string or a positive integer of 1 to 18 decimal digits (1..999999999999999999)" }}
+{{- if kindIs "string" $githubAppId }}
+  {{- if and (ne $githubAppId "") (not (regexMatch "^[1-9][0-9]{0,17}$" $githubAppId)) }}
+    {{- fail $githubAppIdError }}
+  {{- end }}
+  {{- $githubAppIdDigits = $githubAppId }}
+{{- else if has (kindOf $githubAppId) (list "int" "int8" "int16" "int32" "int64" "uint" "uint8" "uint16" "uint32" "uint64" "float32" "float64") }}
+  {{- $githubAppIdInteger := int64 $githubAppId }}
+  {{- $githubAppIdDigits = printf "%d" $githubAppIdInteger }}
+  {{- /* Check converted digits to reject float64 values rounded up to 1e18.
+         A float64 upper-bound comparison would round the limit up as well. */}}
+  {{- if or (ne (float64 $githubAppId) (float64 $githubAppIdInteger)) (not (regexMatch "^[1-9][0-9]{0,17}$" $githubAppIdDigits)) }}
+    {{- fail $githubAppIdError }}
+  {{- end }}
+{{- else }}
+  {{- fail $githubAppIdError }}
+{{- end }}
 apiVersion: v1
 kind: Service
 metadata:
-  name: {{ include "curie.fullname" . }}-api
+  name: {{ include "curie.checkedObjectName" (dict "kind" "Service" "name" (printf "%s-api" (include "curie.fullname" .))) }}
   labels:
     {{- include "curie.labels" . | nindent 4 }}
     app.kubernetes.io/component: api
@@ -32,6 +61,12 @@ metadata:
     app.kubernetes.io/component: api
 spec:
   replicas: {{ .Values.api.replicas }}
+  # Keep an API pod available while its replacement becomes ready (#4174).
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0
+      maxSurge: 1
   selector:
     matchLabels:
       {{- include "curie.selectorLabels" (dict "root" . "component" "api") | nindent 6 }}
@@ -44,6 +79,16 @@ spec:
         {{- include "curie.labels" . | nindent 8 }}
         {{- include "curie.selectorLabels" (dict "root" . "component" "api") | nindent 8 }}
       annotations:
+        {{- with (include "curie.channelGateway.tlsChecksum" .) }}
+        checksum/gateway-tls: {{ . | quote }}
+        {{- end }}
+        {{- with (include "curie.secretChecksum" (dict
+        "root" $
+        "keys" (list "apiKey" "approvalChatAttesterSecret" "remediationAuthorityKey" "internalWorkerToken" "installationId" "githubWebhookSecret")
+        "refs" $checksumRefs
+        "env" (printf "%s\n%s\n%s\n%s\n%s\n%s" (include "curie.env.postgres" $) (include "curie.env.valkey" $) (include "curie.env.slack" (dict "root" $ "workload" "api")) (include "curie.env.channelGateway" (dict "root" $ "caller" "api")) (include "curie.env.otel" (dict "root" $ "extraEnv" $.Values.api.extraEnv)) $checksumExtraEnv))) }}
+        checksum/secret: {{ . }}
+        {{- end }}
         {{- with (include "curie.placement.annotations" (dict "root" $ "class" "platform")) }}
         {{- . | nindent 8 }}
         {{- end }}
@@ -57,6 +102,12 @@ spec:
       # The runner-logs proxy lists pods and reads pod logs via the K8s API, so
       # the API pod runs as its own ServiceAccount (see api-rbac.yaml).
       serviceAccountName: {{ include "curie.fullname" . }}-api
+      {{- if or (include "curie.factory.hasCredentials" .) (include "curie.httpIdentity.apiSecret" .) }}
+      # The api runs as gid 1000: fsGroup reads the 0440 forge credentials and
+      # HTTP identity operator file.
+      securityContext:
+        fsGroup: 1000
+      {{- end }}
       {{- with .Values.priorityClasses.platform.name }}
       priorityClassName: {{ . }}
       {{- end }}
@@ -145,10 +196,16 @@ spec:
           env:
             {{- include "curie.env.postgres" . | nindent 12 }}
       {{- end }}
+      enableServiceLinks: false
       containers:
         - name: api
           image: {{ include "curie.image" (dict "repository" .Values.api.image.repository "tag" .Values.api.image.tag "digest" .Values.api.image.digest "defaultTag" .Chart.AppVersion) | quote }}
           imagePullPolicy: {{ .Values.api.image.pullPolicy }}
+          # Allow Service endpoint removal to propagate before shutdown (#4174).
+          lifecycle:
+            preStop:
+              exec:
+                command: ["sleep", "5"]
           {{- with .Values.api.containerSecurityContext }}
           {{- include "curie.containerSecurityContext" . | nindent 10 }}
           {{- end }}
@@ -165,6 +222,19 @@ spec:
                 secretKeyRef:
                   name: {{ include "curie.secretName" . }}
                   key: approvalChatAttesterSecret
+            # ADR 0231: the remediation policy bind and arm authority. Only the
+            # API receives it; no worker, dispatcher or runner may hold it.
+            - name: CURIE_REMEDIATION_AUTHORITY_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "curie.secretName" . }}
+                  key: remediationAuthorityKey
+            - name: ATTACHMENT_TRANSFER_TIMEOUT_SECONDS
+              value: {{ dig "broker" "transferTimeoutSeconds" 300 .Values.worker.attachments | quote }}
+            - name: ATTACHMENT_ACCESS_ENABLED
+              value: {{ and .Values.worker.attachments.enabled (eq (.Values.worker.attachments.mode | default "eager") "lazy") | quote }}
+            - name: ATTACHMENT_BROKER_URL
+              value: {{ printf "http://%s-attachment-broker:%v" (include "curie.fullname" .) (dig "broker" "port" 8093 .Values.worker.attachments) | quote }}
             - name: CURIE_INTERNAL_WORKER_TOKEN
               valueFrom:
                 secretKeyRef:
@@ -178,6 +248,47 @@ spec:
                   name: {{ include "curie.secretName" . }}
                   key: installationId
                   optional: false
+            # The action executor switch (ACTION-EXECUTOR-1). The worker
+            # renders the same value from the same helper; the two must never
+            # differ.
+            - name: CURIE_ACTION_EXECUTOR_ENABLED
+              value: {{ include "curie.actionExecutorEnabled" . | quote }}
+            # The installation-wide executor sandbox cap (AUTOMATED-REMEDIATION-12,
+            # executor amendment E9), enforced by the claim route. The worker
+            # renders the same value from the same helper.
+            - name: CURIE_ACTION_EXECUTOR_MAX_CONCURRENT_SANDBOXES
+              value: {{ include "curie.actionExecutorMaxConcurrentSandboxes" . | quote }}
+            {{- if eq (include "curie.workspaceRecoveryEnabled" .) "true" }}
+            # Workspace recovery (ADR 0251). The ledger compares the worker's
+            # archive limit with its own, so both render from the same value.
+            - name: CURIE_WORKSPACE_RECOVERY_ENABLED
+              value: "true"
+            - name: CURIE_WORKSPACE_RECOVERY_MAX_BYTES
+              value: {{ include "curie.workspaceRecoveryMaxBytes" . | quote }}
+            - name: CURIE_WORKSPACE_MAX_ARCHIVE_BYTES
+              value: {{ .Values.worker.workspace.maxArchiveBytes | int64 | quote }}
+            {{- end }}
+            # The automated remediation switch (AUTOMATED-REMEDIATION-1). The
+            # worker renders the same value from the same helper, which fails
+            # the render when it is on and the executor is off.
+            - name: CURIE_REMEDIATION_ENABLED
+              value: {{ include "curie.remediationEnabled" . | quote }}
+            # Delivery budget and optional cron claim lease. Both come from the
+            # worker values, the same source the worker Deployment renders, so
+            # the pair cannot be split. Null leaves the lease unset.
+            - name: CURIE_DELIVERY_BUDGET_S
+              value: {{ .Values.worker.deliveryBudgetSeconds | quote }}
+            {{- if .Values.worker.hookClaimLeaseSeconds }}
+            - name: CURIE_HOOK_CLAIM_LEASE_S
+              value: {{ .Values.worker.hookClaimLeaseSeconds | quote }}
+            {{- end }}
+            # The test installation declaration (ADR 0202 decision 1). The
+            # dispatcher renders the same two values from the same helpers;
+            # secrets.yaml refuses the render when it is on and unsafe.
+            - name: CURIE_TEST_INSTALLATION_ENABLED
+              value: {{ include "curie.testInstallation.enabled" . | quote }}
+            - name: CURIE_TEST_INSTALLATION_DRIVERS
+              value: {{ include "curie.testInstallation.drivers" . | quote }}
             # The connector caller public keys and the proxy image (ADR-0168
             # decision 7). The API renders a caller proxy into every hosted
             # connector it renders when the current key is set; the worker
@@ -195,6 +306,53 @@ spec:
               value: {{ .Values.worker.image.pullPolicy | quote }}
             - name: CURIE_CONNECTOR_PROXY_IMAGE_PULL_SECRETS
               value: {{ join "," $connectorProxyPullSecrets | quote }}
+            {{- $e2e := .Values.e2eConnector }}
+            {{- if and $e2e.enabled (or (not $e2e.ownerLabel.value) (not $e2e.serviceAccount) (not $e2e.serviceAccountNamespace) (not $e2e.workerClusterRole)) }}
+            {{- fail "e2eConnector.enabled requires ownerLabel.value, serviceAccount, serviceAccountNamespace, and workerClusterRole" }}
+            {{- end }}
+            - name: CURIE_E2E_CONNECTOR_ENABLED
+              value: {{ $e2e.enabled | quote }}
+            - name: CURIE_E2E_CONNECTOR_IMAGE
+              value: {{ include "curie.image" (dict "repository" .Values.worker.image.repository "tag" .Values.worker.image.tag "digest" .Values.worker.image.digest "defaultTag" .Chart.AppVersion) | quote }}
+            - name: CURIE_E2E_NAMESPACE_PREFIX
+              value: {{ $e2e.namespacePrefix | quote }}
+            - name: CURIE_E2E_OWNER_LABEL_KEY
+              value: {{ $e2e.ownerLabel.key | quote }}
+            - name: CURIE_E2E_OWNER_LABEL_VALUE
+              value: {{ $e2e.ownerLabel.value | quote }}
+            - name: CURIE_E2E_SERVICE_ACCOUNT
+              value: {{ $e2e.serviceAccount | quote }}
+            - name: CURIE_E2E_SERVICE_ACCOUNT_NAMESPACE
+              value: {{ $e2e.serviceAccountNamespace | quote }}
+            - name: CURIE_E2E_WORKER_CLUSTER_ROLE
+              value: {{ $e2e.workerClusterRole | quote }}
+            - name: CURIE_E2E_TTL_SECONDS
+              value: {{ $e2e.ttlSeconds | quote }}
+            - name: CURIE_E2E_POD_SECURITY
+              value: {{ $e2e.podSecurity | quote }}
+            - name: CURIE_E2E_REGISTRY
+              value: {{ $e2e.registry | default "" | quote }}
+            - name: CURIE_E2E_BUILD_CACHE_REPO
+              {{- /* null means <registry>/cache; an explicit empty string disables the cache. */}}
+              {{- if kindIs "invalid" $e2e.buildCacheRepo }}
+              value: {{ ternary (printf "%s/cache" (trimSuffix "/" ($e2e.registry | default ""))) "" (ne ($e2e.registry | default "") "") | quote }}
+              {{- else }}
+              value: {{ $e2e.buildCacheRepo | quote }}
+              {{- end }}
+            - name: CURIE_E2E_REGISTRY_INSECURE
+              value: {{ $e2e.registryInsecure | default false | quote }}
+            - name: CURIE_E2E_REGISTRY_TOKEN_HOSTS
+              value: {{ join "," ($e2e.registryTokenHosts | default list) | quote }}
+            - name: CURIE_E2E_BUILDER_IMAGE
+              value: {{ $e2e.builderImage | default "" | quote }}
+            - name: CURIE_E2E_GIT_IMAGE
+              value: {{ $e2e.gitImage | default "" | quote }}
+            - name: CURIE_E2E_PUSH_IMAGE
+              value: {{ $e2e.pushImage | default "" | quote }}
+            - name: CURIE_E2E_BUILD_TIMEOUT_SECONDS
+              value: {{ $e2e.buildTimeoutSeconds | default 1200 | quote }}
+            - name: CURIE_E2E_SOURCE_HOSTS
+              value: {{ join "," ($e2e.sourceHosts | default (list "github.com")) | quote }}
             - name: CURIE_PUBLICATION_PATCH_MAX_BYTES
               value: {{ .Values.worker.publication.patchMaxBytes | quote }}
             - name: CURIE_PUBLICATION_RETENTION_SECONDS
@@ -221,18 +379,16 @@ spec:
               value: {{ .Values.api.githubReviewIngressEnabled | quote }}
             - name: GITHUB_REVIEW_RECONCILER_INTERVAL_S
               value: {{ .Values.api.githubReviewReconcilerIntervalSeconds | quote }}
-            - name: GITHUB_FACTORY_INGRESS_ENABLED
-              value: {{ .Values.api.githubFactoryIngressEnabled | quote }}
-            - name: GITHUB_FACTORY_LABEL
-              value: {{ .Values.api.githubFactoryLabel | quote }}
-            - name: GITHUB_FACTORY_MENTION
-              value: {{ .Values.api.githubFactoryMention | quote }}
-            - name: GITHUB_FACTORY_CARD_BASE_URL
-              value: {{ .Values.api.githubFactoryCardBaseUrl | quote }}
-            - name: GITHUB_FACTORY_CI_WAIT_S
-              value: {{ .Values.api.githubFactoryCiWaitSeconds | quote }}
-            - name: GITHUB_FACTORY_PYTHON_CI
-              value: {{ .Values.api.githubFactoryPythonCi | default dict | toJson | quote }}
+            - name: FACTORY_ENABLED
+              value: {{ get (.Values.factory | default dict) "enabled" | default false | quote }}
+            - name: FACTORY_INTAKE
+              value: {{ get (.Values.factory | default dict) "intake" | default "poll" | quote }}
+            - name: FACTORY_BASE_LABEL_SETTLE_S
+              value: {{ dig "baseLabelSettleSeconds" 60 (.Values.factory | default dict) | quote }}
+            - name: FACTORY_CI_WAIT_S
+              value: {{ include "curie.factory.str" (get (.Values.factory | default dict) "ciWaitSeconds" | default 3600) | quote }}
+            - name: CURIE_FORGES
+              value: {{ include "curie.factory.forgesJson" . | quote }}
             - name: GITHUB_API_URL
               value: {{ .Values.api.githubApiUrl | quote }}
             # Outbound GitHub credential: the eval commit status AND the
@@ -247,13 +403,17 @@ spec:
                   {{- include "curie.secretRef" (dict "root" . "existingSecret" .Values.api.githubTokenExistingSecret "existingSecretKey" .Values.api.githubTokenExistingSecretKey "defaultKey" "githubToken") | nindent 18 }}
             - name: GITHUB_REPO_ALLOWLIST
               value: {{ .Values.api.githubRepoAllowlist | toJson | quote }}
+            {{- with (get (.Values.api | default dict) "factoryPublicationLabels") }}
+            - name: CURIE_FACTORY_PUBLICATION_LABELS
+              value: {{ . | toJson | quote }}
+            {{- end }}
             {{- include "curie.env.otel" (dict "root" . "extraEnv" .Values.api.extraEnv) | nindent 12 }}
             # GitHub App identity (ADR-0092). When both are set the platform
             # mints a one-hour token scoped to the single repository it is
             # cloning, instead of using GITHUB_TOKEN above. Both empty is fine:
             # public repositories clone with no credential.
             - name: GITHUB_APP_ID
-              value: {{ if .Values.api.githubAppId }}{{ .Values.api.githubAppId | int64 | quote }}{{ else }}""{{ end }}
+              value: {{ $githubAppIdDigits | quote }}
             - name: GITHUB_APP_PRIVATE_KEY
               valueFrom:
                 secretKeyRef:
@@ -275,6 +435,8 @@ spec:
               value: {{ .Values.api.logLevel | quote }}
             - name: ENVIRONMENT
               value: {{ .Values.api.environment | quote }}
+            - name: FORWARDED_ALLOW_IPS
+              value: ""
             - name: ORG_NAME
               value: {{ .Values.api.orgName | quote }}
             # Runner sandboxes are claimed in the release namespace (the
@@ -285,6 +447,13 @@ spec:
               value: {{ .Values.api.commitPollIntervalSeconds | quote }}
             - name: GITHUB_CLONE_BASE
               value: {{ .Values.api.githubCloneBase | quote }}
+            {{- if include "curie.codeHostTrust.name" . }}
+            # The code host CA bundle (ADR 0197).
+            - name: CURIE_CODE_HOST_CA_BUNDLE
+              value: {{ include "curie.codeHostTrust.path" . | quote }}
+            - name: GIT_SSL_CAINFO
+              value: {{ include "curie.codeHostTrust.path" . | quote }}
+            {{- end }}
             - name: LANGFUSE_HOST
               value: {{ include "curie.langfuse.url" . }}
             - name: LANGFUSE_PUBLIC_KEY
@@ -296,6 +465,8 @@ spec:
                   key: langfuseInitProjectSecretKey
             - name: S3_ENDPOINT_URL
               value: {{ include "curie.rustfs.endpoint" . }}
+            - name: S3_REGION
+              value: {{ .Values.rustfs.region | quote }}
             {{- if include "curie.rustfs.staticCredentials" . }}
             - name: S3_ACCESS_KEY
               value: {{ .Values.rustfs.auth.accessKey | quote }}
@@ -322,14 +493,9 @@ spec:
               value: {{ $resumeReconcilerGrace | quote }}
             - name: RESUME_RECONCILER_BATCH_LIMIT
               value: {{ .Values.api.resumeReconciler.batchLimit | quote }}
-            # Slack bot token for the approval user-group authorizer (#420): the
-            # API resolves usergroups.users.list itself rather than trusting a
-            # caller-asserted membership claim (ADR-0034). Every Slack identity's
-            # bot token comes from the one helper dispatcher.yaml and worker.yaml
-            # also render (curie.env.slack), so the three cannot drift apart.
-            # Rendered unconditionally; a declared approver group with no token
-            # then fails closed at resolve time, which is the intended posture.
+            # Identity declarations select gateway ports without mounting provider credentials.
             {{- include "curie.env.slack" (dict "root" . "workload" "api") | trim | nindent 12 }}
+            {{- include "curie.env.channelGateway" (dict "root" . "caller" "api") | nindent 12 }}
             # Expiry sweeper cadence (#412). Rendered unconditionally, not behind
             # an optional-value guard, because the disable value 0 is falsy in Go
             # templates and would be silently dropped, leaving the app default
@@ -348,7 +514,12 @@ spec:
             # Per-thread conversation transcript cap in bytes (#3301).
             - name: TRANSCRIPT_MAX_THREAD_BYTES
               value: {{ .Values.api.transcriptMaxThreadBytes | int64 | quote }}
-            {{- include "curie.extraEnv" (dict "root" . "workload" "api" "env" .Values.api.extraEnv "additionalReserved" (include "curie.slack.reservedEnv" (dict "root" . "workload" "api") | fromJson)) | nindent 12 }}
+            {{- if include "curie.httpIdentity.apiSecret" . }}
+            # HTTP identity operator file (HTTP-INVOCATION-EXECUTION-20).
+            - name: CURIE_HTTP_IDENTITY_DIR
+              value: /var/run/curie/http-identity
+            {{- end }}
+            {{- $checksumExtraEnv | nindent 12 }}
           ports:
             - name: http
               containerPort: 8000
@@ -363,5 +534,29 @@ spec:
               port: 8000
             {{- toYaml .Values.api.livenessProbe | nindent 12 }}
           resources:
-            {{- toYaml .Values.api.resources | nindent 12 }}
+            {{- include "curie.api.resources" . | nindent 12 }}
+          {{- $codeHostTrust := include "curie.codeHostTrust.name" . }}
+          {{- $forgeCredentials := include "curie.factory.hasCredentials" . }}
+          {{- $httpIdentity := include "curie.httpIdentity.apiSecret" . }}
+          {{- $providerCa := include "curie.httpIdentity.providerCaBundle" . }}
+          {{- if or $codeHostTrust $forgeCredentials $httpIdentity (include "curie.channelGateway.tlsSecret" .) }}
+          volumeMounts:
+            {{- include "curie.channelGateway.clientMount" . | nindent 12 }}
+            {{- include "curie.codeHostTrust.volumeMount" . | nindent 12 }}
+            {{- include "curie.factory.credentialMount" . | nindent 12 }}
+            {{- if $httpIdentity }}
+            - name: http-identity
+              mountPath: /var/run/curie/http-identity
+              readOnly: true
+            {{- end }}
+          {{- end }}
+      {{- if or $codeHostTrust $forgeCredentials $httpIdentity (include "curie.channelGateway.tlsSecret" .) }}
+      volumes:
+        {{- include "curie.channelGateway.clientVolume" . | nindent 8 }}
+        {{- include "curie.codeHostTrust.volume" . | nindent 8 }}
+        {{- include "curie.factory.credentialVolume" . | nindent 8 }}
+        {{- if $httpIdentity }}
+        {{- include "curie.httpIdentity.volume" (dict "name" "http-identity" "secret" $httpIdentity "files" (compact (list "api-runtime.json" (ternary "provider-ca.pem" "" (eq $providerCa "true"))))) | nindent 8 }}
+        {{- end }}
+      {{- end }}
 {{- end }}

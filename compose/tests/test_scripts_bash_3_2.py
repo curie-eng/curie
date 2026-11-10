@@ -27,6 +27,7 @@ import fcntl
 import json
 import os
 import re
+import runpy
 import shlex
 import shutil
 import socket
@@ -44,15 +45,15 @@ IDLE_ROUTE_PATH = (
     REPO_ROOT / "cli" / "scripts" / "e2e-cluster-idle-route-reclamation.sh"
 )
 MAIL_ADAPTER_PATH = REPO_ROOT / "scripts" / "e2e-mail-adapter.sh"
-CLI_MAIN_PATH = REPO_ROOT / "cli" / "src" / "main.rs"
+CLI_DEV_DISPATCH_PATH = REPO_ROOT / "cli" / "src" / "dispatch" / "dev_action.rs"
 # Every script a `curie dev` verb runs, read from the verbs' dispatch.
-DEV_SCRIPT_CALLS = CLI_MAIN_PATH.read_text().count("dev_script(")
+DEV_SCRIPT_CALLS = CLI_DEV_DISPATCH_PATH.read_text().count("dev_script(")
 DEV_SCRIPTS = [
     REPO_ROOT / path
-    for path in re.findall(r'dev_script\(\s*"([^"]+\.sh)"', CLI_MAIN_PATH.read_text())
+    for path in re.findall(r'dev_script\(\s*"([^"]+\.sh)"', CLI_DEV_DISPATCH_PATH.read_text())
 ]
 # `curie dev chart-check` runs this with the bash on PATH through
-# `run_chart_check_scripts` (cli/src/commands.rs), not `dev_script`, so the
+# `run_chart_check_scripts` (cli/src/commands/dev.rs), not `dev_script`, so the
 # dispatch above does not find it.
 WORKER_TTL_BOUNDS_PATH = (
     REPO_ROOT / "charts" / "curie" / "ci" / "worker-ttl-bounds-assertions.sh"
@@ -203,7 +204,7 @@ def test_every_curie_dev_script_is_a_host_script() -> None:
     """A dispatch the pattern cannot read would drop its script silently."""
 
     assert len(DEV_SCRIPTS) == DEV_SCRIPT_CALLS, (
-        f"{CLI_MAIN_PATH} calls dev_script {DEV_SCRIPT_CALLS} times, but only "
+        f"{CLI_DEV_DISPATCH_PATH} calls dev_script {DEV_SCRIPT_CALLS} times, but only "
         f"{len(DEV_SCRIPTS)} name a script literally"
     )
     assert {LADDER_PATH, AGENT_SKILLS_PATH} <= set(DEV_SCRIPTS)
@@ -760,7 +761,7 @@ def test_mail_adapter_cleanup_deletes_every_inbox_it_created(
     log = tmp_path / "cleanup.log"
     script = f"""set -euo pipefail
 TMP="$1"
-CONTEXT=k8
+CONTEXT=scratch-cluster
 KEEP=0
 RELEASE=curie-mail-e2e
 NAMESPACE=curie-mail-e2e-acme
@@ -1008,7 +1009,7 @@ REPO_ROOT={shlex.quote(str(REPO_ROOT))}
 {_top_level_assignments(source, ["GNU_PROCESS"])}
 W="$1"
 REAL_KUBECTL="$2"
-KUBE_CONTEXT=k8
+KUBE_CONTEXT=scratch-cluster
 NAMESPACE=acme-ns
 RESOURCE_QUOTA=acme-quota
 QUOTA_RESOURCE=pods
@@ -1050,16 +1051,20 @@ python3 -c 'import os, sys; print(sys.argv[1], os.getpgid(int(sys.argv[1])))' "$
         time.sleep(0.05)
 
 
+IDLE_ROUTE_CONTEXT = "scratch-cluster"
+
 IDLE_ROUTE_CALLS = {
     "run_message": (
         'run_message acme-label hello "$WORKDIR/out.json"',
-        "--json cluster message hello --namespace acme-ns --release acme "
+        f"--json cluster message --context {IDLE_ROUTE_CONTEXT} hello "
+        "--namespace acme-ns --release acme "
         "--listen-host 127.0.0.1 --timeout-secs 240",
         "acme-label cluster message failed",
     ),
     "reset_thread": (
         'reset_thread curie:sandbox:route:acme-bot:1700000000.000100 "$WORKDIR/out.json"',
-        "--json cluster reset-thread acme-bot --thread-key acme-bot:1700000000.000100 "
+        f"--json cluster reset-thread --context {IDLE_ROUTE_CONTEXT} acme-bot "
+        "--thread-key acme-bot:1700000000.000100 "
         "--namespace acme-ns --release acme --yes",
         "public reset failed for curie:sandbox:route:acme-bot:1700000000.000100",
     ),
@@ -1094,6 +1099,7 @@ REPO_ROOT={shlex.quote(str(REPO_ROOT))}
 {_top_level_assignments(source, ["GNU_PROCESS"])}
 WORKDIR="$1"
 BIN="$2"
+KUBE_CONTEXT={shlex.quote(IDLE_ROUTE_CONTEXT)}
 NAMESPACE=acme-ns
 RELEASE=acme
 AGENT=acme-bot
@@ -1203,8 +1209,9 @@ def test_registry_missing_case_corrupts_and_restores_the_lock_on_a_stock_mac(
         curie,
         "#!/bin/sh\n"
         'case "$*" in\n'
-        '    "--json cluster deploy --namespace acme-ns --release acme --plugin-dir "*)\n'
-        '        cp "$9/connectors.lock.yaml" "$STUB_STATE/deployed.lock.yaml"\n'
+        '    "--json cluster deploy --context $FIXTURE_CONTEXT '
+        '--namespace acme-ns --release acme --plugin-dir "*)\n'
+        '        shift 10; cp "$1/connectors.lock.yaml" "$STUB_STATE/deployed.lock.yaml"\n'
         '        echo "error: the registry could not resolve the locked image"\n'
         "        exit 2 ;;\n"
         "esac\n"
@@ -1214,7 +1221,8 @@ def test_registry_missing_case_corrupts_and_restores_the_lock_on_a_stock_mac(
     script = f"""set -euo pipefail
 WORKDIR="$1"
 BIN="$2"
-ns_rel=(--namespace acme-ns --release acme)
+KUBE_CONTEXT="$FIXTURE_CONTEXT"
+ns_rel=(--context "$KUBE_CONTEXT" --namespace acme-ns --release acme)
 connector_object_name() {{ echo "$1-$2-$3"; }}
 connector_image() {{ echo {shlex.quote(REGISTRY_GOOD_IMAGE)}; }}
 {case}
@@ -1226,6 +1234,7 @@ case_connector_registry_missing_cluster acme acme-bot acme-ns
             **os.environ,
             "PATH": f"{bin_dir}:{os.environ['PATH']}",
             "STUB_STATE": str(tmp_path),
+            "FIXTURE_CONTEXT": "scratch-cluster",
         },
         text=True,
         capture_output=True,
@@ -1444,3 +1453,127 @@ assert_ladder_reply_timeout "$3" 960
         check=False,
     )
     assert result.returncode == 0, result.stderr
+
+
+@pytest.mark.parametrize(
+    ("relative_path", "args", "required_input"),
+    [
+        ("scripts/chart-runtime-e2e.sh", [], "CURIE_E2E_KUBE_CONTEXT"),
+        ("scripts/e2e-mail-adapter.sh", [], "--context"),
+        ("charts/curie/ci/runner-images-assertions.sh", ["--cluster"], "CURIE_E2E_KUBE_CONTEXT"),
+        (
+            "charts/curie/ci/runtime/connector-readiness-runtime.sh",
+            [],
+            "CONNECTOR_READINESS_CONTEXT",
+        ),
+        ("charts/curie/ci/runtime/metrics-alerts-runtime.sh", [], "CURIE_2428_CONTEXT"),
+        ("cli/scripts/cluster-down-namespace-bound.sh", [], "CURIE_E2E_KIND_CLUSTER"),
+        ("cli/scripts/cluster-upgrade-matrix.sh", [], "CURIE_E2E_KIND_CLUSTER"),
+        ("cli/scripts/e2e-cluster-idle-route-reclamation.sh", [], "CURIE_E2E_KUBE_CONTEXT"),
+        ("cli/scripts/e2e-ladder.sh", [], "CURIE_E2E_KUBE_CONTEXT"),
+        ("cli/scripts/recovery-drill.sh", ["--surface", "cluster"], "CURIE_E2E_KUBE_CONTEXT"),
+    ],
+)
+def test_cluster_drivers_refuse_missing_context_before_cluster_commands(
+    relative_path: str, args: list[str], required_input: str, tmp_path: Path
+) -> None:
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    command_log = tmp_path / "cluster-commands"
+    for tool in ("kubectl", "helm", "kind", "curie", "docker", "uv"):
+        _write_executable(
+            bin_dir / tool,
+            '#!/bin/sh\nprintf "%s\\n" "$0 $*" >> "$CLUSTER_COMMAND_LOG"\nexit 97\n',
+        )
+    env = {
+        key: value
+        for key, value in os.environ.items()
+        if key
+        not in {
+            "CURIE_E2E_KUBE_CONTEXT",
+            "CURIE_E2E_KIND_CLUSTER",
+            "CONNECTOR_READINESS_CONTEXT",
+            "CURIE_2428_CONTEXT",
+            "CURIE_E2E_HOOK_APPROVAL",
+        }
+    }
+    env.update(
+        PATH=f"{bin_dir}:{os.environ['PATH']}",
+        CURIE_BIN=str(bin_dir / "curie"),
+        CURIE_E2E_TIERS="cluster",
+        CURIE_E2E_NAMESPACE="test-explicit-context",
+        CURIE_E2E_RELEASE="acme-context",
+        CLUSTER_COMMAND_LOG=str(command_log),
+    )
+    result = subprocess.run(
+        ["bash", str(REPO_ROOT / relative_path), *args],
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert result.returncode != 0, result.stdout + result.stderr
+    assert required_input in result.stderr, result.stdout + result.stderr
+    assert not command_log.exists(), command_log.read_text() if command_log.exists() else ""
+
+
+@pytest.mark.parametrize(
+    ("filename", "class_name", "context_env", "image_env", "namespace"),
+    [
+        (
+            "hook-approval-proof.py",
+            "Proof",
+            "CURIE_HOOK_APPROVAL_CONTEXT",
+            "CURIE_HOOK_APPROVAL_RECEIPT_IMAGE",
+            "test-2765",
+        ),
+        (
+            "cron-operator-approval-proof.py",
+            "CronProof",
+            "CURIE_CRON_APPROVAL_CONTEXT",
+            "CURIE_CRON_APPROVAL_RECEIPT_IMAGE",
+            "test-2940",
+        ),
+    ],
+)
+def test_approval_proof_forwards_an_arbitrary_explicit_context(
+    filename: str,
+    class_name: str,
+    context_env: str,
+    image_env: str,
+    namespace: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    context = "acme-disposable-cluster"
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    command_log = tmp_path / "kubectl-argv"
+    _write_executable(
+        bin_dir / "kubectl",
+        '#!/bin/sh\nprintf "%s\\n" "$@" > "$PROOF_KUBECTL_LOG"\n',
+    )
+    for key, value in {
+        context_env: context,
+        image_env: "registry.example.com/receipt:fixture",
+        "CURIE_NAMESPACE": namespace,
+        "CURIE_RELEASE": namespace,
+        "CURIE_BIN": sys.executable,
+        "CURIE_API_URL": "http://api.example.com",
+        "CURIE_API_KEY": "synthetic-fixture-key",
+        "PATH": f"{bin_dir}:{os.environ['PATH']}",
+        "PROOF_KUBECTL_LOG": str(command_log),
+    }.items():
+        monkeypatch.setenv(key, value)
+    module = runpy.run_path(str(REPO_ROOT / "charts" / "curie" / "ci" / filename))
+    proof = module[class_name]()
+    proof.kubectl(["get", "namespace", namespace])
+    assert command_log.read_text().splitlines() == [
+        "--context",
+        context,
+        "-n",
+        namespace,
+        "get",
+        "namespace",
+        namespace,
+    ]

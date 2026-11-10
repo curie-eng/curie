@@ -7,10 +7,11 @@ import io
 import json
 import tarfile
 import uuid
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
+import pytest
 from curie_api.config import get_settings
 from curie_api.models import HookRun
 from sqlalchemy import text
@@ -52,9 +53,7 @@ def _bundle(root: Path, triggers: list[dict[str, Any]]) -> Path:
         "description": "t",
         "triggers": triggers,
     }
-    (inner / ".claude-plugin" / "plugin.json").write_text(
-        json.dumps(manifest), encoding="utf-8"
-    )
+    (inner / ".claude-plugin" / "plugin.json").write_text(json.dumps(manifest), encoding="utf-8")
     (inner / "skills" / "acme-bot").mkdir(parents=True, exist_ok=True)
     (inner / "skills" / "acme-bot" / "SKILL.md").write_text(
         "---\nname: acme-bot\ndescription: t\n---\nhi\n", encoding="utf-8"
@@ -131,6 +130,9 @@ def _insert_run(
     name: str,
     slot: datetime,
     outcome: str | None,
+    *,
+    source: str = "schedule",
+    reason: str | None = None,
 ) -> None:
     async def run() -> None:
         engine = create_async_engine(get_settings().database_url)
@@ -144,7 +146,9 @@ def _insert_run(
                         name=name,
                         slot_utc=slot,
                         version_id=uuid.UUID(version_id),
+                        source=source,
                         outcome=outcome,
+                        reason=reason,
                         started_at=slot,
                         ended_at=None if outcome is None else slot,
                     )
@@ -226,9 +230,7 @@ def _schedule_action(
     hook_name: str,
     action: str,
 ) -> Any:
-    return client.post(
-        f"/schedules/{agent_id}/{hook_name}/{action}", headers=headers
-    )
+    return client.post(f"/schedules/{agent_id}/{hook_name}/{action}", headers=headers)
 
 
 def _body(response: Any) -> dict[str, Any]:
@@ -287,6 +289,9 @@ def test_three_failed_nights_are_the_newest_outcome(
     assert nightly["zone"] == "UTC"
     assert _instant(nightly["last_fire_at"]) == NIGHTLY
     assert nightly["last_outcome"] == "failed"
+    assert nightly["last_manual_fire_at"] is None
+    assert nightly["last_manual_outcome"] is None
+    assert nightly["last_manual_reason"] is None
     weekly = _hook(row, "weekly-report")
     assert weekly["zone"] == "America/New_York"
     assert weekly["schedule"] == "0 16 * * FRI"
@@ -308,6 +313,10 @@ def test_a_hook_with_no_rows_is_listed_without_an_outcome(
     hook = _hook(_agent(_body(_schedules(client, auth_headers)), "acme-quiet"), "nightly-cleanup")
     assert hook["last_fire_at"] is None
     assert hook["last_outcome"] is None
+    assert hook["last_reason"] is None
+    assert hook["last_manual_fire_at"] is None
+    assert hook["last_manual_outcome"] is None
+    assert hook["last_manual_reason"] is None
     assert hook["zone"] == "UTC"
 
 
@@ -480,17 +489,18 @@ def test_pause_and_resume_only_change_the_named_hook_for_the_named_agent(
     unauthenticated = _schedule_action(client, {}, owner_id, "nightly-cleanup", "pause")
     assert unauthenticated.status_code != 200
 
-    paused = _schedule_action(
-        client, auth_headers, owner_id, "nightly-cleanup", "pause"
-    )
+    paused = _schedule_action(client, auth_headers, owner_id, "nightly-cleanup", "pause")
     assert paused.status_code == 200, paused.text
     assert paused.json()["paused"] is True
-    assert _schedule_action(
-        client, auth_headers, owner_id, "nightly-cleanup", "pause"
-    ).json()["paused"] is True
-    assert _schedule_action(
-        client, auth_headers, owner_id, "not-declared", "pause"
-    ).status_code == 404
+    assert (
+        _schedule_action(client, auth_headers, owner_id, "nightly-cleanup", "pause").json()[
+            "paused"
+        ]
+        is True
+    )
+    assert (
+        _schedule_action(client, auth_headers, owner_id, "not-declared", "pause").status_code == 404
+    )
 
     body = _body(_schedules(client, auth_headers))
     owner = _agent(body, "acme-pause-owner")
@@ -499,25 +509,32 @@ def test_pause_and_resume_only_change_the_named_hook_for_the_named_agent(
     assert _hook(owner, "weekly-report")["paused"] is False
     assert _hook(other, "nightly-cleanup")["paused"] is False
 
-    resumed = _schedule_action(
-        client, auth_headers, owner_id, "nightly-cleanup", "resume"
-    )
+    resumed = _schedule_action(client, auth_headers, owner_id, "nightly-cleanup", "resume")
     assert resumed.status_code == 200, resumed.text
     assert resumed.json()["paused"] is False
     first_resume_floor = _control_resume_from(owner_id, "nightly-cleanup")
     assert first_resume_floor is not None
     first_generation = _control_generation(owner_id, "nightly-cleanup")
-    assert _schedule_action(
-        client, auth_headers, owner_id, "nightly-cleanup", "pause"
-    ).json()["paused"] is True
-    assert _schedule_action(
-        client, auth_headers, owner_id, "nightly-cleanup", "resume"
-    ).json()["paused"] is False
+    assert (
+        _schedule_action(client, auth_headers, owner_id, "nightly-cleanup", "pause").json()[
+            "paused"
+        ]
+        is True
+    )
+    assert (
+        _schedule_action(client, auth_headers, owner_id, "nightly-cleanup", "resume").json()[
+            "paused"
+        ]
+        is False
+    )
     assert _control_resume_from(owner_id, "nightly-cleanup") == first_resume_floor
     assert _control_generation(owner_id, "nightly-cleanup") == first_generation + 2
-    assert _schedule_action(
-        client, auth_headers, owner_id, "nightly-cleanup", "resume"
-    ).json()["paused"] is False
+    assert (
+        _schedule_action(client, auth_headers, owner_id, "nightly-cleanup", "resume").json()[
+            "paused"
+        ]
+        is False
+    )
     assert _control_generation(owner_id, "nightly-cleanup") == first_generation + 2
 
     body = _body(_schedules(client, auth_headers))
@@ -526,3 +543,103 @@ def test_pause_and_resume_only_change_the_named_hook_for_the_named_agent(
     assert _hook(owner, "nightly-cleanup")["paused"] is False
     assert _hook(owner, "weekly-report")["paused"] is False
     assert _hook(other, "nightly-cleanup")["paused"] is False
+
+
+def test_scheduled_and_manual_history_select_their_own_newest_rows(
+    tmp_path: Path, client: Any, auth_headers: dict[str, str], clean_db: None
+) -> None:
+    agent_id, version_id = _publish(
+        client,
+        auth_headers,
+        _archive(_bundle(tmp_path, [_cron("nightly-cleanup", "0 9 * * *")])),
+        "acme-history",
+    )
+    _deploy(client, auth_headers, agent_id, version_id, "dev")
+    latest_manual = NIGHTLY + timedelta(seconds=20, microseconds=1)
+    _insert_run(
+        agent_id,
+        version_id,
+        "nightly-cleanup",
+        latest_manual,
+        "skipped",
+        source="manual",
+        reason="run_in_flight",
+    )
+    _insert_run(
+        agent_id,
+        version_id,
+        "nightly-cleanup",
+        NIGHTLY_OLDER[0],
+        "failed",
+        reason="turn_error",
+    )
+    _insert_run(
+        agent_id,
+        version_id,
+        "nightly-cleanup",
+        NIGHTLY + timedelta(seconds=10),
+        "blocked",
+        source="manual",
+        reason="agent_killed",
+    )
+    _insert_run(agent_id, version_id, "nightly-cleanup", NIGHTLY, "ran")
+
+    hook = _hook(
+        _agent(_body(_schedules(client, auth_headers, "acme-history")), "acme-history"),
+        "nightly-cleanup",
+    )
+    assert _instant(hook["last_fire_at"]) == NIGHTLY
+    assert hook["last_outcome"] == "ran"
+    assert hook["last_reason"] is None
+    assert _instant(hook["last_manual_fire_at"]) == latest_manual
+    assert hook["last_manual_outcome"] == "skipped"
+    assert hook["last_manual_reason"] == "run_in_flight"
+
+
+def test_a_manual_run_in_progress_does_not_create_scheduled_history(
+    tmp_path: Path, client: Any, auth_headers: dict[str, str], clean_db: None
+) -> None:
+    agent_id, version_id = _publish(
+        client,
+        auth_headers,
+        _archive(_bundle(tmp_path, [_cron("nightly-cleanup", "0 9 * * *")])),
+        "acme-open-manual",
+    )
+    _deploy(client, auth_headers, agent_id, version_id, "dev")
+    manual_slot = NIGHTLY + timedelta(seconds=5)
+    _insert_run(agent_id, version_id, "nightly-cleanup", manual_slot, None, source="manual")
+
+    hook = _hook(
+        _agent(_body(_schedules(client, auth_headers)), "acme-open-manual"), "nightly-cleanup"
+    )
+    assert hook["last_fire_at"] is None
+    assert hook["last_outcome"] is None
+    assert hook["last_reason"] is None
+    assert _instant(hook["last_manual_fire_at"]) == manual_slot
+    assert hook["last_manual_outcome"] is None
+    assert hook["last_manual_reason"] is None
+
+
+@pytest.mark.parametrize("source", ["schedule", "manual"])
+def test_schedules_refuse_an_unknown_reason_in_either_history(
+    tmp_path: Path, client: Any, auth_headers: dict[str, str], clean_db: None, source: str
+) -> None:
+    agent_id, version_id = _publish(
+        client,
+        auth_headers,
+        _archive(_bundle(tmp_path, [_cron("nightly-cleanup", "0 9 * * *")])),
+        "acme-unknown-reason",
+    )
+    _deploy(client, auth_headers, agent_id, version_id, "dev")
+    _insert_run(
+        agent_id,
+        version_id,
+        "nightly-cleanup",
+        NIGHTLY,
+        "failed",
+        source=source,
+        reason="unknown_future_reason",
+    )
+    response = _schedules(client, auth_headers, "acme-unknown-reason")
+    assert response.status_code == 500, response.text
+    assert response.json()["detail"] == "hook run reason is unknown"

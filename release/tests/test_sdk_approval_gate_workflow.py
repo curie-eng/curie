@@ -100,14 +100,14 @@ class TestSdkApprovalGateWorkflowContract:
         cannot run, and a check that reports success anyway is exactly the
         vacuous green that let #1852 ship.
 
-        A saboteur reverting to the report-don't-block posture would flip the
-        guard's `exit 1` to `exit 0`, delete the exit so the branch falls
-        through, or leave the exit in place and neutralize it with
-        `continue-on-error: true`. So this asserts the structure each of those
-        edits breaks: inside the empty-credential branch itself there is a
-        nonzero `exit` and no zero `exit`, and neither the step nor the job
-        swallows that failure. Asserting on the summary prose alone would
-        survive every one of those three edits.
+        A saboteur reverting to the report-don't-block posture would make the
+        model-credit step `exit 0`, drop the captured command status, or
+        neutralize the failure with `continue-on-error: true` or a step `if:`.
+        So this asserts the structure each of those edits breaks: the step is
+        unconditional, writes the command class to the job summary, exits with
+        the command status, and neither the step nor the job swallows that
+        failure. Asserting on the summary prose alone would survive every one
+        of those edits.
         """
         workflow = load_workflow()
         jobs = workflow["jobs"]
@@ -116,36 +116,25 @@ class TestSdkApprovalGateWorkflowContract:
         guard_steps = [
             step
             for step in live_job["steps"]
-            if "GITHUB_STEP_SUMMARY" in step.get("run", "")
-            and "OPENROUTER_API_KEY" in step.get("run", "")
+            if "curie dev model-credit" in step.get("run", "")
+            and "GITHUB_STEP_SUMMARY" in step.get("run", "")
         ]
         assert len(guard_steps) == 1
         guard = guard_steps[0]
+        run = guard["run"]
 
-        lines = guard["run"].splitlines()
-        branch_starts = [
-            index
-            for index, line in enumerate(lines)
-            if line.strip().startswith("if ") and "OPENROUTER_API_KEY" in line and "-z" in line
-        ]
-        assert len(branch_starts) == 1, "expected one empty-credential branch in the guard"
-        start = branch_starts[0]
-        ends = [index for index, line in enumerate(lines) if index > start and line.strip() == "fi"]
-        assert ends, "the empty-credential branch is unterminated"
-        branch = [line.strip() for line in lines[start + 1 : ends[0]]]
+        assert "GITHUB_STEP_SUMMARY" in run
+        assert "curie dev model-credit" in run
+        assert "secrets.OPENROUTER_API_KEY" not in run
+        assert "exit 0" not in run
+        assert 'exit "$status"' in run or 'exit "${status}"' in run, run
 
-        assert any(line.startswith("echo") or line == "{" for line in branch), branch
-        assert any("GITHUB_STEP_SUMMARY" in line for line in branch), branch
+        env = guard.get("env")
+        assert isinstance(env, dict)
+        assert "secrets.OPENROUTER_API_KEY" in env.get("CURIE_CREDENTIALS", "")
 
-        exits = [line for line in branch if line.split("#")[0].strip().startswith("exit")]
-        assert exits, "the empty-credential branch must terminate the job explicitly"
-        codes = [int(line.split()[1]) for line in exits]
-        assert all(code != 0 for code in codes), (
-            f"a missing credential must fail the job, not exit 0 (found {codes})"
-        )
-
-        # An `exit 1` that the runner is told to ignore is the same vacuous
-        # green by another name, at either the step or the job level.
+        # An exit that the runner is told to ignore is the same vacuous green
+        # by another name, at either the step or the job level.
         assert guard.get("continue-on-error", "false") == "false"
         assert live_job.get("continue-on-error", "false") == "false"
         # And the guard itself must be unconditional: an `if:` on this step

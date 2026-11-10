@@ -14,6 +14,13 @@ import uuid
 
 from redis.asyncio import Redis
 
+_RENEW_LUA = """
+if redis.call('GET', KEYS[1]) ~= ARGV[1] then return 0 end
+redis.call('SET', KEYS[1], ARGV[1], 'PX', tonumber(ARGV[2]))
+redis.call('SET', KEYS[2], '1', 'PX', tonumber(ARGV[3]))
+return 1
+"""
+
 
 def consumer_heartbeat_key(stream: str, group: str, consumer: str) -> str:
     """The renewable alive lease for one stream consumer."""
@@ -74,13 +81,14 @@ class ConsumerLivenessStore:
         consumer: str,
         heartbeat_ttl_ms: int,
         capability_ttl_ms: int,
-    ) -> None:
+    ) -> str:
         """Publish alive first, then capability, in one ordered transaction."""
 
+        token = uuid.uuid4().hex
         async with self._redis.pipeline(transaction=True) as pipe:
             pipe.set(
                 consumer_heartbeat_key(stream, group, consumer),
-                "alive",
+                token,
                 px=heartbeat_ttl_ms,
             )
             pipe.set(
@@ -89,6 +97,7 @@ class ConsumerLivenessStore:
                 px=capability_ttl_ms,
             )
             await pipe.execute()
+        return token
 
     async def renew(
         self,
@@ -98,16 +107,20 @@ class ConsumerLivenessStore:
         consumer: str,
         heartbeat_ttl_ms: int,
         capability_ttl_ms: int,
-    ) -> None:
-        """Renew both markers together, preserving their publication order."""
+        token: str,
+    ) -> bool:
+        """Renew both markers only while this generation owns the alive key."""
 
-        await self.publish(
-            stream=stream,
-            group=group,
-            consumer=consumer,
-            heartbeat_ttl_ms=heartbeat_ttl_ms,
-            capability_ttl_ms=capability_ttl_ms,
+        result = await self._redis.eval(
+            _RENEW_LUA,
+            2,
+            consumer_heartbeat_key(stream, group, consumer),
+            consumer_heartbeat_capable_key(stream, group, consumer),
+            token,
+            heartbeat_ttl_ms,
+            capability_ttl_ms,
         )
+        return bool(result)
 
     async def is_alive(self, *, stream: str, group: str, consumer: str) -> bool:
         return bool(

@@ -4,13 +4,18 @@ the real cluster path is the e2e in test_e2e_k8scratch.py)."""
 
 from __future__ import annotations
 
+import base64
+import hashlib
+import json
 import logging
 import time
+from collections.abc import Mapping
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime, timedelta
 
 import pytest
 from aci_protocol import BootEnv
+from curie_worker import caller_token
 from curie_worker.sandbox import (
     THREAD_HASH_LABEL,
     AffinityStore,
@@ -29,7 +34,10 @@ from curie_worker.sandbox import (
     SuspendedThreadError,
     UnschedulableClaimError,
 )
-from curie_worker.sandbox.k8s import _claim_view
+from curie_worker.sandbox.k8s import KubernetesSandboxClient, _claim_view
+from curie_worker.sandbox.types import KubeTransientError
+from nacl.signing import SigningKey
+from urllib3.exceptions import ReadTimeoutError
 
 from .conftest import FakeClaim, FakeSandbox, FakeSandboxClient
 
@@ -39,6 +47,11 @@ from .conftest import FakeClaim, FakeSandbox, FakeSandboxClient
 # the runner that has to read it (#488).
 HISTORY_ENV = BootEnv.env_key("history_ref")
 SESSION_ENV = BootEnv.env_key("session_id")
+
+# After their first poll, the bind and serviceFQDN loops send no poll in the
+# last half second of their budget (#4181). A short-budget test that needs more
+# than one poll adds its polling window on top of this.
+_POLL_GUARD_S = 0.5
 
 
 @pytest.fixture
@@ -332,6 +345,177 @@ def test_claim_timeout_cleans_up_claim(
     assert affinity.get("T1") is None
 
 
+class _RunnerLogSandboxClient(FakeSandboxClient, KubernetesSandboxClient):
+    """Fake the Kubernetes control plane while retaining its substrate gate."""
+
+    def __init__(self, tail: str | None, *, reported_pod: str | None = None) -> None:
+        FakeSandboxClient.__init__(self, bind_ready=False)
+        self.tail = tail
+        self.reported_pod = reported_pod
+        self.log_reads: list[tuple[str, float]] = []
+        self.diagnostic_order: list[str] = []
+
+    def get_claim(
+        self, name: str, *, request_timeout_seconds: float
+    ) -> ClaimView | None:
+        view = super().get_claim(name, request_timeout_seconds=request_timeout_seconds)
+        if view is not None and not view.ready:
+            return replace(view, sandbox_name=self.reported_pod)
+        return view
+
+    def pod_log_tail(self, name: str, *, request_timeout_seconds: float) -> str | None:
+        assert self.claims, "capture must precede claim deletion"
+        self.log_reads.append((name, request_timeout_seconds))
+        self.diagnostic_order.append("tail")
+        return self.tail
+
+    def delete_claim(self, name: str, *, request_timeout_seconds: float) -> None:
+        self.diagnostic_order.append("delete")
+        super().delete_claim(name, request_timeout_seconds=request_timeout_seconds)
+
+
+@pytest.mark.parametrize("reported_pod", [None, "runner-pod"], ids=["claim-name", "sandbox-name"])
+def test_claim_timeout_logs_one_redacted_runner_tail_before_cleanup(
+    reported_pod: str | None,
+    affinity: AffinityStore,
+    config: SubstrateConfig,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    tail = "runner boot marker\nAuthorization: Bearer fixture-private-value\nTraceback: boot died"
+    fake_k8s = _RunnerLogSandboxClient(tail, reported_pod=reported_pod)
+    fake_k8s.ready_reason = "ReconcilerError"
+    fake_k8s.ready_message = "runner never became Ready"
+    substrate = SandboxSubstrate(
+        fake_k8s, affinity, replace(config, claim_timeout_seconds=0.025)
+    )
+
+    with caplog.at_level(logging.WARNING, logger="curie_worker.sandbox.substrate"):
+        with pytest.raises(ClaimTimeoutError) as excinfo:
+            substrate.claim("T-runner-log")
+
+    assert type(excinfo.value) is ClaimTimeoutError
+    claim_name = fake_k8s.created[0]
+    pod_name = reported_pod or claim_name
+    assert fake_k8s.log_reads == [(pod_name, 5.0)]
+    assert fake_k8s.diagnostic_order == ["tail", "delete"]
+    warnings = [
+        record
+        for record in caplog.records
+        if record.name == "curie_worker.sandbox.substrate" and record.levelno >= logging.WARNING
+    ]
+    assert len(warnings) == 1
+    assert warnings[0].levelno == logging.WARNING
+    assert warnings[0].getMessage() == (
+        f"runner log tail for claim {claim_name} pod {pod_name}:\n"
+        "runner boot marker\nAuthorization: [REDACTED:bearer_token]\nTraceback: boot died"
+    )
+    assert "fixture-private-value" not in caplog.text
+    message = str(excinfo.value)
+    assert "ReconcilerError" in message
+    assert "runner never became Ready" in message
+    assert "runner boot marker" not in message
+    assert "Traceback" not in message
+    assert "fixture-private-value" not in message
+    assert fake_k8s.deleted == fake_k8s.created
+    assert affinity.get("T-runner-log") is None
+
+
+@pytest.mark.parametrize("tail", [None, ""], ids=["api-error", "empty-output"])
+def test_claim_timeout_without_runner_output_keeps_the_original_failure(
+    tail: str | None,
+    affinity: AffinityStore,
+    config: SubstrateConfig,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    fake_k8s = _RunnerLogSandboxClient(tail)
+    substrate = SandboxSubstrate(
+        fake_k8s, affinity, replace(config, claim_timeout_seconds=0.025)
+    )
+
+    with caplog.at_level(logging.WARNING, logger="curie_worker.sandbox.substrate"):
+        with pytest.raises(ClaimTimeoutError) as excinfo:
+            substrate.claim("T-no-runner-log")
+
+    assert type(excinfo.value) is ClaimTimeoutError
+    assert "no Ready condition was observed" in str(excinfo.value)
+    assert fake_k8s.log_reads == [(fake_k8s.created[0], 5.0)]
+    assert "runner log tail" not in caplog.text
+    assert fake_k8s.deleted == fake_k8s.created
+
+
+@pytest.mark.parametrize("failure", ["quota", "unschedulable"])
+def test_capacity_claim_failure_never_reads_runner_log(
+    failure: str,
+    affinity: AffinityStore,
+    config: SubstrateConfig,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    fake_k8s = _RunnerLogSandboxClient("must not be read")
+    expected: type[SandboxError]
+    if failure == "quota":
+        fake_k8s.quota_rejection = QuotaRejection(
+            quota_name="curie-sandbox-quota",
+            requested={"pods": "1"},
+            used={"pods": "1"},
+            hard={"pods": "1"},
+        )
+        expected = CapacityExhaustedError
+    else:
+        fake_k8s.unschedulable_message = "0/1 nodes are available: 1 Insufficient cpu."
+        expected = UnschedulableClaimError
+    substrate = SandboxSubstrate(
+        fake_k8s, affinity, replace(config, claim_timeout_seconds=0.025)
+    )
+
+    with caplog.at_level(logging.WARNING, logger="curie_worker.sandbox.substrate"):
+        with pytest.raises(expected):
+            substrate.claim("T-capacity-no-log")
+
+    assert fake_k8s.log_reads == []
+    assert "runner log tail" not in caplog.text
+    assert fake_k8s.diagnostic_order == ["delete"]
+    assert fake_k8s.deleted == fake_k8s.created
+
+
+def test_ready_kubernetes_claim_never_reads_runner_log(
+    affinity: AffinityStore, config: SubstrateConfig, caplog: pytest.LogCaptureFixture
+) -> None:
+    fake_k8s = _RunnerLogSandboxClient("must not be read")
+    fake_k8s.bind_ready = True
+    substrate = SandboxSubstrate(fake_k8s, affinity, config)
+
+    with caplog.at_level(logging.WARNING, logger="curie_worker.sandbox.substrate"):
+        handle = substrate.claim("T-ready-no-log")
+
+    assert handle.sandbox_name in fake_k8s.sandboxes
+    assert fake_k8s.log_reads == []
+    assert "runner log tail" not in caplog.text
+    assert affinity.get("T-ready-no-log") == RouteRecord(handle=handle)
+
+
+def test_non_kubernetes_timeout_does_not_request_runner_log(
+    fake_k8s: FakeSandboxClient,
+    affinity: AffinityStore,
+    config: SubstrateConfig,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fake_k8s.bind_ready = False
+
+    def forbidden_log_read(name: str, *, request_timeout_seconds: float) -> str | None:
+        raise AssertionError("non-Kubernetes substrate attempted a runner log read")
+
+    monkeypatch.setattr(fake_k8s, "pod_log_tail", forbidden_log_read, raising=False)
+    substrate = SandboxSubstrate(
+        fake_k8s, affinity, replace(config, claim_timeout_seconds=0.025)
+    )
+
+    with pytest.raises(ClaimTimeoutError) as excinfo:
+        substrate.claim("T-other-substrate-no-log")
+
+    assert type(excinfo.value) is ClaimTimeoutError
+    assert fake_k8s.deleted == fake_k8s.created
+
+
 def test_quota_rejection_fails_promptly_and_cleans_up_claim(
     fake_k8s: FakeSandboxClient, affinity: AffinityStore, config: SubstrateConfig
 ) -> None:
@@ -463,7 +647,7 @@ def test_later_non_quota_condition_replaces_earlier_quota_evidence(
         return view
 
     fake_k8s.get_claim = get_claim_after_quota_rejection  # type: ignore[method-assign]
-    short_config = replace(config, claim_timeout_seconds=0.05)
+    short_config = replace(config, claim_timeout_seconds=_POLL_GUARD_S + 0.05)
     substrate = SandboxSubstrate(fake_k8s, affinity, short_config)
 
     with pytest.raises(ClaimTimeoutError) as excinfo:
@@ -645,6 +829,71 @@ def test_release_deletes_claim_and_route(
     assert handle.sandbox_name not in fake_k8s.sandboxes
     assert affinity.get("T1") is None
     assert not substrate.release("T1")
+
+
+def _repoint_route_to_successor(
+    substrate: SandboxSubstrate, affinity: AffinityStore, thread_key: str
+) -> SandboxHandle:
+    """Claim a second real sandbox and point ``thread_key``'s route at it.
+
+    Mirrors a successor request admitted on the same thread (ADR 0206): its
+    claim is live in the cluster and the route names it, not the first claim.
+    """
+
+    successor = substrate.claim(f"{thread_key}-successor")
+    assert affinity.delete_if_claim(f"{thread_key}-successor", successor.claim_name)
+    affinity.replace(thread_key, RouteRecord(handle=successor), ttl_seconds=60)
+    return successor
+
+
+def test_release_if_claim_leaves_a_route_naming_another_claim_untouched(
+    substrate: SandboxSubstrate, fake_k8s: FakeSandboxClient, affinity: AffinityStore
+) -> None:
+    # #4331: a lost owner's cleanup must not delete the successor's sandbox.
+    own = substrate.claim("T1")
+    successor = _repoint_route_to_successor(substrate, affinity, "T1")
+    route_before = affinity.get("T1")
+    deleted_before = list(fake_k8s.deleted)
+
+    assert substrate.release_if_claim("T1", own.claim_name) is False
+
+    assert fake_k8s.deleted == deleted_before
+    assert successor.claim_name in fake_k8s.claims
+    assert successor.sandbox_name in fake_k8s.sandboxes
+    assert own.claim_name in fake_k8s.claims
+    assert affinity.get("T1") == route_before
+    assert affinity.get("T1") == RouteRecord(handle=successor)
+
+
+def test_release_if_claim_deletes_the_named_claim_and_its_route(
+    substrate: SandboxSubstrate, fake_k8s: FakeSandboxClient, affinity: AffinityStore
+) -> None:
+    handle = substrate.claim("T1")
+    other = substrate.claim("T2")
+
+    assert substrate.release_if_claim("T1", handle.claim_name) is True
+
+    assert handle.claim_name not in fake_k8s.claims
+    assert handle.sandbox_name not in fake_k8s.sandboxes
+    assert affinity.get("T1") is None
+    # Only the named claim went; an unrelated thread is untouched.
+    assert other.claim_name in fake_k8s.claims
+    assert affinity.get("T2") == RouteRecord(handle=other)
+
+
+def test_release_if_claim_without_a_route_deletes_nothing(
+    substrate: SandboxSubstrate, fake_k8s: FakeSandboxClient, affinity: AffinityStore
+) -> None:
+    unrelated = substrate.claim("T2")
+    claims_before = dict(fake_k8s.claims)
+    deleted_before = list(fake_k8s.deleted)
+
+    assert substrate.release_if_claim("T1", unrelated.claim_name) is False
+
+    assert fake_k8s.deleted == deleted_before
+    assert fake_k8s.claims == claims_before
+    assert affinity.get("T1") is None
+    assert affinity.get("T2") == RouteRecord(handle=unrelated)
 
 
 @dataclass
@@ -930,6 +1179,150 @@ def test_delete_detached_requires_claim_and_sandbox_disappearance(
         rejection,
         rejection,
     ]
+
+
+@dataclass
+class _TransientPressureGoneReadClient(FakeSandboxClient):
+    unreadable: str = "claim"
+    transient_reads_remaining: int | None = 2
+    target_claim: str | None = None
+    target_sandbox: str | None = None
+    read_calls: list[tuple[str, float]] = field(default_factory=list)
+    observed_gone: set[str] = field(default_factory=set)
+    headroom_observations: list[set[str]] = field(default_factory=list)
+
+    def delete_claim(self, name: str, *, request_timeout_seconds: float) -> None:
+        claim = self.claims.get(name)
+        assert claim is not None
+        self.target_claim = name
+        self.target_sandbox = claim.sandbox_name
+        super().delete_claim(name, request_timeout_seconds=request_timeout_seconds)
+
+    def _read_after_delete(self, kind: str, request_timeout_seconds: float) -> None:
+        assert 0 < request_timeout_seconds <= 1.0
+        self.read_calls.append((kind, request_timeout_seconds))
+        if kind == self.unreadable and (
+            self.transient_reads_remaining is None or self.transient_reads_remaining > 0
+        ):
+            if self.transient_reads_remaining is not None:
+                self.transient_reads_remaining -= 1
+            raise _transient()
+        self.observed_gone.add(kind)
+
+    def get_claim(
+        self, name: str, *, request_timeout_seconds: float
+    ) -> ClaimView | None:
+        if name != self.target_claim:
+            return super().get_claim(name, request_timeout_seconds=request_timeout_seconds)
+        self._read_after_delete("claim", request_timeout_seconds)
+        return None
+
+    def get_sandbox(
+        self, name: str, *, request_timeout_seconds: float
+    ) -> SandboxView | None:
+        if name != self.target_sandbox:
+            return super().get_sandbox(name, request_timeout_seconds=request_timeout_seconds)
+        self._read_after_delete("sandbox", request_timeout_seconds)
+        return None
+
+    def quota_has_headroom(
+        self,
+        rejection: QuotaRejection,
+        *,
+        request_timeout_seconds: float,
+    ) -> bool:
+        self.headroom_observations.append(set(self.observed_gone))
+        return super().quota_has_headroom(
+            rejection, request_timeout_seconds=request_timeout_seconds
+        )
+
+
+@pytest.mark.parametrize("unreadable", ["claim", "sandbox"])
+def test_delete_detached_recovers_transient_disappearance_reads_before_exact_quota_proof(
+    affinity: AffinityStore, config: SubstrateConfig, unreadable: str
+) -> None:
+    fake_k8s = _TransientPressureGoneReadClient(unreadable=unreadable)
+    fast = replace(
+        config,
+        poll_interval_seconds=0.001,
+        poll_interval_max_seconds=0.001,
+    )
+    substrate = SandboxSubstrate(fake_k8s, affinity, fast)
+    handle = substrate.claim("T-pressure-transient")
+    unrelated = substrate.claim("T-pressure-unrelated")
+    record = affinity.get(handle.thread_key)
+    assert record is not None
+    assert affinity.delete_if_claim(handle.thread_key, handle.claim_name)
+    rejection = QuotaRejection(
+        quota_name="curie-sandbox-quota",
+        requested={"pods": "1", "limits.cpu": "1"},
+        used={"pods": "2", "limits.cpu": "2"},
+        hard={"pods": "2", "limits.cpu": "2"},
+    )
+    fake_k8s.quota_headroom_results = [False, True]
+    created_before = list(fake_k8s.created)
+
+    assert substrate.delete_detached(
+        record, rejection, deadline=time.monotonic() + 1.0
+    )
+
+    assert sum(kind == unreadable for kind, _timeout in fake_k8s.read_calls) >= 3
+    assert fake_k8s.headroom_observations == [
+        {"claim", "sandbox"},
+        {"claim", "sandbox"},
+    ]
+    assert [observed for observed, _timeout in fake_k8s.quota_headroom_calls] == [
+        rejection,
+        rejection,
+    ]
+    assert fake_k8s.deleted == [handle.claim_name]
+    assert fake_k8s.created == created_before
+    assert handle.claim_name not in fake_k8s.claims
+    assert handle.sandbox_name not in fake_k8s.sandboxes
+    assert unrelated.claim_name in fake_k8s.claims
+    assert unrelated.sandbox_name in fake_k8s.sandboxes
+    assert affinity.get(unrelated.thread_key) == RouteRecord(handle=unrelated)
+
+
+@pytest.mark.parametrize("unreadable", ["claim", "sandbox"])
+def test_delete_detached_sustained_transient_reads_never_prove_absence_or_extend_deadline(
+    affinity: AffinityStore, config: SubstrateConfig, unreadable: str
+) -> None:
+    fake_k8s = _TransientPressureGoneReadClient(
+        unreadable=unreadable, transient_reads_remaining=None
+    )
+    fast = replace(
+        config,
+        poll_interval_seconds=0.001,
+        poll_interval_max_seconds=0.001,
+    )
+    substrate = SandboxSubstrate(fake_k8s, affinity, fast)
+    handle = substrate.claim("T-pressure-unavailable")
+    record = affinity.get(handle.thread_key)
+    assert record is not None
+    assert affinity.delete_if_claim(handle.thread_key, handle.claim_name)
+    rejection = QuotaRejection(
+        quota_name="curie-sandbox-quota",
+        requested={"pods": "1"},
+        used={"pods": "2"},
+        hard={"pods": "2"},
+    )
+    fake_k8s.quota_headroom_results = [True]
+    created_before = list(fake_k8s.created)
+    started = time.monotonic()
+
+    assert not substrate.delete_detached(record, rejection, deadline=started + 0.05)
+
+    elapsed = time.monotonic() - started
+    assert 0.04 <= elapsed < 0.2
+    assert sum(kind == unreadable for kind, _timeout in fake_k8s.read_calls) >= 2
+    assert all(0 < timeout <= 0.05 for _kind, timeout in fake_k8s.read_calls)
+    assert unreadable not in fake_k8s.observed_gone
+    assert fake_k8s.headroom_observations == []
+    assert fake_k8s.quota_headroom_calls == []
+    assert fake_k8s.deleted == [handle.claim_name]
+    assert fake_k8s.created == created_before
+    assert affinity.get(handle.thread_key) is None
 
 
 @dataclass
@@ -1330,6 +1723,84 @@ def test_reap_orphans_skips_and_warns_on_a_claim_of_unknown_age(
     assert warned, "an unknown-age skip must name the claim at WARNING"
 
 
+def test_reap_orphans_sweeps_claim_templates_with_observed_claims_kept(
+    substrate: SandboxSubstrate,
+    fake_k8s: FakeSandboxClient,
+    affinity: AffinityStore,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # #3842: a worker crash between creating a claim's per-claim template and
+    # binding the template to the claim leaves a labelled template no claim
+    # owns, so garbage collection never removes it (nor its token Secret).
+    # The reaper sweeps those, keeping every claim it still observes and
+    # sparing anything younger than the same bind-window cutoff it uses for
+    # claims.
+    live = substrate.claim("T-live")
+    orphan = substrate.claim("T-orphan")
+    young = substrate.claim("T-young")
+    affinity.delete_if_claim("T-orphan", orphan.claim_name)
+    affinity.delete_if_claim("T-young", young.claim_name)
+
+    frozen = datetime.now(UTC)
+
+    class _FrozenClock:
+        @staticmethod
+        def now(tz: object = None) -> datetime:
+            return frozen
+
+    monkeypatch.setattr("curie_worker.sandbox.substrate.datetime", _FrozenClock)
+    fake_k8s.claims[live.claim_name].created_at = frozen - timedelta(seconds=33.0)
+    fake_k8s.claims[orphan.claim_name].created_at = frozen - timedelta(seconds=33.0)
+    fake_k8s.claims[young.claim_name].created_at = frozen - timedelta(seconds=1.0)
+
+    assert substrate.reap_orphans() == [orphan.claim_name]
+
+    # One sweep per tick. keep is what the cluster still has after this pass:
+    # the routed claim and the in-flight one, never the claim just reaped.
+    # The cutoff is the claim grace (2.0 + 30.0) as literals, for the same
+    # reason the grace tests above spell it out.
+    assert fake_k8s.template_reaps == [
+        ({live.claim_name, young.claim_name}, frozen - timedelta(seconds=32.0))
+    ]
+
+
+def test_reap_orphans_survives_a_template_sweep_failure(
+    substrate: SandboxSubstrate,
+    fake_k8s: FakeSandboxClient,
+    affinity: AffinityStore,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    # The sweep is best effort: an RBAC gap or API error on templates must
+    # cost only the sweep, never claim reaping or the inventory metric.
+    recorded: list[tuple[float, float]] = []
+    monkeypatch.setattr(
+        "curie_worker.sandbox.substrate._record_inventory",
+        lambda *, active, suspended: recorded.append((active, suspended)),
+    )
+    live = substrate.claim("T-live")
+    orphan = substrate.claim("T-orphan")
+    affinity.delete_if_claim("T-orphan", orphan.claim_name)
+    fake_k8s.claims[orphan.claim_name].created_at = datetime.now(UTC) - timedelta(seconds=33.0)
+
+    class _SweepRefused(RuntimeError):
+        pass
+
+    fake_k8s.template_reap_error = _SweepRefused("sandboxtemplates is forbidden: secret-ish detail")
+
+    with caplog.at_level(logging.WARNING, logger="curie_worker.sandbox.substrate"):
+        assert substrate.reap_orphans() == [orphan.claim_name]
+
+    assert len(fake_k8s.template_reaps) == 1, "the sweep must have been attempted"
+    assert orphan.claim_name not in fake_k8s.claims
+    assert live.claim_name in fake_k8s.claims
+    assert recorded == [(1.0, 0.0)], "inventory must still be recorded"
+    warnings = [r for r in caplog.records if r.levelno >= logging.WARNING]
+    assert any("_SweepRefused" in r.getMessage() for r in warnings)
+    # Exception class only: the API error text is not logged.
+    assert all("secret-ish detail" not in r.getMessage() for r in warnings)
+
+
 def test_claim_rebinds_when_sandbox_died_under_live_route(
     substrate: SandboxSubstrate, fake_k8s: FakeSandboxClient, affinity: AffinityStore
 ) -> None:
@@ -1521,7 +1992,7 @@ def test_non_quota_reconciler_error_stays_on_slow_bind_path(
         return current
 
     fake_k8s.get_claim = get_claim_with_updated_condition  # type: ignore[method-assign]
-    short_config = replace(config, claim_timeout_seconds=0.05)
+    short_config = replace(config, claim_timeout_seconds=_POLL_GUARD_S + 0.05)
     substrate = SandboxSubstrate(fake_k8s, affinity, short_config)
 
     with pytest.raises(ClaimTimeoutError) as excinfo:
@@ -1769,6 +2240,17 @@ def test_service_fqdn_polling_backs_off_over_a_cold_boot(
     assert len(fake_k8s.sandbox_polls) >= 10
 
 
+class _SlowVirtualBindClient(_VirtualBindClient):
+    """A ``_VirtualBindClient`` whose every claim read takes 0.2 virtual seconds."""
+
+    def get_claim(
+        self, name: str, *, request_timeout_seconds: float
+    ) -> ClaimView | None:
+        view = super().get_claim(name, request_timeout_seconds=request_timeout_seconds)
+        self.clock.now += 0.2
+        return view
+
+
 def test_backoff_is_capped_and_never_overshoots_the_claim_budget(
     affinity: AffinityStore, key_prefix: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1778,13 +2260,15 @@ def test_backoff_is_capped_and_never_overshoots_the_claim_budget(
     # at claim_timeout_seconds rather than a cap-length overshoot past it.
     clock = _VirtualClock()
     monkeypatch.setattr("curie_worker.sandbox.substrate.time", clock)
-    # 90.0s lands the backoff grid (6 x 0.05, then 0.1 + 0.2 + 0.4, then 0.5
-    # steps) exactly on the deadline, so the clamp would never fire and the
-    # test would pass even with the ``min(..., deadline - now)`` clamp
-    # deleted. 90.3 leaves a 0.3s remainder, smaller than
-    # poll_interval_max_seconds, so only the clamp can produce the final sleep.
-    config = replace(_production_poll_config(key_prefix), claim_timeout_seconds=90.3)
-    fake_k8s = _VirtualBindClient(clock, bind_after_seconds=float("inf"))
+    # Each claim read takes 0.2s of apiserver round trip. With instant reads no
+    # poll can leave less than the cap behind it (no poll is sent with under
+    # _POLL_GUARD_S left, and the shipped cap equals that guard), so the clamp
+    # would never fire and the test would pass with the ``min(..., deadline -
+    # now)`` clamp deleted. A read that eats budget is exactly when production
+    # needs the clamp. 90.2 starts the last poll 0.6s out and ends it with 0.4s
+    # left, under the cap, so only the clamp can produce the 0.4s final sleep.
+    config = replace(_production_poll_config(key_prefix), claim_timeout_seconds=90.2)
+    fake_k8s = _SlowVirtualBindClient(clock, bind_after_seconds=float("inf"))
     substrate = SandboxSubstrate(fake_k8s, affinity, config)
 
     with pytest.raises(ClaimTimeoutError):
@@ -1793,7 +2277,7 @@ def test_backoff_is_capped_and_never_overshoots_the_claim_budget(
     assert max(clock.sleeps) <= config.poll_interval_max_seconds
     # The clamp is what produced this final sleep: an unclamped backoff would
     # have kept it at the cap instead of shortening it.
-    assert clock.sleeps[-1] < config.poll_interval_max_seconds
+    assert clock.sleeps[-1] == pytest.approx(0.4)
     assert clock.now == pytest.approx(config.claim_timeout_seconds)
     # The claim that never bound is still cleaned up.
     assert fake_k8s.deleted == fake_k8s.created
@@ -2019,45 +2503,11 @@ def test_fresh_only_claim_refuses_a_docker_runner_that_restarted_after_lookup(
     and the same container back to ``running`` must not be adopted by a
     fresh-only claim."""
 
-    from curie_worker.sandbox.docker import DockerSandboxClient
-
-    from .conftest import _FakeBundleStore
+    from .conftest import _FakeBundleStore, _RecordingDocker
 
     route_changed = _route_changed_error()
 
-    class _RestartingDocker(DockerSandboxClient):
-        def __init__(self) -> None:
-            super().__init__(image="curie-runner", bundle_store=_FakeBundleStore())
-            self.status = "running"
-            self.created: list[str] = []
-
-        def _docker(
-            self,
-            args: list[str],
-            *,
-            request_timeout_seconds: float,
-            check: bool = True,
-        ) -> str:
-            assert request_timeout_seconds > 0
-            raise AssertionError(f"unexpected docker call {args}")
-
-        def _inspect(
-            self, name: str, *, deadline: float
-        ) -> tuple[str, dict[str, str], datetime | None]:
-            assert deadline > time.monotonic()
-            return self.status, {}, None
-
-        def _dial_endpoint(
-            self, name: str, *, deadline: float
-        ) -> tuple[str, int] | None:
-            assert deadline > time.monotonic()
-            return ("127.0.0.1", 18080)
-
-        def create_claim(self, name: str, **_kwargs: object) -> None:
-            self.created.append(name)
-            raise AssertionError("a fresh-only claim created a container on a live route")
-
-    docker = _RestartingDocker()
+    docker = _RecordingDocker(image="curie-runner", bundle_store=_FakeBundleStore())
     substrate = SandboxSubstrate(docker, affinity, config)
     old = SandboxHandle(
         thread_key="T2739-docker",
@@ -2068,11 +2518,23 @@ def test_fresh_only_claim_refuses_a_docker_runner_that_restarted_after_lookup(
         port=18080,
         session_id="thread-docker",
     )
+    # Docker inspect fields: https://docs.docker.com/reference/cli/docker/inspect/
+    docker.containers[old.sandbox_name] = {
+        "curietech.ai/managed-by": "curie-sandbox-substrate",
+        "curietech.ai/stack": "default",
+        "curietech.ai/claim": old.claim_name,
+        "curietech.ai/component": "claim-runner",
+        "curietech.ai/claim-attempt": "a" * 32,
+    }
+    docker.container_ids[old.sandbox_name] = "b" * 64
+    docker.container_created_at[old.sandbox_name] = datetime.now(UTC).isoformat()
+    docker.container_started_at[old.sandbox_name] = docker.container_created_at[old.sandbox_name]
+    docker.outputs["port"] = "127.0.0.1:18080\n"
     assert affinity.put_if_absent("T2739-docker", RouteRecord(handle=old), 60)
 
-    docker.status = "restarting"
+    docker.container_status[old.sandbox_name] = "restarting"
     assert substrate.lookup("T2739-docker") is None
-    docker.status = "running"
+    docker.container_status[old.sandbox_name] = "running"
     assert substrate.lookup("T2739-docker") == old
 
     with pytest.raises(route_changed):
@@ -2082,7 +2544,8 @@ def test_fresh_only_claim_refuses_a_docker_runner_that_restarted_after_lookup(
             fresh_only=True,  # type: ignore[call-arg]
         )
 
-    assert docker.created == []
+    assert {args[0] for args in docker.calls} <= {"inspect", "port"}
+    assert all(timeout > 0 for timeout in docker.timeouts)
     assert affinity.get("T2739-docker") == RouteRecord(handle=old)
 
 
@@ -2105,8 +2568,9 @@ def test_terminate_thread_observes_absence_of_labelled_and_sql_names(
         "extra-labelled-claim",
         pool="test-pool",
         labels={THREAD_HASH_LABEL: thread_hash},
+        deadline=time.monotonic() + 300,
     )
-    fake_k8s.create_claim("sql-claim", pool="test-pool")
+    fake_k8s.create_claim("sql-claim", pool="test-pool", deadline=time.monotonic() + 300)
     sql_claim = "sql-claim"
     sql_sandbox = fake_k8s.claims[sql_claim].sandbox_name
 
@@ -2119,7 +2583,9 @@ def test_terminate_thread_observes_absence_of_labelled_and_sql_names(
     assert isinstance(observation, TerminationObservation)
     assert fake_k8s.get_claim(sql_claim, request_timeout_seconds=1.0) is None
     assert fake_k8s.get_sandbox(sql_sandbox, request_timeout_seconds=1.0) is None
-    assert fake_k8s.get_claim(handle.claim_name, request_timeout_seconds=1.0) is not None
+    # The thread's current claim is deleted with the stored name. A labelled
+    # claim that is not the route is left for the reaper.
+    assert fake_k8s.get_claim(handle.claim_name, request_timeout_seconds=1.0) is None
     assert "extra-labelled-claim" in fake_k8s.claims
     assert sql_claim in str(observation.claims)
     assert sql_sandbox in str(observation.sandboxes)
@@ -2309,7 +2775,7 @@ def test_a_pod_that_becomes_schedulable_is_not_reported_unschedulable(
 
     fake_k8s.pod_unschedulable = placed_after_first_read  # type: ignore[method-assign]
     substrate = SandboxSubstrate(
-        fake_k8s, affinity, replace(config, claim_timeout_seconds=0.05)
+        fake_k8s, affinity, replace(config, claim_timeout_seconds=_POLL_GUARD_S + 0.05)
     )
 
     with pytest.raises(ClaimTimeoutError) as excinfo:
@@ -2317,3 +2783,381 @@ def test_a_pod_that_becomes_schedulable_is_not_reported_unschedulable(
 
     assert not isinstance(excinfo.value, UnschedulableClaimError)
     assert len(fake_k8s.pod_reads) >= 2
+
+
+# --- Transient kube API reads in the bind/serviceFQDN loops (#4181) -----------
+# A poll that fails in transport or with a 5xx is no observation: the loop keeps
+# polling on its normal schedule and, at the deadline, raises the timeout built
+# from the last REAL observation. These run on the virtual clock above.
+
+
+def _transient() -> KubeTransientError:
+    # Chained from the urllib3 error the kube client actually raises, so the
+    # substrate sees exactly what KubernetesSandboxClient._get produces.
+    try:
+        raise ReadTimeoutError(None, "/apis/sandboxclaims/c", "Read timed out.")  # type: ignore[arg-type]
+    except ReadTimeoutError as exc:
+        try:
+            raise KubeTransientError("kube API transport error") from exc
+        except KubeTransientError as transient:
+            return transient
+
+
+class _ScriptedClaimClient(FakeSandboxClient):
+    """Answers ``get_claim``/``get_sandbox`` from a script; the last entry repeats.
+
+    An entry that is an exception is raised, anything else is returned.
+    """
+
+    def __init__(
+        self,
+        claim_script: list[ClaimView | None | Exception] | None = None,
+        sandbox_script: list[SandboxView | None | Exception] | None = None,
+    ) -> None:
+        super().__init__()
+        self.claim_script = claim_script or [None]
+        self.sandbox_script = sandbox_script or [None]
+        self.claim_timeouts: list[float] = []
+        self.sandbox_calls = 0
+
+    def get_claim(
+        self, name: str, *, request_timeout_seconds: float
+    ) -> ClaimView | None:
+        del name
+        self.claim_timeouts.append(request_timeout_seconds)
+        index = min(len(self.claim_timeouts) - 1, len(self.claim_script) - 1)
+        entry = self.claim_script[index]
+        if isinstance(entry, Exception):
+            raise entry
+        return entry
+
+    def get_sandbox(
+        self, name: str, *, request_timeout_seconds: float
+    ) -> SandboxView | None:
+        del name, request_timeout_seconds
+        self.sandbox_calls += 1
+        entry = self.sandbox_script[min(self.sandbox_calls, len(self.sandbox_script)) - 1]
+        if isinstance(entry, Exception):
+            raise entry
+        return entry
+
+
+def _claim(*, ready: bool, reason: str | None = None) -> ClaimView:
+    return ClaimView(
+        name="claim-x",
+        ready=ready,
+        sandbox_name="sbx-claim-x" if ready else None,
+        created_at=datetime.now(UTC),
+        quota_rejection=None,
+        ready_reason=reason,
+        ready_message="waiting for dependencies" if reason else None,
+    )
+
+
+def test_await_bound_survives_one_transient_read(
+    affinity: AffinityStore, config: SubstrateConfig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    clock = _VirtualClock()
+    monkeypatch.setattr("curie_worker.sandbox.substrate.time", clock)
+    fake_k8s = _ScriptedClaimClient(claim_script=[_transient(), _claim(ready=True)])
+    substrate = SandboxSubstrate(fake_k8s, affinity, config)
+
+    assert substrate._await_bound("claim-x", deadline=10.0) == "sbx-claim-x"  # noqa: SLF001
+    assert len(fake_k8s.claim_timeouts) == 2
+
+
+def test_await_bound_times_out_on_last_real_observation_under_transient_reads(
+    affinity: AffinityStore, config: SubstrateConfig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    clock = _VirtualClock()
+    monkeypatch.setattr("curie_worker.sandbox.substrate.time", clock)
+    fake_k8s = _ScriptedClaimClient(
+        claim_script=[_claim(ready=False, reason="DependenciesNotReady"), _transient()]
+    )
+    substrate = SandboxSubstrate(fake_k8s, affinity, config)
+
+    with pytest.raises(ClaimTimeoutError, match="DependenciesNotReady") as excinfo:
+        substrate._await_bound("claim-x", deadline=10.0)  # noqa: SLF001
+
+    assert not isinstance(excinfo.value, UnschedulableClaimError)
+    # The loop kept polling through the transient reads rather than bailing on
+    # the first one, and never sent a sub-second request near the deadline.
+    assert len(fake_k8s.claim_timeouts) > 2
+    assert min(fake_k8s.claim_timeouts) >= 0.5
+
+
+class _SlowFirstPollClient(_ScriptedClaimClient):
+    """Its first claim read takes 0.7 virtual seconds, leaving the clock 0.3s
+    short of a 1.0s deadline when it returns."""
+
+    def __init__(
+        self, clock: _VirtualClock, claim_script: list[ClaimView | None | Exception]
+    ) -> None:
+        super().__init__(claim_script=claim_script)
+        self.clock = clock
+
+    def get_claim(
+        self, name: str, *, request_timeout_seconds: float
+    ) -> ClaimView | None:
+        view = super().get_claim(name, request_timeout_seconds=request_timeout_seconds)
+        if len(self.claim_timeouts) == 1:
+            self.clock.now += 0.7
+        return view
+
+
+def test_await_bound_sends_no_further_poll_with_under_half_a_second_left(
+    affinity: AffinityStore, config: SubstrateConfig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    clock = _VirtualClock()
+    monkeypatch.setattr("curie_worker.sandbox.substrate.time", clock)
+    fake_k8s = _SlowFirstPollClient(clock, claim_script=[_claim(ready=False)])
+    substrate = SandboxSubstrate(fake_k8s, affinity, config)
+
+    with pytest.raises(ClaimTimeoutError):
+        substrate._await_bound("claim-x", deadline=1.0)  # noqa: SLF001
+
+    assert len(fake_k8s.claim_timeouts) == 1
+
+
+def test_await_bound_polls_once_under_a_budget_below_the_floor(
+    affinity: AffinityStore, config: SubstrateConfig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Any positive CURIE_CLAIM_TIMEOUT_SECONDS is accepted, so a budget under
+    # the floor must still get its one look rather than refusing every claim.
+    clock = _VirtualClock()
+    monkeypatch.setattr("curie_worker.sandbox.substrate.time", clock)
+    fake_k8s = _ScriptedClaimClient(claim_script=[_claim(ready=True)])
+    substrate = SandboxSubstrate(fake_k8s, affinity, config)
+
+    assert substrate._await_bound("claim-x", deadline=0.3) == "sbx-claim-x"  # noqa: SLF001
+    assert fake_k8s.claim_timeouts == pytest.approx([0.3])
+
+
+def test_await_bound_still_polls_with_just_over_half_a_second_left(
+    affinity: AffinityStore, config: SubstrateConfig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    clock = _VirtualClock()
+    monkeypatch.setattr("curie_worker.sandbox.substrate.time", clock)
+    fake_k8s = _ScriptedClaimClient(claim_script=[_claim(ready=True)])
+    substrate = SandboxSubstrate(fake_k8s, affinity, config)
+
+    assert substrate._await_bound("claim-x", deadline=0.6) == "sbx-claim-x"  # noqa: SLF001
+    assert fake_k8s.claim_timeouts == pytest.approx([0.6])
+
+
+def test_await_service_fqdn_survives_one_transient_read(
+    affinity: AffinityStore, config: SubstrateConfig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    clock = _VirtualClock()
+    monkeypatch.setattr("curie_worker.sandbox.substrate.time", clock)
+    view = SandboxView(
+        name="sbx-claim-x",
+        ready=True,
+        service_fqdn="sbx-claim-x.test-ns.svc.cluster.local",
+        operating_mode="Running",
+        port=8080,
+    )
+    fake_k8s = _ScriptedClaimClient(sandbox_script=[_transient(), view])
+    substrate = SandboxSubstrate(fake_k8s, affinity, config)
+
+    assert substrate._await_service_fqdn("sbx-claim-x", deadline=10.0) == view  # noqa: SLF001
+    assert fake_k8s.sandbox_calls == 2
+
+
+def test_await_service_fqdn_times_out_under_persistent_transient_reads(
+    affinity: AffinityStore, config: SubstrateConfig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    clock = _VirtualClock()
+    monkeypatch.setattr("curie_worker.sandbox.substrate.time", clock)
+    fake_k8s = _ScriptedClaimClient(sandbox_script=[_transient()])
+    substrate = SandboxSubstrate(fake_k8s, affinity, config)
+
+    with pytest.raises(ClaimTimeoutError, match="has no serviceFQDN"):
+        substrate._await_service_fqdn("sbx-claim-x", deadline=10.0)  # noqa: SLF001
+
+    assert fake_k8s.sandbox_calls > 1
+
+
+# -- ADR 0270 decision 3: every boot records the requester it booted with ---------------
+
+# Named from the boot contract, as the history and session names above are.
+CALLER_TOKEN_ENV = BootEnv.env_key("connector_caller_token")
+_REQUESTER_DIGEST_DOMAIN = b"curie-cct-principal-v1\n"
+_REQUESTER_TENANT = "33333333-3333-4333-8333-333333333333"
+_REQUESTER_ISSUER = "https://identity.example.test/directory"
+_ALICE = {
+    "tenant_id": _REQUESTER_TENANT,
+    "issuer": _REQUESTER_ISSUER,
+    "subject": "SyntheticAliceSubject",
+}
+_BOB = {
+    "tenant_id": _REQUESTER_TENANT,
+    "issuer": _REQUESTER_ISSUER,
+    "subject": "SyntheticBobSubject",
+}
+# Fixed expiries; the substrate reads them, it never compares them with a clock.
+_ALICE_EXP = 1_900_003_600
+_PLAIN_EXP = 1_900_086_400
+_MINTED_EXP = 1_900_007_200
+
+
+def _requester_digest(principal: dict[str, str]) -> str:
+    """The plan's requester fact, computed independently. @spec CONNECTOR-REQUESTER-3."""
+    canonical = json.dumps(principal, separators=(",", ":"), sort_keys=True, ensure_ascii=True)
+    digest = hashlib.sha256(_REQUESTER_DIGEST_DOMAIN + canonical.encode("ascii")).hexdigest()
+    return "sha256:" + digest
+
+
+def _requester_seed() -> str:
+    """A fresh worker Ed25519 seed, minted at runtime. @spec CONNECTOR-REQUESTER-3."""
+    return base64.b64encode(bytes(SigningKey.generate())).decode()
+
+
+def _cct(seed: str, *, exp: int, principal: dict[str, str] | None = None) -> str:
+    """@spec CONNECTOR-REQUESTER-3."""
+    return caller_token.mint(
+        seed,
+        agent="test-agent",
+        exp=exp,
+        principal=None if principal is None else caller_token.CallerPrincipal(**principal),
+    )
+
+
+def _boot_by(
+    substrate: SandboxSubstrate,
+    path: str,
+    thread_key: str,
+    env: dict[str, str] | None,
+    predecessor_env: dict[str, str],
+) -> tuple[SandboxHandle, SandboxHandle | None]:
+    """Boot ``thread_key`` with ``env`` through one substrate entry point.
+
+    Resume and handoff start from a predecessor booted with a different cct, so
+    a record copied from the old route cannot pass. @spec CONNECTOR-REQUESTER-3.
+    """
+    if path == "claim":
+        return substrate.claim(thread_key, env=env), None
+    first = substrate.claim(thread_key, env=predecessor_env)
+    if path == "resume":
+        substrate.suspend(thread_key, history_ref=f"history/{thread_key}")
+        return substrate.resume(thread_key, env=env), first
+    assert env is not None
+    return substrate.handoff(thread_key, expected=first, env=env, workspace_repo=None), first
+
+
+_BOOT_PATHS = ["claim", "resume", "handoff"]
+# booted -> (env factory, expected fact name). None means no env at all.
+_BOOTED = ["requester", "principal-less", "unreadable", "no-cct", "no-env"]
+
+
+# @spec CONNECTOR-REQUESTER-3
+@pytest.mark.parametrize(
+    ("path", "booted"),
+    [
+        (path, booted)
+        for path in _BOOT_PATHS
+        for booted in _BOOTED
+        if not (path == "handoff" and booted == "no-env")
+    ],
+)
+def test_every_boot_path_records_the_booted_requester(
+    substrate: SandboxSubstrate,
+    fake_k8s: FakeSandboxClient,
+    affinity: AffinityStore,
+    path: str,
+    booted: str,
+) -> None:
+    """The handle and the durable record describe the cct the runner booted with.
+
+    A digest for a principal-bearing cct, ``"none"`` for a principal-less or
+    unreadable one, and ``"absent"`` when the boot env has no cct at all. From
+    this change no boot records None: None is reserved for routes written
+    before the fields existed, which cannot prove a match.
+    """
+    seed = _requester_seed()
+    thread_key = f"T-requester-{path}-{booted}"
+    envs: dict[str, dict[str, str] | None] = {
+        "requester": {CALLER_TOKEN_ENV: _cct(seed, exp=_ALICE_EXP, principal=_ALICE)},
+        "principal-less": {CALLER_TOKEN_ENV: _cct(seed, exp=_PLAIN_EXP)},
+        "unreadable": {CALLER_TOKEN_ENV: "cct.payload.signature"},
+        "no-cct": {SESSION_ENV: "logical-session"},
+        "no-env": None,
+    }
+    expected = {
+        "requester": (_requester_digest(_ALICE), _ALICE_EXP),
+        "principal-less": ("none", _PLAIN_EXP),
+        "unreadable": ("none", None),
+        "no-cct": ("absent", None),
+        "no-env": ("absent", None),
+    }[booted]
+    env = envs[booted]
+    predecessor_env = {CALLER_TOKEN_ENV: _cct(seed, exp=_ALICE_EXP + 1, principal=_BOB)}
+
+    handle, first = _boot_by(substrate, path, thread_key, env, predecessor_env)
+
+    assert (handle.caller_requester, handle.caller_token_exp) == expected
+    record = affinity.get(thread_key)
+    assert record is not None and record.state is RouteState.LIVE
+    assert record.handle == handle
+    assert (record.handle.caller_requester, record.handle.caller_token_exp) == expected
+    # The fact describes the env this claim really booted.
+    booted_env = fake_k8s.claims[handle.claim_name].env
+    assert booted_env.get(CALLER_TOKEN_ENV) == (env or {}).get(CALLER_TOKEN_ENV)
+    if first is not None:
+        # The predecessor recorded its own requester, and the new boot did not copy it.
+        assert first.caller_requester == _requester_digest(_BOB)
+        assert first.caller_token_exp == _ALICE_EXP + 1
+        assert handle.claim_name != first.claim_name
+
+
+# @spec CONNECTOR-REQUESTER-3
+@pytest.mark.parametrize("path", _BOOT_PATHS)
+def test_every_boot_path_records_the_requester_the_minter_booted(
+    substrate: SandboxSubstrate,
+    fake_k8s: FakeSandboxClient,
+    affinity: AffinityStore,
+    path: str,
+) -> None:
+    """With a claim-time minter wired, the record follows the env the minter returned.
+
+    The minter runs before the handle is built, so the recorded requester and
+    expiry are the re-minted token's, never the caller's. The minter here
+    swaps in a different principal so a record taken from the pre-minter env
+    cannot pass.
+    """
+    seed = _requester_seed()
+    thread_key = f"T-requester-minted-{path}"
+    predecessor_env = {CALLER_TOKEN_ENV: _cct(seed, exp=_PLAIN_EXP)}
+    minted: list[str] = []
+
+    def minter(env: Mapping[str, str]) -> dict[str, str]:
+        out = dict(env)
+        if CALLER_TOKEN_ENV in out:
+            token = _cct(seed, exp=_MINTED_EXP + len(minted), principal=_BOB)
+            minted.append(token)
+            out[CALLER_TOKEN_ENV] = token
+        return out
+
+    alice_env = {CALLER_TOKEN_ENV: _cct(seed, exp=_ALICE_EXP, principal=_ALICE)}
+    if path == "claim":
+        substrate.set_boot_credential_minter(minter)
+        handle = substrate.claim(thread_key, env=alice_env)
+    else:
+        first = substrate.claim(thread_key, env=predecessor_env)
+        assert (first.caller_requester, first.caller_token_exp) == ("none", _PLAIN_EXP)
+        substrate.set_boot_credential_minter(minter)
+        if path == "resume":
+            substrate.suspend(thread_key, history_ref=f"history/{thread_key}")
+            handle = substrate.resume(thread_key, env=alice_env)
+        else:
+            handle = substrate.handoff(
+                thread_key, expected=first, env=alice_env, workspace_repo=None
+            )
+
+    assert len(minted) == 1
+    assert fake_k8s.claims[handle.claim_name].env[CALLER_TOKEN_ENV] == minted[0]
+    expected = (_requester_digest(_BOB), _MINTED_EXP)
+    assert (handle.caller_requester, handle.caller_token_exp) == expected
+    record = affinity.get(thread_key)
+    assert record is not None and record.handle == handle
+    assert (record.handle.caller_requester, record.handle.caller_token_exp) == expected

@@ -2,7 +2,7 @@
 apiVersion: v1
 kind: Service
 metadata:
-  name: {{ include "curie.fullname" . }}-postgres
+  name: {{ include "curie.checkedObjectName" (dict "kind" "Service" "name" (printf "%s-postgres" (include "curie.fullname" .))) }}
   labels:
     {{- include "curie.labels" . | nindent 4 }}
 spec:
@@ -17,7 +17,7 @@ spec:
 apiVersion: apps/v1
 kind: StatefulSet
 metadata:
-  name: {{ include "curie.fullname" . }}-postgres
+  name: {{ include "curie.checkedObjectName" (dict "kind" "StatefulSet" "name" (printf "%s-postgres" (include "curie.fullname" .))) }}
   labels:
     {{- include "curie.labels" . | nindent 4 }}
 spec:
@@ -34,9 +34,20 @@ spec:
         {{- end }}
         {{- include "curie.statefulPodLabels" . | nindent 8 }}
         {{- include "curie.selectorLabels" (dict "root" . "component" "postgres") | nindent 8 }}
-      {{- with (include "curie.placement.annotations" (dict "root" $ "class" "data")) }}
+      {{- $placementAnnotations := include "curie.placement.annotations" (dict "root" $ "class" "data") }}
+      {{- $secretChecksum := include "curie.secretChecksum" (dict
+        "root" $
+        "keys" (list )
+        "refs" (list (dict "name" (include "curie.storeSecretName" (dict "root" $ "store" $.Values.postgres)) "key" "postgresPassword"))
+        "env" "") }}
+      {{- if or $placementAnnotations $secretChecksum }}
       annotations:
+        {{- with $placementAnnotations }}
         {{- . | nindent 8 }}
+        {{- end }}
+        {{- with $secretChecksum }}
+        checksum/secret: {{ . }}
+        {{- end }}
       {{- end }}
     spec:
       {{- with (include "curie.placement.spec" (dict "root" $ "class" "data")) }}
@@ -52,6 +63,7 @@ spec:
         - name: data
           emptyDir: {}
       {{- end }}
+      enableServiceLinks: false
       containers:
         - name: postgres
           image: {{ .Values.postgres.image }}
@@ -83,7 +95,7 @@ spec:
           # unclean stop, so the liveness cutoff must outlive the readiness one
           # -- otherwise the kubelet restarts a Postgres that is still replaying
           # and the restart re-enters the same recovery. Cadence from values;
-          # ordering pinned by ci/probe-window-assertions.sh.
+          # ordering pinned by ci/policy/engine.py (P3).
           livenessProbe:
             exec:
               command: ["sh", "-c", "pg_isready -U {{ .Values.postgres.auth.username }}"]

@@ -129,7 +129,7 @@ class SeedAgent:
 
     `legacy` means the address is a shape the RELEASED code stored but the
     CURRENT write validator rejects. That flag is asserted against the live
-    `curie_api.schemas._validate_channel_binding` in the gate's tests, so an
+    `curie_api.schemas.channels.validate_channel_binding` in the gate's tests, so an
     address softened to make the gate green stops being legacy and reddens the
     suite instead.
 

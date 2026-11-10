@@ -1,3 +1,8 @@
+<!-- This repository is public. Anonymize customer and downstream information
+     in this PR's title/body, comments, links, attachments, and every outgoing
+     commit subject/body. Do not reproduce a leaked value when explaining a
+     redaction. Live-test evidence and provenance are not exceptions. -->
+
 ## Summary
 
 <!-- One paragraph: what changed, and why. Skip the play by play. -->
@@ -23,6 +28,16 @@ Closes #
 <!-- Required for a patch release PR. Name a run URL that re-verified each
      trigger on a live surface, or an explicit waiver of the form:
      waiver: <reason>
+
+     To defer proof to this pull request's own CI, replace this comment with
+     the exact marker below on its own visible line:
+this-pr-ci
+
+     Wait for the CI checks on this pull request's current head to pass before
+     merging. A passing run proves only the ladder rungs CI executes on that
+     head. Include separate live proof or a waiver for any broader surface.
+     This pull request's own CI run URL also counts for those same rungs;
+     do not rerun a rung locally after CI has proved it on the same tree.
      Other pull requests may leave this comment in place. -->
 
 ## Fix pin verification
@@ -60,61 +75,33 @@ Fix pin: <supported selector>
      reason:
 Fix pin: n/a - <reason>
 
-     The pin's tier is derived from the selector's location, not from prose:
-     unit tests, cli/tests/local/test_*.py (local), charts/curie/ci/* (cluster
-     helm-render), or other test_live.py selectors (live). If the closed issue
-     carries found:unit, found:local, found:cluster, or found:live and the pin
-     is below that surface, add:
-Fix pin waiver: <reason>
-
-     A unit pin for a found:live issue fails without that waiver.
+     A lower-tier pin that reproduces the defect is accepted without a waiver,
+     regardless of the issue's discovery label. The verifier still requires a
+     changed test that passes and fails when the fix is reversed.
 
      For a non fix pull request that does not close a bug-labeled issue, leave
      this section empty. -->
 
-## End-to-end verification
+## Verification
 
-<!-- Choose exactly one path.
-
-     Behavior-bearing: keep the tier table and three evidence checkboxes below.
-     Classify every tier required or n/a with a concrete reason, and paste the
-     exact command plus what you observed for each required tier.
-
-     No runtime behavior: delete the tier table and three evidence checkboxes.
-     Replace them with one explanation and the scoped checks you ran:
-
-     This change does not alter runtime behavior because <reason>.
-     Scoped verification: `<command>` - <observed outcome>.
-
-     Documentation and ADR changes are not automatically exempt. If they alter
-     runtime behavior, use the behavior-bearing path. See "E2E verification is
-     mandatory" in AGENTS.md.
-
+<!-- State what you ran locally, with commands and observed outcomes.
+     Include any live or external proof CI cannot produce.
+     CI tier results are read from CI, not restated here.
      A change that reaches runner MCP catalog projection, unscoped PreToolUse,
      in-process platform MCP tools, workspace publication, or
      built-in coding-tool session capability must record live-provider plus
-     external-integration evidence, or leave those required-tier rows open.
-     "No model routing change" is not a valid n/a reason. Fake-model kind,
-     skill ladder, and helper-only tests are not sufficient. -->
+     external-integration evidence, or leave that proof open.
+     "No model routing change" is not a valid n/a reason.
+     Test at the cheapest boundary that proves the changed contract;
+     a higher tier needs a failure mode the lower tier cannot see. -->
 
-| Tier | Required / n/a | Reason | Mode (fake / live) | Command and observed outcome |
-| --- | --- | --- | --- | --- |
-| skill | | | | |
-| local | | | | |
-| local-release | | | | |
-| cluster | | | | |
-| live provider | | | | |
-| external integration | | | | |
+Local checks:
 
-- [ ] Every required tier above names its exact command, the commit it ran
-      against, the mode it ran in, and the literal outcome observed.
-- [ ] Each meaningful acceptance criterion has positive proof plus a falsifiable
-      negative or a second independent path.
-- [ ] No required tier is left unproved; any blocked tier names its blocker in
-      the table.
+Live or external proof CI cannot produce:
 
 ## Checklist
 
-- [ ] Tests pass for the area I touched (see CONTRIBUTING.md for the commands).
-- [ ] Docs updated if behavior changed.
-- [ ] An ADR is added under `docs/adr/` if this is an architectural decision.
+1. [ ] Tests pass for the area I touched (see CONTRIBUTING.md for the commands).
+1. [ ] Docs updated if behavior changed.
+1. [ ] An ADR is added under `docs/adr/` if this is an architectural decision.
+1. [ ] Reviewed the public title, body, commits, branch name, links, and attachments for customer and downstream information; used anonymous roles and placeholders throughout.

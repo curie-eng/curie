@@ -31,6 +31,7 @@ import json
 import logging
 import os
 import re
+import ssl
 import time
 from collections.abc import AsyncIterator, Mapping
 from contextlib import asynccontextmanager
@@ -39,11 +40,17 @@ from pathlib import Path
 from typing import Any
 
 import anyio
+import httpx2
+from curie_internal.connector_endpoints import CA_FILE_ENV
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.sse import sse_client
 from mcp.client.stdio import stdio_client
 from mcp.client.streamable_http import streamable_http_client
-from mcp.shared._httpx_utils import create_mcp_http_client
+from mcp.shared._httpx_utils import (
+    MCP_DEFAULT_SSE_READ_TIMEOUT,
+    MCP_DEFAULT_TIMEOUT,
+    create_mcp_http_client,
+)
 from mcp.shared.exceptions import MCPError
 from mcp.shared.tool_name_validation import validate_tool_name
 from mcp.types import PaginatedRequestParams
@@ -133,9 +140,10 @@ def _probe_error_leaves(exc: BaseException) -> tuple[BaseException, ...]:
 
 @dataclass(frozen=True)
 class ConnectorCapabilityFailure:
-    """A declared-connector capability/auth failure safe to show a caller (#2519).
+    """A declared-connector capability/auth failure with two representations (#2519).
 
-    Names the connector and the credential env var. Never carries a secret
+    Diagnostic text names the connector and credential env var; caller text
+    explains the unavailable service without internal identifiers. Never carries a secret
     value: diagnosis keys on placeholder presence versus env emptiness, and
     probe exceptions are mapped to ``probe_failed`` without ``str(exc)``.
 
@@ -153,7 +161,33 @@ class ConnectorCapabilityFailure:
     refusal: str | None = None
 
     def caller_message(self) -> str:
-        """The exact sentence the message caller sees. Values never appear."""
+        """Plain feedback based only on the observed failure category."""
+
+        if self.reason == "caller_refused":
+            return (
+                "Connected service access was refused. Ask an administrator to "
+                "check access permissions before trying again."
+            )
+        if self.reason in ("empty_expansion", "missing_credential"):
+            return (
+                "Connected service features are unavailable because sign-in settings "
+                "are missing or empty. Ask an administrator to check the connection settings."
+            )
+        if self.reason == "probe_misconfigured":
+            return (
+                "Connected service features are unavailable because the connection "
+                "settings or supported actions are invalid. Ask an administrator to "
+                "check the connection settings."
+            )
+        attempts = f" after {self.attempts} attempts" if self.attempts > 1 else ""
+        return (
+            "Connected service features are unavailable: "
+            f"the connection could not be completed{attempts}. "
+            "Try again later. If this continues, ask an administrator to check the connection."
+        )
+
+    def diagnostic_message(self) -> str:
+        """Technical diagnosis for logs; credential values never appear."""
 
         names = ", ".join(self.credential_names)
         if self.reason == "caller_refused":
@@ -355,14 +389,42 @@ def _bundle_server_configs(
     return configs
 
 
+def _hosted_http_client(
+    headers: dict[str, str] | None = None,
+    timeout: httpx2.Timeout | None = None,
+    auth: httpx2.Auth | None = None,
+) -> httpx2.AsyncClient:
+    context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+    paths = ssl.get_default_verify_paths()
+    context.load_verify_locations(
+        cafile=paths.openssl_cafile if Path(paths.openssl_cafile).is_file() else None,
+        capath=paths.openssl_capath if Path(paths.openssl_capath).is_dir() else None,
+    )
+    if ca_file := os.environ.get(CA_FILE_ENV):
+        if not Path(ca_file).is_absolute():
+            raise _ProbeConfigurationError("hosted connector CA file must be absolute")
+        context.load_verify_locations(cafile=ca_file)
+    return httpx2.AsyncClient(
+        headers=headers,
+        auth=auth,
+        verify=context,
+        trust_env=False,
+        timeout=timeout or httpx2.Timeout(MCP_DEFAULT_TIMEOUT, read=MCP_DEFAULT_SSE_READ_TIMEOUT),
+    )
+
+
 @asynccontextmanager
-async def _server_streams(
+async def server_streams(
     config: Mapping[str, Any],
     *,
     plugin_dir: Path | None,
     inherited_env: Mapping[str, str],
 ) -> AsyncIterator[tuple[Any, Any]]:
-    """Open one stdio, SSE, or streamable-HTTP MCP transport."""
+    """Open one stdio, SSE, or streamable-HTTP MCP transport.
+
+    @spec ACTION-EXECUTOR-6: the standalone client the boot probe dials, public
+    so the executor route opens each connector session the same way.
+    """
 
     interpolation_env = dict(inherited_env)
     if plugin_dir is not None:
@@ -408,15 +470,23 @@ async def _server_streams(
         if isinstance(raw_headers, Mapping)
         else None
     )
+    hosted = any(name.lower() == "x-curie-caller" for name in (headers or {}))
+    client_factory = _hosted_http_client if hosted else create_mcp_http_client
     if config.get("type") == "sse":
-        async with sse_client(expanded_url, headers=headers) as streams:
+        async with sse_client(
+            expanded_url, headers=headers, httpx_client_factory=client_factory
+        ) as streams:
             yield streams
         return
 
-    async with create_mcp_http_client(headers=headers) as http_client:
+    async with client_factory(headers=headers) as http_client:
         async with streamable_http_client(expanded_url, http_client=http_client) as streams:
             read_stream, write_stream = streams
             yield read_stream, write_stream
+
+
+# The probe dials through this module name, which existing tests replace.
+_server_streams = server_streams
 
 
 async def _probe_server_once(
@@ -645,7 +715,7 @@ async def probe_mcp_tool_capability(
                         reason="probe_misconfigured",
                     )
                 )
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001 - existing broad catch retained
             failures.append(name)
             logger.warning(
                 "MCP tool-capability probe failed server=%s; keeping approval tool: %s",

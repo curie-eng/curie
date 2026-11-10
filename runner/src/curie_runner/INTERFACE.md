@@ -37,6 +37,30 @@ names. The keys are walked in declared order and the first that is both set and
 non-empty wins; a present-but-empty key is skipped, never wins. Unset or empty
 defaults to `CURIE_CREDENTIALS`, the single hardcoded name read before this.
 
+### `CURIE_MODEL_AUTH_MODE` (input)
+
+Selects who authenticates model work: exactly `service` or `personal`. Unset
+means `service`, which is every rule on this page. Any other present value,
+including the empty string, raises `InvalidAuthModeError` before the CLI starts.
+`personal` is checked right after the wire-protocol gate: `resolve_sdk_env`
+returns no override and maps nothing, so this seam's base URL override and
+`CURIE_CREDENTIALS` mapping never apply, and the owner's `CLAUDE_CODE_OAUTH_TOKEN`
+is the only grant. From the `CLAUDE_*` and `ANTHROPIC_*` namespaces the CLI
+parent env then keeps only model selection, `CLAUDE_CODE_SHELL`,
+`CLAUDE_CODE_DISABLE_TERMINAL_TITLE`, `CLAUDE_CODE_MAX_OUTPUT_TOKENS` and
+`CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC`. Every other name there is removed,
+including `CLAUDE_SECURESTORAGE_CONFIG_DIR` and subagent model forcing
+(`CLAUDE_CODE_SUBAGENT_MODEL`, `CLAUDE_CODE_SUBAGENT_MODEL_FORCE`,
+`CLAUDE_CODE_WORKFLOW_SUBAGENT_MODEL`), so reviewer roles keep the configured
+reviewer model. Workspace settings `env` may set no name from those namespaces
+and workspace `availableModels` and `fallbackModel` are refused; managed
+settings `env` may set only the kept `CLAUDE_*` names from them, a managed
+`availableModels` must list both the implementer and the reviewer model,
+managed `modelOverrides` and `deniedModels` must be absent or empty, and managed
+`fallbackModel` and `policyHelpers` must be absent. The personal policy lives in
+`personal_auth.py` (#5373, ADR 0268); see the runner README, "Personal
+subscription mode".
+
 ### `ANTHROPIC_API_KEY` (output, set by the runner)
 
 A NON-EMPTY no-op placeholder (`not-needed`, the `NO_OP_API_KEY` constant).

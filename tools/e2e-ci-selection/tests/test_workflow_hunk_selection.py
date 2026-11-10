@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import importlib.util
+import json
 import os
 import subprocess
 import sys
@@ -10,6 +11,7 @@ from pathlib import Path
 from types import ModuleType
 
 import pytest
+import yaml
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
 SELECTOR = REPO_ROOT / "tools" / "e2e-ci-selection" / "select_tiers.py"
@@ -24,8 +26,8 @@ TARGETS = (
 JOBS = ("before", *TARGETS, "after")
 
 
-def _selector() -> ModuleType:
-    spec = importlib.util.spec_from_file_location("select_tiers_workflow_test", SELECTOR)
+def _load_module(name: str, path: Path) -> ModuleType:
+    spec = importlib.util.spec_from_file_location(name, path)
     assert spec is not None and spec.loader is not None
     module = importlib.util.module_from_spec(spec)
     sys.modules[spec.name] = module
@@ -33,7 +35,10 @@ def _selector() -> ModuleType:
     return module
 
 
-SELECTOR_MODULE = _selector()
+SELECTOR_MODULE = _load_module("select_tiers_workflow_test", SELECTOR)
+SELECTION_TESTS = _load_module(
+    "e2e_selection_workflow_test", Path(__file__).with_name("test_e2e_ci_selection.py")
+)
 
 
 def _git(repo: Path, *args: str) -> str:
@@ -44,7 +49,14 @@ def _git(repo: Path, *args: str) -> str:
 
 
 def _workflow(jobs: tuple[str, ...] = JOBS) -> str:
+    # Selection reads the candidate chart job even when the changed hunk is
+    # elsewhere. Keep its real steps in these otherwise minimal workflows.
+    chart_job = "e2e-cluster-chart-regressions"
+    chart = yaml.safe_load((REPO_ROOT / WORKFLOW_PATH).read_text())["jobs"][chart_job]
+    chart_text = yaml.safe_dump({chart_job: chart}, sort_keys=False)
     return "name: Example CI\njobs:\n" + "".join(
+        "  " + line for line in chart_text.splitlines(keepends=True)
+    ) + "".join(
         f"  {job}:\n    runs-on: ubuntu-latest\n    steps:\n"
         f"      - run: echo {job}\n"
         for job in jobs
@@ -94,11 +106,11 @@ def _invoke_selector(
 
 
 @pytest.mark.parametrize("target", TARGETS)
-def test_each_upgrade_job_edit_selects_full_upgrade(
+def test_each_upgrade_job_edit_selects_upgrade(
     git_repo: tuple[Path, str], target: str
 ) -> None:
     repo, base = git_repo
-    head = _commit_workflow(repo, _workflow().replace(f"echo {target}", "echo changed"))
+    head = _commit_workflow(repo, _workflow().replace(f"echo {target}\n", "echo changed\n"))
 
     assert SELECTOR_MODULE._changes_upgrade_workflow_jobs(base, head) is True
 
@@ -311,12 +323,13 @@ def test_aliased_upgrade_job_fails_closed(
 
 
 @pytest.mark.parametrize("omit_kind", (False, True), ids=("main", "next"))
-def test_relevant_workflow_edit_runs_full_upgrade_before_merge(
-    git_repo: tuple[Path, str], tmp_path: Path, omit_kind: bool
+@pytest.mark.parametrize("target", TARGETS)
+def test_relevant_workflow_edit_runs_upgrade_smoke_before_merge(
+    git_repo: tuple[Path, str], tmp_path: Path, omit_kind: bool, target: str
 ) -> None:
     repo, base = git_repo
     head = _commit_workflow(
-        repo, _workflow().replace("echo e2e-released-upgrade", "echo changed", 1)
+        repo, _workflow().replace(f"echo {target}\n", "echo changed\n", 1)
     )
     options = ("--base", base, "--head", head)
     if omit_kind:
@@ -326,8 +339,9 @@ def test_relevant_workflow_edit_runs_full_upgrade_before_merge(
 
     assert result.returncode == 0, result.stderr
     assert output["released_upgrade"] == "true"
-    assert output["released_upgrade_full"] == "true"
-    assert output["cluster"] == "false"
+    assert output["released_upgrade_full"] == "false"
+    assert output["cluster"] == str(not omit_kind).lower()
+    SELECTION_TESTS._assert_upgrade_smoke_shards(tmp_path, output)
 
 
 def test_unrelated_workflow_edit_keeps_upgrade_tier_off(
@@ -362,6 +376,9 @@ def test_ordinary_upgrade_code_edit_remains_smoke_only(
 
 
 def test_path_only_workflow_selection_has_no_hunks_to_select(tmp_path: Path) -> None:
+    workflow = tmp_path / WORKFLOW_PATH
+    workflow.parent.mkdir(parents=True)
+    workflow.write_text(_workflow(), encoding="utf-8")
     result, output = _invoke_selector(
         tmp_path, tmp_path, "--path", WORKFLOW_PATH.as_posix()
     )
@@ -385,3 +402,132 @@ def test_ordinary_next_pr_still_omits_kind(
     assert output["cluster"] == "false"
     assert output["released_upgrade"] == "false"
     assert output["released_upgrade_full"] == "false"
+
+
+@pytest.mark.parametrize(
+    "changed", [
+        "README.md", "cli/src/queue-example.rs", "apps/worker/src/queue_example.py",
+        "tools/factory-e2e/queue-example.py", "charts/curie/templates/queue-example.yaml",
+        "apps/api/migrations/versions/queue_example.py",
+    ],
+)
+@pytest.mark.parametrize("train", ["main", "next"])
+def test_merge_group_payload_selects_pr_tiers_and_full_pytest(
+    git_repo: tuple[Path, str], tmp_path: Path, changed: str, train: str,
+) -> None:
+    repo, base = git_repo
+    _git(repo, "branch", "-M", train)
+    _git(repo, "remote", "add", "origin", str(repo))
+    _git(repo, "checkout", "-qb", "candidate")
+    path = repo / changed
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("example\n")
+    _git(repo, "add", ".")
+    _git(repo, "commit", "-qm", "change")
+    head = _git(repo, "rev-parse", "HEAD")
+    # Payload schema: https://docs.github.com/en/webhooks/webhook-events-and-payloads#merge_group
+    payload = {"action": "checks_requested", "merge_group": {
+        "base_sha": base, "head_sha": head, "base_ref": f"refs/heads/{train}",
+        "head_ref": f"refs/heads/gh-readonly-queue/{train}/pr-1-{head}",
+    }}
+    workflow = yaml.safe_load((REPO_ROOT / WORKFLOW_PATH).read_text())
+    script = next(step["run"] for step in workflow["jobs"]["changes"]["steps"]
+                  if step.get("id") == "filter")
+    selections = []
+    for event in ("pull_request", "merge_group"):
+        rendered = script
+        for expression, value in {
+            "github.event_name": event,
+            "github.base_ref": train if event == "pull_request" else "",
+            "github.event.merge_group.base_sha": payload["merge_group"]["base_sha"],
+            "github.event.merge_group.head_sha": payload["merge_group"]["head_sha"],
+        }.items():
+            rendered = rendered.replace("${{ " + expression + " }}", value)
+        assert "${{" not in rendered
+        output = tmp_path / event
+        # Execute the workflow's command through the real selector and Git diff.
+        # The wrapper only replaces uv's dependency launcher and absolute paths.
+        rendered = rendered.replace("tools/e2e-ci-selection/select_tiers.py", str(SELECTOR))
+        rendered = rendered.replace(".github/e2e-selection.yaml", str(REGISTRY))
+        result = subprocess.run(
+            ["bash", "-e", "-c", 'uv() { shift 5; python3 "$@"; };\n' + rendered],
+            cwd=repo, env={**os.environ, "GITHUB_OUTPUT": str(output)},
+            capture_output=True, text=True,
+        )
+        assert result.returncode == 0, result.stdout + result.stderr
+        selections.append(dict(line.split("=", 1) for line in output.read_text().splitlines()))
+    pull_request, outputs = selections
+    # Every tier matches the pull request's selection for the same diff.
+    tiers = {key for key in pull_request if not key.startswith("pytest")}
+    assert {key: outputs[key] for key in tiers} == {key: pull_request[key] for key in tiers}
+    # The queue is the deep lane: pytest runs whenever the pull request ran it,
+    # on the full scope and shard plan, never on the impact selection, so an
+    # impact-selection miss fails before main.
+    if pull_request["pytest"] == "true":
+        assert outputs["pytest"] == "true"
+    if outputs["pytest"] == "true":
+        assert outputs["pytest_scope"] == "full"
+        assert outputs["pytest_targets"] == ""
+        assert outputs["pytest_deselect"] == ""
+        assert (outputs["pytest_shards"], outputs["pytest_storage_shards"],
+                outputs["pytest_full_shards"]) == ("6", "6", "6")
+    if changed == "tools/factory-e2e/queue-example.py":
+        assert outputs["factory"] == outputs["cluster"] == "true"
+    if changed in {
+        "charts/curie/templates/queue-example.yaml",
+        "apps/api/migrations/versions/queue_example.py",
+    }:
+        assert "failed-first-install-retry" in json.loads(outputs["chart_scenarios"])
+
+
+@pytest.mark.parametrize(
+    "changed", ["README.md", "cli/src/queue-example.rs", "apps/docker-daemon/src/queue-example.rs"],
+)
+@pytest.mark.parametrize("job_id", ["rust-select", "image-proofs"])
+def test_queue_subselectors_use_the_same_paths_as_pr(
+    git_repo: tuple[Path, str], tmp_path: Path, changed: str, job_id: str,
+) -> None:
+    repo, _ = git_repo
+    patterns = repo / ".github/rust-test-paths.txt"
+    patterns.write_text((REPO_ROOT / ".github/rust-test-paths.txt").read_text())
+    _git(repo, "add", ".")
+    _git(repo, "commit", "-qm", "patterns")
+    base = _git(repo, "rev-parse", "HEAD")
+    _git(repo, "branch", "-M", "main")
+    _git(repo, "remote", "add", "origin", str(repo))
+    _git(repo, "checkout", "-qb", "candidate")
+    path = repo / changed
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("example\n")
+    _git(repo, "add", ".")
+    _git(repo, "commit", "-qm", "change")
+    head = _git(repo, "rev-parse", "HEAD")
+    jobs = yaml.safe_load((REPO_ROOT / WORKFLOW_PATH).read_text())["jobs"]
+    step_id = "select" if job_id == "rust-select" else "scope"
+    step = next(step for step in jobs[job_id]["steps"] if step.get("id") == step_id)
+    selections = []
+    for event in ("pull_request", "merge_group"):
+        values = {
+            "github.event_name": event,
+            "github.base_ref": "main" if event == "pull_request" else "",
+            "github.event.merge_group.base_sha": base, "github.event.merge_group.head_sha": head,
+            "needs.changes.outputs.version_only": "false",
+        }
+        environment = dict(os.environ)
+        for key, expression in step["env"].items():
+            for name, value in values.items():
+                expression = expression.replace("${{ " + name + " }}", value)
+            assert "${{" not in expression
+            environment[key] = expression
+        output = tmp_path / event
+        environment.update(GITHUB_OUTPUT=str(output), RUNNER_TEMP=str(tmp_path))
+        result = subprocess.run(["bash", "-e", "-c", step["run"]], cwd=repo,
+                                env=environment, capture_output=True, text=True)
+        assert result.returncode == 0, result.stdout + result.stderr
+        selections.append(output.read_text())
+        if event == "pull_request":
+            # The merge-group route must use its payload bounds, even if HEAD moves.
+            (repo / ".github/workflows/ci.yaml").write_text("later checkout\n")
+            _git(repo, "add", ".")
+            _git(repo, "commit", "-qm", "outside group")
+    assert selections[0] == selections[1]

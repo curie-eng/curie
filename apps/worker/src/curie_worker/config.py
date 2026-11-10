@@ -1,7 +1,7 @@
 """Typed configuration for the worker kernel, read from the environment.
 
 The kernel needs a Valkey connection (the stream it consumes plus its locks and
-markers), a Slack bot token (to edit the placeholder in place), the stream and
+markers), a gateway caller credential (to edit the placeholder in place), the stream and
 consumer-group identity, and the tunables for retry, per-thread locking, and
 crash-recovery reclaim. Substrate wiring (namespace, warm pool, runner port)
 lives in ``SubstrateConfig`` and is assembled separately by the entrypoint.
@@ -18,8 +18,7 @@ from __future__ import annotations
 import json
 import os
 import socket
-from typing import Annotated, Any
-from urllib.parse import urlsplit, urlunsplit
+from typing import Annotated, Any, Literal
 
 from aci_protocol.service_config import (
     API_KEY_ENV,
@@ -38,6 +37,10 @@ from aci_protocol.service_config import (
     warn_if_deprecated_api_url_env,
 )
 from aci_protocol.slack_identities import SLACK_IDENTITIES_ENV, SlackIdentities
+from curie_channel_gateway.token_custody import refuse_slack_tokens
+from curie_internal import keyspace
+from curie_internal.connector_endpoints import StaticConnectorEndpoints, parse_endpoint_json
+from curie_upgrade_pause import authoritative_key, legacy_key
 from pydantic import AliasChoices, BeforeValidator, Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 from pydantic_settings.sources import (
@@ -47,15 +50,6 @@ from pydantic_settings.sources import (
 from . import caller_token
 from .publication_validation import normalize_protected_publication_paths
 from .receipt import TurnReceiptMode
-
-
-def github_html_base(api_url: str) -> str:
-    """Derive the forge HTML base from its configured REST API base."""
-
-    parsed = urlsplit(api_url.rstrip("/"))
-    authority = "github.com" if parsed.netloc == "api.github.com" else parsed.netloc
-    path = parsed.path.removesuffix("/api/v3")
-    return urlunsplit((parsed.scheme, authority, path, "", ""))
 
 
 def _default_consumer_name() -> str:
@@ -174,9 +168,9 @@ PublicationProtectedPaths = Annotated[
 ]
 
 # Upper bound for CURIE_DELIVERY_BUDGET_S and CURIE_RUNNER_TOTAL_TIMEOUT_S:
-# three hours, so a long factory run fits one delivery (#3071, ADR-0171). The
+# twelve hours, so a long factory run fits one delivery (#3071, ADR-0171, #5067). The
 # chart schema carries the same maximum.
-MAX_DELIVERY_BUDGET_S = 10800.0
+MAX_DELIVERY_BUDGET_S = 43200.0
 
 
 class CallerSigningKeyError(RuntimeError):
@@ -226,21 +220,26 @@ class WorkerConfig(BaseSettings):
     valkey_tls: bool = False
 
     # Slack
-    slack_bot_token: str = ""
-    # The Slack identities the chart declares (ADR-0168 decision 1). Parsed
-    # here so a malformed declaration refuses boot; `slack_tokens` reads each
-    # one's bot token for its replies and file downloads (decision 5).
-    slack_identities: SlackIdentities = Field(default=(), validation_alias=SLACK_IDENTITIES_ENV)
-    # The worker's DEFAULT Slack Web API base URL: the endpoint used to finalize a
-    # turn whose reply handle carries no per-turn endpoint (issue #19). Unset = the
-    # real Slack API. A turn that carries its own reply endpoint (e.g. a CLI stub)
-    # overrides this per turn, so a real workspace and a no-Slack CLI stub can
-    # coexist on one worker instead of contending for this single setting.
-    slack_api_base_url: str = ""
+    channel_gateway_url: str = Field(default="", validation_alias="CURIE_CHANNEL_GATEWAY_URL")
+    channel_gateway_token: str = Field(
+        default="", validation_alias="CURIE_CHANNEL_GATEWAY_TOKEN", repr=False
+    )
+    channel_gateway_allow_insecure: bool = Field(
+        default=False, validation_alias="CURIE_CHANNEL_GATEWAY_ALLOW_INSECURE"
+    )
 
+    @model_validator(mode="before")
+    @classmethod
+    def _refuse_slack_credentials(cls, values: object) -> object:
+        return refuse_slack_tokens(values)
+
+    # The Slack identities the chart declares (ADR-0168 decision 1). Parsed
+    # here so a malformed declaration refuses boot. The gateway holds tokens
+    # and routes replies and downloads by these names (decision 5).
+    slack_identities: SlackIdentities = Field(default=(), validation_alias=SLACK_IDENTITIES_ENV)
     # ADDITIONAL Slack origins a per-turn reply endpoint may name (ADR-0096
     # D4.4), comma-separated. Empty by default, which leaves the configured
-    # ``slack_api_base_url`` (or real Slack) as the only trusted origin. This
+    # gateway's default origin (or real Slack) as the only trusted origin. This
     # exists for the dev/CLI stub: `local message` advertises
     # ``host.docker.internal`` and `cluster message` a routable host, neither of
     # which the single default base URL can also name, so the origin pin would
@@ -322,6 +321,10 @@ class WorkerConfig(BaseSettings):
     # scope that names a Service which cannot exist.
     connector_release: str = Field(default="", validation_alias="CURIE_RELEASE")
     connector_namespace: str = Field(default="", validation_alias="CURIE_NAMESPACE")
+    connector_endpoints: Annotated[
+        StaticConnectorEndpoints | None, NoDecode, BeforeValidator(parse_endpoint_json)
+    ] = Field(default=None, validation_alias="CURIE_CONNECTOR_ENDPOINTS")
+    sandbox_substrate: str = Field(default="kubernetes", validation_alias="CURIE_SANDBOX_SUBSTRATE")
 
     # The Ed25519 seed that signs each sandbox's connector caller token
     # (ADR-0168 decision 7), standard base64. Empty mints no token. The chart
@@ -371,10 +374,10 @@ class WorkerConfig(BaseSettings):
     # would clear until Slack's own two-minute timeout.
     shimmer: Bool = Field(default=True, validation_alias=SHIMMER_ENV)
 
-    # When true, suppress intermediate placeholder edits while streaming so the
-    # placeholder gets exactly one chat.update (the final) -- rate-limit friendly
-    # and flicker-free; pair with the shimmer for liveness. Default false
-    # preserves live-edit streaming.
+    # Suppress nonterminal placeholder notices as well as provisional text.
+    # Assistant TextDelta frames are internal diagnostics in every mode; the
+    # terminal answer is delivered through the completion outbox. The default
+    # still permits the booting caption and other platform lifecycle notices.
     slack_no_edit_streaming: Bool = Field(
         default=False, validation_alias="CURIE_SLACK_NO_EDIT_STREAMING"
     )
@@ -394,7 +397,7 @@ class WorkerConfig(BaseSettings):
     # Any other value refuses boot rather than falling back to a mode nobody
     # chose. It changes only what the person is shown, never what the action
     # ledger records or what the no-retry rule reads.
-    turn_receipt: TurnReceiptMode = Field(default="all", validation_alias="CURIE_TURN_RECEIPT")
+    turn_receipt: TurnReceiptMode = Field(default="off", validation_alias="CURIE_TURN_RECEIPT")
 
     # Whether deliberate progress (ADR 0130) reaches an adapter. Temporary: it
     # exists until the rendering change lands, and the chart does not set it.
@@ -488,6 +491,26 @@ class WorkerConfig(BaseSettings):
     )
 
     @model_validator(mode="after")
+    def _static_endpoints_exclude_action_executor(self) -> WorkerConfig:
+        if self.connector_endpoints is not None and self.action_executor_enabled:
+            raise ValueError("static connector endpoints do not support the action executor")
+        return self
+
+    @model_validator(mode="after")
+    def _remediation_requires_the_executor(self) -> WorkerConfig:
+        """Refuse remediation with the action executor off.
+
+        @spec AUTOMATED-REMEDIATION-1: compose cannot refuse the combination at
+        render, so the worker fails closed at boot, as the API does.
+        """
+        if self.remediation_enabled and not self.action_executor_enabled:
+            raise ValueError(
+                "CURIE_REMEDIATION_ENABLED=true requires CURIE_ACTION_EXECUTOR_ENABLED=true "
+                "(remediation.enabled requires actionExecutor.enabled)"
+            )
+        return self
+
+    @model_validator(mode="after")
     def _progress_render_needs_a_deliverer(self) -> WorkerConfig:
         """Refuse to start with progress rendering on (ADR 0130).
 
@@ -554,6 +577,62 @@ class WorkerConfig(BaseSettings):
                 "the reconciler would manage a parallel set under wrong names"
             )
         return self
+
+    @model_validator(mode="after")
+    def _executor_connector_reads_stand_alone(self) -> WorkerConfig:
+        """Refuse the executor's own connector reads where they cannot apply.
+
+        @spec ACTION-EXECUTOR-12 (as amended, #4800). Without the executor
+        nothing would read; with the reconciler on its reads already apply, so
+        the setting would claim a mode the worker is not in; and the
+        Deployment the executor reads is named from the namespace, release and
+        app name, so with any of them unset every read would miss and every
+        execution would refuse for a reason the operator cannot see.
+        """
+
+        if not self.action_executor_connector_reads:
+            return self
+        if not self.action_executor_enabled:
+            raise ValueError(
+                "CURIE_ACTION_EXECUTOR_CONNECTOR_READS=true requires "
+                "CURIE_ACTION_EXECUTOR_ENABLED=true"
+            )
+        if self.connector_reconcile_enabled:
+            raise ValueError(
+                "CURIE_ACTION_EXECUTOR_CONNECTOR_READS=true is for a worker with the "
+                "connector reconciler off; with CURIE_CONNECTOR_RECONCILE on the "
+                "executor already reads through it, so leave it unset"
+            )
+        missing = [
+            env
+            for env, value in (
+                ("CURIE_NAMESPACE", self.connector_namespace),
+                ("CURIE_RELEASE", self.connector_release),
+                ("CURIE_CONNECTOR_APP_NAME", self.connector_app_name),
+            )
+            if not value.strip()
+        ]
+        if missing:
+            raise ValueError(
+                f"CURIE_ACTION_EXECUTOR_CONNECTOR_READS is on but {', '.join(missing)} "
+                "is unset; the connector Deployment the executor reads is named "
+                "from these, so every read would miss"
+            )
+        return self
+
+    @property
+    def executor_reads_connectors(self) -> bool:
+        """Whether the executor and the digest recorder read connector Deployments.
+
+        @spec ACTION-EXECUTOR-12: with the executor on and either the connector
+        reconciler or the executor's own connector reads on. These are exactly
+        the configurations in which the chart grants the worker ``get`` on
+        Deployments.
+        """
+
+        return self.action_executor_enabled and (
+            self.connector_reconcile_enabled or self.action_executor_connector_reads
+        )
 
     @model_validator(mode="after")
     def _caller_signing_key_is_a_seed(self) -> WorkerConfig:
@@ -737,9 +816,18 @@ class WorkerConfig(BaseSettings):
     # stays safely under this 120s TTL; if you raise claim_timeout keep it below
     # this. A force-killed holder cannot renew (#2500); replacement steal uses
     # the consumer alive lease rather than waiting this TTL out.
-    lock_ttl_ms: int = 120000
-    lock_acquire_timeout_s: float = 45.0
-    lock_poll_interval_s: float = 0.02
+    #
+    # All three are strictly positive and finite (#3730): ``lock_ttl_ms`` goes
+    # straight into ``SET key token NX PX <ttl>``, which Valkey rejects for
+    # every non-positive value, so an unbounded field boots fine and then fails
+    # every per-thread lock acquire -- every turn -- instead of refusing the
+    # configuration at boot. A non-positive poll interval turns a contended
+    # acquire into a hot loop against Valkey, a non-positive acquire timeout
+    # gives up on every contended acquire immediately, and inf/nan breaks the
+    # timeout arithmetic the same way.
+    lock_ttl_ms: int = Field(default=120000, gt=0)
+    lock_acquire_timeout_s: float = Field(default=45.0, gt=0, allow_inf_nan=False)
+    lock_poll_interval_s: float = Field(default=0.02, gt=0, allow_inf_nan=False)
 
     # Retry (flag-clean failures only; see the no-retry-after-side-effects rule)
     max_attempts: int = Field(default=3, validation_alias="CURIE_MAX_ATTEMPTS")
@@ -830,12 +918,12 @@ class WorkerConfig(BaseSettings):
     # ``read_block_ms`` to avoid probing peers during ordinary read blocking.
     dead_consumer_idle_ms: int = Field(default=15000, ge=0)
     # Independent stream-consumer liveness. A capable worker publishes the
-    # short alive lease before it reads and refreshes it throughout graceful
+    # 45-second alive lease before it reads and refreshes it throughout graceful
     # in-flight drain. A replacement requires two absent observations separated
     # by a full heartbeat TTL before prompt claim, so neither consumer idle nor
     # one transient Redis read can manufacture process death.
     consumer_heartbeat_ttl_ms: int = Field(
-        default=15000,
+        default=45000,
         gt=0,
         validation_alias="CURIE_CONSUMER_HEARTBEAT_TTL_MS",
     )
@@ -876,7 +964,7 @@ class WorkerConfig(BaseSettings):
     # healthy long turn un-reclaimable and a dead owner's turn recoverable
     # after a bounded expiry, replacing the old dead pair of a flat HTTP
     # timeout and a 900s idle-based steal window. Both this budget and the
-    # per-request ceiling reach MAX_DELIVERY_BUDGET_S (three hours, #3071).
+    # per-request ceiling reach MAX_DELIVERY_BUDGET_S (twelve hours, #5067).
     delivery_budget_s: float = Field(
         default=600.0,
         ge=60.0,
@@ -893,6 +981,12 @@ class WorkerConfig(BaseSettings):
     )
     delivery_lease_ttl_s: float = Field(
         default=45.0, gt=0, validation_alias="CURIE_DELIVERY_LEASE_TTL_S"
+    )
+    abandoned_turn_grace_s: float = Field(
+        default=90.0,
+        gt=0,
+        allow_inf_nan=False,
+        validation_alias="CURIE_ABANDONED_TURN_GRACE_S",
     )
     delivery_lease_heartbeat_s: float = Field(
         default=10.0, gt=0, validation_alias="CURIE_DELIVERY_LEASE_HEARTBEAT_S"
@@ -1079,6 +1173,17 @@ class WorkerConfig(BaseSettings):
     workspace_max_concurrent_clones: int = Field(
         default=2, gt=0, validation_alias="CURIE_WORKSPACE_MAX_CONCURRENT_CLONES"
     )
+    # Recovery checkpoint objects (ADR 0251). Off by default; when on (which
+    # requires the internal worker token and managed workspaces), the worker
+    # captures a failed run's workspace before releasing its claim (#5143) and
+    # supervises the recovery object collector. Recovery never changes
+    # ``workspace_enabled`` or the claim coordinator.
+    workspace_recovery_enabled: bool = Field(
+        default=False, validation_alias="CURIE_WORKSPACE_RECOVERY_ENABLED"
+    )
+    workspace_recovery_collect_interval_s: float = Field(
+        default=30.0, gt=0, validation_alias="CURIE_WORKSPACE_RECOVERY_COLLECT_INTERVAL_S"
+    )
     # The inbound-attachment lane's resource envelope (#2567). These are the
     # operator's handles on ``AttachmentLimits``, whose own defaults these
     # literals mirror -- the chart templates the same three numbers into the
@@ -1099,6 +1204,25 @@ class WorkerConfig(BaseSettings):
     # charts/curie/values.yaml worker.attachments.enabled, which also gates the
     # sandbox half, and pinned by test_config.py.
     attachment_enabled: bool = Field(default=False, validation_alias="CURIE_ATTACHMENT_ENABLED")
+    attachment_mode: Literal["eager", "lazy"] = Field(
+        default="eager", validation_alias="CURIE_ATTACHMENT_MODE"
+    )
+    attachment_cache_size_bytes: int = Field(
+        default=512 * 1024 * 1024, gt=0, validation_alias="CURIE_ATTACHMENT_CACHE_SIZE_BYTES"
+    )
+    attachment_broker_host: str = Field(
+        default="127.0.0.1", validation_alias="CURIE_ATTACHMENT_BROKER_HOST"
+    )
+    attachment_broker_port: int = Field(
+        default=8093, gt=0, le=65535, validation_alias="CURIE_ATTACHMENT_BROKER_PORT"
+    )
+    attachment_broker_max_concurrent: int = Field(
+        default=8, gt=0, validation_alias="CURIE_ATTACHMENT_BROKER_MAX_CONCURRENT"
+    )
+    attachment_transfer_timeout_seconds: int = Field(
+        default=300, gt=0, validation_alias="CURIE_ATTACHMENT_TRANSFER_TIMEOUT_SECONDS"
+    )
+
     attachment_max_file_bytes: int = Field(
         default=32 * 1024 * 1024,
         gt=0,
@@ -1110,6 +1234,52 @@ class WorkerConfig(BaseSettings):
     attachment_retention_ttl_seconds: int = Field(
         default=3600, gt=0, validation_alias="CURIE_ATTACHMENT_RETENTION_TTL_SECONDS"
     )
+    # The per-thread budget (ADR 0205 decision 7): every boot rebuilds the
+    # thread's files, so one boot's work is bounded per thread, separately from
+    # the per-message cap. The file count may never be below one message's cap,
+    # because the current message's files are always kept whole. The byte
+    # budget must fit the sandbox's attachments volume; the chart checks that.
+    # The prepare timeout bounds the worker's own rebuild (ledger read, cache
+    # re-mint, channel re-fetch) inside the turn's remaining budget.
+    attachment_thread_max_files: int = Field(
+        default=20, gt=0, validation_alias="CURIE_ATTACHMENT_THREAD_MAX_FILES"
+    )
+    attachment_thread_max_bytes: int = Field(
+        default=256 * 1024 * 1024,
+        gt=0,
+        validation_alias="CURIE_ATTACHMENT_THREAD_MAX_BYTES",
+    )
+    attachment_thread_prepare_timeout_seconds: float = Field(
+        default=15.0, gt=0, validation_alias="CURIE_ATTACHMENT_THREAD_PREPARE_TIMEOUT_SECONDS"
+    )
+
+    @model_validator(mode="after")
+    def validate_workspace_recovery_capture(self) -> WorkerConfig:
+        # The terminal capture (#5143) authenticates its ledger calls with the
+        # worker token and reads the claim's trusted base, which only managed
+        # workspaces have. Refused before operation, not discovered per run.
+        if self.workspace_recovery_enabled:
+            if not self.internal_worker_token:
+                raise ValueError(
+                    "CURIE_WORKSPACE_RECOVERY_ENABLED requires CURIE_INTERNAL_WORKER_TOKEN"
+                )
+            if not self.workspace_enabled:
+                raise ValueError(
+                    "CURIE_WORKSPACE_RECOVERY_ENABLED requires CURIE_WORKSPACE_ENABLED"
+                )
+        return self
+
+    @model_validator(mode="after")
+    def validate_lazy_attachment_activation(self) -> WorkerConfig:
+        if self.attachment_enabled and self.attachment_mode == "lazy":
+            if self.fake_model:
+                raise ValueError(
+                    "lazy attachments require a real runner; fake-model runs stay offline"
+                )
+            if not self.internal_worker_token:
+                raise ValueError("lazy attachments require CURIE_INTERNAL_WORKER_TOKEN")
+        return self
+
     # Approval-gated publication runs only on the Kubernetes substrate. These
     # values shape the worker-owned Job; none are bundle inputs.
     publication_enabled: bool = Field(default=True, validation_alias="CURIE_PUBLICATION_ENABLED")
@@ -1147,20 +1317,38 @@ class WorkerConfig(BaseSettings):
         default=(),
         validation_alias="CURIE_PUBLICATION_PROTECTED_PATHS",
     )
+    publication_allow_dependency_additions: bool = Field(
+        default=False,
+        validation_alias="CURIE_PUBLICATION_ALLOW_DEPENDENCY_ADDITIONS",
+    )
+
+    @field_validator("attachment_thread_max_files")
+    @classmethod
+    def _thread_budget_holds_one_message(cls, value: int) -> int:
+        from .attachments import AttachmentLimits
+
+        per_message = AttachmentLimits().max_files
+        if value < per_message:
+            raise ValueError(
+                f"CURIE_ATTACHMENT_THREAD_MAX_FILES must be at least the per-message "
+                f"cap of {per_message}"
+            )
+        return value
 
     @field_validator("publication_protected_paths")
     @classmethod
     def _repository_relative_protected_paths(cls, value: tuple[str, ...]) -> tuple[str, ...]:
         return normalize_protected_publication_paths(value)
 
-    publication_github_api_url: str = Field(
-        default="https://api.github.com",
-        validation_alias="CURIE_PUBLICATION_GITHUB_API_URL",
+    # The path of the worker's own mounted copy of the operator's code host CA
+    # bundle (codeHostTrust.caBundle.configMapRef, ADR 0197). The publication
+    # Job runs in another namespace, so the worker copies this PEM into the
+    # Job's own ConfigMap and mounts it at the path the push credential's
+    # ``ca_bundle_ref`` names. The worker itself calls no code host. Empty
+    # means none.
+    publication_ca_bundle_path: str = Field(
+        default="", validation_alias="CURIE_CODE_HOST_CA_BUNDLE"
     )
-
-    @property
-    def publication_github_html_base(self) -> str:
-        return github_html_base(self.publication_github_api_url)
 
     publication_reconcile_interval_seconds: float = Field(
         default=2.0,
@@ -1259,6 +1447,43 @@ class WorkerConfig(BaseSettings):
     connector_reconcile_interval_s: float = Field(
         default=60.0, gt=0, validation_alias="CURIE_CONNECTOR_RECONCILE_INTERVAL_S"
     )
+    # The action executor switch (ACTION-EXECUTOR-1). The chart and compose
+    # render this one name into the API and the worker from one value, so the
+    # two cannot disagree. Off: the worker claims no execution, and the chart
+    # withholds the Role's `get` on Deployments the digest reads need.
+    action_executor_enabled: bool = Field(
+        default=False, validation_alias="CURIE_ACTION_EXECUTOR_ENABLED"
+    )
+    # The installation-wide executor sandbox cap (AUTOMATED-REMEDIATION-12,
+    # executor amendment E9), rendered from the same chart or compose value as
+    # the API's. The executor loop runs up to this many executions at once; the
+    # API's claim route, not this loop, is the authority over the count.
+    # The executor's own connector reads without the reconcile loop (#4800,
+    # ACTION-EXECUTOR-12 as amended). On, the worker reads the acting
+    # connector's Deployment by name and the in-force digest for the executor
+    # and the digest recorder exactly as it does with the reconciler on, while
+    # the reconcile loop stays off. The chart grants only `get` on Deployments
+    # for it. Off (the default), those reads follow CURIE_CONNECTOR_RECONCILE.
+    action_executor_connector_reads: bool = Field(
+        default=False, validation_alias="CURIE_ACTION_EXECUTOR_CONNECTOR_READS"
+    )
+    action_executor_max_concurrent_sandboxes: int = Field(
+        default=2, ge=1, validation_alias="CURIE_ACTION_EXECUTOR_MAX_CONCURRENT_SANDBOXES"
+    )
+    # The automated remediation switch (AUTOMATED-REMEDIATION-1), rendered from
+    # the same chart or compose value as the API's. It requires the executor.
+    remediation_enabled: bool = Field(default=False, validation_alias="CURIE_REMEDIATION_ENABLED")
+    # Factory Slack run progress (#5414). Enabled, the worker posts each factory
+    # run's owed progress to its agent's configured Slack channel. Nothing posts
+    # for an agent with no destination, so the default changes nothing. Off,
+    # this worker posts nothing; what is owed is derived from existing run
+    # records, so a worker with it on later still posts it.
+    factory_slack_progress_enabled: bool = Field(
+        default=True, validation_alias="CURIE_FACTORY_SLACK_PROGRESS_ENABLED"
+    )
+    factory_slack_interval_s: float = Field(
+        default=2.0, gt=0, validation_alias="CURIE_FACTORY_SLACK_INTERVAL_S"
+    )
     # The cron scheduler (ADR-0099, #268) is always on; this is only its tick.
     # A slot fires on the first tick at or after it, so the tick bounds lateness.
     cron_tick_interval_s: float = Field(
@@ -1269,8 +1494,10 @@ class WorkerConfig(BaseSettings):
         default=15.0, gt=0, validation_alias="CURIE_WORK_ITEM_ORPHAN_SWEEP_INTERVAL_S"
     )
     # Settled stream entries are trimmed once they are older than this window
-    # (ADR 0184). The floor sits above the three-hour delivery budget ceiling;
-    # the ceiling is the one year shared by the other seconds knobs.
+    # (ADR 0184). Trimming touches only settled entries, and the
+    # default day keeps the pass clear of any delivery still inside its budget
+    # (at most 43200 s). The ceiling is the one year shared by the other
+    # seconds knobs.
     stream_retention_min_age_s: int = Field(
         default=86400,
         ge=3600,
@@ -1292,6 +1519,29 @@ class WorkerConfig(BaseSettings):
     # chart's nameOverride, and it appears only in the pod selector the
     # NetworkPolicy matches on.
     connector_app_name: str = Field(default="", validation_alias="CURIE_CONNECTOR_APP_NAME")
+    # The end to end namespace reaper (#3245, ADR 0176 decision 4). The chart
+    # sets these from the same e2eConnector values the API reads, so the scope
+    # the reaper deletes in is the scope env_create creates in. It reads each
+    # agent's kubeconfig from its connector Secret, which needs the reconciler's
+    # Secret list grant, so run.py builds it only when the reconciler is on too.
+    e2e_reaper_enabled: bool = Field(default=False, validation_alias="CURIE_E2E_CONNECTOR_ENABLED")
+    e2e_namespace_prefix: str = Field(
+        default="curie-e2e-", validation_alias="CURIE_E2E_NAMESPACE_PREFIX"
+    )
+    e2e_owner_label_key: str = Field(
+        default="curietech.ai/e2e-owner", validation_alias="CURIE_E2E_OWNER_LABEL_KEY"
+    )
+    e2e_owner_label_value: str = Field(default="", validation_alias="CURIE_E2E_OWNER_LABEL_VALUE")
+    e2e_reaper_interval_s: float = Field(
+        default=60.0, gt=0, validation_alias="CURIE_E2E_REAPER_INTERVAL_S"
+    )
+    e2e_registry: str = Field(default="", validation_alias="CURIE_E2E_REGISTRY")
+    e2e_registry_insecure: bool = Field(
+        default=False, validation_alias="CURIE_E2E_REGISTRY_INSECURE"
+    )
+    e2e_registry_token_hosts: str = Field(
+        default="", validation_alias="CURIE_E2E_REGISTRY_TOKEN_HOSTS"
+    )
     report_max_attempts: int = 3
     report_backoff_base_s: float = Field(default=0.5, gt=0)
     # Langfuse for recording eval scores (the matrix reads them back by version).
@@ -1305,7 +1555,17 @@ class WorkerConfig(BaseSettings):
         default="/tmp/curie-worker.heartbeat",
         validation_alias=HEARTBEAT_FILE_ENV,
     )
-    heartbeat_interval_s: float = Field(default=10.0, validation_alias=HEARTBEAT_INTERVAL_ENV)
+    # Strictly positive and finite (#3726). The loop waits
+    # ``asyncio.wait_for(stop.wait(), timeout=interval_s)`` between touches, and
+    # a timeout of 0 or below expires at once, so the heartbeat would spin the
+    # event loop on file writes -- loading the very loop the heartbeat exists to
+    # watch. ``nan`` reaches the same end by making every timeout comparison
+    # meaningless, so it is refused alongside 0, negatives and infinities rather
+    # than clamped: an operator who asked for a broken cadence should learn at
+    # boot, not run a worker whose liveness signal is silently nonsense.
+    heartbeat_interval_s: float = Field(
+        default=10.0, gt=0, allow_inf_nan=False, validation_alias=HEARTBEAT_INTERVAL_ENV
+    )
 
     # Supervised in-process task restarts (#2637): exponential backoff from the
     # base up to the cap, and a task that crashes this many times in a row is
@@ -1324,7 +1584,10 @@ class WorkerConfig(BaseSettings):
         default=300.0, ge=0, validation_alias="CURIE_WORKER_SUPERVISE_FAILURE_RESET_S"
     )
 
-    key_prefix: str = "curie:worker"
+    key_prefix: str = keyspace.WORKER_KEY_PREFIX_DEFAULT
+    approval_pending_retention_enabled: bool = Field(
+        default=False, validation_alias="CURIE_APPROVAL_PENDING_RETENTION_ENABLED"
+    )
 
     @property
     def runner_facing_api_base_url(self) -> str:
@@ -1377,10 +1640,22 @@ class WorkerConfig(BaseSettings):
         return self.read_block_ms / 1000 + 5.0
 
     def done_key(self, event_id: str) -> str:
-        return f"{self.key_prefix}:done:{event_id}"
+        return keyspace.done_key(self.key_prefix, event_id)
+
+    def sweep_published_key(self, event_id: str) -> str:
+        # Set beside a sweep slice's successor XADD (ADR-0160, #2878). Unlike
+        # the completion record, an outbox clear never deletes it, so a retried
+        # publishing settle still recognizes its own earlier run.
+        return f"{self.key_prefix}:sweep-published:{event_id}"
 
     def side_effect_key(self, event_id: str) -> str:
         return f"{self.key_prefix}:sidefx:{event_id}"
+
+    def steering_sent_key(self, event_id: str) -> str:
+        # Set before a factory steering request is sent (#5414): from then on
+        # its admission may have committed with the answer lost, so no later
+        # attempt of the delivery may invite a resend.
+        return f"{self.key_prefix}:steering-sent:{event_id}"
 
     def delivery_lease_key(self, stream: str, group: str, entry_id: str) -> str:
         """The lease STRING key: the opaque owner token, TTL'd at
@@ -1404,11 +1679,14 @@ class WorkerConfig(BaseSettings):
         """
         return f"{self.key_prefix}:delivery:{stream}:{group}:{entry_id}"
 
+    def capacity_thread_order_key(self, thread_key: str) -> str:
+        return f"{self.key_prefix}:capacity_wait:thread:{thread_key}"
+
     def completion_key(self, event_id: str) -> str:
         # The durable outbox record for this event's ``turn.completed``. NO TTL:
         # a payload that expires under a longer-lived set membership is a
         # completion lost silently (EB-B6(f)).
-        return f"{self.key_prefix}:completion:{event_id}"
+        return keyspace.completion_key(self.key_prefix, event_id)
 
     def completions_pending_key(self) -> str:
         # The sweep index. A SET, not a SCAN over the keyspace: the maintenance
@@ -1416,10 +1694,33 @@ class WorkerConfig(BaseSettings):
         # would never reach a turn whose stream entry was already acked.
         return f"{self.key_prefix}:completions:pending"
 
+    def memory_steer_turns_key(self, agent_id: str, live_turn: str) -> str:
+        # The memory turn claims steered into one live runner turn (#3776),
+        # which the attempt owning that turn drains and closes when it ends.
+        # Keyed by the live turn, not the thread: the next turn on the thread
+        # can open before this one's owner has drained, and this owner must
+        # not close the steers that joined the next turn.
+        return f"{self.key_prefix}:memory-steer-turns:{agent_id}:{live_turn}"
+
+    def attachment_access_turn_key(self, thread_key: str) -> str:
+        return f"{self.key_prefix}:attachment-access:turn:{thread_key}"
+
+    def channel_read_turn_key(self, thread_key: str) -> str:
+        # The live channel read logical turn on one thread (ADR 0100, #2877):
+        # who opened it and what it is bound to, so a steer on any worker can
+        # renew it. Never a token. Deleted by its opener's owner only.
+        return f"{self.key_prefix}:channel-read-turn:{thread_key}"
+
+    def channel_read_pin_key(self, thread_key: str) -> str:
+        # The deployment a thread's sandbox claim was booted for (ADR 0100),
+        # so a retained sandbox mints against its own bundle's grant after a
+        # redeploy. Keyed by thread, naming the claim it describes.
+        return f"{self.key_prefix}:channel-read-pin:{thread_key}"
+
     def progress_key(self, progress_id: str) -> str:
         # One logical turn chain's progress record (ADR 0130); see the worker
         # README's "Deliberate progress" section for its fields and expiry.
-        return f"{self.key_prefix}:progress:{progress_id}"
+        return keyspace.progress_key(self.key_prefix, progress_id)
 
     def progress_delivery_key(self, delivery_id: str) -> str:
         # One pending progress delivery, keyed by its derived reply-wire id.
@@ -1438,22 +1739,15 @@ class WorkerConfig(BaseSettings):
         # The chain's inbox stream. The API appends to it under the same
         # KEY_PREFIX (its worker_key_prefix); the shape is frozen in
         # tests/vectors/turn-progress-capability.json.
-        return f"{self.key_prefix}:progress:inbox:{progress_id}"
+        return keyspace.inbox_key(self.key_prefix, progress_id)
 
     def progress_inbox_pending_key(self) -> str:
         # Durable discovery for commands accepted after a live pump stops or
         # while every worker is restarting.
-        return f"{self.key_prefix}:progress:inbox:pending"
+        return keyspace.inbox_pending_key(self.key_prefix)
 
     def upgrade_quiesce_key(self) -> str:
-        # One authoritative "stop taking new work" marker per Helm installation
-        # (#2374), shared by every replica in that installation. Standalone and
-        # Compose deliberately have a blank installation ID and retain the
-        # legacy release-wide key. Every marker is written with a finite TTL.
-        legacy_key = self.upgrade_legacy_quiesce_key()
-        if not self.installation_id:
-            return legacy_key
-        return f"{legacy_key}:{self.installation_id}"
+        return authoritative_key(self.key_prefix, self.installation_id)
 
     def upgrade_drain_success_key(self) -> str:
         """The record that this revision's drain finished cleanly (#3360).
@@ -1471,7 +1765,7 @@ class WorkerConfig(BaseSettings):
     def upgrade_legacy_quiesce_key(self) -> str:
         """The pre-#2374 global key used only by standalone or the bridge."""
 
-        return f"{self.key_prefix}:upgrade:quiesce"
+        return legacy_key(self.key_prefix)
 
     def lock_key(self, thread_key: str) -> str:
         return f"{self.key_prefix}:lock:{thread_key}"
@@ -1480,6 +1774,12 @@ class WorkerConfig(BaseSettings):
         # Where a posted approval card lives so its own resolution or expiry can
         # settle it without sharing identity with another approval on the thread.
         return f"{self.key_prefix}:approval-card:{approval_id}"
+
+    def approval_references_pending_key(self) -> str:
+        return f"{self.key_prefix}:approval-references:pending"
+
+    def approval_retention_key(self, approval_id: str) -> str:
+        return f"{self.key_prefix}:approval-retention:{approval_id}"
 
     def approval_notice_ref_key(self, approval_id: str) -> str:
         # The reply ref a placeholderless pending notice minted AFTER its approval
@@ -1530,3 +1830,11 @@ class WorkerConfig(BaseSettings):
         ``eval_stream`` and needs no self-targeting validator.
         """
         return f"{self.eval_stream}:dead"
+
+    def deploy_notice_stream_name(self) -> str:
+        """Match the API producer within this run stream and installation."""
+        base = f"{self.stream}:deploy-notices"
+        return f"{base}:{self.installation_id}" if self.installation_id else base
+
+    def deploy_notice_group_name(self) -> str:
+        return f"{self.consumer_group}-deploy-notices"

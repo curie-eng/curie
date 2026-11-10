@@ -3,6 +3,11 @@
 This is the agent Curie runs for a labelled GitHub issue. One issue goes in.
 One pull request, or one stated reason, comes out.
 
+Trying it for the first time? The
+[dark factory quickstart](../../docs/guides/dark-factory-quickstart.md) takes
+you from nothing to a pull request on a new repository with
+`curie factory quickstart`, polling intake and a local kind cluster.
+
 One agent does the work with one skill,
 [`skills/implement-issue/SKILL.md`](skills/implement-issue/SKILL.md), and two
 reviewer subagents check it on a stronger model. The skill walks nine phases:
@@ -13,12 +18,25 @@ reviewer subagents check it on a stronger model. The skill walks nine phases:
 3. `plan`: read the repository's own guidance, find its test commands, and
    write a plan.
 4. `plan_review`: [`agents/plan-reviewer.md`](agents/plan-reviewer.md)
-   approves the plan or sends it back to `plan`.
+   reviews the plan once. The review is advisory: `VERDICT: APPROVE` and
+   `VERDICT: CHANGES` both complete planning, and the findings of a `CHANGES`
+   carry into `failing_test` and `implement`.
 5. `failing_test`: write a failing test first where one is feasible.
 6. `implement`: make the smallest change and run the repository's own checks.
 7. `review_diff`: [`agents/diff-reviewer.md`](agents/diff-reviewer.md) reviews
-   the working diff against every criterion, and approves it or sends it back
-   to `implement` (never to `plan`).
+   the rendered candidate patch, the net change from the run's base commit
+   exactly as it will be published (committed, staged, unstaged and untracked
+   changes together), against every criterion, and approves it or sends it back
+   to `implement` (never to `plan`), for at most 5 completed rounds. The
+   candidate is built without running clean or process filter programs, so a
+   change to a path with a `filter` attribute is refused with a reason naming
+   that path. The gate records the patch file's sha256 when the review starts
+   and refuses the verdict when that file is missing or changed. The gate's
+   state file and the patch file are owned by the agent's user, so the gate is
+   not an OS isolation or authentication boundary: mode 0600 and the tree id
+   in the file name do not protect against that owner, and the digest check
+   catches a missing or persistently changed patch at verdict time but does
+   not defeat a transient replace and restore, or forged gate state.
 8. `publish`: publish one pull request, or end with `Could not complete:` and
    the reason.
 9. `wait_ci`: the pull request's checks run and the platform waits on them
@@ -29,17 +47,95 @@ reviewer subagents check it on a stronger model. The skill walks nine phases:
    successfully; an unreadable checks result or one that never settles ends
    it unverified or timed out instead.
 
-The skill budgets its own time against the platform's 10800 second (3 hour)
-execution bound and treats the issue text and repository files as untrusted data.
+The skill paces its work from `execution_deadline` and `execution_seconds`
+returned by the mandatory `mcp__curie__get_issue` read, and treats the issue
+text and repository files as untrusted data. The maximum execution duration is
+10800 seconds; an unconfigured execution deadline remains 1800 seconds.
+The review gate hook enforces the skill's round and wrap up cutoffs from the
+same two values (see "Review loops").
 Running the repository's tests is an instruction in this skill. The platform
 does not enforce it, and a different bundle can choose differently.
 
+## Inspect a pull request locally
+
+The companion `review-pr` skill runs in the human's existing coding agent.
+Install the local Software Factory skills with `curie factory skills install --agent codex`, or select
+`claude-code`, `copilot`, `gemini` or `cursor`. It explains components and calls,
+diff and behavior changes, new and regression tests, and guides local manual
+verification. It can publish approved feedback through existing host tools,
+request a configured factory revision and complete an explicitly approved merge.
+The [PR review guide](../../docs/guides/factory-pr-review.md) explains the workflow.
+The skill stays under `review/skills/`, outside this bundle's executable `skills/`
+tree, and adds no platform runtime or tracker integration.
+
+## Prepare a specification locally
+
+The factory bundle also distributes a text-only `prepare-factory-ticket` skill
+for your existing local coding agent. It inspects a repository, clarifies intent,
+and prepares a reviewed specification or proposed ticket set, with optional
+approved publication and configured-label factory selection. It requires no host Python,
+parser installation, Curie service or container runtime. Repository-specific
+verification uses the repository's own prerequisites and records any missing ones.
+
+Install directly with `curie factory skills install --agent codex`, or select
+`claude-code`, `copilot`, `gemini` or `cursor`. Add `--global` for personal use
+across repositories, or `--dir DIR` to choose an existing project directory.
+The command is offline and preserves existing local edits. The
+[preparation guide](../../docs/guides/factory-preparation.md)
+covers installation and invocation for supported clients and a plain-file
+fallback. A pre-existing CLI release will not gain new embedded files by selecting
+a newer deployment image; use a CLI built from this change or a release containing it.
+
+The installer copies only the human-facing skill folders. The root factory plugin's execution
+hooks require an implementation plan and are unsuitable for local draft authoring.
+The nested preparation skill is not registered as a factory execution skill.
+Its Markdown references stay inside the copied folder, so no Curie source checkout
+or Python package is needed to use it.
+
+## Prepare and maintain repository environments
+
+The same installer includes `factory-environment-setup` and
+`factory-environment-maintenance` from [`environment/skills/`](environment/skills/).
+These are local admin skills, outside the deployed factory execution skill.
+Setup examines the configured tracker issues, code-host pull or merge request
+history, verification commands and current repository runner before proposing
+an operator-owned runner spec. After admin review, it uses the existing
+`curie cluster factory --repo-runner` build and binding flow. Maintenance
+groups failed work items, distinguishes missing image tools from egress and
+other causes, and proposes targeted changes for review. An admin may schedule
+that local skill at a chosen cadence.
+
+Both skills follow the binding's actual GitHub, GitLab, Jira Cloud or Bitbucket
+Cloud/DC provider identities. The selected repository image carries its own
+tool manifest; its digest-pinned binding is operator configuration. Neither
+skill grants new sandbox egress or credentials.
+The [repository environment guide](../../docs/guides/factory-environments.md)
+walks through setup, review, deployment validation, and recurring maintenance.
+
+Deployment readiness stays `unvalidated`, including after developer review,
+publication and selection. After presenting the complete specification, the skill
+asks whether to publish only, publish and start the factory, or retain local drafts.
+It uses existing authenticated tracker tools, verifies the published body, then
+adds the confirmed factory label only to explicitly selected eligible issues.
+The evidence report remains local. Connected deployment validation and validated
+handoff remain #4488 and #4490; the skill does not implement the requested feature.
+Python packaging checks and managed behavior replays are contributor verification;
+they are not client installation requirements.
+
 ## Review loops
 
-Each loop (`plan` and `plan_review`, `implement` and `review_diff`, and
-`wait_ci` back to `implement`) runs at most 3 rounds. When a reviewer still asks for changes on round 3, or a review
-call fails, the run publishes nothing. It posts the reviewer's unresolved
-findings and open questions on the issue and ends with `Could not complete:`.
+The plan review runs once and is advisory. Either verdict opens the failing test.
+Carry every finding into implementation, resolve each blocking finding before
+the diff review, and include each finding and its resolution in that review prompt.
+
+The diff loop (`implement` and
+`review_diff`) runs at most 5 completed rounds, and `wait_ci` back to
+`implement` at most 3. A round counts only when the reviewer returns a
+verdict. When the diff reviewer still asks for changes on round 5, a reviewer
+stays unavailable, or the review gate stops the run, the run publishes
+nothing. It ends its reply with `Could not complete:` and the reviewer's
+unresolved findings and open questions, and the platform's status comment on
+the issue carries that result.
 
 A reviewer tags every finding `blocking` (the change would be incorrect or
 unverifiable, or misses a criterion) or `note` (an improvement that does not
@@ -51,18 +147,100 @@ approved. Notes never start another review round.
 
 [`hooks/review_gate.py`](hooks/review_gate.py) enforces this, because the main
 model does not follow the protocol reliably. It routes every sub-agent call to
-the right reviewer, strips `isolation` and `model`, forces
-`run_in_background: false`, refuses reviews out of order, counts rounds and
-applies the cap, stops the run on a reviewer reply without a verdict, and
-refuses `publish_changes` until the diff reviewer approves. It also writes the
-`plan_review` and `review_diff` phase lines, with the round, to the pod log.
+the right reviewer and refuses any other named `subagent_type`, strips
+`isolation` and `model`, forces `run_in_background: false`, and refuses
+reviews out of order. It counts a round only when a reviewer call completes
+with a verdict, so a refused admission, a call the runner refuses, or a reply
+without a verdict costs nothing; a reply without a verdict is reported as
+incomplete and may be retried. It refuses a second plan review, a diff review
+of a checkout the diff reviewer already approved, and a diff review of the
+exact checkout that last got `CHANGES` (no progress, so no round is spent),
+and it stops the run when the diff loop reaches its cap. A completed edit
+after a diff approval clears that approval. It refuses `publish_changes` until
+the diff reviewer approves the current checkout. It writes the `plan_review`
+and `review_diff` phase lines, with the round, to the pod log, along with
+`curie_gate` lines such as `review_refused` (its causes include `round_cap`,
+written when the diff loop reaches its cap), `review_incomplete`,
+`timing_recorded` and `timing_refused`. `report_progress` cannot record
+`implement` rounds 4 and 5 until #5203 is fixed, because the runner takes the
+`implement` cap from the `wait_ci` loop; the hook's own `review_diff` phase
+lines still record those rounds. The hook hands the agent and both reviewers
+the same verification contract,
+[`verification/contract.md`](verification/contract.md): the per-criterion
+verification table, when a check that needs an absent service may be delegated
+to a required pull request check, what always blocks, and the `VERIFICATION:`
+block each reviewer returns, which the hook records as a
+`curie_gate: verification_classified` line. When the bundle ships a
+`verification/checks.json`, both reviewers also get it after the contract.
+Without the contract no review runs.
 
-Both reviewers default to `anthropic/claude-opus-5.5`, served through the same
-OpenRouter key as the main loop. The Agent tool's own `model` argument only
-takes Claude aliases, so the per-deployment override is the `model:` line in
-each file under `agents/`: change it in the bundle you deploy. Opus 5.5 needs
-the runner's bundled Claude Code CLI 2.1.280 or later (claude-agent-sdk
-0.2.158 or later).
+The hook also enforces the time budget. It reads `execution_deadline` and
+`execution_seconds` from the `mcp__curie__get_issue` result, and refuses plan
+review, diff review, edits and publication until it has them. At or after
+`execution_deadline - execution_seconds/6` no plan review or new
+implementation round starts. At or after
+`execution_deadline - execution_seconds/12` no edit, Bash command or diff
+review runs, and every earlier Bash timeout is cut to the time left before
+then. That timeout bounds only how long the agent waits in the foreground: a
+command still running at its timeout keeps running in the background until the
+execution deadline ends the sandbox. A command whose exit status was not
+observed is unfinished, so its check is never reported as passed, it supports
+no verification claim, and nothing is published on it. A checkout
+the diff reviewer approved may still be published until the deadline. Every
+stop or refusal carries the unresolved reviewer findings the hook retained, so
+the final reply can list them; those findings never reach the pod log.
+
+A run continues across prompts. Its state is keyed by `CURIE_SESSION_ID`
+(else the hook's own session id) plus the workspace, the root of the checkout
+the prompt runs in, so every directory of one checkout names the same run. A
+later prompt in the same session and workspace keeps the spent
+rounds, the completed plan review, the findings and any stop, and a platform
+`wait_ci` message opens one new diff loop in it. A new session, or a prompt
+from another checkout, starts a fresh run.
+
+The same hook gates repository edits. `Edit`, `Write`, `MultiEdit` and
+`NotebookEdit` are refused until the `dark-factory:implement-issue` skill is
+loaded and the plan review returns its verdict. After that only test edits
+may run: an edit to a test file, or an edit to a source file that adds a test
+(an inline Rust `#[test]` module, a `def test_` function, and the like) beyond the
+ones the replaced text already held. The model writes the failing test (a
+test file, or an inline test that adds a test), runs it with Bash, then calls
+`report_progress` with phase `implement`, then edits source. When no test is
+feasible it reports `implement` directly and says why. That report is the one
+event that opens source edits; no Bash command does. The hook records evidence
+only: after a test edit it counts finished Bash commands and failed ones,
+never their text, and writes `test_edited`, `bash_after_test_edit` and
+`bash_failed_after_test_edit` on its `implement` phase line. It never claims
+a test ran. The hook fingerprints the checkout at the prompt and refuses the plan
+review verdict, stopping the run, if the checkout changed before it (for example
+through Bash). Its evidence lines share one `seq` counter per run:
+`curie_phase` lines carry `source: "hook"`, `curie_reported` lines record each
+`report_progress` call with the hook's last observed phase and `late: true`
+when the report trails it, and `curie_gate` lines record refusals.
+
+Both reviewers declare the `opus` alias. The runner resolves it to
+`claude-opus-5-5` for a direct Anthropic credential or
+`openai/gpt-6.1-sol` for an OpenRouter credential, using the same
+credential as the main loop. Pin a reviewer model with
+`curie cluster overrides dark-factory --reviewer-model <provider-model-id>`;
+`--clear-reviewer-model` restores the credential default without changing the
+bundle. The local overrides command accepts the same flags.
+
+The Helm overlay [`values.yaml`](values.yaml) caps every factory model request
+at 16000 output tokens through
+`agentSandbox.runnerEnv.dark-factory.CLAUDE_CODE_MAX_OUTPUT_TOKENS`.
+Apply it to the release before deploying this bundle. `curie factory quickstart`
+sets the same value for its selected agent, including an operator bundle that
+uses the platform runner. The setting belongs to the agent and applies to its
+repository runner templates too.
+Claude Code otherwise asks for up to 64000 output tokens per Opus request, and
+OpenRouter reserves credit for that whole ceiling, so a low balance refused
+every reviewer call. A verdict needs a few thousand tokens. Claude Code has no
+per-subagent ceiling, so the cap applies to the factory model's requests too.
+Plan on 5 USD of OpenRouter credit per run. Both the account balance and the
+key's own limit count, and the smaller one is what a run can spend. When
+OpenRouter refuses a reviewer call for credit (HTTP 402), the run ends with the
+out-of-credits cause and the review is not retried.
 
 ## What the bundle can reach
 
@@ -70,73 +248,133 @@ the runner's bundled Claude Code CLI 2.1.280 or later (claude-agent-sdk
   gives every session the built-in file tools. The sandbox has no general
   network access. The operator may allow package registry routes for locked
   dependency fetches, and the sandbox holds no push or publication credential.
-- **The issue.** `.mcp.json` declares the GitHub MCP server. This bundle's
-  `runner.Dockerfile` installs it in a runner layer that `connectors.yaml`
-  declares (ADR 0173). The platform runner does not carry it, so the layer
-  must be built with `curie build` before the deploy (below). The server is
-  authenticated with the bundle's own `GITHUB_PERSONAL_ACCESS_TOKEN`
-  (ADR 0145: reading the ticket is the bundle's job). The manifest's
-  `toolPolicy` allows `github/get_issue` and `github/add_issue_comment`.
-  The review gate hook refuses the comment tool except for one comment on
-  the run's own issue, after a failed or capped review, to post the
-  unresolved findings. Every other GitHub tool, including every other
-  write tool, is denied by the runner, and so is any tool the server adds
-  later.
+- **The issue.** The platform tool `mcp__curie__get_issue` (no arguments),
+  mounted for executions that have a WorkItem. The tool presents an
+  execution scoped capability the API minted for that execution. The API
+  checks that it names this execution and the WorkItem's issue, reads the
+  ticket through its tracker (a GitHub issue with the App installation token
+  minted fresh per read, so runs longer than one hour keep reading; a Jira
+  issue with the tracker's own credential), and returns it as markdown with
+  its comments, its link, the execution's absolute UTC `execution_deadline`
+  and total duration in seconds as `execution_seconds`. It stores nothing.
+  The sandbox holds no tracker credential at all.
+  A failed or capped review ends the reply with `Could not complete:` and the
+  unresolved findings, and the platform's factory status comment on the issue
+  carries that result.
 - **Publication.** The built-in `mcp__curie__publish_changes` tool. The platform
   captures the patch and publishes it from a separate trusted job. The agent
   never pushes.
 
-Give the bundle a narrow token: a fine-grained token (or a GitHub App
-installation token) limited to the factory repositories with **Issues: Read
-and write** and nothing else. Write is for the findings comment. With a
-read-only token a capped run still stops and states its findings in its final
-reply, but they do not reach the issue. That token is in the sandbox's
-environment, so any tool in the session can read it. The tool policy limits
-which GitHub MCP tools the agent can call; it does not hide the credential
-from other tools. The token scope is the real bound.
-
 ## Deploy it as the factory agent
 
-Enable factory intake first (see "Admitting a labelled GitHub issue" in
-[`docs/operations.md`](../../docs/operations.md)). Then:
+For a laptop trial on a small repository, follow the
+[quickstart](../../docs/guides/dark-factory-quickstart.md) instead; it needs
+none of the long run sizing below. This section is the production recipe for a
+repository the size of Curie itself.
+
+To try an unreleased commit from `next`, pass `--candidate` to quickstart.
+Replace the illustrative commit below with a published full 40 character
+lowercase hex commit from `next`. Only full commit tags are published, so
+branch names and short commits are refused.
 
 ```bash
-# The skill plans for a 3 hour run. The chart worker budget and runner ceiling
-# already default to 10800. The execution deadline still defaults to 1800, so
-# the required override is:
-#   curie cluster overrides dark-factory --execution-deadline 10800
-# The helm sets below pin those worker values explicitly. The chart raises the
-# worker termination grace with the budget. At this budget, the drain Job
-# publishes a minimum Helm timeout of 21900 seconds in its annotation.
+curie factory quickstart \
+  --candidate 0123456789abcdef0123456789abcdef01234567 \
+  --repo acme-corp/acme-bot --context <context> \
+  --namespace <namespace> --release <release> \
+  --app-id <app-id> --private-key-file ./app.pem
+```
+
+This works with a released CLI or a CLI built from source. Quickstart resolves
+all seven Curie images at `sha-<commit>` before any kubectl, Helm or GitHub call
+and refuses the install if any image is missing, naming each one. It installs
+those tags for the API, dispatcher, mail adapter, worker, UI and platform
+runner, clearing their chart digest overrides so the tags take effect on
+released charts too. It locks the dark factory runner layer and its base to
+the resolved digests. The chart still comes from the CLI's default or `--chart`.
+Add `--dry-run` to resolve the tags and print the candidate, image overrides
+and runner lock without installing.
+
+The rendered bundle comes from the CLI build; the candidate selects the
+published images. When adding an agent to an existing factory install without
+App flags, use a candidate that matches the images already installed. That
+path runs no `cluster up` and checks the runner base before binding the agent.
+
+Candidate image pins persist in Helm user values. Omitting `--candidate` or
+running `curie cluster upgrade` does not restore release images. Resetting
+only some image settings can leave mixed versions, including the retained
+mail adapter.
+
+For a disposable trial in a namespace created by quickstart, remove the trial
+installation and its data with the command below. Then use a released CLI to
+run quickstart without `--candidate` in a fresh namespace. This teardown is
+not a migration procedure for an installation whose data must be kept.
+
+```bash
+curie cluster down --context <context> --namespace <namespace> --release <release> --yes
+curie factory quickstart --repo acme-corp/acme-bot --context <context> \
+  --namespace <fresh-namespace> --release <release> \
+  --app-id <app-id> --private-key-file ./app.pem
+```
+
+Write the bundle out first. No clone of this repository is needed:
+
+```bash
+curie example dark-factory render --out ./dark-factory
+```
+
+A release CLI records the runner layer its release published (the repository
+toolchains, for linux/amd64 and linux/arm64) in `connectors.lock.yaml`, so the
+deploy below builds nothing. A CLI built from source has no published layer,
+says so, and names the `curie build` that builds one instead.
+
+Then enable the model and intake. This recipe selects the maximum execution
+duration of 10800 seconds. The chart worker budget and runner ceiling already
+default to 10800. The execution deadline remains 1800 seconds when unconfigured,
+so this recipe needs an override. The skill paces itself from the configured
+deadline returned by `get_issue`.
+
+```bash
+# The factory's default model: GLM 5.3 Flash through OpenRouter. The
+# credential comes from the environment, never argv.
+export CURIE_CREDENTIALS=<openrouter-api-key>
+curie cluster up --model z-ai/glm-5.3-flash --allow-egress-host openrouter
+
+# The helm sets pin the worker budget explicitly. The chart raises the worker
+# termination grace with the budget. At this budget, the drain Job publishes a
+# minimum Helm timeout of 21900 seconds in its annotation.
 helm upgrade curie <chart> -n curie --reuse-values \
   --timeout 21900s \
+  -f ./dark-factory/values.yaml \
   --set worker.deliveryBudgetSeconds=10800 \
   --set worker.runnerTotalTimeoutSeconds=10800
 curie cluster overrides dark-factory --execution-deadline 10800
 
-# The factory's default model: GLM 5.3 Flash through OpenRouter.
-helm upgrade curie <chart> -n curie --reuse-values \
-  --timeout 21900s \
-  --set agentSandbox.runner.fakeModel=false \
-  --set agentSandbox.runner.model=z-ai/glm-5.3-flash \
-  --set agentSandbox.runner.credentials=<openrouter-api-key>
+# Intake. On a release with no GitHub App, the first run prints a prefilled App
+# registration link (add --org <org> for an organization) and four manual
+# steps, and applies nothing. It never opens a browser. Click Create, copy the
+# App ID, generate a private key, and install the App on the repositories.
+# Polling is the default and needs no webhook URL or secret. Then rerun with
+# the App's details.
+curie cluster factory
 
-# Runner egress to the GitHub API for the MCP server, one entry per CIDR
-# from the "api" list at https://api.github.com/meta.
-helm upgrade curie <chart> -n curie --reuse-values \
-  --timeout 21900s \
-  --set 'agentSandbox.connectorEgress.dark-factory[0].cidr=<github-api-cidr>' \
-  --set 'agentSandbox.connectorEgress.dark-factory[0].ports[0].port=443' \
-  --set 'agentSandbox.connectorEgress.dark-factory[0].ports[0].protocol=TCP'
+# The rerun confirms the App with GET /app, takes the mention from its slug,
+# and checks each --repo (repeatable) against its installed repositories.
+# Use --all-installed-repos explicitly to allow the whole installation.
+# The label defaults to curie-factory and is created in each allowlisted
+# repository. The key goes into the Secret
+# curie-github-app (key privateKey) through kubectl stdin; a Secret that
+# holds another App's key is refused. Polling does not need a webhook secret.
+# Pass --webhook-secret-file (or CURIE_GITHUB_WEBHOOK_SECRET) only for webhook
+# mode. Before applying anything, the command checks the merged config
+# against the API boot gate and applies nothing if one value is missing. The
+# values survive a later `curie cluster up`.
+curie cluster factory \
+  --app-id <app-id> --private-key-file ./app.pem --intake poll \
+  --repo acme-corp/acme-bot
 
-# Build the runner layer that carries the repository toolchains and GitHub MCP
-# server. It records the layer digest in connectors.lock.yaml for deployment.
-curie build --plugin-dir examples/dark-factory --registry <registry-ref>
-
-export GITHUB_PERSONAL_ACCESS_TOKEN=<read-only token>
-curie cluster deploy --plugin-dir examples/dark-factory \
-  --agent dark-factory --env prod --repo acme-corp/acme-bot \
-  --secret GITHUB_PERSONAL_ACCESS_TOKEN
+curie cluster deploy --plugin-dir ./dark-factory \
+  --agent dark-factory --env prod --repo acme-corp/acme-bot
 # Illustrative USD cap for a run that can last 3 hours. Tune it for your model.
 curie cluster budget dark-factory --limit 100
 curie cluster surfaces dark-factory --add github=acme-corp/acme-bot
@@ -144,6 +382,41 @@ curie cluster surfaces dark-factory --add github=acme-corp/acme-bot
 # Optional. Human approval of each pull request stays the default.
 curie cluster publication-policy dark-factory --policy auto
 ```
+
+For a different agent name, change the `dark-factory` key in the rendered
+`values.yaml` before applying it. The overlay contains non-secret environment
+strings; quote every value. Environment names use uppercase letters, digits and
+underscores, starting with a letter or underscore. Agent names use lowercase
+DNS labels. The chart rejects reserved platform and credential
+names and names already supplied by the chart, connector secrets or global
+`agentSandbox.runner.extraEnv`. Agent `OTEL_*` entries are also refused because
+the chart derives telemetry egress from global configuration. Configure
+`otelCollector` or `agentSandbox.runner.extraEnv` for telemetry instead.
+
+`curie cluster factory --disable` turns intake off. See "Admitting a labelled
+GitHub issue" in [`docs/operations.md`](../../docs/operations.md) for what the
+gate requires.
+
+### On a laptop (kind)
+
+A kind cluster works for a single operator. It pulls the published runner
+layer from GHCR, so it needs no local registry.
+
+Polling needs no inbound GitHub connection. If you choose webhook mode,
+GitHub must reach the API. Start a port forward and a cloudflared quick tunnel
+to it:
+
+```bash
+kubectl --context kind-<name> -n curie port-forward svc/curie-api 8000:8000
+cloudflared tunnel --url http://localhost:8000
+```
+
+Set the App's webhook URL to `<tunnel>/github/webhook`, enable the webhook,
+and subscribe to Issues, Issue comment, Pull request review, and Pull request
+review comment. Pass `--intake webhook`, `--webhook-secret-file <path>` and
+`--card-base-url <tunnel>` to `curie cluster factory`. The port forward and
+tunnel both die when the laptop sleeps or the API restarts. Restart them and
+update the App webhook URL if the quick tunnel hostname changed.
 
 Before a production factory run resolves dependencies, provide an operator
 controlled registry mirror or terminating proxy. Configure uv, Cargo and pnpm
@@ -181,23 +454,34 @@ PyPI resolves package metadata through `pypi.org` and downloads artifacts from
 check redirects against its allowed upstream hosts. The `registryEgress` CIDR
 above points only to that proxy. NetworkPolicy matches IP addresses, not
 hostnames, and a shared CDN CIDR can also serve unrelated hosts. Direct CDN
-CIDRs are unsafe for factory runs carrying a GitHub token because dependency
-build scripts or other runner code could send it to an unrelated host on the
-same address range. If the proxy is unavailable, leave registry egress closed
-and report the locked installs as unavailable. The proxy narrows network access
-but does not hide the token from code in the runner. Verify the rendered policy
+CIDRs are unsafe for factory runs because dependency build scripts or other
+runner code could reach unrelated hosts on the same address range. If the
+proxy is unavailable, leave registry egress closed and report the locked
+installs as unavailable. Verify the rendered policy
 selects the `dark-factory` runner pods.
+
+If runs fetch a registry on some attempts and fail with `Failed to connect` on
+others, the `registryEgress` list covers only part of that host's addresses.
+`index.crates.io` resolves through Fastly to several rotating IPv4 addresses
+and IPv6 addresses in `2a04:4e42::/32`, and each fetch picks one. A CIDR that
+covers one of those addresses passes the runs that pick it and fails the rest.
+The factory reports this as `registry_egress_unreachable` with the addresses
+that connected and the ones that did not. Point `registryEgress` at the
+proxy's fixed address instead of the CDN.
 
 The platform runner already supplies Python 3.13 and Node 22. This bundle
 adds pinned uv, Rust and pnpm 9 for repositories with committed lockfiles. It
-does not bake repository dependencies into the image. After changing the
-toolchain layer or upgrading the platform runner, rebuild and redeploy:
+does not bake repository dependencies into the image. The published layer is
+built on the platform runner of the same release, so after upgrading Curie,
+render the bundle again with the upgraded CLI. After changing the toolchain
+layer, build it yourself into a registry your nodes can pull from; the build
+replaces the published entry in the lock:
 
 ```bash
-curie build --plugin-dir examples/dark-factory --registry <registry-ref>
-curie cluster deploy --plugin-dir examples/dark-factory \
-  --agent dark-factory --env prod --repo acme-corp/acme-bot \
-  --secret GITHUB_PERSONAL_ACCESS_TOKEN
+curie build --plugin-dir ./dark-factory --registry <registry-ref> \
+  --platform linux/amd64
+curie cluster deploy --plugin-dir ./dark-factory \
+  --agent dark-factory --env prod --repo acme-corp/acme-bot
 ```
 
 The build updates the layer digest, and the deploy selects that digest.
@@ -217,27 +501,12 @@ Cargo cache used 585 MiB, and UI modules used 223 MiB. After
 These are measured values for this checkout; other repositories and build
 profiles can need different amounts. The chart's default 1 GiB workspace,
 512 MiB home scratch, and 4 GiB runner ephemeral storage limit cannot hold this
-workload. Give the factory agent its own workspace ceiling with
-`agentSandbox.workspaceSizeLimits`, which applies to that agent's sandboxes
-only. Merge these values into the same Helm values file as the registry routes:
-
-```yaml
-agentSandbox:
-  workspaceSizeLimits:
-    dark-factory: 24Gi
-  runner:
-    hardening:
-      writablePathSizeLimit: 2Gi
-```
-
-The kubelet counts the workspace against the pod's `ephemeral-storage` limit
-too, so raise the factory agent's runner resources to match. This override
-applies to the `dark-factory` agent only:
-
-```bash
-curie cluster overrides dark-factory --runner-resources \
-  '{"requests":{"cpu":"500m","memory":"2Gi","ephemeral-storage":"16Gi"},"limits":{"cpu":"2","memory":"6Gi","ephemeral-storage":"28Gi"}}'
-```
+workload. The chart's `factory` resource profile is sized for it, and the
+`values.yaml` in this directory selects it for the `dark-factory` agent with
+`agentSandbox.agentResourceProfiles`. No per-key sizing recipe is needed. The
+profile gives that agent's sandboxes 8Gi of memory (request and limit), 2 CPU,
+10Gi to 20Gi of ephemeral storage, a 15Gi workspace, a 15Gi home volume and a
+4Gi tmp volume. Other agents keep the `standard` profile.
 
 With these settings, a sandbox running this layer built every `cli/` test
 target (`cargo test --locked --manifest-path cli/Cargo.toml --no-run`) in about
@@ -245,11 +514,31 @@ three minutes. The workspace peaked at 8.8 GiB and the build used the full 6 GiB
 of memory. With a 2 GiB memory limit, the same build was OOMKilled while
 linking.
 
-`writablePathSizeLimit` still applies to every sandbox runner in this Helm
-release. The larger home scratch holds the default uv, Cargo and pnpm caches;
-a run can instead put them under `/workspace`. Repeat the frozen installs and
-Rust build in a pod with these values, measure peak disk and memory use, and
-raise the limits if the completed build needs more room.
+The volume ceilings are independent upper bounds, and the 20Gi
+ephemeral-storage limit also caps their combined use, so a pod is evicted if any
+one volume passes its ceiling or the total passes 20Gi. The home volume holds
+the default uv, Cargo and pnpm caches; a run can instead put them under
+`/workspace`. Each factory sandbox requests 8Gi of memory, so the default
+`resourceQuota.hard.requestsMemory` of `8Gi` admits one at a time; raise
+`resourceQuota.hard.*` for concurrency. Sandboxes created before an upgrade keep
+the limits they started with.
+
+To change one field, override it on the profile in your Helm values. For
+example, to give the workspace 24Gi while keeping the rest of the profile:
+
+```yaml
+agentSandbox:
+  resourceProfiles:
+    factory:
+      workspaceSizeLimit: 24Gi
+```
+
+A per-agent `agentSandbox.workspaceSizeLimits.dark-factory` value takes
+precedence over the profile for the workspace only, and
+`curie cluster overrides dark-factory --runner-resources` still applies on top
+at claim time. Repeat the frozen installs and Rust build in a pod, measure peak
+disk and memory use, and raise the limits if the completed build needs more
+room.
 
 The $100 cap is an example for this three hour recipe. Tune it to the model
 and expected workload. The SDK applies it to each session; it does not meter

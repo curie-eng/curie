@@ -3,6 +3,8 @@
 Date: 2026-07-09
 Status: Accepted
 
+Partially superseded by [ADR 0194](0194-plugin-format-contract-is-the-frozen-schema-plus-a-parity-gate.md): the plugin-format code-generation clause.
+
 Retroactive record of the codegen mechanism behind the frozen contracts.
 ADR-0005 established that the ACI and plugin-format are frozen; this ADR records
 how that freeze is maintained across three languages and what it closes the door

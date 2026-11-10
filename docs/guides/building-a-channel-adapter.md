@@ -382,16 +382,23 @@ From [`apps/mail-adapter`](../../apps/mail-adapter):
   same thread before the first turn completes, and the first answer then lands on the
   wrong message or clear the second turn's text. Persist ownership at the same
   granularity as the target.
-- **Filtering inbound senders is not authenticating them.** Find out what your
-  provider already drops or withholds by default, ask for that filtering explicitly in
-  every request rather than inheriting it, so a changed provider default cannot widen
-  your install silently, and keep a cheap check on the provider's own verdict behind
-  that as defense in depth. An allow-list on a sender identifier the sender controls
-  (an email `From` header, a display name, a caller ID) sits on top of all three and
-  authenticates nobody: it is meaningful only where that identifier is independently
-  enforced, which for email means the sending domain publishing an enforcing DMARC
-  policy. [`apps/mail-adapter/README.md`](../../apps/mail-adapter/README.md) is the
-  worked version, with AgentMail's parameter names and the key permissions it needs.
+
+**Verify sender authentication before accepting a turn or approval answer.**
+An allowlist filters a claimed sender identifier and never authenticates it.
+Require a positive authentication verdict that your own code verifies. A
+provider label, the absence of a rejection label, or a provider supplied header
+cannot supply that verdict. If no verifiable verdict is available, refuse the
+message with a named reason before either platform endpoint is called. Keep
+provider result exclusions explicit as an additional filter. For email,
+AgentMail supplies no trusted positive aligned verdict, guarantees neither
+header provenance nor stripping, and permits DMARC failure under `p=none`;
+Curie refuses every message with `authentication_unverifiable`, including
+allowlisted senders and approval answers. A wildcard needs a separate boot opt
+in and never bypasses authentication. For another mail service, do not write a
+new email adapter: write a mail provider for `apps/mail-adapter` (ADR 0228, the
+[mail provider seam](../interfaces/mail-provider/INTERFACE.md)) and run its
+conformance kit. The provider evidence and complete gate
+contract are in [`apps/mail-adapter/README.md`](../../apps/mail-adapter/README.md).
 
 ## 7. Conformance floor
 
@@ -418,6 +425,33 @@ An adapter must:
    repeated `delivery_id` with the first attempt's result, and handle
    `progress` before any answer path so a progress body never changes answer
    text.
+
+### Running the floor
+
+The floor is executable. `channel_protocol.conformance`
+(`packages/channel-protocol/src/channel_protocol/conformance.py`) ships fourteen
+checks covering ingress normalization, reply delivery, edit and buffered streaming,
+attachments, approval cards, progress, and error mapping. Wrap your adapter in a
+`ChannelAdapterSubject` and declare its `Capabilities`: kind, streaming mode (edit,
+buffered, silent or relay), ingress, authenticates, refuses_foreign_targets and
+serves_attachments. Then run every check
+`packages/channel-protocol/src/channel_protocol/conformance.py::applicable_checks`
+returns for that declaration. A check your declaration does not cover is not
+returned, never skipped.
+
+```python
+for check in applicable_checks(subject.capabilities):
+    await check.run(subject, CheckContext(validate_turn=my_validator))
+```
+
+In this repository, the suite in `tests/channel_conformance/` runs every check
+against Discord, the mail adapter, GitHub and the worker's `HttpReplyAdapter`, each
+driven through the worker's real `ReplySinkRouter`. Adding an adapter is one `_Entry`
+(its declared `Capabilities` plus a factory that opens the subject) in the `_ENTRIES`
+table of `tests/channel_conformance/subjects.py`, which feeds the `REGISTRY` the
+tests parametrize over. If you build a third-party relay, drive your egress through
+the worker's `HttpReplyAdapter` so header names and statuses are proven across the
+real wire.
 
 ## Related
 

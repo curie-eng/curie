@@ -8,7 +8,7 @@ the caller.
 
 Required environment:
 
-CURIE_HOOK_APPROVAL_CONTEXT       k8 or kind-test-2765
+CURIE_HOOK_APPROVAL_CONTEXT       Explicit disposable Kubernetes context
 CURIE_NAMESPACE                   test-2765
 CURIE_RELEASE                     test-2765
 CURIE_BIN                         Path to the candidate curie binary
@@ -20,6 +20,8 @@ Required Helm values for the installed release:
 
 worker.slackApiBaseUrl: "http://127.0.0.1:1"
 worker.slackTrustedOrigins: ""
+channelGateway.deploy: true
+channelGateway.allowInsecure: true
 
 Build the receipt fixture from ``cli/scripts/fixtures/mcp-receipt/Dockerfile``
 with ``cli/scripts/fixtures/mcp-receipt`` as the Docker build context, import
@@ -28,12 +30,12 @@ through ``CURIE_HOOK_APPROVAL_RECEIPT_IMAGE``. The checked in fixture serves
 ``/mcp`` on port 8000, exposes ``receipt_read``, and writes the exact line
 ``MCP_RECEIPT tools/call`` for each accepted tool call.
 
-The worker must have no ``SLACK_BOT_TOKEN`` so no human Slack transport takes
+The gateway must have no ``SLACK_BOT_TOKEN`` so no human Slack transport takes
 part in the proof; preflight checks that condition. Slack acknowledges the
 ``TurnCompleted`` event without a transport call, so the proof requires the
 initial completion hash to be absent after the done marker appears.
 
-The agent binds the channel under the default identity. The worker's own Slack
+The agent binds the channel under the default identity. The gateway's own Slack
 origin is the refusing endpoint, so the initial stream fails loudly there, and
 the empty bot token never reaches a reachable Slack.
 
@@ -101,14 +103,14 @@ class ProofError(RuntimeError):
     pass
 
 
-def check_offline_slack_origin(worker_env: dict[str, Any]) -> None:
-    """The worker's own Slack origin is the refusing endpoint, and nothing else is trusted."""
-    origin = worker_env.get("SLACK_API_BASE_URL", {})
+def check_offline_slack_origin(gateway_env: dict[str, Any]) -> None:
+    """The gateway's Slack origin refuses connections, with no extra trusted origin."""
+    origin = gateway_env.get("SLACK_API_BASE_URL", {})
     if origin.get("value") != OFFLINE_ENDPOINT or "valueFrom" in origin:
         raise ProofError(
             "proof release must set worker.slackApiBaseUrl to the offline endpoint"
         )
-    trusted = worker_env.get("CURIE_SLACK_TRUSTED_ORIGINS")
+    trusted = gateway_env.get("CURIE_SLACK_TRUSTED_ORIGINS")
     if trusted is not None and (
         trusted.get("value") not in {None, ""} or "valueFrom" in trusted
     ):
@@ -182,8 +184,6 @@ class Proof:
             )
         except ValueError as exc:
             raise ProofError("CURIE_HOOK_APPROVAL_TIMEOUT_SECONDS must be an integer") from exc
-        if self.context not in {"k8", "kind-test-2765"}:
-            raise ProofError("proof context must be k8 or kind-test-2765")
         if self.namespace != "test-2765" or self.release != "test-2765":
             raise ProofError("proof namespace and release must both be test-2765")
         if not self.curie_bin.is_file() or not os.access(self.curie_bin, os.X_OK):
@@ -284,6 +284,7 @@ class Proof:
         for kind, name in (
             ("deployment", f"{self.release}-api"),
             ("deployment", f"{self.release}-worker"),
+            ("deployment", f"{self.release}-channel-gateway"),
             ("statefulset", f"{self.release}-postgres"),
             ("statefulset", f"{self.release}-valkey"),
         ):
@@ -338,13 +339,20 @@ class Proof:
         }
         if not all(self.platform_images.values()):
             raise ProofError("proof release has an empty candidate image reference")
-        check_offline_slack_origin(worker_env)
+        gateway = self.kubectl_json(["get", "deployment", f"{self.release}-channel-gateway"])
+        gateway_container = next(
+            item
+            for item in gateway["spec"]["template"]["spec"]["containers"]
+            if item.get("name") == "channel-gateway"
+        )
+        gateway_env = {item.get("name"): item for item in gateway_container.get("env", [])}
+        check_offline_slack_origin(gateway_env)
         slack_check = self.kubectl(
             [
                 "exec",
-                f"deployment/{self.release}-worker",
+                f"deployment/{self.release}-channel-gateway",
                 "-c",
-                "worker",
+                "channel-gateway",
                 "--",
                 "sh",
                 "-c",
@@ -357,9 +365,9 @@ class Proof:
         offline_check = self.kubectl(
             [
                 "exec",
-                f"deployment/{self.release}-worker",
+                f"deployment/{self.release}-channel-gateway",
                 "-c",
-                "worker",
+                "channel-gateway",
                 "--",
                 "python",
                 "-c",
@@ -372,7 +380,7 @@ class Proof:
             check=False,
         )
         if offline_check.returncode != 0:
-            raise ProofError("proof offline endpoint must refuse connections in the worker")
+            raise ProofError("proof offline endpoint must refuse connections in the gateway")
 
         for kind, name in (
             ("deployment", FIXTURE),
@@ -641,15 +649,23 @@ class Proof:
             raise ProofError("could not load the Alertmanager signer fixture")
         module = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(module)
-        previous = os.environ.get("CURIE_HOOK_SECRET")
-        os.environ["CURIE_HOOK_SECRET"] = secret
+        environment = {
+            "CURIE_HOOK_SECRET": secret,
+            "CURIE_HOOK_URL": (
+                f"{self.api_url}/hooks/{self.agent_id}/{HOOK}?"
+                + urllib.parse.urlencode({"kind": "slack", "address": CHANNEL})
+            ),
+        }
+        previous = {name: os.environ.get(name) for name in environment}
+        os.environ.update(environment)
         try:
             body, signature, delivery, timestamp = module.prepare(payload)
         finally:
-            if previous is None:
-                os.environ.pop("CURIE_HOOK_SECRET", None)
-            else:
-                os.environ["CURIE_HOOK_SECRET"] = previous
+            for name, value in previous.items():
+                if value is None:
+                    os.environ.pop(name, None)
+                else:
+                    os.environ[name] = value
         return body, signature, delivery, timestamp
 
     def post_hook(
@@ -1205,10 +1221,10 @@ class Proof:
                             )
                             if reset.get("released") is not True:
                                 failures.append(f"thread/{self.thread_key}")
-                        except Exception:
+                        except Exception:  # noqa: BLE001 - existing broad catch retained
                             failures.append(f"thread/{self.thread_key}")
                     self.cli_json("delete", [AGENT, "--yes"])
-            except Exception:
+            except Exception:  # noqa: BLE001 - existing broad catch retained
                 failures.append(f"agent/{AGENT}")
         if self.fixture_started:
             objects = [
@@ -1245,13 +1261,13 @@ def main() -> int:
     try:
         proof = Proof()
         outcome = proof.run_proof()
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001 - existing broad catch retained
         error = exc
     finally:
         if proof is not None:
             try:
                 cleanup_failures = proof.cleanup()
-            except Exception:
+            except Exception:  # noqa: BLE001 - existing broad catch retained
                 cleanup_raised = True
 
     failed = False

@@ -1,0 +1,141 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.curietech.ai/cli/preflight/v2.json",
+  "title": "curie dev preflight --json",
+  "description": "The selected pull request gates for the fast or full tier, their results, base freshness and health, and selected CI-only work. Under --dry-run the executable gates are planned without execution.",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "checks": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "name": {
+            "type": "string"
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "planned",
+              "passed",
+              "failed",
+              "skipped"
+            ]
+          },
+          "detail": {
+            "type": "string"
+          },
+          "workflow": {
+            "type": "string"
+          },
+          "job": {
+            "type": "string"
+          },
+          "step": {
+            "type": "string"
+          },
+          "command": {
+            "type": "string"
+          },
+          "cwd": {
+            "type": "string"
+          },
+          "group": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "name",
+          "status",
+          "detail"
+        ]
+      }
+    },
+    "failures": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "check": {
+            "type": "string"
+          },
+          "output_tail": {
+            "type": "string"
+          },
+          "exit_code": {
+            "type": "integer"
+          }
+        },
+        "required": [
+          "check",
+          "output_tail",
+          "exit_code"
+        ]
+      }
+    },
+    "passed": {
+      "type": "boolean"
+    },
+    "dry_run": {
+      "type": "boolean"
+    },
+    "base": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "ref": {
+          "type": "string"
+        },
+        "contains_tip": {
+          "type": "boolean"
+        },
+        "failing_required_checks": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      },
+      "required": [
+        "ref",
+        "contains_tip",
+        "failing_required_checks"
+      ]
+    },
+    "head": {
+      "type": "string"
+    },
+    "error": {
+      "type": "string"
+    },
+    "fix": {
+      "type": "string"
+    },
+    "tier": {
+      "type": "string",
+      "enum": [
+        "fast",
+        "full"
+      ]
+    },
+    "ci_only": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    }
+  },
+  "required": [
+    "checks",
+    "failures",
+    "passed",
+    "dry_run",
+    "base",
+    "head",
+    "tier",
+    "ci_only"
+  ]
+}

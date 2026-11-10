@@ -1,0 +1,1 @@
+error during connect: Get "https://7bd5b54461f4.fd-proof-d-e8ce1a8c.svc:2376/v1.56/info": tls: failed to verify certificate: x509: certificate is valid for 3f9a0d2c7e15.fd-proof-d-e8ce1a8c.svc, 3f9a0d2c7e15.fd-proof-d-e8ce1a8c.svc.cluster.local, 3f9a0d2c7e15.fd-proof-d-e8ce1a8c, not 7bd5b54461f4.fd-proof-d-e8ce1a8c.svc

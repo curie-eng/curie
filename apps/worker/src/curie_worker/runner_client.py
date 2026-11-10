@@ -18,13 +18,15 @@ from __future__ import annotations
 import asyncio
 import base64
 import binascii
+import hashlib
 import json
 import logging
+import ssl
 import time
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
 from dataclasses import dataclass
 from types import TracebackType
-from typing import Any, Literal, TypeVar
+from typing import IO, Any, Literal, TypeVar
 
 import aiohttp
 from aci_protocol import Event, Final, Interrupt, OutboundEvent, parse_ndjson_line
@@ -52,12 +54,55 @@ _POST_FINAL_CLEANUP_TIMEOUT_S = 1.0
 _POST_FINAL_DISCARD_CHUNK_BYTES = 64 * 1024
 _TURN_EPOCH_HEADER = "X-Curie-Turn-Epoch"
 _CAPACITY_ADMISSION_HEADER = "X-Curie-Capacity-Admission"
+_FINAL_ANSWER_HEADER = "X-Curie-Final-Answer"
 _TURN_EPOCH_MIN_LENGTH = 32
 _TURN_EPOCH_MAX_LENGTH = 256
 _T = TypeVar("_T")
 TimeoutResult = Literal["accepted", "conflict", "unconfirmed"]
 
 logger = logging.getLogger(__name__)
+
+# @spec ACTION-EXECUTOR-5 @spec ACTION-EXECUTOR-24. The runner-private boot
+# variable (outside ``BootEnv``) an executor claim sets, and its value. Frozen
+# with the runner's reader by ``tests/vectors/runner-execute.json``.
+RUNNER_MODE_ENV = "CURIE_RUNNER_MODE"
+EXECUTOR_MODE = "execute"
+
+# @spec ACTION-EXECUTOR-6. The executor route's one request shape: every key is
+# present on every phase, and a key the phase does not use is null.
+EXECUTE_PATH = "/v1/execute"
+EXECUTE_REQUEST_KEYS = frozenset(
+    {"execution_id", "phase", "connector", "tool", "arguments", "grant", "target"}
+)
+EXECUTE_PHASES = frozenset({"list", "observe", "call", "read"})
+# @spec AUTOMATED-REMEDIATION-12 (executor amendment E3): the ``read`` request
+# alone adds the predicate's pointer to the frozen keys.
+EXECUTE_READ_KEYS = EXECUTE_REQUEST_KEYS | {"pointer"}
+# @spec ACTION-EXECUTOR-20. A route refusal that provably dialed nothing (or, for
+# ``connector_unreachable`` on ``list``/``observe``, only a read) maps to one
+# pre-dispatch code. Ordering and shape refusals are the worker's own fault
+# against a healthy runner, reported as ``runner_unavailable``.
+_EXECUTE_REFUSALS = {
+    "phase_out_of_order": "runner_unavailable",
+    "invalid_request": "runner_unavailable",
+    "tool_not_advertised": "tool_not_advertised",
+    "restore_not_advertised": "restore_not_advertised",
+    "restore_schema_mismatch": "restore_schema_mismatch",
+    "arguments_mismatch": "arguments_mismatch",
+    # A ``call`` whose connector has no URL the grant header could ride to; the
+    # route refuses before dialing, so it is pre-dispatch, never response_lost.
+    "connector_not_hosted": "connector_not_hosted",
+}
+# ``list``, ``observe`` and ``read`` dial reads only, so an unknown refusal is
+# ``runner_unavailable``, never ``response_lost`` (AUTOMATED-REMEDIATION-12).
+_READ_PHASE_REFUSALS = {
+    **_EXECUTE_REFUSALS,
+    "connector_unreachable": "connector_unreachable",
+    # Executor amendment E4: a read tool not advertised ``readOnlyHint: true``.
+    "tool_not_read_only": "tool_not_read_only",
+}
+_EXECUTE_REFUSAL_BODY_KEY = "refused"
+_EXECUTE_BODY_MAX_BYTES = 1_048_576
 
 
 def _auth_headers(token: str | None) -> dict[str, str] | None:
@@ -96,6 +141,64 @@ class RunnerError(Exception):
     """The runner returned an unexpected HTTP status or an unreadable stream."""
 
 
+class FinalAnswerProtocolError(RunnerError):
+    """Unsupported publication negotiation; retry cannot establish integrity."""
+
+
+class ExecuteRefused(RunnerError):
+    """An executor route call ended without a usable phase response.
+
+    ``code`` is the closed ACTION-EXECUTOR-20 code the worker reports: a
+    pre-dispatch code (``runner_unavailable`` for a runner without the route, an
+    unreachable runner or an ordering refusal) or, for a ``call`` whose outcome
+    may have reached the connector, ``response_lost``, which is never a refusal
+    (ACTION-EXECUTOR-17).
+    """
+
+    def __init__(self, code: str, detail: str) -> None:
+        super().__init__(f"/v1/execute: {code} ({detail})")
+        self.code = code
+
+
+def _execute_failure_code(phase: str, status: int | None, refused: object) -> str:
+    """The ACTION-EXECUTOR-20 code for a failed executor route call.
+
+    ``status`` is None for a transport failure. Only a refusal the route makes
+    before dialing is a provable non-write; anything else on a ``call``, an
+    unknown code above all, may have reached the connector and is
+    ``response_lost``.
+    """
+
+    if status == 404:
+        # A runner image without the route (ACTION-EXECUTOR-24); it dials nothing.
+        return "runner_unavailable"
+    if phase == "call":
+        if isinstance(refused, str) and refused in _EXECUTE_REFUSALS:
+            return _EXECUTE_REFUSALS[refused]
+        return "response_lost"
+    if isinstance(refused, str) and refused in _READ_PHASE_REFUSALS:
+        return _READ_PHASE_REFUSALS[refused]
+    return "runner_unavailable"
+
+
+class RunnerSnapshotReadError(RunnerError):
+    """The publication snapshot could not be read or validated at its boundary."""
+
+
+class RunnerCheckpointRefused(RunnerError):
+    """The runner answered ``/v1/checkpoint`` with a coded refusal.
+
+    Only a 4xx or a 504 carrying a string ``code`` is a refusal; an uncoded
+    answer, any other 5xx, a transport fault or a malformed body is a plain
+    ``RunnerError``. The message carries the code and status only.
+    """
+
+    def __init__(self, code: str, status: int) -> None:
+        super().__init__(f"/v1/checkpoint refused: {code} ({status})")
+        self.code = code
+        self.status = status
+
+
 class RunnerStreamTimeout(TimeoutError):
     """The turn exceeded its deadline during transport or frame handling.
 
@@ -126,6 +229,78 @@ class RunnerWorkspaceSnapshot:
     publication_body: str
 
 
+@dataclass(frozen=True)
+class RunnerWorkspaceCheckpoint:
+    """A recovery checkpoint read from the runner after strict boundary validation."""
+
+    base_sha: str
+    patch: bytes
+    changed_paths: tuple[str, ...]
+    manifest: bytes
+
+
+CHECKPOINT_PATCH_MAX_BYTES = 900_000
+CHECKPOINT_MANIFEST_MAX_BYTES = 1_048_576
+# Both payloads base64 encoded, plus the changed path list (bounded by the
+# manifest, which names every changed path) and the fixed fields.
+_CHECKPOINT_BODY_MAX_BYTES = (
+    4 * ((CHECKPOINT_PATCH_MAX_BYTES + 2) // 3)
+    + 4 * ((CHECKPOINT_MANIFEST_MAX_BYTES + 2) // 3)
+    + CHECKPOINT_MANIFEST_MAX_BYTES
+    + 65_536
+)
+# How long past its own budget a checkpoint call may wait for the runner's coded
+# deadline answer when the caller hands no remaining budget.
+_CHECKPOINT_GRACE_S = 5.0
+
+# The runner's UI evidence index answer (one entry per manifest image) is read
+# bounded to this many bytes.
+UI_EVIDENCE_INDEX_MAX_BYTES = 8 * 1024 * 1024
+
+
+def _checkpoint_bytes(body: dict[str, Any], name: str, cap: int) -> bytes:
+    encoded = body[f"{name}_base64"]
+    if not isinstance(encoded, str):
+        raise TypeError(f"{name}_base64 is not a string")
+    data = base64.b64decode(encoded, validate=True)
+    if len(data) > cap:
+        raise ValueError(f"{name} exceeds {cap} raw bytes")
+    size = body[f"{name}_size_bytes"]
+    if isinstance(size, bool) or size != len(data):
+        raise ValueError(f"{name} size does not match its decoded payload")
+    if body[f"{name}_sha256"] != hashlib.sha256(data).hexdigest():
+        raise ValueError(f"{name} digest does not match its decoded payload")
+    return data
+
+
+def _parse_checkpoint(raw: bytes, base_sha: str) -> RunnerWorkspaceCheckpoint:
+    body = json.loads(raw)
+    if not isinstance(body, dict):
+        raise TypeError("checkpoint answer is not an object")
+    if body["base_sha"] != base_sha:
+        raise ValueError("checkpoint answer names another base")
+    paths = body["changed_paths"]
+    if not isinstance(paths, list) or not all(isinstance(path, str) and path for path in paths):
+        raise TypeError("changed_paths is not a string list")
+    return RunnerWorkspaceCheckpoint(
+        base_sha=base_sha,
+        patch=_checkpoint_bytes(body, "patch", CHECKPOINT_PATCH_MAX_BYTES),
+        changed_paths=tuple(paths),
+        manifest=_checkpoint_bytes(body, "manifest", CHECKPOINT_MANIFEST_MAX_BYTES),
+    )
+
+
+def _checkpoint_refusal_code(status: int, raw: bytes) -> str | None:
+    if not (400 <= status < 500 or status == 504):
+        return None
+    try:
+        body = json.loads(raw)
+    except ValueError:
+        return None
+    code = body.get("code") if isinstance(body, dict) else None
+    return code if isinstance(code, str) and code else None
+
+
 class TurnStream:
     """An open ``/v1/event`` response; capacity turns await admission."""
 
@@ -136,9 +311,15 @@ class TurnStream:
         deadline: float,
         turn_epoch: str | None,
         timeout_callback: Callable[[], Awaitable[TimeoutResult]] | None = None,
+        *,
+        verbatim_answer: bool = False,
     ) -> None:
         self._response = response
         self.turn_epoch = turn_epoch
+        self.verbatim_answer = verbatim_answer
+        # ADR 0270 decision 3: set by the kernel when the requester token
+        # window, not the configured bound, set this stream's deadline.
+        self.requester_window_bound = False
         self._saw_final = False
         # The streaming budget this stream is running under, carried from the
         # client so the stream can NAME the budget it blew (#2011).
@@ -176,9 +357,7 @@ class TurnStream:
             # straight through -- do not broaden this clause.
             raise await self._normalize_stream_timeout(cause) from cause
 
-    async def _normalize_stream_timeout(
-        self, cause: BaseException
-    ) -> RunnerStreamTimeout:
+    async def _normalize_stream_timeout(self, cause: BaseException) -> RunnerStreamTimeout:
         terminal = self._stream_timeout_error
         if terminal is None:
             terminal = RunnerStreamTimeout(self._timeout_reason(cause), "unconfirmed")
@@ -255,9 +434,7 @@ class TurnStream:
         try:
             async with asyncio.timeout(_POST_FINAL_CLEANUP_TIMEOUT_S):
                 while not self._response.content.at_eof():
-                    chunk = await self._response.content.read(
-                        _POST_FINAL_DISCARD_CHUNK_BYTES
-                    )
+                    chunk = await self._response.content.read(_POST_FINAL_DISCARD_CHUNK_BYTES)
                     if not chunk:
                         break
         except TimeoutError:
@@ -289,6 +466,19 @@ class TurnStream:
             self.close()
 
 
+def _rejected_frame(endpoint: str, status: int, body: str) -> RunnerError:
+    """The error for a runner that refused a turn-opening frame.
+
+    Only the status and the body's length, never the body (MEMORY-TOKEN-3). A
+    runner's validation response can repeat the frame it rejected, and the frame
+    carries the turn's memory credential and its publication capability. An
+    older runner repeats it as pydantic's ``str(ValidationError)``, which cuts
+    the input in the middle, so no string replace of the whole credential can
+    redact what is left of it. This error is logged."""
+
+    return RunnerError(f"{endpoint} -> {status} (body: {len(body)} chars, not logged)")
+
+
 class RunnerClient:
     """Dials a claimed runner over its base_url. One client serves all threads."""
 
@@ -300,9 +490,17 @@ class RunnerClient:
         interrupt_timeout_s: float = _DEFAULT_INTERRUPT_TIMEOUT_S,
         snapshot_patch_max_bytes: int = 900_000,
         session: aiohttp.ClientSession | None = None,
+        ssl_context: ssl.SSLContext | None = None,
     ) -> None:
+        """``ssl_context`` is the trust an ``https`` runner endpoint is verified
+        against (a static-pool shell's CA bundle); certificate and host name
+        are always checked. ``None`` keeps the platform default trust."""
         if snapshot_patch_max_bytes <= 0:
             raise ValueError("snapshot patch byte limit must be positive")
+        if ssl_context is not None and (
+            not ssl_context.check_hostname or ssl_context.verify_mode != ssl.CERT_REQUIRED
+        ):
+            raise ValueError("a runner TLS context must verify the certificate and host name")
         self._total_timeout_s = total_timeout_s
         self._own_session = session is None
         self._connect_timeout_s = connect_timeout_s
@@ -314,7 +512,10 @@ class RunnerClient:
         self._session = session or aiohttp.ClientSession(
             timeout=aiohttp.ClientTimeout(
                 total=total_timeout_s, connect=connect_timeout_s, sock_read=total_timeout_s
-            )
+            ),
+            connector=(
+                None if ssl_context is None else aiohttp.TCPConnector(ssl=ssl_context)
+            ),
         )
         # A per-request override, not folded into the session default above: it
         # replaces (not merges with) the session timeout for this one call, so
@@ -329,9 +530,17 @@ class RunnerClient:
         # just fenced.
         self._interrupt_timeout = aiohttp.ClientTimeout(total=interrupt_timeout_s)
         self._snapshot_patch_max_bytes = snapshot_patch_max_bytes
-        self._snapshot_body_max_bytes = (
-            4 * ((snapshot_patch_max_bytes + 2) // 3) + 131_072
-        )
+        self._snapshot_body_max_bytes = 4 * ((snapshot_patch_max_bytes + 2) // 3) + 131_072
+
+    def turn_deadline_s(self, remaining_s: float | None) -> float:
+        """How long a turn opened now may stream: ``_request_timeout``'s bound.
+
+        ``min(total_timeout_s, remaining_s)``, or the ceiling when there is no
+        budget in hand. ADR-0188's per-turn memory credential expires with it.
+        """
+        if remaining_s is None:
+            return self._total_timeout_s
+        return max(_MIN_REQUEST_TIMEOUT_S, min(self._total_timeout_s, remaining_s))
 
     def _request_timeout(self, remaining_s: float | None) -> aiohttp.ClientTimeout | Any:
         """The per-request timeout for a delivery with ``remaining_s`` of budget.
@@ -389,7 +598,7 @@ class RunnerClient:
             inject_trace_context(headers)
             try:
                 result, outcome = await request(headers or None)
-            except Exception as exc:
+            except Exception as exc:  # noqa: BLE001 - existing broad catch retained
                 error = exc
                 outcome = "timeout" if isinstance(exc, TimeoutError) else "failure"
                 _mark_rpc_failed(span, outcome, exc)
@@ -425,9 +634,7 @@ class RunnerClient:
         """
         request_timeout = self._request_timeout(remaining_s)
         stream_timeout_s = (
-            self._total_timeout_s
-            if request_timeout is sentinel
-            else request_timeout.total
+            self._total_timeout_s if request_timeout is sentinel else request_timeout.total
         )
         if remaining_s is not None:
             logger.info(
@@ -440,6 +647,7 @@ class RunnerClient:
             assert stream_timeout_s is not None
             deadline = asyncio.get_running_loop().time() + stream_timeout_s
             request_headers = dict(headers or {})
+            request_headers[_FINAL_ANSWER_HEADER] = "1"
             if capacity_admission:
                 request_headers[_CAPACITY_ADMISSION_HEADER] = "wait"
             if progress:
@@ -451,13 +659,15 @@ class RunnerClient:
                 timeout=request_timeout,
             )
             if resp.status != 200:
-                if event.publication_context is not None:
-                    # A validation response can echo the submitted capability.
+                try:
+                    body = await resp.text()
+                finally:
                     resp.release()
-                    raise RunnerError(f"/v1/event -> {resp.status}")
-                body = await resp.text()
+                raise _rejected_frame("/v1/event", resp.status, body)
+            final_answer_modes = resp.headers.getall(_FINAL_ANSWER_HEADER, [])
+            if final_answer_modes not in ([], ["1"]):
                 resp.release()
-                raise RunnerError(f"/v1/event -> {resp.status}: {body}")
+                raise FinalAnswerProtocolError("unsupported final-answer delivery mode")
             turn_epoch = resp.headers.get(_TURN_EPOCH_HEADER)
             if capacity_admission and not _valid_turn_epoch(turn_epoch):
                 resp.release()
@@ -473,7 +683,14 @@ class RunnerClient:
 
                 timeout_callback = notify_timeout
             return (
-                TurnStream(resp, stream_timeout_s, deadline, turn_epoch, timeout_callback),
+                TurnStream(
+                    resp,
+                    stream_timeout_s,
+                    deadline,
+                    turn_epoch,
+                    timeout_callback,
+                    verbatim_answer=final_answer_modes == ["1"],
+                ),
                 "success",
             )
 
@@ -541,10 +758,7 @@ class RunnerClient:
                 if resp.status == 409:
                     return False, "conflict"
                 if resp.status != 200:
-                    if event.publication_context is not None:
-                        raise RunnerError(f"/v1/steer -> {resp.status}")
-                    body = await resp.text()
-                    raise RunnerError(f"/v1/steer -> {resp.status}: {body}")
+                    raise _rejected_frame("/v1/steer", resp.status, await resp.text())
                 return True, "success"
 
         return await self._rpc("steer", token, request)
@@ -590,6 +804,7 @@ class RunnerClient:
         never be live at reset time -- a 409 here is a real ordering bug, not a
         condition to swallow.
         """
+
         async def request(headers: dict[str, str] | None) -> tuple[None, str]:
             async with self._session.post(
                 f"{base_url}/v1/reset",
@@ -608,9 +823,13 @@ class RunnerClient:
         base_url: str,
         token: str | None = None,
         *,
+        base_sha: str,
         remaining_s: float | None = None,
     ) -> RunnerWorkspaceSnapshot:
         """Capture a bounded patch before a publication approval suspends.
+
+        ``base_sha`` is the prepared commit the worker retained for the
+        thread; the runner anchors the patch there, never at the agent's HEAD.
 
         This call is always runner-token authenticated. A missing token is a
         worker invariant violation, not a request to try the unauthenticated
@@ -622,25 +841,28 @@ class RunnerClient:
             raise RunnerError("publication snapshot requires a runner token")
         async with self._session.post(
             f"{base_url}/v1/snapshot",
+            json={"base_sha": base_sha},
             headers=_auth_headers(token),
             timeout=self._request_timeout(remaining_s),
         ) as resp:
             if resp.status != 200:
                 body = await resp.text()
+                if resp.status >= 500:
+                    raise RunnerSnapshotReadError(f"/v1/snapshot -> {resp.status}: {body}")
                 raise RunnerError(f"/v1/snapshot -> {resp.status}: {body}")
+            raw = bytearray()
             try:
-                raw = await resp.content.read(self._snapshot_body_max_bytes + 1)
-                if len(raw) > self._snapshot_body_max_bytes:
-                    raise ValueError("snapshot response exceeds its encoded byte limit")
+                async for chunk in resp.content.iter_chunked(65_536):
+                    raw.extend(chunk)
+                    if len(raw) > self._snapshot_body_max_bytes:
+                        raise ValueError("snapshot response exceeds its encoded byte limit")
                 body = json.loads(raw)
                 encoded = body["patch_base64"]
                 if not isinstance(encoded, str):
                     raise TypeError("patch_base64 is not a string")
                 patch = base64.b64decode(encoded, validate=True)
                 if len(patch) > self._snapshot_patch_max_bytes:
-                    raise ValueError(
-                        f"patch exceeds {self._snapshot_patch_max_bytes} raw bytes"
-                    )
+                    raise ValueError(f"patch exceeds {self._snapshot_patch_max_bytes} raw bytes")
                 declared_size = body.get("patch_size_bytes")
                 if declared_size != len(patch):
                     raise ValueError("patch size does not match decoded payload")
@@ -669,7 +891,160 @@ class RunnerClient:
                     publication_body=description,
                 )
             except (KeyError, TypeError, ValueError, binascii.Error, json.JSONDecodeError) as exc:
-                raise RunnerError("/v1/snapshot returned an invalid bounded payload") from exc
+                raise RunnerSnapshotReadError(
+                    "/v1/snapshot returned an invalid bounded payload "
+                    f"after {len(raw)} bytes: {type(exc).__name__}: {str(exc)[:160]}"
+                ) from exc
+
+    async def _ui_evidence_post(
+        self,
+        route: str,
+        base_url: str,
+        token: str | None,
+        payload: dict[str, object],
+        remaining_s: float | None,
+        on_chunk: Callable[[bytes], object],
+        sha256: str | None = None,
+    ) -> None:
+        """Feed a token-authenticated evidence route's body to ``on_chunk``.
+
+        Every failure raises ``RunnerError`` naming a status or class, never the body.
+        """
+
+        if not token:
+            raise RunnerError(f"{route} requires a runner token")
+        try:
+            async with self._session.post(
+                f"{base_url}{route}",
+                json=payload,
+                headers=_auth_headers(token),
+                timeout=self._request_timeout(remaining_s),
+            ) as resp:
+                if resp.status != 200:
+                    raise RunnerError(f"{route} -> {resp.status}")
+                if sha256 is not None and resp.headers.get("X-Curie-Evidence-Sha256") != sha256:
+                    raise RunnerError(f"{route} answered for another digest")
+                async for chunk in resp.content.iter_chunked(65_536):
+                    on_chunk(chunk)
+        except aiohttp.ClientError as exc:
+            if isinstance(exc, TimeoutError):
+                raise
+            raise RunnerError(f"{route} transport failed: {type(exc).__name__}") from None
+
+    async def ui_evidence_index(
+        self,
+        base_url: str,
+        token: str | None,
+        *,
+        base_sha: str,
+        budget_s: float,
+        remaining_s: float | None = None,
+    ) -> dict[str, object]:
+        """The runner's UI evidence index for ``base_sha``: a bounded JSON object."""
+
+        route = "/v1/ui-evidence/index"
+        raw = bytearray()
+
+        def take(chunk: bytes) -> None:
+            raw.extend(chunk)
+            if len(raw) > UI_EVIDENCE_INDEX_MAX_BYTES:
+                raise RunnerError(f"{route} answer exceeds its byte limit")
+
+        payload: dict[str, object] = {"base_sha": base_sha, "budget_seconds": budget_s}
+        await self._ui_evidence_post(route, base_url, token, payload, remaining_s, take)
+        try:
+            body = json.loads(raw)
+        except (ValueError, RecursionError):
+            raise RunnerError(f"{route} returned malformed JSON") from None
+        if not isinstance(body, dict):
+            raise RunnerError(f"{route} returned a non-object body")
+        return body
+
+    async def ui_evidence_image(
+        self,
+        base_url: str,
+        token: str | None,
+        *,
+        index: int,
+        sha256: str,
+        size: int,
+        sink: IO[bytes],
+        remaining_s: float | None = None,
+    ) -> None:
+        """Stream one image into ``sink``, refusing any size or sha256 mismatch.
+
+        ``sink`` may hold a partial image after a refusal; the caller discards it.
+        """
+
+        route = "/v1/ui-evidence/image"
+        digest = hashlib.sha256()
+        received = 0
+
+        def take(chunk: bytes) -> None:
+            nonlocal received
+            received += len(chunk)
+            if received > size:
+                raise RunnerError(f"{route} sent more than its size")
+            digest.update(chunk)
+            sink.write(chunk)
+
+        payload: dict[str, object] = {"index": index, "sha256": sha256}
+        await self._ui_evidence_post(route, base_url, token, payload, remaining_s, take, sha256)
+        if received != size:
+            raise RunnerError(f"{route} sent {received} of {size} bytes")
+        if digest.hexdigest() != sha256:
+            raise RunnerError(f"{route} bytes do not match their digest")
+
+    async def checkpoint(
+        self,
+        base_url: str,
+        token: str | None,
+        *,
+        base_sha: str,
+        budget_seconds: float,
+        remaining_s: float | None = None,
+    ) -> RunnerWorkspaceCheckpoint:
+        """Read a recovery checkpoint of the managed checkout against ``base_sha``.
+
+        Always runner-token authenticated, like ``snapshot``. The runner spends
+        at most ``budget_seconds``; this call waits at most ``remaining_s`` (or
+        the budget plus a short grace) and then raises ``TimeoutError``. A coded
+        refusal raises ``RunnerCheckpointRefused``; anything else unusable raises
+        ``RunnerError``. Errors name codes, statuses and sizes, never bytes.
+        """
+
+        if not token:
+            raise RunnerError("recovery checkpoint requires a runner token")
+        wait_s = remaining_s if remaining_s is not None else budget_seconds + _CHECKPOINT_GRACE_S
+        raw = bytearray()
+        try:
+            async with self._session.post(
+                f"{base_url}/v1/checkpoint",
+                headers=_auth_headers(token),
+                json={"base_sha": base_sha, "budget_seconds": budget_seconds},
+                timeout=self._request_timeout(wait_s),
+            ) as resp:
+                async for chunk in resp.content.iter_chunked(65_536):
+                    raw.extend(chunk)
+                    if len(raw) > _CHECKPOINT_BODY_MAX_BYTES:
+                        raise RunnerError("/v1/checkpoint answer exceeds its encoded byte limit")
+                status = resp.status
+        except aiohttp.ClientError as exc:
+            if isinstance(exc, TimeoutError):
+                raise
+            raise RunnerError(f"/v1/checkpoint transport failed: {type(exc).__name__}") from None
+        if status != 200:
+            code = _checkpoint_refusal_code(status, bytes(raw))
+            if code is not None:
+                raise RunnerCheckpointRefused(code, status)
+            raise RunnerError(f"/v1/checkpoint -> {status} without a refusal code")
+        try:
+            return _parse_checkpoint(bytes(raw), base_sha)
+        except (KeyError, TypeError, ValueError, binascii.Error) as exc:
+            raise RunnerError(
+                "/v1/checkpoint returned an invalid bounded payload "
+                f"after {len(raw)} bytes: {type(exc).__name__}"
+            ) from None
 
     async def status(
         self,
@@ -750,6 +1125,68 @@ class RunnerClient:
                 return None, "success"
 
         await self._rpc("turn-admit", token, request)
+
+    async def execute(
+        self,
+        base_url: str,
+        request: Mapping[str, Any],
+        *,
+        token: str,
+        remaining_s: float | None = None,
+    ) -> dict[str, Any]:
+        """Run one executor phase on an executor-mode runner. @spec ACTION-EXECUTOR-24.
+
+        Posts ``request`` (exactly the ACTION-EXECUTOR-6 keys, plus ``pointer``
+        on a ``read``, AUTOMATED-REMEDIATION-12) to
+        ``/v1/execute`` with the per-sandbox bearer and returns the phase's
+        response body. Every other ending raises ``ExecuteRefused`` with the
+        code the worker reports; nothing about the arguments, grant or reply is
+        logged or carried in the error.
+        """
+
+        if not token:
+            raise RunnerError("/v1/execute requires a runner token")
+        phase = request.get("phase")
+        if phase not in EXECUTE_PHASES:
+            raise RunnerError("/v1/execute request names an unknown phase")
+        expected = EXECUTE_READ_KEYS if phase == "read" else EXECUTE_REQUEST_KEYS
+        if set(request) != expected:
+            raise RunnerError("/v1/execute request does not carry exactly the frozen keys")
+        body = dict(request)
+
+        async def send(headers: dict[str, str] | None) -> tuple[dict[str, Any], str]:
+            try:
+                async with self._session.post(
+                    f"{base_url}{EXECUTE_PATH}",
+                    json=body,
+                    headers=headers,
+                    timeout=self._request_timeout(remaining_s),
+                ) as resp:
+                    raw = await resp.content.read(_EXECUTE_BODY_MAX_BYTES + 1)
+                    status = resp.status
+            except (aiohttp.ClientError, TimeoutError) as exc:
+                code = _execute_failure_code(phase, None, None)
+                raise ExecuteRefused(code, f"transport {type(exc).__name__}") from exc
+            parsed: object = None
+            if len(raw) <= _EXECUTE_BODY_MAX_BYTES:
+                try:
+                    parsed = json.loads(raw)
+                except (ValueError, UnicodeDecodeError):
+                    parsed = None
+            if status != 200:
+                refused = (
+                    parsed.get(_EXECUTE_REFUSAL_BODY_KEY) if isinstance(parsed, dict) else None
+                )
+                code = _execute_failure_code(phase, status, refused)
+                raise ExecuteRefused(code, f"HTTP {status}")
+            if not isinstance(parsed, dict) or parsed.get("phase") != phase:
+                # A 200 the worker cannot read: on ``call`` the write may have
+                # happened, so it is lost, never refused.
+                code = "response_lost" if phase == "call" else "runner_unavailable"
+                raise ExecuteRefused(code, "unreadable phase response")
+            return parsed, "success"
+
+        return await self._rpc("execute", token, send)
 
     async def close(self) -> None:
         if self._own_session:

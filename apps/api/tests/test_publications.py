@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import hashlib
+import itertools
 import json
 import subprocess
 import sys
@@ -17,8 +18,9 @@ import tarfile
 import threading
 import time
 import uuid
-from collections.abc import Iterable, Iterator, Mapping
+from collections.abc import Iterable, Iterator, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from io import BytesIO
@@ -32,13 +34,29 @@ import httpx
 import pytest
 import redis
 import redis.asyncio as aioredis
-from curie_api import approval_principal, crud, sandbox_token
+from curie_api import approval_principal
 from curie_api.config import get_settings
+from curie_api.crud import (
+    approvals as crud_approvals,
+)
+from curie_api.crud import (
+    errors as crud_errors,
+)
+from curie_api.crud import (
+    lineages as crud_lineages,
+)
+from curie_api.crud import (
+    publications as crud_publications,
+)
+from curie_api.factory_rediscovery import issue_marker
+from curie_api.forges.types import TrackerIssueRef
 from curie_api.github_app import _RESOLVERS
 from curie_api.main import create_app
 from curie_api.resumequeue import ResumeQueue
-from curie_api.schemas import ChannelBindingWrite, PublicationCreate
+from curie_api.schemas.channels import ChannelBindingWrite
+from curie_api.schemas.publications import PublicationCreate
 from curie_api.sweeper import sweep_expired_approvals
+from curie_internal import sandbox_token
 from curie_telemetry import record_metric
 from curie_test_support.valkey import connect_or_skip
 from fastapi import Response
@@ -50,6 +68,12 @@ from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
+from curie_api.forges.registry import forges_registry
+from forge_fakes.github import REPO as FACTORY_REPO
+from forge_fakes.github import REPO_ID as FACTORY_REPO_ID
+from forge_fakes.github import forges_document, forges_env_json, github_repository_binding
+from forge_fakes.github_comments import _rows as _factory_rows
+from forge_fakes.github_comments import admitted, comments  # noqa: F401
 from test_factory_terminus import (  # noqa: F401
     _label as _factory_label,
 )
@@ -57,16 +81,11 @@ from test_factory_terminus import (
     _request as _factory_request,
 )
 from test_factory_terminus import (
-    _rows as _factory_rows,
-)
-from test_factory_terminus import (
     _start_running as _start_factory_request,
 )
-from test_factory_terminus import admitted, comments  # noqa: F401
-from test_github_factory_ingress import REPO as FACTORY_REPO
 
 REPO = "acme-corp/acme-bot"
-WORKER_TOKEN = "remote-dev-publication-worker-token"
+WORKER_TOKEN = "example-publication-worker-token"
 WORKER_HEADERS = {"X-Curie-Worker-Token": WORKER_TOKEN}
 PATCH_LIMIT = 900_000
 BASE_SHA = "0123456789abcdef0123456789abcdef01234567"
@@ -189,6 +208,12 @@ def _workspace_identity(payload: Mapping[str, Any]) -> str:
         str(payload["reply_channel"]),
         str(payload["conversation_id"]),
     )
+
+
+def _worker_request() -> Any:
+    """A request for a direct route call; the GitHub credential reads no HTTP client."""
+
+    return SimpleNamespace(app=SimpleNamespace(state=SimpleNamespace(http_client=None)))
 
 
 def test_publication_schema_refuses_github_workflow_changes() -> None:
@@ -353,6 +378,137 @@ def test_builtin_reply_adapter_and_ref_persist_on_both_publication_rows(
     }
 
 
+@pytest.mark.parametrize(
+    ("reply_adapter", "requested_identity", "reply_identity"),
+    [
+        (CLUSTER_MESSAGE_ADAPTER, "acme-named", "acme-named"),
+        (CLUSTER_MESSAGE_ADAPTER, None, None),
+        (CLUSTER_MESSAGE_ADAPTER, "default", None),
+        ("acme-named", "acme-named", None),
+    ],
+)
+def test_relay_publication_preserves_binding_identity_and_refuses_changed_replay(
+    publication_stack: tuple[TestClient, str],
+    auth_headers: dict[str, str],
+    clean_db: None,
+    monkeypatch: pytest.MonkeyPatch,
+    reply_adapter: str,
+    requested_identity: str | None,
+    reply_identity: str | None,
+) -> None:
+    from curie_api.models import Approval
+    from curie_api.resumequeue import build_resume_turn
+
+    monkeypatch.setenv(
+        "CURIE_SLACK_IDENTITIES",
+        json.dumps(
+            [
+                {
+                    "name": "default",
+                    "app_token_env": "SLACK_APP_TOKEN",
+                    "bot_token_env": "SLACK_BOT_TOKEN",
+                    "signing_secret_env": "SLACK_SIGNING_SECRET",
+                },
+                {
+                    "name": "acme-named",
+                    "app_token_env": "CURIE_SLACK_APP_TOKEN__0",
+                    "bot_token_env": "CURIE_SLACK_BOT_TOKEN__0",
+                    "signing_secret_env": None,
+                },
+            ]
+        ),
+    )
+    get_settings.cache_clear()
+    client, runs_stream = publication_stack
+    deployment = _create_deployment(client, auth_headers)
+    named_binding = client.post(
+        f"/agents/{deployment['agent_id']}/channels",
+        json={"kind": "slack", "address": "C0EXAMPLE1", "adapter": "acme-named"},
+        headers=auth_headers,
+    )
+    assert named_binding.status_code == 201, named_binding.text
+    thread = "1700000000.000100"
+    binding_identity = (
+        reply_identity or "default" if reply_adapter == CLUSTER_MESSAGE_ADAPTER else reply_adapter
+    )
+    scoped_thread = channel_protocol.scoped_conversation_id(
+        "slack", "C0EXAMPLE1", thread, identity=binding_identity
+    )
+    reply_ref = str(uuid.uuid4())
+    payload = _publication_payload(deployment["id"], conversation_id=scoped_thread)
+    payload.update(
+        reply_conversation_id=thread,
+        reply_placeholder=reply_ref,
+        reply_adapter=reply_adapter,
+        reply_identity=requested_identity,
+    )
+    status, publication = _create_publication(client, payload)
+    assert status == 201
+    assert _rows(
+        "SELECT p.reply_identity AS publication_identity, a.reply_identity AS approval_identity, "
+        "p.reply_adapter AS publication_adapter, a.reply_adapter AS approval_adapter, "
+        "c.adapter AS binding_identity, c.endpoint AS binding_endpoint, "
+        "l.binding_generation = c.generation AS current "
+        "FROM curie.publications p JOIN curie.approvals a ON a.id = p.approval_id "
+        "JOIN curie.thread_publication_lineages l ON l.id = p.lineage_id "
+        "LEFT JOIN curie.agent_channels c ON c.id = l.binding_id WHERE p.id = :id",
+        {"id": publication["id"]},
+    ) == [
+        {
+            "publication_identity": reply_identity,
+            "approval_identity": reply_identity,
+            "publication_adapter": reply_adapter,
+            "approval_adapter": reply_adapter,
+            "binding_identity": binding_identity,
+            "binding_endpoint": None,
+            "current": True,
+        }
+    ]
+    replay = client.post("/v1/internal/publications", json=payload, headers=WORKER_HEADERS)
+    assert replay.status_code == 200, replay.text
+    assert replay.json()["id"] == publication["id"]
+    if reply_adapter == CLUSTER_MESSAGE_ADAPTER:
+        changed = dict(payload, reply_identity=None if reply_identity else "acme-named")
+        refused = client.post("/v1/internal/publications", json=changed, headers=WORKER_HEADERS)
+        assert refused.status_code == 409, refused.text
+        if reply_identity is None:
+            equivalent = dict(
+                payload, reply_identity="default" if requested_identity is None else None
+            )
+            accepted = client.post(
+                "/v1/internal/publications", json=equivalent, headers=WORKER_HEADERS
+            )
+            assert accepted.status_code == 200, accepted.text
+            assert accepted.json()["id"] == publication["id"]
+    else:
+        equivalent = dict(payload, reply_identity=None)
+        accepted = client.post("/v1/internal/publications", json=equivalent, headers=WORKER_HEADERS)
+        assert accepted.status_code == 200, accepted.text
+        assert accepted.json()["id"] == publication["id"]
+    assert _counts() == (1, 1)
+
+    resolved = _resolve(client, auth_headers, publication["approval_id"])
+    assert resolved.status_code == 200, resolved.text
+
+    async def stored_resume() -> Any:
+        engine = create_async_engine(get_settings().database_url)
+        sessionmaker = async_sessionmaker(engine, expire_on_commit=False)
+        try:
+            async with sessionmaker() as session:
+                approval = await session.get(Approval, uuid.UUID(publication["approval_id"]))
+                assert approval is not None
+                return build_resume_turn(approval)
+        finally:
+            await engine.dispose()
+
+    turn = asyncio.run(stored_resume())
+    assert turn.reply_handle.identity == reply_identity
+    assert turn.reply_handle.adapter == reply_adapter
+    assert turn.reply_handle.placeholder == reply_ref
+    assert turn.conversation_id == thread
+    assert _stream_entries(runs_stream) == []
+
+
 def test_a_named_non_slack_adapter_still_builds_the_pre_identity_workspace_key(
     publication_stack: tuple[TestClient, str],
     auth_headers: dict[str, str],
@@ -476,6 +632,106 @@ def _advance_lineage(
     if lease is None:
         owner = "api-test-worker"
         lease = (_claim_publication_lease(publication_id, owner), owner)
+    with _publication_commit_http(client, publication_id, head_sha):
+        return _patch_lineage(
+            client,
+            publication_id,
+            expected_version,
+            expected_head_sha,
+            head_sha,
+            state,
+            pr_number,
+            pr_url,
+            lease,
+        )
+
+
+@contextmanager
+def _publication_commit_http(
+    client: TestClient, publication_id: str, head_sha: str
+) -> Iterator[None]:
+    rows = _rows(
+        "SELECT expected_prior_head, repo_full_name FROM curie.publications WHERE id = :id",
+        {"id": uuid.UUID(publication_id)},
+    )
+    if not rows:
+        yield
+        return
+    row = rows[0]
+    parent = row["expected_prior_head"]
+    repo = row["repo_full_name"]
+    original = client.app.state.http_client
+    fixture_token = (
+        "fixture-publication-app-token"
+        if get_settings().github_app_id
+        else "ghp_publication_operator"
+    )
+    # Observed GitHubCodeHost._token contract: REST uses the Git Basic header.
+    adapter_authorization = (
+        "Basic " + base64.b64encode(f"x-access-token:{fixture_token}".encode()).decode("ascii")
+    )
+
+    async def handle(request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        # https://docs.github.com/en/rest/git/commits#get-a-commit-object
+        # https://docs.github.com/en/rest/git/refs#get-a-reference
+        if f"/repos/{repo}/git/commits/" in path:
+            assert request.headers["authorization"] == adapter_authorization
+            sha = path.rsplit("/", 1)[-1]
+            if sha == head_sha:
+                return httpx.Response(
+                    200,
+                    json={
+                        "sha": sha,
+                        "parents": [{"sha": parent}],
+                        "message": f"Publish\n\nCurie-Revision: {publication_id}\n",
+                    },
+                )
+            if sha == parent:
+                return httpx.Response(200, json={"sha": sha, "parents": [], "message": "Base"})
+            return httpx.Response(404, json={"message": "Unknown fixture commit"})
+        if f"/repos/{repo}/git/ref/heads/" in path:
+            assert request.headers["authorization"] == adapter_authorization
+            branch = unquote(path.split("/git/ref/heads/", 1)[1])
+            return httpx.Response(
+                200,
+                json={
+                    "ref": f"refs/heads/{branch}",
+                    "object": {"type": "commit", "sha": parent},
+                },
+            )
+        if path.endswith(f"/repos/{repo}") and not get_settings().github_app_id:
+            assert request.headers["authorization"] == adapter_authorization
+            return httpx.Response(
+                200,
+                json={
+                    "id": 9001,
+                    "full_name": repo,
+                    "default_branch": "main",
+                },
+            )
+        return await original.send(request)
+
+    injected = httpx.AsyncClient(transport=httpx.MockTransport(handle))
+    client.app.state.http_client = injected
+    try:
+        yield
+    finally:
+        client.app.state.http_client = original
+        asyncio.run(injected.aclose())
+
+
+def _patch_lineage(
+    client: TestClient,
+    publication_id: str,
+    expected_version: int,
+    expected_head_sha: str | None,
+    head_sha: str,
+    state: str,
+    pr_number: int,
+    pr_url: str,
+    lease: tuple[int, str],
+) -> Any:
     return client.patch(
         f"/v1/internal/publications/{publication_id}/lineage",
         json={
@@ -508,8 +764,10 @@ def _open_lineage(
     *,
     conversation_id: str,
     pr_url: str = PR_URL,
+    deployment: dict[str, Any] | None = None,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
-    deployment = _create_deployment(client, auth_headers)
+    if deployment is None:
+        deployment = _create_deployment(client, auth_headers)
     _, publication = _create_publication(
         client,
         _publication_payload(
@@ -812,7 +1070,7 @@ def test_publication_create_is_atomic_private_and_idempotent(
     ],
 )
 def test_publication_create_rejects_noncanonical_or_oversized_text(field: str, value: str) -> None:
-    from curie_api.schemas import PublicationCreate
+    from curie_api.schemas.publications import PublicationCreate
 
     payload = _publication_payload(str(uuid.uuid4()))
     payload[field] = value
@@ -909,8 +1167,8 @@ def test_publication_splits_scoped_thread_identity_from_slack_reply_identity(
     auth_headers: dict[str, str],
     clean_db: None,
 ) -> None:
+    from curie_channel_gateway.slack.slack_sink import _thread_ts
     from curie_worker.publication_store import PostgresPublicationStore
-    from curie_worker.slack_sink import _thread_ts
 
     client, _ = publication_stack
     deployment = _create_deployment(client, auth_headers)
@@ -1120,17 +1378,17 @@ def test_publication_credential_resolution_does_not_block_the_event_loop(
     resolver_started = threading.Event()
     loop_progressed = threading.Event()
 
-    def blocking_resolver(_: str, __: Any) -> tuple[str, str]:
+    def blocking_resolver(_: str, *, html_base: str, credentials: Any) -> tuple[str, str]:
         resolver_started.set()
         # A blocked loop never sets the event, however long this waits, so the
         # budget only has to outlast thread wakeups on a contended runner: 0.5s
         # failed 1 in 20 under `pytest -n 4` on 4 vCPU (run 34542518036).
         if not loop_progressed.wait(timeout=10):
             raise AssertionError("credential resolver blocked the event loop")
-        return "https://github.com/acme-corp/acme-bot.git", "Basic test"
+        return "https://github.com/acme-corp/acme-bot.git", "Basic eC1hY2Nlc3MtdG9rZW46dGVzdA=="
 
     monkeypatch.setattr(
-        "curie_api.routers.publications.resolve_repository_credential", blocking_resolver
+        "curie_api.forges.github.code_host.resolve_repository_credential", blocking_resolver
     )
 
     async def exercise() -> str:
@@ -1139,7 +1397,9 @@ def test_publication_credential_resolution_does_not_block_the_event_loop(
         try:
             async with sessionmaker() as session:
                 call = asyncio.create_task(
-                    redeem_publication_credential(uuid.UUID(publication["id"]), session, Response())
+                    redeem_publication_credential(
+                        uuid.UUID(publication["id"]), _worker_request(), session, Response()
+                    )
                 )
 
                 async def prove_progress() -> None:
@@ -1154,7 +1414,7 @@ def test_publication_credential_resolution_does_not_block_the_event_loop(
         finally:
             await engine.dispose()
 
-    assert asyncio.run(exercise()) == "Basic test"
+    assert asyncio.run(exercise()) == "Basic eC1hY2Nlc3MtdG9rZW46dGVzdA=="
 
 
 def test_publication_repo_must_match_the_thread_selection(
@@ -1512,7 +1772,7 @@ def test_cluster_message_publication_card_consumer_is_delivered_or_bounded(
             ),
             credentials=None,
             cluster=None,
-            github=None,
+            code_host=None,
             lineage=None,
             replies=sink,
             job_settings=None,  # type: ignore[arg-type]
@@ -1525,7 +1785,7 @@ def test_cluster_message_publication_card_consumer_is_delivered_or_bounded(
                     if not await reconciler.deliver_pending_card():
                         break
                     raised.append(None)
-                except Exception as exc:
+                except Exception as exc:  # noqa: BLE001 - existing broad catch retained
                     raised.append(type(exc).__name__)
         finally:
             await sink.aclose()
@@ -1994,7 +2254,7 @@ def test_publication_resolved_before_card_registration_settles_the_card_once(
             ),
             credentials=None,
             cluster=None,
-            github=None,
+            code_host=None,
             lineage=None,
             replies=sink,
             job_settings=None,  # type: ignore[arg-type]
@@ -2024,9 +2284,7 @@ def test_publication_resolved_before_card_registration_settles_the_card_once(
     events, remaining, waited = asyncio.run(exercise())
     assert waited == [False, True, False]
     settled = [
-        event
-        for event in events
-        if isinstance(event, ReplyUpdate) and event.settled is not None
+        event for event in events if isinstance(event, ReplyUpdate) and event.settled is not None
     ]
     assert len(settled) == 1
     assert settled[0].target.reply_ref == card_ts
@@ -2050,11 +2308,11 @@ def test_publication_turn_is_done_before_card_delivery_and_never_replays_model(
     """The real publication insert is the card outbox; Slack never owns the turn ACK."""
 
     from aci_protocol import QueuedTurn, ReplyHandle, SessionStatus
-    from curie_api.schemas import PublicationCreate
+    from curie_api.schemas.publications import PublicationCreate
     from curie_worker.approvals import CreatedPublication, PublicationCreateRequest
     from curie_worker.behaviorpacks import BehaviorPacks
     from curie_worker.binding import ResolvedDeployment
-    from curie_worker.kernel import TurnOutcome
+    from curie_worker.kernel.failures import TurnOutcome
     from curie_worker.runner_client import RunnerWorkspaceSnapshot
 
     from apps.worker.tests.kernel.conftest import kernel_harness
@@ -2086,13 +2344,17 @@ def test_publication_turn_is_done_before_card_delivery_and_never_replays_model(
         def __init__(self, engine: Any) -> None:
             self.engine = engine
 
-        async def create_publication(self, request: PublicationCreateRequest) -> CreatedPublication:
+        async def create_publication(
+            self, request: PublicationCreateRequest, *, budget_s: float = 120
+        ) -> CreatedPublication:
             sessionmaker = async_sessionmaker(self.engine, expire_on_commit=False)
             async with sessionmaker() as session:
                 data = PublicationCreate.model_validate(request.to_json())
+
                 async def metadata_check() -> None:
                     return
-                publication, _ = await crud.create_publication(
+
+                publication, _ = await crud_publications.create_publication(
                     session, data, patch=data.decoded_patch(), metadata_check=metadata_check
                 )
                 return CreatedPublication(
@@ -2102,6 +2364,10 @@ def test_publication_turn_is_done_before_card_delivery_and_never_replays_model(
                 )
 
     class WorkspaceBinding:
+        async def identity_binding(self, *_args: Any) -> None:
+            """@spec HTTP-INVOCATION-EXECUTION-18: explicit local fixture classification."""
+            return None
+
         async def resolve(self, kind: str, adapter: str | None, channel: str) -> ResolvedDeployment:
             return ResolvedDeployment(
                 agent_id=uuid.UUID(deployment["agent_id"]),
@@ -2122,6 +2388,7 @@ def test_publication_turn_is_done_before_card_delivery_and_never_replays_model(
             *,
             kind: str | None = None,
             address: str | None = None,
+            **_: object,
         ) -> dict[str, str]:
             return {"CURIE_SESSION_ID": f"session-{thread}"}
 
@@ -2383,8 +2650,9 @@ def test_coder_path_reaches_the_publication_boundary_through_real_runner_and_api
     from aci_protocol import QueuedTurn, ReplyHandle
     from claude_agent_sdk import AssistantMessage, ResultMessage, TextBlock, ToolUseBlock
     from claude_agent_sdk.types import PermissionResultDeny
-    from curie_runner.approval import build_approval_gate, build_can_use_tool
+    from curie_runner.approval import build_approval_gate
     from curie_runner.fake import FakeModelSession
+    from curie_runner.harness.claude.approval import build_can_use_tool
     from curie_runner.otel import RunTracer
     from curie_runner.server import create_app as create_runner_app
     from curie_runner.session import SessionRunner
@@ -2407,6 +2675,10 @@ def test_coder_path_reaches_the_publication_boundary_through_real_runner_and_api
     repo, base_sha, base_archive = _local_publication_repository(tmp_path, REPO)
 
     class WorkspaceBinding:
+        async def identity_binding(self, *_args: Any) -> None:
+            """@spec HTTP-INVOCATION-EXECUTION-18: explicit local fixture classification."""
+            return None
+
         async def resolve(self, kind: str, adapter: str | None, address: str) -> ResolvedDeployment:
             assert (kind, address) == ("slack", "C0EXAMPLE1")
             return ResolvedDeployment(
@@ -2488,6 +2760,7 @@ def test_coder_path_reaches_the_publication_boundary_through_real_runner_and_api
         approval_gate=gate,
     )
     runner = SessionRunner(
+        max_usd_per_day=None,
         held_secrets=frozenset(),
         session_factory=lambda: model,
         ceiling=10_000,
@@ -2564,9 +2837,13 @@ def test_coder_path_reaches_the_publication_boundary_through_real_runner_and_api
                     runner_app=create_runner_app(
                         runner,
                         token=runner_token,
-                        snapshotter=lambda: capture_workspace_snapshot(
+                        snapshotter=lambda base_sha: capture_workspace_snapshot(
                             repo,
+                            base_sha=base_sha,
                             expected_repo=REPO,
+                            # The boot env's CURIE_REPO_ORIGIN and CURIE_REPO_PATH.
+                            trusted_origin="https://github.com",
+                            repository_path=REPO,
                             publication_title="Update README",
                             publication_body="Prepared by coder.",
                         ),
@@ -2703,6 +2980,7 @@ def test_coder_path_reaches_the_publication_boundary_through_real_runner_and_api
                 "history_durable": True,
                 "status": "idle-awaiting-input",
                 "turn_epoch": None,
+                "side_effect_emitted": False,
                 "capacity_admission": True,
                 # RUNNER-TOOL-ACCESS-5: this test's runner session is built
                 # without tool access enforcement, so it advertises none.
@@ -2817,6 +3095,10 @@ def test_kernel_publications_isolate_same_timestamp_across_slack_channels(
     class RecordingBinding:
         """Observe the production resolver's canonical history identity."""
 
+        async def identity_binding(self, *args: Any) -> Any:
+            """@spec HTTP-INVOCATION-EXECUTION-18: the wrapped production classification."""
+            return await self._resolver.identity_binding(*args)
+
         def __init__(self, resolver: BindingResolver) -> None:
             self._resolver = resolver
             self.history_keys: list[tuple[str, str, str]] = []
@@ -2831,6 +3113,7 @@ def test_kernel_publications_isolate_same_timestamp_across_slack_channels(
             *,
             kind: str | None = None,
             address: str | None = None,
+            **_: object,
         ) -> dict[str, str]:
             env = self._resolver.boot_env(
                 resolved,
@@ -3279,14 +3562,14 @@ def test_publication_approval_is_never_in_the_owed_wake_worklist(
         try:
             async with sessionmaker() as session:
                 approval_id = uuid.UUID(publication["approval_id"])
-                ids = await crud.list_resolved_unresumed(
+                ids = await crud_approvals.list_resolved_unresumed(
                     session,
                     resolved_before=datetime.now(UTC).replace(tzinfo=None) + timedelta(days=1),
                     limit=100,
                 )
-                claim = await crud.claim_resume_row(session, approval_id)
+                claim = await crud_approvals.claim_resume_row(session, approval_id)
                 await session.rollback()
-                reopened = await crud.reopen_dead_lettered_resume(
+                reopened = await crud_approvals.reopen_dead_lettered_resume(
                     session,
                     approval_id,
                     dead_lettered_after=datetime.now(UTC).replace(tzinfo=None) + timedelta(days=1),
@@ -3336,7 +3619,7 @@ def test_expired_publication_settles_without_expiry_or_reconciler_wake(
                 count = await sweep_expired_approvals(
                     session, queue, now=past + timedelta(seconds=1)
                 )
-                ids = await crud.list_resolved_unresumed(
+                ids = await crud_approvals.list_resolved_unresumed(
                     session,
                     resolved_before=past + timedelta(days=1),
                     limit=100,
@@ -3436,6 +3719,9 @@ def test_publication_credential_is_approved_only_server_derived_and_audited(
         "authorization_header": "Basic "
         + base64.b64encode(b"x-access-token:ghp_publication_operator").decode(),
         "revision": None,
+        "origin": "https://github.com",
+        "header_form": "authorization_basic",
+        "ca_bundle_ref": None,
     }
 
     audit = _rows(
@@ -3670,7 +3956,7 @@ def test_terminal_patch_retention_reaps_bytes_but_keeps_public_metadata(
                     )
                 )
                 await session.commit()
-                return await crud.reap_terminal_publication_patches(
+                return await crud_publications.reap_terminal_publication_patches(
                     session,
                     terminal_before=old + timedelta(minutes=1),
                     limit=100,
@@ -3948,6 +4234,896 @@ def test_denied_first_revision_leaves_absent_pr_create_path_available(
     assert _counts() == (2, 2)
 
 
+_READMIT_ISSUE_SEQUENCE = itertools.count(1)
+
+
+def _readmit_tracker_issue_id() -> str:
+    """A distinct numeric tracker issue id per seeded WorkItem."""
+
+    return str(494_800 + next(_READMIT_ISSUE_SEQUENCE))
+
+
+# Execution-request state shapes for the readmit fixture, as SQL value tails
+# for (status, wait_deadline, started_at, execution_deadline, terminal_at,
+# terminal_cause) -- every shape satisfies execution_requests_state_shape_ck.
+_READMIT_EXECUTION_SHAPES = {
+    "failed": (
+        "'failed', clock_timestamp() - interval '2 minutes', "
+        "clock_timestamp() - interval '90 minutes', "
+        "clock_timestamp() - interval '30 minutes', "
+        "clock_timestamp() - interval '29 minutes', 'early_stop'"
+    ),
+    "running": (
+        "'running', clock_timestamp() - interval '2 minutes', "
+        "clock_timestamp() - interval '5 minutes', "
+        "clock_timestamp() + interval '55 minutes', NULL, NULL"
+    ),
+    "completed": (
+        "'completed', clock_timestamp() - interval '2 minutes', "
+        "clock_timestamp() - interval '90 minutes', "
+        "clock_timestamp() - interval '30 minutes', "
+        "clock_timestamp() - interval '29 minutes', 'completed'"
+    ),
+}
+
+
+def _seed_readmit_stale_lineage(
+    client: TestClient,
+    auth_headers: dict[str, str],
+    *,
+    conversation_id: str,
+    base_sha: str = BASE_SHA,
+    execution_status: str = "failed",
+    work_item_conversation: str | None = None,
+    outcome_ready: bool = True,
+    deployment: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Seed #4948's bug shape: an open headless lineage at ``base_sha`` whose
+    single publication is the failed prior execution of a live WorkItem.
+
+    Every scenario lives on its own conversation, so one caller-created
+    deployment (one agent bound to one Slack route) can host them all: the
+    ``agent_channels_route_key`` uniqueness makes a second agent on the same
+    route a 409, and a shared agent is the production shape anyway.
+    """
+
+    if deployment is None:
+        deployment = _create_deployment(client, auth_headers)
+    _, publication = _create_publication(
+        client,
+        _publication_payload(
+            deployment["id"],
+            conversation_id=conversation_id,
+            dedupe_key=f"{conversation_id}-failed-first",
+            base_sha=base_sha,
+        ),
+    )
+    _execute(
+        "UPDATE curie.publications SET status = 'failed'"
+        + (", outcome_history_ready_at = now()" if outcome_ready else "")
+        + " WHERE id = :id",
+        {"id": uuid.UUID(publication["id"])},
+    )
+    lineage_id = uuid.UUID(publication["lineage_id"])
+    lineage = _rows(
+        "SELECT agent_id, conversation_id FROM curie.thread_publication_lineages WHERE id = :id",
+        {"id": lineage_id},
+    )[0]
+    item_id, request_id = uuid.uuid4(), uuid.uuid4()
+    _execute(
+        "INSERT INTO curie.work_items (id, code_host_kind, code_host_host, "
+        "tracker_kind, tracker_host, tracker_scope_id, repository_project_id, tracker_issue_id, "
+        "code_host_installation_id, agent_id, repository_path, conversation_id, version, "
+        "base_branch, base_source, base_commit) "
+        "VALUES (:id, 'github', 'github.com', 'github', 'github.com', '9001', "
+        "'9001', :issue, 41, :agent, :repo, :conversation, 1, 'main', 'default', :base)",
+        {
+            "id": item_id,
+            "issue": _readmit_tracker_issue_id(),
+            "agent": lineage["agent_id"],
+            "repo": REPO,
+            "conversation": work_item_conversation or lineage["conversation_id"],
+            "base": base_sha,
+        },
+    )
+    _execute(
+        "INSERT INTO curie.execution_requests (id, work_item_id, sequence, status, "
+        "wait_deadline, started_at, execution_deadline, terminal_at, terminal_cause, "
+        "execution_attempts) "
+        f"VALUES (:id, :item, 1, {_READMIT_EXECUTION_SHAPES[execution_status]}, 1)",
+        {"id": request_id, "item": item_id},
+    )
+    _execute(
+        "UPDATE curie.publications SET execution_request_id = :request WHERE id = :id",
+        {"id": uuid.UUID(publication["id"]), "request": request_id},
+    )
+    return {
+        "deployment": deployment,
+        "publication": publication,
+        "lineage_id": lineage_id,
+        "item_id": item_id,
+        "request_id": request_id,
+    }
+
+
+def _readmit_lineage_row(lineage_id: uuid.UUID) -> dict[str, Any]:
+    return _rows(
+        "SELECT * FROM curie.thread_publication_lineages WHERE id = :id",
+        {"id": lineage_id},
+    )[0]
+
+
+def _absent_branch(request: httpx.Request) -> httpx.Response:
+    """The code host's answer when the lineage branch was never pushed."""
+
+    if "/git/matching-refs/heads/" in request.url.path:
+        return httpx.Response(200, json=[])
+    assert "/git/ref/heads/" in request.url.path, request.url.path
+    return httpx.Response(404, json={"message": "Branch not found"})
+
+
+@pytest.mark.parametrize("contents_status", [404, 401, 403, 503])
+def test_readmit_masked_ref_404_preserves_pushed_lineage(
+    publication_stack: tuple[TestClient, str],
+    auth_headers: dict[str, str],
+    clean_db: None,
+    contents_status: int,
+) -> None:
+    # GitHub masks inaccessible resources as 404, including existing refs:
+    # https://docs.github.com/en/rest/using-the-rest-api/troubleshooting-the-rest-api
+    # Repository metadata permission does not grant Contents read permission:
+    # https://docs.github.com/en/rest/authentication/permissions-required-for-fine-grained-personal-access-tokens#repository-permissions-for-contents
+    from forge_fakes.github import GitHubRepositoryFake
+
+    client, _ = publication_stack
+    conversation_id = "thread-readmit-masked-ref"
+    seed = _seed_readmit_stale_lineage(client, auth_headers, conversation_id=conversation_id)
+    original = _readmit_lineage_row(seed["lineage_id"])
+    forge = GitHubRepositoryFake()
+    forge.branches[original["branch"]] = SECOND_REVISION_SHA
+    requests: list[httpx.Request] = []
+
+    def inaccessible_contents(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        if "/git/ref/heads/" in request.url.path:
+            assert forge.handle(request).status_code == 200
+            return httpx.Response(404, json={"message": "Not Found"})
+        if "/git/matching-refs/heads/" in request.url.path:
+            return httpx.Response(contents_status, json={"message": "Not Found"})
+        return forge.handle(request)
+
+    kept = _get_lineage_with_http(
+        client,
+        deployment_id=seed["deployment"]["id"],
+        conversation_id=conversation_id,
+        handler=inaccessible_contents,
+    )
+    assert kept.status_code == 200, kept.text
+    assert uuid.UUID(kept.json()["id"]) == seed["lineage_id"]
+    assert _readmit_lineage_row(seed["lineage_id"]) == original
+    assert len(requests) == 2
+    assert "/git/matching-refs/heads/" in requests[1].url.path
+    assert requests[0].headers["Authorization"] == requests[1].headers["Authorization"]
+    _execute(
+        "UPDATE curie.work_items SET base_commit = :base WHERE id = :id",
+        {"id": seed["item_id"], "base": SECOND_REVISION_SHA},
+    )
+    status_code, revision = _create_publication(
+        client,
+        _publication_payload(
+            seed["deployment"]["id"],
+            conversation_id=conversation_id,
+            dedupe_key="readmit-masked-ref-two",
+        ),
+    )
+    assert status_code == 201
+    assert uuid.UUID(revision["lineage_id"]) == seed["lineage_id"]
+    assert revision["revision_number"] == 2
+    assert revision["base_sha"] == original["base_sha"]
+    after = _readmit_lineage_row(seed["lineage_id"])
+    assert after["status"] == "open"
+    assert after["version"] == original["version"]
+    assert after["branch"] == original["branch"]
+    assert after["head_sha"] is None
+    assert after["pr_number"] is None
+
+
+def test_readmitted_never_pushed_lineage_prepares_current_base(
+    publication_stack: tuple[TestClient, str],
+    auth_headers: dict[str, str],
+    clean_db: None,
+    tmp_path: Path,
+) -> None:
+    """#4948: a re-admitted run whose failed first publication never pushed
+    prepares its workspace at the WorkItem's re-admit base.
+
+    The lineage read drives the production route, credential redemption the
+    production client, and the workspace the production preparer over a real
+    two-commit git fixture; only the forge and the object store are faked.
+    """
+    from curie_worker.workspace import (
+        WorkspaceCredentialClient,
+        WorkspaceLimits,
+        WorkspacePreparer,
+    )
+
+    client, _ = publication_stack
+    repo_path, stale_base, readmit_base = _two_commit_repository(tmp_path)
+    conversation_id = "thread-readmit-current-base"
+    seed = _seed_readmit_stale_lineage(
+        client,
+        auth_headers,
+        conversation_id=conversation_id,
+        base_sha=stale_base,
+    )
+    # Re-admission: the WorkItem's base moves to the newer commit.
+    _execute(
+        "UPDATE curie.work_items SET base_commit = :base WHERE id = :id",
+        {"id": seed["item_id"], "base": readmit_base},
+    )
+
+    retired = _get_lineage_with_http(
+        client,
+        deployment_id=seed["deployment"]["id"],
+        conversation_id=conversation_id,
+        handler=_absent_branch,
+    )
+    assert retired.status_code == 404, retired.text
+
+    scoped = channel_protocol.scoped_conversation_id("slack", "C0EXAMPLE1", conversation_id)
+    credentials = WorkspaceCredentialClient(
+        api_url="http://internal-api.test",
+        worker_token=WORKER_TOKEN,
+        transport=_testclient_transport(client),
+    )
+    credential = credentials.redeem(uuid.UUID(seed["deployment"]["id"]), scoped)
+    assert credential.base_commit == readmit_base
+
+    preparer = WorkspacePreparer(
+        credentials=credentials,
+        commands=_ReadmitGitCommands(repo_path),
+        objects=_PresigningObjects(),
+        scratch_root=tmp_path / "claim-scratch",
+        limits=WorkspaceLimits(
+            clone_timeout_seconds=90,
+            archive_timeout_seconds=30,
+            upload_timeout_seconds=30,
+            total_timeout_seconds=150,
+            max_checkout_bytes=512 * 1024 * 1024,
+            max_archive_bytes=256 * 1024 * 1024,
+            max_members=4096,
+            max_compression_ratio=20.0,
+            reference_ttl_seconds=300,
+            max_concurrent_clones=2,
+        ),
+    )
+    prepared = preparer.prepare(
+        deployment_id=uuid.UUID(seed["deployment"]["id"]),
+        thread_key=scoped,
+        generation="claim-readmit-one",
+    )
+    assert prepared.base_sha == readmit_base
+    assert prepared.materialized_head == readmit_base
+    commands = preparer.commands
+    fetch_pins = [call["argv"][-1] for call in commands.calls if "fetch" in call["argv"]]
+    assert readmit_base in fetch_pins
+    assert stale_base not in fetch_pins
+    checkout_pins = [
+        call["argv"][-1]
+        for call in commands.calls
+        if "checkout" in call["argv"] and "--detach" in call["argv"]
+    ]
+    assert checkout_pins == [readmit_base]
+
+
+def test_readmit_preserves_published_or_pushed_lineage(
+    publication_stack: tuple[TestClient, str],
+    auth_headers: dict[str, str],
+    clean_db: None,
+) -> None:
+    """#4948: retirement fires only for the never-pushed failed-execution shape.
+
+    Control first: the eligible lineage retires. A lineage that reached a pull
+    request (a recorded head always arrives with one), a branch that exists
+    remotely although no push was recorded, and a publication whose execution
+    is not a failed prior execution of this thread's WorkItem each keep the
+    lineage and its revision sequence.
+    """
+    client, _ = publication_stack
+    control_conversation = "thread-readmit-preserve-control"
+    control = _seed_readmit_stale_lineage(
+        client,
+        auth_headers,
+        conversation_id=control_conversation,
+    )
+    retired = _get_lineage_with_http(
+        client,
+        deployment_id=control["deployment"]["id"],
+        conversation_id=control_conversation,
+        handler=_absent_branch,
+    )
+    assert retired.status_code == 404, retired.text
+    assert _readmit_lineage_row(control["lineage_id"])["status"] == "closed"
+
+    # A lineage that reached a pull request keeps its recorded identity.
+    pr_conversation = "thread-readmit-preserve-pull-request"
+    pr_deployment, pr_publication = _open_lineage(
+        client,
+        auth_headers,
+        conversation_id=pr_conversation,
+        deployment=control["deployment"],
+    )
+
+    def pull_request_reads(request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        assert "/git/ref/heads/" not in path, "a pull request lineage is never probed"
+        assert path.endswith(f"/repos/{REPO}/pulls/{PR_NUMBER}"), path
+        return _healthy_github_pr(
+            branch=pr_publication["branch"],
+            head_sha=FIRST_REVISION_SHA,
+        )
+
+    preserved = _get_lineage_with_http(
+        client,
+        deployment_id=pr_deployment["id"],
+        conversation_id=pr_conversation,
+        handler=pull_request_reads,
+    )
+    assert preserved.status_code == 200, preserved.text
+    assert preserved.json()["pr_number"] == PR_NUMBER
+    assert preserved.json()["head_sha"] == FIRST_REVISION_SHA
+    assert _readmit_lineage_row(uuid.UUID(pr_publication["lineage_id"]))["status"] == "open"
+    _, pr_revision = _create_publication(
+        client,
+        _publication_payload(
+            pr_deployment["id"],
+            conversation_id=pr_conversation,
+            dedupe_key="readmit-preserve-pull-request-two",
+            base_sha=FIRST_REVISION_SHA,
+        ),
+    )
+    assert uuid.UUID(pr_revision["lineage_id"]) == uuid.UUID(pr_publication["lineage_id"])
+    assert pr_revision["revision_number"] == 2
+
+    # A branch that exists remotely although no push was recorded is preserved.
+    pushed_conversation = "thread-readmit-preserve-pushed"
+    pushed = _seed_readmit_stale_lineage(
+        client,
+        auth_headers,
+        conversation_id=pushed_conversation,
+        deployment=control["deployment"],
+    )
+
+    def present_branch(request: httpx.Request) -> httpx.Response:
+        assert "/git/ref/heads/" in request.url.path, request.url.path
+        return httpx.Response(
+            200,
+            json={
+                "ref": "refs/heads/unrecorded-push",
+                "object": {"type": "commit", "sha": SECOND_REVISION_SHA},
+            },
+        )
+
+    kept = _get_lineage_with_http(
+        client,
+        deployment_id=pushed["deployment"]["id"],
+        conversation_id=pushed_conversation,
+        handler=present_branch,
+    )
+    assert kept.status_code == 200, kept.text
+    assert _readmit_lineage_row(pushed["lineage_id"])["status"] == "open"
+    _, pushed_revision = _create_publication(
+        client,
+        _publication_payload(
+            pushed["deployment"]["id"],
+            conversation_id=pushed_conversation,
+            dedupe_key="readmit-preserve-pushed-two",
+        ),
+    )
+    assert uuid.UUID(pushed_revision["lineage_id"]) == pushed["lineage_id"]
+    assert pushed_revision["revision_number"] == 2
+
+    # Eligibility predicates: the failed publication must be the failed prior
+    # execution of this thread's own WorkItem.
+    for label, kwargs in (
+        ("running-execution", {"execution_status": "running"}),
+        ("completed-execution", {"execution_status": "completed"}),
+        (
+            "another-work-item",
+            {"work_item_conversation": "thread-readmit-preserve-foreign-item"},
+        ),
+    ):
+        conversation_id = f"thread-readmit-preserve-{label}"
+        seed = _seed_readmit_stale_lineage(
+            client,
+            auth_headers,
+            conversation_id=conversation_id,
+            deployment=control["deployment"],
+            **kwargs,
+        )
+        ineligible = _get_lineage_with_http(
+            client,
+            deployment_id=seed["deployment"]["id"],
+            conversation_id=conversation_id,
+            handler=_absent_branch,
+        )
+        assert ineligible.status_code == 200, f"{label}: {ineligible.text}"
+        assert _readmit_lineage_row(seed["lineage_id"])["status"] == "open", label
+
+
+def test_readmit_creates_new_lineage_after_never_pushed_failure(
+    publication_stack: tuple[TestClient, str],
+    auth_headers: dict[str, str],
+    clean_db: None,
+) -> None:
+    """#4948: the abandoned lineage closes before the new workspace is exposed,
+    and the next publication opens a distinct open lineage at the re-admit
+    base. Reads and creates never resurrect the closed row, and a lineage that
+    closed with a pull request keeps its terminal refusal.
+    """
+    client, _ = publication_stack
+    conversation_id = "thread-readmit-fresh-lineage"
+    seed = _seed_readmit_stale_lineage(
+        client,
+        auth_headers,
+        conversation_id=conversation_id,
+    )
+    retired = _get_lineage_with_http(
+        client,
+        deployment_id=seed["deployment"]["id"],
+        conversation_id=conversation_id,
+        handler=_absent_branch,
+    )
+    assert retired.status_code == 404, retired.text
+    old = _readmit_lineage_row(seed["lineage_id"])
+    assert old["status"] == "closed"
+    assert old["pr_number"] is None
+    assert old["head_sha"] is None
+    assert old["version"] == 2
+
+    _execute(
+        "UPDATE curie.work_items SET base_commit = :base WHERE id = :id",
+        {"id": seed["item_id"], "base": SECOND_REVISION_SHA},
+    )
+    status_code, fresh = _create_publication(
+        client,
+        _publication_payload(
+            seed["deployment"]["id"],
+            conversation_id=conversation_id,
+            dedupe_key="readmit-fresh-lineage-two",
+            base_sha=SECOND_REVISION_SHA,
+        ),
+    )
+    assert status_code == 201
+    assert uuid.UUID(fresh["lineage_id"]) != seed["lineage_id"]
+    assert fresh["revision_number"] == 1
+    assert fresh["base_sha"] == SECOND_REVISION_SHA
+    assert fresh["branch"] != old["branch"]
+    fresh_row = _readmit_lineage_row(uuid.UUID(fresh["lineage_id"]))
+    assert fresh_row["status"] == "open"
+    assert fresh_row["base_sha"] == SECOND_REVISION_SHA
+    assert _readmit_lineage_row(seed["lineage_id"])["status"] == "closed"
+
+    read = _get_lineage(
+        client,
+        deployment_id=seed["deployment"]["id"],
+        conversation_id=conversation_id,
+    )
+    assert read.status_code == 200, read.text
+    assert uuid.UUID(read.json()["id"]) == uuid.UUID(fresh["lineage_id"])
+
+    # A reader whose probe overlapped another reader's close is never answered
+    # with the retired row: the close lands while its probe is in flight, so
+    # its locked re-read finds the lineage closed and it must answer absence,
+    # not the closed headless lineage a naive lock holder would hand back.
+    overlap_conversation = "thread-readmit-overlapping-readers"
+    overlap = _seed_readmit_stale_lineage(
+        client,
+        auth_headers,
+        conversation_id=overlap_conversation,
+        deployment=seed["deployment"],
+    )
+    probe_started = threading.Event()
+    close_landed = threading.Event()
+
+    def probe_then_close(request: httpx.Request) -> httpx.Response:
+        if "/git/matching-refs/heads/" in request.url.path:
+            return httpx.Response(200, json=[])
+        assert "/git/ref/heads/" in request.url.path, request.url.path
+        probe_started.set()
+        assert close_landed.wait(timeout=30), "closing reader never landed during the probe"
+        return httpx.Response(404, json={"message": "Branch not found"})
+
+    def closing_reader() -> None:
+        assert probe_started.wait(timeout=30), "the probe never started"
+        with TestClient(create_app()) as closing_client:
+            response = _get_lineage_with_http(
+                closing_client,
+                deployment_id=overlap["deployment"]["id"],
+                conversation_id=overlap_conversation,
+                handler=_absent_branch,
+            )
+        assert response.status_code == 404, response.text
+        close_landed.set()
+
+    closing_thread = threading.Thread(target=closing_reader)
+    closing_thread.start()
+    try:
+        second = _get_lineage_with_http(
+            client,
+            deployment_id=overlap["deployment"]["id"],
+            conversation_id=overlap_conversation,
+            handler=probe_then_close,
+        )
+    finally:
+        close_landed.set()
+        closing_thread.join(timeout=30)
+    assert second.status_code == 404, second.text
+    assert _readmit_lineage_row(overlap["lineage_id"])["status"] == "closed"
+
+    # A lineage that closed carrying a pull request remains terminal.
+    terminal_conversation = "thread-readmit-terminal-pull-request"
+    terminal_deployment, terminal_first = _open_lineage(
+        client,
+        auth_headers,
+        conversation_id=terminal_conversation,
+        deployment=seed["deployment"],
+    )
+    _, terminal_second = _create_publication(
+        client,
+        _publication_payload(
+            terminal_deployment["id"],
+            conversation_id=terminal_conversation,
+            dedupe_key="readmit-terminal-two",
+            base_sha=FIRST_REVISION_SHA,
+        ),
+    )
+    assert (
+        _resolve(client, auth_headers, terminal_second["approval_id"]).status_code == 200
+    )
+    terminal = _advance_lineage(
+        client,
+        terminal_second["id"],
+        expected_version=2,
+        expected_head_sha=FIRST_REVISION_SHA,
+        head_sha=FIRST_REVISION_SHA,
+        state="closed",
+    )
+    assert terminal.status_code == 200, terminal.text
+    refused = client.post(
+        "/v1/internal/publications",
+        json=_publication_payload(
+            terminal_deployment["id"],
+            conversation_id=terminal_conversation,
+            dedupe_key="readmit-terminal-three",
+            base_sha=FIRST_REVISION_SHA,
+        ),
+        headers=WORKER_HEADERS,
+    )
+    assert refused.status_code == 409
+    assert refused.json()["detail"]["code"] == "publication.lineage_terminal"
+
+
+def test_readmit_lineage_retirement_fails_closed(
+    publication_stack: tuple[TestClient, str],
+    auth_headers: dict[str, str],
+    clean_db: None,
+) -> None:
+    """#4948: retirement is refused unless remote branch absence is proven.
+
+    An unavailable or unauthorized forge read, a publication writer admitted
+    during the probe, an in-flight revision, an undurable outcome, and a
+    lineage-version bump during the probe each leave the lineage unchanged
+    and claim no fresh lineage. The control proves the machinery retires when
+    nothing races it.
+    """
+    client, _ = publication_stack
+    control_conversation = "thread-readmit-failclosed-control"
+    control = _seed_readmit_stale_lineage(
+        client,
+        auth_headers,
+        conversation_id=control_conversation,
+    )
+    retired = _get_lineage_with_http(
+        client,
+        deployment_id=control["deployment"]["id"],
+        conversation_id=control_conversation,
+        handler=_absent_branch,
+    )
+    assert retired.status_code == 404, retired.text
+    assert _readmit_lineage_row(control["lineage_id"])["status"] == "closed"
+
+    unavailable_conversation = "thread-readmit-failclosed-unavailable"
+    unavailable = _seed_readmit_stale_lineage(
+        client,
+        auth_headers,
+        conversation_id=unavailable_conversation,
+        deployment=control["deployment"],
+    )
+
+    def unreachable(request: httpx.Request) -> httpx.Response:
+        assert "/git/ref/heads/" in request.url.path, request.url.path
+        raise httpx.ConnectError("forge unreachable")
+
+    kept = _get_lineage_with_http(
+        client,
+        deployment_id=unavailable["deployment"]["id"],
+        conversation_id=unavailable_conversation,
+        handler=unreachable,
+    )
+    assert kept.status_code == 200, kept.text
+    assert _readmit_lineage_row(unavailable["lineage_id"])["status"] == "open"
+    _, unavailable_revision = _create_publication(
+        client,
+        _publication_payload(
+            unavailable["deployment"]["id"],
+            conversation_id=unavailable_conversation,
+            dedupe_key="readmit-failclosed-unavailable-two",
+        ),
+    )
+    assert uuid.UUID(unavailable_revision["lineage_id"]) == unavailable["lineage_id"]
+    assert unavailable_revision["revision_number"] == 2
+
+    unauthorized_conversation = "thread-readmit-failclosed-unauthorized"
+    unauthorized = _seed_readmit_stale_lineage(
+        client,
+        auth_headers,
+        conversation_id=unauthorized_conversation,
+        deployment=control["deployment"],
+    )
+
+    def refused_credentials(request: httpx.Request) -> httpx.Response:
+        assert "/git/ref/heads/" in request.url.path, request.url.path
+        return httpx.Response(401, json={"message": "Bad credentials"})
+
+    kept = _get_lineage_with_http(
+        client,
+        deployment_id=unauthorized["deployment"]["id"],
+        conversation_id=unauthorized_conversation,
+        handler=refused_credentials,
+    )
+    assert kept.status_code == 200, kept.text
+    assert _readmit_lineage_row(unauthorized["lineage_id"])["status"] == "open"
+
+    inflight_conversation = "thread-readmit-failclosed-inflight"
+    inflight = _seed_readmit_stale_lineage(
+        client,
+        auth_headers,
+        conversation_id=inflight_conversation,
+        deployment=control["deployment"],
+    )
+    _, _pending = _create_publication(
+        client,
+        _publication_payload(
+            inflight["deployment"]["id"],
+            conversation_id=inflight_conversation,
+            dedupe_key="readmit-failclosed-inflight-two",
+        ),
+    )
+    read = _get_lineage_with_http(
+        client,
+        deployment_id=inflight["deployment"]["id"],
+        conversation_id=inflight_conversation,
+        handler=_absent_branch,
+    )
+    assert read.status_code == 200, read.text
+    assert read.json()["has_pending_revision"] is True
+    assert _readmit_lineage_row(inflight["lineage_id"])["status"] == "open"
+
+    undurable_conversation = "thread-readmit-failclosed-undurable"
+    undurable = _seed_readmit_stale_lineage(
+        client,
+        auth_headers,
+        conversation_id=undurable_conversation,
+        outcome_ready=False,
+        deployment=control["deployment"],
+    )
+    read = _get_lineage_with_http(
+        client,
+        deployment_id=undurable["deployment"]["id"],
+        conversation_id=undurable_conversation,
+        handler=_absent_branch,
+    )
+    assert read.status_code == 200, read.text
+    assert read.json()["has_pending_outcome"] is True
+    blocked = client.post(
+        "/v1/internal/publications",
+        json=_publication_payload(
+            undurable["deployment"]["id"],
+            conversation_id=undurable_conversation,
+            dedupe_key="readmit-failclosed-undurable-two",
+        ),
+        headers=WORKER_HEADERS,
+    )
+    assert blocked.status_code == 409
+    assert blocked.json()["detail"]["code"] == "publication.outcome_pending"
+    assert _readmit_lineage_row(undurable["lineage_id"])["status"] == "open"
+
+    # A publication writer admitted while the probe is in flight serializes
+    # against the retirement lock and keeps the lineage.
+    writer_conversation = "thread-readmit-failclosed-writer"
+    writer = _seed_readmit_stale_lineage(
+        client,
+        auth_headers,
+        conversation_id=writer_conversation,
+        deployment=control["deployment"],
+    )
+    probe_started = threading.Event()
+    writer_landed = threading.Event()
+
+    def probe_then_wait(request: httpx.Request) -> httpx.Response:
+        if "/git/matching-refs/heads/" in request.url.path:
+            return httpx.Response(200, json=[])
+        assert "/git/ref/heads/" in request.url.path, request.url.path
+        probe_started.set()
+        assert writer_landed.wait(timeout=30), "writer never landed during the probe"
+        return httpx.Response(404, json={"message": "Branch not found"})
+
+    def admit_writer() -> None:
+        assert probe_started.wait(timeout=30), "the probe never started"
+        with TestClient(create_app()) as writer_client:
+            response = writer_client.post(
+                "/v1/internal/publications",
+                json=_publication_payload(
+                    writer["deployment"]["id"],
+                    conversation_id=writer_conversation,
+                    dedupe_key="readmit-failclosed-writer-two",
+                ),
+                headers=WORKER_HEADERS,
+            )
+        assert response.status_code in (200, 201), response.text
+        writer_landed.set()
+
+    writer_thread = threading.Thread(target=admit_writer)
+    writer_thread.start()
+    try:
+        kept = _get_lineage_with_http(
+            client,
+            deployment_id=writer["deployment"]["id"],
+            conversation_id=writer_conversation,
+            handler=probe_then_wait,
+        )
+    finally:
+        writer_landed.set()
+        writer_thread.join(timeout=30)
+    assert kept.status_code == 200, kept.text
+    assert _readmit_lineage_row(writer["lineage_id"])["status"] == "open"
+    assert _rows(
+        "SELECT revision_number FROM curie.publications WHERE lineage_id = :id "
+        "ORDER BY revision_number",
+        {"id": writer["lineage_id"]},
+    ) == [{"revision_number": 1}, {"revision_number": 2}]
+
+    # A lineage-version bump during the probe makes the close refuse.
+    stale_conversation = "thread-readmit-failclosed-stale"
+    stale = _seed_readmit_stale_lineage(
+        client,
+        auth_headers,
+        conversation_id=stale_conversation,
+        deployment=control["deployment"],
+    )
+    bump_seen = threading.Event()
+    bump_done = threading.Event()
+
+    def probe_then_bump(request: httpx.Request) -> httpx.Response:
+        if "/git/matching-refs/heads/" in request.url.path:
+            return httpx.Response(200, json=[])
+        assert "/git/ref/heads/" in request.url.path, request.url.path
+        bump_seen.set()
+        assert bump_done.wait(timeout=30), "version bump never landed during the probe"
+        return httpx.Response(404, json={"message": "Branch not found"})
+
+    def bump_lineage_version() -> None:
+        assert bump_seen.wait(timeout=30), "the probe never started"
+        _execute(
+            "UPDATE curie.thread_publication_lineages SET version = version + 1, "
+            "updated_at = now() WHERE id = :id",
+            {"id": stale["lineage_id"]},
+        )
+        bump_done.set()
+
+    bump_thread = threading.Thread(target=bump_lineage_version)
+    bump_thread.start()
+    try:
+        kept = _get_lineage_with_http(
+            client,
+            deployment_id=stale["deployment"]["id"],
+            conversation_id=stale_conversation,
+            handler=probe_then_bump,
+        )
+    finally:
+        bump_done.set()
+        bump_thread.join(timeout=30)
+    assert kept.status_code == 200, kept.text
+    bumped_row = _readmit_lineage_row(stale["lineage_id"])
+    assert bumped_row["status"] == "open"
+    assert bumped_row["version"] == 2
+    _, stale_revision = _create_publication(
+        client,
+        _publication_payload(
+            stale["deployment"]["id"],
+            conversation_id=stale_conversation,
+            dedupe_key="readmit-failclosed-stale-two",
+        ),
+    )
+    assert uuid.UUID(stale_revision["lineage_id"]) == stale["lineage_id"]
+    assert stale_revision["revision_number"] == 2
+
+
+def _two_commit_repository(root: Path) -> tuple[Path, str, str]:
+    """A real repository on branch ``main``: (path, stale base, newer base)."""
+
+    repo = root / "readmit-fixture-repo"
+    repo.mkdir()
+
+    def git(*args: str) -> str:
+        return subprocess.run(
+            ["git", *args],
+            cwd=repo,
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+
+    subprocess.run(["git", "init", "--initial-branch=main", "--quiet"], cwd=repo, check=True)
+    git("config", "user.email", "coder@example.com")
+    git("config", "user.name", "Coder Test")
+    (repo / "README.md").write_text("stale proposal base\n")
+    git("add", "README.md")
+    git("commit", "--quiet", "-m", "stale base")
+    stale_base = git("rev-parse", "HEAD")
+    (repo / "README.md").write_text("re-admit base\n")
+    git("commit", "--quiet", "-am", "readmit base")
+    return repo, stale_base, git("rev-parse", "HEAD")
+
+
+class _ReadmitGitCommands:
+    """A CommandPort double that runs the production argv with real git.
+
+    Only the clone URL is redirected to the on-disk fixture; the preparer's
+    pin order alone decides which base the checkout lands on (#4948).
+    """
+
+    def __init__(self, source: Path) -> None:
+        self.source = source
+        self.calls: list[dict[str, Any]] = []
+
+    def require(self, executable: str) -> None:
+        subprocess.run(["git", "--version"], check=True, capture_output=True)
+
+    def run(
+        self,
+        argv: Sequence[str],
+        *,
+        cwd: Path | None = None,
+        env: dict[str, str] | None = None,
+        timeout_seconds: float,
+    ) -> Any:
+        del env, timeout_seconds
+        args = [str(part) for part in argv]
+        self.calls.append({"argv": args, "cwd": cwd})
+        assert args[0] == "git"
+        forwarded = ["git", "-c", "protocol.file.allow=always", *args[1:]]
+        if "clone" in args:
+            forwarded[-2] = f"file://{self.source}"
+        result = subprocess.run(
+            forwarded,
+            cwd=cwd,
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        return SimpleNamespace(stdout=result.stdout)
+
+
+class _PresigningObjects(_MemoryWorkspaceObjects):
+    """`_MemoryWorkspaceObjects` plus the reference signing the preparer needs."""
+
+    def presign_get(self, key: str, *, expires_seconds: int) -> str:
+        del expires_seconds
+        return f"https://objects.example.test/{key}"
+
+
 def test_redeployment_reuses_agent_owned_thread_lineage(
     publication_stack: tuple[TestClient, str],
     auth_headers: dict[str, str],
@@ -4100,7 +5276,7 @@ def test_terminal_lineage_refuses_revision_and_credential_before_resolution(
         raise AssertionError("terminal lineage reached credential resolution")
 
     monkeypatch.setattr(
-        "curie_api.routers.publications.resolve_repository_credential",
+        "curie_api.forges.github.code_host.resolve_repository_credential",
         forbidden_resolver,
     )
     credential = client.post(
@@ -4218,6 +5394,141 @@ def test_lineage_advance_success_clears_an_earlier_attempt_error(
         "SELECT status, error FROM curie.publications WHERE id = :id",
         {"id": uuid.UUID(publication["id"])},
     ) == [{"status": "succeeded", "error": None}]
+
+
+def _late_publication_link_case(
+    client: TestClient, auth_headers: dict[str, str], *, refusal: str | None = None
+) -> tuple[dict[str, Any], uuid.UUID, uuid.UUID]:
+    deployment = _create_deployment(client, auth_headers)
+    _, publication = _create_publication(client, _publication_payload(deployment["id"]))
+    approved = _resolve(client, auth_headers, publication["approval_id"])
+    assert approved.status_code == 200, approved.text
+    lineage_id = uuid.UUID(publication["lineage_id"])
+    lineage = _rows(
+        "SELECT agent_id, conversation_id FROM curie.thread_publication_lineages WHERE id = :id",
+        {"id": lineage_id},
+    )[0]
+    item_id, request_id = uuid.uuid4(), uuid.uuid4()
+    _execute(
+        "INSERT INTO curie.work_items (id, code_host_kind, code_host_host, "
+        "tracker_kind, tracker_host, tracker_scope_id, repository_project_id, tracker_issue_id, "
+        "code_host_installation_id, agent_id, repository_path, conversation_id, version, "
+        "base_branch, base_source, base_commit) "
+        "VALUES (:id, 'github', 'github.com', 'github', 'github.com', :repository, "
+        ":repository, '4298', :installation, :agent, :repo, :conversation, 7, "
+        "'main', 'default', :base)",
+        {
+            "id": item_id,
+            "agent": lineage["agent_id"],
+            "repository": "9002" if refusal == "repository_id" else "9001",
+            "installation": 42 if refusal == "installation_id" else 41,
+            "repo": "acme-corp/other" if refusal == "repository" else REPO,
+            "conversation": lineage["conversation_id"],
+            "base": publication["base_sha"],
+        },
+    )
+    _execute(
+        "INSERT INTO curie.execution_requests (id, work_item_id, sequence, status, "
+        "wait_deadline, started_at, execution_deadline, terminal_cause, execution_attempts) "
+        "VALUES (:id, :item, 1, 'cancellation_requested', "
+        "clock_timestamp() - interval '2 minutes', clock_timestamp() - interval '1 minute', "
+        "clock_timestamp() + interval '1 hour', 'issue_cancelled', 1)",
+        {"id": request_id, "item": item_id},
+    )
+    _execute(
+        "UPDATE curie.publications SET execution_request_id = :request WHERE id = :id",
+        {"id": uuid.UUID(publication["id"]), "request": request_id},
+    )
+    return publication, item_id, request_id
+
+
+def test_lineage_advance_links_a_readmitted_work_item_after_its_request_left_running(
+    review_lineage_app: tuple[TestClient, dict[str, Any], str],
+    auth_headers: dict[str, str],
+    clean_db: None,
+) -> None:
+    client, truth, _ = review_lineage_app
+    publication, item_id, request_id = _late_publication_link_case(client, auth_headers)
+    truth["branch"] = publication["branch"]
+    before = _rows("SELECT * FROM curie.work_items WHERE id = :id", {"id": item_id})[0]
+    old_request = _rows("SELECT * FROM curie.execution_requests WHERE id = :id", {"id": request_id})
+
+    advanced = _advance_lineage(
+        client,
+        publication["id"],
+        expected_version=1,
+        expected_head_sha=None,
+        head_sha=FIRST_REVISION_SHA,
+    )
+
+    assert advanced.status_code == 200, advanced.text
+    after = _rows("SELECT * FROM curie.work_items WHERE id = :id", {"id": item_id})[0]
+    assert after["publication_lineage_id"] == uuid.UUID(publication["lineage_id"])
+    assert after["version"] == before["version"] + 1
+    unchanged = set(before) - {"publication_lineage_id", "version", "updated_at"}
+    assert {key: after[key] for key in unchanged} == {key: before[key] for key in unchanged}
+    assert (
+        _rows("SELECT * FROM curie.execution_requests WHERE id = :id", {"id": request_id})
+        == old_request
+    )
+    assert _rows(
+        "SELECT execution_request_id FROM curie.publications WHERE id = :id",
+        {"id": uuid.UUID(publication["id"])},
+    ) == [{"execution_request_id": request_id}]
+
+
+@pytest.mark.parametrize(
+    "refusal", ["cancelled", "another_owner", "repository_id", "installation_id", "repository"]
+)
+def test_late_lineage_advance_preserves_ineligible_work_item_rows(
+    review_lineage_app: tuple[TestClient, dict[str, Any], str],
+    auth_headers: dict[str, str],
+    clean_db: None,
+    refusal: str,
+) -> None:
+    client, truth, _ = review_lineage_app
+    publication, item_id, request_id = _late_publication_link_case(
+        client, auth_headers, refusal=refusal
+    )
+    truth["branch"] = publication["branch"]
+    if refusal == "another_owner":
+        _execute(
+            "INSERT INTO curie.work_items (id, code_host_kind, code_host_host, "
+            "tracker_kind, tracker_host, tracker_scope_id, repository_project_id, "
+            "tracker_issue_id, "
+            "code_host_installation_id, agent_id, repository_path, conversation_id, "
+            "publication_lineage_id) SELECT :other, code_host_kind, code_host_host, "
+            "tracker_kind, tracker_host, tracker_scope_id, repository_project_id, '4299', "
+            "code_host_installation_id, agent_id, repository_path, 'other-conversation', :lineage "
+            "FROM curie.work_items WHERE id = :id",
+            {
+                "id": item_id,
+                "other": uuid.uuid4(),
+                "lineage": uuid.UUID(publication["lineage_id"]),
+            },
+        )
+    elif refusal == "cancelled":
+        _execute(
+            "UPDATE curie.work_items SET cancelled_at = clock_timestamp() WHERE id = :id",
+            {"id": item_id},
+        )
+    before = _rows("SELECT * FROM curie.work_items ORDER BY id")
+    old_request = _rows("SELECT * FROM curie.execution_requests WHERE id = :id", {"id": request_id})
+
+    advanced = _advance_lineage(
+        client,
+        publication["id"],
+        expected_version=1,
+        expected_head_sha=None,
+        head_sha=FIRST_REVISION_SHA,
+    )
+
+    assert advanced.status_code == 200, advanced.text
+    assert _rows("SELECT * FROM curie.work_items ORDER BY id") == before
+    assert (
+        _rows("SELECT * FROM curie.execution_requests WHERE id = :id", {"id": request_id})
+        == old_request
+    )
 
 
 def test_lineage_advance_refuses_a_worker_whose_publication_lease_was_reclaimed(
@@ -5044,9 +6355,11 @@ def test_policy_revocation_and_cancellation_block_credential_redemption(
     _, cancelled = _create_publication(client, payload)
     _execute(
         "INSERT INTO curie.work_items "
-        "(id, github_repository_id, github_issue_number, github_installation_id, "
-        "agent_id, repo_full_name, conversation_id, cancelled_at) "
-        "VALUES (:id, 1, 2575, 1, :agent_id, :repo, :conversation_id, now())",
+        "(id, tracker_kind, tracker_host, tracker_scope_id, tracker_issue_id, "
+        "code_host_kind, code_host_host, repository_project_id, code_host_installation_id, "
+        "agent_id, repository_path, conversation_id, cancelled_at) "
+        "VALUES (:id, 'github', 'github.com', '1', '2575', 'github', 'github.com', '1', 1, "
+        ":agent_id, :repo, :conversation_id, now())",
         {
             "id": uuid.uuid4(),
             "agent_id": uuid.UUID(deployment["agent_id"]),
@@ -5183,75 +6496,6 @@ def test_clearing_the_prefix_keeps_the_existing_publication_branch(
     assert body["branch_prefix"] == "factory/"
 
 
-def test_stale_publication_policy_version_conflicts(
-    publication_stack: tuple[TestClient, str],
-    auth_headers: dict[str, str],
-    clean_db: None,
-) -> None:
-    client, _ = publication_stack
-    deployment = _create_deployment(client, auth_headers)
-    agent_id = uuid.UUID(deployment["agent_id"])
-    waiting = threading.Event()
-
-    async def hold_then_bump() -> None:
-        engine = create_async_engine(get_settings().database_url)
-        try:
-            async with engine.connect() as connection:
-                await connection.execute(text("BEGIN"))
-                await connection.execute(
-                    text("SELECT id FROM curie.agents WHERE id = :id FOR UPDATE"),
-                    {"id": agent_id},
-                )
-                waiting.set()
-                for _ in range(100):
-                    blocked = await connection.execute(
-                        text("SELECT count(*) FROM pg_locks WHERE NOT granted")
-                    )
-                    if int(blocked.scalar_one()) > 0:
-                        break
-                    await asyncio.sleep(0.05)
-                else:
-                    raise AssertionError("publication policy update did not wait")
-                await connection.execute(
-                    text(
-                        "UPDATE curie.agents "
-                        "SET publication_policy_version = publication_policy_version + 1, "
-                        "publication_draft = true "
-                        "WHERE id = :id"
-                    ),
-                    {"id": agent_id},
-                )
-                await connection.commit()
-        finally:
-            await engine.dispose()
-
-    with ThreadPoolExecutor(max_workers=1) as pool:
-        holder = pool.submit(lambda: asyncio.run(hold_then_bump()))
-        assert waiting.wait(5)
-        stale = client.patch(
-            f"/agents/{deployment['agent_id']}",
-            json={"publication_policy": "auto"},
-            headers=auth_headers,
-        )
-        holder.result(timeout=15)
-    assert stale.status_code == 409, stale.text
-    assert stale.json()["detail"]["code"] == "publication.policy_version_conflict"
-    current = client.get(f"/agents/{deployment['agent_id']}", headers=auth_headers)
-    assert current.status_code == 200, current.text
-    assert current.json()["publication_policy"] == "approve"
-    assert current.json()["publication_policy_version"] == 2
-    assert current.json()["publication_draft"] is True
-    retried = _set_publication_policy(
-        client,
-        auth_headers,
-        deployment["agent_id"],
-        {"publication_policy": "auto"},
-    )
-    assert retried["publication_policy"] == "auto"
-    assert retried["publication_policy_version"] == 3
-    assert retried["publication_draft"] is True
-
-
 def test_lineage_get_reports_external_head_without_pending_revision_or_overwrite(
     publication_stack: tuple[TestClient, str],
     auth_headers: dict[str, str],
@@ -5360,9 +6604,9 @@ def test_review_reservation_refuses_legacy_unproved_lineage(
     assert _rows("SELECT count(*) AS n FROM curie.publication_review_reservations")[0]["n"] == 0
     assert (
         _rows(
-            "SELECT github_repository_id FROM curie.thread_publication_lineages WHERE id=:id",
+            "SELECT repository_project_id FROM curie.thread_publication_lineages WHERE id=:id",
             {"id": publication["lineage_id"]},
-        )[0]["github_repository_id"]
+        )[0]["repository_project_id"]
         is None
     )
     valkey = connect_or_skip(decode_responses=True)
@@ -5411,6 +6655,7 @@ def review_lineage_app(
     get_settings.cache_clear()
     truth: dict[str, Any] = {
         "repository_id": 9001,
+        "default_branch": "main",
         "installation_id": 41,
         "node_id": "PR_example_123",
         "branch": "pending",
@@ -5440,10 +6685,22 @@ def review_lineage_app(
                     "expires_at": "2999-01-01T00:00:00Z",
                 },
             )
-        assert request.headers["authorization"] == truth["authorization"]
+        # verify_publication_identity uses Bearer; GitHubCodeHost._token uses Basic for REST.
+        authorizations = {
+            "Bearer fixture-publication-app-token",
+            "Basic "
+            + base64.b64encode(b"x-access-token:fixture-publication-app-token").decode("ascii"),
+        }
+        assert truth["authorization"] in authorizations
+        assert request.headers["authorization"] in authorizations
         if truth["status"] != 200:
             return httpx.Response(truth["status"], json={"message": "fixture-unavailable"})
-        repo = {"id": truth["repository_id"], "full_name": REPO}
+        # https://docs.github.com/en/rest/repos/repos#get-a-repository
+        repo = {
+            "id": truth["repository_id"],
+            "full_name": REPO,
+            "default_branch": truth["default_branch"],
+        }
         if request.url.path.endswith(f"/repos/{REPO}"):
             return httpx.Response(200, json=repo)
         return httpx.Response(
@@ -5499,7 +6756,8 @@ def test_post_capture_publication_binds_route_then_first_advance_binds_github_id
     captured = _rows(
         "SELECT l.binding_id, l.binding_generation, l.reply_conversation_id, "
         "l.conversation_id, c.id AS current_binding_id, c.generation AS current_generation, "
-        "l.github_repository_id, l.github_installation_id, l.github_pr_node_id, l.base_ref "
+        "l.code_host_kind, l.code_host_host, l.repository_project_id, "
+        "l.code_host_installation_id, l.code_host_pr_id, l.base_ref "
         "FROM curie.thread_publication_lineages l "
         "JOIN curie.agent_channels c ON c.id = l.binding_id "
         "WHERE l.id = :id",
@@ -5513,9 +6771,11 @@ def test_post_capture_publication_binds_route_then_first_advance_binds_github_id
             "conversation_id": scoped_conversation,
             "current_binding_id": captured[0]["current_binding_id"],
             "current_generation": captured[0]["current_generation"],
-            "github_repository_id": None,
-            "github_installation_id": None,
-            "github_pr_node_id": None,
+            "code_host_kind": None,
+            "code_host_host": None,
+            "repository_project_id": None,
+            "code_host_installation_id": None,
+            "code_host_pr_id": None,
             "base_ref": None,
         }
     ]
@@ -5533,14 +6793,17 @@ def test_post_capture_publication_binds_route_then_first_advance_binds_github_id
     )
     assert advanced.status_code == 200, advanced.text
     assert _rows(
-        "SELECT github_repository_id, github_installation_id, github_pr_node_id, base_ref, "
+        "SELECT code_host_kind, code_host_host, repository_project_id, "
+        "code_host_installation_id, code_host_pr_id, base_ref, "
         "head_sha, version FROM curie.thread_publication_lineages WHERE id = :id",
         {"id": publication["lineage_id"]},
     ) == [
         {
-            "github_repository_id": 9001,
-            "github_installation_id": 41,
-            "github_pr_node_id": "PR_example_123",
+            "code_host_kind": "github",
+            "code_host_host": "github.com",
+            "repository_project_id": "9001",
+            "code_host_installation_id": 41,
+            "code_host_pr_id": "PR_example_123",
             "base_ref": "main",
             "head_sha": FIRST_REVISION_SHA,
             "version": 2,
@@ -5600,26 +6863,25 @@ def test_enterprise_publication_advances_and_refreshes_the_same_lineage(
         "pr_url": ENTERPRISE_PR_URL,
         "head_sha": FIRST_REVISION_SHA,
         "version": 2,
-        "github_repository_id": 9001,
-        "github_installation_id": 41,
-        "github_pr_node_id": "PR_example_123",
+        "code_host_kind": "github",
+        "code_host_host": "github.example.com",
+        "repository_project_id": "9001",
+        "code_host_installation_id": 41,
+        "code_host_pr_id": "PR_example_123",
         "base_ref": "main",
     }
 
-    truth["authorization"] = "Basic " + base64.b64encode(
-        b"x-access-token:fixture-publication-app-token"
-    ).decode()
-
-    refreshed = _get_lineage(
-        client, deployment_id=deployment["id"], conversation_id=conversation
+    truth["authorization"] = (
+        "Basic " + base64.b64encode(b"x-access-token:fixture-publication-app-token").decode()
     )
+
+    refreshed = _get_lineage(client, deployment_id=deployment["id"], conversation_id=conversation)
     assert refreshed.status_code == 200, refreshed.text
     assert refreshed.json()["pr_url"] == ENTERPRISE_PR_URL
     assert refreshed.json()["version"] == 2
     assert truth["requests"]
     assert all(
-        request.url.host == "github.example.com"
-        and request.url.path.startswith("/forge/api/v3/")
+        request.url.host == "github.example.com" and request.url.path.startswith("/forge/api/v3/")
         for request in truth["requests"]
     )
     assert any(
@@ -5634,7 +6896,9 @@ def test_enterprise_publication_advances_and_refreshes_the_same_lineage(
     [{"api_url": ENTERPRISE_API_URL, "html_base": ENTERPRISE_HTML_BASE}],
     indirect=True,
 )
-@pytest.mark.parametrize("wrong_url", [PR_URL, f"https://other.example.com/{REPO}/pull/{PR_NUMBER}"])
+@pytest.mark.parametrize(
+    "wrong_url", [PR_URL, f"https://other.example.com/{REPO}/pull/{PR_NUMBER}"]
+)
 def test_enterprise_publication_refuses_wrong_host_outcomes_before_provider_access(
     review_lineage_app: tuple[TestClient, dict[str, Any], str],
     auth_headers: dict[str, str],
@@ -5684,9 +6948,9 @@ def test_enterprise_publication_refuses_public_github_provider_truth(
             client, truth, auth_headers, conversation="enterprise-refused-refresh"
         )
         truth["pr_url"] = PR_URL
-        truth["authorization"] = "Basic " + base64.b64encode(
-            b"x-access-token:fixture-publication-app-token"
-        ).decode()
+        truth["authorization"] = (
+            "Basic " + base64.b64encode(b"x-access-token:fixture-publication-app-token").decode()
+        )
         before = _lineage_identity(publication["lineage_id"])
         refused = _get_lineage(
             client,
@@ -5931,14 +7195,17 @@ def test_review_identity_cannot_change_on_existing_pr_advance(
     )
     assert refused.status_code == (503 if mutation == "status" else 409), refused.text
     stored = _rows(
-        "SELECT github_repository_id, github_installation_id, github_pr_node_id, "
+        "SELECT code_host_kind, code_host_host, repository_project_id, "
+        "code_host_installation_id, code_host_pr_id, "
         "head_sha, version FROM curie.thread_publication_lineages WHERE id=:id",
         {"id": lineage["id"]},
     )[0]
     assert stored == {
-        "github_repository_id": 9001,
-        "github_installation_id": 41,
-        "github_pr_node_id": "PR_example_123",
+        "code_host_kind": "github",
+        "code_host_host": "github.com",
+        "repository_project_id": "9001",
+        "code_host_installation_id": 41,
+        "code_host_pr_id": "PR_example_123",
         "head_sha": FIRST_REVISION_SHA,
         "version": lineage["version"],
     }
@@ -5950,9 +7217,11 @@ def test_review_identity_constraints_reject_partial_authority(
     client, truth, _ = review_lineage_app
     _, _, lineage = _verified_lineage(client, truth, auth_headers)
     for assignment in (
-        "github_repository_id=NULL",
-        "github_installation_id=NULL",
-        "github_pr_node_id=NULL",
+        "code_host_kind=NULL",
+        "code_host_host=NULL",
+        "repository_project_id=NULL",
+        "code_host_installation_id=NULL",
+        "code_host_pr_id=NULL",
         "base_ref=NULL",
     ):
         with pytest.raises(IntegrityError):
@@ -5962,10 +7231,10 @@ def test_review_identity_constraints_reject_partial_authority(
             )
     assert (
         _rows(
-            "SELECT github_repository_id FROM curie.thread_publication_lineages WHERE id=:id",
+            "SELECT repository_project_id FROM curie.thread_publication_lineages WHERE id=:id",
             {"id": lineage["id"]},
-        )[0]["github_repository_id"]
-        == 9001
+        )[0]["repository_project_id"]
+        == "9001"
     )
 
 
@@ -6095,14 +7364,14 @@ def test_verified_github_pr_has_only_one_conversation_owner(
     )
     owners = _rows(
         "SELECT id FROM curie.thread_publication_lineages "
-        "WHERE github_repository_id=9001 AND pr_number=:number",
+        "WHERE repository_project_id='9001' AND pr_number=:number",
         {"number": PR_NUMBER},
     )
     assert owners == [{"id": uuid.UUID(lineage["id"])}]
     assert _rows(
-        "SELECT github_repository_id,head_sha FROM curie.thread_publication_lineages WHERE id=:id",
+        "SELECT repository_project_id,head_sha FROM curie.thread_publication_lineages WHERE id=:id",
         {"id": other["lineage_id"]},
-    ) == [{"github_repository_id": None, "head_sha": None}]
+    ) == [{"repository_project_id": None, "head_sha": None}]
 
 
 def test_adding_app_after_pat_publication_does_not_backfill_legacy_identity(
@@ -6139,9 +7408,9 @@ def test_adding_app_after_pat_publication_does_not_backfill_legacy_identity(
     assert advanced.status_code == 200, advanced.text
     assert truth["calls"] == []
     assert _rows(
-        "SELECT github_repository_id,head_sha FROM curie.thread_publication_lineages WHERE id=:id",
+        "SELECT repository_project_id,head_sha FROM curie.thread_publication_lineages WHERE id=:id",
         {"id": publication["lineage_id"]},
-    ) == [{"github_repository_id": None, "head_sha": SECOND_REVISION_SHA}]
+    ) == [{"repository_project_id": None, "head_sha": SECOND_REVISION_SHA}]
     assert _reserve_review(client, advanced.json(), "review:legacy-replay").status_code == 409
 
 
@@ -6153,7 +7422,7 @@ def test_review_reservation_refreshes_authority_already_loaded_by_its_caller(
 ) -> None:
     """A row lock must refresh objects retained during earlier authority reads."""
     from curie_api.models import AgentChannel, Deployment, ThreadPublicationLineage
-    from curie_api.schemas import ReviewRevisionReserve
+    from curie_api.schemas.publications import ReviewRevisionReserve
     from sqlalchemy.ext.asyncio import AsyncSession
 
     client, truth, _ = review_lineage_app
@@ -6211,8 +7480,8 @@ def test_review_reservation_refreshes_authority_already_loaded_by_its_caller(
                 assert response.status_code == (204 if mutation == "deployment" else 200), (
                     response.text
                 )
-                with pytest.raises(crud.PublicationLineageConflict) as conflict:
-                    await crud.reserve_review_revision(
+                with pytest.raises(crud_errors.PublicationLineageConflict) as conflict:
+                    await crud_lineages.reserve_review_revision(
                         session,
                         ReviewRevisionReserve(
                             repository_id=9001,
@@ -6239,7 +7508,8 @@ def test_review_reservation_refreshes_authority_already_loaded_by_its_caller(
 def _lineage_identity(lineage_id: str) -> dict[str, Any]:
     return _rows(
         "SELECT status, pr_number, pr_url, head_sha, version, "
-        "github_repository_id, github_installation_id, github_pr_node_id, base_ref "
+        "code_host_kind, code_host_host, repository_project_id, code_host_installation_id, "
+        "code_host_pr_id, base_ref "
         "FROM curie.thread_publication_lineages WHERE id = :id",
         {"id": uuid.UUID(lineage_id)},
     )[0]
@@ -6279,14 +7549,20 @@ class _TerminalObservationCluster:
         self.terminal_cleanups = 0
 
     def observe(self, _job_name: str) -> Any:
+        from curie_worker.publication_k8s import PublicationTransport
         from curie_worker.publication_loop import PublicationJobObservation
 
+        # The Job reports only its pushed commit and the transport it was
+        # built with; the pull request comes from the API afterwards.
         return PublicationJobObservation(
             phase="succeeded",
-            pr_url=PR_URL,
-            pr_number=PR_NUMBER,
             commit_sha=FIRST_REVISION_SHA,
             logs="",
+            transport=PublicationTransport(
+                origin="https://github.com",
+                header_form="authorization_basic",
+                ca_bundle_ref=None,
+            ),
         )
 
     def validate_existing(self, _resources: Any) -> None:
@@ -6300,6 +7576,48 @@ class _TerminalObservationCluster:
 
     def cleanup_terminal(self, _names: Any) -> None:
         self.terminal_cleanups += 1
+
+
+class _PushedPullCodeHost:
+    """The API's answers after the push: the marked commit and its open PR."""
+
+    def __init__(self, branch: str) -> None:
+        self.branch = branch
+        self.calls: list[str] = []
+
+    def read_branch_head(self, _publication_id: uuid.UUID) -> Any:
+        from curie_worker.publication_loop import PublicationBranchHead
+
+        return PublicationBranchHead(head_sha=FIRST_REVISION_SHA, base_branch="main")
+
+    def verify_revision_commit(
+        self,
+        _publication_id: uuid.UUID,
+        commit_sha: str,
+        *,
+        revision_id: uuid.UUID,
+        expected_parent: str,
+    ) -> Any:
+        from curie_worker.publication_loop import PublicationRevisionCommit
+
+        del revision_id
+        self.calls.append("verify_revision_commit")
+        return PublicationRevisionCommit(commit_sha=commit_sha, parent_sha=expected_parent)
+
+    def recover_pull_request(
+        self, _publication_id: uuid.UUID, *, expected_head_sha: str, adopt_only: bool
+    ) -> Any:
+        from curie_worker.publication_loop import PublicationPullState
+
+        assert adopt_only is False
+        self.calls.append("recover_pull_request")
+        return PublicationPullState(
+            number=PR_NUMBER,
+            url=PR_URL,
+            state="open",
+            head_sha=expected_head_sha,
+            head_ref=self.branch,
+        )
 
 
 class _UnexpectedPublicationCredentials:
@@ -6376,7 +7694,7 @@ async def _reconcile_through_lineage_patch(
                 store=store,
                 credentials=_UnexpectedPublicationCredentials(),
                 cluster=cluster,
-                github=SimpleNamespace(),
+                code_host=_PushedPullCodeHost(work.branch),
                 lineage=PublicationLineageClient(
                     api_base_url="http://api.example.test",
                     worker_token=WORKER_TOKEN,
@@ -6414,7 +7732,8 @@ def test_worker_lineage_patch_captures_immutable_identity_in_real_postgres(
             lease_owner="lineage-patch-worker",
         )
 
-    work, cluster, transcript, replies = client.portal.call(reconcile)
+    with _publication_commit_http(client, publication["id"], FIRST_REVISION_SHA):
+        work, cluster, transcript, replies = client.portal.call(reconcile)
 
     assert truth["calls"]
     assert cluster.validations == 1
@@ -6429,9 +7748,11 @@ def test_worker_lineage_patch_captures_immutable_identity_in_real_postgres(
         "pr_url": PR_URL,
         "head_sha": FIRST_REVISION_SHA,
         "version": work.lineage_version + 1,
-        "github_repository_id": 9001,
-        "github_installation_id": 41,
-        "github_pr_node_id": "PR_example_123",
+        "code_host_kind": "github",
+        "code_host_host": "github.com",
+        "repository_project_id": "9001",
+        "code_host_installation_id": 41,
+        "code_host_pr_id": "PR_example_123",
         "base_ref": "main",
     }
     assert _rows(
@@ -6540,9 +7861,7 @@ def test_stale_worker_lease_refuses_before_terminal_provider_and_leaves_rows_unc
 
     async def claim() -> Any:
         engine = create_async_engine(get_settings().database_url)
-        store = PostgresPublicationStore(
-            engine, schema="curie", lease_owner="stale-lineage-worker"
-        )
+        store = PostgresPublicationStore(engine, schema="curie", lease_owner="stale-lineage-worker")
         try:
             work = await store.claim_next()
             assert work is not None
@@ -6592,9 +7911,11 @@ def test_stale_worker_lease_refuses_before_terminal_provider_and_leaves_rows_unc
         "pr_url": None,
         "head_sha": None,
         "version": 1,
-        "github_repository_id": None,
-        "github_installation_id": None,
-        "github_pr_node_id": None,
+        "code_host_kind": None,
+        "code_host_host": None,
+        "repository_project_id": None,
+        "code_host_installation_id": None,
+        "code_host_pr_id": None,
         "base_ref": None,
     }
 
@@ -6623,7 +7944,8 @@ def test_terminal_patch_response_maps_to_the_worker_terminal_cas(
             lease_owner="terminal-lineage-worker",
         )
 
-    work, cluster, transcript, replies = client.portal.call(reconcile)
+    with _publication_commit_http(client, publication["id"], FIRST_REVISION_SHA):
+        work, cluster, transcript, replies = client.portal.call(reconcile)
 
     assert truth["calls"]
     assert cluster.validations == 1
@@ -6636,11 +7958,226 @@ def test_terminal_patch_response_maps_to_the_worker_terminal_cas(
         "pr_url": PR_URL,
         "head_sha": FIRST_REVISION_SHA,
         "version": work.lineage_version + 1,
-        "github_repository_id": None,
-        "github_installation_id": None,
-        "github_pr_node_id": None,
+        "code_host_kind": None,
+        "code_host_host": None,
+        "repository_project_id": None,
+        "code_host_installation_id": None,
+        "code_host_pr_id": None,
         "base_ref": None,
     }
+
+
+@pytest.mark.parametrize("state", ["merged", "closed"])
+def test_headless_terminal_store_records_verified_first_parent_and_replay_compares_it(
+    clean_db: None,
+    publication_stack: tuple[TestClient, str],
+    auth_headers: dict[str, str],
+    state: str,
+) -> None:
+    from curie_worker.publication_store import PostgresPublicationStore, PublicationStoreError
+    from sqlalchemy.ext.asyncio import AsyncSession
+
+    from apps.api.tests.test_workitem_outcomes import _first_parent_proof
+
+    client, _ = publication_stack
+    _, publication = _approved_revision(
+        client,
+        auth_headers,
+        conversation_id=f"terminal-moved-{state}",
+        dedupe_key=f"terminal-moved-{state}",
+    )
+    _reportable(publication["id"])
+    parent = "3" * 40
+
+    async def run() -> None:
+        engine = create_async_engine(get_settings().database_url)
+        try:
+            store = PostgresPublicationStore(
+                engine, schema="curie", lease_owner="terminal-parent-worker"
+            )
+            work = await store.claim_next()
+            assert work is not None and str(work.publication_id) == publication["id"]
+            async with AsyncSession(engine) as session:
+                proof = await _first_parent_proof(
+                    session, publication["id"], FIRST_REVISION_SHA, parent_sha=parent
+                )
+            facts = {
+                "publication_id": work.publication_id,
+                "expected_publication_version": work.version,
+                "lease_owner": work.lease_owner,
+                "expected_version": work.lineage_version,
+                "expected_stored_head": None,
+                "state": state,
+                "pr_number": PR_NUMBER,
+                "pr_url": PR_URL,
+                "head_sha": proof.commit_sha,
+                "first_parent_sha": proof.parent_sha,
+            }
+            await store.mark_lineage_terminal(work.lineage_id, **facts)
+            async with engine.connect() as connection:
+                before = (
+                    (
+                        await connection.execute(
+                            text(
+                                "SELECT base_sha, head_sha, status, version FROM "
+                                "curie.thread_publication_lineages "
+                                "WHERE id = :id"
+                            ),
+                            {"id": work.lineage_id},
+                        )
+                    )
+                    .mappings()
+                    .one()
+                )
+            assert dict(before) == {
+                "base_sha": parent,
+                "head_sha": FIRST_REVISION_SHA,
+                "status": state,
+                "version": work.lineage_version + 1,
+            }
+            await store.mark_lineage_terminal(work.lineage_id, **facts)
+            with pytest.raises(PublicationStoreError):
+                await store.mark_lineage_terminal(
+                    work.lineage_id, **{**facts, "first_parent_sha": BASE_SHA}
+                )
+            async with engine.connect() as connection:
+                after = (
+                    (
+                        await connection.execute(
+                            text(
+                                "SELECT base_sha, head_sha, status, version FROM "
+                                "curie.thread_publication_lineages "
+                                "WHERE id = :id"
+                            ),
+                            {"id": work.lineage_id},
+                        )
+                    )
+                    .mappings()
+                    .one()
+                )
+                original = (
+                    await connection.execute(
+                        text(
+                            "SELECT base_sha, expected_prior_head FROM curie.publications WHERE "
+                            "id = :id"
+                        ),
+                        {"id": work.publication_id},
+                    )
+                ).one()
+            assert dict(after) == dict(before)
+            assert original == (BASE_SHA, BASE_SHA)
+        finally:
+            await engine.dispose()
+
+    client.portal.call(run)
+
+
+@pytest.mark.parametrize("defect", ["missing-parent", "version", "lease", "lineage-version"])
+def test_headless_terminal_store_cannot_write_parent_with_absent_proof_or_stale_authority(
+    clean_db: None,
+    publication_stack: tuple[TestClient, str],
+    auth_headers: dict[str, str],
+    defect: str,
+) -> None:
+    from curie_worker.publication_store import PostgresPublicationStore, PublicationStoreError
+    from sqlalchemy.ext.asyncio import AsyncSession
+
+    from apps.api.tests.test_workitem_outcomes import _first_parent_proof
+
+    client, _ = publication_stack
+    _, publication = _approved_revision(
+        client,
+        auth_headers,
+        conversation_id=f"terminal-stale-parent-{defect}",
+        dedupe_key=f"terminal-stale-parent-{defect}",
+    )
+    _reportable(publication["id"])
+
+    async def run() -> None:
+        engine = create_async_engine(get_settings().database_url)
+        try:
+            store = PostgresPublicationStore(
+                engine, schema="curie", lease_owner="terminal-parent-worker"
+            )
+            work = await store.claim_next()
+            assert work is not None and str(work.publication_id) == publication["id"]
+            async with AsyncSession(engine) as session:
+                proof = await _first_parent_proof(
+                    session, publication["id"], FIRST_REVISION_SHA, parent_sha="3" * 40
+                )
+            async with engine.begin() as connection:
+                if defect in {"version", "lease"}:
+                    assignment = (
+                        "version = version + 1"
+                        if defect == "version"
+                        else "lease_owner = 'another-worker'"
+                    )
+                    await connection.execute(
+                        text(f"UPDATE curie.publications SET {assignment} WHERE id = :id"),
+                        {"id": work.publication_id},
+                    )
+                elif defect == "lineage-version":
+                    await connection.execute(
+                        text(
+                            "UPDATE curie.thread_publication_lineages SET version = version + 1 "
+                            "WHERE id = :id"
+                        ),
+                        {"id": work.lineage_id},
+                    )
+                before = (
+                    (
+                        await connection.execute(
+                            text(
+                                "SELECT p.status, p.version, p.lease_owner, l.base_sha, "
+                                "l.head_sha, l.pr_number, "
+                                "l.status AS lineage_status, l.version AS lineage_version "
+                                "FROM curie.publications p JOIN curie.thread_publication_lineages "
+                                "l "
+                                "ON l.id = p.lineage_id WHERE p.id = :id"
+                            ),
+                            {"id": work.publication_id},
+                        )
+                    )
+                    .mappings()
+                    .one()
+                )
+            with pytest.raises(PublicationStoreError):
+                await store.mark_lineage_terminal(
+                    work.lineage_id,
+                    publication_id=work.publication_id,
+                    expected_publication_version=work.version,
+                    lease_owner=work.lease_owner,
+                    expected_version=work.lineage_version,
+                    expected_stored_head=None,
+                    state="merged",
+                    pr_number=PR_NUMBER,
+                    pr_url=PR_URL,
+                    head_sha=proof.commit_sha,
+                    first_parent_sha=None if defect == "missing-parent" else proof.parent_sha,
+                )
+            async with engine.connect() as connection:
+                after = (
+                    (
+                        await connection.execute(
+                            text(
+                                "SELECT p.status, p.version, p.lease_owner, l.base_sha, "
+                                "l.head_sha, l.pr_number, "
+                                "l.status AS lineage_status, l.version AS lineage_version "
+                                "FROM curie.publications p JOIN curie.thread_publication_lineages "
+                                "l "
+                                "ON l.id = p.lineage_id WHERE p.id = :id"
+                            ),
+                            {"id": work.publication_id},
+                        )
+                    )
+                    .mappings()
+                    .one()
+                )
+            assert dict(after) == dict(before)
+        finally:
+            await engine.dispose()
+
+    client.portal.call(run)
 
 
 def test_a_replay_matches_a_default_identity_a_later_migration_names(
@@ -6699,7 +8236,8 @@ def test_a_replay_matches_a_row_an_older_writer_stored_as_null(
 
 @pytest.fixture
 def _factory_publication_case(
-    clean_db: None, admitted: Any  # noqa: F811
+    clean_db: None,
+    admitted: Any,  # noqa: F811
 ) -> Iterator[tuple[TestClient, uuid.UUID, dict[str, Any]]]:
     """Build a live factory request and its deployment for publication API tests."""
 
@@ -6708,10 +8246,9 @@ def _factory_publication_case(
     _factory_label(client, github, issue_number)
     request = _factory_request(issue_number)
     request_id = request["id"]
-    runtime_epoch = _start_factory_request(request_id)
+    runtime_epoch = _start_factory_request(client, request_id)
     work_item = _factory_rows(
-        "SELECT w.agent_id, w.conversation_id FROM curie.work_items w "
-        "WHERE w.id = :id",
+        "SELECT w.agent_id, w.conversation_id FROM curie.work_items w WHERE w.id = :id",
         {"id": request["work_item_id"]},
     )[0]
 
@@ -6749,8 +8286,10 @@ def _factory_publication_case(
         "base_sha": BASE_SHA,
         "work_item_request_id": str(request_id),
         "work_item_runtime_epoch": runtime_epoch,
-        "patch_b64": base64.b64encode(b"diff --git a/example.py b/example.py\n").decode(),
-        "changed_paths": ["apps/api/src/example.py"],
+        "patch_b64": base64.b64encode(
+            b"diff --git a/unitconv/convert.py b/unitconv/convert.py\n"
+        ).decode(),
+        "changed_paths": ["unitconv/convert.py"],
         "expires_in_seconds": 600,
         "title": "Verify the factory publication route",
         "body": "The change updates the factory verification route.",
@@ -6758,37 +8297,47 @@ def _factory_publication_case(
     yield client, request_id, payload
 
 
-CURIE_PYTHON_CI_CHECK = "Python (ruff + mypy + pytest)"
-CURIE_PYTHON_CI_POLICY = {
-    "check": CURIE_PYTHON_CI_CHECK,
-    "paths": [
-        "apps",
-        "runner",
-        "cli",
-        "adapters",
-        "packages",
-        "examples/tests",
-        "tools",
-        "release",
-    ],
-    "pendingCheckPrefix": "Python pytest (shard ",
+CONVERSION_PYTHON_CI_CHECK = "Unit conversion suite"
+CONVERSION_PYTHON_CI_POLICY = {
+    "key": CONVERSION_PYTHON_CI_CHECK,
+    "paths": ["unitconv", "tests"],
+    "pending_key_prefix": "Conversion batch ",
 }
 
 
 def _configure_python_ci(
-    monkeypatch: pytest.MonkeyPatch, policies: Mapping[str, Any]
+    monkeypatch: pytest.MonkeyPatch,
+    key_dir: Path,
+    client: TestClient,
+    policies: Mapping[str, Any],
 ) -> None:
-    """Set GITHUB_FACTORY_PYTHON_CI as an operator would (#3617)."""
+    """Bind each repository's required Python check as an operator would (#3617):
+    on its forge binding (#4397). The running app gets the new registry too."""
 
-    monkeypatch.setenv("GITHUB_FACTORY_PYTHON_CI", json.dumps(dict(policies)))
+    bindings = [
+        github_repository_binding(
+            repo=repo,
+            repo_id=FACTORY_REPO_ID if repo.lower() == FACTORY_REPO else 9300 + index,
+            ci={"required": dict(required)},
+        )
+        for index, (repo, required) in enumerate(policies.items())
+    ]
+    document = forges_document(api_url=get_settings().github_api_url, bindings=bindings)
+    monkeypatch.setenv("CURIE_FORGES", forges_env_json(document, key_dir))
     get_settings.cache_clear()
+    client.app.state.forges = forges_registry(get_settings())
 
 
 @pytest.fixture
-def _curie_python_ci(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
-    """Configure Curie's own Python CI layout for the factory repository."""
+def _conversion_python_ci(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    admitted: Any,  # noqa: F811
+) -> Iterator[None]:
+    """Configure the foreign unit conversion repository's own CI layout."""
 
-    _configure_python_ci(monkeypatch, {FACTORY_REPO: CURIE_PYTHON_CI_POLICY})
+    client, _github, _comments = admitted
+    _configure_python_ci(monkeypatch, tmp_path, client, {FACTORY_REPO: CONVERSION_PYTHON_CI_POLICY})
     yield
     get_settings.cache_clear()
 
@@ -6799,7 +8348,10 @@ def _record_factory_verification(
     *,
     outcome: str = "unavailable",
     check: str = "python",
-    command: str = "uv run pytest runner/tests -q",
+    command: str = "uv run pytest unitconv/tests -q",
+    delegated_to: str | None = None,
+    blocked_services: list[str] | None = None,
+    missing_binaries: list[str] | None = None,
 ) -> Any:
     observation: dict[str, Any]
     if outcome == "not_declared":
@@ -6817,9 +8369,15 @@ def _record_factory_verification(
             "command": command,
             "outcome": outcome,
             "exit_status": {"unavailable": None, "passed": 0}.get(outcome, 1),
-            "missing_binaries": ["uv"] if outcome == "unavailable" else [],
-            "blocked_services": [],
+            "missing_binaries": (
+                missing_binaries
+                if missing_binaries is not None
+                else (["uv"] if outcome == "unavailable" else [])
+            ),
+            "blocked_services": blocked_services or [],
         }
+        if delegated_to is not None:
+            observation["delegated_to"] = delegated_to
     token = sandbox_token.mint(
         get_settings().api_key,
         agent=str(request_id),
@@ -6833,9 +8391,7 @@ def _record_factory_verification(
     )
 
 
-def _post_factory_publication(
-    client: TestClient, payload: dict[str, Any]
-) -> Any:
+def _post_factory_publication(client: TestClient, payload: dict[str, Any]) -> Any:
     selected = client.post(
         f"/v1/internal/workspaces/{payload['deployment_id']}/selection",
         json={
@@ -6854,7 +8410,7 @@ def _post_factory_publication(
 
 
 def test_factory_publication_adds_unavailable_and_pending_proof_to_python_pr_body(
-    _curie_python_ci: None,
+    _conversion_python_ci: None,
     _factory_publication_case: tuple[TestClient, uuid.UUID, dict[str, Any]],
 ) -> None:
     client, request_id, payload = _factory_publication_case
@@ -6870,13 +8426,40 @@ def test_factory_publication_adds_unavailable_and_pending_proof_to_python_pr_bod
         {"id": publication_id},
     )[0]["body"]
     assert payload["body"] in body
-    assert "In-sandbox verification was unavailable." in body
-    assert "Python (ruff + mypy + pytest) is pending proof." in body
+    assert "In-sandbox verification was unavailable for: python." in body
+    assert (
+        "Unit conversion suite had not reported when this pull request was opened; "
+        "the issue status comment reports its result."
+    ) in body
+    assert "pending proof" not in body
+    assert "No in-sandbox Python verification check was declared." not in body
     assert "verification passed" not in body.casefold()
 
 
-_NOT_DECLARED_STAMP = "No in-sandbox Python verification check was declared."
-_PENDING_PROOF_STAMP = "Python (ruff + mypy + pytest) is pending proof."
+_NOT_DECLARED_STAMP = "The repository declares no in-sandbox verification check with id `python`."
+_PENDING_PROOF_STAMP = (
+    "Unit conversion suite had not reported when this pull request was opened; "
+    "the issue status comment reports its result."
+)
+
+
+def _factory_issue_marker(request_id: uuid.UUID) -> str:
+    """The canonical marker line naming the request's WorkItem issue (#4629)."""
+
+    (row,) = _factory_rows(
+        "SELECT w.tracker_kind, w.tracker_host, w.tracker_scope_id, w.tracker_issue_id "
+        "FROM curie.work_items w JOIN curie.execution_requests r ON r.work_item_id = w.id "
+        "WHERE r.id = :request",
+        {"request": request_id},
+    )
+    return issue_marker(
+        TrackerIssueRef(
+            row["tracker_kind"],
+            row["tracker_host"],
+            row["tracker_scope_id"],
+            row["tracker_issue_id"],
+        )
+    )
 
 
 def _factory_publication_body(publication_id: str) -> str:
@@ -6889,7 +8472,7 @@ def _factory_publication_body(publication_id: str) -> str:
 
 
 def test_factory_python_publication_with_no_declared_check_states_it_was_not_declared(
-    _curie_python_ci: None,
+    _conversion_python_ci: None,
     _factory_publication_case: tuple[TestClient, uuid.UUID, dict[str, Any]],
 ) -> None:
     client, request_id, payload = _factory_publication_case
@@ -6903,12 +8486,14 @@ def test_factory_python_publication_with_no_declared_check_states_it_was_not_dec
     assert payload["body"] in body
     assert _NOT_DECLARED_STAMP in body
     assert _PENDING_PROOF_STAMP in body
-    assert "In-sandbox verification was unavailable." not in body
+    assert "In-sandbox verification was unavailable" not in body
+    assert "pending proof" not in body
+    assert "No in-sandbox Python verification check was declared." not in body
     assert "verification passed" not in body.casefold()
 
 
 def test_factory_python_publication_with_only_a_rust_check_is_not_declared_for_python(
-    _curie_python_ci: None,
+    _conversion_python_ci: None,
     _factory_publication_case: tuple[TestClient, uuid.UUID, dict[str, Any]],
 ) -> None:
     client, request_id, payload = _factory_publication_case
@@ -6927,7 +8512,7 @@ def test_factory_python_publication_with_only_a_rust_check_is_not_declared_for_p
     body = _factory_publication_body(created.json()["id"])
     assert _NOT_DECLARED_STAMP in body
     assert _PENDING_PROOF_STAMP in body
-    assert "In-sandbox verification was unavailable." not in body
+    assert "In-sandbox verification was unavailable" not in body
 
 
 def test_factory_python_publication_with_a_passed_python_check_adds_no_stamp(
@@ -6940,11 +8525,16 @@ def test_factory_python_publication_with_a_passed_python_check_adds_no_stamp(
     created = _post_factory_publication(client, payload)
 
     assert created.status_code == 201, created.text
-    assert created.json()["body"] == payload["body"]
+    # No stamp: the only additions are the closing reference (#4358 plan D7)
+    # and the canonical issue marker (#4629).
+    number = payload["reply_conversation_id"].removeprefix("issue-")
+    assert created.json()["body"] == (
+        f"{payload['body']}\n\nCloses #{number}\n\n{_factory_issue_marker(request_id)}"
+    )
 
 
 def test_factory_python_publication_uses_the_python_check_among_several(
-    _curie_python_ci: None,
+    _conversion_python_ci: None,
     _factory_publication_case: tuple[TestClient, uuid.UUID, dict[str, Any]],
 ) -> None:
     client, request_id, payload = _factory_publication_case
@@ -6963,7 +8553,7 @@ def test_factory_python_publication_uses_the_python_check_among_several(
 
     assert created.status_code == 201, created.text
     body = _factory_publication_body(created.json()["id"])
-    assert "In-sandbox verification was unavailable." in body
+    assert "In-sandbox verification was unavailable for: python." in body
     assert _PENDING_PROOF_STAMP in body
     assert _NOT_DECLARED_STAMP not in body
 
@@ -6987,10 +8577,13 @@ def test_factory_python_publication_refuses_a_failed_python_check_beside_a_passe
 
     assert refused.status_code == 409, refused.text
     assert refused.json()["detail"]["code"] == "publication.verification_preflight_failed"
-    assert _factory_rows(
-        "SELECT count(*) AS n FROM curie.publications WHERE execution_request_id = :id",
-        {"id": request_id},
-    )[0]["n"] == 0
+    assert (
+        _factory_rows(
+            "SELECT count(*) AS n FROM curie.publications WHERE execution_request_id = :id",
+            {"id": request_id},
+        )[0]["n"]
+        == 0
+    )
 
 
 def test_factory_python_publication_refuses_any_failed_declared_check(
@@ -7002,7 +8595,7 @@ def test_factory_python_publication_refuses_any_failed_declared_check(
         request_id,
         outcome="failed",
         check="api",
-        command="uv run pytest apps/api/tests -q",
+        command="uv run pytest tests -q",
     )
     assert failed.status_code == 201, failed.text
 
@@ -7013,7 +8606,7 @@ def test_factory_python_publication_refuses_any_failed_declared_check(
 
 
 def test_factory_python_publication_stamps_an_unavailable_check_under_any_id(
-    _curie_python_ci: None,
+    _conversion_python_ci: None,
     _factory_publication_case: tuple[TestClient, uuid.UUID, dict[str, Any]],
 ) -> None:
     client, request_id, payload = _factory_publication_case
@@ -7022,7 +8615,7 @@ def test_factory_python_publication_stamps_an_unavailable_check_under_any_id(
         request_id,
         outcome="unavailable",
         check="api",
-        command="uv run pytest apps/api/tests -q",
+        command="uv run pytest tests -q",
     )
     assert recorded.status_code == 201, recorded.text
 
@@ -7030,9 +8623,81 @@ def test_factory_python_publication_stamps_an_unavailable_check_under_any_id(
 
     assert created.status_code == 201, created.text
     body = _factory_publication_body(created.json()["id"])
-    assert "In-sandbox verification was unavailable." in body
+    assert "In-sandbox verification was unavailable for: api." in body
     assert _PENDING_PROOF_STAMP in body
     assert _NOT_DECLARED_STAMP not in body
+    assert "pending proof" not in body
+    assert "No in-sandbox Python verification check was declared." not in body
+
+
+def test_factory_python_publication_names_only_the_unavailable_check_with_its_delegate(
+    _conversion_python_ci: None,
+    _factory_publication_case: tuple[TestClient, uuid.UUID, dict[str, Any]],
+) -> None:
+    client, request_id, payload = _factory_publication_case
+    passed = _record_factory_verification(client, request_id, outcome="passed")
+    assert passed.status_code == 201, passed.text
+    unavailable = _record_factory_verification(
+        client,
+        request_id,
+        outcome="unavailable",
+        check="pgstore",
+        command="uv run pytest pgstore/tests -q",
+        blocked_services=["postgres"],
+        missing_binaries=[],
+        delegated_to="pgstore (postgres)",
+    )
+    assert unavailable.status_code == 201, unavailable.text
+
+    created = _post_factory_publication(client, payload)
+
+    assert created.status_code == 201, created.text
+    body = _factory_publication_body(created.json()["id"])
+    assert (
+        "In-sandbox verification was unavailable for: pgstore (delegated to pgstore (postgres))."
+    ) in body
+    assert "In-sandbox verification was unavailable." not in body
+    assert "unavailable for: python" not in body
+    assert _PENDING_PROOF_STAMP in body
+    assert _NOT_DECLARED_STAMP not in body
+
+
+def test_factory_python_publication_names_every_unavailable_check_in_recorded_order(
+    _conversion_python_ci: None,
+    _factory_publication_case: tuple[TestClient, uuid.UUID, dict[str, Any]],
+) -> None:
+    client, request_id, payload = _factory_publication_case
+    passed = _record_factory_verification(client, request_id, outcome="passed")
+    assert passed.status_code == 201, passed.text
+    first = _record_factory_verification(
+        client,
+        request_id,
+        outcome="unavailable",
+        check="pgstore",
+        command="uv run pytest pgstore/tests -q",
+        blocked_services=["postgres"],
+        missing_binaries=[],
+        delegated_to="pgstore (postgres)",
+    )
+    assert first.status_code == 201, first.text
+    second = _record_factory_verification(
+        client,
+        request_id,
+        outcome="unavailable",
+        check="api",
+        command="uv run pytest tests -q",
+    )
+    assert second.status_code == 201, second.text
+
+    created = _post_factory_publication(client, payload)
+
+    assert created.status_code == 201, created.text
+    body = _factory_publication_body(created.json()["id"])
+    assert (
+        "In-sandbox verification was unavailable for: "
+        "pgstore (delegated to pgstore (postgres)), api."
+    ) in body
+    assert _PENDING_PROOF_STAMP in body
 
 
 def test_factory_python_publication_refuses_a_missing_preflight_observation(
@@ -7045,10 +8710,13 @@ def test_factory_python_publication_refuses_a_missing_preflight_observation(
     assert refused.status_code == 409, refused.text
     assert refused.json()["detail"]["code"] == "publication.verification_preflight_missing"
     assert "preflight" in refused.json()["detail"]["message"].casefold()
-    assert _factory_rows(
-        "SELECT count(*) AS n FROM curie.publications WHERE execution_request_id = :id",
-        {"id": request_id},
-    )[0]["n"] == 0
+    assert (
+        _factory_rows(
+            "SELECT count(*) AS n FROM curie.publications WHERE execution_request_id = :id",
+            {"id": request_id},
+        )[0]["n"]
+        == 0
+    )
 
 
 def test_factory_python_publication_refuses_a_failed_preflight_observation(
@@ -7063,18 +8731,21 @@ def test_factory_python_publication_refuses_a_failed_preflight_observation(
     assert refused.status_code == 409, refused.text
     assert refused.json()["detail"]["code"] == "publication.verification_preflight_failed"
     assert "rerun" in refused.json()["detail"]["message"].casefold()
-    assert _factory_rows(
-        "SELECT count(*) AS n FROM curie.publications WHERE execution_request_id = :id",
-        {"id": request_id},
-    )[0]["n"] == 0
+    assert (
+        _factory_rows(
+            "SELECT count(*) AS n FROM curie.publications WHERE execution_request_id = :id",
+            {"id": request_id},
+        )[0]["n"]
+        == 0
+    )
 
 
 def test_factory_python_publication_refuses_when_ci_does_not_select_the_path(
-    _curie_python_ci: None,
+    _conversion_python_ci: None,
     _factory_publication_case: tuple[TestClient, uuid.UUID, dict[str, Any]],
 ) -> None:
     client, request_id, payload = _factory_publication_case
-    payload["changed_paths"] = ["examples/coder/factory_fixture.py"]
+    payload["changed_paths"] = ["scripts/convert.py"]
     recorded = _record_factory_verification(client, request_id)
     assert recorded.status_code == 201, recorded.text
 
@@ -7082,7 +8753,7 @@ def test_factory_python_publication_refuses_when_ci_does_not_select_the_path(
 
     assert refused.status_code == 409, refused.text
     assert refused.json()["detail"]["code"] == "publication.required_python_ci_unselected"
-    assert "examples/coder/factory_fixture.py" in refused.json()["detail"]["message"]
+    assert "scripts/convert.py" in refused.json()["detail"]["message"]
 
 
 def test_factory_non_python_publication_keeps_its_existing_body_without_python_claims(
@@ -7096,11 +8767,16 @@ def test_factory_non_python_publication_keeps_its_existing_body_without_python_c
     created = _post_factory_publication(client, payload)
 
     assert created.status_code == 201, created.text
-    assert created.json()["body"] == payload["body"]
+    # No python claim is added; only the tracker's closing reference, which the
+    # body lacked (#4358 plan D7), and the canonical issue marker (#4629).
+    issue_number = int(payload["reply_conversation_id"].removeprefix("issue-"))
+    assert created.json()["body"] == (
+        f"{payload['body']}\n\nCloses #{issue_number}\n\n{_factory_issue_marker(request_id)}"
+    )
 
 
 def test_later_non_python_publication_keeps_prior_python_proof_pending(
-    _curie_python_ci: None,
+    _conversion_python_ci: None,
     _factory_publication_case: tuple[TestClient, uuid.UUID, dict[str, Any]],
 ) -> None:
     client, request_id, payload = _factory_publication_case
@@ -7122,13 +8798,16 @@ def test_later_non_python_publication_keeps_prior_python_proof_pending(
     created = _post_factory_publication(client, later)
 
     assert created.status_code == 201, created.text
-    assert "In-sandbox verification was unavailable." in created.json()["body"]
-    assert "Python (ruff + mypy + pytest) is pending proof." in created.json()["body"]
+    assert "In-sandbox verification was unavailable for: python." in created.json()["body"]
+    assert _PENDING_PROOF_STAMP in created.json()["body"]
 
 
 # --- per-repository Python CI policy (#3617) ------------------------------------------
 
-_REPOSITORY_PENDING_PROOF = "Repository CI is pending proof."
+_REPOSITORY_PENDING_PROOF = (
+    "Repository CI had not reported when this pull request was opened; "
+    "the issue status comment reports its result."
+)
 
 
 def test_outside_python_layout_without_a_policy_is_published_with_repository_ci_pending(
@@ -7147,14 +8826,16 @@ def test_outside_python_layout_without_a_policy_is_published_with_repository_ci_
     body = _factory_publication_body(created.json()["id"])
     assert _NOT_DECLARED_STAMP in body
     assert _REPOSITORY_PENDING_PROOF in body
-    assert CURIE_PYTHON_CI_CHECK not in body
+    assert CONVERSION_PYTHON_CI_CHECK not in body
+    assert "pending proof" not in body
+    assert "No in-sandbox Python verification check was declared." not in body
 
 
 def test_outside_python_layout_without_a_policy_accepts_any_python_path(
     _factory_publication_case: tuple[TestClient, uuid.UUID, dict[str, Any]],
 ) -> None:
     client, request_id, payload = _factory_publication_case
-    payload["changed_paths"] = ["examples/coder/factory_fixture.py"]
+    payload["changed_paths"] = ["scripts/convert.py"]
     recorded = _record_factory_verification(client, request_id)
     assert recorded.status_code == 201, recorded.text
 
@@ -7162,16 +8843,22 @@ def test_outside_python_layout_without_a_policy_accepts_any_python_path(
 
     assert created.status_code == 201, created.text
     body = _factory_publication_body(created.json()["id"])
-    assert "In-sandbox verification was unavailable." in body
+    assert "In-sandbox verification was unavailable for: python." in body
     assert _REPOSITORY_PENDING_PROOF in body
 
 
 def test_policy_for_another_repository_does_not_apply(
     monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
     _factory_publication_case: tuple[TestClient, uuid.UUID, dict[str, Any]],
 ) -> None:
-    _configure_python_ci(monkeypatch, {"curie-eng/curie": CURIE_PYTHON_CI_POLICY})
     client, request_id, payload = _factory_publication_case
+    _configure_python_ci(
+        monkeypatch,
+        tmp_path,
+        client,
+        {"acme-corp/another-repository": CONVERSION_PYTHON_CI_POLICY},
+    )
     payload["changed_paths"] = ["unitconv/convert.py"]
     recorded = _record_factory_verification(client, request_id, outcome="not_declared")
     assert recorded.status_code == 201, recorded.text
@@ -7184,13 +8871,16 @@ def test_policy_for_another_repository_does_not_apply(
 
 def test_custom_policy_names_its_check_in_the_pending_proof_stamp(
     monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
     _factory_publication_case: tuple[TestClient, uuid.UUID, dict[str, Any]],
 ) -> None:
+    client, request_id, payload = _factory_publication_case
     _configure_python_ci(
         monkeypatch,
-        {FACTORY_REPO.upper(): {"check": "Unit tests", "paths": ["src"]}},
+        tmp_path,
+        client,
+        {FACTORY_REPO.upper(): {"key": "Unit tests", "paths": ["src"]}},
     )
-    client, request_id, payload = _factory_publication_case
     payload["changed_paths"] = ["src/widget.py"]
     recorded = _record_factory_verification(client, request_id, outcome="not_declared")
     assert recorded.status_code == 201, recorded.text
@@ -7199,21 +8889,27 @@ def test_custom_policy_names_its_check_in_the_pending_proof_stamp(
 
     assert created.status_code == 201, created.text
     body = _factory_publication_body(created.json()["id"])
-    assert "Unit tests is pending proof." in body
-    assert CURIE_PYTHON_CI_CHECK not in body
+    assert (
+        "Unit tests had not reported when this pull request was opened; "
+        "the issue status comment reports its result."
+    ) in body
+    assert CONVERSION_PYTHON_CI_CHECK not in body
     assert _REPOSITORY_PENDING_PROOF not in body
+    assert "pending proof" not in body
+    assert "No in-sandbox Python verification check was declared." not in body
 
 
 def test_custom_policy_refuses_a_path_outside_its_selection(
     monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
     _factory_publication_case: tuple[TestClient, uuid.UUID, dict[str, Any]],
 ) -> None:
-    _configure_python_ci(
-        monkeypatch, {FACTORY_REPO: {"check": "Unit tests", "paths": ["src"]}}
-    )
     client, request_id, payload = _factory_publication_case
-    # Selected by Curie's layout, not by this repository's.
-    payload["changed_paths"] = ["apps/api/src/example.py"]
+    _configure_python_ci(
+        monkeypatch, tmp_path, client, {FACTORY_REPO: {"key": "Unit tests", "paths": ["src"]}}
+    )
+    # Selected by the conversion policy, outside this custom policy's layout.
+    payload["changed_paths"] = ["unitconv/convert.py"]
     recorded = _record_factory_verification(client, request_id)
     assert recorded.status_code == 201, recorded.text
 
@@ -7221,4 +8917,4 @@ def test_custom_policy_refuses_a_path_outside_its_selection(
 
     assert refused.status_code == 409, refused.text
     assert refused.json()["detail"]["code"] == "publication.required_python_ci_unselected"
-    assert "apps/api/src/example.py" in refused.json()["detail"]["message"]
+    assert "unitconv/convert.py" in refused.json()["detail"]["message"]

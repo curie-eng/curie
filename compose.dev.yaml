@@ -102,6 +102,7 @@ services:
       interval: 3s
       timeout: 5s
       retries: 10
+    restart: unless-stopped
 
   valkey:
     # Must equal charts/curie/values.yaml `valkey.image` (compose/tests).
@@ -119,6 +120,7 @@ services:
       interval: 3s
       timeout: 5s
       retries: 10
+    restart: unless-stopped
 
   clickhouse:
     # Pinned to 24.8.14.39: newer ClickHouse needs AVX and crashes (exit 132)
@@ -144,6 +146,7 @@ services:
       timeout: 5s
       retries: 12
       start_period: 10s
+    restart: unless-stopped
 
   # RustFS runs as UID 10001. Its named volumes are prepared by rustfs-perms
   # before this service starts, matching RustFS's documented Compose pattern.
@@ -173,6 +176,7 @@ services:
       timeout: 5s
       retries: 12
       start_period: 10s
+    restart: unless-stopped
 
   # Creates every first-party bucket so no service races a missing store.
   rustfs-init:
@@ -229,6 +233,7 @@ services:
       timeout: 10s
       retries: 24
       start_period: 10s
+    restart: unless-stopped
 
   ollama-pull:
     image: ollama/ollama:0.24.0
@@ -297,19 +302,28 @@ services:
 
   # The Collector image runs as UID 10001. Prepare its task-owned named volume
   # before boot so the persistent queue stays writable without running the
-  # Collector itself as root.
+  # Collector itself as root. The RustFS image also declares VOLUME /data,
+  # which this one-shot never uses. A named project volume covers that path
+  # so a wipe still removes it after the container is gone. An anonymous
+  # volume there has no project label, and compose deletes those only while
+  # the container still exists.
   otel-collector-perms:
     image: rustfs/rustfs:1.0.0-beta.12
     profiles: *full_profiles
     user: "0"
     volumes:
       - otel_collector_storage:/var/lib/otelcol/storage
+      - otel_collector_perms_data:/data
     entrypoint: ["/bin/sh", "-ec"]
     command: ["chown -R 10001:10001 /var/lib/otelcol/storage"]
     restart: "no"
 
   otel-collector:
-    image: otel/opentelemetry-collector-contrib:0.119.0
+    build:
+      context: otel
+      dockerfile_inline: |
+        FROM otel/opentelemetry-collector-contrib:0.119.0
+        COPY collector-config.yaml /etc/otel/collector-config.yaml
     profiles: *full_profiles
     user: "10001:10001"
     # Multi-homed onto curie_runner (#631): a hardened runner exports OTLP to
@@ -326,7 +340,6 @@ services:
       # base64("pk-lf-curie-dev:sk-lf-curie-dev"); matches the LANGFUSE_INIT keys above.
       LANGFUSE_OTLP_AUTH_HEADER: ${LANGFUSE_OTLP_AUTH_HEADER:-Basic cGstbGYtY3VyaWUtZGV2OnNrLWxmLWN1cmllLWRldg==}
     volumes:
-      - ./otel/collector-config.yaml:/etc/otel/collector-config.yaml:ro
       - otel_collector_storage:/var/lib/otelcol/storage
     ports:
       - "127.0.0.1:24317:4317"
@@ -393,6 +406,8 @@ services:
     # `--network curie_runner` always resolves. The data tier
     # (postgres/valkey/rustfs/clickhouse) is deliberately NOT on this network.
     networks: [default, curie_runner]
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     depends_on:
       postgres:
         condition: service_healthy
@@ -412,12 +427,39 @@ services:
       DB_SCHEMA: curie
       # Per-install key from `curie local up`; the fallback is for raw compose only.
       API_KEY: ${CURIE_LOCAL_API_KEY:-curie-dev-key}
+      # Console request budgets use the socket peer address. Users behind one
+      # proxy share a budget because forwarded client addresses are untrusted.
+      FORWARDED_ALLOW_IPS: ""
       # Dedicated Slack approval-principal attestation key. It is independent
       # from API_KEY so an administrator holding the platform key cannot forge
       # the authenticated Slack identity/channel evidence accepted by the API.
       # Only the API verifier and dispatcher producer receive it.
       CURIE_APPROVAL_CHAT_ATTESTER_SECRET: ${CURIE_APPROVAL_CHAT_ATTESTER_SECRET:-curie-dev-approval-chat-attester}
+      # Remediation authority (ADR 0231): binding and arming a remediation
+      # policy need it in X-Curie-Remediation-Authority. It is independent from
+      # API_KEY, which every worker holds, so only the API receives it.
+      CURIE_REMEDIATION_AUTHORITY_KEY: ${CURIE_REMEDIATION_AUTHORITY_KEY:-curie-dev-remediation-authority}
+      ATTACHMENT_TRANSFER_TIMEOUT_SECONDS: ${CURIE_ATTACHMENT_TRANSFER_TIMEOUT_SECONDS:-300}
+      ATTACHMENT_ACCESS_ENABLED: ${CURIE_ATTACHMENT_ACCESS_ENABLED:-false}
+      ATTACHMENT_BROKER_URL: ${CURIE_ATTACHMENT_BROKER_URL:-http://host.docker.internal:${CURIE_ATTACHMENT_BROKER_PORT:-28093}}
       CURIE_INTERNAL_WORKER_TOKEN: curie-dev-worker-token
+      # The action executor switch (ACTION-EXECUTOR-1). curie-worker reads the
+      # same interpolation, so one CURIE_ACTION_EXECUTOR_ENABLED in the
+      # environment turns both on and an unset one leaves both off.
+      CURIE_ACTION_EXECUTOR_ENABLED: ${CURIE_ACTION_EXECUTOR_ENABLED:-false}
+      # The installation-wide executor sandbox cap (AUTOMATED-REMEDIATION-12,
+      # executor amendment E9), enforced by the claim route. curie-worker reads
+      # the same interpolation; the two must never differ.
+      CURIE_ACTION_EXECUTOR_MAX_CONCURRENT_SANDBOXES: ${CURIE_ACTION_EXECUTOR_MAX_CONCURRENT_SANDBOXES:-2}
+      # The automated remediation switch (AUTOMATED-REMEDIATION-1). curie-worker
+      # reads the same interpolation. It requires the executor switch above; the
+      # API and the worker refuse to boot with it on and the executor off.
+      CURIE_REMEDIATION_ENABLED: ${CURIE_REMEDIATION_ENABLED:-false}
+      # Shared with curie-worker. The budget defaults to the process value.
+      # The lease passes the host value through: unset stays null, empty stays
+      # empty, and a set value is that value. An empty default would boot-fail.
+      CURIE_DELIVERY_BUDGET_S: ${CURIE_DELIVERY_BUDGET_S:-600}
+      CURIE_HOOK_CLAIM_LEASE_S:
       VALKEY_HOST: valkey
       VALKEY_PORT: "6379"
       VALKEY_PASSWORD: ${VALKEY_PASSWORD:-valkeypass}
@@ -433,27 +475,20 @@ services:
       # not receive the App private key or webhook HMAC secret.
       GITHUB_REVIEW_INGRESS_ENABLED: ${GITHUB_REVIEW_INGRESS_ENABLED:-false}
       GITHUB_REVIEW_RECONCILER_INTERVAL_S: ${GITHUB_REVIEW_RECONCILER_INTERVAL_S:-5}
-      GITHUB_FACTORY_INGRESS_ENABLED: ${GITHUB_FACTORY_INGRESS_ENABLED:-false}
-      GITHUB_FACTORY_LABEL: ${GITHUB_FACTORY_LABEL:-}
-      GITHUB_FACTORY_MENTION: ${GITHUB_FACTORY_MENTION:-}
-      GITHUB_FACTORY_CARD_BASE_URL: ${GITHUB_FACTORY_CARD_BASE_URL:-}
-      GITHUB_FACTORY_CI_WAIT_S: ${GITHUB_FACTORY_CI_WAIT_S:-1200}
-      GITHUB_FACTORY_PYTHON_CI: ${GITHUB_FACTORY_PYTHON_CI:-{}}
+      # The factory (#4397): CURIE_FORGES is the typed forge config, whose
+      # credentials name key files the API reads; it carries no secret itself.
+      FACTORY_ENABLED: ${FACTORY_ENABLED:-false}
+      FACTORY_INTAKE: ${FACTORY_INTAKE:-poll}
+      FACTORY_CI_WAIT_S: ${FACTORY_CI_WAIT_S:-3600}
+      CURIE_FORGES: ${CURIE_FORGES:-}
       GITHUB_APP_ID: ${GITHUB_APP_ID:-}
       GITHUB_APP_PRIVATE_KEY: ${GITHUB_APP_PRIVATE_KEY:-}
       GITHUB_WEBHOOK_SECRET: ${GITHUB_WEBHOOK_SECRET:-dev-webhook-secret}
-      # Approval user-group authorizers (#420) look up Slack usergroup
-      # membership from the API itself, so the API reads the same bot token the
-      # worker and dispatcher use. Empty by default: the Slack-free local loop
-      # needs nothing here, and a route that declares an approver group without a
-      # token fails closed at resolve time rather than widening to channel
-      # membership. Needs the `usergroups:read` bot scope.
-      SLACK_BOT_TOKEN: ${SLACK_BOT_TOKEN:-}
-      # How long a fetched user-group member set is reused. The fallback repeats
-      # the app's own 60s default rather than being empty, because the setting is
-      # float-typed: an empty value fails validation and the API would not boot.
-      # Set SLACK_USERGROUP_CACHE_TTL_S=0 to fetch on every resolve.
-      SLACK_USERGROUP_CACHE_TTL_S: ${SLACK_USERGROUP_CACHE_TTL_S:-60}
+      # Provider reads authenticate to the gateway with an API-only credential.
+      CURIE_CHANNEL_GATEWAY_URL: http://host.docker.internal:${CURIE_LOCAL_GATEWAY_PORT:-8081}
+      CURIE_CHANNEL_GATEWAY_TOKEN: ${CURIE_CHANNEL_GATEWAY_API_TOKEN:-curie-dev-gateway-api}
+      CURIE_CHANNEL_GATEWAY_PORT: ${CURIE_LOCAL_GATEWAY_PORT:-8081}
+      CURIE_CHANNEL_GATEWAY_ALLOW_INSECURE: "true"
       # Single-dash defaults preserve an explicitly empty endpoint/protocol.
       # `curie local up --minimal` uses that empty value to keep the core-only
       # stack inert when the full-profile Collector is absent.
@@ -561,12 +596,6 @@ services:
     user: "0"
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
-      # Shared bundle staging dir. The worker fetches each plugin bundle from
-      # RustFS and bind-mounts it into the runner container it spawns; because the
-      # runner runs on the HOST daemon, that bind source must resolve on the host
-      # at the SAME absolute path the worker used. An identical host:container
-      # path plus TMPDIR pointed here makes the worker's tempdir host-resolvable.
-      - /tmp/curie-bundles:/tmp/curie-bundles
     environment:
       - CURIE_SANDBOX_SUBSTRATE=docker
       # The image the worker spawns per turn -- the one that decides whether the
@@ -579,7 +608,6 @@ services:
       # platform and builds its runner as a plain `curie-runner` -- so the worker
       # went looking for a `curie-runner:ci-local` nothing had built.
       - CURIE_RUNNER_IMAGE=${CURIE_RUNNER_IMAGE:-ghcr.io/curie-eng/curie-runner:latest}
-      - TMPDIR=/tmp/curie-bundles
       - VALKEY_HOST=localhost
       - VALKEY_PORT=26379
       - VALKEY_PASSWORD=${VALKEY_PASSWORD:-valkeypass}
@@ -595,6 +623,13 @@ services:
       # with this key, so it must match curie-api's API_KEY. The Helm chart sets
       # the same variable on the worker.
       - CURIE_API_KEY=${CURIE_LOCAL_API_KEY:-curie-dev-key}
+      - CURIE_ATTACHMENT_ENABLED=${CURIE_ATTACHMENT_ENABLED:-false}
+      - CURIE_ATTACHMENT_CACHE_SIZE_BYTES=${CURIE_ATTACHMENT_CACHE_SIZE_BYTES:-536870912}
+      - CURIE_ATTACHMENT_MODE=${CURIE_ATTACHMENT_MODE:-eager}
+      - CURIE_ATTACHMENT_BROKER_HOST=${CURIE_ATTACHMENT_BROKER_HOST:-127.0.0.1}
+      - CURIE_ATTACHMENT_BROKER_PORT=${CURIE_ATTACHMENT_BROKER_PORT:-28093}
+      - CURIE_ATTACHMENT_BROKER_MAX_CONCURRENT=${CURIE_ATTACHMENT_BROKER_MAX_CONCURRENT:-8}
+      - CURIE_ATTACHMENT_TRANSFER_TIMEOUT_SECONDS=${CURIE_ATTACHMENT_TRANSFER_TIMEOUT_SECONDS:-300}
       - CURIE_INTERNAL_WORKER_TOKEN=curie-dev-worker-token
       # The worker runs host-net, so it self-dials the API at the published
       # localhost port above. But the runner containers it spawns join the
@@ -605,19 +640,11 @@ services:
       # worker's self-dial URL (#678). curie-api joins curie_runner (via its
       # network membership), so this name resolves from a spawned runner.
       - CURIE_RUNNER_API_URL=http://curie-api:8000
-      - SLACK_API_BASE_URL=${SLACK_API_BASE_URL-http://localhost:8155/api/}
-      # Additional Slack origins a per-turn reply endpoint may name (ADR-0096
-      # D4.4). The CLI stub advertises itself as `localhost` on native-Docker
-      # Linux and `host.docker.internal` under Docker Desktop (#680), and it
-      # binds an EPHEMERAL port on `curie chat`, so the single
-      # SLACK_API_BASE_URL above cannot also name it -- without these the origin
-      # pin refuses the local loop. A portless entry trusts any port on that
-      # host, which is why the ephemeral-port stub works. DEV ONLY: the deployed
-      # chart defaults this to empty, and a LAN-host dev setup (`cluster message
-      # --listen-host <ip>`, or CURIE_LOCAL_STUB_HOST) must extend this list
-      # with that host itself.
+      - CURIE_CHANNEL_GATEWAY_URL=http://localhost:${CURIE_LOCAL_GATEWAY_PORT:-8081}
+      - CURIE_CHANNEL_GATEWAY_TOKEN=${CURIE_CHANNEL_GATEWAY_WORKER_TOKEN:-curie-dev-gateway-worker}
+      - CURIE_CHANNEL_GATEWAY_ALLOW_INSECURE=true
       - CURIE_SLACK_TRUSTED_ORIGINS=${CURIE_SLACK_TRUSTED_ORIGINS-http://localhost,http://127.0.0.1,http://host.docker.internal}
-      - SLACK_BOT_TOKEN=${SLACK_BOT_TOKEN:-xoxb-dev}
+      - CURIE_ATTACHMENT_MAX_FILE_BYTES=${CURIE_ATTACHMENT_MAX_FILE_BYTES:-33554432}
       # Per-adapter egress credentials (ADR-0096 D4.2): a JSON object mapping an
       # adapter slug (the binding row's `adapter`) to the secret the worker
       # presents as X-Curie-Adapter-Secret when it delivers reply events there.
@@ -633,7 +660,7 @@ services:
       - CURIE_STATUS_TEXT=${CURIE_STATUS_TEXT:-is working on your request...}
       # The receipt beneath a turn's reply (ADR-0180): all, failures or off. The
       # chart's worker.turnReceipt sets the same variable on a cluster install.
-      - CURIE_TURN_RECEIPT=${CURIE_TURN_RECEIPT:-all}
+      - CURIE_TURN_RECEIPT=${CURIE_TURN_RECEIPT:-off}
       # Fake model by default (no credential needed). `curie local up` reaches
       # skill-tier parity: when a credential (one of the bare names below) is set
       # in your SHELL it injects CURIE_FAKE_MODEL=0 automatically, so local goes
@@ -690,9 +717,23 @@ services:
       # alias the local connector container starts under, so the runner
       # derives the identical name it would derive on cluster. The default
       # here must match the CLI's local connector bring-up identity: release
-      # `curie` (cli/src/commands.rs), the same as `local::COMPOSE_PROJECT`.
+      # `curie` (cli/src/commands/connector_images.rs), the same as `local::COMPOSE_PROJECT`.
       - CURIE_RELEASE=${CURIE_RELEASE:-curie}
       - CURIE_NAMESPACE=${CURIE_NAMESPACE:-default}
+      # The action executor switch (ACTION-EXECUTOR-1). curie-api reads the
+      # same interpolation; the two must never differ.
+      - CURIE_ACTION_EXECUTOR_ENABLED=${CURIE_ACTION_EXECUTOR_ENABLED:-false}
+      # The installation-wide executor sandbox cap (AUTOMATED-REMEDIATION-12,
+      # executor amendment E9). curie-api reads the same interpolation.
+      - CURIE_ACTION_EXECUTOR_MAX_CONCURRENT_SANDBOXES=${CURIE_ACTION_EXECUTOR_MAX_CONCURRENT_SANDBOXES:-2}
+      # The automated remediation switch (AUTOMATED-REMEDIATION-1). curie-api
+      # reads the same interpolation; the two must never differ.
+      - CURIE_REMEDIATION_ENABLED=${CURIE_REMEDIATION_ENABLED:-false}
+      # Shared with curie-api. A bare lease name is the list form of a null
+      # mapping value: unset stays null, empty stays empty, and a set value is
+      # that value. Do not give it an empty default.
+      - CURIE_DELIVERY_BUDGET_S=${CURIE_DELIVERY_BUDGET_S:-600}
+      - CURIE_HOOK_CLAIM_LEASE_S
     restart: unless-stopped
 
   # Optional real Slack ingress for local development.
@@ -703,7 +744,7 @@ services:
   #
   # Enable it:
   #   export SLACK_APP_TOKEN=xapp-... SLACK_BOT_TOKEN=xoxb-...
-  #   export SLACK_API_BASE_URL=          # empty: un-wire the worker's stub
+  #   export SLACK_API_BASE_URL=          # empty: un-wire the gateway's stub
   #   docker compose --profile full --profile slack -f compose.dev.yaml up -d
   #   (or: curie local up --slack)
   #
@@ -711,9 +752,46 @@ services:
   # A local dispatcher and a cluster dispatcher on the same Slack app conflict.
   # Use one dispatcher per app. This is why the service is behind the `slack`
   # profile and disabled by default.
+  curie-gateway-replay-perms:
+    restart: "no"
+    profiles: *core_profiles
+    image: ${CURIE_DISPATCHER_IMAGE:-ghcr.io/curie-eng/curie-dispatcher:latest}
+    user: "0:0"
+    command: ["python", "-c", "import os; os.chown('/state', 1000, 1000)"]
+    volumes:
+      - curie_gateway_replay:/state
+
+  curie-channel-gateway:
+    profiles: *core_profiles
+    image: ${CURIE_DISPATCHER_IMAGE:-ghcr.io/curie-eng/curie-dispatcher:latest}
+    command: ["python", "-m", "curie_channel_gateway.slack.read_server"]
+    network_mode: host
+    depends_on:
+      curie-gateway-replay-perms:
+        condition: service_completed_successfully
+    volumes:
+      - curie_gateway_replay:/var/lib/curie-gateway
+    environment:
+      CURIE_CHANNEL_GATEWAY_API_TOKEN: ${CURIE_CHANNEL_GATEWAY_API_TOKEN:-curie-dev-gateway-api}
+      CURIE_CHANNEL_GATEWAY_WORKER_TOKEN: ${CURIE_CHANNEL_GATEWAY_WORKER_TOKEN:-curie-dev-gateway-worker}
+      CURIE_CHANNEL_GATEWAY_PORT: ${CURIE_LOCAL_GATEWAY_PORT:-8081}
+      CURIE_CHANNEL_GATEWAY_ALLOW_INSECURE: "true"
+      CURIE_CHANNEL_GATEWAY_MAX_FILE_BYTES: ${CURIE_ATTACHMENT_MAX_FILE_BYTES:-33554432}
+      SLACK_BOT_TOKEN: ${SLACK_BOT_TOKEN:-xoxb-dev}
+      SLACK_API_BASE_URL: ${SLACK_API_BASE_URL-http://localhost:8155/api/}
+      CURIE_SLACK_TRUSTED_ORIGINS: ${CURIE_SLACK_TRUSTED_ORIGINS-http://localhost,http://127.0.0.1,http://host.docker.internal}
+      SLACK_USERGROUP_CACHE_TTL_S: ${SLACK_USERGROUP_CACHE_TTL_S:-60}
+    healthcheck:
+      test: ["CMD", "python", "-c", "import os,socket; socket.create_connection(('127.0.0.1', int(os.environ['CURIE_CHANNEL_GATEWAY_PORT'])), timeout=3).close()"]
+      interval: 5s
+      timeout: 5s
+      retries: 6
+      start_period: 5s
+    restart: unless-stopped
+
   curie-dispatcher:
     # Its own variable, same reasoning as curie-ui above (#1915). This one bit
-    # hardest locally: the CLI invoked `curie_dispatcher.enqueue_once`, the
+    # hardest locally: the CLI invoked `curie_channel_gateway.slack.enqueue_once`, the
     # published image predated that module, and the failure surfaced as a bare
     # `No module named` from inside a container.
     image: ${CURIE_DISPATCHER_IMAGE:-ghcr.io/curie-eng/curie-dispatcher:latest}
@@ -759,6 +837,7 @@ networks:
     name: curie_runner
 
 volumes:
+  curie_gateway_replay:
   postgres_data:
   valkey_data:
   clickhouse_data:
@@ -767,3 +846,4 @@ volumes:
   rustfs_logs:
   ollama_data:
   otel_collector_storage:
+  otel_collector_perms_data:

@@ -120,7 +120,7 @@ def validate_deploy_targets(data: Any) -> tuple[DeployTargetsFile | None, list[t
 
     try:
         parsed = DeployTargetsFile.model_validate(data)
-    except Exception as exc:  # pydantic ValidationError -- surface it verbatim
+    except Exception as exc:  # noqa: BLE001 - pydantic ValidationError -- surface it verbatim
         return None, [("deploy.invalid", str(exc)[:400])]
 
     for name, target in parsed.targets.items():

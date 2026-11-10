@@ -35,7 +35,7 @@ metadata:
     app.kubernetes.io/component: mail-persistence-preflight
   annotations:
     "helm.sh/hook": pre-install,pre-upgrade,test
-    "helm.sh/hook-weight": "-9"
+    "helm.sh/hook-weight": "-12"
     "helm.sh/hook-delete-policy": before-hook-creation,hook-succeeded,hook-failed
 ---
 apiVersion: rbac.authorization.k8s.io/v1
@@ -47,7 +47,7 @@ metadata:
     app.kubernetes.io/component: mail-persistence-preflight
   annotations:
     "helm.sh/hook": pre-install,pre-upgrade,test
-    "helm.sh/hook-weight": "-9"
+    "helm.sh/hook-weight": "-12"
     "helm.sh/hook-delete-policy": before-hook-creation,hook-succeeded,hook-failed
 rules:
   - apiGroups: [""]
@@ -64,7 +64,7 @@ metadata:
     app.kubernetes.io/component: mail-persistence-preflight
   annotations:
     "helm.sh/hook": pre-install,pre-upgrade,test
-    "helm.sh/hook-weight": "-8"
+    "helm.sh/hook-weight": "-12"
     "helm.sh/hook-delete-policy": before-hook-creation,hook-succeeded,hook-failed
 roleRef:
   apiGroup: rbac.authorization.k8s.io
@@ -78,13 +78,13 @@ subjects:
 apiVersion: batch/v1
 kind: Job
 metadata:
-  name: {{ include "curie.fullname" . }}-mail-persistence-preflight
+  name: {{ include "curie.checkedObjectName" (dict "kind" "Job" "name" (printf "%s-mail-persistence-preflight" (include "curie.fullname" .))) }}
   labels:
     {{- include "curie.labels" . | nindent 4 }}
     app.kubernetes.io/component: mail-persistence-preflight
   annotations:
     "helm.sh/hook": pre-install,pre-upgrade,test
-    "helm.sh/hook-weight": "-7"
+    "helm.sh/hook-weight": "-11"
     "helm.sh/hook-delete-policy": before-hook-creation
 spec:
   backoffLimit: 0
@@ -119,6 +119,7 @@ spec:
         fsGroup: 65532
         seccompProfile:
           type: RuntimeDefault
+      enableServiceLinks: false
       containers:
         - name: claim-check
           image: {{ .Values.security.probe.kubectlImage }}

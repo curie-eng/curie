@@ -26,6 +26,7 @@ impl PrivateHelmValues {
             "worker.adapterCredentialsExistingSecretKey",
         ]
         .into_iter()
+        .chain(RETAINED_RUNNER_FAMILIES.iter().copied())
         .filter(|key| {
             self.0
                 .pointer(&format!("/{}", key.replace('.', "/")))
@@ -45,15 +46,32 @@ impl std::fmt::Debug for PrivateHelmValues {
 }
 
 pub struct UpOpts {
+    /// @spec CLUSTER-VALUES-FILES c1-c4: captured operator values.
+    pub file_values: Option<PrivateHelmValues>,
     /// Existing mail lifecycle and paired worker credentials, with explicit
     /// operator overrides removed. Populated by the one release-values read.
     pub retained_mail_values: Option<PrivateHelmValues>,
+    /// The recorded runner, api and dispatcher environment lists and every
+    /// per-agent connector binding, with explicit operator overrides removed.
+    /// A full upgrade otherwise resets them, and only a typed values file keeps
+    /// a numeric environment string a string (#3848).
+    pub retained_runner_values: Option<PrivateHelmValues>,
+    /// The model credential saved in Curie private storage. Unlike
+    /// [`Self::credentials`] it is not a change request: completion adopts it
+    /// only when the release records no model credential of its own, so a
+    /// saved credential for another provider cannot replace a recorded Secret
+    /// reference (#3848).
+    pub saved_credentials: Option<String>,
 
     pub common: CommonOpts,
     pub chart: String,
     pub no_expose: bool,
     pub set: Vec<String>,
     pub set_string: Vec<String>,
+    /// `path=<compact json>` object or array values a configuration migration
+    /// promoted from the release (#4322). Not operator input: they never
+    /// override an operator key and are passed to Helm whole via `--set-json`.
+    pub set_json: Vec<String>,
     /// Named model providers (validated against [`parse_egress_provider`]) whose
     /// API host(s) runner egress is opened to. Resolved to narrow host-route
     /// CIDRs at install time into [`resolved_egress_cidrs`]; empty means no
@@ -110,7 +128,18 @@ pub struct UpOpts {
 
 impl UpOpts {
     pub(super) fn operator_sets(&self) -> Vec<String> {
-        self.set.iter().chain(&self.set_string).cloned().collect()
+        // @spec CLUSTER-VALUES-FILES c3: file keys are explicit overrides.
+        self.file_values
+            .iter()
+            .flat_map(|values| {
+                values
+                    .1
+                    .iter()
+                    .map(|(key, value)| format!("{key}={}", escape_helm_set_string_value(value)))
+            })
+            .chain(self.set.iter().cloned())
+            .chain(self.set_string.iter().cloned())
+            .collect()
     }
 }
 
@@ -369,7 +398,7 @@ fn lookup_dotted(values: &serde_json::Value, dotted: &str) -> Option<String> {
 /// This cannot reuse [`lookup_dotted`]: helm records `--set KEY=true` as a JSON
 /// *boolean*, and `lookup_dotted` ends in `as_str()`, so it returns `None` for
 /// exactly the shape this key normally has.
-fn lookup_dotted_flag(values: &serde_json::Value, dotted: &str) -> bool {
+pub(crate) fn lookup_dotted_flag(values: &serde_json::Value, dotted: &str) -> bool {
     let mut cursor = values;
     for part in dotted.split('.') {
         let Some(next) = cursor.get(part) else {
@@ -528,6 +557,117 @@ fn resolve_sealing_values(
     resolved
 }
 
+/// The part of a retained values document that no operator `--set` key
+/// owns. An operator key at or above a path removes that subtree; an operator
+/// key inside a list removes the whole list, because explicit list input
+/// replaces the recorded family rather than patching one index of it.
+fn without_overrides(
+    value: &serde_json::Value,
+    path: &str,
+    overridden: &std::collections::HashSet<String>,
+) -> Option<serde_json::Value> {
+    if removed_by_overrides(path, value.is_array(), overridden) {
+        return None;
+    }
+    match value {
+        serde_json::Value::Object(object) => {
+            let remaining: serde_json::Map<String, serde_json::Value> = object
+                .iter()
+                .filter_map(|(key, value)| {
+                    let child = if path.is_empty() {
+                        key.clone()
+                    } else {
+                        format!("{path}.{key}")
+                    };
+                    without_overrides(value, &child, overridden).map(|value| (key.clone(), value))
+                })
+                .collect();
+            (!remaining.is_empty() || object.is_empty())
+                .then_some(serde_json::Value::Object(remaining))
+        }
+        _ => Some(value.clone()),
+    }
+}
+
+/// Whether [`without_overrides`] drops the node at `path`: an operator key at
+/// or above it removes it, and for a list any operator key inside it removes
+/// the whole list too. The one rule both apply and `diff` use (#3848).
+fn removed_by_overrides(
+    path: &str,
+    is_list: bool,
+    overridden: &std::collections::HashSet<String>,
+) -> bool {
+    overridden.iter().any(|key| {
+        key_is_or_descends_from(path, key) || (is_list && key_is_or_descends_from(key, path))
+    })
+}
+
+/// Whether a flattened retained runner key (`a.b[0].c` spelling, as
+/// `flatten_values` writes it) survives [`without_overrides`] given these
+/// operator or declared keys. Every enclosing node is checked with the same
+/// rule apply uses, so a declared element of a recorded list resets the rest
+/// of that list in `diff` exactly as apply drops it (#3848).
+pub(crate) fn retained_runner_key_survives(
+    key: &str,
+    overridden: &std::collections::HashSet<String>,
+) -> bool {
+    let enclosing = key
+        .char_indices()
+        .filter(|(_, ch)| matches!(ch, '.' | '['))
+        .map(|(i, ch)| (&key[..i], ch == '['));
+    !enclosing
+        .chain(std::iter::once((key, false)))
+        .any(|(path, is_list)| removed_by_overrides(path, is_list, overridden))
+}
+
+/// Runtime value families retained with their types and private file delivery.
+const RETAINED_RUNNER_FAMILIES: &[&str] = &[
+    "agentSandbox.runner.extraEnv",
+    "agentSandbox.connectorSecrets",
+    "api.extraEnv",
+    "dispatcher.extraEnv",
+    "channelGateway",
+];
+
+pub(crate) fn is_retained_runner_key(key: &str) -> bool {
+    RETAINED_RUNNER_FAMILIES
+        .iter()
+        .any(|family| key_is_or_descends_from(key, family))
+}
+
+/// Preserve runtime environment lists, connector bindings and gateway configuration
+/// as typed values.
+///
+/// `up` is a full upgrade, so these reset to the chart's empty default unless
+/// re-supplied, which silently unbound every agent's connector credentials and
+/// dropped the runner environment. They travel through the private values
+/// file rather than `--set`: a list of env objects has no faithful `--set`
+/// form, a numeric string such as `"8080"` becomes an integer Kubernetes then
+/// rejects, and a connector value is a credential that must stay off argv.
+/// Every agent is kept; an explicit binding replaces only its own name.
+fn resolve_retained_runner_values(
+    existing: Option<&serde_json::Value>,
+    operator_sets: &[String],
+) -> Option<PrivateHelmValues> {
+    let existing = existing?;
+    let mut retained = serde_json::json!({});
+    for family in RETAINED_RUNNER_FAMILIES {
+        let pointer = format!("/{}", family.replace('.', "/"));
+        let Some(value) = existing.pointer(&pointer) else {
+            continue;
+        };
+        let (parent, leaf) = pointer.rsplit_once('/').expect("family pointer");
+        let mut cursor = &mut retained;
+        for part in parent.split('/').skip(1) {
+            cursor = &mut cursor[part];
+        }
+        cursor[leaf] = value.clone();
+    }
+    without_overrides(&retained, "", &operator_set_keys(operator_sets))
+        .filter(|value| value.as_object().is_some_and(|object| !object.is_empty()))
+        .map(|document| PrivateHelmValues(document, BTreeMap::new()))
+}
+
 /// Preserve the installed mail surface as typed values: booleans, arrays and
 /// credential maps must not become strings when delivered through Helm -f.
 /// This family includes the paired worker credential source, because preserving
@@ -636,44 +776,6 @@ fn resolve_retained_mail_values(
                     cleared.extend(removed_leaves.into_keys().map(|key| (key, String::new())));
                 }
             }
-        }
-    }
-    fn without_overrides(
-        value: &serde_json::Value,
-        path: &str,
-        overridden: &std::collections::HashSet<String>,
-    ) -> Option<serde_json::Value> {
-        if overridden
-            .iter()
-            .any(|key| key_is_or_descends_from(path, key))
-        {
-            return None;
-        }
-        match value {
-            serde_json::Value::Object(object) => {
-                let remaining: serde_json::Map<String, serde_json::Value> = object
-                    .iter()
-                    .filter_map(|(key, value)| {
-                        let child = if path.is_empty() {
-                            key.clone()
-                        } else {
-                            format!("{path}.{key}")
-                        };
-                        without_overrides(value, &child, overridden)
-                            .map(|value| (key.clone(), value))
-                    })
-                    .collect();
-                (!remaining.is_empty() || object.is_empty())
-                    .then_some(serde_json::Value::Object(remaining))
-            }
-            serde_json::Value::Array(_)
-                if overridden
-                    .iter()
-                    .any(|key| key_is_or_descends_from(key, path)) =>
-            {
-                None
-            }
-            _ => Some(value.clone()),
         }
     }
     Ok(without_overrides(&retained, "", &overridden)
@@ -999,10 +1101,13 @@ mod connector_caller_preservation_tests {
         CONNECTOR_CALLER_PREVIOUS_VERIFY_KEY, CONNECTOR_CALLER_SIGNING_KEY,
         CONNECTOR_CALLER_VERIFY_KEY,
     };
+    use base64::Engine;
 
     // The first frozen seed and its public key
     // (tests/vectors/connector-caller-token.json).
-    const SEED: &str = "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=";
+    fn seed() -> String {
+        base64::engine::general_purpose::STANDARD.encode((0_u8..32).collect::<Vec<_>>())
+    }
     const PUBLIC: &str = "A6EHv/POEL4dcN0Y50vAmWfk1jCbpQ1fHdyGZBJVMbg=";
 
     fn get<'a>(pairs: &'a [(String, String)], key: &str) -> Option<&'a str> {
@@ -1013,7 +1118,7 @@ mod connector_caller_preservation_tests {
     }
 
     fn recorded() -> serde_json::Value {
-        serde_json::json!({"connectorCaller": {"signingKey": SEED, "verifyKey": PUBLIC}})
+        serde_json::json!({"connectorCaller": {"signingKey": seed(), "verifyKey": PUBLIC}})
     }
 
     /// A plain `cluster up` drops anything it does not re-pass, and a new pair
@@ -1021,7 +1126,10 @@ mod connector_caller_preservation_tests {
     #[test]
     fn an_upgrade_re_supplies_the_recorded_pair_unchanged() {
         let all = resolve_preserved_values(Some(&recorded()), &[]);
-        assert_eq!(get(&all, CONNECTOR_CALLER_SIGNING_KEY), Some(SEED));
+        assert_eq!(
+            get(&all, CONNECTOR_CALLER_SIGNING_KEY),
+            Some(seed().as_str())
+        );
         assert_eq!(get(&all, CONNECTOR_CALLER_VERIFY_KEY), Some(PUBLIC));
         assert!(
             generate_connector_caller_values(Some(&recorded()), &[], false)
@@ -1067,7 +1175,7 @@ mod connector_caller_preservation_tests {
 
     #[test]
     fn an_operator_set_wins() {
-        let sets = vec![format!("{CONNECTOR_CALLER_SIGNING_KEY}={SEED}")];
+        let sets = vec![format!("{CONNECTOR_CALLER_SIGNING_KEY}={}", seed())];
         assert!(generate_connector_caller_values(None, &sets, false)
             .unwrap()
             .is_empty());
@@ -1092,7 +1200,7 @@ mod connector_caller_preservation_tests {
     #[test]
     fn a_previous_key_is_preserved_and_never_generated() {
         let existing = serde_json::json!({"connectorCaller": {
-            "signingKey": SEED, "verifyKey": PUBLIC, "previousVerifyKey": "OLD"
+            "signingKey": seed(), "verifyKey": PUBLIC, "previousVerifyKey": "OLD"
         }});
         let all = resolve_preserved_values(Some(&existing), &[]);
         assert_eq!(get(&all, CONNECTOR_CALLER_PREVIOUS_VERIFY_KEY), Some("OLD"));
@@ -1112,8 +1220,10 @@ mod connector_caller_preservation_tests {
 /// The chart value holding the model credential. Named here so the secret
 /// classifier below cannot drift from the key `up_commands` actually masks.
 pub(crate) const MODEL_CREDENTIAL_KEY: &str = "agentSandbox.runner.credentials";
+/// The Secret the runner reads its model credential from when one is recorded.
+const MODEL_CREDENTIAL_SECRET_KEY: &str = "agentSandbox.runner.credentialsExistingSecret";
 const MODEL_CREDENTIAL_REFERENCE_KEYS: &[&str] = &[
-    "agentSandbox.runner.credentialsExistingSecret",
+    MODEL_CREDENTIAL_SECRET_KEY,
     "agentSandbox.runner.credentialsExistingSecretKey",
 ];
 const CREATED_BY_LABEL: &str = "curietech.ai/created-by";
@@ -1126,6 +1236,40 @@ const ADOPTED_CONTENTS_ANNOTATION: &str = "curietech.ai/adopted-contents";
 const ADOPTION_RECORD_LIMIT: usize = 4096;
 const ADOPT_HINT: &str =
     "; pass --adopt to adopt it anyway, recording what was adopted on the namespace";
+/// Set only on the `cluster up` child that `factory quickstart` spawns.
+/// Quickstart has no `--adopt`, so that child names a working remedy instead.
+pub(crate) const QUICKSTART_NAMESPACE_HINT_ENV: &str = "CURIE_QUICKSTART_NAMESPACE_HINT";
+/// Set only on a child `factory quickstart` spawns to write the release
+/// (`cluster up`, the GitHub intake): the mark that child's Helm write
+/// records as its `--description`, so the parent adopts exactly the
+/// revisions that write produced and no other (#4620).
+pub(crate) const QUICKSTART_RELEASE_WRITE_ENV: &str = "CURIE_QUICKSTART_RELEASE_WRITE";
+/// Every release write mark starts with this.
+pub(crate) const QUICKSTART_RELEASE_WRITE_PREFIX: &str = "curie-quickstart-write-";
+
+/// `cmd`, a Helm install or upgrade of the release, with `--description`
+/// naming the release write mark a quickstart parent handed this process in
+/// [`QUICKSTART_RELEASE_WRITE_ENV`]; unchanged when it handed none.
+pub(crate) fn quickstart_marked_release_write(cmd: &OpsCommand) -> OpsCommand {
+    release_write_with_mark(
+        cmd,
+        std::env::var(QUICKSTART_RELEASE_WRITE_ENV).ok().as_deref(),
+    )
+}
+
+/// `cmd` with `--description <mark>` when `mark` is a release write mark.
+fn release_write_with_mark(cmd: &OpsCommand, mark: Option<&str>) -> OpsCommand {
+    let mut marked = cmd.clone();
+    let valid = mark.filter(|mark| {
+        mark.strip_prefix(QUICKSTART_RELEASE_WRITE_PREFIX)
+            .is_some_and(|id| !id.is_empty() && id.bytes().all(|b| b.is_ascii_alphanumeric()))
+    });
+    if let Some(mark) = valid {
+        marked.args.extend([plain("--description"), plain(mark)]);
+    }
+    marked
+}
+const METADATA_NAME_LABEL: &str = "kubernetes.io/metadata.name";
 
 /// Emitted alongside [`MODEL_CREDENTIAL_KEY`], and only when a credential is
 /// present -- see `up_commands`, which pushes both inside one `if let`.
@@ -1276,6 +1420,45 @@ fn resolve_credential_values(
         .collect()
 }
 
+/// Decide whether the model credential saved in Curie private storage is this
+/// run's model credential (#3848).
+///
+/// A saved credential is a convenience for a fresh install, not a request to
+/// change the model credential. Treating it as one replaced a recorded
+/// `credentialsExistingSecret` reference with whatever provider happened to be
+/// saved locally. So it is adopted only when nothing else owns the family: no
+/// explicit credential, no fake or local model, no operator credential or
+/// reference key, and no nonempty credential or reference recorded by the
+/// release. An adopted credential then flows exactly like an explicit one,
+/// including the post-completion provider validation and egress inference.
+fn adopt_saved_model_credential(
+    opts: &mut UpOpts,
+    existing: Option<&serde_json::Value>,
+    operator_sets: &[String],
+) {
+    let Some(saved) = opts.saved_credentials.take() else {
+        return;
+    };
+    if opts.credentials.is_some() || opts.fake_model || opts.local_model.is_some() {
+        return;
+    }
+    let overridden = operator_set_keys(operator_sets);
+    if std::iter::once(MODEL_CREDENTIAL_KEY)
+        .chain(MODEL_CREDENTIAL_REFERENCE_KEYS.iter().copied())
+        .any(|key| overridden.contains(key))
+    {
+        return;
+    }
+    if preserved_value(existing, MODEL_CREDENTIAL_KEY).is_some()
+        || preserved_value(existing, MODEL_CREDENTIAL_SECRET_KEY).is_some()
+    {
+        crate::ui::ui()
+            .note("saved model credential ignored: the release records its own model credential");
+        return;
+    }
+    opts.credentials = Some(saved);
+}
+
 /// Carry the runner configuration recorded by a prior real model install into
 /// a plain rerun. Explicit inputs replace their recorded family.
 fn resolve_preserved_runner_identity_values(
@@ -1307,6 +1490,21 @@ fn resolve_preserved_runner_identity_values(
         for (_, value) in &mut references {
             value.clear();
         }
+    }
+    // A preserved Secret reference is the release's model credential, and the
+    // chart reads it only when `fakeModel` is false. That switch is a managed
+    // key the live overlay skips, so without re-supplying it a plain rerun
+    // reverts to the fake model while keeping the reference (#3848).
+    if !opts.fake_model
+        && !overridden.contains(FAKE_MODEL_KEY)
+        && references
+            .iter()
+            .any(|(key, value)| key == MODEL_CREDENTIAL_SECRET_KEY && !value.is_empty())
+        && existing
+            .and_then(|values| values.pointer("/agentSandbox/runner/fakeModel"))
+            .is_some_and(|recorded| !crate::doctor::helm_truthy(Some(recorded)))
+    {
+        opts.set.push(format!("{FAKE_MODEL_KEY}=false"));
     }
     opts.secrets.extend(references);
     let preserve_inline_credential = opts.fake_model && opts.local_model.is_none();
@@ -1582,6 +1780,7 @@ fn is_retained_mail_key(key: &str) -> bool {
 /// two lists agree by construction rather than by a hand-kept fixture.
 pub fn is_preserved_by_up(key: &str) -> bool {
     is_retained_mail_key(key)
+        || is_retained_runner_key(key)
         || COMMS_MANAGED_KEYS.contains(&key)
         || GITHUB_APP_MANAGED_KEYS.contains(&key)
         || REQUIRED_SECRETS.iter().any(|(k, _)| *k == key)
@@ -2214,6 +2413,7 @@ fn complete_up_opts_without_runner_egress(
     github_token: Option<&str>,
     clear_github_token: bool,
     overlay_live: bool,
+    factory: &crate::config_migrate::FactoryMigrationContext,
 ) -> Result<UpOpts> {
     let operator_sets = opts.operator_sets();
     refuse_half_a_caller_key_pair(&operator_sets)?;
@@ -2234,9 +2434,22 @@ fn complete_up_opts_without_runner_egress(
     opts.retained_mail_values = resolve_retained_mail_values(existing, &operator_sets)?;
     let migrated_owned;
     let existing = if let Some(values) = existing {
-        let outcome = crate::config_migrate::migrate_installed_config(values.clone(), None)?;
+        let outcome =
+            crate::config_migrate::migrate_installed_config(values.clone(), None, factory)?;
         stamp_config_schema(&mut opts, &outcome);
         overlay_migration_results(&mut opts, &outcome.values, &operator_sets);
+        if matches!(
+            factory,
+            crate::config_migrate::FactoryMigrationContext::LegacyGitHub { .. }
+        ) && opts.file_values.is_none()
+        {
+            overlay_leaf(
+                &mut opts,
+                &outcome.values,
+                "factory",
+                &std::collections::HashSet::new(),
+            );
+        }
         if overlay_live {
             overlay_live_operator_values(&mut opts, &outcome.values, &operator_sets)?;
         }
@@ -2246,6 +2459,7 @@ fn complete_up_opts_without_runner_egress(
         stamp_target_schema(&mut opts);
         existing
     };
+    opts.retained_runner_values = resolve_retained_runner_values(existing, &operator_sets);
     resolve_preserved_gvisor_mode_value(&mut opts, existing, &operator_sets);
     resolve_preserved_worker_extra_env_values(&mut opts, existing, &operator_sets);
     resolve_preserved_slack_trusted_origins_value(&mut opts, existing, &operator_sets);
@@ -2270,6 +2484,7 @@ fn complete_up_opts_without_runner_egress(
         opts.secrets
             .extend(resolve_preserved_values(existing, &operator_sets));
     }
+    adopt_saved_model_credential(&mut opts, existing, &operator_sets);
     resolve_preserved_runner_identity_values(&mut opts, existing, &operator_sets);
     let mut references =
         resolve_credential_values(existing, &operator_sets, GITHUB_TOKEN_REFERENCE_KEYS);
@@ -2343,6 +2558,14 @@ fn overlay_overridden_keys(
     {
         overridden.insert((*key).to_string());
     }
+    // A promoted object travels whole as `--set-json`; its leaves must not
+    // also be re-supplied per path by the live overlay (#4322).
+    overridden.extend(
+        opts.set_json
+            .iter()
+            .filter_map(|expression| expression.split_once('='))
+            .map(|(key, _)| key.to_string()),
+    );
     overridden
 }
 
@@ -2356,10 +2579,20 @@ fn overlay_migration_results(
 ) {
     let overridden = overlay_overridden_keys(opts, operator_sets);
     for (_, helm_key) in crate::config_migrate::extra_env_successors() {
-        if overridden.contains(*helm_key)
-            || overridden
-                .iter()
-                .any(|key| key_is_or_descends_from(key, helm_key))
+        let typed = values
+            .pointer(&format!("/{}", helm_key.replace('.', "/")))
+            .is_some_and(|value| value.is_object() || value.is_array());
+        // An operator override of the key or an ancestor replaces it outright.
+        // A descendant override replaces a scalar too, but only refines an
+        // object: Helm applies `--set` over `--set-json`, so the typed object
+        // still travels and the operator leaf wins (#4322).
+        if overridden
+            .iter()
+            .any(|key| key_is_or_descends_from(helm_key, key))
+            || (!typed
+                && overridden
+                    .iter()
+                    .any(|key| key_is_or_descends_from(key, helm_key)))
         {
             continue;
         }
@@ -2390,9 +2623,7 @@ fn overlay_family_is_managed(key: &str) -> bool {
         || key_is_or_descends_from(key, SLACK_TRUSTED_ORIGINS_KEY)
         || is_grafana_connector_reference_key(key)
         || key_is_or_descends_from(key, WORKER_EXTRA_ENV_KEY)
-        || key_is_or_descends_from(key, "api.extraEnv")
-        || key_is_or_descends_from(key, "dispatcher.extraEnv")
-        || key_is_or_descends_from(key, "agentSandbox.runner.extraEnv")
+        || is_retained_runner_key(key)
         || COMMS_MANAGED_KEYS
             .iter()
             .any(|managed| key_is_or_descends_from(key, managed))
@@ -2425,6 +2656,7 @@ fn overlay_secret_refs(
         if is_external_secret_ref_key(&path)
             && !overridden.contains(&path)
             && !is_retained_mail_key(&path)
+            && !is_retained_runner_key(&path)
         {
             match child {
                 serde_json::Value::String(raw) => opts
@@ -2463,7 +2695,12 @@ fn overlay_leaf(
             .push(format!("{path}={}", escape_helm_set_string_value(raw))),
         serde_json::Value::Bool(flag) => opts.set.push(format!("{path}={flag}")),
         serde_json::Value::Number(number) => opts.set.push(format!("{path}={number}")),
-        _ => {}
+        // An object or list has no faithful per-leaf `--set` form, so it
+        // reaches Helm whole as compact JSON (#4322).
+        value @ (serde_json::Value::Object(_) | serde_json::Value::Array(_)) => {
+            opts.set_json.push(format!("{path}={value}"));
+        }
+        serde_json::Value::Null => {}
     }
 }
 
@@ -2507,7 +2744,7 @@ fn overlay_json(
             if prefix == "config.schemaVersion" || prefix == "config.migratedFrom" {
                 return Ok(());
             }
-            if is_retained_mail_key(prefix) {
+            if is_retained_mail_key(prefix) || is_retained_runner_key(prefix) {
                 return Ok(());
             }
             if overridden.contains(prefix)
@@ -2545,12 +2782,204 @@ fn overlay_json(
 /// Finish an already validated up plan with the one live values read and, when
 /// requested, resolved provider addresses. This is kept separate from command
 /// execution so apply and diff can compare the same completed values.
+pub(crate) struct PreparedFactoryMigration {
+    pub opts: UpOpts,
+    pub existing: Option<serde_json::Value>,
+    pub effective: Option<serde_json::Value>,
+    pub context: crate::config_migrate::FactoryMigrationContext,
+}
+
+pub(crate) async fn prepare_factory_migration(
+    mut opts: UpOpts,
+    mut existing: Option<serde_json::Value>,
+    live: bool,
+    retain_all: bool,
+) -> Result<PreparedFactoryMigration> {
+    use crate::config_migrate::{
+        has_legacy_factory_input, legacy_factory_keys, FactoryMigrationContext,
+    };
+    let legacy_keys = legacy_factory_keys();
+    let operator_may_require = opts.set.iter().chain(&opts.set_string).any(|expression| {
+        operator_set_entries(std::slice::from_ref(expression))
+            .iter()
+            .any(|(key, value)| {
+                legacy_keys
+                    .iter()
+                    .any(|legacy| key_is_or_descends_from(key.trim(), legacy))
+                    || ((key.starts_with("api.extraEnv") || key.starts_with("worker.extraEnv"))
+                        && value.contains("GITHUB_FACTORY_"))
+            })
+    });
+    if !existing.as_ref().is_some_and(has_legacy_factory_input)
+        && !opts
+            .file_values
+            .as_ref()
+            .is_some_and(|values| has_legacy_factory_input(&values.0))
+        && !operator_may_require
+    {
+        return Ok(PreparedFactoryMigration {
+            opts,
+            effective: existing.clone(),
+            existing,
+            context: FactoryMigrationContext::NotRequired,
+        });
+    }
+    let mut explicit = opts
+        .file_values
+        .as_ref()
+        .map(|values| values.0.clone())
+        .unwrap_or_else(|| serde_json::json!({}));
+    if !live {
+        for (expressions, typed) in [(&opts.set, true), (&opts.set_string, false)] {
+            for (key, value) in operator_set_entries(expressions) {
+                let key = key.trim();
+                if key.starts_with("api.extraEnv") || key.starts_with("worker.extraEnv") {
+                    bail!("api.extraEnv factory settings require live factory.bindings resolution");
+                }
+                if !legacy_keys.iter().any(|old| key == old) {
+                    continue;
+                }
+                let parsed = if typed {
+                    serde_norway::from_str(value)
+                        .map_err(|_| anyhow::anyhow!("api.githubFactory settings are malformed"))?
+                } else {
+                    serde_json::json!(value)
+                };
+                crate::config_migrate::set_path(&mut explicit, key, parsed);
+            }
+        }
+    } else {
+        let arguments = file_set_args(&opts);
+        if !arguments.is_empty() {
+            explicit = super::lint_values::pending_set_values(&explicit, &arguments)
+                .await
+                .map_err(|_| {
+                    anyhow::anyhow!(
+                        "api.githubFactory settings could not parse the supplied overlay"
+                    )
+                })?;
+        }
+    }
+    let mut overlay = existing.clone().unwrap_or_else(|| serde_json::json!({}));
+    crate::config_migrate::clear_replaced_secret_refs(&mut overlay, &explicit);
+    super::lint_values::merge_values(&mut overlay, explicit.clone());
+    if !has_legacy_factory_input(&overlay) {
+        return Ok(PreparedFactoryMigration {
+            opts,
+            effective: existing.clone(),
+            existing,
+            context: FactoryMigrationContext::NotRequired,
+        });
+    }
+    let source = if live && existing.is_some() {
+        let (ok, output, _) = run_capture(&super::verbs::helm_history_cmd(&opts.common))
+            .await
+            .map_err(|_| anyhow::anyhow!("installed factory release history could not be read"))?;
+        if !ok {
+            bail!("installed factory release history could not be read");
+        }
+        let history = super::verbs::parse_helm_history(&output)
+            .map_err(|_| anyhow::anyhow!("installed factory release history is malformed"))?;
+        let latest = history
+            .into_iter()
+            .max_by_key(|row| row.revision)
+            .ok_or_else(|| {
+                anyhow::anyhow!("installed factory release history has no latest revision")
+            })?;
+        let source = crate::factory_config_migrate::read_installed_factory_source(
+            &opts.common,
+            latest.revision,
+            latest.chart,
+        )
+        .await?;
+        existing = Some(source.user_values.clone());
+        overlay = source.user_values.clone();
+        crate::config_migrate::clear_replaced_secret_refs(&mut overlay, &explicit);
+        super::lint_values::merge_values(&mut overlay, explicit.clone());
+        Some(source)
+    } else {
+        None
+    };
+    if !has_legacy_factory_input(&overlay) {
+        return Ok(PreparedFactoryMigration {
+            opts,
+            effective: existing.clone(),
+            existing,
+            context: FactoryMigrationContext::NotRequired,
+        });
+    }
+    let context = if live {
+        crate::factory_config_migrate::resolve_factory_migration_context(
+            &opts.common,
+            source.as_ref(),
+            &overlay,
+        )
+        .await?
+    } else {
+        let effective_legacy = crate::config_migrate::normalized_factory_input(&overlay)?;
+        if crate::config_migrate::LegacyFactory::parse(&effective_legacy)?.needs_identity() {
+            bail!("api.githubFactory settings require live factory.bindings resolution");
+        }
+        FactoryMigrationContext::LegacyGitHub {
+            effective_legacy,
+            repositories: Vec::new(),
+        }
+    };
+    let migrated = crate::config_migrate::migrate_installed_config(
+        overlay,
+        source.as_ref().map(|s| s.installed_chart.as_str()),
+        &context,
+    )?
+    .values;
+    let mut supplied_keys = BTreeMap::new();
+    flatten_file_values(&explicit, "", &mut supplied_keys);
+    let document = if retain_all {
+        migrated.clone()
+    } else {
+        let mut document = crate::config_migrate::normalized_factory_input(&explicit)?;
+        for key in legacy_factory_keys() {
+            crate::config_migrate::remove_path(&mut document, &key);
+        }
+        crate::config_migrate::remove_path(&mut document, "worker.publication.githubHttpsCidrs");
+        if let Some(factory) = migrated.get("factory") {
+            document["factory"] = factory.clone();
+        }
+        document
+    };
+    let mut flattened = BTreeMap::new();
+    flatten_file_values(&document, "", &mut flattened);
+    flattened.retain(|key, _| {
+        supplied_keys.contains_key(key) || key_is_or_descends_from(key, "factory")
+    });
+    opts.file_values = Some(PrivateHelmValues(document, flattened));
+    if live {
+        opts.set.clear();
+        opts.set_string.clear();
+    } else {
+        for expressions in [&mut opts.set, &mut opts.set_string] {
+            expressions.retain(|expression| {
+                !operator_set_entries(std::slice::from_ref(expression))
+                    .iter()
+                    .any(|(key, _)| legacy_keys.iter().any(|old| key.trim() == old))
+            });
+        }
+    }
+    let effective = existing.as_ref().map(|_| migrated);
+    Ok(PreparedFactoryMigration {
+        opts,
+        existing,
+        effective,
+        context,
+    })
+}
+
 pub(crate) fn complete_up_opts(
     opts: UpOpts,
     existing: Option<&serde_json::Value>,
     github_token: Option<&str>,
     clear_github_token: bool,
     resolve_provider_egress: bool,
+    factory: &crate::config_migrate::FactoryMigrationContext,
 ) -> Result<UpOpts> {
     let mut opts = complete_up_opts_without_runner_egress(
         opts,
@@ -2558,6 +2987,7 @@ pub(crate) fn complete_up_opts(
         github_token,
         clear_github_token,
         false,
+        factory,
     )?;
     let operator_sets = opts.operator_sets();
     resolve_preserved_runner_egress_values(&mut opts, existing, &operator_sets, false);
@@ -2732,7 +3162,10 @@ enum DiffParticipation {
 
 #[derive(Clone, PartialEq, Eq)]
 enum PlannedHelmValues {
-    RetainedMail(PrivateHelmValues),
+    /// A typed values document carried forward from the release: the mail
+    /// family or the runner family. Its cleared keys participate in diff;
+    /// the retained document itself is preservation, not change.
+    Retained(PrivateHelmValues),
     Set {
         flag: HelmSetFlag,
         expression: String,
@@ -2742,6 +3175,9 @@ enum PlannedHelmValues {
         values: Vec<(String, String)>,
         diff: DiffParticipation,
     },
+    /// A migrated object or list (#4322): executed as `--set-json key=<json>`,
+    /// masked in every rendered form, and compared leaf by leaf.
+    Json { key: String, json: String },
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -2817,6 +3253,15 @@ impl UpValuePlan {
         });
     }
 
+    fn set_json_expression(&mut self, expression: &str) {
+        if let Some((key, json)) = expression.split_once('=') {
+            self.entries.push(PlannedHelmValues::Json {
+                key: key.to_string(),
+                json: json.to_string(),
+            });
+        }
+    }
+
     fn secret_file(&mut self, values: Vec<(String, String)>, diff: DiffParticipation) {
         if !values.is_empty() {
             self.entries
@@ -2827,7 +3272,7 @@ impl UpValuePlan {
     fn append_command_args(&self, args: &mut Vec<CmdArg>) {
         for entry in &self.entries {
             match entry {
-                PlannedHelmValues::RetainedMail(values) => {
+                PlannedHelmValues::Retained(values) => {
                     args.push(CmdArg::PrivateJsonValuesFile(values.clone()));
                 }
                 PlannedHelmValues::Set {
@@ -2843,6 +3288,13 @@ impl UpValuePlan {
                 PlannedHelmValues::SecretFile { values, .. } => {
                     args.push(CmdArg::SecretValuesFile(values.clone()));
                 }
+                PlannedHelmValues::Json { key, json } => {
+                    args.push(plain("--set-json"));
+                    args.push(CmdArg::MaskedJsonSet {
+                        key: key.clone(),
+                        json: MaskedJson(json.clone()),
+                    });
+                }
             }
         }
     }
@@ -2851,7 +3303,7 @@ impl UpValuePlan {
         let mut values = BTreeMap::new();
         for entry in &self.entries {
             match entry {
-                PlannedHelmValues::RetainedMail(retained) => {
+                PlannedHelmValues::Retained(retained) => {
                     values.extend(
                         retained
                             .1
@@ -2872,6 +3324,13 @@ impl UpValuePlan {
                     diff: DiffParticipation::Preserve,
                     ..
                 } => {}
+                // The same leaf keys `installation::flatten_values` reads off
+                // the live release, so an unchanged object compares equal.
+                PlannedHelmValues::Json { key, json } => {
+                    if let Ok(parsed) = serde_json::from_str(json) {
+                        crate::installation::flatten_values(&parsed, key, &mut values);
+                    }
+                }
             }
         }
         values
@@ -2883,12 +3342,24 @@ impl UpValuePlan {
 /// update one path without updating the other.
 pub(crate) fn up_value_plan(o: &UpOpts) -> UpValuePlan {
     let mut plan = UpValuePlan::default();
+    // @spec CLUSTER-VALUES-FILES c3-c4: explicit flags follow file inputs.
+    if let Some(values) = &o.file_values {
+        plan.entries
+            .push(PlannedHelmValues::Retained(values.clone()));
+    }
     if o.dev {
         plan.set(ALLOW_DEV_DEFAULTS_KEY, "true");
     }
     if !o.no_expose {
-        plan.set("ui.service.type", "NodePort");
-        plan.set("langfuse.web.service.type", "NodePort");
+        // @spec CLUSTER-VALUES-FILES c1: defaults do not override file choices.
+        for key in ["ui.service.type", "langfuse.web.service.type"] {
+            if o.file_values
+                .as_ref()
+                .is_none_or(|values| !values.1.contains_key(key))
+            {
+                plan.set(key, "NodePort");
+            }
+        }
     }
     if let Some(model) = &o.local_model {
         plan.set(INFERENCE_DEPLOY_KEY, "true");
@@ -2933,9 +3404,19 @@ pub(crate) fn up_value_plan(o: &UpOpts) -> UpValuePlan {
         );
     }
     plan.secret_file(o.secrets.clone(), DiffParticipation::Preserve);
-    if let Some(values) = &o.retained_mail_values {
+    // Retained documents precede every `--set` lane so explicit input wins.
+    for values in [&o.retained_mail_values, &o.retained_runner_values]
+        .into_iter()
+        .flatten()
+    {
         plan.entries
-            .push(PlannedHelmValues::RetainedMail(values.clone()));
+            .push(PlannedHelmValues::Retained(values.clone()));
+    }
+    // Helm merges `--set-json` before `--set` and `--set-string` whatever the
+    // argv order, so the migrated objects come first and an operator leaf
+    // override wins in `effective_values` exactly as it does in Helm.
+    for expression in &o.set_json {
+        plan.set_json_expression(expression);
     }
     if let Some(model) = &o.model {
         if explicit_runner_model(&o.operator_sets()).is_none() {
@@ -2951,19 +3432,45 @@ pub(crate) fn up_value_plan(o: &UpOpts) -> UpValuePlan {
     for expression in &o.set_string {
         plan.set_string_expression(expression.clone());
     }
+    let mut gateway_values: BTreeMap<String, String> = o.secrets.iter().cloned().collect();
+    gateway_values.extend(plan.effective_values());
+    let slack_configured = gateway_values.iter().any(|(key, value)| {
+        key.starts_with("dispatcher.slack.")
+            && (key.ends_with(".botToken") || key.ends_with(".botTokenExistingSecret"))
+            && !value.is_empty()
+    });
+    if slack_configured
+        && gateway_values
+            .get("channelGateway.url")
+            .is_none_or(String::is_empty)
+        && !operator_set_keys(&o.operator_sets()).contains("channelGateway.deploy")
+    {
+        plan.set("channelGateway.deploy", "true");
+    }
     plan
 }
 
-fn gvisor_preflight_job_name_from_render(rendered: &str) -> Result<Option<String>> {
+struct RenderedGvisorPreflight {
+    job_name: String,
+    runtime_class_name: String,
+    creates_runtime_class: bool,
+}
+
+fn gvisor_preflight_from_render(rendered: &str) -> Result<Option<RenderedGvisorPreflight>> {
     let mut found = None;
+    let mut creates_runtime_class = false;
     for document in rendered.split("\n---") {
         let document = document.trim();
         if document.is_empty() {
             continue;
         }
         let value: serde_json::Value = serde_norway::from_str(document)
-            .context("could not parse the rendered gVisor preflight Job")?;
+            .context("could not parse the rendered gVisor preflight")?;
         if value.is_null() {
+            continue;
+        }
+        if value.get("kind").and_then(|kind| kind.as_str()) == Some("RuntimeClass") {
+            creates_runtime_class = true;
             continue;
         }
         if value.get("kind").and_then(|kind| kind.as_str()) != Some("Job") {
@@ -2975,18 +3482,32 @@ fn gvisor_preflight_job_name_from_render(rendered: &str) -> Result<Option<String
             .and_then(|name| name.as_str())
             .filter(|name| !name.is_empty())
             .context("the rendered gVisor preflight Job has no name")?;
-        if found.replace(name.to_string()).is_some() {
+        let runtime_class_name = value
+            .pointer("/spec/template/spec/runtimeClassName")
+            .and_then(|name| name.as_str())
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
+            .context("the rendered gVisor preflight Job has no runtimeClassName")?
+            .to_string();
+        if found.is_some() {
             bail!("the gVisor preflight template rendered more than one Job");
         }
+        found = Some((name.to_string(), runtime_class_name));
     }
-    Ok(found)
+    Ok(
+        found.map(|(job_name, runtime_class_name)| RenderedGvisorPreflight {
+            job_name,
+            runtime_class_name,
+            creates_runtime_class,
+        }),
+    )
 }
 
 async fn rendered_gvisor_preflight_job(
     chart: &str,
     common: &CommonOpts,
     plan: &UpValuePlan,
-) -> Result<Option<String>> {
+) -> Result<Option<RenderedGvisorPreflight>> {
     let mut args = vec![
         plain("template"),
         plain(&common.release),
@@ -3013,7 +3534,7 @@ async fn rendered_gvisor_preflight_job(
             failure_reason(&err)
         );
     }
-    gvisor_preflight_job_name_from_render(&out)
+    gvisor_preflight_from_render(&out)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -3058,6 +3579,14 @@ const GVISOR_MODE_KEY: &str = "security.gvisor.mode";
 /// desynchronises the guard from what helm actually renders.
 const ALLOW_DEV_DEFAULTS_KEY: &str = "security.allowDevDefaults";
 
+fn controller_deploy_enabled(plan: &UpValuePlan) -> bool {
+    // Missing overrides keep the shipped chart's enabled default.
+    plan.effective_values()
+        .get(CONTROLLER_DEPLOY_KEY)
+        .map(String::as_str)
+        != Some("false")
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum ClusterUpInference {
     Provider {
@@ -3069,9 +3598,15 @@ enum ClusterUpInference {
         owner_release: String,
     },
     ControllerReuse {
-        owner_release: String,
+        owner_release: Option<String>,
+        image: Option<String>,
     },
-    GvisorOff,
+    GvisorOffFromLookup,
+    GvisorOffFromScheduling {
+        name: String,
+        selector: String,
+    },
+    GvisorOffFromAdmission,
 }
 
 impl ClusterUpInference {
@@ -3088,14 +3623,211 @@ impl ClusterUpInference {
                 "inferred reuse of PriorityClass `{name}` from Helm release `{owner_release}`; applying `--set priorityClasses.{}.create=false`",
                 role.key()
             )),
-            Self::ControllerReuse { owner_release } => ui.note(&format!(
-                "inferred reuse of `{CONTROLLER_DEPLOYMENT_NAME}` from Helm release `{owner_release}`; applying `--set {CONTROLLER_DEPLOY_KEY}=false`"
+            Self::ControllerReuse {
+                owner_release,
+                image,
+            } => match owner_release {
+                Some(owner_release) => ui.note(&format!(
+                    "inferred reuse of `{CONTROLLER_DEPLOYMENT_NAME}` from Helm release `{owner_release}`; applying `--set {CONTROLLER_DEPLOY_KEY}=false`"
+                )),
+                None => ui.note(&format!(
+                    "inferred reuse of `{CONTROLLER_DEPLOYMENT_NAME}` at `{}` without Helm ownership; applying `--set {CONTROLLER_DEPLOY_KEY}=false`",
+                    image.as_deref().unwrap_or("unknown")
+                )),
+            },
+            Self::GvisorOffFromLookup => ui.note(&format!(
+                "inferred that the cluster has no `gvisor` RuntimeClass from the RuntimeClass lookup (NotFound); applying `--set {GVISOR_MODE_KEY}=off`"
             )),
-            Self::GvisorOff => ui.note(&format!(
+            Self::GvisorOffFromScheduling { name, selector } => ui.note(&format!(
+                "inferred that RuntimeClass `{name}` cannot schedule: no node matches its nodeSelector `{selector}` (on GKE, add a GKE Sandbox node pool to keep gVisor); applying `--set {GVISOR_MODE_KEY}=off`"
+            )),
+            Self::GvisorOffFromAdmission => ui.note(&format!(
                 "inferred that the cluster has no `gvisor` RuntimeClass from admission; applying `--set {GVISOR_MODE_KEY}=off`"
             )),
         }
     }
+}
+
+#[derive(Clone, PartialEq, Eq)]
+enum RuntimeClassLookup {
+    Present,
+    Absent,
+    Forbidden,
+    Unschedulable { selector: String },
+}
+
+fn runtime_class_node_selector(value: &serde_json::Value) -> Option<String> {
+    let selector = value.pointer("/scheduling/nodeSelector")?.as_object()?;
+    if selector.is_empty() {
+        return None;
+    }
+    let sorted = selector
+        .iter()
+        .map(|(key, value)| Some((key.as_str(), value.as_str()?)))
+        .collect::<Option<BTreeMap<_, _>>>()?;
+    Some(
+        sorted
+            .into_iter()
+            .map(|(key, value)| format!("{key}={value}"))
+            .collect::<Vec<_>>()
+            .join(","),
+    )
+}
+
+async fn runtime_class_selector_matches_no_node(selector: &str) -> bool {
+    let cmd = OpsCommand::new(
+        "kubectl",
+        vec![
+            plain("get"),
+            plain("nodes"),
+            plain("-l"),
+            plain(selector),
+            plain("-o"),
+            plain("name"),
+        ],
+    );
+    // Only a readable, empty node list authorizes the reduced isolation posture.
+    // Taints, tolerations and cordons are outside this node pool selector check.
+    match run_capture(&cmd).await {
+        Ok((true, out, _)) => out.trim().is_empty(),
+        Ok((false, _, err)) => {
+            crate::ui::ui().plumbing(&format!(
+                "gVisor node selector lookup unavailable: {}",
+                failure_reason(&err)
+            ));
+            false
+        }
+        Err(error) => {
+            crate::ui::ui().plumbing(&format!("gVisor node selector lookup unavailable: {error}"));
+            false
+        }
+    }
+}
+
+async fn gvisor_preflight_scheduling_failure(
+    common: &CommonOpts,
+    preflight: &RenderedGvisorPreflight,
+    invocation: UpInvocation,
+) -> Option<anyhow::Error> {
+    let cmd = OpsCommand::new(
+        "kubectl",
+        vec![
+            plain("get"),
+            plain("events"),
+            plain("-n"),
+            plain(&common.namespace),
+            plain("--field-selector"),
+            plain("reason=FailedScheduling,involvedObject.kind=Pod"),
+            plain("-o"),
+            plain("json"),
+        ],
+    );
+    let (ok, out, _) = run_capture(&cmd).await.ok()?;
+    if !ok {
+        return None;
+    }
+    let events: serde_json::Value = serde_json::from_str(&out).ok()?;
+    let pod_prefix = format!("{}-", preflight.job_name);
+    if !events.get("items")?.as_array()?.iter().any(|event| {
+        event.get("reason").and_then(|value| value.as_str()) == Some("FailedScheduling")
+            && event
+                .pointer("/involvedObject/kind")
+                .and_then(|value| value.as_str())
+                == Some("Pod")
+            && event
+                .pointer("/involvedObject/name")
+                .and_then(|value| value.as_str())
+                .is_some_and(|name| name.starts_with(&pod_prefix))
+    }) {
+        return None;
+    }
+
+    let name = &preflight.runtime_class_name;
+    let selector_clause = match lookup_runtime_class(name).await {
+        Ok(RuntimeClassLookup::Unschedulable { selector }) => format!(
+            ": RuntimeClass `{name}` requires nodes labelled `{selector}` and no node has that label; on GKE this means the cluster has no GKE Sandbox node pool"
+        ),
+        _ => String::new(),
+    };
+    let fix = invocation.gvisor_fix();
+    let instruction = match invocation {
+        UpInvocation::ClusterUp => format!("run `{fix}`"),
+        UpInvocation::Apply => fix.to_string(),
+    };
+    // Event messages can contain private configuration. Only the reason code
+    // and the selector read directly from the RuntimeClass enter this error.
+    Some(
+        crate::exit::CliError::failure(format!(
+            "gVisor preflight Job `{}` was never scheduled (FailedScheduling){selector_clause}. To install without gVisor isolation, {instruction}.",
+            preflight.job_name
+        ))
+        .with_fix(fix)
+        .into(),
+    )
+}
+
+fn runtime_class_read_error(
+    name: &str,
+    detail: impl std::fmt::Display,
+    transient: bool,
+) -> anyhow::Error {
+    let fix = "run `curie cluster status`".to_string();
+    let message = format!("could not inspect RuntimeClass `{name}`: {detail}; {fix}");
+    let error = if transient {
+        crate::exit::CliError::transient(message)
+    } else {
+        crate::exit::CliError::failure(message)
+    };
+    error.with_fix(fix).into()
+}
+
+async fn lookup_runtime_class(name: &str) -> Result<RuntimeClassLookup> {
+    let cmd = OpsCommand::new(
+        "kubectl",
+        vec![
+            plain("get"),
+            plain("runtimeclass"),
+            plain(name),
+            plain("-o"),
+            plain("json"),
+        ],
+    );
+    let (ok, out, err) = run_capture(&cmd).await?;
+    if ok {
+        if let Ok(value) = serde_json::from_str::<serde_json::Value>(out.trim()) {
+            let found = value
+                .as_object()
+                .and_then(|object| object.get("metadata"))
+                .and_then(|metadata| metadata.as_object())
+                .and_then(|metadata| metadata.get("name"))
+                .and_then(|found| found.as_str());
+            if found == Some(name) {
+                if let Some(selector) = runtime_class_node_selector(&value) {
+                    if runtime_class_selector_matches_no_node(&selector).await {
+                        return Ok(RuntimeClassLookup::Unschedulable { selector });
+                    }
+                }
+                return Ok(RuntimeClassLookup::Present);
+            }
+        }
+    }
+    let text = format!("{err}\n{out}");
+    if text.contains("(NotFound)") {
+        return Ok(RuntimeClassLookup::Absent);
+    }
+    if text.contains("(Forbidden)") {
+        return Ok(RuntimeClassLookup::Forbidden);
+    }
+    let detail = if ok {
+        "kubectl returned invalid JSON"
+    } else {
+        failure_reason(&err)
+    };
+    Err(runtime_class_read_error(
+        name,
+        detail,
+        is_connectivity_failure(&text),
+    ))
 }
 
 fn final_operator_value<'a>(opts: &'a UpOpts, key: &str) -> Option<&'a str> {
@@ -3105,7 +3837,13 @@ fn final_operator_value<'a>(opts: &'a UpOpts, key: &str) -> Option<&'a str> {
             .rev()
             .find_map(|(candidate, value)| (candidate.trim() == key).then_some(value.trim()))
     };
-    in_lane(&opts.set_string).or_else(|| in_lane(&opts.set))
+    in_lane(&opts.set_string)
+        .or_else(|| in_lane(&opts.set))
+        .or_else(|| {
+            opts.file_values
+                .as_ref()
+                .and_then(|values| values.1.get(key).map(String::as_str))
+        })
 }
 
 fn detected_provider_from_plan(opts: &UpOpts, plan: &UpValuePlan) -> Option<&'static str> {
@@ -3495,10 +4233,17 @@ async fn reconcile_priority_class_ownership(
     Ok(inferred)
 }
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq)]
 enum ControllerOwnership {
     Absent,
-    Existing(Option<PriorityClassOwner>),
+    Owned(PriorityClassOwner),
+    Unowned(serde_json::Value),
+}
+
+struct ControllerHealth {
+    healthy: bool,
+    desired: u64,
+    detail: String,
 }
 
 fn controller_read_error(detail: impl std::fmt::Display, transient: bool) -> anyhow::Error {
@@ -3600,20 +4345,281 @@ async fn controller_owner() -> Result<ControllerOwnership> {
     }
     let labels = controller_metadata_map(metadata, "labels")?;
     if controller_metadata_value(labels, "app.kubernetes.io/managed-by")? != Some("Helm") {
-        return Ok(ControllerOwnership::Existing(None));
+        return Ok(ControllerOwnership::Unowned(value));
     }
     let annotations = controller_metadata_map(metadata, "annotations")?;
     let Some(release) = controller_metadata_value(annotations, "meta.helm.sh/release-name")? else {
-        return Ok(ControllerOwnership::Existing(None));
+        return Ok(ControllerOwnership::Unowned(value));
     };
     let Some(namespace) = controller_metadata_value(annotations, "meta.helm.sh/release-namespace")?
     else {
-        return Ok(ControllerOwnership::Existing(None));
+        return Ok(ControllerOwnership::Unowned(value));
     };
-    Ok(ControllerOwnership::Existing(Some(PriorityClassOwner {
+    Ok(ControllerOwnership::Owned(PriorityClassOwner {
         release: release.to_string(),
         namespace: namespace.to_string(),
-    })))
+    }))
+}
+
+fn image_name_and_tag(image: &str) -> Option<(&str, &str)> {
+    let without_digest = image.split_once('@').map(|(name, _)| name).unwrap_or(image);
+    let tag_at = match without_digest.rfind('/') {
+        Some(slash) => without_digest[slash + 1..]
+            .rfind(':')
+            .map(|offset| slash + 1 + offset),
+        None => without_digest.rfind(':'),
+    }?;
+    let repo = &without_digest[..tag_at];
+    let tag = &without_digest[tag_at + 1..];
+    if repo.is_empty() || tag.is_empty() {
+        None
+    } else {
+        Some((repo, tag))
+    }
+}
+
+fn images_compatible(live: &str, required: &str) -> bool {
+    match (image_name_and_tag(live), image_name_and_tag(required)) {
+        (Some(live_image), Some(required_image)) => live_image == required_image,
+        _ => live == required,
+    }
+}
+
+const VENDORED_CONTROLLER_MANIFEST: &str = "files/agent-sandbox/controller.yaml";
+
+fn chart_read_error(chart: &str, detail: impl std::fmt::Display) -> anyhow::Error {
+    let fix = "pass `--chart` as a local chart directory or packaged .tgz that contains files/agent-sandbox/controller.yaml";
+    crate::exit::CliError::failure(format!(
+        "could not read the vendored agent-sandbox controller image from `{chart}`: {detail}; {fix}"
+    ))
+    .with_fix(fix)
+    .into()
+}
+
+fn vendored_controller_manifest(chart: &str) -> Result<String> {
+    let path = std::path::Path::new(chart);
+    if path.is_dir() {
+        let manifest = path.join(VENDORED_CONTROLLER_MANIFEST);
+        return std::fs::read_to_string(&manifest).map_err(|error| chart_read_error(chart, error));
+    }
+    let name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("");
+    if name.ends_with(".tgz") || name.ends_with(".tar.gz") {
+        let file = std::fs::File::open(path).map_err(|error| chart_read_error(chart, error))?;
+        let decoder = flate2::read::GzDecoder::new(file);
+        let mut archive = tar::Archive::new(decoder);
+        let entries = archive
+            .entries()
+            .map_err(|error| chart_read_error(chart, error))?;
+        for entry in entries {
+            let mut entry = entry.map_err(|error| chart_read_error(chart, error))?;
+            let entry_path = entry
+                .path()
+                .map_err(|error| chart_read_error(chart, error))?
+                .to_path_buf();
+            if !entry_path.ends_with(VENDORED_CONTROLLER_MANIFEST) {
+                continue;
+            }
+            let mut text = String::new();
+            std::io::Read::read_to_string(&mut entry, &mut text)
+                .map_err(|error| chart_read_error(chart, error))?;
+            return Ok(text);
+        }
+        return Err(chart_read_error(
+            chart,
+            format!("the archive has no {VENDORED_CONTROLLER_MANIFEST}"),
+        ));
+    }
+    Err(chart_read_error(
+        chart,
+        "the chart is neither a directory nor a .tgz",
+    ))
+}
+
+fn vendored_controller_image(chart: &str) -> Result<String> {
+    let text = vendored_controller_manifest(chart)?;
+    let path = std::path::Path::new(chart).join(VENDORED_CONTROLLER_MANIFEST);
+    for document in text.split("\n---") {
+        let document = document.trim();
+        if document.is_empty() {
+            continue;
+        }
+        let Ok(value) = serde_norway::from_str::<serde_json::Value>(document) else {
+            continue;
+        };
+        if value.get("kind").and_then(|kind| kind.as_str()) != Some("Deployment") {
+            continue;
+        }
+        let name = value
+            .pointer("/metadata/name")
+            .and_then(|name| name.as_str());
+        if name != Some(CONTROLLER_DEPLOYMENT_NAME) {
+            continue;
+        }
+        let Some(image) = controller_container_image(&value) else {
+            break;
+        };
+        return Ok(image);
+    }
+    let fix = "restore files/agent-sandbox/controller.yaml in the chart directory";
+    Err(crate::exit::CliError::failure(format!(
+        "the chart at `{}` does not name an image for Deployment `{CONTROLLER_DEPLOYMENT_NAME}`; {fix}",
+        path.display()
+    ))
+    .with_fix(fix)
+    .into())
+}
+
+fn controller_container_image(deployment: &serde_json::Value) -> Option<String> {
+    let containers = deployment
+        .pointer("/spec/template/spec/containers")?
+        .as_array()?;
+    containers.iter().find_map(|container| {
+        let name = container.get("name").and_then(|value| value.as_str());
+        if name != Some(CONTROLLER_DEPLOYMENT_NAME) {
+            return None;
+        }
+        container
+            .get("image")
+            .and_then(|value| value.as_str())
+            .filter(|image| !image.is_empty())
+            .map(str::to_string)
+    })
+}
+
+fn controller_health(deployment: &serde_json::Value) -> ControllerHealth {
+    let desired = deployment
+        .pointer("/spec/replicas")
+        .and_then(|value| value.as_u64())
+        .unwrap_or(1);
+    let ready = deployment
+        .pointer("/status/readyReplicas")
+        .and_then(|value| value.as_u64());
+    let available_replicas = deployment
+        .pointer("/status/availableReplicas")
+        .and_then(|value| value.as_u64());
+    let updated = deployment
+        .pointer("/status/updatedReplicas")
+        .and_then(|value| value.as_u64());
+    let total = deployment
+        .pointer("/status/replicas")
+        .and_then(|value| value.as_u64());
+    let unavailable = deployment
+        .pointer("/status/unavailableReplicas")
+        .and_then(|value| value.as_u64())
+        .unwrap_or(0);
+    let generation = deployment
+        .pointer("/metadata/generation")
+        .and_then(|value| value.as_u64());
+    let observed = deployment
+        .pointer("/status/observedGeneration")
+        .and_then(|value| value.as_u64());
+    let available = deployment
+        .pointer("/status/conditions")
+        .and_then(|value| value.as_array())
+        .and_then(|conditions| {
+            conditions.iter().find_map(|condition| {
+                (condition.get("type").and_then(|value| value.as_str()) == Some("Available"))
+                    .then(|| condition.get("status").and_then(|value| value.as_str()))
+                    .flatten()
+            })
+        });
+    let current = generation.is_some()
+        && observed == generation
+        && updated == Some(desired)
+        && total == Some(desired)
+        && ready == Some(desired)
+        && available_replicas == Some(desired)
+        && unavailable == 0;
+    let healthy = desired >= 1 && available == Some("True") && current;
+    let ready_text = ready
+        .map(|count| count.to_string())
+        .unwrap_or_else(|| "missing".to_string());
+    let observed_text = observed
+        .map(|count| count.to_string())
+        .unwrap_or_else(|| "missing".to_string());
+    let generation_text = generation
+        .map(|count| count.to_string())
+        .unwrap_or_else(|| "missing".to_string());
+    ControllerHealth {
+        healthy,
+        desired,
+        detail: format!(
+            "Available is {} and readyReplicas is {ready_text} of {desired}; observedGeneration is {observed_text} of generation {generation_text}",
+            available.unwrap_or("missing")
+        ),
+    }
+}
+
+fn shell_quote(value: &str) -> String {
+    if value.chars().all(|character| {
+        character.is_ascii_alphanumeric() || matches!(character, '-' | '_' | '.' | '@')
+    }) {
+        value.to_string()
+    } else {
+        format!("'{}'", value.replace('\'', "'\\''"))
+    }
+}
+
+fn kubectl_repair_prefix() -> String {
+    match std::env::var("HELM_KUBECONTEXT") {
+        Ok(context) if !context.is_empty() => format!(
+            "kubectl --context {} -n {CONTROLLER_DEPLOYMENT_NAMESPACE}",
+            shell_quote(&context)
+        ),
+        _ => format!("kubectl -n {CONTROLLER_DEPLOYMENT_NAMESPACE}"),
+    }
+}
+
+fn unowned_controller_conflict(
+    observed_image: Option<&str>,
+    required: &str,
+    health: &ControllerHealth,
+) -> anyhow::Error {
+    let observed = observed_image.unwrap_or("missing");
+    let image_matches = observed_image.is_some_and(|image| images_compatible(image, required));
+    let kubectl = kubectl_repair_prefix();
+    let mut steps = Vec::new();
+    if !image_matches {
+        steps.push(format!(
+            "{kubectl} set image deployment/{CONTROLLER_DEPLOYMENT_NAME} {CONTROLLER_DEPLOYMENT_NAME}={required}"
+        ));
+    }
+    if health.desired < 1 {
+        steps.push(format!(
+            "{kubectl} scale deployment/{CONTROLLER_DEPLOYMENT_NAME} --replicas=1"
+        ));
+    }
+    steps.push(format!(
+        "{kubectl} rollout status deployment/{CONTROLLER_DEPLOYMENT_NAME}"
+    ));
+    let fix = format!(
+        "{}, then rerun `curie factory quickstart`",
+        steps.join(" && ")
+    );
+    let message = format!(
+        "Deployment `{CONTROLLER_DEPLOYMENT_NAME}` in namespace `{CONTROLLER_DEPLOYMENT_NAMESPACE}` cannot be reused: image is `{observed}` and this chart requires `{required}`; {}. {fix}",
+        health.detail
+    );
+    crate::exit::CliError::failure(message).with_fix(fix).into()
+}
+
+fn explicit_controller_creation_error(detail: &str) -> anyhow::Error {
+    let assignment = format!("{CONTROLLER_DEPLOY_KEY}=true");
+    let fix = format!("remove `--set {assignment}`, or pass `--set {CONTROLLER_DEPLOY_KEY}=false`");
+    crate::exit::CliError::usage(format!("{detail}; {fix}"))
+        .with_fix(fix)
+        .into()
+}
+
+fn reuse_unowned_controller(plan: &mut UpValuePlan, image: String) -> Option<ClusterUpInference> {
+    plan.set(CONTROLLER_DEPLOY_KEY, "false");
+    Some(ClusterUpInference::ControllerReuse {
+        owner_release: None,
+        image: Some(image),
+    })
 }
 
 async fn reconcile_controller_ownership(
@@ -3624,37 +4630,57 @@ async fn reconcile_controller_ownership(
     if explicit == Some("false") {
         return Ok(None);
     }
-    let owner = match controller_owner().await? {
-        ControllerOwnership::Absent => return Ok(None),
-        ControllerOwnership::Existing(Some(owner)) => owner,
-        ControllerOwnership::Existing(None) => {
-            return Err(controller_read_error(
-                "the Deployment exists without complete Helm ownership metadata",
-                false,
-            ));
+    match controller_owner().await? {
+        ControllerOwnership::Absent => Ok(None),
+        ControllerOwnership::Owned(owner)
+            if owner.release == opts.common.release && owner.namespace == opts.common.namespace =>
+        {
+            Ok(None)
         }
-    };
-    if owner.release == opts.common.release && owner.namespace == opts.common.namespace {
-        return Ok(None);
+        ControllerOwnership::Owned(owner) => {
+            if explicit == Some("true") {
+                return Err(explicit_controller_creation_error(&format!(
+                    "Deployment `{CONTROLLER_DEPLOYMENT_NAME}` is owned by Helm release `{}` in namespace `{}`, which contradicts explicit `{CONTROLLER_DEPLOY_KEY}=true`",
+                    owner.release, owner.namespace
+                )));
+            }
+            if explicit.is_some() {
+                return Ok(None);
+            }
+            plan.set(CONTROLLER_DEPLOY_KEY, "false");
+            Ok(Some(ClusterUpInference::ControllerReuse {
+                owner_release: Some(owner.release),
+                image: None,
+            }))
+        }
+        ControllerOwnership::Unowned(deployment) => {
+            let required = vendored_controller_image(&opts.chart)?;
+            let observed = controller_container_image(&deployment);
+            let health = controller_health(&deployment);
+            let compatible = observed
+                .as_deref()
+                .is_some_and(|image| images_compatible(image, &required));
+            if compatible && health.healthy {
+                if explicit == Some("true") {
+                    return Err(explicit_controller_creation_error(&format!(
+                        "Deployment `{CONTROLLER_DEPLOYMENT_NAME}` in namespace `{CONTROLLER_DEPLOYMENT_NAMESPACE}` is a healthy `{}` without Helm ownership, which contradicts explicit `{CONTROLLER_DEPLOY_KEY}=true`",
+                        observed.as_deref().unwrap_or("missing")
+                    )));
+                }
+                if explicit.is_some() {
+                    return Ok(None);
+                }
+                let image = observed.unwrap_or(required);
+                Ok(reuse_unowned_controller(plan, image))
+            } else {
+                Err(unowned_controller_conflict(
+                    observed.as_deref(),
+                    &required,
+                    &health,
+                ))
+            }
+        }
     }
-    if explicit == Some("true") {
-        let assignment = format!("{CONTROLLER_DEPLOY_KEY}=true");
-        let fix =
-            format!("remove `--set {assignment}`, or pass `--set {CONTROLLER_DEPLOY_KEY}=false`");
-        return Err(crate::exit::CliError::usage(format!(
-            "Deployment `{CONTROLLER_DEPLOYMENT_NAME}` is owned by Helm release `{}` in namespace `{}`, which contradicts explicit `{assignment}`; {fix}",
-            owner.release, owner.namespace
-        ))
-        .with_fix(fix)
-        .into());
-    }
-    if explicit.is_some() {
-        return Ok(None);
-    }
-    plan.set(CONTROLLER_DEPLOY_KEY, "false");
-    Ok(Some(ClusterUpInference::ControllerReuse {
-        owner_release: owner.release,
-    }))
 }
 
 fn up_commands_with_plan(o: &UpOpts, plan: &UpValuePlan) -> Vec<OpsCommand> {
@@ -3960,6 +4986,14 @@ async fn admission_objects(namespace: &str, resources: &str) -> Option<Vec<serde
         .cloned()
 }
 
+// A hook Job the current render omits is not an admission rejection of this install.
+fn omitted_gvisor_preflight_job(event: &serde_json::Value, gvisor_job: Option<&str>) -> bool {
+    let name = admission_text(event, "/involvedObject/name");
+    admission_text(event, "/involvedObject/kind") == "Job"
+        && name.ends_with("-preflight-gvisor")
+        && gvisor_job != Some(name)
+}
+
 fn admission_rejection_excerpt(message: &str) -> String {
     let printable: String = message
         .chars()
@@ -4003,6 +5037,7 @@ async fn observe_admission_rejection(
                     admission_text(event, "/reason") == "FailedCreate"
                         && message.to_ascii_lowercase().contains("is forbidden:")
                         && fresh_admission_event(event, &baseline)
+                        && !omitted_gvisor_preflight_job(event, gvisor_job)
                         // The existing gVisor observer owns its inference and retry.
                         && !(namespace == common.namespace && gvisor_job.is_some_and(|job| {
                             admission_text(event, "/involvedObject/kind") == "Job"
@@ -4262,6 +5297,8 @@ async fn run_install_with_observers(
 ) -> Result<InstallOutcome> {
     let ui = crate::ui::ui();
     let namespace = &common.namespace;
+    let marked = quickstart_marked_release_write(cmd);
+    let cmd = &marked;
     ui.plumbing(&format!("+ {}", cmd.display()));
     let step = cl.step(label);
     let namespace_existed_before_install = namespace_states
@@ -4436,6 +5473,17 @@ pub enum ClusterUpOutput {
     Up { namespace: String, release: String },
 }
 
+fn status_hint(namespace: &str, release: &str, context: Option<&str>) -> String {
+    let context = context
+        .map(|context| format!(" --context {}", crate::ops::shell_quote(context)))
+        .unwrap_or_default();
+    format!(
+        "Run `curie cluster status{context} --namespace {} --release {}` for pod health and URLs.",
+        crate::ops::shell_quote(namespace),
+        crate::ops::shell_quote(release),
+    )
+}
+
 impl crate::ui::CliOutput for ClusterUpOutput {
     fn to_json(&self) -> serde_json::Value {
         match self {
@@ -4451,9 +5499,13 @@ impl crate::ui::CliOutput for ClusterUpOutput {
     fn render(&self, ui: &crate::ui::Ui) {
         match self {
             ClusterUpOutput::DryRun(plan) => plan.render(ui),
-            ClusterUpOutput::Up { .. } => {
+            ClusterUpOutput::Up { namespace, release } => {
                 ui.payload("curie is up");
-                ui.note("Run `curie cluster status` for pod health and URLs.");
+                ui.note(&status_hint(
+                    namespace,
+                    release,
+                    crate::kube_context::pinned_context_name(),
+                ));
             }
         }
     }
@@ -4591,9 +5643,28 @@ pub async fn up(
     github_token: Option<String>,
     clear_github_token: bool,
 ) -> Result<ClusterUpOutput> {
+    // @spec CLUSTER-VALUES-FILES c1-c3
+    apply_flags_to_file_values(&mut opts, github_token.as_deref(), clear_github_token);
+    if opts.file_values.is_some() {
+        // @spec CLUSTER-VALUES-FILES c1-c3: Helm supplies actual typed set semantics.
+        let args = file_set_args(&opts);
+        if let Some(values) = &mut opts.file_values {
+            if !args.is_empty() {
+                let explicit = super::lint_values::pending_set_overlay(&args).await?;
+                let mut combined = super::lint_values::pending_set_values(&values.0, &args).await?;
+                crate::config_migrate::clear_replaced_secret_refs(&mut combined, &explicit);
+                values.0 = combined;
+            }
+            values.1.clear();
+            flatten_file_values(&values.0, "", &mut values.1);
+        }
+    }
+    // @spec CLUSTER-VALUES-FILES c3: validation sees the captured files.
     validate_up_inputs(&opts, github_token.as_deref(), clear_github_token)?;
     validate_credential_egress_consistency(&opts)?;
-    provider_contradiction(&opts, &up_value_plan(&opts))?;
+    if opts.file_values.is_none() {
+        provider_contradiction(&opts, &up_value_plan(&opts))?;
+    }
     let resolve_provider_egress = !opts.common.dry_run;
     let existing = if should_read_existing(opts.dev, opts.common.dry_run) {
         require_on_path("helm")?;
@@ -4601,13 +5672,55 @@ pub async fn up(
     } else {
         None
     };
+    let prepared = prepare_factory_migration(opts, existing, resolve_provider_egress, true).await?;
+    opts = prepared.opts;
+    let existing = prepared.existing;
+    let factory = prepared.context;
+    // @spec CLUSTER-VALUES-FILES c3: preserve completion, with explicit files winning.
+    let mut effective_existing = prepared.effective;
+    if let Some(values) = &opts.file_values {
+        let supplied_keys: BTreeSet<String> = values.1.keys().cloned().collect();
+        let merged = effective_existing.get_or_insert_with(|| serde_json::json!({}));
+        crate::config_migrate::clear_replaced_secret_refs(merged, &values.0);
+        super::lint_values::merge_values(merged, values.0.clone());
+        // @spec CLUSTER-VALUES-FILES c3: normalize the admitted full snapshot,
+        // but keep input provenance separate from retained value ownership.
+        opts.file_values = Some(PrivateHelmValues(merged.clone(), BTreeMap::new()));
+        apply_flags_to_file_values(&mut opts, github_token.as_deref(), clear_github_token);
+        let mut values = opts.file_values.take().expect("captured file snapshot");
+        values.0 =
+            crate::config_migrate::migrate_installed_config(values.0, None, &factory)?.values;
+        flatten_file_values(&values.0, "", &mut values.1);
+        values.1.retain(|key, _| supplied_keys.contains(key));
+        *merged = values.0.clone();
+        opts.file_values = Some(values);
+    }
+    // #4622, ADR 0197: once the release's values were read, the merged
+    // snapshot is the whole document Helm renders, so dangling tracker
+    // references and duplicate tracker scopes refuse before any mutation. A
+    // dry run reads no release values, so its files alone are not that
+    // document; the chart render refuses those at apply.
+    if should_read_existing(opts.dev, opts.common.dry_run) {
+        if let Some(values) = &opts.file_values {
+            crate::factory_intake::check_factory_document(&values.0).map_err(|message| {
+                crate::exit::CliError::usage(message)
+                    .with_fix("fix factory.codeHosts, factory.trackers or factory.bindings; nothing was applied")
+            })?;
+        }
+    }
     opts = complete_up_opts_without_runner_egress(
         opts,
-        existing.as_ref(),
+        effective_existing.as_ref(),
         github_token.as_deref(),
         clear_github_token,
         true,
+        &factory,
     )?;
+    // @spec CLUSTER-VALUES-FILES c3: an overlay is not an installed release.
+    if existing.is_none() && opts.file_values.is_some() && !opts.dev {
+        opts.secrets
+            .extend(resolve_generated_secrets(None, &opts.operator_sets())?);
+    }
     validate_credential_egress_consistency(&opts)?;
     let completed_identity_plan = up_value_plan(&opts);
     let mut inferences = Vec::new();
@@ -4620,7 +5733,7 @@ pub async fn up(
     let (next_preserved_egress_index, recorded_egress_cidrs) =
         resolve_preserved_runner_egress_values(
             &mut opts,
-            existing.as_ref(),
+            effective_existing.as_ref(),
             &operator_sets,
             provider_was_inferred,
         );
@@ -4665,6 +5778,73 @@ pub(crate) async fn up_prepared(
     .await
 }
 
+/// What an offline plan states about an existing shared controller (#4626).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SharedControllerPlan {
+    /// No explicit controller value: a live run infers reuse of a foreign or
+    /// unowned controller.
+    Reuse,
+    /// `agentSandbox.controller.deploy=true` was set: a live run refuses a
+    /// controller this release does not own.
+    RefuseExplicitDeploy,
+    /// Another explicit value, or fact detection is off: nothing to state.
+    Unstated,
+}
+
+/// The conditional ownership plan `--dry-run` prints in place of stamp
+/// commands (#4626). A dry run reads neither namespace nor the controller, so
+/// each live decision is a comment line naming its condition. `shared` is
+/// `Some` only when the chart deploys the controller and the primary namespace
+/// is not the shared one.
+fn dry_run_ownership_lines(
+    common: &CommonOpts,
+    shared: Option<SharedControllerPlan>,
+) -> Vec<String> {
+    let namespace = &common.namespace;
+    let release = &common.release;
+    let created = format!("{CREATED_BY_LABEL}={release} {CREATED_IN_LABEL}={namespace}");
+    let mut lines = vec![
+        format!("# not read under --dry-run: whether namespace {namespace} exists and which release owns it; a live run checks it before helm runs"),
+        format!("#   if namespace {namespace} does not exist: create it with labels {created}"),
+        format!("#   if namespace {namespace} is not terminating and already has this release's created-by and created-in labels, or its adopted-by and adopted-in labels: use it and leave its labels unchanged"),
+    ];
+    if namespace != CONTROLLER_DEPLOYMENT_NAMESPACE {
+        lines.push(format!("#   if namespace {namespace} is not terminating and exists with no ownership or foreign labels and only its default objects: add labels {created}"));
+    }
+    lines.push(format!(
+        "#   otherwise: refuse to install into namespace {namespace}"
+    ));
+    let Some(shared) = shared else {
+        return lines;
+    };
+    let stamp = ownership_label_commands(
+        &ns_common(common, CONTROLLER_DEPLOYMENT_NAMESPACE, true),
+        namespace,
+        false,
+    )
+    .into_iter()
+    .next()
+    .expect("the create-only controller stamp has one command")
+    .display();
+    if shared == SharedControllerPlan::Unstated {
+        lines.push(format!("# not read under --dry-run: whether namespace {CONTROLLER_DEPLOYMENT_NAMESPACE} already exists; a live run checks it before helm runs"));
+    } else {
+        lines.push(format!("# not read under --dry-run: whether namespace {CONTROLLER_DEPLOYMENT_NAMESPACE} and Deployment {CONTROLLER_DEPLOYMENT_NAME} already exist; a live run checks them before helm runs"));
+    }
+    lines.push(format!("#   if namespace {CONTROLLER_DEPLOYMENT_NAMESPACE} does not exist before helm runs and exists after: {stamp}"));
+    lines.push(format!("#   if namespace {CONTROLLER_DEPLOYMENT_NAMESPACE} already exists: use it and leave its labels unchanged"));
+    match shared {
+        SharedControllerPlan::Reuse => {
+            lines.push(format!("#   if Deployment {CONTROLLER_DEPLOYMENT_NAME} already runs there and another release or no Helm release owns it: reuse it with {CONTROLLER_DEPLOY_KEY}=false and leave its ownership metadata unchanged; an unowned controller that is unhealthy or runs an incompatible image is refused"));
+        }
+        SharedControllerPlan::RefuseExplicitDeploy => {
+            lines.push(format!("#   if Deployment {CONTROLLER_DEPLOYMENT_NAME} already runs there and this release does not own it: refuse, because {CONTROLLER_DEPLOY_KEY}=true was set"));
+        }
+        SharedControllerPlan::Unstated => {}
+    }
+    lines
+}
+
 async fn run_prepared_up(
     opts: UpOpts,
     mut value_plan: UpValuePlan,
@@ -4691,6 +5871,12 @@ async fn run_prepared_up(
     if let Some(values) = &opts.retained_mail_values {
         ui.note(&format!(
             "preserving {} mail value(s) recorded by the release",
+            values.keys().len()
+        ));
+    }
+    if let Some(values) = &opts.retained_runner_values {
+        ui.note(&format!(
+            "preserving {} runtime value family(s) recorded by the release",
             values.keys().len()
         ));
     }
@@ -4846,7 +6032,9 @@ async fn run_prepared_up(
             }
         }
     }
-    if set_passthrough_leaks_github_token(&opts.operator_sets()) {
+    // @spec CLUSTER-VALUES-FILES c4: files are not argv credential inputs.
+    let argv_sets: Vec<String> = opts.set.iter().chain(&opts.set_string).cloned().collect();
+    if set_passthrough_leaks_github_token(&argv_sets) {
         match invocation {
             UpInvocation::ClusterUp => ui.warn("a GitHub credential passed with --set lands in the process table and shell history; use --github-token, or CURIE_GITHUB_TOKEN to keep it out of shell history too"),
             UpInvocation::Apply => ui.warn("a GitHub credential placed under `set:` in `curie.yaml` reaches the Helm process table; use `credentials.github_token` to name a credential source instead"),
@@ -4888,34 +6076,23 @@ async fn run_prepared_up(
     // label namespace <missing>`. Mirror the resolve_generated_secrets
     // existing/fresh split: both runtime probes live here in the executor, the
     // argv stays in the pure `ownership_label_commands` builder. `--dry-run`
-    // stays offline and previews the fresh-install stamp for every candidate
-    // (existed == false), never touching the cluster and never running the
-    // post-install probe.
-    let mut owned_namespaces = vec![opts.common.namespace.clone()];
-    if opts.common.namespace != "agent-sandbox-system" {
-        owned_namespaces.push("agent-sandbox-system".to_string());
-    }
+    // stays offline: it reads neither namespace nor the shared controller, so it
+    // prints the conditional ownership plan a live run decides (see
+    // `dry_run_ownership_lines`, #4626) instead of any stamp command, never
+    // touching the cluster or running the post-install probe, so
+    // `ownership_candidates` stays empty on a dry run.
+    let mut ownership_candidates: Vec<(String, bool)> = Vec::new();
     if !opts.common.dry_run {
+        let mut owned_namespaces = vec![opts.common.namespace.clone()];
+        if opts.common.namespace != "agent-sandbox-system" {
+            owned_namespaces.push("agent-sandbox-system".to_string());
+        }
         require_on_path("kubectl")?;
         establish_primary_namespace_ownership(&opts.common, opts.adopt).await?;
-    }
-    let mut ownership_candidates: Vec<(String, bool)> = Vec::new();
-    for ns in owned_namespaces {
-        let existed_before = if opts.common.dry_run {
-            false
-        } else {
-            namespace_exists(&ns).await?
-        };
-        if opts.common.dry_run {
-            // existed_before is provably false on this branch (set above).
-            let common = ns_common(&opts.common, &ns, true);
-            cmds.extend(ownership_label_commands(
-                &common,
-                &opts.common.namespace,
-                false,
-            ));
+        for ns in owned_namespaces {
+            let existed_before = namespace_exists(&ns).await?;
+            ownership_candidates.push((ns, existed_before));
         }
-        ownership_candidates.push((ns, existed_before));
     }
 
     // Count named provider intent on both live and dry runs, plus egress
@@ -4955,6 +6132,20 @@ async fn run_prepared_up(
     }
     if opts.common.dry_run {
         let mut lines: Vec<String> = cmds.iter().map(OpsCommand::display).collect();
+        let controller = match (
+            detect_facts,
+            final_operator_value(&opts, CONTROLLER_DEPLOY_KEY),
+        ) {
+            (true, None) => SharedControllerPlan::Reuse,
+            (true, Some("true")) => SharedControllerPlan::RefuseExplicitDeploy,
+            _ => SharedControllerPlan::Unstated,
+        };
+        let shared_namespace = controller_deploy_enabled(&value_plan)
+            && opts.common.namespace != CONTROLLER_DEPLOYMENT_NAMESPACE;
+        lines.extend(dry_run_ownership_lines(
+            &opts.common,
+            shared_namespace.then_some(controller),
+        ));
         if opts.adopt {
             lines.push(format!(
                 "# --adopt: a live run may adopt a pre-existing primary namespace with foreign labels or non-default contents, stamp {ADOPTED_BY_LABEL}={}/{ADOPTED_IN_LABEL}={} with an audit record, and retain it on cluster down. The shared controller and terminating namespaces remain ineligible.",
@@ -4971,6 +6162,8 @@ async fn run_prepared_up(
         return Ok(ClusterUpOutput::DryRun(crate::ui::DryRunPlan { lines }));
     }
     require_on_path("helm")?;
+    // Skipped lookups are not Forbidden: only a refused GET keeps the admission retry.
+    let mut runtime_class_lookup_forbidden = false;
     if detect_facts {
         for inference in reconcile_priority_class_ownership(&opts, &mut value_plan).await? {
             inference.render(ui);
@@ -4981,11 +6174,7 @@ async fn run_prepared_up(
     } else {
         preflight_priority_class_ownership(&opts, &value_plan).await?;
     }
-    let observe_controller = value_plan
-        .effective_values()
-        .get(CONTROLLER_DEPLOY_KEY)
-        .map(String::as_str)
-        != Some("false");
+    let observe_controller = controller_deploy_enabled(&value_plan);
     let admission_namespaces: Vec<_> = ownership_candidates
         .iter()
         .filter(|(namespace, _)| {
@@ -4995,19 +6184,125 @@ async fn run_prepared_up(
         .cloned()
         .collect();
     cmds = up_commands_with_plan(&opts, &value_plan);
-    let gvisor_preflight_job =
+    // The rendered preflight is the chart's decision: it already applied Helm's
+    // typed values, string truthiness, and this chart's defaults. A copied
+    // predicate would disagree with `--set-string` and with a chart whose
+    // runtimeClassName default is not `gvisor`.
+    let mut gvisor_preflight =
         rendered_gvisor_preflight_job(&opts.chart, &opts.common, &value_plan).await?;
+    // A fake-model auto install omits the Job but can still use the class on
+    // runner pods. Let the chart identify that path with one real-model render.
+    let fake_model_preflight = if detect_facts && gvisor_preflight.is_none() {
+        let mut real_model_plan = value_plan.clone();
+        real_model_plan.set(FAKE_MODEL_KEY, "false");
+        rendered_gvisor_preflight_job(&opts.chart, &opts.common, &real_model_plan)
+            .await?
+            .filter(|preflight| !preflight.creates_runtime_class)
+    } else {
+        None
+    };
+    if detect_facts {
+        if let Some(preflight) = gvisor_preflight.as_ref().or(fake_model_preflight.as_ref()) {
+            let name = preflight.runtime_class_name.clone();
+            let creates_runtime_class = preflight.creates_runtime_class;
+            let fake_model_auto = fake_model_preflight.is_some();
+            let lookup = match lookup_runtime_class(&name).await {
+                Ok(lookup) => lookup,
+                Err(error) if fake_model_auto => {
+                    ui.plumbing(&format!("gVisor RuntimeClass lookup unavailable: {error}"));
+                    RuntimeClassLookup::Present
+                }
+                Err(error) => return Err(error),
+            };
+            match lookup {
+                RuntimeClassLookup::Present => {}
+                RuntimeClassLookup::Forbidden | RuntimeClassLookup::Absent if fake_model_auto => {}
+                RuntimeClassLookup::Forbidden => {
+                    runtime_class_lookup_forbidden = true;
+                }
+                RuntimeClassLookup::Absent if creates_runtime_class => {}
+                RuntimeClassLookup::Unschedulable { .. } if creates_runtime_class => {}
+                RuntimeClassLookup::Unschedulable { selector } => {
+                    match final_operator_value(&opts, GVISOR_MODE_KEY) {
+                        Some("auto") => {
+                            let assignment = format!("{GVISOR_MODE_KEY}=auto");
+                            let fix = format!(
+                                "remove the explicit `{assignment}` setting and rerun to accept the inferred gVisor posture"
+                            );
+                            return Err(crate::exit::CliError::usage(format!(
+                                "explicit `{assignment}` contradicts the detected RuntimeClass scheduling: no node matches `{name}` nodeSelector `{selector}`; {fix}"
+                            ))
+                            .with_fix(fix)
+                            .into());
+                        }
+                        // The operator may rely on sandbox nodes provisioned
+                        // on demand. The preflight remains the enforcement gate.
+                        Some("require") => {}
+                        _ => {
+                            value_plan.set(GVISOR_MODE_KEY, "off");
+                            ClusterUpInference::GvisorOffFromScheduling { name, selector }
+                                .render(ui);
+                            cmds = up_commands_with_plan(&opts, &value_plan);
+                            gvisor_preflight = rendered_gvisor_preflight_job(
+                                &opts.chart,
+                                &opts.common,
+                                &value_plan,
+                            )
+                            .await?;
+                        }
+                    }
+                }
+                RuntimeClassLookup::Absent => {
+                    if let Some(mode @ ("auto" | "require")) =
+                        final_operator_value(&opts, GVISOR_MODE_KEY)
+                    {
+                        let assignment = format!("{GVISOR_MODE_KEY}={mode}");
+                        let fix = format!(
+                            "remove the explicit `{assignment}` setting and rerun to accept the inferred gVisor posture"
+                        );
+                        return Err(crate::exit::CliError::usage(format!(
+                            "explicit `{assignment}` contradicts the detected RuntimeClass lookup `runtimeclasses.node.k8s.io \"{name}\" not found`; {fix}"
+                        ))
+                        .with_fix(fix)
+                        .into());
+                    }
+                    value_plan.set(GVISOR_MODE_KEY, "off");
+                    ClusterUpInference::GvisorOffFromLookup.render(ui);
+                    cmds = up_commands_with_plan(&opts, &value_plan);
+                    gvisor_preflight =
+                        rendered_gvisor_preflight_job(&opts.chart, &opts.common, &value_plan)
+                            .await?;
+                }
+            }
+        }
+    }
+    let gvisor_preflight_job = gvisor_preflight
+        .as_ref()
+        .map(|preflight| preflight.job_name.clone());
+    {
+        let mut args = vec![
+            plain("template"),
+            plain(&opts.common.release),
+            plain(&opts.chart),
+            plain("-n"),
+            plain(&opts.common.namespace),
+        ];
+        value_plan.append_command_args(&mut args);
+        super::capacity::preflight(
+            OpsCommand::new("helm", args),
+            &opts.common,
+            existing.is_some(),
+            ui,
+        )
+        .await;
+    }
     let cl = ui.checklist();
     let label = format!("installing release {}", opts.common.release);
     // A failed-only history is not an upgrade target: `helm upgrade --install`
     // fires the pre-upgrade drain hook against Secrets revision 1 never
     // created (#2856). Empty/absent history is a fresh install and is left
     // alone; the Detect gVisor retry still uninstalls an unrecorded abort.
-    if let Err(error) =
-        discard_failed_gvisor_install_if_never_deployed(&cl, &opts.common, true, invocation).await
-    {
-        return Err(convergence::installation_failure(&opts.common, error, invocation).await);
-    }
+    discard_failed_gvisor_install_if_never_deployed(&cl, &opts.common, true, invocation).await?;
     for cmd in &cmds {
         let outcome = match run_install_with_observers(
             &cl,
@@ -5022,9 +6317,17 @@ async fn run_prepared_up(
         {
             Ok(outcome) => outcome,
             Err(error) => {
+                if let Some(preflight) = gvisor_preflight.as_ref() {
+                    if let Some(diagnosis) =
+                        gvisor_preflight_scheduling_failure(&opts.common, preflight, invocation)
+                            .await
+                    {
+                        return Err(diagnosis);
+                    }
+                }
                 return Err(
                     convergence::installation_failure(&opts.common, error, invocation).await,
-                )
+                );
             }
         };
         match outcome {
@@ -5032,7 +6335,9 @@ async fn run_prepared_up(
             InstallOutcome::AdmissionRejected(rejection) => {
                 return Err(admission_install_error(rejection, invocation));
             }
-            InstallOutcome::RuntimeClassRejected { rejection, step } if detect_facts => {
+            InstallOutcome::RuntimeClassRejected { rejection, step }
+                if detect_facts && runtime_class_lookup_forbidden =>
+            {
                 if let Some(mode @ ("auto" | "require")) =
                     final_operator_value(&opts, GVISOR_MODE_KEY)
                 {
@@ -5049,19 +6354,14 @@ async fn run_prepared_up(
                 }
                 step.warn("retrying");
                 value_plan.set(GVISOR_MODE_KEY, "off");
-                ClusterUpInference::GvisorOff.render(ui);
-                if let Err(error) = discard_failed_gvisor_install_if_never_deployed(
+                ClusterUpInference::GvisorOffFromAdmission.render(ui);
+                discard_failed_gvisor_install_if_never_deployed(
                     &cl,
                     &opts.common,
                     false,
                     invocation,
                 )
-                .await
-                {
-                    return Err(
-                        convergence::installation_failure(&opts.common, error, invocation).await,
-                    );
-                }
+                .await?;
                 let retry = up_commands_with_plan(&opts, &value_plan)
                     .into_iter()
                     .next()
@@ -5146,6 +6446,11 @@ async fn run_prepared_up(
         }
     }
 
+    if existing.is_some() {
+        super::runner_templates::reconcile(&opts.common).await?;
+        super::runner_templates::verify(&opts.common).await?;
+    }
+
     let step = cl.step("waiting for exact target workload convergence");
     if let Err(error) = convergence::wait(&opts.common, invocation).await {
         step.fail("not converged");
@@ -5164,14 +6469,937 @@ mod tests {
 
     use crate::ops::testsupport::*;
 
+    #[test]
+    fn cluster_up_status_hint_context() {
+        assert_eq!(
+            status_hint("target-ns", "target-release", Some("scratch-cluster")),
+            "Run `curie cluster status --context scratch-cluster --namespace target-ns --release target-release` for pod health and URLs.",
+        );
+        assert_eq!(
+            status_hint("target-ns", "target-release", None),
+            "Run `curie cluster status --namespace target-ns --release target-release` for pod health and URLs.",
+        );
+        assert_eq!(
+            status_hint("ns space;$", "rel'quote", Some("ctx '$;\\name")),
+            format!(
+                r"Run `curie cluster status --context {} --namespace 'ns space;$' --release 'rel'\''quote'` for pod health and URLs.",
+                r"'ctx '\''$;\name'"
+            ),
+        );
+    }
+
+    mod failed_first_revision_data_pvc_tests {
+        use super::*;
+        use serde_json::{json, Value};
+
+        const ANCHOR: &str = "2026-10-17T10:00:00Z";
+        const LATER: &str = "2026-10-17T10:00:02Z";
+        const CLAIM: &str = "data-acme-installed-postgres-0";
+
+        struct Inputs {
+            common: CommonOpts,
+            history: Vec<HelmRevision>,
+            anchor: Value,
+            statefulsets: Value,
+            pvcs: Value,
+        }
+
+        fn list(items: Vec<Value>) -> Value {
+            json!({"apiVersion": "v1", "kind": "List", "items": items})
+        }
+
+        fn statefulset(name: &str, component: &str) -> Value {
+            // Kubernetes apps/v1 StatefulSetSpec and Helm ownership metadata:
+            // https://kubernetes.io/docs/reference/kubernetes-api/workload-resources/stateful-set-v1/
+            // https://github.com/helm/helm/blob/v3.19.0/pkg/action/validate.go
+            json!({
+                "apiVersion": "apps/v1",
+                "kind": "StatefulSet",
+                "metadata": {
+                    "name": name,
+                    "namespace": "acme-ns",
+                    "labels": {
+                        "app.kubernetes.io/name": "curie",
+                        "app.kubernetes.io/instance": "acme-retry",
+                        "app.kubernetes.io/managed-by": "Helm"
+                    },
+                    "annotations": {
+                        "meta.helm.sh/release-name": "acme-retry",
+                        "meta.helm.sh/release-namespace": "acme-ns"
+                    }
+                },
+                "spec": {
+                    "replicas": 1,
+                    "serviceName": name,
+                    "selector": {"matchLabels": {
+                        "app.kubernetes.io/instance": "acme-retry",
+                        "app.kubernetes.io/component": component
+                    }},
+                    "template": {
+                        "metadata": {"labels": {
+                            "app.kubernetes.io/instance": "acme-retry",
+                            "app.kubernetes.io/component": component
+                        }},
+                        "spec": {"containers": [{
+                            "name": "store", "image": "example.com/acme/store:1.0"
+                        }]}
+                    },
+                    "volumeClaimTemplates": [{
+                        "metadata": {"name": "data"},
+                        "spec": {
+                            "accessModes": ["ReadWriteOnce"],
+                            "resources": {"requests": {"storage": "1Gi"}}
+                        }
+                    }]
+                }
+            })
+        }
+
+        fn pvc(name: &str, component: &str, timestamp: &str, uid: &str) -> Value {
+            // ObjectMeta creationTimestamp and UID are assigned by the server:
+            // https://kubernetes.io/docs/reference/kubernetes-api/common-definitions/object-meta/
+            json!({
+                "apiVersion": "v1",
+                "kind": "PersistentVolumeClaim",
+                "metadata": {
+                    "name": name,
+                    "namespace": "acme-ns",
+                    "uid": uid,
+                    "creationTimestamp": timestamp,
+                    "labels": {
+                        "app.kubernetes.io/instance": "acme-retry",
+                        "app.kubernetes.io/component": component
+                    }
+                },
+                "spec": {
+                    "accessModes": ["ReadWriteOnce"],
+                    "resources": {"requests": {"storage": "1Gi"}}
+                },
+                "status": {"phase": "Bound"}
+            })
+        }
+
+        impl Inputs {
+            fn new() -> Self {
+                let components = ["postgres", "clickhouse", "rustfs", "valkey"];
+                Self {
+                    common: CommonOpts {
+                        namespace: "acme-ns".into(),
+                        release: "acme-retry".into(),
+                        dry_run: false,
+                    },
+                    history: vec![HelmRevision {
+                        revision: 1,
+                        status: "failed".into(),
+                        chart: "curie-0.13.0".into(),
+                        app_version: "0.13.0".into(),
+                        description: "post-install hook failed".into(),
+                    }],
+                    // Helm's Secret storage driver, not the chart's app Secret:
+                    // https://github.com/helm/helm/blob/v3.19.0/pkg/storage/driver/secrets.go
+                    anchor: json!({
+                        "apiVersion": "v1",
+                        "kind": "Secret",
+                        "type": "helm.sh/release.v1",
+                        "metadata": {
+                            "name": "sh.helm.release.v1.acme-retry.v1",
+                            "namespace": "acme-ns",
+                            "creationTimestamp": ANCHOR,
+                            "labels": {
+                                "owner": "helm", "name": "acme-retry",
+                                "version": "1", "status": "failed"
+                            }
+                        }
+                    }),
+                    statefulsets: list(
+                        components
+                            .iter()
+                            .map(|component| {
+                                statefulset(&format!("acme-installed-{component}"), component)
+                            })
+                            .collect(),
+                    ),
+                    pvcs: list(
+                        components
+                            .iter()
+                            .enumerate()
+                            .map(|(index, component)| {
+                                pvc(
+                                    &format!("data-acme-installed-{component}-0"),
+                                    component,
+                                    LATER,
+                                    &format!("00000000-0000-4000-8000-{index:012}"),
+                                )
+                            })
+                            .collect(),
+                    ),
+                }
+            }
+
+            fn plan(&self, recorded_only: bool) -> Result<FailedFirstRevisionDataPvcPlan> {
+                plan_failed_first_revision_data_pvcs(
+                    &self.common,
+                    &self.history,
+                    recorded_only,
+                    Ok(&self.anchor.to_string()),
+                    Ok(&self.statefulsets.to_string()),
+                    Ok(&self.pvcs.to_string()),
+                )
+            }
+        }
+
+        fn selected(plan: &FailedFirstRevisionDataPvcPlan) -> BTreeSet<&str> {
+            plan.claims
+                .iter()
+                .map(|claim| claim.name.as_str())
+                .collect()
+        }
+
+        fn assert_no_cleanup_action(result: Result<FailedFirstRevisionDataPvcPlan>, needle: &str) {
+            let action = result.map(|plan| plan.first_action());
+            let error = action.expect_err("invalid provenance must produce no executor action");
+            let message = format!("{error:#}");
+            assert!(message.contains(CLAIM), "retained claim missing: {message}");
+            assert!(
+                message
+                    .to_ascii_lowercase()
+                    .contains(&needle.to_ascii_lowercase()),
+                "failed check missing: {message}"
+            );
+        }
+
+        fn waiting_after_uninstall(
+            plan: &FailedFirstRevisionDataPvcPlan,
+            now: Duration,
+        ) -> FailedFirstRevisionCleanupAction {
+            let first = plan.first_action();
+            assert!(matches!(
+                &first,
+                FailedFirstRevisionCleanupAction::Delete(_)
+            ));
+            let uninstall = failed_first_revision_cleanup_transition(
+                plan,
+                &first,
+                Ok("deletion requested"),
+                Duration::ZERO,
+            )
+            .unwrap();
+            match &uninstall {
+                FailedFirstRevisionCleanupAction::Uninstall(command) => {
+                    assert_eq!(Some(command), plan.uninstall.as_ref());
+                }
+                other => panic!("successful deletion request must lead to uninstall: {other:?}"),
+            }
+            let wait = failed_first_revision_cleanup_transition(
+                plan,
+                &uninstall,
+                Ok("release uninstalled"),
+                now,
+            )
+            .unwrap();
+            assert!(matches!(
+                &wait,
+                FailedFirstRevisionCleanupAction::WaitForPvcs { .. }
+            ));
+            wait
+        }
+
+        #[test]
+        fn failed_first_revision_data_pvcs_selects_all_four_installed_stores_before_uninstall() {
+            let mut inputs = Inputs::new();
+            let mut second = inputs.history[0].clone();
+            second.revision = 2;
+            second.status = " FAILED ".into();
+            inputs.history.insert(0, second);
+            for recorded_only in [true, false] {
+                let plan = inputs.plan(recorded_only).unwrap();
+                assert_eq!(
+                    selected(&plan),
+                    BTreeSet::from([
+                        "data-acme-installed-postgres-0",
+                        "data-acme-installed-clickhouse-0",
+                        "data-acme-installed-rustfs-0",
+                        "data-acme-installed-valkey-0",
+                    ])
+                );
+                for claim in &plan.claims {
+                    let source = inputs.pvcs["items"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .find(|pvc| pvc["metadata"]["name"].as_str() == Some(claim.name.as_str()))
+                        .unwrap();
+                    assert_eq!(source["metadata"]["uid"].as_str(), Some(claim.uid.as_str()));
+                }
+                let delete = plan.delete.as_ref().unwrap();
+                assert_eq!(delete.program, "kubectl");
+                let argv = delete.argv();
+                assert_eq!(&argv[..2], ["delete", "pvc"]);
+                assert!(argv.iter().any(|arg| arg == "--wait=false"));
+                assert!(argv.windows(2).any(|pair| pair == ["-n", "acme-ns"]));
+                let expected: BTreeSet<_> = selected(&plan)
+                    .into_iter()
+                    .chain(["delete", "pvc", "-n", "acme-ns", "--wait=false"])
+                    .collect();
+                assert_eq!(
+                    argv.iter().map(String::as_str).collect::<BTreeSet<_>>(),
+                    expected
+                );
+                let uninstall = plan.uninstall.as_ref().unwrap();
+                assert_eq!(uninstall.program, "helm");
+                assert_eq!(
+                    uninstall.argv(),
+                    [
+                        "uninstall",
+                        "acme-retry",
+                        "-n",
+                        "acme-ns",
+                        "--wait",
+                        "--timeout",
+                        "60s"
+                    ]
+                );
+                match plan.first_action() {
+                    FailedFirstRevisionCleanupAction::Delete(command) => {
+                        assert_eq!(&command, delete)
+                    }
+                    other => panic!("must mark all approved claims before uninstall: {other:?}"),
+                }
+            }
+        }
+
+        #[test]
+        fn failed_first_revision_data_pvcs_keeps_unrelated_newer_other_release_and_inference_claims(
+        ) {
+            let mut inputs = Inputs::new();
+            let candidates = inputs.pvcs["items"].as_array_mut().unwrap();
+            for (name, component, timestamp) in [
+                ("acme-old-extra", "valkey", "2026-10-17T09:00:00Z"),
+                ("acme-new-extra", "valkey", LATER),
+                ("model-cache-acme-inference-0", "inference", LATER),
+                ("data-acme-other-postgres-0", "postgres", LATER),
+            ] {
+                let mut claim = pvc(name, component, timestamp, &format!("uid-{name}"));
+                if name == "data-acme-other-postgres-0" {
+                    claim["metadata"]["labels"]["app.kubernetes.io/instance"] = json!("acme-other");
+                }
+                candidates.push(claim);
+            }
+            let mut inference = statefulset("acme-inference", "inference");
+            inference["spec"]["volumeClaimTemplates"][0]["metadata"]["name"] = json!("model-cache");
+            let mut foreign = statefulset("acme-other-postgres", "postgres");
+            foreign["metadata"]["annotations"]["meta.helm.sh/release-name"] = json!("acme-other");
+            inputs.statefulsets["items"]
+                .as_array_mut()
+                .unwrap()
+                .extend([inference, foreign]);
+            let plan = inputs.plan(true).unwrap();
+            assert_eq!(plan.claims.len(), 4);
+            let kept: BTreeSet<_> = plan.kept.iter().map(|(name, _)| name.as_str()).collect();
+            assert_eq!(
+                kept,
+                BTreeSet::from([
+                    "acme-old-extra",
+                    "acme-new-extra",
+                    "model-cache-acme-inference-0",
+                    "data-acme-other-postgres-0",
+                ])
+            );
+            assert!(plan
+                .kept
+                .iter()
+                .all(|(_, reason)| !reason.trim().is_empty()));
+            let argv = plan.delete.as_ref().unwrap().argv();
+            for name in kept {
+                assert!(!argv.iter().any(|arg| arg == name), "must keep {name}");
+            }
+        }
+
+        #[test]
+        fn failed_first_revision_data_pvcs_uses_installed_templates_and_replica_ordinal_range() {
+            let mut inputs = Inputs::new();
+            let mut installed = statefulset("acme-existing-db", "postgres");
+            installed["spec"]["replicas"] = json!(2);
+            installed["spec"]["ordinals"] = json!({"start": 3});
+            installed["spec"]["volumeClaimTemplates"][0]["metadata"]["name"] = json!("store");
+            inputs.statefulsets = list(vec![installed]);
+            let names = [
+                "store-acme-existing-db-3",
+                "store-acme-existing-db-4",
+                "store-acme-existing-db-2",
+                "store-acme-existing-db-5",
+                "store-acme-existing-db-03",
+                "store-acme-existing-db-3-backup",
+                "data-acme-existing-db-3",
+                "data-acme-retry-postgres-0",
+            ];
+            inputs.pvcs = list(
+                names
+                    .iter()
+                    .map(|name| pvc(name, "postgres", LATER, name))
+                    .collect(),
+            );
+            let plan = inputs.plan(false).unwrap();
+            assert_eq!(
+                selected(&plan),
+                BTreeSet::from(["store-acme-existing-db-3", "store-acme-existing-db-4",])
+            );
+            assert_eq!(plan.kept.len(), 6);
+        }
+
+        #[test]
+        fn failed_first_revision_data_pvcs_matches_each_template_and_respects_zero_replicas() {
+            let mut inputs = Inputs::new();
+            let mut installed = statefulset("acme-existing-db", "postgres");
+            let mut journal = installed["spec"]["volumeClaimTemplates"][0].clone();
+            journal["metadata"]["name"] = json!("journal");
+            installed["spec"]["volumeClaimTemplates"]
+                .as_array_mut()
+                .unwrap()
+                .push(journal);
+            inputs.statefulsets = list(vec![installed]);
+            inputs.pvcs = list(vec![
+                pvc("data-acme-existing-db-0", "postgres", LATER, "uid-data"),
+                pvc(
+                    "journal-acme-existing-db-0",
+                    "postgres",
+                    LATER,
+                    "uid-journal",
+                ),
+                pvc(
+                    "journal-acme-existing-db-1",
+                    "postgres",
+                    LATER,
+                    "uid-outside",
+                ),
+            ]);
+            let plan = inputs.plan(true).unwrap();
+            assert_eq!(
+                selected(&plan),
+                BTreeSet::from(["data-acme-existing-db-0", "journal-acme-existing-db-0",])
+            );
+            inputs.statefulsets["items"][0]["spec"]["replicas"] = json!(0);
+            let plan = inputs.plan(true).unwrap();
+            assert!(plan.claims.is_empty());
+            assert!(plan.delete.is_none());
+            assert_eq!(plan.kept.len(), 3);
+        }
+
+        #[test]
+        fn failed_first_revision_data_pvcs_requires_both_claim_labels_even_for_exact_data_names() {
+            for (key, replacement) in [
+                ("app.kubernetes.io/instance", json!("acme-other")),
+                ("app.kubernetes.io/component", json!("inference")),
+                ("app.kubernetes.io/instance", Value::Null),
+                ("app.kubernetes.io/component", Value::Null),
+            ] {
+                let mut inputs = Inputs::new();
+                let mut claim = inputs.pvcs["items"][0].clone();
+                claim["metadata"]["labels"][key] = replacement;
+                inputs.pvcs = list(vec![claim]);
+                for recorded_only in [true, false] {
+                    let plan = inputs.plan(recorded_only).unwrap();
+                    assert!(plan.claims.is_empty());
+                    assert!(plan.delete.is_none());
+                    assert_eq!(plan.kept.len(), 1);
+                    assert_eq!(plan.kept[0].0, CLAIM);
+                    assert!(!plan.kept[0].1.trim().is_empty());
+                }
+            }
+        }
+
+        #[test]
+        fn failed_first_revision_data_pvcs_requires_installed_statefulset_helm_ownership() {
+            for (pointer, value) in [
+                (
+                    "/metadata/annotations/meta.helm.sh~1release-name",
+                    "acme-other",
+                ),
+                (
+                    "/metadata/annotations/meta.helm.sh~1release-namespace",
+                    "acme-other-ns",
+                ),
+                (
+                    "/metadata/labels/app.kubernetes.io~1managed-by",
+                    "another-controller",
+                ),
+            ] {
+                let mut inputs = Inputs::new();
+                *inputs.statefulsets["items"][0]
+                    .pointer_mut(pointer)
+                    .unwrap() = json!(value);
+                inputs.pvcs = list(vec![inputs.pvcs["items"][0].clone()]);
+                let plan = inputs.plan(true).unwrap();
+                assert!(plan.delete.is_none(), "foreign StatefulSet at {pointer}");
+                assert!(plan.claims.is_empty());
+                assert_eq!(plan.kept[0].0, CLAIM);
+            }
+        }
+
+        #[test]
+        fn failed_first_revision_data_pvcs_rejects_older_equal_and_missing_claim_provenance() {
+            for timestamp in [
+                json!("2026-10-17T09:59:59Z"),
+                json!(ANCHOR),
+                json!("2026-10-17T11:00:00+01:00"),
+                json!("2026-10-17T10:00:02+01:00"),
+                Value::Null,
+                json!("not-an-api-timestamp"),
+                json!(123),
+            ] {
+                for recorded_only in [true, false] {
+                    let mut inputs = Inputs::new();
+                    inputs.pvcs["items"][0]["metadata"]["creationTimestamp"] = timestamp.clone();
+                    assert_no_cleanup_action(inputs.plan(recorded_only), "timestamp");
+                }
+            }
+            for value in [Value::Null, json!("")] {
+                let mut inputs = Inputs::new();
+                inputs.pvcs["items"][0]["metadata"]["uid"] = value;
+                assert_no_cleanup_action(inputs.plan(true), "UID");
+            }
+            let mut inputs = Inputs::new();
+            inputs.pvcs["items"][0]["metadata"]
+                .as_object_mut()
+                .unwrap()
+                .remove("creationTimestamp");
+            assert_no_cleanup_action(inputs.plan(true), "timestamp");
+        }
+
+        #[test]
+        fn failed_first_revision_data_pvcs_validates_every_claim_before_producing_any_command() {
+            for reverse in [false, true] {
+                let mut inputs = Inputs::new();
+                inputs.pvcs["items"][0]["metadata"]["creationTimestamp"] = json!(ANCHOR);
+                if reverse {
+                    inputs.pvcs["items"].as_array_mut().unwrap().reverse();
+                }
+                assert_no_cleanup_action(inputs.plan(true), "timestamp");
+            }
+        }
+
+        #[test]
+        fn failed_first_revision_data_pvcs_requires_recorded_revision_one() {
+            let mut inputs = Inputs::new();
+            inputs.history[0].revision = 2;
+            for recorded_only in [true, false] {
+                assert_no_cleanup_action(inputs.plan(recorded_only), "revision 1");
+            }
+        }
+
+        #[test]
+        fn failed_first_revision_data_pvcs_rejects_unreadable_missing_and_malformed_anchor() {
+            let inputs = Inputs::new();
+            let mut missing_timestamp = inputs.anchor.clone();
+            missing_timestamp["metadata"]
+                .as_object_mut()
+                .unwrap()
+                .remove("creationTimestamp");
+            let mut malformed_timestamp = inputs.anchor.clone();
+            malformed_timestamp["metadata"]["creationTimestamp"] = json!("not-an-api-timestamp");
+            let mut non_string_timestamp = inputs.anchor.clone();
+            non_string_timestamp["metadata"]["creationTimestamp"] = json!(123);
+            let mut wrong_revision = inputs.anchor.clone();
+            wrong_revision["metadata"]["name"] = json!("sh.helm.release.v1.acme-retry.v2");
+            wrong_revision["metadata"]["labels"]["version"] = json!("2");
+            let mut wrong_release = inputs.anchor.clone();
+            wrong_release["metadata"]["labels"]["name"] = json!("acme-other");
+            let mut wrong_namespace = inputs.anchor.clone();
+            wrong_namespace["metadata"]["namespace"] = json!("acme-other-ns");
+            let mut wrong_driver = inputs.anchor.clone();
+            wrong_driver["type"] = json!("Opaque");
+            let malformed = [
+                "{".to_string(),
+                "null".to_string(),
+                "{}".to_string(),
+                missing_timestamp.to_string(),
+                malformed_timestamp.to_string(),
+                non_string_timestamp.to_string(),
+                wrong_revision.to_string(),
+                wrong_release.to_string(),
+                wrong_namespace.to_string(),
+                wrong_driver.to_string(),
+            ];
+            for recorded_only in [true, false] {
+                for anchor in [
+                    Err("Forbidden reading revision 1 Secret"),
+                    Err("revision 1 Secret not found"),
+                ]
+                .into_iter()
+                .chain(malformed.iter().map(|json| Ok(json.as_str())))
+                {
+                    let result = plan_failed_first_revision_data_pvcs(
+                        &inputs.common,
+                        &inputs.history,
+                        recorded_only,
+                        anchor,
+                        Ok(&inputs.statefulsets.to_string()),
+                        Ok(&inputs.pvcs.to_string()),
+                    );
+                    assert_no_cleanup_action(result, "revision 1");
+                }
+            }
+        }
+
+        #[test]
+        fn failed_first_revision_data_pvcs_rejects_unreadable_and_malformed_inventory() {
+            let inputs = Inputs::new();
+            for broken in [Err("Forbidden"), Ok("{"), Ok("{}"), Ok(r#"{"items":null}"#)] {
+                for break_statefulsets in [true, false] {
+                    let statefulsets = inputs.statefulsets.to_string();
+                    let pvcs = inputs.pvcs.to_string();
+                    let result = plan_failed_first_revision_data_pvcs(
+                        &inputs.common,
+                        &inputs.history,
+                        true,
+                        Ok(&inputs.anchor.to_string()),
+                        if break_statefulsets {
+                            broken
+                        } else {
+                            Ok(statefulsets.as_str())
+                        },
+                        if break_statefulsets {
+                            Ok(pvcs.as_str())
+                        } else {
+                            broken
+                        },
+                    );
+                    assert!(result.map(|plan| plan.first_action()).is_err());
+                }
+            }
+            for pointer in [
+                "/spec/replicas",
+                "/spec/volumeClaimTemplates/0/metadata/name",
+            ] {
+                let mut inputs = Inputs::new();
+                *inputs.statefulsets["items"][0]
+                    .pointer_mut(pointer)
+                    .unwrap() = Value::Null;
+                assert_no_cleanup_action(inputs.plan(true), "StatefulSet");
+            }
+        }
+
+        #[test]
+        fn discard_keeps_pvcs_unless_every_revision_failed_on_both_callers() {
+            for status in [
+                "deployed",
+                "superseded",
+                "pending-install",
+                "pending-upgrade",
+                "unknown",
+            ] {
+                for recorded_only in [true, false] {
+                    for unsafe_revision_first in [true, false] {
+                        let mut inputs = Inputs::new();
+                        let mut other = inputs.history[0].clone();
+                        other.revision = 2;
+                        other.status = status.into();
+                        inputs.history.push(other);
+                        if unsafe_revision_first {
+                            inputs.history.reverse();
+                        }
+                        let plan = plan_failed_first_revision_data_pvcs(
+                            &inputs.common,
+                            &inputs.history,
+                            recorded_only,
+                            Err("anchor must not authorize cleanup"),
+                            Err("StatefulSets must not authorize cleanup"),
+                            Err("PVCs must not authorize cleanup"),
+                        )
+                        .unwrap();
+                        assert!(
+                            plan.claims.is_empty(),
+                            "{status}, recorded_only={recorded_only}"
+                        );
+                        assert!(
+                            plan.delete.is_none(),
+                            "{status}, recorded_only={recorded_only}"
+                        );
+                        assert!(!matches!(
+                            plan.first_action(),
+                            FailedFirstRevisionCleanupAction::Delete(_)
+                        ));
+                    }
+                }
+            }
+        }
+
+        #[test]
+        fn discard_keeps_pvcs_unless_every_revision_failed_with_empty_history() {
+            let mut inputs = Inputs::new();
+            inputs.history.clear();
+            for recorded_only in [true, false] {
+                let plan = inputs.plan(recorded_only).unwrap();
+                assert!(plan.claims.is_empty());
+                assert!(plan.delete.is_none());
+                if recorded_only {
+                    assert!(plan.uninstall.is_none());
+                    assert!(matches!(
+                        plan.first_action(),
+                        FailedFirstRevisionCleanupAction::Reinstall
+                    ));
+                }
+            }
+        }
+
+        #[test]
+        fn failed_first_revision_data_pvcs_delete_request_failure_never_authorizes_uninstall() {
+            let plan = Inputs::new().plan(true).unwrap();
+            let first = plan.first_action();
+            assert!(matches!(
+                &first,
+                FailedFirstRevisionCleanupAction::Delete(_)
+            ));
+            let error = failed_first_revision_cleanup_transition(
+                &plan,
+                &first,
+                Err("Forbidden deleting PVCs"),
+                Duration::ZERO,
+            )
+            .expect_err("failed deletion request must not return uninstall or reinstall");
+            let message = format!("{error:#}");
+            assert!(message.contains("Forbidden deleting PVCs"), "{message}");
+            assert!(message.contains(CLAIM), "{message}");
+        }
+
+        #[test]
+        fn failed_first_revision_data_pvcs_uninstall_failure_never_authorizes_reinstall() {
+            let plan = Inputs::new().plan(false).unwrap();
+            let uninstall = failed_first_revision_cleanup_transition(
+                &plan,
+                &plan.first_action(),
+                Ok("deletion requested"),
+                Duration::ZERO,
+            )
+            .unwrap();
+            assert!(matches!(
+                &uninstall,
+                FailedFirstRevisionCleanupAction::Uninstall(_)
+            ));
+            let error = failed_first_revision_cleanup_transition(
+                &plan,
+                &uninstall,
+                Err("helm uninstall failed"),
+                Duration::from_secs(5),
+            )
+            .expect_err("uninstall failure must not return reinstall");
+            assert!(format!("{error:#}").contains("helm uninstall failed"));
+        }
+
+        #[test]
+        fn failed_first_revision_data_pvcs_uses_one_total_sixty_second_uid_deletion_deadline() {
+            let inputs = Inputs::new();
+            let plan = inputs.plan(true).unwrap();
+            let mut next = waiting_after_uninstall(&plan, Duration::from_secs(100));
+            assert!(matches!(
+                &next, FailedFirstRevisionCleanupAction::WaitForPvcs { deadline }
+                    if *deadline == Duration::from_secs(160)
+            ));
+            let mut remaining = inputs.pvcs["items"][0].clone();
+            remaining["metadata"]["deletionTimestamp"] = json!("2026-10-17T10:01:00Z");
+            remaining["metadata"]["finalizers"] = json!(["kubernetes.io/pvc-protection"]);
+            remaining["metadata"]["labels"]["app.kubernetes.io/instance"] = json!("acme-other");
+            remaining["metadata"]["labels"]["app.kubernetes.io/component"] = json!("inference");
+            let snapshot = list(vec![remaining]).to_string();
+            for now in [
+                Duration::from_secs(101),
+                Duration::from_secs(159),
+                Duration::from_millis(159_999),
+            ] {
+                next = failed_first_revision_cleanup_transition(&plan, &next, Ok(&snapshot), now)
+                    .unwrap();
+                assert!(matches!(
+                    &next, FailedFirstRevisionCleanupAction::WaitForPvcs { deadline }
+                        if *deadline == Duration::from_secs(160)
+                ));
+            }
+            for now in [Duration::from_secs(160), Duration::from_secs(161)] {
+                let error =
+                    failed_first_revision_cleanup_transition(&plan, &next, Ok(&snapshot), now)
+                        .expect_err(
+                            "the total deadline must stop reinstall while a recorded UID remains",
+                        );
+                let message = format!("{error:#}");
+                assert!(message.contains(CLAIM), "{message}");
+                assert!(message.contains("60"), "{message}");
+                assert!(
+                    !message.contains("data-acme-installed-clickhouse-0"),
+                    "already gone: {message}"
+                );
+            }
+        }
+
+        #[test]
+        fn failed_first_revision_data_pvcs_wait_read_errors_do_not_authorize_reinstall() {
+            let inputs = Inputs::new();
+            let plan = inputs.plan(true).unwrap();
+            let wait = waiting_after_uninstall(&plan, Duration::ZERO);
+            for snapshot in [
+                Err("Forbidden listing PVCs"),
+                Ok("{"),
+                Ok("{}"),
+                Ok(r#"{"items":null}"#),
+            ] {
+                let error = failed_first_revision_cleanup_transition(
+                    &plan,
+                    &wait,
+                    snapshot,
+                    Duration::from_secs(1),
+                )
+                .expect_err("an unreadable deletion observation cannot prove UID disappearance");
+                assert!(format!("{error:#}").contains(CLAIM));
+            }
+            let mut missing_uid = inputs.pvcs["items"][0].clone();
+            missing_uid["metadata"]
+                .as_object_mut()
+                .unwrap()
+                .remove("uid");
+            let snapshot = list(vec![missing_uid]).to_string();
+            assert!(failed_first_revision_cleanup_transition(
+                &plan,
+                &wait,
+                Ok(&snapshot),
+                Duration::from_secs(1),
+            )
+            .is_err());
+        }
+
+        #[test]
+        fn failed_first_revision_data_pvcs_valid_success_waits_for_all_uids_then_allows_reinstall()
+        {
+            let inputs = Inputs::new();
+            let plan = inputs.plan(true).unwrap();
+            let wait = waiting_after_uninstall(&plan, Duration::from_secs(10));
+            let one_left = list(vec![inputs.pvcs["items"][0].clone()]).to_string();
+            let next = failed_first_revision_cleanup_transition(
+                &plan,
+                &wait,
+                Ok(&one_left),
+                Duration::from_secs(11),
+            )
+            .unwrap();
+            assert!(matches!(
+                &next,
+                FailedFirstRevisionCleanupAction::WaitForPvcs { .. }
+            ));
+            let empty = list(vec![]).to_string();
+            let next = failed_first_revision_cleanup_transition(
+                &plan,
+                &next,
+                Ok(&empty),
+                Duration::from_secs(69),
+            )
+            .unwrap();
+            assert!(matches!(next, FailedFirstRevisionCleanupAction::Reinstall));
+        }
+
+        #[test]
+        fn failed_first_revision_data_pvcs_uid_disappearance_allows_same_name_replacement_to_survive(
+        ) {
+            let mut inputs = Inputs::new();
+            let plan = inputs.plan(false).unwrap();
+            let wait = waiting_after_uninstall(&plan, Duration::ZERO);
+            for (index, claim) in inputs.pvcs["items"]
+                .as_array_mut()
+                .unwrap()
+                .iter_mut()
+                .enumerate()
+            {
+                claim["metadata"]["uid"] = json!(format!("10000000-0000-4000-8000-{index:012}"));
+                claim["metadata"]["creationTimestamp"] = json!("2026-10-17T10:02:00Z");
+            }
+            let next = failed_first_revision_cleanup_transition(
+                &plan,
+                &wait,
+                Ok(&inputs.pvcs.to_string()),
+                Duration::from_secs(59),
+            )
+            .unwrap();
+            assert!(matches!(next, FailedFirstRevisionCleanupAction::Reinstall));
+        }
+
+        #[test]
+        fn failed_first_revision_data_pvcs_empty_data_set_still_allows_uninstall_and_reinstall() {
+            let mut inputs = Inputs::new();
+            inputs.pvcs = list(vec![pvc(
+                "acme-unrelated",
+                "valkey",
+                ANCHOR,
+                "uid-unrelated",
+            )]);
+            let plan = inputs.plan(true).unwrap();
+            assert!(plan.claims.is_empty());
+            assert!(plan.delete.is_none());
+            assert_eq!(plan.kept[0].0, "acme-unrelated");
+            let first = plan.first_action();
+            assert!(matches!(
+                &first,
+                FailedFirstRevisionCleanupAction::Uninstall(_)
+            ));
+            let next = failed_first_revision_cleanup_transition(
+                &plan,
+                &first,
+                Ok("release uninstalled"),
+                Duration::ZERO,
+            )
+            .unwrap();
+            assert!(matches!(next, FailedFirstRevisionCleanupAction::Reinstall));
+        }
+    }
+
+    #[test]
+    fn a_quickstart_release_write_records_only_a_well_formed_mark() {
+        let cmd = OpsCommand::new("helm", vec![plain("upgrade"), plain("r")]);
+        let mark = format!("{QUICKSTART_RELEASE_WRITE_PREFIX}0a1b");
+        assert_eq!(
+            release_write_with_mark(&cmd, Some(&mark)).argv(),
+            ["upgrade", "r", "--description", mark.as_str()]
+        );
+        assert_eq!(release_write_with_mark(&cmd, None), cmd);
+        for forged in [
+            "",
+            QUICKSTART_RELEASE_WRITE_PREFIX,
+            "operator note",
+            "curie-quickstart-write-a b",
+        ] {
+            assert_eq!(release_write_with_mark(&cmd, Some(forged)), cmd, "{forged}");
+        }
+    }
+
+    #[test]
+    fn file_set_capture_masks_credential_values_in_command_diagnostics() {
+        // @spec CLUSTER-VALUES-FILES c4
+        let o = UpOpts {
+            set: vec![
+                "api.githubToken=PLACEHOLDER-capture-secret".into(),
+                "worker.adapterCredentials={}".into(),
+            ],
+            set_string: vec!["agentSandbox.runner.credentials=PLACEHOLDER-model-secret".into()],
+            ..opts()
+        };
+        let cmd = OpsCommand::new("helm", file_set_args(&o));
+        let display = cmd.display();
+        assert!(!display.contains("PLACEHOLDER-capture-secret"));
+        assert!(!display.contains("PLACEHOLDER-model-secret"));
+        assert!(cmd
+            .argv()
+            .iter()
+            .any(|arg| arg.contains("PLACEHOLDER-capture-secret")));
+        assert!(cmd.argv().iter().any(|arg| arg == "--set-json"));
+    }
+
     fn opts() -> UpOpts {
         UpOpts {
+            file_values: None,
             retained_mail_values: None,
+            retained_runner_values: None,
+            saved_credentials: None,
             common: common(),
             chart: "charts/curie".into(),
             no_expose: true,
             set: vec![],
             set_string: vec![],
+            set_json: vec![],
             allow_egress_host: vec![],
             resolved_egress_cidrs: vec![],
             allow_web_egress: vec![],
@@ -5197,6 +7425,7 @@ mod tests {
             None,
             false,
             true,
+            &crate::config_migrate::FactoryMigrationContext::NotRequired,
         )
         .unwrap()
     }
@@ -5409,6 +7638,7 @@ mod tests {
             None,
             false,
             true,
+            &crate::config_migrate::FactoryMigrationContext::NotRequired,
         )
         .unwrap();
 
@@ -5453,6 +7683,7 @@ mod tests {
             None,
             false,
             true,
+            &crate::config_migrate::FactoryMigrationContext::NotRequired,
         )
         .unwrap();
 
@@ -5473,6 +7704,444 @@ mod tests {
         );
     }
 
+    // -----------------------------------------------------------------------
+    // #3848: a sealed plain `cluster up` is a FULL Helm upgrade, so the runner
+    // environment and per-agent connector bindings a release recorded have to
+    // be re-supplied, typed, through a private values file, and a saved local
+    // model credential is not a request to replace the recorded one.
+    // -----------------------------------------------------------------------
+
+    const SAVED_OPENROUTER_CREDENTIAL: &str = "sk-or-v1-PLACEHOLDER-saved";
+    const RECORDED_ANTHROPIC_CREDENTIAL: &str = "sk-ant-api03-PLACEHOLDER-recorded";
+    const EXPLICIT_ANTHROPIC_CREDENTIAL: &str = "sk-ant-api03-PLACEHOLDER-explicit";
+
+    fn retained_runner_fixture() -> serde_json::Value {
+        serde_json::json!({
+            "agentSandbox": {
+                "runner": {
+                    "extraEnv": [
+                        {"name": "PORT", "value": "8080"},
+                        {
+                            "name": "FROM_SECRET",
+                            "valueFrom": {"secretKeyRef": {"name": "s", "key": "k"}}
+                        }
+                    ]
+                },
+                "connectorSecrets": {
+                    "acme-a": {
+                        "GRAFANA_TOKEN": "placeholder-a",
+                        "GRAFANA_URL": "http://grafana.example"
+                    },
+                    "acme-b": {"GITHUB_PERSONAL_ACCESS_TOKEN": "placeholder-b"}
+                }
+            }
+        })
+    }
+
+    /// A sealed (`--dev` absent) plain rerun against `existing`.
+    fn sealed_upgrade(
+        existing: Option<&serde_json::Value>,
+        set: Vec<String>,
+        set_string: Vec<String>,
+    ) -> UpOpts {
+        complete_up_opts_without_runner_egress(
+            UpOpts {
+                set,
+                set_string,
+                ..opts()
+            },
+            existing,
+            None,
+            false,
+            true,
+            &crate::config_migrate::FactoryMigrationContext::NotRequired,
+        )
+        .unwrap()
+    }
+
+    /// Helm's merge of values files: maps merge, everything else replaces.
+    fn merge_helm_values(into: &mut serde_json::Value, from: &serde_json::Value) {
+        match (into, from) {
+            (serde_json::Value::Object(into), serde_json::Value::Object(from)) => {
+                for (key, value) in from {
+                    match into.get_mut(key) {
+                        Some(existing) if existing.is_object() && value.is_object() => {
+                            merge_helm_values(existing, value)
+                        }
+                        _ => {
+                            into.insert(key.clone(), value.clone());
+                        }
+                    }
+                }
+            }
+            (into, from) => *into = from.clone(),
+        }
+    }
+
+    /// What `helm upgrade` would receive from this run: the materialized argv
+    /// with every `-f` operand (a random temp path) blanked, every `-f` document
+    /// in argv order, and those documents merged. The files are read while the
+    /// guards still hold them.
+    fn helm_upgrade_inputs(opts: &UpOpts) -> (Vec<String>, Vec<String>, serde_json::Value) {
+        let commands = up_commands(opts);
+        let (materialized, _guards) = commands[0].materialize_secret_files().unwrap();
+        let bodies = secret_values_file_bodies(&materialized);
+        let mut argv = materialized.argv();
+        let mut operand_is_file = false;
+        for argument in &mut argv {
+            let is_flag = argument == "-f";
+            if operand_is_file {
+                *argument = "<values-file>".to_string();
+            }
+            operand_is_file = is_flag;
+        }
+        let mut merged = serde_json::json!({});
+        for body in &bodies {
+            let document: serde_json::Value = serde_json::from_str(body)
+                .unwrap_or_else(|error| panic!("values file is not JSON ({error}): {body}"));
+            merge_helm_values(&mut merged, &document);
+        }
+        (argv, bodies, merged)
+    }
+
+    #[test]
+    fn sealed_up_retains_recorded_runner_env_and_connector_secrets_in_a_private_file() {
+        let existing = retained_runner_fixture();
+        let opts = sealed_upgrade(Some(&existing), vec![], vec![]);
+        let (argv, bodies, merged) = helm_upgrade_inputs(&opts);
+
+        assert_eq!(
+            merged.pointer("/agentSandbox/runner/extraEnv"),
+            existing.pointer("/agentSandbox/runner/extraEnv"),
+            "a sealed up must re-supply every recorded runner extraEnv entry: {bodies:?}"
+        );
+        assert_eq!(
+            merged.pointer("/agentSandbox/runner/extraEnv/0/value"),
+            Some(&serde_json::json!("8080")),
+            "a numeric environment string must stay a JSON string, never an integer"
+        );
+        assert_eq!(
+            merged.pointer("/agentSandbox/connectorSecrets"),
+            existing.pointer("/agentSandbox/connectorSecrets"),
+            "a sealed up must re-supply every agent's connector bindings: {bodies:?}"
+        );
+
+        for private in ["placeholder-a", "placeholder-b", "8080", "grafana.example"] {
+            assert!(
+                !argv.iter().any(|argument| argument.contains(private)),
+                "retained runner value {private} reached the Helm argv: {argv:?}"
+            );
+        }
+        let shown = up_commands(&opts)[0].display();
+        for private in ["placeholder-a", "placeholder-b"] {
+            assert!(!shown.contains(private), "connector secret leaked: {shown}");
+        }
+
+        // Explicit `--set` input must be able to win, so the retained file has
+        // to precede every set lane in argv.
+        let retained_ordinal = bodies
+            .iter()
+            .position(|body| body.contains("connectorSecrets"))
+            .expect("the retained runner values file is in argv");
+        let retained_file = argv
+            .iter()
+            .enumerate()
+            .filter(|(_, argument)| argument.as_str() == "-f")
+            .nth(retained_ordinal)
+            .map(|(index, _)| index)
+            .expect("the retained values file has a -f flag");
+        let first_set = argv
+            .iter()
+            .position(|argument| argument.starts_with("--set"))
+            .unwrap_or(argv.len());
+        assert!(
+            retained_file < first_set,
+            "retained values must precede explicit --set input: {argv:?}"
+        );
+    }
+
+    #[test]
+    fn explicit_runner_extra_env_replaces_the_recorded_list_but_keeps_connector_secrets() {
+        let existing = retained_runner_fixture();
+        let opts = sealed_upgrade(
+            Some(&existing),
+            vec![],
+            vec![
+                "agentSandbox.runner.extraEnv[0].name=OTHER".into(),
+                "agentSandbox.runner.extraEnv[0].value=operator-value".into(),
+            ],
+        );
+        let (argv, bodies, merged) = helm_upgrade_inputs(&opts);
+
+        assert!(
+            merged.pointer("/agentSandbox/runner/extraEnv").is_none(),
+            "explicit extraEnv input replaces the recorded list as a whole: {bodies:?}"
+        );
+        assert!(
+            !bodies
+                .iter()
+                .any(|body| body.contains("FROM_SECRET") || body.contains("\"PORT\"")),
+            "no recorded runner extraEnv entry may survive an explicit list: {bodies:?}"
+        );
+        assert!(
+            argv.windows(2).any(|pair| pair[0] == "--set-string"
+                && pair[1] == "agentSandbox.runner.extraEnv[0].name=OTHER"),
+            "the explicit runner extraEnv must reach Helm: {argv:?}"
+        );
+        assert_eq!(
+            merged.pointer("/agentSandbox/connectorSecrets"),
+            existing.pointer("/agentSandbox/connectorSecrets"),
+            "an unrelated explicit input must not drop connector bindings: {bodies:?}"
+        );
+    }
+
+    #[test]
+    fn explicit_connector_secret_replaces_only_that_binding() {
+        let existing = retained_runner_fixture();
+        let opts = sealed_upgrade(
+            Some(&existing),
+            vec!["agentSandbox.connectorSecrets.acme-a.GRAFANA_TOKEN=operator-token".into()],
+            vec![],
+        );
+        let (argv, bodies, merged) = helm_upgrade_inputs(&opts);
+
+        assert_eq!(
+            merged.pointer("/agentSandbox/connectorSecrets"),
+            Some(&serde_json::json!({
+                "acme-a": {"GRAFANA_URL": "http://grafana.example"},
+                "acme-b": {"GITHUB_PERSONAL_ACCESS_TOKEN": "placeholder-b"}
+            })),
+            "only the explicitly replaced binding leaves the retained file: {bodies:?}"
+        );
+        assert!(
+            !bodies.iter().any(|body| body.contains("placeholder-a")),
+            "the replaced recorded value must not be re-supplied: {bodies:?}"
+        );
+        assert!(
+            argv.windows(2).any(|pair| pair[0] == "--set"
+                && pair[1] == "agentSandbox.connectorSecrets.acme-a.GRAFANA_TOKEN=operator-token"),
+            "the explicit binding must reach Helm: {argv:?}"
+        );
+        assert_eq!(
+            merged.pointer("/agentSandbox/runner/extraEnv"),
+            existing.pointer("/agentSandbox/runner/extraEnv"),
+            "an explicit connector binding must not drop the runner extraEnv: {bodies:?}"
+        );
+    }
+
+    #[test]
+    fn sealed_up_retains_recorded_api_and_dispatcher_extra_env() {
+        let existing = serde_json::json!({
+            "api": {"extraEnv": [{"name": "API_PORT", "value": "9090"}]},
+            "dispatcher": {"extraEnv": [
+                {"name": "DISPATCH_FLAG", "value": "true"},
+                {"name": "DISPATCH_TOKEN", "valueFrom": {"secretKeyRef": {"name": "d", "key": "t"}}}
+            ]}
+        });
+        let opts = sealed_upgrade(Some(&existing), vec![], vec![]);
+        let (argv, bodies, merged) = helm_upgrade_inputs(&opts);
+
+        assert_eq!(
+            merged.pointer("/api/extraEnv"),
+            existing.pointer("/api/extraEnv"),
+            "a sealed up must re-supply the recorded api extraEnv typed: {bodies:?}"
+        );
+        assert_eq!(
+            merged.pointer("/dispatcher/extraEnv"),
+            existing.pointer("/dispatcher/extraEnv"),
+            "a sealed up must re-supply the recorded dispatcher extraEnv typed: {bodies:?}"
+        );
+        for private in ["9090", "DISPATCH_TOKEN"] {
+            assert!(
+                !argv.iter().any(|argument| argument.contains(private)),
+                "retained extraEnv reached the Helm argv: {argv:?}"
+            );
+        }
+    }
+
+    fn sealed_upgrade_with_saved_credential(
+        existing: Option<&serde_json::Value>,
+        explicit: Option<&str>,
+        fake_model: bool,
+        set: Vec<String>,
+    ) -> UpOpts {
+        complete_up_opts_without_runner_egress(
+            UpOpts {
+                set,
+                fake_model,
+                credentials: explicit.map(str::to_string),
+                saved_credentials: Some(SAVED_OPENROUTER_CREDENTIAL.to_string()),
+                ..opts()
+            },
+            existing,
+            None,
+            false,
+            true,
+            &crate::config_migrate::FactoryMigrationContext::NotRequired,
+        )
+        .unwrap()
+    }
+
+    fn assert_saved_credential_absent(opts: &UpOpts) {
+        let (argv, bodies, _) = helm_upgrade_inputs(opts);
+        assert!(
+            !bodies
+                .iter()
+                .chain(argv.iter())
+                .any(|surface| surface.contains(SAVED_OPENROUTER_CREDENTIAL)),
+            "an unrequested saved credential reached Helm: {bodies:?}"
+        );
+    }
+
+    #[test]
+    fn a_saved_credential_does_not_replace_a_recorded_credential_reference() {
+        let existing = serde_json::json!({
+            "agentSandbox": {"runner": {
+                "fakeModel": false,
+                "credentialsExistingSecret": "byo-model",
+                "credentialsExistingSecretKey": "agentCredentials"
+            }}
+        });
+        let opts = sealed_upgrade_with_saved_credential(Some(&existing), None, false, vec![]);
+
+        assert_eq!(
+            opts.credentials, None,
+            "a saved local credential is not a model credential change request"
+        );
+        assert_eq!(
+            secret_for(&opts, "agentSandbox.runner.credentialsExistingSecret"),
+            Some("byo-model"),
+            "the recorded reference must stay authoritative"
+        );
+        assert_eq!(
+            secret_for(&opts, "agentSandbox.runner.credentialsExistingSecretKey"),
+            Some("agentCredentials"),
+        );
+        let (_, _, merged) = helm_upgrade_inputs(&opts);
+        assert_eq!(
+            merged.pointer("/agentSandbox/runner/credentialsExistingSecret"),
+            Some(&serde_json::json!("byo-model")),
+        );
+        assert!(
+            merged.pointer("/agentSandbox/runner/credentials").is_none(),
+            "no inline credential may be supplied beside the recorded reference: {merged}"
+        );
+        assert_saved_credential_absent(&opts);
+    }
+
+    #[test]
+    fn a_saved_credential_does_not_replace_a_recorded_inline_credential() {
+        let existing = serde_json::json!({
+            "agentSandbox": {"runner": {
+                "fakeModel": false,
+                "credentials": RECORDED_ANTHROPIC_CREDENTIAL
+            }}
+        });
+        let opts = sealed_upgrade_with_saved_credential(Some(&existing), None, false, vec![]);
+
+        assert_eq!(
+            opts.credentials.as_deref(),
+            Some(RECORDED_ANTHROPIC_CREDENTIAL),
+            "the recorded inline credential is what this release keeps"
+        );
+        let (_, _, merged) = helm_upgrade_inputs(&opts);
+        assert_eq!(
+            merged.pointer("/agentSandbox/runner/credentials"),
+            Some(&serde_json::json!(RECORDED_ANTHROPIC_CREDENTIAL)),
+        );
+        assert_saved_credential_absent(&opts);
+    }
+
+    #[test]
+    fn a_saved_credential_is_adopted_when_the_release_records_none() {
+        for existing in [
+            None,
+            Some(serde_json::json!({})),
+            Some(serde_json::json!({"agentSandbox": {"runner": {
+                "credentials": "",
+                "credentialsExistingSecret": ""
+            }}})),
+        ] {
+            let opts = sealed_upgrade_with_saved_credential(existing.as_ref(), None, false, vec![]);
+            assert_eq!(
+                opts.credentials.as_deref(),
+                Some(SAVED_OPENROUTER_CREDENTIAL),
+                "with nothing recorded, the saved credential is the model credential: {existing:?}"
+            );
+            let (_, _, merged) = helm_upgrade_inputs(&opts);
+            assert_eq!(
+                merged.pointer("/agentSandbox/runner/credentials"),
+                Some(&serde_json::json!(SAVED_OPENROUTER_CREDENTIAL)),
+                "the adopted credential travels through the private values file"
+            );
+        }
+    }
+
+    #[test]
+    fn an_explicit_credential_still_replaces_a_recorded_reference() {
+        let existing = serde_json::json!({
+            "agentSandbox": {"runner": {
+                "fakeModel": false,
+                "credentialsExistingSecret": "byo-model",
+                "credentialsExistingSecretKey": "agentCredentials"
+            }}
+        });
+        let opts = sealed_upgrade_with_saved_credential(
+            Some(&existing),
+            Some(EXPLICIT_ANTHROPIC_CREDENTIAL),
+            false,
+            vec![],
+        );
+
+        assert_eq!(
+            opts.credentials.as_deref(),
+            Some(EXPLICIT_ANTHROPIC_CREDENTIAL)
+        );
+        assert_eq!(
+            secret_for(&opts, "agentSandbox.runner.credentialsExistingSecret"),
+            Some(""),
+            "an explicit credential replaces the recorded reference family"
+        );
+        assert_saved_credential_absent(&opts);
+    }
+
+    #[test]
+    fn a_saved_credential_is_not_adopted_under_fake_model_or_an_operator_reference() {
+        let fake = sealed_upgrade_with_saved_credential(None, None, true, vec![]);
+        assert_eq!(
+            fake.credentials, None,
+            "--fake-model installs no credential"
+        );
+        assert_saved_credential_absent(&fake);
+
+        let referenced = sealed_upgrade_with_saved_credential(
+            None,
+            None,
+            false,
+            vec!["agentSandbox.runner.credentialsExistingSecret=operator-model".into()],
+        );
+        assert_eq!(
+            referenced.credentials, None,
+            "an operator reference owns the model credential family"
+        );
+        assert_saved_credential_absent(&referenced);
+    }
+
+    #[test]
+    fn diff_treats_retained_runner_families_as_preserved_by_up() {
+        for key in [
+            "agentSandbox.runner.extraEnv",
+            "agentSandbox.runner.extraEnv[0].value",
+            "agentSandbox.runner.extraEnv[1].valueFrom.secretKeyRef.name",
+            "agentSandbox.connectorSecrets",
+            "agentSandbox.connectorSecrets.acme-a.GRAFANA_TOKEN",
+            "api.extraEnv[0].name",
+            "dispatcher.extraEnv[0].value",
+        ] {
+            assert!(is_preserved_by_up(key), "{key} must be preserved by up");
+        }
+    }
+
     #[test]
     fn plain_up_escapes_commas_in_recorded_worker_extra_env_values() {
         let existing = serde_json::json!({
@@ -5483,9 +8152,15 @@ mod tests {
                 }]
             }
         });
-        let opts =
-            complete_up_opts_without_runner_egress(opts(), Some(&existing), None, false, true)
-                .unwrap();
+        let opts = complete_up_opts_without_runner_egress(
+            opts(),
+            Some(&existing),
+            None,
+            false,
+            true,
+            &crate::config_migrate::FactoryMigrationContext::NotRequired,
+        )
+        .unwrap();
 
         assert_eq!(
             up_value_plan(&opts)
@@ -5524,9 +8199,15 @@ mod tests {
                 }
             }
         });
-        let opts =
-            complete_up_opts_without_runner_egress(opts(), Some(&existing), None, false, true)
-                .unwrap();
+        let opts = complete_up_opts_without_runner_egress(
+            opts(),
+            Some(&existing),
+            None,
+            false,
+            true,
+            &crate::config_migrate::FactoryMigrationContext::NotRequired,
+        )
+        .unwrap();
 
         let effective = up_value_plan(&opts).effective_values();
         assert_eq!(
@@ -5607,7 +8288,10 @@ mod tests {
         });
         let opts = complete_up_opts_without_runner_egress(
             UpOpts {
+                file_values: None,
                 retained_mail_values: None,
+                retained_runner_values: None,
+                saved_credentials: None,
                 common: common(),
                 github_token: GithubTokenPlan::Untouched,
                 allow_egress_host: vec![],
@@ -5619,6 +8303,7 @@ mod tests {
                 no_expose: true,
                 set: vec![],
                 set_string: vec![],
+                set_json: vec![],
                 allow_web_egress: vec![],
                 fake_model: false,
                 credentials: None,
@@ -5629,6 +8314,7 @@ mod tests {
             None,
             false,
             true,
+            &crate::config_migrate::FactoryMigrationContext::NotRequired,
         )
         .unwrap();
 
@@ -5664,9 +8350,15 @@ mod tests {
         let existing = serde_json::json!({
             "worker": { "slackTrustedOrigins": "http://host.docker.internal" }
         });
-        let opts =
-            complete_up_opts_without_runner_egress(opts(), Some(&existing), None, false, true)
-                .unwrap();
+        let opts = complete_up_opts_without_runner_egress(
+            opts(),
+            Some(&existing),
+            None,
+            false,
+            true,
+            &crate::config_migrate::FactoryMigrationContext::NotRequired,
+        )
+        .unwrap();
 
         let (materialized, _guards) = up_commands(&opts)[0].materialize_secret_files().unwrap();
         let argv = materialized.argv().join(" ");
@@ -5697,6 +8389,7 @@ mod tests {
             None,
             false,
             true,
+            &crate::config_migrate::FactoryMigrationContext::NotRequired,
         )
         .unwrap();
 
@@ -5729,6 +8422,7 @@ mod tests {
             None,
             false,
             true,
+            &crate::config_migrate::FactoryMigrationContext::NotRequired,
         )
         .unwrap();
 
@@ -5753,9 +8447,15 @@ mod tests {
         let existing = serde_json::json!({
             "worker": { "slackTrustedOrigins": recorded }
         });
-        let opts =
-            complete_up_opts_without_runner_egress(opts(), Some(&existing), None, false, true)
-                .unwrap();
+        let opts = complete_up_opts_without_runner_egress(
+            opts(),
+            Some(&existing),
+            None,
+            false,
+            true,
+            &crate::config_migrate::FactoryMigrationContext::NotRequired,
+        )
+        .unwrap();
 
         assert_eq!(
             up_value_plan(&opts)
@@ -5794,6 +8494,7 @@ mod tests {
                 None,
                 false,
                 true,
+                &crate::config_migrate::FactoryMigrationContext::NotRequired,
             )
             .unwrap();
 
@@ -5913,6 +8614,7 @@ mod tests {
             None,
             false,
             overlay_live,
+            &crate::config_migrate::FactoryMigrationContext::NotRequired,
         )
         .unwrap()
     }
@@ -6759,6 +9461,7 @@ mod tests {
             None,
             false,
             true,
+            &crate::config_migrate::FactoryMigrationContext::NotRequired,
         )
         .unwrap()
     }
@@ -6863,7 +9566,15 @@ mod tests {
         opts.dev = false;
         opts.secrets = vec![];
         opts.set = set;
-        complete_up_opts_without_runner_egress(opts, existing, None, false, true).unwrap()
+        complete_up_opts_without_runner_egress(
+            opts,
+            existing,
+            None,
+            false,
+            true,
+            &crate::config_migrate::FactoryMigrationContext::NotRequired,
+        )
+        .unwrap()
     }
 
     /// ADR-0168 decision 7, through the wiring rather than the helper: a sealed
@@ -6941,6 +9652,7 @@ mod tests {
                     None,
                     false,
                     true,
+                    &crate::config_migrate::FactoryMigrationContext::NotRequired,
                 ) else {
                     panic!("half a caller key pair must be refused: {half} dev={dev}");
                 };
@@ -8094,6 +10806,110 @@ mod tests {
             "the conflict guard matches the key trimmed on both ends"
         );
     }
+
+    #[test]
+    fn namespace_manifest_carries_pod_security_labels_and_ownership_labels() {
+        let bytes = namespace_manifest("curie-ns", "curie-rel").expect("manifest serializes");
+        let doc: serde_json::Value = serde_json::from_slice(&bytes).expect("manifest is JSON");
+        let labels = &doc["metadata"]["labels"];
+        assert_eq!(
+            labels["pod-security.kubernetes.io/enforce"], "baseline",
+            "the release namespace enforces baseline"
+        );
+        assert_eq!(
+            labels["pod-security.kubernetes.io/warn"], "restricted",
+            "the release namespace warns on restricted violations"
+        );
+        assert_eq!(
+            labels["pod-security.kubernetes.io/audit"], "restricted",
+            "the release namespace audits restricted violations"
+        );
+        // Liveness: the ownership labels the `down` sweep keys on survive.
+        assert_eq!(labels[CREATED_BY_LABEL], "curie-rel");
+        assert_eq!(labels[CREATED_IN_LABEL], "curie-ns");
+    }
+
+    #[test]
+    fn cluster_up_foreign_label_refusal_keeps_adopt_and_omits_metadata_name() {
+        let mut labels = BTreeMap::new();
+        labels.insert("foo".to_string(), "bar".to_string());
+        labels.insert(METADATA_NAME_LABEL.to_string(), "acme-dev".to_string());
+        let keys = reported_foreign_label_keys(&labels, "acme-dev");
+        let hint = adoption_hint(
+            NamespaceHintAudience::ClusterUp,
+            "acme-dev",
+            Some("scratch-cluster"),
+            Some(&keys),
+        );
+        let message = foreign_labels_message("acme-dev", &keys, &hint);
+        assert_eq!(keys, vec!["foo".to_string()]);
+        assert!(message.contains("foreign labels (foo)"), "{message}");
+        assert!(message.contains("--adopt"), "{message}");
+        assert!(!message.contains(METADATA_NAME_LABEL), "{message}");
+        assert!(!message.contains("label namespace"), "{message}");
+    }
+
+    #[test]
+    fn quickstart_foreign_label_refusal_names_removal_and_another_namespace() {
+        let keys = vec!["foo".to_string()];
+        let hint = adoption_hint(
+            NamespaceHintAudience::Quickstart,
+            "acme-dev",
+            Some("scratch-cluster"),
+            Some(&keys),
+        );
+        let message = foreign_labels_message("acme-dev", &keys, &hint);
+        assert!(
+            message.contains("kubectl --context scratch-cluster label namespace acme-dev foo-"),
+            "{message}"
+        );
+        assert!(message.contains("--namespace"), "{message}");
+        assert!(!message.contains("--adopt"), "{message}");
+    }
+
+    #[test]
+    fn quickstart_ownership_and_contents_refusals_name_another_namespace_only() {
+        let ownership = adoption_hint(
+            NamespaceHintAudience::Quickstart,
+            "acme-dev",
+            Some("scratch-cluster"),
+            None,
+        );
+        let contents = adoption_hint(
+            NamespaceHintAudience::Quickstart,
+            "acme-dev",
+            Some("scratch-cluster"),
+            None,
+        );
+        assert_eq!(ownership, "; rerun with a different --namespace");
+        assert_eq!(contents, ownership);
+        assert!(!ownership.contains("--adopt"));
+        assert!(!ownership.contains("label namespace"));
+        assert_eq!(
+            adoption_hint(
+                NamespaceHintAudience::ClusterUp,
+                "acme-dev",
+                Some("scratch-cluster"),
+                None,
+            ),
+            ADOPT_HINT
+        );
+    }
+
+    #[test]
+    fn a_namespace_whose_only_label_is_its_metadata_name_stays_adoptable() {
+        let mut labels = BTreeMap::new();
+        labels.insert(METADATA_NAME_LABEL.to_string(), "acme-dev".to_string());
+        assert!(labels_allow_empty_adoption(&labels, "acme-dev"));
+        assert!(reported_foreign_label_keys(&labels, "acme-dev").is_empty());
+        let mut mismatched = labels.clone();
+        mismatched.insert(METADATA_NAME_LABEL.to_string(), "other".to_string());
+        assert!(!labels_allow_empty_adoption(&mismatched, "acme-dev"));
+        assert_eq!(
+            reported_foreign_label_keys(&mismatched, "acme-dev"),
+            vec![METADATA_NAME_LABEL.to_string()]
+        );
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -8143,8 +10959,403 @@ fn should_discard_failed_gvisor_install(history: &[HelmRevision], recorded_only:
     history_has_no_known_good_revision(history)
 }
 
+#[derive(Debug, Clone)]
+struct FailedFirstRevisionDataPvc {
+    name: String,
+    uid: String,
+}
+
+#[derive(Debug)]
+struct FailedFirstRevisionDataPvcPlan {
+    claims: Vec<FailedFirstRevisionDataPvc>,
+    kept: Vec<(String, String)>,
+    delete: Option<OpsCommand>,
+    uninstall: Option<OpsCommand>,
+}
+
+#[derive(Debug)]
+enum FailedFirstRevisionCleanupAction {
+    Delete(OpsCommand),
+    Uninstall(OpsCommand),
+    WaitForPvcs { deadline: Duration },
+    Reinstall,
+}
+
+impl FailedFirstRevisionDataPvcPlan {
+    fn first_action(&self) -> FailedFirstRevisionCleanupAction {
+        if let Some(command) = &self.delete {
+            FailedFirstRevisionCleanupAction::Delete(command.clone())
+        } else if let Some(command) = &self.uninstall {
+            FailedFirstRevisionCleanupAction::Uninstall(command.clone())
+        } else {
+            FailedFirstRevisionCleanupAction::Reinstall
+        }
+    }
+
+    fn claim_names(&self) -> String {
+        self.claims
+            .iter()
+            .map(|claim| claim.name.as_str())
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+}
+
+fn failed_first_revision_inventory(
+    input: std::result::Result<&str, &str>,
+    resource: &str,
+) -> Result<Vec<serde_json::Value>> {
+    let json = input.map_err(|error| anyhow::anyhow!("could not read {resource}: {error}"))?;
+    let list: serde_json::Value =
+        serde_json::from_str(json).with_context(|| format!("malformed {resource} inventory"))?;
+    list.get("items")
+        .and_then(serde_json::Value::as_array)
+        .cloned()
+        .with_context(|| format!("{resource} inventory has no items array"))
+}
+
+struct FailedFirstRevisionClaimTemplate {
+    prefix: String,
+    component: String,
+    start: u64,
+    end: u64,
+}
+
+impl FailedFirstRevisionClaimTemplate {
+    fn matches(&self, name: &str, component: &str) -> bool {
+        if component != self.component {
+            return false;
+        }
+        let Some(suffix) = name.strip_prefix(&self.prefix) else {
+            return false;
+        };
+        let Ok(ordinal) = suffix.parse::<u64>() else {
+            return false;
+        };
+        (self.start..self.end).contains(&ordinal) && suffix == ordinal.to_string()
+    }
+}
+
+fn failed_first_revision_claim_templates(
+    common: &CommonOpts,
+    statefulsets: &[serde_json::Value],
+) -> Result<Vec<FailedFirstRevisionClaimTemplate>> {
+    let mut templates = Vec::new();
+    for statefulset in statefulsets {
+        let metadata = &statefulset["metadata"];
+        if metadata["namespace"].as_str() != Some(common.namespace.as_str())
+            || metadata["labels"]["app.kubernetes.io/managed-by"].as_str() != Some("Helm")
+            || metadata["annotations"]["meta.helm.sh/release-name"].as_str()
+                != Some(common.release.as_str())
+            || metadata["annotations"]["meta.helm.sh/release-namespace"].as_str()
+                != Some(common.namespace.as_str())
+        {
+            continue;
+        }
+        let name = metadata["name"]
+            .as_str()
+            .filter(|name| !name.is_empty())
+            .context("installed StatefulSet has no name")?;
+        let selector = &statefulset["spec"]["selector"]["matchLabels"];
+        let instance = selector["app.kubernetes.io/instance"]
+            .as_str()
+            .with_context(|| format!("StatefulSet {name} has no release selector"))?;
+        let component = selector["app.kubernetes.io/component"]
+            .as_str()
+            .with_context(|| format!("StatefulSet {name} has no component selector"))?;
+        if instance != common.release
+            || !matches!(component, "postgres" | "clickhouse" | "rustfs" | "valkey")
+        {
+            continue;
+        }
+        let spec = &statefulset["spec"];
+        let replicas = spec["replicas"]
+            .as_u64()
+            .filter(|replicas| *replicas <= i32::MAX as u64)
+            .with_context(|| format!("StatefulSet {name} has malformed replicas"))?;
+        let start = match spec.get("ordinals") {
+            None => 0,
+            Some(ordinals) => {
+                let ordinals = ordinals
+                    .as_object()
+                    .with_context(|| format!("StatefulSet {name} has malformed ordinals"))?;
+                match ordinals.get("start") {
+                    None => 0,
+                    Some(start) => start
+                        .as_u64()
+                        .filter(|start| *start <= i32::MAX as u64)
+                        .with_context(|| {
+                            format!("StatefulSet {name} has malformed ordinal start")
+                        })?,
+                }
+            }
+        };
+        let end = start
+            .checked_add(replicas)
+            .with_context(|| format!("StatefulSet {name} ordinal range overflows"))?;
+        let Some(claim_templates) = spec.get("volumeClaimTemplates") else {
+            continue;
+        };
+        for template in claim_templates
+            .as_array()
+            .with_context(|| format!("StatefulSet {name} has malformed volumeClaimTemplates"))?
+        {
+            let template_name = template["metadata"]["name"]
+                .as_str()
+                .filter(|name| !name.is_empty())
+                .with_context(|| {
+                    format!("StatefulSet {name} has a claim template without a name")
+                })?;
+            templates.push(FailedFirstRevisionClaimTemplate {
+                prefix: format!("{template_name}-{name}-"),
+                component: component.to_string(),
+                start,
+                end,
+            });
+        }
+    }
+    Ok(templates)
+}
+
+fn plan_failed_first_revision_data_pvcs(
+    common: &CommonOpts,
+    history: &[HelmRevision],
+    recorded_only: bool,
+    anchor: std::result::Result<&str, &str>,
+    statefulsets: std::result::Result<&str, &str>,
+    pvcs: std::result::Result<&str, &str>,
+) -> Result<FailedFirstRevisionDataPvcPlan> {
+    let mut plan = FailedFirstRevisionDataPvcPlan {
+        claims: Vec::new(),
+        kept: Vec::new(),
+        delete: None,
+        uninstall: should_discard_failed_gvisor_install(history, recorded_only).then(|| {
+            OpsCommand::new(
+                "helm",
+                vec![
+                    plain("uninstall"),
+                    plain(&common.release),
+                    plain("-n"),
+                    plain(&common.namespace),
+                    plain("--wait"),
+                    plain("--timeout"),
+                    plain("60s"),
+                ],
+            )
+        }),
+    };
+    if !history_is_failed_only(history) {
+        return Ok(plan);
+    }
+
+    let candidates = failed_first_revision_inventory(pvcs, "PVCs")?;
+    let names = candidates
+        .iter()
+        .map(|claim| {
+            claim["metadata"]["name"]
+                .as_str()
+                .filter(|name| !name.is_empty())
+                .context("PVC inventory contains a claim without a name")
+        })
+        .collect::<Result<Vec<_>>>()?
+        .join(", ");
+    (|| -> Result<()> {
+        let statefulsets = failed_first_revision_inventory(statefulsets, "StatefulSets")?;
+        let templates = failed_first_revision_claim_templates(common, &statefulsets)?;
+        anyhow::ensure!(
+            history.iter().any(|revision| revision.revision == 1),
+            "Helm history is missing revision 1"
+        );
+        let anchor = anchor
+            .map_err(|error| anyhow::anyhow!("could not read revision 1 Helm Secret: {error}"))?;
+        let anchor: serde_json::Value =
+            serde_json::from_str(anchor).context("malformed revision 1 Helm Secret")?;
+        let anchor_name = format!("sh.helm.release.v1.{}.v1", common.release);
+        let metadata = &anchor["metadata"];
+        anyhow::ensure!(
+            anchor["kind"].as_str() == Some("Secret")
+                && anchor["type"].as_str() == Some("helm.sh/release.v1")
+                && metadata["name"].as_str() == Some(anchor_name.as_str())
+                && metadata["namespace"].as_str() == Some(common.namespace.as_str())
+                && metadata["labels"]["owner"].as_str() == Some("helm")
+                && metadata["labels"]["name"].as_str() == Some(common.release.as_str())
+                && metadata["labels"]["version"].as_str() == Some("1"),
+            "revision 1 Helm Secret identity or storage driver does not match this release"
+        );
+        let timestamp = metadata["creationTimestamp"]
+            .as_str()
+            .context("revision 1 Helm Secret creation timestamp is missing or malformed")?;
+        let anchor_time = time::OffsetDateTime::parse(
+            timestamp,
+            &time::format_description::well_known::Rfc3339,
+        )
+        .context("revision 1 Helm Secret creation timestamp is malformed")?;
+
+        for claim in &candidates {
+            let metadata = &claim["metadata"];
+            let name = metadata["name"].as_str().context("PVC name is missing")?;
+            let component = metadata["labels"]["app.kubernetes.io/component"].as_str();
+            let reason = if metadata["namespace"].as_str() != Some(common.namespace.as_str()) {
+                Some("claim is outside the release namespace")
+            } else if metadata["labels"]["app.kubernetes.io/instance"].as_str()
+                != Some(common.release.as_str())
+            {
+                Some("claim does not carry this release's instance label")
+            } else if !matches!(component, Some("postgres" | "clickhouse" | "rustfs" | "valkey")) {
+                Some("claim does not carry a data-store component label")
+            } else if !component.is_some_and(|component| {
+                templates
+                    .iter()
+                    .any(|template| template.matches(name, component))
+            }) {
+                Some("claim does not match an installed Helm-owned StatefulSet claim template and ordinal")
+            } else {
+                None
+            };
+            if let Some(reason) = reason {
+                plan.kept.push((name.to_string(), reason.to_string()));
+                continue;
+            }
+            let timestamp = metadata["creationTimestamp"]
+                .as_str()
+                .with_context(|| format!("PVC {name} creation timestamp is missing or malformed"))?;
+            let created = time::OffsetDateTime::parse(
+                timestamp,
+                &time::format_description::well_known::Rfc3339,
+            )
+            .with_context(|| format!("PVC {name} creation timestamp is malformed"))?;
+            anyhow::ensure!(
+                created > anchor_time,
+                "PVC {name} creation timestamp is not strictly later than the revision 1 Helm Secret timestamp"
+            );
+            let uid = metadata["uid"]
+                .as_str()
+                .filter(|uid| !uid.is_empty())
+                .with_context(|| format!("PVC {name} UID is missing or malformed"))?;
+            plan.claims.push(FailedFirstRevisionDataPvc {
+                name: name.to_string(),
+                uid: uid.to_string(),
+            });
+        }
+        Ok(())
+    })()
+    .with_context(|| {
+        format!("refusing to discard failed first revision; retained PVCs [{names}]; provenance check failed")
+    })?;
+
+    plan.claims
+        .sort_by(|left, right| left.name.cmp(&right.name));
+    if !plan.claims.is_empty() {
+        let mut args = vec![plain("delete"), plain("pvc")];
+        args.extend(plan.claims.iter().map(|claim| plain(&claim.name)));
+        args.extend([plain("-n"), plain(&common.namespace), plain("--wait=false")]);
+        plan.delete = Some(OpsCommand::new("kubectl", args));
+    }
+    Ok(plan)
+}
+
+fn failed_first_revision_cleanup_transition(
+    plan: &FailedFirstRevisionDataPvcPlan,
+    action: &FailedFirstRevisionCleanupAction,
+    observation: std::result::Result<&str, &str>,
+    now: Duration,
+) -> Result<FailedFirstRevisionCleanupAction> {
+    use FailedFirstRevisionCleanupAction::*;
+    let output = observation.map_err(|error| {
+        anyhow::anyhow!(
+            "failed first revision cleanup stopped for PVCs [{}]: {error}",
+            plan.claim_names()
+        )
+    })?;
+    match action {
+        Delete(_) => {
+            Ok(Uninstall(plan.uninstall.clone().context(
+                "PVC deletion plan has no Helm uninstall command",
+            )?))
+        }
+        Uninstall(_) if plan.claims.is_empty() => Ok(Reinstall),
+        Uninstall(_) => Ok(WaitForPvcs {
+            deadline: now + Duration::from_secs(60),
+        }),
+        WaitForPvcs { deadline } => {
+            let pvcs = failed_first_revision_inventory(Ok(output), "PVCs").with_context(|| {
+                format!(
+                    "could not confirm deletion of PVCs [{}]",
+                    plan.claim_names()
+                )
+            })?;
+            let uids = pvcs
+                .iter()
+                .map(|claim| {
+                    claim["metadata"]["uid"]
+                        .as_str()
+                        .filter(|uid| !uid.is_empty())
+                        .context("PVC deletion observation contains a missing or malformed UID")
+                })
+                .collect::<Result<BTreeSet<_>>>()
+                .with_context(|| {
+                    format!(
+                        "could not confirm deletion of PVCs [{}]",
+                        plan.claim_names()
+                    )
+                })?;
+            let remaining = plan
+                .claims
+                .iter()
+                .filter(|claim| uids.contains(claim.uid.as_str()))
+                .map(|claim| claim.name.as_str())
+                .collect::<Vec<_>>();
+            if remaining.is_empty() {
+                return Ok(Reinstall);
+            }
+            anyhow::ensure!(
+                now < *deadline,
+                "timed out after 60 seconds waiting for failed first revision PVCs: {}",
+                remaining.join(", ")
+            );
+            Ok(WaitForPvcs {
+                deadline: *deadline,
+            })
+        }
+        Reinstall => Ok(Reinstall),
+    }
+}
+
+fn failed_first_revision_get_command(
+    common: &CommonOpts,
+    resource: &str,
+    name: Option<&str>,
+    selector: Option<&str>,
+) -> OpsCommand {
+    let mut args = vec![plain("get"), plain(resource)];
+    if let Some(name) = name {
+        args.push(plain(name));
+    }
+    args.extend([
+        plain("-n"),
+        plain(&common.namespace),
+        plain("-o"),
+        plain("json"),
+    ]);
+    if let Some(selector) = selector {
+        args.extend([plain("-l"), plain(selector)]);
+    }
+    OpsCommand::new("kubectl", args)
+}
+
+async fn failed_first_revision_read(command: &OpsCommand) -> std::result::Result<String, String> {
+    crate::ui::ui().plumbing(&format!("+ {}", command.display()));
+    match run_capture(command).await {
+        Ok((true, output, _)) => Ok(output),
+        Ok((false, _, error)) => Err(format!("{} failed: {}", command.display(), error.trim())),
+        Err(error) => Err(format!("{error:#}")),
+    }
+}
+
 /// Remove a never-deployed failed revision so the next Helm command is a
 /// clean install (#2347, #2856).
+/// Data PVC cleanup requires proven first-revision provenance; otherwise,
+/// cleanup is refused.
 ///
 /// `recorded_only` is true for a later `apply` / `cluster up` against whatever
 /// Helm already recorded: an empty history is a fresh install. The Detect
@@ -8209,42 +11420,167 @@ async fn discard_failed_gvisor_install_if_never_deployed(
         return Ok(());
     }
 
-    let uninstall = OpsCommand::new(
-        "helm",
-        vec![
-            plain("uninstall"),
-            plain(&common.release),
-            plain("-n"),
-            plain(&common.namespace),
-            plain("--wait"),
-            plain("--timeout"),
-            plain("60s"),
-        ],
-    );
-    ui.plumbing(&format!("+ {}", uninstall.display()));
-    let step = cl.step("discarding failed Helm revision");
-    let (ok, out, err) = run_capture(&uninstall).await?;
-    for line in out.lines().chain(err.lines()) {
-        ui.plumbing(line);
-    }
-    if ok {
-        step.done("removed");
-        Ok(())
-    } else if err.contains("not found") || out.contains("not found") {
-        step.done("already absent");
-        Ok(())
-    } else {
-        step.fail("failed");
-        Err(crate::exit::CliError::failure(format!(
-            "helm uninstall of the failed first revision failed: {}",
-            err.trim()
+    let mut anchor = Err("Helm history does not authorize PVC inspection".to_string());
+    let mut statefulsets = anchor.clone();
+    let mut pvcs = anchor.clone();
+    if history_is_failed_only(&history) {
+        let selector = format!(
+            "app.kubernetes.io/instance={},app.kubernetes.io/component in (postgres,clickhouse,rustfs,valkey)",
+            common.release
+        );
+        pvcs = failed_first_revision_read(&failed_first_revision_get_command(
+            common,
+            "pvc",
+            None,
+            Some(&selector),
         ))
-        .with_fix(format!(
-            "curie cluster down --yes --namespace {} --release {}",
-            common.namespace, common.release
+        .await;
+        statefulsets = failed_first_revision_read(&failed_first_revision_get_command(
+            common,
+            "statefulset",
+            None,
+            None,
         ))
-        .into())
+        .await;
+        anchor = failed_first_revision_read(&failed_first_revision_get_command(
+            common,
+            "secret",
+            Some(&format!("sh.helm.release.v1.{}.v1", common.release)),
+            None,
+        ))
+        .await;
     }
+    let plan = plan_failed_first_revision_data_pvcs(
+        common,
+        &history,
+        recorded_only,
+        anchor.as_deref().map_err(String::as_str),
+        statefulsets.as_deref().map_err(String::as_str),
+        pvcs.as_deref().map_err(String::as_str),
+    )
+    .map_err(|error| {
+        let fix = format!(
+            "inspect the retained PVCs and revision 1 Helm Secret for release {} in namespace {} before retrying",
+            common.release, common.namespace
+        );
+        crate::exit::CliError::failure(format!("{error:#}; {fix}")).with_fix(fix)
+    })?;
+    for (name, reason) in &plan.kept {
+        ui.note(&format!("keeping PVC {name}: {reason}"));
+    }
+    let data_step = plan.delete.as_ref().map(|_| {
+        cl.step(&format!(
+            "removing data volumes of the failed first revision: {}",
+            plan.claim_names()
+        ))
+    });
+    let started = tokio::time::Instant::now();
+    let mut action = plan.first_action();
+    let mut last_snapshot = pvcs;
+    let result: Result<()> = async {
+        loop {
+            let next = match &action {
+                FailedFirstRevisionCleanupAction::Delete(command)
+                | FailedFirstRevisionCleanupAction::Uninstall(command) => {
+                    let uninstall =
+                        matches!(action, FailedFirstRevisionCleanupAction::Uninstall(_));
+                    let step = uninstall.then(|| cl.step("discarding failed Helm revision"));
+                    ui.plumbing(&format!("+ {}", command.display()));
+                    let observation = match run_capture(command).await {
+                        Ok((ok, out, err)) => {
+                            for line in out.lines().chain(err.lines()) {
+                                ui.plumbing(line);
+                            }
+                            let absent = uninstall
+                                && (err.contains("not found") || out.contains("not found"));
+                            if let Some(step) = step {
+                                if ok || absent {
+                                    step.done(if absent { "already absent" } else { "removed" });
+                                } else {
+                                    step.fail("failed");
+                                }
+                            }
+                            if ok || absent {
+                                Ok(out)
+                            } else {
+                                Err(format!("{} failed: {}", command.display(), err.trim()))
+                            }
+                        }
+                        Err(error) => {
+                            if let Some(step) = step {
+                                step.fail("failed");
+                            }
+                            Err(format!("{error:#}"))
+                        }
+                    };
+                    failed_first_revision_cleanup_transition(
+                        &plan,
+                        &action,
+                        observation.as_deref().map_err(String::as_str),
+                        started.elapsed(),
+                    )?
+                }
+                FailedFirstRevisionCleanupAction::WaitForPvcs { deadline } => {
+                    let command = failed_first_revision_get_command(common, "pvc", None, None);
+                    let observation = if started.elapsed() >= *deadline {
+                        None
+                    } else {
+                        tokio::time::timeout_at(
+                            started + *deadline,
+                            failed_first_revision_read(&command),
+                        )
+                        .await
+                        .ok()
+                    };
+                    let next = if let Some(observation) = observation {
+                        let next = failed_first_revision_cleanup_transition(
+                            &plan,
+                            &action,
+                            observation.as_deref().map_err(String::as_str),
+                            started.elapsed(),
+                        )?;
+                        last_snapshot = observation;
+                        next
+                    } else {
+                        failed_first_revision_cleanup_transition(
+                            &plan,
+                            &action,
+                            last_snapshot.as_deref().map_err(String::as_str),
+                            started.elapsed(),
+                        )?
+                    };
+                    if let FailedFirstRevisionCleanupAction::WaitForPvcs { deadline } = &next {
+                        tokio::time::sleep(
+                            deadline
+                                .saturating_sub(started.elapsed())
+                                .min(Duration::from_secs(1)),
+                        )
+                        .await;
+                    }
+                    next
+                }
+                FailedFirstRevisionCleanupAction::Reinstall => return Ok(()),
+            };
+            action = next;
+        }
+    }
+    .await;
+    if let Some(step) = data_step {
+        if result.is_ok() {
+            step.done("removed");
+        } else {
+            step.fail("failed");
+        }
+    }
+    result.map_err(|error| {
+        let fix = format!(
+            "inspect Helm history and PVC deletion state for release {} in namespace {}; correct the reported cleanup failure before retrying, preserving Helm history and retained PVCs",
+            common.release, common.namespace
+        );
+        crate::exit::CliError::failure(format!("{error:#}; {fix}"))
+            .with_fix(fix)
+            .into()
+    })
 }
 
 pub(crate) async fn namespace_probe(namespace: &str) -> Result<NamespaceProbe> {
@@ -8291,6 +11627,69 @@ fn adoption_timestamp() -> Result<String> {
     time::OffsetDateTime::now_utc()
         .format(&time::format_description::well_known::Rfc3339)
         .context("formatting the adoption timestamp")
+}
+
+#[derive(Clone, Copy)]
+enum NamespaceHintAudience {
+    ClusterUp,
+    Quickstart,
+}
+
+fn namespace_hint_audience() -> NamespaceHintAudience {
+    match std::env::var(QUICKSTART_NAMESPACE_HINT_ENV) {
+        Ok(value) if value == "1" => NamespaceHintAudience::Quickstart,
+        _ => NamespaceHintAudience::ClusterUp,
+    }
+}
+
+fn reported_foreign_label_keys(labels: &BTreeMap<String, String>, namespace: &str) -> Vec<String> {
+    labels
+        .iter()
+        .filter(|(key, value)| {
+            !(key.as_str() == METADATA_NAME_LABEL && value.as_str() == namespace)
+        })
+        .map(|(key, _)| key.clone())
+        .collect()
+}
+
+fn kubectl_unlabel(context: Option<&str>, namespace: &str, keys: &[String]) -> String {
+    let mut parts = vec!["kubectl".to_string()];
+    if let Some(context) = context.filter(|context| !context.is_empty()) {
+        parts.push("--context".to_string());
+        parts.push(shell_quote(context));
+    }
+    parts.push("label".to_string());
+    parts.push("namespace".to_string());
+    parts.push(shell_quote(namespace));
+    for key in keys {
+        parts.push(shell_quote(&format!("{key}-")));
+    }
+    parts.join(" ")
+}
+
+fn adoption_hint(
+    audience: NamespaceHintAudience,
+    namespace: &str,
+    context: Option<&str>,
+    keys: Option<&[String]>,
+) -> String {
+    match audience {
+        NamespaceHintAudience::ClusterUp => ADOPT_HINT.to_string(),
+        NamespaceHintAudience::Quickstart => match keys {
+            Some(keys) => format!(
+                "; remove it with `{}`, or rerun with a different --namespace",
+                kubectl_unlabel(context, namespace, keys)
+            ),
+            None => "; rerun with a different --namespace".to_string(),
+        },
+    }
+}
+
+fn foreign_labels_message(namespace: &str, keys: &[String], hint: &str) -> String {
+    format!(
+        "namespace `{namespace}` has foreign labels ({}) and cannot be adopted{hint}",
+        keys.join(", ")
+    )
 }
 
 fn announce_adoption_override(namespace: &str, taken: &AdoptionOverride) {
@@ -8349,11 +11748,16 @@ async fn establish_primary_namespace_ownership(o: &CommonOpts, adopt: bool) -> R
             {
                 return Ok(());
             }
+            let audience = namespace_hint_audience();
+            let context = std::env::var("HELM_KUBECONTEXT")
+                .ok()
+                .filter(|value| !value.is_empty());
             if (created_by.is_some() || created_in.is_some()) && !adopt {
                 let by = created_by.map(String::as_str).unwrap_or("<missing>");
                 let install = created_in.map(String::as_str).unwrap_or("<missing>");
+                let hint = adoption_hint(audience, &o.namespace, context.as_deref(), None);
                 bail!(
-                    "namespace `{}` has incomplete or foreign ownership labels: {CREATED_BY_LABEL}={by}, {CREATED_IN_LABEL}={install}; refusing to mutate it{ADOPT_HINT}",
+                    "namespace `{}` has incomplete or foreign ownership labels: {CREATED_BY_LABEL}={by}, {CREATED_IN_LABEL}={install}; refusing to mutate it{hint}",
                     o.namespace
                 );
             }
@@ -8364,18 +11768,25 @@ async fn establish_primary_namespace_ownership(o: &CommonOpts, adopt: bool) -> R
                 );
             }
             let foreign_labels = !labels_allow_empty_adoption(&record.labels, &o.namespace);
+            let foreign_keys = reported_foreign_label_keys(&record.labels, &o.namespace);
             if foreign_labels && !adopt {
-                let keys = record.labels.keys().cloned().collect::<Vec<_>>().join(", ");
+                let hint = adoption_hint(
+                    audience,
+                    &o.namespace,
+                    context.as_deref(),
+                    Some(&foreign_keys),
+                );
                 bail!(
-                    "namespace `{}` has foreign labels ({keys}) and cannot be adopted{ADOPT_HINT}",
-                    o.namespace
+                    "{}",
+                    foreign_labels_message(&o.namespace, &foreign_keys, &hint)
                 );
             }
             let contents = namespace_foreign_contents(&o.namespace).await?;
             if let Some(detail) = &contents {
                 if !adopt {
+                    let hint = adoption_hint(audience, &o.namespace, context.as_deref(), None);
                     bail!(
-                        "namespace `{}` contains non-default objects and cannot be adopted: {detail}{ADOPT_HINT}",
+                        "namespace `{}` contains non-default objects and cannot be adopted: {detail}{hint}",
                         o.namespace
                     );
                 }
@@ -8465,7 +11876,7 @@ fn namespace_create_cmd() -> OpsCommand {
     OpsCommand::new("kubectl", vec![plain("create"), plain("-f"), plain("-")])
 }
 
-fn namespace_inventory_cmd(namespace: &str, resource: &str) -> OpsCommand {
+pub(crate) fn namespace_inventory_cmd(namespace: &str, resource: &str) -> OpsCommand {
     OpsCommand::new(
         "kubectl",
         vec![
@@ -8480,12 +11891,20 @@ fn namespace_inventory_cmd(namespace: &str, resource: &str) -> OpsCommand {
 }
 
 fn namespace_manifest(namespace: &str, release: &str) -> Result<Vec<u8>> {
+    let mut labels = ownership_labels(release, namespace);
+    // Every chart workload passes `baseline`, so it is enforced. Several
+    // (clickhouse, postgres, valkey, some Jobs, the prewarm DaemonSet) still
+    // fail `restricted`, so that level is warn and audit only: it surfaces
+    // violations without rejecting pods.
+    labels["pod-security.kubernetes.io/enforce"] = "baseline".into();
+    labels["pod-security.kubernetes.io/warn"] = "restricted".into();
+    labels["pod-security.kubernetes.io/audit"] = "restricted".into();
     serde_json::to_vec(&serde_json::json!({
         "apiVersion": "v1",
         "kind": "Namespace",
         "metadata": {
             "name": namespace,
-            "labels": ownership_labels(release, namespace),
+            "labels": labels,
         },
     }))
     .context("serializing the owned Namespace manifest")
@@ -8541,7 +11960,7 @@ fn parse_namespace_probe(namespace: &str, output: &str) -> Result<NamespaceProbe
     }))
 }
 
-fn namespaced_resources_cmd() -> OpsCommand {
+pub(crate) fn namespaced_resources_cmd() -> OpsCommand {
     OpsCommand::new(
         "kubectl",
         vec![
@@ -8686,10 +12105,7 @@ fn is_root_ca_config_map(item: &serde_json::Value, namespace: &str) -> bool {
 fn labels_allow_empty_adoption(labels: &BTreeMap<String, String>, namespace: &str) -> bool {
     labels.is_empty()
         || (labels.len() == 1
-            && labels
-                .get("kubernetes.io/metadata.name")
-                .map(String::as_str)
-                == Some(namespace))
+            && labels.get(METADATA_NAME_LABEL).map(String::as_str) == Some(namespace))
 }
 
 async fn namespace_foreign_contents(namespace: &str) -> Result<Option<String>> {
@@ -9078,4 +12494,131 @@ fn effective_existing_secret(
         return !value.is_empty();
     }
     preserved_value(existing, &reference).is_some()
+}
+
+/// @spec CLUSTER-VALUES-FILES c1-c4
+fn file_set_args(opts: &UpOpts) -> Vec<CmdArg> {
+    opts.set
+        .iter()
+        .map(|expression| {
+            if let Some(typed) = typed_empty_worker_map_override(expression) {
+                [plain("--set-json"), CmdArg::HelmSetExpression(typed)]
+            } else {
+                [
+                    plain("--set"),
+                    CmdArg::HelmSetExpression(expression.clone()),
+                ]
+            }
+        })
+        .chain(opts.set_string.iter().map(|expression| {
+            [
+                plain("--set-string"),
+                CmdArg::HelmSetExpression(expression.clone()),
+            ]
+        }))
+        .flatten()
+        .collect()
+}
+
+/// @spec CLUSTER-VALUES-FILES c1-c3
+fn apply_flags_to_file_values(opts: &mut UpOpts, github_token: Option<&str>, clear: bool) {
+    let Some(values) = &mut opts.file_values else {
+        return;
+    };
+    let mut changes = Vec::new();
+    if opts.model.is_some() {
+        changes.push((RUNNER_MODEL_KEY.to_string(), None));
+    }
+    if clear || github_token.is_some_and(|value| !value.is_empty()) {
+        changes.push((GITHUB_TOKEN_KEY.to_string(), None));
+        changes.extend(
+            GITHUB_TOKEN_REFERENCE_KEYS
+                .iter()
+                .map(|key| ((*key).to_string(), Some(serde_json::json!("")))),
+        );
+    }
+    if opts.credentials.is_some() || opts.local_model.is_some() {
+        changes.push((MODEL_CREDENTIAL_KEY.to_string(), None));
+        changes.extend(
+            MODEL_CREDENTIAL_REFERENCE_KEYS
+                .iter()
+                .map(|key| ((*key).to_string(), Some(serde_json::json!("")))),
+        );
+    }
+    if opts.fake_model {
+        changes.push((FAKE_MODEL_KEY.to_string(), Some(serde_json::json!(true))));
+    }
+    if opts.no_expose {
+        for key in ["ui.service.type", "langfuse.web.service.type"] {
+            changes.push((key.to_string(), Some(serde_json::json!("ClusterIP"))));
+        }
+    }
+    for (key, replacement) in changes {
+        // These managed key paths are fixed chart paths, never file-authored
+        // dotted map keys. Leave absent file keys to existing completion.
+        let Some((parent, leaf)) = key.rsplit_once('.') else {
+            continue;
+        };
+        let pointer = format!("/{}", parent.replace('.', "/"));
+        let Some(object) = values
+            .0
+            .pointer_mut(&pointer)
+            .and_then(serde_json::Value::as_object_mut)
+        else {
+            continue;
+        };
+        if !object.contains_key(leaf) {
+            continue;
+        }
+        if let Some(replacement) = replacement {
+            object.insert(leaf.to_string(), replacement);
+        } else {
+            object.remove(leaf);
+        }
+    }
+    values.1.clear();
+    flatten_file_values(&values.0, "", &mut values.1);
+}
+
+/// @spec CLUSTER-VALUES-FILES c1-c4
+pub async fn load_values_files(files: &[std::path::PathBuf]) -> Result<Option<PrivateHelmValues>> {
+    if files.is_empty() {
+        return Ok(None);
+    }
+    let parsed = super::lint_values::pending_values(files).await?;
+    // Admission belongs after dedicated flags and typed --set overlays.
+    let document = parsed;
+    let mut flattened = BTreeMap::new();
+    flatten_file_values(&document, "", &mut flattened);
+    Ok(Some(PrivateHelmValues(document, flattened)))
+}
+
+/// @spec CLUSTER-VALUES-FILES c2-c3
+fn flatten_file_values(
+    value: &serde_json::Value,
+    prefix: &str,
+    out: &mut BTreeMap<String, String>,
+) {
+    match value {
+        serde_json::Value::Object(map) if !map.is_empty() => {
+            for (key, child) in map {
+                flatten_file_values(child, &join_escaped_helm_set_path(prefix, key), out);
+            }
+        }
+        serde_json::Value::Array(items) => {
+            out.insert(prefix.into(), value.to_string());
+            for (index, child) in items.iter().enumerate() {
+                flatten_file_values(child, &format!("{prefix}[{index}]"), out);
+            }
+        }
+        scalar => {
+            out.insert(
+                prefix.into(),
+                scalar
+                    .as_str()
+                    .map(str::to_owned)
+                    .unwrap_or_else(|| scalar.to_string()),
+            );
+        }
+    }
 }

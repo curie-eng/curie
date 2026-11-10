@@ -23,11 +23,13 @@ import anyio
 from claude_agent_sdk.types import PermissionResultDeny, ToolPermissionContext
 from curie_runner.approval import (
     ApprovalGate,
-    build_approval_hook,
-    build_can_use_tool,
     canonical_tool_name,
     is_mcp_tool,
     policy_disallowed_tools,
+)
+from curie_runner.harness.claude.approval import (
+    build_approval_hook,
+    build_can_use_tool,
 )
 from plugin_format import ToolPolicy
 
@@ -181,3 +183,28 @@ def test_no_bundle_name_cannot_resolve_a_plugin_mount() -> None:
         )
         is None
     )
+
+
+def test_policy_denial_feedback_describes_action_in_both_permission_lanes() -> None:
+    name = "mcp__acme__shareAsset"
+
+    def gate() -> ApprovalGate:
+        return ApprovalGate(
+            tool_policy=ToolPolicy(enforcement="curie/mcp-tool-policy@1", deny=["acme/*"]),
+            connector_servers={"acme"},
+        )
+
+    permission_gate = gate()
+    refusal = anyio.run(build_can_use_tool(permission_gate), name, {}, ToolPermissionContext())
+    assert isinstance(refusal, PermissionResultDeny)
+    assert "share asset" in refusal.message
+    assert name not in refusal.message
+    assert "not permitted" in refusal.message
+    assert permission_gate.pending_summary is None
+    hook_gate = gate()
+    hook = build_approval_hook(hook_gate)["PreToolUse"][0].hooks[0]
+    result = anyio.run(hook, {"tool_name": name, "tool_input": {}}, None, None)
+    assert result["hookSpecificOutput"]["permissionDecision"] == "deny"
+    assert "share asset" in result["stopReason"]
+    assert name not in result["stopReason"]
+    assert hook_gate.pending_summary is None

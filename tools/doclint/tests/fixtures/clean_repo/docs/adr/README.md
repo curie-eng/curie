@@ -8,4 +8,5 @@ whatever branch you happen to be on, which is how number collisions happen.
 | # | Decision | Status |
 |---|---|---|
 | 0001 | [ADR-0001: Example (fixture)](0001-example.md) | Accepted |
+| 0035 | [ADR-0035: Example approval decision (fixture)](0035-example-approval.md) | Accepted |
 <!-- END GENERATED: adr-index -->

@@ -6,7 +6,7 @@
 # Langfuse 3.225.x ClickHouse migration 39 cannot parse on 24.8 or 25.8. The
 # chart default must be on the 25.12 line (the version Langfuse's own compose
 # pins at v3.225.7) so the Langfuse pin can be advanced, and AVX is a
-# chart-default requirement because 25.12 is not SSE4.2-safe. Since #2319 the
+# chart-default requirement on x86 because 25.12 is not SSE4.2-safe. Since #2319 the
 # expected value is the 25.12.11.4 patch build rather than the moving 25.12
 # alias. Comments on both values.yaml keys must name the other pin so they are
 # not moved independently.
@@ -116,7 +116,7 @@ safe_tags = (preflight_env.get("SSE42_SAFE_TAGS") or "").split()
 if expected_clickhouse in safe_tags:
     problems.append(
         f"chart-default ClickHouse {expected_clickhouse} must stay out of "
-        "sse42SafeTags so AVX remains required for the default pair; "
+        "sse42SafeTags so AVX remains required on x86 for the default pair; "
         f"found {safe_tags!r}"
     )
 if "24.8" not in safe_tags:
@@ -192,7 +192,7 @@ if problems:
 
 print(
     f"chart pins Langfuse {expected_langfuse} with ClickHouse {expected_clickhouse}, "
-    "comments name the pair, and AVX is required for the default tag"
+    "comments name the pair, and AVX is required on x86 for the default tag"
 )
 PY
 
@@ -299,6 +299,109 @@ if completed.returncode != 0:
     )
 print("override: helm-rendered clickhouse.image.tag=24.8 passes AVX preflight without AVX")
 PY
+
+# Execute the Helm-rendered hook with deterministic host architecture and CPU
+# flags. PATH stubs redirect only the host probes; the hook code is unmodified.
+python3 - "$RENDER" "$OVERRIDE_RENDER" <<'PY_ARCH'
+import os
+import pathlib
+import shlex
+import shutil
+import subprocess
+import sys
+import tempfile
+
+import yaml
+
+real_grep = shutil.which("grep")
+if real_grep is None:
+    raise SystemExit("grep is required for the rendered preflight tests")
+
+
+def rendered_hook(render_path):
+    hooks = [
+        container
+        for document in yaml.safe_load_all(pathlib.Path(render_path).read_text())
+        if document and document.get("kind") == "Job"
+        and document.get("metadata", {}).get("name", "").endswith("-preflight-avx")
+        for container in document["spec"]["template"]["spec"]["containers"]
+        if container.get("name") == "avx-check"
+    ]
+    if len(hooks) != 1:
+        raise SystemExit(f"expected exactly one rendered CPU preflight: {render_path}")
+    hook = hooks[0]
+    return hook["command"], {
+        item["name"]: item["value"] for item in hook.get("env", [])
+    }
+
+
+# The safe-tag escape hatch still applies to supported x86 hosts and to the
+# explicit no-AVX simulation. Unknown architectures must never bypass the gate.
+cases = [
+    ("aarch64", False, False, True, True),
+    ("arm64", False, False, True, True),
+    ("x86_64", True, False, True, True),
+    ("x86_64", False, False, False, True),
+    ("aarch64", False, True, False, True),
+    ("arm64", False, True, False, True),
+    ("x86_64", True, True, False, True),
+    ("riscv64", False, False, False, False),
+    ("riscv64", True, False, False, False),
+]
+problems = []
+with tempfile.TemporaryDirectory(prefix="curie CPU fixtures ") as tmp:
+    root = pathlib.Path(tmp)
+    stubs = root / "probe stubs"
+    stubs.mkdir()
+    cpuinfo = root / "cpu info"
+    uname = stubs / "uname"
+    uname.write_text('#!/bin/sh\nprintf "%s\\n" "$TEST_NODE_ARCH"\n')
+    uname.chmod(0o755)
+    grep = stubs / "grep"
+    # Python preserves argument boundaries, including fixture paths with spaces.
+    probe = (
+        "import os, sys\n"
+        "args = [os.environ['TEST_CPUINFO'] if a == '/proc/cpuinfo' else a "
+        "for a in sys.argv[1:]]\n"
+        "os.execv(os.environ['TEST_REAL_GREP'], ['grep', *args])\n"
+    )
+    # A shebang cannot quote an interpreter path containing spaces.
+    grep.write_text(
+        "#!/bin/sh\nexec " + shlex.quote(sys.executable)
+        + " -c " + shlex.quote(probe) + ' "$@"\n'
+    )
+    grep.chmod(0o755)
+    for render_index, render_path in enumerate(sys.argv[1:]):
+        command, hook_env = rendered_hook(render_path)
+        tag = hook_env["CLICKHOUSE_TAG"]
+        for arch, has_avx, force_no_avx, default_pass, safe_pass in cases:
+            expected_pass = default_pass if render_index == 0 else safe_pass
+            cpuinfo.write_text(
+                "processor : 0\nFeatures : fp asimd\n"
+                if arch in ("aarch64", "arm64") else
+                "processor : 0\nflags : sse4_2" + (" avx avx2" if has_avx else "") + "\n"
+            )
+            env = os.environ.copy()
+            env.update(hook_env)
+            env.update({
+                "PATH": str(stubs) + os.pathsep + env.get("PATH", ""),
+                "TEST_NODE_ARCH": arch,
+                "TEST_CPUINFO": str(cpuinfo),
+                "TEST_REAL_GREP": real_grep,
+                "FORCE_NO_AVX": "true" if force_no_avx else "false",
+            })
+            result = subprocess.run(command, env=env, text=True, capture_output=True)
+            output = result.stdout + result.stderr
+            name = f"tag={tag}, arch={arch}, avx={has_avx}, forced={force_no_avx}"
+            verdict = "PASS" if expected_pass else "FAIL"
+            if (result.returncode == 0) != expected_pass or f"RESULT: {verdict}" not in output:
+                problems.append(f"{name}: expected {verdict}, exit={result.returncode}\n{output}")
+            else:
+                print(f"architecture: {name}: {verdict}")
+if problems:
+    raise SystemExit("\n".join(problems))
+print("architecture: rendered default and safe-tag hooks satisfy all CPU cases")
+PY_ARCH
 
 MUTANT_RENDER="$TMP/chart-old-clickhouse.yaml"
 python3 - "$RENDER" "$MUTANT_RENDER" "$EXPECTED_CLICKHOUSE" <<'PY'

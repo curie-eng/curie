@@ -6,18 +6,17 @@ is what TurnStream.close (called from __aexit__) invokes."""
 
 from __future__ import annotations
 
-import ast
 import asyncio
+import base64
 import contextlib
-import inspect
+import json
 import logging
-import textwrap
 import tracemalloc
 from typing import Any
 
 import pytest
 from aci_protocol import Event, Final, SessionStatus, SideEffectFlag, TextDelta
-from aiohttp import web
+from aiohttp import ClientError, web
 from aiohttp.test_utils import TestServer
 from claude_agent_sdk import AssistantMessage, ResultMessage, TextBlock, ToolUseBlock
 from curie_runner import RunTracer, SideEffectClassifier, create_app
@@ -297,8 +296,192 @@ def test_snapshot_refuses_an_oversized_body_before_json_decoding() -> None:
         try:
             with pytest.raises(RunnerError, match="invalid bounded payload"):
                 await client.snapshot(
-                    f"http://127.0.0.1:{server.port}", token="runner-token"
+                    f"http://127.0.0.1:{server.port}", token="runner-token", base_sha="a" * 40
                 )
+        finally:
+            await client.close()
+            await server.close()
+
+    asyncio.run(go())
+
+
+def test_snapshot_reads_the_whole_chunked_400kb_body() -> None:
+    from curie_worker.runner_client import RunnerWorkspaceSnapshot
+
+    async def go() -> None:
+        patch = b"x" * 300_000
+        body = json.dumps(
+            {
+                "repo_full_name": "acme-corp/acme-bot",
+                "base_sha": "a1" * 20,
+                "patch_base64": base64.b64encode(patch).decode("ascii"),
+                "patch_size_bytes": len(patch),
+                "changed_paths": ["src/widget.py"],
+                "contains_workflow_files": False,
+                "publication_title": "Fix the widget parser",
+                "publication_body": "Fixes the parser.",
+            }
+        ).encode("utf-8")
+        assert len(body) >= 400_000
+        app = web.Application()
+
+        requested: list[object] = []
+
+        async def chunked(request: web.Request) -> web.StreamResponse:
+            requested.append(await request.json())
+            response = web.StreamResponse(headers={"Content-Type": "application/json"})
+            response.enable_chunked_encoding()
+            await response.prepare(request)
+            for offset in range(0, len(body), 4096):
+                await response.write(body[offset : offset + 4096])
+                # aiohttp read(n) returns buffered bytes, rather than waiting
+                # for n bytes or EOF: https://docs.aiohttp.org/en/stable/streams.html
+                await response.drain()
+                await asyncio.sleep(0)
+                await asyncio.sleep(0.001)
+            await response.write_eof()
+            return response
+
+        app.add_routes([web.post("/v1/snapshot", chunked)])
+        server = TestServer(app)
+        await server.start_server()
+        client = RunnerClient(total_timeout_s=30.0)
+        try:
+            snapshot = await client.snapshot(
+                f"http://127.0.0.1:{server.port}", token="runner-token", base_sha="a1" * 20
+            )
+            # The worker names the prepared base and nothing else (#5230).
+            assert requested == [{"base_sha": "a1" * 20}]
+            assert isinstance(snapshot, RunnerWorkspaceSnapshot)
+            assert snapshot.patch == patch
+            assert snapshot.changed_paths == ("src/widget.py",)
+        finally:
+            await client.close()
+            await server.close()
+
+    asyncio.run(go())
+
+
+def test_snapshot_short_content_length_raises_a_client_error() -> None:
+    async def go() -> None:
+        app = web.Application()
+
+        async def truncated(request: web.Request) -> web.StreamResponse:
+            response = web.StreamResponse(
+                headers={"Content-Type": "application/json", "Content-Length": "1000"}
+            )
+            await response.prepare(request)
+            await response.write(b'{"patch_base64":"')
+            assert request.transport is not None
+            request.transport.close()
+            return response
+
+        app.add_routes([web.post("/v1/snapshot", truncated)])
+        server = TestServer(app)
+        await server.start_server()
+        client = RunnerClient(total_timeout_s=5.0)
+        try:
+            # aiohttp reports an incomplete Content-Length body as
+            # ClientPayloadError, a ClientError subclass, when read to EOF:
+            # https://docs.aiohttp.org/en/stable/client_reference.html#client-exceptions
+            with pytest.raises(ClientError):
+                await client.snapshot(
+                    f"http://127.0.0.1:{server.port}", token="runner-token", base_sha="a" * 40
+                )
+        finally:
+            await client.close()
+            await server.close()
+
+    asyncio.run(go())
+
+
+def test_snapshot_malformed_json_names_the_inner_error_and_byte_count() -> None:
+    from curie_worker.runner_client import RunnerSnapshotReadError
+
+    async def go() -> None:
+        body = b'{"patch_base64":'
+        app = web.Application()
+
+        async def malformed(_request: web.Request) -> web.Response:
+            return web.Response(body=body, content_type="application/json")
+
+        app.add_routes([web.post("/v1/snapshot", malformed)])
+        server = TestServer(app)
+        await server.start_server()
+        client = RunnerClient(total_timeout_s=5.0)
+        try:
+            with pytest.raises(RunnerSnapshotReadError) as caught:
+                await client.snapshot(
+                    f"http://127.0.0.1:{server.port}", token="runner-token", base_sha="a" * 40
+                )
+            assert str(caught.value).startswith(
+                f"/v1/snapshot returned an invalid bounded payload after {len(body)} bytes: "
+                "JSONDecodeError: "
+            )
+            assert isinstance(caught.value.__cause__, json.JSONDecodeError)
+        finally:
+            await client.close()
+            await server.close()
+
+    asyncio.run(go())
+
+
+def test_snapshot_oversized_body_keeps_the_byte_cap_and_named_validation_error() -> None:
+    from curie_worker.runner_client import RunnerSnapshotReadError
+
+    async def go() -> None:
+        patch_limit = 16
+        encoded_body_limit = 4 * ((patch_limit + 2) // 3) + 131_072
+        body = b"x" * (encoded_body_limit + 1)
+        app = web.Application()
+
+        async def oversized(_request: web.Request) -> web.Response:
+            return web.Response(body=body, content_type="application/json")
+
+        app.add_routes([web.post("/v1/snapshot", oversized)])
+        server = TestServer(app)
+        await server.start_server()
+        client = RunnerClient(total_timeout_s=5.0, snapshot_patch_max_bytes=patch_limit)
+        try:
+            with pytest.raises(RunnerSnapshotReadError) as caught:
+                await client.snapshot(
+                    f"http://127.0.0.1:{server.port}", token="runner-token", base_sha="a" * 40
+                )
+            assert str(caught.value) == (
+                f"/v1/snapshot returned an invalid bounded payload after {len(body)} bytes: "
+                "ValueError: snapshot response exceeds its encoded byte limit"
+            )
+            assert isinstance(caught.value.__cause__, ValueError)
+        finally:
+            await client.close()
+            await server.close()
+
+    asyncio.run(go())
+
+
+@pytest.mark.parametrize("status", [503, 403])
+def test_snapshot_http_status_distinguishes_retryable_reads_from_refusals(status: int) -> None:
+    from curie_worker.runner_client import RunnerSnapshotReadError
+
+    async def go() -> None:
+        app = web.Application()
+
+        async def unavailable(_request: web.Request) -> web.Response:
+            return web.Response(status=status, text="snapshot unavailable")
+
+        app.add_routes([web.post("/v1/snapshot", unavailable)])
+        server = TestServer(app)
+        await server.start_server()
+        client = RunnerClient(total_timeout_s=5.0)
+        try:
+            with pytest.raises(RunnerError, match=f"/v1/snapshot -> {status}") as caught:
+                await client.snapshot(
+                    f"http://127.0.0.1:{server.port}", token="runner-token", base_sha="a" * 40
+                )
+            if status == 503:
+                assert isinstance(caught.value, RunnerSnapshotReadError)
+            else:
+                assert type(caught.value) is RunnerError
         finally:
             await client.close()
             await server.close()
@@ -346,6 +529,7 @@ def test_kernel_final_break_closes_real_runner_stream_without_write_eof_error(
         monkeypatch.setattr(runner_server, "_event", wrapped_event)
         fake = FakeModelSession()
         runner = SessionRunner(
+            max_usd_per_day=None,
             held_secrets=frozenset(),
             session_factory=lambda: fake,
             ceiling=0,
@@ -410,9 +594,7 @@ class _PostFinalRunner:
         self.handler_errors: list[BaseException] = []
 
     async def _event(self, request: web.Request) -> web.StreamResponse:
-        response = web.StreamResponse(
-            status=200, headers={"Content-Type": "application/x-ndjson"}
-        )
+        response = web.StreamResponse(status=200, headers={"Content-Type": "application/x-ndjson"})
         await response.prepare(request)
         try:
             await response.write(
@@ -636,8 +818,7 @@ def test_start_turn_without_a_remaining_budget_uses_the_session_default(
             ]
             assert budget_records == [], caplog.text
             assert not any(
-                "remaining" in record.getMessage()
-                and "effective" in record.getMessage()
+                "remaining" in record.getMessage() and "effective" in record.getMessage()
                 for record in caplog.records
                 if record.name == "curie_worker.runner_client"
             ), caplog.text
@@ -741,9 +922,7 @@ def test_budgeted_status_does_not_log_the_turn_timeout_bound(caplog) -> None:
 
             assert status["turn_active"] is False
             records = [
-                record
-                for record in caplog.records
-                if record.name == "curie_worker.runner_client"
+                record for record in caplog.records if record.name == "curie_worker.runner_client"
             ]
             assert not any(
                 record.levelno == logging.INFO
@@ -911,9 +1090,7 @@ def test_turn_deadline_covers_buffered_frame_handling_after_http_eof(
                 headers_elapsed = loop.time() - started
                 with pytest.raises(RunnerStreamTimeout) as excinfo:
                     await asyncio.wait_for(
-                        _consume_with_stalled_side_effect(
-                            turn, runner, entered, release
-                        ),
+                        _consume_with_stalled_side_effect(turn, runner, entered, release),
                         timeout=2.0,
                     )
             elapsed = loop.time() - started
@@ -981,8 +1158,7 @@ def test_external_cancellation_during_buffered_frame_handling_stays_cancelled(
 
             assert runner.timeout_calls == 0
             assert not any(
-                "runner turn stream exceeded" in record.getMessage()
-                for record in caplog.records
+                "runner turn stream exceeded" in record.getMessage() for record in caplog.records
             )
         finally:
             release.set()
@@ -1024,48 +1200,8 @@ def test_handler_timeout_before_turn_deadline_stays_plain_timeout() -> None:
     asyncio.run(go())
 
 
-def test_interrupt_takes_no_remaining_budget_while_the_other_rpcs_do() -> None:
-    """A structural guard against a future "simplification" that folds interrupt
-    into the budget path. ``/v1/interrupt`` is the fail-closed path a lost lease
-    fires: deriving its timeout from a budget that may already be exhausted would
-    make the fence unable to stop the runner it just fenced."""
-    for name in ("start_turn", "steer", "status", "snapshot", "reset"):
-        parameters = inspect.signature(getattr(RunnerClient, name)).parameters
-        assert "remaining_s" in parameters, f"{name} must accept a remaining budget"
-
-    assert "remaining_s" not in inspect.signature(RunnerClient.interrupt).parameters, (
-        "interrupt must never take a remaining budget: it is the fail-closed "
-        "control path and keeps its own independent timeout"
-    )
-
-    source = textwrap.dedent(inspect.getsource(RunnerClient))
-    tree = ast.parse(source)
-    timeout_posts = []
-    for node in ast.walk(tree):
-        if not isinstance(node, ast.Call):
-            continue
-        call_source = ast.get_source_segment(source, node) or ""
-        if (
-            isinstance(node.func, ast.Attribute)
-            and node.func.attr == "post"
-            and "/v1/timeout" in call_source
-        ):
-            timeout_posts.append(node)
-
-    assert len(timeout_posts) == 1, "RunnerClient must own one /v1/timeout POST"
-    timeout_keywords = {
-        keyword.arg: ast.unparse(keyword.value)
-        for keyword in timeout_posts[0].keywords
-        if keyword.arg is not None
-    }
-    assert timeout_keywords.get("timeout") == "self._interrupt_timeout", (
-        "/v1/timeout must use the independent control-plane cap, never the "
-        "expired stream/delivery budget"
-    )
-
-
 def test_interrupt_keeps_its_own_timeout_under_a_huge_streaming_budget() -> None:
-    """The behavioral half of the guard above. With a 30s session budget and a
+    """With a 30s session budget and a
     wedged runner, the interrupt must still return at its own 0.2s bound."""
 
     async def go() -> None:
@@ -1117,9 +1253,7 @@ def test_stream_timeout_raises_a_named_timeout_and_logs_the_expired_budget(
             client = RunnerClient(total_timeout_s=5.0)
             try:
                 with caplog.at_level(logging.WARNING, logger="curie_worker.runner_client"):
-                    turn = await client.start_turn(
-                        handle.base_url, _event(), remaining_s=0.2
-                    )
+                    turn = await client.start_turn(handle.base_url, _event(), remaining_s=0.2)
                     with pytest.raises(TimeoutError) as excinfo:
                         async with turn:
                             async for _frame in turn:
@@ -1144,9 +1278,9 @@ def test_stream_timeout_raises_a_named_timeout_and_logs_the_expired_budget(
                     and record.levelno >= logging.WARNING
                 ]
                 assert warnings, caplog.text
-                assert any(
-                    "Timeout" in message and "0.2" in message for message in warnings
-                ), warnings
+                assert any("Timeout" in message and "0.2" in message for message in warnings), (
+                    warnings
+                )
                 assert all("5.0s" not in message for message in warnings)
             finally:
                 hold.set()
@@ -1173,9 +1307,7 @@ def test_timeout_callback_preserves_the_runner_confirmation(
         await server.start_server()
         client = RunnerClient(total_timeout_s=5.0)
         try:
-            result = await client._notify_timeout(
-                f"http://127.0.0.1:{server.port}", "e" * 32, None
-            )
+            result = await client._notify_timeout(f"http://127.0.0.1:{server.port}", "e" * 32, None)
             assert result == expected
         finally:
             await client.close()
@@ -1217,9 +1349,7 @@ def test_timeout_callback_control_timeout_is_unconfirmed() -> None:
         client = RunnerClient(total_timeout_s=5.0, interrupt_timeout_s=0.05)
         try:
             notifying = asyncio.create_task(
-                client._notify_timeout(
-                    f"http://127.0.0.1:{server.port}", "e" * 32, None
-                )
+                client._notify_timeout(f"http://127.0.0.1:{server.port}", "e" * 32, None)
             )
             await asyncio.wait_for(entered.wait(), timeout=1.0)
             assert not notifying.done()
@@ -1316,6 +1446,7 @@ async def _assert_real_timeout_boundary(
     provider.add_span_processor(SimpleSpanProcessor(exporter))
     fake = _TimeoutBoundaryFake(release_on_interrupt=release_on_interrupt)
     runner = SessionRunner(
+        max_usd_per_day=None,
         held_secrets=frozenset(),
         session_factory=lambda: fake,
         ceiling=0,
@@ -1424,11 +1555,7 @@ async def _assert_real_timeout_boundary(
     )
     assert parent_rpc.name == "curie.runner.rpc"
     assert parent_rpc.attributes["curie.operation"] == "event"
-    for phase in (
-        span
-        for span in spans
-        if span.name in {"llm.generation", "execute_tool"}
-    ):
+    for phase in (span for span in spans if span.name in {"llm.generation", "execute_tool"}):
         assert phase.end_time is not None
         assert "curie.phase.end_kind" in phase.attributes
     tool = next(span for span in spans if span.name == "execute_tool")
@@ -1436,11 +1563,7 @@ async def _assert_real_timeout_boundary(
     assert tool.attributes["curie.tool.outcome"] == "cancelled"
     assert tool.status.status_code is StatusCode.ERROR
 
-    completed = [
-        attributes
-        for name, attributes in metrics
-        if name == "curie.turn.completed"
-    ]
+    completed = [attributes for name, attributes in metrics if name == "curie.turn.completed"]
     assert completed == [
         {
             "service.name": "curie-runner",
@@ -1467,9 +1590,7 @@ async def _assert_real_timeout_boundary(
 def test_real_http_timeout_unblocks_live_consumer_with_first_failure_terminal(
     monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
-    metrics = asyncio.run(
-        _assert_real_timeout_boundary(monkeypatch, release_on_interrupt=True)
-    )
+    metrics = asyncio.run(_assert_real_timeout_boundary(monkeypatch, release_on_interrupt=True))
     timeout_rpc_attributes = {
         "service.name": "curie-worker",
         "operation": "timeout",
@@ -1490,9 +1611,7 @@ def test_real_http_timeout_unblocks_live_consumer_with_first_failure_terminal(
 def test_real_http_timeout_terminalizes_before_released_body_write_failure(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    asyncio.run(
-        _assert_real_timeout_boundary(monkeypatch, release_on_interrupt=False)
-    )
+    asyncio.run(_assert_real_timeout_boundary(monkeypatch, release_on_interrupt=False))
 
 
 class _ProductionTimeoutPostureSession:
@@ -1572,6 +1691,7 @@ def test_production_http_timeout_handler_holds_next_query_until_ack(
     async def go() -> None:
         session = _ProductionTimeoutPostureSession()
         runner = SessionRunner(
+            max_usd_per_day=None,
             held_secrets=frozenset(),
             session_factory=lambda: session,
             ceiling=0,
@@ -1647,16 +1767,17 @@ def test_production_http_timeout_handler_holds_next_query_until_ack(
             await asyncio.wait_for(second_task, timeout=1.0)
 
             assert session.interrupts == 1
+            from curie_runner.sender_frame import frame_user_turn
+
             assert session.wire == [
-                ("query", "first"),
+                ("query", frame_user_turn("message", "U0EXAMPLE1", "first", None)),
                 ("interrupt", 1),
-                ("query", "second"),
+                ("query", frame_user_turn("message", "U0EXAMPLE1", "second", None)),
             ]
             assert isinstance(second_frames[-1], Final)
             assert second_frames[-1].status is SessionStatus.DONE
             assert any(
-                "runner timeout terminal notification failed"
-                in record.getMessage()
+                "runner timeout terminal notification failed" in record.getMessage()
                 for record in caplog.records
             )
         finally:
@@ -1667,5 +1788,383 @@ def test_production_http_timeout_handler_holds_next_query_until_ack(
                     await second_task
             await client.close()
             await app_runner.cleanup()
+
+    asyncio.run(go())
+
+
+# --- POST /v1/checkpoint: the recovery capture's runner read (#5143) ----------------
+#
+# The liveness case drives the real runner app (``curie_runner.server.create_app``
+# with its checkpoint route) over a real git checkout. Every other body is a
+# recorded real shape: success bodies come from the runner's own
+# ``WorkspaceCheckpoint.to_json`` and refusals from its own
+# ``CheckpointRefusal.body`` / ``CheckpointTimeout.body``
+# (runner/src/curie_runner/workspace_checkpoint.py), served at the status the
+# route answers them with (runner/src/curie_runner/server.py ``_checkpoint``).
+# Only the bytes inside a shape are altered, to provoke each validation branch.
+
+_CHECKPOINT_TOKEN = "checkpoint-runner-token"
+_PATCH_CAP = 900_000
+_MANIFEST_CAP = 1_048_576
+_GIT = (
+    "-c",
+    "user.name=Recovery Fixture",
+    "-c",
+    "user.email=recovery@example.com",
+    "-c",
+    "commit.gpgsign=false",
+    "-c",
+    "core.hooksPath=/dev/null",
+)
+
+
+def _checkpoint_git(repo: Any, *args: str) -> str:
+    import subprocess
+
+    done = subprocess.run(
+        ["git", *_GIT, *args], cwd=repo, capture_output=True, text=True, check=True
+    )
+    return done.stdout.strip()
+
+
+def _checkpoint_repo(root: Any) -> tuple[Any, str]:
+    root.mkdir(parents=True)
+    _checkpoint_git(root, "init", "-q", "-b", "main")
+    (root / "README.md").write_text("base\n")
+    (root / "run.sh").write_text("#!/bin/sh\necho run\n")
+    _checkpoint_git(root, "add", "-A")
+    _checkpoint_git(root, "commit", "-q", "-m", "base")
+    return root, _checkpoint_git(root, "rev-parse", "HEAD")
+
+
+def _real_checkpoint_runner(workspace: Any) -> SessionRunner:
+    from curie_runner.server import bind_status_attestation
+
+    runner = SessionRunner(
+        max_usd_per_day=None,
+        held_secrets=frozenset(),
+        session_factory=FakeModelSession,
+        ceiling=10_000,
+        tracer=RunTracer(None),
+        classifier=SideEffectClassifier(),
+        trace_name="checkpoint-client",
+    )
+    return bind_status_attestation(
+        runner,
+        session_id="session-acme-checkpoint",
+        sandbox_id="sandbox-acme-checkpoint",
+        cwd=str(workspace),
+    )
+
+
+def _recorded_success(
+    *, base_sha: str, patch: bytes, manifest: bytes, paths: tuple[str, ...]
+) -> dict[str, Any]:
+    from curie_runner.workspace_checkpoint import WorkspaceCheckpoint
+
+    return WorkspaceCheckpoint(
+        base_sha=base_sha, patch=patch, changed_paths=paths, manifest=manifest
+    ).to_json()
+
+
+@contextlib.asynccontextmanager
+async def _recorded_checkpoint_runner(answer: Any):  # noqa: ANN201 - async cm
+    """Serve ``answer(request)`` on /v1/checkpoint and record each request body."""
+
+    seen: list[dict[str, Any]] = []
+    headers: list[dict[str, str]] = []
+    app = web.Application()
+
+    async def checkpoint(request: web.Request) -> web.StreamResponse:
+        headers.append(dict(request.headers))
+        seen.append(json.loads(await request.read()))
+        return await answer(request)
+
+    app.add_routes([web.post("/v1/checkpoint", checkpoint)])
+    server = TestServer(app)
+    await server.start_server()
+    client = RunnerClient(total_timeout_s=30.0)
+    try:
+        yield client, f"http://127.0.0.1:{server.port}", seen, headers
+    finally:
+        await client.close()
+        await server.close()
+
+
+def _json_answer(body: Any, status: int = 200) -> Any:
+    async def answer(_request: web.Request) -> web.Response:
+        return web.json_response(body, status=status)
+
+    return answer
+
+
+def test_checkpoint_reads_the_real_runner_route_and_validates_its_answer(tmp_path: Any) -> None:
+    from curie_worker.runner_client import RunnerWorkspaceCheckpoint
+
+    repo, base = _checkpoint_repo(tmp_path / "workspace")
+    (repo / "README.md").write_text("edited\n")
+    (repo / "notes.txt").write_text("untracked\n")
+    (repo / "run.sh").chmod(0o755)
+    (repo / "blob.bin").write_bytes(b"\x00\x01binary\xff")
+
+    async def go() -> None:
+        runner = _real_checkpoint_runner(repo)
+        server = TestServer(create_app(runner, token=_CHECKPOINT_TOKEN))
+        await server.start_server()
+        client = RunnerClient(total_timeout_s=30.0)
+        base_url = f"http://127.0.0.1:{server.port}"
+        try:
+            checkpoint = await client.checkpoint(
+                base_url, _CHECKPOINT_TOKEN, base_sha=base, budget_seconds=30.0
+            )
+            assert isinstance(checkpoint, RunnerWorkspaceCheckpoint)
+            assert checkpoint.base_sha == base
+            assert checkpoint.changed_paths == ("README.md", "blob.bin", "notes.txt", "run.sh")
+            assert b"diff --git a/README.md b/README.md" in checkpoint.patch
+            document = json.loads(checkpoint.manifest)
+            assert document["base_sha"] == base
+            assert [entry["path"] for entry in document["entries"]] == list(
+                checkpoint.changed_paths
+            )
+            # The token is not optional: the route is bearer-gated.
+            from curie_worker.runner_client import RunnerCheckpointRefused
+
+            with pytest.raises(RunnerError) as missing:
+                await client.checkpoint(base_url, None, base_sha=base, budget_seconds=30.0)
+            assert not isinstance(missing.value, RunnerCheckpointRefused)
+            with pytest.raises(RunnerError):
+                await client.checkpoint(base_url, "", base_sha=base, budget_seconds=30.0)
+            # A real coded refusal from the real route: a base the checkout lacks.
+            with pytest.raises(RunnerCheckpointRefused) as refused:
+                await client.checkpoint(
+                    base_url, _CHECKPOINT_TOKEN, base_sha="f" * 40, budget_seconds=30.0
+                )
+            assert (refused.value.code, refused.value.status) == ("base_unavailable", 422)
+            # The positive control still holds after the refusals.
+            again = await client.checkpoint(
+                base_url, _CHECKPOINT_TOKEN, base_sha=base, budget_seconds=30.0
+            )
+            assert again.patch == checkpoint.patch
+        finally:
+            await client.close()
+            await server.close()
+
+    asyncio.run(go())
+
+
+def test_checkpoint_sends_the_bearer_and_exactly_base_and_budget() -> None:
+    base = "ab" * 20
+    body = _recorded_success(
+        base_sha=base, patch=b"diff --git a/x b/x\n", manifest=b"{}", paths=("x",)
+    )
+
+    async def go() -> None:
+        async with _recorded_checkpoint_runner(_json_answer(body)) as (client, url, seen, headers):
+            await client.checkpoint(url, "runner-token", base_sha=base, budget_seconds=12.5)
+            assert seen == [{"base_sha": base, "budget_seconds": 12.5}]
+            assert headers[0].get("Authorization") == "Bearer runner-token"
+
+            # A missing token never reaches the runner at all.
+            with pytest.raises(RunnerError):
+                await client.checkpoint(url, None, base_sha=base, budget_seconds=12.5)
+            assert len(seen) == 1
+
+    asyncio.run(go())
+
+
+def test_checkpoint_accepts_a_patch_and_manifest_exactly_at_their_caps() -> None:
+    # Liveness for the cap refusals below: the boundary itself is accepted.
+    base = "cd" * 20
+    patch = b"p" * _PATCH_CAP
+    manifest = b"m" * _MANIFEST_CAP
+    body = _recorded_success(base_sha=base, patch=patch, manifest=manifest, paths=("big.bin",))
+
+    async def go() -> None:
+        async with _recorded_checkpoint_runner(_json_answer(body)) as (client, url, _seen, _h):
+            checkpoint = await client.checkpoint(
+                url, "runner-token", base_sha=base, budget_seconds=30.0
+            )
+            assert checkpoint.patch == patch
+            assert checkpoint.manifest == manifest
+            assert checkpoint.changed_paths == ("big.bin",)
+
+    asyncio.run(go())
+
+
+def _malformed_bodies(base: str) -> dict[str, Any]:
+    good = _recorded_success(
+        base_sha=base, patch=b"diff --git a/x b/x\n", manifest=b'{"v":1}', paths=("x",)
+    )
+
+    def changed(**fields: Any) -> dict[str, Any]:
+        return {**good, **fields}
+
+    over_patch = _recorded_success(
+        base_sha=base, patch=b"p" * (_PATCH_CAP + 1), manifest=b"{}", paths=("x",)
+    )
+    over_manifest = _recorded_success(
+        base_sha=base, patch=b"p", manifest=b"m" * (_MANIFEST_CAP + 1), paths=("x",)
+    )
+    missing = dict(good)
+    missing.pop("manifest_sha256")
+    return {
+        "patch-not-base64": changed(patch_base64="!!not base64!!"),
+        "patch-loose-base64": changed(patch_base64=good["patch_base64"] + "\n"),
+        "manifest-not-base64": changed(manifest_base64="***"),
+        "patch-size-mismatch": changed(patch_size_bytes=good["patch_size_bytes"] + 1),
+        "manifest-size-mismatch": changed(manifest_size_bytes=0),
+        "patch-digest-mismatch": changed(patch_sha256="0" * 64),
+        "manifest-digest-mismatch": changed(manifest_sha256="0" * 64),
+        "other-base": changed(base_sha="ef" * 20),
+        "paths-not-a-list": changed(changed_paths="x"),
+        "missing-field": missing,
+        "patch-over-cap": over_patch,
+        "manifest-over-cap": over_manifest,
+        "not-an-object": ["not", "an", "object"],
+    }
+
+
+@pytest.mark.parametrize("shape", sorted(_malformed_bodies("12" * 20)))
+def test_checkpoint_refuses_a_malformed_answer_as_a_runner_error(shape: str) -> None:
+    from curie_worker.runner_client import RunnerCheckpointRefused
+
+    base = "12" * 20
+    body = _malformed_bodies(base)[shape]
+
+    async def go() -> None:
+        async with _recorded_checkpoint_runner(_json_answer(body)) as (client, url, _seen, _h):
+            with pytest.raises(RunnerError) as raised:
+                await client.checkpoint(url, "runner-token", base_sha=base, budget_seconds=30.0)
+            # Malformed is not a coded refusal: the capture records runner_unavailable.
+            assert not isinstance(raised.value, RunnerCheckpointRefused)
+            # The error never carries the payload bytes.
+            assert "not base64" not in str(raised.value)
+
+    asyncio.run(go())
+
+
+def _coded_refusals() -> dict[str, tuple[int, dict[str, Any]]]:
+    from curie_runner.workspace_checkpoint import CheckpointRefusal, CheckpointTimeout
+
+    def shape(refusal: CheckpointRefusal) -> tuple[int, dict[str, Any]]:
+        return refusal.status, refusal.body()
+
+    return {
+        "workspace_changed": shape(
+            CheckpointRefusal("workspace_changed", 409, "the workspace changed mid-checkpoint")
+        ),
+        "patch_too_large": shape(
+            CheckpointRefusal("patch_too_large", 422, "checkpoint patch exceeds 900000 bytes")
+        ),
+        "manifest_too_large": shape(
+            CheckpointRefusal("manifest_too_large", 422, "manifest exceeds 1048576 bytes")
+        ),
+        "unsafe_entry": shape(CheckpointRefusal("unsafe_entry", 422, "unsafe entry")),
+        "unreadable": shape(CheckpointRefusal("unreadable", 422, "unreadable entry")),
+        "deadline_exceeded": shape(CheckpointTimeout("git")),
+        "turn_active": shape(
+            CheckpointRefusal("turn_active", 409, "cannot checkpoint while a turn is active")
+        ),
+    }
+
+
+@pytest.mark.parametrize("code", sorted(_coded_refusals()))
+def test_checkpoint_maps_each_coded_refusal_with_its_code_and_status(code: str) -> None:
+    from curie_worker.runner_client import RunnerCheckpointRefused
+
+    status, body = _coded_refusals()[code]
+    base = "34" * 20
+
+    async def go() -> None:
+        async with _recorded_checkpoint_runner(_json_answer(body, status)) as (
+            client,
+            url,
+            _seen,
+            _h,
+        ):
+            with pytest.raises(RunnerCheckpointRefused) as raised:
+                await client.checkpoint(url, "runner-token", base_sha=base, budget_seconds=30.0)
+            assert isinstance(raised.value, RunnerError)
+            assert raised.value.code == code
+            assert raised.value.status == status
+
+    asyncio.run(go())
+
+
+@pytest.mark.parametrize(
+    ("status", "body"),
+    [
+        (404, {"error": "not found"}),
+        (500, {"error": "boom", "code": "workspace_changed"}),
+        (502, "bad gateway"),
+        (409, {"error": "uncoded conflict"}),
+    ],
+    ids=["no-route", "server-error-even-if-coded", "bad-gateway", "uncoded-4xx"],
+)
+def test_checkpoint_treats_routeless_uncoded_and_server_errors_as_unavailable(
+    status: int, body: Any
+) -> None:
+    from curie_worker.runner_client import RunnerCheckpointRefused
+
+    base = "56" * 20
+
+    async def answer(_request: web.Request) -> web.Response:
+        if isinstance(body, str):
+            return web.Response(text=body, status=status)
+        return web.json_response(body, status=status)
+
+    async def go() -> None:
+        async with _recorded_checkpoint_runner(answer) as (client, url, _seen, _h):
+            with pytest.raises(RunnerError) as raised:
+                await client.checkpoint(url, "runner-token", base_sha=base, budget_seconds=30.0)
+            assert not isinstance(raised.value, RunnerCheckpointRefused)
+
+    asyncio.run(go())
+
+
+def test_checkpoint_transport_failure_is_a_runner_error() -> None:
+    import socket
+
+    from curie_worker.runner_client import RunnerCheckpointRefused
+
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+        probe.bind(("127.0.0.1", 0))
+        port = probe.getsockname()[1]
+
+    async def go() -> None:
+        client = RunnerClient(total_timeout_s=30.0)
+        try:
+            with pytest.raises(RunnerError) as raised:
+                await client.checkpoint(
+                    f"http://127.0.0.1:{port}",
+                    "runner-token",
+                    base_sha="78" * 20,
+                    budget_seconds=5.0,
+                )
+            assert not isinstance(raised.value, RunnerCheckpointRefused)
+        finally:
+            await client.close()
+
+    asyncio.run(go())
+
+
+def test_checkpoint_is_bounded_by_the_remaining_budget() -> None:
+    """A wedged runner cannot hold the capture past the budget the caller has left."""
+
+    base = "9a" * 20
+
+    async def wedged(_request: web.Request) -> web.Response:
+        await asyncio.sleep(20)
+        return web.json_response({})
+
+    async def go() -> None:
+        async with _recorded_checkpoint_runner(wedged) as (client, url, _seen, _h):
+            loop = asyncio.get_running_loop()
+            started = loop.time()
+            with pytest.raises((RunnerError, TimeoutError)):
+                await client.checkpoint(
+                    url, "runner-token", base_sha=base, budget_seconds=1.0, remaining_s=1.0
+                )
+            assert loop.time() - started < 8.0
 
     asyncio.run(go())

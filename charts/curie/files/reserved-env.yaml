@@ -3,14 +3,25 @@
 # suppress the chart entry. The shared validator still refuses repeated extraEnv names.
 worker:
   BUNDLE_BUCKET: agentSandbox.runner.bundleFetch.bucket
+  CURIE_ACTION_EXECUTOR_CONNECTOR_READS: actionExecutor.connectorReadsWithoutReconciler
+  CURIE_ACTION_EXECUTOR_ENABLED: actionExecutor.enabled
+  CURIE_ACTION_EXECUTOR_MAX_CONCURRENT_SANDBOXES: actionExecutor.maxConcurrentSandboxes
   CURIE_ADAPTER_CREDENTIALS: worker.adapterCredentialsExistingSecret
   CURIE_AGENT_CONNECTOR_SECRET_POOLS: agentSandbox.connectorSecrets
   CURIE_AGENT_SANDBOX_POOLS: agentSandbox.connectorSecrets or agentSandbox.registryEgress
+  CURIE_ATTACHMENT_BROKER_HOST: worker.attachments.broker
+  CURIE_ATTACHMENT_BROKER_PORT: worker.attachments.broker.port
+  CURIE_ATTACHMENT_BROKER_MAX_CONCURRENT: worker.attachments.broker.maxConcurrent
+  CURIE_ATTACHMENT_TRANSFER_TIMEOUT_SECONDS: worker.attachments.broker.transferTimeoutSeconds
+  CURIE_ATTACHMENT_MODE: worker.attachments.mode
   CURIE_ATTACHMENT_ENABLED: worker.attachments.enabled
   CURIE_ATTACHMENT_MAX_FILE_BYTES: worker.attachments.maxFileBytes
   CURIE_ATTACHMENT_REFERENCE_TTL_SECONDS: worker.attachments.referenceTtlSeconds
   CURIE_ATTACHMENT_RETENTION_TTL_SECONDS: worker.attachments.retentionTtlSeconds
+  CURIE_ATTACHMENT_THREAD_MAX_BYTES: worker.attachments.threadMaxBytes
+  CURIE_ATTACHMENT_THREAD_MAX_FILES: worker.attachments.threadMaxFiles
   CURIE_CLAIM_TIMEOUT_SECONDS: worker.claimTimeoutSeconds
+  CURIE_CODE_HOST_CA_BUNDLE: codeHostTrust.caBundle.configMapRef.name
   CURIE_CONNECTOR_APP_NAME: nameOverride
   CURIE_CONNECTOR_CALLER_SIGNING_KEY: connectorCaller.signingKey
   CURIE_CONNECTOR_RECONCILE: worker.connectorReconciler.enabled
@@ -20,17 +31,26 @@ worker:
   CURIE_DELIVERY_LEASE_HEARTBEAT_S: worker.deliveryLeaseHeartbeatSeconds
   CURIE_DELIVERY_LEASE_TTL_S: worker.deliveryLeaseTtlSeconds
   CURIE_DELIVERY_SHUTDOWN_RESERVE_S: worker.deliveryShutdownReserveSeconds
+  CURIE_E2E_CONNECTOR_ENABLED: e2eConnector.enabled
+  CURIE_E2E_NAMESPACE_PREFIX: e2eConnector.namespacePrefix
+  CURIE_E2E_OWNER_LABEL_KEY: e2eConnector.ownerLabel.key
+  CURIE_E2E_OWNER_LABEL_VALUE: e2eConnector.ownerLabel.value
+  CURIE_E2E_REAPER_INTERVAL_S: e2eConnector.reaperIntervalSeconds
+  CURIE_E2E_REGISTRY: e2eConnector.registry
+  CURIE_E2E_REGISTRY_INSECURE: e2eConnector.registryInsecure
+  CURIE_E2E_REGISTRY_TOKEN_HOSTS: e2eConnector.registryTokenHosts
   CURIE_FAKE_MODEL: agentSandbox.runner.fakeModel
   CURIE_HEARTBEAT_FILE: the chart-managed heartbeat path (remove this override)
+  CURIE_HOOK_CLAIM_LEASE_S: worker.hookClaimLeaseSeconds
   CURIE_INTERNAL_WORKER_TOKEN: worker.internalWorkerToken
   CURIE_INSTALLATION_ID: the release-managed installation identity (remove this override)
   CURIE_NAMESPACE: the release namespace (Helm --namespace)
+  CURIE_PUBLICATION_ALLOW_DEPENDENCY_ADDITIONS: worker.publication.allowDependencyAdditions
   CURIE_PUBLICATION_CPU_LIMIT: worker.publication.resources.limits.cpu
   CURIE_PUBLICATION_CPU_REQUEST: worker.publication.resources.requests.cpu
   CURIE_PUBLICATION_ENABLED: worker.publication.enabled
   CURIE_PUBLICATION_EPHEMERAL_LIMIT: worker.publication.resources.limits.ephemeral-storage
   CURIE_PUBLICATION_EPHEMERAL_REQUEST: worker.publication.resources.requests.ephemeral-storage
-  CURIE_PUBLICATION_GITHUB_API_URL: api.githubApiUrl
   CURIE_PUBLICATION_GIT_COMMAND_TIMEOUT_SECONDS: worker.publication.gitCommandTimeoutSeconds
   CURIE_PUBLICATION_GIT_USER_EMAIL: worker.publication.gitUserEmail
   CURIE_PUBLICATION_GIT_USER_NAME: worker.publication.gitUserName
@@ -50,14 +70,21 @@ worker:
   CURIE_PUBLICATION_RESULT_MAX_ATTEMPTS: worker.publication.resultMaxAttempts
   CURIE_PUBLICATION_SERVICE_ACCOUNT_NAME: worker.publication.serviceAccountName
   CURIE_RELEASE: the Helm release name
+  CURIE_REMEDIATION_ENABLED: remediation.enabled
+  CURIE_REPO_RUNNER_POOLS: factory.bindings[].repos[].runner
   CURIE_ROUTE_TTL_SECONDS: worker.routeTtlSeconds
   CURIE_RUNNER_IMAGE: agentSandbox.runner.image
   CURIE_RUNNER_PORT: agentSandbox.runner.port
   CURIE_RUNNER_TOTAL_TIMEOUT_S: worker.runnerTotalTimeoutSeconds
+  CURIE_SANDBOX_ADMISSION: resourceQuota
   CURIE_SEALING_PREVIOUS_PRIVATE_KEY: sealing.previousPrivateKeyExistingSecret
   CURIE_SEALING_PRIVATE_KEY: sealing.privateKeyExistingSecret
   CURIE_SHIMMER: worker.shimmer
   CURIE_SLACK_IDENTITIES: dispatcher.slack.identities
+  CURIE_CHANNEL_GATEWAY_URL: channelGateway.url
+  CURIE_CHANNEL_GATEWAY_TOKEN: channelGateway.apiToken or channelGateway.workerToken
+  CURIE_CHANNEL_GATEWAY_ALLOW_INSECURE: channelGateway.allowInsecure
+  CURIE_CHANNEL_GATEWAY_CA_FILE: channelGateway.tlsSecret
   CURIE_SLACK_TRUSTED_ORIGINS: worker.slackTrustedOrigins
   CURIE_STATUS_TEXT: worker.statusText
   CURIE_STREAM_RETENTION_MIN_AGE_S: worker.streamRetention.minAgeSeconds
@@ -78,6 +105,7 @@ worker:
   CURIE_WORKSPACE_MAX_COMPRESSION_RATIO: worker.workspace.maxCompressionRatio
   CURIE_WORKSPACE_MAX_CONCURRENT_CLONES: worker.workspace.maxConcurrentClones
   CURIE_WORKSPACE_MAX_MEMBERS: worker.workspace.maxMembers
+  CURIE_WORKSPACE_RECOVERY_ENABLED: worker.workspace.recovery.enabled
   CURIE_WORKSPACE_REFERENCE_TTL_SECONDS: worker.workspace.referenceTtlSeconds
   CURIE_WORKSPACE_SCRATCH_ROOT: worker.workspace.mountPath
   CURIE_WORKSPACE_TOTAL_TIMEOUT_SECONDS: worker.workspace.totalTimeoutSeconds
@@ -98,44 +126,84 @@ worker:
   VALKEY_PORT: valkey.port
   VALKEY_TLS: valkey.tls
 api:
+  ATTACHMENT_TRANSFER_TIMEOUT_SECONDS: worker.attachments.broker.transferTimeoutSeconds
+  ATTACHMENT_ACCESS_ENABLED: worker.attachments.enabled and worker.attachments.mode
+  ATTACHMENT_BROKER_URL: worker.attachments.broker
   API_KEY: api.apiKey
   APPROVAL_SWEEP_INTERVAL_S: api.approvalSweepIntervalSeconds
   BUNDLE_BUCKET: agentSandbox.runner.bundleFetch.bucket
   COMMIT_POLL_INTERVAL_S: api.commitPollIntervalSeconds
+  CURIE_ACTION_EXECUTOR_ENABLED: actionExecutor.enabled
+  CURIE_ACTION_EXECUTOR_MAX_CONCURRENT_SANDBOXES: actionExecutor.maxConcurrentSandboxes
   CURIE_APPROVAL_CHAT_ATTESTER_SECRET: api.approvalChatAttesterSecret
   CURIE_APPROVAL_RECOVERY_ENABLED: api.approvalRecovery.enabled
+  CURIE_CODE_HOST_CA_BUNDLE: codeHostTrust.caBundle.configMapRef.name
   CURIE_CONNECTOR_CALLER_PREVIOUS_PUBLIC_KEY: connectorCaller.previousVerifyKey
   CURIE_CONNECTOR_CALLER_PUBLIC_KEY: connectorCaller.verifyKey
   CURIE_CONNECTOR_PROXY_IMAGE: worker.image
   CURIE_CONNECTOR_PROXY_IMAGE_PULL_POLICY: worker.image.pullPolicy
   CURIE_CONNECTOR_PROXY_IMAGE_PULL_SECRETS: worker.imagePullSecrets
+  CURIE_DELIVERY_BUDGET_S: worker.deliveryBudgetSeconds
+  CURIE_E2E_BUILDER_IMAGE: e2eConnector.builderImage
+  CURIE_E2E_BUILD_CACHE_REPO: e2eConnector.buildCacheRepo
+  CURIE_E2E_BUILD_TIMEOUT_SECONDS: e2eConnector.buildTimeoutSeconds
+  CURIE_E2E_CONNECTOR_ENABLED: e2eConnector.enabled
+  CURIE_E2E_CONNECTOR_IMAGE: worker.image
+  CURIE_E2E_GIT_IMAGE: e2eConnector.gitImage
+  CURIE_E2E_NAMESPACE_PREFIX: e2eConnector.namespacePrefix
+  CURIE_E2E_OWNER_LABEL_KEY: e2eConnector.ownerLabel.key
+  CURIE_E2E_OWNER_LABEL_VALUE: e2eConnector.ownerLabel.value
+  CURIE_E2E_POD_SECURITY: e2eConnector.podSecurity
+  CURIE_E2E_PUSH_IMAGE: e2eConnector.pushImage
+  CURIE_E2E_REGISTRY: e2eConnector.registry
+  CURIE_E2E_REGISTRY_INSECURE: e2eConnector.registryInsecure
+  CURIE_E2E_REGISTRY_TOKEN_HOSTS: e2eConnector.registryTokenHosts
+  CURIE_E2E_SERVICE_ACCOUNT: e2eConnector.serviceAccount
+  CURIE_E2E_SERVICE_ACCOUNT_NAMESPACE: e2eConnector.serviceAccountNamespace
+  CURIE_E2E_SOURCE_HOSTS: e2eConnector.sourceHosts
+  CURIE_E2E_TTL_SECONDS: e2eConnector.ttlSeconds
+  CURIE_E2E_WORKER_CLUSTER_ROLE: e2eConnector.workerClusterRole
+  CURIE_FACTORY_PUBLICATION_LABELS: api.factoryPublicationLabels
+  CURIE_FORGES: factory.codeHosts / factory.trackers / factory.bindings
+  CURIE_HOOK_CLAIM_LEASE_S: worker.hookClaimLeaseSeconds
+  CURIE_HTTP_IDENTITY_DIR: api.httpIdentity.existingSecret
   CURIE_INSTALLATION_ID: the release-managed installation identity (remove this override)
   CURIE_INTERNAL_WORKER_TOKEN: worker.internalWorkerToken
   CURIE_PUBLICATION_PATCH_MAX_BYTES: worker.publication.patchMaxBytes
   CURIE_PUBLICATION_RETENTION_SECONDS: worker.publication.retentionSeconds
+  CURIE_REMEDIATION_AUTHORITY_KEY: api.remediationAuthorityKey
+  CURIE_REMEDIATION_ENABLED: remediation.enabled
+  CURIE_WORKSPACE_MAX_ARCHIVE_BYTES: worker.workspace.maxArchiveBytes
+  CURIE_WORKSPACE_RECOVERY_ENABLED: worker.workspace.recovery.enabled
+  CURIE_WORKSPACE_RECOVERY_MAX_BYTES: worker.workspace.recovery.maxBytes
   CURIE_SANDBOX_QUOTA_LIMITS_CPU: resourceQuota.hard.limitsCpu
   CURIE_SANDBOX_QUOTA_LIMITS_MEMORY: resourceQuota.hard.limitsMemory
   CURIE_SANDBOX_QUOTA_REQUESTS_CPU: resourceQuota.hard.requestsCpu
   CURIE_SANDBOX_QUOTA_REQUESTS_MEMORY: resourceQuota.hard.requestsMemory
   CURIE_SLACK_IDENTITIES: dispatcher.slack.identities
+  CURIE_CHANNEL_GATEWAY_URL: channelGateway.url
+  CURIE_CHANNEL_GATEWAY_TOKEN: channelGateway.apiToken or channelGateway.workerToken
+  CURIE_CHANNEL_GATEWAY_ALLOW_INSECURE: channelGateway.allowInsecure
+  CURIE_CHANNEL_GATEWAY_CA_FILE: channelGateway.tlsSecret
+  CURIE_TEST_INSTALLATION_DRIVERS: testInstallation.drivers
+  CURIE_TEST_INSTALLATION_ENABLED: testInstallation.enabled
   DATABASE_URL: postgres.host / postgres.port / postgres.auth / postgres.sslMode
   DB_SCHEMA: the chart-managed database schema (remove this override)
   ENVIRONMENT: api.environment
+  FACTORY_CI_WAIT_S: factory.ciWaitSeconds
+  FACTORY_ENABLED: factory.enabled
+  FACTORY_INTAKE: factory.intake
+  FACTORY_BASE_LABEL_SETTLE_S: factory.baseLabelSettleSeconds
   GITHUB_API_URL: api.githubApiUrl
   GITHUB_APP_ID: api.githubAppId
   GITHUB_APP_PRIVATE_KEY: api.githubAppExistingSecret
   GITHUB_CLONE_BASE: api.githubCloneBase
-  GITHUB_FACTORY_CARD_BASE_URL: api.githubFactoryCardBaseUrl
-  GITHUB_FACTORY_CI_WAIT_S: api.githubFactoryCiWaitSeconds
-  GITHUB_FACTORY_PYTHON_CI: api.githubFactoryPythonCi
-  GITHUB_FACTORY_INGRESS_ENABLED: api.githubFactoryIngressEnabled
-  GITHUB_FACTORY_LABEL: api.githubFactoryLabel
-  GITHUB_FACTORY_MENTION: api.githubFactoryMention
   GITHUB_REPO_ALLOWLIST: api.githubRepoAllowlist
   GITHUB_REVIEW_INGRESS_ENABLED: api.githubReviewIngressEnabled
   GITHUB_REVIEW_RECONCILER_INTERVAL_S: api.githubReviewReconcilerIntervalSeconds
   GITHUB_TOKEN: api.githubTokenExistingSecret
   GITHUB_WEBHOOK_SECRET: api.githubWebhookSecret
+  GIT_SSL_CAINFO: codeHostTrust.caBundle.configMapRef.name
   LANGFUSE_HOST: langfuse.host / langfuse.web.service.port
   LANGFUSE_PUBLIC_KEY: langfuse.init.projectPublicKey
   LANGFUSE_SECRET_KEY: langfuse.existingSecret
@@ -158,12 +226,16 @@ api:
   VALKEY_PORT: valkey.port
   VALKEY_TLS: valkey.tls
 dispatcher:
+  CURIE_TEST_INSTALLATION_THREAD_TURN_LIMIT: testInstallation.threadTurnLimit
   CURIE_API_KEY: api.apiKey
   CURIE_API_PREFLIGHT_TIMEOUT_SECONDS: dispatcher.apiPreflightTimeoutSeconds
   CURIE_API_URL: dispatcher.apiBaseUrl
   CURIE_APPROVAL_CHAT_ATTESTER_SECRET: api.approvalChatAttesterSecret
   CURIE_HEARTBEAT_FILE: the chart-managed heartbeat path (remove this override)
+  CURIE_HTTP_RECEIVER_DIR: dispatcher.httpIdentity.existingSecret
   CURIE_SLACK_IDENTITIES: dispatcher.slack.identities
+  CURIE_TEST_INSTALLATION_DRIVERS: testInstallation.drivers
+  CURIE_TEST_INSTALLATION_ENABLED: testInstallation.enabled
   SLACK_APP_TOKEN: dispatcher.slack.appTokenExistingSecret
   SLACK_BOT_TOKEN: dispatcher.slack.botTokenExistingSecret
   SLACK_SIGNING_SECRET: dispatcher.slack.signingSecretExistingSecret
@@ -172,18 +244,26 @@ dispatcher:
   VALKEY_PORT: valkey.port
   VALKEY_TLS: valkey.tls
 agentSandbox.runner:
+  CURIE_ATTACHMENT_ACCESS_ENABLED: worker.attachments.enabled and worker.attachments.mode
   ANTHROPIC_BASE_URL: inference.service.port
+  CURIE_ATTACHMENTS_MANIFEST: the claim's attachment manifest, filled per boot (remove this override)
   CURIE_BUDGET: agentSandbox.runner.budget.maxOutputTokensPerRun
   CURIE_CREDENTIALS: agentSandbox.runner.credentialsExistingSecret
   CURIE_FAKE_MODEL: agentSandbox.runner.fakeModel
   CURIE_MODEL: agentSandbox.runner.model
   CURIE_PLUGIN_DIR: agentSandbox.runner.pluginDir
+  CURIE_REPO_CA_BUNDLE: codeHostTrust.caBundle.configMapRef.name
+  CURIE_RUNNER_ALLOW_TOKENLESS: nothing; a cluster runner always serves a bearer (remove this override)
   CURIE_RUNNER_PORT: agentSandbox.runner.port
+  CURIE_RUNNER_TOKEN: the chart-managed runner token Secret (remove this override)
   CURIE_SANDBOX_ID: the pod identity (remove this override)
   CURIE_SESSION_ID: the chart-managed warm session identity (remove this override)
   GIT_CONFIG_COUNT: agentSandbox.runner.workspace.enabled
   GIT_CONFIG_KEY_0: agentSandbox.runner.workspace.mountPath
   GIT_CONFIG_VALUE_0: agentSandbox.runner.workspace.mountPath
+  GIT_SSL_CAINFO: codeHostTrust.caBundle.configMapRef.name
   HOME: agentSandbox.runner.hardening.home
+  REQUESTS_CA_BUNDLE: codeHostTrust.caBundle.configMapRef.name
+  SSL_CERT_FILE: codeHostTrust.caBundle.configMapRef.name
 otelCollector:
   LANGFUSE_OTLP_AUTH_HEADER: otelCollector.otlpAuthHeader / langfuse.existingSecret

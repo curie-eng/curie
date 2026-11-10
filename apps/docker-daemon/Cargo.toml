@@ -1,0 +1,25 @@
+[package]
+name = "curie-docker-authz"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+publish = false
+description = "Docker authorization plugin for Curie's per-run Docker daemon (ADR 0217)"
+
+[lib]
+name = "curie_docker_authz"
+path = "src/lib.rs"
+
+[[bin]]
+name = "curie-docker-authz"
+path = "src/main.rs"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[profile.release]
+opt-level = "s"
+lto = true
+codegen-units = 1
+strip = true

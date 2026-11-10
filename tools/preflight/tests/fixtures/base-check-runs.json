@@ -1,0 +1,29 @@
+{
+  "total_count": 4,
+  "check_runs": [
+    {
+      "id": 1,
+      "name": "Python (ruff + mypy + pytest)",
+      "status": "completed",
+      "conclusion": "failure"
+    },
+    {
+      "id": 2,
+      "name": "E2E required",
+      "status": "completed",
+      "conclusion": "success"
+    },
+    {
+      "id": 3,
+      "name": "Optional example",
+      "status": "completed",
+      "conclusion": "failure"
+    },
+    {
+      "id": 4,
+      "name": "Fix pin verification",
+      "status": "in_progress",
+      "conclusion": null
+    }
+  ]
+}

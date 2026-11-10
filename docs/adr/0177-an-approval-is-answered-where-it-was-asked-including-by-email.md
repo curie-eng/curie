@@ -4,9 +4,27 @@ Date: 2026-09-25
 
 Status: Accepted
 
+**Partially amended by [ADR 0273](0273-approval-routes-own-expiry-and-reminders.md)**
+(back link added under [ADR 0045](0045-the-status-line-is-the-mutable-part-of-an-immutable-adr.md)):
+ADR 0273 extends decision 5 with non-interactive reminder replies and decision 6
+with pending-lifetime reference retention and bounded terminal retention.
+
+**Partially amended by [ADR 0272](0272-approver-dm-delivery-uses-one-selected-recipient.md)**
+(back link added under [ADR 0045](0045-the-status-line-is-the-mutable-part-of-an-immutable-adr.md)):
+ADR 0272 adds `approver_dm` to the opening location rule and decisions 1 and 2,
+and extends decision 6's single-card lifecycle to that surface.
+
+**Superseded in part by [ADR 0220](0220-one-identity-provider-decides-who-may-invoke-and-approve-on-every-channel.md)**
+(back-link added under [ADR 0045](0045-the-status-line-is-the-mutable-part-of-an-immutable-adr.md)):
+for an agent that names an approver team, approver-team membership replaces
+amendment A1 to A3's `approvers.emails` list and its "no list, nobody" rule.
+Everything else in this ADR stands.
+
 Accepted with explicit maintainer approval from Brian Conn in the review of
 [#3252](https://github.com/curie-eng/curie/pull/3252), the pull request that
 published this status, before implementation.
+
+**Amended 2026-10-01** by the [amendment](#amendment-email-approver-lists) at the end, at the request of Brian Conn, the maintainer, in the [review of #3584](https://github.com/curie-eng/curie/pull/3584#pullrequestreview-5378690059), who asked for a small change to this ADR instead of a separate one. It replaces decision 3, the requester-only set in decision 4, the last sentence of decision 7 and rejected alternative 2. The text between this note and the amendment is unchanged. This edit goes beyond the status line and back-link that [ADR-0045](0045-the-status-line-is-the-mutable-part-of-an-immutable-adr.md) allows, because the maintainer asked for it. The amendment is accepted with his explicit approval on merge of [#3584](https://github.com/curie-eng/curie/pull/3584), and is realized by [#3585](https://github.com/curie-eng/curie/pull/3585) (platform) and [#3450](https://github.com/curie-eng/curie/pull/3450) (mail adapter).
 
 When a bot pauses for a person's approval, it can only be answered by a click
 in Slack. A request raised in an email thread therefore can never be approved:
@@ -181,7 +199,7 @@ sets, without waiting for this ADR.
    `apps/api/src/curie_api/approvers.py`: the requester-only set.
 4. `apps/worker/src/curie_worker/kernel.py`: `_parse_approval_targets` accepts
    the mode, and the escalation in decision 3.
-5. `apps/mail-adapter/src/curie_mail_adapter/`: render the intent, keep
+5. `packages/channel-gateway/src/curie_channel_gateway/mail/`: render the intent, keep
    references, read replies, send the follow-up.
 6. `cli/src/commands.rs` and `cli/src/api.rs`: route validation.
 7. `docs/interfaces/approval/INTERFACE.md` and
@@ -210,3 +228,13 @@ a requester approves by replying to a real email and the bot resumes.
    link, and a click proves only that someone held the email.
 4. **Only routeless approvals, no new route mode.** Rejected. A gate that names
    a route could then never be answered by email.
+
+## Amendment: email approver lists
+
+Added 2026-10-01. An approval shown in an email thread is answered only by an address the route lists.
+
+- **A1. A route may list approver emails.** `approvers.emails` holds exact, bare addresses (no display name, wildcard or domain), stored and compared lowercase. It is allowed only on a `requesting_surface` route, and may sit beside `users` or `group`: a Slack card reads only the Slack entries, an email card reads only `emails`. An empty list is refused when written. This reverses rejected alternative 2; the identity links of ADR-0166 (#2910) will absorb the list when they land.
+- **A2. Who may answer.** A reply counts only when all of these hold, checked in this order: (1) it passes the adapter's inbound gate (SPF, DKIM and DMARC); (2) the binding's `allowed_callers` admit its sender; (3) it follows the reply rules of decision 5; (4) the sender's address is on `emails`. Only the adapter that serves the thread's binding can carry the answer; no operator, console or Slack principal can answer an email card. The inbound gate proves the sending domain, not the mailbox, and that limitation is accepted.
+- **A3. No list, nobody.** The requester-only default is retired. An email card whose route lists no addresses, including a routeless approval, admits nobody, so the worker escalates it when it is raised instead of letting it expire. Any other non-Slack channel is treated the same way.
+- **A4. Slack is unchanged.** An address never answers a Slack card, and a route that lists only `emails` admits nobody on Slack.
+- **A5. The requester adds approvers.** The request email names who can approve and says which of them are already on the thread. If none is, the requester replies all and adds any number of listed approvers; the bot never emails an approver who is not on the thread. The first answer decides and is final, and later answers are told it was already answered. A listed requester may approve their own request, as on Slack under [ADR-0106](0106-an-approver-is-an-authenticated-principal.md). The outcome always reaches the requester: it is sent reply all to the winning answer, and directly to the requester when they are not on it.

@@ -47,14 +47,14 @@ from channel_protocol import (
     ReplyPost,
     ReplyTarget,
 )
-from curie_dispatcher.queue import to_stream_fields
-from curie_worker.attachments import SlackFileClient, SlackFileError
-from curie_worker.blocks import (
+from curie_channel_gateway.slack.blocks import (
     PROGRESS_CARD_BLOCK_ID_PREFIX,
     PROGRESS_MILESTONE_BLOCK_ID_PREFIX,
 )
+from curie_channel_gateway.slack.files import SlackFileClient, SlackFileError
+from curie_channel_gateway.slack.slack_sink import SlackReplyAdapter
+from curie_internal.turn_queue import to_stream_fields
 from curie_worker.reply_sink import TargetRoute
-from curie_worker.slack_sink import SlackReplyAdapter
 from redis import Redis
 from redis.exceptions import RedisError
 from slack_sdk.errors import SlackApiError
@@ -523,7 +523,7 @@ def test_live_slack_pdf_reaches_the_model(caplog: pytest.LogCaptureFixture) -> N
             time.sleep(min(0.2, max(0.05, deadline - time.monotonic())))
         else:
             raise _ProofError("worker did not acknowledge the live proof before the deadline")
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001 - existing broad catch retained
         failure = (
             str(exc)
             if isinstance(exc, _ProofError)
@@ -540,7 +540,7 @@ def test_live_slack_pdf_reaches_the_model(caplog: pytest.LogCaptureFixture) -> N
                     timeout=cleanup_timeout,
                     data={"channel": config.slack_channel, "ts": placeholder_ts},
                 )
-            except Exception:
+            except Exception:  # noqa: BLE001 - existing broad catch retained
                 cleanup_failures.append("Slack message cleanup")
         if file_id is not None:
             try:
@@ -551,7 +551,7 @@ def test_live_slack_pdf_reaches_the_model(caplog: pytest.LogCaptureFixture) -> N
                     timeout=cleanup_timeout,
                     data={"file": file_id},
                 )
-            except Exception:
+            except Exception:  # noqa: BLE001 - existing broad catch retained
                 cleanup_failures.append("Slack file cleanup")
         # The external driver owns this isolated Valkey database. Leaving the
         # entry avoids racing the worker between its visible Slack edit and ACK.

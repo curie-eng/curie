@@ -5,6 +5,7 @@ from __future__ import annotations
 import copy
 import json
 from dataclasses import dataclass, field
+from functools import partial
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit
@@ -13,7 +14,7 @@ import aiohttp
 import anyio
 from aci_protocol import PublicationContext
 
-from .workspace_snapshot import capture_workspace_snapshot
+from .workspace_snapshot import WorkspaceHistoryError, capture_workspace_snapshot
 
 PRECHECK_TIMEOUT_SECONDS = 10
 _MAX_PRECHECKS = 5
@@ -22,10 +23,6 @@ _UNAVAILABLE = (
     "precheck_unavailable: Publication could not be verified. No approval was created. "
     "Make a working tree file change or retry with fresh execution context."
 )
-
-
-class _MalformedPublication(ValueError):
-    """A malformed proposal retains the existing halting gate behavior."""
 
 
 def _origin(url: str | None) -> tuple[str, str, int] | None:
@@ -53,7 +50,6 @@ class _Call:
     tool_input: dict[str, Any]
     ready: anyio.Event = field(default_factory=anyio.Event)
     refusal: str | None = _UNAVAILABLE
-    malformed: ValueError | None = None
     conflicted: bool = False
 
 
@@ -66,9 +62,19 @@ class PublicationPrecheck:
     """
 
     def __init__(
-        self, workspace: Path | None, trusted_url: str | None, *, network_enabled: bool
+        self,
+        workspace: Path | None,
+        trusted_url: str | None,
+        *,
+        network_enabled: bool,
+        repo_origin: str | None,
+        repo_path: str | None,
     ) -> None:
         self._workspace = workspace
+        # The boot env's code host origin and repository path (ADR 0197); the
+        # snapshot check trusts them exactly as the publication snapshot does.
+        self._repo_origin = repo_origin
+        self._repo_path = repo_path
         self._trusted_origin = _origin(trusted_url)
         self._network_enabled = network_enabled
         self._context: PublicationContext | None = None
@@ -113,9 +119,7 @@ class PublicationPrecheck:
             try:
                 with anyio.fail_after(PRECHECK_TIMEOUT_SECONDS):
                     call.refusal = await self._compare(context, tool_input)
-            except _MalformedPublication as exc:
-                call.malformed = exc
-            except Exception:
+            except Exception:  # noqa: BLE001 - existing broad catch retained
                 # Never include a transport diagnostic containing the endpoint
                 # or its credential in model text, transcripts or logs.
                 call.refusal = _UNAVAILABLE
@@ -123,13 +127,7 @@ class PublicationPrecheck:
                 call.ready.set()
         if self._context is not context or not self._active:
             return _UNAVAILABLE
-        refusal: str | None
-        if call.conflicted:
-            refusal = _UNAVAILABLE
-        else:
-            if call.malformed is not None:
-                raise call.malformed
-            refusal = call.refusal
+        refusal: str | None = _UNAVAILABLE if call.conflicted else call.refusal
         if refusal is not None:
             self.refused_ids.add(tool_use_id)
         return refusal
@@ -142,9 +140,15 @@ class PublicationPrecheck:
             return "body_required: Provide a useful nonblank publication body and retry."
         title = tool_input.get("title")
         if not isinstance(title, str) or not title.strip() or len(title) > 240:
-            raise _MalformedPublication("publication title must be 1 to 240 characters")
+            # #4460: a malformed proposal is a continuing refusal, exactly like
+            # a blank body. The refusal tells the model to retry, so halting the
+            # turn on it would fail the run before the retry can happen.
+            return "title_required: Provide a pull request title of 1 to 240 characters and retry."
         if not isinstance(body, str) or len(body) > 65_536:
-            raise _MalformedPublication("publication body must be at most 65536 characters")
+            return (
+                "body_too_large: Shorten the publication body to at most 65536"
+                " characters and retry."
+            )
         if (
             self._trusted_origin is None
             or _origin(context.precheck_url) != self._trusted_origin
@@ -154,17 +158,25 @@ class PublicationPrecheck:
             return "precheck_unavailable: The managed workspace is unavailable."
         try:
             snapshot = await anyio.to_thread.run_sync(
-                capture_workspace_snapshot, self._workspace, abandon_on_cancel=True
+                partial(
+                    capture_workspace_snapshot,
+                    self._workspace,
+                    base_sha=context.expected_head,
+                    trusted_origin=self._repo_origin,
+                    repository_path=self._repo_path,
+                ),
+                abandon_on_cancel=True,
             )
-        except Exception:
+        except WorkspaceHistoryError:
+            return (
+                "head_changed: Local HEAD is not the prepared head or a local commit on top "
+                "of it. Restore or refresh the checkout through the trusted workspace path "
+                "before retrying."
+            )
+        except Exception:  # noqa: BLE001 - existing broad catch retained
             return (
                 "precheck_unavailable: The workspace snapshot could not be captured. "
                 "Correct the working tree and retry."
-            )
-        if snapshot.base_sha != context.expected_head:
-            return (
-                "head_changed: Local HEAD differs from the prepared head. Restore or "
-                "refresh the checkout through the trusted workspace path before retrying."
             )
         if snapshot.patch:
             return None

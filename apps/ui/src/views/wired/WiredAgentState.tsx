@@ -2,6 +2,7 @@ import { useCallback, useEffect, useState } from "react";
 import { C } from "../../tokens";
 import { Button, Card, Chip, Notice } from "../../primitives";
 import {
+  isUnauthorized,
   listStateNamespaces,
   listStateEntries,
   type StateNamespace,
@@ -15,6 +16,19 @@ import {
 // namespace, every key with its value, compare-and-set version, and most recent
 // write. Read-only: it never mutates the store. Backed by the real API over the
 // same-origin /api proxy (GET /agents/{id}/state and .../state/{namespace}).
+//
+// Those routes accept only the platform key or a sandbox state token, never the
+// console session (#1047, ADR-0083), so under cookie auth a read is refused with
+// a 401. The panel says so instead of claiming the agent stored nothing; letting
+// a session read state is a deferred follow-up that needs an ADR amendment.
+
+function StateUnavailable({ padding }: { padding: string }) {
+  return (
+    <div data-testid="state-unavailable">
+      <Notice padding={padding}>Durable state is not readable from a console session yet.</Notice>
+    </div>
+  );
+}
 
 function formatWhen(iso: string): string {
   const d = new Date(iso);
@@ -35,16 +49,20 @@ export function WiredAgentState({ agentId }: { agentId: string }) {
   const [entries, setEntries] = useState<StateEntry[] | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+  const [refused, setRefused] = useState(false);
   const [entriesLoading, setEntriesLoading] = useState(false);
   const [entriesError, setEntriesError] = useState<string | null>(null);
+  const [entriesRefused, setEntriesRefused] = useState(false);
 
   const loadNamespaces = useCallback(async () => {
     setLoading(true);
     setError(null);
+    setRefused(false);
     try {
       setNamespaces(await listStateNamespaces(agentId));
     } catch (e) {
-      setError(e instanceof Error ? e.message : String(e));
+      if (isUnauthorized(e)) setRefused(true);
+      else setError(e instanceof Error ? e.message : String(e));
     } finally {
       setLoading(false);
     }
@@ -55,6 +73,7 @@ export function WiredAgentState({ agentId }: { agentId: string }) {
       setSelected(namespace);
       setEntriesLoading(true);
       setEntriesError(null);
+      setEntriesRefused(false);
       setEntries(null);
       try {
         const rows = await listStateEntries(agentId, namespace);
@@ -63,7 +82,8 @@ export function WiredAgentState({ agentId }: { agentId: string }) {
         rows.sort((a, b) => b.updated_at.localeCompare(a.updated_at));
         setEntries(rows);
       } catch (e) {
-        setEntriesError(e instanceof Error ? e.message : String(e));
+        if (isUnauthorized(e)) setEntriesRefused(true);
+        else setEntriesError(e instanceof Error ? e.message : String(e));
       } finally {
         setEntriesLoading(false);
       }
@@ -108,8 +128,11 @@ export function WiredAgentState({ agentId }: { agentId: string }) {
 
         {loading ? (
           <Notice padding="28px 20px">Loading state…</Notice>
-        ) : !namespaces || namespaces.length === 0 ? (
-          <Notice padding="28px 20px">This agent has not stored any durable state yet.</Notice>
+        ) : refused ? (
+          <StateUnavailable padding="28px 20px" />
+        ) : !namespaces ? null : namespaces.length === 0 ? (
+          // Only a successful empty read is evidence that nothing was stored.
+          error ? null : <Notice padding="28px 20px">This agent has not stored any durable state yet.</Notice>
         ) : (
           <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
             <div style={{ display: "flex", flexWrap: "wrap", gap: 8 }}>
@@ -159,6 +182,8 @@ export function WiredAgentState({ agentId }: { agentId: string }) {
                 ) : null}
                 {entriesLoading ? (
                   <Notice padding="20px">Loading keys…</Notice>
+                ) : entriesRefused ? (
+                  <StateUnavailable padding="20px" />
                 ) : !entries || entries.length === 0 ? (
                   <Notice padding="20px">No keys in this namespace.</Notice>
                 ) : (

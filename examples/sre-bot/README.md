@@ -1,14 +1,51 @@
 # SRE bot example
 
+The SRE co-worker is a second use case of the same Curie platform behind the
+[Software Factory](../../docs/software-factory.md). Ask it to investigate an
+operational problem in a connected workspace, inspect the evidence it gathers,
+and review its proposed action. Reads can run immediately; Kubernetes mutations
+require a fresh human approval. After an approved action, the agent can inspect
+the result and report back. Approval does not expand its Kubernetes permissions.
+
+Start with [Install](#install) and read [Kubernetes authority](#kubernetes-authority)
+before granting access. The default write grant is confined to the disposable
+`sre-demo` namespace. See the [capability reference](../../docs/capabilities.md)
+for release and verification status, and the
+[co-worker overview](../../docs/co-workers.md) for shared platform controls.
+
 This bundle combines Grafana, Tempo, and one pinned upstream Kubernetes MCP
 server. The Kubernetes connector runs only the `core` toolset, has config and
 multi-cluster disabled, is stateless, and reads one file-mounted kubeconfig.
+
+The optional read-only startability observer has a separate
+[observation contract](docs/STARTABILITY.md), explicit installation inputs, and
+a real Kubernetes/Postgres verification gate. It observes configuration;
+credential validity, successful sandbox claims, and execution need their own
+evidence. The default bundle and installer do not install the observer.
 
 Installations whose alert provider delivers email into Slack can opt into the
 per-message, source-thread intake described in
 [`docs/SLACK-EMAIL-INTAKE.md`](docs/SLACK-EMAIL-INTAKE.md). It is deliberately
 not part of the default bundle because its Slack source identity, subject
 prefixes, channel, and signed hook are installation-specific.
+
+Installations can also opt into [scheduled job health alerts](docs/SCHEDULED-JOB-ALERTS.md).
+The renderer requires an explicit namespace and impact description; it does not
+change the default installation or treat intentionally suspended templates as healthy.
+
+Installations preparing automated remediation can opt into the
+[remediation scaler connector](#remediation-scaler-connector-opt-in) and the
+[remediation restarter connector](#remediation-restarter-connector-opt-in),
+acting connectors whose replies the platform can record and qualify, and the
+[remediation metrics connector](#remediation-metrics-connector-opt-in), a
+read-only Prometheus verifier for them. The default bundle declares none of
+them.
+
+Installations with existing paired adapter reply credentials can opt into
+the worker map reconciler described in
+[`docs/ADAPTER-CREDENTIALS.md`](docs/ADAPTER-CREDENTIALS.md). Its inventory is
+explicit and provider independent; credential issuance and renewal remain with
+the existing adapter and platform interfaces.
 
 ## Kubernetes authority
 
@@ -250,6 +287,214 @@ A leaked connector token can still select the platform-upgrader ServiceAccount
 on Job create (PR #2163). Draft ADR-0141 proposes the admission pin; the
 installer does not apply it.
 
+## Remediation scaler connector (opt-in)
+
+Automated remediation
+([ADR 0203](../../docs/adr/0203-automated-remediation-is-a-pre-qualified-action-the-platform-executes-and-verifies.md),
+[operator guide](../../docs/operations.md#automated-remediation)) runs an action
+only through a connector whose replies the platform can record: a sealed prior
+state, the version the write left, and the target
+([writing a reversible connector](../../docs/writing-a-reversible-connector.md)).
+The pinned Kubernetes connector replies in plain text, so no action through it
+can be qualified, idempotent or reversible. The `scaler` connector in
+[`connectors/scaler`](connectors/scaler/server.py) is the acting connector for
+one such action, restoring a stopped workload by setting its replica count.
+
+It is **off by default**. The bundle does not declare it, `plugin.json` names
+none of its tools, and the installer applies nothing for it, so an installation
+that does not opt in is unchanged.
+
+What it serves:
+
+- `scale_deployment(name, replicas)`: sets one allowlisted Deployment's replica
+  count to exactly `replicas` through the `scale` subresource, in the one
+  namespace it is configured for. It is gated for the model. The arguments are
+  flat scalars, so a remediation policy can bound them: `name` as the target
+  argument with the allowed names, and `replicas` as a range.
+- `observe_version(target)`: the live version, read-only and never gated.
+- `restore(target, prior_state, expected_version)`: puts the sealed prior count
+  back. The runner hides it from the model; only the platform's executor calls
+  it, and an undo always needs a person's approval.
+
+The version names the state a write left, the Deployment's uid and its replica
+count, not a random value per write. Scaling to a count already in force writes
+nothing and replies with the same version, which is what an idempotent
+qualification compares: two approved forwards with the same arguments that left
+the same `post_version`. Any change of the count, or the Deployment deleted and
+recreated, is a different version, so an undo refuses with `version_conflict`
+after someone has moved the count. A concurrent change between the connector's
+read and its write is refused the same way, because the write carries the read's
+`resourceVersion`.
+
+To opt in, in your copy of the bundle:
+
+1. Merge [`connectors/scaler/opt-in.yaml`](connectors/scaler/opt-in.yaml): its
+   `connector` entry into `connectors.yaml` and its `plugin` entries into
+   `.claude-plugin/plugin.json`. Set `SCALER_NAMESPACE`, `SCALER_DEPLOYMENTS` and
+   `SCALER_MAX_REPLICAS` for your workload. An empty namespace or allowlist
+   refuses every call.
+2. Edit and apply [`manifests/scaler-access.yaml`](manifests/scaler-access.yaml)
+   so its Role's namespace and `resourceNames` match those settings. It is a
+   separate identity from `manifests/kubernetes-access.yaml`, limited to `get`
+   and `update` on `deployments/scale` for the named Deployments.
+3. Assemble a kubeconfig for `sre-bot-scaler` from its token Secret and store it
+   as the connector secret `SCALER_KUBECONFIG`.
+4. Create the Kubernetes Secret `sre-bot-scaler-sealing` with the keys
+   `SNAPSHOT_SEALING_KEY` (`<kid>:<base64 of 32 bytes>`) and
+   `SNAPSHOT_SEALING_KEYS_RETAINED` (empty until a key rotation).
+5. Build the connector image with `curie build --plugin-dir <bundle> --registry <ref>`,
+   then deploy the bundle.
+
+The connector does not make anything automatic. A remediation policy, its
+qualification drills and a verifier through a different connector are still
+required, in the [drill order](../../docs/operations.md#qualifying-an-action-the-drill-order).
+`examples/tests/test_sre_bot_scaler_opt_in.py` applies the opt-in file to the
+shipped bundle and runs the intake validators on the result.
+
+## Remediation restarter connector (opt-in)
+
+A rolling restart is the remediation operators reach for first, and it cannot
+be undone: writing the old state back would roll the workload a second time.
+ADR 0203 admits such an action to automatic execution only in its REMEDIATION-11
+class: idempotent, bounded to the policy's declared target, and verified. The
+`restarter` connector in [`connectors/restarter`](connectors/restarter/server.py)
+is the acting connector for that action. It is **off by default**, like the
+scaler.
+
+What it serves:
+
+- `restart_deployment(name, restart_at)`: sets
+  `kubectl.kubernetes.io/restartedAt` on the pod template of one allowlisted
+  Deployment, in the one namespace it is configured for, to `restart_at`
+  formatted as RFC 3339 UTC. That is the annotation `kubectl rollout restart`
+  writes, so the controller rolls the workload. It is gated for the model.
+
+Nothing else: no `observe_version` and no `restore`. The capability probe never
+records it as restore capable, so every record it leaves is not undoable
+(`refused_not_restore_capable`).
+
+`restart_at` is the token that makes the restart idempotent: a Unix time in
+seconds, normally the start time of the alert being handled. A remediation
+policy bounds an argument only by a closed set or a numeric range, so the token
+is an integer, and the policy bounds it with a range:
+
+- the same `restart_at` again writes nothing and replies with the same version,
+  `deployments/<uid>/restartedAt=<value>`, so two approved forwards with the same
+  arguments leave the same `post_version`, which the idempotent qualification
+  compares;
+- the annotation never moves backwards: when it already names an instant at or
+  after `restart_at`, the workload was restarted since that incident began and
+  the call writes nothing;
+- a `restart_at` more than five minutes in the future is refused, because it
+  would suppress every later restart;
+- a new incident has a new start time, so it restarts again, at most once per
+  incident per target under the platform's limits.
+
+The reply carries a sealed `prior` (the previous annotation and the uid) only
+because the ledger records a `post_version` from a sealed reply alone; nothing
+ever opens it. The write is a merge patch of the one annotation carrying the
+read's `uid` and `resourceVersion` as preconditions, so a concurrent restart is
+refused `version_conflict`. A paused Deployment is refused, because the
+annotation would not roll it.
+
+To opt in, in your copy of the bundle:
+
+1. Merge [`connectors/restarter/opt-in.yaml`](connectors/restarter/opt-in.yaml):
+   its `connector` entry into `connectors.yaml` and its `plugin` entries into
+   `.claude-plugin/plugin.json`. Set `RESTARTER_NAMESPACE` and
+   `RESTARTER_DEPLOYMENTS` for your workload. An empty namespace or allowlist
+   refuses every call.
+2. Edit and apply [`manifests/restarter-access.yaml`](manifests/restarter-access.yaml)
+   so its Role's namespace and `resourceNames` match those settings. It is a
+   separate identity from both the general connector identity and the scaler's,
+   limited to `get` and `patch` on the named Deployments.
+3. Assemble a kubeconfig for `sre-bot-restarter` from its token Secret and store
+   it as the connector secret `RESTARTER_KUBECONFIG`.
+4. Create the Kubernetes Secret `sre-bot-restarter-sealing` with the key
+   `SNAPSHOT_SEALING_KEY` (`<kid>:<base64 of 32 bytes>`).
+5. Build the connector image with `curie build --plugin-dir <bundle> --registry <ref>`,
+   then deploy the bundle.
+
+Why a separate connector rather than a verb on the scaler: the scaler's
+credential reaches only the `scale` subresource and never a pod template, and a
+restart must patch the pod template. RBAC cannot narrow `patch` to one field, so
+a leaked restarter token can change anything in the named Deployments; say so in
+the qualification's worst case statement. Undo is also decided per connector, so
+a restart on the restore-capable scaler would be reported undoable.
+
+A policy action for it, with placeholder bounds:
+
+```json
+{"name": "restart-api", "kind": "remediate",
+ "connector": "restarter", "tool": "restart_deployment",
+ "arguments": {"name": {"type": "string", "allowed": ["example-api"]},
+               "restart_at": {"type": "integer", "minimum": 1767225600, "maximum": 4102444800}},
+ "target": {"argument": "name", "allowed": ["example-api"]},
+ "reversibility": "idempotent",
+ "verifier": {"connector": "example-metrics", "...": "..."},
+ "automatic": false, "qualification": null}
+```
+
+Its qualification is the idempotent drill in the
+[drill order](../../docs/operations.md#qualifying-an-action-the-drill-order):
+two `confirmed` approved forwards with the same `name` and `restart_at`, the
+second leaving the same `post_version`.
+`examples/tests/test_sre_bot_restarter_opt_in.py` applies the opt-in file to the
+shipped bundle and runs the intake validators on the result.
+
+## Remediation metrics connector (opt-in)
+
+Every automated remediation is checked before it runs (`precondition`) and
+judged after it ran (`verifier`) by a read-only tool of a connector other than
+the acting one. The platform applies one RFC 6901 pointer to the read's
+structured reply and one comparator to the value it finds
+([operator guide](../../docs/operations.md#automated-remediation)). The
+`metrics` connector in [`connectors/metrics`](connectors/metrics/server.py) is
+that read for the scaler and the restarter: one tool, `query_value(query)`, that runs a Prometheus
+instant query against one configured URL. It holds no Kubernetes credential and
+has no write verb.
+
+It is **off by default**, like the scaler.
+
+The reply is structured content shaped for the documented pointers:
+
+- a vector is `{"resultType": "vector", "data": [{"metric", "value": [<time>, "<sample>"]}]}`,
+  ordered by labels, so `/data/0/value/1` is the first series' sample as a
+  decimal string the ordering comparators read as a number. An empty vector
+  leaves that pointer absent; write `... or vector(0)` when no series should
+  read as zero, and aggregate (`max`, `sum`) to one series;
+- a scalar is `{"resultType": "scalar", "data": {"value": "<sample>", "time"}}`,
+  read at `/data/value`.
+
+Anything else is a tool error, which the platform records as an unsuccessful
+sample, never a pass: no `METRICS_URL`, a transport error, a timeout
+(`METRICS_TIMEOUT_SECONDS`), a redirect, a non-2xx answer, a Prometheus error, a
+range (`matrix`) or string result, a malformed sample, more than
+`METRICS_MAX_SERIES` series or a body past `METRICS_MAX_RESPONSE_BYTES`.
+
+To opt in, in your copy of the bundle:
+
+1. Merge [`connectors/metrics/opt-in.yaml`](connectors/metrics/opt-in.yaml): its
+   `connector` entry into `connectors.yaml` and its `plugin` entry into
+   `.claude-plugin/plugin.json`. Set `METRICS_URL` to your Prometheus; the
+   default is the bundled observability stack's.
+2. If your Prometheus needs a bearer token, store it in a Secret and declare it
+   as the SecretRef the opt-in file shows. It must not be a secret the acting
+   connector's headers expand, or the platform refuses the policy
+   `verifier_not_independent`.
+3. Build the connector image with `curie build --plugin-dir <bundle> --registry <ref>`,
+   then deploy the bundle.
+
+[`connectors/metrics/example-policy.json`](connectors/metrics/example-policy.json)
+pairs the two: restore `example-api` to one replica with the scaler when
+kube-state-metrics reports no available replica, and verify with the same query
+that at least one is available. It binds with `automatic: false`; the
+[drill order](../../docs/operations.md#qualifying-an-action-the-drill-order)
+still decides when it may run without a person.
+`examples/tests/test_sre_bot_metrics_opt_in.py` applies the opt-in file to the
+shipped bundle, runs the intake validators, validates the example policy with
+the platform's document validator and checks the two connectors' independence.
+
 ## Live demo
 
 The six Slack scenarios (read, approved scale, one-shot re-arm, configuration
@@ -258,12 +503,38 @@ prerequisites, and the expected evidence for each are in [DEMO.md](DEMO.md).
 
 ## Alert source (opt-in)
 
+The optional [CloudWatch source](observability/cloudwatch-alarms/INSTALL.md)
+reads metric and composite alarms for an operator-owned SNS topic. It requires
+separate read-only web identity configuration and a Prometheus overlay; the
+default installer does not enable it. Its [contract](docs/CLOUDWATCH-ALARMS.md)
+distinguishes retained alarm evidence from current provider state.
+
 Alertmanager stays off in the default observability overlay. The optional source
 uses the signer in `observability/alert-signer.yaml` because Alertmanager cannot
 sign webhook bodies. The signer runs the checked in `server.py` in a pinned
 Python image. Its Service is named `alert-signer` in Alertmanager's namespace.
 The webhook overlay mounts only the bearer token into Alertmanager; the
 derived Curie hook secret stays in the signer pod.
+
+Signer diagnostics (`SIGNER-DIAGNOSTICS-1`): upstream non-success responses
+remain HTTP 502 to the source and emit one warning with only the numeric upstream
+status. Transport failures also return 502 and emit only the fixed reason
+`transport_error`. No diagnostic includes a URL, response body, payload, delivery
+identity, authentication header or exception text. Successful forwarding and
+local authentication or payload refusals do not emit this warning. A 502 never
+changes the stable delivery ID or retries inside the signer.
+
+For an existing installation, update the API and every custom signer together
+to the context format in the [trigger contract](../../docs/interfaces/triggers/INTERFACE.md).
+The signed bytes are `b"curie.hook.delivery.v2\n"` followed by
+`{timestamp}.{delivery_id}.{len(context)}:`, compact ASCII JSON for
+`[hook, tool_access]`, and the raw body. The omitted policy is `null` in the
+context, and `len(context)` is its byte length.
+The API refuses signatures made with the previous format. This example copies
+`server.py` into the `alert-signer-code` ConfigMap, so updating the checkout alone
+does not update the installed signer. Repeat the ConfigMap creation and apply
+commands below from the updated checkout, then restart `deployment/alert-signer`
+as described after the command block, alongside the API upgrade.
 
 Configure the two distinct agent fields first. `source_bindings.alertmanager`
 maps `/commonLabels/curie_workload` to the repository and deployed revision.
@@ -352,6 +623,62 @@ changes. A changed `server.py` ConfigMap also needs a signer restart.
 A genuine signed alert creates one partitioned investigation. Missing,
 ambiguous, or unauthorized mappings visibly stop coding. Invalid signatures
 and replayed delivery ids do not multiply work.
+
+#### Protected source mode (opt-in)
+
+The commands above install an ordinary source: it signs with the shared agent
+secret, and `tool_access=read-only` in the hook URL is an optional request the
+ordinary path honors without proving runtime enforcement. The signer also has
+a protected mode for a hook an administrator bound to a mandatory read-only
+source policy under
+[ADR 0190](../../docs/adr/0190-automated-hook-sources-cannot-widen-their-tool-access.md)
+and [ADR 0191](../../docs/adr/0191-protected-hook-delivery-authority.md)
+(`HOOK-SOURCE-POLICY-6`). The default stays ordinary, and an installation that
+does not set the mode keeps the behavior above.
+
+In protected mode the `alert-signer-hook` Secret holds `CURIE_HOOK_URL`,
+`CURIE_HOOK_SOURCE_MODE` set to `protected`, and `CURIE_HOOK_SOURCE_SECRET`,
+the hook's scoped key from `GET /agents/{agent_id}/hooks/{hook}/source-policy/secret`.
+It must not hold `CURIE_HOOK_SECRET`. The hook URL must request
+`tool_access=read-only` and must not carry explicit reply query parameters,
+which protected ingress refuses. The signer refuses to start on any other
+combination, so it never falls back to the shared key or to an optional policy.
+
+For each alert the signer then:
+
+1. Posts the signed support probe `POST /hooks/{agent_id}/{hook}/support` with
+   the body `{"tool_access":"read-only"}`. The probe creates no hook claim,
+   queue entry, Slack post or turn. The signer forwards only when the API
+   answers 200 with `supported` and read-only effective policy. A shared or
+   revoked key (401), an unconfigured or closed hook, an unavailable runtime, or
+   an API without the probe is refused before any delivery.
+2. Forwards the delivery signed under the scoped key with `read-only` in the
+   signed context.
+3. Checks the receipt: `requested_tool_access`, `effective_tool_access` and
+   `tool_access` must each be `read-only`, `source_generation` must equal the
+   generation the support probe reported,
+   and `acceptance_status` must be `accepted` or `preparing`. A duplicate is
+   checked the same way.
+
+A refusal answers HTTP 502 to Alertmanager and logs one warning,
+`protected hook delivery refused (reason=<reason>)`, whose reason is a fixed
+token such as `support_source_unconfigured`, `support_unauthenticated` or
+`receipt_not_read_only`; it never contains a credential, URL or payload.
+Two other failures also answer 502 with one fixed warning. A transport failure
+on the probe or the delivery logs
+`hook ingress forwarding failed (reason=transport_error)`. A delivery the
+ingress answers with a non-2xx status after a supported probe logs
+`hook ingress rejected delivery (status=<status>)`.
+Alertmanager retries with the same delivery ID and counts the failures in
+`alertmanager_notifications_failed_total`, which is the signal to alert on. A
+receipt refusal means the API answered a delivery the source cannot attest as
+read-only; investigate it rather than relaxing the check.
+
+A supported answer needs the protected delivery lane, a qualified runtime and
+current readiness evidence. Until those exist for an installation the probe
+reports the missing piece and the protected signer delivers nothing, which is
+the intended result: ADR 0190 keeps the automated intake uninstalled wherever
+runtime read-only guarantees are required.
 
 ### Slack Email alert source (opt-in)
 
@@ -453,6 +780,18 @@ themselves.
   Alertmanager `startsAt` or a provider state transition time. That timestamp
   identifies the reported episode. It does not prove the condition is still
   active and it never replaces a current read.
+- `SRE-ALERT-4`: For a turn-canary alert, read the installed check's contract,
+  same-route fresh delivery and exact-response observations, and bounded
+  diagnostics before attributing a failure. Delivered relay output with a
+  response mismatch is a probe-compliance finding; legacy exact-response
+  failure without delivery telemetry leaves delivery unverified. Failed
+  delivery establishes only that synthetic path's failure, not its cause or
+  user impact. Internal relay delivery does not prove Slack ingress, Slack
+  posting, useful work or policy compliance. Unverified channel capability,
+  healthy adapter probes and rollout timing alone establish neither a Slack
+  permission fault nor an identity-wide outage. Review a mismatching probe
+  against the agent's supported work without weakening the agent's policy;
+  use actual transport errors and user-turn evidence to establish impact.
 
 ## What watches the alert path
 

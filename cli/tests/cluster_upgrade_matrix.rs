@@ -87,6 +87,10 @@ fn cluster_upgrade_matrix_self_test_refuses_soak_unknown_scenario_and_path_curie
         "self-test must pin cluster upgrade as the mutator\n{text}"
     );
     assert!(
+        text.contains("verified named kind context reaches kubectl helm and cluster upgrade"),
+        "self-test must execute all three clients with the verified task-owned kind context\n{text}"
+    );
+    assert!(
         text.contains("restore_n resumes leftover in_progress 0.10.0"),
         "self-test must pin restore_n resuming leftover in_progress 0.10.0\n{text}"
     );
@@ -109,6 +113,10 @@ fn cluster_upgrade_matrix_self_test_refuses_soak_unknown_scenario_and_path_curie
     assert!(
         text.contains("guarded rollback reloads exclusive 0.10.0 images"),
         "self-test must pin guarded rollback reloading 0.10.0 images\n{text}"
+    );
+    assert!(
+        text.contains("rollback-to-serving leaves the pending revision for the CLI"),
+        "self-test must refuse recovery helpers in rollback-to-serving\n{text}"
     );
     assert!(
         text.contains("published 0.8.8 rollback reloads 0.8.8 images"),
@@ -384,8 +392,29 @@ fn list_shards_json_covers_every_scenario_and_phase_exactly_once() {
         .collect();
     assert_eq!(
         ids,
-        ["s01", "s02", "s03", "s04", "s05", "s06", "s07", "s08", "s09", "s11", "s13", "s14"],
+        [
+            "s01", "s02", "s03", "s04", "s05", "s06", "s07", "s08", "s09", "s11", "s13", "s14",
+            "s15", "s16", "s17", "s18", "s19", "s20", "s21",
+        ],
         "canonical shard ids\n{manifest}"
+    );
+    let rollback_shard = shards
+        .iter()
+        .find(|shard| shard["id"] == "s17")
+        .expect("rollback-to-serving shard s17");
+    assert_eq!(
+        rollback_shard["scenarios"],
+        serde_json::json!([{"name": "rollback-to-serving", "phases": null}]),
+        "s17 must run rollback-to-serving"
+    );
+    let terminal_shard = shards
+        .iter()
+        .find(|shard| shard["id"] == "s19")
+        .expect("terminal-pods shard s19");
+    assert_eq!(
+        terminal_shard["scenarios"],
+        serde_json::json!([{"name": "terminal-pods", "phases": null}]),
+        "s19 must run terminal-pods"
     );
 
     let mut unsplit: Vec<String> = Vec::new();
@@ -474,6 +503,15 @@ fn self_test_checks_shard_coverage_and_timing() {
         "shard coverage refused a dropped phase",
         "shard coverage refused a duplicated phase",
         "per-scenario timing recorded",
+        "apply-kill-takeover uses the binary without harness recovery",
+        "apply-kill-takeover sends SIGKILL to every descendant",
+        "apply-kill-takeover retains its verified private kind context",
+        "adopted named kind cluster retained its private context",
+        "invalid kind kubeconfig refused before runtime calls",
+        "mismatched kind server refused before runtime calls",
+        "terminal-pods runs in setup shard s19",
+        "terminal-pods asserts healthy status with terminal pods, a succeeded upgrade, and the surplus refusal",
+        "shard coverage refused a dropped terminal-pods",
     ] {
         assert!(
             text.contains(needle),
@@ -499,7 +537,14 @@ s08 setup interrupt-resume:apply+commit
 s09 setup n-to-n1 guarded-rollback
 s11 nosetup rollback-published-089
 s13 setup converge-negative
-s14 setup previous-serves";
+s14 setup previous-serves
+s15 setup runner-layer-retire
+s16 setup apply-kill-takeover
+s17 setup rollback-to-serving
+s18 setup hook-fail-not-serving
+s19 setup terminal-pods
+s20 setup rollback-interrupted
+s21 setup rollback-uncatalogued";
 
 fn assert_override_refused(manifest: &str, what: &str) {
     assert_ne!(
@@ -537,6 +582,38 @@ fn self_test_fails_when_override_drops_a_scenario() {
     assert_override_refused(
         &GOOD_SHARDS.replace(" migration-crash", ""),
         "dropped scenario",
+    );
+}
+
+#[test]
+fn self_test_fails_when_override_drops_rollback_to_serving() {
+    assert_override_refused(
+        &GOOD_SHARDS.replace("\ns17 setup rollback-to-serving", ""),
+        "dropped rollback-to-serving scenario",
+    );
+}
+
+#[test]
+fn self_test_fails_when_override_drops_rollback_uncatalogued() {
+    assert_override_refused(
+        &GOOD_SHARDS.replace("\ns21 setup rollback-uncatalogued", ""),
+        "dropped rollback-uncatalogued scenario",
+    );
+}
+
+#[test]
+fn self_test_fails_when_override_drops_runner_layer_retire() {
+    assert_override_refused(
+        &GOOD_SHARDS.replace("\ns15 setup runner-layer-retire", ""),
+        "dropped runner-layer-retire scenario",
+    );
+}
+
+#[test]
+fn self_test_fails_when_override_drops_terminal_pods() {
+    assert_override_refused(
+        &GOOD_SHARDS.replace("\ns19 setup terminal-pods", ""),
+        "dropped terminal-pods scenario",
     );
 }
 
@@ -637,6 +714,179 @@ fn cluster_upgrade_matrix_every_listed_shard_id_resolves() {
 }
 
 #[test]
+fn apply_kill_takeover_waits_for_hook_jobs_before_matching_dry_and_real_takeover() {
+    let source = fs::read_to_string(script()).expect("read cluster upgrade matrix");
+    let body = source
+        .split_once("run_apply_kill_takeover() {")
+        .map(|(_, rest)| rest.split_once("\n}\n").map_or(rest, |(body, _)| body))
+        .expect("run_apply_kill_takeover function");
+    let wait_start = body
+        .find("local running_hooks deadline=$((SECONDS + 600))")
+        .expect("takeover must bound the hook Job wait at 600 seconds");
+    let wait_end = body[wait_start..]
+        .find("\n    done\n")
+        .map(|offset| wait_start + offset + "\n    done\n".len())
+        .expect("hook Job wait must finish before attempting takeover");
+    let hook_wait = &body[wait_start..wait_end];
+    assert!(
+        hook_wait.contains("running_hooks=\"$(running_release_hook_jobs)\"")
+            && hook_wait.contains("[[ -n \"$running_hooks\" ]] || break")
+            && hook_wait.contains("(( SECONDS < deadline )) || die"),
+        "takeover must wait for zero running hook Jobs and refuse on timeout"
+    );
+    let matching_dry = body
+        .find("\"$BIN\" --json cluster upgrade --yes --to \"0.10.1\" --dry-run --take-over \"$holder\"")
+        .expect("matching dry takeover must use the real binary");
+    let real_takeover = body
+        .find("\"$BIN\" --json cluster upgrade --yes --to \"0.10.1\" --take-over \"$holder\"")
+        .expect("real takeover must use the real binary");
+    assert!(
+        wait_end < matching_dry && matching_dry < real_takeover,
+        "the hook Job wait must finish before matching dry and real takeover; a running hook correctly refuses both"
+    );
+}
+
+#[test]
+fn apply_kill_takeover_dry_plan_accepts_prose_and_rejects_reversed_recovery_commands() {
+    let source = fs::read_to_string(script()).expect("read cluster upgrade matrix");
+    let body = source
+        .split_once("run_apply_kill_takeover() {")
+        .map(|(_, rest)| rest.split_once("\n}\n").map_or(rest, |(body, _)| body))
+        .expect("run_apply_kill_takeover function");
+    let assertion = body
+        .split_once("2>\"$EVIDENCE_DIR/apply-kill-takeover-dry-plan.err\"")
+        .and_then(|(_, rest)| rest.split_once("python3 -c '"))
+        .and_then(|(_, rest)| {
+            rest.split_once("\n' \"$EVIDENCE_DIR/apply-kill-takeover-dry-plan.json\"")
+        })
+        .map(|(python, _)| python)
+        .expect("matching dry takeover Python assertion");
+    let helper_at = source
+        .find("check_explicit_helm_plan() {")
+        .expect("explicit helm plan helper");
+    let helper = &source[helper_at
+        ..helper_at
+            + source[helper_at..]
+                .find("\nrun_apply_kill_takeover() {")
+                .expect("helper ends before apply-kill-takeover")];
+    let fixture = tempfile::tempdir().expect("dry plan fixture");
+    let plan_path = fixture.path().join("plan.json");
+    let write_plan = |plan: &[&str]| {
+        fs::write(
+            &plan_path,
+            serde_json::to_vec(&serde_json::json!({"dry_run": true, "plan": plan}))
+                .expect("serialize dry plan"),
+        )
+        .expect("write dry plan fixture");
+    };
+    let run_prose = |plan: &[&str]| {
+        write_plan(plan);
+        Command::new("python3")
+            .args(["-c", assertion])
+            .arg(&plan_path)
+            .args(["example-holder", "acme-release", "2", "ns"])
+            .output()
+            .expect("run the matrix dry takeover prose assertion")
+    };
+    let run_order = |plan: &[&str]| {
+        write_plan(plan);
+        Command::new("bash")
+            .arg("-c")
+            .arg(format!(
+                "{helper}\ncheck_explicit_helm_plan takeover \"$1\" acme-release 2 ns"
+            ))
+            .arg("check_explicit_helm_plan")
+            .arg(&plan_path)
+            .output()
+            .expect("run the matrix explicit helm plan helper")
+    };
+    let context = "example-context";
+    let rollback_plan =
+        format!("helm --kube-context {context} rollback acme-release 2 -n ns --wait --timeout 15m");
+    let mut plan = [
+        "phase plan: 0.10.0 -> 0.10.1",
+        "phase validate: configuration overlay migration and pre-mutation refusals",
+        "take over upgrade ownership from example-holder",
+        rollback_plan.as_str(),
+        "phase drain_preflight: confirm the worker workload is reachable; the worker upgrade drain gate itself runs later, inside Apply's Helm pre-upgrade hook (issue 2010)",
+        "phase checkpoint: persist recoverable release state",
+        "phase migrate: checkpoint boundary only; the chart's pre-upgrade hook Job performs schema migration during apply",
+        "helm upgrade acme-release /example/charts/curie-0.10.1.tgz -n ns --wait --timeout 21900s -f <retained-values>",
+        "phase converge: exact images, generations, replicas, unavailable=0, hooks, queues, manifest",
+        "phase canary: target-version smoke",
+        "phase commit: record known-good version",
+        "config schema: 0.8.8 -> 0.9.0",
+    ];
+    let prose = run_prose(&plan);
+    assert!(
+        prose.status.success(),
+        "ordinary apostrophes in plan prose must not be parsed as shell commands\n{}",
+        output_text(&prose)
+    );
+    let valid = run_order(&plan);
+    assert!(
+        valid.status.success(),
+        "captured plan with context-prefixed rollback before unprefixed upgrade must pass\n{}",
+        output_text(&valid)
+    );
+
+    let context_prefix = format!("--kube-context {context} ");
+    let context_argument = format!("--kube-context {context}");
+    for (original, replacement) in [
+        ("rollback acme-release", "rollback acme-other-release"),
+        ("acme-release 2", "acme-release 9"),
+        ("-n ns", "-n acme-other-namespace"),
+        (context_prefix.as_str(), ""),
+        (context_argument.as_str(), "--kube-context ''"),
+        ("--wait ", ""),
+        ("--wait", "--wait=false"),
+        (" --timeout 15m", ""),
+        ("--timeout 15m", "--timeout 5m"),
+    ] {
+        let rollback = plan[3].replace(original, replacement);
+        let mut invalid_plan = plan;
+        invalid_plan[3] = &rollback;
+        let invalid = run_order(&invalid_plan);
+        assert!(
+            !invalid.status.success(),
+            "takeover must reject rollback replacement {original:?} -> {replacement:?}\n{}",
+            output_text(&invalid)
+        );
+    }
+
+    let prefixed_upgrade = plan[7].replace(
+        "helm upgrade",
+        &format!("helm --kube-context {context} upgrade"),
+    );
+    let mut invalid_plan = plan;
+    invalid_plan[7] = &prefixed_upgrade;
+    let invalid = run_order(&invalid_plan);
+    assert!(
+        !invalid.status.success(),
+        "takeover must require the unprefixed upgrade emitted by helm_upgrade_argv\n{}",
+        output_text(&invalid)
+    );
+
+    plan.swap(3, 7);
+    let prose_reversed = run_prose(&plan);
+    assert!(
+        prose_reversed.status.success(),
+        "plan prose stays valid when recovery commands are reversed\n{}",
+        output_text(&prose_reversed)
+    );
+    let reversed = run_order(&plan);
+    assert!(
+        !reversed.status.success(),
+        "the explicit helm plan helper must reject upgrade before rollback"
+    );
+    assert!(
+        output_text(&reversed).contains("dry run did not plan rollback before upgrade"),
+        "reversed commands must fail the recovery ordering assertion\n{}",
+        output_text(&reversed)
+    );
+}
+
+#[test]
 fn migration_crash_bounds_the_interrupted_upgrade_wait() {
     // #2733: the interrupted first upgrade blocked ~900s on helm's hook wait.
     // It gets 120s to exit, then is killed with ownership and helm lock recovered.
@@ -667,6 +917,264 @@ fn migration_crash_bounds_the_interrupted_upgrade_wait() {
     let text = output_text(&output);
     assert!(
         text.contains("migration-crash bounds the interrupted upgrade wait"),
+        "{text}"
+    );
+}
+
+/// The CRI section of `containerd config dump` from the pinned
+/// kindest/node:v1.31.4 image, trimmed to the keys the loader reads.
+const KIND_NODE_CONTAINERD_DUMP: &str = r#"version = 2
+
+[plugins]
+
+  [plugins."io.containerd.grpc.v1.cri"]
+
+    [plugins."io.containerd.grpc.v1.cri".containerd]
+      default_runtime_name = "runc"
+      disable_snapshot_annotations = true
+      discard_unpacked_layers = true
+      snapshotter = "overlayfs"
+
+  [plugins."io.containerd.transfer.v1.local"]
+
+    [[plugins."io.containerd.transfer.v1.local".unpack_config]]
+      platform = "linux/amd64"
+      snapshotter = "overlayfs"
+"#;
+
+const FAKE_KIND: &str = r#"#!/usr/bin/env bash
+printf 'kind %s\n' "$*" >>"$FAKE_LOG"
+if [[ "$1 $2" == "get nodes" && "$3" == "--name" && "$4" == "$FAKE_CLUSTER" ]]; then
+    [[ -n "$FAKE_NODES" ]] && printf '%s\n' $FAKE_NODES
+    [[ -n "$FAKE_NODES" ]] || echo "No kind nodes found for cluster \"$4\"." >&2
+    exit 0
+fi
+exit 97
+"#;
+
+const FAKE_DOCKER: &str = r#"#!/usr/bin/env bash
+case "$1" in
+version)
+    echo linux/amd64
+    exit 0 ;;
+image)
+    printf 'docker %s\n' "$*" >>"$FAKE_LOG"
+    [[ "$2 $3 $4" == "save --platform linux/amd64" ]] || exit 96
+    shift 4
+    [[ -z "${FAKE_SAVE_FAIL:-}" ]] || { echo "save failed" >&2; exit 1; }
+    printf 'archive:%s\n' "$*"
+    exit 0 ;;
+exec)
+    if [[ "$2" == -i ]]; then
+        node="$3"; shift 3
+        printf 'import %s %s\n' "$node" "$*" >>"$FAKE_LOG"
+        stdin="$(cat)"
+        printf 'stdin %s %s\n' "$node" "$stdin" >>"$FAKE_LOG"
+        if [[ -n "${FAKE_IMPORT_FAIL:-}" ]]; then
+            echo "flag provided but not defined: -discard-unpacked-layers" >&2
+            exit 1
+        fi
+        exit 0
+    fi
+    node="$2"; shift 2
+    printf 'exec %s %s\n' "$node" "$*" >>"$FAKE_LOG"
+    [[ "$*" == "containerd config dump" ]] || exit 95
+    cat "$FAKE_DUMP"
+    exit 0 ;;
+esac
+exit 94
+"#;
+
+fn script_function(source: &str, name: &str) -> String {
+    let start = source
+        .find(&format!("\n{name}() {{"))
+        .unwrap_or_else(|| panic!("{name} must be defined"));
+    let body = &source[start + 1..];
+    let first_line = body.split_once('\n').expect("function line").0;
+    if first_line.trim_end().ends_with('}') {
+        return format!("{first_line}\n");
+    }
+    let end = body.find("\n}\n").expect("function end") + 3;
+    body[..end].to_string()
+}
+
+struct LoadRun {
+    output: std::process::Output,
+    log: String,
+    workdir_entries: usize,
+}
+
+fn run_load_kind_images(nodes: &str, dump: &str, envs: &[(&str, &str)]) -> LoadRun {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let bin_dir = tmp.path().join("bin");
+    let workdir = tmp.path().join("work");
+    fs::create_dir_all(&bin_dir).unwrap();
+    fs::create_dir_all(&workdir).unwrap();
+    for (name, body) in [("kind", FAKE_KIND), ("docker", FAKE_DOCKER)] {
+        let path = bin_dir.join(name);
+        fs::write(&path, body).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+        }
+    }
+    let dump_path = tmp.path().join("containerd-dump.toml");
+    fs::write(&dump_path, dump).unwrap();
+    let log_path = tmp.path().join("calls.log");
+    fs::write(&log_path, "").unwrap();
+
+    let source = fs::read_to_string(script()).expect("read script");
+    let mut harness = String::from("set -euo pipefail\n");
+    for name in ["log", "die", "kind_node_snapshotter", "load_kind_images"] {
+        harness.push_str(&script_function(&source, name));
+    }
+    harness
+        .push_str("load_kind_images ghcr.io/curie-eng/curie-runner:0.10.0 curie-runner:0.10.0\n");
+
+    let path = format!(
+        "{}:{}",
+        bin_dir.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+    let mut command = Command::new("bash");
+    command
+        .arg("-c")
+        .arg(&harness)
+        .env("PATH", path)
+        .env("WORKDIR", &workdir)
+        .env("KIND_CLUSTER", "curie-upgrade-matrix")
+        .env("FAKE_CLUSTER", "curie-upgrade-matrix")
+        .env("FAKE_NODES", nodes)
+        .env("FAKE_DUMP", &dump_path)
+        .env("FAKE_LOG", &log_path);
+    for (key, value) in envs {
+        command.env(key, value);
+    }
+    let output = command.output().expect("run load_kind_images harness");
+    LoadRun {
+        output,
+        log: fs::read_to_string(&log_path).unwrap(),
+        workdir_entries: fs::read_dir(&workdir).unwrap().count(),
+    }
+}
+
+const DISCARDING_IMPORT: &str = "ctr --namespace=k8s.io images import --all-platforms --digests \
+     --snapshotter=overlayfs --discard-unpacked-layers -";
+
+#[test]
+fn load_kind_images_streams_a_discarding_import_into_every_node() {
+    // #5242: kind load image-archive kept every uncompressed layer blob next
+    // to its unpacked snapshot and filled the runner disk.
+    let run = run_load_kind_images(
+        "curie-upgrade-matrix-control-plane curie-upgrade-matrix-worker",
+        KIND_NODE_CONTAINERD_DUMP,
+        &[],
+    );
+    let text = output_text(&run.output);
+    assert!(run.output.status.success(), "{text}\n{}", run.log);
+    let refs = "ghcr.io/curie-eng/curie-runner:0.10.0 curie-runner:0.10.0";
+    for node in [
+        "curie-upgrade-matrix-control-plane",
+        "curie-upgrade-matrix-worker",
+    ] {
+        assert!(
+            run.log
+                .contains(&format!("import {node} {DISCARDING_IMPORT}\n")),
+            "{node} must import with the kind argv plus --discard-unpacked-layers\n{}",
+            run.log
+        );
+        assert!(
+            run.log.contains(&format!("stdin {node} archive:{refs}\n")),
+            "{node} must receive the streamed save of every ref\n{}",
+            run.log
+        );
+        assert!(
+            run.log
+                .contains(&format!("exec {node} containerd config dump\n")),
+            "{node} snapshotter must come from the node's containerd config\n{}",
+            run.log
+        );
+    }
+    assert!(
+        !run.log.contains("--output") && run.workdir_entries == 0,
+        "the save must stream, not leave an archive in WORKDIR\n{}",
+        run.log
+    );
+    assert!(
+        run.log
+            .lines()
+            .filter(|line| line.starts_with("kind "))
+            .all(|line| line == "kind get nodes --name curie-upgrade-matrix"),
+        "kind must only list nodes, never load\n{}",
+        run.log
+    );
+}
+
+#[test]
+fn load_kind_images_refuses_a_failed_import() {
+    let run = run_load_kind_images(
+        "curie-upgrade-matrix-control-plane",
+        KIND_NODE_CONTAINERD_DUMP,
+        &[("FAKE_IMPORT_FAIL", "1")],
+    );
+    assert!(
+        !run.output.status.success(),
+        "an unsupported flag or failed import must fail the load\n{}",
+        run.log
+    );
+}
+
+#[test]
+fn load_kind_images_refuses_a_failed_save() {
+    let run = run_load_kind_images(
+        "curie-upgrade-matrix-control-plane",
+        KIND_NODE_CONTAINERD_DUMP,
+        &[("FAKE_SAVE_FAIL", "1")],
+    );
+    assert!(
+        !run.output.status.success(),
+        "a failed save must fail the load even though ctr read the stream\n{}",
+        run.log
+    );
+}
+
+#[test]
+fn load_kind_images_refuses_a_cluster_without_nodes() {
+    let run = run_load_kind_images("", KIND_NODE_CONTAINERD_DUMP, &[]);
+    let text = output_text(&run.output);
+    assert!(!run.output.status.success(), "{text}");
+    assert!(text.contains("has no nodes"), "{text}");
+    assert!(!run.log.contains("docker image save"), "{}", run.log);
+}
+
+#[test]
+fn load_kind_images_refuses_a_node_without_a_cri_snapshotter() {
+    let dump = KIND_NODE_CONTAINERD_DUMP.replace("      snapshotter = \"overlayfs\"\n\n", "\n");
+    assert!(
+        dump.matches("snapshotter = ").count() == 1,
+        "only the transfer unpack snapshotter may remain"
+    );
+    let run = run_load_kind_images("curie-upgrade-matrix-control-plane", &dump, &[]);
+    let text = output_text(&run.output);
+    assert!(!run.output.status.success(), "{text}");
+    assert!(text.contains("no CRI snapshotter"), "{text}");
+    assert!(!run.log.contains("import "), "{}", run.log);
+}
+
+#[test]
+fn matrix_refuses_missing_kind_cluster_before_invoking_dependencies() {
+    let output = Command::new("bash")
+        .arg(script())
+        .env_remove("CURIE_E2E_KIND_CLUSTER")
+        .env("CURIE_E2E_NAMESPACE", "test-explicit-context")
+        .env("CURIE_E2E_RELEASE", "acme-context")
+        .output()
+        .expect("run the matrix without a named kind cluster");
+    assert!(!output.status.success(), "missing cluster must be refused");
+    let text = output_text(&output);
+    assert!(
+        text.contains("CURIE_E2E_KIND_CLUSTER is required"),
         "{text}"
     );
 }

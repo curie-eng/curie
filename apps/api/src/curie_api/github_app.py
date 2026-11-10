@@ -3,7 +3,7 @@
 Answers one question: *what credential may this installation use to read
 repository X?* Everything about how that credential is then applied — the
 `x-access-token` basic header, keeping it out of `argv` and out of
-`.git/config` — stays in `gitflow._clone_credential_env`, unchanged.
+`.git/config` — stays in `gitflow.clone_credential_env`, unchanged.
 
 Two paths, in order:
 
@@ -35,6 +35,7 @@ from typing import Any
 import httpx
 import jwt
 
+from .code_host_trust import verify_for_bundle
 from .config import Settings
 from .repo_full_name import (
     InvalidRepoFullName,
@@ -56,28 +57,56 @@ _TOKEN_REFRESH_MARGIN_SECONDS = 300
 _REPOSITORY_CACHE_LIMIT = 256
 
 
+@dataclass(frozen=True)
+class GitHubAuth:
+    """The fields that decide which GitHub identity a resolver mints as.
+
+    ``from_settings`` is the one mapping from the install's own settings, used by
+    the non-factory callers (git-flow, review ingress, publication, workspaces).
+    A factory code host entry builds its own from its credential config.
+    """
+
+    app_id: str
+    private_key: str = field(repr=False)
+    token: str = field(repr=False)
+    api_url: str
+    timeout_s: float
+    ca_bundle: str
+
+    @classmethod
+    def from_settings(cls, settings: Settings) -> GitHubAuth:
+        return cls(
+            app_id=settings.github_app_id,
+            private_key=settings.github_app_private_key,
+            token=settings.github_token,
+            api_url=settings.github_api_url,
+            timeout_s=settings.github_app_timeout_seconds,
+            ca_bundle=settings.code_host_ca_bundle,
+        )
+
+
 # Resolvers are shared per credential configuration, because the token cache
 # lives on the resolver. Constructing one per webhook -- the obvious thing --
 # would mean two extra GitHub calls on every single push, and the cache would
-# never once be hit. Keyed on the fields that determine identity, so a test
-# passing its own Settings gets its own resolver rather than a poisoned one.
-_RESOLVERS: dict[tuple[str, str, str, str], GitHubCredentials] = {}
+# never once be hit. Keyed on every `GitHubAuth` field, so a test passing its
+# own configuration gets its own resolver rather than a poisoned one.
+_RESOLVERS: dict[GitHubAuth, GitHubCredentials] = {}
+
+
+def credentials_for_auth(auth: GitHubAuth) -> GitHubCredentials:
+    """The shared resolver for this credential configuration."""
+
+    existing = _RESOLVERS.get(auth)
+    if existing is None:
+        existing = GitHubCredentials(auth=auth)
+        _RESOLVERS[auth] = existing
+    return existing
 
 
 def credentials_for(settings: Settings) -> GitHubCredentials:
-    """The shared resolver for this credential configuration."""
+    """The shared resolver for the install's own GitHub identity (non-factory)."""
 
-    key = (
-        settings.github_app_id,
-        settings.github_app_private_key,
-        settings.github_token,
-        settings.github_api_url,
-    )
-    existing = _RESOLVERS.get(key)
-    if existing is None:
-        existing = GitHubCredentials(settings=settings)
-        _RESOLVERS[key] = existing
-    return existing
+    return credentials_for_auth(GitHubAuth.from_settings(settings))
 
 
 def log_credential_path(settings: Settings) -> None:
@@ -147,7 +176,7 @@ class GitHubCredentials:
     bug, but it is free to avoid.
     """
 
-    settings: Settings
+    auth: GitHubAuth
     _tokens: OrderedDict[str, _CachedToken] = field(default_factory=OrderedDict)
     _installations: OrderedDict[str, int] = field(default_factory=OrderedDict)
     # Per-repository, never global: a mint for one repo must not serialize a
@@ -155,10 +184,13 @@ class GitHubCredentials:
     _mint_locks: dict[str, threading.Lock] = field(default_factory=dict)
     # Guards only the dict above, and is never held across a network call.
     _mint_locks_guard: threading.Lock = field(default_factory=threading.Lock)
+    # The App's slug, read once with the App JWT; an App's slug never changes.
+    _app_slug: str | None = None
+    _app_slug_lock: threading.Lock = field(default_factory=threading.Lock)
 
     @property
     def app_configured(self) -> bool:
-        return bool(self.settings.github_app_id and self.settings.github_app_private_key)
+        return bool(self.auth.app_id and self.auth.private_key)
 
     def describe(self) -> str:
         """Which path is in use, for one startup log line. Names no secret.
@@ -169,8 +201,8 @@ class GitHubCredentials:
         """
 
         if self.app_configured:
-            return f"github app (app_id={self.settings.github_app_id})"
-        if self.settings.github_token:
+            return f"github app (app_id={self.auth.app_id})"
+        if self.auth.token:
             return "personal access token"
         return "none (public repositories only)"
 
@@ -189,14 +221,14 @@ class GitHubCredentials:
 
         if self.app_configured:
             return None
-        if self.settings.github_app_id and not self.settings.github_app_private_key:
+        if self.auth.app_id and not self.auth.private_key:
             return (
-                f"github_app_id is set (app_id={self.settings.github_app_id}) but the "
+                f"github_app_id is set (app_id={self.auth.app_id}) but the "
                 "private key is EMPTY, so the App is not in use. A BYO Secret that "
                 "exists but is unpopulated looks exactly like this -- check the key "
                 "name and whether the sync has completed."
             )
-        if self.settings.github_app_private_key and not self.settings.github_app_id:
+        if self.auth.private_key and not self.auth.app_id:
             return (
                 "a GitHub App private key is set but github_app_id is empty, "
                 "so the App is not in use."
@@ -207,7 +239,7 @@ class GitHubCredentials:
         """A credential able to read ``owner/repo``, or "" if none is configured.
 
         Returning "" rather than raising is deliberate: a public repository
-        needs no credential, and `_clone_credential_env` already treats an empty
+        needs no credential, and `clone_credential_env` already treats an empty
         token as "send no Authorization header".
         """
 
@@ -217,7 +249,7 @@ class GitHubCredentials:
             raise GitHubAppError(str(exc)) from exc
 
         if not self.app_configured:
-            return self.settings.github_token
+            return self.auth.token
 
         cached = self._tokens.get(repo_full_name)
         if cached is not None and cached.usable(time.time()):
@@ -253,13 +285,13 @@ class GitHubCredentials:
         repo_full_name = normalize_repo_full_name(repo_full_name)
         if not self.app_configured:
             raise GitHubInstallationRefused("review feedback requires a configured GitHub App")
-        url = (
-            f"{self.settings.github_api_url.rstrip('/')}"
-            f"/repos/{repo_url_path(repo_full_name)}/installation"
-        )
+        url = f"{self.auth.api_url.rstrip('/')}/repos/{repo_url_path(repo_full_name)}/installation"
         with self._mint_lock_for(repo_full_name):
             try:
-                with httpx.Client(timeout=self.settings.github_app_timeout_seconds) as client:
+                with httpx.Client(
+                    timeout=self.auth.timeout_s,
+                    verify=verify_for_bundle(self.auth.ca_bundle),
+                ) as client:
                     response = client.get(url, headers=self._headers(), follow_redirects=False)
                 if response.status_code != 200:
                     if response.status_code < 500 and response.status_code not in {
@@ -310,6 +342,31 @@ class GitHubCredentials:
         _, token = self.fresh_installation_token(repo_full_name, expected_installation_id)
         return token
 
+    def app_slug(self) -> str:
+        """The App's slug, read once with the App JWT and cached (#4629).
+
+        The App's bot user, which authors what an installation token writes,
+        is ``<slug>[bot]``.
+        https://docs.github.com/en/rest/apps/apps#get-the-authenticated-app
+        Raises `GitHubAppError` when no App is configured or the slug cannot
+        be read; a failed read is not cached.
+        """
+
+        if not self.app_configured:
+            raise GitHubAppError("no GitHub App is configured")
+        with self._app_slug_lock:
+            if self._app_slug is None:
+                url = f"{self.auth.api_url.rstrip('/')}/app"
+                try:
+                    payload = self._get(url)
+                except ValueError as exc:
+                    raise GitHubAppError(f"GitHub returned an unreadable body for {url}") from exc
+                slug = payload.get("slug")
+                if not isinstance(slug, str) or not slug.strip():
+                    raise GitHubAppError(f"GitHub reported no App slug at {url}")
+                self._app_slug = slug
+            return self._app_slug
+
     def _mint_lock_for(self, repo_full_name: str) -> threading.Lock:
         with self._mint_locks_guard:
             lock = self._mint_locks.get(repo_full_name)
@@ -325,10 +382,10 @@ class GitHubCredentials:
         payload = {
             "iat": now - _JWT_BACKDATE_SECONDS,
             "exp": now + _JWT_LIFETIME_SECONDS,
-            "iss": self.settings.github_app_id,
+            "iss": self.auth.app_id,
         }
         try:
-            return jwt.encode(payload, self.settings.github_app_private_key, algorithm="RS256")
+            return jwt.encode(payload, self.auth.private_key, algorithm="RS256")
         except Exception as exc:  # a malformed key is an operator error, not a runtime one
             raise GitHubAppError(
                 "could not sign a GitHub App JWT; check that github_app_private_key "
@@ -352,10 +409,7 @@ class GitHubCredentials:
     def _discover_installation_id(self, repo_full_name: str) -> int:
         """Ask GitHub which installation covers this repository, and cache it."""
 
-        url = (
-            f"{self.settings.github_api_url.rstrip('/')}"
-            f"/repos/{repo_url_path(repo_full_name)}/installation"
-        )
+        url = f"{self.auth.api_url.rstrip('/')}/repos/{repo_url_path(repo_full_name)}/installation"
         data = self._get(url)
         installation_id = data.get("id")
         if not isinstance(installation_id, int):
@@ -404,10 +458,7 @@ class GitHubCredentials:
     def _mint_for_installation(
         self, repo_full_name: str, installation_id: int
     ) -> tuple[str, float]:
-        url = (
-            f"{self.settings.github_api_url.rstrip('/')}"
-            f"/app/installations/{installation_id}/access_tokens"
-        )
+        url = f"{self.auth.api_url.rstrip('/')}/app/installations/{installation_id}/access_tokens"
         # Scoped to this one repository even though the installation may cover
         # more. A credential that leaks is then useless against the others --
         # the narrowing ADR-0092 buys over an org-wide PAT.
@@ -499,7 +550,10 @@ class GitHubCredentials:
 
     def _request(self, method: str, url: str, body: dict[str, Any] | None) -> dict[str, Any]:
         try:
-            with httpx.Client(timeout=self.settings.github_app_timeout_seconds) as client:
+            with httpx.Client(
+                timeout=self.auth.timeout_s,
+                verify=verify_for_bundle(self.auth.ca_bundle),
+            ) as client:
                 response = client.request(method, url, json=body, headers=self._headers())
         except httpx.HTTPError as exc:
             raise GitHubAppError(f"could not reach GitHub at {url}: {exc}") from exc

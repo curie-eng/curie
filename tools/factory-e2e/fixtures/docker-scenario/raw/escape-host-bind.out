@@ -1,0 +1,3 @@
+docker: Error response from daemon: authorization denied by plugin curie-authz: refused by rule host-bind: HostConfig.Binds "/:/host" has a host path source
+
+Run 'docker run --help' for more information

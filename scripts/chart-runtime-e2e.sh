@@ -16,7 +16,7 @@
 #
 # THE PATTERN (reusable -- this is NOT a #56 one-off)
 # ---------------------------------------------------
-# 1. Install a trimmed chart slice on k8scratch with RustFS and agent sandbox.
+# 1. Install a trimmed chart slice on a caller-selected disposable cluster with RustFS and agent sandbox.
 # 2. Assert the API Service pinned and auto allocated NodePort cases.
 # 3. Seed a real bundle object into RustFS.
 # 4. Render the SandboxTemplate.spec.podTemplate into a BOUND sandbox Pod
@@ -37,6 +37,7 @@ set -euo pipefail
 # --------------------------------------------------------------------------
 # Config / flags
 # --------------------------------------------------------------------------
+KUBE_CONTEXT="${CURIE_E2E_KUBE_CONTEXT:-}"
 NAMESPACE="curie-e2eharness"
 RELEASE="e2eharness"
 CHART="charts/curie"
@@ -64,13 +65,14 @@ usage() {
   cat <<'EOF'
 Usage: scripts/chart-runtime-e2e.sh [options]
 
-Stands up a trimmed Curie chart slice on the k8scratch cluster, proves the API
+Stands up a trimmed Curie chart slice on the caller-selected disposable cluster, proves the API
 Service pinned and auto allocated NodePort cases, seeds a real bundle into
 RustFS, renders a bound agent-sandbox Pod, runs its bundle-fetch/extract init
 containers, and execs the runner to assert the #56 credential is NOT readable
 off the shared bundle volume (and the bundle really was provisioned).
 
 Options:
+  --context <context>    Required Kubernetes context for a disposable cluster.
   --namespace <ns>       Namespace to use (default: curie-e2eharness)
   --release <name>       Helm release name (default: e2eharness)
   --chart <path>         Chart path, relative to repo root (default: charts/curie)
@@ -83,10 +85,11 @@ Options:
                          PASS means the credential IS exposed. Point at an unfixed
                          template to prove the harness discriminates.
   --keep                 Skip teardown (leave namespace + release for debugging).
-  --force                Allow running against a non-k8scratch kube context.
+  --force                Allow a context outside the kind/k3d/minikube patterns.
   --help                 Show this help.
 
 Environment:
+  CURIE_E2E_KUBE_CONTEXT Explicit Kubernetes context; the context flag takes precedence.
   CURIE_CHART_E2E_RUNNER_IMAGE
                          Runner image fallback for callers that cannot forward
                          flags. --runner-image takes precedence when supplied.
@@ -95,6 +98,9 @@ EOF
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
+    --context)
+      [[ $# -ge 2 && -n "$2" ]] || { echo "context flag needs a value" >&2; exit 2; }
+      KUBE_CONTEXT="$2"; shift 2 ;;
     --namespace) NAMESPACE="$2"; shift 2 ;;
     --release) RELEASE="$2"; shift 2 ;;
     --chart) CHART="$2"; shift 2 ;;
@@ -106,6 +112,12 @@ while [[ $# -gt 0 ]]; do
     *) echo "unknown flag: $1" >&2; usage >&2; exit 2 ;;
   esac
 done
+
+[[ -n "$KUBE_CONTEXT" ]] || { echo "the context flag or CURIE_E2E_KUBE_CONTEXT is required" >&2; exit 2; }
+case "$KUBE_CONTEXT" in
+  kind-*|k3d-*|minikube|minikube-*) ;;
+  *) [[ "$FORCE" -eq 1 ]] || { echo "context is not a disposable kind/k3d/minikube context; use --force for another disposable cluster" >&2; exit 2; } ;;
+esac
 
 # Resolve repo root from this script's location so --chart is repo-relative.
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -145,24 +157,20 @@ fail() { echo; echo "FAIL: $*"; exit 1; }
 # ns_is_owned <ns> : true iff the namespace exists AND carries the ownership label.
 ns_is_owned() {
   local ns="$1" val
-  val="$(kubectl get ns "$ns" -o "jsonpath={.metadata.labels['curie-e2e-harness/owned']}" 2>/dev/null || echo "")"
+  val="$(kubectl --context "$KUBE_CONTEXT" get ns "$ns" -o "jsonpath={.metadata.labels['curie-e2e-harness/owned']}" 2>/dev/null || echo "")"
   [[ "$val" == "true" ]]
 }
 
 # create_owned_ns <ns> : create the namespace and stamp the ownership label on it.
 create_owned_ns() {
   local ns="$1"
-  kubectl create ns "$ns"
-  kubectl label ns "$ns" "${OWNED_LABEL}=true" --overwrite >/dev/null
+  kubectl --context "$KUBE_CONTEXT" create ns "$ns"
+  kubectl --context "$KUBE_CONTEXT" label ns "$ns" "${OWNED_LABEL}=true" --overwrite >/dev/null
 }
 
 # --------------------------------------------------------------------------
 # Guardrails
 # --------------------------------------------------------------------------
-CURRENT_CTX="$(kubectl config current-context 2>/dev/null || echo "")"
-if [[ "$CURRENT_CTX" != "k8scratch" && "$FORCE" -ne 1 ]]; then
-  fail "kube context is '$CURRENT_CTX', not 'k8scratch'. Refusing (override with --force)."
-fi
 
 # --------------------------------------------------------------------------
 # Teardown (trap on EXIT). Leaves the cluster-scoped sandbox* CRDs alone.
@@ -176,13 +184,13 @@ teardown() {
   fi
   banner "TEARDOWN"
   [[ -n "${JSON_DIR:-}" ]] && rm -rf "$JSON_DIR"
-  helm uninstall "$RELEASE" -n "$NAMESPACE" --no-hooks >/dev/null 2>&1 || true
-  kubectl delete priorityclass \
+  helm --kube-context "$KUBE_CONTEXT" uninstall "$RELEASE" -n "$NAMESPACE" --no-hooks >/dev/null 2>&1 || true
+  kubectl --context "$KUBE_CONTEXT" delete priorityclass \
     "$PLATFORM_PRIORITY_CLASS" "$SANDBOX_PRIORITY_CLASS" \
     --ignore-not-found --wait=true >/dev/null 2>&1 || true
   # Only ever delete a namespace THIS script created (carries the ownership label).
   if ns_is_owned "$NAMESPACE"; then
-    kubectl delete ns "$NAMESPACE" --wait=false >/dev/null 2>&1 || true
+    kubectl --context "$KUBE_CONTEXT" delete ns "$NAMESPACE" --wait=false >/dev/null 2>&1 || true
   else
     echo "namespace $NAMESPACE not owned by this harness; leaving it in place"
   fi
@@ -208,7 +216,7 @@ exec_echo() {
   out_file="$(mktemp /tmp/e2e-exec-out.XXXXXX)"
   err_file="$(mktemp /tmp/e2e-exec-err.XXXXXX)"
   set +e
-  kubectl exec "$POD_NAME" -n "$NAMESPACE" "$@" >"$out_file" 2>"$err_file"
+  kubectl --context "$KUBE_CONTEXT" exec "$POD_NAME" -n "$NAMESPACE" "$@" >"$out_file" 2>"$err_file"
   EXEC_RC=$?
   set -e
   EXEC_OUT="$(cat "$out_file")"
@@ -258,7 +266,7 @@ OTELCOL_QUEUE_CAPACITY_METRIC=otelcol_exporter_queue_capacity
 # the task-owned observer Pod and save the complete payload in METRICS_OUT.
 metrics_snapshot() {
   local service="$1"
-  if ! METRICS_OUT="$(kubectl exec "$OTEL_OBSERVER" -n "$NAMESPACE" -- \
+  if ! METRICS_OUT="$(kubectl --context "$KUBE_CONTEXT" exec "$OTEL_OBSERVER" -n "$NAMESPACE" -- \
       curl -fsS "http://$service:8888/metrics")"; then
     fail "could not read Collector self-metrics from $service:8888"
   fi
@@ -270,7 +278,7 @@ metrics_snapshot() {
 metrics_scrape_from() {
   local observer="$1" deadline=$((SECONDS + 45)) output=""
   while (( SECONDS < deadline )); do
-    if output="$(kubectl exec "$observer" -n "$NAMESPACE" -- \
+    if output="$(kubectl --context "$KUBE_CONTEXT" exec "$observer" -n "$NAMESPACE" -- \
         curl -fsS --connect-timeout 2 --max-time 5 \
         "http://$OTEL_COLLECTOR_SERVICE:8888/metrics" 2>/dev/null)" && \
         grep -q '^otelcol_process_uptime' <<<"$output"; then
@@ -287,7 +295,7 @@ metrics_scrape_from() {
 assert_metrics_scrape_denied() {
   local observer="$1" attempt
   for attempt in 1 2 3; do
-    if kubectl exec "$observer" -n "$NAMESPACE" -- \
+    if kubectl --context "$KUBE_CONTEXT" exec "$observer" -n "$NAMESPACE" -- \
         curl -fsS --connect-timeout 2 --max-time 5 \
         "http://$OTEL_COLLECTOR_SERVICE:8888/metrics" >/dev/null 2>&1; then
       fail "$observer reached Collector self-metrics without an allowed peer"
@@ -302,7 +310,7 @@ assert_collector_metrics_network_policy() {
   metrics_scrape_from "$OTEL_OBSERVER"
   assert_metrics_scrape_denied "$OTEL_UNSELECTED_OBSERVER"
 
-  cat <<EOF | kubectl apply -n "$NAMESPACE" -f -
+  cat <<EOF | kubectl --context "$KUBE_CONTEXT" apply -n "$NAMESPACE" -f -
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:
@@ -330,7 +338,7 @@ spec:
           port: 8888
 EOF
   metrics_scrape_from "$OTEL_UNSELECTED_OBSERVER"
-  kubectl delete networkpolicy "$OTEL_METRICS_TEST_ALLOW" \
+  kubectl --context "$KUBE_CONTEXT" delete networkpolicy "$OTEL_METRICS_TEST_ALLOW" \
     -n "$NAMESPACE" --wait=true --timeout=60s
   echo "Collector metrics policy: selected peer allowed; unselected peer denied; targeted control allow proved CNI enforcement"
 }
@@ -412,7 +420,7 @@ wait_metrics_present() {
 wait_collector_retry_log() {
   local pod="$1" deadline=$((SECONDS + 90)) logs=""
   while (( SECONDS < deadline )); do
-    logs="$(kubectl logs "$pod" -n "$NAMESPACE" 2>&1 || true)"
+    logs="$(kubectl --context "$KUBE_CONTEXT" logs "$pod" -n "$NAMESPACE" 2>&1 || true)"
     if grep -Eiq 'exporting failed.*retry|failed to export.*retry|will retry' <<<"$logs"; then
       return 0
     fi
@@ -475,8 +483,8 @@ assert_sustained_outage_bounded() {
   local pod="$1" samples=20 interval=3 sample ready queue capacity used_kib
   local pod_uid restart_count current_uid current_restart_count last_reason
   local first_used_kib=0 max_used_kib=0 bound_kib growth_allowance_kib=4096
-  pod_uid="$(kubectl get pod "$pod" -n "$NAMESPACE" -o jsonpath='{.metadata.uid}')"
-  restart_count="$(kubectl get pod "$pod" -n "$NAMESPACE" \
+  pod_uid="$(kubectl --context "$KUBE_CONTEXT" get pod "$pod" -n "$NAMESPACE" -o jsonpath='{.metadata.uid}')"
+  restart_count="$(kubectl --context "$KUBE_CONTEXT" get pod "$pod" -n "$NAMESPACE" \
     -o jsonpath='{.status.containerStatuses[0].restartCount}')"
   [[ -n "$pod_uid" && "$restart_count" =~ ^[0-9]+$ ]] || \
     fail "could not capture Collector pod identity/restart baseline"
@@ -500,14 +508,14 @@ raise SystemExit(0 if float(sys.argv[1]) == float(sys.argv[2]) else 1)
     fail "persistent queue capacity was $capacity, expected $OTEL_QUEUE_CAPACITY_TOTAL"
 
   for sample in $(seq 1 "$samples"); do
-    ready="$(kubectl get pod "$pod" -n "$NAMESPACE" \
+    ready="$(kubectl --context "$KUBE_CONTEXT" get pod "$pod" -n "$NAMESPACE" \
       -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}')"
     [[ "$ready" == True ]] || \
       fail "Collector stopped being Ready during sustained exporter outage (sample $sample: $ready)"
-    current_uid="$(kubectl get pod "$pod" -n "$NAMESPACE" -o jsonpath='{.metadata.uid}')"
-    current_restart_count="$(kubectl get pod "$pod" -n "$NAMESPACE" \
+    current_uid="$(kubectl --context "$KUBE_CONTEXT" get pod "$pod" -n "$NAMESPACE" -o jsonpath='{.metadata.uid}')"
+    current_restart_count="$(kubectl --context "$KUBE_CONTEXT" get pod "$pod" -n "$NAMESPACE" \
       -o jsonpath='{.status.containerStatuses[0].restartCount}')"
-    last_reason="$(kubectl get pod "$pod" -n "$NAMESPACE" \
+    last_reason="$(kubectl --context "$KUBE_CONTEXT" get pod "$pod" -n "$NAMESPACE" \
       -o jsonpath='{.status.containerStatuses[0].lastState.terminated.reason}')"
     [[ "$current_uid" == "$pod_uid" && "$current_restart_count" == "$restart_count" ]] || \
       fail "Collector restarted during sustained exporter outage (uid=$current_uid restarts=$current_restart_count)"
@@ -522,7 +530,7 @@ value, capacity = map(float, sys.argv[1:])
 raise SystemExit(0 if 0 < value <= capacity else 1)
 ' "$queue" "$capacity" || \
       fail "persistent queue was $queue outside (0, $capacity] during outage"
-    used_kib="$(kubectl exec "$OTEL_STORAGE_OBSERVER" -n "$NAMESPACE" -- sh -c \
+    used_kib="$(kubectl --context "$KUBE_CONTEXT" exec "$OTEL_STORAGE_OBSERVER" -n "$NAMESPACE" -- sh -c \
       'du -sk /var/lib/otelcol 2>/dev/null | cut -f1')"
     [[ "$used_kib" =~ ^[0-9]+$ ]] || fail "could not measure Collector PVC usage: $used_kib"
     if (( sample == 1 )); then
@@ -539,7 +547,7 @@ raise SystemExit(0 if 0 < value <= capacity else 1)
 }
 
 create_otlp_probe_resources() {
-  cat <<EOF | kubectl apply -n "$NAMESPACE" -f -
+  cat <<EOF | kubectl --context "$KUBE_CONTEXT" apply -n "$NAMESPACE" -f -
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -672,14 +680,14 @@ spec:
         requests: {cpu: 5m, memory: 8Mi}
         limits: {cpu: 50m, memory: 32Mi}
 EOF
-  kubectl rollout status deployment/$OTEL_SINK -n "$NAMESPACE" --timeout=120s
-  kubectl wait --for=condition=Ready pod/$OTEL_OBSERVER -n "$NAMESPACE" --timeout=120s
-  kubectl wait --for=condition=Ready pod/$OTEL_UNSELECTED_OBSERVER \
+  kubectl --context "$KUBE_CONTEXT" rollout status deployment/$OTEL_SINK -n "$NAMESPACE" --timeout=120s
+  kubectl --context "$KUBE_CONTEXT" wait --for=condition=Ready pod/$OTEL_OBSERVER -n "$NAMESPACE" --timeout=120s
+  kubectl --context "$KUBE_CONTEXT" wait --for=condition=Ready pod/$OTEL_UNSELECTED_OBSERVER \
     -n "$NAMESPACE" --timeout=120s
 }
 
 create_otlp_storage_observer() {
-  cat <<EOF | kubectl apply -n "$NAMESPACE" -f -
+  cat <<EOF | kubectl --context "$KUBE_CONTEXT" apply -n "$NAMESPACE" -f -
 apiVersion: v1
 kind: Pod
 metadata:
@@ -718,7 +726,7 @@ spec:
         claimName: $COLLECTOR_PVC
         readOnly: true
 EOF
-  kubectl wait --for=condition=Ready pod/$OTEL_STORAGE_OBSERVER \
+  kubectl --context "$KUBE_CONTEXT" wait --for=condition=Ready pod/$OTEL_STORAGE_OBSERVER \
     -n "$NAMESPACE" --timeout=120s
 }
 
@@ -726,8 +734,8 @@ EOF
 send_otlp_triplet() {
   local label="$1" count="$2" delay="$3" mode="$4"
   local job="e2e-otlp-${label}"
-  kubectl delete job "$job" -n "$NAMESPACE" --ignore-not-found >/dev/null
-  cat <<EOF | kubectl apply -n "$NAMESPACE" -f -
+  kubectl --context "$KUBE_CONTEXT" delete job "$job" -n "$NAMESPACE" --ignore-not-found >/dev/null
+  cat <<EOF | kubectl --context "$KUBE_CONTEXT" apply -n "$NAMESPACE" -f -
 apiVersion: batch/v1
 kind: Job
 metadata:
@@ -776,8 +784,8 @@ spec:
         - name: fixtures
           configMap: {name: $OTEL_FIXTURES}
 EOF
-  if ! kubectl wait --for=condition=complete job/$job -n "$NAMESPACE" --timeout=180s; then
-    kubectl logs job/$job -n "$NAMESPACE" || true
+  if ! kubectl --context "$KUBE_CONTEXT" wait --for=condition=complete job/$job -n "$NAMESPACE" --timeout=180s; then
+    kubectl --context "$KUBE_CONTEXT" logs job/$job -n "$NAMESPACE" || true
     fail "OTLP fixture Job $job did not complete"
   fi
 }
@@ -877,7 +885,7 @@ wait_for_init_complete() {
   local timeout=180 waited=0 interval=4
   while true; do
     local pod_json
-    pod_json="$(kubectl get pod "$POD_NAME" -n "$NAMESPACE" -o json 2>/dev/null || echo '{}')"
+    pod_json="$(kubectl --context "$KUBE_CONTEXT" get pod "$POD_NAME" -n "$NAMESPACE" -o json 2>/dev/null || echo '{}')"
     local ready
     ready="$(printf '%s' "$pod_json" | python3 -c '
 import json, sys
@@ -900,18 +908,18 @@ print("yes" if (init_ok and runner_running) else "no")
     fi
     if [[ "$waited" -ge "$timeout" ]]; then
       banner "DIAGNOSTICS (timeout after ${timeout}s)"
-      kubectl describe pod "$POD_NAME" -n "$NAMESPACE" || true
+      kubectl --context "$KUBE_CONTEXT" describe pod "$POD_NAME" -n "$NAMESPACE" || true
       echo "--- bundle-fetch logs"
-      kubectl logs "$POD_NAME" -n "$NAMESPACE" -c bundle-fetch || true
+      kubectl --context "$KUBE_CONTEXT" logs "$POD_NAME" -n "$NAMESPACE" -c bundle-fetch || true
       echo "--- bundle-extract logs"
-      kubectl logs "$POD_NAME" -n "$NAMESPACE" -c bundle-extract || true
+      kubectl --context "$KUBE_CONTEXT" logs "$POD_NAME" -n "$NAMESPACE" -c bundle-extract || true
       # The runner's own logs, which this block used to omit. When the runner is
       # the container that failed -- the common case, since the init pair either
       # completes or fails loudly -- its log is the only place the real reason
       # appears, and without it the timeout above is the entire diagnosis.
       echo "--- runner logs"
-      kubectl logs "$POD_NAME" -n "$NAMESPACE" -c runner 2>/dev/null \
-        || kubectl logs "$POD_NAME" -n "$NAMESPACE" -c runner --previous 2>/dev/null \
+      kubectl --context "$KUBE_CONTEXT" logs "$POD_NAME" -n "$NAMESPACE" -c runner 2>/dev/null \
+        || kubectl --context "$KUBE_CONTEXT" logs "$POD_NAME" -n "$NAMESPACE" -c runner --previous 2>/dev/null \
         || true
       fail "bound sandbox did not reach (init Completed + runner Running) within ${timeout}s"
     fi
@@ -933,8 +941,8 @@ run_assertions() {
   # STDOUT (stderr like "Permission denied" must never count as present).
   if [[ "$EXEC_RC" -ne 0 || -z "${EXEC_OUT//[[:space:]]/}" ]]; then
     banner "DIAGNOSTICS (positive control failed)"
-    kubectl logs "$POD_NAME" -n "$NAMESPACE" -c bundle-fetch || true
-    kubectl logs "$POD_NAME" -n "$NAMESPACE" -c bundle-extract || true
+    kubectl --context "$KUBE_CONTEXT" logs "$POD_NAME" -n "$NAMESPACE" -c bundle-fetch || true
+    kubectl --context "$KUBE_CONTEXT" logs "$POD_NAME" -n "$NAMESPACE" -c bundle-extract || true
     fail "bundle not provisioned (no plugin.json under /bundles/current); test inconclusive"
   fi
 
@@ -976,9 +984,9 @@ run_assertions() {
 # --------------------------------------------------------------------------
 # 1. Fresh namespace + trimmed install
 # --------------------------------------------------------------------------
-banner "PRECHECK context=$CURRENT_CTX namespace=$NAMESPACE release=$RELEASE"
+banner "PRECHECK context=$KUBE_CONTEXT namespace=$NAMESPACE release=$RELEASE"
 
-DEFAULT_STORAGE_CLASS="$(kubectl get storageclass -o json | python3 -c '
+DEFAULT_STORAGE_CLASS="$(kubectl --context "$KUBE_CONTEXT" get storageclass -o json | python3 -c '
 import json, sys
 items = json.load(sys.stdin).get("items", [])
 defaults = []
@@ -996,16 +1004,16 @@ if [[ "$DEFAULT_STORAGE_CLASS" == *$'\n'* ]]; then
 fi
 echo "default StorageClass: $DEFAULT_STORAGE_CLASS"
 
-if kubectl get ns "$NAMESPACE" >/dev/null 2>&1; then
+if kubectl --context "$KUBE_CONTEXT" get ns "$NAMESPACE" >/dev/null 2>&1; then
   # Only reclaim a namespace WE created. An unlabeled pre-existing namespace
   # (e.g. `default`, or someone else's) must never be deleted by this harness.
   if ns_is_owned "$NAMESPACE"; then
     banner "namespace $NAMESPACE already exists (harness-owned) -- cleaning up before run"
-    helm uninstall "$RELEASE" -n "$NAMESPACE" --no-hooks >/dev/null 2>&1 || true
-    kubectl delete priorityclass \
+    helm --kube-context "$KUBE_CONTEXT" uninstall "$RELEASE" -n "$NAMESPACE" --no-hooks >/dev/null 2>&1 || true
+    kubectl --context "$KUBE_CONTEXT" delete priorityclass \
       "$PLATFORM_PRIORITY_CLASS" "$SANDBOX_PRIORITY_CLASS" \
       --ignore-not-found --wait=true >/dev/null 2>&1 || true
-    kubectl delete ns "$NAMESPACE" --wait=true --timeout=120s >/dev/null 2>&1 || true
+    kubectl --context "$KUBE_CONTEXT" delete ns "$NAMESPACE" --wait=true --timeout=120s >/dev/null 2>&1 || true
   else
     fail "namespace $NAMESPACE already exists and is NOT owned by this harness (missing label ${OWNED_LABEL}=true). Remove it manually or pick another --namespace."
   fi
@@ -1090,21 +1098,21 @@ CHART_VALUES=(
   --set-string valkey.host=valkey.example.com
 )
 install_chart() {
-  helm install "$RELEASE" "$CHART_PATH" \
+  helm --kube-context "$KUBE_CONTEXT" install "$RELEASE" "$CHART_PATH" \
     -n "$NAMESPACE" --no-hooks \
     "${CHART_VALUES[@]}"
 }
-# k8scratch is shared and slightly flaky: a spurious "namespaces not found" at
+# A shared disposable cluster can have API churn: a spurious "namespaces not found" at
 # install is usually API churn, so retry ONCE before failing.
 if ! install_chart; then
   echo "helm install failed once (likely transient API churn on shared node); retrying in 5s..."
   sleep 5
-  kubectl delete priorityclass \
+  kubectl --context "$KUBE_CONTEXT" delete priorityclass \
     "$PLATFORM_PRIORITY_CLASS" "$SANDBOX_PRIORITY_CLASS" \
     --ignore-not-found --wait=true >/dev/null 2>&1 || true
   # Recreate the labeled namespace before retrying; only ever delete our own.
   if ns_is_owned "$NAMESPACE"; then
-    kubectl delete ns "$NAMESPACE" --wait=true --timeout=60s >/dev/null 2>&1 || true
+    kubectl --context "$KUBE_CONTEXT" delete ns "$NAMESPACE" --wait=true --timeout=60s >/dev/null 2>&1 || true
   fi
   create_owned_ns "$NAMESPACE"
   create_otlp_probe_resources
@@ -1112,17 +1120,17 @@ if ! install_chart; then
 fi
 
 banner "WAIT durable OTel Collector Running"
-if ! kubectl rollout status deployment/$OTEL_COLLECTOR_DEPLOYMENT \
+if ! kubectl --context "$KUBE_CONTEXT" rollout status deployment/$OTEL_COLLECTOR_DEPLOYMENT \
     -n "$NAMESPACE" --timeout=180s; then
-  kubectl describe deployment/$OTEL_COLLECTOR_DEPLOYMENT -n "$NAMESPACE" || true
-  kubectl get pods -n "$NAMESPACE" -l app.kubernetes.io/component=otel-collector || true
+  kubectl --context "$KUBE_CONTEXT" describe deployment/$OTEL_COLLECTOR_DEPLOYMENT -n "$NAMESPACE" || true
+  kubectl --context "$KUBE_CONTEXT" get pods -n "$NAMESPACE" -l app.kubernetes.io/component=otel-collector || true
   fail "chart OTel Collector did not become Ready"
 fi
 
 banner "ASSERT Collector self-metrics ingress policy"
 assert_collector_metrics_network_policy
 
-COLLECTOR_PVC="$(kubectl get deployment "$OTEL_COLLECTOR_DEPLOYMENT" -n "$NAMESPACE" -o json | python3 -c '
+COLLECTOR_PVC="$(kubectl --context "$KUBE_CONTEXT" get deployment "$OTEL_COLLECTOR_DEPLOYMENT" -n "$NAMESPACE" -o json | python3 -c '
 import json, sys
 pod = json.load(sys.stdin)["spec"]["template"]["spec"]
 claims = [
@@ -1134,16 +1142,16 @@ if len(claims) != 1:
     raise SystemExit(f"expected one Collector PVC volume, found {claims!r}")
 print(claims[0])
 ')"
-kubectl wait --for=jsonpath='{.status.phase}'=Bound pvc/$COLLECTOR_PVC \
+kubectl --context "$KUBE_CONTEXT" wait --for=jsonpath='{.status.phase}'=Bound pvc/$COLLECTOR_PVC \
   -n "$NAMESPACE" --timeout=120s
 create_otlp_storage_observer
-PVC_REQUEST="$(kubectl get pvc "$COLLECTOR_PVC" -n "$NAMESPACE" -o jsonpath='{.spec.resources.requests.storage}')"
-PVC_CAPACITY="$(kubectl get pvc "$COLLECTOR_PVC" -n "$NAMESPACE" -o jsonpath='{.status.capacity.storage}')"
+PVC_REQUEST="$(kubectl --context "$KUBE_CONTEXT" get pvc "$COLLECTOR_PVC" -n "$NAMESPACE" -o jsonpath='{.spec.resources.requests.storage}')"
+PVC_CAPACITY="$(kubectl --context "$KUBE_CONTEXT" get pvc "$COLLECTOR_PVC" -n "$NAMESPACE" -o jsonpath='{.status.capacity.storage}')"
 [[ "$PVC_REQUEST" == "$OTEL_PVC_SIZE" ]] || \
   fail "Collector disk bound is $PVC_REQUEST, expected task limit $OTEL_PVC_SIZE"
 [[ -n "$PVC_CAPACITY" ]] || fail "Collector PVC $COLLECTOR_PVC has no finite bound capacity"
 
-COLLECTOR_MEMORY_LIMIT="$(kubectl get deployment "$OTEL_COLLECTOR_DEPLOYMENT" -n "$NAMESPACE" \
+COLLECTOR_MEMORY_LIMIT="$(kubectl --context "$KUBE_CONTEXT" get deployment "$OTEL_COLLECTOR_DEPLOYMENT" -n "$NAMESPACE" \
   -o jsonpath='{.spec.template.spec.containers[?(@.name=="otel-collector")].resources.limits.memory}')"
 [[ "$COLLECTOR_MEMORY_LIMIT" == "$OTEL_MEMORY_LIMIT" ]] || \
   fail "Collector memory bound is $COLLECTOR_MEMORY_LIMIT, expected $OTEL_MEMORY_LIMIT"
@@ -1153,7 +1161,7 @@ echo "bounded Collector resources: memory=$COLLECTOR_MEMORY_LIMIT disk-request=$
 # 2. Assert the API Service pinned NodePort, then restore auto allocation.
 # --------------------------------------------------------------------------
 banner "ASSERT API Service pinned NodePort"
-API_SERVICE_JSON="$(kubectl get service "$API_SERVICE" -n "$NAMESPACE" -o json)"
+API_SERVICE_JSON="$(kubectl --context "$KUBE_CONTEXT" get service "$API_SERVICE" -n "$NAMESPACE" -o json)"
 python3 - "$API_SERVICE_JSON" <<'PY' || exit 1
 import json
 import sys
@@ -1175,12 +1183,12 @@ print("live API Service: type=NodePort nodePort=30181")
 PY
 
 banner "UPGRADE API Service to auto allocated NodePort"
-helm upgrade "$RELEASE" "$CHART_PATH" \
+helm --kube-context "$KUBE_CONTEXT" upgrade "$RELEASE" "$CHART_PATH" \
   -n "$NAMESPACE" --no-hooks \
   "${CHART_VALUES[@]}" \
   --set-string api.service.nodePort=
 
-STORED_VALUES_JSON="$(helm get values "$RELEASE" -n "$NAMESPACE" -o json)"
+STORED_VALUES_JSON="$(helm --kube-context "$KUBE_CONTEXT" get values "$RELEASE" -n "$NAMESPACE" -o json)"
 python3 - "$STORED_VALUES_JSON" <<'PY' || exit 1
 import json
 import sys
@@ -1196,7 +1204,7 @@ if "nodePort" not in service or service["nodePort"] != "":
 print('stored override: api.service.nodePort=""')
 PY
 
-API_SERVICE_MANIFEST="$(helm get manifest "$RELEASE" -n "$NAMESPACE" | awk -v name="$API_SERVICE" '
+API_SERVICE_MANIFEST="$(helm --kube-context "$KUBE_CONTEXT" get manifest "$RELEASE" -n "$NAMESPACE" | awk -v name="$API_SERVICE" '
   BEGIN { RS = "---" }
   {
     is_service = 0
@@ -1228,14 +1236,14 @@ if grep -q '^[[:space:]]*nodePort:' <<<"$API_SERVICE_MANIFEST"; then
 fi
 echo "stored release manifest: API Service nodePort omitted"
 
-kubectl delete service "$API_SERVICE" -n "$NAMESPACE" --wait=true
-if kubectl get service "$API_SERVICE" -n "$NAMESPACE" >/dev/null 2>&1; then
+kubectl --context "$KUBE_CONTEXT" delete service "$API_SERVICE" -n "$NAMESPACE" --wait=true
+if kubectl --context "$KUBE_CONTEXT" get service "$API_SERVICE" -n "$NAMESPACE" >/dev/null 2>&1; then
   fail "API Service still exists after deletion"
 fi
 echo "live API Service deleted before auto allocation proof"
 
-printf '%s\n' "$API_SERVICE_MANIFEST" | kubectl create -n "$NAMESPACE" -f -
-API_SERVICE_JSON="$(kubectl get service "$API_SERVICE" -n "$NAMESPACE" -o json)"
+printf '%s\n' "$API_SERVICE_MANIFEST" | kubectl --context "$KUBE_CONTEXT" create -n "$NAMESPACE" -f -
+API_SERVICE_JSON="$(kubectl --context "$KUBE_CONTEXT" get service "$API_SERVICE" -n "$NAMESPACE" -o json)"
 python3 - "$API_SERVICE_JSON" <<'PY' || exit 1
 import json
 import sys
@@ -1263,11 +1271,11 @@ PY
 # 3. Wait for RustFS Running. Gate on the pod, not Helm release status.
 # --------------------------------------------------------------------------
 banner "WAIT RustFS Running"
-if ! kubectl wait --for=condition=Ready pod \
+if ! kubectl --context "$KUBE_CONTEXT" wait --for=condition=Ready pod \
     -l app.kubernetes.io/component=rustfs \
     -n "$NAMESPACE" --timeout=180s; then
-  kubectl get pods -n "$NAMESPACE" || true
-  kubectl describe pod -l app.kubernetes.io/component=rustfs -n "$NAMESPACE" || true
+  kubectl --context "$KUBE_CONTEXT" get pods -n "$NAMESPACE" || true
+  kubectl --context "$KUBE_CONTEXT" describe pod -l app.kubernetes.io/component=rustfs -n "$NAMESPACE" || true
   fail "RustFS pod did not become Ready"
 fi
 
@@ -1293,7 +1301,7 @@ PROBE_B64="$(base64 < "$SEED_DIR/probe.tgz" | tr -d '\n')"
 
 # ConfigMap carrying the archive plus a one shot AWS CLI Job that creates the
 # bucket and uploads the object using path addressing.
-cat <<EOF | kubectl apply -n "$NAMESPACE" -f -
+cat <<EOF | kubectl --context "$KUBE_CONTEXT" apply -n "$NAMESPACE" -f -
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -1351,9 +1359,9 @@ spec:
             name: e2e-bundle-seed
 EOF
 
-if ! kubectl wait --for=condition=complete job/e2e-bundle-seed \
+if ! kubectl --context "$KUBE_CONTEXT" wait --for=condition=complete job/e2e-bundle-seed \
     -n "$NAMESPACE" --timeout=120s; then
-  kubectl logs job/e2e-bundle-seed -n "$NAMESPACE" || true
+  kubectl --context "$KUBE_CONTEXT" logs job/e2e-bundle-seed -n "$NAMESPACE" || true
   fail "bundle seed Job did not complete"
 fi
 echo "bundle seeded: $BUNDLE_REF"
@@ -1377,10 +1385,10 @@ fi
 # gives teardown one thing to remove.
 JSON_DIR="$(mktemp -d /tmp/e2e-json.XXXXXX)"
 TEMPLATE_JSON="$JSON_DIR/sandboxtemplate.json"
-kubectl get sandboxtemplate "$SANDBOX_TEMPLATE" -n "$NAMESPACE" -o json > "$TEMPLATE_JSON"
+kubectl --context "$KUBE_CONTEXT" get sandboxtemplate "$SANDBOX_TEMPLATE" -n "$NAMESPACE" -o json > "$TEMPLATE_JSON"
 POD_JSON="$JSON_DIR/bound-pod.json"
 build_bound_pod "$TEMPLATE_JSON" > "$POD_JSON"
-kubectl apply -n "$NAMESPACE" -f "$POD_JSON"
+kubectl --context "$KUBE_CONTEXT" apply -n "$NAMESPACE" -f "$POD_JSON"
 
 banner "WAIT init pair Completed + runner Running"
 wait_for_init_complete
@@ -1406,15 +1414,15 @@ assert_metrics_zero "$OTEL_COLLECTOR_SERVICE" "$OTEL_EXPORTER" \
 echo "healthy path: all three signals accepted and sent; refused and send-failed stayed observable at zero"
 
 banner "ASSERT backend outage queues and reports failure"
-SINK_POD="$(kubectl get pod -n "$NAMESPACE" -l app="$OTEL_SINK" -o jsonpath='{.items[0].metadata.name}')"
+SINK_POD="$(kubectl --context "$KUBE_CONTEXT" get pod -n "$NAMESPACE" -l app="$OTEL_SINK" -o jsonpath='{.items[0].metadata.name}')"
 [[ -n "$SINK_POD" ]] || fail "private OTLP sink has no pod before outage control"
-kubectl scale deployment/$OTEL_SINK -n "$NAMESPACE" --replicas=0
-kubectl wait --for=delete pod/$SINK_POD -n "$NAMESPACE" --timeout=120s
+kubectl --context "$KUBE_CONTEXT" scale deployment/$OTEL_SINK -n "$NAMESPACE" --replicas=0
+kubectl --context "$KUBE_CONTEXT" wait --for=delete pod/$SINK_POD -n "$NAMESPACE" --timeout=120s
 # Occupy the sole consumer with a distinct in-flight retry, then enqueue the
 # uniquely named outage sample behind it. Queue size excludes the in-flight
 # request, so this makes durable persistence observable before restart.
 send_otlp_triplet priming 1 0 strict
-OUTAGE_COLLECTOR_POD="$(kubectl get pod -n "$NAMESPACE" \
+OUTAGE_COLLECTOR_POD="$(kubectl --context "$KUBE_CONTEXT" get pod -n "$NAMESPACE" \
   -l app.kubernetes.io/component=otel-collector -o jsonpath='{.items[0].metadata.name}')"
 wait_collector_retry_log "$OUTAGE_COLLECTOR_POD"
 send_otlp_triplet outage 1 0 strict
@@ -1425,22 +1433,22 @@ assert_sustained_outage_bounded "$OUTAGE_COLLECTOR_POD"
 echo "outage path: per-signal refused/failure counters remain visible, stderr reports retry, and the bounded persistent queue is non-empty"
 
 banner "ASSERT Collector restart retains the queued signals on its PVC"
-OLD_COLLECTOR_POD="$(kubectl get pod -n "$NAMESPACE" \
+OLD_COLLECTOR_POD="$(kubectl --context "$KUBE_CONTEXT" get pod -n "$NAMESPACE" \
   -l app.kubernetes.io/component=otel-collector -o jsonpath='{.items[0].metadata.name}')"
-OLD_COLLECTOR_UID="$(kubectl get pod "$OLD_COLLECTOR_POD" -n "$NAMESPACE" -o jsonpath='{.metadata.uid}')"
+OLD_COLLECTOR_UID="$(kubectl --context "$KUBE_CONTEXT" get pod "$OLD_COLLECTOR_POD" -n "$NAMESPACE" -o jsonpath='{.metadata.uid}')"
 # The storage observer mounts the same ReadWriteOnce claim read-only. Remove it
 # before replacement so single-node and multi-node provisioners alike can
 # detach/reattach the Collector claim without a second live pod holding it.
-kubectl delete pod "$OTEL_STORAGE_OBSERVER" -n "$NAMESPACE" \
+kubectl --context "$KUBE_CONTEXT" delete pod "$OTEL_STORAGE_OBSERVER" -n "$NAMESPACE" \
   --wait=true --timeout=120s
-kubectl delete pod "$OLD_COLLECTOR_POD" -n "$NAMESPACE" --wait=true --timeout=180s
-kubectl rollout status deployment/$OTEL_COLLECTOR_DEPLOYMENT -n "$NAMESPACE" --timeout=180s
-NEW_COLLECTOR_POD="$(kubectl get pod -n "$NAMESPACE" \
+kubectl --context "$KUBE_CONTEXT" delete pod "$OLD_COLLECTOR_POD" -n "$NAMESPACE" --wait=true --timeout=180s
+kubectl --context "$KUBE_CONTEXT" rollout status deployment/$OTEL_COLLECTOR_DEPLOYMENT -n "$NAMESPACE" --timeout=180s
+NEW_COLLECTOR_POD="$(kubectl --context "$KUBE_CONTEXT" get pod -n "$NAMESPACE" \
   -l app.kubernetes.io/component=otel-collector -o jsonpath='{.items[0].metadata.name}')"
-NEW_COLLECTOR_UID="$(kubectl get pod "$NEW_COLLECTOR_POD" -n "$NAMESPACE" -o jsonpath='{.metadata.uid}')"
+NEW_COLLECTOR_UID="$(kubectl --context "$KUBE_CONTEXT" get pod "$NEW_COLLECTOR_POD" -n "$NAMESPACE" -o jsonpath='{.metadata.uid}')"
 [[ "$NEW_COLLECTOR_UID" != "$OLD_COLLECTOR_UID" ]] || \
   fail "Collector restart control reused pod UID $OLD_COLLECTOR_UID"
-NEW_COLLECTOR_PVC="$(kubectl get pod "$NEW_COLLECTOR_POD" -n "$NAMESPACE" -o json | python3 -c '
+NEW_COLLECTOR_PVC="$(kubectl --context "$KUBE_CONTEXT" get pod "$NEW_COLLECTOR_POD" -n "$NAMESPACE" -o json | python3 -c '
 import json, sys
 pod = json.load(sys.stdin)["spec"]
 claims = [
@@ -1458,16 +1466,16 @@ wait_metrics_positive "$OTEL_COLLECTOR_SERVICE" "$OTEL_EXPORTER" "$OTELCOL_QUEUE
 echo "restart path: new pod UID retained claim $COLLECTOR_PVC and its non-empty queue"
 
 banner "ASSERT queued outage sample recovers exactly once"
-kubectl scale deployment/$OTEL_SINK -n "$NAMESPACE" --replicas=1
-kubectl rollout status deployment/$OTEL_SINK -n "$NAMESPACE" --timeout=120s
+kubectl --context "$KUBE_CONTEXT" scale deployment/$OTEL_SINK -n "$NAMESPACE" --replicas=1
+kubectl --context "$KUBE_CONTEXT" rollout status deployment/$OTEL_SINK -n "$NAMESPACE" --timeout=120s
 wait_metrics_positive "$OTEL_SINK" "" "${OTELCOL_RECEIVER_METRICS[@]}"
 # Sink self-metrics reset when its outage pod was removed. Count the unique
 # outage sample in its detailed stderr receipt ledger so an independently
 # recovered priming request cannot disguise a duplicate queued delivery.
 sleep 5
-RECOVERY_SINK_POD="$(kubectl get pod -n "$NAMESPACE" -l app="$OTEL_SINK" \
+RECOVERY_SINK_POD="$(kubectl --context "$KUBE_CONTEXT" get pod -n "$NAMESPACE" -l app="$OTEL_SINK" \
   -o jsonpath='{.items[0].metadata.name}')"
-RECOVERY_LOGS="$(kubectl logs "$RECOVERY_SINK_POD" -n "$NAMESPACE")"
+RECOVERY_LOGS="$(kubectl --context "$KUBE_CONTEXT" logs "$RECOVERY_SINK_POD" -n "$NAMESPACE")"
 for marker in trace-outage-probe log-outage-probe metric.outage.probe; do
   recovered="$(awk -v marker="$marker" 'index($0, marker) { count++ } END { print count + 0 }' \
     <<<"$RECOVERY_LOGS")"
@@ -1478,9 +1486,9 @@ wait_metric_equals "$OTEL_COLLECTOR_SERVICE" "$OTELCOL_QUEUE_SIZE_METRIC" "$OTEL
 echo "recovery path: uniquely named queued trace, log record, and metric point delivered once; queue drained"
 
 banner "ASSERT tiny persistent queue overflows loudly and loses bounded excess"
-SINK_POD="$(kubectl get pod -n "$NAMESPACE" -l app="$OTEL_SINK" -o jsonpath='{.items[0].metadata.name}')"
-kubectl scale deployment/$OTEL_SINK -n "$NAMESPACE" --replicas=0
-kubectl wait --for=delete pod/$SINK_POD -n "$NAMESPACE" --timeout=120s
+SINK_POD="$(kubectl --context "$KUBE_CONTEXT" get pod -n "$NAMESPACE" -l app="$OTEL_SINK" -o jsonpath='{.items[0].metadata.name}')"
+kubectl --context "$KUBE_CONTEXT" scale deployment/$OTEL_SINK -n "$NAMESPACE" --replicas=0
+kubectl --context "$KUBE_CONTEXT" wait --for=delete pod/$SINK_POD -n "$NAMESPACE" --timeout=120s
 # One-second spacing forces separate batch exports. With one request retrying
 # and queue_size=2, twelve samples cannot all fit and enqueue_failed_* must move.
 OVERFLOW_SAMPLES=12
@@ -1489,8 +1497,8 @@ wait_metrics_positive "$OTEL_COLLECTOR_SERVICE" "$OTEL_EXPORTER" "${OTELCOL_ENQU
 wait_metric_equals "$OTEL_COLLECTOR_SERVICE" "$OTELCOL_QUEUE_CAPACITY_METRIC" "$OTEL_EXPORTER" "$OTEL_QUEUE_CAPACITY_TOTAL"
 assert_metric_between "$OTEL_COLLECTOR_SERVICE" "$OTELCOL_QUEUE_SIZE_METRIC" "$OTEL_EXPORTER" 0 "$OTEL_QUEUE_CAPACITY_TOTAL"
 
-kubectl scale deployment/$OTEL_SINK -n "$NAMESPACE" --replicas=1
-kubectl rollout status deployment/$OTEL_SINK -n "$NAMESPACE" --timeout=120s
+kubectl --context "$KUBE_CONTEXT" scale deployment/$OTEL_SINK -n "$NAMESPACE" --replicas=1
+kubectl --context "$KUBE_CONTEXT" rollout status deployment/$OTEL_SINK -n "$NAMESPACE" --timeout=120s
 wait_metrics_positive "$OTEL_SINK" "" "${OTELCOL_RECEIVER_METRICS[@]}"
 sleep 8
 metrics_snapshot "$OTEL_SINK"

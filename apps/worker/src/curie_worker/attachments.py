@@ -4,13 +4,10 @@ The dispatcher records file *references* on the wire and nothing else:
 ``aci_protocol.Attachment`` carries ``id``/``name`` and deliberately no url and
 no bytes, because a carried channel URL would invite a sandbox-side fetch that
 ADR-0032's default-deny egress forbids.  This module is the other half.  The
-worker holds the channel credential and can reach the channel (the bot token
-for Slack, the adapter's egress secret for a channel-port binding, ADR-0153),
-so it downloads each referenced file, parks the bytes in the private object
-store under its OWN prefix, and mints a short-lived one-object read capability
-that the sandbox's attachment init container redeems.  The credential (the bot
-token, or an adapter's secret) never leaves the worker, which
-is what keeps ADR-0075's boundary intact while the Agent Proxy is unbuilt.
+worker retains attachment authority and asks a gateway file port for the
+provider bytes. It parks them under its own private object-store prefix and
+mints a short-lived one-object read capability for the sandbox. Slack tokens
+stay in the gateway; the worker holds only a caller credential.
 
 Three properties are load-bearing and each has a reason it is not merely style:
 
@@ -45,8 +42,11 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import http.client
 import json
 import os
+import socket
+import ssl
 import threading
 import time
 import urllib.error
@@ -54,14 +54,20 @@ import urllib.parse
 import urllib.request
 import uuid
 from collections.abc import Callable, Container, Iterable, Iterator, Mapping, Sequence
-from dataclasses import dataclass, field
-from typing import Any, Protocol
+from contextvars import ContextVar, Token
+from dataclasses import dataclass, field, replace
+from typing import Any
 
-from aci_protocol import Attachment, ReplyHandle
-from aci_protocol.turn import DEFAULT_IDENTITY
+from aci_protocol import Attachment, BootEnv, ReplyHandle
+from aci_protocol.turn import DEFAULT_IDENTITY, slack_speaking_identity
+from curie_channel_gateway.ports.reads import FileSource
+from curie_channel_gateway.reply_transport import ADAPTER_SECRET_HEADER
+from curie_channel_gateway.slack.files import FileResponse, SlackFileError
+from curie_channel_gateway.tls import gateway_file_context
+from curie_internal.workspace_objects import WorkspaceObjectPort
 
-from .reply_sink import ADAPTER_SECRET_HEADER, SLACK_KIND
-from .workspace import WorkspaceObjectPort
+from .ledger_client import ThreadAttachmentRef
+from .reply_sink import SLACK_KIND
 
 # The attachment lane's own object namespace. Never the workspace archives':
 # the two object classes have different owners, different TTLs and different
@@ -83,6 +89,13 @@ ATTACHMENT_LEDGER_PREFIX = "_attachments"
 # init container only.
 ATTACHMENTS_REF_ENV = "CURIE_ATTACHMENTS_REF"
 
+#: The claim-env key carrying the attachment manifest to the runner (ADR 0205
+#: decision 8): each delivered file's on-disk name and whether it arrived on the
+#: current message, plus the earlier files that are unavailable or omitted.
+#: Unlike ``CURIE_ATTACHMENTS_REF`` it is a runner input (``BootEnv``'s
+#: ``attachments_manifest``) and carries no URL, no id and no credential.
+ATTACHMENTS_MANIFEST_ENV = BootEnv.env_key("attachments_manifest")
+
 #: Where a resolved attachment lands inside the sandbox, on EVERY substrate.
 #: Kubernetes reaches it through an init container and a mounted emptyDir;
 #: Docker bind-mounts it directly. The runner probes this same path
@@ -93,9 +106,13 @@ ATTACHMENTS_REF_ENV = "CURIE_ATTACHMENTS_REF"
 #: exists to close.
 ATTACHMENTS_MOUNT_PATH = "/attachments"
 
+# How much longer than one capability a parked copy must outlive the boot to be
+# re-minted rather than fetched again: the init container redeems within the
+# capability's life, and the margin absorbs claim latency and clock skew.
+_REUSE_MARGIN_SECONDS = 60
+
 # Where Slack's file metadata is looked up. The id in ``Attachment`` is the
 # channel's own file id, so resolving it is the port's job, not this module's.
-_SLACK_API_URL = "https://slack.com/api"
 
 # A files.info envelope is metadata; nothing legitimate is large. Bounded so a
 # hostile or broken response cannot be read into memory without limit.
@@ -130,13 +147,6 @@ class AttachmentFetchError(AttachmentResolutionError):
         super().__init__("fetch", f"{name!r} could not be downloaded: {detail}")
 
 
-class SlackFileError(RuntimeError):
-    """Slack refused a file lookup or download at the application level.
-
-    Slack answers ``200`` with ``{"ok": false, "error": "..."}`` for an
-    application-level failure, so translating that envelope belongs to the port
-    rather than to the resolver above it.
-    """
 
 
 @dataclass(frozen=True)
@@ -155,6 +165,14 @@ class AttachmentLimits:
     #: How long the parked bytes are retained for a redelivery of the turn.
     retention_ttl_seconds: int = 3600
     max_files: int = 10
+    #: How many files one boot materializes for a whole thread (ADR 0205
+    #: decision 7). Never below ``max_files``: a single message's files are
+    #: always delivered whole, so a thread budget smaller than one message
+    #: could only ever be exceeded.
+    thread_max_files: int = 20
+    #: The total recorded bytes one boot materializes for a thread. The chart
+    #: checks it against the attachments volume, not this class.
+    thread_max_bytes: int = 256 * 1024 * 1024
 
     def __post_init__(self) -> None:
         numeric = {
@@ -163,10 +181,14 @@ class AttachmentLimits:
             "reference_ttl_seconds": self.reference_ttl_seconds,
             "retention_ttl_seconds": self.retention_ttl_seconds,
             "max_files": self.max_files,
+            "thread_max_files": self.thread_max_files,
+            "thread_max_bytes": self.thread_max_bytes,
         }
         for name, value in numeric.items():
             if value <= 0:
                 raise ValueError(f"{name} must be positive")
+        if self.thread_max_files < self.max_files:
+            raise ValueError("thread_max_files must be at least max_files")
 
 
 @dataclass(frozen=True)
@@ -289,6 +311,99 @@ def unique_attachment_leaf(leaf: str, taken: Container[str]) -> str:
     return f"{stem}-{bump}{extension}"
 
 
+def clean_attachment_leaf(name: str) -> str:
+    """The on-disk leaf for a channel-supplied file name (ADR 0205 decision 4).
+
+    The attachments init container's own cleaning, ported: backslashes become
+    slashes, the name is stripped, and only its basename survives, so a name
+    can never climb out of the mount. One rule is added: a leading ``.`` becomes
+    ``_``. A dot name would be hidden from the runner's discovery and could
+    collide with the init container's own ``.curie-*`` status files, and a
+    hidden attachment is exactly the silent loss #2567 exists to close.
+
+    A name that cleans to nothing usable (empty, ``.`` or ``..``) is refused
+    rather than invented, with stage ``name``.
+    """
+
+    leaf = name.replace("\\", "/").strip().rsplit("/", 1)[-1].strip()
+    if leaf in {"", ".", ".."}:
+        raise AttachmentResolutionError("name", f"attachment name {name!r} has no usable leaf")
+    if leaf.startswith("."):
+        leaf = "_" + leaf[1:]
+    return _fit_leaf(leaf)
+
+
+# Filesystems cap a name at 255 BYTES. Cleaned names are cut to leave room for
+# the ``-N`` suffix disambiguation may add, so init never meets one too long.
+_MAX_LEAF_BYTES = 255
+_SUFFIX_ROOM_BYTES = 12
+
+
+def _fit_leaf(leaf: str, limit: int = _MAX_LEAF_BYTES - _SUFFIX_ROOM_BYTES) -> str:
+    """Shorten ``leaf`` to ``limit`` UTF-8 bytes, keeping a short extension."""
+
+    if len(leaf.encode("utf-8")) <= limit:
+        return leaf
+    stem, extension = os.path.splitext(leaf)
+    if len(extension.encode("utf-8")) > 16:
+        stem, extension = leaf, ""
+    room = limit - len(extension.encode("utf-8"))
+    cut = stem.encode("utf-8")[:room].decode("utf-8", errors="ignore")
+    return cut + extension
+
+
+class _FoldedNames:
+    """``in`` that ignores case: a docker host on macOS or Windows folds case,
+    so ``Report.pdf`` and ``report.pdf`` would land on one file there."""
+
+    def __init__(self, names: Iterable[str]) -> None:
+        self._folded = {name.casefold() for name in names}
+
+    def __contains__(self, name: object) -> bool:
+        return isinstance(name, str) and name.casefold() in self._folded
+
+    def add(self, name: str) -> None:
+        self._folded.add(name.casefold())
+
+
+def assign_disk_names(names: Sequence[str], *, taken: Iterable[str]) -> tuple[str, ...]:
+    """Fix each name's on-disk leaf against every name already held.
+
+    ``taken`` is every disk name the thread's ledger already records, including
+    files this boot will not deliver, so a name is never reused and a later
+    omission never shifts another file's name. Names assigned earlier in the
+    same call are taken too.
+    """
+
+    held = _FoldedNames(taken)
+    assigned: list[str] = []
+    for name in names:
+        leaf = unique_attachment_leaf(clean_attachment_leaf(name), held)
+        held.add(leaf)
+        assigned.append(leaf)
+    return tuple(assigned)
+
+
+@dataclass(frozen=True)
+class AgentRoute:
+    """One of the agent's bindings as it is NOW (ADR 0205 decision 5).
+
+    A re-fetch resolves its route from these and never from anything recorded
+    with the file, so a rotated endpoint or a removed binding takes effect on
+    the next boot. Eager materialization remains structural; the lazy broker
+    additionally requires the exact binding identity and generation.
+    """
+
+    kind: str
+    adapter: str | None
+    endpoint: str | None
+    # Exact binding fence used by the private lazy broker. Legacy eager ports
+    # may omit these, but the broker never admits an unidentified route.
+    binding_id: uuid.UUID | None = None
+    generation: int | None = None
+    address: str | None = None
+
+
 @dataclass(frozen=True)
 class PreparedAttachments:
     """One turn's resolved set: what was written, what was minted, until when."""
@@ -322,6 +437,163 @@ class PreparedAttachments:
         return {ATTACHMENTS_REF_ENV: encode_attachment_refs(self.refs)}
 
 
+#: Why an earlier file could not be delivered on this boot (ADR 0205 decision
+#: 6). Named to the agent in the manifest; never a reason to fail the boot.
+UNAVAILABLE_REASONS = frozenset(
+    {
+        "no_route",
+        "no_credential",
+        "not_found",
+        "forbidden",
+        "rate_limited",
+        "timeout",
+        "digest_changed",
+        "expired",
+        "deadline",
+        "fetch_failed",
+    }
+)
+
+
+@dataclass(frozen=True)
+class ThreadSetEntry:
+    """One file a boot materializes, under the name it was recorded with."""
+
+    disk_name: str
+    object_key: str
+    sha256: str
+    size_bytes: int
+    mime_type: str | None
+    current: bool
+
+
+@dataclass(frozen=True)
+class UnavailableAttachment:
+    """An earlier file this boot could not deliver, and why."""
+
+    name: str
+    reason: str
+
+
+@dataclass(frozen=True)
+class PreparedThreadSet:
+    """One boot's whole thread set (ADR 0205 decision 3).
+
+    ``entries`` are in arrival order with the current message's files last.
+    ``object_keys`` are only the objects this prepare WROTE; a re-minted parked
+    copy is named by this prepare's owner record but belongs to an earlier one,
+    so a discard never deletes it. ``append_refs`` are the current message's
+    references, recorded only once the set is installed.
+    """
+
+    entries: tuple[ThreadSetEntry, ...] = ()
+    unavailable: tuple[UnavailableAttachment, ...] = ()
+    omitted: tuple[str, ...] = ()
+    append_refs: tuple[ThreadAttachmentRef, ...] = ()
+    ledger_unavailable: bool = False
+    object_keys: tuple[str, ...] = ()
+    #: The minted capabilities, aligned with ``entries``.
+    refs: tuple[AttachmentRef, ...] = field(default=(), repr=False)
+    #: Whether this prepare wrote an owner record, under ``_owner_token``.
+    owner_recorded: bool = field(default=False, repr=False)
+    #: Minted before any store write, so the owner record for re-minted parked
+    #: copies can be written ahead of the re-fetches and rewritten at the end.
+    _owner_token: str = field(
+        compare=False, repr=False, default_factory=lambda: uuid.uuid4().hex
+    )
+
+    def claim_env(self) -> dict[str, str]:
+        """The claim-env contribution: refs for the init container, manifest
+        for the runner, or nothing at all for a thread with nothing to say.
+
+        Each ref entry carries the exact disk name in ``n`` and ``c`` (1 for a
+        current file, 0 for an earlier one) so the init container writes that
+        name and never renames. The manifest carries names and reasons only,
+        never a URL, an id or a credential.
+        """
+
+        if not (self.entries or self.unavailable or self.omitted or self.ledger_unavailable):
+            return {}
+        env: dict[str, str] = {}
+        if self.entries:
+            payload = [
+                {
+                    "n": entry.disk_name,
+                    "u": ref.url,
+                    "s": ref.sha256,
+                    "b": ref.size_bytes,
+                    "e": ref.expires_at_epoch,
+                    "m": ref.mime_type,
+                    "c": 1 if entry.current else 0,
+                }
+                for entry, ref in zip(self.entries, self.refs, strict=True)
+            ]
+            raw = json.dumps(payload, separators=(",", ":"), sort_keys=True).encode()
+            env[ATTACHMENTS_REF_ENV] = base64.urlsafe_b64encode(raw).decode().rstrip("=")
+        env[ATTACHMENTS_MANIFEST_ENV] = json.dumps(
+            {
+                "v": 1,
+                "files": [
+                    {"name": entry.disk_name, "current": entry.current}
+                    for entry in self.entries
+                ],
+                "unavailable": [
+                    {"name": item.name, "reason": item.reason} for item in self.unavailable
+                ],
+                "omitted": list(self.omitted),
+                "ledger_unavailable": self.ledger_unavailable,
+            },
+            separators=(",", ":"),
+        )
+        return env
+
+
+class _FetchDeadline(Exception):
+    """Internal: an earlier file's bytes were still arriving at the deadline."""
+
+
+class _EarlierUnavailable(Exception):
+    """Internal: one earlier file is unavailable for ``reason``."""
+
+    def __init__(self, reason: str) -> None:
+        self.reason = reason
+        super().__init__(reason)
+
+
+def _unavailable_reason(exc: BaseException) -> str:
+    """Name why an earlier file's fetch failed, from the failure itself.
+
+    Walks the cause chain because ``_park`` wraps the port's own error in an
+    ``AttachmentFetchError``. A status-carrying refusal is named by its status;
+    a timeout anywhere in the chain is a timeout; anything else is
+    ``fetch_failed``.
+    """
+
+    seen: set[int] = set()
+    current: BaseException | None = exc
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        if isinstance(current, _FetchDeadline):
+            return "deadline"
+        if isinstance(current, TimeoutError):
+            return "timeout"
+        if isinstance(current, urllib.error.URLError) and isinstance(
+            current.reason, TimeoutError
+        ):
+            return "timeout"
+        status = getattr(current, "status", None)
+        if isinstance(current, (SlackFileError, ChannelPortFileError)) and status is not None:
+            if status == 404 or status == 410:
+                return "not_found"
+            if status in (401, 403):
+                return "forbidden"
+            if status == 429:
+                return "rate_limited"
+            return "fetch_failed"
+        current = current.__cause__ or current.__context__
+    return "fetch_failed"
+
+
 @dataclass(frozen=True)
 class _AttachmentSet:
     """The durable retention record for ONE resolved set, not one thread.
@@ -336,19 +608,28 @@ class _AttachmentSet:
     refs: tuple[AttachmentRef, ...]
     object_keys: tuple[str, ...]
     expires_at_epoch: int
+    #: The agent whose bytes these are, or None on a record written before
+    #: ADR 0205. Optional fields, never a version bump: a stable-line worker
+    #: shares the bucket during a rolling upgrade and its reap tick refuses any
+    #: version but 1.
+    agent_id: str | None = None
+    #: object key -> sha256 of the parked bytes, the parked-cache index a boot
+    #: re-mints an earlier file from. Empty on a pre-ADR-0205 record.
+    shas: Mapping[str, str] = field(default_factory=dict, hash=False)
 
     def encode(self) -> bytes:
-        return json.dumps(
-            {
-                "version": 1,
-                "thread_key": self.thread_key,
-                "expires_at_epoch": self.expires_at_epoch,
-                "object_keys": list(self.object_keys),
-                "refs": encode_attachment_refs(self.refs),
-            },
-            separators=(",", ":"),
-            sort_keys=True,
-        ).encode("utf-8")
+        payload: dict[str, Any] = {
+            "version": 1,
+            "thread_key": self.thread_key,
+            "expires_at_epoch": self.expires_at_epoch,
+            "object_keys": list(self.object_keys),
+            "refs": encode_attachment_refs(self.refs),
+        }
+        if self.agent_id is not None:
+            payload["agent"] = self.agent_id
+        if self.shas:
+            payload["shas"] = dict(self.shas)
+        return json.dumps(payload, separators=(",", ":"), sort_keys=True).encode("utf-8")
 
     @classmethod
     def decode(cls, payload: bytes) -> _AttachmentSet:
@@ -367,11 +648,17 @@ class _AttachmentSet:
                 raise ValueError("unsupported attachment record version")
             thread_key = str(raw["thread_key"])
             object_keys = tuple(str(key) for key in raw["object_keys"])
+            agent = raw.get("agent")
+            raw_shas = raw.get("shas") or {}
+            if not isinstance(raw_shas, Mapping):
+                raise TypeError("attachment record shas is not a mapping")
             record = cls(
                 thread_key=thread_key,
                 refs=decode_attachment_refs(str(raw["refs"])),
                 object_keys=object_keys,
                 expires_at_epoch=int(raw["expires_at_epoch"]),
+                agent_id=None if agent is None else str(agent),
+                shas={str(key): str(value) for key, value in raw_shas.items()},
             )
         except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
             raise AttachmentResolutionError(
@@ -402,26 +689,6 @@ class AttachmentReapCandidate:
     deleted_object_keys: tuple[str, ...]
 
 
-class AttachmentFilePort(Protocol):
-    """The channel's file download, chunk by chunk.
-
-    A generator rather than a bytes-returning call: the size cap is enforced
-    against what has actually been pulled, which is only possible if the caller
-    controls the pull.
-    """
-
-    def fetch(self, file_id: str) -> Iterator[bytes]: ...
-
-
-@dataclass(frozen=True)
-class SlackFileResponse:
-    """One transport answer: status, headers, and an unread chunk stream."""
-
-    status: int
-    headers: Mapping[str, str]
-    chunks: Iterator[bytes]
-
-
 class _NoRedirect(urllib.request.HTTPRedirectHandler):
     def redirect_request(  # type: ignore[override]
         self,
@@ -435,13 +702,145 @@ class _NoRedirect(urllib.request.HTTPRedirectHandler):
         return None
 
 
-def _slack_transport(
+class AttachmentReadScope:
+    """Own only this transfer's sockets, so cancellation interrupts blocked reads.
+
+    The optional context is inherited by ``asyncio.to_thread``. Legacy eager
+    callers do not install it. A deadline and socket shutdown complement each
+    other: slow dripping bytes cannot refresh the absolute transfer lifetime.
+    Synchronous OS DNS resolution cannot be forcibly interrupted; callers must
+    retain their concurrency slot until that owned call settles. TCP connect
+    also precedes socket ownership, with the original finite socket timeout.
+    """
+
+    def __init__(self, *, deadline_epoch: float) -> None:
+        self.deadline_epoch = deadline_epoch
+        self._lock = threading.Lock()
+        self._sockets: set[socket.socket] = set()
+        self._responses: set[Any] = set()
+        self._cancelled = False
+        self._token: Token[AttachmentReadScope | None] | None = None
+        self._deadline_timer: threading.Timer | None = None
+
+    def __enter__(self) -> AttachmentReadScope:
+        self._token = _READ_SCOPE.set(self)
+        self._deadline_timer = threading.Timer(
+            max(0, self.deadline_epoch - time.time()), self.cancel
+        )
+        self._deadline_timer.daemon = True
+        self._deadline_timer.start()
+        return self
+
+    def __exit__(self, *exc: object) -> None:
+        self.cancel()
+        if self._deadline_timer is not None:
+            self._deadline_timer.cancel()
+        for response in tuple(self._responses):
+            response.close()
+        self._responses.clear()
+        for sock in tuple(self._sockets):
+            sock.close()
+        self._sockets.clear()
+        if self._token is not None:
+            _READ_SCOPE.reset(self._token)
+
+    def remaining(self) -> float:
+        if self._cancelled or self.deadline_epoch <= time.time():
+            raise TimeoutError("attachment transfer ended")
+        return self.deadline_epoch - time.time()
+
+    def track_socket(self, sock: socket.socket) -> None:
+        try:
+            with self._lock:
+                self.remaining()
+                self._sockets.add(sock)
+        except BaseException:
+            sock.close()
+            raise
+
+    def track(self, response: Any) -> socket.socket:
+        # urllib's HTTPResponse retains its socket through BufferedReader.raw.
+        # HTTP and HTTPS use this same ownership chain. Fail closed if a
+        # custom transport cannot expose a socket that this scope can stop.
+        sock = getattr(getattr(response.fp, "raw", None), "_sock", None)
+        if not isinstance(sock, socket.socket):
+            response.close()
+            raise OSError("attachment transport is not cancellable")
+        try:
+            with self._lock:
+                self.remaining()
+                self._sockets.add(sock)
+                self._responses.add(response)
+        except BaseException:
+            response.close()
+            raise
+        return sock
+
+    def untrack(self, sock: socket.socket, response: Any) -> None:
+        with self._lock:
+            self._sockets.discard(sock)
+            self._responses.discard(response)
+
+    def cancel(self) -> None:
+        with self._lock:
+            self._cancelled = True
+            owned = tuple(self._sockets)
+        for sock in owned:
+            try:
+                sock.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+
+
+_READ_SCOPE: ContextVar[AttachmentReadScope | None] = ContextVar(
+    "attachment_transfer_read_scope", default=None
+)
+
+
+class _ScopedHTTPConnection(http.client.HTTPConnection):
+    def connect(self) -> None:
+        super().connect()
+        scope = _READ_SCOPE.get()
+        assert scope is not None and self.sock is not None
+        scope.track_socket(self.sock)
+
+
+class _ScopedHTTPSConnection(http.client.HTTPSConnection):
+    _context: ssl.SSLContext
+
+    def connect(self) -> None:
+        # Own the TCP socket before TLS and response-head parsing. Preserve
+        # stdlib certificate/hostname verification through its default context.
+        http.client.HTTPConnection.connect(self)
+        scope = _READ_SCOPE.get()
+        assert scope is not None and self.sock is not None
+        scope.track_socket(self.sock)
+        self.sock = self._context.wrap_socket(
+            self.sock, server_hostname=self.host, do_handshake_on_connect=False
+        )
+        scope.track_socket(self.sock)
+        self.sock.do_handshake()
+
+
+class _ScopedHTTPHandler(urllib.request.HTTPHandler):
+    def http_open(self, request: urllib.request.Request) -> Any:
+        return self.do_open(_ScopedHTTPConnection, request)
+
+
+class _ScopedHTTPSHandler(urllib.request.HTTPSHandler):
+    _context: ssl.SSLContext | None
+
+    def https_open(self, request: urllib.request.Request) -> Any:
+        return self.do_open(_ScopedHTTPSConnection, request, context=self._context)
+
+
+def _file_transport(
     *,
     method: str,
     url: str,
     headers: Mapping[str, str],
     chunk_bytes: int,
-) -> SlackFileResponse:
+) -> FileResponse:
     """One bearer-authenticated request whose body is left unread.
 
     Redirects are refused for the same reason the workspace credential client
@@ -449,24 +848,60 @@ def _slack_transport(
     Slack named rather than one this worker chose.
     """
 
+    scope = _READ_SCOPE.get()
+    timeout = min(30.0, scope.remaining()) if scope is not None else 30.0
     request = urllib.request.Request(url, headers=dict(headers), method=method)
-    opener = urllib.request.build_opener(_NoRedirect())
+    opener = (
+        urllib.request.build_opener(
+            _NoRedirect(),
+            urllib.request.ProxyHandler({}),
+            _ScopedHTTPHandler(),
+            _ScopedHTTPSHandler(context=gateway_file_context(url)),
+        )
+        if scope is not None
+        else urllib.request.build_opener(
+            _NoRedirect(), urllib.request.HTTPSHandler(context=gateway_file_context(url))
+        )
+    )
     try:
-        response = opener.open(request, timeout=30)
+        response = opener.open(request, timeout=timeout)
     except urllib.error.HTTPError as exc:
-        body = exc.read()
-        return SlackFileResponse(
+        # Error envelopes are control data, never attachment content.
+        with exc:
+            body = exc.read1(_MAX_INFO_BYTES + 1)
+        return FileResponse(
             status=int(exc.code),
             headers=dict(exc.headers.items()) if exc.headers is not None else {},
             chunks=iter([body]),
         )
 
-    def _chunks() -> Iterator[bytes]:
-        with response:
-            while chunk := response.read(chunk_bytes):
-                yield chunk
+    owned = scope.track(response) if scope is not None else None
 
-    return SlackFileResponse(
+    def _chunks() -> Iterator[bytes]:
+        try:
+            with response:
+                while True:
+                    # read1 closes the socket after the final Content-Length
+                    # byte. Honor cancellation, then finish without touching it.
+                    if response.length == 0:
+                        if scope is not None:
+                            scope.remaining()
+                        break
+                    if scope is not None and owned is not None:
+                        owned.settimeout(min(30.0, scope.remaining()))
+                    chunk = response.read1(chunk_bytes)
+                    if scope is not None:
+                        scope.remaining()
+                    if not chunk:
+                        if response.length not in (None, 0):
+                            raise OSError("attachment response ended before Content-Length")
+                        break
+                    yield chunk
+        finally:
+            if scope is not None and owned is not None:
+                scope.untrack(owned, response)
+
+    return FileResponse(
         status=int(response.status),
         headers=dict(response.headers.items()),
         chunks=_chunks(),
@@ -475,6 +910,10 @@ def _slack_transport(
 
 class ChannelPortFileError(RuntimeError):
     """The adapter behind a channel-port binding would not serve a file."""
+
+    def __init__(self, message: str, *, status: int | None = None) -> None:
+        self.status = status
+        super().__init__(message)
 
 
 class ChannelPortFileClient:
@@ -498,7 +937,7 @@ class ChannelPortFileClient:
         self,
         *,
         credentials: Mapping[str, str],
-        transport: Callable[..., SlackFileResponse] = _slack_transport,
+        transport: Callable[..., FileResponse] = _file_transport,
         read_chunk_bytes: int = 1024 * 1024,
     ) -> None:
         if read_chunk_bytes <= 0:
@@ -507,25 +946,40 @@ class ChannelPortFileClient:
         self._transport = transport
         self._read_chunk_bytes = read_chunk_bytes
 
-    def bind(self, handle: ReplyHandle) -> AttachmentFilePort:
+    def bind(self, handle: ReplyHandle) -> FileSource:
         """The file port for one binding, refused before any request when the
         worker has nowhere to ask or nothing to authenticate with."""
 
-        endpoint = (handle.endpoint or "").rstrip("/")
-        if not endpoint:
+        if not (handle.endpoint or "").rstrip("/"):
             raise AttachmentResolutionError(
                 "wiring",
                 f"the {handle.kind} binding declares no endpoint to fetch its attachments from",
             )
-        secret = self._credentials.get(handle.adapter or "")
+        return self.bind_route(handle.adapter, handle.endpoint)
+
+    def bind_route(self, adapter: str | None, endpoint: str | None) -> FileSource:
+        """The file port for one of the agent's CURRENT bindings (ADR 0205).
+
+        ``bind`` for a route read from the bindings rather than from a reply
+        handle: an earlier file is re-fetched from wherever its adapter lives
+        now, never from an endpoint recorded with the file. Same two refusals
+        as ``bind``, both before any request.
+        """
+
+        base = (endpoint or "").rstrip("/")
+        if not base:
+            raise AttachmentResolutionError(
+                "wiring", "the binding declares no endpoint to fetch its attachments from"
+            )
+        secret = self._credentials.get(adapter or "")
         if not secret:
             raise AttachmentResolutionError(
                 "credential",
                 f"no adapter credential is configured on this worker for adapter "
-                f"{handle.adapter!r}, so its attachments cannot be fetched",
+                f"{adapter!r}, so its attachments cannot be fetched",
             )
         return _BoundChannelPortFiles(
-            endpoint=endpoint,
+            endpoint=base,
             secret=secret,
             transport=self._transport,
             read_chunk_bytes=self._read_chunk_bytes,
@@ -534,11 +988,11 @@ class ChannelPortFileClient:
 
 @dataclass(frozen=True)
 class _BoundChannelPortFiles:
-    """One binding's ``AttachmentFilePort``."""
+    """One binding's ``FileSource``."""
 
     endpoint: str
     secret: str = field(repr=False)
-    transport: Callable[..., SlackFileResponse]
+    transport: Callable[..., FileResponse]
     read_chunk_bytes: int
 
     def fetch(self, file_id: str) -> Iterator[bytes]:
@@ -550,120 +1004,12 @@ class _BoundChannelPortFiles:
         )
         if response.status != 200:
             raise ChannelPortFileError(
-                f"adapter attachment download failed: HTTP {response.status}"
+                f"adapter attachment download failed: HTTP {response.status}",
+                status=response.status,
             )
         return response.chunks
 
 
-class SlackFileClient:
-    """Download one Slack file's bytes with the bot token, and only here.
-
-    The download reads ``url_private_download`` rather than ``url_private``:
-    Slack answers a PDF's ``url_private`` with a 302 to ``slack-files.com``,
-    and the transport below deliberately refuses to follow it (see
-    ``_NoRedirect``), so the bearer token never reaches a host Slack chose.
-    ``url_private_download`` is Slack's documented direct-download endpoint on
-    the same file object and does not redirect
-    (https://docs.slack.dev/reference/objects/file-object). It is NOT public,
-    though: the download must carry ``Authorization: Bearer <token>``, or
-    Slack answers with an HTML sign-in page rather than the bytes.
-
-    The token authenticates exactly these two requests and reaches nothing
-    downstream -- what the sandbox receives is a presigned one-object URL from
-    the private object store.
-    """
-
-    def __init__(
-        self,
-        *,
-        token: str,
-        transport: Callable[..., SlackFileResponse] = _slack_transport,
-        api_url: str = _SLACK_API_URL,
-        read_chunk_bytes: int = 1024 * 1024,
-    ) -> None:
-        if not token:
-            raise ValueError("attachment resolution requires a Slack bot token")
-        if read_chunk_bytes <= 0:
-            raise ValueError("read_chunk_bytes must be positive")
-        self._token = token
-        self._transport = transport
-        self._api_url = api_url.rstrip("/")
-        self._read_chunk_bytes = read_chunk_bytes
-
-    def fetch(self, file_id: str) -> Iterator[bytes]:
-        download_url = self._download_url(file_id)
-        response = self._transport(
-            method="GET",
-            url=download_url,
-            headers=self._headers(),
-            chunk_bytes=self._read_chunk_bytes,
-        )
-        if response.status != 200:
-            raise SlackFileError(
-                f"slack file download failed: HTTP {response.status}"
-            )
-        content_type = self._content_type(response.headers)
-        if content_type.startswith("text/html"):
-            # Slack serves its sign-in page, with a 200, when the bearer token
-            # is missing or lacks files:read. Storing that page as the
-            # "attachment" would hand the agent a login screen to read.
-            raise SlackFileError(
-                "slack file download returned an HTML page rather than file bytes; "
-                "the bot token is likely missing the files:read scope"
-            )
-        return response.chunks
-
-    def _download_url(self, file_id: str) -> str:
-        response = self._transport(
-            method="GET",
-            url=f"{self._api_url}/files.info?file={file_id}",
-            headers=self._headers(),
-            chunk_bytes=self._read_chunk_bytes,
-        )
-        if response.status != 200:
-            raise SlackFileError(f"slack files.info failed: HTTP {response.status}")
-        body = self._bounded_body(response.chunks)
-        try:
-            payload = json.loads(body)
-            if not payload.get("ok"):
-                raise SlackFileError(f"slack files.info failed: {payload.get('error')}")
-            file_obj = payload["file"]
-            if not isinstance(file_obj, Mapping):
-                raise TypeError("file object is not a mapping")
-        except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
-            raise SlackFileError("slack files.info returned an unusable envelope") from exc
-        # The envelope parsed fine and was ok, but the field this module reads
-        # instead of url_private (see the class docstring) may still be
-        # absent. Named explicitly rather than folded into the except above,
-        # since a missing field is not the same failure as a malformed
-        # envelope and an operator needs to be able to tell them apart.
-        if "url_private_download" not in file_obj:
-            raise SlackFileError(
-                "slack files.info's file object has no url_private_download field"
-            )
-        download_url = str(file_obj["url_private_download"])
-        if not download_url.startswith("https://"):
-            raise SlackFileError("slack files.info returned a non-HTTPS url_private_download")
-        return download_url
-
-    def _headers(self) -> dict[str, str]:
-        return {"Authorization": f"Bearer {self._token}"}
-
-    @staticmethod
-    def _content_type(headers: Mapping[str, str]) -> str:
-        for key, value in headers.items():
-            if str(key).lower() == "content-type":
-                return str(value).lower()
-        return ""
-
-    @staticmethod
-    def _bounded_body(chunks: Iterator[bytes]) -> bytes:
-        body = bytearray()
-        for chunk in chunks:
-            body.extend(chunk)
-            if len(body) > _MAX_INFO_BYTES:
-                raise SlackFileError("slack files.info response is oversized")
-        return bytes(body)
 
 
 class AttachmentCoordinator:
@@ -683,11 +1029,11 @@ class AttachmentCoordinator:
     def __init__(
         self,
         *,
-        files: AttachmentFilePort | None,
+        files: FileSource | None,
         objects: WorkspaceObjectPort,
         limits: AttachmentLimits | None = None,
         clock: Callable[[], float] = time.time,
-        identity_files: Mapping[str, AttachmentFilePort] | None = None,
+        identity_files: Mapping[str, FileSource] | None = None,
         channel_files: ChannelPortFileClient | None = None,
     ) -> None:
         # None when this worker holds no bot token for `default` (ADR-0168
@@ -699,7 +1045,7 @@ class AttachmentCoordinator:
         self.limits = limits or AttachmentLimits()
         self._clock = clock
         self._lock = threading.Lock()
-        self._identity_files: dict[str, AttachmentFilePort] = dict(identity_files or {})
+        self._identity_files: dict[str, FileSource] = dict(identity_files or {})
         self.channel_files = channel_files
 
     # -- resolve ------------------------------------------------------------
@@ -753,7 +1099,7 @@ class AttachmentCoordinator:
                 # mid-upload leaves the chunks it already yielded under this key
                 # and only a caller that remembers the key can remove them.
                 written.append(key)
-                digest, size = self._park(attachment, key, files)
+                digest, size = self._park(attachment.id, attachment.name, key, files)
                 minted.append(
                     AttachmentRef(
                         name=attachment.name,
@@ -779,7 +1125,447 @@ class AttachmentCoordinator:
         self._record(thread_key, prepared)
         return prepared
 
-    def _files_for(self, identity: str, handle: ReplyHandle | None = None) -> AttachmentFilePort:
+    # -- the thread set (ADR 0205) -------------------------------------------
+
+    def prepare_thread_set(
+        self,
+        *,
+        thread_key: str,
+        agent_id: str | None,
+        ledger_refs: Sequence[ThreadAttachmentRef],
+        current: Sequence[Attachment] = (),
+        event_id: str | None = None,
+        identity: str = DEFAULT_IDENTITY,
+        handle: ReplyHandle | None = None,
+        routes: Sequence[Any] = (),
+        deadline_epoch: float | None = None,
+        ledger_unavailable: bool = False,
+    ) -> PreparedThreadSet:
+        """Build one boot's whole thread set (ADR 0205 decisions 3 to 7).
+
+        ``ledger_refs`` is the thread's ledger in arrival order and ``current``
+        the message this boot is for. The current message's files are fetched
+        FIRST and all or nothing, exactly as ``resolve`` does: any failure
+        raises and leaves no object and no owner record. Earlier files are then
+        taken newest-first within the thread budget, each re-minted from a live
+        parked copy of the same digest or fetched again through ``routes`` (the
+        agent's bindings as they are now). An earlier file that cannot be had
+        is named unavailable and never fails the set. Every capability is
+        presigned only after every fetch has finished, so a slow fetch cannot
+        age one out before the sandbox redeems it.
+
+        A thread with no ledger reference and no current file costs nothing:
+        no fetch, no store call, no claim env beyond the ledger-unavailable
+        manifest the caller asked for.
+        """
+
+        held = tuple(ledger_refs)
+        attached = tuple(current)
+        if not held and not attached:
+            return PreparedThreadSet(ledger_unavailable=ledger_unavailable)
+        if len(attached) > self.limits.max_files:
+            raise AttachmentResolutionError(
+                "set-size",
+                f"{len(attached)} attachments exceed the {self.limits.max_files}-file cap",
+            )
+        if not agent_id:
+            raise AttachmentResolutionError(
+                "wiring", "attachment resolution requires a bound agent"
+            )
+
+        # A ledger row recorded by THIS event for a file this message carries
+        # is this message's file (a redelivered turn finds its own refs already
+        # appended): it keeps the name already recorded and is delivered once,
+        # as current. The same file id recorded by another event is an earlier
+        # file, and this message's copy gets a new name (#4141).
+        current_ids = {attachment.id for attachment in attached}
+        recorded: dict[str, ThreadAttachmentRef] = {}
+        for ref in held:
+            if ref.event_id == event_id and ref.file_id in current_ids:
+                recorded.setdefault(ref.file_id, ref)
+        earlier = [
+            ref
+            for ref in held
+            if not (ref.event_id == event_id and ref.file_id in current_ids)
+        ]
+        current_names = self._current_disk_names(attached, recorded, held)
+
+        mint = uuid.uuid4().hex
+        written: list[str] = []
+        parked_current: list[tuple[str, int]] = []
+        if attached:
+            files = self._files_for(identity, handle)
+            try:
+                for attachment in attached:
+                    key = self._object_key(
+                        agent_id=agent_id, generation=mint, index=len(written)
+                    )
+                    written.append(key)
+                    parked_current.append(
+                        self._park(attachment.id, attachment.name, key, files)
+                    )
+            except Exception:
+                self._discard(written)
+                raise
+
+        current_keys = tuple(written)
+        kept, omitted_ids = self._within_budget(
+            earlier,
+            current_bytes=sum(size for _digest, size in parked_current),
+            current_files=len(attached),
+        )
+
+        delivered: dict[int, ThreadSetEntry] = {}
+        unavailable: dict[int, str] = {}
+        reused: list[str] = []
+        owner_token = uuid.uuid4().hex
+        early_owner = False
+        cache = self._parked_cache(thread_key, agent_id) if kept else {}
+        refetch: list[tuple[int, ThreadAttachmentRef]] = []
+        for position, ref in kept:
+            if ref.size_bytes is not None and ref.size_bytes > self.limits.max_file_bytes:
+                # Recorded under a larger per-file cap than this worker's: it
+                # would be refused mid-stream anyway, so it is not sent.
+                unavailable[position] = "fetch_failed"
+                continue
+            hit = cache.get(ref.sha256)
+            if hit is None:
+                refetch.append((position, ref))
+                continue
+            delivered[position] = ThreadSetEntry(
+                disk_name=ref.disk_name,
+                object_key=hit,
+                sha256=ref.sha256,
+                size_bytes=ref.size_bytes if ref.size_bytes is not None else 0,
+                mime_type=ref.mime_type,
+                current=False,
+            )
+            reused.append(hit)
+        if reused:
+            # Own every re-minted key BEFORE the first re-fetch: a reap that
+            # runs during a slow fetch must already see this boot's owner, or
+            # it deletes bytes the boot is about to hand out. Rewritten in
+            # place at the end with everything this prepare holds.
+            try:
+                self._write_owner(
+                    thread_key,
+                    owner_token,
+                    _AttachmentSet(
+                        thread_key=thread_key,
+                        refs=(),
+                        object_keys=tuple(dict.fromkeys(reused)),
+                        expires_at_epoch=int(self._clock())
+                        + self.limits.retention_ttl_seconds,
+                        agent_id=agent_id,
+                        shas={
+                            entry.object_key: entry.sha256 for entry in delivered.values()
+                        },
+                    ),
+                )
+                early_owner = True
+            except Exception:
+                self._discard(written)
+                raise
+        try:
+            for position, ref in refetch:
+                key = self._object_key(agent_id=agent_id, generation=mint, index=len(written))
+                try:
+                    entry = self._refetch_earlier(ref, key, routes, deadline_epoch)
+                except _EarlierUnavailable as gone:
+                    unavailable[position] = gone.reason
+                    continue
+                written.append(key)
+                delivered[position] = entry
+        except BaseException:
+            # Anything not named unavailable abandons the prepare: nothing it
+            # wrote, the early owner record included, outlives it.
+            self._discard(written)
+            if early_owner:
+                self._discard([self._owner_key(thread_key, owner_token)])
+            raise
+
+        entries: list[ThreadSetEntry] = [
+            delivered[position] for position in range(len(earlier)) if position in delivered
+        ]
+        append_refs: list[ThreadAttachmentRef] = []
+        for ordinal, (attachment, disk_name, key, (digest, size)) in enumerate(
+            zip(attached, current_names, current_keys, parked_current, strict=True)
+        ):
+            entries.append(
+                ThreadSetEntry(
+                    disk_name=disk_name,
+                    object_key=key,
+                    sha256=digest,
+                    size_bytes=size,
+                    mime_type=attachment.mime_type,
+                    current=True,
+                )
+            )
+            append_refs.append(
+                ThreadAttachmentRef(
+                    file_id=attachment.id,
+                    ordinal=ordinal,
+                    name=attachment.name,
+                    disk_name=disk_name,
+                    mime_type=attachment.mime_type,
+                    size_bytes=size,
+                    sha256=digest,
+                    route_kind=handle.kind if handle is not None else SLACK_KIND,
+                    route_adapter=handle.adapter if handle is not None else None,
+                    route_identity=identity,
+                )
+            )
+
+        prepared = PreparedThreadSet(
+            entries=tuple(entries),
+            unavailable=tuple(
+                UnavailableAttachment(name=earlier[position].disk_name, reason=reason)
+                for position, reason in sorted(unavailable.items())
+            ),
+            omitted=tuple(earlier[position].disk_name for position in sorted(omitted_ids)),
+            append_refs=tuple(append_refs),
+            ledger_unavailable=ledger_unavailable,
+            object_keys=tuple(written),
+            _owner_token=owner_token,
+        )
+        if not entries:
+            return prepared
+        try:
+            # Signed LAST, on the clock as it stands after every fetch.
+            signed_at = int(self._clock())
+            refs = tuple(
+                AttachmentRef(
+                    name=entry.disk_name,
+                    url=self.objects.presign_get(
+                        entry.object_key, expires_seconds=self.limits.reference_ttl_seconds
+                    ),
+                    sha256=entry.sha256,
+                    size_bytes=entry.size_bytes,
+                    expires_at_epoch=signed_at + self.limits.reference_ttl_seconds,
+                    mime_type=entry.mime_type,
+                )
+                for entry in entries
+            )
+            prepared = replace(prepared, refs=refs, owner_recorded=True)
+            owned = tuple(dict.fromkeys([*written, *reused]))
+            self._write_owner(
+                thread_key,
+                owner_token,
+                _AttachmentSet(
+                    thread_key=thread_key,
+                    refs=refs,
+                    object_keys=owned,
+                    expires_at_epoch=int(self._clock()) + self.limits.retention_ttl_seconds,
+                    agent_id=agent_id,
+                    shas={entry.object_key: entry.sha256 for entry in entries},
+                ),
+            )
+        except Exception:
+            self._discard(written)
+            if early_owner:
+                self._discard([self._owner_key(thread_key, owner_token)])
+            raise
+        return prepared
+
+    def _write_owner(self, thread_key: str, owner_token: str, record: _AttachmentSet) -> None:
+        with self._lock:
+            self.objects.put_stream(self._owner_key(thread_key, owner_token), (record.encode(),))
+
+    def _current_disk_names(
+        self,
+        attached: Sequence[Attachment],
+        recorded: Mapping[str, ThreadAttachmentRef],
+        held: Sequence[ThreadAttachmentRef],
+    ) -> tuple[str, ...]:
+        """Each current file's disk name: the recorded one on a redelivery,
+        otherwise fixed now against every name the ledger holds."""
+
+        taken = {ref.disk_name for ref in held}
+        names: list[str] = []
+        reused_ids: set[str] = set()
+        for attachment in attached:
+            prior = recorded.get(attachment.id)
+            if prior is not None and attachment.id not in reused_ids:
+                reused_ids.add(attachment.id)
+                names.append(prior.disk_name)
+                continue
+            (leaf,) = assign_disk_names([attachment.name], taken=(*taken, *names))
+            taken.add(leaf)
+            names.append(leaf)
+        return tuple(names)
+
+    def _within_budget(
+        self,
+        earlier: Sequence[ThreadAttachmentRef],
+        *,
+        current_bytes: int,
+        current_files: int,
+    ) -> tuple[list[tuple[int, ThreadAttachmentRef]], set[int]]:
+        """Admit earlier files newest-first after the current ones.
+
+        The current message is always kept and counted first, even alone over
+        budget. The first earlier file that does not fit ends admission, so an
+        older small file never displaces a newer one. A ref with no recorded
+        size is counted as the per-file cap, the most it could be.
+        """
+
+        files = current_files
+        total = current_bytes
+        kept: list[tuple[int, ThreadAttachmentRef]] = []
+        omitted: set[int] = set()
+        full = False
+        for position in range(len(earlier) - 1, -1, -1):
+            ref = earlier[position]
+            size = ref.size_bytes if ref.size_bytes is not None else self.limits.max_file_bytes
+            if (
+                full
+                or files + 1 > self.limits.thread_max_files
+                or total + size > self.limits.thread_max_bytes
+            ):
+                full = True
+                omitted.add(position)
+                continue
+            files += 1
+            total += size
+            kept.append((position, ref))
+        return kept, omitted
+
+    def _refetch_earlier(
+        self,
+        ref: ThreadAttachmentRef,
+        key: str,
+        routes: Sequence[Any],
+        deadline_epoch: float | None,
+    ) -> ThreadSetEntry:
+        """Fetch one earlier file again, or raise ``_EarlierUnavailable``.
+
+        Never raises anything else: an earlier file is best effort (ADR 0205
+        decision 6), and whatever it wrote is removed before it is named
+        unavailable.
+        """
+
+        if deadline_epoch is not None and self._clock() >= deadline_epoch:
+            raise _EarlierUnavailable("deadline")
+        try:
+            files = self._route_files(ref, routes)
+        except _EarlierUnavailable:
+            raise
+        except Exception as exc:  # noqa: BLE001 -- an earlier file never fails the set
+            raise _EarlierUnavailable("fetch_failed") from exc
+        try:
+            digest, size = self._park(ref.file_id, ref.disk_name, key, files, deadline_epoch)
+        except Exception as exc:  # noqa: BLE001 -- named, never raised
+            self._discard([key])
+            raise _EarlierUnavailable(_unavailable_reason(exc)) from exc
+        if digest != ref.sha256:
+            # The bytes at the channel are not the bytes the agent was given.
+            self._discard([key])
+            raise _EarlierUnavailable("digest_changed")
+        return ThreadSetEntry(
+            disk_name=ref.disk_name,
+            object_key=key,
+            sha256=digest,
+            size_bytes=size,
+            mime_type=ref.mime_type,
+            current=False,
+        )
+
+    def _route_files(
+        self, ref: ThreadAttachmentRef, routes: Sequence[Any]
+    ) -> FileSource:
+        """The download for an earlier file, from the agent's CURRENT bindings.
+
+        Never from anything recorded with the file: Slack needs a Slack binding
+        that speaks as the recorded identity and this worker's token for it;
+        any other kind needs a binding of the same kind and adapter, fetched
+        from that binding's endpoint as it is now.
+        """
+
+        if ref.route_kind == SLACK_KIND:
+            if not any(
+                route.kind == SLACK_KIND
+                and slack_speaking_identity(route.kind, route.adapter, route.endpoint)
+                == ref.route_identity
+                for route in routes
+            ):
+                raise _EarlierUnavailable("no_route")
+            files = (
+                self.files
+                if ref.route_identity == DEFAULT_IDENTITY
+                else self._identity_files.get(ref.route_identity)
+            )
+            if files is None:
+                raise _EarlierUnavailable("no_credential")
+            return files
+        matches = [
+            route
+            for route in routes
+            if route.kind == ref.route_kind
+            and route.adapter == ref.route_adapter
+            and (route.endpoint or "").rstrip("/")
+        ]
+        if not matches:
+            raise _EarlierUnavailable("no_route")
+        if self.channel_files is None:
+            raise _EarlierUnavailable("no_credential")
+        try:
+            return self.channel_files.bind_route(matches[0].adapter, matches[0].endpoint)
+        except AttachmentResolutionError as exc:
+            raise _EarlierUnavailable(
+                "no_credential" if exc.stage == "credential" else "no_route"
+            ) from exc
+
+    def _parked_cache(self, thread_key: str, agent_id: str) -> dict[str, str]:
+        """sha256 -> a parked object key this boot may re-mint (ADR 0205 decision 5).
+
+        Only this thread's own owner records are read (its digest subprefix,
+        not the whole ledger), only ones written for this agent, and only
+        objects whose owner outlives the capability by a margin: a copy that
+        would lapse before the sandbox redeems it is fetched again instead. A
+        candidate key is confirmed present before it is offered. Any store
+        failure here only means "no cache": the file is fetched again.
+        """
+
+        floor = int(self._clock()) + self.limits.reference_ttl_seconds + _REUSE_MARGIN_SECONDS
+        digest = hashlib.sha256(thread_key.encode("utf-8")).hexdigest()
+        agent_prefix = f"{ATTACHMENT_OBJECT_PREFIX}/{agent_id}/"
+        best: dict[str, tuple[int, str]] = {}
+        try:
+            # No process-wide lock across these store reads: they only read,
+            # and a reused key is owned by a record written before any fetch.
+            keys = tuple(self.objects.list_keys(f"{ATTACHMENT_LEDGER_PREFIX}/{digest}"))
+            for owner_key in keys:
+                try:
+                    record = self._load_key(owner_key)
+                except Exception:  # noqa: BLE001 -- a bad record is not a cache hit
+                    continue
+                if (
+                    record.thread_key != thread_key
+                    or record.agent_id != agent_id
+                    or record.expires_at_epoch <= floor
+                ):
+                    continue
+                for object_key, sha in record.shas.items():
+                    if object_key not in record.object_keys or not object_key.startswith(
+                        agent_prefix
+                    ):
+                        continue
+                    held = best.get(sha)
+                    if held is None or record.expires_at_epoch > held[0]:
+                        best[sha] = (record.expires_at_epoch, object_key)
+            present: dict[str, set[str]] = {}
+            cache: dict[str, str] = {}
+            for sha, (_expiry, object_key) in best.items():
+                parent = object_key.rsplit("/", 1)[0]
+                if parent not in present:
+                    present[parent] = set(self.objects.list_keys(parent))
+                if object_key in present[parent]:
+                    cache[sha] = object_key
+        except Exception:  # noqa: BLE001 -- no cache, fetch again
+            return {}
+        return cache
+
+    def _files_for(self, identity: str, handle: ReplyHandle | None = None) -> FileSource:
         """The download for this turn's binding, refused before any fetch when absent."""
 
         if handle is not None and handle.kind != SLACK_KIND:
@@ -801,7 +1587,12 @@ class AttachmentCoordinator:
         return files
 
     def _park(
-        self, attachment: Attachment, key: str, files: AttachmentFilePort
+        self,
+        file_id: str,
+        name: str,
+        key: str,
+        files: FileSource,
+        deadline_epoch: float | None = None,
     ) -> tuple[str, int]:
         """Stream one file into the store under its cap, returning digest+size."""
 
@@ -811,10 +1602,11 @@ class AttachmentCoordinator:
             self.objects.put_stream(
                 key,
                 self._bounded(
-                    files.fetch(attachment.id),
-                    name=attachment.name,
+                    files.fetch(file_id),
+                    name=name,
                     digest=digest,
                     counted=counted,
+                    deadline_epoch=deadline_epoch,
                 ),
             )
         except AttachmentResolutionError:
@@ -824,7 +1616,7 @@ class AttachmentCoordinator:
             # set: a swallowed error would boot a sandbox with no files and the
             # agent would answer "I can't see any attachment" about a message
             # that visibly carries one.
-            raise AttachmentFetchError(attachment.name, str(exc)) from exc
+            raise AttachmentFetchError(name, str(exc)) from exc
         return digest.hexdigest(), counted[0]
 
     def _bounded(
@@ -834,6 +1626,7 @@ class AttachmentCoordinator:
         name: str,
         digest: Any,
         counted: list[int],
+        deadline_epoch: float | None = None,
     ) -> Iterator[bytes]:
         """``_read_bounded_upload``'s shape: refuse at the crossing chunk.
 
@@ -844,6 +1637,10 @@ class AttachmentCoordinator:
 
         total = 0
         for chunk in source:
+            if deadline_epoch is not None and self._clock() > deadline_epoch:
+                # Checked as the bytes arrive, so one dripping earlier file
+                # cannot hold the boot past its budget (ADR 0205 decision 6).
+                raise _FetchDeadline(name)
             total += len(chunk)
             if total > self.limits.max_file_bytes:
                 raise AttachmentTooLargeError(name, self.limits.max_file_bytes)
@@ -865,7 +1662,9 @@ class AttachmentCoordinator:
             except Exception:  # noqa: BLE001 -- the refusal above is the real news
                 continue
 
-    def discard_prepared(self, *, thread_key: str, prepared: PreparedAttachments) -> None:
+    def discard_prepared(
+        self, *, thread_key: str, prepared: PreparedAttachments | PreparedThreadSet
+    ) -> None:
         """Discard an abandoned preclaim set without disturbing a newer resolve.
 
         The caller knows the exact bytes it prepared but not whether another
@@ -886,7 +1685,14 @@ class AttachmentCoordinator:
         and are swept on schedule instead of immediately.
         """
 
-        if not prepared.object_keys:
+        if isinstance(prepared, PreparedThreadSet):
+            # A thread set may own no NEW object yet still have written an
+            # owner record for parked copies it re-minted; that record is
+            # this prepare's to remove. The re-minted keys are not in
+            # ``object_keys``, so they are never deleted here.
+            if not prepared.owner_recorded:
+                return
+        elif not prepared.object_keys:
             # An empty set owns no bytes, so it wrote no owner record and has
             # nothing to protect against. Returning here keeps the common
             # file-free turn at exactly zero store calls.

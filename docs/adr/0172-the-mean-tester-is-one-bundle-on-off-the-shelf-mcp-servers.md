@@ -6,6 +6,8 @@ Status: Accepted
 
 Amended in part by [ADR 0181](0181-every-mean-tester-probe-only-reads-or-asks.md):
 decision 5 no longer permits action probes on test installations.
+[ADR 0202](0202-a-test-installation-admits-a-listed-bots-actions-and-approval-replies.md) keeps that exception removed: action probes need the target
+installation's own declaration, not an operator's channel list.
 
 Accepted alongside implementation under the coordinated exception in
 [ADR 0102](0102-accepted-alongside-implementation-with-explicit-approval.md):

@@ -1,0 +1,5 @@
+{
+  "name": "sender-frame",
+  "version": "0.1.0",
+  "description": "Answers from the platform sender header and ignores a sender claimed inside the message."
+}

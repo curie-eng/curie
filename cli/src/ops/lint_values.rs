@@ -6,6 +6,7 @@ use std::path::PathBuf;
 use anyhow::Result;
 use serde_json::Value;
 
+use super::CmdArg;
 use super::{fetch_release_values, plain, run_capture, CommonOpts, OpsCommand};
 use crate::ui::{CliOutput, Ui};
 
@@ -51,9 +52,40 @@ impl CliOutput for LintValuesOutput {
 
 /// Ask Helm to parse each pending file. Reading the copies through `fromYaml`
 /// keeps explicit nulls that Helm omits from its computed `.Values` template.
-/// The original files also go through `-f` so Helm validates the upgrade input.
-async fn pending_values(files: &[PathBuf]) -> Result<Value> {
-    let chart = tempfile::tempdir()
+/// The same captured copies go through `-f` so Helm validates this input.
+pub(crate) async fn pending_values(files: &[PathBuf]) -> Result<Value> {
+    parsed_values(files, &[]).await
+}
+
+/// @spec CLUSTER-VALUES-FILES c1-c3
+pub(crate) async fn pending_set_overlay(args: &[CmdArg]) -> Result<Value> {
+    parsed_values(&[], args).await
+}
+
+/// @spec CLUSTER-VALUES-FILES c1-c3
+pub(crate) async fn pending_set_values(base: &Value, args: &[CmdArg]) -> Result<Value> {
+    let snapshot = tempfile::NamedTempFile::new()
+        .map_err(|_| crate::exit::CliError::failure("could not prepare values snapshot"))?;
+    let encoded = serde_json::to_vec(base)
+        .map_err(|_| crate::exit::CliError::failure("could not prepare values snapshot"))?;
+    std::fs::write(snapshot.path(), encoded)
+        .map_err(|_| crate::exit::CliError::failure("could not prepare values snapshot"))?;
+    parsed_values(&[snapshot.path().to_path_buf()], args).await
+}
+
+/// @spec CLUSTER-VALUES-FILES c2-c3
+async fn parsed_values(files: &[PathBuf], explicit_args: &[CmdArg]) -> Result<Value> {
+    // @spec CLUSTER-VALUES-FILES c2: Helm parses only captured copies.
+    // @spec CLUSTER-VALUES-FILES c4: the copies can carry credentials, so the
+    // directory is owner-only from creation and each copy is written 0600.
+    let mut builder = tempfile::Builder::new();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        builder.permissions(std::fs::Permissions::from_mode(0o700));
+    }
+    let chart = builder
+        .tempdir()
         .map_err(|_| crate::exit::CliError::failure("could not prepare values lint chart"))?;
     let templates = chart.path().join("templates");
     std::fs::create_dir(&templates)
@@ -73,13 +105,19 @@ async fn pending_values(files: &[PathBuf]) -> Result<Value> {
         template.push_str("  empty: \"{}\"\n");
     }
     for (index, file) in files.iter().enumerate() {
-        let contents = std::fs::read(file)
-            .map_err(|_| crate::exit::CliError::failure("could not read values file"))?;
-        std::fs::write(chart_files.join(format!("{index}.yaml")), contents)
+        // @spec CLUSTER-VALUES-FILES c2: name the path, never the contents.
+        let contents = std::fs::read(file).map_err(|_| {
+            crate::exit::CliError::usage(format!("could not read values file {}", file.display()))
+                .with_fix("pass an existing, readable YAML file to -f/--values-file")
+        })?;
+        crate::secrets::write_private(&chart_files.join(format!("{index}.yaml")), &contents)
             .map_err(|_| crate::exit::CliError::failure("could not prepare values lint chart"))?;
         template.push_str(&format!(
             "  file{index}: {{{{ (.Files.Get \"files/{index}.yaml\" | fromYaml | toJson) | quote }}}}\n"
         ));
+    }
+    if !explicit_args.is_empty() {
+        template.push_str("  operatorValues: {{ .Values | toJson | quote }}\n");
     }
     std::fs::write(templates.join("values.yaml"), template)
         .map_err(|_| crate::exit::CliError::failure("could not prepare values lint chart"))?;
@@ -89,27 +127,29 @@ async fn pending_values(files: &[PathBuf]) -> Result<Value> {
         plain("curie-values-lint"),
         plain(chart.path().to_string_lossy().into_owned()),
     ];
-    for file in files {
-        let path = file
+    for index in 0..files.len() {
+        let snapshot = chart_files.join(format!("{index}.yaml"));
+        let path = snapshot
             .to_str()
             .ok_or_else(|| crate::exit::CliError::failure("values file path is not UTF-8"))?;
         args.push(plain("-f"));
         args.push(plain(path));
     }
+    args.extend_from_slice(explicit_args);
     let (ok, output, _) = run_capture(&OpsCommand::new("helm", args))
         .await
         .map_err(|_| {
             crate::exit::CliError::failure("could not invoke Helm to parse values files")
         })?;
     if !ok {
-        return Err(
-            crate::exit::CliError::failure("could not parse values files with Helm").into(),
-        );
+        return Err(crate::exit::CliError::usage("could not parse values files with Helm")
+            .with_fix("make each -f/--values-file a valid YAML mapping and each --set expression valid Helm syntax")
+            .into());
     }
     let rendered: Value = serde_norway::from_str(&output)
         .map_err(|_| crate::exit::CliError::failure("could not read Helm parsed values"))?;
     let mut pending = Value::Object(serde_json::Map::new());
-    for index in 0..files.len() {
+    for (index, file) in files.iter().enumerate() {
         let key = format!("file{index}");
         let json = rendered
             .get("data")
@@ -119,10 +159,23 @@ async fn pending_values(files: &[PathBuf]) -> Result<Value> {
         let values: Value = serde_json::from_str(json)
             .map_err(|_| crate::exit::CliError::failure("could not read Helm parsed values"))?;
         if !values.is_object() {
-            return Err(
-                crate::exit::CliError::failure("values files must contain YAML maps").into(),
-            );
+            return Err(crate::exit::CliError::usage(format!(
+                "values file {} must contain a YAML map",
+                file.display()
+            ))
+            .with_fix("make each -f/--values-file a YAML mapping at the top level")
+            .into());
         }
+        merge_values(&mut pending, values);
+    }
+    if !explicit_args.is_empty() {
+        let json = rendered
+            .get("data")
+            .and_then(|data| data.get("operatorValues"))
+            .and_then(Value::as_str)
+            .ok_or_else(|| crate::exit::CliError::failure("could not read Helm parsed values"))?;
+        let values: Value = serde_json::from_str(json)
+            .map_err(|_| crate::exit::CliError::failure("could not read Helm parsed values"))?;
         merge_values(&mut pending, values);
     }
     Ok(pending)
@@ -156,7 +209,7 @@ pub async fn lint_values(common: CommonOpts, files: Vec<PathBuf>) -> Result<Lint
 }
 
 /// Helm merges maps recursively and replaces lists, scalars, and nulls.
-fn merge_values(previous: &mut Value, later: Value) {
+pub(crate) fn merge_values(previous: &mut Value, later: Value) {
     match (previous, later) {
         (Value::Object(previous), Value::Object(later)) => {
             for (key, value) in later {

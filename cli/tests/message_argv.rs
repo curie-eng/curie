@@ -35,9 +35,9 @@ fn run_with_kubeconfig(args: &[&str]) -> Output {
         &kubeconfig,
         r#"apiVersion: v1
 kind: Config
-current-context: test-ctx
+current-context: test-context
 contexts:
-- name: test-ctx
+- name: test-context
   context:
     cluster: test-cluster
     user: test-user
@@ -259,7 +259,7 @@ fn cluster_message_separated_context_single_text_dry_run_succeeds() {
         "cluster",
         "message",
         "--context",
-        "test-ctx",
+        "test-context",
         ISSUE_TEXT,
         "--dry-run",
     ]);
@@ -269,7 +269,7 @@ fn cluster_message_separated_context_single_text_dry_run_succeeds() {
         "separated --context <ctx> single-text --dry-run must succeed\n{text}"
     );
     assert!(
-        text.contains("Kubernetes context: test-ctx"),
+        text.contains("Kubernetes context: test-context"),
         "the named kubeconfig context must be resolved\n{text}"
     );
     assert!(
@@ -288,7 +288,7 @@ fn cluster_message_separated_context_two_positionals_keep_agent_refusal() {
         "cluster",
         "message",
         "--context",
-        "test-ctx",
+        "test-context",
         ISSUE_AGENT,
         ISSUE_TEXT,
     ]);
@@ -297,7 +297,7 @@ fn cluster_message_separated_context_two_positionals_keep_agent_refusal() {
 
 #[test]
 fn local_message_context_is_clap_error_not_agent_refusal() {
-    let output = run(&["local", "message", "--context", "test-ctx", ISSUE_TEXT]);
+    let output = run(&["local", "message", "--context", "test-context", ISSUE_TEXT]);
     let text = combined(&output);
     assert_eq!(
         output.status.code(),
@@ -426,4 +426,53 @@ fn cluster_versions_help_still_takes_agent() {
         text.contains("<AGENT>") || text.contains("<agent>"),
         "cluster versions help must keep the AGENT positional\n{text}"
     );
+}
+
+#[test]
+fn local_message_and_eval_dry_runs_never_print_valkey_credentials() {
+    let bundle = tempfile::tempdir().expect("temporary eval bundle");
+    fs::create_dir(bundle.path().join("evals")).unwrap();
+    fs::write(
+        bundle.path().join("evals/cases.json"),
+        r#"{
+        "name":"redaction",
+        "cases":[{"id":"one","input":"ping","grader":{"kind":"contains","expected":"pong"}}]
+    }"#,
+    )
+    .unwrap();
+    for json in [false, true] {
+        for verb in ["message", "eval"] {
+            let mut command = Command::new(bin());
+            if json {
+                command.arg("--json");
+            }
+            command.args(["local", verb]);
+            if verb == "message" {
+                command.arg("ping");
+            }
+            let output = command
+                .args(["--dry-run", "--valkey-password", "example#private%token"])
+                .current_dir(bundle.path())
+                .env("CURIE_CONFIG_DIR", bundle.path().join("config"))
+                .env("CURIE_LOCAL_STUB_HOST", "127.0.0.1")
+                .output()
+                .unwrap();
+            let text = combined(&output);
+            assert!(output.status.success(), "{verb}: {text}");
+            assert!(!text.contains("example#private%token"), "{verb}: {text}");
+            assert!(
+                !text.contains("example%23private%25token"),
+                "{verb}: {text}"
+            );
+            if json {
+                let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+                assert_eq!(value["dry_run"], true);
+            } else {
+                assert!(
+                    text.contains("enqueue onto redis redis://"),
+                    "{verb}: {text}"
+                );
+            }
+        }
+    }
 }

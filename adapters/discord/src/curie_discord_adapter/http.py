@@ -1,5 +1,6 @@
 """Authenticated HTTP ingress for Curie's neutral reply events."""
 
+import logging
 import secrets
 from typing import Protocol
 
@@ -8,6 +9,8 @@ from fastapi import FastAPI, Header, HTTPException, Request, status
 from pydantic import TypeAdapter, ValidationError
 
 _EVENT: TypeAdapter[ReplyEvent] = TypeAdapter(ReplyEvent)
+
+logger = logging.getLogger(__name__)
 
 
 class ReplyService(Protocol):
@@ -37,7 +40,31 @@ def create_reply_app(service: ReplyService, adapter_secret: str) -> FastAPI:
             event = _EVENT.validate_json(await request.body())
         except ValidationError as exc:
             raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, exc.errors()) from exc
-        return await service.deliver(event)
+        try:
+            return await service.deliver(event)
+        except ValueError as exc:
+            # The service refuses an event it cannot render (a foreign target
+            # kind, a progress edit without the card's reply_ref) before any
+            # provider call. Retrying the same body cannot change that.
+            logger.warning(
+                "refused %s event the adapter cannot render (%s)",
+                event.event,
+                type(exc).__name__,
+            )
+            raise HTTPException(
+                status.HTTP_422_UNPROCESSABLE_ENTITY, "event cannot be rendered by this adapter"
+            ) from exc
+        except Exception as exc:
+            # A failed Discord call is a delivery failure the worker retries, so
+            # answer it deliberately. Left to escape, uvicorn's bare 500 closes
+            # the socket without `Connection: close`, and the worker's pooled
+            # session then fails the immediate retry as unreachable, which a
+            # best-effort turn acks as delivered. Only the class is logged: the
+            # message of a provider error can carry its response body or URL.
+            logger.error(
+                "delivering %s event to Discord failed (%s)", event.event, type(exc).__name__
+            )
+            raise HTTPException(status.HTTP_502_BAD_GATEWAY, "provider delivery failed") from exc
 
     @app.get("/healthz")
     async def health() -> dict[str, str]:

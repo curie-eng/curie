@@ -4,7 +4,7 @@
 //! and across separate processes. Timestamp-only names failed that on hosted
 //! runners and on a separately owned Valkey.
 
-mod support;
+use crate::support;
 use support::unique_stream;
 
 use std::collections::HashSet;
@@ -83,7 +83,7 @@ fn unique_stream_names_are_unique_across_processes() {
             Command::new(&exe)
                 .env(CHILD_ENV, PER_PROCESS.to_string())
                 .args([
-                    "unique_stream_names_are_unique_across_processes",
+                    "unique_stream::unique_stream_names_are_unique_across_processes",
                     "--exact",
                     "--nocapture",
                 ])

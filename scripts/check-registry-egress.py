@@ -509,12 +509,12 @@ def main() -> int:
     cleanup_error: str | None = None
     try:
         check.execute()
-    except Exception as exc:  # Keep partial evidence for diagnosis.
+    except Exception as exc:  # noqa: BLE001 - Keep partial evidence for diagnosis.
         error = f"{type(exc).__name__}: {exc}"
     finally:
         try:
             check.cleanup()
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001 - existing broad catch retained
             cleanup_error = f"{type(exc).__name__}: {exc}"
         if check.temp is not None:
             check.temp.cleanup()

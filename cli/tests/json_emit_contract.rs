@@ -12,7 +12,7 @@
 //! (comms/eval legitimately exit non-zero with a JSON *error* object); the bug
 //! under test is empty stdout, not a nonzero code.
 
-mod support;
+use crate::support;
 
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
@@ -47,12 +47,15 @@ fn manifest() -> serde_json::Value {
 fn placeholder(id: &str) -> &'static str {
     match id {
         "limit" => "1",
+        "tenant" => "00000000-0000-0000-0000-000000000001",
+        "resource" => "config",
         // `migrate-store --phase` restricts its values, so the generic "x" is
         // rejected by clap before the verb reaches its dry-run branch -- which
         // would fail this gate on an argument-parsing error rather than on the
         // empty-stdout bug it exists to catch. Any arg with a value_parser
         // enumeration needs a real value here.
         "phase" => "export",
+        "agent" => "codex",
         _ => "x",
     }
 }
@@ -105,8 +108,20 @@ fn dry_run_verbs() -> Vec<(Vec<String>, Vec<String>)> {
                         continue;
                     }
                     let id = a.get("id").and_then(|i| i.as_str()).unwrap_or("");
+                    let sample = a
+                        .get("possible_values")
+                        .and_then(|values| values.as_array())
+                        .and_then(|values| values.first())
+                        .and_then(|value| value.as_str())
+                        .unwrap_or_else(|| {
+                            if id == "agent" && path.join(" ") == "cluster role-filter" {
+                                "00000000-0000-0000-0000-000000000001"
+                            } else {
+                                placeholder(id)
+                            }
+                        });
                     if a.get("positional").and_then(|p| p.as_bool()) == Some(true) {
-                        required.push(placeholder(id).to_string());
+                        required.push(sample.to_string());
                     } else {
                         let long = a
                             .get("long")
@@ -122,7 +137,7 @@ fn dry_run_verbs() -> Vec<(Vec<String>, Vec<String>)> {
                                     && values.iter().any(|value| value == "false")
                             });
                         if !boolean_switch {
-                            required.push(placeholder(id).to_string());
+                            required.push(sample.to_string());
                         }
                     }
                 }
@@ -132,6 +147,11 @@ fn dry_run_verbs() -> Vec<(Vec<String>, Vec<String>)> {
                 // grammar; the full form is covered by example_sre_bot_install.
                 if path.join(" ") == "example sre-bot install" {
                     required.push("--observability-only".to_string());
+                }
+                // Budget requires either limit flag, a conditional requirement
+                // the manifest does not encode. Supply a valid token limit.
+                if matches!(path.join(" ").as_str(), "local budget" | "cluster budget") {
+                    required.extend(["--output-tokens".to_string(), "64000".to_string()]);
                 }
                 out.push((path, required));
             }
@@ -169,6 +189,7 @@ fn every_dry_run_verb_emits_json_object() {
         // branch; pre-fix that path emits exit 0 + empty stdout (the RED we want).
         let root = concat!(env!("CARGO_MANIFEST_DIR"), "/..");
         let output = Command::new(bin())
+            .env("KUBECONFIG", "/dev/null")
             .current_dir(root)
             .args(&argv)
             .output()
@@ -193,6 +214,14 @@ fn every_dry_run_verb_emits_json_object() {
             "`curie {}` under --json must emit a JSON object, got: {stdout}",
             argv.join(" ")
         );
+        if matches!(path.join(" ").as_str(), "local budget" | "cluster budget") {
+            assert!(
+                output.status.success(),
+                "budget dry run must succeed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert_eq!(parsed["dry_run"], true, "budget must emit its dry run plan");
+        }
         if path.join(" ") == "example sre-bot install" {
             assert!(
                 output.status.success(),
@@ -218,6 +247,7 @@ fn observability_emits_json_object() {
     // `{"surfaces":[{"name","url"}]}` contract (empty-stdout was already fixed
     // by #456/PR#503, before this branch).
     let output = Command::new(bin())
+        .env("KUBECONFIG", "/dev/null")
         .args(["local", "observability", "--json"])
         .output()
         .expect("run curie local observability --json");
@@ -256,6 +286,7 @@ fn dry_run_json_masks_credentials() {
     // CARGO_MANIFEST_DIR). `--dry-run` never fetches or stats it.
     let chart = concat!(env!("CARGO_MANIFEST_DIR"), "/../charts/curie");
     let output = Command::new(bin())
+        .env("KUBECONFIG", "/dev/null")
         .args(["cluster", "up", "--chart", chart, "--dry-run", "--json"])
         .env("CURIE_MODEL_CREDENTIALS", "sk-ant-SECRETSENTINEL9999")
         .output()
@@ -297,6 +328,7 @@ fn dry_run_json_masks_credentials() {
 /// `--dry-run` touches no network.
 fn assert_eval_dry_run_plan(tier: &str) {
     let output = Command::new(bin())
+        .env("KUBECONFIG", "/dev/null")
         .args([tier, "eval", "--dry-run", "--json"])
         .current_dir(concat!(env!("CARGO_MANIFEST_DIR"), "/../examples/weather"))
         .output()
@@ -426,6 +458,7 @@ fn assert_comms_dry_run_plan(tier: &str, extra: &[&str]) -> serde_json::Value {
     args.extend_from_slice(extra);
     args.extend_from_slice(&["--dry-run", "--json"]);
     let output = Command::new(bin())
+        .env("KUBECONFIG", "/dev/null")
         .args(&args)
         // The token flags default from these; remove them so an ambient shell
         // value can never influence the plan under test.
@@ -573,8 +606,8 @@ fn cluster_comms_disconnect_dry_run_emits_plan_not_error() {
 
 use curie::api::{MemoryEntry, Version};
 use curie::commands::{
-    ApprovalsOutput, BudgetOutput, DeleteOutput, InitOutput, KillOutput, MemoryOutput,
-    ResetThreadOutput, ResumeOutput, VersionsOutput,
+    ApprovalsOutput, BudgetOutput, DeleteOutput, InitOutput, KillOutput, MemoryChannel, MemoryFact,
+    MemoryOutput, ResetThreadOutput, ResumeOutput, VersionsOutput,
 };
 // `ObservabilityOutput` moved to the tier-aware `observability` seam (#460) so
 // both the local and cluster handlers return one type.
@@ -681,11 +714,13 @@ fn memory_output_json_shape_is_pinned() {
         json!({"dry_run": true, "plan": ["GET <api>/agents/<id>/memory"]})
     );
     assert_eq!(
-        MemoryOutput::Empty {
+        MemoryOutput::List {
             agent: "weather".to_string(),
+            entries: vec![],
+            facts: vec![],
         }
         .to_json(),
-        json!({"agent": "weather", "entries": []})
+        json!({"agent": "weather", "entries": [], "facts": []})
     );
     // `MemoryEntry::version` is deliberately NOT emitted; this exact-match pins
     // that (surfacing it later would fail here and force a contract decision).
@@ -706,6 +741,27 @@ fn memory_output_json_shape_is_pinned() {
                     provenance: Default::default(),
                 },
             ],
+            facts: vec![
+                MemoryFact {
+                    id: "fact-0123456789abcdef0123456789abcdef".to_string(),
+                    scope: "agent".to_string(),
+                    channel: None,
+                    statement: "prefer complete timestamps".to_string(),
+                    author: "operator@example.com".to_string(),
+                    stated_at: "2026-10-01T03:04:05.123456+00:00".to_string(),
+                },
+                MemoryFact {
+                    id: "fact-11111111111111111111111111111111".to_string(),
+                    scope: "channel".to_string(),
+                    channel: Some(MemoryChannel {
+                        kind: "slack".to_string(),
+                        address: "C0EXAMPLE1".to_string(),
+                    }),
+                    statement: "prefer morning updates".to_string(),
+                    author: "U0EXAMPLE1".to_string(),
+                    stated_at: "2026-10-02T03:04:05Z".to_string(),
+                },
+            ],
         }
         .to_json(),
         json!({
@@ -714,6 +770,59 @@ fn memory_output_json_shape_is_pinned() {
                 {"index": 0, "content": "user prefers celsius"},
                 {"index": 1, "content": "home airport is BOS"},
             ],
+            "facts": [
+                {
+                    "id": "fact-0123456789abcdef0123456789abcdef",
+                    "scope": "agent",
+                    "channel": null,
+                    "statement": "prefer complete timestamps",
+                    "author": "operator@example.com",
+                    "stated_at": "2026-10-01T03:04:05.123456+00:00",
+                },
+                {
+                    "id": "fact-11111111111111111111111111111111",
+                    "scope": "channel",
+                    "channel": {"kind": "slack", "address": "C0EXAMPLE1"},
+                    "statement": "prefer morning updates",
+                    "author": "U0EXAMPLE1",
+                    "stated_at": "2026-10-02T03:04:05Z",
+                },
+            ],
+        })
+    );
+    assert_eq!(
+        MemoryOutput::Deleted {
+            agent: "weather".to_string(),
+            id: "fact-0123456789abcdef0123456789abcdef".to_string(),
+            scope: "agent".to_string(),
+            channel: None,
+        }
+        .to_json(),
+        json!({
+            "agent": "weather",
+            "id": "fact-0123456789abcdef0123456789abcdef",
+            "scope": "agent",
+            "channel": null,
+            "deleted": true,
+        })
+    );
+    assert_eq!(
+        MemoryOutput::Deleted {
+            agent: "weather".to_string(),
+            id: "fact-11111111111111111111111111111111".to_string(),
+            scope: "channel".to_string(),
+            channel: Some(MemoryChannel {
+                kind: "slack".to_string(),
+                address: "C0EXAMPLE1".to_string(),
+            }),
+        }
+        .to_json(),
+        json!({
+            "agent": "weather",
+            "id": "fact-11111111111111111111111111111111",
+            "scope": "channel",
+            "channel": {"kind": "slack", "address": "C0EXAMPLE1"},
+            "deleted": true,
         })
     );
     assert_eq!(
@@ -805,6 +914,7 @@ fn approvals_pending_and_resolved_json_shapes_are_pinned() {
         status: "pending".to_string(),
         conversation_id: "C1-thread-9".to_string(),
         summary: "Deploy the thing".to_string(),
+        display_summary: None,
         expires_at: Some("2026-07-16T00:00:00Z".to_string()),
         resolved_by: None,
         // #1078: the persisted card location for a route-bound approval.
@@ -1011,9 +1121,10 @@ fn budget_output_json_shape_is_pinned() {
         BudgetOutput::Done {
             agent: "weather".to_string(),
             max_usd_per_day: Some(12.5),
+            max_output_tokens_per_run: Some(64000),
         }
         .to_json(),
-        json!({"agent": "weather", "max_usd_per_day": 12.5})
+        json!({"agent": "weather", "max_usd_per_day": 12.5, "max_output_tokens_per_run": 64000})
     );
     // `None` means "platform default" and must serialize as an explicit null --
     // omitting the key would read to an agent as "no budget field at all".
@@ -1021,10 +1132,22 @@ fn budget_output_json_shape_is_pinned() {
         BudgetOutput::Done {
             agent: "weather".to_string(),
             max_usd_per_day: None,
+            max_output_tokens_per_run: None,
         }
         .to_json(),
-        json!({"agent": "weather", "max_usd_per_day": null})
+        json!({"agent": "weather", "max_usd_per_day": null, "max_output_tokens_per_run": null})
     );
+    for (usd, tokens) in [(Some(12.5), None), (None, Some(64000))] {
+        assert_eq!(
+            BudgetOutput::Done {
+                agent: "weather".to_string(),
+                max_usd_per_day: usd,
+                max_output_tokens_per_run: tokens,
+            }
+            .to_json(),
+            json!({"agent": "weather", "max_usd_per_day": usd, "max_output_tokens_per_run": tokens})
+        );
+    }
 }
 
 #[test]
@@ -1111,6 +1234,9 @@ fn deploy_output_json_shape_is_pinned() {
             deployment_id: "dep_1".to_string(),
             deployment_environment: "dev".to_string(),
             deployment_status: "active".to_string(),
+            cron_triggers: Vec::new(),
+            wake_triggers: Vec::new(),
+            warnings: Vec::new(),
         }
         .to_json(),
         expected
@@ -1177,7 +1303,7 @@ fn cluster_down_failforward_error_is_transient_with_resume_fix() {
     // The resume command an incomplete teardown surfaces: only the outstanding
     // steps, label-scoped per #707 (the ownership-scope invariant).
     let resume =
-        "kubectl delete namespace -l curietech.ai/created-by=prod-release,curietech.ai/created-in=agent-ns --ignore-not-found";
+        "kubectl delete namespace -l curietech.ai/created-by=prod-release,curietech.ai/created-in=agent-ns --ignore-not-found --timeout=300s";
     let err: anyhow::Error =
         CliError::transient("cluster teardown could not complete; the API server was unreachable")
             .with_fix(resume)
@@ -1282,6 +1408,7 @@ fn init_from_spec_emits_json_object() {
     let out_dir = tmp.path().join("bundle");
 
     let output = Command::new(bin())
+        .env("KUBECONFIG", tmp.path().join("kubeconfig"))
         .args([
             "init",
             "--from-spec",
@@ -1440,6 +1567,8 @@ enum DeployTargetChannels {
 struct ClusterDeployFixture {
     all_targets: bool,
     cron_trigger: bool,
+    cron_target: Option<&'static str>,
+    json_output: bool,
     deploy_failure: DeployFixtureFailure,
     connectors: ConnectorFixture,
     kubectl_failure: KubectlFixtureFailure,
@@ -1452,6 +1581,8 @@ impl Default for ClusterDeployFixture {
         Self {
             all_targets: true,
             cron_trigger: false,
+            cron_target: None,
+            json_output: true,
             deploy_failure: DeployFixtureFailure::None,
             connectors: ConnectorFixture::Empty,
             kubectl_failure: KubectlFixtureFailure::None,
@@ -1598,6 +1729,18 @@ fn deploy_api_response(
                 }),
             )
         }
+        ("PATCH", path) if path.starts_with("/agents/") && path.matches('/').count() == 2 => {
+            let id = path.trim_start_matches("/agents/");
+            response_json(
+                200,
+                json!({
+                    "id": id,
+                    "name": id,
+                    "channels": [],
+                    "memory": false
+                }),
+            )
+        }
         ("GET", path) if path.contains("/versions/") && path.contains("/connectors?") => {
             let target = target_from_agent(path);
             let (manifests, owned_secret_name, owned_secret_keys) = match connectors {
@@ -1723,7 +1866,7 @@ fn stub_path(bin_dir: &Path) -> std::ffi::OsString {
     std::env::join_paths(paths).expect("join stub PATH")
 }
 
-fn run_cluster_deploy_json(fixture: ClusterDeployFixture) -> (Output, Vec<support::Request>) {
+fn run_cluster_deploy(fixture: ClusterDeployFixture) -> (Output, Vec<support::Request>) {
     let plugin = tempfile::tempdir().expect("plugin tempdir");
     curie::scaffold::scaffold(plugin.path(), "acme-bundle").expect("scaffold test bundle");
     if fixture.cron_trigger {
@@ -1735,8 +1878,22 @@ fn run_cluster_deploy_json(fixture: ClusterDeployFixture) -> (Output, Vec<suppor
         manifest["triggers"] = json!([{
             "type": "cron",
             "name": "acme-nightly",
-            "schedule": "0 2 * * *"
+            "schedule": "0 2 * * *",
+            "timezone": "Europe/London",
+            "prompt": "Report the scheduled result."
         }]);
+        if let Some(target) = fixture.cron_target {
+            manifest["triggers"][0]["target"] = json!(target);
+            manifest["triggers"]
+                .as_array_mut()
+                .expect("cron declaration array")
+                .push(json!({
+                    "type": "cron",
+                    "name": "acme-maintenance",
+                    "schedule": "30 3 * * *",
+                    "prompt": "Perform the scheduled maintenance."
+                }));
+        }
         fs::write(
             manifest_path,
             serde_json::to_string_pretty(&manifest).expect("serialize cron manifest"),
@@ -1785,9 +1942,14 @@ fn run_cluster_deploy_json(fixture: ClusterDeployFixture) -> (Output, Vec<suppor
     } else {
         command.args(["--target", "dev"]);
     }
+    if fixture.json_output {
+        command.arg("--json");
+    }
     command
-        .arg("--json")
         .env("PATH", stub_path(tools.path()))
+        .env("KUBECONFIG", tools.path().join("kubeconfig"))
+        .env("CURIE_CONFIG_DIR", empty_config_dir.path())
+        .env("NO_COLOR", "1")
         .env_remove("CURIE_API_URL")
         .env_remove("CURIE_API_KEY")
         .env_remove("DEV_TOKEN")
@@ -1868,13 +2030,16 @@ fn expected_deploy(target: &str) -> serde_json::Value {
             "id": format!("deployment-{target}"),
             "environment": environment,
             "status": "active"
-        }
+        },
+        "cron_triggers": [],
+        "wake_triggers": [],
+        "warnings": []
     })
 }
 
 #[test]
 fn cluster_deploy_target_refuses_documentation_placeholder_before_mutation() {
-    let (output, requests) = run_cluster_deploy_json(ClusterDeployFixture {
+    let (output, requests) = run_cluster_deploy(ClusterDeployFixture {
         all_targets: false,
         target_channels: DeployTargetChannels::DocumentationPlaceholders,
         ..ClusterDeployFixture::default()
@@ -1905,7 +2070,7 @@ fn cluster_deploy_target_refuses_documentation_placeholder_before_mutation() {
 
 #[test]
 fn cluster_deploy_target_preserves_actionable_api_placeholder_refusal() {
-    let (output, requests) = run_cluster_deploy_json(ClusterDeployFixture {
+    let (output, requests) = run_cluster_deploy(ClusterDeployFixture {
         all_targets: false,
         target_channels: DeployTargetChannels::ApiRejectsDocumentationPlaceholder,
         ..ClusterDeployFixture::default()
@@ -1958,7 +2123,7 @@ fn assert_failure_keys(value: &serde_json::Value, includes_failed_result: bool) 
 
 #[test]
 fn cluster_deploy_json_all_targets_emits_one_ordered_complete_object() {
-    let (output, _) = run_cluster_deploy_json(ClusterDeployFixture::default());
+    let (output, _) = run_cluster_deploy(ClusterDeployFixture::default());
     assert_eq!(
         output.status.code(),
         Some(0),
@@ -1981,11 +2146,11 @@ fn cluster_deploy_json_all_targets_emits_one_ordered_complete_object() {
 }
 
 #[test]
-fn cluster_deploy_with_cron_trigger_emits_no_cron_warning() {
-    // The worker scheduler fires cron triggers on cluster installs (#268), so
-    // deploy has nothing to warn about for single or all target invocations.
+fn cluster_deploy_with_targetless_cron_emits_no_cron_warning() {
+    // The worker scheduler fires cron triggers on cluster installs (#268).
+    // Targetless cron has no channel address to resolve or warn about (#4009).
     for all_targets in [false, true] {
-        let (output, _) = run_cluster_deploy_json(ClusterDeployFixture {
+        let (output, _) = run_cluster_deploy(ClusterDeployFixture {
             all_targets,
             cron_trigger: true,
             ..ClusterDeployFixture::default()
@@ -2004,9 +2169,142 @@ fn cluster_deploy_with_cron_trigger_emits_no_cron_warning() {
     }
 }
 
+fn all_targets_cron_warning() -> &'static str {
+    "cron trigger `acme-nightly` targets `C000000A02`, which matches no single channel bound to `acme-dev`; every slot records failed until that address is bound."
+}
+
+fn expected_deploy_with_cron(target: &str) -> serde_json::Value {
+    let mut value = expected_deploy(target);
+    value["cron_triggers"] = json!([
+        {"name": "acme-nightly", "schedule": "0 2 * * *", "zone": "Europe/London", "target": "C000000A02"},
+        {"name": "acme-maintenance", "schedule": "30 3 * * *", "zone": "UTC", "target": null}
+    ]);
+    value["warnings"] = if target == "dev" {
+        json!([all_targets_cron_warning()])
+    } else {
+        json!([])
+    };
+    value
+}
+
+#[test]
+fn cluster_deploy_human_all_targets_keeps_every_cron_receipt_and_the_first_warning() {
+    let (output, requests) = run_cluster_deploy(ClusterDeployFixture {
+        cron_trigger: true,
+        cron_target: Some("C000000A02"),
+        json_output: false,
+        ..ClusterDeployFixture::default()
+    });
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "all targets must deploy: {stderr}"
+    );
+    assert_eq!(deployment_request_count(&requests), 2);
+    let nightly: Vec<_> = stdout
+        .lines()
+        .filter(|line| line.contains("acme-nightly") && line.contains("0 2 * * *"))
+        .collect();
+    assert_eq!(
+        nightly.len(),
+        2,
+        "both successful targets must retain their cron receipt: {stdout}"
+    );
+    assert!(
+        nightly
+            .iter()
+            .all(|line| { line.contains("Europe/London") && line.contains("C000000A02") }),
+        "each receipt must show its zone and target: {stdout}"
+    );
+    let maintenance: Vec<_> = stdout
+        .lines()
+        .filter(|line| line.contains("acme-maintenance") && line.contains("30 3 * * *"))
+        .collect();
+    assert_eq!(
+        maintenance.len(),
+        2,
+        "targetless cron appears for each target: {stdout}"
+    );
+    assert!(
+        maintenance
+            .iter()
+            .all(|line| { line.contains("UTC") && line.contains("targetless") }),
+        "targetless cron must retain its zone and target label: {stdout}"
+    );
+    assert_eq!(
+        stderr.matches(all_targets_cron_warning()).count(),
+        1,
+        "the earlier target's exact warning must remain visible once: {stderr}"
+    );
+    assert!(
+        !stderr.contains("which matches no single channel bound to `acme-prod`"),
+        "the last target binds the cron address and must not warn: {stderr}"
+    );
+}
+
+#[test]
+fn cluster_deploy_json_all_targets_keeps_cron_receipts_and_per_target_warnings() {
+    let (output, requests) = run_cluster_deploy(ClusterDeployFixture {
+        cron_trigger: true,
+        cron_target: Some("C000000A02"),
+        ..ClusterDeployFixture::default()
+    });
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "all targets must deploy: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(deployment_request_count(&requests), 2);
+    assert_eq!(
+        one_stdout_object(&output),
+        json!({
+            "results": [
+                {"target": "dev", "result": expected_deploy_with_cron("dev")},
+                {"target": "prod", "result": expected_deploy_with_cron("prod")}
+            ]
+        })
+    );
+}
+
+#[test]
+fn cluster_deploy_json_cron_receipts_survive_later_deploy_and_connector_failures() {
+    let (output, _) = run_cluster_deploy(ClusterDeployFixture {
+        cron_trigger: true,
+        cron_target: Some("C000000A02"),
+        deploy_failure: DeployFixtureFailure::Deploy("prod"),
+        ..ClusterDeployFixture::default()
+    });
+    assert_eq!(output.status.code(), Some(1));
+    let value = one_stdout_object(&output);
+    assert_eq!(value["stage"], json!("deploy"));
+    assert_eq!(value["failed_target"], json!("prod"));
+    assert_eq!(
+        value["completed"],
+        json!([
+            {"target": "dev", "result": expected_deploy_with_cron("dev")}
+        ])
+    );
+
+    let (output, _) = run_cluster_deploy(ClusterDeployFixture {
+        cron_trigger: true,
+        cron_target: Some("C000000A02"),
+        connectors: ConnectorFixture::Manifest,
+        kubectl_failure: KubectlFixtureFailure::Apply,
+        ..ClusterDeployFixture::default()
+    });
+    assert_eq!(output.status.code(), Some(1));
+    let value = one_stdout_object(&output);
+    assert_eq!(value["stage"], json!("connector_sync"));
+    assert_eq!(value["failed_result"], expected_deploy_with_cron("dev"));
+    assert_eq!(value["completed"], json!([]));
+}
+
 #[test]
 fn cluster_deploy_json_later_failure_names_target_and_completed_results() {
-    let (output, _) = run_cluster_deploy_json(ClusterDeployFixture {
+    let (output, _) = run_cluster_deploy(ClusterDeployFixture {
         deploy_failure: DeployFixtureFailure::Deploy("prod"),
         ..ClusterDeployFixture::default()
     });
@@ -2029,7 +2327,7 @@ fn cluster_deploy_json_later_failure_names_target_and_completed_results() {
 
 #[test]
 fn cluster_deploy_json_first_failure_has_empty_completed_results() {
-    let (output, _) = run_cluster_deploy_json(ClusterDeployFixture {
+    let (output, _) = run_cluster_deploy(ClusterDeployFixture {
         deploy_failure: DeployFixtureFailure::Deploy("dev"),
         ..ClusterDeployFixture::default()
     });
@@ -2049,7 +2347,7 @@ fn cluster_deploy_json_first_failure_has_empty_completed_results() {
 
 #[test]
 fn cluster_deploy_json_all_targets_env_credentials_ignore_unset_home() {
-    let (output, requests) = run_cluster_deploy_json(ClusterDeployFixture {
+    let (output, requests) = run_cluster_deploy(ClusterDeployFixture {
         connectors: ConnectorFixture::CredentialKeys,
         credentials: CredentialEnvironment::BothWithoutHome,
         ..ClusterDeployFixture::default()
@@ -2078,7 +2376,7 @@ fn cluster_deploy_json_all_targets_env_credentials_ignore_unset_home() {
 
 #[test]
 fn cluster_deploy_json_later_connector_credential_failure_deploys_zero_targets() {
-    let (output, requests) = run_cluster_deploy_json(ClusterDeployFixture {
+    let (output, requests) = run_cluster_deploy(ClusterDeployFixture {
         connectors: ConnectorFixture::CredentialKeys,
         credentials: CredentialEnvironment::DevOnlyWithEmptyVault,
         ..ClusterDeployFixture::default()
@@ -2104,7 +2402,7 @@ fn cluster_deploy_json_later_connector_credential_failure_deploys_zero_targets()
 
 #[test]
 fn cluster_deploy_json_app_discovery_failure_is_precondition_with_zero_deployments() {
-    let (output, requests) = run_cluster_deploy_json(ClusterDeployFixture {
+    let (output, requests) = run_cluster_deploy(ClusterDeployFixture {
         kubectl_failure: KubectlFixtureFailure::Discovery,
         ..ClusterDeployFixture::default()
     });
@@ -2137,7 +2435,7 @@ fn cluster_deploy_json_app_discovery_failure_is_precondition_with_zero_deploymen
 
 #[test]
 fn cluster_deploy_json_connector_apply_failure_carries_failed_result_after_activation() {
-    let (output, requests) = run_cluster_deploy_json(ClusterDeployFixture {
+    let (output, requests) = run_cluster_deploy(ClusterDeployFixture {
         connectors: ConnectorFixture::Manifest,
         kubectl_failure: KubectlFixtureFailure::Apply,
         ..ClusterDeployFixture::default()
@@ -2164,7 +2462,7 @@ fn cluster_deploy_json_connector_apply_failure_carries_failed_result_after_activ
 
 #[test]
 fn cluster_deploy_json_single_target_shape_is_unchanged() {
-    let (output, _) = run_cluster_deploy_json(ClusterDeployFixture {
+    let (output, _) = run_cluster_deploy(ClusterDeployFixture {
         all_targets: false,
         ..ClusterDeployFixture::default()
     });

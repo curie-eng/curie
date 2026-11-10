@@ -19,7 +19,7 @@ import json
 from pathlib import Path
 
 import pytest
-from curie_api.schemas import EvalCaseOut, GraderOut
+from curie_api.schemas.evals import EvalCaseOut, GraderOut
 from jsonschema import Draft202012Validator
 
 _SCHEMA_PATH = (
@@ -76,6 +76,13 @@ def test_expect_status_values_match_the_schema_enum() -> None:
         f"EvalCaseOut.expect_status literals {sorted(api_statuses)} diverge from the "
         f"schema ExpectedStatus enum {sorted(schema_statuses)}"
     )
+
+
+def test_sender_is_an_optional_eval_case_field() -> None:
+    case = _schema()["$defs"]["EvalCase"]
+    assert "sender" in case["properties"]
+    assert "sender" not in case.get("required", [])
+    assert "sender" in EvalCaseOut.model_fields
 
 
 def test_eval_case_field_names_match_the_schema() -> None:

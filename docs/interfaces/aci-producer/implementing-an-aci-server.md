@@ -17,9 +17,12 @@ truth (the committed JSON Schema and generated Rust/TS are derived from them).
 
 ## What "an ACI server" is
 
-An ACI server is an **HTTP process** inside the sandbox that exposes seven POST
-routes and streams NDJSON back. Those seven plus the bearer-gated `GET /v1/status`
-described below are its eight authenticated control routes:
+An ACI server is an **HTTP process** inside the sandbox that exposes 11 POST
+routes and streams NDJSON back: seven every server serves, plus four optional
+runner-private routes described below, the executor route `POST /v1/execute`,
+the checkpoint route `POST /v1/checkpoint`, and the UI evidence routes
+`POST /v1/ui-evidence/index` and `POST /v1/ui-evidence/image`. Those seven plus the bearer-gated
+`GET /v1/status` are its eight required authenticated control routes:
 
 | Route | Purpose |
 | --- | --- |
@@ -30,6 +33,10 @@ described below are its eight authenticated control routes:
 | `POST /v1/snapshot` | Capture a bounded, credential-free snapshot of the managed repository workspace for the authenticated worker; return `409` when the session has no managed workspace. |
 | `POST /v1/timeout` | Stop the exact open turn named by the event response epoch. This runner-private control route is authenticated; a server omitting the epoch response header is simply not notified, and worker timeout classification remains unaffected. |
 | `POST /v1/turn-admit` | Grant or deny the exact waiting turn epoch. This runner-private control route is authenticated and does not change the ACI wire frames. |
+| `POST /v1/execute` | Optional. Served only by a runner booted with `CURIE_RUNNER_MODE=execute`; runs one connector action's `list`, `observe` and `call` phases for the worker's executor (see below). |
+| `POST /v1/checkpoint` | Optional. Capture the managed workspace against a worker-supplied trusted base commit as a bounded patch plus manifest; runner-private and authenticated (see below). |
+| `POST /v1/ui-evidence/index` | Optional. Return the validated index of the gitignored `.curie/ui-evidence/` manifest and its PNG images, bound to a worker-named base commit; runner-private and authenticated (see below). |
+| `POST /v1/ui-evidence/image` | Optional. Return the raw bytes of one indexed, unchanged PNG; runner-private and authenticated (see below). |
 | `GET /v1/status` | Return session status plus the credential-free boot attestation (`session_id`, `sandbox_id`, `managed_workspace`, `cwd`) and `history_durable` for the worker's replacement-authority check. |
 
 Plus two unauthenticated GETs the platform relies on: `GET /healthz` (liveness)
@@ -37,7 +44,39 @@ and `GET /status` (session status + readiness). The chart's readiness probe hits
 `/healthz` with no auth header, so keep those two open even when the control routes
 are token-gated.
 
-The seventh authenticated control route is `GET /v1/status`. It returns session status,
+`POST /v1/execute` is optional and runner-private (ACTION-EXECUTOR-6, -24). Only a
+runner booted with `CURIE_RUNNER_MODE=execute` serves it: that process loads no
+model session, serves only `/healthz`, `/status`, `/v1/status` and
+`/v1/execute` (bearer-authenticated), and answers every other control route `409`
+naming the mode. It runs one connector action's `list`, `observe` and `call`
+phases for the worker's executor, frozen in `tests/vectors/runner-execute.json`.
+Like `/v1/turn-admit` it carries no ACI frame, so it changes no frozen contract
+(ACTION-EXECUTOR-25). `run_conformance` does not cover it, and a server without it
+answers `404`, which the worker maps to `runner_unavailable`; a second
+implementation need not provide it.
+
+`POST /v1/checkpoint` is also optional and runner-private
+([ADR 0251](../../adr/0251-a-failed-factory-run-keeps-a-private-recovery-checkpoint-that-only-explicit-restoration-reads.md)). Like `/v1/turn-admit` and `/v1/execute` it is a
+bearer-authenticated control route that carries no ACI frame and changes no ACI
+wire frame. The body names a trusted base commit (`base_sha`) and a budget of at
+most 60 seconds (`budget_seconds`); the runner answers a patch against that base
+plus a manifest of the changed paths, bounded at 900000 and 1048576 bytes. It
+stores nothing and conveys no credentials or authority. `run_conformance` does not
+cover it, a server without it answers `404`, and executor mode answers `409`
+naming the mode.
+
+`POST /v1/ui-evidence/index` and `POST /v1/ui-evidence/image` are also optional and
+runner-private. They are bearer-authenticated control routes that carry no ACI
+frame. The index route takes the publication base commit and a budget and returns
+the manifest status, the before and after binding and, per image, its size,
+sha256 or refusal. The image route takes an index entry and its sha256 and returns
+that PNG only if it is unchanged. Only regular PNG files under `.curie/ui-evidence/`
+are read, without following symlinks. Neither route enters the snapshot patch.
+`run_conformance` does not cover them, a server without them answers `404`, which
+the worker records as unavailable evidence, and a session without a managed
+workspace or a runner in executor mode answers `409`.
+
+The eighth required authenticated control route is `GET /v1/status`. It returns session status,
 the credential-free boot attestation (`session_id`, `sandbox_id`, `managed_workspace`,
 `cwd`), and `history_durable` for the worker's replacement-authority check.
 
@@ -212,7 +251,7 @@ Route contract to honor:
   `session_id`, `sandbox_id`, `managed_workspace`, and `cwd`; the worker uses that
   credential-free attestation to establish replacement authority.
 - **Auth (optional):** when a bearer token is configured, require
-  `Authorization: Bearer <token>` on all seven control routes, compared with a
+  `Authorization: Bearer <token>` on every control route, compared with a
   constant-time check; leave `/healthz` and `/status` open for the probe.
 
 Map any decode/validation error on a POST body to a **400** so a malformed frame
@@ -268,6 +307,8 @@ You have a conformant ACI server when:
       while a turn is active, so eval cases stay isolated.
 - [ ] `POST /v1/snapshot` returns the bounded managed-workspace snapshot, or 409
       when the session has no managed workspace.
+- [ ] Optional: `POST /v1/checkpoint` is bearer-authenticated and returns a bounded
+      patch plus manifest against the requested base, or answers `404` when absent.
 - [ ] `GET /healthz` and `GET /status` are open and unauthenticated.
 - [ ] `GET /v1/status` is bearer-authenticated and returns the boot attestation plus
       `history_durable`.

@@ -13,8 +13,9 @@ from claude_agent_sdk.types import (
     PermissionResultDeny,
     ToolPermissionContext,
 )
-from curie_runner.approval import ApprovalGate, build_can_use_tool
+from curie_runner.approval import ApprovalGate
 from curie_runner.fake import FakeModelSession
+from curie_runner.harness.claude.approval import build_can_use_tool
 from curie_runner.history import (
     ConversationMessage,
     TranscriptStore,
@@ -75,6 +76,7 @@ def _runner(
     decision: str | None = None,
 ) -> SessionRunner:
     return SessionRunner(
+        max_usd_per_day=None,
         held_secrets=frozenset(),
         session_factory=lambda: session,
         ceiling=0,

@@ -7,6 +7,7 @@ scriptable in-process fake runner; only Slack and the model are faked.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 import sys
 import threading
@@ -36,12 +37,21 @@ from aci_protocol import (
 from aiohttp import web
 from aiohttp.test_utils import TestServer
 from channel_protocol.reply import ReplyAck, ReplyEvent, ReplyTarget
-from curie_worker import kernel as kernel_module
 from curie_worker.actions import ActionClient
 from curie_worker.attachments import PreparedAttachments
 from curie_worker.behaviorpacks import BehaviorPacks
+from curie_worker.binding import HttpIdentityBinding
 from curie_worker.capacity_wait import CapacityWaitRequested
-from curie_worker.kernel import ThreadBusyError
+from curie_worker.kernel import attempt as kernel_attempt
+from curie_worker.kernel import clock as kernel_clock
+from curie_worker.kernel import constants as kernel_constants
+from curie_worker.kernel import core as kernel_core
+from curie_worker.kernel import delivery as kernel_delivery
+from curie_worker.kernel import failures as kernel_failures
+from curie_worker.kernel import log as kernel_log
+from curie_worker.kernel import routing as kernel_routing
+from curie_worker.kernel import workspace as kernel_workspace
+from curie_worker.kernel.failures import ThreadBusyError
 from curie_worker.reply_sink import TargetRoute
 from curie_worker.runner_client import RunnerError, TurnStream
 from curie_worker.sandbox import (
@@ -50,7 +60,10 @@ from curie_worker.sandbox import (
     RouteRecord,
     SandboxHandle,
 )
+from curie_worker.sandbox.types import SandboxTermination
 from curie_worker.workspace import (
+    WorkspaceClaimCoordinator,
+    WorkspaceCredentialClient,
     WorkspacePreparationError,
     WorkspaceSelectionRefused,
 )
@@ -105,6 +118,19 @@ def _safe_candidate_status(candidate: SandboxHandle) -> dict[str, object]:
 
 
 class _HistoryBinding:
+
+    async def identity_binding(
+        self, kind: str, adapter: str | None, address: str,
+    ) -> HttpIdentityBinding | None:
+        """@spec HTTP-INVOCATION-EXECUTION-18: explicit local fixture classification."""
+        agent_id = uuid.UUID("22222222-2222-4222-8222-222222222222")
+        return HttpIdentityBinding(
+            tenant_id=uuid.UUID("00000000-0000-4000-8000-000000000001"),
+            agent_id=agent_id,
+            binding_id=uuid.uuid5(uuid.NAMESPACE_URL, repr((kind, adapter, address))),
+            binding_generation=1, http_identity_required=False,
+        )
+
     async def resolve(self, _kind: str, _adapter: str | None, _channel: str) -> _FakeResolved:
         return _FakeResolved(uuid.UUID("22222222-2222-4222-8222-222222222222"))
 
@@ -115,6 +141,7 @@ class _HistoryBinding:
         *,
         kind: str | None = None,
         address: str | None = None,
+        **_: object,
     ) -> dict[str, str]:
         del kind, address
         return {
@@ -177,7 +204,7 @@ class _PressureAttachmentLane:
 
 
 def _capture_pressure_outcomes(monkeypatch: pytest.MonkeyPatch) -> list[str]:
-    real_record_metric = kernel_module.record_metric
+    real_record_metric = kernel_log.record_metric
     outcomes: list[str] = []
 
     def record(
@@ -194,7 +221,7 @@ def _capture_pressure_outcomes(monkeypatch: pytest.MonkeyPatch) -> list[str]:
         ):
             outcomes.append(attributes["outcome"])
 
-    monkeypatch.setattr(kernel_module, "record_metric", record)
+    monkeypatch.setattr(kernel_log, "record_metric", record)
     return outcomes
 
 
@@ -387,6 +414,19 @@ def test_cancellation_during_deferred_job_boot_reply_releases_runner_response(
 class _BuiltInCodingBinding:
     """Resolved deployment facts for the built-in claim-time coding path."""
 
+    async def identity_binding(
+        self, kind: str, adapter: str | None, address: str,
+    ) -> HttpIdentityBinding | None:
+        """@spec HTTP-INVOCATION-EXECUTION-18: explicit local fixture classification."""
+        agent_id = uuid.UUID("22222222-2222-4222-8222-222222222222")
+        return HttpIdentityBinding(
+            tenant_id=uuid.UUID("00000000-0000-4000-8000-000000000001"),
+            agent_id=agent_id,
+            binding_id=uuid.uuid5(uuid.NAMESPACE_URL, repr((kind, adapter, address))),
+            binding_generation=1, http_identity_required=False,
+        )
+
+
     def __init__(
         self,
         deployment_id: uuid.UUID | None,
@@ -413,6 +453,7 @@ class _BuiltInCodingBinding:
         *,
         kind: str | None = None,
         address: str | None = None,
+        **_: object,
     ) -> dict[str, str]:
         return {}
 
@@ -902,16 +943,16 @@ def test_announcement_sits_between_answer_and_receipt(
 ) -> None:
     # A unit on the composition order: answer, announcement, receipt. The stub
     # takes the install's receipt mode too (ADR-0180), which the order ignores.
-    monkeypatch.setattr(kernel_module, "render_receipt", lambda rows, mode="all": "RECEIPT")
+    monkeypatch.setattr(kernel_delivery, "render_receipt", lambda rows, mode="all": "RECEIPT")
 
-    announced = kernel_module._StreamAccumulator(
+    announced = kernel_delivery._StreamAccumulator(
         text_parts=["answer"],
         receipt_rows=[{"x": 1}],
         workspace_inferred_repo="acme-corp/acme-bot",
     )
     assert announced.rendered_with_receipt() == f"answer\n\n{_ANNOUNCEMENT}\n\nRECEIPT"
 
-    unannounced = kernel_module._StreamAccumulator(
+    unannounced = kernel_delivery._StreamAccumulator(
         text_parts=["answer"],
         receipt_rows=[{"x": 1}],
     )
@@ -1144,6 +1185,19 @@ def test_conflicting_runtime_repo_is_terminal_before_claim_or_model(
             self.workspace_enabled = False
 
     class WorkspaceBinding:
+
+        async def identity_binding(
+            self, kind: str, adapter: str | None, address: str,
+        ) -> HttpIdentityBinding | None:
+            """@spec HTTP-INVOCATION-EXECUTION-18: explicit local fixture classification."""
+            agent_id = WorkspaceResolved().agent_id
+            return HttpIdentityBinding(
+                tenant_id=uuid.UUID("00000000-0000-4000-8000-000000000001"),
+                agent_id=agent_id,
+                binding_id=uuid.uuid5(uuid.NAMESPACE_URL, repr((kind, adapter, address))),
+                binding_generation=1, http_identity_required=False,
+            )
+
         async def resolve(
             self, _kind: str, _adapter: str | None, _channel: str
         ) -> WorkspaceResolved:
@@ -1156,6 +1210,7 @@ def test_conflicting_runtime_repo_is_terminal_before_claim_or_model(
             *,
             kind: str | None = None,
             address: str | None = None,
+            **_: object,
         ) -> dict[str, str]:
             return {"CURIE_RUNNER_TOKEN": "workspace-test-token"}
 
@@ -1278,6 +1333,19 @@ def test_workspace_capability_without_selection_keeps_fresh_thread_generic(
             self.workspace_enabled = False
 
     class WorkspaceBinding:
+
+        async def identity_binding(
+            self, kind: str, adapter: str | None, address: str,
+        ) -> HttpIdentityBinding | None:
+            """@spec HTTP-INVOCATION-EXECUTION-18: explicit local fixture classification."""
+            agent_id = WorkspaceResolved().agent_id
+            return HttpIdentityBinding(
+                tenant_id=uuid.UUID("00000000-0000-4000-8000-000000000001"),
+                agent_id=agent_id,
+                binding_id=uuid.uuid5(uuid.NAMESPACE_URL, repr((kind, adapter, address))),
+                binding_generation=1, http_identity_required=False,
+            )
+
         async def resolve(
             self, _kind: str, _adapter: str | None, _channel: str
         ) -> WorkspaceResolved:
@@ -1290,6 +1358,7 @@ def test_workspace_capability_without_selection_keeps_fresh_thread_generic(
             *,
             kind: str | None = None,
             address: str | None = None,
+            **_: object,
         ) -> dict[str, str]:
             return {}
 
@@ -1454,6 +1523,9 @@ def test_late_workspace_selection_replaces_generic_sandbox_and_stays_sticky(
         (False, False, "idle-awaiting-input", True),
         (False, True, "awaiting-approval", True),
         (False, True, "idle-awaiting-input", False),
+        (True, True, "classified-failure", True),
+        (False, False, "classified-failure", True),
+        (False, True, "classified-failure", False),
     ],
 )
 def test_late_workspace_selection_defers_without_steering_until_boundary_is_safe(
@@ -1509,6 +1581,8 @@ def test_late_workspace_selection_defers_without_steering_until_boundary_is_safe
     [
         pytest.param(SessionStatus.DONE, id="done"),
         pytest.param(SessionStatus.IDLE_AWAITING_INPUT, id="idle-awaiting-input"),
+        # #4188: a failed turn is never recorded, so durable replay is whole.
+        pytest.param(SessionStatus.CLASSIFIED_FAILURE, id="classified-failure"),
     ],
 )
 def test_workspace_handoff_boundary_accepts_completed_durable_status(
@@ -1780,7 +1854,6 @@ def test_late_workspace_candidate_attestation_uses_exact_authenticated_handle(
         pytest.param("sandbox_id", "other-sandbox", id="sandbox-id"),
         pytest.param("managed_workspace", False, id="managed-workspace"),
         pytest.param("cwd", "/tmp", id="cwd"),
-        pytest.param("ready", False, id="ready"),
         pytest.param("status", SessionStatus.DONE.value, id="status"),
         pytest.param("turn_active", True, id="turn-active"),
         pytest.param("history_durable", False, id="history-durable"),
@@ -1817,6 +1890,7 @@ def test_late_workspace_candidate_attestation_mismatch_refuses_handoff(
                 workspace_repo="acme-corp/acme-bot",
                 generation=old.generation + 1,
             )
+            candidate_reads: list[str] = []
 
             async def status(
                 base_url: str,
@@ -1834,8 +1908,13 @@ def test_late_workspace_candidate_attestation_mismatch_refuses_handoff(
                     }
                 assert base_url == candidate.base_url
                 assert token == candidate.token
+                candidate_reads.append(field)
                 payload = _safe_candidate_status(candidate)
                 payload[field] = invalid_value
+                # A still-connecting candidate is polled, so each real mismatch
+                # here also reports ``ready`` false: the refusal must still be
+                # immediate rather than waiting out the readiness budget.
+                payload["ready"] = False
                 return payload
 
             h.kernel._runner.status = status  # type: ignore[method-assign]
@@ -1854,7 +1933,9 @@ def test_late_workspace_candidate_attestation_mismatch_refuses_handoff(
 
             h.kernel._workspace = WorkspaceProbe()  # type: ignore[assignment]
 
-            with pytest.raises(ThreadBusyError):
+            with pytest.raises(
+                ThreadBusyError, match="did not attest the expected managed checkout"
+            ):
                 await h.kernel._claim_or_resume(
                     thread_key,
                     {
@@ -1864,7 +1945,296 @@ def test_late_workspace_candidate_attestation_mismatch_refuses_handoff(
                     workspace_deployment_id=deployment_id,
                     workspace_repo="acme-corp/acme-bot",
                     replace_handle=old,
+                    remaining_s=5.0,
                 )
+
+            # Exactly one read: a real mismatch is refused without polling.
+            assert candidate_reads == [field]
+
+    asyncio.run(go())
+
+
+def _late_candidate_handles(
+    h: Any, thread_key: str, history_ref: str
+) -> tuple[SandboxHandle, SandboxHandle]:
+    old = h.substrate.claim(
+        thread_key,
+        env={
+            "CURIE_RUNNER_TOKEN": "old-runner-token",
+            "CURIE_SESSION_ID": "logical-session",
+            "CURIE_HISTORY_REF": history_ref,
+        },
+    )
+    candidate = SandboxHandle(
+        thread_key=thread_key,
+        claim_name="candidate-claim",
+        sandbox_name="candidate-sandbox",
+        namespace=old.namespace,
+        service_fqdn="candidate.test-ns.svc.cluster.local",
+        port=old.port,
+        session_id=old.session_id,
+        history_ref=old.history_ref,
+        token="candidate-runner-token",
+        workspace_repo="acme-corp/acme-bot",
+        generation=old.generation + 1,
+    )
+    return old, candidate
+
+
+def test_late_workspace_candidate_still_connecting_is_polled_until_ready(
+    make_harness,
+) -> None:
+    """#4777: a candidate whose runner is up but whose session is still
+    connecting reports ``ready: False`` with every other fact safe. The
+    handoff keeps reading its status and accepts the same handle once it
+    turns ready, instead of refusing on the first not-ready read."""
+
+    deployment_id = uuid.uuid4()
+
+    async def go() -> None:
+        async with make_harness(binding=_workspace_binding(deployment_id)) as h:
+            thread_key = _thread_key("tCandidateConnecting")
+            old, candidate = _late_candidate_handles(h, thread_key, "history/tCandidateConnecting")
+            ordering: list[str] = []
+            candidate_reads: list[bool] = []
+
+            async def status(
+                base_url: str,
+                *,
+                token: str | None = None,
+                remaining_s: float | None = None,
+            ) -> dict[str, object]:
+                del remaining_s
+                if base_url == old.base_url:
+                    assert token == old.token
+                    ordering.append("old-runner-revalidated")
+                    return {
+                        "status": SessionStatus.DONE.value,
+                        "turn_active": False,
+                        "history_durable": True,
+                    }
+                assert base_url == candidate.base_url
+                assert token == candidate.token
+                ready = len(candidate_reads) >= 3
+                candidate_reads.append(ready)
+                ordering.append("candidate-attested")
+                payload = _safe_candidate_status(candidate)
+                payload["ready"] = ready
+                return payload
+
+            h.kernel._runner.status = status  # type: ignore[method-assign]
+
+            class WorkspaceProbe:
+                def claim_or_resume_with_handle(self, **kwargs: object) -> object:
+                    ordering.append("prepared-and-verified")
+                    revalidate = kwargs.get("revalidate_before_handoff")
+                    assert callable(revalidate)
+                    revalidate()
+                    validate_candidate = kwargs.get("validate_candidate")
+                    assert callable(validate_candidate)
+                    validate_candidate(candidate)
+                    return SimpleNamespace(handle=candidate, prepared=None)
+
+            h.kernel._workspace = WorkspaceProbe()  # type: ignore[assignment]
+
+            # The explicit budget bounds a regression that never stops
+            # polling, so it fails instead of hanging.
+            result = await asyncio.wait_for(
+                h.kernel._claim_or_resume(
+                    thread_key,
+                    {
+                        "CURIE_SESSION_ID": old.session_id,
+                        "CURIE_HISTORY_REF": old.history_ref or "",
+                    },
+                    workspace_deployment_id=deployment_id,
+                    workspace_repo="acme-corp/acme-bot",
+                    replace_handle=old,
+                    remaining_s=10.0,
+                ),
+                timeout=20.0,
+            )
+
+            assert result is candidate
+            assert candidate_reads == [False, False, False, True]
+            assert ordering == [
+                "prepared-and-verified",
+                "old-runner-revalidated",
+                "candidate-attested",
+                "candidate-attested",
+                "candidate-attested",
+                "candidate-attested",
+            ]
+
+    asyncio.run(go())
+
+
+def test_late_workspace_candidate_never_ready_refuses_once_budget_is_spent(
+    make_harness,
+) -> None:
+    """#4777: polling a not-ready candidate is bounded by the delivery's
+    remaining budget. A candidate that never turns ready is refused with
+    the attestation failure, not the bridge timeout, once that budget is
+    spent, after more than one read."""
+
+    deployment_id = uuid.uuid4()
+    budget_s = 3.0
+
+    async def go() -> None:
+        async with make_harness(binding=_workspace_binding(deployment_id)) as h:
+            thread_key = _thread_key("tCandidateNeverReady")
+            old, candidate = _late_candidate_handles(h, thread_key, "history/tCandidateNeverReady")
+            candidate_reads = 0
+
+            async def status(
+                base_url: str,
+                *,
+                token: str | None = None,
+                remaining_s: float | None = None,
+            ) -> dict[str, object]:
+                nonlocal candidate_reads
+                if base_url == old.base_url:
+                    assert token == old.token
+                    return {
+                        "status": SessionStatus.DONE.value,
+                        "turn_active": False,
+                        "history_durable": True,
+                    }
+                assert base_url == candidate.base_url
+                assert token == candidate.token
+                if remaining_s is not None:
+                    assert remaining_s <= budget_s
+                candidate_reads += 1
+                payload = _safe_candidate_status(candidate)
+                payload["ready"] = False
+                return payload
+
+            h.kernel._runner.status = status  # type: ignore[method-assign]
+
+            class WorkspaceProbe:
+                def claim_or_resume_with_handle(self, **kwargs: object) -> object:
+                    revalidate = kwargs.get("revalidate_before_handoff")
+                    assert callable(revalidate)
+                    revalidate()
+                    validate_candidate = kwargs.get("validate_candidate")
+                    assert callable(validate_candidate)
+                    validate_candidate(candidate)
+                    raise AssertionError("a never-ready candidate must never be returned")
+
+            h.kernel._workspace = WorkspaceProbe()  # type: ignore[assignment]
+
+            started = time.monotonic()
+            with pytest.raises(
+                ThreadBusyError, match="did not attest the expected managed checkout"
+            ):
+                await asyncio.wait_for(
+                    h.kernel._claim_or_resume(
+                        thread_key,
+                        {
+                            "CURIE_SESSION_ID": old.session_id,
+                            "CURIE_HISTORY_REF": old.history_ref or "",
+                        },
+                        workspace_deployment_id=deployment_id,
+                        workspace_repo="acme-corp/acme-bot",
+                        replace_handle=old,
+                        remaining_s=budget_s,
+                    ),
+                    timeout=budget_s + 10.0,
+                )
+            elapsed = time.monotonic() - started
+
+            # Polled, not refused on the first not-ready read, and with a
+            # pause between reads rather than a tight loop.
+            assert 1 < candidate_reads < 1000
+            # The match above proves the probe's own deadline fired rather than
+            # the coordinator bridge timeout; this bounds how long it took.
+            assert elapsed < budget_s + 3.0
+
+    asyncio.run(go())
+
+
+def test_late_workspace_candidate_never_ready_refuses_on_configured_deadline_alone(
+    make_harness,
+) -> None:
+    """#4777: with no explicit ``remaining_s`` the only bound on polling a
+    not-ready candidate is the configured ``runner_total_timeout_s``. A
+    candidate that never turns ready is still refused with the attestation
+    failure within that ceiling, after more than one read, and no status
+    call is given a longer budget than the ceiling."""
+
+    deployment_id = uuid.uuid4()
+    ceiling_s = 3.0
+
+    async def go() -> None:
+        async with make_harness(
+            binding=_workspace_binding(deployment_id),
+            runner_total_timeout_s=ceiling_s,
+        ) as h:
+            thread_key = _thread_key("tCandidateConfigDeadline")
+            old, candidate = _late_candidate_handles(
+                h, thread_key, "history/tCandidateConfigDeadline"
+            )
+            candidate_reads = 0
+            seen_remaining: list[float | None] = []
+
+            async def status(
+                base_url: str,
+                *,
+                token: str | None = None,
+                remaining_s: float | None = None,
+            ) -> dict[str, object]:
+                nonlocal candidate_reads
+                if base_url == old.base_url:
+                    assert token == old.token
+                    return {
+                        "status": SessionStatus.DONE.value,
+                        "turn_active": False,
+                        "history_durable": True,
+                    }
+                assert base_url == candidate.base_url
+                assert token == candidate.token
+                seen_remaining.append(remaining_s)
+                candidate_reads += 1
+                payload = _safe_candidate_status(candidate)
+                payload["ready"] = False
+                return payload
+
+            h.kernel._runner.status = status  # type: ignore[method-assign]
+
+            class WorkspaceProbe:
+                def claim_or_resume_with_handle(self, **kwargs: object) -> object:
+                    revalidate = kwargs.get("revalidate_before_handoff")
+                    assert callable(revalidate)
+                    revalidate()
+                    validate_candidate = kwargs.get("validate_candidate")
+                    assert callable(validate_candidate)
+                    validate_candidate(candidate)
+                    raise AssertionError("a never-ready candidate must never be returned")
+
+            h.kernel._workspace = WorkspaceProbe()  # type: ignore[assignment]
+
+            started = time.monotonic()
+            with pytest.raises(
+                ThreadBusyError, match="did not attest the expected managed checkout"
+            ):
+                await asyncio.wait_for(
+                    h.kernel._claim_or_resume(
+                        thread_key,
+                        {
+                            "CURIE_SESSION_ID": old.session_id,
+                            "CURIE_HISTORY_REF": old.history_ref or "",
+                        },
+                        workspace_deployment_id=deployment_id,
+                        workspace_repo="acme-corp/acme-bot",
+                        replace_handle=old,
+                        remaining_s=None,
+                    ),
+                    timeout=ceiling_s + 10.0,
+                )
+            elapsed = time.monotonic() - started
+
+            assert candidate_reads > 1
+            assert all(r is None or r <= ceiling_s for r in seen_remaining)
+            assert elapsed < ceiling_s + 1.0
 
     asyncio.run(go())
 
@@ -1935,6 +2305,19 @@ def test_a_selection_refusal_is_logged_so_an_operator_can_find_it(make_harness, 
             self.workspace_enabled = True
 
     class WorkspaceBinding:
+
+        async def identity_binding(
+            self, kind: str, adapter: str | None, address: str,
+        ) -> HttpIdentityBinding | None:
+            """@spec HTTP-INVOCATION-EXECUTION-18: explicit local fixture classification."""
+            agent_id = WorkspaceResolved().agent_id
+            return HttpIdentityBinding(
+                tenant_id=uuid.UUID("00000000-0000-4000-8000-000000000001"),
+                agent_id=agent_id,
+                binding_id=uuid.uuid5(uuid.NAMESPACE_URL, repr((kind, adapter, address))),
+                binding_generation=1, http_identity_required=False,
+            )
+
         async def resolve(
             self, _kind: str, _adapter: str | None, _channel: str
         ) -> WorkspaceResolved:
@@ -1947,6 +2330,7 @@ def test_a_selection_refusal_is_logged_so_an_operator_can_find_it(make_harness, 
             *,
             kind: str | None = None,
             address: str | None = None,
+            **_: object,
         ) -> dict[str, str]:
             return {}
 
@@ -1981,8 +2365,8 @@ def test_a_selection_refusal_is_logged_so_an_operator_can_find_it(make_harness, 
 # The refusal half of this ticket is already covered above, by the INFO line the
 # refusal branch emits. These pin the other half: clone and upload failures used
 # to be swallowed by the broad start-failure clause, which names an event id and
-# an anonymous repr. They assert the log line, not the reply; the reply was never
-# the missing half.
+# an anonymous repr. The original #2004 tests pin those log lines. The #4367
+# tests below also pin the stage and reason carried into the terminal reply.
 
 
 def _workspace_binding(
@@ -2004,6 +2388,19 @@ def _workspace_binding(
             self.workspace_enabled = True
 
     class WorkspaceBinding:
+
+        async def identity_binding(
+            self, kind: str, adapter: str | None, address: str,
+        ) -> HttpIdentityBinding | None:
+            """@spec HTTP-INVOCATION-EXECUTION-18: explicit local fixture classification."""
+            agent_id = WorkspaceResolved().agent_id
+            return HttpIdentityBinding(
+                tenant_id=uuid.UUID("00000000-0000-4000-8000-000000000001"),
+                agent_id=agent_id,
+                binding_id=uuid.uuid5(uuid.NAMESPACE_URL, repr((kind, adapter, address))),
+                binding_generation=1, http_identity_required=False,
+            )
+
         async def resolve(
             self, _kind: str, _adapter: str | None, _channel: str
         ) -> WorkspaceResolved:
@@ -2016,6 +2413,7 @@ def _workspace_binding(
             *,
             kind: str | None = None,
             address: str | None = None,
+            **_: object,
         ) -> dict[str, str]:
             return dict(boot_env_override or {"CURIE_RUNNER_TOKEN": "workspace-test-token"})
 
@@ -2102,6 +2500,182 @@ def test_workspace_preparation_failure_escalates_by_its_own_name(make_harness, c
     asyncio.run(go())
 
 
+@pytest.mark.parametrize(
+    ("status", "expected_detail", "expected_attempts"),
+    [
+        pytest.param(
+            500,
+            "workspace repository-selection failed: API returned HTTP 500",
+            None,
+            id="dependency-fault-retries-in-current-invocation",
+        ),
+        pytest.param(
+            403,
+            "That repository is not in api.githubRepoAllowlist for this installation; "
+            "allow `owner/repo` or `owner/*` in the chart values.",
+            1,
+            id="allowlist-refusal-is-terminal",
+        ),
+        pytest.param(
+            409,
+            "This thread is already bound to a different repository.",
+            1,
+            id="selection-conflict-is-terminal",
+        ),
+    ],
+)
+def test_workspace_selection_http_failure_preserves_diagnostic_and_retry_policy(
+    make_harness, status: int, expected_detail: str, expected_attempts: int | None
+) -> None:
+    """#4367: selection faults retain the reason while policy refusals stay terminal."""
+
+    deployment_id = uuid.uuid4()
+
+    async def go() -> None:
+        requests: list[dict[str, object]] = []
+
+        async def select(request: web.Request) -> web.Response:
+            requests.append(await request.json())
+            return web.json_response(
+                {
+                    "detail": {
+                        "code": "workspace.selection_conflict",
+                        "message": "opaque API response must not become the public reason",
+                    }
+                },
+                status=status,
+            )
+
+        app = web.Application()
+        app.router.add_post(f"/v1/internal/workspaces/{deployment_id}/selection", select)
+        async with TestServer(app) as server:
+            credentials = WorkspaceCredentialClient(
+                api_url=str(server.make_url("")),
+                worker_token="workspace-test-token",
+            )
+            async with make_harness(
+                binding=_workspace_binding(deployment_id),
+                max_attempts=1,
+                workspace_total_timeout_seconds=1,
+            ) as h:
+                h.kernel._workspace = WorkspaceClaimCoordinator(
+                    preparer=SimpleNamespace(credentials=credentials),
+                    substrate=h.substrate,
+                )
+                event = qevent(
+                    "Fix https://github.com/acme-corp/acme-bot",
+                    thread=f"tWorkspaceSelection{status}",
+                )
+                await h.kernel.process_event(event)
+
+                if status == 500:
+                    assert len(requests) > h.config.max_attempts
+                else:
+                    assert len(requests) == expected_attempts
+                assert all(body["repo_full_name"] == "acme-corp/acme-bot" for body in requests)
+                assert h.fake_k8s.claim_envs == []
+                assert h.runner.opened == []
+                assert h.runner.steers == []
+                assert len(h.sink.completions) == 1
+                assert h.sink.completions[0].event_id == event.event_id
+                reply = h.sink.last_text
+                assert reply is not None
+                if status == 500:
+                    assert f"after {len(requests)} attempt(s)" in reply
+                    assert kernel_failures.failure_class_from_reply(reply) == "workspace-error"
+                    assert expected_detail in reply
+                    assert h.sink.completions[0].outcome == "escalated"
+                else:
+                    assert reply == expected_detail
+                    assert kernel_failures.failure_class_from_reply(reply) is None
+                    assert h.sink.completions[0].outcome == "delivered"
+                assert "opaque API response" not in reply
+                assert await h.kernel._markers.is_terminal(event.event_id)
+
+    asyncio.run(go())
+
+
+def test_workspace_failure_reason_is_redacted_before_clipping(make_harness) -> None:
+    """A credential spanning the bound must be consumed before a prefix is kept."""
+
+    deployment_id = uuid.uuid4()
+    reason = (
+        "git clone exited 128: -----BEGIN PRIVATE KEY-----\n"
+        f"{'SYNTHETIC-PRIVATE-MATERIAL' * 30}\n-----END PRIVATE KEY----- "
+        f"remaining diagnosis {'x' * 1000}"
+    )
+
+    async def go() -> None:
+        async with make_harness(binding=_workspace_binding(deployment_id), max_attempts=1) as h:
+
+            class WorkspaceProbe:
+                def select_repository(self, **_kwargs: object) -> str:
+                    return "acme-corp/acme-bot"
+
+                def claim_or_resume_with_handle(self, **_kwargs: object) -> object:
+                    raise WorkspacePreparationError("clone", reason)
+
+            h.kernel._workspace = WorkspaceProbe()  # type: ignore[assignment]
+            event = qevent("Fix https://github.com/acme-corp/acme-bot", thread="tWorkspaceSecret")
+            await h.kernel.process_event(event)
+
+            reply = h.sink.last_text
+            assert reply is not None
+            assert kernel_failures.failure_class_from_reply(reply) == "workspace-error"
+            detail = reply.split("after 1 attempt(s). ", 1)[1].split(" event_id=", 1)[0]
+            assert detail.startswith(
+                "workspace clone failed: git clone exited 128: [REDACTED:pem_private_key]"
+            )
+            assert len(detail) <= 300
+            assert "remaining diagnosis" in detail
+            assert "SYNTHETIC-PRIVATE-MATERIAL" not in reply
+            assert "-----BEGIN PRIVATE KEY-----" not in reply
+            assert "-----END PRIVATE KEY-----" not in reply
+            assert h.fake_k8s.claim_envs == []
+            assert h.runner.opened == []
+            assert len(h.sink.completions) == 1
+            assert h.sink.completions[0].outcome == "escalated"
+
+    asyncio.run(go())
+
+
+def test_prior_side_effect_does_not_retry_a_workspace_selection_failure(make_harness) -> None:
+    """The durable no-retry marker wins before another workspace request is sent."""
+
+    deployment_id = uuid.uuid4()
+
+    async def go() -> None:
+        async with make_harness(binding=_workspace_binding(deployment_id), max_attempts=3) as h:
+
+            class WorkspaceProbe:
+                selection_calls = 0
+
+                def select_repository(self, **_kwargs: object) -> str:
+                    self.selection_calls += 1
+                    raise WorkspacePreparationError("repository-selection", "API returned HTTP 500")
+
+            probe = WorkspaceProbe()
+            h.kernel._workspace = probe  # type: ignore[assignment]
+            event = qevent(
+                "Fix https://github.com/acme-corp/acme-bot", thread="tWorkspacePriorAction"
+            )
+            await h.kernel._markers.mark_side_effect(event.event_id)
+            await h.kernel.process_event(event)
+
+            assert probe.selection_calls == 0
+            assert h.fake_k8s.claim_envs == []
+            assert h.runner.opened == []
+            reply = h.sink.last_text
+            assert reply is not None
+            assert kernel_failures.failure_class_from_reply(reply) == "prior-side-effect"
+            assert "not retrying automatically" in reply
+            assert len(h.sink.completions) == 1
+            assert h.sink.completions[0].outcome == "escalated"
+            assert await h.kernel._markers.is_terminal(event.event_id)
+
+    asyncio.run(go())
+
+
 def test_binding_without_deployment_id_runs_the_generic_path(make_harness) -> None:
     """No deployment identity means there is no server-derived repo authority."""
 
@@ -2179,8 +2753,8 @@ def test_tool_notes_are_consumed_without_reaching_user_facing_updates(
             await h.kernel.process_event(event)
 
             texts = [text for _, _, text in h.sink.updates]
-            assert "Answer so far" in texts
-            assert "Answer so far and more" in texts
+            assert "Answer so far" not in texts
+            assert "Answer so far and more" not in texts
             assert h.sink.last_text == "Final answer"
             assert all("WebSearch" not in text for text in texts)
             assert all("searching..." not in text for text in texts)
@@ -2204,7 +2778,7 @@ def test_tool_notes_with_empty_or_absent_names_remain_internal(
             await h.kernel.process_event(qevent("research this"))
 
             texts = [text for _, _, text in h.sink.updates]
-            assert "Answer so far" in texts
+            assert "Answer so far" not in texts
             assert h.sink.last_text == "Final answer"
             assert all("empty name" not in text for text in texts)
             assert all("unnamed" not in text for text in texts)
@@ -2480,7 +3054,7 @@ def test_streamer_adopts_its_own_minted_ref(make_harness) -> None:
 
     async def go() -> None:
         async with make_harness() as h:
-            reply = kernel_module._ThrottledReply(
+            reply = kernel_delivery._ThrottledReply(
                 h.sink,
                 target=ReplyTarget(
                     kind="slack", address="C1", conversation_id="th-1", reply_ref=None
@@ -2582,8 +3156,8 @@ def test_active_file_turn_with_a_real_delivery_lease_settles_once(
     """A refused active file turn is delivered, acknowledged, and never reclaimed."""
 
     async def go() -> None:
-        from curie_dispatcher.queue import to_stream_fields
-        from curie_worker.consumer import Consumer
+        from curie_internal.turn_queue import to_stream_fields
+        from curie_worker.consumer import Consumer, refuse_unconfigured_reminder
         from curie_worker.delivery_lease import DeliveryLeaseStore
 
         class AttachmentLane:
@@ -2603,6 +3177,7 @@ def test_active_file_turn_with_a_real_delivery_lease_settles_once(
                 kernel=h.kernel,
                 config=h.config,
                 leases=store,
+                reminders=refuse_unconfigured_reminder,
             )
             await consumer.ensure_group()
 
@@ -2741,6 +3316,20 @@ def test_finish_race_falls_back_to_a_fresh_turn(make_harness) -> None:
             id="empty-alone-is-retryable-runner-error",
         ),
         pytest.param(
+            [
+                ErrorEvent(
+                    message="model error: server_error: API Error: Connection refused "
+                    "(ECONNREFUSED)",
+                    classification="model-unreachable",
+                )
+            ],
+            [Final(text="recovered", status=DONE)],
+            "recovered",
+            # #4333: a model endpoint that could not be reached before any
+            # side effect is a transport failure a later attempt can pass.
+            id="model-unreachable-retries",
+        ),
+        pytest.param(
             # Mid-run drop: a delta streams, then the stream ends with no final.
             [TextDelta(text="partial")],
             [TextDelta(text="full"), Final(text="full done", status=DONE)],
@@ -2781,7 +3370,7 @@ def test_pod_termination_cause_reaches_terminal_notice(
 ) -> None:
     async def go() -> None:
         async with make_harness(max_attempts=1) as h:
-            h.fake_k8s.termination = SimpleNamespace(reason=reason, detail=detail)
+            h.fake_k8s.termination = SandboxTermination(reason, detail)
             h.runner.default_script = [TextDelta(text="partial")]
             h.runner.abort_after_frames = True
             event = qevent("go")
@@ -2828,9 +3417,7 @@ def test_pod_termination_cause_reaches_factory_finish_detail(make_harness) -> No
         ) as h:
             items = _WorkItems()
             h.kernel._work_items = items
-            h.fake_k8s.termination = SimpleNamespace(
-                reason="Evicted", detail="The node was low on memory."
-            )
+            h.fake_k8s.termination = SandboxTermination("Evicted", "The node was low on memory.")
             h.runner.default_script = [TextDelta(text="partial")]
             h.runner.abort_after_frames = True
             event = _turn(f"work-item-{uuid.uuid4()}-execute-1", ISSUE_PROMPT)
@@ -2851,6 +3438,251 @@ def test_pod_termination_cause_reaches_factory_finish_detail(make_harness) -> No
     asyncio.run(go())
 
 
+class _DropAfterSideEffectPersisted:
+    """A runner ``hold`` that drops the stream once the worker persisted the flag.
+
+    ``abort_after_frames`` can close the socket before the client reads the
+    buffered flag frame, and aiohttp then raises before yielding it. Raising
+    from the handler after the headers were sent aborts the chunked stream.
+    """
+
+    def __init__(self, redis: Any, key: str) -> None:
+        self._redis = redis
+        self._key = key
+
+    async def wait(self) -> None:
+        for _ in range(500):
+            if await self._redis.exists(self._key):
+                break
+            await asyncio.sleep(0.01)
+        raise ConnectionResetError("runner pod deleted")
+
+
+def test_deleted_pod_after_side_effect_escalates_as_sandbox_terminated(make_harness) -> None:
+    async def go() -> None:
+        async with make_harness(
+            binding=_Binding(),
+            workspace_factory=_Workspace,
+            publication_creator=_PublicationApi(),
+            max_attempts=2,
+        ) as h:
+            items = _WorkItems()
+            h.kernel._work_items = items
+            h.fake_k8s.termination = SandboxTermination("Deleted")
+            event = _turn(f"work-item-{uuid.uuid4()}-execute-1", ISSUE_PROMPT)
+            h.runner.default_script = [SideEffectFlag(tool="deploy"), TextDelta(text="partial")]
+            h.runner.hold = _DropAfterSideEffectPersisted(
+                h.async_redis, h.config.side_effect_key(event.event_id)
+            )
+
+            await h.kernel.process_event(event)
+
+            assert await h.async_redis.exists(h.config.side_effect_key(event.event_id))
+
+            # ADR 0013: no automatic retry after a side effect, even though
+            # sandbox-terminated is otherwise retryable.
+            assert h.runner.opened == [ISSUE_PROMPT]
+            assert len(items.finishes) == 1
+            finish = items.finishes[0]
+            assert finish["outcome"] == "failed"
+            assert finish["cause"] == "sandbox_terminated"
+            assert isinstance(finish["detail"], str)
+            assert "Kubernetes pod terminated: Deleted" in finish["detail"]
+            assert h.fake_k8s.termination_queries
+
+    asyncio.run(go())
+
+
+def test_deleted_pod_without_side_effect_retries(make_harness) -> None:
+    async def go() -> None:
+        async with make_harness(
+            binding=_Binding(),
+            workspace_factory=_Workspace,
+            publication_creator=_PublicationApi(),
+            max_attempts=2,
+        ) as h:
+            items = _WorkItems()
+            h.kernel._work_items = items
+            h.fake_k8s.termination = SandboxTermination("Deleted")
+            h.runner.default_script = [TextDelta(text="partial")]
+            h.runner.abort_after_frames = True
+            event = _turn(f"work-item-{uuid.uuid4()}-execute-1", ISSUE_PROMPT)
+
+            await h.kernel.process_event(event)
+
+            assert h.runner.opened == [ISSUE_PROMPT, ISSUE_PROMPT]
+            assert len(h.fake_k8s.termination_queries) == 2
+
+    asyncio.run(go())
+
+
+def _factory_drop(h, event_id: str):
+    items = _WorkItems()
+    h.kernel._work_items = items
+    event = _turn(event_id, ISSUE_PROMPT)
+    h.runner.default_script = [SideEffectFlag(tool="deploy"), TextDelta(text="partial")]
+    h.runner.hold = _DropAfterSideEffectPersisted(
+        h.async_redis, h.config.side_effect_key(event.event_id)
+    )
+    return items, event
+
+
+def test_late_oomkilled_after_side_effect_finishes_sandbox_terminated(make_harness) -> None:
+    async def go() -> None:
+        async with make_harness(
+            binding=_Binding(),
+            workspace_factory=_Workspace,
+            publication_creator=_PublicationApi(),
+            max_attempts=1,
+            pod_termination_wait_s=10.0,
+        ) as h:
+            items, event = _factory_drop(h, f"work-item-{uuid.uuid4()}-execute-8")
+            first: dict[str, float | None] = {"at": None}
+            returned: list[object] = []
+
+            def diagnose(name: str, *, request_timeout_seconds: float, since: datetime):
+                assert request_timeout_seconds > 0
+                assert since.tzinfo is not None
+                h.fake_k8s.termination_queries.append(name)
+                now = time.monotonic()
+                if first["at"] is None:
+                    first["at"] = now
+                if now - first["at"] >= 1.2:
+                    found = SandboxTermination("OOMKilled", "exit code 137")
+                else:
+                    found = None
+                returned.append(found)
+                return found
+
+            h.fake_k8s.pod_termination = diagnose
+            await h.kernel.process_event(event)
+
+            assert h.runner.opened == [ISSUE_PROMPT]
+            assert len(items.finishes) == 1
+            finish = items.finishes[0]
+            assert finish["outcome"] == "failed"
+            assert finish["cause"] == "sandbox_terminated"
+            detail = finish["detail"]
+            assert isinstance(detail, str)
+            assert "Kubernetes pod terminated: OOMKilled (exit code 137)." in detail
+            assert "The runner container hit its memory limit." in detail
+            assert returned[-1] is not None
+            assert all(item is None for item in returned[:-1])
+
+    asyncio.run(go())
+
+
+def test_stream_drop_without_termination_ends_runner_error_at_the_10_s_bound(
+    make_harness, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    async def go() -> None:
+        class _Clock:
+            def __init__(self) -> None:
+                self.now = 0.0
+                self.sleeps: list[float] = []
+
+            def read(self) -> float:
+                return self.now
+
+            async def sleep(self, delay: float) -> None:
+                self.sleeps.append(delay)
+                self.now += delay
+
+        clock = _Clock()
+        monkeypatch.setattr(kernel_attempt, "_pod_termination_clock", clock.read)
+        monkeypatch.setattr(kernel_attempt, "_pod_termination_sleep", clock.sleep)
+        async with make_harness(
+            binding=_Binding(),
+            workspace_factory=_Workspace,
+            publication_creator=_PublicationApi(),
+            max_attempts=1,
+            pod_termination_wait_s=10.0,
+        ) as h:
+            items, event = _factory_drop(h, f"work-item-{uuid.uuid4()}-execute-8")
+            read_at: list[float] = []
+
+            def diagnose(name: str, *, request_timeout_seconds: float, since: datetime):
+                assert request_timeout_seconds > 0
+                h.fake_k8s.termination_queries.append(name)
+                read_at.append(clock.now)
+                return None
+
+            h.fake_k8s.pod_termination = diagnose
+            wall = time.monotonic()
+            await h.kernel.process_event(event)
+            assert time.monotonic() - wall < 2.0
+
+            assert "runner-error" in caplog.text
+            assert len(items.finishes) == 1
+            assert items.finishes[0]["cause"] == "runner_escalated"
+            assert read_at == [i * 0.5 for i in range(20)]
+            assert clock.sleeps
+            assert all(delay == 0.5 for delay in clock.sleeps)
+            assert all(moment < 10.0 for moment in read_at)
+
+    asyncio.run(go())
+
+
+@pytest.mark.parametrize("scenario", ["late", "none"])
+def test_sandbox_release_waits_for_termination_classification(
+    make_harness, monkeypatch: pytest.MonkeyPatch, scenario: str
+) -> None:
+    async def go() -> None:
+        class _Clock:
+            def __init__(self) -> None:
+                self.now = 0.0
+
+            def read(self) -> float:
+                return self.now
+
+            async def sleep(self, delay: float) -> None:
+                self.now += delay
+
+        if scenario == "none":
+            clock = _Clock()
+            monkeypatch.setattr(kernel_attempt, "_pod_termination_clock", clock.read)
+            monkeypatch.setattr(kernel_attempt, "_pod_termination_sleep", clock.sleep)
+        async with make_harness(
+            binding=_Binding(),
+            workspace_factory=_Workspace,
+            publication_creator=_PublicationApi(),
+            max_attempts=1,
+            pod_termination_wait_s=10.0,
+        ) as h:
+            _items, event = _factory_drop(h, f"work-item-{uuid.uuid4()}-execute-8")
+            order: list[str] = []
+            first: dict[str, float | None] = {"at": None}
+            original_delete = h.fake_k8s.delete_claim
+
+            def diagnose(name: str, *, request_timeout_seconds: float, since: datetime):
+                order.append("pod_termination")
+                h.fake_k8s.termination_queries.append(name)
+                if scenario == "none":
+                    return None
+                now = time.monotonic()
+                if first["at"] is None:
+                    first["at"] = now
+                if now - first["at"] >= 1.2:
+                    return SandboxTermination("OOMKilled", "exit code 137")
+                return None
+
+            def delete_claim(name: str, *, request_timeout_seconds: float) -> None:
+                order.append("delete_claim")
+                original_delete(name, request_timeout_seconds=request_timeout_seconds)
+
+            h.fake_k8s.pod_termination = diagnose
+            h.fake_k8s.delete_claim = delete_claim
+            await h.kernel.process_event(event)
+
+            deletes = [i for i, name in enumerate(order) if name == "delete_claim"]
+            reads = [i for i, name in enumerate(order) if name == "pod_termination"]
+            assert deletes
+            assert reads
+            assert max(reads) < deletes[0]
+
+    asyncio.run(go())
+
+
 def test_first_eviction_survives_generic_failure_on_retry_in_terminal_and_factory(
     make_harness, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
@@ -2865,7 +3697,7 @@ def test_first_eviction_survives_generic_failure_on_retry_in_terminal_and_factor
             h.kernel._work_items = items
             diagnoses = iter(
                 [
-                    SimpleNamespace(
+                    SandboxTermination(
                         reason="Evicted",
                         detail=(
                             'Usage of EmptyDir volume "workspace" exceeds the limit "1Gi". '
@@ -2878,7 +3710,7 @@ def test_first_eviction_survives_generic_failure_on_retry_in_terminal_and_factor
 
             def diagnose(
                 name: str, *, request_timeout_seconds: float, since: datetime
-            ) -> SimpleNamespace | None:
+            ) -> SandboxTermination | None:
                 h.fake_k8s.termination_queries.append(name)
                 return next(diagnoses)
 
@@ -2905,6 +3737,99 @@ def test_first_eviction_survives_generic_failure_on_retry_in_terminal_and_factor
             assert 'EmptyDir volume "workspace" exceeds the limit "1Gi"' in finish["detail"]
             assert "exampleSecretValue123456" not in finish["detail"]
             assert len(finish["detail"]) <= 300
+
+    asyncio.run(go())
+
+
+def test_publication_unrecorded_escalation_has_its_own_cause(make_harness) -> None:
+    """#4459: publication diagnosis survives both flag-clean and side-effect escalation."""
+
+    async def go() -> None:
+        for with_side_effect in (False, True):
+            async with make_harness(
+                binding=_Binding(),
+                workspace_factory=_Workspace,
+                publication_creator=_PublicationApi(),
+                max_attempts=3,
+            ) as h:
+                items = _WorkItems()
+                h.kernel._work_items = items
+                detail = "No valid publication was recorded after the publish attempt."
+                prefix = [SideEffectFlag(tool="deploy")] if with_side_effect else []
+                h.runner.default_script = [
+                    *prefix,
+                    ErrorEvent(message=detail, classification="publication-unrecorded"),
+                    Final(text="failed", status=FAIL),
+                ]
+                event = _turn(f"work-item-{uuid.uuid4()}-execute-1", ISSUE_PROMPT)
+
+                await h.kernel.process_event(event)
+
+                assert h.runner.opened == [ISSUE_PROMPT]
+                assert len(items.finishes) == 1
+                finish = items.finishes[0]
+                assert finish["outcome"] == "failed"
+                assert finish["cause"] == "publication_unrecorded"
+                assert finish["detail"] == detail
+                assert await h.kernel._markers.is_terminal(event.event_id)
+                assert (
+                    bool(await h.async_redis.exists(h.config.side_effect_key(event.event_id)))
+                    == with_side_effect
+                )
+
+    asyncio.run(go())
+
+
+@pytest.mark.parametrize(
+    ("classification", "expected_cause", "max_attempts"),
+    [
+        ("false-completion", "runner_escalated", 3),
+        ("approval-not-acted", "runner_escalated", 3),
+        ("runner-error", "runner_escalated", 1),
+        ("model-credit-exhausted", "model_credit_exhausted", 3),
+        ("model-usage-limited", "model_usage_limited", 3),
+        ("model-credential-rejected", "model_credential_rejected", 3),
+        ("rate-limit", "model_rate_limited", 1),
+        ("server-error", "model_error", 3),
+        ("model-unreachable", "model_unreachable", 1),
+        ("budget-exceeded", "budget_exceeded", 3),
+        ("runner-timeout", "runner_timeout", 1),
+        ("workspace-error", "workspace_error", 1),
+        ("history-persistence-error", "history_capacity", 3),
+        ("max-turns", "max_turns", 3),
+        ("unknown", "unclassified", 3),
+    ],
+)
+def test_other_escalation_classifications_keep_their_factory_causes(
+    make_harness, classification: str, expected_cause: str, max_attempts: int
+) -> None:
+    """#4459: naming publication failures preserves every sibling cause in this matrix."""
+
+    async def go() -> None:
+        async with make_harness(
+            binding=_Binding(),
+            workspace_factory=_Workspace,
+            publication_creator=_PublicationApi(),
+            max_attempts=max_attempts,
+        ) as h:
+            items = _WorkItems()
+            h.kernel._work_items = items
+            detail = "No valid publication was recorded after the publish attempt."
+            h.runner.default_script = [
+                ErrorEvent(message=detail, classification=classification),
+                Final(text="failed", status=FAIL),
+            ]
+            event = _turn(f"work-item-{uuid.uuid4()}-execute-1", ISSUE_PROMPT)
+
+            await h.kernel.process_event(event)
+
+            assert h.runner.opened == [ISSUE_PROMPT]
+            assert len(items.finishes) == 1
+            finish = items.finishes[0]
+            assert finish["outcome"] == "failed"
+            assert finish["cause"] == expected_cause
+            assert finish["detail"] == detail
+            assert await h.kernel._markers.is_terminal(event.event_id)
 
     asyncio.run(go())
 
@@ -3026,6 +3951,69 @@ def test_side_effect_failure_escalates_without_retry(make_harness) -> None:
     asyncio.run(go())
 
 
+def test_server_error_model_unreachable_split_server_error_not_retried(make_harness) -> None:
+    """#4333: only model-unreachable joined the retryable set, not server-error."""
+
+    async def go() -> None:
+        async with make_harness() as h:
+            h.runner.turn_scripts = [
+                [
+                    ErrorEvent(
+                        message="model error: server_error: API Error: 500 Internal server error",
+                        classification="server-error",
+                    ),
+                    Final(text="failed", status=FAIL),
+                ],
+                [Final(text="recovered", status=DONE)],
+            ]
+            await h.kernel.process_event(qevent("go", event_id="evt-server-error-4333"))
+
+            assert h.runner.opened == ["go"]  # exactly one attempt, no retry
+            reply = h.sink.last_text
+            assert reply is not None
+            assert "(server-error) after 1 attempt(s)" in reply
+            assert "recovered" not in reply
+
+    asyncio.run(go())
+
+
+def test_model_unreachable_after_side_effect_escalates_without_retry(make_harness) -> None:
+    """ADR 0013: a retryable model-unreachable must not retry after a side effect."""
+
+    async def go() -> None:
+        async with make_harness() as h:
+            h.runner.turn_scripts = [
+                [
+                    SideEffectFlag(tool="deploy"),
+                    ErrorEvent(
+                        message="model error: server_error: API Error: Connection refused "
+                        "(ECONNREFUSED)",
+                        classification="model-unreachable",
+                    ),
+                    Final(text="failed", status=FAIL),
+                ],
+                [Final(text="recovered", status=DONE)],
+            ]
+            ev = qevent("do it", event_id="evt-unreachable-side-effect")
+            await h.kernel.process_event(ev)
+
+            assert h.runner.opened == ["do it"]  # exactly one attempt, no retry
+            reply = h.sink.last_text
+            assert reply is not None
+            assert reply.startswith("curie-turn-failure: model-unreachable\n")
+            assert (
+                "The run hit an error (model-unreachable) after starting an action; "
+                "not retrying automatically."
+            ) in reply
+            assert "ECONNREFUSED" in reply
+            assert "human" in reply.lower()
+            assert "recovered" not in reply
+            assert await h.async_redis.exists(h.config.side_effect_key(ev.event_id))
+            assert await h.async_redis.exists(h.config.done_key(ev.event_id))
+
+    asyncio.run(go())
+
+
 def test_side_effect_unknown_classification_escalates_with_detail_and_event_id(
     make_harness,
 ) -> None:
@@ -3112,11 +4100,11 @@ def test_turn_start_failure_is_retryable_not_a_stall(make_harness) -> None:
 def test_max_turns_classification_is_platform_vocabulary_and_not_retryable() -> None:
     """#3071: an exhausted turn budget is a named platform failure, and retrying
     it would only burn the same budget again."""
-    from curie_worker.kernel import (
+    from curie_worker.kernel.constants import (
         PLATFORM_ERROR_CLASSIFICATIONS,
         RETRYABLE_CLASSIFICATIONS,
-        map_error_classification,
     )
+    from curie_worker.kernel.failures import map_error_classification
 
     assert "max-turns" in PLATFORM_ERROR_CLASSIFICATIONS
     assert "max-turns" not in RETRYABLE_CLASSIFICATIONS
@@ -3146,7 +4134,7 @@ def test_max_turns_escalates_once_naming_the_turn_budget_knob(make_harness) -> N
             assert "CURIE_MAX_TURNS" in text, text
             assert "CURIE_WORK_ITEM_MAX_TURNS" not in text, text
             assert text.startswith("curie-turn-failure: max-turns\n")
-            assert kernel_module.failure_class_from_reply(text) == "max-turns"
+            assert kernel_failures.failure_class_from_reply(text) == "max-turns"
 
     asyncio.run(go())
 
@@ -3168,7 +4156,7 @@ def test_failed_turn_reply_replaces_success_looking_model_text(make_harness) -> 
 
             reply = h.sink.last_text
             assert reply is not None
-            assert kernel_module.failure_class_from_reply(reply) == "max-turns"
+            assert kernel_failures.failure_class_from_reply(reply) == "max-turns"
             assert model_text not in reply
             assert h.sink.completions[-1].outcome == "escalated"
 
@@ -3186,15 +4174,15 @@ def test_successful_reply_is_not_a_failure_marker(make_harness) -> None:
 
             reply = h.sink.last_text
             assert reply == "the answer is PONG"
-            assert kernel_module.failure_class_from_reply(reply or "") is None
+            assert kernel_failures.failure_class_from_reply(reply or "") is None
             assert (
-                kernel_module.failure_class_from_reply(
+                kernel_failures.failure_class_from_reply(
                     "the answer is PONG\n\ncurie-turn-failure: max-turns"
                 )
                 is None
             )
             assert (
-                kernel_module.failure_class_from_reply(
+                kernel_failures.failure_class_from_reply(
                     "curie-turn-failure: max-turns and more words"
                 )
                 is None
@@ -3448,6 +4436,19 @@ def test_quota_capacity_reclaims_oldest_idle_route_and_preserves_history(
     from curie_worker.sandbox.k8s import _claim_view
 
     class HistoryBinding:
+
+        async def identity_binding(
+            self, kind: str, adapter: str | None, address: str,
+        ) -> HttpIdentityBinding | None:
+            """@spec HTTP-INVOCATION-EXECUTION-18: explicit local fixture classification."""
+            agent_id = uuid.UUID("22222222-2222-4222-8222-222222222222")
+            return HttpIdentityBinding(
+                tenant_id=uuid.UUID("00000000-0000-4000-8000-000000000001"),
+                agent_id=agent_id,
+                binding_id=uuid.uuid5(uuid.NAMESPACE_URL, repr((kind, adapter, address))),
+                binding_generation=1, http_identity_required=False,
+            )
+
         async def resolve(self, _kind: str, _adapter: str | None, _channel: str) -> _FakeResolved:
             return _FakeResolved(uuid.UUID("22222222-2222-4222-8222-222222222222"))
 
@@ -3458,6 +4459,7 @@ def test_quota_capacity_reclaims_oldest_idle_route_and_preserves_history(
             *,
             kind: str | None = None,
             address: str | None = None,
+            **_: object,
         ) -> dict[str, str]:
             return {
                 "CURIE_HISTORY_REF": f"https://api.example.com/state/transcript/{thread_key}",
@@ -3531,7 +4533,7 @@ def test_quota_capacity_reclaims_oldest_idle_route_and_preserves_history(
             event_id = "idle-route-capacity-trigger"
             lease = await _leased_entry(h, store, event_id=event_id, generation=1)
             h.runner.default_script = [Final(text="started after reclaim", status=DONE)]
-            real_record_metric = kernel_module.record_metric
+            real_record_metric = kernel_log.record_metric
 
             def record(
                 name: str,
@@ -3550,7 +4552,7 @@ def test_quota_capacity_reclaims_oldest_idle_route_and_preserves_history(
                     assert h.substrate.lookup(_thread_key(oldest_thread)) is None
                     outcomes.append(attributes["outcome"])
 
-            monkeypatch.setattr(kernel_module, "record_metric", record)
+            monkeypatch.setattr(kernel_log, "record_metric", record)
 
             await h.kernel.process_event(
                 qevent("start a new turn", thread=trigger_thread, event_id=event_id),
@@ -3666,12 +4668,10 @@ def test_quota_pressure_reclaims_an_idle_eval_route_before_an_older_person_route
 def test_is_eval_thread_key_reads_the_isolate_prefix_from_the_scoped_key() -> None:
     from channel_protocol import scoped_conversation_id
 
-    is_eval = kernel_module._is_eval_thread_key  # noqa: SLF001
+    is_eval = kernel_routing._is_eval_thread_key  # noqa: SLF001
 
     assert is_eval(scoped_conversation_id("slack", "C1", "eval:1720000000.000100"))
-    assert is_eval(
-        scoped_conversation_id("slack", "C1", "eval:1720000000.000100", identity="ops")
-    )
+    assert is_eval(scoped_conversation_id("slack", "C1", "eval:1720000000.000100", identity="ops"))
     assert not is_eval(scoped_conversation_id("slack", "C1", "1720000000.000100"))
     assert not is_eval(scoped_conversation_id("slack", "C1", "eval-1720000000.000100"))
     assert not is_eval(scoped_conversation_id("slack", "eval:C1", "1720000000.000100"))
@@ -4162,6 +5162,91 @@ def test_unreadable_oldest_runner_does_not_block_later_safe_reclamation(
     asyncio.run(go())
 
 
+@pytest.mark.parametrize("stale_routes", [False, True])
+def test_quota_pressure_repeated_passes_reach_completed_route_after_four_unreadable_routes(
+    make_harness,
+    stale_routes: bool,
+) -> None:
+    async def go() -> None:
+        async with make_harness(
+            binding=_HistoryBinding(),
+            claim_timeout_seconds=0.05,
+            per_sandbox_runners=8,
+            **_PRESSURE_LEASE_KNOBS,
+        ) as h:
+            unreadable = [
+                await _safe_pressure_candidate(h, f"tUnreadablePressure{number}")
+                for number in range(4)
+            ]
+            active = await _safe_pressure_candidate(h, "tActivePressure")
+            nondurable = await _safe_pressure_candidate(h, "tNondurablePressure")
+            completed = await _safe_pressure_candidate(h, "tCompletedPressure")
+            protected = [*unreadable, active, nondurable]
+
+            # Explicit expiry order keeps all four unreadable routes ahead of
+            # the completed candidate, regardless of Valkey SCAN order.
+            for number, candidate in enumerate([*protected, completed]):
+                assert h.substrate._affinity.touch(  # noqa: SLF001
+                    candidate.thread_key, 30 + number
+                )
+            for candidate in unreadable:
+                h.runners[candidate.port].status_fails = True
+            h.runners[active.port].turn_active = True
+            h.runners[nondurable.port].history_durable = False
+            h.runners[completed.port].session_status = SessionStatus.DONE.value
+
+            if stale_routes:
+                # A prior phase owns only substrate resources. Its affinity
+                # records intentionally survive to reproduce stale routes.
+                for candidate in unreadable:
+                    h.fake_k8s.delete_claim(candidate.claim_name, request_timeout_seconds=1.0)
+                    assert candidate.sandbox_name not in h.fake_k8s.sandboxes
+                    record = h.substrate._affinity.get(candidate.thread_key)  # noqa: SLF001
+                    assert record is not None
+                    assert record.handle == candidate
+            deleted_before_pressure = set(h.fake_k8s.deleted_claims)
+            h.fake_k8s.quota_headroom_results = [True]
+
+            results = []
+            for _ in range(3):
+                probes_before = sum(len(runner.status_headers) for runner in h.runners.values())
+                result = await h.kernel._reclaim_idle_route(  # noqa: SLF001
+                    _thread_key("tPressureTrigger"),
+                    _quota_rejection(),
+                    remaining_s=120.0,
+                )
+                results.append(result)
+                probes_after = sum(len(runner.status_headers) for runner in h.runners.values())
+                # Fairness must not expand the existing per-pass probe cap.
+                assert probes_after - probes_before <= 4
+                for candidate in protected:
+                    record = h.substrate._affinity.get(candidate.thread_key)  # noqa: SLF001
+                    assert record is not None
+                    assert record.handle == candidate
+                assert not (set(h.fake_k8s.deleted_claims) - deleted_before_pressure).intersection(
+                    candidate.claim_name for candidate in protected
+                )
+                if result.reclaimed:
+                    break
+
+            assert results[-1].reclaimed, "old unreadable routes starved a safe completed route"
+            assert results[-1].outcome == "reclaimed"
+            assert len(results) > 1
+            assert h.substrate.lookup(completed.thread_key) is None
+            assert completed.claim_name in h.fake_k8s.deleted_claims
+
+            await h.kernel.process_event(
+                qevent("resume the reclaimed completed thread", thread="tCompletedPressure")
+            )
+            resumed = h.substrate.lookup(completed.thread_key)
+            assert resumed is not None
+            assert resumed.claim_name != completed.claim_name
+            assert resumed.history_ref == completed.history_ref
+            assert h.runners[resumed.port].opened == ["resume the reclaimed completed thread"]
+
+    asyncio.run(go())
+
+
 @pytest.mark.parametrize("race", ["touch", "replace", "lease-loss"])
 def test_quota_pressure_loses_races_without_deleting_the_candidate(
     make_harness,
@@ -4486,7 +5571,7 @@ def test_route_created_between_attachment_retry_locks_keeps_changed_route_outcom
             assert lane.discard_calls == 2
             assert h.substrate.lookup(trigger_key) is not None
             assert h.runner.opened == []
-            assert h.sink.last_text == kernel_module._CHANGED_ATTACHMENT_REPLY
+            assert h.sink.last_text == kernel_constants._CHANGED_ATTACHMENT_REPLY
 
     asyncio.run(go())
 
@@ -4550,7 +5635,7 @@ def test_pressure_can_reclaim_victim_between_its_attachment_locks(
             assert lane.resolve_calls == 1
             assert lane.discard_calls == 1
             assert any(
-                update[2] == kernel_module._CHANGED_ATTACHMENT_REPLY for update in h.sink.updates
+                update[2] == kernel_constants._CHANGED_ATTACHMENT_REPLY for update in h.sink.updates
             )
 
     asyncio.run(go())
@@ -4593,22 +5678,22 @@ def test_quota_without_delivery_budget_refuses_before_pressure_inventory(
 
 def test_pressure_ceiling_is_derived_from_named_transport_slices() -> None:
     cold_redis_operation = (
-        kernel_module._PRESSURE_REDIS_CONNECT_S + 3 * kernel_module._PRESSURE_REDIS_READ_S
+        kernel_constants._PRESSURE_REDIS_CONNECT_S + 3 * kernel_constants._PRESSURE_REDIS_READ_S
     )
-    inventory = kernel_module._PRESSURE_SCAN_DEADLINE_S
+    inventory = kernel_constants._PRESSURE_SCAN_DEADLINE_S
     candidate = (
         2 * cold_redis_operation
-        + kernel_module._PRESSURE_RUNNER_STATUS_S
-        + 3 * kernel_module._PRESSURE_REDIS_READ_S
+        + kernel_constants._PRESSURE_RUNNER_STATUS_S
+        + 3 * kernel_constants._PRESSURE_REDIS_READ_S
     )
-    cleanup = kernel_module._PRESSURE_DELETE_S + kernel_module._PRESSURE_GONE_WAIT_S
+    cleanup = kernel_constants._PRESSURE_DELETE_S + kernel_constants._PRESSURE_GONE_WAIT_S
 
-    assert kernel_module._PRESSURE_REDIS_COLD_OPERATION_S == cold_redis_operation
-    assert kernel_module._PRESSURE_INVENTORY_CEILING_S == inventory
-    assert kernel_module._PRESSURE_CANDIDATE_CEILING_S == candidate
-    assert kernel_module._PRESSURE_CLEANUP_CEILING_S == cleanup
-    assert kernel_module._PRESSURE_CEILING_S == (
-        inventory + kernel_module._PRESSURE_CANDIDATES * candidate + cleanup
+    assert kernel_constants._PRESSURE_REDIS_COLD_OPERATION_S == cold_redis_operation
+    assert kernel_constants._PRESSURE_INVENTORY_CEILING_S == inventory
+    assert kernel_constants._PRESSURE_CANDIDATE_CEILING_S == candidate
+    assert kernel_constants._PRESSURE_CLEANUP_CEILING_S == cleanup
+    assert kernel_constants._PRESSURE_CEILING_S == (
+        inventory + kernel_constants._PRESSURE_CANDIDATES * candidate + cleanup
     )
 
 
@@ -4618,7 +5703,7 @@ def test_pressure_entry_refuses_when_current_budget_is_below_derived_floor(
 ) -> None:
     async def go() -> None:
         claim_timeout = 0.05
-        budget = kernel_module._PRESSURE_CEILING_S + claim_timeout - 0.01
+        budget = kernel_constants._PRESSURE_CEILING_S + claim_timeout - 0.01
         async with make_harness(
             binding=_HistoryBinding(),
             claim_timeout_seconds=claim_timeout,
@@ -4659,7 +5744,7 @@ def test_scan_cap_emits_one_incomplete_pressure_outcome(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     outcomes = _capture_pressure_outcomes(monkeypatch)
-    monkeypatch.setattr(kernel_module, "_PRESSURE_SCAN_RECORDS", 0)
+    monkeypatch.setattr(kernel_constants, "_PRESSURE_SCAN_RECORDS", 0)
 
     async def go() -> None:
         async with make_harness(
@@ -4691,7 +5776,7 @@ def test_expiry_unsupported_is_a_declared_finite_pressure_outcome(
 ) -> None:
     outcomes = _capture_pressure_outcomes(monkeypatch)
 
-    kernel_module.Kernel._record_pressure_outcome("expiry-unsupported")
+    kernel_core.Kernel._record_pressure_outcome("expiry-unsupported")
 
     assert outcomes == ["expiry-unsupported"]
 
@@ -4731,7 +5816,7 @@ def test_capacity_queued_notice_keeps_operator_accounting_out_of_the_reply(
             with caplog.at_level(logging.WARNING, logger="curie_worker.kernel"):
                 with pytest.raises(CapacityWaitRequested):
                     await h.kernel.process_event(event)
-            await h.kernel.notify_capacity_queued(event)
+            await h.kernel.notify_capacity_queued(event, wait_reply_ref=None)
 
             # Read off the rejection rather than retyping literals, so the two
             # halves of the boundary cannot drift apart.
@@ -4773,18 +5858,9 @@ def test_approval_resume_capacity_retries_then_escalates(
     make_harness,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """#3693, #3700: a resume that reclamation cannot help is not a runner failure.
+    """#5399: a refused approval parks after one safe-reclamation pass."""
 
-    The reclamation pass runs for the resume as for any turn, finds no idle
-    route to free, and the resume keeps its retries. Each of the three
-    attempts records the pass, and the failure is a ``sandbox-capacity``
-    escalation, not the fresh-turn capacity reply. The person is told the
-    agent was at capacity, with no quota detail (#2434). The same event id
-    resumes an approved, a rejected and an expired approval, so the sentence
-    names the decision, not an approval.
-    """
-
-    real_record_metric = kernel_module.record_metric
+    real_record_metric = kernel_log.record_metric
     recorded: list[tuple[str, dict[str, str]]] = []
 
     def spy(name: str, value: float = 1, *, attributes: dict[str, str] | None = None) -> None:
@@ -4792,7 +5868,7 @@ def test_approval_resume_capacity_retries_then_escalates(
         # Delegate so the metric allowlist still validates the new class.
         real_record_metric(name, value, attributes=attributes)
 
-    monkeypatch.setattr(kernel_module, "record_metric", spy)
+    monkeypatch.setattr(kernel_log, "record_metric", spy)
 
     async def go() -> None:
         async with make_harness(
@@ -4816,45 +5892,22 @@ def test_approval_resume_capacity_retries_then_escalates(
             )
             lease = await _pressure_lease(h, ev.event_id)
 
-            await h.kernel.process_event(ev, lease=lease)
+            with pytest.raises(CapacityWaitRequested):
+                await h.kernel.process_event(ev, lease=lease)
 
-            assert len(h.fake_k8s.claim_envs) == 3
-            assert h.runner.opened == []
-            assert h.sink.updates == [
-                (
-                    "C1",
-                    "p-1",
-                    "curie-turn-failure: sandbox-capacity\n\n"
-                    "The run failed (sandbox-capacity) after 3 attempt(s). "
-                    "The agent was at capacity, so it could not continue after the "
-                    "approval decision. Send the request again in a few minutes if it "
-                    "is still needed. "
-                    "event_id=approval-example-resolved. Flagging for a human.",
-                )
-            ]
-            reply = h.sink.updates[0][2]
-            for leaked in (
-                "curie-sandbox-quota",
-                "limits.cpu",
-                "quota",
-                "runner-error",
-                "approved request",
-            ):
-                assert leaked not in reply
+            assert len(h.fake_k8s.claim_envs) == 1
+            assert h.runner.opened == h.sink.updates == h.sink.completions == []
             retries = [attrs for name, attrs in recorded if name == "curie.queue.retry"]
-            assert [attrs["retry_class"] for attrs in retries] == [
-                "sandbox-capacity",
-                "sandbox-capacity",
-            ]
+            assert retries == []
             reclaims = [
                 attrs["outcome"]
                 for name, attrs in recorded
                 if name == "curie.sandbox.lifecycle" and attrs.get("operation") == "reclaim"
             ]
-            assert reclaims == ["refused-no-safe-route"] * 3
-            assert h.sink.update_endpoints == [endpoint]
+            assert reclaims == ["refused-no-safe-route"]
+            assert h.sink.update_endpoints == []
             assert h.kernel._order_locks == {}
-            assert await h.async_redis.exists(h.config.done_key(ev.event_id))
+            assert not await h.async_redis.exists(h.config.done_key(ev.event_id))
 
     asyncio.run(go())
 
@@ -4909,13 +5962,7 @@ def test_approval_resume_refused_again_after_reclaim_keeps_its_capacity_failure(
     make_harness,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """#3700: the retry after a reclamation is refused again.
-
-    The resume records ``reclaimed-retry-refused`` and fails as
-    ``sandbox-capacity``. It neither sends the fresh turn's capacity reply nor
-    asks to wait for capacity (#2711), which would drop the approved
-    continuation.
-    """
+    """#5399: reclaim refusal parks without losing the approved continuation."""
 
     async def go() -> None:
         outcomes = _capture_pressure_outcomes(monkeypatch)
@@ -4938,17 +5985,16 @@ def test_approval_resume_refused_again_after_reclaim_keeps_its_capacity_failure(
             )
             lease = await _pressure_lease(h, ev.event_id)
 
-            await h.kernel.process_event(ev, lease=lease)
+            with pytest.raises(CapacityWaitRequested):
+                await h.kernel.process_event(ev, lease=lease)
 
             assert victim.claim_name in h.fake_k8s.deleted_claims
             # "reclaimed" is recorded only when the retry succeeds.
             assert outcomes == ["reclaimed-retry-refused"]
             assert h.runner.opened == []
-            reply = h.sink.updates[-1][2]
-            assert reply.startswith("curie-turn-failure: sandbox-capacity\n\n")
-            assert "queued" not in reply.lower()
-            assert "limits.cpu" not in reply
-            assert await h.async_redis.exists(h.config.done_key(ev.event_id))
+            assert h.sink.updates == h.sink.completions == []
+            assert h.kernel._order_locks == {}
+            assert not await h.async_redis.exists(h.config.done_key(ev.event_id))
 
     asyncio.run(go())
 
@@ -4956,9 +6002,9 @@ def test_approval_resume_refused_again_after_reclaim_keeps_its_capacity_failure(
 def test_approval_resume_capacity_keeps_an_earlier_pod_termination(
     make_harness,
     monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
-    """#3693: a resume whose pod was evicted, then refused for capacity on the
-    retries, still tells the operator about the eviction, as runner-error did."""
+    """#5399: parking preserves the earlier eviction in the operator log."""
 
     async def go() -> None:
         async with make_harness(
@@ -4984,9 +6030,7 @@ def test_approval_resume_capacity_keeps_an_earlier_pod_termination(
                 h.fake_k8s.sandboxes.clear()
                 return found
 
-            h.fake_k8s.termination = SimpleNamespace(
-                reason="Evicted", detail="The node was low on memory."
-            )
+            h.fake_k8s.termination = SandboxTermination("Evicted", "The node was low on memory.")
             monkeypatch.setattr(h.fake_k8s, "pod_termination", evicted_then_full)
             h.runner.default_script = [TextDelta(text="partial")]
             h.runner.abort_after_frames = True
@@ -4996,13 +6040,15 @@ def test_approval_resume_capacity_keeps_an_earlier_pod_termination(
                 event_id="approval-evicted-resolved",
             )
 
-            await h.kernel.process_event(ev)
+            with caplog.at_level(logging.WARNING), pytest.raises(CapacityWaitRequested):
+                await h.kernel.process_event(ev)
 
             assert len(h.runner.opened) == 1
-            reply = h.sink.updates[-1][2]
-            assert reply.startswith("curie-turn-failure: sandbox-capacity\n\n")
-            assert "Earlier attempt: Kubernetes pod terminated: Evicted" in reply
-            assert "limits.cpu" not in reply
+            assert "Evicted" in caplog.text
+            assert "The node was low on memory." in caplog.text
+            assert h.sink.completions == []
+            assert not await h.async_redis.exists(h.config.done_key(ev.event_id))
+            assert h.kernel._order_locks == {}
 
     asyncio.run(go())
 
@@ -5083,7 +6129,7 @@ def test_interrupt_agent_signals_other_threads_past_a_wedged_runner(
                 await h.kernel.process_event(qevent("hi", thread=thread))
             h.kernel._active_by_agent[agent_id] = {_thread_key(t) for t in threads}
 
-            monkeypatch.setattr(kernel_module, "_KILL_INTERRUPT_TIMEOUT_S", 0.2)
+            monkeypatch.setattr(kernel_constants, "_KILL_INTERRUPT_TIMEOUT_S", 0.2)
 
             wedged = asyncio.Event()  # never set: the first thread's runner hangs forever
             attempted: list[str] = []
@@ -5274,6 +6320,19 @@ class _TokenBinding:
     header. The claim-time minting itself is covered by the binding unit tests;
     this proves the claim->handle->kernel->runner delivery path."""
 
+    async def identity_binding(
+        self, kind: str, adapter: str | None, address: str,
+    ) -> HttpIdentityBinding | None:
+        """@spec HTTP-INVOCATION-EXECUTION-18: explicit local fixture classification."""
+        agent_id = self._agent_id
+        return HttpIdentityBinding(
+            tenant_id=uuid.UUID("00000000-0000-4000-8000-000000000001"),
+            agent_id=agent_id,
+            binding_id=uuid.uuid5(uuid.NAMESPACE_URL, repr((kind, adapter, address))),
+            binding_generation=1, http_identity_required=False,
+        )
+
+
     def __init__(self, token: str, agent_id: uuid.UUID) -> None:
         self._token = token
         self._agent_id = agent_id
@@ -5288,6 +6347,7 @@ class _TokenBinding:
         *,
         kind: str | None = None,
         address: str | None = None,
+        **_: object,
     ) -> dict[str, str]:
         return {"CURIE_RUNNER_TOKEN": self._token}
 
@@ -5720,7 +6780,7 @@ def test_release_thread_releases_when_the_runner_never_answers_the_interrupt(
             await h.kernel.process_event(qevent("hi", thread="tWedged"))
             assert h.substrate.lookup(_thread_key("tWedged")) is not None  # the route is live
 
-            monkeypatch.setattr(kernel_module, "_RESET_INTERRUPT_TIMEOUT_S", 0.2)
+            monkeypatch.setattr(kernel_constants, "_RESET_INTERRUPT_TIMEOUT_S", 0.2)
 
             wedged = asyncio.Event()  # never set: the runner answers nothing, ever
 
@@ -5893,7 +6953,7 @@ def test_lock_acquire_timeout_is_a_retryable_turn_start_failure(make_harness) ->
                 TargetRoute(),
                 release_order,
                 pressure_retried=False,
-                workspace_inference=kernel_module._WorkspaceInferenceCarry(),
+                workspace_inference=kernel_workspace._WorkspaceInferenceCarry(),
             )
 
             assert outcome.terminal_ok is False
@@ -5963,6 +7023,261 @@ _PRESSURE_LEASE_KNOBS: dict[str, object] = {
 }
 
 
+class _MarkerRetryClock:
+    """Inject arithmetic and sleeps locally; keep actual Valkey writes real."""
+
+    def __init__(self) -> None:
+        # Half-second retry increments stay exact regardless of host uptime.
+        self.now = float(int(time.monotonic()))
+        self.owner_task = asyncio.current_task()
+        self.delays: list[float] = []
+        self.after_sleep: Callable[[], None] | None = None
+
+    def monotonic(self) -> float:
+        return self.now
+
+    async def sleep(self, delay: float) -> None:
+        if asyncio.current_task() is not self.owner_task:
+            await asyncio.sleep(delay)
+            return
+        self.delays.append(delay)
+        self.now += delay
+        if self.after_sleep is not None:
+            self.after_sleep()
+        # Yield real time so a separately scheduled liveness renewal can reach
+        # Valkey, without changing shared time or asyncio module functions.
+        await asyncio.sleep(0.01)
+
+    def install(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(
+            kernel_clock, "time", SimpleNamespace(**{**vars(time), "monotonic": self.monotonic})
+        )
+        monkeypatch.setattr(
+            kernel_attempt, "asyncio", SimpleNamespace(**{**vars(asyncio), "sleep": self.sleep})
+        )
+
+
+async def _marker_retry_lease(h: Any, event_id: str) -> Any:
+    from curie_worker.delivery_lease import DeliveryLeaseStore
+
+    await h.async_redis.xgroup_create(
+        h.config.stream, h.config.consumer_group, id="0", mkstream=True
+    )
+    return await _leased_entry(
+        h, DeliveryLeaseStore(h.async_redis, h.config), event_id=event_id, generation=1
+    )
+
+
+def test_side_effect_marker_retries_exact_backoff_and_holds_action_until_durable(
+    make_harness, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    async def go() -> None:
+        async with make_harness() as h:
+            event = qevent("marker retry", event_id=uuid.uuid4().hex)
+            lease = await _marker_retry_lease(h, event.event_id)
+            clock = _MarkerRetryClock()
+            lease.local_deadline_monotonic = clock.now + 35.0
+            clock.install(monkeypatch)
+            real_marker = h.kernel._markers.mark_side_effect
+            real_action = h.kernel._record_action
+            writes = 0
+            actions = 0
+
+            async def failed_writes(event_id: str) -> None:
+                nonlocal writes
+                writes += 1
+                assert actions == 0, "the side-effect frame was applied before its marker"
+                if writes <= 5:
+                    raise redis.exceptions.ConnectionError("injected marker transport error")
+                await real_marker(event_id)
+
+            async def observed_action(*args: Any, **kwargs: Any) -> None:
+                nonlocal actions
+                assert await h.kernel._markers.saw_side_effect(event.event_id)
+                actions += 1
+                await real_action(*args, **kwargs)
+
+            monkeypatch.setattr(h.kernel._markers, "mark_side_effect", failed_writes)
+            monkeypatch.setattr(h.kernel, "_record_action", observed_action)
+            token = kernel_constants._DELIVERY_LEASE.set(lease)
+            try:
+                acc = kernel_delivery._StreamAccumulator()
+                await h.kernel._apply_frame(
+                    SideEffectFlag(tool="deploy", call_id="marker-retry"),
+                    acc,
+                    SimpleNamespace(),
+                    event,
+                )
+            finally:
+                kernel_constants._DELIVERY_LEASE.reset(token)
+            assert clock.delays == [0.5, 1.0, 2.0, 4.0, 5.0]
+            assert writes == 6 and actions == 1
+            assert acc.saw_side_effect and acc.classification is None
+            assert not lease.lost.is_set()
+
+    asyncio.run(go())
+
+
+def test_marker_deadline_returns_ownership_store_unavailable_while_liveness_is_healthy(
+    make_harness, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A real runner turn reaches the existing consume timeout outcome path."""
+
+    from curie_worker.consumer import Consumer, refuse_unconfigured_reminder
+    from curie_worker.delivery_lease import DeliveryLeaseStore
+
+    async def go() -> None:
+        async with make_harness(consumer_heartbeat_ttl_ms=150) as h:
+            event = qevent("marker deadline", event_id=uuid.uuid4().hex)
+            lease = await _marker_retry_lease(h, event.event_id)
+            consumer = Consumer(
+                redis=h.async_redis,
+                kernel=h.kernel,
+                config=h.config,
+                leases=DeliveryLeaseStore(h.async_redis, h.config),
+                reminders=refuse_unconfigured_reminder,
+            )
+            await consumer._publish_liveness()
+            initial_liveness = consumer._last_liveness_renewal
+            liveness = asyncio.create_task(consumer._liveness_refresh_loop())
+            h.runner.default_script = [
+                SideEffectFlag(tool="deploy", call_id="held-marker"),
+                Final(text="must not apply", status=DONE),
+            ]
+            clock = _MarkerRetryClock()
+            started = clock.now
+            lease.local_deadline_monotonic = started + 35.0
+            clock.install(monkeypatch)
+            attempts: list[float] = []
+            actions: list[Any] = []
+
+            async def unavailable(_event_id: str) -> None:
+                attempts.append(clock.now - started)
+                raise redis.exceptions.ConnectionError("injected marker store outage")
+
+            async def forbidden_action(*args: Any, **_kwargs: Any) -> None:
+                actions.append(args)
+                raise AssertionError("an unmarked side-effect frame reached the action ledger")
+
+            monkeypatch.setattr(h.kernel._markers, "mark_side_effect", unavailable)
+            monkeypatch.setattr(h.kernel, "_record_action", forbidden_action)
+            token = kernel_constants._DELIVERY_LEASE.set(lease)
+            try:
+                outcome = await h.kernel._attempt(
+                    event,
+                    TargetRoute(),
+                    lambda: None,
+                    pressure_retried=False,
+                    workspace_inference=kernel_workspace._WorkspaceInferenceCarry(),
+                )
+                assert outcome.terminal_ok is False
+                assert outcome.classification == "ownership-store-unavailable"
+                assert outcome.saw_side_effect
+                assert "must not apply" not in outcome.text
+                assert kernel_failures._display_error_classification(outcome.classification) == (
+                    "ownership-store-unavailable"
+                )
+                assert clock.delays == [0.5, 1.0, 2.0, 4.0, 5.0, 5.0, 5.0, 5.0, 5.0, 2.5]
+                assert attempts == [0.0, 0.5, 1.5, 3.5, 7.5, 12.5, 17.5, 22.5, 27.5, 32.5]
+                assert clock.now - started == 35.0
+                assert not actions
+                assert not await h.kernel._markers.saw_side_effect(event.event_id)
+                assert not liveness.done(), "marker exhaustion terminated healthy liveness"
+                assert consumer._last_liveness_renewal > initial_liveness
+                assert await consumer._liveness_store.is_alive(
+                    stream=h.config.stream,
+                    group=h.config.consumer_group,
+                    consumer=h.config.consumer_name,
+                )
+                assert not lease.lost.is_set()
+            finally:
+                kernel_constants._DELIVERY_LEASE.reset(token)
+                liveness.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await liveness
+                await consumer._cleanup_alive()
+
+    asyncio.run(go())
+
+
+@pytest.mark.parametrize("loss_point", ["retry", "confirmed-write"])
+def test_side_effect_marker_cannot_apply_a_frame_after_authority_is_lost(
+    make_harness, monkeypatch: pytest.MonkeyPatch, loss_point: str
+) -> None:
+    from curie_worker.delivery_lease import LeaseLostError
+
+    async def go() -> None:
+        async with make_harness() as h:
+            event = qevent("lost marker", event_id=uuid.uuid4().hex)
+            lease = await _marker_retry_lease(h, event.event_id)
+            clock = _MarkerRetryClock()
+            lease.local_deadline_monotonic = clock.now + 35.0
+            clock.install(monkeypatch)
+            real_marker = h.kernel._markers.mark_side_effect
+            attempts = 0
+            actions: list[Any] = []
+
+            async def lose_during_write(event_id: str) -> None:
+                nonlocal attempts
+                attempts += 1
+                if loss_point == "retry":
+                    raise redis.exceptions.ConnectionError("injected marker outage before refusal")
+                await real_marker(event_id)
+                lease.lost.set()
+
+            async def forbidden_action(*args: Any, **_kwargs: Any) -> None:
+                actions.append(args)
+
+            if loss_point == "retry":
+                clock.after_sleep = lease.lost.set
+            monkeypatch.setattr(h.kernel._markers, "mark_side_effect", lose_during_write)
+            monkeypatch.setattr(h.kernel, "_record_action", forbidden_action)
+            token = kernel_constants._DELIVERY_LEASE.set(lease)
+            try:
+                with pytest.raises(LeaseLostError):
+                    await h.kernel._apply_frame(
+                        SideEffectFlag(tool="deploy"),
+                        kernel_delivery._StreamAccumulator(),
+                        SimpleNamespace(),
+                        event,
+                    )
+            finally:
+                kernel_constants._DELIVERY_LEASE.reset(token)
+            assert attempts == 1, "a lost owner attempted another marker write"
+            assert not actions
+            assert await h.kernel._markers.saw_side_effect(event.event_id) is (
+                loss_point == "confirmed-write"
+            )
+            assert clock.delays == ([0.5] if loss_point == "retry" else [])
+
+    asyncio.run(go())
+
+
+def test_unfenced_side_effect_marker_failure_propagates_without_retry(
+    make_harness, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    async def go() -> None:
+        async with make_harness() as h:
+            attempts = 0
+
+            async def unavailable(_event_id: str) -> None:
+                nonlocal attempts
+                attempts += 1
+                raise redis.exceptions.ConnectionError("injected unfenced marker outage")
+
+            monkeypatch.setattr(h.kernel._markers, "mark_side_effect", unavailable)
+            with pytest.raises(redis.exceptions.ConnectionError):
+                await h.kernel._apply_frame(
+                    SideEffectFlag(tool="deploy"),
+                    kernel_delivery._StreamAccumulator(),
+                    SimpleNamespace(),
+                    qevent("unfenced marker"),
+                )
+            assert attempts == 1
+
+    asyncio.run(go())
+
+
 async def _leased_entry(h: Any, store: Any, *, event_id: str, generation: int) -> Any:
     """A lease on a real PEL row, advanced to ``generation`` by re-acquisition.
 
@@ -5971,7 +7286,7 @@ async def _leased_entry(h: Any, store: Any, *, event_id: str, generation: int) -
     and only signal the reclaim preflight keys on (a distributed-state fact, not
     a sniff of the message text: kernel rule 3 stands).
     """
-    from curie_dispatcher.queue import to_stream_fields
+    from curie_internal.turn_queue import to_stream_fields
 
     await h.async_redis.xadd(
         h.config.stream, to_stream_fields(qevent("reclaimed", event_id=event_id))
@@ -6022,8 +7337,8 @@ def test_a_long_turn_keeps_accepting_steers_and_a_finished_one_opens_a_new_turn(
     ``h.runner.opened`` is the negative control on the steering half: a steer
     that silently became a second turn shows up there.
     """
-    from curie_dispatcher.queue import to_stream_fields
-    from curie_worker.consumer import Consumer
+    from curie_internal.turn_queue import to_stream_fields
+    from curie_worker.consumer import Consumer, refuse_unconfigured_reminder
 
     # Imported inside the test on purpose: ``delivery_lease`` does not exist
     # until this ticket lands, and a module-level import would fail COLLECTION
@@ -6033,7 +7348,9 @@ def test_a_long_turn_keeps_accepting_steers_and_a_finished_one_opens_a_new_turn(
     async def go() -> None:
         async with make_harness(**_LEASE_KNOBS, reclaim_min_idle_ms=900000) as h:
             store = DeliveryLeaseStore(h.async_redis, h.config)
-            consumer = Consumer(redis=h.async_redis, kernel=h.kernel, config=h.config, leases=store)
+            consumer = Consumer(redis=h.async_redis, kernel=h.kernel, config=h.config, leases=store,
+                                reminders=refuse_unconfigured_reminder,
+                       )
             await consumer.ensure_group()
 
             hold = asyncio.Event()
@@ -6224,26 +7541,12 @@ def test_a_reclaimed_delivery_interrupts_a_still_active_retained_runner(
     asyncio.run(go())
 
 
-def test_an_unreadable_runner_fails_closed_and_leaves_a_reclaimed_delivery_pending(
+def test_an_unreadable_runner_keeps_a_reclaimed_delivery_pending_until_recovery(
     make_harness,
 ) -> None:
-    """Reclaim preflight rule 3: an unreadable runner FAILS CLOSED.
-
-    ``_turn_active`` already reports busy on an unreadable answer, so the bounded
-    poll can never clear and the preflight must raise -- leaving the stream entry
-    PENDING rather than running a replacement beside a turn whose liveness nobody
-    can read. Asserted at the consumer, because "left pending" is the observable
-    contract and does not depend on which exception type the preflight raises.
-
-    Red on making the preflight fail OPEN (proceeding when liveness is
-    unreadable), which is the failure mode a "just retry it" simplification
-    reaches for.
-
-    The negative control is the second delivery, with the status endpoint
-    healthy again: the same reclaimed entry then runs and acks.
-    """
-    from curie_dispatcher.queue import to_stream_fields
-    from curie_worker.consumer import Consumer
+    """An unreadable predecessor holds the same delivery until liveness recovers."""
+    from curie_internal.turn_queue import to_stream_fields
+    from curie_worker.consumer import Consumer, refuse_unconfigured_reminder
 
     # Imported inside the test on purpose: ``delivery_lease`` does not exist
     # until this ticket lands, and a module-level import would fail COLLECTION
@@ -6253,7 +7556,9 @@ def test_an_unreadable_runner_fails_closed_and_leaves_a_reclaimed_delivery_pendi
     async def go() -> None:
         async with make_harness(**_LEASE_KNOBS, reclaim_min_idle_ms=900000) as h:
             store = DeliveryLeaseStore(h.async_redis, h.config)
-            consumer = Consumer(redis=h.async_redis, kernel=h.kernel, config=h.config, leases=store)
+            consumer = Consumer(redis=h.async_redis, kernel=h.kernel, config=h.config, leases=store,
+                                reminders=refuse_unconfigured_reminder,
+                       )
             await consumer.ensure_group()
 
             # A first turn so the thread retains a sandbox to be read.
@@ -6286,25 +7591,32 @@ def test_an_unreadable_runner_fails_closed_and_leaves_a_reclaimed_delivery_pendi
 
             h.runner.status_fails = True
             await consumer._dispatch(entry_id, dict(fields))
-            await asyncio.gather(*list(consumer._inflight), return_exceptions=True)
+            inflight = list(consumer._inflight)
+            try:
+                await wait_until(lambda: h.runner.interrupts >= 2, timeout=15.0)
+                assert all(not task.done() for task in inflight)
 
-            assert h.runner.opened == ["first"], (
-                "a replacement ran beside a runner whose liveness could not be read"
-            )
-            summary = await h.async_redis.xpending(h.config.stream, h.config.consumer_group)
-            assert summary["pending"] == 1, "an unreadable runner did not leave the entry pending"
+                assert h.runner.opened == ["first"], (
+                    "a replacement ran beside a runner whose liveness could not be read"
+                )
+                summary = await h.async_redis.xpending(h.config.stream, h.config.consumer_group)
+                assert summary["pending"] == 1
+                assert await h.async_redis.xlen(h.config.dead_letter_stream_name()) == 0
 
-            # NEGATIVE CONTROL: the status endpoint recovers and the same
-            # reclaimed entry runs to an ACK.
-            h.runner.status_fails = False
-            h.runner.turn_active = False
-            h.runner.default_script = [Final(text="two", status=DONE)]
-            await consumer._dispatch(entry_id, dict(fields))
-            await asyncio.gather(*list(consumer._inflight), return_exceptions=True)
+                h.runner.status_fails = False
+                h.runner.turn_active = False
+                h.runner.default_script = [Final(text="two", status=DONE)]
+                async with asyncio.timeout(10):
+                    await asyncio.gather(*inflight)
 
-            assert h.runner.opened == ["first", "second"]
-            summary = await h.async_redis.xpending(h.config.stream, h.config.consumer_group)
-            assert summary["pending"] == 0
+                assert h.runner.opened == ["first", "second"]
+                summary = await h.async_redis.xpending(h.config.stream, h.config.consumer_group)
+                assert summary["pending"] == 0
+            finally:
+                consumer.request_stop()
+                for task in inflight:
+                    task.cancel()
+                await asyncio.gather(*inflight, return_exceptions=True)
 
     asyncio.run(go())
 
@@ -6347,7 +7659,7 @@ def test_stream_timeout_classifies_as_runner_timeout_with_a_named_reason(
                         TargetRoute(),
                         release_order,
                         pressure_retried=False,
-                        workspace_inference=kernel_module._WorkspaceInferenceCarry(),
+                        workspace_inference=kernel_workspace._WorkspaceInferenceCarry(),
                     )
             finally:
                 hold.set()  # let the fake runner's handler unwind
@@ -6491,7 +7803,7 @@ def test_error_event_classification_precedes_unconfirmed_stream_timeout(
                     TargetRoute(),
                     lambda: None,
                     pressure_retried=False,
-                    workspace_inference=kernel_module._WorkspaceInferenceCarry(),
+                    workspace_inference=kernel_workspace._WorkspaceInferenceCarry(),
                 )
             finally:
                 hold.set()
@@ -6503,25 +7815,21 @@ def test_error_event_classification_precedes_unconfirmed_stream_timeout(
 
 
 def test_history_persistence_error_has_dedicated_factory_cause() -> None:
-    failure = kernel_module.TurnOutcome(
+    failure = kernel_failures.TurnOutcome(
         terminal_ok=False,
         classification="history-persistence-error",
         error_message="conversation history capacity exceeded",
     )
 
-    assert kernel_module._escalation_cause(failure) == "history_capacity"
+    assert kernel_failures._escalation_cause(failure) == "history_capacity"
 
 
 def test_max_turns_and_unclassified_have_their_own_factory_causes() -> None:
-    max_turns = kernel_module.TurnOutcome(
-        terminal_ok=False, classification="max-turns"
-    )
-    unclassified = kernel_module.TurnOutcome(
-        terminal_ok=False, classification="unclassified"
-    )
+    max_turns = kernel_failures.TurnOutcome(terminal_ok=False, classification="max-turns")
+    unclassified = kernel_failures.TurnOutcome(terminal_ok=False, classification="unclassified")
 
-    assert kernel_module._escalation_cause(max_turns) == "max_turns"
-    assert kernel_module._escalation_cause(unclassified) == "unclassified"
+    assert kernel_failures._escalation_cause(max_turns) == "max_turns"
+    assert kernel_failures._escalation_cause(unclassified) == "unclassified"
 
 
 @pytest.mark.parametrize(
@@ -6651,7 +7959,7 @@ def test_stream_timeout_without_a_side_effect_still_retries(make_harness, monkey
     the retry folded into the dead turn as a STEER instead of opening a second
     one, which is what ``steers == []`` below guards."""
 
-    real_record_metric = kernel_module.record_metric
+    real_record_metric = kernel_log.record_metric
     recorded: list[tuple[str, dict[str, str]]] = []
 
     def spy(name: str, value: float = 1, *, attributes: dict[str, str] | None = None) -> None:
@@ -6659,7 +7967,7 @@ def test_stream_timeout_without_a_side_effect_still_retries(make_harness, monkey
         # Delegate to the real recorder so the metric allowlist still validates.
         real_record_metric(name, value, attributes=attributes)
 
-    monkeypatch.setattr(kernel_module, "record_metric", spy)
+    monkeypatch.setattr(kernel_log, "record_metric", spy)
 
     async def go() -> None:
         async with make_harness(
@@ -6739,7 +8047,7 @@ def test_reply_delivery_timeout_is_not_a_runner_timeout(make_harness, caplog, mo
                     TargetRoute(),
                     lambda: None,
                     pressure_retried=False,
-                    workspace_inference=kernel_module._WorkspaceInferenceCarry(),
+                    workspace_inference=kernel_workspace._WorkspaceInferenceCarry(),
                 )
 
             assert outcome.terminal_ok is False
@@ -6765,9 +8073,7 @@ def test_streaming_turn_route_survives_the_reaper_past_its_ttl(
     # disables the refresh and must see the claim reaped, proving the TTL
     # really expires inside this test.
     async def go() -> None:
-        async with make_harness() as h:
-            h.substrate._config = replace(h.substrate._config, route_ttl_seconds=1)
-            h.kernel._route_ttl_seconds = 1
+        async with make_harness(substrate_env={"CURIE_ROUTE_TTL_SECONDS": "1"}) as h:
             calls: list[tuple[str, str]] = []
             inner = h.substrate.touch_live
 

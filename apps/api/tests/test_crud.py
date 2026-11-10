@@ -76,7 +76,13 @@ def test_full_round_trip(
     got_agent = client.get(f"/agents/{agent_id}", headers=auth_headers)
     assert got_agent.status_code == 200
     assert got_agent.json()["channels"] == [
-        {"kind": "slack", "address": "C0EXAMPLE1", "adapter": "default", "allowed_callers": None}
+        {
+            "kind": "slack",
+            "address": "C0EXAMPLE1",
+            "adapter": "default",
+            "allowed_callers": None,
+            "trigger_label": None,
+        }
     ]
 
     listed_versions = client.get(
@@ -309,13 +315,25 @@ def test_update_channel_binding_moves_the_channel(
     )
     assert resp.status_code == 200, resp.text
     assert resp.json()["channels"] == [
-        {"kind": "slack", "address": "C0EXAMPLE2", "adapter": "default", "allowed_callers": None}
+        {
+            "kind": "slack",
+            "address": "C0EXAMPLE2",
+            "adapter": "default",
+            "allowed_callers": None,
+            "trigger_label": None,
+        }
     ]
 
     # The change is persisted, not just echoed back.
     got = client.get(f"/agents/{agent_id}", headers=auth_headers).json()
     assert got["channels"] == [
-        {"kind": "slack", "address": "C0EXAMPLE2", "adapter": "default", "allowed_callers": None}
+        {
+            "kind": "slack",
+            "address": "C0EXAMPLE2",
+            "adapter": "default",
+            "allowed_callers": None,
+            "trigger_label": None,
+        }
     ]
 
 
@@ -341,8 +359,20 @@ def test_add_channel_binding_appends_and_leaves_the_first_alone(
 
     got = client.get(f"/agents/{agent['id']}", headers=auth_headers).json()
     assert got["channels"] == [
-        {"kind": "slack", "address": "C0EXAMPLE0", "adapter": "default", "allowed_callers": None},
-        {"kind": "slack", "address": "C0EXAMPLE1", "adapter": "default", "allowed_callers": None},
+        {
+            "kind": "slack",
+            "address": "C0EXAMPLE0",
+            "adapter": "default",
+            "allowed_callers": None,
+            "trigger_label": None,
+        },
+        {
+            "kind": "slack",
+            "address": "C0EXAMPLE1",
+            "adapter": "default",
+            "allowed_callers": None,
+            "trigger_label": None,
+        },
     ]
 
 
@@ -377,7 +407,13 @@ def test_delete_channel_binding_removes_only_the_named_row(
 
     got = client.get(f"/agents/{agent['id']}", headers=auth_headers).json()
     assert got["channels"] == [
-        {"kind": "slack", "address": "C0EXAMPLE3", "adapter": "default", "allowed_callers": None}
+        {
+            "kind": "slack",
+            "address": "C0EXAMPLE3",
+            "adapter": "default",
+            "allowed_callers": None,
+            "trigger_label": None,
+        }
     ]
     assert (
         _count(
@@ -408,7 +444,13 @@ def test_patch_agent_omitted_field_is_noop(
     )
     assert resp.status_code == 200, resp.text
     assert resp.json()["channels"] == [
-        {"kind": "slack", "address": "C0EXAMPLE5", "adapter": "default", "allowed_callers": None}
+        {
+            "kind": "slack",
+            "address": "C0EXAMPLE5",
+            "adapter": "default",
+            "allowed_callers": None,
+            "trigger_label": None,
+        }
     ]
 
 
@@ -464,7 +506,13 @@ def test_binding_writes_reject_a_non_id_channel(
     # The rejected writes left the original channel intact, and added nothing.
     got = client.get(f"/agents/{agent_id}", headers=auth_headers).json()
     assert got["channels"] == [
-        {"kind": "slack", "address": "C0EXAMPLE6", "adapter": "default", "allowed_callers": None}
+        {
+            "kind": "slack",
+            "address": "C0EXAMPLE6",
+            "adapter": "default",
+            "allowed_callers": None,
+            "trigger_label": None,
+        }
     ]
 
 
@@ -611,11 +659,13 @@ def test_delete_agent_removes_work_requests_and_internal_lineage_without_github(
                 await conn.execute(
                     text(
                         "INSERT INTO curie.work_items "
-                        "(id, github_repository_id, github_issue_number, "
-                        "github_installation_id, agent_id, repo_full_name, "
-                        "conversation_id, publication_lineage_id, version, "
-                        "next_sequence) VALUES "
-                        "(:id, 101, 2573, 202, :agent, :repo, :conversation, "
+                        "(id, tracker_kind, tracker_host, tracker_scope_id, "
+                        "tracker_issue_id, code_host_kind, code_host_host, "
+                        "repository_project_id, code_host_installation_id, agent_id, "
+                        "repository_path, conversation_id, publication_lineage_id, "
+                        "version, next_sequence) VALUES "
+                        "(:id, 'github', 'github.com', '101', '2573', 'github', "
+                        "'github.com', '101', 202, :agent, :repo, :conversation, "
                         ":lineage, 2, 2)"
                     ),
                     {

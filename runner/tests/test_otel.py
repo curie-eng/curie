@@ -3,7 +3,7 @@
 import os
 import time
 from collections import defaultdict
-from collections.abc import AsyncIterator, Callable
+from collections.abc import AsyncIterator, Callable, Iterator
 from typing import Any
 
 import anyio
@@ -15,6 +15,7 @@ from aci_protocol import (
     Final,
     OtelConfig,
     SessionStatus,
+    ToolAccess,
     parse_ndjson,
     parse_ndjson_line,
 )
@@ -36,6 +37,7 @@ from curie_runner.adapter import ClaudeAgentSession, PartialMessageBoundary
 from curie_runner.approval import ApprovalGate
 from curie_runner.fake import FakeModelSession
 from curie_runner.otel import _SchemaValidatingSpanProcessor
+from curie_runner.sender_frame import frame_user_turn
 from curie_runner.session import SessionRunner
 from opentelemetry.context import Context
 from opentelemetry.exporter.otlp.proto.grpc.trace_exporter import (
@@ -56,6 +58,11 @@ from opentelemetry.trace import (
     TraceState,
     set_span_in_context,
 )
+
+
+def _sent(text: str, user: str = "U0EXAMPLE1") -> str:
+    return frame_user_turn("message", user, text, None)
+
 
 _STREAM_BODY = "private-partial-body-PLACEHOLDER"
 _STREAM_ARGUMENT = "private-partial-argument-PLACEHOLDER"
@@ -135,6 +142,7 @@ def _export_turn(
             SimpleSpanProcessor(HttpOTLPSpanExporter(endpoint=collector_endpoint))
         )
     runner = SessionRunner(
+        max_usd_per_day=None,
         held_secrets=frozenset(),
         session_factory=session_factory,
         ceiling=0,
@@ -190,11 +198,10 @@ class _ScriptedSDKClient:
 
 def _adapter_session_factory(script: list[object]) -> Callable[[], ClaudeAgentSession]:
     def factory() -> ClaudeAgentSession:
-        session = ClaudeAgentSession.__new__(ClaudeAgentSession)
-        session._client = _ScriptedSDKClient(script)  # type: ignore[attr-defined]
         # connect() installs the CLI parent env from the real options object.
         # This scripted session never spawns a CLI, so the env map stays empty.
-        session._options = ClaudeAgentOptions(env={})  # type: ignore[attr-defined]
+        session = ClaudeAgentSession(ClaudeAgentOptions(env={}))
+        session._client = _ScriptedSDKClient(script)  # type: ignore[assignment]
         return session
 
     return factory
@@ -582,6 +589,7 @@ def test_steer_during_provider_wait_preserves_generation_and_ttft(
     async def go() -> tuple[list[object], BlockingSteerSession]:
         session = BlockingSteerSession()
         runner = SessionRunner(
+            max_usd_per_day=None,
             held_secrets=frozenset(),
             session_factory=lambda: session,
             ceiling=0,
@@ -604,7 +612,7 @@ def test_steer_during_provider_wait_preserves_generation_and_ttft(
                 tasks.start_soon(consume)
                 await session.waiting_after_boundary.wait()
                 assert runner.turn_active
-                assert session.queries == ["initial"]
+                assert session.queries == [_sent("initial")]
                 assert await runner.steer("steered follow-up") is True
                 session.release.set()
         finally:
@@ -612,7 +620,7 @@ def test_steer_during_provider_wait_preserves_generation_and_ttft(
         return parse_ndjson("".join(lines)), session
 
     events, session = anyio.run(go)
-    assert session.queries == ["initial", "steered follow-up"]
+    assert session.queries == [_sent("initial"), _sent("steered follow-up", "")]
     assert isinstance(events[-1], Final)
     assert events[-1].status is SessionStatus.DONE
 
@@ -1060,6 +1068,7 @@ def test_run_emits_agent_generation_and_tool_spans() -> None:
     provider.add_span_processor(SimpleSpanProcessor(exporter))
 
     runner = SessionRunner(
+        max_usd_per_day=None,
         held_secrets=frozenset(),
         session_factory=FakeModelSession,  # default_turn: text + Bash tool + result usage
         ceiling=0,
@@ -1100,6 +1109,7 @@ def test_generation_model_backfilled_from_sdk_when_unconfigured() -> None:
     provider.add_span_processor(SimpleSpanProcessor(exporter))
 
     runner = SessionRunner(
+        max_usd_per_day=None,
         held_secrets=frozenset(),
         session_factory=FakeModelSession,
         ceiling=0,
@@ -1136,6 +1146,7 @@ def test_run_stamps_langfuse_session_and_user_ids() -> None:
     provider.add_span_processor(SimpleSpanProcessor(exporter))
 
     runner = SessionRunner(
+        max_usd_per_day=None,
         held_secrets=frozenset(),
         session_factory=FakeModelSession,
         ceiling=0,
@@ -1166,6 +1177,7 @@ def test_run_omits_langfuse_user_id_when_event_user_empty() -> None:
     provider.add_span_processor(SimpleSpanProcessor(exporter))
 
     runner = SessionRunner(
+        max_usd_per_day=None,
         held_secrets=frozenset(),
         session_factory=FakeModelSession,
         ceiling=0,
@@ -1197,6 +1209,7 @@ def test_run_stamps_approval_decision_when_resuming_a_resolved_approval() -> Non
     provider.add_span_processor(SimpleSpanProcessor(exporter))
 
     runner = SessionRunner(
+        max_usd_per_day=None,
         held_secrets=frozenset(),
         session_factory=FakeModelSession,
         ceiling=0,
@@ -1226,6 +1239,7 @@ def test_run_omits_approval_decision_on_an_ordinary_turn() -> None:
     provider.add_span_processor(SimpleSpanProcessor(exporter))
 
     runner = SessionRunner(
+        max_usd_per_day=None,
         held_secrets=frozenset(),
         session_factory=FakeModelSession,
         ceiling=0,
@@ -1380,6 +1394,7 @@ def test_run_span_uses_explicit_parent_instead_of_ambient_context() -> None:
     parent, parent_span_context = _remote_parent()
     ambient_tracer = TracerProvider().get_tracer("ambient")
     runner = SessionRunner(
+        max_usd_per_day=None,
         held_secrets=frozenset(),
         session_factory=FakeModelSession,
         ceiling=0,
@@ -1586,6 +1601,7 @@ def test_approval_halt_abort_is_a_paused_non_error_terminal() -> None:
         can_use_tool=record_gate,
     )
     runner = SessionRunner(
+        max_usd_per_day=None,
         held_secrets=frozenset(),
         session_factory=lambda: fake,
         ceiling=0,
@@ -1639,6 +1655,7 @@ def test_interrupt_requested_wins_over_error_result_and_sdk_abort_reason() -> No
     ]
     fake = FakeModelSession(lambda: script, truncate_on_interrupt=False)
     runner = SessionRunner(
+        max_usd_per_day=None,
         held_secrets=frozenset(),
         session_factory=lambda: fake,
         ceiling=0,
@@ -1751,6 +1768,7 @@ def test_abandoned_turn_reports_interrupted_not_stale_prior_success(
 
     monkeypatch.setattr(session_module, "record_metric", capture)
     runner = SessionRunner(
+        max_usd_per_day=None,
         held_secrets=frozenset(),
         session_factory=FakeModelSession,
         ceiling=0,
@@ -2038,6 +2056,82 @@ def test_result_only_usage_is_never_fabricated_on_earlier_generations() -> None:
     assert final.attributes[_SCOPE] == "turn"
 
 
+def test_a_steered_sender_frame_is_not_exported_when_the_model_echoes_it() -> None:
+    """A steer registers its frame before the model can echo it into a trace."""
+
+    secret = "private-steer-PLACEHOLDER"
+    exporter = InMemorySpanExporter()
+    provider = TracerProvider()
+    provider.add_span_processor(SimpleSpanProcessor(exporter))
+
+    class EchoSteerSession:
+        def __init__(self) -> None:
+            self.queries: list[str] = []
+            self.waiting_after_boundary = anyio.Event()
+            self.release = anyio.Event()
+
+        async def connect(self) -> None:
+            return None
+
+        async def query(self, text: str) -> None:
+            self.queries.append(text)
+
+        def receive_turn(self) -> AsyncIterator[object]:
+            async def messages() -> AsyncIterator[object]:
+                yield PartialMessageBoundary(event_type="message_start")
+                self.waiting_after_boundary.set()
+                await self.release.wait()
+                yield AssistantMessage(
+                    content=[TextBlock(text=f"echo {self.queries[-1]}")],
+                    model="observed-model",
+                )
+                yield _result(text="done")
+
+            return messages()
+
+        async def interrupt(self) -> None:
+            self.release.set()
+
+        async def close(self) -> None:
+            return None
+
+    async def go() -> None:
+        session = EchoSteerSession()
+        runner = SessionRunner(
+            max_usd_per_day=None,
+            held_secrets=frozenset(),
+            session_factory=lambda: session,
+            ceiling=0,
+            tracer=RunTracer(provider),
+            classifier=SideEffectClassifier(),
+            trace_name="curie-run:steer-redaction",
+            model="configured-model",
+        )
+
+        async def consume() -> None:
+            async for _line in runner.run_turn(
+                Event(type="message", text="start", user="U0EXAMPLE1", ts="1")
+            ):
+                pass
+
+        await runner.start()
+        try:
+            async with anyio.create_task_group() as tasks:
+                tasks.start_soon(consume)
+                await session.waiting_after_boundary.wait()
+                frame = Event(type="message", text=secret, user="U123", ts="2")
+                assert await runner.steer(frame.text, event=frame) is True
+                session.release.set()
+        finally:
+            await runner.close()
+
+    anyio.run(go)
+    finished = list(exporter.get_finished_spans())
+    material = _span_wire_material(finished)
+    assert secret not in material
+    assert "person: U123" not in material
+
+
 def test_generations_record_the_prompt_output_and_tool_names_only() -> None:
     prompt = "Resolve https://github.com/acme-corp/widgets/issues/123"
     script: list[object] = [
@@ -2205,3 +2299,271 @@ def test_an_echoed_user_prompt_is_replaced_in_the_generation_output() -> None:
     assert prompt not in _span_wire_material(finished)
     output = generation.attributes[_OUTPUT]
     assert f"You asked: {placeholder}. Answer: sunny" in output
+
+
+# #4940: a classified failure names its closed classification on the root span.
+_CLASSIFICATION = "curie.terminal.classification"
+_OUTPUT_CEILING = "curie.budget.output_ceiling"
+_CAUSE = "curie.terminal.cause"
+
+
+def _failure_canaries(kind: str) -> dict[str, str]:
+    return {
+        "prompt": f"private-prompt-{kind}-PLACEHOLDER",
+        "tool_argument": f"private-tool-arg-{kind}-PLACEHOLDER",
+        "tool_result": f"private-tool-output-{kind}-PLACEHOLDER",
+        "tool_call_id": f"private-call-id-{kind}-PLACEHOLDER",
+        "provider_error": f"private-provider-error-{kind}-PLACEHOLDER",
+    }
+
+
+def _canary_tool_round(canaries: dict[str, str]) -> list[object]:
+    # Tool call and result shapes from
+    # test_generations_record_the_prompt_output_and_tool_names_only above.
+    return [
+        AssistantMessage(
+            content=[
+                ToolUseBlock(
+                    id=canaries["tool_call_id"],
+                    name="Bash",
+                    input={"command": canaries["tool_argument"]},
+                )
+            ],
+            model="observed-model",
+            usage={"input_tokens": 1, "output_tokens": 1},
+        ),
+        _tool_result(canaries["tool_call_id"], content=canaries["tool_result"]),
+    ]
+
+
+def _export_failed_turn(
+    session_factory: Callable[[], Any],
+    event: Event,
+    *,
+    ceiling: int = 0,
+) -> tuple[list[object], list[ReadableSpan]]:
+    exporter = InMemorySpanExporter()
+    provider = TracerProvider()
+    provider.add_span_processor(SimpleSpanProcessor(exporter))
+    runner = SessionRunner(
+        max_usd_per_day=None,
+        held_secrets=frozenset(),
+        session_factory=session_factory,
+        ceiling=ceiling,
+        tracer=RunTracer(provider),
+        classifier=SideEffectClassifier(),
+        trace_name="curie-run:test",
+        model="configured-model",
+    )
+
+    async def go() -> list[object]:
+        await runner.start()
+        try:
+            lines = [line async for line in runner.run_turn(event)]
+            return parse_ndjson("".join(lines))
+        finally:
+            await runner.close()
+
+    events = anyio.run(go)
+    return events, list(exporter.get_finished_spans())
+
+
+def _assert_no_canary_exported(finished: list[ReadableSpan], canaries: dict[str, str]) -> None:
+    # Span names, attribute keys and values, event names and attributes, and
+    # status descriptions of every exported span.
+    material = _span_wire_material(finished)
+    leaked = sorted(name for name, value in canaries.items() if value in material)
+    assert not leaked, f"canaries exported to OTel: {leaked}"
+
+
+def _classified_root(
+    events: list[object], finished: list[ReadableSpan], classification: str
+) -> ReadableSpan:
+    errors = [event for event in events if isinstance(event, ErrorEvent)]
+    assert errors and errors[-1].classification == classification
+    assert isinstance(events[-1], Final)
+    assert events[-1].status is SessionStatus.CLASSIFIED_FAILURE
+    [root] = _spans_by_name(finished)["agent.run"]
+    assert root.attributes[_CAUSE] == "classified_failure"
+    return root
+
+
+def test_credential_rejection_root_carries_classification_without_output_ceiling() -> None:
+    canaries = _failure_canaries("credential")
+    # The rejection shape is test_session.py
+    # test_auth_rejection_fails_fast_not_retried: AssistantMessage.error
+    # "authentication_failed" (session.py _is_auth_rejection), here with the
+    # provider's own text as the assistant TextBlock.
+    script: list[object] = [
+        *_canary_tool_round(canaries),
+        AssistantMessage(
+            content=[TextBlock(text=canaries["provider_error"])],
+            model="observed-model",
+            error="authentication_failed",
+        ),
+        _result(),
+    ]
+    events, finished = _export_failed_turn(
+        lambda: FakeModelSession(lambda: script),
+        Event(type="message", text=canaries["prompt"], user="U0EXAMPLE1", ts="1"),
+        ceiling=1000,
+    )
+
+    root = _classified_root(events, finished, "model-credential-rejected")
+    _assert_no_canary_exported(finished, canaries)
+    assert root.attributes.get(_CLASSIFICATION) == "model-credential-rejected"
+    assert _OUTPUT_CEILING not in root.attributes
+
+
+def test_budget_halt_root_carries_classification_and_output_ceiling() -> None:
+    ceiling = 5
+    canaries = _failure_canaries("budget")
+    # Assistant usage crossing the ceiling mid-turn is the shape of test_session.py
+    # test_output_token_budget_failure_names_the_configured_limit. The provider
+    # error canary rides an earlier errored assistant message, the recorded
+    # shape in test_translate.py (error="server_error" with the provider text as
+    # a TextBlock), so the no-canary assertion covers generation output too.
+    script: list[object] = [
+        *_canary_tool_round(canaries),
+        AssistantMessage(
+            content=[TextBlock(text=canaries["provider_error"])],
+            model="observed-model",
+            error="server_error",
+        ),
+        AssistantMessage(
+            content=[TextBlock(text="still working")],
+            model="observed-model",
+            usage={"input_tokens": 1, "output_tokens": ceiling + 10},
+        ),
+        _result(),
+    ]
+    events, finished = _export_failed_turn(
+        lambda: FakeModelSession(lambda: script),
+        Event(type="message", text=canaries["prompt"], user="U0EXAMPLE1", ts="1"),
+        ceiling=ceiling,
+    )
+
+    root = _classified_root(events, finished, "budget-exceeded")
+    _assert_no_canary_exported(finished, canaries)
+    assert _CLASSIFICATION in root.attributes
+    assert root.attributes[_CLASSIFICATION] == "budget-exceeded"
+    assert _OUTPUT_CEILING in root.attributes
+    assert type(root.attributes[_OUTPUT_CEILING]) is int
+    assert root.attributes[_OUTPUT_CEILING] == ceiling
+
+
+def test_provider_error_text_is_never_generation_output() -> None:
+    canaries = _failure_canaries("generation")
+    normal_text = "normal-assistant-answer-PLACEHOLDER"
+    # Recorded shape: test_translate.py (error="server_error" with the provider
+    # text as the message's TextBlock), followed by an ordinary reply.
+    script: list[object] = [
+        AssistantMessage(
+            content=[TextBlock(text=canaries["provider_error"])],
+            model="observed-model",
+            error="server_error",
+        ),
+        AssistantMessage(
+            content=[TextBlock(text=normal_text)],
+            model="observed-model",
+            usage={"input_tokens": 1, "output_tokens": 1},
+        ),
+        _result(),
+    ]
+    _, finished = _export_failed_turn(
+        lambda: FakeModelSession(lambda: script),
+        Event(type="message", text=canaries["prompt"], user="U0EXAMPLE1", ts="1"),
+        ceiling=1000,
+    )
+
+    _assert_no_canary_exported(finished, canaries)
+    generations = _spans_by_name(finished)["llm.generation"]
+    assert any(normal_text in str(g.attributes.get(_OUTPUT, "")) for g in generations)
+
+
+def test_runner_error_root_carries_runner_error_classification() -> None:
+    canaries = _failure_canaries("runner")
+
+    def raising_script() -> Iterator[object]:
+        # A raised SDK/transport error mid-turn becomes the runner-error
+        # ErrorEvent (session.py _run_turn ``except Exception``), as in
+        # test_caught_runner_failure_sets_explicit_error_status, here after a
+        # completed tool round.
+        yield from _canary_tool_round(canaries)
+        raise RuntimeError(canaries["provider_error"])
+
+    events, finished = _export_failed_turn(
+        lambda: FakeModelSession(raising_script),  # type: ignore[arg-type]
+        Event(type="message", text=canaries["prompt"], user="U0EXAMPLE1", ts="1"),
+        ceiling=1000,
+    )
+
+    root = _classified_root(events, finished, "runner-error")
+    _assert_no_canary_exported(finished, canaries)
+    assert root.attributes.get(_CLASSIFICATION) == "runner-error"
+    assert _OUTPUT_CEILING not in root.attributes
+
+
+def test_abandoned_turn_carries_no_failure_classification() -> None:
+    exporter = InMemorySpanExporter()
+    provider = TracerProvider()
+    provider.add_span_processor(SimpleSpanProcessor(exporter))
+    # A non-terminal provider error (translate.py ``server_error`` ->
+    # ``server-error``) reaches the consumer before it walks away, so the turn
+    # did emit a classified ErrorEvent that must still not be stamped.
+    script: list[object] = [
+        AssistantMessage(content=[], model="observed-model", error="server_error"),
+        AssistantMessage(content=[TextBlock(text="retrying")], model="observed-model"),
+        _result(),
+    ]
+    runner = SessionRunner(
+        max_usd_per_day=None,
+        held_secrets=frozenset(),
+        session_factory=lambda: FakeModelSession(lambda: script),
+        ceiling=5,
+        tracer=RunTracer(provider),
+        classifier=SideEffectClassifier(),
+        trace_name="curie-run:test",
+        model="configured-model",
+    )
+    seen: list[object] = []
+
+    async def go() -> None:
+        await runner.start()
+        turn = runner.run_turn(Event(type="message", text="go", user="U0EXAMPLE1", ts="1"))
+        async for line in turn:
+            seen.append(parse_ndjson_line(line))
+            if isinstance(seen[-1], ErrorEvent):
+                break
+        await turn.aclose()
+        await runner.close()
+
+    anyio.run(go)
+    assert not any(isinstance(event, Final) for event in seen)
+    assert any(
+        isinstance(event, ErrorEvent) and event.classification == "server-error" for event in seen
+    )
+    [root] = _spans_by_name(list(exporter.get_finished_spans()))["agent.run"]
+    assert root.attributes[_CAUSE] == "abandoned"
+    assert _CLASSIFICATION not in root.attributes
+    assert _OUTPUT_CEILING not in root.attributes
+
+
+def test_out_of_set_classification_exports_unclassified() -> None:
+    # A restricted turn this runner cannot enforce is refused with
+    # ``tool-access-unenforced`` (session.py _tool_access_refusal,
+    # tool_access.py), which is outside PLATFORM_ERROR_CLASSIFICATIONS.
+    events, finished = _export_failed_turn(
+        FakeModelSession,
+        Event(
+            type="message",
+            text="go",
+            user="U0EXAMPLE1",
+            ts="1",
+            tool_access=ToolAccess.READ_ONLY,
+        ),
+    )
+
+    root = _classified_root(events, finished, "tool-access-unenforced")
+    assert root.attributes.get(_CLASSIFICATION) == "unclassified"
+    assert _OUTPUT_CEILING not in root.attributes

@@ -6,6 +6,7 @@ import os
 from pathlib import Path
 
 import anyio
+from aiohttp import ClientSession, ClientTimeout
 from mcp import Tool, types
 from mcp.server import ServerRequestContext
 from mcp.server.lowlevel import Server
@@ -18,6 +19,12 @@ async def list_tools(
     params: types.PaginatedRequestParams | None,
 ) -> ListToolsResult:
     """Serve one or two tools so the client exercises MCP pagination."""
+
+    rendezvous_url = os.environ.get("CURIE_TEST_BOOT_RENDEZVOUS_URL")
+    if rendezvous_url:
+        async with ClientSession(timeout=ClientTimeout(total=15)) as session:
+            async with session.post(rendezvous_url) as response:
+                response.raise_for_status()
 
     mode = os.environ.get("CURIE_TEST_TOOL_MODE", "unknown")
     if mode == "policy-catalog":

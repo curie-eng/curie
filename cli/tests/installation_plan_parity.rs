@@ -1,5 +1,4 @@
-#[path = "support/executable.rs"]
-mod test_executable;
+use crate::support::executable as test_executable;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
@@ -124,6 +123,17 @@ impl HelmFixture {
             r#"#!/bin/sh
 if [ -n "${CURIE_TEST_CALL_LOG:-}" ]; then
     printf 'HELM_CALL: %s\n' "$*" >> "$CURIE_TEST_CALL_LOG"
+fi
+# Capture private generated values before the CLI's file guard unlinks them.
+# Only the parity assertion opts in; do not change the recorded argv.
+if [ -n "${CURIE_TEST_CAPTURE_VALUES_DIR:-}" ] && [ "$1" = template ]; then
+    previous=""
+    for argument in "$@"; do
+        if [ "$previous" = '-f' ]; then
+            cp "$argument" "$CURIE_TEST_CAPTURE_VALUES_DIR/$(basename "$argument")" || exit 1
+        fi
+        previous="$argument"
+    done
 fi
 if [ "$1" = get ] && [ "$2" = values ]; then
     case "${CURIE_TEST_HELM_VALUES_MODE:-}" in
@@ -359,6 +369,7 @@ if [ -n "${{CURIE_TEST_CALL_LOG:-}}" ]; then
     printf 'KUBECTL_CALL: %s\n' "$*" >> "$CURIE_TEST_CALL_LOG"
 fi
 all="$*"
+curie_test_capacity_read "$@"
 script=""
 previous=""
 for argument in "$@"; do
@@ -391,7 +402,9 @@ unexpected() {{
 migration_target="$CURIE_TEST_MIGRATION_STATE/target"
 migration_source="$CURIE_TEST_MIGRATION_STATE/source.list"
 persist_target() {{
-    target=$(printf '%s\n' "$script" | sed -n "s/.*printf '%s\\\\n' '\\(minio\\|rustfs\\)' > .*/\\1/p")
+    # POSIX BRE has no \| alternation (BSD sed treats it literally).
+    # Extract the quoted target, then validate its supported values below.
+    target=$(printf '%s\n' "$script" | sed -n "s/.*printf '[^']*' '\\([a-z]*\\)' > .*/\\1/p")
     case "$target" in
         minio|rustfs) printf '%s\n' "$target" > "$migration_target" ;;
         *) unexpected ;;
@@ -419,6 +432,12 @@ case "$verb $object" in
 'get priorityclass')
     # Empty stdout with exit 0 is kubectl --ignore-not-found for an absent class.
     :
+    ;;
+'get runtimeclass')
+    # A real-model install now GETs the RuntimeClass. Forbidden keeps these
+    # tests on the install path they already assert.
+    printf '%s\n' 'Error from server (Forbidden): runtimeclasses.node.k8s.io "gvisor" is forbidden: User "system:serviceaccount:example:example" cannot get resource "runtimeclasses" in API group "node.k8s.io" at the cluster scope' >&2
+    exit 1
     ;;
 'get namespace')
     case "$all" in
@@ -469,7 +488,7 @@ case "$verb $object" in
         unexpected
     fi
     case "$all" in
-        '-n parity rollout restart deployment/parity-curie-worker'|\
+        '-n parity rollout restart deployment/parity-curie-channel-gateway'|\
         '-n parity rollout restart deployment/parity-curie-dispatcher') : ;;
         *) unexpected ;;
     esac
@@ -479,7 +498,7 @@ case "$verb $object" in
         unexpected
     fi
     case "$all" in
-        '-n parity rollout status deployment/parity-curie-worker --timeout=120s'|\
+        '-n parity rollout status deployment/parity-curie-channel-gateway --timeout=120s'|\
         '-n parity rollout status deployment/parity-curie-dispatcher --timeout=120s') : ;;
         *) unexpected ;;
     esac
@@ -646,6 +665,7 @@ exit 0
             .args(globals)
             .args(args)
             .env("PATH", path)
+            .env("KUBECONFIG", self.temp.path().join("kubeconfig"))
             .env("CURIE_TEST_CALL_LOG", &self.log)
             .env("CURIE_TEST_MIGRATION_STATE", &self.migration_state)
             .env("CURIE_TEST_LAST_EXEC_SCRIPT", &self.last_exec_script)
@@ -656,6 +676,7 @@ exit 0
             .env_remove("CURIE_TEST_KUBECTL_FORBIDDEN")
             .env_remove("CURIE_TEST_COMMS_ROLLOUTS")
             .env_remove("CURIE_TEST_HELM_MIXED_STATEFULSETS")
+            .env_remove("CURIE_TEST_CAPTURE_VALUES_DIR")
             .env_remove("CURIE_TEST_RELEASE_SECRET")
             .env_remove("CURIE_TEST_SOURCE_LIST_FAIL")
             .env_remove("CURIE_TEST_SOURCE_LIST")
@@ -917,6 +938,63 @@ fn shell_tokens(line: &str) -> Vec<String> {
     tokens
 }
 
+fn template_semantics(line: &str, captured: &Path) -> (Vec<String>, Vec<Value>) {
+    let mut tokens = shell_tokens(line);
+    let mut values = Vec::new();
+    for index in 1..tokens.len() {
+        if tokens[index - 1] != "-f" {
+            continue;
+        }
+        let path = Path::new(&tokens[index]);
+        let name = path.file_name().expect("values file name");
+        if name.to_string_lossy().starts_with("curie-helm-values-") {
+            let content = fs::read_to_string(captured.join(name)).expect("captured Helm values");
+            values.push(serde_json::from_str(&content).expect("valid generated JSON values"));
+            tokens[index] = "<generated-values-file>".to_string();
+        }
+    }
+    (tokens, values)
+}
+
+#[test]
+fn template_comparison_preserves_values_and_nonincidental_argv() {
+    let captured = tempfile::tempdir().unwrap();
+    fs::write(
+        captured.path().join("curie-helm-values-a.yaml"),
+        r#"{"rustfs":{"deploy":false}}"#,
+    )
+    .unwrap();
+    fs::write(
+        captured.path().join("curie-helm-values-b.yaml"),
+        r#"{ "rustfs": { "deploy": false } }"#,
+    )
+    .unwrap();
+    let first = "HELM_CALL: template parity charts/curie -f /tmp/curie-helm-values-a.yaml --set-string config.schemaVersion=0.9.0";
+    let second = "HELM_CALL: template parity charts/curie -f /private/custom-temp/curie-helm-values-b.yaml --set-string config.schemaVersion=0.9.0";
+    assert_eq!(
+        template_semantics(first, captured.path()),
+        template_semantics(second, captured.path())
+    );
+    fs::write(
+        captured.path().join("curie-helm-values-b.yaml"),
+        r#"{"rustfs":{"deploy":true}}"#,
+    )
+    .unwrap();
+    assert_ne!(
+        template_semantics(first, captured.path()),
+        template_semantics(second, captured.path())
+    );
+    fs::write(
+        captured.path().join("curie-helm-values-b.yaml"),
+        r#"{ "rustfs": { "deploy": false } }"#,
+    )
+    .unwrap();
+    assert_ne!(
+        template_semantics(first, captured.path()),
+        template_semantics(&second.replace("0.9.0", "0.8.0"), captured.path())
+    );
+}
+
 fn helm_values(plan: &str) -> BTreeMap<String, String> {
     let helm = plan
         .lines()
@@ -993,6 +1071,242 @@ fn assert_diff_keys(diff: &Value, expected: &[&str]) {
 /// the guard and the upgrade need and nothing else.
 fn installation_for_the_stateful_guard() -> &'static str {
     "version: 1\ninstall:\n  namespace: parity\n  release: parity\n"
+}
+
+fn install_factory_revision_reads(fixture: &HelmFixture, legacy: bool) {
+    let HelmValuesResponse::Object(mut user) = recorded_runner_values() else {
+        panic!("recorded runner fixture must contain supplied values");
+    };
+    user["config"] = json!({"schemaVersion": "0.9.0"});
+    user["worker"]["runnerTotalTimeoutSeconds"] = json!(511);
+    if legacy {
+        user["api"]["githubFactoryIngressEnabled"] = json!(false);
+    }
+    let mut computed = user.clone();
+    computed["agentSandbox"]["deploy"] = json!(false);
+    computed["api"]["githubFactoryIngressEnabled"] = json!(false);
+    computed["api"]["githubFactoryIntake"] = json!("poll");
+    computed["api"]["githubFactoryPollIntervalSeconds"] = json!(45);
+    computed["api"]["githubFactoryLabel"] = json!("");
+    computed["api"]["githubFactoryMention"] = json!("");
+    computed["api"]["githubFactoryCardBaseUrl"] = json!("");
+    computed["api"]["githubFactoryCiWaitSeconds"] = json!(1200);
+    for key in [
+        "githubFactoryBases",
+        "githubFactoryPythonCi",
+        "githubFactoryMetadataCi",
+    ] {
+        computed["api"][key] = json!({});
+    }
+    let mut inputs = super::cluster_upgrade::factory_read_inputs(user, computed);
+    inputs["unpinned_revision"] = json!(if legacy { "4" } else { "5" });
+    let bin_dir = fixture.temp.path().join("bin");
+    let base = bin_dir.join("base");
+    fs::create_dir(&base).unwrap();
+    fs::rename(bin_dir.join("helm"), base.join("helm")).unwrap();
+    fs::write(bin_dir.join("factory-inputs.json"), inputs.to_string()).unwrap();
+    let resolved = Command::new("sh")
+        .args(["-c", "command -v helm"])
+        .output()
+        .expect("resolve real Helm before installing the factory wrapper");
+    assert!(
+        resolved.status.success(),
+        "real Helm is required for the values parser"
+    );
+    let helm = String::from_utf8(resolved.stdout).expect("UTF-8 Helm path");
+    let helm = fs::canonicalize(helm.trim()).expect("real Helm executable");
+    let helm = serde_json::to_string(helm.to_str().expect("UTF-8 Helm path")).unwrap();
+    let wrapper = format!(
+        r#"#!/usr/bin/env python3
+import os
+import sys
+if sys.argv[1:3] == ['template', 'curie-values-lint']:
+    os.execv({helm}, [{helm}, *sys.argv[1:]])
+{}"#,
+        super::cluster_upgrade::FACTORY_READ_WRAPPER
+            .strip_prefix("#!/usr/bin/env python3\n")
+            .expect("Python factory wrapper")
+    );
+    test_executable::install(&bin_dir.join("helm"), &wrapper);
+}
+
+fn factory_revision_calls(fixture: &HelmFixture) -> Vec<Vec<String>> {
+    fixture
+        .calls()
+        .lines()
+        .take_while(|line| {
+            line.strip_prefix("FACTORY_VALUES: ").is_none_or(|payload| {
+                serde_json::from_str::<Value>(payload).unwrap()["argv"][0] != "upgrade"
+            })
+        })
+        .filter_map(|line| line.strip_prefix("FACTORY_CALL: "))
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect()
+}
+
+fn factory_consumed_values(fixture: &HelmFixture) -> Vec<Value> {
+    fixture
+        .calls()
+        .lines()
+        .filter_map(|line| line.strip_prefix("FACTORY_VALUES: "))
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect()
+}
+
+#[test]
+fn factory_non_upgrade_callers_pin_latest_user_and_computed_values_after_the_initial_read() {
+    let live_statefulset = live_rustfs_statefulset();
+    for surface in ["up", "apply", "diff"] {
+        let fixture = HelmFixture::new(
+            installation_for_the_stateful_guard(),
+            recorded_runner_values(),
+        );
+        install_factory_revision_reads(&fixture, true);
+        let output = match surface {
+            "up" => fixture.cluster_up_without_credentials(&[]),
+            "apply" => fixture.apply(&[], &[]),
+            _ => fixture.diff(&[("CURIE_TEST_KUBECTL_STS", live_statefulset.as_str())]),
+        };
+        json_output(output, surface);
+        let calls = factory_revision_calls(&fixture);
+        let pinned: Vec<_> = calls
+            .iter()
+            .filter(|call| {
+                call.get(1).is_some_and(|arg| arg == "get")
+                    && call.get(2).is_some_and(|arg| arg == "values")
+                    && call.iter().any(|arg| arg == "--revision")
+            })
+            .collect();
+        assert!(
+            pinned
+                .iter()
+                .any(|call| call.iter().any(|arg| arg == "--all")),
+            "{surface} must read computed source values at the captured latest revision: {calls:?}"
+        );
+        assert!(
+            pinned
+                .iter()
+                .any(|call| !call.iter().any(|arg| arg == "--all")),
+            "{surface} must replace any earlier unpinned user document: {calls:?}"
+        );
+        assert!(
+            pinned
+                .iter()
+                .all(|call| call.windows(2).any(|pair| pair == ["--revision", "5"])),
+            "{surface} retains latest semantics while revision 4 is serving: {calls:?}"
+        );
+        assert!(
+            pinned
+                .iter()
+                .all(|call| call.get(3).is_some_and(|arg| arg == "parity")
+                    && call.windows(2).any(|pair| pair == ["-n", "parity"])),
+            "{surface} source documents must belong to the same release and namespace: {pinned:?}"
+        );
+        let consumed = factory_consumed_values(&fixture);
+        assert!(
+            !consumed.is_empty(),
+            "{surface} must render the completed source snapshot"
+        );
+        let mut saw_latest = false;
+        let mut saw_disabled = false;
+        for consumer in consumed {
+            let arguments = consumer["argv"].as_array().unwrap();
+            saw_latest |= arguments
+                .iter()
+                .any(|arg| arg == "worker.runnerTotalTimeoutSeconds=511");
+            saw_disabled |= arguments.iter().any(|arg| arg == "factory.enabled=false");
+            assert!(
+                !arguments
+                    .iter()
+                    .any(|arg| arg == "worker.runnerTotalTimeoutSeconds=411"),
+                "{surface} must not consume the stale initial user values"
+            );
+            for document in consumer["documents"].as_array().unwrap() {
+                let values: Value = serde_norway::from_str(document.as_str().unwrap()).unwrap();
+                saw_latest |=
+                    values.pointer("/worker/runnerTotalTimeoutSeconds") == Some(&json!(511));
+                saw_disabled |= values.pointer("/factory/enabled") == Some(&json!(false));
+                assert_ne!(
+                    values.pointer("/worker/runnerTotalTimeoutSeconds"),
+                    Some(&json!(411))
+                );
+                assert!(values.pointer("/api/githubFactoryIngressEnabled").is_none());
+            }
+        }
+        assert!(
+            saw_latest,
+            "{surface} must pass the pinned latest user setting to Helm"
+        );
+        assert!(
+            saw_disabled,
+            "{surface} must pass migrated disabled intent to Helm"
+        );
+    }
+}
+
+#[test]
+fn factory_absent_supplied_input_keeps_non_upgrade_latest_reads_without_factory_changes() {
+    for surface in ["up", "apply", "diff"] {
+        let fixture = HelmFixture::new(
+            installation_for_the_stateful_guard(),
+            recorded_runner_values(),
+        );
+        install_factory_revision_reads(&fixture, false);
+        let output = match surface {
+            "up" => fixture.cluster_up_without_credentials(&[]),
+            "apply" => fixture.apply(&[], &[]),
+            _ => fixture.diff(&[]),
+        };
+        json_output(output, surface);
+        let calls = factory_revision_calls(&fixture);
+        let reads: Vec<_> = calls
+            .iter()
+            .filter(|call| {
+                call.get(1).is_some_and(|arg| arg == "get")
+                    && call.get(2).is_some_and(|arg| arg == "values")
+            })
+            .collect();
+        assert!(!reads.is_empty());
+        assert!(
+            reads
+                .iter()
+                .all(|call| !call.iter().any(|arg| arg == "--revision")),
+            "{surface} must preserve the established no-legacy read behavior: {reads:?}"
+        );
+        for consumer in factory_consumed_values(&fixture) {
+            assert!(!consumer["argv"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|arg| arg.as_str().is_some_and(|arg| arg.starts_with("factory."))));
+            for document in consumer["documents"].as_array().unwrap() {
+                let values: Value = serde_norway::from_str(document.as_str().unwrap()).unwrap();
+                assert!(
+                    values.get("factory").is_none(),
+                    "computed legacy defaults must not create factory intent"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn factory_apply_dry_run_with_legacy_identity_requirements_refuses_without_live_reads() {
+    let config = "version: 1\ninstall:\n  namespace: parity\n  release: parity\nset:\n  api.githubFactoryLabel: identity-sentinel-4628\n";
+    let fixture = HelmFixture::new(config, recorded_runner_values());
+    let output = fixture.apply_dry_run(&[]);
+    assert!(
+        !output.status.success(),
+        "local preview must refuse unresolved legacy identity"
+    );
+    let message = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(message.contains("api.githubFactory") || message.contains("factory.bindings"));
+    assert!(!message.contains("identity-sentinel-4628"));
+    assert!(fixture.calls().is_empty(), "apply dry-run must stay local");
 }
 
 /// A live release running a `minio` object store, in the shape
@@ -2142,7 +2456,7 @@ fn declarative_comms_replaces_byo_sources_in_diff_and_apply_but_omission_preserv
             "the follow-up comms upgrade must consume the declared Slack replacement"
         );
     }
-    for component in ["worker", "dispatcher"] {
+    for component in ["channel-gateway", "dispatcher"] {
         for (action, suffix) in [("restart", ""), ("status", " --timeout=120s")] {
             let expected = format!(
                 "KUBECTL_CALL: -n parity rollout {action} deployment/parity-curie-{component}{suffix}"
@@ -2152,6 +2466,11 @@ fn declarative_comms_replaces_byo_sources_in_diff_and_apply_but_omission_preserv
                 "the follow-up comms apply must {action} the {component} deployment:\n{calls}"
             );
         }
+    }
+    for component in ["worker", "api"] {
+        assert!(!calls.contains(&format!(
+            "rollout restart deployment/parity-curie-{component}"
+        )));
     }
 
     let retained = HelmFixture::new(
@@ -3919,9 +4238,17 @@ fn migrate_store_refuses_a_values_file_that_turns_the_store_off() {
     );
     let live_before = live_minio_statefulset();
 
+    let capture_dir = fixture.temp.path().join("helm-value-captures");
+    fs::create_dir(&capture_dir).expect("create Helm value capture directory");
     let output = fixture.apply(
         &["--migrate-store"],
-        &[("CURIE_TEST_KUBECTL_STS", live_before.as_str())],
+        &[
+            ("CURIE_TEST_KUBECTL_STS", live_before.as_str()),
+            (
+                "CURIE_TEST_CAPTURE_VALUES_DIR",
+                capture_dir.to_str().unwrap(),
+            ),
+        ],
     );
 
     let calls = fixture.calls();
@@ -3948,32 +4275,13 @@ fn migrate_store_refuses_a_values_file_that_turns_the_store_off() {
         reported.contains("renders no known object store"),
         "the refusal must say the target chart has no store to migrate into; stdout:\n{reported}"
     );
-    // The direct AC2 assertion (#1501): the guard and the export must render
-    // the chart with the SAME values. Pinning one `--set-string` would survive
-    // a mutation that threads only that value and drops the rest of the plan,
-    // and a real chart could then again disagree about which StatefulSets
-    // exist. Both halves build the command identically -- `helm template
-    // <release> <chart> -n <namespace> <value-plan args>` -- so the two
-    // full-chart renders must be byte-identical. `--show-only` renders are the
-    // priorityclass/preflight probes, not stateful-component detection. The one
-    // provably incidental difference is the per-call temp values file, whose
-    // name carries a fresh uuid, so that token alone is normalised.
-    let full_chart_renders: Vec<String> = calls
+    // UUID file names and the host TMPDIR are incidental. Compare every
+    // remaining argv token AND the captured YAML, so dropped values still fail.
+    let full_chart_renders: Vec<_> = calls
         .lines()
         .filter(|line| line.starts_with("HELM_CALL: template "))
         .filter(|line| !line.contains("--show-only"))
-        .map(|line| {
-            line.split_whitespace()
-                .map(|token| {
-                    if token.starts_with("/tmp/curie-helm-values-") {
-                        "<values-file>"
-                    } else {
-                        token
-                    }
-                })
-                .collect::<Vec<_>>()
-                .join(" ")
-        })
+        .map(|line| template_semantics(line, &capture_dir))
         .collect();
     assert!(
         full_chart_renders.len() >= 2,
@@ -5608,6 +5916,42 @@ fn diff_answers_the_same_against_an_explicitly_passed_chart() {
     );
 }
 
+fn assert_fake_model_is_only_set_by_gvisor_counterfactual(calls: &str) {
+    for call in calls.lines().filter(|call| call.contains("fakeModel")) {
+        assert!(
+            call.starts_with("HELM_CALL: template "),
+            "only the gVisor counterfactual render may set fakeModel:\n{call}"
+        );
+        let arguments: Vec<_> = call.split_whitespace().collect();
+        let templates: Vec<_> = arguments
+            .windows(2)
+            .filter(|pair| pair[0] == "--show-only")
+            .map(|pair| pair[1])
+            .collect();
+        assert_eq!(
+            templates,
+            ["templates/preflight-gvisor.yaml"],
+            "fakeModel may only override the gVisor preflight render:\n{call}"
+        );
+        let fake_model_arguments: Vec<_> = arguments
+            .iter()
+            .copied()
+            .filter(|argument| argument.contains("fakeModel"))
+            .collect();
+        assert_eq!(
+            fake_model_arguments,
+            ["agentSandbox.runner.fakeModel=false"],
+            "the counterfactual may only set fakeModel to false:\n{call}"
+        );
+        assert!(
+            arguments
+                .windows(2)
+                .any(|pair| pair == ["--set", "agentSandbox.runner.fakeModel=false"]),
+            "the counterfactual fakeModel override must use --set:\n{call}"
+        );
+    }
+}
+
 /// #2459: `--fake-model` must IGNORE a recorded BYO credential reference, not
 /// erase it.
 ///
@@ -5663,12 +6007,12 @@ fn fake_model_up_preserves_a_recorded_byo_credential_reference() {
         "the key travels with the name; half a reference is not one:\n{supplied}"
     );
 
-    // Preserving it must not turn the fake model back into the real one. The
-    // CLI only ever pins this key to `false`, so its absence is the assertion.
-    let visible = format!("{}\n{supplied}", fixture.calls());
+    // The gVisor counterfactual may render real-model admission requirements,
+    // but preserving the reference must not change the applied model mode.
+    assert_fake_model_is_only_set_by_gvisor_counterfactual(&fixture.calls());
     assert!(
-        !visible.contains("fakeModel"),
-        "--fake-model must not select the real model off the value it preserved:\n{visible}"
+        !supplied.contains("fakeModel"),
+        "--fake-model must not select the real model off the value it preserved:\n{supplied}"
     );
 }
 
@@ -5727,12 +6071,12 @@ fn fake_model_up_preserves_a_recorded_model_and_inline_credential() {
         "--fake-model must re-supply the recorded model id:\n{calls}"
     );
 
-    // The CLI only ever pins this key to `false`, so its absence is the
-    // assertion that the effective runner is still fake.
-    let visible = format!("{calls}\n{supplied}");
+    // Only the gVisor counterfactual render may override fakeModel. The applied
+    // values must still preserve fake mode.
+    assert_fake_model_is_only_set_by_gvisor_counterfactual(&calls);
     assert!(
-        !visible.contains("fakeModel"),
-        "--fake-model must not select the real model off the values it preserved:\n{visible}"
+        !supplied.contains("fakeModel"),
+        "--fake-model must not select the real model off the values it preserved:\n{supplied}"
     );
 }
 
@@ -5823,10 +6167,7 @@ fn plain_up_preserves_a_recorded_local_model_install() {
         calls.contains("inference.persistence.size=40Gi"),
         "a recorded PVC size must not shrink back to the chart default:\n{calls}"
     );
-    assert!(
-        !calls.contains("agentSandbox.runner.fakeModel=false"),
-        "inference is the model source; do not pin fakeModel off a blank credential:\n{calls}"
-    );
+    assert_fake_model_is_only_set_by_gvisor_counterfactual(&calls);
 }
 
 /// #2510: `CURIE_CREDENTIALS` after `--local-model` replaces the inference
@@ -5922,5 +6263,45 @@ fn fresh_cluster_up_does_not_invent_inference() {
     assert!(
         calls.contains("RUNNER_FRESH_FAKE_MODE: yes"),
         "a fresh install without a model source stays fake:\n{calls}"
+    );
+}
+
+/// #4626: `curie apply` does not detect cluster facts, so its dry run has no
+/// controller decision to state. The shared namespace header must not mention
+/// the controller Deployment, and the stamp stays conditional.
+#[test]
+fn apply_dry_run_plans_the_shared_namespace_without_a_controller_decision() {
+    let fixture = HelmFixture::new(
+        "version: 1\ninstall:\n  namespace: parity\n  release: parity\n",
+        HelmValuesResponse::Absent,
+    );
+    let apply = plan(fixture.apply_dry_run(&[]));
+    let lines: Vec<&str> = apply.lines().collect();
+    let header = "# not read under --dry-run: whether namespace agent-sandbox-system already exists; a live run checks it before helm runs";
+    let stamp = "#   if namespace agent-sandbox-system does not exist before helm runs and exists after: kubectl label namespace agent-sandbox-system curietech.ai/created-by=parity curietech.ai/created-in=parity --overwrite";
+    for expected in [header, stamp] {
+        assert_eq!(
+            lines.iter().filter(|line| **line == expected).count(),
+            1,
+            "apply must plan {expected:?} exactly once: {apply}"
+        );
+    }
+    assert!(
+        !lines
+            .iter()
+            .any(|line| line.contains("and Deployment agent-sandbox-controller already exist")),
+        "apply detects no controller facts, so it must not name the Deployment: {apply}"
+    );
+    assert!(
+        !lines
+            .iter()
+            .any(|line| line.contains("reuse it with agentSandbox.controller.deploy=false")),
+        "apply must not plan a controller reuse it never decides: {apply}"
+    );
+    assert!(
+        !lines
+            .iter()
+            .any(|line| line.starts_with("kubectl label namespace")),
+        "apply must not plan an unconditional namespace stamp: {apply}"
     );
 }

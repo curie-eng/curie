@@ -28,10 +28,26 @@ from typing import Any
 import pytest
 import redis
 from aci_protocol import STREAM_PAYLOAD_FIELD
-from curie_api import bundles, crud
+from curie_api import bundles
 from curie_api.config import get_settings
+from curie_api.crud import (
+    agents as crud_agents,
+)
+from curie_api.crud import (
+    deployments as crud_deployments,
+)
+from curie_api.crud import (
+    versions as crud_versions,
+)
+from curie_api.db import create_sessionmaker
 from curie_api.deps import get_eval_queue
+from curie_api.github_review_audit import claim_push_delivery, settle_push_delivery
+from curie_api.routers import github as github_router
+from curie_api.storage import BundleStore
+from curie_telemetry import build_resource, configure_meter_provider
 from curie_test_support.scaffold import scaffolded_deploy_yaml
+from opentelemetry.sdk.metrics import MeterProvider
+from opentelemetry.sdk.metrics.export import InMemoryMetricReader
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
@@ -132,7 +148,16 @@ def _build_bare_repo_with_pull_only_commit(
     return clone_url, pull_sha
 
 
-def _post(client: Any, event: str, payload: dict[str, Any], secret: str = SECRET) -> Any:
+def _post(
+    client: Any,
+    event: str,
+    payload: dict[str, Any],
+    secret: str = SECRET,
+    *,
+    delivery: str | None = None,
+) -> Any:
+    """Sign and post one delivery; each call is a fresh delivery id unless one is given."""
+
     body = json.dumps(payload).encode()
     sig = "sha256=" + hmac.new(secret.encode(), body, hashlib.sha256).hexdigest()
     return client.post(
@@ -140,6 +165,7 @@ def _post(client: Any, event: str, payload: dict[str, Any], secret: str = SECRET
         content=body,
         headers={
             "X-GitHub-Event": event,
+            "X-GitHub-Delivery": delivery or str(uuid.uuid4()),
             "X-Hub-Signature-256": sig,
             "Content-Type": "application/json",
         },
@@ -165,7 +191,7 @@ def _insert_partial_version(agent_id: str, sha: str) -> None:
         engine = create_async_engine(get_settings().database_url)
         maker = async_sessionmaker(engine, expire_on_commit=False)
         async with maker() as session:
-            await crud.create_version_row(
+            await crud_versions.create_version_row(
                 session,
                 uuid.UUID(agent_id),
                 version_label=sha[:12],
@@ -245,6 +271,36 @@ class _RecordingEvalQueue:
     async def enqueue(self, job: Any) -> str:
         self.jobs.append(job)
         return f"0-{len(self.jobs)}"
+
+
+def _notice_cursor() -> str:
+    """Remember the private Valkey stream tail without erasing another test's rows."""
+
+    settings = get_settings()
+    stream = settings.deploy_notice_stream_name()
+    with redis.Redis(
+        host=settings.valkey_host,
+        port=settings.valkey_port,
+        password=settings.valkey_password,
+    ) as valkey:
+        info = (
+            valkey.xinfo_stream(stream)
+            if valkey.exists(stream)
+            else None
+        )
+        return str(info["last-generated-id"], "ascii") if info is not None else "0-0"
+
+
+def _notices_after(cursor: str) -> list[dict[str, Any]]:
+    settings = get_settings()
+    stream = settings.deploy_notice_stream_name()
+    with redis.Redis(
+        host=settings.valkey_host,
+        port=settings.valkey_port,
+        password=settings.valkey_password,
+    ) as valkey:
+        entries = valkey.xrange(stream, min=f"({cursor}")
+    return [json.loads(fields[b"payload"]) for _, fields in entries]
 
 
 def _delete_bare_repo(base_dir: Path, repo_full_name: str = REPO) -> None:
@@ -376,6 +432,693 @@ def test_signed_push_rejects_an_invalid_legacy_repository_binding(
     )
 
 
+def test_case_only_repository_binding_miss_is_a_rejection(
+    client: Any,
+    auth_headers: dict[str, str],
+    clean_db: None,
+    trusted_clone_base: Path,
+) -> None:
+    """A canonical-casing error must be visible in GitHub's delivery body."""
+
+    agent_id = _register_agent(client, auth_headers)
+    clone_url, sha = _build_bare_repo(trusted_clone_base, REPO, VALID_FILES)
+    payload = _push_payload("refs/heads/dev", sha, clone_url)
+    payload["repository"]["full_name"] = "Octo/Demo-Agent"
+    cursor = _notice_cursor()
+
+    response = _post(client, "push", payload)
+
+    assert response.status_code == 200
+    assert response.json()["status"] == "rejected"
+    assert {error["code"] for error in response.json()["errors"]} == {
+        "git.repository_case_mismatch"
+    }
+    assert [notice["codes"] for notice in _notices_after(cursor)] == [
+        ["git.repository_case_mismatch"]
+    ]
+    assert client.get(f"/agents/{agent_id}/versions", headers=auth_headers).json() == []
+
+    payload["repository"]["full_name"] = "octo/unrelated"
+    unrelated = _post(client, "push", payload)
+    assert unrelated.status_code == 200
+    assert unrelated.json()["status"] == "ignored"
+
+
+def test_success_notice_requires_opt_in_and_is_deduplicated(
+    client: Any,
+    auth_headers: dict[str, str],
+    clean_db: None,
+    trusted_clone_base: Path,
+) -> None:
+    agent_id = _register_agent(client, auth_headers)
+    clone_url, sha = _build_bare_repo(trusted_clone_base, REPO, VALID_FILES)
+    payload = _push_payload("refs/heads/dev", sha, clone_url)
+
+    cursor = _notice_cursor()
+    assert _post(client, "push", payload).json()["status"] == "deployed"
+    assert _notices_after(cursor) == []
+
+    changed = client.patch(
+        f"/agents/{agent_id}",
+        json={"deploy_notifications": True},
+        headers=auth_headers,
+    )
+    assert changed.status_code == 200
+    assert changed.json()["deploy_notifications"] is True
+
+    # A new commit, because a notice announces a change of the active
+    # version; re-pushing the active sha changes nothing.
+    sha = _push_commit(
+        trusted_clone_base,
+        {"skills/gamma/SKILL.md": "---\nname: gamma\ndescription: does gamma\n---\n"},
+    )
+    payload = _push_payload("refs/heads/dev", sha, clone_url)
+    cursor = _notice_cursor()
+    assert _post(client, "push", payload).json()["status"] == "deployed"
+    notices = _notices_after(cursor)
+    assert len(notices) == 1
+    assert notices[0]["address"] == "C000000G01"
+    assert notices[0]["identity"] == "default"
+    assert notices[0]["agent_name"] == "gitflow-agent"
+    assert notices[0]["status"] == "deployed"
+    assert notices[0]["sha"] == sha
+
+    cursor = _notice_cursor()
+    assert _post(client, "push", payload).json()["status"] == "deployed"
+    assert _notices_after(cursor) == []
+
+
+def test_rollback_to_an_announced_sha_is_announced_again(
+    client: Any,
+    auth_headers: dict[str, str],
+    clean_db: None,
+    trusted_clone_base: Path,
+) -> None:
+    """A to B to A: the channel must hear that A is live again.
+
+    A notice follows each deployment that changes the active version. The
+    redelivery of an already-active push changes nothing and stays quiet
+    (the dedupe test above), but a rollback to a sha the channel already heard
+    about is a real change underneath its users (#1309 supports exactly that
+    rollback), and a content-only dedupe key swallowed it.
+    """
+
+    agent_id = _register_agent(client, auth_headers)
+    changed = client.patch(
+        f"/agents/{agent_id}", json={"deploy_notifications": True}, headers=auth_headers
+    )
+    assert changed.status_code == 200
+    clone_url, first_sha = _build_bare_repo(trusted_clone_base, REPO, VALID_FILES)
+
+    cursor = _notice_cursor()
+    first = _post(client, "push", _push_payload("refs/heads/dev", first_sha, clone_url)).json()
+    assert first["status"] == "deployed", first
+    second_sha = _push_commit(
+        trusted_clone_base,
+        {"skills/gamma/SKILL.md": "---\nname: gamma\ndescription: does gamma\n---\n"},
+    )
+    second = _post(client, "push", _push_payload("refs/heads/dev", second_sha, clone_url)).json()
+    assert second["status"] == "deployed", second
+    rollback = _post(client, "push", _push_payload("refs/heads/dev", first_sha, clone_url)).json()
+    assert rollback["status"] == "deployed", rollback
+    redelivery = _post(
+        client, "push", _push_payload("refs/heads/dev", first_sha, clone_url)
+    ).json()
+    assert redelivery["status"] == "deployed", redelivery
+
+    assert [notice["sha"] for notice in _notices_after(cursor)] == [
+        first_sha,
+        second_sha,
+        first_sha,
+    ]
+
+
+def test_success_notice_reloads_opt_in_and_binding_after_push_started(
+    client: Any,
+    auth_headers: dict[str, str],
+    clean_db: None,
+) -> None:
+    """A slow clone must not notify a channel removed during that clone."""
+    from curie_api.deploy_notice import DeployNoticeQueue
+    from curie_api.models import Agent, AgentChannel
+    from curie_api.schemas.deployments import WebhookResult
+    from redis.asyncio import Redis
+    from sqlalchemy import update
+
+    agent_id = _register_agent(client, auth_headers)
+    stream = f"test:deploy-notices:{uuid.uuid4()}"
+    sha = "a" * 40
+
+    async def exercise() -> None:
+        settings = get_settings()
+        engine = create_async_engine(settings.database_url)
+        maker = async_sessionmaker(engine, expire_on_commit=False)
+        valkey = Redis.from_url(settings.valkey_dsn(), decode_responses=True)
+        try:
+            async with maker() as stale, maker() as writer:
+                agent = await crud_agents.get_agent(stale, uuid.UUID(agent_id))
+                assert agent is not None
+                assert agent.deploy_notifications is False
+                assert [binding.address for binding in agent.channels] == ["C000000G01"]
+                await writer.execute(
+                    update(Agent)
+                    .where(Agent.id == agent.id)
+                    .values(deploy_notifications=True)
+                )
+                await writer.execute(
+                    update(AgentChannel)
+                    .where(AgentChannel.agent_id == agent.id)
+                    .values(address="C0EXAMPLE2")
+                )
+                await writer.commit()
+
+                result = WebhookResult(status="deployed", agent_id=agent.id, commit_sha=sha)
+                payload = _push_payload("refs/heads/dev", sha, "file:///unused")
+                count = await DeployNoticeQueue(valkey, stream).publish(
+                    stale,
+                    result,
+                    payload,
+                    settings,
+                )
+                assert count == 1
+                notices = await valkey.xrange(stream)
+                assert len(notices) == 1
+                assert json.loads(notices[0][1]["payload"])["address"] == "C0EXAMPLE2"
+                # Two installations may use the same repository and binding
+                # with one shared Valkey; dedupe must not suppress either lane.
+                other_stream = f"{stream}:other-installation"
+                other_count = await DeployNoticeQueue(valkey, other_stream).publish(
+                    stale, result, payload, settings
+                )
+                assert other_count == 1
+                assert len(await valkey.xrange(other_stream)) == 1
+        finally:
+            await valkey.aclose()
+            await engine.dispose()
+
+    asyncio.run(exercise())
+
+
+def test_notice_stream_and_group_follow_the_api_worker_installation_contract() -> None:
+    from curie_api.config import Settings
+    from curie_worker.config import WorkerConfig
+
+    first_api = Settings.model_construct(
+        runs_stream="tenant-one:runs",
+        runs_consumer_group="tenant-workers",
+        installation_id="installation-one",
+    )
+    first_worker = WorkerConfig.model_construct(
+        stream="tenant-one:runs",
+        consumer_group="tenant-workers",
+        installation_id="installation-one",
+    )
+    second_api = Settings.model_construct(
+        runs_stream="tenant-one:runs",
+        runs_consumer_group="tenant-workers",
+        installation_id="installation-two",
+    )
+    other_stream_api = Settings.model_construct(
+        runs_stream="tenant-two:runs",
+        runs_consumer_group="tenant-workers",
+        installation_id="installation-one",
+    )
+
+    assert first_api.deploy_notice_stream_name() == first_worker.deploy_notice_stream_name()
+    assert first_api.deploy_notice_group_name() == first_worker.deploy_notice_group_name()
+    assert first_api.deploy_notice_stream_name() != second_api.deploy_notice_stream_name()
+    assert first_api.deploy_notice_stream_name() != other_stream_api.deploy_notice_stream_name()
+
+
+def test_notice_enqueue_error_does_not_poison_retry_dedupe(valkey: redis.Redis) -> None:
+    """A failed XADD must not leave a marker that suppresses later recovery."""
+    from curie_api.deploy_notice import _PUBLISH_ONCE
+    from redis.exceptions import ResponseError
+
+    token = uuid.uuid4().hex
+    marker = f"test:deploy-notice:marker:{token}"
+    stream = f"test:deploy-notice:stream:{token}"
+    valkey.set(stream, "wrong-type")
+    try:
+        with pytest.raises(ResponseError):
+            valkey.eval(_PUBLISH_ONCE, 2, marker, stream, 60, '{"status":"rejected"}')
+        assert not valkey.exists(marker)
+        valkey.delete(stream)
+        assert valkey.eval(_PUBLISH_ONCE, 2, marker, stream, 60, '{"status":"rejected"}')
+        assert valkey.xlen(stream) == 1
+    finally:
+        valkey.delete(marker, stream)
+
+
+def test_notice_outbox_recovers_after_valkey_outage_and_api_restart(
+    client: Any,
+    auth_headers: dict[str, str],
+    clean_db: None,
+) -> None:
+    """The recipient decision survives an unavailable stream and queue restart."""
+    from curie_api.deploy_notice import DeployNoticeQueue
+    from curie_api.models import DeployNoticeOutbox
+    from curie_api.schemas.deployments import WebhookResult
+    from redis.asyncio import Redis
+    from sqlalchemy import select
+
+    _register_agent(client, auth_headers)
+    stream = f"test:deploy-notice:outbox:{uuid.uuid4().hex}"
+    payload = _push_payload("refs/heads/dev", "a" * 40, "file:///unused")
+
+    async def exercise() -> None:
+        settings = get_settings()
+        engine = create_async_engine(settings.database_url)
+        maker = async_sessionmaker(engine, expire_on_commit=False)
+        valkey = Redis.from_url(settings.valkey_dsn(), decode_responses=True)
+        try:
+            await valkey.set(stream, "wrong-type")
+            queue = DeployNoticeQueue(valkey, stream)
+            async with maker() as session:
+                assert await queue.publish(
+                    session,
+                    WebhookResult(
+                        status="rejected",
+                        errors=[{"code": "git.archive_failed"}],
+                    ),
+                    payload,
+                    settings,
+                ) == 0
+                rows = list(await session.scalars(select(DeployNoticeOutbox)))
+                assert len(rows) == 1
+                assert rows[0].enqueued_at is None
+                assert rows[0].stream == stream
+                assert rows[0].attempts == 1
+                assert json.loads(rows[0].payload)["notice_key"] == rows[0].key
+
+            await valkey.delete(stream)
+            restarted = DeployNoticeQueue(valkey, stream)
+            async with maker() as session:
+                assert await restarted.reconcile_once(session) == 1
+            async with maker() as session:
+                row = await session.scalar(select(DeployNoticeOutbox))
+                assert row is not None and row.enqueued_at is not None
+                assert row.attempts == 2
+            async with maker() as session:
+                assert await restarted.reconcile_once(session) == 0
+            async with maker() as session:
+                assert await restarted.publish(
+                    session,
+                    WebhookResult(
+                        status="rejected",
+                        errors=[{"code": "git.archive_failed"}],
+                    ),
+                    payload,
+                    settings,
+                ) == 0
+            assert await valkey.xlen(stream) == 1
+            notice = json.loads((await valkey.xrange(stream))[0][1]["payload"])
+            assert notice["status"] == "rejected"
+            assert notice["agent_name"] == "gitflow-agent"
+            assert notice["notice_key"] == row.key
+        finally:
+            await valkey.delete(stream)
+            await valkey.aclose()
+            await engine.dispose()
+
+    asyncio.run(exercise())
+
+
+def test_notice_marker_lasts_beyond_outbox_retention() -> None:
+    from curie_api.deploy_notice import _DEDUP_TTL_SECONDS, _OUTBOX_RETENTION
+
+    assert _DEDUP_TTL_SECONDS > _OUTBOX_RETENTION.total_seconds()
+
+
+@pytest.fixture
+def notice_metrics(client: Any) -> Iterator[tuple[MeterProvider, InMemoryMetricReader]]:
+    reader = InMemoryMetricReader()
+    provider = MeterProvider(
+        metric_readers=[reader],
+        resource=build_resource(
+            "curie-api",
+            service_version="0.0.0-test",
+            service_instance_id="acme-api-notice-test",
+            deployment_environment="test",
+        ),
+    )
+    original = client.app.state.telemetry.meter_provider
+    configure_meter_provider(provider)
+    try:
+        yield provider, reader
+    finally:
+        configure_meter_provider(original)
+        provider.shutdown()
+
+
+def _suppressed_counts(
+    metrics: tuple[MeterProvider, InMemoryMetricReader],
+) -> dict[str, int]:
+    provider, reader = metrics
+    assert provider.force_flush(timeout_millis=5000)
+    data = reader.get_metrics_data()
+    counts: dict[str, int] = {}
+    if data is None:
+        return counts
+    for resource_metrics in data.resource_metrics:
+        for scope_metrics in resource_metrics.scope_metrics:
+            for metric in scope_metrics.metrics:
+                if metric.name != "curie.deploy_notice.suppressed":
+                    continue
+                for point in metric.data.data_points:
+                    counts[str(point.attributes["reason"])] = int(point.value)
+    return counts
+
+
+def test_an_unmatched_rejection_never_posts_in_a_prod_bound_channel(
+    client: Any,
+    auth_headers: dict[str, str],
+    clean_db: None,
+    trusted_clone_base: Path,
+    notice_metrics: tuple[MeterProvider, InMemoryMetricReader],
+) -> None:
+    """A dev bot and a prod bot share a repository (ADR-0091).
+
+    `git.archive_failed` is decided before the push names its agent, so it may
+    belong to either; it must reach only the dev bot's channel, never the
+    channel of the agent with an active prod deployment.
+    """
+
+    _register(client, auth_headers, "two-agent-dev", "C000000D01")
+    prod_id = _register(client, auth_headers, "two-agent-prod", "C000000E01")
+    clone_url, sha = _build_bare_repo(trusted_clone_base, REPO, TWO_TARGET_FILES)
+    dev = _post(client, "push", _push_payload("refs/heads/dev", sha, clone_url)).json()
+    assert dev["status"] == "deployed", dev
+    prod = _post(client, "push", _push_payload("refs/heads/main", sha, clone_url)).json()
+    assert prod["status"] == "promoted", prod
+    assert prod["agent_id"] == prod_id
+    _delete_bare_repo(trusted_clone_base)
+    cursor = _notice_cursor()
+
+    rejected = _post(
+        client, "push", _push_payload("refs/heads/dev", "c" * 40, clone_url)
+    ).json()
+
+    assert rejected["status"] == "rejected", rejected
+    assert rejected["agent_id"] is None, rejected
+    assert {error["code"] for error in rejected["errors"]} == {"git.archive_failed"}
+    assert [
+        (notice["address"], notice["agent_name"]) for notice in _notices_after(cursor)
+    ] == [("C000000D01", "two-agent-dev")]
+    assert _suppressed_counts(notice_metrics) == {}
+
+
+@pytest.mark.parametrize("remove_bindings", [False, True])
+def test_an_unmatched_rejection_with_only_prod_channels_is_logged_and_counted(
+    client: Any,
+    auth_headers: dict[str, str],
+    clean_db: None,
+    trusted_clone_base: Path,
+    notice_metrics: tuple[MeterProvider, InMemoryMetricReader],
+    caplog: pytest.LogCaptureFixture,
+    remove_bindings: bool,
+) -> None:
+    """@spec docs/operations.md#automatically-with-git-flow.
+
+    One agent serves dev and prod from one channel: that channel is prod.
+
+    The rejection must post nothing there, and it must still be findable: one
+    WARNING naming the repository and code, and one counted suppression.
+    """
+
+    _register_agent(client, auth_headers)
+    clone_url, sha = _build_bare_repo(trusted_clone_base, REPO, VALID_FILES)
+    assert _post(client, "push", _push_payload("refs/heads/dev", sha, clone_url)).json()[
+        "status"
+    ] == "deployed"
+    assert _post(client, "push", _push_payload("refs/heads/main", sha, clone_url)).json()[
+        "status"
+    ] == "promoted"
+    _delete_bare_repo(trusted_clone_base)
+    if remove_bindings:
+        # No Slack recipient is still an observable suppression for this repo.
+        async def remove_channels() -> None:
+            engine = create_async_engine(get_settings().database_url)
+            try:
+                async with engine.begin() as session:
+                    await session.execute(text("DELETE FROM curie.agent_channels"))
+            finally:
+                await engine.dispose()
+
+        asyncio.run(remove_channels())
+    cursor = _notice_cursor()
+
+    with caplog.at_level("WARNING", logger="curie_api.deploy_notice"):
+        rejected = _post(
+            client, "push", _push_payload("refs/heads/dev", "d" * 40, clone_url)
+        )
+
+    assert rejected.status_code == 200
+    assert rejected.json()["status"] == "rejected"
+    assert _notices_after(cursor) == []
+    withheld = [
+        record.getMessage()
+        for record in caplog.records
+        if record.name == "curie_api.deploy_notice" and "no non-prod" in record.getMessage()
+    ]
+    assert len(withheld) == 1, withheld
+    assert REPO in withheld[0] and "git.archive_failed" in withheld[0], withheld
+    assert _suppressed_counts(notice_metrics) == {"no_nonprod_recipient": 1}
+
+
+def test_concurrent_rejections_share_one_repository_notice_budget(
+    client: Any,
+    auth_headers: dict[str, str],
+    clean_db: None,
+) -> None:
+    """@spec docs/operations.md#automatically-with-git-flow."""
+    from curie_api.deploy_notice import DeployNoticeQueue
+    from curie_api.schemas.deployments import WebhookResult
+    from redis.asyncio import Redis
+
+    _register_agent(client, auth_headers)
+    stream = f"test:deploy-notice:concurrent:{uuid.uuid4().hex}"
+
+    async def exercise() -> None:
+        settings = get_settings()
+        engine = create_async_engine(settings.database_url)
+        maker = async_sessionmaker(engine, expire_on_commit=False)
+        valkey = Redis.from_url(settings.valkey_dsn(), decode_responses=True)
+        queue = DeployNoticeQueue(valkey, stream)
+
+        async def publish(n: int) -> int:
+            async with maker() as session:
+                return await queue.publish(
+                    session,
+                    WebhookResult(status="rejected", errors=[{"code": "git.archive_failed"}]),
+                    _push_payload("refs/heads/dev", f"{n:040x}", "file:///unused"),
+                    settings,
+                )
+
+        try:
+            published = await asyncio.gather(*(publish(n) for n in range(21)))
+            assert sum(published) == 20
+            assert published.count(0) == 1
+            assert await valkey.xlen(stream) == 20
+            async with maker() as session:
+                count = await session.scalar(
+                    text("SELECT count(*) FROM curie.deploy_notice_outbox WHERE stream = :stream"),
+                    {"stream": stream},
+                )
+                assert count == 20
+        finally:
+            await valkey.delete(stream)
+            await engine.dispose()
+
+    asyncio.run(exercise())
+
+
+def test_deploy_notices_are_bounded_per_repository(
+    client: Any,
+    auth_headers: dict[str, str],
+    clean_db: None,
+    notice_metrics: tuple[MeterProvider, InMemoryMetricReader],
+) -> None:
+    """At most 20 notices per repository per rolling hour (docs/operations.md).
+
+    Forged rejections for fresh shas are exactly what a webhook-secret holder
+    can send. The 21st is withheld and counted; a redelivered outcome adds
+    nothing and is not counted; another repository keeps its own budget; and
+    notices older than the window stop counting.
+    """
+    from curie_api.deploy_notice import DeployNoticeQueue
+    from curie_api.schemas.deployments import WebhookResult
+    from redis.asyncio import Redis
+
+    _register_agent(client, auth_headers)
+    other = client.post(
+        "/agents",
+        json={
+            "name": "other-repo-agent",
+            "channel": {"kind": "slack", "address": "C0EXAMPLE3"},
+            "repo_full_name": "octo/other-agent",
+        },
+        headers=auth_headers,
+    )
+    assert other.status_code == 201, other.text
+    stream = f"test:deploy-notice:bound:{uuid.uuid4().hex}"
+    rejected = WebhookResult(status="rejected", errors=[{"code": "git.archive_failed"}])
+    # A case-variant repository name arrives as this rejection (see
+    # test_case_only_repository_binding_miss_is_a_rejection).
+    case_mismatch = WebhookResult(
+        status="rejected", errors=[{"code": "git.repository_case_mismatch"}]
+    )
+
+    def payload_for(sha: str, repository: str = REPO) -> dict[str, Any]:
+        payload = _push_payload("refs/heads/dev", sha, "file:///unused")
+        payload["repository"]["full_name"] = repository
+        return payload
+
+    async def exercise() -> None:
+        settings = get_settings()
+        engine = create_async_engine(settings.database_url)
+        maker = async_sessionmaker(engine, expire_on_commit=False)
+        valkey = Redis.from_url(settings.valkey_dsn(), decode_responses=True)
+        queue = DeployNoticeQueue(valkey, stream)
+        try:
+            async with maker() as session:
+                for n in range(20):
+                    published = await queue.publish(
+                        session, rejected, payload_for(f"{n:040x}"), settings
+                    )
+                    assert published == 1, n
+                assert await queue.publish(
+                    session, rejected, payload_for(f"{20:040x}"), settings
+                ) == 0
+                # A different casing is the same GitHub repository.
+                assert await queue.publish(
+                    session, case_mismatch, payload_for(f"{21:040x}", REPO.upper()), settings
+                ) == 0
+                assert _suppressed_counts(notice_metrics) == {"rate_limited": 2}
+                # Redelivering a recorded outcome adds nothing and is not counted.
+                assert await queue.publish(
+                    session, rejected, payload_for(f"{0:040x}"), settings
+                ) == 0
+                assert _suppressed_counts(notice_metrics) == {"rate_limited": 2}
+                assert await queue.publish(
+                    session, rejected, payload_for("e" * 40, "octo/other-agent"), settings
+                ) == 1
+                assert await valkey.xlen(stream) == 21
+                await session.execute(
+                    text(
+                        "UPDATE curie.deploy_notice_outbox "
+                        "SET created_at = now() - interval '61 minutes' "
+                        "WHERE stream = :stream"
+                    ),
+                    {"stream": stream},
+                )
+                await session.commit()
+                assert await queue.publish(
+                    session, rejected, payload_for(f"{22:040x}"), settings
+                ) == 1
+        finally:
+            await valkey.delete(stream)
+            await valkey.aclose()
+            await engine.dispose()
+
+    asyncio.run(exercise())
+
+
+def test_notice_reconciler_is_on_by_default_and_the_suite_turns_it_off(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Production must retry pending notices; only this suite opts out."""
+    from curie_api.config import Settings
+
+    assert os.environ["CURIE_DEPLOY_NOTICE_RECONCILER_ENABLED"] == "false"
+    assert Settings().deploy_notice_reconciler_enabled is False
+    monkeypatch.delenv("CURIE_DEPLOY_NOTICE_RECONCILER_ENABLED")
+    assert Settings().deploy_notice_reconciler_enabled is True
+
+
+def test_suite_app_runs_no_background_notice_reconciler(client: Any) -> None:
+    assert client.app.state.deploy_notice_reconciler_task is None
+    assert client.app.state.deploy_notice_queue is not None
+
+
+def test_webhook_reports_outbox_persistence_failure_instead_of_false_success(
+    client: Any,
+    auth_headers: dict[str, str],
+    clean_db: None,
+) -> None:
+    _register_agent(client, auth_headers)
+    payload = _push_payload("refs/heads/dev", "a" * 40, "file:///unused")
+    payload["repository"]["full_name"] = "Octo/Demo-Agent"
+    async def rename(statement: str) -> None:
+        engine = create_async_engine(get_settings().database_url)
+        try:
+            async with engine.begin() as connection:
+                await connection.execute(text(statement))
+        finally:
+            await engine.dispose()
+
+    try:
+        asyncio.run(
+            rename(
+                "ALTER TABLE curie.deploy_notice_outbox "
+                "RENAME TO deploy_notice_outbox_temporarily_unavailable"
+            )
+        )
+        response = _post(client, "push", payload)
+        assert response.status_code == 503
+        detail = response.json()["detail"]
+        assert detail["code"] == "git.notice_outbox_unavailable"
+        # GitHub's delivery body must still say what the push itself did, or a
+        # 503 hides the deploy outcome this issue is about.
+        assert detail["result"]["status"] == "rejected"
+        assert [error["code"] for error in detail["result"]["errors"]] == [
+            "git.repository_case_mismatch"
+        ]
+    finally:
+        asyncio.run(
+            rename(
+                "ALTER TABLE curie.deploy_notice_outbox_temporarily_unavailable "
+                "RENAME TO deploy_notice_outbox"
+            )
+        )
+
+    retry = _post(client, "push", payload)
+    assert retry.status_code == 200
+    assert retry.json()["status"] == "rejected"
+
+
+def test_archive_rejection_notifies_without_success_opt_in(
+    client: Any,
+    auth_headers: dict[str, str],
+    clean_db: None,
+    trusted_clone_base: Path,
+) -> None:
+    agent_id = _register_agent(client, auth_headers)
+    added = client.post(
+        f"/agents/{agent_id}/channels",
+        json={"kind": "slack", "address": "C0EXAMPLE2", "adapter": "default"},
+        headers=auth_headers,
+    )
+    assert added.status_code == 201, added.text
+    clone_url, sha = _build_bare_repo(trusted_clone_base, REPO, VALID_FILES)
+    _delete_bare_repo(trusted_clone_base)
+    cursor = _notice_cursor()
+
+    response = _post(client, "push", _push_payload("refs/heads/dev", sha, clone_url))
+
+    assert response.status_code == 200
+    assert response.json()["status"] == "rejected"
+    notices = _notices_after(cursor)
+    assert {(notice["address"], notice["identity"]) for notice in notices} == {
+        ("C000000G01", "default"),
+        ("C0EXAMPLE2", "default"),
+    }
+    assert all(notice["status"] == "rejected" for notice in notices)
+    assert all(notice["codes"] == ["git.archive_failed"] for notice in notices)
+    assert all(notice["sha"] == sha for notice in notices)
+    assert client.get(f"/agents/{agent_id}/versions", headers=auth_headers).json() == []
+
+
 def test_patched_repo_binding_routes_a_push(
     client: Any,
     auth_headers: dict[str, str],
@@ -482,7 +1225,13 @@ def test_patch_omitting_repo_full_name_leaves_the_binding_intact(
         "a channel write must leave the repository binding unchanged"
     )
     assert fetched.json()["channels"] == [
-        {"kind": "slack", "address": "C0EXAMPLE4", "adapter": "default", "allowed_callers": None}
+        {
+            "kind": "slack",
+            "address": "C0EXAMPLE4",
+            "adapter": "default",
+            "allowed_callers": None,
+            "trigger_label": None,
+        }
     ], "the channel write must still take effect"
 
 
@@ -871,7 +1620,10 @@ def test_a_redelivered_dev_push_reuses_the_version_without_rebuilding(
     GitHub redelivers a webhook whenever the first attempt looks unhealthy, and
     an operator can redeliver by hand from the deliveries UI. The version is
     already built and stored, so the second delivery must reuse that row rather
-    than build a second one or fan out a second eval.
+    than build a second one or fan out a second eval. The two posts carry
+    distinct `X-GitHub-Delivery` ids, so this is the "new delivery id for the
+    same commit behaves as today" half of #3820; a replay of the SAME id is
+    `test_a_replayed_push_delivery_id_deploys_and_promotes_once`.
 
     What it must NOT claim is that the dev lane skips the clone. The dev lane
     deliberately still clones on every delivery, because the clone is where
@@ -923,6 +1675,337 @@ def test_a_redelivered_dev_push_reuses_the_version_without_rebuilding(
     ).json()
     assert [d["environment"] for d in deployments] == ["dev", "dev"], deployments
     assert {d["version_id"] for d in deployments} == {first["version_id"]}
+
+
+def test_a_replayed_push_delivery_id_deploys_and_promotes_once(
+    client: Any,
+    auth_headers: dict[str, str],
+    clean_db: None,
+    trusted_clone_base: Path,
+) -> None:
+    """A second POST with the same X-GitHub-Delivery does nothing (#3820).
+
+    A signed push replayed byte for byte, by GitHub or by anyone holding a
+    captured delivery, must not deploy or promote again. The dev replay and the
+    prod replay are both pinned, because they reach a Deployment row through
+    different paths (build versus stored-bundle reuse). The eval queue is
+    recorded across both dev posts so "one job" cannot pass by the fan-out
+    having stopped working.
+    """
+
+    agent_id = _register_agent(client, auth_headers)
+    clone_url, sha = _build_bare_repo(trusted_clone_base, REPO, VALID_FILES)
+    dev_delivery = str(uuid.uuid4())
+    prod_delivery = str(uuid.uuid4())
+
+    eval_queue = _RecordingEvalQueue()
+    client.app.dependency_overrides[get_eval_queue] = lambda: eval_queue
+    try:
+        dev_payload = _push_payload("refs/heads/dev", sha, clone_url)
+        first = _post(client, "push", dev_payload, delivery=dev_delivery)
+        replay = _post(client, "push", dev_payload, delivery=dev_delivery)
+
+        prod_payload = _push_payload("refs/heads/main", sha, clone_url)
+        promoted = _post(client, "push", prod_payload, delivery=prod_delivery)
+        prod_replay = _post(client, "push", prod_payload, delivery=prod_delivery)
+    finally:
+        client.app.dependency_overrides.pop(get_eval_queue, None)
+
+    assert first.status_code == 200, first.text
+    assert first.json()["status"] == "deployed", first.json()
+    assert replay.status_code == 200, replay.text
+    assert replay.json()["status"] == "push_duplicate", replay.json()
+    assert replay.json()["version_id"] is None
+    assert replay.json()["deployment_id"] is None
+    assert len(eval_queue.jobs) == 1, "a replayed delivery must not fan out a second eval"
+
+    assert promoted.json()["status"] == "promoted", promoted.json()
+    assert prod_replay.status_code == 200, prod_replay.text
+    assert prod_replay.json()["status"] == "push_duplicate", prod_replay.json()
+    assert prod_replay.json()["deployment_id"] is None
+
+    deployments = client.get(
+        "/deployments", params={"agent_id": agent_id}, headers=auth_headers
+    ).json()
+    assert sorted(d["environment"] for d in deployments) == ["dev", "prod"], deployments
+    assert {d["id"] for d in deployments} == {
+        first.json()["deployment_id"],
+        promoted.json()["deployment_id"],
+    }
+
+
+def test_a_push_delivery_id_is_case_folded_and_otherwise_canonical(
+    client: Any,
+    auth_headers: dict[str, str],
+    clean_db: None,
+    trusted_clone_base: Path,
+) -> None:
+    """A push must name its delivery in canonical form, or nothing can dedupe it.
+
+    Case is folded, the same rule the review arm applies, so the uppercase
+    spelling of a spent id is the same delivery and answers `push_duplicate`.
+    Any other spelling (braces, urn:) or a missing header is refused rather
+    than given a second receipt to replay under.
+    """
+
+    agent_id = _register_agent(client, auth_headers)
+    clone_url, sha = _build_bare_repo(trusted_clone_base, REPO, VALID_FILES)
+    payload = _push_payload("refs/heads/dev", sha, clone_url)
+    delivery = str(uuid.uuid4())
+
+    first = _post(client, "push", payload, delivery=delivery)
+    assert first.json()["status"] == "deployed", first.text
+
+    uppercase = _post(client, "push", payload, delivery=delivery.upper())
+    assert uppercase.status_code == 200, uppercase.text
+    assert uppercase.json()["status"] == "push_duplicate", uppercase.text
+
+    braced = _post(client, "push", payload, delivery="{" + delivery + "}")
+    assert braced.status_code == 400, braced.text
+    assert braced.json()["detail"] == {"code": "invalid_delivery"}
+
+    body = json.dumps(payload).encode()
+    missing = client.post(
+        "/github/webhook",
+        content=body,
+        headers={
+            "X-GitHub-Event": "push",
+            "X-Hub-Signature-256": "sha256="
+            + hmac.new(SECRET.encode(), body, hashlib.sha256).hexdigest(),
+            "Content-Type": "application/json",
+        },
+    )
+    assert missing.status_code == 400, missing.text
+    assert missing.json()["detail"] == {"code": "invalid_delivery"}
+
+    deployments = client.get(
+        "/deployments", params={"agent_id": agent_id}, headers=auth_headers
+    ).json()
+    assert [d["id"] for d in deployments] == [first.json()["deployment_id"]]
+
+
+def test_a_reused_delivery_id_with_a_different_body_is_ignored(
+    client: Any,
+    auth_headers: dict[str, str],
+    clean_db: None,
+    trusted_clone_base: Path,
+) -> None:
+    """One delivery id binds one body; a different body under it does nothing."""
+
+    agent_id = _register_agent(client, auth_headers)
+    clone_url, sha = _build_bare_repo(trusted_clone_base, REPO, VALID_FILES)
+    delivery = str(uuid.uuid4())
+
+    first = _post(
+        client, "push", _push_payload("refs/heads/dev", sha, clone_url), delivery=delivery
+    )
+    assert first.json()["status"] == "deployed", first.json()
+
+    reused = _post(
+        client, "push", _push_payload("refs/heads/main", sha, clone_url), delivery=delivery
+    )
+    assert reused.status_code == 200, reused.text
+    assert reused.json()["status"] == "ignored", reused.json()
+    assert reused.json()["errors"] == [{"code": "delivery_identity_conflict"}]
+
+    deployments = client.get(
+        "/deployments", params={"agent_id": agent_id}, headers=auth_headers
+    ).json()
+    assert [d["environment"] for d in deployments] == ["dev"], deployments
+
+
+def test_a_redelivery_of_an_ignored_push_with_the_same_id_still_deploys(
+    client: Any,
+    auth_headers: dict[str, str],
+    clean_db: None,
+    trusted_clone_base: Path,
+) -> None:
+    """Only a delivery that deployed or promoted is spent.
+
+    GitHub's Redeliver button reuses the original X-GitHub-Delivery id, and the
+    #2436 repair is "fix the cause, redeliver the same sha". So a delivery that
+    was ignored (here: no agent bound to the repository yet) must still deploy
+    when redelivered under the same id once the cause is fixed. A third post is
+    then the duplicate, which proves the receipt settled on the second.
+    """
+
+    clone_url, sha = _build_bare_repo(trusted_clone_base, REPO, VALID_FILES)
+    payload = _push_payload("refs/heads/dev", sha, clone_url)
+    delivery = str(uuid.uuid4())
+
+    ignored = _post(client, "push", payload, delivery=delivery)
+    assert ignored.status_code == 200, ignored.text
+    assert ignored.json()["status"] == "ignored", ignored.json()
+
+    agent_id = _register_agent(client, auth_headers)
+    redelivered = _post(client, "push", payload, delivery=delivery)
+    assert redelivered.status_code == 200, redelivered.text
+    assert redelivered.json()["status"] == "deployed", redelivered.json()
+
+    replay = _post(client, "push", payload, delivery=delivery)
+    assert replay.json()["status"] == "push_duplicate", replay.json()
+
+    deployments = client.get(
+        "/deployments", params={"agent_id": agent_id}, headers=auth_headers
+    ).json()
+    assert [d["id"] for d in deployments] == [redelivered.json()["deployment_id"]]
+
+
+class _FailingEvalQueue:
+    """An eval producer whose enqueue fails, after the deployment row committed."""
+
+    async def enqueue(self, job: Any) -> str:
+        raise RuntimeError("eval queue unavailable")
+
+
+def test_a_push_delivery_that_crashed_after_deploying_is_never_reprocessed(
+    client: Any,
+    auth_headers: dict[str, str],
+    clean_db: None,
+    trusted_clone_base: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A delivery that raised mid-flight stays unsettled and cannot deploy twice.
+
+    `process_push` commits the dev Deployment row before it enqueues the eval
+    job, so an enqueue failure leaves a real deployment behind an errored
+    request. Replaying that delivery id must answer `delivery_unsettled` and do
+    nothing, because nothing can tell whether it deployed. A NEW delivery id
+    for the same commit is still processed normally.
+    """
+
+    agent_id = _register_agent(client, auth_headers)
+    clone_url, sha = _build_bare_repo(trusted_clone_base, REPO, VALID_FILES)
+    payload = _push_payload("refs/heads/dev", sha, clone_url)
+    delivery = str(uuid.uuid4())
+
+    monkeypatch.setattr(client._transport, "raise_server_exceptions", False)
+    client.app.dependency_overrides[get_eval_queue] = lambda: _FailingEvalQueue()
+    try:
+        crashed = _post(client, "push", payload, delivery=delivery)
+    finally:
+        client.app.dependency_overrides.pop(get_eval_queue, None)
+    assert crashed.status_code == 500, crashed.text
+
+    deployments = client.get(
+        "/deployments", params={"agent_id": agent_id}, headers=auth_headers
+    ).json()
+    assert len(deployments) == 1, "the crash happened after the deployment committed"
+
+    eval_queue = _RecordingEvalQueue()
+    client.app.dependency_overrides[get_eval_queue] = lambda: eval_queue
+    try:
+        replay = _post(client, "push", payload, delivery=delivery)
+        fresh = _post(client, "push", payload)
+    finally:
+        client.app.dependency_overrides.pop(get_eval_queue, None)
+
+    assert replay.status_code == 200, replay.text
+    assert replay.json()["status"] == "push_duplicate", replay.json()
+    assert replay.json()["errors"] == [{"code": "delivery_unsettled"}]
+    assert replay.json()["deployment_id"] is None
+
+    assert fresh.status_code == 200, fresh.text
+    assert fresh.json()["status"] == "deployed", fresh.json()
+
+    deployments = client.get(
+        "/deployments", params={"agent_id": agent_id}, headers=auth_headers
+    ).json()
+    assert len(deployments) == 2, deployments
+    assert fresh.json()["deployment_id"] in {d["id"] for d in deployments}
+
+
+def test_a_push_releases_its_request_connection_before_settling(
+    client: Any,
+    auth_headers: dict[str, str],
+    clean_db: None,
+    trusted_clone_base: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The settle never waits for a connection while the request still holds one.
+
+    `process_push` leaves the request session in a transaction after a deploy
+    (its refresh of the committed Deployment row). If the settle opened its own
+    session before that connection went back to the pool, concurrent pushes
+    could each hold one connection while waiting for a second. Recorded at the
+    moment the settle runs, for both a deployed and an ignored push.
+    """
+
+    _register_agent(client, auth_headers)
+    clone_url, sha = _build_bare_repo(trusted_clone_base, REPO, VALID_FILES)
+
+    sessions: list[Any] = []
+    real_process_push = github_router.process_push
+
+    async def _recording_process_push(session: Any, *args: Any, **kwargs: Any) -> Any:
+        sessions.append(session)
+        return await real_process_push(session, *args, **kwargs)
+
+    held_at_settle: list[bool] = []
+    real_settle = github_router.settle_push_delivery
+
+    async def _recording_settle(*args: Any, **kwargs: Any) -> None:
+        held_at_settle.append(sessions[-1].in_transaction())
+        await real_settle(*args, **kwargs)
+
+    monkeypatch.setattr(github_router, "process_push", _recording_process_push)
+    monkeypatch.setattr(github_router, "settle_push_delivery", _recording_settle)
+
+    deployed = _post(client, "push", _push_payload("refs/heads/dev", sha, clone_url))
+    ignored = _post(client, "push", _push_payload("refs/heads/feature-x", sha, clone_url))
+
+    assert deployed.json()["status"] == "deployed", deployed.text
+    assert ignored.json()["status"] == "ignored", ignored.text
+    assert held_at_settle == [False, False]
+
+
+def test_overlapping_claims_of_one_push_delivery_admit_exactly_one(
+    clean_db: None,
+) -> None:
+    """Concurrent claims of one delivery id against real Postgres pick one owner.
+
+    The committed `pending` receipt is the in-flight marker, so every other
+    overlapping claim answers `unsettled` rather than waiting on a row lock.
+    Once settled accepted, the id is spent. A receipt settled `rejected` is
+    reopened by exactly one of several concurrent claims (#2436 liveness).
+    """
+
+    payload = {"ref": "refs/heads/dev", "after": "0" * 40}
+    body = json.dumps(payload).encode()
+
+    async def exercise() -> tuple[list[str], str, list[str], str]:
+        engine = create_async_engine(get_settings().database_url)
+        maker = create_sessionmaker(engine)
+
+        def claim(delivery_id: uuid.UUID) -> Any:
+            return claim_push_delivery(
+                maker, delivery_id=delivery_id, event="push", body=body, payload=payload
+            )
+
+        try:
+            spent = uuid.uuid4()
+            first = list(await asyncio.gather(*(claim(spent) for _ in range(5))))
+            await settle_push_delivery(maker, delivery_id=spent, status="accepted")
+            after_accept = await claim(spent)
+
+            repaired = uuid.uuid4()
+            assert await claim(repaired) == "process"
+            await settle_push_delivery(
+                maker, delivery_id=repaired, status="rejected", reason="push_rejected"
+            )
+            reopened = list(await asyncio.gather(*(claim(repaired) for _ in range(5))))
+            await settle_push_delivery(maker, delivery_id=repaired, status="accepted")
+            after_repair = await claim(repaired)
+        finally:
+            await engine.dispose()
+        return first, after_accept, reopened, after_repair
+
+    first, after_accept, reopened, after_repair = asyncio.run(exercise())
+
+    assert sorted(first) == ["process"] + ["unsettled"] * 4, first
+    assert after_accept == "duplicate"
+    assert sorted(reopened) == ["process"] + ["unsettled"] * 4, reopened
+    assert after_repair == "duplicate"
 
 
 def test_a_dev_push_for_a_sha_no_longer_on_the_branch_is_still_rejected(
@@ -1445,7 +2528,8 @@ def test_commit_poller_retries_after_routing_topology_is_repaired(
 ) -> None:
     """A rejected sha deploys on the next pass after its target is created."""
     from curie_api.commitpoller import CommitPoller
-    from curie_api.schemas import AgentCreate, ChannelBinding
+    from curie_api.schemas.agents import AgentCreate
+    from curie_api.schemas.channels import ChannelBinding
 
     _register(client, auth_headers, "bootstrap_agent", "C000000R01")
     files = {
@@ -1457,6 +2541,7 @@ def test_commit_poller_retries_after_routing_topology_is_repaired(
     }
     _, sha = _build_bare_repo(trusted_clone_base, REPO, files)
     settings = get_settings()
+    notice_cursor = _notice_cursor()
 
     class Tips:
         def sha_for(self, repo_full_name: str, branch: str) -> str | None:
@@ -1468,13 +2553,18 @@ def test_commit_poller_retries_after_routing_topology_is_repaired(
             pass
 
     async def exercise() -> str:
+        from curie_api.deploy_notice import DeployNoticeQueue
+        from redis.asyncio import Redis
+
         engine = create_async_engine(settings.database_url)
         maker = async_sessionmaker(engine, expire_on_commit=False)
+        notice_redis = Redis.from_url(settings.valkey_dsn())
         poller = CommitPoller(
             session_factory=maker,
             store=client.app.state.bundle_store,
             settings=settings,
             eval_queue=NoopEvalQueue(),
+            notice_queue=DeployNoticeQueue(notice_redis, settings.deploy_notice_stream_name()),
             tips=Tips(),
             interval_seconds=60,
         )
@@ -1484,13 +2574,14 @@ def test_commit_poller_retries_after_routing_topology_is_repaired(
             assert "deploy.unknown_agent" in caplog.text
 
             async with maker() as session:
-                assert await crud.list_deployments(session) == []
-                repaired = await crud.create_agent(
+                assert await crud_deployments.list_deployments(session) == []
+                repaired = await crud_agents.create_agent(
                     session,
                     AgentCreate(
                         name="repairedagent",
                         channel=ChannelBinding(kind="slack", address="C000000R02"),
                         repo_full_name=REPO,
+                        deploy_notifications=True,
                     ),
                 )
 
@@ -1498,6 +2589,7 @@ def test_commit_poller_retries_after_routing_topology_is_repaired(
             assert [move.sha for move in second] == [sha]
             return str(repaired.id)
         finally:
+            await notice_redis.aclose()
             await engine.dispose()
 
     repaired_id = asyncio.run(exercise())
@@ -1507,6 +2599,11 @@ def test_commit_poller_retries_after_routing_topology_is_repaired(
     assert len(deployments) == 1, deployments
     assert deployments[0]["commit_sha"] == sha
     assert deployments[0]["environment"] == "dev"
+    notices = _notices_after(notice_cursor)
+    assert {(notice["status"], notice["address"]) for notice in notices} == {
+        ("rejected", "C000000R01"),
+        ("deployed", "C000000R02"),
+    }
 
 
 def test_the_commit_poller_promotes_a_stored_bundle_with_the_remote_deleted(
@@ -1967,6 +3064,40 @@ def test_a_prod_promote_is_refused_when_the_promoting_agent_lacks_the_binding(
     ] == ["dev"]
 
 
+def test_a_routed_rejection_notifies_only_the_agent_it_was_for(
+    client: Any,
+    auth_headers: dict[str, str],
+    clean_db: None,
+    trusted_clone_base: Path,
+) -> None:
+    """A prod promote refused for the prod agent must not post in the dev channel.
+
+    One repository builds a dev bot and a prod bot (ADR-0091). Once the push
+    has resolved its target agent, a rejection belongs to that agent alone;
+    the sibling's channel may be a different audience entirely.
+    """
+
+    dev_id = _register(client, auth_headers, "two-agent-dev", "C000000D01")
+    prod_id = _register(client, auth_headers, "two-agent-prod", "C000000E01")
+    clone_url, sha = _build_bare_repo(
+        trusted_clone_base, REPO, _gated_files(TWO_TARGET_FILES, "ops")
+    )
+    _bind_route(client, auth_headers, dev_id, "ops")
+    dev = _post(client, "push", _push_payload("refs/heads/dev", sha, clone_url)).json()
+    assert dev["status"] == "deployed", dev
+
+    cursor = _notice_cursor()
+    prod = _post(client, "push", _push_payload("refs/heads/main", sha, clone_url)).json()
+
+    assert prod["status"] == "rejected", prod
+    assert "approval_routes.unbound" in _unbound_codes(prod), prod
+    assert prod["agent_id"] == prod_id, prod
+    assert [
+        (notice["address"], notice["agent_name"], notice["status"], notice["environment"])
+        for notice in _notices_after(cursor)
+    ] == [("C000000E01", "two-agent-prod", "rejected", "prod")]
+
+
 def test_a_sibling_attach_is_refused_when_the_sibling_object_declares_an_unbound_route(
     client: Any,
     auth_headers: dict[str, str],
@@ -2242,3 +3373,108 @@ def test_a_live_sibling_attach_whose_stored_object_exceeds_the_current_cap_repor
             "/deployments", params={"agent_id": dev_id}, headers=auth_headers
         ).json()
     ] == [activated.json()["id"]]
+
+
+# --------------------------------------------------------------------------- #
+# @spec ACTION-EXECUTOR-16: a prod promote re-checks sealing key custody
+# --------------------------------------------------------------------------- #
+
+_SEAL_IMAGE = "ghcr.io/example/k8s-restorer@sha256:" + "ab" * 32
+_SEAL_PLAIN = (
+    f"connectors:\n  k8s:\n    image: {_SEAL_IMAGE}\n    secrets:\n      - SNAPSHOT_SEALING_KEY\n"
+)
+_SEAL_SECRET_REF = (
+    f"connectors:\n  k8s:\n    image: {_SEAL_IMAGE}\n"
+    "    secrets:\n      - name: SNAPSHOT_SEALING_KEY\n        from_secret: k8s-restorer-seal\n"
+)
+
+
+def _replace_stored_bundle_with(agent_id: str, version_id: str, connectors_yaml: str) -> None:
+    """Point a stored version at bytes that never passed intake.
+
+    Simulates a bundle stored before the custody check existed: the bytes go
+    straight to the object store under a fresh key (keys are write-once) and
+    the version row is repointed with SQL.
+    """
+
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w:gz") as tf:
+        for rel, content in {**VALID_FILES, "connectors.yaml": connectors_yaml}.items():
+            data = content.encode()
+            info = tarfile.TarInfo(f"demo-plugin/{rel}")
+            info.size = len(data)
+            tf.addfile(info, io.BytesIO(data))
+    archive = buf.getvalue()
+
+    async def _run() -> None:
+        settings = get_settings()
+        store = BundleStore(settings)
+        key = f"bundles/{agent_id}/{version_id}-legacy-{uuid.uuid4().hex[:6]}.tar.gz"
+        await store.put(key, archive, "application/gzip")
+        engine = create_async_engine(settings.database_url)
+        async with engine.begin() as connection:
+            await connection.execute(
+                text(
+                    "UPDATE curie.agent_versions SET bundle_ref = :ref, bundle_sha256 = :sha "
+                    "WHERE id = :id"
+                ),
+                {
+                    "ref": key,
+                    "sha": hashlib.sha256(archive).hexdigest(),
+                    "id": uuid.UUID(version_id),
+                },
+            )
+        await engine.dispose()
+
+    asyncio.run(_run())
+
+
+def test_a_prod_promote_of_a_stored_bundle_declaring_the_sealing_key_plainly_is_refused(
+    client: Any,
+    auth_headers: dict[str, str],
+    clean_db: None,
+    trusted_clone_base: Path,
+) -> None:
+    """@spec ACTION-EXECUTOR-16: the promote reuses stored bytes without revalidating them.
+
+    `_read_stored_targets` deliberately skips `validate_bundle`, and
+    `revalidate_stored_bundle` re-checks only the caps. A version stored before
+    intake refused a plain `SNAPSHOT_SEALING_KEY` must not reach prod through
+    the reuse path either.
+    """
+
+    agent_id = _register_agent(client, auth_headers)
+    clone_url, sha = _build_bare_repo(trusted_clone_base, REPO, VALID_FILES)
+    dev = _post(client, "push", _push_payload("refs/heads/dev", sha, clone_url)).json()
+    assert dev["status"] == "deployed", dev
+    _replace_stored_bundle_with(agent_id, dev["version_id"], _SEAL_PLAIN)
+
+    body = _post(client, "push", _push_payload("refs/heads/main", sha, clone_url)).json()
+
+    assert body["status"] == "rejected", body
+    messages = [str(e.get("message", "")) for e in body.get("errors", [])]
+    assert any("SNAPSHOT_SEALING_KEY" in m and "SecretRef" in m for m in messages), body
+    deployments = client.get(
+        "/deployments", params={"agent_id": agent_id}, headers=auth_headers
+    ).json()
+    assert [d["environment"] for d in deployments] == ["dev"], deployments
+
+
+def test_a_prod_promote_of_a_stored_bundle_with_the_sealing_key_secret_ref_is_promoted(
+    client: Any,
+    auth_headers: dict[str, str],
+    clean_db: None,
+    trusted_clone_base: Path,
+) -> None:
+    """@spec ACTION-EXECUTOR-16: the paired control; the repointed version still promotes."""
+
+    agent_id = _register_agent(client, auth_headers)
+    clone_url, sha = _build_bare_repo(trusted_clone_base, REPO, VALID_FILES)
+    dev = _post(client, "push", _push_payload("refs/heads/dev", sha, clone_url)).json()
+    assert dev["status"] == "deployed", dev
+    _replace_stored_bundle_with(agent_id, dev["version_id"], _SEAL_SECRET_REF)
+
+    body = _post(client, "push", _push_payload("refs/heads/main", sha, clone_url)).json()
+
+    assert body["status"] == "promoted", body
+    assert body["version_id"] == dev["version_id"], body

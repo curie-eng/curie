@@ -4,6 +4,10 @@ The umbrella Helm chart: Langfuse + Postgres + Valkey + ClickHouse + RustFS +
 OTel Collector, plus the Agent Sandbox substrate and its security rails. Full
 component and rail detail in `charts/curie/README.md`.
 
+The gateway in `templates/channel-gateway.yaml` also requires one replica and
+Recreate: its durable SQLite replay ledger has one writer. Scaling requires a
+shared replay store and a separate reviewed change; there is no replica knob.
+
 ## Load-bearing invariants
 
 - **Values, not templates, for anything that varies by environment.** Per
@@ -66,7 +70,7 @@ component and rail detail in `charts/curie/README.md`.
     `timeoutSeconds` explicitly; the kubelet's 1s default is invisible in the
     manifest and each timed-out probe counts as a failure. Both rules are pinned
     for *every* rendered container, with no allowlist, by
-    `ci/probe-window-assertions.sh`. The remaining hardcoded probe blocks
+    policy P3 in `ci/policy/`. The remaining hardcoded probe blocks
     (`ui.yaml`, `clickhouse.yaml`, `valkey.yaml`, `rustfs.yaml`,
     `otel-collector.yaml`, `mail-adapter.yaml`, `inference.yaml`, and the
     `curie.heartbeatProbes` helper used by `worker.yaml` and `dispatcher.yaml`)
@@ -85,7 +89,7 @@ component and rail detail in `charts/curie/README.md`.
   at the time of writing it selects `api.yaml`, `dispatcher.yaml`, `worker.yaml`,
   `agent-sandbox.yaml` (the runner) and `mail-adapter.yaml`. Adding a workload
   means adding the include. The CI half is
-  `ci/instrumented-workload-assertions.sh` (#2360): it enumerates first-party
+  policy P5 in `ci/policy/` (#2360): it enumerates first-party
   workloads from rendered chart-owned images (`ghcr.io/curie-eng/curie-*` and
   single-component `curie-*` names), includes the runner SandboxTemplate,
   classifies bootstrap/hooks/prewarm/UI as exemptions rather than skipping
@@ -169,6 +173,20 @@ component and rail detail in `charts/curie/README.md`.
   canonical overlay for that shape (all four stores off, Secret references,
   three buckets, narrow S3 egress). Pin it with
   `ci/external-values-profile-assertions.sh`.
+- **`attachments-init` has a docker twin, held by a shared vector.** The
+  program `templates/agent-sandbox.yaml` renders into the sandbox's
+  `attachments-init` container and the docker driver's `_prepare_attachments`
+  (`apps/worker/src/curie_worker/sandbox/docker.py`) redeem the same
+  `CURIE_ATTACHMENTS_REF` payload and must agree on every outcome: names written
+  exactly, current files first and all-or-nothing, earlier files skipped with a
+  reason in `.curie-attachments-status.json`, a digest mismatch fatal either
+  way (ADR 0205); a payload with no "c" keeps the pre-ADR rules, so a new
+  chart never regresses an old worker. Change one and you change the other in the same PR;
+  `tests/vectors/attachment-init-outcomes.json` is run through both by
+  `ci/attachment-init-behavior-assertions.sh` and
+  `test_docker_attachment_claim.py`. The worker's `threadMaxBytes` must fit the
+  attachments emptyDir's `sizeLimit`; the worker template refuses to render
+  otherwise.
 - **Values keys are camelCase, not hyphenated.** Go templates cannot
   dot-index a hyphenated key. Keep this consistent across any new values
   additions.
@@ -180,6 +198,17 @@ component and rail detail in `charts/curie/README.md`.
   other resources (#2097). The helper drops colliding names so first-class
   values win. A new first-class worker timeout env must be added to that
   reserved dict, not only to `templates/worker.yaml`.
+- **Every chart pod spec sets `enableServiceLinks: false`.** Kubernetes
+  injects `<SERVICE>_PORT=tcp://<ip>:<port>` and its siblings for every
+  Service in the namespace, so a Service named `<release>-<x>` shadows any
+  `CURIE_<X>_PORT` setting in a pod that does not set the value explicitly.
+  The lazy-attachment `<release>-attachment-broker` Service turned
+  `CURIE_ATTACHMENT_BROKER_PORT` into a URL and failed `WorkerConfig()` in
+  the post-upgrade drain hook, which failed the upgrade with the fleet
+  still quiesced (#5350). No chart workload reads service-link variables;
+  addresses come from explicit env. This covers Deployments, StatefulSets,
+  DaemonSets, Jobs, CronJobs, bare Pods and the SandboxTemplate pod
+  template. Pinned by `ci/service-links-assertions.sh`.
 - **Placement-class lookups go through `curie.placement.class`; never
   index `.Values.placement.<class>` directly in a template.** Helm's
   values coalescing deletes a key whose replayed value is YAML null, so
@@ -193,6 +222,17 @@ component and rail detail in `charts/curie/README.md`.
   that refusal into a default would silently drop every scheduling
   constraint the operator asked for. A new pod surface added to the chart
   uses the helper with its class name rather than a fresh direct index.
+- **A new top level values key is nil under `--reuse-values` from any
+  release that predates it.** Helm renders the new templates against the
+  OLD chart's values.yaml plus the stored operator values, so
+  `.Values.<newKey>.<field>` dereferences nil and the upgrade dies
+  (`connectorCaller`, #3505). Read it through
+  `(get (.Values.<newKey> | default dict) "<field>")` as #3544 did.
+  `ci/reuse-values-render-assertions.sh` renders the candidate on the
+  newest stable release's and a pinned v0.10.3's values.yaml, under no
+  operator values, the release's `values-dev.yaml`, and
+  `ci/fixtures/reuse-values-operator.yaml`, and its negative control
+  reverts the #3544 guard (#3813).
 - **Fail-closed egress, always.** `security.networkPolicy.allowedEgress` is
   empty by default; an unset allowlist must never mean allow-all. If you add
   a new egress destination the runner needs, it goes into this allowlist
@@ -230,7 +270,7 @@ component and rail detail in `charts/curie/README.md`.
   path for e2e/scratch clusters.
 - **CRDs in `crds/` are vendored, never templated.** Helm does not
   upgrade or delete `crds/` content; a teardown needs a manual
-  `kubectl delete crd <name>`. Do not move CRD definitions into `templates/`
+  `kubectl --context <context> delete crd <name>`. Do not move CRD definitions into `templates/`
   to make them "manageable" -- that changes install ordering guarantees
   Helm's `crds/` convention provides.
 - **The controller (`agentSandbox.controller.deploy`) is cluster-scoped.**
@@ -259,12 +299,17 @@ component and rail detail in `charts/curie/README.md`.
   false`, and it types only four bounded values: the three worker knobs
   (`worker.claimTimeoutSeconds`, `worker.routeTtlSeconds`,
   `worker.suspendedRouteTtlSeconds`) and the approval-chat attester's explicit
-  nonblank contract (`api.approvalChatAttesterSecret`), plus
+  nonblank contract (`api.approvalChatAttesterSecret`), the remediation
+  authority key's identical nonblank contract (`api.remediationAuthorityKey`,
+  ADR 0231), plus
   `worker.streamRetention.minAgeSeconds` (a new key, so no existing values
   file can disagree with it; the template reads it through `dig` for a
   retained release without the block) and the new
   `e2eConnectorIdentity` block, whose prefix and label patterns keep its
-  values safe to embed in the admission policy's CEL (#3243). Adding a `required` or
+  values safe to embed in the admission policy's CEL (#3243), and the new
+  `worker.attachments.threadMaxFiles` / `threadMaxBytes` thread budget (ADR
+  0205; new keys, read in the template with a default so a `--reuse-values`
+  upgrade from a release without them still renders). Adding a `required` or
   `additionalProperties: false` constraint, or typing any other existing
   key, would fail every install whose values file happens not to match the
   new shape -- broaden the schema only for a key you are prepared to
@@ -294,11 +339,10 @@ component and rail detail in `charts/curie/README.md`.
     can store `placement: null`, and `--reuse-values` on upgrade replays
     it, deleting the key -- and the `curie.placement.class` helper (see
     the values-keys invariant above) is its template-level backstop
-    (#2008). `worker.publication.githubHttpsCidrs` is a third instance:
-    `minItems: 1` catches `[]`, but a coalesced nil deletes the key and a
-    `range` over it used to emit an empty `to:` (allow-all on 443 for the
-    tokenless publication job). The template `fail` in
-    `publication-owner.yaml` is the backstop (#2321).
+    (#2008). Publication egress is a third: an empty
+    `curie.factory.egress` list would emit an empty `to:` (allow-all
+    for the tokenless publication job), so `publication-owner.yaml` fails on
+    it (#2321, #4397).
 
 ## Verify
 
@@ -312,26 +356,25 @@ helm template charts/curie -f charts/curie/values-dev.yaml   # chart-authoring c
 Runtime check (the cheap default for a chart/sandbox/bundle change): installs a
 trimmed slice, runs the bundle-fetch init pair, and exec-asserts on the runner:
 ```bash
-curie dev chart-runtime-e2e            # implemented by scripts/chart-runtime-e2e.sh
-curie dev chart-runtime-e2e --force    # same, on a scratch context not named k8scratch
+curie dev chart-runtime-e2e --context <context>  # implemented by scripts/chart-runtime-e2e.sh
 ```
 A ticket whose AC is a runtime check (like #56, the bundle-fetch credential
 isolation) is only satisfied by running this and pasting its output -- lint /
 template do not exercise the init container or the live runner.
 
-It refuses any kube context not named `k8scratch`, because it installs and
-uninstalls a real release; `--force` is the override, and points at a disposable
-cluster only. The other script flags (`--namespace`, `--release`, `--chart`,
+It requires an explicit `--context <context>` for a disposable cluster because
+it installs and uninstalls a real release. The other script flags
+(`--namespace`, `--release`, `--chart`,
 `--runner-image`, `--expect-vulnerable`, `--keep`) are not yet exposed through
 `curie dev`; reach them with `bash scripts/chart-runtime-e2e.sh --help`.
 
 Cluster verification (a disposable local cluster, `kind` or `k3s`):
 ```bash
-helm install curie-dev charts/curie -n curie-dev --create-namespace \
+helm --kube-context <context> install curie-dev charts/curie -n curie-dev --create-namespace \
   -f charts/curie/values-dev.yaml
-kubectl get pods -n curie-dev -w
-helm test curie-dev -n curie-dev                              # re-runs the three preflights + the security probe suite
-kubectl logs -n curie-dev job/curie-dev-preflight-avx
-kubectl logs -n curie-dev job/curie-dev-security-probe        # rails 1, 2, 4
-kubectl logs -n curie-dev curie-dev-security-probe-hardening  # rail 3
+kubectl --context <context> get pods -n curie-dev -w
+helm --kube-context <context> test curie-dev -n curie-dev       # re-runs the three preflights + the security probe suite
+kubectl --context <context> logs -n curie-dev job/curie-dev-preflight-avx
+kubectl --context <context> logs -n curie-dev job/curie-dev-security-probe        # rails 1, 2, 4
+kubectl --context <context> logs -n curie-dev curie-dev-security-probe-hardening  # rail 3
 ```

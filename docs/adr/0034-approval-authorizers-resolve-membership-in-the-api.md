@@ -4,6 +4,11 @@ Date: 2026-07-15
 
 Status: Accepted
 
+**Partially amended by [ADR 0271](0271-per-request-approver-sets-and-separation-of-duties.md)**
+(back link added under [ADR 0045](0045-the-status-line-is-the-mutable-part-of-an-immutable-adr.md)):
+ADR 0271 amends decision 2 for per-request selection. It stores selected people
+for dynamic routes while preserving current authority and missing-route refusal.
+
 **Partially superseded by [ADR 0106](0106-an-approver-is-an-authenticated-principal.md).**
 ADR 0106 supersedes only the universal pre-membership self-approval prohibition;
 the server-side, fail-closed approver-set design remains in force.

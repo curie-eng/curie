@@ -5,6 +5,7 @@ import { Card, SectionTitle, EmptyState, Notice, Button, CliHint, cliCommand } f
 import { useStore } from "../../state/store";
 import { useWired } from "../../state/wired";
 import { ApiError, getWorkItem, listWorkItems, type WorkItemOutcome } from "../../api/client";
+import { issueRef } from "./factoryParts";
 
 // Factory outcomes console (#2577): the GitHub-issue-driven agent's queue of
 // work items, one row per issue it took on. State and cause strings come
@@ -166,13 +167,13 @@ function WorkItemRow({ item, onOpen }: { item: WorkItemOutcome; onOpen: () => vo
         {item.state}
       </span>
       <a
-        href={item.issue_url}
+        href={item.tracker.url}
         target="_blank"
         rel="noreferrer"
         onClick={(e) => e.stopPropagation()}
         style={{ color: C.link, fontFamily: C.mono, fontSize: 13 }}
       >
-        {item.repo_full_name}#{item.github_issue_number}
+        {issueRef(item)}
       </a>
       <span style={{ fontSize: 13, color: C.text2, flex: 1, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
         {item.actionable_cause}
@@ -200,12 +201,12 @@ function WorkItemDetail({ item }: { item: WorkItemOutcome }) {
       <div data-testid="work-item-detail" style={{ display: "flex", flexDirection: "column", gap: 12, fontSize: 13 }}>
         <div data-testid="work-item-detail-header" style={{ display: "flex", alignItems: "baseline", gap: 12 }}>
           <a
-            href={item.issue_url}
+            href={item.tracker.url}
             target="_blank"
             rel="noreferrer"
             style={{ color: C.link, fontFamily: C.mono, fontSize: 15, fontWeight: 600 }}
           >
-            {item.repo_full_name}#{item.github_issue_number}
+            {issueRef(item)}
           </a>
           {item.pr ? (
             <a

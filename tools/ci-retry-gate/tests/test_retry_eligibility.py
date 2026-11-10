@@ -20,6 +20,7 @@ from collections.abc import Iterator
 from pathlib import Path
 from typing import Any, NamedTuple
 
+import pytest
 import yaml
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
@@ -31,7 +32,11 @@ WORKFLOWS_DIR = REPO_ROOT / ".github" / "workflows"
 ACQUISITION_ACTIONS = frozenset(
     {
         "astral-sh/setup-uv",
+        "azure/setup-helm",
+        "actions/setup-node",
+        "pnpm/action-setup",
         "docker/setup-buildx-action",
+        "docker/setup-qemu-action",
         "docker/login-action",
         "actions/download-artifact",
         "helm/kind-action",
@@ -43,13 +48,124 @@ ACQUISITION_ACTIONS = frozenset(
 # one entry covers all three steps of a single wrap.
 RETRY_ALLOWLIST = frozenset(
     {
-        ("ci.yaml", "python", "Install uv"),
+        ("ci.yaml", "adapter-credential-reconciliation", "Install uv"),
+        ("ci.yaml", "python-dry-run-fixture", "Install uv"),
+        ("ci.yaml", "python-dry-run-fixture", "Install Helm"),
+        (
+            "ci.yaml",
+            "python-dry-run-fixture",
+            "Install kind and kubectl without creating a cluster",
+        ),
+        ("ci.yaml", "python-container-fixtures", "Install uv"),
+        ("ci.yaml", "python-container-fixtures", "Install Helm"),
+        (
+            "ci.yaml",
+            "python-container-fixtures",
+            "Install kind and kubectl without creating a cluster",
+        ),
+        ("ci.yaml", "python-static", "Install uv"),
         ("ci.yaml", "python-pytest", "Install uv"),
+        ("ci.yaml", "ci-policy", "Install uv"),
+        ("ci.yaml", "turn-canary-contract", "Install uv"),
         ("fix-pin.yaml", "fix-pin", "Install uv"),
+        (
+            "fix-pin.yaml",
+            "fix-pin",
+            "Install kind and kubectl without creating a cluster",
+        ),
         ("ci.yaml", "e2e-ladder-cluster", "Create the kind cluster"),
         ("ci.yaml", "e2e-cluster-chart-regressions", "Create the kind cluster"),
         ("ci.yaml", "e2e-cluster-rollout-recovery", "Create the kind cluster"),
+        ("ci.yaml", "e2e-cluster-approval-resume-restarts", "Create the kind cluster"),
         ("ci.yaml", "e2e-cluster-upgrade-matrix", "Create the disposable kind cluster"),
+        # Issue #3866: the same acquisition class as the #1106 wraps, on the
+        # ci.yaml and helm-ci.yaml steps that were still a single attempt.
+        ("ci.yaml", "action-pins", "Install uv"),
+        ("ci.yaml", "rust-lint", "Install uv"),
+        ("ci.yaml", "runtime-assertion-registration", "Install uv for the runtime assertion gate"),
+        ("ci.yaml", "rust-test", "Install uv"),
+        ("ci.yaml", "rust-test", "Install Helm for CLI consumer render tests"),
+        # Like the UI job, this acquires pnpm before repository code runs.
+        ("ci.yaml", "contracts-ts", "Install pnpm"),
+        ("ci.yaml", "contracts-ts", "Install Node"),
+        ("ci.yaml", "ui", "Install pnpm"),
+        ("ci.yaml", "ui", "Install Node"),
+        (
+            "ci.yaml",
+            "ci-images",
+            "Set up a cache-only buildx builder "
+            "(named, NOT the default -- preserves the overlay's FROM)",
+        ),
+        ("ci.yaml", "images", "Set up QEMU"),
+        ("ci.yaml", "images", "Set up Buildx"),
+        ("ci.yaml", "image-proofs", "Docker daemon: Set up Buildx"),
+        ("ci.yaml", "image-proofs", "Toolchain: Install uv"),
+        ("ci.yaml", "changes", "Install uv"),
+        ("ci.yaml", "e2e-ladder-cluster", "Install Helm"),
+        ("ci.yaml", "e2e-ladder-cluster", "Install uv for publication proof"),
+        ("ci.yaml", "e2e-cluster-chart-regressions", "Install Helm"),
+        (
+            "ci.yaml",
+            "e2e-cluster-chart-regressions",
+            "Install uv for the connector readiness render",
+        ),
+        ("ci.yaml", "e2e-cluster-rollout-recovery", "Install Helm"),
+        ("ci.yaml", "e2e-cluster-approval-resume-restarts", "Install Helm"),
+        # Issue #4628: the pinned setup action acquires uv before workspace sync.
+        ("ci.yaml", "e2e-released-upgrade", "Install uv"),
+        ("ci.yaml", "e2e-released-upgrade", "Install Helm"),
+        ("ci.yaml", "e2e-released-upgrade", "Create the disposable kind cluster"),
+        ("ci.yaml", "e2e-released-upgrade-negative", "Install Helm"),
+        ("ci.yaml", "e2e-released-upgrade-negative", "Create the disposable kind cluster"),
+        ("ci.yaml", "e2e-cluster-upgrade-matrix", "Install Helm"),
+        # Issue #4111: the scripted factory job acquires Helm, kind and kubectl
+        # before the driver runs; the driver creates its own cluster.
+        ("ci.yaml", "e2e-scripted-factory", "Install uv"),
+        ("ci.yaml", "e2e-scripted-factory", "Install Helm"),
+        (
+            "ci.yaml",
+            "e2e-scripted-factory",
+            "Install kind and kubectl without creating a cluster",
+        ),
+        # Issue #4620: the forge instance regression acquires uv, Helm, kind and
+        # kubectl before the module runs; the module creates its own clusters.
+        ("ci.yaml", "forge-instance-regression", "Install uv"),
+        ("ci.yaml", "forge-instance-regression", "Install Helm"),
+        (
+            "ci.yaml",
+            "forge-instance-regression",
+            "Install kind and kubectl without creating a cluster",
+        ),
+        # Issue #4619: the admitted agent shards acquire the same tools; each
+        # case creates its own cluster.
+        ("ci.yaml", "factory-admitted-agent", "Install uv"),
+        ("ci.yaml", "factory-admitted-agent", "Install Helm"),
+        (
+            "ci.yaml",
+            "factory-admitted-agent",
+            "Install kind and kubectl without creating a cluster",
+        ),
+        # The CLI convergence regressions acquire Helm, kind and kubectl; each
+        # test creates its own cluster.
+        ("ci.yaml", "rust-convergence", "Install Helm"),
+        (
+            "ci.yaml",
+            "rust-convergence",
+            "Install kind and kubectl without creating a cluster",
+        ),
+        ("ci.yaml", "e2e-required", "Install uv for the runtime assertion gate"),
+        ("helm-ci.yaml", "chart-lint-and-assertions-1", "Install Helm"),
+        (
+            "helm-ci.yaml",
+            "chart-lint-and-assertions-1",
+            "Install kind and kubectl without creating a cluster",
+        ),
+        ("helm-ci.yaml", "chart-assertions-2", "Install Helm"),
+        ("helm-ci.yaml", "chart-assertions-2", "Install uv"),
+        ("helm-ci.yaml", "chart-assertions-retained-values", "Install Helm"),
+        ("helm-ci.yaml", "reserved-env-upgrade", "Install Helm"),
+        ("helm-ci.yaml", "reserved-env-upgrade", "Create the kind cluster"),
+        ("helm-ci.yaml", "automatic-thread-isolation", "Install Helm"),
         ("dependency-audit.yaml", "python-audit", "Install uv"),
         ("gitleaks.yaml", "gitleaks", "Pull the gitleaks image"),
         ("release.yaml", "build", "Set up Buildx"),
@@ -62,6 +178,11 @@ RETRY_ALLOWLIST = frozenset(
         ("release.yaml", "worker-local-merge", "Download digests"),
         ("release.yaml", "worker-local-merge", "Set up Buildx"),
         ("release.yaml", "worker-local-merge", "Log in to GHCR"),
+        ("release.yaml", "dark-factory-runner-build", "Set up Buildx"),
+        ("release.yaml", "dark-factory-runner-build", "Log in to GHCR"),
+        ("release.yaml", "dark-factory-runner-merge", "Download digests"),
+        ("release.yaml", "dark-factory-runner-merge", "Set up Buildx"),
+        ("release.yaml", "dark-factory-runner-merge", "Log in to GHCR"),
         ("release.yaml", "release", "Download built binaries"),
     }
 )
@@ -86,17 +207,21 @@ RETRY_ALLOWLIST = frozenset(
 PROTECTED_STEPS = frozenset(
     {
         ("ci.yaml", "python-pytest", "Pytest"),
-        ("ci.yaml", "python", "Docs gate (catalog drift + agent contract + citations)"),
+        ("ci.yaml", "ci-policy", "Pytest"),
+        ("ci.yaml", "python-container-fixtures", "Pytest"),
+        ("ci.yaml", "python-dry-run-fixture", "Pytest"),
+        ("ci.yaml", "python-static", "Docs gate (catalog drift + agent contract + citations)"),
         ("ci.yaml", "rust-test", "Test"),
+        ("ci.yaml", "rust-convergence", "Test"),
         ("ci.yaml", "ui", "Lint"),
         ("ci.yaml", "ui", "Command manifest is current"),
         ("ci.yaml", "commit-messages", "Check the PR's commit messages"),
         (
             "ci.yaml",
-            "repo-toolchain-proof",
-            "Absent image fails in required mode (negative control)",
+            "image-proofs",
+            "Toolchain: Absent image fails in required mode (negative control)",
         ),
-        ("ci.yaml", "repo-toolchain-proof", "Repository toolchain proof"),
+        ("ci.yaml", "image-proofs", "Toolchain: Repository toolchain proof"),
         # Security gates. Retrying any of these reruns a scan or a verification
         # against the very same tree or the very same asset set, so a second
         # attempt cannot recover anything and can only bury a true positive.
@@ -172,13 +297,6 @@ SHELL_KEYWORDS = frozenset({"do", "done", "fi", "then", "else", "esac", "true", 
 # deliberate decision with the same weight as adding one to RETRY_ALLOWLIST.
 RUN_RETRY_EXEMPT: frozenset[tuple[str, str, str]] = frozenset(
     {
-        ("ci.yaml", "python-pytest", "Wait for Langfuse to serve"),
-        # The fix pin job boots the same dev stack as the pytest shards,
-        # for the same reason and with the same readiness poll: Langfuse
-        # web has no compose healthcheck, so `--wait` returns while it is
-        # merely running. A readiness poll for an external service, not a
-        # retry of anything this repository builds or gates.
-        ("fix-pin.yaml", "fix-pin", "Wait for Langfuse to serve"),
         # The candidate API has already rolled out; this only waits for the
         # temporary local port-forward to expose its external health state.
         (
@@ -197,8 +315,8 @@ RUN_RETRY_EXEMPT: frozenset[tuple[str, str, str]] = frozenset(
         # is already reachable. Neither re invokes repository code, and neither
         # retries a mutation whose failure would be a defect: if either never
         # becomes ready the step fails the job rather than papering over it.
-        ("ci.yaml", "ui-image-smoke", "Start the stub API upstream"),
-        ("ci.yaml", "ui-image-smoke", "Start the UI container"),
+        ("ci.yaml", "image-proofs", "UI: Start the stub API upstream"),
+        ("ci.yaml", "image-proofs", "UI: Start the UI container"),
     }
 )
 
@@ -208,7 +326,7 @@ Identity = tuple[str, str, str]
 class LocatedStep(NamedTuple):
     """A step together with the position that fixes its order within its job."""
 
-    index: int
+    step_index: int
     step: dict[str, Any]
 
 
@@ -287,11 +405,13 @@ def _step_name(step: dict[str, Any]) -> str | None:
 
 def _base_name(name: str) -> str:
     """Fold a backoff step or a retry copy back onto its attempt 1 name."""
-    if name.startswith(BACKOFF_PREFIX):
-        return name[len(BACKOFF_PREFIX) :]
-    if name.endswith(RETRY_SUFFIX):
-        return name[: -len(RETRY_SUFFIX)]
-    return name
+    group, separator, label = name.rpartition(": ")
+    return group + separator + label.removeprefix(BACKOFF_PREFIX).removesuffix(RETRY_SUFFIX)
+
+
+def _backoff_name(base: str) -> str:
+    group, separator, label = base.rpartition(": ")
+    return group + separator + BACKOFF_PREFIX + label
 
 
 def _continue_on_error(step: dict[str, Any]) -> bool:
@@ -306,14 +426,35 @@ def _continue_on_error(step: dict[str, Any]) -> bool:
     return False
 
 
+# A failed build or ladder records one class line and stops. The `if` names
+# the failed step so a credit refusal is not labeled build-failed, and so a
+# ladder failure is not labeled build-failed. That outcome reference is how a
+# retry guard is detected, but these steps do not run the failed command again.
+_FAILURE_CLASS_SUMMARIES = frozenset(
+    {
+        'echo build-failed >> "$GITHUB_STEP_SUMMARY"',
+        'echo test-failed >> "$GITHUB_STEP_SUMMARY"',
+    }
+)
+
+
+def _is_failure_class_summary(step: dict[str, Any]) -> bool:
+    if step.get("uses"):
+        return False
+    body = step.get("run")
+    return isinstance(body, str) and body.strip() in _FAILURE_CLASS_SUMMARIES
+
+
 def _carries_retry(step: dict[str, Any]) -> bool:
+    if _is_failure_class_summary(step):
+        return False
     if _continue_on_error(step):
         return True
     condition = step.get("if")
     if isinstance(condition, str) and OUTCOME_REFERENCE.search(condition):
         return True
     name = _step_name(step)
-    if name is not None and (name.endswith(RETRY_SUFFIX) or name.startswith(BACKOFF_PREFIX)):
+    if name is not None and name != _base_name(name):
         return True
     body = step.get("run")
     if isinstance(body, str) and RUN_LOOP_SENTINEL in body:
@@ -377,7 +518,7 @@ def _locate_trio(steps: list[Any], base: str) -> Trio:
         name = _step_name(step)
         if name == base:
             attempt = LocatedStep(index, step)
-        elif name == BACKOFF_PREFIX + base:
+        elif name == _backoff_name(base):
             backoff = LocatedStep(index, step)
         elif name == base + RETRY_SUFFIX:
             retry = LocatedStep(index, step)
@@ -435,12 +576,12 @@ def _trio_problems(base: str, trio: Trio) -> list[str]:
     if attempt is None:
         return ["no attempt step"]
     if backoff is None:
-        problems.append(f"no `{BACKOFF_PREFIX}{base}` step")
+        problems.append(f"no `{_backoff_name(base)}` step")
     if retry is None:
         problems.append(f"no `{base}{RETRY_SUFFIX}` step")
     if backoff is None or retry is None:
         return problems
-    if not (attempt.index < backoff.index < retry.index):
+    if not (attempt.step_index < backoff.step_index < retry.step_index):
         problems.append("attempt, backoff, and retry are out of order")
     if not _continue_on_error(attempt.step):
         problems.append("attempt carries no `continue-on-error: true`, so the retry is dead")
@@ -460,6 +601,37 @@ def _trio_problems(base: str, trio: Trio) -> list[str]:
 
 def _render(entries: list[Identity]) -> str:
     return "\n".join(f"  {filename} :: {job} :: {name}" for filename, job, name in sorted(entries))
+
+
+def test_failure_class_summaries_are_not_retries() -> None:
+    """Recording build-failed or test-failed does not re-run the failed step.
+
+    The summary's `if` names `steps.<id>.outcome` so it can tell a build
+    failure from a ladder failure. That reference is also how a retry guard
+    is recognized. A step whose entire `run` is the class echo is not a retry.
+    Adding a command, or turning the step into an action, puts it back under
+    the closed-world rule.
+    """
+    found: list[Identity] = []
+    for filename, job_id, _index, step in _iter_steps():
+        if not _is_failure_class_summary(step):
+            continue
+        found.append((filename, job_id, _step_name(step) or "<unnamed>"))
+        assert not _carries_retry(step), found[-1]
+    assert found, "the graded ladder workflows must record build-failed and test-failed"
+    hidden = {
+        "name": "Record a build failure",
+        "if": "steps.build.outcome == 'failure'",
+        "run": 'echo build-failed >> "$GITHUB_STEP_SUMMARY"\ncargo test',
+    }
+    assert _carries_retry(hidden)
+    action = {
+        "name": "Record a build failure",
+        "uses": "actions/checkout@v7",
+        "run": 'echo build-failed >> "$GITHUB_STEP_SUMMARY"',
+        "if": "steps.build.outcome == 'failure'",
+    }
+    assert _carries_retry(action)
 
 
 def test_rule_1_every_retry_carrying_step_is_allowlisted() -> None:
@@ -520,7 +692,7 @@ def test_rule_3_every_allowlisted_step_is_an_acquisition_step() -> None:
     ineligible: list[Identity] = []
     for filename, job_id, _index, step in _iter_steps():
         name = _step_name(step)
-        if name is None or name.startswith(BACKOFF_PREFIX):
+        if name is None or name == _backoff_name(_base_name(name)):
             # The backoff step is a sleep, not an attempt, so it is not held to
             # the acquisition rule.
             continue
@@ -606,7 +778,7 @@ def test_rule_4_no_protected_step_carries_a_retry() -> None:
         "eligible acquisition, or it is not retrying:\n" + _render(unaccounted)
     )
     # Positive exercise of `_run_retry_construct` against real workflow steps.
-    # Both readiness polls use a loop keyword together with a sleep, so all this
+    # The exempt readiness polls use a loop keyword with a sleep, so all this
     # guards is the LOOP_KEYWORDS and SLEEP_CALL half of the helper: a typo in
     # either would satisfy every rule above just as well as a clean repository.
     #
@@ -733,6 +905,27 @@ def test_rule_6_every_allowlisted_wrap_is_a_complete_faithful_trio() -> None:
         f"implies {expected}. Either a wrap's attempt step vanished or it stopped "
         "being a `uses:` step, and this rule silently stopped checking it"
     )
+
+
+def test_grouped_acquisition_names_and_trios() -> None:
+    steps = _load_workflows()["ci.yaml"]["jobs"]["image-proofs"]["steps"]
+    for base in ("Docker daemon: Set up Buildx", "Toolchain: Install uv"):
+        assert ("ci.yaml", "image-proofs", base) in RETRY_ALLOWLIST
+        assert _base_name(_backoff_name(base)) == _base_name(base + RETRY_SUFFIX) == base
+        assert _carries_retry({"name": _backoff_name(base)})
+        assert not _trio_problems(base, _locate_trio(steps, base))
+        for missing in (_backoff_name(base), base + RETRY_SUFFIX):
+            reduced = [step for step in steps if step.get("name") != missing]
+            assert f"no `{missing}` step" in _trio_problems(base, _locate_trio(reduced, base))
+
+
+def test_a_grouped_proof_retry_is_rejected(monkeypatch: pytest.MonkeyPatch) -> None:
+    base = "Toolchain: Repository toolchain proof"
+    assert ("ci.yaml", "image-proofs", base) in PROTECTED_STEPS
+    retry = ("ci.yaml", "image-proofs", 0, {"name": base + RETRY_SUFFIX})
+    monkeypatch.setitem(globals(), "_iter_steps", lambda: iter([retry]))
+    with pytest.raises(AssertionError, match="not on RETRY_ALLOWLIST"):
+        test_rule_1_every_retry_carrying_step_is_allowlisted()
 
 
 def test_run_retry_construct_detects_every_constructed_shape() -> None:

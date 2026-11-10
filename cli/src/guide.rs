@@ -29,6 +29,7 @@ pub struct Primer {
     pub parity_ladder: Vec<Rung>,
     pub decision_logic: Vec<Decision>,
     pub approvals: Approvals,
+    pub cron: Cron,
     pub landmines: Vec<Landmine>,
     pub recovery: Vec<Recovery>,
 }
@@ -47,6 +48,22 @@ pub struct Approvals {
 
 #[derive(Serialize)]
 pub struct ApprovalFact {
+    pub title: &'static str,
+    pub detail: &'static str,
+}
+
+/// Scheduled turns (#4012). Nothing in the command tree says a bundle can
+/// declare `triggers`: the `schedules` and `hook fire` verbs read a record the
+/// manifest field creates, so without this section the feature is invisible.
+#[derive(Serialize)]
+pub struct Cron {
+    pub summary: &'static str,
+    pub facts: Vec<CronFact>,
+    pub commands: Vec<&'static str>,
+}
+
+#[derive(Serialize)]
+pub struct CronFact {
     pub title: &'static str,
     pub detail: &'static str,
 }
@@ -320,6 +337,57 @@ pub fn primer() -> Primer {
                 "curie local approvals <AGENT> --resolve <id>",
             ],
         },
+        cron: Cron {
+            summary: "A bundle can wake its agent on a schedule. The worker's scheduler fires \
+                      each declared cron trigger for every in-force deployment and records each \
+                      slot as one run, so schedules exist at the local and cluster tiers. A \
+                      fresh scaffold declares none.",
+            facts: vec![
+                CronFact {
+                    title: "Declaring one",
+                    detail: "Add a `triggers` array to .claude-plugin/plugin.json. Each entry is \
+                             {type: \"cron\", name, schedule, timezone, target, prompt}. `name` \
+                             is required and unique; it keys the run history, so renaming a \
+                             trigger starts a new one. `schedule` is a required five-field cron \
+                             expression (names such as FRI are allowed). `timezone` is an \
+                             optional IANA zone, default UTC. `prompt` is the required text of \
+                             the scheduled turn.",
+                },
+                CronFact {
+                    title: "Targeted or targetless",
+                    detail: "`target` is optional. When set it must be a channel bound to the \
+                             agent, and the reply is a new top-level post there. When omitted \
+                             the turn is targetless: it runs silently and posts nothing.",
+                },
+                CronFact {
+                    title: "A targetless turn cannot wait for approval",
+                    detail: "A targetless turn that hits an approval gate records `failed` and \
+                             the tool never runs. Give the trigger a `target` if its work needs \
+                             approval.",
+                },
+                CronFact {
+                    title: "Reading and firing",
+                    detail: "`schedules` lists each cron hook on the in-force deployment with \
+                             its newest slot and outcome (ran, failed, blocked, deferred, \
+                             skipped, reclaimed); `--agent` limits it to one agent. \
+                             `hook fire <AGENT> <NAME>` runs a hook now and prints its run \
+                             record.",
+                },
+                CronFact {
+                    title: "The skill tier has no scheduler",
+                    detail: "`skill hook fire <NAME>` runs the prompt against the local runner \
+                             and writes no run record. `skill schedules` is refused: that tier \
+                             has no scheduler and no run record.",
+                },
+            ],
+            commands: vec![
+                "curie local schedules",
+                "curie local hook fire <AGENT> <NAME>",
+                "curie cluster schedules",
+                "curie cluster hook fire <AGENT> <NAME>",
+                "curie skill hook fire <NAME>",
+            ],
+        },
         landmines: vec![
             Landmine {
                 title: "A terminal principal has no channel membership",
@@ -354,8 +422,8 @@ pub fn primer() -> Primer {
                 detail: "When you are asked to get a bundle running, do the plumbing yourself -- source the bundle's dotenv, run `curie local up`, `curie local deploy`, and `curie local comms --slack`, then tear down -- rather than handing the human a shell checklist to copy-paste. Two parts are irreducibly manual and stay with the human: supplying the actual secret VALUES (never type a credential or API key yourself) and creating an external app in a browser to mint its tokens (e.g. the Slack app). Automate everything between. If a credential already lives in the environment or the bundle's own `.env`, use it instead of asking for it to be exported.",
             },
             Landmine {
-                title: "Missing gVisor is inferred only from admission",
-                detail: "A real model install first keeps the gVisor chart default. When admission reports exactly that RuntimeClass gvisor is not found, direct `curie cluster up` shows that attempt as retrying, applies security.gvisor.mode=off, prints the override, and retries once. Other failures remain closed. Explicit auto or require modes contradict the detected result and are errors.",
+                title: "Missing gVisor is inferred from a NotFound lookup, or from admission when that lookup is forbidden",
+                detail: "Direct `curie cluster up` looks up the configured RuntimeClass before the first install. A GET that returns NotFound applies security.gvisor.mode=off before the first install and prints the same inference. When that lookup is Forbidden, the chart default stays, `curie-preflight-gvisor` may report that RuntimeClass gvisor is not found, the attempt shows as retrying, the override is applied, and direct `curie cluster up` retries once. Other failures remain closed. Explicit auto or require modes contradict the detected result and are errors. A present RuntimeClass whose nodeSelector matches no node also infers security.gvisor.mode=off before the first install, including fake-model auto installs with the preflight enabled; explicit auto is an error, while explicit require keeps the preflight gate for clusters that provision sandbox nodes on demand.",
             },
         ],
         recovery: vec![
@@ -365,11 +433,11 @@ pub fn primer() -> Primer {
             },
             Recovery {
                 symptom: "`curie cluster up` fails immediately when `curie-preflight-gvisor` reports `FailedCreate`: `RuntimeClass \"gvisor\" not found`",
-                fix: "Plain `curie cluster up` now infers security.gvisor.mode=off from this exact admission result and retries once. If you explicitly set auto or require, remove that setting to accept the detected posture, or install runsc on the nodes.",
+                fix: "A NotFound lookup already applied security.gvisor.mode=off before the first install. A forbidden lookup still retries once from this exact admission result. If you explicitly set auto or require, remove that setting to accept the detected posture, or install runsc on the nodes.",
             },
             Recovery {
                 symptom: "`curie cluster up` hangs ~2 min then dies with `job curie-preflight-gvisor failed: DeadlineExceeded`",
-                fix: "The Kubernetes Event watch was unavailable, so Helm reported the later deadline. A real-model install on a cluster with no `runsc` RuntimeClass still fails closed. Opt out with `curie cluster up --set security.gvisor.mode=off`, or use `--fake-model`, or install runsc on the nodes.",
+                fix: "The Kubernetes Event watch was unavailable, so Helm reported the later deadline. That case stays fail closed: Curie did not read a RuntimeClass lookup or an admission result from the deadline itself. Opt out with `curie cluster up --set security.gvisor.mode=off`, or use `--fake-model`, or install runsc on the nodes.",
             },
             Recovery {
                 symptom: "\"(no response)\" or an empty reply",
@@ -475,6 +543,17 @@ fn render_markdown(p: &Primer) -> String {
         s.push_str(&format!("- **{}**\n  {}\n\n", f.title, f.detail));
     }
     for c in &p.approvals.commands {
+        s.push_str(&format!("    {c}\n"));
+    }
+    s.push('\n');
+
+    s.push_str("## Cron triggers\n\n");
+    s.push_str(p.cron.summary);
+    s.push_str("\n\n");
+    for f in &p.cron.facts {
+        s.push_str(&format!("- **{}**\n  {}\n\n", f.title, f.detail));
+    }
+    for c in &p.cron.commands {
         s.push_str(&format!("    {c}\n"));
     }
     s.push('\n');

@@ -11,7 +11,7 @@
 //! (AGENTS.md). The cluster tier also gets the case only it can have: a
 //! malformed id is refused before the connection is discovered.
 
-mod support;
+use crate::support;
 
 use std::process::Command;
 use support::{serve, MockServer, Response};

@@ -1,4 +1,5 @@
 {{- if .Values.otelCollector.deploy }}
+{{- $checksumExtraEnv := include "curie.extraEnv" (dict "root" . "workload" "otelCollector" "env" .Values.otelCollector.extraEnv) -}}
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -72,7 +73,7 @@ subjects:
 apiVersion: v1
 kind: Service
 metadata:
-  name: {{ include "curie.fullname" . }}-otel-collector
+  name: {{ include "curie.checkedObjectName" (dict "kind" "Service" "name" (printf "%s-otel-collector" (include "curie.fullname" .))) }}
   labels:
     {{- include "curie.labels" . | nindent 4 }}
 spec:
@@ -107,6 +108,13 @@ spec:
   template:
     metadata:
       annotations:
+        {{- with (include "curie.secretChecksum" (dict
+        "root" $
+        "keys" (list )
+        "refs" (list (dict "name" (include "curie.otlpAuthHeaderSecretName" $) "key" "otlpAuthHeader"))
+        "env" $checksumExtraEnv)) }}
+        checksum/secret: {{ . }}
+        {{- end }}
         {{- with (include "curie.placement.annotations" (dict "root" $ "class" "platform")) }}
         {{- . | nindent 8 }}
         {{- end }}
@@ -144,6 +152,7 @@ spec:
           emptyDir:
             sizeLimit: {{ .Values.otelCollector.persistence.size }}
           {{- end }}
+      enableServiceLinks: false
       containers:
         - name: otel-collector
           image: {{ .Values.otelCollector.image }}
@@ -159,7 +168,7 @@ spec:
                 secretKeyRef:
                   name: {{ include "curie.otlpAuthHeaderSecretName" . }}
                   key: otlpAuthHeader
-            {{- include "curie.extraEnv" (dict "root" . "workload" "otelCollector" "env" .Values.otelCollector.extraEnv) | nindent 12 }}
+            {{- $checksumExtraEnv | nindent 12 }}
           ports:
             - name: otlp-grpc
               containerPort: 4317

@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 from pathlib import Path
 from typing import Any
 
@@ -21,8 +22,9 @@ from curie_runner.approval import APPROVAL_SERVER_NAME
 from curie_runner.connectors import build_mcp_servers, derive_mcp_servers
 from curie_runner.mcp_tool_capability import McpToolCapabilityProbe
 from curie_runner.plugin import PluginBundleError
-from curie_runner.state import STATE_SERVER_NAME
+from curie_runner.tool_names import STATE_SERVER_NAME
 from plugin_format.connectors import RESERVED_CONNECTOR_NAMES
+from runner_boot_session import initialized_session_sync
 
 HOSTED = "connectors:\n  grafana:\n    image: grafana/mcp-grafana:0.17.2\n    secrets: [T]\n"
 REMOTE = "connectors:\n  internal:\n    url: https://mcp.internal/mcp\n"
@@ -71,7 +73,7 @@ def _boot_options(
 
     monkeypatch.setattr(boot, "probe_mcp_tool_capability", probe)
     monkeypatch.setattr(boot, "ClaudeAgentSession", _CapturedSession)
-    session = build_runner(config, fake_model=False)._factory()
+    session = initialized_session_sync(build_runner(config, fake_model=False))
     assert isinstance(session, _CapturedSession)
     return session.options
 
@@ -300,13 +302,6 @@ def test_the_cluster_still_uses_the_service_it_created(tmp_path: Path) -> None:
     servers = derive_mcp_servers(_bundle(tmp_path, HOSTED_WITH_FALLBACK), **SCOPE)
     assert "svc.cluster.local" in servers["grafana"]["url"]
     assert "8765" not in servers["grafana"]["url"]
-
-
-def test_a_hosted_connector_without_a_fallback_still_mounts_nothing(tmp_path: Path) -> None:
-    servers = derive_mcp_servers(
-        _bundle(tmp_path, HOSTED), release=None, agent=None, namespace=None
-    )
-    assert servers == {}
 
 
 # --------------------------------------------------------------------------- #
@@ -787,27 +782,46 @@ def test_a_name_in_both_channels_fails_the_boot_instead_of_picking_a_winner(
 
 
 def test_the_reserved_list_matches_the_runner_constants() -> None:
-    # plugin_format re-enumerates these names because runner depends on it and
-    # never the reverse. This is the pin that keeps the copy honest: rename
-    # either constant here and the deploy-time guard stops fencing it.
-    assert RESERVED_CONNECTOR_NAMES == {APPROVAL_SERVER_NAME, STATE_SERVER_NAME}
+    from plugin_format.connectors import CHANNEL_READ_SERVER_NAME
+
+    assert RESERVED_CONNECTOR_NAMES == {
+        APPROVAL_SERVER_NAME,
+        STATE_SERVER_NAME,
+        CHANNEL_READ_SERVER_NAME,
+    }
 
 
-def test_the_boot_mounts_exactly_the_reserved_platform_servers(tmp_path, monkeypatch) -> None:
-    # #2286. Pinned against the boot MOUNT, not against another constant: the
-    # sibling above already pins RESERVED_CONNECTOR_NAMES against the two runner
-    # constants, and two constants can agree with each other and both be wrong
-    # about what this boot actually mounted. A platform server mounted without
-    # being reserved is denied for every policy-bearing bundle, which is exactly
-    # the #2286 defect recurring, so this reddens instead.
+@pytest.mark.parametrize("grant", [None, False, True], ids=["absent", "false", "true"])
+@pytest.mark.parametrize("wildcard_policy", [False, True], ids=["no-policy", "wildcard-policy"])
+def test_the_boot_mounts_only_active_platform_servers(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, grant: bool | None, wildcard_policy: bool
+) -> None:
+    # The grant alone mounts curie-slack on a real-model boot (#2877). Absent
+    # or false mounts nothing, and a wildcard policy never mounts it either:
+    # a pattern governs a mounted tool, it does not grant one.
     env = _boot_env(monkeypatch, tmp_path, "platform-set")
+    manifest_path = Path(env["CURIE_PLUGIN_DIR"]) / ".claude-plugin" / "plugin.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    if grant is not None:
+        manifest["channelRead"] = grant
+    if wildcard_policy:
+        manifest["toolPolicy"] = {
+            "enforcement": "curie/mcp-tool-policy@1",
+            "allow": ["*/*"],
+        }
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
     mounted = _boot_options(
         monkeypatch,
         RunnerConfig.from_env(env),
         potential_write=True,
     ).mcp_servers
 
-    assert set(mounted) == set(RESERVED_CONNECTOR_NAMES)
+    if grant is True:
+        assert set(mounted) == {APPROVAL_SERVER_NAME, STATE_SERVER_NAME, "curie-slack"}
+    else:
+        assert set(mounted) == {APPROVAL_SERVER_NAME, STATE_SERVER_NAME}
+        assert "curie-slack" not in mounted
+    assert set(mounted) <= RESERVED_CONNECTOR_NAMES
 
 
 def _published_live_tool_names(mcp_servers: dict[str, Any]) -> set[str]:
@@ -865,11 +879,32 @@ def test_the_tool_policy_exemption_set_matches_what_the_boot_publishes(
     assert set(mounted) == {APPROVAL_SERVER_NAME, STATE_SERVER_NAME}
     # report_progress mounts only when the worker injected the progress env
     # (#3077); its name is exempt regardless, like an omitted request_approval.
-    from curie_runner.approval import PROGRESS_TOOL_NAME
+    # get_issue (ADR 0187) mounts only with the worker's issue read env.
+    from curie_runner.approval import ISSUE_TOOL_NAME, PROGRESS_TOOL_NAME
 
     assert _published_live_tool_names(mounted) == platform_tool_names(state_server_mounted=True) - {
-        PROGRESS_TOOL_NAME
+        PROGRESS_TOOL_NAME,
+        ISSUE_TOOL_NAME,
     }
+
+
+def test_a_work_item_boot_mounts_get_issue_and_exempts_it(tmp_path, monkeypatch) -> None:
+    # ADR 0187: an execution with a WorkItem boots with the API's issue read
+    # route and capability, and only that boot publishes get_issue.
+    from curie_runner.approval import ISSUE_TOOL_NAME, PROGRESS_TOOL_NAME, platform_tool_names
+
+    env = _boot_env(monkeypatch, tmp_path, "issue-read")
+    monkeypatch.setenv("CURIE_ISSUE_READ_URL", "http://api.example/work-items/issue-read")
+    monkeypatch.setenv("CURIE_ISSUE_READ_TOKEN", "wir.example-capability.signature")
+    mounted = _boot_options(
+        monkeypatch,
+        RunnerConfig.from_env(env),
+        potential_write=True,
+    ).mcp_servers
+
+    published = _published_live_tool_names(mounted)
+    assert ISSUE_TOOL_NAME in published
+    assert published == platform_tool_names(state_server_mounted=True) - {PROGRESS_TOOL_NAME}
 
 
 def test_a_boot_without_a_state_url_publishes_and_exempts_no_state_tools(
@@ -895,9 +930,12 @@ def test_a_boot_without_a_state_url_publishes_and_exempts_no_state_tools(
 
     assert set(mounted) == {APPROVAL_SERVER_NAME}
     published = _published_live_tool_names(mounted)
-    from curie_runner.approval import PROGRESS_TOOL_NAME
+    from curie_runner.approval import ISSUE_TOOL_NAME, PROGRESS_TOOL_NAME
 
-    assert published == platform_tool_names(state_server_mounted=False) - {PROGRESS_TOOL_NAME}
+    assert published == platform_tool_names(state_server_mounted=False) - {
+        PROGRESS_TOOL_NAME,
+        ISSUE_TOOL_NAME,
+    }
     assert not any(name.startswith(f"mcp__{STATE_SERVER_NAME}__") for name in published)
 
 
@@ -1107,12 +1145,54 @@ def test_build_runner_expands_the_bearer_and_drops_it_from_spawn_env(
 
     monkeypatch.setattr(boot, "probe_mcp_tool_capability", probe)
     monkeypatch.setattr(boot, "ClaudeAgentSession", _CapturedSession)
-    session = build_runner(config, fake_model=False, sdk_env=spawn)._factory()
+    session = initialized_session_sync(build_runner(config, fake_model=False, sdk_env=spawn))
     assert isinstance(session, _CapturedSession)
     assert "GITHUB_PERSONAL_ACCESS_TOKEN" not in spawn
     assert spawn["STDIO_TOKEN"] == "keep-me"
     github = session.options.mcp_servers["github"]
     assert github["headers"]["Authorization"] == "Bearer ghp_sentinel"
+
+
+def test_optional_binding_is_projected_before_hosted_secret_cleanup(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.delenv("CURIE_STATE_URL", raising=False)
+    monkeypatch.setenv("GITHUB_PERSONAL_ACCESS_TOKEN", "example-shared-token")
+    root = _bundle(
+        tmp_path,
+        GITHUB,
+        mcp={
+            "mcpServers": {
+                "stdio": {"command": "node", "env": {"TOKEN": "${GITHUB_PERSONAL_ACCESS_TOKEN}"}}
+            }
+        },
+    )
+    manifest_path = root / ".claude-plugin/plugin.json"
+    manifest = json.loads(manifest_path.read_text())
+    manifest["optionalSecrets"] = ["GITHUB_PERSONAL_ACCESS_TOKEN"]
+    manifest_path.write_text(json.dumps(manifest))
+    before = (root / ".mcp.json").read_bytes()
+    config = _config_for(root, release="curie", agent="acme-dev", namespace="curie")
+    spawn = {"GITHUB_PERSONAL_ACCESS_TOKEN": "example-shared-token"}
+
+    async def probe(*_args: Any, **_kwargs: Any) -> McpToolCapabilityProbe:
+        return McpToolCapabilityProbe(complete=True, has_potential_write_tool=False, tool_count=0)
+
+    monkeypatch.setattr(boot, "probe_mcp_tool_capability", probe)
+    monkeypatch.setattr(boot, "ClaudeAgentSession", _CapturedSession)
+    runner = build_runner(config, fake_model=False, sdk_env=spawn)
+    session = initialized_session_sync(runner)
+    assert isinstance(session, _CapturedSession)
+    # Bound is judged at boot, before hosted credential custody removes the
+    # process variable. Preserve existing stdio placeholder semantics; this is
+    # not a claim that sharing hosted/stdio credentials authenticates stdio.
+    servers = session.options.mcp_servers
+    assert servers["plugin:b:stdio"]["env"]["TOKEN"] == "${GITHUB_PERSONAL_ACCESS_TOKEN}"
+    assert servers["github"]["headers"]["Authorization"] == "Bearer example-shared-token"
+    assert "GITHUB_PERSONAL_ACCESS_TOKEN" not in spawn
+    assert "GITHUB_PERSONAL_ACCESS_TOKEN" not in os.environ
+    assert "example-shared-token" in runner._held_secrets
+    assert (root / ".mcp.json").read_bytes() == before
 
 
 # --------------------------------------------------------------------------- #
@@ -1198,6 +1278,85 @@ def test_a_remote_connector_never_receives_the_grant_header(tmp_path: Path) -> N
     assert servers["grafana"]["headers"][_GRANT_HEADER] == _GRANT_PLACEHOLDER
 
 
+def test_only_a_hosted_entry_with_a_caller_token_is_proxied(tmp_path: Path) -> None:
+    from curie_runner.connectors import proxied_connector_servers
+
+    root = _bundle(tmp_path, HOSTED + REMOTE.replace("connectors:\n", ""))
+    with_token = derive_mcp_servers(root, **SCOPE, caller_header=True, env={})
+    without_token = derive_mcp_servers(root, **SCOPE, caller_header=False, env={})
+    assert proxied_connector_servers(with_token) == frozenset({"grafana"})
+    assert proxied_connector_servers(without_token) == frozenset()
+
+
+@pytest.mark.parametrize(("caller_token", "expected"), [("cct.a.b", {"grafana"}), (None, set())])
+def test_the_boot_tells_the_gate_which_connectors_are_proxied(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caller_token: str | None,
+    expected: set[str],
+) -> None:
+    # Wiring pin: a grantable policy route to a proxied connector tool is
+    # refused in-turn only if build_runner hands the gate the proxied set.
+    monkeypatch.delenv("CURIE_STATE_URL", raising=False)
+    root = _bundle(tmp_path, HOSTED)
+    (root / ".claude-plugin" / "plugin.json").write_text(
+        json.dumps(
+            {
+                "name": "b",
+                "version": "0.1.0",
+                "description": "t",
+                "approvalPolicy": {
+                    "gates": [
+                        {
+                            "gate": "mcp__grafana__update_dashboard",
+                            "route": "ops",
+                            "grantableViaPolicy": True,
+                        }
+                    ]
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    config = _config_for(
+        root, release="curie", agent="acme-dev", namespace="curie", caller_token=caller_token
+    )
+
+    async def probe(*_args: Any, **_kwargs: Any) -> McpToolCapabilityProbe:
+        return McpToolCapabilityProbe(complete=True, has_potential_write_tool=True, tool_count=1)
+
+    monkeypatch.setattr(boot, "probe_mcp_tool_capability", probe)
+    monkeypatch.setattr(boot, "ClaudeAgentSession", _CapturedSession)
+    runner = build_runner(config, fake_model=False)
+    gate = runner._approval_gate
+    assert gate is not None
+    assert gate.proxied_connector_servers == frozenset(expected)
+
+
+# @spec ADR-0168 d7
+def test_a_bundle_stdio_server_cannot_ask_for_the_caller_token(tmp_path: Path) -> None:
+    # The starting point ADR 0240 (Draft) records: naming the token in a bundle
+    # stdio server's env gets it nothing. Only the derived hosted entry is
+    # expanded, and the name is gone from every env before the CLI spawns the
+    # server (#3550).
+    from curie_runner.connectors import materialize_connector_caller_headers
+
+    derived = derive_mcp_servers(_bundle(tmp_path, HOSTED), **SCOPE, caller_header=True)
+    stdio = {
+        "type": "stdio",
+        "command": "review-tools",
+        "env": {"CALLER": _CALLER_PLACEHOLDER},
+    }
+    servers = build_mcp_servers({}, {**derived, "plugin:b:review-tools": stdio})
+    process_env = {"CURIE_CONNECTOR_CALLER_TOKEN": "cct.payload.signature"}
+    spawn_env = dict(process_env)
+    materialize_connector_caller_headers(servers, spawn_env, process_env)
+    assert servers["grafana"]["headers"][_CALLER_HEADER] == "cct.payload.signature"
+    assert servers["plugin:b:review-tools"]["env"] == {"CALLER": _CALLER_PLACEHOLDER}
+    assert "CURIE_CONNECTOR_CALLER_TOKEN" not in spawn_env
+    assert "CURIE_CONNECTOR_CALLER_TOKEN" not in process_env
+
+
 def test_a_fallback_url_never_receives_the_caller_token(tmp_path: Path) -> None:
     servers = derive_mcp_servers(
         _bundle(tmp_path, HOSTED_WITH_FALLBACK),
@@ -1234,7 +1393,7 @@ def test_a_minted_token_is_expanded_into_the_header_and_dropped_from_env(
 
     monkeypatch.setattr(boot, "probe_mcp_tool_capability", probe)
     monkeypatch.setattr(boot, "ClaudeAgentSession", _CapturedSession)
-    session = build_runner(config, fake_model=False, sdk_env=spawn)._factory()
+    session = initialized_session_sync(build_runner(config, fake_model=False, sdk_env=spawn))
     assert isinstance(session, _CapturedSession)
     assert session.options.mcp_servers["github"]["headers"] == {
         _CALLER_HEADER: "cct.payload.signature"

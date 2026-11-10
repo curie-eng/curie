@@ -1,0 +1,115 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.curietech.ai/cli/repo-runner-build/v1.json",
+  "title": "curie build --repo-runner --json",
+  "description": "The `curie build --repo-runner` receipt (ADR 0216): the pushed repository runner image as the Helm values `runner` block of `factory.bindings[].repos[].runner`, ready to paste, plus the platform runner it was built on, the catalog version and the path of the tool manifest inside the image.",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "runner": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "The `repositoryRunner` values block (charts/curie/values.schema.json).",
+      "properties": {
+        "tools": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "enum": [
+              "uv",
+              "rust",
+              "pnpm",
+              "build-essential",
+              "docker-cli"
+            ]
+          },
+          "description": "The selected catalog tools, in catalog order."
+        },
+        "image": {
+          "type": "string",
+          "pattern": "^[^\\s@]+@sha256:[0-9a-f]{64}$",
+          "description": "The pushed image index: `<registry>/curie-repo-runner:r-<16 hex>@sha256:<64 hex>`."
+        },
+        "base": {
+          "type": "string",
+          "pattern": "^sha256:[0-9a-f]{64}$",
+          "description": "The platform runner's manifest digest the image was built on."
+        },
+        "platformDigests": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "linux/amd64",
+            "linux/arm64"
+          ],
+          "properties": {
+            "linux/amd64": {
+              "type": "string",
+              "pattern": "^sha256:[0-9a-f]{64}$"
+            },
+            "linux/arm64": {
+              "type": "string",
+              "pattern": "^sha256:[0-9a-f]{64}$"
+            }
+          },
+          "description": "Each platform's manifest digest inside the pushed index."
+        },
+        "dockerfile": {
+          "type": "string",
+          "minLength": 1,
+          "description": "The operator Dockerfile, relative to the input file's directory. Omitted when none was declared."
+        },
+        "probes": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "name": {
+                "type": "string",
+                "minLength": 1
+              },
+              "command": {
+                "type": "array",
+                "minItems": 1,
+                "items": {
+                  "type": "string"
+                }
+              }
+            },
+            "required": [
+              "name",
+              "command"
+            ]
+          },
+          "description": "The declared extra probes. Omitted when none were declared."
+        }
+      },
+      "required": [
+        "tools",
+        "image",
+        "base",
+        "platformDigests"
+      ]
+    },
+    "platform_runner": {
+      "type": "string",
+      "description": "The digest-pinned platform runner reference the image was built on."
+    },
+    "catalog_version": {
+      "type": "integer",
+      "const": 1,
+      "description": "The tool catalog version the image was built from."
+    },
+    "manifest_path": {
+      "type": "string",
+      "description": "Where the probe manifest lives inside the image."
+    }
+  },
+  "required": [
+    "runner",
+    "platform_runner",
+    "catalog_version",
+    "manifest_path"
+  ]
+}

@@ -3,8 +3,7 @@
 //! it uses only `prepare`/`sync` (already on main) plus a fake kubectl, not the
 //! new wait helpers.
 
-#[path = "support/executable.rs"]
-mod test_executable;
+use crate::support::executable as test_executable;
 
 use curie::connectors::{bind_current_cluster, prepare, sync};
 use curie::exit::{classify, ExitClass};
@@ -12,8 +11,6 @@ use serde_json::json;
 use std::collections::BTreeMap;
 use std::ffi::OsString;
 use std::path::Path;
-
-static PATH_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 fn prepend_path(dir: &Path) -> Option<OsString> {
     let previous = std::env::var_os("PATH");
@@ -34,7 +31,7 @@ fn restore_path(previous: Option<OsString>) {
 /// `sync` nonzero and names the connector plus the recovery command.
 #[tokio::test]
 async fn crashloop_observation_fails_named_connector() {
-    let _lock = PATH_LOCK.lock().await;
+    let _lock = crate::support::ENV_LOCK.lock().await;
     let bin = tempfile::tempdir().expect("bin");
     test_executable::install_in(
         bin.path(),

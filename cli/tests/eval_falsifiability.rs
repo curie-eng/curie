@@ -121,6 +121,7 @@ fn done_turn(text: &str) -> Vec<OutboundEvent> {
         approval_display: None,
         input_tokens: None,
         output_tokens: None,
+        text_mode: None,
     }]
 }
 

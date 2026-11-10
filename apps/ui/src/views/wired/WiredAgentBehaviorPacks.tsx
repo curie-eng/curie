@@ -6,6 +6,12 @@ import {
   putBehaviorPacks,
   ApiError,
   type BehaviorPacksConfig,
+  type GreetingPack,
+  type HelpPack,
+  type LoadPack,
+  type NavPack,
+  type SettingConfig,
+  type TipsPack,
 } from "../../api/client";
 
 // The wired "behavior packs" surface (#870): a small settings-style panel on the
@@ -37,9 +43,42 @@ function cleanList(lines: string[]): string[] {
   return lines.map((l) => l.trim()).filter((l) => l.length > 0);
 }
 
+// The editor's working copy, with every pack and pack field present. The API
+// schema declares all of them optional, so an absent one takes the declared
+// default (off, empty). Declared settings knobs are kept verbatim: the settings
+// pack is read-only here and must round-trip unchanged.
+interface ResolvedPacks {
+  load: Required<LoadPack>;
+  tips: Required<TipsPack>;
+  greeting: Required<GreetingPack>;
+  help: Required<HelpPack>;
+  settings: { enabled: boolean; settings: SettingConfig[] };
+  nav: Required<NavPack>;
+}
+
+function resolvePacks(config: BehaviorPacksConfig): ResolvedPacks {
+  const { load = {}, tips = {}, greeting = {}, help = {}, settings = {}, nav = {} } = config;
+  return {
+    load: { enabled: load.enabled ?? false, lines: load.lines ?? [] },
+    tips: { enabled: tips.enabled ?? false, tips: tips.tips ?? [] },
+    greeting: {
+      enabled: greeting.enabled ?? false,
+      phrases: greeting.phrases ?? [],
+      reply: greeting.reply ?? "",
+    },
+    help: { enabled: help.enabled ?? false, phrases: help.phrases ?? [], reply: help.reply ?? "" },
+    settings: { enabled: settings.enabled ?? false, settings: settings.settings ?? [] },
+    nav: {
+      enabled: nav.enabled ?? false,
+      hub_label: nav.hub_label ?? "",
+      hub_command: nav.hub_command ?? "",
+    },
+  };
+}
+
 // The exact object PUT on save: every list field trimmed + blank-stripped, the
 // rest (nav strings, replies, the read-only settings pack) carried verbatim.
-function cleanConfig(config: BehaviorPacksConfig): BehaviorPacksConfig {
+function cleanConfig(config: ResolvedPacks): BehaviorPacksConfig {
   return {
     ...config,
     load: { ...config.load, lines: cleanList(config.load.lines) },
@@ -177,8 +216,8 @@ function PackSection({
 }
 
 export function WiredAgentBehaviorPacks({ agentId }: { agentId: string }) {
-  const [config, setConfig] = useState<BehaviorPacksConfig | null>(null);
-  const [baseline, setBaseline] = useState<BehaviorPacksConfig | null>(null);
+  const [config, setConfig] = useState<ResolvedPacks | null>(null);
+  const [baseline, setBaseline] = useState<ResolvedPacks | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [saving, setSaving] = useState(false);
@@ -189,7 +228,7 @@ export function WiredAgentBehaviorPacks({ agentId }: { agentId: string }) {
     setLoading(true);
     setError(null);
     try {
-      const cfg = await getBehaviorPacks(agentId);
+      const cfg = resolvePacks(await getBehaviorPacks(agentId));
       setConfig(cfg);
       setBaseline(cfg);
     } catch (e) {
@@ -211,7 +250,7 @@ export function WiredAgentBehaviorPacks({ agentId }: { agentId: string }) {
   );
 
   // Typed patch helper: mutate one pack's slice, clear the transient saved flag.
-  const patch = useCallback((next: Partial<BehaviorPacksConfig>) => {
+  const patch = useCallback((next: Partial<ResolvedPacks>) => {
     setSaved(false);
     setSaveError(null);
     setConfig((prev) => (prev ? { ...prev, ...next } : prev));
@@ -225,7 +264,7 @@ export function WiredAgentBehaviorPacks({ agentId }: { agentId: string }) {
       // Send the cleaned config (blank list lines stripped); adopt the server's
       // echo as the new working copy + baseline so the panel reflects exactly
       // what persisted (and pending blank lines collapse in the editor).
-      const updated = await putBehaviorPacks(agentId, cleanConfig(config));
+      const updated = resolvePacks(await putBehaviorPacks(agentId, cleanConfig(config)));
       setConfig(updated);
       setBaseline(updated);
       setSaved(true);
@@ -400,7 +439,7 @@ export function WiredAgentBehaviorPacks({ agentId }: { agentId: string }) {
                       }}
                     >
                       <span style={{ color: C.text }}>{s.key}</span>
-                      <span style={{ color: C.muted }}>{` · ${s.kind}`}</span>
+                      <span style={{ color: C.muted }}>{` · ${s.kind ?? "str"}`}</span>
                       {s.default ? <span style={{ color: C.muted }}>{` · default ${s.default}`}</span> : null}
                       {s.label ? <span style={{ color: C.muted }}>{` — ${s.label}`}</span> : null}
                     </div>

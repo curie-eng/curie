@@ -1,0 +1,5 @@
+.curie/
+# Written by `curie build --plugin-dir`, and it records YOUR registry and the
+# digests YOUR build resolved, so it belongs to an install rather than to this
+# example.
+connectors.lock.yaml

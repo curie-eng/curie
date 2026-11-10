@@ -1,7 +1,10 @@
+import type { EvalCaseOut } from "../api/client";
+
 export type Nav =
   | "overview"
   | "agents"
   | "work-items"
+  | "factory"
   | "evals"
   | "observability"
   | "versions"
@@ -46,16 +49,8 @@ export interface AppState {
   promotedEvalCases: PromotedEvalCase[];
 }
 
-// An anonymized eval case promoted from a trace (mirrors the API EvalCaseOut).
-export interface PromotedEvalCase {
-  id: string;
-  input: string;
-  grader: {
-    kind: "exact" | "contains" | "regex" | "tool_called";
-    expected: string;
-    case_sensitive: boolean;
-  };
-}
+// An anonymized eval case promoted from a trace: the API's EvalCaseOut as is.
+export type PromotedEvalCase = EvalCaseOut;
 
 export type Action =
   | { type: "go"; nav: Nav }

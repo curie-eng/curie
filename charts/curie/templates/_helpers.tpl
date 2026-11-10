@@ -25,6 +25,16 @@ lifted from Langfuse's chart: flip `deploy` and fill `host` on the same block.
 {{- end -}}
 {{- end -}}
 
+{{/* Fail a render when a fullname-derived object name exceeds the 63 character
+     DNS and label limit. The helper returns the name unchanged. */}}
+{{- define "curie.checkedObjectName" -}}
+{{- $name := .name -}}
+{{- if gt (len $name) 63 -}}
+{{- fail (printf "%s name \"%s\" is %d characters; Kubernetes allows at most 63. Use a shorter release name or fullnameOverride." .kind $name (len $name)) -}}
+{{- end -}}
+{{- $name -}}
+{{- end -}}
+
 {{- define "curie.labels" -}}
 app.kubernetes.io/name: {{ include "curie.name" . }}
 app.kubernetes.io/instance: {{ .Release.Name }}
@@ -128,6 +138,17 @@ affinity:
 {{- printf "%s-secrets" (include "curie.fullname" .) -}}
 {{- end -}}
 
+{{/* ---- Chart-owned runner token Secret name (issue #3821) ----
+     The warm-pod runner bearer lives in its own chart-owned Secret,
+     independent of every `existingSecret` override, so a BYO credentials
+     Secret never has to carry it. runner-token.yaml renders it, and
+     agent-sandbox.yaml (through `curie.sandboxTemplate`: the generic template,
+     every per-agent template, and the security probe fixtures) references it,
+     both by this one name. */}}
+{{- define "curie.runnerTokenSecretName" -}}
+{{- printf "%s-runner-token" (include "curie.fullname" .) -}}
+{{- end -}}
+
 {{/* Resolve a store credential Secret, defaulting to the chart Secret. */}}
 {{- define "curie.storeSecretName" -}}
 {{- .store.existingSecret | default (include "curie.secretName" .root) -}}
@@ -136,6 +157,14 @@ affinity:
 {{/* Dedicated namespace for short-lived publication resources. */}}
 {{- define "curie.publicationNamespace" -}}
 {{- default (printf "%s-%s-publication" .Release.Namespace (include "curie.fullname" .)) .Values.worker.publication.namespace | trunc 63 | trimSuffix "-" -}}
+{{- end -}}
+
+{{/* ADR 0217: the per-run Docker daemon namespace. factory.docker is read
+     through default dict because it is nil under --reuse-values for a release
+     that predates it. */}}
+{{- define "curie.factory.dockerNamespace" -}}
+{{- $docker := get (.Values.factory | default dict) "docker" | default dict -}}
+{{- get $docker "namespace" | default (printf "%s-%s-docker" .Release.Namespace (include "curie.fullname" .)) | toString | trunc 63 | trimSuffix "-" -}}
 {{- end -}}
 
 {{/* ---- Reserved connector-secret boot-env names (#457, ADR-0009) ----
@@ -147,14 +176,64 @@ affinity:
      define's body and fails CI if the two lists drift.
 
      IMPORTANT: the pin scans this body for env-name-shaped uppercase tokens, so
-     the body must contain EXACTLY these eight keys and no other stray ones (this
+     the body must contain EXACTLY the enumerated keys and no other stray ones (this
      comment lives OUTSIDE the define so it is never scanned): the four runner
-     credential keys plus the four redirect/capture-capable keys (#487). The whole
+     credential keys plus the transport-control keys. The whole
      CURIE_ namespace is fenced separately by the hasPrefix rule in the
      connector-secret guard, so it is intentionally absent here. Emitted
      space-separated for consumption via `splitList " "`. */}}
 {{- define "curie.reservedConnectorSecretNames" -}}
-ANTHROPIC_BASE_URL ANTHROPIC_API_KEY CLAUDE_CODE_OAUTH_TOKEN ANTHROPIC_AUTH_TOKEN HTTPS_PROXY HTTP_PROXY NODE_EXTRA_CA_CERTS ANTHROPIC_CUSTOM_HEADERS
+ANTHROPIC_BASE_URL ANTHROPIC_API_KEY CLAUDE_CODE_OAUTH_TOKEN ANTHROPIC_AUTH_TOKEN HTTPS_PROXY HTTP_PROXY ALL_PROXY SSL_CERT_FILE SSL_CERT_DIR NODE_EXTRA_CA_CERTS NODE_TLS_REJECT_UNAUTHORIZED NODE_OPTIONS ANTHROPIC_CUSTOM_HEADERS https_proxy http_proxy all_proxy ssl_cert_file ssl_cert_dir node_extra_ca_certs node_tls_reject_unauthorized node_options anthropic_custom_headers
+{{- end -}}
+
+{{/* @spec ACTION-EXECUTOR-16: the reserved snapshot sealing key names. The
+     source of truth is packages/curie-internal (module sealing_key); Helm
+     cannot import Python, so this is the second copy. Kept apart from
+     curie.reservedConnectorSecretNames because these are not boot-env names:
+     they are refused for a different reason (key custody) with a different
+     message, and the boot-env drift pin scans that define exactly. Emitted
+     space-separated for consumption via `splitList " "`. */}}
+{{- define "curie.sealingKeyNames" -}}
+SNAPSHOT_SEALING_KEY SNAPSHOT_SEALING_KEYS_RETAINED
+{{- end -}}
+
+{{/* Per-agent literal runner environment. Missing values stay empty on retained
+     releases. Environment names follow plugin_format.reserved_env.SECRET_NAME_RE
+     in the frozen plugin-format package: uppercase letters, digits and
+     underscores, with a letter or underscore first. Credential and telemetry
+     names have their own configuration paths. */}}
+{{- define "curie.agentSandboxRunnerEnv" -}}
+{{- $env := dict -}}
+{{- if hasKey .Values.agentSandbox "runnerEnv" -}}
+{{- $env = get .Values.agentSandbox "runnerEnv" -}}
+{{- if not (kindIs "map" $env) -}}
+{{- fail "agentSandbox.runnerEnv must be a map of agent names to environment maps" -}}
+{{- end -}}
+{{- end -}}
+{{- $reserved := splitList " " (trim (include "curie.reservedConnectorSecretNames" .)) -}}
+{{- range $agent, $entries := $env -}}
+{{- if or (gt (len $agent) 40) (not (regexMatch "^[a-z0-9]([a-z0-9-]*[a-z0-9])?$" $agent)) -}}
+{{- fail (printf "agentSandbox.runnerEnv.%s has an invalid agent name" $agent) -}}
+{{- end -}}
+{{- if not (kindIs "map" $entries) -}}
+{{- fail (printf "agentSandbox.runnerEnv.%s must be a map of environment names to strings" $agent) -}}
+{{- end -}}
+{{- range $name, $value := $entries -}}
+{{- if not (regexMatch "^[A-Z_][A-Z0-9_]*$" $name) -}}
+{{- fail (printf "agentSandbox.runnerEnv.%s contains invalid environment variable name %q" $agent $name) -}}
+{{- end -}}
+{{- if or (hasPrefix "CURIE_" $name) (has $name $reserved) -}}
+{{- fail (printf "agentSandbox.runnerEnv.%s contains reserved environment variable %s; configure the runner credentials or platform values instead" $agent $name) -}}
+{{- end -}}
+{{- if hasPrefix "OTEL_" $name -}}
+{{- fail (printf "agentSandbox.runnerEnv.%s contains telemetry environment variable %s; configure otelCollector or agentSandbox.runner.extraEnv globally so chart-managed telemetry egress matches the endpoint" $agent $name) -}}
+{{- end -}}
+{{- if not (kindIs "string" $value) -}}
+{{- fail (printf "agentSandbox.runnerEnv.%s.%s must be a string; quote numeric and boolean values" $agent $name) -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+{{- toJson $env -}}
 {{- end -}}
 
 {{/* ---- Backing-store hosts (in-cluster Service name, or BYO host) ---- */}}
@@ -366,6 +445,25 @@ http
 {{- include "curie.rustfs.scheme" . }}://{{ include "curie.rustfs.host" . }}:{{ .Values.rustfs.port }}
 {{- end -}}
 
+{{/* Storage request for the RustFS `data` claim template (#4408).
+
+     StatefulSet volumeClaimTemplates are immutable, so rendering a new default
+     size against an existing StatefulSet fails every `helm upgrade` that picks
+     up chart defaults. Given the StatefulSet `lookup` returned (an empty dict
+     on a fresh install or under `helm template`/Argo CD), this returns the
+     storage its `data` claim template already requests, else `default`. A
+     pure function of its arguments, so the CI script drives it with a
+     fixture. */}}
+{{- define "curie.rustfs.claimSize" -}}
+{{- $size := "" -}}
+{{- range (dig "spec" "volumeClaimTemplates" list (.statefulSet | default dict)) -}}
+{{- if and (not $size) (eq (dig "metadata" "name" "" .) "data") -}}
+{{- $size = dig "spec" "resources" "requests" "storage" "" . -}}
+{{- end -}}
+{{- end -}}
+{{- $size | default .default -}}
+{{- end -}}
+
 {{/* Whether the object-store clients (api, worker, and the sandbox
      bundle-fetch init container) present static credentials.
 
@@ -504,6 +602,50 @@ http
 
 {{- define "curie.otelCollector.config" -}}
 {{- $debugEnabled := .Values.otelCollector.debugExporter.enabled -}}
+{{- /* @spec charts/curie/README.md: Optional trace processors. */ -}}
+{{- $extraProcessors := dict -}}
+{{- if hasKey .Values.otelCollector "extraProcessors" -}}
+{{- $extraProcessors = get .Values.otelCollector "extraProcessors" -}}
+{{- end -}}
+{{- $traceProcessors := list -}}
+{{- if hasKey .Values.otelCollector "extraTracePipelineProcessors" -}}
+{{- $traceProcessors = get .Values.otelCollector "extraTracePipelineProcessors" -}}
+{{- end -}}
+{{- $builtInProcessors := dict "memory_limiter" true "batch" true "transform/runner_identity" true -}}
+{{- $componentIDPattern := "^[a-z][a-z0-9_]*(/[A-Za-z0-9_-]+)?$" -}}
+{{- if not (kindIs "map" $extraProcessors) -}}
+{{- fail "otelCollector.extraProcessors must be a map of Collector processor IDs to configuration maps." -}}
+{{- end -}}
+{{- if not (kindIs "slice" $traceProcessors) -}}
+{{- fail "otelCollector.extraTracePipelineProcessors must be a list of processor IDs." -}}
+{{- end -}}
+{{- range $name, $config := $extraProcessors -}}
+{{- if hasKey $builtInProcessors $name -}}
+{{- fail (printf "otelCollector.extraProcessors[%q] must not replace built-in processor %q." $name $name) -}}
+{{- end -}}
+{{- if not (regexMatch $componentIDPattern $name) -}}
+{{- fail (printf "otelCollector.extraProcessors[%q] has invalid component ID." $name) -}}
+{{- end -}}
+{{- if not (kindIs "map" $config) -}}
+{{- fail (printf "otelCollector.extraProcessors[%q] must be a map." $name) -}}
+{{- end -}}
+{{- end -}}
+{{- $seenTraceProcessors := dict -}}
+{{- range $processor := $traceProcessors -}}
+{{- if not (kindIs "string" $processor) -}}
+{{- fail "otelCollector.extraTracePipelineProcessors entries must be processor IDs." -}}
+{{- end -}}
+{{- if hasKey $builtInProcessors $processor -}}
+{{- fail (printf "otelCollector.extraTracePipelineProcessors must not select built-in processor %q." $processor) -}}
+{{- end -}}
+{{- if hasKey $seenTraceProcessors $processor -}}
+{{- fail (printf "otelCollector.extraTracePipelineProcessors duplicates processor %q." $processor) -}}
+{{- end -}}
+{{- if not (hasKey $extraProcessors $processor) -}}
+{{- fail (printf "otelCollector.extraTracePipelineProcessors references undefined processor %q." $processor) -}}
+{{- end -}}
+{{- $_ := set $seenTraceProcessors $processor true -}}
+{{- end -}}
 {{- $builtInExporters := dict "otlphttp/langfuse" true "nop/logs" true "nop/metrics" true -}}
 {{- /* Reserve built-in names even when the development-only debug exporter is disabled.
       An extra exporter with one of these keys would otherwise replace chart-owned
@@ -632,6 +774,9 @@ processors:
       - context: datapoint
         statements:
           - 'set(attributes["service.instance.id"], resource.attributes["service.instance.id"]) where resource.attributes["service.name"] == "curie-runner"'
+{{- with $extraProcessors }}
+{{ toYaml . | nindent 2 }}
+{{- end }}
 exporters:
   otlphttp/langfuse:
     endpoint: {{ include "curie.langfuse.url" . }}/api/public/otel
@@ -678,7 +823,7 @@ service:
   pipelines:
     traces:
       receivers: [otlp]
-      processors: [memory_limiter, batch]
+      processors: [memory_limiter{{- range $traceProcessors }}, {{ . }}{{- end }}, batch]
       exporters: [otlphttp/langfuse{{- if $debugEnabled }}, debug{{- end }}{{- range .Values.otelCollector.extraPipelineExporters }}, {{ . }}{{- end }}]
     logs:
       receivers: [otlp{{- if $eventsEnabled }}, k8sobjects/events{{- end }}]
@@ -899,8 +1044,9 @@ Secret is memoized separately from its data so callers can reuse generated
 credentials without losing access to the Secret UID used by the legacy-upgrade
 bridge.
 
-Fresh installs always mint a new identity, including adoption of a retained
-Secret. Upgrades reuse the stored identity; the first upgrade from a chart that
+Sealed fresh installs always mint a new identity, including adoption of a
+retained Secret. Dev installs derive an identity from namespace/release for
+reproducible renders; reinstalling that pair in dev reuses the identity. Upgrades reuse the stored identity; the first upgrade from a chart that
 predates installationId adopts the live Secret UID and enables the one-release
 legacy bridge. A client-only upgrade has no lookup result, so it receives one
 memoized placeholder and marks the identity unobserved for the hook to refuse
@@ -915,7 +1061,13 @@ before contacting Valkey.
 {{- $observed := true -}}
 {{- $legacy := false -}}
 {{- if .Release.IsInstall -}}
+{{- if eq (toString .Values.security.allowDevDefaults) "true" -}}
+{{- /* #1135, ADR-0144: dev renders are reproducible. Reinstalling the same
+namespace/release in dev reuses its identity; sealed installs remain unique. */ -}}
+{{- $installationId = (list .Release.Namespace .Release.Name | toJson | sha256sum | trunc 32) -}}
+{{- else -}}
 {{- $installationId = randAlphaNum 32 -}}
+{{- end -}}
 {{- else if .Release.IsUpgrade -}}
 {{- $encodedId := get $managedSecretData "installationId" | default "" -}}
 {{- $decodedId := "" -}}
@@ -936,7 +1088,13 @@ before contacting Valkey.
 {{- end -}}
 {{- end -}}
 {{- else -}}
+{{- if eq (toString .Values.security.allowDevDefaults) "true" -}}
+{{- /* #1135, ADR-0144: dev renders are reproducible. Reinstalling the same
+namespace/release in dev reuses its identity; sealed installs remain unique. */ -}}
+{{- $installationId = (list .Release.Namespace .Release.Name | toJson | sha256sum | trunc 32) -}}
+{{- else -}}
 {{- $installationId = randAlphaNum 32 -}}
+{{- end -}}
 {{- end -}}
 {{- $_ = set . "_curieInstallationId" $installationId -}}
 {{- $_ = set . "_curieInstallationIdObserved" $observed -}}
@@ -966,8 +1124,8 @@ before contacting Valkey.
      Secret's data), value (.Values.<path>), default (the published dev default),
      hex (true for the 64-hex encryption key, else false).
 
-     The existing Secret's data is looked up ONCE by the caller (secrets.yaml) and
-     passed in as `.existingData` (an always-present dict, empty under `helm
+     The existing Secret's data is looked up ONCE by installationIdentity.init and
+     passed by secretContent.init as `.existingData` (an always-present dict, empty under `helm
      template`/--dry-run/first install), so this helper does no per-key lookup.
 
      A legacy retained values set can omit a key that a newer chart adds. Treat
@@ -1031,6 +1189,117 @@ before contacting Valkey.
 {{- else -}}
 {{- randAlphaNum 32 -}}
 {{- end -}}
+{{- end -}}
+
+{{/* Resolve the full plaintext Secret once per root render (#1135). Every
+consumer checksum and the Secret emission read this same dict, so generated
+credentials and the derived collector header cannot disagree. */}}
+{{- define "curie.secretContent.init" -}}
+{{- if not (hasKey . "_curieSecretContent") -}}
+{{- include "curie.checkDefaultCredentials" . }}
+{{- if eq (toString .Values.api.approvalChatAttesterSecret) (toString .Values.api.apiKey) }}
+{{- fail "api.approvalChatAttesterSecret and api.apiKey must differ. Set the Slack approval attestation credential independently; neither value is printed because both are live credentials." }}
+{{- end }}
+{{- if eq (toString .Values.api.remediationAuthorityKey) (toString .Values.api.apiKey) }}
+{{- fail "api.remediationAuthorityKey and api.apiKey must differ. Binding and arming a remediation policy need an authority the platform key cannot derive (ADR 0231); neither value is printed because both are live credentials." }}
+{{- end }}
+{{- include "curie.installationIdentity.init" . -}}
+{{- $existingSecret := get . "_curieManagedSecret" | default dict -}}
+{{- $existingSecretData := $existingSecret.data | default dict -}}
+{{- include "curie.connectorCallerRefuseKeylessDevExit" (dict "root" . "existingData" $existingSecretData) -}}
+{{- include "curie.testInstallation.check" (dict "root" . "existingData" $existingSecretData) -}}
+{{- $apiKey := .Values.api.apiKey -}}
+{{- if kindIs "invalid" $apiKey -}}
+{{- $apiKey = "curie-dev-key" -}}
+{{- end -}}
+{{- if eq (trim (toString $apiKey)) "" -}}
+{{- fail "api.apiKey must be nonblank. Set a nonblank API key." -}}
+{{- end -}}
+{{- if and (ne (toString .Values.security.allowDevDefaults) "true") (eq (toString $apiKey) "curie-dev-key") (hasKey $existingSecretData "apiKey") -}}
+{{- if eq (trim (index $existingSecretData "apiKey" | b64dec)) "" -}}
+{{- fail "api.apiKey: retained apiKey in the existing chart managed Secret must be nonblank. Set api.apiKey to a nonblank replacement." -}}
+{{- end -}}
+{{- end -}}
+{{- $langfuseInitProjectSecretKey := include "curie.managedSecret" (dict "root" . "key" "langfuseInitProjectSecretKey" "value" .Values.langfuse.init.projectSecretKey "default" "sk-lf-curie-dev" "hex" false "existingData" $existingSecretData) -}}
+{{- $langfuseInitUserPassword := include "curie.managedSecret" (dict "root" . "key" "langfuseInitUserPassword" "value" .Values.langfuse.init.userPassword "default" "curie-dev-password" "hex" false "existingData" $existingSecretData) -}}
+{{- $content := dict -}}
+{{- $gateway := .Values.channelGateway | default dict -}}
+{{- range $caller := list "api" "worker" -}}
+{{- $key := printf "channelGateway%sToken" (title $caller) -}}
+{{- $_ := set $content $key (include "curie.managedSecret" (dict "root" $ "key" $key "value" (index $gateway (printf "%sToken" $caller)) "default" (printf "curie-dev-gateway-%s" $caller) "hex" false "existingData" $existingSecretData)) -}}
+{{- end -}}
+
+{{- $_ := set $content "installationId" ((include "curie.installationId" .) | toString) -}}
+{{- $_ := set $content "postgresPassword" ((include "curie.managedSecret" (dict "root" . "key" "postgresPassword" "value" .Values.postgres.auth.password "default" "postgres" "hex" false "existingData" $existingSecretData)) | toString) -}}
+{{- $_ := set $content "valkeyPassword" ((include "curie.managedSecret" (dict "root" . "key" "valkeyPassword" "value" .Values.valkey.password "default" "valkeypass" "hex" false "existingData" $existingSecretData)) | toString) -}}
+{{- $_ := set $content "clickhousePassword" ((include "curie.managedSecret" (dict "root" . "key" "clickhousePassword" "value" .Values.clickhouse.auth.password "default" "clickhouse" "hex" false "existingData" $existingSecretData)) | toString) -}}
+{{- $_ := set $content "rustfsSecretKey" ((include "curie.managedSecret" (dict "root" . "key" "rustfsSecretKey" "value" .Values.rustfs.auth.secretKey "default" "rustfssecret" "hex" false "existingData" $existingSecretData)) | toString) -}}
+{{- $_ := set $content "langfuseSalt" ((include "curie.managedSecret" (dict "root" . "key" "langfuseSalt" "value" .Values.langfuse.salt "default" "dev-salt-change-me" "hex" false "existingData" $existingSecretData)) | toString) -}}
+{{- $_ := set $content "langfuseEncryptionKey" ((include "curie.managedSecret" (dict "root" . "key" "langfuseEncryptionKey" "value" .Values.langfuse.encryptionKey "default" "0000000000000000000000000000000000000000000000000000000000000000" "hex" true "existingData" $existingSecretData)) | toString) -}}
+{{- $_ := set $content "langfuseNextauthSecret" ((include "curie.managedSecret" (dict "root" . "key" "langfuseNextauthSecret" "value" .Values.langfuse.nextauthSecret "default" "dev-nextauth-secret-change-me" "hex" false "existingData" $existingSecretData)) | toString) -}}
+{{- $_ := set $content "langfuseInitProjectSecretKey" (($langfuseInitProjectSecretKey) | toString) -}}
+{{- $_ := set $content "langfuseInitUserPassword" (($langfuseInitUserPassword) | toString) -}}
+{{- if eq (include "curie.otlpAuthHeaderSecretName" .) (include "curie.secretName" .) -}}
+{{- $_ := set $content "otlpAuthHeader" ((.Values.otelCollector.otlpAuthHeader | default (printf "Basic %s" (printf "%s:%s" .Values.langfuse.init.projectPublicKey $langfuseInitProjectSecretKey | b64enc))) | toString) -}}
+{{- end -}}
+{{- $_ := set $content "agentCredentials" (ternary "" (toString .Values.agentSandbox.runner.credentials) (kindIs "invalid" .Values.agentSandbox.runner.credentials)) -}}
+{{- $_ := set $content "adapterCredentials" ((include "curie.adapterCredentials" .) | toString) -}}
+{{- $_ := set $content "apiKey" ((include "curie.managedSecret" (dict "root" . "key" "apiKey" "value" .Values.api.apiKey "default" "curie-dev-key" "hex" false "existingData" $existingSecretData)) | toString) -}}
+{{- $_ := set $content "approvalChatAttesterSecret" ((include "curie.managedSecret" (dict "root" . "key" "approvalChatAttesterSecret" "value" .Values.api.approvalChatAttesterSecret "default" "curie-dev-approval-chat-attester" "hex" false "existingData" $existingSecretData)) | toString) -}}
+{{- $_ := set $content "remediationAuthorityKey" ((include "curie.managedSecret" (dict "root" . "key" "remediationAuthorityKey" "value" .Values.api.remediationAuthorityKey "default" "curie-dev-remediation-authority" "hex" false "existingData" $existingSecretData)) | toString) -}}
+{{/* The values check above cannot see a credential the managed Secret retained
+     from an earlier install; compare what the Secret will actually hold. */}}
+{{- if eq (index $content "remediationAuthorityKey") (index $content "apiKey") -}}
+{{- fail "api.remediationAuthorityKey and api.apiKey resolve to the same retained credential. Set api.remediationAuthorityKey to an independent value (ADR 0231); neither value is printed because both are live credentials." -}}
+{{- end -}}
+{{- $_ := set $content "internalWorkerToken" ((include "curie.managedSecret" (dict "root" . "key" "internalWorkerToken" "value" .Values.worker.internalWorkerToken "default" "curie-dev-worker-token" "hex" false "existingData" $existingSecretData)) | toString) -}}
+{{- $_ := set $content "githubWebhookSecret" ((include "curie.managedSecret" (dict "root" . "key" "githubWebhookSecret" "value" .Values.api.githubWebhookSecret "default" "dev-webhook-secret" "hex" false "existingData" $existingSecretData)) | toString) -}}
+{{- $_ := set $content "githubToken" ((.Values.api.githubToken | default "") | toString) -}}
+{{- $_ := set $content "githubAppPrivateKey" ((.Values.api.githubAppPrivateKey | default "") | toString) -}}
+{{- $_ := set $content "sealingPrivateKey" ((.Values.sealing.privateKey | default "") | toString) -}}
+{{- $_ := set $content "sealingPreviousPrivateKey" ((.Values.sealing.previousPrivateKey | default "") | toString) -}}
+{{- $_ := set $content "connectorCallerSigningKey" ((include "curie.connectorCallerSigningKey" .) | toString) -}}
+{{- $_ := set $content "connectorCallerVerifyKey" ((include "curie.connectorCallerVerifyKey" .) | toString) -}}
+{{- $_ := set $content "slackAppToken" (ternary "" (toString .Values.dispatcher.slack.appToken) (kindIs "invalid" .Values.dispatcher.slack.appToken)) -}}
+{{- $_ := set $content "slackBotToken" (ternary "" (toString .Values.dispatcher.slack.botToken) (kindIs "invalid" .Values.dispatcher.slack.botToken)) -}}
+{{- $_ := set $content "slackSigningSecret" (ternary "" (toString .Values.dispatcher.slack.signingSecret) (kindIs "invalid" .Values.dispatcher.slack.signingSecret)) -}}
+{{- if not .Values.mailAdapter.agentmail.apiKeyExistingSecret -}}
+{{- $_ := set $content "mailAgentmailApiKey" (ternary "" (toString .Values.mailAdapter.agentmail.apiKey) (kindIs "invalid" .Values.mailAdapter.agentmail.apiKey)) -}}
+{{- end -}}
+{{- if not .Values.mailAdapter.channelTokenExistingSecret -}}
+{{- $_ := set $content "mailChannelToken" (ternary "" (toString .Values.mailAdapter.channelToken) (kindIs "invalid" .Values.mailAdapter.channelToken)) -}}
+{{- end -}}
+{{- if not .Values.mailAdapter.egressSecretExistingSecret -}}
+{{- $_ := set $content "mailEgressSecret" (ternary "" (toString .Values.mailAdapter.egressSecret) (kindIs "invalid" .Values.mailAdapter.egressSecret)) -}}
+{{- end -}}
+{{- $_ := set . "_curieSecretContent" $content -}}
+{{- end -}}
+{{- end -}}
+
+{{/* Hash only chart-owned keys consumed by this pod. Call with root, keys
+(unconditional chart keys), refs (resolved secretKeyRefs), and env (rendered
+shared/extraEnv fragments). Foreign Secret contents are never looked up here.
+An absent optional key hashes null rather than inventing a credential. */}}
+{{- define "curie.secretChecksum" -}}
+{{- include "curie.secretContent.init" .root -}}
+{{- $secretName := include "curie.secretName" .root -}}
+{{- $content := get .root "_curieSecretContent" -}}
+{{- $refs := .refs | default list -}}
+{{- range (.keys | default list) -}}
+{{- $refs = append $refs (dict "name" $secretName "key" .) -}}
+{{- end -}}
+{{- $env := fromYaml (printf "env:\n%s" ((.env | default "") | indent 2)) -}}
+{{- range ($env.env | default list) -}}
+{{- $ref := get (.valueFrom | default dict) "secretKeyRef" | default dict -}}
+{{- if $ref -}}{{- $refs = append $refs $ref -}}{{- end -}}
+{{- end -}}
+{{- $subset := dict -}}
+{{- range $refs -}}
+{{- if eq .name $secretName -}}
+{{- $_ := set $subset .key (index $content .key) -}}
+{{- end -}}
+{{- end -}}
+{{- if $subset -}}{{- $subset | toJson | sha256sum -}}{{- end -}}
 {{- end -}}
 
 {{/* ---- Shared first-party-app environment fragments ---- */}}
@@ -1684,6 +1953,13 @@ livenessProbe:
      lookup cannot see the RuntimeClass the same install is about to create (nor
      anything under helm template/--dry-run). Fake-model auto still omits the
      class when that lookup is empty. */}}
+{{/* gVisor's sentry reports LinuxVersion via uname -v, independent of pod names.
+     Source: https://github.com/google/gvisor/blob/master/pkg/sentry/kernel/version/version.go
+     Older releases use the same LinuxVersion in pkg/sentry/syscalls/linux/linux64.go. */}}
+{{- define "curie.gvisor.sentryKernelVersion" -}}
+{{- "#1 SMP Sun Jan 10 15:06:54 PST 2016" -}}
+{{- end -}}
+
 {{- define "curie.gvisor.className" -}}
 {{- $g := .Values.security.gvisor -}}
 {{- if eq ($g.mode | default "auto") "off" -}}
@@ -2183,36 +2459,57 @@ securityContext:
 {{- end -}}
 {{/*
 Render the runner-sandbox egress rules for a list of {cidr, ports, except?}
-entries. The dot IS the entry list, and the caller supplies the indentation:
+entries. The argument is a dict: `entries` is the entry list and `root` is the
+chart context (read for security.networkPolicy.clusterCidrs). The caller
+supplies the indentation:
 
-    {{- include "curie.egress.ipBlockRules" .Values.api.egress | trim | nindent 4 }}
+    {{- include "curie.egress.ipBlockRules" (dict "entries" .Values.api.egress "root" $) | trim | nindent 4 }}
 
-Every ipBlock peer rail 1 renders goes through here, so the metadata carve-out
-is stated ONCE. That carve-out is the security invariant: NetworkPolicy allows
-are additive, so an entry broad enough to contain 169.254.169.254 re-permits the
-cloud metadata endpoint rail 1 otherwise denies. An explicit per-entry `except:`
-list wins (an empty one is refused before render by
-curie.objectStore.egressEntry, because it would drop the carve-out); otherwise
-curie.metadataExcept returns a comma-separated list of same-family, subset-safe
-carve-outs for ANY CIDR that contains a metadata address -- not just an exact /0
--- rendered one except line per item, and "" for CIDRs that cannot reach one. See that helper for the containment/family rules.
+Inside this helper `$` is that wrapper dict, not the chart context, so the root
+is captured from `.root` once, before the range rebinds the dot.
+
+Every ipBlock peer rail 1 renders goes through here, so the carve-outs are
+stated ONCE. They are the security invariant: NetworkPolicy allows are
+additive, so an entry broad enough to contain 169.254.169.254 or a private range
+re-permits what rail 1 otherwise denies. Per entry the except list is the
+explicit per-entry `except:` when set (an empty one is refused before render by
+curie.objectStore.egressEntry, because it would drop the carve-out), else
+curie.metadataExcept (same-family, subset-safe metadata carve-outs for ANY CIDR
+that contains a metadata address, not just an exact /0); then every
+curie.privateExcept range (private, link-local, CGNAT, ULA and
+security.networkPolicy.clusterCidrs ranges the CIDR strictly contains, #3842)
+not already listed is appended. A narrow entry equal to or inside a private
+range gets no private except, which is the re-allow path for a private peer.
+See those helpers for the containment/family rules.
 */}}
+{{/* The except list of one egress entry as JSON: its own `except`, else the
+     metadata carve-out, plus every private range its CIDR strictly contains.
+     Args: dict "entry" "root". Shared by ipBlockRules and the publication Job
+     policy so both carve the same ranges. */}}
+{{- define "curie.egress.ipBlockExcept" -}}
+{{- $excepts := list }}
+{{- if .entry.except }}
+{{- $excepts = .entry.except }}
+{{- else }}
+{{- $excepts = without (splitList "," (include "curie.metadataExcept" .entry.cidr | trim)) "" }}
+{{- end }}
+{{- range without (splitList "," (include "curie.privateExcept" (dict "cidr" .entry.cidr "root" .root) | trim)) "" }}
+{{- if not (has . $excepts) }}
+{{- $excepts = append $excepts . }}
+{{- end }}
+{{- end }}
+{{- toJson $excepts }}
+{{- end -}}
 {{- define "curie.egress.ipBlockRules" -}}
-{{- range . }}
+{{- $root := .root }}
+{{- range .entries }}
 - to:
     - ipBlock:
         cidr: {{ .cidr }}
-        {{- if .except }}
+        {{- $excepts := include "curie.egress.ipBlockExcept" (dict "entry" . "root" $root) | fromJsonArray }}
+        {{- if $excepts }}
         except:
-          {{- toYaml .except | nindent 10 }}
-        {{- else }}
-        {{- $auto := include "curie.metadataExcept" .cidr | trim }}
-        {{- if $auto }}
-        except:
-          {{- range splitList "," $auto }}
-          - {{ . }}
-          {{- end }}
-        {{- end }}
+          {{- toYaml $excepts | nindent 10 }}
         {{- end }}
   {{- with .ports }}
   ports:
@@ -2239,14 +2536,544 @@ no {{ .key }} in this container's env: nothing to stage. This is expected for a 
 {{/*
 Agents that get a per-agent runner SandboxTemplate and warm pool, as a JSON
 array: every connectorSecrets agent, every registryEgress agent (#3083), and
-every runnerImages agent (ADR-0173), and every workspaceSizeLimits agent (#3523),
-and every string in agentSandbox.poolAgents.
+every runnerImages agent (ADR-0173), every runnerEnv agent, every workspaceSizeLimits agent (#3523),
+every agentResourceProfiles agent (#4889), every true factory.sandboxEgress, and every string in
+agentSandbox.poolAgents.
 */}}
 {{- define "curie.agentSandboxPoolAgents" -}}
 {{- $extra := list -}}
 {{- if kindIs "slice" .Values.agentSandbox.poolAgents -}}
 {{- $extra = .Values.agentSandbox.poolAgents -}}
 {{- end -}}
-{{- $agents := concat (keys (.Values.agentSandbox.connectorSecrets | default dict)) (keys (.Values.agentSandbox.registryEgress | default dict)) (keys (.Values.agentSandbox.runnerImages | default dict)) (keys (.Values.agentSandbox.workspaceSizeLimits | default dict)) $extra -}}
+{{- $agents := concat (keys (.Values.agentSandbox.connectorSecrets | default dict)) (keys (.Values.agentSandbox.registryEgress | default dict)) (keys (.Values.agentSandbox.runnerImages | default dict)) (keys (include "curie.agentSandboxRunnerEnv" . | fromJson)) (keys (.Values.agentSandbox.workspaceSizeLimits | default dict)) (keys (get .Values.agentSandbox "agentResourceProfiles" | default dict)) (include "curie.factory.sandboxAgents" . | fromJsonArray) $extra -}}
 {{- $agents | uniq | sortAlpha | toJson -}}
+{{- end -}}
+
+{{/*
+The action executor switch (ACTION-EXECUTOR-1): one value, rendered as "true"
+or "false" into both the API and the worker, so the two processes can never
+disagree about whether executions are created and claimed. Read through
+`default dict` because `actionExecutor` is a top level key a release that
+predates it does not carry under --reuse-values (#3505, #3544).
+*/}}
+{{- define "curie.actionExecutorEnabled" -}}
+{{- if (get (.Values.actionExecutor | default dict) "enabled") -}}true{{- else -}}false{{- end -}}
+{{- end -}}
+
+{{/*
+The executor's own connector reads without the reconcile loop (#4800,
+ACTION-EXECUTOR-12 as amended): "true" or "false". On, the worker Role gains a
+single-object `get` on Deployments (and nothing else) and the worker reads the
+acting connector's Deployment and the in-force digest itself, while
+worker.connectorReconciler stays off. It requires the executor, and is refused
+with the reconciler on, where the executor already reads through the
+reconciler's rules. Read through `default dict` for --reuse-values from a
+release that predates the key.
+*/}}
+{{- define "curie.actionExecutorConnectorReads" -}}
+{{- if (get (.Values.actionExecutor | default dict) "connectorReadsWithoutReconciler") -}}
+{{- if ne (include "curie.actionExecutorEnabled" .) "true" -}}
+{{- fail "actionExecutor.connectorReadsWithoutReconciler=true requires actionExecutor.enabled=true: only the executor reads connector Deployments" -}}
+{{- end -}}
+{{- if .Values.worker.connectorReconciler.enabled -}}
+{{- fail "actionExecutor.connectorReadsWithoutReconciler=true is for worker.connectorReconciler.enabled=false: with the reconciler on the executor already reads connector Deployments, so leave it unset" -}}
+{{- end -}}
+true
+{{- else -}}false{{- end -}}
+{{- end -}}
+
+{{/*
+The installation-wide executor sandbox cap (AUTOMATED-REMEDIATION-12, executor
+amendment E9): one value, rendered as the same integer literal into both the
+API (whose claim route enforces it) and the worker (whose executor loop runs up
+to that many at once). values.schema.json keeps it an integer of at least 1.
+*/}}
+{{- define "curie.actionExecutorMaxConcurrentSandboxes" -}}
+{{- $cap := get (.Values.actionExecutor | default dict) "maxConcurrentSandboxes" -}}
+{{- if kindIs "invalid" $cap -}}2{{- else -}}{{ int $cap }}{{- end -}}
+{{- end -}}
+
+{{/*
+The automated remediation switch (AUTOMATED-REMEDIATION-1): one value, rendered
+as "true" or "false" into both the API and the worker. Enabling it requires the
+action executor, so a render with remediation on and the executor off fails
+here, in the one helper both workloads include. Read through `default dict`
+for --reuse-values from a release that predates the key.
+*/}}
+{{- define "curie.remediationEnabled" -}}
+{{- if (get (.Values.remediation | default dict) "enabled") -}}
+{{- if ne (include "curie.actionExecutorEnabled" .) "true" -}}
+{{- fail "remediation.enabled=true requires actionExecutor.enabled=true (AUTOMATED-REMEDIATION-1): automated remediation executes through the connector action executor" -}}
+{{- end -}}
+true
+{{- else -}}false{{- end -}}
+{{- end -}}
+
+{{/*
+Workspace recovery (ADR 0251): off by default. Enabling it requires a positive
+integer installation-wide byte cap that counts every recovery byte. Read
+through `default dict` for --reuse-values from a release that predates the key.
+The one helper both the API and the worker include, so a bad cap fails the
+render instead of starting an API that refuses to boot.
+*/}}
+{{- define "curie.workspaceRecoveryEnabled" -}}
+{{- $recovery := dig "workspace" "recovery" dict (.Values.worker | default dict) -}}
+{{- if get $recovery "enabled" -}}
+{{- $_ := include "curie.workspaceRecoveryMaxBytes" . -}}
+true
+{{- else -}}false{{- end -}}
+{{- end -}}
+
+{{- define "curie.workspaceRecoveryMaxBytes" -}}
+{{- $recovery := dig "workspace" "recovery" dict (.Values.worker | default dict) -}}
+{{- $cap := get $recovery "maxBytes" -}}
+{{- if or (kindIs "invalid" $cap) (kindIs "string" $cap) (not (or (kindIs "float64" $cap) (kindIs "int64" $cap) (kindIs "int" $cap))) -}}
+{{- fail "worker.workspace.recovery.enabled=true requires worker.workspace.recovery.maxBytes to be a positive integer (ADR 0251): the installation-wide cap counts every recovery byte" -}}
+{{- end -}}
+{{- $number := float64 $cap -}}
+{{- if or (le $number 0.0) (ne $number (floor $number)) -}}
+{{- fail "worker.workspace.recovery.maxBytes must be a positive integer (ADR 0251): the installation-wide cap counts every recovery byte" -}}
+{{- end -}}
+{{- $cap | int64 -}}
+{{- end -}}
+
+{{/* Code host trust (ADR 0197): renders nothing when no ConfigMap is named. */}}
+{{- define "curie.codeHostTrust.name" -}}
+{{- dig "caBundle" "configMapRef" "name" "" (.Values.codeHostTrust | default dict) -}}
+{{- end -}}
+{{- define "curie.codeHostTrust.key" -}}
+{{- dig "caBundle" "configMapRef" "key" "ca.crt" (.Values.codeHostTrust | default dict) -}}
+{{- end -}}
+{{- define "curie.codeHostTrust.dir" -}}/etc/curie/code-host-trust{{- end -}}
+{{- define "curie.codeHostTrust.path" -}}{{ include "curie.codeHostTrust.dir" . }}/ca.crt{{- end -}}
+{{- define "curie.codeHostTrust.volume" -}}
+{{- if include "curie.codeHostTrust.name" . }}
+- name: code-host-trust
+  configMap:
+    name: {{ include "curie.codeHostTrust.name" . | quote }}
+    items:
+      - key: {{ include "curie.codeHostTrust.key" . | quote }}
+        path: ca.crt
+{{- end }}
+{{- end -}}
+{{- define "curie.codeHostTrust.volumeMount" -}}
+{{- if include "curie.codeHostTrust.name" . }}
+- name: code-host-trust
+  mountPath: {{ include "curie.codeHostTrust.dir" . }}
+  readOnly: true
+{{- end }}
+{{- end -}}
+{{/* git and HTTP clients in a sandbox read the one bundle. */}}
+{{- define "curie.codeHostTrust.clientEnv" -}}
+{{- if include "curie.codeHostTrust.name" . }}
+{{- $path := include "curie.codeHostTrust.path" . }}
+- name: CURIE_REPO_CA_BUNDLE
+  value: {{ $path | quote }}
+- name: GIT_SSL_CAINFO
+  value: {{ $path | quote }}
+- name: SSL_CERT_FILE
+  value: {{ $path | quote }}
+- name: REQUESTS_CA_BUNDLE
+  value: {{ $path | quote }}
+{{- end }}
+{{- end -}}
+
+{{/* The factory (#4397): factory.* is read through `get`, so a release
+     without the block renders. */}}
+{{- define "curie.factory.mount" -}}/etc/curie/forges{{- end -}}
+
+{{/* A number as a plain string, never in exponent form. */}}
+{{- define "curie.factory.str" -}}
+{{- if kindIs "float64" . }}{{ . | int64 | toString }}{{ else }}{{ . | toString }}{{ end -}}
+{{- end -}}
+
+{{- define "curie.factory.secretField" -}}
+{{- $type := get . "type" | default "github_app" -}}
+{{- if eq $type "oauth_client_credentials" }}client_secret{{ else if eq $type "static_token" }}token{{ else }}private_key{{ end -}}
+{{- end -}}
+
+{{- define "curie.factory.credentials" -}}
+{{- $factory := .Values.factory | default dict -}}
+{{- $found := list -}}
+{{- range $key := list "codeHosts" "trackers" -}}
+{{- range $index, $entry := (get $factory $key | default list) -}}
+{{- $credential := get $entry "credential" | default dict -}}
+{{- $field := include "curie.factory.secretField" $credential -}}
+{{- $path := printf "%s-%s/%s" (snakecase $key) (get $entry "name" | default "" | toString) $field -}}
+{{- $found = append $found (dict "key" $key "index" $index "name" (get $entry "name" | default "") "entry" (omit $entry "credential") "credential" $credential "field" $field "path" $path) -}}
+{{- end -}}
+{{- end -}}
+{{- toJson $found -}}
+{{- end -}}
+
+{{/* .v in snake_case as {"v": ...}; an *Id is a string. */}}
+{{- define "curie.factory.snake" -}}
+{{- $v := .v -}}
+{{- if kindIs "map" $v -}}
+{{- $out := dict -}}
+{{- range $k, $c := $v -}}
+{{- $n := snakecase $k | replace "interval_seconds" "interval_s" -}}
+{{- if has $k (list "components" "reviewFeedbackAllowlist") }}{{ $_ := set $out $n $c }}
+{{- else if hasSuffix "Id" $k }}{{ $_ := set $out $n (include "curie.factory.str" $c) }}
+{{- else }}{{ $_ := set $out $n (include "curie.factory.snake" (dict "v" $c) | fromJson).v }}{{ end -}}
+{{- end -}}
+{{- $v = $out -}}
+{{- else if kindIs "slice" $v -}}
+{{- $out := list -}}
+{{- range $v }}{{ $out = append $out (include "curie.factory.snake" (dict "v" .) | fromJson).v }}{{ end -}}
+{{- $v = $out -}}
+{{- end -}}
+{{- toJson (dict "v" $v) -}}
+{{- end -}}
+
+{{- define "curie.factory.forgesJson" -}}
+{{- $factory := .Values.factory | default dict -}}
+{{- $doc := dict "code_hosts" list "trackers" list "card_base_url" (get $factory "cardBaseUrl" | default "" | toString) -}}
+{{- $_ := set $doc "bindings" (include "curie.factory.snake" (dict "v" (get $factory "bindings" | default list)) | fromJson).v -}}
+{{- range (include "curie.factory.credentials" . | fromJsonArray) -}}
+{{- $out := (include "curie.factory.snake" (dict "v" (omit .entry "egress")) | fromJson).v -}}
+{{- $credential := (include "curie.factory.snake" (dict "v" (omit .credential "existingSecret" "existingSecretKey" "privateKey" "clientSecret" "token")) | fromJson).v -}}
+{{- $_ := set $credential "type" (get .credential "type" | default "github_app") -}}
+{{- $_ := set $credential (printf "%s_file" .field) (printf "%s/%s" (include "curie.factory.mount" .) .path) -}}
+{{- $_ := set $out "credential" $credential -}}
+{{- $section := snakecase .key -}}
+{{- $_ := set $doc $section (append (get $doc $section) $out) -}}
+{{- end -}}
+{{- toJson $doc -}}
+{{- end -}}
+
+{{- define "curie.factory.hasCredentials" -}}
+{{- if include "curie.factory.credentials" . | fromJsonArray }}true{{ end -}}
+{{- end -}}
+{{- define "curie.factory.credentialVolume" -}}
+{{- $credentials := include "curie.factory.credentials" . | fromJsonArray -}}
+{{- if $credentials }}
+- name: forge-credentials
+  projected:
+    defaultMode: 0440
+    sources:
+      {{- range $credentials }}
+      {{- $credential := .credential }}
+      - secret:
+          name: {{ get $credential "existingSecret" | quote }}
+          items:
+            - key: {{ get $credential "existingSecretKey" | quote }}
+              path: {{ .path | quote }}
+      {{- end }}
+{{- end }}
+{{- end -}}
+{{- define "curie.factory.credentialMount" -}}
+{{- if include "curie.factory.hasCredentials" . }}
+- name: forge-credentials
+  mountPath: {{ include "curie.factory.mount" . }}
+  readOnly: true
+{{- end }}
+{{- end -}}
+
+{{/* Refuse a removed key set to other than null or its old default, and a removed env name in extraEnv. */}}
+{{- define "curie.factory.legacyKeyGuard" -}}
+{{- range $name := (.Files.Get "files/legacy-factory-env.yaml" | fromYamlArray) -}}
+{{- range $workload := list "api" "worker" -}}
+{{- range (get (get $.Values $workload | default dict) "extraEnv" | default list) -}}
+{{- if eq (get . "name") $name -}}
+{{- fail (printf "%s.extraEnv %s is no longer read; use `curie cluster upgrade` to migrate retained factory settings to factory.* (repository CI and bases under factory.bindings[].repos[]), or remove unsupported raw entries" $workload $name) -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+{{- range $key := (.Files.Get "files/legacy-factory-keys.yaml" | fromYamlArray) -}}
+{{- $node := $.Values -}}
+{{- range splitList "." $key }}{{ $node = and (kindIs "map" $node) (get $node .) }}{{ end -}}
+{{- if and $node (not (has (include "curie.factory.str" $node) (list "poll" "45" "1200"))) -}}
+{{- fail (printf "%s is no longer read; use `curie cluster upgrade` to migrate retained factory settings to factory.* (repository CI and bases under factory.bindings[].repos[]), or remove unsupported raw values" $key) -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+
+{{- define "curie.factory.validate" -}}
+{{- include "curie.factory.legacyKeyGuard" . -}}
+{{- $factory := .Values.factory | default dict -}}
+{{- $appId := "" -}}
+{{- with .Values.api.githubAppId }}{{ $appId = include "curie.factory.str" . }}{{ end -}}
+{{- range (include "curie.factory.credentials" . | fromJsonArray) -}}
+{{- $where := printf "factory.%s[%v] (%s)" .key .index .name -}}
+{{- if not (and (get .credential "existingSecret") (get .credential "existingSecretKey")) -}}
+{{- fail (printf "%s credential needs existingSecret and existingSecretKey" $where) -}}
+{{- end -}}
+{{- range (get .entry "egress" | default list) }}{{ include "curie.objectStore.egressEntry" (dict "key" (printf "%s egress" $where) "entry" .) }}{{ end -}}
+{{- $own := get .credential "appId" -}}
+{{- if and $appId $own (eq (get .credential "type" | default "github_app") "github_app") (ne (include "curie.factory.str" $own) $appId) -}}
+{{- fail (printf "%s credential appId %s differs from api.githubAppId %s; the factory and git-flow must use one GitHub App" $where (include "curie.factory.str" $own) $appId) -}}
+{{- end -}}
+{{- end -}}
+{{- /* One binding per tracker scope (#4622, ADR 0197), whether or not
+factory.enabled: CURIE_FORGES renders from these lists either way and the API's
+ForgesConfig.check_references refuses the same document at boot. The scope is
+(tracker kind, host stripped and lowercased, trackerScopeId), as the runtime
+resolves it, so two tracker entries for one site cannot hide a duplicate. */ -}}
+{{- $trackers := dict -}}
+{{- range $index, $tracker := (get $factory "trackers" | default list) -}}
+{{- $name := get $tracker "name" | default "" | toString -}}
+{{- if hasKey $trackers $name -}}
+{{- fail (printf "factory.trackers[%v] (%s) repeats a tracker name; tracker names must be unique" $index $name) -}}
+{{- end -}}
+{{- $_ := set $trackers $name $tracker -}}
+{{- end -}}
+{{- $bindings := dict -}}
+{{- $scopes := dict -}}
+{{- range $index, $binding := (get $factory "bindings" | default list) -}}
+{{- $name := get $binding "name" | default "" | toString -}}
+{{- if hasKey $bindings $name -}}
+{{- fail (printf "factory.bindings[%v] (%s) repeats a binding name; binding names must be unique" $index $name) -}}
+{{- end -}}
+{{- $_ := set $bindings $name true -}}
+{{- end -}}
+{{- range $index, $binding := (get $factory "bindings" | default list) -}}
+{{- $name := get $binding "name" | default "" | toString -}}
+{{- $trackerName := get $binding "tracker" | default "" | toString -}}
+{{- if not (hasKey $trackers $trackerName) -}}
+{{- fail (printf "factory.bindings[%v] (%s) names unknown tracker %s; add it to factory.trackers or name an existing tracker" $index $name $trackerName) -}}
+{{- end -}}
+{{- $tracker := get $trackers $trackerName -}}
+{{- $kind := get $tracker "kind" | default "" | toString -}}
+{{- $host := get $tracker "host" | default "" | toString | trim | lower -}}
+{{- /* A trackerScopeId is a nonempty string, taken as is like the runtime, or
+a whole number below 2^53 in magnitude, which Helm's float64 holds exactly and
+renders as plain decimal digits. Anything else (missing, null, empty, a list
+or map, a fraction, a larger number) is refused, as the CLI preflight does. */ -}}
+{{- $rawScope := get $binding "trackerScopeId" -}}
+{{- $validScope := false -}}
+{{- if kindIs "string" $rawScope }}{{ $validScope = ne $rawScope "" }}
+{{- else if or (kindIs "float64" $rawScope) (kindIs "int64" $rawScope) (kindIs "int" $rawScope) -}}
+{{- $f := float64 $rawScope -}}
+{{- $validScope = and (eq $f (floor $f)) (lt $f 9007199254740992.0) (gt $f -9007199254740992.0) -}}
+{{- end -}}
+{{- if not $validScope -}}
+{{- fail (printf "factory.bindings[%v] (%s) trackerScopeId must be a nonempty string or a whole number; quote the tracker's scope id" $index $name) -}}
+{{- end -}}
+{{- $scopeId := include "curie.factory.str" $rawScope -}}
+{{- $key := toJson (list $kind $host $scopeId) -}}
+{{- if hasKey $scopes $key -}}
+{{- $first := get $scopes $key -}}
+{{- fail (printf "factory.bindings %s and %s claim the same tracker scope (%s on %s, trackerScopeId %s); keep one binding per tracker scope: add the other repositories to binding %s repos and select one with a repo:<alias> label" $first $name $kind $host $scopeId $first) -}}
+{{- end -}}
+{{- $_ := set $scopes $key $name -}}
+{{- end -}}
+{{- /* factory.enabled needs a tracker and a code host of any installed kind (#4399).
+A GitHub entry in either list keeps GitHub's own pairing: a github tracker and a
+github code host together. */ -}}
+{{- if get $factory "enabled" -}}
+{{- $anyGithub := false -}}
+{{- range concat (get $factory "trackers" | default list) (get $factory "codeHosts" | default list) }}{{ if eq (get . "kind" | default "") "github" }}{{ $anyGithub = true }}{{ end }}{{ end -}}
+{{- range $section, $key := dict "tracker" "trackers" "code host" "codeHosts" -}}
+{{- $entries := get $factory $key | default list -}}
+{{- $github := false -}}
+{{- range $entries }}{{ if eq (get . "kind" | default "") "github" }}{{ $github = true }}{{ end }}{{ end -}}
+{{- if not $entries -}}
+{{- fail (printf "factory.enabled needs a %s in factory.%s; run `curie cluster factory` to write one" $section $key) -}}
+{{- end -}}
+{{- if and $anyGithub (not $github) -}}
+{{- fail (printf "factory.enabled with a github entry needs a github %s in factory.%s; run `curie cluster factory` to write one" $section $key) -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+{{/* Forge egress (#4397): an entry's own, else the built-in GitHub set. */}}
+{{- define "curie.factory.egress" -}}
+{{- $f := .root.Values.factory | default dict -}}
+{{- $gh := list -}}
+{{- range splitList " " "192.30.252.0/22 185.199.108.0/22 140.82.112.0/20 143.55.64.0/20 2a0a:a440::/29 2606:50c0::/32 20.201.28.151/32 20.201.28.148/32 20.205.243.166/32 20.205.243.168/32 20.87.245.0/32 20.87.245.6/32 4.237.22.38/32 4.237.22.34/32 4.228.31.150/32 4.228.31.149/32 20.207.73.82/32 20.207.73.85/32 20.27.177.113/32 20.27.177.116/32 20.200.245.247/32 20.200.245.245/32 20.175.192.147/32 20.175.192.149/32 20.233.83.145/32 20.233.83.146/32 20.29.134.23/32 20.29.134.17/32 20.199.39.232/32 20.199.39.228/32 20.217.135.5/32 20.217.135.0/32 4.225.11.194/32 4.225.11.201/32 4.208.26.197/32 4.208.26.200/32 20.26.156.215/32 20.26.156.210/32 172.182.252.133/32 172.182.252.137/32 4.249.131.164/32 4.249.131.166/32 48.202.248.40/32 48.202.248.39/32 48.204.201.5/32 48.204.201.2/32" }}{{ $gh = append $gh (dict "cidr" . "ports" (list (dict "protocol" "TCP" "port" 443))) }}{{ end -}}
+{{- $hosts := get $f "codeHosts" | default list -}}
+{{- $out := ternary $gh list (not $hosts) -}}
+{{- range concat $hosts (ternary (get $f "trackers" | default list) list (hasKey . "sandbox")) -}}
+{{- $out = concat $out (get . "egress" | default (ternary $gh list (eq (get . "kind") "github"))) -}}
+{{- end -}}
+{{- toJson (uniq $out) -}}
+{{- end -}}
+{{- define "curie.factory.sandboxAgents" -}}
+{{- $out := list -}}
+{{- range $a, $on := get (.Values.factory | default dict) "sandboxEgress" | default dict -}}
+{{- if or (gt (len $a) 40) (not (regexMatch "^[a-z0-9]([a-z0-9-]*[a-z0-9])?$" $a)) }}{{ fail (printf "factory.sandboxEgress.%s has an invalid agent name" $a) }}{{ end -}}
+{{- if $on }}{{ $out = append $out $a }}{{ end -}}
+{{- end -}}
+{{- toJson $out -}}
+{{- end -}}
+
+{{/* ADR 0217: resolve and validate the worker's daemon handoff at the root. */}}
+{{- define "curie.factory.dockerConfig" -}}
+{{- $factory := .Values.factory | default dict -}}
+{{- $docker := get $factory "docker" -}}
+{{- if or (not (hasKey $factory "docker")) (kindIs "invalid" $docker) }}{{ $docker = dict }}{{ end -}}
+{{- if not (kindIs "map" $docker) }}{{ fail "factory.docker must be a map" }}{{ end -}}
+{{- $image := get $docker "daemonImage" -}}
+{{- if not (and (kindIs "string" $image) (regexMatch "^[A-Za-z0-9][A-Za-z0-9._/:-]*@sha256:[0-9a-f]{64}$" $image)) }}{{ fail "factory.docker.daemonImage must be a CEL-safe digest-pinned image reference when a repository enables docker" }}{{ end -}}
+{{- $portRaw := "2376" -}}
+{{- if hasKey $docker "port" }}{{ $portRaw = get $docker "port" | toString }}{{ end -}}
+{{- if not (regexMatch "^[0-9]{1,5}$" $portRaw) }}{{ fail "factory.docker.port must be an integer from 1 through 65535" }}{{ end -}}
+{{- $port := int $portRaw -}}
+{{- if or (lt $port 1) (gt $port 65535) }}{{ fail "factory.docker.port must be an integer from 1 through 65535" }}{{ end -}}
+{{- $namespaceRaw := get $docker "namespace" -}}
+{{- if and (not (kindIs "invalid" $namespaceRaw)) (not (kindIs "string" $namespaceRaw)) }}{{ fail "factory.docker.namespace must be a string" }}{{ end -}}
+{{- $namespace := include "curie.factory.dockerNamespace" . -}}
+{{- if or (gt (len $namespace) 63) (not (regexMatch "^[a-z0-9]([a-z0-9-]*[a-z0-9])?$" $namespace)) }}{{ fail "factory.docker.namespace must resolve to a Kubernetes namespace DNS label" }}{{ end -}}
+{{- $selector := include "curie.selectorLabels" (dict "root" . "component" "docker-daemon") | fromYaml -}}
+{{- range $value := $selector -}}
+{{- if not (and (kindIs "string" $value) (le (len $value) 63) (regexMatch "^[A-Za-z0-9]([-A-Za-z0-9_.]*[A-Za-z0-9])?$" $value)) }}{{ fail "factory.docker selector labels must be nonempty Kubernetes label values of at most 63 characters" }}{{ end -}}
+{{- end -}}
+{{- $resources := get $docker "resources" -}}
+{{- if or (not (hasKey $docker "resources")) (kindIs "invalid" $resources) }}{{ $resources = dict }}{{ end -}}
+{{- if not (kindIs "map" $resources) }}{{ fail "factory.docker.resources must be a map" }}{{ end -}}
+{{- if omit $resources "requests" "limits" }}{{ fail "factory.docker.resources accepts only requests and limits" }}{{ end -}}
+{{- $resolved := dict -}}
+{{- range $kind, $defaults := dict "requests" (dict "cpu" "500m" "memory" "1Gi" "ephemeral-storage" "10Gi") "limits" (dict "cpu" "2" "memory" "4Gi" "ephemeral-storage" "20Gi") -}}
+{{- $supplied := get $resources $kind -}}
+{{- if or (not (hasKey $resources $kind)) (kindIs "invalid" $supplied) }}{{ $supplied = dict }}{{ end -}}
+{{- if not (kindIs "map" $supplied) }}{{ fail (printf "factory.docker.resources.%s must be a map" $kind) }}{{ end -}}
+{{- if omit $supplied "cpu" "memory" "ephemeral-storage" }}{{ fail "factory.docker resources accept only cpu, memory and ephemeral-storage" }}{{ end -}}
+{{- $group := dict -}}
+{{- range $key, $fallback := $defaults -}}
+{{- $value := get $supplied $key -}}
+{{- if or (not (hasKey $supplied $key)) (kindIs "invalid" $value) }}{{ $value = $fallback }}{{ end -}}
+{{- $_ := set $group $key $value -}}
+{{- end -}}
+{{- $_ := set $resolved $kind $group -}}
+{{- end -}}
+{{- $out := dict "namespace" $namespace "image" $image "port" $port "selectorLabels" $selector "resources" $resolved -}}
+{{- range $key, $fallback := dict "storageSizeLimit" "20Gi" "maxClaimLifetimeSeconds" 86400 "pingTimeoutSeconds" 2 -}}
+{{- $value := get $docker $key -}}
+{{- if or (not (hasKey $docker $key)) (kindIs "invalid" $value) }}{{ $value = $fallback }}{{ end -}}
+{{- if and (ne $key "storageSizeLimit") (not (regexMatch "^[1-9][0-9]*$" (toJson $value))) }}{{ fail (printf "factory.docker.%s must be a positive integer" $key) }}{{ end -}}
+{{- $_ := set $out $key $value -}}
+{{- end -}}
+{{- $quantity := "^\\+?(?:[0-9]*[1-9][0-9]*(?:\\.[0-9]*)?|[0-9]*\\.[0-9]*[1-9][0-9]*)(?:[eE][+-]?[0-9]{1,3}|[numkMGTPE]|[KMGTPE]i)?$" -}}
+{{- range $value := concat (values $resolved.requests) (values $resolved.limits) (list $out.storageSizeLimit) -}}
+{{- if not (and (kindIs "string" $value) (le (len $value) 128) (not (regexMatch "\\s" $value)) (regexMatch $quantity $value)) }}{{ fail "factory.docker resources and storageSizeLimit must be positive Kubernetes quantity strings of at most 128 characters" }}{{ end -}}
+{{- end -}}
+{{- toJson $out -}}
+{{- end -}}
+
+{{/* ADR 0216: one descriptor per repository, sharing pools by index digest. */}}
+{{- define "curie.factory.repoRunnerDescriptors" -}}
+{{- $root := . -}}
+{{- $entries := list -}}
+{{- $hasRunners := false -}}
+{{- range $bi, $binding := get (.Values.factory | default dict) "bindings" | default list -}}
+{{- range $ri, $repo := get $binding "repos" | default list -}}
+{{- $entries = append $entries (dict "repo" $repo "key" (printf "factory.bindings[%d].repos[%d]" $bi $ri)) -}}
+{{- if get $repo "runner" }}{{ $hasRunners = true }}{{ end -}}
+{{- end -}}
+{{- end -}}
+{{- $descriptors := dict -}}
+{{- if $hasRunners -}}
+{{- $agents := list -}}
+{{- range $agent, $on := get (.Values.factory | default dict) "sandboxEgress" | default dict -}}
+{{- if not (kindIs "bool" $on) }}{{ fail (printf "factory.sandboxEgress.%s must be a boolean when repository runners are configured" $agent) }}{{ end -}}
+{{- if $on }}{{ $agents = append $agents $agent }}{{ end -}}
+{{- end -}}
+{{- if ne (len $agents) 1 }}{{ fail "repository runners require exactly one true factory agent in factory.sandboxEgress" }}{{ end -}}
+{{- $agent := first $agents -}}
+{{- $poolAgents := include "curie.agentSandboxPoolAgents" . | fromJsonArray -}}
+{{- if not .Values.agentSandbox.deploy }}{{ fail "repository runners require agentSandbox.deploy=true for chart-managed sandbox pools" }}{{ end -}}
+{{- $basePool := printf "%s-runner-pool" (include "curie.fullname" .) -}}
+{{- $warmPool := get (.Values.worker | default dict) "warmPool" | default $basePool -}}
+{{- if ne $warmPool $basePool }}{{ fail "repository runners require worker.warmPool to be empty or the chart-managed runner pool" }}{{ end -}}
+{{- $declarations := dict -}}
+{{- $identities := dict -}}
+{{- $prefixes := dict -}}
+{{- range $entries -}}
+{{- $repo := .repo -}}
+{{- $path := get $repo "path" | default "" | toString -}}
+{{- $declaration := toJson $repo -}}
+{{- if and (hasKey $declarations $path) (ne (get $declarations $path) $declaration) }}{{ fail (printf "conflicting duplicate repository path %q in %s; repository declarations must be identical" $path .key) }}{{ end -}}
+{{- $_ := set $declarations $path $declaration -}}
+{{- $source := printf "%s.runner" .key -}}
+{{- with get $repo "runner" -}}
+{{- if not (regexMatch "^[A-Za-z0-9_][A-Za-z0-9._~-]*(/[A-Za-z0-9_][A-Za-z0-9._~-]*)+$" $path) }}{{ fail (printf "%s path %q is not a repository path" $source $path) }}{{ end -}}
+{{- $image := get . "image" | default "" | toString -}}
+{{- if not (regexMatch "^[A-Za-z0-9][A-Za-z0-9._/:-]*@sha256:[0-9a-f]{64}$" $image) }}{{ fail (printf "%s.image must be a CEL-safe digest image reference" $source) }}{{ end -}}
+{{- $index := last (splitList "@" $image) -}}
+{{- $base := get . "base" | default "" | toString -}}
+{{- $platforms := get . "platformDigests" | default dict -}}
+{{- $amd64 := get $platforms "linux/amd64" | default "" | toString -}}
+{{- $arm64 := get $platforms "linux/arm64" | default "" | toString -}}
+{{- range $digest := list $base $amd64 $arm64 -}}
+{{- if not (regexMatch "^sha256:[0-9a-f]{64}$" $digest) }}{{ fail (printf "%s base and platformDigests must be sha256 digests" $source) }}{{ end -}}
+{{- end -}}
+{{- $identity := toJson (dict "image" $image "base" $base "platformDigests" $platforms) -}}
+{{- if and (hasKey $identities $index) (ne (get $identities $index) $identity) }}{{ fail (printf "conflicting repository runner image identity for index digest %s" $index) }}{{ end -}}
+{{- $_ := set $identities $index $identity -}}
+{{- $prefix := trimPrefix "sha256:" $index | trunc 12 -}}
+{{- if and (hasKey $prefixes $prefix) (ne (get $prefixes $prefix) $index) }}{{ fail (printf "repository runner digest prefix collision for %s" $prefix) }}{{ end -}}
+{{- $_ := set $prefixes $prefix $index -}}
+{{- if has (printf "%s-img-%s" $agent $prefix) $poolAgents }}{{ fail (printf "repository runner name collision with ordinary agent %s-img-%s" $agent $prefix) }}{{ end -}}
+{{- $template := printf "%s-agent-%s-img-%s-runner" (include "curie.fullname" $root) $agent $prefix -}}
+{{- $pool := printf "%s-pool" $template -}}
+{{- if or (gt (len $pool) 63) (not (regexMatch "^[a-z0-9]([a-z0-9-]*[a-z0-9])?$" $pool)) }}{{ fail (printf "repository runner pool name %q must be a DNS label of at most 63 characters" $pool) }}{{ end -}}
+{{- $docker := get $repo "docker" | default dict -}}
+{{- $dockerOn := get $docker "enabled" | default false -}}
+{{- $egress := list -}}
+{{- if $dockerOn -}}
+{{- range get $docker "egressAllowlist" | default list -}}
+{{- $ports := list -}}
+{{- range .ports -}}
+{{- $port := deepCopy . -}}
+{{- if not (hasKey $port "protocol") }}{{ $_ := set $port "protocol" "TCP" }}{{ end -}}
+{{- $ports = append $ports $port -}}
+{{- end -}}
+{{- $egress = append $egress (set (deepCopy .) "ports" $ports) -}}
+{{- end -}}
+{{- end -}}
+{{- $descriptor := dict "path" $path "agent" $agent "prefix" $prefix "template" $template "pool" $pool "image" $image "digests" (list $index $amd64 $arm64) "base" $base "docker" $dockerOn "egress" $egress "source" $source -}}
+{{- if and $dockerOn $root.Values.worker.deploy -}}
+{{- $_ := set $descriptor "daemon" (include "curie.factory.dockerConfig" $root | fromJson) -}}
+{{- end -}}
+{{- $_ := set $descriptors $path $descriptor -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+{{- $out := list -}}
+{{- range $path := keys $descriptors | sortAlpha }}{{ $out = append $out (get $descriptors $path) }}{{ end -}}
+{{- toJson $out -}}
+{{- end -}}
+
+{{- define "curie.factory.repoRunnerPoolsJson" -}}
+{{- $out := dict -}}
+{{- range . -}}
+{{- $_ := set $out .path (pick . "pool" "digests" "base" "docker" "egress" "daemon") -}}
+{{- end -}}
+{{- toJson $out -}}
+{{- end -}}
+
+{{/* HTTP identity operator files (@spec HTTP-INVOCATION-EXECUTION-20). Each names an
+     operator-created Secret, or renders empty. Read through dig so a retained
+     release whose values predate httpIdentity renders unchanged. */}}
+{{- define "curie.httpIdentity.apiSecret" -}}
+{{- dig "httpIdentity" "existingSecret" "" (.Values.api | default dict) -}}
+{{- end -}}
+{{- define "curie.httpIdentity.providerCaBundle" -}}
+{{- if dig "httpIdentity" "providerCaBundle" false (.Values.api | default dict) -}}
+{{- if not (include "curie.httpIdentity.apiSecret" .) -}}
+{{- fail "api.httpIdentity.providerCaBundle requires api.httpIdentity.existingSecret: the CA bundle is a key of that Secret" -}}
+{{- end -}}
+true
+{{- end -}}
+{{- end -}}
+{{- define "curie.httpIdentity.receiverSecret" -}}
+{{- $name := dig "httpIdentity" "existingSecret" "" (.Values.dispatcher | default dict) -}}
+{{- if and $name (not (include "curie.httpIdentity.apiSecret" .)) -}}
+{{- fail "dispatcher.httpIdentity.existingSecret requires api.httpIdentity.existingSecret: the API must hold the receiver registrations it verifies" -}}
+{{- end -}}
+{{- $name -}}
+{{- end -}}
+{{/* Named operator Secret keys as 0440 files; only the named workload mounts them. */}}
+{{- define "curie.httpIdentity.volume" -}}
+- name: {{ .name }}
+  secret:
+    secretName: {{ .secret | quote }}
+    defaultMode: 0440
+    items:
+      {{- range .files }}
+      - key: {{ . }}
+        path: {{ . }}
+      {{- end }}
 {{- end -}}

@@ -1,4 +1,8 @@
 {{- if .Values.security.dataTierNetworkPolicy.enabled }}
+{{- $allowMcpConnectorValkeyIngress := true }}
+{{- if hasKey .Values.security.dataTierNetworkPolicy "allowMcpConnectorValkeyIngress" }}
+{{- $allowMcpConnectorValkeyIngress = .Values.security.dataTierNetworkPolicy.allowMcpConnectorValkeyIngress }}
+{{- end }}
 {{/*
 Rail: default-deny ingress + scoped-allow around the data tier (Postgres, RustFS,
 ClickHouse, Valkey).
@@ -75,7 +79,8 @@ spec:
         {{- range $p := $s.ports }}
         - { protocol: TCP, port: {{ $p }} }
         {{- end }}
-    {{ if eq $s.component "valkey" }}
+    {{/* @spec docs/superpowers/specs/2026-10-08-mcp-connector-valkey-ingress-optout.md */}}
+    {{ if and (eq $s.component "valkey") $allowMcpConnectorValkeyIngress }}
     # Connector proxies spend one-shot grants in Valkey. Their pods are not
     # chart app pods: the name is the connector object, and the component is
     # mcp-connector. This peer is that pair only, and only on the Valkey port.

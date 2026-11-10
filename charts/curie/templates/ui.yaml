@@ -7,7 +7,7 @@
 apiVersion: v1
 kind: Service
 metadata:
-  name: {{ include "curie.fullname" . }}-ui
+  name: {{ include "curie.checkedObjectName" (dict "kind" "Service" "name" (printf "%s-ui" (include "curie.fullname" .))) }}
   labels:
     {{- include "curie.labels" . | nindent 4 }}
     app.kubernetes.io/component: ui
@@ -60,6 +60,7 @@ spec:
       imagePullSecrets:
         {{- toYaml . | nindent 8 }}
       {{- end }}
+      enableServiceLinks: false
       containers:
         - name: ui
           image: {{ include "curie.image" (dict "repository" .Values.ui.image.repository "tag" .Values.ui.image.tag "digest" .Values.ui.image.digest "defaultTag" .Chart.AppVersion) | quote }}

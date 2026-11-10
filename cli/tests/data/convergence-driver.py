@@ -1,4 +1,4 @@
-#!/usr/bin/python3
+#!/usr/bin/env python3
 """Recording external process boundary; never claims a real Kubernetes run."""
 
 import copy
@@ -125,17 +125,22 @@ def emit(value):
 
 if program == "helm":
     if args[0] == "history":
+        if (root / "helm-applied").exists():
+            emit([{"revision": 1, "status": "deployed"}])
         print("Error: release: not found", file=sys.stderr)
         sys.exit(1)
     if args[:2] == ["get", "values"]:
-        emit({"security": {"allowDevDefaults": True}})
+        emit({"security": {"allowDevDefaults": True}, "agentSandbox": {"deploy": False}})
     if args[:2] == ["get", "manifest"]:
         # JSON documents are YAML documents too; no optional YAML dependency.
         print("\n---\n".join(json.dumps(item) for item in expected))
         sys.exit(0)
     if args[0] == "status":
         if "json" in args:
-            if scenario == "degraded-then-hung":
+            # A non-terminal unconverged scenario would keep `cluster up` polling
+            # for its full 300 second wait; hanging the second observation ends
+            # it through the bounded read with the first observation's reasons.
+            if scenario in ["degraded-then-hung", "surplus", "evicted-terminating"]:
                 counter = root / "status-observations"
                 count = int(counter.read_text()) + 1 if counter.exists() else 1
                 counter.write_text(str(count))
@@ -198,11 +203,15 @@ if program == "helm":
         print("STATUS: deployed\nREVISION: 2")
         sys.exit(0)
     if args[0] == "template":
-        print(
-            "Error: could not find template " + args[args.index("--show-only") + 1] + " in chart",
-            file=sys.stderr,
-        )
-        sys.exit(1)
+        if "--show-only" in args:
+            print(
+                "Error: could not find template "
+                + args[args.index("--show-only") + 1]
+                + " in chart",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        emit(deployment)
     if args[0] == "upgrade":
         if scenario == "helm-hook-fails":
             print("Error: pre-upgrade hook failed", file=sys.stderr)
@@ -213,6 +222,7 @@ if program == "helm":
         ]:
             print("Error: recorded install did not converge", file=sys.stderr)
             sys.exit(1)
+        (root / "helm-applied").touch()
         print("Release accepted")
         sys.exit(0)
     if args[:2] == ["show", "chart"]:
@@ -221,6 +231,12 @@ if program == "helm":
 
 if program == "kubectl":
     if args[:2] == ["get", "node"]:
+        if scenario == "evicted-old-image-gone-node":
+            print(
+                'Error from server (NotFound): nodes "' + args[2] + '" not found',
+                file=sys.stderr,
+            )
+            sys.exit(1)
         if scenario == "alias-forbidden":
             print("Forbidden PRIVATE_MESSAGE_SENTINEL", file=sys.stderr)
             sys.exit(1)
@@ -342,9 +358,28 @@ if program == "kubectl":
         sys.exit(0)
     if "label" in args:
         sys.exit(0)
+    if "nodes" in args:
+        # Advisory capacity reads use NodeList, not workload convergence data.
+        # https://kubernetes.io/docs/reference/kubernetes-api/cluster-resources/node-v1/
+        emit(
+            {
+                "apiVersion": "v1",
+                "kind": "NodeList",
+                "items": [
+                    {
+                        "metadata": {"name": "acme-capacity-node"},
+                        "spec": {},
+                        "status": {
+                            "allocatable": {"cpu": "64", "memory": "128Gi"},
+                            "conditions": [{"type": "Ready", "status": "True"}],
+                        },
+                    }
+                ],
+            }
+        )
     if any(
         a in args
-        for a in ["service", "services", "svc", "nodes", "priorityclass", "priorityclasses"]
+        for a in ["service", "services", "svc", "priorityclass", "priorityclasses"]
     ):
         emit({"items": []})
     if scenario == "mixed":
@@ -548,6 +583,57 @@ if program == "kubectl":
         old["spec"]["containers"][0]["image"] = "example.com/custom-api:old"
         old["status"]["containerStatuses"][0]["image"] = "example.com/custom-api:old"
         pods.append(old)
+    if scenario in [
+        "evicted-succeeded",
+        "evicted-failed",
+        "evicted-terminating",
+        "evicted-old-image-gone-node",
+    ]:
+        # #4496: kubelet-initiated termination leaves the pod object behind and
+        # its ReplicaSet never deletes it. Observed 2026-10-12 after a k3s node
+        # ephemeral-storage eviction: Succeeded pods (container terminated
+        # Completed, exit 0, restartCount 0, DisruptionTarget=True reason
+        # TerminationByKubelet) and Failed pods with reason Evicted, beside
+        # healthy Running replacements. The Deployment status stays 1/1 because
+        # the controller counts active pods only.
+        # https://kubernetes.io/docs/concepts/workloads/pods/disruptions/#pod-disruption-conditions
+        # https://kubernetes.io/docs/concepts/scheduling-eviction/node-pressure-eviction/
+        evicted = copy.deepcopy(pods[0])
+        evicted["metadata"]["name"] = "acme-bot-api-evicted"
+        disruption = {
+            "type": "DisruptionTarget",
+            "status": "True",
+            "reason": "TerminationByKubelet",
+        }
+        evicted["status"]["conditions"] = [disruption, {"type": "Ready", "status": "False"}]
+        evicted["status"]["containerStatuses"][0].update(
+            ready=False,
+            restartCount=0,
+            state={"terminated": {"exitCode": 0, "reason": "Completed"}},
+        )
+        evicted["status"]["phase"] = "Succeeded"
+        if scenario == "evicted-failed":
+            # The kubelet stops an evicted pod's containers (SIGKILL after the
+            # grace period, exit 137) and records phase Failed, reason Evicted
+            # and a free-text message naming the starved resource.
+            evicted["status"].update(
+                phase="Failed", reason="Evicted", message="PRIVATE_MESSAGE_SENTINEL"
+            )
+            evicted["status"]["containerStatuses"][0]["state"] = {
+                "terminated": {"exitCode": 137, "reason": "Error"}
+            }
+        if scenario == "evicted-old-image-gone-node":
+            # The evicted pod ran an older tagged image on a Node that has since
+            # been deleted. The tag differs from the target, so reading its
+            # Node would be needed if the pod counted; it must not be read.
+            evicted["spec"]["nodeName"] = "acme-gone-node"
+            evicted["status"]["containerStatuses"][0].update(
+                image="example.com/custom-api:old",
+                imageID="example.com/other-api@sha256:" + "d" * 64,
+            )
+        if scenario == "evicted-terminating":
+            evicted["metadata"]["deletionTimestamp"] = "2026-10-12T14:56:00Z"
+        pods.append(evicted)
     if scenario == "mixed":
         pods[0]["status"]["containerStatuses"][0].update(
             ready=False,

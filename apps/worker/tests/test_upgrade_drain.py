@@ -22,7 +22,7 @@ The API this file pins:
       .await_drained(*, timeout_s=None, poll_interval_s=None) -> DrainOutcome
 
     DrainOutcome: .drained .remaining .waited_s
-    run_gate(config, *, mode="drain"|"release"|"attest") -> int   (the hook's exit code)
+    run_gate(config, *, mode="drain"|"release"|"attest"|"hold") -> int
 """
 
 from __future__ import annotations
@@ -785,7 +785,7 @@ def test_status_reports_unknown_when_the_marker_cannot_be_read(
         assert _VALKEY_PW not in stderr
 
 
-@pytest.mark.parametrize("mode", ["drain", "release", "attest"])
+@pytest.mark.parametrize("mode", ["drain", "release", "attest", "hold"])
 def test_unobserved_installation_refuses_mutating_modes_before_connecting(
     names,
     mode: str,
@@ -1050,6 +1050,27 @@ def test_an_empty_release_drains_immediately(names) -> None:  # noqa: ANN001
     asyncio.run(go())
 
 
+def test_a_clean_drain_hands_off_a_300_second_pause_not_the_roll_hold(
+    names: dict[str, str],
+) -> None:
+    """A later pre-upgrade failure must not leave the full 1800 s hold behind."""
+
+    async def go() -> None:
+        async with _gate(names, upgrade_quiesce_ttl_s=1800.0) as (
+            gate,
+            config,
+            client,
+        ):
+            outcome = await gate.await_drained()
+            assert outcome.drained is True
+            ttl_ms = await client.pttl(config.upgrade_quiesce_key())
+            assert 299_000 <= ttl_ms <= 300_000, (
+                f"the clean drain handed off {ttl_ms}ms instead of the 300 s lease"
+            )
+
+    asyncio.run(go())
+
+
 # --- the hook's exit contract -------------------------------------------------
 
 
@@ -1123,6 +1144,12 @@ def _success_configs(names: dict[str, str]) -> tuple[WorkerConfig, ...]:
     return (
         _config(names),
         _config(names, installation_id="acme-install", upgrade_revision=4),
+        _config(
+            names,
+            installation_id="acme-install",
+            upgrade_revision=4,
+            upgrade_legacy_quiesce=True,
+        ),
     )
 
 
@@ -1136,7 +1163,7 @@ def _hook_redis() -> AsyncRedis:
 
 
 async def _delete_marker_keys(client: AsyncRedis, config: WorkerConfig) -> None:
-    await client.delete(config.upgrade_quiesce_key())
+    await client.delete(config.upgrade_quiesce_key(), _legacy_quiesce_key(config))
     # Cleanup must not hide a missing success-key method; the assertions call it.
     deleter = getattr(config, "upgrade_drain_success_key", None)
     if deleter is not None:
@@ -1151,12 +1178,19 @@ def test_clean_drain_records_success_and_release_deletes_both(
 
     async def go() -> None:
         for config in _success_configs(names):
+            config = config.model_copy(update={"upgrade_quiesce_ttl_s": 1800.0})
             client = _hook_redis()
             try:
                 assert await run_gate(config, mode="drain") == 0
                 assert await client.exists(config.upgrade_quiesce_key())
+                assert 299_000 <= await client.pttl(config.upgrade_quiesce_key()) <= 300_000
                 recorded = json.loads(await client.get(config.upgrade_drain_success_key()))
                 assert recorded == {"revision": _recorded_revision(config)}
+                assert (
+                    1_799_000
+                    <= await client.pttl(config.upgrade_drain_success_key())
+                    <= 1_800_000
+                ), "the success record must retain the configured roll-hold lifetime"
                 assert await run_gate(config, mode="release") == 0
                 assert not await client.exists(config.upgrade_quiesce_key())
                 assert not await client.exists(config.upgrade_drain_success_key())
@@ -1192,19 +1226,29 @@ def test_refused_drain_leaves_no_success_key_and_no_quiesce_key(
     asyncio.run(go())
 
 
-def test_attest_without_success_key_refuses_and_creates_nothing(
+@pytest.mark.parametrize("with_marker", [False, True])
+def test_attest_without_success_key_refuses_without_creating_or_renewing_pause(
     names: dict[str, str],
+    with_marker: bool,
 ) -> None:
-    """Attest only reads the success record. Missing means refuse, and neither
-    the quiesce marker nor the success key may be created."""
+    """The record check must precede renewal, even with an owned pause present."""
 
     async def go() -> None:
         for config in _success_configs(names):
             client = _hook_redis()
             try:
+                key = config.upgrade_quiesce_key()
+                if with_marker:
+                    await UpgradeDrainGate(client, config).request_quiesce(ttl_s=60.0)
+                before = await client.get(key)
+                ttl_before = await client.pttl(key)
                 assert await client.get(config.upgrade_drain_success_key()) is None
                 assert await run_gate(config, mode="attest") == 1
-                assert not await client.exists(config.upgrade_quiesce_key())
+                assert await client.get(key) == before
+                if with_marker:
+                    assert 0 < await client.pttl(key) <= ttl_before
+                else:
+                    assert not await client.exists(key)
                 assert await client.get(config.upgrade_drain_success_key()) is None
             finally:
                 await _delete_marker_keys(client, config)
@@ -1213,11 +1257,10 @@ def test_attest_without_success_key_refuses_and_creates_nothing(
     asyncio.run(go())
 
 
-def test_attest_accepts_a_planted_success_key_without_draining(
+def test_attest_renews_an_owned_marker_after_a_matching_record_without_draining(
     names: dict[str, str],
 ) -> None:
-    """A success record for this revision is enough. Attest must not require a
-    drain call and must not write the quiesce marker."""
+    """A valid handoff extends the pause once without re-running the drain."""
 
     async def go() -> None:
         for config in _success_configs(names):
@@ -1227,9 +1270,21 @@ def test_attest_accepts_a_planted_success_key_without_draining(
                 await client.set(
                     config.upgrade_drain_success_key(),
                     json.dumps({"revision": revision}),
+                    px=60_000,
                 )
+                record = await client.get(config.upgrade_drain_success_key())
+                record_ttl = await client.pttl(config.upgrade_drain_success_key())
+                await UpgradeDrainGate(client, config).request_quiesce(ttl_s=1.0)
+                marker = await client.get(config.upgrade_quiesce_key())
+                await _hold_live_delivery(client, config)
                 assert await run_gate(config, mode="attest") == 0
-                assert not await client.exists(config.upgrade_quiesce_key())
+                assert await client.get(config.upgrade_quiesce_key()) == marker
+                assert 299_000 <= await client.pttl(config.upgrade_quiesce_key()) <= 300_000
+                if config.upgrade_legacy_quiesce:
+                    assert await client.get(_legacy_quiesce_key(config)) == marker
+                    assert 299_000 <= await client.pttl(_legacy_quiesce_key(config)) <= 300_000
+                assert await client.get(config.upgrade_drain_success_key()) == record
+                assert 0 < await client.pttl(config.upgrade_drain_success_key()) <= record_ttl
             finally:
                 await _delete_marker_keys(client, config)
                 await client.aclose()
@@ -1268,19 +1323,245 @@ def test_attest_refuses_a_success_key_for_another_revision(
     asyncio.run(go())
 
 
-def test_attest_refuses_a_non_json_success_value(names: dict[str, str]) -> None:
-    """Garbage stored under this revision's key is not a successful drain."""
+@pytest.mark.parametrize(
+    "record",
+    ["not-json", "[]", '{"revision":true}', '{"revision":"4"}', '{"revision":5}'],
+)
+def test_attest_refuses_an_invalid_success_record_without_renewing_an_owned_pause(
+    names: dict[str, str],
+    record: str,
+) -> None:
+    """Malformed or foreign success metadata must not extend a healthy pause."""
 
     async def go() -> None:
-        for config in _success_configs(names):
-            client = _hook_redis()
+        async with _gate(
+            names, installation_id="acme-install", upgrade_revision=4
+        ) as (gate, config, client):
             try:
-                await client.set(config.upgrade_drain_success_key(), "not-json")
+                await gate.request_quiesce(ttl_s=60.0)
+                marker = await client.get(config.upgrade_quiesce_key())
+                ttl_before = await client.pttl(config.upgrade_quiesce_key())
+                await client.set(config.upgrade_drain_success_key(), record, px=60_000)
                 assert await run_gate(config, mode="attest") == 1
-                assert not await client.exists(config.upgrade_quiesce_key())
+                assert await client.get(config.upgrade_quiesce_key()) == marker
+                assert 0 < await client.pttl(config.upgrade_quiesce_key()) <= ttl_before
+                assert await client.get(config.upgrade_drain_success_key()) == record
             finally:
                 await _delete_marker_keys(client, config)
-                await client.aclose()
+
+    asyncio.run(go())
+
+
+@pytest.mark.parametrize("mode", ["attest", "hold"])
+@pytest.mark.parametrize("marker_revision", [None, 3, 5])
+def test_renewal_refuses_an_absent_or_foreign_pause_without_creating_a_key(
+    names: dict[str, str],
+    mode: str,
+    marker_revision: int | None,
+) -> None:
+    """Neither renew-only hook may acquire an expired or another revision's pause."""
+
+    async def go() -> None:
+        async with _gate(
+            names,
+            installation_id="acme-install",
+            upgrade_revision=4,
+            upgrade_legacy_quiesce=True,
+            upgrade_quiesce_ttl_s=1800.0,
+        ) as (_unused_gate, config, client):
+            key = config.upgrade_quiesce_key()
+            bridge = _legacy_quiesce_key(config)
+            try:
+                record = json.dumps({"revision": 4})
+                await client.set(config.upgrade_drain_success_key(), record, px=60_000)
+                if marker_revision is not None:
+                    await client.set(
+                        key,
+                        json.dumps(
+                            {
+                                "revision": marker_revision,
+                                "since": "2026-10-01T00:00:00Z",
+                            }
+                        ),
+                        px=60_000,
+                    )
+                before = await client.get(key)
+                ttl_before = await client.pttl(key)
+                assert await run_gate(config, mode=mode) == 1
+                assert await client.get(key) == before
+                if marker_revision is None:
+                    assert not await client.exists(key)
+                else:
+                    assert 0 < await client.pttl(key) <= ttl_before
+                assert not await client.exists(bridge), "renewal created an absent bridge key"
+                assert await client.get(config.upgrade_drain_success_key()) == record
+            finally:
+                await _delete_marker_keys(client, config)
+                await client.delete(bridge)
+
+    asyncio.run(go())
+
+
+@pytest.mark.parametrize("mode", ["attest", "hold"])
+@pytest.mark.parametrize(
+    "marker",
+    ["not-json", "[]", '{"revision":true}', '{"revision":"4"}'],
+)
+def test_renewal_refuses_a_malformed_pause_without_creating_a_bridge(
+    names: dict[str, str],
+    mode: str,
+    marker: str,
+) -> None:
+    """An unreadable pause remains unchanged even with a matching success record."""
+
+    async def go() -> None:
+        async with _gate(
+            names,
+            installation_id="acme-install",
+            upgrade_revision=4,
+            upgrade_legacy_quiesce=True,
+            upgrade_quiesce_ttl_s=1800.0,
+        ) as (_unused_gate, config, client):
+            key = config.upgrade_quiesce_key()
+            bridge = _legacy_quiesce_key(config)
+            try:
+                await client.set(key, marker, px=60_000)
+                ttl_before = await client.pttl(key)
+                record = '{"revision":4}'
+                await client.set(config.upgrade_drain_success_key(), record, px=60_000)
+                assert await run_gate(config, mode=mode) == 1
+                assert await client.get(key) == marker
+                assert 0 < await client.pttl(key) <= ttl_before
+                assert not await client.exists(bridge)
+                assert await client.get(config.upgrade_drain_success_key()) == record
+            finally:
+                await _delete_marker_keys(client, config)
+
+    asyncio.run(go())
+
+
+@pytest.mark.parametrize("mode", ["attest", "hold"])
+def test_renewal_refuses_an_unreachable_valkey_without_creating_keys(
+    names: dict[str, str],
+    mode: str,
+) -> None:
+    """Connection failure is exit 1, not a successful handoff or a retrying drain."""
+
+    async def go() -> None:
+        async with _gate(
+            names, installation_id="acme-install", upgrade_revision=4
+        ) as (_unused_gate, config, client):
+            keys = (config.upgrade_quiesce_key(), config.upgrade_drain_success_key())
+            assert await client.exists(*keys) == 0
+            with socket.socket() as unreachable:
+                unreachable.bind(("127.0.0.1", 0))
+                unreadable = config.model_copy(
+                    update={
+                        "valkey_host": "127.0.0.1",
+                        "valkey_port": int(unreachable.getsockname()[1]),
+                    }
+                )
+                code = await asyncio.wait_for(run_gate(unreadable, mode=mode), timeout=5.0)
+                assert code == 1
+            assert await client.exists(*keys) == 0
+
+    asyncio.run(go())
+
+
+@pytest.mark.parametrize("bridge", [False, True])
+def test_hold_mode_extends_owned_pause_to_the_roll_hold_without_draining(
+    names: dict[str, str],
+    bridge: bool,
+) -> None:
+    """The chart's module entry point must renew existing keys, preserving bytes."""
+
+    async def go() -> None:
+        async with _gate(
+            names,
+            installation_id="acme-install",
+            upgrade_revision=4,
+            upgrade_legacy_quiesce=bridge,
+            upgrade_quiesce_ttl_s=1800.0,
+        ) as (gate, config, client):
+            keys = [config.upgrade_quiesce_key()]
+            if bridge:
+                keys.append(_legacy_quiesce_key(config))
+            try:
+                await gate.request_quiesce(ttl_s=60.0)
+                before = await client.mget(keys)
+                await _hold_live_delivery(client, config)
+                completed = await asyncio.to_thread(
+                    subprocess.run,
+                    [sys.executable, "-m", "curie_worker.upgrade_drain", "--mode", "hold"],
+                    env=_module_env(config),
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                    # Import startup under shared-host load is setup time,
+                    # separate from the renewal TTL asserted below.
+                    timeout=30,
+                )
+                assert completed.returncode == 0
+                assert await client.mget(keys) == before
+                for key in keys:
+                    assert 1_799_000 <= await client.pttl(key) <= 1_800_000
+                assert await client.get(config.upgrade_drain_success_key()) is None
+            finally:
+                await client.delete(*keys)
+                await _delete_marker_keys(client, config)
+
+    asyncio.run(go())
+
+
+def test_attest_preserves_a_pause_already_longer_than_the_handoff_lease(
+    names: dict[str, str],
+) -> None:
+    """An attest retry after hold must not shorten the roll's existing authority."""
+
+    async def go() -> None:
+        async with _gate(
+            names,
+            installation_id="acme-install",
+            upgrade_revision=4,
+            upgrade_quiesce_ttl_s=1800.0,
+        ) as (gate, config, client):
+            try:
+                await gate.request_quiesce(ttl_s=1200.0)
+                await client.set(
+                    config.upgrade_drain_success_key(), '{"revision":4}', px=60_000
+                )
+                assert await run_gate(config, mode="attest") == 0
+                assert 1_199_000 <= await client.pttl(config.upgrade_quiesce_key()) <= 1_200_000
+            finally:
+                await _delete_marker_keys(client, config)
+
+    asyncio.run(go())
+
+
+def test_hold_shorter_than_the_handoff_lease_preserves_the_existing_pause(
+    names: dict[str, str],
+) -> None:
+    """A configured hold below 300 s extends only; it cannot shorten the handoff."""
+
+    async def go() -> None:
+        async with _gate(
+            names,
+            installation_id="acme-install",
+            upgrade_revision=4,
+            upgrade_legacy_quiesce=True,
+            upgrade_quiesce_ttl_s=60.0,
+        ) as (gate, config, client):
+            keys = (config.upgrade_quiesce_key(), _legacy_quiesce_key(config))
+            try:
+                await gate.request_quiesce(ttl_s=300.0)
+                before = await client.mget(keys)
+                assert await run_gate(config, mode="hold") == 0
+                assert await client.mget(keys) == before
+                for key in keys:
+                    assert 299_000 <= await client.pttl(key) <= 300_000
+                assert await client.get(config.upgrade_drain_success_key()) is None
+            finally:
+                await _delete_marker_keys(client, config)
 
     asyncio.run(go())
 
@@ -1318,10 +1599,12 @@ def test_the_chart_hooks_invoke_a_module_and_modes_this_package_actually_has() -
         interpreter, dash_m, module, mode_flag, mode, *_hook_args = command
         assert (interpreter, dash_m, mode_flag) == ("python", "-m", "--mode"), command
         importlib.import_module(module)
-        assert mode in ("drain", "release", "attest"), f"the chart asks for --mode {mode}"
+        assert mode in ("drain", "release", "attest", "hold"), (
+            f"the chart asks for --mode {mode}"
+        )
     modes = {command[4] for command in commands}
-    assert modes == {"drain", "release", "attest"}, (
-        f"the chart wires {sorted(modes)}; drain, release, and attest are required. "
+    assert modes == {"drain", "release", "attest", "hold"}, (
+        f"the chart wires {sorted(modes)}; drain, release, attest, and hold are required. "
         "Without the release the fleet waits out the whole quiesce TTL after every "
         "upgrade, and without attest a deleted drain Job still lets the roll proceed."
     )
@@ -1331,6 +1614,10 @@ def test_the_chart_hooks_invoke_a_module_and_modes_this_package_actually_has() -
     assert attest.get("helm.sh/hook") == "pre-upgrade", attest
     assert attest.get("helm.sh/hook-weight") == "-9", attest
     assert annotations["upgrade-drain"]["helm.sh/hook-weight"] == "-10", annotations
+    hold = annotations.get("upgrade-drain-hold")
+    assert hold is not None, "the chart has no upgrade-drain-hold hook annotations"
+    assert hold.get("helm.sh/hook") == "pre-upgrade", hold
+    assert hold.get("helm.sh/hook-weight") == "10", hold
 
 
 def _template_hook_annotations(text: str) -> dict[str, dict[str, str]]:
@@ -1338,7 +1625,12 @@ def _template_hook_annotations(text: str) -> dict[str, dict[str, str]]:
     lines = text.splitlines()
     found: dict[str, dict[str, str]] = {}
     prefix = "app.kubernetes.io/component: "
-    known = {"upgrade-drain", "upgrade-drain-release", "upgrade-drain-attest"}
+    known = {
+        "upgrade-drain",
+        "upgrade-drain-release",
+        "upgrade-drain-attest",
+        "upgrade-drain-hold",
+    }
     for index, line in enumerate(lines):
         stripped = line.strip()
         if not stripped.startswith(prefix):
@@ -1406,8 +1698,8 @@ def test_client_selects_ssl_connection_when_tls_is_set() -> None:
 # A drain Job that is killed mid-wait (helm cancelled then the Job deleted,
 # activeDeadlineSeconds, SIGKILL, node loss) must not leave the fleet paused for
 # the long quiesce TTL. While waiting, the marker is a short lease renewed each
-# poll; only a clean drain extends it to the roll hold. The lease is patched to a
-# tiny value so the tests run in about a second.
+# poll; a clean drain hands off the 300 s lease for the later hold hook. The
+# waiting lease is patched to a tiny value so the tests run in about a second.
 
 _TINY_LEASE_S = 0.5
 
@@ -1444,7 +1736,7 @@ def test_quiesce_lease_is_capped_at_the_effective_drain_wait() -> None:
     )
 
 
-def test_marker_is_a_renewed_short_lease_while_waiting_then_the_roll_hold(
+def test_marker_is_a_renewed_short_lease_while_waiting_then_the_handoff_lease(
     names, monkeypatch: pytest.MonkeyPatch
 ) -> None:  # noqa: ANN001
     monkeypatch.setattr(_drain_mod, "quiesce_lease_s", lambda _c: _TINY_LEASE_S)
@@ -1475,9 +1767,9 @@ def test_marker_is_a_renewed_short_lease_while_waiting_then_the_roll_hold(
                 with contextlib.suppress(BaseException):
                     await waiter
             assert outcome.drained is True
-            hold = await client.pttl(key)
-            assert 19_000 <= hold <= 20_000, (
-                f"a clean drain did not extend the marker to the roll hold ({hold}ms)"
+            handoff = await client.pttl(key)
+            assert 299_000 <= handoff <= 300_000, (
+                f"a clean drain did not hand off the 300 s lease ({handoff}ms)"
             )
 
     asyncio.run(go())
@@ -1528,9 +1820,9 @@ def test_marker_survives_a_delivery_scan_slower_than_the_lease(
                 with contextlib.suppress(BaseException):
                     await waiter
             assert outcome.drained is True
-            hold = await client.pttl(key)
-            assert 19_000 <= hold <= 20_000, (
-                f"a clean drain did not extend the marker to the roll hold ({hold}ms)"
+            handoff = await client.pttl(key)
+            assert 299_000 <= handoff <= 300_000, (
+                f"a clean drain did not hand off the 300 s lease ({handoff}ms)"
             )
 
     asyncio.run(go())

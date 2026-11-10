@@ -9,6 +9,7 @@ from collections.abc import Sequence
 
 import sqlalchemy as sa
 from alembic import op
+from curie_api.migration_schema import create_schema_if_absent
 from sqlalchemy.dialects import postgresql
 
 revision: str = "0001"
@@ -20,7 +21,7 @@ SCHEMA = "curie"
 
 
 def upgrade() -> None:
-    op.execute(f"CREATE SCHEMA IF NOT EXISTS {SCHEMA}")
+    op.execute(create_schema_if_absent(SCHEMA))
 
     environment = postgresql.ENUM(
         "prod", "dev", name="environment", schema=SCHEMA, create_type=False

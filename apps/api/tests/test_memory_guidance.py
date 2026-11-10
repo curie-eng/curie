@@ -13,7 +13,7 @@ from typing import Any
 
 from curie_api.config import get_settings
 from curie_api.memory_guidance import DEFAULT_MEMORY_GUIDANCE
-from curie_api.sandbox_token import mint
+from curie_internal.sandbox_token import mint
 
 OPERATOR_TEXT = "Remember customer preferences; never record secrets or credentials."
 

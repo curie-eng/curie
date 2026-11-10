@@ -4,6 +4,8 @@ Date: 2026-08-27
 
 Status: Accepted
 
+**Superseded in part by [ADR 0207](0207-a-delivery-owner-rides-through-an-ownership-store-outage-shorter-than-its-lease.md)**
+
 This decision was explicitly approved by a maintainer on 2026-08-27 before
 implementation began. It extends [ADR-0013](0013-concurrency-and-delivery-model.md)
 and [ADR-0039](0039-bounded-delivery-and-a-dead-letter-graveyard.md): at-least-once

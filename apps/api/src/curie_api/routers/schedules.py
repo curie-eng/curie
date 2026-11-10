@@ -1,35 +1,47 @@
-"""List each in-force cron hook and the newest slot recorded for it (#2933).
+"""List each in-force cron hook and its scheduled and manual histories (#4010).
 
 The ranking matches the worker cron loop: prod outranks dev, then the newest
 active deployment. Declarations are read from that version's bundle. ``hook_runs``
-only supplies the newest slot for a name the bundle still declares.
+supplies the newest slot of each source for a name the bundle still declares.
+
+Pause and resume also accept an explicit webhook wake name (ADR 0274 decision 3
+and package 4; ``docs/interfaces/triggers/INTERFACE.md`` "Declared webhook wake
+contract (ADR 0274)"). Pause refuses new wake admission under the same lock the
+wake route takes. Resuming a wake owes no catch up: a later connector poll wakes
+fresh work, so the listing stays cron only.
 """
 
 from __future__ import annotations
 
 import tempfile
 import uuid
+from collections.abc import Iterator
+from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, cast, get_args
 
 from fastapi import APIRouter, Depends, HTTPException, status
+from plugin_format import TriggerDeclaration
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 from starlette.concurrency import run_in_threadpool
 
-from .. import bundles, crud
-from ..auth import require_api_key
-from ..config import get_settings
-from ..db import SCHEMA
-from ..deps import SessionDep, StoreDep
-from ..schemas import (
+from curie_api.crud import agents as crud_agents
+from curie_api.schemas.schedules import (
     AgentSchedulesOut,
+    HookRunReason,
     ScheduleControlOut,
     ScheduleHookOut,
     ScheduleListOut,
     ScheduleOutcome,
 )
+
+from .. import bundles
+from ..auth import require_api_key
+from ..config import get_settings
+from ..db import SCHEMA
+from ..deps import SessionDep, StoreDep
 from ..storage import ObjectStore
 
 _OUTCOMES: dict[str, ScheduleOutcome] = {
@@ -62,11 +74,11 @@ ORDER BY a.id, (d.environment = 'prod') DESC, d.deployed_at DESC, d.id DESC
 """
 
 _LATEST_SQL = """
-SELECT DISTINCT ON (name)
-       name, slot_utc, outcome
+SELECT DISTINCT ON (name, source)
+       name, source, slot_utc, outcome, reason
 FROM {schema}.hook_runs
 WHERE agent_id = :agent_id
-ORDER BY name, slot_utc DESC
+ORDER BY name, source, slot_utc DESC
 """
 
 _PAUSED_SQL = """
@@ -100,6 +112,17 @@ SET resume_from = CASE WHEN paused_at IS NULL THEN resume_from
 WHERE agent_id = :agent_id AND name = :name
 """
 
+# A wake has no schedule to catch up on (ADR 0274 decision 3): resuming clears
+# the pause and any stale catch up horizon, and bumps the generation only when
+# the hook was paused, exactly as the cron resume does.
+_WAKE_RESUME_SQL = """
+UPDATE {schema}.schedule_controls
+SET resume_from = NULL,
+    paused_at = NULL,
+    generation = generation + CASE WHEN paused_at IS NOT NULL THEN 1 ELSE 0 END
+WHERE agent_id = :agent_id AND name = :name
+"""
+
 
 def _cron_hooks(raw: list[Any]) -> list[tuple[str, str, str]]:
     found: list[tuple[str, str, str]] = []
@@ -119,7 +142,8 @@ def _cron_hooks(raw: list[Any]) -> list[tuple[str, str, str]]:
     return found
 
 
-def _read_triggers(data: bytes) -> list[Any]:
+@contextmanager
+def _extracted(data: bytes) -> Iterator[Path]:
     settings = get_settings()
     with tempfile.TemporaryDirectory() as tmp:
         bundles.extract_and_validate(
@@ -129,19 +153,51 @@ def _read_triggers(data: bytes) -> list[Any]:
             max_compression_ratio=settings.bundle_max_compression_ratio,
             max_members=settings.bundle_max_members,
         )
-        declared = bundles.read_manifest_triggers(Path(tmp))
+        yield Path(tmp)
+
+
+def read_triggers(data: bytes) -> list[Any]:
+    with _extracted(data) as root:
+        declared = bundles.read_manifest_triggers(root)
     return declared if isinstance(declared, list) else []
 
 
-async def _resolve_agent(session: AsyncSession, raw: str) -> Any:
+def read_wake_triggers(data: bytes) -> dict[str, TriggerDeclaration]:
+    """Explicit wake declarations of a stored bundle, keyed by exact name.
+
+    Raises whenever the bundle or its declarations cannot be read: a wake is
+    authority, so a malformed bundle never reads as "no wake declared".
+    """
+
+    with _extracted(data) as root:
+        return bundles.read_manifest_wake_triggers(root)
+
+
+def _read_named_triggers(data: bytes) -> tuple[list[Any], dict[str, TriggerDeclaration] | None]:
+    """Raw triggers and wake declarations from one extraction.
+
+    The wake half is None when it cannot be read, so a cron name keeps its
+    controls even when a sibling declaration is malformed.
+    """
+
+    with _extracted(data) as root:
+        declared = bundles.read_manifest_triggers(root)
+        try:
+            wakes: dict[str, TriggerDeclaration] | None = bundles.read_manifest_wake_triggers(root)
+        except Exception:  # noqa: BLE001 - decided by the caller from the name
+            wakes = None
+    return (declared if isinstance(declared, list) else []), wakes
+
+
+async def resolve_agent(session: AsyncSession, raw: str) -> Any:
     parsed: uuid.UUID | None
     try:
         parsed = uuid.UUID(raw)
     except ValueError:
         parsed = None
-    agent = await crud.get_agent(session, parsed) if parsed is not None else None
+    agent = await crud_agents.get_agent(session, parsed) if parsed is not None else None
     if agent is None:
-        agent = await crud.get_agent_by_name(session, raw)
+        agent = await crud_agents.get_agent_by_name(session, raw)
     if agent is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "agent not found")
     return agent
@@ -157,14 +213,14 @@ async def _in_force(session: AsyncSession, agent_id: uuid.UUID | None) -> list[d
 
 async def _latest(
     session: AsyncSession, agent_id: uuid.UUID
-) -> dict[str, tuple[datetime, str | None]]:
+) -> dict[tuple[str, str], tuple[datetime, str | None, str | None]]:
     statement = text(_LATEST_SQL.format(schema=SCHEMA))
     rows = (await session.execute(statement, {"agent_id": agent_id})).mappings().all()
-    latest: dict[str, tuple[datetime, str | None]] = {}
+    latest: dict[tuple[str, str], tuple[datetime, str | None, str | None]] = {}
     for row in rows:
         name = row["name"]
         if isinstance(name, str):
-            latest[name] = (row["slot_utc"], row["outcome"])
+            latest[name, row["source"]] = (row["slot_utc"], row["outcome"], row["reason"])
     return latest
 
 
@@ -184,16 +240,27 @@ async def _hooks_for(
         return [], None
     try:
         data = await store.get(bundle_ref)
-        declared = await run_in_threadpool(_read_triggers, data)
-    except Exception:
+        declared = await run_in_threadpool(read_triggers, data)
+    except Exception:  # noqa: BLE001 - existing broad catch retained
         return [], _UNREADABLE
     latest = await _latest(session, agent_id)
     paused = await _paused(session, agent_id)
     hooks: list[ScheduleHookOut] = []
     for name, schedule, zone in _cron_hooks(declared):
-        slot = latest.get(name)
+        slot = latest.get((name, "schedule"))
         last_fire_at = None if slot is None else slot[0]
         last_outcome = None if slot is None else _OUTCOMES.get(slot[1] or "")
+        raw_reason = None if slot is None else slot[2]
+        if raw_reason is not None and raw_reason not in get_args(HookRunReason):
+            raise HTTPException(status.HTTP_500_INTERNAL_SERVER_ERROR, "hook run reason is unknown")
+        last_reason = cast(HookRunReason | None, raw_reason)
+        manual = latest.get((name, "manual"))
+        last_manual_fire_at = None if manual is None else manual[0]
+        last_manual_outcome = None if manual is None else _OUTCOMES.get(manual[1] or "")
+        raw_manual_reason = None if manual is None else manual[2]
+        if raw_manual_reason is not None and raw_manual_reason not in get_args(HookRunReason):
+            raise HTTPException(status.HTTP_500_INTERNAL_SERVER_ERROR, "hook run reason is unknown")
+        last_manual_reason = cast(HookRunReason | None, raw_manual_reason)
         hooks.append(
             ScheduleHookOut(
                 name=name,
@@ -202,6 +269,10 @@ async def _hooks_for(
                 zone=zone,
                 last_fire_at=last_fire_at,
                 last_outcome=last_outcome,
+                last_reason=last_reason,
+                last_manual_fire_at=last_manual_fire_at,
+                last_manual_outcome=last_manual_outcome,
+                last_manual_reason=last_manual_reason,
                 paused=name in paused,
             )
         )
@@ -214,9 +285,9 @@ async def list_schedules(
     store: StoreDep,
     agent: str | None = None,
 ) -> ScheduleListOut:
-    """Cron hooks on each in-force deployment, newest slot first in the record."""
+    """Cron hooks on each in-force deployment, with separate latest run histories."""
 
-    selected = None if agent is None else await _resolve_agent(session, agent)
+    selected = None if agent is None else await resolve_agent(session, agent)
     rows = await _in_force(session, None if selected is None else selected.id)
     if selected is not None and not rows:
         return ScheduleListOut(
@@ -244,28 +315,43 @@ async def list_schedules(
     return ScheduleListOut(schedules=listed)
 
 
-async def _named_hook(session: AsyncSession, store: ObjectStore, raw_agent: str, name: str) -> Any:
-    agent = await _resolve_agent(session, raw_agent)
+async def _named_hook(
+    session: AsyncSession, store: ObjectStore, raw_agent: str, name: str
+) -> tuple[Any, bool]:
+    """The agent and whether ``name`` is a wake rather than a cron hook.
+
+    Cron names resolve first, unchanged. Otherwise only an explicit wake
+    declaration (ADR 0274) qualifies; an unreadable wake declaration set is the
+    same 503 as an unreadable bundle, never a silent 404.
+    """
+    agent = await resolve_agent(session, raw_agent)
     rows = await _in_force(session, agent.id)
     if not rows or rows[0]["bundle_ref"] is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "schedule not found")
     try:
         data = await store.get(rows[0]["bundle_ref"])
-        declared = await run_in_threadpool(_read_triggers, data)
+        declared, wakes = await run_in_threadpool(_read_named_triggers, data)
     except Exception as exc:
         raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, _UNREADABLE) from exc
-    if name not in {hook_name for hook_name, _, _ in _cron_hooks(declared)}:
+    if name in {hook_name for hook_name, _, _ in _cron_hooks(declared)}:
+        return agent, False
+    if wakes is None:
+        raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, _UNREADABLE)
+    if name not in wakes:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "schedule not found")
-    return agent
+    return agent, True
 
 
 async def _change_pause(
     session: AsyncSession, store: ObjectStore, raw_agent: str, name: str, *, pause: bool
 ) -> ScheduleControlOut:
-    agent = await _named_hook(session, store, raw_agent, name)
+    agent, wake = await _named_hook(session, store, raw_agent, name)
     params = {"agent_id": agent.id, "name": name}
     await session.execute(text(_LOCK_SQL), {"agent_id": str(agent.id), "name": name})
-    statement = _PAUSE_SQL if pause else _RESUME_SQL
+    if pause:
+        statement = _PAUSE_SQL
+    else:
+        statement = _WAKE_RESUME_SQL if wake else _RESUME_SQL
     await session.execute(text(statement.format(schema=SCHEMA)), params)
     await session.commit()
     return ScheduleControlOut(agent=agent.name, name=name, paused=pause)
@@ -275,7 +361,7 @@ async def _change_pause(
 async def pause_schedule(
     agent: str, name: str, session: SessionDep, store: StoreDep
 ) -> ScheduleControlOut:
-    """Pause a named cron hook without changing its in force bundle."""
+    """Pause a named cron or webhook wake hook without changing its in force bundle."""
 
     return await _change_pause(session, store, agent, name, pause=True)
 
@@ -284,6 +370,6 @@ async def pause_schedule(
 async def resume_schedule(
     agent: str, name: str, session: SessionDep, store: StoreDep
 ) -> ScheduleControlOut:
-    """Resume a named cron hook with one bounded catch up opportunity."""
+    """Resume a named hook: a cron hook gets one bounded catch up, a wake none."""
 
     return await _change_pause(session, store, agent, name, pause=False)

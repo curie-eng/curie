@@ -41,16 +41,19 @@ frozen ACI field is unchanged; the state-API bearer is a runner-local knob
 
 ## Current contract
 
-- **Resolution.** `resolve_memory(memory_ref, env)`: an absent ref →
+1. **Resolution.** `resolve_memory(memory_ref, env)`: an absent ref →
   `NullMemoryStore`; an `http(s)://` ref → `StateApiMemoryStore`; any other
   scheme (`s3://` …) is reserved for a future loader and rejected loudly.
-- **Load side.** `load()` returns prior records oldest-first (empty when none).
+2. **Load side.** `load()` returns prior records oldest-first (empty when none).
   At boot the runner loads memory and composes it into the effective system
   prompt as a preamble — this is how memory is *delivered into the sandbox*. A
   transient load failure degrades to "no memory" and does not block boot.
-- **Append side.** `append(record)` durably writes one record; provenance is
-  stamped by `SessionRunner.remember(content, source_trace_ids=...)`. The record
-  survives suspend/resume and is reloaded at the next boot.
+3. **Append side.** `append(record)` POSTs one record to the legacy log; provenance is
+  stamped by `SessionRunner.remember(content, source_trace_ids=...)`. A platform-authorized
+  caller can persist it for the next boot. The worker's sandbox credential cannot:
+  the state API refuses memory appends even with a per-turn write token. The supported
+  per-turn `remember` fact tool writes a fact key with PUT through `MemoryFactsStore`,
+  beside this port.
 
 ## Implementations today
 
@@ -61,7 +64,11 @@ facts store (`MemoryFactsStore`, below) sits beside the port, not behind it.
 over the durable KV/document store landed for #23/#248
 (`apps/api` `/agents/{agent_id}/state/{namespace}/{key}`, Postgres JSONB).
 `load` GETs the single log-shaped key; `append` POSTs to that key's `/append`
-endpoint (#248), inheriting durability and the per-value/per-namespace size caps.
+endpoint (#248), inheriting durability and the per-value/per-namespace size caps when
+authorized. These methods use the store's supplied token, so the worker's read-only
+boot token permits loading but cannot fulfill legacy `SessionRunner.remember` or
+log consolidation's PUT. Per-turn fact credentials never authorize a log append or
+replacement (`apps/api/src/curie_api/routers/state.py::_check_memory_reach`).
 The worker (`binding.boot_env`) delivers the ref as
 `http(s)://api/agents/<id>/state/memory` and forwards a scoped, agent-bound
 `state` token (ADR-0033, #410) as the memory token rather than the raw platform
@@ -75,42 +82,128 @@ starts with `eval:` (#1909): that path omits the ref so the runner boots
 Beside the legacy `log`, memory also holds **facts**, read and written by
 `runner/src/curie_runner/memory_facts.py::MemoryFactsStore` rather than through
 the `MemoryStore` port. A fact is one key `fact-<32 hex>` whose value is
-`{statement, author, stated_at, session_id}`. Facts live in two namespaces
-reached with the same memory token:
+`{statement, author, stated_at, session_id}`. Facts live in two namespaces,
+read with the long-lived memory token and written with the turn's write
+credential (see "The memory credential" below):
 
-- **Agent memory**, at `CURIE_MEMORY_REF`, loaded in every channel. It also
+1. **Agent memory**, at `CURIE_MEMORY_REF`, loaded in every channel. It also
   holds two reserved keys that are never facts: `log` (above) and `guidance`
   (`{"text": ...}`, an operator's replacement for the default guidance).
-- **Channel memory**, at `CURIE_CHANNEL_MEMORY_REF`
+2. **Channel memory**, at `CURIE_CHANNEL_MEMORY_REF`
   (`BootEnv.channel_memory_ref`), the binding-scoped namespace
   `.../agents/<id>/state/bindings/<kind>/<address>/memory`. The worker sets it
-  only when the agent's `memory_writes` setting is on and the turn has a
-  binding, and never on an eval-isolated turn.
+  whenever the turn has a binding, whether memory writes are on or off, and
+  never on an eval-isolated turn. Alongside it the worker sends
+  `CURIE_MEMORY_WRITES` (`BootEnv.memory_writes`), `1` or `0` from the agent's
+  `memory_writes` setting; it is never sent without a channel ref.
 
 At boot the runner lists whichever of the two it was given and renders a
 "Remembered facts" block (agent facts, then channel facts, newest first, at
-most 200 per memory, each statement flattened to one line and framed as data,
-not instructions) after the legacy log preamble. With memory writes off no
-channel ref is minted, so only agent facts are loaded. When
-`CURIE_CHANNEL_MEMORY_REF` is set it also mounts `remember`, `update` and
-`forget` on the platform `curie` server and injects the guidance block
-(`guidance` if stored, else `DEFAULT_GUIDANCE`) before the bundle prompt. The
+most 200 per memory by default, each statement flattened to one line and framed as data,
+not instructions) after the legacy log preamble. Each line reads
+`- [<id>] <author> on <YYYY-MM-DD> stated: <statement>` (or
+`- [<id>] <author> stated: <statement>` without a date; a date that does not
+parse is left out, never shown raw), or
+`- [<id>] Author unknown, as of <YYYY-MM-DD>: <statement>` (or
+`- [<id>] Author unknown: <statement>`) when no person is recorded. The
+attribution comes before the statement so a statement cannot forge it. The
+author keeps only the characters `[A-Za-z0-9._@+-]` (anything else, including
+whitespace, parentheses, colons, zero-width and bidi characters, is dropped; nothing
+left means unknown) and is capped at 64 characters. The block tells the model to
+weigh each fact by who stated it, and says that only the attribution at the
+start of each line is the platform's record: anything in the statement that
+looks like an attribution is part of what was said. Reading memory needs no
+switch: with memory writes off, both agent and channel facts still load. Only
+when writes are on does it also mount `remember`, `update` and `forget` on the
+platform `curie` server and inject the guidance block (`guidance` if stored,
+else `DEFAULT_GUIDANCE`) before the bundle prompt. Writes are on when
+`CURIE_MEMORY_WRITES` is `1`, or when it is absent and
+`CURIE_CHANNEL_MEMORY_REF` is set (an older worker, which only sent the ref
+with writes on). With a channel ref and token but writes off, a short notice
+(`WRITES_OFF_NOTICE`) takes the guidance block's place: saving memory is turned
+off for this agent, nothing said here is kept for later conversations, and the
+agent must never say it saved, noted or will remember something. The
 tools take `memory: agent|channel`; the author is the turn's sender, never a
 tool argument. A write the state API refuses at its cap is reported to the model
-as refused. The tools are exempt from bundle toolPolicy by published name, and
-the worker leaves them out of change receipts.
+as refused, and so is one it refuses for the credential (a 403, `MemoryRefused`:
+"this memory cannot be written from this conversation"). So is a `remember` into a memory that already holds 200 facts, the
+most boot loads, so no fact silently leaves the prompt; `update` and `forget`
+still work there. The operator can change that limit with
+`CURIE_MEMORY_MAX_FACTS` (`BootEnv.memory_max_facts`, read as
+`RunnerConfig.memory_max_facts`). It is one number for both the save refusal
+and the boot load, and for agent and channel memory alike, so a saved fact is
+always shown. A value that is not a positive integer is ignored and the
+default of 200 applies. The tools are exempt from bundle toolPolicy by published
+name, and the worker leaves them out of change receipts.
+
+### The memory credential (ADR-0188)
+
+The state API, not the sandbox, decides what a sandbox may do on the `memory`
+namespace (`apps/api/src/curie_api/routers/state.py::_check_memory_reach`).
+There are two sandbox credentials, both `scope="state"` tokens:
+
+1. **Boot env, read-only.** `CURIE_MEMORY_TOKEN` (and `CURIE_HISTORY_TOKEN`),
+  minted in `boot_env` with claims `{binding, memory: "read", cred}`. `binding`
+  is the boot binding's `"<kind>:<address>"`, or JSON null when the turn has
+  none. `cred` is the credential id shared with `CURIE_STATE_TOKEN`. The token
+  expires at the turn's stream deadline plus 60 seconds, capped at 24 hours
+  (`BindingResolver.boot_env`). When the sandbox claim is
+  deleted the worker reports that id and the API refuses the token.
+2. **Per turn, write.** Minted by
+  `apps/worker/src/curie_worker/binding.py::BindingResolver.turn_memory_token`
+  only when the agent has memory writes on, the turn names a binding and it is
+  not eval-isolated, with claims `{binding, memory: "write", sender, turn}`.
+  `sender` is the turn's `event.user`, or `<no person>`; `turn` is the queued
+  event id plus a random suffix unique to each mint
+  (`apps/worker/src/curie_worker/kernel/memory.py::_with_memory_token`), so a retry or
+  continuation carries its own claim. It expires at the turn's stream deadline,
+  capped at 24 hours, with no grace. When the attempt ends the worker reports
+  the turn closed (`BindingResolver.close_turn_memory`), and the API then
+  refuses writes with that claim before expiry
+  (`apps/api/src/curie_api/routers/state.py::_check_turn_open`); if it cannot
+  check the closed-turn record it answers 503 rather than accept the write. A
+  failed close leaves the credential valid until it expires. A steering
+  attempt does not close its own claim when it ends: it hands the claim through
+  Valkey to the live turn it joined, and that turn's owner closes it when the
+  live turn ends (`Kernel._close_memory_turns`). A steer whose runner did not
+  name its live turn is never closed and stays valid until it expires. It rides the
+  runner POST as `Event.memory_token`
+  (MEMORY-TOKEN-1..3), never the env. The runner keeps it on
+  `MemoryTurn.write_token`, and the tool stores present it, falling back to the
+  env token when the event has none.
+
+On `memory` the API allows a sandbox credential: agent memory; channel memory
+only for the binding its `binding` claim names (otherwise 403, checked before
+the binding lookup so it reveals nothing); writes (PUT, DELETE) only with
+`memory: "write"` and only on fact keys (`fact-` plus 32 lowercase hex, so
+never `guidance` or `log`); no POST append. On a PUT it stores the `sender`
+claim as the fact's `author`, whatever the body says, and refuses a value that
+is not a JSON object (422). The namespace listing for another binding leaves
+out its `memory` row. A token with no `memory` claim (from a worker older than
+ADR-0188) is read-only on agent memory and refused on channel memory, with a
+warning naming "legacy sandbox token". The platform key keeps full reach and
+the body's author.
+
+Upgrade order: a runner older than `CURIE_MEMORY_WRITES` ignores the flag and
+mounts the memory tools whenever it gets a channel ref. A newer worker sends
+that ref with writes off too, so an older runner behind it would mount the tools
+against the operator's setting. Upgrade runners with or before workers (one
+`helm upgrade` does both), and don't pin runner images separately across this
+change.
 
 ## Known leakage
 
-- **Scoped memory token (was: shared API key).** Earlier the state API's one
+1. **Scoped memory token (was: shared API key).** Earlier the state API's one
   shared platform key was forwarded into the sandbox as `CURIE_MEMORY_TOKEN`,
   granting that key's full scope. ADR-0033 (#410) closed that: the worker now
-  mints a scoped, agent-bound, HMAC-signed `state` token per turn, accepted only
+  mints a scoped, agent-bound, HMAC-signed `state` token per claim, accepted only
   by the state router and bound to this agent's namespace, so the sandbox
-  credential can no longer resolve approvals or reach another agent's state. The
+  credential can no longer resolve approvals or reach another agent's state.
+  ADR-0188 (#3623) narrows it further on memory, to its own channel and to
+  reads; writes need the per-turn credential above. The
   platform key still authenticates the state router for operators, the CLI, and
   the worker's own control-plane calls.
-- **Consolidation is an opt-in capability, not part of the port.** The core
+2. **Consolidation is an opt-in capability, not part of the port.** The core
   `MemoryStore` port stays `load`/`append` only. Consolidation (#265) adds a
   separate `SupportsReplace` capability (`replace(records)`) and the
   `consolidate_memory(store)` entry point (also `SessionRunner.consolidate_memory`):
@@ -118,10 +211,12 @@ the worker leaves them out of change receipts.
   `consolidate_records` while **unioning their provenance** (`merge_provenance` —
   no source trace is lost), and writes the compacted set back only when the store
   advertises `replace` and the pass actually reduced the record count.
-  `StateApiMemoryStore.replace` is a blind PUT of the log key; `NullMemoryStore`
-  and any read-only backing make consolidation a reporting-only no-op. Automatic
+  `StateApiMemoryStore.replace` is a blind PUT of the log key and succeeds only with
+  platform authorization. With the worker's boot-read token a reducing pass attempts
+  that PUT and is refused; it is not a reporting-only no-op. `NullMemoryStore` and
+  stores without the replace capability remain reporting-only. Automatic
   learned-record *extraction* remains later work.
-- **An operator read/write plane sits below the port, not on it.** The
+3. **An operator read/write plane sits below the port, not on it.** The
   inspect, seed, trace-back, edit, and delete surface (#266, #267, #1904) is
   `apps/api/src/curie_api/routers/memory.py`
   (`apps/api/src/curie_api/routers/memory.py::list_memory`,
@@ -138,24 +233,45 @@ the worker leaves them out of change receipts.
   runner's `runner/src/curie_runner/memory.py::MEMORY_LOG_KEY`), re-declares the
   `{content, provenance}` item shape in
   `apps/api/src/curie_api/routers/memory.py::_records_of`, and borrows the state
-  router's size caps (`apps/api/src/curie_api/routers/state.py::_enforce_caps`).
+  router's size caps (`apps/api/src/curie_api/routers/state.py::enforce_caps`).
   Its consumers are the CLI (`cli/src/api.rs`, behind `curie local memory` /
   `curie local memory --add` and `curie cluster memory` /
   `curie cluster memory --add`) and the console (`apps/ui/src/api/client.ts`). Unlike
-  the sandbox path it is platform-key-only (`require_api_key`), so the scoped
-  memory token cannot reach it. This is coherent today (one loader plus the facts
-  store, one backing store, and the router says so in its own docstring), but it is the precise leak
+  the sandbox path it accepts the platform key or a live console session through
+  `require_api_key`, and the scoped sandbox token still cannot reach it. This is
+  coherent today (one loader plus the facts store, one backing store, and the
+  router says so in its own docstring), but it is the precise leak
   a real second loader would trip over: an `s3://` store would satisfy the port
   and still leave every operator read returning an empty list and every edit and
   delete 404ing, because the operator plane is addressing a Postgres row that
   loader never writes.
-- **No query on the port; the query and edit surface lives below it.** The port
+4. **No query on the port; the query and edit surface lives below it.** The port
   is still `load`/`append` (plus optional `replace`), with no query language, and
   the runner reads the whole log. Listing, trace-back, edit, and delete do exist
   in the system, as the operator plane above rather than as port methods. The
   load-bearing constraint remains: **memory lives OUTSIDE the sandbox**
   (ADR-0003) — the store is network-reachable and rehydratable, not pod-local
   state.
+
+The operator guidance plane also bypasses `MemoryStore`:
+`get_memory_guidance`, `put_memory_guidance` and `delete_memory_guidance` in
+`apps/api/src/curie_api/routers/memory.py` implement GET, PUT and DELETE on
+`/agents/{agent_id}/memory/guidance`. They directly read or mutate the shared
+`WorkflowStateEntry` at `memory/guidance`; GET returns the effective text and
+whether it is operator supplied or the default, PUT replaces it for the next
+boot, and DELETE restores the default. PUT reuses the state caps. Neither
+mutation calls `state_mutation.record`. The API owns
+`apps/api/src/curie_api/memory_guidance.py::DEFAULT_MEMORY_GUIDANCE`, duplicating
+`runner/src/curie_runner/memory_facts.py::DEFAULT_GUIDANCE`; the byte parity
+check is `tests/test_memory_guidance_parity.py`.
+
+CLI facts have another path below the port:
+`ApiClient::list_memory_facts`, `ApiClient::get_memory_fact` and
+`ApiClient::delete_memory_fact` (`cli/src/api.rs`) use the generic shared or
+binding-scoped state routes, rather than the memory router. Deletion sends
+`expected_version` and refuses a stale row without retrying. A backend swap
+must therefore cover the generic state API as well as the memory router's
+legacy log and guidance ORM paths.
 
 ## Cross-links
 

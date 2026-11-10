@@ -55,6 +55,9 @@ import httpx
 from curie_telemetry import operation_span, record_metric
 from opentelemetry.trace import SpanKind, StatusCode
 
+from curie_api.schemas.deployments import WebhookResult
+
+from .code_host_trust import code_host_verify
 from .config import Settings
 from .models import GIT_FLOW_CREATED_BY
 from .repo_full_name import InvalidRepoFullName, repo_url_path
@@ -119,7 +122,7 @@ def moves_to_deploy(
         for branch in target.branches:
             try:
                 sha = tips.sha_for(target.repo_full_name, branch)
-            except Exception as exc:
+            except Exception as exc:  # noqa: BLE001 - existing broad catch retained
                 # One unreachable or unauthorized repository must not stop the
                 # rest. Logged per repo/branch so the cause is attributable.
                 logger.warning(
@@ -225,7 +228,9 @@ class GitHubBranchTip:
             f"{self._settings.github_api_url.rstrip('/')}"
             f"/repos/{repository_path}/commits/{branch}"
         )
-        with httpx.Client(timeout=self._timeout) as client:
+        with httpx.Client(
+            timeout=self._timeout, verify=code_host_verify(self._settings)
+        ) as client:
             response = client.get(url, headers=headers)
         if response.status_code in (403, 429):
             # Not `or 60.0`: `Retry-After: 0` is a legitimate "ask again now"
@@ -336,6 +341,12 @@ _RETRY_MAX_DOUBLINGS = math.ceil(math.log2(_RETRY_MAX_DELAY_S / _RETRY_BASE_DELA
 # failure the deploy lane has stopped, and an operator needs to find it as that
 # rather than as one more per-pass INFO line (#1309).
 _RETRY_ERROR_ROUNDS = 3
+# The failure class of an exception that ESCAPED process_push rather than being
+# mapped to a rejection (#3736). A rejection's codes name the failure; an escape
+# has none, so the backoff record needs a stable stand-in for the same
+# "same sha AND same failure class continues the schedule" rule. Chosen to be
+# visibly not a rejection code, since no `process_push` result ever carries it.
+_PUSH_RAISED = "commitpoller.process_push_raised"
 
 
 @dataclass(frozen=True)
@@ -388,6 +399,7 @@ class CommitPoller:
         store: Any,
         settings: Settings,
         eval_queue: Any,
+        notice_queue: Any | None = None,
         tips: BranchTip,
         interval_seconds: float,
         clock: Callable[[], float] = time.monotonic,
@@ -396,6 +408,7 @@ class CommitPoller:
         self._store = store
         self._settings = settings
         self._eval_queue = eval_queue
+        self._notice_queue = notice_queue
         self._tips = tips
         self._interval = interval_seconds
         # Monotonic, not wall clock: a backoff window must not be skipped or
@@ -411,6 +424,11 @@ class CommitPoller:
         # geometrically growing, capped delay before earning another clone
         # (#1309). Keyed the same way as _settled, per (repository, branch).
         self._archive_backoff: dict[tuple[str, str], ArchiveBackoff] = {}
+        # Only for a Postgres write failure AFTER process_push has settled.
+        # Ordinary Valkey failures are already durable in deploy_notice_outbox.
+        self._pending_notices: dict[
+            tuple[str, str, str], tuple[WebhookResult, dict[str, object]]
+        ] = {}
 
     async def run_forever(self) -> None:
         logger.info("commit poller started interval=%ss", self._interval)
@@ -448,7 +466,7 @@ class CommitPoller:
         ) as span:
             try:
                 moves = await self._poll_once()
-            except Exception as exc:
+            except Exception as exc:  # noqa: BLE001 - existing broad catch retained
                 error = exc
                 if hasattr(span, "set_status"):
                     span.set_status(StatusCode.ERROR)
@@ -480,6 +498,23 @@ class CommitPoller:
         from sqlalchemy import text
 
         from . import gitflow
+
+        # A successful deployment disappears from moves_to_deploy on the next
+        # pass. Retry any notice whose SQL outbox insert failed before checking
+        # branch tips, or that success would erase its last in-process chance.
+        if self._notice_queue is not None:
+            for pending_key, (pending_result, pending_payload) in list(
+                self._pending_notices.items()
+            ):
+                try:
+                    async with self._session_factory() as notice_session:
+                        await self._notice_queue.publish(
+                            notice_session, pending_result, pending_payload, self._settings
+                        )
+                except Exception:
+                    logger.exception("could not persist pending git-flow deploy notice")
+                else:
+                    self._pending_notices.pop(pending_key, None)
 
         schema = self._settings.db_schema
         branch_for_env = {
@@ -577,16 +612,65 @@ class CommitPoller:
                 unsettled.append(move)
         moves = unsettled
 
+        # A move whose deploy RAISES must not stop the moves behind it (#3736).
+        # `process_push` maps git, archive and bundle validation errors to a
+        # rejected result, but its later steps -- a stored bundle's object read,
+        # the bundle store write, the revalidation, database writes, the eval
+        # enqueue -- are unguarded. The first such failure is held here and
+        # re-raised AFTER the loop, so the remaining moves still deploy in this
+        # pass while `poll_once` still records the pass as a failure rather than
+        # letting a broken lane look like a clean one.
+        pass_failure: Exception | None = None
         for move in moves:
             key = (move.repo_full_name, move.branch)
             async with self._session_factory() as session:
-                result = await gitflow.process_push(
-                    session, self._store, self._settings, self._eval_queue, move.as_push_payload()
-                )
+                # No `except CancelledError: raise`, deliberately -- the same
+                # structural guarantee `run_forever` documents: CancelledError
+                # derives from BaseException, so `except Exception` below cannot
+                # catch it and cancellation propagates on its own.
+                try:
+                    result = await gitflow.process_push(
+                        session,
+                        self._store,
+                        self._settings,
+                        self._eval_queue,
+                        move.as_push_payload(),
+                    )
+                except Exception as exc:
+                    # The mirror clone lives inside process_push, so an escape
+                    # must earn the same capped backoff a retryable rejection
+                    # does (#1309) -- otherwise the next pass re clones it
+                    # first and blocks these same repositories again. The
+                    # record is a statement about the attempt, not the sha:
+                    # `_settled` is not written, so recovery stays possible.
+                    logger.exception(
+                        "commit poll deploy raised repo=%s branch=%s sha=%s: %s",
+                        move.repo_full_name,
+                        move.branch,
+                        move.sha[:8],
+                        exc,
+                    )
+                    self._record_retryable_failure(move, {_PUSH_RAISED}, deployed.get(key))
+                    if pass_failure is None:
+                        pass_failure = exc
+                    continue
             # Shared with the webhook lane, not copied (#1268). Reporting a
             # rejection as "deployed" at INFO is #1066 again, and this is the
             # lane with no GitHub delivery UI to fall back on.
             gitflow.log_push_outcome(result, move.as_push_payload(), source="commit poll")
+            if self._notice_queue is not None:
+                notice_payload = move.as_push_payload()
+                notice_key = (move.repo_full_name, move.branch, move.sha)
+                try:
+                    async with self._session_factory() as notice_session:
+                        await self._notice_queue.publish(
+                            notice_session, result, notice_payload, self._settings
+                        )
+                except Exception:
+                    self._pending_notices[notice_key] = (result, notice_payload)
+                    logger.exception("could not persist git-flow deploy notice from commit poll")
+                else:
+                    self._pending_notices.pop(notice_key, None)
 
             if result.status in ("deployed", "promoted"):
                 # A Deployment row exists now, so the database is the memory
@@ -620,6 +704,11 @@ class CommitPoller:
                     move.sha[:8],
                     result.status,
                 )
+        if pass_failure is not None:
+            # Only once every move has had its turn (#3736): the pass reports
+            # failure through poll_once's span and metric, and run_forever's
+            # existing handler keeps the loop alive.
+            raise pass_failure
         return moves
 
     def _record_retryable_failure(

@@ -1,5 +1,16 @@
 # apps/dispatcher
 
+The dispatcher image is the deployment shell for gateway-owned Slack intake.
+Its command is `python -m curie_channel_gateway.slack.run`. Admission caching,
+Redis/Valkey construction and heartbeat live in the gateway's `slack/` package;
+shared stream encoding, publication and dedupe live in
+`curie_internal.turn_queue`. The one-shot CLI producer runs
+`python -m curie_channel_gateway.slack.enqueue_once`. `curie_dispatcher` contains
+only deployment metadata. An import-linter independence contract forbids either
+package from importing the other, including indirectly and under `TYPE_CHECKING`.
+The behavior below is implemented by the gateway with the existing storage keys,
+admission ordering and heartbeat timings.
+
 The Slack dispatcher: Slack Bolt for Python in Socket Mode.
 On an `app_mention` (channel) or direct `message` (DM) for the bot it acks the
 Socket Mode envelope fast, posts an in-thread placeholder reply, and enqueues a
@@ -58,7 +69,9 @@ bot-authored `app_mention` posted at the root of a channel is ingested, so an al
 Still refused: a bot-authored `app_mention` that carries a `thread_ts`, as a loop guard
 between two Curie installations in one workspace, unless its exact sender/channel pair
 is explicitly trusted as described below; a `message` event outside the DM lane, which the app
-never subscribed to; a redelivery whose dedupe key is already claimed; and a button click
+never subscribed to; a mention in a delivery-canary channel, which is counted and never
+starts a turn (see *One app per identity*); a redelivery whose dedupe key is already
+claimed; and a button click
 with nowhere to reply — an App Home or modal click, which carries no channel and no
 message.
 
@@ -189,6 +202,19 @@ ID, channel, and root timestamp, for
 `CURIE_THREAD_CONTEXT_TTL_SECONDS`, so a restart keeps it and a long thread
 reads Slack once; a root that is not this bot's is cached without its text.
 
+## Earlier messages in a direct message
+
+A new top-level message in a one to one direct message quotes recent earlier
+messages from that person and this agent into the turn text, as untrusted
+context. The quote is the newest of those messages inside the last seven days,
+up to `CURIE_DM_CONTINUITY_MAX_MESSAGES` (default 20, allowed 0 through 40),
+oldest first. Zero does not call Slack. A thread reply, a channel mention, a
+group direct message, and any envelope whose `is_ext_shared_channel` is not
+exactly false are unchanged. The conversation id stays the Slack thread
+timestamp. The block is escaped the same way as a quoted thread root. A Slack
+error leaves the person's text unchanged and still admits the turn. Operators
+set the bound through `dispatcher.extraEnv`.
+
 ## The queue seam (what the worker consumes)
 
 The dispatcher `XADD`s onto a Valkey Stream (`CURIE_STREAM`, default
@@ -202,14 +228,14 @@ parenthetical is what the Slack adapter maps onto each one:
 | `conversation_id` | canonical thread/conversation key (the thread ts) |
 | `author` | who authored the message (the Slack user id) |
 | `text` | message text |
-| `reply_handle` | where the reply is delivered: a `ReplyHandle` of `channel`, required nullable `placeholder`, and an optional per turn `endpoint`. It may be absent only on a cron turn with complete nonblank `hook_run` identity. Generated clients cannot enforce that cross field rule. The Slack adapter always supplies the ts of its already posted placeholder. The worker currently rejects targetless execution. |
+| `reply_handle` | where the reply is delivered: a `ReplyHandle` of `channel`, required nullable `placeholder`, and an optional per turn `endpoint`. It may be absent only on a cron turn with complete nonblank `hook_run` identity. Generated clients cannot enforce that cross field rule. The Slack adapter supplies the ts of its already posted placeholder, or `null` when posting the placeholder failed (see Dedupe below). The worker currently rejects targetless execution. |
 | `received_at` | ISO-8601 UTC timestamp the adapter received it |
 
 The worker reconstructs it with `from_stream_fields(fields)`, a module-level
-helper in `curie_dispatcher.queue`. The model lives in the frozen `aci_protocol`
+helper in `curie_internal.turn_queue`. The model lives in the frozen `aci_protocol`
 package (promoted out of the dispatcher in issue #7) so the producer and the
 Rust/TS consumers share one schema-gated contract instead of a hand-mirrored copy;
-the dispatcher's queue module owns only the Stream transport of it. The
+the shared queue module owns only the Stream transport of it. The
 single-`payload`-field encoding keeps the seam explicit and lets fields be added
 without reshaping the Stream schema.
 
@@ -223,6 +249,15 @@ acked, never re-posted, never re-enqueued). Chosen over stream-side dedupe becau
 it is O(1), TTL-bounded (no unbounded dedupe set to prune), and needs no Stream
 scan. Order is claim -> post placeholder -> `XADD`, so a duplicate never produces
 a second placeholder.
+
+A failed placeholder never costs the request. Bolt acks a Socket Mode envelope
+before the listener runs, so Slack does not normally redeliver an event whose
+handling failed. If posting the placeholder fails for any reason, the dispatcher
+logs a warning, keeps the claim, and still enqueues the turn with a `null`
+placeholder; the worker then posts the answer, or its failure notice, as a fresh
+reply in the thread. When the failure was ambiguous (a dropped connection,
+`fatal_error`), a placeholder may already be in the thread, and the answer then
+arrives as a separate reply below it.
 
 ## Reconnect supervision and shutdown
 
@@ -282,6 +317,44 @@ check closes a dead socket without calling any listener, and the heartbeat file
 keeps its mtime fresh either way. Alert when `connected` stays below
 `configured`. The gauge carries no identity attribute.
 
+An open socket is not proof that events arrive (#4960). Slack can stop routing
+events to a socket that still answers pings, and frames that do arrive may never
+reach a listener. Either way the gauge stays at `connected`. Two counters cover
+that gap, and both carry the identity:
+
+- `curie.slack.socket.envelopes` (`curie_slack_socket_envelopes_total`) counts
+  every frame Slack hands an identity's Socket Mode client. It has attributes
+  `slack_identity` and `type`: the frame's Socket Mode type (`hello`,
+  `disconnect`, `events_api`, `interactive`, `slash_commands`), or `other` for
+  any other type or an unparseable frame. The count is taken where the SDK
+  enqueues the raw frame, before any listener runs, so it says whether Slack
+  sent something. It does not say whether a listener handled it. Each socket
+  gets a `hello` when it opens, and per
+  [Slack's Socket Mode documentation](https://docs.slack.dev/apis/events-api/using-socket-mode/)
+  a `disconnect` before Slack refreshes it, so even a quiet identity's count
+  moves.
+- `curie.slack.delivery_canary` (`curie_slack_delivery_canary_total`) counts the
+  delivery-canary mentions an identity's mention listener handled. It has
+  attribute `slack_identity`. A delivery canary is an `app_mention` in a channel
+  listed in `CURIE_SLACK_DELIVERY_CANARY_CHANNELS`. It is counted, logged as the
+  `delivery_canary` drop at DEBUG, and refused before admission, dedupe,
+  placeholder and enqueue: no turn, no reply, no API call. To prove delivery
+  for each identity, post one root message that mentions every identity into
+  such a channel on a schedule. Alert when an identity's
+  `increase(curie_slack_delivery_canary_total[30m])` is zero while the poster
+  is succeeding. If `curie_slack_socket_envelopes_total{type="events_api"}` is
+  still rising at that point, events reach the socket but not the listener.
+
+`slack_identity` is the declared identity name, `default` for a stock install.
+Names past 16, or names that are not a short slug, share `other`.
+
+Each identity's Socket Mode client logs to its own logger,
+`curie_dispatcher.slack_socket.<identity>`, a child of the dispatcher's
+service logger. slack_sdk's session lifecycle lines go out at INFO through the
+dispatcher's redacted JSON handler, and the record's `logger` field names the
+identity: a session established, a CLOSE received, a stale connection
+disconnected, a reconnect to a new endpoint. Its DEBUG frame traces stay off.
+
 ## Config surface (env vars)
 
 Read from the environment by `DispatcherConfig()` (a `pydantic_settings.BaseSettings`).
@@ -297,6 +370,7 @@ Read from the environment by `DispatcherConfig()` (a `pydantic_settings.BaseSett
 | `VALKEY_PASSWORD` | "" | Valkey password (compose dev: `valkeypass`) |
 | `VALKEY_DB` | `0` | Valkey db index |
 | `CURIE_SLACK_THREADED_BOT_ALLOWLIST` | `[]` | exact `{channel_id, bot_id}` pairs allowed to mention the agent inside channel threads |
+| `CURIE_SLACK_DELIVERY_CANARY_CHANNELS` | `[]` | JSON list of channel ids (`C…` or `G…`) whose mentions are delivery canaries: counted on `curie.slack.delivery_canary` and refused before admission (see *One app per identity*). The chart sets it through `dispatcher.extraEnv` |
 | `VALKEY_TLS` | `false` | when `true`, the client connects over TLS and verifies against the system CA bundle; the chart sets this from `valkey.tls` |
 | `CURIE_STREAM` | `curie:runs` | Stream the jobs land on |
 | `CURIE_DEDUPE_PREFIX` | `curie:dedupe:` | dedupe key prefix |
@@ -314,6 +388,8 @@ Read from the environment by `DispatcherConfig()` (a `pydantic_settings.BaseSett
 | `CURIE_ADMISSION_CACHE_PREFIX` | `curie:admission:` | Valkey key prefix for the persisted caller-list answers, so a restarted dispatcher keeps them; change it only when two installs share one Valkey |
 | `CURIE_THREAD_CONTEXT_CACHE_PREFIX` | `curie:slack-root-context:` | Valkey key prefix for the cached thread-root answers (see *Replies in a thread this bot rooted*); change it only when two installs share one Valkey |
 | `CURIE_THREAD_CONTEXT_TTL_SECONDS` | `2592000` | how long a cached thread-root answer is kept, 30 days by default to match the idle transcript window; must be positive |
+| `CURIE_MENTION_RECEIPT_TTL_SECONDS` | `604800` | how long the receipt of a human mention in a channel thread is kept (Valkey key `curie:slack-mention-receipt:<delivery id>`, written once before the dedupe claim); the worker reads it to decide factory run steering, and a turn in a factory run thread whose receipt has expired is refused. 7 days by default; must be positive |
+| `CURIE_DM_CONTINUITY_MAX_MESSAGES` | `20` | how many earlier direct messages a top-level one to one direct message may quote; 0 turns the read off; allowed 0 through 40 |
 
 ### Boot preflights
 
@@ -401,7 +477,7 @@ the Console, or operators.
 ## Run it
 
 ```bash
-python -m curie_dispatcher
+python -m curie_channel_gateway.slack.run
 ```
 
 ## Runbook: point it at a real Slack workspace (once one exists)
@@ -417,7 +493,7 @@ python -m curie_dispatcher
 2. Generate an App-Level Token with `connections:write` -> `SLACK_APP_TOKEN`
    (`xapp-...`); copy the Bot User OAuth Token -> `SLACK_BOT_TOKEN` (`xoxb-...`).
 3. Set both env vars (plus `VALKEY_*` for the target Valkey) and run
-   `python -m curie_dispatcher`. @-mention the bot in a channel it is in, or DM
+   `python -m curie_channel_gateway.slack.run`. @-mention the bot in a channel it is in, or DM
    it: you should see the placeholder reply appear and one entry land on the
    Stream (`XLEN curie:runs`). The worker consumes from there.
 
@@ -437,3 +513,48 @@ uv run pytest apps/dispatcher/tests -q
 event-filtering cases; `tests/test_queue.py` covers the seam and dedupe against
 real Valkey; `tests/test_supervisor.py` covers backoff, reconnect, and graceful
 shutdown with a fake connection.
+
+
+## Provider gateway
+
+Run `python -m curie_channel_gateway.slack.read_server` alongside the dispatcher
+for provider reads, group membership, attachment fetches, sender identities and
+worker replies. Only these processes receive Slack credentials. The dispatcher
+retains the chat attester key; the read gateway does not mint approval evidence.
+
+Set distinct `CURIE_CHANNEL_GATEWAY_API_TOKEN` and
+`CURIE_CHANNEL_GATEWAY_WORKER_TOKEN` on the gateway. Each application receives
+its own value as `CURIE_CHANNEL_GATEWAY_TOKEN`, plus `CURIE_CHANNEL_GATEWAY_URL`.
+API credentials authorize channel, canvas and membership operations; worker
+credentials authorize files, sender lookup and replies. Provider identities are
+configured at the gateway; reply origins pass its origin policy. File responses
+are capped at 32 MiB by default on both sides. Helm derives
+the gateway cap from `worker.attachments.maxFileBytes`; standalone gateways use
+`CURIE_CHANNEL_GATEWAY_MAX_FILE_BYTES`.
+
+The listener requires `CURIE_CHANNEL_GATEWAY_TLS_CERT` and
+`CURIE_CHANNEL_GATEWAY_TLS_KEY`. Clients verify the certificate using their
+system trust store, including an operator-supplied `SSL_CERT_FILE`.
+`CURIE_CHANNEL_GATEWAY_ALLOW_INSECURE=true` explicitly permits HTTP on both ends;
+Compose uses that opt-out only for its local development listener.
+
+Existing installations must remove bot, user and app token environment variables
+from API and worker before upgrading, including named identity token variables.
+Both applications refuse those credentials at boot. In Helm, enable
+`channelGateway.deploy` with a trusted `channelGateway.tlsSecret`, or explicitly
+opt out of TLS with `channelGateway.allowInsecure`. Set `channelGateway.url` to
+use an external gateway. The gateway is opt-in because the chart cannot choose
+or trust an operator's server certificate. Until configured, provider-dependent
+operations fail closed; authorization never borrows a different identity or
+widens group membership when a gateway answer is missing.
+
+Gateway requests carry a signed timestamp and nonce as well as the caller
+credential. The replay ledger consumes each nonce once, survives restart and
+rejects stale or altered requests. Set `CURIE_CHANNEL_GATEWAY_REPLAY_DB` to a
+persistent SQLite file; Helm and Compose mount a dedicated volume. The chart
+uses one gateway replica with Recreate so the SQLite volume has one owner.
+
+Reply delivery uses the shared durable delivery claims as well as request replay
+protection. A retry of identical bytes at the same identity and provider route
+returns its confirmed result. An unconfirmed claim refuses after restart.
+Distinct posts with identical content require distinct delivery IDs.

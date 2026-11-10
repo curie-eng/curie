@@ -6,7 +6,7 @@
 //! pending response and a mutable agent response prove that each list command
 //! reads the current binding rather than treating the pending row as a snapshot.
 
-mod support;
+use crate::support;
 
 use std::process::{Command, Output};
 use std::sync::{Arc, Mutex};

@@ -163,6 +163,43 @@ skipped.
 {{- dict "fits" $fits "ceiling" $ceiling "nodes" $eligible | toJson -}}
 {{- end -}}
 
+{{- define "curie.sandboxQuota.name" -}}
+{{- printf "%s-sandbox-quota" (include "curie.fullname" .) -}}
+{{- end -}}
+
+{{- define "curie.sandboxQuota.priorityClass" -}}
+{{- $class := .Values.resourceQuota.sandboxPriorityClassName | default .Values.priorityClasses.sandbox.name -}}
+{{- if not $class -}}
+{{- fail "resourceQuota.enabled is true but no sandbox PriorityClass name resolves: set priorityClasses.sandbox.name, or resourceQuota.sandboxPriorityClassName for an externally-managed class. A quota scoped to an empty name matches no pods and silently enforces nothing." -}}
+{{- end -}}
+{{- $class -}}
+{{- end -}}
+
+{{- define "curie.sandboxQuota.hard" -}}
+{{- $hard := .Values.resourceQuota.hard -}}
+{{- dict
+  "pods" (toString $hard.sandboxPodCount)
+  "requests.cpu" (toString $hard.requestsCpu)
+  "requests.memory" (toString $hard.requestsMemory)
+  "limits.cpu" (toString $hard.limitsCpu)
+  "limits.memory" (toString $hard.limitsMemory)
+  | toJson -}}
+{{- end -}}
+
+{{- define "curie.sandboxAdmission" -}}
+{{- $envelope := include "curie.sandboxEnvelope" (dict "root" . "agent" "") | fromJson -}}
+{{- $capacity := include "curie.sandboxCapacity" (dict
+  "perSandbox" $envelope.resources.requests
+  "perSandboxLimits" $envelope.resources.limits
+  "hard" .Values.resourceQuota.hard) | fromJson -}}
+{{- dict
+  "quota_name" (include "curie.sandboxQuota.name" .)
+  "priority_class" (include "curie.sandboxQuota.priorityClass" .)
+  "ceiling" (int64 $capacity.ceiling)
+  "hard" (include "curie.sandboxQuota.hard" . | fromJson)
+  | toJson -}}
+{{- end -}}
+
 {{/*
 curie.sandboxCapacity.notes: the NOTES.txt block for a computed capacity.
 Input dict: fits, ceiling, cpu, memory (per-sandbox request strings),

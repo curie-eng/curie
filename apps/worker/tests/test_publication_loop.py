@@ -4,23 +4,35 @@ from __future__ import annotations
 
 import asyncio
 import importlib
+import importlib.util
+import json
 import logging
 import os
+import subprocess
+import sys
 import threading
 import uuid
+from collections.abc import AsyncIterator, Callable, Iterator
+from copy import deepcopy
 from dataclasses import replace
 from datetime import UTC, datetime
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
+import httpx
 import pytest
 from aiohttp import web
 from aiohttp.test_utils import TestServer
 from channel_protocol import scoped_conversation_id
 from channel_protocol.reply import ReplyAck, ReplyTarget
+from curie_channel_gateway.reply_errors import (
+    UnconfiguredSlackIdentityError,
+)
 from curie_test_support.postgres import pg_connect_or_skip
 from curie_worker.approval_cards import ApprovalCardRef
 from curie_worker.config import WorkerConfig
+from curie_worker.publication_clients import PublicationCodeHostClient, PublicationLineageClient
 from curie_worker.publication_loop import (
     PublicationIdentityUnavailable,
     PublicationLineageRefused,
@@ -32,9 +44,9 @@ from curie_worker.publication_store import (
     PublicationStoreError,
 )
 from curie_worker.reply_sink import CLUSTER_MESSAGE_ADAPTER, TargetRoute, build_reply_sink
-from curie_worker.slack_sink import UnconfiguredSlackIdentityError
-from sqlalchemy import text
+from sqlalchemy import make_url, text
 from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
+from sqlalchemy.pool import NullPool
 
 PUBLICATION_ID = uuid.UUID("22222222-2222-4222-8222-222222222222")
 APPROVAL_ID = uuid.UUID("33333333-3333-4333-8333-333333333333")
@@ -43,18 +55,14 @@ PR_URL = "https://github.com/acme-corp/acme-bot/pull/123"
 RESOLVER = "U0APPROVE1"
 RESOLUTION_NOTE = "Ready to publish."
 CONVERSATION_ID = "1700000000.000100"
-WORKSPACE_CONVERSATION_ID = scoped_conversation_id(
-    "slack", "C0EXAMPLE1", CONVERSATION_ID
-)
+WORKSPACE_CONVERSATION_ID = scoped_conversation_id("slack", "C0EXAMPLE1", CONVERSATION_ID)
 LINEAGE_ID = uuid.UUID("55555555-5555-4555-8555-555555555555")
 REVISION_ID = uuid.UUID("44444444-4444-4444-8444-444444444444")
 LINEAGE_BRANCH = "curie/thread-lineage-example"
 PRIOR_HEAD = "a" * 40
 REVISION_HEAD = "b" * 40
-REPOSITORY_ID = 9001
-INSTALLATION_ID = 41
-PR_NODE_ID = "PR_example_123"
-BASE_REF = "main"
+ORIGIN = "https://github.com"
+METADATA_UPDATED_AT = datetime(2026, 9, 25, 12, 34, 56, tzinfo=UTC)
 _DB_URL = os.environ.get(
     "TEST_DATABASE_URL",
     "postgresql+asyncpg://postgres:postgres@localhost:25432/postgres",
@@ -71,6 +79,739 @@ def anyio_backend() -> str:
 @pytest.fixture
 def publication() -> Any:
     return importlib.import_module("curie_worker.publication_loop")
+
+
+@pytest.fixture
+def migrated_publication_database_url() -> Iterator[str]:
+    """Replay the real API migrations in this test's disposable database."""
+    base = make_url(_DB_URL)
+    name = f"curie_publication_{uuid.uuid4().hex}"
+    url = base.set(database=name).render_as_string(hide_password=False)
+
+    async def admin(statement: str) -> None:
+        engine = create_async_engine(
+            base.set(database="postgres"), isolation_level="AUTOCOMMIT", poolclass=NullPool
+        )
+        try:
+            async with engine.connect() as connection:
+                await connection.exec_driver_sql(statement)
+        finally:
+            await engine.dispose()
+
+    asyncio.run(admin(f'CREATE DATABASE "{name}"'))
+    try:
+        subprocess.run(
+            [sys.executable, "-m", "alembic", "upgrade", "head"],
+            cwd=Path(__file__).resolve().parents[3] / "apps/api",
+            env={**os.environ, "DATABASE_URL": url},
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        yield url
+    finally:
+        asyncio.run(admin(f'DROP DATABASE IF EXISTS "{name}" WITH (FORCE)'))
+
+
+@pytest.fixture
+async def publication_store() -> AsyncIterator[tuple[AsyncEngine, str, PostgresPublicationStore]]:
+    engine = create_async_engine(_DB_URL)
+    schema = f"test_publication_retry_{uuid.uuid4().hex}"
+    try:
+        await pg_connect_or_skip(engine)
+        async with engine.begin() as connection:
+            await connection.execute(text(f'CREATE SCHEMA "{schema}"'))
+            await connection.execute(
+                text(
+                    f'CREATE TABLE "{schema}".approvals ('
+                    "id uuid PRIMARY KEY, conversation_id text NOT NULL)"
+                )
+            )
+            await connection.execute(
+                text(
+                    f'CREATE TABLE "{schema}".thread_publication_lineages ('
+                    "id uuid PRIMARY KEY, version integer NOT NULL DEFAULT 1, "
+                    "branch text NOT NULL, pr_number integer, pr_url text, head_sha text, "
+                    "repository_project_id text, code_host_pr_id text, "
+                    "base_sha text NOT NULL, status text NOT NULL DEFAULT 'open', "
+                    "latest_revision integer NOT NULL DEFAULT 1, "
+                    "updated_at timestamp NOT NULL DEFAULT now())"
+                )
+            )
+            await connection.execute(
+                text(f'CREATE TABLE "{schema}".work_items (id uuid PRIMARY KEY, base_branch text)')
+            )
+            await connection.execute(
+                text(
+                    f'CREATE TABLE "{schema}".execution_requests ('
+                    "id uuid PRIMARY KEY, work_item_id uuid, status text)"
+                )
+            )
+            await connection.execute(
+                text(
+                    f'CREATE TABLE "{schema}".publications ('
+                    "id uuid PRIMARY KEY, approval_id uuid NOT NULL, lineage_id uuid NOT NULL, "
+                    "repo_full_name text NOT NULL, status text NOT NULL DEFAULT 'approved', "
+                    "version integer NOT NULL DEFAULT 1, revision_number integer DEFAULT 1, "
+                    "expected_prior_head text NOT NULL, base_sha text NOT NULL, "
+                    "patch_bytes bytea, changed_paths text[], title text, body text, "
+                    "observed_title_sha256 text, observed_body_sha256 text, "
+                    "reply_kind text, reply_channel text, reply_placeholder text, "
+                    "reply_endpoint text, reply_adapter text, execution_request_id uuid, "
+                    "open_as_draft boolean NOT NULL DEFAULT false, branch_prefix text, "
+                    "approval_card_reported_at timestamp NOT NULL DEFAULT now(), "
+                    "reconcile_attempts integer NOT NULL DEFAULT 0, "
+                    "reconcile_dead_lettered_at timestamp, lease_owner text, "
+                    "lease_expires_at timestamp, error text, terminal_at timestamp, "
+                    "created_at timestamp NOT NULL DEFAULT now(), "
+                    "updated_at timestamp NOT NULL DEFAULT now())"
+                )
+            )
+            await connection.execute(
+                text(
+                    f'INSERT INTO "{schema}".approvals (id, conversation_id) '
+                    "VALUES (:id, :conversation)"
+                ),
+                {"id": APPROVAL_ID, "conversation": CONVERSATION_ID},
+            )
+            await connection.execute(
+                text(
+                    f'INSERT INTO "{schema}".thread_publication_lineages (id, branch, base_sha) '
+                    "VALUES (:id, :branch, :base)"
+                ),
+                {"id": LINEAGE_ID, "branch": LINEAGE_BRANCH, "base": PRIOR_HEAD},
+            )
+            await connection.execute(
+                text(
+                    f'INSERT INTO "{schema}".publications '
+                    "(id, approval_id, lineage_id, repo_full_name, expected_prior_head, "
+                    "base_sha, patch_bytes, changed_paths, title, body, reply_kind, "
+                    "reply_channel, reply_placeholder) VALUES "
+                    "(:id, :approval, :lineage, 'acme-corp/acme-bot', :head, :head, "
+                    ":patch, ARRAY['README.md'], 'Update repository', 'Approved change', "
+                    "'slack', 'C0EXAMPLE1', :conversation)"
+                ),
+                {
+                    "id": PUBLICATION_ID,
+                    "approval": APPROVAL_ID,
+                    "lineage": LINEAGE_ID,
+                    "head": PRIOR_HEAD,
+                    "patch": b"diff --git a/README.md b/README.md\n",
+                    "conversation": CONVERSATION_ID,
+                },
+            )
+        yield (
+            engine,
+            schema,
+            PostgresPublicationStore(engine, schema=schema, lease_owner="retry-test-worker"),
+        )
+    finally:
+        async with engine.begin() as connection:
+            await connection.execute(text(f'DROP SCHEMA IF EXISTS "{schema}" CASCADE'))
+        await engine.dispose()
+
+
+@pytest.fixture
+async def timeout_recovery_case(
+    migrated_publication_database_url: str, request: pytest.FixtureRequest
+) -> AsyncIterator[tuple[Any, AsyncEngine, uuid.UUID, dict[str, str], str]]:
+    path = Path(__file__).parent / "fixtures" / "publication_timeout_repro.py"
+    spec = importlib.util.spec_from_file_location("publication_timeout_repro", path)
+    if spec is None or spec.loader is None:
+        raise RuntimeError("publication timeout fixture could not be loaded")
+    repro = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = repro
+    spec.loader.exec_module(repro)
+    scenario = getattr(request, "param", "delayed-success-after-cap")
+    engine = create_async_engine(migrated_publication_database_url)
+    publication_id = uuid.uuid4()
+    try:
+        seeded = await repro._seed(engine, publication_id, 9)
+        yield repro, engine, publication_id, seeded, scenario
+    finally:
+        await engine.dispose()
+
+
+async def test_timeout_recovery_adopts_original_request_after_quiescence(
+    timeout_recovery_case: tuple[Any, AsyncEngine, uuid.UUID, dict[str, str], str],
+) -> None:
+    repro, engine, publication_id, seeded, scenario = timeout_recovery_case
+
+    report = await repro._run_seeded_scenario(scenario, engine, publication_id, seeded)
+
+    assert report["invariants"]["safe_adoption"]
+    assert report["invariants"]["no_duplicate"]
+    assert report["completed_by_original_request"]
+    assert report["remote_pr_count"] == 1
+    assert report["observed_store"]["status"] == "succeeded"
+    assert report["observed_store"]["reconcile_attempts"] == 9
+    assert report["observed_store"]["result_url"] == "https://code.example/acme/widget/pull/41"
+    assert report["observed_store"]["patch_cleared"]
+    assert not report["observed_store"]["dead_lettered"]
+    assert not report["claim_eligible_after"]
+    assert report["recovery_bodies"] == [
+        {"expected_head_sha": REVISION_HEAD, "adopt_only": False},
+        {"expected_head_sha": REVISION_HEAD, "adopt_only": True},
+    ]
+    assert [event["event"] for event in report["events"]] == [
+        "observation",
+        "redemption",
+        "POST",
+        "observation",
+        "release",
+        "POST",
+    ]
+    observations = [event["job_name"] for event in report["events"] if "job_name" in event]
+    assert len(observations) == 2
+    assert observations[0] == observations[1]
+    assert report["credential_redemptions"] == 1
+    assert report["job_count"] == report["push_count"] == 0
+    assert repro._exit_for(report) == 0
+
+
+@pytest.mark.parametrize("timeout_recovery_case", ["delayed-absent-after-cap"], indirect=True)
+async def test_timeout_recovery_without_original_success_preserves_tenth_attempt_cap(
+    timeout_recovery_case: tuple[Any, AsyncEngine, uuid.UUID, dict[str, str], str],
+) -> None:
+    repro, engine, publication_id, seeded, scenario = timeout_recovery_case
+
+    report = await repro._run_seeded_scenario(scenario, engine, publication_id, seeded)
+
+    assert report["observed_store"]["status"] == "failed"
+    assert report["observed_store"]["reconcile_attempts"] == 10
+    assert report["observed_store"]["patch_cleared"]
+    assert report["observed_store"]["dead_lettered"]
+    assert report["observed_store"]["terminal"]
+    assert report["observed_store"]["result_url"] is None
+    assert report["remote_pr_count"] == report["job_count"] == report["push_count"] == 0
+    assert not report["completed_by_original_request"]
+    assert not report["invariants"]["safe_adoption"]
+    assert report["invariants"]["cap_preserved"]
+    assert not report["claim_eligible_after"]
+    assert [body["adopt_only"] for body in report["recovery_bodies"]] == [False, True]
+    assert "release" not in [event["event"] for event in report["events"]]
+    assert report["credential_redemptions"] == 1
+    assert repro._exit_for(report) == 0
+
+
+async def test_timeout_recovery_stale_version_is_refused_by_real_api_crud_and_retry_cas(
+    publication: Any,
+    timeout_recovery_case: tuple[Any, AsyncEngine, uuid.UUID, dict[str, str], str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from curie_api.config import get_settings
+    from curie_api.crud.errors import PublicationLineageConflict
+    from curie_api.crud.lineages import advance_publication_lineage
+    from curie_api.routers.publications import internal_router
+    from curie_api.schemas.publications import PublicationLineageAdvance
+    from fastapi import FastAPI
+    from sqlalchemy.ext.asyncio import async_sessionmaker
+
+    repro, engine, publication_id, seeded, _ = timeout_recovery_case
+    settings = get_settings()
+    monkeypatch.setattr(settings, "internal_worker_token", "synthetic-worker-token")
+    monkeypatch.setattr(settings, "github_api_url", "https://code.example/api/v3")
+    app = FastAPI()
+    app.include_router(internal_router)
+    sessions = async_sessionmaker(engine, expire_on_commit=False)
+    app.state.sessionmaker = sessions
+    peer = repro.Peer(
+        scenario="delayed-success-after-cap",
+        head=REVISION_HEAD,
+        parent=PRIOR_HEAD,
+        branch=seeded["branch"],
+        released=False,
+    )
+    cluster = repro._Cluster(peer)
+    credentials = repro._Credentials("https://code.example", seeded["repo"], peer)
+    durable = PostgresPublicationStore(engine, schema="curie", lease_owner="timeout-stale-worker")
+    work = await durable.claim_next()
+    assert work is not None
+    lineage_requests: list[dict[str, Any]] = []
+    lineage_responses: list[httpx.Response] = []
+    competitor = create_async_engine(engine.url)
+    try:
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app), base_url="https://publication.example.com"
+        ) as api:
+
+            async def handler(request: httpx.Request) -> httpx.Response:
+                if request.url.path.endswith("/lineage"):
+                    lineage_requests.append(json.loads(request.content))
+                    response = await api.request(
+                        request.method,
+                        request.url.path,
+                        content=request.content,
+                        headers=dict(request.headers),
+                    )
+                    lineage_responses.append(response)
+                    return response
+                response = peer.handler(request)
+                if request.url.path.endswith("/pull-request") and response.status_code == 200:
+                    assert json.loads(request.content)["adopt_only"] is True
+                    async with competitor.begin() as connection:
+                        await connection.execute(
+                            text(
+                                "UPDATE curie.publications SET version = version + 1, "
+                                "lease_owner = 'newer-timeout-worker' WHERE id = :id"
+                            ),
+                            {"id": publication_id},
+                        )
+                return response
+
+            async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http:
+                app.state.http_client = http
+                loop = publication.PublicationReconciler(
+                    store=durable,
+                    credentials=credentials,
+                    cluster=cluster,
+                    code_host=PublicationCodeHostClient(
+                        api_base_url="https://publication.example.com",
+                        worker_token="synthetic-worker-token",
+                        client=http,
+                    ),
+                    lineage=PublicationLineageClient(
+                        api_base_url="https://publication.example.com",
+                        worker_token="synthetic-worker-token",
+                        client=http,
+                    ),
+                    replies=repro._Replies(),
+                    job_settings=repro._JOB_SETTINGS,
+                )
+                with pytest.raises(PublicationStoreError, match="retry CAS was lost"):
+                    await loop.reconcile(work)
+        assert [body["adopt_only"] for body in peer.recovery_bodies] == [False, True]
+        assert len(peer.prs) == 1
+        assert peer.completed_by_original_request
+        assert len(lineage_responses) == 1
+        assert lineage_responses[0].status_code == 409
+        assert lineage_responses[0].json()["detail"]["code"] == "publication.lease_lost"
+        assert lineage_requests[0]["expected_publication_version"] == work.version
+        assert lineage_requests[0]["lease_owner"] == work.lease_owner
+
+        async with sessions() as session:
+            with pytest.raises(PublicationLineageConflict) as conflict:
+                await advance_publication_lineage(
+                    session,
+                    publication_id,
+                    PublicationLineageAdvance.model_validate(lineage_requests[0]),
+                    github_html_base="https://code.example",
+                    first_parent_proof=None,
+                )
+            assert conflict.value.code == "publication.lease_lost"
+        stored = await repro._read_row(engine, publication_id)
+        assert stored["status"] == "launching"
+        assert stored["result_url"] is None
+        assert stored["reconcile_attempts"] == 9
+        assert not stored["patch_cleared"]
+        assert not stored["dead_lettered"]
+        assert not stored["terminal"]
+        async with engine.connect() as connection:
+            row = (
+                (
+                    await connection.execute(
+                        text(
+                            "SELECT p.version AS publication_version, p.lease_owner, "
+                            "l.version AS lineage_version, l.head_sha, l.pr_number, l.pr_url "
+                            "FROM curie.publications p JOIN curie.thread_publication_lineages l "
+                            "ON l.id = p.lineage_id WHERE p.id = :id"
+                        ),
+                        {"id": publication_id},
+                    )
+                )
+                .mappings()
+                .one()
+            )
+        assert dict(row) == {
+            "publication_version": work.version + 1,
+            "lease_owner": "newer-timeout-worker",
+            "lineage_version": 1,
+            "head_sha": None,
+            "pr_number": None,
+            "pr_url": None,
+        }
+        assert cluster.cleanups == cluster.jobs == cluster.pushes == 0
+        assert credentials.redeemed == 1
+    finally:
+        await competitor.dispose()
+
+
+async def test_charged_retry_blocks_claim_for_fifteen_seconds_then_reclaims(
+    publication_store: tuple[AsyncEngine, str, PostgresPublicationStore],
+) -> None:
+    engine, schema, store = publication_store
+    peer = PostgresPublicationStore(engine, schema=schema, lease_owner="peer-test-worker")
+    work = await store.claim_next()
+    assert work is not None
+
+    await store.retry(work.publication_id, error="GitHub returned HTTP 500")
+
+    async with engine.connect() as connection:
+        row = (
+            (
+                await connection.execute(
+                    text(
+                        f"SELECT reconcile_attempts, lease_owner, patch_bytes, "
+                        "extract(epoch FROM lease_expires_at - updated_at) AS delay, "
+                        "extract(epoch FROM lease_expires_at - clock_timestamp()) AS remaining "
+                        f'FROM "{schema}".publications WHERE id = :id'
+                    ),
+                    {"id": work.publication_id},
+                )
+            )
+            .mappings()
+            .one()
+        )
+    assert row["reconcile_attempts"] == 1
+    assert row["lease_owner"] is None
+    assert row["patch_bytes"] == work.patch
+    assert float(row["delay"]) == 15
+    assert await store.claim_next() is None
+    assert await peer.claim_next() is None
+
+    # Let the real database deadline pass; no clock or lease mutation hides a
+    # claim query that ignores the retry deadline.
+    await asyncio.sleep(max(0, float(row["remaining"])) + 0.1)
+    reclaimed = await peer.claim_next()
+    assert reclaimed is not None
+    assert reclaimed.publication_id == work.publication_id
+    assert reclaimed.version > work.version
+    assert reclaimed.lease_owner == "peer-test-worker"
+
+
+@pytest.mark.parametrize(("previous_attempts", "delay"), [(4, 240), (8, 300)])
+async def test_charged_retry_backoff_grows_and_caps_at_five_minutes(
+    publication_store: tuple[AsyncEngine, str, PostgresPublicationStore],
+    previous_attempts: int,
+    delay: int,
+) -> None:
+    engine, schema, store = publication_store
+    async with engine.begin() as connection:
+        await connection.execute(
+            text(
+                f'UPDATE "{schema}".publications SET reconcile_attempts = :attempts WHERE id = :id'
+            ),
+            {"id": PUBLICATION_ID, "attempts": previous_attempts},
+        )
+    work = await store.claim_next()
+    assert work is not None
+
+    await store.retry(work.publication_id, error="provider unavailable")
+
+    async with engine.connect() as connection:
+        row = (
+            (
+                await connection.execute(
+                    text(
+                        f"SELECT reconcile_attempts, lease_owner, patch_bytes, status, "
+                        "extract(epoch FROM lease_expires_at - updated_at) AS delay "
+                        f'FROM "{schema}".publications WHERE id = :id'
+                    ),
+                    {"id": work.publication_id},
+                )
+            )
+            .mappings()
+            .one()
+        )
+    assert row["reconcile_attempts"] == previous_attempts + 1
+    assert row["lease_owner"] is None
+    assert row["patch_bytes"] == work.patch
+    assert row["status"] == "launching"
+    assert float(row["delay"]) == delay
+    assert await store.claim_next() is None
+
+
+async def test_tenth_charged_retry_dead_letters_and_clears_patch_and_lease(
+    publication_store: tuple[AsyncEngine, str, PostgresPublicationStore],
+) -> None:
+    engine, schema, store = publication_store
+    async with engine.begin() as connection:
+        await connection.execute(
+            text(f'UPDATE "{schema}".publications SET reconcile_attempts = 9 WHERE id = :id'),
+            {"id": PUBLICATION_ID},
+        )
+    work = await store.claim_next()
+    assert work is not None
+
+    await store.retry(work.publication_id, error="x" * 2100)
+
+    async with engine.connect() as connection:
+        row = (
+            (
+                await connection.execute(
+                    text(
+                        f"SELECT reconcile_attempts, status, patch_bytes, lease_owner, "
+                        "lease_expires_at, error, reconcile_dead_lettered_at, terminal_at "
+                        f'FROM "{schema}".publications WHERE id = :id'
+                    ),
+                    {"id": work.publication_id},
+                )
+            )
+            .mappings()
+            .one()
+        )
+    assert row["reconcile_attempts"] == 10
+    assert row["status"] == "failed"
+    assert row["patch_bytes"] is None
+    assert row["lease_owner"] is None
+    assert row["lease_expires_at"] is None
+    assert row["error"] == "x" * 2000
+    assert row["reconcile_dead_lettered_at"] is not None
+    assert row["terminal_at"] is not None
+    assert await store.claim_next() is None
+    assert await store.is_terminal(work.publication_id)
+
+
+async def test_stale_retry_cannot_charge_or_reschedule_a_newer_version(
+    publication_store: tuple[AsyncEngine, str, PostgresPublicationStore],
+) -> None:
+    engine, schema, store = publication_store
+    work = await store.claim_next()
+    assert work is not None
+    async with engine.begin() as connection:
+        await connection.execute(
+            text(f'UPDATE "{schema}".publications SET version = version + 1 WHERE id = :id'),
+            {"id": work.publication_id},
+        )
+        before = (
+            (
+                await connection.execute(
+                    text(f'SELECT * FROM "{schema}".publications WHERE id = :id'),
+                    {"id": work.publication_id},
+                )
+            )
+            .mappings()
+            .one()
+        )
+
+    with pytest.raises(PublicationStoreError, match="retry CAS was lost"):
+        await store.retry(work.publication_id, error="late failure")
+
+    async with engine.connect() as connection:
+        after = (
+            (
+                await connection.execute(
+                    text(f'SELECT * FROM "{schema}".publications WHERE id = :id'),
+                    {"id": work.publication_id},
+                )
+            )
+            .mappings()
+            .one()
+        )
+    assert dict(after) == dict(before)
+
+
+async def test_uncharged_release_remains_immediately_claimable(
+    publication_store: tuple[AsyncEngine, str, PostgresPublicationStore],
+) -> None:
+    engine, schema, store = publication_store
+    peer = PostgresPublicationStore(engine, schema=schema, lease_owner="peer-test-worker")
+    work = await store.claim_next()
+    assert work is not None
+
+    await store.release(work.publication_id)
+
+    async with engine.connect() as connection:
+        row = (
+            (
+                await connection.execute(
+                    text(
+                        f"SELECT reconcile_attempts, lease_owner, lease_expires_at "
+                        f'FROM "{schema}".publications WHERE id = :id'
+                    ),
+                    {"id": work.publication_id},
+                )
+            )
+            .mappings()
+            .one()
+        )
+    assert dict(row) == {
+        "reconcile_attempts": 0,
+        "lease_owner": None,
+        "lease_expires_at": None,
+    }
+    reclaimed = await peer.claim_next()
+    assert reclaimed is not None
+    assert reclaimed.publication_id == work.publication_id
+
+
+async def _terminal_rows(engine: AsyncEngine, schema: str) -> dict[str, Any]:
+    async with engine.connect() as connection:
+        row = (
+            (
+                await connection.execute(
+                    text(
+                        "SELECT l.base_sha, l.head_sha, l.status, l.version, "
+                        "l.pr_number, l.pr_url, "
+                        "p.base_sha AS approved_base, p.expected_prior_head, "
+                        "p.status AS publication_status, p.version AS publication_version, "
+                        "p.lease_owner, p.patch_bytes "
+                        f'FROM "{schema}".thread_publication_lineages l '
+                        f'JOIN "{schema}".publications p ON p.id = :id '
+                        "WHERE l.id = :lineage_id"
+                    ),
+                    {"id": PUBLICATION_ID, "lineage_id": LINEAGE_ID},
+                )
+            )
+            .mappings()
+            .one()
+        )
+    return dict(row)
+
+
+@pytest.mark.parametrize("state", ["merged", "closed"])
+async def test_terminal_first_publication_records_actual_parent_with_lease_fence(
+    publication_store: tuple[AsyncEngine, str, PostgresPublicationStore], state: str
+) -> None:
+    engine, schema, store = publication_store
+    work = await store.claim_next()
+    assert work is not None
+    actual_parent = "c" * 40
+    before = await _terminal_rows(engine, schema)
+    arguments: dict[str, Any] = {
+        "expected_version": work.lineage_version,
+        "expected_stored_head": None,
+        "state": state,
+        "pr_number": 123,
+        "pr_url": PR_URL,
+        "head_sha": REVISION_HEAD,
+        "publication_id": work.publication_id,
+        "expected_publication_version": work.version,
+        "lease_owner": work.lease_owner,
+        "first_parent_sha": actual_parent,
+    }
+
+    await store.mark_lineage_terminal(LINEAGE_ID, **arguments)
+
+    after = await _terminal_rows(engine, schema)
+    assert after == {
+        **before,
+        "base_sha": actual_parent,
+        "head_sha": REVISION_HEAD,
+        "status": state,
+        "version": before["version"] + 1,
+        "pr_number": 123,
+        "pr_url": PR_URL,
+    }
+    assert after["approved_base"] == PRIOR_HEAD
+    assert after["expected_prior_head"] == PRIOR_HEAD
+
+    await store.mark_lineage_terminal(LINEAGE_ID, **arguments)
+    assert await _terminal_rows(engine, schema) == after
+    with pytest.raises(PublicationStoreError):
+        await store.mark_lineage_terminal(LINEAGE_ID, **{**arguments, "first_parent_sha": "d" * 40})
+    assert await _terminal_rows(engine, schema) == after
+
+
+@pytest.mark.parametrize(
+    "fault",
+    [
+        "lineage_version",
+        "publication_version",
+        "lease_owner",
+        "transferred_lease",
+        "expired_lease",
+        "publication_terminal",
+        "publication_link",
+        "superseding_revision",
+        "approved_base_changed",
+        "partial_identity",
+        "absent_parent",
+        "malformed_parent",
+    ],
+)
+async def test_terminal_first_parent_cannot_be_recorded_without_current_authority(
+    publication_store: tuple[AsyncEngine, str, PostgresPublicationStore], fault: str
+) -> None:
+    engine, schema, store = publication_store
+    work = await store.claim_next()
+    assert work is not None
+    arguments: dict[str, Any] = {
+        "expected_version": work.lineage_version,
+        "expected_stored_head": None,
+        "state": "merged",
+        "pr_number": 123,
+        "pr_url": PR_URL,
+        "head_sha": REVISION_HEAD,
+        "publication_id": work.publication_id,
+        "expected_publication_version": work.version,
+        "lease_owner": work.lease_owner,
+        "first_parent_sha": "c" * 40,
+    }
+    if fault == "lineage_version":
+        arguments["expected_version"] -= 1
+    elif fault == "publication_version":
+        arguments["expected_publication_version"] -= 1
+    elif fault == "lease_owner":
+        arguments["lease_owner"] = "foreign-publication-worker"
+    elif fault == "absent_parent":
+        arguments["first_parent_sha"] = None
+    elif fault == "malformed_parent":
+        arguments["first_parent_sha"] = "not-a-parent"
+    else:
+        mutations = {
+            "transferred_lease": ("publications", "lease_owner = 'replacement-worker'"),
+            "expired_lease": ("publications", "lease_expires_at = now() - interval '1 second'"),
+            "publication_terminal": ("publications", "status = 'failed'"),
+            "publication_link": ("publications", "lineage_id = :foreign_lineage"),
+            "superseding_revision": ("thread_publication_lineages", "latest_revision = 2"),
+            "approved_base_changed": ("thread_publication_lineages", "base_sha = :foreign_base"),
+            "partial_identity": ("thread_publication_lineages", "pr_number = 123"),
+        }
+        table, assignment = mutations[fault]
+        async with engine.begin() as connection:
+            await connection.execute(
+                text(f'UPDATE "{schema}".{table} SET {assignment} WHERE id = :id'),
+                {
+                    "id": PUBLICATION_ID if table == "publications" else LINEAGE_ID,
+                    "foreign_lineage": uuid.uuid4(),
+                    "foreign_base": "d" * 40,
+                },
+            )
+    before = await _terminal_rows(engine, schema)
+
+    with pytest.raises((PublicationStoreError, ValueError)):
+        await store.mark_lineage_terminal(LINEAGE_ID, **arguments)
+
+    assert await _terminal_rows(engine, schema) == before
+
+
+async def test_terminal_established_revision_preserves_the_recorded_lineage_base(
+    publication_store: tuple[AsyncEngine, str, PostgresPublicationStore],
+) -> None:
+    engine, schema, store = publication_store
+    recorded_parent = "c" * 40
+    async with engine.begin() as connection:
+        await connection.execute(
+            text(
+                f'UPDATE "{schema}".thread_publication_lineages '
+                "SET base_sha = :base, head_sha = :head, pr_number = 123, pr_url = :url "
+                "WHERE id = :id"
+            ),
+            {"base": recorded_parent, "head": PRIOR_HEAD, "url": PR_URL, "id": LINEAGE_ID},
+        )
+    work = await store.claim_next()
+    assert work is not None
+
+    await store.mark_lineage_terminal(
+        LINEAGE_ID,
+        expected_version=work.lineage_version,
+        expected_stored_head=PRIOR_HEAD,
+        state="closed",
+        pr_number=123,
+        pr_url=PR_URL,
+        head_sha=REVISION_HEAD,
+        publication_id=work.publication_id,
+        expected_publication_version=work.version,
+        lease_owner=work.lease_owner,
+        first_parent_sha=None,
+    )
+
+    row = await _terminal_rows(engine, schema)
+    assert row["base_sha"] == recorded_parent
+    assert row["head_sha"] == REVISION_HEAD
+    assert row["status"] == "closed"
+    assert row["approved_base"] == row["expected_prior_head"] == PRIOR_HEAD
 
 
 class _Store:
@@ -153,10 +894,7 @@ class _Store:
         value = self.pending.get(publication_id)
         if value is None:
             return None
-        if (
-            value["outcome"] in {"published", "failed"}
-            and publication_id in self.cleanup_pending
-        ):
+        if value["outcome"] in {"published", "failed"} and publication_id in self.cleanup_pending:
             return None
         result = {
             "resolved_by": None,
@@ -197,6 +935,7 @@ class _Store:
         }
         if outcome in {"published", "failed"}:
             self.cleanup_pending.add(publication_id)
+
     def mark_result_delivered(self, publication_id: uuid.UUID) -> None:
         self.delivered.add(publication_id)
         self.pending.pop(publication_id, None)
@@ -232,6 +971,10 @@ class _Store:
         pr_number: int,
         pr_url: str,
         head_sha: str,
+        publication_id: uuid.UUID,
+        expected_publication_version: int,
+        lease_owner: str,
+        first_parent_sha: str | None,
     ) -> None:
         self.lineage_terminals.append(
             {
@@ -242,6 +985,10 @@ class _Store:
                 "pr_number": pr_number,
                 "pr_url": pr_url,
                 "head_sha": head_sha,
+                "publication_id": publication_id,
+                "expected_publication_version": expected_publication_version,
+                "lease_owner": lease_owner,
+                "first_parent_sha": first_parent_sha,
             }
         )
 
@@ -258,6 +1005,8 @@ class _Lineage:
         if self.error is not None:
             raise self.error
         self.advances.append({"publication_id": publication_id, **advance})
+
+
 class _Credentials:
     def __init__(self, module: Any) -> None:
         self.module = module
@@ -268,10 +1017,42 @@ class _Credentials:
         self.calls.append(publication_id)
         if self.error is not None:
             raise self.error
-        return self.module.PublicationCredential(
-            clean_clone_url="https://github.com/acme-corp/acme-bot.git",
-            authorization_header="Basic publication-write-credential-value",
-        )
+        return _credential(self.module, "Basic publication-write-credential-value")
+
+
+def _credential(module: Any, header: str, *, origin: str = ORIGIN) -> Any:
+    return module.PublicationCredential(
+        clean_clone_url=f"{origin}/acme-corp/acme-bot.git",
+        authorization_header=header,
+        origin=origin,
+        header_form="authorization_basic",
+    )
+
+
+def _transport(origin: str = ORIGIN, header_form: str = "authorization_basic") -> Any:
+    k8s = importlib.import_module("curie_worker.publication_k8s")
+    return k8s.PublicationTransport(origin=origin, header_form=header_form)
+
+
+def _job(
+    module: Any,
+    phase: str,
+    *,
+    commit_sha: str | None = None,
+    logs: str | None = None,
+    error: str | None = None,
+    transport: Any | None = None,
+) -> Any:
+    """A Job observation; a commit marker means the Job pushed that commit."""
+
+    if logs is None:
+        logs = f"CURIE_COMMIT_SHA={commit_sha}\n" if commit_sha is not None else ""
+    return module.PublicationJobObservation(
+        phase=phase,
+        logs=logs,
+        error=error,
+        transport=transport if transport is not None else _transport(),
+    )
 
 
 class _Cluster:
@@ -280,16 +1061,11 @@ class _Cluster:
         self.applied: list[Any] = []
         self.credentials_cleaned: list[Any] = []
         self.terminals_cleaned: list[Any] = []
-        self.observation = module.PublicationJobObservation(
-            phase="succeeded",
-            pr_url=PR_URL,
-            pr_number=123,
-            commit_sha=REVISION_HEAD,
-            logs=(
-                f"CURIE_PR_URL={PR_URL}\n"
-                f"CURIE_PR_NUMBER=123\nCURIE_COMMIT_SHA={REVISION_HEAD}\n"
-            ),
-        )
+        self.observation = _job(module, "succeeded", commit_sha=REVISION_HEAD)
+        self.observed: list[str] = []
+        # The code host the Job pushes to: a commit marker is printed only
+        # after the push, so observing one moves the remote branch.
+        self.code_host: _CodeHost | None = None
         self.preexisting_observation: Any | None = None
         self.raise_after_apply = False
         self.apply_error: Exception | None = None
@@ -300,6 +1076,9 @@ class _Cluster:
         self.active_jobs: set[str] = set()
         self.observe_release: threading.Event | None = None
         self.observe_timed_out = False
+        self.quiescent = False
+        self.quiescence_error: Exception | None = None
+        self.quiescence_checks: list[tuple[str, str]] = []
 
     def apply(self, resources: Any) -> None:
         self.applied.append(resources)
@@ -315,18 +1094,28 @@ class _Cluster:
         if self.apply_error is not None:
             raise self.apply_error
 
+    def rejected_job_quiescent(self, job_name: str, job_uid: str) -> bool:
+        self.quiescence_checks.append((job_name, job_uid))
+        if self.quiescence_error is not None:
+            raise self.quiescence_error
+        return self.quiescent
+
     def observe(self, job_name: str) -> Any:
-        if self.observe_release is not None and not self.observe_release.wait(
-            timeout=0.2
-        ):
+        self.observed.append(job_name)
+        if self.observe_release is not None and not self.observe_release.wait(timeout=0.2):
             self.observe_timed_out = True
         if self.applied and self.observe_after_apply_error is not None:
             raise self.observe_after_apply_error
         if job_name not in self.active_jobs:
-            return self.preexisting_observation or self.module.PublicationJobObservation(
-                phase="pending", pr_url=None, logs="", exists=False
+            observation = self.preexisting_observation or self.module.PublicationJobObservation(
+                phase="pending", logs="", exists=False
             )
-        return self.observation
+        else:
+            observation = self.observation
+        commit = self.module._marker_commit(observation.logs)
+        if observation.exists and commit is not None and self.code_host is not None:
+            self.code_host.pushed(commit)
+        return observation
 
     def cleanup(self, names: Any) -> None:
         self.credentials_cleaned.append(names)
@@ -346,114 +1135,133 @@ class _Cluster:
         self.active_jobs.discard(names.job)
 
 
-class _GitHub:
-    def __init__(self) -> None:
-        self.number_calls: list[tuple[str, int]] = []
-        self.branch_calls: list[tuple[str, str]] = []
-        self.recover_calls: list[tuple[str, str, str]] = []
-        self.verify_calls: list[tuple[str, str, uuid.UUID, str]] = []
-        self.authorization_headers: list[str] = []
+class _CodeHost:
+    """The API's code host routes, as the worker sees them."""
+
+    def __init__(self, module: Any) -> None:
+        self.module = module
+        # Every call in order, by method name, for ordering assertions.
+        self.calls: list[str] = []
+        self.number_calls: list[tuple[uuid.UUID, int]] = []
+        self.branch_calls: list[uuid.UUID] = []
+        self.recover_calls: list[tuple[uuid.UUID, str, bool]] = []
+        self.verify_calls: list[tuple[uuid.UUID, str, uuid.UUID, str]] = []
+        self.metadata_calls: list[uuid.UUID] = []
         self.state = "open"
         self.head_sha = PRIOR_HEAD
+        self.pr_url = PR_URL
+        self.head_ref = LINEAGE_BRANCH
+        # The stored pull request's state once a Job has pushed, when it was
+        # merged or closed while the Job ran; None keeps ``state``.
+        self.state_after_push: str | None = None
         self.branch_head: str | None = None
-        self.recovered_pr_url = PR_URL
+        self.base_branch = "main"
+        self.branch_error: Exception | None = None
+        self.branch_contexts: list[Any] = []
+        self.recovered_pr_url: str | None = PR_URL
         self.recovered_head_sha = REVISION_HEAD
         self.recovered_pr_state = "open"
-        self.verified_revision_head: str | None = None
-        self.verified_revision_id: uuid.UUID | None = None
-        self.verified_expected_parent: str | None = None
+        # The API proves the first revision's marked commit by default; any
+        # other commit is refused unless a test allows it.
+        self.allowed_revisions: dict[tuple[str, uuid.UUID, str], str] = {
+            (REVISION_HEAD, REVISION_ID, PRIOR_HEAD): PRIOR_HEAD
+        }
+        self.metadata_state = "open"
+        self.metadata_head_sha = PRIOR_HEAD
+        self.metadata_updated_at: datetime | None = METADATA_UPDATED_AT
+        self.metadata_error: Exception | None = None
 
-    def read_pr_by_number(
-        self,
-        repo_full_name: str,
-        pr_number: int,
-        authorization_header: str,
-    ) -> Any:
-        self.authorization_headers.append(authorization_header)
-        if not authorization_header:
-            raise AssertionError(
-                "GitHub lineage lookup happened before publication credential redemption"
-            )
-        self.number_calls.append((repo_full_name, pr_number))
-        return SimpleNamespace(
-            number=pr_number,
-            url=PR_URL,
-            state=self.state,
-            head_sha=self.head_sha,
-            head_ref=LINEAGE_BRANCH,
+    def _pull(self, *, number: int, url: str, state: str, head_sha: str) -> Any:
+        return self.module.PublicationPullState(
+            number=number,
+            url=url,
+            state=state,
+            head_sha=head_sha,
+            head_ref=self.head_ref,
+        )
+
+    def pushed(self, commit_sha: str) -> None:
+        """The Job pushed ``commit_sha`` to the lineage branch."""
+
+        self.branch_head = commit_sha
+        self.head_sha = commit_sha
+        if self.state_after_push is not None:
+            self.state = self.state_after_push
+
+    def read_pull_request(self, publication_id: uuid.UUID, pr_number: int) -> Any:
+        self.calls.append("read_pull_request")
+        self.number_calls.append((publication_id, pr_number))
+        return self._pull(
+            number=pr_number, url=self.pr_url, state=self.state, head_sha=self.head_sha
         )
 
     def verify_revision_commit(
         self,
-        repo_full_name: str,
+        publication_id: uuid.UUID,
         commit_sha: str,
         *,
         revision_id: uuid.UUID,
         expected_parent: str,
-        authorization_header: str,
-    ) -> str:
-        self.authorization_headers.append(authorization_header)
-        if not authorization_header:
-            raise AssertionError(
-                "GitHub revision verification happened before credential redemption"
-            )
-        self.verify_calls.append(
-            (repo_full_name, commit_sha, revision_id, expected_parent)
-        )
-        if (
-            commit_sha != self.verified_revision_head
-            or revision_id != self.verified_revision_id
-            or expected_parent != self.verified_expected_parent
-        ):
+    ) -> Any:
+        self.calls.append("verify_revision_commit")
+        self.verify_calls.append((publication_id, commit_sha, revision_id, expected_parent))
+        if (commit_sha, revision_id, expected_parent) not in self.allowed_revisions:
             raise PublicationReconcileError(
                 "remote head is not this revision's marked commit with expected parent"
             )
-        return commit_sha
+        return self.module.PublicationRevisionCommit(
+            commit_sha=commit_sha,
+            parent_sha=self.allowed_revisions[(commit_sha, revision_id, expected_parent)],
+        )
 
-    def read_branch_head(
-        self,
-        repo_full_name: str,
-        branch: str,
-        authorization_header: str,
-    ) -> str | None:
-        self.authorization_headers.append(authorization_header)
-        self.branch_calls.append((repo_full_name, branch))
-        return self.branch_head
+    def read_branch_head(self, publication_id: uuid.UUID) -> Any:
+        self.calls.append("read_branch_head")
+        self.branch_calls.append(publication_id)
+        if self.branch_error is not None:
+            raise self.branch_error
+        if self.branch_contexts:
+            return self.branch_contexts.pop(0)
+        return self.module.PublicationBranchHead(
+            head_sha=self.branch_head, base_branch=self.base_branch
+        )
 
-    def recover_pr_by_head(
-        self,
-        repo_full_name: str,
-        branch: str,
-        title: str,
-        body: str,
-        *,
-        expected_head_sha: str,
-        authorization_header: str,
-        draft: bool = False,
+    def recover_pull_request(
+        self, publication_id: uuid.UUID, *, expected_head_sha: str, adopt_only: bool
     ) -> Any | None:
-        del draft
-        self.authorization_headers.append(authorization_header)
-        self.recover_calls.append((repo_full_name, branch, expected_head_sha))
+        self.calls.append("recover_pull_request")
+        self.recover_calls.append((publication_id, expected_head_sha, adopt_only))
         if expected_head_sha != self.recovered_head_sha:
             raise PublicationReconcileError(
                 "recoverable pull request head does not match the expected commit"
             )
         if self.recovered_pr_url is None:
             return None
-        return SimpleNamespace(
+        return self._pull(
             number=123,
             url=self.recovered_pr_url,
             state=self.recovered_pr_state,
             head_sha=self.recovered_head_sha,
-            head_ref=LINEAGE_BRANCH,
+        )
+
+    def update_pull_request_metadata(self, publication_id: uuid.UUID) -> Any:
+        self.calls.append("update_pull_request_metadata")
+        self.metadata_calls.append(publication_id)
+        if self.metadata_error is not None:
+            raise self.metadata_error
+        return replace(
+            self._pull(
+                number=123,
+                url=self.pr_url,
+                state=self.metadata_state,
+                head_sha=self.metadata_head_sha,
+            ),
+            updated_at=self.metadata_updated_at,
         )
 
     def allow_exact_revision(
         self, commit_sha: str, revision_id: uuid.UUID, expected_parent: str
     ) -> None:
-        self.verified_revision_head = commit_sha
-        self.verified_revision_id = revision_id
-        self.verified_expected_parent = expected_parent
+        self.allowed_revisions[(commit_sha, revision_id, expected_parent)] = expected_parent
 
 
 class _Replies:
@@ -598,15 +1406,11 @@ def _work(
         branch=LINEAGE_BRANCH,
         pr_number=None,
         pr_url=None,
-        github_repository_id=None,
-        github_pr_node_id=None,
         expected_prior_head=PRIOR_HEAD,
         expected_remote_head=None,
         base_sha="a" * 40,
         patch=b"diff --git a/README.md b/README.md\n",
         changed_paths=("README.md",),
-        observed_title_sha256=None,
-        observed_body_sha256=None,
         title="Update repository",
         body="Approved platform publication.",
         target=_target(kind),
@@ -642,15 +1446,11 @@ def _lineage_work(
         branch=LINEAGE_BRANCH,
         pr_number=pr_number,
         pr_url=pr_url,
-        github_repository_id=9001 if pr_number is not None else None,
-        github_pr_node_id="PR_example_123" if pr_number is not None else None,
         expected_prior_head=expected_prior_head,
         expected_remote_head=(expected_prior_head if pr_number is not None else None),
         base_sha=expected_prior_head or PRIOR_HEAD,
         patch=b"diff --git a/README.md b/README.md\n",
         changed_paths=("README.md",),
-        observed_title_sha256=None,
-        observed_body_sha256=None,
         title="Update repository",
         body="Approved platform publication.",
         target=_target(),
@@ -683,12 +1483,13 @@ def _loop(
     cards: _Cards | None = None,
     transcript: _Transcript | None | object = _DEFAULT_TRANSCRIPT,
     lineage: _Lineage | None = None,
-) -> tuple[Any, _Store, _Credentials, _Cluster, _GitHub, _Replies]:
+) -> tuple[Any, _Store, _Credentials, _Cluster, _CodeHost, _Replies]:
     k8s = importlib.import_module("curie_worker.publication_k8s")
     store = _Store()
     credentials = _Credentials(module)
     cluster = _Cluster(module)
-    github = _GitHub()
+    github = _CodeHost(module)
+    cluster.code_host = github
     replies = _Replies()
     cards = cards or _Cards()
     if transcript is _DEFAULT_TRANSCRIPT:
@@ -698,7 +1499,7 @@ def _loop(
         credentials=credentials,
         lineage=lineage if lineage is not None else _Lineage(),
         cluster=cluster,
-        github=github,
+        code_host=github,
         replies=replies,
         card_store=cards,
         transcript=transcript if isinstance(transcript, _Transcript) else None,
@@ -728,40 +1529,430 @@ def _job_env(resources: Any) -> dict[str, str]:
     return {item["name"]: item["value"] for item in container["env"]}
 
 
-@pytest.mark.parametrize(
-    "html_base", ["https://github.com", "https://github.example.com/forge"]
-)
-async def test_publication_markers_accept_the_configured_html_origin(
-    publication: Any, html_base: str
-) -> None:
-    url = f"{html_base}/acme-corp/acme-bot/pull/123"
-    marker = publication._marker_url(f"Publishing\nCURIE_PR_URL={url}\n")
+class _TimeoutRecoveryPeer:
+    def __init__(self) -> None:
+        self.requests: list[str] = []
+        self.bodies: list[dict[str, Any]] = []
+        self.on_timeout: Callable[[], None] = lambda: None
+        self.adoption = "matching"
+        self.ordinary_failure: int | None = None
+        self.timeout_operation: str | None = None
 
-    assert marker == url
-    assert publication._validated_pr_url(
-        _work(publication), marker, github_html_base=html_base
-    ) == url
+    def handler(self, request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        self.requests.append(path.rsplit("/", 1)[-1])
+        if path.endswith(f"/{self.timeout_operation}"):
+            raise httpx.ReadTimeout("code host observation unavailable", request=request)
+        if path.endswith("/branch-head"):
+            return httpx.Response(200, json={"head_sha": REVISION_HEAD, "base_branch": "main"})
+        if path.endswith("/revision-commit"):
+            return httpx.Response(200, json={"commit_sha": REVISION_HEAD, "parent_sha": PRIOR_HEAD})
+        if not path.endswith("/pull-request") or request.method != "POST":
+            raise AssertionError(f"unexpected code host request: {request.method} {path}")
+        body = json.loads(request.content)
+        self.bodies.append(body)
+        if len(self.bodies) == 1:
+            if self.ordinary_failure is not None:
+                return httpx.Response(self.ordinary_failure, json={"detail": "recovery refused"})
+            self.on_timeout()
+            raise httpx.ReadTimeout("original recovery response lost", request=request)
+        if self.adoption == "timeout":
+            raise httpx.ReadTimeout("adoption response lost", request=request)
+        if self.adoption == "absent":
+            return httpx.Response(204)
+        if self.adoption == "unavailable":
+            return httpx.Response(503, json={"detail": "lookup unavailable"})
+        return httpx.Response(
+            200,
+            json={
+                "number": 123,
+                "url": PR_URL,
+                "state": "open",
+                "head_sha": "c" * 40 if self.adoption == "foreign" else REVISION_HEAD,
+                "head_ref": LINEAGE_BRANCH,
+            },
+        )
+
+
+@pytest.fixture
+async def timeout_recovery_peer() -> AsyncIterator[tuple[_TimeoutRecoveryPeer, Any]]:
+    peer = _TimeoutRecoveryPeer()
+    async with httpx.AsyncClient(transport=httpx.MockTransport(peer.handler)) as client:
+        yield (
+            peer,
+            PublicationCodeHostClient(
+                api_base_url="https://publication.example.com",
+                worker_token="synthetic-worker-token",
+                client=client,
+            ),
+        )
+
+
+def _timeout_job(module: Any, phase: str, uid: str | None, *, marker: bool = False) -> Any:
+    return replace(_job(module, phase, commit_sha=REVISION_HEAD if marker else None), job_uid=uid)
+
+
+def _assert_timeout_recovery_waits(
+    store: _Store, cluster: _Cluster, replies: _Replies, lineage: _Lineage
+) -> None:
+    assert store.completed == {}
+    assert store.pending == {}
+    assert store.retries == []
+    assert store.failures == []
+    assert store.cleanup_pending == set()
+    assert cluster.applied == []
+    assert cluster.credentials_cleaned == []
+    assert cluster.terminals_cleaned == []
+    assert lineage.advances == []
+    assert replies.events == []
+
+
+@pytest.mark.parametrize("allow_launch", [False, True])
+@pytest.mark.parametrize("terminal_phase", ["succeeded", "failed"])
+@pytest.mark.parametrize("marker", [False, True])
+async def test_timeout_recovery_waits_for_newly_appeared_job_and_terminal_pods(
+    publication: Any,
+    timeout_recovery_peer: tuple[_TimeoutRecoveryPeer, Any],
+    allow_launch: bool,
+    terminal_phase: str,
+    marker: bool,
+) -> None:
+    peer, client = timeout_recovery_peer
+    lineage = _Lineage()
+    loop, store, credentials, cluster, _, replies = _loop(publication, lineage=lineage)
+    loop._code_host = client
+    peer.on_timeout = lambda: setattr(
+        cluster, "preexisting_observation", _timeout_job(publication, "running", "original-uid")
+    )
+    work = _work(publication)
+
+    await loop.reconcile(work)
+
+    _assert_timeout_recovery_waits(store, cluster, replies, lineage)
+    assert store.releases == [PUBLICATION_ID]
+    assert len(cluster.observed) == 2
+    assert credentials.calls == [PUBLICATION_ID]
+    assert peer.bodies == [{"expected_head_sha": REVISION_HEAD, "adopt_only": False}]
+    proof_requests = list(peer.requests)
+    cluster.preexisting_observation = _timeout_job(
+        publication, terminal_phase, "original-uid", marker=marker
+    )
+    for version in (2, 3):
+        await loop.reconcile(replace(work, version=version), allow_launch=allow_launch)
+        _assert_timeout_recovery_waits(store, cluster, replies, lineage)
+        assert peer.requests == proof_requests
+        assert credentials.calls == [PUBLICATION_ID]
+    assert store.releases == [PUBLICATION_ID] * 3
+    names = publication.publication_resource_names(PUBLICATION_ID)
+    assert cluster.quiescence_checks == [(names.job, "original-uid")] * 3
+
+    cluster.quiescent = True
+    await loop.reconcile(replace(work, version=7), allow_launch=allow_launch)
+
+    assert peer.bodies == [
+        {"expected_head_sha": REVISION_HEAD, "adopt_only": False},
+        {"expected_head_sha": REVISION_HEAD, "adopt_only": True},
+    ]
+    assert peer.requests == proof_requests + ["pull-request"]
+    assert credentials.calls == [PUBLICATION_ID]
+    assert cluster.applied == []
+    assert store.retries == []
+    assert store.completed == {PUBLICATION_ID: ("published", PR_URL)}
+    assert len(lineage.advances) == 1
+    assert lineage.advances[0]["expected_publication_version"] == 7
+    assert lineage.advances[0]["lease_owner"] == work.lease_owner
+    assert len(replies.events) == 1
+
+
+@pytest.mark.parametrize("timing", ["after-timeout", "later-pass"])
+@pytest.mark.parametrize(
+    "problem",
+    ["missing-uid", "empty-uid", "replacement", "absent", "error", "incomplete", "proof-error"],
+)
+async def test_timeout_recovery_known_uid_never_uses_missing_or_replaced_observation(
+    publication: Any,
+    timeout_recovery_peer: tuple[_TimeoutRecoveryPeer, Any],
+    monkeypatch: pytest.MonkeyPatch,
+    problem: str,
+    timing: str,
+) -> None:
+    peer, client = timeout_recovery_peer
+    lineage = _Lineage()
+    loop, store, credentials, cluster, _, replies = _loop(publication, lineage=lineage)
+    loop._code_host = client
+    cluster.preexisting_observation = _timeout_job(publication, "succeeded", "original-uid")
+    original_observe = cluster.observe
+
+    def break_observation() -> None:
+        if problem in {"error", "incomplete"}:
+
+            def observe(_job_name: str) -> Any:
+                if problem == "error":
+                    raise RuntimeError("Job inventory unavailable")
+                return None
+
+            monkeypatch.setattr(cluster, "observe", observe)
+        elif problem == "absent":
+            cluster.preexisting_observation = publication.PublicationJobObservation(
+                phase="absent", logs="", exists=False
+            )
+        else:
+            uid = {"missing-uid": None, "empty-uid": "", "replacement": "replacement-uid"}.get(
+                problem, "original-uid"
+            )
+            cluster.preexisting_observation = _timeout_job(
+                publication, "succeeded", uid, marker=True
+            )
+        cluster.quiescent = True
+        if problem == "proof-error":
+            cluster.quiescence_error = RuntimeError("Pod inventory unavailable")
+
+    if timing == "after-timeout":
+        peer.on_timeout = break_observation
+    work = _work(publication)
+    await loop.reconcile(work)
+    _assert_timeout_recovery_waits(store, cluster, replies, lineage)
+    proof_requests = list(peer.requests)
+    if timing == "later-pass":
+        break_observation()
+    for version in (2, 3):
+        await loop.reconcile(replace(work, version=version), allow_launch=False)
+        _assert_timeout_recovery_waits(store, cluster, replies, lineage)
+        assert credentials.calls == [PUBLICATION_ID]
+        assert peer.requests == proof_requests
+    assert store.releases == [PUBLICATION_ID] * 3
+
+    monkeypatch.setattr(cluster, "observe", original_observe)
+    cluster.preexisting_observation = _timeout_job(publication, "succeeded", "original-uid")
+    cluster.quiescence_error = None
+    cluster.quiescent = True
+    await loop.reconcile(replace(work, version=4), allow_launch=False)
+
+    assert [body["adopt_only"] for body in peer.bodies] == [False, True]
+    assert credentials.calls == [PUBLICATION_ID]
+    assert store.retries == []
+    assert store.completed == {PUBLICATION_ID: ("published", PR_URL)}
+
+
+@pytest.mark.parametrize("problem", ["error", "incomplete"])
+async def test_timeout_recovery_absent_job_requires_a_fresh_complete_observation(
+    publication: Any,
+    timeout_recovery_peer: tuple[_TimeoutRecoveryPeer, Any],
+    monkeypatch: pytest.MonkeyPatch,
+    problem: str,
+) -> None:
+    peer, client = timeout_recovery_peer
+    lineage = _Lineage()
+    loop, store, credentials, cluster, _, replies = _loop(publication, lineage=lineage)
+    loop._code_host = client
+    original_observe = cluster.observe
+
+    def incomplete_observe(_job_name: str) -> Any:
+        if problem == "error":
+            raise RuntimeError("Job inventory unavailable")
+        return None
+
+    peer.on_timeout = lambda: monkeypatch.setattr(cluster, "observe", incomplete_observe)
+    await loop.reconcile(_work(publication))
+
+    _assert_timeout_recovery_waits(store, cluster, replies, lineage)
+    assert store.releases == [PUBLICATION_ID]
+    assert [body["adopt_only"] for body in peer.bodies] == [False]
+    assert credentials.calls == [PUBLICATION_ID]
+    monkeypatch.setattr(cluster, "observe", original_observe)
+    await loop.reconcile(replace(_work(publication), version=2))
+
+    assert [body["adopt_only"] for body in peer.bodies] == [False, True]
+    assert cluster.quiescence_checks == []
+    assert store.retries == []
+    assert credentials.calls == [PUBLICATION_ID]
+    assert store.completed == {PUBLICATION_ID: ("published", PR_URL)}
+
+
+async def test_timeout_recovery_new_job_without_uid_waits_until_identity_and_pods_are_proven(
+    publication: Any, timeout_recovery_peer: tuple[_TimeoutRecoveryPeer, Any]
+) -> None:
+    peer, client = timeout_recovery_peer
+    lineage = _Lineage()
+    loop, store, credentials, cluster, _, replies = _loop(publication, lineage=lineage)
+    loop._code_host = client
+    peer.on_timeout = lambda: setattr(
+        cluster, "preexisting_observation", _timeout_job(publication, "succeeded", None)
+    )
+
+    await loop.reconcile(_work(publication))
+
+    _assert_timeout_recovery_waits(store, cluster, replies, lineage)
+    assert cluster.quiescence_checks == []
+    assert [body["adopt_only"] for body in peer.bodies] == [False]
+    cluster.preexisting_observation = _timeout_job(publication, "succeeded", "visible-uid")
+    cluster.quiescent = True
+    await loop.reconcile(replace(_work(publication), version=2))
+
+    assert [body["adopt_only"] for body in peer.bodies] == [False, True]
+    assert credentials.calls == [PUBLICATION_ID]
+    assert store.completed == {PUBLICATION_ID: ("published", PR_URL)}
+
+
+@pytest.mark.parametrize("site", ["post-push", "rejected-job"])
+async def test_timeout_recovery_covers_post_push_and_rejected_job_callers(
+    publication: Any,
+    timeout_recovery_peer: tuple[_TimeoutRecoveryPeer, Any],
+    site: str,
+) -> None:
+    peer, client = timeout_recovery_peer
+    lineage = _Lineage()
+    loop, store, credentials, cluster, _, replies = _loop(publication, lineage=lineage)
+    loop._code_host = client
+    if site == "post-push":
+        cluster.preexisting_observation = _timeout_job(
+            publication, "running", "original-uid", marker=True
+        )
+    else:
+        _reject_existing_job(publication, cluster, phase="succeeded")
+        cluster.quiescent = True
+        peer.on_timeout = lambda: setattr(cluster, "quiescent", False)
+
+    await loop.reconcile(_work(publication))
+
+    _assert_timeout_recovery_waits(store, cluster, replies, lineage)
+    assert credentials.calls == ([] if site == "post-push" else [PUBLICATION_ID])
+    assert [body["adopt_only"] for body in peer.bodies] == [False]
+    proof_requests = list(peer.requests)
+    cluster.quiescent = True
+    cluster.preexisting_observation = _timeout_job(
+        publication,
+        "succeeded",
+        "original-uid" if site == "post-push" else "old-job-uid",
+        marker=True,
+    )
+    await loop.reconcile(replace(_work(publication), version=2))
+
+    assert peer.requests == proof_requests + ["pull-request"]
+    assert [body["adopt_only"] for body in peer.bodies] == [False, True]
+    assert credentials.calls == ([] if site == "post-push" else [PUBLICATION_ID])
+    assert cluster.applied == []
+    assert store.retries == []
+    assert store.completed == {PUBLICATION_ID: ("published", PR_URL)}
+    assert len(lineage.advances) == 1
+
+
+@pytest.mark.parametrize("adoption", ["absent", "foreign", "timeout", "unavailable"])
+@pytest.mark.parametrize("terminal", [False, True])
+async def test_timeout_recovery_failed_adoption_charges_once_without_recursive_probe(
+    publication: Any,
+    timeout_recovery_peer: tuple[_TimeoutRecoveryPeer, Any],
+    adoption: str,
+    terminal: bool,
+) -> None:
+    peer, client = timeout_recovery_peer
+    peer.adoption = adoption
+    loop, store, credentials, cluster, _, replies = _loop(publication)
+    loop._code_host = client
+    store.retry_terminal_after = 1 if terminal else 99
+
+    await loop.reconcile(_work(publication))
+
+    assert [body["adopt_only"] for body in peer.bodies] == [False, True]
+    assert len(store.retries) == 1
+    assert store.completed == ({PUBLICATION_ID: ("failed", None)} if terminal else {})
+    assert loop._lineage.advances == []
+    assert credentials.calls == [PUBLICATION_ID]
+    assert cluster.applied == []
+    assert len(replies.events) == (1 if terminal else 0)
+    requests = list(peer.requests)
+    peer.adoption = "matching"
+    await loop.reconcile(replace(_work(publication), version=2))
+    if terminal:
+        assert peer.requests == requests
+    else:
+        assert [body["adopt_only"] for body in peer.bodies] == [False, True, False]
+        assert store.completed == {PUBLICATION_ID: ("published", PR_URL)}
+        assert credentials.calls == [PUBLICATION_ID] * 2
+    assert len(store.retries) == 1
+
+
+@pytest.mark.parametrize("status", [409, 503])
+async def test_timeout_recovery_does_not_probe_an_ordinary_refusal(
+    publication: Any, timeout_recovery_peer: tuple[_TimeoutRecoveryPeer, Any], status: int
+) -> None:
+    peer, client = timeout_recovery_peer
+    peer.ordinary_failure = status
+    loop, store, credentials, cluster, _, _ = _loop(publication)
+    loop._code_host = client
+
+    await loop.reconcile(_work(publication))
+
+    assert [body["adopt_only"] for body in peer.bodies] == [False]
+    assert len(store.retries) == 1
+    assert store.releases == []
+    assert credentials.calls == [PUBLICATION_ID]
+    assert cluster.applied == []
+
+
+@pytest.mark.parametrize("operation", ["branch-head", "revision-commit"])
+async def test_timeout_recovery_does_not_probe_timeouts_in_other_operations(
+    publication: Any, timeout_recovery_peer: tuple[_TimeoutRecoveryPeer, Any], operation: str
+) -> None:
+    peer, client = timeout_recovery_peer
+    peer.timeout_operation = operation
+    loop, store, credentials, cluster, _, _ = _loop(publication)
+    loop._code_host = client
+
+    await loop.reconcile(_work(publication))
+
+    assert peer.bodies == []
+    assert len(store.retries) == 1
+    assert store.releases == []
+    assert credentials.calls == ([] if operation == "branch-head" else [PUBLICATION_ID])
+    assert cluster.applied == []
 
 
 @pytest.mark.parametrize(
     "url",
     [
         PR_URL,
-        "https://other.example.com/forge/acme-corp/acme-bot/pull/123",
-        "https://github.example.com/acme-corp/acme-bot/pull/123",
-        "https://github.example.com/forge/acme-corp/other-bot/pull/123",
+        "https://github.example.com/forge/acme-corp/acme-bot/pull/123",
+        "https://gitlab.example.com/acme-corp/acme-bot/-/merge_requests/123",
     ],
 )
-async def test_enterprise_publication_markers_refuse_a_foreign_html_origin(
+async def test_api_pull_request_url_is_accepted_for_any_forge_shape(
     publication: Any, url: str
 ) -> None:
-    marker = publication._marker_url(f"CURIE_PR_URL={url}\n")
-    assert marker == url
+    """The worker knows no forge URL pattern; the API derived the URL."""
 
-    with pytest.raises(PublicationReconcileError, match="repository"):
-        publication._validated_pr_url(
-            _work(publication), marker, github_html_base="https://github.example.com/forge"
-        )
+    assert publication._checked_pr_url(url, 123) == url
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "http://github.com/acme-corp/acme-bot/pull/123",
+        "https://user:secret@github.com/acme-corp/acme-bot/pull/123",
+        "https://github.com/acme-corp/acme-bot/pull/123?x=1",
+        "https://github.com/acme-corp/acme-bot/pull/123#frag",
+        "https://github.com/acme-corp/acme-bot/pull/124",
+        "https:///acme-corp/acme-bot/pull/123",
+    ],
+)
+async def test_api_pull_request_url_must_be_clean_https_naming_the_number(
+    publication: Any, url: str
+) -> None:
+    with pytest.raises(PublicationReconcileError, match="not a clean HTTPS URL"):
+        publication._checked_pr_url(url, 123)
+
+
+async def test_job_commit_marker_is_the_only_marker_read(publication: Any) -> None:
+    logs = (
+        f"CURIE_PR_URL={PR_URL}\nCURIE_PR_NUMBER=123\nCURIE_PR_STATE=merged\n"
+        f"CURIE_COMMIT_SHA={REVISION_HEAD}\n"
+    )
+
+    assert publication._marker_commit(logs) == REVISION_HEAD
+    assert publication._marker_commit(f"CURIE_PR_URL={PR_URL}\n") is None
+    assert publication._marker_commit("CURIE_COMMIT_SHA=not-a-sha\n") is None
+    assert not hasattr(publication, "_marker_url")
+    assert not hasattr(publication, "_marker_state")
 
 
 async def test_publication_card_outbox_posts_and_remembers_before_ack(
@@ -1051,19 +2242,25 @@ async def test_untokened_identity_card_delivery_retries_rather_than_dead_letters
     publication finally gives up.
     """
     loop, store, _, _, _, _ = _loop(publication, _Cards())
-    loop._replies = build_reply_sink(WorkerConfig(slack_bot_token=""))
+    from curie_test_support.channel_gateway import reply_gateway
+
     work = _card_work()
     work.route = TargetRoute(endpoint=None, adapter="ghost")
     store.card_pending = work
-
-    with pytest.raises(UnconfiguredSlackIdentityError):
-        await loop.deliver_pending_card()
+    with reply_gateway({}, "") as values:
+        sink = build_reply_sink(WorkerConfig(**values))
+        loop._replies = sink
+        try:
+            with pytest.raises(UnconfiguredSlackIdentityError):
+                await loop.deliver_pending_card()
+        finally:
+            await sink.aclose()
 
     assert store.card_delivery_permanent == [False]
     assert store.completed == {}
     assert len(store.card_delivery_retries) == 1
     _, error = store.card_delivery_retries[0]
-    assert "ghost" in error
+    assert error == "unconfigured_slack_identity"
 
 
 async def test_cluster_message_card_relay_outage_is_a_bounded_retry(
@@ -1105,9 +2302,9 @@ async def test_publication_card_crash_after_post_adopts_same_ref_on_retry(
     await loop.deliver_pending_card()
 
     assert len(replies.events) == 2
-    assert {
-        replies.post_refs[str(APPROVAL_ID)]
-    } == {"1700000000.000050"}, "the UUID idempotency key adopts one Slack message"
+    assert {replies.post_refs[str(APPROVAL_ID)]} == {"1700000000.000050"}, (
+        "the UUID idempotency key adopts one Slack message"
+    )
     assert cards.ref is not None and cards.ref.ts == "1700000000.000050"
     assert store.card_delivered == {PUBLICATION_ID}
 
@@ -1147,9 +2344,27 @@ async def test_approved_publication_launches_job_and_reports_pr_url(
     assert len(cluster.applied) == 1
     resources = cluster.applied[0]
     assert resources.job["kind"] == "Job"
-    assert PR_URL not in str(resources.secret), "the result is learned from the Job"
+    assert PR_URL not in str(resources.secret), "the result is learned from the API"
+    env = _job_env(resources)
+    assert env["CODE_HOST_ORIGIN"] == ORIGIN
+    assert env["CODE_HOST_HEADER_FORM"] == "authorization_basic"
+    assert env["BASE_BRANCH"] == github.base_branch
+    assert env["BASE_SHA"] == work.base_sha
+    assert env["EXPECTED_PRIOR_HEAD"] == work.expected_prior_head
+    assert not {"PR_NUMBER", "PR_URL", "PR_BODY", "BASE_REF"} & env.keys(), (
+        "the Job is push-only and holds no pull request facts"
+    )
+    # The Job only pushes; the API proves the pushed commit and then finds or
+    # opens the pull request for it.
+    assert github.calls == [
+        "read_branch_head",
+        "read_branch_head",
+        "verify_revision_commit",
+        "recover_pull_request",
+    ]
     assert github.number_calls == []
-    assert github.verify_calls == []
+    assert github.verify_calls == [(PUBLICATION_ID, REVISION_HEAD, REVISION_ID, PRIOR_HEAD)]
+    assert github.recover_calls == [(PUBLICATION_ID, REVISION_HEAD, False)]
     assert store.completed == {PUBLICATION_ID: ("published", PR_URL)}
     assert cluster.credentials_cleaned == [resources.names]
     assert cluster.terminals_cleaned == [resources.names]
@@ -1168,31 +2383,14 @@ async def test_two_approved_revisions_keep_one_lineage_branch_and_pull_number(
     second_publication_id = uuid.UUID("66666666-6666-4666-8666-666666666666")
     second_revision_id = uuid.UUID("77777777-7777-4777-8777-777777777777")
     first = _lineage_work(publication)
-    cluster.observation = publication.PublicationJobObservation(
-        phase="succeeded",
-        pr_url=PR_URL,
-        pr_number=123,
-        commit_sha=REVISION_HEAD,
-        logs=(
-            f"CURIE_PR_URL={PR_URL}\n"
-            f"CURIE_PR_NUMBER=123\nCURIE_COMMIT_SHA={REVISION_HEAD}\n"
-        ),
-    )
+    cluster.observation = _job(publication, "succeeded", commit_sha=REVISION_HEAD)
 
     await loop.reconcile(first)
 
-    github.head_sha = REVISION_HEAD
+    assert github.head_sha == REVISION_HEAD, "the first Job pushed its revision"
     second_head = "c" * 40
-    cluster.observation = publication.PublicationJobObservation(
-        phase="succeeded",
-        pr_url=PR_URL,
-        pr_number=123,
-        commit_sha=second_head,
-        logs=(
-            f"CURIE_PR_URL={PR_URL}\n"
-            f"CURIE_PR_NUMBER=123\nCURIE_COMMIT_SHA={second_head}\n"
-        ),
-    )
+    github.allow_exact_revision(second_head, second_revision_id, REVISION_HEAD)
+    cluster.observation = _job(publication, "succeeded", commit_sha=second_head)
     second = _lineage_work(
         publication,
         publication_id=second_publication_id,
@@ -1204,18 +2402,23 @@ async def test_two_approved_revisions_keep_one_lineage_branch_and_pull_number(
     await loop.reconcile(second)
 
     assert credentials.calls == [PUBLICATION_ID, second_publication_id]
+    # Each revision reads the stored pull request before launch and again
+    # after its push; neither opens another one.
     assert github.number_calls == [
-        ("acme-corp/acme-bot", 123),
-        ("acme-corp/acme-bot", 123),
+        (PUBLICATION_ID, 123),
+        (PUBLICATION_ID, 123),
+        (second_publication_id, 123),
+        (second_publication_id, 123),
     ]
-    assert github.authorization_headers == [
-        "Basic publication-write-credential-value",
-        "Basic publication-write-credential-value",
+    assert github.recover_calls == []
+    assert github.verify_calls == [
+        (PUBLICATION_ID, REVISION_HEAD, REVISION_ID, PRIOR_HEAD),
+        (second_publication_id, second_head, second_revision_id, REVISION_HEAD),
     ]
     assert len(cluster.applied) == 2
     job_envs = [_job_env(resource) for resource in cluster.applied]
     assert {env["BRANCH"] for env in job_envs} == {LINEAGE_BRANCH}
-    assert {env["PR_NUMBER"] for env in job_envs} == {"123"}
+    assert all("PR_NUMBER" not in env for env in job_envs)
     assert [env["REVISION_ID"] for env in job_envs] == [
         str(REVISION_ID),
         str(second_revision_id),
@@ -1256,9 +2459,7 @@ async def test_denied_first_revision_leaves_absent_identity_for_later_create_pat
         pr_number=None,
         pr_url=None,
     )
-    cluster.observation = publication.PublicationJobObservation(
-        phase="pending", pr_url=None, pr_number=None, commit_sha=None, logs=""
-    )
+    cluster.observation = _job(publication, "pending")
 
     await loop.reconcile(later)
 
@@ -1266,7 +2467,7 @@ async def test_denied_first_revision_leaves_absent_identity_for_later_create_pat
     assert len(cluster.applied) == 1
     env = _job_env(cluster.applied[0])
     assert env["REVISION_NUMBER"] == "2"
-    assert env["PR_NUMBER"] == ""
+    assert "PR_NUMBER" not in env
     assert env["EXPECTED_REMOTE_HEAD"] == ""
 
 
@@ -1279,14 +2480,8 @@ async def test_foreign_remote_head_is_never_adopted_as_the_approved_revision(
     await loop.reconcile(_lineage_work(publication))
 
     assert credentials.calls == [PUBLICATION_ID]
-    assert github.number_calls == [("acme-corp/acme-bot", 123)]
-    assert github.verify_calls == [
-        ("acme-corp/acme-bot", "d" * 40, REVISION_ID, PRIOR_HEAD)
-    ]
-    assert github.authorization_headers == [
-        "Basic publication-write-credential-value",
-        "Basic publication-write-credential-value",
-    ]
+    assert github.number_calls == [(PUBLICATION_ID, 123)]
+    assert github.verify_calls == [(PUBLICATION_ID, "d" * 40, REVISION_ID, PRIOR_HEAD)]
     assert cluster.applied == []
     assert store.completed == {}
     assert loop._lineage.advances == []
@@ -1333,29 +2528,26 @@ async def test_succeeded_job_retry_uses_validated_markers_without_a_second_crede
 ) -> None:
     """A rotated installation token cannot make a completed Job unadoptable."""
 
-    loop, store, credentials, cluster, _, replies = _loop(publication)
+    loop, store, credentials, cluster, github, replies = _loop(publication)
     work = _work(publication)
-    cluster.observation = publication.PublicationJobObservation(
-        phase="pending", pr_url=None, pr_number=None, commit_sha=None, logs=""
-    )
+    cluster.observation = _job(publication, "pending")
 
     await loop.reconcile(work)
+    assert github.calls == ["read_branch_head", "read_branch_head"]
 
-    cluster.observation = publication.PublicationJobObservation(
-        phase="succeeded",
-        pr_url=PR_URL,
-        pr_number=123,
-        commit_sha=REVISION_HEAD,
-        logs=(
-            f"CURIE_PR_URL={PR_URL}\n"
-            f"CURIE_PR_NUMBER=123\nCURIE_COMMIT_SHA={REVISION_HEAD}\n"
-        ),
-    )
+    cluster.observation = _job(publication, "succeeded", commit_sha=REVISION_HEAD)
     await loop.reconcile(work)
 
     assert credentials.calls == [PUBLICATION_ID]
     assert len(cluster.applied) == 1
     assert len(cluster.validated_existing) == 1
+    assert github.calls == [
+        "read_branch_head",
+        "read_branch_head",
+        "read_branch_head",
+        "verify_revision_commit",
+        "recover_pull_request",
+    ]
     assert store.completed == {PUBLICATION_ID: ("published", PR_URL)}
     assert len(replies.events) == 1
 
@@ -1376,19 +2568,14 @@ async def test_ttl_deleted_first_revision_job_recovers_exact_marked_commit_and_p
 
         def observe(self, job_name: str) -> Any:
             if not self.job_exists:
-                return self.module.PublicationJobObservation(
-                    phase="pending", pr_url=None, logs="", exists=False
-                )
+                return self.module.PublicationJobObservation(phase="pending", logs="", exists=False)
             return self.observation
 
     class RotatingCredentials(_Credentials):
         def redeem(self, publication_id: uuid.UUID) -> Any:
             self.calls.append(publication_id)
             ordinal = len(self.calls)
-            return self.module.PublicationCredential(
-                clean_clone_url="https://github.com/acme-corp/acme-bot.git",
-                authorization_header=f"Bearer rotated-installation-token-{ordinal}",
-            )
+            return _credential(self.module, f"Bearer rotated-installation-token-{ordinal}")
 
     loop, store, _, _, github, replies = _loop(publication)
     cluster = TtlCluster(publication)
@@ -1396,9 +2583,7 @@ async def test_ttl_deleted_first_revision_job_recovers_exact_marked_commit_and_p
     loop._cluster = cluster
     loop._credentials = credentials
     work = _work(publication)
-    cluster.observation = publication.PublicationJobObservation(
-        phase="pending", pr_url=None, pr_number=None, commit_sha=None, logs=""
-    )
+    cluster.observation = _job(publication, "pending")
 
     await loop.reconcile(work)
     assert len(cluster.applied) == 1
@@ -1411,21 +2596,13 @@ async def test_ttl_deleted_first_revision_job_recovers_exact_marked_commit_and_p
     assert credentials.calls == [PUBLICATION_ID, PUBLICATION_ID]
     assert len(cluster.applied) == 1, "recovery must not recreate the publication Job"
     assert github.branch_calls == [
-        ("acme-corp/acme-bot", LINEAGE_BRANCH),
-        ("acme-corp/acme-bot", LINEAGE_BRANCH),
+        PUBLICATION_ID,
+        PUBLICATION_ID,
+        PUBLICATION_ID,
+        PUBLICATION_ID,
     ]
-    assert github.verify_calls == [
-        ("acme-corp/acme-bot", REVISION_HEAD, REVISION_ID, PRIOR_HEAD)
-    ]
-    assert github.recover_calls == [
-        ("acme-corp/acme-bot", LINEAGE_BRANCH, REVISION_HEAD)
-    ]
-    assert github.authorization_headers == [
-        "Bearer rotated-installation-token-1",
-        "Bearer rotated-installation-token-2",
-        "Bearer rotated-installation-token-2",
-        "Bearer rotated-installation-token-2",
-    ]
+    assert github.verify_calls == [(PUBLICATION_ID, REVISION_HEAD, REVISION_ID, PRIOR_HEAD)]
+    assert github.recover_calls == [(PUBLICATION_ID, REVISION_HEAD, False)]
     assert store.completed == {PUBLICATION_ID: ("published", PR_URL)}
     assert loop._lineage.advances[0]["pr_number"] == 123
     assert loop._lineage.advances[0]["head_sha"] == REVISION_HEAD
@@ -1443,12 +2620,8 @@ async def test_first_revision_recovery_refuses_pr_head_replaced_after_commit_pro
     await loop.reconcile(_work(publication))
 
     assert credentials.calls == [PUBLICATION_ID]
-    assert github.verify_calls == [
-        ("acme-corp/acme-bot", REVISION_HEAD, REVISION_ID, PRIOR_HEAD)
-    ]
-    assert github.recover_calls == [
-        ("acme-corp/acme-bot", LINEAGE_BRANCH, REVISION_HEAD)
-    ]
+    assert github.verify_calls == [(PUBLICATION_ID, REVISION_HEAD, REVISION_ID, PRIOR_HEAD)]
+    assert github.recover_calls == [(PUBLICATION_ID, REVISION_HEAD, False)]
     assert cluster.applied == []
     assert store.completed == {}
     assert loop._lineage.advances == []
@@ -1462,21 +2635,21 @@ async def test_first_revision_recovery_refuses_pr_head_replaced_after_commit_pro
 
 
 @pytest.mark.parametrize("terminal_state", ["closed", "merged"])
+@pytest.mark.parametrize("actual_parent", [PRIOR_HEAD, "c" * 40])
 async def test_first_revision_recovery_persists_terminal_pull_without_repost(
     publication: Any,
     terminal_state: str,
+    actual_parent: str,
 ) -> None:
     loop, store, credentials, cluster, github, replies = _loop(publication)
     github.branch_head = REVISION_HEAD
-    github.allow_exact_revision(REVISION_HEAD, REVISION_ID, PRIOR_HEAD)
+    github.allowed_revisions[(REVISION_HEAD, REVISION_ID, PRIOR_HEAD)] = actual_parent
     github.recovered_pr_state = terminal_state
 
     await loop.reconcile(_work(publication))
 
     assert credentials.calls == [PUBLICATION_ID]
-    assert github.recover_calls == [
-        ("acme-corp/acme-bot", LINEAGE_BRANCH, REVISION_HEAD)
-    ]
+    assert github.recover_calls == [(PUBLICATION_ID, REVISION_HEAD, False)]
     assert store.lineage_terminals == [
         {
             "lineage_id": LINEAGE_ID,
@@ -1486,6 +2659,10 @@ async def test_first_revision_recovery_persists_terminal_pull_without_repost(
             "pr_number": 123,
             "pr_url": PR_URL,
             "head_sha": REVISION_HEAD,
+            "publication_id": PUBLICATION_ID,
+            "expected_publication_version": 1,
+            "lease_owner": "publication-loop-test",
+            "first_parent_sha": actual_parent,
         }
     ]
     assert store.retries == [
@@ -1513,9 +2690,7 @@ async def test_stored_terminal_pull_never_adopts_a_foreign_replacement_head(
     await loop.reconcile(_lineage_work(publication))
 
     assert credentials.calls == [PUBLICATION_ID]
-    assert github.verify_calls == [
-        ("acme-corp/acme-bot", foreign_head, REVISION_ID, PRIOR_HEAD)
-    ]
+    assert github.verify_calls == [(PUBLICATION_ID, foreign_head, REVISION_ID, PRIOR_HEAD)]
     assert store.lineage_terminals == [
         {
             "lineage_id": LINEAGE_ID,
@@ -1525,6 +2700,10 @@ async def test_stored_terminal_pull_never_adopts_a_foreign_replacement_head(
             "pr_number": 123,
             "pr_url": PR_URL,
             "head_sha": PRIOR_HEAD,
+            "publication_id": PUBLICATION_ID,
+            "expected_publication_version": 1,
+            "lease_owner": "publication-loop-test",
+            "first_parent_sha": None,
         }
     ]
     assert store.retries == [
@@ -1579,9 +2758,7 @@ async def test_stored_terminal_pull_accepts_an_exact_verified_revision_head(
 
     await loop.reconcile(_lineage_work(publication))
 
-    assert github.verify_calls == [
-        ("acme-corp/acme-bot", REVISION_HEAD, REVISION_ID, PRIOR_HEAD)
-    ]
+    assert github.verify_calls == [(PUBLICATION_ID, REVISION_HEAD, REVISION_ID, PRIOR_HEAD)]
     assert store.lineage_terminals == [
         {
             "lineage_id": LINEAGE_ID,
@@ -1591,6 +2768,10 @@ async def test_stored_terminal_pull_accepts_an_exact_verified_revision_head(
             "pr_number": 123,
             "pr_url": PR_URL,
             "head_sha": REVISION_HEAD,
+            "publication_id": PUBLICATION_ID,
+            "expected_publication_version": 1,
+            "lease_owner": "publication-loop-test",
+            "first_parent_sha": None,
         }
     ]
     assert cluster.applied == []
@@ -1600,32 +2781,29 @@ async def test_stored_terminal_pull_accepts_an_exact_verified_revision_head(
 
 
 @pytest.mark.parametrize("terminal_state", ["closed", "merged"])
-async def test_terminal_first_pr_job_marker_persists_lineage_without_recovery(
+@pytest.mark.parametrize("phase", ["running", "succeeded", "failed"])
+async def test_pull_merged_or_closed_after_first_push_persists_lineage_without_redeem(
     publication: Any,
     terminal_state: str,
+    phase: str,
 ) -> None:
+    """ADR 0197 Consequence 6: the API's post-push read records a terminal pull."""
+
     loop, store, credentials, cluster, github, replies = _loop(publication)
-    cluster.preexisting_observation = publication.PublicationJobObservation(
-        phase="failed",
-        pr_url=PR_URL,
-        pr_number=123,
+    cluster.preexisting_observation = _job(
+        publication,
+        phase,
         commit_sha=REVISION_HEAD,
-        pr_state=terminal_state,
-        logs=(
-            f"CURIE_PR_URL={PR_URL}\n"
-            "CURIE_PR_NUMBER=123\n"
-            f"CURIE_COMMIT_SHA={REVISION_HEAD}\n"
-            f"CURIE_PR_STATE={terminal_state}\n"
-        ),
-        error=f"stored pull request is {terminal_state}",
+        error="job process exited" if phase == "failed" else None,
     )
+    github.recovered_pr_state = terminal_state
 
     await loop.reconcile(_work(publication))
 
     assert len(cluster.validated_existing) == 1
     assert credentials.calls == []
-    assert github.branch_calls == []
-    assert github.recover_calls == []
+    assert github.calls == ["read_branch_head", "verify_revision_commit", "recover_pull_request"]
+    assert github.recover_calls == [(PUBLICATION_ID, REVISION_HEAD, False)]
     assert store.lineage_terminals == [
         {
             "lineage_id": LINEAGE_ID,
@@ -1635,6 +2813,10 @@ async def test_terminal_first_pr_job_marker_persists_lineage_without_recovery(
             "pr_number": 123,
             "pr_url": PR_URL,
             "head_sha": REVISION_HEAD,
+            "publication_id": PUBLICATION_ID,
+            "expected_publication_version": 1,
+            "lease_owner": "publication-loop-test",
+            "first_parent_sha": PRIOR_HEAD,
         }
     ]
     assert store.retries == [
@@ -1649,16 +2831,60 @@ async def test_terminal_first_pr_job_marker_persists_lineage_without_recovery(
     assert replies.events == []
 
 
-async def test_terminal_job_state_without_exact_facts_cannot_close_lineage(
+@pytest.mark.parametrize("terminal_state", ["closed", "merged"])
+async def test_stored_pull_merged_or_closed_while_job_pushed_is_recorded(
     publication: Any,
+    terminal_state: str,
 ) -> None:
     loop, store, credentials, cluster, github, replies = _loop(publication)
-    cluster.preexisting_observation = publication.PublicationJobObservation(
-        phase="failed",
-        pr_url=None,
-        pr_number=None,
-        commit_sha=None,
-        pr_state="closed",
+    github.state_after_push = terminal_state
+
+    await loop.reconcile(_lineage_work(publication))
+
+    assert credentials.calls == [PUBLICATION_ID]
+    assert len(cluster.applied) == 1
+    assert github.calls == [
+        "read_branch_head",
+        "read_pull_request",
+        "verify_revision_commit",
+        "read_pull_request",
+    ]
+    assert github.recover_calls == []
+    assert store.lineage_terminals == [
+        {
+            "lineage_id": LINEAGE_ID,
+            "expected_version": 2,
+            "expected_stored_head": PRIOR_HEAD,
+            "state": terminal_state,
+            "pr_number": 123,
+            "pr_url": PR_URL,
+            "head_sha": REVISION_HEAD,
+            "publication_id": PUBLICATION_ID,
+            "expected_publication_version": 1,
+            "lease_owner": "publication-loop-test",
+            "first_parent_sha": None,
+        }
+    ]
+    assert store.retries == [
+        (
+            PUBLICATION_ID,
+            f"pull request lineage is {terminal_state}; start a new thread",
+        )
+    ]
+    assert store.completed == {}
+    assert loop._lineage.advances == []
+    assert replies.events == []
+
+
+async def test_job_state_claim_without_commit_marker_cannot_close_lineage(
+    publication: Any,
+) -> None:
+    """A Job's own pull request state line is not authority; only the API is."""
+
+    loop, store, credentials, cluster, github, replies = _loop(publication)
+    cluster.preexisting_observation = _job(
+        publication,
+        "failed",
         logs="CURIE_PR_STATE=closed\n",
         error="stored pull request is closed",
     )
@@ -1666,50 +2892,98 @@ async def test_terminal_job_state_without_exact_facts_cannot_close_lineage(
     await loop.reconcile(_work(publication))
 
     assert store.lineage_terminals == []
-    assert store.retries == [
-        (
-            PUBLICATION_ID,
-            "publication Job terminal state omitted exact pull request facts",
-        )
-    ]
-    assert credentials.calls == []
     assert github.recover_calls == []
-    assert store.completed == {}
+    assert github.verify_calls == []
     assert loop._lineage.advances == []
-    assert replies.events == []
+    assert store.retries == []
+    assert store.completed == {PUBLICATION_ID: ("failed", None)}
+    assert "Nothing was pushed" in store.failures[0][1]
+    assert len(replies.events) == 1
 
 
 async def test_terminal_job_reconcile_replay_is_idempotent_in_real_store(
     publication: Any,
+    migrated_publication_database_url: str,
 ) -> None:
-    engine: AsyncEngine = create_async_engine(_DB_URL)
-    schema: str | None = None
+    engine: AsyncEngine = create_async_engine(migrated_publication_database_url)
+    schema = "curie"
+    version_id = uuid.uuid4()
+    deployment_id = uuid.uuid4()
     try:
-        await pg_connect_or_skip(engine)
-
-        schema = f"test_publication_{uuid.uuid4().hex}"
         durable = PostgresPublicationStore(
             engine,
             schema=schema,
             lease_owner="terminal-replay-test",
         )
         async with engine.begin() as connection:
-            await connection.execute(text(f'CREATE SCHEMA "{schema}"'))
+            await connection.execute(
+                text("INSERT INTO curie.agents (id, name) VALUES (:id, :name)"),
+                {"id": AGENT_ID, "name": "acme-publication-test"},
+            )
             await connection.execute(
                 text(
-                    f'CREATE TABLE "{schema}".thread_publication_lineages ('
-                    "id uuid PRIMARY KEY, pr_number integer, pr_url text, "
-                    "head_sha text, status text NOT NULL, version integer NOT NULL, "
-                    "updated_at timestamp NOT NULL DEFAULT now())"
-                )
+                    "INSERT INTO curie.agent_versions "
+                    "(id, agent_id, version_label, created_by) "
+                    "VALUES (:id, :agent_id, 'v1', 'publication-test')"
+                ),
+                {"id": version_id, "agent_id": AGENT_ID},
+            )
+            await connection.execute(
+                text(
+                    "INSERT INTO curie.deployments (id, agent_id, version_id, environment) "
+                    "VALUES (:id, :agent_id, :version_id, 'dev')"
+                ),
+                {"id": deployment_id, "agent_id": AGENT_ID, "version_id": version_id},
             )
             await connection.execute(
                 text(
                     f'INSERT INTO "{schema}".thread_publication_lineages '
-                    "(id, pr_number, pr_url, head_sha, status, version) "
-                    "VALUES (:id, 123, :pr_url, :head_sha, 'open', 2)"
+                    "(id, agent_id, deployment_id, conversation_id, repo_full_name, "
+                    "base_sha, branch, pr_number, pr_url, head_sha, status, version, "
+                    "latest_revision) "
+                    "VALUES (:id, :agent_id, :deployment_id, :conversation_id, "
+                    "'acme-corp/acme-bot', :base_sha, :branch, 123, :pr_url, "
+                    ":head_sha, 'open', 2, 2)"
                 ),
-                {"id": LINEAGE_ID, "pr_url": PR_URL, "head_sha": PRIOR_HEAD},
+                {
+                    "id": LINEAGE_ID,
+                    "agent_id": AGENT_ID,
+                    "deployment_id": deployment_id,
+                    "conversation_id": CONVERSATION_ID,
+                    "base_sha": PRIOR_HEAD,
+                    "branch": LINEAGE_BRANCH,
+                    "pr_url": PR_URL,
+                    "head_sha": PRIOR_HEAD,
+                },
+            )
+            await connection.execute(
+                text(
+                    "INSERT INTO curie.approvals "
+                    "(id, agent_id, conversation_id, author, summary, dedupe_key, "
+                    "reply_kind, reply_channel, status) VALUES "
+                    "(:id, :agent, :conversation, 'fixture-requester', 'Publish approved change', "
+                    "'terminal-replay', 'slack', 'C0EXAMPLE1', 'approved')"
+                ),
+                {"id": APPROVAL_ID, "agent": AGENT_ID, "conversation": CONVERSATION_ID},
+            )
+            await connection.execute(
+                text(
+                    "INSERT INTO curie.publications "
+                    "(id, approval_id, deployment_id, lineage_id, repo_full_name, status, version, "
+                    "revision_number, base_sha, expected_prior_head, changed_paths, title, body, "
+                    "reply_kind, reply_channel, lease_owner, lease_expires_at) VALUES "
+                    "(:id, :approval, :deployment, :lineage, 'acme-corp/acme-bot', 'running', 1, "
+                    "2, :head, :head, '[\"README.md\"]'::jsonb, 'Update repository', "
+                    "'Approved change', 'slack', 'C0EXAMPLE1', 'publication-loop-test', "
+                    "now() + interval '1 hour')"
+                ),
+                {
+                    "id": PUBLICATION_ID,
+                    "approval": APPROVAL_ID,
+                    "deployment": deployment_id,
+                    "lineage": LINEAGE_ID,
+                    "head": PRIOR_HEAD,
+                },
             )
 
         class RealTerminalStore(_Store):
@@ -1723,6 +2997,10 @@ async def test_terminal_job_reconcile_replay_is_idempotent_in_real_store(
                 pr_number: int,
                 pr_url: str,
                 head_sha: str,
+                publication_id: uuid.UUID,
+                expected_publication_version: int,
+                lease_owner: str,
+                first_parent_sha: str | None,
             ) -> None:
                 await durable.mark_lineage_terminal(
                     lineage_id,
@@ -1732,25 +3010,18 @@ async def test_terminal_job_reconcile_replay_is_idempotent_in_real_store(
                     pr_number=pr_number,
                     pr_url=pr_url,
                     head_sha=head_sha,
+                    publication_id=publication_id,
+                    expected_publication_version=expected_publication_version,
+                    lease_owner=lease_owner,
+                    first_parent_sha=first_parent_sha,
                 )
 
         loop, _, credentials, cluster, github, replies = _loop(publication)
         store = RealTerminalStore()
         loop._store = store
-        cluster.preexisting_observation = publication.PublicationJobObservation(
-            phase="failed",
-            pr_url=PR_URL,
-            pr_number=123,
-            commit_sha=REVISION_HEAD,
-            pr_state="merged",
-            logs=(
-                f"CURIE_PR_URL={PR_URL}\n"
-                "CURIE_PR_NUMBER=123\n"
-                f"CURIE_COMMIT_SHA={REVISION_HEAD}\n"
-                "CURIE_PR_STATE=merged\n"
-            ),
-            error="stored pull request is merged",
-        )
+        # The Job pushed; the API then reads the stored pull request merged.
+        cluster.preexisting_observation = _job(publication, "succeeded", commit_sha=REVISION_HEAD)
+        github.state_after_push = "merged"
         work = _lineage_work(publication)
 
         await loop.reconcile(work)
@@ -1758,20 +3029,25 @@ async def test_terminal_job_reconcile_replay_is_idempotent_in_real_store(
 
         async with engine.connect() as connection:
             row = (
-                await connection.execute(
-                    text(
-                        f'SELECT status, pr_number, pr_url, head_sha, version '
-                        f'FROM "{schema}".thread_publication_lineages WHERE id = :id'
-                    ),
-                    {"id": LINEAGE_ID},
+                (
+                    await connection.execute(
+                        text(
+                            f"SELECT status, pr_number, pr_url, head_sha, version, base_sha "
+                            f'FROM "{schema}".thread_publication_lineages WHERE id = :id'
+                        ),
+                        {"id": LINEAGE_ID},
+                    )
                 )
-            ).mappings().one()
+                .mappings()
+                .one()
+            )
         assert dict(row) == {
             "status": "merged",
             "pr_number": 123,
             "pr_url": PR_URL,
             "head_sha": REVISION_HEAD,
             "version": 3,
+            "base_sha": PRIOR_HEAD,
         }
         assert len(store.retries) == 2
         assert credentials.calls == []
@@ -1793,6 +3069,10 @@ async def test_terminal_job_reconcile_replay_is_idempotent_in_real_store(
                     pr_number=123,
                     pr_url=PR_URL,
                     head_sha=conflict_head,
+                    publication_id=PUBLICATION_ID,
+                    expected_publication_version=1,
+                    lease_owner="publication-loop-test",
+                    first_parent_sha=None,
                 )
 
         concurrent_id = uuid.uuid4()
@@ -1801,10 +3081,27 @@ async def test_terminal_job_reconcile_replay_is_idempotent_in_real_store(
             await connection.execute(
                 text(
                     f'INSERT INTO "{schema}".thread_publication_lineages '
-                    "(id, pr_number, pr_url, head_sha, status, version) "
-                    "VALUES (:id, 123, :pr_url, :head_sha, 'open', 2)"
+                    "(id, agent_id, deployment_id, conversation_id, repo_full_name, "
+                    "base_sha, branch, pr_number, pr_url, head_sha, status, version, "
+                    "latest_revision) "
+                    "VALUES (:id, :agent_id, :deployment_id, :conversation_id, "
+                    "'acme-corp/acme-bot', :base_sha, :branch, 123, :pr_url, "
+                    ":head_sha, 'open', 2, 2)"
                 ),
-                {"id": concurrent_id, "pr_url": PR_URL, "head_sha": foreign_head},
+                {
+                    "id": concurrent_id,
+                    "agent_id": AGENT_ID,
+                    "deployment_id": deployment_id,
+                    "conversation_id": f"{CONVERSATION_ID}-concurrent",
+                    "base_sha": PRIOR_HEAD,
+                    "branch": f"{LINEAGE_BRANCH}-concurrent",
+                    "pr_url": PR_URL,
+                    "head_sha": foreign_head,
+                },
+            )
+            await connection.execute(
+                text("UPDATE curie.publications SET lineage_id = :lineage WHERE id = :id"),
+                {"lineage": concurrent_id, "id": PUBLICATION_ID},
             )
         with pytest.raises(PublicationStoreError, match="terminal CAS was lost"):
             await durable.mark_lineage_terminal(
@@ -1815,26 +3112,31 @@ async def test_terminal_job_reconcile_replay_is_idempotent_in_real_store(
                 pr_number=123,
                 pr_url=PR_URL,
                 head_sha=PRIOR_HEAD,
+                publication_id=PUBLICATION_ID,
+                expected_publication_version=1,
+                lease_owner="publication-loop-test",
+                first_parent_sha=None,
             )
         async with engine.connect() as connection:
             concurrent = (
-                await connection.execute(
-                    text(
-                        f'SELECT status, head_sha, version FROM "{schema}".'
-                        "thread_publication_lineages WHERE id = :id"
-                    ),
-                    {"id": concurrent_id},
+                (
+                    await connection.execute(
+                        text(
+                            f'SELECT status, head_sha, version FROM "{schema}".'
+                            "thread_publication_lineages WHERE id = :id"
+                        ),
+                        {"id": concurrent_id},
+                    )
                 )
-            ).mappings().one()
+                .mappings()
+                .one()
+            )
         assert dict(concurrent) == {
             "status": "open",
             "head_sha": foreign_head,
             "version": 2,
         }
     finally:
-        if schema is not None:
-            async with engine.begin() as connection:
-                await connection.execute(text(f'DROP SCHEMA IF EXISTS "{schema}" CASCADE'))
         await engine.dispose()
 
 
@@ -1847,9 +3149,7 @@ async def test_missing_job_never_overwrites_an_unmarked_lineage_branch_head(
     await loop.reconcile(_work(publication))
 
     assert credentials.calls == [PUBLICATION_ID]
-    assert github.verify_calls == [
-        ("acme-corp/acme-bot", "d" * 40, REVISION_ID, PRIOR_HEAD)
-    ]
+    assert github.verify_calls == [(PUBLICATION_ID, "d" * 40, REVISION_ID, PRIOR_HEAD)]
     assert github.recover_calls == []
     assert cluster.applied == []
     assert store.completed == {}
@@ -1874,14 +3174,8 @@ async def test_exact_marked_remote_revision_is_adopted_before_recreating_a_missi
     await loop.reconcile(work)
 
     assert credentials.calls == [PUBLICATION_ID]
-    assert github.number_calls == [("acme-corp/acme-bot", 123)]
-    assert github.verify_calls == [
-        ("acme-corp/acme-bot", REVISION_HEAD, REVISION_ID, PRIOR_HEAD)
-    ]
-    assert github.authorization_headers == [
-        "Basic publication-write-credential-value",
-        "Basic publication-write-credential-value",
-    ]
+    assert github.number_calls == [(PUBLICATION_ID, 123)]
+    assert github.verify_calls == [(PUBLICATION_ID, REVISION_HEAD, REVISION_ID, PRIOR_HEAD)]
     assert cluster.applied == [], "remote adoption must happen before a replacement Job"
     assert store.completed == {PUBLICATION_ID: ("published", PR_URL)}
     assert loop._lineage.advances[0]["head_sha"] == REVISION_HEAD
@@ -2001,12 +3295,8 @@ async def test_terminal_result_settles_card_with_durable_resolution_identity(
     assert card_update.message.text == "Publish these repository changes?"
     assert card_update.settled.decision == decision
     assert card_update.settled.requested_by == "requester@example.test"
-    assert card_update.settled.resolver == (
-        RESOLVER if decision is not None else None
-    )
-    assert card_update.settled.note == (
-        RESOLUTION_NOTE if decision is not None else None
-    )
+    assert card_update.settled.resolver == (RESOLVER if decision is not None else None)
+    assert card_update.settled.note == (RESOLUTION_NOTE if decision is not None else None)
     # ADR-0179 decision 1: the publication rebuild keeps the time the click
     # stamped, read off the same row; an expiry has no decision time.
     assert decided_at(card_update.message) == (decided if decision is not None else None)
@@ -2185,11 +3475,9 @@ async def test_terminal_job_recovers_exact_marked_revision_after_lost_response(
     loop, store, credentials, cluster, github, replies = _loop(publication)
     github.head_sha = REVISION_HEAD
     github.allow_exact_revision(REVISION_HEAD, REVISION_ID, PRIOR_HEAD)
-    cluster.preexisting_observation = publication.PublicationJobObservation(
-        phase=phase,
-        pr_url=None,
-        pr_number=None,
-        commit_sha=None,
+    cluster.preexisting_observation = _job(
+        publication,
+        phase,
         logs="publication process exited without a marker\n",
         error="job process exited" if phase == "failed" else None,
     )
@@ -2197,14 +3485,8 @@ async def test_terminal_job_recovers_exact_marked_revision_after_lost_response(
     await loop.reconcile(_lineage_work(publication))
 
     assert credentials.calls == [PUBLICATION_ID]
-    assert github.number_calls == [("acme-corp/acme-bot", 123)]
-    assert github.verify_calls == [
-        ("acme-corp/acme-bot", REVISION_HEAD, REVISION_ID, PRIOR_HEAD)
-    ]
-    assert github.authorization_headers == [
-        "Basic publication-write-credential-value",
-        "Basic publication-write-credential-value",
-    ]
+    assert github.number_calls == [(PUBLICATION_ID, 123)]
+    assert github.verify_calls == [(PUBLICATION_ID, REVISION_HEAD, REVISION_ID, PRIOR_HEAD)]
     assert cluster.applied == []
     assert store.completed == {PUBLICATION_ID: ("published", PR_URL)}
     assert PR_URL in replies.events[0][0].text
@@ -2214,15 +3496,14 @@ async def test_running_job_is_validated_without_redeeming_another_credential(
     publication: Any,
 ) -> None:
     loop, store, credentials, cluster, github, replies = _loop(publication)
-    cluster.preexisting_observation = publication.PublicationJobObservation(
-        phase="running", pr_url=None, logs=""
-    )
+    cluster.preexisting_observation = _job(publication, "running")
 
     await loop.reconcile(_work(publication))
 
     assert len(cluster.validated_existing) == 1
     assert credentials.calls == []
-    assert github.number_calls == []
+    assert github.calls == ["read_branch_head"]
+    assert store.releases == [PUBLICATION_ID]
     assert cluster.applied == []
     assert store.completed == {}
     assert replies.events == []
@@ -2257,17 +3538,13 @@ async def test_credential_setup_failure_is_bounded_and_terminalized(publication:
     store.retry_terminal_after = 2
 
     await loop.reconcile(work)
-    assert store.retries == [
-        (PUBLICATION_ID, "publication credential endpoint is unreachable")
-    ]
+    assert store.retries == [(PUBLICATION_ID, "publication credential endpoint is unreachable")]
     assert store.completed == {}
     assert replies.events == []
 
     await loop.reconcile(work)
     assert store.completed == {PUBLICATION_ID: ("failed", None)}
-    assert store.failures == [
-        (PUBLICATION_ID, "publication credential endpoint is unreachable")
-    ]
+    assert store.failures == [(PUBLICATION_ID, "publication credential endpoint is unreachable")]
     assert cluster.applied == []
     assert github.number_calls == []
     assert "failed safely" in replies.events[0][0].text.lower()
@@ -2297,12 +3574,8 @@ async def test_unvalidated_terminal_marker_cannot_bypass_resource_adoption(
     publication: Any,
 ) -> None:
     k8s = importlib.import_module("curie_worker.publication_k8s")
-    loop, store, _, cluster, _, replies = _loop(publication)
-    cluster.preexisting_observation = publication.PublicationJobObservation(
-        phase="succeeded",
-        pr_url="https://github.com/other-corp/other-repo/pull/9",
-        logs="CURIE_PR_URL=https://github.com/other-corp/other-repo/pull/9\n",
-    )
+    loop, store, credentials, cluster, github, replies = _loop(publication)
+    cluster.preexisting_observation = _job(publication, "succeeded", commit_sha=REVISION_HEAD)
     cluster.apply_error = k8s.PublicationResourceError(
         "existing publication Job metadata contract does not match"
     )
@@ -2310,50 +3583,639 @@ async def test_unvalidated_terminal_marker_cannot_bypass_resource_adoption(
     await loop.reconcile(_work(publication))
 
     assert len(cluster.validated_existing) == 1
+    assert github.calls == ["read_branch_head"], "an unvalidated Job's marker is never trusted"
+    assert credentials.calls == []
     assert cluster.applied == []
     assert store.completed == {}
-    assert len(store.retries) == 1
+    assert store.retries == []
+    assert store.releases == [PUBLICATION_ID]
     assert replies.events == []
 
 
-async def test_foreign_repository_pr_url_is_bounded_instead_of_reported(
+def _rejected_job(
+    module: Any, phase: str = "running", *, job_uid: str | None = "old-job-uid"
+) -> Any:
+    return SimpleNamespace(
+        phase=phase,
+        logs=f"CURIE_COMMIT_SHA={'e' * 40}\nCURIE_PR_URL={PR_URL}\n",
+        commit_sha="e" * 40,
+        exists=True,
+        error=None,
+        transport=None,
+        job_uid=job_uid,
+    )
+
+
+def _reject_existing_job(module: Any, cluster: _Cluster, *, phase: str = "running") -> None:
+    k8s = importlib.import_module("curie_worker.publication_k8s")
+    cluster.code_host = None
+    cluster.preexisting_observation = _rejected_job(module, phase)
+    cluster.apply_error = k8s.PublicationResourceError("old publication resource contract")
+
+
+def _assert_rejected_job_waits(
+    store: _Store,
+    credentials: _Credentials,
+    cluster: _Cluster,
+    github: _CodeHost,
+    replies: _Replies,
+    *,
+    base_reads: int,
+) -> None:
+    assert store.completed == {}
+    assert store.failures == []
+    assert store.retries == []
+    assert store.pending == {}
+    assert store.cleanup_pending == set()
+    assert credentials.calls == []
+    assert github.calls == ["read_branch_head"] * base_reads
+    assert github.branch_calls == [PUBLICATION_ID] * base_reads
+    assert github.number_calls == []
+    assert github.verify_calls == []
+    assert github.recover_calls == []
+    assert github.metadata_calls == []
+    assert cluster.applied == []
+    assert cluster.credentials_cleaned == []
+    assert cluster.terminals_cleaned == []
+    assert replies.events == []
+
+
+async def test_mismatched_existing_job_is_proven_through_github_without_charging(
     publication: Any,
 ) -> None:
-    loop, store, _, cluster, _, replies = _loop(publication)
-    cluster.observation = publication.PublicationJobObservation(
-        phase="succeeded",
-        pr_url="https://github.com/other-corp/other-repo/pull/9",
-        logs="CURIE_PR_URL=https://github.com/other-corp/other-repo/pull/9\n",
-    )
+    loop, store, credentials, cluster, github, replies = _loop(publication)
+    _reject_existing_job(publication, cluster)
+    cluster.preexisting_observation = _rejected_job(publication)
+    cluster.preexisting_observation.logs = ""
+    cluster.preexisting_observation.commit_sha = None
+    cluster.preexisting_observation.transport = _transport()
+    store.retry_terminal_after = 1
+    work = _work(publication)
+    assert github.branch_head is None
+
+    for attempt in range(3):
+        await loop.reconcile(work)
+        _assert_rejected_job_waits(
+            store, credentials, cluster, github, replies, base_reads=attempt + 1
+        )
+    assert len(cluster.validated_existing) == 3
+
+    github.pushed(REVISION_HEAD)
+    await loop.reconcile(work)
+    _assert_rejected_job_waits(store, credentials, cluster, github, replies, base_reads=4)
+
+    cluster.preexisting_observation = _rejected_job(publication, "succeeded")
+    await loop.reconcile(work)
+    _assert_rejected_job_waits(store, credentials, cluster, github, replies, base_reads=5)
+    assert store.releases == [PUBLICATION_ID] * 5
+    job_name = publication.publication_resource_names(PUBLICATION_ID).job
+    assert cluster.quiescence_checks == [(job_name, "old-job-uid")] * 5
+
+    cluster.quiescent = True
+    await loop.reconcile(work)
+
+    assert credentials.calls == [PUBLICATION_ID]
+    assert github.branch_calls == [PUBLICATION_ID] * 7
+    assert github.verify_calls == [(PUBLICATION_ID, REVISION_HEAD, REVISION_ID, PRIOR_HEAD)]
+    assert github.recover_calls == [(PUBLICATION_ID, REVISION_HEAD, False)]
+    assert store.completed == {PUBLICATION_ID: ("published", PR_URL)}
+    assert store.retries == []
+    assert store.failures == []
+    assert cluster.applied == []
+    assert len(cluster.credentials_cleaned) == 1
+    assert len(cluster.terminals_cleaned) == 1
+    assert len(loop._lineage.advances) == 1
+    assert loop._lineage.advances[0]["head_sha"] == REVISION_HEAD
+    assert loop._lineage.advances[0]["pr_url"] == PR_URL
+    assert len(replies.events) == 1
+    assert PR_URL in replies.events[0][0].text
+
+    await loop.reconcile(work)
+    assert github.recover_calls == [(PUBLICATION_ID, REVISION_HEAD, False)]
+    assert len(replies.events) == 1
+    assert cluster.applied == []
+    assert len(cluster.terminals_cleaned) == 1
+
+
+@pytest.mark.parametrize("job_uid", [None, ""])
+async def test_rejected_job_without_a_uid_waits_uncharged(
+    publication: Any, job_uid: str | None
+) -> None:
+    loop, store, credentials, cluster, github, replies = _loop(publication)
+    _reject_existing_job(publication, cluster, phase="succeeded")
+    cluster.preexisting_observation = _rejected_job(publication, "succeeded", job_uid=job_uid)
+    cluster.quiescent = True
 
     await loop.reconcile(_work(publication))
 
-    assert store.completed == {}
-    assert store.retries == [
-        (
-            PUBLICATION_ID,
-            "publication result URL does not belong to the requested repository",
+    _assert_rejected_job_waits(store, credentials, cluster, github, replies, base_reads=1)
+    assert cluster.quiescence_checks == []
+    assert store.releases == [PUBLICATION_ID]
+
+
+@pytest.mark.parametrize("error", [None, RuntimeError("control-plane observation unavailable")])
+async def test_rejected_job_without_quiescence_proof_waits_uncharged(
+    publication: Any, error: Exception | None
+) -> None:
+    loop, store, credentials, cluster, github, replies = _loop(publication)
+    _reject_existing_job(publication, cluster, phase="succeeded")
+    cluster.quiescence_error = error
+    store.retry_terminal_after = 1
+    github.pushed(REVISION_HEAD)
+
+    for attempt in range(3):
+        await loop.reconcile(_work(publication))
+        _assert_rejected_job_waits(
+            store, credentials, cluster, github, replies, base_reads=attempt + 1
         )
-    ]
+
+    assert store.releases == [PUBLICATION_ID] * 3
+    job_name = publication.publication_resource_names(PUBLICATION_ID).job
+    assert cluster.quiescence_checks == [(job_name, "old-job-uid")] * 3
+
+
+@pytest.mark.parametrize("allow_launch", [False, True])
+async def test_tracked_rejected_uid_base_identity_outage_waits_past_escape_bound(
+    publication: Any, allow_launch: bool
+) -> None:
+    loop, store, credentials, cluster, github, replies = _loop(publication)
+    _reject_existing_job(publication, cluster)
+    store.retry_terminal_after = 1
+    work = _work(publication)
+    job_name = publication.publication_resource_names(PUBLICATION_ID).job
+
+    await loop.reconcile(work, allow_launch=allow_launch)
+    _assert_rejected_job_waits(store, credentials, cluster, github, replies, base_reads=1)
+    assert cluster.quiescence_checks == [(job_name, "old-job-uid")]
+    assert store.releases == [PUBLICATION_ID]
+
+    cluster.quiescent = True
+    github.branch_error = PublicationIdentityUnavailable("base identity temporarily unavailable")
+    for attempt in range(_uncharged_bound(publication) + 2):
+        await loop.reconcile(work, allow_launch=allow_launch)
+
+        _assert_rejected_job_waits(
+            store, credentials, cluster, github, replies, base_reads=attempt + 2
+        )
+        assert store.releases == [PUBLICATION_ID] * (attempt + 2)
+        assert cluster.quiescence_checks == [(job_name, "old-job-uid")]
+        assert cluster.observed == [job_name]
+        assert store.lineage_terminals == []
+        assert loop._lineage.advances == []
+
+
+async def test_untracked_base_identity_outage_keeps_ordinary_escape_bound(
+    publication: Any,
+) -> None:
+    loop, store, credentials, cluster, github, replies = _loop(publication)
+    error = "base identity temporarily unavailable"
+    github.branch_error = PublicationIdentityUnavailable(error)
+    work = _work(publication)
+
+    for _ in range(_uncharged_bound(publication)):
+        with pytest.raises(PublicationIdentityUnavailable):
+            await loop.reconcile(work)
+        assert store.retries == []
+        assert store.releases == []
+
+    await loop.reconcile(work)
+
+    assert store.retries == [(PUBLICATION_ID, error)]
+    assert store.completed == {}
+    assert store.lineage_terminals == []
+    assert credentials.calls == []
+    assert cluster.observed == []
+    assert cluster.quiescence_checks == []
+    assert cluster.applied == []
+    assert cluster.credentials_cleaned == []
+    assert cluster.terminals_cleaned == []
+    assert github.verify_calls == []
+    assert github.recover_calls == []
     assert replies.events == []
 
 
-async def test_result_url_accepts_github_canonical_repository_casing(
+@pytest.mark.parametrize("rejected_job", [False, True])
+@pytest.mark.parametrize("stored_pull", [False, True])
+async def test_remote_revision_identity_outage_keeps_bounded_uncharged_retries(
+    publication: Any,
+    monkeypatch: pytest.MonkeyPatch,
+    rejected_job: bool,
+    stored_pull: bool,
+) -> None:
+    loop, store, credentials, cluster, github, replies = _loop(publication)
+    if rejected_job:
+        _reject_existing_job(publication, cluster, phase="succeeded")
+        cluster.quiescent = True
+    github.pushed(REVISION_HEAD)
+    work = _lineage_work(publication) if stored_pull else _work(publication)
+    original_verify = github.verify_revision_commit
+    error = "revision identity temporarily unavailable"
+
+    def unavailable(
+        publication_id: uuid.UUID, commit_sha: str, *, revision_id: uuid.UUID, expected_parent: str
+    ) -> Any:
+        github.verify_calls.append((publication_id, commit_sha, revision_id, expected_parent))
+        raise PublicationIdentityUnavailable(error)
+
+    monkeypatch.setattr(github, "verify_revision_commit", unavailable)
+    for _ in range(_uncharged_bound(publication)):
+        with pytest.raises(PublicationIdentityUnavailable):
+            await loop.reconcile(work)
+        assert store.retries == []
+        assert store.completed == {}
+        assert store.releases == []
+
+    await loop.reconcile(work)
+
+    assert store.retries == [(PUBLICATION_ID, error)]
+    assert store.completed == {}
+    assert store.lineage_terminals == []
+    assert loop._lineage.advances == []
+    assert github.recover_calls == []
+    assert github.verify_calls == [(PUBLICATION_ID, REVISION_HEAD, REVISION_ID, PRIOR_HEAD)] * (
+        _uncharged_bound(publication) + 1
+    )
+    assert credentials.calls == [PUBLICATION_ID] * (_uncharged_bound(publication) + 1)
+    job_name = publication.publication_resource_names(PUBLICATION_ID).job
+    assert cluster.quiescence_checks == (
+        [(job_name, "old-job-uid")] * (_uncharged_bound(publication) + 1) if rejected_job else []
+    )
+    assert cluster.applied == []
+    assert cluster.credentials_cleaned == []
+    assert cluster.terminals_cleaned == []
+    assert replies.events == []
+
+    monkeypatch.setattr(github, "verify_revision_commit", original_verify)
+    await loop.reconcile(work)
+
+    assert store.completed == {PUBLICATION_ID: ("published", PR_URL)}
+    assert len(store.retries) == 1
+    assert len(loop._lineage.advances) == 1
+    assert len(replies.events) == 1
+
+
+async def test_quiescent_rejected_job_with_nothing_pushed_fails_once(publication: Any) -> None:
+    loop, store, credentials, cluster, github, replies = _loop(publication)
+    _reject_existing_job(publication, cluster, phase="failed")
+    cluster.quiescent = True
+    github.recovered_pr_url = None
+    work = _work(publication)
+    error = "publication resources were created by a different Curie release and nothing was pushed"
+
+    await loop.reconcile(work)
+    await loop.reconcile(work)
+
+    assert store.completed == {PUBLICATION_ID: ("failed", None)}
+    assert store.failures == [(PUBLICATION_ID, error)]
+    assert store.retries == []
+    assert credentials.calls == [PUBLICATION_ID]
+    assert github.calls == ["read_branch_head"] * 2
+    assert cluster.applied == []
+    assert len(cluster.credentials_cleaned) == 1
+    assert len(cluster.terminals_cleaned) == 1
+    assert len(replies.events) == 1
+    assert replies.events[0][0].text == f"Publication failed safely after approval: {error}"
+    assert loop._lineage.advances == []
+
+
+@pytest.mark.parametrize("allow_launch", [False, True])
+async def test_rejected_job_checks_remote_branch_when_the_stored_pull_has_the_prior_head(
+    publication: Any, allow_launch: bool
+) -> None:
+    loop, store, credentials, cluster, github, replies = _loop(publication)
+    _reject_existing_job(publication, cluster)
+    work = _lineage_work(publication)
+
+    await loop.reconcile(work, allow_launch=allow_launch)
+    _assert_rejected_job_waits(store, credentials, cluster, github, replies, base_reads=1)
+    assert store.releases == [PUBLICATION_ID]
+
+    cluster.preexisting_observation = _rejected_job(publication, "succeeded")
+    cluster.quiescent = True
+    github.branch_head = REVISION_HEAD
+    github.head_sha = PRIOR_HEAD
+
+    await loop.reconcile(work, allow_launch=allow_launch)
+
+    assert github.number_calls == [(PUBLICATION_ID, 123)]
+    assert github.branch_calls == [PUBLICATION_ID] * 3
+    assert github.verify_calls == [(PUBLICATION_ID, REVISION_HEAD, REVISION_ID, PRIOR_HEAD)]
+    assert github.recover_calls == [(PUBLICATION_ID, REVISION_HEAD, False)]
+    assert store.completed == {PUBLICATION_ID: ("published", PR_URL)}
+    assert store.retries == []
+    assert store.failures == []
+    assert credentials.calls == [PUBLICATION_ID]
+    assert cluster.applied == []
+    assert len(replies.events) == 1
+
+
+async def test_ended_run_with_a_rejected_job_still_requires_quiescence_before_absence(
     publication: Any,
 ) -> None:
-    loop, store, _, cluster, _, replies = _loop(publication)
+    loop, store, credentials, cluster, github, replies = _loop(publication)
+    _reject_existing_job(publication, cluster)
     work = _work(publication)
-    work = publication.PublicationWork(
-        **{**work.__dict__, "repo_full_name": "Acme-Corp/Acme-Bot"}
+
+    await loop.reconcile(work, allow_launch=False)
+    _assert_rejected_job_waits(store, credentials, cluster, github, replies, base_reads=1)
+
+    cluster.preexisting_observation = _rejected_job(publication, "failed")
+    cluster.quiescent = True
+    await loop.reconcile(work, allow_launch=False)
+
+    assert credentials.calls == [PUBLICATION_ID]
+    assert github.branch_calls == [PUBLICATION_ID] * 3
+    assert cluster.applied == []
+    assert store.failures == [
+        (
+            PUBLICATION_ID,
+            "publication resources were created by a different Curie release "
+            "and nothing was pushed",
+        )
+    ]
+    assert store.retries == []
+    assert len(replies.events) == 1
+
+
+@pytest.mark.parametrize("stored_pull", [False, True])
+@pytest.mark.parametrize("failure_site", ["read", "verify", "recover"])
+async def test_quiescent_rejected_job_remote_errors_are_never_absence(
+    publication: Any, monkeypatch: pytest.MonkeyPatch, stored_pull: bool, failure_site: str
+) -> None:
+    loop, store, credentials, cluster, github, replies = _loop(publication)
+    _reject_existing_job(publication, cluster, phase="succeeded")
+    cluster.quiescent = True
+    github.pushed(REVISION_HEAD)
+    work = _lineage_work(publication) if stored_pull else _work(publication)
+    if failure_site == "recover" and stored_pull:
+        work = _work(publication)
+    method = {
+        "read": "read_pull_request" if stored_pull else "read_branch_head",
+        "verify": "verify_revision_commit",
+        "recover": "recover_pull_request",
+    }[failure_site]
+
+    original = getattr(github, method)
+    reads = 0
+
+    def unavailable(*args: Any, **kwargs: Any) -> Any:
+        nonlocal reads
+        reads += 1
+        if method == "read_branch_head" and reads == 1:
+            return original(*args, **kwargs)
+        raise publication.PublicationReconcileError("remote observation unavailable")
+
+    monkeypatch.setattr(github, method, unavailable)
+    await loop.reconcile(work)
+
+    job_name = publication.publication_resource_names(PUBLICATION_ID).job
+    assert cluster.quiescence_checks == [(job_name, "old-job-uid")]
+    assert credentials.calls == [PUBLICATION_ID]
+    assert len(store.retries) == 1
+    assert "nothing was pushed" not in store.retries[0][1]
+    assert store.completed == {}
+    assert store.failures == []
+    assert loop._lineage.advances == []
+    assert cluster.applied == []
+    assert cluster.credentials_cleaned == []
+    assert cluster.terminals_cleaned == []
+    assert replies.events == []
+
+
+@pytest.mark.parametrize("stored_pull", [False, True])
+async def test_quiescent_rejected_job_refuses_foreign_credential_repository(
+    publication: Any, monkeypatch: pytest.MonkeyPatch, stored_pull: bool
+) -> None:
+    loop, store, credentials, cluster, github, replies = _loop(publication)
+    _reject_existing_job(publication, cluster, phase="succeeded")
+    github.pushed(REVISION_HEAD)
+    work = _lineage_work(publication) if stored_pull else _work(publication)
+    credential = replace(
+        _credential(publication, "Basic publication-write-credential-value"),
+        clean_clone_url=f"{ORIGIN}/acme-corp/other-bot.git",
     )
-    cluster.observation = publication.PublicationJobObservation(
-        phase="succeeded", pr_url=PR_URL, logs=f"CURIE_PR_URL={PR_URL}\n"
+
+    def redeem(publication_id: uuid.UUID) -> Any:
+        credentials.calls.append(publication_id)
+        return credential
+
+    monkeypatch.setattr(credentials, "redeem", redeem)
+
+    await loop.reconcile(work)
+    _assert_rejected_job_waits(store, credentials, cluster, github, replies, base_reads=1)
+    job_name = publication.publication_resource_names(PUBLICATION_ID).job
+    assert cluster.quiescence_checks == [(job_name, "old-job-uid")]
+
+    cluster.quiescent = True
+    await loop.reconcile(work)
+
+    assert cluster.quiescence_checks == [(job_name, "old-job-uid")] * 2
+    assert credentials.calls == [PUBLICATION_ID]
+    assert store.retries == [
+        (PUBLICATION_ID, "publication clone URL does not match the requested repository")
+    ]
+    assert store.completed == {}
+    assert store.failures == []
+    assert store.pending == {}
+    assert store.cleanup_pending == set()
+    assert loop._lineage.advances == []
+    assert github.calls == ["read_branch_head"] * 2
+    assert cluster.applied == []
+    assert cluster.credentials_cleaned == []
+    assert cluster.terminals_cleaned == []
+    assert replies.events == []
+
+
+@pytest.mark.parametrize("stored_pull", [False, True])
+@pytest.mark.parametrize("foreign", ["repository", "branch", "head", "revision", "parent"])
+async def test_quiescent_rejected_job_refuses_foreign_remote_identity(
+    publication: Any, monkeypatch: pytest.MonkeyPatch, foreign: str, stored_pull: bool
+) -> None:
+    loop, store, credentials, cluster, github, replies = _loop(publication)
+    _reject_existing_job(publication, cluster, phase="succeeded")
+    cluster.quiescent = True
+    github.pushed(REVISION_HEAD)
+    work = _lineage_work(publication) if stored_pull else _work(publication)
+    if foreign == "repository":
+        advance = loop._lineage.advance
+        refusal = (
+            "publication lineage advance was refused: "
+            "pull request identity does not match the publication repository"
+        )
+
+        def advance_authorized_identity(publication_id: uuid.UUID, **identity: Any) -> None:
+            # curie_api.crud.lineages.publication_lineage_outcome_conflict compares
+            # the supplied URL with the authorized lineage's canonical URL.
+            if identity["pr_url"].casefold() != PR_URL.casefold():
+                raise PublicationLineageRefused(refusal)
+            advance(publication_id, **identity)
+
+        monkeypatch.setattr(loop._lineage, "advance", advance_authorized_identity)
+        github.pr_url = "https://github.com/acme-corp/other-bot/pull/123"
+        github.recovered_pr_url = github.pr_url
+    elif foreign == "branch":
+        github.head_ref = "curie/another-lineage"
+    elif foreign == "head":
+        github.head_sha = "c" * 40
+        github.recovered_head_sha = "c" * 40
+    elif foreign == "revision":
+        github.allowed_revisions = {(REVISION_HEAD, uuid.UUID(int=99), PRIOR_HEAD): PRIOR_HEAD}
+    else:
+        github.allowed_revisions = {(REVISION_HEAD, REVISION_ID, "c" * 40): "c" * 40}
+
+    await loop.reconcile(work)
+
+    job_name = publication.publication_resource_names(PUBLICATION_ID).job
+    assert cluster.quiescence_checks == [(job_name, "old-job-uid")]
+    assert credentials.calls == [PUBLICATION_ID]
+    assert len(store.retries) == 1
+    assert "nothing was pushed" not in store.retries[0][1]
+    assert store.completed == {}
+    assert store.failures == []
+    assert store.pending == {}
+    assert store.cleanup_pending == set()
+    assert loop._lineage.advances == []
+    assert cluster.applied == []
+    assert cluster.credentials_cleaned == []
+    assert cluster.terminals_cleaned == []
+    assert replies.events == []
+    if foreign in {"revision", "parent"}:
+        assert github.verify_calls == [(PUBLICATION_ID, REVISION_HEAD, REVISION_ID, PRIOR_HEAD)]
+        assert github.recover_calls == []
+    elif foreign == "repository" and not stored_pull:
+        assert github.recover_calls == [(PUBLICATION_ID, REVISION_HEAD, False)]
+        assert store.retries == [(PUBLICATION_ID, refusal)]
+
+    if foreign == "repository":
+        github.pr_url = PR_URL
+        github.recovered_pr_url = PR_URL
+        await loop.reconcile(work)
+
+        assert credentials.calls == [PUBLICATION_ID] * 2
+        assert store.completed == {PUBLICATION_ID: ("published", PR_URL)}
+        assert len(store.retries) == 1
+        assert store.failures == []
+        assert cluster.applied == []
+        assert len(cluster.credentials_cleaned) == 1
+        assert len(cluster.terminals_cleaned) == 1
+        assert len(loop._lineage.advances) == 1
+        assert loop._lineage.advances[0]["pr_url"] == PR_URL
+        assert loop._lineage.advances[0]["head_sha"] == REVISION_HEAD
+        assert len(replies.events) == 1
+        assert PR_URL in replies.events[0][0].text
+
+
+@pytest.mark.parametrize("stored_pull", [False, True])
+async def test_quiescent_rejected_job_recovers_api_approved_bitbucket_dc_identity(
+    publication: Any, monkeypatch: pytest.MonkeyPatch, stored_pull: bool
+) -> None:
+    loop, store, credentials, cluster, github, replies = _loop(publication)
+    _reject_existing_job(publication, cluster, phase="succeeded")
+    github.pushed(REVISION_HEAD)
+    # curie_api.forges.bitbucket_dc.connection.BitbucketDcConnection uses /scm.
+    # Clone and web paths follow forge_fakes/bitbucket_dc_captures/pull-request.json.
+    origin = "https://bitbucket.example.com/scm"
+    repository = "ACME/acme-bot"
+    clone_url = f"{origin}/{repository}.git"
+    pr_url = "https://bitbucket.example.com/projects/ACME/repos/acme-bot/pull-requests/123"
+    credential = publication.PublicationCredential(
+        clean_clone_url=clone_url,
+        authorization_header="Bearer publication-write-credential-value",
+        origin=origin,
+        header_form="authorization_bearer",
+    )
+
+    def redeem(publication_id: uuid.UUID) -> Any:
+        credentials.calls.append(publication_id)
+        return credential
+
+    monkeypatch.setattr(credentials, "redeem", redeem)
+    github.pr_url = pr_url
+    github.recovered_pr_url = pr_url
+    work = replace(
+        _lineage_work(publication, pr_url=pr_url) if stored_pull else _work(publication),
+        repo_full_name=repository,
+    )
+
+    await loop.reconcile(work)
+    _assert_rejected_job_waits(store, credentials, cluster, github, replies, base_reads=1)
+
+    cluster.quiescent = True
+    await loop.reconcile(work)
+
+    job_name = publication.publication_resource_names(PUBLICATION_ID).job
+    assert cluster.quiescence_checks == [(job_name, "old-job-uid")] * 2
+    assert credentials.calls == [PUBLICATION_ID]
+    assert github.branch_calls == [PUBLICATION_ID] * 3
+    assert github.verify_calls == [(PUBLICATION_ID, REVISION_HEAD, REVISION_ID, PRIOR_HEAD)]
+    assert github.number_calls == ([(PUBLICATION_ID, 123)] if stored_pull else [])
+    assert github.recover_calls == ([] if stored_pull else [(PUBLICATION_ID, REVISION_HEAD, False)])
+    assert store.completed == {PUBLICATION_ID: ("published", pr_url)}
+    assert store.failures == []
+    assert store.retries == []
+    assert store.releases == [PUBLICATION_ID]
+    assert cluster.applied == []
+    assert len(cluster.credentials_cleaned) == 1
+    assert len(cluster.terminals_cleaned) == 1
+    assert len(loop._lineage.advances) == 1
+    assert loop._lineage.advances[0]["head_sha"] == REVISION_HEAD
+    assert loop._lineage.advances[0]["pr_url"] == pr_url
+    assert len(replies.events) == 1
+    assert pr_url in replies.events[0][0].text
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "http://github.com/acme-corp/acme-bot/pull/123",
+        "https://token@github.com/acme-corp/acme-bot/pull/123",
+        "https://github.com/acme-corp/acme-bot/pull/9",
+    ],
+)
+async def test_unclean_api_pull_request_url_is_bounded_instead_of_reported(
+    publication: Any, url: str
+) -> None:
+    loop, store, _, cluster, github, replies = _loop(publication)
+    github.recovered_pr_url = url
+
+    await loop.reconcile(_work(publication))
+
+    assert github.recover_calls == [(PUBLICATION_ID, REVISION_HEAD, False)]
+    assert store.completed == {}
+    assert loop._lineage.advances == []
+    assert store.retries == [(PUBLICATION_ID, "the pull request URL is not a clean HTTPS URL")]
+    assert replies.events == []
+
+
+async def test_stored_pull_url_comparison_accepts_canonical_casing(
+    publication: Any,
+) -> None:
+    loop, store, _, _, github, replies = _loop(publication)
+    work = replace(
+        _lineage_work(publication),
+        repo_full_name="Acme-Corp/Acme-Bot",
+        pr_url="https://github.com/Acme-Corp/Acme-Bot/pull/123",
     )
 
     await loop.reconcile(work)
 
+    assert github.number_calls == [(PUBLICATION_ID, 123), (PUBLICATION_ID, 123)]
     assert store.completed == {PUBLICATION_ID: ("published", PR_URL)}
     assert PR_URL in replies.events[0][0].text
+
+
+async def test_stored_pull_url_changed_by_the_api_is_bounded(publication: Any) -> None:
+    loop, store, credentials, cluster, github, replies = _loop(publication)
+    github.pr_url = "https://github.com/acme-corp/other-bot/pull/123"
+
+    await loop.reconcile(_lineage_work(publication))
+
+    assert credentials.calls == [PUBLICATION_ID]
+    assert cluster.applied == []
+    assert store.retries == [
+        (PUBLICATION_ID, "pull request URL no longer matches the stored lineage identity")
+    ]
+    assert replies.events == []
 
 
 async def test_repeated_apiserver_failure_after_apply_is_dead_lettered(
@@ -2474,25 +4336,20 @@ _JOB_FAILURE = (
     "fatal: repository 'https://github.com/o/r.git/' not found"
 )
 _NO_PUSH_SENTENCE = (
-    "Nothing was pushed to acme-corp/acme-bot; "
-    "ask again to request a new publication approval."
+    "Nothing was pushed to acme-corp/acme-bot; ask again to request a new publication approval."
 )
 
 
 def _failed_unmarked_job(module: Any) -> Any:
-    return module.PublicationJobObservation(
-        phase="failed",
-        pr_url=None,
-        pr_number=None,
-        commit_sha=None,
+    return _job(
+        module,
+        "failed",
         logs="fatal: repository 'https://github.com/o/r.git/' not found\n",
         error=_JOB_FAILURE,
     )
 
 
-def _assert_terminal_no_push_failure(
-    store: _Store, cluster: _Cluster, replies: _Replies
-) -> None:
+def _assert_terminal_no_push_failure(store: _Store, cluster: _Cluster, replies: _Replies) -> None:
     assert store.retries == [], "a proven no-push failure must not burn retries"
     assert store.completed == {PUBLICATION_ID: ("failed", None)}
     assert len(store.failures) == 1
@@ -2518,7 +4375,7 @@ async def test_failed_first_revision_job_with_no_push_terminalizes_on_first_reco
     await loop.reconcile(_work(publication))
 
     assert len(cluster.validated_existing) == 1
-    assert github.branch_calls == [("acme-corp/acme-bot", LINEAGE_BRANCH)]
+    assert github.branch_calls == [PUBLICATION_ID, PUBLICATION_ID]
     _assert_terminal_no_push_failure(store, cluster, replies)
 
     await loop.reconcile(_work(publication))
@@ -2535,28 +4392,26 @@ async def test_failed_lineage_job_with_unmoved_pr_head_terminalizes_on_first_rec
 
     await loop.reconcile(_lineage_work(publication))
 
-    assert github.number_calls == [("acme-corp/acme-bot", 123)]
+    assert github.number_calls == [(PUBLICATION_ID, 123)]
     assert github.verify_calls == []
     _assert_terminal_no_push_failure(store, cluster, replies)
 
 
-async def test_failed_job_with_complete_push_markers_still_publishes(
+async def test_failed_job_with_a_commit_marker_still_publishes(
     publication: Any,
 ) -> None:
     loop, store, credentials, cluster, github, replies = _loop(publication)
-    cluster.preexisting_observation = publication.PublicationJobObservation(
-        phase="failed",
-        pr_url=PR_URL,
-        pr_number=123,
+    cluster.preexisting_observation = _job(
+        publication,
+        "failed",
         commit_sha=REVISION_HEAD,
-        logs=(
-            f"CURIE_PR_URL={PR_URL}\n"
-            f"CURIE_PR_NUMBER=123\nCURIE_COMMIT_SHA={REVISION_HEAD}\n"
-        ),
         error="BackoffLimitExceeded: Job has reached the specified backoff limit",
     )
 
     await loop.reconcile(_work(publication))
+
+    assert credentials.calls == []
+    assert github.calls == ["read_branch_head", "verify_revision_commit", "recover_pull_request"]
 
     assert store.completed == {PUBLICATION_ID: ("published", PR_URL)}
     assert store.failures == []
@@ -2605,13 +4460,13 @@ def _uncharged_bound(module: Any) -> int:
     return int(module._MAX_UNCHARGED_IDENTITY_ESCAPES)
 
 
-def _recovery_work(module: Any, cluster: _Cluster, github: _GitHub) -> Any:
+def _recovery_work(module: Any, cluster: _Cluster, github: _CodeHost) -> Any:
     github.branch_head = REVISION_HEAD
     github.allow_exact_revision(REVISION_HEAD, REVISION_ID, PRIOR_HEAD)
     return _work(module)
 
 
-def _later_revision_work(module: Any, cluster: _Cluster, github: _GitHub) -> Any:
+def _later_revision_work(module: Any, cluster: _Cluster, github: _CodeHost) -> Any:
     github.head_sha = PRIOR_HEAD
     return _lineage_work(module)
 
@@ -2641,42 +4496,612 @@ async def test_lineage_advance_carries_the_publication_lease_fence(
     assert store.completed == {PUBLICATION_ID: ("published", PR_URL)}
 
 
-async def test_metadata_only_job_forwards_update_marker_to_lineage_authority(
+def _metadata_work(module: Any, **changes: Any) -> Any:
+    return replace(_lineage_work(module), patch=b"", changed_paths=(), **changes)
+
+
+async def test_metadata_only_revision_runs_no_job_and_records_api_update_time(
+    publication: Any,
+) -> None:
+    lineage = _Lineage()
+    loop, store, credentials, cluster, github, replies = _loop(publication, lineage=lineage)
+
+    await loop.reconcile(_metadata_work(publication))
+
+    assert github.calls == ["update_pull_request_metadata"]
+    assert github.metadata_calls == [PUBLICATION_ID]
+    assert github.branch_calls == []
+    assert github.verify_calls == []
+    assert credentials.calls == [], "nothing is pushed, so no credential is redeemed"
+    assert cluster.observed == []
+    assert cluster.applied == []
+    assert lineage.advances == [
+        {
+            "publication_id": PUBLICATION_ID,
+            "expected_version": 2,
+            "expected_head_sha": PRIOR_HEAD,
+            "expected_publication_version": 1,
+            "lease_owner": "publication-loop-test",
+            "pr_number": 123,
+            "pr_url": PR_URL,
+            "head_sha": PRIOR_HEAD,
+            "metadata_updated_at": METADATA_UPDATED_AT,
+        }
+    ]
+    assert store.completed == {PUBLICATION_ID: ("published", PR_URL)}
+    assert PR_URL in replies.events[0][0].text
+
+
+async def test_refused_metadata_update_is_a_bounded_retry_then_terminal(
+    publication: Any,
+) -> None:
+    loop, store, credentials, cluster, github, replies = _loop(publication)
+    github.metadata_error = PublicationReconcileError(
+        "the code host refused the pull request metadata update"
+    )
+    store.retry_terminal_after = 2
+    work = _metadata_work(publication)
+
+    await loop.reconcile(work)
+
+    assert store.retries == [
+        (PUBLICATION_ID, "the code host refused the pull request metadata update")
+    ]
+    assert store.completed == {}
+    assert replies.events == []
+
+    await loop.reconcile(work)
+
+    assert github.metadata_calls == [PUBLICATION_ID, PUBLICATION_ID]
+    assert store.completed == {PUBLICATION_ID: ("failed", None)}
+    assert loop._lineage.advances == []
+    assert credentials.calls == []
+    assert cluster.applied == []
+    assert "failed safely" in replies.events[0][0].text.lower()
+
+
+async def test_unavailable_metadata_update_escapes_uncharged_then_charges(
+    publication: Any,
+) -> None:
+    loop, store, _, _, github, _ = _loop(publication)
+    github.metadata_error = PublicationIdentityUnavailable(
+        "the code host is temporarily unavailable"
+    )
+    work = _metadata_work(publication)
+
+    for _ in range(_uncharged_bound(publication)):
+        with pytest.raises(PublicationIdentityUnavailable):
+            await loop.reconcile(work)
+        assert store.retries == []
+
+    await loop.reconcile(work)
+
+    assert store.retries == [(PUBLICATION_ID, "the code host is temporarily unavailable")]
+
+
+@pytest.mark.parametrize(
+    ("change", "error"),
+    [
+        (
+            {"metadata_updated_at": None},
+            "metadata-only publication has no code host update time",
+        ),
+        (
+            {"pr_url": "https://github.com/acme-corp/other-bot/pull/123"},
+            "pull request URL no longer matches the stored lineage identity",
+        ),
+        (
+            {"metadata_head_sha": "d" * 40},
+            "pull request head does not match the pushed publication commit",
+        ),
+    ],
+)
+async def test_untrusted_metadata_update_answer_is_bounded(
+    publication: Any, change: dict[str, Any], error: str
+) -> None:
+    loop, store, _, _, github, replies = _loop(publication)
+    for name, value in change.items():
+        setattr(github, name, value)
+
+    await loop.reconcile(_metadata_work(publication))
+
+    assert github.metadata_calls == [PUBLICATION_ID]
+    assert store.retries == [(PUBLICATION_ID, error)]
+    assert store.completed == {}
+    assert loop._lineage.advances == []
+    assert replies.events == []
+
+
+async def test_metadata_only_revision_without_a_stored_pull_is_bounded(
+    publication: Any,
+) -> None:
+    loop, store, _, cluster, github, _ = _loop(publication)
+
+    await loop.reconcile(_metadata_work(publication, pr_number=None, pr_url=None))
+
+    assert github.calls == []
+    assert cluster.applied == []
+    assert store.retries == [
+        (PUBLICATION_ID, "metadata-only publication requires a stored pull request")
+    ]
+
+
+@pytest.mark.parametrize("terminal_state", ["closed", "merged"])
+async def test_metadata_update_on_a_terminal_pull_records_the_lineage_terminal(
+    publication: Any, terminal_state: str
+) -> None:
+    loop, store, _, _, github, replies = _loop(publication)
+    github.metadata_state = terminal_state
+    github.metadata_updated_at = None
+
+    await loop.reconcile(_metadata_work(publication))
+
+    assert store.lineage_terminals == [
+        {
+            "lineage_id": LINEAGE_ID,
+            "expected_version": 2,
+            "expected_stored_head": PRIOR_HEAD,
+            "state": terminal_state,
+            "pr_number": 123,
+            "pr_url": PR_URL,
+            "head_sha": PRIOR_HEAD,
+            "publication_id": PUBLICATION_ID,
+            "expected_publication_version": 1,
+            "lease_owner": "publication-loop-test",
+            "first_parent_sha": None,
+        }
+    ]
+    assert store.retries == [
+        (PUBLICATION_ID, f"pull request lineage is {terminal_state}; start a new thread")
+    ]
+    assert loop._lineage.advances == []
+    assert replies.events == []
+
+
+async def test_metadata_only_revision_after_the_run_ended_fails_without_an_update(
+    publication: Any,
+) -> None:
+    loop, store, _, _, github, _ = _loop(publication)
+
+    await loop.reconcile(_metadata_work(publication), allow_launch=False)
+
+    assert github.calls == []
+    assert store.completed == {PUBLICATION_ID: ("failed", None)}
+    assert store.failures == [(PUBLICATION_ID, "the factory run already ended")]
+
+
+async def test_post_push_recover_opens_the_pull_when_none_is_stored(
+    publication: Any,
+) -> None:
+    """With no stored pull request the API finds or opens one for the pushed commit."""
+
+    lineage = _Lineage()
+    loop, store, _, cluster, github, _ = _loop(publication, lineage=lineage)
+    github.recovered_pr_url = None
+    opened: list[str] = []
+
+    def recover(publication_id: uuid.UUID, *, expected_head_sha: str, adopt_only: bool) -> Any:
+        github.calls.append("recover_pull_request")
+        assert adopt_only is False
+        assert github.branch_head == expected_head_sha, "recovery runs only after the push"
+        opened.append(expected_head_sha)
+        return publication.PublicationPullState(
+            number=123,
+            url=PR_URL,
+            state="open",
+            head_sha=expected_head_sha,
+            head_ref=LINEAGE_BRANCH,
+        )
+
+    github.recover_pull_request = recover  # type: ignore[method-assign]
+
+    await loop.reconcile(_work(publication))
+
+    assert github.calls == [
+        "read_branch_head",
+        "read_branch_head",
+        "verify_revision_commit",
+        "recover_pull_request",
+    ]
+    assert opened == [REVISION_HEAD]
+    assert len(cluster.applied) == 1
+    assert [(a["pr_number"], a["head_sha"]) for a in lineage.advances] == [(123, REVISION_HEAD)]
+    assert store.completed == {PUBLICATION_ID: ("published", PR_URL)}
+
+
+async def test_post_push_absent_pull_request_is_bounded(publication: Any) -> None:
+    loop, store, _, _, github, replies = _loop(publication)
+    github.recovered_pr_url = None
+
+    await loop.reconcile(_work(publication))
+
+    assert github.recover_calls == [(PUBLICATION_ID, REVISION_HEAD, False)]
+    assert store.retries == [
+        (PUBLICATION_ID, "the pushed publication branch is absent on the code host")
+    ]
+    assert store.completed == {}
+    assert replies.events == []
+
+
+async def test_unproven_job_commit_marker_is_bounded_before_any_pull_read(
+    publication: Any,
+) -> None:
+    loop, store, _, cluster, github, replies = _loop(publication)
+    cluster.observation = _job(publication, "succeeded", commit_sha="e" * 40)
+
+    await loop.reconcile(_work(publication))
+
+    assert github.verify_calls == [(PUBLICATION_ID, "e" * 40, REVISION_ID, PRIOR_HEAD)]
+    assert github.recover_calls == []
+    assert github.number_calls == []
+    assert loop._lineage.advances == []
+    assert store.retries == [
+        (
+            PUBLICATION_ID,
+            "remote head is not this revision's marked commit with expected parent",
+        )
+    ]
+    assert replies.events == []
+
+
+async def test_post_push_stored_pull_is_read_again_and_published(
     publication: Any,
 ) -> None:
     lineage = _Lineage()
     loop, store, _, cluster, github, _ = _loop(publication, lineage=lineage)
-    import hashlib
 
-    original = _lineage_work(publication)
-    work = replace(
-        original,
-        patch=b"",
-        changed_paths=(),
-        observed_title_sha256=hashlib.sha256(original.title.encode()).hexdigest(),
-        observed_body_sha256=hashlib.sha256(original.body.encode()).hexdigest(),
-    )
-    cluster.active_jobs.add(publication.publication_resource_names(PUBLICATION_ID).job)
-    github.head_sha = PRIOR_HEAD
-    marker_time = datetime.fromisoformat("2026-09-25T12:34:56+00:00")
-    cluster.observation = publication.PublicationJobObservation(
-        phase="succeeded",
-        pr_url=PR_URL,
-        pr_number=123,
-        commit_sha=PRIOR_HEAD,
-        logs=(
-            f"CURIE_PR_UPDATED_AT={marker_time.isoformat()}\n"
-            f"CURIE_PR_URL={PR_URL}\n"
-            f"CURIE_PR_NUMBER=123\nCURIE_COMMIT_SHA={PRIOR_HEAD}\n"
-        ),
+    await loop.reconcile(_lineage_work(publication))
+
+    assert github.calls == [
+        "read_branch_head",
+        "read_pull_request",
+        "verify_revision_commit",
+        "read_pull_request",
+    ]
+    assert github.recover_calls == []
+    assert len(cluster.applied) == 1
+    assert [a["head_sha"] for a in lineage.advances] == [REVISION_HEAD]
+    assert store.completed == {PUBLICATION_ID: ("published", PR_URL)}
+
+
+async def test_adopting_an_existing_job_validates_its_transport_without_redeeming(
+    publication: Any,
+) -> None:
+    loop, store, credentials, cluster, github, _ = _loop(publication)
+    enterprise = "https://git.example.test/forge"
+    cluster.preexisting_observation = _job(
+        publication,
+        "running",
+        transport=_transport(enterprise, "private_token"),
     )
 
+    await loop.reconcile(_work(publication))
+
+    assert credentials.calls == []
+    assert len(cluster.validated_existing) == 1
+    env = _job_env(cluster.validated_existing[0])
+    assert env["CODE_HOST_ORIGIN"] == enterprise
+    assert env["CODE_HOST_HEADER_FORM"] == "private_token"
+    assert env["CLEAN_CLONE_URL"] == f"{enterprise}/acme-corp/acme-bot.git"
+    assert cluster.applied == []
+    assert github.calls == ["read_branch_head"]
+    assert store.releases == [PUBLICATION_ID]
+
+
+@pytest.mark.parametrize("base_branch", ["main", "next", "release/example"])
+@pytest.mark.parametrize("existing", [False, True])
+async def test_api_base_branch_reaches_fresh_and_adopted_jobs(
+    publication: Any, base_branch: str, existing: bool
+) -> None:
+    loop, store, credentials, cluster, github, _ = _loop(publication)
+    github.base_branch = base_branch
+    if existing:
+        cluster.preexisting_observation = _job(publication, "running")
+    else:
+        cluster.observation = _job(publication, "running")
+
+    await loop.reconcile(_work(publication))
+
+    resources = cluster.validated_existing if existing else cluster.applied
+    assert len(resources) == 1
+    assert _job_env(resources[0])["BASE_BRANCH"] == base_branch
+    assert _job_env(resources[0])["BASE_SHA"] == PRIOR_HEAD
+    assert credentials.calls == ([] if existing else [PUBLICATION_ID])
+    assert store.retries == []
+    assert store.releases == [PUBLICATION_ID]
+
+
+@pytest.mark.parametrize("owner_running", [False, True])
+async def test_branch_context_failure_cannot_adopt_a_job_or_trust_its_marker(
+    publication: Any, owner_running: bool
+) -> None:
+    loop, store, credentials, cluster, github, replies = _loop(publication)
+    cluster.preexisting_observation = _job(publication, "succeeded", commit_sha=REVISION_HEAD)
+    github.branch_error = PublicationReconcileError("authoritative base branch is unavailable")
+    work = replace(_work(publication), owner_running=owner_running)
+
+    await loop.reconcile(work, allow_launch=owner_running)
+
+    assert cluster.validated_existing == []
+    assert cluster.applied == []
+    assert credentials.calls == []
+    assert github.verify_calls == []
+    assert github.recover_calls == []
+    assert store.completed == {}
+    assert store.lineage_terminals == []
+    assert loop._lineage.advances == []
+    assert replies.events == []
+    assert len(store.retries) == 1
+    assert "authoritative base branch" in store.retries[0][1]
+
+    github.branch_error = None
+    await loop.reconcile(work, allow_launch=owner_running)
+
+    assert len(cluster.validated_existing) == 1
+    assert store.completed == {PUBLICATION_ID: ("published", PR_URL)}
+    assert credentials.calls == []
+
+
+async def test_branch_context_change_during_fresh_setup_is_refused_then_can_retry(
+    publication: Any,
+) -> None:
+    loop, store, credentials, cluster, github, replies = _loop(publication)
+    github.branch_contexts = [
+        publication.PublicationBranchHead(head_sha=None, base_branch="main"),
+        publication.PublicationBranchHead(head_sha=None, base_branch="next"),
+    ]
+
+    await loop.reconcile(_work(publication))
+
+    assert github.branch_calls == [PUBLICATION_ID, PUBLICATION_ID]
+    assert cluster.applied == []
+    assert github.verify_calls == []
+    assert github.recover_calls == []
+    assert store.completed == {}
+    assert loop._lineage.advances == []
+    assert replies.events == []
+    assert len(store.retries) == 1
+
+    await loop.reconcile(_work(publication))
+
+    assert len(cluster.applied) == 1
+    assert _job_env(cluster.applied[0])["BASE_BRANCH"] == "main"
+    assert store.completed == {PUBLICATION_ID: ("published", PR_URL)}
+
+
+@pytest.mark.parametrize("mutation", ["missing", "changed"])
+async def test_adoption_checks_api_branch_before_consuming_a_job_commit_marker(
+    publication: Any, mutation: str
+) -> None:
+    k8s = importlib.import_module("curie_worker.publication_k8s")
+    loop, store, credentials, cluster, github, replies = _loop(publication)
+    work = _work(publication)
+    expected = k8s.build_publication_resources(
+        loop._payload(work, _transport(), base_branch="main"),
+        credential="validation-placeholder",
+        settings=loop._job_settings,
+    )
+    observed = deepcopy(expected.job)
+    env = observed["spec"]["template"]["spec"]["containers"][0]["env"]
+    item = next(item for item in env if item["name"] == "BASE_BRANCH")
+    if mutation == "missing":
+        env.remove(item)
+    else:
+        item["value"] = "next"
+    cluster.code_host = None
+    cluster.preexisting_observation = replace(
+        _job(publication, "succeeded", commit_sha="e" * 40), job_uid="old-job-uid"
+    )
+
+    def validate(resources: Any) -> None:
+        cluster.validated_existing.append(resources)
+        k8s.validate_adopted_resource("Job", resources.job, observed)
+
+    cluster.validate_existing = validate  # type: ignore[method-assign]
     await loop.reconcile(work)
 
-    assert len(lineage.advances) == 1
-    assert lineage.advances[0]["head_sha"] == PRIOR_HEAD
-    assert lineage.advances[0]["metadata_updated_at"] == marker_time
+    assert len(cluster.validated_existing) == 1
+    assert credentials.calls == []
+    assert github.verify_calls == []
+    assert github.recover_calls == []
+    assert store.completed == {}
+    assert store.lineage_terminals == []
+    assert loop._lineage.advances == []
+    assert replies.events == []
+    assert store.retries == []
+    assert store.releases == [PUBLICATION_ID]
+    job_name = publication.publication_resource_names(PUBLICATION_ID).job
+    assert cluster.quiescence_checks == [(job_name, "old-job-uid")]
+    assert cluster.credentials_cleaned == []
+    assert cluster.terminals_cleaned == []
+    assert github.calls == ["read_branch_head"]
+
+    cluster.quiescent = True
+    github.pushed(REVISION_HEAD)
+    await loop.reconcile(work)
+
+    assert credentials.calls == [PUBLICATION_ID]
+    assert cluster.applied == []
+    assert cluster.quiescence_checks == [(job_name, "old-job-uid")] * 2
+    assert github.verify_calls == [(PUBLICATION_ID, REVISION_HEAD, REVISION_ID, PRIOR_HEAD)]
+    assert github.recover_calls == [(PUBLICATION_ID, REVISION_HEAD, False)]
+    assert store.retries == []
     assert store.completed == {PUBLICATION_ID: ("published", PR_URL)}
+
+
+@pytest.mark.parametrize(
+    "site", ["fresh", "marker", "lost_job", "lost_apply", "owner_ended", "rejected_quiescent"]
+)
+@pytest.mark.parametrize("pull_state", ["open", "merged", "closed"])
+async def test_moved_base_parent_is_consumed_on_first_publication_and_recovery(
+    publication: Any, site: str, pull_state: str
+) -> None:
+    loop, store, credentials, cluster, github, replies = _loop(publication)
+    actual_parent = "c" * 40
+    github.allowed_revisions[(REVISION_HEAD, REVISION_ID, PRIOR_HEAD)] = actual_parent
+    github.recovered_pr_state = pull_state
+    work = replace(_work(publication), revision_number=3)
+    if site in {"marker", "owner_ended"}:
+        cluster.preexisting_observation = _job(publication, "succeeded", commit_sha=REVISION_HEAD)
+    elif site == "lost_job":
+        github.branch_head = REVISION_HEAD
+    elif site == "lost_apply":
+        cluster.raise_after_apply = True
+    elif site == "rejected_quiescent":
+        _reject_existing_job(publication, cluster, phase="succeeded")
+        cluster.quiescent = True
+        github.pushed(REVISION_HEAD)
+
+    await loop.reconcile(work, allow_launch=site != "owner_ended")
+
+    assert github.verify_calls
+    assert all(
+        call == (PUBLICATION_ID, REVISION_HEAD, REVISION_ID, PRIOR_HEAD)
+        for call in github.verify_calls
+    )
+    assert github.recover_calls == [(PUBLICATION_ID, REVISION_HEAD, False)]
+    for resources in [*cluster.applied, *cluster.validated_existing]:
+        assert _job_env(resources)["BASE_SHA"] == PRIOR_HEAD
+        assert _job_env(resources)["EXPECTED_PRIOR_HEAD"] == PRIOR_HEAD
+        assert _job_env(resources)["BASE_BRANCH"] == "main"
+    assert credentials.calls == ([] if site in {"marker", "owner_ended"} else [PUBLICATION_ID])
+    if site == "rejected_quiescent":
+        job_name = publication.publication_resource_names(PUBLICATION_ID).job
+        assert cluster.quiescence_checks == [(job_name, "old-job-uid")]
+        assert cluster.applied == []
+        assert github.branch_calls == [PUBLICATION_ID] * 2
+    if pull_state == "open":
+        assert store.completed == {PUBLICATION_ID: ("published", PR_URL)}
+        assert [advance["head_sha"] for advance in loop._lineage.advances] == [REVISION_HEAD]
+        assert store.lineage_terminals == []
+        assert store.retries == []
+        assert len(replies.events) == 1
+    else:
+        assert store.completed == {}
+        assert loop._lineage.advances == []
+        assert len(store.lineage_terminals) == 1
+        terminal = store.lineage_terminals[0]
+        assert terminal["head_sha"] == REVISION_HEAD
+        assert terminal["first_parent_sha"] == actual_parent
+        assert terminal["publication_id"] == work.publication_id
+        assert terminal["expected_publication_version"] == work.version
+        assert terminal["lease_owner"] == work.lease_owner
+        assert len(store.retries) == 1
+        assert replies.events == []
+
+
+@pytest.mark.parametrize(
+    "site", ["marker", "lost_job", "existing_pr", "lost_apply", "rejected_quiescent"]
+)
+@pytest.mark.parametrize("proof_fault", ["different_commit", "malformed_parent"])
+async def test_every_revision_verification_site_refuses_a_different_returned_commit(
+    publication: Any, site: str, proof_fault: str
+) -> None:
+    loop, store, _, cluster, github, replies = _loop(publication)
+    original_verify = github.verify_revision_commit
+    work = _work(publication)
+    if site == "lost_job":
+        github.branch_head = REVISION_HEAD
+    elif site == "existing_pr":
+        work = _lineage_work(publication)
+        github.head_sha = REVISION_HEAD
+    elif site == "lost_apply":
+        cluster.raise_after_apply = True
+    elif site == "rejected_quiescent":
+        _reject_existing_job(publication, cluster, phase="succeeded")
+        cluster.quiescent = True
+        github.pushed(REVISION_HEAD)
+
+    def verify(
+        publication_id: uuid.UUID, commit_sha: str, *, revision_id: uuid.UUID, expected_parent: str
+    ) -> Any:
+        github.verify_calls.append((publication_id, commit_sha, revision_id, expected_parent))
+        return publication.PublicationRevisionCommit(
+            commit_sha="e" * 40 if proof_fault == "different_commit" else commit_sha,
+            parent_sha="not-a-parent" if proof_fault == "malformed_parent" else PRIOR_HEAD,
+        )
+
+    github.verify_revision_commit = verify  # type: ignore[method-assign]
+    await loop.reconcile(work)
+
+    assert github.verify_calls == [(PUBLICATION_ID, REVISION_HEAD, REVISION_ID, PRIOR_HEAD)]
+    assert github.recover_calls == []
+    assert loop._lineage.advances == []
+    assert store.lineage_terminals == []
+    assert store.completed == {}
+    assert len(store.retries) == 1
+    assert cluster.credentials_cleaned == []
+    assert cluster.terminals_cleaned == []
+    assert replies.events == []
+    if site == "rejected_quiescent":
+        job_name = publication.publication_resource_names(PUBLICATION_ID).job
+        assert cluster.quiescence_checks == [(job_name, "old-job-uid")]
+        assert cluster.applied == []
+
+    github.verify_revision_commit = original_verify  # type: ignore[method-assign]
+    await loop.reconcile(work)
+    assert store.completed == {PUBLICATION_ID: ("published", PR_URL)}
+    assert [advance["head_sha"] for advance in loop._lineage.advances] == [REVISION_HEAD]
+
+
+async def test_terminal_pull_verification_refuses_a_different_returned_commit(
+    publication: Any,
+) -> None:
+    loop, store, _, _, github, _ = _loop(publication)
+
+    def verify(
+        publication_id: uuid.UUID, commit_sha: str, *, revision_id: uuid.UUID, expected_parent: str
+    ) -> Any:
+        github.verify_calls.append((publication_id, commit_sha, revision_id, expected_parent))
+        return publication.PublicationRevisionCommit(commit_sha="e" * 40, parent_sha="c" * 40)
+
+    github.verify_revision_commit = verify  # type: ignore[method-assign]
+    terminal = github._pull(number=123, url=PR_URL, state="merged", head_sha=REVISION_HEAD)
+    with pytest.raises(PublicationReconcileError):
+        await loop._record_terminal_pull(_work(publication), terminal)
+    assert github.verify_calls == [(PUBLICATION_ID, REVISION_HEAD, REVISION_ID, PRIOR_HEAD)]
+    assert store.lineage_terminals == []
+    assert loop._lineage.advances == []
+
+
+@pytest.mark.parametrize("state", ["merged", "closed"])
+async def test_terminal_pull_read_records_the_verified_actual_first_parent(
+    publication: Any, state: str
+) -> None:
+    loop, store, _, _, github, _ = _loop(publication)
+    parent = "c" * 40
+    github.allowed_revisions[(REVISION_HEAD, REVISION_ID, PRIOR_HEAD)] = parent
+    terminal = github._pull(number=123, url=PR_URL, state=state, head_sha=REVISION_HEAD)
+
+    with pytest.raises(PublicationReconcileError, match=f"lineage is {state}"):
+        await loop._record_terminal_pull(_work(publication), terminal)
+
+    assert github.verify_calls == [(PUBLICATION_ID, REVISION_HEAD, REVISION_ID, PRIOR_HEAD)]
+    assert len(store.lineage_terminals) == 1
+    assert store.lineage_terminals[0]["first_parent_sha"] == parent
+    assert store.lineage_terminals[0]["head_sha"] == REVISION_HEAD
+    assert store.lineage_terminals[0]["publication_id"] == PUBLICATION_ID
+    assert store.lineage_terminals[0]["expected_publication_version"] == 1
+    assert store.lineage_terminals[0]["lease_owner"] == "publication-loop-test"
+    assert loop._lineage.advances == []
+
+
+async def test_existing_job_without_a_transport_waits_uncharged_without_redeeming(
+    publication: Any,
+) -> None:
+    loop, store, credentials, cluster, github, replies = _loop(publication)
+    cluster.preexisting_observation = publication.PublicationJobObservation(
+        phase="succeeded", logs=f"CURIE_COMMIT_SHA={REVISION_HEAD}\n"
+    )
+
+    await loop.reconcile(_work(publication))
+
+    _assert_rejected_job_waits(store, credentials, cluster, github, replies, base_reads=1)
+    assert cluster.validated_existing == []
+    assert github.calls == ["read_branch_head"]
+    assert cluster.quiescence_checks == []
+    assert store.retries == []
+    assert store.releases == [PUBLICATION_ID]
 
 
 async def test_terminal_lineage_response_uses_the_worker_terminal_cas(
@@ -2699,11 +5124,13 @@ async def test_terminal_lineage_response_uses_the_worker_terminal_cas(
             "pr_number": 123,
             "pr_url": PR_URL,
             "head_sha": REVISION_HEAD,
+            "publication_id": PUBLICATION_ID,
+            "expected_publication_version": 1,
+            "lease_owner": "publication-loop-test",
+            "first_parent_sha": PRIOR_HEAD,
         }
     ]
-    assert store.retries == [
-        (PUBLICATION_ID, "pull request lineage is merged; start a new thread")
-    ]
+    assert store.retries == [(PUBLICATION_ID, "pull request lineage is merged; start a new thread")]
 
 
 @pytest.mark.parametrize(
@@ -2712,6 +5139,7 @@ async def test_terminal_lineage_response_uses_the_worker_terminal_cas(
         "normal_completion",
         "recovery_completion",
         "later_revision",
+        "metadata_only",
     ],
 )
 async def test_lineage_unavailable_escapes_uncharged_then_charges_on_every_advance_site(
@@ -2727,6 +5155,8 @@ async def test_lineage_unavailable_escapes_uncharged_then_charges_on_every_advan
         work = _work(publication)
     elif site == "recovery_completion":
         work = _recovery_work(publication, cluster, github)
+    elif site == "metadata_only":
+        work = _metadata_work(publication)
     else:
         work = _later_revision_work(publication, cluster, github)
 
@@ -2754,74 +5184,72 @@ async def test_lineage_refusal_is_charged_without_an_uncharged_escape(
 
     await loop.reconcile(_work(publication))
 
-    assert store.retries == [
-        (PUBLICATION_ID, "publication lineage advance was refused")
-    ]
+    assert store.retries == [(PUBLICATION_ID, "publication lineage advance was refused")]
 
 
-_TRIPLE_LOGS = (
-    f"CURIE_PR_URL={PR_URL}\nCURIE_PR_NUMBER=123\nCURIE_COMMIT_SHA={REVISION_HEAD}\n"
-)
+_COMMIT_LOGS = f"Pushing the revision\nCURIE_COMMIT_SHA={REVISION_HEAD}\n"
 
 
 @pytest.mark.parametrize("preexisting", [False, True])
-async def test_running_job_with_full_success_markers_settles_immediately(
+async def test_running_job_with_a_commit_marker_settles_immediately(
     publication: Any, preexisting: bool
 ) -> None:
-    """#3074: the PR exists once the final marker prints; do not wait on Job exit."""
+    """#3074: the push is done once the marker prints; do not wait on Job exit."""
 
     lineage = _Lineage()
-    loop, store, _, cluster, _, replies = _loop(publication, lineage=lineage)
+    loop, store, credentials, cluster, github, replies = _loop(publication, lineage=lineage)
     work = _work(publication)
     if preexisting:
         cluster.active_jobs.add(publication.publication_resource_names(PUBLICATION_ID).job)
-    cluster.observation = publication.PublicationJobObservation(
-        phase="running", pr_url=None, logs=_TRIPLE_LOGS
-    )
+    cluster.observation = _job(publication, "running", logs=_COMMIT_LOGS)
 
     await loop.reconcile(work)
 
     assert store.completed == {PUBLICATION_ID: ("published", PR_URL)}
     assert [advance["head_sha"] for advance in lineage.advances] == [REVISION_HEAD]
+    assert credentials.calls == ([] if preexisting else [PUBLICATION_ID])
+    assert github.calls[-2:] == ["verify_revision_commit", "recover_pull_request"]
     assert store.retries == []
     assert store.releases == []
     assert PR_URL in replies.events[0][0].text
 
 
 @pytest.mark.parametrize("preexisting", [False, True])
-async def test_running_job_with_only_url_marker_waits_and_releases_lease(
+async def test_running_job_with_only_a_legacy_url_marker_waits_and_releases_lease(
     publication: Any, preexisting: bool
 ) -> None:
-    loop, store, _, cluster, _, replies = _loop(publication)
+    loop, store, _, cluster, github, replies = _loop(publication)
     work = _work(publication)
     if preexisting:
         cluster.active_jobs.add(publication.publication_resource_names(PUBLICATION_ID).job)
-    cluster.observation = publication.PublicationJobObservation(
-        phase="running", pr_url=None, logs=f"CURIE_PR_URL={PR_URL}\n"
-    )
+    cluster.observation = _job(publication, "running", logs=f"CURIE_PR_URL={PR_URL}\n")
 
     await loop.reconcile(work)
 
+    assert github.verify_calls == []
+    assert github.recover_calls == []
     assert store.completed == {}
     assert store.retries == []
     assert store.releases == [PUBLICATION_ID]
     assert replies.events == []
 
 
-async def test_running_job_with_state_marker_is_not_settled_early(
+async def test_running_job_legacy_state_line_is_not_pull_request_authority(
     publication: Any,
 ) -> None:
+    """The API's read of the pull request decides its state, never the Job's logs."""
+
     loop, store, _, cluster, _, _ = _loop(publication)
     cluster.active_jobs.add(publication.publication_resource_names(PUBLICATION_ID).job)
-    cluster.observation = publication.PublicationJobObservation(
-        phase="running", pr_url=None, logs=_TRIPLE_LOGS + "CURIE_PR_STATE=closed\n"
+    cluster.observation = _job(
+        publication, "running", logs=_COMMIT_LOGS + "CURIE_PR_STATE=closed\n"
     )
 
     await loop.reconcile(_work(publication))
 
-    assert store.completed == {}
     assert store.lineage_terminals == []
-    assert store.releases == [PUBLICATION_ID]
+    assert store.completed == {PUBLICATION_ID: ("published", PR_URL)}
+    assert store.releases == []
 
 
 async def test_running_job_without_markers_releases_lease_uncharged_then_settles(
@@ -2829,9 +5257,7 @@ async def test_running_job_without_markers_releases_lease_uncharged_then_settles
 ) -> None:
     loop, store, credentials, cluster, _, _ = _loop(publication)
     work = _work(publication)
-    cluster.observation = publication.PublicationJobObservation(
-        phase="running", pr_url=None, logs=""
-    )
+    cluster.observation = _job(publication, "running")
 
     await loop.reconcile(work)
 
@@ -2839,9 +5265,7 @@ async def test_running_job_without_markers_releases_lease_uncharged_then_settles
     assert store.retries == []
     assert store.completed == {}
 
-    cluster.observation = publication.PublicationJobObservation(
-        phase="running", pr_url=None, logs=_TRIPLE_LOGS
-    )
+    cluster.observation = _job(publication, "running", logs=_COMMIT_LOGS)
     await loop.reconcile(work)
 
     assert credentials.calls == [PUBLICATION_ID], "re-claim adopts, never re-redeems"
@@ -2850,9 +5274,7 @@ async def test_running_job_without_markers_releases_lease_uncharged_then_settles
 
 
 class _QueueStore(_Store):
-    def __init__(
-        self, works: list[Any], shutdown: asyncio.Event, *, sticky: bool = False
-    ) -> None:
+    def __init__(self, works: list[Any], shutdown: asyncio.Event, *, sticky: bool = False) -> None:
         super().__init__()
         self.queue = list(works)
         self.shutdown = shutdown
@@ -2888,9 +5310,7 @@ class _RecordingReconciler:
 
 
 def _distinct_works(module: Any, count: int) -> list[Any]:
-    return [
-        _lineage_work(module, publication_id=uuid.uuid4()) for _ in range(count)
-    ]
+    return [_lineage_work(module, publication_id=uuid.uuid4()) for _ in range(count)]
 
 
 async def test_supervisor_drains_every_claimable_publication_in_one_pass(

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import re
 from collections.abc import Mapping
 from decimal import (
@@ -16,7 +17,98 @@ from decimal import (
 
 from kubernetes.utils.quantity import parse_quantity
 
-from .types import QuotaRejection
+from .types import (
+    AdmissionConfig,
+    AdmissionRejection,
+    CapacityRejection,
+    QuotaRejection,
+    QuotaStatus,
+)
+
+ADMISSION_DIMENSIONS = frozenset(
+    {"pods", "requests.cpu", "requests.memory", "limits.cpu", "limits.memory"}
+)
+
+
+def resource_vector(values: Mapping[str, str]) -> dict[str, str]:
+    """Normalize quantities exactly before they cross the atomic ledger seam."""
+
+    if not values or not set(values) <= ADMISSION_DIMENSIONS:
+        raise ValueError("unsupported sandbox admission resource dimension")
+    with localcontext() as context:
+        _configure_quantity_context(context)
+        normalized = _parse_quantity_map(values)
+    if normalized is None or any(value < 0 for value in normalized.values()):
+        raise ValueError("invalid sandbox admission resource quantity")
+    result = {}
+    for key, value in normalized.items():
+        text = format(value, "f") if value else "0"
+        result[key] = text.rstrip("0").rstrip(".") if "." in text else text
+    return result
+
+
+def parse_admission_config(raw: str | None) -> AdmissionConfig | None:
+    if raw is None:
+        return None
+    value = json.loads(raw)
+    if not isinstance(value, dict) or set(value) != {
+        "quota_name", "priority_class", "ceiling", "hard"
+    }:
+        raise ValueError("invalid sandbox admission contract")
+    if (
+        not _valid_quota_name(value["quota_name"])
+        or not _valid_quota_name(value["priority_class"])
+        or type(value["ceiling"]) is not int
+        or value["ceiling"] < 0
+        or not isinstance(value["hard"], dict)
+        or set(value["hard"]) != ADMISSION_DIMENSIONS
+    ):
+        raise ValueError("invalid sandbox admission contract")
+    resource_vector(value["hard"])
+    return AdmissionConfig(**value)
+
+
+def capacity_rejection_is_valid(rejection: CapacityRejection) -> bool:
+    if isinstance(rejection, QuotaRejection):
+        return quota_rejection_is_valid(rejection)
+    if not isinstance(rejection, AdmissionRejection) or rejection.evidence_type != "admission":
+        return False
+    try:
+        requested, used, hard = (
+            resource_vector(values)
+            for values in (rejection.requested, rejection.used, rejection.hard)
+        )
+        return (
+            _valid_quota_name(rejection.quota_name)
+            and set(requested) == set(used) == set(hard)
+            and any(
+                Decimal(used[key]) + Decimal(requested[key]) > Decimal(hard[key])
+                for key in hard
+            )
+        )
+    except (ValueError, ArithmeticError, TypeError):
+        return False
+
+
+def admission_quota_headroom(
+    config: AdmissionConfig, namespace: str, requested: Mapping[str, str], quota: QuotaStatus
+) -> bool:
+    """Validate the published quota and all live dimensions before submitting."""
+
+    if quota.name != config.quota_name or quota.namespace != namespace:
+        raise ValueError("sandbox admission quota identity mismatch")
+    hard = resource_vector(config.hard)
+    spec = resource_vector(quota.spec_hard)
+    status = resource_vector(quota.status_hard)
+    used = resource_vector(quota.status_used)
+    if hard != spec or hard != status or set(used) != set(hard):
+        raise ValueError("sandbox admission quota envelope mismatch")
+    request = resource_vector(requested)
+    return all(
+        Decimal(used[key]) + Decimal(request.get(key, "0")) <= Decimal(hard[key])
+        for key in hard
+    )
+
 
 _QUANTITY_CONTEXT_PRECISION = 128
 _QUANTITY_RE = re.compile(

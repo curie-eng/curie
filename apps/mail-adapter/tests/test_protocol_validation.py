@@ -19,17 +19,17 @@ from _support import (
     get,
     post_bytes,
     post_event,
+    seed_historical_reply,
     update,
     wait_until,
 )
-from curie_mail_adapter import egress
-from curie_mail_adapter.adapter import MailAdapter
-from curie_mail_adapter.egress import MAX_CONCURRENT_REQUESTS
+from curie_channel_gateway.mail import egress
+from curie_channel_gateway.mail.adapter import MailAdapter
+from curie_channel_gateway.mail.egress import MAX_CONCURRENT_REQUESTS
 
 
 def _seed(mail: MailState, adapter: MailAdapter) -> None:
-    mail.add_inbound("msg-1", "thr-1")
-    adapter.poll_once()
+    seed_historical_reply(mail, adapter.state)
 
 
 @pytest.mark.parametrize(
@@ -230,8 +230,7 @@ def test_chunked_authenticated_body_is_rejected(
             disconnect_attempts.append(attempt)
             continue
         assert status == 400, (
-            f"chunked request was not refused with 400 on attempt {attempt}: "
-            f"status={status}"
+            f"chunked request was not refused with 400 on attempt {attempt}: status={status}"
         )
         if disconnect_attempts:
             # stacklevel=1 attributes the warning to this warn call inside the

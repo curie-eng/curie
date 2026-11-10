@@ -1,17 +1,9 @@
 [project]
 name = "curie-dispatcher"
 version = "0.0.0"
-description = "Curie dispatcher (Slack Bolt for Python, Socket Mode): ack + enqueue to Valkey Streams"
+description = "Deployment package for gateway-owned Slack intake"
 requires-python = ">=3.13"
-dependencies = [
-    "aci-protocol",
-    "curie-telemetry",
-    "slack-bolt>=1.30.0",
-    "redis>=5.2",
-    "pydantic>=2.10",
-    "pydantic-settings>=2.15.0",
-    "httpx>=0.28",
-]
+dependencies = ["curie-channel-gateway"]
 
 [build-system]
 requires = ["hatchling"]

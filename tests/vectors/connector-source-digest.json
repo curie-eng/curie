@@ -450,6 +450,25 @@
         ]
       },
       "source_digest": "sha256:837584781dd494634229dec09f47a9b73434445ccb25029ddd6f936a080bee1e"
+    },
+    {
+      "name": "a_star_ignore_at_the_bundle_root_hashes_only_the_named_dockerfile",
+      "why": "The dark factory runner shape (#4109). A bundle-root context with a non-default dockerfile and a .dockerignore of `*` hashes only that dockerfile and .dockerignore, so an agent file or connectors.yaml beside them does not move the digest; a reader that re-included only `Dockerfile`, or none, computes something else.",
+      "tree": {
+        "runner.Dockerfile": "ARG CURIE_RUNNER_IMAGE\nFROM ${CURIE_RUNNER_IMAGE}\nUSER 1000:1000\n",
+        ".dockerignore": "# runner.Dockerfile copies only from other images.\n*\n",
+        "connectors.yaml": "connectors: {}\nrunner:\n  build:\n    context: .\n    dockerfile: runner.Dockerfile\n    platforms: [linux/amd64, linux/arm64]\n",
+        "agents/diff-reviewer.md": "---\nname: diff-reviewer\nmodel: opus\n---\nReview the diff.\n"
+      },
+      "build": {
+        "context": ".",
+        "dockerfile": "runner.Dockerfile",
+        "platforms": [
+          "linux/amd64",
+          "linux/arm64"
+        ]
+      },
+      "source_digest": "sha256:ef6792d9d1b3f1dfe1c96d0578b71af4bda1cce946e104a8c2338d2b5af3fc8c"
     }
   ],
   "relations": [

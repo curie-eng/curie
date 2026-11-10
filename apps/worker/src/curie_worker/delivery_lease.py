@@ -46,9 +46,9 @@ makes "the state key is absent" unambiguously mean *first delivery*: minting a
 fresh deadline for a delivery that already burned its budget is precisely the
 budget multiplication ``HSETNX`` on ``deadline_ms`` exists to prevent.
 
-Every fallible path here **fails closed**. A heartbeat that cannot confirm
-renewal is lease-lost, not "probably fine": loss of the ownership store is never
-permission to keep producing user-visible effects.
+An explicit renewal refusal drops authority immediately. An unconfirmed renewal
+may retain authority only until the last confirmed send's conservative local
+deadline (ADR-0207); an ownership-store outage never extends that deadline.
 """
 
 from __future__ import annotations
@@ -309,8 +309,9 @@ class DeliveryLease:
     ``budget`` is replaced in place by the heartbeat loop -- a fresh
     ``DeliveryBudget`` built from the Lua script's returned deadline and server
     time, not a call to :meth:`DeliveryBudget.reanchor` -- so a holder always
-    reads the freshest anchor; ``lost`` is set the instant a renewal cannot be
-    confirmed, and never cleared -- authority is not recoverable once fenced out.
+    reads the freshest anchor. The separate local ownership deadline advances
+    only on a confirmed renewal; ``lost`` is set on refusal or local expiry and
+    never cleared, since authority is not recoverable once fenced out.
     """
 
     def __init__(
@@ -329,6 +330,9 @@ class DeliveryLease:
         self.owner = owner
         self.generation = generation
         self.budget = budget
+        # Acquire stamps the conservative ownership window before exposing a
+        # real lease. A directly constructed lease has no confirmed authority.
+        self.local_deadline_monotonic = budget.anchor_monotonic
         self.resume_event_id: str | None = None
         self.lost = asyncio.Event()
         self.entry_vanished = asyncio.Event()
@@ -363,7 +367,7 @@ def unfenced_lease() -> DeliveryLease:
     exhausted would make every budget check skip every attempt -- a total stall
     reached from the other side of the same mistake.
     """
-    return DeliveryLease(
+    lease = DeliveryLease(
         stream="",
         group="",
         entry_id="",
@@ -375,6 +379,8 @@ def unfenced_lease() -> DeliveryLease:
             anchor_monotonic=time.monotonic(),
         ),
     )
+    lease.local_deadline_monotonic += _UNFENCED_BUDGET_S
+    return lease
 
 
 class DeliveryLeaseStore:
@@ -394,6 +400,11 @@ class DeliveryLeaseStore:
         lease spans at least three of these, so two consecutive missed renewals
         still leave a healthy owner's lease live."""
         return self._config.delivery_lease_heartbeat_s
+
+    @property
+    def ownership_window_s(self) -> float:
+        """Confirmed-send authority, reserving one heartbeat before server expiry."""
+        return self._config.delivery_lease_ttl_s - self.heartbeat_interval_s
 
     def _keys(self, stream: str, group: str, entry_id: str) -> tuple[str, str]:
         return (
@@ -474,7 +485,7 @@ class DeliveryLeaseStore:
         )
         if int(raw[0]) != 1:
             raise LeaseRefused(str(raw[1]))
-        return DeliveryLease(
+        lease = DeliveryLease(
             stream=stream,
             group=group,
             entry_id=entry_id,
@@ -486,6 +497,8 @@ class DeliveryLeaseStore:
                 anchor_monotonic=anchor_monotonic,
             ),
         )
+        lease.local_deadline_monotonic = anchor_monotonic + self.ownership_window_s
+        return lease
 
     async def heartbeat(
         self,
@@ -501,10 +514,9 @@ class DeliveryLeaseStore:
         """Renew the lease and reset same-owner PEL idle, or refuse.
 
         Returns the re-anchored budget on success and ``None`` on ANY refusal --
-        the caller treats ``None`` as lease-lost and fails closed. There is no
-        third answer, deliberately: a renewal that cannot be confirmed is
-        indistinguishable from one that was refused, and both must fence this
-        owner out.
+        the caller treats ``None`` as immediate lease loss. A raising call is
+        unconfirmed, rather than refused, and the caller retains only its prior
+        local ownership deadline (ADR-0207).
         """
         lease_key, state_key = self._keys(stream, group, entry_id)
         resume_key = (

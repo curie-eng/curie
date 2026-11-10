@@ -1,0 +1,50 @@
+{{/*
+Chart-owned runner token Secret (issue #3821).
+
+The runner fails closed: it refuses to boot without a bearer. A warm,
+unclaimed sandbox pod boots from the SandboxTemplate before any claim exists,
+so the template must carry a token of its own. This Secret supplies it. It is
+dedicated (not a key in the shared chart Secret) so it renders regardless of
+any `existingSecret` override and no BYO Secret has to carry it.
+
+Lifecycle:
+  - `helm template`, `--dry-run`, and a first install get an empty lookup and
+    generate a fresh random value. A client-only dry run's value is never
+    applied.
+  - An upgrade reuses the stored nonblank value through `lookup`, so warm pods
+    are not handed a new token mid-upgrade. A deleted or blank Secret
+    regenerates on the next upgrade; warm pods read env at start and pick the
+    new value up when they are recreated.
+  - Hand-rolled rather than `curie.managedSecret`: under
+    security.allowDevDefaults that helper returns the supplied value verbatim,
+    which is blank for a token with no published default, and the runner
+    refuses to boot on a blank token.
+  - No `helm.sh/resource-policy: keep`, matching secrets.yaml: a kept Secret
+    would outlive uninstall and block a reinstall on ownership metadata.
+
+The worker's per-claim Overrides injection replaces CURIE_RUNNER_TOKEN with a
+per-claim minted token on every bound claim, so this value is only ever
+presented to a warm pod by the pod's own operator tooling.
+*/}}
+{{- if .Values.agentSandbox.deploy }}
+{{- $name := include "curie.runnerTokenSecretName" . }}
+{{- $live := lookup "v1" "Secret" .Release.Namespace $name | default dict }}
+{{- $liveData := get $live "data" | default dict }}
+{{- $token := "" }}
+{{- $encoded := get $liveData "runnerToken" | default "" }}
+{{- if ne (trim (toString $encoded)) "" }}
+{{- $token = $encoded | b64dec }}
+{{- end }}
+{{- if eq (trim $token) "" }}
+{{- $token = randAlphaNum 48 }}
+{{- end }}
+apiVersion: v1
+kind: Secret
+metadata:
+  name: {{ $name }}
+  labels:
+    {{- include "curie.labels" . | nindent 4 }}
+type: Opaque
+stringData:
+  runnerToken: {{ $token | quote }}
+{{- end }}

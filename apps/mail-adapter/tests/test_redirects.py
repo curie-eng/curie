@@ -21,9 +21,9 @@ from collections.abc import Callable
 
 import pytest
 from _support import MailState, RedirectState, SinkState
-from curie_mail_adapter.adapter import MailAdapter
-from curie_mail_adapter.agentmail import AgentMailClient
-from curie_mail_adapter.config import MailAdapterConfig
+from curie_channel_gateway.mail.adapter import MailAdapter
+from curie_channel_gateway.mail.agentmail import AgentMailClient
+from curie_channel_gateway.mail.config import MailAdapterConfig
 
 
 @pytest.mark.parametrize("status", [301, 302, 303, 307, 308])
@@ -61,9 +61,7 @@ def test_a_redirected_ingress_post_never_replays_the_channel_token(
     origin that captures it can drive the agent directly.
     """
     adapter = make_adapter(api_base_url=redirect.url)
-    mail.add_inbound("msg-1", "thr-1")
-
-    adapter.poll_once()
+    adapter.post_turn({"delivery_id": "msg-1", "conversation_id": "thr-1"})
 
     assert sink.credentials_seen() == [], "the channel token was replayed at the redirect target"
     # The name-independent form of the same claim: nothing at all arrived, so

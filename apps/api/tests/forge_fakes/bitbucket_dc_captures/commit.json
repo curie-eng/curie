@@ -1,0 +1,21 @@
+{
+  "id": "7a3f0c9e1d2b4a5f6e7d8c9b0a1f2e3d4c5b6a79",
+  "displayId": "7a3f0c9e1d2",
+  "author": {
+    "name": "placeholder-user-1",
+    "emailAddress": "placeholder-user-1@example.invalid"
+  },
+  "authorTimestamp": 1760000000000,
+  "committer": {
+    "name": "placeholder-user-1",
+    "emailAddress": "placeholder-user-1@example.invalid"
+  },
+  "committerTimestamp": 1760000000000,
+  "message": "Demo change",
+  "parents": [
+    {
+      "id": "1f2e3d4c5b6a79807a3f0c9e1d2b4a5f6e7d8c9b",
+      "displayId": "1f2e3d4c5b6"
+    }
+  ]
+}

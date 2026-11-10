@@ -72,7 +72,21 @@ if [ "$1" = "run" ]; then
     *) printf '%s\n' 'test stopped runner startup' >&2; exit 86 ;;
   esac
 fi
-exit 0
+case "$1 $2" in
+  "volume create")
+    for volume in "$@"; do :; done
+    printf '%s\n' "$volume"
+    ;;
+  "volume inspect") printf '%s\n' 'curie-cli skill-snapshot' ;;
+  "volume rm"|"volume ls"|"image inspect"|"ps "*) ;;
+  *)
+    case "$1" in
+      create) printf '%s\n' 'fixture-seed-id' ;;
+      cp|rm) ;;
+      *) printf 'unexpected Docker command: %s\n' "$*" >&2; exit 93 ;;
+    esac
+    ;;
+esac
 "#,
         log = log.display(),
         base = base_digest(),

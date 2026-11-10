@@ -1,6 +1,7 @@
 import asyncio
 from pathlib import Path
 
+import pytest
 from channel_protocol import (
     OutboundMessage,
     ReplyPost,
@@ -64,6 +65,31 @@ def test_reply_update_edits_placeholder_and_posts_continuations(tmp_path: Path) 
     asyncio.run(service.deliver(shorter))
     assert port.deletes == [("222", "posted-1")]
     assert state.continuations("222", "9002") == []
+
+
+def test_verbatim_reply_update_is_refused_before_state_or_discord_mutation(
+    tmp_path: Path,
+) -> None:
+    port = FakeDiscord()
+    state = DiscordState(tmp_path / "state.sqlite3")
+    service = DiscordReplyService(port, state)
+    event = ReplyUpdate(
+        version="1.2",
+        event="reply.update",
+        target=target(),
+        text="approved exact text",
+        text_mode="verbatim",
+        delivery_id="01234567-89ab-cdef-0123-456789abcdef",
+    )
+
+    with pytest.raises(ValueError, match="reply wire 1.2 verbatim is not supported"):
+        asyncio.run(service.deliver(event))
+
+    assert port.edits == []
+    assert port.posts == []
+    assert port.deletes == []
+    assert state.continuations("222", "9002") == []
+    assert state.completed_count() == 0
 
 
 def test_settled_approval_uses_text_fallback_and_terminal_outcome(tmp_path: Path) -> None:

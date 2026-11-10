@@ -1,6 +1,7 @@
 """FastAPI dependencies that pull shared resources off app.state."""
 
 from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from typing import Annotated
 
 from fastapi import Depends, Request
@@ -9,6 +10,9 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from .approvers import ApproverSetSelector
 from .evalqueue import EvalQueue
 from .github_checks import GitHubStatusReporter
+from .identity.http_approval import identity_runtime
+from .identity.http_invocation import HttpInvocationRuntime
+from .identity_fence import request_owned_session
 from .k8s import PodLister, PodLogReader
 from .killswitch import KillSwitch
 from .langfuse import LangfuseClient
@@ -17,8 +21,26 @@ from .storage import ObjectStore
 from .threadreset import ThreadResetRequests
 
 
-async def get_session(request: Request) -> AsyncIterator[AsyncSession]:
+@asynccontextmanager
+async def request_session(request: Request) -> AsyncIterator[AsyncSession]:
+    """@spec IDENTITY-WRITER-LIFETIME-V1-2."""
+    owned = request_owned_session(request)
+    if owned is not None:
+        yield owned
+        return
     sessionmaker: async_sessionmaker[AsyncSession] = request.app.state.sessionmaker
+    async with sessionmaker() as session:
+        yield session
+
+
+async def get_session(request: Request) -> AsyncIterator[AsyncSession]:
+    """@spec IDENTITY-WRITER-LIFETIME-V1-2."""
+    async with request_session(request) as session:
+        yield session
+
+
+async def get_liveness_session(request: Request) -> AsyncIterator[AsyncSession]:
+    sessionmaker: async_sessionmaker[AsyncSession] = request.app.state.liveness_sessionmaker
     async with sessionmaker() as session:
         yield session
 
@@ -79,7 +101,16 @@ def get_approver_sets(request: Request) -> ApproverSetSelector:
     return selector
 
 
+def get_identity_runtime(request: Request) -> HttpInvocationRuntime | None:
+    """The app's HTTP invocation runtime; absent registers no identity.
+
+    @spec HTTP-APPROVAL-CONTINUITY-14: approval writers classify by binding with it.
+    """
+    return identity_runtime(request.app.state)
+
+
 SessionDep = Annotated[AsyncSession, Depends(get_session)]
+LivenessSessionDep = Annotated[AsyncSession, Depends(get_liveness_session)]
 LangfuseDep = Annotated[LangfuseClient, Depends(get_langfuse)]
 StoreDep = Annotated[ObjectStore, Depends(get_store)]
 PodLogReaderDep = Annotated[PodLogReader, Depends(get_pod_log_reader)]
@@ -89,6 +120,7 @@ EvalQueueDep = Annotated[EvalQueue, Depends(get_eval_queue)]
 GitHubReporterDep = Annotated[GitHubStatusReporter, Depends(get_github_reporter)]
 ResumeQueueDep = Annotated[ResumeQueue, Depends(get_resume_queue)]
 ApproverSetSelectorDep = Annotated[ApproverSetSelector, Depends(get_approver_sets)]
+IdentityRuntimeDep = Annotated[HttpInvocationRuntime | None, Depends(get_identity_runtime)]
 ThreadResetRequestsDep = Annotated[
     ThreadResetRequests, Depends(get_thread_reset_requests)
 ]

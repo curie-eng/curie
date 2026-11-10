@@ -13,7 +13,7 @@ import asyncio
 import functools
 import sys
 import uuid
-from collections.abc import Callable
+from collections.abc import AsyncIterator, Callable
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -22,6 +22,7 @@ import pytest
 from aci_protocol import (
     ErrorEvent,
     Final,
+    OutboundEvent,
     QueuedTurn,
     ReplyHandle,
     SessionStatus,
@@ -37,8 +38,9 @@ from curie_worker.approvals import (
     PublicationLineage,
 )
 from curie_worker.behaviorpacks import BehaviorPacks
-from curie_worker.kernel import ThreadBusyError
-from curie_worker.runner_client import RunnerWorkspaceSnapshot
+from curie_worker.binding import HttpIdentityBinding
+from curie_worker.kernel.failures import ThreadBusyError
+from curie_worker.runner_client import RunnerWorkspaceSnapshot, TurnStream
 from curie_worker.workspace import WorkspaceSelectionRefused
 
 # importlib import mode does not add the test root to sys.path.
@@ -116,6 +118,19 @@ def _verified(turn: QueuedTurn) -> Any:
 
 
 class ReviewBinding:
+
+    async def identity_binding(
+        self, kind: str, adapter: str | None, address: str,
+    ) -> HttpIdentityBinding | None:
+        """@spec HTTP-INVOCATION-EXECUTION-18: explicit local fixture classification."""
+        agent_id = AGENT_ID
+        return HttpIdentityBinding(
+            tenant_id=uuid.UUID("00000000-0000-4000-8000-000000000001"),
+            agent_id=agent_id,
+            binding_id=uuid.uuid5(uuid.NAMESPACE_URL, repr((kind, adapter, address))),
+            binding_generation=1, http_identity_required=False,
+        )
+
     async def resolve(self, kind: str, adapter: str | None, channel: str) -> object:
         assert (kind, channel) == ("slack", CHANNEL)
         return SimpleNamespace(
@@ -134,6 +149,7 @@ class ReviewBinding:
         *,
         kind: str | None = None,
         address: str | None = None,
+        **_: object,
     ) -> dict[str, str]:
         assert (kind, address) == ("slack", CHANNEL)
         return {
@@ -176,6 +192,10 @@ class ReviewWorkspace:
 
     def release(self, thread_key: str) -> None:
         self.released.append(thread_key)
+
+    def current(self, _thread_key: str) -> object:
+        # The retained prepared head the review revision is anchored at.
+        return SimpleNamespace(repo_full_name=REPO, base_sha=HEAD)
 
 
 class ReviewPublicationApi:
@@ -259,7 +279,7 @@ class ReviewPublicationApi:
         )
 
     async def create_publication(
-        self, request: PublicationCreateRequest
+        self, request: PublicationCreateRequest, *, budget_s: float = 120
     ) -> CreatedPublication:
         self.operations.append("create")
         self.creates.append(request)
@@ -431,8 +451,7 @@ def test_final_reserve_refusal_stops_before_steer_or_model(make_harness) -> None
     async def exercise() -> None:
         turn = _review_turn()
         refusal = (
-            "The pull request changed after GitHub feedback verification; "
-            "no model turn started."
+            "The pull request changed after GitHub feedback verification; no model turn started."
         )
         api = ReviewPublicationApi(
             turn,
@@ -590,6 +609,7 @@ def test_verified_review_records_history_capacity_in_terminal_marker(
 
 def test_review_cancellation_releases_started_response_without_publication(
     make_harness,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     async def exercise() -> None:
         turn = _review_turn()
@@ -603,12 +623,23 @@ def test_review_cancellation_releases_started_response_without_publication(
             hold = asyncio.Event()
             h.runner.hold = hold
             h.runner.default_script = [TextDelta(text="working")]
+            response_reading = asyncio.Event()
+            real_iterate = TurnStream.__aiter__
+
+            def iterate_turn(stream: TurnStream) -> AsyncIterator[OutboundEvent]:
+                response_reading.set()
+                return real_iterate(stream)
+
+            monkeypatch.setattr(TurnStream, "__aiter__", iterate_turn)
             task = asyncio.create_task(h.kernel.process_event(turn))
             try:
-                await _wait_until(lambda: h.runner.turn_active)
+                # Begin cancellation only after lock cleanup has handed the
+                # real response to the stream consumer's cleanup context.
+                await asyncio.wait_for(response_reading.wait(), timeout=5)
                 task.cancel()
                 with pytest.raises(asyncio.CancelledError):
-                    await task
+                    async with asyncio.timeout(10):
+                        await task
                 await _wait_until(lambda: not h.runner.turn_active)
                 assert len(api.reserve_calls) == 1
                 assert api.creates == []
@@ -659,7 +690,7 @@ def test_review_publication_carries_origin_into_a_fresh_same_pr_approval(
 
             monkeypatch.setattr(h.kernel._runner, "snapshot", snapshot)
             monkeypatch.setattr(
-                "curie_worker.kernel.validate_snapshot_against_base",
+                'curie_worker.kernel.attempt.validate_snapshot_against_base',
                 lambda *_args, **_kwargs: None,
             )
 

@@ -154,7 +154,14 @@ pub fn local_connect_commands(o: &LocalCommsOpts) -> Vec<OpsCommand> {
             comms_compose_args(
                 o,
                 &["core", "slack"],
-                &["up", "-d", "--wait", "curie-worker", "curie-dispatcher"],
+                &[
+                    "up",
+                    "-d",
+                    "--wait",
+                    "curie-worker",
+                    "curie-channel-gateway",
+                    "curie-dispatcher",
+                ],
             ),
         )
         .with_env(env),
@@ -184,7 +191,17 @@ pub fn local_disconnect_commands(o: &LocalCommsOpts) -> Vec<OpsCommand> {
         crate::local::with_stack_secret_env(
             OpsCommand::new(
                 "docker",
-                comms_compose_args(o, &["core"], &["up", "-d", "--wait", "curie-worker"]),
+                comms_compose_args(
+                    o,
+                    &["core"],
+                    &[
+                        "up",
+                        "-d",
+                        "--wait",
+                        "curie-worker",
+                        "curie-channel-gateway",
+                    ],
+                ),
             )
             .with_env(worker_env),
             o.model_credentials.clone(),
@@ -233,14 +250,29 @@ fn rollout_status_command(
     )
 }
 
+#[derive(Clone, Copy)]
+struct SlackTokenConsumer {
+    workload: &'static str,
+    removed_on_disconnect: bool,
+}
+
+const SLACK_TOKEN_CONSUMERS: [SlackTokenConsumer; 2] = [
+    SlackTokenConsumer {
+        workload: "channel-gateway",
+        removed_on_disconnect: false,
+    },
+    SlackTokenConsumer {
+        workload: "dispatcher",
+        removed_on_disconnect: true,
+    },
+];
+
 /// The kubectl rollout commands that follow the helm upgrade so the running pods
-/// pick up the token change. Connect must roll the worker AND the dispatcher (an
-/// existing dispatcher would otherwise keep stale tokens; a freshly rendered one
-/// is rolled harmlessly). Disconnect rolls only the worker -- helm deletes the
-/// dispatcher (its gate `curie.dispatcher.enabled` goes false), so there is no
-/// dispatcher to wait on.
+/// pick up the token change. Connect rolls every Slack token consumer.
+/// Disconnect rolls the gateway; Helm removes the dispatcher when its
+/// `curie.dispatcher.enabled` gate goes false, so there is none to wait on.
 ///
-/// Takes a RESOLVED `ReleaseFullname` (#1533): the chart names both Deployments
+/// Takes a RESOLVED `ReleaseFullname` (#1533): the chart names these Deployments
 /// `{{ include "curie.fullname" . }}-<component>`, which is NOT
 /// `{release}-<component>` unless the release name already contains the chart
 /// name. A wrong name makes the restart reach nothing, so the pods keep the
@@ -250,19 +282,15 @@ pub fn rollout_commands(
     namespace: &str,
     fullname: &crate::ops::ReleaseFullname,
 ) -> Vec<OpsCommand> {
-    let components: &[&str] = if disconnect {
-        &["worker"]
-    } else {
-        &["worker", "dispatcher"]
-    };
-    let mut cmds: Vec<OpsCommand> = components
+    let consumers = SLACK_TOKEN_CONSUMERS
         .iter()
-        .map(|c| rollout_restart_command(namespace, fullname, c))
+        .filter(|consumer| !disconnect || !consumer.removed_on_disconnect);
+    let mut cmds: Vec<OpsCommand> = consumers
+        .clone()
+        .map(|consumer| rollout_restart_command(namespace, fullname, consumer.workload))
         .collect();
     cmds.extend(
-        components
-            .iter()
-            .map(|c| rollout_status_command(namespace, fullname, c)),
+        consumers.map(|consumer| rollout_status_command(namespace, fullname, consumer.workload)),
     );
     cmds
 }
@@ -469,6 +497,80 @@ pub async fn local_comms(opts: LocalCommsOpts) -> Result<CommsOutput> {
 }
 
 #[cfg(test)]
+#[tokio::test]
+async fn slack_token_consumers_match_chart() {
+    let chart = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../charts/curie");
+    let command = OpsCommand::new(
+        "helm",
+        [
+            "template",
+            "acme",
+            chart.to_str().expect("UTF-8 chart path"),
+            "--set",
+            "security.allowDevDefaults=true",
+            "--set",
+            "dispatcher.slack.appToken=xapp-example",
+            "--set",
+            "dispatcher.slack.botToken=xoxb-example",
+            "--set",
+            "channelGateway.deploy=true",
+            "--set",
+            "channelGateway.allowInsecure=true",
+        ]
+        .into_iter()
+        .map(plain)
+        .collect(),
+    );
+    let (ok, rendered, stderr) = crate::ops::run_capture(&command)
+        .await
+        .expect("helm is required to verify the rendered Slack token consumers");
+    assert!(ok, "helm template failed: {stderr}");
+    let mut chart_consumers = std::collections::BTreeSet::new();
+    for document in rendered.split("\n---") {
+        if !document.lines().any(|line| line == "kind: Deployment") {
+            continue;
+        }
+        let holds_token = document.lines().any(|line| {
+            line.trim_start()
+                .strip_prefix("- name: ")
+                .is_some_and(|name| {
+                    name == "SLACK_BOT_TOKEN" || name.starts_with("CURIE_SLACK_BOT_TOKEN__")
+                })
+        });
+        if !holds_token {
+            continue;
+        }
+        let workload = document
+            .lines()
+            .find_map(|line| line.strip_prefix("  name: "))
+            .and_then(|name| name.strip_prefix("acme-curie-"))
+            .expect("token consumer has the chart's deployment name");
+        chart_consumers.insert(workload.to_string());
+    }
+    let matches_chart = |consumers: &[SlackTokenConsumer]| {
+        consumers
+            .iter()
+            .map(|consumer| consumer.workload.to_string())
+            .collect::<std::collections::BTreeSet<_>>()
+            == chart_consumers
+    };
+    assert!(
+        matches_chart(&SLACK_TOKEN_CONSUMERS),
+        "rollout consumers must match chart Slack env consumers: {chart_consumers:?}"
+    );
+
+    let without_gateway: Vec<_> = SLACK_TOKEN_CONSUMERS
+        .iter()
+        .copied()
+        .filter(|consumer| consumer.workload != "channel-gateway")
+        .collect();
+    assert!(
+        !matches_chart(&without_gateway),
+        "removing the gateway must fail the same chart equality check"
+    );
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -501,6 +603,10 @@ mod tests {
             "kubectl -n acme-system rollout restart deployment/platform-curie-worker"
         );
         assert_eq!(
+            rollout_restart_command("acme-system", &fullname, "api").display(),
+            "kubectl -n acme-system rollout restart deployment/platform-curie-api"
+        );
+        assert_eq!(
             rollout_restart_command("acme-system", &fullname, "dispatcher").display(),
             "kubectl -n acme-system rollout restart deployment/platform-curie-dispatcher"
         );
@@ -520,6 +626,11 @@ mod tests {
     fn rollout_status_targets_the_chart_rendered_deployment() {
         let fullname = crate::ops::chart_fullname("platform");
         assert_eq!(
+            rollout_status_command("acme-system", &fullname, "api").display(),
+            "kubectl -n acme-system rollout status deployment/platform-curie-api \
+             --timeout=120s"
+        );
+        assert_eq!(
             rollout_status_command("acme-system", &fullname, "worker").display(),
             "kubectl -n acme-system rollout status deployment/platform-curie-worker \
              --timeout=120s"
@@ -533,10 +644,9 @@ mod tests {
         );
     }
 
-    /// The public entry point, so the fix is pinned where `comms` actually
-    /// calls it and not only on the two private builders.
+    /// The shared rollout plan must reach every chart-rendered token consumer.
     #[test]
-    fn connect_rolls_both_chart_rendered_deployments() {
+    fn connect_rolls_all_chart_rendered_token_consumers() {
         let rendered: Vec<String> = rollout_commands(
             false,
             "acme-system",
@@ -548,14 +658,79 @@ mod tests {
         assert_eq!(
             rendered,
             vec![
-                "kubectl -n acme-system rollout restart deployment/platform-curie-worker",
+                "kubectl -n acme-system rollout restart deployment/platform-curie-channel-gateway",
                 "kubectl -n acme-system rollout restart deployment/platform-curie-dispatcher",
-                "kubectl -n acme-system rollout status deployment/platform-curie-worker \
+                "kubectl -n acme-system rollout status deployment/platform-curie-channel-gateway \
                  --timeout=120s",
                 "kubectl -n acme-system rollout status deployment/platform-curie-dispatcher \
                  --timeout=120s",
             ]
         );
+    }
+
+    #[test]
+    fn disconnect_rolls_remaining_chart_rendered_token_consumers() {
+        let rendered: Vec<String> =
+            rollout_commands(true, "acme-system", &crate::ops::chart_fullname("platform"))
+                .iter()
+                .map(OpsCommand::display)
+                .collect();
+        assert_eq!(
+            rendered,
+            vec![
+                "kubectl -n acme-system rollout restart deployment/platform-curie-channel-gateway",
+                "kubectl -n acme-system rollout status deployment/platform-curie-channel-gateway \
+                 --timeout=120s",
+            ]
+        );
+        assert!(
+            !rendered.iter().any(|line| line.contains("dispatcher")),
+            "disconnect must not wait for the removed dispatcher: {rendered:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn comms_dry_run_uses_the_same_rollout_commands_for_connect_and_disconnect() {
+        for disconnect in [false, true] {
+            let opts = CommsOpts {
+                common: CommonOpts {
+                    namespace: "acme-system".into(),
+                    release: "platform".into(),
+                    dry_run: true,
+                },
+                chart: "charts/curie".into(),
+                app_token: "xapp-EXAMPLE".into(),
+                bot_token: "xoxb-EXAMPLE".into(),
+                disconnect,
+            };
+            let upgrade = if disconnect {
+                disconnect_commands(&opts)
+            } else {
+                connect_commands(&opts)
+            };
+            let rollout = rollout_commands(
+                disconnect,
+                &opts.common.namespace,
+                &crate::ops::chart_fullname(&opts.common.release),
+            );
+            let expected: Vec<String> = upgrade
+                .iter()
+                .chain(rollout.iter())
+                .map(OpsCommand::display)
+                .collect();
+            let CommsOutput::DryRun(plan) = comms(opts).await.expect("offline comms dry run")
+            else {
+                panic!("comms dry run must return its command plan");
+            };
+            assert_eq!(plan.lines, expected, "disconnect={disconnect}");
+            assert!(
+                plan.lines
+                    .iter()
+                    .any(|line| line.contains("deployment/platform-curie-channel-gateway")),
+                "dry run must roll the gateway token consumer: {:?}",
+                plan.lines
+            );
+        }
     }
 
     /// #749 token resolution precedence: the clap-merged `--flag`/env value wins;
@@ -651,15 +826,15 @@ mod tests {
     }
 
     #[test]
-    fn rollout_commands_connect_rolls_worker_and_dispatcher() {
+    fn rollout_commands_connect_rolls_worker_api_and_dispatcher() {
         let cmds = rollout_commands(false, "curie", &crate::ops::chart_fullname("curie"));
         let lines: Vec<String> = cmds.iter().map(OpsCommand::display).collect();
         assert_eq!(
             lines,
             vec![
-                "kubectl -n curie rollout restart deployment/curie-worker".to_string(),
+                "kubectl -n curie rollout restart deployment/curie-channel-gateway".to_string(),
                 "kubectl -n curie rollout restart deployment/curie-dispatcher".to_string(),
-                "kubectl -n curie rollout status deployment/curie-worker --timeout=120s"
+                "kubectl -n curie rollout status deployment/curie-channel-gateway --timeout=120s"
                     .to_string(),
                 "kubectl -n curie rollout status deployment/curie-dispatcher --timeout=120s"
                     .to_string(),
@@ -668,14 +843,14 @@ mod tests {
     }
 
     #[test]
-    fn rollout_commands_disconnect_rolls_worker_only() {
+    fn rollout_commands_disconnect_rolls_worker_and_api() {
         let cmds = rollout_commands(true, "curie", &crate::ops::chart_fullname("curie"));
         let lines: Vec<String> = cmds.iter().map(OpsCommand::display).collect();
         assert_eq!(
             lines,
             vec![
-                "kubectl -n curie rollout restart deployment/curie-worker".to_string(),
-                "kubectl -n curie rollout status deployment/curie-worker --timeout=120s"
+                "kubectl -n curie rollout restart deployment/curie-channel-gateway".to_string(),
+                "kubectl -n curie rollout status deployment/curie-channel-gateway --timeout=120s"
                     .to_string(),
             ]
         );
@@ -812,7 +987,7 @@ mod tests {
             "COMPOSE_PROJECT_NAME=curie SLACK_API_BASE_URL= 'SLACK_APP_TOKEN=xapp-1-s***' \
              'SLACK_BOT_TOKEN=xoxb-1-s***' \
              docker compose --profile core --profile slack -p curie -f compose.dev.yaml up -d --wait \
-             curie-worker curie-dispatcher"
+             curie-worker curie-channel-gateway curie-dispatcher"
         );
         assert!(!line.contains("secretsecret"), "secret leaked: {line}");
     }
@@ -865,7 +1040,7 @@ mod tests {
             second,
             "COMPOSE_PROJECT_NAME=curie SLACK_API_BASE_URL=http://localhost:8155/api/ \
              SLACK_BOT_TOKEN=xoxb-dev \
-             docker compose --profile core -p curie -f compose.dev.yaml up -d --wait curie-worker"
+             docker compose --profile core -p curie -f compose.dev.yaml up -d --wait curie-worker curie-channel-gateway"
         );
         assert!(
             !second.contains("curie-dispatcher"),

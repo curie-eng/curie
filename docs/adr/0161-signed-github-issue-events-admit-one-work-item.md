@@ -4,6 +4,19 @@ Date: 2026-09-22
 
 Status: Accepted
 
+**Partially amended by [ADR 0197](0197-the-factory-reaches-code-hosts-and-trackers-through-two-ports.md)**
+(back-link added under [ADR 0045](0045-the-status-line-is-the-mutable-part-of-an-immutable-adr.md)):
+only where it names GitHub as the sole source of a notice; notices come
+from any Tracker adapter. Everything else in this ADR stands.
+
+**Partially amended by [ADR 0215](0215-each-tracker-surface-starts-factory-work-under-its-own-trigger-label.md)**
+(back-link added under [ADR 0045](0045-the-status-line-is-the-mutable-part-of-an-immutable-adr.md)):
+the Consequences' "one label" and the configured label that removal
+cancels on. Each tracker surface carries its own
+trigger label, or serves the tracker's configured label when it has none, and
+a removed label cancels a WorkItem only when it is the label stored as having
+admitted it. Everything else in this ADR stands.
+
 Partially amends
 [ADR 0145](0145-a-labelled-issue-is-a-backlog-item-and-the-stream-is-its-queue.md).
 The tracker remains the backlog. Curie still does not copy issue bodies.

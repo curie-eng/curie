@@ -31,7 +31,7 @@ use crate::chat::{
     await_reply, await_resume, capped, continue_hint_line, continue_hint_long_line,
     failure_class_from_reply, parse_approval_id, resolve_targets, Outcome, SlackStub,
 };
-use crate::evals::{EvalCase, EvalSuite, ExpectedStatus, LoadedEval};
+use crate::evals::{eval_author, EvalCase, EvalSuite, ExpectedStatus, LoadedEval};
 use crate::ops::{plain, require_on_path, run_capture, OpsCommand};
 use crate::queue::{
     self, connect, diagnostics, eval_case_turn, name_relay_identity, queue_thread_reset, speak_as,
@@ -404,6 +404,7 @@ pub struct MessageOpts {
     /// `--agent`: send as this agent's binding (ADR-0168 decision 8).
     pub agent: Option<String>,
     pub thread: Option<String>,
+    pub context: Option<String>,
     pub namespace: String,
     pub release: String,
     pub chart: String,
@@ -445,6 +446,7 @@ impl Default for MessageOpts {
             channel: None,
             agent: None,
             thread: None,
+            context: None,
             namespace: "curie".to_string(),
             release: "curie".to_string(),
             chart: "charts/curie".to_string(),
@@ -510,12 +512,19 @@ fn persist_and_hint(opts: &MessageOpts, verb: TurnVerb, channel: &str, thread_ts
     let ui = crate::ui::ui();
     let verb_str = match verb {
         TurnVerb::Local => format!("{} message", tier_str(verb)),
-        TurnVerb::Cluster => format!(
-            "{} message --namespace {} --release {}",
-            tier_str(verb),
-            crate::ops::shell_quote(&opts.namespace),
-            crate::ops::shell_quote(&opts.release),
-        ),
+        TurnVerb::Cluster => {
+            let context = opts
+                .context
+                .as_deref()
+                .map(|context| format!(" --context {}", crate::ops::shell_quote(context)))
+                .unwrap_or_default();
+            format!(
+                "{} message{context} --namespace {} --release {}",
+                tier_str(verb),
+                crate::ops::shell_quote(&opts.namespace),
+                crate::ops::shell_quote(&opts.release),
+            )
+        }
     };
     match save_turn_context(opts, verb, channel, thread_ts) {
         Ok(()) => ui.note(&continue_hint_line(&verb_str)),
@@ -847,6 +856,7 @@ async fn await_cluster_relay(
 /// published host port, authenticated with the same password the compose worker
 /// uses. Pure so the construction is unit-tested without a live Valkey.
 pub fn local_valkey_url(password: &str, host: &str, port: u16) -> String {
+    let password = queue::percent_encode_unreserved(password);
     format!("redis://:{password}@{host}:{port}")
 }
 
@@ -1603,7 +1613,7 @@ fn diagnostics_with_claim_wait(diagnostics: String, reason: Option<&str>) -> Str
 
 const COMPOSE_CONFIG_FILES_LABEL: &str = "com.docker.compose.project.config_files";
 const COMPOSE_DISPATCHER_SERVICE: &str = "curie-dispatcher";
-const DISPATCHER_ENQUEUE_MODULE: &str = "curie_dispatcher.enqueue_once";
+const DISPATCHER_ENQUEUE_MODULE: &str = "curie_channel_gateway.slack.enqueue_once";
 const DISPATCHER_ENQUEUE_TIMEOUT: Duration = Duration::from_secs(30);
 // The one-shot dispatcher shares the runner's bridge network, not the
 // worker's host network. Inspect this separately; it is never forwarded as a
@@ -1679,7 +1689,7 @@ fn compose_config_files(label: &str) -> Result<Vec<String>> {
 ///   invocation. Compose substitutes its variables from each caller's own
 ///   environment, so after `local up --build` the stack ran `:dev` while this
 ///   verb resolved `:latest` and died on `No module named
-///   curie_dispatcher.enqueue_once`.
+///   curie_channel_gateway.slack.enqueue_once`.
 /// - Checked, because a tag that exists for the platform images need not exist
 ///   for the dispatcher. CI runs the ladder with `CURIE_BASE_TAG=ci-local` and
 ///   builds its dispatcher as `:latest`, so pointing this at `:ci-local` asked
@@ -2055,7 +2065,10 @@ async fn message_local(opts: MessageOpts) -> Result<()> {
             local_dry_run_channel_line(opts.agent.as_deref(), opts.channel.as_deref(), &api_base);
         let human_lines = vec![
             "local mode (compose stack; no kubectl/helm)".to_string(),
-            format!("enqueue onto redis {valkey_url}"),
+            format!(
+                "enqueue onto redis redis://{}:{}",
+                resources.valkey_host, resources.valkey_port
+            ),
             format!("stub advertised at {reply_endpoint}"),
             channel_line,
             format!("enqueue a synthetic QueuedTurn on stream {}", opts.stream),
@@ -2983,14 +2996,14 @@ async fn resume_cluster_after_approval(
 /// dispatcher is wired to the local stub -- NOT a real workspace.
 const LOCAL_STUB_BOT_TOKEN: &str = "xoxb-dev";
 
-/// The Slack transport the RUNNING compose worker is actually configured with:
+/// The Slack transport the RUNNING compose gateway is actually configured with:
 /// `(SLACK_API_BASE_URL, SLACK_BOT_TOKEN)` as the container holds them.
-type WorkerTransport = (Option<String>, Option<String>);
+type GatewayTransport = (Option<String>, Option<String>);
 
 /// The bot token to post a real placeholder with, or `None` when this stack is
 /// not wired to a real workspace.
 ///
-/// Decided from the worker's OWN transport, never from CLI-side config (#957).
+/// Decided from the gateway's OWN transport, never from CLI-side config (#957).
 /// The previous form read `CURIE_SLACK_BOT_TOKEN`/`SLACK_BOT_TOKEN`/the persisted
 /// secret vault and claimed a deliberate `--disconnect` could not be overridden
 /// by a stale vault entry. That claim was false and the failure was ugly:
@@ -2998,13 +3011,13 @@ type WorkerTransport = (Option<String>, Option<String>);
 /// SUBPROCESS environment, and a child process cannot set its parent's env, so
 /// a vault token from `curie secrets set SLACK_BOT_TOKEN` (the documented #749
 /// setup) stayed visible to the CLI. A stub-only stack would then post a real
-/// placeholder into a real channel while the worker updated the stub -- an
+/// placeholder into a real channel while the gateway updated the stub -- an
 /// orphaned "..." in a customer channel and a reply nobody sees.
 ///
 /// Two conditions, both read from the container:
 ///
 /// 1. `SLACK_API_BASE_URL` must NOT point at the local stub. This is the
-///    definitive signal: it is literally the transport the worker will use to
+///    definitive signal: it is literally the transport the gateway will use to
 ///    edit the placeholder, so if it is the stub, no real post can ever be
 ///    updated, whatever any token says.
 ///
@@ -3015,14 +3028,14 @@ type WorkerTransport = (Option<String>, Option<String>);
 ///    compose's single-dash `${SLACK_API_BASE_URL-http://localhost:8155/api/}`
 ///    preserves an explicitly empty value rather than re-defaulting it, and
 ///    `docs/slack-local-runbook.md` documents the convention; the cluster tier
-///    says the same thing with `worker.slackApiBaseUrl=`. Empty therefore means
+///    says the same thing with `gateway.slackApiBaseUrl=`. Empty therefore means
 ///    "no override -> real slack.com", which is exactly what
 ///    `SlackTransport::new(None, ..)` resolves to. What genuinely carries no
 ///    information is an ABSENT value (`None`): the probe could not read the
 ///    container at all, and that stays the stub path.
 /// 2. the token must be a real one, not the `xoxb-dev` sentinel.
 ///
-/// Returning the worker's OWN token (rather than one the CLI resolved) also
+/// Returning the gateway's OWN token (rather than one the CLI resolved) also
 /// keeps the posting identity equal to the updating identity: Slack only lets the
 /// authoring bot `chat.update` a message, so two different tokens would leave the
 /// placeholder stuck at "..." with `cant_update_message` (#957 mode B).
@@ -3031,17 +3044,19 @@ type WorkerTransport = (Option<String>, Option<String>);
 /// values were already read out of the same container here; only the token was
 /// kept, and the base was then re-read from the CLI's own process environment at
 /// post time. Carrying the pair means the placeholder goes exactly where the
-/// worker that will edit it is pointed, and a stale `SLACK_API_BASE_URL` in the
+/// gateway that will edit it is pointed, and a stale `SLACK_API_BASE_URL` in the
 /// operator's shell has nothing left to decide.
 ///
 /// Pure, so both conditions are unit-testable without Docker.
-fn connected_worker_transport(transport: WorkerTransport) -> Option<crate::slack::SlackTransport> {
+fn connected_gateway_transport(
+    transport: GatewayTransport,
+) -> Option<crate::slack::SlackTransport> {
     let (api_base, token) = transport;
     // Absent, not empty. `None` means the value was never read off the container
-    // -- there is no worker transport to trust, so take the stub path (#1031).
+    // -- there is no gateway transport to trust, so take the stub path (#1031).
     let api_base = api_base?;
     // Wired to the stub is not connected: the stub is literally the transport the
-    // worker will edit the placeholder over, so no real post can ever be updated.
+    // gateway will edit the placeholder over, so no real post can ever be updated.
     let Ok(resources) = crate::local::current_resources() else {
         return None;
     };
@@ -3050,13 +3065,13 @@ fn connected_worker_transport(transport: WorkerTransport) -> Option<crate::slack
     }
     let token = token?.trim().to_string();
     // An EMPTY base is carried through as "the source named no base", which
-    // `SlackTransport::new` resolves to real Slack -- the same answer the worker
+    // `SlackTransport::new` resolves to real Slack -- the same answer the gateway
     // itself reaches. See the empty-is-connected paragraph above (#1031).
     (!token.is_empty() && token != LOCAL_STUB_BOT_TOKEN)
         .then(|| crate::slack::SlackTransport::new(Some(api_base), token))
 }
 
-/// How long the whole worker-transport probe (resolve the container, then read
+/// How long the whole gateway-transport probe (resolve the container, then read
 /// its env) may take before `local message` gives up on it.
 ///
 /// A wedged docker daemon accepts the request and then never answers, so an
@@ -3064,33 +3079,33 @@ fn connected_worker_transport(transport: WorkerTransport) -> Option<crate::slack
 /// "a probe failure falls back to the safe stub path" claim vacuous, since
 /// nothing ever fails. Two local `docker` reads have no business taking longer
 /// than this (#1031).
-const WORKER_PROBE_TIMEOUT: Duration = Duration::from_secs(10);
+const GATEWAY_PROBE_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// Read the running compose worker's Slack transport out of the container.
+/// Read the running compose gateway's Slack transport out of the container.
 ///
-/// `docker inspect` on the worker container, so what we act on is what the worker
+/// `docker inspect` on the gateway container, so what we act on is what the gateway
 /// holds -- the reconciliation #957 asks for.
 ///
 /// The container is resolved through the compose SERVICE LABEL
-/// ([`local_worker_container`] / [`COMPOSE_WORKER_SERVICE`]), never by a
+/// ([`local_gateway_container`] / [`COMPOSE_GATEWAY_SERVICE`]), never by a
 /// hardcoded name. Container names carry the compose project
-/// (`<project>-curie-worker-1`, and the CLI pins `COMPOSE_PROJECT_NAME=curie`),
-/// so inspecting a bare `curie-worker` matched nothing on a default stack and
+/// (`<project>-curie-channel-gateway-1`, with the project selected per run),
+/// so inspecting a bare `curie-gateway` matched nothing on a default stack and
 /// silently classified every stack as disconnected (#1031). The selector also
 /// closes the inverse hazard: an unrelated container that merely happens to be
-/// NAMED `curie-worker` carries no compose service label, so it can no longer
-/// impersonate the worker and hand this probe a real token the actual worker
+/// NAMED `curie-gateway` carries no compose service label, so it can no longer
+/// impersonate the gateway and hand this probe a real token the actual gateway
 /// does not hold.
 ///
 /// Failures are returned rather than swallowed, so the caller can say that the
 /// probe could not run instead of asserting a disconnected stack it never saw.
-async fn running_worker_transport() -> Result<WorkerTransport> {
-    let worker = local_worker_container().await?;
+async fn running_gateway_transport() -> Result<GatewayTransport> {
+    let gateway = local_gateway_container().await?;
     let cmd = OpsCommand::new(
         "docker",
         vec![
             plain("inspect"),
-            plain(&worker),
+            plain(&gateway),
             plain("--format"),
             plain("{{range .Config.Env}}{{println .}}{{end}}"),
         ],
@@ -3098,7 +3113,7 @@ async fn running_worker_transport() -> Result<WorkerTransport> {
     let (ok, stdout, stderr) = run_capture(&cmd).await?;
     if !ok {
         bail!(
-            "inspecting the local worker container {worker}: {}",
+            "inspecting the local gateway container {gateway}: {}",
             stderr.trim()
         );
     }
@@ -3113,12 +3128,12 @@ async fn running_worker_transport() -> Result<WorkerTransport> {
 /// Bound `probe` by `budget`, flattening both a probe error and a timeout into
 /// one operator-facing reason string. Generic over the future purely so the
 /// timeout itself is testable without a wedged daemon.
-async fn bounded_worker_probe<F>(
+async fn bounded_gateway_probe<F>(
     probe: F,
     budget: Duration,
-) -> std::result::Result<WorkerTransport, String>
+) -> std::result::Result<GatewayTransport, String>
 where
-    F: std::future::Future<Output = Result<WorkerTransport>>,
+    F: std::future::Future<Output = Result<GatewayTransport>>,
 {
     match tokio::time::timeout(budget, probe).await {
         Ok(Ok(transport)) => Ok(transport),
@@ -3134,9 +3149,9 @@ where
 /// for the connected mode, got the other one, and was told nothing. Still fall
 /// back -- the stub path never posts to real Slack, and failing the whole command
 /// on a flaky docker would be worse -- but say so (#1031).
-fn worker_probe_warning(reason: &str) -> String {
+fn gateway_probe_warning(reason: &str) -> String {
     format!(
-        "could not determine whether a Slack workspace is connected (the local worker \
+        "could not determine whether a Slack workspace is connected (the local gateway \
          transport probe failed: {}); assuming NOT connected and using the local reply stub",
         reason.trim().lines().next().unwrap_or("no detail")
     )
@@ -3148,10 +3163,10 @@ fn worker_probe_warning(reason: &str) -> String {
 /// (resolve by label -> inspect -> classify) against a `docker` shim; the pure
 /// predicate alone cannot see the wiring both #1031 defects lived in.
 pub async fn local_connected_transport() -> Option<crate::slack::SlackTransport> {
-    match bounded_worker_probe(running_worker_transport(), WORKER_PROBE_TIMEOUT).await {
-        Ok(transport) => connected_worker_transport(transport),
+    match bounded_gateway_probe(running_gateway_transport(), GATEWAY_PROBE_TIMEOUT).await {
+        Ok(transport) => connected_gateway_transport(transport),
         Err(reason) => {
-            crate::ui::ui().warn(&worker_probe_warning(&reason));
+            crate::ui::ui().warn(&gateway_probe_warning(&reason));
             None
         }
     }
@@ -3410,10 +3425,10 @@ async fn message_connected(
         // #957 mode A failure arriving by a different road.
         crate::ops::SlackApiBase::Unknown => {
             anyhow::bail!(
-                "could not read the Slack API base from the worker Deployment for release \
+                "could not read the Slack API base from the channel gateway Deployment for release \
                  {} in namespace {}; refusing to guess where a real workspace token should be \
                  sent. Check `kubectl -n {} get deployment -l \
-                 app.kubernetes.io/instance={},app.kubernetes.io/component=worker`.",
+                 app.kubernetes.io/instance={},app.kubernetes.io/component=channel-gateway`.",
                 opts.release,
                 opts.namespace,
                 opts.namespace,
@@ -3422,10 +3437,7 @@ async fn message_connected(
         }
     };
 
-    let valkey_url = format!(
-        "redis://:{}@127.0.0.1:{valkey_local_port}",
-        opts.valkey_password
-    );
+    let valkey_url = local_valkey_url(&opts.valkey_password, "127.0.0.1", valkey_local_port);
     let mut conn = connect(&valkey_url).await?;
     enqueue_over_connected_transport(&opts, &mut conn, TurnVerb::Cluster, &channel, &transport)
         .await
@@ -3472,7 +3484,16 @@ pub async fn message(mut opts: MessageOpts) -> Result<()> {
     // against its ts with no per-turn endpoint, so the approval card and any
     // resumed reply ride the connected transport. A kubectl failure remains
     // fail-closed; only positively observed absence selects the built-in relay.
-    if dispatcher_connected_strict(&opts.namespace, &fullname).await? {
+    if dispatcher_connected_strict(&opts.namespace, &fullname)
+        .await
+        .map_err(|error| {
+            crate::ops::cluster_message_context_error(
+                error,
+                opts.context.is_some(),
+                &crate::kube_context::available_contexts(),
+            )
+        })?
+    {
         return message_connected(opts, &fullname).await;
     }
 
@@ -3515,10 +3536,7 @@ pub async fn message(mut opts: MessageOpts) -> Result<()> {
 
     // Enqueue the exact Slack binding coordinates the dispatcher would produce,
     // with only the reserved adapter/ref selecting the built-in relay.
-    let valkey_url = format!(
-        "redis://:{}@127.0.0.1:{valkey_local_port}",
-        opts.valkey_password
-    );
+    let valkey_url = local_valkey_url(&opts.valkey_password, "127.0.0.1", valkey_local_port);
     let mut conn = connect(&valkey_url).await?;
     let (channel, thread_ts, _) = resolve_targets(Some(&channel), opts.thread.as_deref());
     let (event, reply_ref) = cluster_relay_turn(&channel, identity.as_deref(), &opts, &thread_ts);
@@ -3872,14 +3890,12 @@ pub fn eval_dry_run_lines(
     )];
     if opts.local {
         let resources = crate::local::current_resources()?;
-        let valkey_url = local_valkey_url(
-            &opts.valkey_password,
-            &resources.valkey_host,
-            resources.valkey_port,
-        );
         let api_base = local_api_base(opts.api_url.as_deref().or(Some(resources.api_url.as_str())));
         lines.push("local mode (compose stack; no kubectl/helm)".to_string());
-        lines.push(format!("enqueue onto redis {valkey_url}"));
+        lines.push(format!(
+            "enqueue onto redis redis://{}:{}",
+            resources.valkey_host, resources.valkey_port
+        ));
         lines.push(format!(
             "stub advertised at http://localhost:{}/api/",
             resources.stub_port
@@ -3994,6 +4010,7 @@ async fn run_eval_turns(
                 // Thread reset (#1534) must use the same prefixed key the
                 // worker claimed.
                 let (channel_id, thread_ts, placeholder_ts) = resolve_targets(Some(channel), None);
+                let author = eval_author(&case.sender, opts.user.as_str());
                 let (event, relay_ref) = match &transport {
                     EvalReplyTransport::Stub(stub) => {
                         let reply_endpoint = stub.base_api_url().to_string();
@@ -4002,7 +4019,7 @@ async fn run_eval_turns(
                                 eval_case_turn(
                                     "slack",
                                     &channel_id,
-                                    &opts.user,
+                                    author,
                                     &case.input,
                                     &thread_ts,
                                     &placeholder_ts,
@@ -4018,7 +4035,7 @@ async fn run_eval_turns(
                         let mut event = eval_case_turn(
                             "slack",
                             &channel_id,
-                            &opts.user,
+                            author,
                             &case.input,
                             &thread_ts,
                             reply_ref.hyphenated().to_string(),
@@ -4503,6 +4520,7 @@ async fn probe_fake_model(
 /// `the_probe_matches_the_worker_service_compose_declares` pins this against the
 /// compose file so a service rename cannot silently blind the probe again.
 pub(crate) const COMPOSE_WORKER_SERVICE: &str = "curie-worker";
+const COMPOSE_GATEWAY_SERVICE: &str = "curie-channel-gateway";
 
 /// The label selector the probe matches on, quoted into diagnostics so an
 /// operator can re-run the same `docker ps` and see what the CLI saw.
@@ -4564,6 +4582,41 @@ async fn local_worker_container() -> Result<String> {
         bail!("listing the local worker container: {}", stderr.trim());
     }
     select_worker_container(&stdout)
+}
+
+async fn local_gateway_container() -> Result<String> {
+    let project = crate::local::current_resources()?.project;
+    let cmd = OpsCommand::new(
+        "docker",
+        vec![
+            plain("ps"),
+            plain("--filter"),
+            plain(format!(
+                "label=com.docker.compose.service={COMPOSE_GATEWAY_SERVICE}"
+            )),
+            plain("--filter"),
+            plain(format!("label=com.docker.compose.project={project}")),
+            plain("--format"),
+            plain("{{.Names}}"),
+        ],
+    );
+    let (ok, stdout, _) = run_capture(&cmd).await?;
+    let names: Vec<_> = stdout
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .collect();
+    let selector = format!("label=com.docker.compose.service={COMPOSE_GATEWAY_SERVICE}");
+    if !ok {
+        bail!("listing the local gateway container failed");
+    }
+    match names.as_slice() {
+        [only] => Ok(only.trim().to_string()),
+        [] => bail!("no running container matches `{selector}`; start it with curie local up"),
+        many => bail!(
+            "{} running containers match `{selector}`; stop the extra gateways",
+            many.len()
+        ),
+    }
 }
 
 /// The `--model` sweep at the local/cluster tier: enqueue one platform eval per
@@ -5157,10 +5210,7 @@ async fn eval_cluster(opts: EvalOpts, suite: EvalSuite) -> Result<()> {
     };
     ui.note(&format!("routing to channel {channel}"));
 
-    let valkey_url = format!(
-        "redis://:{}@127.0.0.1:{valkey_local_port}",
-        opts.valkey_password
-    );
+    let valkey_url = local_valkey_url(&opts.valkey_password, "127.0.0.1", valkey_local_port);
     let mut conn = connect(&valkey_url).await?;
 
     let results = match run_eval_turns(
@@ -5188,19 +5238,28 @@ mod tests {
     const PERSIST_HINT_DRIVER: &str = "CURIE_TEST_PERSIST_HINT_DRIVER";
 
     fn capture_persist_hint(mode: &str) -> std::process::Output {
+        capture_persist_hint_state(mode).0
+    }
+
+    fn capture_persist_hint_state(mode: &str) -> (std::process::Output, Option<serde_json::Value>) {
         let dir = tempfile::tempdir().expect("tempdir");
-        std::process::Command::new(std::env::current_exe().expect("current test binary"))
-            .args([
-                "--exact",
-                "message::tests::persist_and_hint_subprocess_driver",
-                "--nocapture",
-            ])
-            .env(PERSIST_HINT_DRIVER, mode)
-            .env("NO_COLOR", "1")
-            .env("CI", "1")
-            .current_dir(dir.path())
-            .output()
-            .expect("run hint driver")
+        let output =
+            std::process::Command::new(std::env::current_exe().expect("current test binary"))
+                .args([
+                    "--exact",
+                    "message::tests::persist_and_hint_subprocess_driver",
+                    "--nocapture",
+                ])
+                .env(PERSIST_HINT_DRIVER, mode)
+                .env("NO_COLOR", "1")
+                .env("CI", "1")
+                .current_dir(dir.path())
+                .output()
+                .expect("run hint driver");
+        let state = std::fs::read_to_string(dir.path().join(".curie/last-turn.json"))
+            .ok()
+            .map(|raw| serde_json::from_str(&raw).expect("saved turn JSON"));
+        (output, state)
     }
 
     fn captured_stderr(output: &std::process::Output) -> String {
@@ -5215,11 +5274,13 @@ mod tests {
         let mut opts = MessageOpts::default();
         match mode.as_str() {
             "cluster-short" => {
+                opts.context = Some("scratch-cluster".into());
                 opts.namespace = "acme-platform".into();
                 opts.release = "acme-prod".into();
                 persist_and_hint(&opts, TurnVerb::Cluster, "C0EXAMPLE1", "1700000000.000100");
             }
             "cluster-fallback" => {
+                opts.context = Some("scratch-cluster".into());
                 opts.namespace = "acme-platform".into();
                 opts.release = "acme-prod".into();
                 std::fs::write(".curie", "blocks the state directory")
@@ -5239,7 +5300,17 @@ mod tests {
                     .expect("create state obstruction");
                 persist_and_hint(&opts, TurnVerb::Cluster, "C0EXAMPLE1", "1700000000.000100");
             }
+            "cluster-context-special" | "cluster-context-special-fallback" => {
+                opts.context = Some("ctx '$;\\name".into());
+                opts.namespace = "ns space;$".into();
+                opts.release = "rel'quote".into();
+                if mode.ends_with("fallback") {
+                    std::fs::write(".curie", "obstruction").unwrap();
+                }
+                persist_and_hint(&opts, TurnVerb::Cluster, "C0EXAMPLE1", "1700000000.000100");
+            }
             "local" => {
+                opts.context = Some("must-not-appear".into());
                 opts.namespace = "must-not-appear".into();
                 opts.release = "must-not-appear".into();
                 persist_and_hint(&opts, TurnVerb::Local, "C0EXAMPLE1", "1700000000.000100");
@@ -5330,6 +5401,60 @@ mod tests {
                     case.name
                 );
             }
+        }
+    }
+
+    #[test]
+    fn continue_hint_context_short_and_fallback() {
+        for mode in ["cluster-short", "cluster-fallback"] {
+            let (output, state) = capture_persist_hint_state(mode);
+            let text = captured_stderr(&output);
+            assert!(output.status.success(), "{mode}: {text}");
+            assert!(text.contains(
+                "curie cluster message --context scratch-cluster --namespace acme-platform --release acme-prod"
+            ), "{mode}: {text}");
+            if mode == "cluster-short" {
+                assert!(text.contains("--continue"), "{text}");
+                assert_eq!(state.unwrap()["context"], "scratch-cluster");
+            } else {
+                assert!(text.contains("could not save turn context"), "{text}");
+                assert!(
+                    text.contains("--channel 'C0EXAMPLE1' --thread 1700000000.000100"),
+                    "{text}"
+                );
+                assert!(!text.contains("--continue"), "{text}");
+                assert!(state.is_none());
+            }
+        }
+    }
+
+    #[test]
+    fn continue_hint_without_context_and_local() {
+        for mode in ["cluster-default", "cluster-default-fallback", "local"] {
+            let output = capture_persist_hint(mode);
+            let text = captured_stderr(&output);
+            assert!(output.status.success(), "{mode}: {text}");
+            assert!(!text.contains("--context"), "{mode}: {text}");
+            if mode == "local" {
+                assert!(text.contains("curie local message --continue"), "{text}");
+                assert!(!text.contains("must-not-appear"), "{text}");
+            }
+        }
+    }
+
+    #[test]
+    fn continue_hint_context_quotes_special_characters_in_both_branches() {
+        for mode in [
+            "cluster-context-special",
+            "cluster-context-special-fallback",
+        ] {
+            let output = capture_persist_hint(mode);
+            let text = captured_stderr(&output);
+            assert!(output.status.success(), "{mode}: {text}");
+            assert!(text.contains(&format!(
+                r"curie cluster message --context {} --namespace 'ns space;$' --release 'rel'\''quote'",
+                r"'ctx '\''$;\name'"
+            )), "{mode}: {text}");
         }
     }
 
@@ -6262,9 +6387,9 @@ mod tests {
     }
 
     /// A stalled private executable drives the real readiness wait without
-    /// depending on kubectl, DNS, or a cluster. Each trial must spend its lookup
-    /// budget, return the turn channel, and kill the PID the shim recorded.
-    /// Removing the shared timeout fails the outer harness; removing
+    /// depending on kubectl, DNS, or a cluster. Each trial advances an injected
+    /// clock to prove expiry returns the turn channel and kills the recorded PID.
+    /// Removing the shared timeout leaves the lookup pending at expiry; removing
     /// `kill_on_drop` leaves that known child alive and fails cleanup.
     #[tokio::test]
     async fn the_cluster_arm_degrades_without_leaking_a_port_forward() {
@@ -6304,7 +6429,7 @@ mod tests {
 
         let temp = tempfile::tempdir().expect("create temporary directory");
         let script = temp.path().join("stalled-port-forward");
-        crate::test_executable::install(&script, "#!/bin/sh\necho $$ > \"$1\"\nexec sleep 60\n");
+        crate::test_executable::install(&script, "#!/bin/sh\necho $$ > \"$1\"\nexec sleep 86400\n");
         let opts = MessageOpts {
             api_key: HINT_API_KEY.to_string(),
             local: false,
@@ -6321,9 +6446,9 @@ mod tests {
             );
             let mut plumbing = Box::pin(start_port_forward(&cmd, opts.api_local_port, "api"));
 
-            // Confirm startup before measuring cancellation. Move the same owned
+            // Confirm real process startup before pausing time. Move the same owned
             // future into the helper so its timeout must drop the real child.
-            let pid = tokio::time::timeout(Duration::from_secs(1), async {
+            let pid = tokio::time::timeout(Duration::from_secs(60), async {
                 loop {
                     tokio::select! {
                         result = &mut plumbing => {
@@ -6348,22 +6473,39 @@ mod tests {
                 "trial {trial}: shim must be alive before cancellation"
             );
 
-            let started = Instant::now();
-            let resolved = tokio::time::timeout(
-                Duration::from_secs(1),
-                hint_channel_with_cluster_plumbing(
-                    &opts,
-                    TurnVerb::Cluster,
-                    HINT_TURN_CHANNEL,
-                    HINT_APPROVAL_ID,
-                    hint_far_deadline(),
-                    budget,
-                    plumbing,
-                ),
-            )
-            .await
-            .expect("the cluster lookup must return before the outer harness expires");
-            let elapsed = started.elapsed();
+            tokio::time::pause();
+            let mut lookup = Box::pin(hint_channel_with_cluster_plumbing(
+                &opts,
+                TurnVerb::Cluster,
+                HINT_TURN_CHANNEL,
+                HINT_APPROVAL_ID,
+                hint_far_deadline(),
+                budget,
+                plumbing,
+            ));
+            assert!(
+                futures_util::poll!(lookup.as_mut()).is_pending(),
+                "trial {trial}: the started port-forward must stall the lookup"
+            );
+            tokio::time::advance(budget - Duration::from_millis(1)).await;
+            assert!(
+                futures_util::poll!(lookup.as_mut()).is_pending(),
+                "trial {trial}: the lookup must remain pending before its budget expires"
+            );
+            assert!(
+                child_running(pid),
+                "trial {trial}: the child must remain alive until expiry"
+            );
+            // Tokio timers have millisecond granularity. Advance one tick past
+            // expiry, far short of the port-forward's own readiness deadline.
+            tokio::time::advance(Duration::from_millis(2)).await;
+            let resolved = match futures_util::poll!(lookup.as_mut()) {
+                std::task::Poll::Ready(resolved) => resolved,
+                std::task::Poll::Pending => {
+                    panic!("trial {trial}: lookup remained pending after its budget expired")
+                }
+            };
+            tokio::time::resume();
 
             assert_eq!(
                 resolved, HINT_TURN_CHANNEL,
@@ -6373,20 +6515,15 @@ mod tests {
                 !resolved.is_empty(),
                 "trial {trial}: the fallback must be nonempty"
             );
-            assert!(
-                elapsed <= budget + Duration::from_millis(500),
-                "trial {trial}: lookup exceeded its budget plus scheduling margin: {elapsed:?}"
-            );
-
-            // The kernel may apply the drop signal after the helper returns.
-            let cleanup_deadline = Instant::now() + Duration::from_millis(500);
-            while child_running(pid) && Instant::now() < cleanup_deadline {
-                tokio::time::sleep(Duration::from_millis(5)).await;
-            }
-            assert!(
-                !child_running(pid),
-                "trial {trial}: lookup left child PID {pid} alive"
-            );
+            // The kernel applies the drop signal independently of Tokio's clock.
+            // This broad watchdog detects a leak, without measuring CPU scheduling.
+            tokio::time::timeout(Duration::from_secs(60), async {
+                while child_running(pid) {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .unwrap_or_else(|_| panic!("trial {trial}: lookup left child PID {pid} alive"));
         }
         eprintln!("cluster hint cancellation passed 50 of 50 trials");
     }
@@ -6473,12 +6610,14 @@ mod tests {
                     address: c.to_string(),
                     adapter: None,
                     allowed_callers: None,
+                    trigger_label: None,
                 })
                 .collect(),
             repo_full_name: None,
             approval_required_tools: None,
             approval_routes: None,
             model: None,
+            reviewer_model: None,
             thinking: None,
             execution_deadline_seconds: None,
             runner_resources: None,
@@ -6488,6 +6627,8 @@ mod tests {
             publication_policy_version: 1,
             publication_draft: false,
             publication_branch_prefix: None,
+            connector_requester_identity: None,
+            connector_requester_identity_version: None,
         }
     }
 
@@ -6500,6 +6641,7 @@ mod tests {
                 address: address.to_string(),
                 adapter: adapter.map(str::to_string),
                 allowed_callers: None,
+                trigger_label: None,
             })
             .collect();
         agent
@@ -6670,6 +6812,7 @@ mod tests {
         MessageOpts {
             text: "hi".into(),
             channel: channel.map(str::to_string),
+            context: None,
             agent: None,
             thread: None,
             namespace: "curie".into(),
@@ -7113,6 +7256,23 @@ mod tests {
     }
 
     #[test]
+    fn local_valkey_url_preserves_reserved_password_characters() {
+        for password in [
+            "example#token",
+            "example+token",
+            "example%2Ftoken",
+            "example/?@token",
+        ] {
+            let client =
+                redis::Client::open(local_valkey_url(password, "localhost", 6379)).unwrap();
+            assert_eq!(
+                client.get_connection_info().redis_settings().password(),
+                Some(password)
+            );
+        }
+    }
+
+    #[test]
     fn local_api_base_prefers_explicit_then_falls_back_to_compose_default() {
         assert_eq!(local_api_base(Some("http://host:9999")), "http://host:9999");
         assert_eq!(local_api_base(None), DEFAULT_LOCAL_API_URL);
@@ -7193,7 +7353,7 @@ mod tests {
 
         // Connected: the worker's transport is real Slack and its token is real.
         assert_eq!(
-            token(connected_worker_transport((
+            token(connected_gateway_transport((
                 t("https://slack.com/api/"),
                 t("xoxb-real")
             ))),
@@ -7204,7 +7364,7 @@ mod tests {
         // worker is wired to the stub, so posting would orphan a "..." in a real
         // channel that the worker can never edit. Not connected.
         assert_eq!(
-            connected_worker_transport((
+            connected_gateway_transport((
                 t("http://localhost:8155/api/"),
                 t("xoxb-real-from-the-vault")
             )),
@@ -7213,7 +7373,7 @@ mod tests {
 
         // The stub sentinel is not a workspace token even if the base URL is odd.
         assert_eq!(
-            connected_worker_transport((t("https://slack.com/api/"), t(LOCAL_STUB_BOT_TOKEN))),
+            connected_gateway_transport((t("https://slack.com/api/"), t(LOCAL_STUB_BOT_TOKEN))),
             None
         );
         // #1031: an EMPTY `SLACK_API_BASE_URL` is this repo's "talk to real Slack"
@@ -7222,7 +7382,7 @@ mod tests {
         // `${SLACK_API_BASE_URL-...}` preserves it, and the runbook documents it.
         // Reading it as disconnected made the connected local transport
         // unreachable. Connected, over real Slack's own base.
-        let empty_base = connected_worker_transport((t(""), t("xoxb-real")))
+        let empty_base = connected_gateway_transport((t(""), t("xoxb-real")))
             .expect("an empty SLACK_API_BASE_URL is the connected signal, not the stub one");
         assert_eq!(empty_base.api_base, crate::slack::DEFAULT_API_BASE);
         assert_eq!(empty_base.bot_token, "xoxb-real");
@@ -7230,14 +7390,14 @@ mod tests {
         // Absent is NOT empty. `None` means the value was never read off the
         // container (no stack, docker down, container renamed), so there is no
         // worker transport to trust -> stub path, never a real post.
-        assert_eq!(connected_worker_transport((None, None)), None);
-        assert_eq!(connected_worker_transport((None, t("xoxb-real"))), None);
+        assert_eq!(connected_gateway_transport((None, None)), None);
+        assert_eq!(connected_gateway_transport((None, t("xoxb-real"))), None);
         assert_eq!(
-            connected_worker_transport((t("https://slack.com/api/"), None)),
+            connected_gateway_transport((t("https://slack.com/api/"), None)),
             None
         );
         assert_eq!(
-            connected_worker_transport((t("https://slack.com/api/"), t("  "))),
+            connected_gateway_transport((t("https://slack.com/api/"), t("  "))),
             None
         );
     }
@@ -7262,7 +7422,7 @@ mod tests {
 
     /// The worker Slack env a `local comms` command actually applies, read back
     /// out of the built `OpsCommand`s the same way compose would.
-    fn worker_slack_env(commands: &[crate::ops::OpsCommand]) -> WorkerTransport {
+    fn gateway_slack_env(commands: &[crate::ops::OpsCommand]) -> GatewayTransport {
         let get = |key: &str| -> Option<String> {
             commands
                 .iter()
@@ -7282,7 +7442,7 @@ mod tests {
     #[test]
     fn local_comms_connect_and_disconnect_round_trip_through_the_probe() {
         let connect = crate::comms::local_connect_commands(&local_comms_opts(false));
-        let connected_env = worker_slack_env(&connect);
+        let connected_env = gateway_slack_env(&connect);
         assert_eq!(
             connected_env.0,
             Some(String::new()),
@@ -7290,7 +7450,7 @@ mod tests {
              ever changes, the probe's reading of empty must change with it"
         );
 
-        let transport = connected_worker_transport(connected_env)
+        let transport = connected_gateway_transport(connected_env)
             .expect("`local comms --connect` must leave the worker classified as connected");
         assert_eq!(transport.api_base, crate::slack::DEFAULT_API_BASE);
         assert_eq!(transport.bot_token, "xoxb-real-workspace");
@@ -7298,7 +7458,7 @@ mod tests {
         // Negative control on the same seam: --disconnect restores the stub, which
         // must stay classified as not connected however real the token looks.
         let disconnect = crate::comms::local_disconnect_commands(&local_comms_opts(true));
-        let disconnected_env = worker_slack_env(&disconnect);
+        let disconnected_env = gateway_slack_env(&disconnect);
         assert!(
             disconnected_env
                 .0
@@ -7307,7 +7467,7 @@ mod tests {
             "`local comms --disconnect` must point the worker back at the stub: {:?}",
             disconnected_env.0
         );
-        assert_eq!(connected_worker_transport(disconnected_env), None);
+        assert_eq!(connected_gateway_transport(disconnected_env), None);
     }
 
     /// #1031 mode C at the local tier: a probe that could not RUN is not evidence
@@ -7315,7 +7475,7 @@ mod tests {
     /// the stub path (the asymmetry `ops::dispatcher_connected` already closed).
     #[test]
     fn a_probe_that_could_not_run_warns_rather_than_claiming_disconnected() {
-        let warning = worker_probe_warning("no running container matches `label=x`");
+        let warning = gateway_probe_warning("no running container matches `label=x`");
         assert!(
             warning.contains("could not determine")
                 && warning.contains("no running container matches `label=x`")
@@ -7324,7 +7484,7 @@ mod tests {
         );
         // Only the first line of a multi-line failure, so a docker stack trace
         // cannot swamp the operator's terminal.
-        let multi = worker_probe_warning("first line\nsecond line");
+        let multi = gateway_probe_warning("first line\nsecond line");
         assert!(
             multi.contains("first line") && !multi.contains("second line"),
             "{multi}"
@@ -7345,7 +7505,7 @@ mod tests {
         // only fire when the budget is not being applied at all.
         let reason = tokio::time::timeout(
             Duration::from_secs(5),
-            bounded_worker_probe(std::future::pending(), budget),
+            bounded_gateway_probe(std::future::pending(), budget),
         )
         .await
         .expect("the probe must be bounded; it never returned")
@@ -7366,6 +7526,78 @@ mod tests {
         rest.split_whitespace().next()?.chars().next()
     }
 
+    /// An interrupted `poll` is not a missing child. `poll` returns `EINTR`
+    /// even when the process restarts interrupted calls.
+    #[cfg(target_os = "linux")]
+    fn readiness_poll_was_interrupted(rc: i32, err: i32) -> bool {
+        rc < 0 && err == libc::EINTR
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn an_interrupted_readiness_poll_is_not_a_failure() {
+        assert!(readiness_poll_was_interrupted(-1, libc::EINTR));
+        assert!(!readiness_poll_was_interrupted(-1, libc::EIO));
+        assert!(!readiness_poll_was_interrupted(1, libc::EINTR));
+    }
+
+    /// Pid of the shim, published on `ready` only after that stub has exec'd.
+    #[cfg(target_os = "linux")]
+    fn pid_published_on(ready: std::fs::File) -> u32 {
+        use std::os::fd::AsRawFd;
+
+        let fd = ready.as_raw_fd();
+        // SAFETY: `fd` is the open fifo this function owns, and these fcntl
+        // commands only change that descriptor's flags.
+        let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+        assert!(flags >= 0, "read fifo flags");
+        assert_eq!(
+            unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) },
+            0,
+            "mark the readiness fifo nonblocking"
+        );
+        let started = std::time::Instant::now();
+        let limit = std::time::Duration::from_secs(10);
+        loop {
+            let left = limit.saturating_sub(started.elapsed());
+            assert!(!left.is_zero(), "the shim never published its pid");
+            let timeout_ms = i32::try_from(left.as_millis()).unwrap_or(i32::MAX);
+            let mut pollfd = libc::pollfd {
+                fd,
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            // SAFETY: `pollfd` points at one stack descriptor for this fifo.
+            let ready_count = unsafe { libc::poll(&raw mut pollfd, 1, timeout_ms) };
+            if ready_count < 0 {
+                let err = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
+                if readiness_poll_was_interrupted(ready_count, err) {
+                    continue;
+                }
+                panic!("readiness poll failed: {err}");
+            }
+            if ready_count == 1 {
+                break;
+            }
+        }
+        let mut buf = [0u8; 64];
+        let n = loop {
+            // SAFETY: `buf` is writable storage and `fd` is the same open fifo.
+            let n = unsafe { libc::read(fd, buf.as_mut_ptr().cast(), buf.len()) };
+            if n < 0 {
+                let err = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
+                if err == libc::EINTR {
+                    continue;
+                }
+                panic!("readiness read failed: {err}");
+            }
+            break n;
+        };
+        assert!(n > 0, "the readiness fifo closed before a pid");
+        let line = std::str::from_utf8(&buf[..n as usize]).expect("pid is utf 8");
+        line.trim().parse().expect("the recorded pid is a number")
+    }
+
     /// #1031(d), second half: bounding the WAIT is not bounding the WORK. A
     /// timeout that only drops the future leaves the `docker` client running
     /// against the wedged daemon, so every timed-out `local message` strands
@@ -7376,30 +7608,57 @@ mod tests {
     #[tokio::test]
     async fn a_timed_out_probe_kills_the_docker_child_it_abandoned() {
         let temp = tempfile::tempdir().expect("create temporary directory");
-        let pidfile = temp.path().join("pid");
+        let ready_path = temp.path().join("ready");
+        use std::os::unix::ffi::OsStrExt;
+        let ready_c =
+            std::ffi::CString::new(ready_path.as_os_str().as_bytes()).expect("ready fifo path");
+        assert_eq!(
+            unsafe { libc::mkfifo(ready_c.as_ptr(), 0o600) },
+            0,
+            "create the readiness fifo: {}",
+            std::io::Error::last_os_error()
+        );
+        // Hold the fifo open for read and write before spawn. The shim's
+        // `echo` then cannot block waiting for a reader, and it cannot finish
+        // the write before this descriptor exists.
+        let ready = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&ready_path)
+            .expect("open readiness fifo");
         let script = temp.path().join("wedged-docker");
         crate::test_executable::install(&script, "#!/bin/sh\necho $$ > \"$1\"\nexec sleep 60\n");
+        // Exec only after the stub's write descriptor is gone. A read-only
+        // reopen that we drop is the barrier: `install` has already synced
+        // and closed its own write.
+        drop(std::fs::File::open(&script).expect("stub is closed"));
 
         let cmd = OpsCommand::new(
             script.to_str().expect("shim path is UTF 8"),
-            vec![plain(pidfile.to_str().expect("pidfile path is UTF 8"))],
+            vec![plain(ready_path.to_str().expect("ready path is UTF 8"))],
         );
-        let reason = bounded_worker_probe(
-            async {
-                let (_ok, _out, _err) = run_capture(&cmd).await?;
-                Ok((None, None))
-            },
-            Duration::from_millis(300),
+        let probe = tokio::spawn(async move {
+            bounded_gateway_probe(
+                async {
+                    let (_ok, _out, _err) = run_capture(&cmd).await?;
+                    Ok((None, None))
+                },
+                Duration::from_millis(300),
+            )
+            .await
+        });
+        let published = tokio::time::timeout(
+            Duration::from_secs(10),
+            tokio::task::spawn_blocking(move || pid_published_on(ready)),
         )
         .await
-        .expect_err("a shim that never answers must time out");
+        .expect("the shim never published its pid");
+        let pid = published.expect("readiness read task");
+        let reason = probe
+            .await
+            .expect("probe task")
+            .expect_err("a shim that never answers must time out");
         assert!(reason.contains("did not answer within"), "{reason}");
-
-        let pid: u32 = std::fs::read_to_string(&pidfile)
-            .expect("the shim recorded its pid before sleeping")
-            .trim()
-            .parse()
-            .expect("the recorded pid is a number");
 
         // The kill is delivered on drop; give the kernel a moment to land it.
         let mut state = proc_state(pid);
@@ -7419,9 +7678,9 @@ mod tests {
     #[test]
     fn the_probe_budget_is_bounded_and_usable() {
         assert!(
-            WORKER_PROBE_TIMEOUT > Duration::ZERO
-                && WORKER_PROBE_TIMEOUT <= Duration::from_secs(30),
-            "{WORKER_PROBE_TIMEOUT:?}"
+            GATEWAY_PROBE_TIMEOUT > Duration::ZERO
+                && GATEWAY_PROBE_TIMEOUT <= Duration::from_secs(30),
+            "{GATEWAY_PROBE_TIMEOUT:?}"
         );
     }
 
@@ -7431,7 +7690,7 @@ mod tests {
         // the same `docker inspect`, so the placeholder goes where the worker that
         // will edit it is pointed. Before this, only the token survived and the base
         // came from whatever the operator happened to have exported.
-        let resolved = connected_worker_transport((
+        let resolved = connected_gateway_transport((
             Some("https://proxy.example/api".to_string()),
             Some("xoxb-worker-actual".to_string()),
         ))
@@ -7440,7 +7699,7 @@ mod tests {
         assert_eq!(resolved.bot_token, "xoxb-worker-actual");
 
         std::env::set_var("SLACK_API_BASE_URL", "http://127.0.0.1:18081/api");
-        let again = connected_worker_transport((
+        let again = connected_gateway_transport((
             Some("https://proxy.example/api".to_string()),
             Some("xoxb-worker-actual".to_string()),
         ))
@@ -7711,6 +7970,7 @@ mod tests {
                 case_sensitive: false,
             },
             shared_history: false,
+            sender: None,
             expect_status,
         }
     }
@@ -7771,6 +8031,15 @@ mod tests {
     }
 
     #[test]
+    fn local_eval_dry_run_hides_raw_and_encoded_valkey_passwords() {
+        let mut opts = eval_opts(true, Some("C123"));
+        opts.valkey_password = "example#private%token".into();
+        let lines = eval_dry_run_lines(&opts, "smoke", 1).unwrap().join("\n");
+        assert!(!lines.contains(&opts.valkey_password));
+        assert!(!lines.contains(&queue::percent_encode_unreserved(&opts.valkey_password)));
+    }
+
+    #[test]
     fn local_eval_dry_run_plan_names_the_tier_suite_and_enqueue() {
         // The `local eval` path with no live stack: the plan is a pure render.
         let lines = eval_dry_run_lines(&eval_opts(true, Some("C123")), "smoke", 3)
@@ -7784,7 +8053,7 @@ mod tests {
         assert!(
             lines
                 .iter()
-                .any(|l| l == "enqueue onto redis redis://:valkeypass@localhost:26379"),
+                .any(|l| l == "enqueue onto redis redis://localhost:26379"),
             "{lines:?}"
         );
         assert!(lines.iter().any(|l| l == "channel C123"), "{lines:?}");
@@ -7971,11 +8240,13 @@ mod tests {
                     address: "C1".into(),
                     adapter: None,
                     allowed_callers: None,
+                    trigger_label: None,
                 }],
                 repo_full_name: None,
                 approval_required_tools: None,
                 approval_routes: None,
                 model: None,
+                reviewer_model: None,
                 thinking: None,
                 execution_deadline_seconds: None,
                 runner_resources: None,
@@ -7985,6 +8256,8 @@ mod tests {
                 publication_policy_version: 1,
                 publication_draft: false,
                 publication_branch_prefix: None,
+                connector_requester_identity: None,
+                connector_requester_identity_version: None,
             },
             Agent {
                 id: "a2".into(),
@@ -7996,11 +8269,13 @@ mod tests {
                     address: "C2".into(),
                     adapter: None,
                     allowed_callers: None,
+                    trigger_label: None,
                 }],
                 repo_full_name: None,
                 approval_required_tools: None,
                 approval_routes: None,
                 model: None,
+                reviewer_model: None,
                 thinking: None,
                 execution_deadline_seconds: None,
                 runner_resources: None,
@@ -8010,6 +8285,8 @@ mod tests {
                 publication_policy_version: 1,
                 publication_draft: false,
                 publication_branch_prefix: None,
+                connector_requester_identity: None,
+                connector_requester_identity_version: None,
             },
         ];
         // Explicit channel picks the matching agent's id.
@@ -8269,7 +8546,7 @@ mod tests {
     /// Compose substitutes its variables from each invocation's own environment,
     /// so after `local up --build` the stack ran `:dev` while `local message`
     /// resolved `:latest` and died on `No module named
-    /// curie_dispatcher.enqueue_once` -- the module the published image predates.
+    /// curie_channel_gateway.slack.enqueue_once` -- the module the published image predates.
     #[test]
     fn the_one_shot_producer_runs_the_stacks_dispatcher_image() {
         let cmd = dispatcher_enqueue_command(

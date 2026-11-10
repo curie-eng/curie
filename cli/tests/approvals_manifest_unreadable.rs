@@ -8,7 +8,7 @@
 //! ready-made reason cannot see that, so every case here makes the HTTP call
 //! actually fail (or succeed) and asserts what the command concluded from it.
 
-mod support;
+use crate::support;
 
 use curie::commands::{approvals, AgentActionOpts, ApprovalCmd, ApprovalsOutput};
 use curie::ui::CliOutput;
@@ -68,6 +68,9 @@ fn gates(out: &ApprovalsOutput) -> (Vec<String>, Option<String>) {
         }
         ApprovalsOutput::OperatorPrincipal { .. } => {
             panic!("expected the gate view, not an operator-principal mint")
+        }
+        ApprovalsOutput::RemediationPrincipal { .. } => {
+            panic!("unexpected remediation-principal mint output")
         }
         ApprovalsOutput::ConsoleLoginCode { .. } => {
             panic!("expected the gate view, not a console login-code mint")

@@ -30,17 +30,6 @@ OTEL_PATH = REPO_ROOT / "otel" / "collector-config.yaml"
 # Artifacts that must carry the SAME data-tier image pins as compose (#2319).
 CHART_VALUES_PATH = REPO_ROOT / "charts" / "curie" / "values.yaml"
 CI_WORKFLOW_PATH = REPO_ROOT / ".github" / "workflows" / "ci.yaml"
-READINESS_DOCKERFILE_PATH = (
-    REPO_ROOT / "charts" / "curie" / "ci" / "postgres-readiness-delay.Dockerfile"
-)
-READINESS_RUNTIME_SCRIPT_PATH = (
-    REPO_ROOT
-    / "charts"
-    / "curie"
-    / "ci"
-    / "runtime"
-    / "langfuse-postgres-readiness-runtime.sh"
-)
 
 DEV_TEXT = DEV_PATH.read_text()
 OTEL_TEXT = OTEL_PATH.read_text()
@@ -146,6 +135,29 @@ def test_otel_collector_references_config_not_host_mount():
     assert "./otel/collector-config.yaml" not in out
 
 
+def test_compose_mounts_require_no_client_host_paths_except_daemon_socket():
+    for label, document in compose_docs():
+        for name, service in document["services"].items():
+            for mount in service.get("volumes", []):
+                if isinstance(mount, dict):
+                    if mount.get("type") != "bind":
+                        continue
+                    source, target = mount["source"], mount["target"]
+                else:
+                    parts = mount.split(":")
+                    if len(parts) == 1:
+                        continue
+                    source, target = parts[:2]
+                    if not source.startswith(("/", ".", "~", "$")):
+                        continue
+                assert (source, target) == (
+                    "/var/run/docker.sock",
+                    "/var/run/docker.sock",
+                ), f"{label} {name} requires a client-host bind: {mount!r}"
+        for name, config in document.get("configs", {}).items():
+            assert "file" not in config, f"{label} config {name} requires a client-host file"
+
+
 def test_curie_images_pinned_non_curie_untouched():
     generate = load_generate()
     out = generate(DEV_TEXT, OTEL_TEXT, version="9.9.9")
@@ -167,10 +179,10 @@ def test_curie_images_pinned_non_curie_untouched():
 def test_data_tier_pins_agree_across_artifacts():
     """The data-tier image pins are the same bytes everywhere they are named (#2319).
 
-    Postgres and Valkey are one pin repeated across four artifacts: a chart that
-    pins one build while compose, the rust job's Valkey service, or the readiness
-    fixture's base image pin another is a stack nobody has actually tested
-    together. ClickHouse is the ONE documented exception (#2210): compose stays on
+    Postgres is one pin in the chart and in compose. Valkey is that same kind of
+    pin in the chart, in compose, and in the rust job's service container. A
+    stack that names two builds has not been tested together. ClickHouse is the
+    ONE documented exception (#2210): compose stays on
     the SSE4.2-safe 24.8 line so an AVX-less developer host can boot, while the
     chart needs the AVX-only 25.12 line for the Langfuse migration set. That split
     is asserted as a split -- compose must sit on a tag the chart itself lists as
@@ -179,33 +191,12 @@ def test_data_tier_pins_agree_across_artifacts():
     values = yaml.safe_load(CHART_VALUES_PATH.read_text())
     workflow = yaml.safe_load(CI_WORKFLOW_PATH.read_text())
 
-    # Postgres: chart == compose (dev and release) == readiness fixture base.
+    # Postgres: chart == compose (dev and release).
     chart_postgres = values["postgres"]["image"]
     for label, doc in compose_docs():
         assert doc["services"]["postgres"]["image"] == chart_postgres, (
-            f"{label} postgres image must match the chart's postgres.image "
-            f"{chart_postgres!r}"
+            f"{label} postgres image must match the chart's postgres.image {chart_postgres!r}"
         )
-
-    dockerfile_args = re.findall(
-        r"^ARG\s+POSTGRES_BASE_IMAGE=(\S+)\s*$",
-        READINESS_DOCKERFILE_PATH.read_text(),
-        re.MULTILINE,
-    )
-    assert dockerfile_args == [chart_postgres], (
-        f"{READINESS_DOCKERFILE_PATH.name} POSTGRES_BASE_IMAGE default "
-        f"{dockerfile_args!r} must be the chart's postgres.image {chart_postgres!r}"
-    )
-
-    runtime_script_pins = re.findall(
-        r'^CHART_DEFAULT_POSTGRES_IMAGE="([^"]+)"\s*$',
-        READINESS_RUNTIME_SCRIPT_PATH.read_text(),
-        re.MULTILINE,
-    )
-    assert runtime_script_pins == [chart_postgres], (
-        f"{READINESS_RUNTIME_SCRIPT_PATH.name} CHART_DEFAULT_POSTGRES_IMAGE "
-        f"{runtime_script_pins!r} must be the chart's postgres.image {chart_postgres!r}"
-    )
 
     # Valkey: chart == compose (dev and release) == the rust job's service container.
     chart_valkey = values["valkey"]["image"]
@@ -264,8 +255,7 @@ def test_rustfs_and_aws_bucket_bootstrap_preserve_the_s3_consumer_contract():
         assert bootstrap is not None, f"{label} must bootstrap the Langfuse bucket through RustFS"
         assert bootstrap.get("image") == "amazon/aws-cli:2.32.6"
         assert (
-            bootstrap.get("depends_on", {}).get("rustfs", {}).get("condition")
-            == "service_healthy"
+            bootstrap.get("depends_on", {}).get("rustfs", {}).get("condition") == "service_healthy"
         )
         bootstrap_command = str(bootstrap.get("entrypoint", ""))
         assert "aws " in bootstrap_command and "s3" in bootstrap_command
@@ -286,7 +276,7 @@ def test_invariants_preserved_from_dev():
 
     assert "x-core-profiles: &core_profiles [core, full]" in out
     assert "x-full-profiles: &full_profiles [full]" in out
-    assert out.count("profiles: *core_profiles") == 8
+    assert out.count("profiles: *core_profiles") == 10
     assert out.count("profiles: *full_profiles") == 6
 
     # No service is added or dropped by the transforms.
@@ -520,6 +510,39 @@ def test_approval_chat_attester_secret_is_independent_and_minimally_distributed(
             )
 
 
+def test_remediation_authority_key_is_set_on_the_api_only():
+    """ADR 0231 (#4231): binding and arming a remediation policy need a key the
+    platform API key cannot derive. It is independent only if no platform-key
+    holder receives it, so on both compose forms ``curie-api`` alone carries
+    ``CURIE_REMEDIATION_AUTHORITY_KEY``, its no-override value is nonblank and
+    differs from ``API_KEY``, and no other service names the variable or holds
+    that value under another name.
+    """
+    env_name = "CURIE_REMEDIATION_AUTHORITY_KEY"
+    for label, doc in compose_docs():
+        services = doc["services"]
+        api = env_map(services["curie-api"])
+
+        assert env_name in api, f"{label}: curie-api has no {env_name}"
+        authority = resolve_shell_default(api[env_name])
+        assert authority and authority.strip(), f"{label}: curie-api {env_name} is blank"
+        assert authority != resolve_shell_default(api["API_KEY"]), (
+            f"{label}: the remediation authority reuses the platform API key"
+        )
+        for service_name, spec in services.items():
+            if service_name == "curie-api":
+                continue
+            env = env_map(spec)
+            assert env_name not in env, f"{label}: {service_name} must not receive {env_name}"
+            assert env_name not in yaml.safe_dump(spec), f"{label}: {service_name} names {env_name}"
+            leaked = [
+                key for key, value in env.items() if resolve_shell_default(value) == authority
+            ]
+            assert not leaked, (
+                f"{label}: {service_name} holds the remediation authority as {leaked}"
+            )
+
+
 def test_dispatcher_depends_on_api_healthy():
     """The dispatcher waits for the API to be healthy before it starts.
 
@@ -603,9 +626,7 @@ def test_worker_traces_to_shipped_collector_by_default():
             f"{otel_endpoint!r}, expected {expected_worker!r}; the host-network "
             "worker cannot resolve a Compose service name"
         )
-        runner_endpoint = resolve_shell_default(
-            env.get("CURIE_RUNNER_OTEL_EXPORTER_OTLP_ENDPOINT")
-        )
+        runner_endpoint = resolve_shell_default(env.get("CURIE_RUNNER_OTEL_EXPORTER_OTLP_ENDPOINT"))
         assert runner_endpoint == expected_runner, (
             f"{label}: runner OTLP endpoint resolves to {runner_endpoint!r}, "
             f"expected {expected_runner!r} on the isolated runner network"
@@ -652,21 +673,24 @@ def test_platform_services_export_to_shipped_collector_by_default(service_name):
         ({"OTEL_EXPORTER_OTLP_ENDPOINT": ""}, "", ""),
         (
             {"OTEL_EXPORTER_OTLP_ENDPOINT": "http://collector.example.com:4318"},
-            "http://collector.example.com:4318", "http://collector.example.com:4318",
+            "http://collector.example.com:4318",
+            "http://collector.example.com:4318",
         ),
         (
             {
                 "OTEL_EXPORTER_OTLP_ENDPOINT": "http://collector.example.com:4318",
                 "CURIE_WORKER_OTEL_EXPORTER_OTLP_ENDPOINT": "",
             },
-            "", "http://collector.example.com:4318",
+            "",
+            "http://collector.example.com:4318",
         ),
         (
             {
                 "OTEL_EXPORTER_OTLP_ENDPOINT": "http://otel-collector:4318",
                 "CURIE_WORKER_OTEL_EXPORTER_OTLP_ENDPOINT": "http://127.0.0.1:24318",
             },
-            "http://127.0.0.1:24318", "http://otel-collector:4318",
+            "http://127.0.0.1:24318",
+            "http://otel-collector:4318",
         ),
     ],
 )
@@ -681,16 +705,33 @@ def test_worker_endpoint_split_executes_compose_interpolation(
             for key in ("OTEL_EXPORTER_OTLP_ENDPOINT", "CURIE_RUNNER_OTEL_EXPORTER_OTLP_ENDPOINT")
         }
         config = tmp_path / label
-        config.write_text(yaml.safe_dump({
-            "services": {"worker": {"image": "example-worker", "environment": selected}}
-        }))
-        clean_env = {key: value for key, value in os.environ.items() if key not in (
-            "OTEL_EXPORTER_OTLP_ENDPOINT", "CURIE_WORKER_OTEL_EXPORTER_OTLP_ENDPOINT"
-        )}
+        config.write_text(
+            yaml.safe_dump(
+                {"services": {"worker": {"image": "example-worker", "environment": selected}}}
+            )
+        )
+        clean_env = {
+            key: value
+            for key, value in os.environ.items()
+            if key
+            not in ("OTEL_EXPORTER_OTLP_ENDPOINT", "CURIE_WORKER_OTEL_EXPORTER_OTLP_ENDPOINT")
+        }
         result = subprocess.run(
-            ["docker", "compose", "--env-file", "/dev/null", "-f", str(config),
-             "config", "--format", "json"],
-            env={**clean_env, **overrides}, capture_output=True, text=True, check=True,
+            [
+                "docker",
+                "compose",
+                "--env-file",
+                "/dev/null",
+                "-f",
+                str(config),
+                "config",
+                "--format",
+                "json",
+            ],
+            env={**clean_env, **overrides},
+            capture_output=True,
+            text=True,
+            check=True,
         )
         rendered = json.loads(result.stdout)["services"]["worker"]["environment"]
         assert rendered["OTEL_EXPORTER_OTLP_ENDPOINT"] == worker_endpoint
@@ -759,12 +800,10 @@ def _assert_component_references_resolve(config, label):
 
         processors = pipeline.get("processors", [])
         assert "memory_limiter" in processors and "batch" in processors, (
-            f"{label}: {signal} pipeline must contain memory_limiter and batch; "
-            f"got {processors!r}"
+            f"{label}: {signal} pipeline must contain memory_limiter and batch; got {processors!r}"
         )
         assert processors.index("memory_limiter") < processors.index("batch"), (
-            f"{label}: {signal} pipeline must limit memory before batching; "
-            f"got {processors!r}"
+            f"{label}: {signal} pipeline must limit memory before batching; got {processors!r}"
         )
 
     extensions = config.get("extensions", {})
@@ -839,9 +878,7 @@ def test_dev_collector_receives_every_signal_with_durable_bounded_delivery():
 
     doc = yaml.safe_load(DEV_TEXT)
     collector = doc["services"]["otel-collector"]
-    volume_name = _collector_storage_mount(
-        collector, storage_directory, "compose.dev.yaml"
-    )
+    volume_name = _collector_storage_mount(collector, storage_directory, "compose.dev.yaml")
     assert volume_name in (doc.get("volumes") or {}), (
         f"compose.dev.yaml: Collector storage volume {volume_name!r} is not declared"
     )
@@ -870,6 +907,14 @@ def test_release_generator_keeps_collector_config_and_storage_in_lockstep():
     )
     assert volume_name in (release.get("volumes") or {}), (
         f"generated compose.release.yaml: storage volume {volume_name!r} is not declared"
+    )
+    perms = release["services"]["otel-collector-perms"]
+    assert "otel_collector_perms_data:/data" in (perms.get("volumes") or []), (
+        "generated compose.release.yaml: otel-collector-perms /data must be "
+        "the named volume otel_collector_perms_data"
+    )
+    assert "otel_collector_perms_data" in (release.get("volumes") or {}), (
+        "generated compose.release.yaml: volume otel_collector_perms_data is not declared"
     )
 
 
@@ -1002,6 +1047,37 @@ def test_release_compose_init_containers_adopted():
     assert_init_containers_adopted(release_text, "compose.release.yaml")
 
 
+# One-shot jobs that run to completion and must not be restarted.
+ONESHOT_SERVICES = {
+    "curie-gateway-replay-perms",
+    "rustfs-init",
+    "rustfs-perms",
+    "ollama-pull",
+    "otel-collector-perms",
+    "curie-migrate",
+}
+
+
+@pytest.mark.parametrize("label_index", [0, 1], ids=["dev", "release"])
+def test_long_running_services_restart_after_a_docker_restart(label_index):
+    """Every long-running service comes back when the Docker daemon restarts.
+
+    Without a restart policy, a Docker Desktop restart (host sleep, update)
+    leaves the data tier Exited while the API and worker come back and
+    crash-loop against it. `unless-stopped` still honours `curie local down`
+    and `docker compose stop`. One-shot jobs keep `restart: "no"`.
+    """
+    label, doc = compose_docs()[label_index]
+    services = doc["services"]
+    assert ONESHOT_SERVICES <= set(services), f"{label}: one-shot list is stale"
+    wrong = {}
+    for name, spec in services.items():
+        expected = "no" if name in ONESHOT_SERVICES else "unless-stopped"
+        if spec.get("restart") != expected:
+            wrong[name] = (spec.get("restart"), expected)
+    assert not wrong, f"{label}: services with the wrong restart policy (got, want): {wrong}"
+
+
 @pytest.mark.skipif(shutil.which("docker") is None, reason="docker not available")
 def test_generated_compose_validates_with_docker(tmp_path):
     generate = load_generate()
@@ -1032,11 +1108,27 @@ def test_threaded_bot_allowlist_reaches_dev_and_generated_release_compose(raw, t
         path.write_text(content)
         result = subprocess.run(
             [
-                "docker", "compose", "--env-file", "/dev/null",
-                "--project-directory", str(REPO_ROOT), "-f", str(path),
-                "--profile", "slack", "--profile", "full", "config", "--format", "json",
+                "docker",
+                "compose",
+                "--env-file",
+                "/dev/null",
+                "--project-directory",
+                str(REPO_ROOT),
+                "-f",
+                str(path),
+                "--profile",
+                "slack",
+                "--profile",
+                "full",
+                "config",
+                "--format",
+                "json",
             ],
-            env=env, capture_output=True, text=True, check=True, timeout=30,
+            env=env,
+            capture_output=True,
+            text=True,
+            check=True,
+            timeout=30,
         )
         dispatcher = json.loads(result.stdout)["services"]["curie-dispatcher"]
         assert dispatcher["environment"]["CURIE_SLACK_THREADED_BOT_ALLOWLIST"] == (raw or "[]")
@@ -1086,9 +1178,7 @@ def test_every_published_port_binds_loopback(label_index):
     label, doc = compose_docs()[label_index]
     ports = list(published_ports(doc))
     assert ports, f"{label}: no published ports found; the walk is broken"
-    exposed = [
-        f"{svc}: {entry!r}" for svc, entry in ports if port_host_ip(entry) != LOOPBACK
-    ]
+    exposed = [f"{svc}: {entry!r}" for svc, entry in ports if port_host_ip(entry) != LOOPBACK]
     assert not exposed, (
         f"{label}: ports published without a {LOOPBACK} host IP (reachable from the "
         f"LAN with fixed credentials): {exposed}"
@@ -1140,9 +1230,7 @@ def test_every_database_url_uses_the_local_install_password():
             urls[name] = url
     assert urls, "no postgres DATABASE_URL found; the walk is broken"
     wrong = {
-        name: url
-        for name, url in urls.items()
-        if f"postgres:{LOCAL_PG_PASSWORD_REF}@" not in url
+        name: url for name, url in urls.items() if f"postgres:{LOCAL_PG_PASSWORD_REF}@" not in url
     }
     assert not wrong, f"DATABASE_URLs not using {LOCAL_PG_PASSWORD_REF}: {wrong}"
     assert "postgres:postgres@" not in DEV_TEXT, (

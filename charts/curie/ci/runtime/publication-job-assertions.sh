@@ -359,6 +359,7 @@ kc wait -n "$NAMESPACE" \
 start_port_forward() {
   local service="$1" remote_port="$2" log_file="$3"
   local pid_name="$4" port_name="$5" pid port="" waited=0
+  : > "$log_file"
   kc port-forward -n "$NAMESPACE" "service/$service" ":$remote_port" \
     > "$log_file" 2>&1 &
   pid=$!

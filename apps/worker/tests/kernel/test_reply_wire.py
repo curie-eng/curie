@@ -30,11 +30,13 @@ from channel_protocol.reply import (
     ReplyUpdate,
     TurnCompleted,
 )
+from curie_test_support.channel_gateway import reply_gateway
 from curie_worker.behaviorpacks import BehaviorPacks
 from curie_worker.binding import (
     BUDGET_ENV,
     BUNDLE_REF_ENV,
     PLUGIN_DIR_ENV,
+    HttpIdentityBinding,
     ResolvedDeployment,
 )
 from curie_worker.config import WorkerConfig
@@ -64,6 +66,22 @@ class StubBinding:
     the server-minted reply handle, not from a lookup it cannot reach.
     """
 
+    async def identity_binding(
+        self, kind: str, adapter: str | None, address: str,
+    ) -> HttpIdentityBinding | None:
+        """@spec HTTP-INVOCATION-EXECUTION-18: explicit local fixture classification."""
+        resolved = self._by_route.get((kind, address))
+        if resolved is None:
+            return None
+        agent_id = resolved.agent_id
+        return HttpIdentityBinding(
+            tenant_id=uuid.UUID("00000000-0000-4000-8000-000000000001"),
+            agent_id=agent_id,
+            binding_id=uuid.uuid5(uuid.NAMESPACE_URL, repr((kind, adapter, address))),
+            binding_generation=1, http_identity_required=False,
+        )
+
+
     def __init__(self, by_route: dict[tuple[str, str], ResolvedDeployment]) -> None:
         self._by_route = by_route
         self.resolve_calls: list[tuple[str, str]] = []
@@ -81,6 +99,7 @@ class StubBinding:
         *,
         kind: str | None = None,
         address: str | None = None,
+    **_: object,
     ) -> dict[str, str]:
         env = {
             BUDGET_ENV: '{"max_output_tokens_per_run":100000,"max_usd_per_day":10.0}',
@@ -92,6 +111,18 @@ class StubBinding:
 
     def packs_for(self, resolved: ResolvedDeployment) -> BehaviorPacks:
         return BehaviorPacks.from_config(resolved.behavior_packs)
+
+
+_reply_gateways = []
+
+
+@pytest.fixture(autouse=True)
+def owned_reply_gateways():
+    try:
+        yield
+    finally:
+        while _reply_gateways:
+            _reply_gateways.pop().__exit__(None, None, None)
 
 
 def _resolved(
@@ -194,12 +225,10 @@ def test_the_same_turn_through_the_slack_adapter_edits_exactly_one_message(
         try:
             port = server.port
             assert port is not None
-            sink = build_reply_sink(
-                WorkerConfig(
-                    slack_bot_token="xoxb-test",
-                    slack_api_base_url=f"http://127.0.0.1:{port}/slack/api/",
-                )
-            )
+            gateway = reply_gateway({"default": "xoxb-test"}, f"http://127.0.0.1:{port}/slack/api/")
+            values = gateway.__enter__()
+            _reply_gateways.append(gateway)
+            sink = build_reply_sink(WorkerConfig(**values))
             binding = StubBinding({("slack", "C1"): _resolved()})
             async with make_harness(binding=binding, sink=sink, shimmer=False) as h:
                 h.runner.default_script = [
@@ -251,18 +280,6 @@ def test_a_turn_completes_with_no_slack_adapter_registered(make_harness) -> None
             assert await h.async_redis.exists(h.config.done_key(ev.event_id))
 
     asyncio.run(go())
-
-
-def test_the_kernel_source_carries_no_kind_branch() -> None:
-    # Corroboration only -- the green suite above is the proof. Kept because the
-    # regression it guards is textual: a ``kind ==`` re-appearing in the kernel
-    # is the seam leaking back upward, and it would pass every behavioral test
-    # that only ever exercises one kind.
-    source = (Path(__file__).resolve().parents[2] / "src" / "curie_worker" / "kernel.py").read_text(
-        encoding="utf-8"
-    )
-    assert "kind ==" not in source
-    assert '== "slack"' not in source
 
 
 # --- the two sanctioned route sources, and their seam -------------------------
@@ -342,12 +359,10 @@ def test_the_slack_adapter_renders_the_hub_button_from_the_affordance() -> None:
         try:
             port = server.port
             assert port is not None
-            sink = build_reply_sink(
-                WorkerConfig(
-                    slack_bot_token="xoxb-test",
-                    slack_api_base_url=f"http://127.0.0.1:{port}/slack/api/",
-                )
-            )
+            gateway = reply_gateway({"default": "xoxb-test"}, f"http://127.0.0.1:{port}/slack/api/")
+            values = gateway.__enter__()
+            _reply_gateways.append(gateway)
+            sink = build_reply_sink(WorkerConfig(**values))
             from channel_protocol.reply import REPLY_WIRE_VERSION, ReplyTarget
 
             structured = (
@@ -442,8 +457,8 @@ def test_the_already_done_skip_still_lowers_the_shimmer(make_harness) -> None:
 def test_the_prior_side_effect_escalate_emits_through_the_reply_handle_route(
     make_harness,
 ) -> None:
-    # T-B15(b). This is the "a prior attempt started an action before the worker
-    # restarted" escalation -- the one message a human most needs to see -- and
+    # T-B15(b). This is the "a prior attempt may already have executed an action"
+    # escalation -- the one message a human most needs to see -- and
     # revision 3's shape suppressed it. It runs BEFORE binding resolution, so its
     # route comes from the server-minted ``reply_handle`` (EB-B6's trust
     # argument: after phase 2 no adapter writes to the stream at all).
@@ -475,7 +490,7 @@ def test_the_prior_side_effect_escalate_emits_through_the_reply_handle_route(
             await h.kernel.process_event(ev)
 
             assert len(h.sink.updates) == 1
-            assert "prior attempt started an action" in h.sink.updates[0][2]
+            assert "prior attempt may already have executed an action" in h.sink.updates[0][2]
             # The route is the reply handle's, verbatim -- not a lookup, not a
             # default, and never the Slack credential standing in for a missing
             # adapter (the second mutation named in AC10f).

@@ -18,8 +18,8 @@ from typing import Any
 
 import httpx
 import pytest
-from curie_dispatcher.identities import SlackBotIds, SlackIdentityCredentials
-from curie_dispatcher.preflight import (
+from curie_channel_gateway.slack.identities import SlackBotIds, SlackIdentityCredentials
+from curie_channel_gateway.slack.preflight import (
     PreflightedIdentity,
     SlackChannelPreflightError,
     check_slack_channel_capabilities,
@@ -280,7 +280,7 @@ def test_a_single_identity_makes_no_auth_test_call_and_returns_default() -> None
 def test_production_clients_carry_each_identitys_own_bot_token(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    from curie_dispatcher import preflight
+    from curie_channel_gateway.slack import preflight
 
     probed: list[tuple[str, str]] = []
 
@@ -360,7 +360,7 @@ def test_every_identity_probes_against_discoverys_one_deadline(
 ) -> None:
     """A fresh deadline per identity would stretch the startup envelope the
     chart checks from one Slack budget to one per identity."""
-    from curie_dispatcher import preflight
+    from curie_channel_gateway.slack import preflight
 
     original = preflight._probe_identity
     deadlines: dict[str, float] = {}
@@ -411,7 +411,7 @@ def test_identities_probe_at_the_same_time(caplog: pytest.LogCaptureFixture) -> 
 def test_capability_probes_carry_each_identitys_own_bot_token(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    from curie_dispatcher import preflight
+    from curie_channel_gateway.slack import preflight
 
     calls: list[tuple[str, str]] = []
 
@@ -624,7 +624,7 @@ def test_an_unexpected_probe_error_is_redacted_and_skips_only_that_identity(
     monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    from curie_dispatcher import preflight
+    from curie_channel_gateway.slack import preflight
 
     original = preflight._slack_probe_client
 
@@ -729,7 +729,7 @@ def test_a_provider_call_that_ignores_its_timeout_cannot_hold_every_identity(
 def test_a_name_missing_from_web_clients_raises_rather_than_reaching_slack(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    from curie_dispatcher import preflight
+    from curie_channel_gateway.slack import preflight
 
     constructed: list[object] = []
 

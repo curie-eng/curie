@@ -1,28 +1,66 @@
 """Eval endpoints (K1): the matrix grid and the PR-check report callback."""
 
+import re
+from datetime import UTC, datetime, timedelta
+
 from aci_protocol import EvalJob
 from fastapi import APIRouter, Depends, HTTPException, status
 
-from .. import crud
+from curie_api.crud import agents as crud_agents
+from curie_api.crud import deployments as crud_deployments
+from curie_api.crud import versions as crud_versions
+from curie_api.schemas.evals import (
+    EvalMatrix,
+    EvalReportResult,
+    EvalTriggerRequest,
+    EvalTriggerResult,
+)
+
 from ..auth import require_api_key
 from ..config import get_settings
 from ..deps import EvalQueueDep, GitHubReporterDep, LangfuseDep, SessionDep
 from ..evalqueue import now_iso
 from ..evals import build_matrix
 from ..github_checks import GitHubReportError
+from ..langfuse import LangfuseReadLimitExceeded
 from ..models import Environment
 from ..repo_full_name import InvalidRepoFullName
-from ..schemas import (
-    EvalMatrix,
-    EvalReportResult,
-    EvalTriggerRequest,
-    EvalTriggerResult,
-)
 from ..wirebody import EvalReportBody
 
 router = APIRouter(
     prefix="/evals", tags=["evals"], dependencies=[Depends(require_api_key)]
 )
+
+
+def _stream_trace_window(stream_id: str) -> datetime | None:
+    """Read the enqueue milliseconds from a concrete Redis stream entry ID."""
+    match = re.fullmatch(r"([0-9]{1,20})-([0-9]{1,20})", stream_id)
+    if match is None:
+        raise HTTPException(
+            status.HTTP_422_UNPROCESSABLE_CONTENT,
+            "stream_id must be a Redis stream entry ID (<milliseconds>-<sequence>)",
+        )
+    milliseconds, sequence = map(int, match.groups())
+    if max(milliseconds, sequence) > 2**64 - 1 or (milliseconds, sequence) == (0, 0):
+        raise HTTPException(
+            status.HTTP_422_UNPROCESSABLE_CONTENT, "stream_id is outside the Redis entry ID range"
+        )
+    # Pinned ClickHouse DateTime64 supports dates through 2299. Validate the
+    # enqueue timestamp itself, before allowing clock skew in the query bound.
+    # https://github.com/ClickHouse/ClickHouse/blob/v24.8.14.39-lts/docs/en/sql-reference/data-types/datetime64.md
+    if milliseconds > 10_413_791_999_999:
+        raise HTTPException(
+            status.HTTP_422_UNPROCESSABLE_CONTENT,
+            "stream_id timestamp is outside the supported range",
+        )
+    lower_milliseconds = max(0, milliseconds - 5_000)
+    # Langfuse serializes this filter as numeric milliseconds. The pinned
+    # ClickHouse parser interprets smaller values as seconds (or rejects them).
+    # Omit this optimization for early IDs; exact stream metadata still filters.
+    # https://github.com/ClickHouse/ClickHouse/blob/v24.8.14.39-lts/src/IO/ReadHelpers.h
+    if lower_milliseconds < 10_413_792_000:
+        return None
+    return datetime(1970, 1, 1, tzinfo=UTC) + timedelta(milliseconds=lower_milliseconds)
 
 
 @router.post("/trigger", response_model=EvalTriggerResult)
@@ -33,19 +71,19 @@ async def trigger_eval(
     # enqueue the SAME EvalJob onto curie:evals, minus the push-only
     # gate. This does NOT parse the eval-case format (worker/CLI concern); it
     # only resolves and emits agent_id/version_id/sha/suite/bundle_ref.
-    agent = await crud.get_agent(session, body.agent_id)
+    agent = await crud_agents.get_agent(session, body.agent_id)
     if agent is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "agent not found")
 
     if body.version_id is not None:
-        version = await crud.get_version(session, body.version_id)
+        version = await crud_versions.get_version(session, body.version_id)
         if version is None or version.agent_id != agent.id:
             raise HTTPException(
                 status.HTTP_404_NOT_FOUND, "version not found for this agent"
             )
         sha = version.commit_sha or version.bundle_sha256
     else:
-        deployment = await crud.get_active_deployment(
+        deployment = await crud_deployments.get_active_deployment(
             session, agent.id, Environment.dev
         )
         if deployment is None:
@@ -53,7 +91,7 @@ async def trigger_eval(
                 status.HTTP_404_NOT_FOUND,
                 "agent has no active dev deployment to evaluate",
             )
-        version = await crud.get_version(session, deployment.version_id)
+        version = await crud_versions.get_version(session, deployment.version_id)
         if version is None:
             raise HTTPException(
                 status.HTTP_404_NOT_FOUND, "deployed version not found"
@@ -111,7 +149,23 @@ async def eval_matrix(
     # Filtered by SUITE, the real dimension on eval traces. There is
     # deliberately no agent filter: eval traces are tagged by suite + version,
     # not agent, so an agent param would be dead. Do not re-add one.
-    traces = await lf.list_traces_by_tags(["eval", f"suite:{suite}"])
+    from_timestamp = _stream_trace_window(stream_id) if stream_id is not None else None
+    # Matrix outcomes and recorded costs live in metadata (io); it needs no
+    # observation, score or metric aggregations, including for historical reads.
+    try:
+        traces = await lf.list_traces_by_tags(
+            ["eval", f"suite:{suite}"],
+            from_timestamp=from_timestamp,
+            fields="core,io",
+            # A unique order prevents omissions when timestamp ties cross pages.
+            order_by="id.asc",
+            require_complete=True,
+        )
+    except LangfuseReadLimitExceeded as exc:
+        raise HTTPException(
+            status.HTTP_503_SERVICE_UNAVAILABLE,
+            "matrix history exceeds the complete read bound; select a narrower stream_id",
+        ) from exc
     if stream_id is not None:
         traces = [
             trace

@@ -75,4 +75,47 @@ for value in '{}' null; do
   render "${BASE[@]}" -f "$TMP/tls.yaml"
   if [[ "$value" == null ]]; then check disabled; else check enabled; fi
 done
-echo "api-ingress-assertions: all routing, identity and TLS assertions passed"
+
+# Check the API container environment, not an unrelated workload or a
+# similarly named value elsewhere in the rendered chart.
+render -s templates/api.yaml
+python3 - "$TMP/render.yaml" "$CHART/values.yaml" <<'PY' || exit 1
+import sys
+from pathlib import Path
+
+import yaml
+
+deployments = [
+    document for document in yaml.safe_load_all(Path(sys.argv[1]).read_text())
+    if document and document.get("kind") == "Deployment"
+]
+if len(deployments) != 1:
+    raise SystemExit(f"FAIL [g] expected one API Deployment, found {len(deployments)}")
+containers = deployments[0]["spec"]["template"]["spec"]["containers"]
+api = [container for container in containers if container["name"] == "api"]
+if len(api) != 1:
+    raise SystemExit(f"FAIL [g] expected one API container, found {len(api)}")
+values = [
+    entry.get("value") for entry in api[0]["env"]
+    if entry["name"] == "FORWARDED_ALLOW_IPS"
+]
+if values != [""]:
+    raise SystemExit(f"FAIL [g] FORWARDED_ALLOW_IPS rendered {values!r}, expected one empty value")
+with open(sys.argv[2]) as stream:
+    chart_values = yaml.safe_load(stream)
+if "forwardedAllowIps" in chart_values["api"]:
+    raise SystemExit("FAIL [g] api.forwardedAllowIps exposes forbidden proxy trust configuration")
+PY
+
+# Both narrow and universal trust overrides must fail before deployment.
+for configured in '192.0.2.10' '*' '0.0.0.0/0'; do
+  if render --set-string 'api.extraEnv[0].name=FORWARDED_ALLOW_IPS' \
+      --set-string "api.extraEnv[0].value=$configured" \
+      -s templates/api.yaml 2>"$TMP/refused"; then
+    fail h "api.extraEnv accepted FORWARDED_ALLOW_IPS=$configured"
+  fi
+  grep -q 'api.extraEnv contains chart-owned environment variable FORWARDED_ALLOW_IPS' "$TMP/refused" \
+    || fail h "the rejection of $configured did not name the reserved environment"
+done
+
+echo "api-ingress-assertions: all routing, identity, TLS and proxy trust assertions passed"

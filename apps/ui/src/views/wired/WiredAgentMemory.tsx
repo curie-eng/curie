@@ -121,7 +121,7 @@ export function WiredAgentMemory({ agentId }: { agentId: string }) {
             {entries.map((entry) => {
               const busy = busyIndex === entry.index;
               const editing = editingIndex === entry.index;
-              const traces = entry.provenance.source_trace_ids;
+              const traces = entry.provenance.source_trace_ids ?? [];
               return (
                 <div
                   key={entry.index}

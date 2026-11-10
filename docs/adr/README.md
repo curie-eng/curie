@@ -89,9 +89,9 @@ read verbatim from its `Status:` line. **Do not hand-edit it.** Run
 | 0057 | [`cluster deploy` self-plumbs a port-forward so the generated key stays off the cleartext proxy](0057-cluster-deploy-self-plumbs-port-forward-for-generated-key.md) | Accepted |
 | 0058 | [A pushed tag is not release authority: ancestry, checks, and an approval environment gate publication](0058-tag-push-is-not-release-authority.md) | Accepted |
 | 0059 | [The sandbox is a bounded resource envelope; capacity is a tenant boundary](0059-sandbox-is-a-bounded-resource-envelope.md) | Accepted |
-| 0060 | [The harness is a declared package, not a class](0060-the-harness-is-a-declared-package.md) | Accepted |
-| 0061 | [The harness boundary is an out-of-process adapter, wire-compatible with Omnigent](0061-out-of-process-harness-boundary.md) | Draft |
-| 0062 | [Harness conformance has teeth](0062-harness-conformance-has-teeth.md) | Accepted |
+| 0060 | [The harness is a declared package, not a class](0060-the-harness-is-a-declared-package.md) | Superseded by [ADR 0140](0140-curie-supports-one-model-harness-until-a-second-one-exists.md) |
+| 0061 | [The harness boundary is an out-of-process adapter, wire-compatible with Omnigent](0061-out-of-process-harness-boundary.md) | Draft; program stopped under [ADR 0140](0140-curie-supports-one-model-harness-until-a-second-one-exists.md) before its prerequisite spike ran |
+| 0062 | [Harness conformance has teeth](0062-harness-conformance-has-teeth.md) | Superseded by [ADR 0140](0140-curie-supports-one-model-harness-until-a-second-one-exists.md) |
 | 0063 | [Message-driven approval reply surface](0063-message-driven-approval-reply-surface.md) | Accepted |
 | 0064 | [Fail-forward cluster teardown](0064-fail-forward-cluster-teardown.md) | Accepted |
 | 0065 | [Tag protection, not the workflow gate, binds a write actor](0065-tag-protection-not-the-workflow-gate-binds-a-write-actor.md) | Accepted |
@@ -138,7 +138,7 @@ read verbatim from its `Status:` line. **Do not hand-edit it.** Run
 | 0106 | [An approver is an authenticated principal, never a caller-asserted string](0106-an-approver-is-an-authenticated-principal.md) | Accepted |
 | 0107 | [An agent reads its own runs through a first-party surface, scoped by structured identity](0107-an-agent-reads-its-own-runs-through-a-first-party-scoped-surface.md) | Draft |
 | 0108 | [A deploy target carries its environment's values](0108-a-deploy-target-carries-its-environments-values.md) | Draft |
-| 0109 | [Retention, capacity, and back pressure are one policy: a claim is admitted, not discovered](0109-retention-capacity-and-back-pressure-are-one-policy.md) | Draft |
+| 0109 | [Retention, capacity, and back pressure are one policy: a claim is admitted, not discovered](0109-retention-capacity-and-back-pressure-are-one-policy.md) | Accepted |
 | 0110 | [Deterministic security posture classification distinguishes manifest declarations from operator gates](0110-deterministic-security-posture-classification.md) | Draft |
 | 0111 | [The default memory compaction algorithm](0111-the-default-memory-compaction-algorithm.md) | Draft |
 | 0112 | [A turn source names what caused the turn, not the channel it arrived on](0112-a-turn-source-names-what-caused-the-turn.md) | Draft |
@@ -150,15 +150,15 @@ read verbatim from its `Status:` line. **Do not hand-edit it.** Run
 | 0118 | [Binding cardinality is the multi surface opt in](0118-binding-cardinality-is-the-multi-surface-opt-in.md) | Accepted |
 | 0119 | [A resumed thread rebuilds its prefix so the prompt cache still hits](0119-a-resumed-thread-rebuilds-its-prefix-so-the-prompt-cache-still-hits.md) | Accepted |
 | 0120 | [First-party email delivery state is local durable single-writer state](0120-durable-first-party-email-state.md) | Accepted |
-| 0121 | [A restore is the connector's own verb, run under the same pinned connector](0121-a-restore-is-the-connectors-own-verb-run-under-the-same-pinned-connector.md) | Draft |
+| 0121 | [A restore is the connector's own verb, run under the same pinned connector](0121-a-restore-is-the-connectors-own-verb-run-under-the-same-pinned-connector.md) | Accepted |
 | 0122 | [A warm pool's runner token is per version, not per pod](0122-a-warm-pools-runner-token-is-per-version-not-per-pod.md) | Accepted |
 | 0123 | [A pending approval's approver set does not follow its route binding](0123-a-pending-approvals-approver-set-does-not-follow-its-route-binding.md) | Accepted |
-| 0124 | [A snapshot is sealed to the connector that wrote it](0124-a-snapshot-is-sealed-to-the-connector-that-wrote-it.md) | Draft |
+| 0124 | [A snapshot is sealed to the connector that wrote it](0124-a-snapshot-is-sealed-to-the-connector-that-wrote-it.md) | Accepted |
 | 0125 | [Managed repository workspaces and approval-gated publication are platform capabilities](0125-managed-repository-workspaces-and-approval-gated-publication.md) | Accepted |
 | 0126 | [Runtime repository selection is sticky authorized thread state](0126-runtime-repository-selection-is-sticky-authorized-thread-state.md) | Accepted |
 | 0127 | [An inbound ACP client admits any ACP harness behind the harness port](0127-an-inbound-acp-client-admits-any-acp-harness.md) | Draft |
 | 0128 | [An installation owns the model gateway and operator bindings select its aliases](0128-install-owned-model-gateway-and-agent-aliases.md) | Draft |
-| 0129 | [One release owns a cluster's shared singletons; every other release declares what it needs from them](0129-one-release-owns-a-clusters-shared-singletons.md) | Draft |
+| 0129 | [One release owns a cluster's shared singletons; every other release declares what it needs from them](0129-one-release-owns-a-clusters-shared-singletons.md) | Accepted |
 | 0130 | [Deliberate progress is bounded durable channel state, not answer streaming](0130-deliberate-progress-is-bounded-durable-channel-state.md) | Accepted |
 | 0131 | [A delivery has one deadline and one renewable fenced owner](0131-a-delivery-has-one-deadline-and-one-renewable-fenced-owner.md) | Accepted |
 | 0132 | [Gate evals on the worst cohort and require cross-family verifiers](0132-worst-cohort-eval-gates-and-cross-family-verifiers.md) | Draft |
@@ -169,7 +169,7 @@ read verbatim from its `Status:` line. **Do not hand-edit it.** Run
 | 0137 | [Coding tools are built in and an initial repository URL selects the workspace](0137-coding-tools-are-built-in-and-an-initial-repository-url-selects-the-workspace.md) | Draft |
 | 0138 | [Provider-side web search is a default-on bundle capability](0138-provider-side-web-search-is-a-default-on-bundle-capability.md) | Proposed |
 | 0139 | [Bundle owners classify every vanilla MCP tool](0139-bundle-owners-classify-every-vanilla-mcp-tool.md) | Draft |
-| 0140 | [Curie supports one model harness until a second one exists](0140-curie-supports-one-model-harness-until-a-second-one-exists.md) | Draft |
+| 0140 | [Curie supports one model harness until a second one exists](0140-curie-supports-one-model-harness-until-a-second-one-exists.md) | Accepted |
 | 0141 | [Admission pins the Jobs a connector token may create](0141-admission-pins-jobs-a-connector-token-may-create.md) | Draft |
 | 0142 | [Database compatibility is a release contract; migrations run in one upgrade phase](0142-database-compatibility-windows-and-a-single-upgrade-phase.md) | Accepted |
 | 0143 | [A coding thread owns one fenced pull request lineage](0143-thread-owned-pull-request-lineage.md) | Accepted |
@@ -202,11 +202,99 @@ read verbatim from its `Status:` line. **Do not hand-edit it.** Run
 | 0175 | [A bot may limit who can talk to it](0175-a-bot-may-limit-who-can-talk-to-it.md) | Accepted |
 | 0176 | [A factory run may test end to end in a namespace it owns on a separate cluster](0176-a-factory-run-may-test-end-to-end-in-a-namespace-it-owns-on-a-separate-cluster.md) | Accepted |
 | 0177 | [An approval is answered where it was asked, including by email](0177-an-approval-is-answered-where-it-was-asked-including-by-email.md) | Accepted |
-| 0178 | [The connector caller token names the run and work item](0178-the-connector-caller-token-names-the-run-and-work-item.md) | Draft |
+| 0178 | [The connector caller token names the run and work item](0178-the-connector-caller-token-names-the-run-and-work-item.md) | Accepted |
 | 0179 | [A settled approval card is a record of the decision, and the requester's thread reads in order](0179-a-settled-approval-card-is-a-record-and-the-thread-reads-in-order.md) | Accepted |
 | 0180 | [The turn receipt is an install choice](0180-the-turn-receipt-is-an-install-choice.md) | Accepted |
 | 0181 | [Every mean tester probe only reads or asks](0181-every-mean-tester-probe-only-reads-or-asks.md) | Accepted |
 | 0182 | [A signed hook may complete a preposted reply](0182-a-signed-hook-may-complete-a-preposted-reply.md) | Accepted |
 | 0184 | [Settled stream entries are trimmed; receipts live in Postgres; backlog is counted, not rated](0184-settled-stream-entries-are-trimmed-receipts-live-in-postgres-backlog-is-counted.md) | Draft |
 | 0185 | [Enterprise plugins are licensed services behind open ports](0185-enterprise-plugins-are-licensed-services-behind-open-ports.md) | Draft |
+| 0186 | [A factory ticket declares its base branch and keeps it](0186-a-factory-ticket-declares-its-base-and-keeps-it.md) | Accepted |
+| 0187 | [The factory polls GitHub for its work, and the platform reads the issue](0187-the-factory-polls-github-and-the-platform-reads-the-issue.md) | Accepted |
+| 0188 | [The sandbox memory credential is scoped to its own channel](0188-the-sandbox-memory-credential-is-scoped-to-its-own-channel.md) | Accepted |
+| 0189 | [Deployed agents see only their bundle's skills](0189-deployed-agents-see-only-their-bundles-skills.md) | Accepted |
+| 0190 | [Automated hook sources cannot widen their tool access](0190-automated-hook-sources-cannot-widen-their-tool-access.md) | Accepted |
+| 0191 | [Protected hooks use a separately authorized delivery lane](0191-protected-hook-delivery-authority.md) | Accepted |
+| 0192 | [The model sees the platform sender](0192-the-model-sees-the-platform-sender.md) | Accepted |
+| 0193 | [Cluster up reads a missing RuntimeClass before install](0193-cluster-up-reads-a-missing-runtimeclass-before-install.md) | Accepted |
+| 0194 | [The plugin-format contract is the frozen schema plus a parity gate](0194-plugin-format-contract-is-the-frozen-schema-plus-a-parity-gate.md) | Accepted |
+| 0195 | [A version-only delta reuses its parent's checks](0195-a-version-only-delta-reuses-its-parents-checks.md) | Accepted |
+| 0196 | [Combined preparation PR checks can prove an unchanged release merge](0196-combined-preparation-pr-checks.md) | Draft |
+| 0197 | [The factory reaches code hosts and trackers through two ports](0197-the-factory-reaches-code-hosts-and-trackers-through-two-ports.md) | Accepted |
+| 0198 | [Identity links live in provider identity namespaces](0198-identity-links-live-in-provider-identity-namespaces.md) | Accepted |
+| 0199 | [The factory admits only tickets it can start and finish](0199-the-factory-admits-only-tickets-it-can-start-and-finish.md) | Accepted |
+| 0200 | [Agents read and edit canvases shared into their bound channels](0200-agents-read-and-edit-canvases-shared-into-their-bound-channels.md) | Accepted |
+| 0201 | [Provider field mappings live with their realization](0201-provider-field-mappings-live-with-their-realization.md) | Accepted |
+| 0202 | [A test installation admits a listed bot's actions and approval replies](0202-a-test-installation-admits-a-listed-bots-actions-and-approval-replies.md) | Accepted |
+| 0203 | [Automated remediation is a pre-qualified action the platform executes and verifies](0203-automated-remediation-is-a-pre-qualified-action-the-platform-executes-and-verifies.md) | Accepted |
+| 0204 | [The factory checks its environment before it admits a ticket](0204-the-factory-checks-its-environment-before-it-admits-a-ticket.md) | Accepted |
+| 0205 | [An attachment belongs to its thread, and every boot rebuilds the thread's files](0205-an-attachment-belongs-to-its-thread.md) | Accepted |
+| 0206 | [A factory run lost with its worker is re-admitted as a new attempt](0206-a-factory-run-lost-with-its-worker-is-re-admitted-as-a-new-attempt.md) | Accepted |
+| 0207 | [A delivery owner rides through an ownership store outage shorter than its lease](0207-a-delivery-owner-rides-through-an-ownership-store-outage-shorter-than-its-lease.md) | Accepted |
+| 0208 | [A factory PR opened after its request was cancelled is adopted by the next run](0208-a-factory-pr-opened-after-its-request-was-cancelled-is-adopted-by-the-next-run.md) | Accepted |
+| 0209 | [Pause authority after a drain is a lease held by a live upgrade step](0209-pause-authority-after-a-drain-is-a-lease-held-by-a-live-upgrade-step.md) | Accepted |
+| 0210 | [A bundle may declare a secret optional](0210-a-bundle-may-declare-a-secret-optional.md) | Accepted |
+| 0211 | [A factory run that loses its sandbox is re-admitted like one that loses its worker](0211-a-factory-run-that-loses-its-sandbox-is-re-admitted-like-one-that-loses-its-worker.md) | Draft |
+| 0212 | [A work item owner rides through a store outage and stops its turn when it cannot](0212-a-work-item-owner-rides-through-a-store-outage-and-stops-its-turn-when-it-cannot.md) | Draft |
+| 0214 | [One factory agent serves every GitHub repository bound to it](0214-one-factory-agent-serves-every-github-repository-bound-to-it.md) | Accepted |
+| 0215 | [Each tracker surface starts factory work under its own trigger label](0215-each-tracker-surface-starts-factory-work-under-its-own-trigger-label.md) | Accepted |
+| 0216 | [A factory repository binding selects its own runner image, built from a tool catalog](0216-a-factory-repository-binding-selects-its-own-runner-image-built-from-a-tool-catalog.md) | Accepted |
+| 0217 | [A factory run that opts into Docker gets its own daemon outside the sandbox](0217-a-factory-run-that-opts-into-docker-gets-its-own-daemon-outside-the-sandbox.md) | Accepted |
+| 0218 | [Cluster up infers gVisor off when the RuntimeClass matches no node](0218-cluster-up-infers-gvisor-off-when-the-runtimeclass-matches-no-node.md) | Accepted |
+| 0219 | [A deploy binds an agent's runner image at runtime, outside the Helm release](0219-a-deploy-binds-an-agents-runner-image-at-runtime-outside-the-helm-release.md) | Draft |
+| 0220 | [One identity provider decides who may invoke and approve, on every channel](0220-one-identity-provider-decides-who-may-invoke-and-approve-on-every-channel.md) | Accepted |
+| 0221 | [Cluster up reads the gVisor RuntimeClass for a fake-model install](0221-cluster-up-reads-the-gvisor-runtimeclass-for-a-fake-model-install.md) | Accepted |
+| 0222 | [Coworker bundles own workflow policy and Curie enforces execution](0222-coworker-bundles-own-workflow-policy-and-curie-enforces-execution.md) | Accepted |
+| 0224 | [Protected runtime commissioning precedes installation acceptance](0224-protected-runtime-commissioning-precedes-installation-acceptance.md) | Accepted |
+| 0225 | [Turn action receipts are opt-in](0225-turn-action-receipts-are-opt-in.md) | Accepted |
+| 0226 | [Persist terminal answers before channel delivery](0226-persist-terminal-answers-before-channel-delivery.md) | Accepted |
+| 0227 | [Opt-in final-answer publication validation](0227-opt-in-final-answer-publication-validation.md) | Accepted |
+| 0228 | [Mail services plug into one email adapter, which owns approvals by email](0228-mail-services-plug-into-one-email-adapter-which-owns-approvals-by-email.md) | Accepted |
+| 0229 | [A hosted connector may declare the Host the caller proxy presents upstream](0229-a-hosted-connector-may-declare-the-host-the-caller-proxy-presents-upstream.md) | Accepted |
+| 0230 | [Cluster upgrade and rollback report outcomes from one lifecycle record checked against the cluster](0230-upgrade-and-rollback-report-from-one-lifecycle-record-checked-against-the-cluster.md) | Draft |
+| 0231 | [Remediation policy bind and arm need an authority the platform key cannot derive](0231-remediation-policy-bind-and-arm-need-an-authority-the-platform-key-cannot-derive.md) | Accepted |
+| 0232 | [A contract migration ships one release after the code stops using what it drops](0232-a-contract-migration-ships-one-release-after-the-code-stops-using-what-it-drops.md) | Accepted |
+| 0233 | [Factory publication recovery requires explicit operator adoption](0233-factory-publication-recovery-requires-explicit-operator-adoption.md) | Draft |
+| 0234 | [Factory-owned pull requests accept authorized feedback without a mention](0234-factory-owned-pull-requests-accept-authorized-feedback-without-a-mention.md) | Accepted |
+| 0235 | [Bitbucket Cloud publication discovery trusts tracker-authenticated receipts](0235-bitbucket-cloud-publication-discovery-trusts-tracker-authenticated-receipts.md) | Draft |
+| 0236 | [The commissioning operator splits provisioner and control processes](0236-the-commissioning-operator-splits-provisioner-and-control-processes.md) | Accepted |
+| 0237 | [Ordinary hook receipts preserve policy after stream retention](0237-ordinary-hook-receipts-preserve-policy-after-stream-retention.md) | Accepted |
+| 0238 | [A managed CNI installation qualifies through its own behavioral network producer](0238-a-managed-cni-installation-qualifies-through-its-own-behavioral-network-producer.md) | Accepted |
+| 0239 | [Release kind proof reuses a complete CI run on the same tree](0239-release-kind-proof-reuses-a-complete-ci-run-on-the-same-tree.md) | Accepted |
+| 0240 | [A hosted connector declares the routes its bundle's stdio servers call through the caller proxy](0240-a-hosted-connector-declares-the-routes-its-bundles-stdio-servers-call-through-the-caller-proxy.md) | Accepted |
+| 0241 | [A commissioning run separates destructive trials from final acceptance](0241-a-commissioning-run-separates-destructive-trials-from-final-acceptance.md) | Accepted |
+| 0242 | [Commissioning session scope makes the last observer finite](0242-commissioning-session-scope-makes-the-last-observer-finite.md) | Accepted |
+| 0243 | [Network case five measures new connection denial after replacement or policy change](0243-network-case-five-measures-new-connection-denial-after-replacement-or-policy-change.md) | Accepted |
+| 0244 | [Attachments are fetched on demand through scoped platform tools](0244-attachments-are-fetched-on-demand-through-scoped-platform-tools.md) | Accepted |
+| 0245 | [Protected lifecycle evidence binds host-owned contexts to actual SDK closure](0245-protected-lifecycle-evidence-binds-host-owned-contexts-to-actual-sdk-closure.md) | Accepted |
+| 0246 | [Common admission resolves an optional HTTP identity before authorized enqueue](0246-common-admission-resolves-an-optional-http-identity-before-authorized-enqueue.md) | Accepted |
+| 0247 | [A tree-identical parent or a schema window registration reuses checks](0247-a-tree-identical-parent-or-a-schema-window-registration-reuses-checks.md) | Accepted |
+| 0249 | [A factory run may take twelve hours](0249-a-factory-run-may-take-twelve-hours.md) | Accepted |
+| 0250 | [Verbatim Slack answers render as rich text sections with literal links](0250-verbatim-slack-answers-render-as-rich-text-sections-with-literal-links.md) | Accepted |
+| 0251 | [A failed factory run keeps a private recovery checkpoint that only explicit restoration reads](0251-a-failed-factory-run-keeps-a-private-recovery-checkpoint-that-only-explicit-restoration-reads.md) | Accepted |
+| 0252 | [HTTP identity resolves Enterprise Grid senders in their organisation](0252-http-identity-resolves-enterprise-grid-senders-in-their-organisation.md) | Accepted |
+| 0253 | [Factory base labels resolve at claim and follow relabels](0253-factory-base-labels-resolve-at-claim-and-follow-relabels.md) | Accepted |
+| 0254 | [HTTP identity applies to the channel identities an operator registers](0254-http-identity-applies-to-the-channel-identities-an-operator-registers.md) | Accepted |
+| 0255 | [Claim-backed sandbox scratch is bounded by its storage request](0255-claim-backed-sandbox-scratch-is-bounded-by-its-storage-request.md) | Draft |
+| 0256 | [Publication validates and pushes a Git object overlay](0256-publication-validates-and-pushes-a-git-object-overlay.md) | Accepted |
+| 0257 | [A release registers its schema window only at the cut](0257-a-release-registers-its-schema-window-only-at-the-cut.md) | Accepted |
+| 0258 | [A scheduled hook turn carries its deployment authority on HTTP identity bindings](0258-a-scheduled-hook-turn-carries-its-deployment-authority-on-http-identity-bindings.md) | Accepted |
+| 0259 | [A binding requires HTTP identity when its invocation or approver role needs HTTP facts](0259-a-binding-requires-http-identity-when-its-invocation-or-approver-role-needs-http-facts.md) | Accepted |
+| 0260 | [HTTP identity admits an email sender only on a signed email receiver proof](0260-http-identity-admits-an-email-sender-only-on-a-signed-email-receiver-proof.md) | Accepted |
+| 0261 | [HTTP identity resolves Slack Connect senders from operator-trusted partner namespaces](0261-http-identity-resolves-slack-connect-senders-from-operator-trusted-partner-namespaces.md) | Accepted |
+| 0262 | [The dispatcher qualifies each HTTP receiver once behind its own failure boundary](0262-the-dispatcher-qualifies-each-http-receiver-once-behind-its-own-failure-boundary.md) | Accepted |
+| 0263 | [HTTP identity accepts a one-to-one direct message to a registered receiver's bot](0263-http-identity-accepts-a-one-to-one-direct-message-to-a-registered-receivers-bot.md) | Accepted |
+| 0264 | [A selected delivery's reply slot is authenticated but outside its delivery intent](0264-a-selected-deliverys-reply-slot-is-authenticated-but-outside-its-delivery-intent.md) | Accepted |
+| 0265 | [A file-bearing Slack message's sender team may come from the sender's own files](0265-a-file-bearing-slack-messages-sender-team-may-come-from-the-senders-own-files.md) | Accepted |
+| 0266 | [Email receivers share a trusted sender domain under one namespace](0266-email-receivers-share-a-trusted-sender-domain-under-one-namespace.md) | Accepted |
+| 0267 | [An email reply answers an approval under the HTTP approver role](0267-an-email-reply-answers-an-approval-under-the-http-approver-role.md) | Accepted |
+| 0268 | [Personal subscription execution and its acceptance contract](0268-personal-subscription-execution-and-acceptance-contract.md) | Accepted |
+| 0269 | [Factory failure retries share a bounded fresh request allowance](0269-factory-failure-retries-share-a-bounded-fresh-request-allowance.md) | Accepted |
+| 0270 | [Hosted connectors receive the verified requester as a signed caller claim](0270-hosted-connectors-receive-the-verified-requester-as-a-signed-caller-claim.md) | Accepted |
+| 0271 | [Per-request approver sets and separation of duties](0271-per-request-approver-sets-and-separation-of-duties.md) | Accepted |
+| 0272 | [Approver DM delivery uses one selected recipient](0272-approver-dm-delivery-uses-one-selected-recipient.md) | Accepted |
+| 0273 | [Approval routes own expiry and reminders](0273-approval-routes-own-expiry-and-reminders.md) | Accepted |
+| 0274 | [A declared webhook wake skips overlap until the next poll](0274-a-declared-webhook-wake-skips-overlap-until-the-next-poll.md) | Accepted |
+| 0275 | [A channel gateway owns provider authentication and I/O](0275-channel-gateway-provider-boundary.md) | Accepted |
+| 0276 | [Static shells share capacity and receive agent inputs per claim](0276-static-shells-share-capacity-and-receive-agent-inputs-per-claim.md) | Accepted |
 <!-- END GENERATED: adr-index -->

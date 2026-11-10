@@ -5,13 +5,19 @@ description = "Relay (Curie) monorepo workspace root"
 requires-python = ">=3.13"
 dependencies = [
     "aci-protocol",
+    "curie-internal",
     "curie-channel-protocol",
+    "curie-channel-gateway",
+    "curie-protected-hooks",
     "curie-telemetry-schema",
+    "curie-upgrade-pause",
+    "curie-shell-supervisor",
     "plugin-format",
     "curie-api",
     "curie-dispatcher",
     "curie-discord-adapter",
     "curie-mail-adapter",
+    "curie-e2e-connector",
     "curie-worker",
     "curie-runner",
     "curie-telemetry",
@@ -23,15 +29,21 @@ package = false
 [tool.uv.workspace]
 members = [
     "packages/aci-protocol",
+    "packages/curie-internal",
     "packages/channel-protocol",
+    "packages/channel-gateway",
+    "packages/protected-hooks",
     "packages/plugin-format",
     "packages/telemetry-schema",
+    "packages/upgrade-pause",
+    "packages/shell-supervisor",
     "packages/test-support",
     "packages/telemetry",
     "apps/api",
     "apps/dispatcher",
     "adapters/discord",
     "apps/mail-adapter",
+    "apps/e2e-connector",
     "apps/worker",
     "runner",
     "tools/doclint",
@@ -40,14 +52,20 @@ members = [
 
 [tool.uv.sources]
 aci-protocol = { workspace = true }
+curie-internal = { workspace = true }
 curie-channel-protocol = { workspace = true }
+curie-channel-gateway = { workspace = true }
+curie-protected-hooks = { workspace = true }
 curie-telemetry-schema = { workspace = true }
+curie-upgrade-pause = { workspace = true }
+curie-shell-supervisor = { workspace = true }
 plugin-format = { workspace = true }
 curie-test-support = { workspace = true }
 curie-api = { workspace = true }
 curie-dispatcher = { workspace = true }
 curie-discord-adapter = { workspace = true }
 curie-mail-adapter = { workspace = true }
+curie-e2e-connector = { workspace = true }
 curie-worker = { workspace = true }
 curie-runner = { workspace = true }
 curie-telemetry = { workspace = true }
@@ -72,22 +90,26 @@ dev = [
 ]
 
 [tool.importlinter]
-# ADR-0062 (#844 Phase 2): harness conformance gets teeth. The full contract that
-# ADR-0062 asks for -- no `claude_agent_sdk` import ANYWHERE outside the Claude
-# harness package -- cannot pass yet: nine `curie_runner` modules still import the
-# SDK directly (adapter, approval, check, fake, hooks, plugin, session, state,
-# translate), and confining them is Phase 2's refactor. These two contracts gate
-# the boundaries that are ALREADY clean, so they cannot rot back before that
-# lands, and the third contract is added when it does.
+# ADR 0140 keeps the current harness boundaries and ratchets the 15 remaining
+# legacy runner SDK importers. Only the Claude harness package may add imports.
+# The platform, frozen contracts, harness port and approval gate stay SDK free.
 root_packages = [
+    "curie_protected_hooks",
     "curie_api",
+    "curie_internal",
     "curie_worker",
     "curie_connector_proxy",
+    "curie_commissioning_ingress",
+    "curie_commissioning_worker",
+    "curie_channel_gateway",
     "curie_dispatcher",
     "curie_discord_adapter",
     "curie_mail_adapter",
+    "curie_e2e_connector",
     "curie_runner",
     "curie_telemetry_schema",
+    "curie_upgrade_pause",
+    "curie_shell_supervisor",
     # The frozen contract packages (#961). Outside the graph, no contract could
     # ever fire on them, which left the worst possible place for an SDK import
     # ungated. Clean today; the contract below keeps them that way.
@@ -100,6 +122,351 @@ root_packages = [
 include_external_packages = true
 
 [[tool.importlinter.contracts]]
+name = "API and worker never import the Slack SDK"
+type = "forbidden"
+source_modules = ["curie_api", "curie_worker"]
+forbidden_modules = ["slack_sdk", "slack_bolt"]
+allow_indirect_imports = true
+
+[[tool.importlinter.contracts]]
+name = "Channel gateway ports stay provider and application independent"
+type = "forbidden"
+source_modules = ["curie_channel_gateway.ports"]
+forbidden_modules = ["slack_sdk", "curie_api", "curie_worker"]
+
+[[tool.importlinter.contracts]]
+name = "Gateway mail stays independent of Slack and dispatcher"
+type = "forbidden"
+source_modules = ["curie_channel_gateway.mail"]
+forbidden_modules = ["curie_channel_gateway.slack", "curie_dispatcher"]
+
+[[tool.importlinter.contracts]]
+name = "Channel gateway and dispatcher stay independent"
+type = "independence"
+modules = ["curie_channel_gateway", "curie_dispatcher"]
+
+[[tool.importlinter.contracts]]
+name = "Channel gateway implementations stay independent of API and worker"
+type = "forbidden"
+source_modules = ["curie_channel_gateway"]
+forbidden_modules = ["curie_api", "curie_worker"]
+
+# The static-pool shell supervisor is the trusted half of a shell: it never
+# imports the untrusted runner it supervises, the worker, or a model SDK.
+[[tool.importlinter.contracts]]
+name = "The shell supervisor stays independent of the runner, worker and harnesses"
+type = "forbidden"
+source_modules = ["curie_shell_supervisor"]
+forbidden_modules = ["curie_runner", "curie_worker", "curie_api", "claude_agent_sdk"]
+
+# @spec PROTECTED-HOOK-LANE-1: internal transport has no application/SDK authority.
+[[tool.importlinter.contracts]]
+name = "Protected hook primitives stay independent of applications and harnesses"
+type = "forbidden"
+source_modules = ["curie_protected_hooks"]
+forbidden_modules = ["curie_api", "curie_worker", "curie_runner", "claude_agent_sdk"]
+
+# @spec PROTECTED-HOOK-SOURCE-11: only provisioner composition imports the
+# runtime directory writer. The HTTP application and every package that
+# composes a process holding the ordinary platform key or ordinary application
+# credentials cannot reach it, and the shared grammar the API reads never
+# imports it. A provisioner entry inside a listed package needs a reviewed
+# ignore_imports exception naming that one module.
+[[tool.importlinter.contracts]]
+name = "The runtime directory writer stays out of ordinary compositions"
+type = "forbidden"
+source_modules = [
+    "curie_api",
+    "curie_worker",
+    "curie_dispatcher",
+    "curie_channel_gateway",
+    "curie_runner",
+    "curie_internal",
+    "curie_upgrade_pause",
+    "curie_discord_adapter",
+    "curie_mail_adapter",
+    "curie_connector_proxy",
+    "curie_e2e_connector",
+    "curie_commissioning_ingress",
+    "curie_commissioning_worker",
+    "curie_protected_hooks.runtime_directory",
+]
+forbidden_modules = ["curie_protected_hooks.runtime_directory_writer"]
+ignore_imports = [
+    "curie_worker.commissioning_registered_observer -> curie_protected_hooks.commissioning_operator_custody",
+]
+
+# @spec PROTECTED-COMMISSIONING-1/2: production composition reads no commissioning
+# record. The whole API and worker are sources, so a new production module is
+# covered by default; a later commissioning entry needs a reviewed exception.
+# Later commissioning slices add their record modules to the forbidden list.
+[[tool.importlinter.contracts]]
+name = "Production composition never imports commissioning records"
+type = "forbidden"
+source_modules = ["curie_api", "curie_worker"]
+forbidden_modules = [
+    "curie_protected_hooks.commissioning_series_guard",
+    "curie_protected_hooks.commissioning_operator_custody",
+    "curie_protected_hooks.commissioning_operator_records",
+    "curie_protected_hooks.commissioning_run_authority",
+    "curie_protected_hooks.commissioning_run_storage",
+    "curie_protected_hooks.commissioning_run_records",
+    "curie_protected_hooks.commissioning_trial_records",
+    "curie_protected_hooks.commissioning_trial_evidence_records",
+    "curie_protected_hooks.commissioning_evidence_acl",
+    "curie_protected_hooks.commissioning_series_bootstrap",
+    "curie_protected_hooks.commissioning_retained",
+    "curie_protected_hooks.commissioning_evidence_records",
+    "curie_protected_hooks.commissioning_acceptance_writer",
+    "curie_protected_hooks.commissioning_acl",
+    "curie_protected_hooks.commissioning_activation",
+    "curie_protected_hooks.commissioning_admissions",
+    "curie_protected_hooks.commissioning_bootstrap",
+    "curie_protected_hooks.commissioning_campaign_records",
+    "curie_protected_hooks.commissioning_encoding",
+    "curie_protected_hooks.commissioning_gateway_control",
+    "curie_protected_hooks.commissioning_journal",
+    "curie_protected_hooks.commissioning_launch_control",
+    "curie_protected_hooks.commissioning_local_bootstrap",
+    "curie_protected_hooks.commissioning_local_broker",
+    "curie_protected_hooks.commissioning_local_installation",
+    "curie_protected_hooks.commissioning_local_ownership",
+    "curie_protected_hooks.commissioning_local_worker",
+    "curie_protected_hooks.commissioning_local_workloads",
+    "curie_protected_hooks.commissioning_operator_guard",
+    "curie_protected_hooks.commissioning_operator_protocol",
+    "curie_protected_hooks.commissioning_producers",
+    "curie_protected_hooks.commissioning_provisioner",
+    "curie_protected_hooks.commissioning_records",
+    "curie_protected_hooks.commissioning_reservations",
+    "curie_protected_hooks.commissioning_scripts",
+    "curie_protected_hooks.commissioning_verifier",
+    "curie_protected_hooks.commissioning_worker",
+    "curie_protected_hooks.qualification_publication",
+]
+
+# ADR 0236's internal operator and ADR 0241's provisioner-only evidence reader
+# have only these named exceptions. Local installation reads stay provisioner-only.
+ignore_imports = [
+    "curie_worker.commissioning_registered_observer -> curie_protected_hooks.commissioning_operator_custody",
+    "curie_worker.commissioning_registered_observer -> curie_protected_hooks.commissioning_journal",
+    "curie_worker.commissioning_registered_observer -> curie_protected_hooks.commissioning_records",
+    "curie_worker.commissioning_registered_observer -> curie_protected_hooks.commissioning_producers",
+    "curie_worker.commissioning_registered_observer -> curie_protected_hooks.commissioning_evidence_records",
+    "curie_worker.commissioning_registered_observer -> curie_protected_hooks.commissioning_evidence_acl",
+    "curie_worker.commissioning_evidence_observer -> curie_protected_hooks.commissioning_series_guard",
+    "curie_worker.commissioning_evidence_observer -> curie_protected_hooks.commissioning_series_bootstrap",
+    "curie_worker.commissioning_evidence_observer -> curie_protected_hooks.commissioning_records",
+    "curie_worker.commissioning_evidence_observer -> curie_protected_hooks.commissioning_journal",
+    "curie_worker.commissioning_evidence_observer -> curie_protected_hooks.commissioning_evidence_records",
+    "curie_worker.commissioning_control_process -> curie_protected_hooks.commissioning_bootstrap",
+    "curie_worker.commissioning_control_process -> curie_protected_hooks.commissioning_operator_guard",
+    "curie_worker.commissioning_control_process -> curie_protected_hooks.commissioning_producers",
+    "curie_worker.commissioning_control_process -> curie_protected_hooks.commissioning_provisioner",
+    "curie_worker.commissioning_control_process -> curie_protected_hooks.commissioning_records",
+    "curie_worker.commissioning_control_reader -> curie_protected_hooks.commissioning_local_installation",
+    "curie_worker.commissioning_control_reader -> curie_protected_hooks.commissioning_local_ownership",
+]
+
+# @spec PROTECTED-COMMISSIONING-8: the commissioning launch authorizer is the
+# second closed authorizer of the shared launch mechanics. It and its registry
+# live in `curie_worker` beside the mechanics, import no commissioning record,
+# and are reached from production composition only through the mechanics'
+# closed class admission and authorizer-owned registry; those two edges are the
+# reviewed exception.
+[[tool.importlinter.contracts]]
+name = "Production composition reaches the commissioning launch path only through the closed seam"
+type = "forbidden"
+source_modules = [
+    "curie_api",
+    "curie_worker.__main__",
+    "curie_worker.protected_entry",
+    "curie_worker.protected_lane",
+    "curie_worker.protected_launch_client",
+    "curie_worker.protected_launch_server",
+]
+forbidden_modules = [
+    "curie_worker.commissioning_cleanup",
+    "curie_worker.commissioning_launch",
+    "curie_worker.commissioning_probe_registry",
+    "curie_worker.commissioning_probe_runtime",
+    "curie_worker.commissioning_registry",
+    "curie_worker.commissioning_supervisor",
+]
+ignore_imports = [
+    "curie_worker.protected_launch_mechanics -> curie_worker.commissioning_launch",
+    "curie_worker.protected_launch_mechanics -> curie_worker.commissioning_registry",
+]
+
+# @spec PROTECTED-COMMISSIONING-8: before a permit exists, the primitive probes
+# follow the campaign ownership rules in a registry of their own that grants no
+# campaign or production authority. They reuse the campaign registry's
+# termination and never-started facts, but reach no launch authorizer, launch
+# server or client, supervisor, provider gateway or API.
+[[tool.importlinter.contracts]]
+name = "Primitive probes hold no campaign or production launch authority"
+type = "forbidden"
+source_modules = [
+    "curie_worker.commissioning_probe_registry",
+    "curie_worker.commissioning_probe_runtime",
+]
+forbidden_modules = [
+    "curie_api",
+    "curie_worker.commissioning_launch",
+    "curie_worker.commissioning_provider_gateway",
+    "curie_worker.commissioning_supervisor",
+    "curie_worker.protected_entry",
+    "curie_worker.protected_launch_client",
+    "curie_worker.protected_launch_mechanics",
+    "curie_worker.protected_launch_server",
+]
+
+# @spec PROTECTED-COMMISSIONING-8: the provider gateway is a permanent
+# installation component named by the execution configuration's model base URL.
+# It selects its production or commissioning authorizer only from the launch
+# identity a trusted registrar recorded, so it never reaches the launch
+# mechanics, the commissioning launch path or a launch server, and its campaign
+# authority arrives only through the protocol the control implements outside
+# `curie_worker` (covered by the first contract).
+[[tool.importlinter.contracts]]
+name = "The provider gateway reaches no launch mechanics"
+type = "forbidden"
+source_modules = [
+    "curie_worker.commissioning_provider_gateway",
+    "curie_worker.provider_identity",
+]
+forbidden_modules = [
+    "curie_worker.commissioning_launch",
+    "curie_worker.commissioning_registry",
+    "curie_worker.protected_launch_client",
+    "curie_worker.protected_launch_mechanics",
+    "curie_worker.protected_launch_server",
+]
+
+# @spec PROTECTED-COMMISSIONING-8: the guard's control profile, slots and
+# admission policy are installation objects, read by the guard and the
+# commissioning compositions only. No production composition imports them, and
+# they reach no launch authority, so the guard can decide admission but can
+# never itself create, reserve or authorize a launch. The control installation
+# that installs the guard and the control observer that reobserves it are held
+# to the same two contracts. The guard modules live in
+# `curie_worker`, so the first contract names every protected production module
+# explicitly: import-linter does not check a package against its own modules.
+[[tool.importlinter.contracts]]
+name = "Production composition never imports the commissioning guard"
+type = "forbidden"
+source_modules = [
+    "curie_api",
+    "curie_worker.__main__",
+    "curie_worker.protected_binding",
+    "curie_worker.protected_completion",
+    "curie_worker.protected_configuration",
+    "curie_worker.protected_dispatch",
+    "curie_worker.protected_entry",
+    "curie_worker.protected_execution",
+    "curie_worker.protected_history",
+    "curie_worker.protected_kubernetes_projection",
+    "curie_worker.protected_lane",
+    "curie_worker.protected_launch_client",
+    "curie_worker.protected_launch_documents",
+    "curie_worker.protected_launch_kubernetes",
+    "curie_worker.protected_launch_mechanics",
+    "curie_worker.protected_launch_records",
+    "curie_worker.protected_launch_registry",
+    "curie_worker.protected_launch_server",
+    "curie_worker.protected_markers",
+    "curie_worker.protected_nomination",
+    "curie_worker.protected_nomination_filter",
+    "curie_worker.protected_recovery",
+    "curie_worker.protected_retirement",
+    "curie_worker.protected_run",
+    "curie_worker.protected_runner",
+    "curie_worker.protected_substrate",
+    "curie_worker.protected_substrate_facts",
+    "curie_worker.protected_substrate_readers",
+    "curie_worker.protected_worker_bootstrap",
+]
+forbidden_modules = [
+    "curie_worker.commissioning_evidence_observer",
+    "curie_worker.commissioning_registered_observer",
+    "curie_worker.commissioning_control_admission",
+    "curie_worker.commissioning_control_installation",
+    "curie_worker.commissioning_control_observer",
+    "curie_worker.commissioning_control_process",
+    "curie_worker.commissioning_control_reader",
+    "curie_worker.commissioning_control_profile",
+    "curie_worker.commissioning_control_slots",
+]
+
+[[tool.importlinter.contracts]]
+name = "The commissioning guard holds no launch authority"
+type = "forbidden"
+source_modules = [
+    "curie_worker.commissioning_control_admission",
+    "curie_worker.commissioning_control_installation",
+    "curie_worker.commissioning_control_observer",
+    "curie_worker.commissioning_control_profile",
+    "curie_worker.commissioning_control_slots",
+]
+forbidden_modules = [
+    "curie_api",
+    "curie_worker.protected_entry",
+    "curie_worker.protected_launch_mechanics",
+    "curie_worker.protected_launch_server",
+    "curie_worker.protected_launch_client",
+    "curie_worker.protected_launch_kubernetes",
+    "curie_worker.protected_launch_registry",
+]
+
+# The in-cluster control process cannot acquire the provisioner's local cluster
+# configuration or signing key, acceptance writer, or publication credentials.
+[[tool.importlinter.contracts]]
+name = "The control process never owns provisioner or publication authority"
+type = "forbidden"
+source_modules = ["curie_worker.commissioning_control_process"]
+forbidden_modules = [
+    "curie_worker.commissioning_evidence_observer",
+    "curie_worker.commissioning_registered_observer",
+    "curie_worker.commissioning_control_reader",
+    "curie_worker.commissioning_control_installation",
+    "curie_protected_hooks.commissioning_local_installation",
+    "curie_protected_hooks.commissioning_local_ownership",
+    "curie_protected_hooks.commissioning_local_bootstrap",
+    "curie_protected_hooks.commissioning_acceptance_writer",
+    "curie_protected_hooks.commissioning_activation",
+    "curie_protected_hooks.qualification_publication",
+]
+
+# @spec PROTECTED-COMMISSIONING-2/4: the commissioning ingress and worker are
+# separate standalone process compositions, top-level packages beside
+# `curie_api` and `curie_worker` rather than modules of them, so the contract
+# above holds for the whole API and worker with no exception. No ordinary
+# composition imports either. The ingress may import the API's shared signing
+# and file-reading helpers and the worker the worker's stream transport, never
+# the reverse.
+[[tool.importlinter.contracts]]
+name = "Ordinary compositions never import the commissioning compositions"
+type = "forbidden"
+source_modules = [
+    "curie_api",
+    "curie_worker",
+    "curie_dispatcher",
+    "curie_channel_gateway",
+    "curie_runner",
+    "curie_internal",
+    "curie_protected_hooks",
+    "curie_connector_proxy",
+]
+forbidden_modules = ["curie_commissioning_ingress", "curie_commissioning_worker"]
+
+# The commissioning worker has no path into the API: no worker to API import.
+[[tool.importlinter.contracts]]
+name = "The commissioning worker imports nothing of the API"
+type = "forbidden"
+source_modules = ["curie_commissioning_worker"]
+forbidden_modules = ["curie_api", "curie_commissioning_ingress"]
+
+[[tool.importlinter.contracts]]
 # Telemetry attribute names are shared schema, not an application or harness
 # integration surface. Keeping this package independent lets every producer and
 # consumer use the exact same enum without reversing a runtime dependency.
@@ -110,6 +477,7 @@ forbidden_modules = [
     "curie_api",
     "curie_worker",
     "curie_dispatcher",
+    "curie_channel_gateway",
     "curie_runner",
     "aci_protocol",
     "channel_protocol",
@@ -133,7 +501,7 @@ forbidden_modules = ["curie_worker", "kubernetes", "sqlalchemy", "redis", "boto3
 # direction that is hardest to see in review.
 name = "The platform never imports a harness SDK"
 type = "forbidden"
-source_modules = ["curie_api", "curie_worker", "curie_dispatcher", "curie_discord_adapter", "curie_mail_adapter"]
+source_modules = ["curie_api", "curie_worker", "curie_dispatcher", "curie_channel_gateway", "curie_discord_adapter", "curie_mail_adapter", "curie_e2e_connector"]
 forbidden_modules = ["claude_agent_sdk"]
 
 [[tool.importlinter.contracts]]
@@ -167,17 +535,64 @@ source_modules = [
 ]
 forbidden_modules = ["claude_agent_sdk"]
 
+[[tool.importlinter.contracts]]
+# These are the current direct SDK edges. Indirect use remains possible while
+# the existing adapters stay in place, but a new importing module must live in
+# the Claude harness package rather than expanding this list (ADR 0140).
+name = "The runner adds no SDK imports outside the Claude harness"
+type = "forbidden"
+source_modules = ["curie_runner"]
+forbidden_modules = ["claude_agent_sdk"]
+allow_indirect_imports = true
+ignore_imports = [
+    "curie_runner.__main__ -> claude_agent_sdk",
+    "curie_runner.adapter -> claude_agent_sdk",
+    "curie_runner.harness.claude.** -> claude_agent_sdk",
+    "curie_runner.check -> claude_agent_sdk",
+    "curie_runner.fake -> claude_agent_sdk",
+    "curie_runner.hooks -> claude_agent_sdk",
+    "curie_runner.issue_read -> claude_agent_sdk",
+    "curie_runner.mcp_argv -> claude_agent_sdk",
+    "curie_runner.plugin -> claude_agent_sdk",
+    "curie_runner.progress -> claude_agent_sdk",
+    "curie_runner.session -> claude_agent_sdk",
+    "curie_runner.state -> claude_agent_sdk",
+    "curie_runner.tool_access -> claude_agent_sdk",
+    "curie_runner.translate -> claude_agent_sdk",
+    "curie_runner.turn_progress -> claude_agent_sdk",
+    "curie_runner.usage_report -> claude_agent_sdk",
+]
+
+
+[[tool.importlinter.contracts]]
+# Approval decisions must remain free of the SDK through every dependency,
+# including shared tool identities. This gate intentionally checks indirect
+# imports separately from the legacy direct import ratchet.
+name = "The approval gate stays free of the harness SDK"
+type = "forbidden"
+source_modules = ["curie_runner.approval"]
+forbidden_modules = ["claude_agent_sdk"]
+
 [tool.pytest.ini_options]
 addopts = "--import-mode=importlib"
+norecursedirs = [
+    "*.egg", ".*", "_darcs", "build", "CVS", "dist", "node_modules", "venv", "{arch}",
+    "runner/tests/fixtures",
+]
 testpaths = [
     "packages/aci-protocol/tests",
+    "packages/curie-internal/tests",
     "packages/channel-protocol/tests",
+    "packages/channel-gateway/tests",
     "packages/plugin-format/tests",
     "packages/test-support/tests",
+    "packages/upgrade-pause/tests",
+    "packages/shell-supervisor/tests",
     "packages/telemetry/tests",
     "apps/api/tests",
     "apps/dispatcher/tests",
     "apps/mail-adapter/tests",
+    "apps/e2e-connector/tests",
     # The Discord adapter's tests sat in no collection root above, and the
     # string "discord" appears in no .github/workflows file, so they ran
     # nowhere in CI (#2358). A telemetry test in a suite CI never collects is
@@ -199,11 +614,22 @@ testpaths = [
     # the only CI signal on the shipped images was "the Dockerfile builds"
     # (#2093).
     "examples/sre-bot/connectors",
+    # The github-activity connector ships its own test_server.py, same reason.
+    "examples/github-activity/connectors",
+    # @spec ACTION-EXECUTOR-9: the reference reversible connector is a hosted
+    # fixture the e2e ladder builds into a bundle; its tests ship beside it.
+    "cli/scripts/fixtures/reversible-reference",
+    "tools/preflight/tests",
+    "tools/test-env",
     "tools/doclint/tests",
+    # @spec PROTECTED-HOOK-LANE-2
+    "packages/protected-hooks/tests",
     "tools/wire-tolerance-gate/tests",
     "tools/ci-retry-gate/tests",
+    "tools/dependency-audit-paths/tests",
     "tools/ci-workflow-paths/tests",
     "tools/e2e-ci-selection/tests",
+    "tools/helm-ci-gate/tests",
     "tools/fix-pin-ci/tests",
     "tools/sdk-lock-gate/tests",
     "tools/close-on-next/tests",
@@ -212,7 +638,13 @@ testpaths = [
     "tools/restore-drill/tests",
     "tools/sre-contract/tests",
     "tools/factory-e2e/tests",
+    "tools/github-stub/tests",
+    "tools/identity-e2e/tests",
+    "tools/model-script/tests",
+    "tools/sandbox-admission-observer/tests",
     "tools/runtime-assertion-gate/tests",
+    # @spec NAMESPACE-CLEANUP-EVIDENCE-4
+    "tools/released-upgrade/tests",
     # Repo-level tests that pin a seam between two apps which may not import
     # each other, such as the runner/API default memory guidance (#1461).
     "tests",
@@ -230,7 +662,7 @@ target-version = "py313"
 extend-exclude = ["prototypes", "runner/tests/fixtures/repo_toolchain"]
 
 [tool.ruff.lint]
-select = ["E", "F", "I", "UP", "B"]
+select = ["E", "F", "I", "UP", "B", "BLE"]
 
 [tool.ruff.lint.per-file-ignores]
 # The committed doclint test suite is frozen (issue #452) and groups its imports
@@ -248,15 +680,21 @@ namespace_packages = true
 explicit_package_bases = true
 mypy_path = [
     "packages/aci-protocol/src",
+    "packages/curie-internal/src",
     "packages/channel-protocol/src",
+    "packages/channel-gateway/src",
+    "packages/protected-hooks/src",
     "packages/plugin-format/src",
     "packages/telemetry-schema/src",
+    "packages/upgrade-pause/src",
+    "packages/shell-supervisor/src",
     "packages/test-support/src",
     "packages/telemetry/src",
     "apps/api/src",
     "apps/dispatcher/src",
     "adapters/discord/src",
     "apps/mail-adapter/src",
+    "apps/e2e-connector/src",
     "apps/worker/src",
     "runner/src",
     "tools/doclint/src",
@@ -264,15 +702,21 @@ mypy_path = [
 ]
 files = [
     "packages/aci-protocol/src",
+    "packages/curie-internal/src",
     "packages/channel-protocol/src",
+    "packages/channel-gateway/src",
+    "packages/protected-hooks/src",
     "packages/plugin-format/src",
     "packages/telemetry-schema/src",
+    "packages/upgrade-pause/src",
+    "packages/shell-supervisor/src",
     "packages/test-support/src",
     "packages/telemetry/src",
     "apps/api/src",
     "apps/dispatcher/src",
     "adapters/discord/src",
     "apps/mail-adapter/src",
+    "apps/e2e-connector/src",
     "apps/worker/src",
     "runner/src",
     "tools/doclint/src",

@@ -3,6 +3,7 @@ import ast
 import hashlib
 import json
 import re
+import subprocess
 import sys
 from collections import defaultdict
 from pathlib import Path
@@ -10,6 +11,7 @@ from pathlib import Path
 from alembic.script import ScriptDirectory
 
 FILENAME_PATTERN = re.compile(r"^(\d+[a-z]?)_.+\.py$")
+DEFAULT_REPO = Path(__file__).resolve().parents[1]
 DEFAULT_SCRIPT_LOCATION = (
     Path(__file__).resolve().parents[1] / "apps" / "api" / "alembic"
 )
@@ -22,6 +24,13 @@ DEFAULT_KINDS_FILE = (
     / "revision_kinds.json"
 )
 DEFAULT_WINDOW_FILE = DEFAULT_KINDS_FILE.with_name("schema_compat.json")
+DEFAULT_SERVING_FILE = (
+    Path(__file__).resolve().parents[1]
+    / "packages/protected-hooks/src/curie_protected_hooks/schema_serving.json"
+)
+DEFAULT_CATALOG_FILE = (
+    Path(__file__).resolve().parents[1] / "cli/src/application_schema_windows.json"
+)
 DEFAULT_CHART_METADATA = (
     Path(__file__).resolve().parents[1] / "charts/curie/files/schema-compat.json"
 )
@@ -57,6 +66,90 @@ def _revision_id(path: Path) -> str | None:
     return None
 
 
+def _revision_lineage(
+    source: str, filename: str
+) -> tuple[str, str | tuple[str, ...] | None]:
+    """Read literal module assignments without executing a migration."""
+    values: dict[str, object] = {}
+    for node in ast.parse(source, filename=filename).body:
+        if isinstance(node, ast.AnnAssign):
+            targets: list[ast.expr] = [node.target]
+        elif isinstance(node, ast.Assign):
+            targets = list(node.targets)
+        else:
+            continue
+        for target in targets:
+            if (
+                isinstance(target, ast.Name)
+                and target.id in {"revision", "down_revision"}
+                and node.value is not None
+            ):
+                values[target.id] = ast.literal_eval(node.value)
+
+    revision = values.get("revision")
+    if not isinstance(revision, str) or "down_revision" not in values:
+        raise ValueError(f"{filename}: expected literal revision and down_revision assignments")
+    parent = values["down_revision"]
+    if parent is None:
+        parents: str | tuple[str, ...] | None = None
+    elif isinstance(parent, str):
+        parents = parent
+    elif isinstance(parent, (list, tuple)) and all(isinstance(item, str) for item in parent):
+        parents = tuple(sorted(parent))
+    else:
+        raise ValueError(f"{filename}: down_revision must be None, a string, or string parents")
+    return revision, parents
+
+
+def _cross_train_shared_count(versions: Path, repo: Path, ref: str) -> int:
+    local: dict[str, tuple[str, str | tuple[str, ...] | None]] = {}
+    for path in sorted(versions.glob("*.py")):
+        if not path.is_file() or path.name == "__init__.py":
+            continue
+        revision, parents = _revision_lineage(path.read_text(encoding="utf-8"), path.name)
+        local[revision] = (path.name, parents)
+
+    versions_path = "apps/api/alembic/versions"
+    listing = subprocess.run(
+        ["git", "-C", str(repo), "ls-tree", "--name-only", "-z", f"{ref}:{versions_path}"],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    other: dict[str, tuple[str, str | tuple[str, ...] | None]] = {}
+    for filename in sorted(listing.stdout.split("\0")):
+        if not filename.endswith(".py") or filename == "__init__.py":
+            continue
+        source = subprocess.run(
+            ["git", "-C", str(repo), "show", f"{ref}:{versions_path}/{filename}"],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout
+        revision, parents = _revision_lineage(source, filename)
+        if revision in other:
+            raise ValueError(
+                f"{ref}: duplicate revision id {revision!r} in "
+                f"{other[revision][0]} and {filename}"
+            )
+        other[revision] = (filename, parents)
+
+    shared = sorted(local.keys() & other.keys())
+    mismatches = []
+    for revision in shared:
+        if local[revision] != other[revision]:
+            local_filename, local_parents = local[revision]
+            other_filename, other_parents = other[revision]
+            mismatches.append(
+                f"revision {revision!r}: local {local_filename} "
+                f"down_revision={local_parents!r}; {ref} {other_filename} "
+                f"down_revision={other_parents!r}"
+            )
+    if mismatches:
+        raise ValueError("\n".join(mismatches))
+    return len(shared)
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(
         description="Validate Alembic revision numbers and graph heads."
@@ -64,8 +157,17 @@ def main() -> int:
     parser.add_argument(
         "--script-location",
         type=Path,
-        default=DEFAULT_SCRIPT_LOCATION,
-        help="Alembic script directory to validate.",
+        help="Alembic script directory to validate (default: <repo>/apps/api/alembic).",
+    )
+    parser.add_argument(
+        "--repo",
+        type=Path,
+        default=DEFAULT_REPO,
+        help="Repository for local migrations and Git reads (default: repository root).",
+    )
+    parser.add_argument(
+        "--other-train-ref",
+        help="Git ref whose shared revision filenames and parents must match the local tree.",
     )
     parser.add_argument(
         "--write-upgrade-metadata",
@@ -73,7 +175,7 @@ def main() -> int:
         help="Regenerate the chart's schema metadata from the API window and graph.",
     )
     args = parser.parse_args()
-    script_location: Path = args.script_location
+    script_location: Path = args.script_location or args.repo / "apps/api/alembic"
     if (
         args.write_upgrade_metadata
         and script_location.resolve() != DEFAULT_SCRIPT_LOCATION.resolve()
@@ -187,9 +289,27 @@ def main() -> int:
         )
         return 1
 
+    shared_revision_count = None
+    if args.other_train_ref is not None:
+        try:
+            shared_revision_count = _cross_train_shared_count(
+                versions, args.repo, args.other_train_ref
+            )
+        except (OSError, SyntaxError, ValueError, subprocess.CalledProcessError) as exc:
+            detail = (
+                exc.stderr.strip()
+                if isinstance(exc, subprocess.CalledProcessError)
+                else str(exc)
+            )
+            print(
+                f"Alembic cross-train lineage failed against {args.other_train_ref}: {detail}",
+                file=sys.stderr,
+            )
+            return 1
+
     try:
         heads = sorted(ScriptDirectory(str(script_location)).get_heads())
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001 - existing broad catch retained
         print(
             f"Alembic revision gate failed: could not load the revision graph "
             f"from {script_location}: {exc}",
@@ -250,13 +370,11 @@ def main() -> int:
                 print(f"  invalid kinds: {', '.join(invalid)}", file=sys.stderr)
             return 1
 
-        # ADR-0142: the API remains the sole schema authority. The chart copy
-        # lets the CLI inspect the target before creating any cluster resource
-        # or relying on a container runtime on the operator's machine.
+        # @spec PROTECTED-HOOK-SOURCE-2: installed serving metadata owns its mirror.
         try:
-            window = json.loads(DEFAULT_WINDOW_FILE.read_text(encoding="utf-8"))
+            window = json.loads(DEFAULT_CATALOG_FILE.read_text(encoding="utf-8"))["candidate"]
             if window["schema_head"] != heads[0] or window["schema_min"] not in graph_ids:
-                raise ValueError("API compatibility window does not name the current graph")
+                raise ValueError("candidate compatibility window does not name the current graph")
             revisions = []
             for revision in ScriptDirectory(str(script_location)).walk_revisions():
                 parent = revision.down_revision
@@ -273,6 +391,23 @@ def main() -> int:
                         "sha256": hashlib.sha256(Path(revision.path).read_bytes()).hexdigest(),
                     }
                 )
+            serving = {
+                "schema_min": window["schema_min"],
+                "schema_head": window["schema_head"],
+                "revision_parents": {
+                    row["revision"]: row["parents"] for row in revisions
+                },
+            }
+            serving_text = json.dumps(serving, indent=2, sort_keys=True) + "\n"
+            window_text = json.dumps(window, indent=2, sort_keys=True) + "\n"
+            if args.write_upgrade_metadata:
+                DEFAULT_SERVING_FILE.parent.mkdir(parents=True, exist_ok=True)
+                DEFAULT_SERVING_FILE.write_text(serving_text, encoding="utf-8")
+                DEFAULT_WINDOW_FILE.write_text(window_text, encoding="utf-8")
+            if DEFAULT_SERVING_FILE.read_text(encoding="utf-8") != serving_text:
+                raise ValueError("shared serving metadata differs from candidate or actual graph")
+            if json.loads(DEFAULT_WINDOW_FILE.read_text(encoding="utf-8")) != window:
+                raise ValueError("API window mirror differs from shared serving metadata")
             metadata = {
                 "schema_min": window["schema_min"],
                 "schema_head": window["schema_head"],
@@ -292,6 +427,11 @@ def main() -> int:
             )
             return 1
 
+    if shared_revision_count is not None:
+        print(
+            f"Alembic cross-train lineage passed: {shared_revision_count} shared "
+            f"revision ids match {args.other_train_ref}."
+        )
     print(f"Alembic revision gate passed with head {heads[0]}.")
     return 0
 

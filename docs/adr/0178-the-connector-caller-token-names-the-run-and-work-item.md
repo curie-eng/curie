@@ -2,7 +2,32 @@
 
 Date: 2026-09-27
 
-Status: Draft
+Status: Accepted
+
+**Partially amended by [ADR 0271](0271-per-request-approver-sets-and-separation-of-duties.md)**
+(back link added under [ADR 0045](0045-the-status-line-is-the-mutable-part-of-an-immutable-adr.md)):
+ADR 0271 extends decisions 5 and 6 with the proxy-only spent-grant id and its
+connector trust rule.
+
+**Partially amended by [ADR 0270](0270-hosted-connectors-receive-the-verified-requester-as-a-signed-caller-claim.md)**
+(back link added under [ADR 0045](0045-the-status-line-is-the-mutable-part-of-an-immutable-adr.md)):
+ADR 0270 changes decision 2's non-work-item byte promise, decision 3's
+requester-token lifetime, decision 4's closed claims and decision 5's
+identity-header projection, only for the opted-in capability.
+
+**Amended by [ADR-0229](0229-a-hosted-connector-may-declare-the-host-the-caller-proxy-presents-upstream.md)**
+(back-link added under [ADR-0045](0045-the-status-line-is-the-mutable-part-of-an-immutable-adr.md)):
+0229 amends decision 5 so a hosted connector may declare the `Host` its caller
+proxy presents upstream on admitted requests. Decision 6 stands as decided.
+
+**Amended by [ADR-0240](0240-a-hosted-connector-declares-the-routes-its-bundles-stdio-servers-call-through-the-caller-proxy.md)**
+(back-link added under [ADR-0045](0045-the-status-line-is-the-mutable-part-of-an-immutable-adr.md)):
+0240 amends decision 4 so the proxy also admits a second token type, `ccr`,
+which names one connector and is admitted only on that connector's declared
+routes. The `cct` claim set is unchanged.
+
+Accepted with explicit maintainer approval from Brian Conn in the pull request
+that published this status, before implementation.
 
 This ADR extends [ADR-0168](0168-one-installation-hosts-several-bot-identities.md)
 decision 7. It does not supersede it: admission by `admits:` stays exactly as

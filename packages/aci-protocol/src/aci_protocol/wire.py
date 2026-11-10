@@ -149,6 +149,7 @@ class ApprovalRequest(_AciModel):
     reply_placeholder: str | None = Field(min_length=1)
     reply_endpoint: str | None = None
     reply_adapter: str | None = None
+    reply_identity: str | None = None
     dedupe_key: str = Field(min_length=1)
     route: str | None = None
     card_channel: str | None = None

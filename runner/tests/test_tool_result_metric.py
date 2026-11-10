@@ -41,8 +41,12 @@ from claude_agent_sdk import (
     UserMessage,
 )
 from curie_runner import RunTracer, SideEffectClassifier
-from curie_runner.approval import ApprovalGate, build_approval_gate, build_approval_hook
+from curie_runner.approval import (
+    ApprovalGate,
+    build_approval_gate,
+)
 from curie_runner.fake import FakeModelSession
+from curie_runner.harness.claude.approval import build_approval_hook
 from curie_runner.session import SessionRunner
 from curie_telemetry import configure_meter_provider
 from curie_telemetry import metrics as curie_metrics
@@ -227,6 +231,7 @@ def _run(
     else:
         fake = FakeModelSession(next_script)
     runner = SessionRunner(
+        max_usd_per_day=None,
         held_secrets=frozenset(),
         session_factory=lambda: fake,
         ceiling=0,

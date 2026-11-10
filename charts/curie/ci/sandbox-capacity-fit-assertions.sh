@@ -169,7 +169,10 @@ data:
   memMilli: {{ include "curie.capacity.memBytes" "1500m" | quote }}
   memMilliLarge: {{ include "curie.capacity.memBytes" "2000000m" | quote }}
   memMilliSub1: {{ include "curie.capacity.memBytes" "500m" | quote }}
-  defaults: {{ include "curie.sandboxCapacity" (dict "nodes" $s.nodes "pods" list "perSandbox" .Values.agentSandbox.runner.resources.requests "perSandboxLimits" .Values.agentSandbox.runner.resources.limits "sandboxPriorityClass" "curie-sandbox" "hard" .Values.resourceQuota.hard) | quote }}
+{{- /* #4889: the generic runner.resources default is unset; the standard
+     profile supplies the effective generic envelope. */}}
+{{- $genericEnv := include "curie.sandboxEnvelope" (dict "root" . "agent" "") | fromJson }}
+  defaults: {{ include "curie.sandboxCapacity" (dict "nodes" $s.nodes "pods" list "perSandbox" $genericEnv.resources.requests "perSandboxLimits" $genericEnv.resources.limits "sandboxPriorityClass" "curie-sandbox" "hard" .Values.resourceQuota.hard) | quote }}
   notesOver: |
 {{- include "curie.sandboxCapacity.notes" (dict "fits" 3 "ceiling" 8 "cpu" "1" "memory" "1Gi" "fullname" "curie" "namespace" "ns") | nindent 4 }}
   notesEqual: |

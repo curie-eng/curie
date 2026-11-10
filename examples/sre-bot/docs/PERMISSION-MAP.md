@@ -172,6 +172,85 @@ legitimate Job.
 authorized while the ADR is Draft. If the proposed control is not acceptable,
 do not install the upgrade connector.
 
+## `scale_deployment()` (opt-in scaler connector)
+
+Tool: `mcp__scaler__scale_deployment(name, replicas)`, only after an operator
+opts in. The default bundle does not declare the `scaler` connector, names none
+of its tools, and does not apply its credential, so none of this exists on an
+installation that has not opted in. The opt-in declaration is
+`connectors/scaler/opt-in.yaml`; it adds `scaler/scale_deployment` as
+`approval-required` with its own `sre-approvals` gate and `scaler/observe_version`
+as `allow`.
+
+The tool sets one Deployment's replica count to an exact value in the one
+namespace the connector is configured for (`SCALER_NAMESPACE`), only for a name
+on its allowlist (`SCALER_DEPLOYMENTS`) and only up to `SCALER_MAX_REPLICAS`.
+Every reply carries the prior count sealed for the platform's undo, the version
+the write left and the target, so a platform executed remediation can record and
+qualify it (see the README's scaler section). `observe_version` is a read the
+platform's executor calls without approval. `restore` is hidden from the model;
+the platform gates it with a one-shot grant once the capability probe records the
+pair, and an undo is always a person's approval.
+
+The connector identity is a separate ServiceAccount, `sre-bot-scaler`, from
+`manifests/scaler-access.yaml`. Its Role grants `get` and `update` on
+`deployments/scale` only, in the one namespace, with `resourceNames` limited to
+the allowlisted Deployments. It cannot read or change a Deployment's pod
+template, image, command, environment or Secret references, cannot list
+anything, and cannot act in another namespace. A leaked token can set those
+Deployments' replica counts, zero included, and nothing else; RBAC stays the
+ceiling even if the connector's own allowlist is wider than the Role.
+
+## `restart_deployment()` (opt-in restarter connector)
+
+Tool: `mcp__restarter__restart_deployment(name, restart_at)`, only after an
+operator opts in. The default bundle does not declare the `restarter`
+connector, names none of its tools, and does not apply its credential. The
+opt-in declaration is `connectors/restarter/opt-in.yaml`; it adds
+`restarter/restart_deployment` as `approval-required` with its own
+`sre-approvals` gate, and nothing as `allow`.
+
+The tool sets the `kubectl.kubernetes.io/restartedAt` annotation on the pod
+template of one Deployment in the one namespace the connector is configured for
+(`RESTARTER_NAMESPACE`), only for a name on its allowlist
+(`RESTARTER_DEPLOYMENTS`), so the controller replaces its Pods. The same
+`restart_at` twice, or a `restart_at` older than the last restart, changes
+nothing; a future one is refused. Every reply carries a sealed prior state, the
+version the write left and the target, so a platform executed remediation can
+record and qualify it as idempotent (see the README's restarter section). The
+connector serves no `restore`, so nothing it does is undoable.
+
+The connector identity is a separate ServiceAccount, `sre-bot-restarter`, from
+`manifests/restarter-access.yaml`. Its Role grants `get` and `patch` on
+`deployments` only, in the one namespace, with `resourceNames` limited to the
+allowlisted Deployments. It cannot list anything, delete or read Pods, read
+Secrets, or act in another namespace. RBAC cannot narrow `patch` to one field:
+a leaked token can change anything in those Deployments' spec, the image
+included, and `get` shows their pod templates. The connector itself sends only
+the one annotation and returns nothing of the template; RBAC stays the ceiling
+even if the connector's own allowlist is wider than the Role.
+
+## `query_value()` (opt-in metrics connector)
+
+Tool: `mcp__metrics__query_value(query)`, only after an operator opts in. The
+default bundle does not declare the `metrics` connector and names none of its
+tools. The opt-in declaration is `connectors/metrics/opt-in.yaml`; it adds
+`metrics/query_value` as `allow`, with no gate.
+
+The tool runs one PromQL instant query (`GET /api/v1/query`) against the one
+Prometheus in `METRICS_URL` and returns its vector or scalar. It is the read a
+remediation policy declares as its `precondition` and `verifier`, sampled by
+the platform's executor without a grant; the model may call it too. It cannot
+write: Prometheus's query API is read-only, the connector sends nothing but
+that `GET`, and it never follows a redirect.
+
+It holds no Kubernetes credential. By default it holds no credential at all;
+an operator whose Prometheus requires one adds `METRICS_BEARER_TOKEN` as a
+SecretRef. A leaked token reads whatever that Prometheus serves, which can
+include every scraped metric and label in the cluster. The connector does not
+narrow the queries it runs, so treat that Prometheus's contents as readable by
+the bot.
+
 ## Retention and evidence
 
 Kubernetes Events and pod logs are short-lived. Approval records show a call

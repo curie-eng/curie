@@ -156,7 +156,7 @@ networks:
             "CURIE_CONFIG_DIR": str(config_dir),
             "DB_SCHEMA": "curie",
             "ENVIRONMENT": "dev",
-            "GITHUB_FACTORY_INGRESS_ENABLED": "false",
+            "FACTORY_ENABLED": "false",
             "GITHUB_APP_ID": "",
             "GITHUB_APP_PRIVATE_KEY": "",
             "GITHUB_REVIEW_INGRESS_ENABLED": "false",
@@ -288,7 +288,7 @@ networks:
                 with urllib.request.urlopen(f"{api_url}/health", timeout=1) as response:
                     if response.status == 200:
                         break
-            except Exception:
+            except Exception:  # noqa: BLE001 - existing broad catch retained
                 time.sleep(1)
         else:
             api_log.flush()

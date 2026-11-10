@@ -1,4 +1,4 @@
-"""Stub upstream API for the `ui-image-smoke` CI job.
+"""Stub upstream API for the UI group of the `image-proofs` CI job.
 
 The job puts this server behind the console image's `/api/` proxy location so
 the smoke checks can prove that proxied API responses stay uncompressed,

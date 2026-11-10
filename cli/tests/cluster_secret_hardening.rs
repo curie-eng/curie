@@ -1,8 +1,7 @@
 //! Binary and public surface regressions for cluster secret lifecycle and
 //! rendered Helm passthrough values.
 
-#[path = "support/executable.rs"]
-mod test_executable;
+use crate::support::executable as test_executable;
 
 use std::fs;
 use std::os::unix::process::ExitStatusExt;
@@ -156,6 +155,11 @@ fi
 if [ "$1" = "get" ] && [ "$2" = "statefulset" ]; then
     printf '%s\n' '{"apiVersion":"v1","items":[],"kind":"List","metadata":{}}'
     exit 0
+fi
+
+if [ "$1" = "get" ] && [ "$2" = "runtimeclass" ]; then
+    printf '%s\n' 'Error from server (Forbidden): runtimeclasses.node.k8s.io "gvisor" is forbidden: User "system:serviceaccount:example:example" cannot get resource "runtimeclasses" in API group "node.k8s.io" at the cluster scope' >&2
+    exit 1
 fi
 
 printf 'unexpected kubectl invocation: %s\n' "$*" >&2
@@ -416,7 +420,10 @@ fn assert_parser_edge_cases_are_masked(rendered: &str, surface: &str) {
 
 fn pure_up() -> UpOpts {
     UpOpts {
+        file_values: None,
         retained_mail_values: None,
+        retained_runner_values: None,
+        saved_credentials: None,
         common: CommonOpts {
             namespace: TARGET_NAMESPACE.to_string(),
             release: TARGET_RELEASE.to_string(),
@@ -433,6 +440,7 @@ fn pure_up() -> UpOpts {
             UNCLOSED_LIST_EXPRESSION.to_string(),
         ],
         set_string: vec![SET_STRING_EXPRESSION.to_string()],
+        set_json: vec![],
         allow_egress_host: vec![],
         resolved_egress_cidrs: vec![],
         allow_web_egress: vec![],

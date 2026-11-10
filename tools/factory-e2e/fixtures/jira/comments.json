@@ -1,0 +1,83 @@
+{
+  "startAt": 0,
+  "maxResults": 5000,
+  "total": 3,
+  "comments": [
+    {
+      "self": "https://example.atlassian.net/rest/api/3/issue/10042/comment/10100",
+      "id": "10100",
+      "author": {
+        "accountId": "712020:00000000-0000-4000-8000-00000000b07a",
+        "accountType": "app",
+        "displayName": "Curie Factory",
+        "active": true
+      },
+      "body": {
+        "type": "doc",
+        "version": 1,
+        "content": [
+          {"type": "paragraph", "content": [{"type": "text", "text": "Factory status: running"}]}
+        ]
+      },
+      "created": "2026-10-12T09:00:00.000-0400",
+      "updated": "2026-10-12T09:05:00.000-0400",
+      "properties": [
+        {
+          "key": "curie.factory",
+          "value": {
+            "marker": "curie-factory:status",
+            "body_sha256": "0000000000000000000000000000000000000000000000000000000000000000"
+          }
+        }
+      ]
+    },
+    {
+      "self": "https://example.atlassian.net/rest/api/3/issue/10042/comment/10101",
+      "id": "10101",
+      "author": {
+        "accountId": "557058:00000000-0000-4000-8000-0000000000a1",
+        "accountType": "atlassian",
+        "displayName": "Factory Labeler",
+        "active": true
+      },
+      "body": {
+        "type": "doc",
+        "version": 1,
+        "content": [
+          {"type": "paragraph", "content": [{"type": "text", "text": "Copied the status property by hand."}]}
+        ]
+      },
+      "created": "2026-10-12T09:06:00.000-0400",
+      "updated": "2026-10-12T09:06:00.000-0400",
+      "properties": [
+        {
+          "key": "curie.factory",
+          "value": {
+            "marker": "curie-factory:status",
+            "body_sha256": "0000000000000000000000000000000000000000000000000000000000000000"
+          }
+        }
+      ]
+    },
+    {
+      "self": "https://example.atlassian.net/rest/api/3/issue/10042/comment/10102",
+      "id": "10102",
+      "author": {
+        "accountId": "712020:00000000-0000-4000-8000-00000000b07a",
+        "accountType": "app",
+        "displayName": "Curie Factory",
+        "active": true
+      },
+      "body": {
+        "type": "doc",
+        "version": 1,
+        "content": [
+          {"type": "paragraph", "content": [{"type": "text", "text": "A reply with no status property."}]}
+        ]
+      },
+      "created": "2026-10-12T09:07:00.000-0400",
+      "updated": "2026-10-12T09:07:00.000-0400",
+      "properties": []
+    }
+  ]
+}

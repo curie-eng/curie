@@ -45,6 +45,26 @@ function NavProbe() {
 }
 
 describe("RealTraceDetail — view sandbox logs (issue #16)", () => {
+  it("renders an observation with omitted optional children", async () => {
+    // ObservationNode requires only id and type in apps/api/openapi.json.
+    vi.mocked(getTrace).mockResolvedValue({
+      trace: { id: "tr-1", name: "example trace" },
+      tree: [{ id: "root", type: "SPAN" }],
+    } as TraceTree);
+
+    function Harness() {
+      const { dispatch } = useStore();
+      useEffect(() => {
+        dispatch({ type: "openTrace", id: "tr-1" });
+      }, [dispatch]);
+      return <RealTraceDetail />;
+    }
+
+    renderWired(<Harness />);
+    expect(await screen.findByTestId("span-tree")).toBeInTheDocument();
+    expect(screen.getAllByText("SPAN")).toHaveLength(2);
+  });
+
   it("shows the control when a typed sandbox id is present and jumps to the logs tab prefilled", async () => {
     const user = userEvent.setup();
 

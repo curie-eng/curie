@@ -13,6 +13,7 @@ provisioned-runner end-to-end (no ``target_url``) that tears the sandbox down.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import io
 import json
 import logging
@@ -26,7 +27,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, cast
+from typing import TYPE_CHECKING, Any, NoReturn, cast
 
 import httpx
 import pytest
@@ -62,6 +63,7 @@ from curie_worker.consumer_liveness import (
     consumer_heartbeat_capable_key,
     consumer_heartbeat_key,
 )
+from curie_worker.delivery_lease import DeliveryLeaseStore
 from curie_worker.eval import (
     EvalCase,
     EvalJob,
@@ -78,6 +80,7 @@ from curie_worker.eval import stream as eval_stream_module
 from curie_worker.eval.models import EvalCaseResult, EvalOutcome, EvalRunResult
 from curie_worker.sandbox import AffinityStore, SandboxSubstrate, SubstrateConfig
 from curie_worker.sandbox.types import ClaimView, QuotaRejection, SandboxError, SandboxView
+from curie_worker.stream_consumer import ConsumerLivenessExpired
 from opentelemetry import trace
 from redis.asyncio import Redis as AsyncRedis
 from redis.asyncio.retry import Retry as AsyncRetry
@@ -91,6 +94,9 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from queue_fixtures import wait_until as _wait_until  # noqa: E402
 
+if TYPE_CHECKING:
+    from curie_worker.sandbox.types import ToolDaemonMount
+
 CONTAINS = GraderKind.CONTAINS
 _DB_URL = os.environ.get(
     "TEST_DATABASE_URL", "postgresql+asyncpg://postgres:postgres@localhost:25432/postgres"
@@ -98,13 +104,223 @@ _DB_URL = os.environ.get(
 _DB_SCHEMA = os.environ.get("TEST_DB_SCHEMA", "curie")
 
 
+@pytest.mark.parametrize(
+    ("lane", "outage_s"),
+    [
+        pytest.param("delivery", 2.9, id="delivery-29s-survives"),
+        pytest.param("liveness", 2.9, id="liveness-29s-survives"),
+        pytest.param("delivery", 5.0, id="delivery-50s-expires"),
+        pytest.param("delivery-key-gone", 0.0, id="delivery-key-gone-refused"),
+        pytest.param("delivery-wrong-token", 0.0, id="delivery-wrong-token-refused"),
+    ],
+)
+def test_eval_real_suite_shares_ownership_outage_recovery_and_expiry(
+    make_eval_harness,
+    bundles,
+    monkeypatch: pytest.MonkeyPatch,
+    lane: str,
+    outage_s: float,
+) -> None:
+    """Both shared leases fence a real eval suite, with production clocks at 0.1.
+
+    RustFS supplies the bundle and Langfuse records the score. Only model
+    responses and the platform's report HTTP are faked. The ownership adapters
+    delegate every successful operation to real Valkey.
+    """
+    bundles_store, upload = bundles
+
+    async def go() -> None:
+        async with make_eval_harness() as (base_url, fake, _runner):
+            token = uuid.uuid4().hex
+            cfg = _lease_cfg(
+                token,
+                delivery_lease_ttl_s=4.5,
+                delivery_lease_heartbeat_s=1.0,
+                consumer_heartbeat_ttl_ms=4500,
+                consumer_capability_ttl_ms=9000,
+                reclaim_min_idle_ms=6000,
+                read_block_ms=10,
+            )
+            client = AsyncRedis(host=_VH, port=_VP, password=_VPW, decode_responses=True)
+            release = asyncio.Event()
+            fake.hold_inputs["ownership-outage"] = release
+            fake.responses["ownership-outage"] = "completed"
+            bundle_ref = upload(
+                EvalSuite(
+                    name="ownership-outage",
+                    cases=[
+                        EvalCase(
+                            id="held",
+                            input="ownership-outage",
+                            grader=Grader(kind=CONTAINS, expected="completed"),
+                        )
+                    ],
+                )
+            )
+            reports: list[dict[str, Any]] = []
+            async with httpx.AsyncClient(timeout=30.0) as lf_client:
+                consumer = _build_consumer(
+                    redis_client=client,
+                    cfg=cfg,
+                    bundle_store=bundles_store,
+                    substrate=_UnusedSubstrate(),
+                    reports=reports,
+                    lf_client=lf_client,
+                )
+                leases = DeliveryLeaseStore(client, cfg)
+                # Same real store that production injects at construction.
+                consumer._leases = leases
+                liveness = consumer._liveness_store
+                assert liveness is not None
+                real_heartbeat = leases.heartbeat
+                real_renew = liveness.renew
+                outage_until: float | None = None
+                failures = 0
+                heartbeat_calls = 0
+                recovered = asyncio.Event()
+                loss_calls = 0
+                real_finish_loss = consumer._finish_lease_loss
+
+                def unavailable() -> None:
+                    nonlocal failures
+                    if outage_until is not None and time.monotonic() < outage_until:
+                        failures += 1
+                        raise redis.exceptions.ConnectionError("injected eval ownership outage")
+
+                async def heartbeat(*args: Any, **kwargs: Any) -> Any:
+                    nonlocal heartbeat_calls
+                    heartbeat_calls += 1
+                    unavailable()
+                    result = await real_heartbeat(*args, **kwargs)
+                    if outage_until is not None:
+                        recovered.set()
+                    return result
+
+                async def renew(**kwargs: Any) -> bool:
+                    unavailable()
+                    result = await real_renew(**kwargs)
+                    if outage_until is not None:
+                        recovered.set()
+                    return result
+
+                async def finish_loss(*args: Any, **kwargs: Any) -> None:
+                    nonlocal loss_calls
+                    loss_calls += 1
+                    await real_finish_loss(*args, **kwargs)
+
+                if lane.startswith("delivery"):
+                    monkeypatch.setattr(leases, "heartbeat", heartbeat)
+                    monkeypatch.setattr(consumer, "_finish_lease_loss", finish_loss)
+                else:
+                    monkeypatch.setattr(liveness, "renew", renew)
+                await consumer.ensure_group()
+                entry_id = await client.xadd(
+                    cfg.eval_stream,
+                    {
+                        STREAM_PAYLOAD_FIELD: _item(
+                            suite="ownership-outage",
+                            sha=f"sha-{token}",
+                            bundle_ref=bundle_ref,
+                            target_url=base_url,
+                        ).model_dump_json()
+                    },
+                )
+                task = asyncio.create_task(consumer.run())
+                try:
+                    await _wait_until(lambda: bool(fake.seen))
+                    lease = consumer._held_leases[entry_id]
+                    started = (
+                        lease.local_deadline_monotonic - 3.5
+                        if lane == "delivery"
+                        else consumer._last_liveness_renewal
+                    )
+                    assert started is not None
+                    if outage_s > 0:
+                        outage_until = time.monotonic() + outage_s
+                    if outage_s == 0:
+                        refused_at = time.monotonic()
+                        lease_key = cfg.delivery_lease_key(
+                            cfg.eval_stream, cfg.eval_consumer_group, entry_id
+                        )
+                        if lane == "delivery-key-gone":
+                            await client.delete(lease_key)
+                        else:
+                            await client.set(lease_key, "another-owner", px=4500)
+                        await asyncio.wait_for(lease.lost.wait(), timeout=1.25)
+                        assert time.monotonic() - refused_at < 1.2
+                        await asyncio.gather(*list(consumer._lease_loss_tasks))
+                        assert loss_calls == 1
+                        await asyncio.sleep(0.05)
+                        assert heartbeat_calls == 1
+                        consumer.request_stop()
+                        release.set()
+                        await asyncio.wait_for(task, timeout=5.0)
+                        assert not reports, "a refused eval owner published a report"
+                        assert entry_id in await _eval_pending(client, cfg)
+                    elif outage_s == 2.9:
+                        await asyncio.wait_for(recovered.wait(), timeout=3.3)
+                        assert failures == 2
+                        assert not lease.lost.is_set()
+                        assert not task.done()
+                        release.set()
+                        await _wait_until(lambda: bool(reports))
+                        await _wait_until(lambda: entry_id not in consumer._inflight_ids)
+                        assert reports[0]["passed_count"] == reports[0]["total"] == 1
+                        assert entry_id not in await _eval_pending(client, cfg)
+                        assert loss_calls == 0
+                    elif lane == "delivery":
+                        await asyncio.sleep(max(0, started + 3.43 - time.monotonic()))
+                        assert not lease.lost.is_set()
+                        await asyncio.wait_for(lease.lost.wait(), timeout=0.2)
+                        assert time.monotonic() - started == pytest.approx(3.5, abs=0.07)
+                        await asyncio.gather(*list(consumer._lease_loss_tasks))
+                        assert loss_calls == 1
+                        consumer.request_stop()
+                        release.set()
+                        await asyncio.wait_for(task, timeout=5.0)
+                        assert not reports, "a fenced eval owner published a report"
+                        assert entry_id in await _eval_pending(client, cfg)
+                        assert failures == 3
+                    else:
+                        await asyncio.sleep(max(0, started + 3.43 - time.monotonic()))
+                        assert not task.done()
+                        with pytest.raises(ConsumerLivenessExpired):
+                            await asyncio.wait_for(task, timeout=0.2)
+                        assert time.monotonic() - started == pytest.approx(3.5, abs=0.07)
+                        assert not reports
+                        assert entry_id in await _eval_pending(client, cfg)
+                        assert not consumer._inflight_ids
+                        assert failures == 3
+                finally:
+                    release.set()
+                    consumer.request_stop()
+                    with contextlib.suppress(ConsumerLivenessExpired):
+                        await asyncio.wait_for(task, timeout=5.0)
+                    await client.delete(
+                        consumer_heartbeat_key(
+                            cfg.eval_stream, cfg.eval_consumer_group, cfg.eval_consumer_name
+                        ),
+                        consumer_heartbeat_capable_key(
+                            cfg.eval_stream, cfg.eval_consumer_group, cfg.eval_consumer_name
+                        ),
+                    )
+                    await _eval_cleanup(client, cfg)
+
+    asyncio.run(go())
+
+
 class _StubRepo:
     """The B1 repo lookup, stubbed: a channel/agent resolves to a GitHub repo."""
 
     def __init__(
-        self, *, model: str | None = None, thinking: str | None = None
+        self,
+        *,
+        model: str | None = None,
+        reviewer_model: str | None = None,
+        thinking: str | None = None,
     ) -> None:
         self._model = model
+        self._reviewer_model = reviewer_model
         self._thinking = thinking
         self.model_settings_agent_ids: list[uuid.UUID] = []
 
@@ -119,11 +335,17 @@ class _StubRepo:
     async def name_for(self, _agent_id: uuid.UUID) -> str | None:
         return None
 
+    async def eval_connector_settings_for(
+        self, agent_id: uuid.UUID
+    ) -> tuple[str, list[str]] | None:
+        name = await self.name_for(agent_id)
+        return (name, []) if name is not None else None
+
     async def model_settings_for(
         self, agent_id: uuid.UUID
-    ) -> tuple[str | None, str | None, dict[str, object] | None]:
+    ) -> tuple[str | None, str | None, str | None, dict[str, object] | None]:
         self.model_settings_agent_ids.append(agent_id)
-        return self._model, self._thinking, None
+        return self._model, self._reviewer_model, self._thinking, None
 
 
 class _ObservedBindingResolver(BindingResolver):
@@ -135,7 +357,7 @@ class _ObservedBindingResolver(BindingResolver):
 
     async def model_settings_for(
         self, agent_id: uuid.UUID
-    ) -> tuple[str | None, str | None, dict[str, object] | None]:
+    ) -> tuple[str | None, str | None, str | None, dict[str, object] | None]:
         self.model_settings_agent_ids.append(agent_id)
         return await super().model_settings_for(agent_id)
 
@@ -181,9 +403,12 @@ class _FakeK8s:
         pool: str,
         env: dict[str, str] | None = None,
         labels: dict[str, str] | None = None,
+        deadline: float,
         runner_resources: dict[str, object] | None = None,
         agent_name: str | None = None,
+        tool_daemon: ToolDaemonMount | None = None,
     ) -> None:
+        assert deadline > 0 and tool_daemon is None
         self.claim_envs.append(dict(env or {}))
         self.created_pools.append(pool)
         self.created_labels.append(
@@ -197,9 +422,7 @@ class _FakeK8s:
             pool=pool,
         )
 
-    def get_claim(
-        self, name: str, *, request_timeout_seconds: float
-    ) -> ClaimView | None:
+    def get_claim(self, name: str, *, request_timeout_seconds: float) -> ClaimView | None:
         assert request_timeout_seconds > 0
         claim = self.claims.get(name)
         if claim is None:
@@ -230,6 +453,11 @@ class _FakeK8s:
                 out.append(view)
         return out
 
+    def reap_claim_templates(self, *, keep: set[str], created_before: datetime) -> list[str]:
+        # The eval lane creates no claim-scoped templates the fake must sweep.
+        del keep, created_before
+        return []
+
     def get_sandbox(
         self, name: str, *, request_timeout_seconds: float
     ) -> SandboxView | None:
@@ -250,8 +478,37 @@ class _FakeK8s:
         assert 0 < request_timeout_seconds <= 1.0
         return False
 
+    # No Docker repository pool is configured in this suite, so the substrate
+    # never reaches the tool-daemon seam (ADR 0217); any call is a test bug.
+    def create_daemon_object(self, *args: object, **kwargs: object) -> NoReturn:
+        raise AssertionError("no tool daemon is provisioned in this suite")
+
+    def list_daemon_objects(self, *args: object, **kwargs: object) -> NoReturn:
+        raise AssertionError("no tool daemon is listed in this suite")
+
+    def delete_daemon_object(self, *args: object, **kwargs: object) -> NoReturn:
+        raise AssertionError("no tool daemon is retired in this suite")
+
+    def get_daemon_pod(self, *args: object, **kwargs: object) -> NoReturn:
+        raise AssertionError("no tool daemon pod is read in this suite")
+
+    def open_daemon_stream(self, *args: object, **kwargs: object) -> NoReturn:
+        raise AssertionError("no tool daemon is pinged in this suite")
+
     def set_sandbox_mode(self, name: str, mode: str) -> None:  # pragma: no cover - unused here
         pass
+
+
+# The eval liveness test's ceilings for observing a marker publish or renew.
+# A healthy consumer satisfies each within milliseconds; the ceiling only
+# bounds how long a broken one takes to fail, so it sits far above any stall.
+_OBSERVE_S = 30.0
+# Renewed every third of its TTL, so a renewal shows within about a second,
+# while a stall must exceed about two seconds to fail the generation closed.
+_ALIVE_TTL_MS = 3_000
+# Above the test's 300ms reclaim idle, as the config requires, and far above
+# the drain and report the test waits on after the last renewal.
+_CAPABILITY_TTL_MS = 60_000
 
 
 def _cfg(stream: str, group: str, **overrides: object) -> WorkerConfig:
@@ -400,8 +657,14 @@ def test_eval_consumer_publishes_and_renews_shared_liveness_lifecycle(
                 f"test:evals:{token}",
                 f"g-{token}",
                 reclaim_min_idle_ms=300,
-                consumer_heartbeat_ttl_ms=150,
-                consumer_capability_ttl_ms=450,
+                # The consumer fails its generation closed when a renewal is
+                # not confirmed inside this lease, so at 150ms one stalled
+                # renewal ended consumer.run() mid-drain (#3861).
+                consumer_heartbeat_ttl_ms=_ALIVE_TTL_MS,
+                # Long enough that the final EXISTS proves shutdown left the
+                # marker in place. At 450ms it was also a budget on the drain
+                # and the report, which a stalled runner overran (#3861).
+                consumer_capability_ttl_ms=_CAPABILITY_TTL_MS,
                 read_block_ms=10,
             )
             client = AsyncRedis(host=_VH, port=_VP, password=_VPW, decode_responses=True)
@@ -457,10 +720,12 @@ def test_eval_consumer_publishes_and_renews_shared_liveness_lifecycle(
                     return int(alive_ttl), int(capable_ttl)
 
                 task = asyncio.create_task(consumer.run())
-                # One EXISTS per key can observe the 150ms alive lease in its
-                # last milliseconds and fail the following assert. Require both
+                # One EXISTS per key can observe the alive lease in its last
+                # milliseconds and fail the following assert. Require both
                 # TTLs in one round trip, with margin, and do not sample again.
-                deadline = time.monotonic() + 2
+                # The ceilings below only bound a broken consumer; a healthy
+                # one exits each loop on its first matching sample.
+                deadline = time.monotonic() + _OBSERVE_S
                 while time.monotonic() < deadline:
                     alive_ttl, capable_ttl = await liveness_ttls()
                     if alive_ttl > 40 and capable_ttl > 40:
@@ -469,20 +734,20 @@ def test_eval_consumer_publishes_and_renews_shared_liveness_lifecycle(
                 else:
                     pytest.fail("eval consumer did not publish both liveness markers")
 
-                await _wait_until(lambda: bool(fake.seen))
+                await _wait_until(lambda: bool(fake.seen), timeout=_OBSERVE_S)
                 consumer.request_stop()
                 # b23d87c9b polled one PTTL sample after a sleep longer than the
                 # 150ms alive lease. That sleep is the other race: a stalled
                 # refresh expires the key and kills the generation before the
                 # sample. A rise in both TTLs is one renewal transaction. A
                 # non-positive sample resets the baselines, so a lapse and a
-                # later republish cannot count as that renewal. The 450ms
-                # capability lease would otherwise still be the original key.
+                # later republish cannot count as that renewal. Without a rise the
+                # capability lease could still be the original key.
                 low_alive: int | None = None
                 low_capable: int | None = None
                 alive_rose = False
                 capable_rose = False
-                renewal_deadline = time.monotonic() + 2
+                renewal_deadline = time.monotonic() + _OBSERVE_S
                 while time.monotonic() < renewal_deadline:
                     if task.done():
                         break
@@ -920,7 +1185,7 @@ def test_entry_is_acked_after_report_even_when_report_fails(make_eval_harness, b
         ),
     ],
 )
-def test_provisioned_runner_end_to_end(
+def test_provisioned_runner_reviewer_model_end_to_end(
     make_eval_harness,
     bundles,
     platform_model: str | None,
@@ -951,13 +1216,14 @@ def test_provisioned_runner_end_to_end(
                 await conn.execute(
                     text(
                         f"INSERT INTO {_DB_SCHEMA}.agents "
-                        "(id, name, model, thinking, repo_full_name) "
-                        "VALUES (:id, :name, :model, :thinking, :repo)"
+                        "(id, name, model, reviewer_model, thinking, repo_full_name) "
+                        "VALUES (:id, :name, :model, :reviewer_model, :thinking, :repo)"
                     ),
                     {
                         "id": agent_id,
                         "name": f"eval_agent_{token}",
                         "model": stored_model,
+                        "reviewer_model": "acme-reviewer-model" if stored_model else None,
                         "thinking": agent_thinking,
                         "repo": "acme-corp/acme-bot",
                     },
@@ -1011,11 +1277,20 @@ def test_provisioned_runner_end_to_end(
                         pool: str,
                         env: dict[str, str] | None = None,
                         labels: dict[str, str] | None = None,
+                        deadline: float,
                         runner_resources: dict[str, object] | None = None,
                         agent_name: str | None = None,
+                        tool_daemon: ToolDaemonMount | None = None,
                     ) -> None:
                         fake.responses["report model"] = (env or {}).get(MODEL_ENV, "unset")
-                        super().create_claim(name, pool=pool, env=env, labels=labels)
+                        super().create_claim(
+                            name,
+                            pool=pool,
+                            env=env,
+                            labels=labels,
+                            deadline=deadline,
+                            tool_daemon=tool_daemon,
+                        )
 
                 fake_k8s = _ModelEchoK8s()
                 substrate = SandboxSubstrate(
@@ -1076,20 +1351,19 @@ def test_provisioned_runner_end_to_end(
                         assert THINKING_ENV not in claim_env
                     else:
                         assert claim_env[THINKING_ENV] == expected_thinking
+                    assert claim_env.get("CURIE_REVIEWER_MODEL") == (
+                        "acme-reviewer-model" if stored_model else None
+                    )
                     assert repo_lookup.model_settings_agent_ids == [agent_id]
                     assert fake_k8s.deleted, "provisioned sandbox was never released"
                     assert not fake_k8s.claims
 
                     summary = await client.xpending(cfg.eval_stream, cfg.eval_consumer_group)
                     assert summary["pending"] == 0
-                    traces = await _assert_langfuse_traces(
-                        lf_client, cfg, sha, expected=1
-                    )
+                    traces = await _assert_langfuse_traces(lf_client, cfg, sha, expected=1)
                     trace_row = traces[0]
                     assert trace_row["metadata"]["model"] == expected_model
-                    model_tags = [
-                        tag for tag in trace_row["tags"] if tag.startswith("model:")
-                    ]
+                    model_tags = [tag for tag in trace_row["tags"] if tag.startswith("model:")]
                     assert model_tags == (
                         [] if expected_model is None else [f"model:{expected_model}"]
                     )
@@ -1392,9 +1666,7 @@ class _TokenSubstrate:
         self._token = token
         self.released: list[str] = []
 
-    def claim(
-        self, _key: str, *, env: dict[str, str] | None = None, **_: object
-    ) -> _FakeHandle:
+    def claim(self, _key: str, *, env: dict[str, str] | None = None, **_: object) -> _FakeHandle:
         return _FakeHandle(base_url="http://sandbox.local:8080", token=self._token)
 
     def release(self, key: str, **_: object) -> None:
@@ -1421,7 +1693,7 @@ def test_eval_boot_env_mints_runner_token() -> None:
         repo_lookup=None,
     )
     item = _item(suite="s", sha="deadbeef", bundle_ref="bundles/x.zip", target_url=None)
-    env = consumer._boot_env(item, None, None, model=None)
+    env = consumer._boot_env(item, None, None, model=None, reviewer_model=None)
     assert env.get(RUNNER_TOKEN_ENV), "_boot_env must mint a non-empty runner token"
 
 
@@ -1442,7 +1714,7 @@ def test_eval_lane_boot_env_omits_memory_ref() -> None:
         repo_lookup=None,
     )
     item = _item(suite="s", sha="deadbeef", bundle_ref="bundles/x.zip", target_url=None)
-    env = consumer._boot_env(item, None, None, model=None)
+    env = consumer._boot_env(item, None, None, model=None, reviewer_model=None)
     assert "CURIE_MEMORY_REF" not in env
     assert "CURIE_MEMORY_TOKEN" not in env
     assert "CURIE_HISTORY_REF" not in env
@@ -1466,7 +1738,7 @@ def test_eval_boot_env_forwards_sha_as_bundle_version() -> None:
         repo_lookup=None,
     )
     item = _item(suite="s", sha="deadbeef", bundle_ref="bundles/x.zip", target_url=None)
-    env = consumer._boot_env(item, None, None, model=None)
+    env = consumer._boot_env(item, None, None, model=None, reviewer_model=None)
     assert env["CURIE_BUNDLE_VERSION"] == "deadbeef"
     assert env[BUNDLE_REF_ENV] == "bundles/x.zip"
 
@@ -1488,14 +1760,16 @@ def test_eval_requested_model_boots_and_tags_that_model() -> None:
     item = _item(
         suite="s", sha="deadbeef", bundle_ref="bundles/x.zip", target_url=None, model="claude-x"
     )
-    env = consumer._boot_env(item, None, None, model="claude-x")
+    env = consumer._boot_env(item, None, None, model="claude-x", reviewer_model=None)
     assert env[MODEL_ENV] == "claude-x"  # requested model wins over worker default
     assert consumer._eval_model(item, "claude-x") == "claude-x"
 
     # No requested model: the worker default is booted and tagged, as before.
     default_item = _item(suite="s", sha="deadbeef", bundle_ref="bundles/x.zip", target_url=None)
     assert (
-        consumer._boot_env(default_item, None, None, model="worker-default")[MODEL_ENV]
+        consumer._boot_env(default_item, None, None, model="worker-default", reviewer_model=None)[
+            MODEL_ENV
+        ]
         == "worker-default"
     )
     assert consumer._eval_model(default_item, "worker-default") == "worker-default"
@@ -1556,7 +1830,9 @@ def test_eval_fake_model_install_refuses_to_label_a_model_never_called(
     # A fake run with no requested model is unlabelled too (not the worker default,
     # which the fake session never calls either).
     default_item = _item(suite="s", sha="deadbeef", bundle_ref="bundles/x.zip", target_url=None)
-    default_env = consumer._boot_env(default_item, None, None, model="stored_model")
+    default_env = consumer._boot_env(
+        default_item, None, None, model="stored_model", reviewer_model=None
+    )
     assert default_env[MODEL_ENV] == "stored_model"
     assert consumer._eval_model(default_item, "stored_model") is None
 
@@ -1587,9 +1863,7 @@ class _ConcurrencyProbeSubstrate:
         self.peak = 0
         self.claims = 0
 
-    def claim(
-        self, _key: str, *, env: dict[str, str] | None = None, **_: object
-    ) -> _FakeHandle:
+    def claim(self, _key: str, *, env: dict[str, str] | None = None, **_: object) -> _FakeHandle:
         with self._lock:
             self._live += 1
             self.claims += 1
@@ -1617,7 +1891,10 @@ def test_eval_claim_creation_is_bounded_to_one_by_default() -> None:
 
     async def go() -> None:
         await asyncio.gather(
-            *(consumer._acquire_target(item, model=None, thinking=None) for item in items)
+            *(
+                consumer._acquire_target(item, model=None, reviewer_model=None, thinking=None)
+                for item in items
+            )
         )
 
     asyncio.run(go())
@@ -1646,7 +1923,10 @@ def test_eval_claim_creation_bound_admits_configured_parallelism() -> None:
 
     async def go() -> None:
         await asyncio.gather(
-            *(consumer._acquire_target(item, model=None, thinking=None) for item in items)
+            *(
+                consumer._acquire_target(item, model=None, reviewer_model=None, thinking=None)
+                for item in items
+            )
         )
 
     asyncio.run(go())
@@ -1684,9 +1964,7 @@ def _canned_run(monkeypatch, outcomes: list[EvalOutcome]) -> None:
             suite=suite.name,
             model=None,
             results=[
-                EvalCaseResult(
-                    case_id=f"c{i}", outcome=outcome, output="all done", latency_ms=1.0
-                )
+                EvalCaseResult(case_id=f"c{i}", outcome=outcome, output="all done", latency_ms=1.0)
                 for i, outcome in enumerate(outcomes)
             ],
         )
@@ -1716,9 +1994,7 @@ class _EvalMetric:
 
 
 class _EvalSpan:
-    def add_event(
-        self, _name: str, _attributes: Mapping[str, str] | None = None
-    ) -> None:
+    def add_event(self, _name: str, _attributes: Mapping[str, str] | None = None) -> None:
         pass
 
 
@@ -1802,8 +2078,7 @@ def test_eval_consumer_uses_a_safe_root_and_records_bounded_completion(
     assert completed
     assert {point.attributes["outcome"] for point in completed} == {"success"}
     assert all(
-        set(point.attributes)
-        <= {"service.name", "operation", "role", "source", "outcome"}
+        set(point.attributes) <= {"service.name", "operation", "role", "source", "outcome"}
         for point in completed
     )
 
@@ -1913,6 +2188,7 @@ def test_eval_boot_env_drops_reserved_connector_secret() -> None:
         },
         None,
         model=None,
+        reviewer_model=None,
     )
     # The reserved model-credential key never carries the injected value.
     assert env.get("ANTHROPIC_BASE_URL") != "http://evil"
@@ -1922,11 +2198,22 @@ def test_eval_boot_env_drops_reserved_connector_secret() -> None:
     assert env.get("CURIE_CONNECTOR_SECRET_KEYS") == "GITHUB_PERSONAL_ACCESS_TOKEN"
 
 
-def test_eval_claim_with_connector_secrets_targets_the_per_agent_pool(monkeypatch) -> None:
+@pytest.mark.parametrize("configured_scope", [True, False])
+@pytest.mark.parametrize("signed_caller", [True, False])
+def test_eval_claim_with_connector_secrets_targets_the_per_agent_pool(
+    monkeypatch, configured_scope: bool, signed_caller: bool
+) -> None:
     """Eval is the sibling of the runs claim path (#1488): secrets + agent name
     must route the claim to the per-agent pool, not the generic one."""
+    import base64
+
+    from aci_protocol import BootEnv
+    from curie_connector_proxy import caller
     from curie_worker.eval import stream as stream_module
     from curie_worker.sandbox.types import AGENT_LABEL
+    from nacl.signing import SigningKey
+
+    signing = SigningKey.generate()
 
     class _NamedSecrets(_StubRepo):
         async def secrets_for(self, _agent_id: uuid.UUID) -> dict[str, str] | None:
@@ -1935,15 +2222,16 @@ def test_eval_claim_with_connector_secrets_targets_the_per_agent_pool(monkeypatc
         async def name_for(self, _agent_id: uuid.UUID) -> str | None:
             return "acme-a"
 
+        async def eval_connector_settings_for(self, _agent_id: uuid.UUID) -> tuple[str, list[str]]:
+            return "acme-a", ["mcp__acme__change"]
+
     async def _skip_suite(*_args: object, **_kwargs: object) -> EvalRunResult:
         return EvalRunResult(version="deadbeef", suite="s", results=[])
 
     monkeypatch.setattr(stream_module, "run_eval_suite", _skip_suite)
     fake_k8s = _FakeK8s()
     sandbox_prefix = f"test:curie:sandbox:{uuid.uuid4().hex}"
-    sync_client = redis.Redis(
-        host=_VH, port=_VP, password=_VPW or None, decode_responses=False
-    )
+    sync_client = redis.Redis(host=_VH, port=_VP, password=_VPW or None, decode_responses=False)
     pressure_client = AsyncRedis(
         host=_VH,
         port=_VP,
@@ -1975,7 +2263,14 @@ def test_eval_claim_with_connector_secrets_targets_the_per_agent_pool(monkeypatc
         ),
     )
     consumer = _consumer(
-        WorkerConfig(fake_model=True),
+        WorkerConfig(
+            fake_model=True,
+            connector_release="acme" if configured_scope else "",
+            connector_namespace="acme-system",
+            connector_caller_signing_key=(
+                base64.b64encode(bytes(signing)).decode() if signed_caller else ""
+            ),
+        ),
         bundle_store=_FakeBundleStore(
             _suite_bundle(
                 EvalSuite(
@@ -2000,6 +2295,54 @@ def test_eval_claim_with_connector_secrets_targets_the_per_agent_pool(monkeypatc
     asyncio.run(go())
     assert fake_k8s.created_pools == ["curie-agent-acme-a-runner-pool"]
     assert fake_k8s.created_labels[-1][AGENT_LABEL] == "acme-a"
+
+    # The K8s envVarsInjectionPolicy supplies this substrate-owned identity,
+    # not the worker's claim env (BootEnv.render_worker deliberately omits it).
+    boot = BootEnv.from_env({**fake_k8s.claim_envs[-1], "CURIE_SANDBOX_ID": "eval-test-sandbox"})
+    assert boot.connector_agent == ("acme-a" if configured_scope else None)
+    assert boot.connector_release == ("acme" if configured_scope else None)
+    assert boot.connector_namespace == ("acme-system" if configured_scope else None)
+    assert boot.session.memory_ref is None and boot.history_ref is None
+    from curie_runner.approval import build_approval_gate
+
+    gate = build_approval_gate(
+        operator_tools=boot.approval_required_tools,
+        policy_routes={},
+        connector_servers={"acme"},
+        mcp_servers=set(),
+        bundle_name="acme-bot",
+    )
+    assert gate is not None and gate.requires_approval("mcp__acme__change")
+    assert boot.approval_grant_tool is None and boot.approval_grant_arguments is None
+    if signed_caller and configured_scope:
+        decision = caller.decide(
+            [signing.verify_key],
+            boot.connector_caller_token,
+            admits=frozenset({"acme-a"}),
+            now=int(time.time()),
+        )
+        assert decision.admitted and decision.agent == "acme-a"
+        assert (
+            caller.decide(
+                [signing.verify_key],
+                boot.connector_caller_token,
+                admits=frozenset({"acme-other"}),
+                now=int(time.time()),
+            ).refusal
+            == caller.NOT_ADMITTED
+        )
+        assert (
+            caller.decide(
+                [SigningKey.generate().verify_key],
+                boot.connector_caller_token,
+                admits=frozenset({"acme-a"}),
+                now=int(time.time()),
+            ).refusal
+            == caller.INVALID
+        )
+        assert decision.run is None and decision.work_item is None
+    else:
+        assert boot.connector_caller_token is None
 
 
 @dataclass
@@ -2026,9 +2369,7 @@ class _DelayedDeleteK8s(_FakeK8s):
         self.lingering_sandboxes[claim.sandbox_name] = name
         self.deleted.append(name)
 
-    def get_claim(
-        self, name: str, *, request_timeout_seconds: float
-    ) -> ClaimView | None:
+    def get_claim(self, name: str, *, request_timeout_seconds: float) -> ClaimView | None:
         if name in self.claim_gets:
             self.claim_gets[name] += 1
             if self.claim_gets[name] >= self.claim_gone_after_gets:
@@ -2065,9 +2406,7 @@ def test_eval_suite_waits_until_the_released_claim_is_gone(monkeypatch) -> None:
     monkeypatch.setattr(stream_module, "run_eval_suite", _skip_suite)
     fake_k8s = _DelayedDeleteK8s(claim_gone_after_gets=2, sandbox_gone_after_gets=4)
     sandbox_prefix = f"test:curie:sandbox:{uuid.uuid4().hex}"
-    sync_client = redis.Redis(
-        host=_VH, port=_VP, password=_VPW or None, decode_responses=False
-    )
+    sync_client = redis.Redis(host=_VH, port=_VP, password=_VPW or None, decode_responses=False)
     pressure_client = AsyncRedis(
         host=_VH,
         port=_VP,
@@ -2230,9 +2569,7 @@ def test_eval_threads_sample_config_from_env_into_run_eval_suite(
 
     asyncio.run(go())
 
-    assert captured["samples"] == SampleConfig(
-        n=3, policy=AggregationPolicy.MAJORITY, k=1
-    )
+    assert captured["samples"] == SampleConfig(n=3, policy=AggregationPolicy.MAJORITY, k=1)
 
 
 @pytest.mark.parametrize("fake_model", [True, False])
@@ -2455,8 +2792,7 @@ def test_bundle_trajectory_sidecar_scores_observed_calls_instead_of_text(
                 "wrong": ["fetch", "search"],
             }
             cases_payload = (
-                json.dumps(suite.model_dump(mode="json"), indent=2, sort_keys=True)
-                + "\n"
+                json.dumps(suite.model_dump(mode="json"), indent=2, sort_keys=True) + "\n"
             ).encode("utf-8")
             sidecar = _trajectory_sidecar(
                 [
@@ -2499,8 +2835,7 @@ def test_bundle_trajectory_sidecar_scores_observed_calls_instead_of_text(
             assert by_id["right_order"].detail is None
             assert by_id["wrong_order"].outcome is EvalOutcome.FAIL
             assert by_id["wrong_order"].detail == (
-                "mode=exact expected=['search', 'fetch'] "
-                "observed=['fetch', 'search']"
+                "mode=exact expected=['search', 'fetch'] observed=['fetch', 'search']"
             )
             assert by_id["wrong_order"].error is None
             assert reporter.reports[0].passed_count == 1
@@ -2931,11 +3266,7 @@ def test_stream_records_the_trigger_identity_and_selected_trajectory_scorer(
                         params={"tags": f"version:{sha}"},
                         auth=(cfg.langfuse_public_key, cfg.langfuse_secret_key),
                     )
-                    traces = (
-                        response.json().get("data", [])
-                        if response.status_code == 200
-                        else []
-                    )
+                    traces = response.json().get("data", []) if response.status_code == 200 else []
                     if traces:
                         trace = traces[0]
                         break
@@ -3001,9 +3332,7 @@ def _lease_result(entry_id: str) -> EvalRunResult:
         suite="lease",
         stream_id=entry_id,
         results=[
-            EvalCaseResult(
-                case_id="1", outcome=EvalOutcome.PASS, output="ok", latency_ms=1.0
-            )
+            EvalCaseResult(case_id="1", outcome=EvalOutcome.PASS, output="ok", latency_ms=1.0)
         ],
     )
 
@@ -3096,9 +3425,7 @@ def test_eval_a_second_replica_is_refused_while_the_first_holds_a_live_lease() -
         client = AsyncRedis(host=_VH, port=_VP, password=_VPW, decode_responses=True)
         store = DeliveryLeaseStore(client, cfg)
         held = _HeldSuiteRun()
-        consumer_a = _lease_consumer(
-            redis_client=client, cfg=cfg_a, leases=store, suite_run=held
-        )
+        consumer_a = _lease_consumer(redis_client=client, cfg=cfg_a, leases=store, suite_run=held)
         consumer_b = _lease_consumer(
             redis_client=client, cfg=cfg_b, leases=store, suite_run=_instant_suite_run
         )
@@ -3151,9 +3478,7 @@ def test_eval_a_running_suite_holds_its_lease_without_burning_a_delivery() -> No
         client = AsyncRedis(host=_VH, port=_VP, password=_VPW, decode_responses=True)
         store = DeliveryLeaseStore(client, cfg)
         held = _HeldSuiteRun()
-        consumer = _lease_consumer(
-            redis_client=client, cfg=cfg, leases=store, suite_run=held
-        )
+        consumer = _lease_consumer(redis_client=client, cfg=cfg, leases=store, suite_run=held)
         await consumer.ensure_group()
 
         await _eval_payload(client, cfg, sha=f"sha-{token}")
@@ -3173,9 +3498,9 @@ def test_eval_a_running_suite_holds_its_lease_without_burning_a_delivery() -> No
 
         deadline = time.monotonic() + 3.0
         while time.monotonic() < deadline:
-            assert await store.is_live(
-                cfg.eval_stream, cfg.eval_consumer_group, renewed_id
-            ), "a running eval lost its lease: the heartbeat is not renewing"
+            assert await store.is_live(cfg.eval_stream, cfg.eval_consumer_group, renewed_id), (
+                "a running eval lost its lease: the heartbeat is not renewing"
+            )
             await asyncio.sleep(0.1)
 
         assert (
@@ -3215,9 +3540,7 @@ def test_eval_a_dead_owners_entry_transfers_only_after_expiry() -> None:
         client = AsyncRedis(host=_VH, port=_VP, password=_VPW, decode_responses=True)
         store = DeliveryLeaseStore(client, cfg)
         held = _HeldSuiteRun()
-        consumer = _lease_consumer(
-            redis_client=client, cfg=cfg, leases=store, suite_run=held
-        )
+        consumer = _lease_consumer(redis_client=client, cfg=cfg, leases=store, suite_run=held)
         await consumer.ensure_group()
 
         await _eval_payload(client, cfg, sha=f"sha-{token}")
@@ -3280,9 +3603,7 @@ def test_eval_a_live_lease_holds_off_the_delivery_cap() -> None:
 
         await _eval_payload(client, cfg, sha=f"sha-{token}")
         entry_id, _fields = await _eval_read_one(client, cfg, "peer-eval")
-        await client.xclaim(
-            cfg.eval_stream, cfg.eval_consumer_group, "peer-eval", 0, [entry_id]
-        )
+        await client.xclaim(cfg.eval_stream, cfg.eval_consumer_group, "peer-eval", 0, [entry_id])
         assert (await _eval_pending(client, cfg))[entry_id] >= cfg.max_delivery
 
         lease = await store.acquire(
@@ -3302,7 +3623,10 @@ def test_eval_a_live_lease_holds_off_the_delivery_cap() -> None:
         # dead-lettered on the next pass.
         assert (
             await store.release(
-                cfg.eval_stream, cfg.eval_consumer_group, entry_id, owner=lease.owner,
+                cfg.eval_stream,
+                cfg.eval_consumer_group,
+                entry_id,
+                owner=lease.owner,
                 resume_event_id=None,
             )
             is True
@@ -3330,20 +3654,20 @@ def test_eval_request_stop_stops_the_read_loop_but_never_the_heartbeat() -> None
     ``_inflight`` wait (its handler is awaited INLINE inside ``_consume``), which
     is exactly why this twin exists instead of a shared body with the runs lane.
 
-    The negative control is the sibling lease that is never renewed: it expires
-    across the same post-stop window.
+    Six advances of the held lease's absolute server expiry prove post-stop
+    renewal under a 300s TTL that tolerates runner stalls. The negative control
+    is the sibling lease that is never renewed: its expiry never moves later
+    across the same post-stop window, even if the sibling has already expired.
     """
     from curie_worker.delivery_lease import DeliveryLeaseStore
 
     async def go() -> None:
         token = uuid.uuid4().hex[:8]
-        cfg = _lease_cfg(token)
+        cfg = _lease_cfg(token, delivery_lease_ttl_s=300.0)
         client = AsyncRedis(host=_VH, port=_VP, password=_VPW, decode_responses=True)
         store = DeliveryLeaseStore(client, cfg)
         held = _HeldSuiteRun()
-        consumer = _lease_consumer(
-            redis_client=client, cfg=cfg, leases=store, suite_run=held
-        )
+        consumer = _lease_consumer(redis_client=client, cfg=cfg, leases=store, suite_run=held)
         await consumer.ensure_group()
 
         await _eval_payload(client, cfg, sha=f"sha-{token}")
@@ -3359,28 +3683,39 @@ def test_eval_request_stop_stops_the_read_loop_but_never_the_heartbeat() -> None
             sibling_id,
             consumer=cfg.eval_consumer_name,
         )
+        held_key = cfg.delivery_lease_key(cfg.eval_stream, cfg.eval_consumer_group, entry_id)
+        sibling_key = cfg.delivery_lease_key(cfg.eval_stream, cfg.eval_consumer_group, sibling_id)
+        sibling_expiry = await client.pexpiretime(sibling_key)
+        assert sibling_expiry > 0
 
         consumer.request_stop()
         late_id = await _eval_payload(client, cfg, sha=f"late-{token}")
+        expiry = await client.pexpiretime(held_key)
+        assert expiry > 0
 
-        deadline = time.monotonic() + 3.0
-        while time.monotonic() < deadline:
-            assert await store.is_live(
-                cfg.eval_stream, cfg.eval_consumer_group, entry_id
-            ), "request_stop() dropped the in-flight lease: the drain cannot finish"
-            await asyncio.sleep(0.1)
-
-        assert (
-            await store.is_live(cfg.eval_stream, cfg.eval_consumer_group, sibling_id) is False
-        ), "the un-renewed sibling never expired, so the survival above is vacuous"
+        for _ in range(6):
+            deadline = time.monotonic() + 10.0
+            while True:
+                renewed_expiry = await client.pexpiretime(held_key)
+                assert renewed_expiry > 0, (
+                    "request_stop() dropped the in-flight lease: the drain cannot finish"
+                )
+                if renewed_expiry > expiry:
+                    expiry = renewed_expiry
+                    break
+                assert time.monotonic() < deadline, (
+                    "request_stop() stopped renewing the in-flight lease"
+                )
+                await asyncio.sleep(0.05)
+            assert await client.pexpiretime(sibling_key) <= sibling_expiry, (
+                "the un-renewed sibling's expiry moved later"
+            )
         assert held.runs == [entry_id], "the read loop took a new entry after request_stop()"
         assert late_id not in await _eval_pending(client, cfg)
 
         held.hold.set()
         await asyncio.wait_for(task, timeout=10.0)
-        assert entry_id not in await _eval_pending(client, cfg), (
-            "the drained eval never acked"
-        )
+        assert entry_id not in await _eval_pending(client, cfg), "the drained eval never acked"
         await _eval_cleanup(client, cfg)
 
     asyncio.run(go())
@@ -3767,9 +4102,7 @@ def test_eval_a_suite_is_cut_short_at_the_deliverys_remaining_budget(
         assert slow.started.is_set(), (
             "the suite never started, so 'it did not complete' proves nothing"
         )
-        assert not slow.completed.is_set(), (
-            "the suite ran to completion past its delivery deadline"
-        )
+        assert not slow.completed.is_set(), "the suite ran to completion past its delivery deadline"
         assert elapsed < 4.0, (
             f"the suite ran {elapsed:.1f}s on 0.5s of remaining budget; it was not "
             "bounded at roughly the budget"

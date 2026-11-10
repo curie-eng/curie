@@ -34,6 +34,9 @@ _TURN_OUTCOMES: Final = [
     # and leaves the stream entry pending.
     "deadline_halted",
     "capacity_wait_expired",
+    # "stale_owner" (#4331): an abandoned WorkItem run whose turn reached an
+    # approval gate drops the delivery; the API termination owns its outcome.
+    "stale_owner",
 ]
 
 
@@ -136,6 +139,10 @@ _HISTORY_PERSISTENCE_FAILURE_ATTRIBUTES = {
     "outcome": ["capacity"],
     "limit": ["value", "namespace"],
 }
+_DEPLOY_NOTICE_SUPPRESSED_ATTRIBUTES = {
+    "service.name": ["curie-api"],
+    "reason": ["no_nonprod_recipient", "rate_limited"],
+}
 _QUEUE_ATTRIBUTES = {
     "service.name": ["curie-api", "curie-dispatcher", "curie-worker"],
     "source": ["api", "dispatcher", "worker", "local", "eval"],
@@ -161,6 +168,8 @@ _QUEUE_RETRY_ATTRIBUTES = {
     # cause; omitting it makes the retry metric reject the classification.
     # "sandbox-capacity" (#3693): an approval resume refused by the sandbox
     # ResourceQuota, retried under its own name.
+    # "model-unreachable" (#4333): a transport failure reaching the model
+    # endpoint, retried under its own name.
     "retry_class": [
         "redelivery",
         "rate-limit",
@@ -169,8 +178,16 @@ _QUEUE_RETRY_ATTRIBUTES = {
         "workspace-error",
         "sandbox-terminated",
         "sandbox-capacity",
+        "model-unreachable",
     ],
 }
+# ADR 0205 (#4141): the worker's append of a turn's installed files to the
+# thread attachment ledger. Closed on purpose: no thread, agent or event label.
+_ATTACHMENT_LEDGER_ATTRIBUTES = {
+    "service.name": ["curie-worker"],
+    "outcome": ["success", "failure"],
+}
+
 _THREAD_ATTRIBUTES = {
     "service.name": ["curie-worker"],
     "source": ["worker"],
@@ -197,6 +214,8 @@ _SANDBOX_ATTRIBUTES = {
         "failed",
         "orphan-cleaned",
         "observed",
+        # A WorkItem release whose thread route names another claim (#4331).
+        "fenced",
         "terminated",
         "expiry-unsupported",
         "race-lost",
@@ -217,13 +236,24 @@ _SANDBOX_INVENTORY_ATTRIBUTES = {
 }
 _RUNNER_RPC_ATTRIBUTES = {
     "service.name": ["curie-worker"],
-    "operation": ["event", "steer", "interrupt", "reset", "status", "timeout", "turn-admit"],
+    "operation": [
+        "event",
+        "steer",
+        "interrupt",
+        "reset",
+        "status",
+        "timeout",
+        "turn-admit",
+        "execute",
+    ],
     "role": ["client"],
     "outcome": ["success", "failure", "conflict", "timeout"],
 }
 _APPROVAL_ATTRIBUTES = {
     "service.name": ["curie-api", "curie-worker"],
-    "operation": ["request", "resolve", "expire", "suspend", "resume", "observe"],
+    # ``dm_delivery``: an approver DM card that was not posted or not registered
+    # (ADR 0272); it records only ``failure``.
+    "operation": ["request", "resolve", "expire", "suspend", "resume", "observe", "dm_delivery"],
     "outcome": [
         "requested",
         "resolved",
@@ -254,6 +284,24 @@ _SLACK_SOCKET_IDENTITY_ATTRIBUTES = {
     "service.name": ["curie-dispatcher"],
     "state": ["configured", "connected"],
 }
+# A Slack identity name is an install-declared slug (ADR-0168 decision 1), and
+# an install declares a handful; past 16 they share ``other`` (#4960).
+_SLACK_IDENTITY_LABEL: Final = {
+    "kind": "bounded",
+    "ceiling": 16,
+    "reserved": ["other"],
+    "overflow": "other",
+    "pattern": r"^[a-z0-9]+(-[a-z0-9]+)*$",
+}
+_SLACK_SOCKET_ENVELOPE_ATTRIBUTES = {
+    "service.name": ["curie-dispatcher"],
+    "slack_identity": _SLACK_IDENTITY_LABEL,
+    "type": ["hello", "disconnect", "events_api", "interactive", "slash_commands", "other"],
+}
+_SLACK_DELIVERY_CANARY_ATTRIBUTES = {
+    "service.name": ["curie-dispatcher"],
+    "slack_identity": _SLACK_IDENTITY_LABEL,
+}
 _REPLY_ATTRIBUTES = {
     "service.name": ["curie-worker"],
     "operation": ["update", "post"],
@@ -267,6 +315,13 @@ _REPLY_RETRY_ATTRIBUTES = {
     "retry_class": ["block-fallback", "rate-limit", "transport-fallback"],
 }
 _HTTP_OPERATIONS = [
+    "/action-executions/claim",
+    "/action-executions/{execution_id}",
+    "/action-executions/{execution_id}/arguments",
+    "/action-executions/{execution_id}/dispatch",
+    "/action-executions/{execution_id}/observation",
+    "/action-executions/{execution_id}/outcome",
+    "/action-executions/{execution_id}/samples",
     "/actions",
     "/actions/{action_id}",
     "/actions/{action_id}/audit",
@@ -295,6 +350,19 @@ _HTTP_OPERATIONS = [
     "/agents/{agent_id}/state/{namespace}/{key}",
     "/agents/{agent_id}/state/{namespace}/{key}/append",
     "/agents/{agent_id}/threads/{thread_key}/reset",
+    "/agents/{agent_id}/hooks/{hook}/source-policy",
+    "/agents/{agent_id}/hooks/{hook}/source-policy/rotate",
+    "/agents/{agent_id}/hooks/{hook}/source-policy/secret",
+    "/agents/{agent_id}/hooks/{hook}/remediation-policy",
+    "/agents/{agent_id}/hooks/{hook}/remediation-policy/arm",
+    "/agents/{agent_id}/hooks/{hook}/remediation-policy/disarm",
+    "/agents/{agent_id}/hooks/{hook}/remediation-policy/breakers",
+    "/agents/{agent_id}/hooks/{hook}/remediation-policy/breakers/{breaker_id}/close",
+    "/agents/{agent_id}/hooks/{hook}/wake-secret",
+    "/agents/{agent_id}/hooks/{hook}/wake-secret/rotate",
+    "/agents/{agent_id}/remediation-qualifications/{qualification_id}",
+    "/agents/{agent_id}/remediation-qualifications/{qualification_id}/verifier-runs",
+    "/agents/{agent_id}/remediation-qualifications/{qualification_id}/verifier-runs/{run_id}",
     "/agents/{agent_id}/hooks/{name}/fire",
     "/agents/{agent_id}/hooks/{name}/runs/{run_id}",
     "/agents/{agent_id}/versions",
@@ -305,18 +373,48 @@ _HTTP_OPERATIONS = [
     "/approvals/principals/adapter",
     "/approvals/principals/adapter/rotate",
     "/approvals/principals/operator",
+    "/approvals/principals/remediation-operator",
     "/approvals/{approval_id}",
     "/approvals/{approval_id}/audit",
     "/approvals/{approval_id}/resolve",
     # Break-glass recovery (#2753).
     "/approvals/identity-report",
     "/approvals/{approval_id}/recover",
+    "/channel-canvas",
+    "/attachment-access/list",
+    "/attachment-access/authorize",
+    "/attachment-access/fetch",
+    "/attachment-access/completion",
+    "/v1/internal/attachment-access/register",
+    "/v1/internal/attachment-access/context",
+    "/v1/internal/attachment-access/renew",
+    "/v1/internal/attachment-access/revoke",
+    "/v1/internal/attachment-access/redeem",
+    "/v1/internal/attachment-access/complete",
+    # @spec HTTP-INVOCATION-EXECUTION-16
+    "/v1/internal/identity/turn-authority/check",
+    # @spec HTTP-APPROVAL-CONTINUITY-3
+    "/v1/internal/identity/approvals",
+    # @spec APPROVER-DM-2
+    "/v1/internal/identity/approvals/{approval_id}/card",
+    # @spec HTTP-APPROVAL-CONTINUITY-12
+    "/v1/internal/identity/approval-grant/check",
+    # @spec HTTP-INVOCATION-EXECUTION-22
+    "/v1/internal/identity/binding-classification/check",
+    "/channel-read",
     "/channels/admission",
     "/channels/token",
     "/channels/turns",
+    "/channels/turns/admission",
     "/cluster-message-replies/{reply_ref}",
     "/config",
+    "/connector-capabilities/probes",
     "/console/login-codes",
+    "/console/logout",
+    # Generic OIDC console login (#2908).
+    "/console/oidc/callback",
+    "/console/oidc/login",
+    "/console/principal",
     "/console/session",
     "/deploy-targets/list",
     "/deploy-targets/resolve",
@@ -330,6 +428,8 @@ _HTTP_OPERATIONS = [
     "/health",
     "/ready",
     "/hooks/{agent_id}/{hook}",
+    "/hooks/{agent_id}/{hook}/support",
+    "/hooks/{agent_id}/{hook}/wake",
     "/langfuse/traces",
     "/langfuse/traces/{trace_id}",
     "/langfuse/traces/{trace_id}/eval-case",
@@ -341,12 +441,49 @@ _HTTP_OPERATIONS = [
     "/observability/metrics/summary",
     "/observability/runners",
     "/observability/runners/{namespace}/{pod}/logs",
+    # Provider installation and channel identity admin CRUD (#2909, ADR 0193).
+    "/channel-identities",
+    "/channel-identities/{identity_id}",
+    "/provider-installations",
+    "/provider-installations/{installation_id}",
+    # Principal resolution and Slack identity reports (#2910, #3039, ADR 0198).
+    "/identity/resolve",
+    "/identity/slack-reports",
+    "/identity/admin/{tenant_id}/{resource}",
+    # Operator code host links and link revocation (#5414).
+    "/identity/admin/{tenant_id}/code-host-links",
+    "/identity/admin/{tenant_id}/links/{link_id}/revoke",
+    "/identity/authorities",
+    "/identity/authorities/{tenant_id}",
+    "/identity/authorities/{tenant_id}/replace",
+    "/identity/authorities/{tenant_id}/retire",
+    "/identity/roles/{tenant_id}/{agent_id}",
+    "/identity/roles/{tenant_id}/{agent_id}/{role}",
+    "/directory/binding",
+    "/directory/config/{tenant_id}",
+    "/directory/credentials",
+    "/directory/teams",
+    "/directory/teams/{team_id}",
+    "/directory/teams/{team_id}/snapshot",
+    "/directory/teams/{team_id}/attempt",
+    "/directory/people",
+    "/directory/people/status",
+    "/directory/namespaces",
+    "/identity/connect/{token}",
+    "/identity/connect/{token}/confirm",
+    # Team directory sync status (#4584, ADR 0220).
+    "/teams",
+    "/teams/metrics",
+    # An agent's invocation and approver teams (#4585, ADR 0220).
+    "/agents/{agent_id}/access-policy",
     "/publications",
     "/publications/precheck",
     "/publications/{publication_id}",
     "/v1/internal/cluster-message-replies/{reply_ref}",
     "/v1/internal/github/reviews/{event_id}/reserve",
     "/v1/internal/github/reviews/{event_id}/verify",
+    "/v1/internal/memory/closed-turns",
+    "/v1/internal/state/released-credentials",
     "/v1/internal/publications",
     "/v1/internal/publications/precheck/context",
     "/v1/internal/publications/lineage",
@@ -354,6 +491,22 @@ _HTTP_OPERATIONS = [
     "/v1/internal/publications/review-reservations/{reservation_id}/cancel",
     "/v1/internal/publications/{publication_id}/lineage",
     "/v1/internal/publications/{publication_id}/credential",
+    "/v1/internal/publications/{publication_id}/pull-request",
+    "/v1/internal/publications/{publication_id}/pull-request/metadata",
+    "/v1/internal/publications/{publication_id}/branch-head",
+    "/v1/internal/publications/{publication_id}/revision-commit",
+    "/v1/internal/publications/{publication_id}/ui-evidence",
+    "/v1/internal/publications/{publication_id}/ui-evidence/images/{ordinal}",
+    "/v1/internal/publications/{publication_id}/ui-evidence/seal",
+    "/v1/internal/workspace-recovery/context",
+    "/v1/internal/workspace-recovery/outcome",
+    "/v1/internal/workspace-recovery/reserve",
+    "/v1/internal/workspace-recovery/complete",
+    "/v1/internal/workspace-recovery/fail",
+    "/v1/internal/workspace-recovery/acquire-reader",
+    "/v1/internal/workspace-recovery/release-reader",
+    "/v1/internal/workspace-recovery/claim-collection",
+    "/v1/internal/workspace-recovery/finalize-collection",
     "/v1/internal/workspaces/{deployment_id}/credential",
     "/v1/internal/workspaces/{deployment_id}/selection",
     "/v1/internal/work-items/admissions",
@@ -370,18 +523,35 @@ _HTTP_OPERATIONS = [
     "/v1/internal/work-items/requests/{request_id}/finish",
     "/v1/internal/work-items/requests/{request_id}/termination/claim",
     "/v1/internal/work-items/requests/{request_id}/termination",
+    "/v1/internal/work-items/issue-read/context",
+    # Factory Slack run steering (#5414).
+    "/v1/internal/factory-slack/steer",
+    "/v1/internal/channel-read/context",
+    # The thread attachment ledger (ADR 0205).
+    "/v1/internal/thread-attachments/query",
+    "/v1/internal/thread-attachments/append",
+    # Automated remediation nominations (AUTOMATED-REMEDIATION-6).
+    "/v1/internal/remediation/nominations",
     "/v1/work-item-progress/{request_id}",
     "/v1/work-item-progress/{request_id}/usage",
     "/v1/work-item-progress/{request_id}/verification",
     # Deliberate progress from a running turn (ADR 0130).
     "/v1/turn-progress/{progress_id}",
     "/v1/factory/cards/{token}.svg",
+    # Forge credential health (#4630).
+    "/forges/credentials/health",
+    "/remediation-nominations",
+    "/remediation-nominations/{nomination_id}",
     "/schedules",
     "/schedules/{agent}/{name}/pause",
     "/schedules/{agent}/{name}/resume",
     "/work-items",
+    "/work-items/issue-read",
     "/work-items/{work_item_id}",
     "/work-items/{work_item_id}/usage",
+    "/work-items/{work_item_id}/recovery",
+    "/work-items/{work_item_id}/recovery/{checkpoint_id}",
+    "/work-items/{work_item_id}/recovery/{checkpoint_id}/objects/{kind}",
     "unmatched",
 ]
 _HTTP_ATTRIBUTES = {
@@ -413,6 +583,57 @@ _BACKGROUND_AGE_ATTRIBUTES = {
 # skipping right now (#1215). Which agents, and why, is in the log line each
 # skip transition emits; an agent label here would be a deployment identifier.
 _CONNECTOR_RECONCILE_SKIPPED_ATTRIBUTES = {"service.name": ["curie-worker"]}
+# @spec ACTION-EXECUTOR-22. One point per claimed connector action execution:
+# kind, state, stage, code and connector only, never an argument, envelope,
+# target or version. ``unreported`` is a run whose outcome the API never
+# acknowledged (the lease sweep ends it); ``none`` is a code-free outcome. The
+# codes are the closed ACTION-EXECUTOR-20 pre-dispatch and post-dispatch sets.
+_ACTION_EXECUTION_CODES = [
+    "agent_stopped",
+    "authority_unavailable",
+    "reserved_verb_via_forward",
+    "arguments_mismatch",
+    "tool_not_grant_bound",
+    "connector_not_hosted",
+    "connector_digest_unavailable",
+    "restore_not_advertised",
+    "restore_schema_mismatch",
+    "tool_not_advertised",
+    "version_conflict",
+    "sandbox_unavailable",
+    "runner_unavailable",
+    "connector_unreachable",
+    "tool_not_read_only",
+    "version_conflict_at_write",
+    "sealing_key_unavailable",
+    "snapshot_unopenable",
+    "connector_error",
+    "unstructured_reply",
+    "response_lost",
+    "deadline_exceeded",
+    "none",
+]
+_ACTION_EXECUTION_ATTRIBUTES = {
+    "service.name": ["curie-worker"],
+    "kind": ["restore", "probe", "other"],
+    "state": ["confirmed", "failed", "indeterminate", "refused", "unreported"],
+    "stage": ["pre_dispatch", "connector_refusal", "post_dispatch", "none"],
+    "code": _ACTION_EXECUTION_CODES,
+    # Connector names are RFC 1123 labels chosen by bundle authors; past the
+    # ceiling they share ``other``.
+    "connector": {
+        "kind": "bounded",
+        "ceiling": 16,
+        "reserved": ["other"],
+        "overflow": "other",
+        "pattern": r"^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$",
+    },
+}
+# The end to end namespace reaper's health (#3245, ADR 0176 decision 4): when
+# it last finished a clean sweep, and how many scoped namespaces were past
+# their TTL at the last pass. Namespace and run names are in the WARNING line
+# each reap emits, never on the metric.
+_E2E_REAPER_ATTRIBUTES = {"service.name": ["curie-worker"]}
 # Removals and rewrites of an agent's stored state (#3673). Namespaces are
 # caller-chosen, so every one the platform does not own shares ``other``; the
 # agent, scope and key are in the log line, never on the metric.
@@ -420,6 +641,13 @@ _STATE_MUTATION_ATTRIBUTES = {
     "service.name": ["curie-api"],
     "op": ["delete", "edit"],
     "namespace": ["memory", "transcript", "other"],
+}
+# Requests the state API allowed for a pre-ADR-0188 sandbox token (#3767): its
+# transcript reach stays unscoped until the token expires. The agent and path
+# are in the warning line, never on the metric.
+_STATE_LEGACY_TOKEN_ATTRIBUTES = {
+    "service.name": ["curie-api"],
+    "namespace": ["transcript"],
 }
 _WORK_ITEM_RECONCILER_STEP_ATTRIBUTES = {
     "service.name": ["curie-api"],
@@ -432,8 +660,10 @@ _WORK_ITEM_RECONCILER_STEP_ATTRIBUTES = {
         "settle_overdue_cancellations",
         "readmit_pending",
         "reconcile_missed_labels",
+        "poll_trackers",
         "sync_status_comments",
         "redispatch_lapsed_acquisitions",
+        "reconcile_base_transitions",
         "publish_execute_wakes",
     ],
 }
@@ -451,6 +681,7 @@ _SUPERVISED_RESTART_ATTRIBUTES = {
         "heartbeat",
         "connectors",
         "publications",
+        "e2e-reaper",
         "other",
     ],
     "outcome": ["restart", "give_up"],
@@ -463,6 +694,72 @@ _TOOL_RESULT_ATTRIBUTES = {
     "source": ["runner"],
     "origin": ["connector", "platform", "builtin"],
     "outcome": ["success", "error", "awaiting_approval", "cancelled", "refused", "unavailable"],
+}
+
+# AUTOMATED-REMEDIATION-21: closed lists from tests/vectors/remediation-codes.json.
+_REMEDIATION_STAGES = [
+    "nominated",
+    "refused",
+    "approval_requested",
+    "executed",
+    "verified",
+    "not-recovered",
+    "verifier-unavailable",
+    "superseded",
+    "undo_requested",
+    "undone",
+    "escalated",
+]
+_REMEDIATION_KINDS = [
+    "remediate",
+    "prevent",
+    "tune",
+]
+_REMEDIATION_AUTHORITIES = [
+    "policy",
+    "approval",
+    "none",
+]
+_REMEDIATION_CODES = [
+    "nomination_malformed",
+    "unknown_action",
+    "nomination_duplicate",
+    "arguments_schema_mismatch",
+    "agent_stopped",
+    "reply_surface_unavailable",
+    "http_identity_selected",
+    "tune_execution_not_automated",
+    "generation_not_current",
+    "policy_disarmed",
+    "not_automatic",
+    "qualification_missing",
+    "qualification_stale",
+    "verifier_not_independent",
+    "out_of_bounds",
+    "not_reversible_now",
+    "breaker_open",
+    "policy_rate_limit",
+    "action_rate_limit",
+    "incident_limit",
+    "turn_limit",
+    "target_live",
+    "precondition_not_met",
+    "precondition_unavailable",
+    "admission_unreadable",
+    "policy_changed",
+    "arguments_mismatch",
+    "verified",
+    "not-recovered",
+    "verifier-unavailable",
+    "superseded",
+    "none",
+]
+_REMEDIATION_LIFECYCLE_ATTRIBUTES = {
+    "service.name": ["curie-worker"],
+    "stage": _REMEDIATION_STAGES,
+    "kind": _REMEDIATION_KINDS,
+    "authority": _REMEDIATION_AUTHORITIES,
+    "code": _REMEDIATION_CODES,
 }
 
 
@@ -510,6 +807,13 @@ _METRICS: dict[str, dict[str, Any]] = {
         True,
         _HISTORY_PERSISTENCE_FAILURE_ATTRIBUTES,
     ),
+    "curie.deploy_notice.suppressed": _definition(
+        "counter",
+        "{outcome}",
+        "Git-flow push outcomes whose Slack deploy notices were withheld.",
+        True,
+        _DEPLOY_NOTICE_SUPPRESSED_ATTRIBUTES,
+    ),
     "curie.queue.enqueue": _definition(
         "counter", "{message}", "Messages enqueued.", True, _QUEUE_ATTRIBUTES
     ),
@@ -549,6 +853,13 @@ _METRICS: dict[str, dict[str, Any]] = {
     ),
     "curie.thread.lock.wait.duration": _definition(
         "histogram", "s", "Thread lock acquisition duration.", False, _THREAD_ATTRIBUTES
+    ),
+    "curie.attachments.ledger.append": _definition(
+        "counter",
+        "{append}",
+        "Thread attachment ledger appends after install.",
+        True,
+        _ATTACHMENT_LEDGER_ATTRIBUTES,
     ),
     "curie.thread.route": _definition(
         "counter", "{decision}", "Thread routing decisions.", True, _THREAD_ATTRIBUTES
@@ -620,6 +931,20 @@ _METRICS: dict[str, dict[str, Any]] = {
         False,
         _SLACK_SOCKET_IDENTITY_ATTRIBUTES,
     ),
+    "curie.slack.socket.envelopes": _definition(
+        "counter",
+        "{envelope}",
+        "Socket Mode frames Slack delivered, by Slack identity and frame type.",
+        True,
+        _SLACK_SOCKET_ENVELOPE_ATTRIBUTES,
+    ),
+    "curie.slack.delivery_canary": _definition(
+        "counter",
+        "{mention}",
+        "Delivery-canary mentions the dispatcher handled, by Slack identity.",
+        True,
+        _SLACK_DELIVERY_CANARY_ATTRIBUTES,
+    ),
     "curie.reply.delivery": _definition(
         "counter", "{reply}", "Reply delivery outcomes.", True, _REPLY_ATTRIBUTES
     ),
@@ -655,6 +980,13 @@ _METRICS: dict[str, dict[str, Any]] = {
         False,
         _BACKGROUND_AGE_ATTRIBUTES,
     ),
+    "curie.action_executor.execution": _definition(
+        "counter",
+        "{execution}",
+        "Connector action executions by kind, terminal state, stage, code and connector.",
+        True,
+        _ACTION_EXECUTION_ATTRIBUTES,
+    ),
     "curie.connector.reconcile.skipped_agents": _definition(
         "gauge",
         "{agent}",
@@ -662,12 +994,41 @@ _METRICS: dict[str, dict[str, Any]] = {
         False,
         _CONNECTOR_RECONCILE_SKIPPED_ATTRIBUTES,
     ),
+    "curie.e2e.reaper.last_success": _definition(
+        "gauge",
+        "s",
+        "Unix time of the end to end namespace reaper's last successful sweep, 0 if none.",
+        False,
+        _E2E_REAPER_ATTRIBUTES,
+    ),
+    "curie.e2e.namespaces.expired": _definition(
+        "gauge",
+        "{namespace}",
+        "End to end namespaces past their TTL at the reaper's last pass.",
+        False,
+        _E2E_REAPER_ATTRIBUTES,
+    ),
+    "curie.e2e.namespaces.overdue": _definition(
+        "gauge",
+        "{namespace}",
+        "End to end namespaces at least ten minutes past their TTL, or without one, "
+        "at the reaper's last pass.",
+        False,
+        _E2E_REAPER_ATTRIBUTES,
+    ),
     "curie.state.mutation": _definition(
         "counter",
         "{mutation}",
         "Agent state and memory entries removed or rewritten.",
         True,
         _STATE_MUTATION_ATTRIBUTES,
+    ),
+    "curie.state.legacy_token": _definition(
+        "counter",
+        "{request}",
+        "State requests allowed for a sandbox token minted before ADR-0188.",
+        True,
+        _STATE_LEGACY_TOKEN_ATTRIBUTES,
     ),
     "curie.work_item.reconciler.step.failure": _definition(
         "counter",
@@ -692,6 +1053,13 @@ _METRICS: dict[str, dict[str, Any]] = {
         "In-process supervised worker task restarts.",
         True,
         _SUPERVISED_RESTART_ATTRIBUTES,
+    ),
+    "curie.remediation.lifecycle": _definition(
+        "counter",
+        "{receipt}",
+        "Remediation lifecycle receipts posted, by stage, kind, authority and code.",
+        True,
+        _REMEDIATION_LIFECYCLE_ATTRIBUTES,
     ),
     "curie.tool.result": _definition(
         "counter",

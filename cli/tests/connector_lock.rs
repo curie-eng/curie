@@ -478,6 +478,7 @@ fn attestation_manifests_are_not_platforms() {
         Ok(&raw),
         &BTreeSet::from(["amd64".to_string(), "arm64".to_string()]),
         &["linux/amd64".to_string(), "linux/arm64".to_string()],
+        None,
     )
     .expect("an attested multi-arch push must deploy");
 }
@@ -495,6 +496,7 @@ fn an_unresolvable_digest_is_refused_before_anything_is_applied() {
         Err("ERROR: failed to resolve reference: manifest unknown".to_string()),
         &BTreeSet::from(["amd64".to_string()]),
         &["linux/amd64".to_string(), "linux/arm64".to_string()],
+        None,
     )
     .expect_err("a deleted package must stop the deploy");
 
@@ -519,6 +521,7 @@ fn an_index_that_does_not_cover_every_node_architecture_is_refused() {
         Ok(&index_covering(&[("linux", "amd64")])),
         &BTreeSet::from(["amd64".to_string(), "arm64".to_string()]),
         &["linux/amd64".to_string(), "linux/arm64".to_string()],
+        None,
     )
     .expect_err("an amd64-only index cannot run on an arm64 node");
 
@@ -540,6 +543,7 @@ fn a_lock_declaring_two_platforms_does_not_excuse_a_single_arch_push() {
         Ok(&index_covering(&[("linux", "amd64"), ("linux", "arm64")])),
         &BTreeSet::from(["amd64".to_string(), "arm64".to_string()]),
         &declared,
+        None,
     )
     .expect("a genuinely multi-arch push deploys");
 
@@ -549,6 +553,7 @@ fn a_lock_declaring_two_platforms_does_not_excuse_a_single_arch_push() {
             Ok(&single_platform_manifest()),
             &BTreeSet::from(["amd64".to_string(), "arm64".to_string()]),
             &declared,
+            None,
         )
         .is_err(),
         "the lock's declared platforms must not be able to vouch for what was actually pushed"
@@ -567,6 +572,7 @@ fn coverage_is_against_the_node_set_not_equality_with_the_declaration() {
         Ok(&index_covering(&[("linux", "amd64")])),
         &BTreeSet::from(["amd64".to_string()]),
         &["linux/amd64".to_string(), "linux/arm64".to_string()],
+        None,
     )
     .expect("an amd64 image on an amd64-only cluster is fine");
 }

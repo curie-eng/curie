@@ -1,0 +1,740 @@
+"""Database access for agents."""
+
+import uuid
+from typing import Any
+
+from sqlalchemy import (
+    delete,
+    func,
+    select,
+    update,
+)
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import selectinload
+
+from curie_api.schemas.agents import AgentCreate, HookPartitionConfig, SourceBindingConfig
+
+from .. import approver_tickets, identity_audit
+from ..approver_dm import dm_route
+from ..identity.http_invocation import (
+    HttpInvocationRuntime,
+    registered_binding_ids,
+    tenant_selects_http_identity,
+)
+from ..models import (
+    DEFAULT_TENANT_ID,
+    Agent,
+    AgentChannel,
+    AgentVersion,
+    ChannelIdentity,
+    Deployment,
+    WorkItem,
+    WorkspaceRecoveryGroup,
+)
+from ..publication_policy import PublicationPolicyConflict
+
+# ADR 0272 decision 1 route-write refusal codes. @spec APPROVER-DM-1.
+APPROVER_DM_STATIC_ROUTE = "approver_dm_static_route"
+APPROVER_DM_RECEIVER_MISSING = "approver_dm_receiver_missing"
+
+# ADR 0270 decision 1 refusal codes. @spec CONNECTOR-REQUESTER-1.
+REQUESTER_IDENTITY_VERSION_CONFLICT = "agent.requester_identity_version_conflict"
+REQUESTER_IDENTITY_REQUIRES_HTTP_IDENTITY = "requester_identity_requires_http_identity"
+
+
+async def refresh_with_channels(session: AsyncSession, agent: Agent) -> Agent:
+    """Commit, then refresh the agent and name the `channels` relationship explicitly.
+
+    The response model reads `agent.channels` after this session is done with,
+    and an unloaded relationship RAISES under asyncio rather than lazy-loading,
+    so the endpoint 500s where a crud-level test (holding a live session) passes.
+    Naming the collection also re-reads it from the database, so a binding
+    inserted or deleted around the relationship is reflected rather than served
+    from the stale loaded collection (`expire_on_commit=False`).
+    """
+    await session.commit()
+    await session.refresh(agent)
+    await session.refresh(agent, ["channels"])
+    return agent
+
+
+async def create_agent(session: AsyncSession, data: AgentCreate) -> Agent:
+    agent = Agent(
+        name=data.name,
+        tenant_id=DEFAULT_TENANT_ID,
+        # Attached through the relationship rather than inserted separately, so
+        # the agent row and its binding are one transaction: a unique-constraint
+        # collision on either rolls BOTH back, and no agent is ever left behind
+        # bound to nothing (#38's silent-shadow state).
+        # `endpoint`/`adapter` are the server-controlled reply route (ADR-0096
+        # phase 2): for `slack` the identity alone (ADR-0168 decision 3), for
+        # any other kind both NULL until configured or both set together. The
+        # write schema has already refused any other shape, and
+        # `agent_channels_route_ck` refuses one from an out-of-band writer.
+        # A create binds exactly ONE channel (ADR-0118 keeps the create
+        # singular); the rest arrive through `add_channel_binding`.
+        channels=[
+            AgentChannel(
+                tenant_id=DEFAULT_TENANT_ID,
+                kind=data.channel.kind,
+                address=data.channel.address,
+                endpoint=data.channel.endpoint,
+                adapter=data.channel.adapter,
+                # A tracker surface's label is set when it is bound (#4361).
+                trigger_label=data.channel.trigger_label,
+            )
+        ],
+        repo_full_name=data.repo_full_name,
+        deploy_notifications=data.deploy_notifications,
+        model=data.model,
+        reviewer_model=data.reviewer_model,
+        thinking=data.thinking,
+        behavior_packs=(
+            data.behavior_packs.model_dump() if data.behavior_packs is not None else None
+        ),
+        approval_required_tools=data.approval_required_tools,
+        approval_routes=(
+            {name: b.model_dump() for name, b in data.approval_routes.items()}
+            if data.approval_routes is not None
+            else None
+        ),
+        hook_partitions=_stored_hook_partitions(data.hook_partitions),
+        source_bindings=_stored_source_bindings(data.source_bindings),
+        secrets=data.secrets,
+        memory=data.memory,
+        publication_policy=data.publication_policy,
+        publication_draft=data.publication_draft,
+        publication_branch_prefix=data.publication_branch_prefix,
+    )
+    session.add(agent)
+    return await refresh_with_channels(session, agent)
+
+
+async def list_agents(session: AsyncSession) -> list[Agent]:
+    # `selectinload` explicitly, even though the relationship is already
+    # lazy="selectin": the list path is the one where the per-row alternative is
+    # correct AND unboundedly slow, so a hundred-agent install would pay a
+    # hundred round trips to render one page.
+    result = await session.scalars(
+        select(Agent).options(selectinload(Agent.channels)).order_by(Agent.created_at)
+    )
+    return list(result)
+
+
+async def get_agent(session: AsyncSession, agent_id: uuid.UUID) -> Agent | None:
+    return await session.get(Agent, agent_id)
+
+
+class RecoveryRetained(Exception):
+    pass
+
+
+async def delete_agent(session: AsyncSession, agent_id: uuid.UUID) -> None:
+    await session.scalar(select(Agent).where(Agent.id == agent_id).with_for_update())
+    item_ids = list(await session.scalars(
+        select(WorkItem.id).where(WorkItem.agent_id == agent_id)
+        .order_by(WorkItem.id).with_for_update()
+    ))
+    if item_ids and await session.scalar(
+        select(WorkspaceRecoveryGroup.work_item_id)
+        .where(WorkspaceRecoveryGroup.work_item_id.in_(item_ids)).limit(1)
+    ):
+        raise RecoveryRetained()
+    # Remove child rows first, then the agent. Bulk deletes bypass the ORM
+    # relationship cascade (which would emit an async lazy-load during flush) and
+    # match the FK ondelete=CASCADE already declared on every child table. Bundle
+    # objects in RustFS are intentionally left in place (out of scope).
+    await session.execute(delete(AgentChannel).where(AgentChannel.agent_id == agent_id))
+    await session.execute(delete(WorkItem).where(WorkItem.agent_id == agent_id))
+    await session.execute(delete(Deployment).where(Deployment.agent_id == agent_id))
+    await session.execute(delete(AgentVersion).where(AgentVersion.agent_id == agent_id))
+    await session.execute(delete(Agent).where(Agent.id == agent_id))
+    await session.commit()
+
+
+async def update_agent_model(session: AsyncSession, agent: Agent, model: str | None) -> Agent:
+    agent.model = model
+    await session.commit()
+    await session.refresh(agent)
+    return agent
+
+
+async def update_agent_thinking(session: AsyncSession, agent: Agent, thinking: str | None) -> Agent:
+    agent.thinking = thinking
+    await session.commit()
+    await session.refresh(agent)
+    return agent
+
+
+async def update_agent_execution_deadline(
+    session: AsyncSession, agent: Agent, seconds: int | None
+) -> Agent:
+    agent.execution_deadline_seconds = seconds
+    await session.commit()
+    await session.refresh(agent)
+    return agent
+
+
+async def update_agent_runner_resources(
+    session: AsyncSession, agent: Agent, resources: dict[str, Any] | None
+) -> Agent:
+    agent.runner_resources = resources
+    await session.commit()
+    await session.refresh(agent)
+    return agent
+
+
+async def update_agent_publication_policy(
+    session: AsyncSession,
+    agent: Agent,
+    *,
+    policy: str | None,
+    draft: bool | None,
+    branch_prefix: str | None,
+    prefix_sent: bool,
+) -> Agent:
+    """Apply one operator publication-policy write and bump the version once.
+
+    A request that names a field but does not change its stored value does not
+    bump the version, so a repeated PATCH cannot revoke an in-flight approval.
+    """
+
+    values: dict[str, Any] = {}
+    if policy is not None and policy != agent.publication_policy:
+        values["publication_policy"] = policy
+    if draft is not None and draft != agent.publication_draft:
+        values["publication_draft"] = draft
+    if prefix_sent and branch_prefix != agent.publication_branch_prefix:
+        values["publication_branch_prefix"] = branch_prefix
+    if not values:
+        return agent
+    expected_version = agent.publication_policy_version
+    values["publication_policy_version"] = expected_version + 1
+    # The version predicate is the compare-and-set. Two writers that read the
+    # same version cannot both commit, so a publication created under the
+    # winning version is revoked when the loser retries and bumps again.
+    updated_version = await session.scalar(
+        update(Agent)
+        .where(
+            Agent.id == agent.id,
+            Agent.publication_policy_version == expected_version,
+        )
+        .values(**values)
+        .returning(Agent.publication_policy_version)
+    )
+    if updated_version is None:
+        await session.rollback()
+        raise PublicationPolicyConflict("publication policy version changed; retry the read")
+    await session.commit()
+    await session.refresh(agent)
+    return agent
+
+
+class RequesterIdentityConflict(Exception):
+    """The expected connector requester identity version is no longer stored."""
+
+
+class RequesterIdentityRefused(Exception):
+    """A flag write the stored state does not admit. ``code`` names the reason."""
+
+    def __init__(self, code: str, message: str) -> None:
+        super().__init__(message)
+        self.code = code
+
+
+async def check_requester_identity_invariant(
+    session: AsyncSession, agent: Agent, *, enabled: bool, runtime: object
+) -> None:
+    """The one invariant every operator writer of the flag enforces.
+
+    ADR 0270 decision 1: enabling requires the tenant's HTTP identity
+    selection and at least one of the agent's bindings listed in an operator
+    receiver registration of the live runtime. Disabling needs neither, so an
+    operator can always turn requester transport off. Raises
+    ``RequesterIdentityRefused``; callers run it inside the transaction that
+    holds the agent row's compare-and-set, before committing.
+
+    ADR 0271 adds its selector checks HERE, not beside its own writers: refuse
+    disabling while any ``approver_ticket`` selector registration of this agent
+    exists, and refuse registering such a selector while the flag is off. Its
+    selector and route writes compare-and-set on
+    ``connector_requester_identity_version`` (bumping it), so a flag write and a
+    selector write that read the same version cannot both commit.
+    @spec CONNECTOR-REQUESTER-1.
+    """
+
+    if not enabled:
+        # Re-read under the caller's row lock, never from the loaded object: a
+        # selector registered since the read must still refuse the disable.
+        stored = await session.scalar(select(Agent.approval_routes).where(Agent.id == agent.id))
+        if approver_tickets.has_selector(stored):
+            raise RequesterIdentityRefused(
+                approver_tickets.SELECTOR_REGISTERED,
+                "connector requester identity cannot be turned off while an approver_ticket "
+                "selector is registered on this agent; remove every registration first",
+            )
+        return
+    missing = await http_identity_shortfall(session, agent, runtime=runtime)
+    if missing is not None:
+        raise RequesterIdentityRefused(
+            REQUESTER_IDENTITY_REQUIRES_HTTP_IDENTITY,
+            f"enabling connector requester identity requires {missing}",
+        )
+
+
+async def http_identity_shortfall(
+    session: AsyncSession, agent: Agent, *, runtime: object
+) -> str | None:
+    """What the agent lacks for verified requester identity, or None.
+
+    The one prerequisite shared by the requester identity flag (ADR 0270
+    decision 1) and by enabling requester exclusion or an exemption on any
+    approval route (ADR 0271 decision 6): the tenant's HTTP identity selection,
+    and at least one of the agent's bindings listed in an operator receiver
+    registration of the live runtime. Callers judge it inside the transaction
+    that holds the agent row lock and refuse with their own code.
+    """
+
+    if not await tenant_selects_http_identity(session, agent.tenant_id):
+        return "the tenant's HTTP identity selection"
+    registered = registered_binding_ids(runtime, agent.tenant_id)
+    bindings = await session.scalars(
+        select(AgentChannel.id).where(
+            AgentChannel.agent_id == agent.id, AgentChannel.tenant_id == agent.tenant_id
+        )
+    )
+    if not any(str(binding) in registered for binding in bindings):
+        return "an operator receiver registration that lists one of this agent's bindings"
+    return None
+
+
+async def update_agent_connector_requester_identity(
+    session: AsyncSession,
+    agent: Agent,
+    *,
+    enabled: bool,
+    expected_version: int,
+    runtime: object,
+) -> Agent:
+    """Compare-and-set the flag on its version, bumping the version.
+
+    Every accepted write bumps the version, even one that stores the value
+    already there, so a write names exactly the state it read. The agent row is
+    locked first and held while the invariant is judged; a stored version other
+    than the expected one means another writer moved it, and nothing changes.
+    The UPDATE follows the judgement, so storage's own selector check (ADR
+    0271, migration 0153) never meets a write this writer refuses. The caller
+    sends nothing else in the same request, so this is its only write.
+    @spec CONNECTOR-REQUESTER-1.
+    """
+
+    stored = await session.scalar(
+        select(Agent.connector_requester_identity_version)
+        .where(Agent.id == agent.id)
+        .with_for_update()
+    )
+    if stored != expected_version:
+        await session.rollback()
+        raise RequesterIdentityConflict(
+            "connector requester identity version changed; retry the read"
+        )
+    try:
+        await check_requester_identity_invariant(session, agent, enabled=enabled, runtime=runtime)
+    except RequesterIdentityRefused:
+        await session.rollback()
+        raise
+    await session.execute(
+        update(Agent)
+        .where(Agent.id == agent.id)
+        .values(
+            connector_requester_identity=enabled,
+            connector_requester_identity_version=expected_version + 1,
+        )
+    )
+    await session.commit()
+    await session.refresh(agent)
+    return agent
+
+
+async def update_agent_memory(session: AsyncSession, agent: Agent, memory: bool) -> Agent:
+    """Set whether this agent's bindings share one workflow-state namespace
+    (#1525 follow-up). Flipping it changes nothing already stored -- a row
+    written under one scope is simply not the row a later request under the
+    other scope reads; it is a routing decision for FUTURE state calls, not a
+    migration of past ones."""
+
+    agent.memory = memory
+    await session.commit()
+    await session.refresh(agent)
+    return agent
+
+
+async def update_agent_memory_writes(
+    session: AsyncSession, agent: Agent, memory_writes: bool
+) -> Agent:
+    """Set whether the runner mounts its memory tools for this agent (#1461).
+    Takes effect at the next sandbox boot; stored facts are untouched."""
+
+    agent.memory_writes = memory_writes
+    await session.commit()
+    await session.refresh(agent)
+    return agent
+
+
+async def update_agent_approval_tools(
+    session: AsyncSession, agent: Agent, tools: list[str]
+) -> Agent:
+    """Set the agent's permission gates (#245). An empty list clears them
+    (stored as NULL, the no-gates posture)."""
+
+    agent.approval_required_tools = tools or None
+    await session.commit()
+    await session.refresh(agent)
+    return agent
+
+
+class ApprovalRoutesRefused(Exception):
+    """A route map write the stored state does not admit (ADR 0271 decision 1)."""
+
+    def __init__(self, status: int, code: str, message: str) -> None:
+        super().__init__(message)
+        self.status = status
+        self.code = code
+
+
+async def check_approver_dm_routes(
+    session: AsyncSession, agent: Agent, routes: dict[str, Any], *, runtime: object
+) -> None:
+    """Every ``approver_dm`` resolution of a proposed map is deliverable (ADR 0272).
+
+    Judged on the whole replacement map, kept routes included, inside the
+    caller's row-locked transaction. A DM resolution needs its route's own
+    ``approver_ticket`` selector (only a dynamic approval has one selected
+    person to deliver to) and names an active Slack bot identity of the
+    agent's tenant for which the live runtime registers a receiver. A
+    notification beside it is refused by ``ApprovalRouteBinding`` before this
+    runs. Raises ``ApprovalRoutesRefused`` (422). @spec APPROVER-DM-1.
+    """
+
+    for name, binding in routes.items():
+        identity = dm_route(binding)
+        if identity is None:
+            continue
+        if "approver_ticket" not in binding:
+            raise ApprovalRoutesRefused(
+                422,
+                APPROVER_DM_STATIC_ROUTE,
+                f"route {name!r} resolves to approver_dm but registers no approver_ticket "
+                "selector; an approver DM is only for a dynamic route's one selected approver",
+            )
+        if not await approver_dm_receiver_registered(
+            session, runtime, tenant_id=agent.tenant_id, identity=identity
+        ):
+            raise ApprovalRoutesRefused(
+                422,
+                APPROVER_DM_RECEIVER_MISSING,
+                f"route {name!r} names approver_dm identity {identity!r}, which is not an "
+                "active Slack bot identity of this tenant with a registered receiver",
+            )
+
+
+async def approver_dm_receiver_registered(
+    session: AsyncSession, runtime: object, *, tenant_id: uuid.UUID, identity: str
+) -> bool:
+    """An active Slack identity row named ``identity`` and a receiver registered for it.
+
+    @spec APPROVER-DM-1.
+    """
+
+    if type(runtime) is not HttpInvocationRuntime:
+        return False
+    row = await session.scalar(
+        select(ChannelIdentity).where(
+            ChannelIdentity.tenant_id == tenant_id,
+            ChannelIdentity.provider == "slack",
+            ChannelIdentity.name == identity,
+            ChannelIdentity.status == "active",
+        )
+    )
+    if row is None:
+        return False
+    return any(
+        registration.tenant_id == str(tenant_id)
+        and registration.channel_identity_name == identity
+        and registration.channel_identity_id == str(row.id)
+        for registration in runtime._receivers.values()
+    )
+
+
+async def update_agent_approval_routes(
+    session: AsyncSession,
+    agent: Agent,
+    routes: dict[str, Any],
+    *,
+    expected_version: int | None = None,
+    runtime: object,
+) -> Agent:
+    """Set the agent's approval route bindings (#247). An empty dict clears
+    them (stored as NULL: unbound routes escalate rather than inventing a
+    resolution surface).
+
+    ADR 0271 decisions 1 and 6 (plan D1, D2): the agent row is locked and
+    re-read first. ``expected_version``, when sent, must equal the stored
+    ``connector_requester_identity_version``. A write whose stored or proposed
+    map carries any ``approver_ticket`` or ``separation`` key must send it,
+    pins every registration's ceiling, bumps the version and writes one
+    identity audit row per changed registration or exclusion, all in this one
+    commit. A written map holding static exclusion or an exemption on any
+    route, kept or newly enabled, also needs ``http_identity_shortfall`` to
+    find nothing missing against ``runtime``. The flag writer takes the same
+    row lock, so two writers that read one version cannot both commit. Writes
+    with neither key keep the unversioned behavior and do not bump. Raises
+    ``ApprovalRoutesRefused``.
+    """
+
+    locked = await session.scalar(
+        select(Agent)
+        .where(Agent.id == agent.id)
+        .with_for_update()
+        .execution_options(populate_existing=True)
+    )
+    assert locked is not None
+    current = locked.connector_requester_identity_version
+    try:
+        await check_approver_dm_routes(session, locked, routes, runtime=runtime)
+        if expected_version is not None and expected_version != current:
+            raise ApprovalRoutesRefused(
+                409,
+                approver_tickets.VERSION_CONFLICT,
+                f"approval_routes_expected_version {expected_version} is not the stored "
+                f"configuration version {current}; read the agent again",
+            )
+        if not (
+            approver_tickets.needs_configuration_version(locked.approval_routes)
+            or approver_tickets.needs_configuration_version(routes)
+        ):
+            locked.approval_routes = routes or None
+        else:
+            if expected_version is None:
+                raise ApprovalRoutesRefused(
+                    409,
+                    approver_tickets.EXPECTED_VERSION_REQUIRED,
+                    "this route map write registers, replaces, removes or keeps an "
+                    "approver_ticket selector or a separation: send "
+                    "approval_routes_expected_version",
+                )
+            try:
+                written, audits = await approver_tickets.prepare_selector_write(
+                    session,
+                    locked,
+                    routes,
+                    new_version=current + 1,
+                )
+            except approver_tickets.ApproverTicketRefusal as exc:
+                raise ApprovalRoutesRefused(exc.status, exc.code, str(exc)) from None
+            if approver_tickets.separation_needs_http_identity(written):
+                missing = await http_identity_shortfall(session, locked, runtime=runtime)
+                if missing is not None:
+                    raise ApprovalRoutesRefused(
+                        422,
+                        approver_tickets.SEPARATION_REQUIRES_HTTP_IDENTITY,
+                        "enabling requester exclusion or an exempt_group on an approval "
+                        f"route requires {missing}",
+                    )
+            locked.approval_routes = written or None
+            locked.connector_requester_identity_version = current + 1
+            for audit in audits:
+                identity_audit.record(
+                    session,
+                    tenant_id=locked.tenant_id,
+                    event_type=audit.event_type,
+                    actor="operator",
+                    details=audit.details,
+                )
+    except ApprovalRoutesRefused:
+        await session.rollback()
+        raise
+    await session.commit()
+    await session.refresh(locked)
+    return locked
+
+
+def _stored_hook_partitions(
+    partitions: dict[str, HookPartitionConfig] | None,
+) -> dict[str, Any] | None:
+    """The column value for a hook-partition map (ADR-0134).
+
+    One definition for both write paths, because create and PATCH must not
+    disagree about what "no configuration" looks like in the column: an empty
+    map is stored as NULL, the same "every hook returns to one thread per hook"
+    posture as an omitted map, which is what an operator turning the feature
+    off is asking for.
+    """
+
+    if not partitions:
+        return None
+    return {name: c.model_dump() for name, c in partitions.items()}
+
+
+def _stored_source_bindings(
+    bindings: dict[str, SourceBindingConfig] | None,
+) -> dict[str, Any] | None:
+    if not bindings:
+        return None
+    return {name: c.model_dump() for name, c in bindings.items()}
+
+
+async def update_agent_source_bindings(
+    session: AsyncSession, agent: Agent, bindings: dict[str, SourceBindingConfig]
+) -> Agent:
+    """Set the agent's workload-to-repository map (#2572). An empty dict clears it."""
+
+    agent.source_bindings = _stored_source_bindings(bindings)
+    await session.commit()
+    await session.refresh(agent)
+    return agent
+
+
+async def update_agent_hook_partitions(
+    session: AsyncSession, agent: Agent, partitions: dict[str, HookPartitionConfig]
+) -> Agent:
+    """Set which of the agent's hooks fan out (ADR-0134). An empty dict clears
+    them (stored as NULL)."""
+
+    agent.hook_partitions = _stored_hook_partitions(partitions)
+    await session.commit()
+    await session.refresh(agent)
+    return agent
+
+
+async def update_budget(
+    session: AsyncSession,
+    agent: Agent,
+    max_usd_per_day: float | None,
+    max_output_tokens_per_run: int | None,
+) -> Agent:
+    agent.max_usd_per_day = max_usd_per_day
+    agent.max_output_tokens_per_run = max_output_tokens_per_run
+    await session.commit()
+    await session.refresh(agent)
+    return agent
+
+
+async def update_behavior_packs(
+    session: AsyncSession, agent: Agent, behavior_packs: dict[str, Any] | None
+) -> Agent:
+    agent.behavior_packs = behavior_packs
+    await session.commit()
+    await session.refresh(agent)
+    return agent
+
+
+async def update_agent_secrets(
+    session: AsyncSession, agent: Agent, secrets: dict[str, str] | None
+) -> Agent:
+    """Set the per-agent connector secrets (#429). An empty dict clears them."""
+    agent.secrets = secrets
+    await session.commit()
+    await session.refresh(agent)
+    return agent
+
+
+async def get_agent_by_repo(session: AsyncSession, repo_full_name: str) -> Agent | None:
+    agent: Agent | None = await session.scalar(
+        select(Agent).where(Agent.repo_full_name == repo_full_name)
+    )
+    return agent
+
+
+async def update_agent_repo(session: AsyncSession, agent: Agent, repo_full_name: str) -> Agent:
+    agent.repo_full_name = repo_full_name
+    await session.commit()
+    await session.refresh(agent)
+    return agent
+
+
+async def update_agent_deploy_notifications(
+    session: AsyncSession, agent: Agent, enabled: bool
+) -> Agent:
+    agent.deploy_notifications = enabled
+    await session.commit()
+    await session.refresh(agent)
+    return agent
+
+
+async def get_agents_by_repo(session: AsyncSession, repo_full_name: str) -> list[Agent]:
+    """Every agent built from this repository (ADR-0091).
+
+    One repository legitimately binds several agents -- a dev bot and a prod
+    bot are the same bundle on two channels. Ordered by name so a caller that
+    must pick one without a target (a bundle predating ``deploy.yaml``) picks
+    the same one every time rather than whatever the planner returned.
+    """
+
+    result = await session.scalars(
+        select(Agent).where(Agent.repo_full_name == repo_full_name).order_by(Agent.name)
+    )
+    return list(result)
+
+
+async def get_agents_by_repo_casefold(session: AsyncSession, repo_full_name: str) -> list[Agent]:
+    """Find a binding whose only difference from GitHub's name is ASCII casing."""
+
+    result = await session.scalars(
+        select(Agent)
+        .where(func.lower(Agent.repo_full_name) == repo_full_name.lower())
+        .order_by(Agent.name)
+    )
+    return list(result)
+
+
+async def get_agent_by_name(session: AsyncSession, name: str) -> Agent | None:
+    agent: Agent | None = await session.scalar(select(Agent).where(Agent.name == name))
+    return agent
+
+
+async def update_agent_reviewer_model(
+    session: AsyncSession, agent: Agent, reviewer_model: str | None
+) -> Agent:
+    agent.reviewer_model = reviewer_model
+    await session.commit()
+    await session.refresh(agent)
+    return agent
+
+
+class FactorySlackChannelUnbound(Exception):
+    """The agent does not hold exactly one Slack binding, with an identity, there."""
+
+
+async def update_agent_factory_slack_channel(
+    session: AsyncSession, agent: Agent, channel: str | None
+) -> Agent:
+    """Set or clear the factory Slack destination (#5414).
+
+    A channel names the agent's one Slack binding for that address whose
+    adapter is the posting identity. A changed channel restarts
+    ``factory_slack_since`` on the database clock; null clears both.
+    """
+
+    if channel is None:
+        agent.factory_slack_channel = None
+        agent.factory_slack_since = None
+    else:
+        bindings = await session.scalar(
+            select(func.count())
+            .select_from(AgentChannel)
+            .where(
+                AgentChannel.agent_id == agent.id,
+                AgentChannel.kind == "slack",
+                AgentChannel.address == channel,
+                AgentChannel.adapter.is_not(None),
+            )
+        )
+        if bindings != 1:
+            raise FactorySlackChannelUnbound(channel)
+        if agent.factory_slack_channel != channel or agent.factory_slack_since is None:
+            agent.factory_slack_channel = channel
+            agent.factory_slack_since = func.now()
+    await session.commit()
+    await session.refresh(agent)
+    return agent

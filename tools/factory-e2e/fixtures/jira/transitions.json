@@ -1,0 +1,23 @@
+{
+  "expand": "transitions",
+  "transitions": [
+    {
+      "id": "11",
+      "name": "To Do",
+      "to": {"id": "10000", "name": "To Do", "statusCategory": {"id": 2, "key": "new", "name": "To Do"}},
+      "hasScreen": false
+    },
+    {
+      "id": "21",
+      "name": "In Progress",
+      "to": {"id": "3", "name": "In Progress", "statusCategory": {"id": 4, "key": "indeterminate", "name": "In Progress"}},
+      "hasScreen": false
+    },
+    {
+      "id": "31",
+      "name": "Done",
+      "to": {"id": "10001", "name": "Done", "statusCategory": {"id": 3, "key": "done", "name": "Done"}},
+      "hasScreen": false
+    }
+  ]
+}

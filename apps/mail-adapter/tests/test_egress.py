@@ -32,6 +32,7 @@ from _support import (
     refused_agentmail_connection,
     refused_agentmail_reply,
     reply_post,
+    seed_historical_reply,
     spawn_adapter,
     stop,
     turn_status,
@@ -39,15 +40,16 @@ from _support import (
     wait_for_healthz,
     wait_until,
 )
-from curie_mail_adapter.adapter import EMPTY_REPLY_TEXT, EVENT_MARKER, MailAdapter
-from curie_mail_adapter.agentmail import AgentMailClient
-from curie_mail_adapter.config import MailAdapterConfig
+from curie_channel_gateway.mail.adapter import EMPTY_REPLY_TEXT, EVENT_MARKER, MailAdapter
+from curie_channel_gateway.mail.agentmail import AgentMailClient
+from curie_channel_gateway.mail.config import MailAdapterConfig
 
 
 def seed(mail: MailState, adapter: MailAdapter, message_id: str = "msg-1", **kwargs: Any) -> None:
-    """One inbound message, admitted through the real poll path."""
-    mail.add_inbound(message_id, kwargs.pop("thread_id", "thr-1"), **kwargs)
-    adapter.poll_once()
+    """One turn accepted before upgrade, seeded through the real SQLite store."""
+    seed_historical_reply(
+        mail, adapter.state, message_id, kwargs.pop("thread_id", "thr-1"), **kwargs
+    )
 
 
 @contextmanager
@@ -101,7 +103,7 @@ def test_egress_rejection_log_names_only_the_outcome(
     """Credential material and even its transport name stay out of retained logs."""
     seed(mail, adapter)
 
-    with caplog.at_level(logging.WARNING, logger="curie_mail_adapter.egress"):
+    with caplog.at_level(logging.WARNING, logger="curie_channel_gateway.mail.egress"):
         assert post_event(egress_url, completed("ev-1"), secret="attacker-value")[0] == 401
 
     assert [record.getMessage() for record in caplog.records] == [
@@ -135,6 +137,29 @@ def test_reply_text_is_the_latest_update_and_carries_the_event_marker(
     assert text.startswith("the full answer")
     assert "partial\n" not in text
     assert f"{EVENT_MARKER} ev-42" in text
+
+
+def test_verbatim_reply_update_is_refused_before_recording_or_provider_send(
+    mail: MailState, adapter: MailAdapter, egress_url: str
+) -> None:
+    seed(mail, adapter)
+    assert adapter.record_text_at("thr-1", "msg-1", "existing answer")[0] == 200
+    before = adapter.state.reply_text("thr-1", "msg-1")
+    event = update("approved exact text")
+    event.update(
+        version="1.2",
+        text_mode="verbatim",
+        delivery_id="01234567-89ab-cdef-0123-456789abcdef",
+    )
+
+    status, body = post_event(egress_url, event)
+
+    assert status == 422
+    assert body == {"detail": "reply wire 1.2 verbatim is not supported"}
+    assert adapter.state.reply_text("thr-1", "msg-1") == before
+    assert mail.replies == []
+    assert mail.thread_calls == 0
+    assert mail.list_calls == 0
 
 
 def test_turn_status_is_ignored(mail: MailState, adapter: MailAdapter, egress_url: str) -> None:
@@ -232,7 +257,9 @@ def test_ingress_disabled_serves_egress_and_never_polls(
         stop(proc)
 
 
-def test_ingress_enabled_polls_and_posts_new_mail(mail: MailState, ingress: IngressState) -> None:
+def test_ingress_enabled_polls_and_rejects_unverifiable_new_mail(
+    mail: MailState, ingress: IngressState
+) -> None:
     port = free_port()
     proc = spawn_adapter(
         adapter_env(agentmail_base_url=mail.base_url, api_url=ingress.url, port=port)
@@ -245,10 +272,11 @@ def test_ingress_enabled_polls_and_posts_new_mail(mail: MailState, ingress: Ingr
         mail.add_inbound("msg-sent", "thr-live", sender=INBOX, labels=["sent"])
         mail.add_inbound("msg-live", "thr-live")
 
-        assert wait_until(lambda: bool(ingress.requests)), "new mail never reached ingress"
+        assert wait_until(lambda: mail.list_calls >= 3), "the poller never revisited new mail"
         time.sleep(0.3)  # a second pass must not re-post it
 
-        assert ingress.delivery_ids() == ["msg-live"]
+        assert ingress.delivery_ids() == []
+        assert mail.body_calls == {}
     finally:
         stop(proc)
 
@@ -266,10 +294,11 @@ def test_interleaved_turns_each_reply_to_their_own_message(
     Every other egress case uses one message per thread, so this is the only test
     that can see that mutation.
     """
-    mail.add_inbound("msg-1", "thr-1", subject="First", text="one")
-    mail.add_inbound("msg-2", "thr-1", subject="Follow up", text="and this?")
-    adapter.poll_once()
-    assert ingress.delivery_ids() == ["msg-1", "msg-2"]
+    seed_historical_reply(mail, adapter.state, "msg-1", "thr-1", subject="First", text="one")
+    seed_historical_reply(
+        mail, adapter.state, "msg-2", "thr-1", subject="Follow up", text="and this?"
+    )
+    assert adapter.state.live_reply_refs("thr-1") == ["msg-1", "msg-2"]
 
     post_event(egress_url, update("answer one"))
     post_event(egress_url, completed("ev-1", conversation_id="thr-1", reply_ref="msg-1"))
@@ -295,14 +324,12 @@ def test_a_late_update_for_a_finished_ref_never_moves_to_the_next_live_turn(
     update for turn one arrives. Remapping it to the sole live ref would put the
     first answer in the second correspondent-facing email.
     """
-    mail.add_inbound("msg-1", "thr-1", subject="First", text="one")
-    adapter.poll_once()
+    seed_historical_reply(mail, adapter.state, "msg-1", "thr-1", subject="First", text="one")
     post_event(egress_url, update("answer one", reply_ref="msg-1"))
     assert post_event(egress_url, completed("ev-1", reply_ref="msg-1"))[0] == 200
 
-    mail.add_inbound("msg-2", "thr-1", subject="Follow up", text="two")
-    adapter.poll_once()
-    assert ingress.delivery_ids() == ["msg-1", "msg-2"]
+    seed_historical_reply(mail, adapter.state, "msg-2", "thr-1", subject="Follow up", text="two")
+    assert adapter.state.live_reply_refs("thr-1") == ["msg-2"]
 
     status, _ = post_event(
         egress_url,
@@ -327,13 +354,13 @@ def test_a_second_message_does_not_erase_an_answer_already_emitted(
     worker saw a 200. Only the record's TEXT is at stake here; the reply target
     still comes off the event.
     """
-    mail.add_inbound("msg-1", "thr-1", subject="First", text="one")
-    adapter.poll_once()
+    seed_historical_reply(mail, adapter.state, "msg-1", "thr-1", subject="First", text="one")
     post_event(egress_url, update("answer one", reply_ref="msg-1"))
 
-    mail.add_inbound("msg-2", "thr-1", subject="Follow up", text="and this?")
-    adapter.poll_once()
-    assert ingress.delivery_ids() == ["msg-1", "msg-2"]
+    seed_historical_reply(
+        mail, adapter.state, "msg-2", "thr-1", subject="Follow up", text="and this?"
+    )
+    assert adapter.state.live_reply_refs("thr-1") == ["msg-1", "msg-2"]
 
     post_event(egress_url, completed("ev-1", conversation_id="thr-1", reply_ref="msg-1"))
 
@@ -359,10 +386,9 @@ def test_a_null_ref_reply_post_is_503_when_two_live_replies_are_ambiguous(
     mail: MailState, ingress: IngressState, adapter: MailAdapter, egress_url: str
 ) -> None:
     """A platform-owned post may attach implicitly only to one live reply ref."""
-    mail.add_inbound("msg-1", "thr-1", subject="First", text="one")
-    mail.add_inbound("msg-2", "thr-1", subject="Second", text="two")
-    adapter.poll_once()
-    assert ingress.delivery_ids() == ["msg-1", "msg-2"]
+    seed_historical_reply(mail, adapter.state, "msg-1", "thr-1", subject="First", text="one")
+    seed_historical_reply(mail, adapter.state, "msg-2", "thr-1", subject="Second", text="two")
+    assert adapter.state.live_reply_refs("thr-1") == ["msg-1", "msg-2"]
 
     status, _ = post_event(egress_url, reply_post("must not cross turns"))
 
@@ -502,15 +528,15 @@ def test_a_later_turn_does_not_email_the_previous_turns_answer_again(
     through `reply.post` to completion can see it; every other case here either
     ends at turn one or overwrites the text with a `reply.update`.
     """
-    mail.add_inbound("msg-1", "thr-1", subject="First", text="one")
-    adapter.poll_once()
+    seed_historical_reply(mail, adapter.state, "msg-1", "thr-1", subject="First", text="one")
     post_event(egress_url, update("answer one"))
     post_event(egress_url, completed("ev-1", conversation_id="thr-1", reply_ref="msg-1"))
     assert mail.replies[0][1].startswith("answer one")
 
-    mail.add_inbound("msg-2", "thr-1", subject="Follow up", text="ship it?")
-    adapter.poll_once()
-    assert ingress.delivery_ids() == ["msg-1", "msg-2"]
+    seed_historical_reply(
+        mail, adapter.state, "msg-2", "thr-1", subject="Follow up", text="ship it?"
+    )
+    assert adapter.state.live_reply_refs("thr-1") == ["msg-2"]
 
     post_event(egress_url, reply_post("Approve this deploy?"))
     post_event(egress_url, completed("ev-2", conversation_id="thr-1", reply_ref="msg-2"))
@@ -701,7 +727,7 @@ class _RaiseOnceClient(AgentMailClient):
 
     A deliberate, narrow carve-out to this package's mocking rule: it is a real
     subclass of the client that wraps the EXTERNAL provider, the same seam the fake
-    HTTP servers occupy, and nothing inside `curie_mail_adapter` is patched. The
+    HTTP servers occupy, and nothing inside `curie_channel_gateway.mail` is patched. The
     fault has to be injected here because the behavior under test is the handling
     of an UNEXPECTED exception, and anything provokable through the provider's HTTP
     boundary is by definition an expected one the client turns into a failure
@@ -712,7 +738,7 @@ class _RaiseOnceClient(AgentMailClient):
         super().__init__(config)
         self.calls = 0
 
-    def reply(self, message_id: str, text: str) -> tuple[int, Any]:
+    def reply(self, message_id: str, text: str, *, reply_all: bool = False) -> tuple[int, Any]:
         self.calls += 1
         if self.calls == 1:
             raise RuntimeError("injected")
@@ -735,8 +761,7 @@ def test_an_unexpected_exception_does_not_poison_the_event_id(
     config = make_config()
     adapter = MailAdapter(config, client=_RaiseOnceClient(config))
     url = serve_egress(adapter) + "/"
-    mail.add_inbound("msg-1", "thr-1")
-    adapter.poll_once()
+    seed_historical_reply(mail, adapter.state, "msg-1", "thr-1")
     post_event(url, update("answer one"))
 
     assert post_event(url, completed("ev-1"))[0] == 500
@@ -760,7 +785,7 @@ def test_deleted_provider_thread_is_terminal_once_across_restart(
     seed(mail, adapter)
     post_event(egress_url, update("answer one"))
     mail.deleted_threads.add("thr-1")
-    with caplog.at_level(logging.WARNING, logger="curie_mail_adapter.adapter"):
+    with caplog.at_level(logging.WARNING, logger="curie_channel_gateway.mail.adapter"):
         assert post_event(egress_url, completed("ev-deleted"))[0] == 410
         assert post_event(egress_url, completed("ev-deleted"))[0] == 410
         with restarted_adapter(adapter, serve_egress, adapter.config) as (_, replacement_url):
@@ -837,6 +862,9 @@ def test_version_one_state_migrates_without_losing_admitted_or_delivered_replies
     # Reconstruct the released v1 database shape, preserving real admitted rows.
     with sqlite3.connect(adapter.config.state_path) as connection:
         connection.execute("ALTER TABLE completion_events DROP COLUMN deleted")
+        connection.execute("ALTER TABLE completion_events DROP COLUMN send_attempted_at")
+        connection.execute("DROP TABLE approval_refs")
+        connection.execute("DELETE FROM metadata WHERE key='provider'")
         connection.execute("PRAGMA user_version=1")
     replacement = MailAdapter(adapter.config)
     try:
@@ -910,9 +938,7 @@ def test_a_progress_post_never_joins_the_buffered_reply(
     seed(mail, adapter)
     post_event(egress_url, update("the answer", reply_ref="msg-1"))
 
-    status, body = post_event(
-        egress_url, progress_post("Reading the ledger", reply_ref="msg-1")
-    )
+    status, body = post_event(egress_url, progress_post("Reading the ledger", reply_ref="msg-1"))
     post_event(egress_url, progress_post("Found it", reply_ref="msg-1", kind="milestone"))
     post_event(egress_url, completed("ev-1"))
 
@@ -928,10 +954,9 @@ def test_a_progress_post_with_no_ref_is_silent_even_when_two_turns_are_live(
     mail: MailState, ingress: IngressState, adapter: MailAdapter, egress_url: str
 ) -> None:
     """An approval card here is refused 503 as ambiguous; progress owes nothing."""
-    mail.add_inbound("msg-1", "thr-1", subject="First", text="one")
-    mail.add_inbound("msg-2", "thr-1", subject="Second", text="two")
-    adapter.poll_once()
-    assert ingress.delivery_ids() == ["msg-1", "msg-2"]
+    seed_historical_reply(mail, adapter.state, "msg-1", "thr-1", subject="First", text="one")
+    seed_historical_reply(mail, adapter.state, "msg-2", "thr-1", subject="Second", text="two")
+    assert adapter.state.live_reply_refs("thr-1") == ["msg-1", "msg-2"]
 
     status, _ = post_event(egress_url, progress_post("Reading the ledger"))
 

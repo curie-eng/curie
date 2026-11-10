@@ -17,6 +17,7 @@ import posixpath
 import re
 import subprocess
 import sys
+from collections.abc import Sequence
 from pathlib import Path, PurePosixPath
 
 import pytest
@@ -37,6 +38,8 @@ def load_module():
 
 
 authorize_module = load_module()
+
+SCHEMA_WINDOWS_PATH = authorize_module._atlas.SCHEMA_WINDOWS_PATH
 
 
 def run_git(repo: Path, *args: str) -> str:
@@ -1113,6 +1116,899 @@ class TestMainLookupFailures:
         assert "required check-run" in refusal_stderr
 
 
+# The exact five files of the real v0.11.2 preparation PR #3845 (#3858): a
+# release bump changes only version identity, and the atlas snapshot it adds
+# is named for that release.
+V0112_PREP_PATHS = (
+    "charts/curie/Chart.yaml",
+    "cli/Cargo.toml",
+    "cli/Cargo.lock",
+    "docs/architecture-atlas/versions.json",
+    "docs/architecture-atlas/snapshots/v0.11.2.json",
+)
+V0112_TAG = "v0.11.2"
+
+
+def commit_paths(repo: Path, paths: Sequence[str], label: str) -> str:
+    """Write every path with label-specific content and commit them together."""
+    for path in paths:
+        target = repo / path
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(f"{path} {label}\n")
+    run_git(repo, "add", "--", *paths)
+    run_git(repo, "commit", "-q", "-m", label)
+    return run_git(repo, "rev-parse", "HEAD")
+
+
+def green_runs(job_prefix: str = "9") -> list[dict]:
+    return [
+        check_run("CI", "success", OTHER_RUN_ID, f"{job_prefix}1"),
+        check_run("CodeQL", "neutral", OTHER_RUN_ID, f"{job_prefix}2"),
+    ]
+
+
+def red_runs(job_prefix: str = "8") -> list[dict]:
+    return [
+        check_run("CI", "success", OTHER_RUN_ID, f"{job_prefix}1"),
+        check_run("CodeQL", "failure", OTHER_RUN_ID, f"{job_prefix}2"),
+    ]
+
+
+class FakeProofFetcher:
+    """Check-runs keyed by sha, shaped like the live API, recording each lookup."""
+
+    def __init__(self, table: dict[str, list[dict]]) -> None:
+        self.table = table
+        self.calls: list[str] = []
+
+    def __call__(self, sha: str) -> list[dict]:
+        self.calls.append(sha)
+        return list(self.table.get(sha, []))
+
+
+def version_only(commit_sha: str):
+    """The proof `authorize()` returns for a version-only ancestor (ADR-0195)."""
+    return authorize_module.Proof(commit_sha, authorize_module.VERSION_ONLY_ANCESTOR)
+
+
+def tree_identical(commit_sha: str):
+    """The proof `authorize()` returns for a tree-identical parent (#4862)."""
+    return authorize_module.Proof(commit_sha, authorize_module.TREE_IDENTICAL_PARENT)
+
+
+def tree_of(repo: Path, rev: str) -> str:
+    return run_git(repo, "rev-parse", f"{rev}^{{tree}}")
+
+
+class TestVersionOnlyProof:
+    """#3858: a tag on a version-only commit may borrow its parent's green CI.
+
+    The tagged commit S changes exactly the version-only set for its own tag
+    (`release/atlas.py`'s `version_only_paths`). When S's own required checks
+    are absent or still running, the gate walks S's first-parent ancestors and
+    authorizes against the nearest one whose required checks are green, as long
+    as everything between that ancestor and S is version-only. Contrary
+    evidence on S itself (a required check that concluded non-passing) still
+    refuses, and any other path in the delta still refuses.
+    """
+
+    @staticmethod
+    def _prep(git_repo: Path, paths: Sequence[str] = V0112_PREP_PATHS) -> tuple[str, str]:
+        parent = run_git(git_repo, "rev-parse", "HEAD")
+        tagged = commit_paths(git_repo, paths, "prepare release")
+        return parent, tagged
+
+    @staticmethod
+    def _authorize(
+        git_repo: Path,
+        sha: str,
+        own_runs: list[dict],
+        fetcher: FakeProofFetcher | None,
+        *,
+        tag: str | None = V0112_TAG,
+        reviewed_refs: Sequence[str] = ("main",),
+        exclude_run_id: str | None = CURRENT_RUN_ID,
+    ):
+        return authorize_module.authorize(
+            sha,
+            own_runs,
+            reviewed_refs,
+            cwd=git_repo,
+            exclude_run_id=exclude_run_id,
+            required_names=TEST_REQUIRED_NAMES,
+            tag=tag,
+            fetch_proof_check_runs=fetcher,
+        )
+
+    def test_proof_depth_is_ten(self):
+        assert authorize_module.VERSION_ONLY_PROOF_DEPTH == 10
+
+    def test_version_only_tag_with_no_own_runs_authorizes_from_its_green_parent(
+        self, git_repo
+    ):
+        parent, tagged = self._prep(git_repo)
+        fetcher = FakeProofFetcher({parent: green_runs()})
+
+        proof = self._authorize(git_repo, tagged, [GATE_OWN_IN_PROGRESS], fetcher)
+
+        assert proof == version_only(parent)
+        assert fetcher.calls == [parent]
+
+    def test_liveness_realistic_in_progress_tag_authorizes(self, git_repo):
+        """The liveness case: the tag push's own CI is still running.
+
+        This is the shape the gate actually sees at tag time: the merge commit's
+        push CI is in progress (conclusion null) and the gate's own job is on
+        the same sha. Before #3858 the gate refused until that CI finished.
+        """
+        parent, tagged = self._prep(git_repo)
+        own_runs = [
+            GATE_OWN_IN_PROGRESS,
+            check_run("CI", None, OTHER_RUN_ID, "71"),
+            check_run("CodeQL", None, OTHER_RUN_ID, "72"),
+        ]
+        fetcher = FakeProofFetcher({parent: green_runs()})
+
+        assert self._authorize(git_repo, tagged, own_runs, fetcher) == version_only(parent)
+
+    def test_refs_tags_prefix_names_the_same_snapshot(self, git_repo):
+        parent, tagged = self._prep(git_repo)
+        fetcher = FakeProofFetcher({parent: green_runs()})
+
+        proof = self._authorize(
+            git_repo, tagged, [], fetcher, tag=f"refs/tags/{V0112_TAG}"
+        )
+
+        assert proof == version_only(parent)
+
+    def test_own_green_checks_return_none_and_never_fetch_a_proof(self, git_repo):
+        parent, tagged = self._prep(git_repo)
+        fetcher = FakeProofFetcher({parent: green_runs()})
+
+        proof = self._authorize(
+            git_repo, tagged, [GATE_OWN_IN_PROGRESS, *green_runs("5")], fetcher
+        )
+
+        assert proof is None
+        assert fetcher.calls == []
+
+    def test_a_source_path_in_the_delta_is_refused(self, git_repo):
+        parent, tagged = self._prep(git_repo, (*V0112_PREP_PATHS, "cli/src/main.rs"))
+        fetcher = FakeProofFetcher({parent: green_runs()})
+
+        with pytest.raises(authorize_module.AuthorizationError, match="required check-run"):
+            self._authorize(git_repo, tagged, [], fetcher)
+
+    def test_another_versions_snapshot_in_the_delta_is_refused(self, git_repo):
+        paths = (*V0112_PREP_PATHS[:-1], "docs/architecture-atlas/snapshots/v9.9.9.json")
+        parent, tagged = self._prep(git_repo, paths)
+        fetcher = FakeProofFetcher({parent: green_runs()})
+
+        with pytest.raises(authorize_module.AuthorizationError, match="required check-run"):
+            self._authorize(git_repo, tagged, [], fetcher)
+
+    def test_red_parent_is_not_a_proof(self, git_repo):
+        parent, tagged = self._prep(git_repo)
+        fetcher = FakeProofFetcher({parent: red_runs()})
+
+        with pytest.raises(authorize_module.AuthorizationError, match="required check-run"):
+            self._authorize(git_repo, tagged, [], fetcher)
+
+    @pytest.mark.parametrize("conclusion", ["failure", "skipped", "cancelled", "timed_out"])
+    def test_own_required_check_that_concluded_non_passing_refuses_despite_green_parent(
+        self, git_repo, conclusion
+    ):
+        # Contrary evidence on the tagged commit itself wins over any proof.
+        # `skipped` included: #1470 refuses a skipped required check.
+        parent, tagged = self._prep(git_repo)
+        own_runs = [
+            GATE_OWN_IN_PROGRESS,
+            check_run("CI", conclusion, OTHER_RUN_ID, "61"),
+            check_run("CodeQL", None, OTHER_RUN_ID, "62"),
+        ]
+        fetcher = FakeProofFetcher({parent: green_runs()})
+
+        with pytest.raises(authorize_module.AuthorizationError, match="required check-run"):
+            self._authorize(git_repo, tagged, own_runs, fetcher)
+
+    def test_a_superseded_failure_does_not_block_the_proof_walk(self, git_repo):
+        # CI passed on a later attempt. CodeQL is still running, so the
+        # commit's own checks are incomplete and the version-only parent
+        # may stand in. The earlier CI failure is not contrary evidence.
+        parent, tagged = self._prep(git_repo)
+        failed = check_run("CI", "failure", OTHER_RUN_ID, "61")
+        failed["completed_at"] = "2026-10-21T19:04:55Z"
+        passed = check_run("CI", "success", "29811600002", "63")
+        passed["completed_at"] = "2026-10-21T19:35:45Z"
+        pending = check_run("CodeQL", None, OTHER_RUN_ID, "62")
+        pending["started_at"] = "2026-10-21T19:40:00Z"
+        fetcher = FakeProofFetcher({parent: green_runs()})
+
+        proof = self._authorize(
+            git_repo, tagged, [GATE_OWN_IN_PROGRESS, failed, passed, pending], fetcher
+        )
+
+        assert proof == version_only(parent)
+        assert fetcher.calls == [parent]
+
+    def test_a_later_failure_still_blocks_the_proof_walk(self, git_repo):
+        parent, tagged = self._prep(git_repo)
+        passed = check_run("CI", "success", OTHER_RUN_ID, "61")
+        passed["completed_at"] = "2026-10-21T18:00:00Z"
+        failed = check_run("CI", "failure", "29811600002", "63")
+        failed["completed_at"] = "2026-10-21T19:00:00Z"
+        pending = check_run("CodeQL", None, OTHER_RUN_ID, "62")
+        pending["started_at"] = "2026-10-21T19:10:00Z"
+        fetcher = FakeProofFetcher({parent: green_runs()})
+
+        with pytest.raises(authorize_module.AuthorizationError, match="required check-run"):
+            self._authorize(
+                git_repo, tagged, [GATE_OWN_IN_PROGRESS, passed, failed, pending], fetcher
+            )
+        assert fetcher.calls == []
+
+    def test_no_tag_means_no_proof_fallback(self, git_repo):
+        parent, tagged = self._prep(git_repo)
+        fetcher = FakeProofFetcher({parent: green_runs()})
+
+        with pytest.raises(authorize_module.AuthorizationError, match="required check-run"):
+            self._authorize(git_repo, tagged, [], fetcher, tag=None)
+
+    def test_no_fetcher_means_no_proof_fallback(self, git_repo):
+        _parent, tagged = self._prep(git_repo)
+
+        with pytest.raises(authorize_module.AuthorizationError, match="required check-run"):
+            self._authorize(git_repo, tagged, [], None)
+
+    def test_parent_runs_from_the_current_workflow_run_are_not_a_proof(self, git_repo):
+        parent, tagged = self._prep(git_repo)
+        fetcher = FakeProofFetcher(
+            {
+                parent: [
+                    check_run("CI", "success", CURRENT_RUN_ID, "51"),
+                    check_run("CodeQL", "success", CURRENT_RUN_ID, "52"),
+                ]
+            }
+        )
+
+        with pytest.raises(authorize_module.AuthorizationError, match="required check-run"):
+            self._authorize(git_repo, tagged, [], fetcher)
+
+    def test_proof_two_commits_back_through_a_red_version_only_commit(self, git_repo):
+        grandparent = run_git(git_repo, "rev-parse", "HEAD")
+        middle = commit_paths(git_repo, ("cli/Cargo.toml", "cli/Cargo.lock"), "bump once")
+        tagged = commit_paths(git_repo, V0112_PREP_PATHS, "prepare release")
+        fetcher = FakeProofFetcher({grandparent: green_runs(), middle: red_runs()})
+
+        assert self._authorize(git_repo, tagged, [], fetcher) == version_only(grandparent)
+        assert fetcher.calls == [middle, grandparent]
+
+    def test_no_proof_past_a_non_version_only_ancestor_delta(self, git_repo):
+        grandparent = run_git(git_repo, "rev-parse", "HEAD")
+        middle = commit_paths(git_repo, ("cli/src/main.rs",), "runtime change")
+        tagged = commit_paths(git_repo, V0112_PREP_PATHS, "prepare release")
+        fetcher = FakeProofFetcher({grandparent: green_runs()})
+
+        with pytest.raises(authorize_module.AuthorizationError, match="required check-run"):
+            self._authorize(git_repo, tagged, [], fetcher)
+        # The middle commit is a version-only distance from S, so it is
+        # consulted (and has no runs); the walk stops before the green
+        # grandparent because that delta includes cli/src/main.rs.
+        assert fetcher.calls == [middle]
+
+    def test_proof_walk_stops_at_the_depth_limit(self, git_repo):
+        depth = authorize_module.VERSION_ONLY_PROOF_DEPTH
+        green = run_git(git_repo, "rev-parse", "HEAD")
+        for index in range(depth - 1):
+            commit_paths(git_repo, ("cli/Cargo.toml",), f"bump {index}")
+        at_limit = commit_paths(git_repo, V0112_PREP_PATHS, "prepare at limit")
+        fetcher = FakeProofFetcher({green: green_runs()})
+
+        assert self._authorize(git_repo, at_limit, [], fetcher) == version_only(green)
+
+        past_limit = commit_paths(git_repo, ("cli/Cargo.lock",), "one more bump")
+        with pytest.raises(authorize_module.AuthorizationError, match="required check-run"):
+            self._authorize(git_repo, past_limit, [], FakeProofFetcher({green: green_runs()}))
+
+    def test_prerelease_tag_uses_its_own_snapshot_name(self, git_repo):
+        tag = "v0.12.0-rc.1"
+        paths = (*V0112_PREP_PATHS[:-1], f"docs/architecture-atlas/snapshots/{tag}.json")
+        parent, tagged = self._prep(git_repo, paths)
+        fetcher = FakeProofFetcher({parent: green_runs()})
+
+        assert self._authorize(git_repo, tagged, [], fetcher, tag=tag) == version_only(parent)
+
+    def test_prerelease_tag_refuses_the_final_versions_snapshot(self, git_repo):
+        paths = (*V0112_PREP_PATHS[:-1], "docs/architecture-atlas/snapshots/v0.12.0.json")
+        parent, tagged = self._prep(git_repo, paths)
+        fetcher = FakeProofFetcher({parent: green_runs()})
+
+        with pytest.raises(authorize_module.AuthorizationError, match="required check-run"):
+            self._authorize(git_repo, tagged, [], fetcher, tag="v0.12.0-rc.1")
+
+    def test_ancestry_refusal_still_wins_over_a_green_version_only_parent(
+        self, git_repo
+    ):
+        parent = run_git(git_repo, "rev-parse", "HEAD")
+        run_git(git_repo, "checkout", "-q", "-b", "unreviewed")
+        tagged = commit_paths(git_repo, V0112_PREP_PATHS, "prepare off main")
+        run_git(git_repo, "checkout", "-q", "main")
+        fetcher = FakeProofFetcher({parent: green_runs()})
+
+        with pytest.raises(authorize_module.AuthorizationError, match="not reachable"):
+            self._authorize(git_repo, tagged, [], fetcher)
+
+    @staticmethod
+    def _merge_prep_branch(git_repo: Path) -> tuple[str, str, str]:
+        """Merge a version-only prep branch into main with a real merge commit."""
+        first_parent = run_git(git_repo, "rev-parse", "HEAD")
+        run_git(git_repo, "checkout", "-q", "-b", "prep")
+        pr_head = commit_paths(git_repo, V0112_PREP_PATHS, "prepare release")
+        run_git(git_repo, "checkout", "-q", "main")
+        run_git(git_repo, "merge", "-q", "--no-ff", "-m", "Merge prep", "prep")
+        merge = run_git(git_repo, "rev-parse", "HEAD")
+        assert run_git(git_repo, "rev-parse", f"{merge}^1") == first_parent
+        assert run_git(git_repo, "rev-parse", f"{merge}^2") == pr_head
+        return first_parent, pr_head, merge
+
+    def test_merge_commit_borrows_its_first_parent(self, git_repo):
+        # main did not move, so the merge tree equals the PR head's and the
+        # tree-identity rule (#4862) consults the PR head first. It is red
+        # here, so the first-parent version-only walk is what proves the merge.
+        first_parent, pr_head, merge = self._merge_prep_branch(git_repo)
+        fetcher = FakeProofFetcher({first_parent: green_runs(), pr_head: red_runs("4")})
+
+        proof = self._authorize(git_repo, merge, [], fetcher)
+
+        assert proof == version_only(first_parent)
+        assert fetcher.calls == [pr_head, first_parent]
+
+    def test_merge_commit_green_tree_identical_second_parent_alone_is_a_proof(
+        self, git_repo
+    ):
+        # Before #4862 a green second parent never counted. Under ADR-0247 a
+        # second parent whose tree is the merge's tree is the same bytes, so
+        # its green CI proves the merge even when the first parent is red.
+        first_parent, pr_head, merge = self._merge_prep_branch(git_repo)
+        assert tree_of(git_repo, merge) == tree_of(git_repo, pr_head)
+        fetcher = FakeProofFetcher({first_parent: red_runs(), pr_head: green_runs("4")})
+
+        assert self._authorize(git_repo, merge, [], fetcher) == tree_identical(pr_head)
+        assert fetcher.calls == [pr_head]
+
+
+class TestTreeIdenticalParentProof:
+    """#4862 (ADR-0247): a parent with the tagged commit's exact tree proves it.
+
+    A release-PR merge on a main that has not moved since the branch point has
+    the same tree as the PR head, so the PR head's green CI ran on these exact
+    bytes. When the tagged commit's own required checks are absent or still
+    running and none concluded non-passing, the gate checks every parent in
+    parent order (a merge's second parent included) whose tree equals the
+    tagged commit's tree, before the first-parent version-only walk. A parent
+    with a different tree is never fetched by this rule.
+    """
+
+    _authorize = staticmethod(TestVersionOnlyProof._authorize)
+
+    @staticmethod
+    def _merge_release_pr(git_repo: Path) -> tuple[str, str, str]:
+        """Merge an up-to-date release branch carrying a source change."""
+        first_parent = run_git(git_repo, "rev-parse", "HEAD")
+        run_git(git_repo, "checkout", "-q", "-b", "release")
+        pr_head = commit_paths(git_repo, ("cli/src/main.rs",), "release change")
+        run_git(git_repo, "checkout", "-q", "main")
+        run_git(git_repo, "merge", "-q", "--no-ff", "-m", "Merge release", "release")
+        merge = run_git(git_repo, "rev-parse", "HEAD")
+        assert run_git(git_repo, "rev-parse", f"{merge}^1") == first_parent
+        assert run_git(git_repo, "rev-parse", f"{merge}^2") == pr_head
+        return first_parent, pr_head, merge
+
+    @staticmethod
+    def _empty_commit(git_repo: Path) -> tuple[str, str]:
+        parent = run_git(git_repo, "rev-parse", "HEAD")
+        run_git(git_repo, "commit", "-q", "--allow-empty", "-m", "empty")
+        tagged = run_git(git_repo, "rev-parse", "HEAD")
+        assert tree_of(git_repo, tagged) == tree_of(git_repo, parent)
+        return parent, tagged
+
+    def test_path_labels(self):
+        assert authorize_module.TREE_IDENTICAL_PARENT == "tree-identical parent"
+        assert authorize_module.VERSION_ONLY_ANCESTOR == "version-only ancestor"
+        assert authorize_module.Proof._fields == ("commit", "path")
+
+    @pytest.mark.parametrize("first_parent_runs", [[], red_runs()], ids=["absent", "red"])
+    def test_release_pr_merge_is_proved_by_its_green_pr_head(
+        self, git_repo, first_parent_runs
+    ):
+        first_parent, pr_head, merge = self._merge_release_pr(git_repo)
+        assert tree_of(git_repo, merge) == tree_of(git_repo, pr_head)
+        assert tree_of(git_repo, merge) != tree_of(git_repo, first_parent)
+        fetcher = FakeProofFetcher({first_parent: first_parent_runs, pr_head: green_runs("4")})
+
+        proof = self._authorize(git_repo, merge, [GATE_OWN_IN_PROGRESS], fetcher)
+
+        assert proof == tree_identical(pr_head)
+        # The first parent's tree differs, so tree identity never fetches it,
+        # and the proof returns before the version-only walk runs.
+        assert fetcher.calls == [pr_head]
+
+    def test_main_advanced_after_the_branch_point_is_refused(self, git_repo):
+        # Another path landed on main after `release` branched, so the merge
+        # tree matches neither parent. The PR head's CI never saw these bytes.
+        first_parent = run_git(git_repo, "rev-parse", "HEAD")
+        run_git(git_repo, "checkout", "-q", "-b", "release")
+        pr_head = commit_paths(git_repo, ("cli/src/main.rs",), "release change")
+        run_git(git_repo, "checkout", "-q", "main")
+        advanced = commit_paths(git_repo, ("docs/other.md",), "main moved")
+        run_git(git_repo, "merge", "-q", "--no-ff", "-m", "Merge release", "release")
+        merge = run_git(git_repo, "rev-parse", "HEAD")
+        assert tree_of(git_repo, merge) != tree_of(git_repo, pr_head)
+        assert tree_of(git_repo, merge) != tree_of(git_repo, advanced)
+        fetcher = FakeProofFetcher(
+            {first_parent: green_runs(), advanced: green_runs("3"), pr_head: green_runs("4")}
+        )
+
+        with pytest.raises(authorize_module.AuthorizationError, match="required check-run"):
+            self._authorize(git_repo, merge, [], fetcher)
+        # Neither rule fetches anything: no parent tree matches, and the
+        # first-parent delta carries cli/src/main.rs.
+        assert pr_head not in fetcher.calls
+        assert fetcher.calls == []
+
+    def test_tree_identical_red_pr_head_is_refused(self, git_repo):
+        first_parent, pr_head, merge = self._merge_release_pr(git_repo)
+        fetcher = FakeProofFetcher({first_parent: green_runs(), pr_head: red_runs("4")})
+
+        with pytest.raises(authorize_module.AuthorizationError, match="required check-run"):
+            self._authorize(git_repo, merge, [], fetcher)
+        # The green first parent is not a proof: its delta is a source change.
+        assert fetcher.calls == [pr_head]
+
+    def test_pr_head_runs_from_the_current_workflow_run_are_not_a_proof(self, git_repo):
+        _first_parent, pr_head, merge = self._merge_release_pr(git_repo)
+        fetcher = FakeProofFetcher(
+            {
+                pr_head: [
+                    check_run("CI", "success", CURRENT_RUN_ID, "51"),
+                    check_run("CodeQL", "success", CURRENT_RUN_ID, "52"),
+                ]
+            }
+        )
+
+        with pytest.raises(authorize_module.AuthorizationError, match="required check-run"):
+            self._authorize(git_repo, merge, [], fetcher)
+
+    def test_empty_commit_is_proved_by_its_green_first_parent_via_tree_identity(
+        self, git_repo
+    ):
+        # An empty delta is also version-only, so this pins the order: tree
+        # identity is tried first and names its own path.
+        parent, tagged = self._empty_commit(git_repo)
+        fetcher = FakeProofFetcher({parent: green_runs()})
+
+        assert self._authorize(git_repo, tagged, [], fetcher) == tree_identical(parent)
+        assert fetcher.calls == [parent]
+
+    def test_liveness_in_progress_own_ci_authorizes_from_a_tree_identical_parent(
+        self, git_repo
+    ):
+        _first_parent, pr_head, merge = self._merge_release_pr(git_repo)
+        own_runs = [
+            GATE_OWN_IN_PROGRESS,
+            check_run("CI", None, OTHER_RUN_ID, "71"),
+            check_run("CodeQL", None, OTHER_RUN_ID, "72"),
+        ]
+        fetcher = FakeProofFetcher({pr_head: green_runs("4")})
+
+        assert self._authorize(git_repo, merge, own_runs, fetcher) == tree_identical(pr_head)
+
+    def test_tree_identical_parents_are_consulted_in_parent_order(self, git_repo):
+        # Both sides are empty commits on the same base, so the merge tree
+        # equals both parents' trees.
+        run_git(git_repo, "checkout", "-q", "-b", "side")
+        run_git(git_repo, "commit", "-q", "--allow-empty", "-m", "side empty")
+        second = run_git(git_repo, "rev-parse", "HEAD")
+        run_git(git_repo, "checkout", "-q", "main")
+        run_git(git_repo, "commit", "-q", "--allow-empty", "-m", "main empty")
+        first = run_git(git_repo, "rev-parse", "HEAD")
+        run_git(git_repo, "merge", "-q", "--no-ff", "-m", "Merge side", "side")
+        merge = run_git(git_repo, "rev-parse", "HEAD")
+        assert tree_of(git_repo, merge) == tree_of(git_repo, first) == tree_of(git_repo, second)
+
+        both_green = FakeProofFetcher({first: green_runs(), second: green_runs("4")})
+        assert self._authorize(git_repo, merge, [], both_green) == tree_identical(first)
+        assert both_green.calls == [first]
+
+        first_red = FakeProofFetcher({first: red_runs(), second: green_runs("4")})
+        assert self._authorize(git_repo, merge, [], first_red) == tree_identical(second)
+        assert first_red.calls == [first, second]
+
+    @pytest.mark.parametrize("conclusion", ["failure", "skipped", "cancelled"])
+    def test_own_non_passing_required_check_refuses_despite_tree_identical_parent(
+        self, git_repo, conclusion
+    ):
+        # #4862 AC3: contrary evidence on the tagged commit wins before any
+        # parent is fetched.
+        _first_parent, pr_head, merge = self._merge_release_pr(git_repo)
+        own_runs = [
+            GATE_OWN_IN_PROGRESS,
+            check_run("CI", conclusion, OTHER_RUN_ID, "61"),
+            check_run("CodeQL", None, OTHER_RUN_ID, "62"),
+        ]
+        fetcher = FakeProofFetcher({pr_head: green_runs("4")})
+
+        with pytest.raises(authorize_module.AuthorizationError, match="required check-run"):
+            self._authorize(git_repo, merge, own_runs, fetcher)
+        assert fetcher.calls == []
+
+    def test_ancestry_refusal_still_wins_over_a_green_tree_identical_parent(
+        self, git_repo
+    ):
+        run_git(git_repo, "checkout", "-q", "-b", "unreviewed")
+        parent, tagged = self._empty_commit(git_repo)
+        run_git(git_repo, "checkout", "-q", "main")
+        fetcher = FakeProofFetcher({parent: green_runs()})
+
+        with pytest.raises(authorize_module.AuthorizationError, match="not reachable"):
+            self._authorize(git_repo, tagged, [], fetcher)
+        assert fetcher.calls == []
+
+    def test_red_nightly_still_refuses_with_a_tree_proof_available(self, git_repo):
+        parent, tagged = self._empty_commit(git_repo)
+        fetcher = FakeProofFetcher({parent: green_runs()})
+
+        with pytest.raises(authorize_module.AuthorizationError, match="nightly"):
+            authorize_module.authorize(
+                tagged,
+                [GATE_OWN_IN_PROGRESS],
+                ("main",),
+                cwd=git_repo,
+                exclude_run_id=CURRENT_RUN_ID,
+                required_names=TEST_REQUIRED_NAMES,
+                tag=V0112_TAG,
+                fetch_proof_check_runs=fetcher,
+                nightly_conclusion="failure",
+                require_nightly=True,
+            )
+
+    def test_own_green_checks_return_none_and_never_fetch_a_tree_parent(self, git_repo):
+        parent, tagged = self._empty_commit(git_repo)
+        fetcher = FakeProofFetcher({parent: green_runs()})
+
+        proof = self._authorize(
+            git_repo, tagged, [GATE_OWN_IN_PROGRESS, *green_runs("5")], fetcher
+        )
+
+        assert proof is None
+        assert fetcher.calls == []
+
+
+def schema_catalog() -> dict:
+    """A small catalog shaped like the real `cli/src/application_schema_windows.json`.
+
+    A fresh object on every call so a test can mutate it freely.
+    """
+    return {
+        "candidate": {"schema_head": "0123", "schema_min": "0123"},
+        "revisions": ["0120", "0121", "0122", "0123"],
+        "windows": {
+            "0.11.1": {"schema_head": "0122", "schema_min": "0120"},
+            "0.9.3": {"schema_head": "0041", "schema_min": "0041"},
+        },
+    }
+
+
+def registered(catalog: dict, key: str) -> dict:
+    """`catalog` with `key` registered the way bump-version does: the candidate."""
+    catalog["windows"][key] = dict(catalog["candidate"])
+    return catalog
+
+
+def catalog_text(catalog: dict) -> str:
+    return json.dumps(catalog, indent=2) + "\n"
+
+
+class TestSchemaWindowRegistration:
+    """#4862 (ADR-0247): registering this tag's schema window stays version-only.
+
+    `bump-version` promotes the catalog's `candidate` into `windows[<version>]`
+    in the same release-preparation commit, so a delta that also touches
+    SCHEMA_WINDOWS_PATH still counts as version-only for tag vX.Y.Z when the
+    only JSON change is that registration: the key (the tag without `v`) is
+    new, its value equals the ancestor's candidate, and nothing else in the
+    document moved. Anything else in that file ends the walk.
+    """
+
+    _authorize = staticmethod(TestVersionOnlyProof._authorize)
+
+    @staticmethod
+    def _base(git_repo: Path, catalog: dict | None = None) -> str:
+        """Commit the catalog as the green ancestor's state and return its sha."""
+        path = git_repo / SCHEMA_WINDOWS_PATH
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(catalog_text(schema_catalog() if catalog is None else catalog))
+        run_git(git_repo, "add", "--", SCHEMA_WINDOWS_PATH)
+        run_git(git_repo, "commit", "-q", "-m", "schema catalog")
+        return run_git(git_repo, "rev-parse", "HEAD")
+
+    @staticmethod
+    def _prep(
+        git_repo: Path, text: str, paths: Sequence[str] = V0112_PREP_PATHS
+    ) -> str:
+        """One release-prep commit: the version paths plus the catalog as `text`."""
+        path = git_repo / SCHEMA_WINDOWS_PATH
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(text)
+        run_git(git_repo, "add", "--", SCHEMA_WINDOWS_PATH)
+        return commit_paths(git_repo, paths, "prepare release")
+
+    def _assert_refused(self, git_repo: Path, tagged: str, parent: str, **kwargs) -> None:
+        fetcher = FakeProofFetcher({parent: green_runs()})
+        with pytest.raises(authorize_module.AuthorizationError, match="required check-run"):
+            self._authorize(git_repo, tagged, [], fetcher, **kwargs)
+        # The walk ends at the first candidate, before fetching it.
+        assert fetcher.calls == []
+
+    def test_schema_windows_path(self):
+        assert SCHEMA_WINDOWS_PATH == "cli/src/application_schema_windows.json"
+
+    def test_registering_this_tags_window_is_version_only(self, git_repo):
+        parent = self._base(git_repo)
+        tagged = self._prep(git_repo, catalog_text(registered(schema_catalog(), "0.11.2")))
+        fetcher = FakeProofFetcher({parent: green_runs()})
+
+        proof = self._authorize(git_repo, tagged, [GATE_OWN_IN_PROGRESS], fetcher)
+
+        assert proof == version_only(parent)
+        assert fetcher.calls == [parent]
+
+    def test_prerelease_tag_registers_its_own_rc_key(self, git_repo):
+        tag = "v0.12.0-rc.1"
+        paths = (*V0112_PREP_PATHS[:-1], f"docs/architecture-atlas/snapshots/{tag}.json")
+        parent = self._base(git_repo)
+        tagged = self._prep(
+            git_repo, catalog_text(registered(schema_catalog(), "0.12.0-rc.1")), paths
+        )
+        fetcher = FakeProofFetcher({parent: green_runs()})
+
+        assert self._authorize(git_repo, tagged, [], fetcher, tag=tag) == version_only(parent)
+
+    def test_refs_tags_prefix_registers_the_same_key(self, git_repo):
+        parent = self._base(git_repo)
+        tagged = self._prep(git_repo, catalog_text(registered(schema_catalog(), "0.11.2")))
+        fetcher = FakeProofFetcher({parent: green_runs()})
+
+        proof = self._authorize(git_repo, tagged, [], fetcher, tag=f"refs/tags/{V0112_TAG}")
+
+        assert proof == version_only(parent)
+
+    def test_two_commit_walk_through_a_bump_reaches_the_green_grandparent(self, git_repo):
+        grandparent = self._base(git_repo)
+        middle = commit_paths(git_repo, ("cli/Cargo.toml",), "bump once")
+        tagged = self._prep(git_repo, catalog_text(registered(schema_catalog(), "0.11.2")))
+        fetcher = FakeProofFetcher({grandparent: green_runs()})
+
+        assert self._authorize(git_repo, tagged, [], fetcher) == version_only(grandparent)
+        assert fetcher.calls == [middle, grandparent]
+
+    def test_editing_an_existing_window_is_refused(self, git_repo):
+        parent = self._base(git_repo)
+        catalog = registered(schema_catalog(), "0.11.2")
+        catalog["windows"]["0.11.1"]["schema_min"] = "0121"
+        self._assert_refused(git_repo, self._prep(git_repo, catalog_text(catalog)), parent)
+
+    def test_removing_an_existing_window_is_refused(self, git_repo):
+        parent = self._base(git_repo)
+        catalog = registered(schema_catalog(), "0.11.2")
+        del catalog["windows"]["0.9.3"]
+        self._assert_refused(git_repo, self._prep(git_repo, catalog_text(catalog)), parent)
+
+    def test_registering_another_versions_window_is_refused(self, git_repo):
+        parent = self._base(git_repo)
+        catalog = registered(schema_catalog(), "0.11.3")
+        self._assert_refused(git_repo, self._prep(git_repo, catalog_text(catalog)), parent)
+
+    def test_registering_a_v_prefixed_key_is_refused(self, git_repo):
+        # Window keys carry no leading `v`; the tag's `v` is stripped.
+        parent = self._base(git_repo)
+        catalog = registered(schema_catalog(), V0112_TAG)
+        self._assert_refused(git_repo, self._prep(git_repo, catalog_text(catalog)), parent)
+
+    def test_registration_plus_a_candidate_change_is_refused(self, git_repo):
+        parent = self._base(git_repo)
+        catalog = registered(schema_catalog(), "0.11.2")
+        catalog["candidate"]["schema_head"] = "0124"
+        self._assert_refused(git_repo, self._prep(git_repo, catalog_text(catalog)), parent)
+
+    def test_registration_plus_a_new_revision_is_refused(self, git_repo):
+        parent = self._base(git_repo)
+        catalog = registered(schema_catalog(), "0.11.2")
+        catalog["revisions"].append("0124")
+        self._assert_refused(git_repo, self._prep(git_repo, catalog_text(catalog)), parent)
+
+    @staticmethod
+    def _ambiguous_base() -> dict:
+        # The real catalog has windows carrying a boolean flag (0.8.8, 0.8.9).
+        catalog = schema_catalog()
+        catalog["windows"]["0.9.3"]["artifact_identity_ambiguous"] = True
+        return catalog
+
+    def test_registration_beside_an_untouched_boolean_flag_is_version_only(self, git_repo):
+        # Companion to the True-to-1 refusal: the same base, boolean left
+        # `true`, only the registration added, so that fixture is not refused
+        # for any other reason.
+        parent = self._base(git_repo, self._ambiguous_base())
+        tagged = self._prep(
+            git_repo, catalog_text(registered(self._ambiguous_base(), "0.11.2"))
+        )
+        fetcher = FakeProofFetcher({parent: green_runs()})
+
+        assert self._authorize(git_repo, tagged, [], fetcher) == version_only(parent)
+        assert fetcher.calls == [parent]
+
+    def test_registration_that_turns_a_true_flag_into_one_is_refused(self, git_repo):
+        # Python treats True == 1, so a plain dict comparison would call this
+        # edit "nothing else moved". The Rust consumer reads a bool, not 1.
+        parent = self._base(git_repo, self._ambiguous_base())
+        catalog = registered(self._ambiguous_base(), "0.11.2")
+        catalog["windows"]["0.9.3"]["artifact_identity_ambiguous"] = 1
+        self._assert_refused(git_repo, self._prep(git_repo, catalog_text(catalog)), parent)
+
+    def test_registration_with_a_duplicate_member_in_an_existing_window_is_refused(
+        self, git_repo
+    ):
+        # json.loads collapses duplicate members, so the parsed document equals
+        # the base. The Rust consumer (cli/src/schema_window.rs, serde derive
+        # Deserialize) rejects duplicate fields, so this file would not load.
+        parent = self._base(git_repo)
+        text = catalog_text(registered(schema_catalog(), "0.11.2"))
+        member = '"schema_min": "0041"'
+        assert text.count(member) == 1
+        text = text.replace(member, f"{member},\n      {member}")
+        assert json.loads(text) == registered(schema_catalog(), "0.11.2")
+        self._assert_refused(git_repo, self._prep(git_repo, text), parent)
+
+    def test_registered_value_that_is_not_the_candidate_is_refused(self, git_repo):
+        parent = self._base(git_repo)
+        catalog = schema_catalog()
+        catalog["windows"]["0.11.2"] = {"schema_head": "0123", "schema_min": "0120"}
+        self._assert_refused(git_repo, self._prep(git_repo, catalog_text(catalog)), parent)
+
+    def test_rewriting_a_key_the_ancestor_already_had_is_refused(self, git_repo):
+        # The ancestor already registered 0.11.2 with another window, so
+        # setting it to the candidate is an edit, not a registration.
+        before = schema_catalog()
+        before["windows"]["0.11.2"] = {"schema_head": "0122", "schema_min": "0121"}
+        parent = self._base(git_repo, before)
+        catalog = registered(schema_catalog(), "0.11.2")
+        self._assert_refused(git_repo, self._prep(git_repo, catalog_text(catalog)), parent)
+
+    def test_malformed_catalog_at_the_tagged_commit_is_refused(self, git_repo):
+        parent = self._base(git_repo)
+        text = catalog_text(registered(schema_catalog(), "0.11.2"))[:-3] + "\n"
+        with pytest.raises(json.JSONDecodeError):
+            json.loads(text)
+        self._assert_refused(git_repo, self._prep(git_repo, text), parent)
+
+    def test_catalog_absent_at_the_ancestor_is_refused(self, git_repo):
+        parent = run_git(git_repo, "rev-parse", "HEAD")
+        catalog = registered(schema_catalog(), "0.11.2")
+        self._assert_refused(git_repo, self._prep(git_repo, catalog_text(catalog)), parent)
+
+    @pytest.mark.parametrize("conclusion", ["failure", "skipped", "cancelled"])
+    def test_own_non_passing_required_check_refuses_despite_a_registration_parent(
+        self, git_repo, conclusion
+    ):
+        # #4862 AC3: the registration rule widens the walk, not the precondition.
+        parent = self._base(git_repo)
+        tagged = self._prep(git_repo, catalog_text(registered(schema_catalog(), "0.11.2")))
+        own_runs = [
+            GATE_OWN_IN_PROGRESS,
+            check_run("CI", conclusion, OTHER_RUN_ID, "61"),
+            check_run("CodeQL", None, OTHER_RUN_ID, "62"),
+        ]
+        fetcher = FakeProofFetcher({parent: green_runs()})
+
+        with pytest.raises(authorize_module.AuthorizationError, match="required check-run"):
+            self._authorize(git_repo, tagged, own_runs, fetcher)
+        assert fetcher.calls == []
+
+
+class TestMainVersionOnlyProof:
+    """#3858: `main()` wires the live fetcher in as the proof source."""
+
+    @staticmethod
+    def _run(git_repo: Path, monkeypatch, tagged: str, table: dict[str, list[dict]]) -> int:
+        TestMain._use_test_required_names(monkeypatch)
+        TestMain._stub_green_nightly(monkeypatch)
+        monkeypatch.setattr(
+            authorize_module, "fetch_check_runs", lambda sha, repo: table.get(sha, [])
+        )
+        monkeypatch.chdir(git_repo)
+        monkeypatch.setenv("GITHUB_RUN_ID", CURRENT_RUN_ID)
+        return authorize_module.main(
+            [
+                tagged,
+                "--repo",
+                "curie-eng/curie",
+                "--reviewed-ref",
+                "main",
+                "--tag",
+                V0112_TAG,
+            ]
+        )
+
+    def test_main_authorizes_a_version_only_tag_and_names_the_proof_commit(
+        self, git_repo, monkeypatch, capsys
+    ):
+        parent = run_git(git_repo, "rev-parse", "HEAD")
+        tagged = commit_paths(git_repo, V0112_PREP_PATHS, "prepare release")
+        table = {
+            parent: green_runs(),
+            tagged: [GATE_OWN_IN_PROGRESS, check_run("CI", None, OTHER_RUN_ID, "31")],
+        }
+
+        exit_code = self._run(git_repo, monkeypatch, tagged, table)
+
+        captured = capsys.readouterr()
+        assert exit_code == 0, captured.err
+        assert captured.out.startswith("OK:")
+        assert f"checked via version-only ancestor {parent} " in captured.out
+        assert "ADR-0195 as amended by ADR-0247" in captured.out
+
+    def test_main_names_a_tree_identical_release_pr_head(
+        self, git_repo, monkeypatch, capsys
+    ):
+        # #4862 AC5: the release-PR merge is proved by its PR head, and the
+        # OK line says which rule produced that proof.
+        first_parent, pr_head, merge = TestTreeIdenticalParentProof._merge_release_pr(
+            git_repo
+        )
+        table = {
+            first_parent: red_runs(),
+            pr_head: green_runs(),
+            merge: [GATE_OWN_IN_PROGRESS, check_run("CI", None, OTHER_RUN_ID, "31")],
+        }
+
+        exit_code = self._run(git_repo, monkeypatch, merge, table)
+
+        captured = capsys.readouterr()
+        assert exit_code == 0, captured.err
+        assert captured.out.startswith("OK:")
+        assert f"checked via tree-identical parent {pr_head} " in captured.out
+        assert "ADR-0195 as amended by ADR-0247" in captured.out
+
+    def test_main_names_the_ancestor_of_a_schema_window_registration(
+        self, git_repo, monkeypatch, capsys
+    ):
+        parent = TestSchemaWindowRegistration._base(git_repo)
+        tagged = TestSchemaWindowRegistration._prep(
+            git_repo, catalog_text(registered(schema_catalog(), "0.11.2"))
+        )
+        table = {parent: green_runs(), tagged: [GATE_OWN_IN_PROGRESS]}
+
+        exit_code = self._run(git_repo, monkeypatch, tagged, table)
+
+        captured = capsys.readouterr()
+        assert exit_code == 0, captured.err
+        assert f"checked via version-only ancestor {parent} " in captured.out
+
+    def test_main_refuses_a_tag_whose_delta_is_not_version_only(
+        self, git_repo, monkeypatch, capsys
+    ):
+        parent = run_git(git_repo, "rev-parse", "HEAD")
+        tagged = commit_paths(
+            git_repo, (*V0112_PREP_PATHS, "cli/src/main.rs"), "prepare with code"
+        )
+        table = {parent: green_runs(), tagged: [GATE_OWN_IN_PROGRESS]}
+
+        exit_code = self._run(git_repo, monkeypatch, tagged, table)
+
+        assert exit_code == 1
+        assert "required check-run" in capsys.readouterr().err
+
+
 CI_YAML = REPO_ROOT / ".github" / "workflows" / "ci.yaml"
 HELM_CI_YAML = REPO_ROOT / ".github" / "workflows" / "helm-ci.yaml"
 
@@ -1292,6 +2188,52 @@ class TestRequiredNamesMatchCiWorkflows:
             "image while the binaries and the GitHub Release publish anyway."
         )
 
+    def test_docker_daemon_image_build_is_a_required_check(self):
+        # The per-run Docker daemon image is a release.yaml `build` matrix row
+        # outside `examples/`, so the connector guard above cannot see it. Its
+        # ci.yaml job name is read from the workflow, not from the constant.
+        release_doc = yaml.safe_load(
+            (REPO_ROOT / ".github" / "workflows" / "release.yaml").read_text()
+        )
+        release_rows = release_doc["jobs"]["build"]["strategy"]["matrix"]["include"]
+        assert any(
+            row.get("dockerfile") == "apps/docker-daemon/Dockerfile" for row in release_rows
+        ), "release.yaml no longer builds the docker-daemon image; revisit this guard"
+
+        ci_name = yaml.safe_load(CI_YAML.read_text())["jobs"]["image-proofs"]["name"]
+
+        assert ci_name in authorize_module.REQUIRED_CHECK_NAMES, (
+            f"ci.yaml job {ci_name!r} builds an image release.yaml publishes, so a red "
+            "build would skip the manifest merge for every image; require it in "
+            "release/authorize.py"
+        )
+
+    def test_combined_image_proof_replaces_all_former_required_names(self):
+        combined = "Image proofs (smoke, Docker daemon, toolchain)"
+        removed = {
+            "Docker daemon image (authz plugin + escape test)",
+            "Dispatcher image imports resolve",
+            "Mail adapter image imports resolve",
+            "UI image response headers are correct",
+            "Repository toolchain proof (runner image)",
+        }
+        assert combined in authorize_module.REQUIRED_CHECK_NAMES
+        assert not removed & authorize_module.REQUIRED_CHECK_NAMES
+        assert combined in ci_job_check_run_names()
+        assert not removed & ci_job_check_run_names()
+
+    @pytest.mark.parametrize("conclusion", [None, "failure", "cancelled", "skipped", "success"])
+    def test_combined_image_proof_must_be_present_and_successful(self, conclusion):
+        combined = "Image proofs (smoke, Docker daemon, toolchain)"
+        required = authorize_module.REQUIRED_CHECK_NAMES
+        runs = [{"name": name, "conclusion": "success"} for name in required - {combined}]
+        if conclusion is not None:
+            runs.append({"name": combined, "conclusion": conclusion})
+
+        assert authorize_module.missing_required_checks(runs, required) == (
+            set() if conclusion == "success" else {combined}
+        )
+
 
 class TestHelmCiWorkflowTriggers:
     """Pin the deliberate push and pull request trigger asymmetry."""
@@ -1300,20 +2242,16 @@ class TestHelmCiWorkflowTriggers:
         doc = yaml.safe_load(HELM_CI_YAML.read_text())
         triggers = doc[True]
 
-        assert triggers["push"]["branches"] == ["main", "next"]
+        assert triggers["push"]["branches"] == ["main", "next", "backport/**"]
         assert "paths" not in triggers["push"]
         assert "paths-ignore" not in triggers["push"]
         assert triggers["pull_request"]["branches"] == ["main", "next"]
-        # The non-chart trees are not strays to tidy up: helm-ci's Chart job
-        # is the only CI run of charts/curie/ci/, and those scripts read or
-        # execute code in each of these trees (the api, worker, and
-        # dispatcher config through `uv run`, the CLI through cargo, the
-        # aci-protocol bindings, scripts/, the compose files, the ci.yaml and
-        # release.yaml image matrices). A PR touching
-        # only one of them must still match this filter or the gate that
-        # exists to catch it never runs. The explicit files below are also
-        # executed by gates that live outside their owning trees.
-        assert triggers["pull_request"]["paths"] == [
+        assert "paths" not in triggers["pull_request"]
+        assert "paths-ignore" not in triggers["pull_request"]
+        # Those trees are executed by the chart scripts. The list now lives
+        # in CHART_PATHS, and a pull request that touches one must still
+        # select the chart run.
+        assert _load_helm_decide().CHART_PATHS == (
             "charts/curie/**",
             "examples/sre-bot/**",
             ".github/workflows/helm-ci.yaml",
@@ -1335,13 +2273,13 @@ class TestHelmCiWorkflowTriggers:
             "packages/aci-protocol/src/aci_protocol/turn.py",
             "apps/worker/src/curie_worker/sandbox/types.py",
             "compose/**",
-        ]
+        )
 
     def test_a_cli_only_change_runs_the_chart_scripts(self):
         # The Rust job no longer runs the chart scripts, so a CLI-only PR
         # that breaks upgrade-retained-scalar or observability-stack is
         # caught only if helm-ci's filter matches it.
-        paths = yaml.safe_load(HELM_CI_YAML.read_text())[True]["pull_request"]["paths"]
+        paths = _load_helm_decide().CHART_PATHS
         for changed in (
             "cli/src/ops/upgrade.rs",
             "cli/src/examples.rs",
@@ -1354,19 +2292,19 @@ class TestHelmCiWorkflowTriggers:
 
 
 class TestMixedPassFailRequiredCheck:
-    """A required name with any non-passing run is not satisfied (issue #811).
+    """The current attempt of a required name is what authorizes (issue #811).
 
-    The set logic only tracks names that have at least one *passing* run, so a
-    required check that ran twice -- once green, once red (a re-run that failed)
-    -- has its name in the passing set and is silently treated as satisfied.
-    For a fail-closed release gate that masks a genuinely failing required
-    check. These use the `required_names` override so they exercise the logic
-    independent of the production constant.
+    GitHub keeps every attempt. A later failure after a success is still a
+    failing required check and must block. An earlier failure or cancellation
+    that a later success superseded is history, not the current conclusion.
+    Runs with no timestamps cannot be ordered and still fail closed. These
+    use the `required_names` override so they exercise the logic independent
+    of the production constant.
     """
 
     MIXED_CI = [
         {"name": "CI", "conclusion": "success"},
-        {"name": "CI", "conclusion": "failure"},  # a re-run that failed
+        {"name": "CI", "conclusion": "failure"},  # unordered, so fail closed
         {"name": "CodeQL", "conclusion": "success"},
     ]
 
@@ -1412,6 +2350,79 @@ class TestMixedPassFailRequiredCheck:
                 cwd=git_repo,
                 required_names=TEST_REQUIRED_NAMES,
             )
+
+    def test_a_later_failure_still_blocks_after_an_earlier_success(self):
+        runs = [
+            {
+                "name": "CI",
+                "conclusion": "success",
+                "completed_at": "2026-10-21T18:00:00Z",
+            },
+            {
+                "name": "CI",
+                "conclusion": "failure",
+                "completed_at": "2026-10-21T19:00:00Z",
+            },
+            {
+                "name": "CodeQL",
+                "conclusion": "success",
+                "completed_at": "2026-10-21T19:00:00Z",
+            },
+        ]
+
+        assert authorize_module.missing_required_checks(runs, TEST_REQUIRED_NAMES) == {
+            "CI"
+        }
+
+    def test_an_earlier_failure_does_not_block_a_later_success(self, git_repo):
+        # The v0.14.0 chart index publish hit this: a cancelled or failed
+        # attempt of each required name stayed on the commit after a later
+        # attempt of the same name succeeded.
+        sha = run_git(git_repo, "rev-parse", "HEAD")
+        runs = [
+            {
+                "name": "CI",
+                "conclusion": "failure",
+                "completed_at": "2026-10-21T19:04:55Z",
+            },
+            {
+                "name": "CI",
+                "conclusion": "cancelled",
+                "completed_at": "2026-10-21T19:04:22Z",
+            },
+            {
+                "name": "CI",
+                "conclusion": "success",
+                "completed_at": "2026-10-21T19:35:45Z",
+            },
+            {
+                "name": "CodeQL",
+                "conclusion": "success",
+                "completed_at": "2026-10-21T19:16:27Z",
+            },
+        ]
+
+        assert authorize_module.missing_required_checks(runs, TEST_REQUIRED_NAMES) == set()
+        authorize_module.authorize(
+            sha, runs, ("main",), cwd=git_repo, required_names=TEST_REQUIRED_NAMES
+        )
+
+    def test_a_later_in_progress_attempt_blocks_an_earlier_success(self):
+        runs = [
+            {
+                "name": "CI",
+                "conclusion": "success",
+                "completed_at": "2026-10-21T19:00:00Z",
+            },
+            {
+                "name": "CI",
+                "conclusion": None,
+                "started_at": "2026-10-21T19:10:00Z",
+            },
+            {"name": "CodeQL", "conclusion": "success", "completed_at": "2026-10-21T19:00:00Z"},
+        ]
+
+        assert "CI" in authorize_module.missing_required_checks(runs, TEST_REQUIRED_NAMES)
 
 
 class TestSkippedRequiredCheck:
@@ -1474,8 +2485,8 @@ class TestSkippedRequiredCheck:
     def test_a_required_name_with_both_a_success_and_a_skipped_run_is_refused(
         self, git_repo
     ):
-        # Fail-closed, consistent with the mixed pass/fail behavior above: one
-        # green run does not excuse a same-named run that never executed.
+        # Unordered runs fail closed: one green run does not excuse a
+        # same-named run that never executed when the payload has no times.
         sha = run_git(git_repo, "rev-parse", "HEAD")
         runs = [
             {"name": "CI", "conclusion": "success"},
@@ -1533,18 +2544,20 @@ class TestLegitimateSkips:
             if job.get("name") in authorize_module.REQUIRED_CHECK_NAMES
             and "if" in job
         }
-        images_if = "${{ needs.changes.outputs.images == 'true' }}"
         expected = {
             "ci-images": (
                 "${{ needs.changes.outputs.images == 'true' || "
                 "needs.changes.outputs.skill == 'true' || "
                 "needs.changes.outputs.local == 'true' || "
                 "needs.changes.outputs.local_release == 'true' || "
-                "needs.changes.outputs.cluster == 'true' || "
-                "needs.changes.outputs.released_upgrade == 'true' }}"
+                "(needs.changes.outputs.deep == 'true' && "
+                "(needs.changes.outputs.cluster == 'true' || "
+                "needs.changes.outputs.released_upgrade == 'true')) }}"
             ),
-            "dispatcher-image-smoke": images_if,
-            "repo-toolchain-proof": images_if,
+            "image-proofs": (
+                "${{ !cancelled() && needs.changes.result == 'success' && "
+                "(needs.ci-images.result == 'success' || needs.ci-images.result == 'skipped') }}"
+            ),
             "eval-falsifiability": "${{ needs.changes.outputs.skill == 'true' }}",
             "e2e-ladder": (
                 "${{ needs.changes.outputs.skill == 'true' || "
@@ -1567,29 +2580,55 @@ class TestLegitimateSkips:
 
 
 class TestHelmCiJobsCarryNoJobLevelIf:
-    """No helm-ci.yaml job may carry a job-level `if:` (#1470).
+    """A conditional if on helm skips the required check name on a releasable push.
 
-    A job-level `if:` on the `helm` job makes GitHub record
-    `Chart (lint + template + kubeconform)` -- a required check name -- with
-    `conclusion: skipped` on every releasable push. The gate now refuses a
-    skipped required check, so every release would be blocked with the chart
-    never rendered; before that change it silently AUTHORIZED instead, which is
-    strictly worse. Either way the job must simply run on push.
-
-    `TestHelmCiWorkflowTriggers` pins the trigger-level route into the same
-    hole (a filtered `push:` trigger produces no check-run at all); this pins
-    the job-level route. Asserted over every job in the workflow, not just
-    `helm`, so a future job added there is covered without editing this test.
+    After #1470 the gate refuses a skipped required check, so that skip blocks
+    every release. helm's if must be exactly `${{ !cancelled() }}` so a
+    completed run cannot record the required check as skipped. chart-changes
+    has no if. The five gated jobs use exactly
+    `${{ needs.chart-changes.outputs.chart == 'true' }}`. Any other job-level
+    if fails the test.
     """
 
-    def test_no_helm_ci_job_declares_a_job_level_if(self):
-        doc = yaml.safe_load(HELM_CI_YAML.read_text())
-        conditional = sorted(
-            job_id for job_id, job in doc["jobs"].items() if "if" in job
+    # Push runs always select the chart and the deep tiers, so these
+    # conditions never skip the required chart check on a release train.
+    GATED = {
+        "chart-lint-and-assertions-1": "${{ needs.chart-changes.outputs.chart == 'true' }}",
+        "chart-assertions-2": "${{ needs.chart-changes.outputs.chart == 'true' }}",
+        "chart-assertions-retained-values": "${{ needs.chart-changes.outputs.chart == 'true' }}",
+        "reserved-env-upgrade": (
+            "${{ needs.chart-changes.outputs.chart == 'true' && "
+            "needs.chart-changes.outputs.deep == 'true' }}"
+        ),
+        "automatic-thread-isolation": (
+            "${{ needs.chart-changes.outputs.chart == 'true' && "
+            "needs.chart-changes.outputs.deep == 'true' }}"
+        ),
+    }
+
+    def test_only_the_chart_gate_ifs_are_allowed(self):
+        jobs = yaml.safe_load(HELM_CI_YAML.read_text())["jobs"]
+
+        assert "if" not in jobs["chart-changes"]
+        assert jobs["helm"]["if"] == "${{ !cancelled() }}"
+        for job_id, condition in self.GATED.items():
+            assert jobs[job_id]["if"] == condition
+        extra = sorted(
+            job_id
+            for job_id, job in jobs.items()
+            if "if" in job and job_id not in {"helm", *self.GATED}
+        )
+        assert not extra, (
+            "helm-ci.yaml job(s) carry an unexpected job-level if, which can "
+            f"skip the required chart check and block every release: {extra}"
         )
 
-        assert not conditional, (
-            "helm-ci.yaml job(s) carry a job-level `if:`, which makes their "
-            "check-run `skipped` on releasable pushes and blocks every release "
-            f"with the chart never rendered: {conditional}"
-        )
+
+def _load_helm_decide():
+    """Import the chart gate by path. Do not name the module `select`."""
+    path = REPO_ROOT / "tools" / "helm-ci-gate" / "decide.py"
+    spec = importlib.util.spec_from_file_location("helm_ci_gate_decide", path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module

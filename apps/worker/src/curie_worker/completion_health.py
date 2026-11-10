@@ -17,6 +17,7 @@ import time
 from dataclasses import dataclass
 from typing import Any, Final
 
+from curie_internal.valkey import AsyncRedis
 from curie_telemetry import record_metric
 from redis.asyncio import Redis
 
@@ -139,9 +140,9 @@ async def snapshot_completion_outbox(
     """Read the pending set. Never mutate it."""
 
     observed_at = time.time() if now is None else now
-    count = int(await redis.scard(config.completions_pending_key()))
-    members = await markers.pending_completions(config.completion_sweep_batch)
-    stored = await markers.read_completions(sorted(members))
+    count = await markers.pending_completion_count()
+    members = await markers.pending_completion_entries(config.completion_sweep_batch)
+    stored = await markers.read_completion_entries(sorted(members))
     inflight = 0
     retry = 0
     oldest_retry = 0.0
@@ -209,7 +210,7 @@ async def observe_completion_outbox(
 
     try:
         snapshot = await snapshot_completion_outbox(markers, redis, config)
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001 - existing broad catch retained
         logger.warning(
             "completion outbox telemetry observation failed (%s)",
             type(exc).__name__,
@@ -227,7 +228,7 @@ async def observe_completion_outbox(
         )
     try:
         publish_snapshot(snapshot)
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001 - existing broad catch retained
         logger.warning(
             "completion outbox metric publish failed (%s)",
             type(exc).__name__,
@@ -236,7 +237,7 @@ async def observe_completion_outbox(
 
 
 async def _read_status(config: WorkerConfig) -> CompletionOutboxSnapshot:
-    redis = Redis(**config.valkey_client_kwargs())
+    redis = AsyncRedis(**config.valkey_client_kwargs())
     try:
         markers = Markers(redis, config)
         return await snapshot_completion_outbox(markers, redis, config)

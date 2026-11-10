@@ -1,0 +1,16 @@
+mailAdapter:
+  deploy: true
+  agentmail:
+    httpsCidrs:
+      - 203.0.113.10/32
+  persistence:
+    existingClaim: mail-state
+grafanaConnector:
+  enabled: true
+inference:
+  deploy: true
+  persistence:
+    enabled: true
+security:
+  gvisor:
+    mode: require

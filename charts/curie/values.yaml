@@ -103,6 +103,62 @@ e2eConnectorIdentity:
     value: ""
 
 # ---------------------------------------------------------------------------
+# End to end connector on the factory cluster (ADR 0176 decisions 1 to 3,
+# issue #3244). Off unless this installation has a separate test cluster.
+# The connector process runs here. The credential and the identity live on
+# the test cluster (e2eConnectorIdentity, installed only there).
+# ---------------------------------------------------------------------------
+e2eConnector:
+  enabled: false
+  namespacePrefix: "curie-e2e-"
+  ownerLabel:
+    key: "curietech.ai/e2e-owner"
+    # The test cluster release name. Required when enabled. It must equal
+    # e2eConnectorIdentity.ownerLabel.value on that cluster.
+    value: ""
+  # The test cluster service account installed by --e2e-connector-identity.
+  serviceAccount: ""
+  serviceAccountNamespace: ""
+  workerClusterRole: ""
+  ttlSeconds: 3600
+  podSecurity: baseline
+  # How often the worker's reaper (#3245) deletes namespaces past their TTL or
+  # whose run has finished. Enabling e2eConnector needs
+  # worker.connectorReconciler.enabled: the reaper reads the kubeconfig from
+  # the connector Secret through the reconciler's Secret list grant.
+  reaperIntervalSeconds: 60
+  # Daemonless image builds (#3246, ADR 0176 decision 6). The registry prefix
+  # the build pushes under, as <registry>/<namespace>/<name>. Empty means
+  # image_build refuses with e2e_registry_not_configured. The push credential
+  # is E2E_REGISTRY_PUSH_CONFIG (a docker config.json stored with
+  # `curie secrets`); it never reaches the sandbox or a build container that
+  # runs Dockerfile RUN steps. The registry must allow manifest deletes and
+  # run garbage collection, because teardown deletes every image a run pushed.
+  registry: ""
+  # Remote layer cache repository. null renders <registry>/cache; an explicit
+  # "" disables the cache. The cache is used only when this is non empty AND
+  # E2E_BUILD_CACHE_CONFIG is stored, so an authenticated registry needs that
+  # config to cache at all. WARNING: that credential is mounted in the build
+  # container, so Dockerfile RUN steps can read it. Scope it to the cache
+  # repository only, never to the push repositories.
+  buildCacheRepo: null
+  # Plain http to the registry (and the cache). Never enable it on a registry
+  # that is reachable beyond the test cluster network.
+  registryInsecure: false
+  # Hosts, beyond the registry itself, whose https token realm may receive the
+  # push credential. Entries without a port mean 443.
+  registryTokenHosts: []
+  # Empty means the digest pinned default in the connector.
+  builderImage: ""
+  gitImage: ""
+  pushImage: ""
+  # Wall clock limit for one build, 60 to 3600 seconds.
+  buildTimeoutSeconds: 1200
+  # https hosts a build may fetch its commit from.
+  sourceHosts:
+    - github.com
+
+# ---------------------------------------------------------------------------
 # PriorityClass (ADR-0059 decision 5): ranks the platform -- worker, api,
 # dispatcher, the data tier (postgres, valkey, clickhouse, rustfs), and the
 # observability and UI tier (langfuse web/worker, the OTel collector, the UI,
@@ -323,7 +379,7 @@ langfuse:
     # Probe cadences. Liveness must outlast readiness: this replicas:1 +
     # Recreate Deployment runs Prisma/ClickHouse boot migrations at container
     # start, and init containers do NOT re-run on a liveness restart. Cutoffs:
-    # readiness 310s, liveness 370s. Formula/rationale: ci/probe-window-assertions.sh header.
+    # readiness 310s, liveness 370s. Formula/rationale: ci/policy/engine.py (P3).
     readinessProbe:
       initialDelaySeconds: 20
       periodSeconds: 10
@@ -368,7 +424,7 @@ langfuse:
     # Probe cadences, deliberately equal to langfuse.web's above: same boot
     # migrations, same replicas:1 + Recreate constraint, cadence kept equal to
     # web's. Cutoffs: readiness 310s, liveness 370s. Formula/rationale:
-    # ci/probe-window-assertions.sh header.
+    # ci/policy/engine.py (P3).
     readinessProbe:
       initialDelaySeconds: 20
       periodSeconds: 10
@@ -439,7 +495,7 @@ postgres:
   # Probe cadences. Liveness MUST outlast readiness here because `pg_isready`
   # returns non-zero for the whole of WAL recovery after an unclean stop, and a
   # restart re-enters the same recovery. Cutoffs: readiness 60s, liveness 310s.
-  # Formula/rationale: ci/probe-window-assertions.sh header.
+  # Formula/rationale: ci/policy/engine.py (P3).
   readinessProbe:
     initialDelaySeconds: 5
     periodSeconds: 5
@@ -533,9 +589,9 @@ valkey:
 # onward need the 25.12 line (Langfuse v3.225.7 compose pins
 # clickhouse-server:25.12), pinned here to the 25.12.11.4 patch build so the
 # alias cannot move under the chart version (#2319). AVX is a chart-default
-# requirement because 25.12 is not SSE4.2-safe. Do not move this pin
+# requirement on x86 because 25.12 is not SSE4.2-safe. Do not move this pin
 # independently of the Langfuse pin (#2210). The AVX preflight
-# still allows an explicit sse42SafeTags override on AVX-less nodes; that
+# still allows an explicit sse42SafeTags override on AVX-less x86 nodes; that
 # override cannot apply the current Langfuse migration set.
 # BYO: deploy=false + host/httpPort/nativePort (existingSecret key clickhousePassword).
 # ---------------------------------------------------------------------------
@@ -554,7 +610,7 @@ clickhouse:
     # by digest, or the preflight judges the wrong build.
     digest: ""
   # Tags whose upstream binaries still ship an SSE4.2 build (no AVX required).
-  # The AVX preflight passes an AVX-less node only if the configured tag begins
+  # The AVX preflight passes an AVX-less x86 node only if the configured tag begins
   # with one of these. Not a supported default: the 25.12 line is required by the
   # Langfuse pin and is deliberately absent from this list. 24.8/24.3 are LTS
   # lines; 23.8 is the prior LTS.
@@ -727,6 +783,85 @@ connectorCaller:
   signingKeyKey: signingKey
   verifyKeyKey: verifyKey
 
+# The connector action executor (ACTION-EXECUTOR-1). One switch, rendered as
+# CURIE_ACTION_EXECUTOR_ENABLED into both the API and the worker so the two can
+# never disagree. Off: the worker claims no execution and the API refuses an undo
+# that would authorize a restore with `executor_disabled`. On, with
+# worker.connectorReconciler.enabled, the worker Role also gains a single-object
+# `get` on Deployments so it can read the digest a connector ran at
+# (ACTION-EXECUTOR-12, -14); with the executor off that grant is absent and
+# actions record no digest, so they are not undoable.
+#
+# connectorReadsWithoutReconciler (#4800, default false) is for an installation
+# that keeps worker.connectorReconciler off, for example because its hosted
+# connectors are pinned and managed outside Curie. On, the worker Role gains
+# only that single-object `get` on Deployments, none of the reconciler's rules,
+# and the worker reads the acting connector's Deployment and the in-force digest
+# itself; the reconcile loop stays off. An execution whose Deployment cannot be
+# read, or does not serve the in-force digest, is refused
+# `connector_digest_unavailable` before dispatch. Capability probes are still
+# requested only by a reconcile pass, so restores need a recorded capability.
+# Requires enabled: true; a render with the reconciler on fails.
+#
+# maxConcurrentSandboxes (AUTOMATED-REMEDIATION-12, executor amendment E9) is the
+# most executions live (claimed or dispatched) across the installation at once,
+# rendered as CURIE_ACTION_EXECUTOR_MAX_CONCURRENT_SANDBOXES into both the API,
+# whose claim route enforces it across worker replicas, and the worker, whose
+# executor loop runs up to that many at once. While two or more slots exist one
+# is kept for write-kind executions, so remediation samples never starve a
+# write. It leaves sandbox quota to ordinary turns; an integer of at least 1.
+actionExecutor:
+  enabled: false
+  connectorReadsWithoutReconciler: false
+  maxConcurrentSandboxes: 2
+
+# Automated remediation (AUTOMATED-REMEDIATION-1). One switch, rendered as
+# CURIE_REMEDIATION_ENABLED into both the API and the worker. Closed by default.
+# Enabling it requires actionExecutor.enabled: a render with remediation on and
+# the executor off fails. Off, the remediation policy routes stay readable and
+# writable so a policy can be staged before activation.
+remediation:
+  enabled: false
+
+# The test installation declaration (ADR 0202 decision 1). Off by default, and
+# set only here: it is never derived from a channel name, a deployment's env,
+# a bundle, or anything an agent or a message says. Rendered as
+# CURIE_TEST_INSTALLATION_ENABLED and CURIE_TEST_INSTALLATION_DRIVERS into the
+# API and the dispatcher, and neither may be set through extraEnv.
+#
+# Turning it on is the operator's statement that every credential this
+# installation's agents hold reaches only test accounts, and that a driver's
+# Slack token is reachable by no agent other than the driver itself. A test
+# installation owns its Slack app exclusively (#2248).
+#
+# The chart refuses to render it on when api.environment is prod (a tripwire,
+# not evidence), when the API key, the worker token or the approval attester
+# secret is still the published default, or when a driver has no channel. The
+# API and the dispatcher refuse to boot on a published default secret too, and
+# the dispatcher's preflight refuses a driver that is this installation's
+# authorized identity (default), a sibling driver that names no agent, and a
+# sibling driver whose identity is bound to any other agent.
+#
+# Each driver is a channel id, a Slack bot id and that bot's user id, validated
+# like a dispatcher.threadedBotAllowlist pair. A sibling driver, another Slack
+# identity of this installation (dispatcher.slack.identities), also names the
+# one agent it serves:
+#   drivers:
+#     - channel_id: C0EXAMPLE1     # ^[CG][A-Z0-9]+$
+#       bot_id: B0EXAMPLE1         # ^B[A-Z0-9]+$
+#       bot_user_id: U0EXAMPLE1    # ^U[A-Z0-9]+$
+#     - channel_id: C0EXAMPLE1
+#       bot_id: B0EXAMPLE2
+#       bot_user_id: U0EXAMPLE2
+#       agent: acme-tester         # sibling driver only
+testInstallation:
+  enabled: false
+  drivers: []
+  # Maximum driver-started turns per Slack identity/channel/thread in any ten
+  # minutes, shared by all listed drivers (1–100). Pings and duplicate deliveries
+  # spend no turn budget. Valkey reservations make the cap atomic across replicas.
+  threadTurnLimit: 10
+
 rustfs:
   deploy: true
   image: rustfs/rustfs:1.0.0-beta.12
@@ -794,7 +929,11 @@ rustfs:
     fsGroup: 10001
   persistence:
     enabled: true
-    size: 3Gi
+    # 10Gi on ext4 is 655,360 inodes; each Langfuse event upload costs about
+    # three (#4408). An existing install keeps its claim size: the chart reads
+    # it back from the live StatefulSet with `lookup`. Renderers with no
+    # cluster access (helm template, Argo CD) must pin this to the current size.
+    size: 10Gi
   # Measured rustfs/rustfs:1.0.0-beta.12 under ordinary Langfuse traffic
   # (issue #2706): 1120Mi working set, 425m CPU. The shipped 512Mi / 500m
   # ceiling OOMKilled every in-chart install in a silent loop: kubelet
@@ -1000,6 +1139,12 @@ otelCollector:
   # Network exporters must opt into bounded retry and a persistent file_storage
   # sending queue. The chart rejects an exporter that omits either protection.
   extraExporters: {}
+  # @spec charts/curie/README.md: Optional trace processors.
+  # Additional Collector processor definitions. Select IDs for traces below;
+  # selected processors run after memory_limiter and before batch. Built-in
+  # names are reserved and both keys default to no change in any pipeline.
+  extraProcessors: {}
+  extraTracePipelineProcessors: []
   # Only awsemf exporters may bypass exporterhelper validation on contrib
   # 0.119.0. Map each configured awsemf name to a nonblank reason naming the
   # exporter and checked Collector version. Other network exporters retain
@@ -1122,20 +1267,95 @@ grafanaConnector:
 #   - ui         static React SPA served by nginx, proxying /api to the API
 #
 # IMAGE DEFAULTS: every app image defaults to the GHCR package the Release
-# workflow publishes. The `tag` is left EMPTY so it resolves to the chart
-# `appVersion` (see Chart.yaml) -- an immutable, per-release version tag rather
-# than the mutable `latest`. That makes installs deterministic and rollback-able:
-# the same chart version always renders the same image ref (`helm template` shows
-# `...-api:<appVersion>`, not `:latest`). For the strongest guarantee set `digest`
-# to a `sha256:...` content digest instead (it wins over `tag` and pins by digest,
-# verifiable via `cosign verify-attestation` / `gh attestation verify`); the
-# Release workflow prints each published image's digest. `pullPolicy: Always` on
-# an immutable ref is a cheap no-op that still self-heals a node that cached a
-# same-named ref, so it is kept.
+# workflow publishes. In this source tree `tag` is left EMPTY so it resolves to
+# the chart `appVersion` (see Chart.yaml) -- an immutable, per-release version
+# tag rather than the mutable `latest`. The released chart asset differs: it
+# ships each first-party image's `digest` set to the signed index digest that
+# release built. `digest` wins over `tag`, so to run a different tag from the
+# released chart, clear that image's digest too (for example
+# `--set api.image.tag=X --set api.image.digest=`). Verify signatures and
+# attestations as described in docs/release-verification.md.
+# `pullPolicy: Always` on an immutable ref is a cheap no-op that still
+# self-heals a node that cached a same-named ref, so it is kept.
 # The repo and its packages are public, so NO imagePullSecret is needed by
 # default; the `imagePullSecrets` plumbing stays for private forks. For offline
 # dev/e2e use values-dev.yaml, which repoints each image at a locally-built,
 # cluster-imported image with imagePullPolicy Never (mirroring the runner pattern).
+# ---------------------------------------------------------------------------
+# Code host trust (ADR 0197): one PEM CA bundle from a ConfigMap you create,
+# for a code host no public root covers. See the README's "Code host CA
+# bundle". An empty name mounts nothing.
+codeHostTrust:
+  caBundle:
+    configMapRef:
+      name: ""
+      key: ca.crt
+# ---------------------------------------------------------------------------
+# The factory (#4397) as CURIE_FORGES; `curie cluster factory` writes it.
+# A credential names its Secret: existingSecret, existingSecretKey.
+factory:
+  enabled: false
+  intake: poll  # or webhook
+  baseLabelSettleSeconds: 60
+  cardBaseUrl: ""
+  ciWaitSeconds: 3600
+  codeHosts: []
+  trackers: []
+  bindings: []
+  sandboxEgress: {}
+  # Per-run Docker daemons (ADR 0217). Read only when a bindings[].repos[]
+  # entry with a runner block sets docker.enabled: true and worker.deploy is
+  # true; otherwise templates/docker-daemon.yaml renders nothing. See the
+  # README's "Factory Docker daemons" section.
+  docker:
+    # Required when a repository enables docker: a digest-pinned reference
+    # (name@sha256:<64 hex>). The Curie authorization plugin ships inside this
+    # image, so this one digest pins both (decisions 4 and 5). Admission
+    # refuses a daemon pod running any other image.
+    daemonImage: ""
+    # The daemon namespace. Empty means <release-namespace>-<fullname>-docker,
+    # truncated to 63 characters.
+    namespace: ""
+    # Create the namespace with the privileged Pod Security label. Set false
+    # when the operator creates it; it must then carry
+    # pod-security.kubernetes.io/enforce: privileged.
+    createNamespace: true
+    # The daemon's mutual TLS API port. Rail 1 opens TCP 1 through 65535 to
+    # this release's daemons; each daemon admits only its own claim's runner.
+    port: 2376
+    # Individual daemon Pod sizing, separate from namespace quota and limits.
+    resources:
+      requests: { cpu: "500m", memory: "1Gi", ephemeral-storage: "10Gi" }
+      limits: { cpu: "2", memory: "4Gi", ephemeral-storage: "20Gi" }
+    storageSizeLimit: "20Gi"
+    maxClaimLifetimeSeconds: 86400
+    pingTimeoutSeconds: 2
+    # ResourceQuota spec.hard for the daemon namespace, the ceiling on every
+    # concurrent run's daemon. Required when docker is enabled. Persistent
+    # volumes, LoadBalancers and NodePorts stay at zero.
+    quota:
+      hard:
+        pods: "8"
+        requests.cpu: "8"
+        requests.memory: 16Gi
+        requests.ephemeral-storage: 160Gi
+        limits.cpu: "16"
+        limits.memory: 32Gi
+        limits.ephemeral-storage: 160Gi
+        services: "8"
+        secrets: "16"
+        persistentvolumeclaims: "0"
+        services.loadbalancers: "0"
+        services.nodeports: "0"
+    # One Container LimitRange item in the daemon namespace: per-container
+    # max, min, default limits and default requests. All four are required
+    # when docker is enabled. Admission separately refuses a zero request or
+    # limit.
+    limitRange:
+      max: { cpu: "4", memory: 8Gi, ephemeral-storage: 40Gi }
+      min: { cpu: 100m, memory: 256Mi, ephemeral-storage: 1Gi }
+      default: { cpu: "2", memory: 4Gi, ephemeral-storage: 20Gi }
+      defaultRequest: { cpu: 500m, memory: 1Gi, ephemeral-storage: 10Gi }
 # ---------------------------------------------------------------------------
 api:
   deploy: true
@@ -1212,10 +1432,32 @@ api:
   # approval evidence. A sealed install generates and persists this value
   # independently; values-dev.yaml keeps the published deterministic default.
   approvalChatAttesterSecret: curie-dev-approval-chat-attester
+  # Remediation authority key (ADR 0231). Binding (PUT) and arming a remediation
+  # policy need it in X-Curie-Remediation-Authority; the platform key plus an
+  # operator principal is not enough, because every worker holds the platform
+  # key. It MUST differ from apiKey (the render refuses equality) and is mounted
+  # into the API Deployment only. A sealed install generates and persists it;
+  # values-dev.yaml keeps the published deterministic default. Read it back with
+  # kubectl get secret <release>-secrets -o jsonpath='{.data.remediationAuthorityKey}'.
+  remediationAuthorityKey: curie-dev-remediation-authority
+  # HTTP identity operator file (HTTP-INVOCATION-EXECUTION-20), off by default.
+  # existingSecret names an operator-created Secret whose api-runtime.json key
+  # holds the provider bearers, receiver registrations and keys, and the core
+  # context sealing keys. It is mounted read-only at 0440 into the API
+  # container alone and read once at startup; the chart never creates, reads or
+  # checksums it, so roll the API after changing it. No chart NetworkPolicy
+  # restricts API egress, so the provider lookup needs no extra rule (api.egress
+  # is the runner's route and does not apply). Rendering this is wiring, not
+  # activation: see charts/curie/README.md. providerCaBundle: true also mounts
+  # that Secret's provider-ca.pem key, the private CA bundle that then becomes
+  # the only trust anchor for provider lookups (hostnames are still verified).
+  httpIdentity:
+    existingSecret: ""
+    providerCaBundle: false
   # Probe cadences. Database aware /ready keeps the API out of the Service until
   # Postgres responds, while process local /health keeps the process alive.
   # Liveness must outlast readiness. Cutoffs: readiness 120s, liveness 195s.
-  # Formula/rationale: ci/probe-window-assertions.sh header.
+  # Formula/rationale: ci/policy/engine.py (P3).
   # Kubelet withdrawal of a bounce shorter than the 120s readiness cutoff is
   # out of scope; the longer-outage proof covers endpoints.
   readinessProbe:
@@ -1238,26 +1480,6 @@ api:
   # positive reconciliation interval.
   githubReviewIngressEnabled: false
   githubReviewReconcilerIntervalSeconds: 5
-  # Signed factory issue intake is opt-in and separate from review feedback.
-  # When enabled, the API boot gate requires the App id and private key, a
-  # non-default webhook secret, a label, a mention login, and a repo allowlist.
-  githubFactoryIngressEnabled: false
-  githubFactoryLabel: ""
-  githubFactoryMention: ""
-  # Public https origin GitHub's image proxy fetches the live factory status card
-  # from (#3077). Set, the card replaces the phase checklist (#3125); empty omits
-  # the card and the comment shows the checklist instead.
-  githubFactoryCardBaseUrl: ""
-  # Seconds a published factory run waits on its pull request's CI, from the
-  # push (#3162). The run's execution deadline still caps it. 1 to 10800.
-  githubFactoryCiWaitSeconds: 1200
-  # Required Python CI per repository (#3617), keyed by owner/name (matched
-  # case-insensitively): {check, paths, pendingCheckPrefix}. A factory Python
-  # change must fall under `paths` and pass the `check` Actions check; shard
-  # jobs named with `pendingCheckPrefix` keep the run waiting for it. A
-  # repository without an entry is judged on its own checks. Rendered as JSON
-  # into GITHUB_FACTORY_PYTHON_CI; see docs/operations.md for curie-eng/curie.
-  githubFactoryPythonCi: {}
   # GitHub credential the API uses OUTBOUND: posting the eval commit status, and
   # authenticating the git-flow bundle clone. Without it git-flow can only deploy
   # a PUBLIC repository -- a private one is rejected with git.archive_failed
@@ -1279,6 +1501,12 @@ api:
   # reach. Each entry is owner/repository or owner/*; an empty list allows no
   # opening-message repository selections.
   githubRepoAllowlist: []
+  # Operator-controlled GitHub labels by exact owner/repository; agents cannot
+  # choose labels. No wildcards; at most 10 label names of 1 to 50 characters.
+  # Repository keys match case-insensitively.
+  # Applied once per publication revision using a 30-day Valkey success marker.
+  # Best effort: forge or Valkey errors preserve the publication.
+  factoryPublicationLabels: {}
   # BYO secret (issue #1759, the same idiom githubAppExistingSecret below
   # uses). Wins over githubToken when set. A plain `curie cluster up`
   # preserves the reference and key; an explicit inline replacement or
@@ -1335,7 +1563,7 @@ api:
   # is rejected with git.origin_mismatch. Set it to a GitHub Enterprise Server
   # base to deploy from GHE.
   githubCloneBase: "https://github.com"
-  # REST base used by credential minting, polling, and managed publication.
+  # REST base for credential minting, polling and the API's pull request calls.
   githubApiUrl: "https://api.github.com"
   # How often (seconds) the API scans for lapsed pending approvals and resumes
   # their stranded sessions (#412). Set to 0 (or any value <= 0) to disable the
@@ -1464,9 +1692,13 @@ api:
     enabled: true
     intervalSeconds: 30
     batchLimit: 100
+  # limits.memory is unset on purpose: the selected resource profile supplies
+  # it (agentSandbox.resourceProfiles.<profile>.apiMemoryLimit, 512Mi for
+  # `standard`, 2Gi for `factory`). Any explicit limits.memory, including
+  # 512Mi, wins for every install. The schema-migrate Job uses these too.
   resources:
     requests: { cpu: 100m, memory: 256Mi }
-    limits: { cpu: "1", memory: 512Mi }
+    limits: { cpu: "1" }
   # Container securityContext (issue #67). Restricted-PSS baseline: the image runs
   # as non-root uid 1000 (see apps/api/Dockerfile) and needs no Linux
   # capabilities. readOnlyRootFilesystem stays false -- the app writes to its
@@ -1481,6 +1713,36 @@ api:
       drop: [ALL]
     seccompProfile:
       type: RuntimeDefault
+
+channelGateway:
+  # Retained-value upgrades use the same defaults in files/channel-gateway-defaults.yaml.
+  # null deploys automatically when Slack is configured and url is empty.
+  # false requires an external url; true deploys even without Slack.
+  deploy: null
+  replayStorageSize: 1Gi
+  replayStorageClass: ""
+  port: 8081
+  url: ""
+  allowInsecure: false
+  # Optional Secret with ca.crt, tls.crt and tls.key. Otherwise Helm provisions
+  # and preserves a certificate across upgrades using lookup.
+  tlsSecret: ""
+  apiToken: null
+  workerToken: null
+  groupCacheTtlSeconds: 60
+  readinessProbe:
+    initialDelaySeconds: 1
+    periodSeconds: 5
+    timeoutSeconds: 2
+    failureThreshold: 3
+  livenessProbe:
+    initialDelaySeconds: 10
+    periodSeconds: 10
+    timeoutSeconds: 2
+    failureThreshold: 3
+  resources:
+    requests: {cpu: 100m, memory: 128Mi}
+    limits: {cpu: 1000m, memory: 512Mi}
 
 dispatcher:
   deploy: true
@@ -1520,6 +1782,14 @@ dispatcher:
   # first deadline; the startup probe below outlasts both phases plus the final
   # bounded two-second Slack call.
   apiPreflightTimeoutSeconds: 120
+  # Selected HTTP receivers (HTTP-INVOCATION-EXECUTION-20), off by default.
+  # existingSecret names an operator-created Secret whose receivers.json key
+  # holds each selected identity's receiver scope, bindings with their pinned
+  # channel credentials, and that receiver's key; never a core context key. It
+  # is mounted read-only at 0440 into the dispatcher container alone. Selecting
+  # a receiver requires api.httpIdentity.existingSecret.
+  httpIdentity:
+    existingSecret: ""
   # Startup uses the same heartbeat freshness check as readiness/liveness. The
   # kubelet can count its first failure at t=0, so 27 samples every 10 seconds
   # make the earliest fast-failure 260s -- strictly after the maximum 242s
@@ -1540,9 +1810,9 @@ dispatcher:
   # Slack credentials. Socket Mode means the process dials out (no ingress), so
   # there is no Service. Left empty the supervisor just backs off and retries, so
   # the pod stays up without them; fill them (or an existingSecret) to connect.
-  # slackBotToken is shared with the worker (it edits the Slack placeholder) and,
-  # when set, with the API, whose approval user-group authorizers look up
-  # usergroup membership themselves (#420, ADR-0034). That lookup needs the
+  # slackBotToken belongs to dispatcher and gateway. The gateway performs
+  # provider reads and worker replies; API and worker hold only caller tokens.
+  # User-group membership lookup needs the
   # `usergroups:read` bot scope, which existing Slack apps get only by
   # reinstalling the app to the workspace. Changing this token requires a pod
   # rollout of the consumers, not just a `helm upgrade`: a secretKeyRef env
@@ -1584,7 +1854,7 @@ dispatcher:
     # entry named `default` with the block's token fields left empty. A list
     # that ends up with no `default` fails the render, because a Slack route
     # that names no identity means `default`. A list entry's tokens render as
-    # CURIE_SLACK_BOT_TOKEN__<n> (worker, API, dispatcher) and
+    # CURIE_SLACK_BOT_TOKEN__<n> (gateway, dispatcher) and
     # CURIE_SLACK_APP_TOKEN__<n> / CURIE_SLACK_SIGNING_SECRET__<n> (dispatcher),
     # where <n> is the entry's position, and CURIE_SLACK_IDENTITIES tells all
     # three which name reads which variable. That declaration is what the API
@@ -1686,6 +1956,19 @@ mailAdapter:
   otelEgress:
     httpsCidrs: []
     port: ""
+  # Email receiver proof (ADR 0260). The receiver key is held only by the API
+  # and this adapter, and is distinct from the platform key and the channel
+  # token. Set receiverId and keyExistingSecret together to make the adapter
+  # sign every turn; the key is read by reference only from that Secret.
+  # generation is the registration's positive integer generation. An empty
+  # receiverId renders none of CURIE_MAIL_RECEIVER_ID, _GENERATION and _KEY, so
+  # legacy bindings are unchanged; setting only one of receiverId and
+  # keyExistingSecret fails the render.
+  emailReceiver:
+    receiverId: ""
+    generation: 1
+    keyExistingSecret: ""
+    keyExistingSecretKey: emailReceiverKey
   image:
     repository: ghcr.io/curie-eng/curie-mail-adapter
     # Empty -> chart appVersion (immutable). Set to pin an explicit version tag.
@@ -1726,23 +2009,20 @@ mailAdapter:
   # readiness going 503 is the operator signal via Deployment.Available, not
   # a routing cutoff.
   discoveryUnreadyAfterSeconds: 120
-  # Who may start a turn by emailing the inbox. Empty denies everything, and with
-  # ingressEnabled true the adapter refuses to boot rather than run an inbox that
-  # answers nobody. "*" is the explicit allow-all.
+  # Claimed senders the inbound gate permits after Curie itself verifies a
+  # positive sender authentication verdict. Empty fails boot with ingress enabled.
+  # Any list containing "*" fails boot unless allowAllSenders is explicitly true.
+  # The wildcard opt in never replaces sender authentication.
   #
-  # THIS IS NOT SENDER AUTHENTICATION. It filters on the `From` header, which the
-  # sender controls. It is meaningful only for domains that publish an enforcing
-  # DMARC policy (p=quarantine or p=reject); a domain with no DMARC record, or
-  # p=none, remains spoofable and adding it here buys nothing.
-  #
-  # The real filtering happens upstream: AgentMail drops hard authentication
-  # failures and excludes spam, blocked and unauthenticated mail from list
-  # results by default, and the adapter asks for that exclusion explicitly on
-  # every poll rather than relying on the default. The `labels` check behind it
-  # is defense in depth and should never fire on a correct install. See
-  # apps/mail-adapter/README.md for the AgentMail key permissions the operator
-  # should also turn off.
+  # AgentMail exposes no trusted positive aligned verdict and guarantees neither
+  # header provenance nor stripping. Its inbound handling permits DMARC failure
+  # under p=none. Labels, missing rejection labels and provider supplied headers
+  # cannot authenticate the sender, so every current AgentMail message is refused
+  # with authentication_unverifiable before starting a turn or resolving approval.
+  # Provider include_* exclusions remain explicit but do not satisfy this gate.
+  # See apps/mail-adapter/README.md for the provider evidence and config contract.
   allowedSenders: []
+  allowAllSenders: false
   agentmail:
     # AgentMail API key. Never generated by the chart: a random value would be
     # sent to a third party as a bearer token and fail auth in a way that looks
@@ -1916,6 +2196,14 @@ worker:
     bucket: curie-workspaces
     cloneVolumeSize: 4Gi
     mountPath: /var/lib/curie/workspaces
+    # Workspace recovery capture (ADR 0251). Off by default. Enabling it keeps
+    # a checkpoint of a terminated turn's workspace for 24 hours and requires
+    # maxBytes, a positive installation-wide cap that counts every recovery
+    # byte; the render fails without it. The API also receives
+    # maxArchiveBytes above so its ledger matches the worker's limit.
+    recovery:
+      enabled: false
+      maxBytes: null
   # Inbound channel attachments (#2567). The worker downloads a referenced file
   # with the channel bot token (Slack) or from the adapter that sent it, with
   # that adapter's adapterCredentials secret (any other kind, ADR-0153), parks
@@ -1939,7 +2227,16 @@ worker:
     # not refuse). Gates agentSandbox.runner.attachments too; that key is only a
     # sandbox-side sub-gate and cannot turn the lane on by itself.
     enabled: false
-    # Per-file ceiling, enforced while streaming in the worker (nothing is
+    # Explicit opt-in. Lazy mode requires compatible API/worker/runner images.
+    mode: eager
+    broker:
+      port: 8093
+      maxConcurrent: 8
+      transferTimeoutSeconds: 300
+
+    # Legacy eager-only per-file ceiling. Lazy catalog entries and selected
+    # transfers ignore this policy; finite cache/resource capacity still applies.
+    # Enforced while streaming in the eager worker (nothing is
     # buffered past the crossing chunk) and again in the init container. A zero
     # is refused rather than read as "unlimited".
     maxFileBytes: 33554432
@@ -1949,6 +2246,16 @@ worker:
     # How long the parked bytes are retained so a redelivery of the same turn can
     # still fetch them. Swept by the worker's existing reap_orphans tick.
     retentionTtlSeconds: 3600
+    # Legacy eager-only budgets (ADR 0205 decision 7). Lazy catalogs do not
+    # filter by these byte budgets. In eager mode every boot rebuilds the thread's whole
+    # file set, so it is bounded per thread, separately from the per-message
+    # cap. Over either bound the newest files are kept and the omitted ones are
+    # named to the agent. threadMaxBytes must fit
+    # agentSandbox.runner.attachments.sizeLimit (the chart refuses to render
+    # otherwise), and the set has to arrive within that block's
+    # fetchTimeoutSeconds.
+    threadMaxFiles: 20
+    threadMaxBytes: 268435456
   publication:
     enabled: true
     # Short-lived Jobs and their scoped token Secret live outside the platform
@@ -1967,55 +2274,9 @@ worker:
     # Each entry matches that exact path and anything under it. The worker
     # receives the list as a JSON array, so a path may contain a comma.
     protectedPaths: []
-    # GitHub publishes these address sets from https://api.github.com/meta.
-    # Override for GitHub Enterprise or refresh when GitHub changes the set.
-    githubHttpsCidrs:
-      - 192.30.252.0/22
-      - 185.199.108.0/22
-      - 140.82.112.0/20
-      - 143.55.64.0/20
-      - 2a0a:a440::/29
-      - 2606:50c0::/32
-      - 20.201.28.151/32
-      - 20.201.28.148/32
-      - 20.205.243.166/32
-      - 20.205.243.168/32
-      - 20.87.245.0/32
-      - 20.87.245.6/32
-      - 4.237.22.38/32
-      - 4.237.22.34/32
-      - 4.228.31.150/32
-      - 4.228.31.149/32
-      - 20.207.73.82/32
-      - 20.207.73.85/32
-      - 20.27.177.113/32
-      - 20.27.177.116/32
-      - 20.200.245.247/32
-      - 20.200.245.245/32
-      - 20.175.192.147/32
-      - 20.175.192.149/32
-      - 20.233.83.145/32
-      - 20.233.83.146/32
-      - 20.29.134.23/32
-      - 20.29.134.17/32
-      - 20.199.39.232/32
-      - 20.199.39.228/32
-      - 20.217.135.5/32
-      - 20.217.135.0/32
-      - 4.225.11.194/32
-      - 4.225.11.201/32
-      - 4.208.26.197/32
-      - 4.208.26.200/32
-      - 20.26.156.215/32
-      - 20.26.156.210/32
-      - 172.182.252.133/32
-      - 172.182.252.137/32
-      - 4.249.131.164/32
-      - 4.249.131.166/32
-      - 48.202.248.40/32
-      - 48.202.248.39/32
-      - 48.204.201.5/32
-      - 48.204.201.2/32
+    # Opt in to new third-party dependency names in manifests and lockfiles.
+    # Applies to every publication in this install, including factory work.
+    allowDependencyAdditions: false
     # Empty derives release-scoped `<fullname>-publication` names.
     serviceAccountName: ""
     ownerName: ""
@@ -2117,6 +2378,13 @@ worker:
   # bounds an unconfigured agent. Raising these defaults raises rendered
   # termination grace to budget + reserve (10860) for every install.
   deliveryBudgetSeconds: 10800
+  # Optional cron claim lease, rendered as CURIE_HOOK_CLAIM_LEASE_S on the API
+  # and the worker from this one value. Null or omitted leaves the variable
+  # unset, so each process uses its delivery budget. A positive number with no
+  # chart maximum, matching the released worker. The process refuses a lease
+  # shorter than the delivery budget at boot. There is no cross-field check
+  # in the schema.
+  hookClaimLeaseSeconds: null
   # Positive per-request ceiling for runner work within the overall delivery
   # budget. Must be at most 10800 seconds and no greater than
   # deliveryBudgetSeconds; fractional seconds are supported. values.schema.json
@@ -2194,13 +2462,17 @@ worker:
     # Size it to span the expected rollout: the flag is what keeps replacement
     # Pods from reclaiming mid-roll.
     quiesceTtlSeconds: 1800
+    # Shared by drain, attest and release. Worker dependency imports peaked at
+    # approximately 148Mi in subprocess measurements. Both memory defaults give
+    # more than 2x headroom; size both the request and limit to at least twice
+    # the deployed worker image's measured peak when overriding this block.
     resources:
       requests:
         cpu: 10m
-        memory: 64Mi
+        memory: 384Mi
       limits:
         cpu: 200m
-        memory: 128Mi
+        memory: 384Mi
   # The Slack assistant-thread "shimmer" (#1182): the animated caption Slack
   # shows next to the app's name while a turn runs. On by default -- the
   # placeholder message only changes when the model emits text, so a model that
@@ -2220,27 +2492,26 @@ worker:
   # per-agent behavior-pack load line intact.
   statusText: "is working on your request..."
   # What the receipt beneath a turn's reply shows (ADR-0180), rendered as
-  # CURIE_TURN_RECEIPT. A turn that ran a tool outside the read-only allowlist
-  # ends its reply with a "What I changed:" list of those actions (ADR-0117).
+  # CURIE_TURN_RECEIPT. When enabled, a turn that ran a tool outside the
+  # read-only allowlist ends its reply with a "What I changed:" list (ADR-0117).
   #   all       every action, each saying whether restore information was
-  #             recorded (default)
+  #             recorded
   #   failures  only actions that reported failure, the ones a person must
   #             check before asking again; no receipt when nothing failed
-  #   off       no receipt at all, even when an action failed
+  #   off       no receipt at all, even when an action failed (default)
   # Only the reply changes: every action is still recorded, and a turn that
   # touched anything is still never retried automatically. The schema admits
   # these three values only, because the worker refuses any other at startup.
-  turnReceipt: all
+  turnReceipt: "off"
   # No-Slack egress routing. When non-empty, renders SLACK_API_BASE_URL on the
-  # worker Deployment so its Slack sink uses that global base URL instead of real
-  # Slack. Empty (the default) leaves the worker on real Slack. `curie cluster
+  # gateway Deployment as its default provider endpoint. Empty uses real Slack. `curie cluster
   # message` does not change this value: its synthetic turn carries a per-turn
   # reply endpoint for the command's local Slack Web API stub.
   slackApiBaseUrl: ""
   # ADDITIONAL Slack origins a per-turn reply endpoint may name (ADR-0096
   # D4.4), comma-separated `scheme://host[:port]`. EMPTY (the default) is the
   # production posture: the configured Slack origin (slackApiBaseUrl, or real
-  # Slack) is the only endpoint the worker will send the bot token to, and every
+  # Slack) is the only endpoint the gateway will send the bot token to, and every
   # cross-origin endpoint a turn names is refused before any request.
   #
   # DEV ONLY. `curie cluster message` temporarily adds the exact advertised stub
@@ -2371,15 +2642,16 @@ ui:
 # ---------------------------------------------------------------------------
 preflights:
   # (a) CPU-AVX / ClickHouse-pin check. Runs as a pre-install/pre-upgrade hook
-  # Job on the cluster. Chart defaults require AVX: clickhouse.image.tag 25.12
+  # Job on the cluster. Chart defaults require AVX on x86: clickhouse.image.tag 25.12
   # is required by langfuse.image.tag 3.225.5 and is not SSE4.2-safe. If the
-  # node lacks AVX the Job FAILS unless the operator pins a tag in
+  # x86 node lacks AVX the Job FAILS unless the operator pins a tag in
   # clickhouse.sse42SafeTags -- catching the exit-132 SIGILL before pods
-  # crash-loop. Skipped when clickhouse.deploy is false (BYO ClickHouse).
+  # crash-loop. Native ARM64 passes without x86 AVX; unsupported architectures
+  # fail. Skipped when clickhouse.deploy is false (BYO ClickHouse).
   avxCheck:
     enabled: true
     image: busybox:1.36.1
-    # Test knob: pretend the node has no AVX. With the default 25.12 tag this
+    # Test knob: simulate an x86 node without AVX, including on ARM64. With the default 25.12 tag this
     # exercises the AVX-required failure branch; pin an sse42SafeTags tag to
     # exercise the older-tag override. Never set true in a real install.
     forceNoAvx: false
@@ -2405,16 +2677,26 @@ preflights:
   # runs a CLUSTER-scope NetworkPolicy informer; if its RBAC cannot satisfy that
   # cluster LIST the manager crash-loops and no SandboxClaim ever binds (issue
   # #350). This post-install/upgrade hook Job fails the Helm operation unless the
-  # controller reaches "Starting workers" (all informer caches synced), so an RBAC
-  # regression fails at install, not at first turn. Gated also on
-  # agentSandbox.controller.deploy.
+  # controller logs "Starting workers" or its current Running pod has positive
+  # successful-reconcile metrics (all informer caches synced). Failure logs and
+  # pod restarts take precedence over either signal. The metrics counter survives
+  # startup-log rotation. Gated also on agentSandbox.controller.deploy.
   controllerReady:
     enabled: true
     image: alpine/k8s:1.31.2
-    # Max seconds to wait for the controller to become Available and log
-    # "Starting workers". Sized for a fresh install; an upgrade over a
-    # crash-looping controller may need a manual pod delete + `helm test`.
+    # Max seconds to wait for a stable serving leader, "Starting workers" or
+    # positive successful-reconcile metrics after checking for controller
+    # failures. Sized for a fresh install; an upgrade over a crash-looping
+    # controller may need a manual pod delete + `helm test`.
     timeoutSeconds: 180
+    # How long the current controller pod must have held its leader-election
+    # Lease, while still renewing it, for the gate to accept it as serving
+    # without a fresh startup log (issue #4197). This is what lets an upgrade
+    # that does not restart the controller pass. It must exceed the
+    # controller's 120s cache-sync timeout, after which a manager whose
+    # informers cannot sync exits and loses the lease; the chart refuses
+    # values below 150.
+    stableLeaderSeconds: 180
     resources:
       requests: { cpu: 50m, memory: 64Mi }
       limits: { cpu: 250m, memory: 128Mi }
@@ -2491,23 +2773,105 @@ agentSandbox:
   #   runnerImages:
   #     factory: ghcr.io/acme/factory-runner@sha256:<64 hex>
   runnerImages: {}
+  # Per-agent non-secret runner environment: agent name -> NAME: string map.
+  # Each listed agent gets its own SandboxTemplate and warm pool, including
+  # agents using the platform image. Repository runner templates inherit the
+  # same agent values. Entries are appended to runner.extraEnv; duplicate names
+  # and collisions with chart-owned env or connector secrets are refused.
+  # Environment names use uppercase letters, digits and underscores, starting
+  # with a letter or underscore. Agent names remain lowercase DNS labels.
+  # Quote every value, including empty strings, numbers and booleans.
+  # CURIE_ names, runner credential/proxy names and snapshot sealing keys are
+  # reserved. OTEL_ names are refused here because telemetry egress follows the
+  # global endpoint: configure otelCollector or runner.extraEnv instead.
+  #   runnerEnv:
+  #     dark-factory:
+  #       CLAUDE_CODE_MAX_OUTPUT_TOKENS: "16000"
+  runnerEnv: {}
   # Per-agent workspace ceiling (#3523): agent name -> the sizeLimit of that
-  # agent's `workspace` emptyDir, replacing agentSandbox.runner.workspace.sizeLimit
-  # (default 1Gi) for that agent only. Each listed agent gets its own
-  # SandboxTemplate and warm pool; every other agent keeps the runner default.
-  # A build-heavy agent needs this: a checkout of curie-eng/curie plus the cargo
-  # target directory of `cargo test` for cli/ outgrew a 10Gi workspace and the
-  # pod was evicted. emptyDir usage also counts against the pod's
-  # ephemeral-storage limit, so raise that agent's runner resources
-  # `ephemeral-storage` limit (runner.resources, or the agent's runner
-  # resources) to at least this value plus the home scratch.
+  # agent's `workspace` emptyDir. It beats both agentSandbox.runner.workspace.sizeLimit
+  # and the agent's resource profile workspaceSizeLimit, for that agent only.
+  # Each listed agent gets its own SandboxTemplate and warm pool. emptyDir usage
+  # also counts against the pod's ephemeral-storage limit, so keep the agent's
+  # profile (or explicit runner.resources) ephemeral-storage limit at least
+  # this value plus the home and tmp scratch it actually fills.
   #   workspaceSizeLimits:
   #     dark-factory: 24Gi
   workspaceSizeLimits: {}
+  # Sandbox resource profiles (#4889; ADR-0059: every ceiling is an
+  # operator-overridable value). Agent name -> profile name (a key of
+  # resourceProfiles below). Overrides the derived selection: an agent with
+  # factory.sandboxEgress.<agent>: true while factory.enabled is true uses
+  # `factory`; every other agent, and the generic template, uses `standard`.
+  # Each listed agent gets its own SandboxTemplate and warm pool.
+  #   agentResourceProfiles:
+  #     dark-factory: standard   # opt a factory agent out
+  #     big-builder: factory     # opt any agent in
+  agentResourceProfiles: {}
+  # Complete sandbox envelopes. A profile field applies only where no explicit
+  # value supplies it:
+  #   resources, per pair (cpu, memory, ephemeral-storage): setting either
+  #     agentSandbox.runner.resources.requests.<r> or .limits.<r> takes that pair
+  #     from the generic keys for EVERY template (the unset side from
+  #     `standard`); otherwise the selected profile supplies both sides.
+  #   workspace: workspaceSizeLimits.<agent> > runner.workspace.sizeLimit >
+  #     the profile workspaceSizeLimit.
+  #   writable paths: runner.hardening.writablePathSizeLimit (every path) >
+  #     homeSizeLimit for runner.hardening.home, tmpSizeLimit for /tmp,
+  #     writablePathSizeLimit for any other writablePaths entry.
+  # The render refuses a needed field that resolves to nothing, and a memory or
+  # ephemeral-storage request above its limit (bare integer or Ki/Mi/Gi/Ti
+  # quantities only; other forms are left to the API server).
+  #
+  # factory sizing: the 15Gi workspace, 15Gi home and 4Gi tmp are independent
+  # volume ceilings (15 + 15 + 4 = 34Gi of upper bounds, not reservations); the
+  # 20Gi ephemeral-storage limit is an additional shared bound on all of them,
+  # and the scheduler reserves only the 10Gi request. The 8Gi memory request
+  # equals resourceQuota.hard.requestsMemory, so the default quota admits one
+  # factory sandbox at a time and a node needs 8Gi of unrequested memory to
+  # schedule it. Raise resourceQuota.hard.requestsMemory / limitsMemory per
+  # extra concurrent factory sandbox. Existing pods keep their envelope; a new
+  # sandbox picks up a change.
+  #
+  # apiMemoryLimit is install-wide, not per agent: it is the API container's
+  # memory limit (and the schema-migrate Job's) when api.resources.limits.memory
+  # is unset. The profile is `factory` when factory.enabled is true, else
+  # `standard`. The factory 2Gi is a headroom choice, not a measured need:
+  # after #4895 the factory publication listing over 231 pages peaked near
+  # 170 MB under both 512Mi and 2Gi limits.
+  #
+  # scratchVolume.type is emptyDir (the default) or ephemeral. emptyDir keeps
+  # today's sizeLimit. ephemeral uses that same size as requests.storage on
+  # workspace and the home writable volume only. /tmp and every other writable
+  # path stay emptyDir. Leave storageClassName unset so the cluster default
+  # class is used; an empty class is omitted rather than rendered as "".
+  resourceProfiles:
+    standard:
+      resources:
+        requests: { cpu: 50m, memory: 192Mi, ephemeral-storage: 512Mi }
+        limits: { cpu: "1", memory: 768Mi, ephemeral-storage: 4Gi }
+      workspaceSizeLimit: 1Gi
+      homeSizeLimit: 512Mi
+      tmpSizeLimit: 512Mi
+      writablePathSizeLimit: 512Mi
+      scratchVolume:
+        type: emptyDir
+      apiMemoryLimit: 512Mi
+    factory:
+      resources:
+        requests: { cpu: 50m, memory: 8Gi, ephemeral-storage: 10Gi }
+        limits: { cpu: "2", memory: 8Gi, ephemeral-storage: 20Gi }
+      workspaceSizeLimit: 15Gi
+      homeSizeLimit: 15Gi
+      tmpSizeLimit: 4Gi
+      writablePathSizeLimit: 512Mi
+      scratchVolume:
+        type: emptyDir
+      apiMemoryLimit: 2Gi
   # Agents that get a labeled sandbox template and warm pool so connector
   # ingress can select curietech.ai/agent=<name>. A list of agent name strings.
   # Empty by default. Agents already covered by connectorSecrets, registryEgress,
-  # runnerImages, or workspaceSizeLimits are unchanged.
+  # runnerImages, runnerEnv, or workspaceSizeLimits are unchanged.
   poolAgents: []
   controller:
     # Installs the vendored kubernetes-sigs/agent-sandbox v0.5.0 controller
@@ -2631,7 +2995,10 @@ agentSandbox:
     workspace:
       enabled: true
       mountPath: /workspace
-      sizeLimit: 1Gi
+      # Unset: the agent's resource profile workspaceSizeLimit (standard 1Gi,
+      # factory 15Gi). A value here applies to every agent;
+      # agentSandbox.workspaceSizeLimits.<agent> still wins for that agent.
+      sizeLimit:
       fetchTimeoutSeconds: 45
       extractTimeoutSeconds: 45
     # Inbound attachments arrive the same way a workspace does: a claim-scoped,
@@ -2649,8 +3016,16 @@ agentSandbox:
       mountPath: /attachments
       # ADR-0059 decision 2: every writable emptyDir in the sandbox pod carries
       # a ceiling, so a hostile or broken store cannot fill the node. Sized
-      # above worker.attachments.maxFileBytes x the lane's 10-file set cap.
+      # above worker.attachments.maxFileBytes x the lane's 10-file set cap,
+      # and at least worker.attachments.threadMaxBytes (ADR 0205 decision 7;
+      # the chart refuses a budget this volume cannot hold).
       sizeLimit: 512Mi
+      # The overall deadline for one boot's fetches, current and earlier
+      # files together, on a monotonic clock. Each read's socket timeout is
+      # what is left of it. A current file that misses it refuses the boot; an
+      # earlier one is skipped and named to the agent as unavailable (ADR 0205
+      # decision 6), so a thread's history never lengthens a boot past it. It
+      # must stay inside worker.claimTimeoutSeconds (90 by default).
       fetchTimeoutSeconds: 45
     # Extra env for the runner container, list of {name, value}.
     # Per-workload OTEL_EXPORTER_OTLP_* overrides still win over the
@@ -2714,9 +3089,14 @@ agentSandbox:
     # keeps a node from being overcommitted) and the limit (the periodic-
     # measurement backstop) are required and do different jobs (decision 2);
     # raise either per agent/workload via a values override.
+    #
+    # #4889: the numbers live in agentSandbox.resourceProfiles (standard for
+    # the generic template). Leave a pair unset to take the selected profile's
+    # values; set either side of a pair (e.g. limits.memory) and that pair
+    # applies to EVERY template, its unset side taken from `standard`.
     resources:
-      requests: { cpu: 50m, memory: 192Mi, ephemeral-storage: 512Mi }
-      limits: { cpu: "1", memory: 768Mi, ephemeral-storage: 4Gi }
+      requests: {}
+      limits: {}
     # --- security rails on the runner surface ---
     # Rail 3: container hardening. non-root + read-only rootfs + dropped caps +
     # no privilege escalation + RuntimeDefault seccomp. readOnlyRootFilesystem
@@ -2746,7 +3126,12 @@ agentSandbox:
       # bundleFetch.sizeLimit above: the kubelet samples usage rather than
       # capping writes inline, so this is a fast, attributable backstop (the
       # offending pod is evicted, not the node degraded), not a hard quota.
-      writablePathSizeLimit: 512Mi
+      #
+      # #4889: unset takes the agent's resource profile per path: the `home`
+      # path gets homeSizeLimit, `/tmp` gets tmpSizeLimit, and any other path
+      # gets writablePathSizeLimit. A value here is one ceiling for every path
+      # on every template (the pre-profile semantics).
+      writablePathSizeLimit:
     # Rail 4 (gVisor kernel isolation) is controlled by security.gvisor.mode
     # below -- the effective pod runtimeClassName is computed from that tri-state,
     # not set here.
@@ -2767,6 +3152,9 @@ agentSandbox:
     serviceAccount:
       create: true
       # The runner does not call the K8s API, so its token is not mounted.
+      # Must stay false: the chart refuses any other value at render, and runner
+      # template admission refuses a worker-written template that mounts a
+      # ServiceAccount token (#3842).
       automountToken: false
       # Extra annotations on the runner ServiceAccount. The key-free object
       # store path (#1325) binds the bundle-fetch IAM role here, e.g.
@@ -2777,7 +3165,18 @@ agentSandbox:
       # Scope that role to the bundle bucket, read-only: NetworkPolicy selects
       # pods and not containers, so an identity the bundle-fetch init container
       # can reach is also reachable by the runner, which is prompt-injectable.
+      # The chart refuses a role ARN equal to the api, worker, or langfuse
+      # ServiceAccount's role ARN (#3842). It cannot see the role's IAM policy
+      # or an EKS Pod Identity association, so scoping the role stays yours.
       annotations: {}
+    # Runner template admission (#3842). The worker's SandboxTemplate writes are
+    # admitted only with images the chart itself renders into a runner template:
+    # the runner image, each agentSandbox.runnerImages digest, and the
+    # bundleFetch images when bundleFetch is enabled. List any other image the
+    # worker may write here. Each entry must match ^[A-Za-z0-9][A-Za-z0-9._/:@-]*$
+    # or the render fails naming this key.
+    admission:
+      extraImages: []
 
 # ---------------------------------------------------------------------------
 # Security rails. The four security-boundary rails shipped ON by default. They
@@ -2811,12 +3210,28 @@ security:
     # (169.254.169.254, fd00:ec2::254). `except: []` is refused, an explicit
     # except must cover those addresses, and an IPv4-mapped range such as
     # ::ffff:0:0/96 is refused because no except can carve it.
+    # Every entry (and every BYO egress list) also excepts each private range it
+    # STRICTLY contains: 10.0.0.0/8, 100.64.0.0/10, 169.254.0.0/16,
+    # 172.16.0.0/12, 192.168.0.0/16, fc00::/7, fe80::/10 and the clusterCidrs
+    # below (#3842). So 0.0.0.0/0 on 443 reaches public model APIs but not pods,
+    # Services or VPC hosts. To let the runner reach a private peer (a private
+    # model endpoint, say), list its narrow CIDR as its own entry, e.g.
+    # 10.20.0.5/32: an entry equal to or inside a private range gets no private
+    # except, and NetworkPolicy allows are additive.
     allowedEgress: []
     #  - cidr: 160.79.104.0/23           # e.g. api.anthropic.com
     #    ports: [{ protocol: TCP, port: 443 }]
-    # Also restrict ingress to the runner ACI port from inside the cluster. The
-    # worker dials the claimed sandbox, so ingress is allowed from the release
-    # namespace only. Egress policies do not affect ingress; this adds the lock.
+    # Pod and Service CIDRs that sit OUTSIDE the private ranges above (for
+    # example a cluster using 198.18.0.0/15 or public space for pods). Every
+    # broad runner route that strictly contains one excepts it, like the
+    # built-in private ranges. Each entry must be a valid IPv4 or IPv6 CIDR with
+    # prefix 1 or longer, not IPv4-mapped. Empty by default: most clusters use
+    # private pod and Service ranges already covered.
+    clusterCidrs: []
+    # Also restrict ingress to the runner ACI port from inside the cluster. Only
+    # this release's worker pods dial the claimed sandbox, so ingress is allowed
+    # from those pods only (#3842). Egress policies do not affect ingress; this
+    # adds the lock.
     lockIngress: true
   # Rail: default-deny ingress + scoped-allow around the data tier (Postgres,
   # RustFS, ClickHouse, Valkey). The backing stores hold every credential and all
@@ -2827,6 +3242,10 @@ security:
   # single-tenant single-node dev cluster; matters for the shared/production path.
   dataTierNetworkPolicy:
     enabled: true
+    # @spec docs/superpowers/specs/2026-10-08-mcp-connector-valkey-ingress-optout.md
+    # Keep the existing MCP connector peer by default. Set false only when
+    # connector proxies do not need to reach this release's in-chart Valkey.
+    allowMcpConnectorValkeyIngress: true
   # Default-on ingress isolation for Collector self-metrics. OTLP receivers
   # remain open to platform workloads and external senders on 4317/4318, and
   # the kubelet health probe remains admitted on 13133. The Prometheus endpoint
@@ -2925,13 +3344,13 @@ security:
   # chart credentials once its design pass lands.)
   checkDefaultCredentials: false
   # Auto-generate per-release chart credentials (issue #195). Default false: a
-  # no-override `helm install` generates strong random values for the thirteen
+  # no-override `helm install` generates strong random values for the fourteen
   # chart owned credentials: the backing store passwords, Langfuse
   # salt/encryptionKey/nextauthSecret, the two init credentials, the
-  # api/webhook keys, worker.internalWorkerToken, and
-  # api.approvalChatAttesterSecret. Set true (values-dev.yaml does) for a
-  # deterministic dev/CI render that keeps the published defaults
-  # byte-for-byte. The eleven non init credentials persist via `lookup`, so
+  # api/webhook keys, worker.internalWorkerToken,
+  # api.approvalChatAttesterSecret, and api.remediationAuthorityKey. Set true
+  # (values-dev.yaml does) for a deterministic dev/CI render that keeps the published defaults
+  # byte-for-byte. The twelve non init credentials persist via `lookup`, so
   # `helm upgrade` re-uses them. Their explicit `--set` overrides and per
   # store `existingSecret` values support
   # rotation and recovery. The two Langfuse init credentials are first boot
@@ -2985,10 +3404,13 @@ resourceQuota:
   # that then sit Pending until the claim times out.
   #
   #   quota ceiling = min(sandboxPodCount,
-  #                       requestsCpu    / agentSandbox.runner.resources.requests.cpu,
-  #                       requestsMemory / agentSandbox.runner.resources.requests.memory,
-  #                       limitsCpu      / agentSandbox.runner.resources.limits.cpu,
-  #                       limitsMemory   / agentSandbox.runner.resources.limits.memory)
+  #                       requestsCpu    / per-sandbox requests.cpu,
+  #                       requestsMemory / per-sandbox requests.memory,
+  #                       limitsCpu      / per-sandbox limits.cpu,
+  #                       limitsMemory   / per-sandbox limits.memory)
+  #   where per-sandbox is the generic (standard) envelope: agentSandbox.resourceProfiles.standard
+  #   unless agentSandbox.runner.resources sets the pair. NOTES also reports
+  #   each agent whose profile differs (a factory sandbox requests 8Gi).
   #   (a term whose per-sandbox value is unset or 0 is skipped). With the
   #   shipped defaults: min(50, 4/50m=80, 8Gi/192Mi=42, 8/1=8, 16Gi/768Mi=21)
   #   = 8, so limitsCpu is the binding term.

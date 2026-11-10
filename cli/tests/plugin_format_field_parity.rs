@@ -4,14 +4,14 @@
 // truth: the frozen package's own schema export, not `apps/api/openapi.json`).
 //
 // Reuses the EXACT SAME comparator #691 built
-// (`cli/tests/support/field_parity.rs`, included below via `#[path = ...]`,
+// (`cli/tests/support/field_parity.rs`, imported below from `crate::support`,
 // same as `cli/tests/api_field_parity.rs`). That comparator is generic over
 // "a Rust source, a components.schemas-shaped Value, a mirrors/non_mirrors
 // manifest" -- so the only new work here is (a) wrapping
 // `packages/plugin-format/schema/plugin-format.schema.json`'s `$defs` into the
 // `components.schemas` shape the comparator expects, and (b) running it once
-// per source file (`cli/src/commands.rs`, `cli/src/spec.rs`), since the
-// plugin_format mirrors are split across both, filtering
+// per source file (each file under `cli/src/commands/`, plus `cli/src/spec.rs`),
+// since the plugin_format mirrors are split across them, filtering
 // `cli/plugin-format-mirrors.json`'s entries to each file's own slice.
 //
 // The comparator's own violation-class behavior (MissingField, StaleOmission,
@@ -22,10 +22,10 @@
 // stay fully covered, and the gate's own wiring (schema wrapping + per-file
 // manifest filtering) actually rejects a deliberately introduced drift.
 
-#[path = "support/field_parity.rs"]
-mod field_parity;
+use crate::support::field_parity;
 
 use field_parity::{violations, Violation};
+use quote::ToTokens;
 use serde_json::Value;
 
 // ─── Loaders ─────────────────────────────────────────────────────────────────
@@ -123,27 +123,58 @@ fn mentions_struct(vs: &[Violation], struct_name: &str) -> bool {
         | Violation::StaleOmission { struct_name: s, .. }
         | Violation::SchemaNotFound { struct_name: s, .. }
         | Violation::DuplicateStruct { struct_name: s }
-        | Violation::UnsupportedShape { struct_name: s, .. } => s == struct_name,
-        Violation::MalformedManifestEntry { .. } => false,
+        | Violation::UnsupportedShape { struct_name: s, .. }
+        | Violation::OptionalityMismatch { struct_name: s, .. } => s == struct_name,
+        _ => false,
     })
 }
 
 // ─── Real-tree assertions ────────────────────────────────────────────────────
 
+/// Every source file of the `commands` module, as repo-relative paths. The
+/// handlers are split one command group per file, and a Deserialize mirror may
+/// live in any of them, so the gate sweeps the whole directory.
+fn commands_module_files() -> Vec<String> {
+    let dir = format!("{}/src/commands", env!("CARGO_MANIFEST_DIR"));
+    let mut files: Vec<String> = std::fs::read_dir(&dir)
+        .unwrap_or_else(|e| panic!("read {dir}: {e}"))
+        .map(|entry| {
+            entry
+                .expect("dir entry")
+                .file_name()
+                .to_string_lossy()
+                .into_owned()
+        })
+        .filter(|name| name.ends_with(".rs"))
+        .map(|name| format!("cli/src/commands/{name}"))
+        .collect();
+    files.sort();
+    files
+}
+
 #[test]
-fn commands_rs_has_no_plugin_format_field_parity_violations() {
-    let src = repo_text("cli/src/commands.rs");
+fn commands_module_has_no_plugin_format_field_parity_violations() {
     let schema = plugin_format_schema_as_components();
     let manifest = repo_json("cli/plugin-format-mirrors.json");
-    let scoped = manifest_for_file(&manifest, "cli/src/commands.rs");
-
-    let vs = violations(&src, &schema, &scoped);
+    let files = commands_module_files();
     assert!(
-        vs.is_empty(),
-        "cli/src/commands.rs has drifted from packages/plugin-format/schema/plugin-format.schema.json. \
-         Each entry below is fixed by either adding the field to the struct or declaring the \
-         omission (with a justification) in cli/plugin-format-mirrors.json:\n{vs:#?}"
+        files
+            .iter()
+            .any(|f| f == "cli/src/commands/skill_approvals.rs"),
+        "the commands module sweep found {files:?}; the directory walk is misconfigured"
     );
+
+    for file in files {
+        let src = repo_text(&file);
+        let scoped = manifest_for_file(&manifest, &file);
+        let vs = violations(&src, &schema, &scoped);
+        assert!(
+            vs.is_empty(),
+            "{file} has drifted from packages/plugin-format/schema/plugin-format.schema.json. \
+             Each entry below is fixed by either adding the field to the struct or declaring the \
+             omission (with a justification) in cli/plugin-format-mirrors.json:\n{vs:#?}"
+        );
+    }
 }
 
 #[test]
@@ -159,6 +190,65 @@ fn spec_rs_has_no_plugin_format_field_parity_violations() {
         "cli/src/spec.rs has drifted from packages/plugin-format/schema/plugin-format.schema.json. \
          Each entry below is fixed by either adding the field to the struct or declaring the \
          omission (with a justification) in cli/plugin-format-mirrors.json:\n{vs:#?}"
+    );
+}
+
+#[test]
+fn spec_gate_rejects_an_existing_schema_field_removed_from_the_real_source() {
+    let src = repo_text("cli/src/spec.rs");
+    let mut parsed = syn::parse_file(&src).expect("the real spec source parses");
+    let gate = parsed
+        .items
+        .iter_mut()
+        .find_map(|item| match item {
+            syn::Item::Struct(item) if item.ident == "ApprovalGateSpec" => Some(item),
+            _ => None,
+        })
+        .expect("the real source defines ApprovalGateSpec");
+    let syn::Fields::Named(fields) = &mut gate.fields else {
+        panic!("ApprovalGateSpec has named fields");
+    };
+    let original_count = fields.named.len();
+    fields.named = std::mem::take(&mut fields.named)
+        .into_iter()
+        .filter(|field| field.ident.as_ref().is_none_or(|name| name != "summary"))
+        .collect();
+    assert_eq!(
+        fields.named.len() + 1,
+        original_count,
+        "the mutation must remove exactly ApprovalGateSpec.summary"
+    );
+    let drifted = parsed.to_token_stream().to_string();
+    syn::parse_file(&drifted).expect("the field mutation preserves valid Rust syntax");
+    let schema = plugin_format_schema_as_components();
+    let manifest = repo_json("cli/plugin-format-mirrors.json");
+    let scoped = manifest_for_file(&manifest, "cli/src/spec.rs");
+
+    let vs = violations(&drifted, &schema, &scoped);
+    assert!(
+        has_missing_field(&vs, "ApprovalGateSpec", "summary"),
+        "the real spec gate must reject a missing frozen schema field:\n{vs:#?}"
+    );
+}
+
+#[test]
+fn spec_gate_rejects_a_schema_field_added_without_updating_the_real_source() {
+    let src = repo_text("cli/src/spec.rs");
+    let mut schema = plugin_format_schema_as_components();
+    schema["components"]["schemas"]["ApprovalPolicy"]["properties"]
+        .as_object_mut()
+        .expect("the real ApprovalPolicy schema has properties")
+        .insert(
+            "newPolicyField".into(),
+            serde_json::json!({ "type": "string" }),
+        );
+    let manifest = repo_json("cli/plugin-format-mirrors.json");
+    let scoped = manifest_for_file(&manifest, "cli/src/spec.rs");
+
+    let vs = violations(&src, &schema, &scoped);
+    assert!(
+        has_missing_field(&vs, "ApprovalPolicySpec", "newPolicyField"),
+        "the real spec gate must reject a schema field absent from the Rust mirror:\n{vs:#?}"
     );
 }
 
@@ -250,8 +340,8 @@ fn every_connector_mirror_struct_denies_unknown_fields() {
 #[test]
 fn approval_gate_and_policy_mirrors_stay_fully_covered() {
     // The issue's named drift class hinges on ApprovalGate/ApprovalPolicy
-    // never silently losing coverage across BOTH mirror sites (commands.rs's
-    // runtime read path and spec.rs's authoring-write path). Checked
+    // never silently losing coverage across BOTH mirror sites (the commands
+    // module's runtime read path and spec.rs's authoring-write path). Checked
     // independently of the whole-file sweep so a manifest mistake elsewhere
     // cannot hide a regression here.
     let schema = plugin_format_schema_as_components();
@@ -259,7 +349,7 @@ fn approval_gate_and_policy_mirrors_stay_fully_covered() {
 
     for (file, structs) in [
         (
-            "cli/src/commands.rs",
+            "cli/src/commands/skill_approvals.rs",
             vec!["ApprovalGateDecl", "ApprovalPolicyDecl"],
         ),
         (

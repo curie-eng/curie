@@ -1,0 +1,39 @@
+{
+  "type": "repository",
+  "full_name": "example-workspace/example-repo",
+  "name": "example-repo",
+  "slug": "example-repo",
+  "uuid": "{00000000-0000-4000-8000-000000000001}",
+  "is_private": true,
+  "scm": "git",
+  "mainbranch": {
+    "name": "main",
+    "type": "branch"
+  },
+  "workspace": {
+    "type": "workspace",
+    "slug": "example-workspace",
+    "name": "Example Workspace",
+    "uuid": "{00000000-0000-4000-8000-000000000002}"
+  },
+  "project": {
+    "type": "project",
+    "key": "EX",
+    "name": "Example",
+    "uuid": "{00000000-0000-4000-8000-000000000003}"
+  },
+  "links": {
+    "self": {
+      "href": "https://api.bitbucket.org/2.0/repositories/example-workspace/example-repo"
+    },
+    "html": {
+      "href": "https://bitbucket.org/example-workspace/example-repo"
+    },
+    "clone": [
+      {
+        "name": "https",
+        "href": "https://bitbucket.org/example-workspace/example-repo.git"
+      }
+    ]
+  }
+}

@@ -1,0 +1,9 @@
+REVIEWER: plan-reviewer
+VERDICT: CHANGES
+- AC2 (blocking): no edit writes a header row. Step 1 only writes one row per widget. Change export_csv so it writes a header row naming each column before the widget rows.
+- AC2 (blocking): no test or verification row covers the header. Add a test in tests/test_export.py, for example test_export_header, that asserts the first row names each column. Then add an AC2 row to the verification table that runs it with python -m pytest.
+OPEN QUESTIONS:
+- none
+VERIFICATION:
+- AC1: sandbox python -m pytest tests/test_export.py
+- AC2: refused the plan has no edit, test or verification row for the header row

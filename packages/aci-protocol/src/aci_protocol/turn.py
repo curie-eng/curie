@@ -278,6 +278,13 @@ class HookRunRef(_AciModel):
     slot_utc: str
 
 
+class PrincipalRef(_AciModel):
+    """Initiating principal provenance. @spec INITIATING-PRINCIPAL-1"""
+
+    principal_id: str
+    authorization_version: int
+
+
 class QueuedTurn(_AciModel):
     """A normalized inbound turn ready for the worker to route and run.
 
@@ -320,6 +327,11 @@ class QueuedTurn(_AciModel):
     and one that does not drops it. It defaults to ``None``, today's
     unrestricted turn, so a pre-upgrade producer keeps decoding unchanged. No
     first-party ingress sets it.
+
+    ``author_principal`` is the initiating subject admission resolved ``author``
+    to (INITIATING-PRINCIPAL-1). ``author`` keeps its existing meaning. The
+    executing actor, the agent, is never this principal. This is provenance,
+    not authority: neither its presence nor its absence grants anything.
     """
 
     event_id: str
@@ -332,6 +344,7 @@ class QueuedTurn(_AciModel):
     attachments: list[Attachment] = []
     hook_run: HookRunRef | None = None
     tool_access: ToolAccess | None = None  # @spec TOOL-ACCESS-1 TOOL-ACCESS-2
+    author_principal: PrincipalRef | None = None  # @spec INITIATING-PRINCIPAL-1
 
     @model_validator(mode="after")
     def _validate_targetless_cron_identity(self) -> "QueuedTurn":

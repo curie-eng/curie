@@ -1,0 +1,3 @@
+docker: Error response from daemon: authorization denied by plugin curie-authz: refused by rule security-opt: HostConfig.SecurityOpt "seccomp=unconfined"
+
+Run 'docker run --help' for more information

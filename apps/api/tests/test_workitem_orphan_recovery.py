@@ -9,6 +9,10 @@ claims termination, reads the stored claim and sandbox names, tears them down
 through the substrate, and records the observation. Only the substrate (the
 cluster) is faked. The runtime lease is a few seconds and the whole recovery
 must finish inside it.
+
+Settling the lost request admits its successor (ADR 0206). The reconciler wakes
+the successor; a redelivered wake for the lost request is refused by the real
+worker client's acquire, and the successor is acquired exactly once.
 """
 
 from __future__ import annotations
@@ -25,19 +29,32 @@ import pytest
 import redis
 import redis.asyncio as aredis
 from aci_protocol import STREAM_PAYLOAD_FIELD, QueuedTurn
+from channel_protocol.work_item_events import execute_event_id
 from curie_api.config import get_settings
 from curie_api.main import create_app
 from curie_api.workitem_reconciler import WorkItemReconciler
+from curie_worker.binding import FactoryWake
 from curie_worker.config import WorkerConfig
-from curie_worker.kernel import Kernel
+from curie_worker.consumer_liveness import ConsumerLivenessStore, ThreadLockOwnerLiveness
+from curie_worker.kernel.core import Kernel
 from curie_worker.markers import Markers
 from curie_worker.runner_client import RunnerClient
 from curie_worker.threadlock import ThreadLock
-from curie_worker.workitem_dispatch import TerminationObservation, WorkItemDispatchClient
+from curie_worker.workitem_dispatch import (
+    TerminationObservation,
+    WorkItemConflict,
+    WorkItemDispatchClient,
+)
 from curie_worker.workitem_orphans import WorkItemOrphanSweeper
 from fastapi.testclient import TestClient
+from forge_fakes import factory_wake
 from sqlalchemy import text
-from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
+from sqlalchemy.ext.asyncio import (
+    AsyncEngine,
+    AsyncSession,
+    async_sessionmaker,
+    create_async_engine,
+)
 
 WORKER_TOKEN = "work-item-orphan-worker-token"
 REPO = "acme-corp/acme-bot"
@@ -124,10 +141,19 @@ def _admit(api: TestClient, auth_headers: dict[str, str]) -> uuid.UUID:
         "kind": "slack",
         "address": ADDRESS,
         "reply_conversation_id": "1700000000.000100",
-        "repo_full_name": REPO,
-        "github_repository_id": 101,
-        "github_issue_number": 3076,
-        "github_installation_id": 202,
+        "tracker": {
+            "kind": "github",
+            "host": "github.com",
+            "scope_id": "101",
+            "issue_id": "3076",
+        },
+        "repository": {
+            "code_host_kind": "github",
+            "host": "github.com",
+            "project_id": "101",
+            "path": REPO,
+        },
+        "code_host_installation_id": 202,
         "objective": "Recover the orphaned run",
         "requester": "U0REQUEST1",
         "request_id": str(uuid.uuid4()),
@@ -149,6 +175,12 @@ def _async_valkey() -> aredis.Redis:
         password=s.valkey_password or None,
         decode_responses=True,
     )
+
+
+async def _request_wake(engine: AsyncEngine, request_id: uuid.UUID) -> FactoryWake:
+    async with AsyncSession(engine) as session:
+        wake = await factory_wake(session, request_id)
+        return FactoryWake.model_validate(wake.model_dump())
 
 
 def _kernel(name: str, cluster: _Cluster, client: WorkItemDispatchClient, valkey: Any) -> Kernel:
@@ -199,13 +231,17 @@ async def _recover(app: Any, request_id: uuid.UUID, old: str) -> dict[str, Any]:
                 api_base_url="http://api", worker_token=WORKER_TOKEN, client=http
             )
             # The old incarnation acquires and starts, then dies.
-            await client.acquire(request_id, owner=old, generation=1)
+            request_wake = await _request_wake(engine, request_id)
+            acquired = await client.acquire(
+                request_id, owner=old, generation=1, wake=request_wake, context=None,
+            )
             await client.start(
                 request_id,
                 owner=old,
                 generation=1,
                 claim_name=CLAIM_NAME,
                 sandbox_name=SANDBOX_NAME,
+                context=acquired.context,
             )
 
             # The restarted process: same name, a fresh kernel holding nothing.
@@ -216,15 +252,13 @@ async def _recover(app: Any, request_id: uuid.UUID, old: str) -> dict[str, Any]:
             await reconciler._publish_terminate_wakes()
             wakes_before = await _published_turns(valkey)
 
-            liveness_calls: list[str] = []
-
-            async def liveness(owner: str) -> bool:
-                liveness_calls.append(owner)
-                return False
-
             sweeper = WorkItemOrphanSweeper(
                 client,
-                liveness,
+                ThreadLockOwnerLiveness(
+                    ConsumerLivenessStore(valkey),
+                    stream=kernel._config.stream,
+                    group=kernel._config.consumer_group,
+                ),
                 self_name=old,
                 locally_owned=kernel.owns_work_item,
                 absence_proof_s=3600.0,
@@ -251,18 +285,66 @@ async def _recover(app: Any, request_id: uuid.UUID, old: str) -> dict[str, Any]:
             for wake in wakes:
                 await kernel.process_event(wake)
             final = await client.get_request(request_id)
+            elapsed = time.monotonic() - started_at
+
+            # ADR 0206: the settlement admitted a successor on the same WorkItem.
+            async with AsyncSession(engine) as session:
+                successors = [
+                    tuple(row)
+                    for row in await session.execute(
+                        text(
+                            "SELECT s.id, s.status, s.dispatch_generation "
+                            "FROM curie.execution_requests s "
+                            "JOIN curie.execution_requests l ON l.work_item_id = s.work_item_id "
+                            "WHERE l.id = :id AND s.id <> l.id ORDER BY s.sequence"
+                        ),
+                        {"id": request_id},
+                    )
+                ]
+            # The SQL dispatch path wakes it; nothing else publishes (ADR 0157).
+            await reconciler._publish_execute_wakes()
+            redispatched = (await _published_turns(valkey))[len(wakes) :]
+            # A redelivered wake for the lost request reaches acquire and is refused.
+            lost_refusal: str | None = None
+            try:
+                await client.acquire(
+                    request_id, owner=old, generation=1, wake=request_wake, context=None,
+                )
+            except WorkItemConflict as exc:
+                lost_refusal = exc.code
+            successor_grant = None
+            duplicate_refusal: str | None = None
+            if len(successors) == 1:
+                successor_id, _status, generation = successors[0]
+                successor_wake = await _request_wake(engine, successor_id)
+                successor_grant = await client.acquire(
+                    successor_id, owner=old, generation=generation,
+                    wake=successor_wake, context=None,
+                )
+                try:
+                    await client.acquire(
+                        successor_id, owner=f"{old}-peer", generation=generation,
+                        wake=successor_wake, context=None,
+                    )
+                except WorkItemConflict as exc:
+                    duplicate_refusal = exc.code
     finally:
         if kernel is not None:
             await kernel._runner.close()
         await valkey.aclose()
         await engine.dispose()
     return {
-        "elapsed": time.monotonic() - started_at,
+        "elapsed": elapsed,
         "wakes_before": wakes_before,
         "declared": declared,
         "wakes": wakes,
         "cluster": cluster,
         "final": final,
+        "successors": successors,
+        "redispatched": redispatched,
+        "lost_refusal": lost_refusal,
+        "successor_grant": successor_grant,
+        "duplicate_refusal": duplicate_refusal,
     }
 
 
@@ -311,13 +393,39 @@ def test_restarted_worker_recovers_its_orphaned_run(
     assert f"claims={CLAIM_NAME}" in observation
     assert f"sandboxes={SANDBOX_NAME}" in observation
     assert observation.endswith(f"observer={old}")
+
+    # ADR 0206: exactly one successor waits, flagged as the owner_lost retry.
+    successors = result["successors"]
+    assert len(successors) == 1, successors
+    successor_id, successor_status, generation = successors[0]
+    assert successor_status == "waiting"
+    retry_rows = asyncio.run(
+        _db("SELECT owner_lost_retry FROM curie.execution_requests WHERE id = :id", successor_id)
+    )
+    [(retry,)] = [tuple(r) for r in retry_rows]
+    assert retry is True
+    # The reconciler published the successor's execute wake and nothing else.
+    redispatched = result["redispatched"]
+    assert [w.event_id for w in redispatched] == [execute_event_id(successor_id, generation)]
+    assert (redispatched[0].text, redispatched[0].author) == (
+        "Recover the orphaned run",
+        "U0REQUEST1",
+    )
+    assert result["lost_refusal"] == "not_dispatchable"
+    grant = result["successor_grant"]
+    assert grant is not None
+    assert grant.generation == generation
+    assert result["duplicate_refusal"] == "duplicate"
+
+    # The lost request's notice is still owner_lost; the successor has its own row.
     notices = asyncio.run(
         _db(
-            "SELECT terminal_cause FROM curie.factory_terminal_notices "
-            "WHERE execution_request_id = :id",
+            "SELECT execution_request_id, terminal_cause FROM curie.factory_terminal_notices "
+            "WHERE work_item_id = "
+            "(SELECT work_item_id FROM curie.execution_requests WHERE id = :id)",
             request_id,
         )
     )
-    assert [r[0] for r in notices] == ["owner_lost"]
+    assert {r[0]: r[1] for r in notices} == {request_id: "owner_lost", successor_id: None}
     # Recovery never waited for the runtime lease to lapse.
     assert result["elapsed"] < RUNTIME_TTL_S

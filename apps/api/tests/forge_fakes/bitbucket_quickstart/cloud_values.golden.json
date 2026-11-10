@@ -1,0 +1,199 @@
+{
+  "codeHosts": [
+    {
+      "name": "bitbucket",
+      "kind": "bitbucket_cloud",
+      "host": "bitbucket.org",
+      "apiUrl": "https://api.bitbucket.org/2.0",
+      "credential": {
+        "type": "static_token",
+        "existingSecret": "curie-bitbucket-token",
+        "existingSecretKey": "token"
+      },
+      "egress": [
+        {
+          "cidr": "104.192.136.0/21",
+          "ports": [
+            {
+              "protocol": "TCP",
+              "port": 443
+            }
+          ]
+        },
+        {
+          "cidr": "185.166.140.0/22",
+          "ports": [
+            {
+              "protocol": "TCP",
+              "port": 443
+            }
+          ]
+        },
+        {
+          "cidr": "2401:1d80:3000::/36",
+          "ports": [
+            {
+              "protocol": "TCP",
+              "port": 443
+            }
+          ]
+        },
+        {
+          "cidr": "104.192.138.0/24",
+          "ports": [
+            {
+              "protocol": "TCP",
+              "port": 443
+            }
+          ]
+        },
+        {
+          "cidr": "104.192.139.0/24",
+          "ports": [
+            {
+              "protocol": "TCP",
+              "port": 443
+            }
+          ]
+        },
+        {
+          "cidr": "104.192.141.0/24",
+          "ports": [
+            {
+              "protocol": "TCP",
+              "port": 443
+            }
+          ]
+        },
+        {
+          "cidr": "2401:1d80:32fd::/48",
+          "ports": [
+            {
+              "protocol": "TCP",
+              "port": 443
+            }
+          ]
+        },
+        {
+          "cidr": "2401:1d80:32fe::/48",
+          "ports": [
+            {
+              "protocol": "TCP",
+              "port": 443
+            }
+          ]
+        },
+        {
+          "cidr": "2401:1d80:32ff::/48",
+          "ports": [
+            {
+              "protocol": "TCP",
+              "port": 443
+            }
+          ]
+        },
+        {
+          "cidr": "13.35.248.0/24",
+          "ports": [
+            {
+              "protocol": "TCP",
+              "port": 443
+            }
+          ]
+        },
+        {
+          "cidr": "13.227.180.0/24",
+          "ports": [
+            {
+              "protocol": "TCP",
+              "port": 443
+            }
+          ]
+        },
+        {
+          "cidr": "13.227.213.0/24",
+          "ports": [
+            {
+              "protocol": "TCP",
+              "port": 443
+            }
+          ]
+        },
+        {
+          "cidr": "13.200.41.128/25",
+          "ports": [
+            {
+              "protocol": "TCP",
+              "port": 443
+            }
+          ]
+        },
+        {
+          "cidr": "104.192.137.0/24",
+          "ports": [
+            {
+              "protocol": "TCP",
+              "port": 443
+            }
+          ]
+        },
+        {
+          "cidr": "104.192.143.0/24",
+          "ports": [
+            {
+              "protocol": "TCP",
+              "port": 443
+            }
+          ]
+        },
+        {
+          "cidr": "185.166.143.0/24",
+          "ports": [
+            {
+              "protocol": "TCP",
+              "port": 443
+            }
+          ]
+        },
+        {
+          "cidr": "185.166.142.0/24",
+          "ports": [
+            {
+              "protocol": "TCP",
+              "port": 443
+            }
+          ]
+        },
+        {
+          "cidr": "104.192.142.0/24",
+          "ports": [
+            {
+              "protocol": "TCP",
+              "port": 443
+            }
+          ]
+        },
+        {
+          "cidr": "104.192.140.0/24",
+          "ports": [
+            {
+              "protocol": "TCP",
+              "port": 443
+            }
+          ]
+        }
+      ]
+    }
+  ],
+  "repo": {
+    "alias": "example-repo",
+    "codeHost": "bitbucket",
+    "projectId": "{00000000-0000-4000-8000-000000000001}",
+    "path": "example-workspace/example-repo"
+  },
+  "reviewFeedbackAllowlist": {
+    "bitbucket": [
+      "example-account-1"
+    ]
+  }
+}

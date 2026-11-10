@@ -37,7 +37,12 @@ PY
 render() {
   local name="$1" chart="$2"
   shift 2
-  helm template rel "$chart" --output-dir "$TMP/render-$name" "$@" >/dev/null
+  # Independent offline renders cannot retain generated credentials through
+  # lookup. Keep Secret content deterministic so complete pod-template
+  # comparisons measure metadata and intentional input changes, including
+  # checksum/secret, rather than fresh sealed-install randomness.
+  helm template rel "$chart" --set security.allowDevDefaults=true \
+    --output-dir "$TMP/render-$name" "$@" >/dev/null
 }
 
 CHART_VERSION_COPY="$TMP/chart-version"

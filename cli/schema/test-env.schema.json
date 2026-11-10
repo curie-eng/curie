@@ -1,0 +1,22 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.curietech.ai/cli/test-env/v1.json",
+  "title": "curie dev test-env run --json",
+  "description": "The isolated backing service identity, actual published ports, child exit code and verified cleanup result. Child output is written to stderr.",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "profile": { "type": "string" },
+    "project": { "type": "string" },
+    "ports": {
+      "type": "object",
+      "additionalProperties": { "type": "integer", "minimum": 1, "maximum": 65535 }
+    },
+    "networks": { "type": "array", "items": { "type": "string" } },
+    "child_exit_code": { "type": ["integer", "null"] },
+    "cleanup_verified": { "type": "boolean" },
+    "error": { "type": "string" },
+    "signal": { "type": "integer" }
+  },
+  "required": ["profile", "project", "ports", "networks", "child_exit_code", "cleanup_verified"]
+}

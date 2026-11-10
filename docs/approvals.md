@@ -92,6 +92,13 @@ valid; assigning two distinct grantable tools to one route is rejected as
 single-valued rather than letting a model-selected request decide which tool receives the
 one-shot allowance.
 
+A grantable route whose tool is on a hosted connector behind the caller proxy is the
+exception. The proxy forwards a gated call only with a grant bound to its exact arguments,
+and a policy approval carries none, so the approved call could never run. The runner
+refuses that `request_approval` in-turn, before any card, and tells the model to call the
+tool directly. The permission gate then holds the call with its arguments on the card, and
+the resume grant is bound to them. It is still one approval.
+
 View what a bundle declares, offline and with no credential:
 
 ```bash
@@ -147,7 +154,7 @@ Three independent axes, and keeping them separate is the point:
   members are the approvers, which is the zero-setup default. Notification recipients never
   become approvers merely by receiving the ping.
 
-A Slack notification can use the worker's default transport. Any other notification kind
+A Slack notification can use the gateway's default Slack identity. Any other notification kind
 must store both `endpoint` and `adapter`; those transport details are write-only and are
 redacted from API and `--list-routes` output. The target's `kind` and `address` remain visible.
 A fixed resolution target stays Slack-only, and a notification never resolves anything.
@@ -163,13 +170,38 @@ the channel the card lands on:
 
 - **In Slack**, nothing changes: the channel's members, the route's user group, or its
   listed users, exactly as for any Slack card.
-- **Anywhere else**, such as an email thread, only the person who asked may answer, by
-  replying in that conversation through the channel's adapter. People copied on the thread
-  cannot answer, and neither can an operator token, a console session or a Slack click.
-  This is the requester confirming their own request, not a second person's sign-off. A
-  route that lists `approvers` and would land on such a conversation is escalated when the
-  approval is raised, because approver lists name Slack users that nobody there can prove
-  to be yet. A bot that needs a second person's sign-off keeps a fixed Slack route.
+- **In an email thread**, only an address on the route's approver list may answer
+  ([ADR-0177 amendment](adr/0177-an-approval-is-answered-where-it-was-asked-including-by-email.md#amendment-email-approver-lists)). The list
+  is `approvers.emails`, separate from the binding's `allowed_callers`: being allowed to
+  talk to the bot is not being allowed to approve what it does. A reply counts only when
+  the mail adapter verified its sender (the same SPF, DKIM and DMARC check it applies to
+  every message), the binding's `allowed_callers` admit that sender, and the verified
+  address is on the list. The match is exact apart from case. Anyone on the list may
+  answer, including the person who asked only if their own address is listed. An operator
+  token, a console session and a Slack click cannot answer an email card.
+- **With no list, nobody answers by email.** A routeless approval, or a route that lists
+  no `emails`, raised in an email thread is escalated when it is raised instead of creating
+  an approval that can only expire. So is a route that lists only Slack `users` or a
+  `group`, since nobody on an email thread can prove to be one. Any other non-Slack channel
+  has no approver list it can verify yet, so its approvals admit nobody.
+- **The requester adds approvers** (ADR-0177 amendment A5). The request email names the route's listed addresses. If one of them is already on the thread (the person who asked, or the To or Cc of the asking message), it says they can answer. If none is, it asks the requester to reply all and add one or more of them, as many as they like. The first answer the platform accepts is final, and later answers are told it was already answered. A listed requester may approve their own request, as on Slack. The request email and the outcome are sent reply all, the requester always gets the outcome, and the bot never emails an approver who is not on the thread. The worker passes the listed addresses to the adapter as the card's `Approver` fields, for wording only.
+
+`emails` is allowed only on a `requesting_surface` route, and may sit beside `users` or
+`group`: a card shown in Slack reads only the Slack entries, and a card shown in email
+reads only `emails`. A Slack card whose route lists only `emails` admits nobody. For
+example, in a `--routes-from` file:
+
+```json
+{
+  "confirm": {
+    "resolution": { "mode": "requesting_surface" },
+    "approvers": {
+      "users": ["U0123ABCD"],
+      "emails": ["approver@example.com", "second.approver@example.com"]
+    }
+  }
+}
+```
 
 An adapter answers only approvals whose card went to one of its own bindings. Until a
 channel's adapter renders the Approve and Reject request and reads the replies, its
@@ -214,6 +246,61 @@ curie local approvals my-agent --routes-from approval-routes.json
 curie local approvals my-agent --list-routes
 ```
 
+A route's optional `expires_in_seconds` selects its decision deadline. An integer
+from 1 to 315,360,000 seconds (ten years) chooses that duration; explicit JSON null
+chooses no deadline. Omit the field to keep the producer's duration, including its
+existing null meaning.
+Session requests default to 24 hours when the route has no override. Booleans,
+zero, negative values and fractional numbers are refused. The API freezes the
+chosen deadline at creation, so retries and later route edits do not move it.
+Publication and remediation keep their independent deadline policies.
+
+Set route `remind_every_s` to a positive integer to receive periodic reminders
+under the existing approval card. Omission or null disables reminders. The API
+freezes the interval and first due time at creation; route edits affect future
+approvals. Reminders and decision deadlines are independent. After an outage,
+the next interval starts from the sweeper's current database time rather than
+replaying missed intervals. A claimed reminder can be lost if publication fails;
+a later due interval remains scheduled. Redelivery after an uncertain send can
+produce another non-interactive reply.
+
+Roll out reminders in this order:
+
+1. Deploy compatible API readers, workers and mail adapters everywhere while
+   `CURIE_APPROVAL_REMINDERS_ENABLED` remains false. Every consumer in the runs
+   group must understand reminder entries before publication is enabled.
+2. Configure `remind_every_s` only after all API and worker route readers are
+   compatible. Older readers refuse this key. Complete pending reference
+   retention as described below.
+3. Enable `CURIE_APPROVAL_REMINDERS_ENABLED=true` on the API replicas. A disabled
+   API neither claims nor publishes reminders. The existing approval sweeper
+   interval controls how often due reminders are checked.
+
+For rollback, disable publication on every API replica, wait for those replicas
+to finish their current sweep, and drain all reminder entries through compatible
+workers in the runs group, including pending deliveries. Remove the route key
+before restoring incompatible API or worker readers. Keep compatible reference
+owners until pending approvals settle. Do not restore old workers while reminder
+entries remain available to that consumer group.
+
+Reminders reuse the card's stored transport, endpoint, identity and thread. They
+perform no eligibility lookup and contain no approval action or new email answer
+reference. Email reminders reply to the original thread participants and can be
+sent after the original turn has completed;
+answers still use the original live reference and ordinary signed sender proof.
+Missing card destinations are logged and skipped, and never create a new card.
+The CLI cluster-message relay skips reminders because its bounded reply bucket
+must retain capacity for the resumed answer. Use a fixed-channel or email card
+for reminder delivery.
+
+Deploy compatible API readers and workers before writing deadline keys. Complete
+the [reference-retention rollout](../apps/worker/README.md#approval-deadline-and-reference-retention-rollout)
+so pending cards, notices and reply-placement references survive the whole pending
+lifetime. Terminal settlement starts a fresh 14-day retention window before card
+delivery; failed edits keep their references within that window. A no-deadline
+request still needs current answer authority. Removing its route can strand it
+until the binding is restored or an operator rejects it through recovery.
+
 The strict `--routes-from` JSON uses the complete binding shape shown above and is the only
 way to declare a notification, including the `endpoint` and `adapter` required for a
 non-Slack target. `--route-resolution` and `--route-approvers` can override resolution and
@@ -229,6 +316,323 @@ declares the route and the preflight still refuses. The retired `--route` flag a
 `channel` JSON key are not accepted. Nothing is written unless every entry parses, so a
 typo cannot leave a half-written map behind.
 
+## Per-request approver selection (ADR 0271)
+
+Some approvals need a different set of approvers each time, chosen by the connector
+that raises them rather than fixed on the route. [ADR 0271](adr/0271-per-request-approver-sets-and-separation-of-duties.md)
+lets an operator register a signing key on one approval route for one connector tool.
+The connector then signs a short-lived ticket naming the approvers for that request.
+The platform checks the ticket when the approval is created. This section covers
+registering and reading back that selector. The wire format of the ticket is in the
+[connector host interface](interfaces/connector-host/INTERFACE.md#per-request-approval-tickets-adr-0271).
+
+Answer and resume authority and separation of duties are enforced. A dynamic approval, and
+a static route that enforces separation, is answered only through the HTTP identity answer
+path, which accepts a Slack answer or an email reply carrying its registered receiver's
+signed answer proof. The legacy approver-set resolution without that proof, and operator
+principals (including the CLI's operator-principal resolution), are refused. On every such
+route the answering human must have a canonical active identity at answer and again at
+resume, and resume requires that same person. For a dynamic approval the answering human
+must also be one of the stored selected approvers, still inside the route's registered
+ceiling (the pinned approver role plus `ceiling.users`), with the registration still present
+for the same connector, tool and key id. A static route that enforces separation has no
+selector: any approver its existing route and role rules admit may answer, subject to the
+separation rules below. A dynamic approval's selection never changes after creation:
+widening the ceiling or changing the connector's source never admits
+someone who was not selected, and revoking a selected person, removing the registration or
+rotating the key refuses.
+
+Requester exclusion is on by default, and omitting `separation` on a selector route excludes.
+The requester is matched as the canonical human (issuer and subject), not a channel alias. A
+member of the route's `exempt_group` who is the requester may answer; removal from the group
+refuses, and a group that cannot be read refuses as 503 `authority_unavailable`. An explicit
+operator opt-out (`separation` with `exclude_requester` false, written through the versioned,
+audited route write) lets an eligible requester approve and records an
+`approval_separation.changed` audit row. An agent-owned write cannot opt out: the access
+policy (`PUT /agents/{id}/access-policy`) refuses a body carrying `separation` or
+`approval_routes`, and the stored separation is unchanged. Operator principals are refused on
+dynamic routes and on static routes
+whose binding enforces separation, before any approver-set shortcut, even when the route
+binds an explicit `approvers.users` list.
+
+Refusals answer 403 `caller_not_allowed` or 503 `authority_unavailable`. Each writes an audit
+row (action `denied` at answer, `resume_refused` at resume) whose evidence names a stable code
+from `apps/api/src/curie_api/approval_selection.py`:
+
+1. Route and registration: `selection_route_missing`, `selection_registration_invalid`,
+   `selection_registration_changed`, `selection_key_revoked`, `separation_policy_invalid`.
+2. Actor and selection: `selection_snapshot_invalid`, `selection_actor_not_canonical`,
+   `selection_actor_not_selected`, `selection_actor_outside_ceiling`, `selection_actor_changed`
+   (the person at resume is not the one sealed with the answer).
+3. Separation: `separation_requester_unknown`, `separation_actor_unknown`,
+   `separation_requester_excluded`, `separation_exemption_unavailable` (the 503 case).
+
+A dynamic approval's card, the pending notice and the API's `display_summary` describe the
+tool and arguments the platform stored at creation, with the `approval_ticket` left out of
+the preview. A bundle's gate summary or the model's wording never replaces them. When an
+approved call runs, the connector proxy spends its grant once and passes the grant id to
+the connector as `X-Curie-Grant-Verified`, so a connector can refuse an execution call that
+was not approved.
+
+### Registering a selector
+
+Registration is part of the route binding. Add `approver_ticket` (and optionally
+`separation`) to the route in the JSON you pass to `--routes-from`:
+
+```json
+{
+  "approval_routes": {
+    "ledger_post": {
+      "resolution": { "kind": "slack", "address": "C0EXAMPLE1" },
+      "approver_ticket": {
+        "connector": "ledger",
+        "tool": "post_entry",
+        "key_id": "ledger-selector-1",
+        "public_key": "<unpadded base64url of a 32-byte Ed25519 public key>",
+        "ceiling": {
+          "approver_role_version": 4,
+          "users": [
+            { "issuer": "https://idp.example.test", "subject": "alice@example.test" }
+          ]
+        }
+      },
+      "separation": { "exclude_requester": true }
+    }
+  }
+}
+```
+
+```bash
+curie cluster approvals my-agent --routes-from routes.json
+curie cluster approvals my-agent --routes-from routes.json --routes-expected-version 5
+```
+
+`ceiling.users` is optional (1 to 128 unique entries) and narrows the pinned role to
+those exact people. `connector` is the declared hosted connector name, and `tool` is the
+exact upstream tool name. The key is the public half only; the private key stays with the
+connector.
+
+Prerequisites, all checked on write:
+
+1. The agent's requester identity flag (`connector_requester_identity`, ADR 0270) is on.
+   Without it the write is refused `approver_ticket_requires_requester_identity`.
+2. The agent has a restricted approver role in its access policy, and the write names that
+   policy's current version in `ceiling.approver_role_version`. The platform copies the role
+   as it stands at that version into the registration (`ceiling.approver_role`, returned on
+   readback). A later change to the agent's access policy never rewrites the copy, so a role
+   widened after registration does not widen the ceiling. To adopt the new role, write the
+   registration again naming the new version. A stale version is refused
+   `stale_role_policy_version`. An absent policy or approver role, an unrestricted role, or
+   one with no entries is refused `approver_ticket_ceiling_invalid`.
+3. At least one deployment is active, and every active deployment's bundle gates the exact
+   connector tool on this route, so the tool name resolves to this route under the bundle's
+   last-declaration-wins rule. Otherwise the write is refused `approver_ticket.bundle_gate_mismatch`
+   or, with no active deployment, `approver_ticket.no_serving_bundle`. The same check runs
+   when you deploy or upload a bundle, so a later deploy cannot move the gate off the route.
+4. A connector and tool pair is registered on at most one route (`approver_ticket_pair_conflict`).
+
+Once registered, the tool is locked to its route: an approval for it on any other route, or
+without a route, is refused `approval_route_locked`. Both creation paths check the route map
+again on the agent row they lock for their final write and hold that lock until the approval
+is committed. The registration takes the same lock. A registration that lands while an
+approval is being created is therefore judged by that creation, or waits for it to commit.
+
+### The shared configuration version
+
+Selector and separation writes and the requester identity flag compare-and-set on the same
+agent value, `connector_requester_identity_version`. A route write that registers, replaces or
+removes a selector, that writes or removes a `separation` on any route, or that edits a map
+already holding either, must carry the version you read. With
+`--routes-from`, the CLI reads the current version in the same command and sends it as
+`approval_routes_expected_version`, so ordinary use needs nothing extra. Pass
+`--routes-expected-version N` to pin the version you reviewed instead; if the agent has moved
+on, the API refuses `approval_routes.version_conflict` and writes nothing. A write that
+omits the version is refused `approval_routes.expected_version_required`. The flag can only
+be turned off after every selector is removed (`requester_identity_selector_registered`),
+and two writers holding the same version cannot both commit. Route writes that involve
+neither a selector nor a separation are unchanged and do not bump the version.
+`--routes-expected-version` is accepted only alongside a route write flag.
+
+### Requester exclusion
+
+`separation` decides whether the person who asked may approve their own request. It can sit
+on any route, with or without a selector.
+
+On a route that registers a selector, exclusion is the default: omitting `separation` stores
+and returns `{"exclude_requester": true}`. Setting `"exclude_requester": false` is the audited
+opt-out for routes where one person may legitimately do both. Only that explicit operator
+write opts out; omission never does.
+
+On a route without a selector, `separation` is stored as written. `{"exclude_requester": true}`
+turns on static exclusion, so the person whose turn raised the approval cannot approve it.
+Omitting `separation` keeps ordinary self-confirmation (ADR 0106).
+
+`exempt_group` names one identity provider group, by its canonical `issuer` and stable group
+`id`, whose members are exempt from the exclusion:
+
+```json
+"separation": {
+  "exclude_requester": true,
+  "exempt_group": { "issuer": "https://idp.example.test", "id": "finance-leads" }
+}
+```
+
+It is valid only beside `"exclude_requester": true`. An exemption without exclusion is refused
+422, and so is `exempt_group` anywhere other than inside `separation`. The issuer is 1 to 2048
+UTF-8 bytes and the id 1 to 256, with no surrounding whitespace or control characters.
+
+Rules, all checked on write:
+
+1. A route map that carries a `separation` on the stored or the proposed side is a versioned
+   write. It must send `approval_routes_expected_version`, and every accepted one bumps it.
+2. Static exclusion and any `exempt_group` need verified requester identity: the tenant's HTTP
+   identity selection, and at least one of the agent's bindings listed in an operator receiver
+   registration of the running API. This is the same prerequisite as the requester identity
+   flag. Without it the write is refused `approval_separation_requires_http_identity` and
+   nothing is stored. The whole map being written is judged, so a write that only keeps an
+   existing static exclusion or exemption is judged again. A selector route's default
+   exclusion needs nothing more, because the registration already needs the requester identity
+   flag.
+3. `separation` cannot be set when an agent is created; `POST /agents` refuses it 422. Create
+   the agent, then write it.
+4. Only this operator route write changes `separation`. The agent-owned access policy writer
+   has no separation field and refuses a body that carries one (422), so an agent can never
+   opt out of exclusion itself.
+
+Each route whose effective `exclude_requester` or `exempt_group` changes writes one
+`approval_separation.changed` identity audit row with actor `operator`. It names the route,
+the old and new `exclude_requester`, the old and new `exempt_group`, the old and new
+configuration version, and on a selector route the selector's key id, connector and tool. A
+selector registered with `separation` omitted records no change, because exclusion is its
+default; an opt-out or an exemption at registration does. Removing a selector or a static
+exclusion records the change back to self-confirmation. Each registration, replacement and
+removal of a selector also writes its own `approver_ticket.registered`,
+`approver_ticket.replaced` or `approver_ticket.removed` row with the route, key id, connector
+and tool, the old and new configuration version, and the old and new pinned role version. The
+public key bytes are never audited beyond the key id.
+
+### Reading it back
+
+```bash
+curie cluster approvals my-agent --list-routes --json
+```
+
+The readback shows each registration with its key id, public key, ceiling (including the
+pinned `approver_role` and its version) and the effective `separation`, with its
+`exempt_group` when one is set. Edit that output and
+feed it back through `--routes-from` to change an unrelated route: a registration identical
+to the stored one, with its pinned role echoed back or omitted, keeps its existing pin and
+is not judged against the current policy version.
+
+### The creation-time ceiling rule
+
+When the connector raises a dynamic approval, the platform proves each selected approver is
+inside the pinned ceiling before storing anything. Each selected approver must be a known,
+active human in the platform's identity records and must be named by exact issuer and
+subject in the pinned role. When `ceiling.users` is set, the approver must also be listed
+there. `ceiling.users` only narrows the pinned role; it never admits someone the role does
+not name. Group entries and surface-account entries never match at creation, because the
+platform cannot establish group membership or an account association for someone who is not
+present in the request.
+
+The consequence: if the pinned role names approvers only by group, with no issuer and
+subject entry, every dynamic approval is refused `approval_ticket_outside_ceiling`, even
+when `ceiling.users` names the selected people. Name approvers by issuer and subject in the
+approver role, and optionally narrow them with `ceiling.users`, until a subject-keyed
+identity lookup exists. The answer-time check will use fresh identity facts, so this limit
+applies to creation only.
+
+### The requester must be current at creation
+
+Ordinary approval creation admits a sender named by a surface-account entry of a migrated
+invocation role even when the fresh identity lookup does not resolve, finds the account
+inactive, or resolves it to a different person. A dynamic approval never relies on that
+exception. The fresh lookup at creation must resolve the sender to an active human whose
+issuer and subject equal the requester the original invocation sealed, and the final write
+rechecks that person in the same transaction. Anything else is refused
+`caller_not_allowed`, and nothing is stored or spent.
+
+### Older API versions and downgrades
+
+Migration 0153 is an expand, so an API from before it keeps serving during a rolling upgrade
+and after an application rollback. That version knows nothing of selectors, so the database
+itself refuses what it could otherwise do:
+
+1. Record the registered tool on a looser route, with no route, or as an ordinary approval,
+   record another tool on the registered route, or record a ticket on a route that registers
+   none.
+2. Turn the requester identity flag off while a selector is registered.
+3. Approve a dynamic approval. From migration 0156, storage accepts that only from a
+   transaction the enforcing answer owner marked, in its final commit, after the selected
+   approvers, the ceiling and separation passed. An older API never marks it, so it cannot
+   approve one; rejection and expiry are unaffected.
+
+An older version sees these as failed writes, so the action fails closed. Removing a
+registration through an older API is not refused. It writes no selector audit, and the
+tool becomes ordinary again.
+
+Downgrading the database below 0153 is refused while any dynamic approval or registered
+selector exists. A downgrade would drop each dynamic approval's selection and its spent
+ticket nonce, so the row would read back ordinary and its ticket could be used again. Roll
+the application forward instead.
+
+## Delivering the card to the selected approver's DM (ADR 0272)
+
+A dynamic route can send its one card to the selected approver's Slack DM instead of a
+channel. [ADR 0272](adr/0272-approver-dm-delivery-uses-one-selected-recipient.md) adds a
+third `resolution` form:
+
+```json
+{ "mode": "approver_dm", "identity": "default" }
+```
+
+`identity` names the Slack bot identity that posts the card (`default` is the default app,
+and is stored as written). The route write refuses, with a 422 whose detail carries the code:
+
+1. `approver_dm_static_route`: the same route registers no `approver_ticket`. Only a
+   dynamic approval has one selected person to deliver to.
+2. `approver_dm_notification`: the route carries a `notification`. The card goes only to the DM.
+3. `approver_dm_receiver_missing`: the tenant has no active Slack identity of that name, or
+   the API registers no receiver for it.
+
+At creation the worker sends `card_channel: null`, and the API requires exactly one selected
+approver with exactly one recipient account on the receiver's installation and Slack
+workspace. It looks that account up through the HTTP identity provider (purpose `approval`)
+and requires it to resolve to the selected person as an active human. The final write
+rechecks the receiver registration, its identity, installation and namespace rows, the
+provider configuration and the recipient facts, which must still be inside their freshness
+window. Creation refuses `approver_dm_requires_dynamic`, `approver_dm_recipient_count`,
+`approver_dm_account_missing`, `approver_dm_wrong_installation`,
+`approver_dm_account_unresolved` or `approver_dm_receiver_missing`, a change between the
+lookup and the write answers 503 `authority_unavailable`, and nothing is stored or spent.
+The creation response carries `delivery` (mode, identity, installation and the recipient's
+Slack user id). The key is present only for a DM approval, and a duplicate creation
+recomputes it from the stored row.
+
+The worker posts one card with the recipient's user id as the channel and registers the DM
+channel Slack returns through `POST /v1/internal/identity/approvals/{id}/card` (worker token
+only). Registration binds the approval id, the original creation context, the bot identity
+and the recipient. It stores the channel in `card_channel`, reseals the row's continuity
+context (only the record digest changes) and writes one `card_registered` audit row, all in
+one commit. An identical retry answers `duplicate: true`; a different channel, identity or
+recipient answers 409 `approval_card_conflict`, judged against the committed registration,
+not the current route. A row that already settled answers its status without writing, so the
+worker settles the posted card at once. A row whose sealed record no longer matches answers
+409 `approval_provenance_conflict` and is never resealed.
+
+Until registration, `card_channel` is unset and every answer refuses; there is no fallback to
+the requester's thread. After it, an answer must come from the registered DM channel, through
+the recorded bot installation, by the selected person, under every ADR 0271 check. Operator
+principals and email replies are refused. The requester's thread gets a non-interactive
+pending notice and the outcome.
+
+Rollout is readers first. API, worker, dispatcher and CLI versions from before ADR 0272
+refuse the mode, so roll the release out everywhere and drain old card writers before any
+operator writes an `approver_dm` route. The worker creates a DM approval only when
+`CURIE_APPROVAL_PENDING_RETENTION_ENABLED` is on and the ADR 0273 decision 4 reconciliation
+has completed, because a pending DM card reference must outlive the 14-day default. A
+rollback first needs every DM route removed and every pending DM approval settled.
+
 ## Who may resolve
 
 One authorizer decides, and the swappable part behind it is the approver set
@@ -238,7 +642,7 @@ precedence is fixed: `users` beats `group` beats channel membership.
 | Declared | Set | Lookup | Eligible principal |
 |---|---|---|---|
 | nothing, and the route is bound (or the approval has no route at all) | `SlackChannelMembers` | none, the attested card channel is the proof | authenticated `chat` only |
-| nothing, and the approval names a route that is **not** bound | `UnboundRoute` — refuses everyone | none, there is no set to resolve | none |
+| nothing, and the approval names a route that is **not** bound | `UnboundRoute` refuses everyone. Creation against a missing route fails with 422 and the worker escalates to a human. Only a pre-0273 row, or a binding removed after creation, reaches this set. | none, there is no set to resolve | none |
 | `approvers.group: S...` | `SlackUserGroupMembers` | Slack `usergroups.users.list` | authenticated `chat` or `console` |
 | `approvers.users: [U...]` | `ExplicitUsers` | none, pure config | authenticated `chat`, `console`, or `operator` |
 
@@ -306,14 +710,13 @@ Four properties worth knowing before you design around this:
   outage, reports "could not verify approver group membership" and refuses. It never falls back to channel
   membership, because that would silently widen the set an operator narrowed.
 
-Resolving a group-bound route needs `SLACK_BOT_TOKEN` on the API with the
-`usergroups:read` scope. Both requirements are stated in
-[ADR-0034](adr/0034-approval-authorizers-resolve-membership-in-the-api.md) and
-`.env.example`; `apps/api/src/curie_api/slack_usergroups.py` is the lookup that
-consumes them and names neither, so it is the wrong place to send a reader
-checking the claim. The scope needs the Slack app reinstalled. Without the
-token, such a route fails closed: every resolution reports `could not verify approver
-group membership`.
+Resolving a group-bound route requires an authenticated channel gateway whose
+Slack bot has the `usergroups:read` scope. Reinstall the Slack app after adding
+the scope. The API keeps the membership freshness policy and receives only a
+per-caller gateway credential. Slack tokens belong in the gateway or dispatcher;
+the API and worker refuse to start when one is present. Without gateway access,
+every group-bound resolution fails closed with `could not verify approver group
+membership`.
 
 ## What your skill must handle on resume
 
@@ -377,6 +780,9 @@ curie local approvals my-agent --resolve <id> --reject --note "discount too deep
 # create the Console's single-use, subject-bound login code instead
 curie local approvals my-agent --mint-console-login-code U0EXAMPLE1
 
+# mint a remediation operator principal for remediation policy writes instead
+curie local approvals my-agent --mint-remediation-principal U0EXAMPLE1
+
 # which tools are gated behind approval
 curie local approvals my-agent
 ```
@@ -393,14 +799,39 @@ so a human knows where that authenticated card lives. A null or empty `card_chan
 from an older row or a direct API write that omitted the field; for that compatibility
 case, the requesting channel is the card location.
 
+The two operator mints carry different scopes and neither stands in for the other.
+`--mint-operator-principal` (`POST /approvals/principals/operator`) carries
+`approval.resolve` and settles approvals. `--mint-remediation-principal`
+(`POST /approvals/principals/remediation-operator`) carries
+`remediation.administer` and is what remediation policy, breaker and qualification
+writes require as attribution (binding and arming also need the separate
+remediation authority key, ADR 0231); it resolves no approval, and an approval operator token on a
+remediation write is refused `operator_principal_required`. Both are sent as
+`CURIE_APPROVAL_PRINCIPAL_TOKEN` (header `X-Curie-Approval-Principal`).
+
 A single operator does not need a second person to settle a card. An authenticated
 member of the approver set may approve their own request, including the person who
 asked. Terminal resolution still works only for an explicit `approvers.users`
-binding, because an operator principal carries no channel. If nobody resolves a
-worker-raised request, it expires after 24 hours and the paused session wakes on
-the timeout branch instead of staying pending.
+binding, because an operator principal carries no channel. A finite request that
+passes its stored deadline expires and wakes the paused session on its timeout
+branch. A request with no deadline stays pending until settlement.
 
 ## Operational guarantees
+
+Publication approvals retain their 24-hour deadline. The expiry sweeper wakes
+settled sessions, and the resume reconciler re-drives resolutions whose resume
+turn never landed. Historical approvals with a null `expires_at` remain pending
+until settlement.
+
+An approved HTTP identity resume retries a final lifecycle-generation conflict with up to
+three attempts in total (two retries), waiting 50 ms then 100 ms, with complete fresh
+authority checks before any append is attempted. Exhausted pre-append refusals remain
+owed to the grace-based reconciler, while uncertain appends retain #4016 recovery on
+the next reconciler pass before grace; grace applies to the remaining owed wakes.
+A resume that succeeds on a retry still keeps one `resume_refused` audit row for each
+failed attempt on a canonical route.
+An approved resume refuses and leaves the wake owed when the stored principal was
+observed disabled or revoked after the approval's saved capture.
 
 - **A paused turn holds nothing.** The queue entry is acknowledged when the turn
   suspends; the resolution arrives later as its own queued turn. No stream entry, thread
@@ -409,14 +840,6 @@ the timeout branch instead of staying pending.
   ([ADR-0003](adr/0003-stateless-first-rehydrate-on-resume.md)). Resume cold-creates a
   fresh one and rehydrates from history. Never design a feature that needs in-process
   state to survive a pause.
-- **Worker-raised approvals expire.** Session approvals the worker creates, and
-  publication approvals, carry a 24 hour deadline. The sweeper settles a lapsed
-  record and wakes the paused session down its timeout branch
-  (`apps/api/src/curie_api/sweeper.py`), and a reconciler re-drives resolutions
-  whose resume turn never landed (`apps/api/src/curie_api/resumereconciler.py`).
-  A direct API create that omits `expires_in_seconds` is still the wire's no-SLA
-  path and is not swept. Approvals created before this deadline existed keep a
-  null `expires_at` and are not swept; settle those by hand.
 - **Every attempt is audited.** `GET /approvals/{id}/audit` returns each resolution
   attempt with the authorizer, membership evidence, `principal_kind`, and
   `authenticated` proof state, including refusals. Historical rows remain
@@ -439,12 +862,12 @@ the timeout branch instead of staying pending.
 | `401 missing or invalid approval principal` | A platform API key alone cannot resolve. For an explicit-user route, mint an operator principal, export it as `CURIE_APPROVAL_PRINCIPAL_TOKEN`, and retry; otherwise use the authenticated Slack card or a live Console session. |
 | `403 operator approval principals can resolve only routes bound to an explicit user list` | Terminal credentials carry no Slack membership evidence. Add the subject to an explicit `approvers.users` binding, or resolve through the authenticated card. |
 | `403 console approval principals can resolve only routes bound to an explicit user list or verifiable user group` | The Console session carries no channel evidence. Use an explicit `approvers.users` binding, a group the API can verify, or the authenticated card. |
-| Console login succeeds but session inspection or resolve returns `401` | Serve the Console over HTTPS. Its `Secure` session cookie is deliberately not retained on plain HTTP. After an upgrade that renames the cookie to `__Host-curie_console_session`, an older session also returns 401 until the operator exchanges a new login code. |
+| Console login succeeds but session inspection or resolve returns `401` | Serve the Console over HTTPS, or reach it on `http://localhost` through `kubectl port-forward` or a kind `extraPortMappings` entry. Its `Secure` `__Host-` session cookie is deliberately not retained on plain HTTP from a non-loopback host ([#3968](https://github.com/curie-eng/curie/issues/3968)). After an upgrade that renames the cookie to `__Host-curie_console_session`, an older session also returns 401 until the operator exchanges a new login code. |
 | `403 console session origin rejected` | The console cookie was the only principal on an unsafe call, and `Origin` (or `Referer` if `Origin` was absent) was missing or named a different host. Retry from the console page itself. Header principals are not checked. |
 | `403 you are not an approver` | The selected set does not admit the authenticated principal. Check the `approvers` block and current membership. Requester equality does not bypass or veto that check. |
 | `403 could not verify approvers` | The declared `approvers` block is malformed and cannot be evaluated. Correct its `users` or `group` value, then replace the complete route map. |
 | `403 could not verify approvers: ... route is no longer bound` | The approval named a route whose binding was cleared or rewritten while it was pending — `--clear-routes`, a `--routes-from` file that omits the route, or any `--route` write, since a write is a full replacement. A pending approval is resolvable only through its own route's binding (ADR-0123), so it fails closed rather than widening to card-channel membership. Restore the binding and the approval resolves normally; it is not lost. |
-| `403 could not verify approver group membership` | Slack group membership could not be verified. This fails closed and does not name its cause. Check the API `SLACK_BOT_TOKEN`, its `usergroups:read` scope and reinstallation, and Slack availability. It never falls back to channel membership. |
+| `403 could not verify approver group membership` | Slack group membership could not be verified. This fails closed and does not name its cause. Check gateway connectivity, its Slack bot’s `usergroups:read` scope and reinstallation, and Slack availability. It never falls back to channel membership. |
 | `409 already resolved by ...` | Someone else won the claim. The decision stands. |
 | `410 expired` | The record passed its deadline. The session was already woken down its timeout branch. |
 | Thread says "Not requesting approval again: ... was rejected by ..." | The agent re-raised an approval a person rejected in this thread, with nobody asking since (`409 approval.rejected_in_thread`). Expected. To try again, ask for it in the thread. |
@@ -574,9 +997,9 @@ upgrade, because a guessed reply route is a silent misroute.
 | Concern | Path |
 |---|---|
 | Raising a request, and the tool gate | `runner/src/curie_runner/approval.py` |
-| Pausing, routing the card, suspending | `apps/worker/src/curie_worker/kernel.py` |
+| Pausing, routing the card, suspending | `apps/worker/src/curie_worker/kernel/core.py` |
 | Remembering the card so an expiry can disable it | `apps/worker/src/curie_worker/approval_cards.py` |
-| Click to resolve, and rendering the verdict | `apps/dispatcher/src/curie_dispatcher/approval_actions.py` |
+| Click to resolve, and rendering the verdict | `packages/channel-gateway/src/curie_channel_gateway/slack/approval_actions.py` |
 | The resolve endpoint, claim, and audit | `apps/api/src/curie_api/routers/approvals.py` |
 | Break-glass recovery | `apps/api/src/curie_api/routers/approval_recovery.py` |
 | Who may resolve | `apps/api/src/curie_api/authorizer.py`, `apps/api/src/curie_api/approvers.py`, `apps/api/src/curie_api/slack_approvers.py` |

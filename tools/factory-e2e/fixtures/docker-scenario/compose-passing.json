@@ -1,0 +1,62 @@
+{
+  "project": "curie-compose-5c0d3a71-5cc379",
+  "window": [
+    1792819242.7541106,
+    1792819254.3097446
+  ],
+  "docker_host": "tcp://curie-docker-sections-a01e0a8:2375",
+  "published_host": "curie-docker-sections-a01e0a8",
+  "info": {
+    "id": "275deac0-10bc-4cf6-857e-3f51f70c36de",
+    "name": "ded1c42cd936"
+  },
+  "image": "python:3.13.15-slim-bookworm@sha256:ed86c82274b3c69b52fb5820f358f0bd7df0b603332063cb5c6e32bd220c3e6e",
+  "files": {
+    "compose.yaml": "cd4ffc855eb671a21348c2640f255282b359daf0420c02d155854e3f1266f8b9",
+    "server/Dockerfile": "2ba811bd5e79f21a7ec9d7b28540fca3ae4564ceeff0a7065d2a53bad61114fc",
+    "server/index.html": "c3041b7463803a09032cf193a624e1510e892bd9b3fcf930ddd08a57190a6d3c",
+    "client/Dockerfile": "cb72180203c48daa25bec58e437e809ed2d3b1583f6f083ab4124214697e74b6"
+  },
+  "expected": "curie-compose 5c0d3a71",
+  "build": {
+    "exit_code": 0,
+    "output_tail": "curie-compose-5c0d3a71-5cc379-server done\n#11 DONE 0.0s\n\n#12 [client] resolving provenance for metadata file\n#12 DONE 0.0s\n\n#13 [server] resolving provenance for metadata file\n#13 DONE 0.0s\n Image curie-compose-5c0d3a71-5cc379-client Building \n Image curie-compose-5c0d3a71-5cc379-server Building \n Image curie-compose-5c0d3a71-5cc379-client Built \n Image curie-compose-5c0d3a71-5cc379-server Built \n"
+  },
+  "up": {
+    "exit_code": 0,
+    "output_tail": "-compose-5c0d3a71-5cc379-client-1 Creating \n Container curie-compose-5c0d3a71-5cc379-server-1 Created \n Container curie-compose-5c0d3a71-5cc379-client-1 Created \n Container curie-compose-5c0d3a71-5cc379-server-1 Starting \n Container curie-compose-5c0d3a71-5cc379-client-1 Starting \n Container curie-compose-5c0d3a71-5cc379-server-1 Started \n Container curie-compose-5c0d3a71-5cc379-client-1 Started \n"
+  },
+  "services": [
+    {
+      "service": "client",
+      "state": "running"
+    },
+    {
+      "service": "server",
+      "state": "running"
+    }
+  ],
+  "reach": {
+    "from": "client",
+    "to": "server:8080",
+    "exit_code": 0,
+    "body": "curie-compose 5c0d3a71\n"
+  },
+  "published": {
+    "port": 32773,
+    "url": "http://curie-docker-sections-a01e0a8:32773/index.html",
+    "status": 200,
+    "body": "curie-compose 5c0d3a71\n"
+  },
+  "down": {
+    "exit_code": 0,
+    "output_tail": "ie-compose-5c0d3a71-5cc379-client-1 Removed \n Network curie-compose-5c0d3a71-5cc379_default Removing \n Image curie-compose-5c0d3a71-5cc379-server:latest Removing \n Image curie-compose-5c0d3a71-5cc379-client:latest Removing \n Image curie-compose-5c0d3a71-5cc379-server:latest Removed \n Image curie-compose-5c0d3a71-5cc379-client:latest Removed \n Network curie-compose-5c0d3a71-5cc379_default Removed \n"
+  },
+  "cleanup": {
+    "containers": [],
+    "networks": [],
+    "volumes": [],
+    "images": [],
+    "verified": true
+  }
+}

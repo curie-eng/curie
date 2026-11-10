@@ -1,0 +1,56 @@
+# The opt-in declaration for the scaler connector. OFF BY DEFAULT: the bundle's
+# connectors.yaml does not declare it and plugin.json names none of its tools,
+# so an install that does not opt in is unchanged.
+#
+# To opt in, in your copy of the bundle:
+#   1. add `connector.scaler` below under `connectors:` in connectors.yaml;
+#   2. add the `plugin` entries to .claude-plugin/plugin.json (`toolPolicy` and
+#      `approvalPolicy.gates`);
+#   3. apply manifests/scaler-access.yaml, assemble a kubeconfig for
+#      `sre-bot-scaler` and store it as the connector secret SCALER_KUBECONFIG;
+#   4. create the Kubernetes Secret `sre-bot-scaler-sealing` with two keys:
+#      SNAPSHOT_SEALING_KEY (`<kid>:<base64 of 32 bytes>`) and
+#      SNAPSHOT_SEALING_KEYS_RETAINED (empty until a rotation; both keys must
+#      exist, because a secretKeyRef to a missing key stops the pod);
+#   5. build and deploy as for the other source-built connectors.
+#
+# examples/tests/test_sre_bot_scaler_opt_in.py applies exactly this file to the
+# shipped bundle and validates the result, so the steps above stay valid.
+connector:
+  scaler:
+    build:
+      context: connectors/scaler
+      platforms: [linux/amd64, linux/arm64]
+    env:
+      # The one namespace it acts in. Must agree with the Role's namespace in
+      # manifests/scaler-access.yaml. EMPTY MEANS EVERY CALL IS REFUSED.
+      SCALER_NAMESPACE: sre-demo
+      # Comma-separated Deployment names. Must agree with the Role's
+      # resourceNames. EMPTY MEANS EVERY CALL IS REFUSED.
+      SCALER_DEPLOYMENTS: example-api
+      # The largest count a forward call may set. A restore puts back whatever
+      # count was in force and is not bounded by it.
+      SCALER_MAX_REPLICAS: "1"
+    secret_files:
+      SCALER_KUBECONFIG: /secrets/kubeconfig
+    # Key custody (ACTION-EXECUTOR-16): only as a SecretRef on this connector.
+    # Curie renders a secretKeyRef and never reads the value.
+    secrets:
+      - name: SNAPSHOT_SEALING_KEY
+        from_secret: sre-bot-scaler-sealing
+      - name: SNAPSHOT_SEALING_KEYS_RETAINED
+        from_secret: sre-bot-scaler-sealing
+plugin:
+  toolPolicy:
+    # Read-only and never gated: the platform's executor calls it without a
+    # grant before any restore.
+    allow:
+      - scaler/observe_version
+    approvalRequired:
+      - scaler/scale_deployment
+    # `scaler/restore` is listed nowhere: the runner hides it from the model,
+    # and the platform gates it once the capability probe records the pair.
+  approvalPolicy:
+    gates:
+      - gate: mcp__scaler__scale_deployment
+        route: sre-approvals

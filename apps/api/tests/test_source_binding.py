@@ -165,7 +165,12 @@ def _post(
         headers["X-Curie-Signature-256"] = signature
     elif secret is not None:
         headers["X-Curie-Signature-256"] = hook_signing.sign(
-            secret, timestamp=timestamp, delivery_id=delivery_id or "", body=body
+            secret,
+            timestamp=timestamp,
+            delivery_id=delivery_id or "",
+            hook=hook,
+            tool_access=None,
+            body=body,
         )
     if delivery_id is not None:
         headers["X-Curie-Delivery-Id"] = delivery_id

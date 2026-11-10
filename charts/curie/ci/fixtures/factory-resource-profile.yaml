@@ -1,0 +1,29 @@
+# Minimal enabled factory whose one forge-egress agent, acme-factory, selects
+# the chart's `factory` sandbox resource profile (#4889). Shared by the render
+# assertions (sandbox-emptydir-sizelimit, reuse-values-render,
+# upgrade-retained-scalar) and the released-upgrade job. It must render on any
+# chart that has the top-level `factory:` block, so it carries no profile keys
+# of its own: the selection is derived from factory.enabled plus
+# factory.sandboxEgress.acme-factory.
+factory:
+  enabled: true
+  codeHosts:
+    - name: github
+      kind: github
+      host: github.com
+      credential:
+        type: github_app
+        appId: "12345"
+        existingSecret: curie-factory-app
+        existingSecretKey: privateKey
+  trackers:
+    - name: github
+      kind: github
+      host: github.com
+      credential:
+        type: github_app
+        appId: "12345"
+        existingSecret: curie-factory-app
+        existingSecretKey: privateKey
+  sandboxEgress:
+    acme-factory: true

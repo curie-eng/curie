@@ -542,7 +542,7 @@ def test_the_connectors_route_refuses_a_local_daemon_lock(
     # Everything that calls this route APPLIES what it returns to a cluster --
     # the worker's connector reconcile loop
     # (`curie_worker.connector_loop.HttpManifestSource`, ADR-0090) and
-    # `curie cluster deploy`'s `sync_connectors` (`cli/src/main.rs`, ADR-0086).
+    # `curie cluster deploy`'s `sync_connectors` (`cli/src/dispatch/cluster_action.rs`, ADR-0086).
     # A `local-daemon` lock records a bare image id no node can pull, so
     # rendering it hands the applier a Deployment that ImagePullBackOffs minutes
     # after the deploy reported success, with every gate green. The bundle
@@ -651,7 +651,7 @@ def _collision_archive(connectors_yaml: str) -> bytes:
     return buf.getvalue()
 
 
-def _agent_row(name: str) -> str:
+def _agent_row(name: str, address: str = "C0EXAMPLE4") -> str:
     """Insert the agent row directly, the way a pre-validator install holds one.
 
     Mirrors `crud.create_agent`'s shape (the agent and its binding in one
@@ -668,7 +668,7 @@ def _agent_row(name: str) -> str:
             async with sessionmaker() as session:
                 agent = Agent(
                     name=name,
-                    channels=[AgentChannel(kind="slack", address="C0EXAMPLE4", adapter="default")],
+                    channels=[AgentChannel(kind="slack", address=address, adapter="default")],
                 )
                 session.add(agent)
                 await session.commit()
@@ -743,6 +743,68 @@ def test_the_same_bundle_still_renders_for_an_unambiguous_agent(
         f"{name}-allow-ingress",
     }
     assert name in body["mcp_entries"]["grafana"]["url"]
+
+
+# --------------------------------------------------------------------------- #
+# One bundle, two agents, two out-of-band Secrets: `from_secret` carrying
+# `${CURIE_AGENT}` is expanded by the route's render to the agent it renders
+# for. Real Postgres + RustFS, the same route `cluster deploy` reads.
+# --------------------------------------------------------------------------- #
+AGENT_SCOPED = (
+    "connectors:\n"
+    "  reader:\n"
+    "    image: ghcr.io/example/reader:1\n"
+    "    port: 8000\n"
+    "    secrets:\n"
+    "      - name: EXAMPLE_TOKEN\n"
+    "        from_secret: example-read-${CURIE_AGENT}\n"
+)
+
+
+def _upload(client: Any, headers: dict[str, str], agent_id: str, connectors_yaml: str) -> Any:
+    version = client.post(
+        f"/agents/{agent_id}/versions",
+        json={"version_label": "v1", "created_by": "test"},
+        headers=headers,
+    )
+    assert version.status_code == 201, version.text
+    version_id = version.json()["id"]
+    return version_id, client.put(
+        f"/agents/{agent_id}/versions/{version_id}/bundle",
+        files={"file": ("b.tar.gz", _collision_archive(connectors_yaml))},
+        headers=headers,
+    )
+
+
+def test_each_agent_renders_its_own_agent_scoped_secret(
+    client: Any, auth_headers: dict[str, str], clean_db: None, _caller_key: None
+) -> None:
+    rendered = {}
+    for agent, address in (("foo", "C0EXAMPLE5"), ("foo-dev", "C0EXAMPLE6")):
+        agent_id = _agent_row(agent, address)
+        version_id, stored = _upload(client, auth_headers, agent_id, AGENT_SCOPED)
+        assert stored.status_code == 201, stored.text
+        resp = _read_connectors(client, auth_headers, agent_id, version_id)
+        assert resp.status_code == 200, resp.text
+        dep = next(o for o in resp.json()["manifests"] if o["kind"] == "Deployment")
+        env = dep["spec"]["template"]["spec"]["containers"][0]["env"]
+        token = next(e for e in env if e["name"] == "EXAMPLE_TOKEN")
+        rendered[agent] = token["valueFrom"]["secretKeyRef"]["name"]
+    assert rendered == {"foo": "example-read-foo", "foo-dev": "example-read-foo-dev"}
+
+
+def test_an_unknown_from_secret_placeholder_never_becomes_a_version_bundle(
+    client: Any, auth_headers: dict[str, str], clean_db: None
+) -> None:
+    agent_id = _agent_row("foo")
+    _, stored = _upload(
+        client,
+        auth_headers,
+        agent_id,
+        AGENT_SCOPED.replace("${CURIE_AGENT}", "${CURIE_CONNECTOR_HOST}"),
+    )
+    assert stored.status_code >= 400, stored.text
+    assert "connectors.secret_ref_unknown_placeholder" in stored.text
 
 
 GITHUB = (
@@ -920,3 +982,215 @@ def test_the_route_renders_the_proxy_from_the_api_settings(
     assert _proxy_admits(body["manifests"]) == ["acme-bot"]
     service = next(o for o in body["manifests"] if o["kind"] == "Service")
     assert service["spec"]["ports"][0]["targetPort"] == "caller"
+
+
+# --------------------------------------------------------------------------- #
+# The probed restore verb joins the connector's gated set
+# (ACTION-EXECUTOR-8, ACTION-EXECUTOR-13; plan task 6)
+#
+# The gated set reaches the caller proxy only through this route's render: the
+# worker's connector reconcile applies what it returns, the proxy parses the
+# caller-proxy container's env (`ProxyConfig.from_env`) and requires a grant for
+# every tool `_is_gated` matches, and the executor loop reads the same env from
+# the live Deployment before it dispatches a grant-bound call
+# (`action_executor_loop._gated_patterns` / `tool_is_gated`). Today the set
+# comes from the bundle's approval patterns alone, so a capable connector's
+# `restore` is ungated unless the bundle lists `<connector>/restore`, and every
+# restore refuses `tool_not_grant_bound`. Once the probe has recorded the paired
+# verbs for the digest this version renders, `restore` must be gated there; a
+# lone `restore` (not capable), no capability row, or a capable row for another
+# digest leaves the set as the approval patterns make it. The proxy's grant
+# enforcement for a gated tool is pinned in apps/worker/tests/test_connector_proxy.py.
+# --------------------------------------------------------------------------- #
+_LOCKED_DIGEST = DIGEST_IMAGE.rsplit("@", 1)[1]
+_OTHER_DIGEST = "sha256:" + "2" * 64
+
+
+def _capability_row(agent_id: str, *, digest: str, restore_capable: bool) -> None:
+    """Record what a finished probe records (ACTION-EXECUTOR-20 route decisions)."""
+
+    import uuid
+
+    from curie_api.models import ConnectorCapability
+
+    async def run() -> None:
+        engine = create_async_engine(get_settings().database_url)
+        sessionmaker = async_sessionmaker(engine, expire_on_commit=False)
+        try:
+            async with sessionmaker() as session:
+                session.add(
+                    ConnectorCapability(
+                        agent_id=uuid.UUID(agent_id),
+                        connector="k8s-write",
+                        digest=digest,
+                        restore_capable=restore_capable,
+                    )
+                )
+                await session.commit()
+        finally:
+            await engine.dispose()
+
+    asyncio.run(run())
+
+
+def _gating_bundle(root: Path, approval_required: list[str] | None = None) -> bytes:
+    _built(root)
+    _write_lock(root)
+    if approval_required is not None:
+        manifest = root / "b" / ".claude-plugin" / "plugin.json"
+        document = json.loads(manifest.read_text(encoding="utf-8"))
+        document["toolPolicy"] = {
+            "enforcement": "curie/mcp-tool-policy@1",
+            "approvalRequired": approval_required,
+        }
+        manifest.write_text(json.dumps(document), encoding="utf-8")
+    return _archive(root)
+
+
+def _proxy_config_of(client: Any, headers: dict[str, str], agent_id: str, version_id: str) -> Any:
+    """The rendered connector Deployment, parsed the way the proxy parses it."""
+
+    from curie_connector_proxy.server import ProxyConfig
+
+    resp = client.get(
+        f"/agents/{agent_id}/versions/{version_id}/connectors",
+        params={"release": RELEASE, "namespace": NAMESPACE, "app_name": APP_NAME},
+        headers=headers,
+    )
+    assert resp.status_code == 200, resp.text
+    dep = next(o for o in resp.json()["manifests"] if o["kind"] == "Deployment")
+    proxy = next(
+        c for c in dep["spec"]["template"]["spec"]["containers"] if c["name"] == "caller-proxy"
+    )
+    env = {e["name"]: e["value"] for e in proxy.get("env") or () if "value" in e}
+    return dep, ProxyConfig.from_env(env)
+
+
+def _gates(dep: dict[str, Any], config: Any, tool: str) -> bool:
+    """Both consumers' answer, which must agree: the proxy's and the executor's."""
+
+    from curie_connector_proxy.server import _is_gated
+    from curie_worker.action_executor_loop import _gated_patterns, tool_is_gated
+
+    proxy_gates = _is_gated(config, tool)
+    executor_gates = tool_is_gated(_gated_patterns(dep), "k8s-write", tool)
+    assert proxy_gates == executor_gates, "the proxy and the executor read different sets"
+    return proxy_gates
+
+
+def test_a_probed_capable_digest_gates_restore_at_the_proxy(
+    tmp_path: Path,
+    client: Any,
+    auth_headers: dict[str, str],
+    clean_db: None,
+    _caller_key: None,
+) -> None:
+    """@spec ACTION-EXECUTOR-8 @spec ACTION-EXECUTOR-13: once the probe records
+    the pair for the digest this version renders, the API adds ``restore`` to
+    that connector's rendered gated set, so the proxy refuses it without a
+    grant and the executor's gate check lets a grant-bound restore dispatch.
+    """
+
+    agent_id, version_id = _version_with_bundle(client, auth_headers, _gating_bundle(tmp_path))
+    _capability_row(agent_id, digest=_LOCKED_DIGEST, restore_capable=True)
+
+    dep, config = _proxy_config_of(client, auth_headers, agent_id, version_id)
+
+    assert config.connector == "k8s-write"
+    assert _gates(dep, config, "restore"), "a capable connector's restore must be grant-bound"
+    # observe_version is read-only and never gated (ACTION-EXECUTOR-8).
+    assert not _gates(dep, config, "observe_version")
+
+
+def test_a_capable_digest_keeps_the_bundles_own_approval_patterns(
+    tmp_path: Path,
+    client: Any,
+    auth_headers: dict[str, str],
+    clean_db: None,
+    _caller_key: None,
+) -> None:
+    """@spec ACTION-EXECUTOR-8: ``restore`` is added to the set, never replaces it."""
+
+    archive = _gating_bundle(tmp_path, approval_required=["k8s-write/scale"])
+    agent_id, version_id = _version_with_bundle(client, auth_headers, archive)
+    _capability_row(agent_id, digest=_LOCKED_DIGEST, restore_capable=True)
+
+    dep, config = _proxy_config_of(client, auth_headers, agent_id, version_id)
+
+    assert _gates(dep, config, "scale")
+    assert _gates(dep, config, "restore")
+
+
+def test_no_capability_row_leaves_restore_ungated(
+    tmp_path: Path,
+    client: Any,
+    auth_headers: dict[str, str],
+    clean_db: None,
+    _caller_key: None,
+) -> None:
+    """@spec ACTION-EXECUTOR-8: until the probe records the pair, the gated set
+    is the approval patterns' and every restore refuses ``tool_not_grant_bound``.
+    """
+
+    agent_id, version_id = _version_with_bundle(client, auth_headers, _gating_bundle(tmp_path))
+
+    dep, config = _proxy_config_of(client, auth_headers, agent_id, version_id)
+
+    assert not _gates(dep, config, "restore")
+
+
+def test_a_lone_restore_is_never_added_to_the_gated_set(
+    tmp_path: Path,
+    client: Any,
+    auth_headers: dict[str, str],
+    clean_db: None,
+    _caller_key: None,
+) -> None:
+    """@spec ACTION-EXECUTOR-8: a connector advertising ``restore`` without
+    ``observe_version`` is probed not capable; its ``restore`` stays an ordinary
+    tool, gated only if the bundle's approval patterns gate it.
+    """
+
+    agent_id, version_id = _version_with_bundle(client, auth_headers, _gating_bundle(tmp_path))
+    _capability_row(agent_id, digest=_LOCKED_DIGEST, restore_capable=False)
+
+    dep, config = _proxy_config_of(client, auth_headers, agent_id, version_id)
+
+    assert not _gates(dep, config, "restore")
+
+
+def test_a_lone_restore_the_bundle_gates_stays_gated(
+    tmp_path: Path,
+    client: Any,
+    auth_headers: dict[str, str],
+    clean_db: None,
+    _caller_key: None,
+) -> None:
+    """@spec ACTION-EXECUTOR-8: today's behavior for a lone ``restore`` is kept."""
+
+    archive = _gating_bundle(tmp_path, approval_required=["k8s-write/restore"])
+    agent_id, version_id = _version_with_bundle(client, auth_headers, archive)
+    _capability_row(agent_id, digest=_LOCKED_DIGEST, restore_capable=False)
+
+    dep, config = _proxy_config_of(client, auth_headers, agent_id, version_id)
+
+    assert _gates(dep, config, "restore")
+
+
+def test_a_capable_row_for_another_digest_does_not_gate_this_render(
+    tmp_path: Path,
+    client: Any,
+    auth_headers: dict[str, str],
+    clean_db: None,
+    _caller_key: None,
+) -> None:
+    """@spec ACTION-EXECUTOR-13: capability is a property of one image digest;
+    a row for a digest this version does not render counts for nothing.
+    """
+
+    agent_id, version_id = _version_with_bundle(client, auth_headers, _gating_bundle(tmp_path))
+    _capability_row(agent_id, digest=_OTHER_DIGEST, restore_capable=True)
+
+    dep, config = _proxy_config_of(client, auth_headers, agent_id, version_id)
+
+    assert not _gates(dep, config, "restore")

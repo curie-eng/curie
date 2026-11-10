@@ -4,6 +4,7 @@ import userEvent from "@testing-library/user-event";
 import { StoreProvider } from "../../state/store";
 import { WiredAgentState } from "./WiredAgentState";
 import {
+  ApiError,
   listStateNamespaces,
   listStateEntries,
   type StateNamespace,
@@ -79,5 +80,59 @@ describe("WiredAgentState (#250)", () => {
     vi.mocked(listStateNamespaces).mockRejectedValue(new Error("boom"));
     renderPanel();
     expect(await screen.findByTestId("state-error")).toHaveTextContent("boom");
+    // A failed load is not evidence that nothing was stored.
+    expect(screen.queryByText(/has not stored any durable state/i)).not.toBeInTheDocument();
+  });
+});
+
+// #1047: the state routes accept only the platform key or a sandbox state
+// token, never a console session (apps/api/src/curie_api/routers/state.py
+// require_state_access: 401 "missing or invalid credential"; pinned by
+// apps/api/tests/test_console_session_api_auth.py). Under cookie auth the card
+// says so honestly instead of claiming the agent stored nothing.
+const STATE_401 = "missing or invalid credential";
+
+describe("WiredAgentState under console-session auth (#1047)", () => {
+  it("shows the unavailable notice, not an error or the empty state, when the state read is refused", async () => {
+    vi.mocked(listStateNamespaces).mockRejectedValue(new ApiError(401, STATE_401));
+    renderPanel();
+
+    expect(await screen.findByTestId("state-unavailable")).toHaveTextContent(/console session/i);
+    expect(screen.queryByTestId("state-error")).not.toBeInTheDocument();
+    expect(screen.queryByText(/has not stored any durable state/i)).not.toBeInTheDocument();
+  });
+
+  it("shows a server failure as an error, without the unavailable notice or the empty state", async () => {
+    vi.mocked(listStateNamespaces).mockRejectedValue(new ApiError(500, "Internal Server Error"));
+    renderPanel();
+
+    expect(await screen.findByTestId("state-error")).toHaveTextContent("Internal Server Error");
+    expect(screen.queryByTestId("state-unavailable")).not.toBeInTheDocument();
+    expect(screen.queryByText(/has not stored any durable state/i)).not.toBeInTheDocument();
+  });
+
+  it("clears the refusal when a refresh succeeds", async () => {
+    vi.mocked(listStateNamespaces).mockRejectedValueOnce(new ApiError(401, STATE_401)).mockResolvedValue(NAMESPACES);
+    renderPanel();
+    await screen.findByTestId("state-unavailable");
+
+    await userEvent.click(screen.getByRole("button", { name: "Refresh" }));
+
+    expect(await screen.findByText("approvals")).toBeInTheDocument();
+    expect(screen.queryByTestId("state-unavailable")).not.toBeInTheDocument();
+  });
+
+  it("shows the unavailable notice in the entries pane when a namespace read is refused", async () => {
+    vi.mocked(listStateNamespaces).mockResolvedValue(NAMESPACES);
+    vi.mocked(listStateEntries).mockRejectedValue(new ApiError(401, STATE_401));
+    renderPanel();
+
+    await userEvent.click(await screen.findByText("approvals"));
+
+    expect(await screen.findByTestId("state-unavailable")).toHaveTextContent(/console session/i);
+    // The namespace list stays; only the entries pane reports the refusal.
+    expect(screen.getByText("dedupe")).toBeInTheDocument();
+    expect(screen.queryByText(STATE_401)).not.toBeInTheDocument();
+    expect(screen.queryAllByTestId("state-entry")).toHaveLength(0);
   });
 });

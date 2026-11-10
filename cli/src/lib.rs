@@ -4,7 +4,10 @@
 //! local runner container (via the generated `curie-aci-protocol` crate) and
 //! the platform API's committed OpenAPI surface. Task I1.
 
+pub mod agent_skills;
 pub mod api;
+pub mod api_requests;
+pub mod approval_wording;
 pub mod artifacts;
 pub mod bundle;
 pub mod channel;
@@ -28,6 +31,12 @@ pub mod eval_sampling;
 pub mod evals;
 pub mod examples;
 pub mod exit;
+pub mod factory_app;
+pub mod factory_config_migrate;
+pub mod factory_intake;
+pub mod factory_quickstart;
+pub mod factory_toolchain;
+pub mod forge_expiry;
 pub mod github_app;
 pub mod guide;
 pub mod installation;
@@ -42,11 +51,16 @@ pub mod modelpin;
 pub mod ndjson;
 pub mod observability;
 pub mod oci_registry;
+pub mod openrouter_credit;
 pub mod ops;
+pub mod process_migrate;
 pub mod queue;
 pub mod recipes;
 pub mod release_accept;
+pub mod remediation;
+pub mod remediation_policy;
 pub mod render;
+pub mod repo_runner;
 pub mod retired;
 pub mod runner;
 pub mod scaffold;
@@ -56,6 +70,7 @@ pub mod schema_window;
 pub mod schemas;
 pub mod seal;
 pub mod sealing;
+pub mod sealing_key;
 pub mod secrets;
 pub mod slack;
 pub mod spec;

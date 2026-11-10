@@ -54,7 +54,7 @@ of not discarding what is already computed.
 
 - **There is already a pre-execution seam that sees the arguments.**
   `build_can_use_tool` in
-  [`runner/src/curie_runner/approval.py`](../../runner/src/curie_runner/approval.py)
+  [`runner/src/curie_runner/harness/claude/approval.py`](../../runner/src/curie_runner/harness/claude/approval.py)
   is the SDK permission callback, and it receives `tool_name` **and
   `tool_input`** *before the call executes*. Its own docstring draws the
   distinction this design needs: the decision is "proactive -- the call is
@@ -71,7 +71,7 @@ of not discarding what is already computed.
   evidence blob."
 
 - **Cards with buttons on a channel already work.** `ApprovalCardStore` and
-  `apps/worker/src/curie_worker/blocks.py` in the worker render and track interactive cards, and the API
+  `packages/channel-gateway/src/curie_channel_gateway/slack/blocks.py` in the worker render and track interactive cards, and the API
   exposes `GET /{approval_id}`, `GET /{approval_id}/audit`, and
   `POST /{approval_id}/resolve`. A receipt with an Undo button is that machinery
   pointed at a different row.

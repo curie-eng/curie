@@ -53,7 +53,10 @@
         "streaming",
         "rich-cards",
         "threading",
-        "file-attachments"
+        "file-attachments",
+        "history-read",
+        "canvas-read",
+        "canvas-edit"
       ],
       "title": "ChannelCapability",
       "type": "string"
@@ -454,8 +457,20 @@
     },
     "ReplyAck": {
       "additionalProperties": false,
-      "description": "What an adapter answers with. ``ref`` is None when it mints no handle.",
+      "description": "What an adapter answers with. ``ref`` is None when it mints no handle.\n\n``channel`` is the conversation the provider says a new top-level post\nlanded in, when that differs from the address posted to (ADR 0272: a\nSlack post to a user id lands in the bot's DM with that user, a ``D...``\nid). None when the adapter reports no such conversation, and then omitted\nfrom the wire, so a strict reader that predates the field reads every\nother ack unchanged.",
       "properties": {
+        "channel": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Channel"
+        },
         "ref": {
           "anyOf": [
             {
@@ -678,10 +693,25 @@
           "default": null,
           "title": "Text"
         },
+        "text_mode": {
+          "anyOf": [
+            {
+              "const": "verbatim",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Reply wire 1.2. Preserve this text-only answer literally.",
+          "title": "Text Mode"
+        },
         "version": {
           "enum": [
             "1.0",
-            "1.1"
+            "1.1",
+            "1.2"
           ],
           "title": "Version",
           "type": "string"

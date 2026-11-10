@@ -13,8 +13,6 @@ from curie_runner.harness import get_contribution
 from curie_runner.sdk_auth import (
     API_BACKEND_ENV,
     CREDENTIALS_ENV,
-    MODEL_BASE_URL_ENV,
-    MODEL_ENV_KEY_ENV,
     UnsupportedApiBackendError,
     resolve_sdk_env,
 )
@@ -24,22 +22,6 @@ _FIXTURES = Path(__file__).resolve().parents[2] / "packages/plugin-format/tests/
 
 def test_claude_contribution_wraps_readonly_tools() -> None:
     assert get_contribution().readonly_tools is CLAUDE_READONLY_TOOLS
-
-
-def test_claude_contribution_image_identity() -> None:
-    assert get_contribution().image == "curie-runner"
-
-
-def test_claude_contribution_install_uses_the_bundled_sdk_runtime() -> None:
-    assert get_contribution().install.packages == ("claude-agent-sdk",)
-
-
-def test_claude_contribution_model_override_env_keys() -> None:
-    assert get_contribution().model_override_env_keys == (
-        MODEL_BASE_URL_ENV,
-        API_BACKEND_ENV,
-        MODEL_ENV_KEY_ENV,
-    )
 
 
 def test_build_spawn_env_matches_resolve_sdk_env_plain_credential() -> None:

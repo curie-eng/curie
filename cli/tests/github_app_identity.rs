@@ -20,7 +20,7 @@
 
 #![cfg(unix)]
 
-mod support;
+use crate::support;
 
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};

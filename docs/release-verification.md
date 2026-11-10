@@ -12,6 +12,33 @@ These artifacts are produced by the release workflow, so they exist on every
 release published *after* v0.4.0. Nothing below works against v0.4.0 or earlier,
 which shipped bare binaries.
 
+## Full kind proof can reuse a complete run on the same tree
+
+After release authorization, `release-kind-tier` in
+`.github/workflows/release.yaml` uses `release/kind_ci.py` to find one completed,
+successful `.github/workflows/ci.yaml` run whose head commit has exactly the
+tagged commit's tree. The commit SHAs may differ. The job logs the chosen run
+URL and whether it reused proof or dispatched CI.
+
+Reuse requires completed success for every required kind job and all 19
+canonical upgrade shards, including every factory, chart, and admitted agent
+matrix leg, the upgrade negative control, shard listing, and `E2E required`.
+The canonical shard listing determines the expected upgrade set; the observed
+jobs cannot shrink it. Overall success alone is insufficient: push CI omits
+kind, and a PR's smoke-only upgrade matrix is incomplete proof. Missing,
+skipped, incomplete, or unsuccessful required jobs refuse reuse. Nightly-only
+jobs may be skipped. [ADR 0239](adr/0239-release-kind-proof-reuses-a-complete-ci-run-on-the-same-tree.md)
+records the required coverage and decision.
+
+When no run qualifies, the gate dispatches `ci.yaml` on the tag with no workflow
+inputs and polls status GETs for the returned run ID. Transient HTTP 5xx
+responses retry within the same deadline. Only completed success passes;
+failure, cancellation, and deadline expiry keep publication blocked.
+
+This proof gate leaves release authorization unchanged. Reusing kind proof
+does not alter `release/authorize.py` or satisfy its separate ancestry and
+required-check rules.
+
 ## Patch releases name their trigger and live proof
 
 A patch release (`vX.Y.Z` where Z is not 0) names the defects that triggered it
@@ -24,10 +51,11 @@ trigger, and even that cut did not record live proof on the PR.
 The release pull request therefore carries two required sections, which the
 default [PR template](../.github/PULL_REQUEST_TEMPLATE.md) includes:
 
-- **Trigger** lists the issue numbers of the defects that caused the cut.
-- **Live proof** names a CI or ladder run URL that re-verified each trigger on
-  a live surface, or an explicit `waiver:` line with the reason no live run
-  was possible.
+1. **Trigger** lists the issue numbers of the defects that caused the cut.
+2. **Live proof** names a CI or ladder run URL that re-verified each trigger on
+   a live surface, the preparation PR's own CI through the exact standalone
+   marker `this-pr-ci`, or an explicit `waiver:` line with the reason no live
+   run was possible.
 
 `scripts/check-pr-body.sh` (the PR-body gate in
 [`.github/workflows/pr-body.yaml`](../.github/workflows/pr-body.yaml)) rejects a
@@ -35,10 +63,95 @@ patch release PR whose title matches `Prepare the vX.Y.Z release` when either
 section is missing, comment-only, or empty of those contents. Feature releases
 (`vX.Y.0`) are not this gate.
 
+The marker must occupy its own visible line inside **Live proof**:
+
+```markdown
+## Live proof
+
+this-pr-ci
+```
+
+A mention in prose, an HTML comment, or another section does not count. It
+references the preparation PR's own CI on its final head, so the body can be
+complete before that run has a URL. The marker passes the body-content check;
+it does not assert that CI has passed.
+
+The preparation PR's own CI run is proof for every rung CI actually ran on that
+tree. Do not rerun those rungs locally. A version-only preparation PR runs the
+local-release rung, version consistency, the schema window, release tests, and
+chart lint. A preparation PR that carries fixes is selected from its entire
+diff, including those fixes. `this-pr-ci` does not prove a live surface that CI
+did not run. Record a qualifying run URL or an explicit waiver for each trigger
+whose required live surface is outside that CI run.
+
 When an open issue is moved out of the milestone within 24 hours of the cut,
 comment on that issue naming the release it moved from. That is a process
 rule: the PR-body gate does not observe milestone moves. A milestone that
 reads "zero open issues" is not itself a reason to cut.
+
+## One preparation PR carries the fixes and version
+
+Prepare a patch cut in one short-lived branch targeting current `main`. Keep
+the trigger fixes and release preparation in the same PR; a separate candidate
+PR and candidate CI round are not required.
+
+1. Finish and review the fixes, tests, and documentation. Commit every change
+   outside the release's version-only path set before generating the atlas
+   snapshot. Record that final non-version commit's full SHA as the atlas pin.
+2. Generate the release snapshot from that pin. Run `curie dev bump-version
+   X.Y.Z` and register the snapshot in a following version/snapshot commit. The
+   only permitted paths after the pin are `charts/curie/Chart.yaml`,
+   `cli/Cargo.toml`, `cli/Cargo.lock`,
+   `docs/architecture-atlas/versions.json`, and
+   `docs/architecture-atlas/snapshots/<tag>.json`, plus
+   `cli/src/application_schema_windows.json` when its only change registers this
+   release's own window equal to the candidate. This is
+   `release/atlas.py::version_only_extra`; another release's snapshot or window
+   is outside it. Never register a window before the cut
+   ([ADR 0257](adr/0257-a-release-registers-its-schema-window-only-at-the-cut.md)).
+3. Open the preparation PR with the title `Prepare the vX.Y.Z release`, its
+   trigger issue numbers, and its Live proof. Run the required CI on the final
+   head. Those checks cover the combined preparation tree, including its
+   version identity. Keep the branch up to date with `main`. If the base or
+   any non-version change advances after the pin, update the branch, regenerate
+   the snapshot from the new final non-version commit, recreate the
+   version/snapshot commit, and rerun the required checks on that head.
+4. Merge only the reviewed, up-to-date head with its required checks passing.
+   The atlas gate accepts the resulting merge commit when the pin is its
+   ancestor and the aggregate delta from pin to merge contains only the
+   permitted paths, including an empty delta. A non-version merge change
+   requires a new pin and snapshot before tagging.
+
+The atlas pin and the CI proof commit serve different gates. Under
+[ADR 0195](adr/0195-a-version-only-delta-reuses-its-parents-checks.md) as amended
+by [ADR 0247](adr/0247-a-tree-identical-parent-or-a-schema-window-registration-reuses-checks.md),
+the release authorizer can reuse green required checks from two kinds of commit
+when the tagged commit's own checks are absent or still running.
+
+1. A tree-identical parent. A parent of the tagged commit, including the second
+   parent of a merge, whose git tree equals the tagged commit's tree, with every
+   required check green, is the proof. An up-to-date preparation merge has the
+   same tree as its checked PR head, so that head is accepted. This is checked
+   first.
+2. A version-only first-parent ancestor. The walk continues across the
+   version-only path set. A delta that also changes
+   `cli/src/application_schema_windows.json` continues the walk only when it
+   adds exactly the release's own schema window, equal to the ancestor's
+   candidate, and changes nothing else. The atlas pin gate and the PR selector
+   apply the same rule under
+   [ADR 0257](adr/0257-a-release-registers-its-schema-window-only-at-the-cut.md).
+
+The authorizer prints which path it used and the proof commit, for example
+`checked via tree-identical parent <sha> ...` or
+`checked via version-only ancestor <sha> ...`. A merge that is not tree-identical
+to its head, because `main` moved after the branch was last updated, still waits
+for its own required checks on `main`. Contrary required evidence on the tagged
+commit itself, such as a failed, cancelled, or skipped required check, still
+refuses in both cases.
+
+[Draft ADR 0196](adr/0196-combined-preparation-pr-checks.md) remains a Draft and
+is not authority. The tree-identical case above covers the up-to-date
+preparation merge it describes.
 
 ## What each release publishes
 
@@ -52,6 +165,10 @@ reads "zero open issues" is not itself a reason to cut.
 | `<asset>.spdx.json` | SPDX SBOM, one per asset |
 | `checksums.txt` | sha256 of every file above |
 | `checksums.txt.sigstore.json` | cosign signature over `checksums.txt` |
+
+Container images are not release assets. The release workflow publishes them to
+GHCR (GitHub Container Registry) with the signatures and attestations described
+in [Verify a container image](#verify-a-container-image).
 
 Every asset also carries [SLSA (Supply-chain Levels for Software Artifacts)
 build provenance](https://slsa.dev/), naming the repository, the workflow, and
@@ -137,7 +254,10 @@ provenance statement, including the commit the build ran from.
 ## Verify the chart and the compose file
 
 Same two steps, different asset. The chart and compose file are data rather than
-executables, but a tampered chart deploys tampered images:
+executables, but a tampered chart can point at different images. The released
+chart pins each first-party image to a signed digest (see
+[Verify a container image](#verify-a-container-image)), so a chart that passes
+the check below deploys exactly the images the release built:
 
 ```bash
 curl -fsSLO "$BASE/compose.release.yaml"
@@ -153,6 +273,91 @@ up` or `curie local up`, caching them under `~/.cache/curie/`. That fetch
 does not verify them today: it is protected by HTTPS to GitHub, not by the
 signature. Verify them by hand as above if you need the stronger guarantee.
 
+## Verify a container image
+
+Every image the release publishes is a multi-arch index: `curie-runner`,
+`curie-api`, `curie-dispatcher`, `curie-mail-adapter`, `curie-worker`,
+`curie-ui`, `curie-sre-bot-tempo`, `curie-sre-bot-self-upgrade`,
+`curie-worker-local`, and `curie-dark-factory-runner`. Each index carries:
+
+- a BuildKit SPDX SBOM and a SLSA provenance attestation per platform;
+- a keyless cosign signature over the index digest, made by the release
+  workflow's GitHub OIDC identity;
+- a GitHub build provenance attestation, pushed to the registry.
+
+This runs on every push to `main` or `next` (`sha-<commit>` tags) and on every
+`v*` tag. The released chart pins every first-party image it deploys to the
+index digest that release built. The chart job verifies each signature before it
+pins.
+
+**Read the pinned digests from the released chart.** Either command works:
+
+```bash
+helm show values curie-<version>.tgz | grep -n 'digest: "sha256'
+helm template x curie-<version>.tgz | grep -E 'image: "?ghcr.io/curie-eng/curie-'
+```
+
+**Resolve a tag to its digest** when you have only a tag:
+
+```bash
+docker buildx imagetools inspect ghcr.io/curie-eng/curie-api:<version> \
+  --format '{{json .Manifest}}' | jq -r .digest
+```
+
+**Verify the signature.** The identity is pinned to the release workflow and
+ref, so a signature from any other workflow, repo, or ref fails:
+
+```bash
+cosign verify ghcr.io/curie-eng/curie-api@<digest> \
+  --certificate-identity "https://github.com/curie-eng/curie/.github/workflows/release.yaml@refs/tags/v<version>" \
+  --certificate-oidc-issuer https://token.actions.githubusercontent.com
+```
+
+For a `sha-<commit>` build from a branch, the identity ends in
+`@refs/heads/main` or `@refs/heads/next` instead of the tag ref. To accept
+either branch, use a fully anchored, escaped pattern in place of
+`--certificate-identity`. A looser pattern can accept a signature from
+another workflow or ref.
+
+```bash
+cosign verify ghcr.io/curie-eng/curie-api@<digest> \
+  --certificate-identity-regexp '^https://github\.com/curie-eng/curie/\.github/workflows/release\.yaml@refs/heads/(main|next)$' \
+  --certificate-oidc-issuer https://token.actions.githubusercontent.com
+```
+
+**Verify the build provenance:**
+
+```bash
+gh attestation verify oci://ghcr.io/curie-eng/curie-api@<digest> \
+  --repo curie-eng/curie \
+  --signer-workflow curie-eng/curie/.github/workflows/release.yaml
+```
+
+**Read the SBOM and BuildKit provenance.** Both are stored per platform:
+
+```bash
+docker buildx imagetools inspect ghcr.io/curie-eng/curie-api@<digest> --format '{{ json .SBOM }}'
+docker buildx imagetools inspect ghcr.io/curie-eng/curie-api@<digest> --format '{{ json .Provenance }}'
+# one platform only
+docker buildx imagetools inspect ghcr.io/curie-eng/curie-api@<digest> \
+  --format '{{ json (index .SBOM "linux/amd64").SPDX }}'
+```
+
+The attestation manifests are referenced by digest from the signed index. So
+verifying the index signature covers them: you do not sign or check each
+platform separately.
+
+**Overriding a tag on the released chart.** The pinned digest wins over the
+tag. To run a different tag, clear that image's digest too:
+
+```bash
+helm upgrade curie curie-<version>.tgz \
+  --set api.image.tag=<other-tag> --set api.image.digest=
+```
+
+The source-tree chart keeps `digest` empty and falls back to the chart
+`appVersion` tag. Only the released chart asset is pinned.
+
 ## SBOMs (Software Bill of Materials)
 
 Each asset ships an SPDX (Software Package Data Exchange) 2.3 SBOM at
@@ -165,8 +370,8 @@ it the same way before trusting it:
 - **Chart and compose** -- these are deployment manifests with no dependencies of
   their own, so their SBOMs inventory the packaged artifact itself and little
   else. The dependency graph of what they deploy belongs to the `curie-*`
-  container images, and those do **not** carry SBOMs or provenance yet: that is
-  issue #62, still open. Do not read a verified chart as a verified stack.
+  container images. Those carry their own SBOMs, read from the registry as
+  described in [Verify a container image](#verify-a-container-image).
 
 Scan one with any SPDX-aware tool, for example
 [grype](https://github.com/anchore/grype):
@@ -209,8 +414,10 @@ which is a reviewed edit rather than a side effect.
   `xattr -d com.apple.quarantine ./curie-aarch64-apple-darwin` (or right-click
   the binary in Finder and choose Open). Verify it with cosign or
   `gh attestation verify` as above -- that is the real check regardless.
-- **Container images.** GHCR (GitHub Container Registry) image signing,
-  provenance, and SBOMs are issue #62.
+- **Compose image pinning.** The released chart pins images by digest.
+  `compose.release.yaml` does not: it still pins each image by version tag, so
+  the images it pulls are not tied to a signed digest until you verify them as
+  above.
 - **The SBOM generator's own supply chain.** `anchore/sbom-action` is pinned to a
   commit SHA, but on Linux and macOS it fetches `install.sh` from the `anchore/syft`
   `main` branch at run time, so the SBOM step still executes mutable upstream code

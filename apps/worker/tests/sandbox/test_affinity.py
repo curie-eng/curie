@@ -40,6 +40,82 @@ def test_round_trip_and_ttl(affinity: AffinityStore, redis_client: redis.Redis) 
     assert not affinity.touch("missing", ttl_seconds=90)
 
 
+def test_credential_inventory_does_not_imply_retirement(affinity: AffinityStore) -> None:
+    affinity.remember_claim_credential("claim-active", "acme-agent", "acme-credential", ttl_s=60)
+    assert affinity.claim_credential("claim-active") == ("acme-agent", "acme-credential")
+    assert affinity.iter_claim_credentials() == [
+        ("claim-active", "acme-agent", "acme-credential")
+    ]
+    assert not affinity.claim_credential_retiring("claim-active")
+    assert not affinity.claim_credential_retiring("claim-absent")
+
+
+def test_retirement_is_durable_nonrenewing_and_forgotten_with_credential(
+    affinity: AffinityStore,
+    redis_client: redis.Redis,
+    pressure_redis_factory: Callable[[], AsyncRedis],
+    key_prefix: str,
+    request: pytest.FixtureRequest,
+) -> None:
+    pressure = pressure_redis_factory()
+    request.addfinalizer(lambda: asyncio.run(pressure.aclose()))
+    independent = AffinityStore(redis_client, pressure_client=pressure, key_prefix=key_prefix)
+    affinity.remember_claim_credential("claim-retiring", "acme-agent", "acme-credential", ttl_s=60)
+    credential_keys = list(redis_client.scan_iter(match=f"{key_prefix}:*"))
+    assert len(credential_keys) == 1
+    original_expiry = redis_client.pexpiretime(credential_keys[0])
+    affinity.mark_claim_credential_retiring("claim-retiring", ttl_s=10)
+    assert independent.claim_credential_retiring("claim-retiring")
+    keys = list(redis_client.scan_iter(match=f"{key_prefix}:*"))
+    assert len(keys) == 2
+    expiries = {key: redis_client.pexpiretime(key) for key in keys}
+    assert expiries[credential_keys[0]] == original_expiry
+    for _ in range(3):
+        independent.mark_claim_credential_retiring("claim-retiring", ttl_s=60)
+        assert {key: redis_client.pexpiretime(key) for key in keys} == expiries
+    assert independent.iter_claim_credentials() == [
+        ("claim-retiring", "acme-agent", "acme-credential")
+    ]
+    affinity.remember_claim_credential(
+        "claim-control", "acme-agent", "control-credential", ttl_s=60
+    )
+    independent.forget_claim_credential("claim-retiring")
+    independent.forget_claim_credential("claim-retiring")
+    assert affinity.claim_credential("claim-retiring") is None
+    assert not affinity.claim_credential_retiring("claim-retiring")
+    assert all(not redis_client.exists(key) for key in keys)
+    assert affinity.claim_credential("claim-control") == ("acme-agent", "control-credential")
+
+
+@pytest.mark.parametrize(("credential_ttl", "retirement_ttl"), [(1, 2), (2, 1)])
+def test_expired_credential_and_retirement_leave_no_inventory_or_index(
+    affinity: AffinityStore,
+    redis_client: redis.Redis,
+    key_prefix: str,
+    credential_ttl: int,
+    retirement_ttl: int,
+) -> None:
+    affinity.remember_claim_credential(
+        "claim-expiring", "acme-agent", "acme-credential", ttl_s=credential_ttl
+    )
+    affinity.mark_claim_credential_retiring("claim-expiring", ttl_s=retirement_ttl)
+    keys = list(redis_client.scan_iter(match=f"{key_prefix}:*"))
+    assert len(keys) == 2
+    assert all(0 < redis_client.pttl(key) <= 2_000 for key in keys)
+    deadline = time.monotonic() + 4
+    while any(redis_client.exists(key) for key in keys):
+        if time.monotonic() >= deadline:
+            raise RuntimeError("credential lifecycle keys did not expire")
+        time.sleep(0.01)
+    assert affinity.claim_credential("claim-expiring") is None
+    assert not affinity.claim_credential_retiring("claim-expiring")
+    assert affinity.iter_claim_credentials() == []
+    assert not list(redis_client.scan_iter(match=f"{key_prefix}:*"))
+    affinity.remember_claim_credential("claim-new", "acme-agent", "new-credential", ttl_s=60)
+    assert affinity.claim_credential("claim-new") == ("acme-agent", "new-credential")
+    assert not affinity.claim_credential_retiring("claim-new")
+
+
 def test_put_if_absent_loses_race(affinity: AffinityStore) -> None:
     first = RouteRecord(handle=_handle(claim="claim-a"))
     second = RouteRecord(handle=_handle(claim="claim-b"))

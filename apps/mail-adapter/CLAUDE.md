@@ -7,13 +7,23 @@ the enforceable-rule summary.
 ## Load-bearing invariants
 
 - **The adapter holds no platform API key, no queue credential, and no platform
-  database access.** Its only credentials are `CURIE_CHANNEL_TOKEN` (presented as
-  `X-API-Key` on ingress), `CURIE_EGRESS_SECRET` (checked on every inbound POST)
-  and `AGENTMAIL_API_KEY`. Do not add `CURIE_API_KEY`, a Valkey client, or a DB
+  database access.** Its credentials are `CURIE_CHANNEL_TOKEN` (presented as
+  `X-API-Key` on ingress), `CURIE_EGRESS_SECRET` (checked on every inbound POST),
+  `AGENTMAIL_API_KEY`, and the optional `CURIE_ADAPTER_PRINCIPAL` (ADR-0156,
+  presented on approval answers and opt-in self-rotation). The
+  optional `CURIE_MAIL_RECEIVER_KEY` is its email receiver key (ADR 0260): it
+  signs the sender of each turn through the shared
+  `curie_internal.identity_context` signer and authorizes nothing alone. It also
+  signs each email approval answer it carries, as the shared
+  `EmailApprovalAnswerProofV1` (ADR 0267), over the exact resolve bytes. Never
+  add a second canonicalisation or MAC here, and never post a turn or an answer unsigned when
+  the receiver is configured. Do not add `CURIE_API_KEY`, a Valkey client, or a DB
   session to the platform here; a capability the adapter does not hold cannot be
-  stolen from it, and re-minting an expired `chn` token is an operator step for
-  exactly that reason. Its local SQLite file is delivery state, not a platform
-  capability, and must never contain any of the three credentials.
+  stolen from it. `CURIE_MAIL_SELF_ROTATE` is off by default. When enabled,
+  `credential_rotation.py` renews both scoped credentials, serializes channel mint and
+  ingress, and stores them in a separate owner-only SQLite snapshot beside the
+  journal. The delivery journal must never contain credentials. Treat the
+  snapshot, its volume and backups as bearer-credential storage.
 - **Reply text and its send target are owned at `(conversation_id, reply_ref)`.**
   Every update and completion uses that exact durable pair, and the send target
   is only the event's `target.reply_ref`. Never derive a target or accumulated
@@ -40,20 +50,11 @@ the enforceable-rule summary.
   permanent 503. A confirmed provider thread 404 for an admitted reply is the
   exception: persist a deleted receipt and return 410, including on duplicates
   and restart, so the worker dead-letters it without claiming delivery.
-- **The inbound gate is two checks, in order: the provider's verdict labels, then
-  the allow-list.** They are not equivalent and the ordering is not incidental.
-  The provider's filtering is the real control; the label check is defense in
-  depth that should never fire in a correct install; the allow-list is a filter on
-  an attacker-controlled `From` header. **Never describe the allow-list as
-  authenticating a sender** in code, comments, docs or chart values: Curie
-  performs no sender authentication.
+- **Reply all only for the approval request, its reminders and its outcome** (ADR-0177 amendment A5 and ADR-0273 decision 3). Every other send stays sender-only, so the resumed answer reaches the requester. Never mail an address that is not already on the thread: the requester copies approvers in. The card's `Approver` fields word the email and decide nothing.
 - **`list_messages` always sends all three `include_*=false`.** They are
   constants in `agentmail.py`, not parameters and not config, so no caller and no
   operator can turn them on. Sending them when they are already the provider's
   default is the point: a changed default cannot silently widen the install.
-- **`conversations` is written only after both inbound checks pass.** Pre-seeding
-  it from the poll listing, however convenient, silently removes the allow-list's
-  protection of egress.
 - **Admission is bounded before state or body allocation.** At the pending or
   state-byte cap, leave provider mail unclaimed and unmodified so later capacity
   can recover it. Never evict an unresolved delivery merely to admit a newer one.
@@ -66,7 +67,7 @@ the enforceable-rule summary.
   content into the cluster log-retention system.
 - **Every log record leaves through the shared service logger, and that filter
   is a backstop, not a licence.** `main()` calls `bootstrap_service_telemetry`
-  on the *package* logger `curie_mail_adapter`, which installs one redacting
+  on the *package* logger `curie_channel_gateway.mail`, which installs one redacting
   single-line-JSON stderr handler and sets `propagate=False` there; `run`,
   `adapter` and `egress` each hold a `getLogger(__name__)` child, so one
   bootstrap covers all three and nothing walks past it to a root handler. Do not
@@ -86,13 +87,64 @@ the enforceable-rule summary.
   installs the resource and the exporters, so records and any future spans carry
   `service.name: curie-mail-adapter`, but neither the poll loop nor the egress
   path is instrumented -- traces will show nothing from it until that lands.
-- **Empty allow-list plus ingress enabled is a boot failure, not deny-all.** The
-  inbox is a public mailbox by construction, so fail-open would make every install
-  an open trigger for agent turns. Allow-all must be written as `*`.
 - **One SQLite file has one serialized writer and the chart pins one replica.**
   Every poller and egress transaction uses the adapter-owned lock. Adding a
   second replica or changing `Recreate` to rolling update creates two writers;
   horizontal scale needs a separately accepted shared-store design.
+  `CURIE_MAIL_EXCLUSIVE_WAL` (default off) is the single-process network-volume
+  opt-in: exclusive locking before the first WAL access, still one writer.
+
+## Inbound gate
+
+**The adapter is neutral; the mail service is a provider (ADR 0228).** The
+adapter calls only the `MailProvider` protocol in `provider.py`; AgentMail is
+`agentmail.AgentMailProvider`. Never read a provider's raw shape (labels,
+`extracted_text`, header maps, HTTP statuses) outside its provider module, and
+never let a provider own approval logic.
+
+**An email approval answer passes the same gate as a turn**, before approval
+resolution: `_listing_rejection` before any fetch, `_message_rejection` after
+it. The reference parser and the resolution transport are reached only from
+the intake path, after a `verified` verdict whose domain equals the one From
+mailbox's domain. They cannot authenticate a sender themselves and must never
+be exposed to unauthenticated intake. A provider that declares
+`verifies_senders` false (AgentMail) refuses every message from the listing.
+
+The parser's ADR-0177 rules remain: an answer is never a turn, its reference
+must be live and issued in this thread, it must not be sent automatically
+(missing headers count as automatic), and its decision word is on the first
+line of `extracted_text` only, never the full body. The reference links a reply
+to its approval; it is not proof of identity. **Who may answer is the platform's
+decision** (ADR-0177 amendment): the actor
+is the sender's bare lowercased address, never a display name, and the
+platform checks the binding's `allowed_callers` and the route's approver
+`emails`. Do not add a local approver or requester filter. A
+`caller_not_allowed` refusal gets nothing back. Never respond to an automatic
+message. A settled card spends its reference.
+
+**Inbound mail fails closed before a turn or approval can be admitted.** A
+sender must match the allowlist and carry a `verified` sender verdict from a
+provider that verifies senders. A provider may build `verified` only from
+results the receiving mail system attaches and the service guarantees a sender
+cannot supply. A provider label, absence of a rejection label, or any header a
+sender could have written never counts as that verdict. AgentMail supplies no
+trusted positive aligned verdict, guarantees neither header provenance nor
+stripping, and permits DMARC failure under `p=none`; its provider therefore
+declares `verifies_senders` false and every AgentMail message is refused with
+`authentication_unverifiable`. Never describe the allowlist or provider
+filtering as authenticating a sender. See the provider evidence in the README
+before proposing a new authentication source.
+
+**`conversations` is written only after sender authentication and allowlist
+checks pass.** Never seed it from a poll listing. Every current AgentMail
+message fails authentication and must not create a conversation or egress target.
+
+**An empty allowlist fails boot while ingress is enabled.** The error asks
+for explicit sender addresses or domains and never suggests `*`. A list
+containing `*` fails boot unless `CURIE_MAIL_ALLOW_ALL_SENDERS=true` is explicitly
+set. Its default is `false`; the chart key is `mailAdapter.allowAllSenders`.
+This opt in permits wildcard configuration only and never bypasses sender
+authentication. Every current AgentMail message is still refused.
 
 ## Config surface
 
@@ -101,7 +153,8 @@ the enforceable-rule summary.
 `CURIE_CHANNEL_TOKEN`, `CURIE_EGRESS_SECRET`, `ADAPTER_INGRESS_ENABLED` and the
 `CURIE_MAIL_*` knobs. Full table in `apps/mail-adapter/README.md`, and
 `tests/test_config.py` fails if the table and the code drift apart. A new field
-means a new README row.
+means a new README row. `CURIE_MAIL_PROVIDER` picks the provider; a provider
+reads its own settings, and only the built-in reads `AGENTMAIL_*`.
 
 ## Verify (AgentMail-free)
 
@@ -109,11 +162,17 @@ means a new README row.
 uv run pytest apps/mail-adapter/tests -q
 ```
 
+The intake path and approvals by email are driven end to end through
+`tests/_verifying_provider.py`, a provider that speaks AgentMail's wire to the
+fake server and takes its verdict from a field only the fake receiving system
+sets. `tests/test_provider_conformance.py` runs the conformance kit against
+both providers.
+
 Only the two external dependencies are faked, both as real local
 `ThreadingHTTPServer` instances: AgentMail's API and the platform's channel
-ingress. Nothing inside `curie_mail_adapter` is patched. The fake AgentMail
-server reproduces the provider's documented filtering rather than serving
-whatever it is handed, because a test built on a fake that serves labeled mail
-the real provider would have withheld proves nothing about production. A new test
-that patches an internal function instead of driving it through those servers does
+ingress. Nothing inside `curie_channel_gateway.mail` is patched. The fake AgentMail
+server exercises the adapter's own admission decision, including unlabelled
+spoofed mail, allowlisted senders without verifiable verdicts, and approval
+answers. Provider filtering cannot stand in for that decision. A new test that
+patches an internal function instead of driving it through those servers does
 not meet this package's bar.

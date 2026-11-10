@@ -18,8 +18,8 @@ import anyio
 import pytest
 import yaml
 from curie_runner.__main__ import build_runner
-from curie_runner.approval import build_approval_hook
 from curie_runner.config import RunnerConfig
+from curie_runner.harness.claude.approval import build_approval_hook
 
 BUNDLE = Path(__file__).resolve().parents[2] / "examples" / "sre-bot"
 _BUDGET = '{"max_output_tokens_per_run": 10000, "max_usd_per_day": 1.0}'

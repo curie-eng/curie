@@ -14,7 +14,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 
-mod support;
+use crate::support;
 
 use curie_aci_protocol::PROTOCOL_VERSION;
 use support::{serve, Response};
@@ -24,6 +24,144 @@ const UNREACHABLE_API_URL: &str = "http://127.0.0.1:1";
 const INVALID_API_URL: &str = "localhost:8000";
 const INVALID_RUNNER_URL: &str = "localhost:8787";
 const DOCKER_FAILURE_SENTINEL: &str = "curie-1655-docker-command-failure";
+
+const SNAPSHOT_DOCKER_FIXTURE: &str = r#"#!/usr/bin/env python3
+import json
+import os
+from pathlib import Path
+import re
+import shutil
+import sqlite3
+import sys
+
+CONFLICT_NAME = None
+root = Path(os.environ.get("CURIE_TEST_DEMO_STATE", Path(__file__).parent))
+db = sqlite3.connect(root / "docker-state.sqlite3")
+db.execute("CREATE TABLE IF NOT EXISTS objects (kind TEXT, name TEXT, body TEXT, PRIMARY KEY (kind, name))")
+args = sys.argv[1:]
+kind = "container"
+if args[0] in ("container", "volume", "image"):
+    kind = args.pop(0)
+command = args.pop(0)
+
+def option(flag, default=None):
+    return args[args.index(flag) + 1] if flag in args else default
+
+def labels():
+    return dict(args[i + 1].split("=", 1) for i, arg in enumerate(args) if arg == "--label")
+
+def objects(object_kind):
+    return [(name, json.loads(body)) for name, body in db.execute("SELECT name, body FROM objects WHERE kind = ?", (object_kind,))]
+
+def save(object_kind, name, body):
+    db.execute("INSERT OR REPLACE INTO objects VALUES (?, ?, ?)", (object_kind, name, json.dumps(body)))
+    db.commit()
+
+def fail(message, code=93):
+    print(message, file=sys.stderr)
+    sys.exit(code)
+
+if kind == "image" and command == "inspect":
+    sys.exit(0)
+if command == "create":
+    name = args[-1] if kind == "volume" else option("--name")
+    body = {"Name": name, "Labels": labels()}
+    if kind == "container":
+        mount = dict(field.split("=", 1) for field in option("--mount").split(",") if "=" in field)
+        if mount.get("type") != "volume" or mount.get("source") not in dict(objects("volume")):
+            fail("seed container requires an existing named volume")
+        body = {"Id": name, "Name": "/" + name, "Config": {"Labels": labels(), "Env": []},
+                "Mounts": [{"Type": "volume", "Name": mount["source"], "Destination": mount["target"], "RW": True}]}
+    save(kind, name, body)
+    print(name)
+elif command == "cp":
+    source, destination = args[-2:]
+    container, target = destination.split(":", 1)
+    seed = dict(objects("container")).get(container)
+    if not Path(source).is_dir() or seed is None:
+        fail("copy requires a client directory and an existing seed container")
+    mount = next((mount for mount in seed["Mounts"] if mount["Destination"] == target), None)
+    if mount is None:
+        fail("copy destination must be the seed container's mounted input")
+    volume = dict(objects("volume"))[mount["Name"]]
+    volume["Seeded"] = True
+    save("volume", mount["Name"], volume)
+elif command == "run":
+    if CONFLICT_NAME is not None:
+        fail(f'docker: Error response from daemon: Conflict. The container name "/{CONFLICT_NAME}" is already in use by container "9f2c".', 125)
+    env = [args[i + 1] for i, arg in enumerate(args) if arg == "-e"]
+    session_id = next((value.split("=", 1)[1] for value in env if value.startswith("CURIE_SESSION_ID=")), "")
+    if not session_id:
+        fail("runner startup omitted its session identity")
+    name = option("--name")
+    volume, target, mode = option("-v").split(":")
+    if not dict(objects("volume")).get(volume, {}).get("Seeded"):
+        fail("runner requires its seeded snapshot volume")
+    save("container", name, {"Id": "fixture-runner-id", "Name": "/" + name,
+         "Config": {"Labels": labels(), "Env": env},
+         "Mounts": [{"Type": "volume", "Name": volume, "Destination": target, "RW": "ro" not in mode.split(",")}]})
+    (root / "started").write_text(session_id)
+    print("fixture-runner-id")
+elif command == "inspect":
+    name = args[-1]
+    body = next((body for key, body in objects(kind) if name in (key, body.get("Id"))), None)
+    if body is None:
+        fail(f"Error: No such {kind}: {name}", 1)
+    template = option("--format")
+    if template is None:
+        print(json.dumps([body]))
+    elif template == "{{json .}}":
+        print(json.dumps(body))
+    elif template == "{{json .Mounts}}":
+        print(json.dumps(body["Mounts"]))
+    elif template in ("{{json .Config.Labels}}", "{{json .Labels}}"):
+        print(json.dumps(body["Config"]["Labels"] if kind == "container" else body["Labels"]))
+    elif "Labels" in template:
+        values = body["Config"]["Labels"] if kind == "container" else body["Labels"]
+        keys = re.findall(r'index \.(?:Config\.)?Labels "([^"]+)"', template)
+        if "{{if eq" in template:
+            print(values.get(keys[-1], "") if values.get("curietech.ai/managed-by") == "curie-cli" else "")
+        else:
+            print(" ".join(values.get(key, "") for key in keys))
+    else:
+        fail(f"unsupported inspect template: {template}")
+elif command in ("ps", "ls"):
+    filters = [args[i + 1] for i, arg in enumerate(args) if arg == "--filter"]
+    for name, body in objects(kind):
+        values = body["Config"]["Labels"] if kind == "container" else body["Labels"]
+        if any(not re.search(value[5:], name) for value in filters if value.startswith("name=")):
+            continue
+        if any(values.get(value[6:].split("=", 1)[0]) != value[6:].split("=", 1)[1]
+               for value in filters if value.startswith("label=")):
+            continue
+        if kind == "volume" or "-q" in args:
+            print(body.get("Id", name))
+        else:
+            print(f'{name}\t{body["Id"]}\t{values.get("curietech.ai/managed-by", "")}')
+elif command == "rm":
+    for name in (arg for arg in args if not arg.startswith("-")):
+        entry = next(((key, body) for key, body in objects(kind) if name in (key, body.get("Id"))), None)
+        if entry is None:
+            fail(f"Error: No such {kind}: {name}", 1)
+        key, body = entry
+        if kind == "container" and body["Id"] == "fixture-runner-id":
+            session_id = (root / "started").read_text()
+            (root / "teardown-attempted").write_text(session_id)
+            if os.environ.get("CURIE_TEST_DEMO_MODE") == "teardown":
+                fail("fixture teardown failed", 37)
+            (root / "started").unlink()
+            if os.environ.get("CURIE_TEST_DEMO_MODE") == "remove":
+                for demo in Path(os.environ["TMPDIR"]).glob("curie-try-*"):
+                    shutil.rmtree(demo)
+                    demo.write_text("fixture prevents directory removal")
+        if kind == "volume" and any(mount.get("Name") == name for _, container in objects("container") for mount in container["Mounts"]):
+            fail(f"volume is in use: {name}", 1)
+        db.execute("DELETE FROM objects WHERE kind = ? AND name = ?", (kind, key))
+        db.commit()
+        print(name)
+else:
+    fail(f"unexpected Docker command: {sys.argv[1:]}")
+"#;
 
 fn streamed_reply(status: &str, include_final: bool) -> Response {
     let mut frames = vec![
@@ -142,42 +280,7 @@ fn run_demo(mode: &str, json: bool) -> Output {
     fs::create_dir(&bin).unwrap();
     fs::create_dir(&demos).unwrap();
     let docker = bin.join("docker");
-    fs::write(
-        &docker,
-        r#"#!/bin/sh
-case "$1" in
-  image) exit 0 ;;
-  ps)
-    case "$*" in
-      *'name=^curie-runner-local$'*)
-        if [ -f "$CURIE_TEST_DEMO_STATE/started" ]; then
-          printf 'curie-runner-local\tfixture-runner-id\tcurie-cli\n'
-        fi ;;
-    esac
-    exit 0 ;;
-  run)
-    printf started > "$CURIE_TEST_DEMO_STATE/started"
-    printf 'fixture-runner-id\n'
-    exit 0 ;;
-  rm)
-    printf removed > "$CURIE_TEST_DEMO_STATE/teardown-attempted"
-    if [ "$CURIE_TEST_DEMO_MODE" = teardown ]; then
-      printf 'fixture teardown failed\n' >&2
-      exit 37
-    fi
-    /bin/rm "$CURIE_TEST_DEMO_STATE/started"
-    if [ "$CURIE_TEST_DEMO_MODE" = remove ]; then
-      for demo in "$TMPDIR"/curie-try-*; do
-        /bin/rm -rf "$demo"
-        printf 'fixture prevents directory removal' > "$demo"
-      done
-    fi
-    exit 0 ;;
-  *) printf 'unexpected docker command: %s\n' "$*" >&2; exit 93 ;;
-esac
-"#,
-    )
-    .expect("write demo Docker fixture");
+    fs::write(&docker, SNAPSHOT_DOCKER_FIXTURE).expect("write demo Docker fixture");
     fs::set_permissions(&docker, fs::Permissions::from_mode(0o755)).unwrap();
     let mut command = Command::new(env!("CARGO_BIN_EXE_curie"));
     if json {
@@ -186,11 +289,15 @@ esac
     command
         .arg("try")
         .current_dir(scratch.path())
-        .env("PATH", &bin)
+        .env(
+            "PATH",
+            crate::support::executable::fixture_python_path(&bin),
+        )
         .env("TMPDIR", &demos)
         .env("CURIE_CONFIG_DIR", scratch.path().join("config"))
         .env("CURIE_TEST_DEMO_STATE", scratch.path())
-        .env("CURIE_TEST_DEMO_MODE", mode);
+        .env("CURIE_TEST_DEMO_MODE", mode)
+        .env_remove("DOCKER_PUBLISHED_HOST");
     for name in curie::commands::MODEL_CREDENTIAL_ENV_NAMES {
         command.env_remove(name);
     }
@@ -478,7 +585,7 @@ fn run_invalid_runner_message(debug: bool) -> Output {
         .expect("run skill message with an invalid runner URL")
 }
 
-fn run_skill_up_with_path(debug: bool, path: &Path, name: &str) -> Output {
+fn run_skill_up_with_path(debug: bool, path: impl AsRef<std::ffi::OsStr>, name: &str) -> Output {
     let dir = tempfile::tempdir().expect("create plugin directory");
     curie::scaffold::scaffold(dir.path(), "acme-agent").expect("scaffold plugin");
     let mut command = Command::new(env!("CARGO_BIN_EXE_curie"));
@@ -549,13 +656,9 @@ fn executable_docker_lost_race_stub(container_name: &str) -> tempfile::TempDir {
     let docker = dir.path().join("docker");
     fs::write(
         &docker,
-        format!(
-            "#!/bin/sh\n\
-             case \"$1\" in\n\
-               ps) exit 0 ;;\n\
-               run) printf '%s\\n' 'docker: Error response from daemon: Conflict. The container name \"/{container_name}\" is already in use by container \"9f2c\".' >&2; exit 125 ;;\n\
-               *) printf '%s\\n' 'unexpected docker command' >&2; exit 93 ;;\n\
-             esac\n"
+        SNAPSHOT_DOCKER_FIXTURE.replace(
+            "CONFLICT_NAME = None",
+            &format!("CONFLICT_NAME = {container_name:?}"),
         ),
     )
     .expect("write Docker race stub");
@@ -1189,7 +1292,8 @@ fn skill_up_docker_command_failure_keeps_the_command_diagnosis() {
 fn skill_up_lost_name_race_keeps_the_specialized_replacement_remedy() {
     let container_name = "acme-1655-docker-name-race";
     let stub = executable_docker_lost_race_stub(container_name);
-    let human = run_skill_up_with_path(false, stub.path(), container_name);
+    let path = crate::support::executable::fixture_python_path(stub.path());
+    let human = run_skill_up_with_path(false, &path, container_name);
     let human_stderr = String::from_utf8_lossy(&human.stderr);
     assert_eq!(
         human.status.code(),
@@ -1246,8 +1350,48 @@ fn seal_rejects_invalid_connector_names_as_usage_with_a_fix() {
 }
 
 #[test]
+fn seal_rejects_reserved_connector_names_as_usage_with_a_fix() {
+    for connector in ["curie", "curie-state"] {
+        let output = run_seal(connector, true);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(
+            output.status.code(),
+            Some(ExitClass::Usage.code()),
+            "{connector:?} must be rejected as Usage\nstdout: {stdout}\nstderr: {stderr}"
+        );
+        let payload: serde_json::Value = serde_json::from_slice(&output.stdout)
+            .unwrap_or_else(|err| panic!("{connector:?} must emit JSON: {err}; {stdout}"));
+        assert!(
+            payload["error"]
+                .as_str()
+                .is_some_and(|error| error.contains(connector) && error.contains("reserved")),
+            "{connector:?} must be named as reserved: {payload}"
+        );
+        assert!(
+            payload["fix"]
+                .as_str()
+                .is_some_and(|fix| fix.contains("rename")),
+            "{connector:?} must include rename guidance: {payload}"
+        );
+        assert!(
+            payload.get("sealed").is_none() && payload.get("yaml").is_none(),
+            "{connector:?} must not emit a sealed value or yaml: {payload}"
+        );
+        assert!(
+            !stdout.contains(SEAL_VALUE) && !stderr.contains(SEAL_VALUE),
+            "a rejected connector must not expose the value"
+        );
+    }
+}
+
+#[test]
 fn seal_accepts_the_connector_name_length_boundary_and_interior_dash() {
-    for connector in ["a".repeat(40), "grafana-cloud".to_string()] {
+    for connector in [
+        "a".repeat(40),
+        "grafana-cloud".to_string(),
+        "curie-docs".to_string(),
+    ] {
         let output = run_seal(&connector, true);
         let stdout = String::from_utf8_lossy(&output.stdout);
         let stderr = String::from_utf8_lossy(&output.stderr);

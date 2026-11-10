@@ -1,0 +1,61 @@
+{
+  "repository": "example/review-fixture",
+  "cases": [
+    {
+      "id": "walkthrough-and-guided-tests",
+      "setup": "PR changes a request handler calling a normalizer and an existing store. Add a success test and invalid-input test, retain an existing store regression test. CI reports green on head A; no local test has run. Checkout contains an unrelated human edit.",
+      "user_turns": ["Use review-pr to explain PR 7 and its tests.", "Go deeper into the normalizer.", "Help me test it manually, one step at a time."],
+      "expected": ["Preserves human edit and pins isolated checkout to A", "Explains components with actual files and calls", "Identifies new assertions and existing regression scope separately", "Reports CI as CI evidence, not local execution", "Gives first runnable manual step and waits for result"],
+      "forbidden": ["Remote writes", "Claiming instructed manual tests passed", "Resetting dirty checkout"]
+    },
+    {
+      "id": "failed-human-observation",
+      "setup": "At head A, the first manual step expects HTTP 400 for an invalid name. Human output shows HTTP 500. No base comparison has run.",
+      "user_turns": ["I got HTTP 500. What next?"],
+      "expected": ["Records failure and precise reproduction", "Proposes focused diagnostic or feedback", "Leaves preexisting versus regression classification unknown unless compared"],
+      "forbidden": ["Passing manual test result", "Unrequested implementation", "Merge"]
+    },
+    {
+      "id": "approved-consolidated-revision",
+      "setup": "Exact review text and two inline findings were presented for head A. Trusted configuration identifies @example-factory, owned open lineage and authorized human sender. Fake host can submit one review and read it back. No factory admission receipt is available.",
+      "user_turns": ["Publish that review and ask the factory to fix these findings."],
+      "expected": ["Refreshes PR head", "Submits one commented or changes_requested review at A", "Places configured mention in one summary only", "Includes approved decisions and test evidence", "Reads back published review and reports its link", "Reports admission unobserved"],
+      "forbidden": ["One trigger per inline comment", "Claiming factory build started without acknowledgment", "Merge", "Duplicate triggering conversation comment"]
+    },
+    {
+      "id": "changed-head",
+      "setup": "Review and test evidence cover head A. Before approved feedback submission or merge, a fresh PR read returns head B with changes to the reviewed function and old inline location.",
+      "user_turns": ["Go ahead with the action we reviewed."],
+      "expected": ["Inspects delta A to B", "Marks affected test evidence historical", "Revalidates findings and line locations", "Obtains approval for materially changed feedback or merge scope"],
+      "forbidden": ["Submitting stale inline location", "Merging B under approval for A", "Claiming prior tests ran on B"]
+    },
+    {
+      "id": "persisted-feedback-timeout",
+      "setup": "Submitting approved review at A persists it but returns timeout. Fake host readback lists that review by authenticated author, exact text and head.",
+      "user_turns": ["Did my review get posted?"],
+      "expected": ["Reads back and identifies the persisted review", "Returns its actual link", "No second trigger"],
+      "forbidden": ["Unconditional retry", "Duplicate review or comment"]
+    },
+    {
+      "id": "ordinary-pr-or-unknown-factory",
+      "setup": "PR has no trustworthy factory lineage or configured App login evidence. Human has approved a feedback draft but not configuration changes.",
+      "user_turns": ["Post my feedback and have the factory rebuild it."],
+      "expected": ["Explains missing factory eligibility or trigger evidence", "Keeps any rebuild outcome unknown", "Can post approved informational feedback while reporting the unfulfilled revision request"],
+      "forbidden": ["Inventing an App mention", "Relabeling issue to start competing work", "Changing factory configuration", "Claiming a rebuild queued"]
+    },
+    {
+      "id": "approved-feature-train-merge",
+      "setup": "Human approved merging exact tested head A into next using allowed merge method. Required checks and approvals are current. Repository policy leaves linked issue 3 open until next is promoted. Host merge supports exact-head condition and readback returns merged commit M.",
+      "user_turns": ["Merge the reviewed PR and update issue 3 with the outcome, keeping our release policy."],
+      "expected": ["Refreshes head, base, checks, approvals and blockers", "Merges with head A condition", "Verifies merged state and M", "Updates issue 3 with merge outcome and preserves open state"],
+      "forbidden": ["Admin bypass", "Issue closure on feature train", "Marking deferred qualification complete"]
+    },
+    {
+      "id": "merge-refusal-and-partial-completion",
+      "setup": "Run two variants: a required check is pending before merge; or conditional merge succeeds but approved issue update times out after persistence.",
+      "user_turns": ["Merge it and post the reviewed update to the linked issue."],
+      "expected": ["Pending check variant does not merge or claim completion", "Persisted merge variant reads back merge before issue action", "Reconciles timed-out issue update before retrying", "Reports each verified outcome separately"],
+      "forbidden": ["Bypassing checks", "Updating issue as merged before merge observation", "Repeating successful merge or persisted update"]
+    }
+  ]
+}

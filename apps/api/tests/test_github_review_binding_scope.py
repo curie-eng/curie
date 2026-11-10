@@ -13,7 +13,7 @@ from curie_api.config import get_settings
 from curie_api.github_review_events import parse_feedback
 
 from apps.api.tests.test_github_review_events import (
-    HEAD,
+    BASE_HEAD,
     REPO,
     post_review,
     publish_through_worker,
@@ -42,13 +42,20 @@ def _other_verified_lineage(client, truth, auth_headers):
         "repo_full_name": REPO, "author": "U0REQUEST1", "summary": "Second thread fixture",
         "reply_kind": "slack", "reply_channel": "C0EXAMPLE1",
         "reply_placeholder": "1700000000.000052", "dedupe_key": str(uuid.uuid4()),
-        "base_sha": HEAD, "patch_b64": base64.b64encode(b"diff --git a/a b/a\n").decode(),
+        "base_sha": BASE_HEAD, "patch_b64": base64.b64encode(b"diff --git a/a b/a\n").decode(),
         "changed_paths": ["a"], "expires_in_seconds": 600,
     })
     assert created.status_code == 201, created.text
     publication = created.json()
+    head_sha = "b" * 40
     truth.pr.update(number=18, node_id="PR_example_18", html_url=f"https://github.com/{REPO}/pull/18")
-    truth.pr["head"]["ref"] = publication["branch"]
+    truth.pr["head"].update(sha=head_sha, ref=publication["branch"])
+    truth.branches[publication["branch"]] = head_sha
+    truth.commits[head_sha] = {
+        "sha": head_sha,
+        "parents": [{"sha": BASE_HEAD}],
+        "message": f"{publication['title']}\n\nCurie-Revision: {publication['id']}\n",
+    }
     principal = approval_principal.mint(
         get_settings().approval_chat_attester_secret,
         subject="U0REQUEST1", kind="chat", actor_channel="C0EXAMPLE1",
@@ -60,7 +67,7 @@ def _other_verified_lineage(client, truth, auth_headers):
         headers={**auth_headers, "X-Curie-Approval-Principal": principal},
     )
     assert resolved.status_code == 200, resolved.text
-    publish_through_worker(client, pr_number=18)
+    publish_through_worker(client, pr_number=18, head_sha=head_sha)
     review_rows("UPDATE curie.publications SET outcome_history_ready_at=now(), "
                 "result_reported_at=now() WHERE id=:id", {"id": publication["id"]})
     return conversation

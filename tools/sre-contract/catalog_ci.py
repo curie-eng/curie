@@ -214,7 +214,7 @@ users:
                 ],
                 timeout=300,
             ).returncode
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001 - existing broad catch retained
         print(f"SRE catalog CI failed: {type(exc).__name__}", file=sys.stderr)
         return 1
     finally:

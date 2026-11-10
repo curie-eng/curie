@@ -13,7 +13,8 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 # GNU timeout and util-linux setsid, with their exit statuses, on hosts that
 # ship neither (a stock Mac).
 GNU_PROCESS="$REPO_ROOT/cli/scripts/gnu-process.py"
-KUBE_CONTEXT="${CURIE_E2E_KUBE_CONTEXT:-k8}"
+KUBE_CONTEXT="${CURIE_E2E_KUBE_CONTEXT:-}"
+[[ -n "$KUBE_CONTEXT" ]] || { echo "error: CURIE_E2E_KUBE_CONTEXT is required" >&2; exit 2; }
 NAMESPACE="${CURIE_E2E_NAMESPACE:-test-2714-idle-route-reclamation}"
 RELEASE="${CURIE_E2E_RELEASE:-curie}"
 AGENT="${CURIE_E2E_AGENT:-weather}"
@@ -841,7 +842,7 @@ PY
 
 run_message() {
     local label="$1" prompt="$2" output="$3" thread="${4:-}"
-    local args=(--json cluster message "$prompt" --namespace "$NAMESPACE" --release "$RELEASE")
+    local args=(--json cluster message --context "$KUBE_CONTEXT" "$prompt" --namespace "$NAMESPACE" --release "$RELEASE")
     args+=(--listen-host "$CURIE_E2E_LISTEN_HOST" --timeout-secs "$MESSAGE_TIMEOUT_SECONDS")
     if [[ -n "$thread" ]]; then
         args+=(--thread "$thread")
@@ -859,7 +860,7 @@ reset_thread() {
     thread_key="${route_key#"$ROUTE_PREFIX"}"
     [[ "$thread_key" != "$route_key" && -n "$thread_key" ]] || \
         die "route key does not carry the expected prefix: $route_key"
-    if ! "$GNU_PROCESS" timeout 90 "$BIN" --json cluster reset-thread "$AGENT" \
+    if ! "$GNU_PROCESS" timeout 90 "$BIN" --json cluster reset-thread --context "$KUBE_CONTEXT" "$AGENT" \
         --thread-key "$thread_key" --namespace "$NAMESPACE" --release "$RELEASE" \
         --yes >"$output" 2>"${output%.json}.err"; then
         cat "${output%.json}.err" >&2 || true
@@ -1301,25 +1302,11 @@ require_command python3
 REAL_KUBECTL="$(command -v kubectl)"
 [[ "$NAMESPACE" == "test-2714-idle-route-reclamation" ]] || \
     die "CURIE_E2E_NAMESPACE must be the exact throwaway namespace test-2714-idle-route-reclamation"
-[[ "$KUBE_CONTEXT" == "k8" ]] || die "CURIE_E2E_KUBE_CONTEXT must be k8"
 [[ -n "${CURIE_BIN:-}" && -x "${CURIE_BIN:-}" ]] || \
     die "CURIE_BIN must name an executable candidate curie binary"
 [[ -n "${CURIE_E2E_LISTEN_HOST:-}" ]] || \
     die "CURIE_E2E_LISTEN_HOST must name the pod reachable callback host"
 BIN="$(cd "$(dirname "$CURIE_BIN")" && pwd)/$(basename "$CURIE_BIN")"
-
-# Force every kubectl subprocess spawned by the public CLI onto the authorized
-# homelab context. The wrapper adds an explicit argv flag, even when the CLI does
-# not expose a context flag of its own.
-mkdir -p "$WORKDIR/bin"
-cat >"$WORKDIR/bin/kubectl" <<'SH'
-#!/bin/sh
-exec "${CURIE_E2E_REAL_KUBECTL:?}" --context "${CURIE_E2E_KUBE_CONTEXT:?}" "$@"
-SH
-chmod 0700 "$WORKDIR/bin/kubectl"
-export CURIE_E2E_REAL_KUBECTL="$REAL_KUBECTL"
-export CURIE_E2E_KUBE_CONTEXT="$KUBE_CONTEXT"
-export PATH="$WORKDIR/bin:$PATH"
 
 echo "=== fail closed cluster and release preconditions ==="
 kube get namespace "$NAMESPACE" -o json | python3 -c '
@@ -1472,7 +1459,7 @@ echo "preconditions: context=$KUBE_CONTEXT namespace=$NAMESPACE quotaResource=$Q
 
 echo "=== deploy the weather bundle through the public cluster CLI ==="
 cp -a "$REPO_ROOT/examples/weather" "$WORKDIR/weather"
-"$BIN" --json cluster deploy --plugin-dir "$WORKDIR/weather" \
+"$BIN" --json cluster deploy --context "$KUBE_CONTEXT" --plugin-dir "$WORKDIR/weather" \
     --namespace "$NAMESPACE" --release "$RELEASE" >"$WORKDIR/deploy.json"
 python3 - "$WORKDIR/deploy.json" <<'PY'
 import json,pathlib,sys

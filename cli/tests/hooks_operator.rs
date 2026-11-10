@@ -2,7 +2,7 @@
 //! The binary drives the real CLI parser and HTTP client. Only its external API
 //! peer is replaced, so each assertion can inspect the request on the wire.
 
-mod support;
+use crate::support;
 
 use std::fs;
 use std::process::{Command, Output};

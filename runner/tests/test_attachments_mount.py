@@ -41,8 +41,20 @@ from aiohttp import web
 from curie_runner import __main__ as boot
 from curie_runner.__main__ import build_runner
 from curie_runner.config import RunnerConfig
+from runner_boot_session import initialized_session_sync
 
 _BUDGET = '{"max_output_tokens_per_run": 10000, "max_usd_per_day": 1.0}'
+
+
+@pytest.fixture(autouse=True)
+def _isolated_boot_declarations(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Keep host image and daemon declarations out of these prompt expectations."""
+
+    monkeypatch.setattr(
+        boot, "TOOL_MANIFEST_PATH", tmp_path / "tool-manifest.json", raising=False
+    )
+    monkeypatch.delenv("DOCKER_HOST", raising=False)
+    monkeypatch.delenv("DOCKER_PUBLISHED_HOST", raising=False)
 
 
 def _attachments_dir() -> Path:
@@ -132,7 +144,7 @@ def _options(
 ) -> Any:
     monkeypatch.setattr(boot, "ClaudeAgentSession", _CapturedSession)
     runner = build_runner(config, **kwargs)
-    session = runner._factory()  # noqa: SLF001 -- the boot wiring is the subject
+    session = initialized_session_sync(runner)  # noqa: SLF001 -- the boot wiring is the subject
     assert isinstance(session, _CapturedSession)
     return session.options
 
@@ -335,7 +347,14 @@ def _serve_kwargs(monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
         model="fake-model",
         port=8080,
         harness="claude",
-        runner_token=None,
+        # A real token, not the dev flag: this drives production boot (#3821).
+        runner_token="runner-test-token",
+        allow_tokenless=False,
+        # _serve reads the workspace snapshotter's trusted origin off every
+        # RunnerConfig (config.py); mirror the fields so the stub keeps the
+        # production boot contract's shape.
+        repo_origin=None,
+        repo_path=None,
     )
     monkeypatch.setenv("CURIE_FAKE_MODEL", "1")
     monkeypatch.setattr(RunnerConfig, "from_env", lambda _env: config)

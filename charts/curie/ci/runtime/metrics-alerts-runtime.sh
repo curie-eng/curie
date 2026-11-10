@@ -10,7 +10,7 @@ CHART="$(cd "$SCRIPT_DIR/../.." && pwd)"
 REPO_ROOT="$(cd "$CHART/../.." && pwd)"
 ASSETS="$REPO_ROOT/examples/sre-bot/observability"
 
-CONTEXT="${CURIE_2428_CONTEXT:-k8scratch}"
+CONTEXT="${CURIE_2428_CONTEXT:-}"
 CURIE_NS="${CURIE_2428_NAMESPACE:-curie-t2428}"
 OBS_NS="${CURIE_2428_OBS_NAMESPACE:-obs-t2428}"
 RELEASE="${CURIE_2428_RELEASE:-t2428}"
@@ -20,7 +20,7 @@ PROM_CHART_VERSION=29.27.0
 
 usage() {
   cat <<'EOF'
-Usage: charts/curie/ci/runtime/metrics-alerts-runtime.sh [--keep]
+Usage: charts/curie/ci/runtime/metrics-alerts-runtime.sh --context <context> [--keep]
 
 Installs a task-owned Prometheus and a trimmed Curie Collector overlay,
 emits Curie run/queue/RPC/delivery metric points and the worker and api
@@ -31,6 +31,9 @@ EOF
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
+    --context)
+      [[ $# -ge 2 && -n "$2" ]] || { echo "context flag needs a value" >&2; exit 2; }
+      CONTEXT="$2"; shift 2 ;;
     --keep) KEEP=1; shift ;;
     -h|--help) usage; exit 0 ;;
     *) echo "unknown argument: $1" >&2; usage; exit 2 ;;
@@ -38,6 +41,8 @@ while [[ $# -gt 0 ]]; do
 done
 
 fail() { echo "FAIL: $*" >&2; exit 1; }
+
+[[ -n "$CONTEXT" ]] || fail "the context flag or CURIE_2428_CONTEXT is required"
 
 for forbidden in curie observability monitoring; do
   if [[ "$CURIE_NS" == "$forbidden" || "$OBS_NS" == "$forbidden" || "$RELEASE" == "curie" ]]; then
@@ -49,11 +54,7 @@ command -v helm >/dev/null 2>&1 || fail "helm is required"
 command -v kubectl >/dev/null 2>&1 || fail "kubectl is required"
 command -v python3 >/dev/null 2>&1 || fail "python3 is required"
 
-kubectl config use-context "$CONTEXT" >/dev/null
-current="$(kubectl config current-context)"
-[[ "$current" == "$CONTEXT" ]] || fail "kubectl context is $current, expected $CONTEXT"
-
-# Never talk to the soak identities even if this script is pointed at k8scratch.
+# Refuse the permanent soak identities on every context.
 for ns in curie observability; do
   if [[ "$CURIE_NS" == "$ns" || "$OBS_NS" == "$ns" ]]; then
     fail "refusing to mutate soak namespace $ns"
@@ -68,10 +69,10 @@ cleanup() {
     echo "KEEP=1: leaving $CURIE_NS / $OBS_NS"
     return
   fi
-  helm uninstall "$RELEASE" -n "$CURIE_NS" --wait --timeout 120s >/dev/null 2>&1 || true
-  helm uninstall "$PROM_RELEASE" -n "$OBS_NS" --wait --timeout 120s >/dev/null 2>&1 || true
-  kubectl delete priorityclass "$RELEASE-curie-platform" "$RELEASE-curie-sandbox" --ignore-not-found >/dev/null 2>&1 || true
-  kubectl delete ns "$CURIE_NS" "$OBS_NS" --wait=true --timeout=180s >/dev/null 2>&1 || true
+  helm --kube-context "$CONTEXT" uninstall "$RELEASE" -n "$CURIE_NS" --wait --timeout 120s >/dev/null 2>&1 || true
+  helm --kube-context "$CONTEXT" uninstall "$PROM_RELEASE" -n "$OBS_NS" --wait --timeout 120s >/dev/null 2>&1 || true
+  kubectl --context "$CONTEXT" delete priorityclass "$RELEASE-curie-platform" "$RELEASE-curie-sandbox" --ignore-not-found >/dev/null 2>&1 || true
+  kubectl --context "$CONTEXT" delete ns "$CURIE_NS" "$OBS_NS" --wait=true --timeout=180s >/dev/null 2>&1 || true
 }
 trap 'cleanup; rm -rf "$TMP"' EXIT
 
@@ -111,13 +112,13 @@ Path(curie_dst).write_text(curie)
 Path(prom_dst).write_text(prom)
 PY
 
-kubectl create ns "$OBS_NS"
-kubectl create ns "$CURIE_NS"
-kubectl label ns "$CURIE_NS" app.kubernetes.io/name=curie app.kubernetes.io/instance="$RELEASE"
+kubectl --context "$CONTEXT" create ns "$OBS_NS"
+kubectl --context "$CONTEXT" create ns "$CURIE_NS"
+kubectl --context "$CONTEXT" label ns "$CURIE_NS" app.kubernetes.io/name=curie app.kubernetes.io/instance="$RELEASE"
 
-helm repo add prometheus-community https://prometheus-community.github.io/helm-charts >/dev/null
-helm repo update prometheus-community >/dev/null
-helm upgrade --install "$PROM_RELEASE" prometheus-community/prometheus \
+helm --kube-context "$CONTEXT" repo add prometheus-community https://prometheus-community.github.io/helm-charts >/dev/null
+helm --kube-context "$CONTEXT" repo update prometheus-community >/dev/null
+helm --kube-context "$CONTEXT" upgrade --install "$PROM_RELEASE" prometheus-community/prometheus \
   --version "$PROM_CHART_VERSION" \
   --namespace "$OBS_NS" \
   -f "$TMP/prometheus-overlay.yaml" \
@@ -130,7 +131,7 @@ apply_curie() {
   if [[ "${1:-}" == "--overlay" ]]; then
     overlay=(-f "$TMP/curie-overlay.yaml")
   fi
-  helm upgrade --install "$RELEASE" "$CHART" \
+  helm --kube-context "$CONTEXT" upgrade --install "$RELEASE" "$CHART" \
     --namespace "$CURIE_NS" --no-hooks \
     -f "$CHART/values-e2e-nogvisor.yaml" \
     -f "$CHART/values-e2e-harness.yaml" \
@@ -161,21 +162,21 @@ apply_curie() {
 # Trimmed Curie: Collector plus the metrics overlay. No application workloads.
 apply_curie --overlay
 
-COLLECTOR="$(kubectl get deploy -n "$CURIE_NS" -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}' | grep otel-collector | head -1)"
+COLLECTOR="$(kubectl --context "$CONTEXT" get deploy -n "$CURIE_NS" -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}' | grep otel-collector | head -1)"
 [[ -n "$COLLECTOR" ]] || fail "Collector Deployment was not found in $CURIE_NS"
-kubectl rollout status deployment/"$COLLECTOR" -n "$CURIE_NS" --timeout=180s
-PROM_SVC="$(kubectl get svc -n "$OBS_NS" -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}' | grep -E 'server$' | head -1)"
+kubectl --context "$CONTEXT" rollout status deployment/"$COLLECTOR" -n "$CURIE_NS" --timeout=180s
+PROM_SVC="$(kubectl --context "$CONTEXT" get svc -n "$OBS_NS" -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}' | grep -E 'server$' | head -1)"
 [[ -n "$PROM_SVC" ]] || fail "Prometheus server Service was not found in $OBS_NS"
-kubectl rollout status deployment/"$PROM_SVC" -n "$OBS_NS" --timeout=180s || \
-  kubectl rollout status statefulset/"$PROM_SVC" -n "$OBS_NS" --timeout=180s || true
+kubectl --context "$CONTEXT" rollout status deployment/"$PROM_SVC" -n "$OBS_NS" --timeout=180s || \
+  kubectl --context "$CONTEXT" rollout status statefulset/"$PROM_SVC" -n "$OBS_NS" --timeout=180s || true
 
 emit_otlp() {
   local accepted="$1" failed="$2" rpc="$3" reply="$4"
-  kubectl delete pod t2428-emit -n "$CURIE_NS" --ignore-not-found --wait=true --timeout=60s || true
-  kubectl run "t2428-emit" -n "$CURIE_NS" --restart=Never --image=curlimages/curl:8.12.1 \
+  kubectl --context "$CONTEXT" delete pod t2428-emit -n "$CURIE_NS" --ignore-not-found --wait=true --timeout=60s || true
+  kubectl --context "$CONTEXT" run "t2428-emit" -n "$CURIE_NS" --restart=Never --image=curlimages/curl:8.12.1 \
     --labels="app.kubernetes.io/name=curie,app.kubernetes.io/instance=$RELEASE,app.kubernetes.io/component=t2428-emit" \
     --command -- sh -c "sleep 3600"
-  kubectl wait --for=condition=Ready pod/t2428-emit -n "$CURIE_NS" --timeout=90s
+  kubectl --context "$CONTEXT" wait --for=condition=Ready pod/t2428-emit -n "$CURIE_NS" --timeout=90s
   python3 - "$accepted" "$failed" "$rpc" "$reply" "$TMP/otlp.json" <<'PY'
 import json, sys, time
 accepted, failed, rpc, reply = (int(x) for x in sys.argv[1:5])
@@ -288,7 +289,7 @@ payload = {
 Path = __import__("pathlib").Path
 Path(out).write_text(json.dumps(payload))
 PY
-  kubectl exec -i t2428-emit -n "$CURIE_NS" -- \
+  kubectl --context "$CONTEXT" exec -i t2428-emit -n "$CURIE_NS" -- \
     curl -fsS -X POST -H "Content-Type: application/json" \
     --data-binary @- \
     "http://$COLLECTOR:4318/v1/metrics" <"$TMP/otlp.json"
@@ -296,7 +297,7 @@ PY
 
 query_prom() {
   local expr="$1"
-  kubectl exec t2428-emit -n "$CURIE_NS" -- \
+  kubectl --context "$CONTEXT" exec t2428-emit -n "$CURIE_NS" -- \
     curl -fsS --get "http://$PROM_SVC.$OBS_NS.svc.cluster.local/api/v1/query" \
     --data-urlencode "query=$expr"
 }
@@ -336,8 +337,8 @@ apply_curie
 
 # Fresh series stop. Absent() becomes true once the last sample ages out of
 # evaluation; also assert the Collector config no longer lists the exporter.
-CM="$(kubectl get cm -n "$CURIE_NS" -o name | grep otel-collector | head -1)"
-kubectl get -n "$CURIE_NS" "$CM" -o jsonpath='{.data.collector-config\.yaml}' \
+CM="$(kubectl --context "$CONTEXT" get cm -n "$CURIE_NS" -o name | grep otel-collector | head -1)"
+kubectl --context "$CONTEXT" get -n "$CURIE_NS" "$CM" -o jsonpath='{.data.collector-config\.yaml}' \
   | python3 -c '
 import sys, yaml
 c = yaml.safe_load(sys.stdin)
@@ -350,7 +351,7 @@ print("PASS: broken export removed prometheusremotewrite/soak")
 # Restore overlay and confirm series can be written again.
 apply_curie --overlay
 
-kubectl delete pod t2428-emit -n "$CURIE_NS" --wait=true --timeout=60s || true
+kubectl --context "$CONTEXT" delete pod t2428-emit -n "$CURIE_NS" --wait=true --timeout=60s || true
 emit_otlp 5 2 5 5
 wait_query 'curie_turn_accepted_total' >/dev/null
 echo "PASS: restored overlay retains Curie series again"

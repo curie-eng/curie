@@ -1,6 +1,8 @@
 name: PR body guard
 
 on:
+  merge_group:
+    types: [checks_requested]
   pull_request:
     branches: [main, next, "task/**"]
     # A PR body can be edited without a new commit. Re-run the body guards on
@@ -10,23 +12,30 @@ on:
     types: [opened, synchronize, reopened, edited]
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  group: ${{ github.workflow }}-${{ github.ref }}-${{ github.event_name }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 permissions:
   contents: read
+  pull-requests: read
+  issues: read
 
 jobs:
   pr-body:
     name: PR body (real newlines)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
+      - name: Acknowledge the PR metadata judgment
+        if: github.event_name == 'merge_group'
+        run: echo 'PR-event run already judged this metadata; merge groups reuse that judgment.' >> "$GITHUB_STEP_SUMMARY"
       - uses: actions/checkout@v7
+        if: github.event_name != 'merge_group'
         with:
           persist-credentials: false
       # Keep untrusted PR text out of shell source. github-script reads the
       # payload directly and writes its bytes to a runner-owned temporary file.
-      - name: Write the pull request body and title to temporary files
+      - name: Write the pull request body and title
+        if: github.event_name != 'merge_group'
         uses: actions/github-script@v9
         env:
           PR_BODY_FILE: ${{ runner.temp }}/curie-pr-body.md
@@ -36,12 +45,8 @@ jobs:
             const fs = require("node:fs");
             const body = context.payload.pull_request?.body ?? "";
             const title = context.payload.pull_request?.title ?? "";
-            if (typeof body !== "string") {
-              core.setFailed("pull request body must be a string or null");
-              return;
-            }
-            if (typeof title !== "string") {
-              core.setFailed("pull request title must be a string or null");
+            if (typeof body !== "string" || typeof title !== "string") {
+              core.setFailed("pull request body and title must be strings");
               return;
             }
             fs.writeFileSync(process.env.PR_BODY_FILE, body, { encoding: "utf8", mode: 0o600 });
@@ -49,8 +54,10 @@ jobs:
       # Prove both branches of the matcher can still be reached before trusting
       # its verdict against the event payload.
       - name: PR body guard self-test
+        if: github.event_name != 'merge_group'
         run: bash scripts/check-pr-body.sh --self-test
-      - name: Reject literal newline escapes, AI attribution, and empty patch-release sections
+      - name: Check body guards
+        if: github.event_name != 'merge_group'
         env:
           PR_BODY_FILE: ${{ runner.temp }}/curie-pr-body.md
           PR_TITLE_FILE: ${{ runner.temp }}/curie-pr-title.txt

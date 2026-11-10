@@ -15,6 +15,8 @@ order: 11
 > **Kind:** CLEAN &nbsp;·&nbsp; **Implementations today:** 1 (redis-py) behind the broker port &nbsp;·&nbsp; **Swap-readiness grade:** not separately graded
 <!-- END GENERATED: header -->
 
+The managed ElastiCache swap for this seam is [managed-valkey-compat.md](./managed-valkey-compat.md). A redis-compatible store is not only a URL change when the managed service cannot keep AOF fsync.
+
 **Kind legend:** CLEAN = a real `Protocol`/typed port class · SOFT = swap via env/URL/prefix/wire, no code interface · NONE = not built yet.
 
 ## The black line
@@ -22,7 +24,7 @@ order: 11
 The seam is the Valkey Stream wire contract between the dispatcher (producer) and the
 worker (consumer): a named stream carrying a frozen one-field payload. As of #284 /
 ADR-0027 the stream verbs are drawn behind a thin **broker port** at the two non-sacred
-seams — a `StreamPublisher` `Protocol` on the producer (`apps/dispatcher/src/curie_dispatcher/queue.py::StreamPublisher`:
+seams — a `StreamPublisher` `Protocol` on the producer (`packages/curie-internal/src/curie_internal/turn_queue.py::StreamPublisher`:
 `xadd` + the `SET NX EX` dedupe-claim + `delete` / `release_event`) and a `StreamBroker` `Protocol` on the consumer
 transport (`apps/worker/src/curie_worker/broker.py::StreamBroker`:
 `xgroup_create`/`xreadgroup`/`xack`/`xautoclaim`/`xinfo_consumers`/`xclaim`/`xpending_range`/`xrange`/`xadd`).
@@ -30,8 +32,10 @@ The routing, consumer-group concurrency, dedupe, and reclaim rules stay opiniona
 **core**. `redis.Redis` / `redis.asyncio.Redis` structurally satisfy the ports, so
 redis-py is the one backing today with no adapter; a redis-compatible backend (Valkey,
 Redis, a managed equivalent) is still a URL change, and a non-redis broker (Kafka, SQS)
-is now a drop-in implementation of the two Protocols rather than a grep-and-replace of
-every call site. The **second broker itself is not built** — no second-broker demand
+can implement the dispatcher publication and shared consumer transport ports. Those
+two Protocols do not cover every producer or adjacent Redis operation: a complete swap
+also migrates direct cron and API appends, retention, delivery leases, liveness, and
+thread-reset state described below. The **second broker itself is not built**; no second-broker demand
 exists (ADR-0007); only the port is extracted.
 
 ## Current contract
@@ -39,14 +43,14 @@ exists (ADR-0007); only the port is extracted.
 A second broker must honor the stream key, the payload encoding, and the Stream verbs:
 
 - **Stream key** — `"curie:runs"`, defaulted identically on both ends:
-  `DispatcherConfig.stream` (`apps/dispatcher/src/curie_dispatcher/config.py::DispatcherConfig`,
+  `DispatcherConfig.stream` (`packages/channel-gateway/src/curie_channel_gateway/slack/config.py::DispatcherConfig`,
   env `CURIE_STREAM`) and `WorkerConfig.stream`
   (`apps/worker/src/curie_worker/config.py::WorkerConfig`).
 - **Payload encoding** — one Stream field, `STREAM_PAYLOAD_FIELD = "payload"`
-  (`apps/dispatcher/src/curie_dispatcher/queue.py::STREAM_PAYLOAD_FIELD`),
+  (`packages/curie-internal/src/curie_internal/turn_queue.py::STREAM_PAYLOAD_FIELD`),
   holding `model_dump_json()`. Produced by `enqueue` via `redis_client.xadd(config.stream, fields)`
-  (`apps/dispatcher/src/curie_dispatcher/queue.py::enqueue`) and reconstructed by
-  `from_stream_fields` (`apps/dispatcher/src/curie_dispatcher/queue.py::from_stream_fields`)
+  (`packages/curie-internal/src/curie_internal/turn_queue.py::enqueue`) and reconstructed by
+  `from_stream_fields` (`packages/curie-internal/src/curie_internal/turn_queue.py::from_stream_fields`)
   into a `QueuedTurn`.
 - **Consumer verbs** — the worker reads with `xreadgroup` over a consumer group; the
   sacred subclass supplies the loop spec and handler
@@ -115,35 +119,112 @@ A second broker must honor the stream key, the payload encoding, and the Stream 
   delivery bound without treating idle alone as liveness.
 
 Idempotency lives beside the stream, not in it: `claim_event` does a
-`SET <dedupe_key> 1 NX EX <ttl>` before `XADD` (`apps/dispatcher/src/curie_dispatcher/queue.py::claim_event`).
+`SET <dedupe_key> 1 NX EX <ttl>` before `XADD` (`packages/curie-internal/src/curie_internal/turn_queue.py::claim_event`).
 
 ## Implementations today
 
 One, redis-py against Valkey. The dispatcher `XADD`s
-(`apps/dispatcher/src/curie_dispatcher/queue.py::enqueue`); the worker runs
+(`packages/curie-internal/src/curie_internal/turn_queue.py::enqueue`); the worker runs
 a consumer group with `XREADGROUP`/`XACK`, crash-recovery `XAUTOCLAIM`,
 capable-peer prompt reclaim `XINFO CONSUMERS`/`XCLAIM` (#1532), and the
 delivery-cap dead-letter path's `XPENDING`/`XRANGE`/`XADD`. The runs and eval
 lanes share the ordered liveness publication, sustained-absence proof, and cap
 enforcement in `apps/worker/src/curie_worker/stream_consumer.py::StreamConsumer`;
-an unmarked peer remains on the 900-second `XAUTOCLAIM` fallback. All stream
-verbs are issued from that shared base
+an unmarked peer remains on the 900-second `XAUTOCLAIM` fallback. The shared
+base issues consumer transport verbs
 (`apps/worker/src/curie_worker/stream_consumer.py::StreamConsumer`);
 the sacred `apps/worker/src/curie_worker/consumer.py::Consumer` subclass supplies the
-specs and handlers and issues only its own pre-claim `xpending_range`
-(`apps/worker/src/curie_worker/consumer.py::Consumer._pending_delivery_count`). A second, sibling stream
+specs and handlers and issues its own pre-claim `xpending_range`
+(`apps/worker/src/curie_worker/consumer.py::Consumer._pending_delivery_count`).
+Its queue metrics also read raw `xpending`, `xlen` and `xinfo_groups` through
+`_valkey` (`apps/worker/src/curie_worker/consumer.py::Consumer._observe_queue_state`). A second, sibling stream
 `"curie:evals"` uses the same one-field `payload` convention
 (`apps/worker/src/curie_worker/eval/stream.py`), reinforcing the wire shape as the
 real contract.
 
+Not every runs-stream producer goes through `StreamPublisher`. Besides the API
+writers listed under Known leakage, two schedulers `XADD` a `QueuedTurn` straight
+onto the runs stream with a raw client: the worker's cron scheduler
+(`apps/worker/src/curie_worker/cron_loop.py::CronSchedulerLoop._enqueue`), and the
+API's WorkItem reconciler
+(`apps/api/src/curie_api/workitem_reconciler.py::WorkItemReconciler._xadd`), which
+uses the shared group creation implementation before publishing, retries once after
+a `NOGROUP`, and for a marked round sets a `SET NX EX` marker and appends in one
+EVAL Lua script (`_MARK_AND_XADD`).
+
+## Declared producers and keyspace
+
+Every production append site the wire gate detects is declared in the inventory
+read by
+`packages/curie-internal/src/curie_internal/wire_inventory.py::validate_inventory`.
+The gate matches `xadd` attribute, alias and `getattr` calls and Lua `redis.call`
+strings, so a command name passed as a plain string argument
+(`execute("XADD", ...)`) is not detected; the commissioning ingress below is such a
+site and is not in `wire_sites.json`.
+The collected `tests/test_wire_state.py` gate scans Python calls, embedded Lua
+commands, and Rust commands. Site identity includes source path, enclosing scope,
+and ordinal, so a second identical append in an already declared scope still
+requires a declaration.
+
+The complete runs capable producer set is:
+
+| Producer | Append sites | Purpose |
+|---|---|---|
+| `packages/curie-internal/src/curie_internal/turn_queue.py::enqueue` | Python `xadd` | Dispatcher intake after the event claim and placeholder |
+| `apps/api/src/curie_api/delivery.py` | Both `XADD` branches in `_ENQUEUE_SCRIPT` | Owner checked channel, hook, and review intake, with optional metadata |
+| `apps/api/src/curie_api/resumequeue.py::ResumeQueue.enqueue` | Python `xadd` | Approval resume |
+| `apps/api/src/curie_api/workitem_reconciler.py::WorkItemReconciler._xadd` | Direct Python append, retry append, and Lua `_MARK_AND_XADD` | WorkItem execute, terminate, and reconciliation wakes |
+| `apps/worker/src/curie_worker/cron_loop.py::CronSchedulerLoop._enqueue` | Python `xadd` | Scheduled turns |
+| `apps/worker/src/curie_worker/capacity_wait.py` | Lua `_WAKE_LUA` and `_RECONCILE_LUA` | Capacity wake and terminal reconciliation |
+| `apps/worker/src/curie_worker/markers.py::Markers.publish_successor` | Python `xadd` | Leaseless sweep continuation |
+| `apps/worker/src/curie_worker/markers.py` | Lua `_SETTLE_FENCED_AND_PUBLISH_LUA` | Fenced successor publication with predecessor settlement |
+| `packages/protected-hooks/src/curie_protected_hooks/admission_scripts.py` | First `XADD` in `TRANSACTION` (`module:1` in `wire_sites.json`) | Initial protected admission at the newly reserved stream id, carrying the protected envelope |
+| `packages/protected-hooks/src/curie_protected_hooks/admission_scripts.py` | Second `XADD` in `TRANSACTION` (`module:2` in `wire_sites.json`) | Protected admission recovery when the reserved entry is absent, carrying the protected envelope |
+| `apps/api/src/curie_commissioning_ingress/ingress.py::CommissioningIngress.admit` | Session `execute("XADD", ...)` | Commissioning admission onto the permit-derived `protected:commissioning:lane:<digest>:runs` stream, carrying payload and envelope; not detected by the wire gate |
+| `cli/src/queue.rs` | Rust `queue::xadd` | Generic stream append used by runs and eval callers; the runtime stream argument makes this site runs capable |
+
+Sibling append sites are declared separately: API `EvalQueue.enqueue` in
+`apps/api/src/curie_api/evalqueue.py`, deploy notice `_PUBLISH_ONCE` in
+`apps/api/src/curie_api/deploy_notice.py`, and progress `_APPEND_LUA` in
+`apps/api/src/curie_api/turn_progress.py`; worker `StreamConsumer._dead_letter` in
+`apps/worker/src/curie_worker/stream_consumer.py`, completion
+`_DEAD_LETTER_COMPLETION_LUA` in `apps/worker/src/curie_worker/markers.py`, and progress
+`_DEAD_LETTER_LUA` in `apps/worker/src/curie_worker/progress.py`. Their eval, notice,
+progress, and graveyard destinations retain their own payload and retention rules.
+Three protected diagnostic writers are also declared in `wire_sites.json`:
+`apps/worker/src/curie_worker/protected_dispatch.py` publishes the original
+delivery diagnostic before fenced acknowledgement;
+`apps/worker/src/curie_worker/protected_lane.py` publishes a transport refusal
+after exact-row and ownership checks; and
+`apps/worker/src/curie_worker/protected_markers.py` publishes a completion
+graveyard row before resolving the exact outbox generation.
+
+Consumer group creation has one implementation,
+`packages/curie-internal/src/curie_internal/streams.py::ensure_group`.
+`StreamConsumer._ensure_group` passes its lane's explicit start position, while
+`WorkItemReconciler._ensure_group` passes `$` before either direct or marked
+publishing. The helper uses `MKSTREAM`, leaves an existing group unchanged by
+accepting only `BUSYGROUP`, and propagates other faults. Creating the group before
+API publishing preserves wakes when the worker starts afterward; consolidating
+the implementation does not change caller start positions.
+
+Cross service key names and builders live in
+`packages/curie-internal/src/curie_internal/keyspace.py`. The same wire gate scans
+Python and Rust key literal occurrences and rejects undeclared `curie:` strings,
+including duplicates of an existing value. Protected worker literals and producer
+sites remain individually declared where present rather than being migrated or
+exempted from scanning. The internal package also owns the single scoped token
+implementation in `packages/curie-internal/src/curie_internal/sandbox_token.py`;
+API and worker import it directly without application copies.
+
 ## The port (as of #284 / ADR-0027)
 
 Drawn only at the **non-sacred** seams; the sacred concurrency kernel
-(`apps/worker/src/curie_worker/kernel.py` / `apps/worker/src/curie_worker/consumer.py` /
+(`apps/worker/src/curie_worker/kernel/core.py` / `apps/worker/src/curie_worker/consumer.py` /
 `apps/worker/src/curie_worker/threadlock.py` / `apps/worker/src/curie_worker/markers.py`)
 is not touched:
 
-- **Producer** — `StreamPublisher` (`apps/dispatcher/src/curie_dispatcher/queue.py::StreamPublisher`): `xadd`, the
+- **Producer** — `StreamPublisher` (`packages/curie-internal/src/curie_internal/turn_queue.py::StreamPublisher`): `xadd`, the
   `SET NX EX` dedupe-claim, and `delete` (the `release_event` path). `enqueue`/`claim_event`/`release_event` type against it.
 - **Consumer transport** — `StreamBroker` (`apps/worker/src/curie_worker/broker.py::StreamBroker`):
   `xgroup_create`/`xreadgroup`/`xack`/`xautoclaim`, plus — since the bounded-delivery
@@ -167,10 +248,40 @@ The verbs return a bare `Awaitable`/value matching redis-py's own typing, so
 
 ## Known leakage
 
+The producer ports also leave sweep successor and protected admission writes
+outside the boundary. `Markers.publish_successor` uses the raw client, and
+`_SETTLE_FENCED_AND_PUBLISH_LUA` atomically publishes the successor with fenced
+predecessor settlement (`apps/worker/src/curie_worker/markers.py`). Both protected
+admission `XADD` sites in
+`packages/protected-hooks/src/curie_protected_hooks/admission_scripts.py`
+use the private broker. Protected worker paths also issue direct `XRANGE`,
+`XACK` and diagnostic `XADD` through that broker or its Lua scripts
+(`apps/worker/src/curie_worker/protected_lane.py`,
+`apps/worker/src/curie_worker/protected_dispatch.py`,
+`apps/worker/src/curie_worker/protected_execution.py`,
+`apps/worker/src/curie_worker/protected_recovery.py`,
+`apps/worker/src/curie_worker/protected_markers.py`). These direct calls bypass
+`StreamBroker`; a broker swap must preserve their exact-row, generation and
+ownership fences as well as the ordinary stream semantics.
+
+The commissioning ingress
+(`apps/api/src/curie_commissioning_ingress/ingress.py::CommissioningIngress.admit`)
+also appends outside `StreamPublisher`: it issues `XADD` through its authenticated
+`CommissioningSession` onto the lane that
+`packages/protected-hooks/src/curie_protected_hooks/commissioning_acl.py::derive_commissioning_lane`
+derives from the permit. Its consumer,
+`apps/worker/src/curie_commissioning_worker/consumer.py::CommissioningConsumer`,
+subclasses `Consumer` and stays on `StreamBroker`.
+
+Queue-state observation is another off-port reader:
+`Consumer._observe_queue_state` reads `xpending`, `xlen` and `xinfo_groups`
+through its concrete `_valkey` client. Implementing the consumer transport
+port alone does not supply those gauges.
+
 - **The composition root still touches redis directly.** The client construction in
   `apps/worker/src/curie_worker/run.py` (by design) builds concrete
   `redis.Redis` / `redis.asyncio.Redis` handles and passes them into the ports.
-  (The audit's companion claim that the sacred `consumer.py` calls `XAUTOCLAIM`
+  (A companion claim that the sacred `consumer.py` calls `XAUTOCLAIM`
   directly does not hold: `consumer.py` names `XAUTOCLAIM` only in a docstring and a
   comment, and the actual call is the base's
   `apps/worker/src/curie_worker/stream_consumer.py::StreamConsumer._reclaim_once`,
@@ -240,6 +351,37 @@ The verbs return a bare `Awaitable`/value matching redis-py's own typing, so
   also reads the graveyard off-port (`xrevrange`, bounded by
   `apps/worker/src/curie_worker/config.py::WorkerConfig.completion_sweep_batch`,
   counting `dl_source=completion-outbox`).
+- **Two scheduler producers write the runs stream off-port.** The cron scheduler
+  (`apps/worker/src/curie_worker/cron_loop.py::CronSchedulerLoop._enqueue`) issues a
+  raw `xadd` and, when it fails, marks the scheduled run failed in Postgres. The
+  WorkItem reconciler
+  (`apps/api/src/curie_api/workitem_reconciler.py::WorkItemReconciler._xadd`) issues
+  group creation through the shared `ensure_group` implementation, a raw `xadd`
+  with one `NOGROUP` retry, and the `_MARK_AND_XADD` EVAL script. Neither uses
+  `StreamPublisher`. A second broker
+  would have to supply, for these two alone: append of a one-field `payload` entry to
+  an ordered stream; idempotent creation of the stream and its consumer group, with an
+  error it can recognize as a missing group; and an atomic "set a TTL marker only if
+  absent, and append only if the marker was set" step, which is what keeps one
+  reconciler round from enqueueing the same turn twice.
+- **Retention trims the consumed streams with a raw Lua script.** The settled-entry
+  pass (`apps/worker/src/curie_worker/stream_retention.py::trim_settled`, driven by
+  `apps/worker/src/curie_worker/stream_retention.py::StreamRetention`) reads each
+  group with `XINFO GROUPS` and `XPENDING`, then issues `XTRIM ... MINID` in one EVAL
+  script on the worker's concrete client. None of those verbs is on `StreamBroker`. A
+  second broker must supply an equivalent "drop everything every group has
+  acknowledged and that is older than the lag window" operation, or keep unbounded
+  growth.
+- **The delivery lease store reads and claims the stream off-port.**
+  `apps/worker/src/curie_worker/delivery_lease.py::DeliveryLeaseStore` is another
+  narrow adjacent adapter on the concrete client. `entry_vanished` calls `xrange`
+  for one exact entry id and `xpending_range` for that same id; it reports the
+  delivery vanished only when both are empty and the lease is absent or still
+  owned by the caller. `heartbeat` runs a Lua script that renews the lease
+  and re-claims the PEL row with `XCLAIM ... JUSTID` to the current consumer, so
+  the claim does not burn a delivery of the ADR-0039 budget. A second broker must
+  provide a claim that moves ownership without bumping the delivery count, or
+  that budget accounting changes.
 - **The redis-py exception surface leaks.** The ports type the verbs but not the error
   contract: `redis.exceptions` propagate through the callers unabstracted, so a non-redis
   broker must either raise redis-py-compatible exceptions or the call sites must learn its
@@ -257,4 +399,4 @@ The verbs return a bare `Awaitable`/value matching redis-py's own typing, so
 - **Epic(s):** #85 — vision: make the broker itself swappable behind the stream contract
 - **Epic(s):** #7 — payload promotion into `packages/aci-protocol` (overlaps the channel seam, landed)
 - **Vision doc:** [architecture-vision.md](../../architecture-vision.md) — opinionated core (`curie:runs` stream), not one of the six swap jobs
-- **ADR(s):** [ADR-0027](../../adr/0027-thin-broker-port-defer-second-broker.md) — the broker port at the non-sacred seams; [ADR-0007](../../adr/0007-adopt-not-build-boundaries.md) — adopt-not-build (Valkey adopted; second broker deferred); [ADR-0039](../../adr/0039-bounded-delivery-and-a-dead-letter-graveyard.md) — the delivery cap and dead-letter graveyard that added `xpending_range`/`xrange`/`xadd` to the port; [ADR-0131](../../adr/0131-a-delivery-has-one-deadline-and-one-renewable-fenced-owner.md) — an adjacent fenced-owner store for delivery liveness and the execution budget, not a `StreamBroker` verb
+- **ADR(s):** [ADR-0027](../../adr/0027-thin-broker-port-defer-second-broker.md) — the broker port at the non-sacred seams; [ADR-0007](../../adr/0007-adopt-not-build-boundaries.md) — adopt-not-build (Valkey adopted; second broker deferred); [ADR-0039](../../adr/0039-bounded-delivery-and-a-dead-letter-graveyard.md) — the delivery cap and dead-letter graveyard that added `xpending_range`/`xrange`/`xadd` to the port; [ADR-0131](../../adr/0131-a-delivery-has-one-deadline-and-one-renewable-fenced-owner.md) — an adjacent fenced-owner store for delivery liveness and the execution budget, not a `StreamBroker` verb; [ADR-0184](../../adr/0184-settled-stream-entries-are-trimmed-receipts-live-in-postgres-backlog-is-counted.md): settled stream entries are trimmed by the worker's retention pass, an off-port `XTRIM MINID`

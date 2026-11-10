@@ -1,4 +1,4 @@
-"""Persist terminal outcomes for scheduled hook turns."""
+"""Persist provenance and terminal outcomes for hook turns."""
 
 from __future__ import annotations
 
@@ -20,6 +20,26 @@ from sqlalchemy.ext.asyncio import AsyncEngine
 # migration 0048 already allows it. "deferred" is a fire that met a live session
 # on its thread (#2929); the scheduler reopens it on a later tick.
 HookRunOutcome = Literal["ran", "failed", "blocked", "deferred", "skipped"]
+# Closed set pinned by tests/vectors/hook-run-reasons.json. NULL means ran,
+# in flight, or a row written before the reason column existed.
+HookRunReason = Literal[
+    "turn_error",
+    "target_unbound",
+    "approval_gate_targetless",
+    "agent_killed",
+    "budget_exhausted",
+    "run_in_flight",
+    "catch_up_expired",
+    "deferred_expired",
+    "reply_undeliverable",
+    "prior_side_effect",
+    "deployment_missing",
+    "hook_paused",
+    "live_session",
+    "enqueue_failed",
+    "claim_expired",
+    "identity_refused",
+]
 
 logger = logging.getLogger(__name__)
 
@@ -67,6 +87,12 @@ class HookRunState:
     name: str
     slot_utc: datetime
     outcome: str | None
+    source: str
+    # The row's own clock: a sweep checkpoint stated before it is not this
+    # run's (ADR-0160, #2878).
+    started_at: datetime
+    # The agent version the run fired from, whose bundle names the trigger zone.
+    version_id: uuid.UUID | None
 
 
 @dataclass(frozen=True)
@@ -156,7 +182,8 @@ class HookRunRecorder:
                 row = (
                     await connection.execute(
                         text(
-                            f"SELECT outcome FROM {self._schema}.hook_runs "
+                            "SELECT outcome, source, started_at, version_id "
+                            f"FROM {self._schema}.hook_runs "
                             "WHERE agent_id = :agent_id "
                             "AND name = :name AND slot_utc = :slot_utc"
                         ),
@@ -179,7 +206,50 @@ class HookRunRecorder:
             name=key.name,
             slot_utc=key.slot_utc,
             outcome=row.outcome,
+            source=row.source,
+            started_at=row.started_at,
+            version_id=row.version_id,
         )
+
+    async def scheduled_authority(self, ref: HookRunRef) -> bool:
+        """Whether the run is open at its agent's active deployment version.
+
+        Only platform admission writes a run row, from the current version's
+        declared cron hook, so an open row at the version the agent would boot
+        now is the deployment authority of ADR 0258. The ranking matches the
+        scheduler's and the binding resolver's: prod before dev, then the most
+        recent deployment. @spec HTTP-INVOCATION-EXECUTION-23.
+        """
+        key = _parse_ref(ref)
+        try:
+            async with self._engine.begin() as connection:
+                held = (
+                    await connection.execute(
+                        text(
+                            f"SELECT 1 FROM {self._schema}.hook_runs r "
+                            "WHERE r.agent_id = :agent_id AND r.name = :name "
+                            "AND r.slot_utc = :slot_utc AND r.outcome IS NULL "
+                            "AND r.version_id = ("
+                            f"SELECT d.version_id FROM {self._schema}.deployments d "
+                            f"JOIN {self._schema}.agent_versions v "
+                            "ON v.id = d.version_id AND v.agent_id = d.agent_id "
+                            "WHERE d.agent_id = r.agent_id AND d.status = 'active' "
+                            "ORDER BY (d.environment = 'prod') DESC, "
+                            "d.deployed_at DESC, d.id DESC LIMIT 1)"
+                        ),
+                        {
+                            "agent_id": key.agent_id,
+                            "name": key.name,
+                            "slot_utc": key.slot_utc,
+                        },
+                    )
+                ).one_or_none()
+        except SQLAlchemyError as exc:
+            raise HookRunRecorderError(
+                "hook run authority could not be read",
+                code="backend",
+            ) from exc
+        return held is not None
 
     async def renew(self, ref: HookRunRef, lease_s: float) -> bool:
         """Extend an open run's claim lease to at least ``lease_s`` from now.
@@ -214,8 +284,25 @@ class HookRunRecorder:
             ) from exc
         return renewed is not None
 
-    async def close(self, ref: HookRunRef, outcome: HookRunOutcome) -> None:
-        """Set one open run terminally without overwriting an earlier outcome."""
+    async def close(
+        self,
+        ref: HookRunRef,
+        outcome: HookRunOutcome,
+        reason: HookRunReason | None = None,
+    ) -> bool:
+        """Set one open run terminally without overwriting an earlier outcome.
+
+        Returns True only when this call closes the row.
+
+        ``ran`` stores no reason. Every other outcome requires one.
+        """
+        if outcome == "ran":
+            reason = None
+        elif reason is None:
+            raise HookRunRecorderError(
+                "hook run reason is required unless the outcome is ran",
+                code="invalid_ref",
+            )
         key = _parse_ref(ref)
         closed = False
         try:
@@ -224,16 +311,17 @@ class HookRunRecorder:
                     await connection.execute(
                         text(
                             f"UPDATE {self._schema}.hook_runs "
-                            "SET outcome = :outcome, ended_at = now() "
+                            "SET outcome = :outcome, reason = :reason, ended_at = now() "
                             "WHERE agent_id = :agent_id "
                             "AND name = :name AND slot_utc = :slot_utc "
-                            "AND outcome IS NULL RETURNING outcome"
+                            "AND outcome IS NULL RETURNING outcome, source"
                         ),
                         {
                             "agent_id": key.agent_id,
                             "name": key.name,
                             "slot_utc": key.slot_utc,
                             "outcome": outcome,
+                            "reason": reason,
                         },
                     )
                 ).one_or_none()
@@ -266,15 +354,16 @@ class HookRunRecorder:
                 "hook run outcome could not be stored",
                 code="backend",
             ) from exc
-        if closed:
+        if updated is not None:
             try:
                 record_metric(
                     "curie.schedule.fire",
                     attributes={
                         "service.name": "curie-worker",
-                        "trigger": "cron",
+                        "trigger": "webhook" if updated.source == "webhook" else "cron",
                         "outcome": outcome,
                     },
                 )
             except Exception:
                 logger.exception("hook run metric emission failed after outcome commit")
+        return closed

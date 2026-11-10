@@ -34,6 +34,7 @@ use sha2::{Digest, Sha256};
 /// The declaration this module reads, named once (its Python twin is
 /// `plugin_format.connectors.CONNECTORS_FILE`).
 pub const CONNECTORS_FILE: &str = "connectors.yaml";
+pub const HOOK_WAKE_KEY_ENV: &str = "CURIE_HOOK_WAKE_KEY";
 
 /// The lock `curie build` writes, named once (its Python twin is
 /// `plugin_format.connector_lock.CONNECTOR_LOCK_FILE`).
@@ -96,6 +97,31 @@ pub struct ConnectorSpecDecl {
     /// `plugin_format.validate_connectors` owns the rules.
     #[serde(default)]
     pub admits: Option<Vec<String>>,
+    /// The Host the caller proxy presents on admitted requests (ADR 0229).
+    /// Carried as written; `plugin_format.validate_connectors` owns the
+    /// loopback rule.
+    #[serde(default)]
+    pub proxy_upstream_host: Option<String>,
+    /// The HTTP path of the server container's readiness probe. Carried as
+    /// written; `plugin_format.validate_connectors` owns the path rule.
+    #[serde(default)]
+    pub readiness_path: Option<String>,
+    /// The server container's requests and limits, merged per key over the
+    /// platform defaults by `plugin_format.connector_render`. Carried as
+    /// written; the quantity and request-within-limit rules are Python's.
+    #[serde(default)]
+    pub resources: Option<ConnectorResourcesDecl>,
+    /// A bounded writable volume for the server container (#5415). Carried
+    /// as written; `plugin_format.validate_connectors` owns the path rules,
+    /// and the local docker tier reads `size_limit` with
+    /// [`scratch_size_bytes`].
+    #[serde(default)]
+    pub scratch: Option<ConnectorScratchDecl>,
+    /// Non-MCP routes the caller proxy admits a connector-scoped route token
+    /// on (ADR 0240). Carried as written; `plugin_format.validate_connectors`
+    /// and `validate_bundle` own the path, method, size and caller rules.
+    #[serde(default)]
+    pub routes: Vec<ConnectorRouteDecl>,
 
     // -- remote form --
     pub url: Option<String>,
@@ -110,10 +136,87 @@ pub struct ConnectorSpecDecl {
     /// A lone [`SecretDecl::Ref`] is not. See [`bearer_secret_name`].
     #[serde(default)]
     pub bearer_secret: Option<String>,
+    /// Reviewer-facing reason the hosted server authenticates no client.
+    /// When set, no Authorization header is derived and no secret name is
+    /// bound into the sandbox. Never rendered. See [`bearer_secret_name`].
+    #[serde(default)]
+    pub no_client_auth: Option<String>,
     #[serde(default)]
     pub sealed_secrets: BTreeMap<String, String>,
     #[serde(default)]
     pub secret_files: BTreeMap<String, String>,
+    /// Per-agent NON-secret settings: resolved and forwarded like a plain
+    /// `secrets:` name, but never a Bearer candidate and never bound into the
+    /// sandbox. See [`declared_secret_names`] and [`bearer_secret_name`].
+    #[serde(default)]
+    pub config: Vec<String>,
+}
+
+/// One entry of `routes:` on a hosted connector (ADR 0240).
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ConnectorRouteDecl {
+    pub path: String,
+    #[serde(default = "default_route_methods")]
+    pub methods: Vec<String>,
+    pub max_body_bytes: u64,
+    pub callers: Vec<String>,
+}
+
+fn default_route_methods() -> Vec<String> {
+    vec!["POST".to_string()]
+}
+
+/// `resources:` on a hosted connector: either side may be omitted.
+#[derive(Debug, Default, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ConnectorResourcesDecl {
+    #[serde(default)]
+    pub requests: Option<ConnectorResourceQuantitiesDecl>,
+    #[serde(default)]
+    pub limits: Option<ConnectorResourceQuantitiesDecl>,
+}
+
+/// `scratch:` on a hosted connector: both keys are required.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ConnectorScratchDecl {
+    pub path: String,
+    pub size_limit: String,
+}
+
+/// The bytes a `scratch.size_limit` means, or `None` when it is refused.
+///
+/// A whole number of bytes with an optional `Ki`, `Mi` or `Gi` suffix, from
+/// 1Mi to 64Gi inclusive: the grammar `plugin_format.scratch_size_bytes`
+/// reads, pinned for both by `tests/vectors/connector-scratch-size.json`.
+pub fn scratch_size_bytes(text: &str) -> Option<u64> {
+    const MIN: u64 = 1 << 20;
+    const MAX: u64 = 64 << 30;
+    let (digits, scale) = if let Some(rest) = text.strip_suffix("Ki") {
+        (rest, 1u64 << 10)
+    } else if let Some(rest) = text.strip_suffix("Mi") {
+        (rest, 1u64 << 20)
+    } else if let Some(rest) = text.strip_suffix("Gi") {
+        (rest, 1u64 << 30)
+    } else {
+        (text, 1u64)
+    };
+    if digits.is_empty() || digits.starts_with('0') || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let bytes = digits.parse::<u64>().ok()?.checked_mul(scale)?;
+    (MIN..=MAX).contains(&bytes).then_some(bytes)
+}
+
+/// One side of [`ConnectorResourcesDecl`]: Kubernetes quantity strings.
+#[derive(Debug, Default, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ConnectorResourceQuantitiesDecl {
+    #[serde(default)]
+    pub cpu: Option<String>,
+    #[serde(default)]
+    pub memory: Option<String>,
 }
 
 /// A declared secret: a bare env var name, or a reference to a Secret someone
@@ -164,12 +267,19 @@ impl Default for ConnectorSpecDecl {
             port: default_port(),
             unhosted_url: None,
             admits: None,
+            proxy_upstream_host: None,
+            readiness_path: None,
+            resources: None,
+            scratch: None,
+            routes: Vec::new(),
             url: None,
             headers: BTreeMap::new(),
             secrets: Vec::new(),
             bearer_secret: None,
+            no_client_auth: None,
             sealed_secrets: BTreeMap::new(),
             secret_files: BTreeMap::new(),
+            config: Vec::new(),
         }
     }
 }
@@ -612,6 +722,7 @@ pub fn locked_runner_image(bundle_dir: &Path) -> Result<Option<String>> {
 }
 
 fn check_spec(name: &str, spec: &ConnectorSpecDecl) -> Result<()> {
+    check_wake_key_role(name, spec)?;
     let forms = [
         spec.image.is_some(),
         spec.build.is_some(),
@@ -638,8 +749,143 @@ fn check_spec(name: &str, spec: &ConnectorSpecDecl) -> Result<()> {
              connector with `env` and `args` instead"
         );
     }
+    if let Some(reason) = &spec.no_client_auth {
+        if reason.trim().is_empty() {
+            bail!(
+                "connectors.bad_no_client_auth: connectors.{name}: `no_client_auth` must \
+                 state a non-empty reason"
+            );
+        }
+        if spec.url.is_some() {
+            bail!(
+                "connectors.remote_has_no_client_auth: connectors.{name}: `no_client_auth` \
+                 applies to a connector Curie hosts; a `url` connector derives no \
+                 Authorization header"
+            );
+        }
+        if spec.bearer_secret.is_some() {
+            bail!(
+                "connectors.no_client_auth_with_bearer_secret: connectors.{name}: \
+                 `no_client_auth` and `bearer_secret` contradict each other; set exactly one"
+            );
+        }
+    }
     if let Some(build) = &spec.build {
         check_build(&format!("connectors.{name}"), build)?;
+    }
+    Ok(())
+}
+
+fn check_wake_key_role(name: &str, spec: &ConnectorSpecDecl) -> Result<()> {
+    if spec.bearer_secret.as_deref() == Some(HOOK_WAKE_KEY_ENV) {
+        bail!(
+            "connectors.wake_key_bearer: connectors.{name}: the wake key cannot be an MCP bearer"
+        );
+    }
+    let invalid_secret = spec.secrets.iter().any(|secret| match secret {
+        SecretDecl::Name(key) => key == HOOK_WAKE_KEY_ENV,
+        SecretDecl::Ref { name, .. } => name == HOOK_WAKE_KEY_ENV && spec.url.is_some(),
+    });
+    let expanded = spec.headers.values().map(String::as_str).chain([
+        spec.url.as_deref().unwrap_or_default(),
+        spec.unhosted_url.as_deref().unwrap_or_default(),
+        spec.bearer_secret.as_deref().unwrap_or_default(),
+    ]);
+    if invalid_secret
+        || spec.secret_files.contains_key(HOOK_WAKE_KEY_ENV)
+        || spec.sealed_secrets.contains_key(HOOK_WAKE_KEY_ENV)
+        || spec.config.iter().any(|key| key == HOOK_WAKE_KEY_ENV)
+        || spec.env.contains_key(HOOK_WAKE_KEY_ENV)
+        || expanded
+            .into_iter()
+            .any(|text| text.contains(HOOK_WAKE_KEY_ENV))
+    {
+        bail!(
+            "connectors.wake_key_delivery: connectors.{name}: deliver the wake key only \
+             through a hosted secrets SecretRef; it cannot enter client configuration \
+             or the per-agent secret store"
+        );
+    }
+    Ok(())
+}
+
+/// Wake-specific declaration checks for the existing connector-build entrypoint.
+pub fn validate_wake_manifest(bundle_dir: &Path) -> Result<()> {
+    if ![".claude-plugin/plugin.json", "plugin.json"]
+        .iter()
+        .any(|relative| bundle_dir.join(relative).is_file())
+    {
+        return Ok(());
+    }
+    let (_, manifest) = crate::scaffold::load_manifest_json(bundle_dir)?;
+    let Some(triggers) = manifest.get("triggers").filter(|value| !value.is_null()) else {
+        return Ok(());
+    };
+    let triggers = triggers
+        .as_array()
+        .ok_or_else(|| anyhow!("triggers.invalid: triggers must be a list"))?;
+    let mut names = BTreeSet::new();
+    for trigger in triggers {
+        let trigger = trigger
+            .as_object()
+            .ok_or_else(|| anyhow!("triggers.invalid: each trigger must be an object"))?;
+        let wake = match trigger.get("wake") {
+            None => false,
+            Some(value) => value
+                .as_bool()
+                .ok_or_else(|| anyhow!("triggers.invalid: wake must be a boolean"))?,
+        };
+        let text = |key: &str| trigger.get(key).and_then(serde_json::Value::as_str);
+        let trim = |text: &str| {
+            text.trim_matches(|c: char| c.is_whitespace() || matches!(c, '\u{1c}'..='\u{1f}'))
+                .to_string()
+        };
+        if let Some(name) = text("name").map(trim).filter(|name| !name.is_empty()) {
+            if !names.insert(name) {
+                bail!("triggers.duplicate_name: trigger names must be unique");
+            }
+        }
+        if wake {
+            if text("type") != Some("webhook") {
+                bail!("triggers.wake_type_invalid: wake requires type webhook");
+            }
+            let valid_name = text("name").is_some_and(|name| {
+                let alnum = |byte: u8| byte.is_ascii_lowercase() || byte.is_ascii_digit();
+                !name.is_empty()
+                    && name.len() <= 63
+                    && alnum(name.as_bytes()[0])
+                    && name
+                        .bytes()
+                        .all(|byte| alnum(byte) || b"._-".contains(&byte))
+            });
+            if !valid_name {
+                bail!("triggers.wake_invalid_name: invalid wake hook name");
+            }
+            if text("prompt").is_none_or(|value| trim(value).is_empty()) {
+                bail!("triggers.wake_missing_prompt: wake requires a standing prompt");
+            }
+            if trigger.contains_key("target") {
+                bail!("triggers.wake_target_forbidden: wake must not define target");
+            }
+            if trigger.contains_key("schedule") {
+                bail!("triggers.schedule_forbidden: webhook must not define schedule");
+            }
+            if trigger.contains_key("timezone")
+                && text("schedule").is_none_or(|value| trim(value).is_empty())
+            {
+                bail!("triggers.timezone_without_schedule: timezone requires a schedule");
+            }
+        }
+        if trigger.contains_key("target")
+            && text("target").is_none_or(|value| trim(value).is_empty())
+        {
+            bail!("triggers.target_invalid: target must be a nonblank string");
+        }
+        if text("type") == Some("webhook")
+            && text("path").is_none_or(|value| trim(value).is_empty())
+        {
+            bail!("triggers.webhook_missing_path: webhook requires a path");
+        }
     }
     Ok(())
 }
@@ -1165,7 +1411,7 @@ const TAG_DIGEST_LEN: usize = 16;
 /// The uid every connector container runs as, mirroring `render_deployment`'s
 /// `runAsUser` so a staged credential is readable by the same identity on both
 /// tiers.
-const CONNECTOR_UID: u32 = 65532;
+pub(crate) const CONNECTOR_UID: u32 = 65532;
 
 /// One connector's resolved build: the inputs, the command's target, and the
 /// identity the lock will record.
@@ -1209,12 +1455,37 @@ pub fn host_platform() -> String {
     format!("linux/{arch}")
 }
 
+/// Narrow a declared platform set to the `--platform` values requested.
+///
+/// No request keeps the declared set. Otherwise every requested platform must
+/// be declared; the result keeps declared order without duplicates. The source
+/// digest still hashes the declared block, so narrowing never moves it.
+pub fn narrow_platforms(declared: &[String], requested: &[String]) -> Result<Vec<String>> {
+    if requested.is_empty() {
+        return Ok(declared.to_vec());
+    }
+    if let Some(missing) = requested.iter().find(|r| !declared.contains(r)) {
+        bail!(
+            "--platform {missing} is not declared; the declared platforms are [{}]",
+            declared.join(", ")
+        );
+    }
+    let mut out: Vec<String> = Vec::new();
+    for platform in declared {
+        if requested.contains(platform) && !out.contains(platform) {
+            out.push(platform.clone());
+        }
+    }
+    Ok(out)
+}
+
 /// Resolve everything one connector's build needs, without contacting anything.
 ///
 /// Planning is where a bad declaration fails: a context outside the bundle, a
 /// symlinked Dockerfile, a missing Dockerfile. A planner that returned a plan
 /// for any of those would hand `docker` a path and surface Docker's error
 /// instead of one naming the connector.
+#[allow(clippy::too_many_arguments)]
 pub fn build_plan(
     bundle_root: &Path,
     bundle_name: &str,
@@ -1223,6 +1494,7 @@ pub fn build_plan(
     registry: Option<&str>,
     host_platform: &str,
     metadata_dir: &Path,
+    platforms: &[String],
 ) -> Result<ConnectorBuildPlan> {
     let build = spec.build.as_ref().ok_or_else(|| {
         anyhow!("connectors.{connector}: declares no `build` block, so there is nothing to build")
@@ -1252,7 +1524,7 @@ pub fn build_plan(
         connector: connector.to_string(),
         context,
         dockerfile,
-        platforms: build.platforms.clone(),
+        platforms: platforms.to_vec(),
         host_platform: host_platform.to_string(),
         delivery,
         image_ref,
@@ -1298,6 +1570,7 @@ pub fn check_runner_source(
 ///
 /// `base_arg` is what the build uses: the `<repo>@sha256:` reference for a
 /// registry build, the inspected reference for a local-daemon one.
+#[allow(clippy::too_many_arguments)]
 pub fn runner_build_plan(
     bundle_root: &Path,
     bundle_name: &str,
@@ -1306,6 +1579,7 @@ pub fn runner_build_plan(
     base_arg: &str,
     host_platform: &str,
     metadata_dir: &Path,
+    platforms: &[String],
 ) -> Result<ConnectorBuildPlan> {
     let (context, dockerfile) = check_runner_source(bundle_root, runner)?;
     let source_digest = source_digest_of(&context, &runner.build).context("runner")?;
@@ -1326,7 +1600,7 @@ pub fn runner_build_plan(
         connector: "runner".to_string(),
         context,
         dockerfile,
-        platforms: runner.build.platforms.clone(),
+        platforms: platforms.to_vec(),
         host_platform: host_platform.to_string(),
         delivery,
         image_ref,
@@ -1598,129 +1872,248 @@ pub fn connector_scope_env(scope: &ConnectorScope) -> Vec<(String, String)> {
     ]
 }
 
-// ─── Staged credentials ──────────────────────────────────────────────────────
+// ─── Runtime credential volumes ─────────────────────────────────────────────
 
-/// Where resolved connector credentials are staged for a local bring-up.
-///
-/// Deterministic, not a per-run tempdir: teardown is label-driven and a reap
-/// that never inspected a container cannot discover a random path, so the
-/// credential would survive every `down`. Under `.curie/`, which the packer
-/// excludes and the scaffold gitignores.
-pub fn connector_secrets_root(plugin_dir: &Path) -> PathBuf {
-    plugin_dir.join(".curie").join("connector-secrets")
+fn secret_file_name(declared_path: &str) -> String {
+    hex(Sha256::digest(declared_path.as_bytes()).as_slice())
 }
 
-/// The host path one declared `secret_files` entry is staged at.
-///
-/// The filename carries a digest of the WHOLE declared path, not just its
-/// basename: one connector may declare `/a/token` and `/b/token`, and a
-/// basename-only name stages the second over the first. Producer
-/// (`stage_secret_file`) and consumers (the `docker run` mounts, the compose
-/// overlay) all derive the path here, so the naming is theirs to share.
-///
-/// The basename is reduced to one path-free component because the declared path
-/// is the CONTAINER's: nothing constrains it to a shape the host can hold, and
-/// `..` or a drive-letter component would otherwise be joined verbatim.
-pub fn staged_secret_path(plugin_dir: &Path, connector: &str, declared_path: &str) -> PathBuf {
-    let basename = declared_path
-        .rsplit(['/', '\\'])
-        .next()
-        .unwrap_or(declared_path);
-    let kept: String = basename
-        .chars()
-        .filter(|c| c.is_ascii_alphanumeric() || matches!(*c, '.' | '_' | '-'))
-        .collect();
-    // `..`, `.` and the empty basename all name a directory rather than a file.
-    let stem = if kept.trim_matches('.').is_empty() {
-        "secret"
+/// Private daemon volumes for one connector bring-up, shared by both emitters.
+#[derive(Debug, Clone)]
+pub struct ConnectorSecretVolumes {
+    pub run_id: String,
+    pub volumes: BTreeMap<String, String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConnectorSecretMount {
+    pub volume: String,
+    pub subpath: String,
+    pub target: String,
+}
+
+impl ConnectorSecretMount {
+    pub fn docker_mount(&self) -> String {
+        format!(
+            "type=volume,source={},volume-subpath={},\"target={}\",readonly,volume-nocopy",
+            self.volume,
+            self.subpath,
+            self.target.replace('"', "\"\"")
+        )
+    }
+}
+
+impl ConnectorSecretVolumes {
+    pub fn new(decl: &ConnectorsFileDecl) -> Self {
+        Self {
+            run_id: uuid::Uuid::new_v4().to_string(),
+            volumes: decl
+                .connectors
+                .iter()
+                .filter(|(_, spec)| is_hosted(spec) && !spec.secret_files.is_empty())
+                .map(|(name, _)| {
+                    (
+                        name.clone(),
+                        format!("curie-credentials-{}", uuid::Uuid::new_v4()),
+                    )
+                })
+                .collect(),
+        }
+    }
+
+    pub fn mounts(
+        &self,
+        connector: &str,
+        spec: &ConnectorSpecDecl,
+    ) -> Result<Vec<ConnectorSecretMount>> {
+        spec.secret_files
+            .values()
+            .map(|target| {
+                let volume = self.volumes.get(connector).ok_or_else(|| {
+                    anyhow!("connector '{connector}' has no runtime credential volume")
+                })?;
+                Ok(ConnectorSecretMount {
+                    volume: volume.clone(),
+                    subpath: secret_file_name(target),
+                    target: target.clone(),
+                })
+            })
+            .collect()
+    }
+
+    pub fn labels(&self, connector: &str) -> Vec<(String, String)> {
+        let mut labels = vec![(
+            crate::docker::CONNECTOR_SECRET_RUN_LABEL_KEY.to_string(),
+            self.run_id.clone(),
+        )];
+        if let Some(volume) = self.volumes.get(connector) {
+            labels.push((
+                crate::docker::CONNECTOR_SECRET_VOLUME_LABEL_KEY.to_string(),
+                volume.clone(),
+            ));
+        }
+        labels
+    }
+}
+
+// ─── Docker minimums for volume subpath mounts ───────────────────────────────
+
+const MIN_ENGINE_API: (u64, u64) = (1, 45);
+const MIN_COMPOSE_VERSION: (u64, u64, u64) = (2, 26, 0);
+const DOCKER_MINIMUM_DOCS: &str = "docs/onboarding.md Prerequisites";
+
+fn numeric_version_components(raw: &str, strip_leading_v: bool) -> Option<Vec<u64>> {
+    let trimmed = raw.trim();
+    let trimmed = if strip_leading_v {
+        trimmed
+            .strip_prefix('v')
+            .or_else(|| trimmed.strip_prefix('V'))
+            .unwrap_or(trimmed)
     } else {
-        kept.as_str()
+        trimmed
     };
-    let digest = hex(Sha256::digest(declared_path.as_bytes()).as_slice());
-    connector_secrets_root(plugin_dir)
-        .join(connector)
-        .join(format!("{stem}-{}", &digest[..DIGEST_LEN]))
+    let head = trimmed
+        .split(['-', '+'])
+        .next()
+        .filter(|head| !head.is_empty())?;
+    head.split('.')
+        .map(|part| {
+            if part.is_empty() || !part.bytes().all(|byte| byte.is_ascii_digit()) {
+                return None;
+            }
+            part.parse::<u64>().ok()
+        })
+        .collect()
 }
 
-/// Write one resolved credential where the container will find it.
-///
-/// The parent directories are `0700` because the file mode is not always
-/// enough: rootless Docker and Docker Desktop map uids differently, so the
-/// `chown` to the container's uid is not always permitted, and where it is not
-/// the file falls back to `0444` inside a private parent.
-pub fn stage_secret_file(
-    plugin_dir: &Path,
-    connector: &str,
-    declared_path: &str,
-    value: &str,
-) -> Result<PathBuf> {
-    let path = staged_secret_path(plugin_dir, connector, declared_path);
-    let parent = path
-        .parent()
-        .ok_or_else(|| anyhow!("staged credential path has no parent"))?;
-    std::fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
-    private_dir(&connector_secrets_root(plugin_dir))?;
-    private_dir(parent)?;
-    // Replace, never write over: hardening left any previous staging 0400 (or
-    // 0444 where the chown fell back), so a plain write onto it is EACCES and
-    // a redeploy or credential rotation would wedge until the tree is removed
-    // by hand.
-    if path.exists() {
-        std::fs::remove_file(&path)
-            .with_context(|| format!("replace previously staged {}", path.display()))?;
+fn parse_engine_api_version(raw: &str) -> Option<(u64, u64)> {
+    let parts = numeric_version_components(raw, false)?;
+    if parts.len() < 2 {
+        return None;
     }
-    std::fs::write(&path, value).with_context(|| format!("write {}", path.display()))?;
-    harden_secret_file(&path)?;
-    Ok(path)
+    Some((parts[0], parts[1]))
 }
 
-#[cfg(unix)]
-fn private_dir(path: &Path) -> Result<()> {
-    use std::os::unix::fs::PermissionsExt;
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))
-        .with_context(|| format!("restrict {}", path.display()))
-}
-
-#[cfg(not(unix))]
-fn private_dir(_path: &Path) -> Result<()> {
-    Ok(())
-}
-
-#[cfg(unix)]
-fn harden_secret_file(path: &Path) -> Result<()> {
-    use std::os::unix::fs::PermissionsExt;
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o400))
-        .with_context(|| format!("restrict {}", path.display()))?;
-    // Where the CLI may not hand the file to the container's uid, the file must
-    // be world-readable instead -- the 0700 parent is what keeps it private.
-    if std::os::unix::fs::chown(path, Some(CONNECTOR_UID), Some(CONNECTOR_UID)).is_err() {
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o444))
-            .with_context(|| format!("widen {} for the container's uid", path.display()))?;
+fn parse_compose_version(raw: &str) -> Option<(u64, u64, u64)> {
+    let parts = numeric_version_components(raw, true)?;
+    if parts.is_empty() {
+        return None;
     }
-    Ok(())
+    Some((
+        parts[0],
+        parts.get(1).copied().unwrap_or(0),
+        parts.get(2).copied().unwrap_or(0),
+    ))
 }
 
-#[cfg(not(unix))]
-fn harden_secret_file(_path: &Path) -> Result<()> {
-    Ok(())
+fn subpath_connector_names(volumes: &ConnectorSecretVolumes) -> String {
+    volumes
+        .volumes
+        .keys()
+        .map(|name| format!("'{name}'"))
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
-/// Remove a staged credential tree. A no-op when it is already gone, so `down`
-/// after `down` does not error.
+fn check_engine_api_version(raw: &str, connectors: &str) -> Result<()> {
+    let observed = raw.trim();
+    match parse_engine_api_version(observed) {
+        Some(version) if version >= MIN_ENGINE_API => Ok(()),
+        Some(_) => anyhow::bail!(
+            "connector {connectors} declares secret_files, which needs a Docker volume \
+             subpath mount: Docker Engine 26.0 (Engine API 1.45) or later is required, \
+             but the Docker server reports Engine API {observed}. \
+             See {DOCKER_MINIMUM_DOCS}."
+        ),
+        None => anyhow::bail!(
+            "connector {connectors} declares secret_files, which needs a Docker volume \
+             subpath mount: Docker Engine 26.0 (Engine API 1.45) or later is required, \
+             but the Docker server reports Engine API '{observed}', which cannot be parsed. \
+             See {DOCKER_MINIMUM_DOCS}."
+        ),
+    }
+}
+
+fn check_compose_version(raw: &str, connectors: &str) -> Result<()> {
+    let observed = raw.trim();
+    match parse_compose_version(observed) {
+        Some(version) if version >= MIN_COMPOSE_VERSION => Ok(()),
+        Some(_) => anyhow::bail!(
+            "connector {connectors} declares secret_files, which needs a Docker volume \
+             subpath mount: Docker Compose 2.26.0 or later is required, \
+             but `docker compose version` reports {observed}. \
+             See {DOCKER_MINIMUM_DOCS}."
+        ),
+        None => anyhow::bail!(
+            "connector {connectors} declares secret_files, which needs a Docker volume \
+             subpath mount: Docker Compose 2.26.0 or later is required, \
+             but `docker compose version` reports '{observed}', which cannot be parsed. \
+             See {DOCKER_MINIMUM_DOCS}."
+        ),
+    }
+}
+
+/// Refuse a connector bring-up that is about to issue a volume subpath mount
+/// on a Docker too old to honor it.
 ///
-/// Addressed by the root rather than the bundle directory because teardown
-/// carries the root it recorded (`ConnectorTeardownStep::WipeSecrets`) while an
-/// aborting boot carries only the plugin dir; one implementation serves both.
-pub fn wipe_secrets_root(root: &Path) -> Result<()> {
-    if !root.exists() {
+/// A no-op when no hosted connector declares `secret_files`, so every other
+/// bundle keeps working on older Docker. The Engine check reads the server
+/// API version because it names the capability across distributions. The
+/// Compose check runs only on the local tier, which is the only tier that
+/// reaches the engine through Compose.
+pub async fn docker_subpath_preflight(
+    volumes: &ConnectorSecretVolumes,
+    require_compose: bool,
+) -> Result<()> {
+    if volumes.volumes.is_empty() {
         return Ok(());
     }
-    std::fs::remove_dir_all(root).with_context(|| format!("remove {}", root.display()))
-}
-
-/// The same wipe, addressed by the bundle directory a boot staged into.
-pub fn wipe_connector_secrets(plugin_dir: &Path) -> Result<()> {
-    wipe_secrets_root(&connector_secrets_root(plugin_dir))
+    let connectors = subpath_connector_names(volumes);
+    let engine_command = plain_command(
+        "docker",
+        vec![
+            "version".into(),
+            "--format".into(),
+            "{{.Server.APIVersion}}".into(),
+        ],
+    );
+    let (ok, stdout, stderr) = crate::ops::run_capture(&engine_command).await?;
+    if !ok {
+        let detail = if stderr.trim().is_empty() {
+            stdout.trim()
+        } else {
+            stderr.trim()
+        };
+        anyhow::bail!(
+            "connector {connectors} declares secret_files, which needs a Docker volume \
+             subpath mount: Docker Engine 26.0 (Engine API 1.45) or later is required, \
+             but reading the Docker server version failed: '{detail}'. \
+             See {DOCKER_MINIMUM_DOCS}."
+        );
+    }
+    check_engine_api_version(&stdout, &connectors)?;
+    if !require_compose {
+        return Ok(());
+    }
+    let compose_command = plain_command(
+        "docker",
+        vec!["compose".into(), "version".into(), "--short".into()],
+    );
+    let (ok, stdout, stderr) = crate::ops::run_capture(&compose_command).await?;
+    if !ok {
+        let detail = if stderr.trim().is_empty() {
+            stdout.trim()
+        } else {
+            stderr.trim()
+        };
+        anyhow::bail!(
+            "connector {connectors} declares secret_files, which needs a Docker volume \
+             subpath mount: Docker Compose 2.26.0 or later is required, \
+             but reading the Compose version failed: '{detail}'. \
+             See {DOCKER_MINIMUM_DOCS}."
+        );
+    }
+    check_compose_version(&stdout, &connectors)
 }
 
 // ─── The compose overlay (the local tier's emitter) ──────────────────────────
@@ -1851,11 +2244,12 @@ pub fn compose_overlay(
     decl: &ConnectorsFileDecl,
     identity: &ConnectorScope,
     project: &str,
-    plugin_dir: &Path,
+    secret_volumes: &ConnectorSecretVolumes,
     caller_public_key: Option<&str>,
 ) -> Result<serde_json::Value> {
     let network = crate::local::current_resources()?.docker_network;
     let mut services = serde_json::Map::new();
+    let mut external_volumes = serde_json::Map::new();
     let hosts_one = decl.connectors.values().any(is_hosted);
     if hosts_one && caller_public_key.map(str::trim).unwrap_or("").is_empty() {
         anyhow::bail!(
@@ -1897,14 +2291,21 @@ pub fn compose_overlay(
             environment.insert(name, serde_json::Value::String(reference));
         }
 
-        let volumes: Vec<serde_json::Value> = spec
-            .secret_files
-            .values()
-            .map(|declared_path| {
-                serde_json::Value::String(format!(
-                    "{}:{declared_path}:ro",
-                    staged_secret_path(plugin_dir, connector, declared_path).display()
-                ))
+        let volumes: Vec<serde_json::Value> = secret_volumes
+            .mounts(connector, spec)?
+            .into_iter()
+            .map(|mount| {
+                external_volumes.insert(
+                    mount.volume.clone(),
+                    serde_json::json!({ "external": true, "name": mount.volume }),
+                );
+                serde_json::json!({
+                    "type": "volume",
+                    "source": mount.volume,
+                    "target": mount.target.replace('$', "$$"),
+                    "read_only": true,
+                    "volume": { "subpath": mount.subpath, "nocopy": true },
+                })
             })
             .collect();
 
@@ -1932,6 +2333,10 @@ pub fn compose_overlay(
         service.insert("networks".into(), serde_json::Value::Object(attachment));
         let mut labels = serde_json::Map::new();
         labels.insert(
+            "curietech.ai/managed-by".into(),
+            serde_json::Value::String("curie-cli".into()),
+        );
+        labels.insert(
             "curietech.ai/component".into(),
             serde_json::Value::String("connector".into()),
         );
@@ -1947,6 +2352,9 @@ pub fn compose_overlay(
         for (key, value) in crate::docker::connector_identity_labels(&identity.agent, &name) {
             labels.insert(key, serde_json::Value::String(value));
         }
+        for (key, value) in secret_volumes.labels(connector) {
+            labels.insert(key, serde_json::Value::String(value));
+        }
         service.insert("labels".into(), serde_json::Value::Object(labels));
         service.insert("read_only".into(), serde_json::Value::Bool(true));
         service.insert(
@@ -1957,6 +2365,15 @@ pub fn compose_overlay(
         service.insert(
             "security_opt".into(),
             serde_json::json!(["no-new-privileges"]),
+        );
+        // Come back after a Docker daemon restart, like the stack this serves;
+        // without it the connector stayed Exited and the agent lost its tools.
+        // `local down` removes these with `docker rm -f`, so it is unaffected,
+        // and a crash-looping start still fails the readiness waiter on its
+        // restart count.
+        service.insert(
+            "restart".into(),
+            serde_json::Value::String("unless-stopped".into()),
         );
         services.insert(name, serde_json::Value::Object(service));
     }
@@ -1969,10 +2386,14 @@ pub fn compose_overlay(
     Ok(serde_json::json!({
         "services": services,
         "networks": serde_json::Value::Object(networks),
+        "volumes": external_volumes,
     }))
 }
 
-/// The env-var names a declaration's `secrets:` list asks to be forwarded.
+/// The env-var names a declaration's `secrets:` and `config:` lists ask to be
+/// forwarded. `config` values come from the same store and reach the container
+/// the same way; only the Bearer derivation tells them apart, and that reads
+/// `secrets` alone.
 pub fn declared_secret_names(spec: &ConnectorSpecDecl) -> Vec<String> {
     spec.secrets
         .iter()
@@ -1980,6 +2401,7 @@ pub fn declared_secret_names(spec: &ConnectorSpecDecl) -> Vec<String> {
             SecretDecl::Name(name) => name.clone(),
             SecretDecl::Ref { name, .. } => name.clone(),
         })
+        .chain(spec.config.iter().cloned())
         .collect()
 }
 
@@ -1988,8 +2410,8 @@ pub fn declared_secret_names(spec: &ConnectorSpecDecl) -> Vec<String> {
 /// A connector carrying `url:` or `unhosted_url:` is not started here -- its
 /// secrets belong to the remote's client config and are expanded by the MCP
 /// client, so demanding them would refuse a bundle that works. Both channels a
-/// hosted connector resolves are covered: the `secrets:` list and the
-/// `secret_files:` keys. Names only; no value ever travels through this seam.
+/// hosted connector resolves are covered: the `secrets:` and `config:` lists
+/// and the `secret_files:` keys. Names only; no value ever travels through this seam.
 pub fn hosted_secret_names(decl: &ConnectorsFileDecl) -> Vec<String> {
     let mut names = std::collections::BTreeSet::new();
     for spec in decl.connectors.values() {
@@ -2012,6 +2434,9 @@ pub fn hosted_secret_names(decl: &ConnectorsFileDecl) -> Vec<String> {
 /// secrets without an explicit name is None (the Python validator refuses that
 /// document rather than picking `secrets[0]`).
 pub fn bearer_secret_name(spec: &ConnectorSpecDecl) -> Option<String> {
+    if spec.no_client_auth.is_some() {
+        return None;
+    }
     if let Some(name) = &spec.bearer_secret {
         return Some(name.clone());
     }
@@ -2093,15 +2518,29 @@ pub fn restrict_to(decl: &ConnectorsFileDecl, allowlist: Option<&[String]>) -> C
 /// `apps/worker/tests/binding/test_reserved_boot_env_pin.py` is the drift pin
 /// that fails CI if the two lists diverge -- the same mechanism that pins the
 /// Helm list.
-pub const RESERVED_CONNECTOR_SECRET_NAMES: [&str; 8] = [
+pub const RESERVED_CONNECTOR_SECRET_NAMES: [&str; 22] = [
     "ANTHROPIC_BASE_URL",
     "ANTHROPIC_API_KEY",
     "CLAUDE_CODE_OAUTH_TOKEN",
     "ANTHROPIC_AUTH_TOKEN",
     "HTTPS_PROXY",
     "HTTP_PROXY",
+    "ALL_PROXY",
+    "SSL_CERT_FILE",
+    "SSL_CERT_DIR",
     "NODE_EXTRA_CA_CERTS",
+    "NODE_TLS_REJECT_UNAUTHORIZED",
+    "NODE_OPTIONS",
     "ANTHROPIC_CUSTOM_HEADERS",
+    "https_proxy",
+    "http_proxy",
+    "all_proxy",
+    "ssl_cert_file",
+    "ssl_cert_dir",
+    "node_extra_ca_certs",
+    "node_tls_reject_unauthorized",
+    "node_options",
+    "anthropic_custom_headers",
 ];
 
 /// Whether `name` is reserved: an enumerated platform credential or
@@ -2140,16 +2579,22 @@ pub fn refuse_reserved_secret_names(decl: &ConnectorsFileDecl) -> Result<()> {
         if spec.url.is_some() || spec.unhosted_url.is_some() {
             continue;
         }
-        for name in declared_secret_names(spec)
-            .into_iter()
-            .chain(spec.secret_files.keys().cloned())
+        for name in spec
+            .secrets
+            .iter()
+            .filter_map(|secret| match secret {
+                SecretDecl::Ref { name, .. } if name == HOOK_WAKE_KEY_ENV => None,
+                SecretDecl::Name(name) | SecretDecl::Ref { name, .. } => Some(name),
+            })
+            .chain(spec.config.iter())
+            .chain(spec.secret_files.keys())
         {
-            crate::secrets::validate_name(&name).map_err(|err| {
+            crate::secrets::validate_name(name).map_err(|err| {
                 crate::exit::usage(format!(
                     "connectors.{connector}: `{name}` is not a usable secret name: {err}"
                 ))
             })?;
-            if is_reserved_secret_name(&name) {
+            if is_reserved_secret_name(name) {
                 return Err(crate::exit::usage(format!(
                     "connectors.{connector}: `{name}` is a reserved platform boot-env or \
                      model-credential key and cannot be a connector secret. Curie would resolve \
@@ -2227,6 +2672,35 @@ connectors:
 "#,
         );
         assert_eq!(hosted_env_secret_names(&decl), vec!["A".to_string()]);
+    }
+
+    #[test]
+    fn an_agent_scoped_secret_reference_is_refused_not_resolved_locally() {
+        // `${CURIE_AGENT}` is expanded by the cluster render only. Locally
+        // there is no out-of-band Secret to point at, so the templated form is
+        // refused like any other reference and its placeholder text never
+        // stands in for a Secret name or a bound env var.
+        let decl = decl(
+            r#"
+connectors:
+  reader:
+    image: ghcr.io/example/reader:1
+    secrets:
+      - name: EXAMPLE_TOKEN
+        from_secret: example-read-${CURIE_AGENT}
+"#,
+        );
+        assert!(hosted_env_secret_names(&decl).is_empty());
+        let spec = &decl.connectors["reader"];
+        let text = format!(
+            "{:#}",
+            refuse_out_of_band_secrets("reader", spec)
+                .expect_err("an agent-scoped reference has no local equivalent")
+        );
+        assert!(
+            text.contains("`example-read-${CURIE_AGENT}`") && text.contains("EXAMPLE_TOKEN"),
+            "the refusal names the reference as written: {text}"
+        );
     }
 
     #[test]
@@ -2340,6 +2814,157 @@ connectors:
         assert_eq!(hosted_env_secret_names(&decl), vec!["PAT".to_string()]);
     }
 
+    const CONFIGURED: &str = r#"
+connectors:
+  docs:
+    image: ghcr.io/example/docs-mcp:1
+    secrets:
+      - DOCS_TOKEN
+    config:
+      - DOCS_FOLDER_PATH
+      - CHAT_CHANNEL_ID
+"#;
+
+    #[test]
+    fn config_names_are_resolved_and_forwarded_like_plain_secrets() {
+        // `config` values come from the same per-agent store and reach the
+        // connector container the same way, so every resolve/forward seam
+        // must see them.
+        let decl = decl(CONFIGURED);
+        let spec = &decl.connectors["docs"];
+        assert_eq!(
+            declared_secret_names(spec),
+            vec!["DOCS_TOKEN", "DOCS_FOLDER_PATH", "CHAT_CHANNEL_ID"]
+        );
+        assert_eq!(
+            hosted_secret_names(&decl),
+            vec!["CHAT_CHANNEL_ID", "DOCS_FOLDER_PATH", "DOCS_TOKEN"]
+        );
+    }
+
+    #[test]
+    fn config_names_never_become_the_bearer_or_reach_the_sandbox() {
+        let configured = decl(CONFIGURED);
+        assert_eq!(
+            bearer_secret_name(&configured.connectors["docs"]).as_deref(),
+            Some("DOCS_TOKEN")
+        );
+        assert_eq!(
+            hosted_env_secret_names(&configured),
+            vec!["DOCS_TOKEN".to_string()]
+        );
+        let config_only = decl(
+            "connectors:\n  docs:\n    image: ghcr.io/example/docs-mcp:1\n    config: [DOCS_FOLDER_PATH]\n",
+        );
+        assert_eq!(bearer_secret_name(&config_only.connectors["docs"]), None);
+        assert!(hosted_env_secret_names(&config_only).is_empty());
+    }
+
+    #[test]
+    fn a_reserved_config_name_is_refused_before_resolution() {
+        let decl = decl(
+            "connectors:\n  docs:\n    image: ghcr.io/example/docs-mcp:1\n    config: [ANTHROPIC_API_KEY]\n",
+        );
+        assert!(refuse_reserved_secret_names(&decl).is_err());
+    }
+
+    #[test]
+    fn node_tls_controls_are_refused_before_secret_resolution() {
+        for name in ["NODE_TLS_REJECT_UNAUTHORIZED", "NODE_OPTIONS"] {
+            let declared = decl(&format!(
+                "connectors:\n  docs:\n    image: ghcr.io/example/docs-mcp:1\n    secrets: [{name}]\n"
+            ));
+            assert!(refuse_reserved_secret_names(&declared).is_err());
+            assert!(refuse_reserved_env_secret_name(name).is_err());
+        }
+        assert!(refuse_reserved_env_secret_name("EXAMPLE_API_TOKEN").is_ok());
+    }
+
+    const NO_CLIENT_AUTH: &str = r#"
+connectors:
+  docs:
+    image: ghcr.io/example/docs-mcp:1
+    port: 8000
+    secrets: [UPSTREAM_CLIENT_ID, UPSTREAM_CLIENT_SECRET]
+    no_client_auth: >-
+      In-cluster MCP server reached over the pod network; it authenticates no
+      client and the boundary is its ingress NetworkPolicy.
+"#;
+
+    #[test]
+    fn no_client_auth_parses_and_binds_no_secret_into_the_sandbox() {
+        let decl = decl(NO_CLIENT_AUTH);
+        let spec = &decl.connectors["docs"];
+        assert!(spec.no_client_auth.is_some());
+        assert_eq!(bearer_secret_name(spec), None);
+        assert!(hosted_env_secret_names(&decl).is_empty());
+        // Pod-side delivery is unchanged: both names still resolve.
+        assert_eq!(
+            hosted_secret_names(&decl),
+            vec!["UPSTREAM_CLIENT_ID", "UPSTREAM_CLIENT_SECRET"]
+        );
+    }
+
+    #[test]
+    fn no_client_auth_single_plain_secret_binds_nothing() {
+        let decl = decl(
+            "connectors:\n  docs:\n    image: ghcr.io/example/docs-mcp:1\n    secrets: [UPSTREAM_TOKEN]\n    no_client_auth: In-cluster server; the boundary is its ingress NetworkPolicy.\n",
+        );
+        assert_eq!(bearer_secret_name(&decl.connectors["docs"]), None);
+        assert!(hosted_env_secret_names(&decl).is_empty());
+    }
+
+    #[test]
+    fn no_client_auth_with_bearer_secret_is_refused() {
+        let err = parse_connectors(
+            "connectors:\n  docs:\n    image: ghcr.io/example/docs-mcp:1\n    secrets: [UPSTREAM_CLIENT_ID, UPSTREAM_CLIENT_SECRET]\n    bearer_secret: UPSTREAM_CLIENT_SECRET\n    no_client_auth: In-cluster server; the boundary is its ingress NetworkPolicy.\n",
+        )
+        .expect_err("no_client_auth with bearer_secret must be refused");
+        assert!(
+            err.to_string()
+                .contains("connectors.no_client_auth_with_bearer_secret"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn no_client_auth_with_empty_bearer_secret_is_refused() {
+        let err = parse_connectors(
+            "connectors:\n  docs:\n    image: ghcr.io/example/docs-mcp:1\n    bearer_secret: ''\n    no_client_auth: In-cluster server; the boundary is its ingress NetworkPolicy.\n",
+        )
+        .expect_err("no_client_auth with an empty bearer_secret must be refused");
+        assert!(
+            err.to_string()
+                .contains("connectors.no_client_auth_with_bearer_secret"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn no_client_auth_on_a_remote_connector_is_refused() {
+        let err = parse_connectors(
+            "connectors:\n  r:\n    url: https://mcp.example.com/mcp\n    no_client_auth: In-cluster server; the boundary is its ingress NetworkPolicy.\n",
+        )
+        .expect_err("no_client_auth on a url connector must be refused");
+        assert!(
+            err.to_string()
+                .contains("connectors.remote_has_no_client_auth"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn no_client_auth_blank_reason_is_refused() {
+        let err = parse_connectors(
+            "connectors:\n  docs:\n    image: ghcr.io/example/docs-mcp:1\n    secrets: [UPSTREAM_CLIENT_ID, UPSTREAM_CLIENT_SECRET]\n    no_client_auth: '   '\n",
+        )
+        .expect_err("a blank no_client_auth reason must be refused");
+        assert!(
+            err.to_string().contains("connectors.bad_no_client_auth"),
+            "{err}"
+        );
+    }
+
     // @spec ADR-0168 d8
     #[test]
     fn restrict_to_keeps_only_the_allowlist() {
@@ -2451,5 +3076,164 @@ mod undeclared_runner_dockerfile_tests {
         let dir = bundle(None, false);
         let decl = load(dir.path()).unwrap();
         assert_eq!(undeclared_runner_dockerfile(dir.path(), &decl), None);
+    }
+}
+
+#[cfg(test)]
+mod narrow_platforms_tests {
+    use super::*;
+
+    fn strings(values: &[&str]) -> Vec<String> {
+        values.iter().map(|v| (*v).to_string()).collect()
+    }
+
+    // B1
+    #[test]
+    fn no_requested_platform_keeps_the_declared_set() {
+        let declared = strings(&["linux/arm64", "linux/amd64"]);
+        assert_eq!(narrow_platforms(&declared, &[]).unwrap(), declared);
+    }
+
+    #[test]
+    fn a_requested_subset_keeps_declared_order_without_duplicates() {
+        let declared = strings(&["linux/arm64", "linux/amd64", "linux/ppc64le"]);
+        let requested = strings(&["linux/ppc64le", "linux/arm64", "linux/arm64"]);
+        assert_eq!(
+            narrow_platforms(&declared, &requested).unwrap(),
+            strings(&["linux/arm64", "linux/ppc64le"])
+        );
+    }
+
+    #[test]
+    fn an_undeclared_platform_is_refused_by_name() {
+        let declared = strings(&["linux/amd64"]);
+        let error = narrow_platforms(&declared, &strings(&["linux/s390x"]))
+            .expect_err("an undeclared platform must be refused");
+        let text = format!("{error:#}");
+        assert!(text.contains("linux/s390x"), "{text}");
+        assert!(
+            text.contains("linux/amd64"),
+            "should name the declared set: {text}"
+        );
+    }
+
+    // B2
+    #[test]
+    fn a_narrowed_registry_build_builds_one_platform_and_keeps_the_digest() {
+        let bundle = tempfile::tempdir().unwrap();
+        let context = bundle.path().join("connectors").join("tempo");
+        std::fs::create_dir_all(&context).unwrap();
+        std::fs::write(context.join("Dockerfile"), "FROM python:3.13-slim\n").unwrap();
+        let meta = tempfile::tempdir().unwrap();
+        let declared = strings(&["linux/amd64", "linux/arm64"]);
+        let spec = ConnectorSpecDecl {
+            build: Some(ConnectorBuildDecl {
+                context: "connectors/tempo".to_string(),
+                dockerfile: "Dockerfile".to_string(),
+                platforms: declared.clone(),
+            }),
+            ..Default::default()
+        };
+        let plan = |platforms: &[String]| {
+            build_plan(
+                bundle.path(),
+                "factory",
+                "tempo",
+                &spec,
+                Some("localhost:5001"),
+                "linux/amd64",
+                meta.path(),
+                platforms,
+            )
+            .expect("build_plan")
+        };
+        let narrowed = narrow_platforms(&declared, &strings(&["linux/amd64"])).unwrap();
+        let single = plan(&narrowed);
+        let full = plan(&declared);
+
+        let argv = build_argv(&single).argv();
+        let at = argv
+            .iter()
+            .position(|t| t == "--platform")
+            .unwrap_or_else(|| panic!("no --platform in {argv:?}"));
+        assert_eq!(argv[at + 1], "linux/amd64", "{argv:?}");
+        assert_eq!(argv.iter().filter(|t| *t == "--platform").count(), 1);
+        assert!(!argv.iter().any(|t| t.contains("linux/arm64")), "{argv:?}");
+        assert_eq!(single.platforms, strings(&["linux/amd64"]));
+        assert_eq!(
+            single.source_digest, full.source_digest,
+            "narrowing must not change the declared source digest"
+        );
+        assert_eq!(single.image_ref, full.image_ref);
+    }
+}
+
+#[cfg(test)]
+mod dark_factory_runner_digest_tests {
+    use super::*;
+
+    /// Copy regular files and directories only; anything else (a symlink) is a
+    /// fixture surprise worth failing loudly on.
+    fn copy_tree(from: &Path, to: &Path) {
+        std::fs::create_dir_all(to).unwrap();
+        for entry in std::fs::read_dir(from).unwrap() {
+            let entry = entry.unwrap();
+            let kind = entry.file_type().unwrap();
+            let target = to.join(entry.file_name());
+            if kind.is_dir() {
+                copy_tree(&entry.path(), &target);
+            } else if kind.is_file() {
+                std::fs::copy(entry.path(), &target).unwrap();
+            } else {
+                panic!("unexpected non-regular entry {}", entry.path().display());
+            }
+        }
+    }
+
+    fn append(path: &Path, text: &str) {
+        let mut body = std::fs::read_to_string(path).unwrap();
+        body.push_str(text);
+        std::fs::write(path, body).unwrap();
+    }
+
+    // #4109: the runner layer reads nothing from its context, so an agent edit
+    // must not invalidate the lock, while a Dockerfile edit still must.
+    #[test]
+    fn editing_an_agent_file_keeps_the_runner_digest_and_editing_the_dockerfile_moves_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let bundle = dir.path().join("dark-factory");
+        copy_tree(
+            &Path::new(env!("CARGO_MANIFEST_DIR")).join("../examples/dark-factory"),
+            &bundle,
+        );
+        let runner = load(&bundle)
+            .unwrap()
+            .runner
+            .expect("the dark factory bundle declares a runner layer");
+        let digest = || {
+            let (context, _) = check_runner_source(&bundle, &runner).unwrap();
+            source_digest_of(&context, &runner.build).unwrap()
+        };
+
+        let original = digest();
+        append(
+            &bundle.join("agents/diff-reviewer.md"),
+            "\nmodel note: edited\n",
+        );
+        assert_eq!(
+            original,
+            digest(),
+            "editing an agent file must not move the runner source digest"
+        );
+
+        append(
+            &bundle.join("runner.Dockerfile"),
+            "LABEL org.opencontainers.image.description=\"edited\"\n",
+        );
+        assert_ne!(
+            original,
+            digest(),
+            "editing runner.Dockerfile must move the runner source digest"
+        );
     }
 }

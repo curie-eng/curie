@@ -5,8 +5,7 @@
 //! overridable. This file talks to the clap binary only so the selected pin
 //! still compiles against the parent `RollbackOpts` (no new struct field).
 
-#[path = "support/executable.rs"]
-mod test_executable;
+use crate::support::executable as test_executable;
 
 use std::fs;
 use std::path::Path;
@@ -37,6 +36,7 @@ fn write_fake_helm(dir: &Path, history_json: &str) {
              echo \"$*\" >> '{log}'\n\
              case \"$1\" in\n\
              history) cat '{history}' ;;\n\
+             get) [ \"$2\" = values ] || exit 1; echo '{{\"agentSandbox\":{{\"deploy\":false}}}}' ;;\n\
              rollback) echo rollback-ran >> '{log}'; echo 'Rollback was a success.' ;;\n\
              *) echo \"unexpected helm verb: $1\" >&2; exit 1 ;;\n\
              esac\n",

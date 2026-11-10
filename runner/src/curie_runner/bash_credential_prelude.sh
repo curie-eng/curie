@@ -11,11 +11,12 @@ if [ -n "${CURIE_MODEL_ENV_KEY-}" ]; then
       ;;
   esac
 fi
-while IFS= read -r -d '' entry; do
-  name=${entry%%=*}
+while IFS= read -r name; do
   case $name in
+    CURIE_CONNECTOR_UPLOAD_TOKENS_FILE)
+      ;;
     CURIE_*TOKEN*)
       unset -- "$name"
       ;;
   esac
-done < /proc/self/environ
+done < <(compgen -e)

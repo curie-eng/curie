@@ -10,8 +10,7 @@
 //! pure comparator over a drifted fixture to prove it rejects each class by
 //! execution, mirroring `cli/tests/api_field_parity.rs`.
 
-#[path = "support/schema_inventory.rs"]
-mod schema_inventory;
+use crate::support::schema_inventory;
 
 use std::collections::BTreeMap;
 
@@ -136,9 +135,12 @@ fn approval_route_split_is_a_v2_schema_contract() {
     )
     .expect("approvals schema is JSON");
     assert_eq!(
-        schema["$id"], "https://schemas.curietech.ai/cli/approvals/v2.3.json",
+        schema["$id"], "https://schemas.curietech.ai/cli/approvals/v2.6.json",
         "removing the fused channel field and requiring resolution is a major schema break; \
-         v2.3 adds the read-time route approver view to pending results (#2940)"
+         v2.3 adds the read-time route approver view to pending results (#2940); v2.4 adds \
+         the remediation_principal mint result (#4228); v2.5 adds the connector requester \
+         identity readback (ADR 0270); v2.6 adds the route approver_ticket and separation \
+         readback (ADR 0271)"
     );
 
     let binding = &schema["$defs"]["approvalRouteBinding"];
@@ -165,7 +167,7 @@ fn approval_route_split_is_a_v2_schema_contract() {
         .iter()
         .find(|entry| entry["result"] == "ApprovalsOutput")
         .expect("ApprovalsOutput inventory entry");
-    assert_eq!(approvals["version"], "2.3");
+    assert_eq!(approvals["version"], "2.6");
 }
 
 #[test]
@@ -510,4 +512,62 @@ fn a_schema_may_not_change_shape_while_keeping_its_id() {
          `curie dev schema-baseline`.\n\n{}\n\n({compared} compared, {versioned} already versioned)",
         problems.join("\n")
     );
+}
+
+#[test]
+fn schedules_history_split_is_v3_and_hook_fire_is_v1_3() {
+    let schedules: Value = serde_json::from_str(
+        &std::fs::read_to_string(repo_path("cli/schema/schedules.schema.json"))
+            .expect("read schedules schema"),
+    )
+    .expect("schedules schema is JSON");
+    assert_eq!(
+        schedules["$id"],
+        "https://schemas.curietech.ai/cli/schedules/v3.json"
+    );
+    let hook = &schedules["$defs"]["hook"];
+    let required = hook["required"].as_array().expect("hook required fields");
+    for field in [
+        "last_manual_fire_at",
+        "last_manual_outcome",
+        "last_manual_reason",
+    ] {
+        assert!(hook["properties"].get(field).is_some(), "missing {field}");
+        assert!(
+            required.contains(&Value::String(field.to_string())),
+            "{field} must be required"
+        );
+    }
+
+    let fire: Value = serde_json::from_str(
+        &std::fs::read_to_string(repo_path("cli/schema/hook-fire.schema.json"))
+            .expect("read hook-fire schema"),
+    )
+    .expect("hook-fire schema is JSON");
+    assert_eq!(
+        fire["$id"],
+        "https://schemas.curietech.ai/cli/hook-fire/v1.3.json"
+    );
+    assert!(fire["$defs"]["record"]["properties"]
+        .get("source")
+        .is_some());
+    // The producer always emits source. It remains optional in the minor-version
+    // schema so adding the field does not narrow existing v1 record validity.
+    let required = fire["$defs"]["record"]["required"].as_array().unwrap();
+    assert!(!required.contains(&Value::String("source".to_string())));
+
+    let index = index_json();
+    let results = index["results"]
+        .as_array()
+        .expect("schema result inventory");
+    for (schema, version) in [
+        ("schedules.schema.json", "3.0"),
+        ("hook-fire.schema.json", "1.3"),
+    ] {
+        let entry = results
+            .iter()
+            .find(|entry| entry["schema"] == schema)
+            .unwrap_or_else(|| panic!("missing inventory entry for {schema}"));
+        assert_eq!(entry["version"], version, "{schema} inventory version");
+    }
 }

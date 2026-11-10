@@ -28,6 +28,12 @@ reads as an escape hatch that silently does nothing (#488).
 
 from collections.abc import Iterable
 
+from .tool_names import (
+    CANVAS_READ_ONLY_TOOL_NAMES,
+    CHANNEL_READ_TOOL_NAMES,
+    STATE_READ_TOOL_NAMES,
+)
+
 # The platform's in-process approval-request tool (ADR-0010) is idempotent under
 # EVERY harness: it executes no real-world action (it only marks the turn
 # awaiting-approval), and when applicable it is injected by the platform rather
@@ -39,13 +45,28 @@ from collections.abc import Iterable
 # reports a phase to the status card and acts on nothing (#3464). So is the
 # deliberate ``progress`` tool (ADR 0130): it reports task state to the
 # platform and acts on nothing, so it is never a side effect and never on the
-# turn's receipt.
-PLATFORM_IDEMPOTENT_TOOLS: frozenset[str] = frozenset(
-    {
-        "mcp__curie__request_approval",
-        "mcp__curie__report_progress",
-        "mcp__curie__progress",
-    }
+# turn's receipt. The factory ``get_issue`` (ADR 0187) only reads its own issue.
+# The channel read tools (ADR 0100) only read the agent's own bound channels
+# through the platform, so a retry after one repeats no real-world action. The
+# canvas list and read tools (ADR 0200) only read too; ``edit_canvas_cell``
+# writes to the provider and is deliberately absent, so it stays a side effect.
+# The ``curie-state`` ``get`` and ``list`` tools only read the durable store; its
+# ``set``, ``append`` and ``delete`` change it and stay side effects.
+PLATFORM_IDEMPOTENT_TOOLS: frozenset[str] = (
+    frozenset(
+        {
+            "mcp__curie__request_approval",
+            "mcp__curie__report_progress",
+            "mcp__curie__progress",
+            "mcp__curie__get_issue",
+            # Catalog listing reads metadata only. Fetch is deliberately absent:
+            # it binds catalog integrity and publishes a local cache file.
+            "mcp__curie__list_attachments",
+        }
+    )
+    | CHANNEL_READ_TOOL_NAMES
+    | CANVAS_READ_ONLY_TOOL_NAMES
+    | STATE_READ_TOOL_NAMES
 )
 
 # The Claude Code harness adapter's declared read-only tool set. Names match the

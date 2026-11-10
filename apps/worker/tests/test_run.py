@@ -8,9 +8,13 @@ CURIE_FAKE_MODEL must fail loudly instead of silently degrading to a fake.
 from __future__ import annotations
 
 import asyncio
+import importlib.util
 import json
 import logging
+import signal
 import socket
+import subprocess
+import time
 from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
@@ -29,6 +33,8 @@ from curie_worker.run import (
 )
 from curie_worker.sandbox import DockerSandboxClient, SubstrateConfig
 
+from .sandbox.conftest import _FakeBundleStore, _flag_values, _RecordingDocker
+
 _SUB = SubstrateConfig(namespace="default", warm_pool="pool")
 
 # A non-secret placeholder credential. The docker fail-closed gate only checks
@@ -40,6 +46,76 @@ _FAKE_SDK_CRED = "oauth-PLACEHOLDER"
 
 def test_substrate_config_claim_timeout_defaults_to_90s() -> None:
     assert _substrate_config({}).claim_timeout_seconds == 90.0
+
+
+def _admission_contract() -> dict[str, Any]:
+    return {
+        "quota_name": "acme-sandbox-quota",
+        "priority_class": "acme-sandbox",
+        "ceiling": 2,
+        "hard": {
+            "pods": "2",
+            "requests.cpu": "500m",
+            "requests.memory": "512Mi",
+            "limits.cpu": "2",
+            "limits.memory": "2Gi",
+        },
+    }
+
+
+@pytest.mark.parametrize("ceiling", [0, 2])
+def test_substrate_config_reads_complete_admission_contract(ceiling: int) -> None:
+    contract = {**_admission_contract(), "ceiling": ceiling}
+    config = _substrate_config({"CURIE_SANDBOX_ADMISSION": json.dumps(contract)})
+    assert config.admission is not None
+    assert config.admission.quota_name == "acme-sandbox-quota"
+    assert config.admission.priority_class == "acme-sandbox"
+    assert config.admission.ceiling == ceiling
+    assert dict(config.admission.hard) == contract["hard"]
+
+
+@pytest.mark.parametrize("raw", ["", "{", "null", "[]", '"contract"', "{}"])
+def test_substrate_config_refuses_malformed_admission_json_or_shape(raw: str) -> None:
+    with pytest.raises(ValueError):
+        _substrate_config({"CURIE_SANDBOX_ADMISSION": raw})
+
+
+@pytest.mark.parametrize(
+    "changes",
+    [
+        {"quota_name": "bad/name"},
+        {"priority_class": ""},
+        {"ceiling": -1},
+        {"ceiling": True},
+        {"ceiling": 2.0},
+        {"ceiling": "2"},
+        {"unexpected": "field"},
+        {"hard": {"pods": "2"}},
+        {"hard": {**_admission_contract()["hard"], "pods": "-1"}},
+        {"hard": {**_admission_contract()["hard"], "limits.cpu": "NaN"}},
+        {"hard": {**_admission_contract()["hard"], "limits.memory": 2}},
+        {"hard": {**_admission_contract()["hard"], "unsupported": "1"}},
+    ],
+)
+def test_substrate_config_refuses_invalid_admission_schema(changes: dict[str, Any]) -> None:
+    contract = {**_admission_contract(), **changes}
+    with pytest.raises(ValueError):
+        _substrate_config({"CURIE_SANDBOX_ADMISSION": json.dumps(contract)})
+
+
+def test_substrate_config_refuses_kubernetes_admission_for_docker() -> None:
+    with pytest.raises(ValueError):
+        _substrate_config(
+            {
+                "CURIE_SANDBOX_SUBSTRATE": "docker",
+                "CURIE_SANDBOX_ADMISSION": json.dumps(_admission_contract()),
+            }
+        )
+
+
+@pytest.mark.parametrize("backend", ["kubernetes", "docker"])
+def test_substrate_config_without_admission_contract_remains_disabled(backend: str) -> None:
+    assert _substrate_config({"CURIE_SANDBOX_SUBSTRATE": backend}).admission is None
 
 
 def test_substrate_config_claim_timeout_reads_env() -> None:
@@ -373,20 +449,8 @@ def test_docker_with_otlp_endpoint_does_not_warn(caplog) -> None:
 def test_docker_runner_uses_its_network_specific_otlp_endpoint(
     monkeypatch, runner_endpoint: str | None, expected_endpoint: str | None
 ) -> None:
-    calls: list[list[str]] = []
-
-    def capture_docker(
-        _self: DockerSandboxClient,
-        args: list[str],
-        *,
-        request_timeout_seconds: float,
-    ) -> str:
-        assert request_timeout_seconds > 0
-        calls.append(args)
-        return ""
-
+    docker = _RecordingDocker(image="curie-runner", bundle_store=_FakeBundleStore())
     monkeypatch.setattr(DockerSandboxClient, "ensure_image", lambda self: None)
-    monkeypatch.setattr(DockerSandboxClient, "_docker", capture_docker)
     env = {
         "CURIE_SANDBOX_SUBSTRATE": "docker",
         "OTEL_EXPORTER_OTLP_ENDPOINT": "http://collector.example.com:4318",
@@ -399,13 +463,117 @@ def test_docker_runner_uses_its_network_specific_otlp_endpoint(
         _SUB,
     )
     assert isinstance(client, DockerSandboxClient)
-    client.create_claim("acme-sandbox", pool="pool", env={"CURIE_FAKE_MODEL": "1"})
-    assert len(calls) == 1
-    assert not any(arg.startswith("CURIE_RUNNER_OTEL_EXPORTER_OTLP_ENDPOINT=") for arg in calls[0])
-    endpoint_args = [arg for arg in calls[0] if arg.startswith("OTEL_EXPORTER_OTLP_ENDPOINT=")]
+    monkeypatch.setattr(client, "_docker", docker._docker)
+    client.create_claim(
+        "acme-sandbox", pool="pool", env={"CURIE_FAKE_MODEL": "1"}, deadline=time.monotonic() + 300
+    )
+    assert all(timeout > 0 for timeout in docker.timeouts)
+    (runner_args,) = [
+        args
+        for args in docker.calls
+        if args[0] == "create"
+        and "curietech.ai/component=claim-runner" in _flag_values(args, "--label")
+    ]
+    assert not any(
+        arg.startswith("CURIE_RUNNER_OTEL_EXPORTER_OTLP_ENDPOINT=") for arg in runner_args
+    )
+    endpoint_args = [arg for arg in runner_args if arg.startswith("OTEL_EXPORTER_OTLP_ENDPOINT=")]
     assert endpoint_args == (
         [f"OTEL_EXPORTER_OTLP_ENDPOINT={expected_endpoint}"] if expected_endpoint else []
     )
+
+
+@pytest.mark.parametrize(
+    ("origin", "repo_name"),
+    [
+        ("https://github.example.com", "acme-corp/acme-bot"),
+        ("https://github.example.com/forge", "acme-corp/acme-bot"),
+        ("https://gitlab.example.com", "group/sub/project"),
+    ],
+)
+def test_docker_runner_snapshot_checks_the_claims_code_host_origin(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, origin: str, repo_name: str
+) -> None:
+    """ADR 0197: the docker runner takes the origin and path from the boot env.
+
+    The worker reads no GitHub URL. The workspace claim carries the origin and
+    path from the API's credential, the docker substrate forwards them as boot
+    env, and the runner's snapshot accepts exactly that path under that origin.
+    """
+
+    from curie_runner.workspace_snapshot import capture_workspace_snapshot
+
+    docker = _RecordingDocker(image="curie-runner", bundle_store=_FakeBundleStore())
+    monkeypatch.setattr(DockerSandboxClient, "ensure_image", lambda self: None)
+    client = _sandbox_client(
+        WorkerConfig(fake_model=True),
+        {"CURIE_SANDBOX_SUBSTRATE": "docker"},
+        _SUB,
+    )
+    assert isinstance(client, DockerSandboxClient)
+    monkeypatch.setattr(client, "_docker", docker._docker)
+    client.create_claim(
+        "acme-sandbox",
+        pool="pool",
+        env={
+            "CURIE_FAKE_MODEL": "1",
+            "CURIE_REPO_ORIGIN": origin,
+            "CURIE_REPO_PATH": repo_name,
+        },
+        deadline=time.monotonic() + 300,
+    )
+    assert all(timeout > 0 for timeout in docker.timeouts)
+    (runner_args,) = [
+        args
+        for args in docker.calls
+        if args[0] == "create"
+        and "curietech.ai/component=claim-runner" in _flag_values(args, "--label")
+    ]
+    assert not any(arg.startswith("CURIE_GITHUB_API_URL=") for arg in runner_args)
+    forwarded = dict(
+        arg.partition("=")[::2] for arg in runner_args if arg.startswith("CURIE_REPO_")
+    )
+    assert forwarded == {"CURIE_REPO_ORIGIN": origin, "CURIE_REPO_PATH": repo_name}
+    for args in (
+        ("init", "--quiet"),
+        ("remote", "add", "origin", f"{origin}/{repo_name}.git"),
+    ):
+        subprocess.run(["git", *args], cwd=tmp_path, check=True, capture_output=True)
+    (tmp_path / "README.md").write_text("base\n")
+    subprocess.run(["git", "add", "."], cwd=tmp_path, check=True, capture_output=True)
+    subprocess.run(
+        [
+            "git",
+            "-c",
+            "user.name=Curie Test",
+            "-c",
+            "user.email=curie@example.com",
+            "commit",
+            "--quiet",
+            "-m",
+            "Initial fixture",
+        ],
+        cwd=tmp_path,
+        check=True,
+        capture_output=True,
+    )
+    prepared = subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=tmp_path, check=True, capture_output=True, text=True
+    ).stdout.strip()
+    (tmp_path / "README.md").write_text("Code host change\n")
+
+    captured = capture_workspace_snapshot(
+        tmp_path,
+        base_sha=prepared,
+        expected_repo=repo_name,
+        trusted_origin=forwarded["CURIE_REPO_ORIGIN"],
+        repository_path=forwarded["CURIE_REPO_PATH"],
+    )
+
+    assert captured.repo_full_name == repo_name
+    assert captured.base_sha == prepared
+    assert captured.changed_paths == ("README.md",)
+    assert b"Code host change" in captured.patch
 
 
 def test_sandbox_client_docker_prepulls_image(monkeypatch) -> None:
@@ -881,6 +1049,21 @@ def test_supervise_policy_reads_worker_config() -> None:
     }
 
 
+def _legacy_boot_schema_support() -> Any:
+    """Baseline fixture prerequisite only, @spec PROTECTED-HOOK-SOURCE-2/10."""
+    path = Path(__file__).with_name("test_source_worker_startup.py")
+    spec = importlib.util.spec_from_file_location("_legacy_worker_startup_setup", path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+_legacy_schema = _legacy_boot_schema_support()
+worker_db = _legacy_schema.worker_db
+worker_templates = _legacy_schema.worker_templates
+
+
 # -- #1751: the boot rekey is CALLED by _run, once, before any consumer reads --
 #
 # Every other test of the legacy approval-card migration drives
@@ -910,6 +1093,9 @@ class _FakeCardStore:
         self._events = events
         self._raises = raises
         self._stall_s = stall_s
+
+    async def run_retention(self, reader: Any, shutdown: asyncio.Event) -> None:
+        self._events.append("approval-reference-retention")
 
     async def migrate_legacy_thread_keyed_refs(self) -> None:
         # Recorded before the stall so the ordering assertion still holds on the
@@ -976,9 +1162,11 @@ class _FakeRuntime:
 
     def __init__(self, card_store: _FakeCardStore, events: list[str]) -> None:
         self.card_store = card_store
+        self.approval_reference_reader = object()
         self.consumer = _FakeSupervisedTask(events, "runs")
         self.killswitch = _FakeSupervisedTask(events, "killswitch")
         self.eval_consumer = _FakeSupervisedTask(events, "evals")
+        self.deploy_notice_consumer = _FakeSupervisedTask(events, "deploy-notices")
         self.connector_loop = None
         self.cron_loop = _FakeCronLoop(events)
         self.runner = _FakeTransport()
@@ -989,15 +1177,30 @@ class _FakeRuntime:
         self.eval_redis = _FakeTransport()
         self.engine = _FakeTransport()
         self.orphan_sweeper = None
+        self.attachment_broker = None
+
+
+def _register_legacy_fake_transports(runtime: _FakeRuntime, resources: Any) -> None:
+    """Existing baseline fakes only, @spec PROTECTED-HOOK-SOURCE-2."""
+    resources.register_close("legacy-runner", runtime.runner.close, order=20)
+    resources.register_close("legacy-sink", runtime.sink.close, order=30)
+    resources.register_close("legacy-http", runtime.eval_http.aclose, order=40)
+    resources.register_close("legacy-runs-redis", runtime.async_redis.aclose, order=50)
+    resources.register_close("legacy-pressure-redis", runtime.pressure_async_redis.aclose, order=51)
+    resources.register_close("legacy-eval-redis", runtime.eval_redis.aclose, order=52)
+    resources.register_close("legacy-engine", runtime.engine.dispose, order=70)
 
 
 def _boot(
     monkeypatch: pytest.MonkeyPatch,
     *,
+    database_url: str,
     raises: BaseException | None = None,
     stall_s: float = 0.0,
 ) -> list[str]:
-    """Drive one full ``_run`` boot against the fakes and return the event log.
+    """@spec PROTECTED-HOOK-SOURCE-2/10.
+
+    Drive one full ``_run`` boot against the fakes and return the event log.
 
     The card store is built here rather than passed in, so it records into the
     very list the fake consumers append to: one shared log is what makes the
@@ -1012,8 +1215,11 @@ def _boot(
     events: list[str] = []
     card_store = _FakeCardStore(events, raises=raises, stall_s=stall_s)
 
-    def fake_build(config: WorkerConfig, env: Any) -> _FakeRuntime:
-        return _FakeRuntime(card_store, events)
+    def fake_build(config: WorkerConfig, env: Any, *, resources: Any) -> _FakeRuntime:
+        """Baseline compatibility only, @spec PROTECTED-HOOK-SOURCE-2."""
+        runtime = _FakeRuntime(card_store, events)
+        _register_legacy_fake_transports(runtime, resources)
+        return runtime
 
     async def fake_heartbeat(*_args: Any, **_kwargs: Any) -> None:
         return None
@@ -1022,13 +1228,15 @@ def _boot(
     monkeypatch.setattr(run, "run_heartbeat", fake_heartbeat)
     # The outer wait_for is a deadlock guard, not the behaviour under test: a
     # regression that leaves _run blocked must fail this suite, not hang CI.
-    asyncio.run(asyncio.wait_for(run._run(WorkerConfig(), {}), timeout=10))
+    asyncio.run(asyncio.wait_for(run._run(WorkerConfig(database_url=database_url), {}), timeout=10))
     return events
 
 
 def test_run_supervises_the_cron_loop_until_shutdown(
     monkeypatch: pytest.MonkeyPatch,
+    worker_db: Any,
 ) -> None:
+    """@spec PROTECTED-HOOK-SOURCE-2/10."""
     # The cron loop is always on (#268): _run must start it under the same
     # supervisor as its siblings and hand it the shared shutdown flag, so a
     # SIGTERM that stops the consumers also stops the scheduler.
@@ -1044,12 +1252,68 @@ def test_run_supervises_the_cron_loop_until_shutdown(
             await asyncio.sleep(0)
         shutdown.set()
 
-    monkeypatch.setattr(run, "build", lambda config, env: runtime)
+    def fake_build(config: WorkerConfig, env: Any, *, resources: Any) -> _FakeRuntime:
+        """Baseline compatibility only, @spec PROTECTED-HOOK-SOURCE-2."""
+        _register_legacy_fake_transports(runtime, resources)
+        return runtime
+
+    monkeypatch.setattr(run, "build", fake_build)
     monkeypatch.setattr(run, "run_heartbeat", stopping_heartbeat)
-    asyncio.run(asyncio.wait_for(run._run(WorkerConfig(), {}), timeout=10))
+    asyncio.run(asyncio.wait_for(run._run(WorkerConfig(database_url=worker_db[2]), {}), timeout=10))
 
     assert events.count("cron") == 1
     assert "cron-stopped" in events
+
+
+def test_sigterm_stops_the_deploy_notice_consumer(
+    monkeypatch: pytest.MonkeyPatch,
+    worker_db: Any,
+) -> None:
+    events: list[str] = []
+    runtime = _FakeRuntime(_FakeCardStore(events), events)
+
+    class StopGatedNotice:
+        def __init__(self) -> None:
+            self.started = asyncio.Event()
+            self.stopped = asyncio.Event()
+
+        async def run(self) -> None:
+            self.started.set()
+            await self.stopped.wait()
+
+        def request_stop(self) -> None:
+            self.stopped.set()
+
+    notice = StopGatedNotice()
+    runtime.deploy_notice_consumer = notice  # type: ignore[assignment]
+
+    async def stopping_heartbeat(_file: Any, _interval: Any, shutdown: asyncio.Event) -> None:
+        await notice.started.wait()
+        handlers[signal.SIGTERM]()
+        await shutdown.wait()
+
+    handlers: dict[signal.Signals, Any] = {}
+
+    async def exercise() -> None:
+        loop = asyncio.get_running_loop()
+        monkeypatch.setattr(
+            loop,
+            "add_signal_handler",
+            lambda sig, handler: handlers.__setitem__(sig, handler),
+        )
+        await asyncio.wait_for(
+            run._run(WorkerConfig(database_url=worker_db[2]), {}), timeout=1
+        )
+
+    def fake_build(config: WorkerConfig, env: Any, *, resources: Any) -> _FakeRuntime:
+        _register_legacy_fake_transports(runtime, resources)
+        return runtime
+
+    monkeypatch.setattr(run, "build", fake_build)
+    monkeypatch.setattr(run, "run_heartbeat", stopping_heartbeat)
+    asyncio.run(exercise())
+    assert notice.started.is_set()
+    assert notice.stopped.is_set()
 
 
 def test_cron_tick_interval_reads_its_env_knob(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1061,21 +1325,26 @@ def test_cron_tick_interval_reads_its_env_knob(monkeypatch: pytest.MonkeyPatch) 
 
 def test_run_migrates_legacy_card_refs_once_at_boot(
     monkeypatch: pytest.MonkeyPatch,
+    worker_db: Any,
 ) -> None:
-    events = _boot(monkeypatch)
+    """@spec PROTECTED-HOOK-SOURCE-2/10."""
+    events = _boot(monkeypatch, database_url=worker_db[2])
     # Exactly once: it is a boot migration, not something supervised or retried,
     # and a second pass would re-walk the keyspace on every restart for nothing.
     assert events.count("migrate") == 1
+    assert events.count("approval-reference-retention") == 1
 
 
 def test_run_migrates_legacy_card_refs_before_the_consumers_start(
     monkeypatch: pytest.MonkeyPatch,
+    worker_db: Any,
 ) -> None:
+    """@spec PROTECTED-HOOK-SOURCE-2/10."""
     # The ordering the whole fix rests on. A ref still under the pre-#1723 thread
     # key must be rekeyed onto its approval id BEFORE the runs consumer can read
     # a resume turn for it -- otherwise the card the turn settles is the one the
     # migration has not reached yet, which is the stranding #1751 exists to end.
-    events = _boot(monkeypatch)
+    events = _boot(monkeypatch, database_url=worker_db[2])
     assert events[0] == "migrate"
     assert "runs" in events
 
@@ -1083,11 +1352,13 @@ def test_run_migrates_legacy_card_refs_before_the_consumers_start(
 def test_run_boots_the_consumers_when_the_migration_fails(
     monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
+    worker_db: Any,
 ) -> None:
+    """@spec PROTECTED-HOOK-SOURCE-2/10."""
     # A Valkey blip during a best-effort boot migration must degrade to "those
     # cards stay live until their TTL", never to a worker that will not start.
     with caplog.at_level(logging.WARNING, logger="curie_worker.run"):
-        events = _boot(monkeypatch, raises=RuntimeError("valkey down"))
+        events = _boot(monkeypatch, database_url=worker_db[2], raises=RuntimeError("valkey down"))
 
     assert events.count("migrate") == 1
     assert "runs" in events  # boot continued past the failure
@@ -1103,7 +1374,9 @@ def test_run_boots_the_consumers_when_the_migration_fails(
 def test_run_boots_the_consumers_when_the_migration_exceeds_its_budget(
     monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
+    worker_db: Any,
 ) -> None:
+    """@spec PROTECTED-HOOK-SOURCE-2/10."""
     # The bound exists because this pass runs BEFORE the liveness heartbeat
     # starts: unbounded, a degraded Valkey stalls readiness until the exec probe
     # kills the pod, and a best-effort migration becomes a restart loop. The
@@ -1112,7 +1385,7 @@ def test_run_boots_the_consumers_when_the_migration_exceeds_its_budget(
     monkeypatch.setattr(run, "_CARD_MIGRATION_BUDGET_S", 0.01)
     with caplog.at_level(logging.WARNING, logger="curie_worker.run"):
         # Far past the patched budget; wait_for cancels it, so nothing waits 30s.
-        events = _boot(monkeypatch, stall_s=30.0)
+        events = _boot(monkeypatch, database_url=worker_db[2], stall_s=30.0)
 
     assert events.count("migrate") == 1
     assert "runs" in events  # boot continued past the cut-short migration
@@ -1232,8 +1505,150 @@ def test_build_wires_dedicated_single_attempt_pressure_clients(
     asyncio.run(exercise())
 
 
-# --- VALKEY_TLS env -> WorkerConfig.valkey_tls (the seam the chart actually
-# drives; a field that only works via kwargs is not wired) ------------------
+def test_build_wires_the_sweep_coverage_into_the_kernel(
+    monkeypatch: pytest.MonkeyPatch,
+    sync_redis: redis.Redis,
+) -> None:
+    """ADR-0160 (#2878): the kernel reads sweep coverage through the SAME trigger
+    source the cron scheduler fires from, so the sweep date is computed in the
+    zone the slot was scheduled in. Driving a budget cut through ``build()``
+    itself needs a live runner image and API; the production factory ``build()``
+    calls is exercised end to end in ``kernel/test_sweep_continuation.py``."""
+    from curie_worker.sweep import SweepCoverage
+
+    endpoint = sync_redis.connection_pool.connection_kwargs
+    config = WorkerConfig(
+        fake_model=True,
+        valkey_host=str(endpoint["host"]),
+        valkey_port=int(endpoint["port"]),
+        valkey_password=str(endpoint.get("password") or ""),
+        valkey_db=int(endpoint.get("db", 0)),
+        s3_access_key="PLACEHOLDER",
+        s3_secret_key="PLACEHOLDER",
+    )
+    monkeypatch.setattr(DockerSandboxClient, "ensure_image", lambda self: None)
+
+    async def exercise() -> None:
+        runtime = run.build(config, {"CURIE_SANDBOX_SUBSTRATE": "docker"})
+        affinity_redis = runtime.consumer._kernel._substrate._affinity._redis
+        try:
+            sweep = runtime.consumer._kernel._sweep
+            assert isinstance(sweep, SweepCoverage)
+            assert runtime.cron_loop is not None
+            assert sweep._trigger_source is runtime.cron_loop._source
+        finally:
+            affinity_redis.close()
+            await runtime.runner.close()
+            await runtime.sink.aclose()
+            await runtime.eval_http.aclose()
+            await runtime.async_redis.aclose()
+            await runtime.pressure_async_redis.aclose()
+            await runtime.eval_redis.aclose()
+            await runtime.engine.dispose()
+
+    asyncio.run(exercise())
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+def test_build_wires_the_recovery_collector_only_when_enabled(
+    monkeypatch: pytest.MonkeyPatch,
+    sync_redis: redis.Redis,
+    enabled: bool,
+) -> None:
+    """ADR 0251: the recovery collector is opt in and never replaces the claim coordinator."""
+    from curie_worker.workspace import WorkspaceClaimCoordinator
+    from curie_worker.workspace_recovery_storage import RecoveryCollector, RecoveryObjectStore
+
+    assert "workspace-recovery-gc" in run._SUPERVISED_OPERATIONS
+    endpoint = sync_redis.connection_pool.connection_kwargs
+    config = WorkerConfig(
+        fake_model=True,
+        valkey_host=str(endpoint["host"]),
+        valkey_port=int(endpoint["port"]),
+        valkey_password=str(endpoint.get("password") or ""),
+        valkey_db=int(endpoint.get("db", 0)),
+        s3_access_key="PLACEHOLDER",
+        s3_secret_key="PLACEHOLDER",
+        workspace_enabled=True,
+        workspace_recovery_enabled=enabled,
+    )
+    monkeypatch.setattr(DockerSandboxClient, "ensure_image", lambda self: None)
+
+    async def exercise() -> None:
+        runtime = run.build(config, {"CURIE_SANDBOX_SUBSTRATE": "docker"})
+        affinity_redis = runtime.consumer._kernel._substrate._affinity._redis
+        collector = runtime.workspace_recovery_gc
+        try:
+            # Recovery on or off, ordinary managed workspaces are still built.
+            assert isinstance(runtime.consumer._kernel._workspace, WorkspaceClaimCoordinator)
+            if not enabled:
+                assert collector is None
+                return
+            assert isinstance(collector, RecoveryCollector)
+            store = collector._store
+            assert isinstance(store, RecoveryObjectStore)
+            assert store._bucket == config.workspace_bucket
+            assert store._key("workspace-recovery/x") == "private/workspace-recovery/x"
+            with pytest.raises(ValueError):
+                store._key("workspaces/x")
+            assert collector._collector_id == config.consumer_name
+        finally:
+            if collector is not None:
+                collector._store._client.close()
+            affinity_redis.close()
+            await runtime.runner.close()
+            await runtime.sink.aclose()
+            await runtime.eval_http.aclose()
+            await runtime.async_redis.aclose()
+            await runtime.pressure_async_redis.aclose()
+            await runtime.eval_redis.aclose()
+            await runtime.engine.dispose()
+
+    asyncio.run(exercise())
+
+
+@pytest.mark.parametrize(("raw", "expected"), [(None, 16), ("4", 4)])
+def test_max_concurrency_environment_sizes_the_production_runs_consumer(
+    monkeypatch: pytest.MonkeyPatch,
+    sync_redis: redis.Redis,
+    raw: str | None,
+    expected: int,
+) -> None:
+    if raw is None:
+        monkeypatch.delenv("CURIE_WORKER_MAX_CONCURRENCY", raising=False)
+    else:
+        monkeypatch.setenv("CURIE_WORKER_MAX_CONCURRENCY", raw)
+    endpoint = sync_redis.connection_pool.connection_kwargs
+    config = WorkerConfig(
+        fake_model=True,
+        valkey_host=str(endpoint["host"]),
+        valkey_port=int(endpoint["port"]),
+        valkey_password=str(endpoint.get("password") or ""),
+        valkey_db=int(endpoint.get("db", 0)),
+        s3_access_key="PLACEHOLDER",
+        s3_secret_key="PLACEHOLDER",
+    )
+    monkeypatch.setattr(DockerSandboxClient, "ensure_image", lambda self: None)
+
+    async def exercise() -> None:
+        runtime = run.build(config, {"CURIE_SANDBOX_SUBSTRATE": "docker"})
+        try:
+            assert runtime.consumer._max_concurrency == expected
+            assert runtime.consumer._transfer_capacity() == expected
+        finally:
+            runtime.consumer._kernel._substrate._affinity._redis.close()
+            await runtime.runner.close()
+            await runtime.sink.aclose()
+            await runtime.eval_http.aclose()
+            await runtime.async_redis.aclose()
+            await runtime.pressure_async_redis.aclose()
+            await runtime.eval_redis.aclose()
+            await runtime.engine.dispose()
+
+    asyncio.run(exercise())
+
+
+# VALKEY_TLS environment reaches WorkerConfig through the chart's configuration.
 
 
 def test_valkey_tls_env_reaches_the_worker_config(
@@ -1263,6 +1678,53 @@ def test_substrate_config_reads_connector_secret_pools() -> None:
     assert _substrate_config({}).connector_secret_pools == frozenset()
     config = _substrate_config({"CURIE_AGENT_CONNECTOR_SECRET_POOLS": "acme-a, acme-b,"})
     assert config.connector_secret_pools == frozenset({"acme-a", "acme-b"})
+
+
+_RUNNER_DIGEST = "sha256:" + "d" * 64
+_REPO_POOL_ENTRY = {
+    "pool": "acme-api-runner",
+    "digests": ["sha256:" + c * 64 for c in "abc"],
+    "base": _RUNNER_DIGEST,
+    "docker": False,
+}
+
+
+def test_substrate_config_reads_repo_runner_pools() -> None:
+    from curie_worker.repo_runner_pools import RepoRunnerPool
+
+    assert dict(_substrate_config({}).repo_runner_pools) == {}
+    config = _substrate_config(
+        {"CURIE_REPO_RUNNER_POOLS": json.dumps({"acme-corp/api": _REPO_POOL_ENTRY})}
+    )
+    assert dict(config.repo_runner_pools) == {
+        "acme-corp/api": RepoRunnerPool.model_validate(_REPO_POOL_ENTRY)
+    }
+
+
+@pytest.mark.parametrize(
+    "raw",
+    ['{"acme-corp/api":', json.dumps({"acme-corp/api": {**_REPO_POOL_ENTRY, "pool": "Bad_Pool"}})],
+    ids=["malformed-json", "bad-entry"],
+)
+def test_substrate_config_refuses_invalid_repo_runner_pools(raw: str) -> None:
+    with pytest.raises(ValueError, match="CURIE_REPO_RUNNER_POOLS"):
+        _substrate_config({"CURIE_REPO_RUNNER_POOLS": raw})
+
+
+@pytest.mark.parametrize(
+    ("image", "expected"),
+    [
+        (f"ghcr.io/x/curie-runner:v1@{_RUNNER_DIGEST}", _RUNNER_DIGEST),
+        ("ghcr.io/x/curie-runner:v1", None),
+    ],
+    ids=["pinned", "tag-only"],
+)
+def test_substrate_config_reads_the_platform_runner_digest(
+    image: str, expected: str | None
+) -> None:
+    assert _substrate_config({}).platform_runner_digest is None
+    config = _substrate_config({"CURIE_RUNNER_IMAGE": image})
+    assert config.platform_runner_digest == expected
 
 
 # -- _supervise: quiet boot while dependencies come up (#3079) ---------------
@@ -1384,12 +1846,16 @@ def test_supervise_keeps_tracebacks_for_connection_failures_after_boot(
 def test_run_warns_in_one_line_when_valkey_is_not_ready_for_the_boot_migration(
     monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
+    worker_db: Any,
 ) -> None:
-    """Valkey still coming up on a fresh install is expected at boot (#3079): the
+    """@spec PROTECTED-HOOK-SOURCE-2/10.
+
+    Valkey still coming up on a fresh install is expected at boot (#3079): the
     migration is skipped with a one-line warning, not a traceback."""
     with caplog.at_level(logging.DEBUG, logger="curie_worker.run"):
         events = _boot(
             monkeypatch,
+            database_url=worker_db[2],
             raises=redis.exceptions.ConnectionError("Error connecting to valkey:6379"),
         )
 
@@ -1414,3 +1880,90 @@ def test_supervise_keeps_tracebacks_for_local_os_errors_during_boot(
 
     records = [r for r in caplog.records if r.name == "curie_worker.run"]
     assert all(r.levelno == logging.ERROR and r.exc_info for r in records)
+
+
+@pytest.mark.parametrize("value", ["kube", "k8s", "Docker-compose", "fargate", ""])
+def test_an_unknown_sandbox_substrate_refuses_worker_start(value: str) -> None:
+    # It used to select Kubernetes silently.
+    with pytest.raises(ValueError, match="not a sandbox substrate"):
+        run.sandbox_substrate({"CURIE_SANDBOX_SUBSTRATE": value})
+    with pytest.raises(ValueError, match="not a sandbox substrate"):
+        _substrate_config({"CURIE_SANDBOX_SUBSTRATE": value})
+
+
+@pytest.mark.parametrize(
+    ("value", "kind"),
+    [
+        (None, "kubernetes"),
+        ("kubernetes", "kubernetes"),
+        (" Docker ", "docker"),
+        ("static", "static"),
+    ],
+)
+def test_sandbox_substrate_names_one_of_the_three_backends(value: str | None, kind: str) -> None:
+    env = {} if value is None else {"CURIE_SANDBOX_SUBSTRATE": value}
+    assert run.sandbox_substrate(env) == kind
+
+
+def test_the_static_substrate_refuses_quota_admission_and_repository_pools() -> None:
+    with pytest.raises(ValueError, match="quota admission"):
+        _substrate_config(
+            {
+                "CURIE_SANDBOX_SUBSTRATE": "static",
+                "CURIE_SANDBOX_ADMISSION": json.dumps(_admission_contract()),
+            }
+        )
+    with pytest.raises(ValueError, match="CURIE_REPO_RUNNER_POOLS"):
+        _substrate_config(
+            {
+                "CURIE_SANDBOX_SUBSTRATE": "static",
+                "CURIE_REPO_RUNNER_POOLS": json.dumps(
+                    {
+                        "acme/app": {
+                            "pool": "curie-repo-app",
+                            "digests": ["sha256:" + c * 64 for c in "acd"],
+                            "base": "sha256:" + "b" * 64,
+                            "docker": False,
+                        }
+                    }
+                ),
+            }
+        )
+
+
+def test_the_static_client_needs_its_inventory_ca_and_lease_store(tmp_path: Path) -> None:
+    shells = json.dumps([{"slot": "s0", "host": "shell.internal", "pool": "curie-runner-pool"}])
+    generic = SubstrateConfig(namespace="default", warm_pool="curie-runner-pool")
+    sync = redis.Redis()
+    env = {"CURIE_SANDBOX_SUBSTRATE": "static", "CURIE_STATIC_SHELLS": shells}
+    with pytest.raises(ValueError, match="action executor"):
+        _sandbox_client(WorkerConfig(action_executor_enabled=True), env, generic, redis_client=sync)
+    with pytest.raises(ValueError, match="Valkey"):
+        _sandbox_client(WorkerConfig(), env, generic)
+    with pytest.raises(ValueError, match="CURIE_STATIC_SHELL_CA_FILE"):
+        _sandbox_client(WorkerConfig(), env, generic, redis_client=sync)
+    from curie_test_support.static_shell import CONTROL_TOKEN, make_shell_tls
+
+    tls = make_shell_tls(tmp_path)
+    full = {
+        **env,
+        "CURIE_STATIC_SHELL_CA_FILE": str(tls.ca),
+        "CURIE_STATIC_SHELL_CONTROL_TOKEN": CONTROL_TOKEN,
+    }
+    agents = SubstrateConfig(
+        namespace="default", warm_pool="curie-runner-pool", agent_pools=frozenset({"sre"})
+    )
+    with pytest.raises(ValueError, match="no static shell: sre"):
+        _sandbox_client(WorkerConfig(), full, agents, redis_client=sync)
+    secrets = SubstrateConfig(
+        namespace="default",
+        warm_pool="curie-runner-pool",
+        connector_secret_pools=frozenset({"mail"}),
+    )
+    with pytest.raises(ValueError, match="no static shell: mail"):
+        _sandbox_client(WorkerConfig(), full, secrets, redis_client=sync)
+    client = _sandbox_client(WorkerConfig(), full, generic, redis_client=sync)
+    from curie_worker.sandbox import StaticPoolSandboxClient
+
+    assert isinstance(client, StaticPoolSandboxClient)
+    assert client.pools == frozenset({"curie-runner-pool"})

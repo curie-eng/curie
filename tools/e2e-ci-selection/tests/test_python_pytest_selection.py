@@ -2,9 +2,19 @@
 
 from __future__ import annotations
 
+import ast
+import fnmatch
+import hashlib
+import json
 import os
+import re
+import shlex
+import shutil
 import subprocess
 import sys
+import tomllib
+from copy import deepcopy
+from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
@@ -15,6 +25,15 @@ REPO_ROOT = Path(__file__).resolve().parents[3]
 SELECTOR = REPO_ROOT / "tools" / "e2e-ci-selection" / "select_tiers.py"
 REGISTRY = REPO_ROOT / ".github" / "e2e-selection.yaml"
 WORKFLOW = REPO_ROOT / ".github" / "workflows" / "ci.yaml"
+ADMITTED_AGENT_RUNTIME = "tools/factory-e2e/tests/test_c4_admitted_agent.py"
+DYNAMIC_BASE_RUNTIME = "tools/factory-e2e/tests/test_c4_dynamic_base.py"
+ADMITTED_AGENT_RUNTIMES = (ADMITTED_AGENT_RUNTIME, DYNAMIC_BASE_RUNTIME)
+SCRIPTED_FACTORY_JOB = "e2e-scripted-factory"
+ADMITTED_AGENT_JOB = "factory-admitted-agent"
+ADMITTED_AGENT_SHARDS = [1, 2, 3, 4, 5, 6, 7]
+RELABEL_REGRESSION = (
+    "test_two_worker_ci_preserves_successor_identity_and_rejects_stale_predecessor"
+)
 
 
 def _invoke_selector(
@@ -24,11 +43,14 @@ def _invoke_selector(
     base: str | None = None,
     head: str | None = None,
     cwd: Path | None = None,
+    targets_out: Path | None = None,
 ) -> tuple[subprocess.CompletedProcess[str], str]:
     output_path = tmp_path / f"github-output-{len(list(tmp_path.glob('github-output-*')))}"
     command = [sys.executable, str(SELECTOR), "--registry", str(REGISTRY)]
     if push:
         command.append("--push")
+    if targets_out is not None:
+        command.extend(("--pytest-targets-out", str(targets_out)))
     if base is not None:
         command.extend(("--base", base))
     if head is not None:
@@ -39,7 +61,7 @@ def _invoke_selector(
     environment["GITHUB_OUTPUT"] = str(output_path)
     completed = subprocess.run(
         command,
-        cwd=cwd or tmp_path,
+        cwd=cwd or REPO_ROOT,
         env=environment,
         capture_output=True,
         text=True,
@@ -50,8 +72,48 @@ def _invoke_selector(
 
 
 PYTEST_SELECTED = "steps.python-runtime.outputs.pytest == 'true'"
-SHARD_COUNT = 3
+PYTEST_ACTIVE = "steps.python-runtime.outputs.active == 'true'"
+STATIC_JOB = "python-static"
+STATIC_REQUIREMENT_STEP = "Require static gates to pass"
+# #4471: the gates that moved from the required job into STATIC_JOB, in order.
+MOVED_STATIC_STEPS = (
+    "Lockfile is up to date",
+    "Alembic revision gate",
+    "Alembic cross-train lineage",
+    "Schema window gate",
+    "Ruff",
+    "Mypy",
+    "Import boundaries (harness SDK containment)",
+    "Docs gate (catalog drift + agent contract + citations)",
+    "Wire tolerance gate (_AciModel model_validate call sites)",
+    "Shellcheck sre-bot platform-upgrade script",
+    "Release tests",
+    "ACI wire-lock base gate",
+)
+SHARD_COUNT = 6
+CONTAINER_JOB = "python-container-fixtures"
+CI_POLICY_DIRS = (
+    "tools/ci-retry-gate",
+    "tools/ci-workflow-paths",
+    "tools/ci-release-target-parity",
+    "tools/e2e-ci-selection",
+    "tools/helm-ci-gate",
+    "tools/fix-pin-ci",
+    "tools/p0-closes-ci",
+    "tools/runtime-assertion-gate",
+    "tools/dependency-audit-paths",
+    "tools/close-on-next",
+)
+CONTAINER_FILES = (
+    "tools/factory-e2e/tests/test_c4_tracker_scope.py",
+    "examples/tests/test_sre_bot_observability_runtime.py",
+)
+DRY_RUN_JOB = "python-dry-run-fixture"
+DRY_RUN_FILE = "tools/factory-e2e/tests/test_c4_dry_run.py"
+SHARD_NEIGHBOR = "tools/factory-e2e/tests/test_c4_reinstall_publication.py"
+PRIVATE_IMPORT_STEP = "API private import boundaries"
 ALWAYS_RUN_PYTHON_STEPS = (
+    "Explicit kube-context policy",
     "Alembic revision gate",
     "Ruff",
     "Mypy",
@@ -59,31 +121,89 @@ ALWAYS_RUN_PYTHON_STEPS = (
     "Wire tolerance gate (_AciModel model_validate call sites)",
     "ACI wire-lock base gate",
 )
-# These run in every pytest shard, each on its own runner with its own stack.
+# These run in every selected shard that the shard plan made active, each
+# with its own stack.
 GATED_RUNTIME_STEPS = (
     "Start dev stack",
     "Wait for Langfuse to serve",
-    "Released database upgrade gate",
     "Migrate the shared database",
     "Pytest",
 )
+STACK_TIERS = ("core", "storage", "full")
+# The shard plan that every event other than a pull request uses.
+FULL_PLAN = (SHARD_COUNT, SHARD_COUNT, SHARD_COUNT)
+TARGETS_FILE = "pytest-targets.txt"
+JUNIT_XML = "shard-result-durations/junit.xml"
+DURATIONS_ARTIFACT = "python-pytest-durations-${{ matrix.shard }}"
+IMPACT_TARGETS = (
+    "apps/api/tests/test_state.py",
+    "packages/aci-protocol/tests/test_attachments.py",
+    "tests/test_stream_groups.py",
+)
+IMPACT_DIGEST = hashlib.sha256("\n".join(IMPACT_TARGETS).encode()).hexdigest()
+OTHER_DIGEST = hashlib.sha256(IMPACT_TARGETS[0].encode()).hexdigest()
 PYTEST_AGGREGATE_EXPRESSIONS = {
-    "pytest_selected": "${{ steps.python-runtime.outputs.pytest }}",
+    "pytest_selected": "${{ needs.changes.outputs.pytest }}",
+    "pytest_deselect": "${{ needs.changes.outputs.pytest_deselect }}",
+    "pytest_scope": "${{ needs.changes.outputs.pytest_scope }}",
+    "pytest_targets": "${{ needs.changes.outputs.pytest_targets }}",
+    "pytest_shards": "${{ needs.changes.outputs.pytest_shards }}",
+    "pytest_storage_shards": "${{ needs.changes.outputs.pytest_storage_shards }}",
+    "pytest_full_shards": "${{ needs.changes.outputs.pytest_full_shards }}",
     "shards_result": "${{ needs.python-pytest.result }}",
+    "changes_result": "${{ needs.changes.result }}",
+    "container_result": "${{ needs.python-container-fixtures.result }}",
+    "ci_policy_selected": "${{ needs.changes.outputs.ci_policy }}",
+    "ci_policy_result": "${{ needs.ci-policy.result }}",
+    "dry_run_result": "${{ needs.python-dry-run-fixture.result }}",
+}
+PYTEST_STEP_EXPRESSIONS = {
+    "shard": "${{ matrix.shard }}",
+    "pytest_deselect": "${{ steps.python-runtime.outputs.pytest_deselect }}",
+    "pytest_scope": "${{ steps.python-runtime.outputs.pytest_scope }}",
+    "pytest_shards": "${{ steps.python-runtime.outputs.pytest_shards }}",
+    "pytest_storage_shards": "${{ steps.python-runtime.outputs.pytest_storage_shards }}",
+    "pytest_full_shards": "${{ steps.python-runtime.outputs.pytest_full_shards }}",
+    "stack_tier": "${{ steps.python-runtime.outputs.stack_tier }}",
+    "event_name": "${{ github.event_name }}",
 }
 SHARD_RECORD_EXPRESSIONS = {
     "shard": "${{ matrix.shard }}",
     "pytest_selected": "${{ steps.python-runtime.outputs.pytest }}",
     "pytest_result": "${{ steps.pytest.outcome }}",
     "stack_result": "${{ steps.dev-stack.outcome }}",
+    "pytest_deselect": "${{ steps.python-runtime.outputs.pytest_deselect }}",
+    "pytest_scope": "${{ steps.python-runtime.outputs.pytest_scope }}",
+    "pytest_shards": "${{ steps.python-runtime.outputs.pytest_shards }}",
+    "stack_tier": "${{ steps.python-runtime.outputs.stack_tier }}",
+    "pytest_targets": "${{ steps.python-runtime.outputs.pytest_targets }}",
 }
+# A shard record: selected, pytest, stack, deselect, scope, shards, tier, targets.
+ShardRecord = tuple[str, str, str, str, str, str, str, str]
+
+
+def _expected_tier(shard: int, plan: tuple[int, int, int]) -> str:
+    """The stack tier the shard plan gives one matrix shard."""
+    shards, storage_shards, full_shards = plan
+    if shard > shards:
+        return "none"
+    if shard <= full_shards:
+        return "full"
+    if shard <= storage_shards:
+        return "storage"
+    return "core"
+
+
+@lru_cache(maxsize=1)
+def _parse_workflow(contents: str) -> Any:
+    return yaml.safe_load(contents)
 
 
 def _python_job(job_id: str = "python") -> dict[str, Any]:
-    workflow = yaml.safe_load(WORKFLOW.read_text())
+    workflow = _parse_workflow(WORKFLOW.read_text())
     job = workflow["jobs"][job_id]
     assert isinstance(job, dict)
-    return job
+    return deepcopy(job)
 
 
 def _named_steps(job_id: str = "python") -> dict[str, dict[str, Any]]:
@@ -104,6 +224,112 @@ def _outputs(output: str) -> dict[str, str]:
     return dict(line.split("=", maxsplit=1) for line in output.splitlines() if line)
 
 
+def _needs(job: dict[str, Any]) -> list[str]:
+    needs = job.get("needs", [])
+    return [needs] if isinstance(needs, str) else list(needs)
+
+
+SHARDS_SELECTED = "${{ needs.changes.outputs.pytest == 'true' }}"
+PYTEST_NOT_SELECTED = "steps.python-runtime.outputs.pytest == 'false'"
+DECISION_STEP = "Decide whether compose and pytest are needed"
+
+
+def _runtime_condition(condition: str, outputs: dict[str, str], shard: int) -> bool:
+    """Evaluate a python-pytest step `if` against decision outputs and a matrix shard."""
+    # https://docs.github.com/en/actions/reference/workflows-and-actions/expressions
+    source = condition.strip()
+    if source.startswith("${{"):
+        source = source.removeprefix("${{").removesuffix("}}").strip()
+    if not source:
+        return True
+
+    def output(match: re.Match[str]) -> str:
+        assert match.group(1) in outputs, match.group(0)
+        return repr(outputs[match.group(1)])
+
+    source = re.sub(r"steps\.python-runtime\.outputs\.([A-Za-z_][A-Za-z0-9_]*)", output, source)
+    source = re.sub(r"\bmatrix\.shard\b", str(shard), source)
+    source = re.sub(r"!(?!=)", " not ", source).replace("&&", " and ").replace("||", " or ")
+
+    def evaluate(node: ast.AST) -> Any:
+        if isinstance(node, ast.Constant):
+            return node.value
+        if isinstance(node, ast.BoolOp):
+            values = [bool(evaluate(value)) for value in node.values]
+            return all(values) if isinstance(node.op, ast.And) else any(values)
+        if isinstance(node, ast.UnaryOp) and isinstance(node.op, ast.Not):
+            return not evaluate(node.operand)
+        if isinstance(node, ast.Compare):
+            assert len(node.ops) == 1 and isinstance(node.ops[0], (ast.Eq, ast.NotEq))
+            left, right = evaluate(node.left), evaluate(node.comparators[0])
+            if isinstance(left, int) != isinstance(right, int):
+                left, right = str(left), str(right)
+            return (left == right) if isinstance(node.ops[0], ast.Eq) else (left != right)
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and not node.args:
+            if node.func.id == "success":
+                return True
+        raise AssertionError(f"unsupported python-pytest step condition: {condition}")
+
+    return bool(evaluate(ast.parse(f"({source})", mode="eval").body))
+
+
+def _runtime_states() -> list[tuple[dict[str, str], int]]:
+    """Every decision state a shard step condition must answer, on shards 1 and 2."""
+    return [
+        ({"pytest": selected, "active": active, "stack_tier": tier}, shard)
+        for selected in ("true", "false")
+        for active in ("true", "false")
+        for tier in ("none", *STACK_TIERS)
+        for shard in (1, 2)
+    ]
+
+
+def _assert_runtime_condition(step: dict[str, Any], *, full_only: bool = False,
+                              shard_one: bool = False) -> None:
+    """The step runs exactly when pytest is selected and the shard is active.
+
+    ``full_only`` also requires the full stack tier; ``shard_one`` matrix shard 1.
+    """
+    condition = _string(step, "if")
+    for outputs, shard in _runtime_states():
+        expected = outputs["pytest"] == "true" and outputs["active"] == "true"
+        if full_only:
+            expected = expected and outputs["stack_tier"] == "full"
+        if shard_one:
+            expected = expected and shard == 1
+        assert _runtime_condition(condition, outputs, shard) is expected, (
+            step.get("name"), condition, outputs, shard,
+        )
+
+
+def test_python_job_sees_workflow_updates_and_isolates_mutations(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    workflow = tmp_path / "ci.yaml"
+    contents = (
+        "jobs:\n"
+        "  python:\n"
+        "    steps:\n"
+        "      - name: initial\n"
+        "        env:\n"
+        "          VALUE: initial\n"
+    )
+    workflow.write_text(contents)
+    monkeypatch.setattr(sys.modules[__name__], "WORKFLOW", workflow)
+
+    job = _python_job()
+    assert job == {"steps": [{"name": "initial", "env": {"VALUE": "initial"}}]}
+    job["steps"][0]["env"]["VALUE"] = "mutated"
+    job["steps"].append({"name": "extra"})
+    assert _python_job() == {"steps": [{"name": "initial", "env": {"VALUE": "initial"}}]}
+
+    workflow.write_text(contents.replace("initial", "updated"))
+    updated = _python_job()
+    assert updated == {"steps": [{"name": "updated", "env": {"VALUE": "updated"}}]}
+    updated["steps"][0]["name"] = "mutated"
+    assert _python_job() == {"steps": [{"name": "updated", "env": {"VALUE": "updated"}}]}
+
+
 @pytest.mark.parametrize(
     "path",
     [
@@ -114,10 +340,12 @@ def _outputs(output: str) -> dict[str, str]:
         "llms.txt",
     ],
 )
-def test_docs_only_path_skips_pytest(tmp_path: Path, path: str) -> None:
+def test_docs_only_path_runs_impact_readers(tmp_path: Path, path: str) -> None:
     completed, output = _invoke_selector(tmp_path, path)
     assert completed.returncode == 0, completed.stderr
-    assert _outputs(output)["pytest"] == "false"
+    outputs = _outputs(output)
+    assert outputs["pytest"] == "true"
+    assert outputs["pytest_scope"] == "impact"
 
 
 @pytest.mark.parametrize(
@@ -126,7 +354,8 @@ def test_docs_only_path_skips_pytest(tmp_path: Path, path: str) -> None:
         "packages/aci-protocol/src/aci_protocol/wire.py",
         "apps/api/src/curie_api/main.py",
         "apps/worker/src/curie_worker/binding.py",
-        "apps/dispatcher/src/curie_dispatcher/app.py",
+        "packages/channel-gateway/src/curie_channel_gateway/slack/valkey.py",
+        "packages/channel-gateway/src/curie_channel_gateway/slack/app.py",
         "runner/src/curie_runner/session.py",
         "examples/tests/test_example.py",
         "cli/src/main.rs",
@@ -174,6 +403,9 @@ def test_empty_revision_diff_fails_closed_to_pytest(tmp_path: Path) -> None:
     subprocess.run(["git", "config", "user.name", "Test User"], cwd=repository, check=True)
     (repository / "docs").mkdir()
     (repository / "docs" / "guides.md").write_text("one sentence.\n")
+    workflow = repository / ".github/workflows/ci.yaml"
+    workflow.parent.mkdir(parents=True)
+    workflow.write_text(WORKFLOW.read_text())
     subprocess.run(["git", "add", "."], cwd=repository, check=True)
     subprocess.run(["git", "commit", "-m", "base"], cwd=repository, check=True)
     head = subprocess.run(
@@ -194,7 +426,7 @@ def test_empty_revision_diff_fails_closed_to_pytest(tmp_path: Path) -> None:
     assert _outputs(output)["pytest"] == "true"
 
 
-def test_deleting_a_docs_guides_sentence_does_not_select_pytest(tmp_path: Path) -> None:
+def test_deleting_a_docs_guides_sentence_runs_impact_readers(tmp_path: Path) -> None:
     repository = tmp_path / "repository"
     repository.mkdir()
     subprocess.run(
@@ -211,6 +443,9 @@ def test_deleting_a_docs_guides_sentence_does_not_select_pytest(tmp_path: Path) 
     guides.joinpath("getting-started.md").write_text(
         "First sentence.\nSecond sentence that a docs-only edit can delete.\n"
     )
+    workflow = repository / ".github/workflows/ci.yaml"
+    workflow.parent.mkdir(parents=True)
+    workflow.write_text(WORKFLOW.read_text())
     subprocess.run(["git", "add", "."], cwd=repository, check=True)
     subprocess.run(["git", "commit", "-m", "base"], cwd=repository, check=True)
     base = subprocess.run(
@@ -238,7 +473,9 @@ def test_deleting_a_docs_guides_sentence_does_not_select_pytest(tmp_path: Path) 
         cwd=repository,
     )
     assert completed.returncode == 0, completed.stderr
-    assert _outputs(output)["pytest"] == "false"
+    outputs = _outputs(output)
+    assert outputs["pytest"] == "true"
+    assert outputs["pytest_scope"] == "impact"
 
 
 def test_required_python_job_keeps_ruleset_name_and_is_not_skippable() -> None:
@@ -246,14 +483,26 @@ def test_required_python_job_keeps_ruleset_name_and_is_not_skippable() -> None:
     assert job["name"] == "Python (ruff + mypy + pytest)"
     # It waits for the shards only to aggregate them; always() keeps it
     # reporting the required check whatever the shards did.
-    assert job["needs"] == "python-pytest"
+    assert job["needs"] == [
+        "changes", "python-pytest", CONTAINER_JOB, DRY_RUN_JOB, "python-static", "ci-policy",
+    ]
     assert job["if"] == "always()"
 
+    # #4471: the static gates run in their own job, parallel to the shards.
+    static = _python_job(STATIC_JOB)
+    assert static["name"] == "Python static gates"
+    assert _needs(static) == ["changes"]
+    assert "if" not in static
+
+    # #3858: the shards no longer boot runners just to skip. They wait for the
+    # `changes` selection and run only when it selected pytest; the required
+    # job above still reports, and its aggregate step accepts the skip.
     shards = _python_job("python-pytest")
-    assert "needs" not in shards
-    assert "if" not in shards
+    assert "changes" in _needs(shards)
+    assert shards["if"] == SHARDS_SELECTED
     assert shards["strategy"]["fail-fast"] is False
     assert shards["strategy"]["matrix"]["shard"] == list(range(1, SHARD_COUNT + 1))
+    assert shards["name"] == "Python pytest (shard ${{ matrix.shard }}/6)"
 
 
 def test_python_shards_require_postgres_and_valkey_tests() -> None:
@@ -263,7 +512,7 @@ def test_python_shards_require_postgres_and_valkey_tests() -> None:
     assert env["CI_REQUIRE_VALKEY_TESTS"] == "1"
 
 
-def test_python_job_gates_compose_and_pytest_on_selector_output() -> None:
+def test_python_job_gates_compose_and_pytest_on_selector_output(tmp_path: Path) -> None:
     named = _named_steps("python-pytest")
     decision = named["Decide whether compose and pytest are needed"]
     assert decision["id"] == "python-runtime"
@@ -271,38 +520,52 @@ def test_python_job_gates_compose_and_pytest_on_selector_output() -> None:
     assert "--registry .github/e2e-selection.yaml" in _string(decision, "run")
 
     for name in GATED_RUNTIME_STEPS:
-        step = named[name]
-        assert _string(step, "if") == PYTEST_SELECTED, name
+        _assert_runtime_condition(named[name], full_only=name == "Wait for Langfuse to serve")
 
     stack = named["Start dev stack"]
     assert stack["id"] == "dev-stack"
-    assert "postgres" in _string(stack, "run")
+    assert (
+        _string(stack, "run").strip()
+        == 'python3 scripts/wait-for-langfuse.py --start --tier "$STACK_TIER" --timeout-seconds 480'
+    )
+    assert _bindings(stack, {"stack_tier": "${{ steps.python-runtime.outputs.stack_tier }}"}) == {
+        "stack_tier": "STACK_TIER"
+    }
+    assert (
+        _string(named["Wait for Langfuse to serve"], "run").strip()
+        == "python3 scripts/wait-for-langfuse.py"
+    )
 
     pytest_step = named["Pytest"]
     assert pytest_step["id"] == "pytest"
-    command = _string(pytest_step, "run").strip()
-    assert command.startswith("uv run pytest -q")
-    assert f"--ci-shard ${{{{ matrix.shard }}}}/{SHARD_COUNT}" in command
+    command = ["uv", *_run_pytest_step(tmp_path, shard=2, deselect="")]
+    assert command[:4] == ["uv", "run", "pytest", "-q"]
+    assert command[command.index("--ci-shard") + 1] == f"2/{SHARD_COUNT}"
     # One automatic rerun, and every rerun test listed in the summary.
-    assert "--reruns 1" in command
+    assert command[command.index("--reruns") + 1] == "1"
     # pytest keeps only the last -r option, so one token must carry both the
     # rerun (R) and skip (s) report characters.
-    report_tokens = [token for token in command.split() if token.startswith("-r")]
+    report_tokens = [token for token in command if token.startswith("-r")]
     assert len(report_tokens) == 1, report_tokens
     assert {"R", "s"} <= set(report_tokens[0][2:])
 
-    # The required job boots no stack and runs no suite of its own.
+    # The required job boots no stack and runs no suite of its own, and
+    # neither does the static job.
     required = _named_steps()
+    static = _named_steps(STATIC_JOB)
     for name in GATED_RUNTIME_STEPS:
         assert name not in required, name
-    assert (
-        named["Decide whether compose and pytest are needed"]["run"]
-        == (required["Decide whether compose and pytest are needed"]["run"])
-    )
+        assert name not in static, name
+    assert DECISION_STEP not in required
+    assert "Sync workspace" not in required
+    for step in _python_job()["steps"]:
+        assert "astral-sh/setup-uv@" not in _string(step, "uses")
+        assert "uv sync" not in _string(step, "run")
+        assert "select_tiers.py" not in _string(step, "run")
 
 
 def test_python_static_gates_stay_unconditional() -> None:
-    named = _named_steps()
+    named = _named_steps(STATIC_JOB)
     for name in ALWAYS_RUN_PYTHON_STEPS:
         step = named[name]
         assert "if" not in step, name
@@ -310,6 +573,104 @@ def test_python_static_gates_stay_unconditional() -> None:
 
     docs = named["Docs gate (catalog drift + agent contract + citations)"]
     assert "scripts/check-docs.sh" in _string(docs, "run")
+
+    cli_list = named["CLI pytest file list"]
+    assert "if" not in cli_list
+    assert _string(cli_list, "run").strip() == (
+        "uv run python tools/e2e-ci-selection/cli_pytest_files.py --check"
+    )
+
+
+def test_static_job_holds_exactly_the_moved_gates_in_order() -> None:
+    """The static gates preserve order, with private imports immediately after sync."""
+    static_names = [
+        step["name"]
+        for step in _python_job(STATIC_JOB)["steps"]
+        if isinstance(step, dict) and isinstance(step.get("name"), str)
+    ]
+    expected = [
+        "Install uv",
+        "Back off before retrying Install uv",
+        "Install uv (retry)",
+        "Lockfile is up to date",
+        "Sync workspace",
+        PRIVATE_IMPORT_STEP,
+        "Explicit kube-context policy",
+        "CLI pytest file list",
+        *MOVED_STATIC_STEPS[1:4],
+        # ADR 0232 (#4610) added this gate after the move.
+        "Contract migration timing gate",
+        "Test-time ratchets",
+        *MOVED_STATIC_STEPS[4:],
+    ]
+    assert static_names == expected
+
+    required = _named_steps()
+    for name in MOVED_STATIC_STEPS:
+        assert name not in required, name
+    assert "Sync workspace" not in required
+
+
+def _assert_gate_placements(jobs: dict[str, Any]) -> None:
+    for script, owner, commands in (
+        ("check-released-upgrade.py", "python-pytest", [
+            "uv run python scripts/check-released-upgrade.py --self-test",
+            "uv run python scripts/check-released-upgrade.py",
+        ]),
+        ("check-private-imports.py", STATIC_JOB, [
+            "uv run python3 scripts/check-private-imports.py --self-test",
+            "uv run python3 scripts/check-private-imports.py",
+        ]),
+    ):
+        matches = [
+            (job_id, step)
+            for job_id in ("python-pytest", "python", STATIC_JOB, CONTAINER_JOB)
+            for step in jobs[job_id]["steps"]
+            if script in _string(step, "run")
+        ]
+        assert len(matches) == 1, script
+        job_id, step = matches[0]
+        assert job_id == owner, script
+        assert _string(step, "run").strip().splitlines() == commands
+        steps = jobs[owner]["steps"]
+        names = [item.get("name") for item in steps]
+        if owner == STATIC_JOB:
+            assert "if" not in step
+            assert names.index("Sync workspace") + 1 == steps.index(step)
+        else:
+            _assert_runtime_condition(step, shard_one=True)
+            assert names.index("Wait for Langfuse to serve") < steps.index(step)
+            assert steps.index(step) < names.index("Migrate the shared database")
+
+
+def test_database_and_private_import_gates_have_one_owner() -> None:
+    _assert_gate_placements(yaml.safe_load(WORKFLOW.read_text())["jobs"])
+
+
+@pytest.mark.parametrize("mutation", ["missing-condition", "all-shards", "static-owner"])
+def test_gate_placement_guard_rejects_execution_outside_shard_one(mutation: str) -> None:
+    jobs = yaml.safe_load(WORKFLOW.read_text())["jobs"]
+    _assert_gate_placements(jobs)
+    steps = jobs["python-pytest"]["steps"]
+    gate = next(step for step in steps if step.get("name") == "Released database upgrade gate")
+    if mutation == "missing-condition":
+        del gate["if"]
+    elif mutation == "all-shards":
+        gate["if"] = PYTEST_SELECTED
+    else:
+        steps.remove(gate)
+        jobs[STATIC_JOB]["steps"].append(gate)
+    with pytest.raises(AssertionError):
+        _assert_gate_placements(jobs)
+
+
+def test_aci_wire_lock_base_gate_compares_against_the_event_branch() -> None:
+    script = _string(_named_steps(STATIC_JOB)["ACI wire-lock base gate"], "run")
+    branch = "${{ github.base_ref || github.ref_name }}"
+    assert script.count(branch) == 2
+    assert f'git fetch --no-tags --depth=1 origin "{branch}"' in script
+    assert f'git show "origin/{branch}:packages/aci-protocol/schema/wire.lock"' in script
+    assert "'main'" not in script
 
 
 def test_dump_logs_do_not_run_when_the_stack_never_started() -> None:
@@ -344,22 +705,837 @@ def _run_bash(
     )
 
 
-def _record_shard(tmp_path: Path, shard: int, selected: str, outcome: str, stack: str) -> None:
+def _record_uv_step(
+    tmp_path: Path,
+    step: dict[str, Any],
+    *,
+    environment: dict[str, str],
+    exit_code: int = 0,
+) -> tuple[subprocess.CompletedProcess[str], list[str]]:
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    log = tmp_path / "uv-argv"
+    stub = bin_dir / "uv"
+    stub.write_text(
+        '#!/usr/bin/env bash\nprintf "%s\\0" "$@" >> "$UV_ARGV_LOG"\n'
+        f"exit {exit_code}\n"
+    )
+    stub.chmod(0o755)
+    result = _run_bash(
+        _string(step, "run"),
+        {
+            **environment,
+            "PATH": f"{bin_dir}:{os.environ['PATH']}",
+            "UV_ARGV_LOG": str(log),
+        },
+        tmp_path,
+    )
+    assert log.exists(), result.stdout + result.stderr
+    recorded = log.read_bytes().split(b"\0")
+    assert recorded.pop() == b""
+    return result, [argument.decode() for argument in recorded]
+
+
+def _without_runtime_exclusion(arguments: list[str], runtime: str) -> list[str]:
+    remaining = []
+    excluded = []
+    index = 0
+    while index < len(arguments):
+        argument = arguments[index]
+        option, separator, value = argument.partition("=")
+        if option in {"--ignore", "--ignore-glob", "--deselect"}:
+            if not separator and index + 1 < len(arguments):
+                value = arguments[index + 1]
+            if value == runtime:
+                excluded.append(value)
+                index += 1 if separator else 2
+                continue
+        remaining.append(argument)
+        index += 1
+    assert excluded == [runtime], arguments
+    return remaining
+
+
+def _without_owned_runtime_exclusions(arguments: list[str]) -> list[str]:
+    expected = {
+        *(("--deselect", runtime) for runtime in ADMITTED_AGENT_RUNTIMES),
+        *(("--ignore", runtime) for runtime in (*CONTAINER_FILES, DRY_RUN_FILE)),
+    }
+    remaining = []
+    excluded = []
+    index = 0
+    while index < len(arguments):
+        argument = arguments[index]
+        option, separator, value = argument.partition("=")
+        if option in {"--ignore", "--deselect"}:
+            if not separator:
+                assert index + 1 < len(arguments), arguments
+                value = arguments[index + 1]
+            if (option, value) in expected:
+                excluded.append((option, value))
+            else:
+                remaining.append(argument)
+                if not separator:
+                    remaining.append(value)
+            index += 1 if separator else 2
+            continue
+        remaining.append(argument)
+        index += 1
+    assert sorted(excluded) == sorted(expected), arguments
+    return remaining
+
+
+def _pytest_step_state(
+    *,
+    shard: int,
+    deselect: str,
+    scope: str = "full",
+    plan: tuple[int, int, int] = FULL_PLAN,
+    tier: str | None = None,
+    event: str = "push",
+) -> dict[str, str]:
+    """The decision outputs one shard's Pytest step reads, keyed semantically.
+
+    The default is a non pull request event, whose plan is six full shards.
+    """
+    return {
+        "shard": str(shard),
+        "pytest_deselect": deselect,
+        "pytest_scope": scope,
+        "pytest_shards": str(plan[0]),
+        "pytest_storage_shards": str(plan[1]),
+        "pytest_full_shards": str(plan[2]),
+        "stack_tier": _expected_tier(shard, plan) if tier is None else tier,
+        "event_name": event,
+    }
+
+
+def _write_pytest_step_inputs(
+    tmp_path: Path,
+    *,
+    scope: str,
+    cli_files: tuple[str, ...] | None,
+    targets: tuple[str, ...] | None,
+) -> None:
+    if scope == "cli":
+        relative = "tools/e2e-ci-selection/cli_pytest_files.txt"
+        destination = tmp_path / relative
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        if cli_files is None:
+            shutil.copyfile(REPO_ROOT / relative, destination)
+        else:
+            destination.write_text("\n".join(cli_files) + "\n")
+    if targets is not None:
+        (tmp_path / TARGETS_FILE).write_text("".join(f"{path}\n" for path in targets))
+
+
+def _run_pytest_step(
+    tmp_path: Path,
+    *,
+    shard: int,
+    deselect: str,
+    scope: str = "full",
+    cli_files: tuple[str, ...] | None = None,
+    plan: tuple[int, int, int] = FULL_PLAN,
+    event: str = "push",
+    targets: tuple[str, ...] | None = None,
+) -> list[str]:
+    """Execute the real workflow Bash and record each argument at the uv boundary.
+
+    ``targets`` writes the decision step's targets file one path per line.
+    """
+    step = _named_steps("python-pytest")["Pytest"]
+    script = _string(step, "run")
+    assert "${{" not in script
+    bindings = _bindings(step, PYTEST_STEP_EXPRESSIONS)
+    tmp_path.mkdir(parents=True, exist_ok=True)
+    _write_pytest_step_inputs(tmp_path, scope=scope, cli_files=cli_files, targets=targets)
+    state = _pytest_step_state(shard=shard, deselect=deselect, scope=scope, plan=plan, event=event)
+    result, recorded = _record_uv_step(
+        tmp_path, step, environment={bindings[key]: value for key, value in state.items()}
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    return recorded
+
+
+def _run_pytest_step_child(
+    tmp_path: Path, state: dict[str, str], *, targets: tuple[str, ...] | None = None,
+    cli_files: tuple[str, ...] | None = None,
+) -> tuple[subprocess.CompletedProcess[str], dict[str, Any] | None]:
+    """Run the real Pytest step; record argv and the pytest child's environment.
+
+    The recorded value is None when the step never reached uv.
+    """
+    step = _named_steps("python-pytest")["Pytest"]
+    assert "${{" not in _string(step, "run")
+    bindings = _bindings(step, PYTEST_STEP_EXPRESSIONS)
+    tmp_path.mkdir(parents=True, exist_ok=True)
+    _write_pytest_step_inputs(
+        tmp_path, scope=state["pytest_scope"], cli_files=cli_files, targets=targets
+    )
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    log = tmp_path / "uv-call.json"
+    recorder = bin_dir / "uv"
+    recorder.write_text(
+        f"#!{sys.executable}\n"
+        "import json, os, sys\n"
+        "from pathlib import Path\n"
+        "Path(os.environ['UV_CALL_LOG']).write_text(json.dumps({\n"
+        "    'argv': sys.argv[1:],\n"
+        "    'stack_tier': os.environ.get('CURIE_CI_STACK_TIER'),\n"
+        "    'scope': os.environ.get('PYTEST_SCOPE'),\n"
+        "}))\n"
+    )
+    recorder.chmod(0o755)
+    result = _run_bash(
+        _string(step, "run"),
+        {
+            "PATH": f"{bin_dir}:{os.environ['PATH']}",
+            "UV_CALL_LOG": str(log),
+            "CURIE_CI_STACK_TIER": "",
+            **{bindings[key]: value for key, value in state.items()},
+        },
+        tmp_path,
+    )
+    return result, json.loads(log.read_text()) if log.exists() else None
+
+
+def _without_shard_report_arguments(argv: list[str], *, tiers: str | None = None) -> list[str]:
+    """Drop the durations report and tier plan arguments after checking them.
+
+    Every shard writes the JUnit report with xunit1 timings exactly once.
+    ``--ci-shard-tiers`` must carry ``tiers`` exactly once, or be absent when
+    ``tiers`` is None (every event other than a pull request).
+    """
+    remaining: list[str] = []
+    reports: list[str] = []
+    families: list[str] = []
+    found_tiers: list[str] = []
+    index = 0
+    while index < len(argv):
+        argument = argv[index]
+        option, separator, value = argument.partition("=")
+        if option in {"--junitxml", "--junit-xml", "--ci-shard-tiers"}:
+            if not separator:
+                assert index + 1 < len(argv), argv
+                value = argv[index + 1]
+            (found_tiers if option == "--ci-shard-tiers" else reports).append(value)
+            index += 1 if separator else 2
+            continue
+        if argument == "-o" and index + 1 < len(argv) and argv[index + 1].startswith(
+            "junit_family="
+        ):
+            families.append(argv[index + 1])
+            index += 2
+            continue
+        remaining.append(argument)
+        index += 1
+    assert reports == [JUNIT_XML], argv
+    assert families == ["junit_family=xunit1"], argv
+    assert found_tiers == ([] if tiers is None else [tiers]), argv
+    return remaining
+
+
+def _selection_expression(expression: str, selected: str, deselect: str) -> bool:
+    """Evaluate the Boolean and string operations used by the actual job expressions."""
+    # https://docs.github.com/en/actions/reference/workflows-and-actions/expressions
+    source = expression.removeprefix("${{").removesuffix("}}").strip()
+    for name, value in (("pytest_deselect", deselect), ("pytest", selected)):
+        source = source.replace(f"needs.changes.outputs.{name}", repr(value))
+    source = re.sub(r"!(?!=)", "not ", source).replace("&&", " and ").replace("||", " or ")
+
+    def evaluate(node: ast.AST) -> Any:
+        if isinstance(node, ast.Constant):
+            return node.value
+        if isinstance(node, ast.BoolOp):
+            values = [bool(evaluate(value)) for value in node.values]
+            return all(values) if isinstance(node.op, ast.And) else any(values)
+        if isinstance(node, ast.UnaryOp) and isinstance(node.op, ast.Not):
+            return not evaluate(node.operand)
+        if isinstance(node, ast.Compare):
+            assert len(node.ops) == 1 and isinstance(node.ops[0], (ast.Eq, ast.NotEq))
+            equal = evaluate(node.left) == evaluate(node.comparators[0])
+            return equal if isinstance(node.ops[0], ast.Eq) else not equal
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name):
+            args = [evaluate(argument) for argument in node.args]
+            if node.func.id == "contains":
+                return args[1].casefold() in args[0].casefold()
+            if node.func.id == "format":
+                return args[0].format(*args[1:])
+        raise AssertionError(f"unsupported workflow selection expression: {ast.dump(node)}")
+
+    return bool(evaluate(ast.parse(f"({source})", mode="eval").body))
+
+
+CONTAINER_SELECTION_CASES = (
+    ("", CONTAINER_FILES),
+    (CONTAINER_FILES[0], (CONTAINER_FILES[1],)),
+    (CONTAINER_FILES[1], (CONTAINER_FILES[0],)),
+    (",".join(CONTAINER_FILES), ()),
+    (",".join(reversed(CONTAINER_FILES)), ()),
+    ("other.py," + CONTAINER_FILES[0] + ",another.py", (CONTAINER_FILES[1],)),
+    ("other.py," + ",".join(CONTAINER_FILES) + ",another.py", ()),
+    (",".join(path + "::test_example" for path in CONTAINER_FILES), CONTAINER_FILES),
+    (",".join("prefix/" + path for path in CONTAINER_FILES), CONTAINER_FILES),
+    (",".join(path + ".neighbor" for path in CONTAINER_FILES), CONTAINER_FILES),
+    (",".join(path[:-3] for path in CONTAINER_FILES), CONTAINER_FILES),
+)
+
+
+def test_container_job_has_its_own_setup_without_a_shared_stack() -> None:
+    job = _python_job(CONTAINER_JOB)
+    assert job["name"] == "Python container fixtures (pytest)"
+    assert _needs(job) == ["changes"]
+    assert not job.get("continue-on-error", False)
+    assert any(_string(step, "uses") == "actions/checkout@v7" for step in job["steps"])
+    named = _named_steps(CONTAINER_JOB)
+    generic = _named_steps("python-pytest")
+    for name in (
+        "Pull Docker Hub images through the mirror", "Install uv",
+        "Back off before retrying Install uv", "Install uv (retry)", "Sync workspace",
+    ):
+        assert named[name] == generic[name], name
+    scripts = "\n".join(_string(step, "run") for step in job["steps"])
+    assert "wait-for-langfuse.py" not in scripts
+    assert "alembic upgrade" not in scripts
+    assert DECISION_STEP not in named
+    assert not named["Pytest"].get("continue-on-error", False)
+    assert named["Pytest"]["env"] == {
+        "PYTEST_DESELECT": "${{ needs.changes.outputs.pytest_deselect }}",
+        "PYTEST_SCOPE": "${{ needs.changes.outputs.pytest_scope }}",
+    }
+    manifest = (REPO_ROOT / "tools/e2e-ci-selection/cli_pytest_files.txt").read_text().splitlines()
+    assert set(CONTAINER_FILES) <= set(manifest)
+
+
+@pytest.mark.parametrize(("deselect", "files"), CONTAINER_SELECTION_CASES)
+@pytest.mark.parametrize("selected", ["true", "false"])
+def test_container_step_uses_complete_deselect_tokens(
+    deselect: str, files: tuple[str, ...], selected: str
+) -> None:
+    expressions = (_named_steps(CONTAINER_JOB)["Pytest"]["if"],)
+    for expression in expressions:
+        assert _selection_expression(expression, selected, deselect) == (
+            selected == "true" and bool(files)
+        )
+
+
+def test_container_selection_guard_rejects_substring_membership() -> None:
+    expression = _named_steps(CONTAINER_JOB)["Pytest"]["if"]
+    assert _selection_expression(expression, "true", ",".join(CONTAINER_FILES)) is False
+    mutated = re.sub(
+        r"format\(\s*',\{0\},'\s*,\s*needs\.changes\.outputs\.pytest_deselect\s*\)",
+        "needs.changes.outputs.pytest_deselect",
+        expression,
+    )
+    for path in CONTAINER_FILES:
+        mutated = mutated.replace(f"',{path},'", f"'{path}'")
+    assert mutated != expression
+    near_matches = ",".join(path + "::test_example" for path in CONTAINER_FILES)
+    assert _selection_expression(expression, "true", near_matches) is True
+    with pytest.raises(AssertionError):
+        assert _selection_expression(mutated, "true", near_matches) is True
+
+
+@pytest.mark.parametrize("scope", ["full", "cli"])
+@pytest.mark.parametrize(
+    ("deselect", "files"), [case for case in CONTAINER_SELECTION_CASES if case[1]]
+)
+def test_container_pytest_runs_only_selected_files(
+    tmp_path: Path, scope: str, deselect: str, files: tuple[str, ...]
+) -> None:
+    step = _named_steps(CONTAINER_JOB)["Pytest"]
+    assert "${{" not in _string(step, "run")
+    result, argv = _record_uv_step(
+        tmp_path, step, environment={"PYTEST_SCOPE": scope, "PYTEST_DESELECT": deselect}
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert argv == [
+        "run", "pytest", "-q", "-n", "2", "--dist", "loadgroup",
+        "--reruns", "1", "-rsR", "--durations=25", *files,
+    ]
+
+
+@pytest.mark.parametrize(("scope", "deselect"), [
+    ("", ""), ("unknown", ""), ("FULL", ""),
+    ("full", ",".join(CONTAINER_FILES)), ("cli", ",".join(reversed(CONTAINER_FILES))),
+])
+def test_container_pytest_rejects_invalid_scope_or_no_files_before_uv(
+    tmp_path: Path, scope: str, deselect: str
+) -> None:
+    result = _run_bash(
+        _string(_named_steps(CONTAINER_JOB)["Pytest"], "run"),
+        {
+            "PYTEST_SCOPE": scope, "PYTEST_DESELECT": deselect,
+            "BASH_FUNC_uv%%": "() { echo unexpected-uv-invocation >&2; exit 99; }",
+        },
+        tmp_path,
+    )
+    assert result.returncode not in (0, 99), result.stdout + result.stderr
+    assert "unexpected-uv-invocation" not in result.stdout + result.stderr
+    assert result.stdout + result.stderr
+
+
+@pytest.mark.parametrize("exit_code", [1, 5])
+def test_container_pytest_propagates_failure(tmp_path: Path, exit_code: int) -> None:
+    result, _ = _record_uv_step(
+        tmp_path, _named_steps(CONTAINER_JOB)["Pytest"],
+        environment={"PYTEST_SCOPE": "full", "PYTEST_DESELECT": ""}, exit_code=exit_code,
+    )
+    assert result.returncode == exit_code, result.stdout + result.stderr
+
+
+@pytest.mark.parametrize(("event", "paths", "scope", "files"), [
+    ("pull_request", (".github/workflows/ci.yaml",), "full", CONTAINER_FILES),
+    ("pull_request", ("cli/src/main.rs",), "cli", (CONTAINER_FILES[0],)),
+    ("pull_request", ("docs/guides/getting-started.md",), "impact", ()),
+    ("push", (), "full", CONTAINER_FILES),
+    ("workflow_dispatch", (), "full", CONTAINER_FILES),
+])
+def test_container_caller_follows_real_selection_for_pr_push_and_dispatch(
+    tmp_path: Path, event: str, paths: tuple[str, ...], scope: str, files: tuple[str, ...]
+) -> None:
+    if event != "pull_request":
+        decision = tmp_path / "decision"
+        decision.mkdir()
+        calls = _run_decision_step(decision, "python-pytest", event)
+        assert any("--push" in call.split() for call in calls)
+    completed, output = _invoke_selector(tmp_path, *paths, push=event != "pull_request")
+    assert completed.returncode == 0, completed.stderr
+    selection = _outputs(output)
+    assert selection["pytest_scope"] == scope
+    assert _selection_expression(
+        _named_steps(CONTAINER_JOB)["Pytest"]["if"],
+        selection["pytest"], selection["pytest_deselect"],
+    ) == bool(files)
+    for expression in (
+        _python_job(CONTAINER_JOB)["if"],
+        _named_steps()["Require pytest outcome to match selection"]["env"]["CONTAINER_SELECTED"],
+    ):
+        assert _selection_expression(
+            expression, selection["pytest"], selection["pytest_deselect"]
+        ) == (selection["pytest"] == "true")
+    if files:
+        caller = tmp_path / "caller"
+        caller.mkdir()
+        result, argv = _record_uv_step(
+            caller, _named_steps(CONTAINER_JOB)["Pytest"],
+            environment={"PYTEST_SCOPE": scope, "PYTEST_DESELECT": selection["pytest_deselect"]},
+        )
+        assert result.returncode == 0, result.stdout + result.stderr
+        assert argv[-len(files):] == list(files)
+        assert [path for path in argv if path in CONTAINER_FILES] == list(files)
+
+
+@pytest.mark.parametrize("exit_code", [0, 1])
+def test_commissioning_crash_case_is_required_without_a_shard_budget(
+    tmp_path: Path, exit_code: int
+) -> None:
+    step = _named_steps(CONTAINER_JOB)["Protected commissioning crash recovery"]
+    assert "if" not in step and not step.get("continue-on-error", False)
+    result, argv = _record_uv_step(tmp_path, step, environment={}, exit_code=exit_code)
+    assert result.returncode == exit_code
+    assert argv == [
+        "run", "python", "-m", "pytest", "-q", "-n", "0", "--durations=25",
+        "cli/tests/local/test_commissioning_claim_execution.py",
+    ]
+
+
+def test_commissioning_crash_step_collects_without_pythonpath() -> None:
+    step = _named_steps(CONTAINER_JOB)["Protected commissioning crash recovery"]
+    environment = os.environ.copy()
+    environment.pop("PYTHONPATH", None)
+    result = subprocess.run(
+        [*shlex.split(_string(step, "run")), "--collect-only"],
+        cwd=REPO_ROOT,
+        env=environment,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert (
+        "cli/tests/local/test_commissioning_claim_execution.py::"
+        "test_a_hard_killed_executor_is_not_replayed_by_a_fresh_os_process"
+    ) in result.stdout
+
+
+def test_dry_run_job_matches_container_setup_and_runs_only_its_file() -> None:
+    job = _python_job(DRY_RUN_JOB)
+    assert job["name"] == "Python dry run fixture (pytest)"
+    assert _needs(job) == ["changes"]
+    assert "python-dry-run-fixture" in _needs(_python_job())
+    named = _named_steps(DRY_RUN_JOB)
+    container = _named_steps(CONTAINER_JOB)
+    for name, step in container.items():
+        if name == "Pytest":
+            break
+        assert named[name] == step, name
+    pytest_step = named["Pytest"]
+    assert pytest_step["env"] == {
+        "PYTEST_SCOPE": "${{ needs.changes.outputs.pytest_scope }}",
+    }
+    script = _string(pytest_step, "run")
+    assert "uv run pytest -q -n 0 --reruns 1 -rsR --durations=25 " + DRY_RUN_FILE in script
+    assert "wait-for-langfuse.py" not in script
+    manifest = (REPO_ROOT / "tools/e2e-ci-selection/cli_pytest_files.txt").read_text().splitlines()
+    assert DRY_RUN_FILE in manifest
+    assert SHARD_NEIGHBOR in manifest
+    assert SHARD_NEIGHBOR not in (*CONTAINER_FILES, DRY_RUN_FILE)
+
+
+@pytest.mark.parametrize("copy", ["job", "aggregate"])
+def test_dry_run_selection_rejects_a_substring_deselect_token(copy: str) -> None:
+    expression = (
+        _python_job(DRY_RUN_JOB)["if"] if copy == "job" else
+        _named_steps()["Require pytest outcome to match selection"]["env"]["DRY_RUN_SELECTED"]
+    )
+    assert _selection_expression(expression, "true", "") is True
+    assert _selection_expression(expression, "true", DRY_RUN_FILE) is False
+    for near in (DRY_RUN_FILE + "::test_x", "prefix/" + DRY_RUN_FILE):
+        assert _selection_expression(expression, "true", near) is True
+    mutated = re.sub(
+        r"format\(\s*',\{0\},'\s*,\s*needs\.changes\.outputs\.pytest_deselect\s*\)",
+        "needs.changes.outputs.pytest_deselect",
+        expression,
+    )
+    mutated = mutated.replace(f"',{DRY_RUN_FILE},'", f"'{DRY_RUN_FILE}'")
+    assert mutated != expression
+    with pytest.raises(AssertionError):
+        assert _selection_expression(mutated, "true", DRY_RUN_FILE + "::test_x") is True
+
+
+@pytest.mark.parametrize(("event", "paths", "selected"), [
+    ("pull_request", (".github/workflows/ci.yaml",), True),
+    ("pull_request", ("docs/guides/getting-started.md",), False),
+    ("push", (), True),
+    ("workflow_dispatch", (), True),
+])
+def test_dry_run_caller_follows_pr_push_and_dispatch_selection(
+    tmp_path: Path, event: str, paths: tuple[str, ...], selected: bool
+) -> None:
+    completed, output = _invoke_selector(tmp_path, *paths, push=event != "pull_request")
+    assert completed.returncode == 0, completed.stderr
+    selection = _outputs(output)
+    for expression in (
+        _python_job(DRY_RUN_JOB)["if"],
+        _named_steps()["Require pytest outcome to match selection"]["env"]["DRY_RUN_SELECTED"],
+    ):
+        assert _selection_expression(
+            expression, selection["pytest"], selection["pytest_deselect"]
+        ) is selected
+
+
+@pytest.mark.parametrize("scope", ["full", "cli"])
+def test_aggregate_rejects_dry_run_skipped_while_selected_or_run_while_deselected(
+    tmp_path: Path, scope: str
+) -> None:
+    skipped = _run_pytest_aggregate(
+        tmp_path / "skipped",
+        ci_policy_selected="false",
+        ci_policy_result="skipped",
+        selected="true",
+        container_result="success",
+        dry_run_result="skipped",
+        scope=scope,
+        shards=_all_shards("true", "success", scope=scope),
+    )
+    assert skipped.returncode != 0, skipped.stdout + skipped.stderr
+    assert "dry run" in (skipped.stdout + skipped.stderr).lower()
+    ran = _run_pytest_aggregate(
+        tmp_path / "ran",
+        ci_policy_selected="false",
+        ci_policy_result="skipped",
+        selected="true",
+        container_result="success",
+        dry_run_result="success",
+        deselect=DRY_RUN_FILE,
+        scope=scope,
+        shards=_all_shards("true", "success", DRY_RUN_FILE, scope),
+    )
+    assert ran.returncode != 0, ran.stdout + ran.stderr
+    assert "dry run" in (ran.stdout + ran.stderr).lower()
+    healthy = _run_pytest_aggregate(
+        tmp_path / "healthy",
+        ci_policy_selected="false",
+        ci_policy_result="skipped",
+        selected="true",
+        container_result="success",
+        dry_run_result="skipped",
+        deselect=DRY_RUN_FILE,
+        scope=scope,
+        shards=_all_shards("true", "success", DRY_RUN_FILE, scope),
+    )
+    assert healthy.returncode == 0, healthy.stdout + healthy.stderr
+
+
+def _admitted_agent_runtime_owner(runtime: str) -> tuple[dict[str, Any], dict[str, Any]]:
+    jobs = yaml.safe_load(WORKFLOW.read_text())["jobs"]
+    owners = []
+    for job_id, job in jobs.items():
+        for step in job.get("steps", []):
+            script = _string(step, "run")
+            if runtime not in script:
+                continue
+            arguments = shlex.split(script)
+            if "pytest" not in arguments:
+                continue
+            for index, argument in enumerate(arguments):
+                if argument.split("::", 1)[0] != runtime:
+                    continue
+                if index and arguments[index - 1] in {"--ignore", "--deselect"}:
+                    continue
+                owners.append((job_id, step))
+    assert [job_id for job_id, _ in owners] == [ADMITTED_AGENT_JOB], owners
+    return jobs[ADMITTED_AGENT_JOB], owners[0][1]
+
+
+@pytest.mark.parametrize("runtime", ADMITTED_AGENT_RUNTIMES)
+def test_admitted_agent_runtime_has_one_required_provisioned_factory_owner(runtime: str) -> None:
+    job, step = _admitted_agent_runtime_owner(runtime)
+    # Deferred to the merge queue on an unlabeled pull request.
+    assert job["if"] == (
+        "${{ needs.changes.outputs.factory == 'true' && needs.changes.outputs.deep == 'true' }}"
+    )
+    assert "changes" in set(_needs(job))
+    assert not job.get("continue-on-error", False)
+    # Every leg must run to completion: one red leg cannot cancel the others,
+    # and the matrix result is failure unless every leg passed.
+    assert job["strategy"]["fail-fast"] is False
+    assert job["strategy"]["matrix"] == {"shard": ADMITTED_AGENT_SHARDS}
+    assert "if" not in step
+    assert not step.get("continue-on-error", False)
+    assert step["env"]["CASE_SHARD"] == (
+        "${{ matrix.shard }}/" + str(len(ADMITTED_AGENT_SHARDS))
+    )
+    assert ADMITTED_AGENT_JOB in _needs(_python_job("e2e-required"))
+    prior_steps = job["steps"][:job["steps"].index(step)]
+    uses = [prior.get("uses", "") for prior in prior_steps]
+    for action in ("astral-sh/setup-uv@", "azure/setup-helm@", "helm/kind-action@"):
+        assert any(value.startswith(action) for value in uses), action
+    assert any("/usr/share/dotnet" in prior.get("run", "") for prior in prior_steps)
+
+
+@pytest.mark.parametrize("exit_code", [0, 1, 5])
+def test_admitted_agent_factory_step_runs_whole_module_and_propagates_failure(
+    tmp_path: Path, exit_code: int
+) -> None:
+    _, step = _admitted_agent_runtime_owner(ADMITTED_AGENT_RUNTIME)
+    completed, arguments = _record_uv_step(
+        tmp_path, step, environment={"CASE_SHARD": "3/7"}, exit_code=exit_code
+    )
+    assert arguments[:2] == ["run", "pytest"]
+    for runtime in ADMITTED_AGENT_RUNTIMES:
+        assert arguments.count(runtime) == 1
+    assert arguments[arguments.index("--case-shard") + 1] == "3/7"
+    assert arguments[arguments.index("-n") + 1] == "0"
+    assert all(
+        argument in {
+            "run", "pytest", "-q", "-v", "-vv", "-n", "0", "--durations=0",
+            "--case-shard", "3/7", *ADMITTED_AGENT_RUNTIMES,
+        }
+        for argument in arguments
+    ), arguments
+    assert completed.returncode == exit_code, completed.stdout + completed.stderr
+
+
+def test_admitted_agent_shards_partition_the_module_in_collection_order(tmp_path: Path) -> None:
+    _, step = _admitted_agent_runtime_owner(ADMITTED_AGENT_RUNTIME)
+    completed, arguments = _record_uv_step(tmp_path, step, environment={"CASE_SHARD": "1/7"})
+    assert completed.returncode == 0, completed.stdout + completed.stderr
+    modules = [argument for argument in arguments if argument in ADMITTED_AGENT_RUNTIMES]
+    assert modules == list(ADMITTED_AGENT_RUNTIMES)
+
+    def collect(*extra: str) -> list[str]:
+        completed = subprocess.run(
+            [sys.executable, "-m", "pytest", "--collect-only", "-q", *modules,
+             *extra],
+            cwd=REPO_ROOT, capture_output=True, text=True, check=False,
+        )
+        assert completed.returncode == 0, completed.stdout + completed.stderr
+        return [line for line in completed.stdout.splitlines() if "::" in line]
+
+    whole = collect()
+    count = len(ADMITTED_AGENT_SHARDS)
+    shards = [collect("--case-shard", f"{index}/{count}") for index in ADMITTED_AGENT_SHARDS]
+    assert all(shards)
+    flattened = [case for shard in shards for case in shard]
+    assert len(flattened) == len(whole)
+    assert set(flattened) == set(whole)
+    assert all(shard == [case for case in whole if case in shard] for shard in shards)
+    prefix = (
+        f"{ADMITTED_AGENT_RUNTIME}::test_continuation_revalidates_current_authority["
+    )
+    continuations = [case for case in whole if case.startswith(prefix)]
+    assert len(continuations) == 6
+    relabel = f"{ADMITTED_AGENT_RUNTIME}::{RELABEL_REGRESSION}"
+    assert whole[whole.index(relabel) - 6 : whole.index(relabel)] == continuations
+    [owner] = [shard for shard in shards if relabel in shard]
+    position = owner.index(relabel)
+    assert position >= 6
+    assert owner[position - 6:position] == continuations
+
+
+@pytest.mark.parametrize("shard", range(1, SHARD_COUNT + 1))
+@pytest.mark.parametrize("scope", ["full", "cli"])
+@pytest.mark.parametrize("runtime", [*ADMITTED_AGENT_RUNTIMES, *CONTAINER_FILES, DRY_RUN_FILE])
+def test_dedicated_runtime_is_excluded_from_every_generic_shard(
+    tmp_path: Path, shard: int, scope: str, runtime: str
+) -> None:
+    neighbor = SHARD_NEIGHBOR
+    arguments = _run_pytest_step(
+        tmp_path,
+        shard=shard,
+        deselect="",
+        scope=scope,
+        cli_files=(runtime, neighbor),
+    )
+    without_exclusion = _without_runtime_exclusion(arguments, runtime)
+    if scope == "cli":
+        assert neighbor in without_exclusion
+        if runtime in (*CONTAINER_FILES, DRY_RUN_FILE):
+            assert runtime not in without_exclusion
+            without_exclusion.append(runtime)
+        else:
+            assert runtime in without_exclusion
+
+    for path in (runtime, neighbor):
+        destination = tmp_path / path
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        destination.write_text("def test_collection_probe():\n    pass\n")
+    (tmp_path / "examples/tests").mkdir(parents=True, exist_ok=True)
+    config = tmp_path / "pytest.ini"
+    config.write_text("[pytest]\ntestpaths = tools/factory-e2e/tests examples/tests\n")
+    expected_neighbor = f"{neighbor}::test_collection_probe"
+    expected_runtime = f"{runtime}::test_collection_probe"
+
+    def collected(argv: list[str]) -> set[str]:
+        # Retain every selection argument; omit only CI scheduling and retry
+        # options so the real pytest collector runs once without extra plugins.
+        selection = []
+        index = 2
+        while index < len(argv):
+            argument = argv[index]
+            if argument in {"-n", "--dist", "--ci-shard", "--ci-shard-tiers", "--reruns"}:
+                index += 2
+                continue
+            selection.append(argument)
+            index += 1
+        result = subprocess.run(
+            [
+                sys.executable, "-m", "pytest", "-c", str(config),
+                "--collect-only", *selection,
+            ],
+            cwd=tmp_path,
+            env={
+                **os.environ,
+                "PYTEST_DISABLE_PLUGIN_AUTOLOAD": "1",
+                "PYTEST_ADDOPTS": "",
+                "PYTEST_PLUGINS": "",
+            },
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        assert result.returncode == 0, result.stdout + result.stderr
+        return {
+            line.strip()
+            for line in result.stdout.splitlines()
+            if line.strip().endswith("::test_collection_probe")
+        }
+
+    assert collected(arguments) == {expected_neighbor}
+    assert collected(without_exclusion) == {expected_neighbor, expected_runtime}
+    if scope == "cli":
+        ignored = [*without_exclusion, "--ignore", runtime]
+        assert collected(ignored) == {expected_neighbor, expected_runtime}
+
+
+def _assert_owned_kind_modules_excluded(argv: list[str]) -> None:
+    separate = [index + 1 for index, argument in enumerate(argv) if argument == "--ignore"]
+    option_values = {
+        index + 1
+        for index, argument in enumerate(argv)
+        if argument in {"--ignore", "--deselect"}
+    }
+    ignored = [
+        argument.split("=", 1)[1] for argument in argv if argument.startswith("--ignore=")
+    ]
+    ignored += [argv[index] for index in separate]
+    deselected = [
+        argument.split("=", 1)[1] for argument in argv if argument.startswith("--deselect=")
+    ]
+    deselected += [
+        argv[index + 1] for index, argument in enumerate(argv) if argument == "--deselect"
+    ]
+    for module in ADMITTED_AGENT_RUNTIMES:
+        assert deselected.count(module) == 1, module
+    for module in (
+        "tools/factory-e2e/tests/test_c4_initial_binding.py",
+        "tools/factory-e2e/tests/test_c4_static_token_rotation.py",
+        "tools/factory-e2e/tests/test_c4_upgrade_migration.py",
+        "tools/factory-e2e/tests/test_c4_held_cancellation.py",
+        "tools/factory-e2e/tests/test_c4_cluster_up.py",
+        "tools/factory-e2e/tests/test_c4_forge_instances.py",
+        *CONTAINER_FILES,
+        DRY_RUN_FILE,
+    ):
+        assert ignored.count(module) == 1, module
+        assert all(
+            index in option_values for index, argument in enumerate(argv) if argument == module
+        ), f"{module} must not be selected as a positional pytest file"
+
+
+@pytest.mark.parametrize("shard", range(1, SHARD_COUNT + 1))
+@pytest.mark.parametrize("scope", ("full", "cli"))
+@pytest.mark.parametrize("deselect", ("", *CONTAINER_FILES, ",".join(CONTAINER_FILES)))
+def test_ordinary_python_shards_exclude_the_owned_kind_modules(
+    tmp_path: Path,
+    shard: int,
+    scope: str,
+    deselect: str,
+) -> None:
+    argv = _run_pytest_step(tmp_path, shard=shard, deselect=deselect, scope=scope)
+    _assert_owned_kind_modules_excluded(argv)
+    assert argv[argv.index("--ci-shard") + 1] == f"{shard}/{SHARD_COUNT}"
+
+
+@pytest.mark.parametrize("scope", ("full", "cli"))
+@pytest.mark.parametrize("module", CONTAINER_FILES)
+def test_owned_kind_module_guard_rejects_positional_files(
+    tmp_path: Path, scope: str, module: str
+) -> None:
+    argv = _run_pytest_step(tmp_path, shard=1, deselect=module, scope=scope)
+    _assert_owned_kind_modules_excluded(argv)
+    with pytest.raises(AssertionError, match="must not be selected as a positional pytest file"):
+        _assert_owned_kind_modules_excluded([*argv, module])
+
+
+def _record_shard(tmp_path: Path, shard: int, record: ShardRecord) -> None:
     """Run the shard job's real record step, as the shard would."""
     step = _named_steps("python-pytest")["Record shard result"]
     assert _string(step, "if") == "always()"
     bindings = _bindings(step, SHARD_RECORD_EXPRESSIONS)
+    assert len(record) == 8, record
+    selected, outcome, stack, deselect, scope, shards, tier, targets = record
     state = {
         "shard": str(shard),
         "pytest_selected": selected,
         "pytest_result": outcome,
         "stack_result": stack,
+        "pytest_deselect": deselect,
+        "pytest_scope": scope,
+        "pytest_shards": shards,
+        "stack_tier": tier,
+        "pytest_targets": targets,
     }
     workdir = tmp_path / f"shard-{shard}"
     workdir.mkdir()
     result = _run_bash(_string(step, "run"), {bindings[k]: v for k, v in state.items()}, workdir)
     assert result.returncode == 0, result.stderr
     upload = _named_steps("python-pytest")["Upload shard result"]
+    assert _string(upload, "if") == "always()"
     source = workdir / upload["with"]["path"]
     download = _named_steps()["Download shard results"]
     target = tmp_path / download["with"]["path"]
@@ -372,41 +1548,938 @@ def _run_pytest_aggregate(
     tmp_path: Path,
     *,
     selected: str,
-    shards: dict[int, tuple[str, str, str]] | None = None,
+    container_result: str,
+    ci_policy_selected: str,
+    ci_policy_result: str,
+    dry_run_result: str | None = None,
+    shards: dict[int, ShardRecord] | None = None,
     shards_result: str = "success",
+    results_dir: bool = True,
+    changes_result: str = "success",
+    deselect: str = "",
+    scope: str = "full",
+    plan: tuple[object, object, object] = FULL_PLAN,
+    targets: str = "",
 ) -> subprocess.CompletedProcess[str]:
     """Record each shard, then run the required job's real aggregate step.
 
-    ``shards`` maps a shard index to (selected, pytest, stack) as that shard
-    saw them; an index left out never reported.
+    ``shards`` maps a shard index to (selected, pytest, stack, deselect, scope,
+    shards, tier, targets) as that shard saw them; an index left out never
+    reported. ``results_dir=False`` leaves the download directory absent, as it
+    is when the download step is skipped (#3858). Selection inputs, including
+    the shard ``plan`` (shards, storage shards, full shards) and the
+    ``targets`` digest, come only from ``changes``. Container selection is
+    evaluated from the real aggregate expression, independently of its result.
     """
     step = _named_steps()["Require pytest outcome to match selection"]
     assert _string(step, "if") == "success()"
     assert step["env"]["SHARD_COUNT"] == str(SHARD_COUNT)
     download = _named_steps()["Download shard results"]
     assert step["env"]["SHARD_RESULTS_DIR"] == download["with"]["path"]
-    (tmp_path / download["with"]["path"]).mkdir(parents=True)
-    for shard, (shard_selected, outcome, stack) in (shards or {}).items():
-        _record_shard(tmp_path, shard, shard_selected, outcome, stack)
+    tmp_path.mkdir(parents=True, exist_ok=True)
+    if results_dir or shards:
+        (tmp_path / download["with"]["path"]).mkdir(parents=True, exist_ok=True)
+    for shard, record in (shards or {}).items():
+        _record_shard(tmp_path, shard, record)
     bindings = _bindings(step, PYTEST_AGGREGATE_EXPRESSIONS)
-    state = {"pytest_selected": selected, "shards_result": shards_result}
+    assert bindings == {name: name.upper() for name in PYTEST_AGGREGATE_EXPRESSIONS}
+    assert not any(name.startswith("CHANGES_") and name != "CHANGES_RESULT" for name in step["env"])
+    state = {
+        "pytest_selected": selected,
+        "shards_result": shards_result,
+        "changes_result": changes_result,
+        "pytest_deselect": deselect,
+        "pytest_scope": scope,
+        "pytest_targets": targets,
+        "pytest_shards": str(plan[0]),
+        "pytest_storage_shards": str(plan[1]),
+        "pytest_full_shards": str(plan[2]),
+        "container_result": container_result,
+        "ci_policy_selected": ci_policy_selected,
+        "ci_policy_result": ci_policy_result,
+        "dry_run_result": "placeholder",
+    }
     literals = {k: v for k, v in step["env"].items() if "${{" not in v}
     environment = literals | {bindings[k]: v for k, v in state.items()}
+    environment["CONTAINER_SELECTED"] = str(
+        _selection_expression(step["env"]["CONTAINER_SELECTED"], selected, deselect)
+    ).lower()
+    dry_run_selected = _selection_expression(
+        step["env"]["DRY_RUN_SELECTED"], selected, deselect
+    )
+    environment["DRY_RUN_SELECTED"] = str(dry_run_selected).lower()
+    environment["DRY_RUN_RESULT"] = (
+        ("success" if dry_run_selected else "skipped")
+        if dry_run_result is None
+        else dry_run_result
+    )
     return _run_bash(_string(step, "run"), environment, tmp_path)
 
 
-def _all_shards(selected: str, outcome: str) -> dict[int, tuple[str, str, str]]:
-    return {shard: (selected, outcome, outcome) for shard in range(1, SHARD_COUNT + 1)}
+def _all_shards(
+    selected: str,
+    outcome: str,
+    deselect: str = "",
+    scope: str = "full",
+    *,
+    plan: tuple[int, int, int] = FULL_PLAN,
+    targets: str = "",
+) -> dict[int, ShardRecord]:
+    """Every matrix shard's record under ``plan``.
+
+    Active shards report ``outcome`` for pytest and the stack and the tier the
+    plan gives them; shards past the plan's count skipped both and report tier
+    none.
+    """
+    records: dict[int, ShardRecord] = {}
+    for shard in range(1, SHARD_COUNT + 1):
+        tier = _expected_tier(shard, plan)
+        result = "skipped" if tier == "none" else outcome
+        records[shard] = (
+            selected, result, result, deselect, scope, str(plan[0]), tier, targets,
+        )
+    return records
 
 
-def test_pytest_aggregator_accepts_docs_only_skips(tmp_path: Path) -> None:
-    completed, output = _invoke_selector(tmp_path, "docs/guides/getting-started.md")
+def test_ci_policy_job_runs_after_changes_without_services() -> None:
+    job = _python_job("ci-policy")
+    assert job["name"] == "CI policy (workflow meta-tests)"
+    assert job["needs"] == ["changes"]
+    assert job["if"] == "${{ needs.changes.outputs.ci_policy == 'true' }}"
+    assert "services" not in job
+    assert not job.get("continue-on-error", False)
+    steps = job["steps"]
+    assert len(steps) == 6
+    assert steps[0]["uses"] == "actions/checkout@v7"
+    assert steps[0]["with"] == {"fetch-depth": 0, "persist-credentials": False}
+    assert [step["name"] for step in steps[1:]] == [
+        "Install uv", "Back off before retrying Install uv", "Install uv (retry)",
+        "Sync workspace", "Pytest",
+    ]
+    install, backoff, retry, sync, tests = steps[1:]
+    uv_action = "astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e"
+    assert install["uses"] == retry["uses"] == uv_action
+    assert install["with"] == retry["with"] == {"python-version": "3.13"}
+    assert install["id"] == "install_uv"
+    assert install["continue-on-error"] is True
+    assert backoff["if"] == retry["if"] == "steps.install_uv.outcome == 'failure'"
+    assert "sleep 15" in backoff["run"]
+    assert sync["run"] == "uv sync"
+    assert not sync.get("continue-on-error", False)
+    assert not tests.get("continue-on-error", False)
+    assert "if" not in tests
+    assert _bindings(tests, {"files": "${{ needs.changes.outputs.ci_policy_files }}"})
+    assert "${{" not in tests["run"]
+    outputs = _python_job("changes")["outputs"]
+    for key in ("ci_policy", "ci_policy_files"):
+        assert outputs[key] == "${{ steps.filter.outputs." + key + " }}"
+
+
+@pytest.mark.parametrize("exit_code", [0, 1, 5])
+def test_ci_policy_pytest_passes_exact_files_and_propagates_failure(
+    tmp_path: Path, exit_code: int
+) -> None:
+    files = (
+        "tools/ci-retry-gate/tests/test_retry_eligibility.py",
+        "tools/e2e-ci-selection/tests/test_e2e_ci_selection.py",
+    )
+    for path in files:
+        destination = tmp_path / path
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        destination.write_text("def test_policy_probe():\n    pass\n")
+    step = _named_steps("ci-policy")["Pytest"]
+    bindings = _bindings(step, {"files": "${{ needs.changes.outputs.ci_policy_files }}"})
+    result, arguments = _record_uv_step(
+        tmp_path, step, environment={bindings["files"]: ",".join(files)}, exit_code=exit_code
+    )
+    assert arguments == ["run", "pytest", "-q", "-n", "4", "-rsR", *files]
+    assert result.returncode == exit_code, result.stdout + result.stderr
+
+
+@pytest.mark.parametrize("files", [
+    "", ",", ",tools/sample/tests/test_policy.py", "tools/sample/tests/test_policy.py,",
+    "tools/sample/tests/test_policy.py,,tools/sample/tests/test_policy.py",
+    "tools/sample/tests/test_policy.py tools/sample/tests/test_policy.py",
+    "tools/sample/tests/test_policy.py\n", "--help", "/tmp/test_policy.py",
+    "../test_policy.py", "tools/sample/tests/../tests/test_policy.py",
+    "tools/sample/tests/test_*.py", "tools/sample/tests/missing.py", "tools/sample/tests",
+])
+def test_ci_policy_pytest_rejects_bad_file_lists_before_uv(tmp_path: Path, files: str) -> None:
+    destination = tmp_path / "tools/sample/tests/test_policy.py"
+    destination.parent.mkdir(parents=True)
+    destination.write_text("def test_policy_probe():\n    pass\n")
+    step = _named_steps("ci-policy")["Pytest"]
+    bindings = _bindings(step, {"files": "${{ needs.changes.outputs.ci_policy_files }}"})
+    bin_dir, log = _recording_stubs(tmp_path, "uv")
+    result = _run_bash(
+        _string(step, "run"),
+        {"PATH": f"{bin_dir}:{os.environ['PATH']}", bindings["files"]: files},
+        tmp_path,
+    )
+    assert result.returncode != 0, result.stdout + result.stderr
+    assert not log.exists(), "invalid policy files reached pytest"
+
+
+@pytest.mark.parametrize("event", ["push", "workflow_dispatch"])
+def test_ci_policy_changes_routes_push_and_dispatch_through_push(
+    tmp_path: Path, event: str,
+) -> None:
+    step = next(step for step in _python_job("changes")["steps"] if step.get("id") == "filter")
+    script = _substitute_expressions(step["run"], {
+        "${{ github.event_name }}": event,
+        "${{ github.ref }}": "refs/heads/next",
+        "${{ github.base_ref }}": "",
+        "${{ github.event.merge_group.base_sha }}": "",
+        "${{ github.event.merge_group.head_sha }}": "",
+    })
+    bin_dir, log = _recording_stubs(tmp_path, "uv", "git")
+    result = _run_bash(script, {"PATH": f"{bin_dir}:{os.environ['PATH']}"}, tmp_path)
+    assert result.returncode == 0, result.stdout + result.stderr
+    calls = log.read_text().splitlines()
+    assert len(calls) == 1, calls
+    command = shlex.split(calls[0])
+    assert command[:7] == [
+        "uv", "run", "--no-project", "--with", "pyyaml==6.0.3", "python",
+        "tools/e2e-ci-selection/select_tiers.py",
+    ]
+    assert "--push" in command
+    assert ("--omit-kind" in command) == (event == "push")
+    completed, output = _invoke_selector(tmp_path, push=True)
     assert completed.returncode == 0, completed.stderr
-    selected = _outputs(output)["pytest"]
+    entries = yaml.safe_load(REGISTRY.read_text())["ci_policy_tests"]
+    assert _outputs(output)["ci_policy"] == "true"
+    assert _outputs(output)["ci_policy_files"] == ",".join(sorted(entries))
+
+
+@pytest.mark.parametrize("shard", range(1, SHARD_COUNT + 1))
+@pytest.mark.parametrize("scope", ["full", "cli"])
+def test_ci_policy_exclusions_collect_only_neighbors_on_every_shard(
+    tmp_path: Path, shard: int, scope: str
+) -> None:
+    entries = yaml.safe_load(REGISTRY.read_text())["ci_policy_tests"]
+    neighbors = ("tools/ci-retry-gate-other/tests/test_neighbor.py",)
+    for path in (*entries, *neighbors):
+        destination = tmp_path / path
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        destination.write_text("def test_policy_collection_probe():\n    pass\n")
+    arguments = _run_pytest_step(
+        tmp_path, shard=shard, scope=scope, deselect="",
+        cli_files=(*sorted(entries), *neighbors),
+    )
+    for directory in CI_POLICY_DIRS:
+        for option, value in (
+            ("--ignore", directory), ("--ignore-glob", f"{directory}/tests/*"),
+        ):
+            assert arguments.count(value) == 1, arguments
+            assert arguments[arguments.index(value) - 1] == option, arguments
+    if scope == "cli":
+        assert not set(entries).intersection(arguments), arguments
+        assert all(path in arguments for path in neighbors)
+    config = tmp_path / "pytest.ini"
+    roots = [f"{directory}/tests" for directory in CI_POLICY_DIRS]
+    roots += [str(Path(path).parent) for path in neighbors]
+    config.write_text(
+        "[pytest]\ntestpaths =\n" + "".join(f"    {root}\n" for root in roots)
+        + "addopts = --import-mode=importlib\n"
+    )
+
+    def collected(argv: list[str]) -> set[str]:
+        selection = []
+        index = 2
+        while index < len(argv):
+            if argv[index] in {"-n", "--dist", "--ci-shard", "--ci-shard-tiers", "--reruns"}:
+                index += 2
+                continue
+            selection.append(argv[index])
+            index += 1
+        result = subprocess.run(
+            [sys.executable, "-m", "pytest", "-c", str(config), "--collect-only", *selection],
+            cwd=tmp_path,
+            env={
+                **os.environ, "PYTEST_DISABLE_PLUGIN_AUTOLOAD": "1",
+                "PYTEST_ADDOPTS": "", "PYTEST_PLUGINS": "",
+            },
+            capture_output=True, text=True, check=False,
+        )
+        assert result.returncode == 0, result.stdout + result.stderr
+        return {
+            line.strip() for line in result.stdout.splitlines()
+            if line.strip().endswith("::test_policy_collection_probe")
+        }
+
+    expected = {path + "::test_policy_collection_probe" for path in neighbors}
+    assert collected(arguments) == expected
+    directory = "tools/e2e-ci-selection"
+    targets = sorted(path for path in entries if path.startswith(directory + "/"))
+    assert targets
+    if scope == "full":
+        mutated = _without_runtime_exclusion(arguments, f"{directory}/tests/*")
+        exposed = targets
+    else:
+        exposed = targets[:1]
+        mutated = [*arguments, *exposed]
+    assert collected(mutated) == expected | {
+        path + "::test_policy_collection_probe" for path in exposed
+    }
+
+
+@pytest.mark.parametrize("selected", ["true", "false"])
+@pytest.mark.parametrize("policy_selected", ["true", "false", "", "TRUE", "unknown"])
+@pytest.mark.parametrize("policy_result", ["success", "skipped", "failure", "cancelled", ""])
+def test_ci_policy_aggregate_accepts_only_the_selected_policy_outcome(
+    tmp_path: Path, selected: str, policy_selected: str, policy_result: str
+) -> None:
     result = _run_pytest_aggregate(
-        tmp_path / "run", selected=selected, shards=_all_shards(selected, "skipped")
+        tmp_path, ci_policy_selected=policy_selected, ci_policy_result=policy_result,
+        selected=selected, container_result="success" if selected == "true" else "skipped",
+        shards=_all_shards("true", "success") if selected == "true" else None,
+        shards_result="success" if selected == "true" else "skipped",
+        results_dir=selected == "true",
+    )
+    accepted = (policy_selected, policy_result) in {("true", "success"), ("false", "skipped")}
+    assert (result.returncode == 0) == accepted, result.stdout + result.stderr
+    if not accepted:
+        assert "policy" in (result.stdout + result.stderr).lower()
+
+
+def _assert_policy_failure_rejected(tmp_path: Path, selected: str) -> None:
+    result = _run_pytest_aggregate(
+        tmp_path,
+        ci_policy_selected="true",
+        ci_policy_result="failure",
+        selected=selected,
+        container_result="success" if selected == "true" else "skipped",
+        shards=_all_shards("true", "success") if selected == "true" else None,
+        shards_result="success" if selected == "true" else "skipped",
+        results_dir=selected == "true",
+    )
+    assert result.returncode != 0, "required Python check accepted failed CI policy"
+
+
+@pytest.mark.parametrize("selected", ["true", "false"])
+def test_ci_policy_aggregate_mutation_exposes_bypassed_result_check(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, selected: str
+) -> None:
+    _assert_policy_failure_rejected(tmp_path / "enforced", selected)
+    named_steps = _named_steps
+
+    def bypassed(job_id: str = "python") -> dict[str, dict[str, Any]]:
+        steps = named_steps(job_id)
+        if job_id == "python":
+            step = steps["Require pytest outcome to match selection"]
+            step["run"] = "CI_POLICY_RESULT=success\n" + step["run"]
+        return steps
+
+    monkeypatch.setattr(sys.modules[__name__], "_named_steps", bypassed)
+    with pytest.raises(AssertionError, match="accepted failed CI policy"):
+        _assert_policy_failure_rejected(tmp_path / "bypassed", selected)
+
+
+@pytest.mark.parametrize("scope", ["full", "cli"])
+@pytest.mark.parametrize(("selected", "deselect", "container_selected"), [
+    ("true", "", True),
+    ("true", CONTAINER_FILES[0], True),
+    ("true", CONTAINER_FILES[1], True),
+    ("true", ",".join(CONTAINER_FILES), True),
+    ("false", "", False),
+])
+@pytest.mark.parametrize("container_result", ["success", "skipped", "failure", "cancelled", ""])
+def test_aggregate_requires_the_selected_container_outcome_before_any_skip_exit(
+    tmp_path: Path, scope: str, selected: str, deselect: str,
+    container_selected: bool, container_result: str,
+) -> None:
+    result = _run_pytest_aggregate(
+        tmp_path, ci_policy_selected="false", ci_policy_result="skipped",
+        selected=selected,
+        container_result=container_result,
+        deselect=deselect,
+        scope=scope,
+        shards=_all_shards("true", "success", deselect, scope) if selected == "true" else None,
+        shards_result="success" if selected == "true" else "skipped",
+        results_dir=selected == "true",
+    )
+    expected = "success" if container_selected else "skipped"
+    assert (result.returncode == 0) == (container_result == expected), result.stdout + result.stderr
+    if container_result != expected:
+        assert "container" in (result.stdout + result.stderr).lower()
+
+
+@pytest.mark.parametrize("selected", ["", "TRUE", "unknown"])
+def test_aggregate_rejects_invalid_changes_selection(tmp_path: Path, selected: str) -> None:
+    result = _run_pytest_aggregate(
+        tmp_path,
+        ci_policy_selected="false",
+        ci_policy_result="skipped",
+        selected=selected,
+        container_result="skipped",
+        shards_result="skipped",
+        results_dir=False,
+    )
+    assert result.returncode != 0, result.stdout + result.stderr
+
+
+@pytest.mark.parametrize("selected", ["true", "false"])
+@pytest.mark.parametrize("scope", ["", "unknown", "IMPACT"])
+def test_aggregate_rejects_invalid_changes_scope(
+    tmp_path: Path, selected: str, scope: str
+) -> None:
+    result = _run_pytest_aggregate(
+        tmp_path, ci_policy_selected="false", ci_policy_result="skipped", selected=selected,
+        container_result="success" if selected == "true" else "skipped",
+        scope=scope,
+        shards=_all_shards("true", "success", scope=scope) if selected == "true" else None,
+        shards_result="success" if selected == "true" else "skipped",
+    )
+    assert result.returncode != 0, result.stdout + result.stderr
+    assert "scope" in (result.stdout + result.stderr).lower()
+
+
+@pytest.mark.parametrize("field", ["pytest", "stack"])
+@pytest.mark.parametrize("outcome", ["failure", "cancelled", "skipped", ""])
+def test_aggregate_rejects_unsuccessful_record_even_when_matrix_succeeded(
+    tmp_path: Path, field: str, outcome: str
+) -> None:
+    shards = _all_shards("true", "success")
+    shards[6] = (
+        "true", outcome if field == "pytest" else "success",
+        outcome if field == "stack" else "success", "", "full", "6", "full", "",
+    )
+    result = _run_pytest_aggregate(
+        tmp_path,
+        ci_policy_selected="false",
+        ci_policy_result="skipped",
+        selected="true",
+        container_result="success",
+        shards=shards,
+    )
+    assert result.returncode != 0, result.stdout + result.stderr
+    assert "shard 6" in result.stderr
+
+
+def test_aggregate_rejects_record_with_the_wrong_shard_identity(tmp_path: Path) -> None:
+    healthy = _run_pytest_aggregate(
+        tmp_path,
+        ci_policy_selected="false",
+        ci_policy_result="skipped",
+        selected="true",
+        container_result="success",
+        shards=_all_shards("true", "success"),
+    )
+    assert healthy.returncode == 0, healthy.stdout + healthy.stderr
+    directory = _named_steps()["Download shard results"]["with"]["path"]
+    record = tmp_path / directory / "shard-6.txt"
+    record.write_text(record.read_text().replace("shard=6 ", "shard=5 "))
+    result = _run_pytest_aggregate(
+        tmp_path,
+        ci_policy_selected="false",
+        ci_policy_result="skipped",
+        selected="true",
+        container_result="success",
+    )
+    assert result.returncode != 0, result.stdout + result.stderr
+    assert "shard 6" in result.stderr
+
+
+def test_aggregate_rejects_mutated_selected_container_skip(tmp_path: Path) -> None:
+    healthy = _run_pytest_aggregate(
+        tmp_path,
+        ci_policy_selected="false",
+        ci_policy_result="skipped",
+        selected="true",
+        container_result="success",
+        shards=_all_shards("true", "success"),
+    )
+    assert healthy.returncode == 0, healthy.stdout + healthy.stderr
+    skipped = _run_pytest_aggregate(
+        tmp_path,
+        ci_policy_selected="false",
+        ci_policy_result="skipped",
+        selected="true",
+        container_result="skipped",
+    )
+    assert skipped.returncode != 0, skipped.stdout + skipped.stderr
+    assert "container" in (skipped.stdout + skipped.stderr).lower()
+    restored = _run_pytest_aggregate(
+        tmp_path,
+        ci_policy_selected="false",
+        ci_policy_result="skipped",
+        selected="true",
+        container_result="success",
+    )
+    assert restored.returncode == 0, restored.stdout + restored.stderr
+
+
+def test_pytest_aggregator_accepts_matching_deselect(tmp_path: Path) -> None:
+    deselect = "examples/tests/test_sre_bot_observability_runtime.py"
+    result = _run_pytest_aggregate(
+        tmp_path, ci_policy_selected="false", ci_policy_result="skipped",
+        container_result="success",
+        selected="true",
+        deselect=deselect,
+        shards=_all_shards("true", "success", deselect),
     )
     assert result.returncode == 0, result.stdout + result.stderr
+
+
+@pytest.mark.parametrize("shard", range(1, SHARD_COUNT + 1))
+def test_pytest_aggregator_rejects_independent_shard_deselect_disagreement(
+    tmp_path: Path, shard: int
+) -> None:
+    deselect = "examples/tests/test_sre_bot_observability_runtime.py"
+    shards = _all_shards("true", "success")
+    shards[shard] = ("true", "success", "success", deselect, "full", "6", "full", "")
+    result = _run_pytest_aggregate(
+        tmp_path, ci_policy_selected="false", ci_policy_result="skipped",
+        container_result="success",
+        selected="true",
+        shards=shards,
+    )
+    assert result.returncode == 1, result.stdout + result.stderr
+    assert f"shard {shard}" in result.stderr
+
+
+def test_pytest_aggregator_rejects_shard_deselect_disagreement(tmp_path: Path) -> None:
+    deselect = "examples/tests/test_sre_bot_observability_runtime.py"
+    shards = _all_shards("true", "success", deselect)
+    shards[2] = ("true", "success", "success", "", "full", "6", "full", "")
+    result = _run_pytest_aggregate(
+        tmp_path,
+        ci_policy_selected="false",
+        ci_policy_result="skipped",
+        container_result="success",
+        selected="true",
+        deselect=deselect,
+        shards=shards,
+    )
+    assert result.returncode == 1, result.stdout + result.stderr
+    assert "shard 2" in result.stderr
+
+
+@pytest.mark.parametrize("results_dir", [True, False])
+def test_pytest_aggregator_accepts_unselected_skips(tmp_path: Path, results_dir: bool) -> None:
+    """#3858: an unselected run skips the shard job, so no shard reports.
+
+    A version-only diff is the pull request that leaves pytest unselected;
+    documentation still runs its impact readers.
+    """
+    cargo = tomllib.loads((REPO_ROOT / "cli" / "Cargo.toml").read_text())
+    version = f"v{cargo['package']['version']}"
+    completed, output = _invoke_selector(
+        tmp_path,
+        "charts/curie/Chart.yaml",
+        "cli/Cargo.toml",
+        "cli/Cargo.lock",
+        "docs/architecture-atlas/versions.json",
+        f"docs/architecture-atlas/snapshots/{version}.json",
+    )
+    assert completed.returncode == 0, completed.stderr
+    selected = _outputs(output)["pytest"]
+    assert selected == "false"
+    result = _run_pytest_aggregate(
+        tmp_path / "run", ci_policy_selected="false", ci_policy_result="skipped",
+        container_result="skipped",
+        selected=selected,
+        shards_result="skipped",
+        results_dir=results_dir,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+def test_pytest_aggregator_accepts_a_version_only_release_prep(tmp_path: Path) -> None:
+    """#3858: the five #3845 paths skip pytest and the required check passes."""
+    cargo = tomllib.loads((REPO_ROOT / "cli" / "Cargo.toml").read_text())
+    version = f"v{cargo['package']['version']}"
+    completed, output = _invoke_selector(
+        tmp_path,
+        "charts/curie/Chart.yaml",
+        "cli/Cargo.toml",
+        "cli/Cargo.lock",
+        "docs/architecture-atlas/versions.json",
+        f"docs/architecture-atlas/snapshots/{version}.json",
+    )
+    assert completed.returncode == 0, completed.stderr
+    outputs = _outputs(output)
+    assert outputs["version_only"] == "true"
+    assert outputs["pytest"] == "false"
+    assert not _selection_expression(
+        _python_job(CONTAINER_JOB)["if"], outputs["pytest"], outputs["pytest_deselect"]
+    )
+    result = _run_pytest_aggregate(
+        tmp_path / "run",
+        ci_policy_selected="false",
+        ci_policy_result="skipped",
+        container_result="skipped",
+        selected=outputs["pytest"],
+        shards_result="skipped",
+        results_dir=False,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+def test_pytest_aggregator_rejects_unselected_shards_that_succeeded(tmp_path: Path) -> None:
+    """#3858: an unselected run must not show the shard job as having run."""
+    result = _run_pytest_aggregate(
+        tmp_path,
+        ci_policy_selected="false",
+        ci_policy_result="skipped",
+        container_result="skipped",
+        selected="false",
+        shards_result="success",
+    )
+    assert result.returncode != 0
+
+
+def test_pytest_aggregator_rejects_an_unselected_skip_with_a_stray_record(
+    tmp_path: Path,
+) -> None:
+    """#3858: a shard record on an unselected run means the selections disagree."""
+    result = _run_pytest_aggregate(
+        tmp_path, ci_policy_selected="false", ci_policy_result="skipped",
+        container_result="skipped",
+        selected="false",
+        shards={1: ("false", "skipped", "skipped", "", "full", "6", "none", "")},
+        shards_result="skipped",
+    )
+    assert result.returncode != 0
+
+
+@pytest.mark.parametrize("changes_result", ["failure", "cancelled", "skipped"])
+def test_pytest_aggregator_rejects_a_changes_job_that_did_not_succeed(
+    tmp_path: Path, changes_result: str
+) -> None:
+    """#3858: a failed `changes` job skips the shards; that skip must not go green."""
+    result = _run_pytest_aggregate(
+        tmp_path, ci_policy_selected="false", ci_policy_result="skipped",
+        container_result="skipped",
+        selected="false",
+        shards_result="skipped",
+        results_dir=False,
+        changes_result=changes_result,
+    )
+    assert result.returncode != 0
+
+
+def test_pytest_aggregator_rejects_selected_changes_with_unselected_records(
+    tmp_path: Path,
+) -> None:
+    """A shard cannot skip tests selected by changes."""
+    result = _run_pytest_aggregate(
+        tmp_path, ci_policy_selected="false", ci_policy_result="skipped",
+        container_result="success",
+        selected="true",
+        shards=_all_shards("false", "skipped"),
+        shards_result="success",
+    )
+    assert result.returncode != 0
+
+
+def test_pytest_aggregator_rejects_unselected_changes_with_selected_records(
+    tmp_path: Path,
+) -> None:
+    """Successful shard records cannot override a skip selected by changes."""
+    result = _run_pytest_aggregate(
+        tmp_path, ci_policy_selected="false", ci_policy_result="skipped",
+        container_result="skipped",
+        selected="false",
+        shards=_all_shards("true", "success"),
+        shards_result="skipped",
+    )
+    assert result.returncode != 0
+
+
+def test_pytest_aggregator_accepts_unselected_when_changes_agrees(tmp_path: Path) -> None:
+    """#3858 liveness: a healthy docs-only run still goes green."""
+    result = _run_pytest_aggregate(
+        tmp_path, ci_policy_selected="false", ci_policy_result="skipped",
+        container_result="skipped",
+        selected="false",
+        shards_result="skipped",
+        results_dir=False,
+        changes_result="success",
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+def test_pytest_aggregator_rejects_selected_with_shards_skipped(tmp_path: Path) -> None:
+    """#3858: a selected run whose shard job was skipped never ran pytest."""
+    result = _run_pytest_aggregate(
+        tmp_path,
+        ci_policy_selected="false",
+        ci_policy_result="skipped",
+        container_result="success",
+        selected="true",
+        shards_result="skipped",
+        results_dir=False,
+    )
+    assert result.returncode != 0
+
+
+def test_shard_download_runs_only_when_pytest_was_selected() -> None:
+    """#3858: an unselected run has no shard artifacts to download."""
+    download = _named_steps()["Download shard results"]
+    assert _string(download, "if") == "needs.changes.outputs.pytest == 'true'"
+
+
+def test_release_tests_run_in_the_static_job_when_pytest_is_skipped() -> None:
+    """#3858: a version-only diff still runs the release tests on the new commit.
+
+    The shards cover release/tests whenever pytest is selected, so the step
+    runs only on the skip path. #4471: it lives in the static job, so it reads
+    the selection from `changes` rather than from a step in the same job.
+    """
+    step = _named_steps(STATIC_JOB)["Release tests"]
+    assert _string(step, "if") == "needs.changes.outputs.pytest == 'false'"
+    assert _string(step, "run").strip() == "uv run pytest -q release/tests"
+    assert "Release tests" not in _named_steps()
+
+
+def test_static_gate_requirement_step_sits_before_the_shard_download() -> None:
+    """#4471: the python job's step order puts the static check first."""
+    names = [
+        step["name"]
+        for step in _python_job()["steps"]
+        if isinstance(step, dict) and isinstance(step.get("name"), str)
+    ]
+    assert names.index(STATIC_REQUIREMENT_STEP) + 1 == names.index("Download shard results")
+
+
+@pytest.mark.parametrize("static_result", ["success", "failure", "skipped", "cancelled"])
+def test_required_job_passes_only_when_the_static_job_succeeded(
+    tmp_path: Path, static_result: str
+) -> None:
+    """#4471: run the real step; only a success result lets the required job pass."""
+    step = _named_steps()[STATIC_REQUIREMENT_STEP]
+    # The default success() condition is what makes this step fail the job, so it
+    # must not be gated or made non-fatal.
+    assert "if" not in step
+    assert "continue-on-error" not in step
+    bindings = _bindings(step, {"static_result": "${{ needs.python-static.result }}"})
+    assert bindings == {"static_result": "STATIC_RESULT"}
+    result = _run_bash(_string(step, "run"), {"STATIC_RESULT": static_result}, tmp_path)
+    if static_result == "success":
+        assert result.returncode == 0, result.stdout + result.stderr
+    else:
+        assert result.returncode != 0
+        assert static_result in result.stdout + result.stderr
+
+
+def test_changes_job_exports_pytest_and_version_only() -> None:
+    """#3858: downstream jobs read the selection from `changes`."""
+    outputs = _python_job("changes")["outputs"]
+    assert outputs["pytest"] == "${{ steps.filter.outputs.pytest }}"
+    assert outputs["version_only"] == "${{ steps.filter.outputs.version_only }}"
+
+
+def _substitute_expressions(script: str, values: dict[str, str]) -> str:
+    for expression, value in values.items():
+        script = script.replace(expression, value)
+    assert "${{" not in script, script
+    return script
+
+
+def _recording_stubs(tmp_path: Path, *names: str) -> tuple[Path, Path]:
+    """Put stub executables first on PATH; each appends its argv to a log."""
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    log = tmp_path / "calls.log"
+    for name in names:
+        stub = bin_dir / name
+        stub.write_text(f'#!/usr/bin/env bash\necho "{name} $*" >> "{log}"\n')
+        stub.chmod(0o755)
+    return bin_dir, log
+
+
+def _selector_outputs(
+    *,
+    scope: str = "full",
+    plan: tuple[int, int, int] = FULL_PLAN,
+    targets: str = "",
+    deselect: str = "",
+) -> dict[str, str]:
+    """The pytest outputs select_tiers.py writes when it selects pytest."""
+    return {
+        "pytest": "true",
+        "pytest_deselect": deselect,
+        "pytest_scope": scope,
+        "pytest_targets": targets,
+        "pytest_shards": str(plan[0]),
+        "pytest_storage_shards": str(plan[1]),
+        "pytest_full_shards": str(plan[2]),
+    }
+
+
+def _decide(
+    tmp_path: Path,
+    event: str,
+    *,
+    shard: int = 1,
+    selector: dict[str, str] | None = None,
+    targets: tuple[str, ...] = (),
+    real_selector: bool = False,
+) -> tuple[list[str], dict[str, str]]:
+    """Run the real decision step for one matrix shard.
+
+    The uv stub stands in for select_tiers.py: it appends ``selector`` to
+    GITHUB_OUTPUT and writes ``targets`` to the file named by
+    ``--pytest-targets-out``. With ``real_selector`` it runs the real selector
+    from the repository instead. Returns the uv and git calls and every output
+    the step wrote (a later line for a name wins, as in GitHub).
+    """
+    tmp_path.mkdir(parents=True, exist_ok=True)
+    step = _named_steps("python-pytest")[DECISION_STEP]
+    expressions = {
+        "${{ github.event_name }}": event,
+        "${{ github.base_ref || 'main' }}": "main",
+        "${{ github.base_ref }}": "main",
+        "${{ github.event.merge_group.base_sha }}": "a" * 40,
+        "${{ github.event.merge_group.head_sha }}": "b" * 40,
+        "${{ matrix.shard }}": str(shard),
+    }
+    script = _substitute_expressions(_string(step, "run"), expressions)
+    environment: dict[str, str] = {}
+    for name, value in (step.get("env") or {}).items():
+        value = str(value)
+        if "${{" in value:
+            assert value in expressions, f"decision step env {name} reads {value}"
+            value = expressions[value]
+        environment[name] = value
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    log = tmp_path / "calls.log"
+    output = tmp_path / "github-output"
+    output.touch()
+    selector_file = tmp_path / "selector-outputs"
+    selector_file.write_text(
+        "".join(f"{key}={value}\n" for key, value in (selector or _selector_outputs()).items())
+    )
+    targets_file = tmp_path / "selector-targets"
+    targets_file.write_text("".join(f"{path}\n" for path in targets))
+    uv = bin_dir / "uv"
+    uv.write_text(
+        f"#!{sys.executable}\n"
+        "import os, shlex, subprocess, sys\n"
+        "from pathlib import Path\n"
+        "argv = sys.argv[1:]\n"
+        "with open(os.environ['DECISION_LOG'], 'a') as log:\n"
+        "    log.write(shlex.join(['uv', *argv]) + '\\n')\n"
+        "if os.environ.get('DECISION_REAL_SELECTOR') == '1':\n"
+        "    assert argv[:2] == ['run', 'python'], argv\n"
+        "    arguments = argv[2:]\n"
+        "    if '--pytest-targets-out' in arguments:\n"
+        "        index = arguments.index('--pytest-targets-out') + 1\n"
+        "        arguments[index] = os.path.abspath(arguments[index])\n"
+        "    environment = {**os.environ, 'PATH': os.environ['DECISION_REAL_PATH']}\n"
+        "    raise SystemExit(subprocess.call(\n"
+        "        [sys.executable, *arguments], cwd=os.environ['DECISION_REPO_ROOT'],\n"
+        "        env=environment,\n"
+        "    ))\n"
+        "with open(os.environ['GITHUB_OUTPUT'], 'a') as handle:\n"
+        "    handle.write(Path(os.environ['DECISION_SELECTOR_OUTPUTS']).read_text())\n"
+        "if '--pytest-targets-out' in argv:\n"
+        "    destination = Path(argv[argv.index('--pytest-targets-out') + 1])\n"
+        "    destination.write_text(Path(os.environ['DECISION_SELECTOR_TARGETS']).read_text())\n"
+    )
+    uv.chmod(0o755)
+    git = bin_dir / "git"
+    git.write_text(f'#!/usr/bin/env bash\necho "git $*" >> "{log}"\n')
+    git.chmod(0o755)
+    result = _run_bash(
+        script,
+        {
+            **environment,
+            "PATH": f"{bin_dir}:{os.environ['PATH']}",
+            "GITHUB_OUTPUT": str(output),
+            "DECISION_LOG": str(log),
+            "DECISION_SELECTOR_OUTPUTS": str(selector_file),
+            "DECISION_SELECTOR_TARGETS": str(targets_file),
+            "DECISION_REAL_SELECTOR": "1" if real_selector else "0",
+            "DECISION_REPO_ROOT": str(REPO_ROOT),
+            "DECISION_REAL_PATH": os.environ["PATH"],
+        },
+        tmp_path,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    calls = log.read_text().splitlines() if log.exists() else []
+    outputs = dict(
+        line.split("=", 1) for line in output.read_text().splitlines() if "=" in line
+    )
+    return calls, outputs
+
+
+def _run_decision_step(tmp_path: Path, job_id: str, event: str) -> list[str]:
+    assert job_id == "python-pytest", job_id
+    calls, _ = _decide(tmp_path, event)
+    return calls
+
+
+@pytest.mark.parametrize("job_id", ["python-pytest"])
+@pytest.mark.parametrize("event", ["workflow_dispatch", "push"])
+def test_decision_steps_select_everything_for_every_non_pull_request_event(
+    tmp_path: Path, job_id: str, event: str
+) -> None:
+    """#3858: a dispatch agrees with `changes`, which treats it as a push."""
+    calls = _run_decision_step(tmp_path, job_id, event)
+    uv_calls = [call for call in calls if call.startswith("uv ")]
+    assert len(uv_calls) == 1, calls
+    assert "--push" in uv_calls[0].split()
+    assert "--base" not in uv_calls[0].split()
+    assert not [call for call in calls if call.startswith("git ")], calls
+
+
+@pytest.mark.parametrize("job_id", ["python-pytest"])
+def test_decision_steps_diff_against_the_base_on_pull_request(tmp_path: Path, job_id: str) -> None:
+    calls = _run_decision_step(tmp_path, job_id, "pull_request")
+    uv_calls = [call for call in calls if call.startswith("uv ")]
+    assert len(uv_calls) == 1, calls
+    assert "--push" not in uv_calls[0].split()
+    assert "--base origin/main" in uv_calls[0]
+    command = shlex.split(uv_calls[0])
+    assert command[command.index("--pytest-targets-out") + 1] == TARGETS_FILE
+
+
+def _rust_select_step() -> dict[str, Any]:
+    return next(step for step in _python_job("rust-select")["steps"] if step.get("id") == "select")
+
+
+def test_rust_select_waits_for_the_version_only_selection() -> None:
+    """#3858: a version-only pull request skips the Rust partitions."""
+    job = _python_job("rust-select")
+    assert "changes" in _needs(job)
+    env = _rust_select_step()["env"]
+    assert env["VERSION_ONLY"] == "${{ needs.changes.outputs.version_only }}"
+
+
+@pytest.mark.parametrize(
+    ("event", "version_only", "expected"),
+    [
+        ("pull_request", "true", "tests=false"),
+        ("merge_group", "true", "tests=false"),
+        ("push", "true", "tests=true"),
+        ("push", "false", "tests=true"),
+        ("workflow_dispatch", "true", "tests=true"),
+    ],
+)
+def test_rust_select_script_honors_version_only_without_git(
+    tmp_path: Path, event: str, version_only: str, expected: str
+) -> None:
+    """#3858: run the real select script; a version-only PR needs no diff."""
+    step = _rust_select_step()
+    bin_dir, log = _recording_stubs(tmp_path, "git")
+    output = tmp_path / "github-output"
+    runner_temp = tmp_path / "runner-temp"
+    runner_temp.mkdir()
+    environment = {
+        "PATH": f"{bin_dir}:{os.environ['PATH']}",
+        "EVENT": event,
+        "VERSION_ONLY": version_only,
+        "BASE_REF": "main",
+        "GITHUB_OUTPUT": str(output),
+        "RUNNER_TEMP": str(runner_temp),
+    }
+    result = _run_bash(_string(step, "run"), environment, tmp_path)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert [line for line in output.read_text().splitlines() if line] == [expected]
+    assert not log.exists(), log.read_text()
 
 
 def test_pytest_aggregator_accepts_selected_success(tmp_path: Path) -> None:
@@ -414,28 +2487,51 @@ def test_pytest_aggregator_accepts_selected_success(tmp_path: Path) -> None:
     assert completed.returncode == 0, completed.stderr
     selected = _outputs(output)["pytest"]
     result = _run_pytest_aggregate(
-        tmp_path / "run", selected=selected, shards=_all_shards(selected, "success")
+        tmp_path / "run",
+        ci_policy_selected="false",
+        ci_policy_result="skipped",
+        container_result="success",
+        selected=selected,
+        shards=_all_shards(selected, "success"),
     )
     assert result.returncode == 0, result.stdout + result.stderr
 
 
 def test_pytest_aggregator_rejects_selected_skip(tmp_path: Path) -> None:
-    result = _run_pytest_aggregate(tmp_path, selected="true", shards=_all_shards("true", "skipped"))
+    result = _run_pytest_aggregate(
+        tmp_path,
+        ci_policy_selected="false",
+        ci_policy_result="skipped",
+        container_result="success",
+        selected="true",
+        shards=_all_shards("true", "skipped"),
+    )
     assert result.returncode != 0
 
 
 def test_pytest_aggregator_rejects_unselected_success(tmp_path: Path) -> None:
     result = _run_pytest_aggregate(
-        tmp_path, selected="false", shards=_all_shards("false", "success")
+        tmp_path,
+        ci_policy_selected="false",
+        ci_policy_result="skipped",
+        container_result="skipped",
+        selected="false",
+        shards=_all_shards("false", "success"),
     )
     assert result.returncode != 0
 
 
 def test_pytest_aggregator_rejects_a_failed_shard(tmp_path: Path) -> None:
     shards = _all_shards("true", "success")
-    shards[2] = ("true", "failure", "success")
+    shards[2] = ("true", "failure", "success", "", "full", "6", "full", "")
     result = _run_pytest_aggregate(
-        tmp_path, selected="true", shards=shards, shards_result="failure"
+        tmp_path,
+        ci_policy_selected="false",
+        ci_policy_result="skipped",
+        container_result="success",
+        selected="true",
+        shards=shards,
+        shards_result="failure",
     )
     assert result.returncode != 0
     assert "failure" in result.stderr
@@ -446,7 +2542,8 @@ def test_pytest_aggregator_rejects_shard_jobs_that_did_not_succeed(
     tmp_path: Path, shards_result: str
 ) -> None:
     result = _run_pytest_aggregate(
-        tmp_path,
+        tmp_path, ci_policy_selected="false", ci_policy_result="skipped",
+        container_result="success",
         selected="true",
         shards=_all_shards("true", "success"),
         shards_result=shards_result,
@@ -454,18 +2551,54 @@ def test_pytest_aggregator_rejects_shard_jobs_that_did_not_succeed(
     assert result.returncode != 0
 
 
-def test_pytest_aggregator_rejects_a_shard_that_never_reported(tmp_path: Path) -> None:
-    shards = _all_shards("true", "success")
-    del shards[3]
-    result = _run_pytest_aggregate(tmp_path, selected="true", shards=shards)
+@pytest.mark.parametrize("missing", range(1, SHARD_COUNT + 1))
+def test_pytest_aggregator_rejects_a_shard_that_never_reported(
+    tmp_path: Path, missing: int
+) -> None:
+    healthy = _run_pytest_aggregate(
+        tmp_path,
+        ci_policy_selected="false",
+        ci_policy_result="skipped",
+        selected="true",
+        container_result="success",
+        shards=_all_shards("true", "success"),
+    )
+    assert healthy.returncode == 0, healthy.stdout + healthy.stderr
+    directory = _named_steps()["Download shard results"]["with"]["path"]
+    record = tmp_path / directory / f"shard-{missing}.txt"
+    original = record.read_text()
+    record.unlink()
+    result = _run_pytest_aggregate(
+        tmp_path,
+        ci_policy_selected="false",
+        ci_policy_result="skipped",
+        container_result="success",
+        selected="true",
+    )
     assert result.returncode != 0
-    assert "shard 3" in result.stderr
+    assert f"shard {missing}" in result.stderr
+    record.write_text(original)
+    restored = _run_pytest_aggregate(
+        tmp_path,
+        ci_policy_selected="false",
+        ci_policy_result="skipped",
+        selected="true",
+        container_result="success",
+    )
+    assert restored.returncode == 0, restored.stdout + restored.stderr
 
 
 def test_pytest_aggregator_rejects_a_shard_that_selected_differently(tmp_path: Path) -> None:
     shards = _all_shards("true", "success")
-    shards[1] = ("false", "skipped", "skipped")
-    result = _run_pytest_aggregate(tmp_path, selected="true", shards=shards)
+    shards[1] = ("false", "skipped", "skipped", "", "full", "6", "none", "")
+    result = _run_pytest_aggregate(
+        tmp_path,
+        ci_policy_selected="false",
+        ci_policy_result="skipped",
+        container_result="success",
+        selected="true",
+        shards=shards,
+    )
     assert result.returncode != 0
 
 
@@ -506,3 +2639,618 @@ def test_shards_partition_the_unfiltered_collection(tmp_path: Path) -> None:
     for index, owned in enumerate(files):
         for other in files[index + 1 :]:
             assert not owned & other, "a file group straddled two shards"
+
+
+def test_commissioning_runner_peer_shares_the_protected_xdist_group() -> None:
+    files = (
+        "apps/worker/tests/test_commissioning_record_refusal.py",
+        "apps/worker/tests/test_commissioning_launch.py",
+        "apps/worker/tests/test_commissioning_cleanup.py",
+        "apps/worker/tests/test_commissioning_supervisor.py",
+        "apps/worker/tests/test_protected_retirement_server.py",
+        "apps/worker/tests/test_protected_recovery_source.py",
+        "apps/worker/tests/test_delivery_lease.py",
+    )
+    probe = """
+import sys
+import pytest
+
+class Groups:
+    def pytest_collection_finish(self, session):
+        groups = {
+            (item.path.relative_to(session.config.rootpath).as_posix(), marker.args[0])
+            for item in session.items
+            for marker in item.iter_markers("xdist_group")
+        }
+        for path, group in sorted(groups):
+            print("RUNNER_GROUP", path, group)
+
+raise SystemExit(pytest.main(sys.argv[1:], plugins=[Groups()]))
+"""
+    completed = subprocess.run(
+        [sys.executable, "-c", probe, "--collect-only", "-q", *files],
+        cwd=REPO_ROOT,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert completed.returncode == 0, completed.stdout + completed.stderr
+    groups = {
+        fields[1]: fields[2]
+        for line in completed.stdout.splitlines()
+        if (fields := line.split()) and fields[0] == "RUNNER_GROUP"
+    }
+    assert set(groups) == set(files)
+    assert len({groups[path] for path in files[:-1]}) == 1
+    assert groups[files[-1]] != groups[files[0]]
+
+
+# Shard plan wiring: `changes` and each shard's decision step agree on how many
+# shards run pytest, which stack tier each boots, and which targets an impact
+# selection passes; the required job cross-checks every shard against it.
+PLAN_CASES = (
+    ("impact", (2, 1, 1)),
+    ("impact", (2, 2, 0)),
+    ("impact", (1, 0, 0)),
+    ("impact", (5, 3, 1)),
+    ("impact", FULL_PLAN),
+    ("full", (6, 4, 2)),
+    ("full", FULL_PLAN),
+    ("cli", (3, 2, 1)),
+)
+
+
+def _plan_targets(scope: str) -> tuple[tuple[str, ...], str]:
+    return (IMPACT_TARGETS, IMPACT_DIGEST) if scope == "impact" else ((), "")
+
+
+def test_changes_job_exports_the_pytest_shard_plan() -> None:
+    outputs = _python_job("changes")["outputs"]
+    for key in ("pytest_targets", "pytest_shards", "pytest_storage_shards", "pytest_full_shards"):
+        assert outputs[key] == "${{ steps.filter.outputs." + key + " }}", key
+
+
+@pytest.mark.parametrize("plan", [(6, 6, 6), (3, 2, 1), (2, 0, 0), (1, 1, 0), (4, 4, 2)])
+@pytest.mark.parametrize("shard", range(1, SHARD_COUNT + 1))
+def test_decision_step_outputs_active_and_stack_tier_from_the_plan(
+    tmp_path: Path, plan: tuple[int, int, int], shard: int
+) -> None:
+    selector = _selector_outputs(scope="impact", plan=plan, targets=IMPACT_DIGEST)
+    calls, outputs = _decide(
+        tmp_path, "pull_request", shard=shard, selector=selector, targets=IMPACT_TARGETS
+    )
+    assert len([call for call in calls if call.startswith("uv ")]) == 1, calls
+    for key, value in selector.items():
+        assert outputs[key] == value, key
+    assert outputs["active"] == ("true" if shard <= plan[0] else "false")
+    assert outputs["stack_tier"] == _expected_tier(shard, plan)
+    assert (tmp_path / TARGETS_FILE).read_text().splitlines() == list(IMPACT_TARGETS)
+
+
+@pytest.mark.parametrize("event", ["push", "workflow_dispatch"])
+def test_non_pull_request_plan_runs_every_shard_at_the_full_tier(
+    tmp_path: Path, event: str
+) -> None:
+    """Every event other than a pull request keeps all six shards and the full stack."""
+    completed, output = _invoke_selector(tmp_path, push=True)
+    assert completed.returncode == 0, completed.stderr
+    selection = _outputs(output)
+    assert selection["pytest"] == "true"
+    assert selection["pytest_scope"] == "full"
+    assert selection["pytest_targets"] == ""
+    assert (
+        selection["pytest_shards"], selection["pytest_storage_shards"],
+        selection["pytest_full_shards"],
+    ) == tuple(str(value) for value in FULL_PLAN)
+    for shard in (1, SHARD_COUNT):
+        calls, decided = _decide(
+            tmp_path / f"decide-{shard}", event, shard=shard, real_selector=True
+        )
+        uv_calls = [shlex.split(call) for call in calls if call.startswith("uv ")]
+        assert len(uv_calls) == 1, calls
+        assert "--push" in uv_calls[0]
+        assert "--base" not in uv_calls[0]
+        assert not [call for call in calls if call.startswith("git ")], calls
+        assert decided["active"] == "true"
+        assert decided["stack_tier"] == "full"
+        assert decided["pytest_shards"] == str(SHARD_COUNT)
+        argv = _run_pytest_step(tmp_path / f"pytest-{shard}", shard=shard, deselect="",
+                                event=event)
+        argv = _without_shard_report_arguments(argv)
+        assert argv[argv.index("--ci-shard") + 1] == f"{shard}/{SHARD_COUNT}"
+    result = _run_pytest_aggregate(
+        tmp_path / "aggregate", ci_policy_selected="false", ci_policy_result="skipped",
+        container_result="success", selected="true",
+        plan=(
+            selection["pytest_shards"], selection["pytest_storage_shards"],
+            selection["pytest_full_shards"],
+        ),
+        targets=selection["pytest_targets"],
+        shards=_all_shards("true", "success"),
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    download = _named_steps()["Download shard results"]["with"]["path"]
+    for shard in range(1, SHARD_COUNT + 1):
+        record = (tmp_path / "aggregate" / download / f"shard-{shard}.txt").read_text()
+        assert record.endswith(f" shards={SHARD_COUNT} tier=full targets=\n"), record
+
+
+@pytest.mark.parametrize(("scope", "plan"), PLAN_CASES)
+def test_shard_plan_flows_from_decision_through_steps_and_records_to_the_aggregate(
+    tmp_path: Path, scope: str, plan: tuple[int, int, int]
+) -> None:
+    """Run every real step a shard executes, on all six shards, then the aggregate."""
+    targets, digest = _plan_targets(scope)
+    selector = _selector_outputs(scope=scope, plan=plan, targets=digest)
+    named = _named_steps("python-pytest")
+    aggregate = tmp_path / "aggregate"
+    aggregate.mkdir()
+    for shard in range(1, SHARD_COUNT + 1):
+        decide = tmp_path / f"decide-{shard}"
+        _, outputs = _decide(
+            decide, "pull_request", shard=shard, selector=selector, targets=targets
+        )
+        tier = _expected_tier(shard, plan)
+        assert outputs["stack_tier"] == tier
+        written = (decide / TARGETS_FILE).read_text().splitlines()
+        assert written == list(targets)
+        runs = {
+            name: _runtime_condition(_string(named[name], "if"), outputs, shard)
+            for name in (*GATED_RUNTIME_STEPS, "Released database upgrade gate")
+        }
+        active = shard <= plan[0]
+        assert runs["Start dev stack"] is active
+        assert runs["Migrate the shared database"] is active
+        assert runs["Pytest"] is active
+        assert runs["Wait for Langfuse to serve"] is (tier == "full")
+        assert runs["Released database upgrade gate"] is (active and shard == 1)
+        if active:
+            state = {
+                "shard": str(shard),
+                "pytest_deselect": outputs["pytest_deselect"],
+                "pytest_scope": outputs["pytest_scope"],
+                "pytest_shards": outputs["pytest_shards"],
+                "pytest_storage_shards": outputs["pytest_storage_shards"],
+                "pytest_full_shards": outputs["pytest_full_shards"],
+                "stack_tier": outputs["stack_tier"],
+                "event_name": "pull_request",
+            }
+            result, recorded = _run_pytest_step_child(
+                tmp_path / f"pytest-{shard}", state, targets=tuple(written)
+            )
+            assert result.returncode == 0, result.stdout + result.stderr
+            assert recorded is not None, "the active shard never reached uv"
+            assert recorded["stack_tier"] == tier
+            argv = _without_shard_report_arguments(
+                recorded["argv"], tiers=f"{plan[1]},{plan[2]}"
+            )
+            assert argv[argv.index("--ci-shard") + 1] == f"{shard}/{plan[0]}"
+            if scope == "impact":
+                assert argv[-len(targets):] == list(targets)
+        outcome = "success" if active else "skipped"
+        _record_shard(aggregate, shard, (
+            outputs["pytest"], outcome, outcome, outputs["pytest_deselect"],
+            outputs["pytest_scope"], outputs["pytest_shards"], outputs["stack_tier"],
+            outputs["pytest_targets"],
+        ))
+    result = _run_pytest_aggregate(
+        aggregate, ci_policy_selected="false", ci_policy_result="skipped",
+        container_result="success", selected="true", scope=scope, plan=plan, targets=digest,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+@pytest.mark.parametrize("scope", ["full", "cli", "impact"])
+def test_pull_request_pytest_passes_the_shard_count_and_tier_limits(
+    tmp_path: Path, scope: str
+) -> None:
+    targets, _ = _plan_targets(scope)
+    argv = _run_pytest_step(
+        tmp_path, shard=2, deselect="", scope=scope, plan=(3, 2, 1), event="pull_request",
+        targets=targets if scope == "impact" else None,
+    )
+    argv = _without_shard_report_arguments(argv, tiers="2,1")
+    assert argv[argv.index("--ci-shard") + 1] == "2/3"
+
+
+@pytest.mark.parametrize("event", ["push", "workflow_dispatch", "merge_group", "schedule"])
+@pytest.mark.parametrize("scope", ["full", "cli"])
+def test_non_pull_request_pytest_omits_the_tier_limits(
+    tmp_path: Path, event: str, scope: str
+) -> None:
+    argv = _run_pytest_step(tmp_path, shard=4, deselect="", scope=scope, event=event)
+    argv = _without_shard_report_arguments(argv)
+    assert argv[argv.index("--ci-shard") + 1] == f"4/{SHARD_COUNT}"
+
+
+@pytest.mark.parametrize(("shard", "tier"), [(1, "full"), (2, "storage"), (3, "core")])
+@pytest.mark.parametrize("scope", ["full", "cli", "impact"])
+def test_pytest_exports_the_stack_tier_to_the_pytest_child(
+    tmp_path: Path, shard: int, tier: str, scope: str
+) -> None:
+    targets, _ = _plan_targets(scope)
+    state = _pytest_step_state(
+        shard=shard, deselect="", scope=scope, plan=(3, 2, 1), event="pull_request"
+    )
+    assert state["stack_tier"] == tier
+    result, recorded = _run_pytest_step_child(
+        tmp_path, state, targets=targets if scope == "impact" else None
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert recorded is not None, "the workflow did not invoke uv"
+    assert recorded["stack_tier"] == tier
+    assert recorded["scope"] is None, "PYTEST_SCOPE leaked into the pytest child environment"
+
+
+@pytest.mark.parametrize("deselect", ["", "examples/tests/test_sre_bot_observability_runtime.py"])
+@pytest.mark.parametrize("shard", [1, 2])
+def test_impact_scope_appends_every_target_line_to_the_full_scope_arguments(
+    tmp_path: Path, deselect: str, shard: int
+) -> None:
+    targets = (*IMPACT_TARGETS, "tools/doclint/tests/test_end to end.py")
+    plan = (2, 1, 1)
+    impact = _run_pytest_step(
+        tmp_path / "impact", shard=shard, deselect=deselect, scope="impact", plan=plan,
+        event="pull_request", targets=targets,
+    )
+    full = _run_pytest_step(
+        tmp_path / "full", shard=shard, deselect=deselect, scope="full", plan=plan,
+        event="pull_request",
+    )
+    assert _without_shard_report_arguments(impact, tiers="1,1") == [
+        *_without_shard_report_arguments(full, tiers="1,1"), *targets,
+    ]
+
+
+@pytest.mark.parametrize("scope", ["full", "cli"])
+def test_full_and_cli_scopes_ignore_the_targets_file(tmp_path: Path, scope: str) -> None:
+    without = _run_pytest_step(
+        tmp_path / "without", shard=1, deselect="", scope=scope, plan=(3, 2, 1),
+        event="pull_request",
+    )
+    with_targets = _run_pytest_step(
+        tmp_path / "with", shard=1, deselect="", scope=scope, plan=(3, 2, 1),
+        event="pull_request", targets=IMPACT_TARGETS,
+    )
+    assert with_targets == without
+    assert not set(IMPACT_TARGETS) & set(with_targets)
+
+
+@pytest.mark.parametrize("targets", [None, ()], ids=["missing", "empty"])
+def test_impact_scope_refuses_missing_or_empty_targets_before_uv(
+    tmp_path: Path, targets: tuple[str, ...] | None
+) -> None:
+    state = _pytest_step_state(
+        shard=1, deselect="", scope="impact", plan=(2, 1, 1), event="pull_request"
+    )
+    result, recorded = _run_pytest_step_child(tmp_path, state, targets=targets)
+    assert result.returncode != 0, result.stdout + result.stderr
+    assert recorded is None, "an impact shard with no targets reached pytest"
+    assert result.stdout + result.stderr
+
+
+def test_pytest_durations_upload_is_separate_from_shard_records() -> None:
+    steps = _python_job("python-pytest")["steps"]
+    names = [step.get("name") for step in steps]
+    uploads = [
+        step for step in steps
+        if _string(step, "uses").startswith("actions/upload-artifact@")
+        and (step.get("with") or {}).get("name") == DURATIONS_ARTIFACT
+    ]
+    assert len(uploads) == 1, uploads
+    upload = uploads[0]
+    record_upload = _named_steps("python-pytest")["Upload shard result"]
+    assert upload["uses"] == record_upload["uses"]
+    assert str(upload["with"]["retention-days"]) == "7"
+    directory = JUNIT_XML.rsplit("/", 1)[0]
+    assert str(upload["with"]["path"]).rstrip("/") in {directory, JUNIT_XML}
+    assert steps.index(upload) > names.index("Pytest")
+    pattern = _named_steps()["Download shard results"]["with"]["pattern"]
+    for shard in range(1, SHARD_COUNT + 1):
+        durations = DURATIONS_ARTIFACT.replace("${{ matrix.shard }}", str(shard))
+        record = record_upload["with"]["name"].replace("${{ matrix.shard }}", str(shard))
+        assert not fnmatch.fnmatchcase(durations, pattern), durations
+        assert fnmatch.fnmatchcase(record, pattern), record
+
+
+@pytest.mark.parametrize("scope", ["full", "cli", "impact"])
+def test_every_shard_writes_the_durations_report(tmp_path: Path, scope: str) -> None:
+    targets, _ = _plan_targets(scope)
+    argv = _run_pytest_step(
+        tmp_path, shard=1, deselect="", scope=scope, plan=(2, 1, 1), event="pull_request",
+        targets=targets if scope == "impact" else None,
+    )
+    # The helper fails unless the JUnit report and xunit1 family appear exactly once.
+    _without_shard_report_arguments(argv, tiers="1,1")
+
+
+@pytest.mark.parametrize(("record", "line"), [
+    (
+        ("true", "success", "success", "", "impact", "2", "storage", IMPACT_DIGEST),
+        f"shard=2 selected=true pytest=success stack=success deselect= scope=impact "
+        f"shards=2 tier=storage targets={IMPACT_DIGEST}",
+    ),
+    (
+        ("true", "skipped", "skipped", DRY_RUN_FILE, "impact", "2", "none", IMPACT_DIGEST),
+        f"shard=2 selected=true pytest=skipped stack=skipped deselect={DRY_RUN_FILE} "
+        f"scope=impact shards=2 tier=none targets={IMPACT_DIGEST}",
+    ),
+    (
+        ("true", "failure", "success", "", "full", "6", "full", ""),
+        "shard=2 selected=true pytest=failure stack=success deselect= scope=full "
+        "shards=6 tier=full targets=",
+    ),
+])
+def test_shard_record_writes_the_plan_fields(
+    tmp_path: Path, record: ShardRecord, line: str
+) -> None:
+    _record_shard(tmp_path, 2, record)
+    download = _named_steps()["Download shard results"]["with"]["path"]
+    assert (tmp_path / download / "shard-2.txt").read_text() == line + "\n"
+
+
+@pytest.mark.parametrize(("scope", "plan"), PLAN_CASES)
+def test_aggregate_accepts_a_plan_whose_inactive_shards_skipped(
+    tmp_path: Path, scope: str, plan: tuple[int, int, int]
+) -> None:
+    _, digest = _plan_targets(scope)
+    result = _run_pytest_aggregate(
+        tmp_path, ci_policy_selected="false", ci_policy_result="skipped",
+        container_result="success", selected="true", scope=scope, plan=plan, targets=digest,
+        shards=_all_shards("true", "success", scope=scope, plan=plan, targets=digest),
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    download = _named_steps()["Download shard results"]["with"]["path"]
+    for shard in range(1, SHARD_COUNT + 1):
+        tier = _expected_tier(shard, plan)
+        outcome = "skipped" if tier == "none" else "success"
+        assert (tmp_path / download / f"shard-{shard}.txt").read_text() == (
+            f"shard={shard} selected=true pytest={outcome} stack={outcome} deselect= "
+            f"scope={scope} shards={plan[0]} tier={tier} targets={digest}\n"
+        )
+
+
+def _impact_records(plan: tuple[int, int, int] = (2, 1, 1)) -> dict[int, ShardRecord]:
+    return _all_shards("true", "success", scope="impact", plan=plan, targets=IMPACT_DIGEST)
+
+
+def _run_impact_aggregate(
+    tmp_path: Path,
+    shards: dict[int, ShardRecord] | None,
+    *,
+    plan: tuple[object, object, object] = (2, 1, 1),
+) -> subprocess.CompletedProcess[str]:
+    return _run_pytest_aggregate(
+        tmp_path, ci_policy_selected="false", ci_policy_result="skipped",
+        container_result="success", selected="true", scope="impact", plan=plan,
+        targets=IMPACT_DIGEST, shards=shards,
+    )
+
+
+@pytest.mark.parametrize(("pytest_result", "stack_result", "tier"), [
+    ("success", "success", "none"),
+    ("success", "skipped", "none"),
+    ("skipped", "success", "none"),
+    ("success", "success", "core"),
+    ("skipped", "skipped", "core"),
+    ("failure", "skipped", "none"),
+])
+@pytest.mark.parametrize("shard", [3, 6])
+def test_aggregate_rejects_an_inactive_shard_that_ran(
+    tmp_path: Path, pytest_result: str, stack_result: str, tier: str, shard: int
+) -> None:
+    shards = _impact_records()
+    shards[shard] = (
+        "true", pytest_result, stack_result, "", "impact", "2", tier, IMPACT_DIGEST,
+    )
+    result = _run_impact_aggregate(tmp_path, shards)
+    assert result.returncode != 0, result.stdout + result.stderr
+    assert f"shard {shard}" in result.stderr
+
+
+@pytest.mark.parametrize(("tier", "outcome"), [
+    ("full", "skipped"), ("none", "skipped"), ("none", "success"),
+])
+def test_aggregate_rejects_an_active_shard_that_skipped_or_claimed_no_tier(
+    tmp_path: Path, tier: str, outcome: str
+) -> None:
+    shards = _impact_records()
+    shards[1] = ("true", outcome, outcome, "", "impact", "2", tier, IMPACT_DIGEST)
+    result = _run_impact_aggregate(tmp_path, shards)
+    assert result.returncode != 0, result.stdout + result.stderr
+    assert "shard 1" in result.stderr
+
+
+@pytest.mark.parametrize("shard", [1, 2, 5])
+@pytest.mark.parametrize("targets", [OTHER_DIGEST, ""])
+def test_aggregate_rejects_a_record_whose_targets_digest_disagrees(
+    tmp_path: Path, shard: int, targets: str
+) -> None:
+    shards = _impact_records()
+    shards[shard] = (*shards[shard][:7], targets)
+    result = _run_impact_aggregate(tmp_path, shards)
+    assert result.returncode != 0, result.stdout + result.stderr
+    assert f"shard {shard}" in result.stderr
+
+
+@pytest.mark.parametrize("shard", [1, 5])
+@pytest.mark.parametrize("count", ["6", "1", ""])
+def test_aggregate_rejects_a_record_whose_shard_count_disagrees(
+    tmp_path: Path, shard: int, count: str
+) -> None:
+    shards = _impact_records()
+    shards[shard] = (*shards[shard][:5], count, *shards[shard][6:])
+    result = _run_impact_aggregate(tmp_path, shards)
+    assert result.returncode != 0, result.stdout + result.stderr
+    assert f"shard {shard}" in result.stderr
+
+
+def _tier_disagreements() -> list[tuple[int, str]]:
+    plan = (3, 2, 1)
+    return [
+        (shard, wrong)
+        for shard in range(1, plan[0] + 1)
+        for wrong in ("none", *STACK_TIERS)
+        if wrong != _expected_tier(shard, plan)
+    ]
+
+
+@pytest.mark.parametrize(("shard", "tier"), _tier_disagreements())
+def test_aggregate_rejects_a_tier_that_disagrees_with_the_plan(
+    tmp_path: Path, shard: int, tier: str
+) -> None:
+    plan = (3, 2, 1)
+    shards = _impact_records(plan)
+    shards[shard] = (*shards[shard][:6], tier, shards[shard][7])
+    result = _run_impact_aggregate(tmp_path, shards, plan=plan)
+    assert result.returncode != 0, result.stdout + result.stderr
+    assert f"shard {shard}" in result.stderr
+
+
+@pytest.mark.parametrize(("plan", "records_plan"), [
+    (("0", "0", "0"), (0, 0, 0)),
+    (("7", "7", "7"), (7, 7, 7)),
+    (("7", "0", "0"), (7, 0, 0)),
+    (("3", "1", "2"), (3, 1, 2)),
+    (("2", "3", "0"), (2, 3, 0)),
+    (("2", "3", "3"), (2, 3, 3)),
+    (("3", "2", "-1"), (3, 2, -1)),
+    (("3", "-1", "0"), (3, -1, 0)),
+    (("x", "0", "0"), (6, 0, 0)),
+    (("3", "2", ""), (3, 2, 0)),
+    (("3", "", "0"), (3, 0, 0)),
+    (("", "", ""), FULL_PLAN),
+    (("2.0", "1", "1"), (2, 1, 1)),
+])
+def test_aggregate_rejects_an_impossible_shard_plan(
+    tmp_path: Path, plan: tuple[str, str, str], records_plan: tuple[int, int, int]
+) -> None:
+    """Records match the plan exactly, so only plan validation can refuse it."""
+    shards = {
+        shard: (*record[:5], plan[0], *record[6:])
+        for shard, record in _impact_records(records_plan).items()
+    }
+    result = _run_impact_aggregate(tmp_path, shards, plan=plan)
+    assert result.returncode != 0, result.stdout + result.stderr
+
+
+@pytest.mark.parametrize("missing", [2, 3, 6])
+def test_aggregate_rejects_a_plan_shard_that_never_reported(
+    tmp_path: Path, missing: int
+) -> None:
+    healthy = _run_impact_aggregate(tmp_path, _impact_records())
+    assert healthy.returncode == 0, healthy.stdout + healthy.stderr
+    directory = _named_steps()["Download shard results"]["with"]["path"]
+    (tmp_path / directory / f"shard-{missing}.txt").unlink()
+    result = _run_impact_aggregate(tmp_path, None)
+    assert result.returncode != 0, result.stdout + result.stderr
+    assert f"shard {missing}" in result.stderr
+
+
+def _pytest_step_exclusions(tmp_path: Path) -> tuple[list[str], list[str], list[str]]:
+    """The --ignore, --ignore-glob and --deselect values the real Pytest step passes."""
+    argv = _run_pytest_step(tmp_path, shard=1, deselect="")
+    values: dict[str, list[str]] = {"--ignore": [], "--ignore-glob": [], "--deselect": []}
+    index = 0
+    while index < len(argv):
+        option, separator, value = argv[index].partition("=")
+        if option in values:
+            if not separator:
+                assert index + 1 < len(argv), argv
+                value = argv[index + 1]
+            values[option].append(value)
+            index += 1 if separator else 2
+            continue
+        index += 1
+    return values["--ignore"], values["--ignore-glob"], values["--deselect"]
+
+
+def test_registry_pytest_impact_exclusions_match_the_pytest_step(tmp_path: Path) -> None:
+    """An impact target the shard would ignore is still collected, so the lists agree."""
+    excluded = yaml.safe_load(REGISTRY.read_text())["pytest_impact"]["excluded"]
+    assert isinstance(excluded, list), excluded
+    assert len(excluded) == len(set(excluded)), excluded
+    ignored, globs, deselected = _pytest_step_exclusions(tmp_path)
+    assert globs, "the step must ignore the CI policy test directories"
+    for pattern in globs:
+        assert pattern.endswith("/tests/*"), pattern
+        assert pattern.removesuffix("/tests/*") in ignored, pattern
+    whole_files = [path for path in deselected if "::" not in path]
+    assert ADMITTED_AGENT_RUNTIME in whole_files
+    assert set(CI_POLICY_DIRS) <= set(ignored)
+    assert sorted(excluded) == sorted({*ignored, *whole_files})
+
+
+@pytest.mark.parametrize("job_id", ["python-pytest"])
+def test_decision_steps_use_queue_sha_bounds(tmp_path: Path, job_id: str) -> None:
+    calls = _run_decision_step(tmp_path, job_id, "merge_group")
+    assert len(calls) == 1
+    assert "--base " + "a" * 40 in calls[0]
+    assert "--head " + "b" * 40 in calls[0]
+    assert "--push" not in calls[0]
+    # The queue keeps pytest on its full scope and shard plan.
+    assert "--full-pytest" in calls[0].split()
+
+
+@pytest.mark.parametrize("train,other", [("main", "next"), ("next", "main")])
+def test_queue_cross_train_checks_the_other_train(
+    tmp_path: Path, train: str, other: str,
+) -> None:
+    step = _named_steps("python-static")["Alembic cross-train lineage"]
+    expression = step["env"]["BASE"].removeprefix("${{").removesuffix("}}").strip()
+    values = {
+        "github.event_name": "merge_group", "github.base_ref": "",
+        "github.ref_name": f"gh-readonly-queue/{train}/pr-1-example",
+        "github.event.merge_group.base_ref": f"refs/heads/{train}",
+    }
+    expression = re.sub(r"github\.[a-z_.]+", lambda match: repr(values[match[0]]), expression)
+    base = eval(expression.replace("&&", " and ").replace("||", " or "),
+                {"__builtins__": {}})
+    bin_dir, log = _recording_stubs(tmp_path, "git", "uv")
+    result = _run_bash(step["run"], {"BASE": base,
+                                   "PATH": f"{bin_dir}:{os.environ['PATH']}"}, tmp_path)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert log.read_text().splitlines() == [
+        f"git fetch --no-tags origin {other}",
+        "uv run python scripts/check-alembic-revisions.py "
+        f"--other-train-ref origin/{other}",
+    ]
+
+
+@pytest.mark.parametrize("available", [True, False])
+def test_queue_wire_lock_reads_immutable_event_base(tmp_path: Path, available: bool) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    def git(*args: str) -> str:
+        return subprocess.run(["git", *args], cwd=repo, check=True,
+                              capture_output=True, text=True).stdout.strip()
+    git("init", "-q")
+    git("config", "user.name", "Example Tester")
+    git("config", "user.email", "tester@example.com")
+    path = repo / "packages/aci-protocol/schema/wire.lock"
+    path.parent.mkdir(parents=True)
+    path.write_text("base lock\n")
+    git("add", ".")
+    git("commit", "-qm", "base")
+    base = git("rev-parse", "HEAD")
+    path.write_text("candidate lock\n")
+    git("commit", "-qam", "candidate")
+    step = _named_steps("python-static")["ACI wire-lock base gate"]
+    script = _substitute_expressions(step["run"], {
+        "${{ github.event_name }}": "merge_group",
+        "${{ github.event.merge_group.base_sha }}": base if available else "0" * 40,
+        "${{ github.base_ref || github.ref_name }}": "gh-readonly-queue/main/pr-1-example",
+    })
+    base_lock = tmp_path / "base-wire.lock"
+    script = script.replace("/tmp/base-wire.lock", str(base_lock))
+    bin_dir, log = _recording_stubs(tmp_path, "uv")
+    result = _run_bash(script, {"PATH": f"{bin_dir}:{os.environ['PATH']}"}, repo)
+    if available:
+        assert result.returncode == 0, result.stdout + result.stderr
+        assert base_lock.read_text() == "base lock\n"
+        assert log.read_text().strip() == (
+            "uv run python -m aci_protocol.wire_lock --check-base " + str(base_lock)
+        )
+    else:
+        assert result.returncode != 0
+        assert not log.exists(), "an unavailable queue base must not certify the candidate"

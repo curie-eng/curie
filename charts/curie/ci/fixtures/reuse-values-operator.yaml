@@ -1,0 +1,81 @@
+# A representative operator overlay for the reuse-values render gate (#3813).
+#
+# This is the shape a production install hands `helm install -f`: stores moved
+# out of the chart onto existingSecret references, a real model instead of the
+# fake one, gVisor off on a node pool without runsc, an Ingress, and a few
+# replica and env overrides. Helm stores exactly this document as the
+# release's user-supplied values, and `helm upgrade --reuse-values` hands it
+# back on top of the PREVIOUS chart's values.yaml.
+#
+# Every key here must exist in every released chart the gate replays (see
+# reuse-values-render-assertions.sh), because an operator on that release could
+# only have set keys the release knew about. The gate renders the released
+# chart with this file first, so a key the release rejects fails loudly rather
+# than silently testing nothing. Hosts and Secret names are placeholders.
+security:
+  gvisor:
+    mode: "off"
+
+postgres:
+  deploy: false
+  host: postgres.example.com
+  port: 5432
+  auth:
+    username: curie
+    database: curie
+  existingSecret: acme-postgres
+  sslMode: require
+
+valkey:
+  deploy: false
+  host: valkey.example.com
+  port: 6379
+  existingSecret: acme-valkey
+  tls: true
+
+clickhouse:
+  deploy: false
+  host: clickhouse.example.com
+  httpPort: 8443
+  nativePort: 9440
+  scheme: https
+  auth:
+    username: default
+  existingSecret: acme-clickhouse
+  clusterEnabled: false
+
+rustfs:
+  deploy: false
+  host: s3.example.com
+  port: 443
+  region: us-east-1
+  bucket: langfuse
+  auth:
+    accessKey: acme
+  existingSecret: acme-s3
+  egress:
+    - cidr: 192.0.2.10/32
+      ports:
+        - protocol: TCP
+          port: 443
+
+api:
+  replicas: 2
+  ingress:
+    enabled: true
+    host: curie.example.com
+    className: nginx
+  extraEnv:
+    - name: CURIE_FIXTURE_OPERATOR
+      value: "retained"
+
+worker:
+  replicas: 2
+  workspace:
+    bucket: curie-workspaces
+
+agentSandbox:
+  runner:
+    fakeModel: false
+    bundleFetch:
+      bucket: curie-bundles

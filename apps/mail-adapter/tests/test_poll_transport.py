@@ -18,7 +18,7 @@ import logging
 import threading
 from collections.abc import Callable
 
-import curie_mail_adapter.adapter as adapter_module
+import curie_channel_gateway.mail.adapter as adapter_module
 import pytest
 from _support import (
     AGENTMAIL_API_KEY,
@@ -28,7 +28,8 @@ from _support import (
     MailState,
     wait_until,
 )
-from curie_mail_adapter.adapter import MailAdapter
+from curie_channel_gateway.mail.adapter import MailAdapter
+from curie_channel_gateway.mail.agentmail import AgentMailProvider
 
 FAILURE_PREFIX = "poll: list failed"
 
@@ -62,7 +63,7 @@ def test_a_dropped_list_call_records_a_bounded_safe_cause(
     """
     mail.drop_next_lists = 1
 
-    with caplog.at_level(logging.WARNING, logger="curie_mail_adapter.adapter"):
+    with caplog.at_level(logging.WARNING, logger="curie_channel_gateway.mail.adapter"):
         status = adapter.poll_once()
 
     assert status == 0, f"a dropped connection must surface as a transport failure, got {status}"
@@ -118,7 +119,17 @@ def test_a_long_credential_bearing_cause_is_redacted_and_truncated(
             f"so this test no longer exercises redaction: {leaked!r}"
         )
 
-    cause = adapter._transport_cause(0, {"error": leaked})
+    # Two layers (ADR 0228): the provider owes a bounded cause without its own
+    # credential, and the neutral adapter redacts its credentials and bounds it
+    # again before logging, in case a provider does not.
+    provider = adapter.provider
+    assert isinstance(provider, AgentMailProvider)
+    failure = provider._failure(0, {"error": leaked})
+    assert failure.kind == "unreachable"
+    assert AGENTMAIL_API_KEY not in failure.cause, (
+        f"the provider's own credential survived its redaction: {failure.cause!r}"
+    )
+    cause = adapter._bounded_cause(failure.cause)
 
     for credential in (AGENTMAIL_API_KEY, CHANNEL_TOKEN, EGRESS_SECRET):
         assert credential not in cause, f"a credential survived redaction: {cause!r}"
@@ -127,9 +138,13 @@ def test_a_long_credential_bearing_cause_is_redacted_and_truncated(
         f"the cause is unbounded at {len(cause)} characters: {cause!r}"
     )
     assert cause.endswith("..."), f"the character budget never truncated: {cause!r}"
-    assert adapter._transport_cause(500, {"error": leaked}) == "http_500", (
+    assert provider._failure(500, {"error": leaked}).cause == "http_500", (
         "a nonzero status was not rendered as its bounded status-only token"
     )
+    hostile = adapter._bounded_cause(f"{CHANNEL_TOKEN} {EGRESS_SECRET} " + "x" * 400)
+    for credential in (CHANNEL_TOKEN, EGRESS_SECRET):
+        assert credential not in hostile, f"the adapter's own pass let {credential!r} through"
+    assert len(hostile) <= adapter_module.CAUSE_MAX_CHARS + 3
 
 
 @pytest.mark.parametrize("http_status", [403, 500])
@@ -155,10 +170,14 @@ def test_a_provider_error_body_is_replaced_by_a_bounded_status_token(
     mail.injected_body = {"error": "Subject: payroll spreadsheet; body: SSN 123-45-6789"}
     mail.fail_next_list = http_status
 
-    with caplog.at_level(logging.WARNING, logger="curie_mail_adapter.adapter"):
+    with caplog.at_level(logging.WARNING, logger="curie_channel_gateway.mail.adapter"):
         observed_status = adapter.poll_once()
 
-    assert observed_status == http_status, (
+    # The provider maps the status to a neutral kind (a 4xx is ``refused``, a 5xx
+    # ``server_error``), and the discovery status stands for that kind; the
+    # exact HTTP code survives only as the bounded cause token below.
+    expected_status = 400 if 400 <= http_status < 500 else http_status
+    assert observed_status == expected_status, (
         f"the injected provider failure did not surface, got {observed_status}"
     )
     message = _failure_record(caplog)
@@ -273,7 +292,7 @@ def test_repeated_list_transport_failures_back_off_then_reset_on_recovery(
     would cost minutes of suite time for a property that is about ordering, not
     absolute seconds. Only those two numeric bounds are rebound, for the
     duration of this test: no function, class or I/O path inside
-    `curie_mail_adapter` is replaced, and every request still crosses the real
+    `curie_channel_gateway.mail` is replaced, and every request still crosses the real
     fake AgentMail server, so the cadence under test is the production one,
     observed as wall-clock arrival times of real requests at the provider seam.
 
@@ -299,7 +318,7 @@ def test_repeated_list_transport_failures_back_off_then_reset_on_recovery(
         mail.drop_next_lists = 4
         mail.add_inbound("msg-drop", "thr-drop", subject="Held", text="delivered after the outage")
 
-        assert wait_until(lambda: ingress.delivery_ids() == ["msg-drop"], timeout=20), (
+        assert wait_until(lambda: adapter.state.delivery("msg-drop") is not None, timeout=20), (
             f"the held message never survived the outage: {ingress.delivery_ids()}"
         )
         # Keep polling past the recovered pass, so a post-recovery gap exists to
@@ -343,8 +362,7 @@ def test_repeated_list_transport_failures_back_off_then_reset_on_recovery(
     # above already guarantees both indexes exist. Do not relax it back into a broad
     # tolerance: a tolerance cannot distinguish saturation from continued growth.
     assert abs(waits_before_failures[-1] - waits_before_failures[-2]) < 0.15, (
-        "the backoff kept doubling instead of saturating at its ceiling: "
-        f"{waits_before_failures}"
+        f"the backoff kept doubling instead of saturating at its ceiling: {waits_before_failures}"
     )
     # The recovery pass is the first list call after the last dropped one, so the
     # final interval of the run is fully post-recovery and needs no guessing.
@@ -355,7 +373,8 @@ def test_repeated_list_transport_failures_back_off_then_reset_on_recovery(
     assert times[-1] - times[-2] < 0.15, (
         f"the normal cadence never resumed after recovery: {times[-1] - times[-2]}"
     )
-    assert ingress.delivery_ids() == ["msg-drop"], (
+    assert ingress.delivery_ids() == []
+    assert adapter.state.delivery("msg-drop") == {"state": "rejected", "turn": None}, (
         f"the held message was skipped or duplicated across the outage: {ingress.delivery_ids()}"
     )
 
@@ -399,7 +418,7 @@ def test_an_unrelated_failure_does_not_clear_an_armed_backoff(
             "msg-mixed", "thr-mixed", subject="Mixed", text="delivered after the outage"
         )
 
-        assert wait_until(lambda: ingress.delivery_ids() == ["msg-mixed"], timeout=20), (
+        assert wait_until(lambda: adapter.state.delivery("msg-mixed") is not None, timeout=20), (
             f"the held message never survived the mixed outage: {ingress.delivery_ids()}"
         )
         # Keep polling past recovery, so the interval after the 500 is a settled
@@ -432,6 +451,7 @@ def test_an_unrelated_failure_does_not_clear_an_armed_backoff(
     assert wait_before_recovery > 0.3, (
         f"an unrelated 5xx cleared the armed transport backoff: {wait_before_recovery}"
     )
-    assert ingress.delivery_ids() == ["msg-mixed"], (
+    assert ingress.delivery_ids() == []
+    assert adapter.state.delivery("msg-mixed") == {"state": "rejected", "turn": None}, (
         f"the held message was skipped or duplicated across the outage: {ingress.delivery_ids()}"
     )

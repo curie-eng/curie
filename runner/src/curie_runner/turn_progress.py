@@ -29,6 +29,8 @@ from typing import Any, Final
 import aiohttp
 from claude_agent_sdk import SdkMcpTool, tool
 
+from .tool_names import TURN_PROGRESS_TOOL
+
 logger = logging.getLogger(__name__)
 
 PROGRESS_URL_HEADER: Final = "X-Curie-Progress-Url"
@@ -36,7 +38,6 @@ PROGRESS_TOKEN_HEADER: Final = "X-Curie-Progress-Token"
 PROGRESS_GENERATION_HEADER: Final = "X-Curie-Progress-Generation"
 PROGRESS_TOKEN_REQUEST_HEADER: Final = "X-API-Key"
 TURN_PROGRESS_ELIGIBILITY_ENV: Final = "CURIE_TURN_PROGRESS_ENABLED"
-TURN_PROGRESS_TOOL: Final = "progress"
 PROGRESS_COMMAND_VERSION: Final = "1.0"
 _TIMEOUT_SECONDS: Final = 5.0
 

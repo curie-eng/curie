@@ -4,9 +4,12 @@ version = "0.0.0"
 description = "Curie email channel adapter (AgentMail): polls an inbox to channel ingress, serves the neutral reply wire"
 requires-python = ">=3.13"
 dependencies = [
+    "curie-channel-gateway",
     "aci-protocol",
     "curie-channel-protocol",
+    "curie-internal",
     "curie-telemetry",
+    "curie-upgrade-pause",
     "pydantic>=2.10",
     "pydantic-settings>=2.7",
 ]

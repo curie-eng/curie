@@ -1,0 +1,48 @@
+{
+  "version": 1,
+  "name": "acme-library-illustrative",
+  "criteria": [
+    {
+      "id": "library-discovery",
+      "description": "Users can discover available library assets."
+    },
+    {
+      "id": "approval-and-restoration",
+      "description": "Filing needs approval and restored content is verified."
+    }
+  ],
+  "cases": [
+    {
+      "id": "discover-assets",
+      "probe": "What demos and images do you have in the asset library?",
+      "mode": "read-or-ask",
+      "attachments": [],
+      "expected_reply": [
+        "Names available assets with read evidence; no internal tool inventory."
+      ],
+      "card_action": null,
+      "expected_state": null,
+      "criterion": "library-discovery",
+      "priority": "P0",
+      "repeat": 2
+    },
+    {
+      "id": "file-report",
+      "probe": "File the attached campaign report under campaigns.",
+      "mode": "action",
+      "attachments": [
+        "fixtures/acme-campaign-report.txt"
+      ],
+      "expected_reply": [
+        "Requests approval before claiming filing succeeded."
+      ],
+      "card_action": "approve",
+      "expected_state": {
+        "campaigns/acme-campaign-report.txt": "content matches the attachment"
+      },
+      "criterion": "approval-and-restoration",
+      "priority": "P0",
+      "repeat": 2
+    }
+  ]
+}

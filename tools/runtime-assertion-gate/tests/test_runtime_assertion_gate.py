@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import fnmatch
 import importlib.util
 import json
 import os
@@ -17,6 +18,8 @@ GATE_DIR = REPO_ROOT / "tools" / "runtime-assertion-gate"
 RUNNER = GATE_DIR / "run.sh"
 CI = REPO_ROOT / ".github" / "workflows" / "ci.yaml"
 SCRIPT = "charts/curie/ci/runtime/example-runtime.sh"
+WORKLOAD_INSTALL = "charts/curie/ci/scenarios/workload-install.sh"
+WORKLOAD_UP = f"bash tools/runtime-assertion-gate/run.sh {WORKLOAD_INSTALL} up"
 
 _spec = importlib.util.spec_from_file_location("runtime_assertion_gate", GATE_DIR / "gate.py")
 assert _spec and _spec.loader
@@ -30,6 +33,11 @@ CALICO = (
     "kubectl -n kube-system rollout status daemonset/calico-node --timeout=300s"
 )
 INVOKE = f"bash tools/runtime-assertion-gate/run.sh {SCRIPT}"
+# Cluster jobs defer to the merge queue on an unlabeled pull request, so the
+# registered condition ANDs the selection with the `deep` output.
+DEEP_CLAUSE = "needs.changes.outputs.deep == 'true'"
+PRE_DEEP_CLUSTER_IF = "${{ needs.changes.outputs.cluster == 'true' }}"
+CLUSTER_JOB_IF = "${{ needs.changes.outputs.cluster == 'true' && " + DEEP_CLAUSE + " }}"
 
 
 def _workflow(tmp_path: Path, **overrides: object) -> Path:
@@ -39,7 +47,7 @@ def _workflow(tmp_path: Path, **overrides: object) -> Path:
         {"name": "Run it", "run": INVOKE},
     ]
     job: dict[str, object] = {
-        "if": "${{ needs.changes.outputs.cluster == 'true' }}",
+        "if": CLUSTER_JOB_IF,
         "needs": ["changes"],
         "steps": steps,
     }
@@ -84,6 +92,8 @@ def test_unregistered_assertion_fails_with_path_and_missing_step(tmp_path: Path)
         ({"calico_after": True}, "does not install Calico"),
         ({"if": "${{ always() }}"}, "is not selected by"),
         ({"if": "${{ needs.changes.outputs.cluster == 'true' && false }}"}, "is not selected by"),
+        # The pre-deep condition would run the job on an unlabeled pull request.
+        ({"if": PRE_DEEP_CLUSTER_IF}, "is not selected by"),
         (
             {"step": {"run": f"if false; then\n  {INVOKE}\nfi"}},
             "runs other commands",
@@ -131,38 +141,39 @@ def test_real_ci_registers_its_calico_runtime_assertions() -> None:
         CI,
         [
             "charts/curie/ci/runtime/publication-job-assertions.sh",
-            "charts/curie/ci/runtime/langfuse-postgres-readiness-runtime.sh",
             "charts/curie/ci/runtime/connector-readiness-runtime.sh",
+            "charts/curie/ci/runtime/metrics-alerts-runtime.sh",
         ],
     )
 
 
-def test_real_ci_does_not_register_an_assertion_the_parity_ladder_only_covers() -> None:
-    # The general cluster ladder runs on every chart change; it is not proof.
+def test_real_ci_rejects_an_unregistered_runtime_assertion() -> None:
     with pytest.raises(gate.GateError, match="unregistered"):
-        gate.check_registration(CI, ["charts/curie/ci/runtime/metrics-alerts-runtime.sh"])
+        gate.check_registration(CI, [gate.NEGATIVE_UNREGISTERED])
 
 
-def _repo(tmp_path: Path, body: str) -> Path:
+def _repo(tmp_path: Path, body: str, script: str = SCRIPT) -> Path:
     repo = tmp_path / "repo"
-    (repo / "charts/curie/ci/runtime").mkdir(parents=True)
-    (repo / SCRIPT).write_text(body, encoding="utf-8")
+    (repo / script).parent.mkdir(parents=True)
+    (repo / script).write_text(body, encoding="utf-8")
     subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
     return repo
 
 
-def _run(repo: Path, receipts: Path, script: str = SCRIPT) -> subprocess.CompletedProcess[str]:
+def _run(
+    repo: Path, receipts: Path, script: str = SCRIPT, args: tuple[str, ...] = ()
+) -> subprocess.CompletedProcess[str]:
     env = {**os.environ, "RUNTIME_ASSERTION_RECEIPTS": str(receipts)}
     return subprocess.run(
-        ["bash", str(RUNNER), script], cwd=repo, env=env, capture_output=True, text=True
+        ["bash", str(RUNNER), script, *args], cwd=repo, env=env, capture_output=True, text=True
     )
 
 
-def _receipts(repo: Path, receipts: Path) -> None:
+def _receipts(repo: Path, receipts: Path, script: str = SCRIPT) -> None:
     cwd = Path.cwd()
     os.chdir(repo)
     try:
-        gate.check_receipts(receipts, [SCRIPT])
+        gate.check_receipts(receipts, [script])
     finally:
         os.chdir(cwd)
 
@@ -216,7 +227,17 @@ def test_select_lists_added_and_modified_assertions_only(tmp_path: Path) -> None
     subprocess.run([*git, "commit", "-qm", "base"], cwd=repo, check=True)
     (repo / SCRIPT).write_text("echo two\n")
     (repo / "charts/curie/ci/runtime/new-runtime.sh").write_text("echo new\n")
+    (repo / "charts/curie/ci/runtime/failed-first-install-retry-runtime.sh").write_text(
+        "echo held\n"
+    )
+    (repo / "charts/curie/ci/runtime/failed-first-install-retry-other.sh").write_text(
+        "echo required\n"
+    )
     (repo / "charts/curie/ci/runtime/notes.md").write_text("not a script\n")
+    fixture = repo / WORKLOAD_INSTALL
+    fixture.parent.mkdir(parents=True)
+    fixture.write_text("echo install\n")
+    (fixture.parent / "other-fixture.sh").write_text("echo unrelated\n")
     other.unlink()
     subprocess.run([*git, "add", "-A"], cwd=repo, check=True)
     subprocess.run([*git, "commit", "-qm", "head"], cwd=repo, check=True)
@@ -229,18 +250,91 @@ def test_select_lists_added_and_modified_assertions_only(tmp_path: Path) -> None
     )
     assert json.loads(completed.stdout) == [
         SCRIPT,
+        "charts/curie/ci/runtime/failed-first-install-retry-other.sh",
         "charts/curie/ci/runtime/new-runtime.sh",
+        WORKLOAD_INSTALL,
     ]
+
+
+def _needs(job: dict[str, object]) -> list[str]:
+    needs = job.get("needs", [])
+    return [needs] if isinstance(needs, str) else list(needs)  # type: ignore[arg-type]
+
+
+def _runs(job: dict[str, object]) -> str:
+    return "\n".join(str(step.get("run", "")) for step in job["steps"])  # type: ignore[attr-defined]
 
 
 def test_required_verdict_runs_the_gate_on_every_changed_assertion() -> None:
     jobs = yaml.safe_load(CI.read_text())["jobs"]
-    steps = jobs["e2e-required"]["steps"]
-    runs = "\n".join(str(step.get("run", "")) for step in steps)
-    assert "registration --workflow .github/workflows/ci.yaml" in runs
-    assert "receipts --dir" in runs
-    assert "self-test --workflow .github/workflows/ci.yaml" in runs
+    registration = jobs["runtime-assertion-registration"]
+    required = jobs["e2e-required"]
+    registration_runs = _runs(registration)
+    assert "self-test --workflow .github/workflows/ci.yaml" in registration_runs
+    assert "registration --workflow .github/workflows/ci.yaml" in registration_runs
+    assert _needs(registration) == ["changes"]
+    assert "runtime-assertion-registration" in _needs(required)
+    required_runs = _runs(required)
+    assert "receipts --dir" in required_runs
+    assert "registration --workflow" not in required_runs
+    assert "self-test --workflow" not in required_runs
     assert "runtime_assertions" in jobs["changes"]["outputs"]
+
+
+def test_registration_job_and_step_conditions_skip_only_the_empty_list() -> None:
+    job = yaml.safe_load(CI.read_text())["jobs"]["runtime-assertion-registration"]
+    # The job runs on every event and every verdict.
+    assert "if" not in job
+    steps = {step.get("name"): step for step in job["steps"]}
+    # Negative controls run on every verdict (#3391).
+    assert "if" not in steps["Runtime assertion gate negative controls"]
+    # Skipped only for the empty list; any nonempty list runs the guard.
+    guard = steps["Changed runtime assertions are registered"]
+    assert guard["if"] == "needs.changes.outputs.runtime_assertions != '[]'"
+
+
+def _run_registration_guard(
+    scripts: list[str], cluster_selected: str
+) -> subprocess.CompletedProcess[str]:
+    job = yaml.safe_load(CI.read_text())["jobs"]["runtime-assertion-registration"]
+    name = "Changed runtime assertions are registered"
+    steps = [s for s in job["steps"] if s.get("name") == name]
+    assert len(steps) == 1
+    environment = os.environ.copy()
+    environment.update(
+        {"RUNTIME_ASSERTIONS": json.dumps(scripts), "CLUSTER_SELECTED": cluster_selected}
+    )
+    return subprocess.run(
+        ["bash", "--noprofile", "--norc", "-e", "-o", "pipefail", "-c", steps[0]["run"]],
+        cwd=REPO_ROOT,
+        env=environment,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+
+def test_registration_guard_fails_an_unregistered_changed_assertion() -> None:
+    result = _run_registration_guard(
+        ["charts/curie/ci/runtime/unregistered-negative-control.sh"], "true"
+    )
+    assert result.returncode != 0
+    assert "unregistered" in result.stdout + result.stderr
+
+
+def test_registration_guard_fails_when_the_cluster_tier_was_not_selected() -> None:
+    result = _run_registration_guard(
+        ["charts/curie/ci/runtime/unregistered-negative-control.sh"], "false"
+    )
+    assert result.returncode != 0
+    assert "cluster tier" in result.stdout + result.stderr
+
+
+def test_registration_guard_passes_a_registered_changed_assertion() -> None:
+    result = _run_registration_guard(
+        ["charts/curie/ci/runtime/publication-job-assertions.sh"], "true"
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
 
 
 def test_self_test_passes_on_the_real_workflow() -> None:
@@ -250,4 +344,355 @@ def test_self_test_passes_on_the_real_workflow() -> None:
 def test_self_test_refuses_an_unregistered_anchor() -> None:
     # A control anchored on an unregistered script would prove nothing.
     with pytest.raises(gate.GateError, match="unregistered"):
-        gate.self_test(CI, "charts/curie/ci/runtime/metrics-alerts-runtime.sh")
+        gate.self_test(CI, gate.NEGATIVE_UNREGISTERED)
+
+
+CHART_JOB = "e2e-cluster-chart-regressions"
+PRE_DEEP_CHART_JOB_IF = "${{ needs.changes.outputs.chart_scenarios != '[]' }}"
+CHART_JOB_IF = "${{ needs.changes.outputs.chart_scenarios != '[]' && " + DEEP_CLAUSE + " }}"
+CHART_STEP_IF = (
+    "${{ matrix.leg == 'chart' && "
+    "contains(fromJSON(needs.changes.outputs.chart_scenarios), 'example-runtime') }}"
+)
+CHART_RUNTIME_SCRIPTS = [
+    # failed-first-install-retry-runtime.sh is temporarily disabled in CI (#5255).
+    "charts/curie/ci/runtime/upgrade-drain-installation-runtime.sh",
+    "charts/curie/ci/runtime/e2e-connector-identity-runtime.sh",
+    "charts/curie/ci/runtime/runner-resources-assertions.sh",
+    "charts/curie/ci/runtime/connector-readiness-runtime.sh",
+    "charts/curie/ci/runtime/metrics-alerts-runtime.sh",
+    "charts/curie/ci/runtime/idle-capacity-reclamation-runtime.sh",
+    "charts/curie/ci/runtime/factory-resource-profile-runtime.sh",
+]
+
+
+def _chart_workflow(tmp_path: Path) -> tuple[Path, Path]:
+    workflow = tmp_path / ".github/workflows/ci.yaml"
+    workflow.parent.mkdir(parents=True)
+    registry = tmp_path / ".github/e2e-selection.yaml"
+    document = yaml.safe_load((REPO_ROOT / ".github/e2e-selection.yaml").read_text())
+    document["chart_scenarios"] = {
+        "job": CHART_JOB,
+        "shared_inputs": ["charts/curie/templates"],
+        "scenarios": {"example-runtime": {"step": "Run it", "inputs": [SCRIPT], "leg": "chart"}},
+    }
+    registry.write_text(yaml.safe_dump(document, sort_keys=False))
+    workflow.write_text(yaml.safe_dump({
+        "jobs": {
+            CHART_JOB: {
+                "if": CHART_JOB_IF,
+                "steps": [
+                    {"name": "Install Calico", "run": CALICO},
+                    {"name": "Run it", "if": CHART_STEP_IF, "run": INVOKE},
+                ],
+            },
+            "e2e-required": {"needs": ["changes", CHART_JOB], "steps": []},
+        }
+    }, sort_keys=False))
+    return workflow, registry
+
+
+def test_chart_assertion_registers_with_its_own_scenario_condition(tmp_path: Path) -> None:
+    workflow, _registry = _chart_workflow(tmp_path)
+    gate.check_registration(workflow, [SCRIPT])
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    ["old-job-if", "pre-deep-job-if", "wrong-job-if", "wrong-step-if", "wrong-scenario-id",
+     "missing-step-if",
+     "missing-entry", "wrong-step-name", "script-only-shared", "script-only-other-scenario",
+     "no-calico", "late-calico", "conditional-calico", "step-continue", "job-continue",
+     "other-command", "not-required", "different-job", "missing-leg-clause", "wrong-leg",
+     "missing-registry-leg"],
+)
+def test_chart_scenario_registration_preserves_all_gate_requirements(
+    tmp_path: Path, mutation: str,
+) -> None:
+    workflow, registry_path = _chart_workflow(tmp_path)
+    document = yaml.safe_load(workflow.read_text())
+    registry = yaml.safe_load(registry_path.read_text())
+    job = document["jobs"][CHART_JOB]
+    step = job["steps"][1]
+    section = registry["chart_scenarios"]
+    entry = section["scenarios"]["example-runtime"]
+    if mutation == "old-job-if":
+        job["if"] = PRE_DEEP_CLUSTER_IF
+    elif mutation == "pre-deep-job-if":
+        job["if"] = PRE_DEEP_CHART_JOB_IF
+    elif mutation == "wrong-job-if":
+        job["if"] = "${{ needs.changes.outputs.chart_scenarios != '[]' && false }}"
+    elif mutation == "wrong-step-if":
+        step["if"] = "${{ false }}"
+    elif mutation == "wrong-scenario-id":
+        step["if"] = CHART_STEP_IF.replace("example-runtime", "other-runtime")
+    elif mutation == "missing-step-if":
+        del step["if"]
+    elif mutation == "missing-entry":
+        del section["scenarios"]["example-runtime"]
+    elif mutation == "wrong-step-name":
+        entry["step"] = "Another step"
+    elif mutation in {"script-only-shared", "script-only-other-scenario"}:
+        entry["inputs"] = ["charts/curie/ci/runtime/other-runtime.sh"]
+        if mutation == "script-only-shared":
+            section["shared_inputs"].append(SCRIPT)
+        else:
+            section["scenarios"]["other-runtime"] = {
+                "step": "Other step",
+                "inputs": [SCRIPT],
+                "leg": "chart",
+            }
+    elif mutation == "no-calico":
+        del job["steps"][0]
+    elif mutation == "late-calico":
+        job["steps"].append(job["steps"].pop(0))
+    elif mutation == "conditional-calico":
+        job["steps"][0]["if"] = "${{ false }}"
+    elif mutation == "step-continue":
+        step["continue-on-error"] = True
+    elif mutation == "job-continue":
+        job["continue-on-error"] = True
+    elif mutation == "other-command":
+        step["run"] += "\necho unrelated command"
+    elif mutation == "not-required":
+        document["jobs"]["e2e-required"]["needs"] = ["changes"]
+    elif mutation == "missing-leg-clause":
+        # The pre-#4722 condition runs the step in every leg.
+        step["if"] = (
+            "${{ contains(fromJSON(needs.changes.outputs.chart_scenarios), 'example-runtime') }}"
+        )
+    elif mutation == "wrong-leg":
+        step["if"] = CHART_STEP_IF.replace("'chart'", "'workload'")
+    elif mutation == "missing-registry-leg":
+        del entry["leg"]
+    else:
+        document["jobs"]["other-chart-job"] = document["jobs"].pop(CHART_JOB)
+        document["jobs"]["e2e-required"]["needs"] = ["changes", "other-chart-job"]
+    workflow.write_text(yaml.safe_dump(document, sort_keys=False))
+    registry_path.write_text(yaml.safe_dump(registry, sort_keys=False))
+    with pytest.raises(gate.GateError):
+        gate.check_registration(workflow, [SCRIPT])
+
+
+def test_real_ci_registers_every_enabled_chart_runtime_script() -> None:
+    gate.check_registration(CI, [*CHART_RUNTIME_SCRIPTS, WORKLOAD_INSTALL])
+
+
+def test_disabled_first_install_remains_ineligible_for_registration() -> None:
+    script = "charts/curie/ci/runtime/failed-first-install-retry-runtime.sh"
+    jobs = yaml.safe_load(CI.read_text())["jobs"]
+    step = next(
+        step for step in jobs[CHART_JOB]["steps"]
+        if step.get("name") == "Failed first install retry recreates data volumes"
+    )
+    assert step["if"].endswith(" && false }}")
+    with pytest.raises(gate.GateError, match="canonical chart scenario condition"):
+        gate.check_registration(CI, [script])
+
+
+def test_chart_legs_upload_distinct_receipts_the_required_verdict_merges() -> None:
+    jobs = yaml.safe_load(CI.read_text())["jobs"]
+    uploads = [
+        step
+        for step in jobs[CHART_JOB]["steps"]
+        if step.get("name") == "Upload runtime assertion receipts"
+    ]
+    assert len(uploads) == 1
+    name = uploads[0]["with"]["name"]
+    assert name == "runtime-assertion-receipts-${{ github.job }}-${{ matrix.leg }}"
+    downloads = [
+        step
+        for step in jobs["e2e-required"]["steps"]
+        if step.get("name") == "Download runtime assertion receipts"
+    ]
+    assert len(downloads) == 1
+    download = downloads[0]["with"]
+    assert download["merge-multiple"] is True
+    names = {
+        name.replace("${{ github.job }}", CHART_JOB).replace("${{ matrix.leg }}", leg)
+        for leg in ("chart", "workload")
+    }
+    # Two legs uploading one name would collide; each leg needs its own artifact.
+    assert len(names) == 2
+    for artifact in names:
+        assert "${{" not in artifact
+        assert fnmatch.fnmatchcase(artifact, download["pattern"]), artifact
+
+
+def test_self_test_exercises_the_registry_omission_negative_control(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    gate.self_test(CI, "charts/curie/ci/runtime/publication-job-assertions.sh")
+    output = capsys.readouterr().out
+    assert "negative control rejected" in output
+    assert "registry" in output.lower()
+
+
+RECEIPT_STEPS_IF = (
+    "${{ !cancelled() && needs.changes.outputs.runtime_assertions != '[]' && "
+    + DEEP_CLAUSE
+    + " }}"
+)
+
+
+def test_receipt_steps_defer_with_the_cluster_jobs_and_registration_does_not() -> None:
+    jobs = yaml.safe_load(CI.read_text())["jobs"]
+    steps = {step.get("name"): step for step in jobs["e2e-required"]["steps"]}
+    # The receipts come from deep cluster jobs, so they are required only when
+    # those jobs run; an unlabeled pull request defers both.
+    receipt_steps = (
+        "Download runtime assertion receipts",
+        "Changed runtime assertions executed and passed",
+    )
+    for name in receipt_steps:
+        assert steps[name]["if"] == RECEIPT_STEPS_IF, name
+    # Registration is static and still runs on every pull request.
+    registration = jobs["runtime-assertion-registration"]
+    assert "if" not in registration
+    assert all("deep" not in str(step.get("if", "")) for step in registration["steps"])
+
+
+@pytest.mark.parametrize(
+    ("path", "expected"),
+    [
+        (WORKLOAD_INSTALL, True),
+        ("charts/curie/ci/scenarios/other-fixture.sh", False),
+        (WORKLOAD_INSTALL + ".bak", False),
+        (WORKLOAD_INSTALL + "/child.sh", False),
+    ],
+)
+def test_only_the_exact_workload_fixture_joins_runtime_assertions(
+    path: str, expected: bool,
+) -> None:
+    assert gate.is_runtime_assertion(path) is expected
+
+
+def _workload_fixture_workflow(tmp_path: Path) -> Path:
+    workflow = tmp_path / ".github/workflows/ci.yaml"
+    workflow.parent.mkdir(parents=True)
+    document = yaml.safe_load(CI.read_text())
+    step = next(
+        step for step in document["jobs"][CHART_JOB]["steps"]
+        if step.get("name") == "Install the shared workload platform"
+    )
+    step["run"] = WORKLOAD_UP
+    registry = yaml.safe_load((REPO_ROOT / ".github/e2e-selection.yaml").read_text())
+    registry["chart_scenarios"]["fixtures"][step["name"]] = WORKLOAD_UP.split()
+    workflow.write_text(yaml.safe_dump(document, sort_keys=False))
+    (tmp_path / ".github/e2e-selection.yaml").write_text(
+        yaml.safe_dump(registry, sort_keys=False)
+    )
+    return workflow
+
+
+def test_workload_fixture_up_registers_as_a_dedicated_receipted_step(tmp_path: Path) -> None:
+    gate.check_registration(_workload_fixture_workflow(tmp_path), [WORKLOAD_INSTALL])
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    ["down", "missing-action", "extra-argument", "other-command", "suppressed",
+     "conditional-command", "conditional-step", "wrong-leg", "continue-on-error",
+     "unwrapped", "registry-down"],
+)
+def test_workload_fixture_registration_requires_unconditional_canonical_up(
+    tmp_path: Path, mutation: str,
+) -> None:
+    workflow = _workload_fixture_workflow(tmp_path)
+    document = yaml.safe_load(workflow.read_text())
+    step = next(
+        step for step in document["jobs"][CHART_JOB]["steps"]
+        if step.get("name") == "Install the shared workload platform"
+    )
+    if mutation == "down":
+        step["run"] = WORKLOAD_UP.removesuffix("up") + "down"
+    elif mutation == "missing-action":
+        step["run"] = WORKLOAD_UP.removesuffix(" up")
+    elif mutation == "extra-argument":
+        step["run"] += " extra"
+    elif mutation == "other-command":
+        step["run"] += "\necho unrelated command"
+    elif mutation == "suppressed":
+        step["run"] += " || true"
+    elif mutation == "conditional-command":
+        step["run"] = f"if false; then\n{WORKLOAD_UP}\nfi"
+    elif mutation == "conditional-step":
+        step["if"] += " && false"
+    elif mutation == "wrong-leg":
+        step["if"] = step["if"].replace("'workload'", "'chart'")
+    elif mutation == "continue-on-error":
+        step["continue-on-error"] = True
+    elif mutation == "unwrapped":
+        step["run"] = f"bash {WORKLOAD_INSTALL} up"
+    else:
+        registry_path = tmp_path / ".github/e2e-selection.yaml"
+        registry = yaml.safe_load(registry_path.read_text())
+        registry["chart_scenarios"]["fixtures"][step["name"]][-1] = "down"
+        registry_path.write_text(yaml.safe_dump(registry, sort_keys=False))
+    workflow.write_text(yaml.safe_dump(document, sort_keys=False))
+    with pytest.raises(gate.GateError):
+        gate.check_registration(workflow, [WORKLOAD_INSTALL])
+
+
+def test_workload_up_receipt_requires_the_executed_blob_and_phase(tmp_path: Path) -> None:
+    repo = _repo(tmp_path, 'test "$1" = up\necho installed\n', WORKLOAD_INSTALL)
+    receipts = tmp_path / "receipts"
+    completed = _run(repo, receipts, WORKLOAD_INSTALL, ("up",))
+    assert completed.returncode == 0, completed.stderr
+    receipt = receipts / "workload-install.json"
+    data = json.loads(receipt.read_text())
+    assert data["script"] == WORKLOAD_INSTALL and data["status"] == "pass"
+    assert data["phase"] == "up"
+    _receipts(repo, receipts, WORKLOAD_INSTALL)
+    (repo / WORKLOAD_INSTALL).write_text("echo changed\n")
+    with pytest.raises(gate.GateError):
+        _receipts(repo, receipts, WORKLOAD_INSTALL)
+
+
+@pytest.mark.parametrize("phase", [None, "down", "unexpected"])
+def test_workload_receipt_without_up_phase_fails(tmp_path: Path, phase: str | None) -> None:
+    repo = _repo(tmp_path, "echo installed\n", WORKLOAD_INSTALL)
+    receipts = tmp_path / "receipts"
+    assert _run(repo, receipts, WORKLOAD_INSTALL, ("up",)).returncode == 0
+    receipt = receipts / "workload-install.json"
+    data = json.loads(receipt.read_text())
+    if phase is None:
+        data.pop("phase", None)
+    else:
+        data["phase"] = phase
+    receipt.write_text(json.dumps(data))
+    with pytest.raises(gate.GateError):
+        _receipts(repo, receipts, WORKLOAD_INSTALL)
+
+
+@pytest.mark.parametrize("args", [(), ("down",), ("unexpected",), ("up", "extra")])
+def test_workload_runner_refuses_non_up_invocations_without_minting_receipts(
+    tmp_path: Path, args: tuple[str, ...],
+) -> None:
+    repo = _repo(tmp_path, "echo ran > invoked\n", WORKLOAD_INSTALL)
+    receipts = tmp_path / "receipts"
+    completed = _run(repo, receipts, WORKLOAD_INSTALL, args)
+    assert completed.returncode != 0, completed.stdout + completed.stderr
+    assert not (repo / "invoked").exists()
+    assert not receipts.exists()
+
+
+def test_workload_down_cannot_overwrite_a_successful_up_receipt(tmp_path: Path) -> None:
+    repo = _repo(tmp_path, "echo installed\n", WORKLOAD_INSTALL)
+    receipts = tmp_path / "receipts"
+    assert _run(repo, receipts, WORKLOAD_INSTALL, ("up",)).returncode == 0
+    receipt = receipts / "workload-install.json"
+    before = receipt.read_bytes()
+    assert _run(repo, receipts, WORKLOAD_INSTALL, ("down",)).returncode != 0
+    assert receipt.read_bytes() == before
+    _receipts(repo, receipts, WORKLOAD_INSTALL)
+
+
+def test_failed_or_unrun_workload_up_has_no_acceptable_receipt(tmp_path: Path) -> None:
+    repo = _repo(tmp_path, "exit 7\n", WORKLOAD_INSTALL)
+    receipts = tmp_path / "receipts"
+    with pytest.raises(gate.GateError, match="no pass receipt"):
+        _receipts(repo, receipts, WORKLOAD_INSTALL)
+    assert _run(repo, receipts, WORKLOAD_INSTALL, ("up",)).returncode == 7
+    with pytest.raises(gate.GateError, match="no pass receipt"):
+        _receipts(repo, receipts, WORKLOAD_INSTALL)

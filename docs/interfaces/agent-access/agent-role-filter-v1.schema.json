@@ -1,0 +1,535 @@
+{
+  "$defs": {
+    "AgentRoleChangeV1": {
+      "discriminator": {
+        "mapping": {
+          "migrate_role": "#/$defs/MigrateRoleV1",
+          "set_filter": "#/$defs/SetRoleFilterV1"
+        },
+        "propertyName": "operation"
+      },
+      "oneOf": [
+        {
+          "$ref": "#/$defs/SetRoleFilterV1"
+        },
+        {
+          "$ref": "#/$defs/MigrateRoleV1"
+        }
+      ]
+    },
+    "AgentRolePolicyV1": {
+      "additionalProperties": false,
+      "description": "@spec AGENT-ROLE-FILTER-V1-3, AGENT-ROLE-FILTER-V1-4.",
+      "properties": {
+        "agent_id": {
+          "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$(?![\\s\\S])",
+          "title": "Agent Id",
+          "type": "string"
+        },
+        "roles": {
+          "$ref": "#/$defs/AgentRolesV1"
+        },
+        "schema_version": {
+          "const": 1,
+          "maximum": 1,
+          "minimum": 1,
+          "title": "Schema Version",
+          "type": "integer"
+        },
+        "tenant_id": {
+          "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$(?![\\s\\S])",
+          "title": "Tenant Id",
+          "type": "string"
+        },
+        "version": {
+          "maximum": 2147483647,
+          "minimum": 1,
+          "title": "Version",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "schema_version",
+        "tenant_id",
+        "agent_id",
+        "version",
+        "roles"
+      ],
+      "title": "AgentRolePolicyV1",
+      "type": "object"
+    },
+    "AgentRolesV1": {
+      "additionalProperties": false,
+      "description": "@spec AGENT-ROLE-FILTER-V1-3, AGENT-ROLE-FILTER-V1-6.",
+      "properties": {
+        "approver": {
+          "default": null,
+          "discriminator": {
+            "mapping": {
+              "migrated": "#/$defs/MigratedRoleConfigurationV1",
+              "retained": "#/$defs/RetainedRoleConfigurationV1"
+            },
+            "propertyName": "legacy_state"
+          },
+          "oneOf": [
+            {
+              "$ref": "#/$defs/RetainedRoleConfigurationV1"
+            },
+            {
+              "$ref": "#/$defs/MigratedRoleConfigurationV1"
+            }
+          ],
+          "title": "Approver"
+        },
+        "invocation": {
+          "default": null,
+          "discriminator": {
+            "mapping": {
+              "migrated": "#/$defs/MigratedRoleConfigurationV1",
+              "retained": "#/$defs/RetainedRoleConfigurationV1"
+            },
+            "propertyName": "legacy_state"
+          },
+          "oneOf": [
+            {
+              "$ref": "#/$defs/RetainedRoleConfigurationV1"
+            },
+            {
+              "$ref": "#/$defs/MigratedRoleConfigurationV1"
+            }
+          ],
+          "title": "Invocation"
+        }
+      },
+      "title": "AgentRolesV1",
+      "type": "object"
+    },
+    "GroupV1": {
+      "additionalProperties": false,
+      "description": "@spec HTTP-IDENTITY-V1-2.",
+      "properties": {
+        "id": {
+          "minLength": 1,
+          "title": "Id",
+          "type": "string"
+        },
+        "issuer": {
+          "description": "Structural HTTPS issuer constraints preserve exact-string URL parsing compatibility. Unicode NFKC netloc checks require semantic validation with the pure facts validator; schema validation alone is insufficient.",
+          "minLength": 1,
+          "pattern": "^(?![\\x09-\\x0d\\x1c-\\x20\\x85\\xa0\\u1680\\u2000-\\u200a\\u2028\\u2029\\u202f\\u205f\\u3000])(?![\\s\\S]*[\\x09-\\x0d\\x1c-\\x20\\x85\\xa0\\u1680\\u2000-\\u200a\\u2028\\u2029\\u202f\\u205f\\u3000]$(?![\\s\\S]))[\\x00-\\x20]*[hH][\\t\\r\\n]*[tT][\\t\\r\\n]*[tT][\\t\\r\\n]*[pP][\\t\\r\\n]*[sS][\\t\\r\\n]*:[\\t\\r\\n]*/[\\t\\r\\n]*/[\\t\\r\\n]*(?:\\[[\\t\\r\\n]*(?:v[\\t\\r\\n]*(?:[0-9a-fA-F][\\t\\r\\n]*)+\\.[\\t\\r\\n]*(?:[^/?#@\\]\\t\\r\\n][\\t\\r\\n]*)+|(?:(?:[0-9a-fA-F][\\t\\r\\n]*){1,4}(?::[\\t\\r\\n]*(?:[0-9a-fA-F][\\t\\r\\n]*){1,4}){7}|:[\\t\\r\\n]*:[\\t\\r\\n]*(?:(?:[0-9a-fA-F][\\t\\r\\n]*){1,4}(?::[\\t\\r\\n]*(?:[0-9a-fA-F][\\t\\r\\n]*){1,4}){0,6})?|(?:(?:[0-9a-fA-F][\\t\\r\\n]*){1,4}:[\\t\\r\\n]*){1}:[\\t\\r\\n]*(?:(?:[0-9a-fA-F][\\t\\r\\n]*){1,4}(?::[\\t\\r\\n]*(?:[0-9a-fA-F][\\t\\r\\n]*){1,4}){0,5})?|(?:(?:[0-9a-fA-F][\\t\\r\\n]*){1,4}:[\\t\\r\\n]*){2}:[\\t\\r\\n]*(?:(?:[0-9a-fA-F][\\t\\r\\n]*){1,4}(?::[\\t\\r\\n]*(?:[0-9a-fA-F][\\t\\r\\n]*){1,4}){0,4})?|(?:(?:[0-9a-fA-F][\\t\\r\\n]*){1,4}:[\\t\\r\\n]*){3}:[\\t\\r\\n]*(?:(?:[0-9a-fA-F][\\t\\r\\n]*){1,4}(?::[\\t\\r\\n]*(?:[0-9a-fA-F][\\t\\r\\n]*){1,4}){0,3})?|(?:(?:[0-9a-fA-F][\\t\\r\\n]*){1,4}:[\\t\\r\\n]*){4}:[\\t\\r\\n]*(?:(?:[0-9a-fA-F][\\t\\r\\n]*){1,4}(?::[\\t\\r\\n]*(?:[0-9a-fA-F][\\t\\r\\n]*){1,4}){0,2})?|(?:(?:[0-9a-fA-F][\\t\\r\\n]*){1,4}:[\\t\\r\\n]*){5}:[\\t\\r\\n]*(?:(?:[0-9a-fA-F][\\t\\r\\n]*){1,4}(?::[\\t\\r\\n]*(?:[0-9a-fA-F][\\t\\r\\n]*){1,4}){0,1})?|(?:(?:[0-9a-fA-F][\\t\\r\\n]*){1,4}:[\\t\\r\\n]*){6}:[\\t\\r\\n]*(?:(?:[0-9a-fA-F][\\t\\r\\n]*){1,4}(?::[\\t\\r\\n]*(?:[0-9a-fA-F][\\t\\r\\n]*){1,4}){0,0})?|(?:(?:[0-9a-fA-F][\\t\\r\\n]*){1,4}:[\\t\\r\\n]*){7}:[\\t\\r\\n]*|(?:(?:(?:[0-9a-fA-F][\\t\\r\\n]*){1,4}:[\\t\\r\\n]*){6}|:[\\t\\r\\n]*:[\\t\\r\\n]*(?:(?:[0-9a-fA-F][\\t\\r\\n]*){1,4}:[\\t\\r\\n]*){0,5}|(?:(?:[0-9a-fA-F][\\t\\r\\n]*){1,4}:[\\t\\r\\n]*){1}:[\\t\\r\\n]*(?:(?:[0-9a-fA-F][\\t\\r\\n]*){1,4}:[\\t\\r\\n]*){0,4}|(?:(?:[0-9a-fA-F][\\t\\r\\n]*){1,4}:[\\t\\r\\n]*){2}:[\\t\\r\\n]*(?:(?:[0-9a-fA-F][\\t\\r\\n]*){1,4}:[\\t\\r\\n]*){0,3}|(?:(?:[0-9a-fA-F][\\t\\r\\n]*){1,4}:[\\t\\r\\n]*){3}:[\\t\\r\\n]*(?:(?:[0-9a-fA-F][\\t\\r\\n]*){1,4}:[\\t\\r\\n]*){0,2}|(?:(?:[0-9a-fA-F][\\t\\r\\n]*){1,4}:[\\t\\r\\n]*){4}:[\\t\\r\\n]*(?:(?:[0-9a-fA-F][\\t\\r\\n]*){1,4}:[\\t\\r\\n]*){0,1}|(?:(?:[0-9a-fA-F][\\t\\r\\n]*){1,4}:[\\t\\r\\n]*){5}:[\\t\\r\\n]*(?:(?:[0-9a-fA-F][\\t\\r\\n]*){1,4}:[\\t\\r\\n]*){0,0})(?:2[\\t\\r\\n]*5[\\t\\r\\n]*[0-5][\\t\\r\\n]*|2[\\t\\r\\n]*[0-4][\\t\\r\\n]*[0-9][\\t\\r\\n]*|1[\\t\\r\\n]*(?:[0-9][\\t\\r\\n]*){2}|[1-9][\\t\\r\\n]*[0-9][\\t\\r\\n]*|[0-9][\\t\\r\\n]*)(?:\\.[\\t\\r\\n]*(?:2[\\t\\r\\n]*5[\\t\\r\\n]*[0-5][\\t\\r\\n]*|2[\\t\\r\\n]*[0-4][\\t\\r\\n]*[0-9][\\t\\r\\n]*|1[\\t\\r\\n]*(?:[0-9][\\t\\r\\n]*){2}|[1-9][\\t\\r\\n]*[0-9][\\t\\r\\n]*|[0-9][\\t\\r\\n]*)){3})(?:%[\\t\\r\\n]*(?:[^%/?#@\\]\\t\\r\\n][\\t\\r\\n]*)+)?)\\][\\t\\r\\n]*(?::[\\t\\r\\n]*(?:[^/?#@\\t\\r\\n][\\t\\r\\n]*)*)?|(?:[^:/?#@\\[\\]\\t\\r\\n][\\t\\r\\n]*)+(?::[\\t\\r\\n]*(?:[^/?#@\\[\\]\\t\\r\\n][\\t\\r\\n]*)*)?)(?:/[^?#]*)?(?:\\?[\\t\\r\\n]*)?(?:#[\\t\\r\\n]*)?$(?![\\s\\S])",
+          "title": "Issuer",
+          "type": "string"
+        }
+      },
+      "required": [
+        "issuer",
+        "id"
+      ],
+      "title": "GroupV1",
+      "type": "object"
+    },
+    "IssuerGroupSelectorV1": {
+      "additionalProperties": false,
+      "description": "@spec AGENT-ROLE-FILTER-V1-2.",
+      "properties": {
+        "group": {
+          "$ref": "#/$defs/GroupV1"
+        },
+        "kind": {
+          "const": "issuer_group",
+          "title": "Kind",
+          "type": "string"
+        }
+      },
+      "required": [
+        "kind",
+        "group"
+      ],
+      "title": "IssuerGroupSelectorV1",
+      "type": "object"
+    },
+    "IssuerSubjectSelectorV1": {
+      "additionalProperties": false,
+      "description": "@spec AGENT-ROLE-FILTER-V1-2.",
+      "properties": {
+        "issuer": {
+          "description": "Structural HTTPS issuer constraints preserve exact-string URL parsing compatibility. Unicode NFKC netloc checks require semantic validation with the pure facts validator; schema validation alone is insufficient.",
+          "minLength": 1,
+          "pattern": "^(?![\\x09-\\x0d\\x1c-\\x20\\x85\\xa0\\u1680\\u2000-\\u200a\\u2028\\u2029\\u202f\\u205f\\u3000])(?![\\s\\S]*[\\x09-\\x0d\\x1c-\\x20\\x85\\xa0\\u1680\\u2000-\\u200a\\u2028\\u2029\\u202f\\u205f\\u3000]$(?![\\s\\S]))[\\x00-\\x20]*[hH][\\t\\r\\n]*[tT][\\t\\r\\n]*[tT][\\t\\r\\n]*[pP][\\t\\r\\n]*[sS][\\t\\r\\n]*:[\\t\\r\\n]*/[\\t\\r\\n]*/[\\t\\r\\n]*(?:\\[[\\t\\r\\n]*(?:v[\\t\\r\\n]*(?:[0-9a-fA-F][\\t\\r\\n]*)+\\.[\\t\\r\\n]*(?:[^/?#@\\]\\t\\r\\n][\\t\\r\\n]*)+|(?:(?:[0-9a-fA-F][\\t\\r\\n]*){1,4}(?::[\\t\\r\\n]*(?:[0-9a-fA-F][\\t\\r\\n]*){1,4}){7}|:[\\t\\r\\n]*:[\\t\\r\\n]*(?:(?:[0-9a-fA-F][\\t\\r\\n]*){1,4}(?::[\\t\\r\\n]*(?:[0-9a-fA-F][\\t\\r\\n]*){1,4}){0,6})?|(?:(?:[0-9a-fA-F][\\t\\r\\n]*){1,4}:[\\t\\r\\n]*){1}:[\\t\\r\\n]*(?:(?:[0-9a-fA-F][\\t\\r\\n]*){1,4}(?::[\\t\\r\\n]*(?:[0-9a-fA-F][\\t\\r\\n]*){1,4}){0,5})?|(?:(?:[0-9a-fA-F][\\t\\r\\n]*){1,4}:[\\t\\r\\n]*){2}:[\\t\\r\\n]*(?:(?:[0-9a-fA-F][\\t\\r\\n]*){1,4}(?::[\\t\\r\\n]*(?:[0-9a-fA-F][\\t\\r\\n]*){1,4}){0,4})?|(?:(?:[0-9a-fA-F][\\t\\r\\n]*){1,4}:[\\t\\r\\n]*){3}:[\\t\\r\\n]*(?:(?:[0-9a-fA-F][\\t\\r\\n]*){1,4}(?::[\\t\\r\\n]*(?:[0-9a-fA-F][\\t\\r\\n]*){1,4}){0,3})?|(?:(?:[0-9a-fA-F][\\t\\r\\n]*){1,4}:[\\t\\r\\n]*){4}:[\\t\\r\\n]*(?:(?:[0-9a-fA-F][\\t\\r\\n]*){1,4}(?::[\\t\\r\\n]*(?:[0-9a-fA-F][\\t\\r\\n]*){1,4}){0,2})?|(?:(?:[0-9a-fA-F][\\t\\r\\n]*){1,4}:[\\t\\r\\n]*){5}:[\\t\\r\\n]*(?:(?:[0-9a-fA-F][\\t\\r\\n]*){1,4}(?::[\\t\\r\\n]*(?:[0-9a-fA-F][\\t\\r\\n]*){1,4}){0,1})?|(?:(?:[0-9a-fA-F][\\t\\r\\n]*){1,4}:[\\t\\r\\n]*){6}:[\\t\\r\\n]*(?:(?:[0-9a-fA-F][\\t\\r\\n]*){1,4}(?::[\\t\\r\\n]*(?:[0-9a-fA-F][\\t\\r\\n]*){1,4}){0,0})?|(?:(?:[0-9a-fA-F][\\t\\r\\n]*){1,4}:[\\t\\r\\n]*){7}:[\\t\\r\\n]*|(?:(?:(?:[0-9a-fA-F][\\t\\r\\n]*){1,4}:[\\t\\r\\n]*){6}|:[\\t\\r\\n]*:[\\t\\r\\n]*(?:(?:[0-9a-fA-F][\\t\\r\\n]*){1,4}:[\\t\\r\\n]*){0,5}|(?:(?:[0-9a-fA-F][\\t\\r\\n]*){1,4}:[\\t\\r\\n]*){1}:[\\t\\r\\n]*(?:(?:[0-9a-fA-F][\\t\\r\\n]*){1,4}:[\\t\\r\\n]*){0,4}|(?:(?:[0-9a-fA-F][\\t\\r\\n]*){1,4}:[\\t\\r\\n]*){2}:[\\t\\r\\n]*(?:(?:[0-9a-fA-F][\\t\\r\\n]*){1,4}:[\\t\\r\\n]*){0,3}|(?:(?:[0-9a-fA-F][\\t\\r\\n]*){1,4}:[\\t\\r\\n]*){3}:[\\t\\r\\n]*(?:(?:[0-9a-fA-F][\\t\\r\\n]*){1,4}:[\\t\\r\\n]*){0,2}|(?:(?:[0-9a-fA-F][\\t\\r\\n]*){1,4}:[\\t\\r\\n]*){4}:[\\t\\r\\n]*(?:(?:[0-9a-fA-F][\\t\\r\\n]*){1,4}:[\\t\\r\\n]*){0,1}|(?:(?:[0-9a-fA-F][\\t\\r\\n]*){1,4}:[\\t\\r\\n]*){5}:[\\t\\r\\n]*(?:(?:[0-9a-fA-F][\\t\\r\\n]*){1,4}:[\\t\\r\\n]*){0,0})(?:2[\\t\\r\\n]*5[\\t\\r\\n]*[0-5][\\t\\r\\n]*|2[\\t\\r\\n]*[0-4][\\t\\r\\n]*[0-9][\\t\\r\\n]*|1[\\t\\r\\n]*(?:[0-9][\\t\\r\\n]*){2}|[1-9][\\t\\r\\n]*[0-9][\\t\\r\\n]*|[0-9][\\t\\r\\n]*)(?:\\.[\\t\\r\\n]*(?:2[\\t\\r\\n]*5[\\t\\r\\n]*[0-5][\\t\\r\\n]*|2[\\t\\r\\n]*[0-4][\\t\\r\\n]*[0-9][\\t\\r\\n]*|1[\\t\\r\\n]*(?:[0-9][\\t\\r\\n]*){2}|[1-9][\\t\\r\\n]*[0-9][\\t\\r\\n]*|[0-9][\\t\\r\\n]*)){3})(?:%[\\t\\r\\n]*(?:[^%/?#@\\]\\t\\r\\n][\\t\\r\\n]*)+)?)\\][\\t\\r\\n]*(?::[\\t\\r\\n]*(?:[^/?#@\\t\\r\\n][\\t\\r\\n]*)*)?|(?:[^:/?#@\\[\\]\\t\\r\\n][\\t\\r\\n]*)+(?::[\\t\\r\\n]*(?:[^/?#@\\[\\]\\t\\r\\n][\\t\\r\\n]*)*)?)(?:/[^?#]*)?(?:\\?[\\t\\r\\n]*)?(?:#[\\t\\r\\n]*)?$(?![\\s\\S])",
+          "title": "Issuer",
+          "type": "string"
+        },
+        "kind": {
+          "const": "issuer_subject",
+          "title": "Kind",
+          "type": "string"
+        },
+        "subject": {
+          "minLength": 1,
+          "title": "Subject",
+          "type": "string"
+        }
+      },
+      "required": [
+        "kind",
+        "issuer",
+        "subject"
+      ],
+      "title": "IssuerSubjectSelectorV1",
+      "type": "object"
+    },
+    "MigrateRoleV1": {
+      "additionalProperties": false,
+      "description": "@spec AGENT-ROLE-FILTER-V1-4.",
+      "properties": {
+        "agent_id": {
+          "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$(?![\\s\\S])",
+          "title": "Agent Id",
+          "type": "string"
+        },
+        "expected_version": {
+          "maximum": 2147483647,
+          "minimum": 0,
+          "title": "Expected Version",
+          "type": "integer"
+        },
+        "filter": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/RoleFilterV1"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "operation": {
+          "const": "migrate_role",
+          "title": "Operation",
+          "type": "string"
+        },
+        "raw_account_revocation": {
+          "const": "separate_removal_required",
+          "title": "Raw Account Revocation",
+          "type": "string"
+        },
+        "role": {
+          "enum": [
+            "invocation",
+            "approver"
+          ],
+          "title": "Role",
+          "type": "string"
+        },
+        "schema_version": {
+          "const": 1,
+          "maximum": 1,
+          "minimum": 1,
+          "title": "Schema Version",
+          "type": "integer"
+        },
+        "tenant_id": {
+          "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$(?![\\s\\S])",
+          "title": "Tenant Id",
+          "type": "string"
+        }
+      },
+      "required": [
+        "schema_version",
+        "tenant_id",
+        "agent_id",
+        "expected_version",
+        "role",
+        "operation",
+        "filter",
+        "raw_account_revocation"
+      ],
+      "title": "MigrateRoleV1",
+      "type": "object"
+    },
+    "MigratedRoleConfigurationV1": {
+      "additionalProperties": false,
+      "description": "@spec AGENT-ROLE-FILTER-V1-3.",
+      "properties": {
+        "filter": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/RoleFilterV1"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "legacy_state": {
+          "const": "migrated",
+          "title": "Legacy State",
+          "type": "string"
+        },
+        "raw_account_revocation": {
+          "const": "separate_removal_required",
+          "title": "Raw Account Revocation",
+          "type": "string"
+        },
+        "schema_version": {
+          "const": 1,
+          "maximum": 1,
+          "minimum": 1,
+          "title": "Schema Version",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "schema_version",
+        "legacy_state",
+        "filter",
+        "raw_account_revocation"
+      ],
+      "title": "MigratedRoleConfigurationV1",
+      "type": "object"
+    },
+    "NamespaceV1": {
+      "additionalProperties": false,
+      "description": "@spec HTTP-IDENTITY-V1-1.",
+      "properties": {
+        "authority": {
+          "title": "Authority",
+          "type": "string"
+        },
+        "id": {
+          "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$(?![\\s\\S])",
+          "title": "Id",
+          "type": "string"
+        },
+        "key": {
+          "minLength": 1,
+          "title": "Key",
+          "type": "string"
+        },
+        "kind": {
+          "minLength": 1,
+          "title": "Kind",
+          "type": "string"
+        }
+      },
+      "required": [
+        "id",
+        "authority",
+        "kind",
+        "key"
+      ],
+      "title": "NamespaceV1",
+      "type": "object"
+    },
+    "RetainedRoleConfigurationV1": {
+      "additionalProperties": false,
+      "description": "@spec AGENT-ROLE-FILTER-V1-3.",
+      "properties": {
+        "filter": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/RoleFilterV1"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "legacy_state": {
+          "const": "retained",
+          "title": "Legacy State",
+          "type": "string"
+        },
+        "schema_version": {
+          "const": 1,
+          "maximum": 1,
+          "minimum": 1,
+          "title": "Schema Version",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "schema_version",
+        "legacy_state",
+        "filter"
+      ],
+      "title": "RetainedRoleConfigurationV1",
+      "type": "object"
+    },
+    "RoleConfigurationV1": {
+      "discriminator": {
+        "mapping": {
+          "migrated": "#/$defs/MigratedRoleConfigurationV1",
+          "retained": "#/$defs/RetainedRoleConfigurationV1"
+        },
+        "propertyName": "legacy_state"
+      },
+      "oneOf": [
+        {
+          "$ref": "#/$defs/RetainedRoleConfigurationV1"
+        },
+        {
+          "$ref": "#/$defs/MigratedRoleConfigurationV1"
+        }
+      ]
+    },
+    "RoleFilterV1": {
+      "additionalProperties": false,
+      "description": "@spec AGENT-ROLE-FILTER-V1-2, AGENT-ROLE-FILTER-V1-6.",
+      "properties": {
+        "entries": {
+          "items": {
+            "discriminator": {
+              "mapping": {
+                "issuer_group": "#/$defs/IssuerGroupSelectorV1",
+                "issuer_subject": "#/$defs/IssuerSubjectSelectorV1",
+                "surface_account": "#/$defs/SurfaceAccountSelectorV1"
+              },
+              "propertyName": "kind"
+            },
+            "oneOf": [
+              {
+                "$ref": "#/$defs/SurfaceAccountSelectorV1"
+              },
+              {
+                "$ref": "#/$defs/IssuerSubjectSelectorV1"
+              },
+              {
+                "$ref": "#/$defs/IssuerGroupSelectorV1"
+              }
+            ]
+          },
+          "maxItems": 128,
+          "title": "Entries",
+          "type": "array",
+          "uniqueItems": true
+        }
+      },
+      "required": [
+        "entries"
+      ],
+      "title": "RoleFilterV1",
+      "type": "object"
+    },
+    "SelectorV1": {
+      "discriminator": {
+        "mapping": {
+          "issuer_group": "#/$defs/IssuerGroupSelectorV1",
+          "issuer_subject": "#/$defs/IssuerSubjectSelectorV1",
+          "surface_account": "#/$defs/SurfaceAccountSelectorV1"
+        },
+        "propertyName": "kind"
+      },
+      "oneOf": [
+        {
+          "$ref": "#/$defs/SurfaceAccountSelectorV1"
+        },
+        {
+          "$ref": "#/$defs/IssuerSubjectSelectorV1"
+        },
+        {
+          "$ref": "#/$defs/IssuerGroupSelectorV1"
+        }
+      ]
+    },
+    "SetRoleFilterV1": {
+      "additionalProperties": false,
+      "description": "@spec AGENT-ROLE-FILTER-V1-4.",
+      "properties": {
+        "agent_id": {
+          "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$(?![\\s\\S])",
+          "title": "Agent Id",
+          "type": "string"
+        },
+        "expected_version": {
+          "maximum": 2147483647,
+          "minimum": 0,
+          "title": "Expected Version",
+          "type": "integer"
+        },
+        "filter": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/RoleFilterV1"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "operation": {
+          "const": "set_filter",
+          "title": "Operation",
+          "type": "string"
+        },
+        "role": {
+          "enum": [
+            "invocation",
+            "approver"
+          ],
+          "title": "Role",
+          "type": "string"
+        },
+        "schema_version": {
+          "const": 1,
+          "maximum": 1,
+          "minimum": 1,
+          "title": "Schema Version",
+          "type": "integer"
+        },
+        "tenant_id": {
+          "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$(?![\\s\\S])",
+          "title": "Tenant Id",
+          "type": "string"
+        }
+      },
+      "required": [
+        "schema_version",
+        "tenant_id",
+        "agent_id",
+        "expected_version",
+        "role",
+        "operation",
+        "filter"
+      ],
+      "title": "SetRoleFilterV1",
+      "type": "object"
+    },
+    "SurfaceAccountSelectorV1": {
+      "additionalProperties": false,
+      "description": "@spec AGENT-ROLE-FILTER-V1-2.",
+      "properties": {
+        "kind": {
+          "const": "surface_account",
+          "title": "Kind",
+          "type": "string"
+        },
+        "namespace": {
+          "$ref": "#/$defs/NamespaceV1"
+        },
+        "native_id": {
+          "minLength": 1,
+          "title": "Native Id",
+          "type": "string"
+        },
+        "provider": {
+          "minLength": 1,
+          "title": "Provider",
+          "type": "string"
+        }
+      },
+      "required": [
+        "kind",
+        "provider",
+        "namespace",
+        "native_id"
+      ],
+      "title": "SurfaceAccountSelectorV1",
+      "type": "object"
+    }
+  },
+  "$id": "https://curietech.ai/schemas/agent-role-filter-v1.schema.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "description": "Pure policy and one-role change representations; no runtime route or authorization result. Select a root through its local $defs reference. Byte limits, duplicate JSON object keys, integer-token spelling, refusal-code precedence, namespace descriptor consistency, inherited Issuer Unicode-NFKC validity and unpaired-surrogate rejection require the pure byte parser. JSON Schema integer semantics admit mathematically integral decimal and exponent values. Structural schema acceptance does not establish authenticated scope, persistence or migration execution.",
+  "title": "Agent role filter representation v1"
+}

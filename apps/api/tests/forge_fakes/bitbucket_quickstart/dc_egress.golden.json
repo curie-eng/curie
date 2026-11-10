@@ -1,0 +1,22 @@
+[
+  {
+    "cidr": "192.0.2.10/32",
+    "ports": [
+      {
+        "protocol": "TCP",
+        "port": 8443
+      }
+    ],
+    "host": "bbdc.example.invalid"
+  },
+  {
+    "cidr": "2001:db8::10/128",
+    "ports": [
+      {
+        "protocol": "TCP",
+        "port": 8443
+      }
+    ],
+    "host": "bbdc.example.invalid"
+  }
+]

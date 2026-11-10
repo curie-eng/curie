@@ -13,8 +13,9 @@ from typing import Any
 
 import redis
 from aci_protocol import STREAM_PAYLOAD_FIELD, EvalJob
-from curie_api import crud
 from curie_api.config import get_settings
+from curie_api.crud import deployments as crud_deployments
+from curie_api.crud import versions as crud_versions
 from curie_api.models import Environment
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
@@ -52,7 +53,7 @@ async def _seed_version_and_dev_deployment(
     sessionmaker = async_sessionmaker(engine, expire_on_commit=False)
     try:
         async with sessionmaker() as session:
-            version = await crud.create_version_row(
+            version = await crud_versions.create_version_row(
                 session,
                 uuid.UUID(agent_id),
                 version_label=version_label,
@@ -62,7 +63,7 @@ async def _seed_version_and_dev_deployment(
             )
             if bundle_sha256 is not None:
                 assert bundle_ref is not None
-                version = await crud.attach_bundle(
+                version = await crud_versions.attach_bundle(
                     session,
                     version,
                     bundle_ref,
@@ -70,7 +71,7 @@ async def _seed_version_and_dev_deployment(
                 )
             version_id = str(version.id)
             if deploy:
-                await crud.create_deployment_row(
+                await crud_deployments.create_deployment_row(
                     session,
                     uuid.UUID(agent_id),
                     version.id,

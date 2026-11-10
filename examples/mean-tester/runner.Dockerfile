@@ -8,4 +8,6 @@ FROM ${CURIE_RUNNER_IMAGE}
 USER root
 RUN npm install -g @zencoderai/slack-mcp-server@0.0.1
 RUN npm install -g @modelcontextprotocol/server-github@2025.4.8
+# The ship gate the skill runs from the shell (docs/VALIDATOR.md, "Ship verdict").
+COPY --chmod=0755 gate/mean_tester_gate.py /usr/local/bin/mean-tester-gate
 USER 1000:1000

@@ -1,0 +1,28 @@
+# Dex for `curie dev oidc-e2e`, rendered by oidc_e2e.py with string.Template
+# (a doubled dollar sign is a literal one).
+# A password user (no groups) and the mock connector (groups: authors) give the
+# driver both sides of a required-claims check against a real IdP.
+issuer: $issuer
+storage:
+  type: memory
+web:
+  http: 0.0.0.0:$dex_port
+oauth2:
+  skipApprovalScreen: true
+staticClients:
+  - id: $client_id
+    name: Curie console (oidc-e2e)
+    secret: $client_secret
+    redirectURIs:
+      - $redirect_uri
+enablePasswordDB: true
+staticPasswords:
+  - email: $user_email
+    username: alice
+    userID: 08a8684b-db88-4b73-90a9-3cd1661f5466
+    # bcrypt of "password"
+    hash: "$$2a$$10$$2b2cU8CPhOTaGrs1HRQuAueS7JTT5ZHsHSzYiFPm1leZck7Mc8T4W"
+connectors:
+  - type: mockCallback
+    id: mock
+    name: Mock

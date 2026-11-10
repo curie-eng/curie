@@ -4,6 +4,10 @@ Date: 2026-09-29
 
 Status: Accepted
 
+Superseded in part by [ADR 0202](0202-a-test-installation-admits-a-listed-bots-actions-and-approval-replies.md): the words "on every installation" no longer
+apply to a test installation as ADR 0202 defines it. Everywhere else
+read-or-ask stays the rule.
+
 Accepted with explicit maintainer approval from Brian on 2026-09-29,
 alongside the forward merge into `next` under ADR 0102.
 

@@ -1,0 +1,526 @@
+"""Remediation policy administration routes, @spec AUTOMATED-REMEDIATION-3.
+
+``GET``, ``PUT`` and ``DELETE`` on ``/agents/{agent_id}/hooks/{hook}/remediation-policy``,
+``POST .../arm`` and ``POST .../disarm``,
+``GET .../breakers`` and ``POST .../breakers/{breaker_id}/close``
+(AUTOMATED-REMEDIATION-11). Authentication is the same
+``require_api_key`` dependency as the source policy routes; a hook signature or
+the hook's scoped key never authenticates, so the hook ingress, the support
+probe and the delivery body have no path to these tables.
+
+Every write also requires an ADR 0106 operator principal in
+``X-Curie-Approval-Principal``, signed by the platform key with the
+``remediation.administer`` scope (minted by
+``POST /approvals/principals/remediation-operator``), and records its subject as
+``bound_by`` on the generation it writes. A write without one, including one
+carrying an ``approval.resolve`` operator token, is refused
+``operator_principal_required``. Reads need no principal.
+
+Binding (``PUT``) and arming additionally require the ADR 0231 remediation
+authority in ``X-Curie-Remediation-Authority``: a key the API holds as
+``CURIE_REMEDIATION_AUTHORITY_KEY``, independent of the platform key, so a
+platform-key holder (every worker) cannot authorize automatic remediation. A
+missing or wrong value, or an API with the key unset, is refused
+``remediation_authority_required`` before the body is read, so an unauthorized
+caller learns nothing about the body schema. The operator principal stays
+required on both for ``bound_by`` attribution; the authority never stands in for
+it. ``DELETE``, disarm and breaker close only reduce what runs automatically and
+need no authority.
+
+Every handler response, refusals included, carries ``Cache-Control: no-store``,
+and every refusal is ``{"detail": {"code": ...}}``. The routes stay readable and
+writable with ``CURIE_REMEDIATION_ENABLED`` off so a policy can be staged before
+activation (AUTOMATED-REMEDIATION-1).
+"""
+
+from __future__ import annotations
+
+import hmac
+import uuid
+from collections.abc import Callable, Coroutine
+from typing import Annotated, Any, Literal
+
+from fastapi import APIRouter, Depends, Header, HTTPException, Path, Query, Request, Response
+from fastapi.responses import JSONResponse
+from fastapi.routing import APIRoute
+from sqlalchemy import select
+
+from .. import approval_principal
+from ..approval_auth import APPROVAL_PRINCIPAL_HEADER
+from ..auth import require_api_key
+from ..config import get_settings
+from ..deps import SessionDep, StoreDep
+from ..hook_source_policy_schemas import SourceHook, SourceUuid
+from ..models import Agent, RemediationBreaker, RemediationPolicyGeneration
+from ..remediation_limits import close_breaker
+from ..remediation_policy_document import PolicyRefused, validate_document
+from ..remediation_policy_store import PolicyGeneration, Verb, read_policy, write_policy
+from ..remediation_qualifications import QUALIFICATION_REQUIRED, automatic_unqualified
+from ..remediation_verifier import NOT_INDEPENDENT, independence_refusal
+from ..schemas.remediation_policy import (
+    RemediationBreakerClose,
+    RemediationBreakerOut,
+    RemediationPolicyMutation,
+    RemediationPolicyOut,
+    RemediationPolicyRefusal,
+    RemediationPolicyWrite,
+)
+
+_NO_STORE = {"Cache-Control": "no-store"}
+
+REMEDIATION_AUTHORITY_HEADER = "X-Curie-Remediation-Authority"
+
+
+def _authority_refusal(presented: str | None) -> HTTPException | None:
+    """The ``remediation_authority_required`` refusal, unless ``presented`` is the key.
+
+    Fails closed: with ``CURIE_REMEDIATION_AUTHORITY_KEY`` unset no value,
+    the empty string included, matches. Constant-time over the bytes.
+    """
+    key = get_settings().remediation_authority_key
+    if key and presented is not None and hmac.compare_digest(presented.encode(), key.encode()):
+        return None
+    return HTTPException(
+        status_code=403,
+        detail={
+            "code": "remediation_authority_required",
+            "message": (
+                "binding or arming a remediation policy needs the remediation authority "
+                f"(CURIE_REMEDIATION_AUTHORITY_KEY) in {REMEDIATION_AUTHORITY_HEADER}"
+            ),
+        },
+        headers=_NO_STORE,
+    )
+
+
+async def require_remediation_authority(
+    x_curie_remediation_authority: Annotated[
+        str | None, Header(alias=REMEDIATION_AUTHORITY_HEADER)
+    ] = None,
+) -> None:
+    """Refuse a bind or arm without the ADR 0231 remediation authority.
+
+    The platform key and a ``remediation.administer`` operator principal are
+    both derivable from the platform key every worker holds; this key is not.
+    \f
+    @spec AUTOMATED-REMEDIATION-3 (ADR 0231).
+    """
+    refusal = _authority_refusal(x_curie_remediation_authority)
+    if refusal is not None:
+        raise refusal
+
+
+class _AuthorityFirstRoute(APIRoute):
+    """Puts the remediation authority ahead of body decoding on the routes that need it.
+
+    FastAPI reads and decodes the body before it resolves dependencies, so a
+    body that does not decode would be answered ``400``/``422`` ahead of a
+    missing authority. On a route carrying ``require_remediation_authority``
+    the wrapper therefore checks the authority before the handler runs, so no
+    body is read. Precedence: ``401`` unauthenticated (``require_api_key``, run
+    here first for a caller refused for authority), then ``403``
+    ``remediation_authority_required``, then body ``400``/``422``, then
+    ``operator_principal_required`` and the rest.
+    """
+
+    def get_route_handler(self) -> Callable[[Request], Coroutine[Any, Any, Response]]:
+        handler = super().get_route_handler()
+        if not any(
+            dependency.call is require_remediation_authority
+            for dependency in self.dependant.dependencies
+        ):
+            return handler
+
+        async def guarded(request: Request) -> Response:
+            refusal = _authority_refusal(request.headers.get(REMEDIATION_AUTHORITY_HEADER))
+            if refusal is not None:
+                await require_api_key(request, request.headers.get("x-api-key"))
+                raise refusal
+            return await handler(request)
+
+        return guarded
+
+
+router = APIRouter(
+    prefix="/agents",
+    tags=["remediation-policy"],
+    dependencies=[Depends(require_api_key)],
+    route_class=_AuthorityFirstRoute,
+)
+_AUTHORITY = [Depends(require_remediation_authority)]
+_BASE = "/{agent_id}/hooks/{hook}/remediation-policy"
+
+AgentPath = Annotated[SourceUuid, Path()]
+HookPath = Annotated[SourceHook, Path()]
+
+_REFUSAL: dict[str, Any] = {"model": RemediationPolicyRefusal, "description": "Policy refusal"}
+_SHAPE_OR_POLICY: dict[str, Any] = {
+    "description": "Validation error or named policy refusal",
+    "content": {
+        "application/json": {
+            "schema": {
+                "anyOf": [
+                    {"$ref": "#/components/schemas/HTTPValidationError"},
+                    {"$ref": "#/components/schemas/RemediationPolicyRefusal"},
+                ]
+            }
+        }
+    },
+}
+_READ_REFUSALS: dict[int | str, dict[str, Any]] = {404: _REFUSAL}
+_WRITE_REFUSALS: dict[int | str, dict[str, Any]] = {
+    403: _REFUSAL,
+    404: _REFUSAL,
+    409: _REFUSAL,
+    422: _SHAPE_OR_POLICY,
+}
+
+
+async def require_operator_principal(
+    x_curie_approval_principal: Annotated[
+        str | None, Header(alias=APPROVAL_PRINCIPAL_HEADER)
+    ] = None,
+) -> str:
+    """The subject of a valid remediation operator principal, else a refusal.
+
+    An ADR 0106 operator token signed by the platform key with the
+    ``remediation.administer`` scope and unexpired (#4228). An
+    ``approval.resolve`` operator token, a chat attestation, an adapter
+    credential or no principal at all is ``operator_principal_required``.
+    \f
+    @spec AUTOMATED-REMEDIATION-3.
+    """
+    claims = None
+    token = x_curie_approval_principal
+    if token is not None and approval_principal.unverified_kind(token) == "operator":
+        claims = approval_principal.verify_claims(
+            token, get_settings().api_key, scope=approval_principal.REMEDIATION_ADMIN_SCOPE
+        )
+    if claims is None or claims.kind != "operator":
+        raise HTTPException(
+            status_code=403,
+            detail={
+                "code": "operator_principal_required",
+                "message": (
+                    "policy writes need a remediation operator principal "
+                    "(curie <local|cluster> approvals <AGENT> "
+                    "--mint-remediation-principal <SUBJECT>) "
+                    f"in {APPROVAL_PRINCIPAL_HEADER}"
+                ),
+            },
+            headers=_NO_STORE,
+        )
+    return claims.subject
+
+
+OperatorDep = Annotated[str, Depends(require_operator_principal)]
+
+
+def _refusal(error: PolicyRefused) -> JSONResponse:
+    """@spec AUTOMATED-REMEDIATION-2."""
+    detail: dict[str, Any] = {"code": error.code}
+    if error.path is not None:
+        detail["path"] = error.path
+    if error.message is not None:
+        detail["message"] = error.message
+    return JSONResponse(
+        status_code=error.status_code, content={"detail": detail}, headers=_NO_STORE
+    )
+
+
+def _ok(policy: PolicyGeneration) -> JSONResponse:
+    """@spec AUTOMATED-REMEDIATION-3."""
+    body = RemediationPolicyOut(
+        agent_id=str(policy.agent_id),
+        hook=policy.hook,
+        generation=str(policy.generation),
+        armed=policy.armed,
+        active=policy.active,
+        bound_by=policy.bound_by,
+        policy=policy.document,
+        updated_at=policy.created_at,
+    )
+    return JSONResponse(content=body.model_dump(mode="json"), headers=_NO_STORE)
+
+
+async def _write(
+    session: SessionDep,
+    agent_id: str,
+    hook: str,
+    verb: Verb,
+    cas: RemediationPolicyMutation,
+    principal: str,
+    document: dict[str, Any] | None = None,
+) -> JSONResponse:
+    """@spec AUTOMATED-REMEDIATION-2 @spec AUTOMATED-REMEDIATION-3."""
+    try:
+        policy = await write_policy(
+            session,
+            agent_id=uuid.UUID(agent_id),
+            hook=hook,
+            verb=verb,
+            expected_generation=int(cas.expected_generation),
+            operation_id=uuid.UUID(cas.operation_id),
+            principal=principal,
+            document=document,
+        )
+    except PolicyRefused as error:
+        return _refusal(error)
+    return _ok(policy)
+
+
+@router.get(_BASE, response_model=RemediationPolicyOut, responses=_READ_REFUSALS)
+async def get_remediation_policy(
+    agent_id: AgentPath, hook: HookPath, session: SessionDep
+) -> JSONResponse:
+    """The current remediation policy generation of a hook.
+
+    \f
+    @spec AUTOMATED-REMEDIATION-3.
+    """
+    try:
+        policy = await read_policy(session, uuid.UUID(agent_id), hook)
+    except PolicyRefused as error:
+        return _refusal(error)
+    return _ok(policy)
+
+
+@router.put(
+    _BASE,
+    response_model=RemediationPolicyOut,
+    responses=_WRITE_REFUSALS,
+    dependencies=_AUTHORITY,
+)
+async def put_remediation_policy(
+    agent_id: AgentPath,
+    hook: HookPath,
+    body: RemediationPolicyWrite,
+    session: SessionDep,
+    store: StoreDep,
+    principal: OperatorDep,
+) -> JSONResponse:
+    """Bind, tighten or widen a protected hook's remediation policy.
+
+    A new binding starts disarmed; a later write keeps the armed flag. Each
+    write creates a generation recorded with the operator principal. Needs the
+    remediation authority in ``X-Curie-Remediation-Authority`` (ADR 0231), else
+    ``remediation_authority_required``; the operator principal is attribution.
+    \f
+    @spec AUTOMATED-REMEDIATION-1 @spec AUTOMATED-REMEDIATION-2 @spec AUTOMATED-REMEDIATION-3.
+    @spec AUTOMATED-REMEDIATION-17: every verifier is independent of its acting
+    connector in the agent's in-force version, or the write is refused
+    ``verifier_not_independent`` and creates no generation.
+    @spec AUTOMATED-REMEDIATION-23: an ``automatic`` action without a valid
+    qualification record (this agent, its connector, tool, reversibility and
+    verifier declaration, at the acting connector's in-force digest) is refused
+    ``qualification_required`` and creates no generation.
+    """
+    try:
+        document = validate_document(body.policy)
+    except PolicyRefused as error:
+        return _refusal(error)
+    for index, action in enumerate(document.get("actions") or []):
+        if isinstance(action, dict) and await independence_refusal(
+            session, uuid.UUID(agent_id), action, store=store
+        ):
+            return _refusal(
+                PolicyRefused(
+                    NOT_INDEPENDENT,
+                    path=f"/actions/{index}/verifier/connector",
+                    message=(
+                        "the verifier must read through its own connector and credential, "
+                        "not the acting connector's"
+                    ),
+                )
+            )
+    unqualified = await automatic_unqualified(session, uuid.UUID(agent_id), document, store=store)
+    if unqualified is not None:
+        return _refusal(
+            PolicyRefused(
+                QUALIFICATION_REQUIRED,
+                path=f"/actions/{unqualified}/qualification",
+                message=(
+                    "an automatic action needs a qualification record of this agent for its "
+                    "connector, tool, verifier and the connector digest now in force"
+                ),
+            )
+        )
+    # The checks only read; the store opens its own transaction for the write.
+    await session.rollback()
+    return await _write(session, agent_id, hook, "bind", body, principal, document)
+
+
+@router.delete(_BASE, response_model=RemediationPolicyOut, responses=_WRITE_REFUSALS)
+async def delete_remediation_policy(
+    agent_id: AgentPath,
+    hook: HookPath,
+    cas: Annotated[RemediationPolicyMutation, Query()],
+    session: SessionDep,
+    principal: OperatorDep,
+) -> JSONResponse:
+    """Remove the policy: a new generation, inactive, disarmed and with no actions.
+
+    \f
+    @spec AUTOMATED-REMEDIATION-2 @spec AUTOMATED-REMEDIATION-3.
+    """
+    return await _write(session, agent_id, hook, "remove", cas, principal)
+
+
+@router.post(
+    f"{_BASE}/arm",
+    response_model=RemediationPolicyOut,
+    responses=_WRITE_REFUSALS,
+    dependencies=_AUTHORITY,
+)
+async def arm_remediation_policy(
+    agent_id: AgentPath,
+    hook: HookPath,
+    body: RemediationPolicyMutation,
+    session: SessionDep,
+    principal: OperatorDep,
+) -> JSONResponse:
+    """Arm the current policy as a new generation.
+
+    Needs the remediation authority in ``X-Curie-Remediation-Authority``
+    (ADR 0231), else ``remediation_authority_required``; the operator principal
+    is attribution.
+    \f
+    @spec AUTOMATED-REMEDIATION-2 @spec AUTOMATED-REMEDIATION-3.
+    """
+    return await _write(session, agent_id, hook, "arm", body, principal)
+
+
+@router.post(f"{_BASE}/disarm", response_model=RemediationPolicyOut, responses=_WRITE_REFUSALS)
+async def disarm_remediation_policy(
+    agent_id: AgentPath,
+    hook: HookPath,
+    body: RemediationPolicyMutation,
+    session: SessionDep,
+    principal: OperatorDep,
+) -> JSONResponse:
+    """Disarm the current policy as a new generation.
+
+    \f
+    @spec AUTOMATED-REMEDIATION-2 @spec AUTOMATED-REMEDIATION-3.
+    """
+    return await _write(session, agent_id, hook, "disarm", body, principal)
+
+
+_CLOSE_RESPONSES: dict[int | str, dict[str, Any]] = {
+    403: _REFUSAL,
+    404: {"description": "No such breaker under this policy"},
+}
+
+
+async def _declared_pairs(
+    session: SessionDep, agent_id: uuid.UUID, hook: str
+) -> frozenset[tuple[str, str]]:
+    """The (connector, tool) pairs any generation of the hook's policy declared."""
+
+    documents = await session.scalars(
+        select(RemediationPolicyGeneration.document).where(
+            RemediationPolicyGeneration.agent_id == agent_id,
+            RemediationPolicyGeneration.hook == hook,
+        )
+    )
+    pairs: set[tuple[str, str]] = set()
+    for document in documents:
+        actions = document.get("actions") if isinstance(document, dict) else None
+        for action in actions if isinstance(actions, list) else ():
+            if isinstance(action, dict):
+                connector, tool = action.get("connector"), action.get("tool")
+                if isinstance(connector, str) and isinstance(tool, str):
+                    pairs.add((connector, tool))
+    return frozenset(pairs)
+
+
+def _breaker_out(breaker: RemediationBreaker) -> RemediationBreakerOut:
+    return RemediationBreakerOut(
+        id=str(breaker.id),
+        agent_id=str(breaker.agent_id),
+        connector=breaker.connector,
+        tool=breaker.tool,
+        target=breaker.target,
+        opened_at=breaker.opened_at,
+        closed_at=breaker.closed_at,
+        closed_by=breaker.closed_by,
+        close_reason=breaker.close_reason,
+    )
+
+
+@router.get(
+    f"{_BASE}/breakers",
+    response_model=list[RemediationBreakerOut],
+    responses=_READ_REFUSALS,
+)
+async def list_remediation_breakers(
+    agent_id: AgentPath,
+    hook: HookPath,
+    session: SessionDep,
+    state: Annotated[Literal["open", "closed", "all"], Query()] = "open",
+) -> JSONResponse:
+    """The hook's breakers, newest opened first: how an operator finds an id to close.
+
+    Scoped as the close route is: only breakers on a connector and tool the
+    hook's policy declares. A read needs the platform key and no operator
+    principal.
+    \f
+    @spec AUTOMATED-REMEDIATION-11 @spec AUTOMATED-REMEDIATION-3.
+    """
+    agent = uuid.UUID(agent_id)
+    if await session.get(Agent, agent) is None:
+        return _refusal(PolicyRefused("agent_not_found", status_code=404))
+    pairs = await _declared_pairs(session, agent, hook)
+    query = select(RemediationBreaker).where(RemediationBreaker.agent_id == agent)
+    if state == "open":
+        query = query.where(RemediationBreaker.closed_at.is_(None))
+    elif state == "closed":
+        query = query.where(RemediationBreaker.closed_at.is_not(None))
+    rows = await session.scalars(
+        query.order_by(RemediationBreaker.opened_at.desc(), RemediationBreaker.id)
+    )
+    body = [
+        _breaker_out(row).model_dump(mode="json")
+        for row in rows
+        if (row.connector, row.tool) in pairs
+    ]
+    return JSONResponse(content=body, headers=_NO_STORE)
+
+
+@router.post(
+    f"{_BASE}/breakers/{{breaker_id}}/close",
+    response_model=RemediationBreakerOut,
+    responses=_CLOSE_RESPONSES,
+)
+async def close_remediation_breaker(
+    agent_id: AgentPath,
+    hook: HookPath,
+    breaker_id: Annotated[uuid.UUID, Path()],
+    body: RemediationBreakerClose,
+    session: SessionDep,
+    principal: OperatorDep,
+) -> JSONResponse:
+    """Close an open breaker, recording the operator principal and the reason.
+
+    Only this route closes a breaker: no nomination, delivery, verifier or
+    approval does. The breaker must hold an action this hook's policy
+    declares; any other id is ``404``. Closing an already closed breaker
+    answers it unchanged.
+    \f
+    @spec AUTOMATED-REMEDIATION-11 @spec AUTOMATED-REMEDIATION-3.
+    """
+    agent = uuid.UUID(agent_id)
+    breaker = await close_breaker(
+        session,
+        agent_id=agent,
+        hook_targets=await _declared_pairs(session, agent, hook),
+        breaker_id=breaker_id,
+        principal=principal,
+        reason=body.reason,
+    )
+    if breaker is None:
+        await session.rollback()
+        raise HTTPException(status_code=404, detail="breaker not found", headers=_NO_STORE)
+    out = _breaker_out(breaker)
+    await session.commit()
+    return JSONResponse(content=out.model_dump(mode="json"), headers=_NO_STORE)

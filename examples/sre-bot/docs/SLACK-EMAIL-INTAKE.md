@@ -113,6 +113,53 @@ Prometheus evaluating a rule is not delivery proof. Operators must route the
 page-level rules to an independently observed notification destination and use
 the existing Alertmanager heartbeat to detect a broken notification path.
 
+## Remediation policy boundary
+
+Automated remediation ([operator guide](../../../docs/operations.md#automated-remediation))
+does not apply to this intake, and nothing here should be read as if it did.
+
+- A remediation policy binds only to a **protected** hook, one with an active
+  protected source policy. The `email-alert` hook this intake signs is an
+  ordinary hook, and neither this bundle nor its installer configures a protected
+  source policy or a remediation policy. A turn it starts cannot nominate: a
+  `curie-remediation` block in its answer is plain text that is neither captured
+  nor submitted, so no approval is raised and nothing executes.
+- Turning remediation on does not change that. The "inspect and explain, never
+  mutate" rule above is still standing prompt policy, not enforcement, until the
+  hook is protected under
+  [ADR 0190](../../../docs/adr/0190-automated-hook-sources-cannot-widen-their-tool-access.md)
+  and [ADR 0191](../../../docs/adr/0191-protected-hook-delivery-authority.md).
+- A policy is a bound on what the platform will execute after a nomination. It
+  does not prove the email was authentic, because the email text is untrusted
+  evidence whether or not the hook is protected, and it does not make the model's
+  analysis correct. The platform instead rechecks the condition with its own
+  declared read and verifies recovery through a different connector.
+- The pinned Kubernetes connector this example uses is an upstream server and is
+  not a reversible connector in the sense of
+  [Writing a connector the platform can undo](../../../docs/writing-a-reversible-connector.md):
+  the bundle carries no `observe_version` or `restore` for it, and its replies
+  carry no sealed prior state or version. No action through it can be qualified,
+  idempotent or reversible, because a qualification compares the versions the
+  ledger recorded. The opt-in
+  [remediation scaler connector](../README.md#remediation-scaler-connector-opt-in)
+  is an acting connector that can be qualified, for setting an allowlisted
+  Deployment's replica count; an action through it still needs its own
+  qualification drills and a different connector to verify it.
+
+The Alertmanager source has an opt-in protected mode that realizes
+`HOOK-SOURCE-POLICY-6` of ADR 0190: it requests and signs `read-only` under the
+hook's scoped source key, checks the support probe before each delivery and
+verifies the effective policy in every receipt
+([protected source mode](../README.md#protected-source-mode-opt-in)). This
+email intake has no such mode. It signs the ordinary `email-alert` hook with
+the shared agent secret, posts its Slack placeholder before delivery, and does
+not verify an effective policy, so it cannot feed a protected hook as shipped.
+
+Moving this intake onto a protected hook is a separate decision for the
+installation. Do it, qualify each action
+([drill order](../../../docs/operations.md#qualifying-an-action-the-drill-order)),
+and only then rely on a policy.
+
 ## Configuration
 
 Before applying the intake Deployment, install an API release that includes

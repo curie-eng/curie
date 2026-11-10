@@ -68,6 +68,13 @@ list order or an exact string comparison.
 {{- end -}}
 
 {{- if .Values.mailAdapter.deploy }}
+{{- $emailReceiver := .Values.mailAdapter.emailReceiver | default dict }}
+{{- if and $emailReceiver.receiverId (not $emailReceiver.keyExistingSecret) }}
+{{- fail "mailAdapter.emailReceiver.receiverId is set but mailAdapter.emailReceiver.keyExistingSecret is empty. The adapter signs only with all three of receiver id, generation and key, and the key is read only from an existing Secret. Set mailAdapter.emailReceiver.keyExistingSecret, or clear receiverId to keep the unsigned legacy behaviour." }}
+{{- end }}
+{{- if and $emailReceiver.keyExistingSecret (not $emailReceiver.receiverId) }}
+{{- fail "mailAdapter.emailReceiver.keyExistingSecret is set but mailAdapter.emailReceiver.receiverId is empty. Set mailAdapter.emailReceiver.receiverId (and generation) together with the key Secret, or clear keyExistingSecret." }}
+{{- end }}
 {{- if and .Values.mailAdapter.egressSecretExistingSecret (not .Values.worker.adapterCredentialsExistingSecret) }}
 {{- fail "mailAdapter.egressSecretExistingSecret requires worker.adapterCredentialsExistingSecret so the adapter and worker source the paired egress credential externally. Set both configuration keys; credential values are not printed." }}
 {{- end }}
@@ -238,7 +245,7 @@ Modeled on templates/dispatcher.yaml, with six deliberate divergences:
 apiVersion: v1
 kind: Service
 metadata:
-  name: {{ include "curie.fullname" . }}-mail-adapter
+  name: {{ include "curie.checkedObjectName" (dict "kind" "Service" "name" (printf "%s-mail-adapter" (include "curie.fullname" .))) }}
   labels:
     {{- include "curie.labels" . | nindent 4 }}
     app.kubernetes.io/component: mail-adapter
@@ -272,9 +279,21 @@ spec:
   selector:
     matchLabels:
       {{- include "curie.selectorLabels" (dict "root" . "component" "mail-adapter") | nindent 6 }}
+  {{- $credentialRefs := list (include "curie.secretRef" (dict "root" $ "existingSecret" $.Values.mailAdapter.channelTokenExistingSecret "existingSecretKey" $.Values.mailAdapter.channelTokenExistingSecretKey "defaultKey" "mailChannelToken") | fromYaml) (include "curie.secretRef" (dict "root" $ "existingSecret" $.Values.mailAdapter.egressSecretExistingSecret "existingSecretKey" $.Values.mailAdapter.egressSecretExistingSecretKey "defaultKey" "mailEgressSecret") | fromYaml) (include "curie.secretRef" (dict "root" $ "existingSecret" $.Values.mailAdapter.agentmail.apiKeyExistingSecret "existingSecretKey" $.Values.mailAdapter.agentmail.apiKeyExistingSecretKey "defaultKey" "mailAgentmailApiKey") | fromYaml) }}
+  {{- if $emailReceiver.receiverId }}
+  {{- /* A rotated receiver key Secret rolls the pod like the other credentials. */}}
+  {{- $credentialRefs = append $credentialRefs (dict "name" $emailReceiver.keyExistingSecret "key" ($emailReceiver.keyExistingSecretKey | default "emailReceiverKey")) }}
+  {{- end }}
   template:
     metadata:
       annotations:
+        {{- with (include "curie.secretChecksum" (dict
+        "root" $
+        "keys" (list )
+        "refs" $credentialRefs
+        "env" (include "curie.env.otel" (dict "root" $ "extraEnv" list)))) }}
+        checksum/secret: {{ . }}
+        {{- end }}
         {{- with (include "curie.placement.annotations" (dict "root" $ "class" "platform")) }}
         {{- . | nindent 8 }}
         {{- end }}
@@ -299,6 +318,7 @@ spec:
       imagePullSecrets:
         {{- toYaml . | nindent 8 }}
       {{- end }}
+      enableServiceLinks: false
       containers:
         - name: mail-adapter
           image: {{ include "curie.image" (dict "repository" .Values.mailAdapter.image.repository "tag" .Values.mailAdapter.image.tag "digest" .Values.mailAdapter.image.digest "defaultTag" .Chart.AppVersion) | quote }}
@@ -329,6 +349,21 @@ spec:
               valueFrom:
                 secretKeyRef:
                   {{- include "curie.secretRef" (dict "root" . "existingSecret" .Values.mailAdapter.agentmail.apiKeyExistingSecret "existingSecretKey" .Values.mailAdapter.agentmail.apiKeyExistingSecretKey "defaultKey" "mailAgentmailApiKey") | nindent 18 }}
+            # Email receiver proof (ADR 0260). All three render together or
+            # none do: an empty receiverId keeps the unsigned legacy behaviour,
+            # and the adapter refuses to start on a partial set. The key is by
+            # reference only, never inline.
+            {{- if $emailReceiver.receiverId }}
+            - name: CURIE_MAIL_RECEIVER_ID
+              value: {{ $emailReceiver.receiverId | quote }}
+            - name: CURIE_MAIL_RECEIVER_GENERATION
+              value: {{ $emailReceiver.generation | default 1 | int64 | quote }}
+            - name: CURIE_MAIL_RECEIVER_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ $emailReceiver.keyExistingSecret | quote }}
+                  key: {{ $emailReceiver.keyExistingSecretKey | default "emailReceiverKey" | quote }}
+            {{- end }}
             - name: AGENTMAIL_INBOX
               value: {{ .Values.mailAdapter.inbox | quote }}
             - name: AGENTMAIL_BASE_URL
@@ -361,6 +396,8 @@ spec:
             # process fall back to its own default and start.
             - name: CURIE_MAIL_ALLOWED_SENDERS
               value: {{ join "," .Values.mailAdapter.allowedSenders | quote }}
+            - name: CURIE_MAIL_ALLOW_ALL_SENDERS
+              value: {{ .Values.mailAdapter.allowAllSenders | default false | quote }}
             # #2731: the exact set of addresses the egress NetworkPolicy admits
             # on TCP 443, comma-joined in the same order as its ipBlock rules, so
             # the adapter can pin to /32 entries when DNS rotates the provider's

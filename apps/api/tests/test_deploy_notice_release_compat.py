@@ -1,0 +1,124 @@
+"""@spec DEPLOY-NOTICE-RELEASE-1."""
+
+from __future__ import annotations
+
+import ast
+import json
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[3]
+
+
+def test_notice_migration_appends_to_released_head() -> None:
+    """@spec DEPLOY-NOTICE-RELEASE-1."""
+    revisions: dict[str, tuple[str | None, str]] = {}
+    for path in (ROOT / "apps/api/alembic/versions").glob("*.py"):
+        fields = {}
+        for node in ast.parse(path.read_text()).body:
+            if isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name):
+                if node.target.id in {"revision", "down_revision"}:
+                    fields[node.target.id] = ast.literal_eval(node.value)
+        if fields.get("revision") is not None:
+            revision = fields["revision"]
+            assert revision not in revisions, f"duplicate migration {revision}"
+            revisions[revision] = (fields.get("down_revision"), path.name)
+    assert revisions["0072"][1] == "0072_work_item_base.py"
+    assert revisions["0073"][0] == "0072"
+    assert "0074" not in revisions
+    assert revisions["0075"] == ("0073", "0075_hook_source_policies.py")
+    assert revisions["0076"][0] == "0075"
+    assert revisions["0079"][0] == "0076"
+    assert revisions["0080"][0] == "0079"
+    assert revisions["0081"][0] == "0080"
+    assert revisions["0082"] == ("0081", "0082_agent_deploy_notifications.py")
+    assert revisions["0102"] == ("0101", "0102_execution_request_reply_targets.py")
+    assert revisions["0103"] == ("0102", "0103_tracker_issue_identity.py")
+
+
+def test_candidate_does_not_rewrite_released_windows() -> None:
+    """@spec DEPLOY-NOTICE-RELEASE-1."""
+    catalog = json.loads((ROOT / "cli/src/application_schema_windows.json").read_text())
+    released = {"schema_min": "0070", "schema_head": "0073"}
+    stable = {"schema_min": "0076", "schema_head": "0076"}
+    # Feature migrations append after the published v0.12.2 head; published
+    # application windows remain fixed while the candidate advances. The
+    # minimum is the join containing both the stable reply selector columns
+    # and the feature train schema. The released v0.13.0 window stays at that
+    # join while the candidate advances to team sync state (0120) and agent access
+    # policies (0121), directory authority (0122), attachment catalogs (0130),
+    # and the stable twelve-hour execution deadline (0140), joined by 0145,
+    # publication UI evidence (0146), and deleted issue cancellation (0147),
+    # joined by 0148.
+    released_0130 = {"schema_min": "0108", "schema_head": "0108"}
+    # @spec AGENT-ROLE-PERSISTENCE-V1-9: policy ORM reads require 0133.
+    # @spec HTTP-APPROVAL-CONTINUITY-5: approval ORM reads require the 0137 column.
+    # @spec AUTOMATED-REMEDIATION-15: 0138 only widens a CHECK.
+    # @spec HTTP-INVOCATION-EXECUTION-21: Grid reports write the 0139 namespace kind.
+    # Workspace recovery reads require the 0141 outcome ledger.
+    # 0149 stores webhook provenance and a wake-key generation.
+    # @spec CONNECTOR-REQUESTER-1: agent ORM reads require the 0151 requester columns.
+    # Approval ORM reads require the 0153 dynamic approval selection columns,
+    # and dynamic approval answers require the 0156 answer gate. The factory
+    # Slack progress loop reads the 0157 tables, and the code host link route
+    # writes the github_host kind 0158 allows.
+    candidate = {"schema_min": "0158", "schema_head": "0158"}
+    assert catalog["windows"]["0.12.0"] == released
+    assert catalog["windows"]["0.12.0-rc.1"] == released
+    assert catalog["windows"]["0.12.1"] == stable
+    assert catalog["windows"]["0.12.2"] == {"schema_min": "0076", "schema_head": "0081"}
+    assert catalog["windows"]["0.12.3"] == {"schema_min": "0076", "schema_head": "0093"}
+    assert catalog["candidate"] == candidate
+    assert catalog["windows"]["0.13.0"] == released_0130
+    assert catalog["revisions"][-40:] == [
+        "0095",
+        "0096",
+        "0097",
+        "0098",
+        "0099",
+        "0100",
+        "0101",
+        "0102",
+        "0103",
+        "0105",
+        "0107",
+        "0108",
+        "0120",
+        "0121",
+        "0122",
+        "0123",
+        "0130",
+        "0131",
+        "0136",
+        "0132",
+        "0133",
+        "0137",
+        "0138",
+        "0139",
+        "0140",
+        "0141",
+        "0143",
+        "0144",
+        "0145",
+        "0146",
+        "0147",
+        "0148",
+        "0149",
+        "0151",
+        "0152",
+        "0153",
+        "0154",
+        "0156",
+        "0157",
+        "0158",
+    ]
+    assert "0074" not in catalog["revisions"]
+    prior_windows = json.loads(
+        (Path(__file__).parent / "fixtures/source_schema_prior_windows.json").read_text()
+    )
+    assert {name: catalog["windows"][name] for name in prior_windows} == prior_windows
+    for name in (
+        "apps/api/src/curie_api/schema_compat.json",
+        "charts/curie/files/schema-compat.json",
+    ):
+        payload = json.loads((ROOT / name).read_text())
+        assert {key: payload[key] for key in candidate} == candidate

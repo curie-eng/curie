@@ -14,7 +14,7 @@ field-name sets per pair so that divergence fails loudly instead.
 from __future__ import annotations
 
 import pytest
-from curie_api import schemas as api
+from curie_api.schemas import agents as api
 from curie_worker import behaviorpacks as worker
 
 # (API write-side model, worker read-side model). An added-but-unpaired pack

@@ -1,0 +1,257 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.curietech.ai/cli/actions/v1.0.json",
+  "title": "curie <tier> actions --json",
+  "description": "The agent-facing payload of `curie <tier> actions <list|show|undo|execution>` (ACTION-EXECUTOR-23): the action list (`agent`, `actions`, `truncated`), one action under `action`, an undo's `execution_id` and `state`, or an execution receipt naming its `state` and `code` (the refusal or failure code; null when confirmed). No variant carries snapshot material (`prior_state`, `post_state`) or an undo's `target`.",
+  "$defs": {
+    "action": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "id": {
+          "type": "string"
+        },
+        "agent_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "conversation_id": {
+          "type": "string"
+        },
+        "call_id": {
+          "type": "string"
+        },
+        "tool": {
+          "type": "string"
+        },
+        "arguments": {
+          "type": [
+            "object",
+            "null"
+          ]
+        },
+        "result": {
+          "type": [
+            "object",
+            "null"
+          ]
+        },
+        "target": {
+          "type": [
+            "object",
+            "null"
+          ]
+        },
+        "detail": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "gate_approval_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "status": {
+          "type": "string"
+        },
+        "created_at": {
+          "type": "string"
+        },
+        "completed_at": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "undone_at": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "undone_by": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "undoable": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "id",
+        "agent_id",
+        "conversation_id",
+        "call_id",
+        "tool",
+        "arguments",
+        "result",
+        "target",
+        "detail",
+        "gate_approval_id",
+        "status",
+        "created_at",
+        "completed_at",
+        "undone_at",
+        "undone_by",
+        "undoable"
+      ]
+    },
+    "list": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "agent",
+        "actions",
+        "truncated"
+      ],
+      "properties": {
+        "agent": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "actions": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/action"
+          }
+        },
+        "truncated": {
+          "type": "boolean"
+        }
+      }
+    },
+    "show": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "action"
+      ],
+      "properties": {
+        "action": {
+          "$ref": "#/$defs/action"
+        }
+      }
+    },
+    "undo": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "action_id",
+        "execution_id",
+        "state"
+      ],
+      "properties": {
+        "action_id": {
+          "type": "string"
+        },
+        "execution_id": {
+          "type": "string"
+        },
+        "state": {
+          "type": "string"
+        }
+      }
+    },
+    "execution": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "execution_id",
+        "kind",
+        "state",
+        "code",
+        "agent_id",
+        "connector",
+        "tool",
+        "subject_action_id",
+        "requested_by",
+        "attempt",
+        "dispatched_at",
+        "finished_at",
+        "created_at"
+      ],
+      "properties": {
+        "execution_id": {
+          "type": "string"
+        },
+        "kind": {
+          "type": "string"
+        },
+        "state": {
+          "type": "string"
+        },
+        "code": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "agent_id": {
+          "type": "string"
+        },
+        "connector": {
+          "type": "string"
+        },
+        "tool": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "subject_action_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "requested_by": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "attempt": {
+          "type": "integer"
+        },
+        "dispatched_at": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "finished_at": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "created_at": {
+          "type": "string"
+        }
+      }
+    }
+  },
+  "oneOf": [
+    {
+      "$ref": "#/$defs/list"
+    },
+    {
+      "$ref": "#/$defs/show"
+    },
+    {
+      "$ref": "#/$defs/undo"
+    },
+    {
+      "$ref": "#/$defs/execution"
+    }
+  ]
+}

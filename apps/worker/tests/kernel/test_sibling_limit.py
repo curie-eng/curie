@@ -15,12 +15,21 @@ import uuid
 from collections.abc import Callable, Mapping
 from typing import Any
 
+import pytest
 from aci_protocol import Final, QueuedTurn, ReplyHandle, SessionStatus
 from aci_protocol.turn import CLUSTER_MESSAGE_ADAPTER, route_identity
 from aiohttp import web
 from aiohttp.test_utils import TestServer
+from curie_channel_gateway.slack.senders import SlackSenderIdentities
+from curie_test_support.channel_gateway import reply_gateway
 from curie_worker.behaviorpacks import BehaviorPacks
-from curie_worker.binding import BUDGET_ENV, BUNDLE_REF_ENV, PLUGIN_DIR_ENV, ResolvedDeployment
+from curie_worker.binding import (
+    BUDGET_ENV,
+    BUNDLE_REF_ENV,
+    PLUGIN_DIR_ENV,
+    HttpIdentityBinding,
+    ResolvedDeployment,
+)
 from curie_worker.config import WorkerConfig
 from curie_worker.reply_sink import (
     ObservedReplySink,
@@ -33,7 +42,6 @@ from curie_worker.sibling_turns import (
     SIBLING_OPEN_LIMIT,
     SIBLING_TURN_LIMIT,
     SiblingTurnLimit,
-    SlackSenderIdentities,
 )
 from redis.asyncio import Redis as AsyncRedis
 
@@ -99,6 +107,22 @@ class _AdapterCapture:
 class _TripleBinding:
     """Canned resolutions keyed on the route triple, like the real resolver."""
 
+    async def identity_binding(
+        self, kind: str, adapter: str | None, address: str,
+    ) -> HttpIdentityBinding | None:
+        """@spec HTTP-INVOCATION-EXECUTION-18: explicit local fixture classification."""
+        resolved = self._routes.get((kind, route_identity(kind, adapter), address))
+        if resolved is None:
+            return None
+        agent_id = resolved.agent_id
+        return HttpIdentityBinding(
+            tenant_id=uuid.UUID("00000000-0000-4000-8000-000000000001"),
+            agent_id=agent_id,
+            binding_id=uuid.uuid5(uuid.NAMESPACE_URL, repr((kind, adapter, address))),
+            binding_generation=1, http_identity_required=False,
+        )
+
+
     def __init__(self, routes: dict[tuple[str, str | None, str], ResolvedDeployment]) -> None:
         self._routes = routes
 
@@ -115,6 +139,7 @@ class _TripleBinding:
         kind: str | None = None,
         address: str | None = None,
         isolate_memory: bool = False,
+    **_: object,
     ) -> dict[str, str]:
         env = {
             BUDGET_ENV: '{"max_output_tokens_per_run":100000,"max_usd_per_day":10.0}',
@@ -185,20 +210,30 @@ def _mail_turn(text: str, *, to: str, adapter: str, author: str, thread: str, po
     )
 
 
+_reply_gateways = []
+
+
+@pytest.fixture(autouse=True)
+def owned_reply_gateways():
+    try:
+        yield
+    finally:
+        while _reply_gateways:
+            _reply_gateways.pop().__exit__(None, None, None)
+
+
 def _slack_sink(port: int) -> ReplySinkRouter:
-    return build_reply_sink(
-        WorkerConfig(
-            slack_bot_token=_DEFAULT_TOKEN,
-            slack_api_base_url=f"http://127.0.0.1:{port}/slack/api/",
-        ),
-        slack_tokens={"default": _DEFAULT_TOKEN, "ops-bot": _OPS_TOKEN},
+    gateway = reply_gateway(
+        {"default": _DEFAULT_TOKEN, "ops-bot": _OPS_TOKEN}, f"http://127.0.0.1:{port}/slack/api/"
     )
+    values = gateway.__enter__()
+    _reply_gateways.append(gateway)
+    return build_reply_sink(WorkerConfig(**values))
 
 
 def _mail_sink() -> ReplySinkRouter:
     return build_reply_sink(
-        WorkerConfig(adapter_credentials={"mail-a": "secret-a", "mail-b": "secret-b"}),
-        slack_tokens={"default": ""},
+        WorkerConfig(adapter_credentials={"mail-a": "secret-a", "mail-b": "secret-b"})
     )
 
 

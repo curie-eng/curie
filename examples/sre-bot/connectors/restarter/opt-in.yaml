@@ -1,0 +1,51 @@
+# The opt-in declaration for the restarter connector. OFF BY DEFAULT: the
+# bundle's connectors.yaml does not declare it and plugin.json names none of its
+# tools, so an install that does not opt in is unchanged.
+#
+# It restarts one allowlisted Deployment, keyed by a token so a repeat is a
+# no-op: the REMEDIATION-11 class of ADR 0203 (idempotent, not reversible). It
+# serves no restore, so nothing it records is undoable.
+#
+# To opt in, in your copy of the bundle:
+#   1. add `connector.restarter` below under `connectors:` in connectors.yaml;
+#   2. add the `plugin` entries to .claude-plugin/plugin.json (`toolPolicy` and
+#      `approvalPolicy.gates`);
+#   3. apply manifests/restarter-access.yaml, assemble a kubeconfig for
+#      `sre-bot-restarter` and store it as the connector secret
+#      RESTARTER_KUBECONFIG;
+#   4. create the Kubernetes Secret `sre-bot-restarter-sealing` with the key
+#      SNAPSHOT_SEALING_KEY (`<kid>:<base64 of 32 bytes>`). The ledger records
+#      a post_version, which an idempotent qualification compares, only from a
+#      sealed reply;
+#   5. build and deploy as for the other source-built connectors.
+#
+# examples/tests/test_sre_bot_restarter_opt_in.py applies exactly this file to
+# the shipped bundle and validates the result, so the steps above stay valid.
+connector:
+  restarter:
+    build:
+      context: connectors/restarter
+      platforms: [linux/amd64, linux/arm64]
+    env:
+      # The one namespace it acts in. Must agree with the Role's namespace in
+      # manifests/restarter-access.yaml. EMPTY MEANS EVERY CALL IS REFUSED.
+      RESTARTER_NAMESPACE: sre-demo
+      # Comma-separated Deployment names, matched exactly. Must agree with the
+      # Role's resourceNames. EMPTY MEANS EVERY CALL IS REFUSED.
+      RESTARTER_DEPLOYMENTS: example-api
+    secret_files:
+      RESTARTER_KUBECONFIG: /secrets/kubeconfig
+    # Key custody (ACTION-EXECUTOR-16): only as a SecretRef on this connector.
+    # Curie renders a secretKeyRef and never reads the value. A key of its own,
+    # not the scaler's: each connector's snapshots are sealed to it (ADR 0124).
+    secrets:
+      - name: SNAPSHOT_SEALING_KEY
+        from_secret: sre-bot-restarter-sealing
+plugin:
+  toolPolicy:
+    approvalRequired:
+      - restarter/restart_deployment
+  approvalPolicy:
+    gates:
+      - gate: mcp__restarter__restart_deployment
+        route: sre-approvals

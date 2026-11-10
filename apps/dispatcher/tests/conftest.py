@@ -15,7 +15,7 @@ import socket
 import threading
 import time
 import uuid
-from collections.abc import Iterator
+from collections.abc import Iterator, Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass
 from dataclasses import field as dataclass_field
@@ -24,8 +24,8 @@ from typing import Any
 
 import pytest
 import redis
-from curie_dispatcher.approval_actions import ResolveOutcome
-from curie_dispatcher.config import DispatcherConfig
+from curie_channel_gateway.slack.approval_actions import ResolveOutcome
+from curie_channel_gateway.slack.config import DispatcherConfig
 from curie_test_support.valkey import (
     VALKEY_HOST as _VALKEY_HOST,
 )
@@ -35,9 +35,7 @@ from curie_test_support.valkey import (
 from curie_test_support.valkey import (
     VALKEY_PW as _VALKEY_PW,
 )
-from curie_test_support.valkey import (
-    connect_or_skip,
-)
+from curie_test_support.valkey import connect_or_skip
 from slack_bolt.authorization import AuthorizeResult
 from slack_sdk.socket_mode.builtin import client as builtin_socket_mode_client
 
@@ -84,6 +82,8 @@ def person_rooted_thread(**kwargs: Any) -> dict[str, Any]:
 
 class _TestTelemetry:
     """A telemetry stand-in for ``run.main`` tests: ``shutdown`` is a no-op."""
+
+    logger_provider = None
 
     def shutdown(self) -> None:
         pass
@@ -302,29 +302,34 @@ class ScriptedResolver:
 
     def __init__(self, outcome: ResolveOutcome) -> None:
         self.outcome = outcome
-        self.calls: list[dict[str, str]] = []
+        self.calls: list[dict[str, Any]] = []
 
     def resolve(
         self,
         approval_id: str,
         *,
         decision: str,
-        attested_user: str,
-        attested_channel: str,
+        actor: str,
+        actor_channel: str,
         note: str | None = None,
+        test_driver: bool = False,
+        evidence: Mapping[str, object] | None = None,
     ) -> ResolveOutcome:
         # `note` is recorded, not ignored: the dialog path's whole point is that
         # the approver's reason reaches the record, and a stand-in that dropped
         # it would let that regress silently (#1053).
-        self.calls.append(
-            {
-                "approval_id": approval_id,
-                "decision": decision,
-                "attested_user": attested_user,
-                "attested_channel": attested_channel,
-                "note": note,
-            }
-        )
+        call: dict[str, Any] = {
+            "approval_id": approval_id,
+            "decision": decision,
+            "actor": actor,
+            "actor_channel": actor_channel,
+            "note": note,
+        }
+        if test_driver:
+            call["test_driver"] = True
+        if evidence is not None:
+            call["slack"] = dict(evidence)
+        self.calls.append(call)
         return self.outcome
 
     def exists(self, approval_id: str) -> bool | None:
@@ -407,3 +412,62 @@ def deliver_frames(client: Any, *frames: dict[str, Any], timeout: float = 5.0) -
         assert done.wait(timeout), f"the SDK did not deliver {last!r} within {timeout}s"
     finally:
         client.message_listeners.remove(_after_the_others)
+
+
+@dataclass
+class IdentityClientBuilds:
+    """What the offline ``build_identity_client`` stub was asked to build."""
+
+    configs: list[Any] = dataclass_field(default_factory=list)
+
+
+@pytest.fixture(autouse=True)
+def offline_identity_client(monkeypatch: pytest.MonkeyPatch) -> IdentityClientBuilds:
+    """Keep every app's principal lookup (#2910) off the network.
+
+    ``build_app``/``register_handlers`` build the production lookup client from
+    config when a test injects none. Its base URL is a real loopback API in
+    most suites (``admission_api``), which has no ``/identity/resolve`` route,
+    so an unpatched lookup would add a stray POST and a WARNING to tests that
+    assert on both. The stub records the call and returns None: no client, no
+    lookup. ``raising=False`` keeps the suite importable before the seam exists.
+    """
+
+    builds = IdentityClientBuilds()
+
+    def _offline_build(config: Any) -> None:
+        builds.configs.append(config)
+        return None
+
+    monkeypatch.setattr(
+        "curie_channel_gateway.slack.handlers.build_identity_client", _offline_build, raising=False
+    )
+    return builds
+
+
+@dataclass
+class InstallationReportStarts:
+    """Every ``start_installation_reports`` call ``run.main`` made."""
+
+    calls: list[tuple[tuple[Any, ...], dict[str, Any]]] = dataclass_field(default_factory=list)
+
+
+@pytest.fixture(autouse=True)
+def offline_installation_reports(monkeypatch: pytest.MonkeyPatch) -> InstallationReportStarts:
+    """Keep ``run.main`` from starting the #3039 reporter threads.
+
+    The reporter calls ``auth.test`` with each identity's real token and posts
+    to the platform API; a ``run.main`` test fakes neither. The stub records
+    the call and starts nothing.
+    """
+
+    starts = InstallationReportStarts()
+
+    def _offline_start(*args: Any, **kwargs: Any) -> list[threading.Thread]:
+        starts.calls.append((args, kwargs))
+        return []
+
+    monkeypatch.setattr(
+        "curie_channel_gateway.slack.run.start_installation_reports", _offline_start, raising=False
+    )
+    return starts

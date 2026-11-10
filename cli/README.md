@@ -22,12 +22,58 @@ extend the platform's own code.
     - [Bundle packing exclusions](#bundle-packing-exclusions)
     - [Artifact resolution](#artifact-resolution)
   - [Managing secrets](#managing-secrets)
+  - [Installing Software Factory skills](#installing-software-factory-skills)
 - [For contributors](#for-contributors)
   - [`curie install`](#curie-install)
   - [`curie dev`](#curie-dev)
   - [Building the runner image from source](#building-the-runner-image-from-source)
   - [Prototyping agents in a source checkout](#prototyping-agents-in-a-source-checkout)
   - [Verify](#verify)
+
+## Installing Software Factory skills
+
+Install all bundled Software Factory workflows into your coding agent with one command:
+
+```bash
+curie factory skills install --agent codex
+```
+
+Choose `codex`, `claude-code`, `copilot`, `gemini` (Gemini CLI), or `cursor`.
+By default the skills are installed in the current repository root; outside Git,
+the current directory is used. `--dir DIR` selects exactly an existing directory.
+`--global` installs in your personal skill directory and conflicts with `--dir`.
+`--dry-run` checks and reports the destination without writing; `--json` emits one
+result object containing one receipt per skill. This installs `prepare-factory-ticket`,
+`review-pr`, `factory-environment-setup`, and `factory-environment-maintenance`.
+All destinations are checked before any writes; a conflict
+in any skill refuses the operation. Identical copies are retained and unrelated
+skills are preserved. An exact, unmodified copy of a previously shipped skill
+is upgraded when the embedded skill changes. Locally edited or extended skill
+folders still conflict; review and move those aside before upgrading.
+
+Installation uses the CLI's embedded files and needs no network, Python, Docker
+or Curie deployment. The result prints invocation and refresh instructions;
+client settings and activation consent still apply. See the
+[preparation guide](../docs/guides/factory-preparation.md) for client paths,
+manual installation, specification review, publication and factory selection.
+
+To upgrade, install the desired Curie CLI release and rerun the install command.
+The CLI upgrades only exact previously shipped skill trees. If you edited a
+skill or added files inside its folder, move that folder to a backup location
+outside the client's skill directories, rerun the command, then review and
+reapply your customizations. Keep the backup until you have verified the new
+skill in your coding agent. Repository version pins remain deferred.
+
+The skills remain separate workflows after installation: use
+`$prepare-factory-ticket <issue-url>`, `$review-pr <pr-url>`,
+`$factory-environment-setup <binding>`, or
+`$factory-environment-maintenance <factory>` in Codex. Claude Code uses the
+same names with `/`. The
+[PR review guide](../docs/guides/factory-pr-review.md) covers walkthroughs,
+local tests, approved factory feedback and merging. The
+[repository environment guide](../docs/guides/factory-environments.md) covers
+the two admin skills. No second installation command is needed. Installation
+grants no tracker or factory authority.
 
 ## Interactive mode
 
@@ -282,6 +328,21 @@ The case file and sidecar are packaged in the same immutable deployed bundle.
 The deploy receipt's `bundle_sha256` identifies the exact bundle used for
 local and cluster parity.
 
+Local and cluster deploy receipts list every cron declaration with its name,
+schedule, zone (default `UTC`), and target (`targetless` when absent). They also
+list every webhook whose `wake` field is boolean true and that has a name.
+Each wake receipt has `name`, `path`, and `mode`. The path is
+`/hooks/{agent id}/{name}/wake`. The mode is `targetless`. An omitted wake, a
+false wake, a non-boolean wake, a cron row, or a row without a name is not a
+wake receipt. No wake declarations emit an empty `wake_triggers` array. The
+receipt carries no credential. An explicit cron target that does not resolve
+to one bound channel produces a warning after a successful deploy; deploy still
+exits 0. With `--json`, deploy schema v1.3 always includes `cron_triggers`,
+`wake_triggers`, and `warnings` arrays, including empty arrays, and an absent
+cron target is `null`. `wake_triggers` stays off the parent required list, the
+same way `cron_triggers` does. Each result from `cluster deploy --all-targets`
+carries the same fields.
+
 Run the same authored suite at each tier:
 
 ```bash
@@ -334,7 +395,7 @@ HTTP surface directly. No platform, no queue, no API, no Slack, no cluster.
 | Command | What it does |
 |---|---|
 | `curie skill up` | Boot the local runner image in Docker with the ACI boot env (runner/README.md recipe), wait for health, print the boxed env summary.<br>• `--fake-model` runs offline.<br>• `--network`/`--otel-endpoint` join the compose stack for traces.<br>• `--model <id>` forwards `CURIE_MODEL` (omit for the SDK default).<br>• `--local-model [<id>]` runs a real model through a local Ollama sidecar (default `qwen3:4b`). Its assets are never downloaded implicitly: `up` refuses when the pinned `ollama/ollama` image (~8.9 GB) or the model is not already cached, naming what is missing and its size. `--pull-model` accepts the download for that run (ADR 0093, #1183).<br>• `--secret <NAME>` forwards bundle MCP secrets by name (Curie private storage when the env var isn't exported).<br>• `--env-file <PATH>` reads the model credential from a bundle `.env` as a last resort (precedence: shell env > stored secret > file; only `CURIE_CREDENTIALS`/`CLAUDE_CODE_OAUTH_TOKEN`/`ANTHROPIC_API_KEY`), so a bundle boots live with no `source` step (#749).<br>• Hosted connectors must report healthy via their Docker healthcheck when one is supplied, or stay continuously running for 2 seconds when one is absent. Set `CURIE_CONNECTOR_START_TIMEOUT_SECONDS` to a positive whole number of seconds to change the connector startup budget; the default is 60 seconds. The readiness deadline starts at the first readiness check, after staging and starting the connectors. A connector readiness failure exits nonzero, names the full declared connector key, and releases startup resources including the bundle snapshot. This proves process and health readiness, not tool or MCP discovery.<br>• A leftover container of the same name fails the boot with a clear fix instead of a raw Docker conflict error; `--replace` removes it and boots fresh. |
-| `curie skill check` | Run an offline, credential free MCP load check and report declared servers, matches, and verdict. Declared cron triggers produce one warning here and on `local deploy` or `cluster deploy` because no tier fires them yet (#268); malformed declarations remain validation errors. |
+| `curie skill check` | Run an offline, credential free MCP load check and report declared servers, matches, and verdict. Declared cron triggers produce one warning here because the skill tier has no scheduler. Local and cluster installs fire cron triggers; deploy warns when an explicit target does not resolve to one bound channel. Malformed declarations remain validation errors. |
 | `curie skill approvals` | View the bundle's declared `approvalPolicy` gates, read straight from `.claude-plugin/plugin.json` (or `plugin.json`); no docker, no network.<br>• `--gate <TOOL>` (repeatable) or `--clear` mutate nothing -- they print the `CURIE_APPROVAL_REQUIRED_TOOLS=...` assignment to export, then re-run your original `skill up` invocation with `--secret CURIE_APPROVAL_REQUIRED_TOOLS` added, since the runner only resolves that env once at container boot. |
 | `curie skill versions` | Not available at this tier (exit 4): `skill up` runs a local snapshot of the bundle on disk (its digest is on `skill status`), and nothing is deployed, so no version is assigned. Use `curie local versions <agent>` or `curie cluster versions <agent>`. |
 | `curie skill memory` | Not available at this tier (exit 4): this tier configures no memory namespace. Use `curie local memory <agent>` or `curie cluster memory <agent>`. |
@@ -350,8 +411,9 @@ accept `--url`. Setting `skill up --model <id>` makes token usage attributable
 in Langfuse traces.
 
 `skill up` also packs the bundle into a content-addressed snapshot under
-`<bundle>/.curie/snapshots/<digest>/` and mounts that read-only, matching what
-the local and cluster tiers do with a deployed bundle. So editing a bundle file
+`<bundle>/.curie/snapshots/<digest>/`, copies it through the Docker API into a
+private named volume, and mounts the volume read only, matching the immutable
+bundle behavior of the local and cluster tiers. So editing a bundle file
 on the host does not reach the running runner: re-run `curie skill up` and
 confirm the new `bundle_digest` in `curie skill status --json`. A verified
 same-directory runner is replaced automatically; `--replace` still forces a
@@ -360,6 +422,32 @@ optional `evals/trajectory.json` sidecar are the exceptions. `skill eval` reads
 them live from source, so an eval edit needs no restart. `skill down` and a
 replacement `up` release the snapshot along with the container.
 
+`skill check`, `skill up`, `skill eval --model`, and `curie try` always copy
+snapshot bytes through the Docker API into private named volumes, for local and
+remote daemons alike. The client workspace and `TMPDIR` need no matching paths
+on the daemon host. `skill down`, replacement, and failed startup release the
+owned volumes.
+
+Set `DOCKER_PUBLISHED_HOST` to the hostname or IP where published ports are
+reachable, without a URL scheme or port. Runner requests use that address,
+including IPv6 addresses; the default is `localhost`. This setting only selects
+the published endpoint. Docker connection settings such as `DOCKER_HOST` select
+the daemon independently.
+
+Hosted connectors support `secret_files` with local and remote Docker. At
+startup, the CLI streams credentials from memory into a private named volume
+for each connector and run. Each file has mode `0400`, belongs to UID/GID
+`65532:65532`, and is mounted read only through a volume subpath at its exact
+declared destination. Credential values are not written to client staging files
+or passed in Docker argv. Connector teardown and failed startup release owned
+credential volumes. Environment secrets and connectors using a remote `url` or
+`unhosted_url` remain supported. That subpath mount needs Docker Engine 26.0
+or later (Engine API 1.45) and, on the local tier, Docker Compose v2.26.0 or
+later. `curie skill up` and `curie local up` connector bring-up refuse before
+creating any volume or container when a hosted connector declares
+`secret_files` on an older Docker, and bundles without `secret_files` are not
+checked.
+
 #### `local` target
 
 Wraps `compose.dev.yaml` via Docker Compose, so a `message` walks the real
@@ -367,7 +455,18 @@ queue -> worker -> sandboxed runner -> reply path on one machine, no Slack and
 no Kubernetes. `curie local up` uses the `full` compose profile by default.
 `curie local up --minimal` uses the smaller `core` profile. The compose API is
 published on host port `28000`. Add `curie local up --slack` to also start
-the optional Slack dispatcher.
+the optional Slack dispatcher. A bundle whose hosted connector declares
+`secret_files` needs Docker Engine 26.0 or later (Engine API 1.45) and Docker
+Compose v2.26.0 or later on this tier, as the `secret_files` note under the
+skill target explains; the local connector bring-up refuses on older versions.
+
+The Docker worker fetches and validates bundle, workspace, and attachment inputs,
+then copies them through the Docker API into claim-owned named volumes. Bundle
+and attachment mounts are read only; the workspace is writable by UID `1000`.
+No shared staging directory or daemon-visible client workspace is required.
+The dev collector config travels in a small Docker build context, while the
+generated release Compose uses inline content configs. The worker's Docker
+socket mount refers to the daemon host's socket.
 
 | Command | What it does |
 |---|---|
@@ -378,19 +477,23 @@ the optional Slack dispatcher.
 | `curie local observability runs` | List newest-first trace rows through the local Curie API. `--limit` defaults to 20 and accepts 1 through 100; `--agent-id <id>` restricts the list. |
 | `curie local observability run <trace-id>` | Read one complete trace tree previously returned by `runs` (or reported by a completed turn). |
 | `curie local observability metrics` | Read the metrics summary, or a series with `--metric runs\|latency_p95_ms\|tokens\|cost_usd\|error_rate`. Series `--granularity hour\|day\|week` defaults to `day`; all metrics queries accept the API's independent `--start`, `--end`, `--environment`, and `--agent` filters. Series results are capped at 1,000 points. |
-| `curie local comms --slack` | Connect or disconnect a real Slack workspace for the compose stack.<br>• Resolves `SLACK_APP_TOKEN` and `SLACK_BOT_TOKEN` with precedence `--app-token`/`--bot-token` flag > env var > a value persisted with `curie secrets set` (so tokens saved once need no per-session re-export, #749).<br>• Masks them in dry run output.<br>• Starts or stops the dispatcher, and switches the worker between real Slack and the local stub.<br>• Exactly one Curie release may connect to a given Slack app. |
+| `curie local comms --slack` | Connect or disconnect a real Slack workspace for the compose stack.<br>• Resolves `SLACK_APP_TOKEN` and `SLACK_BOT_TOKEN` with precedence `--app-token`/`--bot-token` flag > env var > a value persisted with `curie secrets set` (so tokens saved once need no per-session re-export, #749).<br>• Masks them in dry run output.<br>• Starts or stops the dispatcher, and switches the gateway between real Slack and the local stub.<br>• Exactly one Curie release may connect to a given Slack app. |
 | `curie local message "..."` | Drive the local compose stack end to end with zero Slack. Enqueues straight to the compose Valkey and lets the containerized worker answer. |
 | `curie local eval` | Run the deployed bundle's eval suite through the compose platform. Without a trajectory sidecar, it uses the enqueue, worker, sandbox, and reply path with the shared grader, isolating each case from ambient durable agent memory so the gate is the immutable bundle plus committed cases (#1909). With `evals/trajectory.json`, it triggers the worker eval plane and reads each structured trajectory verdict from the exact matrix stream. Prints the same per case table and rollup, with nonzero exit on failure.<br>• `--cases` overrides the file only for a text graded run. It is refused for a trajectory run because the platform grades the deployed bundle.<br>• `--case-id ID` (repeatable) selects which cases run; omit it for the whole suite. A value matching no case exits **2** (usage) naming the typo, so a mistyped selector fails the gate rather than greening an empty run. Refused with exit 4 on a `--model` sweep and on a trajectory run, both of which grade the deployed suite server-side.<br>• `--samples N` / `--aggregation` / `--pass-at-k` match `skill eval`. A `--model` sweep refuses `--samples > 1`.<br>• `--dry-run` prints the plan.<br>• `--concurrency` defaults to 1. Values above 1 are refused for now (#709).<br>• `--agent <NAME>` sends as that agent's Slack binding, taking the channel and identity from it; pair it with `--channel` when the agent answers on several. A binding under a named identity can be driven through the reply stub (`local message`, `local eval`) and through the cluster message relay (`cluster eval`, and `cluster message` on a release without a dispatcher), which names the identity on the turn. A connected Slack transport posts its placeholder as the default bot and refuses it. |
 | `curie local deploy` | Package the bundle as tar.gz and push it to the compose platform API (`--api-url`, default `http://localhost:28000`). Auth via `--api-key` or `CURIE_API_KEY`.<br>• Refuses locally (exit 2) when the bundle declares an approval route the agent does not bind, after the agent is found or created and before any version or bundle is sent; the error names the unbound and bound routes and the `curie local approvals` command to run. Advisory: an unreadable manifest only warns, and the API still refuses.<br>• The API deployment is activated before hosted connectors start and is not rolled back if connector startup fails. A connector must report healthy via its Docker healthcheck when supplied, or stay continuously running for 2 seconds when absent. Compose uses the configured `CURIE_CONNECTOR_START_TIMEOUT_SECONDS` readiness value, defaulting to 60 seconds, plus fixed five second client, ten second connector ID resolution, and five second diagnostic windows. The default total is 80 seconds. A failed Compose wait remains failure even if later state looks ready. Readiness proves process and health, not tool or MCP discovery.<br>• `--identity <NAME>` names the bot the Slack binding speaks through (ADR-0168 decision 8), overriding the target's `identity`; the default identity is written exactly as before. A named identity needs a channel, and the platform's refusal of an undeclared or not-yet-storable identity is reported as a usage error. A `--target` with `connectors:` starts only those connectors locally. |
-| `curie local memory <agent>` | List the agent's durable memory log (`GET /agents/{id}/memory`). Empty when none exist. |
+| `curie local memory <agent>` | List the retained memory log plus individual facts from agent memory and every bound channel. Each fact shows its id, statement, author and stated date. A malformed fact fails the listing with an error naming its id; `--delete` can remove that fact. Listing and deletion remain available when memory writes are disabled. `--json` preserves `agent` and `entries` and adds `facts` with `scope`, `channel` and the full `stated_at` timestamp. The CLI always emits `facts`, including an empty array; the field is optional in memory schema v2.2. |
+| `curie local memory acme-bot --channel slack=C0EXAMPLE1` | List only the selected channel's facts, with `entries: []` in JSON. `--channel KIND=ADDRESS` must name an exact pair bound to the agent. It conflicts with `--add` and all guidance flags. |
+| `curie local memory acme-bot --delete fact-0123456789abcdef0123456789abcdef` | Delete one fact from agent memory. To delete it from a channel, add `--channel slack=C0EXAMPLE1`. A fact id must be `fact-` followed by exactly 32 lowercase hexadecimal characters. Deletion checks the stored version; a version conflict leaves the updated fact intact. List and review it again before retrying. `--delete` conflicts with `--add` and all guidance flags. `--dry-run` prints the read and delete plan. |
 | `curie local memory <agent> --add <content>` | Append an operator-authored memory record (`POST /agents/{id}/memory`). The API stamps operator provenance. A new `curie local message` without `--continue` is required before the entry is injected at boot. `--dry-run` prints the plan. |
-| `curie local memory <agent> --guidance` / `--guidance-from <file>` / `--reset-guidance` | Show, replace or remove the guidance the agent gets beside its memory tools (`GET`/`PUT`/`DELETE /agents/{id}/memory/guidance`).<br>• `--guidance` prints the effective text and its source: `default` (the platform text) or `operator`.<br>• `--guidance-from` sends the file's text verbatim; an empty or whitespace-only file is refused before any request.<br>• `--reset-guidance` restores the platform default. `--guidance-from` and `--reset-guidance` conflict, and none of the three combines with `--add`.<br>• A new `curie local message` without `--continue` picks up the change. `--dry-run` prints the plan. |
-| `curie local schedules [--agent <agent>]` | List cron hooks and their paused state. Use `--agent <agent> --pause <hook>` or `--agent <agent> --resume <hook>` to control one named hook without redeploying. Resume applies the scheduler's bounded catch up rule. |
+| `curie local memory <agent> --guidance` / `--guidance-from <file>` / `--reset-guidance` | Show, replace or remove the guidance the agent gets beside its memory tools (`GET`/`PUT`/`DELETE /agents/{id}/memory/guidance`).<br>• `--guidance` prints the effective text and its source: `default` (the platform text) or `operator`.<br>• `--guidance-from` sends the file's text verbatim; an empty or whitespace-only file is refused before any request.<br>• `--reset-guidance` restores the platform default. `--guidance-from` and `--reset-guidance` conflict, and none of the three combines with `--add`, `--delete` or `--channel`.<br>• A new `curie local message` without `--continue` picks up the change. `--dry-run` prints the plan. |
+| `curie local schedules [--agent <agent>]` | List cron hooks, their paused state, and separate latest scheduled and manual histories. A manual fire does not replace the scheduled result. Use `--agent <agent> --pause <hook>` or `--agent <agent> --resume <hook>` to control one named hook without redeploying. Resume applies the scheduler's bounded catch up rule. |
+| `curie local hook record <agent> <name> <id>` | Print the persisted run. With `--json`, includes its `source` (`schedule`, `manual`, or `webhook`) and its `trigger` (a wake reports `webhook`). A found record exits 0 even for a non-`ran` or in-flight outcome; it does not wait. Use the run id from a hook fire timeout to inspect its current state. |
+| `curie local hook wake-key <agent> <name>` | Read the targetless wake key. Human output prints the secret, then `generation N`. `curie local hook wake-key rotate <agent> <name>` prints only the new generation and does not print the secret. With `--json`, the read returns `agent_id`, `hook`, `generation`, and `secret`; the rotation omits `secret`. `--dry-run` names the route, says redacted, and makes no request. |
 | `curie local hooks show <agent>` | Read the agent's `hook_partitions` and `source_bindings` through the local platform API. Accepts an agent name or id. With `--json`, returns `id`, `agent`, `hook_partitions`, and `source_bindings`. |
 | `curie local hooks configure <agent> --file <PATH>` | Read a JSON object with `hook_partitions`, `source_bindings`, or both, then send only the supplied maps to `PATCH /agents/{id}`. Each supplied map replaces that whole map; `{}` clears it. An omitted map stays unchanged. Invalid file structure is rejected before an API request. With `--json`, returns the same configuration shape as `show`. |
 | `curie local hooks secret <agent>` | Deliberately read and print the derived hook signing secret. Human output prints the secret on stdout; `--json` returns only `{"secret":"..."}`. `--dry-run` makes no API request and redacts the secret. Use `--api-url` to select a local API and `CURIE_API_KEY` to authenticate without putting the key in command arguments. |
-| `curie local approvals <agent>` | Inspect or configure approval gates and route bindings, list pending records with each card's real bound channel, mint subject-bound resolver credentials, or resolve one record.<br>• `--mint-operator-principal <SUBJECT>` administratively mints a reusable token whose one-time output is exported as `CURIE_APPROVAL_PRINCIPAL_TOKEN`; the token carries no Slack channel and may resolve only an explicit-user route containing that subject.<br>• `--mint-console-login-code <SUBJECT>` creates a single-use code that exchanges for an HttpOnly, subject-bound Console session.<br>• `--resolve <ID>` approves by default; add `--reject` to reject and `--note` for an optional reason. It sends only decision/note, derives the actor from `CURIE_APPROVAL_PRINCIPAL_TOKEN`, and has no `--as` or `--actor-channel` assertion flags.<br>• Requester equality neither grants nor vetoes: the authenticated requester may self-confirm only when the selected approver set admits that same subject. A distinct-person requirement is a separate policy, not an ordinary gate default.<br>• A route write (`--clear-routes`, `--route-resolution`, `--route-approvers`, `--routes-from`) first reads the agent's active deployments and refuses locally (exit 2, nothing sent) when one declares a route the write would remove. If that read fails it warns and sends the write, and the API decides. `--dry-run` stays offline. |
-| `curie local overrides <agent> [--model V\|--clear-model] [--thinking V\|--clear-thinking] [--execution-deadline SECONDS\|--clear-execution-deadline] [--runner-resources JSON\|--clear-runner-resources] [--memory-writes on\|off]` | Read or change the agent's nullable operator overrides via the compose platform API (`PATCH /agents/{id}`).<br>• With no change flags it INSPECTS and writes nothing.<br>• `--clear-<field>` sends explicit JSON null, restoring the platform default; an omitted field is left alone, which is a different request the API tells apart with `model_fields_set`.<br>• A blank value is refused rather than forwarded: an empty override skips the platform default instead of restoring it.<br>• `--execution-deadline` pins the agent's run deadline (`execution_deadline_seconds`, a JSON number) and is refused client-side outside 60-10800 seconds or for a non-integer value; the platform default is 1800s.<br>• `--runner-resources` pins cpu, memory, and ephemeral-storage requests and limits as one JSON object. Null means the chart block. The API refuses a value that cannot fit the sandbox quota.<br>• `--memory-writes on\|off` turns the agent's remember/update/forget memory tools on or off (`memory_writes`, a JSON boolean) from the next sandbox boot. Any other value is refused. The result always reports it (`memory_writes` in `--json`, `memory writes on\|off` in text), inspect included. |
+| `curie local approvals <agent>` | Inspect or configure approval gates and route bindings, list pending records with each card's real bound channel, mint subject-bound resolver credentials, or resolve one record.<br>• `--mint-operator-principal <SUBJECT>` administratively mints a reusable token whose one-time output is exported as `CURIE_APPROVAL_PRINCIPAL_TOKEN`; the token carries no Slack channel and may resolve only an explicit-user route containing that subject.<br>• `--mint-remediation-principal <SUBJECT>` mints a reusable `remediation.administer` token for remediation policy, breaker, and qualification writes; export it as `CURIE_APPROVAL_PRINCIPAL_TOKEN`. It cannot resolve approvals.<br>• `--mint-console-login-code <SUBJECT>` creates a single-use code that exchanges for an HttpOnly, subject-bound Console session.<br>• `--resolve <ID>` approves by default; add `--reject` to reject and `--note` for an optional reason. It sends only decision/note, derives the actor from `CURIE_APPROVAL_PRINCIPAL_TOKEN`, and has no `--as` or `--actor-channel` assertion flags.<br>• Requester equality neither grants nor vetoes: the authenticated requester may self-confirm only when the selected approver set admits that same subject. A distinct-person requirement is a separate policy, not an ordinary gate default.<br>• `--requester-identity <MODE>` (`show`, `on` or `off`) reads or sets whether the agent's hosted connector calls carry the verified human requester (ADR 0270). `on` and `off` are compare-and-set writes on the reported version: pass `--expected-version <N>` from `show`, or omit it to use the version read just before the write. `on` requires the tenant's HTTP identity selection and an operator receiver registration that lists one of the agent's bindings. It is experimental in this release: keep it off outside test installs. When on, the agent's hosted connector caller tokens carry the verified human requester. On a cluster install the connector proxy verifies it and passes it to hosted connectors as `X-Curie-Principal`; the local tier runs no caller proxy, so its connectors never receive the requester. The worker replaces a sandbox before serving a different requester; a different person's message that arrives during a live turn waits for that turn to end, for up to the capacity wait budget (24 hours by default), and a message still waiting then ends without running. As a precondition, the api, the worker and the agent's connector proxies must all run this release (redeploy the agent if its connector proxies are older); during a partial rollout the agent's HTTP turns or connector calls are refused. The flag combines with no other approvals flag.<br>• A route write (`--clear-routes`, `--route-resolution`, `--route-approvers`, `--routes-from`) first reads the agent's active deployments and refuses locally (exit 2, nothing sent) when one declares a route the write would remove. If that read fails it warns and sends the write, and the API decides. `--dry-run` stays offline. |
+| `curie local overrides <agent> [--model V\|--clear-model] [--thinking V\|--clear-thinking] [--execution-deadline SECONDS\|--clear-execution-deadline] [--runner-resources JSON\|--clear-runner-resources] [--memory-writes on\|off]` | Read or change the agent's nullable operator overrides via the compose platform API (`PATCH /agents/{id}`).<br>• With no change flags it INSPECTS and writes nothing.<br>• `--clear-<field>` sends explicit JSON null, restoring the platform default; an omitted field is left alone, which is a different request the API tells apart with `model_fields_set`.<br>• A blank value is refused rather than forwarded: an empty override skips the platform default instead of restoring it.<br>• `--execution-deadline` pins the agent's run deadline (`execution_deadline_seconds`, a JSON number) and is refused client-side outside 60-43200 seconds or for a non-integer value; the platform default is 1800s.<br>• `--runner-resources` pins cpu, memory, and ephemeral-storage requests and limits as one JSON object. Null means the chart block. The API refuses a value that cannot fit the sandbox quota.<br>• `--memory-writes on\|off` turns the agent's remember/update/forget memory tools on or off (`memory_writes`, a JSON boolean) from the next sandbox boot. Any other value is refused. The result always reports it (`memory_writes` in `--json`, `memory writes on\|off` in text), inspect included. |
 | `curie local callers <agent> --surface KIND=ADDRESS [--set ID,ID...\|--clear] [--adapter NAME]` | Show, set or clear who may talk to the bot through one surface via the compose platform API (`PUT /agents/{id}/channels/callers`, ADR 0175).<br>• With neither `--set` nor `--clear` it SHOWS the list and writes nothing; `allowed_callers` is `null` when everyone may talk to the bot.<br>• `--set` replaces the whole list with exact ids: Slack user or bot ids (`U`, `W`, `B`) for a Slack surface, bare email addresses for an email one. The API checks them against the surface's kind and refuses an empty list.<br>• `--clear` sends an explicit JSON null, so everyone may talk to the bot again.<br>• Anyone not on a list gets no reply at all. Editing the list does not bump the binding generation, so the surface's adapter token keeps working. |
 | `curie local reset-thread <agent> --thread-key <key> --yes` | Force a stuck thread's sandbox to be released via the compose platform API (`POST /agents/{id}/threads/{thread_key}/reset`, #737).<br>• The worker's next maintenance tick releases the thread's claim and route, so its next message cold-creates a fresh sandbox; conversation history is not deleted.<br>• Waits for the worker to drain the request. When the key matched no route (a named bot's key carries its identity as its own segment, `kind:identity:channel:conversation`), nothing was released: the command says so and exits 2 instead of reporting `released`; `--json` adds `route_existed` when the API reported the outcome.<br>• Interrupts a live turn on the thread first, so it refuses without `--yes`. |
 | `curie local delete <agent> --yes` | End every active deployment, then delete the agent through the compose platform API. Destructive and irreversible: refuses without `--yes`.<br>• If the final agent deletion fails, the agent remains present but any deployments already ended stay ended. |
@@ -464,10 +567,10 @@ flag, or `CURIE_NAMESPACE` for namespace, still overrides the saved field.
 | Command | What it does |
 |---|---|
 | `curie cluster lint-values -f values.yaml [-f more.yaml] --namespace curie --release curie` | Read the release's stored user values and report paths whose values differ from a file based Helm upgrade. Files merge in order. Output contains paths and counts only, including false, null, empty map, and empty list paths. Supply the same files, order, and target as the planned upgrade. |
-| `curie cluster up` | Establish ownership of the primary install namespace before installing or upgrading the release (`helm upgrade --install`), then wait up to five minutes for the target workload images, observed generations and replica counts to converge.<br>• An absent namespace is atomically created with the release and install-namespace ownership labels; an unlabeled primary namespace is adopted only after a point-in-time inventory proves it is empty apart from the default ServiceAccount and `kube-root-ca.crt` ConfigMap. The Namespace UID/resource-version check guards metadata replacement, but does not serialize namespaced-object creation, so keep an unowned namespace unused by other writers during adoption. An unavailable remote APIService registration or unreadable APIService availability blocks adoption. A pre-existing unlabeled namespace containing other objects, a terminating namespace, or a foreign, partially owned, or conflicting namespace refuses before Helm with a reason. The shared `agent-sandbox-system` namespace keeps create-only behavior. A failed rollout returns nonzero with redacted failure reasons.<br>• Exposes the UI and Langfuse on node ports; `--no-expose` keeps them ClusterIP-only.<br>• Set `CURIE_CREDENTIALS` (deprecated alias `CURIE_MODEL_CREDENTIALS`) for a real model, or install sealed with canned replies.<br>• `--local-model` installs in-cluster inference; a following plain `up` re-supplies that inference configuration so the local model stays the source. `CURIE_CREDENTIALS` or an operator `--set` still replaces it (#2510).<br>• A shell `CURIE_MODEL` defaults the sandbox runner model (`agentSandbox.runner.model`) for cross-tier parity with `local up`, unless an explicit `--set agentSandbox.runner.model=` is passed; a shell `CURIE_MODEL` that disagrees with such an explicit `--set` fails loud.<br>• `--github-token` (or `CURIE_GITHUB_TOKEN`) supplies the API's GitHub credential for private-repo git-flow clones; the CLI passes it to helm through a private 0600 values file rather than as a command-line argument, so it does not appear in the helm command, the printed plan, or that plan's JSON.<br>• Prefer the `CURIE_GITHUB_TOKEN` environment variable: a token typed after the flag sits in `curie`'s own argv, so it still lands in your shell history and in `ps`.<br>• Omitting both preserves whatever the release already recorded, and `--clear-github-token` removes it. Passing the token alongside `--set api.githubToken=` fails loud.<br>• `--dev` keeps the chart's published credential defaults, but still re-supplies Slack tokens recorded by `cluster comms`, a previously generated sealing key, and the GitHub App values a sibling verb recorded. A later `--dev` is a full Helm upgrade and does not restore those empty chart defaults (#1134).<br>• `--forward-only` applies contract or irreversible schema migrations. The default refuses them before mutation so a patch rollback window stays intact (#2300).<br>• Retained empty strings and nulls pass to Helm with its normal semantics; null suppresses a chart default. Retained empty lists and maps refuse before mutation and name the retained key unless an explicit operator override covers it. |
+| `curie cluster up` | Establish ownership of the primary install namespace before installing or upgrading the release (`helm upgrade --install`), then wait up to five minutes for the target workload images, observed generations and replica counts to converge. The capacity preflight sums requests from the final chart render and warns when projected CPU or memory requests exceed 80% of eligible nodes' allocatable capacity; it never blocks installation. If nodes or pods cannot be listed, it prints a skip note and proceeds.<br>• An absent namespace is atomically created with the release and install-namespace ownership labels; an unlabeled primary namespace is adopted only after a point-in-time inventory proves it is empty apart from the default ServiceAccount and `kube-root-ca.crt` ConfigMap. The Namespace UID/resource-version check guards metadata replacement, but does not serialize namespaced-object creation, so keep an unowned namespace unused by other writers during adoption. An unavailable remote APIService registration or unreadable APIService availability blocks adoption. A pre-existing unlabeled namespace containing other objects, a terminating namespace, or a foreign, partially owned, or conflicting namespace refuses before Helm with a reason. The shared `agent-sandbox-system` namespace keeps create-only behavior. A failed rollout returns nonzero with redacted failure reasons.<br>• Exposes the UI and Langfuse on node ports; `--no-expose` keeps them ClusterIP-only.<br>• Set `CURIE_CREDENTIALS` (deprecated alias `CURIE_MODEL_CREDENTIALS`) for a real model, or install sealed with canned replies.<br>• `--local-model` installs in-cluster inference; a following plain `up` re-supplies that inference configuration so the local model stays the source. `CURIE_CREDENTIALS` or an operator `--set` still replaces it (#2510).<br>• A shell `CURIE_MODEL` defaults the sandbox runner model (`agentSandbox.runner.model`) for cross-tier parity with `local up`, unless an explicit `--set agentSandbox.runner.model=` is passed; a shell `CURIE_MODEL` that disagrees with such an explicit `--set` fails loud.<br>• `--github-token` (or `CURIE_GITHUB_TOKEN`) supplies the API's GitHub credential for private-repo git-flow clones; the CLI passes it to helm through a private 0600 values file rather than as a command-line argument, so it does not appear in the helm command, the printed plan, or that plan's JSON.<br>• Prefer the `CURIE_GITHUB_TOKEN` environment variable: a token typed after the flag sits in `curie`'s own argv, so it still lands in your shell history and in `ps`.<br>• Omitting both preserves whatever the release already recorded, and `--clear-github-token` removes it. Passing the token alongside `--set api.githubToken=` fails loud.<br>• `--dev` keeps the chart's published credential defaults, but still re-supplies Slack tokens recorded by `cluster comms`, a previously generated sealing key, and the GitHub App values a sibling verb recorded. A later `--dev` is a full Helm upgrade and does not restore those empty chart defaults (#1134).<br>• `--forward-only` applies contract or irreversible schema migrations. The default refuses them before mutation so a patch rollback window stays intact (#2300).<br>• Retained empty strings and nulls pass to Helm with its normal semantics; null suppresses a chart default. Retained empty lists and maps refuse before mutation and name the retained key unless an explicit operator override covers it. |
 | `curie cluster down` | Uninstall the release, remove its release-labeled Helm hook Jobs, and sweep only namespaces bearing the release ownership pair (`helm uninstall` + `kubectl delete job` + `kubectl delete namespace`); prompts unless `--yes`. Hook cleanup runs even when Helm uninstall fails, the namespace is retained, or the namespace is terminating. Foreign or nonempty unlabeled namespaces, the pre-existing shared controller namespace, and Agent Sandbox CRDs are retained with a warning. |
-| `curie cluster rollback` | Roll the release back to a prior Helm revision (`helm rollback`); prompts unless `--yes`.<br>• With no `--revision`, auto-selects the newest revision whose status is `deployed` or `superseded`, skipping any `failed`/`pending-*`/`uninstalling` revision in between.<br>• `--revision <n>` targets an exact revision instead; one that is not `deployed`/`superseded` is refused unless `--allow-failed-revision` is also passed (requires `--revision`).<br>• After that status filter, the verb also refuses a target whose declared schema range does not include the live database revision, before Helm mutates the release (#2296). The refusal names the newest safe fail-forward application version.<br>• When the API pod cannot be probed, `--live-schema-revision <rev>` asserts that live revision so the schema-window check still runs without a healthy API (#2558). It does not skip the window. |
-| `curie cluster upgrade --to <version>` | Resumable upgrade lifecycle: plan, validate, drain_preflight (confirm the worker workload is reachable; the drain gate itself is the chart's pre-upgrade Helm hook, observed at convergence), checkpoint, migrate, apply, exact convergence, canary, known-good commit. The operator does not pass Helm merge flags. Success requires exact convergence and a target-version canary. A failure leaves the previous known-good version serving or returns one fail-forward command. `--dry-run` prints the redacted plan.<br>• After confirmation, one current `curie cluster upgrade` process claims the namespaced upgrade checkpoint before reading release snapshots or running Helm. A concurrent current `curie cluster upgrade` that sees its opaque holder and redacted target action refuses. Checkpoint writes and ordinary release compare that holder and the last Kubernetes `resourceVersion`.<br>• Rerun after a normal command failure only when cleanup released ownership. Any interruption after acquisition, including Ctrl C, SIGINT, and SIGTERM, leaves the holder. A reported ownership release CAS failure can also leave it. Inspect the checkpoint and complete the checked manual recovery in the operations guide before rerunning whenever ownership was not released. There is no expiry or automatic takeover. Deleting the checkpoint is not recovery.<br>• Current `curie cluster up`, `curie cluster rollback`, and `curie cluster down` processes do not participate. Older CLIs, raw Helm commands, direct Kubernetes writes, and cluster administrators also remain outside this cooperative guarantee. It does not make all upgrade effects transactional or exactly once.<br>• If the namespace is absent, run `curie cluster up` first. Upgrade ownership is namespaced and does not read the Namespace object. |
+| `curie cluster rollback` | Roll the release back to a known good Helm revision (`helm rollback`); prompts unless `--yes`.<br>With no `--revision`, the newest `deployed` revision is serving. If the newest history row is above it with a status other than `deployed` or `superseded` (except `pending-rollback`, below), select the serving revision to clear the unfinished revision. Otherwise select the newest prior `deployed` or `superseded` revision, using the highest revision as current when none is deployed. Report ineligible revisions skipped between current and target.<br>A newest `pending-rollback` row whose `Rollback to <N>` target is in history below it, `deployed` or `superseded`, and on the same chart is resumed toward N (`--json` field `resumed_interrupted_rollback: true`, otherwise `false`); if N cannot be confirmed the verb exits 1 and names `--revision <serving>`, plus `--revision <N>` when N is a revision in history.<br>`--dry-run` reads Helm history and resolves the same target, then prints its revision, status, chart, source revision and skipped revisions. `--json` carries the same plan lines. History and selection failures exit nonzero; the live-schema probe and rollback do not run, though the probe remains listed in the plan.<br>`--revision <n>` targets an exact revision instead; one that is not `deployed`/`superseded` is refused unless `--allow-failed-revision` is also passed (requires `--revision`).<br>After that status filter, the verb also refuses a target whose declared schema range does not include the live database revision, before Helm mutates the release (#2296). The refusal names the newest safe fail-forward application version.<br>When the API pod cannot be probed, `--live-schema-revision <rev>` asserts that live revision so the schema-window check still runs without a healthy API (#2558). It does not skip the window. |
+| `curie cluster upgrade --to <version> [--take-over <holder>]` | Resumable upgrade lifecycle: plan, validate, drain_preflight (confirm the worker workload is reachable; the drain gate itself is the chart's pre-upgrade Helm hook, observed at convergence), checkpoint, migrate, apply, exact convergence, canary, known-good commit. The operator does not pass Helm merge flags. Success requires exact convergence against the requested chart and a target-version canary. A same-version known-good rerun remains a no-op only when the requested chart renders the installed container images; different pins refuse with their installed and requested references. Publish a distinct chart version to apply changed pins. A failure leaves the previous known-good version serving or returns one fail-forward command.<br>1. After confirmation, the command claims the namespaced upgrade checkpoint before reading release snapshots or running Helm. A concurrent upgrade reports the holder and target action and refuses. Checkpoint writes and ordinary release compare that holder and the last Kubernetes `resourceVersion`.<br>2. Any interruption after acquisition, including Ctrl C, SIGINT, and SIGTERM, leaves the holder. An ownership release CAS failure can also leave it. After verifying that its CLI and Helm action have stopped, rerun with `--take-over <holder>`. The CLI tests the exact holder and resource version, preserves the record, and refuses while a release hook Job is running or its Job list cannot be read. There is no expiry, heartbeat, or automatic takeover. The operations guide retains the conditional manual patch as a fallback; never delete the checkpoint.<br>3. A plain run refuses a pending newest revision and names the serving revision and rollback command. A takeover rolls an orphaned `pending-upgrade` back to the serving revision before snapshots, then resumes. `pending-install`, `pending-rollback`, or a pending history with no deployed revision refuse without automated recovery.<br>4. `--dry-run` reads ownership without creating or patching it, requires a matching takeover for a held checkpoint, reports the serving revision's version, and plans recovery before the upgrade.<br>5. Current `curie cluster up`, `curie cluster rollback`, and `curie cluster down`, older CLIs, raw Helm commands, direct Kubernetes writes, and administrators remain outside this cooperative guarantee. Upgrade effects are not transactional or exactly once. If the namespace is absent, run `curie cluster up` first. |
 | `curie cluster status` | Report release health, exact target-image convergence, pod readiness, access URLs, completion-delivery health, the current upgrade phase, and the last known-good version (read-only). Returns exit 1 when the target has not converged, including an old ready replica beside a failed replacement. `--json` retains the status payload and lists redacted rollout reasons in `pods.unhealthy`. Tagged images reported under a sibling alias require read access to the serving Pod's Node: the requested tag and reported alias must uniquely bind to the same manifest digest as the Ready container's image ID. A shorter kubelet alias of that digest is accepted, including when kubelet lists the tag, alias, and digest as separate Node.status.images entries of one repository. A missing name, two digests for the same name, or a digest that does not match the Ready image ID fails closed. A digest-pinned chart request is accepted from the Ready image ID even when Node.status.images omits the name (the k3s 50-image cap). Warnings that could not be diagnosed never affect `healthy`. This verifies loaded-image binding, not mutable-tag freshness. |
 | `curie cluster observability` | Report the release's observability surfaces (Curie Console, Langfuse UI, Curie API base), using the same NodePort discovery as `cluster status`.<br>• The Curie API row resolves the UI `/api` proxy NodePort first, then the `api` Service's own NodePort, then a port-forward hint, the same order `curie doctor` uses to discover the API (#1130).<br>• Degrades a missing, ClusterIP, or unresolvable surface to a note instead of failing.<br>• URLs are printed only; pass `--open` to also open the browsable ones (Console, Langfuse) in a browser. `--json` never opens a browser.<br>• `--dry-run` prints the read-only discovery commands. |
 | `curie cluster observability runs\|run\|metrics` | The same read-only query grammar and results as local observability. Omit `--api-url` to self-plumb a loopback port-forward to the API selected by the shared cluster namespace and release rule above; omit `--api-key` there to read the release Secret. A direct `--api-url` requires its matching `--api-key`, so a discovered release key is never sent to an arbitrary endpoint. |
@@ -477,17 +580,78 @@ flag, or `CURIE_NAMESPACE` for namespace, still overrides the saved field.
 | `curie cluster deploy` | Package the bundle as tar.gz and push it to the platform API.<br>• Refuses locally (exit 2) when the bundle declares an approval route the agent does not bind, after the agent is found or created and before any version or bundle is sent; the error names the unbound and bound routes and the `curie cluster approvals` command to run. Advisory: an unreadable manifest only warns, and the API still refuses.<br>• When `--api-url` is omitted, self-plumbs a `kubectl port-forward` (loopback tunnel) to the release API service and auto-discovers the release-generated key from `<release>-secrets`, so the strong key never crosses the cleartext UI proxy (ADR-0057). `--api-local-port` picks the local end of that tunnel; default `0` lets the kernel assign an ephemeral port, matching `cluster message` and `cluster eval`, so concurrent deploys cannot collide on a fixed port.<br>• Before posting, verifies the self-plumbed tunnel's unauthenticated `GET /health` really answers the Curie API (`{"status": "ok"}`); refuses a 404, an HTML 200, a non-`ok` JSON 200, or a redirect, since a squatted local port or a misresolved Service are both TCP-alive and would pass the port-forward's own readiness check. This verification does not run against an explicit `--api-url`.<br>• Pass `--api-url` / `CURIE_API_URL` to direct-dial a URL instead (no tunnel); an explicit `--api-key` / `CURIE_API_KEY` still wins over discovery. |
 | `curie cluster kill <agent> --yes` | Kill an agent (stop its runs) via the platform API (`POST /agents/{id}/kill`). Destructive: refuses without `--yes`. |
 | `curie cluster resume <agent>` | Resume a killed agent via the platform API (`POST /agents/{id}/resume`). |
-| `curie cluster budget <agent> --limit <n>` | Set the agent's USD limit for each SDK session using the SDK cost estimate via the platform API (`PUT /agents/{id}/budget`, `BudgetConfig.max_usd_per_day`). It does not meter aggregate daily spend across runs, and the token cap for each run stays at the platform default. |
-| `curie cluster schedules [--agent <agent>]` | List cron hooks and their paused state. Use `--agent <agent> --pause <hook>` or `--agent <agent> --resume <hook>` to control one named hook without redeploying. Resume applies the scheduler's bounded catch up rule. |
-| `curie cluster approvals <agent>` | The deployed equivalent of `local approvals`: inspect/configure gates and routes, list pending records, administratively mint an operator principal or Console login code, and resolve using an authenticated principal.<br>• A platform API key can mint credentials but cannot itself resolve. `--resolve <ID>` reads `CURIE_APPROVAL_PRINCIPAL_TOKEN`; its subject must be in the route's explicit users list because a terminal principal carries no Slack channel/group evidence.<br>• `--list` reports `card_channel`, and a parked-turn hint names that route-bound authenticated-card channel rather than the requesting-channel stub. Use the Slack card for channel-membership or group routes.<br>• A route write (`--clear-routes`, `--route-resolution`, `--route-approvers`, `--routes-from`) first reads the agent's active deployments and refuses locally (exit 2, nothing sent) when one declares a route the write would remove. If that read fails it warns and sends the write, and the API decides. `--dry-run` stays offline. |
+| `curie cluster budget <agent> [--limit <n>] [--output-tokens <n>]` | Set the USD limit for each SDK session with `--limit`, the output token cap for each run with `--output-tokens`, or both. At least one flag is required. Reads the current budget before updating it through the platform API, preserving every unspecified limit and platform default. The USD field (`BudgetConfig.max_usd_per_day`) uses the SDK cost estimate and does not meter aggregate daily spend across runs. `local budget` has the same flag surface. |
+| `curie cluster schedules [--agent <agent>]` | List cron hooks, their paused state, and separate latest scheduled and manual histories. A manual fire does not replace the scheduled result. Use `--agent <agent> --pause <hook>` or `--agent <agent> --resume <hook>` to control one named hook without redeploying. Resume applies the scheduler's bounded catch up rule. |
+| `curie cluster hook record <agent> <name> <id>` | Print the persisted run. With `--json`, includes its `source` (`schedule`, `manual`, or `webhook`) and its `trigger` (a wake reports `webhook`). A found record exits 0 even for a non-`ran` or in-flight outcome; it does not wait. Use the run id from a hook fire timeout to inspect its current state. |
+| `curie cluster hook wake-key <agent> <name>` | Read the targetless wake key. Human output prints the secret, then `generation N`. `curie cluster hook wake-key rotate <agent> <name>` prints only the new generation and does not print the secret. With `--json`, the read returns `agent_id`, `hook`, `generation`, and `secret`; the rotation omits `secret`. `--dry-run` names the route, says redacted, and makes no request. |
+| `curie cluster approvals <agent>` | The deployed equivalent of `local approvals`: inspect/configure gates and routes, list pending records, administratively mint an operator principal, a remediation operator principal, or Console login code, and resolve using an authenticated principal.<br>• A platform API key can mint credentials but cannot itself resolve. `--resolve <ID>` reads `CURIE_APPROVAL_PRINCIPAL_TOKEN`; its subject must be in the route's explicit users list because a terminal principal carries no Slack channel/group evidence.<br>• `--list` reports `card_channel`, and a parked-turn hint names that route-bound authenticated-card channel rather than the requesting-channel stub. Use the Slack card for channel-membership or group routes.<br>• `--requester-identity <MODE>` (`show`, `on` or `off`) reads or sets whether the agent's hosted connector calls carry the verified human requester (ADR 0270). `on` and `off` are compare-and-set writes on the reported version: pass `--expected-version <N>` from `show`, or omit it to use the version read just before the write. `on` requires the tenant's HTTP identity selection and an operator receiver registration that lists one of the agent's bindings. It is experimental in this release: keep it off outside test installs. When on, the agent's hosted connector caller tokens carry the verified human requester. On a cluster install the connector proxy verifies it and passes it to hosted connectors as `X-Curie-Principal`; the local tier runs no caller proxy, so its connectors never receive the requester. The worker replaces a sandbox before serving a different requester; a different person's message that arrives during a live turn waits for that turn to end, for up to the capacity wait budget (24 hours by default), and a message still waiting then ends without running. As a precondition, the api, the worker and the agent's connector proxies must all run this release (redeploy the agent if its connector proxies are older); during a partial rollout the agent's HTTP turns or connector calls are refused. The flag combines with no other approvals flag.<br>• A route write (`--clear-routes`, `--route-resolution`, `--route-approvers`, `--routes-from`) first reads the agent's active deployments and refuses locally (exit 2, nothing sent) when one declares a route the write would remove. If that read fails it warns and sends the write, and the API decides. `--dry-run` stays offline. |
 | `curie cluster hooks show <agent>` | Read the agent's hook maps from the release API. With `--json`, returns `id`, `agent`, `hook_partitions`, and `source_bindings`. |
 | `curie cluster hooks configure <agent> --file <PATH>` | Replace only the hook maps present in the JSON file through `PATCH /agents/{id}`. An empty `{}` map clears that map; omitting a map preserves it. With `--json`, returns the updated configuration. |
 | `curie cluster hooks secret <agent>` | Deliberately print the derived signing secret on stdout. With `--json`, returns only `{"secret":"..."}`. `--dry-run` makes no API request and redacts the secret. All three cluster hook commands use the cluster API connection behavior described below. |
-| `curie cluster overrides <agent> [--model V\|--clear-model] [--thinking V\|--clear-thinking] [--execution-deadline SECONDS\|--clear-execution-deadline] [--runner-resources JSON\|--clear-runner-resources] [--memory-writes on\|off]` | Read or change the agent's nullable operator overrides via the platform API (`PATCH /agents/{id}`).<br>• With no change flags it INSPECTS and writes nothing.<br>• `--clear-<field>` sends explicit JSON null, restoring the platform default; an omitted field is left alone, which is a different request the API tells apart with `model_fields_set`.<br>• A blank value is refused rather than forwarded: an empty override skips the platform default instead of restoring it.<br>• `--execution-deadline` pins the agent's run deadline (`execution_deadline_seconds`, a JSON number) and is refused client-side outside 60-10800 seconds or for a non-integer value; the platform default is 1800s.<br>• `--runner-resources` pins cpu, memory, and ephemeral-storage requests and limits as one JSON object. Null means the chart block. The API refuses a value that cannot fit the sandbox quota.<br>• `--memory-writes on\|off` turns the agent's remember/update/forget memory tools on or off (`memory_writes`, a JSON boolean) from the next sandbox boot. Any other value is refused. The result always reports it (`memory_writes` in `--json`, `memory writes on\|off` in text), inspect included. |
+| `curie cluster overrides <agent> [--model V\|--clear-model] [--thinking V\|--clear-thinking] [--execution-deadline SECONDS\|--clear-execution-deadline] [--runner-resources JSON\|--clear-runner-resources] [--memory-writes on\|off]` | Read or change the agent's nullable operator overrides via the platform API (`PATCH /agents/{id}`).<br>• With no change flags it INSPECTS and writes nothing.<br>• `--clear-<field>` sends explicit JSON null, restoring the platform default; an omitted field is left alone, which is a different request the API tells apart with `model_fields_set`.<br>• A blank value is refused rather than forwarded: an empty override skips the platform default instead of restoring it.<br>• `--execution-deadline` pins the agent's run deadline (`execution_deadline_seconds`, a JSON number) and is refused client-side outside 60-43200 seconds or for a non-integer value; the platform default is 1800s.<br>• `--runner-resources` pins cpu, memory, and ephemeral-storage requests and limits as one JSON object. Null means the chart block. The API refuses a value that cannot fit the sandbox quota.<br>• `--memory-writes on\|off` turns the agent's remember/update/forget memory tools on or off (`memory_writes`, a JSON boolean) from the next sandbox boot. Any other value is refused. The result always reports it (`memory_writes` in `--json`, `memory writes on\|off` in text), inspect included. |
 | `curie cluster callers <agent> --surface KIND=ADDRESS [--set ID,ID...\|--clear] [--adapter NAME]` | Show, set or clear who may talk to the bot through one surface via the platform API (`PUT /agents/{id}/channels/callers`, ADR 0175).<br>• With neither `--set` nor `--clear` it SHOWS the list and writes nothing; `allowed_callers` is `null` when everyone may talk to the bot.<br>• `--set` replaces the whole list with exact ids: Slack user or bot ids (`U`, `W`, `B`) for a Slack surface, bare email addresses for an email one. The API checks them against the surface's kind and refuses an empty list.<br>• `--clear` sends an explicit JSON null, so everyone may talk to the bot again.<br>• Anyone not on a list gets no reply at all. Editing the list does not bump the binding generation, so the surface's adapter token keeps working. |
+| `curie cluster access-policy <agent> [--invocation-team TEAM_ID\|--clear-invocation-team] [--approver-team TEAM_ID\|--clear-approver-team]` | Show or change which IdP teams may invoke the agent and approve for it via the platform API (`GET`/`PUT /agents/{id}/access-policy`, ADR 0220).<br>• With no team flag it SHOWS the policy and writes nothing; version 0 means none was set.<br>• A team is named by its id, as `GET /teams` lists it, and must be an IdP group team of the agent's tenant; the API refuses any other.<br>• A role left unmentioned keeps its team. `--clear-*` sends an explicit JSON null, so that role keeps today's behavior.<br>• The write sends back the version it just read as `expected_version`, so a concurrent change is refused (409) rather than overwritten.<br>• Nothing enforces the policy yet. |
 | `curie cluster channel-token <agent> --kind email --address <inbox> [--ttl 7d]` | Mint a scoped channel token (`POST /channels/token`), write it into the Secret the mail adapter actually reads (the chart Secret, or `mailAdapter.channelTokenExistingSecret` when that is set), roll the adapter, and print `exp`. Never prints the token and never writes it through helm values, so `helm get values` cannot undo the rotation. `--show-exp` is read-only: it reports the installed token's `exp` and whether the platform still accepts it, the same observation `curie doctor` uses. |
 | `curie cluster reset-thread <agent> --thread-key <key> --yes` | Force a stuck thread's sandbox to be released via the platform API (`POST /agents/{id}/threads/{thread_key}/reset`, #737).<br>• The worker's next maintenance tick releases the thread's claim and route, so its next message cold-creates a fresh sandbox; conversation history is not deleted.<br>• Waits for the worker to drain the request. When the key matched no route (a named bot's key carries its identity as its own segment, `kind:identity:channel:conversation`), nothing was released: the command says so and exits 2 instead of reporting `released`; `--json` adds `route_existed` when the API reported the outcome.<br>• Interrupts a live turn on the thread first, so it refuses without `--yes`. |
 | `curie cluster delete <agent> --yes` | End every active deployment, then delete the agent through the platform API. Destructive and irreversible: refuses without `--yes`.<br>• If the final agent deletion fails, the agent remains present but any deployments already ended stay ended. |
+
+`curie cluster upgrade` rebuilds catalog-only repository runners whose recorded
+base differs from the effective pinned target platform runner. It builds and
+probes both platforms, reads back every receipt, then validates all updated
+receipts in a final Helm render before the single Helm upgrade. A build,
+readback or final-render failure runs no Helm upgrade and leaves installed
+values unchanged. Same-base receipts are preserved without rebuilding.
+
+The target combines chart defaults with retained and operator values. Repository
+runners require a valid literal `agentSandbox.runner.digest`; an unknown,
+malformed or tag-only target is refused during Validate, including dry runs.
+If the installed values retain an old explicit digest, supply the new platform
+digest through `--values-file <values-file>` when upgrading. Keeping the old
+pin keeps that platform runner as the effective target even when chart defaults
+change.
+
+Custom Dockerfile receipts remain unchanged. After upgrading, rebuild and rebind
+them with `curie cluster --context <context> factory --repo-runner
+acme-corp/acme-bot=runner.yaml --registry registry.example.com/acme --namespace
+<namespace> --release <release>`, using a spec containing the retained tools,
+probes and Dockerfile declaration from its own directory. The upgrade plan
+provides the repository and release scope. Until rebuilt on the installed
+pinned platform runner, a mismatched receipt is refused by the worker as
+`stale_base`. An unpinned installation must pin its platform runner first.
+
+##### Console login
+
+Administrators can mint a Console login code without selecting an agent:
+
+```bash
+curie local console login --subject operator@example.com
+curie cluster --context <context> console login --subject operator@example.com
+```
+
+`--subject` is required and must not be blank. The administrator selects the
+identity; the code exchanges once for a Console session bound to that subject.
+Both commands use the existing platform API login code endpoint.
+
+Local login uses the stored installation credential for the selected Compose
+project (`COMPOSE_PROJECT_NAME`, default `curie`) when reaching a loopback API.
+Cluster login discovers the selected release credential and defaults to a
+loopback tunnel to its API. Select that release with `--namespace` and `--release`, using
+the cluster targeting rules above. Either tier accepts `--api-url` or
+`CURIE_API_URL`; a direct cluster endpoint must use HTTPS unless it is loopback.
+Neither command accepts `--api-key`, and both ignore `CURIE_API_KEY`.
+
+Human stdout contains only the code followed by a newline; the subject and
+expiry note goes to stderr. With `--json`, stdout is one object containing
+`console_login_code` with `code`, `subject`, and `expires_at` fields.
+
+Add `--dry-run` to print an offline request plan without reading credentials,
+opening a tunnel, or making an API request. With `--json --dry-run`, the output
+uses the existing `{"dry_run": true, "plan": ["..."]}` shape:
+
+```bash
+curie --json local console login --subject operator@example.com --dry-run
+curie --json cluster --context <context> console login --subject operator@example.com --dry-run
+```
 
 ##### `curie local|cluster observability`: API-backed queries
 
@@ -530,9 +694,11 @@ well-formed trace id writes `{"error","fix"}` and exits 1; an unavailable API
 writes a distinct `{"error","fix"}` and exits 3. Invalid input, including a
 limit outside 1 through 100 or `--granularity` without `--metric`, exits 2.
 
-| `curie cluster memory <agent>` | List the agent's durable memory log (`GET /agents/{id}/memory`). Empty when none exist. |
+| `curie cluster memory <agent>` | List the retained memory log plus individual facts from agent memory and every bound channel. Each fact shows its id, statement, author and stated date. A malformed fact fails the listing with an error naming its id; `--delete` can remove that fact. Listing and deletion remain available when memory writes are disabled. `--json` preserves `agent` and `entries` and adds `facts` with `scope`, `channel` and the full `stated_at` timestamp. The CLI always emits `facts`, including an empty array; the field is optional in memory schema v2.2. |
+| `curie cluster memory acme-bot --channel slack=C0EXAMPLE1` | List only the selected channel's facts, with `entries: []` in JSON. `--channel KIND=ADDRESS` must name an exact pair bound to the agent. It conflicts with `--add` and all guidance flags. |
+| `curie cluster memory acme-bot --delete fact-0123456789abcdef0123456789abcdef` | Delete one fact from agent memory. To delete it from a channel, add `--channel slack=C0EXAMPLE1`. A fact id must be `fact-` followed by exactly 32 lowercase hexadecimal characters. Deletion checks the stored version; a version conflict leaves the updated fact intact. List and review it again before retrying. `--delete` conflicts with `--add` and all guidance flags. `--dry-run` prints the read and delete plan. |
 | `curie cluster memory <agent> --add <content>` | Append an operator-authored memory record (`POST /agents/{id}/memory`). The API stamps operator provenance. A new `curie cluster message` without `--continue` is required before the entry is injected at boot. `--dry-run` prints the plan. |
-| `curie cluster memory <agent> --guidance` / `--guidance-from <file>` / `--reset-guidance` | Show, replace or remove the guidance the agent gets beside its memory tools (`GET`/`PUT`/`DELETE /agents/{id}/memory/guidance`).<br>• `--guidance` prints the effective text and its source: `default` (the platform text) or `operator`.<br>• `--guidance-from` sends the file's text verbatim; an empty or whitespace-only file is refused before any request.<br>• `--reset-guidance` restores the platform default. `--guidance-from` and `--reset-guidance` conflict, and none of the three combines with `--add`.<br>• A new `curie cluster message` without `--continue` picks up the change. `--dry-run` prints the plan. |
+| `curie cluster memory <agent> --guidance` / `--guidance-from <file>` / `--reset-guidance` | Show, replace or remove the guidance the agent gets beside its memory tools (`GET`/`PUT`/`DELETE /agents/{id}/memory/guidance`).<br>• `--guidance` prints the effective text and its source: `default` (the platform text) or `operator`.<br>• `--guidance-from` sends the file's text verbatim; an empty or whitespace-only file is refused before any request.<br>• `--reset-guidance` restores the platform default. `--guidance-from` and `--reset-guidance` conflict, and none of the three combines with `--add`, `--delete` or `--channel`.<br>• A new `curie cluster message` without `--continue` picks up the change. `--dry-run` prints the plan. |
 
 All authenticated cluster API verbs (`versions`, `memory`, `approvals`, `hooks`, `kill`,
 `resume`, `budget`, `overrides`, `reset-thread`, and `delete`) act on a deployed
@@ -775,15 +941,37 @@ release binary has no dev scripts.
 |---|---|
 | `curie dev contracts` | `bash scripts/check-contracts.sh` -- check the frozen contracts. |
 | `curie dev chart-check` | Discover the executable assertion scripts under `charts/curie/ci`, the same set helm-ci runs, run every one, report each result, and return aggregate failure after all scripts finish. |
+| `curie dev test-env run [--profile PROFILE] -- COMMAND` | Run a command with private backing services, discovered endpoints, and verified cleanup. |
 | `curie dev verify-fix-pin <CHANGE> <SELECTOR>` | Prove that a fix makes the selected test fail when only its product files are reversed. |
 | `curie dev e2e` | `bash cli/scripts/e2e.sh` -- the scripted CLI end-to-end test. |
 | `curie dev e2e-ladder` | `bash cli/scripts/e2e-ladder.sh` -- the cold-start parity ladder (skill, local, cluster rungs). |
-| `curie dev field-parity` | `bash cli/scripts/check-field-parity.sh` -- assert CLI `api.rs` mirror structs cover their platform API model fields (#691), and CLI `commands.rs`/`spec.rs` mirror structs cover the frozen `packages/plugin-format` schema's fields (#701). |
+| `curie dev field-parity` | `bash cli/scripts/check-field-parity.sh` -- assert CLI `api.rs` mirror structs cover their platform API model fields (#691), and CLI `commands/`/`spec.rs` mirror structs cover the frozen `packages/plugin-format` schema's fields (#701). |
 | `curie dev emit-parity` | `bash cli/scripts/check-emit-parity.sh` -- assert a `CliOutput::to_json` that hand-projects a mirror struct into a `json!` literal covers that struct's fields, one hop downstream of `field-parity` (#699). |
 | `curie dev wire-tolerance` | `bash scripts/check-wire-tolerance.sh` -- assert every direct `ClassName.model_validate*(...)` call on an `_AciModel` subclass threads `READER_CONTEXT` or is a declared exception (#625). |
 | `curie dev restore-drill` | `bash cli/scripts/restore-drill.sh` -- bounded synthetic restore of postgres, bundles, mail SQLite, and Valkey from a disposable compose install onto a distinct target (#2427). `--check-backup` is the completeness guard; `--negative` omits a required component and expects refusal. Not an RPO/RTO claim or a production backup product. |
 | `curie dev upgrade-drill` | `bash cli/scripts/upgrade-drill.sh` -- isolated retained-upgrade drill (#2426): published v0.8.6 CLI/chart/images on a task-owned kind install, candidate CLI upgrade, drain/apply interrupt recovery, leftover-hook non-quiesce, compatible rollback that serves a new turn, and incompatible 0.8.4 schema rollback refused before Helm mutates. `--also-predecessor` adds the published v0.8.7 happy path. Refuses the permanent soak. Live provider/channel rows fail closed when credential references are absent. |
 | `curie dev release-accept` | Read-only evaluator for the seven-day / 200-canary release gate (#2430). `--self-test` proves a synthetic qualifying ledger passes and that independently missing each criterion fails closed. `--ledger PATH` evaluates a private evidence file as a live result; fixture or source proof cannot qualify. Does not start a campaign, rotate credentials, or mutate the soak. |
+
+`curie dev test-env run --profile core|full -- COMMAND` creates a unique Compose
+project. The default `core` starts Postgres, Valkey, and RustFS and initializes
+the S3 buckets. `full` adds ClickHouse, Langfuse web and worker, and the OTel
+Collector, waiting for readiness. Neither starts application services or runs
+application database migrations. The child runs from the caller's directory.
+
+The caller's Docker endpoint is preserved. Ports bind to loopback on the Docker
+host; `CURIE_TEST_ENV_HOST` (default `127.0.0.1`) selects the reachable host used
+in endpoint URLs. Actual mapped ports populate `DATABASE_URL`/`TEST_DATABASE_URL`,
+`VALKEY_*`/`TEST_VALKEY_*`, and `S3_ENDPOINT_URL`/`TEST_S3_ENDPOINT_URL` directly
+in the child's environment, alongside the private Compose files, project, and
+runner network. `full` also supplies private Langfuse and OTel endpoints;
+`core` clears those endpoints.
+
+With `--json`, stdout contains one final report with the project, ports,
+networks, `child_exit_code`, and `cleanup_verified`; service logs and child
+stdout/stderr go to stderr. A child exit of 42 is recorded as
+`child_exit_code: 42` and returns CLI exit 1. Success, child failure, SIGINT,
+and SIGTERM all trigger child process group cleanup and verified removal of
+the run's containers, networks, and volumes. Cleanup failure returns CLI exit 3.
 
 Use `curie dev verify-fix-pin <CHANGE> <SELECTOR>` from a source checkout to
 verify a fix commit or pull request. `<CHANGE>` accepts a committed change
@@ -794,7 +982,8 @@ these forms:
    or `runner/tests/test_x.py::test_y` for a Python test.
 2. `cli/tests/local/test_x.py::test_y` for a local Python test.
 3. `cli/tests/name.rs::test_name` for a Rust integration test.
-4. `charts/curie/ci/name.sh` for a chart check script.
+4. `charts/curie/ci/name.sh` or `charts/curie/ci/runtime/name.sh` for a chart
+   check script.
 
 The command runs the selector at the current `HEAD`, reverses only the change's
 non test files in a disposable worktree, then runs the selector again. It prints
@@ -826,6 +1015,79 @@ Only product behavior assertions belong in the test body.
 | Command | What it does |
 |---|---|
 | `curie build` | Build the runner image locally from `runner/Dockerfile` at the repo root. Default tag is `curie-runner`; the same image is also tagged `ghcr.io/curie-eng/curie-runner:dev` so a `curie local up --build` stack sees it. `--tag` overrides the primary tag (a custom tag is not also applied as `:dev`). Prints a clear error if Docker is not installed or if run outside a source checkout -- a release binary pulls the pinned runner image from GHCR automatically and never needs to build. |
+| `curie build --repo-runner <PATH> --registry <REF> [--runner-image <REF>]` | Build, probe and push a repository runner image (ADR 0216). Works from a release binary; no source checkout needed. |
+
+#### Repository runner images
+
+`curie build --repo-runner runner.yaml --registry ghcr.io/acme-corp` builds the
+image a factory binding runs a repository's work in. The input file is YAML or
+JSON with three optional keys:
+
+```yaml
+tools: [uv, rust]              # catalog v1: uv, rust, pnpm, build-essential, docker-cli
+dockerfile: ci/Dockerfile.runner
+probes:
+  - name: terraform
+    command: [terraform, version]
+```
+
+`tools` selects pinned catalog entries (`cli/src/tool_catalog_v1.json`).
+`dockerfile` is a path inside the input file's directory, which is also its
+build context; its first `FROM` must be `${CURIE_RUNNER_IMAGE}`, which resolves
+to the platform runner with the catalog tools already layered on. `probes` adds
+version checks for tools the Dockerfile installs. Unknown keys and tools,
+duplicates, and a Dockerfile outside the directory are refused before anything
+builds.
+
+The platform runner (`--runner-image`, default the runner `curie skill up`
+uses) is resolved to a digest first. One `docker buildx bake` then builds
+`linux/amd64` and `linux/arm64`, runs every catalog and declared probe inside
+the image as its own user, and writes the results to
+`/etc/curie/tool-manifest.json`. A missing tool, a nonzero exit or a probe with
+no output fails the build and names the probe. The image is pushed as
+`<REF>/curie-repo-runner:r-<16 hex>`, where the tag is a convenience name
+derived from the inputs; the pushed index digest is the identity the binding
+records. The command prints the `runner` block (`tools`, `image`, `base`,
+`platformDigests`, plus `dockerfile` and `probes` when set) to paste under
+`factory.bindings[].repos[].runner` in the Helm values; `--json` emits it with
+the platform runner reference, catalog version and manifest path.
+
+The two-platform push needs a docker-container builder. Create one with
+`docker buildx create --driver docker-container --use`, or point
+`BUILDX_BUILDER` at an existing one. Docker's default driver refuses the push.
+
+#### Configure an installed factory repository
+
+Run `curie cluster --context <CONTEXT> factory --namespace <NAMESPACE>
+--release <RELEASE> --repo-runner acme-corp/acme-bot=runner.yaml --registry
+ghcr.io/acme-corp` to build that toolset on the installation's serving platform
+runner and deploy it to an already bound repository. Repeat `--repo-runner` for
+other bound repositories. Each input uses the same tools, Dockerfile and probes
+as `curie build --repo-runner`. All inputs and targets are validated before
+building; every build must succeed before the binding values are applied.
+
+The command records the image index digest, platform runner base digest and
+both platform digests, preserving other binding fields and repositories. This
+mode preserves the factory's intake state, code hosts and trackers. Configure
+intake separately. Optional App credentials and `--repo` select repositories
+for toolchain discovery; they leave the intake allowlist unchanged in this mode.
+
+Add `--repo-docker acme-corp/acme-bot` to enable Docker for that repository, or
+use it alone to update an existing runner binding. Its tool list must select
+`docker-cli`; a custom Docker probe does not satisfy that requirement. The
+installation must already configure a digest-pinned `factory.docker.daemonImage`
+and a deployed worker. Replacing a Docker-enabled runner with a toolset lacking
+`docker-cli` is refused before building.
+
+Toolchain warnings compare repository declarations with the selected pinned
+image's `/etc/curie/tool-manifest.json`. Language executables must be observed
+by a probe: `uv` and `pnpm` alone do not establish Python or Node versions.
+Inventory reads use anonymous registry access. A private registry, an absent
+manifest, an unsupported layer encoding or a read limit produces an explicit
+unknown-inventory warning. It never substitutes a fixed toolchain list.
+
+`--dry-run` validates local inputs and prints the build and binding plan with
+placeholders for digests; it performs no registry or cluster reads.
 
 ### Prototyping agents in a source checkout
 
@@ -863,6 +1125,17 @@ drives, then adds a local rung (`local up
 then `cluster message`, a real round trip with no manual port-forward) against
 a pre-installed release. It asserts one bundle identity, one eval suite, and
 one model mode across every rung and fails on divergence.
+
+The local observability failure control uses the actual runner SDK against a
+run-owned HTTP provider on the private runner network. The provider returns a
+synthetic authentication rejection with `x-should-retry: false`, so SDK retries
+cannot consume the delivery budget before the failure is observed. The control
+requires an actual provider request, a new correlated worker/runner ERROR trace
+and log, and a `classified_failure` metric delta, then restores the ordinary
+model configuration and proves a fresh healthy turn. The provider records only
+a request count, never request bodies or headers, and teardown removes it by its
+unique run identity. Delivery budgets and failure/recovery assertions remain
+unchanged.
 
 A `local-release` rung repeats the local rung's exact round trip against the
 generated `compose.release.yaml` instead -- the artifact a release binary's
@@ -911,3 +1184,66 @@ The one-command pre-release gate:
 ```bash
 CURIE_E2E_TIERS=all curie dev e2e-ladder
 ```
+
+### Human turn progress
+
+Tool progress and possible-change warnings on stderr describe actions in plain
+language. MCP identifiers use the action suffix as a readable label; missing or
+malformed identifiers use `action`. Generated identifiers in progress text and
+warning details receive the same treatment. Answer text, error diagnostics,
+wire events, JSON results and eval trajectories keep their original content.
+A possible-change warning does not claim that a call succeeded or that its
+result was committed. Quiet mode continues to suppress progress notes.
+
+Receipt and CLI progress metadata use the same reference-boundary vector as
+approval displays. Closing code quotes end a sentence reference just as closing
+parentheses, brackets and ordinary quotes do; requested filenames and paths stay
+literal. This wording changes neither answers nor stored actions.
+
+### Ordered cluster values files
+
+`CLUSTER-VALUES-FILES c1`: `cluster up` and `cluster upgrade` accept repeatable
+`-f FILE` / `--values-file FILE`. Files merge in caller order: maps merge
+recursively, while lists, scalars and explicit nulls replace earlier values.
+Existing explicit command flags keep their precedence. Without files, retained
+configuration and command behavior remain unchanged.
+
+`CLUSTER-VALUES-FILES c2`: read and parse the complete file set before cluster
+mutation. Missing, unreadable, malformed or non-map input fails closed without
+printing file contents. Snapshot parsed values so edits to an original file
+cannot change a later Helm application. Values remain typed, including numeric
+strings, dotted mapping keys and empty lists/maps.
+
+`CLUSTER-VALUES-FILES c3`: file values override retained operator configuration;
+existing credential, provider, namespace, controller, gVisor, configuration and
+schema admission checks validate the final effective overlay. On upgrade, any
+derived stock runner layer rebind or stale binding removal becomes part of that
+final snapshot before schema compatibility and timeout metadata are rendered.
+All preflight renders use that overlay and the same existing generated/inferred
+overrides. During Apply, rebuilt repository receipts enter a cloned overlay;
+a final Helm render admits that complete candidate and supplies its timeout
+before the same candidate is applied. A file may not bypass a guard.
+
+`CLUSTER-VALUES-FILES c4`: file credentials use the existing private values-file
+lifecycle and stay out of previews, JSON plans, diagnostic contents and argument
+values. Regenerate the command manifests for the new flags. This feature does
+not change release versions or authorize contract migrations.
+
+Tracked by [#4319](https://github.com/curie-eng/curie/issues/4319).
+
+HTTP identity operators can adopt, inspect, replace and retire an external
+provider with `curie cluster identity-authority`, and manage issuer group
+role filters with `curie cluster role-filter`. See the
+[operator runbook](../docs/http-identity-operator.md) for protected credential
+registration, versioned requests and refusal recovery.
+
+### Protected process migration
+
+Stop the protected worker, then run
+`curie migrate-protected-process --runtime-dir /private/acme/runtime --gateway-config /private/acme/gateway.json`.
+The gateway file contains the v2 `channel_gateway` object described in the
+[channel gateway upgrade guide](../packages/channel-gateway/README.md#protected-worker-process-files).
+The command validates both inputs, removes raw Slack credentials, and atomically
+replaces `process.json` with mode `0600`. It refuses already migrated or invalid
+files without changing them. `--json` emits one result object; errors include a
+fix and never include configuration values. Restart the worker after success.

@@ -1,42 +1,38 @@
 """Server-derived GitHub authorization for trusted worker-only redemption."""
 
+import base64
+from typing import Any
 from urllib.parse import urlsplit
 
-from .config import Settings
-from .gitflow import _clone_credential_env, trusted_clone_url
-from .github_app import credentials_for
+from .repo_full_name import repo_url_path
 
 
 def resolve_repository_credential(
-    repo_full_name: str, settings: Settings
+    repo_full_name: str, *, html_base: str, credentials: Any
 ) -> tuple[str, str]:
     """Return a clean origin and its ephemeral Authorization header.
 
-    The origin comes only from stored server facts and configured clone base.
-    App installation-token minting remains preferred by ``GitHubCredentials``;
-    the raw operator token remains its fallback.
+    The origin is the code host's canonical HTTPS origin for the repository,
+    ``<html_base>/<owner>/<name>.git``, derived from the code host's configured
+    host and the stored repository path. ``credentials`` is the code host's
+    `GitHubCredentials`: an App installation token when an App is configured,
+    else its operator token.
     """
 
-    clone_url = trusted_clone_url(repo_full_name, settings)
-    expected_url = f"{settings.github_html_base}/{repo_full_name}.git"
+    base = html_base.rstrip("/")
+    clone_url = f"{base}/{repo_url_path(repo_full_name)}.git"
     origin = urlsplit(clone_url)
     if (
-        clone_url != expected_url
+        clone_url != f"{base}/{repo_full_name}.git"
         or origin.scheme != "https"
         or not origin.hostname
         or origin.username is not None
         or origin.password is not None
     ):
         raise ValueError("managed repository origin is not canonical configured GitHub HTTPS")
-    env = _clone_credential_env(
-        clone_url,
-        settings,
-        repo_full_name=repo_full_name,
-        credentials=credentials_for(settings),
-    )
-    value = env.get("GIT_CONFIG_VALUE_0", "")
-    prefix = "Authorization: "
-    authorization_header = value[len(prefix) :] if value.startswith(prefix) else ""
-    if not authorization_header:
+    token = credentials.token_for(repo_full_name)
+    if not token:
         raise ValueError("operator GitHub credential is not configured")
-    return clone_url, authorization_header
+    # The same `x-access-token` Basic header `gitflow.clone_credential_env` sends.
+    basic = base64.b64encode(f"x-access-token:{token}".encode()).decode()
+    return clone_url, f"Basic {basic}"

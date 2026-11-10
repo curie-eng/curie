@@ -5,7 +5,8 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from curie_api.factory_notices import needs_human, result_section
+from curie_api.factory_notices import result_section
+from curie_api.factory_progress import pill_for
 
 _VECTOR = Path(__file__).resolve().parents[3] / "tests" / "vectors" / "turn-failure-reply.json"
 
@@ -19,13 +20,9 @@ def test_factory_result_names_the_vector_failure_class() -> None:
         assert f"Cause: {example['factory_cause']}" in body
 
 
-def test_split_escalation_causes_still_need_a_person() -> None:
-    assert needs_human("failed", "runner_escalated")
-    assert needs_human("failed", "unclassified")
-    assert needs_human("failed", "max_turns")
-    assert needs_human("failed", "ci_failed")
-    assert not needs_human("failed", "early_stop")
-    assert not needs_human("completed", "max_turns")
+def test_failed_and_expired_runs_show_the_needs_human_pill() -> None:
+    assert pill_for("failed", False)[0] == "NEEDS HUMAN"
+    assert pill_for("expired", False)[0] == "NEEDS HUMAN"
 
 
 def test_a_completed_result_has_no_failure_class() -> None:

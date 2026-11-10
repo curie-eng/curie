@@ -17,9 +17,9 @@ import zipfile
 from typing import Any
 
 import pytest
-from curie_api import crud
 from curie_api import deploy as deploy_module
 from curie_api.config import Settings, get_settings
+from curie_api.crud import versions as crud_versions
 from curie_api.routers import bundles as bundles_router
 from curie_api.storage import BundleStore
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
@@ -74,13 +74,13 @@ def test_oversized_upload_is_rejected_before_buffering(
     agent_id, version_id = _create_version(client, auth_headers)
 
     calls: list[uuid.UUID] = []
-    real_get_version = crud.get_version
+    real_get_version = crud_versions.get_version
 
     async def _tracking_get_version(session: Any, vid: uuid.UUID) -> Any:
         calls.append(vid)
         return await real_get_version(session, vid)
 
-    monkeypatch.setattr(crud, "get_version", _tracking_get_version)
+    monkeypatch.setattr(crud_versions, "get_version", _tracking_get_version)
 
     # An uncompressed archive carrying 2000 filler bytes: well over the 200
     # byte cap regardless of tar's own header/padding overhead.
@@ -232,9 +232,9 @@ def _store_legacy_bundle(agent_id: str, version_id: str, data: bytes) -> None:
         engine = create_async_engine(settings.database_url)
         maker = async_sessionmaker(engine, expire_on_commit=False)
         async with maker() as session:
-            version = await crud.get_version(session, uuid.UUID(version_id))
+            version = await crud_versions.get_version(session, uuid.UUID(version_id))
             assert version is not None
-            await crud.attach_bundle(
+            await crud_versions.attach_bundle(
                 session, version, key, hashlib.sha256(data).hexdigest()
             )
         await engine.dispose()

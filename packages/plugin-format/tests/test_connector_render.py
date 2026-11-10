@@ -888,12 +888,6 @@ def test_a_hosted_connector_with_no_fallback_mounts_nothing_rather_than_a_dead_u
     assert r.unhosted_mcp_entry(ConnectorSpec(image="x:1")) is None
 
 
-def test_a_remote_connector_needs_no_fallback_to_stay_reachable() -> None:
-    entry = r.unhosted_mcp_entry(REMOTE)
-    assert entry is not None
-    assert entry["url"] == "https://mcp.internal/mcp"
-
-
 def test_the_fallback_never_displaces_the_derived_url_where_curie_hosts() -> None:
     # The whole point is that `cluster` keeps hosting it. A fallback that won
     # everywhere would silently repoint a production agent at someone's laptop.
@@ -931,6 +925,58 @@ def test_a_referenced_secret_points_at_the_secret_the_author_named() -> None:
     assert ref["name"] == "grafana-mcp", "must point at the out-of-band Secret, not Curie's"
     assert ref["key"] == "TOKEN"
     assert "value" not in entry
+
+
+def _referenced_secret_name(from_secret: str, agent: str) -> str:
+    spec = ConnectorSpec(image="x:1", secrets=[SecretRef(name="T", from_secret=from_secret)])
+    dep = next(
+        o
+        for o in r.render(
+            release="rel",
+            agent=agent,
+            namespace="ns",
+            app_name="app",
+            connector="g",
+            spec=spec,
+            secret_name="curie-owned",
+            proxy=_caller_proxy(),
+        )
+        if o["kind"] == "Deployment"
+    )
+    entry = next(
+        e for e in dep["spec"]["template"]["spec"]["containers"][0]["env"] if e["name"] == "T"
+    )
+    name = entry["valueFrom"]["secretKeyRef"]["name"]
+    assert isinstance(name, str)
+    return name
+
+
+def test_a_referenced_secret_can_be_scoped_to_the_deploying_agent() -> None:
+    # One bundle deployed as two agents in one namespace: each agent's
+    # connector reads its own out-of-band Secret, not a shared one.
+    template = "example-read-${CURIE_AGENT}"
+    assert _referenced_secret_name(template, "foo") == "example-read-foo"
+    assert _referenced_secret_name(template, "foo-dev") == "example-read-foo-dev"
+
+
+def test_a_literal_referenced_secret_does_not_depend_on_the_agent() -> None:
+    assert _referenced_secret_name("example-read", "foo") == "example-read"
+    assert _referenced_secret_name("example-read", "foo-dev") == "example-read"
+
+
+@pytest.mark.parametrize("agent", ["Foo", "foo_dev", "a" * 250])
+def test_an_agent_that_cannot_complete_a_secret_name_refuses_to_render(agent: str) -> None:
+    # The validator proves the template fits every valid agent name, but the
+    # agent arrives separately at render. A name the API server would refuse
+    # at apply is refused here instead, naming both halves.
+    with pytest.raises(ValueError, match="example-read-"):
+        _referenced_secret_name("example-read-${CURIE_AGENT}", agent)
+
+
+def test_secret_ref_placeholders_are_disjoint_from_args_and_env_placeholders() -> None:
+    # `${CURIE_AGENT}` is substituted only in `from_secret`; an args/env value
+    # carrying it is still refused as unknown, and vice versa.
+    assert not set(r.SECRET_REF_PLACEHOLDERS) & set(r.PLACEHOLDERS)
 
 
 def test_owned_and_referenced_secrets_are_indistinguishable_to_the_container() -> None:
@@ -1304,9 +1350,9 @@ def test_ingress_policy_selects_the_connector_not_the_sandbox() -> None:
         "release-r", "app-name", "agent-a"
     )
     dep = next(o for o in objs if o["kind"] == "Deployment")
-    assert ing["spec"]["podSelector"]["matchLabels"] == dep["spec"]["template"]["metadata"][
-        "labels"
-    ]
+    assert (
+        ing["spec"]["podSelector"]["matchLabels"] == dep["spec"]["template"]["metadata"]["labels"]
+    )
 
 
 def test_ingress_is_port_scoped_to_the_connector_port() -> None:
@@ -1629,9 +1675,7 @@ def test_service_dns_vectors(vector: dict) -> None:
         == vector["object_name"]
     )
     assert (
-        r.service_dns(
-            vector["release"], vector["agent"], vector["connector"], vector["namespace"]
-        )
+        r.service_dns(vector["release"], vector["agent"], vector["connector"], vector["namespace"])
         == vector["service_dns"]
     )
 
@@ -1640,9 +1684,7 @@ def test_the_dns_corpus_covers_the_truncation_branch() -> None:
     # Without an over-long name in the corpus the vectors freeze only the
     # concatenation, and the truncation-with-digest branch -- the half a hand
     # port gets wrong -- stays unpinned in both languages.
-    bases = [
-        f"{v['release']}-{v['agent']}-mcp-{v['connector']}" for v in _DNS_VECTORS["vectors"]
-    ]
+    bases = [f"{v['release']}-{v['agent']}-mcp-{v['connector']}" for v in _DNS_VECTORS["vectors"]]
     assert any(len(base) > 63 for base in bases)
     truncated = [
         v
@@ -1965,9 +2007,7 @@ def test_a_server_on_the_proxy_port_moves_the_proxy_not_the_server() -> None:
     spec = HOSTED.model_copy(update={"port": r.CALLER_PROXY_PORT})
     objs = _proxied(spec)
     containers = _containers(objs)
-    assert containers["server"]["ports"] == [
-        {"name": "http", "containerPort": r.CALLER_PROXY_PORT}
-    ]
+    assert containers["server"]["ports"] == [{"name": "http", "containerPort": r.CALLER_PROXY_PORT}]
     assert containers[r.CALLER_PROXY_CONTAINER]["ports"] == [
         {"name": "caller", "containerPort": r.CALLER_PROXY_ALTERNATE_PORT}
     ]
@@ -2027,22 +2067,6 @@ def test_a_proxy_keeps_a_direct_service_on_the_server_port_for_callers_that_are_
 
 
 # @spec ADR-0168 d7
-def test_without_a_proxy_there_is_no_direct_service() -> None:
-    # There is no rendered Service at all: a hosted connector without a caller
-    # key fails closed before any object is produced.
-    with pytest.raises(ValueError, match="hosted_connector_requires_caller_key"):
-        r.render(
-            release="acme-bot",
-            agent="acme-bot",
-            namespace="acme-bot",
-            app_name="acme-bot",
-            connector="grafana",
-            spec=HOSTED,
-            secret_name="conn-secrets",
-            proxy=None,
-        )
-
-
 # @spec ADR-0168 d7
 def test_a_server_on_the_proxy_port_keeps_its_direct_service_on_that_port() -> None:
     spec = HOSTED.model_copy(update={"port": r.CALLER_PROXY_PORT})
@@ -2156,3 +2180,348 @@ def test_a_proxied_connector_is_ready_only_when_its_proxy_accepts() -> None:
         assert "livenessProbe" not in proxy
         assert "startupProbe" not in proxy
         assert containers["server"]["readinessProbe"]["tcpSocket"] == {"port": "http"}
+
+
+# @spec ADR-0229 d2
+def test_a_declared_upstream_host_reaches_the_proxy_env_only() -> None:
+    spec = HOSTED.model_copy(update={"proxy_upstream_host": "localhost"})
+    objs = _proxied(spec=spec)
+    assert _proxy_env(objs)["CURIE_CALLER_PROXY_UPSTREAM_HOST"] == "localhost"
+    server = _containers(objs)["server"]
+    assert "CURIE_CALLER_PROXY_UPSTREAM_HOST" not in json.dumps(server)
+    # Everything else is rendered exactly as without the field: the Services,
+    # the direct Service and both policies do not move.
+    baseline = _proxied()
+    for key in ("Service", "Service/direct", "NetworkPolicy/Egress", "NetworkPolicy/Ingress"):
+        assert objs[key] == baseline[key], key
+    assert server == _containers(baseline)["server"]
+
+
+# @spec ADR-0229 d1, d2
+def test_without_a_declared_upstream_host_the_proxy_env_does_not_name_one() -> None:
+    assert "CURIE_CALLER_PROXY_UPSTREAM_HOST" not in _proxy_env(_proxied())
+
+
+# --------------------------------------------------------------------------- #
+# `config`: per-agent NON-secret settings from the same per-agent Secret.
+# --------------------------------------------------------------------------- #
+def _configured() -> ConnectorSpec:
+    # Built per test, not at import, so the rest of the module still collects
+    # on a ConnectorSpec that predates the field.
+    return ConnectorSpec(
+        image="ghcr.io/example/docs-mcp:1",
+        secrets=["DOCS_TOKEN"],
+        config=["DOCS_FOLDER_PATH"],
+    )
+
+
+def test_config_renders_a_secret_key_ref_into_the_per_agent_secret() -> None:
+    deployment = next(obj for obj in _objs(spec=_configured()) if obj["kind"] == "Deployment")
+    env = deployment["spec"]["template"]["spec"]["containers"][0]["env"]
+    setting = next(item for item in env if item["name"] == "DOCS_FOLDER_PATH")
+    assert setting == {
+        "name": "DOCS_FOLDER_PATH",
+        "valueFrom": {
+            "secretKeyRef": {"name": "conn-secrets", "key": "DOCS_FOLDER_PATH", "optional": False}
+        },
+    }
+
+
+def test_config_never_becomes_the_bearer() -> None:
+    assert _github_entry(_configured())["headers"] == {"Authorization": "Bearer ${DOCS_TOKEN}"}
+    config_only = ConnectorSpec(image="ghcr.io/example/docs-mcp:1", config=["DOCS_FOLDER_PATH"])
+    assert "headers" not in _github_entry(config_only)
+
+
+# --------------------------------------------------------------------------- #
+# `readiness_path` and `resources`: server-container tuning a bundle declares.
+# --------------------------------------------------------------------------- #
+_DEFAULT_SERVER_RESOURCES = {
+    "requests": {"cpu": "10m", "memory": "64Mi"},
+    "limits": {"cpu": "500m", "memory": "256Mi"},
+}
+
+
+def _tuned(**update: object) -> ConnectorSpec:
+    # Validated through the model, not model_copy, so a ConnectorSpec that
+    # predates the fields fails these tests alone.
+    return ConnectorSpec.model_validate({**HOSTED.model_dump(exclude_defaults=True), **update})
+
+
+def test_a_readiness_path_replaces_the_tcp_probe_with_http_get() -> None:
+    container = _server(_tuned(readiness_path="/healthz"))
+    assert container["readinessProbe"] == {
+        "httpGet": {"path": "/healthz", "port": "http"},
+        "initialDelaySeconds": 2,
+        "periodSeconds": 10,
+        "timeoutSeconds": 5,
+        "failureThreshold": 3,
+    }
+    # One handler only: the API server refuses a probe with two.
+    assert "tcpSocket" not in container["readinessProbe"]
+    assert "livenessProbe" not in container
+    assert "startupProbe" not in container
+
+
+def test_a_readiness_path_leaves_the_proxy_probe_alone() -> None:
+    tuned = _containers(_proxied(_tuned(readiness_path="/healthz")))
+    baseline = _containers(_proxied())
+    assert tuned[r.CALLER_PROXY_CONTAINER] == baseline[r.CALLER_PROXY_CONTAINER]
+    assert tuned["server"]["readinessProbe"]["httpGet"] == {"path": "/healthz", "port": "http"}
+
+
+def test_without_a_readiness_path_the_tcp_probe_is_unchanged() -> None:
+    assert _server(HOSTED)["readinessProbe"] == {
+        "tcpSocket": {"port": "http"},
+        "initialDelaySeconds": 2,
+        "periodSeconds": 10,
+        "timeoutSeconds": 3,
+        "failureThreshold": 3,
+    }
+
+
+def test_without_resources_the_server_keeps_the_defaults() -> None:
+    assert _server(HOSTED)["resources"] == _DEFAULT_SERVER_RESOURCES
+
+
+def test_declared_resources_merge_per_key_over_the_defaults() -> None:
+    only_memory_limit = _server(_tuned(resources={"limits": {"memory": "1Gi"}}))
+    assert only_memory_limit["resources"] == {
+        "requests": {"cpu": "10m", "memory": "64Mi"},
+        "limits": {"cpu": "500m", "memory": "1Gi"},
+    }
+    everything = _server(
+        _tuned(
+            resources={
+                "requests": {"cpu": "250m", "memory": "512Mi"},
+                "limits": {"cpu": "2", "memory": "2Gi"},
+            }
+        )
+    )
+    assert everything["resources"] == {
+        "requests": {"cpu": "250m", "memory": "512Mi"},
+        "limits": {"cpu": "2", "memory": "2Gi"},
+    }
+    only_cpu_request = _server(_tuned(resources={"requests": {"cpu": "100m"}}))
+    assert only_cpu_request["resources"] == {
+        "requests": {"cpu": "100m", "memory": "64Mi"},
+        "limits": {"cpu": "500m", "memory": "256Mi"},
+    }
+
+
+def test_declared_resources_leave_the_proxy_alone() -> None:
+    spec = _tuned(resources={"requests": {"memory": "1Gi"}, "limits": {"memory": "2Gi"}})
+    tuned = _containers(_proxied(spec))
+    baseline = _containers(_proxied())
+    assert tuned[r.CALLER_PROXY_CONTAINER] == baseline[r.CALLER_PROXY_CONTAINER]
+    assert tuned["server"]["resources"]["limits"]["memory"] == "2Gi"
+
+
+def test_the_fields_move_nothing_but_the_server_probe_and_resources() -> None:
+    spec = _tuned(readiness_path="/healthz", resources={"limits": {"memory": "1Gi"}})
+    tuned = _proxied(spec)
+    baseline = _proxied()
+    for key in ("Service", "Service/direct", "NetworkPolicy/Egress", "NetworkPolicy/Ingress"):
+        assert tuned[key] == baseline[key], key
+    server = dict(_containers(tuned)["server"])
+    base_server = dict(_containers(baseline)["server"])
+    for moved in ("readinessProbe", "resources"):
+        server.pop(moved)
+        base_server.pop(moved)
+    assert server == base_server
+
+
+# Every hosted connector in every shipped example, plus two synthetic
+# declarations covering the optional fields, as declared and rendered before
+# `readiness_path` and `resources` existed: each declaration plus the sha256
+# of its canonical JSON render. The declarations are recorded rather than
+# reread from examples/, so an example that later changes does not move this
+# baseline; what it pins is the renderer.
+_BASELINE = Path(__file__).resolve().parent / "fixtures" / "connector-render-baseline.json"
+
+
+def _baseline_render_digest(spec: ConnectorSpec, connector: str) -> str:
+    objs = r.render(
+        release="acme-rel",
+        agent="acme-bot",
+        namespace="acme-ns",
+        app_name="curie",
+        connector=connector,
+        spec=spec,
+        secret_name="conn-secrets",
+        proxy=_caller_proxy(),
+    )
+    canonical = json.dumps(objs, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(canonical.encode()).hexdigest()
+
+
+def test_every_recorded_bundle_renders_byte_identically_without_the_fields() -> None:
+    cases = json.loads(_BASELINE.read_text(encoding="utf-8"))["cases"]
+    assert len(cases) >= 6
+    for case in cases:
+        spec = ConnectorSpec.model_validate(case["spec"])
+        assert _baseline_render_digest(spec, case["connector"]) == case["sha256"], case["name"]
+
+
+def test_the_new_fields_set_to_their_defaults_render_the_same_bytes() -> None:
+    cases = json.loads(_BASELINE.read_text(encoding="utf-8"))["cases"]
+    for case in cases:
+        explicit = ConnectorSpec.model_validate(
+            {**case["spec"], "readiness_path": None, "resources": None}
+        )
+        assert _baseline_render_digest(explicit, case["connector"]) == case["sha256"], case["name"]
+# `no_client_auth`: no Authorization header is derived, and the rendered
+# objects do not change (#4669).
+# --------------------------------------------------------------------------- #
+def _no_client_auth_spec(**overrides: object) -> ConnectorSpec:
+    fields: dict = {
+        "image": "ghcr.io/example/docs-mcp:1",
+        "port": 8000,
+        "secrets": ["UPSTREAM_CLIENT_ID", "UPSTREAM_CLIENT_SECRET"],
+        "no_client_auth": (
+            "In-cluster MCP server reached over the pod network; it authenticates no "
+            "client and the boundary is its ingress NetworkPolicy."
+        ),
+    }
+    fields.update(overrides)
+    return ConnectorSpec(**fields)
+
+
+def test_no_client_auth_hosted_entry_has_no_authorization_header() -> None:
+    assert "headers" not in _github_entry(_no_client_auth_spec())
+
+
+def test_no_client_auth_single_plain_secret_derives_no_header() -> None:
+    assert "headers" not in _github_entry(_no_client_auth_spec(secrets=["UPSTREAM_TOKEN"]))
+
+
+def test_no_client_auth_unhosted_entry_has_no_authorization_header() -> None:
+    spec = _no_client_auth_spec(
+        secrets=["UPSTREAM_TOKEN"], unhosted_url="http://127.0.0.1:9000/mcp"
+    )
+    entry = r.unhosted_mcp_entry(spec)
+    assert entry is not None
+    assert "headers" not in entry
+
+
+def test_no_client_auth_rendered_objects_equal_the_same_declaration_without_it() -> None:
+    with_key = _objs(spec=_no_client_auth_spec())
+    without_key = _objs(
+        spec=ConnectorSpec(
+            image="ghcr.io/example/docs-mcp:1",
+            port=8000,
+            secrets=["UPSTREAM_CLIENT_ID", "UPSTREAM_CLIENT_SECRET"],
+        )
+    )
+    assert with_key == without_key
+    kinds = {obj["kind"] for obj in with_key}
+    assert {"Deployment", "Service", "NetworkPolicy"} <= kinds
+
+
+def test_no_client_auth_secrets_keep_pod_side_delivery() -> None:
+    deployment = next(
+        obj for obj in _objs(spec=_no_client_auth_spec()) if obj["kind"] == "Deployment"
+    )
+    env = deployment["spec"]["template"]["spec"]["containers"][0]["env"]
+    by_name = {item["name"]: item for item in env}
+    for name in ("UPSTREAM_CLIENT_ID", "UPSTREAM_CLIENT_SECRET"):
+        assert by_name[name] == {
+            "name": name,
+            "valueFrom": {"secretKeyRef": {"name": "conn-secrets", "key": name, "optional": False}},
+        }
+
+
+_ROUTE = {"path": "/v1/review", "methods": ["POST"], "max_body_bytes": 64 * 1024 * 1024}
+
+
+# @spec ADR-0240 d3
+def test_declared_routes_reach_the_proxy_env_without_their_callers() -> None:
+    from plugin_format.connectors import ConnectorRoute
+
+    spec = HOSTED.model_copy(
+        update={"routes": [ConnectorRoute(**_ROUTE, callers=["review-tools"])]}
+    )
+    objs = _proxied(spec=spec)
+    assert json.loads(_proxy_env(objs)["CURIE_CALLER_PROXY_ROUTES"]) == [_ROUTE]
+    # The proxy cannot tell sandbox processes apart; callers are the runner's.
+    assert "review-tools" not in json.dumps(objs)
+    server = _containers(objs)["server"]
+    assert "CURIE_CALLER_PROXY_ROUTES" not in json.dumps(server)
+    baseline = _proxied()
+    for key in ("Service", "Service/direct", "NetworkPolicy/Egress", "NetworkPolicy/Ingress"):
+        assert objs[key] == baseline[key], key
+    assert server == _containers(baseline)["server"]
+
+
+# @spec ADR-0240 d3
+def test_without_declared_routes_the_proxy_env_does_not_name_any() -> None:
+    assert "CURIE_CALLER_PROXY_ROUTES" not in _proxy_env(_proxied())
+
+
+# --------------------------------------------------------------------------- #
+# `scratch`: a bounded writable volume for the server container (#5415).
+# --------------------------------------------------------------------------- #
+def _pod(spec: ConnectorSpec) -> dict:
+    return _proxied(spec)["Deployment"]["spec"]["template"]["spec"]
+
+
+def test_scratch_renders_a_bounded_disk_backed_empty_dir() -> None:
+    spec = _tuned(scratch={"path": "/scratch", "size_limit": "2Gi"})
+    pod = _pod(spec)
+    assert pod["volumes"] == [{"name": "scratch", "emptyDir": {"sizeLimit": "2Gi"}}]
+    # Disk, never memory: a memory-backed volume counts against the limit.
+    assert "medium" not in pod["volumes"][0]["emptyDir"]
+    server = _containers(_proxied(spec))["server"]
+    assert server["volumeMounts"] == [{"name": "scratch", "mountPath": "/scratch"}]
+    # The mount is writable and the root filesystem is not.
+    assert server["securityContext"]["readOnlyRootFilesystem"] is True
+
+
+def test_scratch_leaves_the_proxy_and_the_pod_security_context_alone() -> None:
+    spec = _tuned(scratch={"path": "/scratch", "size_limit": "2Gi"})
+    tuned = _proxied(spec)
+    baseline = _proxied()
+    proxy = r.CALLER_PROXY_CONTAINER
+    assert _containers(tuned)[proxy] == _containers(baseline)[proxy]
+    pod = tuned["Deployment"]["spec"]["template"]["spec"]
+    base_pod = baseline["Deployment"]["spec"]["template"]["spec"]
+    # An emptyDir is world-writable, so no fsGroup is needed to write it.
+    assert pod["securityContext"] == base_pod["securityContext"]
+    assert "fsGroup" not in pod["securityContext"]
+
+
+def test_scratch_sits_beside_secret_files() -> None:
+    spec = _tuned(
+        secret_files={"FILES_TOKEN": "/secrets/token"},
+        scratch={"path": "/scratch", "size_limit": "1Gi"},
+    )
+    pod = _pod(spec)
+    assert [v["name"] for v in pod["volumes"]] == ["secret-file-0", "scratch"]
+    server = _containers(_proxied(spec))["server"]
+    mounts = {m["name"]: m for m in server["volumeMounts"]}
+    assert mounts["secret-file-0"]["readOnly"] is True
+    assert mounts["scratch"] == {"name": "scratch", "mountPath": "/scratch"}
+    assert pod["securityContext"]["fsGroup"] == 65532
+
+
+def test_scratch_moves_nothing_but_the_server_mount_and_the_pod_volume() -> None:
+    tuned = _proxied(_tuned(scratch={"path": "/scratch", "size_limit": "2Gi"}))
+    baseline = _proxied()
+    for key in ("Service", "Service/direct", "NetworkPolicy/Egress", "NetworkPolicy/Ingress"):
+        assert tuned[key] == baseline[key], key
+    server = dict(_containers(tuned)["server"])
+    assert server.pop("volumeMounts") == [{"name": "scratch", "mountPath": "/scratch"}]
+    assert server == _containers(baseline)["server"]
+    pod = dict(tuned["Deployment"]["spec"]["template"]["spec"])
+    base_pod = dict(baseline["Deployment"]["spec"]["template"]["spec"])
+    pod.pop("volumes")
+    pod.pop("containers")
+    base_pod.pop("containers")
+    assert pod == base_pod
+
+
+def test_an_unset_scratch_renders_the_same_bytes() -> None:
+    cases = json.loads(_BASELINE.read_text(encoding="utf-8"))["cases"]
+    for case in cases:
+        explicit = ConnectorSpec.model_validate({**case["spec"], "scratch": None})
+        assert _baseline_render_digest(explicit, case["connector"]) == case["sha256"], case["name"]

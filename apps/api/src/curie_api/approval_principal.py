@@ -1,7 +1,9 @@
 """Authenticated principals for approval resolution (ADR-0106, #1531).
 
-An approval principal is a short-lived HMAC credential accepted only by the
-approval resolver.  Its subject and proof kind are claims in the credential,
+An approval principal is a short-lived HMAC credential accepted by the
+approval resolver; an ``operator`` principal minted with the
+``remediation.administer`` scope is accepted instead by the remediation policy
+writes (#4228).  Its subject and proof kind are claims in the credential,
 never values supplied in a resolution body.  ``chat`` principals are signed by
 the dispatcher's dedicated attester secret and bind the channel Slack delivered
 to one approval.  ``operator`` principals are signed by the platform key and
@@ -20,12 +22,18 @@ import time
 from dataclasses import dataclass
 from typing import Literal
 
-from .sandbox_token import _b64url, _b64url_decode, _signature
+from curie_internal.sandbox_token import b64url, b64url_decode, signature
+from pydantic import ValidationError
+
+from .identity.slack import SlackEvidence
 
 _PREFIX = "apr"
 APPROVE_SCOPE = "approval.resolve"
+# A distinct scope for remediation policy administration (#4228): same token
+# format and platform key as APPROVE_SCOPE, but neither scope verifies the other.
+REMEDIATION_ADMIN_SCOPE = "remediation.administer"
 OPERATOR_TOKEN_TTL_SECONDS = 12 * 60 * 60
-PrincipalKind = Literal["chat", "operator"]
+PrincipalKind = Literal["chat", "operator", "test_driver"]
 
 
 @dataclass(frozen=True)
@@ -36,6 +44,7 @@ class ApprovalPrincipalClaims:
     kind: PrincipalKind
     actor_channel: str | None
     approval_id: str | None
+    slack: SlackEvidence | None = None
 
 
 def mint(
@@ -47,6 +56,7 @@ def mint(
     exp: int,
     actor_channel: str | None = None,
     approval_id: str | None = None,
+    slack: SlackEvidence | None = None,
 ) -> str:
     """Mint a strict approval-principal credential.
 
@@ -57,11 +67,11 @@ def mint(
 
     if not isinstance(subject, str) or not subject.strip():
         raise ValueError("approval principal subject must be non-empty")
-    if kind not in ("chat", "operator"):
-        raise ValueError("approval principal kind must be chat or operator")
+    if kind not in ("chat", "operator", "test_driver"):
+        raise ValueError("approval principal kind must be chat, operator or test_driver")
     if not isinstance(exp, int) or isinstance(exp, bool):
         raise ValueError("approval principal expiry must be an integer")
-    if kind == "chat":
+    if kind in ("chat", "test_driver"):
         if not isinstance(actor_channel, str) or not actor_channel.strip():
             raise ValueError("chat approval principals must attest a channel")
         if not isinstance(approval_id, str) or not approval_id.strip():
@@ -72,6 +82,9 @@ def mint(
         if approval_id is not None:
             raise ValueError("operator approval principals cannot bind an approval")
 
+    if slack is not None and (kind != "chat" or slack.user_id != subject):
+        raise ValueError("Slack evidence must name the chat principal")
+    extra = {"slack": slack.model_dump(mode="json")} if slack is not None else {}
     payload = json.dumps(
         {
             "sub": subject,
@@ -80,13 +93,14 @@ def mint(
             "approval_id": approval_id,
             "scope": scope,
             "exp": exp,
+            **extra,
         },
         separators=(",", ":"),
         sort_keys=True,
     ).encode()
-    payload_seg = _b64url(payload)
+    payload_seg = b64url(payload)
     signing_input = f"{_PREFIX}.{payload_seg}"
-    return f"{signing_input}.{_signature(signing_key, signing_input)}"
+    return f"{signing_input}.{signature(signing_key, signing_input)}"
 
 
 def unverified_kind(token: str) -> PrincipalKind | None:
@@ -99,7 +113,7 @@ def unverified_kind(token: str) -> PrincipalKind | None:
 
     try:
         prefix, payload_seg, _sig_seg = token.split(".")
-        payload = json.loads(_b64url_decode(payload_seg))
+        payload = json.loads(b64url_decode(payload_seg))
     except (ValueError, AttributeError, TypeError, json.JSONDecodeError):
         return None
     if prefix != _PREFIX or not isinstance(payload, dict):
@@ -107,6 +121,8 @@ def unverified_kind(token: str) -> PrincipalKind | None:
     kind = payload.get("kind")
     if kind == "chat":
         return "chat"
+    if kind == "test_driver":
+        return "test_driver"
     if kind == "operator":
         return "operator"
     return None
@@ -128,7 +144,7 @@ def verify_claims(
         return None
     if prefix != _PREFIX:
         return None
-    expected_sig = _signature(signing_key, f"{_PREFIX}.{payload_seg}")
+    expected_sig = signature(signing_key, f"{_PREFIX}.{payload_seg}")
     try:
         signature_ok = hmac.compare_digest(sig_seg, expected_sig)
     except TypeError:
@@ -136,10 +152,10 @@ def verify_claims(
     if not signature_ok:
         return None
     try:
-        payload = json.loads(_b64url_decode(payload_seg))
+        payload = json.loads(b64url_decode(payload_seg))
     except (ValueError, json.JSONDecodeError):
         return None
-    if not isinstance(payload, dict) or set(payload) != {
+    if not isinstance(payload, dict) or set(payload) - {"slack"} != {
         "sub",
         "kind",
         "actor_channel",
@@ -157,14 +173,14 @@ def verify_claims(
     exp = payload.get("exp")
     if not isinstance(subject, str) or not subject.strip():
         return None
-    if kind not in ("chat", "operator"):
+    if kind not in ("chat", "operator", "test_driver"):
         return None
     if not isinstance(exp, int) or isinstance(exp, bool):
         return None
     current = now if now is not None else int(time.time())
-    if exp <= current:
+    if exp <= current or (kind == "test_driver" and exp > current + 60):
         return None
-    if kind == "chat":
+    if kind in ("chat", "test_driver"):
         if not isinstance(actor_channel, str) or not actor_channel.strip():
             return None
         if not isinstance(claimed_approval_id, str) or not claimed_approval_id.strip():
@@ -176,9 +192,18 @@ def verify_claims(
             return None
         if approval_id is not None:
             return None
+    slack = None
+    if "slack" in payload:
+        try:
+            slack = SlackEvidence.model_validate(payload["slack"])
+        except ValidationError:
+            return None
+        if kind != "chat" or slack.user_id != subject:
+            return None
     return ApprovalPrincipalClaims(
         subject=subject,
         kind=kind,
         actor_channel=actor_channel,
         approval_id=claimed_approval_id,
+        slack=slack,
     )

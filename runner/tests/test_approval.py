@@ -22,16 +22,16 @@ from claude_agent_sdk.types import (
 )
 from curie_runner.adapter import build_options
 from curie_runner.approval import (
+    _KNOWN_BUILTIN_TOOLS,
     APPROVAL_SUMMARY_PREFIX,
     APPROVAL_TOOL_NAME,
     ApprovalGate,
     ApprovalPolicyError,
     ApprovalPolicyResolution,
     build_approval_gate,
-    build_approval_server,
-    build_can_use_tool,
     guard_reserved_summary,
     load_approval_policy,
+    process_approval_request,
     resolve_approval_policy,
     summarize_tool_call,
 )
@@ -41,6 +41,10 @@ from curie_runner.fake import (
     FakeModelSession,
     approval_turn,
     default_turn,
+)
+from curie_runner.harness.claude.approval import (
+    build_approval_server,
+    build_can_use_tool,
 )
 from curie_runner.otel import RunTracer
 from curie_runner.session import SessionRunner, _apply_approval_override
@@ -56,6 +60,7 @@ def _event(text: str = "hello") -> Event:
 
 def _runner(session: FakeModelSession) -> SessionRunner:
     return SessionRunner(
+        max_usd_per_day=None,
         held_secrets=frozenset(),
         session_factory=lambda: session,
         ceiling=10_000,
@@ -172,7 +177,7 @@ def test_block_renders_a_declared_template_as_pending_display() -> None:
     assert gate.pending_display == "Run ls: 2 files. Approve?"
 
 
-def test_block_falls_back_to_machine_string_when_the_template_cannot_render() -> None:
+def test_block_uses_plain_fallback_when_the_template_cannot_render() -> None:
     gate = ApprovalGate(
         required=frozenset({"Bash"}),
         route_by_tool={"Bash": "managers"},
@@ -180,18 +185,18 @@ def test_block_falls_back_to_machine_string_when_the_template_cannot_render() ->
     )
     tool_input = {"command": "ls"}
     gate.block("Bash", tool_input)
-    assert gate.pending_display is None
+    assert gate.pending_display == "Approve shell request. Command: ls"
     assert gate.pending_summary == summarize_tool_call("Bash", tool_input)
 
 
-def test_block_without_a_template_leaves_pending_display_unset() -> None:
+def test_block_without_a_template_describes_the_pending_action() -> None:
     gate = ApprovalGate(
         required=frozenset({"Bash"}),
         route_by_tool={"Bash": "managers"},
     )
     tool_input = {"command": "ls"}
     gate.block("Bash", tool_input)
-    assert gate.pending_display is None
+    assert gate.pending_display == "Approve shell request. Command: ls"
     assert gate.pending_summary == summarize_tool_call("Bash", tool_input)
 
 
@@ -279,6 +284,7 @@ def test_budget_halt_outranks_approval() -> None:
     async def go() -> None:
         session = FakeModelSession(lambda: approval_turn("Anything"))
         runner = SessionRunner(
+            max_usd_per_day=None,
             held_secrets=frozenset(),
             session_factory=lambda: session,
             ceiling=1,  # the approval turn reports 8 output tokens; the halt trips
@@ -514,6 +520,7 @@ def test_blocked_turn_ends_awaiting_approval() -> None:
 
         session = FakeModelSession(factory)
         runner = SessionRunner(
+            max_usd_per_day=None,
             held_secrets=frozenset(),
             session_factory=lambda: session,
             ceiling=10_000,
@@ -561,6 +568,7 @@ def test_permission_block_outranks_grantless_policy_request() -> None:
 
         session = FakeModelSession(factory)
         runner = SessionRunner(
+            max_usd_per_day=None,
             held_secrets=frozenset(),
             session_factory=lambda: session,
             ceiling=10_000,
@@ -853,7 +861,9 @@ def test_granted_tool_with_different_arguments_is_refused_with_a_reason() -> Non
 
         other = await callback("share_asset", {"asset": "a-2"}, ToolPermissionContext())
         assert isinstance(other, PermissionResultDeny)
-        assert "exact arguments" in other.message
+        assert "approved details" in other.message
+        assert "share asset" in other.message
+        assert "share_asset" not in other.message
         assert other.interrupt is False
         # A refused mismatch mints no new approval and leaves the grant unspent.
         assert gate.pending_summary is None
@@ -892,11 +902,11 @@ def test_permission_resume_on_a_policy_grantable_tool_still_needs_arguments() ->
     # The overlap: a tool both permission-gated and grantableViaPolicy. A
     # permission resume that lost its arguments must not pass as a policy grant.
     gate = build_approval_gate(
-        operator_tools=["close_issue"],
-        policy_routes={"close_issue": "ops"},
-        grant_tool="close_issue",
+        operator_tools=["Bash"],
+        policy_routes={"Bash": "ops"},
+        grant_tool="Bash",
         resumed_kind=None,
-        grantable_by_route={"ops": "close_issue"},
+        grantable_by_route={"ops": "Bash"},
     )
     assert gate is not None
     assert gate.grant_tool is None
@@ -1433,6 +1443,7 @@ def test_blocked_turn_final_carries_the_route() -> None:
 
         session = FakeModelSession(factory)
         runner = SessionRunner(
+            max_usd_per_day=None,
             held_secrets=frozenset(),
             session_factory=lambda: session,
             ceiling=10_000,
@@ -1548,6 +1559,7 @@ async def _run_policy_turn(
         can_use_tool=_executing_approval_callback(gate),
     )
     runner = SessionRunner(
+        max_usd_per_day=None,
         held_secrets=frozenset(),
         session_factory=lambda: session,
         ceiling=10_000,
@@ -1652,6 +1664,7 @@ async def _run_container_fake_policy_turn(
         approval_gate=gate,
     )
     runner = SessionRunner(
+        max_usd_per_day=None,
         held_secrets=frozenset(),
         session_factory=lambda: session,
         ceiling=10_000,
@@ -2060,6 +2073,84 @@ def test_policy_gate_non_grantable_route_stays_none() -> None:
     anyio.run(go)
 
 
+def _hosted_scale_gate(proxied: frozenset[str] = frozenset({"reference"})) -> ApprovalGate:
+    gate = ApprovalGate(
+        required=frozenset({"mcp__reference__scale"}),
+        route_by_tool={"mcp__reference__scale": "proof-operators"},
+        grantable_by_route={"proof-operators": "mcp__reference__scale"},
+        connector_servers={"reference"},
+    )
+    # Set after construction, the way the boot sets it once connectors derive.
+    gate.proxied_connector_servers = proxied
+    return gate
+
+
+def test_a_grantable_route_to_a_proxied_connector_tool_is_refused_in_turn() -> None:
+    """A policy approval cannot carry a hosted connector call through (#3552).
+
+    The caller proxy only forwards a gated call with a grant bound to its exact
+    arguments, and a policy approval has none, so the approved call would be
+    refused after a human approved it. The request is refused before any card,
+    naming the tool to call directly and never the route.
+    """
+
+    gate = _hosted_scale_gate()
+    result = process_approval_request(gate, {"summary": "Scale the owned record to 7"})
+
+    assert result.get("is_error") is True
+    text = result["content"][0]["text"]
+    assert "mcp__reference__scale" in text
+    assert "directly" in text
+    assert "proof-operators" not in text
+    assert gate.policy_requested is True
+    assert gate.policy_rejected is True
+    assert gate.policy_route is None
+
+
+def test_a_refused_proxied_route_ends_the_turn_with_no_approval() -> None:
+    async def go() -> None:
+        frames = await _run_policy_turn(_hosted_scale_gate(), "Scale the owned record to 7")
+
+        final = frames[-1]
+        assert final["status"] == "done"
+        assert final.get("approval_granted_tool") is None
+
+    anyio.run(go)
+
+
+def test_a_grantable_route_to_an_unproxied_tool_still_requests_approval() -> None:
+    """Scope: only a connector behind the caller proxy is refused.
+
+    A remote connector, a docker-tier connector with no caller token, and a
+    non-connector tool keep the ADR-0056 policy grant unchanged.
+    """
+
+    async def go() -> None:
+        gate = _hosted_scale_gate(proxied=frozenset())
+        frames = await _run_policy_turn(gate, "Scale the owned record to 7")
+
+        final = frames[-1]
+        assert final["status"] == "awaiting-approval"
+        assert final["approval_gate_kind"] == "policy"
+        assert final["approval_route"] == "proof-operators"
+        assert final["approval_granted_tool"] == "mcp__reference__scale"
+
+    anyio.run(go)
+
+
+def test_a_proxied_server_does_not_refuse_a_route_granting_another_tool() -> None:
+    gate = ApprovalGate(
+        required=frozenset({"Bash"}),
+        route_by_tool={"Bash": "managers"},
+        grantable_by_route={"managers": "close_issue"},
+        connector_servers={"reference"},
+    )
+    gate.proxied_connector_servers = frozenset({"reference"})
+    result = process_approval_request(gate, {"summary": "Close the ACME issue"})
+    assert result.get("is_error") is not True
+    assert gate.policy_route == "managers"
+
+
 def test_policy_gate_rejected_route_stays_none() -> None:
     """A rejected request (unknown route) creates no approval, so there is
     nothing to grant against: the turn ends clean with no granted tool."""
@@ -2158,6 +2249,7 @@ def test_permission_gate_grants_the_denied_tool_name() -> None:
 
         session = FakeModelSession(factory)
         runner = SessionRunner(
+            max_usd_per_day=None,
             held_secrets=frozenset(),
             session_factory=lambda: session,
             ceiling=10_000,
@@ -2269,6 +2361,7 @@ async def _run_resumed_turn(
 
     session = FakeModelSession(lambda: list(script), can_use_tool=can_use_tool)
     runner = SessionRunner(
+        max_usd_per_day=None,
         held_secrets=frozenset(),
         session_factory=lambda: session,
         ceiling=ceiling,
@@ -2681,45 +2774,67 @@ def test_builtin_and_already_effective_operator_gates_pass_verbatim() -> None:
     anyio.run(go)
 
 
-def test_bare_non_builtin_operator_gate_warns_it_may_be_a_silent_no_op(caplog) -> None:
-    """#736 also relies on this test as its anti-hollow-out guard: widening the
+def test_issue_4424_repro_bare_operator_gate_fails_closed() -> None:
+    """The verbatim #4424 repro: on main this exact call warned and armed
+    `['upgrade_platform']`; a bare name that is not a Claude Code built-in
+    matches no live tool call (MCP tools are reported as `mcp__...`), so it
+    must now refuse boot (ADR-0050) instead of arming a silent no-op."""
+    with pytest.raises(ApprovalPolicyError):
+        build_approval_gate(
+            operator_tools=["upgrade_platform"],
+            policy_routes={},
+            bundle_name="sre-bot",
+            mcp_servers={"self-upgrade"},
+        )
+
+
+@pytest.mark.parametrize("gate_name", ["upgrade_platform", "resolve_leak"])
+def test_bare_non_builtin_operator_gate_fails_closed(gate_name: str) -> None:
+    """#4424 (ADR-0050): a bare (non-mcp__) operator gate name that is not a
+    Claude Code built-in would arm a literal the SDK's `can_use_tool`
+    callback can never match, with zero signal that the gate does nothing --
+    the exact silent fail-open #712's warning was built to surface. A warning
+    cannot defend a security-relevant control, so the gate now refuses boot,
+    mirroring the unresolvable-mcp__ refusal in the same loop. BOTH of the
+    issue's example bare names must be refused, and the message must carry
+    the whole diagnostic an operator needs to fix it: the gate name, the
+    would-arm-nothing explanation, both live naming forms, and BOTH declared
+    inventories.
+
+    #736 also relies on this test as its anti-hollow-out guard: widening the
     known-built-in set must not amount to deleting the check.
-
-    #712: a bare (non-mcp__) operator gate name that ISN'T a well-known
-    built-in tool is still armed verbatim (unchanged behavior -- we cannot
-    fail closed here without an authoritative built-in tool list), but it
-    must no longer be SILENT. This is exactly the shape that bit revenue-leak:
-    `CURIE_APPROVAL_REQUIRED_TOOLS=resolve_leak` (meant as shorthand for an
-    in-bundle MCP tool) armed a literal name the SDK's `can_use_tool` callback
-    can never match, with zero signal anywhere that the gate does nothing.
     """
-    with caplog.at_level("WARNING"):
-        gate = build_approval_gate(
-            operator_tools=["resolve_leak"],
+    with pytest.raises(ApprovalPolicyError) as exc:
+        build_approval_gate(
+            operator_tools=[gate_name],
             policy_routes={},
-            bundle_name="revenue-leak",
-            mcp_servers={"revenue-leak-engine"},
+            bundle_name="sre-bot",
+            mcp_servers={"self-upgrade"},
+            connector_servers={"kubernetes-admin"},
         )
-    assert gate is not None
-    assert gate.required == frozenset({"resolve_leak"})
-    assert any(
-        "resolve_leak" in r.getMessage() and "mcp__" in r.getMessage() for r in caplog.records
-    ), caplog.text
+    message = str(exc.value)
+    assert gate_name in message  # the gate, by name
+    assert "arm nothing" in message  # the explanation, not just the refusal
+    # Both live naming forms, so the operator can rewrite the gate either way.
+    assert "mcp__plugin_<bundle>_<server>__<tool>" in message
+    assert "mcp__<connector>__<tool>" in message
+    # Both declared inventories, so the operator can see what was declared.
+    assert "self-upgrade" in message
+    assert "kubernetes-admin" in message
 
 
-def test_known_builtin_operator_gate_does_not_warn(caplog) -> None:
-    """#712 (no false positives): a real built-in tool name (Bash) must not
-    trigger the "does not match any well-known built-in" warning -- it is a
-    legitimate, common gate target, not a mistake."""
-    with caplog.at_level("WARNING"):
-        gate = build_approval_gate(
-            operator_tools=["Bash"],
-            policy_routes={},
-            bundle_name="revenue-leak",
-            mcp_servers={"revenue-leak-engine"},
-        )
+def test_known_builtin_operator_gate_arms_without_refusal() -> None:
+    """#712 (no false positives): a real built-in tool name (Bash) must keep
+    arming verbatim -- it is a legitimate, common gate target, and the #4424
+    refusal is only for names that can never match a live tool call."""
+    gate = build_approval_gate(
+        operator_tools=["Bash"],
+        policy_routes={},
+        bundle_name="revenue-leak",
+        mcp_servers={"revenue-leak-engine"},
+    )
     assert gate is not None
-    assert not any("does not match any well-known" in r.getMessage() for r in caplog.records)
+    assert gate.required == frozenset({"Bash"})
 
 
 # Provenance and inclusion criterion for these names (#736): see the comment
@@ -2738,33 +2853,65 @@ def test_known_builtin_operator_gate_does_not_warn(caplog) -> None:
         "StructuredOutput",
     ],
 )
-def test_real_builtin_operator_gates_do_not_warn(caplog, builtin: str) -> None:
+def test_real_builtin_operator_gates_arm_without_refusal(builtin: str) -> None:
     """#736: the built-in list drifted behind the bundled CLI, so correctly
     configured gates on real built-ins (Skill, AskUserQuestion, the canonical
-    MCP-resource tools) were falsely warned as probable no-ops.
+    MCP-resource tools) were falsely flagged as probable no-ops. #4424 made
+    the flag a boot refusal, so the false-positive guard is now the arming
+    itself: a real built-in must ARM verbatim, never be refused.
     MultiEdit/NotebookRead have no registry entry in CLI 2.1.206 but are still
     recognized by its permission matcher, so gating them is not an operator
     mistake either."""
-    with caplog.at_level("WARNING"):
-        gate = build_approval_gate(
-            operator_tools=[builtin],
-            policy_routes={},
-            bundle_name="revenue-leak",
-            mcp_servers={"revenue-leak-engine"},
-        )
+    gate = build_approval_gate(
+        operator_tools=[builtin],
+        policy_routes={},
+        bundle_name="revenue-leak",
+        mcp_servers={"revenue-leak-engine"},
+    )
     assert gate is not None
     assert gate.required == frozenset({builtin})
-    assert not any("does not match any well-known" in r.getMessage() for r in caplog.records), (
-        caplog.text
+
+
+# The COMPLETE set, not a curated subset (#4424, AC2): every member of
+# `_KNOWN_BUILTIN_TOOLS` must arm verbatim, so a name the provenance procedure
+# above adds to the set can never silently strand a legitimate gate behind the
+# new refusal.
+@pytest.mark.parametrize("builtin", sorted(_KNOWN_BUILTIN_TOOLS))
+def test_every_known_builtin_operator_gate_arms(builtin: str) -> None:
+    gate = build_approval_gate(
+        operator_tools=[builtin],
+        policy_routes={},
+        bundle_name="revenue-leak",
+        mcp_servers={"revenue-leak-engine"},
     )
+    assert gate is not None
+    assert gate.required == frozenset({builtin})
+
+
+def test_connector_qualified_operator_gate_arms_verbatim() -> None:
+    """AC2's already-qualified half for the connector form: a declared
+    connectors.yaml connector's `mcp__<connector>__<tool>` name arms verbatim
+    -- no plugin prefix, no #4424 refusal -- exactly as it did before the bare
+    names started refusing. An UNdeclared connector name stays refused
+    (test_operator_gate_naming_an_undeclared_connector_still_fails_closed)."""
+    gate = build_approval_gate(
+        operator_tools=["mcp__kubernetes-admin__list_pods"],
+        policy_routes={},
+        bundle_name="sre-bot",
+        mcp_servers={"self-upgrade"},
+        connector_servers={"kubernetes-admin"},
+    )
+    assert gate is not None
+    assert gate.required == frozenset({"mcp__kubernetes-admin__list_pods"})
 
 
 @pytest.mark.parametrize(
     "alias",
     ["Task", "BashOutput", "KillShell", "ListMcpResources"],
 )
-def test_cli_alias_operator_gates_still_warn(caplog, alias: str) -> None:
-    """#736 anti-regression guard: CLI alias names must KEEP warning.
+def test_cli_alias_operator_gates_are_refused(alias: str) -> None:
+    """#736 anti-regression guard, #4424: CLI alias names must KEEP being
+    refused; they must never arm.
 
     These names live in the bundled CLI's alias-to-canonical map (Task -> Agent,
     BashOutput -> TaskOutput, KillShell -> TaskStop, ListMcpResources ->
@@ -2773,21 +2920,16 @@ def test_cli_alias_operator_gates_still_warn(caplog, alias: str) -> None:
     does not use: build_approval_gate arms the name verbatim and
     build_can_use_tool compares the SDK-reported tool name by exact equality,
     and the SDK reports the CANONICAL name. So a gate armed with an alias
-    matches nothing at all, the warning is a true positive, and adding these
+    matches nothing at all: the refusal is a true positive, and adding these
     names back to _KNOWN_BUILTIN_TOOLS would restore a silent fail-open.
     """
-    with caplog.at_level("WARNING"):
-        gate = build_approval_gate(
+    with pytest.raises(ApprovalPolicyError):
+        build_approval_gate(
             operator_tools=[alias],
             policy_routes={},
             bundle_name="revenue-leak",
             mcp_servers={"revenue-leak-engine"},
         )
-    assert gate is not None
-    assert gate.required == frozenset({alias})
-    assert any("does not match any well-known" in r.getMessage() for r in caplog.records), (
-        caplog.text
-    )
 
 
 def test_manifest_gate_half_stays_fail_closed_after_operator_normalization(
@@ -3307,3 +3449,71 @@ def test_the_turn_progress_tool_is_never_mounted_beside_report_progress() -> Non
         ) == {"publish_changes", "report_progress"}
 
     anyio.run(go)
+
+
+def test_permission_display_keeps_values_without_showing_internal_identifiers() -> None:
+    tool = "mcp__plugin_acme_files__file_attachment"
+    arguments = {"file_name": "example.pdf", "destination": "Approved"}
+    gate = ApprovalGate(required=frozenset({tool}))
+    gate.block(tool, arguments)
+    assert gate.pending_display == (
+        "Approve file attachment. Destination: Approved; File name: example.pdf"
+    )
+    assert gate.pending_summary == summarize_tool_call(tool, arguments)
+    assert gate.pending_granted_tool == tool
+    assert gate.pending_granted_arguments == arguments
+
+
+def test_permission_display_preserves_argument_content_even_if_it_names_a_tool() -> None:
+    tool = "mcp__plugin_acme_files__file_attachment"
+    arguments = {"file_name": "mcp__example__read.txt"}
+    gate = ApprovalGate(required=frozenset({tool}))
+    gate.block(tool, arguments)
+    assert "mcp__example__read.txt" in gate.pending_display
+    assert tool not in gate.pending_display
+
+
+@pytest.mark.parametrize(
+    "name,label",
+    [
+        ("mcp__acme__shareAsset", "share asset"),
+        ("Bash", "shell request"),
+        ("Skill", "instruction request"),
+        ("mcp__acme__", "action"),
+    ],
+)
+def test_mismatch_feedback_uses_action_words(name: str, label: str) -> None:
+    async def go() -> None:
+        gate = ApprovalGate(
+            required=frozenset({name}), grant_tool=name, grant_arguments={"asset": "a-1"}
+        )
+        refusal = await build_can_use_tool(gate)(name, {"asset": "a-2"}, ToolPermissionContext())
+        assert isinstance(refusal, PermissionResultDeny)
+        assert f"The approval for {label}" in refusal.message
+        assert "mcp__" not in refusal.message
+        assert "was not run" in refusal.message
+        assert gate.grant_tool == name
+        assert gate.pending_summary is None
+
+    anyio.run(go)
+
+
+def test_declared_gate_summary_sentence_boundaries_preserve_exact_request() -> None:
+    """@spec plain-approval-wording: declared gate summaries share all boundaries."""
+    import json
+    from pathlib import Path
+
+    cases = json.loads(
+        (Path(__file__).resolve().parents[2] / "tests/vectors/user-action-wording.json").read_text()
+    )["metadata_references"]
+    for case in cases:
+        tool = case["tool"]
+        arguments = {"file_name": tool + ".json"}
+        gate = ApprovalGate(
+            required=frozenset({tool}), summary_by_tool={tool: case["summary"]}
+        )
+        gate.block(tool, arguments)
+        assert gate.pending_display == case["display"], case
+        assert gate.pending_summary == summarize_tool_call(tool, arguments)
+        assert gate.pending_granted_tool == tool
+        assert gate.pending_granted_arguments == arguments

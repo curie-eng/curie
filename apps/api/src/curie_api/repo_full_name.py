@@ -1,6 +1,7 @@
 """Strict GitHub repository binding validation and URL path construction."""
 
 import re
+from collections.abc import Mapping
 from typing import Annotated
 from urllib.parse import quote
 
@@ -49,3 +50,13 @@ def repo_url_path(repo_full_name: str) -> str:
 
     owner, repository = normalize_repo_full_name(repo_full_name).split("/", 1)
     return f"{quote(owner, safe='')}/{quote(repository, safe='')}"
+
+
+def entry_for_repo[V](entries: Mapping[str, V], repo_full_name: str) -> V | None:
+    """The first entry keyed by ``repo_full_name``, matched case-insensitively."""
+
+    wanted = repo_full_name.casefold()
+    for name, value in entries.items():
+        if name.casefold() == wanted:
+            return value
+    return None

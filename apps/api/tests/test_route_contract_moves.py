@@ -36,6 +36,7 @@ def test_moving_a_slack_binding_to_another_kind_leaves_it_route_less(
             "address": "room-1",
             "adapter": None,
             "allowed_callers": None,
+            "trigger_label": None,
         }
     ]
 
@@ -66,6 +67,7 @@ def test_moving_a_routed_binding_to_slack_names_the_default_identity(
             "address": "C0EXAMPLE2",
             "adapter": "default",
             "allowed_callers": None,
+            "trigger_label": None,
         }
     ]
 
@@ -96,6 +98,7 @@ def test_a_same_kind_move_keeps_the_stored_route(
             "address": "desk@example.com",
             "adapter": "agentmail",
             "allowed_callers": None,
+            "trigger_label": None,
         }
     ]
 

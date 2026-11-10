@@ -41,7 +41,7 @@ import logging
 import time
 import uuid
 from dataclasses import dataclass
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import httpx
 from curie_telemetry import record_metric
@@ -56,6 +56,9 @@ from .connector_agent import (
     reconcile_agent,
 )
 from .connector_apply import ConnectorClient
+
+if TYPE_CHECKING:
+    from .connector_probe import ProbeTrigger
 
 logger = logging.getLogger(__name__)
 _monotonic = time.monotonic
@@ -152,6 +155,34 @@ class HttpManifestSource:
         )
 
 
+class _ObservingClient:
+    """The reconcile's client, keeping the Deployments ``list_owned`` returned.
+
+    @spec ACTION-EXECUTOR-13. Every verb passes straight through, so the
+    reconcile's decisions and writes are the unwrapped client's. Only
+    Deployments are kept: the owned Secret is listed too and has no business
+    outliving the call.
+    """
+
+    def __init__(self, inner: ConnectorClient) -> None:
+        self._inner = inner
+        self.deployments: list[dict[str, Any]] = []
+
+    def list_owned(self, namespace: str, owner: str) -> list[dict[str, Any]]:
+        live = self._inner.list_owned(namespace, owner)
+        self.deployments = [obj for obj in live if obj.get("kind") == "Deployment"]
+        return live
+
+    def apply(self, namespace: str, obj: dict[str, Any]) -> None:
+        self._inner.apply(namespace, obj)
+
+    def delete(self, namespace: str, kind: str, name: str) -> None:
+        self._inner.delete(namespace, kind, name)
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._inner, name)
+
+
 @dataclass
 class PassSummary:
     """What one sweep did. Reported so a pass is auditable without a debugger.
@@ -187,8 +218,12 @@ class ConnectorReconcileLoop:
         namespace: str,
         db_schema: str,
         interval_seconds: float = 60.0,
+        probe_trigger: ProbeTrigger | None = None,
     ) -> None:
         self._engine = engine
+        # ACTION-EXECUTOR-13: asks for a capability probe from what a pass
+        # observed. None is the loop without it.
+        self._probe_trigger = probe_trigger
         self._source = source
         self._client = client
         self._namespace = namespace
@@ -214,6 +249,9 @@ class ConnectorReconcileLoop:
         ]
 
     def _reconcile_one(self, target: AgentTarget) -> AgentOutcome:
+        return self._reconcile_with(target, self._client)
+
+    def _reconcile_with(self, target: AgentTarget, client: ConnectorClient) -> AgentOutcome:
         if not target.has_bundle:
             # The in-force version has no stored bundle, so the render endpoint
             # 404s for it and `raise_for_status()` would mark this agent failed
@@ -224,13 +262,13 @@ class ConnectorReconcileLoop:
             # prune-only path converges it -- minus the Secret, which we must
             # not touch without a render to name it.
             return prune_agent(
-                self._client,
+                client,
                 agent=target.agent_name,
                 namespace=self._namespace,
             )
         return reconcile_agent(
             self._source,
-            self._client,
+            client,
             agent=target.agent_name,
             agent_id=str(target.agent_id),
             version_id=str(target.version_id),
@@ -249,8 +287,12 @@ class ConnectorReconcileLoop:
             del self._skip_reasons[agent_id]
         for target in targets:
             summary.reconciled += 1
+            observing = _ObservingClient(self._client) if self._probe_trigger is not None else None
             try:
-                outcome = await asyncio.to_thread(self._reconcile_one, target)
+                if observing is None:
+                    outcome = await asyncio.to_thread(self._reconcile_one, target)
+                else:
+                    outcome = await asyncio.to_thread(self._reconcile_with, target, observing)
             except Exception as exc:
                 if (
                     isinstance(exc, httpx.HTTPStatusError)
@@ -284,6 +326,8 @@ class ConnectorReconcileLoop:
                 continue
 
             self._platform_5xx_streaks.pop(target.agent_id, None)
+            if observing is not None:
+                await self._request_probes(target, outcome, observing)
             self._note_skip(target, outcome.skipped)
             if outcome.skipped:
                 summary.skipped += 1
@@ -310,6 +354,29 @@ class ConnectorReconcileLoop:
             outcome="failure" if summary.failed else "success",
         )
         return summary
+
+    async def _request_probes(
+        self, target: AgentTarget, outcome: AgentOutcome, observing: _ObservingClient
+    ) -> None:
+        """Hand the pass's observation to the probe trigger. Never raises.
+
+        Only after a reconcile that completed for this agent, and never for a
+        Deployment the same pass planned to delete: that one is going away, so
+        no probe can be attributed to it.
+        """
+
+        trigger = self._probe_trigger
+        if trigger is None or not observing.deployments:
+            return
+        try:
+            await trigger.after_reconcile(
+                agent_id=str(target.agent_id),
+                agent_name=target.agent_name,
+                observed=observing.deployments,
+                deleting=outcome.plan.delete if outcome.plan is not None else (),
+            )
+        except Exception:
+            logger.exception("capability probe trigger raised for agent=%s", target.agent_name)
 
     def _note_skip(self, target: AgentTarget, reason: str | None) -> None:
         """Log a skip only when it starts, changes or ends.

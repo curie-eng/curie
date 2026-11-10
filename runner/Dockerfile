@@ -24,7 +24,7 @@
 # and an amd64 CI runner both work -- a hardcoded tarball URL would not).
 # Floating tags would still pick up upstream OS security patches without a
 # commit; Dependabot's docker ecosystem raises those base moves as PRs instead.
-FROM node:22.23.2-bookworm-slim@sha256:83f487e0a63425e5b4d146fb5e5be574bcbe1b7b843d3ebafdd95eaf7767a7e5 AS node
+FROM node:22.23.4-bookworm-slim@sha256:de170b39439eb0e5a3444ad7d60b015614a381e10fecae2e30ec9e735122f38d AS node
 
 FROM python:3.13.15-slim-bookworm@sha256:ed86c82274b3c69b52fb5820f358f0bd7df0b603332063cb5c6e32bd220c3e6e
 
@@ -48,28 +48,44 @@ WORKDIR /app
 # not layer placement). --no-deps keeps the closure on those exact pins;
 # local workspace projects are installed by path after the source copy so
 # they resolve to the copied trees, not same-named PyPI distributions.
+#
+# Hash-checked (#3843): the exporter emits every sha256 uv.lock records for each
+# package, and pip runs under --require-hashes, so it refuses any artifact whose
+# hash is not in uv.lock. pip itself comes from a hashed, pinned requirements
+# file instead of an unhashed --upgrade.
 COPY uv.lock ./uv.lock
 COPY runner/export_dependency_pins.py ./runner/export_dependency_pins.py
+COPY runner/pip-requirements.txt ./runner/pip-requirements.txt
 RUN python3 -m venv /app/.venv \
-    && /app/.venv/bin/pip install --no-cache-dir --upgrade pip \
-    && python3 runner/export_dependency_pins.py < uv.lock > /tmp/runner-dependency-pins.txt \
-    && /app/.venv/bin/pip install --no-cache-dir --no-deps -r /tmp/runner-dependency-pins.txt
+    && /app/.venv/bin/pip install --no-cache-dir --require-hashes -r runner/pip-requirements.txt
+RUN python3 runner/export_dependency_pins.py < uv.lock > /tmp/runner-dependency-pins.txt \
+    && /app/.venv/bin/pip install --no-cache-dir --require-hashes --no-deps -r /tmp/runner-dependency-pins.txt
 
-# The five source trees the runner needs: the two frozen workspace packages,
-# the shared telemetry implementation and schema, and the runner itself.
-# Copied by path so the image is reproducible from the lockfile above them
-# (root pyproject/uv.lock are the workspace source of truth).
 COPY packages/aci-protocol ./packages/aci-protocol
+COPY packages/curie-internal ./packages/curie-internal
 COPY packages/plugin-format ./packages/plugin-format
 COPY packages/telemetry ./packages/telemetry
 COPY packages/telemetry-schema ./packages/telemetry-schema
 COPY runner ./runner
 RUN /app/.venv/bin/pip install --no-cache-dir --no-deps \
         ./packages/aci-protocol \
+        ./packages/curie-internal \
         ./packages/plugin-format \
         ./packages/telemetry \
         ./packages/telemetry-schema \
     && /app/.venv/bin/pip install --no-cache-dir --no-deps ./runner
+
+# Same-uid peers cannot read a locked process environ. exec clears that lock.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends gcc libc6-dev \
+    && mkdir -p /usr/local/lib/curie \
+    && gcc -shared -fPIC -O2 \
+        -o /usr/local/lib/curie/libproc_dumpable.so \
+        runner/src/curie_runner/proc_dumpable.c \
+    && apt-get purge -y gcc libc6-dev \
+    && apt-get autoremove -y \
+    && rm -rf /var/lib/apt/lists/*
+ENV CURIE_PROC_DUMPABLE_PRELOAD=/usr/local/lib/curie/libproc_dumpable.so
 
 # Run as a non-root user. The claude-agent-sdk spawns
 # `claude --dangerously-skip-permissions` (permission_mode=bypassPermissions),

@@ -34,7 +34,7 @@ permissions:
 jobs:
   agent-skills:
     name: Skills conform to the Agent Skills spec
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v7
         with:
@@ -43,7 +43,7 @@ jobs:
       # uv's own version decides which transitive deps of the pinned validator
       # get resolved, so pin the uv version too to keep this gate deterministic.
       - name: Install uv
-        uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78 # v7.6.0
+        uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
         with:
           version: "0.10.7"
       - name: Validate every Curie-owned skill

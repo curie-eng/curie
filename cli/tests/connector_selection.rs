@@ -29,8 +29,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use curie::commands::skill_connector_plan;
 use curie::connector_build::{
     compose_overlay, object_name, resolved_image, ConnectorBuildDecl, ConnectorLockEntryDecl,
-    ConnectorLockFileDecl, ConnectorScope, ConnectorSpecDecl, ConnectorsFileDecl, Delivery,
-    LOCK_VERSION,
+    ConnectorLockFileDecl, ConnectorScope, ConnectorSecretVolumes, ConnectorSpecDecl,
+    ConnectorsFileDecl, Delivery, LOCK_VERSION,
 };
 use curie::docker::{
     agent_connectors_argv, connector_identity_labels, connector_project_label, connectors_to_reap,
@@ -38,7 +38,6 @@ use curie::docker::{
     CONNECTOR_COMPONENT_LABEL, CONNECTOR_OBJECT_LABEL_KEY,
 };
 use curie::exit::{classify, ExitClass};
-use tempfile::TempDir;
 
 /// What the author declares TODAY.
 const DECLARED_IMAGE: &str = "ghcr.io/acme-corp/sre-bot-tempo:v2";
@@ -164,13 +163,12 @@ fn a_build_connector_with_no_lock_entry_names_curie_build() {
 
 #[test]
 fn the_local_overlay_refuses_a_hosted_connector_without_a_caller_key() {
-    let dir = TempDir::new().expect("tempdir");
     let error = compose_overlay(
         &lock_for("tempo"),
         &declaring("tempo", image_spec()),
         &scope(),
         PROJECT,
-        dir.path(),
+        &ConnectorSecretVolumes::new(&ConnectorsFileDecl::default()),
         None,
     )
     .expect_err("an empty caller key");
@@ -185,13 +183,12 @@ fn the_local_overlay_refuses_a_hosted_connector_without_a_caller_key() {
 /// writes into `image:` is what compose starts.
 #[test]
 fn the_local_overlay_starts_the_declared_image_despite_a_stale_lock_entry() {
-    let dir = TempDir::new().expect("tempdir");
     let overlay = compose_overlay(
         &lock_for("tempo"),
         &declaring("tempo", image_spec()),
         &scope(),
         PROJECT,
-        dir.path(),
+        &ConnectorSecretVolumes::new(&ConnectorsFileDecl::default()),
         Some("A6EHv/POEL4dcN0Y50vAmWfk1jCbpQ1fHdyGZBJVMbg="),
     )
     .expect("the overlay renders");
@@ -203,13 +200,12 @@ fn the_local_overlay_starts_the_declared_image_despite_a_stale_lock_entry() {
 /// above did not cost the source-build path its image.
 #[test]
 fn the_local_overlay_starts_the_locked_image_for_a_build_connector() {
-    let dir = TempDir::new().expect("tempdir");
     let overlay = compose_overlay(
         &lock_for("tempo"),
         &declaring("tempo", build_spec()),
         &scope(),
         PROJECT,
-        dir.path(),
+        &ConnectorSecretVolumes::new(&ConnectorsFileDecl::default()),
         Some("A6EHv/POEL4dcN0Y50vAmWfk1jCbpQ1fHdyGZBJVMbg="),
     )
     .expect("the overlay renders");
@@ -271,7 +267,6 @@ fn the_skill_plan_skips_a_connector_curie_does_not_host() {
 /// emitters, one pair of labels.
 #[test]
 fn both_emitters_label_a_connector_with_its_agent_and_object_name() {
-    let dir = TempDir::new().expect("tempdir");
     let object = object_name(RELEASE, AGENT, "tempo");
 
     let argv = ConnectorStartSpec::from_declaration(
@@ -281,7 +276,7 @@ fn both_emitters_label_a_connector_with_its_agent_and_object_name() {
         &scope(),
         "curie-skill-net",
         "curie-skill-abc123",
-        dir.path(),
+        &ConnectorSecretVolumes::new(&ConnectorsFileDecl::default()),
         &BTreeMap::new(),
         Some("A6EHv/POEL4dcN0Y50vAmWfk1jCbpQ1fHdyGZBJVMbg="),
     )
@@ -306,7 +301,7 @@ fn both_emitters_label_a_connector_with_its_agent_and_object_name() {
         &declaring("tempo", image_spec()),
         &scope(),
         PROJECT,
-        dir.path(),
+        &ConnectorSecretVolumes::new(&ConnectorsFileDecl::default()),
         Some("A6EHv/POEL4dcN0Y50vAmWfk1jCbpQ1fHdyGZBJVMbg="),
     )
     .expect("the overlay renders");

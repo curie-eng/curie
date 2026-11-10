@@ -24,8 +24,8 @@ from unittest.mock import MagicMock
 import httpx
 import pytest
 import redis
-from curie_dispatcher.app import build_app
-from curie_dispatcher.approval_actions import (
+from curie_channel_gateway.slack.app import build_app
+from curie_channel_gateway.slack.approval_actions import (
     _APPROVAL_ACTION_IDS,
     _DECISION_BY_ACTION_ID,
     APPROVE_ACTION_ID,
@@ -36,8 +36,8 @@ from curie_dispatcher.approval_actions import (
     _refusal_text,
     settled_verdict_line,
 )
-from curie_dispatcher.approval_principal import mint_chat_principal
-from curie_dispatcher.config import DispatcherConfig
+from curie_channel_gateway.slack.approval_principal import mint_chat_principal
+from curie_channel_gateway.slack.config import DispatcherConfig
 from opentelemetry import context as otel_context
 from opentelemetry import trace
 from opentelemetry.trace import NonRecordingSpan, SpanContext, TraceFlags, TraceState
@@ -194,8 +194,8 @@ def test_authorized_click_resolves_and_stamps_the_card(
         {
             "approval_id": APPROVAL_ID,
             "decision": "approved",
-            "attested_user": "U_MANAGER",
-            "attested_channel": "C_MGRS",
+            "actor": "U_MANAGER",
+            "actor_channel": "C_MGRS",
             # The immediate pair carries no note by construction; only the
             # dialog pair can collect one (#1053).
             "note": None,
@@ -355,7 +355,7 @@ def test_resolve_reads_the_decision_time_off_the_response(
     )
 
     outcome = resolver.resolve(
-        APPROVAL_ID, decision="approved", attested_user="U_MANAGER", attested_channel="C_MGRS"
+        APPROVAL_ID, decision="approved", actor="U_MANAGER", actor_channel="C_MGRS"
     )
 
     assert outcome.resolved_at == expected
@@ -873,8 +873,8 @@ def test_resolve_request_carries_the_dispatcher_action_parent() -> None:
         outcome = resolver.resolve(
             APPROVAL_ID,
             decision="approved",
-            attested_user="U_MANAGER",
-            attested_channel="C_MGRS",
+            actor="U_MANAGER",
+            actor_channel="C_MGRS",
         )
 
     assert outcome.status_code == 200
@@ -907,8 +907,8 @@ def test_non_json_403_body_is_not_captured_as_detail() -> None:
     outcome = resolver.resolve(
         APPROVAL_ID,
         decision="approved",
-        attested_user="U_MANAGER",
-        attested_channel="C_MGRS",
+        actor="U_MANAGER",
+        actor_channel="C_MGRS",
     )
 
     assert outcome.status_code == 403
@@ -946,7 +946,7 @@ class _JsonHttpClient:
 
 
 def test_ownership_miss_detail_matches_the_frozen_vector() -> None:
-    from curie_dispatcher.approval_actions import _APPROVAL_NOT_FOUND_DETAIL
+    from curie_channel_gateway.slack.approval_actions import _APPROVAL_NOT_FOUND_DETAIL
 
     vector = json.loads(_OWNERSHIP_VECTOR.read_text(encoding="utf-8"))
     assert set(vector) == _EXPECTED_OWNERSHIP_VECTOR_KEYS
@@ -1188,3 +1188,57 @@ def test_a_verdict_with_no_decision_time_keeps_the_bare_attribution() -> None:
     line = settled_verdict_line(decision="approved", resolver="U1", note=None, resolved_at=None)
 
     assert line == "Approved by <@U1>"
+
+
+def test_dispatcher_mints_shared_test_driver_wire_vector() -> None:
+    from curie_channel_gateway.slack.approval_principal import mint_test_driver_principal
+
+    vector = json.loads(
+        (Path(__file__).parents[3] / "tests/vectors/approval-principal.json").read_text()
+    )
+    claims = vector["test_driver"]["claims"]
+    token = mint_test_driver_principal(
+        vector["secret"],
+        subject=claims["sub"],
+        actor_channel=claims["actor_channel"],
+        approval_id=claims["approval_id"],
+        now=vector["issued_at"],
+    )
+    assert token == vector["test_driver"]["token"]
+
+
+def test_dispatcher_mints_shared_slack_evidence_vector() -> None:
+    vector = json.loads(
+        (Path(__file__).parents[3] / "tests/vectors/approval-principal.json").read_text()
+    )
+    claims = vector["chat_slack"]["claims"]
+    token = mint_chat_principal(vector["secret"], subject=claims["sub"],
+                                actor_channel=claims["actor_channel"],
+                                approval_id=claims["approval_id"], now=vector["issued_at"],
+                                slack=claims["slack"])
+    assert token == vector["chat_slack"]["token"]
+
+
+def test_click_signs_sender_team_evidence_inside_principal() -> None:
+    import base64
+
+    from curie_channel_gateway.slack.approval_actions import resolve_approval_action
+
+    captured = []
+    def transport(request):
+        captured.append(request)
+        return httpx.Response(200, json={"status": "approved", "resolved_by": "U0EXAMPLE1"})
+
+    http = httpx.Client(transport=httpx.MockTransport(transport))
+    resolver = ApprovalResolveClient(api_base_url="https://api.example.com", api_key="",
+                                      approval_chat_attester_secret="example-attester", client=http)
+    body = _approval_click("example", action_id=APPROVE_ACTION_ID, user="U0EXAMPLE1").payload
+    body["user"]["team_id"] = "TEXAMPLE1"
+    outcome = resolve_approval_action(body=body, decision="approved", resolver=resolver)
+    assert outcome is not None and outcome.outcome.status_code == 200
+    wire = captured[0].headers["X-Curie-Approval-Principal"].split(".")[1]
+    claims = json.loads(base64.urlsafe_b64decode(wire + "=" * (-len(wire) % 4)))
+    assert claims["slack"]["interaction_user_team_id"] == "TEXAMPLE1"
+    assert claims["slack"]["user_id"] == "U0EXAMPLE1"
+    assert "slack" not in json.loads(captured[0].content)
+    http.close()

@@ -64,6 +64,28 @@ _BUILD_DECL_KEYS = {
 # --------------------------------------------------------------------------- #
 # Accepted shapes
 # --------------------------------------------------------------------------- #
+@pytest.mark.parametrize("case", _vector_file("connector-fields.json")["connector_names"])
+def test_connector_name_vectors_match_cli_sealing(case: dict) -> None:
+    assert set(case) == {"name", "allowed"}
+    parsed, errors = validate_connectors(
+        {"connectors": {case["name"]: {"url": "https://example.com/mcp"}}}
+    )
+    assert (not errors) is case["allowed"]
+    if case["allowed"]:
+        assert parsed is not None
+        assert case["name"] in parsed.connectors
+    else:
+        assert "connectors.reserved_name" in [code for code, _ in errors]
+        assert any(case["name"] in message for _, message in errors)
+
+
+def test_connector_name_vectors_cover_platform_reservations() -> None:
+    from plugin_format.connectors import RESERVED_CONNECTOR_NAMES
+
+    cases = _vector_file("connector-fields.json")["connector_names"]
+    assert {case["name"] for case in cases if not case["allowed"]} == RESERVED_CONNECTOR_NAMES
+
+
 def test_hosted_connector_is_accepted() -> None:
     parsed, errors = validate_connectors(
         {
@@ -551,6 +573,75 @@ def test_an_empty_from_secret_is_rejected() -> None:
     )
 
 
+def _ref_codes(from_secret: str) -> list[str]:
+    return _codes(
+        {
+            "connectors": {
+                "g": {"image": "x:1", "secrets": [{"name": "T", "from_secret": from_secret}]}
+            }
+        }
+    )
+
+
+@pytest.mark.parametrize(
+    "from_secret",
+    [
+        "example-read-${CURIE_AGENT}",
+        "${CURIE_AGENT}",
+        "${CURIE_AGENT}-example.read",
+        "a-${CURIE_AGENT}-b-${CURIE_AGENT}",
+    ],
+)
+def test_from_secret_may_name_the_deploying_agent(from_secret: str) -> None:
+    # Two agents deployed from one bundle into one namespace each need their
+    # own out-of-band Secret. `${CURIE_AGENT}` is the only per-agent value.
+    assert _ref_codes(from_secret) == []
+
+
+@pytest.mark.parametrize(
+    "from_secret",
+    [
+        # A real args/env placeholder, but not one a Secret name can carry.
+        "example-${CURIE_CONNECTOR_HOST}",
+        "example-${CURIE_AGENT_NAME}",
+        "example-${AGENT}",
+        "example-${curie_agent}",
+        # Unterminated: the literal text would reach the Secret name.
+        "example-${CURIE_AGENT",
+        "example-${CURIE_AGENT}-${}",
+    ],
+)
+def test_from_secret_refuses_any_other_placeholder(from_secret: str) -> None:
+    assert "connectors.secret_ref_unknown_placeholder" in _ref_codes(from_secret)
+
+
+@pytest.mark.parametrize(
+    "from_secret",
+    [
+        "Example-${CURIE_AGENT}",
+        "example_${CURIE_AGENT}",
+        "-${CURIE_AGENT}",
+        "${CURIE_AGENT}.",
+        "example..${CURIE_AGENT}",
+        # 213 + a 40 character agent name is 253; one more cannot fit them all.
+        "a" * 214 + "${CURIE_AGENT}",
+    ],
+)
+def test_a_templated_from_secret_must_expand_to_a_secret_name(from_secret: str) -> None:
+    assert "connectors.secret_ref_bad_name" in _ref_codes(from_secret)
+
+
+def test_the_longest_templated_from_secret_that_fits_every_agent_is_accepted() -> None:
+    assert _ref_codes("a" * 213 + "${CURIE_AGENT}") == []
+
+
+@pytest.mark.parametrize("from_secret", ["Example_Secret", "grafana-mcp", "x" * 300])
+def test_a_literal_from_secret_keeps_its_existing_validation(from_secret: str) -> None:
+    # No behaviour change for a value without a placeholder: the Secret name
+    # checks apply only to the templated form.
+    assert _ref_codes(from_secret) == []
+
+
 def test_the_same_env_name_declared_twice_is_rejected() -> None:
     # Two env entries with one name means the container silently gets whichever
     # the renderer emitted last -- possibly pointed at the wrong Secret.
@@ -570,17 +661,34 @@ def test_key_defaults_to_the_env_var_name() -> None:
 # --------------------------------------------------------------------------- #
 # Names Curie's own platform MCP servers occupy -- #1200
 # --------------------------------------------------------------------------- #
-RESERVED_NAMES = ["curie", "curie-state"]
+RESERVED_NAMES = ["curie", "curie-state", "curie-slack"]
 
 
 @pytest.mark.parametrize("name", RESERVED_NAMES)
 def test_a_reserved_platform_server_name_is_rejected(name: str) -> None:
-    # `curie` is the approval server and `curie-state` the durable state server.
-    # Both ride the same mcp_servers map a declared connector rides, so a
+    # Platform server names share the map a declared connector rides, so a
     # connector claiming the name replaces the platform server in the agent's
     # session -- the agent quietly loses request_approval or the state tools,
     # with nothing logged and nothing failing until a skill calls one.
     assert "connectors.reserved_name" in _codes({"connectors": {name: {"image": "x:1"}}})
+
+
+def test_channel_read_server_identity_is_canonical_and_reserved() -> None:
+    from plugin_format.connectors import CHANNEL_READ_SERVER_NAME, RESERVED_CONNECTOR_NAMES
+
+    assert CHANNEL_READ_SERVER_NAME == "curie-slack"
+    assert RESERVED_CONNECTOR_NAMES == {"curie", "curie-state", CHANNEL_READ_SERVER_NAME}
+
+
+def test_channel_read_connector_refusal_names_its_own_capability() -> None:
+    _, errors = validate_connectors({"connectors": {"curie-slack": {"image": "x:1"}}})
+    message = next(message for code, message in errors if code == "connectors.reserved_name")
+    assert "curie-slack" in message
+    assert "channel" in message.lower()
+    assert "read" in message.lower()
+    assert "platform" in message.lower()
+    assert "request_approval" not in message
+    assert "durable-state" not in message
 
 
 @pytest.mark.parametrize("name", RESERVED_NAMES)
@@ -1101,3 +1209,839 @@ def test_a_direct_suffix_that_renders_no_colliding_service_is_accepted(
     connectors: dict[str, object],
 ) -> None:
     assert "connectors.direct_service_collision" not in _codes({"connectors": connectors})
+
+
+# `config`: per-agent NON-secret settings delivered like a plain secret but
+# never treated as a credential. Synthetic names only.
+
+
+def test_config_is_accepted_beside_a_single_bearer_secret() -> None:
+    # The motivating shape: one real credential plus per-agent settings. Under
+    # `secrets` this would trip bearer_secret_required and risk deriving the
+    # Authorization header from a folder path.
+    parsed, errors = validate_connectors(
+        {
+            "connectors": {
+                "docs": {
+                    "image": "ghcr.io/example/docs-mcp:1",
+                    "secrets": ["DOCS_TOKEN"],
+                    "config": ["DOCS_FOLDER_PATH", "CHAT_CHANNEL_ID"],
+                }
+            }
+        }
+    )
+    assert errors == []
+    assert parsed is not None
+    spec = parsed.connectors["docs"]
+    assert spec.config == ["DOCS_FOLDER_PATH", "CHAT_CHANNEL_ID"]
+    # Resolved from the same per-agent store, so the deploy path writes them.
+    assert spec.resolved_secrets() == ["DOCS_TOKEN", "DOCS_FOLDER_PATH", "CHAT_CHANNEL_ID"]
+    # But they are not credentials.
+    assert spec.secret_names() == ["DOCS_TOKEN"]
+
+
+def test_config_only_connector_is_valid() -> None:
+    assert _codes({"connectors": {"docs": {"image": "x:1", "config": ["DOCS_FOLDER_PATH"]}}}) == []
+
+
+def test_config_names_do_not_count_toward_bearer_secret_required() -> None:
+    codes = _codes(
+        {
+            "connectors": {
+                "docs": {
+                    "image": "x:1",
+                    "secrets": ["DOCS_TOKEN"],
+                    "config": ["A_SETTING", "B_SETTING"],
+                }
+            }
+        }
+    )
+    assert "connectors.bearer_secret_required" not in codes
+
+
+def test_bearer_secret_may_not_name_a_config_entry() -> None:
+    assert "connectors.bearer_secret_unknown" in _codes(
+        {
+            "connectors": {
+                "docs": {
+                    "image": "x:1",
+                    "secrets": ["DOCS_TOKEN"],
+                    "config": ["DOCS_FOLDER_PATH"],
+                    "bearer_secret": "DOCS_FOLDER_PATH",
+                }
+            }
+        }
+    )
+
+
+@pytest.mark.parametrize(
+    "secret_form",
+    [
+        {"secrets": ["SHARED_NAME"]},
+        {"secrets": [{"name": "SHARED_NAME", "from_secret": "s"}]},
+        {"secret_files": {"SHARED_NAME": "/secrets/shared"}},
+    ],
+    ids=["secrets", "secret_ref", "secret_files"],
+)
+def test_a_name_may_not_be_both_config_and_a_secret(secret_form: dict) -> None:
+    doc = {"connectors": {"docs": {"image": "x:1", "config": ["SHARED_NAME"], **secret_form}}}
+    assert "connectors.config_is_secret" in _codes(doc)
+
+
+def test_a_config_name_may_not_repeat() -> None:
+    assert "connectors.duplicate_config" in _codes(
+        {"connectors": {"docs": {"image": "x:1", "config": ["A_SETTING", "A_SETTING"]}}}
+    )
+
+
+def test_a_config_name_must_be_env_var_shaped() -> None:
+    assert "connectors.config_name_invalid" in _codes(
+        {"connectors": {"docs": {"image": "x:1", "config": ["folder-path"]}}}
+    )
+
+
+def test_a_config_name_obeys_the_reserved_fence() -> None:
+    # Same fence as a secret: otherwise moving ANTHROPIC_API_KEY from
+    # `secrets` to `config` would hand the operator's model credential to the
+    # bundle's own container.
+    assert "connectors.config_name_reserved" in _codes(
+        {"connectors": {"docs": {"image": "x:1", "config": ["ANTHROPIC_API_KEY"]}}}
+    )
+
+
+def test_a_remote_connector_cannot_declare_config() -> None:
+    assert "connectors.remote_has_config" in _codes(
+        {"connectors": {"r": {"url": "https://mcp.example.com/mcp", "config": ["A_SETTING"]}}}
+    )
+
+
+# --------------------------------------------------------------------------- #
+# `proxy_upstream_host`: the Host the caller proxy presents on admitted
+# requests (ADR 0229)
+# --------------------------------------------------------------------------- #
+@pytest.mark.parametrize("host", ["localhost", "127.0.0.1", "127.8.9.10", "::1"])
+def test_a_hosted_connector_may_declare_a_loopback_upstream_host(host: str) -> None:
+    # @spec ADR-0229 d1
+    parsed, errors = validate_connectors(
+        {"connectors": {"kubernetes": {"image": "x:1", "proxy_upstream_host": host}}}
+    )
+    assert errors == []
+    assert parsed is not None
+    assert parsed.connectors["kubernetes"].proxy_upstream_host == host
+
+
+def test_the_upstream_host_is_absent_by_default() -> None:
+    # @spec ADR-0229 d1: omitted keeps today's behavior, the caller's Host.
+    parsed, errors = validate_connectors({"connectors": {"grafana": {"image": "x:1"}}})
+    assert errors == []
+    assert parsed is not None
+    assert parsed.connectors["grafana"].proxy_upstream_host is None
+
+
+def test_a_build_form_connector_may_declare_the_upstream_host() -> None:
+    # @spec ADR-0229 d1
+    assert (
+        _codes(
+            {
+                "connectors": {
+                    "kubernetes": {
+                        "build": {"context": "connectors/kubernetes", "platforms": ["linux/amd64"]},
+                        "proxy_upstream_host": "localhost",
+                    }
+                }
+            }
+        )
+        == []
+    )
+
+
+@pytest.mark.parametrize(
+    "host",
+    [
+        "10.0.0.1",
+        "example.com",
+        "curie-sre-bot-kubernetes",
+        "localhost:8000",
+        "127.0.0.1:8000",
+        "[::1]",
+        "[::1]:8000",
+        "0.0.0.0",
+        "::",
+        "LOCALHOST",
+        "localhost\r\nX-Injected: 1",
+        "",
+    ],
+)
+def test_a_non_loopback_or_malformed_upstream_host_is_refused(host: str) -> None:
+    # @spec ADR-0229 d1: loopback host only, with no port; the proxy adds the
+    # server's port itself.
+    assert _codes(
+        {"connectors": {"kubernetes": {"image": "x:1", "proxy_upstream_host": host}}}
+    ) == ["connectors.bad_proxy_upstream_host"]
+
+
+def test_the_upstream_host_on_a_remote_connector_is_refused() -> None:
+    # @spec ADR-0229 d1: a `url` connector has no proxy Curie renders.
+    assert _codes(
+        {
+            "connectors": {
+                "internal": {
+                    "url": "https://mcp.example.com/mcp",
+                    "proxy_upstream_host": "localhost",
+                }
+            }
+        }
+    ) == ["connectors.remote_has_proxy_upstream_host"]
+
+
+def test_bundle_surfaces_a_refused_upstream_host(tmp_path: Path) -> None:
+    root = _bundle(
+        tmp_path,
+        "connectors:\n  kubernetes:\n    image: x:1\n    proxy_upstream_host: example.com\n",
+    )
+    result = validate_bundle(str(root))
+    assert not result.valid
+    assert [e.code for e in result.errors] == ["connectors.bad_proxy_upstream_host"]
+
+
+# --------------------------------------------------------------------------- #
+# `readiness_path`: an HTTP readiness check for the hosted server container.
+# --------------------------------------------------------------------------- #
+@pytest.mark.parametrize("path", ["/healthz", "/", "/api/v1/health", "/ready-z_1.ok~"])
+def test_a_hosted_connector_may_declare_a_readiness_path(path: str) -> None:
+    parsed, errors = validate_connectors(
+        {"connectors": {"docs": {"image": "x:1", "readiness_path": path}}}
+    )
+    assert errors == []
+    assert parsed is not None
+    assert parsed.connectors["docs"].readiness_path == path
+
+
+def test_a_build_form_connector_may_declare_a_readiness_path() -> None:
+    assert (
+        _codes(
+            {
+                "connectors": {
+                    "docs": {
+                        "build": {"context": "connectors/docs", "platforms": ["linux/amd64"]},
+                        "readiness_path": "/healthz",
+                    }
+                }
+            }
+        )
+        == []
+    )
+
+
+def test_the_readiness_path_and_resources_are_absent_by_default() -> None:
+    parsed, errors = validate_connectors({"connectors": {"docs": {"image": "x:1"}}})
+    assert errors == []
+    assert parsed is not None
+    assert parsed.connectors["docs"].readiness_path is None
+    assert parsed.connectors["docs"].resources is None
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "",
+        "healthz",
+        "./healthz",
+        "/health z",
+        "/health\tz",
+        "/healthz\r\nX-Injected: 1",
+        "/healthz?verbose=1",
+        "/healthz#top",
+        "/héalth",
+        "/health\x00",
+    ],
+)
+def test_a_malformed_readiness_path_is_refused(path: str) -> None:
+    assert _codes({"connectors": {"docs": {"image": "x:1", "readiness_path": path}}}) == [
+        "connectors.bad_readiness_path"
+    ]
+
+
+def test_a_readiness_path_on_a_remote_connector_is_refused() -> None:
+    assert _codes(
+        {"connectors": {"r": {"url": "https://mcp.example.com/mcp", "readiness_path": "/healthz"}}}
+    ) == ["connectors.remote_has_readiness_path"]
+
+
+def test_bundle_surfaces_a_refused_readiness_path(tmp_path: Path) -> None:
+    root = _bundle(tmp_path, "connectors:\n  docs:\n    image: x:1\n    readiness_path: healthz\n")
+    result = validate_bundle(str(root))
+    assert not result.valid
+    assert [e.code for e in result.errors] == ["connectors.bad_readiness_path"]
+
+
+# --------------------------------------------------------------------------- #
+# `resources`: requests and limits for the hosted server container.
+# --------------------------------------------------------------------------- #
+@pytest.mark.parametrize(
+    "resources",
+    [
+        {"limits": {"memory": "1Gi"}},
+        {"requests": {"cpu": "100m"}},
+        {"requests": {"cpu": "250m", "memory": "128Mi"}, "limits": {"cpu": "1", "memory": "512Mi"}},
+        {"requests": {"memory": "256Mi"}, "limits": {"memory": "256Mi"}},
+        {"limits": {"cpu": "2.5", "memory": "1G"}},
+        {"limits": {"memory": "1e9"}},
+        {"requests": {}, "limits": {}},
+        {},
+    ],
+)
+def test_a_hosted_connector_may_declare_resources(resources: dict) -> None:
+    parsed, errors = validate_connectors(
+        {"connectors": {"docs": {"image": "x:1", "resources": resources}}}
+    )
+    assert errors == []
+    assert parsed is not None
+    assert parsed.connectors["docs"].resources is not None
+
+
+@pytest.mark.parametrize(
+    "resources",
+    [
+        {"limits": {"memory": "lots"}},
+        {"limits": {"memory": "1 Gi"}},
+        {"limits": {"memory": "1GB"}},
+        {"limits": {"memory": "-1Gi"}},
+        {"limits": {"memory": "+1Gi"}},
+        {"limits": {"memory": "0"}},
+        {"limits": {"cpu": "0m"}},
+        {"limits": {"cpu": ""}},
+        {"limits": {"cpu": "1.2.3"}},
+        {"limits": {"cpu": ".5m"}},
+    ],
+)
+def test_a_malformed_quantity_is_refused(resources: dict) -> None:
+    assert _codes({"connectors": {"docs": {"image": "x:1", "resources": resources}}}) == [
+        "connectors.bad_resources"
+    ]
+
+
+@pytest.mark.parametrize(
+    "resources",
+    [
+        # Above the 256Mi default limit, with no limit declared.
+        {"requests": {"memory": "512Mi"}},
+        # Below the 64Mi default request, with no request declared.
+        {"limits": {"memory": "32Mi"}},
+        {"requests": {"cpu": "2"}, "limits": {"cpu": "1500m"}},
+        {"requests": {"memory": "1Gi"}, "limits": {"memory": "1000Mi"}},
+    ],
+)
+def test_a_request_above_its_merged_limit_is_refused(resources: dict) -> None:
+    assert _codes({"connectors": {"docs": {"image": "x:1", "resources": resources}}}) == [
+        "connectors.bad_resources"
+    ]
+
+
+@pytest.mark.parametrize(
+    "resources",
+    [
+        {"limits": {"gpu": "1"}},
+        {"limit": {"memory": "1Gi"}},
+        {"limits": {"memory": 1024}},
+    ],
+)
+def test_an_unknown_resource_key_or_a_non_string_quantity_is_refused(resources: dict) -> None:
+    assert _codes({"connectors": {"docs": {"image": "x:1", "resources": resources}}}) == [
+        "connectors.invalid"
+    ]
+
+
+def test_resources_on_a_remote_connector_are_refused() -> None:
+    assert _codes(
+        {
+            "connectors": {
+                "r": {
+                    "url": "https://mcp.example.com/mcp",
+                    "resources": {"limits": {"memory": "1Gi"}},
+                }
+            }
+        }
+    ) == ["connectors.remote_has_resources"]
+
+
+def test_bundle_surfaces_refused_resources(tmp_path: Path) -> None:
+    root = _bundle(
+        tmp_path,
+        "connectors:\n  docs:\n    image: x:1\n    resources:\n      limits:\n"
+        "        memory: 32Mi\n",
+    )
+    result = validate_bundle(str(root))
+    assert not result.valid
+    assert [e.code for e in result.errors] == ["connectors.bad_resources"]
+
+
+def test_the_resource_models_match_the_frozen_vector() -> None:
+    from plugin_format.connectors import ConnectorResourceQuantities, ConnectorResources
+
+    fields = _vector_file("connector-fields.json")["models"]
+    assert set(ConnectorResources.model_fields) == set(fields["ConnectorResources"])
+    assert set(ConnectorResourceQuantities.model_fields) == set(
+        fields["ConnectorResourceQuantities"]
+    )
+
+
+_NO_CLIENT_AUTH_REASON = (
+    "In-cluster MCP server reached over the pod network; it authenticates no "
+    "client and the boundary is its ingress NetworkPolicy."
+)
+
+
+def test_no_client_auth_synthetic_example_validates() -> None:
+    parsed, errors = validate_connectors(
+        {
+            "connectors": {
+                "docs": {
+                    "image": "ghcr.io/example/docs-mcp:1",
+                    "port": 8000,
+                    "secrets": ["UPSTREAM_CLIENT_ID", "UPSTREAM_CLIENT_SECRET"],
+                    "no_client_auth": _NO_CLIENT_AUTH_REASON,
+                }
+            }
+        }
+    )
+    assert errors == []
+    assert parsed is not None
+    spec = parsed.connectors["docs"]
+    assert spec.no_client_auth == _NO_CLIENT_AUTH_REASON
+    assert spec.secret_names() == ["UPSTREAM_CLIENT_ID", "UPSTREAM_CLIENT_SECRET"]
+    assert spec.resolved_secrets() == ["UPSTREAM_CLIENT_ID", "UPSTREAM_CLIENT_SECRET"]
+
+
+def test_no_client_auth_absent_still_requires_bearer_secret() -> None:
+    assert "connectors.bearer_secret_required" in _codes(
+        {
+            "connectors": {
+                "docs": {
+                    "image": "ghcr.io/example/docs-mcp:1",
+                    "secrets": ["UPSTREAM_CLIENT_ID", "UPSTREAM_CLIENT_SECRET"],
+                }
+            }
+        }
+    )
+
+
+def test_no_client_auth_with_bearer_secret_is_refused() -> None:
+    assert "connectors.no_client_auth_with_bearer_secret" in _codes(
+        {
+            "connectors": {
+                "docs": {
+                    "image": "ghcr.io/example/docs-mcp:1",
+                    "secrets": ["UPSTREAM_CLIENT_ID", "UPSTREAM_CLIENT_SECRET"],
+                    "bearer_secret": "UPSTREAM_CLIENT_SECRET",
+                    "no_client_auth": _NO_CLIENT_AUTH_REASON,
+                }
+            }
+        }
+    )
+
+
+def test_no_client_auth_with_empty_bearer_secret_is_refused() -> None:
+    assert "connectors.no_client_auth_with_bearer_secret" in _codes(
+        {
+            "connectors": {
+                "docs": {
+                    "image": "ghcr.io/example/docs-mcp:1",
+                    "bearer_secret": "",
+                    "no_client_auth": _NO_CLIENT_AUTH_REASON,
+                }
+            }
+        }
+    )
+
+
+def test_no_client_auth_on_a_remote_connector_is_refused() -> None:
+    assert "connectors.remote_has_no_client_auth" in _codes(
+        {
+            "connectors": {
+                "r": {
+                    "url": "https://mcp.example.com/mcp",
+                    "no_client_auth": _NO_CLIENT_AUTH_REASON,
+                }
+            }
+        }
+    )
+
+
+@pytest.mark.parametrize("reason", ["", "   ", "\n\t "])
+def test_no_client_auth_blank_reason_is_refused(reason: str) -> None:
+    assert "connectors.bad_no_client_auth" in _codes(
+        {
+            "connectors": {
+                "docs": {
+                    "image": "ghcr.io/example/docs-mcp:1",
+                    "secrets": ["UPSTREAM_CLIENT_ID", "UPSTREAM_CLIENT_SECRET"],
+                    "no_client_auth": reason,
+                }
+            }
+        }
+    )
+
+
+# --------------------------------------------------------------------------- #
+# `routes`: non-MCP routes a bundle's stdio servers call through the caller
+# proxy (ADR 0240)
+# --------------------------------------------------------------------------- #
+def _route(**overrides: object) -> dict[str, object]:
+    route: dict[str, object] = {
+        "path": "/v1/review",
+        "methods": ["POST"],
+        "max_body_bytes": 64 * 1024 * 1024,
+        "callers": ["review-tools"],
+    }
+    route.update(overrides)
+    return route
+
+
+def _route_codes(*routes: dict[str, object], **spec: object) -> list[str]:
+    return _codes({"connectors": {"reviewer": {"image": "x:1", **spec, "routes": list(routes)}}})
+
+
+def test_a_hosted_connector_may_declare_a_route() -> None:
+    # @spec ADR-0240 d1
+    parsed, errors = validate_connectors(
+        {"connectors": {"reviewer": {"image": "x:1", "routes": [_route()]}}}
+    )
+    assert errors == []
+    assert parsed is not None
+    (route,) = parsed.connectors["reviewer"].routes
+    assert route.path == "/v1/review"
+    assert route.methods == ["POST"]
+    assert route.max_body_bytes == 64 * 1024 * 1024
+    assert route.callers == ["review-tools"]
+
+
+def test_routes_default_to_none_and_methods_to_post() -> None:
+    # @spec ADR-0240 d1
+    parsed, errors = validate_connectors({"connectors": {"grafana": {"image": "x:1"}}})
+    assert errors == []
+    assert parsed is not None
+    assert parsed.connectors["grafana"].routes == []
+    route = {key: value for key, value in _route().items() if key != "methods"}
+    parsed, errors = validate_connectors(
+        {"connectors": {"reviewer": {"image": "x:1", "routes": [route]}}}
+    )
+    assert errors == []
+    assert parsed is not None
+    assert parsed.connectors["reviewer"].routes[0].methods == ["POST"]
+
+
+def test_a_route_may_take_put_and_the_platform_ceiling() -> None:
+    # @spec ADR-0240 d1
+    assert _route_codes(_route(methods=["PUT", "POST"], max_body_bytes=256 * 1024 * 1024)) == []
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "v1/review",
+        "/",
+        "/v1/review/",
+        "/v1//review",
+        "/v1/./review",
+        "/v1/../mcp",
+        "/v1/re%20view",
+        "/v1/review?x=1",
+        "/v1/review#x",
+        "/v1/re view",
+        "/mcp",
+        "/mcp/upload",
+        "",
+    ],
+)
+def test_a_malformed_or_mcp_route_path_is_refused(path: str) -> None:
+    # @spec ADR-0240 d1: matched exactly, so only unreserved characters, and
+    # never the MCP path a hosted entry dials.
+    assert _route_codes(_route(path=path)) == ["connectors.bad_route_path"]
+
+
+def test_a_route_on_the_readiness_path_is_refused() -> None:
+    # @spec ADR-0240 d1
+    assert _route_codes(_route(path="/healthz"), readiness_path="/healthz") == [
+        "connectors.route_is_readiness_path"
+    ]
+
+
+def test_a_route_path_declared_twice_is_refused() -> None:
+    # @spec ADR-0240 d1
+    assert _route_codes(_route(), _route(methods=["PUT"])) == ["connectors.duplicate_route"]
+
+
+@pytest.mark.parametrize("methods", [[], ["GET"], ["post"], ["POST", "POST"], ["DELETE"]])
+def test_route_methods_outside_post_and_put_are_refused(methods: list[str]) -> None:
+    # @spec ADR-0240 d1
+    assert _route_codes(_route(methods=methods)) == ["connectors.bad_route_methods"]
+
+
+@pytest.mark.parametrize("limit", [0, -1, 256 * 1024 * 1024 + 1])
+def test_a_route_body_limit_outside_the_ceiling_is_refused(limit: int) -> None:
+    # @spec ADR-0240 d1
+    assert _route_codes(_route(max_body_bytes=limit)) == ["connectors.bad_route_max_body_bytes"]
+
+
+@pytest.mark.parametrize("limit", ["64Mi", True, 1.5, None])
+def test_a_route_body_limit_must_be_an_integer(limit: object) -> None:
+    # @spec ADR-0240 d1: there is no default and no coercion.
+    assert _route_codes(_route(max_body_bytes=limit)) == ["connectors.invalid"]
+
+
+def test_a_route_without_its_body_limit_is_refused() -> None:
+    # @spec ADR-0240 d1
+    route = {key: value for key, value in _route().items() if key != "max_body_bytes"}
+    assert _route_codes(route) == ["connectors.invalid"]
+
+
+@pytest.mark.parametrize("callers", [[], [""]])
+def test_a_route_without_callers_is_refused(callers: list[str]) -> None:
+    # @spec ADR-0240 d1
+    assert _route_codes(_route(callers=callers)) == ["connectors.route_without_callers"]
+
+
+def test_routes_on_a_remote_connector_are_refused() -> None:
+    # @spec ADR-0240 d1
+    assert _codes(
+        {"connectors": {"internal": {"url": "https://mcp.example.com/mcp", "routes": [_route()]}}}
+    ) == ["connectors.remote_has_routes"]
+
+
+def test_an_unknown_route_key_is_refused() -> None:
+    # @spec ADR-0240 d1
+    assert _route_codes(_route(stream=True)) == ["connectors.invalid"]
+
+
+_ROUTE_YAML = (
+    "connectors:\n  reviewer:\n    image: x:1\n    routes:\n"
+    "      - path: /v1/review\n        max_body_bytes: 67108864\n"
+    "        callers: [review-tools]\n"
+)
+
+
+def _with_mcp(root: Path, servers: dict[str, object]) -> Path:
+    (root / ".mcp.json").write_text(json.dumps({"mcpServers": servers}), encoding="utf-8")
+    return root
+
+
+def test_bundle_accepts_a_declared_stdio_route_caller(tmp_path: Path) -> None:
+    # @spec ADR-0240 d1
+    root = _with_mcp(
+        _bundle(tmp_path, _ROUTE_YAML),
+        {"review-tools": {"command": "python", "args": ["review.py"]}},
+    )
+    result = validate_bundle(str(root))
+    assert result.valid, [e.code for e in result.errors]
+
+
+def test_bundle_refuses_an_undeclared_route_caller(tmp_path: Path) -> None:
+    # @spec ADR-0240 d1
+    root = _with_mcp(_bundle(tmp_path, _ROUTE_YAML), {"other": {"command": "python"}})
+    result = validate_bundle(str(root))
+    assert [e.code for e in result.errors] == ["connectors.route_caller_undeclared"]
+
+
+def test_bundle_refuses_a_route_caller_with_no_mcp_config(tmp_path: Path) -> None:
+    # @spec ADR-0240 d1
+    result = validate_bundle(str(_bundle(tmp_path, _ROUTE_YAML)))
+    assert [e.code for e in result.errors] == ["connectors.route_caller_undeclared"]
+
+
+@pytest.mark.parametrize(
+    "server",
+    [
+        {"type": "http", "url": "https://mcp.example.com/mcp"},
+        {"type": "sse", "url": "https://mcp.example.com/sse"},
+    ],
+)
+def test_bundle_refuses_a_remote_route_caller(tmp_path: Path, server: dict[str, str]) -> None:
+    # @spec ADR-0240 d1: only a process the runner starts can receive a token.
+    root = _with_mcp(_bundle(tmp_path, _ROUTE_YAML), {"review-tools": server})
+    result = validate_bundle(str(root))
+    assert [e.code for e in result.errors] == ["connectors.route_caller_not_stdio"]
+
+
+def test_bundle_accepts_a_route_caller_declared_in_the_manifest(tmp_path: Path) -> None:
+    # @spec ADR-0240 d1: either declaration surface names a caller.
+    root = _bundle(tmp_path, _ROUTE_YAML)
+    (root / ".claude-plugin" / "plugin.json").write_text(
+        json.dumps(
+            {
+                "name": "b",
+                "version": "0.1.0",
+                "description": "t",
+                "mcpServers": {"review-tools": {"command": "python"}},
+            }
+        ),
+        encoding="utf-8",
+    )
+    result = validate_bundle(str(root))
+    assert result.valid, [e.code for e in result.errors]
+
+
+# --------------------------------------------------------------------------- #
+# `scratch`: a bounded writable volume for the hosted server container (#5415).
+# --------------------------------------------------------------------------- #
+_SCRATCH_SIZES = _vector_file("connector-scratch-size.json")["cases"]
+
+
+def _scratch(scratch: object, **extra: object) -> dict:
+    return {"connectors": {"files": {"image": "x:1", "scratch": scratch, **extra}}}
+
+
+def test_scratch_is_absent_by_default() -> None:
+    parsed, errors = validate_connectors({"connectors": {"files": {"image": "x:1"}}})
+    assert errors == []
+    assert parsed is not None
+    assert parsed.connectors["files"].scratch is None
+
+
+def test_a_hosted_connector_may_declare_scratch() -> None:
+    parsed, errors = validate_connectors(_scratch({"path": "/scratch", "size_limit": "2Gi"}))
+    assert errors == []
+    assert parsed is not None
+    scratch = parsed.connectors["files"].scratch
+    assert scratch is not None
+    assert (scratch.path, scratch.size_limit) == ("/scratch", "2Gi")
+
+
+@pytest.mark.parametrize("case", _SCRATCH_SIZES, ids=lambda case: repr(case["size_limit"]))
+def test_scratch_size_vectors(case: dict) -> None:
+    codes = _codes(_scratch({"path": "/scratch", "size_limit": case["size_limit"]}))
+    if case["bytes"] is None:
+        assert codes == ["connectors.bad_scratch_size"]
+    else:
+        assert codes == []
+
+
+def test_the_scratch_size_vector_covers_both_bounds() -> None:
+    accepted = {case["bytes"] for case in _SCRATCH_SIZES if case["bytes"] is not None}
+    assert min(accepted) == 2**20
+    assert max(accepted) == 64 * 2**30
+    refused = [case for case in _SCRATCH_SIZES if case["bytes"] is None]
+    assert {"1048575", "68719476737"} <= {case["size_limit"] for case in refused}
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "/scratch",
+        "/tmp",
+        "/var/spool/uploads",
+        "/data/scratch-1",
+        "/home/app/.cache",
+    ],
+)
+def test_a_scratch_path_may_be_any_dedicated_absolute_directory(path: str) -> None:
+    assert _codes(_scratch({"path": path, "size_limit": "1Gi"})) == []
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "",
+        "/",
+        "scratch",
+        "./scratch",
+        "/scratch/",
+        "//scratch",
+        "/scratch//spool",
+        "/scratch/./spool",
+        "/scratch/../etc",
+        "/scr atch",
+        "/scratch\n",
+        "/scr~atch",
+        "/scrätch",
+        "/etc",
+        "/etc/app",
+        "/usr/local/scratch",
+        "/proc",
+        "/sys/fs",
+        "/dev/shm",
+        "/run/app",
+        "/bin",
+        "/sbin",
+        "/lib",
+        "/lib64",
+        "/boot",
+    ],
+)
+def test_a_malformed_or_system_scratch_path_is_refused(path: str) -> None:
+    assert _codes(_scratch({"path": path, "size_limit": "1Gi"})) == ["connectors.bad_scratch_path"]
+
+
+@pytest.mark.parametrize("path", ["/etcetera", "/devices", "/runtime", "/library"])
+def test_a_scratch_path_that_only_shares_a_prefix_with_a_system_directory_is_fine(
+    path: str,
+) -> None:
+    assert _codes(_scratch({"path": path, "size_limit": "1Gi"})) == []
+
+
+@pytest.mark.parametrize(
+    ("scratch_path", "secret_path"),
+    [
+        ("/secrets", "/secrets"),
+        ("/data", "/data/token"),
+        ("/data/token/spool", "/data/token"),
+    ],
+)
+def test_scratch_may_not_overlap_a_secret_file(scratch_path: str, secret_path: str) -> None:
+    assert _codes(
+        _scratch(
+            {"path": scratch_path, "size_limit": "1Gi"},
+            secret_files={"FILES_TOKEN": secret_path},
+        )
+    ) == ["connectors.scratch_overlaps_secret_file"]
+
+
+def test_scratch_beside_a_secret_file_is_fine() -> None:
+    assert (
+        _codes(
+            _scratch(
+                {"path": "/scratch", "size_limit": "1Gi"},
+                secret_files={"FILES_TOKEN": "/secrets/token"},
+            )
+        )
+        == []
+    )
+
+
+@pytest.mark.parametrize(
+    "scratch",
+    [
+        {"path": "/scratch"},
+        {"size_limit": "1Gi"},
+        {"path": "/scratch", "size_limit": "1Gi", "medium": "Memory"},
+        {"path": "/scratch", "size_limit": 1073741824},
+        ["/scratch", "1Gi"],
+        "/scratch",
+    ],
+)
+def test_a_scratch_with_a_missing_unknown_or_mistyped_key_is_refused(scratch: object) -> None:
+    assert _codes(_scratch(scratch)) == ["connectors.invalid"]
+
+
+def test_scratch_on_a_remote_connector_is_refused() -> None:
+    assert _codes(
+        {
+            "connectors": {
+                "r": {
+                    "url": "https://mcp.example.com/mcp",
+                    "scratch": {"path": "/scratch", "size_limit": "1Gi"},
+                }
+            }
+        }
+    ) == ["connectors.remote_has_scratch"]
+
+
+def test_bundle_surfaces_a_refused_scratch(tmp_path: Path) -> None:
+    root = _bundle(
+        tmp_path,
+        "connectors:\n  files:\n    image: x:1\n    scratch:\n      path: /etc\n"
+        "      size_limit: 1Gi\n",
+    )
+    result = validate_bundle(str(root))
+    assert not result.valid
+    assert [e.code for e in result.errors] == ["connectors.bad_scratch_path"]

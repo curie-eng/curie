@@ -674,7 +674,7 @@ def quantity_is_finite(value):
 def workload_containers(path):
     """Return the api/dispatcher/worker Deployments and the runner SandboxTemplate container, by role.
 
-    Not the authoritative instrumented set. ci/instrumented-workload-assertions.sh
+    Not the authoritative instrumented set. ci/policy/engine.py (P5)
     enumerates first-party workloads from rendered chart-owned images and is
     the gate that fails when a new workload omits OTEL_EXPORTER_OTLP_ENDPOINT
     (#2360). The mail adapter also carries the shared OTLP env and is pinned

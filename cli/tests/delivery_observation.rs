@@ -16,8 +16,7 @@
 
 #![cfg(unix)]
 
-#[path = "support/executable.rs"]
-mod test_executable;
+use crate::support::executable as test_executable;
 
 use std::ffi::OsString;
 use std::fs;
@@ -70,8 +69,8 @@ fn stub_path(tools: &Path) -> OsString {
     std::env::join_paths(entries).expect("join stub PATH")
 }
 
-/// One test, not two: it sets the PROCESS `PATH` so the in-process observer
-/// finds the stubs, which two tests in one binary would race over.
+/// It sets the PROCESS `PATH` so the in-process observer finds the stubs, so it
+/// holds `support::ENV_LOCK` and restores PATH once the observer returns.
 #[tokio::test]
 async fn a_clusterip_install_with_polling_off_observes_as_not_armed() {
     let temp = tempfile::tempdir().expect("tempdir");
@@ -79,6 +78,8 @@ async fn a_clusterip_install_with_polling_off_observes_as_not_armed() {
     fs::create_dir_all(&tools).expect("tools dir");
     install_clusterip_stubs(&tools);
     let path = stub_path(&tools);
+    let _env = crate::support::ENV_LOCK.lock().await;
+    let original_path = std::env::var_os("PATH");
     std::env::set_var("PATH", &path);
 
     // -- the deploy path: `cluster deploy --repo` calls exactly this ---------
@@ -88,6 +89,10 @@ async fn a_clusterip_install_with_polling_off_observes_as_not_armed() {
         dry_run: false,
     })
     .await;
+    match original_path {
+        Some(value) => std::env::set_var("PATH", value),
+        None => std::env::remove_var("PATH"),
+    }
     assert_eq!(
         facts.exposure, None,
         "api.service.nodePort is populated on a ClusterIP install; exposure must come from \

@@ -32,11 +32,53 @@ selector_old="$temp_root/selector.old"
 rust_old_node="$temp_root/rust-old-node"
 rust_new_node="$temp_root/rust-new-node"
 worktree_added=0
+chart_provision=
+provision_cluster=
+provision_context=
+provision_run_id=
+provision_kubeconfig="$temp_root/kubeconfig"
+provision_cluster_owned=0
+provision_images=()
+workload_fixture_pending=0
 
 cleanup() {
   local status=$?
   local cleanup_status=0
-  trap - EXIT
+  local remaining image
+  trap - EXIT INT TERM
+
+  if (( workload_fixture_pending )); then
+    bash "$scratch/charts/curie/ci/scenarios/workload-install.sh" down \
+      >"$temp_root/workload-cleanup.log" 2>&1 || cleanup_status=1
+    workload_fixture_pending=0
+  fi
+  if (( provision_cluster_owned )); then
+    kind delete cluster --name "$provision_cluster" >/dev/null 2>&1 || cleanup_status=1
+    remaining=$(kind get clusters 2>/dev/null) || cleanup_status=1
+    if [[ $'\n'"$remaining"$'\n' == *$'\n'"$provision_cluster"$'\n'* ]]; then
+      echo "owned Fix pin kind cluster remains" >&2
+      cleanup_status=1
+    fi
+    remaining=$(docker ps -aq --filter "label=io.x-k8s.kind.cluster=$provision_cluster") || cleanup_status=1
+    if [[ -n "$remaining" ]]; then
+      echo "owned Fix pin kind node containers remain" >&2
+      cleanup_status=1
+    fi
+  fi
+  for image in "${provision_images[@]}"; do
+    if ! remaining=$(docker image ls --format '{{.Repository}}:{{.Tag}}' --filter "reference=$image"); then
+      cleanup_status=1
+      continue
+    fi
+    if [[ -n "$remaining" ]]; then
+      docker image rm "$image" >/dev/null 2>&1 || cleanup_status=1
+    fi
+    remaining=$(docker image ls --format '{{.Repository}}:{{.Tag}}' --filter "reference=$image") || cleanup_status=1
+    if [[ -n "$remaining" ]]; then
+      echo "owned Fix pin candidate image tag remains: $image" >&2
+      cleanup_status=1
+    fi
+  done
 
   if (( worktree_added )); then
     git -C "$repo_root" worktree remove --force "$scratch" >/dev/null 2>&1 || cleanup_status=1
@@ -46,6 +88,9 @@ cleanup() {
   if (( cleanup_status != 0 )); then
     echo "failed to clean up the verification worktree" >&2
     exit 1
+  fi
+  if (( provision_cluster_owned )); then
+    echo "OK: owned Fix pin kind cluster, node containers, and candidate tags are gone"
   fi
   exit "$status"
 }
@@ -84,6 +129,9 @@ fi
 
 is_test_path() {
   case "$1" in
+    tools/factory-e2e/tests/*.py)
+      return 0
+      ;;
     apps/*/tests/* | packages/*/tests/* | runner/tests/* | cli/tests/* | charts/curie/ci/*)
       return 0
       ;;
@@ -112,7 +160,7 @@ fi
 
 selector_file=
 selector_kind=
-rust_target=
+rust_module=
 rust_test=
 case "$selector" in
   cli/tests/local/test_*.py::*)
@@ -129,14 +177,21 @@ case "$selector" in
     fi
     selector_kind=python
     ;;
+  tools/factory-e2e/tests/*.py::*)
+    selector_file=${selector%%::*}
+    if [[ ! "$selector" =~ ^tools/factory-e2e/tests/([A-Za-z0-9_-]+/)*[A-Za-z0-9_-]+\.py::([A-Za-z_][A-Za-z0-9_]*::)*test[A-Za-z0-9_]*(\[[A-Za-z0-9_.-]+\])?$ ]]; then
+      fail "unsupported selector: $selector"
+    fi
+    selector_kind=python
+    ;;
   cli/tests/*.rs::*)
     selector_file=${selector%%::*}
     rust_test=${selector#*::}
     if [[ -z "$rust_test" || "$rust_test" == *::* || ! "$rust_test" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]]; then
       fail "unsupported selector: $selector"
     fi
-    rust_target=${selector_file##*/}
-    rust_target=${rust_target%.rs}
+    rust_module=${selector_file##*/}
+    rust_module=${rust_module%.rs}
     selector_kind=rust
     ;;
   charts/curie/ci/*.sh)
@@ -164,6 +219,150 @@ head_commit=$(git -C "$repo_root" rev-parse --verify 'HEAD^{commit}') || \
 git -C "$repo_root" worktree add --detach "$scratch" "$head_commit" >/dev/null
 worktree_added=1
 
+if [[ "$selector_kind" == chart ]]; then
+  header_pattern='^[[:space:]]*#[[:space:]]*fix-pin-provision:[[:space:]]*(.*)$'
+  header_line=0
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    header_line=$((header_line + 1))
+    if [[ "$line" =~ $header_pattern ]]; then
+      token=${BASH_REMATCH[1]}
+      token=${token%"${token##*[![:space:]]}"}
+      case "$token" in
+        kind-calico | candidate-stack) ;;
+        *) fail "unknown Fix pin provisioning token: $token" ;;
+      esac
+      [[ -z "$chart_provision" ]] || fail "duplicate Fix pin provisioning header"
+      chart_provision=$token
+    fi
+    if (( header_line == 20 )); then
+      break
+    fi
+  done <"$scratch/$selector_file"
+fi
+
+provision_chart_cluster() {
+  local command clusters remaining
+  [[ -n "$chart_provision" ]] || return 0
+  for command in docker kind kubectl python3; do
+    command -v "$command" >/dev/null || fail "Fix pin provisioning executable is unavailable: $command"
+  done
+  python3 -c 'import yaml' >/dev/null 2>&1 || fail "Fix pin provisioning requires the Python YAML parser"
+  if [[ "$chart_provision" == candidate-stack ]]; then
+    command -v cargo >/dev/null || fail "Fix pin provisioning executable is unavailable: cargo"
+  fi
+  docker info >/dev/null 2>&1 || fail "Fix pin provisioning Docker is unavailable"
+  umask 077
+  provision_run_id=$(python3 -c 'import uuid; print(uuid.uuid4().hex[:12])')
+  provision_cluster="curie-fixpin-$provision_run_id"
+  provision_context="kind-$provision_cluster"
+  clusters=$(kind get clusters) || fail "could not inventory Fix pin kind clusters"
+  [[ $'\n'"$clusters"$'\n' != *$'\n'"$provision_cluster"$'\n'* ]] || fail "Fix pin kind cluster name is already occupied"
+  remaining=$(docker ps -aq --filter "label=io.x-k8s.kind.cluster=$provision_cluster") || \
+    fail "could not inventory Fix pin kind node containers"
+  [[ -z "$remaining" ]] || fail "Fix pin kind cluster name has existing containers"
+  cat >"$temp_root/kind.yaml" <<'YAML'
+kind: Cluster
+apiVersion: kind.x-k8s.io/v1alpha4
+networking:
+  disableDefaultCNI: true
+  podSubnet: "192.168.0.0/16"
+nodes:
+  - role: control-plane
+YAML
+  python3 - "$temp_root/calico.yaml" <<'PY'
+import hashlib
+import pathlib
+import sys
+import urllib.request
+
+url = "https://raw.githubusercontent.com/projectcalico/calico/v3.28.2/manifests/calico.yaml"
+with urllib.request.urlopen(url, timeout=30) as response:
+    manifest = response.read()
+expected = "be59408bf990e96276f631d2f9285c2a0f9802194c0ad1cecdb6d9c52623a1c8"
+if hashlib.sha256(manifest).hexdigest() != expected:
+    raise SystemExit("Fix pin Calico manifest digest mismatch")
+pathlib.Path(sys.argv[1]).write_bytes(manifest)
+PY
+  # Register ownership before creation, including a partial kind startup.
+  provision_cluster_owned=1
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
+  kind create cluster --name "$provision_cluster" --kubeconfig "$provision_kubeconfig" \
+    --image kindest/node:v1.31.0 --config "$temp_root/kind.yaml" \
+    >"$temp_root/kind.log" 2>&1 || fail "Fix pin kind cluster provisioning failed"
+  [[ "$(kubectl --kubeconfig "$provision_kubeconfig" --context "$provision_context" config current-context)" == "$provision_context" ]] || \
+    fail "Fix pin private kubeconfig does not select the owned cluster"
+  kubectl --kubeconfig "$provision_kubeconfig" --context "$provision_context" \
+    apply -f "$temp_root/calico.yaml" >"$temp_root/calico.log" 2>&1 || fail "Fix pin Calico provisioning failed"
+  kubectl --kubeconfig "$provision_kubeconfig" --context "$provision_context" -n kube-system \
+    rollout status daemonset/calico-node --timeout=300s || fail "Fix pin Calico is not ready"
+  kubectl --kubeconfig "$provision_kubeconfig" --context "$provision_context" \
+    wait --for=condition=Ready node --all --timeout=300s || fail "Fix pin kind nodes are not ready"
+}
+
+is_workload_selector() {
+  case "$selector" in
+    charts/curie/ci/runtime/idle-capacity-reclamation-runtime.sh | \
+    charts/curie/ci/runtime/connector-secret-rotation-runtime.sh | \
+    charts/curie/ci/runtime/connector-apply-race-runtime.sh | \
+    charts/curie/ci/runtime/factory-resource-profile-runtime.sh) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+teardown_selector_phase() {
+  (( workload_fixture_pending )) || return 0
+  if ! bash "$scratch/charts/curie/ci/scenarios/workload-install.sh" down; then
+    return 1
+  fi
+  workload_fixture_pending=0
+}
+
+provision_selector_phase() {
+  local phase=$1 component dockerfile image remaining
+  local phase_images=()
+  [[ -n "$chart_provision" ]] || return 0
+  export KUBECONFIG="$provision_kubeconfig"
+  export CURIE_SCENARIO_CONTEXT="$provision_context"
+  export CURIE_SCENARIO_RUN_ID="$provision_run_id-$phase"
+  export CURIE_SCENARIO_NAMESPACE="test-workload-$CURIE_SCENARIO_RUN_ID"
+  export CURIE_SCENARIO_RELEASE="workload-$CURIE_SCENARIO_RUN_ID"
+  [[ "$chart_provision" == candidate-stack ]] || return 0
+
+  echo "Building the $phase Fix pin candidate CLI and images"
+  cargo build --locked --manifest-path "$scratch/cli/Cargo.toml" \
+    --target-dir "$temp_root/cargo-$phase" >"$temp_root/cargo-$phase.log" 2>&1 || \
+    fail "Fix pin $phase candidate CLI build failed"
+  export CURIE_BIN="$temp_root/cargo-$phase/debug/curie"
+  for component in api worker runner; do
+    image="curie-$component:fixpin-$provision_run_id-$phase"
+    remaining=$(docker image ls --format '{{.Repository}}:{{.Tag}}' --filter "reference=$image") || \
+      fail "could not inventory Fix pin candidate image tags"
+    [[ -z "$remaining" ]] || fail "Fix pin candidate image tag is already occupied: $image"
+    # Register the tag before building so partial builds are cleaned too.
+    provision_images+=("$image")
+    phase_images+=("$image")
+    if [[ "$component" == runner ]]; then
+      dockerfile=runner/Dockerfile
+    else
+      dockerfile="apps/$component/Dockerfile"
+    fi
+    docker build --file "$scratch/$dockerfile" --tag "$image" \
+      --label "curie.fixpin.phase=$phase" "$scratch" \
+      >"$temp_root/build-$component-$phase.log" 2>&1 || fail "Fix pin $phase candidate $component image build failed"
+  done
+  kind load docker-image --name "$provision_cluster" "${phase_images[@]}" \
+    >"$temp_root/load-$phase.log" 2>&1 || fail "Fix pin $phase candidate image import failed"
+  export CURIE_SCENARIO_API_IMAGE="${phase_images[0]}"
+  export CURIE_SCENARIO_WORKER_IMAGE="${phase_images[1]}"
+  export CURIE_SCENARIO_RUNNER_IMAGE="${phase_images[2]}"
+  if is_workload_selector; then
+    workload_fixture_pending=1
+    bash "$scratch/charts/curie/ci/scenarios/workload-install.sh" up \
+      || fail "Fix pin $phase candidate workload installation failed"
+  fi
+}
+
 run_selector() {
   local phase=$1
 
@@ -181,7 +380,7 @@ run_selector() {
     rust)
       (
         cd "$scratch"
-        cargo test --manifest-path cli/Cargo.toml --test "$rust_target" -- --exact "$rust_test"
+        cargo test --manifest-path cli/Cargo.toml --test integration -- --exact "$rust_module::$rust_test"
       )
       ;;
     chart)
@@ -433,12 +632,13 @@ else:
 PY
 }
 
-if run_selector baseline >"$baseline_stdout" 2>"$baseline_stderr"; then
-  replay_selector_output "$baseline_stdout" "$baseline_stderr"
-else
-  replay_selector_output "$baseline_stdout" "$baseline_stderr"
-  fail "baseline selector is red: $selector"
-fi
+provision_chart_cluster
+provision_selector_phase baseline
+baseline_status=0
+run_selector baseline >"$baseline_stdout" 2>"$baseline_stderr" || baseline_status=$?
+teardown_selector_phase || fail "baseline candidate workload teardown failed"
+replay_selector_output "$baseline_stdout" "$baseline_stderr"
+(( baseline_status == 0 )) || fail "baseline selector is red: $selector"
 
 if [[ "$selector_kind" != chart ]]; then
   if ! git -C "$scratch" apply --check --reverse "--include=$selector_file" "$patch_file"; then
@@ -521,13 +721,15 @@ if ! git -C "$scratch" apply --check --reverse "${include_args[@]}" "$patch_file
 fi
 git -C "$scratch" apply --reverse "${include_args[@]}" "$patch_file"
 
-if run_selector reversed >"$reversed_stdout" 2>"$reversed_stderr"; then
-  replay_selector_output "$reversed_stdout" "$reversed_stderr"
+provision_selector_phase reversed
+reversed_status=0
+run_selector reversed >"$reversed_stdout" 2>"$reversed_stderr" || reversed_status=$?
+teardown_selector_phase || fail "reversed candidate workload teardown failed"
+replay_selector_output "$reversed_stdout" "$reversed_stderr"
+if (( reversed_status == 0 )); then
   echo "UNPINNED"
   exit 1
 fi
-
-replay_selector_output "$reversed_stdout" "$reversed_stderr"
 
 case "$selector_kind" in
   python)
@@ -653,7 +855,7 @@ PY
     fi
     ;;
   rust)
-    if grep -Fq "test $rust_test ... FAILED" "$reversed_stdout" "$reversed_stderr"; then
+    if grep -Fq "test $rust_module::$rust_test ... FAILED" "$reversed_stdout" "$reversed_stderr"; then
       :
     else
       if [[ ! "$rust_range" =~ ^([0-9]+):([0-9]+)$ ]]; then

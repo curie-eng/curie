@@ -424,7 +424,7 @@ def test_cron_retry_inside_its_catch_up_bound_runs(
         async with make_hook_run() as run, make_harness(
             hook_runs=run.recorder()
         ) as h:
-            await HookRunRecorder(run.engine, "curie").close(run.ref, "deferred")
+            await HookRunRecorder(run.engine, "curie").close(run.ref, "deferred", "live_session")
             deferred, ended_at = await run.state() or (None, None)
             assert deferred == "deferred"
             assert ended_at is not None
@@ -504,57 +504,6 @@ def test_prior_side_effect_recovery_closes_failed_without_running(
             assert outcome == "failed"
             assert ended_at is not None
             assert await h.async_redis.exists(h.config.done_key(event.event_id))
-
-    asyncio.run(go())
-
-
-def test_exception_after_cron_start_closes_failed_and_propagates(
-    make_harness,
-    make_hook_run,
-) -> None:
-    async def go() -> None:
-        async with make_hook_run() as run, make_harness(
-            hook_runs=run.recorder()
-        ) as h:
-            h.runner.default_script = [Final(text="complete", status=SessionStatus.DONE)]
-            h.sink.fail_events.add("reply.update")
-            event = _event(hook_run=run.ref)
-
-            with pytest.raises(
-                RuntimeError, match="injected reply.update delivery failure"
-            ):
-                await h.kernel.process_event(event)
-
-            assert h.runner.opened == ["run the scheduled hook"]
-            outcome, ended_at = await run.state() or (None, None)
-            assert outcome == "failed"
-            assert ended_at is not None
-            assert not await h.async_redis.exists(h.config.done_key(event.event_id))
-
-    asyncio.run(go())
-
-
-def test_original_exception_survives_failed_failure_close(
-    make_harness,
-    make_hook_run,
-) -> None:
-    async def go() -> None:
-        async with make_hook_run() as run, make_harness(
-            hook_runs=run.recorder()
-        ) as h:
-            h.runner.default_script = [Final(text="complete", status=SessionStatus.DONE)]
-            h.sink.fail_events.add("reply.update")
-            event = _event(hook_run=run.ref)
-
-            async with _reject_hook_run_outcome(run.engine, run.run_id, "failed"):
-                with pytest.raises(
-                    RuntimeError, match="injected reply.update delivery failure"
-                ):
-                    await h.kernel.process_event(event)
-
-            assert h.runner.opened == ["run the scheduled hook"]
-            assert await run.state() == (None, None)
-            assert not await h.async_redis.exists(h.config.done_key(event.event_id))
 
     asyncio.run(go())
 
@@ -859,7 +808,9 @@ def test_approval_pause_closes_cron_run_as_ran(
         def __init__(self) -> None:
             self.requests: list[ApprovalRequest] = []
 
-        async def create(self, request: ApprovalRequest) -> CreatedApproval:
+        async def create(
+            self, request: ApprovalRequest, *, budget_s: float = 120
+        ) -> CreatedApproval:
             self.requests.append(request)
             return CreatedApproval(id="appr-hook-run", status="pending")
 
@@ -1248,5 +1199,94 @@ def test_recorder_reads_and_writes_the_configured_schema() -> None:
             async with engine.begin() as conn:
                 await conn.execute(text(f'DROP SCHEMA IF EXISTS "{schema}" CASCADE'))
             await engine.dispose()
+
+    asyncio.run(go())
+
+
+def test_hook_run_reason_turn_error(
+    make_harness,
+    make_hook_run,
+) -> None:
+    async def go() -> None:
+        async with (
+            make_hook_run() as run,
+            make_harness(hook_runs=run.recorder(), max_attempts=3) as h,
+        ):
+            h.runner.turn_scripts = [
+                [
+                    ErrorEvent(message="retryable", classification="runner-error"),
+                    Final(text="failed", status=SessionStatus.CLASSIFIED_FAILURE),
+                ]
+            ]
+            await h.kernel.process_event(_event(hook_run=run.ref))
+            outcome, _ended = await run.state() or (None, None)
+            assert outcome == "failed"
+            assert await run.reason() == "turn_error"
+
+    asyncio.run(go())
+
+
+def _raise_after_start(h) -> None:
+    async def boom(*args, **kwargs):
+        raise RuntimeError("injected post-start failure")
+
+    h.kernel._finish = boom
+
+
+def test_exception_after_cron_start_closes_failed_and_propagates(
+    make_harness, make_hook_run
+) -> None:
+    async def go() -> None:
+        async with make_hook_run() as run, make_harness(hook_runs=run.recorder()) as h:
+            h.runner.default_script = [Final(text="complete", status=SessionStatus.DONE)]
+            _raise_after_start(h)
+            event = _event(hook_run=run.ref)
+            with pytest.raises(RuntimeError, match="injected post-start failure"):
+                await h.kernel.process_event(event)
+            assert h.runner.opened == ["run the scheduled hook"]
+            outcome, ended_at = await run.state() or (None, None)
+            assert outcome == "failed"
+            assert ended_at is not None
+            assert not await h.async_redis.exists(h.config.done_key(event.event_id))
+
+    asyncio.run(go())
+
+
+def test_original_exception_survives_failed_failure_close(
+    make_harness, make_hook_run
+) -> None:
+    async def go() -> None:
+        async with make_hook_run() as run, make_harness(hook_runs=run.recorder()) as h:
+            h.runner.default_script = [Final(text="complete", status=SessionStatus.DONE)]
+            _raise_after_start(h)
+            event = _event(hook_run=run.ref)
+            async with _reject_hook_run_outcome(run.engine, run.run_id, "failed"):
+                with pytest.raises(RuntimeError, match="injected post-start failure"):
+                    await h.kernel.process_event(event)
+            assert h.runner.opened == ["run the scheduled hook"]
+            assert await run.state() == (None, None)
+            assert not await h.async_redis.exists(h.config.done_key(event.event_id))
+
+    asyncio.run(go())
+
+
+def test_failed_answer_send_closes_ran_and_leaves_the_answer_owed(
+    make_harness, make_hook_run
+) -> None:
+    async def go() -> None:
+        async with make_hook_run() as run, make_harness(hook_runs=run.recorder()) as h:
+            h.runner.default_script = [Final(text="complete", status=SessionStatus.DONE)]
+            h.sink.fail_events.add("reply.update")
+            event = _event(hook_run=run.ref)
+            await h.kernel.process_event(event)
+            outcome, ended_at = await run.state() or (None, None)
+            assert outcome == "ran"
+            assert await h.async_redis.exists(h.config.done_key(event.event_id))
+            owed = await h.kernel._markers.read_completion(event.event_id)
+            assert owed is not None and owed.record.answer is not None
+            h.sink.fail_events.discard("reply.update")
+            await h.kernel._reemit_pending_completion(event.event_id)
+            assert h.runner.opened == ["run the scheduled hook"]
+            assert await h.kernel._markers.read_completion(event.event_id) is None
 
     asyncio.run(go())

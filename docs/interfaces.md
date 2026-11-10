@@ -12,11 +12,11 @@ is documentation of where the code already draws the line, not a new abstraction
 <!-- BEGIN GENERATED: seam-table (curie dev docs-lint) -->
 | Seam | Kind | Impls | Grade | Epic(s) | INTERFACE.md |
 |---|---|---|---|---|---|
-| Substrate / SandboxClient | CLEAN | 2 (k8s, docker) | not separately graded | #86, #44 | [Substrate / SandboxClient](interfaces/substrate/INTERFACE.md) |
-| Harness in-proc / ModelSession | CLEAN | 1 + fake | A- | (folds into #25) | [Harness in-proc / ModelSession](interfaces/harness-modelsession/INTERFACE.md) |
+| Substrate / SandboxClient | CLEAN | 3 (k8s, docker, static) | not separately graded | #86, #44 | [Substrate / SandboxClient](interfaces/substrate/INTERFACE.md) |
+| Harness in-proc / ModelSession | CLEAN | 1 production + fake + blocked-preflight | A- | (folds into #25) | [Harness in-proc / ModelSession](interfaces/harness-modelsession/INTERFACE.md) |
 | ACI producer (frozen protocol) | CLEAN, frozen | 1 + reference | A- | #25, #47 | [ACI producer (frozen protocol)](interfaces/aci-producer/INTERFACE.md) |
-| Channel / ingress | CLEAN | 3 reply adapters behind the `ReplySink` port (Slack, HTTP, built-in cluster-message relay) + a second wire ingress producer (Rust CLI) | B- | #7, #19, #27, #38, #1515 | [Channel / ingress](interfaces/channel-ingress/INTERFACE.md) |
-| Channel interaction message | CLEAN | 2 renderers (Slack, terminal) | not separately graded | ADR-0020 | [Channel interaction message](interfaces/channel-interaction/INTERFACE.md) |
+| Channel / ingress | CLEAN | 4 reply adapter implementations behind the `ReplySink` port (Slack, HTTP, built-in cluster-message relay, acknowledge-only tracker for GitHub/GitLab/Jira) + a second wire ingress producer (Rust CLI) | B- | #7, #19, #27, #38, #1515 | [Channel / ingress](interfaces/channel-ingress/INTERFACE.md) |
+| Channel interaction message | CLEAN | 4 renderers (Slack, terminal, mail, Discord) | not separately graded | ADR-0020 | [Channel interaction message](interfaces/channel-interaction/INTERFACE.md) |
 | Model provider / credentials | SOFT | 2 prefix-routed (Anthropic, OpenRouter) + base-URL-selected provider-native endpoints (Zhipu, Moonshot, DeepSeek, Ollama) | not separately graded | #24, #46 | [Model provider / credentials](interfaces/model-provider/INTERFACE.md) |
 | Telemetry / OTEL | SOFT | 1 | B+ | #47, #1817, #1818, #1819 | [Telemetry / OTEL](interfaces/telemetry-otel/INTERFACE.md) |
 | Evals (case + scorer) | SOFT | 2 scorers (grader family + trajectory matcher) | B | #8, #26 | [Evals (case + scorer)](interfaces/evals/INTERFACE.md) |
@@ -24,16 +24,26 @@ is documentation of where the code already draws the line, not a new abstraction
 | Relational DB (Postgres) | SOFT | 1 | A- | #84 | [Relational DB (Postgres)](interfaces/relational-db/INTERFACE.md) |
 | Queue / stream (Valkey) | CLEAN | 1 (redis-py) behind the broker port | not separately graded | #85, #7 | [Queue / stream (Valkey)](interfaces/queue-stream/INTERFACE.md) |
 | Bundle format | CLEAN, frozen | 1 | not separately graded | #30 | [Bundle format](interfaces/bundle-format/INTERFACE.md) |
-| Approval / authorizer | CLEAN | 3 approver sets behind one authorizer (Slack channel, Slack user group, explicit user list) | not separately graded | #22 | [Approval / authorizer](interfaces/approval/INTERFACE.md) |
+| Approval / authorizer | CLEAN | 6 approver sets behind one authorizer (Slack channel, Slack user group, explicit user list, email list, no verifiable approvers, IdP approver team) | not separately graded | #22 | [Approval / authorizer](interfaces/approval/INTERFACE.md) |
 | Workflow state store | SOFT | 1 (API state router) | not separately graded | #23, #248 | [Workflow state store](interfaces/workflow-state/INTERFACE.md) |
 | Memory | CLEAN | 1 loader (StateApiMemoryStore) + facts store (MemoryFactsStore) | not separately graded | #28 | [Memory](interfaces/memory/INTERFACE.md) |
 | Conversation history | CLEAN | 1 loader (StateApiTranscriptStore) | not separately graded | #20 | [Conversation history](interfaces/conversation-history/INTERFACE.md) |
-| Triggers | SOFT | 5 hardcoded (Slack, GH push, GH review, commit poll, generic HMAC hook) + per-agent cron scheduler (worker cron_loop) | not separately graded | #29 | [Triggers](interfaces/triggers/INTERFACE.md) |
-| CLI output (agent-facing `--json`) | CLEAN | 60 outputs behind one trait | not separately graded | #456 | [CLI output (agent-facing `--json`)](interfaces/cli-output/INTERFACE.md) |
-| Harness package (declared contribution) | CLEAN | 1 (built-in Claude) behind the entry-point registry | not separately graded | #844 | [Harness package (declared contribution)](interfaces/harness-package/INTERFACE.md) |
+| Triggers | SOFT | 10 hardcoded (Slack, GH push, GH review, commit poll, generic HMAC hook, GH factory issue intake, GH factory poll intake, factory missed-label reconcile, tracker intake poll, code-host review feedback poll) + per-agent cron scheduler (worker cron_loop) | not separately graded | #29 | [Triggers](interfaces/triggers/INTERFACE.md) |
+| CLI output (agent-facing `--json`) | CLEAN | 80 outputs behind one trait | not separately graded | #456 | [CLI output (agent-facing `--json`)](interfaces/cli-output/INTERFACE.md) |
+| Harness package (declared contribution) | CLEAN | 1 supported built in Claude contribution | not separately graded | #3828 | [Harness package (declared contribution)](interfaces/harness-package/INTERFACE.md) |
 | Connector host (bundle-declared MCP servers) | CLEAN | 1 (Kubernetes) + in-memory fake | not separately graded | #1063, #1184 | [Connector host (bundle-declared MCP servers)](interfaces/connector-host/INTERFACE.md) |
 | Sealed credential (cluster-sealed connector secrets) | SOFT | 2 halves (Rust sealer, Python opener) over one frozen wire | not separately graded | #1240 | [Sealed credential (cluster-sealed connector secrets)](interfaces/sealed-credential/INTERFACE.md) |
 | Third-party port adapter (deployed service) | NONE | lifecycle unbuilt; generic HTTP edge shipped | not separately graded | #19, #158 | [Third-party port adapter (deployed service)](interfaces/port-adapter-service/INTERFACE.md) |
+| Publication lineage authority | CLEAN | 1 (API authority through PublicationLineageClient) | not separately graded | #2274, #3923 | [Publication lineage authority](interfaces/publication-lineage-authority/INTERFACE.md) |
+| Cluster lifecycle admission | SOFT | 1 Helm and kubectl lifecycle coordinated by the Rust CLI with a worker pre-upgrade hook | not separately graded | #2301, #2010 | [Cluster lifecycle admission](interfaces/cluster-lifecycle/INTERFACE.md) |
+| Model pricing / PriceBook | CLEAN | 1 price source (OpenRouterPriceBook) + disabled fallback | not separately graded | #3223, #3923 | [Model pricing / PriceBook](interfaces/model-pricing/INTERFACE.md) |
+| Forge tracker and code host | CLEAN | GitHub and GitLab pairs, Jira tracker, Bitbucket Cloud and Data Center code hosts, and in-memory pairs | not separately graded | #3831 | [Forge tracker and code host](interfaces/forge-tracker/INTERFACE.md) |
+| MCP service-key authentication | SOFT | 1 deployment-owned service identity mode | not separately graded | #3273, #3308 | [MCP service-key authentication](interfaces/mcp-service-auth/INTERFACE.md) |
+| Protected hook source authority | CLEAN | 1 production resolver (ProvisionedSourceAuthority) + 2 test resolvers | not separately graded | #3603 | [Protected hook source authority](interfaces/protected-hook-source-authority/INTERFACE.md) |
+| Channel read | CLEAN | 1 Slack reader pair (history and canvas) plus HTTP test fakes | not separately graded | ADR-0100, ADR-0200, #2877, #3819 | [Channel read](interfaces/channel-read/INTERFACE.md) |
+| Mail provider | CLEAN | 1 in-tree (AgentMail) + out-of-tree providers loaded from the `curie.mail_provider` entry-point group | not separately graded | ADR-0228 | [Mail provider](interfaces/mail-provider/INTERFACE.md) |
+| Commissioning network producer | CLEAN | ProbeKit (managed-behavioral-v1) and LocalCiliumNetworkProducer (local-cilium-v1) | not separately graded | ADR-0236, ADR-0238, #4557 | [Commissioning network producer](interfaces/commissioning-network-producer/INTERFACE.md) |
+| HTTP identity facts | NONE | 0 active providers; facts-only v1 contract and synthetic vectors | not separately graded | #4890 | [HTTP identity facts](interfaces/http-identity/INTERFACE.md) |
 <!-- END GENERATED: seam-table -->
 
 ## Kind legend

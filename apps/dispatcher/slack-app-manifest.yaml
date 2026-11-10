@@ -51,6 +51,20 @@ oauth_config:
       # REQUIRES REINSTALLING THE APP to the workspace -- an existing
       # installation keeps its old grant until then.
       - files:read
+      # Required only for canvas tools (ADR 0200, #3819): the API reads a canvas
+      # shared into an agent's bound channel and replaces one table cell, with
+      # this same bot token. Without them those tools are refused by name
+      # (channel_read.provider_scope_missing); nothing else changes. ADDING A
+      # SCOPE REQUIRES REINSTALLING THE APP to the workspace -- an existing
+      # installation keeps its old grant until then.
+      - canvases:read
+      - canvases:write
+      # Required only for canvas tools on a PRIVATE channel (ADR 0200, #3819):
+      # the API checks the bot's membership there with conversations.info,
+      # which needs this scope for a private channel. Without it such a canvas
+      # is refused by name (channel_read.provider_scope_missing). ADDING A
+      # SCOPE REQUIRES REINSTALLING THE APP to the workspace.
+      - groups:read
 settings:
   socket_mode_enabled: true
   event_subscriptions:

@@ -19,6 +19,9 @@ import uuid
 from collections.abc import Callable, Sequence
 
 from aci_protocol import Attachment, HookRunRef, QueuedTurn, ReplyHandle, TurnSource
+from aci_protocol.turn import route_identity
+from channel_protocol import scoped_conversation_id
+from curie_worker.binding import FactoryContext, FactoryWake
 
 DEFAULT_RECEIVED_AT = "2026-07-05T00:00:00+00:00"
 
@@ -74,3 +77,21 @@ async def wait_until(
             return
         await asyncio.sleep(interval)
     raise AssertionError(f"timed out after {timeout}s waiting for: {what}")
+
+
+def factory_context(agent_id: uuid.UUID, wake: FactoryWake) -> FactoryContext:
+    return FactoryContext(
+        agent_id=agent_id,
+        tenant_id=uuid.UUID("00000000-0000-0000-0000-000000000001"),
+        binding_id=uuid.UUID("33333333-3333-4333-8333-333333333333"),
+        kind=wake.kind,
+        address=wake.address,
+        adapter=route_identity(wake.kind, wake.adapter),
+    )
+
+
+def factory_conversation(wake: FactoryWake) -> str:
+    return scoped_conversation_id(
+        wake.kind, wake.address, wake.conversation_id,
+        identity=route_identity(wake.kind, wake.adapter),
+    )

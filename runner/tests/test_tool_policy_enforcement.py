@@ -14,7 +14,7 @@ The second cluster here is the mirror-image failure, #2286. Curie mounts its own
 MCP servers (`curie`, `curie-state`) that a bundle is forbidden from declaring,
 so the bundle's policy has nothing to classify them against and the fail-closed
 default refuses them. The agent then sees its own channel memory and its own
-approval path answer "denied by this agent's tool policy, do not retry". That
+approval path answer "not permitted for this agent, do not retry". That
 is a refusal with no audience, over a capability the bundle never governed. These
 tests pin the scope rule (ADR-0139): the tools those servers publish are outside
 a bundle's `toolPolicy`, decided by EXACT published tool name and only for a
@@ -43,10 +43,12 @@ from curie_runner.approval import (
     APPROVAL_TOOL_NAME,
     ApprovalGate,
     build_approval_gate,
-    build_approval_hook,
-    build_can_use_tool,
     policy_disallowed_tools,
     resolve_approval_policy,
+)
+from curie_runner.harness.claude.approval import (
+    build_approval_hook,
+    build_can_use_tool,
 )
 from mcp import Tool
 from mcp.types import ToolAnnotations
@@ -317,7 +319,7 @@ def test_policy_disallowed_tools_project_only_denied_observed_runtime_names() ->
         hook_gate = _catalog_gate()
         hook_result = _hook_call(hook_gate, tool_name)
         assert _denied(hook_result)
-        assert "denied by this agent's tool policy" in _reason(hook_result)
+        assert "not permitted for this agent" in _reason(hook_result)
         _assert_no_approval_was_recorded(hook_gate)
 
         callback_gate = _catalog_gate()
@@ -328,7 +330,7 @@ def test_policy_disallowed_tools_project_only_denied_observed_runtime_names() ->
             ToolPermissionContext(tool_use_id="toolu_policy_test"),
         )
         assert isinstance(callback_result, PermissionResultDeny)
-        assert "denied by this agent's tool policy" in callback_result.message
+        assert "not permitted for this agent" in callback_result.message
         _assert_no_approval_was_recorded(callback_gate)
 
 
@@ -339,7 +341,7 @@ def test_a_denied_tool_is_refused_by_the_hook_not_only_the_callback() -> None:
     gate = _gate(_policy(deny=["k8s-write/*"]))
     result = _hook_call(gate, "mcp__k8s-write__restart_deployment")
     assert _denied(result)
-    assert "denied by this agent's tool policy" in _reason(result)
+    assert "not permitted for this agent" in _reason(result)
     # A refusal is not an approval request: nothing was recorded for a human.
     assert gate.pending_summary is None
 
@@ -396,7 +398,7 @@ def test_platform_publish_reaches_approval_gate_under_production_sre_tool_policy
     assert gate.pending_granted_tool == PLATFORM_PUBLISH_TOOL_NAME
     assert gate.publication_title == "Workspace tool check"
     assert gate.publication_body == "prior-turn marker"
-    assert "denied by this agent's tool policy" not in reason
+    assert "not permitted for this agent" not in reason
 
 
 @pytest.mark.parametrize("interceptor", ["hook", "callback"])
@@ -438,7 +440,7 @@ def test_approval_required_gates_a_tool_the_operator_never_named() -> None:
     assert _denied(result)
     # A block, not a refusal: this one has an audience.
     assert gate.pending_summary is not None
-    assert "denied by this agent's tool policy" not in _reason(result)
+    assert "not permitted for this agent" not in _reason(result)
 
 
 def test_a_bundle_with_no_policy_is_unchanged() -> None:
@@ -446,6 +448,39 @@ def test_a_bundle_with_no_policy_is_unchanged() -> None:
     gate = _gate(None)
     assert _hook_call(gate, "mcp__k8s-write__restart_deployment") == {}
     assert _hook_call(gate, "Bash") == {}
+
+
+@pytest.mark.parametrize("interceptor", ["hook", "callback"])
+@pytest.mark.parametrize("decision", ["allow", "approval", "deny", "unmatched"])
+def test_channel_read_tools_remain_inside_policy_scope(
+    interceptor: str, decision: str
+) -> None:
+    from plugin_format.connectors import CHANNEL_READ_SERVER_NAME
+
+    collections = {
+        "allow": {"allow": ["curie-slack/history"]},
+        "approval": {"approval_required": ["curie-slack/history"]},
+        "deny": {"deny": ["curie-slack/history"]},
+        "unmatched": {"allow": ["curie-slack/replies"]},
+    }
+    gate = ApprovalGate(
+        tool_policy=_policy(**collections[decision]),
+        bundle_name="acme-bot",
+        connector_servers={CHANNEL_READ_SERVER_NAME},
+        mcp_servers=set(),
+        state_server_mounted=True,
+    )
+    reason = _interception_reason(gate, f"mcp__{CHANNEL_READ_SERVER_NAME}__history", interceptor)
+    if decision == "allow":
+        assert reason == ""
+        _assert_no_approval_was_recorded(gate)
+    elif decision == "approval":
+        assert reason
+        assert "not permitted for this agent" not in reason
+        assert gate.pending_summary is not None
+    else:
+        assert "not permitted for this agent" in reason
+        _assert_no_approval_was_recorded(gate)
 
 
 @pytest.mark.parametrize(
@@ -510,7 +545,7 @@ def test_a_tool_from_an_undeclared_server_is_refused_at_both_interception_points
     gate = _gate(_policy(allow=["k8s-write/restart_deployment"]))
     reason = _interception_reason(gate, "mcp__not-declared__whatever", interceptor)
 
-    assert "denied by this agent's tool policy" in reason
+    assert "not permitted for this agent" in reason
     # A refusal, not a request: an undeclared server has no audience to ask.
     _assert_no_approval_was_recorded(gate)
 
@@ -525,7 +560,7 @@ def test_the_shipped_sre_bundle_can_still_reach_its_channel_memory() -> None:
     refused as unattributable. The broader coverage lives in the parametrized
     tests below, which also drive the hook. This one exists to be the pin.
 
-    Reversed, every name here comes back "denied by this agent's tool policy".
+    Reversed, every name here comes back "not permitted for this agent".
     """
 
     gate = _production_sre_gate(managed_workspace=False)
@@ -533,7 +568,7 @@ def test_the_shipped_sre_bundle_can_still_reach_its_channel_memory() -> None:
     refused = [
         tool_name
         for tool_name in _CHANNEL_MEMORY_TOOLS
-        if "denied by this agent's tool policy"
+        if "not permitted for this agent"
         in _interception_reason(gate, tool_name, "callback")
     ]
 
@@ -570,7 +605,7 @@ def test_every_platform_owned_tool_escapes_the_production_sre_tool_policy(
 
     reason = _interception_reason(gate, tool_name, interceptor, _input_for(tool_name))
 
-    assert "denied by this agent's tool policy" not in reason
+    assert "not permitted for this agent" not in reason
     if tool_name == PLATFORM_PUBLISH_TOOL_NAME:
         # Blocked, and rightly so: the platform permission gate still owns
         # publication. Outside policy scope is not permission to run.
@@ -614,7 +649,7 @@ def test_a_tool_the_platform_adds_later_is_exempt_without_a_second_list(
     # COLLECT whenever the product hunks are reversed, and a collection error is
     # not attributable to any one test. The fix-pin verifier refuses that, and
     # so should a reader trying to tell which assertion actually bit.
-    from curie_runner.state import STATE_TOOL_NAMES
+    from curie_runner.tool_names import STATE_TOOL_NAMES
 
     gate = _production_sre_gate(managed_workspace=False)
 
@@ -624,7 +659,7 @@ def test_a_tool_the_platform_adds_later_is_exempt_without_a_second_list(
     )
     for tool_name in sorted(STATE_TOOL_NAMES):
         reason = _interception_reason(gate, tool_name, interceptor)
-        assert "denied by this agent's tool policy" not in reason
+        assert "not permitted for this agent" not in reason
 
     _assert_no_approval_was_recorded(gate)
 
@@ -660,7 +695,7 @@ def test_an_ambient_server_keyed_onto_a_platform_prefix_is_refused(
     gate = _gate(_policy(allow=["k8s-write/restart_deployment"]), state_server_mounted=True)
     reason = _interception_reason(gate, tool_name, interceptor)
 
-    assert "denied by this agent's tool policy" in reason
+    assert "not permitted for this agent" in reason
     # A refusal, not a request: an undeclared server has no audience to ask.
     _assert_no_approval_was_recorded(gate)
 
@@ -687,7 +722,7 @@ def test_the_state_tools_are_exempt_only_when_the_platform_mounted_them(
     gate = _gate(_policy(allow=["k8s-write/restart_deployment"]), state_server_mounted=mounted)
     reason = _interception_reason(gate, "mcp__curie-state__get", interceptor)
 
-    assert ("denied by this agent's tool policy" in reason) is not mounted
+    assert ("not permitted for this agent" in reason) is not mounted
     _assert_no_approval_was_recorded(gate)
 
 
@@ -763,7 +798,7 @@ def test_a_server_that_merely_shares_a_platform_prefix_is_still_refused(
     """
 
     gate = _gate(_policy(allow=["k8s-write/restart_deployment"]))
-    assert "denied by this agent's tool policy" in _interception_reason(
+    assert "not permitted for this agent" in _interception_reason(
         gate, tool_name, "hook"
     )
 
@@ -792,7 +827,7 @@ def test_a_plugin_mounted_bundle_server_named_curie_stays_inside_policy_scope(
         gate, "mcp__plugin_sre-bot_curie__delete_everything", interceptor
     )
 
-    assert "denied by this agent's tool policy" in reason
+    assert "not permitted for this agent" in reason
     _assert_no_approval_was_recorded(gate)
 
 
@@ -820,7 +855,7 @@ def test_a_connector_named_after_the_platform_still_obeys_its_policy(
     )
     reason = _interception_reason(gate, "mcp__curie-docs__search", interceptor)
 
-    assert ("denied by this agent's tool policy" in reason) is refused
+    assert ("not permitted for this agent" in reason) is refused
 
 
 @pytest.mark.parametrize(
@@ -837,7 +872,7 @@ def test_a_platform_prefix_with_no_tool_left_ends_at_the_deny_default(
     """
 
     gate = _gate(_policy(allow=["k8s-write/restart_deployment"]))
-    assert "denied by this agent's tool policy" in _interception_reason(
+    assert "not permitted for this agent" in _interception_reason(
         gate, tool_name, "hook"
     )
 
@@ -861,5 +896,5 @@ def test_an_operator_gate_on_a_platform_tool_still_blocks(interceptor: str) -> N
     reason = _interception_reason(gate, APPROVAL_TOOL_NAME, interceptor)
 
     assert reason != "", "an operator-gated platform tool must stay gated"
-    assert "denied by this agent's tool policy" not in reason
+    assert "not permitted for this agent" not in reason
     assert gate.pending_summary is not None, "and it must still ask a human"

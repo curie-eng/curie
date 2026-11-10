@@ -40,16 +40,282 @@ PostgreSQL 16:
 
 - **DSN + schema** (`apps/api/src/curie_api/db.py::SCHEMA`, `apps/api/src/curie_api/db.py::create_engine`): `SCHEMA = get_settings().db_schema` (default `"curie"`, `apps/api/src/curie_api/config.py::Settings`); the engine is built from `database_url` (env `DATABASE_URL`) via `create_async_engine(..., pool_pre_ping=True)`.
 - **Schema-scoped metadata** (`apps/api/src/curie_api/db.py::Base`): `Base.metadata = MetaData(schema=SCHEMA)` — every table is qualified into the `curie` schema.
-- **Models** (`apps/api/src/curie_api/models.py`): every `Base` subclass in that module is `apps/api/src/curie_api/models.py::Agent` (table `agents`), `apps/api/src/curie_api/models.py::AgentChannel` (table `agent_channels`), `apps/api/src/curie_api/models.py::AgentVersion` (table `agent_versions`), `apps/api/src/curie_api/models.py::Deployment` (table `deployments`), `apps/api/src/curie_api/models.py::ThreadWorkspace` (table `thread_workspaces`), `apps/api/src/curie_api/models.py::Approval` (table `approvals`), `apps/api/src/curie_api/models.py::ThreadPublicationLineage` (table `thread_publication_lineages`), `apps/api/src/curie_api/models.py::PublicationReviewReservation` (table `publication_review_reservations`), `apps/api/src/curie_api/models.py::GitHubReviewDelivery` (table `github_review_deliveries`), `apps/api/src/curie_api/models.py::GitHubReviewFeedback` (table `github_review_feedback`), `apps/api/src/curie_api/models.py::Publication` (table `publications`), `apps/api/src/curie_api/models.py::CredentialRedemptionAuditEntry` (table `credential_redemption_audit_entries`), `apps/api/src/curie_api/models.py::ApprovalAuditEntry` (table `approval_audit_entries`), `apps/api/src/curie_api/models.py::AgentAction` (table `agent_actions`), `apps/api/src/curie_api/models.py::ActionAuditEntry` (table `action_audit_entries`), `apps/api/src/curie_api/models.py::WorkflowStateEntry` (table `workflow_state_entries`), and `apps/api/src/curie_api/models.py::ConsoleSession` (table `console_sessions`), plus the `apps/api/src/curie_api/models.py::Environment`, `apps/api/src/curie_api/models.py::ApprovalStatus`, and `apps/api/src/curie_api/models.py::ActionStatus` StrEnums. The authoritative list remains the set of `Base` subclasses in that module.
-- **Two engines, one DSN** (`apps/api/src/curie_api/db.py::create_engine`, `apps/worker/src/curie_worker/run.py::build`): the API and the worker each build their own `create_async_engine(...)` from their own `database_url` setting (`apps/api/src/curie_api/config.py::Settings`, `apps/worker/src/curie_worker/config.py::WorkerConfig`), both read from `DATABASE_URL`, so a swap repoints both services. The worker never imports the API's models: it reaches the schema through hand-written SQL, both reading (`apps/worker/src/curie_worker/binding.py::_RESOLVE_SQL`, `apps/worker/src/curie_worker/binding.py::_UNDEPLOYED_BINDING_SQL`, `apps/worker/src/curie_worker/connector_loop.py::_TARGETS_SQL`) and writing (`apps/worker/src/curie_worker/publication_store.py::PostgresPublicationStore` updates `publications` / `approvals` under `FOR UPDATE ... SKIP LOCKED`). Table and column names are a second, ORM-independent coupling a conforming DB must honor.
+- **Models** (`apps/api/src/curie_api/models.py`): the authoritative model set is every `apps/api/src/curie_api/db.py::Base` subclass in that module, and each one's `__tablename__` is its table. The set grows with the product, so it is deliberately not enumerated here; examples include `apps/api/src/curie_api/models.py::Agent` (table `agents`), `apps/api/src/curie_api/models.py::Approval` (table `approvals`), `apps/api/src/curie_api/models.py::WorkItem` (table `work_items`), and `apps/api/src/curie_api/models.py::ThreadTranscript` (table `thread_transcripts`). The module also defines StrEnums such as `apps/api/src/curie_api/models.py::Environment` and `apps/api/src/curie_api/models.py::ApprovalStatus`.
+
+4. **Database pools, one DSN.** The API and worker each own database pools, all selected by their service's
+`database_url` setting (`apps/api/src/curie_api/config.py::Settings`,
+`apps/worker/src/curie_worker/config.py::WorkerConfig`), both read from `DATABASE_URL`.
+The API builds its application engine, a separate liveness pool for readiness and
+worker heartbeats, and a source-gate pool
+(`apps/api/src/curie_api/db.py::create_engine`,
+`apps/api/src/curie_api/db.py::create_liveness_engine`,
+`apps/api/src/curie_api/db.py::create_source_gate_engine`). The worker builds an
+application engine and its own source-gate pool
+(`apps/worker/src/curie_worker/run.py::build`,
+`apps/worker/src/curie_worker/run.py::create_source_gate_engine`). A swap must repoint
+both services and therefore all their pools. The worker never imports the API's
+models: it reaches the schema through hand-written SQL, both reading
+(`apps/worker/src/curie_worker/binding.py::_RESOLVE_SQL`,
+`apps/worker/src/curie_worker/binding.py::_UNDEPLOYED_BINDING_SQL`,
+`apps/worker/src/curie_worker/connector_loop.py::_TARGETS_SQL`) and writing
+(`apps/worker/src/curie_worker/publication_store.py::PostgresPublicationStore`
+updates `publications` / `approvals` under `FOR UPDATE ... SKIP LOCKED`). Table and
+column names are a second, ORM-independent coupling a conforming DB must honor.
 - **Migrations**: the target DB must apply the **whole Alembic chain in `apps/api/alembic/versions/`**, in revision order, ending at `alembic heads`. The chain grows with the product, so it is deliberately not enumerated here: `ls apps/api/alembic/versions/` is the list, and `alembic heads` is the tip a conforming DB must reach. A single head is the invariant — a fork means two branches each added a migration (rebase and merge the heads before swapping anything). Two recent expand revisions make authenticated review feedback part of this schema contract: `0042_review_lineage_authority.py` adds immutable App-observed authority to publication lineages and the `publication_review_reservations` concurrency table; `0043_github_review_feedback.py` adds the `github_review_deliveries` audit table and the `github_review_feedback` durable feedback/outbox table. The latter stores normalized feedback and a credential-free queued turn, never a raw webhook body or GitHub credential.
+
+The current application schema window is `schema_min: "0123"` and
+`schema_head: "0123"`, as recorded in
+`apps/api/src/curie_api/schema_compat.json`. Revision `0123` follows the linear
+`0120` to `0122` chain: team sync state
+(`apps/api/alembic/versions/0120_team_sync_state.py`), agent access policies
+(`apps/api/alembic/versions/0121_agent_access_policies.py`), and directory identity
+(`apps/api/alembic/versions/0122_directory_identity.py`). Revision `0123` adds
+the nullable `execution_requests.last_start_failure_detail` diagnostic, with a
+nonblank, 2000-character bound
+(`apps/api/alembic/versions/0123_execution_request_start_failure_detail.py`).
+These values describe this candidate, not a historical release window.
+
+The `channel_canvas_edits` table (`apps/api/src/curie_api/models.py::ChannelCanvasEdit`,
+migration `0084_channel_canvas_edits.py`, ADR 0200) holds one audit row per canvas cell
+edit. Each row records the agent, deployment, logical turn, edit kind, channel address,
+canvas id, section id, the before and after text, a status of `attempted`, `applied` or
+`failed`, an error code, and timestamps, and is indexed on (`canvas_id`, `created_at`).
+
+Migration `0085_action_executions.py` (the connector action executor contract,
+#4067) is additive. It adds `post_version`, `connector`, `connector_digest`,
+`authority_kind` and `authority_ref` to `agent_actions`, all nullable, so rows
+written before it read back NULL and are never undoable. The `action_executions`
+table (`apps/api/src/curie_api/models.py::ActionExecution`) holds one row per
+restore, forward action or capability probe, with checks on `kind` and `state`,
+a unique `idempotency_key`, and a partial unique index allowing one restore that
+is not `refused` per recorded action. The `connector_capabilities` table
+(`apps/api/src/curie_api/models.py::ConnectorCapability`) records whether a
+connector image can restore, keyed on the agent, connector and digest.
+
+Migration `0086_thread_attachment_refs.py` ([ADR 0205](../../adr/0205-an-attachment-belongs-to-its-thread.md)) is additive. The
+`thread_attachment_refs` table (`apps/api/src/curie_api/models.py::ThreadAttachmentRef`)
+holds one row per file a thread's agent was given, keyed like `thread_transcripts`
+(agent, binding scope, thread key) and removed with the transcript. Each row
+records the turn's event id, the channel's file id, the name, the on-disk name,
+the best-effort mime type and size, the sha256, the arrival order (`seq`, an
+identity column) and the route kind, adapter and identity; never an endpoint,
+a URL or bytes. (agent, scope, thread, event, file) and (agent, scope, thread,
+disk name) are each unique with a NULL scope equal, and the agent foreign key
+cascades.
+
+Migration `0087_remediation_policies.py` (automated remediation,
+AUTOMATED-REMEDIATION-2) is additive. The `remediation_policies` table
+(`apps/api/src/curie_api/models.py::RemediationPolicy`) holds one row per bound
+hook, keyed on (agent, hook), with its current positive generation, the
+operation that wrote it and the `armed` and `active` flags. The
+`remediation_policy_generations` table
+(`apps/api/src/curie_api/models.py::RemediationPolicyGeneration`) holds one
+immutable row per generation, keyed on (agent, hook, generation), with the
+operation id (unique per agent and hook), the canonical intent digest, the whole
+policy document as JSONB, the flags and the operator principal that wrote it
+(`bound_by`). A trigger refuses any update of a generation row and its deletion
+while the agent exists; both tables cascade with the agent.
+
+Migration `0088_remediation_nominations.py` (automated remediation,
+AUTOMATED-REMEDIATION-6 and -7) is additive. The
+`remediation_nomination_submissions` table
+(`apps/api/src/curie_api/models.py::RemediationNominationSubmission`) holds the
+one accepted nomination submission of a protected event, keyed on the event id,
+with the agent and hook resolved from the protected binding and the SHA-256 of
+the submitted bytes. The `remediation_nominations` table
+(`apps/api/src/curie_api/models.py::RemediationNomination`) holds one row per
+nominated entry, or one row for a malformed block: the agent, hook and event,
+the admitted and current policy generations, the action, kind, canonical
+arguments and their digest, the target key, the stored reason, a closed
+`state`, a closed `refusal_code` (present exactly when the state is `refused`),
+the approval, execution and verification outcome that later admission fills,
+and `created_at` and `decided_at`. Both tables cascade with the agent and a
+nomination cascades with its submission.
+
+Migration `0089_remediation_ledger_fields.py` (automated remediation,
+AUTOMATED-REMEDIATION-14) is additive. `agent_actions`
+(`apps/api/src/curie_api/models.py::AgentAction`) gains `delivery_event_id` (the
+protected delivery a remediation was nominated from), `nomination_id` (not a
+foreign key, so the record outlives the nomination), `verification_outcome`,
+`verified_at` and `actor_kind`; `action_audit_entries`
+(`apps/api/src/curie_api/models.py::ActionAuditEntry`) gains `actor_kind`. All
+are nullable with no backfill, so existing rows read NULL. Check constraints
+close `authority_kind` on `agent_actions` and `action_executions` to
+`undo_ruling`, `capability_probe`, `policy`, `approval` and `qualification`
+(NULL allowed on the ledger), `actor_kind` on both ledger tables to
+`model_turn`, `policy`, `approval` and `undo_ruling`, and
+`verification_outcome` to `verified`, `not-recovered`, `verifier-unavailable`
+and `superseded`. A model turn's record carries `actor_kind` `model_turn`; a
+remediation's forward record carries its authority, actor, delivery and
+nomination from the dispatch commit
+(`apps/api/src/curie_api/remediation_forward.py`).
+
+Migration `0090_remediation_read_executions.py` (automated remediation,
+AUTOMATED-REMEDIATION-12, executor amendments E2 and E9) is additive.
+`action_executions` (`apps/api/src/curie_api/models.py::ActionExecution`) gains
+`not_before` (the claim route hands out an execution once due; NULL is due),
+`pointer` (a read's RFC 6901 pointer) and `sample` (a read's reported
+`{sample, value}`, or the API's `skipped`), all nullable with no backfill. The
+kind check is replaced so `kind` gains `read`. Read executions are created only by
+`apps/api/src/curie_api/remediation_reads.py::create_read_execution`; the
+downgrade deletes them before restoring the check.
+
+Migration `0091a_remediation_execution_code.py` (automated remediation,
+AUTOMATED-REMEDIATION-18) is additive. `remediation_nominations`
+(`apps/api/src/curie_api/models.py::RemediationNomination`) gains
+`execution_code`, nullable with no backfill: the code of a forward execution
+that ended `failed`, `indeterminate` or `refused` after admission, written when
+the nomination finishes `not-recovered` without a verifier
+(`apps/api/src/curie_api/remediation_verifier.py`). The downgrade drops it.
+
+Migration `0092a_remediation_approvals.py` (automated remediation,
+AUTOMATED-REMEDIATION-15) is additive. `approvals_purpose_ck` is replaced so
+`approvals.purpose` gains `remediation`; existing rows are untouched. The new
+`remediation_approval_requests` table
+(`apps/api/src/curie_api/models.py::RemediationApprovalRequest`) holds one row per
+remediation approval: the raising nomination, its agent, hook, action and
+`arguments_sha256` (the deduplication identity), the failed admission check and
+the observed precondition value the card names, the count and newest `event_id`
+of attached nominations, and the card delivery outbox the worker's remediation
+card loop leases. It cascades with its approval, nomination and agent. Rows are
+written by `apps/api/src/curie_api/remediation_approvals.py`; the downgrade drops
+the table and deletes remediation approvals before restoring the check.
+
+Migration `0093a_remediation_admission.py` (automated remediation,
+AUTOMATED-REMEDIATION-8 to -11) is additive. `remediation_breakers`
+(`apps/api/src/curie_api/models.py::RemediationBreaker`) holds one row per
+breaker keyed by agent, connector, tool and target key, with at most one open
+per key (a partial unique index); it opens on any verification outcome other
+than `verified` and records `closed_at`, `closed_by` (the operator principal)
+and `close_reason` when the policy's administrative route closes it.
+`remediation_reservations` (`RemediationReservation`) holds the check 11
+reservation of each nomination admitted to its precondition read (policy,
+action, target key, turn, `reserved_at`, `released_at`), counted under the
+per-agent admission lock. Both cascade with the agent (reservations also with
+the nomination). `remediation_nominations.approval_reason` names the admission
+check that sent a nomination to approval, one of the frozen `approval_reasons`
+of `tests/vectors/remediation-codes.json`, and
+`remediation_delivery_surfaces` (`RemediationDeliverySurface`) records, per
+protected delivery event id, the reply surface the hook route chose (written by
+`apps/api/src/curie_api/routers/hooks.py` with remediation on, committed before
+the broker admits the delivery; pruned once a submission copied it); it cascades with
+the agent. `remediation_nomination_submissions` gains `conversation_id` and the
+reply surface (`reply_kind`, `reply_channel`, `reply_endpoint`, `reply_adapter`)
+copied from that row at nomination time, which the approval request is raised on;
+existing rows read NULL. `remediation_nominations_refusal_ck` gains
+`reply_surface_unavailable`.
+Rows are written by `apps/api/src/curie_api/remediation_admission.py` and
+`remediation_limits.py`; the downgrade drops the three tables and the added columns,
+deletes nominations refused `reply_surface_unavailable` and restores the refusal
+check.
+
+Migration `0094_remediation_qualifications.py` (automated remediation,
+AUTOMATED-REMEDIATION-22) is additive. `remediation_qualifications`
+(`apps/api/src/curie_api/models.py::RemediationQualification`) holds one
+immutable record per qualification id for one agent, connector, tool, connector
+digest and verifier declaration digest: the reversibility, the operator
+principal that recorded it, the worst case statement (at most 2000 characters,
+a check), the evidence references checked by state and digest at write, and the
+hook, action and policy generation it was evaluated against.
+`remediation_qualification_verifier_runs` (`RemediationQualificationVerifierRun`)
+holds each qualification verifier run (hook, action, generation, verifier
+digest, literal target, operator principal, `started_at`, outcome); its samples
+are `read` executions with `authority_kind` `qualification`. Both cascade with
+the agent. Rows are written by
+`apps/api/src/curie_api/remediation_qualifications.py`; the downgrade drops both
+tables.
+
+Migration `0095_remediation_escalations.py` (automated remediation,
+AUTOMATED-REMEDIATION-19) is additive. `remediation_escalations`
+(`apps/api/src/curie_api/models.py::RemediationEscalation`) holds one row per
+nomination whose verification outcome is not `verified` (unique
+`nomination_id`): the agent, the ledger record when the forward left one, the
+outcome, and the undo approval when one was offered (`undo_approval_id`, set
+null if that approval is deleted). The undo approval is an `approvals` row of
+purpose `remediation` with a `remediation-undo:<nomination id>` dedupe key and
+no `remediation_approval_requests` row. Rows are written by
+`apps/api/src/curie_api/remediation_escalation.py` in the transaction that
+writes the outcome; the downgrade deletes the undo approvals the table names,
+then drops it.
+
+Migration `0096_remediation_tune_refusal.py` (automated remediation,
+AUTOMATED-REMEDIATION-25) widens `remediation_nominations_refusal_ck` to accept
+`tune_execution_not_automated`, the refusal every nomination of an approved
+alert rule tuning request ends with (it executes nothing). The downgrade moves
+such rows to `finished` with the code in `execution_code`, then restores the
+narrower check.
+
+Migration `0097_remediation_receipts.py` (automated remediation,
+AUTOMATED-REMEDIATION-20) adds the nullable
+`remediation_delivery_surfaces.reply_conversation`, the thread the protected
+hook ingress records for the receipts, and `remediation_receipt_posts`, one row
+per (nomination, stage) the worker receipt loop has claimed: its lease, attempt
+count and `posted_at`. The row holds no message text, argument or reason and
+cascades with its nomination. The downgrade drops both.
+
+Migration `0107_identity_links.py` (identity namespaces and links, #2910,
+ADR-0198 decision 5) is additive: two new tables, whose active-link uniqueness
+is a partial unique index (`identity_links_active_native_key`,
+`WHERE revoked_at IS NULL`).
+
+The candidate application serving window and ordered revision ancestry live in
+`packages/protected-hooks/src/curie_protected_hooks/schema_serving.json`,
+validated against the actual API migration graph and CLI candidate catalog.
+`packages/protected-hooks/src/curie_protected_hooks/schema_serving.py::can_serve`
+owns the pure serving decision; API exports delegate to it. The API window
+resource and chart metadata are checked generated mirrors. Historical CLI
+release windows remain separate and unchanged.
+
+API startup calls
+`packages/protected-hooks/src/curie_protected_hooks/schema_serving.py::assert_servable`
+under its configured database identity. The read-only probe requires one live
+revision plus readable source policy and operation columns with compatible
+types, including when an unknown future revision is presumed compatible.
+Configured schema selection locates version metadata; source tables remain in
+`curie`. This proves readable structure, not runtime authority or qualification.
+
+## Worker reads and writes
+
+The worker's SQLAlchemy `text(...)` statements are a schema contract alongside
+the API models. The current modules and table ownership are:
+
+| Worker module | Reads | Writes |
+|---|---|---|
+| `apps/worker/src/curie_worker/action_digest.py` | `agents` | None |
+| `apps/worker/src/curie_worker/binding.py` | `agents`, `agent_channels`, `deployments`, `agent_versions`, `approvals` | None |
+| `apps/worker/src/curie_worker/connector_loop.py` | `agents`, `deployments`, `agent_versions` | None |
+| `apps/worker/src/curie_worker/connector_probe.py` | `connector_capabilities` | None |
+| `apps/worker/src/curie_worker/cron_loop.py` | `agents`, `deployments`, `agent_versions`, `agent_channels`, `hook_runs`, `schedule_controls` | `hook_runs`, `schedule_controls` |
+| `apps/worker/src/curie_worker/hook_runs.py` | `hook_runs`, `schedule_controls` | `hook_runs` |
+| `apps/worker/src/curie_worker/hook_source_guard.py` | `agents`, `hook_source_policies`, `hook_source_operations` (hardcoded `curie` schema) | None |
+| `apps/worker/src/curie_worker/protected_binding.py` | `agents`, `agent_channels`, `agent_versions` | None |
+| `apps/worker/src/curie_worker/publication_store.py` | `publications`, `approvals`, `thread_publication_lineages`, `execution_requests`, `work_items` | `publications`, `approvals`, `thread_publication_lineages` |
+| `apps/worker/src/curie_worker/remediation_cards.py` | `remediation_approval_requests`, `approvals`, `remediation_nominations`, `remediation_policies`, `remediation_policy_generations`, `action_executions` | `remediation_approval_requests` |
+| `apps/worker/src/curie_worker/remediation_receipts.py` | `remediation_nominations`, `remediation_nomination_submissions`, `remediation_delivery_surfaces`, `remediation_escalations`, `action_executions`, `remediation_policy_generations`, `remediation_approval_requests`, `remediation_receipt_posts` | `remediation_receipt_posts` |
+| `apps/worker/src/curie_worker/sweep.py` | `agent_versions` | None |
+
+`tests/test_worker_sql_contract.py` creates an isolated database, applies the
+actual API Alembic chain to head, and checks every discovered worker text
+statement against it through
+`packages/curie-internal/src/curie_internal/worker_sql.py::discover_statements` and
+`packages/curie-internal/src/curie_internal/worker_sql.py::explain_statements`.
+Discovery resolves schema formatting, table attributes assigned by class
+initializers, and each constant branch of local SQL fragments, including filtered
+and unfiltered publication result queries. An unresolved expression is a failure
+with its source location, never a skipped statement. `EXPLAIN` validates table and
+column references without executing writes; the gate also proves that a missing
+column is rejected and a valid parameterized statement is accepted.
+
+The worker continues to own a separate engine and does not import API models at
+runtime. Alembic migrations remain the source of table and column authority; a
+test fixture that fabricates those tables cannot substitute for this contract
+check.
 
 ## Implementations today
 
-One: the compose/dev Postgres. Two SQLAlchemy async engines reach it, the API's
-(`apps/api/src/curie_api/db.py::create_engine`) and the worker's
-(`apps/worker/src/curie_worker/run.py::build`), each built from its own settings object
-but from the same `DATABASE_URL`. Tests point the API engine at the compose Postgres by
+One: the compose/dev Postgres. The API's application, liveness, and source-gate pools
+and the worker's application and source-gate pools reach it, each selected from its
+service's settings object and `DATABASE_URL`. Tests point the API engine at the compose Postgres by
 overriding `database_url` (per the `apps/api/src/curie_api/db.py` module docstring).
 
 ## Known leakage
@@ -59,21 +325,22 @@ The list is enumerated rather than totalled in prose on purpose: what counts as 
 is a judgement call, not something derivable from the tree.
 
 1. **`postgresql.UUID` column type** — `apps/api/src/curie_api/models.py::UUID` is imported
-   from `sqlalchemy.dialects.postgresql` and used as `UUID(as_uuid=True)` on every primary
-   and foreign key (e.g. `apps/api/src/curie_api/models.py::Agent`). This is a dialect-specific type.
+   from `sqlalchemy.dialects.postgresql` and used as `UUID(as_uuid=True)` for entity
+   identity columns such as `apps/api/src/curie_api/models.py::Agent.id` and their
+   references. This does not describe every key: execution events have integer identity
+   keys, source policy and schedule identities include string hook names, and factory
+   polling cursors use repository-name strings. UUID remains a dialect-specific type.
 2. **Schema-qualified tables + a schema-scoped native enum** — foreign keys are
    written as `f"{SCHEMA}.agents.id"` (`apps/api/src/curie_api/models.py::AgentVersion`,
    `apps/api/src/curie_api/models.py::Deployment`) and the `environment`
    column is a native Postgres `Enum(Environment, name="environment", schema=SCHEMA)`
    (`apps/api/src/curie_api/models.py::Deployment`), which materializes as a `CREATE TYPE` in the `curie` schema.
-3. **`JSONB` column type** — `apps/api/src/curie_api/models.py::JSONB` is imported from
-   `sqlalchemy.dialects.postgresql` on the same line as `UUID` and used on **21** columns:
-   `behavior_packs`, `approval_required_tools`, `approval_routes`, `secrets`,
-   `hook_partitions`, `source_bindings`, `runner_resources`, `changed_paths`, `evidence`, `arguments`,
-   `result`, `prior_state`, `target`, `post_state`, `feedback`, `turn`, `declaration`, `activity`, and `value`. The last one is
-   declared twice, on `apps/api/src/curie_api/models.py::WorkflowStateEntry.value` and on
-   `ThreadTranscript.value`, which holds one thread's transcript (ADR-0170); `evidence` is used
-   by both approval and action audit rows. Three of them are
+3. **`JSONB` column type**: `apps/api/src/curie_api/models.py::JSONB` is imported from
+   `sqlalchemy.dialects.postgresql` on the same line as `UUID` and used on many columns
+   across the models. The inventory is every `JSONB` column in that module, including
+   the ones whose `mapped_column(` call wraps onto a second line (for example
+   `JSONB(none_as_null=True)` on `allowed_callers` and `granted_arguments`), so a
+   single-line `mapped_column(JSONB` search undercounts. Several are
    load-bearing rather than incidental: the workflow-state store exists precisely because
    Postgres JSONB meant no new datastore was needed (see that class's docstring), the
    action ledger's `prior_state` holds a snapshot whose shape belongs to whatever resource
@@ -83,19 +350,35 @@ is a judgement call, not something derivable from the tree.
    per hook (ADR-0134, Draft). `source_bindings` holds the operator-controlled
    workload-to-allowlisted-repository map for inbound hooks (#2572). The review-feedback
    outbox likewise stores a normalized `feedback` object and credential-free serialized
-   `turn` as JSONB.
+   `turn` as JSONB. `scopes` is `apps/api/src/curie_api/models.py::ChannelIdentity.scopes`,
+   the list of provider scopes granted to one channel identity (#2909); `attributes` is
+   the same class's `attributes`, provider-specific identity details that don't fit a
+   fixed column, such as a Slack identity's extra token reference (ADR-0168 decision 1,
+   as scoped by ADR-0198 decision 4). Its reserved `slack_auth_test` key holds what a
+   Slack identity's own `auth.test` reported (#3039), written only by
+   `apps/api/src/curie_api/identity/attach.py::report_slack_identity`.
 4. **Raw dialect-specific SQL outside the ORM** — `DISTINCT ON`, which is Postgres-only,
    is written by hand in `apps/api/src/curie_api/commitpoller.py::_DEPLOYED_SQL` (executed
    through `text(...)` in `apps/api/src/curie_api/commitpoller.py::CommitPoller.poll_once`)
-   and in `apps/worker/src/curie_worker/connector_loop.py::_TARGETS_SQL`. The worker's
+   in `apps/worker/src/curie_worker/connector_loop.py::_TARGETS_SQL` and
+   `apps/worker/src/curie_worker/cron_loop.py::_TARGETS_SQL`, and in the API's
+   `apps/api/src/curie_api/routers/hook_fire.py::_IN_FORCE_SQL`,
+   `apps/api/src/curie_api/routers/schedules.py::_IN_FORCE_SQL` and
+   `apps/api/src/curie_api/routers/schedules.py::_LATEST_SQL`. The worker's
    read path adds a driver-level dependency on top of the dialect one:
    `apps/worker/src/curie_worker/binding.py::BindingResolver.resolve` decodes the JSONB
    columns with `json.loads` because asyncpg returns JSONB as a `str` for a raw-text
    `SELECT`, and `apps/worker/src/curie_worker/binding.py::_RESOLVE_SQL` orders on
    `(d.environment = 'prod')`, comparing the native enum of item 2 against a string
    literal.
-5. **`UNIQUE NULLS NOT DISTINCT` workflow-state identity** —
-   `workflow_state_entries` treats `binding_scope IS NULL` as the one real shared scope
+5. **`UNIQUE NULLS NOT DISTINCT` identity constraints**: five constraints use
+   `postgresql_nulls_not_distinct`: `agent_channels_route_key` on
+   `apps/api/src/curie_api/models.py::AgentChannel` (so route-less non-Slack rows
+   collide), `uq_thread_transcripts_agent_scope_thread` on
+   `apps/api/src/curie_api/models.py::ThreadTranscript`,
+   `uq_thread_attachment_refs_event_file` and `uq_thread_attachment_refs_disk_name`
+   on `apps/api/src/curie_api/models.py::ThreadAttachmentRef`, and the
+   workflow-state identity below. `workflow_state_entries` treats `binding_scope IS NULL` as the one real shared scope
    identity, rather than as an absent value. This preserves the shared state of a
    `memory=True` agent (including a legacy general-state row) and the permanently
    agent-wide `memory` and `transcript` namespaces. The named
@@ -108,9 +391,12 @@ is a judgement call, not something derivable from the tree.
    `apps/worker/src/curie_worker/publication_store.py::PostgresPublicationStore`
    claims publication and approval rows under `FOR UPDATE OF p SKIP LOCKED` (and
    sibling `FOR UPDATE SKIP LOCKED` statements in the same module) so concurrent
-   workers do not block on one another's in-flight claim. The API uses the same
-   clause on other claim paths
-   (`apps/api/src/curie_api/crud.py::claim_resume_row`,
+   workers do not block on one another's in-flight claim. The remediation card
+   loop also claims `remediation_approval_requests` under
+   `FOR UPDATE OF r SKIP LOCKED`
+   (`apps/worker/src/curie_worker/remediation_cards.py::PostgresRemediationCardStore.claim_pending_card`).
+   The API uses the same clause on other claim paths
+   (`apps/api/src/curie_api/crud/approvals.py::claim_resume_row`,
    `apps/api/src/curie_api/resumereconciler.py::ResumeReconciler`). A second
    engine that honors the models but not this skip-locked claim would serialize
    those loops.
@@ -124,6 +410,27 @@ is a judgement call, not something derivable from the tree.
    `apps/api/src/curie_api/models.py::Publication` permits only one live
    publication per lineage. A target without partial unique indexes cannot express
    those database-level concurrency constraints as written.
+8. **Advisory locks**: several paths serialize on Postgres advisory locks rather
+   than row locks. Transaction-scoped `pg_advisory_xact_lock` is taken per agent and
+   hook or schedule name in
+   `apps/api/src/curie_api/routers/hook_fire.py::_LOCK_SQL`,
+   `apps/api/src/curie_api/routers/schedules.py::_LOCK_SQL`,
+   `apps/worker/src/curie_worker/cron_loop.py::_LOCK_SQL` and
+   `apps/worker/src/curie_worker/hook_runs.py::HookRunRecorder.start_guard`; per
+   agent for the namespace-count cap in
+   `apps/api/src/curie_api/routers/state.py::enforce_caps`; per route pair in
+   `apps/api/src/curie_api/crud/channels.py::refuse_routeless_pair_sharing`; and per GitHub
+   issue in `apps/api/src/curie_api/github_factory.py::lock_issue`. The factory poll
+   intake instead holds a session-scoped `pg_try_advisory_lock` on one connection
+   (`apps/api/src/curie_api/factory_poll_intake.py::poll_once`). The global identity
+   admission fence uses bigint key `2250220`:
+   `apps/api/src/curie_api/identity_fence.py::mutation` holds the exclusive
+   transaction lock across identity mutation and cache-generation publication,
+   while `apps/api/src/curie_api/identity_fence.py::lock_identity_reader` holds
+   the shared transaction lock to keep authorization stable until commit.
+   The two-argument
+   int4 form and the bigint form are separate lock spaces, so a port must keep the
+   key derivation as written.
 
 Items 1 to 3 are cheap within the Postgres family: any managed Postgres speaks all three
 natively, so the DSN-only swap is unaffected by them. Item 4 is different in kind: it is
@@ -134,12 +441,13 @@ a database-level contract rather than a model type: it is native on a supported 
 Postgres, but a pre-15 server cannot represent Curie's singular NULL shared identity.
 Item 6 is a row-claim concurrency primitive: native on Postgres, not on every
 SQLAlchemy target. Item 7 makes publication uniqueness conditional on row status,
-which likewise depends on a Postgres index feature. All seven items would need rework for a different RDBMS, which is
+which likewise depends on a Postgres index feature. Item 8 is a cross-process mutex
+that lives in the database session rather than in a table. All eight items would need rework for a different RDBMS, which is
 the marker that a real port should be extracted first.
 
 ## Cross-links
 
-- **Swap guide + validation:** [managed-postgres-swap.md](./managed-postgres-swap.md) — the DSN-only swap to RDS/Cloud SQL/Neon, with the `apps/api/tests/test_managed_pg_swap.py` smoke test that proves the migration chain applies against a DSN-selected throwaway database (#283). That test covers leakage items 1 and 2 only; items 3 through 7 have no equivalent managed-swap assertion.
+- **Swap guide + validation:** [managed-postgres-swap.md](./managed-postgres-swap.md) — the DSN-only swap to RDS/Cloud SQL/Neon, with the `apps/api/tests/test_managed_pg_swap.py` smoke test that proves the migration chain applies against a DSN-selected throwaway database (#283). That test covers leakage items 1 and 2 only; items 3 through 8 have no equivalent managed-swap assertion.
 - **Epic(s):** #84 — vision epic for the relational-DB seam (keep the swap a DSN change; extract a port only for a non-Postgres store).
 - **Vision doc:** [architecture-vision.md](../../architecture-vision.md) — Job 5 (Relational database), grade A-
 - **ADR(s):** [ADR-0007](../../adr/0007-adopt-not-build-boundaries.md) — Adopt-not-build boundaries ("vanilla Postgres" adopted for app state)

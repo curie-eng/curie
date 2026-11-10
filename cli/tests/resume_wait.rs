@@ -24,7 +24,7 @@ use curie::chat::{await_reply, await_resume, parse_approval_id, Outcome, SlackSt
 use curie::queue::{synthetic_turn, xadd, WORKER_GROUP};
 use curie_aci_protocol::{QueuedTurn, ReplyHandle, TurnSource};
 
-mod support;
+use crate::support;
 use support::{unique_stream, valkey_or_skip};
 
 const PLACEHOLDER_TS: &str = "1720000000.000200";
@@ -57,6 +57,7 @@ fn resume_turn(resume_event_id: &str, endpoint: &str) -> QueuedTurn {
         source: TurnSource::Slack,
         hook_run: None,
         tool_access: None,
+        author_principal: None,
         // Empty, matching `resumequeue._build_turn`: it replays the original
         // placeholder and endpoint, not the original files. Whether a resumed
         // turn should carry the attachments of the turn it continues is a real
@@ -410,7 +411,7 @@ case "$1" in
   compose)
     case " $* " in
       *" exec "*) printf '%s\n' '{{"state":"claims_enabled","since":null,"revision":null,"ttl_seconds":null}}' ;;
-      *) exec '{}' -m curie_dispatcher.enqueue_once ;;
+      *) exec '{}' -m curie_channel_gateway.slack.enqueue_once ;;
     esac ;;
   *) echo unsupported fake docker command >&2; exit 64 ;;
 esac

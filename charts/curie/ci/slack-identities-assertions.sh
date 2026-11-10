@@ -12,8 +12,10 @@ WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT
 
 python3 - "$CHART" "$WORK" <<'PY'
+import base64
 import json
 import pathlib
+import re
 import shutil
 import subprocess
 import sys
@@ -23,14 +25,36 @@ import yaml
 chart = pathlib.Path(sys.argv[1])
 work = pathlib.Path(sys.argv[2])
 
+# Compare full pod templates with stable credentials across offline renders.
+# An upgrade also needs a constant externally persisted installation identity;
+# replace only that Kubernetes lookup input in a disposable candidate copy.
+INSTALLATION_ID = "acme" + "0" * 28
+fixture = work / "chart-fixture"
+shutil.copytree(chart, fixture)
+helpers_path = fixture / "templates" / "_helpers.tpl"
+helpers = helpers_path.read_text()
+lookup_boundary = 'lookup "v1" "Secret" .Release.Namespace (include "curie.secretName" .) | default dict'
+if helpers.count(lookup_boundary) != 1:
+    raise SystemExit("identity fixture requires exactly one managed Secret lookup boundary")
+encoded_id = base64.b64encode(INSTALLATION_ID.encode()).decode()
+helpers_path.write_text(helpers.replace(
+    lookup_boundary,
+    f'(dict "data" (dict "installationId" "{encoded_id}")) | default dict',
+    1,
+))
+chart = fixture
+
 SECRET = "acme-curie-secrets"
 DECLARATION = "CURIE_SLACK_IDENTITIES"
 INDEXED = ("CURIE_SLACK_APP_TOKEN__", "CURIE_SLACK_BOT_TOKEN__", "CURIE_SLACK_SIGNING_SECRET__")
-# Generated credentials differ on every render; compare these by key set only.
+# Preserve the existing key-set checks for credential and upgrade-hook docs.
+# Workload comparisons retain checksum/secret and every other pod-template field.
 RANDOM_DOCS = {
     ("Secret", SECRET),
+    ("Secret", "acme-curie-runner-token"),
     ("Job", "acme-curie-upgrade-drain"),
     ("Job", "acme-curie-upgrade-drain-attest"),
+    ("Job", "acme-curie-upgrade-drain-hold"),
     ("Job", "acme-curie-upgrade-drain-release"),
 }
 PLAIN = {"dispatcher": {"slack": {"appToken": "xapp-example", "botToken": "xoxb-example"}}}
@@ -47,7 +71,8 @@ def render(values, *args, source=None, ok=True):
     output = work / str(count)
     result = subprocess.run(
         ["helm", "template", "acme", str(source or chart), "-f", str(values_file),
-         "--output-dir", str(output), *args],
+         "--set", "security.allowDevDefaults=true", "--set", "channelGateway.deploy=true",
+         "--set", "channelGateway.allowInsecure=true", "--output-dir", str(output), *args],
         text=True,
         capture_output=True,
     )
@@ -82,6 +107,7 @@ def workloads(output):
         "dispatcher": env(output, "dispatcher.yaml", "dispatcher"),
         "worker": env(output, "worker.yaml", "worker"),
         "api": env(output, "api.yaml", "api"),
+        "gateway": env(output, "channel-gateway.yaml", "channel-gateway"),
     }
 
 
@@ -116,7 +142,7 @@ def identity_env_names(output):
     return names
 
 
-def same_objects(label, left, right, ignore=()):
+def same_objects(label, left, right, ignore=(), *, is_upgrade):
     """Every deterministic object equal, and the random ones equal by key set."""
     a, b = documents(left), documents(right)
     assert a.keys() == b.keys(), f"{label}: object sets differ: {sorted(set(a) ^ set(b))}"
@@ -128,6 +154,33 @@ def same_objects(label, left, right, ignore=()):
                 f"{label}: {key} carries a different set of keys"
             )
             continue
+        if key == ("Job", "acme-curie-schema-migrate"):
+            # Validate the real identity resolution against the managed Secret
+            # and persisted lookup fixture, then compare the complete Job.
+            for docs, job in ((a, a[key]), (b, b[key])):
+                containers = job["spec"]["template"]["spec"]["containers"]
+                migrate = [item for item in containers if item.get("name") == "schema-migrate"]
+                assert len(migrate) == 1, f"{label}: schema-migrate container is missing or ambiguous"
+                identities = named(migrate[0].get("env", []), "CURIE_INSTALLATION_ID")
+                if not is_upgrade:
+                    assert not identities, f"{label}: install migrate must omit pause installation identity"
+                    continue
+                assert len(identities) == 1, f"{label}: migrate installation identity is duplicated"
+                identity = identities[0]
+                assert set(identity) == {"name", "value"}, (
+                    f"{label}: migrate installation identity must be one literal value"
+                )
+                value = identity["value"]
+                assert isinstance(value, str) and re.fullmatch(r"[A-Za-z0-9]{32}", value), (
+                    f"{label}: installation identity must be 32 alphanumeric characters"
+                )
+                secret = docs[("Secret", SECRET)]
+                assert value == (secret.get("stringData") or {}).get("installationId"), (
+                    f"{label}: migrate identity differs from its own managed Secret installationId"
+                )
+                assert value == INSTALLATION_ID, (
+                    f"{label}: upgrade did not retain the lookup fixture installationId"
+                )
         assert a[key] == b[key], f"{label}: {key} differs from the reference render"
 
 
@@ -193,8 +246,8 @@ _, stock = render({})
 stock_env = workloads(stock)
 assert stock_env["dispatcher"] is None, "S1: a token-less install must not render the dispatcher"
 for workload in ("worker", "api"):
-    assert named(stock_env[workload], *LEGACY_NAMES) == LEGACY_BOT, (
-        f"S1: {workload} must render exactly today's SLACK_BOT_TOKEN; got "
+    assert named(stock_env[workload], *LEGACY_NAMES) == [], (
+        f"S1: {workload} must hold no Slack token; got "
         f"{named(stock_env[workload], *LEGACY_NAMES)!r}"
     )
 assert identity_env_names(stock) == [], f"S1: stock render carries {identity_env_names(stock)!r}"
@@ -206,7 +259,7 @@ assert named(plain_env["dispatcher"], *LEGACY_NAMES) == LEGACY_DISPATCHER, (
     f"S2: dispatcher Slack env changed: {named(plain_env['dispatcher'], *LEGACY_NAMES)!r}"
 )
 for workload in ("worker", "api"):
-    assert named(plain_env[workload], *LEGACY_NAMES) == LEGACY_BOT, f"S2: {workload} changed"
+    assert named(plain_env[workload], *LEGACY_NAMES) == [], f"S2: {workload} changed"
 assert identity_env_names(plain) == [], f"S2: plain render carries {identity_env_names(plain)!r}"
 
 # --- S3: the single block by existingSecret, with a custom key --------------
@@ -221,20 +274,18 @@ assert named(byo_env["dispatcher"], *LEGACY_NAMES) == [
     entry("SLACK_SIGNING_SECRET", "slack-sign", "slackSigningSecret"),
 ], f"S3: dispatcher BYO env changed: {named(byo_env['dispatcher'], *LEGACY_NAMES)!r}"
 for workload in ("worker", "api"):
-    assert named(byo_env[workload], *LEGACY_NAMES) == [
-        entry("SLACK_BOT_TOKEN", "slack-main", "slackBotToken")
-    ], f"S3: {workload} BYO env changed"
+    assert named(byo_env[workload], *LEGACY_NAMES) == [], f"S3: {workload} BYO env changed"
 assert identity_env_names(byo) == []
 
 # --- S4: an empty or null list is the stock shape, fresh and on upgrade -----
 for label, identities in (("S4 empty", []), ("S4 null", None)):
     _, output = render({"dispatcher": {"slack": {**PLAIN["dispatcher"]["slack"], "identities": identities}}})
-    same_objects(label, plain, output)
+    same_objects(label, plain, output, is_upgrade=False)
 _, plain_upgrade = render(PLAIN, "--is-upgrade")
 _, empty_upgrade = render(
     {"dispatcher": {"slack": {**PLAIN["dispatcher"]["slack"], "identities": []}}}, "--is-upgrade"
 )
-same_objects("S4 upgrade", plain_upgrade, empty_upgrade)
+same_objects("S4 upgrade", plain_upgrade, empty_upgrade, is_upgrade=True)
 
 # --- T1: the block plus two listed identities -------------------------------
 _, block_only = render(slack(**BLOCK_REFS))
@@ -267,9 +318,11 @@ assert [e for e in two_env["dispatcher"] if e["name"].startswith(INDEXED)] == in
 )
 declarations = {}
 for workload in ("worker", "api"):
-    assert named(two_env[workload], *LEGACY_NAMES) == BLOCK_BOT, f"T1: {workload} default moved"
+    assert named(two_env[workload], *LEGACY_NAMES) == [], f"T1: {workload} holds Slack tokens"
     rendered = [e for e in two_env[workload] if e["name"].startswith(INDEXED)]
-    assert rendered == indexed_bot, f"T1: {workload} must get bot tokens only; got {rendered!r}"
+    assert rendered == [], f"T1: {workload} holds indexed Slack tokens; got {rendered!r}"
+assert named(two_env["gateway"], *LEGACY_NAMES) == BLOCK_BOT
+assert [e for e in two_env["gateway"] if e["name"].startswith(INDEXED)] == indexed_bot
 for workload, entries in two_env.items():
     values = [e["value"] for e in entries if e["name"] == DECLARATION]
     assert len(values) == 1, f"T1: {workload} must carry exactly one {DECLARATION}; got {values!r}"
@@ -285,8 +338,9 @@ same_objects(
     "T1 everything else",
     block_only,
     two,
+    is_upgrade=False,
     ignore={("Deployment", "acme-curie-dispatcher"), ("Deployment", "acme-curie-worker"),
-            ("Deployment", "acme-curie-api")},
+            ("Deployment", "acme-curie-api"), ("Deployment", "acme-curie-channel-gateway")},
 )
 (work / "rendered-declaration.txt").write_text(declarations["worker"])
 (work / "expected-declaration.json").write_text(json.dumps(expected_declaration))
@@ -306,9 +360,7 @@ assert named(only_env["dispatcher"], *LEGACY_NAMES) == [
     entry("SLACK_BOT_TOKEN", "slack-main", "slackBotToken"),
 ], f"T2: a listed default takes the legacy names: {named(only_env['dispatcher'], *LEGACY_NAMES)!r}"
 for workload in ("worker", "api"):
-    assert named(only_env[workload], *LEGACY_NAMES) == [
-        entry("SLACK_BOT_TOKEN", "slack-main", "slackBotToken")
-    ], f"T2: {workload} default bot token must follow the listed default"
+    assert named(only_env[workload], *LEGACY_NAMES) == [], f"T2: {workload} default bot token must follow the listed default"
 # The one shape where `default` takes the legacy names from a list entry and
 # has no signing secret; the real parser reads it below, beside T1's.
 t2_expected = [
@@ -433,12 +485,12 @@ _, mutant_output = render(
     with_extra_env(with_block(SECOND), "worker", "CURIE_SLACK_BOT_TOKEN__0"), source=mutant
 )
 duplicates = named(env(mutant_output, "worker.yaml", "worker"), "CURIE_SLACK_BOT_TOKEN__0")
-assert len(duplicates) == 2, f"M: without the reservation the mutant must emit two; got {duplicates!r}"
+assert len(duplicates) == 1, f"M: without the reservation the mutant must expose a worker token; got {duplicates!r}"
 
 print(f"OK: {count} Helm renders; stock, plain, BYO, empty and null lists render today's objects; "
-      "two identities render by Secret reference into all three workloads from one declaration; "
+      "provider credentials render only in gateway and dispatcher; declarations agree; "
       "every malformed shape and every extraEnv shadow refused; removed-reservation control "
-      "reproduced two entries")
+      "reproduced a forbidden worker credential")
 PY
 
 # Round-trip the EXACT rendered declaration through the REAL Settings of all
@@ -467,7 +519,7 @@ os.environ["CURIE_API_KEY"] = "example-api-key"
 os.environ["CURIE_APPROVAL_CHAT_ATTESTER_SECRET"] = "example-attester-secret"
 
 from curie_api.config import Settings
-from curie_dispatcher.config import DispatcherConfig
+from curie_channel_gateway.slack.config import DispatcherConfig
 from curie_worker.config import WorkerConfig
 from aci_protocol.slack_identities import IDENTITY_NAME_PATTERN
 from curie_worker.sandbox.types import filter_agent_child_env
@@ -496,12 +548,10 @@ def parse_everywhere(label, declaration, want):
 t2_parsed = parse_everywhere("T2", t2_rendered, t2_expected)
 parsed = parse_everywhere("T1", rendered, expected)
 
-token_names = {
-    name for name in worker_env_names
-    if name == "SLACK_BOT_TOKEN" or name.startswith("CURIE_SLACK_BOT_TOKEN__")
-}
-assert len(token_names) == 3, f"expected the worker's three bot tokens, got {token_names!r}"
-child = filter_agent_child_env({name: "placeholder" for name in worker_env_names})
+token_names = {identity["bot_token_env"] for identity in expected}
+assert len(token_names) == 3
+assert token_names.isdisjoint(worker_env_names), "worker rendered provider credentials"
+child = filter_agent_child_env({name: "placeholder" for name in set(worker_env_names) | token_names})
 assert token_names.isdisjoint(child), f"the sandbox filter let {token_names & child.keys()!r} through"
 
 # The negative direction: an env name outside the filtered shapes must be

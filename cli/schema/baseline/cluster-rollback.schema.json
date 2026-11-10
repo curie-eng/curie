@@ -1,8 +1,8 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://schemas.curietech.ai/cli/cluster-rollback/v1.json",
+  "$id": "https://schemas.curietech.ai/cli/cluster-rollback/v1.1.json",
   "title": "curie cluster rollback --json",
-  "description": "The agent-facing payload of `curie cluster rollback`: the dry-run plan, an operator abort, or the completed rollback. `skipped` lists only the revisions passed over that were ineligible (status not `deployed`/`superseded`); an explicit `--revision` can step over eligible revisions too, and those are deliberately not listed here. `forced` is true only when `--allow-failed-revision` admitted the target.",
+  "description": "The agent-facing payload of `curie cluster rollback`: the dry-run plan, an operator abort, or the completed rollback. `skipped` lists only the revisions passed over that were ineligible (status not `deployed`/`superseded`); an explicit `--revision` can step over eligible revisions too, and those are deliberately not listed here. `forced` is true only when `--allow-failed-revision` admitted the target. `resumed_interrupted_rollback` is true only when a bare rollback finished an interrupted `pending-rollback` toward its recorded target instead of restoring the serving revision.",
   "$defs": {
     "dryRun": {
       "type": "object",
@@ -67,6 +67,9 @@
           }
         },
         "forced": {
+          "type": "boolean"
+        },
+        "resumed_interrupted_rollback": {
           "type": "boolean"
         }
       },

@@ -1,9 +1,15 @@
 import { test, expect, type Page } from "@playwright/test";
+import { stubConsoleSession } from "./support/consoleSession";
 
 // FX2 headline: the wired agent-detail surface. Open an agent from the Agents
 // list, see its active version's SKILL.md, edit it, and ship a new version via
 // the create-path sequence (POST version + PUT bundle + activate deployment).
 // The backend is stubbed with real-shaped responses, so this runs stackless.
+
+// The console sits behind the login gate (#1047): sign this spec in.
+test.beforeEach(async ({ page }) => {
+  await stubConsoleSession(page);
+});
 
 const AGENT = { id: "a1", name: "deal-desk", channels: [{ kind: "slack", address: "C0123ABCD" }], created_at: "2026-07-01T00:00:00Z" };
 

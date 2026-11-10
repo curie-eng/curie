@@ -1,0 +1,150 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.curietech.ai/cli/remediation-qualification/v1.0.json",
+  "title": "curie <tier> remediation-qualification --json",
+  "description": "The agent-facing payload of `curie <tier> remediation-qualification <record|start-run|show-run>` (AUTOMATED-REMEDIATION-22): `record` prints the qualification record as the API's `RemediationQualificationOut` carries it; `start-run` and `show-run` print the verifier run as `remediation-verifier-run.schema.json` describes. The operator principal is recorded by subject and its token is never printed. Refusals are the shared error object.",
+  "$defs": {
+    "qualification": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "agent_id",
+        "hook",
+        "action",
+        "generation",
+        "connector",
+        "tool",
+        "connector_digest",
+        "verifier_sha256",
+        "reversibility",
+        "recorded_by",
+        "worst_case",
+        "evidence",
+        "created_at"
+      ],
+      "properties": {
+        "id": {
+          "type": "string"
+        },
+        "agent_id": {
+          "type": "string"
+        },
+        "hook": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "action": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "generation": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "connector": {
+          "type": "string"
+        },
+        "tool": {
+          "type": "string"
+        },
+        "connector_digest": {
+          "type": "string"
+        },
+        "verifier_sha256": {
+          "type": "string"
+        },
+        "reversibility": {
+          "type": "string"
+        },
+        "recorded_by": {
+          "type": "string",
+          "description": "The operator principal's subject, never its token."
+        },
+        "worst_case": {
+          "type": "string"
+        },
+        "evidence": {
+          "type": "object"
+        },
+        "created_at": {
+          "type": "string"
+        }
+      }
+    },
+    "run": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "qualification_id",
+        "hook",
+        "action",
+        "target",
+        "generation",
+        "started_by",
+        "started_at",
+        "outcome",
+        "decided_at"
+      ],
+      "properties": {
+        "id": {
+          "type": "string"
+        },
+        "qualification_id": {
+          "type": "string"
+        },
+        "hook": {
+          "type": "string"
+        },
+        "action": {
+          "type": "string"
+        },
+        "target": {
+          "type": [
+            "string",
+            "integer",
+            "number",
+            "boolean"
+          ]
+        },
+        "generation": {
+          "type": "string"
+        },
+        "started_by": {
+          "type": "string",
+          "description": "The operator principal's subject, never its token."
+        },
+        "started_at": {
+          "type": "string"
+        },
+        "outcome": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "decided_at": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      }
+    }
+  },
+  "oneOf": [
+    {
+      "$ref": "#/$defs/qualification"
+    },
+    {
+      "$ref": "#/$defs/run"
+    }
+  ]
+}

@@ -10,9 +10,15 @@ agent to create.
 
 from fastapi import APIRouter, Depends, HTTPException, status
 
+from curie_api.schemas.deployments import (
+    ListedTargets,
+    NamedTarget,
+    ResolvedTarget,
+    ResolveTargetRequest,
+)
+
 from ..auth import require_api_key
 from ..deploy_target_parsing import parse_deploy_targets as _parse
-from ..schemas import ListedTargets, NamedTarget, ResolvedTarget, ResolveTargetRequest
 
 router = APIRouter(tags=["deploy-targets"], dependencies=[Depends(require_api_key)])
 

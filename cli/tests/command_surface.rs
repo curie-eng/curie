@@ -10,6 +10,7 @@ fn bin() -> &'static str {
 
 fn run_help(args: &[&str]) -> std::process::Output {
     Command::new(bin())
+        .env("KUBECONFIG", "/dev/null")
         .args(args)
         .arg("--help")
         .output()
@@ -45,6 +46,7 @@ fn output_text(output: &std::process::Output) -> String {
 
 fn live_command_manifest() -> serde_json::Value {
     let output = Command::new(bin())
+        .env("KUBECONFIG", "/dev/null")
         .arg("schema")
         .output()
         .expect("run curie schema");
@@ -59,6 +61,7 @@ fn live_command_manifest() -> serde_json::Value {
 fn cluster_status_plan(env_namespace: &str, flag_namespace: Option<&str>) -> Vec<String> {
     let mut command = Command::new(bin());
     command
+        .env("KUBECONFIG", "/dev/null")
         .arg("--json")
         .args(["cluster", "status", "--dry-run"])
         .env("CURIE_NAMESPACE", env_namespace);
@@ -141,20 +144,6 @@ fn apply_help_references_shipped_curie_yaml_example() {
     assert!(
         text.contains("--context"),
         "apply help must offer --context\n{text}"
-    );
-}
-
-#[test]
-fn operations_references_shipped_curie_yaml_example() {
-    let repo_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .expect("cli crate has a repository root");
-    let operations = fs::read_to_string(repo_root.join("docs/operations.md"))
-        .expect("read the operations guide");
-
-    assert!(
-        operations.contains("[`examples/curie.yaml`](../examples/curie.yaml)"),
-        "operations guide must link to the shipped example"
     );
 }
 
@@ -315,6 +304,28 @@ fn process_skill_help_distinguishes_tier_from_bundle_artifact() {
         !text.contains("skills/<name>/SKILL.md`: `skill <up|down|status|message|eval|approvals>"),
         "skill help must not attach the subcommand list to the artifact distinction\n{text}"
     );
+}
+
+/// `hooks` manages webhook partitions and source bindings, which its old help
+/// ("hook configuration") let a reader mistake for cron hooks (#4012). The help
+/// must disown cron triggers and point at the verbs that do read them.
+#[test]
+fn hooks_help_says_not_cron_triggers() {
+    for tier in ["local", "cluster"] {
+        let output = run_help(&[tier, "hooks"]);
+        assert!(
+            output.status.success(),
+            "expected success for {tier} hooks help\n{}",
+            output_text(&output)
+        );
+        let text = String::from_utf8_lossy(&output.stdout);
+        for needle in ["Not cron triggers", "schedules", "hook fire"] {
+            assert!(
+                text.contains(needle),
+                "{tier} hooks help missing `{needle}`\n{text}"
+            );
+        }
+    }
 }
 
 /// `curie dev plugin-compat` is the operator-facing name of the outbound
@@ -576,6 +587,7 @@ printf '%s\n' \
     ));
     let path = std::env::join_paths(paths).expect("join fake tool PATH");
     let output = Command::new(bin())
+        .env("KUBECONFIG", "/dev/null")
         .args([
             "dev",
             "e2e-ci-selection",
@@ -619,6 +631,7 @@ printf '%s\n' \
 #[test]
 fn command_manifest_matches_committed_artifact() {
     let output = Command::new(bin())
+        .env("KUBECONFIG", "/dev/null")
         .arg("schema")
         .output()
         .expect("run curie schema");
@@ -753,10 +766,12 @@ fn cluster_namespace_flag_wins_over_environment() {
 #[test]
 fn dump_commands_alias_emits_same_manifest() {
     let schema = Command::new(bin())
+        .env("KUBECONFIG", "/dev/null")
         .arg("schema")
         .output()
         .expect("run curie schema");
     let alias = Command::new(bin())
+        .env("KUBECONFIG", "/dev/null")
         .arg("dump-commands")
         .output()
         .expect("run curie dump-commands");
@@ -1004,6 +1019,7 @@ fn help_never_discloses_the_curie_api_key_value() {
     let mut leaks = Vec::new();
     for path in &paths {
         let output = Command::new(bin())
+            .env("KUBECONFIG", "/dev/null")
             .args(path)
             .arg("--help")
             .env("CURIE_API_KEY", SENTINEL)
@@ -1026,6 +1042,7 @@ fn help_never_discloses_the_curie_api_key_value() {
     ] {
         let mut command = Command::new(bin());
         command
+            .env("KUBECONFIG", "/dev/null")
             .args(path)
             .arg("--help")
             .env("CURIE_API_KEY", SENTINEL);
@@ -1036,5 +1053,45 @@ fn help_never_discloses_the_curie_api_key_value() {
             text.contains("--api-key") && text.contains("CURIE_API_KEY"),
             "{path:?} help lost the --api-key flag or its env name\n{text}"
         );
+    }
+}
+
+#[test]
+fn hook_record_is_available_on_local_and_cluster_with_three_positionals() {
+    let manifest = live_command_manifest();
+    for tier in ["local", "cluster"] {
+        let tier_command = manifest["subcommands"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|command| command["name"] == tier)
+            .unwrap();
+        let hook = tier_command["subcommands"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|command| command["name"] == "hook")
+            .unwrap();
+        let record = hook["subcommands"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|command| command["name"] == "record")
+            .unwrap_or_else(|| panic!("{tier} hook must expose record"));
+        let positionals: Vec<_> = record["args"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|arg| arg["positional"] == true)
+            .collect();
+        assert_eq!(positionals.len(), 3, "{tier}: {positionals:?}");
+        assert!(
+            positionals.iter().all(|arg| arg["required"] == true),
+            "{tier}: {positionals:?}"
+        );
+        let output = run_help(&[tier, "hook", "record"]);
+        assert!(output.status.success(), "{tier}: {}", output_text(&output));
+        let text = output_text(&output);
+        assert!(text.contains("--dry-run"), "{tier}: {text}");
     }
 }

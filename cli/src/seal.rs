@@ -67,6 +67,14 @@ impl crate::ui::CliOutput for SealOutput {
     }
 }
 
+/// Exact connector names Curie keeps for its own platform MCP servers: `curie`
+/// is the approval server, `curie-state` the durable state server, and
+/// `curie-slack` the granted Slack capability server.
+///
+/// Shared connector-name cases exercise both the plugin-format validator and
+/// this CLI validator through their production boundaries.
+const RESERVED_CONNECTOR_NAMES: [&str; 3] = ["curie", "curie-state", "curie-slack"];
+
 /// A connector name becomes a Kubernetes resource name component.
 fn validate_connector(name: &str) -> Result<()> {
     let is_alphanumeric = |byte: u8| byte.is_ascii_lowercase() || byte.is_ascii_digit();
@@ -88,6 +96,13 @@ fn validate_connector(name: &str) -> Result<()> {
             "connector name `{name}` must be a lower case RFC 1123 label of at most 40 characters"
         ))
         .with_fix("use lower case letters, digits, and internal hyphens, for example grafana")
+        .into());
+    }
+    if RESERVED_CONNECTOR_NAMES.contains(&name) {
+        return Err(crate::exit::CliError::usage(format!(
+            "connector name `{name}` is reserved for Curie's own platform MCP server"
+        ))
+        .with_fix(format!("rename the connector, for example `{name}-tools`"))
         .into());
     }
     Ok(())
@@ -194,6 +209,46 @@ pub async fn seal(opts: SealOpts) -> Result<SealOutput> {
 mod tests {
     use super::*;
     use crate::sealing;
+
+    #[test]
+    fn connector_name_vectors_match_the_plugin_format_behavior() {
+        let vectors: serde_json::Value =
+            serde_json::from_str(include_str!("../../tests/vectors/connector-fields.json"))
+                .expect("connector parity vectors must be valid JSON");
+        let cases = vectors["connector_names"]
+            .as_array()
+            .expect("connector name cases must be present");
+        assert!(!cases.is_empty(), "connector name cases must not be empty");
+        for case in cases {
+            assert_eq!(case.as_object().expect("case must be an object").len(), 2);
+            let name = case["name"]
+                .as_str()
+                .expect("connector name must be a string");
+            let allowed = case["allowed"]
+                .as_bool()
+                .expect("expected outcome must be boolean");
+            let result = validate_connector(name);
+            assert_eq!(result.is_ok(), allowed, "connector {name}: {result:?}");
+            if let Err(error) = result {
+                assert!(
+                    format!("{error:#}").contains(name),
+                    "refusal must name {name}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn validate_connector_refuses_reserved_names_and_keeps_prefixed_names_legal() {
+        for name in RESERVED_CONNECTOR_NAMES {
+            let err = validate_connector(name).expect_err("reserved name must be refused");
+            assert!(
+                format!("{err:#}").contains(name),
+                "the refusal must name the connector: {err:#}"
+            );
+        }
+        assert!(validate_connector("curie-docs").is_ok());
+    }
 
     #[test]
     fn the_snippet_merges_under_a_connector_without_replacing_siblings() {

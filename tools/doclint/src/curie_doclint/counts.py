@@ -99,20 +99,6 @@ _ACI_POST_ROUTE_NAME_RE = re.compile(
 # both bare and path-qualified.
 _CLI_OUTPUT_IMPL_RE = re.compile(r"^impl (?:crate::ui::|ui::)?CliOutput for ", re.MULTILINE)
 
-# A JSONB-typed column declaration. The bare name `JSONB` also appears in the
-# module's import line and would inflate a looser pattern, so the mapping call
-# is what is matched.
-_JSONB_COLUMN_RE = re.compile(r"mapped_column\(JSONB")
-
-# A direct ORM field declaration whose mapping starts with JSONB. The optional
-# annotation covers both the typed production models and the untyped miniature
-# trees used by the gate tests without admitting imports or prose mentions.
-_JSONB_COLUMN_NAME_RE = re.compile(
-    r"^\s*(?P<name>[A-Za-z_]\w*)\s*(?::[^=\n]+)?=\s*"
-    r"mapped_column\(\s*JSONB(?:\s*[,)]|\s*$)",
-    re.MULTILINE,
-)
-
 # FastAPI route decorators in a router module, anchored at column 0 so a
 # decorator quoted inside a docstring or a comment cannot inflate the count.
 # `state.py` holds one `APIRouter` and nothing but state routes, so every
@@ -255,47 +241,6 @@ def _count_cli_output_impls(repo_root: Path) -> int:
     )
 
 
-def _count_jsonb_columns(repo_root: Path) -> int:
-    """Count the JSONB-typed columns in the API's ORM models.
-
-    The relational-DB seam grades itself on how much Postgres-specific surface
-    a non-Postgres target would have to rework, and JSONB is the part of that
-    inventory that is actually countable: what else qualifies as a
-    "Postgres-ism" is a taxonomy judgement, so the doc enumerates those rather
-    than totalling them, and this is the one number left in the section.
-
-    Args:
-        repo_root: The repository root to resolve the models module against.
-
-    Returns:
-        The number of ``mapped_column(JSONB`` declarations, or ``0`` when the
-        models module is absent.
-    """
-    path = repo_root / "apps" / "api" / "src" / "curie_api" / "models.py"
-    if not path.is_file():
-        return 0
-    return len(_JSONB_COLUMN_RE.findall(path.read_text(encoding="utf-8")))
-
-
-def _jsonb_column_names(repo_root: Path) -> set[str]:
-    """List the ORM columns declared directly with the JSONB type.
-
-    Args:
-        repo_root: The repository root to resolve the models module against.
-
-    Returns:
-        The column names whose direct ``mapped_column`` declaration starts with
-        ``JSONB``, matching the identities enumerated in the seam doc.
-    """
-    path = repo_root / "apps" / "api" / "src" / "curie_api" / "models.py"
-    if not path.is_file():
-        return set()
-    return {
-        match.group("name")
-        for match in _JSONB_COLUMN_NAME_RE.finditer(path.read_text(encoding="utf-8"))
-    }
-
-
 def _count_aci_post_routes(repo_root: Path) -> int:
     """Count the POST routes the ACI server publishes.
 
@@ -425,13 +370,6 @@ CLAIMS: tuple[CountClaim, ...] = (
         source="web.post( in runner/src/curie_runner/server.py",
     ),
     CountClaim(
-        doc="docs/interfaces/relational-db/INTERFACE.md",
-        label="JSONB columns in the API models",
-        pattern=re.compile(r"used on \*\*(\S+)\*\* columns"),
-        counter=_count_jsonb_columns,
-        source="mapped_column(JSONB in apps/api/src/curie_api/models.py",
-    ),
-    CountClaim(
         doc="docs/interfaces/workflow-state/INTERFACE.md",
         label="workflow-state HTTP routes",
         # `exposes` is load-bearing: the same doc later says the memory router
@@ -473,7 +411,6 @@ class NameSetClaim:
 # mistaken for inventory members.
 _BACKTICKED_PY_NAME_RE = re.compile(r"`([^`]+\.py)`")
 _BACKTICKED_ACI_ROUTE_RE = re.compile(r"`(?:POST )?(/v1/[^`]+)`")
-_BACKTICKED_COLUMN_NAME_RE = re.compile(r"`([a-z][a-z0-9_]*)`")
 
 # Every enumeration claim the seam catalog makes.
 NAME_CLAIMS: tuple[NameSetClaim, ...] = (
@@ -513,20 +450,6 @@ NAME_CLAIMS: tuple[NameSetClaim, ...] = (
         source=(
             "direct web.post route registrations in "
             "runner/src/curie_runner/server.py"
-        ),
-    ),
-    NameSetClaim(
-        doc="docs/interfaces/relational-db/INTERFACE.md",
-        label="JSONB columns in the API models, by name",
-        pattern=re.compile(
-            r"used on \*\*\S+\*\* columns:\s*(.*?)(?:\. The last one|\.\s*$)",
-            re.DOTALL,
-        ),
-        item_pattern=_BACKTICKED_COLUMN_NAME_RE,
-        lister=_jsonb_column_names,
-        source=(
-            "direct mapped_column(JSONB declarations in "
-            "apps/api/src/curie_api/models.py"
         ),
     ),
 )

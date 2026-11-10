@@ -96,16 +96,30 @@ Helm and the deployed release with `up`, `upgrade`, `status`, `down`, `comms`, `
   test against `apps/worker/schema/eval-cases.example.json` is the enforcement.
   A shape change here lands in the same reviewed change as the Python models,
   not independently.
-- **`skill up` records container state in `.curie/runner.json`** (gitignored
-  by the scaffold) so `skill message`/`skill eval`/`skill status`/`skill down` can resolve the
-  running container from the bundle directory alone. Do not add a second
-  state-tracking file for the same purpose. `.curie/` holds one other thing:
-  `skill up` packs the bundle into a content-addressed snapshot at
-  `.curie/snapshots/<digest>/` and mounts THAT read-only for the runner's
-  lifetime, so a host edit does not reach a running runner (`skill up
-  --replace` is the way to pick one up; `skill status --json` reports the loaded
-  `bundle_digest`). The snapshot is owned by the record and released by `skill
-  down`; `evals/cases.json` is deliberately still read live from source.
+**`skill up` records container state in `.curie/runner.json`** (gitignored
+by the scaffold) so `skill message`/`skill eval`/`skill status`/`skill down` can
+resolve the running container from the bundle directory alone. Do not add a
+second state-tracking file for the same purpose. `skill up` packs the bundle
+into a content-addressed snapshot at `.curie/snapshots/<digest>/`, copies its
+bytes through the Docker API into a private named volume, and mounts the volume
+read only for the runner's lifetime. A host edit does not reach a running
+runner; rerun `skill up` to load a changed snapshot. `skill status --json`
+reports the loaded `bundle_digest`. `skill down`, replacement, and failed
+startup release the owned volume and snapshot; `evals/cases.json` is still read
+live from source.
+
+**Docker inputs always cross the Docker API.** `skill check`, runner startup,
+model sweeps, and `curie try` use seeded named volumes even when Docker is
+local. `DOCKER_PUBLISHED_HOST` selects only the address used to reach published
+ports, defaulting to `localhost`; `DOCKER_HOST` selects the daemon independently.
+No client workspace or `TMPDIR` needs to exist on the daemon host. Hosted
+connector `secret_files` use per-run named volumes seeded from in-memory
+credentials, with each file mounted read only at its exact declared destination
+through a volume subpath. Files have mode `0400` and UID/GID `65532:65532`.
+The dev Compose collector config is copied into its image through a small build
+context; generated release Compose keeps inline content configs. Docker socket
+mounts and kind's `/dev/kmsg` mount still refer to daemon-host resources.
+
 - **The local skill verbs stay fully offline once their local inputs exist; the
   local and cluster target verbs are the exception.** `init`, `skill up`,
   `skill down`, `skill status`, `skill message`, and `skill eval` must keep
@@ -161,9 +175,9 @@ Helm and the deployed release with `up`, `upgrade`, `status`, `down`, `comms`, `
   `CURIE_MODEL_CREDENTIALS`) flows through this path.
   `curie cluster comms --slack` uses the same `SecretSet` masking for
   `SLACK_APP_TOKEN` and `SLACK_BOT_TOKEN`, while `--disconnect --dry-run`
-  prints only the empty clears. After the helm upgrade it also rolls the
-  worker (and, on connect, the dispatcher) via `kubectl rollout restart` +
-  `rollout status` so the Secret-backed tokens go live.
+  prints only the empty clears. After the Helm upgrade it rolls every Slack
+  token consumer, the channel gateway and dispatcher on connect, via
+  `kubectl rollout restart` + `rollout status` so the Secret-backed tokens go live.
 - **`local comms` shares the same Slack flag surface, but tokens travel through
   compose env, not argv.** `curie local comms --slack` reads
   `SLACK_APP_TOKEN` and `SLACK_BOT_TOKEN`, passes them through a masked
@@ -179,7 +193,7 @@ Helm and the deployed release with `up`, `upgrade`, `status`, `down`, `comms`, `
   `cli/api-mirrors.json`** (as a `mirrors` entry with its allowlisted field
   omissions, or a `non_mirrors` entry with a one-line reason). `curie dev
   field-parity` is the check (#691).
-- **A new `Deserialize` struct in `cli/src/commands.rs` or `cli/src/spec.rs`
+- **A new `Deserialize` struct in `cli/src/commands/` or `cli/src/spec.rs`
   that hand-mirrors the frozen `packages/plugin-format` manifest shape must be
   declared in `cli/plugin-format-mirrors.json`** the same way (`mirrors` with
   omissions, or `non_mirrors` with a reason) -- this is a SIBLING gate to the

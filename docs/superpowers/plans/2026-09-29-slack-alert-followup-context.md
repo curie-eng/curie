@@ -86,7 +86,7 @@ Run:
 TEST_VALKEY_HOST=127.0.0.1 TEST_VALKEY_PORT="$TEST_VALKEY_PORT" uv run pytest -q apps/dispatcher/tests/test_thread_context.py apps/dispatcher/tests/test_queue.py -k 'thread_context or own_bot_root or duplicate_human_reply or non_bot_parent'
 ```
 
-Expected: FAIL because `curie_dispatcher.thread_context` and handler integration do not exist.
+Expected: FAIL because `curie_channel_gateway.slack.thread_context` and handler integration do not exist.
 
 - [ ] **Step 4: Commit the failing tests**
 
@@ -100,9 +100,9 @@ git commit -m "test: pin Slack alert follow-up context"
 ### Task 2: Resolve and inject the exact bot-authored root safely
 
 **Files:**
-- Create: `apps/dispatcher/src/curie_dispatcher/thread_context.py`
-- Modify: `apps/dispatcher/src/curie_dispatcher/handlers.py`
-- Modify: `apps/dispatcher/src/curie_dispatcher/config.py`
+- Create: `packages/channel-gateway/src/curie_channel_gateway/slack/thread_context.py`
+- Modify: `packages/channel-gateway/src/curie_channel_gateway/slack/handlers.py`
+- Modify: `packages/channel-gateway/src/curie_channel_gateway/slack/config.py`
 - Modify: `apps/dispatcher/README.md`
 - Test: `apps/dispatcher/tests/test_thread_context.py`
 - Test: `apps/worker/tests/test_workspace.py`
@@ -156,8 +156,8 @@ Run:
 
 ```bash
 TEST_VALKEY_HOST=127.0.0.1 TEST_VALKEY_PORT="$TEST_VALKEY_PORT" uv run pytest -q apps/dispatcher/tests
-uv run ruff check apps/dispatcher/src/curie_dispatcher/thread_context.py apps/dispatcher/src/curie_dispatcher/handlers.py apps/dispatcher/src/curie_dispatcher/config.py apps/dispatcher/tests/test_thread_context.py apps/dispatcher/tests/test_queue.py
-uv run mypy apps/dispatcher/src/curie_dispatcher/thread_context.py apps/dispatcher/src/curie_dispatcher/handlers.py apps/dispatcher/src/curie_dispatcher/config.py
+uv run ruff check packages/channel-gateway/src/curie_channel_gateway/slack/thread_context.py packages/channel-gateway/src/curie_channel_gateway/slack/handlers.py packages/channel-gateway/src/curie_channel_gateway/slack/config.py apps/dispatcher/tests/test_thread_context.py apps/dispatcher/tests/test_queue.py
+uv run mypy packages/channel-gateway/src/curie_channel_gateway/slack/thread_context.py packages/channel-gateway/src/curie_channel_gateway/slack/handlers.py packages/channel-gateway/src/curie_channel_gateway/slack/config.py
 bash scripts/check-docs.sh
 ```
 
@@ -176,7 +176,7 @@ Expected: the verifier observes the baseline failure and candidate pass in separ
 - [ ] **Step 7: Commit the implementation**
 
 ```bash
-git add apps/dispatcher/src/curie_dispatcher/thread_context.py apps/dispatcher/src/curie_dispatcher/handlers.py apps/dispatcher/src/curie_dispatcher/config.py apps/dispatcher/README.md apps/dispatcher/tests/test_thread_context.py apps/dispatcher/tests/test_queue.py
+git add packages/channel-gateway/src/curie_channel_gateway/slack/thread_context.py packages/channel-gateway/src/curie_channel_gateway/slack/handlers.py packages/channel-gateway/src/curie_channel_gateway/slack/config.py apps/dispatcher/README.md apps/dispatcher/tests/test_thread_context.py apps/dispatcher/tests/test_queue.py
 git commit -m "fix: carry bot alert context into Slack replies"
 ```
 

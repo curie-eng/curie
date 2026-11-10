@@ -13,6 +13,7 @@ fn bin() -> &'static str {
 
 fn cluster_message_dry_run(extra: &[&str]) -> String {
     let output = Command::new(bin())
+        .env("KUBECONFIG", "/dev/null")
         .args(["cluster", "message", "hello"])
         .args(extra)
         .args(["--listen-host", "127.0.0.1", "--dry-run"])
@@ -44,6 +45,7 @@ fn cluster_eval_dry_run(extra: &[&str]) -> String {
     let dir = tempfile::tempdir().expect("create eval cases directory");
     let cases = write_eval_cases(dir.path());
     let output = Command::new(bin())
+        .env("KUBECONFIG", dir.path().join("kubeconfig"))
         .args(["cluster", "eval"])
         .args(extra)
         .args([

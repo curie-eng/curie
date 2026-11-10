@@ -27,9 +27,13 @@ from claude_agent_sdk import (
 from claude_agent_sdk.types import PermissionResultDeny, ToolPermissionContext
 from curie_runner import __main__ as boot
 from curie_runner.__main__ import build_runner
-from curie_runner.approval import ApprovalGate, build_approval_hook, build_can_use_tool
+from curie_runner.approval import ApprovalGate
 from curie_runner.config import RunnerConfig
 from curie_runner.fake import FakeModelSession
+from curie_runner.harness.claude.approval import (
+    build_approval_hook,
+    build_can_use_tool,
+)
 from curie_runner.session import SessionRunner
 from plugin_format import PLATFORM_PUBLISH_TOOL_NAME
 from starlette.requests import Request
@@ -150,6 +154,9 @@ async def _api(
         await server.close()
 
 
+_GITHUB_BOOT_ENV = {"CURIE_REPO_ORIGIN": "https://github.com", "CURIE_REPO_PATH": REPO}
+
+
 async def _boot(
     tmp_path: Path,
     repo: Path,
@@ -157,6 +164,7 @@ async def _boot(
     monkeypatch: pytest.MonkeyPatch,
     *,
     sdk_env: dict[str, str] | None = None,
+    boot_env: dict[str, str] | None = None,
 ) -> SessionRunner:
     bundle = tmp_path / "bundle"
     (bundle / ".claude-plugin").mkdir(parents=True)
@@ -171,6 +179,9 @@ async def _boot(
             "CURIE_SESSION_ID": "publicationtest",
             "CURIE_SANDBOX_ID": "publicationbox",
             "CURIE_BUDGET": '{"max_output_tokens_per_run":10000,"max_usd_per_day":1.0}',
+            # The worker sets the workspace's origin and path on every claim
+            # (ADR 0197); a test opts out by passing an explicit mapping.
+            **(_GITHUB_BOOT_ENV if boot_env is None else boot_env),
         }
     )
     # Production boot performs synchronous capability discovery with anyio.run.
@@ -314,6 +325,53 @@ def test_empty_diff_refusal_shares_one_decision_and_finishes_done(
     anyio.run(go)
 
 
+@pytest.mark.parametrize("trusted", [True, False])
+def test_snapshot_trusts_the_boot_env_code_host_and_deep_path(
+    tmp_path: Path,
+    workspace: tuple[Path, str],
+    monkeypatch: pytest.MonkeyPatch,
+    trusted: bool,
+) -> None:
+    """ADR 0197: a deep GitLab path is checked against the boot env's trust.
+
+    With CURIE_REPO_ORIGIN and CURIE_REPO_PATH the snapshot succeeds and the
+    remote comparison runs; without them the same workspace is refused before
+    any remote read, since no GitHub default remains.
+    """
+
+    async def go() -> None:
+        repo, head = workspace
+        _git(
+            repo,
+            "remote",
+            "set-url",
+            "origin",
+            "https://gitlab.example.com/platform/team/infra.git",
+        )
+        boot_env = (
+            {
+                "CURIE_REPO_ORIGIN": "https://gitlab.example.com",
+                "CURIE_REPO_PATH": "platform/team/infra",
+            }
+            if trusted
+            else {}
+        )
+        async with _api([(200, {"result": "unchanged"})]) as (url, calls):
+            runner = await _boot(tmp_path, repo, url, monkeypatch, boot_env=boot_env)
+            gate = runner._approval_gate
+            assert gate is not None
+            model = _PublicationModel(gate, [("publish1", {"title": TITLE, "body": BODY})])
+            frames = await _run(runner, model, _event(_context(head, url)))
+            if trusted:
+                _assert_refusal(model, gate, frames, "no_change")
+                assert len(calls) == 1
+            else:
+                _assert_refusal(model, gate, frames, "precheck_unavailable")
+                assert calls == []
+
+    anyio.run(go)
+
+
 @pytest.mark.parametrize("body", [None, "", " \n\t"])
 def test_blank_body_refuses_before_snapshot_or_remote_read(
     tmp_path: Path,
@@ -336,6 +394,67 @@ def test_blank_body_refuses_before_snapshot_or_remote_read(
             model = _PublicationModel(gate, [("blankbody", proposal)])
             frames = await _run(runner, model, _event(_context(head, url)))
             _assert_refusal(model, gate, frames, "body_required")
+            assert calls == []
+
+    anyio.run(go)
+
+
+_TITLE_REQUIRED = (
+    "title_required: Provide a pull request title of 1 to 240 characters and retry."
+)
+_BODY_TOO_LARGE = (
+    "body_too_large: Shorten the publication body to at most 65536 characters and retry."
+)
+
+
+@pytest.mark.parametrize("title", [None, "", "  \n\t", "x" * 241])
+def test_missing_or_bad_title_refuses_and_keeps_the_turn_open(
+    tmp_path: Path,
+    workspace: tuple[Path, str],
+    monkeypatch: pytest.MonkeyPatch,
+    title: str | None,
+) -> None:
+    """#4460: a malformed title is a continuing refusal, not a halted turn.
+
+    Red before the fix: the precheck raised ``_MalformedPublication`` out of
+    ``decide``, the hook answered ``continue_`` False with a ``stopReason`` and
+    the callback denied with ``interrupt=True``, so a model that obeyed the
+    refusal's own "retry" instruction could never issue the corrected call.
+    """
+
+    async def go() -> None:
+        repo, head = workspace
+        async with _api([(503, {"detail": "precheck_unavailable"})]) as (url, calls):
+            runner = await _boot(tmp_path, repo, url, monkeypatch)
+            gate = runner._approval_gate
+            assert gate is not None
+            proposal: dict[str, Any] = {"body": BODY}
+            if title is not None:
+                proposal["title"] = title
+            model = _PublicationModel(gate, [("titleless", proposal)])
+            frames = await _run(runner, model, _event(_context(head, url)))
+            _assert_refusal(model, gate, frames, _TITLE_REQUIRED)
+            assert calls == []
+
+    anyio.run(go)
+
+
+def test_oversized_body_refuses_and_keeps_the_turn_open(
+    tmp_path: Path,
+    workspace: tuple[Path, str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def go() -> None:
+        repo, head = workspace
+        async with _api([(503, {"detail": "precheck_unavailable"})]) as (url, calls):
+            runner = await _boot(tmp_path, repo, url, monkeypatch)
+            gate = runner._approval_gate
+            assert gate is not None
+            model = _PublicationModel(
+                gate, [("hugebody", {"title": TITLE, "body": "b" * 65_537})]
+            )
+            frames = await _run(runner, model, _event(_context(head, url)))
+            _assert_refusal(model, gate, frames, _BODY_TOO_LARGE)
             assert calls == []
 
     anyio.run(go)
@@ -529,7 +648,7 @@ def test_local_commits_cannot_be_mistaken_for_an_unchanged_publication(
 ) -> None:
     async def go() -> None:
         repo, head = workspace
-        (repo / "README.md").write_text("Local commit which is outside the working tree patch.\n")
+        (repo / "README.md").write_text("Local commit on top of the prepared head.\n")
         _git(repo, "add", "README.md")
         _git(
             repo,
@@ -548,11 +667,13 @@ def test_local_commits_cannot_be_mistaken_for_an_unchanged_publication(
             assert gate is not None
             model = _PublicationModel(gate, [("localcommit", {"title": TITLE, "body": BODY})])
             frames = await _run(runner, model, _event(_context(head, url)))
-            assert model.permissions[0].interrupt is False
-            assert "head" in model.permissions[0].message.casefold()
-            assert frames[-1]["status"] == "done"
-            assert gate.pending_summary is None
-            assert gate.pending_halt is False
+            # #5230: the commit on top of the prepared head is the publication
+            # candidate, so it reaches approval without a metadata comparison.
+            assert "head_changed" not in model.permissions[0].message
+            assert model.permissions[0].interrupt is True
+            assert frames[-1]["status"] == "awaiting-approval"
+            assert gate.publication_title == TITLE
+            assert gate.publication_body == BODY
             assert calls == []
 
     anyio.run(go)

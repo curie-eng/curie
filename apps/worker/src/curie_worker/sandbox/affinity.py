@@ -9,12 +9,27 @@ against the compose-stack instance.
 
 from __future__ import annotations
 
+import json
 import time
+from collections.abc import Mapping
+from dataclasses import asdict
+from decimal import Decimal
+from typing import Literal
 
 import redis
+from curie_internal.keyspace import SANDBOX_KEY_PREFIX_DEFAULT
 from redis.asyncio import Redis as AsyncRedis
 
-from .types import PressureCandidate, PressureScanResult, RouteRecord, RouteState
+from .quota import resource_vector
+from .types import (
+    EXECUTOR_THREAD_KEY_PREFIX,
+    AdmissionReservation,
+    CapacityInventory,
+    PressureCandidate,
+    PressureScanResult,
+    RouteRecord,
+    RouteState,
+)
 
 # SCAN COUNT is an approximate database work hint, not a result limit. The
 # caller permits eight pages, roughly 65,000 examined database keys, while its
@@ -75,6 +90,77 @@ redis.call('DEL', KEYS[1])
 return 1
 """
 
+_ADMISSION_RESERVE = """
+local function digits(value, scale)
+    local whole, fraction = string.match(value, '^(%d+)%.?(%d*)$')
+    if not whole then error('invalid admission quantity') end
+    return whole .. fraction .. string.rep('0', scale - #fraction)
+end
+local function sum(a, b)
+    local af = string.match(a, '%.(%d+)$') or ''
+    local bf = string.match(b, '%.(%d+)$') or ''
+    local scale = math.max(#af, #bf)
+    a, b = digits(a, scale), digits(b, scale)
+    local width = math.max(#a, #b)
+    a, b = string.rep('0', width - #a) .. a, string.rep('0', width - #b) .. b
+    local carry, result = 0, ''
+    for i = width, 1, -1 do
+        local n = tonumber(string.sub(a, i, i)) + tonumber(string.sub(b, i, i)) + carry
+        result, carry = tostring(n % 10) .. result, math.floor(n / 10)
+    end
+    result = tostring(carry) .. result
+    if scale > 0 then
+        result = string.sub(result, 1, #result - scale) .. '.' .. string.sub(result, -scale)
+    end
+    result = string.gsub(result, '^0+(%d)', '%1')
+    return result
+end
+local function greater(a, b)
+    local af = string.match(a, '%.(%d+)$') or ''
+    local bf = string.match(b, '%.(%d+)$') or ''
+    local scale = math.max(#af, #bf)
+    a, b = digits(a, scale), digits(b, scale)
+    a, b = string.gsub(a, '^0+', ''), string.gsub(b, '^0+', '')
+    return #a > #b or (#a == #b and a > b)
+end
+local occupied, hard = cjson.decode(ARGV[1]), cjson.decode(ARGV[2])
+local suspended, observed_at = cjson.decode(ARGV[5]), tonumber(ARGV[6])
+local rows = redis.call('HGETALL', KEYS[1])
+for i = 1, #rows, 2 do
+    local name, row = rows[i], cjson.decode(rows[i + 1])
+    local current = occupied[name] or {}
+    if not (suspended[name] and observed_at > row.updated_at and row.state == 'bound') then
+        for key, value in pairs(row.resources) do
+            if greater(value, current[key] or '0') then current[key] = value end
+        end
+    end
+    occupied[name] = current
+end
+local used = {}
+for key, _ in pairs(hard) do used[key] = '0' end
+for _, resources in pairs(occupied) do
+    for key, _ in pairs(hard) do used[key] = sum(used[key], resources[key] or '0') end
+end
+local row = cjson.decode(ARGV[4])
+local accepted = redis.call('HEXISTS', KEYS[1], ARGV[3]) == 0
+for key, limit in pairs(hard) do
+    if greater(sum(used[key], row.resources[key] or '0'), limit) then accepted = false end
+end
+if accepted and ARGV[7] == 'reserve' then redis.call('HSET', KEYS[1], ARGV[3], ARGV[4]) end
+return cjson.encode({accepted=accepted, used=used})
+"""
+
+_ADMISSION_UPDATE = """
+local raw = redis.call('HGET', KEYS[1], ARGV[1])
+if not raw then return 0 end
+local row, expected = cjson.decode(raw), cjson.decode(ARGV[2])
+if row.owner_token ~= expected.owner_token or row.state ~= expected.state
+    or row.updated_at ~= expected.updated_at then return 0 end
+if ARGV[3] == '' then redis.call('HDEL', KEYS[1], ARGV[1])
+else redis.call('HSET', KEYS[1], ARGV[1], ARGV[3]) end
+return 1
+"""
+
 
 class AffinityStore:
     """Thread-to-sandbox route records with atomic acquire and guarded delete."""
@@ -84,7 +170,7 @@ class AffinityStore:
         client: redis.Redis,
         *,
         pressure_client: AsyncRedis,
-        key_prefix: str = "curie:sandbox",
+        key_prefix: str = SANDBOX_KEY_PREFIX_DEFAULT,
     ) -> None:
         self._redis = client
         self._pressure_redis = pressure_client
@@ -92,9 +178,183 @@ class AffinityStore:
         self._delete_if_claim = client.register_script(_DELETE_IF_CLAIM)
         self._replace_if_generation = client.register_script(_REPLACE_IF_GENERATION)
         self._touch_if_live_claim = client.register_script(_TOUCH_IF_LIVE_CLAIM)
+        self._admission_reserve = client.register_script(_ADMISSION_RESERVE)
+        self._admission_update = client.register_script(_ADMISSION_UPDATE)
+
+    def _admission_key(self, namespace: str, quota_name: str) -> str:
+        return f"{self._prefix}:admission:{namespace}:{quota_name}"
+
+    def admission_entries(self, namespace: str, quota_name: str) -> dict[str, AdmissionReservation]:
+        rows = self._redis.hgetall(self._admission_key(namespace, quota_name))
+        result = {}
+        for name, raw in rows.items():
+            row = AdmissionReservation(**json.loads(raw))
+            if row.state not in {"preparing", "submitted", "bound", "retiring"}:
+                raise ValueError("invalid sandbox admission state")
+            resource_vector(row.resources)
+            result[name.decode() if isinstance(name, bytes) else str(name)] = row
+        return result
+
+    def admission_update(
+        self,
+        namespace: str,
+        quota_name: str,
+        name: str,
+        expected: AdmissionReservation,
+        replacement: AdmissionReservation | None,
+    ) -> bool:
+        return bool(self._admission_update(
+            keys=[self._admission_key(namespace, quota_name)],
+            args=[
+                name, json.dumps(asdict(expected)),
+                "" if replacement is None else json.dumps(asdict(replacement)),
+            ],
+        ))
+
+    def reserve_admission(
+        self,
+        namespace: str,
+        quota_name: str,
+        name: str,
+        reservation: AdmissionReservation,
+        hard: Mapping[str, str],
+        inventory: CapacityInventory,
+        *,
+        operation: Literal["reserve", "inspect"],
+    ) -> tuple[bool, dict[str, str]]:
+        """Charge observed occupants and every outstanding reservation atomically."""
+
+        occupied: dict[str, dict[str, str]] = {}
+        owners_with_pods = {pod.claim_name for pod in inventory.pods.values()}
+        suspended = {
+            claim: True for claim in inventory.suspended_claims if claim not in owners_with_pods
+        }
+        identities = inventory.claims | frozenset(
+            owner if owner is not None else f"sandbox:{name}"
+            for name, owner in inventory.sandboxes.items()
+        )
+        for identity in identities:
+            if identity in suspended:
+                continue
+            footprint = inventory.claim_resources.get(identity)
+            if footprint is not None:
+                occupied[identity] = resource_vector(footprint)
+        pod_totals: dict[str, dict[str, Decimal]] = {}
+        for uid, pod in inventory.pods.items():
+            identity = pod.claim_name or f"pod:{uid}"
+            totals = pod_totals.setdefault(identity, {})
+            for key, value in resource_vector(pod.resources).items():
+                totals[key] = totals.get(key, Decimal(0)) + Decimal(value)
+        for identity, totals in pod_totals.items():
+            current = occupied.setdefault(identity, {})
+            for key, amount in totals.items():
+                current[key] = format(max(amount, Decimal(current.get(key, "0"))), "f")
+        known = self.admission_entries(namespace, quota_name)
+        if any(
+            identity not in occupied and identity not in suspended and identity not in known
+            for identity in identities
+        ):
+            raise ValueError("sandbox admission inventory lacks an occupied footprint")
+        raw = self._admission_reserve(
+            keys=[self._admission_key(namespace, quota_name)],
+            args=[json.dumps(occupied), json.dumps(resource_vector(hard)), name,
+                  json.dumps(asdict(reservation)), json.dumps(suspended), inventory.observed_at,
+                  operation],
+        )
+        result = json.loads(raw)
+        return bool(result["accepted"]), result["used"]
 
     def _key(self, thread_key: str) -> str:
         return f"{self._prefix}:route:{thread_key}"
+
+    def _claim_cred_key(self, claim_name: str) -> str:
+        return f"{self._prefix}:claim-cred:{claim_name}"
+
+    def _claim_cred_retiring_key(self, claim_name: str) -> str:
+        return f"{self._prefix}:claim-cred-retiring:{claim_name}"
+
+    def mark_claim_credential_retiring(self, claim_name: str, *, ttl_s: int) -> None:
+        self._redis.set(self._claim_cred_retiring_key(claim_name), "1", nx=True, ex=ttl_s)
+
+    def claim_credential_retiring(self, claim_name: str) -> bool:
+        return bool(self._redis.exists(self._claim_cred_retiring_key(claim_name)))
+
+    def remember_claim_credential(
+        self, claim_name: str, agent: str, credential: str, *, ttl_s: int
+    ) -> None:
+        """Keep a deleted claim's boot credential until the API accepts the report."""
+
+        self._redis.set(
+            self._claim_cred_key(claim_name),
+            f"{agent}\n{credential}",
+            ex=ttl_s,
+        )
+
+    def claim_credential(self, claim_name: str) -> tuple[str, str] | None:
+        raw = self._redis.get(self._claim_cred_key(claim_name))
+        if raw is None:
+            return None
+        text = raw.decode() if isinstance(raw, bytes) else str(raw)
+        agent, separator, credential = text.partition("\n")
+        if not separator or not agent or not credential:
+            return None
+        return agent, credential
+
+    def forget_claim_credential(self, claim_name: str) -> None:
+        self._redis.delete(
+            self._claim_cred_key(claim_name), self._claim_cred_retiring_key(claim_name)
+        )
+
+    # A Docker-enabled claim's daemon (ADR 0217). The marker, valued with the
+    # daemon namespace, is written before the first daemon object and has no
+    # TTL: it tells handle-less retirement that the claim has a daemon. The
+    # client credential is what the worker pings with, since it cannot read
+    # Secrets back; it lives no longer than the claim can. Never logged.
+
+    def _daemon_marker_key(self, claim_name: str) -> str:
+        return f"{self._prefix}:daemon-claim:{claim_name}"
+
+    def _daemon_cred_key(self, claim_name: str) -> str:
+        return f"{self._prefix}:daemon-tls:{claim_name}"
+
+    def mark_daemon(self, claim_name: str, namespace: str) -> bool:
+        """Associate ``claim_name`` with a daemon; False when it already was."""
+
+        return bool(self._redis.set(self._daemon_marker_key(claim_name), namespace, nx=True))
+
+    def daemon_namespace(self, claim_name: str) -> str | None:
+        raw = self._redis.get(self._daemon_marker_key(claim_name))
+        return None if raw is None else raw.decode() if isinstance(raw, bytes) else str(raw)
+
+    def remember_daemon_credential(
+        self, claim_name: str, files: Mapping[str, str], *, ttl_s: int
+    ) -> None:
+        self._redis.set(self._daemon_cred_key(claim_name), json.dumps(dict(files)), ex=ttl_s)
+
+    def daemon_credential(self, claim_name: str) -> dict[str, str] | None:
+        raw = self._redis.get(self._daemon_cred_key(claim_name))
+        return None if raw is None else dict(json.loads(raw))
+
+    def forget_daemon(
+        self, claim_name: str, *, marker: bool = True, credential: bool = True
+    ) -> None:
+        keys = [self._daemon_marker_key(claim_name)] if marker else []
+        keys += [self._daemon_cred_key(claim_name)] if credential else []
+        if keys:
+            self._redis.delete(*keys)
+
+    def iter_claim_credentials(self) -> list[tuple[str, str, str]]:
+        """``(claim_name, agent, credential)`` for reports that have not landed."""
+
+        found: list[tuple[str, str, str]] = []
+        prefix = f"{self._prefix}:claim-cred:"
+        for key in self._redis.scan_iter(match=f"{prefix}*"):
+            name = key.decode() if isinstance(key, bytes) else str(key)
+            claim_name = name.removeprefix(prefix)
+            pair = self.claim_credential(claim_name)
+            if pair is not None:
+                found.append((claim_name, pair[0], pair[1]))
+        return found
 
     def get(self, thread_key: str) -> RouteRecord | None:
         raw = self._redis.get(self._key(thread_key))
@@ -108,9 +368,7 @@ class AffinityStore:
         lost the race (an existing route wins; the caller should adopt it and
         release its own claim)."""
 
-        result = self._redis.set(
-            self._key(thread_key), record.to_json(), nx=True, ex=ttl_seconds
-        )
+        result = self._redis.set(self._key(thread_key), record.to_json(), nx=True, ex=ttl_seconds)
         return bool(result)
 
     def replace(self, thread_key: str, record: RouteRecord, ttl_seconds: int) -> None:
@@ -146,9 +404,7 @@ class AffinityStore:
 
         return bool(self._redis.expire(self._key(thread_key), ttl_seconds))
 
-    def touch_if_live_claim(
-        self, thread_key: str, claim_name: str, ttl_seconds: int
-    ) -> bool:
+    def touch_if_live_claim(self, thread_key: str, claim_name: str, ttl_seconds: int) -> bool:
         """Refresh the TTL only of a LIVE route that still names ``claim_name``."""
 
         return bool(
@@ -198,8 +454,7 @@ class AffinityStore:
             if keys:
                 pipeline = self._pressure_redis.pipeline(transaction=False)
                 key_texts = [
-                    key.decode("utf-8") if isinstance(key, bytes) else str(key)
-                    for key in keys
+                    key.decode("utf-8") if isinstance(key, bytes) else str(key) for key in keys
                 ]
                 for key_text in key_texts:
                     pipeline.get(key_text)
@@ -278,9 +533,31 @@ class AffinityStore:
         inventory = self.route_inventory(thread_keys_scan_count)
         return set().union(*inventory.values())
 
-    def route_inventory(
-        self, thread_keys_scan_count: int = 500
-    ) -> dict[RouteState, set[str]]:
+    def executor_routes(self, scan_count: int = 500) -> dict[str, RouteRecord]:
+        """Every unexpired executor route (``action-exec:<id>``) by thread key.
+
+        @spec AUTOMATED-REMEDIATION-12: what a live executor loop sweeps after a
+        holder crashed. Turn routes are never matched.
+        """
+
+        route_prefix = f"{self._prefix}:route:"
+        routes: dict[str, RouteRecord] = {}
+        for key in self._redis.scan_iter(
+            match=f"{route_prefix}{EXECUTOR_THREAD_KEY_PREFIX}*", count=scan_count
+        ):
+            key_text = key.decode("utf-8") if isinstance(key, bytes) else str(key)
+            raw = self._redis.get(key)
+            if raw is None:
+                continue
+            text = raw.decode("utf-8") if isinstance(raw, bytes) else str(raw)
+            try:
+                record = RouteRecord.from_json(text)
+            except (ValueError, TypeError, KeyError):
+                continue
+            routes[key_text[len(route_prefix) :]] = record
+        return routes
+
+    def route_inventory(self, thread_keys_scan_count: int = 500) -> dict[RouteState, set[str]]:
         """Authoritative unexpired route claims grouped by persisted state."""
 
         inventory: dict[RouteState, set[str]] = {state: set() for state in RouteState}

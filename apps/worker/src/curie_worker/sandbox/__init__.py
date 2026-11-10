@@ -11,13 +11,25 @@ Public surface for F1 (the worker kernel):
 from .affinity import AffinityStore
 from .docker import DockerError, DockerSandboxClient, RunnerHardening
 from .k8s import KubernetesSandboxClient
+from .static import (
+    StaticPoolSandboxClient,
+    StaticShellSlot,
+    parse_static_shells,
+    shell_ssl_context,
+)
 from .substrate import HISTORY_ENV, SESSION_ENV, SandboxSubstrate
 from .types import (
     AGENT_LABEL,
+    EXECUTOR_THREAD_KEY_PREFIX,
     MANAGED_BY_LABEL,
     MANAGED_BY_VALUE,
     THREAD_HASH_LABEL,
+    AdmissionConfig,
+    AdmissionRejection,
     CapacityExhaustedError,
+    CapacityInventory,
+    CapacityPod,
+    CapacityRejection,
     ClaimTimeoutError,
     ClaimView,
     MissingAgentPoolError,
@@ -25,6 +37,8 @@ from .types import (
     PressureCandidate,
     PressureScanResult,
     QuotaRejection,
+    QuotaStatus,
+    RepoRunnerPoolRefused,
     RouteChangedError,
     RouteRecord,
     RouteState,
@@ -37,10 +51,18 @@ from .types import (
     UnschedulableClaimError,
     agent_warm_pool_name,
     claim_warm_pool,
+    is_executor_thread_key,
 )
 
 __all__ = [
+    "AdmissionConfig",
+    "AdmissionRejection",
+    "CapacityInventory",
+    "CapacityPod",
+    "CapacityRejection",
+    "QuotaStatus",
     "AGENT_LABEL",
+    "EXECUTOR_THREAD_KEY_PREFIX",
     "HISTORY_ENV",
     "MANAGED_BY_LABEL",
     "MANAGED_BY_VALUE",
@@ -48,6 +70,7 @@ __all__ = [
     "THREAD_HASH_LABEL",
     "agent_warm_pool_name",
     "claim_warm_pool",
+    "is_executor_thread_key",
     "AffinityStore",
     "CapacityExhaustedError",
     "MissingAgentPoolError",
@@ -56,11 +79,16 @@ __all__ = [
     "ClaimView",
     "DockerError",
     "DockerSandboxClient",
+    "StaticPoolSandboxClient",
+    "StaticShellSlot",
+    "parse_static_shells",
+    "shell_ssl_context",
     "KubernetesSandboxClient",
     "NoRouteError",
     "PressureCandidate",
     "PressureScanResult",
     "QuotaRejection",
+    "RepoRunnerPoolRefused",
     "RouteChangedError",
     "RouteRecord",
     "RouteState",

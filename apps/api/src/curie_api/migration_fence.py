@@ -38,7 +38,7 @@ Two things are exposed:
    **The order is `agent_channels` THEN `approvals`, and it is chosen for the
    writers.** One `LOCK TABLE` over two tables is not simultaneous: PostgreSQL
    takes them in list order. Every writer that touches both tables takes them
-   in that same order -- `crud.delete_agent` deletes the agent's
+   in that same order -- `crud.agents.delete_agent` deletes the agent's
    `agent_channels` rows and then the agent, whose cascade reaches `approvals`,
    and publication create writes the binding before the approval. Fencing
    `approvals` first let the fence hold `approvals` while such a writer held
@@ -94,7 +94,7 @@ AUDIT = "approval_audit_entries"
 
 #: Locked in this order by every revision that fences, so two of them can never
 #: deadlock against each other -- and `agent_channels` FIRST, because every
-#: writer that touches both tables (`crud.delete_agent`, publication create)
+#: writer that touches both tables (`crud.agents.delete_agent`, publication create)
 #: takes them in that order. See the module docstring for the reader cycle this
 #: order cannot exclude and why deadlock detection resolving it is safe.
 FENCED_TABLES = (CHANNELS, APPROVALS)
@@ -249,7 +249,7 @@ def _blockers(conn: Connection, own_pid: int | None) -> str:
     )
     try:
         rows = [row for row in conn.execute(query).all() if row.pid != own_pid]
-    except Exception:  # pragma: no cover - diagnostics must never mask the refusal
+    except Exception:  # noqa: BLE001 - pragma: no cover - diagnostics must never mask the refusal
         return "the holder could not be read from pg_locks"
     if not rows:
         return "no other session held either table when the fence was attempted"
@@ -276,7 +276,7 @@ def fence_identity_tables(conn: Connection, *, lock_timeout_ms: int | None = Non
     own_pid: int | None = None
     try:
         own_pid = conn.execute(sa.text("SELECT pg_backend_pid()")).scalar_one()
-    except Exception:  # pragma: no cover - only affects the diagnostic filter
+    except Exception:  # noqa: BLE001 - pragma: no cover - only affects the diagnostic filter
         own_pid = None
 
     schema = _schema()

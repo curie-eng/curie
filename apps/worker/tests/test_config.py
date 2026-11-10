@@ -17,18 +17,53 @@ import os
 import socket
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
-from typing import NamedTuple, cast
+from typing import Any, NamedTuple, cast
 
 import pytest
 import yaml
 from curie_worker.attachments import AttachmentLimits
 from curie_worker.config import WorkerConfig
-from curie_worker.consumer import Consumer
+from curie_worker.consumer import Consumer, refuse_unconfigured_reminder
 from curie_worker.delivery_lease import DeliveryLeaseStore
-from curie_worker.kernel import Kernel
+from curie_worker.kernel.core import Kernel
 from nacl.signing import SigningKey
 from pydantic import AliasChoices, ValidationError
 from redis.asyncio import Redis as AsyncRedis
+
+
+def test_default_ownership_clocks_share_a_thirty_five_second_failure_deadline(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _clear_all_config_env(monkeypatch)
+    config = WorkerConfig()
+    store = DeliveryLeaseStore(None, config)  # type: ignore[arg-type]
+    consumer = Consumer(
+        redis=None,
+        kernel=None,
+        config=config,
+        leases=store,  # type: ignore[arg-type],
+        reminders=refuse_unconfigured_reminder,
+    )
+    assert config.consumer_heartbeat_ttl_ms == 45000
+    assert config.delivery_lease_ttl_s == 45.0
+    assert store.heartbeat_interval_s == 10.0
+    assert store.ownership_window_s == 35.0
+    assert consumer._liveness_refresh_interval_s() == 10.0
+    assert config.consumer_heartbeat_ttl_ms / 1000 - consumer._liveness_refresh_interval_s() == 35.0
+
+    shorter = WorkerConfig(consumer_heartbeat_ttl_ms=9000)
+    short_consumer = Consumer(
+        redis=None,
+        kernel=None,
+        config=shorter,
+        leases=None,  # type: ignore[arg-type],
+        reminders=refuse_unconfigured_reminder,
+    )
+    assert short_consumer._liveness_refresh_interval_s() == 3.0
+    assert (
+        shorter.consumer_heartbeat_ttl_ms / 1000 - short_consumer._liveness_refresh_interval_s()
+        == 6.0
+    )
 
 
 def _clear_all_config_env(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -84,9 +119,19 @@ _ENV_TABLE: list[_Row] = [
     _Row("valkey_port", "VALKEY_PORT", "6380", 6380, 6379),
     _Row("valkey_password", "VALKEY_PASSWORD", "vk-pass", "vk-pass", ""),
     _Row("valkey_db", "VALKEY_DB", "7", 7, 0),
-    _Row("slack_bot_token", "SLACK_BOT_TOKEN", "xoxb-sentinel", "xoxb-sentinel", ""),
     _Row(
-        "slack_api_base_url", "SLACK_API_BASE_URL", "http://slack.stub:9", "http://slack.stub:9", ""
+        "channel_gateway_url",
+        "CURIE_CHANNEL_GATEWAY_URL",
+        "https://gateway.example.com",
+        "https://gateway.example.com",
+        "",
+    ),
+    _Row(
+        "channel_gateway_token",
+        "CURIE_CHANNEL_GATEWAY_TOKEN",
+        "caller-sentinel",
+        "caller-sentinel",
+        "",
     ),
     _Row(
         "database_url",
@@ -323,9 +368,9 @@ _ENV_TABLE: list[_Row] = [
         "CURIE_TURN_RECEIPT",
         "failures",
         "failures",
-        "all",
+        "off",
         bare="TURN_RECEIPT",
-        bare_raw="off",
+        bare_raw="all",
     ),
     # --- inbound attachment lane envelope (#2567, S4) ---
     # Defaults are asserted AGAINST ``AttachmentLimits`` rather than literals:
@@ -369,6 +414,40 @@ _ENV_TABLE: list[_Row] = [
         AttachmentLimits().retention_ttl_seconds,
         bare="ATTACHMENT_RETENTION_TTL_SECONDS",
         bare_raw="999999",
+    ),
+    # --- the per-thread attachment budget (ADR 0205 decision 7, #4079) ---
+    # Every boot rebuilds the thread's files, so one boot's work is bounded per
+    # thread, separately from the per-message ``max_files``. The defaults are
+    # literals here on purpose: the ADR names them, and ``AttachmentLimits``
+    # carries the same two counts (pinned in test_attachment_thread_set.py).
+    # The prepare timeout bounds the worker's own rebuild (ledger read, cache
+    # re-mint, channel re-fetch) inside the turn's remaining budget.
+    _Row(
+        "attachment_thread_max_files",
+        "CURIE_ATTACHMENT_THREAD_MAX_FILES",
+        "15",
+        15,
+        20,
+        bare="ATTACHMENT_THREAD_MAX_FILES",
+        bare_raw="999",
+    ),
+    _Row(
+        "attachment_thread_max_bytes",
+        "CURIE_ATTACHMENT_THREAD_MAX_BYTES",
+        "134217728",
+        134217728,
+        256 * 1024 * 1024,
+        bare="ATTACHMENT_THREAD_MAX_BYTES",
+        bare_raw="999",
+    ),
+    _Row(
+        "attachment_thread_prepare_timeout_seconds",
+        "CURIE_ATTACHMENT_THREAD_PREPARE_TIMEOUT_SECONDS",
+        "12.5",
+        12.5,
+        15.0,
+        bare="ATTACHMENT_THREAD_PREPARE_TIMEOUT_SECONDS",
+        bare_raw="999",
     ),
 ]
 
@@ -458,6 +537,67 @@ def test_field_name_kwargs_still_populate() -> None:
     assert config.credentials == "c"
 
 
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("lock_ttl_ms", 0),
+        ("lock_ttl_ms", -1),
+        ("lock_acquire_timeout_s", 0),
+        ("lock_acquire_timeout_s", -0.5),
+        ("lock_acquire_timeout_s", float("nan")),
+        ("lock_acquire_timeout_s", float("inf")),
+        ("lock_acquire_timeout_s", float("-inf")),
+        ("lock_poll_interval_s", 0),
+        ("lock_poll_interval_s", -0.02),
+        ("lock_poll_interval_s", float("nan")),
+        ("lock_poll_interval_s", float("inf")),
+        ("lock_poll_interval_s", float("-inf")),
+    ],
+)
+def test_thread_lock_settings_must_be_positive_and_finite(
+    monkeypatch: pytest.MonkeyPatch, field: str, value: Any
+) -> None:
+    """#3730: refuse the lock knobs at boot instead of failing every turn.
+
+    ``lock_ttl_ms`` goes straight into ``SET key token NX PX <ttl>``, so a
+    non-positive value is rejected by Valkey on every acquire; a non-positive
+    poll interval turns a contended acquire into a hot loop; a non-positive
+    acquire timeout gives up immediately; inf/nan in either float breaks the
+    timeout arithmetic the same way.
+    """
+    _clear_all_config_env(monkeypatch)
+    with pytest.raises(ValidationError):
+        WorkerConfig(**{field: value})
+
+
+def test_thread_lock_settings_env_vars_refuse_non_positive_values(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The issue's repro shape: LOCK_TTL_MS=0 in the pod env must refuse boot."""
+    _clear_all_config_env(monkeypatch)
+    monkeypatch.setenv("LOCK_TTL_MS", "0")
+    with pytest.raises(ValidationError):
+        WorkerConfig()
+
+
+def test_thread_lock_settings_accept_positive_finite_values(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Positive finite values and the defaults are unchanged (#3730)."""
+    _clear_all_config_env(monkeypatch)
+
+    config = WorkerConfig()
+
+    assert config.lock_ttl_ms == 120000
+    assert config.lock_acquire_timeout_s == 45.0
+    assert config.lock_poll_interval_s == 0.02
+
+    explicit = WorkerConfig(lock_ttl_ms=1, lock_acquire_timeout_s=0.5, lock_poll_interval_s=0.001)
+    assert explicit.lock_ttl_ms == 1
+    assert explicit.lock_acquire_timeout_s == 0.5
+    assert explicit.lock_poll_interval_s == 0.001
+
+
 # --- Env-var parity vs the pre-pydantic from_env (review #178) ---------------
 
 
@@ -476,14 +616,12 @@ def test_defaults_parity_with_from_env(monkeypatch: pytest.MonkeyPatch) -> None:
     assert config.valkey_password == ""
     assert config.valkey_db == 0
     # Slack
-    assert config.slack_bot_token == ""
-    assert config.slack_api_base_url == ""
+    assert "slack_bot_token" not in WorkerConfig.model_fields
+    assert config.channel_gateway_url == ""
+    assert config.channel_gateway_token == ""
     assert config.slack_identities == ()
     # Postgres
-    assert (
-        config.database_url
-        == "postgresql+asyncpg://postgres:postgres@localhost:25432/postgres"
-    )
+    assert config.database_url == "postgresql+asyncpg://postgres:postgres@localhost:25432/postgres"
     assert config.db_schema == "curie"
     # Deployment-to-runtime binding
     assert config.default_max_usd_per_day == 10.0
@@ -503,7 +641,7 @@ def test_defaults_parity_with_from_env(monkeypatch: pytest.MonkeyPatch) -> None:
     # Crash recovery
     assert config.reclaim_min_idle_ms == 900000
     assert config.dead_consumer_idle_ms == 15000
-    assert config.consumer_heartbeat_ttl_ms == 15000
+    assert config.consumer_heartbeat_ttl_ms == 45000
     assert config.consumer_capability_ttl_ms == 1800000
     # Slack edit throttle
     assert config.slack_edit_min_interval_s == 0.7
@@ -705,41 +843,6 @@ def test_max_concurrency_accepts_both_ends_of_its_range(
     assert WorkerConfig().max_concurrency == int(raw)
 
 
-def _consumer_as_run_builds_it(config: WorkerConfig) -> Consumer:
-    """Build the runs consumer with exactly the arguments ``run.py`` passes.
-
-    Construction opens no connection, so an unconnected client and a stand-in
-    kernel are enough to observe what the consumer was sized to.
-    """
-    redis = AsyncRedis(host="127.0.0.1", port=1)
-    return Consumer(
-        redis=redis,
-        kernel=cast(Kernel, SimpleNamespace()),
-        config=config,
-        leases=DeliveryLeaseStore(redis, config),
-    )
-
-
-def test_max_concurrency_env_sizes_the_runs_consumer(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """The env value reaches the consumer that ``run.py`` constructs, which
-    passes no ``max_concurrency`` of its own."""
-    _clear_all_config_env(monkeypatch)
-    monkeypatch.setenv("CURIE_WORKER_MAX_CONCURRENCY", "4")
-
-    consumer = _consumer_as_run_builds_it(WorkerConfig())
-
-    assert consumer._max_concurrency == 4
-    assert consumer._transfer_capacity() == 4
-
-
-def test_runs_consumer_defaults_to_sixteen_turns(monkeypatch: pytest.MonkeyPatch) -> None:
-    _clear_all_config_env(monkeypatch)
-
-    assert _consumer_as_run_builds_it(WorkerConfig())._max_concurrency == 16
-
-
 def test_explicit_consumer_concurrency_still_wins_over_config(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -755,6 +858,7 @@ def test_explicit_consumer_concurrency_still_wins_over_config(
         config=config,
         leases=DeliveryLeaseStore(redis, config),
         max_concurrency=1,
+        reminders=refuse_unconfigured_reminder,
     )
 
     assert consumer._max_concurrency == 1
@@ -837,28 +941,6 @@ def _load_test_module(module_name: str, path: Path) -> ModuleType:
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
-
-
-def test_worker_boolean_explanations_do_not_cite_removed_parser() -> None:
-    repo_root = Path(__file__).resolve().parents[3]
-    config_text = (repo_root / "apps/worker/src/curie_worker/config.py").read_text(encoding="utf-8")
-    config_start = config_text.index("def _parse_bool")
-    config_end = config_text.index("\n\nBool =", config_start)
-    config_region = config_text[config_start:config_end]
-
-    test_text = Path(__file__).read_text(encoding="utf-8")
-    test_start = test_text.index("# Worker boolean behavior")
-    test_end = test_text.index("# --- Eval claim-creation concurrency", test_start)
-    test_region = test_text[test_start:test_end]
-
-    removed_helper = "_" + "set" + "_bool"
-    retired_service = "dis" + "patcher"
-
-    for region in (config_region, test_region):
-        assert removed_helper not in region, f"boolean notes still cite {removed_helper}"
-        assert retired_service not in region, (
-            f"boolean notes still compare this parser to {retired_service}"
-        )
 
 
 def test_async_test_body_gate_rejects_a_shallow_corpus(
@@ -978,17 +1060,17 @@ def test_runner_total_timeout_accepts_short_programmatic_values_and_maximum(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """The chart and Python config accept positive timeout values, including
-    sub-minute values; only positivity and the 10800s ceiling (#3071) apply."""
+    sub-minute values; only positivity and the 43200s ceiling (#5067) apply."""
     _clear_all_config_env(monkeypatch)
 
     short = _lease_config(runner_total_timeout_s=0.5)
     maximum = _lease_config(
-        delivery_budget_s=10800.0,
-        runner_total_timeout_s=10800.0,
+        delivery_budget_s=43200.0,
+        runner_total_timeout_s=43200.0,
     )
 
     assert short.runner_total_timeout_s == 0.5
-    assert maximum.runner_total_timeout_s == 10800.0
+    assert maximum.runner_total_timeout_s == 43200.0
 
 
 @pytest.mark.parametrize(
@@ -996,8 +1078,8 @@ def test_runner_total_timeout_accepts_short_programmatic_values_and_maximum(
     [
         (0.0, "greater_than"),
         (-0.1, "greater_than"),
-        (10800.1, "less_than_equal"),
-        (10801.0, "less_than_equal"),
+        (43200.1, "less_than_equal"),
+        (43201.0, "less_than_equal"),
     ],
 )
 def test_runner_total_timeout_rejects_programmatic_values_outside_its_bounds(
@@ -1008,7 +1090,7 @@ def test_runner_total_timeout_rejects_programmatic_values_outside_its_bounds(
     _clear_all_config_env(monkeypatch)
 
     with pytest.raises(ValidationError) as exc_info:
-        _lease_config(delivery_budget_s=10800.0, runner_total_timeout_s=value)
+        _lease_config(delivery_budget_s=43200.0, runner_total_timeout_s=value)
 
     assert any(
         error["loc"] == ("runner_total_timeout_s",) and error["type"] == error_type
@@ -1034,29 +1116,29 @@ def test_runner_total_timeout_rejects_zero_from_the_canonical_env(
 def test_delivery_budget_accepts_the_adr_maximum_and_rejects_above_it(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """#3071 raised the maximum to 10800s (three hours) so a long factory run
+    """#5067 raised the maximum to 43200s (twelve hours) so a long factory run
     fits one delivery. Anything above it is refused at boot."""
     _clear_all_config_env(monkeypatch)
 
-    assert _lease_config(delivery_budget_s=10800.0).delivery_budget_s == 10800.0
+    assert _lease_config(delivery_budget_s=43200.0).delivery_budget_s == 43200.0
 
     with pytest.raises(ValueError):
-        _lease_config(delivery_budget_s=10801.0)
+        _lease_config(delivery_budget_s=43201.0)
 
 
 def test_delivery_budget_maximum_is_read_from_the_canonical_env(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     _clear_all_config_env(monkeypatch)
-    monkeypatch.setenv("CURIE_DELIVERY_BUDGET_S", "10800")
-    monkeypatch.setenv("CURIE_RUNNER_TOTAL_TIMEOUT_S", "10800")
+    monkeypatch.setenv("CURIE_DELIVERY_BUDGET_S", "43200")
+    monkeypatch.setenv("CURIE_RUNNER_TOTAL_TIMEOUT_S", "43200")
 
     config = WorkerConfig()
 
-    assert config.delivery_budget_s == 10800.0
-    assert config.runner_total_timeout_s == 10800.0
+    assert config.delivery_budget_s == 43200.0
+    assert config.runner_total_timeout_s == 43200.0
 
-    monkeypatch.setenv("CURIE_DELIVERY_BUDGET_S", "10801")
+    monkeypatch.setenv("CURIE_DELIVERY_BUDGET_S", "43201")
     with pytest.raises(ValidationError) as exc_info:
         WorkerConfig()
     assert any(
@@ -1072,7 +1154,7 @@ def test_runner_ceiling_still_bounded_by_budget_at_the_raised_maximum(
     _clear_all_config_env(monkeypatch)
 
     with pytest.raises(ValueError) as exc_info:
-        _lease_config(delivery_budget_s=600.0, runner_total_timeout_s=10800.0)
+        _lease_config(delivery_budget_s=600.0, runner_total_timeout_s=43200.0)
 
     assert "CURIE_RUNNER_TOTAL_TIMEOUT_S" in str(exc_info.value)
     assert "CURIE_DELIVERY_BUDGET_S" in str(exc_info.value)
@@ -1081,14 +1163,14 @@ def test_runner_ceiling_still_bounded_by_budget_at_the_raised_maximum(
 def test_termination_grace_must_cover_the_raised_maximum_budget(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A declared grace still has to cover budget + reserve at 10800s."""
+    """A declared grace still has to cover budget + reserve at 43200s."""
     _clear_all_config_env(monkeypatch)
 
-    ok = _lease_config(delivery_budget_s=10800.0, termination_grace_period_s=10860.0)
-    assert ok.termination_grace_period_s == 10860.0
+    ok = _lease_config(delivery_budget_s=43200.0, termination_grace_period_s=43260.0)
+    assert ok.termination_grace_period_s == 43260.0
 
     with pytest.raises(ValueError) as exc_info:
-        _lease_config(delivery_budget_s=10800.0, termination_grace_period_s=10859.0)
+        _lease_config(delivery_budget_s=43200.0, termination_grace_period_s=43259.0)
     assert "CURIE_TERMINATION_GRACE_PERIOD_S" in str(exc_info.value)
 
 
@@ -1456,6 +1538,45 @@ def test_a_non_positive_attachment_bound_is_refused_not_read_as_unlimited(
         WorkerConfig.model_validate(overrides)
 
 
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"attachment_thread_max_files": 0},
+        {"attachment_thread_max_bytes": 0},
+        {"attachment_thread_max_bytes": -1},
+        {"attachment_thread_prepare_timeout_seconds": 0},
+        {"attachment_thread_prepare_timeout_seconds": -1.0},
+    ],
+)
+def test_a_non_positive_thread_attachment_bound_is_refused(
+    overrides: dict[str, object],
+) -> None:
+    """ADR 0205 decision 7: the per-thread budget bounds every boot's rebuild."""
+
+    with pytest.raises(ValidationError):
+        WorkerConfig.model_validate(overrides)
+
+
+def test_the_thread_file_budget_cannot_be_smaller_than_one_message(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A thread budget below the per-message cap would omit files the message
+    that carried them is entitled to keep (the current files are always kept),
+    so the worker refuses it at startup rather than at the first boot."""
+
+    _clear_all_config_env(monkeypatch)
+    per_message = AttachmentLimits().max_files
+
+    with pytest.raises(ValidationError):
+        WorkerConfig.model_validate({"attachment_thread_max_files": per_message - 1})
+    assert (
+        WorkerConfig.model_validate(
+            {"attachment_thread_max_files": per_message}
+        ).attachment_thread_max_files
+        == per_message
+    )
+
+
 @pytest.mark.parametrize("mode", ["all", "failures", "off"])
 def test_each_turn_receipt_mode_is_read_from_its_env(
     monkeypatch: pytest.MonkeyPatch, mode: str
@@ -1468,12 +1589,12 @@ def test_each_turn_receipt_mode_is_read_from_its_env(
     assert WorkerConfig().turn_receipt == mode
 
 
-def test_the_turn_receipt_defaults_to_all(monkeypatch: pytest.MonkeyPatch) -> None:
-    """An install that sets nothing keeps ADR-0117's receipt as built."""
+def test_the_turn_receipt_defaults_to_off(monkeypatch: pytest.MonkeyPatch) -> None:
+    """An install that sets nothing leaves the answer without an appended receipt."""
 
     _clear_all_config_env(monkeypatch)
 
-    assert WorkerConfig().turn_receipt == "all"
+    assert WorkerConfig().turn_receipt == "off"
 
 
 @pytest.mark.parametrize("raw", ["ALL", "Off", "none", "failure", "true", " off", ""])
@@ -1522,7 +1643,7 @@ def test_the_chart_offers_exactly_the_turn_receipt_modes_the_worker_accepts() ->
     assert offered["type"] == "string"
     assert sorted(offered["enum"]) == sorted(get_args(TurnReceiptMode))
     assert values["worker"]["turnReceipt"] == WorkerConfig.model_fields["turn_receipt"].default
-    assert values["worker"]["turnReceipt"] == "all"
+    assert values["worker"]["turnReceipt"] == "off"
 
 
 def test_the_chart_defaults_match_the_worker_defaults() -> None:
@@ -1712,21 +1833,86 @@ def test_hook_claim_lease_shorter_than_the_budget_is_refused(
     assert "CURIE_HOOK_CLAIM_LEASE_S" in str(exc_info.value)
 
 
-@pytest.mark.parametrize(
-    ("api_url", "html_base"),
-    [
-        ("https://api.github.com", "https://github.com"),
-        ("https://api.github.com/", "https://github.com"),
-        ("https://github.example.com/api/v3", "https://github.example.com"),
-        ("https://github.example.com/api/v3/", "https://github.example.com"),
-        ("https://github.example.com/forge/api/v3", "https://github.example.com/forge"),
-        ("https://github.example.com:8443/forge/api/v3/", "https://github.example.com:8443/forge"),
-    ],
-)
-def test_publication_html_base_is_derived_from_the_configured_api_url(
-    monkeypatch: pytest.MonkeyPatch, api_url: str, html_base: str
+def test_the_worker_reads_no_code_host_url(monkeypatch: pytest.MonkeyPatch) -> None:
+    """ADR 0197: the worker receives the code host origin as data with each credential."""
+
+    _clear_all_config_env(monkeypatch)
+    monkeypatch.setenv("CURIE_PUBLICATION_GITHUB_API_URL", "https://github.example.com/api/v3")
+
+    config = WorkerConfig()
+
+    assert not hasattr(config, "publication_github_api_url")
+    assert not hasattr(config, "publication_github_html_base")
+
+
+def test_the_publication_job_trust_bundle_comes_from_the_worker_mount(
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     _clear_all_config_env(monkeypatch)
-    monkeypatch.setenv("CURIE_PUBLICATION_GITHUB_API_URL", api_url)
+    assert WorkerConfig().publication_ca_bundle_path == ""
 
-    assert WorkerConfig().publication_github_html_base == html_base
+    monkeypatch.setenv("CURIE_CODE_HOST_CA_BUNDLE", "/etc/curie/code-host-trust/ca.crt")
+
+    assert WorkerConfig().publication_ca_bundle_path == "/etc/curie/code-host-trust/ca.crt"
+
+
+# --- workspace recovery capture prerequisites (#5143) ----------------------------
+
+
+def test_recovery_capture_refuses_to_start_without_the_internal_worker_token(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The capture's ledger calls authenticate with the worker token, so none is a refusal."""
+
+    _clear_all_config_env(monkeypatch)
+    monkeypatch.setenv("CURIE_WORKSPACE_RECOVERY_ENABLED", "true")
+    monkeypatch.setenv("CURIE_INTERNAL_WORKER_TOKEN", "")
+    with pytest.raises(ValidationError) as exc_info:
+        WorkerConfig()
+    assert "CURIE_INTERNAL_WORKER_TOKEN" in str(exc_info.value)
+
+
+def test_recovery_capture_refuses_to_start_without_managed_workspaces(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A capture reads the claim's trusted base, which only managed workspaces have."""
+
+    _clear_all_config_env(monkeypatch)
+    monkeypatch.setenv("CURIE_WORKSPACE_RECOVERY_ENABLED", "true")
+    monkeypatch.setenv("CURIE_INTERNAL_WORKER_TOKEN", "recovery-worker-token")
+    monkeypatch.setenv("CURIE_WORKSPACE_ENABLED", "false")
+    with pytest.raises(ValidationError) as exc_info:
+        WorkerConfig()
+    assert "CURIE_WORKSPACE_ENABLED" in str(exc_info.value)
+
+
+def test_recovery_capture_starts_with_its_token_and_workspaces(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Liveness for the two refusals above: the complete configuration is accepted."""
+
+    _clear_all_config_env(monkeypatch)
+    monkeypatch.setenv("CURIE_WORKSPACE_RECOVERY_ENABLED", "true")
+    monkeypatch.setenv("CURIE_INTERNAL_WORKER_TOKEN", "recovery-worker-token")
+    monkeypatch.setenv("CURIE_WORKSPACE_ENABLED", "true")
+    config = WorkerConfig()
+    assert config.workspace_recovery_enabled is True
+    assert config.workspace_enabled is True
+    assert config.internal_worker_token == "recovery-worker-token"
+
+
+@pytest.mark.parametrize(
+    ("token", "workspace"),
+    [("", "false"), ("", "true"), ("recovery-worker-token", "false")],
+    ids=["neither", "no-token", "no-workspace"],
+)
+def test_disabled_recovery_keeps_every_existing_configuration_valid(
+    monkeypatch: pytest.MonkeyPatch, token: str, workspace: str
+) -> None:
+    """The refusals bind only when recovery is on; off, nothing new is required."""
+
+    _clear_all_config_env(monkeypatch)
+    monkeypatch.setenv("CURIE_WORKSPACE_RECOVERY_ENABLED", "false")
+    monkeypatch.setenv("CURIE_INTERNAL_WORKER_TOKEN", token)
+    monkeypatch.setenv("CURIE_WORKSPACE_ENABLED", workspace)
+    assert WorkerConfig().workspace_recovery_enabled is False

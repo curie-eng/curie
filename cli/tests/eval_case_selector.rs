@@ -22,7 +22,7 @@
 //! binary; unlike `fake_tier_plumbing.rs` this file needs a deliberate
 //! pass-case/fail-case PAIR, which the one-case seed cannot provide.
 
-mod support;
+use crate::support;
 
 use std::path::Path;
 use std::process::Command;

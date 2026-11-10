@@ -376,3 +376,103 @@ async def test_summary_prefers_an_int_conversion_failure_over_a_bad_level_row() 
         "the level row's conversion failure must not preempt int(runs); "
         f"got {excinfo.value!r}"
     )
+
+
+# --- agent-run scoping -------------------------------------------------------
+#
+# Langfuse holds every trace the platform emits: HTTP requests, turn ingress,
+# background jobs and sandbox cleanup each get their own trace. Only the
+# runner's `curie-run:<session_id>` traces are agent runs. With no agent filter
+# the summary used to count every one of those platform traces as a "run", so a
+# quiet install reported tens of thousands of runs a day with a 24 ms p95.
+
+_AGENT_RUN_FILTERS = {
+    "traces": {
+        "column": "name",
+        "operator": "contains",
+        "value": "curie-run:",
+        "type": "string",
+    },
+    "observations": {
+        "column": "traceName",
+        "operator": "contains",
+        "value": "curie-run:",
+        "type": "string",
+    },
+}
+
+
+def test_unfiltered_filters_select_only_agent_run_traces() -> None:
+    for view, run_filter in _AGENT_RUN_FILTERS.items():
+        assert run_filter in _filters(view, None, None), view
+
+
+def test_agent_filter_keeps_the_agent_run_scope() -> None:
+    token = agent_trace_filter(uuid.uuid4())
+    for view, run_filter in _AGENT_RUN_FILTERS.items():
+        filters = _filters(view, "prod", token)
+        assert run_filter in filters, view
+        assert any(f["value"] == token for f in filters), view
+
+
+# Runs, latency and the error-rate level query are narrowed to run traces. Tokens
+# and cost are sums over generations, which only model calls carry, so platform
+# traces add nothing to them; they keep only the eval exclusion so model spend in
+# a run whose trace ended up under another root name is still counted.
+_RUN_SCOPED_QUERIES = {"count", "latency"}
+
+
+def _is_run_scoped(query: dict[str, Any]) -> bool:
+    return "dimensions" in query or query["metrics"][0]["measure"] in _RUN_SCOPED_QUERIES
+
+
+def _assert_scope(query: dict[str, Any]) -> None:
+    view = query["view"]
+    name_col = "name" if view == "traces" else "traceName"
+    if _is_run_scoped(query):
+        assert _AGENT_RUN_FILTERS[view] in query["filters"], query
+    else:
+        assert _AGENT_RUN_FILTERS[view] not in query["filters"], query
+    assert {
+        "column": name_col,
+        "operator": "does not contain",
+        "value": "eval:",
+        "type": "string",
+    } in query["filters"], query
+
+
+@pytest.mark.anyio
+async def test_unfiltered_summary_counts_only_agent_runs() -> None:
+    lf = _FakeLangfuse()
+
+    await metrics.summary(lf, "s", "e", None, None)
+
+    assert len(lf.queries) == 5
+    scoped = [q for q in lf.queries if _is_run_scoped(q)]
+    assert len(scoped) == 3, "runs, latency and the error-rate level query"
+    for query in lf.queries:
+        _assert_scope(query)
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("metric", metrics.ALL_METRICS)
+async def test_unfiltered_series_matches_the_summary_scope(metric: str) -> None:
+    lf = _FakeLangfuse()
+
+    await metrics.series(lf, metric, "s", "e", "day", None, None)
+
+    assert len(lf.queries) == 1
+    _assert_scope(lf.queries[0])
+
+
+def test_tokens_and_cost_keep_the_agent_filter() -> None:
+    # Not narrowing to run traces must not widen a per-agent query.
+    token = agent_trace_filter(uuid.uuid4())
+    for metric in ("tokens", "cost_usd"):
+        q = _scalar_query(metric, "s", "e", None, token)
+        assert {
+            "column": "traceName",
+            "operator": "contains",
+            "value": token,
+            "type": "string",
+        } in q["filters"], metric

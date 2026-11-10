@@ -29,9 +29,11 @@ runtimes on Kubernetes or Docker, `runner/` serves the ACI protocol inside the
 sandbox, `apps/api` owns agents/versions/deployments and the git-flow deploy
 engine, and `apps/ui` and `cli/` are the operator surfaces. The core's own
 internal seams are already contracts: `packages/aci-protocol` and
-`packages/plugin-format` are frozen, tri-language (Pydantic source of truth,
-committed JSON Schema, generated TypeScript and Rust), and guarded by a
-schema-compat CI test.
+`packages/plugin-format` are frozen and guarded by schema-compat CI tests.
+`aci-protocol` is tri-language (Pydantic source of truth, committed JSON
+Schema, generated TypeScript and Rust). `plugin-format` is a frozen JSON
+Schema plus a CLI field-parity gate; its Rust is hand-written and not
+generated ([ADR 0194](adr/0194-plugin-format-contract-is-the-frozen-schema-plus-a-parity-gate.md)).
 
 ## The six swappable jobs
 
@@ -49,14 +51,17 @@ all compile against the generated artifacts; none of them import the SDK.
 claude-agent-sdk-coupled: `runner/src/curie_runner/adapter.py` defines a
 `ModelSession` protocol and implements it with `ClaudeSDKClient` in
 streaming-input mode (native steer and interrupt), and `translate.py` maps SDK
-messages to ACI events. Above the session sits the declared-package layer from
-ADR-0060: a `HarnessContribution` manifest (name, image, install, auth,
-read-only tool set, spawn env) registered through the `curie.harness`
-entry-point group (`runner/src/curie_runner/harness/`), selected at boot via
-`CURIE_HARNESS` and defaulting to the built-in Claude contribution. Exactly
-one contribution exists today, so the registry is a guarded indirection around
-the same adapter; conformance checks for third-party contributions are pending
-(ADR-0062).
+messages to ACI events. Above the session sits `HarnessContribution`, whose
+fields are `name`, `aliases`, `readonly_tools`, `build_spawn_env`,
+`compile_bundle`, and `supports_structured_replay`. The `curie.harness` entry
+point registry retains guarded discovery, but the internal `CURIE_HARNESS`
+setting admits only Claude and its existing aliases at boot. Every other name
+is refused before discovery, including a registered nonClaude contribution.
+[ADR 0140](adr/0140-curie-supports-one-model-harness-until-a-second-one-exists.md)
+limits supported engines to Claude and stops the unfinished selector and
+conformance program until a real second engine exists. Approval policy stays
+in the core gate without SDK imports; its SDK callbacks and hook matchers live
+in `runner/src/curie_runner/harness/claude/approval.py`.
 
 **Swap (candidates: ADK, Codex, Strands, other Claude Agent SDK variants):**
 implement a new ACI server (an HTTP process that accepts `/v1/event`,
@@ -82,12 +87,15 @@ rather than render history into system instructions (ADR-0119).
 ### 2. Observability / OTel store (Langfuse today)
 
 **Port:** OTLP into the collector on the write side; our API DTOs on the read
-side. Services never speak Langfuse directly: the runner exports gen_ai spans
+side. On the write side, services reach Langfuse only through the collector,
+except the worker's eval recorder (Job 3,
+`apps/worker/src/curie_worker/eval/recorder.py::LangfuseEvalRecorder`), which
+posts directly to Langfuse's ingestion API. The runner exports gen_ai spans
 over OTLP-HTTP to the collector (`runner/src/curie_runner/otel.py`), and the
-collector is the single component that authenticates and forwards to Langfuse
+collector is the component that authenticates and forwards spans to Langfuse
 (`charts/curie/templates/otel-collector.yaml`, needed because Langfuse OTLP
 ingest is HTTP-only). On the read side the UI consumes only our API's schemas
-(`ObservationNode`, `MetricsSummary` in `apps/api/src/curie_api/schemas.py`).
+(`ObservationNode`, `MetricsSummary` in `apps/api/src/curie_api/schemas/observability.py`).
 
 **Current adapter:** `apps/api/src/curie_api/langfuse.py` (trace list, tree
 reconstruction from `parentObservationId`, metrics queries) plus
@@ -109,10 +117,13 @@ tree-building and metrics logic in
 `langfuse.py` is Langfuse-API-shaped (client-side substring scan, the Metrics
 API query object) and would be rewritten, not ported.
 
-**Leakage:** the runner stamps a `langfuse.trace.name` span attribute
-(`runner/src/curie_runner/otel.py`), a vendor attribute on the otherwise
-neutral write path; a clean seam would use a neutral attribute the collector
-maps. The UI also reaches the read adapter through vendor-named routes
+**Leakage:** the runner stamps five vendor span attributes
+(`langfuse.trace.name`, `langfuse.session.id`, `langfuse.user.id`,
+`langfuse.observation.input`, `langfuse.observation.output`) plus the bare
+`model` key (`runner/src/curie_runner/otel.py`, keys declared in
+`packages/telemetry-schema/src/curie_telemetry_schema/__init__.py::SpanAttributeKey`)
+on the otherwise neutral write path; a clean seam would use neutral attributes
+the collector maps. The UI also reaches the read adapter through vendor-named routes
 (`/langfuse/traces` in `apps/ui/src/api/client.ts`), so the vendor name leaks
 into the URL namespace even though the payloads are ours.
 
@@ -234,7 +245,7 @@ wire. Slack still owns interactive approvals (Choice / Confirm cards). A
 complete third-party adapter lifecycle has not been exercised. Slack-specific
 rendering and interaction handling remain below the port: mrkdwn and Block Kit,
 including approval-card buttons and their settlement forms, live in
-`apps/worker/src/curie_worker/slack_sink.py`.
+`packages/channel-gateway/src/curie_channel_gateway/slack/slack_sink.py`.
 
 **Remaining channel work:** `QueuedTurn` carries `{event_id, conversation_id,
 author, text, reply_handle, received_at}`
@@ -325,7 +336,7 @@ flowchart TB
 | Job | Port contract | Current adapter | Grade | Cheapest next step |
 |---|---|---|---|---|
 | Harness / runtime | Frozen ACI protocol (`packages/aci-protocol`), tri-language, CI-guarded | claude-agent-sdk runner | A-: strongest seam in the system; docked for the plugin-format entanglement, the one thing a foreign harness still has to interpret | Done (#256): the guide is [implementing-an-aci-server.md](interfaces/aci-producer/implementing-an-aci-server.md), driven from the conformance suite, so the port is documented as well as enforced |
-| Observability | OTLP to collector (write), API DTOs (read) | Langfuse behind `langfuse.py` | B+: write side clean but for three vendor span attributes (`langfuse.trace.name`, `langfuse.session.id`, `langfuse.user.id`); read side spans several API modules plus routers | Map the three `langfuse.*` attributes to neutral names in the collector; rename the `/langfuse/*` API routes |
+| Observability | OTLP to collector (write), API DTOs (read) | Langfuse behind `langfuse.py` | B+: write side carries five vendor span attributes (`langfuse.trace.name`, `langfuse.session.id`, `langfuse.user.id`, `langfuse.observation.input`, `langfuse.observation.output`) plus the bare `model` key; eval recording uses direct Langfuse ingestion; read side spans several API modules plus routers | Map the five `langfuse.*` attributes and the bare `model` key at the collector; account for the direct eval recorder; rename the `/langfuse/*` API routes |
 | Evals | Our stream schema + `EvalMatrix` DTO; store behind recorder | Langfuse traces + `eval_pass` scores | B: schema is ours; the case format converged into one frozen, drift-gated schema (#8, ADR-0019), leaving the `version:`/`suite:` tag convention as the unfrozen part | Freeze the tag convention into the schema, or record it as a deliberate soft contract |
 | Blob storage | S3 protocol (boto3 + AWS CLI, path-style, endpoint-configurable) | RustFS | B+: config-only within S3-compatible stores; the client is now built in one shared place (`packages/aci-protocol/src/aci_protocol/s3.py::build_s3_client`, #572), and the `ObjectStore` port (`apps/api/src/curie_api/storage.py::ObjectStore`) names the contract, but the second, non-S3 adapter is deferred by decision until a real demand lands (#282) | None needed until a non-S3 demand exists |
 | Relational DB | SQLAlchemy 2.0 + alembic | Postgres | A-: managed-Postgres swap is a DSN change; enumerated Postgres-isms in models | Leave as is; a non-Postgres target reworks the enumerated leakage in the relational-db INTERFACE, not only UUID and the schema-scoped enum |

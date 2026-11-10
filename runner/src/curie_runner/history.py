@@ -62,7 +62,7 @@ class UnprovableAssistantGroupingError(HistoryError):
 
 
 class HistoryAppendError(HistoryError):
-    """The state API refused a transcript append."""
+    """The state API refused a transcript read or write."""
 
     def __init__(self, status: int) -> None:
         self.status = status
@@ -98,6 +98,7 @@ HISTORY_APPEND_RESERVE_BYTES = 8_192
 
 # Compare-and-set attempts for one capacity compaction before giving up.
 _COMPACTION_ATTEMPTS = 3
+
 
 def _json_copy(value: JsonContent) -> JsonContent:
     """Return a detached JSON-safe copy of message content."""
@@ -163,7 +164,7 @@ def is_tool_result_message(message: ConversationMessage) -> bool:
     )
 
 
-def _validate_group_provenance(messages: Sequence[ConversationMessage]) -> None:
+def validate_group_provenance(messages: Sequence[ConversationMessage]) -> None:
     """Validate causal boundaries before either replay or group compaction."""
     seen_groups: set[str] = set()
     current_group: str | None = None
@@ -185,21 +186,26 @@ def validate_assistant_groups(messages: Sequence[ConversationMessage]) -> None:
 
     Roles or arrival order cannot establish a logical assistant identity. Tool
     pairing validates result provenance separately from group provenance.
-    ``reduce_unprovable_overlap_turns`` runs first on a boot's replay, so the
-    overlap refusal reaches a caller only for overlap it could not isolate to
-    one turn (RUNNER-HISTORY-GROUP-4).
+    ``reduce_unprovable_overlap_turns`` runs first on a boot's replay and reduces
+    overlap within a turn or across turns, so on that path the overlap refusal
+    reaches a caller only when other malformed history kept the reducer from
+    seeing it (RUNNER-HISTORY-GROUP-4).
     """
 
-    _validate_group_provenance(messages)
+    validate_group_provenance(messages)
     seen_calls: set[str] = set()
     pending: dict[str, str | None] = {}
     for message in messages:
         if not isinstance(message.content, list):
             continue
         calls = [block for block in message.content if block.get("type") == "tool_use"]
-        if calls and pending and (
-            message.assistant_group is None
-            or any(group != message.assistant_group for group in pending.values())
+        if (
+            calls
+            and pending
+            and (
+                message.assistant_group is None
+                or any(group != message.assistant_group for group in pending.values())
+            )
         ):
             raise UnprovableAssistantGroupingError(
                 "overlapping tool calls lack common proven assistant grouping; "
@@ -235,12 +241,26 @@ UNREPLAYABLE_TOOL_ACTIVITY_TEXT = (
 )
 
 
+def _starts_turn(message: ConversationMessage) -> bool:
+    """A user row with no tool_result block at all.
+
+    Stricter than ``is_tool_result_message``, which validation uses as its causal
+    boundary: a row mixing text and a tool result joins the current turn without
+    creating a boundary, so it is never kept whole as a reduced turn's opener.
+    """
+
+    return message.role == "user" and (
+        not isinstance(message.content, list)
+        or all(block.get("type") != "tool_result" for block in message.content)
+    )
+
+
 def _split_turns(messages: Sequence[ConversationMessage]) -> list[list[ConversationMessage]]:
-    """Split at each genuine user message; a tool result does not start a turn."""
+    """Split at each user row with no tool result; a text-plus-result row joins the turn."""
 
     turns: list[list[ConversationMessage]] = []
     for message in messages:
-        starts = message.role == "user" and not is_tool_result_message(message)
+        starts = _starts_turn(message)
         if starts or not turns:
             turns.append([])
         turns[-1].append(message)
@@ -251,7 +271,7 @@ def _visible_text(turn: Sequence[ConversationMessage]) -> list[ConversationMessa
     """The turn's opening user message and one assistant message of its text blocks."""
 
     opening = turn[0]
-    head = [opening] if opening.role == "user" and not is_tool_result_message(opening) else []
+    head = [opening] if _starts_turn(opening) else []
     texts: list[dict[str, Any]] = []
     for message in turn:
         if message.role != "assistant":
@@ -275,23 +295,103 @@ def reduce_unprovable_overlap_turns(
     """Replay each turn with unprovable overlapping tool calls as its visible text.
 
     RUNNER-HISTORY-GROUP-4. Returns the replay and how many turns were reduced.
-    Only the overlap refusal reduces a turn; any other malformed history is left
-    for ``validate_assistant_groups`` to refuse over the whole replay.
+    A first pass reduces each turn whose own tool calls overlap. A second pass
+    walks the replay in order and catches overlap that spans turns: when a turn
+    adds a tool call while an earlier turn's call is still unanswered, that turn
+    and every earlier turn still holding an unanswered call are reduced. Reducing
+    a turn also reduces every later turn holding a result for one of its calls,
+    transitively, so the replay never keeps a result whose call was reduced away.
+    Each turn is reduced and counted at most once. Only the overlap refusal
+    reduces a turn; the walk stops at any other malformed history, so no later
+    reduction can erase it before ``validate_assistant_groups`` refuses it.
     """
 
-    replay: list[ConversationMessage] = []
-    reduced = 0
-    for turn in _split_turns(messages):
-        try:
-            validate_assistant_groups(turn)
-        except UnprovableAssistantGroupingError:
-            replay.extend(_visible_text(turn))
-            reduced += 1
+    turns = _split_turns(messages)
+    reduced_turns: set[int] = set()
+    for index in range(len(turns)):
+        if index in reduced_turns:
             continue
+        try:
+            validate_assistant_groups(turns[index])
+        except UnprovableAssistantGroupingError:
+            _reduce_turns(turns, [index], reduced_turns)
         except HistoryError:
             pass
-        replay.extend(turn)
-    return tuple(replay), reduced
+
+    replay = [message for turn in turns for message in turn]
+    try:
+        validate_assistant_groups(replay)
+    except HistoryError:
+        pass
+    else:
+        # Validation is prefix-closed, so the walk below would reduce nothing.
+        return tuple(replay), len(reduced_turns)
+
+    # Each step validates the accumulated replay again, quadratic in turns; it
+    # runs only for a history the whole-replay validation refused.
+    accepted: list[int] = []
+    for index, turn in enumerate(turns):
+        prefix = [message for earlier in accepted for message in turns[earlier]]
+        try:
+            validate_assistant_groups([*prefix, *turn])
+        except UnprovableAssistantGroupingError:
+            overlapping = [*_turns_with_unanswered_calls(accepted, turns), index]
+            _reduce_turns(turns, overlapping, reduced_turns)
+        except HistoryError:
+            # The final validation refuses this replay; reducing later turns
+            # could only hide the defect, so stop here.
+            break
+        accepted.append(index)
+    return tuple(message for turn in turns for message in turn), len(reduced_turns)
+
+
+def _reduce_turns(
+    turns: list[list[ConversationMessage]], indexes: Sequence[int], reduced: set[int]
+) -> None:
+    """Reduce the turns, then every later turn holding a result for a reduced call."""
+
+    queue = list(indexes)
+    while queue:
+        index = queue.pop()
+        if index in reduced:
+            continue
+        removed = _block_ids(turns[index], "tool_use", "id")
+        turns[index] = _visible_text(turns[index])
+        reduced.add(index)
+        queue.extend(
+            other
+            for other, turn in enumerate(turns)
+            if other > index
+            and other not in reduced
+            and removed & _block_ids(turn, "tool_result", "tool_use_id")
+        )
+
+
+def _block_ids(turn: Sequence[ConversationMessage], kind: str, key: str) -> set[str]:
+    """The ``key`` values of the turn's content blocks of type ``kind``."""
+
+    return {
+        str(block.get(key))
+        for message in turn
+        if isinstance(message.content, list)
+        for block in message.content
+        if block.get("type") == kind
+    }
+
+
+def _turns_with_unanswered_calls(
+    accepted: Sequence[int], turns: Sequence[Sequence[ConversationMessage]]
+) -> list[int]:
+    """Indexes of accepted turns holding a tool call no accepted turn answered."""
+
+    owner: dict[str, int] = {}
+    for index in accepted:
+        # An accepted turn validated with its prefix, so its results only answer
+        # calls already recorded.
+        owner.update(dict.fromkeys(_block_ids(turns[index], "tool_use", "id"), index))
+        for answered in _block_ids(turns[index], "tool_result", "tool_use_id"):
+            owner.pop(answered, None)
+    return sorted(set(owner.values()))
 
 
 @dataclass(frozen=True)
@@ -390,6 +490,10 @@ class TurnRecord:
     status: str = "done"
     approval: ApprovalContext | None = None
     harness_replay: HarnessReplayState | None = None
+    # Minted once per turn, so a retried append of the same turn is recognized
+    # by the state API and stored once (#5366). Empty means no id: emitted
+    # only when set, so a record without one keeps its earlier item shape.
+    record_id: str = ""
 
     def __post_init__(self) -> None:
         if not self.messages:
@@ -406,7 +510,7 @@ class TurnRecord:
             )
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        data: dict[str, Any] = {
             "type": "turn",
             "user": self.user,
             "assistant": self.assistant,
@@ -418,6 +522,9 @@ class TurnRecord:
                 self.harness_replay.to_dict() if self.harness_replay is not None else None
             ),
         }
+        if self.record_id:
+            data["record_id"] = self.record_id
+        return data
 
     @classmethod
     def from_dict(cls, data: Mapping[str, Any]) -> TurnRecord:
@@ -428,10 +535,7 @@ class TurnRecord:
                 isinstance(item, Mapping) for item in raw_messages
             ):
                 raise HistoryError("invalid structured conversation messages")
-            messages = tuple(
-                ConversationMessage.from_dict(item)
-                for item in raw_messages
-            )
+            messages = tuple(ConversationMessage.from_dict(item) for item in raw_messages)
         raw_approval = data.get("approval")
         raw_harness_replay = data.get("harness_replay")
         return cls(
@@ -450,6 +554,7 @@ class TurnRecord:
                 if isinstance(raw_harness_replay, Mapping)
                 else None
             ),
+            record_id=str(data.get("record_id") or ""),
         )
 
 
@@ -462,10 +567,7 @@ def _state_value_size(record: Mapping[str, Any]) -> int:
 def _digest_marker(value: str) -> str:
     encoded = value.encode("utf-8")
     digest = hashlib.sha256(encoded).hexdigest()
-    return (
-        "[history payload omitted; "
-        f"sha256={digest}; original_bytes={len(encoded)}]"
-    )
+    return f"[history payload omitted; sha256={digest}; original_bytes={len(encoded)}]"
 
 
 def _add_text_payload(
@@ -498,9 +600,7 @@ def _turn_text_payloads(
     messages = record.get("messages")
     if not isinstance(messages, list):
         return candidates
-    first_user = next(
-        (i for i, message in enumerate(messages) if message["role"] == "user"), None
-    )
+    first_user = next((i for i, message in enumerate(messages) if message["role"] == "user"), None)
     final_assistant = next(
         (i for i in range(len(messages) - 1, -1, -1) if messages[i]["role"] == "assistant"),
         None,
@@ -571,9 +671,7 @@ def _turn_text_payloads(
     return candidates
 
 
-def _replace_path(
-    root: dict[str, Any], path: tuple[str | int, ...], replacement: str
-) -> None:
+def _replace_path(root: dict[str, Any], path: tuple[str | int, ...], replacement: str) -> None:
     target: Any = root
     for part in path[:-1]:
         target = target[part]
@@ -624,9 +722,7 @@ def _compact_tool_groups(raw: dict[str, Any], max_value_bytes: int) -> dict[str,
         neighbors.setdefault(call_index, set()).add(reply_index)
         neighbors.setdefault(reply_index, set()).add(call_index)
 
-    first_user = next(
-        (i for i, message in enumerate(messages) if message["role"] == "user"), None
-    )
+    first_user = next((i for i, message in enumerate(messages) if message["role"] == "user"), None)
     if first_user is not None:
         protected.add(first_user)
     final_assistant = next(
@@ -674,7 +770,10 @@ def _compact_tool_groups(raw: dict[str, Any], max_value_bytes: int) -> dict[str,
                 [{"type": "text", "text": content}] if isinstance(content, str) else content
             ):
                 if block.get("type") in (
-                    "tool_use", "tool_result", "thinking", "redacted_thinking"
+                    "tool_use",
+                    "tool_result",
+                    "thinking",
+                    "redacted_thinking",
                 ):
                     omitted_blocks.append(block)
                     call_count += block.get("type") == "tool_use"
@@ -703,9 +802,7 @@ def _compact_tool_groups(raw: dict[str, Any], max_value_bytes: int) -> dict[str,
     return candidate
 
 
-def bound_turn_record(
-    record: TurnRecord, *, max_value_bytes: int
-) -> TurnRecord:
+def bound_turn_record(record: TurnRecord, *, max_value_bytes: int) -> TurnRecord:
     """Bound one turn for a whole state value without losing message order.
 
     Native harness replay is discarded first because portable messages are the
@@ -720,7 +817,7 @@ def bound_turn_record(
     if max_value_bytes <= 0:
         raise HistoryError("history value byte cap must be positive")
 
-    _validate_group_provenance(record.messages)
+    validate_group_provenance(record.messages)
     raw = record.to_dict()
     if _state_value_size(raw) <= max_value_bytes:
         return record
@@ -982,7 +1079,9 @@ class StateApiTranscriptStore:
         self._max_value_bytes = None
         async with session.get(self._key_url, headers=self._headers()) as resp:
             if resp.status not in (200, 404):
-                raise HistoryError(resp.status)
+                # Status-carrying, so a 5xx read during an append is retried
+                # like a 5xx write (#5366).
+                raise HistoryAppendError(resp.status)
             advertised_cap = resp.headers.get("X-Curie-Transcript-Max-Bytes")
             try:
                 cap = int(advertised_cap) if advertised_cap is not None else 0
@@ -1053,6 +1152,14 @@ class StateApiTranscriptStore:
                     # an empty key is the cap itself, not something to compact.
                     raise HistoryCapacityError(413)
                 value, version = snapshot
+                record_id = item.get("record_id")
+                if record_id and any(
+                    isinstance(stored, dict) and stored.get("record_id") == record_id
+                    for stored in value
+                ):
+                    # An earlier attempt of this turn already landed (#5366).
+                    # Whether it kept native replay is unknown, so report not.
+                    return False
                 assert self._max_value_bytes is not None
                 status = await self._put(
                     session,
@@ -1198,6 +1305,8 @@ def _make_summary(
     for turn in compacted:
         portable = turn.to_dict()
         portable.pop("harness_replay", None)
+        # A per-attempt identity, not conversation content (#5366).
+        portable.pop("record_id", None)
         portable_turns.append(portable)
     source = {
         "prior_digest": prior.digest if prior is not None else None,
@@ -1266,9 +1375,7 @@ def build_conversation_replay(
             latest_summary_index = index
 
     appended_turns = [
-        record
-        for record in records[latest_summary_index + 1 :]
-        if isinstance(record, TurnRecord)
+        record for record in records[latest_summary_index + 1 :] if isinstance(record, TurnRecord)
     ]
     active_turns = [
         *((latest_summary.tail) if latest_summary is not None else ()),
@@ -1281,9 +1388,7 @@ def build_conversation_replay(
         )
         source_turns = latest_summary.source_turns + len(active_turns)
     else:
-        current_messages = tuple(
-            message for turn in active_turns for message in turn.messages
-        )
+        current_messages = tuple(message for turn in active_turns for message in turn.messages)
         source_turns = len(active_turns)
 
     over_turns = max_turns is not None and len(active_turns) > max_turns

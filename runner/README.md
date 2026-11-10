@@ -40,8 +40,14 @@ locally in Docker.
   structured replay; oversized text payloads are replaced with stable digest
   markers before the per-thread transcript cap the state API advertises
   (`api.transcriptMaxThreadBytes`, 16 MiB by default) while tool-call
-  structure remains intact. An append failure makes the runner's
-  `history_durable` status fail closed for the rest of that process.
+  structure remains intact. Each turn record carries a `record_id`, and the
+  state API stores a record with a known `record_id` only once. An append whose
+  outcome is unknown (a 5xx, a 408 or 429, a connect failure, a cut connection,
+  a timeout, or a cancellation after the request was sent) is therefore kept
+  and retried in order until it lands, and `history_durable` stays false until
+  then (#5354, #5366). Any other append failure, such as a 4xx refusal, makes
+  the runner's `history_durable` status fail closed for the rest of that
+  process.
 
 ## HTTP surface (ACI channel)
 
@@ -59,15 +65,53 @@ side-channel injections whose output surfaces on the open `/v1/event` stream (th
 proven steering pattern). The finish race (a steer arriving as a turn ends,
 409) is owned by the worker.
 
+### Caller feedback
+
+Connector availability notices describe unavailable connected services in plain
+language. Missing sign-in settings, rejected access, invalid connection settings,
+and unsuccessful connection attempts remain distinguishable; notices never show
+connector identifiers, credential environment-variable names, MCP terminology or
+sandbox details. Only observed causes are described. Retry counts may be shown,
+without promising that a retry will succeed.
+
+Technical diagnosis retains the connector name, credential names (never values),
+reason and refusal in logs. The shared connector diagnosis vector continues to
+verify this diagnostic representation. The final reply and tool exclusion hook
+use the caller representation. Recovery removes the notice as before.
+
+Policy refusals and changed approval details describe the action in ordinary
+words. MCP names use their last nonempty suffix, underscores and hyphens become
+spaces, and camel case becomes words; Bash and Skill are shell and instruction
+requests. Invalid labels fall back to “action”. Refusals still prevent execution,
+never mint an approval for a policy denial and never spend a mismatched grant.
+
 At boot, the runner snapshots held credential values before hosted connector
-environment cleanup. A common outbound boundary replaces those exact values
-and recognized secret patterns with placeholders in assistant replies and
-structured tool results. Protocol keys, control metadata and approval argument
-carriers retain their original values. A buffer shared across `TextDelta`
-chunks protects held values split between chunks. Clean text streams normally;
-overlapping matches may remain buffered until the overlap ends or the turn
-completes. Recognition of unknown token patterns does not guarantee protection
-for fragments split across chunks.
+environment cleanup. A common outbound boundary replaces those exact values,
+their standard and URL-safe base64 forms when that encoding is at least 8 characters, and recognized secret patterns
+with placeholders in assistant replies and structured tool results. Protocol
+keys, control metadata and approval argument carriers retain their original
+values. A buffer shared across `TextDelta` chunks protects held values split
+between chunks. Clean text streams normally; overlapping matches may remain
+buffered until the overlap ends or the turn completes. Recognition of unknown
+token patterns does not guarantee protection for fragments split across chunks.
+
+The SDK parent retains its model authentication. Its Bash tool uses a mandatory
+image owned launcher that removes platform credentials before Bash reads user
+startup files or SDK snapshots. The launcher isolates Python imports from the
+workspace and preserves the shell arguments, exit status and signals. Missing or
+nonexecutable launchers reject session startup instead of selecting another shell.
+Declared connector secrets remain available to bundle tools.
+
+SDK initialization writes a start record and a finish record to the runner log
+under the fixed phase `sdk_initialize`. The finish record carries the outcome
+(`success`, `failure` or `cancelled`), monotonic elapsed milliseconds, the SDK
+version and, on failure only, the exception class. It never carries options,
+environment, prompts or exception text. Every Claude CLI stderr line still reaches
+the runner's stderr for the whole session. While connect runs, the runner also
+keeps a copy of those lines, redacted before it is kept and bounded to the newest
+8192 UTF-8 bytes. A failed initialization emits that tail as one WARNING; success
+and cancellation discard it, and nothing is kept after connect ends. The original
+exception propagates unchanged, with no retry or timeout change.
 
 Each `text_delta` the runner emits is one whole assistant text block, and a
 consumer joins deltas as they come. The same boundary therefore starts a later
@@ -84,8 +128,10 @@ The control routes (`/v1/event`, `/v1/steer`, `/v1/interrupt`, `/v1/reset`,
 header matching `CURIE_RUNNER_TOKEN` when that env var is set, returning 401
 otherwise. This is per-sandbox transport auth (defense-in-depth on the ACI
 ingress alongside the NetworkPolicy), not part of the frozen ACI wire contract.
-Enforcement is only-when-configured: with the var unset the app is pass-through
-(CLI, fake-model CI, and pre-token sandboxes stay unauthenticated). `GET
+A runner with the var unset or blank refuses to boot with
+`RunnerTokenRequiredError` unless `CURIE_RUNNER_ALLOW_TOKENLESS=1` is set, which
+only `curie skill up` and the eval sweep set; the chart always supplies a token
+from the `<release>-runner-token` Secret (#3821). `GET
 /healthz` and probe-only `GET /status` are never gated (the chart readinessProbe
 hits `/healthz`); replacement authority comes only from authenticated
 `GET /v1/status`.
@@ -141,9 +187,13 @@ result the model can correct, still without failing the turn. The call is
 platform-owned and idempotent (`PLATFORM_IDEMPOTENT_TOOLS`), so it raises no
 `side_effect_flag` and never lands on the turn's receipt.
 
-The fake model is unconditionally network-free, including when progress headers
-are present. `[fake:progress-demo]` remains a deterministic long-running turn
-for steering tests, but it does not call the ingress. API/worker integration
+The fake model is network-free, including when progress headers are present.
+`[fake:progress-demo]` remains a deterministic long-running turn
+for steering tests, but it does not call the ingress. The one exception is
+`[fake:connector-call]` (ADR 0270 evidence): it dials each hosted connector the
+caller proxy fronts with one `initialize` and one `tools/list`, and answers one
+`connector-call` line per connector that names the outcome and a sha256 prefix
+of the caller token, never the token. API/worker integration
 tests and live-provider tests exercise the real progress handler instead.
 
 ## Per-turn tool access
@@ -162,7 +212,8 @@ turn whose `Event.tool_access` is `read-only`:
   classifier and this check. The MCP half is each connector's own annotation:
   a server that marks a tool `readOnlyHint: true` has classified it
   read-only. Curie's platform tools are not read-only, including
-  `mcp__curie__request_approval` and `mcp__curie__report_progress`, which the
+  `mcp__curie__request_approval`, `mcp__curie__report_progress` and
+  `mcp__curie__get_issue`, which the
   classifier treats as idempotent.
 - **RUNNER-TOOL-ACCESS-2:** Any other tool call is denied before it executes.
   The runner registers a PreToolUse callback for every tool and wraps every
@@ -236,6 +287,61 @@ turn whose `Event.tool_access` is `read-only`:
   recorded in the thread's durable history, so a later boot of that thread
   replays them.
 
+## Channel read and canvases (ADR 0100, ADR 0200)
+
+A bundle granting `channelRead: true` lets its agent read its own bound
+channels through the platform; `canvasList`, `canvasRead` and `canvasEdit`
+let it list, read and edit table cells of canvases shared into those
+channels. The runner side has four rules.
+
+1. **RUNNER-CHANNEL-READ-1:** Only a real-model boot whose bundle grants at
+   least one of `channelRead`, `canvasList`, `canvasRead`, `canvasEdit` (each a
+   literal `true`) mounts the platform `curie-slack` server, and each tool on
+   it is present only with its own grant: `channelRead` brings
+   `read_channel_history`, `read_thread_replies` and `read_channel_message`;
+   `canvasList` brings `list_channel_canvases`; `canvasRead` brings
+   `read_canvas`; `canvasEdit` brings `edit_canvas_cell`. No grant implies
+   another, and no canvas grant brings the history tools. No grant, or the
+   fake model, mounts nothing. The tools are governed by `toolPolicy` like a
+   connector's (the gate counts `curie-slack` as a connector server) and are
+   never platform exempt. Policy denials hide them from the model's
+   catalogue. The history tools, `list_channel_canvases` and `read_canvas`
+   are idempotent for `side_effect_flag`; `edit_canvas_cell` writes to the
+   provider and is not.
+2. **RUNNER-CHANNEL-READ-2:** `GET /status` and `GET /v1/status` carry
+   `"channel_read": true` only when the server is mounted, and omit the key
+   otherwise, so the kernel refuses a granted turn on a runner that cannot
+   enforce it.
+3. **RUNNER-CHANNEL-READ-3:** The capability arrives on `/v1/event` and
+   `/v1/steer` only and lives in one per-turn holder
+   (`platform_slack/capability.py`). Turn open admits its scope (agent,
+   deployment, logical turn, default channel) and generation. A steer with null
+   or no capability clears the credential and keeps the scope; a steer naming
+   another scope, an unreadable token or a capability with no admitted scope is
+   rejected and clears it; a steer at or below the highest accepted generation
+   is stale and changes nothing. A capability is accepted only when its URL has
+   the boot `CURIE_STATE_URL` origin and a path ending `/channel-read`. The
+   canvas tools post to the sibling `/channel-canvas` route derived from that
+   admitted URL; no second URL is accepted.
+   Completion, interrupt, an accepted timeout (after its epoch check), reset
+   and abandonment clear it before any await. The token never reaches the
+   environment, tool arguments, results, logs, telemetry or the transcript; a
+   tool with no credential refuses `channel_read.no_capability` without a
+   request.
+4. **RUNNER-CHANNEL-READ-4:** A successful result is JSON labelled
+   `content_trust: "untrusted"`, `source: "channel"` (history) or
+   `source: "canvas"` (canvas tools). The persisted turn record keeps a
+   provenance stub (ids, timestamps, permalinks, `bodies_retained: false`) in
+   place of each successful read result; a canvas stub keeps only canvas ids,
+   section ids and creation times, never titles or cell or paragraph text. Once
+   a read or canvas tool has returned a result, the session exports no native
+   replay checkpoint until a new SDK session replaces it. A platform refusal comes back to the model as a
+   named `channel_read.*` code with its message (and, when the platform sends
+   one, `Retry after N seconds`), `channel_read.refused` for an unnamed one;
+   an unreachable platform returns `channel_read.unavailable`. The runner keeps
+   no retry or page counter of its own: the 8 page per turn budget, the 7 day
+   window and the 100 message page ceiling are enforced by the API.
+
 ## Portable assistant message groups
 
 Structured history preserves the logical assistant message that produced each
@@ -265,24 +371,28 @@ marker. This grouping is replay metadata, never approval or tool authority.
   inference from adjacency, result arrival, tool name, or prose may combine
   independent messages or move a dependent call before the result it consumes.
 - **RUNNER-HISTORY-GROUP-4:** Old role/content-only records remain readable.
-  Unambiguous sequential call/result history works without a native checkpoint.
-  A legacy checkpoint can supply missing group identity only when its assistant
-  and user conversation rows match the authoritative portable prefix exactly
-  and unambiguously, with valid IDs and causal boundaries. Its prompt snapshots,
+  Unambiguous sequential call/result history works without a native checkpoint. A
+  legacy checkpoint can supply missing group identity only when its assistant and
+  user conversation rows match the authoritative portable prefix exactly and
+  unambiguously, with valid IDs and causal boundaries. Its prompt snapshots,
   attachment availability, other envelope fields, and extra content are never
   imported by this recovery. If an overlapping tool-call sequence needs grouping
-  that neither portable metadata nor validated native mapping proves, never
-  submit that known corrupt replay or manufacture a result. Replay that one turn
-  as its visible text instead: the turn runs from a genuine user message to the
-  next one, and it becomes that user message followed by one assistant message
-  carrying the turn's assistant text blocks in order (or, if it had none, a text
-  saying its tool activity could not be replayed). Every other turn keeps its
-  rows unchanged, a native checkpoint is set aside, and the runner logs a WARNING
-  naming the session and the number of turns reduced, never their content.
-  Refusing the whole history instead strands the thread: the runner exits
-  before it is ready, every retry and every later message in that thread fails
-  the same way, and a thread whose key is fixed, such as an inbound hook's, can
-  never start fresh.
+  that neither portable metadata nor validated native mapping proves, never submit
+  that known corrupt replay or manufacture a result. Replay that one turn as its
+  visible text instead: the turn runs from a genuine user message (a user row
+  carrying no tool result) to the next one, and it becomes that user message
+  followed by one assistant message carrying the turn's assistant text blocks in
+  order (or, if it had none, a text saying its tool activity could not be
+  replayed). Subagent messages (those with a parent tool call) are not portable
+  history; only the parent's `Agent` call and its result are. Overlap that spans
+  turns is reduced the same way, both the turn that adds the overlapping call and
+  each earlier turn still holding an unanswered call, plus any later turn holding
+  a result for a reduced call. Every other turn keeps its rows unchanged, a native
+  checkpoint is set aside, and the runner logs a WARNING naming the session and
+  the number of turns reduced, never their content. Refusing the whole history
+  instead strands the thread: the runner exits before it is ready, every retry and
+  every later message in that thread fails the same way, and a thread whose key is
+  fixed, such as an inbound hook's, can never start fresh.
 - **RUNNER-HISTORY-GROUP-5:** Reject malformed persisted group metadata and
   inconsistent provenance, including attribution on user rows and reuse across
   genuine user or distinct assistant-group boundaries. Preserve group identity
@@ -313,8 +423,13 @@ resources and fake provider credentials, with no real model or approval action.
   `CURIE_HISTORY_MAX_TURNS` / `CURIE_HISTORY_MAX_BYTES` (bound the rehydrated
   structured prefix with stable summary boundaries; defaults 40 turns / 16000
   bytes, a nonpositive value falls back to the default),
+  `CURIE_MEMORY_MAX_FACTS` (how many facts each memory may hold and boot
+  loads into the prompt, one number for both; default 200, a nonpositive or
+  unparseable value falls back to the default),
   `CURIE_RUNNER_PORT`, `CURIE_RUNNER_TOKEN` (per-sandbox bearer token gating
-  the three ACI POST routes; enforced only when set), `CURIE_FAKE_MODEL`
+  the control routes; required: the runner refuses to boot without it),
+  `CURIE_RUNNER_ALLOW_TOKENLESS` (local development only, `1` or `true`: serve
+  without a bearer token; a set token is still enforced), `CURIE_FAKE_MODEL`
   (offline smoke; no model call), `CURIE_DISALLOWED_TOOLS` (optional
   comma-separated tool names removed from the session and refused even under
   bypassPermissions; unset keeps every tool available). This stops the named
@@ -324,6 +439,10 @@ resources and fake provider credentials, with no real model or approval action.
   still-permitted shell tool (e.g. `Bash`) can reach the same HTTP state API
   directly. Naming `Bash` alongside the state tools closes that path today;
   removing the token itself needs a code change, not a config knob.
+  `CURIE_CHANNEL_BOUND` (optional, set by the worker when the turn has a
+  channel kind and address) adds the `SendMessage` and `PushNotification`
+  built-ins to that same removed list (#3336): neither reaches anyone from a
+  channel agent. Unset or false leaves the list exactly as configured.
   Hosted-connector Bearer secrets are a different class (#2559): the runner
   expands `Authorization: Bearer ${NAME}` into the in-memory MCP catalog at
   boot and drops `NAME` from the process environment (and from
@@ -337,6 +456,77 @@ resources and fake provider credentials, with no real model or approval action.
   Bearer stay in the environment, because stdio / remote MCP clients still
   expand `${VAR}` there.
 
+## Personal subscription mode
+
+`CURIE_MODEL_AUTH_MODE` selects who authenticates model work (#5373, ADR 0268
+section 1). Unset or `service` is the default and keeps every existing path:
+`CURIE_CREDENTIALS` mapping, provider base URLs, OpenRouter routing and the
+credential-prefix reviewer default. `personal` makes the owner's
+`CLAUDE_CODE_OAUTH_TOKEN` the only model grant. Any other value, including the
+empty string or a different case, is refused at boot and at connect. When the
+inherited env and the explicit SDK env disagree, personal wins.
+
+In personal mode the policy in `personal_auth.py` does the following before the
+CLI starts:
+
+1. `resolve_sdk_env` returns no override and maps nothing, so `CURIE_CREDENTIALS`
+   and a `CURIE_MODEL_ENV_KEY` target are never used as the grant.
+2. An absent, empty or blank grant raises `AuthenticationRequiredError`, whose
+   message starts `authentication required`, even when a working service
+   credential or a saved login is present.
+3. Every competing source is removed from the CLI parent env and from the SDK
+   options env (`is_competing_auth_key`). The `CLAUDE_*` and `ANTHROPIC_*`
+   namespaces, leading underscores ignored, fail closed against a keep-list:
+   model selection, the runner-owned `CLAUDE_CODE_SHELL`,
+   `CLAUDE_CODE_DISABLE_TERMINAL_TITLE` and `CLAUDE_CODE_MAX_OUTPUT_TOKENS`, and
+   the installation's `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC`. Every other
+   name there goes, including `CLAUDE_SECURESTORAGE_CONFIG_DIR` (it would keep
+   a stored session live) and subagent model forcing
+   (`CLAUDE_CODE_SUBAGENT_MODEL`, `CLAUDE_CODE_SUBAGENT_MODEL_FORCE`,
+   `CLAUDE_CODE_WORKFLOW_SUBAGENT_MODEL`), so reviewer roles keep the
+   configured reviewer model. Outside the namespaces, cloud selectors and
+   settings (`AWS_*`, `AZURE_*`, Vertex and Google credential discovery),
+   `CURIE_CREDENTIALS`, `CURIE_MODEL_BASE_URL` and the CLI's OAuth switches go.
+   Installation transport (`HTTPS_PROXY`, `HTTP_PROXY`, `NO_PROXY`,
+   `NODE_EXTRA_CA_CERTS`) and every other name stay.
+4. `CLAUDE_CONFIG_DIR` and `ANTHROPIC_CONFIG_DIR` point at fresh 0700
+   directories the runner creates per connect and removes on close, so a saved
+   login, a signed-in gateway session, user settings with `apiKeyHelper` and
+   named profiles are excluded.
+5. Workspace `.claude/settings.json` or `.claude/settings.local.json` that sets a
+   credential helper, a forced login, `modelOverrides`, `availableModels`,
+   `fallbackModel`, any `CLAUDE_*` or `ANTHROPIC_*` `env` name (no keep-list,
+   since the workspace is agent writable), or a competing or transport `env`
+   key refuses the launch (`PersonalLaunchRefusedError`). Env names are
+   compared case-insensitively.
+6. Managed policy under `/etc/claude-code` (`managed-settings.json`, then
+   `managed-settings.d/*.json`) that forces gateway login, names a credential
+   helper, `policyHelper` or `policyHelpers`, puts a competing variable, any
+   `ANTHROPIC_*` name or an unlisted `CLAUDE_*` name in `env`, or cannot be
+   read or parsed refuses the launch. Keep-list `CLAUDE_*` names and transport are allowed. A managed
+   `availableModels` must be a list of strings that names both the implementer
+   model (the session `model`) and the reviewer model; otherwise, or when the
+   session has no explicit implementer model, the launch is refused, because
+   the CLI would silently move a role outside the list onto the parent model.
+   Managed `modelOverrides` and `deniedModels` must be absent or empty and
+   `fallbackModel` absent, since the CLI applies each after the guard and any
+   of them can move a role off its configured model. The runner never edits or
+   bypasses it. The pinned CLI 2.1.301 does
+   not read `CLAUDE_CODE_MANAGED_SETTINGS_PATH`, so step 3 removes it and the
+   guard reads only `/etc/claude-code`.
+
+Personal mode also needs an explicit Claude reviewer model in
+`CURIE_REVIEWER_MODEL` (a `claude-*` ID). It is required, sets
+`ANTHROPIC_DEFAULT_OPUS_MODEL` for the factory reviewer roles, and no default
+is derived from the credential. The `--bare` flag is never passed and the
+setting sources stay `user`, `project`, `local` (ADR 0189).
+
+Out of scope here: worker emission of the personal boot env (#5378) and
+containment of the grant inside the sandbox (#5374). Known residual: the CLI
+reloads project and local settings during a session, and the guard inspects
+them only at launch, so a `.claude/settings.local.json` written mid-session is
+not re-inspected. That channel belongs to #5374.
+
 ## Build and smoke
 
 The image compiles against the frozen workspace packages, so build from the repo
@@ -348,6 +538,7 @@ curie build
 # Offline round-trip (fake model, no credential), OTel to the dev collector:
 docker run -d --name runner-smoke --network curie_default \
   -e CURIE_FAKE_MODEL=1 -e CURIE_PLUGIN_DIR=/unused \
+  -e CURIE_RUNNER_ALLOW_TOKENLESS=1 \
   -e CURIE_SESSION_ID=smoke -e CURIE_SANDBOX_ID=sbx \
   -e 'CURIE_BUDGET={"max_output_tokens_per_run":100000,"max_usd_per_day":5.0}' \
   -e OTEL_EXPORTER_OTLP_ENDPOINT=http://otel-collector:4318 \
@@ -408,3 +599,59 @@ explicitly selected with `CURIE_E2E_LIVE=1`, including the provider-side web
 search proof, may instead use an already-authenticated local Claude SDK. Without
 either authentication path they fail honestly rather than fabricating a live
 result.
+
+## Approval display wording
+
+Permission approval records retain the exact tool identifier and arguments.
+The card and waiting notice describe the requested action in plain language,
+including when a bundle has no summary template or its template cannot render.
+Do not present MCP identifiers or argument field names as prose. Preserve the
+requested values and do not imply that the pending action has run.
+
+Approval metadata references follow the same sentence boundary rules across API,
+worker, runner and the UI fallback for older API responses. A tool identifier
+followed by a sentence-ending period (including whitespace or closing punctuation)
+uses its plain action label. Filenames, extensions, paths, URLs and identifiers
+embedded within another word remain literal data, including Unicode text. The
+stored summary, exact grant target, arguments and nested content remain unchanged.
+
+## On-demand attachment access
+
+With `CURIE_ATTACHMENT_ACCESS_ENABLED=1`, a real-model runner requires a writable
+`/attachments` mount and the trusted platform origin from `CURIE_STATE_URL`.
+It mounts `list_attachments` and `fetch_attachment` on the existing `curie`
+platform server and advertises literal `attachment_access: true` in status.
+Fake-model mode mounts neither tool and performs no attachment network access.
+Without the flag, the legacy disk-present manifest and notices remain in use.
+
+The per-event attachment context stays in memory. New logical turns replace
+it; a steer renews the same opener, while a missing context revokes reads.
+Terminal output, interruption, timeout, reset and shutdown retire access.
+Notices describe remote references until a fetch returns a verified absolute
+path. A fetch accepts only a catalog ID and returns the complete selected file,
+without per-file or thread-total application byte ceilings. Actual sandbox
+storage, a 300-second total operation deadline, and at most two concurrent
+transfers remain finite. The runner's 300-second ceiling still applies when the
+broker/chart `transferTimeoutSeconds` setting is higher. A failed or cancelled
+transfer removes its partial file.
+
+Filesystem writes and synchronization run in joined workers so the event loop
+can process interruption and expiry while disk work is pending. An already
+running kernel syscall cannot be forcibly cancelled: cleanup waits for it to
+finish, which can extend past the deadline, and returns no successful path for
+a cancelled or expired operation.
+
+Listing reads metadata only. Fetching streams chunks of at most 1 MiB, checks
+the platform's durable integrity completion, and publishes the cache entry
+atomically without overwriting an existing path. Reuse reauthorizes the ID and
+hashes the local file, then reauthorizes immediately before returning a path;
+a route revoked during verification cannot use a cache hit or a fresh transfer.
+The cache belongs to the sandbox and downloads no unrequested file. Fetch remains conservatively
+side-effecting because it binds catalog integrity and publishes a local file.
+
+These two tools receive no platform-name approval or tool-policy exemption.
+Existing wildcard patterns such as `*/list_attachments`, `*/fetch_attachment`
+and `*/*` govern them, including deny-by-default behavior and operator approval
+gates. Literal `curie/...` policy patterns remain reserved by bundle validation;
+use those wildcard patterns for this data-tool surface. Fetching does not grant
+permission to execute another tool against the returned file.

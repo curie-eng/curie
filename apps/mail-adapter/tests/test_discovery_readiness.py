@@ -15,11 +15,11 @@ from collections.abc import Callable
 from http.server import ThreadingHTTPServer
 from typing import Any
 
-import curie_mail_adapter.adapter as adapter_module
+import curie_channel_gateway.mail.adapter as adapter_module
 import pytest
 from _support import IngressState, MailHandler, MailState, get, wait_until
-from curie_mail_adapter.adapter import MailAdapter
-from curie_mail_adapter.config import MailAdapterConfig
+from curie_channel_gateway.mail.adapter import MailAdapter
+from curie_channel_gateway.mail.config import MailAdapterConfig
 
 # -- config ------------------------------------------------------------------
 
@@ -38,7 +38,7 @@ def test_threshold_reads_env(monkeypatch: pytest.MonkeyPatch) -> None:
 def test_non_positive_threshold_is_a_boot_problem(
     make_config: Callable[..., MailAdapterConfig], value: str
 ) -> None:
-    from curie_mail_adapter.run import boot_problems
+    from curie_channel_gateway.mail.run import boot_problems
 
     config = make_config(discovery_unready_after_seconds=float(value))
     problems = boot_problems(config)
@@ -183,7 +183,7 @@ def test_poll_loop_drives_discovery_readiness_and_logs_edges_once(
             if r.levelno == logging.INFO and "discovery recovered" in r.getMessage()
         ]
 
-    with caplog.at_level(logging.INFO, logger="curie_mail_adapter"):
+    with caplog.at_level(logging.INFO, logger="curie_channel_gateway.mail"):
         try:
             thread.start()
             assert adapter.ready.wait(10), "startup never completed"

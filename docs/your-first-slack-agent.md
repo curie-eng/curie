@@ -1,9 +1,16 @@
 # Your first Slack agent
 
+This is the workspace deployment path for a supported bundle. To reuse
+existing instructions and tools, start with [Bring your agent](bring-your-agent.md).
+For the primary developer use case, start with the
+[Software Factory](software-factory.md). Check the
+[capability and release reference](capabilities.md) before choosing a channel.
+The setup below creates and connects your Slack app.
+
 From nothing to a bot that answers in Slack and redeploys itself when you push.
 
-Four commands do the work. Everything else on this page is the accounts you
-need first and the seven mistakes that actually cost people time.
+Prepare the cluster, provider gateway and accounts first, then use the commands
+below to deploy the agent and connect Slack.
 
 ---
 
@@ -14,6 +21,7 @@ need first and the seven mistakes that actually cost people time.
 | **Model credential** | [console.anthropic.com](https://console.anthropic.com/) | The agent's brain |
 | **Docker** | [get-docker.sh](https://docs.docker.com/get-docker/) | Runs the agent locally |
 | **A cluster** | k3s on one small VM is enough | Only needed for the Slack step |
+| **Provider gateway** | [Gateway setup](../apps/dispatcher/README.md#provider-gateway) | Authenticated provider access over TLS |
 | **A Slack app** | [api.slack.com/apps](https://api.slack.com/apps) → *From a manifest* | Two tokens, below |
 
 A single-node k3s box with **no inbound ports** serves a Slack bot fine —
@@ -29,6 +37,10 @@ export CURIE_CREDENTIALS=sk-ant-...
 ---
 
 ## 1. Build it on your laptop (2 min)
+
+Already have a bundle? Validate it locally with [Bring your agent](bring-your-agent.md),
+stay in its directory, and continue at [Get the Slack tokens](#2-get-the-slack-tokens).
+The scaffold below is for a new agent.
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/curie-eng/curie/main/get-curie.sh | bash
@@ -57,18 +69,44 @@ Then collect two tokens:
 - **App-Level Token** with scope `connections:write` → `xapp-…`
 - **Install to Workspace**, then **Bot User OAuth Token** → `xoxb-…`
 
+In Bash, load the two tokens into the environment without putting their values
+in command arguments or shell history:
+
+```bash
+read -r -s -p "Slack app token: " SLACK_APP_TOKEN
+printf '\n'
+read -r -s -p "Slack bot token: " SLACK_BOT_TOKEN
+printf '\n'
+export SLACK_APP_TOKEN SLACK_BOT_TOKEN
+```
+
+Keep token values outside your bundle and repository. The comms command below
+reads these environment variables directly.
+
 Invite the bot to your channel, and copy the **channel ID** — right-click the
 channel → *View channel details*, it's at the bottom and looks like `C0…`.
 
 ## 3. Put it on the cluster (10 min)
 
+Configure the [provider gateway](../apps/dispatcher/README.md#provider-gateway)
+and pass its Helm values with `--values-file` when running the install below.
+The gateway requires a trusted TLS certificate and separate API and worker
+caller credentials; its setup guide also covers an external gateway. The
+dispatcher and gateway hold Slack tokens.
+
 ```bash
-curie cluster up --namespace my-agent --release my-agent
+CURIE_CONTEXT="$(kubectl config current-context)"
+CURIE_NAMESPACE=my-agent
+CURIE_RELEASE=my-agent
 
-curie cluster comms --slack --namespace my-agent --release my-agent \
-  --app-token "$SLACK_APP_TOKEN" --bot-token "$SLACK_BOT_TOKEN"
+curie cluster up --context "$CURIE_CONTEXT" \
+  --namespace "$CURIE_NAMESPACE" --release "$CURIE_RELEASE"
 
-curie cluster deploy --plugin-dir . --namespace my-agent --release my-agent \
+curie cluster comms --slack --context "$CURIE_CONTEXT" \
+  --namespace "$CURIE_NAMESPACE" --release "$CURIE_RELEASE"
+
+curie cluster deploy --plugin-dir . --context "$CURIE_CONTEXT" \
+  --namespace "$CURIE_NAMESPACE" --release "$CURIE_RELEASE" \
   --repo <owner>/<repo> --slack-channel C0YOURCHANNEL
 ```
 
@@ -85,7 +123,36 @@ PriorityClasses and the sandbox controller when their complete Helm ownership
 metadata names an existing release. Every applied inference is printed with
 its equivalent override.
 
-`@mention` the bot in that channel. That's the whole thing.
+`@mention` the bot in that channel. Keep the deploy receipt: its
+`bundle.sha256` in the JSON receipt identifies the artifact running in the workspace.
+
+### Verify your workspace reply
+
+Send a fresh mention with the request you already tested locally. Check the
+visible Slack reply, then inspect the run through the same release:
+
+```bash
+curie cluster observability --context "$CURIE_CONTEXT" \
+  --namespace "$CURIE_NAMESPACE" --release "$CURIE_RELEASE" --json runs --agent-id <agent-id>
+
+curie cluster observability --context "$CURIE_CONTEXT" \
+  --namespace "$CURIE_NAMESPACE" --release "$CURIE_RELEASE" --json run <trace-id>
+```
+
+Choose the run matching your message, agent and channel. The run command shows
+the tool names and timing; it does not expose their input and returned payloads.
+An administrator can read the matching conversation through the
+[workflow state API](interfaces/workflow-state/INTERFACE.md):
+`GET /agents/<agent-id>/state/transcript/<url-encoded-thread-key>`.
+For Slack, the thread key is `slack:<channel-id>:<parent-message-ts>`.
+Use the configured platform API authentication and inspect only your agent's
+thread. In `value[].messages`, match the `tool_use` block's `id` to the
+`tool_result` block's `tool_use_id`.
+
+For the text-stats example, confirm that the `word_count` input is
+`{"text":"one two three"}`, the matching result contains `3`, and
+`is_error` is absent or false. A tool request alone does not prove execution;
+an unrelated older trace does not prove your fresh Slack message reached the agent.
 
 ## 4. Make it ship itself
 
@@ -150,16 +217,16 @@ connectors:
 `secrets` are **names only** — the value never enters your repository:
 
 ```bash
-CURIE_CLUSTER_ID="ca:$(kubectl config view --minify --raw -o json | jq -r '.clusters[0].cluster | ((.server // "") + "\\n" + (."certificate-authority-data" // ."certificate-authority" // ""))' | sha256sum | awk '{print $1}')"
+CURIE_CLUSTER_ID="ca:$(kubectl --context "$CURIE_CONTEXT" config view --minify --raw -o json | jq -r '.clusters[0].cluster | ((.server // "") + "\\n" + (."certificate-authority-data" // ."certificate-authority" // ""))' | sha256sum | awk '{print $1}')"
 curie secrets set GRAFANA_SERVICE_ACCOUNT_TOKEN --from-env GRAFANA_SERVICE_ACCOUNT_TOKEN \
-  --cluster-identity "$CURIE_CLUSTER_ID" --release curie --namespace curie
+  --cluster-identity "$CURIE_CLUSTER_ID" --release "$CURIE_RELEASE" --namespace "$CURIE_NAMESPACE"
 ```
 
 At cluster deploy time, Curie delivers both connector `secrets` and
 `secret_files` values into the agent's Kubernetes Secret. Those stored values
 must be scoped to the target cluster identity, release, and namespace; a
 mismatch is refused rather than silently reused. Unscoped names remain for
-skill/local credentials. Issue #440 tracks the future per agent delivery path.
+skill/local credentials.
 
 ---
 
@@ -168,7 +235,7 @@ skill/local credentials. Issue #440 tracks the future per agent delivery path.
 1. **Export the credential before `skill up`.** Otherwise the boot succeeds and
    the *next* command fails with `model-credential-rejected`.
 2. **`--repo` binds once and is never re-pointed.** An agent with *no* binding
-   can still be bound by a later `deploy --repo` (#1194) -- but one already
+   can still be bound by a later `deploy --repo` -- but one already
    pointing at a different repository is left alone and only warned about, so
    there the fix really is deleting the agent and starting over. `curie doctor`
    reports which agents are unbound.
@@ -191,6 +258,6 @@ skill/local credentials. Issue #440 tracks the future per agent delivery path.
 | `curie local` | Docker Compose, full backend | the real queue → worker → sandbox path |
 | `curie cluster` | Kubernetes | Slack, and anything real |
 
-Same bundle at every rung. See [`README.md`](../README.md#quickstart) for the
+Same bundle at every rung. See the [CLI target guide](../cli/README.md#using-different-tiers) for the
 long-form walkthrough, and [`docs/operations.md`](operations.md) for running one
 in production.

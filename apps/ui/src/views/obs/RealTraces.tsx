@@ -173,7 +173,7 @@ function SpanRow({ node, depth }: { node: ObservationNode; depth: number }) {
         {node.model ? <span style={{ fontFamily: C.mono, fontSize: 11.5, color: C.muted }}>{node.model}</span> : null}
         {node.startTime ? <span style={{ marginLeft: "auto", fontFamily: C.mono, fontSize: 11, color: C.muted }}>{node.startTime}</span> : null}
       </div>
-      {node.children.map((c) => (
+      {(node.children ?? []).map((c) => (
         <SpanRow key={c.id} node={c} depth={depth + 1} />
       ))}
     </>

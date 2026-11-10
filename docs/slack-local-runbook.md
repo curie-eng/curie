@@ -24,7 +24,8 @@ flowchart LR
   slack -->|Socket Mode outbound| dispatcher
   dispatcher -->|enqueue run| valkey
   valkey -->|claim run| worker
-  worker -->|reply via bot token| slack
+  worker -->|authenticated reply| gateway
+  gateway -->|reply via bot token| slack
 ```
 
 ## 1. Create the Slack app
@@ -40,7 +41,8 @@ subscriptions are correct from the start.
    - Socket Mode on
    - the bot scopes (`app_mentions:read`, `chat:write`, `channels:read`,
      `channels:history`, `groups:history`, `im:history`, `im:read`,
-     `assistant:write`, and `files:read`)
+     `assistant:write`, `files:read`, `canvases:read`, `canvases:write` and
+     `groups:read`)
    - the `app_mention` and `message.im` event subscriptions
    - interactivity on (so button and block-action clicks arrive over Socket
      Mode)
@@ -49,11 +51,13 @@ subscriptions are correct from the start.
    `SLACK_APP_TOKEN`, used for the Socket Mode connection.
 3. **Install to Workspace** (Install App), then copy the **Bot User OAuth
    Token**. This `xoxb-...` value is your `SLACK_BOT_TOKEN`, used by the Web API
-   to post replies. If this app was installed before `channels:read` or
-   `files:read` was added, reinstall it to the workspace so the existing
-   bot-token grant is refreshed. A stale `channels:read` grant is what the boot
-   preflight below refuses on; a stale `files:read` grant costs you attachments
-   and a warning, not the boot.
+   to post replies. If this app was installed before `channels:read`,
+   `files:read`, `canvases:read`, `canvases:write` or `groups:read` was added,
+   reinstall it to the workspace so the existing bot-token grant is refreshed.
+   A stale `channels:read` grant is what the boot preflight below refuses on; a
+   stale `files:read` grant costs you attachments and a warning, not the boot;
+   a stale canvas or `groups:read` grant refuses the canvas tools by name
+   (`channel_read.provider_scope_missing`), not the boot.
 4. `SLACK_SIGNING_SECRET` is optional and unused in Socket Mode (kept only for
    Bolt app construction); leave it empty.
 
@@ -108,7 +112,7 @@ Export the tokens into your shell and start the profile:
 ```bash
 export SLACK_APP_TOKEN=xapp-...
 export SLACK_BOT_TOKEN=xoxb-...
-export SLACK_API_BASE_URL=          # empty: un-wire the worker's Slack stub -> real slack.com
+export SLACK_API_BASE_URL=          # empty: un-wire the gateway's Slack stub -> real slack.com
 curie local up --slack
 
 # Raw Docker alternative (the dispatcher depends on valkey, a core service, so
@@ -123,17 +127,17 @@ profile, it does not set `SLACK_API_BASE_URL`.
 
 What each export does:
 
-- `SLACK_APP_TOKEN` and `SLACK_BOT_TOKEN` are read by the `curie-dispatcher`
+1. `SLACK_APP_TOKEN` and `SLACK_BOT_TOKEN` are read by the `curie-dispatcher`
   service (its `VALKEY_*` connection is already wired to the compose `valkey`
   service). A token-less dispatcher just backoff-reconnects forever, so the
   profile is meaningless without real tokens.
-- Setting `SLACK_API_BASE_URL` to an EMPTY string un-wires the worker's Slack
-  stub and points its outbound posts at real slack.com. The worker's default is
+2. Setting `SLACK_API_BASE_URL` to an EMPTY string un-wires the gateway's Slack
+  stub and points its outbound posts at real slack.com. The gateway's default is
   `${SLACK_API_BASE_URL-http://localhost:8155/api/}` with a single `-`, so
   leaving the variable UNSET keeps the stub, and setting it empty overrides it.
-- The worker reads `SLACK_BOT_TOKEN=${SLACK_BOT_TOKEN:-xoxb-dev}`, so the same
-  `export SLACK_BOT_TOKEN` covers BOTH the dispatcher (inbound) and the worker
-  (outbound real replies).
+3. The gateway reads `SLACK_BOT_TOKEN`; the dispatcher uses it for inbound Slack
+  operations. API and worker use separate gateway caller credentials and reject
+  Slack token environment variables at startup.
 
 Socket Mode is outbound-only: the dispatcher dials Slack over an outbound
 WebSocket, so your laptop needs no public ingress, port-forward, or tunnel.

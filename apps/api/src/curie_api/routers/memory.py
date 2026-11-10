@@ -18,13 +18,9 @@ from typing import Any
 from fastapi import APIRouter, Depends, HTTPException, Query, Response, status
 from sqlalchemy import select
 
-from .. import crud, state_mutation
-from ..auth import require_api_key
-from ..config import get_settings
-from ..deps import SessionDep
-from ..memory_guidance import DEFAULT_MEMORY_GUIDANCE
-from ..models import WorkflowStateEntry
-from ..schemas import (
+from curie_api.crud import agents as crud_agents
+from curie_api.routers.state import enforce_caps
+from curie_api.schemas.state import (
     MemoryEntryCreate,
     MemoryEntryEdit,
     MemoryEntryOut,
@@ -34,7 +30,13 @@ from ..schemas import (
     MemoryTraceBackOut,
     SourceTraceOut,
 )
-from .state import _enforce_caps
+
+from .. import state_mutation
+from ..auth import require_api_key
+from ..config import get_settings
+from ..deps import SessionDep
+from ..memory_guidance import DEFAULT_MEMORY_GUIDANCE
+from ..models import WorkflowStateEntry
 
 router = APIRouter(
     prefix="/agents", tags=["memory"], dependencies=[Depends(require_api_key)]
@@ -53,7 +55,7 @@ OPERATOR_MEMORY_SOURCE = "operator"
 
 
 async def _require_agent(session: SessionDep, agent_id: uuid.UUID) -> None:
-    if await crud.get_agent(session, agent_id) is None:
+    if await crud_agents.get_agent(session, agent_id) is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "agent not found")
 
 
@@ -180,7 +182,7 @@ async def create_memory(
     )
     if entry is None:
         new_value = [record]
-        await _enforce_caps(
+        await enforce_caps(
             session, agent_id, None, MEMORY_NAMESPACE, MEMORY_LOG_KEY, new_value
         )
         entry = WorkflowStateEntry(
@@ -197,7 +199,7 @@ async def create_memory(
                 "cannot append: stored value is not a JSON array",
             )
         new_value = [*entry.value, record]
-        await _enforce_caps(
+        await enforce_caps(
             session, agent_id, None, MEMORY_NAMESPACE, MEMORY_LOG_KEY, new_value
         )
         entry.value = new_value
@@ -258,7 +260,7 @@ async def put_memory_guidance(
     """
     await _require_agent(session, agent_id)
     value = {"text": data.text}
-    await _enforce_caps(
+    await enforce_caps(
         session, agent_id, None, MEMORY_NAMESPACE, MEMORY_GUIDANCE_KEY, value
     )
     entry: WorkflowStateEntry | None = await session.scalar(
@@ -352,7 +354,7 @@ async def edit_memory(
     # None: the memory port stays agent-wide regardless of `agents.memory`
     # (#1525 follow-up) -- it is a different reserved namespace with no
     # per-binding story, same as every row this port has ever written.
-    await _enforce_caps(
+    await enforce_caps(
         session, agent_id, None, MEMORY_NAMESPACE, MEMORY_LOG_KEY, replacement
     )
     entry.value = replacement

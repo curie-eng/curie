@@ -18,10 +18,13 @@ something for the control to do.
 
 from __future__ import annotations
 
+import json
 from copy import deepcopy
+from pathlib import Path
 from typing import Any
 
 import pytest
+from curie_worker.action_wording import action_label
 from curie_worker.receipt import render_receipt
 
 
@@ -48,6 +51,8 @@ def test_read_only_bash_calls_do_not_add_a_receipt() -> None:
         _action(tool="Bash", arguments={"command": command}, undoable=False, result=None)
         for command in (
             "pwd",
+            "ls -alh apps/worker",
+            "cat README.md",
             "rg -n receipt apps/worker",
             "sed -n '1,40p' apps/worker/src/curie_worker/receipt.py",
             "git status --short",
@@ -56,6 +61,207 @@ def test_read_only_bash_calls_do_not_add_a_receipt() -> None:
     ]
 
     assert render_receipt(actions) is None
+
+
+def test_read_only_find_calls_render_no_receipt() -> None:
+    actions = [
+        _action(
+            tool="Bash",
+            arguments={"command": command},
+            undoable=False,
+            result=None,
+            detail="non-idempotent tool completed",
+        )
+        for command in (
+            'find / -iname "*demo-agent*" -not -path "*/node_modules/*" 2>/dev/null',
+            "find /bundles/current/skills/demo-agent -type f",
+        )
+    ]
+    original = deepcopy(actions)
+
+    assert render_receipt(actions) is None
+    assert actions == original
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "find .",
+        "find /",
+        "find /bundles/current/skills/demo-agent",
+        "find . ../demo_agent-2 /bundles/current",
+        "find ./-delete",
+        "find . ./-exec ./-fprint",
+        "find . -type f",
+        "find . -type d",
+        "find . -type l",
+        "find . -name '*.py'",
+        'find . -name "*.py"',
+        "find . -iname '*README?.md'",
+        'find . -iname "*README?.md"',
+        "find . -path '*/node_modules/*'",
+        'find . -path "*/node_modules/*"',
+        "find . -name '*demo_agent-?.txt'",
+        'find . -name "-delete"',
+        "find . -maxdepth 0",
+        "find . -mindepth 12",
+        "find . -maxdepth 002 -mindepth 0",
+        "find . -not -not -type d",
+        "find . -name '*.py' -name '*.rs'",
+        "find / /bundles -type f -mindepth 1 -maxdepth 3 -not -path '*/vendor/*'",
+        "find . 2>/dev/null",
+        "find . -name '*.py' 2>/dev/null",
+        " \tfind . -type f\n",
+    ],
+)
+def test_read_only_find_variants_render_no_receipt(command: str) -> None:
+    action = _action(tool="Bash", arguments={"command": command}, undoable=False, result=None)
+
+    assert render_receipt([action]) is None
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "find",
+        "find -type f",
+        "find -name '*.py'",
+        "find -maxdepth 1",
+        "find -L .",
+        "find -H .",
+        "find -P .",
+        "find . -delete",
+        "find . -exec rm {} \\;",
+        "find . -execdir rm {} +",
+        "find . -ok rm {} \\;",
+        "find . -okdir rm {} \\;",
+        "find . -fprint out",
+        "find . -fprint0 out",
+        "find . -fprintf out '%p'",
+        "find . -fls out",
+        "find . -type f -delete",
+        "find . -name '*.py' -exec rm {} +",
+        "find . -name '*.py' -fprint out",
+        "find . -print",
+        "find . -print0",
+        "find . -prune",
+        "find . -quit",
+        "find . -o -type f",
+        "find . -a -type f",
+        "find . ! -type f",
+        "find . \\( -type f \\)",
+        "find . -type b",
+        "find . -type c",
+        "find . -type p",
+        "find . -type s",
+        "find . -type F",
+        "find . -type ff",
+        "find . -type",
+        "find . -xtype f",
+        "find . -maxdepth",
+        "find . -maxdepth -1",
+        "find . -maxdepth +1",
+        "find . -maxdepth 1.5",
+        "find . -maxdepth 1x",
+        "find . -mindepth",
+        "find . -mindepth -1",
+        "find . -mindepth 1x",
+        "find . -type f /other",
+        "find . -name",
+        "find . -name *.py",
+        "find . -name x",
+        "find . -name ''",
+        'find . -iname ""',
+        "find . -path */vendor/*",
+        "find . -name '*.py",
+        "find . -name '*.py\"",
+        "find . -name 'a b'",
+        "find . -name '[ab]*'",
+        "find . -path '{src,tests}/*'",
+        "find . -name 'a;touch marker'",
+        "find ~",
+        'find "$HOME"',
+        "find ${ROOT}",
+        "find ./*",
+        "find 'with space'",
+        'find "/bundles"',
+        "find ./a:b",
+        "find $(pwd)",
+        "find `pwd`",
+        "find $((1+1))",
+        "find <(pwd)",
+        'find . -name "$(touch marker)"',
+        'find . -name "`touch marker`"',
+        'find . -name "${ROOT}*"',
+        "find . -name '$(touch marker)'",
+        "find . -name '*.py'$(touch marker)",
+        "find . -name x; rm y",
+        "find .; rm marker",
+        "find . -name '*.py'; touch marker",
+        "find . && rm marker",
+        "find . || touch marker",
+        "find . | xargs rm",
+        "find . & touch marker",
+        "find .\ntouch marker",
+        "find . -name '*.py'\ntouch marker",
+        "find . 2>/dev/null; touch marker",
+        "find . > out",
+        "find . >> out",
+        "find . 1> out",
+        "find . 2> out",
+        "find . 2>>/dev/null",
+        "find . 2> /dev/null",
+        "find . >/dev/null",
+        "find . &>/dev/null",
+        "find . 2>&1",
+        "find . < input",
+        "find . << EOF\nEOF",
+        "find . 2>/dev/null > out",
+        "find . >out 2>/dev/null",
+        "find . 2>/dev/null -type f",
+        "find . 2>/dev/null 2>/dev/null",
+        "find\t. -type f",
+        "find .\n-type f",
+        "/usr/bin/find .",
+        "command find .",
+        "head README.md",
+        "grep receipt README.md",
+    ],
+)
+def test_other_find_forms_keep_shell_receipt(command: str) -> None:
+    action = _action(tool="Bash", arguments={"command": command}, undoable=False, result=None)
+
+    receipt = render_receipt([action])
+
+    assert receipt is not None
+    assert "Shell request completed;" in receipt
+    assert "changes were not summarized and undo information is incomplete" in receipt
+
+
+@pytest.mark.parametrize(
+    "overrides,expected",
+    [
+        ({"result": {"summary": "located acme skill files"}}, "located acme skill files"),
+        ({"status": "failed"}, "failed"),
+        ({"undoable": True}, "restore information recorded"),
+        ({"detail": "manual restoration required"}, "manual restoration required"),
+    ],
+)
+def test_read_only_find_keeps_explicit_action_information(
+    overrides: dict[str, Any], expected: str
+) -> None:
+    action = _action(
+        tool="Bash", arguments={"command": "find . -type f"}, undoable=False, result=None
+    )
+    action.update(overrides)
+    original = deepcopy(action)
+
+    receipt = render_receipt([action])
+
+    assert receipt is not None
+    assert expected in receipt
+    assert "Shell request completed;" not in receipt
+    assert action == original
 
 
 def test_uncertain_bash_calls_are_counted_without_guessing_their_effects() -> None:
@@ -187,7 +393,7 @@ def test_an_action_that_explained_nothing_still_appears() -> None:
     receipt = render_receipt([_action(undoable=False, detail=None, result=None)])
 
     assert receipt is not None
-    assert "scale_deployment" in receipt
+    assert "scale deployment" in receipt
     assert "nothing reported a prior state" in receipt
 
 
@@ -325,12 +531,12 @@ def _mixed_turn() -> list[dict[str, Any]]:
 _MIXED_TURN_GOLDEN = (
     "_What I changed:_\n"
     "• scaled public/api from 3 to 10 — restore information recorded (2 calls)\n"
-    "• called `restart_deployment` — restarting pods cannot be undone\n"
-    "• called `stage_file` — cannot be undone: nothing reported a prior state\n"
+    "• restart deployment — restarting pods cannot be undone\n"
+    "• stage file — cannot be undone: nothing reported a prior state\n"
     "• Shell request completed; changes were not summarized and undo information "
     "is incomplete (2 calls)\n"
     "• filed acme-invoice.pdf — failed — check before retrying\n"
-    "• called `Bash` — failed — check before retrying"
+    "• shell request — failed — check before retrying"
 )
 
 
@@ -398,7 +604,7 @@ def test_failures_mode_keeps_only_the_failed_lines_under_the_same_header() -> No
     assert receipt == (
         "_What I changed:_\n"
         "• filed acme-invoice.pdf — failed — check before retrying\n"
-        "• called `Bash` — failed — check before retrying"
+        "• shell request — failed — check before retrying"
     )
 
 
@@ -460,6 +666,7 @@ def test_off_mode_never_renders_a_receipt() -> None:
 
     for actions in ([], [_action()], _mixed_turn(), _long_turn(), _failed_only(_mixed_turn())):
         assert render_receipt(actions, mode="off") is None
+
 
 # --- #1461: memory saves are recorded, not announced --------------------------
 
@@ -528,8 +735,7 @@ def test_generic_irreversible_tool_detail_explains_missing_prior_state(detail: s
     )
 
     assert receipt == (
-        "_What I changed:_\n"
-        "• called `mcp__acme__stage_file` — cannot be undone: nothing reported a prior state"
+        "_What I changed:_\n• stage file — cannot be undone: nothing reported a prior state"
     )
     assert detail not in receipt
 
@@ -556,7 +762,7 @@ def test_generic_detail_does_not_replace_failure_or_undoability(
         [_action(tool="mcp__acme__stage_file", result=None, detail=detail, **overrides)]
     )
 
-    assert receipt == f"_What I changed:_\n• called `mcp__acme__stage_file` — {verdict}"
+    assert receipt == f"_What I changed:_\n• stage file — {verdict}"
 
 
 @pytest.mark.parametrize("tool,noun", [("Skill", "Instruction"), ("Bash", "Shell")])
@@ -607,11 +813,11 @@ def test_native_request_with_prior_snapshot_and_no_target_does_not_deny_prior_st
 @pytest.mark.parametrize(
     "overrides,line",
     [
-        ({"status": "failed"}, "called `{tool}` — failed — check before retrying"),
-        ({"undoable": True}, "called `{tool}` — restore information recorded"),
+        ({"status": "failed"}, "{label} — failed — check before retrying"),
+        ({"undoable": True}, "{label} — restore information recorded"),
         (
             {"detail": "external changes require manual restoration"},
-            "called `{tool}` — external changes require manual restoration",
+            "{label} — external changes require manual restoration",
         ),
         (
             {"result": {"summary": "updated acme configuration"}},
@@ -625,7 +831,9 @@ def test_native_request_keeps_failure_undoability_custom_detail_and_summary(
     action = _action(tool=tool, result=None, undoable=False)
     action.update(overrides)
 
-    assert render_receipt([action]) == "_What I changed:_\n• " + line.format(tool=tool)
+    assert render_receipt([action]) == "_What I changed:_\n• " + line.format(
+        label="shell request" if tool == "Bash" else "instruction request"
+    )
 
 
 def test_native_request_groups_keep_counts_rows_and_distinct_request_kinds() -> None:
@@ -647,16 +855,17 @@ def test_native_request_groups_keep_counts_rows_and_distinct_request_kinds() -> 
         "• Shell request completed; changes were not summarized and undo information "
         "is incomplete (2 calls)\n"
         "• scaled public/api from 3 to 10 — restore information recorded\n"
-        "• called `Skill` — failed — check before retrying\n"
-        "• called `Skill` — failed — check before retrying"
+        "• instruction request — failed — check before retrying\n"
+        "• instruction request — failed — check before retrying"
     )
     assert actions == stored_rows
 
 
 @pytest.mark.parametrize("tool", ["mcp__acme__Skill", "mcp__acme__Bash"])
-def test_third_party_native_like_name_is_not_rewritten_or_hidden(tool: str) -> None:
+def test_third_party_native_like_name_is_plain_but_not_hidden_or_native(tool: str) -> None:
     assert render_receipt([_action(tool=tool, result=None, undoable=False)]) == (
-        f"_What I changed:_\n• called `{tool}` — cannot be undone: nothing reported a prior state"
+        f"_What I changed:_\n• {tool.rsplit('__', 1)[-1].lower()} — "
+        "cannot be undone: nothing reported a prior state"
     )
 
 
@@ -667,7 +876,7 @@ def test_native_instruction_request_still_obeys_receipt_modes() -> None:
     assert render_receipt([success], mode="all") is not None
     assert render_receipt([success], mode="failures") is None
     assert render_receipt([success, failure], mode="failures") == (
-        "_What I changed:_\n• called `Skill` — failed — check before retrying"
+        "_What I changed:_\n• instruction request — failed — check before retrying"
     )
     assert render_receipt([success, failure], mode="off") is None
 
@@ -683,6 +892,135 @@ def test_unknown_action_with_prior_snapshot_does_not_claim_it_was_absent(
         [_action(tool="third_party_action", undoable=False, **snapshot_fields)]
     )
     assert receipt is not None
-    assert "third_party_action" in receipt
+    assert "third party action" in receipt
     assert "undo information is incomplete" in receipt
     assert "nothing reported a prior state" not in receipt
+
+
+@pytest.mark.parametrize(
+    "tool,label",
+    [
+        ("mcp__acme__file_attachment", "file attachment"),
+        ("mcp__acme__nested__createInvoice", "create invoice"),
+        ("mcp__acme__", "action"),
+        ("mcp__only", "action"),
+        (None, "action"),
+        ("bad\nname", "action"),
+        ("Read", "read file"),
+        ("Edit", "edit file"),
+    ],
+)
+@pytest.mark.parametrize(
+    "status,verdict",
+    [("succeeded", "restore information recorded"), ("failed", "failed — check before retrying")],
+)
+def test_every_receipt_fallback_is_plain_and_status_is_independent(
+    tool: str | None, label: str, status: str, verdict: str
+) -> None:
+    action = _action(tool=tool, result=None, status=status)
+    original = deepcopy(action)
+    assert render_receipt([action]) == f"_What I changed:_\n• {label} — {verdict}"
+    assert action == original
+
+
+def test_connector_metadata_replaces_identifier_references_and_keeps_content() -> None:
+    tool = "mcp__acme__file_attachment"
+    action = _action(
+        tool=tool,
+        result={"summary": f"{tool} attached acme_invoice.pdf to public/api"},
+        undoable=False,
+        detail=f"{tool}: manual restoration required",
+    )
+    original = deepcopy(action)
+    assert render_receipt([action]) == (
+        "_What I changed:_\n• file attachment attached acme_invoice.pdf to public/api — "
+        "file attachment: manual restoration required"
+    )
+    assert action == original
+
+
+def test_connector_metadata_does_not_rewrite_identifier_substrings_in_content() -> None:
+    action = _action(
+        tool="stage_file",
+        result={"summary": "saved acme_stage_file.txt"},
+        undoable=False,
+        detail="restore acme_stage_file.txt manually",
+    )
+    assert render_receipt([action]) == (
+        "_What I changed:_\n• saved acme_stage_file.txt — restore acme_stage_file.txt manually"
+    )
+
+
+def test_connector_metadata_normalizes_secondary_mcp_references() -> None:
+    action = _action(result={"summary": "mcp__acme__file_attachment followed mcp__acme__readFile"})
+    assert (
+        render_receipt([action])
+        == "_What I changed:_\n• file attachment followed read file — restore information recorded"
+    )
+
+
+def test_action_labels_match_shared_presentation_vectors() -> None:
+    vector_path = Path(__file__).resolve().parents[3] / "tests/vectors/user-action-wording.json"
+    for vector in json.loads(vector_path.read_text())["vectors"]:
+        assert action_label(vector["tool"]) == vector["label"]
+
+
+def test_native_words_in_connector_content_are_not_tool_references() -> None:
+    action = _action(tool="Read", result={"summary": "Read permissions updated for acme.txt"})
+    assert render_receipt([action]) == (
+        "_What I changed:_\n• Read permissions updated for acme.txt — restore information recorded"
+    )
+
+
+@pytest.mark.parametrize(
+    "tool,label", [("mcp__acme__send_message", "send message"), ("send_message", "send message")]
+)
+@pytest.mark.parametrize("ending", [".", ". Next action.", ".\nNext action.", '."'])
+def test_connector_tool_reference_before_sentence_period(
+    tool: str, label: str, ending: str
+) -> None:
+    action = _action(
+        tool=tool,
+        result={"summary": f"Called {tool}{ending}"},
+        detail=f"Restore {tool}{ending}",
+        undoable=False,
+    )
+    assert render_receipt(
+        [action]
+    ) == f"_What I changed:_\n• Called {label}{ending} — Restore {label}{ending}".replace(
+        ".\n", ". "
+    )
+
+
+@pytest.mark.parametrize("tool", ["mcp__acme__send_message", "send_message"])
+@pytest.mark.parametrize(
+    "content",
+    [
+        "{tool}.json",
+        "{tool}.backup.txt",
+        "./{tool}",
+        "/tmp/{tool}.json",
+        "https://example.com/{tool}",
+    ],
+)
+def test_connector_tool_identifiers_inside_files_and_paths_stay_content(
+    tool: str, content: str
+) -> None:
+    summary = content.format(tool=tool)
+    action = _action(tool=tool, result={"summary": summary}, detail=summary, undoable=False)
+    assert render_receipt([action]) == f"_What I changed:_\n• {summary} — {summary}"
+
+
+def test_receipt_metadata_uses_all_approval_reference_boundaries() -> None:
+    """@spec WORKER-RECEIPT-1: metadata sibling boundaries preserve ledger data."""
+    cases = json.loads(
+        (Path(__file__).resolve().parents[3] / "tests/vectors/user-action-wording.json").read_text()
+    )["metadata_references"]
+    for case in cases:
+        action = _action(tool=case["tool"], result={"summary": case["summary"]})
+        before = deepcopy(action)
+        display = " ".join(case["display"].split())
+        assert render_receipt([action]) == (
+            f"_What I changed:_\n• {display} — restore information recorded"
+        ), case
+        assert action == before

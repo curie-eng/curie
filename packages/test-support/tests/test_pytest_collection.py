@@ -11,8 +11,13 @@ import pytest
 REPO_ROOT = Path(__file__).resolve().parents[3]
 
 # A suite outside pytest's roots must be an intentional exception, named with
-# the reason it is safe to leave uncollected. There are no such exceptions today.
-COLLECTION_EXCLUSIONS: dict[str, str] = {}
+# the reason it is safe to leave uncollected.
+COLLECTION_EXCLUSIONS: dict[str, str] = {
+    "apps/docker-daemon/tests": (
+        "Rust and shell tests for the daemon image crate, run by cargo test and "
+        "the docker-daemon CI job; it holds no Python"
+    ),
+}
 
 
 def _audit_test_directories(

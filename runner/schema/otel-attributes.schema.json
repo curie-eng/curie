@@ -2,6 +2,7 @@
   "$id": "https://schemas.curietech.ai/runner/otel-attributes/v1.json",
   "schema_version": "v1",
   "keys": {
+    "curie.budget.output_ceiling": "int",
     "curie.generation.round": "int",
     "curie.generation.ttft_ms": "int",
     "curie.phase": "str",
@@ -10,6 +11,7 @@
     "curie.sandbox_id": "str",
     "curie.session_id": "str",
     "curie.terminal.cause": "str",
+    "curie.terminal.classification": "str",
     "curie.terminal.status": "str",
     "curie.tool.call.index": "int",
     "curie.tool.outcome": "str",

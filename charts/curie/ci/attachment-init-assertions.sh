@@ -36,6 +36,15 @@
 #     init container, no volume, no mount. The feature has to be absent when
 #     absent, not present-and-empty.
 #
+#  5. ADR 0205: the runner container declares CURIE_ATTACHMENTS_MANIFEST (empty),
+#     because claim env injection only overrides env the pod template already
+#     declares; the thread's file count and byte budget reach the worker as
+#     CURIE_ATTACHMENT_THREAD_MAX_FILES / _BYTES; a byte budget the attachments
+#     volume cannot hold refuses to render (the worker counts the CURRENT
+#     message's files inside threadMaxBytes too, so the budget is the whole
+#     boot's footprint on the volume, not just the earlier files'); and the init
+#     container's fetch deadline keeps its 45 second default.
+#
 # Runnable locally (from anywhere) and from CI. Fails loudly.
 set -euo pipefail
 
@@ -454,12 +463,129 @@ print("ok: the shipped default (worker.attachments.enabled: false) renders no")
 print(f"    {INIT_NAME}, no attachment volume, no runner mount, and tells the")
 print("    worker CURIE_ATTACHMENT_ENABLED=false -- one value, both halves")
 
+# --- ADR 0205: the thread's set (decisions 7 and 8) --------------------------
+
+MANIFEST_ENV = "CURIE_ATTACHMENTS_MANIFEST"
+THREAD_FILES_ENV = "CURIE_ATTACHMENT_THREAD_MAX_FILES"
+THREAD_BYTES_ENV = "CURIE_ATTACHMENT_THREAD_MAX_BYTES"
+
+
+def try_render(*sets):
+    command = ["helm", "template", "curie", CHART, "--namespace", "dev"]
+    for assignment in sets:
+        command += ["--set", assignment]
+    return subprocess.run(command, capture_output=True, text=True)
+
+
+# (a) The runner declares the manifest key, empty, so the claim can fill it. It
+# is not a capability (names and outcomes only), so unlike the reference it is
+# the RUNNER that must hold it.
+on_runner = named(pod_spec(default_docs)["containers"], "runner")
+manifest = [e for e in on_runner.get("env", []) if e["name"] == MANIFEST_ENV]
+assert len(manifest) == 1, (
+    f"the runner container does not declare {MANIFEST_ENV} exactly once "
+    f"(found {manifest}). The claim's env injection only overrides env the pod "
+    "template already declares, so the runner would never learn which files are "
+    "the current message's."
+)
+assert manifest[0].get("value") == "" and "valueFrom" not in manifest[0], (
+    f"{MANIFEST_ENV} on the runner must be baked as an empty value, got {manifest[0]}"
+)
+print(f"ok: the runner declares {MANIFEST_ENV} with an empty value")
+
+# (b) The thread budget reaches the worker, defaults and overrides both.
+on_env = worker_env(default_docs)
+for name, expected in ((THREAD_FILES_ENV, 20), (THREAD_BYTES_ENV, 268435456)):
+    entry = on_env.get(name)
+    assert entry is not None and str(entry.get("value", "")) != "", (
+        f"the worker Deployment has no {name}; the thread budget values are not "
+        "threaded to the process that applies them"
+    )
+    assert float(str(entry["value"])) == expected, (
+        f"{name} defaults to {entry['value']!r}, expected {expected}"
+    )
+overridden = worker_env(
+    render(
+        LANE_ON,
+        "worker.attachments.threadMaxFiles=7",
+        "worker.attachments.threadMaxBytes=1048576",
+    )
+)
+assert float(str(overridden[THREAD_FILES_ENV]["value"])) == 7, (
+    f"worker.attachments.threadMaxFiles=7 renders {THREAD_FILES_ENV}={overridden[THREAD_FILES_ENV]}"
+)
+assert float(str(overridden[THREAD_BYTES_ENV]["value"])) == 1048576, (
+    f"worker.attachments.threadMaxBytes=1048576 renders {THREAD_BYTES_ENV}={overridden[THREAD_BYTES_ENV]}"
+)
+print(f"ok: worker.attachments.threadMaxFiles/threadMaxBytes reach the worker as {THREAD_FILES_ENV}/{THREAD_BYTES_ENV}")
+
+# (c) A byte budget the volume cannot hold is refused at render time. The
+# worker counts the current message's files inside threadMaxBytes (the budget
+# is everything one boot materializes), so a budget that fits the volume means
+# the whole boot fits it. This is checked against
+# the volume's ACTUAL sizeLimit rather than a constant: over the default 512Mi
+# fails, exactly 512Mi renders, and the same 1Gi budget renders once the volume
+# is raised to 2Gi.
+over = try_render(LANE_ON, "worker.attachments.threadMaxBytes=1073741824")
+assert over.returncode != 0, (
+    "worker.attachments.threadMaxBytes=1Gi rendered against a 512Mi attachments "
+    "volume; the thread's files would overflow the emptyDir and the pod would be "
+    "evicted mid-boot instead of the chart refusing the values"
+)
+assert "threadMaxBytes" in over.stderr, (
+    f"the refusal does not name threadMaxBytes, so an operator cannot tell what to change:\n{over.stderr}"
+)
+fits = try_render(LANE_ON, "worker.attachments.threadMaxBytes=536870912")
+assert fits.returncode == 0, (
+    f"a threadMaxBytes equal to the 512Mi sizeLimit was refused:\n{fits.stderr}"
+)
+raised = try_render(
+    LANE_ON,
+    "worker.attachments.threadMaxBytes=1073741824",
+    "agentSandbox.runner.attachments.sizeLimit=2Gi",
+)
+assert raised.returncode == 0, (
+    "a 1Gi threadMaxBytes was refused against a 2Gi attachments volume; the check "
+    f"compares against a constant rather than the configured sizeLimit:\n{raised.stderr}"
+)
+print("ok: a threadMaxBytes over the attachments volume's sizeLimit refuses to render")
+
+# (d) The init container's fetch deadline keeps its 45 second default (an
+# earlier file that does not fit in it is skipped, never fatal) and is the
+# operator's value, not a literal.
+with open(f"{CHART}/values.yaml") as handle:
+    chart_values = yaml.safe_load(handle)
+default_timeout = chart_values["agentSandbox"]["runner"]["attachments"]["fetchTimeoutSeconds"]
+assert default_timeout == 45, (
+    f"agentSandbox.runner.attachments.fetchTimeoutSeconds defaults to {default_timeout}, "
+    "expected 45: earlier files are best effort inside the existing deadline, "
+    "so a thread's history does not lengthen every boot"
+)
+init_script = script_of(named(pod_spec(default_docs)["initContainers"], INIT_NAME))
+assert 45.0 in numeric_literals(init_script), (
+    "the rendered attachments-init program does not carry the 45 second fetch deadline"
+)
+custom = script_of(
+    named(
+        pod_spec(render(LANE_ON, "agentSandbox.runner.attachments.fetchTimeoutSeconds=77"))[
+            "initContainers"
+        ],
+        INIT_NAME,
+    )
+)
+assert 77.0 in numeric_literals(custom) and 45.0 not in numeric_literals(custom), (
+    "fetchTimeoutSeconds=77 did not replace the rendered fetch deadline"
+)
+print("ok: the init container's fetch deadline defaults to 45s and follows the value")
+
 print()
 print(
     "PASS: attachments-init runs before the runner, shares one size-limited "
     "emptyDir with it, receives the presigned reference that the runner never "
     "sees, verifies the minted sha256, enforces the worker's own size cap, and "
     "disappears entirely -- on both halves, from one value -- when the lane is "
-    "switched off."
+    "switched off; the runner declares the attachment manifest, the thread "
+    "budget reaches the worker and must fit the volume, and the fetch deadline "
+    "defaults to 45 seconds."
 )
 PY

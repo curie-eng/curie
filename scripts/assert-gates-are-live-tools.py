@@ -4,7 +4,7 @@
 Why this has to exist
 ---------------------
 An approval gate is armed by EXACT STRING MATCH against the tool name the SDK
-reports (`curie_runner.approval.build_can_use_tool` compares
+reports (`curie_runner.harness.claude.approval.build_can_use_tool` compares
 `tool_name in gate.required`). A gate naming a tool that does not exist arms
 nothing -- and nothing anywhere reports it. The connector still works, the tool
 still runs, no error is raised, and the approval card simply never appears.

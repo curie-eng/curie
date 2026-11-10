@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Three guards on a pull request body.
+# Guards on a pull request body.
 #
 # 1. Reject a literal "\\n" escape. GitHub displays that escape as text rather
 #    than a line break, so a following `Closes #<issue>` is not parsed as a
@@ -11,12 +11,12 @@
 #    robot-emoji footer and were merged (#2225). The body is the half a human
 #    reviewer sees first and the half no rebase can rewrite.
 # 3. Reject a patch-release PR (title `Prepare the vX.Y.Z release` with Z not
-#    0) whose Trigger or Live proof section is missing, comment-only, or empty
-#    of issue numbers / a run URL or explicit waiver (#2251). The v0.8.x patch
+#    0) whose Trigger lacks issue numbers, or whose visible Live proof lacks
+#    this-pr-ci, a run URL, or an explicit waiver (#2251). The v0.8.x patch
 #    PRs shipped as release mechanics with every product tier marked n/a.
 #
 # Usage:
-#   scripts/check-pr-body.sh <body-file> [--title-file <title-file>]
+#   scripts/check-pr-body.sh <body-file> [--title-file <file>]
 #   scripts/check-pr-body.sh --self-test
 set -euo pipefail
 
@@ -25,7 +25,7 @@ SCRIPT_PATH="$SCRIPT_DIR/$(basename "${BASH_SOURCE[0]}")"
 COMMIT_GATE="$SCRIPT_DIR/check-commit-messages.sh"
 
 usage() {
-    echo "Usage: scripts/check-pr-body.sh <body-file> [--title-file <title-file>]" >&2
+    echo "Usage: scripts/check-pr-body.sh <body-file> [--title-file <file>]" >&2
     echo "       scripts/check-pr-body.sh --self-test" >&2
 }
 
@@ -108,8 +108,12 @@ trigger_lists_issue_numbers() {
     grep -qE '#[0-9]+' <<<"$1"
 }
 
-live_proof_names_url_or_waiver() {
+live_proof_names_ci_url_or_waiver() {
     local text="$1"
+    # A standalone marker defers proof to this PR's current-head CI.
+    if grep -qx 'this-pr-ci' <<<"$text"; then
+        return 0
+    fi
     if grep -qiE 'https?://' <<<"$text"; then
         return 0
     fi
@@ -132,16 +136,18 @@ check_patch_release_sections() {
     fi
 
     proof_text="$(section_visible "Live proof" "$body_file" || true)"
-    if [[ -z "$proof_text" ]] || ! live_proof_names_url_or_waiver "$proof_text"; then
-        echo "PR body check failed: patch release PRs must have a non-empty Live proof section naming a run URL or an explicit waiver." >&2
+    if [[ -z "$proof_text" ]] || ! live_proof_names_ci_url_or_waiver "$proof_text"; then
+        echo "PR body check failed: patch release PRs must have a non-empty Live proof section naming standalone this-pr-ci, a run URL, or an explicit waiver." >&2
         return 1
     fi
     return 0
 }
 
+# Keep the normal guard offline. CI supplies both snapshots through files;
+# validation and path classification are part of this same command boundary.
 check_body_file() {
     local body_file="$1"
-    local title_file="${2:-}"
+    local title_file="$2"
     local grep_status title=""
     local patch_release=0
 
@@ -205,8 +211,10 @@ check_body_file() {
 
 self_test() {
     local temp_dir real_newline_body literal_escape_body attributed_body footer_no_newline_body
-    local empty_patch_body filled_patch_body comment_trigger_body empty_proof_body
+    local empty_patch_body filled_patch_body comment_trigger_body empty_proof_body marker_patch_body
     local patch_title feature_title patch10_title
+    local case_name expected body_text status index
+    local -a patch_release_cases
 
     temp_dir="$(mktemp -d "${TMPDIR:-/tmp}/curie-pr-body-check.XXXXXX")"
     trap 'rm -rf -- "$temp_dir"' RETURN
@@ -218,10 +226,10 @@ self_test() {
     filled_patch_body="$temp_dir/filled-patch.md"
     comment_trigger_body="$temp_dir/comment-trigger.md"
     empty_proof_body="$temp_dir/empty-proof.md"
+    marker_patch_body="$temp_dir/marker-patch.md"
     patch_title="$temp_dir/patch-title.txt"
     feature_title="$temp_dir/feature-title.txt"
     patch10_title="$temp_dir/patch-10-title.txt"
-
     printf 'Describe a fix.\n\nCloses #1713\n' >"$real_newline_body"
     printf 'Describe a fix.\\n\\nCloses #1713\n' >"$literal_escape_body"
     # The exact footer that reached #2225, and the same footer with no trailing
@@ -313,6 +321,37 @@ self_test() {
         echo "PR body check self-test failed: filled Trigger and Live proof were rejected" >&2
         return 1
     fi
+
+    # Three fields per patch case: name, expected status, body. A marker must
+    # supply visible proof in its own section without weakening the Trigger.
+    patch_release_cases=(
+        "standalone this-pr-ci Live proof is accepted" 0 $'## Trigger\n\n#2202\n\n## Live proof\n\nthis-pr-ci'
+        "explicit Live proof waiver remains accepted" 0 $'## Trigger\n\n#2202\n\n## Live proof\n\nwaiver: No live provider behavior changed.'
+        "misspelled this-pr-ci marker is rejected" 1 $'## Trigger\n\n#2202\n\n## Live proof\n\nthis-pr-cl'
+        "prose mentioning this-pr-ci is rejected" 1 $'## Trigger\n\n#2202\n\n## Live proof\n\nThe this-pr-ci marker will be added after validation.'
+        "comment-only this-pr-ci marker is rejected" 1 $'## Trigger\n\n#2202\n\n## Live proof\n\n<!-- this-pr-ci -->'
+        "multiline comment-only this-pr-ci marker is rejected" 1 $'## Trigger\n\n#2202\n\n## Live proof\n\n<!--\nthis-pr-ci\n-->'
+        "this-pr-ci outside Live proof is rejected" 1 $'## Summary\n\nthis-pr-ci\n\n## Trigger\n\n#2202\n\n## Live proof\n\nPending proof.'
+        "this-pr-ci after Live proof is rejected" 1 $'## Trigger\n\n#2202\n\n## Live proof\n\nPending proof.\n\n## Follow-ups\n\nthis-pr-ci'
+        "this-pr-ci without Trigger is rejected" 1 $'## Live proof\n\nthis-pr-ci'
+        "this-pr-ci with comment-only Trigger is rejected" 1 $'## Trigger\n\n<!-- #2202 -->\n\n## Live proof\n\nthis-pr-ci'
+    )
+    for ((index = 0; index < ${#patch_release_cases[@]}; index += 3)); do
+        case_name="${patch_release_cases[index]}"
+        expected="${patch_release_cases[index + 1]}"
+        body_text="${patch_release_cases[index + 2]}"
+        printf '%s\n' "$body_text" >"$marker_patch_body"
+        if bash "$SCRIPT_PATH" "$marker_patch_body" --title-file "$patch_title" >/dev/null 2>&1; then
+            status=0
+        else
+            status=$?
+        fi
+        if ((status != expected)); then
+            echo "PR body check self-test failed: $case_name (expected $expected, observed $status)" >&2
+            return 1
+        fi
+    done
+
     if ! bash "$SCRIPT_PATH" "$empty_patch_body" --title-file "$feature_title" >/dev/null; then
         echo "PR body check self-test failed: a feature-release title was gated as a patch" >&2
         return 1
@@ -322,7 +361,8 @@ self_test() {
         return 1
     fi
 
-    echo "PR body check self-test passed: clean body accepted, literal \\n and AI attribution rejected, empty patch-release Trigger and Live proof rejected"
+    echo "PR body check self-test passed: real newlines accepted, literal \\n and AI attribution rejected, empty patch release Trigger and Live proof rejected"
+
 }
 
 if [[ "${1:-}" == "--self-test" ]]; then
@@ -339,7 +379,7 @@ title_file=""
 while (($#)); do
     case "$1" in
         --title-file)
-            if (($# < 2)); then
+            if (($# < 2)) || [[ -n "$title_file" ]]; then
                 usage
                 exit 2
             fi

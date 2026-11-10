@@ -1,0 +1,3 @@
+docker: Error response from daemon: authorization denied by plugin curie-authz: refused by rule host-namespace: body.HostConfig.UsernsMode is "host"
+
+Run 'docker run --help' for more information

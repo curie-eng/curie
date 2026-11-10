@@ -6,8 +6,7 @@
 //! as Installed from the chart name alone. These run the real binary against
 //! stubbed kubectl/helm.
 
-#[path = "support/executable.rs"]
-mod test_executable;
+use crate::support::executable as test_executable;
 
 use std::ffi::OsString;
 use std::fs;

@@ -252,6 +252,7 @@ def _runner(
     capacity_exceeded: bool = False,
 ) -> SessionRunner:
     return SessionRunner(
+        max_usd_per_day=None,
         held_secrets=frozenset(),
         session_factory=lambda: session,
         ceiling=0,
@@ -701,8 +702,10 @@ def test_factory_sized_turn_preserves_long_final_answer_and_first_user() -> None
     assert state.value is not None
     assert _size(state.value) <= _CAP - _RESERVE
     stored = TurnRecord.from_dict(state.value[-1])
+    from curie_runner.sender_frame import frame_user_turn
+
     assert stored.user == first_user
-    assert stored.messages[0].content == first_user
+    assert stored.messages[0].content == frame_user_turn("message", "U", first_user, None)
     assert stored.assistant == final_answer
     assert stored.messages[-1].content == [{"type": "text", "text": final_answer}]
 

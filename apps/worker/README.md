@@ -16,15 +16,21 @@ env built from the resolution: `CURIE_BUDGET` (the agent's
 `max_usd_per_day`/`max_output_tokens_per_run`, platform defaults when NULL),
 `CURIE_SESSION_ID`, `CURIE_PLUGIN_DIR`, and
 `CURIE_BUNDLE_REF` (the RustFS key). An unmapped channel is a polite placeholder
-edit and drop, never a crash. The claim env also carries a per-sandbox
+edit and drop, never a crash. The boot env also carries a per-sandbox
 `CURIE_RUNNER_TOKEN` (minted with `secrets.token_urlsafe`) that the `RunnerClient`
 sends as an `Authorization: Bearer` header on every ACI call to that sandbox
-(issue #63).
+(issue #63). On Kubernetes this token and the other scoped tokens never ride the
+`SandboxClaim`: the worker writes them to a per-claim Secret that a per-claim
+SandboxTemplate copy reads by `secretKeyRef`, all garbage-collected with the
+claim and swept by the reaper if orphaned. The Docker substrate still passes them
+in the container env.
 
 > Handoff: `CURIE_BUNDLE_REF` is a RustFS object key; the runner reads
 > `CURIE_PLUGIN_DIR` as a local mounted path and does not fetch. Fetching the
-> bundle key into the plugin dir is sandbox provisioning (an init container in the
-> sandbox substrate's SandboxTemplate / the chart), owned there, not by the worker.
+> bundle key into the plugin dir belongs to sandbox provisioning. Kubernetes
+> uses the SandboxTemplate's init containers; the Docker substrate fetches and
+> validates the bundle, then copies it through the Docker API into a read-only
+> named volume.
 
 **Kill switch** (`killswitch.py`): subscribes to the kill-switch Valkey channel
 `curie:kill-events`; on `kill` for an agent it interrupts that agent's live
@@ -98,6 +104,39 @@ queued turn whose `tool_access` is set (a canary sets `read-only`):
   turn, `tool-access-unenforced` and `tool-access-refused`, are platform error
   classes: a turn the runner refuses escalates under its class, never as
   `unclassified`.
+
+The worker's half of channel read (ADR 0100, ADR 0200, `kernel/channel_read.py`),
+for a bundle whose manifest grants any of `channelRead`, `canvasList`,
+`canvasRead` or `canvasEdit`. The worker is the only issuer
+of the capability the runner's `curie-slack` tools use:
+
+- **WORKER-CHANNEL-READ-1:** At turn open, on every path that opens a turn (a
+  fresh claim, a replacement, an attachment handoff, a work-item continuation),
+  the worker reads the grant from the manifest of the bundle the sandbox booted
+  with, cached by bundle ref, and mints a `chr` capability through the API's
+  internal context route. An ungranted bundle makes no mint call and the event
+  carries a null `channel_read`. A retained sandbox keeps the deployment it
+  first booted with: a pin names the claim and deployment, and when the pin is
+  missing the claim's own bundle ref must equal the resolved one to recover it,
+  otherwise the turn gets no capability.
+- **WORKER-CHANNEL-READ-2:** A granted turn on a runner whose status does not
+  carry `channel_read` as literal `true` is refused once, escalated with the
+  class `channel-read-unenforced`, and not retried, whatever the mint outcome.
+  When the grant cannot be read from the bundle and the mint also fails, the
+  worker cannot tell whether enforcement is owed, so the turn is not run and is
+  retried like any turn the runner did not accept (`runner-error`).
+- **WORKER-CHANNEL-READ-3:** The capability is a lease. The API's active key
+  lives 90 seconds, and a heartbeat child of the attempt renews it every 30
+  seconds with an owner-checked refresh until the attempt ends, so a worker
+  that dies or loses Valkey lets it lapse within one lease. A steer renews
+  the live logical turn (same deployment, event and default channel, no owner)
+  only when the retained runner reports a live turn and advertises channel
+  read; any failure sends null, which clears the runner's credential.
+- **WORKER-CHANNEL-READ-4:** Every attempt end, including cancellation,
+  deletes the live record, tombstones the attempt's owner (so a mint the API
+  commits late is refused), and revokes by owner directly in the shared Valkey,
+  covering a mint whose answer was lost. A failed revoke is retried with
+  bounded backoff until the token's expiry and attempted again at shutdown.
 
 ## The eval lane (`curie_worker.eval`)
 
@@ -176,6 +215,14 @@ Runtime rules (each has a provoking integration test in `tests/eval/test_stream.
   **provision a runner via the sandbox substrate** (the same warm-pool `claim` chat runs
   use, boot env carrying `CURIE_BUNDLE_REF` + budget), eval against it, and tear it
   down in a `finally`. A provisioning failure is a failed run reported and acked.
+- **Hosted connectors retain their authority boundary.** A provisioned eval
+  receives the configured release/namespace and the tenant-scoped agent name,
+  plus an agent-only signed caller when signing is configured. The same agent
+  snapshot supplies its operator approval-required tools: bundle policy cannot
+  remove them during evaluation. Unreadable or malformed stored approval policy
+  prevents provisioning. Partial connector scope emits no scope or caller token;
+  missing signing configuration emits no caller token. No protected run/work-item
+  identity or approval grant is invented, and evals still omit ambient state refs.
 - **XACK only after the report POST attempt completes** (success, or terminally failed
   after bounded retries and logged). A worker crash before that leaves the entry
   pending. The shared runs/eval liveness path promptly transfers a capable dead
@@ -208,9 +255,10 @@ end-to-end (no `target_url`) that boots via the substrate and releases in a fina
 
 The kernel closes the loop: it consumes `QueuedTurn` entries the dispatcher
 puts on the `curie:runs` Valkey stream, routes each to a runner turn in a
-claimed sandbox, streams the NDJSON (newline-delimited JSON) reply back into
-the Slack thread by editing the placeholder in place, and gets every failure
-mode right.
+claimed sandbox, consumes its NDJSON events, and delivers the terminal answer
+back into the Slack thread. Provisional assistant text and tool notes remain
+internal diagnostics. The ordinary completion outbox stores the terminal
+answer before delivery, so a delivery retry does not rerun the model.
 
 ```
 XREADGROUP curie:runs        Consumer (consumer group; a pending entry is
@@ -221,12 +269,15 @@ XREADGROUP curie:runs        Consumer (consumer group; a pending entry is
         -> SlackSink     chat.update placeholder to booting text (best effort)
         -> substrate.lookup/claim/resume   (sandbox substrate)
         -> RunnerClient  POST /v1/event | /v1/steer | /v1/interrupt   (runner)
-        -> SlackSink     chat.update the placeholder as frames stream
+        -> completion outbox   persist terminal answer under the lease fence
+        -> SlackSink     update/post the answer and sequential continuations
    -> XACK
 ```
 
-A targeted cron turn posts one message containing the final reply and does not
-show the booting caption or stream partial edits.
+A targeted cron turn delivers the final answer without a booting caption or
+partial edits. Oversized Slack answers use sequential continuation messages
+in the same thread rather than discarding text. Action receipts are off by
+default; an operator can explicitly select `all` or `failures`.
 
 Rules (detailed-architecture 2b), each with an integration test that provokes it
 (`tests/kernel/`):
@@ -250,7 +301,7 @@ Rules (detailed-architecture 2b), each with an integration test that provokes it
   a non-idempotent action. For noncron turns, flag-clean failures retry by
   classification:
   `rate-limit`, `runner-error`, `runner-timeout`, `sandbox-capacity`,
-  `sandbox-terminated` and `workspace-error` are transient (bounded exponential
+  `sandbox-terminated`, `workspace-error` and `model-unreachable` are transient (bounded exponential
   backoff);
   `budget-exceeded` and everything else escalate.
   `runner-timeout` is the runner's streaming budget expiring mid-turn (#2011),
@@ -258,7 +309,7 @@ Rules (detailed-architecture 2b), each with an integration test that provokes it
   confirmed sandbox termination. When Kubernetes confirms that the sandbox pod
   terminated during the stream, the worker classifies the failure as
   `sandbox-terminated`; the terminal notice includes the Kubernetes termination
-  reason so an operator can diagnose it before retrying.
+  reason so an operator can diagnose it before retrying. The worker waits up to 10 s for Kubernetes to confirm a termination before it classifies a dropped stream.
   `workspace-error` is a managed-workspace preparation FAULT before the turn was
   ever accepted (#2004): the clone, the archive, or the upload. It is told apart
   from `runner-error` for the same
@@ -446,7 +497,7 @@ The floor of 2 is enforced because `max_delivery=1` would dead-letter every
 ordinary worker crash on its first reclaim; values below 3 undermine the crash
 recovery of ADR-0013.
 
-Config surface (`WorkerConfig`): `VALKEY_*`, `SLACK_BOT_TOKEN`,
+Config surface (`WorkerConfig`): `VALKEY_*`, `CURIE_CHANNEL_GATEWAY_URL`, `CURIE_CHANNEL_GATEWAY_TOKEN`,
 `CURIE_STREAM` / `CURIE_CONSUMER_GROUP` / `CURIE_CONSUMER_NAME`,
 `CURIE_WORKER_MAX_CONCURRENCY` (turns one worker runs at once, default `16`,
 `1` through `256`; chart `worker.maxConcurrency`),
@@ -479,6 +530,16 @@ alone. Preserve counts and every stored action. Do not suppress instruction
 requests or promote them to read-only: loading one can execute dynamic context.
 Custom descriptions, summaries, failed warnings and undoable verdicts retain
 their existing meaning.
+
+<!-- @spec WORKER-RECEIPT-2 -->
+Every receipt description uses plain action wording, including failed native
+requests, MCP calls, and connector-provided summaries and details. Strip the
+MCP namespace, split identifier words, and describe the action without inferring
+success; an absent or invalid identifier becomes `action`. Replace identifier
+references in presentation metadata while preserving surrounding content and
+restore/failure meaning. Stored ledger identifiers and arguments remain unchanged.
+An MCP tool named like a native request is still a connector action, never
+suppressed or treated as a native completed request.
 
 Tests: `uv run pytest apps/worker/tests/kernel -q` runs against the real Valkey
 from `compose.dev.yaml`, the real sandbox substrate with a fake Kubernetes client whose
@@ -525,7 +586,8 @@ source without a container rebuild -- point it at the stack's exposed ports:
 export CLAUDE_CODE_OAUTH_TOKEN=...        # or ANTHROPIC_API_KEY=... / CURIE_CREDENTIALS=...
 env CURIE_SANDBOX_SUBSTRATE=docker \
     VALKEY_HOST=localhost VALKEY_PORT=26379 VALKEY_PASSWORD=valkeypass \
-    SLACK_API_BASE_URL=http://localhost:8155/api/ SLACK_BOT_TOKEN=xoxb-dev \
+    CURIE_CHANNEL_GATEWAY_URL=http://localhost:8081 CURIE_CHANNEL_GATEWAY_ALLOW_INSECURE=true \
+    CURIE_CHANNEL_GATEWAY_TOKEN=curie-dev-gateway-worker \
     CURIE_DOCKER_NETWORK=curie_default \
     OTEL_EXPORTER_OTLP_ENDPOINT=http://otel-collector:4318 \
     uv run python -m curie_worker &
@@ -545,16 +607,31 @@ env CURIE_SANDBOX_SUBSTRATE=docker \
   failure).
 - `CURIE_RUNNER_IMAGE` overrides the runner image tag (default
   `curie-runner`).
-- `VALKEY_HOST`/`VALKEY_PORT`/`VALKEY_PASSWORD` and `SLACK_BOT_TOKEN` point at
-  the compose stack's exposed ports and dev bot token (see `compose.dev.yaml`);
-  `SLACK_API_BASE_URL` points at the stack's Slack stub instead of real
-  slack.com.
+- `VALKEY_HOST`/`VALKEY_PORT`/`VALKEY_PASSWORD` point at the compose stores.
+  The worker uses a gateway caller credential for provider operations;
+  configure `SLACK_API_BASE_URL` on the gateway to select the stack's Slack stub.
+
+The protected worker's `process.json` uses schema version 2 and a
+`channel_gateway` object with `url`, `token`, `allow_insecure_http` and
+`identities`. Its token authenticates this worker to the gateway. TLS is required
+unless `allow_insecure_http` is explicitly true. Empty URL, token and identities
+disable Slack delivery. Both worker entry points refuse ambient Slack tokens,
+and the protected worker rejects the former provider-credential configuration.
 
 Drive a turn the normal way once it's up (`curie local deploy` / `curie
 local message`, pinned at whichever API port you brought up) -- the hand-run
 worker claims runner containers on the same Docker daemon exactly as the
 compose-managed one would. For an offline round-trip, add `CURIE_FAKE_MODEL=1`
 to the env above and drop the credential.
+
+The Docker substrate fetches and validates the bundle, workspace, and attachment
+inputs before copying them through the Docker API into named volumes. Each
+volume and transfer helper carries claim and creation-attempt ownership labels.
+The runner mounts the bundle and attachments read only and the workspace read
+write with ownership set to UID/GID `1000:1000`. Temporary extraction directories
+belong to the worker process and need no matching path on the daemon host.
+Failed creation, claim deletion, and orphan cleanup remove only the owned
+resources. Kubernetes keeps its existing init-container provisioning path.
 
 ## Delivery ownership: one deadline, one fenced owner (ADR-0131)
 
@@ -568,6 +645,67 @@ heartbeat renews it; a renewal that Valkey cannot confirm fails **closed** —
 the owner is lease-lost, its runner is interrupted through the bounded control
 path, and it may no longer settle anything.
 
+A retained turn that has not reached a durable handoff boundary waits with
+exponential backoff inside its fenced delivery. These refusals consume the
+original delivery deadline, without consuming attempts or increasing the PEL
+delivery count. Reclaim preflight waits use the same rule. Deadline exhaustion
+still emits an operator-visible delivery failure.
+
+Before starting a turn, the worker records the claim and its delivery owner in
+Valkey. Maintenance observes missing ownership and allows
+`CURIE_ABANDONED_TURN_GRACE_S` (90 seconds by default) before checking the exact
+claim under the thread lock. For an unfinished delivery, a runner that remains
+active, unreadable or unable to confirm durable history is retired through its
+backend. A terminal delivery's runner is retired only when status reports an
+active turn. An idle terminal runner keeps its route even if its history is
+non-durable; its watch is removed. An unreadable terminal runner keeps its watch
+for a later status read. Three unreadable status probes remove that terminal
+watch without retiring the runner, bounding probes to 15 seconds across ticks
+and worker restarts while allowing two transient failures. An unreadable
+unfinished runner latches the action marker before retirement. Static shells stop
+the child and verify cleanup. If the runner settled before the supervisor's
+check, the cleaned shell can be reused; otherwise it is quarantined and its 503
+health response asks the platform to replace it. Settlement retains the recovery
+watch for maintenance, which removes it after an eligible idle status,
+confirming the claim is gone, or retiring it.
+Failed retirements retain their watch and do not block other maintenance. Before
+retirement or replacing an unfinished predecessor's watch for a follow-up,
+recovery persists the runner's retained side-effect marker so reclaim escalates
+instead of replaying. Reclaim waits without interrupting a different delivery's
+live watched turn. The runner flag is not tied to an event, so a change in
+delivery ownership can conservatively escalate a delivery that performed no action.
+Turns started through the attachment handoff currently register no recovery
+watch and are a known gap in this bound. The bound and runner cleanup settings
+are described in [the static substrate reference](../../docs/static-pool-substrate.md).
+
+### Shared static shells
+
+With `CURIE_SANDBOX_SUBSTRATE=static`, agents share `CURIE_WARM_POOL` by default.
+Size that pool for concurrent claims. `CURIE_AGENT_SANDBOX_POOLS` and
+`CURIE_AGENT_CONNECTOR_SECRET_POOLS` remain explicit isolation opt-ins and
+require matching inventory entries. Connector credentials alone do not force
+an agent into its own pool.
+
+Agent identity, connector endpoints, caller credentials, bundle inputs and
+connector secrets arrive per claim. `CURIE_AGENT_CREDENTIAL_FILES` maps an
+agent to credential environment names and absolute UTF-8 source file paths
+on the worker, for example an external tool server's bearer. The worker reads
+those files afresh on each claim, removes one final LF or CRLF, and refuses any
+other leading or trailing whitespace. Missing, unreadable, empty, reserved or
+withheld inputs fail closed. Their values join the runner's held-secret
+inventory before it serves. Shells retain only deployment-wide model
+credentials and shared connector trust material.
+
+The supervisor stages runtime configuration and credentials as runner-owned
+`0400` files, consumes and unlinks the bootstrap environment file before exec,
+and wipes the complete claim tree after stopping all claim processes. Removing
+the bootstrap file preserves the runner's existing caller-token shielding
+from bundle subprocesses. Bundle code stays root-owned and read only.
+A stale retirement targets its exact claim and generation, never another
+agent's later lease. Kubernetes pool selection and Secret delivery are
+unchanged. See [the static substrate reference](../../docs/static-pool-substrate.md)
+for configuration and recovery behavior.
+
 ### Capability audit: every owner verb and the fence that gates it
 
 One row per verb a delivery owner can perform that produces a durable or
@@ -575,14 +713,14 @@ user-visible effect.
 
 | Verb | Where | What fences it |
 |---|---|---|
-| Execute or retry a turn | `kernel.py` (the attempt loop; `start_turn` / `steer`) | The lease is checked before every attempt, and attempts consume the one overall deadline. A loss mid-turn fires the base's lease-lost handler, which interrupts the live turn. |
-| Re-execute a *reclaimed* delivery | `kernel.py` reclaim preflight (generation > 1) | A side-effect marker forbids replay and escalates; a runner still reporting an active turn is interrupted and waited out; an unreadable runner fails closed. |
+| Execute or retry a turn | `kernel/` (the attempt loop; `start_turn` / `steer`) | The lease is checked before every attempt, and attempts consume the one overall deadline. A loss mid-turn fires the base's lease-lost handler, which interrupts the live turn. |
+| Re-execute a *reclaimed* delivery | `kernel/` reclaim preflight (generation > 1) | A side-effect marker forbids replay and escalates; a runner still reporting an active turn is interrupted and waited out; an unreadable runner fails closed. |
 | ACK (runs lane) | `consumer.py`, immediately before `XACK` | `lease.raise_if_lost()`. A refusal leaves the entry pending for the current owner. |
 | ACK (eval lane) | `eval/stream.py`, immediately before `XACK` | The same pre-ACK `raise_if_lost()`. |
 | ACK **via dead-letter**, handler path | `stream_consumer.py` `_dead_letter` → `_dead_letter_refusal` | Dead-letter is a terminal settlement (it ACKs, then deletes the lease and delivery state). A handler holds a registered lease, so the question is whether that lease is still ours. The one exception is a broker entry that a fresh read shows is gone and whose lease token is still ours or already absent (`broker-entry-vanished`): there is no successor to leave it for. |
 | ACK **via dead-letter**, over-cap scan | `stream_consumer.py` `_dead_letter_over_cap` | A live-lease check runs *before* cap evaluation, so a healthy long turn cannot be dead-lettered, and `_dead_letter_refusal` re-reads the lease before writing. Both fail closed on an unreadable answer. |
-| Write the done marker + the completion-outbox record | `markers.py` `settle_fenced`, whose only caller is `kernel.py` `_complete` — the only `mark_done` call site | One Lua script verifies the lease token and the fencing generation and then performs the terminal write. A loser writes nothing and returns `None`. |
-| Emit the terminal reply (`turn.completed`) | `kernel.py` `_complete` → `_deliver_completion` | Only reachable past `settle_fenced`; the fenced-out owner returns having emitted nothing. |
+| Write the done marker + the completion-outbox record | `markers.py` `settle_fenced`, whose only caller is `kernel/` `_complete` — the only `mark_done` call site | One Lua script verifies the lease token and the fencing generation and then performs the terminal write. A loser writes nothing and returns `None`. |
+| Emit the terminal reply (`turn.completed`) | `kernel/` `_complete` → `_deliver_completion` | Only reachable past `settle_fenced`; the fenced-out owner returns having emitted nothing. |
 | Clear an outbox record | `markers.py` `clear_completion`, via `_deliver_completion` | The same fence, plus the record-generation compare-and-check, so a stale pass cannot delete a fresh record. |
 | Write platform progress, terminal states included | `progress.py` `ProgressStore.apply_platform_update` (no caller yet; ADR 0130) | One Lua script checks the lease token and the fencing generation, the same two checks `settle_fenced` makes, before it writes anything. A loser writes no state and enqueues no delivery, and is refused `lease-lost`. |
 | Publish an eval report | `eval/stream.py` `_report` → `POST /evals/report` | The lease is resolved from the entry's stream id (never from a field that is `None` on the failure paths) and checked immediately before the send. A fenced lane whose lease cannot be resolved refuses to publish. |
@@ -594,13 +732,13 @@ new attempt.
 Three verbs are **deliberately not lease-fenced**, and none is an oversight:
 
 - **The side-effect marker** (`markers.mark_side_effect`, written from
-  `kernel.py` the instant a `side_effect_flag` is seen). A side effect that
+  `kernel/` the instant a `side_effect_flag` is seen). A side effect that
   happened must be recorded even by an owner that has since lost its fence. The
   marker is itself a hard no-replay fence, and it is what stops the
   *replacement* from re-running a non-idempotent action; fencing the write would
   let a lost lease erase the evidence. This is the one place where fail-closed
   means "write anyway".
-- **The completion-outbox sweeper** (`kernel.py` `sweep_pending_completions`).
+- **The completion-outbox sweeper** (`kernel/` `sweep_pending_completions`).
   The sweeper is not an owner: it drains records for entries that may already be
   acked off the group, where no lease exists or ever will. Its guard is the
   record's done flag plus the compare-and-checked `clear_completion`, not a
@@ -667,6 +805,32 @@ an approval pause, or `failed` for a bad exit or deadline, with `ended_at`
 before writing the done marker. A prestart deferral leaves the row open for
 scheduler reconciliation. A cron failure is not retried within its fire.
 Slack and webhook turns perform no hook run writes.
+
+A long scheduled sweep is the one cron turn that continues past its delivery
+budget (ADR-0160, #2878). A targeted cron delivery cut by the budget
+(`runner-timeout` or `runner-timeout-unconfirmed` with no budget left) whose
+newest checkpoint fact still lists uncovered sources renews the hook lease and
+publishes a continuation `<base>:sweep:<n>:<covered>:<stalled>` on the runs
+stream inside the same fenced script that settles the slice
+(`Markers.settle_fenced_and_publish`), leaving the row open. `covered` is the
+count of distinct covered names, ignoring case, and `stalled` counts the
+slices in a row that added none: a source may span up to two cut slices, and
+the sweep stops after `sweep.MAX_STALLED_SLICES` (3) stalled slices in a row or
+past `sweep.MAX_SWEEP_SLICES` (48) slices. The script publishes before it
+writes the record and the done marker, so a failed publish settles nothing. It
+also sets a per-event published marker beside the publish, and a retried
+script that finds the marker holding its own generation writes nothing again,
+even after the outbox record was cleared.
+`curie_worker.sweep.SweepCoverage` reads the checkpoint from agent and channel
+memory with the platform key, keeping only facts the API stamped with the cron
+sender for this hook, sweep date and run. A continuation only adopts the live
+route and never claims, resumes or hands off a sandbox (`SweepClaimGone`). It
+waits out a winding-down turn inside its own budget and closes `blocked` on a
+paused hook. Every stop that closes `failed`, `skipped` or `blocked` with a
+checkpoint, or on a continuation, posts one coverage notice as a new message
+after the settle is won. The hook lease renewed at a cron delivery's start
+carries `sweep.HOOK_LEASE_START_MARGIN_S` on top, so the interrupt and the
+coverage read at a budget cut cannot let the next fire reclaim the run first.
 
 If persistence fails before durable closure, the delivery stays pending and
 may run again on redelivery. The close and the done marker use PostgreSQL and
@@ -997,16 +1161,41 @@ substrate.reap_orphans()              # periodic tick: claims with no live route
 
 Contract notes the kernel must know:
 
-Quota pressure reclamation runs only after a real ResourceQuota refusal and
-only when the remaining delivery budget is at least 70 seconds plus
-`claim_timeout_seconds`. A lower budget skips the scan. An interactive Slack
+With sandbox quotas enabled, the chart supplies `CURIE_SANDBOX_ADMISSION` with
+the quota name, sandbox PriorityClass, computed ceiling and complete resource
+hard map. Before a fresh claim can mint credentials or create a SandboxClaim,
+the substrate atomically reserves its selected Pod footprint in a shared
+Valkey ledger for its namespace and quota. Every admission accounts for occupied
+claims, unmatched chargeable Pods and outstanding reservations across Pod count,
+CPU and memory requests and limits, including init containers and RuntimeClass
+overhead. The nominal ceiling uses the chart's existing capacity calculation;
+the actual resource vector determines admission. An enabled zero ceiling refuses
+claims. Disabling the quota omits the admission contract.
+
+Reservations survive worker restart and remain charged through uncertain
+creation or deletion. Route expiry and reservation age do not free capacity.
+Reconciliation releases a reservation only after fresh inventory confirms its
+claim, all owned Sandboxes and all owned chargeable Pods are absent. A suspended
+Sandbox occupies zero only after its Pods are confirmed gone. Inventory or
+configured quota read failures fail closed, and an underreported quota usage
+cannot authorize a reservation beyond the shared budget.
+
+Capacity pressure reclamation runs after a real ResourceQuota refusal or a
+typed refusal from shared admission, and only when the remaining delivery budget
+is at least 70 seconds plus `claim_timeout_seconds`. A lower budget skips the
+scan. An interactive Slack
 turn waits durably for capacity under its original event identity, with a
 fixed deadline set by `CURIE_CAPACITY_WAIT_BUDGET_S` (24 hours by default).
 The worker acknowledges a parked stream delivery, then wakes the turn through
-the same stream when its retry is due. Waiting does not use a runner attempt or
+the same stream when its retry is due. Each refused retry is due 5000 ms after
+that park, or at the original deadline when less time remains. The delay does
+not grow with earlier refusals. A queued notice that was already delivered is
+not sent again on those retries when no sandbox grant was confirmed and the
+grant outcome is not unknown. A failed notice stays queued for another try.
+A confirmed or unknown grant keeps the existing notice retry. Waiting does not use a runner attempt or
 hold a conversation lock. Its placeholder says queued while waiting and
 receives an expiry message if the deadline passes. An approval resume does not
-wait. It runs the same reclamation pass after its own quota refusal, and when
+wait. It runs the same reclamation pass after its own capacity refusal, and when
 the pass frees nothing, or the one retry after it is refused again, the attempt
 fails under `sandbox-capacity` instead (#3693, #3700). The failure retries, and
 each retry that is refused again may run the pass once more, so a resume that
@@ -1017,20 +1206,28 @@ earlier attempt's confirmed pod termination is carried onto that notice. Other t
 retain their capacity response. Operators can inspect the persisted wait state and
 `curie.capacity.wait` metrics for waiting, active, and expired turns.
 
-The rejection retains every exceeded resource and its requested, used, and
-hard quantity. Before scanning, the worker validates the complete map with
+Quota rejection evidence retains every exceeded resource and its requested,
+used, and hard quantity. Admission evidence identifies the shared resource
+budget and refused footprint without presenting computed usage as a Kubernetes
+quota rejection. Before scanning, the worker validates the complete map with
 Kubernetes quantity semantics, including CPU DecimalSI, memory BinarySI, pod
 counts, and combined rejections. Invalid or incomplete evidence skips
 pressure reclamation with `outcome=refused-invalid-quota` and performs no
 pressure Redis call or deletion.
 
-After one exact idle route is detached and deleted, the worker polls the exact
-named ResourceQuota in its configured namespace within the existing 20 second
-cleanup window. It retries only when live spec and status hard limits agree and
-every rejected resource has enough current headroom. The worker Role grants
-only namespaced `get` on core `resourcequotas`. A missing permission, malformed
-quantity, mismatched spec and status limits, or timeout fails closed. The
-rejected claim or another quota can consume the freed capacity before the full
+After one exact idle route is detached and deleted, the worker polls within the
+existing 20 second cleanup window until the victim's claim, all owned Sandboxes
+and all owned chargeable Pods are absent and its reservation is released. It
+then verifies shared admission headroom and the exact named ResourceQuota in
+its configured namespace. It retries only when live spec and status hard limits
+agree and every refused resource has enough current headroom. A transient
+inventory read supplies no observation and is polled again within that same
+window. With sandbox quotas enabled, a dedicated namespaced `worker-admission`
+Role grants only `list` on Sandboxes and Pods. The main worker Role retains
+`get` on core `resourcequotas`. A separate cluster grant permits only `get` on
+the selected RuntimeClass when required for overhead. A missing permission,
+malformed quantity, mismatched spec and status limits, or timeout fails closed.
+The rejected claim or another quota can consume the freed capacity before the full
 retry. That bounded race records `reclaimed-retry-refused`; it does not delete
 another victim or schedule work.
 
@@ -1038,8 +1235,15 @@ The inventory scans at most eight pages with a SCAN `COUNT` hint of 8192,
 roughly 65,000 keys in the whole logical database. `COUNT` is approximate. A
 separate limit counts at most 256 matching route keys before filtering, so
 suspended routes count toward it, and at most four candidates are probed.
-Candidates are probed idle eval routes first (conversation ids with the `eval:`
-isolate prefix), then every other route, each group in expiry order. A
+Each worker selects a bounded window of routes not yet selected in its current
+inventory cycle. Idle eval routes come first (conversation ids with the `eval:`
+isolate prefix), then every other route, each group in expiry order. Selected
+thread identities survive expiry changes and are forgotten when absent from a
+complete inventory. After every remaining route has been selected, the next
+pass starts a new cycle. Selection advances before candidate I/O, so concurrent
+passes and unreadable old routes do not repeatedly occupy the same four slots.
+This scheduling state grants no deletion authority; locked runner status and
+fenced route checks still decide whether a route can be reclaimed. A
 database outside either finite window fails closed. Alert on
 `curie.sandbox.lifecycle` with `operation=reclaim` and
 `outcome=scan-incomplete`. Redis or Valkey before 7.0 does not support
@@ -1108,6 +1312,62 @@ That tail consumes unused claim reserve and never authorizes requester retry.
   (`tests/sandbox/test_e2e_k8scratch.py`, `CURIE_SANDBOX_E2E=1`) drives the
   real cluster.
 
+### Workspace recovery metadata (ADR 0251)
+
+`curie_worker.workspace_recovery.WorkspaceRecoveryClient` calls the worker-only
+`/v1/internal/workspace-recovery` API using the required internal worker
+credential (`CURIE_INTERNAL_WORKER_TOKEN`, sent as `X-Curie-Worker-Token`).
+Recovery is off by default; enabling `CURIE_WORKSPACE_RECOVERY_ENABLED` on the
+API requires a positive installation cap in `CURIE_WORKSPACE_RECOVERY_MAX_BYTES`.
+The API and worker must share the `CURIE_WORKSPACE_MAX_ARCHIVE_BYTES` base ceiling.
+`reserve`, `complete` and `fail` manage bounded checkpoint metadata; reservations
+have a completion deadline of at most 60 seconds (the capture's remaining budget)
+and a 600-second staging lifetime.
+`acquire-reader` and `release-reader` manage at most eight readers per WorkItem,
+each bounded to 300 seconds. Two-phase metadata collection uses `claim-collection`
+to fence eligible objects against readers, then `finalize-collection` after deletion.
+
+`curie_worker.workspace_recovery_storage` moves recovery objects. They live in the
+private workspace bucket under `private/workspace-recovery/`, a subtree disjoint
+from claim objects, so releasing a claim never deletes them. The checkpoint writer
+reserves capacity before any upload, uploads each object by explicit multipart
+upload within a 60-second aggregate budget, verifies the stored size and SHA-256
+by HEAD and a full read-back, and only then completes the checkpoint. A failed or
+late capture gets five seconds of foreground cleanup: a ledger `fail`, then, only
+once the tombstone is confirmed, multipart abort and deletion of the keys it
+declared. Anything left stays staging until the collector removes it. The reader holds a non-renewable reader lease and signs a
+GET for exactly one object, expiring at the lesser of
+`CURIE_WORKSPACE_REFERENCE_TTL_SECONDS` and the lease's remaining time, then
+streams and verifies the download. When `CURIE_WORKSPACE_RECOVERY_ENABLED` is set
+on the worker and the internal worker token is present, the worker supervises the
+`workspace-recovery-gc` collector every
+`CURIE_WORKSPACE_RECOVERY_COLLECT_INTERVAL_S` seconds (default 30): it claims
+eligible objects, deletes them outside any lock, and finalizes each claim, so a
+collector interrupted between deletion and finalization repeats both after
+restart. Logs carry ids, kinds, sizes and typed codes only.
+
+Capture is wired on ordinary failure (#5143). A run whose failed finish is known
+to have committed is marked recovery eligible; cancellation, execution deadline,
+termination, owner loss and a `work_item_cancelled` finish refusal never are, and
+keep the plain release. Before releasing an eligible run's claim, the kernel holds
+a renewable lease on the thread lock and, only while the thread's route still
+names the run's claim, `curie_worker.workspace_recovery_capture.WorkspaceRecoveryCapture`
+reads the WorkItem's repository and base through the ledger's `context`
+operation, asks the runner's `POST /v1/checkpoint` for a patch and manifest against
+the claim's trusted base, and writes the checkpoint. One 60-second aggregate
+deadline covers all of it, and `reserve` carries the budget still left, so the
+ledger's completion deadline never outlives it. A capture that ends before any
+reservation (torn capture, oversized patch or manifest, runner unavailable,
+timeout, base mismatch) records its reason through the `outcome` operation within
+the five-second cleanup allowance. The lease is checked before every completion
+attempt and once after it commits; a lease lost first tombstones the staging, and
+a lease lost after commit retracts the just-completed checkpoint back to the
+previous one, leaving its objects to the collector. When the lease is lost before
+the release, the lock is reacquired and the plain release runs with the recorded
+claim. A capture failure never changes the WorkItem's terminal outcome. Enabling
+recovery on the worker requires `CURIE_INTERNAL_WORKER_TOKEN` and
+`CURIE_WORKSPACE_ENABLED`. Restoration is not wired yet.
+
 ### Retained thread attachments
 
 An attachment on an idle retained thread needs new claim environment, so the
@@ -1134,3 +1394,156 @@ selection refusal and the same recovery. When repository workspaces are
 disabled, the existing workspaces disabled refusal takes precedence before the
 file is resolved. Fresh workspace claims and suspended workspace resumes still
 receive attachments. Retained workspace replacement is tracked in #2728.
+
+### Every boot rebuilds the thread's files (ADR 0205)
+
+With the attachment lane on and `CURIE_INTERNAL_WORKER_TOKEN` set, the worker
+wires the API's thread attachment ledger
+(`curie_worker.ledger_client.ThreadAttachmentLedgerClient`, the
+`/v1/internal/thread-attachments` routes behind `X-Curie-Worker-Token`). Without
+the token no ledger is wired and attachments behave exactly as above: a file
+turn resolves only its own files and a text turn reads nothing.
+
+- **A file turn** reads the ledger outside the route lock, then
+  `AttachmentCoordinator.prepare_thread_set` fetches the message's files all or
+  nothing and the thread's earlier files best effort. A failed ledger read
+  refuses the turn before any claim (`stage=ledger`). Once the files are
+  installed and the turn has opened, the worker appends the message's refs to
+  the ledger, outside the lock and idempotent per event and file. A failed append is
+  logged at WARNING and the turn goes on. A turn refused after preparing
+  appends nothing and discards what it wrote.
+- **A text turn that boots** (fresh claim, suspended resume, turn budget or
+  workspace handoff) reads the ledger and prepares the earlier files under the
+  route lock. The ledger read is bounded by
+  `CURIE_ATTACHMENT_THREAD_PREPARE_TIMEOUT_SECONDS` (default 15) and the
+  delivery's remaining budget. The prepare has the same deadline plus a short
+  grace. A failed read boots with `ledger_unavailable` in the manifest. An
+  adopt, a steer and a sweep continuation read nothing. A route that the
+  locked snapshot saw live is read once more just before the claim, with a
+  ledger wired, using the readiness test the claim itself will use (a
+  workspace claim's `substrate.adopt`, which also needs the claim and sandbox
+  ready): if it fails, the claim cold-creates, so that boot carries the set
+  too.
+- **The rebuild is charged to the turn.** On the text-boot and the file paths,
+  the time spent preparing the thread's files comes off the delivery's
+  remaining budget before the claim and the turn start.
+- **An API without the ledger routes** (query answered a bare 404, a mixed
+  rollout) is treated as no ledger. A 404 carrying the ledger's own
+  `detail.code` (such as `thread_attachment.agent_not_found`) is an ordinary
+  ledger failure. No ledger means: a file turn resolves its own files and appends
+  nothing, and a text boot carries no attachment env.
+- **Names are fixed when recorded.** A current file's disk name is cleaned with
+  the init container's rules (a leading `.` becomes `_`) and disambiguated
+  against every name the ledger holds, ignoring case, and cut to fit 255
+  bytes. It is then stored on its ref and never recomputed. A redelivery is
+  the same (event, file id), and it keeps its stored name.
+- **Bytes stay short lived.** An earlier file whose parked copy outlives the
+  capability by a margin is re-minted, and a new owner record (still
+  `"version": 1`, with optional `agent` and `shas` fields), written before any
+  re-fetch starts, keeps it from the reaper. Otherwise it is fetched again through the agent's current bindings
+  (`BindingResolver.routes_for_agent`), never a recorded endpoint, and its
+  digest must match. The prepare deadline is checked as each chunk arrives,
+  so a slow earlier file is cut and named `deadline`. One that cannot be had is named unavailable (`no_route`,
+  `no_credential`, `not_found`, `forbidden`, `rate_limited`, `timeout`,
+  `digest_changed`, `deadline`, `fetch_failed`) and never fails the boot.
+- **The per-thread budget** (`CURIE_ATTACHMENT_THREAD_MAX_FILES`, default 20,
+  never below the per-message cap; `CURIE_ATTACHMENT_THREAD_MAX_BYTES`, default
+  256 MiB) keeps the current files and then the newest earlier files. The rest
+  are named as omitted.
+- Capabilities are presigned only after every fetch. The claim env carries
+  `CURIE_ATTACHMENTS_REF` (each entry with its exact name `n` and `c` 1 for
+  current, 0 for earlier) and `CURIE_ATTACHMENTS_MANIFEST` for the runner
+  (names and reasons only, no URL).
+
+Approval metadata references follow the same sentence boundary rules across API,
+worker, runner and the UI fallback for older API responses. A tool identifier
+followed by a sentence-ending period (including whitespace or closing punctuation)
+uses its plain action label. Filenames, extensions, paths, URLs and identifiers
+embedded within another word remain literal data, including Unicode text. The
+stored summary, exact grant target, arguments and nested content remain unchanged.
+
+Receipt and CLI progress metadata use the same reference-boundary vector as
+approval displays. Closing code quotes end a sentence reference just as closing
+parentheses, brackets and ordinary quotes do; requested filenames and paths stay
+literal. This wording changes neither answers nor stored actions.
+
+### On-demand attachment rollout
+
+The attachment lane remains off by default. With `CURIE_ATTACHMENT_ENABLED=true`,
+`CURIE_ATTACHMENT_MODE=eager` preserves the existing complete-set handoff and its
+positive byte budgets. Explicit `CURIE_ATTACHMENT_MODE=lazy` registers inbound
+metadata before routing, including references above the legacy byte budgets, and
+starts without downloading provider file bodies. Text-only follow-ups register
+no files and do not rebuild attachment history. The real runner exposes
+`list_attachments` and `fetch_attachment` through its existing platform tool
+server; only a selected file is streamed into its private writable cache.
+
+Lazy activation requires matching API, worker, broker and runner support. The
+worker refuses a runner that does not advertise literal `attachment_access:
+true`; the API refuses a missing or incompatible private broker. There is no
+eager fallback. Fake-model runs cannot enable this mode. Every logical opener
+owns a scoped finite lease for the actual sandbox session and route generation.
+A steer renews that opener; completion, cancellation and failed start revoke
+only the ending owner's authority. A crash or unavailable revoke is bounded by
+the independently renewed 90-second lease.
+
+The broker listens on a private worker port (`CURIE_ATTACHMENT_BROKER_PORT`,
+default `8093`) and accepts only internal worker authentication. Channel
+credentials stay in the worker. The API alone exposes the runner-facing facade;
+capabilities are carried on authenticated ACI events, never in boot environment
+variables. Broker concurrency defaults to eight transfers and each transfer has
+a 300-second deadline. Cache storage remains finite; an incomplete transfer or
+capacity failure returns no usable final path. Removing policy byte ceilings
+does not expand the sandbox's storage or memory resources.
+
+The Docker substrate uses a claim-owned named tmpfs volume, bounded by
+`CURIE_ATTACHMENT_CACHE_SIZE_BYTES` (default 512 MiB). These cached bytes consume
+effective memory resources in addition to the model process; a file under the
+volume capacity is not guaranteed to fit the runner's remaining memory. This is
+a resource capacity limit, not a catalog selection or per-file policy ceiling.
+
+
+## Approval deadline and reference-retention rollout
+
+An approval route may set `expires_in_seconds` to a positive integer, or to
+explicit JSON null for no deadline. Omitting it keeps the producer duration;
+session approvals keep their 24-hour default. The API freezes the actual
+deadline at creation. Route edits do not reschedule pending approvals.
+Publication and remediation retain their independent deadline policies.
+
+The reference-retention rollout has an explicit compatibility gate:
+
+1. Keep the new route key absent and
+   `CURIE_APPROVAL_PENDING_RETENTION_ENABLED=false` while deploying compatible
+   API readers, every worker card writer and every settlement consumer.
+2. Drain all old versions before writing deadline keys. Old workers refuse
+   those keys, and old HTTP API readers refuse their route bindings.
+3. Enable `CURIE_APPROVAL_PENDING_RETENTION_ENABLED=true` on every worker.
+   Pending card, notice and reply-placement references then have no TTL.
+   Compatible flag-off writers preserve references already made persistent.
+4. After the final old and flag-off writer drains, run the one-time migration
+   in a compatible worker with its ordinary API and Valkey configuration:
+   `python3 -m curie_worker.approval_cards --writers-drained`.
+   Require a successful JSON `references_reconciled` result. The command visits
+   only still-present references and cannot reconstruct expired references.
+   This in-process maintenance command reuses the worker's credentials and
+   exact store configuration; it exposes no new administrative API.
+   An unreadable approval id stops the pass. Restore API access or repair the
+   invalid legacy reference, then rerun to completion.
+5. Keep compatible reference owners running during rollback until pending
+   approvals settle. Remove `expires_in_seconds` from stored route bindings
+   through the compatible API before rolling any reader back to an old version.
+   Removing the key leaves existing approval deadlines unchanged. Disabling
+   pending retention alone is not a safe rollback of persistent references.
+
+All compatible writers index approval ids, even with the flag off. The worker
+always runs bounded cleanup over that owned index. It checks current API state;
+a definitive missing-approval reply also bounds references after agent deletion.
+An outage or generic proxy 404 preserves them for another pass. The only
+keyspace scan is the explicit one-time post-drain migration.
+
+Terminal settlement starts a fresh 14-day reference window before delivery.
+Retries and late registrations share that window. Successful card delivery may
+consume the exact card reference immediately; failed delivery keeps it within
+the window. Reconciliation also bounds terminal approvals that never resume a
+model turn, including remediation approvals.

@@ -5,330 +5,369 @@
 [![Latest release](https://img.shields.io/github/v/release/curie-eng/curie)](https://github.com/curie-eng/curie/releases)
 [![Docs](https://img.shields.io/badge/Docs-index-blue.svg)](docs/README.md)
 
-Open-source (Apache 2.0), self-hostable delivery platform for production AI agents. Connect
-Slack — the first channel it speaks, with email and Teams next — author a Claude-Code-format
-plugin bundle (skills + tools + MCP), deploy it as a versioned bot identity and run it anywhere -
-in your development environment on your laptop or in production on your own Kubernetes cluster.
-Configure your model, so you can point an agent at Anthropic, OpenRouter, or a local model through
-Ollama. Get traces, evals, budgets, and git-driven deploys for free. One CLI, `curie`, drives all of
-it.
+**Turn agents into co-workers. Run them in your infrastructure. Start with a Software Factory co-worker**
 
-![Curie: build an agent in Claude Code, run it locally, ship it with git push](docs/demo/demo-loop.gif)
+Curie brings agents into the workspaces your team already uses. Delegate work,
+follow progress, approve restricted actions, and inspect the result. The platform
+is Apache-2.0 and runs in your infrastructure, with shared memory facilities,
+model configuration, and cost visibility.
 
-New here? [`Quickstart`](#quickstart) gets you a first agent reply in a few minutes.
+Start with a **Software Factory co-worker**. Use Codex, Claude Code, or another
+coding agent to help investigate and specify a bounded GitHub, GitLab, or Jira
+Cloud issue. Delegate the issue to Curie for implementation and review; it
+returns a pull request or merge request for your team to accept. You can also
+deploy an **SRE co-worker** for Kubernetes investigations, or adapt an existing
+agent's instructions and tools to the same platform.
 
-Run `curie try` for a first reply without configured credentials or prompts. Run
-`curie try --keep` to retain the standard bundle at `./curie-demo` for normal
-`curie skill` commands. The [`Quickstart`](#quickstart) covers the full parity ladder.
+| Start here | First outcome |
+| --- | --- |
+| [Software Factory](#software-factory-on-your-laptop) | Label an issue and get a reviewed PR or merge request, or a clear failure reason. |
+| [SRE co-worker](#sre-co-worker-on-your-laptop) | Ask about your local cluster in Slack; approve configured mutations. |
+| [Bring your existing agent](#make-your-existing-agent-a-co-worker) | Reuse its instructions and tools, then connect it to a workspace. |
 
-Join the [Curie Discord community](https://discord.gg/YZASub2d5B) to connect with other builders.
+## Platform capabilities
 
-## Table of contents
+Curie connects agents to supported external workspaces and work systems.
+Four capabilities let a team delegate work, share appropriate context, and
+control what happens:
 
-- [Why your agent breaks when it leaves your laptop](#why-your-agent-breaks-when-it-leaves-your-laptop)
-- [Quickstart](#quickstart)
-  - [Prerequisites](#prerequisites)
-  - [Building and deploying your first agent with Curie](#building-and-deploying-your-first-agent-with-curie)
-- [Which target do I want?](#which-target-do-i-want)
-- [Status](#status)
-- [Contributing to Curie](#contributing-to-curie)
-- [License and trademarks](#license-and-trademarks)
-- [Where do I go next?](#where-do-i-go-next)
+| Capability | What it provides |
+| --- | --- |
+| Workspace adaptors | Connect supported conversation channels, issue trackers, and code hosts to Curie. |
+| Authentication, authorization, and synchronization | Verify incoming authority, connect workspace accounts to people where supported, and sync identity and team data from an enterprise IdP. |
+| Memory and context | Supply scoped agent and channel facts alongside the work state an agent needs. |
+| Controls | Set tool permissions, approvals, model choices, execution bounds, and inspectable results. |
 
-## Why your agent breaks when it leaves your laptop
+This is a capability map. Each integration has its own supported path and
+limits. Read [platform capabilities and boundaries](docs/platform-capabilities.md)
+for how these capabilities interact, and
+[capabilities and release status](docs/capabilities.md) for what is
+available in a supported deployment.
 
-Local and production environments are usually different - a different Python version, a missing tool,
-a credential that exists in one place and not the other. Curie closes that gap with one mechanic:
-the same plugin bundle climbs three tiers.
+### See the Software Factory
 
-- `skill` runs it directly, as a single container, no platform in front.
+<a href="https://vimeo.com/1231115133/eadc6eb936">
+  <img src="https://i.vimeocdn.com/video/2206199274-0dcf4f345f0dfb2733cf53dfbdb85b3441e3f593dcd23cfdce0c45bb50d46146-d?f=webp&amp;region=us" width="720" alt="Watch the Curie Software Factory demo: GitHub issues to reviewed pull requests.">
+</a>
 
-- `local` runs it through the full platform via Docker Compose.
-
-- `cluster` runs it through that same full platform on Kubernetes.
-
-Here, `skill` names the runner only tier. An authored bundle skill is the
-artifact at `skills/<name>/SKILL.md`.
-
-An environment difference then shows up as a bug while progressing through these tiers, not a surprise
-your users hit - letting you iterate fast locally and ship with confidence.
-
-All three tiers run an immutable bundle snapshot: `local` and `cluster` assign that snapshot a
-version, while `skill` identifies it by its content digest. What makes `skill` the fast loop is that
-it packs and boots that snapshot straight from your working directory in one command, with no
-platform in front.
-
-Curie provides an environment guarantee while climbing the three tiers. It is not a behavior
-guarantee: production traffic can still behave differently than your test cases, and no platform can
-honestly promise otherwise.
-
-See [`ARCHITECTURE.md`](ARCHITECTURE.md#component-map) for the platform architecture and how the pieces fit together, or open the
-[interactive architecture atlas](https://htmlpreview.github.io/?https://github.com/curie-eng/curie/blob/main/docs/architecture-atlas/index.html)
-to explore current and planned flows, maturity-rated seams, ADRs, and versioned snapshots.
-See the [target table](#which-target-do-i-want) below for what each tier actually runs.
+[Watch the Software Factory demo](https://vimeo.com/1231115133/eadc6eb936), then
+follow the local quickstart below. The video features GitHub; the quickstarts
+also cover supported GitLab and Jira Cloud paths.
 
 ## Quickstart
 
-**Just want a bot in Slack?** [`docs/your-first-slack-agent.md`](docs/your-first-slack-agent.md)
-is the short path: what to get first, four commands, and the six mistakes that
-cost people an hour. The walkthrough below is the longer one, and teaches the
-parity ladder as it goes.
+The software factory and SRE co-workers below run on **local kind clusters**. They use the
+same platform you can later install on your own Kubernetes infrastructure.
 
-### Prerequisites
+You need Docker running, kind, kubectl, Helm, and an Anthropic or OpenRouter
+model credential. Use a Bash terminal and keep the variables in that session.
+Allow enough Docker memory and disk for Curie and the SRE observability stack.
+The [factory prerequisites](docs/guides/dark-factory-quickstart.md#what-you-need)
+list supported machines and tools.
 
-- **Docker + Compose v2**: for the dev stack and the local runner container.
-- **kubectl + helm**: only for the cluster-install path.
-
-### Building and deploying your first agent with Curie
-
-Get an [Anthropic API key](https://console.anthropic.com/) and export it once:
-
-```bash
-export CURIE_CREDENTIALS=sk-ant-...
-```
-
-Every step below reuses this same credential and the same bundle. If you don't have Docker installed,
-[install Docker](https://docs.docker.com/get-docker/) and make sure it's running - it is needed for steps 1-2.
-
-**1. Build and test**
+Install the released CLI:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/curie-eng/curie/main/get-curie.sh | bash
-curie init my-agent && cd my-agent
+if [ -w /usr/local/bin ]; then
+  export PATH="/usr/local/bin:$PATH"
+else
+  export PATH="$HOME/.local/bin:$PATH"
+fi
+hash -r
+curie --version
 ```
 
-Take a look at what got scaffolded:
+Enter your model credential without echoing it, then select a model available
+through that provider. For OpenRouter, use its full provider/model identifier.
 
 ```bash
-tree -a
-```
-```
-.
-├── .claude/
-│   └── skills/
-│       └── using-curie/
-│           └── SKILL.md
-├── .claude-plugin/
-│   └── plugin.json
-├── .gitignore
-├── .mcp.json
-├── AGENTS.md
-├── evals/
-│   └── cases.json
-└── skills/
-    └── my-agent/
-        └── SKILL.md
+read -rsp 'Model credential: ' CURIE_CREDENTIALS
+printf '\n'
+export CURIE_CREDENTIALS
+read -rp 'Model ID: ' CURIE_MODEL
+export CURIE_MODEL
 ```
 
-- `skills/my-agent/SKILL.md` - the agent's instructions: what it does, and when to use which tool.
-- `.mcp.json` - the MCP servers (tools) this agent can call.
-- `evals/cases.json` - the eval cases that grade this agent's behavior, at every tier.
-- `AGENTS.md` - the rules for a coding agent working in this bundle.
-- `.claude/skills/using-curie/SKILL.md` - a primer skill that teaches the agent to drive the Curie harness (same content as `curie guide`).
+### Software Factory on your laptop
 
-This is the Claude Code plugin format, verbatim - see [`packages/plugin-format/README.md`](packages/plugin-format/README.md#format-surface)
-for the shape Curie validates against.
+Choose where your issues and code live:
+
+| Issues | Code and result | Start here |
+| --- | --- | --- |
+| GitHub | GitHub pull request | Follow the GitHub steps below |
+| GitLab | GitLab merge request | [GitLab quickstart](docs/guides/factory-gitlab-quickstart.md), for gitlab.com or self-managed GitLab |
+| Jira Cloud | GitHub pull request | [Jira Cloud with GitHub quickstart](docs/guides/factory-jira-github-quickstart.md) |
+| Jira Cloud | Bitbucket Cloud or Data Center pull request | [Jira Cloud with Bitbucket quickstart](docs/guides/dark-factory-quickstart.md#run-quickstart-for-bitbucket), for Bitbucket Cloud or Data Center 9.4.0 or later |
+
+#### GitHub
+
+Create a GitHub repository with an initial commit, or use a small existing
+repository. Write a bounded issue with clear acceptance criteria.
+
+Before starting, check that you have a supported released CLI, Docker and kind,
+`kubectl`, Helm, a model credential with available credit, and permission to
+create and install a GitHub App on the repository. For the default local kind
+trial, plan for **at least 16 GiB allocated to Docker Desktop**: the factory
+trial. Larger repositories may need more. If you use an existing Kubernetes
+cluster, check its available capacity instead. See the
+[capacity and recovery details](docs/guides/dark-factory-quickstart.md#local-kind-capacity-and-recovery).
+Expect a reviewable PR or a stated failure reason, then inspect the final
+issue status after CI handling. Allow variable setup time plus about 190
+minutes of configured waiting windows; this is not a measured completion
+time. Provider credit and actual spend are separate from that time allowance.
+
+**1. Start the local factory setup.** A dedicated kubeconfig keeps this trial
+separate from your other clusters.
 
 ```bash
-curie skill up
-curie skill message "hello, are you there?"
+read -rp 'Repository (owner/name): ' CURIE_FACTORY_REPO
+CURIE_FACTORY_CLUSTER="curie-factory-$(date +%s)"
+CURIE_FACTORY_KUBECONFIG="$(mktemp)"
+KUBECONFIG="$CURIE_FACTORY_KUBECONFIG" curie factory quickstart \
+  --repo "$CURIE_FACTORY_REPO" --kind-name "$CURIE_FACTORY_CLUSTER" \
+  --model "$CURIE_MODEL"
 ```
 
-A real reply streams back: no Slack, no platform yet. `skill up` runs an immutable snapshot of the
-bundle, so after you edit `skills/my-agent/SKILL.md` run `curie skill up` again to load the new
-snapshot. When done run the following command
+The command creates a local kind cluster, installs Curie, and prints a GitHub
+App registration link. Open that link, create the App, generate its private key,
+and install it on the selected repository. Note the App ID and the absolute
+path of the downloaded key file.
+
+On Apple Silicon, an older released chart can stop here with an AVX preflight
+error. ARM64 does not use x86 AVX. Recover only that architecture-specific
+failure in this trial cluster, then rerun the quickstart command using the
+same variables. Do not repeat the cluster-name or kubeconfig initialization:
 
 ```bash
+KUBECONFIG="$CURIE_FACTORY_KUBECONFIG" curie cluster up \
+  --context "kind-$CURIE_FACTORY_CLUSTER" --model "$CURIE_MODEL" \
+  --set preflights.avxCheck.enabled=false
+KUBECONFIG="$CURIE_FACTORY_KUBECONFIG" curie factory quickstart \
+  --repo "$CURIE_FACTORY_REPO" --kind-name "$CURIE_FACTORY_CLUSTER" \
+  --model "$CURIE_MODEL"
+```
+
+The current source chart detects native ARM64 with the preflight enabled.
+Keep the check enabled on x86. See the
+[ARM recovery details](docs/guides/dark-factory-quickstart.md#apple-silicon-recovery-for-older-charts).
+
+**2. Complete the setup with your App.**
+
+```bash
+read -rp 'GitHub App ID: ' CURIE_FACTORY_APP_ID
+read -rp 'Private key file (absolute path): ' CURIE_FACTORY_APP_KEY
+KUBECONFIG="$CURIE_FACTORY_KUBECONFIG" curie factory quickstart \
+  --repo "$CURIE_FACTORY_REPO" \
+  --kind-name "$CURIE_FACTORY_CLUSTER" \
+  --model "$CURIE_MODEL" \
+  --app-id "$CURIE_FACTORY_APP_ID" \
+  --private-key-file "$CURIE_FACTORY_APP_KEY"
+```
+
+**3. Prepare and delegate the issue.** In the repository checkout, install the
+preparation skill for your coding agent using a CLI build that contains it:
+
+```bash
+curie factory skills install --agent codex
+```
+
+In Codex, invoke `$prepare-factory-ticket <issue-url>`. Answer its questions,
+review the complete specification, then choose **publish and start the factory**.
+The agent verifies the published issue and applies the confirmed factory label.
+The [preparation guide](docs/guides/factory-preparation.md) covers Claude Code,
+Copilot, Gemini and Cursor, global installation, and source builds when your
+released CLI does not yet include this command. Skill installation does not
+replace the factory setup in steps 1 and 2.
+
+The same command installs the local admin skills for repository runner setup
+and maintenance. The [repository environment guide](docs/guides/factory-environments.md)
+shows how to review issues, PRs, toolchains, and failed factory work before
+changing a repository's sandbox image or configuration.
+
+You can also prepare the issue yourself and add `curie-factory` in GitHub. The
+account adding the label needs write or admin access to the repository.
+
+| Checkpoint | What you should see | If it stops here |
+| --- | --- | --- |
+| First command | `Kubernetes context:` names the trial cluster, then a prefilled App registration link. | Check the [install and context steps](docs/guides/dark-factory-quickstart.md#choose-the-target-and-run-the-command). |
+| App setup and second command | `Factory quickstart ready` names the same context, repository, intake label, and deployed runner. | Check [App setup and troubleshooting](docs/guides/dark-factory-quickstart.md#rerun-with-the-app). |
+| Issue admission | The App posts a status comment; `curie-factory:queued` then `curie-factory:running` mark progress. | Check [label authority and sandbox capacity](docs/guides/dark-factory-quickstart.md#troubleshooting). |
+| PR and final result | A PR opens under the App identity. Read its diff and verification, then check whether the issue says `Completed:` or `Could not complete:` after CI handling. | Follow the [status-comment reason](docs/guides/dark-factory-quickstart.md#what-a-repository-with-no-ci-sees); an open PR alone is not a completed run. |
+
+Mention the configured App in a new comment to request a revision. The
+[complete factory quickstart](docs/guides/dark-factory-quickstart.md) has the
+canonical commands, recovery steps, and cleanup.
+
+The trial enables automatic initial PR publication. Curie does not merge the PR;
+your team accepts the result. Production agents default to human publication
+approval. Configure implementation and reviewer models explicitly, then use
+usage estimates and your accepted outcomes to evaluate costs.
+
+The [factory overview](docs/software-factory.md) explains review and CI limits.
+
+When finished with the trial, delete its local cluster:
+
+```bash
+kind delete cluster --name "$CURIE_FACTORY_CLUSTER"
+rm -f -- "$CURIE_FACTORY_KUBECONFIG"
+```
+
+If you created an App only for this trial, remove it and its downloaded key
+when finished; keep an App and key that other repositories or runs still use.
+
+### SRE co-worker on your laptop
+
+Create a Slack app with Socket Mode and interactivity, install it in your
+workspace, and invite it to a channel. Collect its app-level token, bot token,
+channel ID, and the Slack user ID of an approver. Follow
+[Slack app setup](docs/your-first-slack-agent.md#2-get-the-slack-tokens)
+using the [app manifest](apps/dispatcher/slack-app-manifest.yaml).
+
+**1. Create a local cluster and select your Slack channel.**
+
+```bash
+CURIE_SRE_CLUSTER="curie-sre-$(date +%s)"
+CURIE_SRE_KUBECONFIG="$(mktemp)"
+kind create cluster --name "$CURIE_SRE_CLUSTER" --kubeconfig "$CURIE_SRE_KUBECONFIG"
+read -rp 'Slack channel ID: ' CURIE_SRE_CHANNEL
+read -rp 'Approver Slack user ID: ' CURIE_SRE_APPROVER
+```
+
+**2. Install the co-worker and its observability stack.**
+
+```bash
+KUBECONFIG="$CURIE_SRE_KUBECONFIG" curie example sre-bot install \
+  --context "kind-$CURIE_SRE_CLUSTER" --observability \
+  --slack-channel "$CURIE_SRE_CHANNEL" --approvers "$CURIE_SRE_APPROVER"
+```
+
+The installer provisions Curie, Grafana, Loki, Tempo, and Prometheus, creates
+the Kubernetes connector identity, binds the approval route, and deploys the
+SRE bundle. The exported model credential from the quickstart is required for
+real replies.
+
+**3. Connect Slack.**
+
+Slack delivery requires a configured
+[provider gateway](apps/dispatcher/README.md#provider-gateway).
+Complete its TLS and caller-credential setup before connecting the workspace.
+
+```bash
+read -rsp 'Slack app-level token: ' SLACK_APP_TOKEN
+printf '\n'
+read -rsp 'Slack bot token: ' SLACK_BOT_TOKEN
+printf '\n'
+export SLACK_APP_TOKEN SLACK_BOT_TOKEN
+KUBECONFIG="$CURIE_SRE_KUBECONFIG" curie cluster comms \
+  --context "kind-$CURIE_SRE_CLUSTER" --slack
+```
+
+**4. Ask it to investigate.** Mention the bot in the bound Slack channel:
+
+> Which workloads in this cluster are unhealthy? Show the evidence and suggest a next step.
+
+Read-only Kubernetes tools run immediately. Configured mutations request a fresh
+human approval; the default write permissions are limited to the disposable
+`sre-demo` namespace. An approval does not expand those permissions.
+
+Use a dedicated Slack app for this trial: one app must connect to only one Curie
+release. GitHub is optional for triage; repository work needs the separate
+allowlist and GitHub App configuration in the
+[SRE guide](examples/sre-bot/README.md). That guide also covers installation
+details, permission boundaries, and demo scenarios.
+
+When finished with the trial, delete its local cluster:
+
+```bash
+kind delete cluster --name "$CURIE_SRE_CLUSTER"
+```
+
+## Make your existing agent a co-worker
+
+Keep your agent's useful instructions and tools. Curie provides workspace
+interaction, deployment, supervision, and operational controls around a
+supported bundle.
+
+[Watch how Curie turns an existing agent into a co-worker](https://vimeo.com/1230537103/2d607d04a5),
+then follow the steps below to adapt your own agent.
+
+1. **Adapt the package.** Put instructions into skills and declare tools through
+   MCP. Existing deterministic code can remain behind a tool wrapper.
+2. **Test a representative task locally.** Check tool discovery, run your agent
+   with a real model, and inspect which tools it used.
+3. **Connect a workspace.** Deploy the bundle and bind its Slack channel.
+4. **Configure shared controls.** Choose approval routes, memory scope, models,
+   and budgets appropriate to the job.
+
+For an existing directory, start by scaffolding the supported bundle alongside
+its files:
+
+```bash
+curie init --adopt ./my-existing-agent
+```
+
+Port the instructions and tool declarations using the
+[adoption guide](docs/bring-your-agent.md), then test them:
+
+```bash
+cd my-existing-agent
+curie skill check --json
+curie skill up --model "$CURIE_MODEL"
+curie skill message "Run a representative task using your tools."
 curie skill down
 ```
 
-This is the fastest inner loop of development and enables you to iterate and build your skills.
+Scaffolding preserves existing files; adapting the agent's behavior is manual.
+The supported path reuses skills and tools in a Curie bundle. Attaching an
+arbitrary agent runtime unchanged requires a separate integration.
 
-**2. Full platform, still your laptop**
+Continue with [bringing your agent](docs/bring-your-agent.md),
+[connecting Slack](docs/your-first-slack-agent.md), and
+[administering co-workers](docs/administering-co-workers.md).
 
-Next hook up the agent into the full backend so that the message runs the real queue -> worker -> sandbox -> reply path.
+## Run it in your infrastructure
 
-```bash
-curie local up
-curie local deploy --plugin-dir . --slack-channel C0123ABCD --api-url http://localhost:28000
-curie local message "hello, are you there?"
-```
+Both examples and your supported custom agents use the same platform.
+Administrators control deployment, credentials, approvals, model settings,
+memory, and bounded runs. Configured model providers and workspace services
+receive the integration data they need.
 
-Then continue this conversation thread
+1. [Production operations](docs/operations.md): installation, backing stores,
+   egress, upgrades, and operational limits.
+2. [Administrator guide](docs/administering-co-workers.md): approvals, memory,
+   models, budgets, inspection, and stop controls.
+3. [Factory outcome measurement](docs/guides/measuring-factory-outcomes.md):
+   accepted work, estimated spend, and human review effort.
+4. [Capabilities](docs/capabilities.md): supported integrations and their limits.
+5. [Documentation](docs/README.md): guides and technical references.
 
-```bash
-curie local message --continue "what's 2 + 2?"
-```
-
-This is the same path a real Slack `@mention`
-takes - see [`docs/slack-local-runbook.md`](docs/slack-local-runbook.md) when you're ready to try it live.
-
-Visit the console at 
-
-```bash
-http://localhost:28080/?api=1&api_key=<key>
-```
-
-where `<key>` is this install's API key: the `api_key` field of
-`~/.config/curie/local/curie.json` (or `$CURIE_CONFIG_DIR/local/curie.json`), which
-`curie local up` generates on first run. There you can see the whole conversation, its traces, metrics, and cost. The same console also surfaces logs,
-approvals, and memory, which get more relevant once this plugin is deployed on Kubernetes in production.
-
-When done run the following command
-
-```bash
-curie local down
-```
-
-**3. Real Kubernetes**
-
-Finally, deploy the bundle on Kubernetes.
-Point `kubectl`/`helm` at a cluster - k3s is the lasting recommendation; if you don't have a cluster
-handy, [install minikube](https://minikube.sigs.k8s.io/) and run the following command
-(See [`docs/operations.md`](docs/operations.md#the-kubernetes-cluster) for the tradeoffs between k3s and minikube):
-
-```bash
-minikube start
-```
-
-Then:
-
-```bash
-curie cluster up
-curie cluster deploy --plugin-dir . --repo <owner>/<name>
-curie cluster message "hello, are you there?"
-```
-
-`--repo` binds this agent to the GitHub repository whose pushes will deploy
-it in step 4. A later deploy can bind an unbound agent; it refuses to replace
-an existing different binding. The API's `PATCH /agents/{id}` can explicitly
-change `repo_full_name`. The bundle's `deploy.yaml` selects the agent for the
-pushed branch's environment when several agents share that repository. See
-[`git-flow routing`](docs/operations.md#automatically-with-git-flow) for the
-single-agent fallback and target refusal codes.
-
-Plain `cluster up` infers Anthropic or OpenRouter egress from an unambiguous
-credential prefix. On minikube, the first admission attempt reports that its
-`gvisor` RuntimeClass is absent, so Curie shows that attempt as retrying,
-applies `security.gvisor.mode=off`, and retries once. Each inference is printed
-with the equivalent override. Ambiguous credential shapes still need an explicit
+Plain `curie cluster up` infers Anthropic or OpenRouter egress from an unambiguous
+credential prefix. Before Helm runs, a `NotFound` GET for the rendered gVisor
+RuntimeClass makes Curie apply `security.gvisor.mode=off`, unless the chart
+creates that RuntimeClass. A `Forbidden` GET retains one retry only after
+admission reports `RuntimeClass "gvisor" not found`. Other read errors and
+admission refusals stay closed. Each inference is printed with the equivalent
+override. Ambiguous credential shapes still need an explicit
 `--allow-egress-host`, and explicit values that contradict detected facts are
 errors.
 
-See [`docs/operations.md`](docs/operations.md#installing-and-inspecting-the-curie-platform-on-the-cluster) for cluster prerequisites and the full egress model.
-
-This first cluster is disposable. For production, keep durable data outside the cluster: set
-`postgres.deploy: false` for managed Postgres and `minio.deploy: false` for an S3 compatible object
-store, then supply their credentials through existing Kubernetes Secrets. The chart redirects its
-consumers to those stores, including bundle fetches. See the
-[`charts/curie` production storage configuration](charts/curie/README.md#values-surface-and-the-byo-idiom)
-for the complete backing store settings.
-
-Then continue this conversation thread
-
-```bash
-curie cluster message --continue "what's 2 + 2?"
-```
-
-When done run the following command
-
-```bash
-curie cluster down --yes
-```
-
-**4. Ship it: your CI/CD**
-
-Git-flow needs the agent created with `--repo`, as step 3 showed. If you tore the cluster down at the
-end of step 3, bring it back up and re-run that same `cluster deploy` line before pushing, because the
-binding lives in the release's database. What is left is exposing the Curie API to GitHub and wiring
-the webhook and its secret (see [`docs/operations.md`](docs/operations.md#automatically-with-git-flow)), then:
-
-```bash
-git push origin dev
-```
-
-A matching dev push stores an immutable, versioned bundle and deploys it under
-your dev bot. Merging that SHA to prod reuses the stored bundle. Each target agent
-owns its own Version row pointing to that object, so you can identify what is
-live and roll back to an earlier version.
-
-No Slack event loop, no queue, no sandbox plumbing to write. You asked the same bundle
-to run somewhere bigger, then told it to ship itself.
-
-Ready to make it real? See [`docs/slack-local-runbook.md`](docs/slack-local-runbook.md) to wire
-this bundle into an actual Slack workspace.
-
-Once this is live in `dev` or `prod`, `@mention` the bot in Slack like any teammate - see
-[`apps/dispatcher/README.md`](apps/dispatcher/README.md#runbook-point-it-at-a-real-slack-workspace-once-one-exists)'s runbook for connecting a real workspace to a deployed release.
-
-See [`QUICKSTART.md`](QUICKSTART.md) for the offline `--fake-model` path,
-the `examples/` bundles, and building Curie from source.
-
-## Which target do I want?
-
-Every CLI command that touches an environment takes a **target noun** in the
-middle: `skill`, `local`, or `cluster`. Pick the lightest one that answers your
-question.`curie init` is the exception: it scaffolds a plugin bundle on disk and
-targets no environment. The point of the three targets is that the same
-plugin bundle format and the same `evals/cases.json` run across all of them, so
-promoting `skill` → `local` → `cluster` is a parity ladder, not three separate
-setups. An eval that passes on your laptop and fails on the cluster is
-signal, not noise; each target's `eval` command is documented alongside it
-in [`cli/README.md`](cli/README.md).
-
-| Target    | What runs                                                                                                    | Slack    | Kubernetes | Verbs                                   | Reach for it to                                                                                                                                    |
-| --------- | ------------------------------------------------------------------------------------------------------------ | -------- | ---------- | --------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `skill`   | Just the runner container on the host Docker daemon. No platform, no queue, no API, no Slack. Fully offline. | none     | none       | `up` `down` `status` `message` `eval`   | Iterate a plugin/skill against a local runner, the fastest development loop.                                                                                   |
-| `local`   | The full platform via docker compose (Postgres + Valkey + Langfuse + API + worker).                          | none     | none       | `up` `down` `status` `message` `eval` `deploy` | Exercise the real queue -> worker -> sandbox -> reply product loop with zero Slack and zero Kubernetes. Its API is published on host port `28000`. |
-| `cluster` | The platform on Kubernetes (a Helm release).                                                                 | optional | yes        | `up` `down` `status` `message` `eval` `deploy` | Operate and drive a deployed cluster release.                                                                                                      |
-
-The table lists the verbs it covers, not every verb a target has: the universal
-quartet `up`/`down`/`status`/`message` is on all three targets, and so is
-`eval`, while `local`/`cluster` add `deploy`. See
-[`cli/README.md`](cli/README.md) for each target's verbs. Parity does not mean
-every capability is implemented at every tier: every verb is answered at every
-tier, with unsupported concepts returning a deterministic reason and an
-alternative, as defined in
-[ADR 0041](docs/adr/0041-every-verb-is-answered-at-every-tier.md).
-
-The distinction that matters: `skill` is the **runner-only** loop — it boots
-just the runner container and talks straight to its ACI HTTP surface with no
-platform in front. `local` and `cluster` put the **full platform** (queue,
-worker, sandbox) in front of the identical runner and ACI. A `message` on
-either therefore walks the same path a real Slack mention would take.
-
-See `cli/README.md` for the full command reference per target
-([`skill`](cli/README.md#skill-target),
-[`local`](cli/README.md#local-target),
-[`cluster`](cli/README.md#cluster-target)),
-[`docs/slack-local-runbook.md`](docs/slack-local-runbook.md) for connecting local Slack, and
-[`docs/operations.md`](docs/operations.md) for cluster operations - the Quickstart above already
-walks through `skill`, `local`, and `cluster` end to end.
-
-## Status
-
-The core spine is built, covered by CI, and was live-verified end to end
-against a real Slack workspace on a real model. For the precise, maintained
-built-vs-deferred split, see "What is built vs deferred" in
-[`ARCHITECTURE.md`](ARCHITECTURE.md#what-is-built-vs-deferred) — this file
-does not duplicate that list, which only drifts out of sync.
-
-Forward-looking work is planned and tracked in
-[GitHub issues](https://github.com/curie-eng/curie/issues), with larger
-journeys filed as `epic`-labeled issues.
+For the `skill`, `local`, and `cluster` tiers, see the
+[CLI target guide](cli/README.md#using-different-tiers) and
+[bundle quickstart](QUICKSTART.md). The architecture reference covers
+[local to production parity](ARCHITECTURE.md#local-to-production-parity) and
+[what is built vs deferred](ARCHITECTURE.md#what-is-built-vs-deferred).
 
 ## Contributing to Curie
-See [`CONTRIBUTING.md`](CONTRIBUTING.md#development-setup) for the full contributor setup (uv, Python
-3.13, Node.js + pnpm, Rust toolchain) and verify commands.
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) for contributor setup and checks, and
+[AGENTS.md](AGENTS.md) for repository instructions. Join the
+[Curie Discord community](https://discord.gg/YZASub2d5B) to discuss the project.
 
 ## License and trademarks
 
-Curie is released under the [Apache License 2.0](LICENSE); see [`NOTICE`](NOTICE)
-for attribution. "Curie" is a trademark of CurieTech AI. The code license
-does not grant trademark rights, and [`TRADEMARKS.md`](TRADEMARKS.md) explains
-what use of the name is fine without asking and what needs permission.
-
-See [Releases](https://github.com/curie-eng/curie/releases) for version history.
+Curie is released under the [Apache License 2.0](LICENSE). See [NOTICE](NOTICE)
+for attribution and [TRADEMARKS.md](TRADEMARKS.md) for use of the Curie name.
 
 If Curie is useful to you, especially if you build on it commercially, we'd
 love a link back to [github.com/curie-eng/curie](https://github.com/curie-eng/curie).
@@ -336,10 +375,9 @@ It is a friendly request, not a license condition: nothing in the Apache License
 requires it, and you are free to use Curie whether or not you do.
 
 ## Where do I go next?
-
-- [docs/your-first-slack-agent.md](docs/your-first-slack-agent.md) -- the
-one-page path from nothing to a bot answering in Slack that redeploys itself on
-push, plus the mistakes worth skipping.
+- Open open the
+[interactive architecture atlas](https://htmlpreview.github.io/?https://github.com/curie-eng/curie/blob/main/docs/architecture-atlas/index.html)
+to explore current and planned flows, maturity-rated seams, ADRs, and versioned snapshots.
 - [`ARCHITECTURE.md`](ARCHITECTURE.md#component-map) -- the component diagram, the
 message-flow and deploy-flow sequence diagrams, and the built/in-progress
 split.
