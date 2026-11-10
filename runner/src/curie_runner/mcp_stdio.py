@@ -57,8 +57,9 @@ def sanitize_stdio_server(
     plugin_dir: Path | None = None,
     denied_names: Collection[str] = (),
     held_values: Collection[str] = (),
+    resolve_references: bool = True,
 ) -> dict[str, Any]:
-    """Materialize permitted references from a scrubbed source, with explicit env."""
+    """Validate declarations and build only their scrubbed explicit environment."""
 
     result = dict(entry)
     command = result.get("command")
@@ -118,11 +119,16 @@ def sanitize_stdio_server(
     args = result.get("args", [])
     if not isinstance(args, (list, tuple)) or not all(isinstance(arg, str) for arg in args):
         raise UnsafeStdioConfiguration("stdio args must be strings")
-    result["command"] = materialize(command)
-    result["args"] = [materialize(arg) for arg in args]
-    result["env"] = shell_and_hook_env(
-        interpolation, extra={name: materialize(value) for name, value in declarations.items()}
-    )
+    def resolve(value: str) -> str:
+        resolved = materialize(value)
+        return resolved if resolve_references else value
+
+    result["command"] = resolve(command)
+    result["args"] = [resolve(arg) for arg in args]
+    explicit_env = {name: resolve(value) for name, value in declarations.items()}
+    if plugin_dir is not None:
+        explicit_env.setdefault("CLAUDE_PLUGIN_ROOT", str(plugin_dir))
+    result["env"] = shell_and_hook_env(explicit_env)
     return result
 
 
@@ -133,6 +139,7 @@ def sanitize_mcp_servers(
     denied_names: Collection[str] = (),
     inherited_env: Mapping[str, str] | None = None,
     plugin_dir: Path | None = None,
+    resolve_references: bool = True,
 ) -> dict[str, Any]:
     if isinstance(servers, (str, Path)):
         try:
@@ -164,6 +171,7 @@ def sanitize_mcp_servers(
             denied_names=denied_names,
             held_values=model_values,
             plugin_dir=plugin_dir,
+            resolve_references=resolve_references,
         )
         if isinstance(entry, Mapping) and ("command" in entry or entry.get("type") == "stdio")
         else entry

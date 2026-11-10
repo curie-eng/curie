@@ -91,10 +91,8 @@ def test_bundle_mcp_servers_keys_both_declaration_surfaces_as_plugin_servers(
     assert set(servers) == {"plugin:probe-bundle:alpha", "plugin:probe-bundle:beta"}
     alpha = servers["plugin:probe-bundle:alpha"]
     assert alpha["command"] == "node"
-    assert alpha["args"] == [f"{root}/a.js", "connector-placeholder"]
-    assert alpha["env"]["CLAUDE_PLUGIN_ROOT"] == str(root)
-    assert alpha["env"]["TOKEN"] == "connector-placeholder"
-    assert "CLAUDE_CODE_OAUTH_TOKEN" not in alpha["env"]
+    assert alpha["args"] == [f"{root}/a.js", "${TOKEN}"]
+    assert alpha["env"] == {"CLAUDE_PLUGIN_ROOT": str(root)}
     assert servers["plugin:probe-bundle:beta"] == {
             "type": "http",
             "url": "${BETA_URL}",
@@ -155,15 +153,12 @@ def test_optional_secret_projection_preserves_other_references_and_bundle(
     servers = bundle_mcp_servers(str(root))
 
     stdio = servers["plugin:probe-bundle:stdio"]
-    assert stdio["env"]["CLAUDE_PLUGIN_ROOT"] == str(root)
-    assert stdio["env"]["EMBEDDED"] == "prefix-" + (binding or "")
-    assert stdio["env"]["REQUIRED"] == ""
-    assert stdio["env"]["UNDECLARED"] == ""
+    expected_env = dict(config["stdio"]["env"])
     if binding is None:
-        assert "TOKEN" not in stdio["env"]
-    else:
-        assert stdio["env"]["TOKEN"] == binding
-    assert stdio["args"] == [binding or ""]
+        del expected_env["TOKEN"]
+    expected_env["CLAUDE_PLUGIN_ROOT"] = str(root)
+    assert stdio["env"] == expected_env
+    assert stdio["args"] == ["${OPTIONAL_TOKEN}"]
     assert servers["plugin:probe-bundle:http"] == config["http"]
     assert {p: p.read_bytes() for p in artifacts} == artifacts
 
@@ -248,12 +243,12 @@ def test_real_loader_optional_secret_child_environment(
     )
     own = next(s for s in registered if s["name"] == "plugin:probe-bundle:own")
     assert own["status"] == "connected", own
-    # Curie materializes an absent ordinary reference as empty and omits an
-    # absent optional binding. The real server records what it receives.
+    # Observed through the real bundled Claude Code loader: an unset variable
+    # is delivered as the literal placeholder. The child records its actual env.
     expected = (
         {"present": False, "value": None}
         if optional and binding is None
-        else {"present": True, "value": binding if binding is not None else ""}
+        else {"present": True, "value": binding if binding is not None else "${OPTIONAL_TOKEN}"}
     )
     assert json.loads(observed.read_text()) == expected
     assert manifest_path.read_bytes() == before

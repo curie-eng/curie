@@ -42,6 +42,7 @@ from mcp.shared.message import SessionMessage
 
 from .connector_endpoints import endpoint_resolver
 from .connectors import declared_connectors
+from .subprocess_env import shell_and_hook_env
 
 logger = logging.getLogger(__name__)
 
@@ -155,7 +156,7 @@ def caller_launch(
     from .mcp_stdio import sanitize_stdio_server
 
     sanitized = sanitize_stdio_server(entry, source_env)
-    env = sanitized["env"]
+    env = shell_and_hook_env(source_env, extra=sanitized["env"])
     env.pop(ROUTE_TOKENS_ENV, None)
     existing = [
         item for item in env.get("LD_PRELOAD", "").split(":") if item and item != lock_library

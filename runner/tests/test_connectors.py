@@ -1153,6 +1153,36 @@ def test_build_runner_expands_the_bearer_and_drops_it_from_spawn_env(
     assert github["headers"]["Authorization"] == "Bearer ghp_sentinel"
 
 
+def test_undeclared_stdio_does_not_receive_hosted_connector_secret(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.delenv("CURIE_STATE_URL", raising=False)
+    monkeypatch.setenv("GITHUB_PERSONAL_ACCESS_TOKEN", "example-hosted-connector-token")
+    root = _bundle(
+        tmp_path, GITHUB,
+        mcp={"mcpServers": {"unrelated": {"command": "node"}}},
+    )
+    config = _config_for(root, release="curie", agent="acme-dev", namespace="curie")
+    spawn = {"GITHUB_PERSONAL_ACCESS_TOKEN": "example-hosted-connector-token"}
+
+    async def probe(*_args: Any, **_kwargs: Any) -> McpToolCapabilityProbe:
+        return McpToolCapabilityProbe(complete=True, has_potential_write_tool=False, tool_count=0)
+
+    monkeypatch.setattr(boot, "probe_mcp_tool_capability", probe)
+    monkeypatch.setattr(boot, "ClaudeAgentSession", _CapturedSession)
+    session = initialized_session_sync(build_runner(config, fake_model=False, sdk_env=spawn))
+    assert isinstance(session, _CapturedSession)
+    entry = session.options.mcp_servers["plugin:b:unrelated"]
+    assert set(entry["env"]) == {"CLAUDE_PLUGIN_ROOT"}
+    assert entry["env"]["CLAUDE_PLUGIN_ROOT"] == str(root)
+    assert "example-hosted-connector-token" not in json.dumps(entry)
+    assert session.options.mcp_servers["github"]["headers"]["Authorization"] == (
+        "Bearer example-hosted-connector-token"
+    )
+    assert "GITHUB_PERSONAL_ACCESS_TOKEN" not in spawn
+    assert "GITHUB_PERSONAL_ACCESS_TOKEN" not in os.environ
+
+
 def test_optional_binding_is_projected_before_hosted_secret_cleanup(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1183,9 +1213,9 @@ def test_optional_binding_is_projected_before_hosted_secret_cleanup(
     runner = build_runner(config, fake_model=False, sdk_env=spawn)
     session = initialized_session_sync(runner)
     assert isinstance(session, _CapturedSession)
-    # Materialize the stdio binding before hosted custody removes its source.
     servers = session.options.mcp_servers
-    assert servers["plugin:b:stdio"]["env"]["TOKEN"] == "example-shared-token"
+    assert servers["plugin:b:stdio"]["env"]["TOKEN"] == "${GITHUB_PERSONAL_ACCESS_TOKEN}"
+    assert "example-shared-token" not in json.dumps(servers["plugin:b:stdio"])
     assert servers["github"]["headers"]["Authorization"] == "Bearer example-shared-token"
     assert "GITHUB_PERSONAL_ACCESS_TOKEN" not in spawn
     assert "GITHUB_PERSONAL_ACCESS_TOKEN" not in os.environ
