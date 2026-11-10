@@ -4,13 +4,35 @@ One session install serves every case in a pytest process. A case may start
 only when a snapshot of the install equals the baseline recorded after the
 install became ready: nothing a previous case created survives, and nothing
 the install owns is missing. This module is pure; the cluster reads live in
-c4_admitted_kind.AdmittedKind.install_snapshot.
+c4_admitted_kind.AdmittedKind.install_snapshot, and the SQL it builds runs
+there through psql in the install's Postgres pod.
 """
 
 from __future__ import annotations
 
+import re
+import uuid
+from collections.abc import Mapping
 from dataclasses import dataclass, fields
 from typing import Any
+
+# Tables the install owns for its whole lifetime; they are not inventoried.
+# apps/api/alembic/env.py pins the version table into the curie schema.
+INSTALL_LIFETIME_TABLES = frozenset({"alembic_version"})
+# Intake's per-scope poll positions. Every reset truncates them so the next
+# case's intake starts from a fresh install's position, and intake rewrites
+# its row within one poll interval, so their row count is not compared.
+INTAKE_CURSOR_TABLES = frozenset({"factory_poll_cursors"})
+# Truncated by the reset's existing statements rather than the generic sweep.
+RESET_COVERED_TABLES = frozenset({"work_items", "agents", "tenants"})
+TABLE_NAME = re.compile(r"[a-z_][a-z0-9_]*")
+TABLE_ROWS_QUERY = (
+    "SELECT coalesce(json_object_agg(t.table_name, (xpath('/row/c/text()', "
+    "query_to_xml(format('SELECT count(*) AS c FROM %I.%I', t.table_schema, t.table_name), "
+    "false, true, '')))[1]::text::bigint), '{}'::json) "
+    "FROM information_schema.tables t "
+    "WHERE t.table_schema = 'curie' AND t.table_type = 'BASE TABLE'"
+)
 
 
 class CaseIsolationError(RuntimeError):
@@ -56,6 +78,57 @@ class InstallSnapshot:
     table_rows: tuple[tuple[str, int], ...]
     # Valkey keys with no TTL, so state a case leaves behind cannot expire.
     persistent_keys: frozenset[str]
+
+
+def inventoried_table_rows(counts: Mapping[str, Any]) -> tuple[tuple[str, int], ...]:
+    """The table_rows field from one TABLE_ROWS_QUERY result."""
+
+    return tuple(
+        sorted(
+            (str(table), int(count))
+            for table, count in counts.items()
+            if table not in INSTALL_LIFETIME_TABLES | INTAKE_CURSOR_TABLES
+        )
+    )
+
+
+def transaction_sql(query: str) -> str:
+    """The psql command text that runs ``query`` as one write transaction."""
+
+    return "BEGIN; " + query + "; COMMIT;"
+
+
+def reset_sql(table_rows: tuple[tuple[str, int], ...], tenants: frozenset[str]) -> str:
+    """The reset's one write: empty every case table and every case tenant.
+
+    Every table that references curie.agents (channels, versions,
+    deployments and their dependants) or curie.work_items is truncated
+    with them, which releases the case-created tenants those rows named.
+    The cascade also empties tables whose nullable foreign keys reference
+    that set, such as credential_redemption_audit_entries and
+    github_review_deliveries; no case asserts on them. Every other
+    table that was empty in the baseline is truncated too, so a row a
+    case created anywhere else is removed. A table with baseline rows is
+    not cleaned: the verification snapshot reports a changed count.
+    """
+
+    kept = ", ".join(f"'{uuid.UUID(tenant)}'" for tenant in sorted(tenants))
+    empty_tables = sorted(
+        table for table, count in table_rows if count == 0 and table not in RESET_COVERED_TABLES
+    )
+    for table in empty_tables:
+        if not TABLE_NAME.fullmatch(table):
+            raise RuntimeError(f"unexpected curie table name {table!r}")
+    # One statement lets Postgres order the foreign keys among the swept
+    # tables. A baseline table the cascade reaches shows up as a changed
+    # count in the verification snapshot and fails the case.
+    swept = ["curie.work_items", "curie.agents"] + [
+        f'curie."{table}"' for table in sorted(INTAKE_CURSOR_TABLES | set(empty_tables))
+    ]
+    return (
+        "TRUNCATE " + ", ".join(swept) + " CASCADE; "
+        "DELETE FROM curie.tenants" + (f" WHERE id NOT IN ({kept})" if kept else "")
+    )
 
 
 _ZERO_FIELDS = frozenset(

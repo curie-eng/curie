@@ -8,7 +8,6 @@ import hashlib
 import hmac
 import json
 import os
-import re
 import selectors
 import shutil
 import sqlite3
@@ -30,11 +29,15 @@ import scripted_kind as sk
 from aci_protocol import RUNS_STREAM_DEFAULT, STREAM_PAYLOAD_FIELD, QueuedTurn
 from c4_admitted_http import gitlab, jira, marker_model_type, tracker_stub_type
 from c4_shared_install import (
+    TABLE_ROWS_QUERY,
     TRACE_BACKEND_KEY_PREFIX,
     CaseIsolationError,
     InstallSnapshot,
     case_owned_streams,
+    inventoried_table_rows,
     leftover_state,
+    reset_sql,
+    transaction_sql,
 )
 from curie_telemetry.redact import redact_text
 
@@ -61,23 +64,6 @@ SCENARIO_ISSUE = 3815
 # WorkItems that dedupe them are truncated; 4 s allows several polls of each.
 RETIRE_OBSERVE_SECONDS = 4
 VALUE_FROM_KINDS = frozenset({"secretKeyRef", "configMapKeyRef", "fieldRef", "resourceFieldRef"})
-# Tables the install owns for its whole lifetime; they are not inventoried.
-# apps/api/alembic/env.py pins the version table into the curie schema.
-INSTALL_LIFETIME_TABLES = frozenset({"alembic_version"})
-# Intake's per-scope poll positions. Every reset truncates them so the next
-# case's intake starts from a fresh install's position, and intake rewrites
-# its row within one poll interval, so their row count is not compared.
-INTAKE_CURSOR_TABLES = frozenset({"factory_poll_cursors"})
-# Truncated by the reset's existing statements rather than the generic sweep.
-RESET_COVERED_TABLES = frozenset({"work_items", "agents", "tenants"})
-TABLE_NAME = re.compile(r"[a-z_][a-z0-9_]*")
-TABLE_ROWS_QUERY = (
-    "SELECT coalesce(json_object_agg(t.table_name, (xpath('/row/c/text()', "
-    "query_to_xml(format('SELECT count(*) AS c FROM %I.%I', t.table_schema, t.table_name), "
-    "false, true, '')))[1]::text::bigint), '{}'::json) "
-    "FROM information_schema.tables t "
-    "WHERE t.table_schema = 'curie' AND t.table_type = 'BASE TABLE'"
-)
 # Every key with no TTL (TTL -1), read in one round trip.
 PERSISTENT_KEYS_SCRIPT = (
     "local cursor = '0' local found = {} repeat "
@@ -995,14 +981,7 @@ except (httpx.HTTPError, OSError, ValueError, TypeError, KeyError) as exc:
                 return case_owned_streams(keys)
 
     def table_rows(self) -> tuple[tuple[str, int], ...]:
-        counts = self.sql(TABLE_ROWS_QUERY)
-        return tuple(
-            sorted(
-                (str(table), int(count))
-                for table, count in counts.items()
-                if table not in INSTALL_LIFETIME_TABLES | INTAKE_CURSOR_TABLES
-            )
-        )
+        return inventoried_table_rows(self.sql(TABLE_ROWS_QUERY))
 
     def persistent_keys(self) -> frozenset[str]:
         return frozenset(
@@ -1352,37 +1331,10 @@ except (httpx.HTTPError, OSError, ValueError, TypeError, KeyError) as exc:
             "--timeout=120s",
             timeout=180,
         )
-        # Every table that references curie.agents (channels, versions,
-        # deployments and their dependants) or curie.work_items is truncated
-        # with them, which releases the case-created tenants those rows named.
-        # The cascade also empties tables whose nullable foreign keys reference
-        # that set, such as credential_redemption_audit_entries and
-        # github_review_deliveries; no case asserts on them. Every other
-        # table that was empty in the baseline is truncated too, so a row a
-        # case created anywhere else is removed. A table with baseline rows is
-        # not cleaned: the verification snapshot reports a changed count.
         remaining = RETIRE_OBSERVE_SECONDS - (time.monotonic() - retired_at)
         if remaining > 0:
             time.sleep(remaining)
-        tenants = ", ".join(f"'{uuid.UUID(tenant)}'" for tenant in sorted(baseline.tenants))
-        empty_tables = sorted(
-            table
-            for table, count in baseline.table_rows
-            if count == 0 and table not in RESET_COVERED_TABLES
-        )
-        for table in empty_tables:
-            if not TABLE_NAME.fullmatch(table):
-                raise RuntimeError(f"unexpected curie table name {table!r}")
-        # One statement lets Postgres order the foreign keys among the swept
-        # tables. A baseline table the cascade reaches shows up as a changed
-        # count in the verification snapshot and fails the case.
-        swept = ["curie.work_items", "curie.agents"] + [
-            f'curie."{table}"' for table in sorted(INTAKE_CURSOR_TABLES | set(empty_tables))
-        ]
-        self.write_sql(
-            "TRUNCATE " + ", ".join(swept) + " CASCADE; "
-            "DELETE FROM curie.tenants" + (f" WHERE id NOT IN ({tenants})" if tenants else "")
-        )
+        self.write_sql(reset_sql(baseline.table_rows, baseline.tenants))
         self.valkey("XTRIM", RUNS_STREAM_DEFAULT, "MAXLEN", "0")
         for stream in sorted(self.stream_keys() - baseline.streams):
             self.valkey("DEL", stream)
@@ -1605,7 +1557,7 @@ except (httpx.HTTPError, OSError, ValueError, TypeError, KeyError) as exc:
         self.kubectl(
             "-n", self.namespace, "exec", "statefulset/curie-postgres", "--",
             "psql", "-U", "postgres", "-d", "postgres", "-At",
-            "-v", "ON_ERROR_STOP=1", "-c", "BEGIN; " + query + "; COMMIT;",
+            "-v", "ON_ERROR_STOP=1", "-c", transaction_sql(query),
         )
 
     def check_violation(self, query: str) -> Any:
