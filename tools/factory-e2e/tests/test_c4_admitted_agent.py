@@ -741,7 +741,7 @@ def test_execute_revalidates_current_authority(
             )
             assert request_state(run, before["id"])["tenant_id"] is None
             assert run.sql(
-                f"SELECT tenant_id IS NULL FROM curie.work_items WHERE id='{item_id}'"
+                f"SELECT to_json(tenant_id IS NULL) FROM curie.work_items WHERE id='{item_id}'"
             ) is True
         run.write_sql(
             "INSERT INTO curie.tenants (id,deployment_id,status) "
