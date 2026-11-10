@@ -52,8 +52,7 @@ change. The same flow applies to each [supported pairing](../capabilities.md#wor
 
 4. **Watch the issue.** State labels and the factory's status comment show
    progress. Follow its link to the pull request or merge request. Read the
-   final `Completed:` or `Could not complete:` status after CI; an open change
-   alone is not completion.
+   final `Status:` line after CI; an open change alone is not completion.
 
 5. **Verify the change.** Open its link and ask your coding agent:
 

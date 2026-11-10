@@ -30,10 +30,15 @@ merge requests. See the [capability status](../capabilities.md#workspaces-and-in
 
 ## What you need
 
-- Docker running with at least **16 GiB** allocated, kind v0.24 or later,
-  kubectl, Helm, and a released Curie CLI.
+- Docker running with at least **16 GiB** allocated and about **20 GiB** of free
+  host disk for the first image pull; kind v0.24 or later, kubectl, Helm, and a
+  released Curie CLI.
 - An Anthropic or OpenRouter model credential with available credit.
 - A small code repository with an initial commit and a passing baseline.
+
+For GitHub Free, use a public trial repository with no sensitive content.
+Private trials need a plan that supports private repository rulesets; otherwise
+GitHub blocks the factory's final CI check.
 
 Use interactive Bash. Keep the same terminal and trial variables through
 cleanup. Each path uses polling, so no webhook or tunnel is needed. See
@@ -199,9 +204,9 @@ with `printf '# Hello, factory\n' | cmp - greeting.md`. Add `curie-factory` as a
 authorized human. On GitHub this requires repository write or admin access;
 on GitLab it requires Developer access or higher; on Jira use the allowed
 `accountId`. Wait for the status comment and linked PR or merge request.
-Read the final `Completed:` or `Could not complete:` status after CI.
-An open PR or merge request alone is not completion. The
-[user guide](factory-user-guide.md) shows a GitHub example.
+Read the issue's final `Status:` line after CI. An open PR or merge request
+alone is not completion. The [user guide](factory-user-guide.md) shows a
+GitHub example.
 
 ## Clean up
 

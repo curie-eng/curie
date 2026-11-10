@@ -69,8 +69,9 @@ builds and other toolchains need the setup described in the
 | A GitHub account | your own GitHub App and the trial repository |
 
 For the default new-kind path on Docker Desktop, plan for **at least 16 GiB
-allocated to Docker** before creating the cluster. Larger repositories may
-need more. For an existing cluster, check its available capacity instead.
+allocated to Docker** and about **20 GiB of free host disk** before creating
+the cluster. Larger repositories may need more. For an existing cluster, check
+its available capacity instead.
 See [local kind capacity and recovery](#local-kind-capacity-and-recovery).
 
 The command checks all required tools on `PATH` before running any command or
@@ -124,9 +125,12 @@ its unpublished factory runner image.
 ## Create the repository
 
 In the GitHub website, create a repository with one commit (an initial README
-is enough). The repository may be public or private. Either way, the GitHub App
-must be installed on it, which the **Install App** step under
-[Rerun with the App](#rerun-with-the-app) covers. The factory branches from the
+is enough). On GitHub Free, use a public trial repository with no sensitive
+content. GitHub's branch-rules API returns 403 for private repositories on
+that plan, which prevents the factory from verifying the final CI result. A
+private trial needs a plan that supports private repository rulesets. Install
+the GitHub App on the repository as shown in
+[Rerun with the App](#rerun-with-the-app). The factory branches from the
 default branch, so the repository needs that commit. It does not need CI. Note
 the `owner/name` form, for example `acme-corp/acme-bot`.
 
@@ -1010,6 +1014,15 @@ Kubernetes cluster with more available capacity. Then repeat the
 [second](#rerun-with-the-app) commands. Reuse an App already installed on the
 trial repository; cluster recreation does not require another App.
 
+For the new local kind path above, if Docker stops during image downloads,
+free host disk space and restart Docker Desktop. Delete only that disposable
+cluster, then empty its isolated kubeconfig before retrying the first command:
+
+```bash
+kind delete cluster --name "${CURIE_CONTEXT#kind-}"
+: > "$CURIE_TRIAL_KUBECONFIG"
+```
+
 If the issue is still queued after the new cluster is ready, remove
 `curie-factory` from the issue, wait for the status comment to report
 cancellation, then add the label again. Confirm the issue moves to running.
@@ -1087,6 +1100,7 @@ then bind the agent with
 | Pending work pod reports `Insufficient memory` | Its resource request exceeds the node's remaining allocatable memory | Follow [local kind capacity and recovery](#local-kind-capacity-and-recovery); waiting alone will not schedule it |
 | Status comment ends with `Could not complete:` | The run stopped. The comment's cause lines say why | Fix the cause, then relabel |
 | CI wait ends `github_forbidden_get_*` after opening a PR | A GitHub CI read returned 403; the reason names the read that was refused (`github_forbidden_list_check_runs`, `github_forbidden_get_combined_status`, `github_forbidden_get_branch_rules` or `github_forbidden_get_branch`) | Check the installed App's effective permissions and the PR checks. The reason does not claim which grant is missing, and a bare `github_forbidden` names no read; do not assume a missing grant or call the run complete, and record the refusal for [#5222](https://github.com/curie-eng/curie/issues/5222) |
+| CI wait ends `github_forbidden_get_branch_rules` (or bare `github_forbidden` on an older release) on a private GitHub Free repository | GitHub does not provide private repository rulesets on that plan, so its branch-rules read returns 403 even with Metadata: read | Use a public disposable repository without sensitive content, or a private repository on a plan that supports private rulesets. Relabel only after the repository can be read. |
 | `Could not resolve host: github.com` on kind | CoreDNS replica race | Rerun. The command scales CoreDNS to one replica |
 | Nothing happens after the label | The labelling user lacks write access, the label name differs, or the agent has no `github=<owner>/<name>` surface | Fix that and relabel. Polling notices the label on its interval |
 | Installation reports a pre-existing agent-sandbox controller | Another release owns it, or an unowned controller is already installed | Curie reuses a controller owned by another Helm release, or a healthy unowned controller with the matching chart image, by inferring `agentSandbox.controller.deploy=false`. An unhealthy or different unowned controller stops setup with a specific repair command. Have its owner make that repair, then rerun; release status cannot repair it. See [controller inference](../operations.md#curie-cluster-up) |
