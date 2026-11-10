@@ -308,6 +308,42 @@ def secret_env(name: str, secret: str, key: str) -> dict[str, Any]:
     return {"name": name, "valueFrom": {"secretKeyRef": {"name": secret, "key": key}}}
 
 
+def live_observations(
+    events: Sequence[Mapping[str, Any]], observed: Mapping[str, Any],
+    elapsed: float, grant: HeldSecret,
+) -> dict[str, Any]:
+    from curie_telemetry.redact import held_secret_literals
+
+    held = held_secret_literals([grant.reveal()])
+    models = {
+        item.get("message", {}).get("model") for item in observed["assistant_messages"]
+    }
+    safe_models = sorted(
+        model for model in models
+        if isinstance(model, str)
+        and (model == "<synthetic>" or re.fullmatch(r"claude-[A-Za-z0-9_.:\[\]-]{1,100}", model))
+        and not any(secret in model for secret in held)
+    )
+    finals = [event for event in events if event.get("type") == "final"]
+    final = finals[0] if len(finals) == 1 else {}
+    status = final.get("status")
+    reported = [item for body in observed["usage"] for item in body.get("models", [])]
+    counts = [item.get("output_tokens") for item in reported]
+    return {
+        "models": safe_models,
+        "unreported_model_entries": len(models) - len(safe_models),
+        "final_status": status if status in {"done", "classified-failure", "awaiting-approval"}
+        else "unrecognized",
+        "final_output_tokens": final.get("output_tokens")
+        if isinstance(final.get("output_tokens"), int) else None,
+        "reported_output_tokens": sum(counts)
+        if counts and all(isinstance(count, int) for count in counts) else None,
+        "usage_report_count": len(observed["usage"]),
+        "error_event_count": sum(event.get("type") == "error" for event in events),
+        "elapsed_seconds": round(elapsed, 3),
+    }
+
+
 class ClusterProof:
     def __repr__(self) -> str:
         return "<private cluster proof>"
@@ -1411,6 +1447,9 @@ print(json.dumps(files))
             )
         self.captures.append(raw)
         observed = self.observe_files(pod)
+        self.evidence["live_observations"] = live_observations(
+            events, observed, elapsed, self.grant
+        )
         assistants = observed["assistant_messages"]
         unique = {item.get("message", {}).get("id") for item in assistants}
         require(

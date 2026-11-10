@@ -19,6 +19,7 @@ from personal_token_cluster_support import (
     ClusterProof,
     HeldSecret,
     ProofCheckError,
+    live_observations,
     validate_inputs,
 )
 
@@ -28,6 +29,36 @@ _GRANT = HeldSecret(
     if os.environ.get("CURIE_PERSONAL_LIVE") == "1"
     else ""
 )
+
+
+def test_live_failure_diagnostics_preserve_safe_model_and_usage_observations() -> None:
+    grant = HeldSecret("claude-private-synthetic-grant")
+    events = [
+        {"type": "error", "message": "private error " + grant.reveal()},
+        {"type": "final", "status": "classified-failure", "output_tokens": 0},
+    ]
+    observed = {
+        "assistant_messages": [
+            {"message": {"model": "<synthetic>"}},
+            {"message": {"model": "claude-sonnet-5-5-20261101"}},
+            {"message": {"model": grant.reveal()}},
+        ],
+        "usage": [{"models": [{"output_tokens": 17}]}],
+    }
+    result = live_observations(events, observed, 1.25, grant)
+    encoded = json.dumps(result)
+    exposed = grant.reveal() in encoded or "private error" in encoded
+    assert not exposed
+    assert result == {
+        "models": ["<synthetic>", "claude-sonnet-5-5-20261101"],
+        "unreported_model_entries": 1,
+        "final_status": "classified-failure",
+        "final_output_tokens": 0,
+        "reported_output_tokens": 17,
+        "usage_report_count": 1,
+        "error_event_count": 1,
+        "elapsed_seconds": 1.25,
+    }
 
 
 @pytest.fixture
