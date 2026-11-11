@@ -555,3 +555,49 @@ def test_publication_card_channel_requires_a_route(
     assert audit.json()[-1]["authorizer"] == "NoVerifiableApprovers"
     stored = client.get(f"/publications/{publication['id']}", headers=auth_headers)
     assert stored.json()["status"] == "pending"
+
+
+def test_tracker_publication_replay_keeps_its_card_target(
+    publication_stack: tuple[TestClient, str],
+    auth_headers: dict[str, str],
+    clean_db: None,
+) -> None:
+    """#5542: an exact replay is adopted only when it names the stored card target."""
+
+    client, _ = publication_stack
+    route = f"operators-{uuid.uuid4().hex[:8]}"
+    deployment = _create_deployment_with_routes(
+        client, auth_headers, route=route, users=[SUBJECT]
+    )
+    payload = _tracker_publication_payload(
+        deployment["id"], route=route, card_channel="C0EXAMPLE1"
+    )
+    payload["dedupe_key"] = f"card-target-{uuid.uuid4().hex[:8]}"
+    _, publication = _create_publication(client, payload)
+
+    def stored_cards() -> list[dict[str, Any]]:
+        return _rows(
+            "SELECT id, card_channel FROM curie.approvals WHERE dedupe_key = :key",
+            {"key": payload["dedupe_key"]},
+        )
+
+    # Liveness: the identical request is adopted, not duplicated.
+    replay = client.post("/v1/internal/publications", json=payload, headers=WORKER_HEADERS)
+    assert replay.status_code == 200, replay.text
+    assert replay.json()["id"] == publication["id"]
+    assert replay.json()["approval_id"] == publication["approval_id"]
+    rows = stored_cards()
+    assert len(rows) == 1
+    assert rows[0]["card_channel"] == "C0EXAMPLE1"
+
+    # Refusal: a different card target, or none (so the reply channel), conflicts.
+    other_target = {**payload, "card_channel": "C0EXAMPLE2"}
+    no_target = {k: v for k, v in payload.items() if k != "card_channel"}
+    for changed in (other_target, no_target):
+        refused = client.post(
+            "/v1/internal/publications", json=changed, headers=WORKER_HEADERS
+        )
+        assert refused.status_code == 409, refused.text
+        rows = stored_cards()
+        assert len(rows) == 1
+        assert rows[0]["card_channel"] == "C0EXAMPLE1"

@@ -29,15 +29,15 @@ def _policy_card_target(
 ) -> tuple[ReplyTarget, TargetRoute]:
     """Where a card on its route's fixed Slack channel posts (ADR 0177, #5542).
 
-    The same rule as the policy-routed card in ``kernel/approval.py``
-    ``_pause_for_approval`` (the ``in_requesting_channel`` block): the card
-    posts top level in a channel that never asked, so it belongs to no
-    conversation, mints its own ref, and has no endpoint. A Slack reply lends
-    its bot identity, selected as ``binding.binding_adapter_for_handle`` does
-    (the relay's stored identity, else the default); any other reply kind gets
-    the worker's default Slack identity. It never raises: it runs after the
-    claim committed, where a raise would strand the lease without charging an
-    attempt.
+    The kernel's rule (``kernel/approval.py`` ``_pause_for_approval``) for a
+    card that is not in the requesting channel: it posts top level in a fixed
+    policy channel, so it belongs to no conversation, mints its own ref, and
+    has no endpoint. A Slack reply lends its bot identity, selected as
+    ``binding.binding_adapter_for_handle`` does (the relay's stored identity,
+    else the default); any other reply kind gets the worker's default Slack
+    identity. It does no lookups and has no refusal of its own, so the only
+    failures are model validation of values the API already validated. A
+    failure here happens after the claim committed.
     """
 
     if reply_kind != SLACK_KIND:
