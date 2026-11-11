@@ -2,6 +2,8 @@
 
 Pins #2705: a publication that carries a bound `approvers.users` route is
 resolvable by an operator principal. Omitting the route stays fail-closed.
+Pins #5542: a publication that replies on a tracker shows its card on the
+route's fixed Slack channel, so that route's list answers it.
 """
 
 from __future__ import annotations
@@ -11,6 +13,7 @@ import time
 import uuid
 from typing import Any
 
+import channel_protocol
 from curie_api import approval_principal
 from curie_api.config import get_settings
 from curie_worker.publication_store import PostgresPublicationStore
@@ -349,3 +352,206 @@ def test_operator_principal_resolves_a_cluster_message_publication_after_card_cl
     queued = asyncio.run(claim_reconcile())
     assert queued is not None
     assert str(queued.publication_id) == publication["id"]
+
+
+def _tracker_publication_payload(
+    deployment_id: str,
+    *,
+    route: str | None = None,
+    card_channel: str | None = None,
+) -> dict[str, Any]:
+    """A publication admitted from a tracker issue, which replies on the repository.
+
+    Each call names its own conversation, so two publications never share a
+    lineage. ``card_channel`` is the route's fixed Slack card target (#5542).
+    """
+
+    payload = _publication_payload(
+        deployment_id, conversation_id=f"issue-{uuid.uuid4().hex[:12]}"
+    )
+    payload.update(reply_kind="github", reply_channel=REPO, reply_placeholder=None)
+    if route is not None:
+        payload["route"] = route
+    if card_channel is not None:
+        payload["card_channel"] = card_channel
+    return payload
+
+
+def _claim_cards(count: int, lease_owner: str) -> list[Any]:
+    """Lease ``count`` pending publication cards through the worker's real outbox."""
+
+    async def claim() -> list[Any]:
+        engine = create_async_engine(get_settings().database_url)
+        store = PostgresPublicationStore(engine, schema="curie", lease_owner=lease_owner)
+        try:
+            works: list[Any] = []
+            for _ in range(count):
+                work = await store.claim_pending_card()
+                assert work is not None
+                works.append(work)
+            assert await store.claim_pending_card() is None
+            for work in works:
+                await store.mark_card_delivered(work.publication_id)
+            return works
+        finally:
+            await engine.dispose()
+
+    return asyncio.run(claim())
+
+
+def test_operator_resolves_a_tracker_publication_on_its_fixed_slack_card(
+    publication_stack: tuple[TestClient, str],
+    auth_headers: dict[str, str],
+    clean_db: None,
+) -> None:
+    """#5542: a tracker publication's card is on its route's fixed Slack channel,
+    so the route's explicit approver list answers it, not the tracker surface.
+    """
+
+    client, _ = publication_stack
+    route = f"operators-{uuid.uuid4().hex[:8]}"
+    deployment = _create_deployment_with_routes(
+        client, auth_headers, route=route, users=[SUBJECT]
+    )
+    publications = [
+        _create_publication(
+            client,
+            _tracker_publication_payload(
+                deployment["id"], route=route, card_channel="C0EXAMPLE1"
+            ),
+        )[1]
+        for _ in range(2)
+    ]
+    for publication in publications:
+        stored_approval = client.get(
+            f"/approvals/{publication['approval_id']}", headers=auth_headers
+        )
+        assert stored_approval.status_code == 200, stored_approval.text
+        assert stored_approval.json()["route"] == route
+        assert stored_approval.json()["reply_channel"] == REPO
+        assert stored_approval.json()["card_channel"] == "C0EXAMPLE1"
+
+    cards = _claim_cards(2, "tracker-publication-card-claim")
+    assert {str(card.approval_id) for card in cards} == {
+        publication["approval_id"] for publication in publications
+    }
+    for card in cards:
+        assert card.target.kind == "slack"
+        assert card.target.address == "C0EXAMPLE1"
+        assert card.target.conversation_id is None
+        assert card.target.reply_ref is None
+        assert card.route.endpoint is None
+        assert card.route.adapter is None
+
+    approved, denied = publications
+    for publication, decision, outcome in (
+        (approved, "approved", "approved"),
+        (denied, "rejected", "denied"),
+    ):
+        resolved = _operator_resolve(client, publication["approval_id"], decision=decision)
+        assert resolved.status_code == 200, resolved.text
+        audit = client.get(
+            f"/approvals/{publication['approval_id']}/audit", headers=auth_headers
+        )
+        assert audit.status_code == 200, audit.text
+        entry = audit.json()[-1]
+        assert entry["authorizer"] == "ExplicitUserListAuthorizer"
+        assert entry["principal_kind"] == "operator"
+        assert entry["actor"] == SUBJECT
+        assert entry["authorized"] is True
+        stored = client.get(f"/publications/{publication['id']}", headers=auth_headers)
+        assert stored.status_code == 200, stored.text
+        assert stored.json()["status"] == outcome
+
+
+def test_unlisted_operator_is_refused_by_the_list_on_a_tracker_publication(
+    publication_stack: tuple[TestClient, str],
+    auth_headers: dict[str, str],
+    clean_db: None,
+) -> None:
+    client, _ = publication_stack
+    route = f"operators-{uuid.uuid4().hex[:8]}"
+    deployment = _create_deployment_with_routes(
+        client, auth_headers, route=route, users=[OTHER]
+    )
+    _, publication = _create_publication(
+        client,
+        _tracker_publication_payload(deployment["id"], route=route, card_channel="C0EXAMPLE1"),
+    )
+
+    refused = _operator_resolve(client, publication["approval_id"])
+    assert refused.status_code == 403, refused.text
+    detail = refused.json()["detail"]
+    assert MEMBERSHIP_403 in detail
+    assert ELIGIBILITY_403 not in detail
+    assert "no approver list that can be verified" not in detail
+
+    audit = client.get(
+        f"/approvals/{publication['approval_id']}/audit", headers=auth_headers
+    )
+    assert audit.status_code == 200, audit.text
+    assert audit.json()[-1]["authorizer"] == "ExplicitUserListAuthorizer"
+    assert audit.json()[-1]["authorized"] is False
+    stored_approval = client.get(
+        f"/approvals/{publication['approval_id']}", headers=auth_headers
+    )
+    assert stored_approval.status_code == 200, stored_approval.text
+    assert stored_approval.json()["status"] == "pending"
+    stored = client.get(f"/publications/{publication['id']}", headers=auth_headers)
+    assert stored.json()["status"] == "pending"
+
+
+def test_publication_card_channel_requires_a_route(
+    publication_stack: tuple[TestClient, str],
+    auth_headers: dict[str, str],
+    clean_db: None,
+) -> None:
+    client, _ = publication_stack
+    route = f"operators-{uuid.uuid4().hex[:8]}"
+    deployment = _create_deployment_with_routes(
+        client, auth_headers, route=route, users=[SUBJECT]
+    )
+    routeless_card = _tracker_publication_payload(deployment["id"], card_channel="C0EXAMPLE1")
+    selected = client.post(
+        f"/v1/internal/workspaces/{deployment['id']}/selection",
+        json={
+            "conversation_id": channel_protocol.scoped_conversation_id(
+                "github", REPO, routeless_card["conversation_id"]
+            ),
+            "author": routeless_card["author"],
+            "repo_full_name": REPO,
+        },
+        headers=WORKER_HEADERS,
+    )
+    assert selected.status_code == 200, selected.text
+
+    refused = client.post(
+        "/v1/internal/publications", json=routeless_card, headers=WORKER_HEADERS
+    )
+    assert refused.status_code == 422, refused.text
+    assert "card_channel requires an approval route" in refused.text
+    assert _rows("SELECT count(*) AS count FROM curie.approvals") == [{"count": 0}]
+    assert _rows("SELECT count(*) AS count FROM curie.publications") == [{"count": 0}]
+
+    # Liveness: without a card target the card stays on the reply route and the
+    # tracker surface still has no approver list an operator can satisfy.
+    _, publication = _create_publication(
+        client, _tracker_publication_payload(deployment["id"])
+    )
+    stored_approval = client.get(
+        f"/approvals/{publication['approval_id']}", headers=auth_headers
+    )
+    assert stored_approval.status_code == 200, stored_approval.text
+    assert stored_approval.json()["route"] is None
+    assert stored_approval.json()["card_channel"] == REPO
+
+    unverifiable = _operator_resolve(client, publication["approval_id"])
+    assert unverifiable.status_code == 403, unverifiable.text
+    assert "github has no approver list that can be verified" in unverifiable.json()["detail"]
+    audit = client.get(
+        f"/approvals/{publication['approval_id']}/audit", headers=auth_headers
+    )
+    assert audit.status_code == 200, audit.text
+    assert audit.json()[-1]["authorizer"] == "NoVerifiableApprovers"
+    stored = client.get(f"/publications/{publication['id']}", headers=auth_headers)
+    assert stored.json()["status"] == "pending"

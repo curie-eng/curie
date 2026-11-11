@@ -103,6 +103,7 @@ async def _adopt_publication_replay(
             approval.reply_kind, approval.reply_adapter, approval.reply_identity
         )
         != normalized_reply_identity(data.reply_kind, data.reply_adapter, data.reply_identity)
+        or approval.card_channel != (data.card_channel or data.reply_channel)
         or publication.deployment_id != data.deployment_id
         or publication.repo_full_name.casefold() != data.repo_full_name.casefold()
         or publication.base_sha != data.base_sha
@@ -639,7 +640,8 @@ async def create_publication(
         dedupe_key=data.dedupe_key,
         traceparent=traceparent,
         route=data.route,
-        card_channel=data.reply_channel,
+        # A route's fixed Slack target, else the reply route (ADR 0177, #5542).
+        card_channel=data.card_channel or data.reply_channel,
         gate_kind="permission",
         granted_tool="mcp__curie__publish_changes",
         purpose="publication",

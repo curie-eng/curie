@@ -39,6 +39,10 @@ class PublicationCreate(BaseModel):
     dedupe_key: str = Field(min_length=1)
     review_origin_key: str | None = Field(default=None, min_length=1, max_length=180)
     route: str | None = None
+    # The route's fixed Slack card channel (ADR 0177 decisions 1 and 2,
+    # #5542), shaped like ``ApprovalRequest.card_channel``. Omitted, the card
+    # is shown on the reply route.
+    card_channel: str | None = None
     base_sha: str
     work_item_request_id: uuid.UUID | None = None
     work_item_runtime_epoch: int | None = Field(default=None, ge=1)
@@ -98,6 +102,14 @@ class PublicationCreate(BaseModel):
             raise ValueError("publication reply adapter must be a lowercase slug")
         if self.reply_endpoint is not None:
             validate_channel_endpoint(self.reply_endpoint)
+        return self
+
+    @model_validator(mode="after")
+    def _card_channel_needs_route(self) -> "PublicationCreate":
+        # Only a route's fixed resolution target moves the card off the reply
+        # route, so a routeless card target names no policy that put it there.
+        if self.card_channel is not None and not self.route:
+            raise ValueError("publication card_channel requires an approval route")
         return self
 
     @field_validator("changed_paths")
