@@ -124,6 +124,7 @@ PER_RESPONSE_OUTPUT_TOKENS = 256
 MAX_TURNS_PER_RUN = 2
 TOKEN_SHAPE = re.compile(r"[\x21-\x7e]{1,4096}")
 SYNTHETIC_SERVICE_CREDENTIAL = "installation-control-unusable"
+SYNTHETIC_SERVICE_BASE_URL = "https://model.example.com"
 
 _TRANSCRIPT_WRITE = """\
 import asyncio, os, sys
@@ -253,10 +254,15 @@ def validate_inputs(phase: str) -> dict[str, str]:
             "SUBSCRIPTION_TEST_GRANT_FILE",
             "CURIE_PERSONAL_SERVICE_CREDENTIAL_FILE",
             "CURIE_PERSONAL_PROOF_RUN_ID",
+            "ANTHROPIC_API_KEY",
+            "ANTHROPIC_BASE_URL",
         ]
     missing = [name for name in required if not os.environ.get(name)]
     require(not missing, "missing required proof inputs: " + ", ".join(missing))
-    for name in ("CLAUDE_CODE_OAUTH_TOKEN", "ANTHROPIC_API_KEY", "CURIE_CREDENTIALS"):
+    forbidden = ["CLAUDE_CODE_OAUTH_TOKEN", "CURIE_CREDENTIALS"]
+    if phase != "live":
+        forbidden.append("ANTHROPIC_API_KEY")
+    for name in forbidden:
         require(name not in os.environ, "a model credential reached the driver environment")
     namespace = os.environ["CURIE_PERSONAL_TEST_NAMESPACE"]
     require(
@@ -470,15 +476,24 @@ class EnrollmentProof(ClusterProof):
             service = read_private_input(
                 os.environ["CURIE_PERSONAL_SERVICE_CREDENTIAL_FILE"], "service credential input"
             )
+            require(os.environ["ANTHROPIC_API_KEY"] == service.reveal(),
+                    "installation credential does not match its private input")
+            service_url = HeldSecret(os.environ.pop("ANTHROPIC_BASE_URL"))
+            parsed = urllib.parse.urlsplit(service_url.reveal())
+            require(parsed.scheme in {"http", "https"} and bool(parsed.hostname),
+                    "installation endpoint is malformed")
+            os.environ.pop("ANTHROPIC_API_KEY")
             # Well formed, and refused by the provider: it was never issued.
             invalid = HeldSecret("sk-ant-oat01-" + secrets.token_urlsafe(72))
         else:
             grant = HeldSecret("synthetic-enrollment-grant-" + secrets.token_hex(16))
             service = HeldSecret(SYNTHETIC_SERVICE_CREDENTIAL)
+            service_url = HeldSecret(SYNTHETIC_SERVICE_BASE_URL)
             invalid = HeldSecret("synthetic-enrollment-invalid-" + secrets.token_hex(16))
         super().__init__(grant, phase)
         self.grant_namespace = names["grant_namespace"]
         self.service = service
+        self.service_url = service_url
         self.invalid = invalid
         self.runner_host = os.environ["CURIE_PERSONAL_RUNNER_API_HOST"]
         self.evidence_dir = Path(os.environ["CURIE_PERSONAL_EVIDENCE_DIR"])
@@ -536,6 +551,7 @@ class EnrollmentProof(ClusterProof):
             self.grant,
             self.invalid,
             self.service,
+            self.service_url,
             self.platform_key,
             self.worker_token,
             self.pg_password,
@@ -816,15 +832,6 @@ class EnrollmentProof(ClusterProof):
                 self.grant_namespace_uid = created.metadata.uid
         self.worker = KubernetesSandboxClient(self.namespace, kubeconfig=self.private_config)
         self.create_inputs()
-        if self.phase == "live":
-            # The installation's model credential is a real usable one, so a
-            # personal run that fell back to it would visibly succeed.
-            self.core.patch_namespaced_secret(
-                "installation-model",
-                self.namespace,
-                {"stringData": {"grant": self.service.reveal()}},
-                _request_timeout=30,
-            )
         self.start_backing_services()
         self.migrate()
         self.relay = TcpRelay(self.runner_host, self.port_api())
@@ -846,6 +853,11 @@ class EnrollmentProof(ClusterProof):
 
         def pod_spec() -> dict[str, Any]:
             spec = original()
+            for container in [*spec["containers"], *spec["initContainers"]]:
+                container["env"] += [
+                    secret_env(name, "installation-model", name)
+                    for name in ("ANTHROPIC_API_KEY", "ANTHROPIC_BASE_URL")
+                ]
             staging = spec["initContainers"][0]
             staging["name"] = "bundle-fetch"
             extract = {**staging, "name": "bundle-extract", "command": ["python3", "-c", "pass"]}
@@ -857,6 +869,12 @@ class EnrollmentProof(ClusterProof):
             super().create_inputs()
         finally:
             self.pod_spec = original  # type: ignore[method-assign]
+        self.core.patch_namespaced_secret(
+            "installation-model", self.namespace,
+            {"stringData": {"ANTHROPIC_API_KEY": self.service.reveal(),
+                            "ANTHROPIC_BASE_URL": self.service_url.reveal()}},
+            _request_timeout=30,
+        )
 
     def port_api(self) -> int:
         if "api" not in self.ports:
@@ -1435,10 +1453,24 @@ class EnrollmentProof(ClusterProof):
         stored = base64.b64decode((tokens.data or {}).get("CLAUDE_CODE_OAUTH_TOKEN", ""))
         self.check("AC2", f"generation {generation} grant only in its per-claim Secret", True,
                    stored == launched.grant.reveal().encode())
+        self.assert_service_isolated(launched.pod, tokens.data or {})
         self.check("AC5", f"generation {generation} request running under the driver",
                    "running", self.request_row(request_id)["status"])
         self.start_worker()
         return launched
+
+    def assert_service_isolated(self, pod: str, token_data: Mapping[str, str]) -> None:
+        names = json.loads(self.exec(
+            pod, "python3", "-c",
+            "import json, os; print(json.dumps(sorted(set(os.environ) & "
+            "{'ANTHROPIC_API_KEY', 'ANTHROPIC_BASE_URL'})))",
+        ))
+        self.check("AC5", "personal runner excludes installation key and endpoint", [], names)
+        self.check(
+            "AC5", "personal claim Secret excludes installation key and endpoint", False,
+            leaks(json.dumps(dict(token_data)).encode(),
+                  [self.service.reveal(), self.service_url.reveal()]),
+        )
 
     def wait_teardown(self, launched: Launched, *, cause: str) -> dict[str, Any]:
         """The fenced runtime is torn down by the worker and its record confirmed."""
@@ -2048,7 +2080,8 @@ class EnrollmentProof(ClusterProof):
             container["env"] = [
                 item for item in container.get("env", [])
                 if item["name"] not in {"CURIE_CREDENTIALS", "CURIE_MODEL_ENV_KEY",
-                                        "ACME_MODEL_TOKEN", "CURIE_MODEL_AUTH_MODE"}
+                                        "ACME_MODEL_TOKEN", "CURIE_MODEL_AUTH_MODE",
+                                        "ANTHROPIC_API_KEY", "ANTHROPIC_BASE_URL"}
             ]
         runner = spec["containers"][0]
         runner["env"] += [
@@ -2062,7 +2095,8 @@ class EnrollmentProof(ClusterProof):
             pod, "python3", "-c",
             "import json, os; print(json.dumps(sorted(set(os.environ) & "
             "{'CURIE_CREDENTIALS', 'CURIE_MODEL_ENV_KEY', 'ACME_MODEL_TOKEN', "
-            "'CLAUDE_CODE_OAUTH_TOKEN', 'ANTHROPIC_API_KEY', 'ANTHROPIC_AUTH_TOKEN'})))",
+            "'CLAUDE_CODE_OAUTH_TOKEN', 'ANTHROPIC_API_KEY', 'ANTHROPIC_AUTH_TOKEN', "
+            "'ANTHROPIC_BASE_URL'})))",
         ))
         self.check("AC5", "the missing-grant runner has no model credential environment", [],
                    credential_names)
@@ -2071,9 +2105,7 @@ class EnrollmentProof(ClusterProof):
         personal_secret = self.core.read_namespaced_secret(
             claim_object_names(self.s4.claim_name).secret, self.namespace, _request_timeout=30,
         )
-        self.check("AC5", "the service credential never enters the personal claim Secret", False,
-                   any(base64.b64decode(encoded) == self.service.reveal().encode()
-                       for encoded in (personal_secret.data or {}).values()))
+        self.assert_service_isolated(pod, personal_secret.data or {})
         with (
             self.forward(pod) as port,
             self.session_deadline(pod, self.runner_auth, port) as deadline,

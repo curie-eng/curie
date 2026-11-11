@@ -54,6 +54,8 @@ _LIVE_INPUTS = (
     "SUBSCRIPTION_TEST_GRANT_FILE",
     "CURIE_PERSONAL_SERVICE_CREDENTIAL_FILE",
     "CURIE_PERSONAL_PROOF_RUN_ID",
+    "ANTHROPIC_API_KEY",
+    "ANTHROPIC_BASE_URL",
 )
 
 
@@ -218,8 +220,37 @@ def test_live_proof_refuses_to_start_without_its_service_credential(
     monkeypatch.setenv("SUBSCRIPTION_TEST_GRANT_FILE", str(grant))
     monkeypatch.setenv("CURIE_PERSONAL_PROOF_RUN_ID", "enrollment-run")
     monkeypatch.setenv("CURIE_PERSONAL_SERVICE_CREDENTIAL_FILE", str(tmp_path / "absent"))
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "service-placeholder")
+    monkeypatch.setenv("ANTHROPIC_BASE_URL", "https://model.example.com")
     with pytest.raises(ProofCheckError, match="service credential input is unavailable"):
         EnrollmentProof("live")
+
+
+def test_live_installation_inputs_are_held_without_reaching_child_environments(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _inputs(monkeypatch, tmp_path)
+    grant = _private(tmp_path / "grant", b"sk-ant-oat01-example\n")
+    service = _private(tmp_path / "service", b"service-placeholder\n")
+    for name, value in {
+        "SUBSCRIPTION_TEST_GRANT_FILE": str(grant),
+        "CURIE_PERSONAL_SERVICE_CREDENTIAL_FILE": str(service),
+        "CURIE_PERSONAL_PROOF_RUN_ID": "enrollment-run",
+        "ANTHROPIC_API_KEY": "service-placeholder",
+        "ANTHROPIC_BASE_URL": "https://model.example.com",
+    }.items():
+        monkeypatch.setenv(name, value)
+    proof = EnrollmentProof("live")
+    try:
+        assert proof.service.reveal() == "service-placeholder"
+        assert proof.service_url.reveal() == "https://model.example.com"
+        assert "ANTHROPIC_API_KEY" not in proof.env
+        assert "ANTHROPIC_BASE_URL" not in proof.env
+        assert "ANTHROPIC_API_KEY" not in os.environ
+        assert "ANTHROPIC_BASE_URL" not in os.environ
+    finally:
+        for held in proof.held():
+            held.clear()
 
 
 @pytest.mark.parametrize(
