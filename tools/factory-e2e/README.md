@@ -50,11 +50,13 @@ The curie binary comes from `$CURIE_BIN`, else `cli/target/debug/curie`.
 
 ## Running it
 
-The commands below use placeholder values. Run them from the repository root.
+The commands below use placeholder values. Run them from the repository root, with
+`$SHA` set to the candidate commit and `$KUBE_CONTEXT` to the throwaway cluster's
+context.
 
 ```sh
 P="python3 tools/factory-e2e/personal_profile.py"
-COMMON="--candidate $SHA --context kind-acme-scratch --namespace ppa-acme-test \
+COMMON="--candidate $SHA --context $KUBE_CONTEXT --namespace ppa-acme-test \
   --release ppa-acme --registry 127.0.0.1:5999 --docker-context acme-builder \
   --kubeconfig $KUBECONFIG_FILE --app-dir $APP_DIR --grant-file $GRANT_FILE \
   --grant-expires-at 2026-11-11T09:30:00Z --state-dir $STATE_DIR --run-id acme-run-1"
@@ -104,7 +106,7 @@ writes a live start or reserves a session, so the single paid `run` is not
 the first execution of the install, setup, forge and cleanup machinery.
 
 ```sh
-$P rehearse --candidate $SHA --context kind-acme-scratch --namespace ppa-acme-rehearsal \
+$P rehearse --candidate $SHA --context "$KUBE_CONTEXT" --namespace ppa-acme-rehearsal \
   --release ppa-acme-r --registry 127.0.0.1:5999 --docker-context acme-builder \
   --kubeconfig $KUBECONFIG_FILE --app-dir $APP_DIR --state-dir $STATE_DIR \
   --run-id acme-rehearsal-1
