@@ -1740,7 +1740,9 @@ jobs:
       - name: Build
         run: pnpm build
       - name: Install Playwright chromium
-        run: pnpm exec playwright install --with-deps chromium
+        run: |
+          sudo sed -i 's|mirror+file:/etc/apt/apt-mirrors.txt|https://archive.ubuntu.com/ubuntu/|g' /etc/apt/sources.list.d/ubuntu.sources
+          pnpm exec playwright install --with-deps chromium
       # The stackless E2E project (route-interception fixtures, testIgnore
       # integration) runs with no backend; the live-backend "integration" project
       # only activates under PW_INTEGRATION=1, which CI does not set. Playwright's
