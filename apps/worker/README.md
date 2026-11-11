@@ -152,7 +152,8 @@ EvalSuite (cases: input + grader)
       name a grader)
    -> EvalRunResult: per-case rows + the "N/M passed" summary
    -> LangfuseEvalRecorder: a trace + `eval_pass` score per case, tagged
-      `version:<sha>` and `suite:<name>`, via the Langfuse ingestion API
+      `version:<sha>` and `suite:<name>`. Completed traces use OTLP/HTTP and
+      grades use the Langfuse score ingestion API.
 ```
 
 Run a Job with `python -m curie_worker.eval`; it loads a suite JSON, runs it
