@@ -4081,19 +4081,37 @@ async fn eval_route_revision(
     ))
 }
 
-/// Best-effort revision lookup: an API hiccup must not fail an eval that
-/// already ran, so it is reported on stderr and the revision stays unknown.
+/// Wall-clock bound on one whole revision lookup (three API reads).
+/// `ApiClient` has a connect timeout but no read timeout, so this is the only
+/// thing stopping a stalled API from holding the eval before its first case or
+/// after its last.
+const EVAL_REVISION_LOOKUP_BUDGET: Duration = Duration::from_secs(10);
+
+/// Best-effort revision lookup: an API hiccup or stall must not fail or hang
+/// an eval, so it is reported on stderr and the revision stays unknown. The
+/// whole lookup, not each request, is bounded by `budget`.
 async fn eval_route_revision_or_warn(
     api: &ApiClient,
     agent: Option<&str>,
     channel: &str,
+    budget: Duration,
 ) -> Option<crate::commands::EvalBundleRevision> {
-    match eval_route_revision(api, agent, channel).await {
-        Ok(revision) => revision,
-        Err(err) => {
-            crate::ui::ui().warn(&format!(
-                "could not resolve the evaluated bundle revision, so bundle_revision is null: \
-                 {err:#}"
+    let warn = |reason: String| {
+        crate::ui::ui().warn(&format!(
+            "could not resolve the evaluated bundle revision, so bundle_revision is null: \
+             {reason}"
+        ));
+    };
+    match tokio::time::timeout(budget, eval_route_revision(api, agent, channel)).await {
+        Ok(Ok(revision)) => revision,
+        Ok(Err(err)) => {
+            warn(format!("{err:#}"));
+            None
+        }
+        Err(_) => {
+            warn(format!(
+                "the platform API did not answer within {}s",
+                budget.as_secs_f64()
             ));
             None
         }
@@ -4102,10 +4120,13 @@ async fn eval_route_revision_or_warn(
 
 /// The revision to report for a run bracketed by two lookups. Every sample
 /// binds the in-force deployment when its fresh thread is claimed, so a run
-/// names ONE revision only when the lookup before the first sample and the
-/// lookup after the last agree. A deploy that landed mid-run means the
-/// samples may have run on different bundles; that is reported as unknown
-/// rather than attributing every sample to either one.
+/// names a revision only when the lookup before the first sample and the
+/// lookup after the last agree. A changed revision means the samples may have
+/// run on different bundles and is reported as unknown. Agreement is weaker
+/// than it looks: a deploy and a rollback inside the run leave both ends equal,
+/// so the value means "in force at the start and at the end, unchanged", not
+/// "served every sample". Neither the relay nor the reply exposes the version a
+/// sample's sandbox booted, so a per-sample revision is not observable here.
 fn stable_eval_revision(
     before: Option<crate::commands::EvalBundleRevision>,
     after: Option<crate::commands::EvalBundleRevision>,
@@ -5259,7 +5280,13 @@ async fn eval_local(opts: EvalOpts, suite: EvalSuite) -> Result<()> {
     ui.note(&format!("routing to channel {channel}"));
 
     let api = ApiClient::new(&api_base, &opts.api_key)?;
-    let revision_before = eval_route_revision_or_warn(&api, opts.agent.as_deref(), &channel).await;
+    let revision_before = eval_route_revision_or_warn(
+        &api,
+        opts.agent.as_deref(),
+        &channel,
+        EVAL_REVISION_LOOKUP_BUDGET,
+    )
+    .await;
     let mut results = run_eval_turns(
         &opts,
         &channel,
@@ -5269,7 +5296,13 @@ async fn eval_local(opts: EvalOpts, suite: EvalSuite) -> Result<()> {
         EvalReplyTransport::Stub(&mut stub),
     )
     .await?;
-    let revision_after = eval_route_revision_or_warn(&api, opts.agent.as_deref(), &channel).await;
+    let revision_after = eval_route_revision_or_warn(
+        &api,
+        opts.agent.as_deref(),
+        &channel,
+        EVAL_REVISION_LOOKUP_BUDGET,
+    )
+    .await;
     attach_eval_revision(&mut results, revision_before, revision_after);
     crate::commands::report_eval(&results, None, stub)
 }
@@ -5385,7 +5418,13 @@ async fn eval_cluster(opts: EvalOpts, suite: EvalSuite) -> Result<()> {
     let valkey_url = local_valkey_url(&opts.valkey_password, "127.0.0.1", valkey_local_port);
     let mut conn = connect(&valkey_url).await?;
 
-    let revision_before = eval_route_revision_or_warn(&api, opts.agent.as_deref(), &channel).await;
+    let revision_before = eval_route_revision_or_warn(
+        &api,
+        opts.agent.as_deref(),
+        &channel,
+        EVAL_REVISION_LOOKUP_BUDGET,
+    )
+    .await;
     let mut results = match run_eval_turns(
         &opts,
         &channel,
@@ -5399,7 +5438,13 @@ async fn eval_cluster(opts: EvalOpts, suite: EvalSuite) -> Result<()> {
         Ok(results) => results,
         Err(err) => return Err(enrich_cluster_enqueue_timeout(err).await),
     };
-    let revision_after = eval_route_revision_or_warn(&api, opts.agent.as_deref(), &channel).await;
+    let revision_after = eval_route_revision_or_warn(
+        &api,
+        opts.agent.as_deref(),
+        &channel,
+        EVAL_REVISION_LOOKUP_BUDGET,
+    )
+    .await;
     attach_eval_revision(&mut results, revision_before, revision_after);
     // report_eval process::exits on a red suite without unwinding, so both
     // port-forwards must move in as guards (#1908). There is no stub guard.
@@ -5998,6 +6043,60 @@ mod tests {
         assert_eq!(
             failed.error.as_deref(),
             Some("runner turn failed: runner_error")
+        );
+    }
+
+    /// The revision lookup is best effort, so a platform API that accepts the
+    /// connection and never answers must cost at most the budget, then degrade
+    /// to an unknown revision. `ApiClient` has a connect timeout but no read
+    /// timeout, so without the wrapping bound this would block the eval before
+    /// its first case or after its last one indefinitely.
+    #[tokio::test]
+    async fn a_stalled_api_cuts_the_revision_lookup_off_at_its_budget() {
+        let (base, stall) = hint_stalling_peer().await;
+        let api = ApiClient::new(&base, HINT_API_KEY).unwrap();
+        let budget = Duration::from_millis(500);
+        let started = Instant::now();
+        let revision = tokio::time::timeout(
+            budget * 20,
+            eval_route_revision_or_warn(&api, None, "C0EXAMPLE1", budget),
+        )
+        .await
+        .expect("nothing bounded the lookup against a stalled API");
+        let elapsed = started.elapsed();
+        stall.abort();
+        assert_eq!(revision, None, "an expired budget is an unknown revision");
+        assert!(
+            elapsed >= budget,
+            "the stall was never reached; took {elapsed:?}"
+        );
+        assert!(
+            elapsed < budget * 4,
+            "not cut off at its budget; took {elapsed:?}"
+        );
+    }
+
+    /// The limit of a before/after bracket, pinned so nobody reads more into
+    /// the field than it proves: a deploy of B and a redeploy of A inside one
+    /// run leaves both lookups on A, so the run still reports A even though
+    /// some samples may have run on B. The field means "the revision in force
+    /// at the start and at the end, unchanged", not "every sample's revision".
+    #[test]
+    fn an_a_to_b_to_a_run_still_reports_a_because_only_the_ends_are_observed() {
+        let revision = |version: &str| crate::commands::EvalBundleRevision {
+            agent_id: "agent-1".into(),
+            deployment_id: format!("dep-{version}"),
+            environment: "prod".into(),
+            version_id: version.into(),
+            version_label: version.into(),
+            commit_sha: None,
+            bundle_sha256: None,
+        };
+        // Observed: A before the first sample, A after the last. The B that
+        // served samples in between never reaches this function.
+        assert_eq!(
+            stable_eval_revision(Some(revision("A")), Some(revision("A"))),
+            Some(revision("A"))
         );
     }
 

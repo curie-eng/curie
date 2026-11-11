@@ -159,9 +159,10 @@ pub(super) fn skill_trial(
 
 /// The deployed bundle revision a local/cluster eval was routed to: the
 /// agent's in-force deployment and the version it serves. Resolved by the CLI
-/// from the platform API with the worker's own precedence (an active prod
-/// deployment outranks dev, then the most recent), not observed inside the
-/// sandbox. `bundle_sha256` is the same sha256-over-the-packed-archive the
+/// from the platform API with the worker's own binding order, not observed
+/// inside the sandbox. The caller reads it before the first sample and after
+/// the last, so a reported value is the revision in force at both ends,
+/// unchanged, not a per-sample record. `bundle_sha256` is the same sha256-over-the-packed-archive the
 /// skill tier reports as `bundle_digest`, so the two are directly comparable
 /// for one archive.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -175,6 +176,38 @@ pub struct EvalBundleRevision {
     pub bundle_sha256: Option<String>,
 }
 
+/// The deployment the worker binds for this agent, chosen with the worker's
+/// exact ordering (`apps/worker/src/curie_worker/binding.py`, `_RESOLVE_SQL`):
+/// active only, then `(environment = 'prod') DESC, deployed_at DESC, id DESC`.
+/// The id tiebreak matters on a tied timestamp, where API list order is not
+/// defined. Timestamps are compared as times, not text. `None` when nothing is
+/// active, or when an active row's `deployed_at` cannot be read, since the
+/// order is then unknown.
+fn worker_bound_deployment(
+    deployments: &[crate::api::Deployment],
+) -> Option<&crate::api::Deployment> {
+    use time::format_description::well_known::Rfc3339;
+    use time::OffsetDateTime;
+    // An offset-less timestamp is UTC: the platform stores and emits UTC.
+    let parse = |text: &str| {
+        OffsetDateTime::parse(text, &Rfc3339)
+            .or_else(|_| OffsetDateTime::parse(&format!("{text}Z"), &Rfc3339))
+            .ok()
+    };
+    let mut active = Vec::new();
+    for deployment in deployments.iter().filter(|d| d.status == "active") {
+        let at = parse(deployment.deployed_at.as_deref()?)?;
+        active.push((deployment.environment == "prod", at, deployment));
+    }
+    active
+        .into_iter()
+        .max_by(|(prod_a, at_a, a), (prod_b, at_b, b)| {
+            // Canonical lowercase UUID text orders like the stored bytes.
+            (prod_a, at_a, &a.id).cmp(&(prod_b, at_b, &b.id))
+        })
+        .map(|(_, _, deployment)| deployment)
+}
+
 /// Join the agent's in-force deployment to the version it serves. `None` when
 /// nothing is in force or the in-force version is not in `versions`: a
 /// revision the CLI cannot name is reported as unknown, never guessed.
@@ -183,7 +216,7 @@ pub fn eval_bundle_revision(
     deployments: &[crate::api::Deployment],
     versions: &[crate::api::Version],
 ) -> Option<EvalBundleRevision> {
-    let deployment = select_in_force_deployment(deployments)?;
+    let deployment = worker_bound_deployment(deployments)?;
     let version_id = deployment.version_id.as_deref()?;
     let version = versions.iter().find(|v| v.id == version_id)?;
     Some(EvalBundleRevision {

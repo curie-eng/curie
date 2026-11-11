@@ -228,6 +228,9 @@ Each case's `trials` array is the raw per-sample record (reply, `tool_calls`,
 verdict, seconds) behind those counts. `tool_calls` null means the tier cannot
 observe tools (local, cluster), not that none ran. The evaluated bundle is
 `bundle_digest` at the skill tier and `bundle_revision` at local and cluster.
+`bundle_revision` is the revision in force at the start and at the end of the
+run, unchanged; it does not prove every sample ran on it, and it is null on a
+local/cluster trajectory eval.
 
 **An eval's exit code is the gate: 1 at least one selected case failed, 2 the
 selector matched no cases, 3 the runner or platform API was unreachable or

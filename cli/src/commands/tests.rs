@@ -1669,8 +1669,8 @@ fn the_eval_bundle_revision_is_the_in_force_deployments_version() {
     // The revision a local/cluster eval names is the one the worker binds: an
     // active prod deployment outranks a newer active dev one.
     let deps = vec![
-        deployment("prod", "active", "v1", "2026-07-01"),
-        deployment("dev", "active", "v2", "2026-07-02"),
+        deployment("prod", "active", "v1", "2026-07-01T00:00:00Z"),
+        deployment("dev", "active", "v2", "2026-07-02T00:00:00Z"),
     ];
     let versions = vec![
         version("v1", "1.0.0", Some("aa11")),
@@ -1691,11 +1691,59 @@ fn the_eval_bundle_revision_is_the_in_force_deployments_version() {
 fn the_eval_bundle_revision_is_unknown_rather_than_guessed() {
     let versions = vec![version("v1", "1.0.0", Some("aa11"))];
     // Nothing in force: no deployment is active, so no revision applies.
-    let retired = vec![deployment("prod", "superseded", "v1", "2026-07-01")];
+    let retired = vec![deployment(
+        "prod",
+        "superseded",
+        "v1",
+        "2026-07-01T00:00:00Z",
+    )];
     assert!(super::eval_bundle_revision("agent-1", &retired, &versions).is_none());
     // In force, but its version is not in the listing: never borrow another one.
-    let orphan = vec![deployment("prod", "active", "v9", "2026-07-01")];
+    let orphan = vec![deployment("prod", "active", "v9", "2026-07-01T00:00:00Z")];
     assert!(super::eval_bundle_revision("agent-1", &orphan, &versions).is_none());
+}
+
+/// The worker binds `ORDER BY (environment = 'prod') DESC, deployed_at DESC,
+/// id DESC` (`apps/worker/src/curie_worker/binding.py`). The eval revision
+/// must pick the same row, including on a tied timestamp, where API list order
+/// is undefined and only the id breaks the tie.
+#[test]
+fn the_eval_bundle_revision_breaks_a_timestamp_tie_the_way_the_worker_does() {
+    let at = "2026-07-01T00:00:00Z";
+    let mut low = deployment("prod", "active", "v-low", at);
+    low.id = "00000000-0000-0000-0000-00000000000a".into();
+    let mut high = deployment("prod", "active", "v-high", at);
+    high.id = "00000000-0000-0000-0000-00000000000b".into();
+    let versions = vec![
+        version("v-low", "1.0.0", Some("aa11")),
+        version("v-high", "2.0.0", Some("bb22")),
+    ];
+    // Either list order must name the higher id, as the worker's id DESC does.
+    for deps in [
+        vec![low.clone(), high.clone()],
+        vec![high.clone(), low.clone()],
+    ] {
+        let revision = super::eval_bundle_revision("agent-1", &deps, &versions).unwrap();
+        assert_eq!(revision.version_id, "v-high", "{deps:?}");
+    }
+}
+
+/// Recency is the timestamp, not the list position, and it is compared as a
+/// time: `00Z` and `00.5Z` sort wrongly as strings.
+#[test]
+fn the_eval_bundle_revision_orders_by_time_not_by_list_position_or_text() {
+    let newer = deployment("dev", "active", "v-new", "2026-07-01T00:00:00.5Z");
+    let older = deployment("dev", "active", "v-old", "2026-07-01T00:00:00Z");
+    let versions = vec![
+        version("v-new", "2.0.0", None),
+        version("v-old", "1.0.0", None),
+    ];
+    let revision = super::eval_bundle_revision("agent-1", &[newer, older], &versions).unwrap();
+    assert_eq!(revision.version_id, "v-new");
+    // An active deployment whose time cannot be read makes the order unknown.
+    let unreadable = deployment("dev", "active", "v-old", "yesterday");
+    let fresh = deployment("dev", "active", "v-new", "2026-07-01T00:00:00Z");
+    assert!(super::eval_bundle_revision("agent-1", &[fresh, unreadable], &versions).is_none());
 }
 
 #[test]

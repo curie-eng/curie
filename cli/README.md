@@ -368,8 +368,12 @@ runner wire). Local and cluster see only the delivered reply, so their
 `tool_calls` is null, meaning not observable rather than none. A trajectory
 eval on local/cluster runs on the platform eval plane and omits `trials`. The
 bundle under test is `bundle_digest` at the skill tier and `bundle_revision`
-(agent, in-force deployment, version, commit, bundle sha256) at local/cluster,
-null when the in-force deployment changed during the run.
+(agent, in-force deployment, version, commit, bundle sha256) on the in-CLI
+local/cluster path. `bundle_revision` is read once before the first sample and
+once after the last, and reported only when both agree: it is the revision in
+force at the start and at the end, unchanged, not proof that every sample ran
+on it. It is null when the reads disagree, when a lookup fails or exceeds its
+10 second budget, and on a local/cluster trajectory eval.
 
 The skill tier scores the runner tool frames directly. The local and cluster
 tiers trigger the deployed bundle through the platform eval plane, then poll
