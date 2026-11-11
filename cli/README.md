@@ -684,10 +684,14 @@ says nothing about whether it is valid or expired.
 | `reconnect` | Give a disconnected enrollment a new grant. Generation and version advance by one. |
 | `disconnect` | Make the enrollment inactive and stop its runtimes. Generation and version advance by one; repeating it at the inactive version changes nothing. It does not revoke the grant at the provider or reverse billed usage. |
 
-`replace`, `reconnect` and `disconnect` are compare-and-set writes. Pass
-`--expected-version <N>` from `status`, or omit it to use the version read just
-before the write. A conflict (HTTP 409) exits 1; run `status` and retry with its
-version.
+`--expected-version <N>` is optional for `replace`, `reconnect` and `disconnect`.
+When supplied, the CLI sends that version with the compare-and-set write. When
+omitted, it first reads the owner's enrollment and sends the returned version
+with the write. If that read finds no enrollment, the command exits 1 with an
+instruction to enroll first and sends no write. A concurrent change produces
+a conflict (HTTP 409) and exits 1; run `status` and retry with its version.
+Direct API callers must supply `expected_version` in the PUT body for replace
+or reconnect, or in the DELETE query for disconnect.
 
 Without `--api-url` the command reaches the release API over a loopback
 port-forward selected by `--namespace` and `--release`. A direct `--api-url`

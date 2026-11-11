@@ -2477,10 +2477,17 @@ curie cluster subscription disconnect --session-file ~/.curie/session --expected
 ```
 
 `enroll` requires no enrollment. `replace` requires an active one and
-`reconnect` an inactive one, and `disconnect` an active one. All three take
-`--expected-version`, a compare-and-swap on the version `status` reports. Each
-`replace`, `reconnect` and `disconnect` raises both the generation and the
-version by one. `--dry-run` prints the plan and sends nothing. A 409 means the
+`reconnect` an inactive one. Replace, reconnect and disconnecting an active
+enrollment raise both the generation and the version by one. Repeating a
+disconnect at the inactive version changes nothing.
+
+`--expected-version <N>` is optional for `replace`, `reconnect` and `disconnect`.
+When supplied, the CLI sends that version with the compare-and-set write. When
+omitted, it first reads the owner's enrollment and sends the returned version
+with the write. If that read finds no enrollment, the command exits 1 with an
+instruction to enroll first and sends no write. Direct API callers must supply
+`expected_version` in the PUT body for replace or reconnect, or in the DELETE
+query for disconnect. `--dry-run` prints the plan and sends nothing. A 409 means the
 enrollment moved or the verb does not fit its state (`stale_version`,
 `enrollment_exists`, `enrollment_absent`, `enrollment_active`,
 `enrollment_inactive` or `staging_conflict`): run `status` again and retry with
