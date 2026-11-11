@@ -1683,6 +1683,8 @@ jobs:
       - uses: actions/checkout@v7
         with:
           persist-credentials: false
+      - name: Trust the checked out workspace in this container
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
       - name: Install pnpm
         id: install_pnpm
         continue-on-error: true
