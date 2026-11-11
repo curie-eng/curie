@@ -292,9 +292,9 @@ def build_secret_reader(
 
     configuration = k8s_client.Configuration()
     try:
-        k8s_config.load_incluster_config(client_configuration=configuration)
+        k8s_config.load_incluster_config(client_configuration=configuration)  # type: ignore[no-untyped-call]
     except k8s_config.ConfigException:
-        k8s_config.load_kube_config(config_file=kubeconfig, client_configuration=configuration)
+        k8s_config.load_kube_config(config_file=kubeconfig, client_configuration=configuration)  # type: ignore[no-untyped-call]
     configuration.retries = 0
     core = k8s_client.CoreV1Api(k8s_client.ApiClient(configuration=configuration))
     return KubernetesSecretReader(core, timeout_s=timeout_s)

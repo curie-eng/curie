@@ -276,9 +276,9 @@ def private_core_v1(kube_config_path: str | None) -> Any:
     if kube_config_path:
         k8s_config.load_kube_config(
             config_file=kube_config_path, client_configuration=configuration
-        )
+        )  # type: ignore[no-untyped-call]
     else:
-        k8s_config.load_incluster_config(client_configuration=configuration)
+        k8s_config.load_incluster_config(client_configuration=configuration)  # type: ignore[no-untyped-call]
     configuration.retries = 0
     return k8s_client.CoreV1Api(k8s_client.ApiClient(configuration=configuration))
 

@@ -134,7 +134,7 @@ def _in_cluster_core() -> Any:
     from kubernetes import config as k8s_config
 
     configuration = k8s_client.Configuration()
-    k8s_config.load_incluster_config(client_configuration=configuration)
+    k8s_config.load_incluster_config(client_configuration=configuration)  # type: ignore[no-untyped-call]
     configuration.retries = 0
     return k8s_client.CoreV1Api(k8s_client.ApiClient(configuration=configuration))
 
