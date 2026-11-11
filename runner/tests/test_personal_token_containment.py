@@ -945,21 +945,40 @@ def test_redaction_through_native_cli_http_aci_and_exported_spans(
 
 
 @pytest.mark.parametrize("boundary", ("finish", "discard"))
-def test_redaction_keeps_split_stderr_protected_after_initialization(boundary: str) -> None:
+@pytest.mark.parametrize("position", ("before-split", "inside-split"))
+@pytest.mark.parametrize(
+    "encoding", ("literal", "base64", "base64-unpadded", "urlsafe", "urlsafe-unpadded"),
+)
+def test_redaction_keeps_split_stderr_protected_after_initialization(
+    boundary: str, position: str, encoding: str,
+) -> None:
     _held_grant()
+    value = _OPAQUE_GRANT
+    if encoding.startswith("base64"):
+        value = base64.b64encode(value.encode()).decode()
+    elif encoding.startswith("urlsafe"):
+        value = base64.urlsafe_b64encode(value.encode()).decode()
+    if encoding.endswith("-unpadded"):
+        value = value.rstrip("=")
     forwarded: list[str] = []
     tail = StderrTail(forwarded.append, partial_line_chars=1024)
     tail.start()
-    getattr(tail, boundary)()
-    tail("p" * 1024 + PUBLIC_MARKER + " " + _OPAQUE_GRANT[:11])
-    tail(_OPAQUE_GRANT[11:])
-    tail(" " + PUBLIC_MARKER)
+    if position == "before-split":
+        getattr(tail, boundary)()
+    tail("p" * 1024 + PUBLIC_MARKER + " " + value[:11])
+    if position == "inside-split":
+        getattr(tail, boundary)()
+    tail(value[11:] + " " + PUBLIC_MARKER)
+    tail("Loading tools")
+    tail("MCP server ready")
     raw = "\n".join(forwarded)
-    grant_exposed = _OPAQUE_GRANT in raw
-    suffix_exposed = _OPAQUE_GRANT[11:] in raw
+    grant_exposed = value in raw
+    suffix_exposed = value[11:] in raw
     public_observed = PUBLIC_MARKER in raw
     assert not grant_exposed
     assert not suffix_exposed
-    assert _OPAQUE_GRANT[:11] not in raw
+    assert value[:11] not in raw
     assert "[REDACTED:held_secret]" in raw
     assert public_observed
+    assert forwarded[-2:] == ["Loading tools", "MCP server ready"]
+    assert forwarded[-3].endswith(" " + PUBLIC_MARKER)

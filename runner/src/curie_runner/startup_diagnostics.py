@@ -78,6 +78,7 @@ class StderrTail:
         self._stopped = False
         self._buffer = bytearray()
         self._pending = ""
+        self._continuations: tuple[tuple[str, int], ...] = ()
 
     @property
     def passthrough(self) -> Callable[[str], None] | None:
@@ -85,6 +86,7 @@ class StderrTail:
 
     def __call__(self, line: str) -> None:
         partial = len(line) >= self._partial_line_chars
+        line = self._redact_continuation(line, partial=partial)
         raw = self._pending + line
         self._pending = ""
         literals = held_secret_literals(registered_held_secrets())
@@ -107,6 +109,33 @@ class StderrTail:
                 raw = raw[:-keep]
         if raw:
             self._emit(self._sanitize(raw), partial=partial)
+
+    def _redact_continuation(self, line: str, *, partial: bool) -> str:
+        continuing: list[tuple[str, int]] = []
+        consumed = 0
+        for literal, offset in self._continuations:
+            remaining = literal[offset:]
+            if remaining.startswith(line):
+                consumed = len(line)
+                if partial and len(line) < len(remaining):
+                    continuing.append((literal, offset + len(line)))
+            elif line.startswith(remaining):
+                consumed = max(consumed, len(remaining))
+        self._continuations = tuple(continuing)
+        return "[REDACTED:held_secret]" + line[consumed:] if consumed else line
+
+    def _clear_pending(self) -> bool:
+        if not self._pending:
+            return False
+        # A capture boundary can bisect a physical SDK line. Keep references
+        # and offsets into held literals, never the raw pending prefix.
+        self._continuations = tuple(
+            (literal, len(self._pending))
+            for literal in held_secret_literals(registered_held_secrets())
+            if literal.startswith(self._pending)
+        )
+        self._pending = ""
+        return True
 
     def _emit(self, text: str, *, partial: bool = False) -> None:
         if self._capturing and not self._stopped:
@@ -161,8 +190,7 @@ class StderrTail:
     def finish(self) -> str:
         """Stop capturing and hand back the retained tail, clearing it."""
 
-        if self._pending:
-            self._pending = ""
+        if self._clear_pending():
             self._emit("[REDACTED:held_secret]")
         self._capturing = False
         self._stopped = False
@@ -171,7 +199,7 @@ class StderrTail:
         return tail
 
     def discard(self) -> None:
-        self._pending = ""
+        self._clear_pending()
         self._capturing = False
         self._stopped = False
         self._buffer.clear()
