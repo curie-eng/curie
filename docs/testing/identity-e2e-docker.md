@@ -22,7 +22,8 @@ assets, provider and scenario helpers. The scenario is in
 2. `docker` with Compose v2.24 or later (the override uses `!override`),
    `openssl` and `python3`, and a `curie` binary built from the same checkout
    (set `CURIE_BIN`). A source build works; the CLI must accept the
-   isolation contract in `cli/src/local.rs`.
+   isolation contract in `cli/src/local.rs`. `openssl` must be OpenSSL 3 or
+   later, as in [the Kubernetes harness](identity-e2e.md#what-you-need).
 3. Loopback reach to the ports the stack publishes: 100 ports from
    `--port-base` (default 27100), all bound to 127.0.0.1 on the Docker host.
    With a remote daemon, forward that block to this host.
