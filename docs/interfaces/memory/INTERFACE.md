@@ -91,7 +91,9 @@ credential (see "The memory credential" below):
   (`{"text": ...}`, an operator's replacement for the default guidance).
 2. **Channel memory**, at `CURIE_CHANNEL_MEMORY_REF`
   (`BootEnv.channel_memory_ref`), the binding-scoped namespace
-  `.../agents/<id>/state/bindings/<kind>/<address>/memory`. The worker sets it
+  `.../agents/<id>/state/bindings/<kind>/<address>/memory`, where `<address>` is
+  the binding address in the encoded form the workflow state interface gives
+  for the `{address}` segment, not the raw address. The worker sets it
   whenever the turn has a binding, whether memory writes are on or off, and
   never on an eval-isolated turn. Alongside it the worker sends
   `CURIE_MEMORY_WRITES` (`BootEnv.memory_writes`), `1` or `0` from the agent's

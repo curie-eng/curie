@@ -150,6 +150,8 @@ async def process_event(
                 await self._markers.mark_done(qevent.event_id, marker_value="1")
                 constants._LIFECYCLE_OUTCOME.set("classified_failure")
                 logger.info("HTTP invocation refused before further execution")
+                # @spec HTTP-INVOCATION-EXECUTION-31: only the relay hears of it.
+                await self._settle_relay_after_refusal(qevent)
         except asyncio.CancelledError as exc:
             error = exc
             await self._close_hook_run_after_error(

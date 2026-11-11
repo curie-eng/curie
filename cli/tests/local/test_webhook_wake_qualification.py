@@ -5,6 +5,9 @@ The sibling worker fixture owns a real kind install and verifies teardown.
 This suite moves admission to HTTP, using an independent contract signer.
 Hosted cases use a connector-only SecretRef. The live cases require
 ``WAKE_TEST_MODEL_CREDENTIAL`` and otherwise record an explicit acceptance gap.
+The live key replaces the scripted placeholder in ``CURIE_CREDENTIALS``.
+``WAKE_TEST_MODEL_BASE_URL`` (default Anthropic) selects the endpoint, and
+``WAKE_TEST_MODEL_EGRESS_CIDRS`` declares runner egress for any other endpoint.
 Local hosted sessions remain a gap because local/skill bring-up cannot deliver
 operator-managed SecretRefs. The two transport cases wait about 150 seconds
 per stack for real lease expiry on the database clock.
@@ -19,6 +22,7 @@ import json
 import os
 import threading
 import time
+import urllib.parse
 import uuid
 from contextlib import contextmanager
 from pathlib import Path
@@ -33,6 +37,54 @@ LIVE_PROVIDER_GAP = (
     "ADR 0274 live-provider connector/session gap: approved credential absent; "
     "Brian waived the live run on 2026-11-08 pending a test credential"
 )
+ANTHROPIC_API_HOST = "api.anthropic.com"
+# Anthropic's published API range, the same entry the chart README gives for
+# security.networkPolicy.allowedEgress on a direct Anthropic install.
+ANTHROPIC_API_CIDR = "160.79.104.0/23"
+
+
+def live_model_egress(base_url, declared_cidrs):
+    """Runner egress entries for the live model endpoint.
+
+    NetworkPolicy cannot target a host name, so the CIDRs are declared, never
+    resolved. The default Anthropic endpoint uses its published range; any
+    other endpoint must name its CIDRs in ``WAKE_TEST_MODEL_EGRESS_CIDRS``.
+    """
+    url = urllib.parse.urlsplit(base_url or f"https://{ANTHROPIC_API_HOST}")
+    port = url.port or (443 if url.scheme == "https" else 80)
+    cidrs = [cidr.strip() for cidr in declared_cidrs.split(",") if cidr.strip()]
+    if not cidrs:
+        if url.hostname != ANTHROPIC_API_HOST:
+            raise RuntimeError(
+                "set WAKE_TEST_MODEL_EGRESS_CIDRS to the CIDRs of WAKE_TEST_MODEL_BASE_URL; "
+                "runner egress cannot target a host name"
+            )
+        cidrs = [ANTHROPIC_API_CIDR]
+    return [{"cidr": cidr, "ports": [{"protocol": "TCP", "port": port}]} for cidr in cidrs]
+
+
+def provider_tier_values(*, base_url, model, credential_secret, allowed_egress):
+    """Helm values one provider tier layers over the install with ``--reuse-values``.
+
+    The tier's credential replaces the install's scripted placeholder as the
+    runner credential reference (``CURIE_CREDENTIALS``). A key carried only in
+    ``ANTHROPIC_API_KEY`` loses to that placeholder once a base URL is set,
+    because the runner reads the declared credential key first. Lists replace
+    the install's lists, so ``allowed_egress`` must keep the install entries.
+    """
+    extra = [{"name": "CURIE_MODEL_BASE_URL", "value": base_url}] if base_url else []
+    runner = {
+        "fakeModel": False,
+        "extraEnv": list(extra),
+        "credentialsExistingSecret": credential_secret,
+        "credentialsExistingSecretKey": "key",
+    }
+    if model:
+        runner["model"] = model
+    values = {"agentSandbox": {"runner": runner}, "worker": {"extraEnv": list(extra)}}
+    if allowed_egress is not None:
+        values["security"] = {"networkPolicy": {"allowedEgress": allowed_egress}}
+    return values
 
 
 class PrivateInput(str):
@@ -1420,9 +1472,6 @@ def test_hosted_connector_session(qualification, agent, provider_tier):
     stack = qualification
     live = provider_tier == "live"
     credential = os.environ.get("WAKE_TEST_MODEL_CREDENTIAL", "") if live else "not-needed"
-    credential_name = os.environ.get("WAKE_TEST_MODEL_ENV_KEY", "ANTHROPIC_API_KEY")
-    if credential_name not in {"CURIE_CREDENTIALS", "CLAUDE_CODE_OAUTH_TOKEN", "ANTHROPIC_API_KEY"}:
-        raise RuntimeError("approved test model credential uses an unsupported environment key")
     agent_id = stack.agents[agent]
     stack.worker(True)
     warm_run = stack.queued(agent)
@@ -1459,32 +1508,39 @@ def test_hosted_connector_session(qualification, agent, provider_tier):
                 }
             ),
         )
-    extra = []
     base_url = os.environ.get("WAKE_TEST_MODEL_BASE_URL", "") if live else stack.model_url
-    if base_url:
-        extra.append({"name": "CURIE_MODEL_BASE_URL", "value": base_url})
+    allowed_egress = None
+    if live:
+        installed = json.loads(
+            stack.run(
+                "helm",
+                "get",
+                "values",
+                NAME,
+                "--kube-context",
+                stack.context,
+                "--namespace",
+                NAME,
+                "-o",
+                "json",
+            )
+        )
+        # The second live case reuses the first one's values; skip entries already present.
+        allowed_egress = installed["security"]["networkPolicy"]["allowedEgress"]
+        for entry in live_model_egress(
+            base_url, os.environ.get("WAKE_TEST_MODEL_EGRESS_CIDRS", "")
+        ):
+            if entry not in allowed_egress:
+                allowed_egress.append(entry)
     values_path = stack.root / "live.yaml"
-    runner = {"fakeModel": False, "extraEnv": extra}
-    if credential_name == "CURIE_CREDENTIALS":
-        runner.update(
-            credentialsExistingSecret="acme-model-credential",
-            credentialsExistingSecretKey="key",
-        )
-    else:
-        extra.append(
-            {
-                "name": credential_name,
-                "valueFrom": {"secretKeyRef": {"name": "acme-model-credential", "key": "key"}},
-            }
-        )
-    if live and os.environ.get("WAKE_TEST_MODEL"):
-        runner["model"] = os.environ["WAKE_TEST_MODEL"]
     values_path.write_text(
         yaml.safe_dump(
-            {
-                "agentSandbox": {"runner": runner},
-                "worker": {"extraEnv": extra},
-            }
+            provider_tier_values(
+                base_url=base_url,
+                model=os.environ.get("WAKE_TEST_MODEL", "") if live else "",
+                credential_secret="acme-model-credential",
+                allowed_egress=allowed_egress,
+            )
         )
     )
     from test_webhook_wake_worker import REPO

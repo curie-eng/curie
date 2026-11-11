@@ -46,7 +46,7 @@ from curie_runner.session import SessionRunner
 from curie_runner.side_effects import SideEffectClassifier
 from curie_runner.startup_diagnostics import StderrTail
 from curie_runner.subprocess_env import lock_process_environ, proc_dumpable_library
-from curie_telemetry.redact import RedactingLogFilter
+from curie_telemetry.redact import RedactingLogFilter, register_held_secrets
 from personal_auth_support import (
     BUNDLED_CLI,
     IMPLEMENTER_MODEL,
@@ -775,11 +775,16 @@ def test_redaction_scrubs_actual_stderr_passthrough_logs_and_publication_seriali
     destination: list[str] = []
     tail = StderrTail(destination.append, partial_line_chars=1024)
     tail.start()
-    tail(PUBLIC_MARKER + " " + value[:11])
+    tail(PUBLIC_MARKER + " " + value)
+    tail("p" * 1024 + value[:11])
     tail(value[11:])
     tail(" " + PUBLIC_MARKER)
     retained = tail.finish()
     raw_passthrough = "\n".join(destination)
+    assert raw_passthrough == (
+        PUBLIC_MARKER + " [REDACTED:held_secret]\n"
+        + "p" * 1024 + "\n[REDACTED:held_secret]\n " + PUBLIC_MARKER
+    )
     stream = io.StringIO()
     handler = logging.StreamHandler(stream)
     handler.addFilter(RedactingLogFilter())
@@ -940,19 +945,71 @@ def test_redaction_through_native_cli_http_aci_and_exported_spans(
 
 
 @pytest.mark.parametrize("boundary", ("finish", "discard"))
-def test_redaction_keeps_split_stderr_protected_after_initialization(boundary: str) -> None:
-    _held_grant()
+def test_redaction_keeps_overlapping_held_prefixes_protected(boundary: str) -> None:
+    prefix = "overlap-"
+    first = "outer-" + prefix + "alpha-credential-fixture"
+    actual = prefix + "beta-credential-fixture"
+    register_held_secrets((first, actual))
     forwarded: list[str] = []
     tail = StderrTail(forwarded.append, partial_line_chars=1024)
     tail.start()
-    tail(PUBLIC_MARKER + " " + _OPAQUE_GRANT[:11])
+    tail("p" * 1024 + "outer-" + prefix)
+
     getattr(tail, boundary)()
-    tail(_OPAQUE_GRANT[11:])
-    tail(" " + PUBLIC_MARKER)
+    tail(actual[len(prefix):] + " " + PUBLIC_MARKER)
+    tail("Loading tools")
+    tail("MCP server ready")
+
     raw = "\n".join(forwarded)
-    grant_exposed = _OPAQUE_GRANT in raw
-    suffix_exposed = _OPAQUE_GRANT[11:] in raw
+    assert first not in raw
+    assert actual not in raw
+    assert "outer-" + prefix not in raw
+    assert prefix not in raw
+    assert actual[len(prefix):] not in raw
+    assert forwarded == [
+        "p" * 1024,
+        *(["[REDACTED:held_secret]"] if boundary == "finish" else []),
+        "[REDACTED:held_secret] " + PUBLIC_MARKER,
+        "Loading tools",
+        "MCP server ready",
+    ]
+
+
+@pytest.mark.parametrize("boundary", ("finish", "discard"))
+@pytest.mark.parametrize("position", ("before-split", "inside-split"))
+@pytest.mark.parametrize(
+    "encoding", ("literal", "base64", "base64-unpadded", "urlsafe", "urlsafe-unpadded"),
+)
+def test_redaction_keeps_split_stderr_protected_after_initialization(
+    boundary: str, position: str, encoding: str,
+) -> None:
+    _held_grant()
+    value = _OPAQUE_GRANT
+    if encoding.startswith("base64"):
+        value = base64.b64encode(value.encode()).decode()
+    elif encoding.startswith("urlsafe"):
+        value = base64.urlsafe_b64encode(value.encode()).decode()
+    if encoding.endswith("-unpadded"):
+        value = value.rstrip("=")
+    forwarded: list[str] = []
+    tail = StderrTail(forwarded.append, partial_line_chars=1024)
+    tail.start()
+    if position == "before-split":
+        getattr(tail, boundary)()
+    tail("p" * 1024 + PUBLIC_MARKER + " " + value[:11])
+    if position == "inside-split":
+        getattr(tail, boundary)()
+    tail(value[11:] + " " + PUBLIC_MARKER)
+    tail("Loading tools")
+    tail("MCP server ready")
+    raw = "\n".join(forwarded)
+    grant_exposed = value in raw
+    suffix_exposed = value[11:] in raw
     public_observed = PUBLIC_MARKER in raw
     assert not grant_exposed
     assert not suffix_exposed
+    assert value[:11] not in raw
+    assert "[REDACTED:held_secret]" in raw
     assert public_observed
+    assert forwarded[-2:] == ["Loading tools", "MCP server ready"]
+    assert forwarded[-3].endswith(" " + PUBLIC_MARKER)

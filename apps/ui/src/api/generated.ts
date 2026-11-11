@@ -9418,6 +9418,8 @@ export interface components {
             base_sha: string;
             /** Body */
             body?: string | null;
+            /** Card Channel */
+            card_channel?: string | null;
             /** Changed Paths */
             changed_paths: string[];
             /** Conversation Id */

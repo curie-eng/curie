@@ -9,9 +9,11 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import importlib.util
 import inspect
 import json
 import uuid
+from pathlib import Path
 from typing import Any
 
 import httpx
@@ -30,6 +32,22 @@ from plugin_format import PLATFORM_PUBLISH_TOOL_NAME
 from ..queue_fixtures import qevent
 from .test_approval_lifecycle import RecordingApprovals
 from .test_http_identity_authority import CAPSULE, Binding, Core, expected_scope, pending_entry
+
+
+def _identity_approval_contract() -> Any:
+    """Load the root ``tests/test_identity_approval.py`` module by its path.
+
+    The repository root ``tests`` directory is not an importable package, so
+    ``from tests.test_identity_approval import ...`` resolved only when the same
+    pytest process had already collected that file. Run alone, or in a shard
+    that does not select it, the import failed with ModuleNotFoundError.
+    """
+    path = Path(__file__).resolve().parents[4] / "tests" / "test_identity_approval.py"
+    spec = importlib.util.spec_from_file_location("_worker_identity_approval_contract", path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
 
 
 def raw_payload(event: Any) -> str:
@@ -212,7 +230,8 @@ def test_expired_resume_notification_keeps_wire_author_and_original_invoker_sepa
     """@spec HTTP-APPROVAL-CONTINUITY-4/12: synthetic current-core boundary, no grant proof."""
     from curie_internal import identity_approval, identity_context
 
-    from tests.test_identity_approval import KEY, KEY_ID, context_body
+    contract = _identity_approval_contract()
+    KEY, KEY_ID, context_body = contract.KEY, contract.KEY_ID, contract.context_body
 
     class NotificationBinding(Binding):
         """@spec HTTP-APPROVAL-CONTINUITY-12: external SQL result is a non-grant notification."""

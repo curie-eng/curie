@@ -11243,6 +11243,17 @@
             ],
             "title": "Body"
           },
+          "card_channel": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Card Channel"
+          },
           "changed_paths": {
             "items": {
               "type": "string"

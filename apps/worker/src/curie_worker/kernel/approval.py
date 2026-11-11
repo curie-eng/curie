@@ -741,6 +741,10 @@ async def _pause_for_approval(
     # happens to equal a Slack policy channel as "the requesting channel".
     card_kind = handle.kind
     card_channel = handle.channel
+    # A publication card is posted by the card outbox, so the route's fixed
+    # Slack channel must travel with the request (ADR 0177 decisions 1 and 2,
+    # #5542). None keeps the card on the reply route.
+    policy_card_channel: str | None = None
     notification_target: tuple[str, str, TargetRoute] | None = None
     # The listed approver addresses an email card names (ADR-0177 amendment
     # A5), so the mail adapter can tell the requester who can approve. Set
@@ -796,6 +800,7 @@ async def _pause_for_approval(
             dm_target = fixed_target
         elif fixed_target is not None:
             card_kind, card_channel = fixed_target
+            policy_card_channel = card_channel
         elif handle.kind in constants._APPROVER_EMAIL_KINDS:
             card_approver_emails = _approver_emails(binding)
             # A selected turn uses the agent approver role (ADR 0267).
@@ -929,6 +934,7 @@ async def _pause_for_approval(
                     max_patch_bytes=self._config.publication_patch_max_bytes,
                     review_origin_key=outcome.review_origin_key,
                     route=route_name,
+                    card_channel=policy_card_channel,
                     work_item_request_id=(
                         parsed_publication.request_id
                         if parsed_publication is not None
