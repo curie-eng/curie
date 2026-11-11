@@ -2513,8 +2513,19 @@ def pod_grant_ref(pod: Any) -> tuple[str, str] | None:
     return None
 
 
+# apps/api/src/curie_api/approvers.py ExplicitUsers.audit_name: the set an
+# ``approvers.users`` route selects for a card shown on Slack.
+EXPLICIT_USERS_AUTHORIZER = "ExplicitUserListAuthorizer"
+
+
 def audit_row(
-    rows: Any, *, action: str, subject: str, authorized: bool, decision: str | None = None
+    rows: Any,
+    *,
+    action: str,
+    subject: str,
+    authorized: bool,
+    decision: str | None = None,
+    authorizer: str | None = None,
 ) -> bool:
     """A ``GET /approvals/{id}/audit`` row (schemas/approvals.py ApprovalAuditOut shape)."""
 
@@ -2526,10 +2537,71 @@ def audit_row(
             and row.get("authorized") is authorized
             and subject in (row.get("principal_subject"), row.get("actor"))
             and (decision is None or row.get("decision") == decision)
+            and (authorizer is None or row.get("authorizer") == authorizer)
             and (action == "denied" or row.get("principal_kind") == "operator")
         ):
             return True
     return False
+
+
+def audit_denial(rows: Any, subject: str) -> dict[str, Any]:
+    """The authorizer and reason of ``subject``'s latest denied audit row, if any."""
+
+    denied = [
+        row
+        for row in (rows if isinstance(rows, list) else [])
+        if isinstance(row, dict)
+        and row.get("action") == "denied"
+        and subject in (row.get("principal_subject"), row.get("actor"))
+    ]
+    if not denied:
+        return {"audit_authorizer": None, "audit_reason": None}
+    last = max(denied, key=lambda row: str(row.get("created_at") or ""))
+    return {"audit_authorizer": last.get("authorizer"), "audit_reason": last.get("reason")}
+
+
+def cli_outcome(returncode: int, stdout: bytes, stderr: bytes) -> dict[str, Any]:
+    """Exit code, HTTP status and API detail of one ``curie cluster approvals`` call.
+
+    Under ``--json`` cli/src/exit.rs writes ``{"error": <message>, "fix": ...}``
+    to stdout, cli/src/api.rs ``expect_ok`` words the message ``<what> failed
+    with <status>: <body>``, and the body is FastAPI's ``{"detail": ...}``.
+    """
+
+    text = (stdout + b"\n" + stderr).decode(errors="replace")
+    try:
+        parsed = json.loads(stdout)
+    except ValueError:
+        parsed = None
+    if isinstance(parsed, dict) and isinstance(parsed.get("error"), str):
+        text = parsed["error"]
+    reason: str | None = None
+    if returncode != 0:
+        match = re.search(r"failed with \d{3}[^:]*: (.*)\Z", text, re.S)
+        body = match[1].strip() if match else text.strip()
+        try:
+            detail = json.loads(body)
+        except ValueError:
+            detail = None
+        if isinstance(detail, dict) and isinstance(detail.get("detail"), str):
+            reason = detail["detail"]
+        else:
+            reason = body[:2000] or None
+    return {
+        "exit": returncode,
+        "http_status": resolve_status(returncode, stdout + stderr),
+        "reason": reason,
+    }
+
+
+def minted_token(stdout: bytes) -> str | None:
+    """The token of ``approvals --mint-operator-principal --json``, else None."""
+
+    try:
+        token = json.loads(stdout)["operator_principal"]["token"]
+    except (ValueError, KeyError, TypeError):
+        return None
+    return token if isinstance(token, str) and token else None
 
 
 def resolve_status(returncode: int, output: bytes) -> int:

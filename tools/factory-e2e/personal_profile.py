@@ -176,16 +176,40 @@ class Shell:
             if stdin is not None and not secret_stdin and raw.encode() in stdin:
                 raise StepFailed("a held secret would reach a child input")
 
-    def _record(self, argv: Sequence[str], result: Completed, *, sensitive: bool) -> None:
+    def record(
+        self,
+        argv: Sequence[str],
+        result: Completed,
+        *,
+        sensitive: bool = False,
+        full: bool = False,
+        withhold_stdout: bool = False,
+    ) -> None:
+        """Append one scrubbed entry to the private command log.
+
+        ``full`` keeps the whole stdout and stderr (the approvals CLI writes its
+        ``--json`` error to stdout); ``withhold_stdout`` keeps only its size.
+        """
+
         if self.log is None:
             return
-        entry = {
+        entry: dict[str, Any] = {
             "argv": [self.scrubber.scrub(arg) for arg in argv[:6]],
             "exit": result.returncode,
-            "stderr_tail": ""
-            if sensitive
-            else self.scrubber.scrub(result.stderr[-800:].decode(errors="replace")),
         }
+        if sensitive:
+            entry["stderr_tail"] = ""
+        elif full:
+            entry["stdout"] = (
+                f"<withheld: {len(result.stdout)} bytes>"
+                if withhold_stdout
+                else self.scrubber.scrub(result.stdout.decode(errors="replace"))
+            )
+            entry["stderr"] = self.scrubber.scrub(result.stderr.decode(errors="replace"))
+        else:
+            entry["stderr_tail"] = self.scrubber.scrub(
+                result.stderr[-800:].decode(errors="replace")
+            )
         descriptor = os.open(
             self.log, os.O_CREAT | os.O_APPEND | os.O_WRONLY | os.O_NOFOLLOW, 0o600
         )
@@ -203,6 +227,8 @@ class Shell:
         secret_env: Sequence[str] = (),
         secret_stdin: bool = False,
         sensitive_output: bool = False,
+        full_output: bool = False,
+        record_output: bool = True,
     ) -> Completed:
         self.guard(
             argv, stdin=stdin, extra_env=extra_env, secret_env=secret_env, secret_stdin=secret_stdin
@@ -224,7 +250,8 @@ class Shell:
         if not sensitive_output:
             self.scan.scan("children", result.stdout)
             self.scan.scan("children", result.stderr)
-        self._record(argv, result, sensitive=sensitive_output)
+        if record_output:
+            self.record(argv, result, sensitive=sensitive_output, full=full_output)
         if check and result.returncode != 0:
             verb = argv[1] if len(argv) > 1 else ""
             raise StepFailed(f"{Path(argv[0]).name} {verb} exited {result.returncode}")
@@ -572,7 +599,32 @@ class CurieCli:
         ]
 
     def run(self, verb: str, *args: str, **kwargs: Any) -> Completed:
+        if verb == "approvals":
+            # Every approvals call keeps its whole output in the private log: the
+            # CLI writes a refusal's API detail to stdout under --json.
+            kwargs.setdefault("full_output", True)
         return self.shell.run(self.argv(verb, *args), **kwargs)
+
+    def mint_operator_principal(self, agent: str, subject: str) -> pps.HeldSecret:
+        """Mint one operator principal; the log keeps its output with the token redacted."""
+
+        args = (agent, "--mint-operator-principal", subject)
+        result = self.run(
+            "approvals", *args, check=False, sensitive_output=True, record_output=False
+        )
+        token = pps.minted_token(result.stdout) if result.returncode == 0 else None
+        held = self.shell.scrubber.hold(pps.HeldSecret(token)) if token else None
+        self.shell.record(
+            self.argv("approvals", *args),
+            result,
+            full=True,
+            withhold_stdout=result.returncode == 0 and held is None,
+        )
+        if result.returncode != 0:
+            raise StepFailed(f"operator principal mint exited {result.returncode}")
+        if held is None:
+            raise StepFailed("operator principal mint returned no token")
+        return held
 
     def json(self, verb: str, *args: str, **kwargs: Any) -> Any:
         result = self.run(verb, *args, **kwargs)
@@ -2005,16 +2057,19 @@ class LiveRun:
             raise StepFailed("read path checks failed: " + ", ".join(failed))
 
     def mint_operator(self, subject: str) -> pps.HeldSecret:
-        result = self.curie.run(
-            "approvals", self.agent, "--mint-operator-principal", subject, sensitive_output=True
-        )
-        try:
-            token = json.loads(result.stdout)["operator_principal"]["token"]
-        except (ValueError, KeyError, TypeError):
-            raise StepFailed("operator principal mint returned no token") from None
-        if not isinstance(token, str) or not token:
-            raise StepFailed("operator principal mint returned no token")
-        return self.scrubber.hold(pps.HeldSecret(token))
+        return self.curie.mint_operator_principal(self.agent, subject)
+
+    def record_resolution(
+        self, step: str, result: Completed, audit: Any, subject: str
+    ) -> dict[str, Any]:
+        """The private ledger's record of one ``--resolve``: CLI outcome and API denial."""
+
+        outcome = {
+            **pps.cli_outcome(result.returncode, result.stdout, result.stderr),
+            **pps.audit_denial(audit, subject),
+        }
+        self.ledger.record("approval", f"cli_{step}", outcome)
+        return outcome
 
     def port_forward(self, target: str, remote: int) -> int:
         process = self.shell.spawn(
@@ -2554,14 +2609,19 @@ class LiveRun:
         approval = self.approval(first.approval_id)
         publication = self.publication(first.publication_id)
         forge = self.require_forge()
+        audit = self.audit(first.approval_id)
+        self.record_resolution("unlisted", result, audit, self.unlisted_subject)
         record = {
             "unlisted_status": status,
             "pending_after_unlisted": approval.get("status") == "pending",
+            # Only the explicit list's own refusal proves the control: a set that
+            # admits nobody refuses the listed operator too (the tracker-surface case).
             "unlisted_audit_denied": pps.audit_row(
-                self.audit(first.approval_id),
+                audit,
                 action="denied",
                 subject=self.unlisted_subject,
                 authorized=False,
+                authorizer=pps.EXPLICIT_USERS_AUTHORIZER,
             ),
             "work_item_unchanged_after_unlisted": before.get("state") == after.get("state")
             and before.get("updated_at") == after.get("updated_at"),
@@ -2594,6 +2654,8 @@ class LiveRun:
             secret_env=("CURIE_APPROVAL_PRINCIPAL_TOKEN",),
         )
         approval = self.approval(first.approval_id)
+        audit = self.audit(first.approval_id)
+        outcome = self.record_resolution("reject", result, audit, self.allowed_subject)
         self.ledger.record(
             "approval",
             "reject_resolved",
@@ -2603,7 +2665,7 @@ class LiveRun:
             "approval",
             "reject_audit_operator",
             pps.audit_row(
-                self.audit(first.approval_id),
+                audit,
                 action="resolved",
                 subject=self.allowed_subject,
                 authorized=True,
@@ -2611,7 +2673,10 @@ class LiveRun:
             ),
         )
         if result.returncode != 0:
-            raise StepFailed("allowed operator could not reject")
+            raise StepFailed(
+                f"allowed operator could not reject (HTTP {outcome['http_status']}; "
+                "the reason is in the private ledger)"
+            )
 
         def denied() -> bool:
             requests = self.work_item().get("requests") or []
@@ -2644,12 +2709,14 @@ class LiveRun:
             extra_env={"CURIE_APPROVAL_PRINCIPAL_TOKEN": self.allowed_token.reveal()},
             secret_env=("CURIE_APPROVAL_PRINCIPAL_TOKEN",),
         )
+        audit = self.audit(second.approval_id)
+        outcome = self.record_resolution("approve", result, audit, self.allowed_subject)
         self.ledger.record("approval", "approve_resolved", result.returncode == 0)
         self.ledger.record(
             "approval",
             "approve_audit_operator",
             pps.audit_row(
-                self.audit(second.approval_id),
+                audit,
                 action="resolved",
                 subject=self.allowed_subject,
                 authorized=True,
@@ -2657,7 +2724,10 @@ class LiveRun:
             ),
         )
         if result.returncode != 0:
-            raise StepFailed("allowed operator could not approve")
+            raise StepFailed(
+                f"allowed operator could not approve (HTTP {outcome['http_status']}; "
+                "the reason is in the private ledger)"
+            )
         publication: dict[str, Any] = {}
 
         def published() -> bool:

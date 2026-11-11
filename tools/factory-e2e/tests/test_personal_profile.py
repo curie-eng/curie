@@ -1504,6 +1504,141 @@ def test_shell_keeps_held_secrets_out_of_argv_env_and_stdin(tmp_path: Path) -> N
     assert (tmp_path / "log").stat().st_mode & 0o777 == 0o600
 
 
+# A recorded refusal: a tracker-surface publication approval answered by its
+# listed operator (apps/api approvers.NoVerifiableApprovers), as cli/src/exit.rs
+# prints it on stdout under --json.
+TRACKER_REFUSAL = "could not verify approvers: github has no approver list that can be verified"
+TRACKER_REFUSAL_STDOUT = json.dumps(
+    {
+        "error": "resolving approval failed with 403 Forbidden: "
+        + json.dumps({"detail": TRACKER_REFUSAL}),
+        "fix": None,
+    }
+).encode()
+
+FAKE_CURIE = """
+import json, sys
+args = sys.argv[1:]
+sys.stderr.write("Kubernetes context: kind-acme-scratch\\n")
+if "--mint-operator-principal" in args:
+    subject = args[args.index("--mint-operator-principal") + 1]
+    token = "" if subject == "U0ACMEEMPTY" else "synthetic-operator-token-" + subject
+    print(json.dumps({"operator_principal": {"token": token, "subject": subject}}))
+elif "--resolve" in args:
+    sys.stdout.write(REFUSAL)
+    sys.exit(1)
+else:
+    print(json.dumps({"pending": [], "count": 0}))
+"""
+
+
+def _fake_curie(tmp_path: Path) -> pp.CurieCli:
+    program = tmp_path / "fake_curie.py"
+    program.write_text(FAKE_CURIE.replace("REFUSAL", repr(TRACKER_REFUSAL_STDOUT.decode())))
+    program.chmod(0o700)
+    launcher = tmp_path / "curie"
+    launcher.write_text(f'#!/bin/sh\nexec {sys.executable} {program} "$@"\n')
+    launcher.chmod(0o700)
+    scrubber = pps.Scrubber()
+    scrubber.hold(pps.HeldSecret(GRANT))
+    shell = pp.Shell(
+        env={"PATH": "/usr/bin:/bin"},
+        scrubber=scrubber,
+        scan=pps.TokenScan(scrubber, pps.SCAN_CHANNELS),
+        cwd=tmp_path,
+        log=tmp_path / "commands.jsonl",
+    )
+    inputs: Any = type(
+        "Inputs", (), {"context": "kind-acme-scratch", "namespace": "ppa-acme", "release": "ppa"}
+    )()
+    return pp.CurieCli(shell, str(launcher), inputs)
+
+
+def _log(tmp_path: Path) -> list[dict[str, Any]]:
+    return [json.loads(line) for line in (tmp_path / "commands.jsonl").read_text().splitlines()]
+
+
+def test_approval_cli_calls_keep_full_output_in_the_private_log(tmp_path: Path) -> None:
+    curie = _fake_curie(tmp_path)
+    token = curie.mint_operator_principal("acme-pp", "U0ACMEALLOW")
+    assert token.reveal() == "synthetic-operator-token-U0ACMEALLOW"
+    refused = curie.run(
+        "approvals",
+        "acme-pp",
+        "--resolve",
+        "a-1",
+        "--reject",
+        check=False,
+        extra_env={"CURIE_APPROVAL_PRINCIPAL_TOKEN": token.reveal()},
+        secret_env=("CURIE_APPROVAL_PRINCIPAL_TOKEN",),
+    )
+    assert refused.returncode == 1
+    curie.json("work-items", "--agent", "acme-pp")
+    with pytest.raises(pp.StepFailed, match="returned no token"):
+        curie.mint_operator_principal("acme-pp", "U0ACMEEMPTY")
+    mint, resolve, other, empty = _log(tmp_path)
+    # The mint keeps its output with the token redacted, never the token itself.
+    assert mint["exit"] == 0
+    assert "<redacted>" in mint["stdout"] and "synthetic-operator-token" not in mint["stdout"]
+    assert mint["stderr"].startswith("Kubernetes context")
+    # The refusal's API detail is on stdout, where the stderr tail never looked.
+    assert resolve["exit"] == 1
+    assert TRACKER_REFUSAL in resolve["stdout"]
+    assert resolve["stderr"].startswith("Kubernetes context")
+    # Other verbs keep the stderr tail only.
+    assert set(other) == {"argv", "exit", "stderr_tail"}
+    # A zero exit without a parseable token withholds stdout and keeps its size.
+    assert empty["stdout"].startswith("<withheld: ")
+    log = (tmp_path / "commands.jsonl").read_text()
+    assert "synthetic-operator-token" not in log and GRANT not in log
+
+
+def test_resolution_outcome_names_the_api_refusal_and_its_authorizer() -> None:
+    outcome = pps.cli_outcome(1, TRACKER_REFUSAL_STDOUT, b"Kubernetes context: kind\n")
+    assert outcome == {"exit": 1, "http_status": 403, "reason": TRACKER_REFUSAL}
+    assert pps.cli_outcome(0, b'{"id": "a-1"}', b"") == {
+        "exit": 0,
+        "http_status": 200,
+        "reason": None,
+    }
+    plain = pps.cli_outcome(1, b"", b"Error: resolving approval failed with 410 Gone: gone\n")
+    assert plain == {"exit": 1, "http_status": 410, "reason": "gone"}
+    # apps/api/src/curie_api/schemas/approvals.py ApprovalAuditOut, as the tracker
+    # refusal records it for the listed operator.
+    tracker = {
+        "action": "denied",
+        "actor": "U0ACMEALLOW",
+        "principal_kind": "operator",
+        "principal_subject": None,
+        "decision": "rejected",
+        "authorizer": "NoVerifiableApprovers",
+        "authorized": False,
+        "reason": TRACKER_REFUSAL,
+        "created_at": "2026-11-11T05:52:37.350823",
+    }
+    listed = {
+        **tracker,
+        "actor": "U0ACMEOTHER",
+        "authorizer": pps.EXPLICIT_USERS_AUTHORIZER,
+        "reason": "not on the explicit list of approvers",
+    }
+    assert pps.audit_denial([tracker], "U0ACMEALLOW") == {
+        "audit_authorizer": "NoVerifiableApprovers",
+        "audit_reason": TRACKER_REFUSAL,
+    }
+    assert pps.audit_denial([], "U0ACMEALLOW") == {"audit_authorizer": None, "audit_reason": None}
+    # A set that admits nobody refuses an unlisted operator too; it is no control.
+    unlisted = {**tracker, "actor": "U0ACMEOTHER"}
+    kwargs: dict[str, Any] = {
+        "action": "denied",
+        "subject": "U0ACMEOTHER",
+        "authorized": False,
+        "authorizer": pps.EXPLICIT_USERS_AUTHORIZER,
+    }
+    assert not pps.audit_row([unlisted], **kwargs)
+    assert pps.audit_row([listed], **kwargs)
+
+
 # --------------------------------------------------------------------------
 # Deployed settings, forge checks and helpers over recorded shapes
 # --------------------------------------------------------------------------

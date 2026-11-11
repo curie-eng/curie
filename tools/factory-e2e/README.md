@@ -230,7 +230,8 @@ model.
    every execution request.
 2. `approval`: the run parked on a publication approval; the unlisted
    operator's resolve returned 403, its audit row is `denied` and
-   unauthorized, the approval stayed pending and nothing moved (work item,
+   unauthorized by the route's explicit user list (a set that admits nobody
+   refuses the listed operator too, so it proves nothing), the approval stayed pending and nothing moved (work item,
    requests, publication, remote branches, owner); the three subjects
    differ; the allowed operator's reject and approve both carry operator audit
    rows; the approved attempt is a fresh approval; the second admission kept
@@ -281,7 +282,12 @@ operator principal tokens are held the same way. Child processes receive only
 `SSH_AUTH_SOCK` and per-call additions, and a held secret in a child's argv,
 environment or input is refused. Every stdout, stderr, child output, HTTP
 response, harvested transcript byte, ledger value and evidence line is
-scanned in memory, and only booleans and counts are kept.
+scanned in memory, and only booleans and counts are kept. The one exception is
+diagnostic and private: every `approvals` CLI call keeps its exit code and
+whole stdout and stderr, held secrets redacted, in the run's command log under
+the state directory (a mint withholds stdout when it cannot parse the token),
+and each `--resolve` records its HTTP status, the API's refusal detail and the
+denying authorizer in the ledger. `judge` never prints them.
 
 Each resource's cleanup is registered before the resource is created and runs
 in reverse order on success, failure, rejection and on SIGINT or SIGTERM.
