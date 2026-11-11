@@ -9,6 +9,7 @@ without ever calling STS. Everything here stays offline and needs no mocks.
 
 import os
 from pathlib import Path
+from urllib.parse import parse_qs, urlsplit
 
 import pytest
 from aci_protocol.s3 import build_s3_client
@@ -97,3 +98,32 @@ def test_half_a_credential_is_refused_not_silently_downgraded(
             secret_key="",
             region="us-east-1",
         )
+
+
+@pytest.mark.parametrize(
+    ("endpoint_url", "expected_prefix"),
+    [
+        ("https://s3.us-east-1.amazonaws.com", "https://s3.us-east-1.amazonaws.com/bkt/"),
+        ("http://rustfs.test:9000", "http://rustfs.test:9000/bkt/"),
+    ],
+)
+def test_presigned_get_url_is_sigv4_and_path_style(endpoint_url: str, expected_prefix: str) -> None:
+    # SSE-KMS buckets reject SigV2 presigned URLs, and `meta.config.signature_version`
+    # can report s3v4 while the presigner still emits SigV2, so assert the URL itself.
+    client = build_s3_client(
+        endpoint_url=endpoint_url,
+        access_key="AKIAEXAMPLE",
+        secret_key="example-secret",
+        region="us-east-1",
+    )
+    url = client.generate_presigned_url(
+        "get_object", Params={"Bucket": "bkt", "Key": "a/b.txt"}, ExpiresIn=60
+    )
+    assert url.startswith(expected_prefix + "a/b.txt?")
+    query = parse_qs(urlsplit(url).query)
+    assert query["X-Amz-Algorithm"] == ["AWS4-HMAC-SHA256"]
+    assert "X-Amz-Credential" in query
+    assert "X-Amz-Signature" in query
+    assert query["X-Amz-Expires"] == ["60"]
+    assert "AWSAccessKeyId" not in query
+    assert "Signature" not in query
