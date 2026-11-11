@@ -428,11 +428,13 @@ def _translate_assistant(
 
     # Assistant usage is per-message. ResultMessage usage is a turn total and
     # must never be copied onto the last generation, where it would double-count
-    # prior rounds.
+    # prior rounds. A nested (reviewer) message exports as its own generation
+    # (#5206) while the parent's Agent tool interval is still open.
     if gen is not None:
         gen.record_assistant(
             getattr(message, "model", None),
             getattr(message, "usage", None),
+            nested=nested,
         )
 
     error = getattr(message, "error", None)

@@ -148,14 +148,14 @@ def build_pod_log_reader(kube_config_path: str | None) -> PodLogReader:
         from kubernetes import client, config
 
         if kube_config_path:
-            config.load_kube_config(config_file=kube_config_path)
+            config.load_kube_config(config_file=kube_config_path)  # type: ignore[no-untyped-call]
         else:
             try:
-                config.load_incluster_config()
+                config.load_incluster_config()  # type: ignore[no-untyped-call]
             except Exception:  # noqa: BLE001 - existing broad catch retained
                 # Not in a cluster: honor the standard KUBECONFIG / ~/.kube/config
                 # so local runs against a real cluster work without extra config.
-                config.load_kube_config()
+                config.load_kube_config()  # type: ignore[no-untyped-call]
         return KubernetesPodLogReader(client.CoreV1Api())
     except Exception as exc:  # noqa: BLE001 - existing broad catch retained
         logger.warning(
@@ -245,12 +245,12 @@ def build_pod_lister(kube_config_path: str | None) -> PodLister:
         from kubernetes import client, config
 
         if kube_config_path:
-            config.load_kube_config(config_file=kube_config_path)
+            config.load_kube_config(config_file=kube_config_path)  # type: ignore[no-untyped-call]
         else:
             try:
-                config.load_incluster_config()
+                config.load_incluster_config()  # type: ignore[no-untyped-call]
             except Exception:  # noqa: BLE001 - existing broad catch retained
-                config.load_kube_config()
+                config.load_kube_config()  # type: ignore[no-untyped-call]
         return KubernetesPodLister(client.CoreV1Api())
     except Exception as exc:  # noqa: BLE001 - existing broad catch retained
         logger.warning(

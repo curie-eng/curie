@@ -746,7 +746,7 @@ async def test_local_cache_hash_stops_with_original_operation_authority(
     stop: str,
 ) -> None:
     import threading
-    import time
+    from contextlib import contextmanager
 
     import curie_runner.attachment_access as module
 
@@ -758,11 +758,21 @@ async def test_local_cache_hash_stops_with_original_operation_authority(
         # transfer as well as the existing-cache read paths.
         access = AttachmentAccess(turn, access.root)
     real_fdopen = module.os.fdopen
-    started = threading.Event()
+    real_fail_after = anyio.fail_after
+    started = anyio.Event()
+    released = threading.Event()
     reads: list[int] = []
+    deadlines: list[anyio.CancelScope] = []
+
+    @contextmanager
+    def observe_deadline(delay: float | None, shield: bool = False) -> Any:
+        with real_fail_after(delay, shield=shield) as scope:
+            if delay == module.TRANSFER_SECONDS:
+                deadlines.append(scope)
+            yield scope
 
     class SlowLocalReader:
-        """Delay bounded reads of the actual cached file, never substitute its bytes."""
+        """Hold the first real disk read until the operation loses authority."""
 
         def __init__(self, stream: Any) -> None:
             self.stream = stream
@@ -777,16 +787,17 @@ async def test_local_cache_hash_stops_with_original_operation_authority(
         def __getattr__(self, name: str) -> Any:
             return getattr(self.stream, name)
 
-        def read(self, size: int) -> bytes:
-            started.set()
+        def pause(self) -> None:
             reads.append(1)
-            time.sleep(0.004)
+            anyio.from_thread.run_sync(started.set)
+            released.wait()
+
+        def read(self, size: int) -> bytes:
+            self.pause()
             return self.stream.read(min(size, 64 * 1024))
 
         def readinto(self, buffer: Any) -> int:
-            started.set()
-            reads.append(1)
-            time.sleep(0.004)
+            self.pause()
             return self.stream.readinto(memoryview(buffer)[: 64 * 1024])
 
     def controlled_reader(fd: int, mode: str) -> Any:
@@ -794,10 +805,8 @@ async def test_local_cache_hash_stops_with_original_operation_authority(
         return SlowLocalReader(stream) if mode == "rb" else stream
 
     monkeypatch.setattr(module.os, "fdopen", controlled_reader)
-    if stop == "deadline":
-        monkeypatch.setattr(module, "TRANSFER_SECONDS", 0.3 if operation == "download" else 0.08)
+    monkeypatch.setattr(module.anyio, "fail_after", observe_deadline)
     failures: list[AttachmentAccessError] = []
-    started_at = time.monotonic()
 
     async def use_cache() -> None:
         try:
@@ -808,16 +817,21 @@ async def test_local_cache_hash_stops_with_original_operation_authority(
         except AttachmentAccessError as exc:
             failures.append(exc)
 
-    async with anyio.create_task_group() as tasks:
-        tasks.start_soon(use_cache)
-        if stop == "turn_end":
-            with anyio.fail_after(2):
-                while not started.is_set():
-                    await anyio.sleep(0.001)
-            turn.end()
+    with real_fail_after(2):
+        async with anyio.create_task_group() as tasks:
+            tasks.start_soon(use_cache)
+            try:
+                await started.wait()
+                assert len(deadlines) == 1, "Verification must retain the original deadline"
+                if stop == "deadline":
+                    deadlines[0].deadline = anyio.current_time()
+                    assert deadlines[0].cancel_called
+                else:
+                    turn.end()
+            finally:
+                released.set()
     assert failures, "A retired or expired operation must not return a cached path/catalog"
     assert started.is_set(), "The cancellation must exercise actual disk verification"
-    assert time.monotonic() - started_at < 0.9
     assert len(reads) < 128, "Cancellation must stop the disk hash before consuming the whole file"
     assert set(access.root.iterdir()) == existing, "Cancelled publication must remove its new file"
     assert platform.reads == (2 if operation == "download" else 1), (
