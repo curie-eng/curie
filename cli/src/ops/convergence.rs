@@ -1354,7 +1354,7 @@ spec:
           image: {{ .Values.image }}
           imagePullPolicy: Never
           command: [sh, -c]
-          args: ["{{ if .Values.gated }}until test -f /tmp/release; do sleep 0.1; done; {{ end }}exit {{ .Values.exitCode }}"]
+          args: ["{{ if .Values.gated }}until test -f /tmp/release; do sleep 0.1; done; writer=$(cat /tmp/release); while kill -0 $writer 2>/dev/null; do sleep 0.1; done; {{ end }}exit {{ .Values.exitCode }}"]
 "#;
 
     // Helm status exposes version, info.status and hooks[].last_run.phase:
@@ -1952,6 +1952,12 @@ sys.exit(result.returncode)
             Ok(())
         }
 
+        // The gate container is the hook pod's PID 1. When it exits, the kernel
+        // SIGKILLs every process left in its PID namespace, including this exec,
+        // which kubectl then reports as exit 137. Signalling with a bare `touch`
+        // let the gate observe the file and exit before `touch` itself had
+        // exited. The writer instead publishes its own PID atomically, and the
+        // gate exits only once that PID is gone (reaped, so its status is final).
         fn open_hook(&self, target: &Target, budget: Duration) -> Result<()> {
             self.invoke(
                 "kubectl",
@@ -1961,8 +1967,9 @@ sys.exit(result.returncode)
                     &target.release,
                     &format!("job/{}", target.hook),
                     "--",
-                    "touch",
-                    "/tmp/release",
+                    "sh",
+                    "-c",
+                    "echo $$ > /tmp/release.next && mv /tmp/release.next /tmp/release",
                 ],
                 budget,
             )?;
