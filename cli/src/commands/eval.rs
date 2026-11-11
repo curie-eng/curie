@@ -17,6 +17,14 @@ pub struct EvalReport {
     pub sampling: crate::eval_sampling::SampleConfig,
     /// Per-case count of samples that passed, keyed by case id.
     pub sample_passes: BTreeMap<String, u32>,
+    /// The raw record of every trial the CLI itself drove, keyed by case id.
+    /// A case is absent when its trials ran somewhere the CLI cannot see (the
+    /// platform eval plane), so a missing key never reads as "zero trials".
+    pub trials: BTreeMap<String, Vec<EvalTrial>>,
+    /// The deployed bundle revision a local/cluster run was routed to, when
+    /// the CLI could resolve it. `None` at the skill tier, which names its
+    /// bundle through `bundle_digest` instead.
+    pub bundle_revision: Option<EvalBundleRevision>,
 }
 
 impl EvalReport {
@@ -31,8 +39,162 @@ impl EvalReport {
             details,
             sampling: crate::eval_sampling::SampleConfig::default(),
             sample_passes,
+            trials: BTreeMap::new(),
+            bundle_revision: None,
         }
     }
+}
+
+/// One tool call a trial made. Only the tool NAME crosses the ACI wire today
+/// (`tool_note.tool`); arguments are never observable from the CLI, so they
+/// are not modeled rather than reported empty.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct TrialToolCall {
+    pub name: String,
+}
+
+/// The raw record of one trial (one independent sample) of an eval case,
+/// before aggregation reduces the trials to the case verdict. This is the
+/// evidence a reviewer needs to see WHICH draw failed and why, instead of one
+/// representative output and a pass count.
+#[derive(Debug, Clone, PartialEq)]
+pub struct EvalTrial {
+    /// Zero-based position of this trial within its case.
+    pub index: u32,
+    /// This trial's own verdict, before aggregation.
+    pub outcome: CaseOutcome,
+    /// Wall-clock seconds for this trial alone.
+    pub seconds: f64,
+    /// The reply text the grader judged; empty when the turn produced none.
+    pub reply: String,
+    /// The tools the trial called, in emission order. `None` when this tier
+    /// cannot observe tool calls at all (local/cluster see only the reply),
+    /// which is different from `Some(vec![])`: an observed turn with no call.
+    pub tool_calls: Option<Vec<TrialToolCall>>,
+    /// How the turn ended as this tier observed it: the runner's terminal
+    /// session status at the skill tier, the reply relay's outcome at
+    /// local/cluster.
+    pub status: Option<String>,
+    /// Scorer explanation for this trial's verdict, when the scorer has one.
+    pub detail: Option<String>,
+    /// Why the turn did not complete (or failed in the runner), when known.
+    pub error: Option<String>,
+}
+
+impl EvalTrial {
+    /// The trial's `--json` record, shaped by `cli/schema/eval.schema.json`.
+    fn to_json(&self) -> serde_json::Value {
+        let mut value = serde_json::json!({
+            "index": self.index,
+            "outcome": self.outcome,
+            // Same tri-state as the case row (ADR-0055).
+            "passed": self.outcome.passed(),
+            "seconds": self.seconds,
+            "reply": self.reply,
+            "tool_calls": self.tool_calls,
+        });
+        for (key, field) in [
+            ("status", &self.status),
+            ("detail", &self.detail),
+            ("error", &self.error),
+        ] {
+            if let Some(text) = field {
+                value[key] = serde_json::json!(text);
+            }
+        }
+        value
+    }
+}
+
+/// Build the skill tier's trial record from the runner's own event stream.
+///
+/// Every field is read from `events`, never inferred: the reply is the graded
+/// answer, the tool calls are the `tool_note` frames in emission order (the
+/// same trajectory a `tool_called` grader reads), and the status is the
+/// terminal `final` frame's. An incomplete turn carries the runner's last
+/// error message when it sent one.
+pub(super) fn skill_trial(
+    index: u32,
+    case: &crate::evals::EvalCase,
+    events: &[OutboundEvent],
+    scored: &crate::evals::ScoredCaseOutcome,
+    seconds: f64,
+) -> EvalTrial {
+    let status = events.iter().rev().find_map(|event| match event {
+        OutboundEvent::Final { status, .. } => serde_json::to_value(status)
+            .ok()
+            .and_then(|value| value.as_str().map(str::to_string)),
+        _ => None,
+    });
+    let error = (!turn_completed(case, events)).then(|| {
+        events
+            .iter()
+            .rev()
+            .find_map(|event| match event {
+                OutboundEvent::ErrorEvent { message, .. } => {
+                    Some(format!("turn did not complete: {message}"))
+                }
+                _ => None,
+            })
+            .unwrap_or_else(|| "turn did not complete".to_string())
+    });
+    EvalTrial {
+        index,
+        outcome: scored.outcome,
+        seconds,
+        reply: graded_answer(events),
+        tool_calls: Some(
+            crate::evals::trajectory(events)
+                .into_iter()
+                .map(|name| TrialToolCall {
+                    name: name.to_string(),
+                })
+                .collect(),
+        ),
+        status,
+        detail: scored.detail.clone(),
+        error,
+    }
+}
+
+/// The deployed bundle revision a local/cluster eval was routed to: the
+/// agent's in-force deployment and the version it serves. Resolved by the CLI
+/// from the platform API with the worker's own precedence (an active prod
+/// deployment outranks dev, then the most recent), not observed inside the
+/// sandbox. `bundle_sha256` is the same sha256-over-the-packed-archive the
+/// skill tier reports as `bundle_digest`, so the two are directly comparable
+/// for one archive.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct EvalBundleRevision {
+    pub agent_id: String,
+    pub deployment_id: String,
+    pub environment: String,
+    pub version_id: String,
+    pub version_label: String,
+    pub commit_sha: Option<String>,
+    pub bundle_sha256: Option<String>,
+}
+
+/// Join the agent's in-force deployment to the version it serves. `None` when
+/// nothing is in force or the in-force version is not in `versions`: a
+/// revision the CLI cannot name is reported as unknown, never guessed.
+pub fn eval_bundle_revision(
+    agent_id: &str,
+    deployments: &[crate::api::Deployment],
+    versions: &[crate::api::Version],
+) -> Option<EvalBundleRevision> {
+    let deployment = select_in_force_deployment(deployments)?;
+    let version_id = deployment.version_id.as_deref()?;
+    let version = versions.iter().find(|v| v.id == version_id)?;
+    Some(EvalBundleRevision {
+        agent_id: agent_id.to_string(),
+        deployment_id: deployment.id.clone(),
+        environment: deployment.environment.clone(),
+        version_id: version.id.clone(),
+        version_label: version.version_label.clone(),
+        commit_sha: version.commit_sha.clone(),
+        bundle_sha256: version.bundle_sha256.clone(),
+    })
 }
 
 pub(super) fn n1_sample_passes(rows: &[EvalRow]) -> BTreeMap<String, u32> {
@@ -70,7 +232,7 @@ pub fn eval_json(results: &[EvalRow], bundle_digest: Option<&str>) -> serde_json
     eval_json_with_details(&EvalReport::from_rows(results.to_vec()), bundle_digest)
 }
 
-pub(super) fn eval_json_with_details(
+pub fn eval_json_with_details(
     report: &EvalReport,
     bundle_digest: Option<&str>,
 ) -> serde_json::Value {
@@ -112,6 +274,10 @@ pub(super) fn eval_json_with_details(
                 row["variance"] =
                     serde_json::json!(format!("{sample_passes}/{n} samples passed ({bar})"));
             }
+            // Raw per-trial records, only where the CLI observed the trials.
+            if let Some(trials) = report.trials.get(id) {
+                row["trials"] = trials.iter().map(EvalTrial::to_json).collect();
+            }
             row
         })
         .collect();
@@ -121,6 +287,7 @@ pub(super) fn eval_json_with_details(
         "failed": failed,
         "plumbing_ok": plumbing_ok,
         "bundle_digest": bundle_digest,
+        "bundle_revision": report.bundle_revision,
         "samples": n,
         "policy": policy,
         "cases": cases,
@@ -264,11 +431,13 @@ pub(super) async fn run_suite_cases(
     let mut results = Vec::with_capacity(suite.cases.len());
     let mut details = BTreeMap::new();
     let mut sample_passes = BTreeMap::new();
+    let mut trials = BTreeMap::new();
     let mut completed = 0usize;
     for case in &suite.cases {
         let mut samples = Vec::with_capacity(sampling.n as usize);
+        let mut case_trials = Vec::with_capacity(sampling.n as usize);
         let mut case_completed = false;
-        for _ in 0..sampling.n {
+        for index in 0..sampling.n {
             // Fresh conversation before every sample (#550 / #1907): two samples
             // of the same case must each start clean, or the second inherits the
             // first's turn. A shared_history case still skips the reset.
@@ -298,6 +467,7 @@ pub(super) async fn run_suite_cases(
             if let Some(detail) = scored.detail.clone() {
                 details.insert(case.id.clone(), detail);
             }
+            case_trials.push(skill_trial(index, case, &events, &scored, elapsed));
             samples.push(crate::eval_sampling::SampleRecord {
                 outcome: scored.outcome,
                 output: graded_answer(&events),
@@ -320,6 +490,7 @@ pub(super) async fn run_suite_cases(
                 .entry(case.id.clone())
                 .or_insert_with(|| variance.clone());
         }
+        trials.insert(case.id.clone(), case_trials);
         results.push((case.id.clone(), agg.outcome, agg.seconds, agg.output));
     }
     Ok((
@@ -328,6 +499,8 @@ pub(super) async fn run_suite_cases(
             details,
             sampling,
             sample_passes,
+            trials,
+            bundle_revision: None,
         },
         completed,
     ))
@@ -939,6 +1112,15 @@ impl crate::ui::CliOutput for EvalOutput<'_> {
             "sampling: {} sample(s), {}",
             n, self.report.sampling.policy
         ));
+        if let Some(revision) = &self.report.bundle_revision {
+            ui.note(&format!(
+                "bundle revision: {} ({} deployment {}, bundle sha256 {})",
+                revision.version_label,
+                revision.environment,
+                revision.deployment_id,
+                revision.bundle_sha256.as_deref().unwrap_or("unknown"),
+            ));
+        }
         if failed == 0 {
             ui.success(&rollup_line(passed, failed, plumbing_ok));
             if plumbing_ok > 0 {

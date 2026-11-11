@@ -107,6 +107,7 @@ mod eval_falsifiability;
 mod eval_portforward_cleanup;
 mod eval_sampling;
 mod eval_thread_reset;
+mod eval_trial_records;
 mod example_builtin_coding_tools;
 mod example_dark_factory_render;
 mod example_sre_bot_install;

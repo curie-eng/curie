@@ -224,6 +224,10 @@ majority aggregation; `curie skill eval --samples 3 --json`,
 `curie local eval --samples 3 --json`, and
 `curie cluster eval --samples 3 --json` raise N on the in-CLI path. A run
 that is all `plumbing_ok` is not a pass, it is an ungraded run.
+Each case's `trials` array is the raw per-sample record (reply, `tool_calls`,
+verdict, seconds) behind those counts. `tool_calls` null means the tier cannot
+observe tools (local, cluster), not that none ran. The evaluated bundle is
+`bundle_digest` at the skill tier and `bundle_revision` at local and cluster.
 
 **An eval's exit code is the gate: 1 at least one selected case failed, 2 the
 selector matched no cases, 3 the runner or platform API was unreachable or

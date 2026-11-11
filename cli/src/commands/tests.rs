@@ -1651,6 +1651,97 @@ fn select_in_force_deployment_prefers_prod_then_most_recent() {
     assert!(select_in_force_deployment(&[]).is_none());
 }
 
+fn version(id: &str, label: &str, sha256: Option<&str>) -> crate::api::Version {
+    crate::api::Version {
+        id: id.into(),
+        version_label: label.into(),
+        commit_sha: Some(format!("commit-{label}")),
+        bundle_sha256: sha256.map(str::to_string),
+        created_by: None,
+        created_at: None,
+        agent_id: None,
+        bundle_ref: None,
+    }
+}
+
+#[test]
+fn the_eval_bundle_revision_is_the_in_force_deployments_version() {
+    // The revision a local/cluster eval names is the one the worker binds: an
+    // active prod deployment outranks a newer active dev one.
+    let deps = vec![
+        deployment("prod", "active", "v1", "2026-07-01"),
+        deployment("dev", "active", "v2", "2026-07-02"),
+    ];
+    let versions = vec![
+        version("v1", "1.0.0", Some("aa11")),
+        version("v2", "1.1.0", Some("bb22")),
+    ];
+    let revision = super::eval_bundle_revision("agent-1", &deps, &versions)
+        .expect("an in-force deployment with a known version names a revision");
+    assert_eq!(revision.agent_id, "agent-1");
+    assert_eq!(revision.deployment_id, "dep-v1");
+    assert_eq!(revision.environment, "prod");
+    assert_eq!(revision.version_id, "v1");
+    assert_eq!(revision.version_label, "1.0.0");
+    assert_eq!(revision.commit_sha.as_deref(), Some("commit-1.0.0"));
+    assert_eq!(revision.bundle_sha256.as_deref(), Some("aa11"));
+}
+
+#[test]
+fn the_eval_bundle_revision_is_unknown_rather_than_guessed() {
+    let versions = vec![version("v1", "1.0.0", Some("aa11"))];
+    // Nothing in force: no deployment is active, so no revision applies.
+    let retired = vec![deployment("prod", "superseded", "v1", "2026-07-01")];
+    assert!(super::eval_bundle_revision("agent-1", &retired, &versions).is_none());
+    // In force, but its version is not in the listing: never borrow another one.
+    let orphan = vec![deployment("prod", "active", "v9", "2026-07-01")];
+    assert!(super::eval_bundle_revision("agent-1", &orphan, &versions).is_none());
+}
+
+#[test]
+fn a_skill_trial_records_tools_in_order_and_why_an_incomplete_turn_failed() {
+    use curie_aci_protocol::{OutboundEvent, PROTOCOL_VERSION};
+    let case: crate::evals::EvalCase = serde_json::from_value(json!({
+        "id": "forecast",
+        "input": "what is the forecast",
+        "grader": {"kind": "contains", "expected": "sunny"}
+    }))
+    .unwrap();
+    let note = |tool: &str| OutboundEvent::ToolNote {
+        version: PROTOCOL_VERSION.into(),
+        text: format!("running tool {tool}"),
+        tool: Some(tool.into()),
+    };
+    // An incomplete turn: two tool calls, then the runner errors with no final.
+    let events = vec![
+        note("WebSearch"),
+        note("WebFetch"),
+        OutboundEvent::ErrorEvent {
+            version: PROTOCOL_VERSION.into(),
+            message: "upstream timed out".into(),
+            classification: None,
+        },
+    ];
+    let scored = crate::evals::score_turn(&case, &events, false, None);
+    let trial = super::skill_trial(2, &case, &events, &scored, 1.5);
+    assert_eq!(trial.index, 2);
+    assert_eq!(trial.outcome, crate::evals::CaseOutcome::Fail);
+    let names: Vec<&str> = trial
+        .tool_calls
+        .as_deref()
+        .expect("the skill tier observes tool calls")
+        .iter()
+        .map(|call| call.name.as_str())
+        .collect();
+    assert_eq!(names, ["WebSearch", "WebFetch"]);
+    assert_eq!(trial.status, None, "no final frame arrived");
+    assert_eq!(
+        trial.error.as_deref(),
+        Some("turn did not complete: upstream timed out")
+    );
+    assert_eq!(trial.reply, "");
+}
+
 #[test]
 fn approvals_summary_line_never_claims_ungated_when_the_manifest_is_unreadable() {
     // The whole point of the three-state split (#607): "no gates found" and

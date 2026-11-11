@@ -360,6 +360,17 @@ Each sample starts a fresh conversation. A `--model` sweep on local/cluster
 refuses `--samples > 1` because the frozen EvalJob cannot carry N; set
 `CURIE_EVAL_SAMPLES` on the worker for the production eval path.
 
+Each case in `--json` also carries `trials`, the raw record of every sample
+the CLI drove: `index`, its own `outcome` and `passed`, `seconds`, the `reply`
+it judged, `tool_calls`, and the terminal `status`. The skill tier reads tool
+calls from the runner's tool frames (names only; arguments do not cross the
+runner wire). Local and cluster see only the delivered reply, so their
+`tool_calls` is null, meaning not observable rather than none. A trajectory
+eval on local/cluster runs on the platform eval plane and omits `trials`. The
+bundle under test is `bundle_digest` at the skill tier and `bundle_revision`
+(agent, in-force deployment, version, commit, bundle sha256) at local/cluster,
+null when the in-force deployment changed during the run.
+
 The skill tier scores the runner tool frames directly. The local and cluster
 tiers trigger the deployed bundle through the platform eval plane, then poll
 the matrix for the exact triggered stream and scorer. Deploy the changed

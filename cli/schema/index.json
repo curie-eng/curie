@@ -181,7 +181,7 @@
       "result": "EvalOutput",
       "kind": "CliOutput",
       "schema": "eval.schema.json",
-      "version": "1.3"
+      "version": "1.4"
     },
     {
       "result": "FactoryAppRegistrationOutput",
@@ -499,7 +499,7 @@
       "result": "eval_json",
       "kind": "builder",
       "schema": "eval.schema.json",
-      "version": "1.3"
+      "version": "1.4"
     },
     {
       "result": "message_awaiting_approval_json",
