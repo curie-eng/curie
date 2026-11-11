@@ -56,6 +56,7 @@ from curie_worker.reply_sink import ReplySink, TargetRoute, build_reply_sink
 from curie_worker.runner_client import RunnerWorkspaceSnapshot
 from curie_worker.sandbox import SandboxError, SuspendedThreadError
 from curie_worker.workitem_dispatch import (
+    TerminationClaim,
     WorkItemAcquireGrant,
     WorkItemConflict,
     WorkItemHeartbeat,
@@ -304,6 +305,14 @@ class _WorkItems:
         self.finishes.append(kwargs)
         if self.after_finish is not None:
             await self.after_finish()
+
+    async def claim_termination(self, request_id: uuid.UUID, *, owner: str) -> TerminationClaim:
+        self.calls.append("claim_termination")
+        started = self.starts.get(request_id)
+        return TerminationClaim(
+            runtime_epoch=started.runtime_epoch if started is not None else 1,
+            request_version=self.calls.count("claim_termination") + 1,
+        )
 
     async def get_request(self, request_id: uuid.UUID) -> WorkItemRequestView:
         self.calls.append("get_request")
@@ -1944,11 +1953,13 @@ class _OrphanWorkItems:
 
     def __init__(self) -> None:
         self.claimed: list[tuple[uuid.UUID, str]] = []
-        self.recorded: list[tuple[uuid.UUID, int, str]] = []
+        self.recorded: list[tuple[uuid.UUID, int, int, str]] = []
 
-    async def claim_termination(self, request_id: uuid.UUID, *, owner: str) -> int:
+    async def claim_termination(self, request_id: uuid.UUID, *, owner: str) -> TerminationClaim:
         self.claimed.append((request_id, owner))
-        return 7
+        # Each claim advances the row version; the epoch of this cancellation
+        # stays the stored 7 in this double.
+        return TerminationClaim(runtime_epoch=7, request_version=2 + len(self.claimed))
 
     async def get_request(self, _request_id: uuid.UUID) -> object:
         return SimpleNamespace(
@@ -1959,9 +1970,14 @@ class _OrphanWorkItems:
         )
 
     async def record_termination(
-        self, request_id: uuid.UUID, *, runtime_epoch: int, observation: str
+        self,
+        request_id: uuid.UUID,
+        *,
+        runtime_epoch: int,
+        expected_request_version: int,
+        observation: str,
     ) -> None:
-        self.recorded.append((request_id, runtime_epoch, observation))
+        self.recorded.append((request_id, runtime_epoch, expected_request_version, observation))
 
 
 def test_terminate_wake_for_an_orphan_tears_down_its_stored_claim(make_harness) -> None:
@@ -1991,12 +2007,14 @@ def test_terminate_wake_for_an_orphan_tears_down_its_stored_claim(make_harness) 
 
             await h.kernel.process_event(_turn(f"work-item-{request_id}-terminate", "terminate"))
 
-            assert [c[0] for c in work_items.claimed] == [request_id]
+            # The gating claim, then the re-claim under the thread lock (#5377).
+            assert work_items.claimed == [(request_id, "test-consumer")] * 2
             assert len(terminated) == 1
             assert terminated[0]["claim_name"] == _OrphanWorkItems.CLAIM
             assert terminated[0]["sandbox_name"] == _OrphanWorkItems.SANDBOX
-            assert [(r[0], r[1]) for r in work_items.recorded] == [(request_id, 7)]
-            assert _OrphanWorkItems.CLAIM in work_items.recorded[0][2]
+            # Recorded with the re-claim's epoch and request version.
+            assert [(r[0], r[1], r[2]) for r in work_items.recorded] == [(request_id, 7, 4)]
+            assert _OrphanWorkItems.CLAIM in work_items.recorded[0][3]
 
     asyncio.run(exercise())
 
@@ -3040,6 +3058,7 @@ def test_refused_resume_finish_transport_failure_cannot_restore_ended_held_run(
             self.runtime_claims: dict[uuid.UUID, tuple[str, str]] = {}
             self.finish_attempts: list[dict[str, object]] = []
             self.terminations: list[uuid.UUID] = []
+            self.termination_claims = 0
 
         async def start(
             self, request_id: uuid.UUID, *, claim_name: str, sandbox_name: str,
@@ -3069,10 +3088,16 @@ def test_refused_resume_finish_transport_failure_cannot_restore_ended_held_run(
             await self.fail_finish.wait()
             raise WorkItemTransportError("finish response unavailable")
 
-        async def claim_termination(self, request_id: uuid.UUID, *, owner: str) -> int:
+        async def claim_termination(
+            self, request_id: uuid.UUID, *, owner: str
+        ) -> TerminationClaim:
             assert request_id == self.refused_request_id
             assert owner == "test-consumer"
-            return self.starts[request_id].runtime_epoch
+            self.termination_claims += 1
+            return TerminationClaim(
+                runtime_epoch=self.starts[request_id].runtime_epoch,
+                request_version=1 + self.termination_claims,
+            )
 
         async def get_request(self, request_id: uuid.UUID) -> WorkItemRequestView:
             view = await super().get_request(request_id)
@@ -3080,9 +3105,13 @@ def test_refused_resume_finish_transport_failure_cannot_restore_ended_held_run(
             return replace(view, runtime_claim_name=claim_name, runtime_sandbox_name=sandbox_name)
 
         async def record_termination(
-            self, request_id: uuid.UUID, *, runtime_epoch: int, observation: str,
+            self, request_id: uuid.UUID, *, runtime_epoch: int,
+            expected_request_version: int, observation: str,
         ) -> None:
             assert runtime_epoch == self.starts[request_id].runtime_epoch
+            # The version the re-claim under the thread lock returned (#5377).
+            assert self.termination_claims == 2
+            assert expected_request_version == 1 + self.termination_claims
             assert self.runtime_claims[request_id][0] in observation
             self.terminal_outcomes[request_id] = "cancelled"
             self.terminations.append(request_id)

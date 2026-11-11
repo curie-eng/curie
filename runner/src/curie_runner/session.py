@@ -24,6 +24,7 @@ import contextlib
 import hmac
 import logging
 import math
+import os
 import time
 import uuid
 from collections import OrderedDict
@@ -96,6 +97,13 @@ from .memory import (
 )
 from .memory_facts import MemoryTurn
 from .otel import RunTracer, _GenerationSpan
+from .personal_auth import (
+    AuthenticationRequiredError,
+    AuthMode,
+    InvalidAuthModeError,
+    PersonalAuthError,
+    effective_auth_mode,
+)
 from .platform_slack.capability import ChannelReadTurn
 from .platform_slack.retention import strip_channel_bodies
 from .progress import ProgressActivity
@@ -165,6 +173,35 @@ _AUTH_REJECTION_SDK_CODE = "authentication_failed"
 # rules) can tell a rejected credential from a transient failure and NOT retry
 # it -- distinct from both a budget halt and a generic runner error.
 AUTH_REJECTED_CLASSIFICATION = "model-credential-rejected"
+# The same terminal outcome in personal mode (#5377, ADR 0268): the owner's
+# grant is missing, refused by personal_auth before the CLI starts, or rejected
+# by the provider. The owner, not the operator, acts on it, so the message names
+# the enrollment and never CURIE_CREDENTIALS. Not retryable, and no service
+# credential is tried in its place. Expiry is never inferred from token shape:
+# only a refusal or a real provider rejection lands here.
+AUTH_REQUIRED_CLASSIFICATION = "authentication-required"
+_ENROLLMENT_FIX = "reconnect or replace the personal Claude enrollment"
+
+
+def _personal_mode() -> bool:
+    """Whether this runner process authenticates with the owner's grant.
+
+    An invalid selector counts as personal: it already refused the launch, and
+    service guidance would point the owner at the platform credential.
+    """
+
+    try:
+        return effective_auth_mode(os.environ, {}) is AuthMode.PERSONAL
+    except InvalidAuthModeError:
+        return True
+
+
+def _personal_refusal_reason(exc: PersonalAuthError) -> str:
+    """A fixed, value-free reason for a personal_auth refusal; never ``str(exc)``."""
+
+    if isinstance(exc, AuthenticationRequiredError):
+        return "no personal Claude grant reached this runner"
+    return f"personal model authentication refused the launch ({type(exc).__name__})"
 
 # Classification tagging the OBSERVE-ONLY reconciliation warning (#544, Decision
 # A2): a resumed policy-gate turn that armed gates yet took no action -- the
@@ -1062,7 +1099,13 @@ class SessionRunner:
         if task.cancelled():
             return
         exc = task.exception()
-        if exc is not None:
+        if isinstance(exc, PersonalAuthError):
+            # Classified before anything logs it: the class, never the text.
+            logger.error(
+                "session start failed error_class=%s: personal model authentication refused",
+                type(exc).__name__,
+            )
+        elif exc is not None:
             logger.error("session start failed error_class=%s: %s", type(exc).__name__, exc)
 
     async def _initialize(self) -> None:
@@ -1707,6 +1750,16 @@ class SessionRunner:
                                     status=SessionStatus.IDLE_AWAITING_INPUT,
                                 )
                             )
+                        elif isinstance(exc, PersonalAuthError):
+                            # #5377: classified before anything logs ``exc`` or
+                            # copies its text; it is terminal, not a retryable
+                            # runner-error, and no service credential is tried.
+                            lines = self._personal_auth_halt_lines(_personal_refusal_reason(exc))
+                            metric_outcome = self._metric_outcome(tracker)
+                            self._set_failed(gen)
+                            terminal_for_log = True
+                            for line in lines:
+                                yield line
                         else:
                             logger.error(
                                 "turn failed session=%s error_class=%s: %s duration_ms=%d",
@@ -2928,9 +2981,13 @@ class SessionRunner:
         Distinct from a budget halt and a generic runner error so downstream
         retry rules do NOT retry a rejected credential (retrying only burns the
         wall). The message names ``CURIE_CREDENTIALS`` since that is the ACI
-        reference the operator must fix; it carries no credential value.
+        reference the operator must fix; it carries no credential value. In
+        personal mode the rejected credential is the owner's grant, so the pair
+        is ``authentication-required`` naming the enrollment instead (#5377).
         """
 
+        if _personal_mode():
+            return self._personal_auth_halt_lines("the provider rejected the personal Claude grant")
         logger.error(
             "auth failure session=%s: model credential rejected by provider", self._session_id
         )
@@ -2947,6 +3004,35 @@ class SessionRunner:
             to_ndjson_line(
                 Final(
                     text="run failed: model credential rejected by provider",
+                    status=SessionStatus.CLASSIFIED_FAILURE,
+                )
+            ),
+        ]
+
+    def _personal_auth_halt_lines(self, reason: str) -> list[str]:
+        """The ``authentication-required`` error+final pair (#5377, ADR 0268).
+
+        ``reason`` is a fixed sentence, never exception text, and the message
+        carries no credential value. Personal mode never names CURIE_CREDENTIALS:
+        no service credential stands in for the owner's grant.
+        """
+
+        logger.error(
+            "auth failure session=%s: authentication required (%s)", self._session_id, reason
+        )
+        self._turn_open = False
+        self._turn_ready = False
+        self._status = SessionStatus.CLASSIFIED_FAILURE
+        return [
+            to_ndjson_line(
+                ErrorEvent(
+                    message=f"authentication required: {reason}; {_ENROLLMENT_FIX}",
+                    classification=AUTH_REQUIRED_CLASSIFICATION,
+                )
+            ),
+            to_ndjson_line(
+                Final(
+                    text="run failed: authentication required",
                     status=SessionStatus.CLASSIFIED_FAILURE,
                 )
             ),

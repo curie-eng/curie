@@ -131,6 +131,19 @@ class WorkItemRuntimeOwner:
 
 
 @dataclass(frozen=True)
+class TerminationClaim:
+    """A held teardown lease: the epoch and request version a record must name.
+
+    ``request_version`` is the row version the claim left; ``record_termination``
+    sends it as ``expected_request_version``, so a claimant whose lease another
+    worker took over and settled is refused instead of recording (#5377).
+    """
+
+    runtime_epoch: int
+    request_version: int
+
+
+@dataclass(frozen=True)
 class TerminationObservation:
     """Observed absence of the named claims and sandboxes."""
 
@@ -458,13 +471,18 @@ class WorkItemDispatchClient:
         request_id: uuid.UUID,
         *,
         owner: str,
-    ) -> int:
+    ) -> TerminationClaim:
+        """Claim, or as the same owner renew, the request's teardown lease."""
+
         body = await self._post(
             f"/v1/internal/work-items/requests/{request_id}/termination/claim",
             {"owner": owner},
         )
         try:
-            return int(body["runtime_epoch"])
+            return TerminationClaim(
+                runtime_epoch=_required_positive_int(body["runtime_epoch"]),
+                request_version=_required_positive_int(body["request_version"]),
+            )
         except (KeyError, TypeError, ValueError) as exc:
             raise WorkItemTransportError(
                 "work-item termination claim returned an unusable body"
@@ -475,11 +493,16 @@ class WorkItemDispatchClient:
         request_id: uuid.UUID,
         *,
         runtime_epoch: int,
+        expected_request_version: int,
         observation: str,
     ) -> None:
         await self._post(
             f"/v1/internal/work-items/requests/{request_id}/termination",
-            {"runtime_epoch": runtime_epoch, "observation": observation},
+            {
+                "runtime_epoch": runtime_epoch,
+                "expected_request_version": expected_request_version,
+                "observation": observation,
+            },
         )
 
     async def runtime_owners(
