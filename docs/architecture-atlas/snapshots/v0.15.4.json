@@ -1,11 +1,11 @@
 {
   "schemaVersion": "1.4",
-  "asOf": "2026-11-10",
+  "asOf": "2026-11-11",
   "repository": {
     "name": "curie-eng/curie",
     "branch": "main",
-    "commit": "be8a7952a7e610a8abd60d20377c85f68fdf7d72",
-    "shortCommit": "be8a7952",
+    "commit": "6cdb71043c7608393b77bc7122a2e4531d42400a",
+    "shortCommit": "6cdb7104",
     "release": "v0.15.4"
   },
   "title": "Curie architecture atlas",
@@ -6812,105 +6812,105 @@
       "type": "code",
       "title": "Transient runtime-class and quota reads in sandbox admission",
       "path": "apps/worker/src/curie_worker/sandbox/k8s.py",
-      "href": "https://github.com/curie-eng/curie/blob/be8a7952a7e610a8abd60d20377c85f68fdf7d72/apps/worker/src/curie_worker/sandbox/k8s.py"
+      "href": "https://github.com/curie-eng/curie/blob/6cdb71043c7608393b77bc7122a2e4531d42400a/apps/worker/src/curie_worker/sandbox/k8s.py"
     },
     {
       "id": "wait-reason-v0154",
       "type": "code",
       "title": "Cause-specific durable wait notices",
       "path": "apps/worker/src/curie_worker/capacity_wait.py",
-      "href": "https://github.com/curie-eng/curie/blob/be8a7952a7e610a8abd60d20377c85f68fdf7d72/apps/worker/src/curie_worker/capacity_wait.py"
+      "href": "https://github.com/curie-eng/curie/blob/6cdb71043c7608393b77bc7122a2e4531d42400a/apps/worker/src/curie_worker/capacity_wait.py"
     },
     {
       "id": "wait-reason-consumer-v0154",
       "type": "code",
       "title": "Durable wait reasons and review follow-up revalidation",
       "path": "apps/worker/src/curie_worker/consumer.py",
-      "href": "https://github.com/curie-eng/curie/blob/be8a7952a7e610a8abd60d20377c85f68fdf7d72/apps/worker/src/curie_worker/consumer.py"
+      "href": "https://github.com/curie-eng/curie/blob/6cdb71043c7608393b77bc7122a2e4531d42400a/apps/worker/src/curie_worker/consumer.py"
     },
     {
       "id": "identity-retry-v0154",
       "type": "code",
       "title": "One unavailable identity lookup retried inside the composition budget",
       "path": "apps/api/src/curie_api/identity/http_invocation.py",
-      "href": "https://github.com/curie-eng/curie/blob/be8a7952a7e610a8abd60d20377c85f68fdf7d72/apps/api/src/curie_api/identity/http_invocation.py"
+      "href": "https://github.com/curie-eng/curie/blob/6cdb71043c7608393b77bc7122a2e4531d42400a/apps/api/src/curie_api/identity/http_invocation.py"
     },
     {
       "id": "upgrade-checkpoint-v0154",
       "type": "code",
       "title": "Transient apiserver retry and adoption for upgrade checkpoint writes",
       "path": "cli/src/ops/upgrade.rs",
-      "href": "https://github.com/curie-eng/curie/blob/be8a7952a7e610a8abd60d20377c85f68fdf7d72/cli/src/ops/upgrade.rs"
+      "href": "https://github.com/curie-eng/curie/blob/6cdb71043c7608393b77bc7122a2e4531d42400a/cli/src/ops/upgrade.rs"
     },
     {
       "id": "langfuse-filter-v0154",
       "type": "code",
       "title": "Langfuse platform-noise collector filter",
       "path": "otel/collector-config.yaml",
-      "href": "https://github.com/curie-eng/curie/blob/be8a7952a7e610a8abd60d20377c85f68fdf7d72/otel/collector-config.yaml"
+      "href": "https://github.com/curie-eng/curie/blob/6cdb71043c7608393b77bc7122a2e4531d42400a/otel/collector-config.yaml"
     },
     {
       "id": "langfuse-filter-chart-v0154",
       "type": "code",
       "title": "Chart Langfuse pipeline filter and unfiltered traces pipeline",
       "path": "charts/curie/values.yaml",
-      "href": "https://github.com/curie-eng/curie/blob/be8a7952a7e610a8abd60d20377c85f68fdf7d72/charts/curie/values.yaml"
+      "href": "https://github.com/curie-eng/curie/blob/6cdb71043c7608393b77bc7122a2e4531d42400a/charts/curie/values.yaml"
     },
     {
       "id": "nested-generation-v0154",
       "type": "code",
       "title": "Nested reviewer generations during the parent tool wait",
       "path": "runner/src/curie_runner/translate.py",
-      "href": "https://github.com/curie-eng/curie/blob/be8a7952a7e610a8abd60d20377c85f68fdf7d72/runner/src/curie_runner/translate.py"
+      "href": "https://github.com/curie-eng/curie/blob/6cdb71043c7608393b77bc7122a2e4531d42400a/runner/src/curie_runner/translate.py"
     },
     {
       "id": "telemetry-interface-v0154",
       "type": "doc",
       "title": "Nested generation and main-loop usage contract",
       "path": "docs/interfaces/telemetry-otel/INTERFACE.md",
-      "href": "https://github.com/curie-eng/curie/blob/be8a7952a7e610a8abd60d20377c85f68fdf7d72/docs/interfaces/telemetry-otel/INTERFACE.md"
+      "href": "https://github.com/curie-eng/curie/blob/6cdb71043c7608393b77bc7122a2e4531d42400a/docs/interfaces/telemetry-otel/INTERFACE.md"
     },
     {
       "id": "stderr-exception-type-v0154",
       "type": "code",
       "title": "Bounded exception type in stderr JSON records",
       "path": "packages/telemetry/src/curie_telemetry/logging.py",
-      "href": "https://github.com/curie-eng/curie/blob/be8a7952a7e610a8abd60d20377c85f68fdf7d72/packages/telemetry/src/curie_telemetry/logging.py"
+      "href": "https://github.com/curie-eng/curie/blob/6cdb71043c7608393b77bc7122a2e4531d42400a/packages/telemetry/src/curie_telemetry/logging.py"
     },
     {
       "id": "handoff-length-v0154",
       "type": "doc",
       "title": "Bounded no-PR handoff",
       "path": "examples/dark-factory/skills/implement-issue/SKILL.md",
-      "href": "https://github.com/curie-eng/curie/blob/be8a7952a7e610a8abd60d20377c85f68fdf7d72/examples/dark-factory/skills/implement-issue/SKILL.md"
+      "href": "https://github.com/curie-eng/curie/blob/6cdb71043c7608393b77bc7122a2e4531d42400a/examples/dark-factory/skills/implement-issue/SKILL.md"
     },
     {
       "id": "compose-startup-v0154",
       "type": "code",
       "title": "Classified Compose startup diagnostics",
       "path": "scripts/wait-for-langfuse.py",
-      "href": "https://github.com/curie-eng/curie/blob/be8a7952a7e610a8abd60d20377c85f68fdf7d72/scripts/wait-for-langfuse.py"
+      "href": "https://github.com/curie-eng/curie/blob/6cdb71043c7608393b77bc7122a2e4531d42400a/scripts/wait-for-langfuse.py"
     },
     {
       "id": "architecture-ci-v0154",
       "type": "doc",
       "title": "Chart workload, upgrade and chart legs",
       "path": "ARCHITECTURE.md",
-      "href": "https://github.com/curie-eng/curie/blob/be8a7952a7e610a8abd60d20377c85f68fdf7d72/ARCHITECTURE.md"
+      "href": "https://github.com/curie-eng/curie/blob/6cdb71043c7608393b77bc7122a2e4531d42400a/ARCHITECTURE.md"
     },
     {
       "id": "kind-ci-v0154",
       "type": "code",
       "title": "Canonical full-kind coverage",
       "path": "release/kind_ci.py",
-      "href": "https://github.com/curie-eng/curie/blob/be8a7952a7e610a8abd60d20377c85f68fdf7d72/release/kind_ci.py"
+      "href": "https://github.com/curie-eng/curie/blob/6cdb71043c7608393b77bc7122a2e4531d42400a/release/kind_ci.py"
     },
     {
       "id": "ci-workflow-v0154",
       "type": "code",
       "title": "Chart legs and duration-balanced factory shards",
       "path": ".github/workflows/ci.yaml",
-      "href": "https://github.com/curie-eng/curie/blob/be8a7952a7e610a8abd60d20377c85f68fdf7d72/.github/workflows/ci.yaml"
+      "href": "https://github.com/curie-eng/curie/blob/6cdb71043c7608393b77bc7122a2e4531d42400a/.github/workflows/ci.yaml"
     }
   ],
   "documentationDrift": [

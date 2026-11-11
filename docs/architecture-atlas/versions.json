@@ -390,9 +390,9 @@
       "id": "v0.15.4",
       "label": "v0.15.4",
       "file": "snapshots/v0.15.4.json",
-      "date": "2026-11-10",
+      "date": "2026-11-11",
       "branch": "main",
-      "commit": "be8a7952a7e610a8abd60d20377c85f68fdf7d72"
+      "commit": "6cdb71043c7608393b77bc7122a2e4531d42400a"
     }
   ]
 }
