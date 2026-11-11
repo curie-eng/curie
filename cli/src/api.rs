@@ -6139,6 +6139,7 @@ fn allowlisted_enrollment_code(body: &str) -> Option<&'static str> {
         "custody_unconfigured" => "custody_unconfigured",
         "custody_unavailable" => "custody_unavailable",
         "enrollment_busy" => "enrollment_busy",
+        "personal_rollout_in_progress" => "personal_rollout_in_progress",
         _ => return None,
     })
 }
@@ -6156,6 +6157,8 @@ const ENROLLMENT_INVALID_FIX: &str = "check that the token file holds only the t
 const ENROLLMENT_UNCONFIGURED_FIX: &str = "ask an operator to set the chart value \
      personalClaude.grantNamespace and upgrade the release";
 const ENROLLMENT_RETRY_FIX: &str = "retry; the previous enrollment is unchanged";
+const ENROLLMENT_ROLLOUT_FIX: &str =
+    "retry after the API rollout completes; the previous enrollment is unchanged";
 
 /// Map one owner enrollment refusal onto the CLI exit class. The message names
 /// the status, an allowlisted code and the fix; it never includes the body.
@@ -6217,6 +6220,13 @@ fn enrollment_refusal(operation: &str, status: reqwest::StatusCode, body: &str) 
             Transient,
             "another change to this enrollment is in progress (enrollment_busy)".to_string(),
             Some(ENROLLMENT_RETRY_FIX),
+        ),
+        (503, Some("personal_rollout_in_progress")) => (
+            Transient,
+            "the platform API is mid-rollout, so it holds enrollment changes \
+             (personal_rollout_in_progress)"
+                .to_string(),
+            Some(ENROLLMENT_ROLLOUT_FIX),
         ),
         (502..=504, _) => (
             Transient,

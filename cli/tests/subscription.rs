@@ -698,7 +698,11 @@ fn unreachable_api_and_custody_unavailable_are_transient() {
     assert_eq!(output.status.code(), Some(3), "{}", text(&output));
     assert_no_credentials(&output);
 
-    for code in ["custody_unavailable", "enrollment_busy"] {
+    for code in [
+        "custody_unavailable",
+        "enrollment_busy",
+        "personal_rollout_in_progress",
+    ] {
         let (output, _server) = refused_by("replace", move || {
             refusal(503, serde_json::json!({"code": code}))
         });

@@ -2520,6 +2520,15 @@ render that sets them equal. While the value is empty the owner API answers 503
 `custody_unconfigured`. Changing the value orphans the custody Secrets in the
 old namespace, so every user must reconnect after a change.
 
+During an API rollout the owner API answers enroll, replace and reconnect with
+503 `personal_rollout_in_progress`, and personal WorkItem admission refuses
+with the same code, until every API pod of the release runs the same pod
+template. An older API
+replica would otherwise settle a fenced personal request the old way and lose
+its transcript. Disconnect is never held. The CLI treats the refusal as
+transient (exit 3); retry once the rollout completes. Single-instance stacks
+outside Kubernetes set `CURIE_PERSONAL_ROLLOUT_HOLD=false`.
+
 ## Talking to your agent
 
 The plugin bundle you just deployed is the agent's backend. There are two
