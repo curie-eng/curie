@@ -806,7 +806,9 @@ class ClusterProof:
         )
         self.registry_volumes = [mount["Name"] for mount in mounts if mount["Type"] == "volume"]
         tag = f"{self.namespace}-runner:{self.candidate[:12]}"
-        published = f"127.0.0.1:{port}/curie-runner-candidate:{self.candidate[:12]}"
+        published = (
+            f"127.0.0.1:{port}/curie-runner-candidate:{self.candidate[:12]}-{self.ownership}"
+        )
         for name in (tag, published):
             require(
                 self.docker("image", "inspect", name, check=False).returncode != 0,
@@ -814,7 +816,10 @@ class ClusterProof:
             )
             self.tags.append(name)
         self.command([self.cli, "build", "--tag", tag], timeout=1200)
-        dockerfile = f"FROM {tag}\nLABEL org.opencontainers.image.revision={self.candidate}\n"
+        dockerfile = (
+            f"FROM {tag}\nLABEL org.opencontainers.image.revision={self.candidate}\n"
+            f"LABEL curie-proof-owner={self.ownership}\n"
+        )
         self.docker(
             "build", "--file", "-", "--tag", published, ".", data=dockerfile.encode(), timeout=300
         )

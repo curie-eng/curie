@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import json
 import os
+import subprocess
 from collections.abc import Iterator
 from dataclasses import replace
 from pathlib import Path
@@ -37,6 +38,77 @@ _GRANT = HeldSecret(
     if os.environ.get("CURIE_PERSONAL_LIVE") == "1"
     else ""
 )
+
+
+def test_rebuilding_candidate_has_distinct_configs_and_digest_pinned_pods() -> None:
+    # An unpaid cluster reproduction observed two manifests sharing a config;
+    # CRI returned the earlier repo digest for both requested digest references.
+    builds: list[bytes] = []
+    published: list[str] = []
+    for owner in ("a" * 24, "b" * 24):
+        proof = object.__new__(ClusterProof)
+        proof.namespace = "test-candidate-image"
+        proof.docker_context = "scratch"
+        proof.cli = "curie"
+        proof.candidate = "c" * 40
+        proof.ownership = owner
+        proof.tags = []
+        proof.evidence = {}
+        digest = "sha256:" + owner[0] * 64
+
+        def command(
+            argv: object, *, candidate: str = proof.candidate, **kwargs: object,
+        ) -> subprocess.CompletedProcess[bytes]:
+            if argv == ["git", "rev-parse", "HEAD"]:
+                output = candidate.encode()
+            elif argv == ["git", "status", "--porcelain", "--untracked-files=all"]:
+                output = b""
+            elif "df -P" in str(argv):
+                output = (
+                    b"Filesystem Blocks Used Available Capacity Mounted\n"
+                    b"/dev/test 100 40 60 40% /\n"
+                )
+            else:
+                output = b"25100"
+            return subprocess.CompletedProcess([], 0, output, b"")
+
+        def docker(
+            *args: str, candidate: str = proof.candidate, manifest: str = digest, **kwargs: object,
+        ) -> subprocess.CompletedProcess[bytes]:
+            output = b""
+            status = 0
+            if args[:2] == ("context", "inspect"):
+                output = b'"ssh://builder.example.com"'
+            elif args[0] == "info":
+                output = b"/data"
+            elif kwargs.get("check") is False:
+                status = 1
+            elif args[-1] == "{{json .Mounts}}":
+                output = b"[]"
+            elif args[-1] == '{{index .Config.Labels "org.opencontainers.image.revision"}}':
+                output = candidate.encode()
+            elif args[-1] == "{{json .RepoDigests}}":
+                output = json.dumps([published[-1].rsplit(":", 1)[0] + "@" + manifest]).encode()
+            elif args[0] == "push":
+                published.append(args[1])
+            elif args[0] == "build":
+                data = kwargs["data"]
+                assert isinstance(data, bytes)
+                builds.append(data)
+            return subprocess.CompletedProcess([], status, output, b"")
+
+        proof.command = command  # type: ignore[method-assign]
+        proof.docker = docker  # type: ignore[method-assign]
+        proof.build_image()
+        labels = dict(line.removeprefix("LABEL ").split("=", 1)
+                      for line in builds[-1].decode().splitlines() if line.startswith("LABEL "))
+        assert labels.get("curie-proof-owner") == owner
+        assert labels["org.opencontainers.image.revision"] == proof.candidate
+        spec = proof.pod_spec()
+        for container in [*spec["containers"], *spec["initContainers"]]:
+            assert container["image"] == "localhost:25100/curie-runner-candidate@" + digest
+    assert builds[0] != builds[1]
+    assert published[0] != published[1]
 
 
 def test_live_failure_diagnostics_preserve_safe_model_and_usage_observations() -> None:
