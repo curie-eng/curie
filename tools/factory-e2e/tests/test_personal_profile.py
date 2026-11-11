@@ -21,6 +21,7 @@ import hashlib
 import http.server
 import json
 import os
+import re
 import signal
 import sqlite3
 import subprocess
@@ -270,6 +271,17 @@ def test_registry_image_reads_the_revision_through_a_buildkit_index() -> None:
     get_children = {("curie-api", digest): body for digest, body in children.items()}
     with _registry({("curie-api", tag): (index, config)}, get_children) as port:
         assert pps.registry_image(pps.loopback_get("127.0.0.1", port), "curie-api", tag) is None
+
+
+def test_docker_listed_tags_keep_tagged_rows_only() -> None:
+    # Recorded `docker image ls --format '{{.Repository}}:{{.Tag}}' <repo>` output
+    # after `curie build` pushed a runner layer, plus an untagged leftover row.
+    listing = (
+        b"localhost:5999/acme-bundle-runner:77d29ee6c43d4e87\n"
+        b"localhost:5999/acme-bundle-runner:<none>\n"
+    )
+    assert pps.docker_listed_tags(listing) == ["localhost:5999/acme-bundle-runner:77d29ee6c43d4e87"]
+    assert pps.docker_listed_tags(b"") == []
 
 
 def test_registry_cleanup_finds_a_push_the_driver_never_read_back() -> None:
@@ -1326,6 +1338,36 @@ def _values() -> dict[str, Any]:
         controller_deploy=False,
         model_addresses=["192.0.2.10", "192.0.2.10", "192.0.2.11"],
     )
+
+
+def test_factory_values_pass_the_api_forge_model() -> None:
+    """The factory lists, keyed as the chart's curie.factory.forgesJson renders them."""
+
+    from curie_api.forges.config import ForgesConfig
+
+    def snake(value: Any) -> Any:
+        if isinstance(value, dict):
+            return {
+                re.sub(r"(?<!^)(?=[A-Z])", "_", key).lower(): snake(v) for key, v in value.items()
+            }
+        if isinstance(value, list):
+            return [snake(item) for item in value]
+        return value
+
+    factory = _values()["factory"]
+    document: dict[str, Any] = {}
+    for key, section in (("codeHosts", "code_hosts"), ("trackers", "trackers")):
+        entries = snake(factory[key])
+        for entry in entries:
+            credential = entry["credential"]
+            for name in ("existing_secret", "existing_secret_key"):
+                credential.pop(name)
+            # The chart mounts the Secret and the API reads it as private_key.
+            credential["private_key"] = "placeholder-key-material"
+        document[section] = entries
+    parsed = ForgesConfig.model_validate(document)
+    [tracker] = parsed.trackers
+    assert tracker.label == tracker.mention == "ppa-unused-0a0b0c0d"
 
 
 def test_deployed_settings_scan_names_service_credentials() -> None:

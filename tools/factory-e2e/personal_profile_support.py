@@ -641,6 +641,16 @@ def verify_candidate_images(
     return verified
 
 
+def docker_listed_tags(stdout: bytes) -> list[str]:
+    """``docker image ls --format '{{.Repository}}:{{.Tag}}'`` lines, untagged rows dropped."""
+
+    return [
+        line
+        for line in stdout.decode(errors="replace").split()
+        if ":" in line and not line.endswith(":<none>")
+    ]
+
+
 def split_image_ref(ref: str) -> tuple[str, str]:
     """``[host:port/]name(:tag|@digest)`` as (registry path, tag or digest)."""
 
@@ -2468,7 +2478,16 @@ def install_values(
             "enabled": True,
             "intake": "poll",
             "codeHosts": [{**github, "credential": dict(credential)}],
-            "trackers": [{**github, "credential": dict(credential), "label": trigger_label}],
+            # Intake stays dormant: the label and the mention are this run's unused
+            # value, and the one admission is the driver's trusted machine admission.
+            "trackers": [
+                {
+                    **github,
+                    "credential": dict(credential),
+                    "label": trigger_label,
+                    "mention": trigger_label,
+                }
+            ],
             "sandboxEgress": {agent: True},
         },
         "priorityClasses": priority_class_values(priority_classes, release),

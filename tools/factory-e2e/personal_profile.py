@@ -855,13 +855,13 @@ class ImageBuilder:
         manifest_path = bundle / ".claude-plugin" / "plugin.json"
         manifest = json.loads(manifest_path.read_text())
         manifest_path.write_text(json.dumps(pps.private_bundle_manifest(manifest), indent=2) + "\n")
-        layer = self.build_layer(bundle, platform, tag, pushed)
+        layer = self.build_layer(bundle, platform, tag, pushed, local_tags)
         if layer.revision != inputs.candidate:
             layer_file = bundle / "runner.Dockerfile"
             layer_file.write_text(
                 layer_file.read_text() + f"\nLABEL {pps.REVISION_LABEL}={inputs.candidate}\n"
             )
-            layer = self.build_layer(bundle, platform, tag, pushed)
+            layer = self.build_layer(bundle, platform, tag, pushed, local_tags)
         if layer.revision != inputs.candidate:
             raise pps.Refusal("candidate_image_mismatch", pps.LAYER_IMAGE)
         self.ledger.record("images", "platform", platform)
@@ -870,7 +870,7 @@ class ImageBuilder:
         return {"images_pushed": len(pushed)}
 
     def build_layer(
-        self, bundle: Path, platform: str, tag: str, pushed: list[Pushed]
+        self, bundle: Path, platform: str, tag: str, pushed: list[Pushed], local_tags: list[str]
     ) -> pps.RegistryImage:
         self.shell.run(
             [
@@ -893,6 +893,24 @@ class ImageBuilder:
             raise pps.Refusal("candidate_image_mismatch", pps.LAYER_IMAGE)
         self.ledger.record("images", "layer_ref", layer_ref)
         repository, reference = pps.split_image_ref(layer_ref)
+        # curie build leaves its own local tag, named from the bundle's source
+        # digest. Every tag in this repository of the driver-owned registry is
+        # this run's, so each is recorded for removal.
+        listed = self.shell.run(
+            [
+                "docker",
+                "image",
+                "ls",
+                "--format",
+                "{{.Repository}}:{{.Tag}}",
+                f"{self.inputs.registry}/{repository}",
+            ],
+            timeout=60,
+        )
+        for listed_tag in pps.docker_listed_tags(listed.stdout):
+            if listed_tag not in local_tags:
+                local_tags.append(listed_tag)
+        self.ledger.record("images", "local_tags", local_tags)
         image = pps.registry_image(self.get, repository, reference)
         if image is None:
             raise pps.Refusal("candidate_image_mismatch", pps.LAYER_IMAGE)
