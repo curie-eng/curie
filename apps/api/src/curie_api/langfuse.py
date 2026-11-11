@@ -9,6 +9,7 @@ prototypes/observability/read_tree.py).
 
 import json
 from datetime import datetime
+from itertools import batched
 from typing import Any
 
 import httpx
@@ -28,18 +29,24 @@ _TRACE_SCAN_LIMIT = 500
 _MAX_PAGE_SIZE = 100
 
 # Langfuse v4 ("langfuse_api_version = v4") has no trace read. A trace is
-# rebuilt from its root observation(s) via Observations API v2, which is
+# rebuilt from its observations via Observations API v2, which is
 # cursor-paginated, newest-first and totally ordered, so no `orderBy` is needed.
 _V2_OBSERVATIONS = "/api/public/v2/observations"
 _V2_METRICS = "/api/public/v2/metrics"
 
 # v2 returns only the `core` and `basic` groups unless asked, so each read names
-# the groups its consumers use. A trace row needs the root's io, metadata, tags
-# (`trace_context`) and latency (`metrics`); an observation row also needs the
-# model and usage groups the tree and eval-case promotion read.
-_V2_TRACE_FIELDS = "core,basic,time,io,metadata,metrics,trace_context"
+# the groups its consumers use. Trace summaries need tags (`trace_context`)
+# and latency (`metrics`). Trees and eval-case promotion need model and usage.
 _V2_OBSERVATION_FIELDS = "core,basic,time,io,metadata,model,usage"
+_V2_TRACE_PARAMS = {
+    "fields": "core,basic,time,io,metadata,metrics,trace_context",
+    # Free-form strings the eval matrix reads, including its case/version keys.
+    "expandMetadata": "case_id,version,model,detail,stream_id",
+}
+# Keep batches of trace IDs comfortably within HTTP request URL limits.
+_V2_TRACE_BATCH_SIZE = 25
 
+_V2_PAGE_BOUND = 50
 # Pages read for one trace's roots; a trace has few logical roots.
 _V2_TRACE_PAGE_BOUND = 10
 
@@ -73,8 +80,8 @@ def _normalize_observation(obs: dict[str, Any]) -> dict[str, Any]:
     return {**obs, "input": _decode_io(obs.get("input")), "output": _decode_io(obs.get("output"))}
 
 
-def trace_from_root_observation(obs: dict[str, Any]) -> dict[str, Any]:
-    """Shape a root observation as the trace dict the v3 trace API returned.
+def _trace_from_observation(obs: dict[str, Any]) -> dict[str, Any]:
+    """Shape the representative observation as a v3 trace dict.
 
     Callers keep reading `id`, `name`, `timestamp`, `input`, `output`,
     `metadata`, `tags` and `latency` (seconds, as before) unchanged.
@@ -101,24 +108,21 @@ def trace_from_root_observation(obs: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def _one_trace_per_id(roots: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Collapse root observations to one trace dict per trace id.
+def _trace_observation_order(obs: dict[str, Any]) -> tuple[bool, str]:
+    return obs.get("isRootObservation") is not True, str(obs.get("startTime") or "")
 
-    A trace can have several logical roots (e.g. a correlated trace that starts
-    at dispatcher ingress). v3 returned one row per trace, so keep the root
-    with the earliest start among those read, preserving newest-first order of
-    the traces themselves.
-    """
 
+def _traces_by_id(observations: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
+    """Prefer each trace's earliest logical root, or its earliest exported row."""
     chosen: dict[str, dict[str, Any]] = {}
-    for obs in roots:
+    for obs in observations:
         trace_id = obs.get("traceId")
         if not isinstance(trace_id, str):
             continue
         held = chosen.get(trace_id)
-        if held is None or str(obs.get("startTime") or "") < str(held.get("startTime") or ""):
+        if held is None or _trace_observation_order(obs) < _trace_observation_order(held):
             chosen[trace_id] = obs
-    return [trace_from_root_observation(obs) for obs in chosen.values()]
+    return {trace_id: _trace_from_observation(obs) for trace_id, obs in chosen.items()}
 
 
 def to_v2_metrics_query(query: dict[str, Any]) -> dict[str, Any]:
@@ -351,63 +355,83 @@ class LangfuseClient:
     async def _get_cursor_all(
         self,
         params: dict[str, Any],
-        max_pages: int = 50,
-        max_traces: int | None = None,
+        max_pages: int = _V2_PAGE_BOUND,
         require_complete: bool = False,
+        max_traces: int | None = None,
     ) -> list[dict[str, Any]]:
-        """Fetch pages of Observations API v2 (data[] + meta.cursor).
-
-        Page size is the same 100 cap as the v3 list reads. `max_traces`, when
-        set, stops once that many distinct trace ids are held, which is how a
-        root-observation read honors a trace `limit`.
-        """
-
+        """Fetch bounded pages, optionally stopping after discovery of enough trace IDs."""
         items: list[dict[str, Any]] = []
+        trace_ids: set[str] = set()
         cursor: str | None = None
         for _ in range(max_pages):
             page_params = {**params, "limit": _MAX_PAGE_SIZE}
             if cursor:
                 page_params["cursor"] = cursor
             body = await self._get(_V2_OBSERVATIONS, page_params)
-            items.extend(body.get("data", []))
+            page = body.get("data", [])
+            items.extend(page)
             cursor = (body.get("meta") or {}).get("cursor")
             if not cursor:
                 return items
-            if max_traces is not None and len({o.get("traceId") for o in items}) >= max_traces:
-                return items
+            if max_traces is not None:
+                trace_ids.update(
+                    row["traceId"] for row in page if isinstance(row.get("traceId"), str)
+                )
+                if len(trace_ids) >= max_traces:
+                    return items
         if require_complete:
             raise LangfuseReadLimitExceeded("complete trace read exceeds page bound")
         return items
 
-    async def _list_root_traces_v4(
-        self,
-        conditions: list[dict[str, Any]],
-        limit: int | None,
-        *,
-        require_complete: bool = False,
+    async def _list_traces_v4(
+        self, limit: int, name_contains: str | None
     ) -> list[dict[str, Any]]:
-        params: dict[str, Any] = {
-            "fields": _V2_TRACE_FIELDS,
-            "filter": json.dumps([_ROOT_ONLY, *conditions]),
-        }
+        if limit <= 0:
+            return []
+        params = {"fields": "core"}
+        if name_contains is not None:
+            params["filter"] = json.dumps(
+                [_v2_condition("string", "traceName", "contains", name_contains)]
+            )
+        # The first match per trace determines recent activity rank. Fetch the
+        # summary separately because an earlier root can be on a later page.
+        activity = await self._get_cursor_all(params, max_traces=limit)
+        trace_ids = list(
+            dict.fromkeys(row["traceId"] for row in activity if isinstance(row.get("traceId"), str))
+        )[:limit]
+        traces: dict[str, dict[str, Any]] = {}
+        for batch in batched(trace_ids, _V2_TRACE_BATCH_SIZE, strict=False):
+            traces.update(await self._read_v4_trace_summaries(batch))
+        return [traces[trace_id] for trace_id in trace_ids if trace_id in traces]
+
+    async def _read_v4_trace_summaries(
+        self, trace_ids: tuple[str, ...]
+    ) -> dict[str, dict[str, Any]]:
+        def trace_filter(ids: tuple[str, ...]) -> dict[str, str]:
+            if len(ids) == 1:
+                return {"traceId": ids[0]}
+            condition = _v2_condition("stringOptions", "traceId", "any of", ids)
+            return {"filter": json.dumps([condition])}
+
         roots = await self._get_cursor_all(
-            params, max_traces=limit, require_complete=require_complete
+            {**_V2_TRACE_PARAMS, **trace_filter(trace_ids), "isRootObservation": "true"},
+            max_pages=_V2_TRACE_PAGE_BOUND if len(trace_ids) == 1 else _V2_PAGE_BOUND,
+            require_complete=True,
         )
-        traces = _one_trace_per_id(roots)
-        return traces if limit is None else traces[:limit]
+        traces = _traces_by_id(roots)
+        rootless_ids = tuple(trace_id for trace_id in trace_ids if trace_id not in traces)
+        if rootless_ids:
+            rows = await self._get_cursor_all(
+                {**_V2_TRACE_PARAMS, **trace_filter(rootless_ids)}, require_complete=True
+            )
+            traces.update(_traces_by_id(rows))
+        return traces
 
     async def list_traces(
         self, limit: int, name_contains: str | None = None
     ) -> list[dict[str, Any]]:
         if self._v4:
-            # Observations API v2 filters on the denormalised trace name
-            # server-side, so no bounded client-side scan is needed.
-            conditions = (
-                [_v2_condition("string", "traceName", "contains", name_contains)]
-                if name_contains is not None
-                else []
-            )
-            return await self._list_root_traces_v4(conditions, limit)
+            return await self._list_traces_v4(limit, name_contains)
         if name_contains is None:
             return await self._get_all("/api/public/traces", {}, max_items=limit)
         # Filter to one agent's traces. Langfuse's list API has no substring
@@ -419,19 +443,10 @@ class LangfuseClient:
 
     async def get_trace(self, trace_id: str) -> dict[str, Any]:
         if self._v4:
-            roots = await self._get_cursor_all(
-                {
-                    "traceId": trace_id,
-                    "isRootObservation": "true",
-                    "fields": _V2_TRACE_FIELDS,
-                },
-                max_pages=_V2_TRACE_PAGE_BOUND,
-                require_complete=True,
-            )
-            traces = _one_trace_per_id(roots)
-            if not traces:
+            traces = await self._read_v4_trace_summaries((trace_id,))
+            if trace_id not in traces:
                 raise LangfuseTraceNotFound(trace_id)
-            return traces[0]
+            return traces[trace_id]
         return await self._get(f"/api/public/traces/{trace_id}", {})
 
     async def get_observations(self, trace_id: str) -> list[dict[str, Any]]:
@@ -467,8 +482,8 @@ class LangfuseClient:
 
         `fields` and `order_by` are Traces API (v3) parameters. Under v4 they
         are ignored: the trace fields come from the v2 groups above, and the v2
-        order (start time, trace id, span id) is already total, so cursor
-        pages cannot drop a row when start times tie.
+        cursor order keeps observations with tied start times across pages.
+        Trace rows are ordered by the selected observation's start time.
         """
 
         if self._v4:
@@ -482,8 +497,14 @@ class LangfuseClient:
                         from_timestamp.isoformat(timespec="milliseconds"),
                     )
                 )
-            return await self._list_root_traces_v4(
-                conditions, None, require_complete=require_complete
+            observations = await self._get_cursor_all(
+                {**_V2_TRACE_PARAMS, "filter": json.dumps(conditions)},
+                require_complete=require_complete,
+            )
+            return sorted(
+                _traces_by_id(observations).values(),
+                key=lambda trace: str(trace.get("timestamp") or ""),
+                reverse=True,
             )
 
         params: dict[str, Any] = {"tags": tags}

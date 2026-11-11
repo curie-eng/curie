@@ -64,7 +64,10 @@ async def list_traces(
     # With agent_id, filter to that agent's runs by the trace-name token
     # (agent-<id>); without it, list all recent traces.
     name_contains = agent_trace_filter(agent_id) if agent_id else None
-    return await lf.list_traces(limit, name_contains)
+    try:
+        return await lf.list_traces(limit, name_contains)
+    except LangfuseReadLimitExceeded as exc:
+        raise HTTPException(status.HTTP_502_BAD_GATEWAY, "trace exceeds read limit") from exc
 
 
 @router.get("/traces/{trace_id}", response_model=TraceTree)

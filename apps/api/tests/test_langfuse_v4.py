@@ -72,6 +72,21 @@ class _V2Upstream:
         limit = int(params.get("limit", "50"))
         start = int(params.get("cursor", "0"))
         page = rows[start : start + limit]
+        # The Observations API caps string metadata values unless expanded.
+        # https://langfuse.com/docs/api-and-data-platform/features/public-api
+        expanded = set(params.get("expandMetadata", "").split(","))
+        page = [
+            {
+                **row,
+                "metadata": {
+                    key: value[:200] if isinstance(value, str) and key not in expanded else value
+                    for key, value in row["metadata"].items()
+                },
+            }
+            if isinstance(row.get("metadata"), dict)
+            else row
+            for row in page
+        ]
         meta: dict[str, Any] = {}
         if start + limit < len(rows):
             meta["cursor"] = str(start + limit)
@@ -82,6 +97,10 @@ def _matches(obs: dict[str, Any], conditions: list[dict[str, Any]]) -> bool:
     for cond in conditions:
         column, operator, value = cond["column"], cond["operator"], cond["value"]
         if column == "isRootObservation" and obs.get("isRootObservation") != value:
+            return False
+        # Observations API v2 supports stringOptions on string columns, including traceId.
+        # https://cloud.langfuse.com/generated/api/openapi.yml
+        if column == "traceId" and operator == "any of" and obs.get("traceId") not in value:
             return False
         name = obs.get("traceName") or ""
         if column == "traceName" and operator == "contains" and value not in name:
@@ -141,10 +160,7 @@ def test_list_traces_reads_root_observations_as_trace_dicts() -> None:
 
     traces = asyncio.run(_client(upstream).list_traces(limit=20))
 
-    assert [request.url.path for request in upstream.requests] == [_OBS]
-    assert _filters(upstream.requests[0]) == [
-        {"type": "boolean", "column": "isRootObservation", "operator": "=", "value": True}
-    ]
+    assert [request.url.path for request in upstream.requests] == [_OBS, _OBS]
     assert len(traces) == 1
     trace = traces[0]
     assert trace["id"] == "t1"
@@ -176,7 +192,7 @@ def test_list_traces_filters_by_agent_token_on_the_server() -> None:
     } in _filters(upstream.requests[0])
 
 
-def test_list_traces_pages_by_cursor_never_over_100_and_stops_at_limit() -> None:
+def test_list_traces_pages_by_cursor_and_fetches_only_selected_summaries() -> None:
     upstream = _V2Upstream(
         [_root(f"t{i:04d}", f"2026-11-17T10:{i // 60:02d}:{i % 60:02d}.000Z") for i in range(450)]
     )
@@ -186,10 +202,12 @@ def test_list_traces_pages_by_cursor_never_over_100_and_stops_at_limit() -> None
     assert len(traces) == 250
     limits = [int(r.url.params["limit"]) for r in upstream.requests]
     assert max(limits) == 100
-    # 250 distinct traces need three 100-row pages, not the whole 450.
-    assert len(upstream.requests) == 3
-    # Newest first: the 250 newest start times.
-    assert traces[0]["id"] == "t0449"
+    discovery = [request for request in upstream.requests if request.url.params["fields"] == "core"]
+    assert len(discovery) == 3
+    summaries = [request for request in upstream.requests if request not in discovery]
+    selected = [trace_id for request in summaries for trace_id in _filters(request)[0]["value"]]
+    assert selected == [f"t{i:04d}" for i in range(449, 199, -1)]
+    assert [trace["id"] for trace in traces] == selected
 
 
 def test_trace_with_several_roots_is_one_row_with_the_earliest_root() -> None:
@@ -204,6 +222,33 @@ def test_trace_with_several_roots_is_one_row_with_the_earliest_root() -> None:
 
     assert len(traces) == 1
     assert traces[0]["output"] == "first"
+
+
+def test_trace_list_ranks_by_activity_and_reads_earliest_root_across_pages() -> None:
+    upstream = _V2Upstream(
+        [
+            _root("multi", "2026-11-17T10:00:02.000Z", output="later root"),
+            _root("single", "2026-11-17T10:00:01.000Z", output="single root"),
+            _root("multi", "2026-11-17T09:00:00.000Z", output="earliest root"),
+            *[
+                _root(
+                    "multi",
+                    f"2026-11-17T10:00:02.{i:03d}Z",
+                )
+                for i in range(1, 101)
+            ],
+        ]
+    )
+    client = _client(upstream)
+
+    first = asyncio.run(client.list_traces(limit=1))
+    assert [(trace["id"], trace["output"]) for trace in first] == [("multi", "earliest root")]
+    assert first[0]["timestamp"] == "2026-11-17T09:00:00.000Z"
+    traces = asyncio.run(client.list_traces(limit=2))
+    assert [(trace["id"], trace["output"]) for trace in traces] == [
+        ("multi", "earliest root"),
+        ("single", "single root"),
+    ]
 
 
 def test_get_trace_returns_the_trace_dict_or_raises_not_found() -> None:
@@ -298,6 +343,25 @@ def test_list_traces_by_tags_reads_every_page_with_server_side_tags() -> None:
     assert matrix.versions == ["v1"]
     assert len(matrix.cases) == 230
     assert all(cell.status == "pass" for row in matrix.rows for cell in row.cells)
+
+
+def test_eval_matrix_preserves_long_detail() -> None:
+    detail = "Scorer explanation. " * 15
+    upstream = _V2Upstream(
+        [
+            _root(
+                "eval",
+                "2026-11-17T10:00:00.000Z",
+                tags=["eval", "suite:s1", "version:v1"],
+                metadata={"case_id": "case-1", "outcome": "fail", "detail": detail},
+            )
+        ]
+    )
+
+    traces = asyncio.run(_client(upstream).list_traces_by_tags(["eval", "suite:s1"]))
+    matrix = build_matrix(traces, "s1", limit_versions=5)
+
+    assert matrix.rows[0].cells[0].detail == detail
 
 
 def test_list_traces_by_tags_applies_from_timestamp() -> None:
@@ -466,24 +530,37 @@ def test_runs_router_maps_a_missing_v4_trace_to_not_ready() -> None:
     assert response.json()["detail"] == "trace has no observations yet"
 
 
-def test_runs_router_maps_root_not_yet_readable_to_not_ready() -> None:
-    # Observations landed but no root observation is readable yet: the v4
-    # equivalent of "observations exist, trace row 404s".
-    orphan = {
-        "id": "kid",
-        "traceId": "abc",
-        "type": "SPAN",
-        "name": "x",
-        "startTime": "2026-11-17T10:00:01.000Z",
-        "parentObservationId": "root",
-        "isRootObservation": False,
-    }
-    with _runs_client(_V2Upstream([orphan])) as client:
+def test_runs_router_lists_and_reads_a_rootless_trace() -> None:
+    # A physical parent may live in another project or service.
+    # https://langfuse.com/docs/api-and-data-platform/features/public-api
+    earliest = _root(
+        "abc",
+        "2026-11-17T10:00:01.000Z",
+        id="kid",
+        parentObservationId="external-root",
+        isRootObservation=False,
+        output="first exported observation",
+    )
+    later = _root(
+        "abc",
+        "2026-11-17T10:00:02.000Z",
+        id="later",
+        parentObservationId="kid",
+        isRootObservation=False,
+        output="later observation",
+    )
+    rooted = _root("other", "2026-11-17T10:00:00.000Z")
+    with _runs_client(_V2Upstream([later, earliest, rooted])) as client:
+        listing = client.get("/langfuse/traces", headers=_headers())
         response = client.get("/langfuse/traces/abc", headers=_headers())
 
-    assert response.status_code == 404
-    assert response.json()["detail"] == "trace has no observations yet"
-
+    assert listing.status_code == response.status_code == 200
+    trace = response.json()["trace"]
+    assert [row["id"] for row in listing.json()] == ["abc", "other"]
+    assert listing.json()[0] == trace
+    assert trace["id"] == "abc"
+    assert trace["output"] == "first exported observation"
+    assert [node["id"] for node in response.json()["tree"]] == ["kid"]
 
 
 class _UnboundedRoots(_V2Upstream):
@@ -518,11 +595,13 @@ class _UnboundedTraceRoots(_UnboundedRoots):
         return super()._observations(params)
 
 
-@pytest.mark.parametrize("method,suffix", [("get", ""), ("post", "/eval-case")])
+@pytest.mark.parametrize(
+    "method,suffix", [("get", ""), ("get", "/abc"), ("post", "/abc/eval-case")]
+)
 def test_runs_router_reports_incomplete_roots_as_upstream_failure(
     method: str, suffix: str
 ) -> None:
     with _runs_client(_UnboundedTraceRoots([])) as client:
-        response = getattr(client, method)(f"/langfuse/traces/abc{suffix}", headers=_headers())
+        response = getattr(client, method)(f"/langfuse/traces{suffix}", headers=_headers())
     assert response.status_code == 502
     assert response.json()["detail"] == "trace exceeds read limit"

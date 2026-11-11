@@ -4068,10 +4068,16 @@ migration before running it against a v4 backend in `events_only` mode.
 
 In v4, run counts and latency aggregates use logical root observations rather
 than trace rows. If a trace contains several application roots, each root
-contributes to these aggregates. Trace listings still collapse those roots to
-one row. Do not compare the v3 and v4 aggregate counts as if their units were
-identical. An exact trace read that exceeds the pagination bound returns an
-upstream error instead of a partial tree or eval case.
+contributes to these aggregates. Do not compare the v3 and v4 aggregate counts
+as if their units were identical.
+
+The Runs list scans up to 5,000 matching observations to find the most
+recently active trace IDs. Each listed trace and each exact read use the
+earliest logical root for the summary, or the earliest exported observation
+if the project has no logical root. The summary timestamp is that observation's
+start time. The eval matrix groups matching tagged observations by trace ID and
+uses the same root preference within its scan. A read that requires complete
+results returns an upstream error when it exceeds the pagination bound.
 
 ## Known gotchas
 
