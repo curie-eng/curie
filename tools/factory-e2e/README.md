@@ -65,6 +65,7 @@ CEILING="sessions=8,turns=96,session-turns=32,output-tokens=32768,session-output
 $P images $COMMON
 $P preflight $COMMON --approve-live "$CEILING"
 $P forge-probe $COMMON
+$P grant-probe --grant-file $GRANT_FILE --grant-expires-at 2026-11-11T09:30:00Z
 $P run $COMMON --approve-live "$CEILING" \
   --slack-bot-token-file $SLACK_BOT_TOKEN_FILE --resolution-channel $RESOLUTION_CHANNEL
 $P judge --criterion all --candidate $SHA --state-dir $STATE_DIR --run-id acme-run-1
@@ -87,7 +88,13 @@ $P judge --criterion all --candidate $SHA --state-dir $STATE_DIR --run-id acme-r
    requests and issues (write) and checks and statuses (read), creates a
    run-owned branch with an empty commit, opens and closes a pull request,
    deletes the branch, and proves both are gone. It touches no other ref.
-4. `run` performs exactly one live attempt. A factory publication's card goes
+4. `grant-probe` sends one turn to `claude-haiku-5-5` with the grant as the
+   only credential and prints its outcome, cost and error class. It writes no
+   ledger. The probe CLI is `claude` from `PATH`, or `--grant-probe-cli`.
+   Its child gets a fresh empty temporary `HOME`, `CLAUDE_CONFIG_DIR` and
+   working directory and inherits nothing else, so a login on the host cannot
+   answer for the grant.
+5. `run` performs exactly one live attempt. A factory publication's card goes
    to the `publication` route's fixed Slack channel (ADR 0177), and the outbox
    fails the publication after five failed deliveries. The install therefore
    deploys the channel gateway, with the bot token from
@@ -98,8 +105,11 @@ $P judge --criterion all --candidate $SHA --state-dir $STATE_DIR --run-id acme-r
    the approved total output tokens; it can only lower the ceiling, is recorded
    before the first reservation, and bounds reservations, the overrun check and
    `judge --criterion budget`. A second `run` with the same run ID refuses with
-   `paid_retry_refused`; there is no retry flag.
-5. `judge --criterion {roles,approval,pod-restart,publication,budget,cleanup,all}`
+   `paid_retry_refused`; there is no retry flag. Immediately before the first
+   reservation, `run` makes the same probe. A failed probe fails the run
+   before any attempt is reserved. Its cost is recorded under `grant_probe` in
+   the ledger, apart from the attempt ceiling.
+6. `judge --criterion {roles,approval,pod-restart,publication,budget,cleanup,all}`
    reads the ledger only and prints
    `{"criterion", "verdict", "checks", "counts"}` with booleans and counts and
    no identifiers. A missing observation fails its check.
@@ -306,6 +316,15 @@ whole stdout and stderr, held secrets redacted, in the run's command log under
 the state directory (a mint withholds stdout when it cannot parse the token),
 and each `--resolve` records its HTTP status, the API's refusal detail and the
 denying authorizer in the ledger. `judge` never prints them.
+
+When a session fails, the evidence names why without keeping its text. A
+synthetic or API-error transcript record is kept as an error class: the CLI's
+category, the HTTP status, the provider error type and a first line with
+credential-shaped values redacted. The ledger scrubs it again and the leak
+scan reads it. A failed attempt's message names the class. The harvester also
+records whether the runner container and each native CLI process had a
+non-empty `CLAUDE_CODE_OAUTH_TOKEN`, as a state and a length; the value never
+leaves the pod.
 
 Each resource's cleanup is registered before the resource is created and runs
 in reverse order on success, failure, rejection and on SIGINT or SIGTERM.

@@ -117,6 +117,7 @@ MANAGED_BY_LABEL = "app.kubernetes.io/managed-by"
 MANAGED_BY_VALUE = "curie-personal-profile"
 RUN_ANNOTATION = "curie.dev/personal-profile-run"
 REDACTED = "<redacted>"
+PERSONAL_GRANT_ENV = "CLAUDE_CODE_OAUTH_TOKEN"
 
 # --------------------------------------------------------------------------
 # Refusals
@@ -567,6 +568,123 @@ def check_grant_file(path: Path | None) -> None:
 
     buffer = bytearray(_open_grant(path))
     buffer[:] = b"\0" * len(buffer)
+
+
+# -- pre-start grant probe ---------------------------------------------------
+#
+# One turn on the cheapest model, run with an empty temporary HOME and the
+# grant as the only credential, so a host login cannot answer for it.
+
+GRANT_PROBE_MODEL = "claude-haiku-5-5"
+GRANT_PROBE_PROMPT = b"Reply with the single word ok.\n"
+GRANT_PROBE_MAX_USD = "0.05"
+GRANT_PROBE_SECONDS = 120.0
+
+
+def grant_probe_argv(cli: str) -> list[str]:
+    return [
+        cli,
+        "--print",
+        "--model",
+        GRANT_PROBE_MODEL,
+        "--output-format",
+        "json",
+        "--max-turns",
+        "1",
+        "--tools",
+        "",
+        "--strict-mcp-config",
+        "--no-session-persistence",
+        "--max-budget-usd",
+        GRANT_PROBE_MAX_USD,
+    ]
+
+
+def grant_probe_env(*, home: str, cli_dir: str, grant: str) -> dict[str, str]:
+    """The probe's whole environment: an empty HOME and the grant, nothing inherited."""
+
+    return {
+        "HOME": home,
+        "CLAUDE_CONFIG_DIR": f"{home}/.claude",
+        "XDG_CONFIG_HOME": f"{home}/.config",
+        "XDG_CACHE_HOME": f"{home}/.cache",
+        "XDG_DATA_HOME": f"{home}/.local/share",
+        "XDG_STATE_HOME": f"{home}/.local/state",
+        "TMPDIR": home,
+        "PATH": f"{cli_dir}:/usr/local/bin:/usr/bin:/bin",
+        "LANG": "C.UTF-8",
+        "DISABLE_AUTOUPDATER": "1",
+        "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1",
+        PERSONAL_GRANT_ENV: grant,
+    }
+
+
+def grant_probe_result(returncode: int, stdout: bytes, stderr: bytes = b"") -> dict[str, Any]:
+    """The probe's sanitized outcome: ok, cost, tokens, models and an error class. Pure.
+
+    The CLI's ``--output-format json`` result names a failure by
+    ``terminal_reason`` (``api_error``) and ``api_error_status``, and keeps
+    ``subtype: success`` even then. A startup error writes no JSON; its first
+    stderr line is the text.
+    """
+
+    try:
+        value = json.loads(stdout)
+    except ValueError:
+        value = None
+    body = value if isinstance(value, dict) else {}
+    text = str(body.get("result") or "") if body else (stderr or stdout).decode(errors="replace")
+    cost = body.get("total_cost_usd")
+    raw_usage = body.get("usage")
+    usage: Mapping[str, Any] = raw_usage if isinstance(raw_usage, dict) else {}
+    tokens = usage.get("output_tokens")
+    raw_models = body.get("modelUsage")
+    models: Mapping[str, Any] = raw_models if isinstance(raw_models, dict) else {}
+    ok = returncode == 0 and body.get("is_error") is False and body.get("subtype") == "success"
+    category = next(
+        (
+            item
+            for item in (body.get("terminal_reason"), body.get("subtype"))
+            if isinstance(item, str)
+            and item not in {"success", "completed"}
+            and _ERROR_CATEGORY.fullmatch(item)
+        ),
+        None if body else "no_result",
+    )
+    status = _status(body.get("api_error_status"))
+    if status is None and (match := _API_STATUS.search(text)):
+        status = int(match.group(1))
+    provider = _PROVIDER_ERROR.search(text)
+    return {
+        "ok": ok,
+        "exit": returncode,
+        "model": GRANT_PROBE_MODEL,
+        "models": sorted(str(name) for name in models),
+        "cost_usd": float(cost) if isinstance(cost, (int, float)) and cost >= 0 else None,
+        "output_tokens": tokens if type(tokens) is int and tokens >= 0 else None,
+        "error": None
+        if ok
+        else {
+            "cli_error": category,
+            "http_status": status,
+            "provider_error_type": provider.group(1) if provider else None,
+            "first_line": redact_secret_shapes(text),
+        },
+    }
+
+
+def error_summary(error: Mapping[str, Any]) -> str:
+    """An error class as one line for an operator message: no free text from the provider."""
+
+    return " ".join(
+        str(error[key])
+        for key in ("cli_error", "http_status", "provider_error_type")
+        if error.get(key) is not None
+    )
+
+
+def probe_summary(outcome: Mapping[str, Any]) -> str:
+    return error_summary(outcome.get("error") or {}) or f"exit {outcome.get('exit')}"
 
 
 def load_grant(path: Path | None) -> HeldSecret:
@@ -1201,6 +1319,15 @@ class Ledger:
         if row is None:
             self.record("budget", "output_token_ceiling", ceiling)
 
+    def recorded_criteria(self) -> list[str]:
+        """Every section this run has recorded, so a leak scan cannot miss a new one."""
+
+        rows = self.db.execute(
+            "SELECT DISTINCT criterion FROM observations WHERE run_id=? ORDER BY criterion",
+            (self.run_id,),
+        ).fetchall()
+        return [str(row[0]) for row in rows]
+
     def observations(self, criterion: str) -> dict[str, Any]:
         rows = self.db.execute(
             "SELECT key, value_json FROM observations WHERE run_id=? AND criterion=?",
@@ -1270,6 +1397,7 @@ class SessionFacts:
     aci_tool_calls: int
     usage_known: bool
     message_ids: frozenset[str] = frozenset()
+    errors: tuple[dict[str, Any], ...] = ()
 
     def usage(self) -> SessionUsage | None:
         if not self.usage_known:
@@ -1361,6 +1489,58 @@ def _union_within(intervals: Iterable[tuple[float, float]], low: float, high: fl
     return total
 
 
+MAX_ERROR_CLASSES = 5
+ERROR_LINE_LIMIT = 200
+_ERROR_CATEGORY = re.compile(r"[a-z][a-z0-9_]{0,40}")
+_API_STATUS = re.compile(r"\bAPI Error: (\d{3})\b")
+_PROVIDER_ERROR = re.compile(r'"type"\s*:\s*"([a-z][a-z0-9_]{0,40}_error)"')
+# Credential-shaped values: known token prefixes, a bearer value, and any long
+# unbroken run of token alphabet. Held secrets are scrubbed separately.
+_SECRET_SHAPE = re.compile(
+    r"(?:sk-ant-|xox[a-z]-|gh[opsur]_|github_pat_)[A-Za-z0-9_\-]+"
+    r"|(?i:bearer)\s+\S+"
+    r"|[A-Za-z0-9_\-+/=.]{24,}"
+)
+
+
+def redact_secret_shapes(text: str, *, limit: int = ERROR_LINE_LIMIT) -> str:
+    """One printable line with every credential-shaped value replaced. Pure."""
+
+    lines = text.strip().splitlines()
+    line = "".join(ch if ch.isprintable() else " " for ch in (lines[0] if lines else ""))
+    return _SECRET_SHAPE.sub(REDACTED, line)[:limit]
+
+
+def _status(value: Any) -> int | None:
+    return value if type(value) is int and 100 <= value <= 599 else None
+
+
+def error_class(record: Mapping[str, Any]) -> dict[str, Any]:
+    """The sanitized class of one synthetic or API-error transcript record. Pure.
+
+    The CLI writes ``error`` (its category), ``apiErrorStatus`` and an
+    ``API Error: <status> <body>`` text line. Only the category, the status,
+    the provider error type and a redacted first line are kept.
+    """
+
+    text = " ".join(
+        str(item.get("text") or "") for item in _content(record) if item.get("type") == "text"
+    )
+    category = record.get("error")
+    status = _status(record.get("apiErrorStatus"))
+    if status is None and (match := _API_STATUS.search(text)):
+        status = int(match.group(1))
+    provider = _PROVIDER_ERROR.search(text)
+    return {
+        "cli_error": (
+            category if isinstance(category, str) and _ERROR_CATEGORY.fullmatch(category) else None
+        ),
+        "http_status": status,
+        "provider_error_type": provider.group(1) if provider else None,
+        "first_line": redact_secret_shapes(text),
+    }
+
+
 def _session_facts(
     path: str, role: str, parent: str, records: Sequence[Mapping[str, Any]]
 ) -> SessionFacts:
@@ -1368,6 +1548,7 @@ def _session_facts(
     models: set[str] = set()
     synthetic = 0
     aci = 0
+    errors: list[dict[str, Any]] = []
     stamps: list[float] = []
     for record in records:
         stamp = _timestamp(record.get("timestamp"))
@@ -1378,6 +1559,10 @@ def _session_facts(
         message = record.get("message") if isinstance(record.get("message"), dict) else {}
         assert isinstance(message, dict)
         model = message.get("model")
+        if (model == SYNTHETIC_MODEL or record.get("isApiErrorMessage") is True) and len(
+            errors
+        ) < MAX_ERROR_CLASSES:
+            errors.append(error_class(record))
         if model == SYNTHETIC_MODEL:
             synthetic += 1
             continue
@@ -1417,6 +1602,7 @@ def _session_facts(
         # A session with no assistant usage at all (only user records) is not known.
         usage_known=bool(by_id) and all(value is not None for value in by_id.values()),
         message_ids=frozenset(key for key in by_id if not key.startswith("<no id")),
+        errors=tuple(errors),
     )
 
 
@@ -1566,6 +1752,7 @@ def session_summary(session: SessionFacts) -> dict[str, Any]:
         "synthetic": session.synthetic,
         "elapsed": round(session.elapsed, 3),
         "usage_known": session.usage_known,
+        "error_classes": [dict(item) for item in session.errors],
     }
 
 
@@ -1655,9 +1842,12 @@ def settle_attempt(
 
 # Run as ``python3 -c HARVEST_PROGRAM <config json>`` inside the runner
 # container. It reads only transcript files, the review gate state files, the
-# workspace through git, and /proc/<pid>/cmdline and /proc/<pid>/stat. It never
-# reads environment variables, /proc/*/environ or any credential file, and the
-# git children get a fresh minimal environment.
+# workspace through git, and /proc/<pid>/cmdline and /proc/<pid>/stat. For the
+# personal credential only, it reads the presence and length of one variable in
+# its own environment (the container's) and in each CLI process's
+# /proc/<pid>/environ; the value never leaves the program. It reads no other
+# variable and no credential file, and the git children get a fresh minimal
+# environment.
 HARVEST_PROGRAM = r"""
 import base64, glob, hashlib, json, os, subprocess, sys, time
 cfg = json.loads(sys.argv[1])
@@ -1771,6 +1961,28 @@ def workspace():
             hashes[path] = None
     return {"kind": "workspace", "ok": True, "head": head.decode().strip(),
             "status": sorted(entries), "hashes": hashes, "nonce_paths": sorted(nonce_paths)}
+CREDENTIAL = cfg["credential_name"].encode() + b"="
+def presence(length):
+    return {"credential": "present" if length else "empty", "credential_length": length}
+def container_credential():
+    value = os.environb.get(CREDENTIAL[:-1])
+    if value is None:
+        return {"kind": "container_credential", "credential": "absent", "credential_length": 0}
+    record = dict(presence(len(value)), kind="container_credential")
+    del value
+    return record
+def process_credential(pid_dir):
+    try:
+        with open(os.path.join(pid_dir, "environ"), "rb") as handle:
+            entries = handle.read().split(b"\0")
+    except OSError:
+        return {"credential": "unreadable", "credential_length": 0}
+    found = {"credential": "absent", "credential_length": 0}
+    for entry in entries:
+        if entry.startswith(CREDENTIAL):
+            found = presence(len(entry) - len(CREDENTIAL))
+    del entries
+    return found
 def is_claude(argv):
     for arg in argv[:2]:
         text = arg.decode("utf-8", "replace")
@@ -1800,11 +2012,14 @@ def processes():
                 continue
             with open(os.path.join(proc, pid, "stat"), "rb") as handle:
                 fields = handle.read().rsplit(b")", 1)[1].split()
-            found.append({"pid": int(pid), "start": round(btime + int(fields[19]) / ticks, 2)})
+            item = {"pid": int(pid), "start": round(btime + int(fields[19]) / ticks, 2)}
+            item.update(process_credential(os.path.join(proc, pid)))
+            found.append(item)
         except (OSError, IndexError, ValueError):
             continue
     return {"kind": "process", "count": len(found), "processes": found}
 deadline = time.monotonic() + float(cfg["max_seconds"])
+emit(container_credential())
 while True:
     scan_files()
     emit({"kind": "sync", "sizes": dict(offsets), "at": round(time.time(), 3)})
@@ -1838,6 +2053,7 @@ def harvest_config(
 ) -> str:
     return json.dumps(
         {
+            "credential_name": PERSONAL_GRANT_ENV,
             "tmp_root": tmp_root,
             "review_dir": review_dir,
             "workspace": workspace,
@@ -1863,6 +2079,8 @@ class HarvestState:
         self.reviews: dict[str, bytes] = {}
         self.workspace: dict[str, Any] | None = None
         self.processes: list[dict[str, Any]] = []
+        self.container_credential: dict[str, Any] | None = None
+        self.process_credentials: dict[tuple[int, float], dict[str, Any]] = {}
         self.process_max = 0
         self.process_records = 0
         self.gaps = 0
@@ -1937,6 +2155,14 @@ class HarvestState:
                 self.process_max = max(self.process_max, count)
                 if processes:
                     self.processes = [item for item in processes if isinstance(item, dict)]
+                for item in self.processes:
+                    key = (item.get("pid"), item.get("start"))
+                    if type(key[0]) is int and isinstance(key[1], (int, float)):
+                        self.process_credentials.setdefault(
+                            (key[0], float(key[1])), credential_presence(item)
+                        )
+        elif kind == "container_credential":
+            self.container_credential = credential_presence(record)
         elif kind == "sync":
             sizes = record.get("sizes")
             at = record.get("at")
@@ -2016,6 +2242,16 @@ class HarvestState:
             "diff_approved": "APPROVE" in diff,
         }
 
+    def credential_evidence(self) -> dict[str, Any]:
+        """Whether the container and each CLI process saw a non-empty grant, as lengths only."""
+
+        return {
+            "container": self.container_credential,
+            "cli_processes": [
+                self.process_credentials[key] for key in sorted(self.process_credentials)
+            ],
+        }
+
     def process_start(self) -> float | None:
         starts = [
             float(item["start"])
@@ -2023,6 +2259,20 @@ class HarvestState:
             if isinstance(item.get("start"), (int, float))
         ]
         return min(starts) if starts else None
+
+
+CREDENTIAL_STATES = frozenset({"present", "empty", "absent", "unreadable"})
+
+
+def credential_presence(record: Mapping[str, Any]) -> dict[str, Any]:
+    """One harvested credential observation, reduced to a state and a length. Pure."""
+
+    state = record.get("credential")
+    length = record.get("credential_length")
+    return {
+        "credential": state if state in CREDENTIAL_STATES else "unknown",
+        "credential_length": length if type(length) is int and length >= 0 else 0,
+    }
 
 
 def workspace_record(record: Mapping[str, Any] | None) -> dict[str, Any] | None:

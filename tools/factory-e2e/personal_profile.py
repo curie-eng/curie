@@ -43,6 +43,7 @@ import socket
 import subprocess
 import sys
 import tarfile
+import tempfile
 import threading
 import time
 import urllib.parse
@@ -59,7 +60,7 @@ import personal_profile_support as pps  # noqa: E402
 
 REPO_ROOT = HERE.parents[1]
 FIXTURE_ISSUE = HERE / "fixtures" / "personal-profile-issue.md"
-SUBCOMMANDS = ("images", "preflight", "forge-probe", "rehearse", "run", "judge")
+SUBCOMMANDS = ("images", "preflight", "forge-probe", "grant-probe", "rehearse", "run", "judge")
 DOCKERFILES = {
     "curie-api": "apps/api/Dockerfile",
     "curie-worker": "apps/worker/Dockerfile",
@@ -77,6 +78,7 @@ POLL_SECONDS = 5.0
 REJECTION_SETTLE_SECONDS = 30.0
 # The last phase a rehearsal runs: everything unpaid, nothing from the grant on.
 REHEARSAL_CUT = "drill"
+DEFAULT_PROBE_CLI = "claude"
 # A delivered card is reported within a few outbox passes (2 s apart).
 CARD_WAIT_SECONDS = 120
 # apps/worker publication_store.PostgresPublicationStore result_max_attempts.
@@ -168,8 +170,9 @@ class Shell:
         extra_env: Mapping[str, str] | None = None,
         secret_env: Sequence[str] = (),
         secret_stdin: bool = False,
+        clean_env: bool = False,
     ) -> None:
-        env = {**self.env, **(extra_env or {})}
+        env = dict(extra_env or {}) if clean_env else {**self.env, **(extra_env or {})}
         for secret in self.scrubber.held():
             raw = secret.reveal()
             if not raw:
@@ -234,9 +237,18 @@ class Shell:
         sensitive_output: bool = False,
         full_output: bool = False,
         record_output: bool = True,
+        clean_env: bool = False,
+        cwd: Path | None = None,
     ) -> Completed:
+        """``clean_env`` gives the child only ``extra_env``, nothing inherited."""
+
         self.guard(
-            argv, stdin=stdin, extra_env=extra_env, secret_env=secret_env, secret_stdin=secret_stdin
+            argv,
+            stdin=stdin,
+            extra_env=extra_env,
+            secret_env=secret_env,
+            secret_stdin=secret_stdin,
+            clean_env=clean_env,
         )
         try:
             completed = subprocess.run(
@@ -245,8 +257,8 @@ class Shell:
                 stdin=subprocess.DEVNULL if stdin is None else None,
                 capture_output=True,
                 timeout=timeout,
-                cwd=self.cwd,
-                env={**self.env, **(extra_env or {})},
+                cwd=cwd or self.cwd,
+                env=dict(extra_env or {}) if clean_env else {**self.env, **(extra_env or {})},
                 check=False,
             )
         except (OSError, subprocess.TimeoutExpired):
@@ -450,6 +462,8 @@ def build_parser() -> argparse.ArgumentParser:
             sub.add_argument("--approve-live", default=None)
         if name in {"preflight", "run"}:
             sub.add_argument("--output-token-ceiling", default="")
+        if name in {"run", "grant-probe"}:
+            sub.add_argument("--grant-probe-cli", default=DEFAULT_PROBE_CLI)
         if name in {"run", "rehearse"}:
             sub.add_argument("--slack-bot-token-file", default="")
             sub.add_argument("--resolution-channel", default="")
@@ -476,6 +490,7 @@ class Inputs:
     expires_at: float = 0.0
     slack_bot_token_file: Path | None = None
     resolution_channel: str = ""
+    grant_probe_cli: str = "claude"
 
     @property
     def work_dir(self) -> Path:
@@ -532,6 +547,13 @@ def with_app(inputs: Inputs, args: argparse.Namespace) -> Inputs:
 def with_slack(inputs: Inputs, args: argparse.Namespace) -> Inputs:
     path, channel = pps.require_slack_kit(args.slack_bot_token_file, args.resolution_channel)
     return dataclasses.replace(inputs, slack_bot_token_file=path, resolution_channel=channel)
+
+
+def with_probe(inputs: Inputs, args: argparse.Namespace) -> Inputs:
+    cli = str(args.grant_probe_cli or "")
+    if not cli or any(ch.isspace() for ch in cli):
+        raise pps.Refusal("arguments_invalid", "--grant-probe-cli")
+    return dataclasses.replace(inputs, grant_probe_cli=cli)
 
 
 def with_grant(inputs: Inputs, args: argparse.Namespace, now: float) -> Inputs:
@@ -1099,6 +1121,40 @@ def remove_local_images(shell: Shell, tags: Sequence[str]) -> None:
             shell.run(["docker", "image", "rm", tag], timeout=120)
 
 
+def grant_probe(shell: Shell, grant: pps.HeldSecret, cli: str, clock: Clock) -> dict[str, Any]:
+    """One turn on the cheapest model with an empty HOME and the grant as the only credential.
+
+    The child inherits nothing: no caller HOME, config dir or credential, and
+    its working directory is the same empty directory, so no host login,
+    project setting or helper can answer for the grant.
+    """
+
+    resolved = shutil.which(cli, path=shell.env.get("PATH"))
+    if resolved is None:
+        raise StepFailed("the grant probe CLI was not found")
+    with tempfile.TemporaryDirectory(prefix="ppa-grant-probe-") as home:
+        if any(Path(home).iterdir()):
+            raise StepFailed("the grant probe home was not empty")
+        started = clock.now()
+        result = shell.run(
+            pps.grant_probe_argv(resolved),
+            stdin=pps.GRANT_PROBE_PROMPT,
+            timeout=pps.GRANT_PROBE_SECONDS,
+            check=False,
+            extra_env=pps.grant_probe_env(
+                home=home, cli_dir=str(Path(resolved).parent), grant=grant.reveal()
+            ),
+            secret_env=(pps.PERSONAL_GRANT_ENV,),
+            clean_env=True,
+            cwd=Path(home),
+            full_output=True,
+        )
+        elapsed = clock.now() - started
+    outcome = pps.grant_probe_result(result.returncode, result.stdout, result.stderr)
+    outcome["elapsed"] = round(elapsed, 3)
+    return outcome
+
+
 # --------------------------------------------------------------------------
 # Subcommands
 # --------------------------------------------------------------------------
@@ -1311,12 +1367,34 @@ def cmd_judge(args: argparse.Namespace, runtime: Runtime) -> int:
     return pps.EXIT_PASS if result["verdict"] == "pass" else pps.EXIT_FAIL
 
 
+def cmd_grant_probe(args: argparse.Namespace, runtime: Runtime) -> int:
+    """Probe the grant alone, as ``run`` does before its first reservation. Writes no ledger."""
+
+    inputs = with_probe(Inputs(candidate="", run_id="", state_dir=Path()), args)
+    inputs = with_grant(inputs, args, runtime.clock.now())
+    shell = Shell(
+        env=pps.child_environment(runtime.environ, kubeconfig=None, docker_context=None),
+        scrubber=runtime.scrubber,
+        scan=runtime.scan,
+        cwd=REPO_ROOT,
+    )
+    grant = runtime.scrubber.hold(pps.load_grant(inputs.grant_file))
+    try:
+        outcome = grant_probe(shell, grant, inputs.grant_probe_cli, runtime.clock)
+    finally:
+        grant.clear()
+    runtime.out.emit(
+        {"command": "grant-probe", "verdict": "pass" if outcome["ok"] else "fail", "probe": outcome}
+    )
+    return pps.EXIT_PASS if outcome["ok"] else pps.EXIT_FAIL
+
+
 def cmd_run(args: argparse.Namespace, runtime: Runtime) -> int:
     inputs = base_inputs(args)
     pps.require_live_approval(args.approve_live)
     ceiling = pps.require_output_token_ceiling(args.output_token_ceiling)
     inputs = with_grant(inputs, args, runtime.clock.now())
-    inputs = with_slack(with_app(with_cluster(inputs, args), args), args)
+    inputs = with_probe(with_slack(with_app(with_cluster(inputs, args), args), args), args)
     ledger = pps.Ledger.open(inputs.state_dir, inputs.run_id, scrubber=runtime.scrubber)
     try:
         if ledger.is_rehearsal():
@@ -1557,16 +1635,21 @@ class LiveRun:
                     "step:revoke-installation-token", "forge", "failed", type(exc).__name__
                 )
                 steps.append(("revoke-installation-token", False))
-        dump = json.dumps(
+        self.scan.scan("ledger", self.ledger_dump().encode())
+        return all(ok for _, ok in steps) and all(s == "absent" for s in inventory.values())
+
+    def ledger_dump(self) -> str:
+        """Every recorded section and cleanup row, for the ledger channel's leak scan."""
+
+        names = {*pps.CRITERIA, "images", "forge", "rehearsal", "install"}
+        return json.dumps(
             [
                 self.ledger.observations(name)
-                for name in (*pps.CRITERIA, "images", "forge", "rehearsal", "install")
+                for name in sorted(names | set(self.ledger.recorded_criteria()))
             ]
             + [self.ledger.cleanup_rows()],
             sort_keys=True,
         )
-        self.scan.scan("ledger", dump.encode())
-        return all(ok for _, ok in steps) and all(s == "absent" for s in inventory.values())
 
     @staticmethod
     def safe(call: Callable[[], Any], default: Any) -> Any:
@@ -2403,6 +2486,16 @@ class LiveRun:
     def phase_grant(self) -> None:
         pps.require_lifetime(self.inputs.expires_at, self.clock.now())
         grant = self.scrubber.hold(pps.load_grant(self.inputs.grant_file))
+        try:
+            # Its cost is recorded apart from the attempt ceiling; a failure reserves nothing.
+            probe = grant_probe(self.shell, grant, self.inputs.grant_probe_cli, self.clock)
+        except BaseException:
+            grant.clear()
+            raise
+        self.ledger.record("grant_probe", "result", probe)
+        if not probe["ok"]:
+            grant.clear()
+            raise StepFailed(f"grant probe failed: {pps.probe_summary(probe)}")
         self.finalizer.register(
             "delete-grant-secret", lambda: self.delete_secret(self.grant_secret)
         )
@@ -2640,7 +2733,9 @@ class LiveRun:
                 if isinstance(row, dict) and row.get("sequence") == attempt.sequence
             ]
             if any(row.get("terminal_at") for row in mine):
-                raise StepFailed("attempt ended before parking for approval")
+                raise StepFailed(
+                    "attempt ended before parking for approval" + self.error_suffix(attempt)
+                )
             fresh = [
                 row
                 for row in pending
@@ -2687,6 +2782,17 @@ class LiveRun:
                 "new_process_after_deletion",
                 start is not None and first.gone_at > 0 and start > first.gone_at,
             )
+
+    def error_suffix(self, attempt: Attempt) -> str:
+        """The first sanitized error class the attempt's transcripts carry, for the failure text."""
+
+        facts = self.safe(lambda: self.attempt_facts(attempt), None)
+        for session in facts.sessions if facts is not None else ():
+            for item in session.errors:
+                summary = pps.error_summary(item)
+                if summary:
+                    return f" (session error: {summary})"
+        return ""
 
     def start_harvest(self, attempt: Attempt) -> None:
         attempt.harvest = pps.HarvestState(self.scan)
@@ -2759,6 +2865,9 @@ class LiveRun:
             return
         key = "sessions_initial" if attempt.number == 1 else "sessions_resumed"
         self.ledger.record("roles", key, [pps.session_summary(s) for s in facts.sessions])
+        self.ledger.record(
+            "diagnostics", f"runner_credential_{attempt.number}", harvest.credential_evidence()
+        )
         done = [a for a in self.attempts.values() if a.facts is not None and a.harvest is not None]
         self.ledger.record(
             "roles", "synthetic_records", sum(a.facts.synthetic_records for a in done if a.facts)
@@ -3173,6 +3282,7 @@ COMMANDS: dict[str, Callable[[argparse.Namespace, Runtime], int]] = {
     "images": cmd_images,
     "preflight": cmd_preflight,
     "forge-probe": cmd_forge_probe,
+    "grant-probe": cmd_grant_probe,
     "rehearse": cmd_rehearse,
     "run": cmd_run,
     "judge": cmd_judge,

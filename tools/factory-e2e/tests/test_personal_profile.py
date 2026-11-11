@@ -2556,6 +2556,7 @@ def test_drill_proves_the_list_refusal_reject_and_approve(
     # The tracker-surface refusal denies everyone; the drill must not pass on it.
     nobody: list[str] = []
     failed = _scripted(_private(tmp_path / "nobody"), _Drill, nobody, stop_after="drill")
+    assert isinstance(failed, _Drill)
     failed.authorizer = "NoVerifiableApprovers"
     capsys.readouterr()
     assert failed.execute() == 1
@@ -2596,6 +2597,7 @@ class _CardRun(_Rehearsal):
 
 def _card_run(tmp_path: Path, **attrs: Any) -> _CardRun:
     run = _scripted(tmp_path, _CardRun, [], stop_after=pp.REHEARSAL_CUT)
+    assert isinstance(run, _CardRun)
     run.inputs = dataclasses.replace(run.inputs, resolution_channel=RESOLUTION_CHANNEL)
     run.agent_id = "4f1e0000-0000-4000-8000-0000000000a1"
     run.api = _DrillApi()
@@ -2741,3 +2743,275 @@ def test_rehearse_ledger_is_refused_by_run_and_judge(
     )
     assert code == 1
     assert json.loads(capsys.readouterr().out.strip().splitlines()[-1])["command"] == "run"
+
+
+# --------------------------------------------------------------------------
+# Error classes, runner credential evidence and the pre-start grant probe
+# --------------------------------------------------------------------------
+
+LOOKALIKE = "sk-ant-oat01-" + "Q" * 40
+# The CLI's synthetic record for a refused request (Claude Code transcript
+# fields `error`, `apiErrorStatus`, `isApiErrorMessage`; text "API Error: ...").
+REVOKED_TEXT = (
+    "Failed to authenticate. API Error: 401 "
+    '{"type":"error","error":{"type":"authentication_error","message":"OAuth token revoked"}} '
+    f"{GRANT} {LOOKALIKE}"
+)
+
+
+def _refused_transcript(config: str = "curie-claude-config-a1b2") -> dict[str, bytes]:
+    records = [
+        {
+            "type": "user",
+            "timestamp": _stamp(0),
+            "sessionId": SESSION,
+            "isSidechain": False,
+            "message": {"role": "user", "content": "work the fixture issue"},
+        },
+        _assistant(
+            "msg_synth",
+            "<synthetic>",
+            0,
+            3,
+            [{"type": "text", "text": REVOKED_TEXT}],
+            isSidechain=False,
+            error="authentication_failed",
+            apiErrorStatus=401,
+            isApiErrorMessage=True,
+        ),
+    ]
+    return {f"{config}/projects/-workspace/{SESSION}.jsonl": _jsonl(records)}
+
+
+def test_synthetic_records_keep_a_sanitized_error_class(tmp_path: Path) -> None:
+    facts = pps.parse_native_transcripts(_refused_transcript())
+    (session,) = facts.sessions
+    summary = pps.session_summary(session)
+    assert summary["synthetic"] == 1 and summary["usage_known"] is False
+    (error,) = summary["error_classes"]
+    assert error["cli_error"] == "authentication_failed"
+    assert error["http_status"] == 401
+    assert error["provider_error_type"] == "authentication_error"
+    assert error["first_line"].startswith("Failed to authenticate. API Error: 401")
+    assert "OAuth token revoked" in error["first_line"]
+    assert GRANT not in error["first_line"] and "sk-ant-" not in error["first_line"]
+
+    # Held secrets are scrubbed again on the way into the ledger, and its leak scan reads it.
+    scrubber = pps.Scrubber()
+    scrubber.hold(pps.HeldSecret(GRANT))
+    ledger = pps.Ledger.open(_private(tmp_path / "state"), "error-class", scrubber=scrubber)
+    ledger.ensure_run(CANDIDATE, phase="run")
+    ledger.record("roles", "sessions_initial", [summary])
+    assert "diagnostics" not in ledger.recorded_criteria()
+    stored = json.dumps(ledger.observations("roles"))
+    assert GRANT not in stored and LOOKALIKE not in stored
+    ledger.close()
+
+
+def test_a_failed_attempt_names_its_error_class_and_records_credential_evidence(
+    tmp_path: Path,
+) -> None:
+    run = _scripted(tmp_path, _ScriptedRun, [])
+    run.ledger.begin_live(now=T0, grant_expires_at=T0 + 4000)
+    attempt = pp.Attempt(1)
+    run.attempts[1] = attempt
+    attempt.admitted_at = T0
+    attempt.reservations = run.ledger.reserve(pps.ATTEMPT_ROLES, attempt=1, now=T0)
+    harvest = pps.HarvestState(run.scan)
+    for name, data in _refused_transcript().items():
+        harvest.feed(_file_record(name, 0, data))
+    harvest.feed(
+        json.dumps(
+            {"kind": "container_credential", "credential": "present", "credential_length": 36}
+        ).encode()
+    )
+    harvest.feed(
+        json.dumps(
+            {
+                "kind": "process",
+                "count": 1,
+                "processes": [
+                    {"pid": 41, "start": T0, "credential": "empty", "credential_length": 0}
+                ],
+            }
+        ).encode()
+    )
+    attempt.harvest = harvest
+    assert run.error_suffix(attempt) == (
+        " (session error: authentication_failed 401 authentication_error)"
+    )
+    run.settle(attempt)
+    assert run.ledger.observations("diagnostics")["runner_credential_1"] == {
+        "container": {"credential": "present", "credential_length": 36},
+        "cli_processes": [{"credential": "empty", "credential_length": 0}],
+    }
+    (initial,) = run.ledger.observations("roles")["sessions_initial"]
+    assert initial["error_classes"][0]["http_status"] == 401
+    # Unknown usage settles every reserved session as unknown, so no further start.
+    assert all(row["source"] == "unknown" for row in run.ledger.sessions())
+    # The finalizer's ledger leak scan reads every recorded section, new ones included.
+    assert '"runner_credential_1"' in run.ledger_dump()
+    assert "authentication_failed" in run.ledger_dump()
+
+
+def test_harvester_reports_credential_presence_and_length_never_the_value(
+    tmp_path: Path,
+) -> None:
+    nonce = "0f0f1e1e2d2d3c3c"
+    _fake_pod(tmp_path, nonce)
+    proc = tmp_path / "proc"
+    for pid, environ in (("103", b"CLAUDE_CODE_OAUTH_TOKEN=\0HOME=/home/runner\0"), ("104", None)):
+        (proc / pid).mkdir()
+        (proc / pid / "cmdline").write_bytes(b"/usr/local/bin/claude\0--print\0")
+        (proc / pid / "stat").write_text(f"{pid} (claude) S " + " ".join(["0"] * 18) + " 9 0 0\n")
+        if environ is not None:
+            (proc / pid / "environ").write_bytes(environ)
+    config = pps.harvest_config(
+        nonce=nonce,
+        tmp_root=str(tmp_path / "tmp"),
+        review_dir=str(tmp_path / "tmp" / "dark-factory-review"),
+        workspace=str(tmp_path / "workspace"),
+        proc_root=str(proc),
+        git=str(tmp_path / "gitbin" / "git"),
+        once=True,
+    )
+
+    def harvest(env: dict[str, str]) -> pps.HarvestState:
+        result = subprocess.run(
+            [sys.executable, "-c", pps.HARVEST_PROGRAM, config],
+            env={"PATH": "/usr/bin:/bin", **env},
+            capture_output=True,
+            timeout=30,
+        )
+        assert result.returncode == 0, result.stderr
+        assert GRANT.encode() not in result.stdout + result.stderr
+        state = pps.HarvestState(pps.TokenScan(pps.Scrubber()))
+        for line in result.stdout.splitlines():
+            state.feed(line)
+        return state
+
+    seen = harvest({pps.PERSONAL_GRANT_ENV: GRANT}).credential_evidence()
+    assert seen == {
+        "container": {"credential": "present", "credential_length": len(GRANT)},
+        "cli_processes": [
+            {"credential": "present", "credential_length": len(GRANT)},
+            {"credential": "empty", "credential_length": 0},
+            {"credential": "unreadable", "credential_length": 0},
+        ],
+    }
+    missing = harvest({}).credential_evidence()["container"]
+    assert missing == {"credential": "absent", "credential_length": 0}
+
+
+PROBE_OK = {
+    "type": "result",
+    "subtype": "success",
+    "is_error": False,
+    "result": "ok",
+    "total_cost_usd": 0.0006,
+    "usage": {"output_tokens": 4},
+    "modelUsage": {"claude-haiku-5-5": {"outputTokens": 4}},
+}
+# The CLI's --output-format json result for a refused grant: subtype stays
+# "success"; terminal_reason and api_error_status name the failure.
+PROBE_REVOKED = {
+    "type": "result",
+    "subtype": "success",
+    "is_error": True,
+    "terminal_reason": "api_error",
+    "api_error_status": 401,
+    "result": REVOKED_TEXT,
+    "total_cost_usd": 0,
+    "usage": {"output_tokens": 0},
+    "modelUsage": {},
+}
+
+
+def _probe_cli(directory: Path, answer: Mapping[str, Any], code: int) -> tuple[Path, Path]:
+    """A stand-in CLI that reports what it was given, then answers like the real one."""
+
+    report = directory / "probe-report.json"
+    cli = directory / "claude"
+    cli.write_text(
+        f"#!{sys.executable}\n"
+        "import json, os, sys\n"
+        f"GRANT = {GRANT!r}\n"
+        "home = os.environ.get('HOME', '')\n"
+        "seen = {\n"
+        "    'env': sorted(os.environ),\n"
+        "    'home': home,\n"
+        "    'home_entries': sorted(os.listdir(home)) if home else None,\n"
+        "    'cwd_is_home': os.path.realpath(os.getcwd()) == os.path.realpath(home),\n"
+        "    'grant_matches': os.environ.get('CLAUDE_CODE_OAUTH_TOKEN') == GRANT,\n"
+        "    'grant_in_argv': any(GRANT in arg for arg in sys.argv),\n"
+        "    'argv': sys.argv[1:],\n"
+        "    'stdin': sys.stdin.read(),\n"
+        "}\n"
+        f"open({str(report)!r}, 'w').write(json.dumps(seen))\n"
+        f"print({json.dumps(json.dumps(answer))})\n"
+        f"sys.exit({code})\n"
+    )
+    cli.chmod(0o755)
+    return cli, report
+
+
+def test_grant_probe_runs_with_an_empty_home_and_the_grant_alone(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    caller_home = _private(tmp_path / "caller-home")
+    (caller_home / ".claude").mkdir()
+    (caller_home / ".claude" / ".credentials.json").write_text('{"claudeAiOauth": {}}')
+    cli, report = _probe_cli(_private(tmp_path / "bin"), PROBE_OK, 0)
+    grant = _grant_file(_private(tmp_path / "grant"))
+    code = pp.main(
+        [
+            "grant-probe",
+            "--grant-file",
+            str(grant),
+            "--grant-expires-at",
+            str(int(T0 + 4000)),
+            "--grant-probe-cli",
+            str(cli),
+        ],
+        environ={"PATH": "/usr/bin:/bin", "HOME": str(caller_home), "LANG": "C.UTF-8"},
+        clock=_FakeClock(T0),
+    )
+    output = capsys.readouterr()
+    summary = json.loads(output.out.strip().splitlines()[-1])
+    assert code == 0 and summary["verdict"] == "pass"
+    assert summary["probe"]["cost_usd"] == 0.0006 and summary["probe"]["output_tokens"] == 4
+    assert summary["probe"]["models"] == ["claude-haiku-5-5"]
+    seen = json.loads(report.read_text())
+    assert seen["home"] != str(caller_home) and seen["home_entries"] == []
+    assert seen["cwd_is_home"] and seen["grant_matches"] and not seen["grant_in_argv"]
+    assert set(seen["env"]) == set(pps.grant_probe_env(home="h", cli_dir="d", grant="g"))
+    assert not [name for name in seen["env"] if name.startswith("ANTHROPIC")]
+    assert seen["argv"][seen["argv"].index("--model") + 1] == pps.GRANT_PROBE_MODEL
+    assert seen["stdin"] == pps.GRANT_PROBE_PROMPT.decode()
+    assert not Path(seen["home"]).exists()
+    assert GRANT not in output.out + output.err
+
+
+def test_a_failed_grant_probe_stops_before_any_reservation(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    events: list[str] = []
+    run = _scripted(tmp_path, _ScriptedRun, events)
+    cli, _report = _probe_cli(_private(tmp_path / "bin"), PROBE_REVOKED, 1)
+    run.inputs = dataclasses.replace(run.inputs, grant_probe_cli=str(cli))
+    capsys.readouterr()
+    code = run.execute()
+    output = capsys.readouterr()
+    summary = json.loads(output.out.strip().splitlines()[-1])
+    assert code == 1 and summary["phase"] == "grant"
+    assert summary["detail"] == "grant probe failed: api_error 401 authentication_error"
+    assert not any(event.startswith(("budget:", "admit")) for event in events)
+    ledger = pps.Ledger.open(tmp_path / "state", "scripted-run")
+    assert ledger.sessions() == []
+    assert ledger.run_row()["live_started_at"] is None
+    probe = ledger.observations("grant_probe")["result"]
+    assert probe["ok"] is False and probe["cost_usd"] == 0.0
+    assert probe["error"]["http_status"] == 401
+    assert GRANT not in json.dumps(probe) and LOOKALIKE not in json.dumps(probe)
+    ledger.close()
+    assert GRANT not in output.out + output.err
