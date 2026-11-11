@@ -5773,6 +5773,7 @@ MAIN_TEMPLATE_CHART_SCENARIOS = [
     "factory-resource-profile",
     "failed-first-install-retry",
     "installation-identity",
+    "metrics-alerts",
     "platform-runner-upgrade",
     "quota-progress",
     "runner-byo-egress",
