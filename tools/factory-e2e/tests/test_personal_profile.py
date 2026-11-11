@@ -758,6 +758,16 @@ def _build_ledger(
         "aci_tool_calls": first.aci_tool_calls,
         "service_credentials_absent": True,
         "candidate_images_running": True,
+        "runner_image_attempt_1": {
+            "from_run_registry": True,
+            "digest_matches": True,
+            "revision_matches": True,
+        },
+        "runner_image_attempt_2": {
+            "from_run_registry": True,
+            "digest_matches": True,
+            "revision_matches": True,
+        },
         "active_profile_processes_max": 1,
     }
     approval: dict[str, Any] = {
@@ -3023,14 +3033,16 @@ def test_a_failed_grant_probe_stops_before_any_reservation(
 
 OWN_BRANCH = "curie/publication-" + "c" * 32
 FOREIGN_BRANCH = "curie/publication-" + "f" * 32
+OWN_SHA = "c" * 40
+OTHER_SHA = "e" * 40
 
 
 class _BranchForge(pp.Forge):
-    """Answers GitHub's pulls and matching-refs listings; records writes."""
+    """Answers GitHub's pulls, matching-refs and ref reads; records writes."""
 
-    def __init__(self, heads: list[str], refs: list[str]) -> None:
+    def __init__(self, pulls: list[tuple[str, str]], refs: dict[str, str]) -> None:
         self.repo = REPO
-        self.heads = heads
+        self.pulls = pulls
         self.refs = refs
         self.writes: list[tuple[str, str]] = []
 
@@ -3040,11 +3052,14 @@ class _BranchForge(pp.Forge):
             return {}
         if "/pulls?" in path:
             return [
-                {"number": n, "state": "open", "head": {"ref": ref}}
-                for n, ref in enumerate(self.heads, 1)
+                {"number": n, "state": "open", "head": {"ref": ref, "sha": sha}}
+                for n, (ref, sha) in enumerate(self.pulls, 1)
             ]
-        prefix = "refs/heads/" + path.split("/git/matching-refs/heads/", 1)[1]
-        return [{"ref": ref} for ref in self.refs if ref.startswith(prefix)]
+        if "/git/matching-refs/heads/" in path:
+            prefix = "refs/heads/" + path.split("/git/matching-refs/heads/", 1)[1]
+            return [{"ref": ref} for ref in self.refs if ref.startswith(prefix)]
+        ref = path.split("/git/", 1)[1]
+        return {"ref": ref, "object": {"sha": self.refs[ref]}}
 
 
 class _BranchApi(_FakeApi):
@@ -3054,34 +3069,290 @@ class _BranchApi(_FakeApi):
         return {"id": path.rsplit("/", 1)[-1], "branch": self.branch, "status": "pending"}
 
 
-def test_the_run_owns_its_publication_branch_outside_its_prefix(tmp_path: Path) -> None:
+def _branch_run(tmp_path: Path, forge: _BranchForge) -> _ScriptedRun:
     run = _scripted(tmp_path, _ScriptedRun, [])
     run.api = _BranchApi()
-    forge = _BranchForge(
-        heads=[OWN_BRANCH, FOREIGN_BRANCH, f"{run.prefix}probe"],
-        refs=[f"refs/heads/{OWN_BRANCH}", f"refs/heads/{FOREIGN_BRANCH}"],
-    )
     run.forge = forge
+    return run
+
+
+def test_the_run_owns_its_publication_branch_outside_its_prefix(tmp_path: Path) -> None:
+    probe = _BranchForge(pulls=[], refs={})
+    run = _branch_run(tmp_path, probe)
+    probe.pulls = [
+        (OWN_BRANCH, OWN_SHA),
+        (FOREIGN_BRANCH, OTHER_SHA),
+        (f"{run.prefix}x", OTHER_SHA),
+    ]
+    probe.refs = {f"refs/heads/{OWN_BRANCH}": OWN_SHA, f"refs/heads/{FOREIGN_BRANCH}": OTHER_SHA}
     attempt = pp.Attempt(2)
     attempt.publication_id = "4f1e0000-0000-4000-8000-0000000000b1"
-    # Before the branch is known, only the prefix is owned.
-    assert [pull["head"]["ref"] for pull in run.run_pulls()] == [f"{run.prefix}probe"]
+    # Before the branch is known, only the prefix is the run's.
+    assert [pull["head"]["ref"] for pull in run.run_pulls()] == [f"{run.prefix}x"]
     run.record_publication_branch(attempt)
     assert attempt.branch == OWN_BRANCH
     assert run.ledger.observations("publication")["attempt_2_branch_known"] is True
     assert sorted(pull["head"]["ref"] for pull in run.run_pulls()) == sorted(
-        [OWN_BRANCH, f"{run.prefix}probe"]
+        [OWN_BRANCH, f"{run.prefix}x"]
     )
     assert run.run_branches() == [f"refs/heads/{OWN_BRANCH}"]
-    run.close_run_pulls()
-    run.delete_run_branches()
-    assert ("PATCH", f"/repos/{REPO}/pulls/1") in forge.writes
-    assert ("DELETE", f"/repos/{REPO}/git/refs/heads/{OWN_BRANCH}") in forge.writes
-    assert not any(FOREIGN_BRANCH in path or path.endswith("/pulls/2") for _m, path in forge.writes)
 
-    bad = _scripted(_private(tmp_path / "bad"), _ScriptedRun, [])
+    bad = _branch_run(_private(tmp_path / "bad"), _BranchForge(pulls=[], refs={}))
     bad.api = _BranchApi()
     bad.api.branch = "main"
     with pytest.raises(pp.StepFailed, match="no valid branch"):
         bad.record_publication_branch(attempt)
     assert bad.publication_branches == []
+
+
+def test_cleanup_closes_and_deletes_only_at_the_runs_own_commit(tmp_path: Path) -> None:
+    forge = _BranchForge(pulls=[], refs={})
+    run = _branch_run(tmp_path, forge)
+    forge.pulls = [
+        (OWN_BRANCH, OWN_SHA),
+        (FOREIGN_BRANCH, OTHER_SHA),
+        (f"{run.prefix}x", OTHER_SHA),
+    ]
+    forge.refs = {f"refs/heads/{OWN_BRANCH}": OWN_SHA, f"refs/heads/{FOREIGN_BRANCH}": OTHER_SHA}
+    run.publication_branches = [OWN_BRANCH]
+    run.published_heads = {OWN_BRANCH: OWN_SHA}
+    # The prefix pull request points at no commit this run made: it is left open and reported.
+    with pytest.raises(pp.StepFailed, match="left open"):
+        run.close_run_pulls()
+    run.delete_run_branches()
+    assert forge.writes == [
+        ("PATCH", f"/repos/{REPO}/pulls/1"),
+        ("DELETE", f"/repos/{REPO}/git/refs/heads/{OWN_BRANCH}"),
+    ]
+
+    # A run branch that now points elsewhere is not the run's to delete.
+    moved = _BranchForge(pulls=[], refs={f"refs/heads/{OWN_BRANCH}": OTHER_SHA})
+    later = _branch_run(_private(tmp_path / "moved"), moved)
+    later.publication_branches = [OWN_BRANCH]
+    later.published_heads = {OWN_BRANCH: OWN_SHA}
+    with pytest.raises(pp.StepFailed, match="left in place"):
+        later.delete_run_branches()
+    assert moved.writes == []
+
+
+class _ProbeForge(pp.Forge):
+    """The fixture repository for forge-probe; the probe branch name already exists."""
+
+    writes: list[tuple[str, str]] = []
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        self.repo = REPO
+        _ProbeForge.writes = []
+
+    def mint(self) -> None:
+        return None
+
+    def revoke(self) -> None:
+        return None
+
+    def request(self, method: str, path: str, body: Any = None) -> tuple[int, Any]:
+        if method == "GET" and path == f"/repos/{REPO}":
+            return 200, {"default_branch": "main"}
+        if method == "GET" and path.endswith("/git/ref/heads/main"):
+            return 200, {"object": {"sha": "b" * 40}}
+        if method == "GET" and "/git/commits/" in path:
+            return 200, {"tree": {"sha": "d" * 40}}
+        if method == "GET" and "/git/ref/heads/ppa-probe-" in path:
+            return 200, {"object": {"sha": OTHER_SHA}}
+        _ProbeForge.writes.append((method, path))
+        if path.endswith("/git/commits"):
+            return 201, {"sha": OWN_SHA}
+        if path.endswith("/git/refs"):
+            # GitHub: "Reference already exists".
+            return 422, {"message": "Reference already exists"}
+        return 200, {}
+
+
+def test_forge_probe_never_deletes_a_branch_it_did_not_create(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(pp, "Forge", _ProbeForge)
+    state = _private(tmp_path / "state")
+    app = _app_dir(_private(tmp_path / "apps"))
+    code = pp.main(
+        [
+            "forge-probe",
+            "--candidate",
+            CANDIDATE,
+            "--state-dir",
+            str(state),
+            "--run-id",
+            "probe-collision",
+            "--app-dir",
+            str(app),
+        ],
+        environ={"PATH": "/usr/bin:/bin", "HOME": str(tmp_path)},
+        clock=_FakeClock(T0),
+    )
+    capsys.readouterr()
+    assert code == 1
+    assert not any(method == "DELETE" for method, _path in _ProbeForge.writes)
+    assert not any(method == "PATCH" for method, _path in _ProbeForge.writes)
+
+
+# --------------------------------------------------------------------------
+# A cut final record, the runner image, and retained volumes
+# --------------------------------------------------------------------------
+
+
+def test_an_unterminated_final_record_makes_usage_unknown(tmp_path: Path) -> None:
+    project = f"curie-claude-config-a1b2/projects/-workspace/{SESSION}.jsonl"
+    complete = [
+        {
+            "type": "user",
+            "timestamp": _stamp(0),
+            "sessionId": SESSION,
+            "isSidechain": False,
+            "message": {"role": "user", "content": "work the fixture issue"},
+        },
+        _assistant("msg_01", "claude-sonnet-5-5", 7900, 5, [{"type": "text", "text": "a"}]),
+    ]
+    cut = _assistant("msg_02", "claude-sonnet-5-5", 4000, 9, [{"type": "text", "text": "b"}])
+    # 11,900 output tokens were written; the capture ends inside the last record.
+    data = _jsonl(complete) + json.dumps(cut).encode()
+    facts = pps.parse_native_transcripts({project: data})
+    (session,) = facts.sessions
+    # The cut record's 4,000 tokens cannot be counted, so the session is not 7,900.
+    assert session.usage() is None
+    assert facts.truncated_files == 1 and session.truncated
+
+    state = _private(tmp_path / "state")
+    ledger = pps.Ledger.open(state, "cut-record")
+    ledger.ensure_run(CANDIDATE, phase="run")
+    ledger.begin_live(now=T0, grant_expires_at=T0 + 4000)
+    reservations = ledger.reserve(pps.ATTEMPT_ROLES, attempt=1, now=T0)
+    pps.settle_attempt(ledger, reservations, facts, complete=True)
+    assert all(row["source"] == "unknown" for row in ledger.sessions())
+    checks, _counts = pps._judge_budget(ledger)
+    assert checks["no_unknown_usage"] is False
+    ledger.close()
+
+
+def _runner_pod(image: str, image_id: str) -> dict[str, Any]:
+    return {
+        "metadata": {"name": "sandbox-1", "uid": "uid-1"},
+        "spec": {
+            "initContainers": [{"name": "attachments-init", "image": "busybox:1"}],
+            "containers": [{"name": "runner", "image": image}],
+        },
+        "status": {
+            "phase": "Running",
+            "containerStatuses": [{"name": "runner", "imageID": image_id}],
+        },
+    }
+
+
+def test_each_runner_pod_must_run_the_candidate_layer(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    layer = "sha256:" + "1" * 64
+    stale = "sha256:" + "2" * 64
+    run = _scripted(tmp_path, _ScriptedRun, [])
+    run.digests = {pps.LAYER_IMAGE: layer}
+    seen: list[tuple[str, str]] = []
+
+    def registry_image(get: Any, repository: str, reference: str) -> pps.RegistryImage:
+        seen.append((repository, reference))
+        return pps.RegistryImage(repository, reference, reference, CANDIDATE)
+
+    monkeypatch.setattr(pps, "registry_image", registry_image)
+    image = f"{run.inputs.registry}/dark-factory-runner@{layer}"
+    good = pp.Attempt(1)
+    good.pod_record = _runner_pod(image, f"{image}")
+    run.check_runner_image(good)
+    assert run.ledger.observations("roles")["runner_image_attempt_1"] == {
+        "from_run_registry": True,
+        "digest_matches": True,
+        "revision_matches": True,
+    }
+    assert seen == [("dark-factory-runner", layer)]
+
+    # The same tag can resolve to a stale image on the node; only the digest proves it.
+    old = pp.Attempt(2)
+    old.pod_record = _runner_pod(
+        f"{run.inputs.registry}/dark-factory-runner:candidate",
+        f"{run.inputs.registry}/dark-factory-runner@{stale}",
+    )
+    with pytest.raises(pp.StepFailed, match="not running the candidate runner image"):
+        run.check_runner_image(old)
+    recorded = run.ledger.observations("roles")["runner_image_attempt_2"]
+    assert recorded["digest_matches"] is False
+    checks, _counts = pps._judge_roles(run.ledger)
+    assert checks["runner_images_are_candidate"] is False
+
+
+class _VolumeKube:
+    """kubectl for one namespace's PVCs and the cluster's PVs; records deletes."""
+
+    def __init__(self, namespace: str, pvs: dict[str, dict[str, Any]]) -> None:
+        self.namespace = namespace
+        self.pvs = pvs
+        self.namespace_present = True
+        self.calls: list[tuple[str, ...]] = []
+
+    def ctl(self, *args: str, **kwargs: Any) -> pp.Completed:
+        self.calls.append(args)
+        if args[:2] == ("get", "namespace"):
+            out = b"volume-run" if self.namespace_present else b""
+            return pp.Completed(0, out, b"")
+        if args[:2] == ("delete", "namespace"):
+            self.namespace_present = False
+        if args[:2] == ("get", "persistentvolume"):
+            pv = self.pvs.get(args[2])
+            return pp.Completed(0, json.dumps(pv).encode() if pv else b"", b"")
+        if args[:2] == ("delete", "persistentvolume"):
+            self.pvs.pop(args[2], None)
+        return pp.Completed(0, b"", b"")
+
+    def json(self, *args: str, **kwargs: Any) -> Any:
+        self.calls.append(args)
+        return {
+            "items": [
+                {
+                    "metadata": {"name": "data-postgres-0", "uid": "pvc-uid-1"},
+                    "spec": {"volumeName": "pvc-0f0e0d0c"},
+                },
+                {"metadata": {"name": "pending", "uid": "pvc-uid-2"}, "spec": {}},
+            ]
+        }
+
+
+def _retained(uid: str, namespace: str) -> dict[str, Any]:
+    return {
+        "metadata": {"name": "pvc-0f0e0d0c"},
+        "spec": {
+            "persistentVolumeReclaimPolicy": "Retain",
+            "claimRef": {"namespace": namespace, "name": "data-postgres-0", "uid": uid},
+        },
+        "status": {"phase": "Released"},
+    }
+
+
+def test_a_retained_volume_of_the_run_is_recorded_deleted_and_checked(tmp_path: Path) -> None:
+    run = _scripted(tmp_path, _ScriptedRun, [], run_id="volume-run")
+    kube = _VolumeKube(run.inputs.namespace, {})
+    kube.pvs["pvc-0f0e0d0c"] = _retained("pvc-uid-1", run.inputs.namespace)
+    run.kube = kube  # type: ignore[assignment]
+    pp.LiveRun.delete_namespace(run)
+    assert run.volumes == {"pvc-0f0e0d0c": "pvc-uid-1"}
+    # The namespace is gone but the Retain volume is not: the inventory must say so.
+    assert run.volumes_absent() is False
+    run.delete_owned_volumes()
+    assert ("delete", "persistentvolume", "pvc-0f0e0d0c") == kube.calls[-2][:3]
+    assert run.volumes_absent() is True
+    assert run.ledger.observations("install")["owned_volumes"] == 1
+
+    # A volume now bound to another claim is not the run's to delete.
+    other = _scripted(_private(tmp_path / "other"), _ScriptedRun, [], run_id="volume-run")
+    rebound = _VolumeKube(other.inputs.namespace, {})
+    rebound.pvs["pvc-0f0e0d0c"] = _retained("someone-else", "elsewhere")
+    other.kube = rebound  # type: ignore[assignment]
+    other.volumes = {"pvc-0f0e0d0c": "pvc-uid-1"}
+    with pytest.raises(pp.StepFailed, match="bound elsewhere"):
+        other.delete_owned_volumes()
+    assert not any(call[:2] == ("delete", "persistentvolume") for call in rebound.calls)

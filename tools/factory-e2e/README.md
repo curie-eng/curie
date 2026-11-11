@@ -251,7 +251,9 @@ model.
    non-synthetic assistant turns, on the configured models; no synthetic
    assistant record in either attempt; at least one `mcp__curie__` tool call;
    the bundle's review gate state files (the hook ran); at most one native
-   CLI process at a time; the running images are the pushed candidate digests;
+   CLI process at a time; the running images are the pushed candidate digests,
+   including each attempt's runner pod, whose running image digest and revision
+   label must be the candidate layer's;
    no service credential in the deployed settings; and the owner tuple
    (tenant, mode `personal`, principal, generation 1) from both
    `GET /work-items/{id}` and `curie cluster work-items <id> --json`, and on
@@ -332,7 +334,21 @@ policy the platform keeps the historical `curie/` prefix for that branch and
 ignores the operator prefix, so the run reads it once each attempt parks.
 Evidence, cleanup and the absence checks cover both.
 
+The driver owns a forge object only after creating it succeeds. It closes or
+deletes a branch or pull request only while its head is the commit this run
+made: the forge probe's own commit, or the commit its publication pushed.
+Anything else is left in place and reported by the absence inventory, so a
+name collision never removes a foreign branch.
+
+Before the namespace is deleted, the driver records the persistent volume
+bound to each of the run's claims. A dynamically provisioned volume carries no
+release mark, and one with reclaim policy `Retain` outlives the namespace, so
+each recorded volume still claimed by the run is deleted afterwards and its
+absence is part of the inventory.
+
 Each resource's cleanup is registered before the resource is created and runs
 in reverse order on success, failure, rejection and on SIGINT or SIGTERM.
 Transcripts are parsed in memory; the ledger keeps only sanitized per-session
-facts, never a raw transcript.
+facts, never a raw transcript. A transcript whose final record is unterminated
+or unreadable makes that attempt's usage unknown, so the budget judge fails
+rather than counting a partial session.

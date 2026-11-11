@@ -30,6 +30,7 @@ import argparse
 import base64
 import contextlib
 import dataclasses
+import functools
 import hashlib
 import http.client
 import json
@@ -1291,7 +1292,9 @@ def cmd_forge_probe(args: argparse.Namespace, runtime: Runtime) -> int:
     )
     finalizer = Finalizer(ledger)
     branch = f"ppa-probe-{hashlib.sha256(inputs.run_id.encode()).hexdigest()[:8]}"
-    state: dict[str, Any] = {"pull": None, "ref": False}
+    # Owned only once created: the commit this run made, and the branch and pull
+    # request that point at it. A deterministic name that already exists is foreign.
+    state: dict[str, Any] = {"pull": None, "ref": None, "commit": None}
     results = {
         "forge_push": False,
         "forge_pr_open": False,
@@ -1301,6 +1304,9 @@ def cmd_forge_probe(args: argparse.Namespace, runtime: Runtime) -> int:
 
     def close_pull() -> None:
         if state["pull"] is not None:
+            current = forge.call("GET", forge.repo_path(f"/pulls/{state['pull']}"))
+            if str(((current or {}).get("head") or {}).get("sha")) != state["commit"]:
+                raise StepFailed("probe pull request head is not this run's commit; not closing")
             forge.call("PATCH", forge.repo_path(f"/pulls/{state['pull']}"), {"state": "closed"})
             pull = forge.call("GET", forge.repo_path(f"/pulls/{state['pull']}"))
             results["forge_pr_closed"] = isinstance(pull, dict) and pull.get("state") == "closed"
@@ -1309,6 +1315,12 @@ def cmd_forge_probe(args: argparse.Namespace, runtime: Runtime) -> int:
 
     def delete_ref() -> None:
         if state["ref"]:
+            found, current = forge.request("GET", forge.repo_path(f"/git/ref/heads/{branch}"))
+            if (
+                found == 200
+                and str(((current or {}).get("object") or {}).get("sha")) != (state["commit"])
+            ):
+                raise StepFailed("probe branch head is not this run's commit; not deleting")
             status, _ = forge.request("DELETE", forge.repo_path(f"/git/refs/heads/{branch}"))
             gone, _ = forge.request("GET", forge.repo_path(f"/git/ref/heads/{branch}"))
             results["forge_branch_deleted"] = status in {204, 422} and gone == 404
@@ -1334,13 +1346,14 @@ def cmd_forge_probe(args: argparse.Namespace, runtime: Runtime) -> int:
                 {"message": "personal profile forge probe", "tree": tree, "parents": [head_sha]},
                 ok=(201,),
             )
-            state["ref"] = True
+            state["commit"] = str(created.get("sha"))
             forge.call(
                 "POST",
                 forge.repo_path("/git/refs"),
-                {"ref": f"refs/heads/{branch}", "sha": created.get("sha")},
+                {"ref": f"refs/heads/{branch}", "sha": state["commit"]},
                 ok=(201,),
             )
+            state["ref"] = f"refs/heads/{branch}"
             results["forge_push"] = True
             pull = forge.call(
                 "POST",
@@ -1475,6 +1488,7 @@ class Attempt:
     approval_id: str = ""
     publication_id: str = ""
     branch: str = ""
+    pod_record: dict[str, Any] = dataclasses.field(default_factory=dict)
     parked_at: float = 0.0
     gone_at: float = 0.0
     facts: pps.TranscriptFacts | None = None
@@ -1515,6 +1529,12 @@ class LiveRun:
         # publication_policy.py publication_branch_name), so each publication's own
         # branch is read from the API and owned by the run as well.
         self.publication_branches: list[str] = []
+        # Branch -> the commit the run's publication put there, once observed.
+        self.published_heads: dict[str, str] = {}
+        # Every PV bound to one of the run's PVCs, by name, with that PVC's uid. A
+        # dynamically provisioned pvc-<uuid> volume carries no release mark, and
+        # one with reclaim policy Retain outlives the namespace.
+        self.volumes: dict[str, str] = {}
         self.trigger_label = f"ppa-unused-{digest[16:24]}"
         self.nonce = secrets.token_hex(8)
         self.owner_subject = f"ppa-owner-{secrets.token_hex(8)}"
@@ -1768,6 +1788,8 @@ class LiveRun:
 
     def phase_namespace(self) -> None:
         self.mutated = True
+        # Registered first, so it runs after the namespace is gone.
+        self.finalizer.register("delete-owned-volumes", self.delete_owned_volumes)
         self.finalizer.register("delete-namespace", self.delete_namespace)
         self.kube.create(
             {
@@ -1797,6 +1819,7 @@ class LiveRun:
             return
         if owner != self.inputs.run_id:
             raise StepFailed("namespace ownership changed; not deleting")
+        self.record_volumes()
         self.kube.ctl(
             "delete",
             "namespace",
@@ -1806,6 +1829,51 @@ class LiveRun:
             namespaced=False,
             timeout=260,
         )
+
+    def record_volumes(self) -> None:
+        """Remember the PV bound to each of the run's PVCs, before anything is torn down."""
+
+        listed = self.kube.json("get", "persistentvolumeclaims")
+        for item in listed.get("items") or [] if isinstance(listed, dict) else []:
+            name = (item.get("spec") or {}).get("volumeName")
+            uid = (item.get("metadata") or {}).get("uid")
+            if isinstance(name, str) and name and isinstance(uid, str) and uid:
+                self.volumes[name] = uid
+        self.ledger.record("install", "owned_volumes", len(self.volumes))
+
+    def volume(self, name: str) -> dict[str, Any] | None:
+        result = self.kube.ctl(
+            "get", "persistentvolume", name, "--ignore-not-found", "-o", "json", namespaced=False
+        )
+        if not result.stdout.strip():
+            return None
+        value = json.loads(result.stdout)
+        return value if isinstance(value, dict) else {}
+
+    def delete_owned_volumes(self) -> None:
+        """Delete each recorded PV that survived the namespace, if one of the run's PVCs held it."""
+
+        for name, uid in sorted(self.volumes.items()):
+            pv = self.volume(name)
+            if pv is None:
+                continue
+            claim = (pv.get("spec") or {}).get("claimRef") or {}
+            if claim.get("uid") != uid or claim.get("namespace") != self.inputs.namespace:
+                raise StepFailed("a recorded volume is now bound elsewhere; not deleting")
+            self.kube.ctl(
+                "delete",
+                "persistentvolume",
+                name,
+                "--wait=true",
+                "--timeout=120s",
+                namespaced=False,
+                timeout=140,
+            )
+            if self.volume(name) is not None:
+                raise StepFailed("a retained volume of the run still exists")
+
+    def volumes_absent(self) -> bool:
+        return all(self.volume(name) is None for name in self.volumes)
 
     # -- phase 3: images ------------------------------------------------------
 
@@ -1975,6 +2043,7 @@ class LiveRun:
             required=("curie-api", "curie-worker", "curie-dispatcher"),
         )
         self.ledger.record("roles", "candidate_images_running", not failures)
+        self.safe(self.record_volumes, None)
         if failures:
             raise StepFailed("candidate images are not the running images")
         documents = [
@@ -2325,18 +2394,53 @@ class LiveRun:
         if branch not in self.publication_branches:
             self.publication_branches.append(branch)
 
+    def owned_heads(self) -> dict[str, str]:
+        """Each run branch's commit that this run's publication created, where known.
+
+        A branch or pull request is closed or deleted only while its head is
+        that commit; anything else is left for the absence inventory to report.
+        """
+
+        heads = dict(self.published_heads)
+        for attempt in self.attempts.values():
+            if not attempt.branch or not attempt.publication_id or attempt.branch in heads:
+                continue
+            record = self.safe(functools.partial(self.publication, attempt.publication_id), {})
+            sha = str((record or {}).get("lineage_head_sha") or "")
+            if pps.is_commit_sha(sha) and sha != str((record or {}).get("lineage_base_sha")):
+                heads[attempt.branch] = sha
+        return heads
+
     def close_run_pulls(self) -> None:
         forge = self.require_forge()
+        heads = self.owned_heads()
+        skipped = 0
         for pull in self.run_pulls():
-            if pull.get("state") == "open":
-                forge.call(
-                    "PATCH", forge.repo_path(f"/pulls/{pull.get('number')}"), {"state": "closed"}
-                )
+            if pull.get("state") != "open":
+                continue
+            head = pull.get("head") or {}
+            if heads.get(str(head.get("ref"))) != str(head.get("sha")):
+                skipped += 1
+                continue
+            forge.call(
+                "PATCH", forge.repo_path(f"/pulls/{pull.get('number')}"), {"state": "closed"}
+            )
+        if skipped:
+            raise StepFailed("an open run pull request is not at this run's commit; left open")
 
     def delete_run_branches(self) -> None:
         forge = self.require_forge()
+        heads = self.owned_heads()
+        skipped = 0
         for ref in self.run_branches():
+            expected = heads.get(ref.removeprefix("refs/heads/"))
+            current = forge.call("GET", forge.repo_path(f"/git/{ref}")) if expected else {}
+            if not expected or str((current.get("object") or {}).get("sha")) != expected:
+                skipped += 1
+                continue
             forge.call("DELETE", forge.repo_path(f"/git/{ref}"), ok=(204,))
+        if skipped:
+            raise StepFailed("a run branch is not at this run's commit; left in place")
 
     # -- phase 6b: the unpaid publication drill (rehearse only) ------------------
 
@@ -2752,10 +2856,13 @@ class LiveRun:
                         attempt.pod = str(meta.get("name"))
                         attempt.pod_uid = uid
                         attempt.grant_ref = pps.pod_grant_ref(pod)
+                        attempt.pod_record = pod
                         return True
             return False
 
         self.wait_until(running, until=until, what="runner pod", every=2.0)
+        self.safe(self.record_volumes, None)
+        self.check_runner_image(attempt)
         if previous is not None:
             self.ledger.record(
                 "pod-restart", "new_pod_uid_differs", attempt.pod_uid != previous.pod_uid
@@ -2823,6 +2930,32 @@ class LiveRun:
                 "new_process_after_deletion",
                 start is not None and first.gone_at > 0 and start > first.gone_at,
             )
+
+    def check_runner_image(self, attempt: Attempt) -> None:
+        """The attempt's runner pod runs the candidate layer: digest and revision label."""
+
+        checks, running = pps.runner_image_check(
+            attempt.pod_record,
+            registry=self.inputs.registry,
+            digest=self.digests.get(pps.LAYER_IMAGE, ""),
+        )
+        image = None
+        if running:
+            spec_image = next(
+                (
+                    str(item.get("image") or "")
+                    for item in (attempt.pod_record.get("spec") or {}).get("containers") or []
+                    if isinstance(item, dict) and item.get("name") == pps.RUNNER_CONTAINER
+                ),
+                "",
+            )
+            repository = re.split(r"[@:]", spec_image.removeprefix(self.inputs.registry + "/"))[0]
+            get = pps.loopback_get("127.0.0.1", self.inputs.registry_port)
+            image = self.safe(lambda: pps.registry_image(get, repository, running), None)
+        checks["revision_matches"] = image is not None and image.revision == self.inputs.candidate
+        self.ledger.record("roles", f"runner_image_attempt_{attempt.number}", checks)
+        if not all(checks.values()):
+            raise StepFailed("the runner pod is not running the candidate runner image")
 
     def error_suffix(self, attempt: Attempt) -> str:
         """The first sanitized error class the attempt's transcripts carry, for the failure text."""
@@ -3129,6 +3262,8 @@ class LiveRun:
         pull = forge.call("GET", forge.repo_path(f"/pulls/{number}"))
         head = pull.get("head") or {}
         head_sha = str(head.get("sha") or "")
+        if second.branch and str(head.get("ref") or "") == second.branch and head_sha:
+            self.published_heads[second.branch] = head_sha
         commit = forge.call("GET", forge.repo_path(f"/git/commits/{head_sha}"))
         self.ledger.record("publication", "pr_draft", pull.get("draft"))
         self.ledger.record(
@@ -3240,6 +3375,7 @@ class LiveRun:
                 or not any(pull.get("state") == "open" for pull in self.run_pulls())
             ),
             "forge_branches": lambda: not self.policy_set or not self.run_branches(),
+            "volumes": self.volumes_absent,
         }
         results: dict[str, str] = {}
         for kind, check in checks.items():

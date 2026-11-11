@@ -1398,6 +1398,7 @@ class SessionFacts:
     usage_known: bool
     message_ids: frozenset[str] = frozenset()
     errors: tuple[dict[str, Any], ...] = ()
+    truncated: bool = False
 
     def usage(self) -> SessionUsage | None:
         if not self.usage_known:
@@ -1414,6 +1415,7 @@ class TranscriptFacts:
     synthetic_records: int
     aci_tool_calls: int
     replayed_records: int = 0
+    truncated_files: int = 0
 
     def message_ids(self) -> frozenset[str]:
         return frozenset(item for session in self.sessions for item in session.message_ids)
@@ -1434,12 +1436,17 @@ def _timestamp(value: Any) -> float | None:
     return parsed.timestamp()
 
 
-def _records(data: bytes) -> tuple[list[dict[str, Any]], int]:
+def _records(data: bytes) -> tuple[list[dict[str, Any]], int, bool]:
+    """Complete records, the malformed count, and whether a final line was unterminated.
+
+    The CLI ends every record with a newline. An unterminated final line is a
+    record still being written, or one the capture cut short. It is never
+    parsed, and the caller treats that session's usage as unknown.
+    """
+
     lines = data.split(b"\n")
-    if lines and lines[-1] == b"":
-        lines.pop()
-    elif lines:
-        # A trailing line without a newline may still be being written.
+    truncated = bool(lines) and bool(lines[-1].strip())
+    if lines:
         lines.pop()
     records: list[dict[str, Any]] = []
     malformed = 0
@@ -1455,7 +1462,7 @@ def _records(data: bytes) -> tuple[list[dict[str, Any]], int]:
             records.append(value)
         else:
             malformed += 1
-    return records, malformed
+    return records, malformed, truncated
 
 
 def _role_of(subagent_type: Any) -> str | None:
@@ -1637,6 +1644,7 @@ def parse_native_transcripts(
     subagents: dict[str, list[dict[str, Any]]] = {}
     sidecars: dict[str, dict[str, Any]] = {}
     malformed = 0
+    truncated: set[str] = set()
     for name, data in files.items():
         parts = PurePosixPath(name).parts
         if "projects" not in parts:
@@ -1652,8 +1660,10 @@ def parse_native_transcripts(
             continue
         if not name.endswith(".jsonl"):
             continue
-        records, bad = _records(data)
+        records, bad, cut = _records(data)
         malformed += bad
+        if cut:
+            truncated.add(name.removesuffix(".jsonl"))
         if "subagents" in parts:
             subagents[name.removesuffix(".jsonl")] = records
         else:
@@ -1719,6 +1729,11 @@ def parse_native_transcripts(
             sessions.append(_session_facts(stem, role, parent, kept))
 
     for session in sessions:
+        if session.path in truncated:
+            # The cut record's usage is missing, so the session's total is unknown.
+            session.truncated = True
+            session.usage_known = False
+    for session in sessions:
         if session.role != IMPLEMENTER or session.first is None or session.last is None:
             continue
         nested = [
@@ -1738,6 +1753,7 @@ def parse_native_transcripts(
         synthetic_records=sum(session.synthetic for session in sessions),
         aci_tool_calls=sum(session.aci_tool_calls for session in sessions),
         replayed_records=replayed,
+        truncated_files=len(truncated),
     )
 
 
@@ -1797,10 +1813,11 @@ def settle_attempt(
 ) -> dict[str, int]:
     """Match observed sessions to this attempt's reservations and settle every one.
 
-    An incomplete harvest (a gap, an unreadable line, or a stream that never
-    ended) leaves every reserved slot unknown, because partial transcripts can
-    undercount. Otherwise a slot with no observed session settles to zero and
-    an observed session beyond the reservations is recorded as unreserved.
+    An incomplete harvest (a gap, an unreadable line, an unterminated final
+    record, or a stream that never ended) leaves every reserved slot unknown,
+    because partial transcripts can undercount. Otherwise a slot with no
+    observed session settles to zero and an observed session beyond the
+    reservations is recorded as unreserved.
     """
 
     admitted_without_implementer = (
@@ -1808,7 +1825,13 @@ def settle_attempt(
         and any(item.role == IMPLEMENTER for item in reservations)
         and not any(session.role == IMPLEMENTER for session in facts.sessions)
     )
-    if not complete or facts is None or facts.malformed_lines or admitted_without_implementer:
+    if (
+        not complete
+        or facts is None
+        or facts.malformed_lines
+        or facts.truncated_files
+        or admitted_without_implementer
+    ):
         # Admitted work always runs an implementer; no implementer record means
         # the capture missed it, so nothing here may settle to zero.
         for reserved in reservations:
@@ -2267,6 +2290,10 @@ CREDENTIAL_STATES = frozenset({"present", "empty", "absent", "unreadable"})
 _PUBLICATION_BRANCH_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,62}/publication-[0-9a-f]{32}")
 
 
+def is_commit_sha(value: str) -> bool:
+    return re.fullmatch(r"[0-9a-f]{40}", value) is not None
+
+
 def publication_branch_valid(branch: str) -> bool:
     """A lineage branch the platform names: ``<prefix>/publication-<32 hex>``. Pure."""
 
@@ -2474,6 +2501,7 @@ INVENTORY_KINDS = (
     "forge_issue",
     "forge_prs",
     "forge_branches",
+    "volumes",
 )
 SCAN_CHANNELS = ("stdout", "stderr", "children", "http", "harvest", "ledger", "evidence")
 OWNER_KEYS = ("tenant_id", "mode", "principal_id", "generation")
@@ -2545,6 +2573,12 @@ def _judge_roles(ledger: Ledger) -> tuple[dict[str, bool], dict[str, int]]:
         and observed["aci_tool_calls"] >= 1,
         "service_credentials_absent": _true(observed, "service_credentials_absent"),
         "candidate_images_running": _true(observed, "candidate_images_running"),
+        "runner_images_are_candidate": all(
+            isinstance(observed.get(f"runner_image_attempt_{n}"), dict)
+            and bool(observed[f"runner_image_attempt_{n}"])
+            and all(value is True for value in observed[f"runner_image_attempt_{n}"].values())
+            for n in (1, 2)
+        ),
         "one_active_profile_process": observed.get("active_profile_processes_max") == 1,
     }
     counts = {
@@ -3289,6 +3323,42 @@ def running_image_failures(
                 seen.add(name)
     failures.extend(f"{name}_not_running" for name in required if name not in seen)
     return sorted(set(failures))
+
+
+RUNNER_CONTAINER = "runner"
+
+
+def runner_image_check(pod: Any, *, registry: str, digest: str) -> tuple[dict[str, bool], str]:
+    """Whether a runner pod's ``runner`` container runs the pushed candidate layer. Pure.
+
+    The spec image must come from the run's registry and the running
+    ``imageID`` must carry the pushed digest; a same-tag stale image fails.
+    Returns the checks and the running digest, empty when none is reported.
+    """
+
+    pod = pod if isinstance(pod, dict) else {}
+    spec = next(
+        (
+            item
+            for item in (pod.get("spec") or {}).get("containers") or []
+            if isinstance(item, dict) and item.get("name") == RUNNER_CONTAINER
+        ),
+        {},
+    )
+    status = next(
+        (
+            item
+            for item in (pod.get("status") or {}).get("containerStatuses") or []
+            if isinstance(item, dict) and item.get("name") == RUNNER_CONTAINER
+        ),
+        {},
+    )
+    found = _DIGEST.findall(str(status.get("imageID") or ""))
+    running = found[-1] if found else ""
+    return {
+        "from_run_registry": str(spec.get("image") or "").startswith(registry + "/"),
+        "digest_matches": bool(running) and running == digest,
+    }, running
 
 
 def route_bound_to(listing: Any, route: str, subject: str) -> bool:
