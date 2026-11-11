@@ -911,10 +911,31 @@ def recorded_pushed(ledger: pps.Ledger) -> list[Pushed]:
     return items
 
 
-def remove_registry_images(port: int, pushed: Sequence[Pushed]) -> None:
+def registry_targets(
+    port: int, pushed: Sequence[Pushed], tags: Sequence[str]
+) -> list[tuple[str, str]]:
+    """Every (repository, digest) the run put in the registry.
+
+    The recorded digests, plus whatever each tag the driver built names now, so a
+    push the driver could not read back is still found and deleted.
+    """
+
+    targets = {(item.repository, item.digest) for item in pushed}
+    get = pps.loopback_get("127.0.0.1", port)
+    for tag in tags:
+        repository, reference = pps.split_image_ref(tag)
+        status, _headers, body = get(
+            f"/v2/{repository}/manifests/{reference}", {"Accept": pps.MANIFEST_ACCEPT}
+        )
+        if status == 200:
+            targets.add((repository, "sha256:" + hashlib.sha256(body).hexdigest()))
+    return sorted(targets)
+
+
+def remove_registry_images(port: int, pushed: Sequence[Pushed], tags: Sequence[str]) -> None:
     failures = 0
-    for item in pushed:
-        status = registry_delete(port, item.repository, item.digest)
+    for repository, digest in registry_targets(port, pushed, tags):
+        status = registry_delete(port, repository, digest)
         failures += status not in {202, 404}
     if failures:
         raise StepFailed("registry refused a manifest delete; enable registry deletes")
@@ -975,7 +996,11 @@ def cmd_images(args: argparse.Namespace, runtime: Runtime) -> int:
     except BaseException:
         finalizer.register(
             "remove-registry-images",
-            lambda: remove_registry_images(inputs.registry_port, recorded_pushed(ledger)),
+            lambda: remove_registry_images(
+                inputs.registry_port,
+                recorded_pushed(ledger),
+                ledger.observations("images").get("local_tags") or [],
+            ),
         )
         finalizer.register(
             "remove-local-images",
@@ -1514,7 +1539,7 @@ class LiveRun:
     def phase_images(self) -> None:
         self.finalizer.register(
             "remove-registry-images",
-            lambda: remove_registry_images(self.inputs.registry_port, self.pushed),
+            lambda: remove_registry_images(self.inputs.registry_port, self.pushed, self.local_tags),
         )
         self.finalizer.register(
             "remove-local-images", lambda: remove_local_images(self.shell, self.local_tags)
@@ -2611,10 +2636,11 @@ class LiveRun:
 
     def registry_absent(self) -> bool:
         get = pps.loopback_get("127.0.0.1", self.inputs.registry_port)
-        for item in self.pushed:
+        references = [(item.repository, item.digest) for item in self.pushed]
+        references += [pps.split_image_ref(tag) for tag in self.local_tags]
+        for repository, reference in references:
             status, _headers, _body = get(
-                f"/v2/{item.repository}/manifests/{item.digest}",
-                {"Accept": pps.MANIFEST_ACCEPT},
+                f"/v2/{repository}/manifests/{reference}", {"Accept": pps.MANIFEST_ACCEPT}
             )
             if status != 404:
                 return False

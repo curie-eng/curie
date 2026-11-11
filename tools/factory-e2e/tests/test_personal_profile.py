@@ -117,10 +117,96 @@ def _image(revision: str) -> tuple[bytes, bytes]:
     return manifest, config
 
 
-@contextlib.contextmanager
-def _registry(images: Mapping[tuple[str, str], tuple[bytes, bytes]]) -> Iterator[int]:
-    """A loopback Registry HTTP API v2 fixture serving manifests by tag and config blobs."""
+def _index_image(revision: str, *, platforms: int = 1) -> tuple[bytes, bytes, dict[str, bytes]]:
+    """A recorded buildkit push: an OCI index naming the image and its attestation.
 
+    Recorded from registry:2.8.3 after ``docker build --platform linux/amd64``
+    and ``docker push``: one ``linux/amd64`` image manifest plus an
+    ``unknown/unknown`` manifest annotated ``attestation-manifest``. Returns the
+    index, the image config blob and the child manifests by digest.
+    """
+
+    _manifest, config = _image(revision)
+    config_digest = "sha256:" + hashlib.sha256(config).hexdigest()
+    image = json.dumps(
+        {
+            "schemaVersion": 2,
+            "mediaType": "application/vnd.oci.image.manifest.v1+json",
+            "config": {
+                "mediaType": "application/vnd.oci.image.config.v1+json",
+                "digest": config_digest,
+                "size": len(config),
+            },
+            "layers": [
+                {
+                    "mediaType": "application/vnd.oci.image.layer.v1.tar+gzip",
+                    "digest": "sha256:" + "2" * 64,
+                    "size": 32,
+                }
+            ],
+        }
+    ).encode()
+    attestation = json.dumps(
+        {
+            "schemaVersion": 2,
+            "mediaType": "application/vnd.oci.image.manifest.v1+json",
+            "config": {
+                "mediaType": "application/vnd.oci.image.config.v1+json",
+                "digest": "sha256:" + "3" * 64,
+                "size": 167,
+            },
+            "layers": [],
+        }
+    ).encode()
+    image_digest = "sha256:" + hashlib.sha256(image).hexdigest()
+    attestation_digest = "sha256:" + hashlib.sha256(attestation).hexdigest()
+    entries: list[dict[str, Any]] = [
+        {
+            "mediaType": "application/vnd.oci.image.manifest.v1+json",
+            "digest": image_digest,
+            "size": len(image),
+            "platform": {"architecture": arch, "os": "linux"},
+        }
+        for arch in ("amd64", "arm64")[:platforms]
+    ]
+    entries.append(
+        {
+            "mediaType": "application/vnd.oci.image.manifest.v1+json",
+            "digest": attestation_digest,
+            "size": len(attestation),
+            "annotations": {
+                "vnd.docker.reference.digest": image_digest,
+                "vnd.docker.reference.type": "attestation-manifest",
+            },
+            "platform": {"architecture": "unknown", "os": "unknown"},
+        }
+    )
+    index = json.dumps(
+        {
+            "schemaVersion": 2,
+            "mediaType": "application/vnd.oci.image.index.v1+json",
+            "manifests": entries,
+        }
+    ).encode()
+    return index, config, {image_digest: image, attestation_digest: attestation}
+
+
+@contextlib.contextmanager
+def _registry(
+    images: Mapping[tuple[str, str], tuple[bytes, bytes]],
+    children: Mapping[tuple[str, str], bytes] | None = None,
+) -> Iterator[int]:
+    """A loopback Registry HTTP API v2 fixture serving manifests and config blobs.
+
+    ``images`` maps (repository, tag or digest) to a manifest or index plus its
+    config blob; ``children`` maps (repository, digest) to manifests an index
+    names. Content negotiation follows registry:2.8.3: a manifest is served only
+    when Accept names its media type, and an index otherwise answers 404
+    MANIFEST_UNKNOWN.
+    """
+
+    manifests = {key: value[0] for key, value in images.items()}
+    manifests.update(children or {})
     blobs = {
         "sha256:" + hashlib.sha256(config).hexdigest(): config
         for _manifest, config in images.values()
@@ -135,12 +221,13 @@ def _registry(images: Mapping[tuple[str, str], tuple[bytes, bytes]]) -> Iterator
             body: bytes | None = None
             headers: dict[str, str] = {}
             if len(parts) == 5 and parts[1] == "v2" and parts[3] == "manifests":
-                accepted = self.headers.get("Accept", "")
-                found = images.get((parts[2], parts[4]))
-                if found and "manifest.v2+json" in accepted:
-                    body = found[0]
+                accepted = [item.strip() for item in self.headers.get("Accept", "").split(",")]
+                found = manifests.get((parts[2], parts[4]))
+                media_type = json.loads(found).get("mediaType") if found else None
+                if found and media_type in accepted:
+                    body = found
                     headers = {
-                        "Content-Type": "application/vnd.docker.distribution.manifest.v2+json",
+                        "Content-Type": str(media_type),
                         "Docker-Content-Digest": "sha256:" + hashlib.sha256(body).hexdigest(),
                     }
             elif len(parts) == 5 and parts[1] == "v2" and parts[3] == "blobs":
@@ -166,6 +253,34 @@ def _registry(images: Mapping[tuple[str, str], tuple[bytes, bytes]]) -> Iterator
         server.shutdown()
         server.server_close()
         thread.join(timeout=10)
+
+
+def test_registry_image_reads_the_revision_through_a_buildkit_index() -> None:
+    index, config, children = _index_image(CANDIDATE)
+    tag = CANDIDATE[:12]
+    get_children = {("curie-api", digest): body for digest, body in children.items()}
+    with _registry({("curie-api", tag): (index, config)}, get_children) as port:
+        image = pps.registry_image(pps.loopback_get("127.0.0.1", port), "curie-api", tag)
+    assert image is not None
+    # The pinned and pod-reported digest is the index the tag names, not the child.
+    assert image.digest == "sha256:" + hashlib.sha256(index).hexdigest()
+    assert image.revision == CANDIDATE
+
+    index, config, children = _index_image(CANDIDATE, platforms=2)
+    get_children = {("curie-api", digest): body for digest, body in children.items()}
+    with _registry({("curie-api", tag): (index, config)}, get_children) as port:
+        assert pps.registry_image(pps.loopback_get("127.0.0.1", port), "curie-api", tag) is None
+
+
+def test_registry_cleanup_finds_a_push_the_driver_never_read_back() -> None:
+    index, config, children = _index_image(OTHER_SHA)
+    tag = CANDIDATE[:12]
+    served = {("curie-api", digest): body for digest, body in children.items()}
+    with _registry({("curie-api", tag): (index, config)}, served) as port:
+        targets = pp.registry_targets(port, [], [f"localhost:{port}/curie-api:{tag}"])
+        absent = pp.registry_targets(port, [], [f"localhost:{port}/curie-worker:{tag}"])
+    assert targets == [("curie-api", "sha256:" + hashlib.sha256(index).hexdigest())]
+    assert absent == []
 
 
 def _candidate_images(revision: str = CANDIDATE) -> dict[tuple[str, str], tuple[bytes, bytes]]:

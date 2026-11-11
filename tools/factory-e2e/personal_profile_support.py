@@ -82,10 +82,19 @@ REVISION_LABEL = "org.opencontainers.image.revision"
 PLATFORM_IMAGES = ("curie-api", "curie-worker", "curie-dispatcher", "curie-runner")
 LAYER_IMAGE = "curie-factory-runner"
 REQUIRED_IMAGES = (*PLATFORM_IMAGES, LAYER_IMAGE)
-MANIFEST_ACCEPT = (
-    "application/vnd.docker.distribution.manifest.v2+json, "
-    "application/vnd.oci.image.manifest.v1+json"
+IMAGE_MANIFEST_TYPES = (
+    "application/vnd.docker.distribution.manifest.v2+json",
+    "application/vnd.oci.image.manifest.v1+json",
 )
+INDEX_MANIFEST_TYPES = (
+    "application/vnd.oci.image.index.v1+json",
+    "application/vnd.docker.distribution.manifest.list.v2+json",
+)
+# registry:2 answers an index-tagged manifest with 404 MANIFEST_UNKNOWN unless the
+# Accept header names the index type, and buildkit pushes an index whenever it
+# attaches a provenance attestation.
+MANIFEST_ACCEPT = ", ".join((*IMAGE_MANIFEST_TYPES, *INDEX_MANIFEST_TYPES))
+ATTESTATION_REFERENCE = "attestation-manifest"
 MANAGED_BY_LABEL = "app.kubernetes.io/managed-by"
 MANAGED_BY_VALUE = "curie-personal-profile"
 RUN_ANNOTATION = "curie.dev/personal-profile-run"
@@ -545,6 +554,40 @@ def loopback_get(address: str, port: int, *, timeout: float = 30) -> RegistryGet
     return get
 
 
+def _platform_manifest(
+    get: RegistryGet, repository: str, index: dict[str, Any]
+) -> dict[str, Any] | None:
+    """The one runnable image manifest an index names, read by digest; else None.
+
+    The digest the pod reports and the chart pins stays the index digest. Only
+    the revision label is read through the index, from the single entry whose
+    platform is a real os and architecture and which is not an attestation.
+    """
+
+    entries = [
+        entry
+        for entry in index.get("manifests") or []
+        if isinstance(entry, dict)
+        and entry.get("mediaType") in IMAGE_MANIFEST_TYPES
+        and (entry.get("annotations") or {}).get("vnd.docker.reference.type")
+        != ATTESTATION_REFERENCE
+        and (entry.get("platform") or {}).get("os") not in {None, "", "unknown"}
+        and (entry.get("platform") or {}).get("architecture") not in {None, "", "unknown"}
+    ]
+    if len(entries) != 1:
+        return None
+    child = entries[0].get("digest")
+    if not isinstance(child, str) or not _DIGEST.fullmatch(child):
+        return None
+    status, _headers, body = get(
+        f"/v2/{repository}/manifests/{child}", {"Accept": ", ".join(IMAGE_MANIFEST_TYPES)}
+    )
+    if status != 200 or "sha256:" + hashlib.sha256(body).hexdigest() != child:
+        return None
+    manifest = json.loads(body)
+    return manifest if isinstance(manifest, dict) else None
+
+
 def registry_image(get: RegistryGet, repository: str, tag: str) -> RegistryImage | None:
     """Manifest then config blob, per the Registry HTTP API v2.
 
@@ -566,6 +609,8 @@ def registry_image(get: RegistryGet, repository: str, tag: str) -> RegistryImage
         reported = headers.get("docker-content-digest")
         if reported and reported != digest:
             return None
+        if isinstance(manifest, dict) and manifest.get("mediaType") in INDEX_MANIFEST_TYPES:
+            manifest = _platform_manifest(get, repository, manifest)
         config = manifest.get("config") if isinstance(manifest, dict) else None
         config_digest = config.get("digest") if isinstance(config, dict) else None
         if not isinstance(config_digest, str) or not _DIGEST.fullmatch(config_digest):
