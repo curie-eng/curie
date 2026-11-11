@@ -480,6 +480,28 @@ def _stamp_author(
     return data.model_copy(update={"value": stamped})
 
 
+def _binding_address(segment: str) -> str:
+    """The binding address named by a ``/state/bindings/{kind}/{address}`` path.
+
+    The server decodes the request path once before it routes, so an address
+    sent with one layer of encoding loses its escapes there, and a GitHub
+    ``owner/name`` arrived split at the slash: a list landed on the single-key
+    route as binding ``github:owner`` and a write matched no route. Callers
+    therefore escape ``%`` and ``/`` in the address before encoding it as a
+    path segment (the worker's ``binding_address_text``, the CLI's
+    ``binding_address_segment``), and this decodes the segment that one more
+    time. An address holding neither character, such as a Slack channel or a
+    mail address, reads the same with or without this decode, so it travels
+    unchanged between callers and servers of either version; one holding a
+    literal ``%`` does not. This is not the form a thread key takes: a thread
+    key keeps every component percent-encoded inside the stored key
+    (``scoped_conversation_id``), while these routes decode the address and
+    compare it with the binding as stored (``_binding_scope``).
+    """
+
+    return unquote(segment)
+
+
 async def _binding_scope(
     session: AsyncSession, agent_id: uuid.UUID, kind: str, address: str
 ) -> str:
@@ -892,6 +914,7 @@ async def put_state_for_binding(
     request: Request,
     principal: Annotated[StatePrincipal, Depends(require_state_access)],
 ) -> StateEntryOut:
+    address = _binding_address(address)
     path = _state_path(namespace, key, kind, address)
     _check_memory_reach(
         principal,
@@ -1011,6 +1034,7 @@ async def append_state_for_binding(
     session: SessionDep,
     principal: Annotated[StatePrincipal, Depends(require_state_access)],
 ) -> StateEntryOut:
+    address = _binding_address(address)
     _check_memory_reach(
         principal,
         agent_id,
@@ -1120,6 +1144,7 @@ async def list_namespaces_for_binding(
     session: SessionDep,
     principal: Annotated[StatePrincipal, Depends(require_state_access)],
 ) -> list[StateNamespaceOut]:
+    address = _binding_address(address)
     scope = await _binding_scope(session, agent_id, kind, address)
     hide_memory = principal.caller is StateCaller.STATE and (
         principal.legacy or principal.binding != scope
@@ -1202,6 +1227,7 @@ async def get_state_for_binding(
     response: Response,
     principal: Annotated[StatePrincipal, Depends(require_state_access)],
 ) -> StateEntryOut:
+    address = _binding_address(address)
     _check_memory_reach(
         principal,
         agent_id,
@@ -1286,6 +1312,7 @@ async def list_state_for_binding(
     session: SessionDep,
     principal: Annotated[StatePrincipal, Depends(require_state_access)],
 ) -> list[StateEntryOut]:
+    address = _binding_address(address)
     _check_memory_reach(
         principal,
         agent_id,
@@ -1425,6 +1452,7 @@ async def delete_state_for_binding(
     principal: Annotated[StatePrincipal, Depends(require_state_access)],
     expected_version: int | None = None,
 ) -> Response:
+    address = _binding_address(address)
     path = _state_path(namespace, key, kind, address)
     _check_memory_reach(
         principal,

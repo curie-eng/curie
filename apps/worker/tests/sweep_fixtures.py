@@ -182,7 +182,11 @@ class FakeStateApi:
             if channel["agent"] != self.agent_id:
                 return httpx.Response(404, json={"detail": "agent not found"})
             failure = self.channel_failure
-            key = (unquote(channel["kind"]), unquote(channel["address"]))
+            # The real API decodes the whole path once before routing and the
+            # address segment once more (``routers/state.py``
+            # ``_binding_address``); the worker escapes ``%`` and ``/`` in the
+            # address before encoding it as a segment (``binding_address_text``).
+            key = (unquote(channel["kind"]), unquote(unquote(channel["address"])))
             entries = self.channel_memory.get(key, [])
         elif agent is not None:
             if agent["agent"] != self.agent_id:
