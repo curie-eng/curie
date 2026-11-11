@@ -88,6 +88,9 @@ os.environ.setdefault("CURIE_WORK_ITEM_RECONCILER_ENABLED", "false")
 # connections from the TestClient's loop, which a test driving the same app
 # from its own loop then receives (#1331). Its tests call reconcile_once.
 os.environ.setdefault("CURIE_DEPLOY_NOTICE_RECONCILER_ENABLED", "false")
+# The suite's create_app() is one process with no pod template to compare, which
+# the personal rollout hold (#5377) treats as held. Its tests turn it back on.
+os.environ.setdefault("CURIE_PERSONAL_ROLLOUT_HOLD", "false")
 get_settings.cache_clear()
 # A dedicated placeholder attester key for authenticated chat approval tests.
 # It is intentionally distinct from the platform key: sharing those keys would

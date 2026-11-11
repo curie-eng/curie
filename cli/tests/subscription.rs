@@ -22,22 +22,8 @@ const AMBIENT_KEY: &str = "ambient-platform-key-SENTINEL";
 const BODY_SENTINEL: &str = "server-body-SENTINEL";
 const ENROLLMENT: &str = "/personal-claude/enrollment";
 
-/// The shared token rule cases (`tests/vectors/personal-enrollment-token.json`,
-/// owned by the API stream). This is that file's contract content; switch to
-/// `include_str!("../../tests/vectors/personal-enrollment-token.json")` once the
-/// file lands, so the CLI and API read one source.
-const TOKEN_VECTOR: &str = r#"{
- "max_length": 4096,
- "cases": [
-  {"name": "printable", "token": "sk-ant-oat01-EXAMPLEexample0123456789", "valid": true},
-  {"name": "no_prefix", "token": "EXAMPLE-not-a-claude-prefix", "valid": true},
-  {"name": "empty", "token": "", "valid": false},
-  {"name": "inner_space", "token": "EXAMPLE token", "valid": false},
-  {"name": "tab", "token": "EXAMPLE\ttoken", "valid": false},
-  {"name": "inner_newline", "token": "EXAMPLE\ntoken", "valid": false},
-  {"name": "non_ascii", "token": "EXAMPLEé", "valid": false},
-  {"name": "max_length", "token_repeat": {"char": "a", "count": 4096}, "valid": true},
-  {"name": "over_max", "token_repeat": {"char": "a", "count": 4097}, "valid": false}]}"#;
+/// The shared token rule cases, the same file the API's token tests read.
+const TOKEN_VECTOR: &str = include_str!("../../tests/vectors/personal-enrollment-token.json");
 
 fn bin() -> &'static str {
     env!("CARGO_BIN_EXE_curie")

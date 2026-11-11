@@ -11,6 +11,7 @@ production deployments.
 """
 
 import json
+import re
 from functools import lru_cache
 from typing import Annotated, Any, Literal
 from urllib.parse import quote, urlsplit, urlunsplit
@@ -55,6 +56,8 @@ _DEV_DEFAULT_WEBHOOK_SECRET = "dev-webhook-secret"
 _DEV_DEFAULT_INTERNAL_WORKER_TOKEN = PUBLISHED_DEFAULT_INTERNAL_WORKER_TOKEN
 _DEV_DEFAULT_APPROVAL_CHAT_ATTESTER_SECRET = PUBLISHED_DEFAULT_APPROVAL_CHAT_ATTESTER_SECRET
 _DEV_DEFAULT_REMEDIATION_AUTHORITY_KEY = PUBLISHED_DEFAULT_REMEDIATION_AUTHORITY_KEY
+# A Kubernetes namespace name, the shape personal_claude_custody_namespace_ck pins.
+_DNS_LABEL = re.compile(r"[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?")
 
 
 class Settings(BaseSettings):
@@ -724,6 +727,47 @@ class Settings(BaseSettings):
     # cluster; when unset the API tries in-cluster config, and if neither is
     # available the logs endpoint degrades to 503 rather than crashing.
     kube_config_path: str | None = None
+
+    # Personal Claude enrollment custody (#5377, ADR 0268 section 4). The
+    # dedicated namespace that holds each enrollment generation's immutable
+    # grant Secret. Empty leaves custody unconfigured: the owner mutations answer
+    # 503 custody_unconfigured and write nothing, and no custody reconciler runs.
+    # The custody client is private to custody and reads kube_config_path, or
+    # in-cluster config when that is unset.
+    personal_grant_namespace: str = Field(
+        default="", validation_alias=AliasChoices("CURIE_PERSONAL_GRANT_NAMESPACE")
+    )
+    # The custody cleanup loop (personal_custody_reconciler.py). It runs only
+    # when the grant namespace is set, and never depends on factory enablement.
+    personal_custody_reconciler_enabled: bool = Field(
+        default=True, validation_alias=AliasChoices("CURIE_PERSONAL_CUSTODY_RECONCILER_ENABLED")
+    )
+    personal_custody_reconcile_interval_seconds: int = Field(
+        default=30,
+        gt=0,
+        validation_alias=AliasChoices("CURIE_PERSONAL_CUSTODY_RECONCILE_INTERVAL_SECONDS"),
+    )
+    # How long a staged custody row may wait for its writer to publish before a
+    # reclaim may abandon it. Far above one Secret create plus two transactions.
+    personal_custody_stage_lease_seconds: int = Field(
+        default=300,
+        gt=0,
+        validation_alias=AliasChoices("CURIE_PERSONAL_CUSTODY_STAGE_LEASE_SECONDS"),
+    )
+    # Bound on one custody Secret request. The client never retries.
+    personal_custody_kube_timeout_seconds: float = Field(
+        default=10,
+        gt=0,
+        allow_inf_nan=False,
+        validation_alias=AliasChoices("CURIE_PERSONAL_CUSTODY_KUBE_TIMEOUT_SECONDS"),
+    )
+    # Hold personal enrollment writes and personal trusted admission while the
+    # API replicas of this installation run different pod templates (#5377): an
+    # older replica would expire a personal transcript a fenced run must keep.
+    # Single-instance stacks and the test suite set it false explicitly.
+    personal_rollout_hold: bool = Field(
+        default=True, validation_alias=AliasChoices("CURIE_PERSONAL_ROLLOUT_HOLD")
+    )
     metrics_default_window_hours: int = 168  # 7 days
     # Durable state store size caps (#248). A hard non-goal of the store is that
     # it never becomes a database product, so a single value and a whole
@@ -1223,6 +1267,15 @@ class Settings(BaseSettings):
     def oidc_enabled(self) -> bool:
         """Whether generic OIDC login is configured (the issuer is the switch)."""
         return bool(self.oidc_issuer.strip())
+
+    @field_validator("personal_grant_namespace")
+    @classmethod
+    def _check_personal_grant_namespace(cls, value: str) -> str:
+        """Empty, or a namespace name custody rows can record (migration 0160's CHECK)."""
+
+        if value and not _DNS_LABEL.fullmatch(value):
+            raise ValueError("CURIE_PERSONAL_GRANT_NAMESPACE must be a Kubernetes namespace name")
+        return value
 
     @field_validator("oidc_required_claims", mode="before")
     @classmethod

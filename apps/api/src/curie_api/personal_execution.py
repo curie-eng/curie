@@ -35,6 +35,7 @@ from typing import Any, Literal, cast
 from sqlalchemy import func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from . import rollout_hold
 from .models import Agent, ExecutionRequest, PersonalClaudeEnrollment, Principal, Tenant, WorkItem
 
 # Declared beside the operator read schemas that serialize it.
@@ -50,6 +51,7 @@ OwnerRefusalCode = Literal[
     "enrollment_inactive",
     "enrollment_generation_mismatch",
     "owner_mismatch",
+    "personal_rollout_in_progress",
 ]
 
 # What an explicit owner that passed validation can still conflict on.
@@ -223,6 +225,10 @@ async def new_work_item_owner(
         return None
     if owner is None:
         return OwnerRefusal("personal_owner_required")
+    # #5377: no new personal WorkItem while API replicas run mixed templates;
+    # an older replica would expire the transcript a fenced run keeps.
+    if await rollout_hold.personal_rollout_held():
+        return OwnerRefusal("personal_rollout_in_progress")
     refused = await _verify(session, owner, agent_id=facts.agent_id)
     if refused is not None:
         return OwnerRefusal(refused)
