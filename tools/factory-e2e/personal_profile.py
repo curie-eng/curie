@@ -51,8 +51,6 @@ from collections.abc import Callable, Iterator, Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
-import channel_protocol
-
 HERE = Path(__file__).resolve().parent
 if str(HERE) not in sys.path:
     sys.path.insert(0, str(HERE))
@@ -2291,6 +2289,10 @@ class LiveRun:
     def drill_publication(self, label: str) -> str:
         """Create one tracker-shaped routed publication and wait for its card."""
 
+        # The workspace package is needed by the drill alone, so every other
+        # command still runs under a bare python3.
+        import channel_protocol
+
         api = self.require_api()
         repo = str(self.inputs.app["repo"])
         deployments = api.get(f"/deployments?agent_id={self.agent_id}")
@@ -2340,11 +2342,10 @@ class LiveRun:
         if status not in (200, 201) or not isinstance(body, dict) or not body.get("approval_id"):
             raise StepFailed(f"drill publication create returned {status}")
         stored = self.approval(str(body["approval_id"]))
-        self.ledger.record(
-            "rehearsal",
-            f"drill_{label}_card_on_route_channel",
-            stored.get("card_channel") == self.inputs.resolution_channel,
-        )
+        on_route = stored.get("card_channel") == self.inputs.resolution_channel
+        self.ledger.record("rehearsal", f"drill_{label}_card_on_route_channel", on_route)
+        if not on_route:
+            raise StepFailed(f"drill {label} card is not on the route's channel")
         self.await_card(str(body["id"]), f"drill_{label}")
         return str(body["approval_id"])
 

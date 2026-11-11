@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import base64
 import contextlib
+import dataclasses
 import datetime as dt
 import hashlib
 import http.server
@@ -2516,6 +2517,90 @@ def test_drill_proves_the_list_refusal_reject_and_approve(
     assert failed.execute() == 1
     summary = json.loads(capsys.readouterr().out.strip().splitlines()[-1])
     assert summary["phase"] == "drill" and "drill_unlisted_refused_by_list" in summary["detail"]
+
+
+class _DrillApi(_FakeApi):
+    """Records the drill's internal writes; answers in the API's recorded shapes."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.posts: list[tuple[str, Any, bool]] = []
+
+    def get(self, path: str) -> Any:
+        self.paths.append(path)
+        # apps/api/src/curie_api/schemas/deployments.py DeploymentOut rows.
+        return [{"id": "d-dev", "environment": "dev"}, {"id": "d-prod", "environment": "prod"}]
+
+    def post(self, path: str, body: Any, *, internal: bool = False) -> tuple[int, Any]:
+        self.posts.append((path, body, internal))
+        if path.endswith("/selection"):
+            return 200, {"conversation_id": body["conversation_id"]}
+        return 201, {"id": "4f1e0000-0000-4000-8000-0000000000b1", "approval_id": "a-1"}
+
+
+class _CardRun(_Rehearsal):
+    card_channel = RESOLUTION_CHANNEL
+    states: list[str] = ["f|0|f", "f|1|t", "t|2|f"]
+
+    def approval(self, approval_id: str) -> dict[str, Any]:
+        return {"card_channel": self.card_channel, "status": "pending"}
+
+    def card_state(self, publication_id: str) -> dict[str, Any]:
+        self.events.append(f"card:{publication_id}")
+        return pps.card_delivery(self.states.pop(0) if len(self.states) > 1 else self.states[0])
+
+
+def _card_run(tmp_path: Path, **attrs: Any) -> _CardRun:
+    run = _scripted(tmp_path, _CardRun, [], stop_after=pp.REHEARSAL_CUT)
+    run.inputs = dataclasses.replace(run.inputs, resolution_channel=RESOLUTION_CHANNEL)
+    run.agent_id = "4f1e0000-0000-4000-8000-0000000000a1"
+    run.api = _DrillApi()
+    for key, value in attrs.items():
+        setattr(run, key, value)
+    return run
+
+
+def test_drill_publication_posts_a_routed_tracker_publication_and_waits_for_its_card(
+    tmp_path: Path,
+) -> None:
+    run = _card_run(_private(tmp_path / "ok"), states=["f|0|f", "f|1|t", "t|2|f"])
+    assert run.drill_publication("reject") == "a-1"
+    assert isinstance(run.api, _DrillApi)
+    (selection, _, selection_internal), (create, body, create_internal) = run.api.posts
+    assert selection == "/v1/internal/workspaces/d-prod/selection" and selection_internal
+    assert create == "/v1/internal/publications" and create_internal
+    # apps/api/src/curie_api/schemas/publications.py PublicationCreate, as a factory
+    # publication arrives: tracker reply, the publication route, its fixed card channel.
+    assert body["reply_kind"] == "github" and body["reply_channel"] == REPO
+    assert body["route"] == pps.PUBLICATION_ROUTE
+    assert body["card_channel"] == RESOLUTION_CHANNEL
+    assert body["base_sha"] == "0" * 40 and body["deployment_id"] == "d-prod"
+    assert body["conversation_id"] != body["reply_conversation_id"]
+    # A retry that clears the error is waited through; delivery ends the wait.
+    assert [e for e in run.events if e.startswith("card:")] == [
+        "card:4f1e0000-0000-4000-8000-0000000000b1"
+    ] * 3
+    state = run.ledger.observations("approval")["drill_reject_card"]
+    assert state == {"delivered": True, "attempts": 2, "error": False}
+
+    wrong = _card_run(_private(tmp_path / "wrong"), card_channel="C0EXAMPLE2")
+    with pytest.raises(pp.StepFailed, match="not on the route's channel"):
+        wrong.drill_publication("reject")
+    assert not any(event.startswith("card:") for event in wrong.events)
+
+
+def test_await_card_fails_on_exhausted_or_missing_delivery(tmp_path: Path) -> None:
+    exhausted = _card_run(_private(tmp_path / "exhausted"), states=["f|3|t", "f|5|t"])
+    with pytest.raises(pp.StepFailed, match="card was not delivered"):
+        exhausted.await_card("4f1e0000-0000-4000-8000-0000000000b1", "attempt_1")
+    assert exhausted.ledger.observations("approval")["attempt_1_card"]["attempts"] == 5
+    silent = _card_run(_private(tmp_path / "silent"), states=["f|0|f"])
+    start = silent.clock.now()
+    with pytest.raises(pp.StepFailed, match="did not happen in time"):
+        silent.await_card("4f1e0000-0000-4000-8000-0000000000b1", "attempt_2")
+    assert silent.clock.now() - start >= pp.CARD_WAIT_SECONDS
+    with pytest.raises(ValueError):
+        pp.LiveRun.card_state(silent, "not-a-uuid'; DROP TABLE x; --")
 
 
 def test_slack_kit_refuses_before_any_mutation(tmp_path: Path) -> None:

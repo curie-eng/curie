@@ -55,7 +55,7 @@ The commands below use placeholder values. Run them from the repository root, wi
 context.
 
 ```sh
-P="python3 tools/factory-e2e/personal_profile.py"
+P="uv run python tools/factory-e2e/personal_profile.py"
 COMMON="--candidate $SHA --context $KUBE_CONTEXT --namespace ppa-acme-test \
   --release ppa-acme --registry 127.0.0.1:5999 --docker-context acme-builder \
   --kubeconfig $KUBECONFIG_FILE --app-dir $APP_DIR --grant-file $GRANT_FILE \
