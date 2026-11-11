@@ -1732,6 +1732,7 @@ class EnrollmentProof(ClusterProof):
         observed["seeded_records"] = self.replay_seeds[pod]
         entries = transcript_entry_metadata(
             observed, turn=turn, prior=self.transcript_metadata.get(pod, ()),
+            held_values=self.held_values(),
         )
         self.transcript_metadata[pod] = entries
         self.evidence.setdefault("transcript_entries", []).append({

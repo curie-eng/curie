@@ -503,15 +503,20 @@ def test_evidence_refuses_an_empty_private_value_list(live_driver: EnrollmentPro
 
 
 @pytest.mark.parametrize("leaked", [False, True])
+@pytest.mark.parametrize("field", ["model", "error-line"])
 def test_retained_transcript_metadata_is_covered_by_the_secret_audit(
-    live_driver: EnrollmentProof, leaked: bool,
+    live_driver: EnrollmentProof, leaked: bool, field: str,
 ) -> None:
     sentinel = live_driver.grant.reveal()
+    error_line = sentinel if leaked and field == "error-line" else "API Error: 401 auth required"
     live_driver.evidence["transcript_entries"] = [{
         "session": 1, "step": "a", "turn": 1,
         "entries": [{"index": 0, "turn": 1, "provenance": "new-response",
-                     "model": sentinel if leaked else support.MODEL,
-                     "usage": {"output_tokens": 3}}],
+                     "model": sentinel if leaked and field == "model" else support.MODEL,
+                     "usage": {"output_tokens": 3},
+                     "error_class": {"http_status": 401,
+                                     "provider_error_type": "authentication_error",
+                                     "first_error_line": error_line}}],
     }]
     if leaked:
         with pytest.raises(ProofCheckError, match="evidence carried a private value"):

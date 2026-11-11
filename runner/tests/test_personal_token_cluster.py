@@ -91,7 +91,9 @@ def test_native_transcript_model_identity_distinguishes_cli_errors(
     )
 
     def responder(request):
-        return ErrorReply(400, "invalid_request_error") if rejected else TextReply("public control")
+        return ErrorReply(
+            401, "authentication_error", message="OAuth token revoked " + OWNER_GRANT,
+        ) if rejected else TextReply("public control")
 
     with installed(tmp_path, monkeypatch, responder) as installation:
         monkeypatch.setenv("CURIE_MODEL_AUTH_MODE", "personal")
@@ -139,6 +141,19 @@ def test_native_transcript_model_identity_distinguishes_cli_errors(
             # records with model <synthetic>, rather than provider messages.
             assert observed["synthetic_assistant_records"] > 0
             assert not observed["assistant_messages"]
+            entry = next(
+                item for item in transcript_entry_metadata(observed, turn=1)
+                if item["model"] == "<synthetic>"
+            )
+            error = entry["error_class"]
+            assert error["http_status"] == 401
+            # The pinned CLI humanizes 401 and drops the provider JSON type;
+            # its own classification remains distinct from that missing field.
+            assert error["provider_error_type"] is None
+            assert error["cli_error_type"] == "authentication_failed"
+            assert error["first_error_line"].startswith("Failed to authenticate. API Error: 401")
+            assert "OAuth token revoked" in error["first_error_line"]
+            assert OWNER_GRANT not in json.dumps(entry)
             with pytest.raises(ProofCheckError, match="did not identify assistant turns"):
                 live_transcript_identity(observed)
             assert any(event.get("type") == "error" for event in events)
@@ -283,6 +298,31 @@ def test_transcript_metadata_keeps_only_identity_usage_and_turn() -> None:
     assert second[:2] == first and second[-1]["turn"] == 2
     assert second[-1]["model"] is None and second[-1]["provenance"] == "new-response"
     assert "private" not in json.dumps(second)
+
+
+def test_zero_usage_error_metadata_redacts_held_values_and_omits_later_lines() -> None:
+    private = "PRIVATE-PLACEHOLDER-installation-value"
+    # Provider error JSON: https://platform.claude.com/docs/en/api/errors
+    record = {"type": "assistant", "message": {
+        "model": MODEL, "usage": {"input_tokens": 0, "output_tokens": 0},
+        "content": [{"type": "text", "text":
+                     'API Error: 403 {"error":{"type":"permission_error","message":"'
+                     + private + '"}}\nPrivate later line'}],
+    }}
+    entry, = transcript_entry_metadata(
+        {"messages": [record]}, turn=2, held_values=[private],
+    )
+    assert entry["error_class"]["http_status"] == 403
+    assert entry["error_class"]["provider_error_type"] == "permission_error"
+    assert "REDACTED" in entry["error_class"]["first_error_line"]
+    assert private not in json.dumps(entry) and "Private later line" not in json.dumps(entry)
+    record["message"]["content"] = [{"type": "text", "text": "Private conversation text"}]
+    entry, = transcript_entry_metadata({"messages": [record]}, turn=2)
+    assert entry["error_class"] == {
+        "http_status": None, "provider_error_type": None,
+        "cli_error_type": None, "first_error_line": None,
+    }
+    assert "Private conversation text" not in json.dumps(entry)
 
 
 def test_diagnostic_retry_preserves_unknown_reservation_and_stops_at_two_sessions(

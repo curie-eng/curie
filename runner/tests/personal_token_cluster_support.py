@@ -392,6 +392,7 @@ def seeded_transcript_record(
 def transcript_entry_metadata(
     observed: Mapping[str, Any], *, turn: int,
     prior: Sequence[Mapping[str, Any]] = (),
+    held_values: Sequence[str] = (),
 ) -> list[dict[str, Any]]:
     counts = (
         "input_tokens", "output_tokens", "cache_creation_input_tokens", "cache_read_input_tokens",
@@ -429,8 +430,58 @@ def transcript_entry_metadata(
             "model": message.get("model") if isinstance(message.get("model"), str) else None,
             "usage": usage_counts,
         }
+        if message.get("model") == "<synthetic>" or (
+            isinstance(usage, dict) and any(key in usage for key in counts)
+            and all(usage.get(key, 0) == 0 for key in counts)
+        ):
+            content = message.get("content", [])
+            text = content if isinstance(content, str) else "\n".join(
+                block.get("text", "") for block in content
+                if isinstance(block, dict) and isinstance(block.get("text"), str)
+            )
+            entry["error_class"] = cli_error_class(
+                text, held_values=held_values, cli_error_type=record.get("error"),
+                error_record=message.get("model") == "<synthetic>",
+            )
         retained.append(entry)
     return retained
+
+
+def cli_error_class(
+    text: str, *, held_values: Sequence[str] = (),
+    cli_error_type: str | None = None, error_record: bool = False,
+) -> dict[str, Any]:
+    from curie_telemetry.redact import held_secret_literals, redact_text
+
+    first = next((line.strip() for line in text.splitlines() if line.strip()), "")
+    cli_type = cli_error_type if isinstance(cli_error_type, str) and re.fullmatch(
+        r"[a-z_]{1,64}", cli_error_type,
+    ) else None
+    if not error_record and not re.search(
+        r"(?:API Error:|Error:|HTTP [1-5][0-9]{2})", first, re.IGNORECASE,
+    ):
+        return {"http_status": None, "provider_error_type": None,
+                "cli_error_type": cli_type, "first_error_line": None}
+    status = re.search(r"(?:API Error:\s*|HTTP\s+)([1-5][0-9]{2})\b", first, re.IGNORECASE)
+    provider_type = None
+    start = text.find("{")
+    if start >= 0:
+        try:
+            body, _ = json.JSONDecoder().raw_decode(text[start:])
+            error = body.get("error", {}) if isinstance(body, dict) else {}
+            kind = error.get("type") if isinstance(error, dict) else None
+            if isinstance(kind, str) and re.fullmatch(r"[a-z_]{1,64}", kind):
+                provider_type = kind
+        except ValueError:
+            pass
+    for literal in held_secret_literals(held_values):
+        first = first.replace(literal, "[REDACTED:held_secret]")
+    return {
+        "http_status": int(status.group(1)) if status else None,
+        "provider_error_type": redact_text(provider_type) if provider_type else None,
+        "cli_error_type": redact_text(cli_type) if cli_type else None,
+        "first_error_line": redact_text(first)[:2048],
+    }
 
 
 def live_observations(
