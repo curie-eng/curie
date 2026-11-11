@@ -1681,6 +1681,8 @@ jobs:
   ui:
     name: UI (lint + vitest + build + Playwright)
     runs-on: ubuntu-24.04
+    container:
+      image: mcr.microsoft.com/playwright:v1.64.1-noble@sha256:2f05f8a734509a7b3f26a912639488ee08f58a7b292d14d62271bcff9038768f
     defaults:
       run:
         working-directory: apps/ui
@@ -1688,6 +1690,8 @@ jobs:
       - uses: actions/checkout@v7
         with:
           persist-credentials: false
+      - name: Trust the checked out workspace in this container
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
       - name: Install pnpm
         id: install_pnpm
         continue-on-error: true
@@ -1746,10 +1750,6 @@ jobs:
         run: pnpm test
       - name: Build
         run: pnpm build
-      - name: Install Playwright chromium
-        run: |
-          sudo sed -i 's|mirror+file:/etc/apt/apt-mirrors.txt|https://archive.ubuntu.com/ubuntu/|g' /etc/apt/sources.list.d/ubuntu.sources
-          pnpm exec playwright install --with-deps chromium
       # The stackless E2E project (route-interception fixtures, testIgnore
       # integration) runs with no backend; the live-backend "integration" project
       # only activates under PW_INTEGRATION=1, which CI does not set. Playwright's
