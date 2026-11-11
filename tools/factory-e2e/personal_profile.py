@@ -804,14 +804,32 @@ class Forge:
         refs = self.call("GET", self.repo_path(f"/git/matching-refs/heads/{prefix}"))
         return [str(ref.get("ref")) for ref in refs or [] if isinstance(ref, dict)]
 
-    def prefix_pulls(self, prefix: str) -> list[dict[str, Any]]:
+    def owned_pulls(self, prefix: str, branches: Sequence[str] = ()) -> list[dict[str, Any]]:
+        """Pull requests (any state) whose head is under ``prefix`` or is one of ``branches``."""
+
         pulls = self.call("GET", self.repo_path("/pulls?state=all&per_page=100"))
+        exact = set(branches)
         return [
             pull
             for pull in pulls or []
             if isinstance(pull, dict)
-            and str(((pull.get("head") or {}).get("ref")) or "").startswith(prefix)
+            and (
+                str(((pull.get("head") or {}).get("ref")) or "").startswith(prefix)
+                or str(((pull.get("head") or {}).get("ref")) or "") in exact
+            )
         ]
+
+    def owned_branches(self, prefix: str, branches: Sequence[str] = ()) -> list[str]:
+        """Branch refs under ``prefix`` plus each of ``branches`` that exists."""
+
+        found = [
+            ref for ref in self.matching_branches(prefix) if ref.startswith(f"refs/heads/{prefix}")
+        ]
+        for branch in branches:
+            found += [
+                ref for ref in self.matching_branches(branch) if ref == f"refs/heads/{branch}"
+            ]
+        return sorted(set(found))
 
     def pull_files(self, number: int) -> tuple[list[str], bool]:
         """Every path a pull request changes, and whether the listing was complete.
@@ -1456,6 +1474,7 @@ class Attempt:
     eof: threading.Event = dataclasses.field(default_factory=threading.Event)
     approval_id: str = ""
     publication_id: str = ""
+    branch: str = ""
     parked_at: float = 0.0
     gone_at: float = 0.0
     facts: pps.TranscriptFacts | None = None
@@ -1491,6 +1510,11 @@ class LiveRun:
         digest = hashlib.sha256(f"{inputs.run_id}:{secrets.token_hex(8)}".encode()).hexdigest()
         self.agent = f"acme-pp-{digest[:8]}"
         self.prefix = f"ppa-{digest[8:16]}/"
+        # Human (approve) policy names a lineage branch under the historical curie/
+        # prefix and ignores the operator prefix (apps/api/src/curie_api/
+        # publication_policy.py publication_branch_name), so each publication's own
+        # branch is read from the API and owned by the run as well.
+        self.publication_branches: list[str] = []
         self.trigger_label = f"ppa-unused-{digest[16:24]}"
         self.nonce = secrets.token_hex(8)
         self.owner_subject = f"ppa-owner-{secrets.token_hex(8)}"
@@ -2283,9 +2307,27 @@ class LiveRun:
             {"state": "closed", "state_reason": "completed"},
         )
 
+    def run_pulls(self) -> list[dict[str, Any]]:
+        return self.require_forge().owned_pulls(self.prefix, self.publication_branches)
+
+    def run_branches(self) -> list[str]:
+        return self.require_forge().owned_branches(self.prefix, self.publication_branches)
+
+    def record_publication_branch(self, attempt: Attempt) -> None:
+        """Own the branch the platform named for this attempt's publication."""
+
+        branch = str(self.publication(attempt.publication_id).get("branch") or "")
+        valid = pps.publication_branch_valid(branch)
+        self.ledger.record("publication", f"attempt_{attempt.number}_branch_known", valid)
+        if not valid:
+            raise StepFailed("the publication names no valid branch")
+        attempt.branch = branch
+        if branch not in self.publication_branches:
+            self.publication_branches.append(branch)
+
     def close_run_pulls(self) -> None:
         forge = self.require_forge()
-        for pull in forge.prefix_pulls(self.prefix):
+        for pull in self.run_pulls():
             if pull.get("state") == "open":
                 forge.call(
                     "PATCH", forge.repo_path(f"/pulls/{pull.get('number')}"), {"state": "closed"}
@@ -2293,9 +2335,7 @@ class LiveRun:
 
     def delete_run_branches(self) -> None:
         forge = self.require_forge()
-        for ref in forge.matching_branches(self.prefix):
-            if not ref.startswith(f"refs/heads/{self.prefix}"):
-                continue
+        for ref in self.run_branches():
             forge.call("DELETE", forge.repo_path(f"/git/{ref}"), ok=(204,))
 
     # -- phase 6b: the unpaid publication drill (rehearse only) ------------------
@@ -2763,6 +2803,7 @@ class LiveRun:
         )
         if attempt.number == 1:
             self.ledger.record("approval", "approval_parked", bool(attempt.publication_id))
+        self.record_publication_branch(attempt)
         attempt.eof.wait(timeout=max(0.0, min(180.0, until - self.clock.now())))
         self.ensure_pod_gone(attempt)
         if attempt.number == 2:
@@ -2924,11 +2965,10 @@ class LiveRun:
             "pod-restart", "approval_pending_after_deletion", approval.get("status") == "pending"
         )
         publication = self.publication(first.publication_id)
-        forge = self.require_forge()
         quiet = (
             publication.get("status") == "pending"
-            and not forge.matching_branches(self.prefix)
-            and not forge.prefix_pulls(self.prefix)
+            and not self.run_branches()
+            and not self.run_pulls()
         )
         self.ledger.record("pod-restart", "no_publication_during_restart", quiet)
 
@@ -2952,7 +2992,6 @@ class LiveRun:
         after = self.work_item()
         approval = self.approval(first.approval_id)
         publication = self.publication(first.publication_id)
-        forge = self.require_forge()
         audit = self.audit(first.approval_id)
         self.record_resolution("unlisted", result, audit, self.unlisted_subject)
         record = {
@@ -2972,7 +3011,7 @@ class LiveRun:
             "execution_requests_unchanged_after_unlisted": len(before.get("requests") or [])
             == len(after.get("requests") or []),
             "publication_jobs_after_unlisted": 0 if publication.get("status") == "pending" else 1,
-            "remote_branches_after_unlisted": len(forge.matching_branches(self.prefix)),
+            "remote_branches_after_unlisted": len(self.run_branches()),
             "owner_unchanged_after_unlisted": pps.owner_matches(pps.owner_of(after), self.owner),
         }
         for key, value in record.items():
@@ -3028,11 +3067,8 @@ class LiveRun:
 
         self.wait_until(denied, until=self.clock.now() + 180, what="publication_denied")
         self.clock.wait(REJECTION_SETTLE_SECONDS)
-        forge = self.require_forge()
-        self.ledger.record(
-            "publication", "rejected_remote_branches", len(forge.matching_branches(self.prefix))
-        )
-        self.ledger.record("publication", "rejected_prs", len(forge.prefix_pulls(self.prefix)))
+        self.ledger.record("publication", "rejected_remote_branches", len(self.run_branches()))
+        self.ledger.record("publication", "rejected_prs", len(self.run_pulls()))
 
     # -- phase 13: the allowed operator approves the fresh attempt ---------------------
 
@@ -3096,11 +3132,14 @@ class LiveRun:
         commit = forge.call("GET", forge.repo_path(f"/git/commits/{head_sha}"))
         self.ledger.record("publication", "pr_draft", pull.get("draft"))
         self.ledger.record(
-            "publication", "pr_head_prefix", str(head.get("ref") or "").startswith(self.prefix)
+            "publication",
+            "pr_head_is_publication_branch",
+            bool(second.branch) and str(head.get("ref") or "") == second.branch,
         )
         self.ledger.record("publication", "head_sha", head_sha)
         self.ledger.record("publication", "tree_sha", str((commit.get("tree") or {}).get("sha")))
-        self.ledger.record("publication", "prs_for_prefix", len(forge.prefix_pulls(self.prefix)))
+        # Both attempts' branches and the prefix: the rejected attempt opened none.
+        self.ledger.record("publication", "prs_for_run", len(self.run_pulls()))
         reviewed = self.ledger.observations("pod-restart").get("reviewed_workspace") or {}
         hashes: dict[str, str | None] = {}
         nonce_paths: list[str] = []
@@ -3198,14 +3237,9 @@ class LiveRun:
             "forge_issue": self.issue_closed,
             "forge_prs": lambda: (
                 not self.policy_set
-                or not any(
-                    pull.get("state") == "open"
-                    for pull in self.require_forge().prefix_pulls(self.prefix)
-                )
+                or not any(pull.get("state") == "open" for pull in self.run_pulls())
             ),
-            "forge_branches": lambda: (
-                not self.policy_set or not self.require_forge().matching_branches(self.prefix)
-            ),
+            "forge_branches": lambda: not self.policy_set or not self.run_branches(),
         }
         results: dict[str, str] = {}
         for kind, check in checks.items():

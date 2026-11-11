@@ -812,9 +812,9 @@ def _build_ledger(
         "rejected_remote_branches": 0,
         "rejected_prs": 0,
         "rejection_stays_rejected": True,
-        "prs_for_prefix": 1,
+        "prs_for_run": 1,
         "pr_draft": False,
-        "pr_head_prefix": True,
+        "pr_head_is_publication_branch": True,
         "publication_status": "succeeded",
         "work_item_state": "published",
         "diff_review_approved": True,
@@ -3015,3 +3015,73 @@ def test_a_failed_grant_probe_stops_before_any_reservation(
     assert GRANT not in json.dumps(probe) and LOOKALIKE not in json.dumps(probe)
     ledger.close()
     assert GRANT not in output.out + output.err
+
+
+# --------------------------------------------------------------------------
+# The run owns each publication's own branch, not only its prefix
+# --------------------------------------------------------------------------
+
+OWN_BRANCH = "curie/publication-" + "c" * 32
+FOREIGN_BRANCH = "curie/publication-" + "f" * 32
+
+
+class _BranchForge(pp.Forge):
+    """Answers GitHub's pulls and matching-refs listings; records writes."""
+
+    def __init__(self, heads: list[str], refs: list[str]) -> None:
+        self.repo = REPO
+        self.heads = heads
+        self.refs = refs
+        self.writes: list[tuple[str, str]] = []
+
+    def call(self, method: str, path: str, body: Any = None, *, ok: Sequence[int] = (200,)) -> Any:
+        if method != "GET":
+            self.writes.append((method, path))
+            return {}
+        if "/pulls?" in path:
+            return [
+                {"number": n, "state": "open", "head": {"ref": ref}}
+                for n, ref in enumerate(self.heads, 1)
+            ]
+        prefix = "refs/heads/" + path.split("/git/matching-refs/heads/", 1)[1]
+        return [{"ref": ref} for ref in self.refs if ref.startswith(prefix)]
+
+
+class _BranchApi(_FakeApi):
+    branch = OWN_BRANCH
+
+    def get(self, path: str) -> Any:
+        return {"id": path.rsplit("/", 1)[-1], "branch": self.branch, "status": "pending"}
+
+
+def test_the_run_owns_its_publication_branch_outside_its_prefix(tmp_path: Path) -> None:
+    run = _scripted(tmp_path, _ScriptedRun, [])
+    run.api = _BranchApi()
+    forge = _BranchForge(
+        heads=[OWN_BRANCH, FOREIGN_BRANCH, f"{run.prefix}probe"],
+        refs=[f"refs/heads/{OWN_BRANCH}", f"refs/heads/{FOREIGN_BRANCH}"],
+    )
+    run.forge = forge
+    attempt = pp.Attempt(2)
+    attempt.publication_id = "4f1e0000-0000-4000-8000-0000000000b1"
+    # Before the branch is known, only the prefix is owned.
+    assert [pull["head"]["ref"] for pull in run.run_pulls()] == [f"{run.prefix}probe"]
+    run.record_publication_branch(attempt)
+    assert attempt.branch == OWN_BRANCH
+    assert run.ledger.observations("publication")["attempt_2_branch_known"] is True
+    assert sorted(pull["head"]["ref"] for pull in run.run_pulls()) == sorted(
+        [OWN_BRANCH, f"{run.prefix}probe"]
+    )
+    assert run.run_branches() == [f"refs/heads/{OWN_BRANCH}"]
+    run.close_run_pulls()
+    run.delete_run_branches()
+    assert ("PATCH", f"/repos/{REPO}/pulls/1") in forge.writes
+    assert ("DELETE", f"/repos/{REPO}/git/refs/heads/{OWN_BRANCH}") in forge.writes
+    assert not any(FOREIGN_BRANCH in path or path.endswith("/pulls/2") for _m, path in forge.writes)
+
+    bad = _scripted(_private(tmp_path / "bad"), _ScriptedRun, [])
+    bad.api = _BranchApi()
+    bad.api.branch = "main"
+    with pytest.raises(pp.StepFailed, match="no valid branch"):
+        bad.record_publication_branch(attempt)
+    assert bad.publication_branches == []

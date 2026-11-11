@@ -267,8 +267,8 @@ model.
    whose uid and resourceVersion never changed.
 3. `pod-restart`: see the next section.
 4. `publication`: the rejected attempt left no branch and no pull request;
-   exactly one ready pull request exists for the run's branch prefix; the
-   publication succeeded and the work item reads `published`; the diff
+   exactly one ready pull request exists for the run, and its head is the
+   approved publication's own branch; the publication succeeded and the work item reads `published`; the diff
    reviewer approved before approval was requested; the published head's
    files equal the reviewed workspace hashes and carry the nonce; and the
    latest check runs and statuses for that head are all complete and
@@ -325,6 +325,12 @@ scan reads it. A failed attempt's message names the class. The harvester also
 records whether the runner container and each native CLI process had a
 non-empty `CLAUDE_CODE_OAUTH_TOKEN`, as a state and a length; the value never
 leaves the pod.
+
+The run owns two kinds of forge refs: those under its random branch prefix,
+and each publication's own branch as the API names it. Under the `approve`
+policy the platform keeps the historical `curie/` prefix for that branch and
+ignores the operator prefix, so the run reads it once each attempt parks.
+Evidence, cleanup and the absence checks cover both.
 
 Each resource's cleanup is registered before the resource is created and runs
 in reverse order on success, failure, rejection and on SIGINT or SIGTERM.

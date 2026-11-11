@@ -2264,6 +2264,15 @@ class HarvestState:
 CREDENTIAL_STATES = frozenset({"present", "empty", "absent", "unreadable"})
 
 
+_PUBLICATION_BRANCH_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,62}/publication-[0-9a-f]{32}")
+
+
+def publication_branch_valid(branch: str) -> bool:
+    """A lineage branch the platform names: ``<prefix>/publication-<32 hex>``. Pure."""
+
+    return _PUBLICATION_BRANCH_NAME.fullmatch(branch) is not None
+
+
 def credential_presence(record: Mapping[str, Any]) -> dict[str, Any]:
     """One harvested credential observation, reduced to a state and a length. Pure."""
 
@@ -2618,9 +2627,9 @@ def _judge_publication(ledger: Ledger) -> tuple[dict[str, bool], dict[str, int]]
         "rejected_no_branch": _zero(observed, "rejected_remote_branches"),
         "rejected_no_pr": _zero(observed, "rejected_prs"),
         "rejection_stays_rejected": _true(observed, "rejection_stays_rejected"),
-        "exactly_one_pr": observed.get("prs_for_prefix") == 1,
+        "exactly_one_pr": observed.get("prs_for_run") == 1,
         "pr_ready": observed.get("pr_draft") is False,
-        "pr_head_prefix": _true(observed, "pr_head_prefix"),
+        "pr_head_is_publication_branch": _true(observed, "pr_head_is_publication_branch"),
         "publication_succeeded": observed.get("publication_status") == "succeeded",
         "work_item_published": observed.get("work_item_state") == "published",
         "diff_review_approved": _true(observed, "diff_review_approved"),
