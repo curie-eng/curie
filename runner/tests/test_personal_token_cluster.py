@@ -180,7 +180,7 @@ def test_diagnostic_retry_preserves_unknown_reservation_and_stops_at_two_session
         assert usage["output_tokens"] == 123
         assert usage["unknown_reserved_output_tokens"] == 1024
         assert usage["accounted_output_tokens"] == 1147
-        with pytest.raises(ProofCheckError, match="two-session"):
+        with pytest.raises(ProofCheckError, match="2-session"):
             retry.start("third-candidate")
     finally:
         retry.db.close()

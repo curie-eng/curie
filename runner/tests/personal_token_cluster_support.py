@@ -93,7 +93,18 @@ def scrubbed_env() -> dict[str, str]:
 
 
 class BudgetLedger:
-    """A started session with unknown usage reserves the entire remaining budget."""
+    """A started session with unknown usage reserves the entire remaining budget.
+
+    The class attributes are the logical proof's session bounds; a driver with
+    another approved ceiling subclasses them. ``unpaid_sessions`` admits a
+    session that the provider refused before any output (zero tokens, zero
+    assistant turns); it still counts against ``max_sessions``.
+    """
+
+    max_sessions = 2
+    max_assistant_turns = 4
+    max_session_seconds = 180
+    unpaid_sessions = False
 
     def __init__(self, run_id: str, *, diagnostic_retry: bool = False) -> None:
         __tracebackhide__ = True
@@ -130,7 +141,10 @@ class BudgetLedger:
                 "SELECT output_tokens, reserved FROM sessions WHERE run_id=? ORDER BY sequence",
                 (self.run_id,),
             ).fetchall()
-            require(len(rows) < 2, "the logical proof has used its two-session allowance")
+            require(
+                len(rows) < self.max_sessions,
+                f"the logical proof has used its {self.max_sessions}-session allowance",
+            )
             spent = sum(output if output is not None else reserved for output, reserved in rows)
             remaining = min(self.session_limit, self.limit - spent)
             require(remaining > 0, "the logical proof has no remaining output-token budget")
@@ -150,7 +164,10 @@ class BudgetLedger:
         rows = self.db.execute(
             "SELECT output_tokens,reserved FROM sessions WHERE run_id=?", (self.run_id,)
         ).fetchall()
-        require(len(rows) < 2, "the logical proof has used its two-session allowance")
+        require(
+            len(rows) < self.max_sessions,
+            f"the logical proof has used its {self.max_sessions}-session allowance",
+        )
         remaining = min(self.session_limit, self.limit - sum(
             output if output is not None else reserved for output, reserved in rows
         ))
@@ -167,13 +184,19 @@ class BudgetLedger:
             "SELECT output_tokens,reserved FROM sessions WHERE run_id=?", (self.run_id,)
         ).fetchall()
         total = sum(output if output is not None else reserved for output, reserved in rows)
+        least = 0 if self.unpaid_sessions else 1
         require(
-            0 < tokens <= rows[sequence - 1][1], "the live session exceeded its output allowance"
+            least <= tokens <= rows[sequence - 1][1],
+            "the live session exceeded its output allowance",
         )
         require(
-            len(rows) <= 2 and total <= self.limit, "the logical proof exceeded its live budget"
+            len(rows) <= self.max_sessions and total <= self.limit,
+            "the logical proof exceeded its live budget",
         )
-        require(0 < turns <= 4 and elapsed <= 180, "the live session exceeded a session bound")
+        require(
+            least <= turns <= self.max_assistant_turns and elapsed <= self.max_session_seconds,
+            "the live session exceeded a session bound",
+        )
         return {
             "sessions": len(rows),
             "assistant_turns": turns,

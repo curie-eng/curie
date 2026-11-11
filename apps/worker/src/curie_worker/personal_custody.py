@@ -17,7 +17,8 @@ No log line, error or repr here carries the grant; ``PersonalGrant`` shows its
 owner and generation only.
 
 Nothing selects owners or launches with this yet: #5378 wires it into owner
-selection, and the delivery shape is #5374's.
+selection. The claim env it returns is #5374's delivery shape
+(``sandbox/claim_tokens.py``).
 """
 
 from __future__ import annotations
@@ -33,11 +34,12 @@ from typing import Any, ClassVar, Literal, Protocol
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncEngine
 
+from .sandbox.claim_tokens import MODEL_AUTH_MODE_ENV, PERSONAL_TOKEN_ENV
+
 #: The custody Secret's sole data key, the same literal migration 0160's
-#: ``personal_claude_custody_key_ck`` pins, and the runner's grant variable.
+#: ``personal_claude_custody_key_ck`` pins. It names the same variable the
+#: per-claim delivery carries, but the custody contract is its own literal.
 CUSTODY_SECRET_KEY = "CLAUDE_CODE_OAUTH_TOKEN"
-#: The runner's model authentication selector (#5373).
-MODEL_AUTH_MODE_ENV = "CURIE_MODEL_AUTH_MODE"
 #: The annotation naming the custody row a Secret belongs to.
 CUSTODY_ID_ANNOTATION = "curietech.ai/personal-custody-id"
 AUTHENTICATION_REQUIRED_CLASSIFICATION = "authentication-required"
@@ -100,9 +102,14 @@ class PersonalGrant:
     __str__ = __repr__
 
     def claim_env(self) -> dict[str, str]:
-        """The explicit personal pair a claim carries: the mode and the grant."""
+        """The explicit personal pair a claim carries: the mode and the grant.
 
-        return {MODEL_AUTH_MODE_ENV: "personal", CUSTODY_SECRET_KEY: self._token}
+        Keyed by #5374's delivery names, so ``claim_tokens.split_claim_tokens``
+        moves the grant into the per-claim ``<claim>-tokens`` Secret and only the
+        mode stays in the claim's value env.
+        """
+
+        return {MODEL_AUTH_MODE_ENV: "personal", PERSONAL_TOKEN_ENV: self._token}
 
 
 @dataclass(frozen=True, slots=True)

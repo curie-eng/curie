@@ -452,6 +452,19 @@ def test_claim_env_is_the_explicit_personal_pair() -> None:
     assert grant.claim_env()["CLAUDE_CODE_OAUTH_TOKEN"] == GRANT
 
 
+def test_claim_env_grant_leaves_the_claim_through_the_per_claim_secret() -> None:
+    """#5374's split moves the grant to ``<claim>-tokens``; only the mode stays."""
+
+    from curie_worker.sandbox.claim_tokens import split_claim_tokens
+
+    grant = PersonalGrant(uuid.uuid4(), uuid.uuid4(), 3, GRANT)
+
+    tokens, rest = split_claim_tokens({"CURIE_SESSION_ID": "s", **grant.claim_env()})
+
+    assert tokens == {"CLAUDE_CODE_OAUTH_TOKEN": GRANT}
+    assert rest == {"CURIE_SESSION_ID": "s", "CURIE_MODEL_AUTH_MODE": "personal"}
+
+
 def test_grant_namespace_is_worker_config(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv("CURIE_PERSONAL_GRANT_NAMESPACE", raising=False)
     assert WorkerConfig().personal_grant_namespace == ""
