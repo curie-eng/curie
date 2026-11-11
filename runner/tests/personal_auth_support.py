@@ -339,6 +339,7 @@ class RecordedRequest:
 @dataclass(frozen=True)
 class TextReply:
     text: str
+    chunks: tuple[str, ...] | None = None
 
 
 @dataclass(frozen=True)
@@ -416,6 +417,16 @@ def messages_stream(
         ),
         ("message_stop", {"type": "message_stop"}),
     ]
+    if isinstance(reply, TextReply) and reply.chunks is not None:
+        if "".join(reply.chunks) != reply.text:
+            raise ValueError("scripted text chunks must reconstruct the reply")
+        events[2:3] = [
+            ("content_block_delta", {
+                "type": "content_block_delta", "index": 0,
+                "delta": {"type": "text_delta", "text": chunk},
+            })
+            for chunk in reply.chunks
+        ]
     return b"".join(_sse(name, data) for name, data in events)
 
 

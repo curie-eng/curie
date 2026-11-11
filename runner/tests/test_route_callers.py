@@ -107,7 +107,10 @@ def test_callers_and_urls_come_from_the_mounted_declaration(tmp_path: Path) -> N
 
 
 # @spec ADR-0240 d4
-def test_a_caller_launch_holds_no_platform_credential(tmp_path: Path) -> None:
+def test_a_caller_launch_holds_no_platform_credential(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("REVIEW_MODE", "deep")
     servers = bundle_mcp_servers(str(_bundle(tmp_path)))
     entry = servers["plugin:b:review-tools"]
     source = {

@@ -37,3 +37,11 @@ def _zero_probe_retry_backoff(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 collect_ignore_glob = ["fixtures/**"]
+
+
+@pytest.fixture(autouse=True)
+def _isolate_held_secret_registry(monkeypatch: pytest.MonkeyPatch) -> None:
+    from curie_telemetry import redact
+
+    monkeypatch.setattr(redact, "_held_values", frozenset())
+    monkeypatch.setattr(redact, "_held_literals", ())

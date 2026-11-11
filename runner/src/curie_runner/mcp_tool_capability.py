@@ -426,29 +426,21 @@ async def server_streams(
     so the executor route opens each connector session the same way.
     """
 
+    from .mcp_stdio import sanitize_mcp_servers
+
+    config = sanitize_mcp_servers(
+        {"probe": config}, inherited_env, plugin_dir=plugin_dir
+    )["probe"]
     interpolation_env = dict(inherited_env)
     if plugin_dir is not None:
         interpolation_env["CLAUDE_PLUGIN_ROOT"] = str(plugin_dir)
 
     command = config.get("command")
     if isinstance(command, str) and command:
-        configured_env = config.get("env")
-        from .subprocess_env import shell_and_hook_env
-
-        expanded_config_env: dict[str, str] = {}
-        if isinstance(configured_env, Mapping):
-            expanded_config_env = {
-                str(key): _expand(str(value), interpolation_env)
-                for key, value in configured_env.items()
-            }
-        child_env = shell_and_hook_env(interpolation_env, extra=expanded_config_env)
-        args = config.get("args")
         parameters = StdioServerParameters(
-            command=_expand(command, interpolation_env),
-            args=[_expand(str(arg), interpolation_env) for arg in args]
-            if isinstance(args, list)
-            else [],
-            env=child_env,
+            command=config["command"],
+            args=config["args"],
+            env=config["env"],
             cwd=plugin_dir,
         )
         async with stdio_client(parameters) as streams:
