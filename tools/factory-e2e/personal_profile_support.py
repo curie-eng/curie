@@ -170,6 +170,15 @@ def _variants(raw: bytes) -> set[bytes]:
     return {item for item in found if item}
 
 
+# A cleared secret is matched by a key-derivation digest under a salt that lives
+# only in this process, so the fingerprint is never a cheap hash of the secret.
+_FINGERPRINT_SALT = os.urandom(16)
+
+
+def _fingerprint_digest(raw: bytes) -> str:
+    return hashlib.scrypt(raw, salt=_FINGERPRINT_SALT, n=2**12, r=8, p=1, dklen=32).hex()
+
+
 @dataclasses.dataclass(frozen=True)
 class Fingerprint:
     """A cleared secret's shape for in-memory scanning: length, a 4 byte prefilter, a digest."""
@@ -180,7 +189,7 @@ class Fingerprint:
 
     @classmethod
     def of(cls, raw: bytes) -> Fingerprint:
-        return cls(len(raw), raw[:4], hashlib.sha256(raw).hexdigest())
+        return cls(len(raw), raw[:4], _fingerprint_digest(raw))
 
     def __repr__(self) -> str:
         return "<fingerprint>"
@@ -190,7 +199,7 @@ class Fingerprint:
         start = data.find(self.prefix)
         while start != -1:
             end = start + self.length
-            if end <= len(data) and hashlib.sha256(data[start:end]).hexdigest() == self.digest:
+            if end <= len(data) and _fingerprint_digest(data[start:end]) == self.digest:
                 found.append((start, end))
             start = data.find(self.prefix, start + 1)
         return found
@@ -203,7 +212,7 @@ class HeldSecret:
         self._value = value
         raw = value.encode()
         self._fingerprints = tuple(Fingerprint.of(item) for item in sorted(_variants(raw)))
-        self.digest = hashlib.sha256(raw).hexdigest() if raw else ""
+        self.held = bool(raw)
 
     def __repr__(self) -> str:
         return "<held secret>"
@@ -221,7 +230,7 @@ class HeldSecret:
 
     @property
     def fingerprints(self) -> tuple[Fingerprint, ...]:
-        return self._fingerprints if self.digest else ()
+        return self._fingerprints if self.held else ()
 
 
 class Scrubber:
