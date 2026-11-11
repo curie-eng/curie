@@ -52,6 +52,7 @@ mod repo_runner_build;
 mod skill;
 mod skill_approvals;
 mod skill_unavailable;
+mod subscription;
 mod work;
 
 pub use access_policy::*;
@@ -77,6 +78,7 @@ pub use repo_runner_build::*;
 pub use skill::*;
 pub use skill_approvals::*;
 pub use skill_unavailable::*;
+pub use subscription::*;
 pub use work::*;
 
 pub const DEFAULT_PORT: u16 = 7245; // the design canon's local bot port

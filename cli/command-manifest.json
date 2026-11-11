@@ -4636,6 +4636,356 @@
           ]
         },
         {
+          "about": "Enroll, replace, reconnect or disconnect your own personal Claude grant, authenticated by your Console session. The token is read from a private file and is never printed",
+          "hidden": false,
+          "name": "subscription",
+          "subcommands": [
+            {
+              "about": "Show your personal Claude enrollment: state, generation, version and pending teardown",
+              "args": [
+                {
+                  "global": false,
+                  "help": "Private file (mode 0600 or stricter) holding only the value of your Console session cookie, __Host-curie_console_session",
+                  "id": "session_file",
+                  "long": "session-file",
+                  "positional": false,
+                  "required": true
+                },
+                {
+                  "env": "CURIE_API_URL",
+                  "global": false,
+                  "help": "Platform API base URL. Omit to reach the release API over loopback. A direct URL must use HTTPS unless it is loopback",
+                  "id": "api_url",
+                  "long": "api-url",
+                  "positional": false,
+                  "required": false
+                },
+                {
+                  "default_values": [
+                    "curie"
+                  ],
+                  "env": "CURIE_NAMESPACE",
+                  "global": false,
+                  "help": "Kubernetes namespace of the release. Default: curie",
+                  "id": "namespace",
+                  "long": "namespace",
+                  "positional": false,
+                  "required": false
+                },
+                {
+                  "default_values": [
+                    "curie"
+                  ],
+                  "global": false,
+                  "help": "Helm release name. Default: curie",
+                  "id": "release",
+                  "long": "release",
+                  "positional": false,
+                  "required": false
+                },
+                {
+                  "global": false,
+                  "help": "Validate the files and print the request plan without making a request",
+                  "id": "dry_run",
+                  "long": "dry-run",
+                  "positional": false,
+                  "possible_values": [
+                    "true",
+                    "false"
+                  ],
+                  "required": false
+                }
+              ],
+              "hidden": false,
+              "name": "status"
+            },
+            {
+              "about": "Enroll a personal Claude grant for the first time (generation 1)",
+              "args": [
+                {
+                  "global": false,
+                  "help": "Private file (mode 0600 or stricter) holding only the value of your Console session cookie, __Host-curie_console_session",
+                  "id": "session_file",
+                  "long": "session-file",
+                  "positional": false,
+                  "required": true
+                },
+                {
+                  "env": "CURIE_API_URL",
+                  "global": false,
+                  "help": "Platform API base URL. Omit to reach the release API over loopback. A direct URL must use HTTPS unless it is loopback",
+                  "id": "api_url",
+                  "long": "api-url",
+                  "positional": false,
+                  "required": false
+                },
+                {
+                  "default_values": [
+                    "curie"
+                  ],
+                  "env": "CURIE_NAMESPACE",
+                  "global": false,
+                  "help": "Kubernetes namespace of the release. Default: curie",
+                  "id": "namespace",
+                  "long": "namespace",
+                  "positional": false,
+                  "required": false
+                },
+                {
+                  "default_values": [
+                    "curie"
+                  ],
+                  "global": false,
+                  "help": "Helm release name. Default: curie",
+                  "id": "release",
+                  "long": "release",
+                  "positional": false,
+                  "required": false
+                },
+                {
+                  "global": false,
+                  "help": "Validate the files and print the request plan without making a request",
+                  "id": "dry_run",
+                  "long": "dry-run",
+                  "positional": false,
+                  "possible_values": [
+                    "true",
+                    "false"
+                  ],
+                  "required": false
+                },
+                {
+                  "global": false,
+                  "help": "Private file (mode 0600 or stricter) holding only the token printed by `claude setup-token`. One trailing newline is ignored",
+                  "id": "token_file",
+                  "long": "token-file",
+                  "positional": false,
+                  "required": true
+                }
+              ],
+              "hidden": false,
+              "name": "enroll"
+            },
+            {
+              "about": "Replace the active grant. Runtimes using the old grant are stopped",
+              "args": [
+                {
+                  "global": false,
+                  "help": "Private file (mode 0600 or stricter) holding only the value of your Console session cookie, __Host-curie_console_session",
+                  "id": "session_file",
+                  "long": "session-file",
+                  "positional": false,
+                  "required": true
+                },
+                {
+                  "env": "CURIE_API_URL",
+                  "global": false,
+                  "help": "Platform API base URL. Omit to reach the release API over loopback. A direct URL must use HTTPS unless it is loopback",
+                  "id": "api_url",
+                  "long": "api-url",
+                  "positional": false,
+                  "required": false
+                },
+                {
+                  "default_values": [
+                    "curie"
+                  ],
+                  "env": "CURIE_NAMESPACE",
+                  "global": false,
+                  "help": "Kubernetes namespace of the release. Default: curie",
+                  "id": "namespace",
+                  "long": "namespace",
+                  "positional": false,
+                  "required": false
+                },
+                {
+                  "default_values": [
+                    "curie"
+                  ],
+                  "global": false,
+                  "help": "Helm release name. Default: curie",
+                  "id": "release",
+                  "long": "release",
+                  "positional": false,
+                  "required": false
+                },
+                {
+                  "global": false,
+                  "help": "Validate the files and print the request plan without making a request",
+                  "id": "dry_run",
+                  "long": "dry-run",
+                  "positional": false,
+                  "possible_values": [
+                    "true",
+                    "false"
+                  ],
+                  "required": false
+                },
+                {
+                  "global": false,
+                  "help": "Private file (mode 0600 or stricter) holding only the token printed by `claude setup-token`. One trailing newline is ignored",
+                  "id": "token_file",
+                  "long": "token-file",
+                  "positional": false,
+                  "required": true
+                },
+                {
+                  "global": false,
+                  "help": "Enrollment version to change, as `status` reports it. Omit to read the current version first",
+                  "id": "expected_version",
+                  "long": "expected-version",
+                  "positional": false,
+                  "required": false
+                }
+              ],
+              "hidden": false,
+              "name": "replace"
+            },
+            {
+              "about": "Reconnect a disconnected enrollment with a new grant",
+              "args": [
+                {
+                  "global": false,
+                  "help": "Private file (mode 0600 or stricter) holding only the value of your Console session cookie, __Host-curie_console_session",
+                  "id": "session_file",
+                  "long": "session-file",
+                  "positional": false,
+                  "required": true
+                },
+                {
+                  "env": "CURIE_API_URL",
+                  "global": false,
+                  "help": "Platform API base URL. Omit to reach the release API over loopback. A direct URL must use HTTPS unless it is loopback",
+                  "id": "api_url",
+                  "long": "api-url",
+                  "positional": false,
+                  "required": false
+                },
+                {
+                  "default_values": [
+                    "curie"
+                  ],
+                  "env": "CURIE_NAMESPACE",
+                  "global": false,
+                  "help": "Kubernetes namespace of the release. Default: curie",
+                  "id": "namespace",
+                  "long": "namespace",
+                  "positional": false,
+                  "required": false
+                },
+                {
+                  "default_values": [
+                    "curie"
+                  ],
+                  "global": false,
+                  "help": "Helm release name. Default: curie",
+                  "id": "release",
+                  "long": "release",
+                  "positional": false,
+                  "required": false
+                },
+                {
+                  "global": false,
+                  "help": "Validate the files and print the request plan without making a request",
+                  "id": "dry_run",
+                  "long": "dry-run",
+                  "positional": false,
+                  "possible_values": [
+                    "true",
+                    "false"
+                  ],
+                  "required": false
+                },
+                {
+                  "global": false,
+                  "help": "Private file (mode 0600 or stricter) holding only the token printed by `claude setup-token`. One trailing newline is ignored",
+                  "id": "token_file",
+                  "long": "token-file",
+                  "positional": false,
+                  "required": true
+                },
+                {
+                  "global": false,
+                  "help": "Enrollment version to change, as `status` reports it. Omit to read the current version first",
+                  "id": "expected_version",
+                  "long": "expected-version",
+                  "positional": false,
+                  "required": false
+                }
+              ],
+              "hidden": false,
+              "name": "reconnect"
+            },
+            {
+              "about": "Disconnect the active grant and stop its runtimes. This does not revoke the grant at the provider",
+              "args": [
+                {
+                  "global": false,
+                  "help": "Private file (mode 0600 or stricter) holding only the value of your Console session cookie, __Host-curie_console_session",
+                  "id": "session_file",
+                  "long": "session-file",
+                  "positional": false,
+                  "required": true
+                },
+                {
+                  "env": "CURIE_API_URL",
+                  "global": false,
+                  "help": "Platform API base URL. Omit to reach the release API over loopback. A direct URL must use HTTPS unless it is loopback",
+                  "id": "api_url",
+                  "long": "api-url",
+                  "positional": false,
+                  "required": false
+                },
+                {
+                  "default_values": [
+                    "curie"
+                  ],
+                  "env": "CURIE_NAMESPACE",
+                  "global": false,
+                  "help": "Kubernetes namespace of the release. Default: curie",
+                  "id": "namespace",
+                  "long": "namespace",
+                  "positional": false,
+                  "required": false
+                },
+                {
+                  "default_values": [
+                    "curie"
+                  ],
+                  "global": false,
+                  "help": "Helm release name. Default: curie",
+                  "id": "release",
+                  "long": "release",
+                  "positional": false,
+                  "required": false
+                },
+                {
+                  "global": false,
+                  "help": "Validate the files and print the request plan without making a request",
+                  "id": "dry_run",
+                  "long": "dry-run",
+                  "positional": false,
+                  "possible_values": [
+                    "true",
+                    "false"
+                  ],
+                  "required": false
+                },
+                {
+                  "global": false,
+                  "help": "Enrollment version to change, as `status` reports it. Omit to read the current version first",
+                  "id": "expected_version",
+                  "long": "expected-version",
+                  "positional": false,
+                  "required": false
+                }
+              ],
+              "hidden": false,
+              "name": "disconnect"
+            }
+          ]
+        },
+        {
           "about": "Report value paths that differ between a release and pending Helm files. A nonempty report is advisory and exits successfully",
           "args": [
             {

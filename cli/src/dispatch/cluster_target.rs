@@ -21,6 +21,7 @@ impl ClusterTargetSources {
             action_name,
             "hooks"
                 | "console"
+                | "subscription"
                 | "actions"
                 | "remediation-policy"
                 | "remediation"
@@ -114,6 +115,13 @@ pub(crate) fn cluster_action_target(action: &ClusterAction) -> (Option<&str>, Op
         | ClusterAction::Deploy {
             namespace, release, ..
         } => (Some(namespace.as_str()), Some(release.as_str())),
+        ClusterAction::Subscription { action } => {
+            let session = action.session();
+            (
+                Some(session.namespace.as_str()),
+                Some(session.release.as_str()),
+            )
+        }
         ClusterAction::Message {
             namespace, release, ..
         } => (namespace.as_deref(), release.as_deref()),
@@ -260,6 +268,11 @@ pub(crate) fn retarget_cluster_action(
         } => {
             replace(current_namespace, &namespace);
             replace(current_release, &release);
+        }
+        ClusterAction::Subscription { action } => {
+            let session = action.session_mut();
+            replace(&mut session.namespace, &namespace);
+            replace(&mut session.release, &release);
         }
         ClusterAction::Message {
             namespace: current_namespace,

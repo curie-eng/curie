@@ -13,6 +13,40 @@ fn pin_context(context: Option<&str>) -> Result<Option<curie::kube_context::Kube
     Ok(target)
 }
 
+/// Map a parsed `cluster subscription` leaf onto the handler's options.
+fn subscription_opts(action: ClusterSubscriptionAction) -> commands::SubscriptionOpts {
+    use commands::SubscriptionVerb as Verb;
+    let (verb, session, token, expected) = match action {
+        ClusterSubscriptionAction::Status { session } => (Verb::Status, session, None, None),
+        ClusterSubscriptionAction::Enroll { session, token } => {
+            (Verb::Enroll, session, Some(token), None)
+        }
+        ClusterSubscriptionAction::Replace {
+            session,
+            token,
+            expected,
+        } => (Verb::Replace, session, Some(token), Some(expected)),
+        ClusterSubscriptionAction::Reconnect {
+            session,
+            token,
+            expected,
+        } => (Verb::Reconnect, session, Some(token), Some(expected)),
+        ClusterSubscriptionAction::Disconnect { session, expected } => {
+            (Verb::Disconnect, session, None, Some(expected))
+        }
+    };
+    commands::SubscriptionOpts {
+        verb,
+        session_file: session.session_file,
+        token_file: token.map(|token| token.token_file),
+        expected_version: expected.and_then(|expected| expected.expected_version),
+        api_url: session.api_url,
+        namespace: session.namespace,
+        release: session.release,
+        dry_run: session.dry_run,
+    }
+}
+
 /// Run one parsed `cluster` subcommand.
 pub(super) async fn run(action: ClusterAction, context: Option<String>) -> Result<()> {
     let target = if matches!(&action, ClusterAction::Message { .. }) {
@@ -1106,6 +1140,9 @@ pub(super) async fn run(action: ClusterAction, context: Option<String>) -> Resul
                 commands::resolve_cluster_conn(api_url, None, &namespace, &release, dry_run)
                     .await?;
             emit(commands::console_login(&api_url, &api_key, &subject, dry_run).await?)
+        }
+        ClusterAction::Subscription { action } => {
+            emit(commands::subscription(subscription_opts(action)).await?)
         }
         ClusterAction::Resume {
             agent,
