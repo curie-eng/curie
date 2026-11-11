@@ -3,10 +3,10 @@
 
 Six subcommands share one private SQLite ledger under ``--state-dir``:
 
-1. ``images`` (unpaid) builds the candidate's api, worker, dispatcher and
-   runner images from ``git archive <candidate>`` with the OCI revision label,
-   pushes them to the loopback registry, and builds the dark-factory runner
-   layer from a private bundle copy.
+1. ``images`` (unpaid) builds the candidate's api, worker and runner images
+   from ``git archive <candidate>`` with the OCI revision label, pushes them to
+   the loopback registry, and builds the dark-factory runner layer from a
+   private bundle copy.
 2. ``preflight`` (unpaid) refuses service credentials, fake mode, a missing or
    unsafe grant file, unknown expiry, insufficient lifetime, unapproved live
    execution and candidate image mismatch before any model session.
@@ -63,7 +63,6 @@ SUBCOMMANDS = ("images", "preflight", "forge-probe", "rehearse", "run", "judge")
 DOCKERFILES = {
     "curie-api": "apps/api/Dockerfile",
     "curie-worker": "apps/worker/Dockerfile",
-    "curie-dispatcher": "apps/dispatcher/Dockerfile",
     "curie-runner": "runner/Dockerfile",
 }
 BUNDLE_SOURCE = "examples/dark-factory"
@@ -1681,7 +1680,8 @@ class LiveRun:
             timeout=960,
         )
         try:
-            for workload in ("api", "worker", "dispatcher"):
+            # No Slack identity is configured, so the chart renders no dispatcher.
+            for workload in ("api", "worker"):
                 self.kube.ctl(
                     "rollout",
                     "status",
@@ -1702,12 +1702,9 @@ class LiveRun:
         pods = self.kube.json("get", "pods")
         failures = pps.running_image_failures(
             pods,
-            {
-                name: self.digests[name]
-                for name in ("curie-api", "curie-worker", "curie-dispatcher")
-            },
+            {name: self.digests[name] for name in ("curie-api", "curie-worker")},
             registry=inputs.registry,
-            required=("curie-api", "curie-worker", "curie-dispatcher"),
+            required=("curie-api", "curie-worker"),
         )
         self.ledger.record("roles", "candidate_images_running", not failures)
         if failures:

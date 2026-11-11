@@ -67,8 +67,8 @@ $P run $COMMON --approve-live "$CEILING"
 $P judge --criterion all --candidate $SHA --state-dir $STATE_DIR --run-id acme-run-1
 ```
 
-1. `images` is unpaid. It builds `curie-api`, `curie-worker`,
-   `curie-dispatcher` and `curie-runner` with the label
+1. `images` is unpaid. It builds `curie-api`, `curie-worker` and
+   `curie-runner` with the label
    `org.opencontainers.image.revision=<candidate>`, pushes them as
    `<name>:<candidate12>`, then runs `curie build` on a private copy of
    `examples/dark-factory` whose manifest routes `mcp__curie__publish_changes`

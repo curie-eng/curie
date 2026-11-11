@@ -79,7 +79,7 @@ DEFAULT_TENANT = "00000000-0000-0000-0000-000000000001"
 PERSONAL_MODE = "personal"
 OWNER_GENERATION = 1
 REVISION_LABEL = "org.opencontainers.image.revision"
-PLATFORM_IMAGES = ("curie-api", "curie-worker", "curie-dispatcher", "curie-runner")
+PLATFORM_IMAGES = ("curie-api", "curie-worker", "curie-runner")
 LAYER_IMAGE = "curie-factory-runner"
 REQUIRED_IMAGES = (*PLATFORM_IMAGES, LAYER_IMAGE)
 IMAGE_MANIFEST_TYPES = (
@@ -2448,7 +2448,7 @@ def install_values(
             "maxConcurrency": 1,
             "workItemMaxTurns": SESSION_TURNS,
         },
-        "dispatcher": {"image": image("curie-dispatcher")},
+        "dispatcher": {"deploy": False},
         "ui": {"deploy": False},
         "inference": {"deploy": False},
         "agentSandbox": {
