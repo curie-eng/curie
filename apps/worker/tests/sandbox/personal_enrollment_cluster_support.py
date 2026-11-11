@@ -958,8 +958,11 @@ class EnrollmentProof(ClusterProof):
         # ``docker cp`` keeps the file's mode and Dex runs unprivileged, so the
         # copy is world-readable inside the owned container; on this host it
         # sits in the 0700 private directory and is removed right after the copy.
+        # The mode is set explicitly: a caller's restrictive umask (077) would
+        # otherwise make it 0600, and Dex would exit unable to read its config.
         config_path = Path(self.private_dir) / "dex.json"
         fd = os.open(config_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY | os.O_NOFOLLOW, 0o644)
+        os.fchmod(fd, 0o644)
         with os.fdopen(fd, "w", encoding="utf-8") as stream:
             json.dump(dex_config, stream)
         self.run_container(
