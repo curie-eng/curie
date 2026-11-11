@@ -75,6 +75,7 @@ runner/tests/test_dockerfile_registry_layer.py
 runner/tests/test_factory_preflight.py
 runner/tests/test_hooks.py
 runner/tests/test_mcp_argv.py
+runner/tests/test_personal_token_cluster.py
 runner/tests/test_preflight_blocked.py
 runner/tests/test_repository_verification.py
 runner/tests/test_route_callers.py

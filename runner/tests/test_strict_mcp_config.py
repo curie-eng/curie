@@ -73,8 +73,9 @@ def _bundle(root: Path, *, inline: dict[str, Any] | None, root_mcp: dict[str, An
 
 
 def test_bundle_mcp_servers_keys_both_declaration_surfaces_as_plugin_servers(
-    tmp_path: Path,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    monkeypatch.setenv("TOKEN", "connector-placeholder")
     root = _bundle(
         tmp_path / "b",
         inline={"alpha": {"command": "node", "args": ["${CLAUDE_PLUGIN_ROOT}/a.js", "${TOKEN}"]}},
@@ -87,19 +88,15 @@ def test_bundle_mcp_servers_keys_both_declaration_surfaces_as_plugin_servers(
         },
     )
     servers = bundle_mcp_servers(str(root))
-    assert servers == {
-        "plugin:probe-bundle:alpha": {
-            "command": "node",
-            # The plugin root is the loader-supplied variable the --mcp-config
-            # path lacks; every other ${VAR} is left for the CLI to expand.
-            "args": [f"{root}/a.js", "${TOKEN}"],
-            "env": {"CLAUDE_PLUGIN_ROOT": str(root)},
-        },
-        "plugin:probe-bundle:beta": {
+    assert set(servers) == {"plugin:probe-bundle:alpha", "plugin:probe-bundle:beta"}
+    alpha = servers["plugin:probe-bundle:alpha"]
+    assert alpha["command"] == "node"
+    assert alpha["args"] == [f"{root}/a.js", "${TOKEN}"]
+    assert alpha["env"] == {"CLAUDE_PLUGIN_ROOT": str(root)}
+    assert servers["plugin:probe-bundle:beta"] == {
             "type": "http",
             "url": "${BETA_URL}",
             "headers": {"X": str(root)},
-        },
     }
     # The CLI normalizes a server key to its live prefix by replacing every
     # character outside [A-Za-z0-9_-] with "_"; that must land on the prefix
@@ -247,8 +244,7 @@ def test_real_loader_optional_secret_child_environment(
     own = next(s for s in registered if s["name"] == "plugin:probe-bundle:own")
     assert own["status"] == "connected", own
     # Observed through the real bundled Claude Code loader: an unset variable
-    # is delivered as the literal placeholder. This control must not be inferred
-    # from our projection; the child process records its actual environment.
+    # is delivered as the literal placeholder. The child records its actual env.
     expected = (
         {"present": False, "value": None}
         if optional and binding is None

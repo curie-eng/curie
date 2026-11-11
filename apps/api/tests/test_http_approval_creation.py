@@ -12,6 +12,7 @@ import json
 import uuid
 from collections.abc import Iterator
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
 from datetime import UTC, datetime
 from types import SimpleNamespace
 from typing import Any
@@ -93,9 +94,9 @@ def request_for(invocation: SimpleNamespace) -> dict[str, Any]:
     }
 
 
-@pytest.fixture
-def creation_case(
-    clean_db: None, valkey: redis.Redis, runs_stream: str,
+@contextmanager
+def creation(
+    valkey: redis.Redis, runs_stream: str,
     synthetic_provider: SimpleNamespace,
 ) -> Iterator[SimpleNamespace]:
     """@spec HTTP-APPROVAL-CONTINUITY-1/4: no fabricated invocation or datastore double."""
@@ -105,6 +106,16 @@ def creation_case(
         before = delivery_state(valkey, runs_stream, invocation.scope["binding"])
         yield invocation
         assert delivery_state(valkey, runs_stream, invocation.scope["binding"]) == before
+
+
+@pytest.fixture
+def creation_case(
+    clean_db: None, valkey: redis.Redis, runs_stream: str,
+    synthetic_provider: SimpleNamespace,
+) -> Iterator[SimpleNamespace]:
+    """@spec HTTP-APPROVAL-CONTINUITY-1/4: ordinary creation uses the clean session DB."""
+    with creation(valkey, runs_stream, synthetic_provider) as case:
+        yield case
 
 
 def post(case: SimpleNamespace, request: dict[str, Any] | None = None) -> Any:
@@ -719,17 +730,27 @@ def test_http_creation_freezes_explicit_route_schedule(creation_case, override, 
     assert again["identity_context"] == seal
 
 
-def test_pending_http_receipt_survives_schedule_schema_upgrade(creation_case):
-    from _migration_support import alembic_config
+def test_pending_http_receipt_survives_schedule_schema_upgrade(
+    isolated_migration_db, valkey, runs_stream, synthetic_provider,
+):
+    from _migration_support import alembic_config, column_names, stamped_revision
     from alembic import command
 
-    case = creation_case
-    accepted(post(case), case.request)
-    before = rows(case.request["approval"]["dedupe_key"])[0]
-    try:
-        command.downgrade(alembic_config(), "0151")
-    finally:
-        command.upgrade(alembic_config(), "head")
-    accepted(post(case), case.request, duplicate=True)
-    after = rows(case.request["approval"]["dedupe_key"])[0]
-    assert after == before
+    isolated_migration_db.at("head")
+    with creation(valkey, runs_stream, synthetic_provider) as case:
+        assert accepted(post(case), case.request)["status"] == "pending"
+        before = rows(case.request["approval"]["dedupe_key"])[0]
+        try:
+            command.downgrade(alembic_config(), "0151")
+            assert stamped_revision() == "0151"
+            assert {"remind_every_s", "next_remind_at"}.isdisjoint(column_names("approvals"))
+            baseline = rows(case.request["approval"]["dedupe_key"])[0]
+            assert {key: baseline[key] for key in RECORD_FIELDS} == {
+                key: before[key] for key in RECORD_FIELDS
+            }
+            assert baseline["identity_context"] == before["identity_context"]
+        finally:
+            command.upgrade(alembic_config(), "head")
+        accepted(post(case), case.request, duplicate=True)
+        after = rows(case.request["approval"]["dedupe_key"])[0]
+        assert after == before
