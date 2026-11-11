@@ -270,6 +270,16 @@ def _conflict(response: httpx.Response, code: str) -> None:
     assert response.json() == {"detail": {"code": code}}
 
 
+def _finish(api: TestClient, request_id: UUID, epoch: int) -> httpx.Response:
+    """The running turn's own finish, as the worker's completion sends it."""
+
+    return api.post(
+        f"{support.INTERNAL_PREFIX}/requests/{request_id}/finish",
+        json={"runtime_epoch": epoch, "outcome": "failed", "cause": "early_stop"},
+        headers=WORKER_HEADERS,
+    )
+
+
 def _heartbeat(api: TestClient, request_id: UUID, epoch: int) -> httpx.Response:
     return api.post(
         f"{support.INTERNAL_PREFIX}/requests/{request_id}/heartbeat",
@@ -399,9 +409,10 @@ def test_fence_stops_running_requests_without_cancelling_the_work_item(
         "AND cancelled_at IS NULL AND enrollment_generation = :generation",
         {"a": live.work_item_id, "b": held.work_item_id, "generation": world.generation},
     ) == [{"n": 2}]
-    # The fenced runs end failed through the worker's termination chain.
+    # The fenced runs end failed through the worker's termination chain. The
+    # live owner's own claim renews its lease and keeps its epoch (r1-G1).
     claim = _claimed(api, live.request_id)
-    assert claim["runtime_epoch"] == live_epoch + 1
+    assert claim["runtime_epoch"] == live_epoch
     recorded = _record(api, live.request_id, claim)
     assert recorded.status_code == 200, recorded.text
     assert (
@@ -737,6 +748,102 @@ def test_confirmation_refuses_blank_stale_epoch_and_stale_version(
         "failed",
         "enrollment_fenced",
     )
+
+
+def _stop_live_run(
+    api: TestClient, world: support.World, agent_id: UUID, issue: int, stop: str
+) -> tuple[UUID, int]:
+    """A started run asked to stop while its owner's heartbeat lease is live."""
+
+    if stop == "enrollment_fence":
+        admitted = _admit(api, world, agent_id, issue)
+        epoch = support.start_request(admitted.request_id)
+        _fence(world)
+    else:
+        # The relabel arrives on the conversation the issue was admitted on.
+        admitted = support.admit_service(
+            api,
+            WORKER_HEADERS,
+            agent_id,
+            issue_number=issue,
+            conversation=support.WIRE_CONVERSATION,
+        )
+        epoch = support.start_request(admitted.request_id)
+        support.relabel_while_live(
+            agent_id,
+            issue_number=issue,
+            live_request_id=admitted.request_id,
+            objective=REVISION_OBJECTIVE,
+        )
+    return admitted.request_id, epoch
+
+
+@pytest.mark.parametrize(
+    ("stop", "finish_code", "ended"),
+    [
+        ("enrollment_fence", "not_running", ("failed", "enrollment_fenced")),
+        ("service_relabel", "work_item_cancelled", ("cancelled", "issue_cancelled")),
+    ],
+)
+def test_live_owner_claim_keeps_the_epoch_its_interrupted_turn_finishes_with(
+    api: TestClient, world: support.World, stop: str, finish_code: str, ended: tuple[str, str]
+) -> None:
+    """r1-G1: the owner's heartbeat stop re-claims before it interrupts its own turn.
+
+    That claim renews the live lease without advancing the epoch, so the
+    interrupted turn's finish, which presents the epoch it started with, is
+    answered as a stopped run and not ``stale_owner``. Only a takeover, by
+    another owner once the lease lapsed, advances the epoch and fences the
+    previous owner; while the lease is live another owner is refused.
+    """
+
+    agent_id = support.insert_agent(world.tenant_id)
+    request_id, epoch = _stop_live_run(api, world, agent_id, 61651, stop)
+    stopping = _request(request_id)
+    assert (stopping["status"], stopping["runtime_owner"], stopping["runtime_epoch"]) == (
+        "cancellation_requested",
+        support.RUNTIME_OWNER,
+        epoch,
+    )
+    assert stopping["lease_lapsed"] is False
+
+    # Another worker is refused while the owner's lease is live.
+    _conflict(_claim(api, request_id, support.OTHER_RUNTIME_OWNER), "duplicate")
+    assert _request(request_id) == stopping
+
+    # The owner's own claim renews its lease and keeps the epoch and version.
+    claim = _claimed(api, request_id)
+    assert claim == {"runtime_epoch": epoch, "request_version": stopping["version"]}
+    renewed = _request(request_id)
+    assert (renewed["runtime_owner"], renewed["runtime_epoch"], renewed["version"]) == (
+        support.RUNTIME_OWNER,
+        epoch,
+        stopping["version"],
+    )
+    assert renewed["runtime_heartbeat_expires_at"] > stopping["runtime_heartbeat_expires_at"]
+    assert _claimed(api, request_id) == claim
+
+    # The interrupted turn finishes with its start epoch: a stopped run, not a stale owner.
+    _conflict(_finish(api, request_id, epoch), finish_code)
+    assert _request(request_id)["status"] == "cancellation_requested"
+
+    # The owner stalls past its lease; another worker takes the runtime over.
+    _expire_lease(request_id)
+    taken = _claimed(api, request_id, support.OTHER_RUNTIME_OWNER)
+    assert taken == {"runtime_epoch": epoch + 1, "request_version": stopping["version"]}
+    taken_over = _request(request_id)
+    assert (taken_over["runtime_owner"], taken_over["lease_lapsed"]) == (
+        support.OTHER_RUNTIME_OWNER,
+        False,
+    )
+    # The superseded owner's late finish and record name the old epoch.
+    _conflict(_finish(api, request_id, epoch), "stale_owner")
+    _conflict(_record(api, request_id, claim), "stale_owner")
+    assert _request(request_id) == taken_over
+
+    recorded = _record(api, request_id, taken)
+    assert recorded.status_code == 200, recorded.text
+    assert (recorded.json()["status"], recorded.json()["terminal_cause"]) == ended
 
 
 # --- outcomes ------------------------------------------------------------------------

@@ -15,11 +15,16 @@ apps/worker/CLAUDE.md), the real fake runner for interrupts, and the real
 test_work_item_settling.py: ``TeardownApi`` serves the termination routes'
 contract (owner lease, epoch, request-version compare and set). The API's own
 refusals are proved against Postgres by the API suite.
+
+The owner's stop is also driven end to end through ``Kernel.process_event``
+(r1-G1): the live owner's re-claim keeps the epoch, so the turn it interrupts
+still finishes as itself, ``not_running``, and settles its delivery.
 """
 
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import uuid
 from dataclasses import dataclass, field
@@ -28,6 +33,7 @@ from typing import Any
 
 import httpx
 import pytest
+from aci_protocol import Final, SessionStatus
 from curie_worker.binding import FactoryWake
 from curie_worker.kernel import routing
 from curie_worker.workitem_dispatch import (
@@ -38,11 +44,16 @@ from curie_worker.workitem_dispatch import (
 
 from apps.worker.tests.queue_fixtures import factory_context
 
+from .test_work_item_early_stop import _Binding as _ExecuteBinding
+from .test_work_item_early_stop import _PublicationApi
+from .test_work_item_early_stop import _Workspace as _ExecuteWorkspace
+from .test_work_item_settling import Api, ApiClock, _event, _until
 from .test_work_item_workspace import (
     AGENT_ID,
     CHANNEL,
     _Binding,
     _NoExistingPublication,
+    _TerminationLease,
     _turn,
     _Workspace,
 )
@@ -52,16 +63,13 @@ PEER = "worker-b"
 _TERMINAL = ("completed", "failed", "expired")
 
 
-@dataclass
-class _Row:
+@dataclass(kw_only=True)
+class _Row(_TerminationLease):
     status: str
-    runtime_epoch: int
-    version: int
     teardown_pending: bool
     claim_name: str | None
     sandbox_name: str | None
-    runtime_owner: str | None = None
-    lease_live: bool = False
+    terminal_cause: str | None = None
     observation: str | None = None
 
 
@@ -70,10 +78,13 @@ class TeardownApi:
     """The worker-token termination routes, as the #5377 contract defines them.
 
     Claim: a ``cancellation_requested`` row, or a terminal row with teardown
-    pending, is claimable when no other owner holds a live lease; the claim
-    renews the lease and bumps the version, and bumps the epoch only for
-    ``cancellation_requested``. Record: the epoch and the expected request
-    version must both be current and the observation nonblank.
+    pending, is claimable when no other owner holds a live lease, and the claim
+    renews the lease under ``_TerminationLease``'s rule (the API's
+    ``claim_termination``): on a ``cancellation_requested`` row only a takeover
+    advances the epoch and the version never moves; on a terminal row only the
+    version advances. Record: the epoch and the expected request version must
+    both be current and the observation nonblank; it advances the version, and
+    a terminal row's confirmation also clears its owner.
     """
 
     request_id: uuid.UUID
@@ -132,15 +143,12 @@ class TeardownApi:
         if not eligible:
             self.claims.append({**seen, "outcome": "not_running"})
             return httpx.Response(409, json={"detail": {"code": "not_running"}})
-        if row.lease_live and row.runtime_owner not in (None, owner):
+        if not row.claim(owner, terminal=row.status in _TERMINAL):
             self.claims.append({**seen, "outcome": "duplicate"})
             return httpx.Response(409, json={"detail": {"code": "duplicate"}})
-        row.runtime_owner = owner
-        row.lease_live = True
-        row.version += 1
-        if row.status == "cancellation_requested":
-            row.runtime_epoch += 1
-        self.claims.append({**seen, "outcome": "claimed", "version": row.version})
+        self.claims.append(
+            {**seen, "outcome": "claimed", "epoch": row.runtime_epoch, "version": row.version}
+        )
         return httpx.Response(
             200, json={"runtime_epoch": row.runtime_epoch, "request_version": row.version}
         )
@@ -156,10 +164,11 @@ class TeardownApi:
                 409, json={"detail": {"code": "termination_observation_required"}}
             )
         if row.status == "cancellation_requested":
+            # The stop's record keeps the owner and its lease, as the API does.
             row.status = "cancelled"
+        else:
+            row.runtime_owner = None
         row.teardown_pending = False
-        row.runtime_owner = None
-        row.lease_live = False
         row.version += 1
         row.observation = body["observation"]
         self.records.append(body)
@@ -268,12 +277,15 @@ def test_delayed_duplicate_teardown_never_touches_a_resumed_successor(make_harne
 
 
 @pytest.mark.parametrize(
-    ("status", "recorded_epoch"),
-    [("cancellation_requested", 5), ("failed", 3)],
+    ("status", "recorded_epoch", "recorded_version"),
+    # A cancellation's gating claim takes the ownerless runtime over (epoch 4)
+    # and the re-claim renews that lease; a terminal row's claims move only the
+    # version.
+    [("cancellation_requested", 4, 5), ("failed", 3, 7)],
     ids=["cancellation", "terminal"],
 )
 def test_terminate_records_with_the_epoch_and_version_of_its_reclaim(
-    make_harness, status: str, recorded_epoch: int
+    make_harness, status: str, recorded_epoch: int, recorded_version: int
 ) -> None:
     async def go() -> None:
         async with _harness(make_harness) as h:
@@ -308,8 +320,10 @@ def test_terminate_records_with_the_epoch_and_version_of_its_reclaim(
             assert [c["interrupts_before"] for c in api.claims] == [0, 0]
             assert h.runner.interrupts == 1
             [record] = api.records
-            assert record["runtime_epoch"] == recorded_epoch
-            assert record["expected_request_version"] == api.claims[-1]["version"] == 7
+            assert record["runtime_epoch"] == recorded_epoch == api.claims[-1]["epoch"]
+            assert (
+                record["expected_request_version"] == api.claims[-1]["version"] == recorded_version
+            )
             assert old.claim_name in record["observation"]
             assert old.claim_name not in h.fake_k8s.claims
 
@@ -421,11 +435,206 @@ def test_owner_stop_records_with_the_epoch_and_version_of_its_reclaim(make_harne
             ]
             assert api.claims[0]["interrupts_before"] == 0
             assert h.runner.interrupts == 1
+            # The live owner's re-claim renews its lease: the epoch its turn
+            # started with and the version both stay.
             [record] = api.records
-            assert record["runtime_epoch"] == 4
-            assert record["expected_request_version"] == 6
+            assert record["runtime_epoch"] == run.runtime_epoch == 3
+            assert record["expected_request_version"] == 5
             assert handle.claim_name not in h.fake_k8s.claims
             assert api.row.status == "cancelled"
             assert run.finished is True
+
+    asyncio.run(go())
+
+
+# --- the owner's stop settles the turn it interrupts (r1-G1) ----------------------------
+
+
+class _OwnerStopApi:
+    """The settling suite's dispatch ``Api`` with one request row behind the stop.
+
+    Acquire, start and the issue read are ``Api``'s; start makes the starting
+    owner the row's live lease holder. Heartbeat, finish, the request read and
+    the termination routes read and write ``teardown.row`` in the order the API
+    checks them (apps/api/src/curie_api/workitem_dispatch.py): a heartbeat
+    presenting another epoch is ``stale_owner``; a finish presenting another
+    epoch, or after the lease lapsed, is ``stale_owner`` before a request that
+    is no longer running answers ``not_running`` (``_map_finish_conflict``).
+    A record waits until the turn's own finish has been answered, the order a
+    real stop takes while ``terminate_thread`` polls for absence.
+    """
+
+    def __init__(self, request_id: uuid.UUID, clock: ApiClock, teardown: TeardownApi) -> None:
+        self.request_id = request_id
+        self.dispatch = Api(request_id, clock)
+        self.teardown = teardown
+        self.finish_answers: list[tuple[int, str]] = []
+        self.finish_answered = asyncio.Event()
+
+    async def __call__(self, request: httpx.Request) -> httpx.Response:
+        base = f"/v1/internal/work-items/requests/{self.request_id}"
+        path = request.url.path
+        row = self.teardown.row
+        if path == f"{base}/termination":
+            with contextlib.suppress(TimeoutError):
+                await asyncio.wait_for(self.finish_answered.wait(), timeout=5)
+        if request.method == "GET" or path.startswith(f"{base}/termination"):
+            return await self.teardown(request)
+        if path == f"{base}/heartbeat":
+            if json.loads(request.content)["runtime_epoch"] != row.runtime_epoch:
+                return httpx.Response(409, json={"detail": {"code": "stale_owner"}})
+            return httpx.Response(
+                200,
+                json={
+                    "status": row.status,
+                    "terminal_cause": row.terminal_cause,
+                    "work_item_cancelled": False,
+                },
+            )
+        if path == f"{base}/finish":
+            return self._finish(json.loads(request.content))
+        response = self.dispatch(request)
+        if path == f"{base}/start":
+            assert self.dispatch.start_grant is not None
+            row.status = "running"
+            row.runtime_epoch = self.dispatch.start_grant["runtime_epoch"]
+            row.runtime_owner = self.dispatch.owner
+            row.lease_live = True
+        return response
+
+    def _finish(self, body: dict[str, Any]) -> httpx.Response:
+        row = self.teardown.row
+        code: str | None = None
+        if body["runtime_epoch"] != row.runtime_epoch or not row.lease_live:
+            code = "stale_owner"
+        elif row.status == "cancellation_requested" and row.terminal_cause in (
+            "issue_cancelled",
+            "issue_deleted",
+        ):
+            code = "work_item_cancelled"
+        elif row.status != "running":
+            code = "not_running"
+        self.finish_answers.append((body["runtime_epoch"], code or "finished"))
+        self.finish_answered.set()
+        if code is not None:
+            return httpx.Response(409, json={"detail": {"code": code}})
+        row.status = body["outcome"]
+        return httpx.Response(200, json={})
+
+
+def test_owner_stop_lets_the_interrupted_turn_finish_and_settle_its_delivery(
+    make_harness, monkeypatch
+) -> None:
+    """The heartbeat sees the fence; the turn it interrupts still finishes as itself.
+
+    Driven through ``Kernel.process_event``: the execute turn starts, the runner
+    holds it open and the run heartbeats every 10 ms. The API then fences the
+    request to ``cancellation_requested`` with the owner's lease still live.
+    The heartbeat's stop re-claims under the thread lock and interrupts the
+    turn, whose own finish presents the epoch it started with. The live owner's
+    re-claim kept that epoch, so the finish is answered ``not_running`` and the
+    delivery writes its done marker and ``turn.completed`` and releases the
+    finished run's sandbox. Were the re-claim to advance the epoch, the finish
+    would be ``stale_owner`` and the delivery would end with no marker.
+    """
+
+    from curie_worker import api_retry
+    from curie_worker import workitem_dispatch as dispatch_module
+
+    async def go() -> None:
+        clock = ApiClock()
+        request_id = uuid.uuid4()
+        event = _event(request_id)
+        thread_key = routing._thread_key_for(event)
+        monkeypatch.setattr(dispatch_module, "_MIN_HEARTBEAT_INTERVAL_S", 0.01)
+        monkeypatch.setattr(api_retry, "_clock", clock)
+        monkeypatch.setattr(api_retry, "_sleep", clock.sleep)
+        async with make_harness(
+            binding=_ExecuteBinding(),
+            workspace_factory=_ExecuteWorkspace,
+            publication_creator=_PublicationApi(),
+        ) as h:
+            teardown = TeardownApi(
+                request_id,
+                _Row(
+                    status="waiting",
+                    runtime_epoch=0,
+                    version=5,
+                    teardown_pending=False,
+                    claim_name=None,
+                    sandbox_name=None,
+                ),
+                h.async_redis,
+                h.config.lock_key(thread_key),
+                h.runner,
+            )
+            api = _OwnerStopApi(request_id, clock, teardown)
+            api.dispatch.kernel = h.kernel
+            api.dispatch.heartbeat_interval_s = 0.01
+            release = h.kernel._release_work_item_sandbox
+            releases: list[str] = []
+
+            async def observed_release(run: Any) -> None:
+                releases.append(run.thread_key)
+                await release(run)
+
+            monkeypatch.setattr(h.kernel, "_release_work_item_sandbox", observed_release)
+            h.runner.hold = asyncio.Event()
+            h.runner.default_script = []
+            # What the runner streams once its turn is interrupted (curie_runner.session).
+            h.runner.tail = [
+                Final(text="run interrupted", status=SessionStatus.IDLE_AWAITING_INPUT)
+            ]
+            async with httpx.AsyncClient(transport=httpx.MockTransport(api)) as http:
+                h.kernel._work_items = _client(http)
+                turn = asyncio.create_task(h.kernel.process_event(event))
+                await _until(
+                    lambda: (
+                        h.runner.turn_active
+                        and api.dispatch.run is not None
+                        and api.dispatch.run.heartbeat_running
+                    )
+                )
+                run = api.dispatch.run
+                start_epoch = run.runtime_epoch
+                own_claim = run.claim_name
+                assert run.thread_key == thread_key
+                assert (teardown.row.runtime_owner, teardown.row.runtime_epoch) == (
+                    OWNER,
+                    start_epoch,
+                )
+
+                # The enrollment fence stops the request; the owner's lease stays live.
+                teardown.row.status = "cancellation_requested"
+                teardown.row.terminal_cause = "enrollment_fenced"
+                await asyncio.wait_for(turn, timeout=10)
+
+            # The interrupted turn's own finish named its start epoch and was
+            # answered as a stopped run, not a stale owner.
+            assert api.finish_answers == [(start_epoch, "not_running")]
+            # So the delivery settled: the done marker, turn.completed, a
+            # finished run and its sandbox released.
+            assert await h.kernel._markers.is_terminal(event.event_id)
+            assert [completion.outcome for completion in h.sink.completions] == ["delivered"]
+            assert run.finished
+            assert releases == [thread_key]
+            assert own_claim not in h.fake_k8s.claims
+            assert h.substrate._affinity.get(thread_key) is None
+            assert not h.kernel.owns_work_item(request_id)
+            # The stop re-claimed under the thread lock before its one interrupt,
+            # and the live owner's re-claim kept the epoch.
+            assert [
+                (c["owner"], c["outcome"], c["lock_held"], c["interrupts_before"])
+                for c in teardown.claims
+            ] == [(OWNER, "claimed", True, 0)]
+            assert h.runner.interrupts == 1
+            assert teardown.row.runtime_epoch == start_epoch
+            # The record named the re-claim's epoch and version.
+            [record] = teardown.records
+            assert (record["runtime_epoch"], record["expected_request_version"]) == (
+                start_epoch,
+                5,
+            )
+            assert own_claim is not None and own_claim in record["observation"]
 
     asyncio.run(go())

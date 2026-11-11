@@ -1880,10 +1880,16 @@ async def claim_termination(
 
     The claimant holds the runtime lease until it lapses; another owner is
     refused ``duplicate`` meanwhile. Claiming a stopping request or a settled
-    cancellation advances the runtime epoch. Claiming a completed, failed or
-    expired request leaves the epoch alone, since an ADR 0251 recovery capture
-    of that run is bound to it, and advances the request version instead, so
-    only the latest claimant's record is accepted (#5377).
+    cancellation advances the runtime epoch only when the claim takes the
+    runtime over: from a different owner, from a lapsed heartbeat, or from no
+    owner. The live owner's own claim renews its lease and keeps the epoch, so
+    the turn it is stopping still finishes with the epoch it started with and
+    is answered ``not_running`` rather than ``stale_owner``; a superseded
+    previous owner still presents an older epoch. Claiming a completed, failed
+    or expired request leaves the epoch alone, since an ADR 0251 recovery
+    capture of that run is bound to it, and advances the request version
+    instead, so only the latest claimant's record is accepted (#5377). The
+    claim returns the request's epoch and version as they stand after it.
     """
 
     request = await lock_request_by_id(session, request_id)
@@ -1907,7 +1913,8 @@ async def claim_termination(
         request.runtime_heartbeat_expires_at is not None
         and request.runtime_heartbeat_expires_at > now
     )
-    allowed = request.runtime_owner is None or not heartbeat_live or request.runtime_owner == owner
+    live_owner = heartbeat_live and request.runtime_owner == owner
+    allowed = request.runtime_owner is None or not heartbeat_live or live_owner
     if not allowed:
         return await _refuse(session, "duplicate", request_id=request.id)
     if terminal_teardown:
@@ -1919,7 +1926,8 @@ async def claim_termination(
             if settled_teardown
             else ExecutionRequest.status == "cancellation_requested"
         )
-        fence = {"runtime_epoch": ExecutionRequest.runtime_epoch + 1}
+        # A renewal by the live owner keeps the epoch its running turn holds.
+        fence = {} if live_owner else {"runtime_epoch": ExecutionRequest.runtime_epoch + 1}
     settings = get_settings()
     changed_id = await session.scalar(
         update(ExecutionRequest)

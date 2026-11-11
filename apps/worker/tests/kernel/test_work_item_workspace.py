@@ -12,7 +12,7 @@ import asyncio
 import contextlib
 import uuid
 from collections.abc import Awaitable, Callable
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 from typing import Any
@@ -171,6 +171,42 @@ class _Workspace:
         return SimpleNamespace(repo_full_name=WORK_ITEM_REPO, base_sha="a1" * 20)
 
 
+@dataclass(kw_only=True)
+class _TerminationLease:
+    """One request's runtime lease as the termination claim moves it (#5377).
+
+    The rule of apps/api/src/curie_api/workitem_dispatch.py::claim_termination:
+    another owner's live lease refuses the claim (``duplicate``); the live
+    owner's own claim renews the lease and keeps the epoch, so the turn it is
+    stopping still finishes with the epoch it started with; a claim that takes
+    the runtime over (another owner, a lapsed lease, or no owner) advances the
+    epoch. A stopping request's claim never moves the request version; a
+    terminal request's teardown claim advances only the version.
+    """
+
+    runtime_epoch: int
+    version: int
+    runtime_owner: str | None = None
+    lease_live: bool = False
+
+    def claim(self, owner: str, *, terminal: bool = False) -> bool:
+        """Apply one claim by ``owner``; False when it is refused ``duplicate``."""
+
+        live_owner = self.lease_live and self.runtime_owner == owner
+        if self.lease_live and self.runtime_owner is not None and not live_owner:
+            return False
+        if terminal:
+            self.version += 1
+        elif not live_owner:
+            self.runtime_epoch += 1
+        self.runtime_owner = owner
+        self.lease_live = True
+        return True
+
+    def granted(self) -> TerminationClaim:
+        return TerminationClaim(runtime_epoch=self.runtime_epoch, request_version=self.version)
+
+
 class _WorkItems:
     """Dispatch double: the acquire grant carries the WorkItem repository."""
 
@@ -182,6 +218,8 @@ class _WorkItems:
         self.starts: dict[uuid.UUID, WorkItemStartGrant] = {}
         self.terminal_outcomes: dict[uuid.UUID, str] = {}
         self.deadline_holds: set[uuid.UUID] = set()
+        # The starting owner's live lease, which a termination claim renews.
+        self.leases: dict[uuid.UUID, _TerminationLease] = {}
 
     async def acquire(
         self,
@@ -251,7 +289,7 @@ class _WorkItems:
         )
 
     async def start(
-        self, request_id: uuid.UUID, *, context: FactoryContext, **_: object
+        self, request_id: uuid.UUID, *, context: FactoryContext, **kwargs: object
     ) -> WorkItemStartGrant:
         self.calls.append("start")
         acquired = self.acquisitions[request_id]
@@ -265,6 +303,13 @@ class _WorkItems:
             heartbeat_interval_s=60.0,
         )
         self.starts[request_id] = started
+        owner = kwargs.get("owner")
+        self.leases[request_id] = _TerminationLease(
+            runtime_epoch=started.runtime_epoch,
+            version=1,
+            runtime_owner=owner if isinstance(owner, str) else None,
+            lease_live=True,
+        )
         return started
 
     async def hold_for_approval(
@@ -307,12 +352,14 @@ class _WorkItems:
             await self.after_finish()
 
     async def claim_termination(self, request_id: uuid.UUID, *, owner: str) -> TerminationClaim:
+        """A stopping request's claim: renewed by its live owner, else taken over."""
+
         self.calls.append("claim_termination")
-        started = self.starts.get(request_id)
-        return TerminationClaim(
-            runtime_epoch=started.runtime_epoch if started is not None else 1,
-            request_version=self.calls.count("claim_termination") + 1,
-        )
+        # A request this double never started has no owner, so a claim takes it over.
+        lease = self.leases.setdefault(request_id, _TerminationLease(runtime_epoch=1, version=1))
+        if not lease.claim(owner):
+            raise WorkItemConflict("duplicate")
+        return lease.granted()
 
     async def get_request(self, request_id: uuid.UUID) -> WorkItemRequestView:
         self.calls.append("get_request")
@@ -1954,17 +2001,24 @@ class _OrphanWorkItems:
     def __init__(self) -> None:
         self.claimed: list[tuple[uuid.UUID, str]] = []
         self.recorded: list[tuple[uuid.UUID, int, int, str]] = []
+        # The previous incarnation, under the same stable consumer name, died
+        # and its lease lapsed: stored epoch 7, request version 3.
+        self.lease = _TerminationLease(
+            runtime_epoch=7, version=3, runtime_owner="test-consumer", lease_live=False
+        )
 
     async def claim_termination(self, request_id: uuid.UUID, *, owner: str) -> TerminationClaim:
         self.claimed.append((request_id, owner))
-        # Each claim advances the row version; the epoch of this cancellation
-        # stays the stored 7 in this double.
-        return TerminationClaim(runtime_epoch=7, request_version=2 + len(self.claimed))
+        # The first claim takes the lapsed runtime over and advances the epoch;
+        # the re-claim renews that live lease. Neither moves the version.
+        if not self.lease.claim(owner):
+            raise WorkItemConflict("duplicate")
+        return self.lease.granted()
 
     async def get_request(self, _request_id: uuid.UUID) -> object:
         return SimpleNamespace(
             status="cancellation_requested",
-            runtime_epoch=7,
+            runtime_epoch=self.lease.runtime_epoch,
             runtime_claim_name=self.CLAIM,
             runtime_sandbox_name=self.SANDBOX,
         )
@@ -2012,8 +2066,9 @@ def test_terminate_wake_for_an_orphan_tears_down_its_stored_claim(make_harness) 
             assert len(terminated) == 1
             assert terminated[0]["claim_name"] == _OrphanWorkItems.CLAIM
             assert terminated[0]["sandbox_name"] == _OrphanWorkItems.SANDBOX
-            # Recorded with the re-claim's epoch and request version.
-            assert [(r[0], r[1], r[2]) for r in work_items.recorded] == [(request_id, 7, 4)]
+            # Recorded with the re-claim's epoch and request version: the
+            # takeover's epoch 8, and the version no cancellation claim moved.
+            assert [(r[0], r[1], r[2]) for r in work_items.recorded] == [(request_id, 8, 3)]
             assert _OrphanWorkItems.CLAIM in work_items.recorded[0][3]
 
     asyncio.run(exercise())
@@ -3094,10 +3149,7 @@ def test_refused_resume_finish_transport_failure_cannot_restore_ended_held_run(
             assert request_id == self.refused_request_id
             assert owner == "test-consumer"
             self.termination_claims += 1
-            return TerminationClaim(
-                runtime_epoch=self.starts[request_id].runtime_epoch,
-                request_version=1 + self.termination_claims,
-            )
+            return await super().claim_termination(request_id, owner=owner)
 
         async def get_request(self, request_id: uuid.UUID) -> WorkItemRequestView:
             view = await super().get_request(request_id)
@@ -3108,10 +3160,12 @@ def test_refused_resume_finish_transport_failure_cannot_restore_ended_held_run(
             self, request_id: uuid.UUID, *, runtime_epoch: int,
             expected_request_version: int, observation: str,
         ) -> None:
-            assert runtime_epoch == self.starts[request_id].runtime_epoch
-            # The version the re-claim under the thread lock returned (#5377).
+            # The epoch and version the re-claim under the thread lock returned
+            # (#5377): the gating claim took the released hold over and advanced
+            # the epoch once, the re-claim renewed it, and neither moved the version.
             assert self.termination_claims == 2
-            assert expected_request_version == 1 + self.termination_claims
+            assert runtime_epoch == self.starts[request_id].runtime_epoch + 1
+            assert expected_request_version == 1
             assert self.runtime_claims[request_id][0] in observation
             self.terminal_outcomes[request_id] = "cancelled"
             self.terminations.append(request_id)
@@ -3140,6 +3194,9 @@ def test_refused_resume_finish_transport_failure_cannot_restore_ended_held_run(
                     items.terminal_outcomes[request_id] = "cancelled"
                     await h.kernel.interrupt_agent(AGENT_ID)
                 else:
+                    # The API's stop releases the parked approval hold
+                    # (lifecycle._release_parked_hold), so the lease has lapsed.
+                    items.leases[request_id].lease_live = False
                     await h.kernel._terminate_work_item(
                         _turn(f"work-item-{request_id}-terminate", "terminate"), request_id,
                     )
