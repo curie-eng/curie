@@ -2495,6 +2495,66 @@ def private_bundle_manifest(manifest: Mapping[str, Any]) -> dict[str, Any]:
     return patched
 
 
+def pod_diagnostics(pods: Mapping[str, Any], events: Mapping[str, Any]) -> dict[str, Any]:
+    """Why a rollout stalled, from pod status and Warning events only.
+
+    Reads ``status.containerStatuses[].state`` and Warning event reasons, never
+    logs or env, and cuts each message to 300 characters.
+    """
+
+    def state(status: Mapping[str, Any]) -> dict[str, Any]:
+        current = status.get("state") or {}
+        last = (status.get("lastState") or {}).get("terminated") or {}
+        found: dict[str, Any] = {
+            "container": status.get("name"),
+            "ready": bool(status.get("ready")),
+            "restarts": status.get("restartCount", 0),
+        }
+        for key in ("waiting", "terminated"):
+            detail = current.get(key)
+            if isinstance(detail, dict):
+                found[key] = {
+                    "reason": detail.get("reason"),
+                    "exit_code": detail.get("exitCode"),
+                    "message": str(detail.get("message") or "")[:300],
+                }
+        if last:
+            found["last_terminated"] = {
+                "reason": last.get("reason"),
+                "exit_code": last.get("exitCode"),
+            }
+        return found
+
+    pod_states = []
+    for pod in pods.get("items") or []:
+        if not isinstance(pod, dict):
+            continue
+        status = pod.get("status") or {}
+        containers = [
+            *(status.get("initContainerStatuses") or []),
+            *(status.get("containerStatuses") or []),
+        ]
+        pod_states.append(
+            {
+                "pod": (pod.get("metadata") or {}).get("name"),
+                "phase": status.get("phase"),
+                "containers": [state(item) for item in containers if isinstance(item, dict)],
+            }
+        )
+    warnings = [
+        {
+            "object": f"{(item.get('involvedObject') or {}).get('kind')}/"
+            f"{(item.get('involvedObject') or {}).get('name')}",
+            "reason": item.get("reason"),
+            "message": str(item.get("message") or "")[:300],
+            "count": item.get("count"),
+        }
+        for item in events.get("items") or []
+        if isinstance(item, dict) and item.get("type") == "Warning"
+    ]
+    return {"pods": pod_states, "warnings": warnings[-20:]}
+
+
 def running_image_failures(
     pods: Any, expected: Mapping[str, str], *, registry: str, required: Sequence[str]
 ) -> list[str]:

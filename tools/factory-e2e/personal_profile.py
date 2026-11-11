@@ -1394,7 +1394,7 @@ class LiveRun:
         dump = json.dumps(
             [
                 self.ledger.observations(name)
-                for name in (*pps.CRITERIA, "images", "forge", "rehearsal")
+                for name in (*pps.CRITERIA, "images", "forge", "rehearsal", "install")
             ]
             + [self.ledger.cleanup_rows()],
             sort_keys=True,
@@ -1662,21 +1662,25 @@ class LiveRun:
             ],
             timeout=960,
         )
-        for workload in ("api", "worker", "dispatcher"):
+        try:
+            for workload in ("api", "worker", "dispatcher"):
+                self.kube.ctl(
+                    "rollout",
+                    "status",
+                    f"deployment/{inputs.fullname}-{workload}",
+                    "--timeout=600s",
+                    timeout=620,
+                )
             self.kube.ctl(
                 "rollout",
                 "status",
-                f"deployment/{inputs.fullname}-{workload}",
+                f"statefulset/{inputs.fullname}-postgres",
                 "--timeout=600s",
                 timeout=620,
             )
-        self.kube.ctl(
-            "rollout",
-            "status",
-            f"statefulset/{inputs.fullname}-postgres",
-            "--timeout=600s",
-            timeout=620,
-        )
+        except Exception:
+            self.record_rollout_diagnostics()
+            raise
         pods = self.kube.json("get", "pods")
         failures = pps.running_image_failures(
             pods,
@@ -1715,6 +1719,18 @@ class LiveRun:
         self.ledger.record("roles", "service_credentials_absent", not findings)
         if findings:
             raise pps.Refusal("deployed_service_credential", ", ".join(findings))
+
+    def record_rollout_diagnostics(self) -> None:
+        """Pod states and Warning events for a stalled rollout, before teardown erases them."""
+
+        diagnostics = self.safe(
+            lambda: pps.pod_diagnostics(
+                self.kube.json("get", "pods"), self.kube.json("get", "events")
+            ),
+            {"pods": [], "warnings": [], "unanswered": True},
+        )
+        self.ledger.record("install", "rollout_diagnostics", diagnostics)
+        self.out.progress("rollout stalled: " + json.dumps(diagnostics, sort_keys=True))
 
     def helm_uninstall(self) -> None:
         listed = self.shell.run(

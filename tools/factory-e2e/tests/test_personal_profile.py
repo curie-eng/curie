@@ -1391,6 +1391,74 @@ def test_deployed_settings_scan_names_service_credentials() -> None:
         assert "inline-value" not in json.dumps(found)
 
 
+def test_pod_diagnostics_report_reasons_never_env() -> None:
+    # Pod and Event shapes from the Kubernetes core/v1 API (PodStatus,
+    # ContainerStatus.state and lastState, Event type/reason/involvedObject).
+    pods = {
+        "items": [
+            {
+                "metadata": {"name": "ppa-acme-curie-api-7c9d"},
+                "spec": {
+                    "containers": [
+                        {"name": "api", "env": [{"name": "CURIE_API_KEY", "value": "inline-value"}]}
+                    ]
+                },
+                "status": {
+                    "phase": "Running",
+                    "initContainerStatuses": [
+                        {
+                            "name": "migrate",
+                            "ready": True,
+                            "restartCount": 0,
+                            "state": {"terminated": {"reason": "Completed", "exitCode": 0}},
+                        }
+                    ],
+                    "containerStatuses": [
+                        {
+                            "name": "api",
+                            "ready": False,
+                            "restartCount": 4,
+                            "state": {
+                                "waiting": {
+                                    "reason": "CrashLoopBackOff",
+                                    "message": "back-off 1m20s restarting failed container",
+                                }
+                            },
+                            "lastState": {"terminated": {"reason": "Error", "exitCode": 3}},
+                        }
+                    ],
+                },
+            }
+        ]
+    }
+    events = {
+        "items": [
+            {
+                "type": "Normal",
+                "reason": "Pulled",
+                "involvedObject": {"kind": "Pod", "name": "ppa-acme-curie-api-7c9d"},
+            },
+            {
+                "type": "Warning",
+                "reason": "BackOff",
+                "message": "Back-off restarting failed container api",
+                "count": 6,
+                "involvedObject": {"kind": "Pod", "name": "ppa-acme-curie-api-7c9d"},
+            },
+        ]
+    }
+    found = pps.pod_diagnostics(pods, events)
+    [pod] = found["pods"]
+    assert pod["phase"] == "Running"
+    migrate, api = pod["containers"]
+    assert migrate["terminated"]["reason"] == "Completed"
+    assert api["waiting"]["reason"] == "CrashLoopBackOff"
+    assert api["last_terminated"] == {"reason": "Error", "exit_code": 3}
+    assert [item["reason"] for item in found["warnings"]] == ["BackOff"]
+    assert "inline-value" not in json.dumps(found)
+    assert "CURIE_API_KEY" not in json.dumps(found)
+
+
 def test_head_checks_require_completed_success() -> None:
     # Shapes: GitHub REST check runs (filter=latest) and the combined status endpoint.
     success = {"status": "completed", "conclusion": "success"}
