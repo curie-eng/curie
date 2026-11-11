@@ -410,7 +410,7 @@ def test_fence_stops_running_requests_without_cancelling_the_work_item(
         {"a": live.work_item_id, "b": held.work_item_id, "generation": world.generation},
     ) == [{"n": 2}]
     # The fenced runs end failed through the worker's termination chain. The
-    # live owner's own claim renews its lease and keeps its epoch (r1-G1).
+    # live owner's own claim renews its lease and keeps its epoch.
     claim = _claimed(api, live.request_id)
     assert claim["runtime_epoch"] == live_epoch
     recorded = _record(api, live.request_id, claim)
@@ -788,7 +788,7 @@ def _stop_live_run(
 def test_live_owner_claim_keeps_the_epoch_its_interrupted_turn_finishes_with(
     api: TestClient, world: support.World, stop: str, finish_code: str, ended: tuple[str, str]
 ) -> None:
-    """r1-G1: the owner's heartbeat stop re-claims before it interrupts its own turn.
+    """The owner's heartbeat stop re-claims before it interrupts its own turn.
 
     That claim renews the live lease without advancing the epoch, so the
     interrupted turn's finish, which presents the epoch it started with, is

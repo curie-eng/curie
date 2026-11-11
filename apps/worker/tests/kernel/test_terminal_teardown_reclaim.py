@@ -16,12 +16,12 @@ test_work_item_settling.py: ``TeardownApi`` serves the termination routes'
 contract (owner lease, epoch, request-version compare and set). The API's own
 refusals are proved against Postgres by the API suite.
 
-The owner's stop is also driven end to end through ``Kernel.process_event``
-(r1-G1): the live owner's re-claim keeps the epoch, so the turn it interrupts
+The owner's stop is also driven end to end through ``Kernel.process_event``.
+The live owner's re-claim keeps the epoch, so the turn it interrupts
 still finishes as itself, ``not_running``, and settles its delivery.
 
-The thread lock's lease is fenced after the re-claim and after the interrupt
-(r1-C1): a lease that expired while either was in flight, with a peer's real
+The thread lock's lease is fenced after the re-claim and after the interrupt.
+A lease that expired while either was in flight, with a peer's real
 ``ThreadLock`` holding the key since, stops the teardown before anything more is
 interrupted, deleted or recorded, and the peer's lock is left as it is.
 """
@@ -104,7 +104,7 @@ class TeardownApi:
     read_gate: asyncio.Event | None = None
     read_entered: asyncio.Event = field(default_factory=asyncio.Event)
     # Awaited while a claim made under the thread lock is being answered, as a
-    # delayed response would be (r1-C1).
+    # delayed response would be.
     on_locked_claim: Callable[[], Awaitable[None]] | None = None
 
     async def __call__(self, request: httpx.Request) -> httpx.Response:
@@ -461,7 +461,7 @@ def test_owner_stop_records_with_the_epoch_and_version_of_its_reclaim(make_harne
     asyncio.run(go())
 
 
-# --- a lease lost mid-teardown stops it (r1-C1) ----------------------------------------
+# --- a lease lost mid-teardown stops it ----------------------------------------
 
 
 async def _peer_takes_the_lock(h: Any, lock_key: str) -> str:
@@ -681,7 +681,7 @@ def test_terminate_whose_lock_is_lost_during_its_interrupt_deletes_and_records_n
     asyncio.run(go())
 
 
-# --- the owner's stop settles the turn it interrupts (r1-G1) ----------------------------
+# --- the owner's stop settles the turn it interrupts ----------------------------
 
 
 class _OwnerStopApi:
