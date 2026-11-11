@@ -55,6 +55,38 @@ def test_compose_collector_limits_and_persists_every_enabled_signal() -> None:
     assert telemetry["level"] != "none"
     assert telemetry["address"] == "0.0.0.0:8888"
     assert "debug" in config["exporters"]
+    noise = config["processors"]["filter/langfuse_platform_noise"]
+    assert noise["error_mode"] == "ignore"
+    assert noise["traces"]["span"] == [
+        (
+            'name == "http.server.request" and '
+            'attributes["service.name"] == "curie-api" and '
+            'attributes["curie.source"] == "GET" and '
+            '(attributes["curie.operation"] == "/health" or '
+            'attributes["curie.operation"] == "/ready" or '
+            'attributes["curie.operation"] == "/agents" or '
+            'attributes["curie.operation"] == "/agents/{agent_id}" or '
+            'attributes["curie.operation"] == "/approvals" or '
+            'attributes["curie.operation"] == "/approvals/{approval_id}" or '
+            'attributes["curie.operation"] == "/approvals/{approval_id}/audit" or '
+            'attributes["curie.operation"] == "/langfuse/traces" or '
+            'attributes["curie.operation"] == "/langfuse/traces/{trace_id}" or '
+            'attributes["curie.operation"] == "/observability/metrics/summary" or '
+            'attributes["curie.operation"] == "/observability/metrics/series" or '
+            'attributes["curie.operation"] == "/observability/runners" or '
+        'attributes["curie.operation"] == "/cluster-message-replies/{reply_ref}" or '
+        'attributes["curie.operation"] == "/v1/internal/work-items/runtime-owners")'
+        ),
+        'IsMatch(name, "^curie\\\\.background\\\\.")',
+        'name == "curie.sandbox.cleanup"',
+    ]
+    assert pipelines["traces"]["processors"] == [
+        "memory_limiter",
+        "filter/langfuse_platform_noise",
+        "batch",
+    ]
+    assert "filter/langfuse_platform_noise" not in pipelines["logs"]["processors"]
+    assert "filter/langfuse_platform_noise" not in pipelines["metrics"]["processors"]
 
 
 def test_compose_collector_volume_is_writable_by_non_root() -> None:

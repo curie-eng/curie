@@ -29,7 +29,15 @@ from typing import Any
 
 import pytest
 from curie_worker import protected_recovery
-from curie_worker.capacity_wait import CapacityWaitRequested, CapacityWaitStore
+from curie_worker.capacity_wait import (
+    REQUESTER_HANDOFF_REASON,
+    WAIT_REASON_ADMISSION,
+    WAIT_REASON_PREDECESSOR,
+    CapacityWaitRefused,
+    CapacityWaitRequested,
+    CapacityWaitStore,
+    durable_wait_notice,
+)
 from curie_worker.consumer import Consumer, refuse_unconfigured_reminder
 from curie_worker.delivery_lease import DeliveryLeaseStore
 
@@ -572,5 +580,419 @@ def test_a_capacity_park_records_no_reason(make_harness, caplog: pytest.LogCaptu
             stored = await h.async_redis.hgetall(waits._record(event.event_id))
             assert "reason" not in stored
             assert set(stored) <= protected_recovery._WAIT_HASH_FIELDS
+
+    asyncio.run(run())
+
+
+# -- The notice cause and the order reason are independent (forward merge) ---
+
+
+def _text(value: object) -> str:
+    """A Valkey reply as text. @spec CONNECTOR-REQUESTER-3."""
+    return value.decode() if isinstance(value, bytes) else str(value)
+
+
+async def order_count(h: Any, key: str, event_id: str) -> int:
+    """How many thread order members (``<rank>|<event_id>``) name ``event_id``.
+
+    @spec CONNECTOR-REQUESTER-3.
+    """
+    members = await h.async_redis.zrange(h.config.capacity_thread_order_key(key), 0, -1)
+    return sum(1 for member in members if _text(member).endswith("|" + event_id))
+
+
+async def stored_hash(h: Any, waits: CapacityWaitStore, event_id: str) -> dict[str, str]:
+    """The wait record hash as stored. @spec CONNECTOR-REQUESTER-3."""
+    stored = await h.async_redis.hgetall(waits._record(event_id))
+    return {_text(name): _text(value) for name, value in stored.items()}
+
+
+async def stored_cause(h: Any, waits: CapacityWaitStore, event_id: str) -> str | None:
+    """The durable notice cause, from its own key outside the hash. @spec CONNECTOR-REQUESTER-3."""
+    raw = await h.async_redis.get(waits._reason(event_id))
+    return None if raw is None else _text(raw)
+
+
+def test_a_handoff_wait_keeps_its_notice_cause_and_its_order_reason_apart(
+    make_harness,
+) -> None:
+    """@spec CONNECTOR-REQUESTER-3 (forward merge): two fields, two park arguments.
+
+    Alice's turn is live and Bob's delivery parks through the real consumer
+    as a requester handoff. The one record carries both fields apart: the
+    order ``reason`` is ``requester_handoff`` in the hash, and the notice
+    cause ``wait_reason`` is ``sandbox_admission`` in its own key. Bob never
+    joins the thread order. A wake while Alice is still live re-parks with
+    both kept (same deadline, one more deferral), and Alice's follow-up still
+    steers her turn. Liveness: once her turn ends, Bob runs once on a sandbox
+    recorded for his requester, and the wait ends ``done``.
+
+    Catches the park script reading the notice cause as the order reason
+    (``local reason = ARGV[15]``): the handoff would store and read back
+    reason ``sandbox_admission`` instead of ``requester_handoff``, losing the
+    sticky marker that keeps its wakes out of the thread order.
+    """
+    require_execution_interface()
+    require_requester_interface()
+    wait_cls = handoff_wait()
+
+    async def run() -> None:
+        binding, alice, bob, core = event_parties()
+        async with make_harness(
+            binding=binding,
+            identity_authority=core,
+            per_sandbox_runners=2,
+            max_delivery=2,
+            **_LEASE_KNOBS,
+        ) as h:
+            consumer = consumer_for(h)
+            waits = CapacityWaitStore(h.async_redis, h.config)
+            outcomes = observe_outcomes(h)
+            holds = hold_turns(h)
+            alice_turn = qevent("alice is working", thread="cause-apart")
+            key = thread_key(alice_turn)
+            opener = asyncio.create_task(process(h, alice_turn))
+            bob_turn = qevent("bob asks", thread="cause-apart")
+            follow_up = qevent("alice follows up", thread="cause-apart")
+            try:
+                await wait_until(lambda: any_turn_active(h), "alice's turn is live")
+                alice_handle = route(h, key)
+                alice_runner = runner_at(h, alice_handle)
+
+                await deliver(h, consumer, core, bob_turn, bob)
+
+                assert outcomes.get(bob_turn.event_id) == [wait_cls]
+                parked = await waits.get(bob_turn.event_id)
+                assert parked is not None and parked.state == "waiting"
+                assert parked.reason == REQUESTER_HANDOFF_REASON
+                assert parked.wait_reason == WAIT_REASON_ADMISSION
+                assert await stored_cause(h, waits, bob_turn.event_id) == WAIT_REASON_ADMISSION
+                stored = await stored_hash(h, waits, bob_turn.event_id)
+                assert stored.get("reason") == REQUESTER_HANDOFF_REASON
+                assert await order_count(h, key, bob_turn.event_id) == 0, (
+                    "a handoff wait joined the thread order"
+                )
+                # The notice cause resolves to a known notice. Bob's delivery
+                # carries an HTTP identity context, so that courtesy is
+                # suppressed and never reaches the sink.
+                notice = durable_wait_notice(parked.wait_reason)
+                sink_texts = [text for _a, _r, text in h.sink.updates] + [
+                    text for _a, _r, text in h.sink.text_posts
+                ]
+                assert all(notice not in text for text in sink_texts)
+                assert all_steers(h) == [] and all_interrupts(h) == 0
+
+                woken_id, woken = await wake(h, waits, bob_turn.event_id)
+                await consumer._handle(woken_id, woken)
+
+                assert outcomes[bob_turn.event_id] == [wait_cls, wait_cls]
+                again = await waits.get(bob_turn.event_id)
+                assert again is not None and again.state == "waiting"
+                assert again.reason == REQUESTER_HANDOFF_REASON
+                assert again.wait_reason == WAIT_REASON_ADMISSION
+                assert await stored_cause(h, waits, bob_turn.event_id) == WAIT_REASON_ADMISSION
+                stored = await stored_hash(h, waits, bob_turn.event_id)
+                assert stored.get("reason") == REQUESTER_HANDOFF_REASON
+                assert again.deadline_ms == parked.deadline_ms
+                assert again.deferrals == parked.deferrals + 1
+                assert await order_count(h, key, bob_turn.event_id) == 0, (
+                    "a re-parked handoff wait joined the thread order"
+                )
+                assert await pending_count(h) == 0
+
+                await deliver(h, consumer, core, follow_up, alice)
+
+                assert alice_runner.steers == ["alice follows up"], (
+                    "Alice's follow-up waited behind Bob's handoff wait"
+                )
+                assert all_steers(h) == ["alice follows up"]
+                assert all_interrupts(h) == 0
+                assert outcomes.get(follow_up.event_id) == [_RETURNED]
+                assert await waits.get(follow_up.event_id) is None
+                assert all_opened(h) == ["alice is working"]
+            finally:
+                release(holds)
+                await opener
+
+            complete_turns(h)
+            woken_id, woken = await wake(h, waits, bob_turn.event_id)
+            await consumer._handle(woken_id, woken)
+
+            assert outcomes[bob_turn.event_id][-1] == _RETURNED
+            bob_handle = route(h, key)
+            assert bob_handle.claim_name != alice_handle.claim_name
+            assert recorded(bob_handle)[0] == requester_digest(bob)
+            assert runner_at(h, bob_handle).opened == ["bob asks"]
+            assert all_opened(h).count("bob asks") == 1
+            assert all_steers(h) == ["alice follows up"] and all_interrupts(h) == 0
+            assert await is_done(h, bob_turn)
+            settled = await waits.get(bob_turn.event_id)
+            assert settled is not None and settled.state == "done"
+            assert await pending_count(h) == 0
+            assert await dead_letters(h) == 0
+
+    asyncio.run(run())
+
+
+def test_an_ordered_wait_stores_its_cause_without_a_reason_field(make_harness) -> None:
+    """@spec CONNECTOR-REQUESTER-3 (forward merge): an ordered wait's cause is not a reason.
+
+    A delivery parked into the thread order with the notice cause
+    ``thread_predecessor`` reads back that cause, an empty order reason, no
+    ``reason`` hash field, and exactly one thread order member. Woken and
+    re-parked with the cause ``sandbox_admission`` on the same thread, the new
+    cause is stored and re-arms the notice, and the record still has no
+    ``reason`` field and one order member. An ordered park writes its
+    ``order_token`` into the hash; the protected lane never parks with a thread
+    key, so its field allowlist is not asserted here.
+
+    Catches the park script reading the notice cause as the order reason
+    (``local reason = ARGV[15]``): every park would write ``reason`` =
+    ``thread_predecessor`` or ``sandbox_admission`` into the hash.
+    """
+
+    async def run() -> None:
+        async with make_harness() as h:
+            consumer = consumer_for(h)
+            leases = DeliveryLeaseStore(h.async_redis, h.config)
+            waits = CapacityWaitStore(h.async_redis, h.config)
+            event = qevent("ordered wait", thread="ordered-cause")
+            key = thread_key(event)
+            entry_id, observed = await pending_entry(
+                h, consumer, {"payload": event.model_dump_json()}
+            )
+
+            async def park_owned(entry: str, fields: dict[str, str], wait_reason: str) -> Any:
+                lease = await leases.acquire(
+                    h.config.stream,
+                    h.config.consumer_group,
+                    entry,
+                    consumer=h.config.consumer_name,
+                )
+                try:
+                    return await waits.park(
+                        entry,
+                        fields,
+                        event.event_id,
+                        lease,
+                        thread_key=key,
+                        wait_reason=wait_reason,
+                    )
+                finally:
+                    await leases.release(
+                        h.config.stream,
+                        h.config.consumer_group,
+                        entry,
+                        owner=lease.owner,
+                        resume_event_id=None,
+                    )
+
+            first = await park_owned(entry_id, observed, WAIT_REASON_PREDECESSOR)
+
+            assert first.state == "waiting"
+            assert first.reason == ""
+            assert first.wait_reason == WAIT_REASON_PREDECESSOR
+            assert await stored_cause(h, waits, event.event_id) == WAIT_REASON_PREDECESSOR
+            stored = await stored_hash(h, waits, event.event_id)
+            assert "reason" not in stored
+            assert await order_count(h, key, event.event_id) == 1
+
+            woken_id, woken = await wake(h, waits, event.event_id)
+            again = await park_owned(woken_id, woken, WAIT_REASON_ADMISSION)
+
+            assert again.state == "waiting"
+            assert again.generation > first.generation
+            assert again.reason == ""
+            assert again.wait_reason == WAIT_REASON_ADMISSION
+            assert again.notice_pending is True
+            assert await stored_cause(h, waits, event.event_id) == WAIT_REASON_ADMISSION
+            stored = await stored_hash(h, waits, event.event_id)
+            assert "reason" not in stored
+            assert await order_count(h, key, event.event_id) == 1
+
+    asyncio.run(run())
+
+
+def test_an_order_reason_is_refused_as_a_notice_cause_before_any_write(make_harness) -> None:
+    """@spec CONNECTOR-REQUESTER-3 (forward merge): ``requester_handoff`` is no notice cause.
+
+    Parking an owned delivery with ``wait_reason=requester_handoff`` raises
+    ``CapacityWaitRefused`` before Valkey is touched: no wait record, no cause
+    key, no thread order member, and the entry is still pending in the
+    consumer group. Liveness: the same entry under the same lease then parks
+    with the cause ``sandbox_admission`` and reads back waiting with it.
+
+    Catches a merge that swaps the two park arguments or drops the
+    ``wait_reason`` validation, so the order reason lands in the notice cause
+    key, where ``durable_wait_notice`` cannot resolve it, and the entry is
+    acked. It does not catch the ``ARGV[15]`` script revert, which the other
+    tests in this section do.
+    """
+
+    async def run() -> None:
+        async with make_harness() as h:
+            consumer = consumer_for(h)
+            leases = DeliveryLeaseStore(h.async_redis, h.config)
+            waits = CapacityWaitStore(h.async_redis, h.config)
+            event = qevent("refused cause", thread="refused-cause")
+            key = thread_key(event)
+            entry_id, observed = await pending_entry(
+                h, consumer, {"payload": event.model_dump_json()}
+            )
+            lease = await leases.acquire(
+                h.config.stream,
+                h.config.consumer_group,
+                entry_id,
+                consumer=h.config.consumer_name,
+            )
+            try:
+                with pytest.raises(CapacityWaitRefused):
+                    await waits.park(
+                        entry_id,
+                        observed,
+                        event.event_id,
+                        lease,
+                        thread_key=key,
+                        wait_reason=REQUESTER_HANDOFF_REASON,
+                    )
+
+                assert await waits.get(event.event_id) is None
+                assert await h.async_redis.exists(waits._reason(event.event_id)) == 0
+                assert await h.async_redis.exists(waits._record(event.event_id)) == 0
+                assert await order_count(h, key, event.event_id) == 0
+                rows = await h.async_redis.xpending_range(
+                    h.config.stream,
+                    h.config.consumer_group,
+                    min=entry_id,
+                    max=entry_id,
+                    count=1,
+                )
+                assert len(rows) == 1, "the refused park acked the entry"
+
+                record = await waits.park(
+                    entry_id,
+                    observed,
+                    event.event_id,
+                    lease,
+                    thread_key=key,
+                    wait_reason=WAIT_REASON_ADMISSION,
+                )
+            finally:
+                await leases.release(
+                    h.config.stream,
+                    h.config.consumer_group,
+                    entry_id,
+                    owner=lease.owner,
+                    resume_event_id=None,
+                )
+
+            assert record.state == "waiting"
+            assert record.wait_reason == WAIT_REASON_ADMISSION
+            assert record.reason == ""
+            parked = await waits.get(event.event_id)
+            assert parked is not None and parked.state == "waiting"
+            assert parked.wait_reason == WAIT_REASON_ADMISSION
+            assert await stored_cause(h, waits, event.event_id) == WAIT_REASON_ADMISSION
+            assert await order_count(h, key, event.event_id) == 1
+            assert await pending_count(h) == 0
+
+    asyncio.run(run())
+
+
+def test_a_handoff_wait_reparked_as_ordered_capacity_keeps_out_of_the_thread_order(
+    make_harness,
+) -> None:
+    """@spec CONNECTOR-REQUESTER-3 (forward merge): the sticky handoff reason outranks a key.
+
+    Bob's delivery parks as a requester handoff with no thread key, as the
+    consumer parks one. Woken, it re-parks the way the consumer's plain
+    capacity path does: with the thread's key, the cause
+    ``thread_predecessor`` and no reason. The stored ``requester_handoff``
+    reason is sticky, so the record keeps it (hash field included) and stays
+    out of the thread order, while the new notice cause is stored and re-arms
+    the notice. Control: a second delivery on the same thread, parked with
+    that key and no reason, joins the order exactly once.
+
+    Catches the reverted park script (``local reason = ARGV[15]`` and
+    ``reason ~= ARGV[16]``): the re-park reads the notice cause as the order
+    reason, which is not the handoff constant, so the wait joins the thread
+    order and the live requester's own follow-ups queue behind a different
+    requester.
+    """
+
+    async def run() -> None:
+        async with make_harness() as h:
+            consumer = consumer_for(h)
+            leases = DeliveryLeaseStore(h.async_redis, h.config)
+            waits = CapacityWaitStore(h.async_redis, h.config)
+            handoff = qevent("bob asks", thread="handoff-ordered")
+            other = qevent("carol asks", thread="handoff-ordered")
+            key = thread_key(handoff)
+
+            async def park_owned(
+                entry: str, fields: dict[str, str], event_id: str, **knobs: Any
+            ) -> Any:
+                lease = await leases.acquire(
+                    h.config.stream,
+                    h.config.consumer_group,
+                    entry,
+                    consumer=h.config.consumer_name,
+                )
+                try:
+                    return await waits.park(entry, fields, event_id, lease, **knobs)
+                finally:
+                    await leases.release(
+                        h.config.stream,
+                        h.config.consumer_group,
+                        entry,
+                        owner=lease.owner,
+                        resume_event_id=None,
+                    )
+
+            entry_id, observed = await pending_entry(
+                h, consumer, {"payload": handoff.model_dump_json()}
+            )
+            first = await park_owned(
+                entry_id,
+                observed,
+                handoff.event_id,
+                thread_key=None,
+                reason=REQUESTER_HANDOFF_REASON,
+            )
+            assert first.state == "waiting"
+            assert first.reason == REQUESTER_HANDOFF_REASON
+            assert first.wait_reason == WAIT_REASON_ADMISSION
+            assert await order_count(h, key, handoff.event_id) == 0
+
+            woken_id, woken = await wake(h, waits, handoff.event_id)
+            record = await park_owned(
+                woken_id,
+                woken,
+                handoff.event_id,
+                thread_key=key,
+                wait_reason=WAIT_REASON_PREDECESSOR,
+                reason="",
+            )
+
+            assert record.state == "waiting"
+            assert record.generation > first.generation
+            assert record.reason == REQUESTER_HANDOFF_REASON, "the handoff reason was not sticky"
+            stored = await stored_hash(h, waits, handoff.event_id)
+            assert stored.get("reason") == REQUESTER_HANDOFF_REASON
+            assert record.wait_reason == WAIT_REASON_PREDECESSOR
+            assert await stored_cause(h, waits, handoff.event_id) == WAIT_REASON_PREDECESSOR
+            assert record.notice_pending is True
+            assert await order_count(h, key, handoff.event_id) == 0, (
+                "a re-parked handoff wait joined the thread order"
+            )
+
+            other_entry, other_fields = await pending_entry(
+                h, consumer, {"payload": other.model_dump_json()}
+            )
+            control = await park_owned(other_entry, other_fields, other.event_id, thread_key=key)
+            assert control.state == "waiting" and control.reason == ""
+            assert await order_count(h, key, other.event_id) == 1
+            assert await order_count(h, key, handoff.event_id) == 0
+            assert await pending_count(h) == 0
 
     asyncio.run(run())

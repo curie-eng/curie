@@ -617,14 +617,17 @@ def test_fifth_diff_rejection_caps_the_loop(session: Session, plan_verdict: str)
 
 def test_a_capped_run_states_its_findings_in_its_reply(session: Session) -> None:
     # ADR 0187: the bundle has no GitHub write tool. The platform posts the
-    # final reply on the issue, so the stop text asks for the findings there.
+    # final reply on the issue, so the stop text carries the short handoff.
     session.review(PLAN, reply(PLAN, "APPROVE"))
     for round_ in range(1, 6):
         _, context = session.review(DIFF, reply(DIFF, "CHANGES"))
         rework(session, round_)
     assert "Could not complete:" in context
+    assert "Decisions needed:" in context
     assert "add_issue_comment" not in context
     assert "platform posts that reply on the issue" in context
+    assert "1500 characters" in context
+    assert "Settled:" in context
 
 
 # --- A reviewer call without a verdict grants nothing -----------------------------

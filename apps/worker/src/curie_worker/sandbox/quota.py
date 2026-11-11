@@ -227,7 +227,7 @@ def _parse_map_quantity(values: object, resource: str) -> Decimal | None:
 def _parse_quantity(raw: object) -> Decimal | None:
     if not isinstance(raw, str) or _QUANTITY_RE.fullmatch(raw) is None:
         return None
-    value = parse_quantity(raw)
+    value = parse_quantity(raw)  # type: ignore[no-untyped-call]
     if not isinstance(value, Decimal) or not value.is_finite():
         return None
     return value

@@ -11,7 +11,7 @@ import pytest
 from aci_protocol import Final, SessionStatus
 from curie_worker.sandbox import CapacityExhaustedError
 from kubernetes.client import ApiException
-from urllib3.exceptions import MaxRetryError, ReadTimeoutError
+from urllib3.exceptions import MaxRetryError, ProtocolError, ReadTimeoutError
 
 from .test_consumer import (
     _capacity_consumer,
@@ -50,6 +50,120 @@ def _footprint_fault_client(sync_redis, names, monkeypatch, plural: str, failure
 
     monkeypatch.setattr(api, "get_namespaced_custom_object", observe)
     return client, api, admission, state
+
+
+def _runtime_quota_fault_client(
+    sync_redis, names, monkeypatch, reader: str, failure: str
+):
+    client, api, admission = _inventory_timeout_client(
+        sync_redis,
+        names,
+        monkeypatch,
+        failure="healthy",
+        restore=True,
+        failures=0,
+    )
+    # A pod spec with runtimeClassName set and no overhead makes
+    # _capacity_pod_spec perform the runtime-class read (#5406); the read goes
+    # to the fake API, not the real NodeV1Api the client constructed.
+    template = api.objects[("sandboxtemplates", "curie-agent-acme-a-runner")]
+    template["spec"]["podTemplate"]["spec"]["runtimeClassName"] = "gvisor"
+    client._node_api = api
+    # A NewConnectionError inherits urllib3's TimeoutError, which the substrate
+    # already treats as transient on the base; ProtocolError is a plain
+    # transport error, the non-timeout outage the base leaves unhandled.
+    connection = ProtocolError("connection reset by peer")
+    fault = {
+        "http-503": ApiException(status=503),
+        "connection": connection,
+        "sdk-connection": MaxRetryError(
+            None, "/apis/node.k8s.io/v1/runtimeclasses/gvisor", connection
+        ),
+    }[failure]
+    state = SimpleNamespace(fault=fault, reads=[])
+    runtime_read = api.read_runtime_class
+    quota_read = api.read_namespaced_resource_quota
+
+    def read_runtime(name: str, **kwargs: Any) -> Any:
+        state.reads.append("runtime-class")
+        if state.fault is not None and reader == "runtime-class":
+            raise state.fault
+        return runtime_read(name, **kwargs)
+
+    def read_quota(*args: Any, **kwargs: Any) -> Any:
+        state.reads.append("quota")
+        if state.fault is not None and reader == "quota":
+            raise state.fault
+        return quota_read(*args, **kwargs)
+
+    monkeypatch.setattr(api, "read_runtime_class", read_runtime)
+    monkeypatch.setattr(api, "read_namespaced_resource_quota", read_quota)
+    return client, api, admission, state
+
+
+@pytest.mark.parametrize("reader", ["runtime-class", "quota"])
+@pytest.mark.parametrize("failure", ["http-503", "connection", "sdk-connection"])
+def test_runtime_class_and_quota_outage_waits_and_recovery_starts_once(
+    make_harness,
+    sync_redis,
+    names,
+    monkeypatch,
+    reader: str,
+    failure: str,
+) -> None:
+    client, api, admission, fault = _runtime_quota_fault_client(
+        sync_redis, names, monkeypatch, reader, failure,
+    )
+
+    async def go() -> None:
+        async with make_harness(
+            sandbox_client=client,
+            substrate_env={"CURIE_SANDBOX_ADMISSION": admission},
+            slack_no_edit_streaming=True,
+            max_delivery=2,
+        ) as h:
+            consumer = _capacity_consumer(h)
+            await consumer.ensure_group()
+            event = _qevent(
+                "run after runtime quota recovery", event_id="runtime-quota-original"
+            )
+            entry, fields = await _pending_local_entry(h, event)
+            await consumer._sem.acquire()
+            await consumer._handle(entry, fields)
+            waiting = await consumer._waits.get(event.event_id)
+            assert waiting is not None and waiting.state == "waiting"
+            assert fault.reads.count(reader) == 1
+            assert api.created == [] and api.secrets == {}
+            assert h.runner.opened == h.sink.completions == []
+            assert not await h.kernel._markers.is_terminal(event.event_id)
+            assert (await h.async_redis.xpending(h.config.stream, h.config.consumer_group))[
+                "pending"
+            ] == 0
+
+            fault.fault = None
+            h.runner.default_script = [
+                Final(text="runtime quota recovered", status=SessionStatus.DONE)
+            ]
+            await h.async_redis.zadd(consumer._waits._due, {event.event_id: 0})
+            assert await consumer._waits.wake_due() == 1
+            rows = await h.async_redis.xreadgroup(
+                h.config.consumer_group,
+                h.config.consumer_name,
+                {h.config.stream: ">"},
+                count=1,
+            )
+            entry, fields = rows[0][1][0]
+            await consumer._sem.acquire()
+            await consumer._handle(entry, fields)
+            finished = await consumer._waits.get(event.event_id)
+            assert finished is not None and finished.state == "done"
+            assert finished.deadline_ms == waiting.deadline_ms
+            assert h.runner.opened == h.runner.queried == ["run after runtime quota recovery"]
+            assert h.sink.last_text == "runtime quota recovered"
+            assert len(h.sink.completions) == 1
+            assert not await h.async_redis.exists(f"{h.config.stream}:dead")
+
+    asyncio.run(go())
 
 
 @pytest.mark.parametrize("plural", ["sandboxwarmpools", "sandboxtemplates"])

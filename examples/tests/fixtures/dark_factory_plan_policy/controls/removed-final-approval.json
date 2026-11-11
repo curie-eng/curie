@@ -48,7 +48,7 @@
       "replace": "a mock presented as real, or a fixed result. When the checks are done, go to\nstep 8.\n"
     },
     {
-      "find": "The plan review runs once, the diff review loop at most 5 completed rounds,\nand the `wait_ci` loop at most 3 rounds. A diff review rejection returns to\nstep 6 (implement), never to the plan. When the diff reviewer still answers\n`VERDICT: CHANGES` on round 5, a review stays unavailable, or the hook stops\nthe run, do not publish:",
+      "find": "The plan review runs once, the diff review loop at most 5 completed rounds,\nand the `wait_ci` loop at most 3 rounds. A diff review rejection returns to\nstep 6 (implement), never to the plan. When the diff reviewer still answers\n`VERDICT: CHANGES` on round 5, a review stays unavailable, or the hook stops\nthe run, do not publish.",
       "replace": "The plan review runs once and the `wait_ci` loop at most 3 rounds. When the\nchecks still fail on `wait_ci` round 3, a review stays unavailable, or the\nhook stops the run, do not publish:"
     },
     {

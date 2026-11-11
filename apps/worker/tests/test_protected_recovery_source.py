@@ -333,3 +333,108 @@ def test_actual_schedule_gate_refuses_changed_snapshot_or_unknown_permanent(
                 )
 
     asyncio.run(go())
+
+
+@pytest.fixture
+def base_wait_stores():
+    import subprocess
+    import sys
+    from types import ModuleType
+
+    # Frozen pre-change worker from main, including its scheduling validator (#5404).
+    base = "906e0dede1baaa27355fbfc8c1b935cfb9b5c428"
+    modules = {}
+    with patch.dict(sys.modules):
+        for name in ("capacity_wait", "protected_recovery"):
+            source = subprocess.check_output(
+                ["git", "show", f"{base}:apps/worker/src/curie_worker/{name}.py"],
+                text=True,
+            )
+            module = ModuleType(f"curie_worker.{name}")
+            sys.modules[module.__name__] = module
+            exec(compile(source, f"base/{name}.py", "exec"), module.__dict__)
+            modules[name] = module
+    return modules["capacity_wait"].CapacityWaitStore, modules[
+        "protected_recovery"
+    ].ProtectedCapacityWaitStore
+
+
+@pytest.mark.parametrize("old_writer", [False, True])
+@pytest.mark.parametrize("reconcile", [False, True])
+def test_base_and_new_workers_schedule_each_others_waits(
+    owned_worker,
+    tmp_path,
+    base_wait_stores,
+    old_writer,
+    reconcile,
+):
+    from curie_worker.protected_recovery import ProtectedCapacityWaitStore
+
+    async def go():
+        async with actual_pair(owned_worker, tmp_path, intake=True) as (
+            _server,
+            client,
+            _external,
+            delivery,
+            _unused,
+            _request,
+        ):
+            ns = derive_lane_namespace(client._manifest)
+            cfg = wb.lane_config(
+                owned_worker.broker,
+                key_prefix=ns.prefix,
+                consumer_group=ns.group,
+                dead_letter_stream=ns.dead,
+                delivery_lease_ttl_s=15,
+                delivery_lease_heartbeat_s=5,
+            )
+            runs = client._broker.lane().runs
+            await runs.xgroup_create(cfg.stream, cfg.consumer_group, id="0")
+            rows = await runs.xreadgroup(
+                cfg.consumer_group, cfg.consumer_name, {cfg.stream: ">"}, count=1
+            )
+            entry, fields = rows[0][1][0]
+            leases = DeliveryLeaseStore(runs, cfg)
+            lease = await leases.acquire(
+                cfg.stream, cfg.consumer_group, entry, consumer=cfg.consumer_name
+            )
+            old_store = base_wait_stores[1](client._broker, client._manifest, cfg)
+            new_store = ProtectedCapacityWaitStore(client._broker, client._manifest, cfg)
+            writer, reader = (old_store, new_store) if old_writer else (new_store, old_store)
+            event_id = delivery.turn.event_id
+            try:
+                parked = await writer.park(entry, fields, event_id, lease)
+                if not old_writer:
+                    assert await new_store.remember_wait_reason(
+                        event_id,
+                        parked.generation,
+                        "workspace_dependency",
+                    )
+                raw = await runs.hgetall(writer._record(event_id))
+                await runs.zadd(writer._due, {event_id: 0})
+                assert await reader.wake_due(limit=1) == 1
+                assert "wait_reason" not in raw
+                if not old_writer:
+                    reason_ttl = await runs.pttl(new_store._reason(event_id))
+                    record_ttl = await runs.pttl(new_store._record(event_id))
+                    assert 0 < record_ttl <= reason_ttl
+                if reconcile:
+                    await runs.hset(writer._record(event_id), "deadline_ms", "0")
+                    await runs.zadd(writer._flight, {event_id: 0})
+                    assert await reader.reconcile_lost_wakes(limit=1) == 1
+                rows = await runs.xreadgroup(
+                    cfg.consumer_group, cfg.consumer_name, {cfg.stream: ">"}, count=2
+                )
+                expected_generation = "3" if reconcile else "2"
+                assert rows[0][1][-1][1][WAIT_GENERATION_FIELD] == expected_generation
+                assert (await new_store.get(event_id)).state == "woken"
+            finally:
+                await leases.release(
+                    cfg.stream,
+                    cfg.consumer_group,
+                    entry,
+                    owner=lease.owner,
+                    resume_event_id=lease.resume_event_id,
+                )
+
+    asyncio.run(go())
