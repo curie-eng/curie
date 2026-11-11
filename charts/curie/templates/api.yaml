@@ -248,6 +248,13 @@ spec:
                   name: {{ include "curie.secretName" . }}
                   key: installationId
                   optional: false
+            {{- $personalGrantNamespace := dig "personalClaude" "grantNamespace" "" (.Values | toYaml | fromYaml) }}
+            {{- if $personalGrantNamespace }}
+            # Personal Claude enrollment custody namespace (#5377). Rendered
+            # only when set; the RBAC lives in personal-grant-custody-rbac.yaml.
+            - name: CURIE_PERSONAL_GRANT_NAMESPACE
+              value: {{ $personalGrantNamespace | quote }}
+            {{- end }}
             # The action executor switch (ACTION-EXECUTOR-1). The worker
             # renders the same value from the same helper; the two must never
             # differ.
