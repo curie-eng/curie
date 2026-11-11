@@ -224,3 +224,13 @@ d3383d0cbcd7b0ff5f3d1fcdf2744e12fbd2fb2f:runner/tests/test_redact.py:generic-api
 5f98d1bce852a94c4545c27a599d24a314a23f59:tools/factory-e2e/tests/test_gitlab_acceptance.py:cross-repo-issue-ref:447
 5f98d1bce852a94c4545c27a599d24a314a23f59:tools/factory-e2e/tests/test_acceptance.py:cross-repo-issue-ref:626
 5f98d1bce852a94c4545c27a599d24a314a23f59:tools/factory-e2e/tests/test_factory_e2e_loop.py:cross-repo-issue-ref:978
+
+# Fake test vectors and a deliberate exception. Historical wake signing fixtures in 6d845405a; next cannot be rewritten.
+6d845405a80b66c845075cb11c085283ab73c434:tests/vectors/hook-wake-signing.json:generic-api-key:15
+6d845405a80b66c845075cb11c085283ab73c434:tests/vectors/hook-wake-signing.json:generic-api-key:32
+6d845405a80b66c845075cb11c085283ab73c434:tests/vectors/hook-wake-signing.json:generic-api-key:51
+6d845405a80b66c845075cb11c085283ab73c434:tests/vectors/hook-wake-signing.json:generic-api-key:68
+6d845405a80b66c845075cb11c085283ab73c434:tests/vectors/hook-wake-signing.json:generic-api-key:85
+6d845405a80b66c845075cb11c085283ab73c434:tests/vectors/hook-wake-signing.json:generic-api-key:102
+6d845405a80b66c845075cb11c085283ab73c434:tests/vectors/hook-wake-signing.json:generic-api-key:119
+6d845405a80b66c845075cb11c085283ab73c434:tests/vectors/hook-wake-signing.json:generic-api-key:136

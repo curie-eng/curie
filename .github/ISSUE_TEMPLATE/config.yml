@@ -1,5 +1,10 @@
 blank_issues_enabled: false
 contact_links:
+  - name: Contributor chat on Discord
+    url: https://discord.gg/YZASub2d5B
+    about: >-
+      Talk with the team and other contributors. Use an issue template for
+      a bug report or feature request.
   - name: Question or how-to help
     url: https://github.com/curie-eng/curie/discussions/categories/q-a
     about: >-

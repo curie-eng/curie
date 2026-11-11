@@ -48,7 +48,9 @@ CLAIM_LABEL = "curietech.ai/sandbox-claim"
 # and the tokens the worker writes beside the render, which are not BootEnv
 # fields (WORKER_TOKEN_ENVS).
 #   CURIE_CONNECTOR_ROUTE_TOKENS  ``ccr.`` route tokens (ADR 0240 decision 2)
-WORKER_TOKEN_ENVS: tuple[str, ...] = ("CURIE_CONNECTOR_ROUTE_TOKENS",)
+MODEL_AUTH_MODE_ENV = "CURIE_MODEL_AUTH_MODE"
+PERSONAL_TOKEN_ENV = "CLAUDE_CODE_OAUTH_TOKEN"
+WORKER_TOKEN_ENVS: tuple[str, ...] = ("CURIE_CONNECTOR_ROUTE_TOKENS", PERSONAL_TOKEN_ENV)
 CLAIM_TOKEN_ENVS: tuple[str, ...] = (
     *(
         BootEnv.env_key(field)
@@ -87,7 +89,7 @@ EXECUTOR_WITHHELD_ENVS: frozenset[str] = frozenset(
         _MODEL_ENV_KEY_ENV,
         "ANTHROPIC_API_KEY",
         "ANTHROPIC_AUTH_TOKEN",
-        "CLAUDE_CODE_OAUTH_TOKEN",
+        PERSONAL_TOKEN_ENV,
         "ANTHROPIC_FOUNDRY_API_KEY",
         "ANTHROPIC_CUSTOM_HEADERS",
     }
@@ -123,6 +125,19 @@ def executor_withheld_names(env: Mapping[str, str]) -> frozenset[str]:
     """Model credential names withheld from an executor claim given ``env``."""
 
     return EXECUTOR_WITHHELD_ENVS | declared_model_env_keys(env.get(_MODEL_ENV_KEY_ENV, ""))
+
+
+def personal_withheld_names(source_spec: Mapping[str, Any]) -> frozenset[str]:
+    """Model credential names declared anywhere in a personal pod template."""
+
+    pod = source_spec.get("podTemplate", {}).get("spec", {})
+    env = [
+        entry
+        for field in ("containers", "initContainers", "ephemeralContainers")
+        for container in pod.get(field) or []
+        for entry in container.get("env") or []
+    ]
+    return _template_withheld_names(env)
 
 
 # Names the connector secret values the claim env carries.
@@ -213,6 +228,7 @@ def claim_template_spec(
     executor_secret_names: frozenset[str] | None = None,
     executor_withheld: Iterable[str] = (),
     tool_daemon: ToolDaemonMount | None = None,
+    personal_mode: bool = False,
 ) -> dict[str, Any]:
     """Copy ``source_spec`` with each token read from ``secret_name`` on the runner.
 
@@ -235,6 +251,10 @@ def claim_template_spec(
     stay verbatim and in order; init containers and the rest of the pod spec
     are untouched.
 
+    ``personal_mode`` removes model credentials, their declared names and opaque
+    ``envFrom`` sources from every container. Connector references remain. Only
+    the runner gets the personal-mode marker and the owner's token reference.
+
     ``tool_daemon`` set (ADR 0217) gives the runner alone its daemon's four
     DOCKER_* values, mounts only the client file keys of ``secret_name``
     read-only at ``DOCKER_CERT_DIR``, and bounds the pod by the absolute claim
@@ -246,10 +266,21 @@ def claim_template_spec(
         if runner_resources is not None
         else copy.deepcopy(dict(source_spec))
     )
-    containers = spec.get("podTemplate", {}).get("spec", {}).get("containers") or []
+    pod = spec.get("podTemplate", {}).get("spec", {})
+    containers = pod.get("containers") or []
     runner = next((c for c in containers if c.get("name") == _RUNNER_CONTAINER), None)
     if runner is None:
         raise ValueError("source template has no runner container")
+    if personal_mode:
+        withheld = personal_withheld_names(spec) | frozenset(executor_withheld)
+        for field in ("containers", "initContainers", "ephemeralContainers"):
+            for container in pod.get(field) or []:
+                container["env"] = [
+                    entry
+                    for entry in container.get("env") or []
+                    if entry.get("name") not in withheld | {MODEL_AUTH_MODE_ENV}
+                ]
+                container.pop("envFrom", None)
     names = list(token_names)
     env = [entry for entry in runner.get("env") or [] if entry.get("name") not in names]
     if executor_secret_names is not None:
@@ -267,6 +298,8 @@ def claim_template_spec(
                 },
             }
         )
+    if personal_mode:
+        env.append({"name": MODEL_AUTH_MODE_ENV, "value": "personal"})
     pod_template = spec["podTemplate"]
     if tool_daemon is not None:
         env = [entry for entry in env if entry.get("name") not in tool_daemon.env]
@@ -293,7 +326,7 @@ def _is_connector_secret_ref(entry: Mapping[str, Any]) -> bool:
 
 
 def _template_withheld_names(env: list[dict[str, Any]]) -> frozenset[str]:
-    """``EXECUTOR_WITHHELD_ENVS`` plus what the runner's declaration names."""
+    """``EXECUTOR_WITHHELD_ENVS`` plus what the supplied declarations name."""
 
     names = set(EXECUTOR_WITHHELD_ENVS)
     for entry in env:
@@ -301,8 +334,8 @@ def _template_withheld_names(env: list[dict[str, Any]]) -> frozenset[str]:
             continue
         if "valueFrom" in entry:
             raise ValueError(
-                f"source template declares {_MODEL_ENV_KEY_ENV} by valueFrom; an "
-                "executor claim cannot tell which model credentials it names"
+                f"source template declares {_MODEL_ENV_KEY_ENV} by valueFrom; the "
+                "claim cannot tell which model credentials it names"
             )
         names |= declared_model_env_keys(str(entry.get("value") or ""))
     return frozenset(names)

@@ -462,6 +462,7 @@ class ExecutingProtectedConsumer(Consumer):
         lease: DeliveryLease,
         entry_id: str,
         fields: dict[str, str],
+        wait_reason: str,
     ) -> None:
         scope = _CURRENT.get()
         if scope is None or not _locally_valid(scope, self._client, self._manifest):
@@ -474,7 +475,13 @@ class ExecutingProtectedConsumer(Consumer):
             or not substrate._client.is_owned_retirement(proof, delivery=delivery)
         ):
             return
-        await self._waits.park(entry_id, fields, delivery.turn.event_id, lease)
+        await self._waits.park(
+            entry_id,
+            fields,
+            delivery.turn.event_id,
+            lease,
+            wait_reason=wait_reason,
+        )
         lease.acknowledged.set()
         await self._settle_delivery(entry_id)
 
@@ -529,12 +536,13 @@ class ExecutingProtectedConsumer(Consumer):
                                         await self._facade.process_event(delivery.turn, lease=lease)
                                     except CapacityWaitExpired:
                                         return  # Never manufacture no-start owned evidence.
-                                    except CapacityWaitRequested:
+                                    except CapacityWaitRequested as requested:
                                         await self._park_owned_wait(
                                             delivery,
                                             lease,
                                             entry_id,
                                             fields,
+                                            requested.wait_reason,
                                         )
                                         return
                             await self._ack_terminal(delivery, lease)

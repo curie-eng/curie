@@ -611,7 +611,7 @@ http
 {{- if hasKey .Values.otelCollector "extraTracePipelineProcessors" -}}
 {{- $traceProcessors = get .Values.otelCollector "extraTracePipelineProcessors" -}}
 {{- end -}}
-{{- $builtInProcessors := dict "memory_limiter" true "batch" true "transform/runner_identity" true -}}
+{{- $builtInProcessors := dict "memory_limiter" true "batch" true "transform/runner_identity" true "filter/langfuse_platform_noise" true -}}
 {{- $componentIDPattern := "^[a-z][a-z0-9_]*(/[A-Za-z0-9_-]+)?$" -}}
 {{- if not (kindIs "map" $extraProcessors) -}}
 {{- fail "otelCollector.extraProcessors must be a map of Collector processor IDs to configuration maps." -}}
@@ -669,6 +669,15 @@ http
 {{- if and $eventsEnabled (not $debugEnabled) (eq (len .Values.otelCollector.extraLogPipelineExporters) 0) -}}
 {{- fail "otelCollector.kubernetesEvents.enabled routes Kubernetes Events into the logs pipeline, which exports only to nop by default. Set otelCollector.extraLogPipelineExporters to a durable log exporter (or enable debugExporter) so the events are recorded." -}}
 {{- end -}}
+{{- /* traces/langfuse always exports the filtered stream to Langfuse. The
+     unfiltered traces pipeline exists only for debug and extra trace exporters,
+     which still want platform spans (#5496). */ -}}
+{{- $extraTraceExporters := .Values.otelCollector.extraPipelineExporters | default list -}}
+{{- $unfilteredTraceExporters := list -}}
+{{- if $debugEnabled -}}
+{{- $unfilteredTraceExporters = append $unfilteredTraceExporters "debug" -}}
+{{- end -}}
+{{- $unfilteredTraceExporters = concat $unfilteredTraceExporters $extraTraceExporters -}}
 {{- /* @spec charts/curie/README.md: Collector exporters without exporterhelper.
      Keep each exemption explicit, documented, and attached to a configured exporter. */ -}}
 {{- $noHelper := .Values.otelCollector.exportersWithoutExporterHelper | default dict -}}
@@ -741,9 +750,12 @@ http
 {{- end -}}
 {{- end -}}
 # Receives OTLP traces, logs, and metrics over gRPC (4317) and HTTP (4318).
-# Traces go to Langfuse over HTTP; logs and metrics retain explicit nop defaults
-# until #1765 supplies their backends. Langfuse OTLP ingest is HTTP-only (gRPC
-# is silently unsupported), so the collector adapts trace traffic to otlphttp.
+# traces/langfuse drops platform noise and exports only to Langfuse over HTTP.
+# The traces pipeline, when debug or an extra trace exporter is configured,
+# keeps those spans for that backend. Logs and metrics retain explicit nop
+# defaults until #1765 supplies their backends. Langfuse OTLP ingest is
+# HTTP-only (gRPC is silently unsupported), so the collector adapts trace
+# traffic to otlphttp.
 receivers:
   otlp:
     protocols:
@@ -768,6 +780,30 @@ processors:
     limit_percentage: {{ .Values.otelCollector.memoryLimiter.limitPercentage }}
     spike_limit_percentage: {{ .Values.otelCollector.memoryLimiter.spikeLimitPercentage }}
   batch: {}
+  filter/langfuse_platform_noise:
+    error_mode: ignore
+    traces:
+      span:
+        - >-
+          name == "http.server.request" and
+          attributes["service.name"] == "curie-api" and
+          attributes["curie.source"] == "GET" and
+          (attributes["curie.operation"] == "/health" or
+          attributes["curie.operation"] == "/ready" or
+          attributes["curie.operation"] == "/agents" or
+          attributes["curie.operation"] == "/agents/{agent_id}" or
+          attributes["curie.operation"] == "/approvals" or
+          attributes["curie.operation"] == "/approvals/{approval_id}" or
+          attributes["curie.operation"] == "/approvals/{approval_id}/audit" or
+          attributes["curie.operation"] == "/langfuse/traces" or
+          attributes["curie.operation"] == "/langfuse/traces/{trace_id}" or
+          attributes["curie.operation"] == "/observability/metrics/summary" or
+          attributes["curie.operation"] == "/observability/metrics/series" or
+          attributes["curie.operation"] == "/observability/runners" or
+          attributes["curie.operation"] == "/cluster-message-replies/{reply_ref}" or
+          attributes["curie.operation"] == "/v1/internal/work-items/runtime-owners")
+        - 'IsMatch(name, "^curie\\.background\\.")'
+        - 'name == "curie.sandbox.cleanup"'
   transform/runner_identity:
     error_mode: ignore
     metric_statements:
@@ -821,10 +857,16 @@ service:
       level: normal
       address: 0.0.0.0:{{ .Values.otelCollector.service.metricsPort }}
   pipelines:
+    traces/langfuse:
+      receivers: [otlp]
+      processors: [memory_limiter{{- range $traceProcessors }}, {{ . }}{{- end }}, filter/langfuse_platform_noise, batch]
+      exporters: [otlphttp/langfuse]
+{{- if $unfilteredTraceExporters }}
     traces:
       receivers: [otlp]
       processors: [memory_limiter{{- range $traceProcessors }}, {{ . }}{{- end }}, batch]
-      exporters: [otlphttp/langfuse{{- if $debugEnabled }}, debug{{- end }}{{- range .Values.otelCollector.extraPipelineExporters }}, {{ . }}{{- end }}]
+      exporters: [{{ join ", " $unfilteredTraceExporters }}]
+{{- end }}
     logs:
       receivers: [otlp{{- if $eventsEnabled }}, k8sobjects/events{{- end }}]
       processors: [memory_limiter, batch]

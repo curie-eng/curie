@@ -368,5 +368,9 @@ whatever license the project adopts; it is not itself a license grant.
 
 ## Getting help while contributing
 
-If you get stuck, see [`SUPPORT.md`](SUPPORT.md) for where to ask. Thank you for
+Join the [Curie Discord community](https://discord.gg/YZASub2d5B) to talk with
+the team and other contributors about a change you are considering or working
+on. Use [GitHub Discussions](https://github.com/curie-eng/curie/discussions)
+for questions and answers that others should be able to find later. See
+[`SUPPORT.md`](SUPPORT.md) for bug reports and other help. Thank you for
 contributing to Curie.

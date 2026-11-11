@@ -97,7 +97,7 @@ WORKFLOW_HEADER = "<header>"
 NON_PYTEST_REGISTRY_SECTIONS = ("chart_scenarios", "ci_policy_tests")
 PYTEST_SHARDS = 6
 CHART_JOB = "e2e-cluster-chart-regressions"
-CHART_LEGS = ("chart", "workload")
+CHART_LEGS = ("chart", "upgrade", "workload")
 SCENARIO_SCRIPT = re.compile(r"^(?:charts/curie/ci|scripts)/[^\s]+\.sh(?:$|[;|&])")
 REPO_ROOT = Path(__file__).resolve().parents[2]
 CARGO_MANIFEST = "cli/Cargo.toml"
@@ -256,7 +256,7 @@ def _chart_registry(value: object) -> ChartScenarios:
             raise RegistryError(f"{label}.step must be a nonempty string")
         leg = entry["leg"]
         if not isinstance(leg, str) or leg not in CHART_LEGS:
-            raise RegistryError(f"{label}.leg must be one of chart, workload")
+            raise RegistryError(f"{label}.leg must be one of chart, upgrade, workload")
         if step in step_names:
             raise RegistryError(f"duplicate chart scenario step: {step}")
         step_names.add(step)
