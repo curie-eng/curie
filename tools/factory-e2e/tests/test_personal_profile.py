@@ -27,7 +27,7 @@ import sqlite3
 import subprocess
 import sys
 import threading
-from collections.abc import Callable, Iterator, Mapping
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
@@ -36,11 +36,13 @@ import personal_profile_support as pps
 import pytest
 
 SCRIPT = Path(pp.__file__).resolve()
+REPO_ROOT = pp.REPO_ROOT
 CANDIDATE = "0123456789abcdef0123456789abcdef01234567"
 OTHER_SHA = "fedcba9876543210fedcba9876543210fedcba98"
 GRANT = "synthetic-personal-grant-not-a-token"
 REPO = "acme-corp/acme-fixture"
 SESSION = "5d0c7f3e-0000-4000-8000-00000000a001"
+TAG = pps.image_tag(CANDIDATE, "acme-run-1")
 # Kubernetes Secret object names, not values.
 APP_SECRET_NAME = "ppa-acme-github-app"
 GRANT_SECRET_NAME = "ppa-acme-personal-grant"
@@ -296,7 +298,7 @@ def test_registry_cleanup_finds_a_push_the_driver_never_read_back() -> None:
 
 
 def _candidate_images(revision: str = CANDIDATE) -> dict[tuple[str, str], tuple[bytes, bytes]]:
-    return {(name, CANDIDATE[:12]): _image(revision) for name in pps.REQUIRED_IMAGES}
+    return {(name, TAG): _image(revision) for name in pps.REQUIRED_IMAGES}
 
 
 def _command_argv(command: str, base: Path, port: int, **overrides: str | None) -> list[str]:
@@ -425,14 +427,14 @@ def test_preflight_refuses_service_credentials(tmp_path: Path) -> None:
         assert result.returncode == 0, result.stdout
 
     mismatched = _candidate_images()
-    mismatched[("curie-worker", CANDIDATE[:12])] = _image(OTHER_SHA)
+    mismatched[("curie-worker", TAG)] = _image(OTHER_SHA)
     with _registry(mismatched) as port:
         base = _private(tmp_path / "mismatch")
         assert _refusal(_run_script(_command_argv("preflight", base, port), base)) == (
             "candidate_image_mismatch"
         )
     missing = _candidate_images()
-    del missing[(pps.LAYER_IMAGE, CANDIDATE[:12])]
+    del missing[(pps.LAYER_IMAGE, TAG)]
     with _registry(missing) as port:
         base = _private(tmp_path / "missing")
         assert _refusal(_run_script(_command_argv("preflight", base, port), base)) == (
@@ -442,7 +444,7 @@ def test_preflight_refuses_service_credentials(tmp_path: Path) -> None:
 
 def test_preflight_reads_the_recorded_layer_ref(tmp_path: Path) -> None:
     images = _candidate_images()
-    del images[(pps.LAYER_IMAGE, CANDIDATE[:12])]
+    del images[(pps.LAYER_IMAGE, TAG)]
     layer_digest = "sha256:" + "a" * 64
     images[("acme-bundle-runner", layer_digest)] = _image(CANDIDATE)
     with _registry(images) as port:
@@ -716,6 +718,8 @@ def _build_ledger(
     approval_overrides: Mapping[str, Any] | None = None,
     inventory_status: str = "absent",
     failed_step: bool = False,
+    published_paths: Sequence[str] = ("NONCE.md",),
+    budget_overrides: Mapping[str, Any] | None = None,
 ) -> None:
     ledger = pps.Ledger.open(state, run_id)
     ledger.ensure_run(CANDIDATE, phase="run", now=T0)
@@ -781,7 +785,12 @@ def _build_ledger(
             "hashes": {"NONCE.md": nonce_hash},
             "nonce_paths": ["NONCE.md"],
         },
-        "published_workspace": {"hashes": {"NONCE.md": nonce_hash}, "nonce_paths": ["NONCE.md"]},
+        "published_workspace": {
+            "hashes": {"NONCE.md": nonce_hash},
+            "nonce_paths": ["NONCE.md"],
+            "changed_paths": list(published_paths),
+            "changed_paths_complete": True,
+        },
     }
     publication = {
         "rejected_remote_branches": 0,
@@ -810,6 +819,9 @@ def _build_ledger(
         for key, value in values.items():
             ledger.record(criterion, key, value)
     ledger.record("budget", "cleanup_elapsed", 41.5)
+    budget = {"paid_starts_fenced": True, "allowance_breach": [], **(budget_overrides or {})}
+    for key, value in budget.items():
+        ledger.record("budget", key, value)
     for name in ("delete-namespace", "helm-uninstall", "delete-grant-secret"):
         ledger.record_cleanup(f"step:{name}", name, "failed" if failed_step else "ok")
     for kind in pps.INVENTORY_KINDS:
@@ -888,6 +900,21 @@ VIOLATIONS: dict[str, tuple[dict[str, Any], str, str]] = {
         {"approval_overrides": {"unlisted_status": 200}},
         "approval",
         "unlisted_refused_403",
+    ),
+    "extra_published_path": (
+        {"published_paths": ("NONCE.md", "unitconv/core.py")},
+        "pod-restart",
+        "workspace_paths_equal",
+    ),
+    "unfenced_paid_starts": (
+        {"budget_overrides": {"paid_starts_fenced": False}},
+        "budget",
+        "paid_starts_fenced",
+    ),
+    "allowance_breach_recorded": (
+        {"budget_overrides": {"allowance_breach": ["output_tokens:implementer"]}},
+        "budget",
+        "no_allowance_breach",
     ),
     "incomplete_teardown_residual": (
         {"inventory_status": "present"},
@@ -1235,6 +1262,134 @@ def test_harvester_program_streams_recorded_shapes(tmp_path: Path) -> None:
     assert harvest.process_start() == pytest.approx(1_700_000_000 + 12345 / ticks, abs=0.01)
     facts = pps.parse_native_transcripts(harvest.transcript_files())
     assert {s.role for s in facts.sessions} == {pps.IMPLEMENTER, *pps.REVIEWER_ROLES}
+
+
+def _file_record(path: str, offset: int, data: bytes) -> bytes:
+    return json.dumps(
+        {"kind": "file", "path": path, "offset": offset, "data": base64.b64encode(data).decode()}
+    ).encode()
+
+
+def _sync_record(sizes: Mapping[str, int]) -> bytes:
+    return json.dumps({"kind": "sync", "sizes": dict(sizes)}).encode()
+
+
+def test_a_secret_split_across_harvest_chunks_is_found() -> None:
+    scrubber = pps.Scrubber()
+    scrubber.hold(pps.HeldSecret(GRANT)).clear()
+    scan = pps.TokenScan(scrubber)
+    harvest = pps.HarvestState(scan)
+    first, second = b"prefix " + GRANT.encode()[:9], GRANT.encode()[9:] + b" suffix\n"
+    other = pps.TokenScan(scrubber)
+    assert not other.scan("harvest", first) and not other.scan("harvest", second)
+    harvest.feed(_file_record("c/projects/s.jsonl", 0, first))
+    assert scan.as_json()["harvest"]["token_bytes_found"] is False
+    harvest.feed(_file_record("c/projects/s.jsonl", len(first), second))
+    assert scan.as_json()["harvest"]["token_bytes_found"] is True
+
+
+def test_harvest_is_complete_only_after_a_matching_size_report(tmp_path: Path) -> None:
+    path = "c/projects/s.jsonl"
+    data = _transcripts()
+    empty = pps.HarvestState(pps.TokenScan(pps.Scrubber()))
+    assert not empty.complete  # a failed exec or an empty EOF reports nothing
+    harvest = pps.HarvestState(pps.TokenScan(pps.Scrubber()))
+    harvest.feed(_file_record(path, 0, b"{}\n"))
+    assert not harvest.complete
+    harvest.feed(_sync_record({path: 3}))
+    assert harvest.complete
+    harvest.feed(_file_record(path, 3, b"{}\n"))  # bytes after the last report
+    assert not harvest.complete
+    harvest.feed(_sync_record({path: 6}))
+    assert harvest.complete
+
+    ledger = _live_ledger(tmp_path)
+    reservations = ledger.reserve(pps.ATTEMPT_ROLES, attempt=1, now=T0 + 10)
+    reviewers_only = {k: v for k, v in data.items() if "subagents" in k}
+    counts = pps.settle_attempt(
+        ledger, reservations, pps.parse_native_transcripts(reviewers_only), complete=True
+    )
+    assert counts["unknown"] == len(reservations)  # no implementer: never settle to zero
+    assert all(item["source"] == "unknown" for item in ledger.sessions())
+    ledger.close()
+    malformed = _live_ledger(tmp_path / "malformed", run_id="malformed-run")
+    reservations = malformed.reserve(pps.ATTEMPT_ROLES, attempt=1, now=T0 + 10)
+    broken = {**data, next(iter(data)): data[next(iter(data))] + b"{not json\n"}
+    facts = pps.parse_native_transcripts(broken)
+    assert facts.malformed_lines
+    counts = pps.settle_attempt(malformed, reservations, facts, complete=True)
+    assert counts["unknown"] == len(reservations)
+    malformed.close()
+
+
+def _gate(tmp_path: Path, event: Mapping[str, Any]) -> subprocess.CompletedProcess[str]:
+    script = tmp_path / pps.RESERVATION_GATE_FILE
+    script.write_text(pps.RESERVATION_GATE_PROGRAM)
+    limits = json.dumps(pps.RESERVATION_LIMITS)
+    return subprocess.run(
+        [sys.executable, "-I", str(script), limits],
+        input=json.dumps(event),
+        capture_output=True,
+        text=True,
+        env={"PATH": os.environ.get("PATH", ""), "PPA_RESERVATION_DIR": str(tmp_path / "r")},
+        check=False,
+        timeout=30,
+    )
+
+
+def test_reservation_gate_refuses_reviewer_starts_past_the_reservation(tmp_path: Path) -> None:
+    def start(kind: str) -> int:
+        event = {"tool_name": "Agent", "tool_input": {"subagent_type": kind, "prompt": "review"}}
+        return _gate(tmp_path, event).returncode
+
+    assert pps.RESERVATION_LIMITS == {"plan": 1, "diff": 2}
+    assert start("dark-factory:plan-reviewer") == 0
+    assert start("plan-reviewer") == 2
+    assert start("dark-factory:diff-reviewer") == 0
+    assert start("diff-reviewer") == 0
+    refused = _gate(
+        tmp_path,
+        {"tool_name": "Task", "tool_input": {"subagent_type": "dark-factory:diff-reviewer"}},
+    )
+    assert refused.returncode == 2 and "allowance is spent" in refused.stderr
+    assert start("general-purpose") == 2
+    assert start("") == 2
+    assert _gate(tmp_path, {"tool_name": "Bash", "tool_input": {"command": "ls"}}).returncode == 0
+    (tmp_path / "r" / "starts.json").write_text("[]")
+    assert start("dark-factory:plan-reviewer") == 2  # unreadable state refuses
+
+    hooks = json.loads((REPO_ROOT / "examples/dark-factory/hooks/hooks.json").read_text())
+    patched = pps.private_bundle_hooks(hooks)
+    added = patched["hooks"]["PreToolUse"][-1]
+    assert added["matcher"] == "Agent|Task"
+    assert pps.RESERVATION_GATE_FILE in added["hooks"][0]["command"]
+    assert patched["hooks"]["PreToolUse"][:-1] == hooks["hooks"]["PreToolUse"]
+
+
+def test_allowance_breaches_name_every_reached_bound() -> None:
+    facts = pps.parse_native_transcripts(_transcripts())
+    implementer = next(s for s in facts.sessions if s.role == pps.IMPLEMENTER)
+    roomy = [
+        pps.Reservation(n, 1, role, 8192, 32, 300.0) for n, role in enumerate(pps.ATTEMPT_ROLES)
+    ]
+    now = max(s.last for s in facts.sessions if s.last is not None)
+    assert pps.allowance_breaches(roomy, facts, now=now) == []
+    tight = [
+        pps.Reservation(0, 1, pps.IMPLEMENTER, implementer.output_tokens, 32, 300.0),
+        *roomy[1:],
+    ]
+    assert pps.allowance_breaches(tight, facts, now=now) == ["output_tokens:implementer"]
+    assert "seconds:" in " ".join(pps.allowance_breaches(roomy, facts, now=now + 400))
+    assert pps.allowance_breaches(roomy[:1], facts, now=now)[0].startswith("unreserved:")
+    assert pps.allowance_breaches(roomy, None, now=now) == []
+
+
+def test_image_tags_and_layer_repository_are_run_owned() -> None:
+    assert pps.image_tag(CANDIDATE, "acme-run-1") != pps.image_tag(CANDIDATE, "acme-run-2")
+    assert pps.image_tag(CANDIDATE, "acme-run-1").startswith(CANDIDATE[:12] + "-")
+    assert pps.layer_repository("localhost:5999/", "dark-factory") == (
+        "localhost:5999/dark-factory-runner"
+    )
 
 
 def test_held_secrets_are_found_in_every_encoding_after_clear() -> None:
@@ -1705,6 +1860,10 @@ class _ScriptedRun(pp.LiveRun):
     def set_platform_budget(self, output_tokens: int) -> None:
         self.events.append(f"budget:{output_tokens}")
 
+    def fence_paid_starts(self) -> None:
+        self.events.append("fence")
+        self.ledger.record("budget", "paid_starts_fenced", True)
+
 
 def _scripted(
     tmp_path: Path,
@@ -2006,7 +2165,9 @@ def test_rehearse_phase_cut_stops_after_forge_and_finalizes(
         "publication_route_bound": True,
         "work_items_list_empty": True,
         "api_pending_empty": True,
+        "fence_exercised": True,
     }
+    assert events.index("fence") < events.index("undo:fixture-issue")
     ledger.close()
     code, result = _judge(tmp_path / "state", "scripted-run", "cleanup", capsys)
     assert code == 0, [key for key, value in result["checks"].items() if not value]

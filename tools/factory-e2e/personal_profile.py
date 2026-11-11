@@ -722,6 +722,24 @@ class Forge:
             and str(((pull.get("head") or {}).get("ref")) or "").startswith(prefix)
         ]
 
+    def pull_files(self, number: int) -> tuple[list[str], bool]:
+        """Every path a pull request changes, and whether the listing was complete.
+
+        ``GET /repos/{owner}/{repo}/pulls/{n}/files`` pages at most 100 entries and
+        lists at most 3000; a full last page past that limit is incomplete.
+        """
+
+        paths: list[str] = []
+        for page in range(1, 31):
+            rows = self.call(
+                "GET", self.repo_path(f"/pulls/{number}/files?per_page=100&page={page}")
+            )
+            rows = [row for row in rows or [] if isinstance(row, dict)]
+            paths += [str(row.get("filename")) for row in rows if row.get("filename")]
+            if len(rows) < 100:
+                return sorted(set(paths)), True
+        return sorted(set(paths)), False
+
     def revoke(self) -> None:
         if self.token is not None and self.token.reveal():
             self.http.request(
@@ -817,7 +835,7 @@ class ImageBuilder:
         source.mkdir(mode=0o700, exist_ok=True)
         extract_archive(archive, source)
         platform = self.platform()
-        tag = inputs.candidate[:12]
+        tag = pps.image_tag(inputs.candidate, inputs.run_id)
         pushed: list[Pushed] = []
         local_tags: list[str] = []
         self.ledger.record("images", "local_tags", local_tags)
@@ -854,6 +872,20 @@ class ImageBuilder:
         manifest_path = bundle / ".claude-plugin" / "plugin.json"
         manifest = json.loads(manifest_path.read_text())
         manifest_path.write_text(json.dumps(pps.private_bundle_manifest(manifest), indent=2) + "\n")
+        hooks_path = bundle / "hooks" / "hooks.json"
+        hooks_path.write_text(
+            json.dumps(pps.private_bundle_hooks(json.loads(hooks_path.read_text())), indent=2)
+            + "\n"
+        )
+        (bundle / "hooks" / pps.RESERVATION_GATE_FILE).write_text(pps.RESERVATION_GATE_PROGRAM)
+        # The layer repository must hold nothing before this run builds into it, so
+        # every tag found there later is this run's. It is recorded before the build.
+        repository = pps.layer_repository(inputs.registry, str(manifest.get("name") or ""))
+        if repository_local_tags(self.shell, repository) or repository_registry_tags(
+            inputs.registry_port, repository
+        ):
+            raise pps.Refusal("layer_repository_not_owned", repository)
+        self.ledger.record("images", "layer_repository", repository)
         layer = self.build_layer(bundle, platform, tag, pushed, local_tags)
         if layer.revision != inputs.candidate:
             layer_file = bundle / "runner.Dockerfile"
@@ -949,6 +981,39 @@ def registry_targets(
     return sorted(targets)
 
 
+def repository_local_tags(shell: Shell, repository: str) -> list[str]:
+    listed = shell.run(
+        ["docker", "image", "ls", "--format", "{{.Repository}}:{{.Tag}}", repository], timeout=60
+    )
+    return pps.docker_listed_tags(listed.stdout)
+
+
+def repository_registry_tags(port: int, repository: str) -> list[str]:
+    """``GET /v2/<name>/tags/list`` (Registry HTTP API v2) as full references; 404 is none."""
+
+    name = pps.split_image_ref(f"{repository}:probe")[0]
+    status, _headers, body = pps.loopback_get("127.0.0.1", port)(f"/v2/{name}/tags/list", {})
+    if status == 404:
+        return []
+    if status != 200:
+        raise StepFailed("registry tag list was not readable")
+    tags = json.loads(body).get("tags") or []
+    return [f"{repository}:{tag}" for tag in tags if isinstance(tag, str)]
+
+
+def owned_tags(ledger: pps.Ledger, port: int, shell: Shell | None) -> list[str]:
+    """Every tag this run built: recorded tags plus all of its owned layer repository."""
+
+    images = ledger.observations("images")
+    tags = [str(tag) for tag in images.get("local_tags") or []]
+    repository = images.get("layer_repository")
+    if isinstance(repository, str) and repository:
+        tags += repository_registry_tags(port, repository)
+        if shell is not None:
+            tags += repository_local_tags(shell, repository)
+    return sorted(set(tags))
+
+
 def remove_registry_images(port: int, pushed: Sequence[Pushed], tags: Sequence[str]) -> None:
     failures = 0
     for repository, digest in registry_targets(port, pushed, tags):
@@ -1016,14 +1081,12 @@ def cmd_images(args: argparse.Namespace, runtime: Runtime) -> int:
             lambda: remove_registry_images(
                 inputs.registry_port,
                 recorded_pushed(ledger),
-                ledger.observations("images").get("local_tags") or [],
+                owned_tags(ledger, inputs.registry_port, None),
             ),
         )
         finalizer.register(
             "remove-local-images",
-            lambda: remove_local_images(
-                shell, ledger.observations("images").get("local_tags") or []
-            ),
+            lambda: remove_local_images(shell, owned_tags(ledger, inputs.registry_port, shell)),
         )
         finalizer.run()
         raise
@@ -1034,7 +1097,9 @@ def cmd_images(args: argparse.Namespace, runtime: Runtime) -> int:
 
 def verify_images(inputs: Inputs, ledger: pps.Ledger) -> dict[str, pps.RegistryImage]:
     layer_ref = ledger.observations("images").get("layer_ref")
-    refs = pps.candidate_refs(inputs.candidate, layer_ref if isinstance(layer_ref, str) else None)
+    refs = pps.candidate_refs(
+        inputs.candidate, inputs.run_id, layer_ref if isinstance(layer_ref, str) else None
+    )
     get = pps.loopback_get("127.0.0.1", inputs.registry_port)
     return pps.verify_candidate_images(get, inputs.candidate, refs)
 
@@ -1345,6 +1410,10 @@ class LiveRun:
                     self.out.progress(f"phase {name}")
                     phase()
                     if name == self.stop_after:
+                        # The paid-start fence is exercised unpaid against the real
+                        # install, so a wrong selector or verb fails here, not live.
+                        self.fence_paid_starts()
+                        self.ledger.record("rehearsal", "fence_exercised", True)
                         break
                 code = pps.EXIT_PASS
             except pps.Refusal as refusal:
@@ -1556,10 +1625,17 @@ class LiveRun:
     def phase_images(self) -> None:
         self.finalizer.register(
             "remove-registry-images",
-            lambda: remove_registry_images(self.inputs.registry_port, self.pushed, self.local_tags),
+            lambda: remove_registry_images(
+                self.inputs.registry_port,
+                self.pushed,
+                owned_tags(self.ledger, self.inputs.registry_port, None),
+            ),
         )
         self.finalizer.register(
-            "remove-local-images", lambda: remove_local_images(self.shell, self.local_tags)
+            "remove-local-images",
+            lambda: remove_local_images(
+                self.shell, owned_tags(self.ledger, self.inputs.registry_port, self.shell)
+            ),
         )
         self.finalizer.register("remove-work-dir", self.remove_work_dir)
         images = self.ledger.observations("images")
@@ -2036,6 +2112,8 @@ class LiveRun:
         self.finalizer.register(
             "delete-grant-secret", lambda: self.delete_secret(self.grant_secret)
         )
+        # Runs before the grant Secret delete: no continuation may start during teardown.
+        self.finalizer.register("fence-paid-starts", self.fence_paid_starts)
         try:
             self.kube.create(
                 {
@@ -2071,6 +2149,7 @@ class LiveRun:
         self.attempts[number] = attempt
         if number == 1:
             self.ledger.begin_live(now=self.clock.now(), grant_expires_at=self.inputs.expires_at)
+            self.ledger.record("budget", "allowance_breach", [])
         attempt.reservations = self.ledger.reserve(
             pps.ATTEMPT_ROLES, attempt=number, now=self.clock.now()
         )
@@ -2108,8 +2187,69 @@ class LiveRun:
             self.observe_attempt(attempt)
         finally:
             self.settle(attempt)
-        if number == 2:
-            self.ledger.end_live(now=self.clock.now())
+
+    def fence_paid_starts(self) -> None:
+        """Make another paid start impossible: no worker, no grant, no runner pod.
+
+        The platform's CI repair (apps/api/src/curie_api/factory_ci.py) can queue a
+        continuation after publication; with no worker nothing consumes it, and a
+        runner without the grant Secret cannot start.
+        """
+
+        self.kube.ctl(
+            "scale", f"deployment/{self.inputs.fullname}-worker", "--replicas=0", timeout=120
+        )
+        self.kube.ctl(
+            "wait",
+            "--for=delete",
+            "pod",
+            "-l",
+            f"app.kubernetes.io/component=worker,app.kubernetes.io/instance={self.inputs.release}",
+            "--timeout=120s",
+            timeout=140,
+        )
+        self.delete_secret(self.grant_secret)
+        for attempt in self.attempts.values():
+            if attempt.pod and self.pod_uid_present(attempt.pod, attempt.pod_uid):
+                self.kube.ctl("delete", "pod", attempt.pod, "--wait=true", timeout=300)
+        runners = self.kube.json("get", "pods", "-l", POD_CLAIM_LABEL)
+        fenced = not [
+            item
+            for item in runners.get("items") or []
+            if (item.get("status") or {}).get("phase") in {"Pending", "Running"}
+        ]
+        self.ledger.record("budget", "paid_starts_fenced", fenced)
+        if not fenced:
+            raise StepFailed("a runner pod is still active after fencing")
+
+    def check_allowance(self, attempt: Attempt) -> None:
+        """Stop paid work once any running session reaches its reserved bound."""
+
+        if attempt.harvest is None:
+            return
+        breaches = pps.allowance_breaches(
+            attempt.reservations, self.attempt_facts(attempt), now=self.clock.now()
+        )
+        if breaches:
+            self.ledger.record("budget", "allowance_breach", sorted(set(breaches)))
+            self.fence_paid_starts()
+            raise StepFailed("a session reached its reserved allowance; paid work stopped")
+
+    def attempt_facts(self, attempt: Attempt) -> pps.TranscriptFacts | None:
+        harvest = attempt.harvest
+        if harvest is None:
+            return None
+        earlier = frozenset(
+            item
+            for other in self.attempts.values()
+            if other.number < attempt.number and other.facts is not None
+            for item in other.facts.message_ids()
+        )
+        return pps.parse_native_transcripts(
+            harvest.transcript_files(),
+            exclude_ids=earlier,
+            not_before=attempt.admitted_at - REPLAY_MARGIN_SECONDS,
+        )
 
     def set_platform_budget(self, output_tokens: int) -> None:
         self.curie.run("budget", self.agent, "--output-tokens", str(output_tokens))
@@ -2187,6 +2327,7 @@ class LiveRun:
         known_approvals = {item.approval_id for item in self.attempts.values() if item.approval_id}
 
         def parked() -> bool:
+            self.check_allowance(attempt)
             pending = self.pending_approvals()
             item = self.work_item()
             mine = [
@@ -2301,21 +2442,7 @@ class LiveRun:
         if not attempt.reservations:
             return
         complete = harvest is not None and attempt.eof.is_set() and harvest.complete
-        earlier = frozenset(
-            item
-            for other in self.attempts.values()
-            if other.number < attempt.number and other.facts is not None
-            for item in other.facts.message_ids()
-        )
-        facts = (
-            pps.parse_native_transcripts(
-                harvest.transcript_files(),
-                exclude_ids=earlier,
-                not_before=attempt.admitted_at - REPLAY_MARGIN_SECONDS,
-            )
-            if harvest
-            else None
-        )
+        facts = self.attempt_facts(attempt)
         attempt.facts = facts
         pps.settle_attempt(self.ledger, attempt.reservations, facts, complete=complete)
         if facts is None or harvest is None:
@@ -2523,6 +2650,8 @@ class LiveRun:
             published, until=self.clock.now() + PUBLICATION_WAIT_SECONDS, what="publication"
         )
         self.ledger.record("publication", "publication_status", publication.get("status"))
+        self.fence_paid_starts()
+        self.ledger.end_live(now=self.clock.now())
         forge = self.require_forge()
         number = publication.get("pr_number")
         pull = forge.call("GET", forge.repo_path(f"/pulls/{number}"))
@@ -2549,11 +2678,20 @@ class LiveRun:
             if status != 200 or not isinstance(body, dict):
                 raise StepFailed("published file could not be read")
             content = base64.b64decode(str(body.get("content") or ""))
+            self.scan.scan("forge", content)
             hashes[path] = hashlib.sha256(content).hexdigest()
             if self.nonce.encode() in content:
                 nonce_paths.append(path)
+        changed, listed_all = forge.pull_files(int(str(number)))
         self.ledger.record(
-            "pod-restart", "published_workspace", {"hashes": hashes, "nonce_paths": nonce_paths}
+            "pod-restart",
+            "published_workspace",
+            {
+                "hashes": hashes,
+                "nonce_paths": nonce_paths,
+                "changed_paths": changed,
+                "changed_paths_complete": listed_all,
+            },
         )
         checks: dict[str, Any] = {}
 
@@ -2668,7 +2806,8 @@ class LiveRun:
     def registry_absent(self) -> bool:
         get = pps.loopback_get("127.0.0.1", self.inputs.registry_port)
         references = [(item.repository, item.digest) for item in self.pushed]
-        references += [pps.split_image_ref(tag) for tag in self.local_tags]
+        owned = owned_tags(self.ledger, self.inputs.registry_port, None)
+        references += [pps.split_image_ref(tag) for tag in owned]
         for repository, reference in references:
             status, _headers, _body = get(
                 f"/v2/{repository}/manifests/{reference}", {"Accept": pps.MANIFEST_ACCEPT}
@@ -2678,7 +2817,7 @@ class LiveRun:
         return True
 
     def local_images_absent(self) -> bool:
-        for tag in self.local_tags:
+        for tag in owned_tags(self.ledger, self.inputs.registry_port, self.shell):
             if self.shell.run(["docker", "image", "ls", "-q", tag], timeout=60).stdout.strip():
                 return False
         return True

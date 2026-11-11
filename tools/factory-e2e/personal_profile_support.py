@@ -40,6 +40,9 @@ SESSION_TURNS = 32
 MAX_OUTPUT_TOKENS = 32768
 SESSION_OUTPUT_TOKENS = 8192
 SESSION_SECONDS = 300
+# Per response. The live watchdog stops paid work once a session reaches its
+# allowance; the response in flight at that moment is the bounded overshoot.
+RESPONSE_OUTPUT_TOKENS = 4096
 LIVE_SECONDS = 2400
 CLEANUP_SECONDS = 300
 PAID_RETRIES = 0
@@ -120,6 +123,7 @@ FIXES: dict[str, str] = {
     "live_unapproved": "pass --approve-live with the exact approved ceiling string",
     "candidate_invalid": "pass --candidate as a full 40 hex commit SHA",
     "candidate_image_mismatch": "run the images subcommand for this candidate, then retry",
+    "layer_repository_not_owned": "use a fresh registry; the runner layer repository holds tags",
     "candidate_mismatch": "judge the run with the candidate its ledger recorded",
     "registry_invalid": "pass --registry as a loopback HOST:PORT (127.0.0.1 or localhost)",
     "state_dir_unsafe": "--state-dir must be an existing directory you own, mode 0700",
@@ -253,6 +257,16 @@ class Scrubber:
     def found(self, data: bytes) -> bool:
         return bool(self._spans(data))
 
+    def longest(self) -> int:
+        """The longest byte form any held secret can take, live or fingerprinted."""
+
+        lengths = [0]
+        for secret in self._secrets:
+            live = secret.reveal().encode()
+            lengths.extend(len(variant) for variant in _variants(live) if live)
+            lengths.extend(fingerprint.length for fingerprint in secret.fingerprints)
+        return max(lengths)
+
     def scrub_bytes(self, data: bytes) -> bytes:
         spans = self._spans(data)
         if not spans:
@@ -288,6 +302,7 @@ class TokenScan:
     def __init__(self, scrubber: Scrubber, channels: Sequence[str] = ()) -> None:
         self.scrubber = scrubber
         self.channels: dict[str, ChannelScan] = {name: ChannelScan() for name in channels}
+        self._tails: dict[tuple[str, str], bytes] = {}
 
     def __repr__(self) -> str:
         return "<token scan>"
@@ -297,6 +312,22 @@ class TokenScan:
         entry.scanned_bytes += len(data)
         hit = self.scrubber.found(data)
         entry.token_bytes_found |= hit
+        return hit
+
+    def scan_stream(self, channel: str, key: str, data: bytes) -> bool:
+        """Scan one chunk of a reassembled stream, so a secret split across chunks is found.
+
+        The previous chunk's tail (one byte shorter than the longest held form)
+        is scanned again with this chunk; only new bytes are counted.
+        """
+
+        entry = self.channels.setdefault(channel, ChannelScan())
+        entry.scanned_bytes += len(data)
+        joined = self._tails.get((channel, key), b"") + data
+        hit = self.scrubber.found(joined)
+        entry.token_bytes_found |= hit
+        keep = max(0, self.scrubber.longest() - 1)
+        self._tails[(channel, key)] = joined[-keep:] if keep else b""
         return hit
 
     def as_json(self) -> dict[str, Any]:
@@ -666,10 +697,24 @@ def split_image_ref(ref: str) -> tuple[str, str]:
     return repository, reference
 
 
-def candidate_refs(candidate: str, layer_ref: str | None = None) -> dict[str, tuple[str, str]]:
+def image_tag(candidate: str, run_id: str) -> str:
+    """A tag owned by one run: the candidate prefix plus a digest of the run ID."""
+
+    return f"{candidate[:12]}-{hashlib.sha256(run_id.encode()).hexdigest()[:8]}"
+
+
+def layer_repository(registry: str, bundle_name: str) -> str:
+    """Where ``curie build --registry`` pushes a runner layer (cli/src/connector_build.rs)."""
+
+    return f"{registry.rstrip('/')}/{bundle_name}-runner"
+
+
+def candidate_refs(
+    candidate: str, run_id: str, layer_ref: str | None = None
+) -> dict[str, tuple[str, str]]:
     """The registry reference of every required image; the layer from the ledger if recorded."""
 
-    tag = candidate[:12]
+    tag = image_tag(candidate, run_id)
     refs = {name: (name, tag) for name in PLATFORM_IMAGES}
     refs[LAYER_IMAGE] = split_image_ref(layer_ref) if layer_ref else (LAYER_IMAGE, tag)
     return refs
@@ -1415,6 +1460,38 @@ def session_summary(session: SessionFacts) -> dict[str, Any]:
     }
 
 
+def allowance_breaches(
+    reservations: Sequence[Reservation], facts: TranscriptFacts | None, *, now: float
+) -> list[str]:
+    """Bounds an observed session has reached, matched to reservations like settlement. Pure.
+
+    The most recently active session is charged the time since its last record,
+    since it may still be running. A session beyond the reservations is a breach.
+    """
+
+    if facts is None:
+        return []
+    breaches: list[str] = []
+    pending = list(reservations)
+    latest = max((s.last for s in facts.sessions if s.last is not None), default=None)
+    for session in facts.sessions:
+        slot = next((item for item in pending if item.role == session.role), None)
+        if slot is None:
+            breaches.append(f"unreserved:{session.role}")
+            continue
+        pending.remove(slot)
+        elapsed = session.elapsed
+        if latest is not None and session.last == latest:
+            elapsed += max(0.0, now - latest)
+        if session.output_tokens >= slot.output_tokens:
+            breaches.append(f"output_tokens:{session.role}")
+        if session.assistant_turns >= slot.turns:
+            breaches.append(f"turns:{session.role}")
+        if elapsed >= slot.seconds:
+            breaches.append(f"seconds:{session.role}")
+    return breaches
+
+
 def settle_attempt(
     ledger: Ledger,
     reservations: Sequence[Reservation],
@@ -1430,7 +1507,14 @@ def settle_attempt(
     an observed session beyond the reservations is recorded as unreserved.
     """
 
-    if not complete or facts is None:
+    admitted_without_implementer = (
+        facts is not None
+        and any(item.role == IMPLEMENTER for item in reservations)
+        and not any(session.role == IMPLEMENTER for session in facts.sessions)
+    )
+    if not complete or facts is None or facts.malformed_lines or admitted_without_implementer:
+        # Admitted work always runs an implementer; no implementer record means
+        # the capture missed it, so nothing here may settle to zero.
         for reserved in reservations:
             ledger.settle(reserved.seq, None, source="unknown")
         return {"settled": 0, "unknown": len(reservations), "unreserved": 0}
@@ -1612,8 +1696,12 @@ def processes():
             continue
     return {"kind": "process", "count": len(found), "processes": found}
 deadline = time.monotonic() + float(cfg["max_seconds"])
+synced = None
 while True:
     scan_files()
+    if synced != offsets:
+        synced = dict(offsets)
+        emit({"kind": "sync", "sizes": synced})
     scan_reviews()
     record = workspace()
     if record != state["workspace"]:
@@ -1674,18 +1762,22 @@ class HarvestState:
         self.gaps = 0
         self.bad_lines = 0
         self.ended = False
+        self.synced: dict[str, int] | None = None
 
     def __repr__(self) -> str:
         return "<harvest state>"
 
-    def _decoded(self, value: Any) -> bytes | None:
+    def _decoded(self, value: Any, *, stream: str | None = None) -> bytes | None:
         if not isinstance(value, str):
             return None
         try:
             data = base64.b64decode(value, validate=True)
         except (ValueError, binascii.Error):
             return None
-        self.scan.scan(self.channel, data)
+        if stream is None:
+            self.scan.scan(self.channel, data)
+        else:
+            self.scan.scan_stream(self.channel, stream, data)
         return data
 
     def feed(self, line: bytes) -> None:
@@ -1702,8 +1794,8 @@ class HarvestState:
             return
         kind = record.get("kind")
         if kind == "file":
-            data = self._decoded(record.get("data"))
             path = record.get("path")
+            data = self._decoded(record.get("data"), stream=path if isinstance(path, str) else None)
             offset = record.get("offset")
             if data is None or not isinstance(path, str) or type(offset) is not int:
                 self.bad_lines += 1
@@ -1738,6 +1830,14 @@ class HarvestState:
                 self.process_max = max(self.process_max, count)
                 if processes:
                     self.processes = [item for item in processes if isinstance(item, dict)]
+        elif kind == "sync":
+            sizes = record.get("sizes")
+            if not isinstance(sizes, dict) or not all(
+                isinstance(k, str) and type(v) is int for k, v in sizes.items()
+            ):
+                self.bad_lines += 1
+                return
+            self.synced = dict(sizes)
         elif kind == "end":
             self.ended = True
         else:
@@ -1745,7 +1845,17 @@ class HarvestState:
 
     @property
     def complete(self) -> bool:
-        return self.gaps == 0 and self.bad_lines == 0
+        """Affirmative capture: the harvester's last size report matches every reassembled file.
+
+        A stream that never reported (a failed exec, an empty EOF) or that
+        delivered bytes after its last report is not complete.
+        """
+
+        if self.gaps or self.bad_lines or self.synced is None:
+            return False
+        held = {path: len(data) for path, data in self.files.items()}
+        reported = {path: size for path, size in self.synced.items() if size}
+        return held == reported
 
     def transcript_files(self) -> dict[str, bytes]:
         merged = {path: bytes(data) for path, data in self.files.items()}
@@ -1817,6 +1927,7 @@ def published_matches(
             "nonce_present": False,
             "deleted_absent": False,
             "head_recorded": False,
+            "paths_equal": False,
         }
     hashes = reviewed.get("hashes") or {}
     blobs = published.get("hashes") or {}
@@ -1830,6 +1941,11 @@ def published_matches(
         "deleted_absent": all(blobs.get(path) is None for path in deleted),
         "head_recorded": bool(re.fullmatch(r"[0-9a-f]{40}", str(reviewed.get("head") or "")))
         and isinstance(reviewed.get("status"), list),
+        # The pull request's complete file list, read independently of the
+        # reviewed record, names exactly the reviewed paths.
+        "paths_equal": published.get("changed_paths_complete") is True
+        and bool(hashes)
+        and sorted(published.get("changed_paths") or []) == sorted(hashes),
     }
 
 
@@ -2111,6 +2227,7 @@ def _judge_pod_restart(ledger: Ledger) -> tuple[dict[str, bool], dict[str, int]]
         "workspace_hashes_restored": match["hashes_equal"],
         "workspace_nonce_restored": match["nonce_present"],
         "workspace_deletions_restored": match["deleted_absent"],
+        "workspace_paths_equal": match["paths_equal"],
     }
     return checks, {
         "changed_paths": len((observed.get("reviewed_workspace") or {}).get("hashes") or {})
@@ -2137,7 +2254,8 @@ def _judge_publication(ledger: Ledger) -> tuple[dict[str, bool], dict[str, int]]
         "diff_review_approved": _true(observed, "diff_review_approved"),
         "published_tree_matches_reviewed": match["hashes_equal"]
         and match["nonce_present"]
-        and match["deleted_absent"],
+        and match["deleted_absent"]
+        and match["paths_equal"],
         "head_recorded": bool(
             re.fullmatch(r"[0-9a-f]{40}", str(observed.get("head_sha") or ""))
             and re.fullmatch(r"[0-9a-f]{40}", str(observed.get("tree_sha") or ""))
@@ -2184,6 +2302,10 @@ def _judge_budget(ledger: Ledger) -> tuple[dict[str, bool], dict[str, int]]:
         and sum(int(item["output_tokens"]) for item in sessions) <= MAX_OUTPUT_TOKENS,
         "budget_not_exceeded": run["budget_state"] == "ok",
         "no_paid_retry": run["live_starts"] == 1 and "paid_retry" not in observed,
+        # Starts were fenced (worker stopped, grant removed, no runner pod) before
+        # the live window closed, so no continuation could spend unreserved.
+        "paid_starts_fenced": _true(observed, "paid_starts_fenced"),
+        "no_allowance_breach": observed.get("allowance_breach") == [],
         "live_elapsed_within": live_start is not None
         and live_end is not None
         and 0 <= float(live_end) - float(live_start) <= LIVE_SECONDS,
@@ -2470,7 +2592,7 @@ def install_values(
                         },
                     },
                     {"name": "CURIE_MAX_TURNS", "value": str(SESSION_TURNS)},
-                    {"name": "CLAUDE_CODE_MAX_OUTPUT_TOKENS", "value": str(SESSION_OUTPUT_TOKENS)},
+                    {"name": "CLAUDE_CODE_MAX_OUTPUT_TOKENS", "value": str(RESPONSE_OUTPUT_TOKENS)},
                 ],
             },
         },
@@ -2501,6 +2623,70 @@ def install_values(
             },
         },
     }
+
+
+RESERVATION_GATE_FILE = "reservation_gate.py"
+RESERVATION_LIMITS = {
+    "plan": ATTEMPT_ROLES.count(PLAN_REVIEWER),
+    "diff": ATTEMPT_ROLES.count(DIFF_REVIEWER),
+}
+
+# A PreToolUse hook added to the private bundle copy. It counts reviewer starts
+# at invocation, before any model call, and refuses a start past this attempt's
+# reservations or of any other subagent type. Exit 2 blocks the call; every
+# unexpected state also exits 2. One attempt is one pod, so /tmp is per attempt.
+RESERVATION_GATE_PROGRAM = r"""
+import json, os, sys
+LIMITS = json.loads(sys.argv[1])
+TYPES = {"dark-factory:plan-reviewer": "plan", "plan-reviewer": "plan",
+         "dark-factory:diff-reviewer": "diff", "diff-reviewer": "diff"}
+def refuse(reason):
+    print("reservation gate: " + reason, file=sys.stderr)
+    sys.exit(2)
+try:
+    event = json.load(sys.stdin)
+    if not isinstance(event, dict):
+        refuse("unreadable hook input")
+    if event.get("tool_name") not in ("Agent", "Task"):
+        sys.exit(0)
+    kind = TYPES.get(str((event.get("tool_input") or {}).get("subagent_type") or ""))
+    if kind is None:
+        refuse("only the reserved plan and diff reviewers may start in this run")
+    folder = os.environ.get("PPA_RESERVATION_DIR") or "/tmp/ppa-reservations"
+    os.makedirs(folder, mode=0o700, exist_ok=True)
+    path = os.path.join(folder, "starts.json")
+    counts = {}
+    if os.path.lexists(path):
+        with open(path) as handle:
+            counts = json.load(handle)
+        if not isinstance(counts, dict):
+            refuse("unreadable reservation state")
+    if int(counts.get(kind, 0)) >= int(LIMITS[kind]):
+        refuse("the reserved " + kind + " review allowance is spent; no further " + kind
+               + " reviewer may start")
+    counts[kind] = int(counts.get(kind, 0)) + 1
+    with open(path + ".tmp", "w") as handle:
+        json.dump(counts, handle)
+    os.replace(path + ".tmp", path)
+except SystemExit:
+    raise
+except Exception:
+    refuse("reservation state could not be updated")
+"""
+
+
+def private_bundle_hooks(hooks: Mapping[str, Any]) -> dict[str, Any]:
+    """The private copy's hooks.json with the reservation gate added for Agent and Task."""
+
+    patched: dict[str, Any] = json.loads(json.dumps(hooks))
+    limits = json.dumps(RESERVATION_LIMITS, sort_keys=True, separators=(",", ":"))
+    command = f"python3 ${{CLAUDE_PLUGIN_ROOT}}/hooks/{RESERVATION_GATE_FILE} '{limits}'"
+    entry = {
+        "matcher": "Agent|Task",
+        "hooks": [{"type": "command", "command": command, "timeout": 10}],
+    }
+    patched.setdefault("hooks", {}).setdefault("PreToolUse", []).append(entry)
+    return patched
 
 
 def private_bundle_manifest(manifest: Mapping[str, Any]) -> dict[str, Any]:

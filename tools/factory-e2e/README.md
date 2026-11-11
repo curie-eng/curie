@@ -70,10 +70,14 @@ $P judge --criterion all --candidate $SHA --state-dir $STATE_DIR --run-id acme-r
 1. `images` is unpaid. It builds `curie-api`, `curie-worker` and
    `curie-runner` with the label
    `org.opencontainers.image.revision=<candidate>`, pushes them as
-   `<name>:<candidate12>`, then runs `curie build` on a private copy of
-   `examples/dark-factory` whose manifest routes `mcp__curie__publish_changes`
-   to the `publication` approval route. The layer inherits the revision label
-   from the runner it is built on.
+   `<name>:<candidate12>-<run digest>` so each tag belongs to one run ID, then
+   runs `curie build` on a private copy of `examples/dark-factory` whose
+   manifest routes `mcp__curie__publish_changes` to the `publication` approval
+   route and whose hooks add the reservation gate. The layer inherits the
+   revision label from the runner it is built on. The layer repository
+   (`<bundle>-runner`) must hold no local or registry tag before the build,
+   which refuses with `layer_repository_not_owned`; it is recorded first, and
+   teardown removes every tag found in it.
 2. `preflight` is unpaid. It refuses before any model session and before any
    cluster mutation.
 3. `forge-probe` mints an installation token limited to contents, pull
@@ -181,6 +185,27 @@ model.
    transcript record. The implementer's elapsed time excludes the wall
    intervals covered by its reviewer subagent sessions, which count as the
    reviewers' own seconds.
+6. Reviewer starts are limited before any model call. The private bundle copy
+   adds a `PreToolUse` hook (`reservation_gate.py`) that counts `Agent` and
+   `Task` starts and refuses a second plan review, a third diff review, or any
+   other subagent type. It counts at invocation, so a review that returns no
+   verdict still uses its reservation.
+7. A watchdog stops paid work while it runs. Every poll during an attempt
+   parses the harvested transcripts and compares each session with its
+   reservation. When a session reaches its output tokens, turns or seconds,
+   the run fences paid starts and fails. Transcripts are written per completed
+   response, so the overshoot is at most the response in flight, which
+   `CLAUDE_CODE_MAX_OUTPUT_TOKENS` caps at 4096.
+8. The fence stops the worker, deletes the grant Secret and confirms no runner
+   pod is pending or running. It runs once the approved publication succeeds
+   and before the live window closes, because the platform's CI repair can
+   queue a continuation for a failing pull request. It also runs early in
+   teardown on every failure path.
+9. Harvest capture is affirmative. The in-pod harvester reports every
+   transcript's size after each pass, and an attempt settles only when the last
+   report matches every reassembled file. A failed exec, an empty stream,
+   bytes after the last report, a malformed transcript line, or an attempt
+   with no implementer session leave the attempt's usage unknown.
 
 ## What each criterion observes
 
