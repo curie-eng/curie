@@ -102,6 +102,8 @@ def test_failed_comment_leads_with_a_plain_sentence_not_the_cause_code() -> None
         "execution_deadline",
         "capacity_wait_expired",
         "owner_lost",
+        "enrollment_fenced",
+        "authentication_required",
         "issue_cancelled",
         "publication_denied",
         "publication_expired",
@@ -330,6 +332,7 @@ def _observe_termination(client: Any, request_id: uuid.UUID) -> None:
         headers=headers,
         json={
             "runtime_epoch": claimed.json()["runtime_epoch"],
+            "expected_request_version": claimed.json()["request_version"],
             "observation": "runtime stopped",
         },
     )
@@ -1113,6 +1116,7 @@ def test_a_running_cancellation_comments_only_after_the_runtime_is_observed(
         headers=headers,
         json={
             "runtime_epoch": claimed.json()["runtime_epoch"],
+            "expected_request_version": claimed.json()["request_version"],
             "observation": "runtime stopped after the issue was unlabelled",
         },
     )

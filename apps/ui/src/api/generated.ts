@@ -10991,7 +10991,7 @@ export interface components {
             /** Lease Held To Deadline */
             lease_held_to_deadline: boolean;
             /** Refusal */
-            refusal: ("not_found" | "identity_mismatch" | "active_request" | "work_item_cancelled" | "not_dispatchable" | "not_published" | "duplicate" | "stale_owner" | "not_running" | "waiting_deadline_elapsed" | "binding_missing" | "repository_not_allowed" | "publication_pending" | "factory_wake_mismatch" | "factory_agent_missing" | "factory_agent_mismatch" | "factory_tenant_mismatch" | "factory_binding_missing" | "factory_binding_ambiguous" | "factory_binding_changed" | "factory_surface_mismatch" | "factory_start_failed" | "personal_owner_required" | "owner_context_unexpected" | "owner_tenant_mismatch" | "owner_tenant_inactive" | "owner_principal_missing" | "owner_principal_inactive" | "enrollment_inactive" | "enrollment_generation_mismatch" | "owner_mismatch") | null;
+            refusal: ("not_found" | "identity_mismatch" | "active_request" | "work_item_cancelled" | "not_dispatchable" | "not_published" | "duplicate" | "stale_owner" | "not_running" | "waiting_deadline_elapsed" | "binding_missing" | "repository_not_allowed" | "publication_pending" | "factory_wake_mismatch" | "factory_agent_missing" | "factory_agent_mismatch" | "factory_tenant_mismatch" | "factory_binding_missing" | "factory_binding_ambiguous" | "factory_binding_changed" | "factory_surface_mismatch" | "factory_start_failed" | "stale_version" | "termination_observation_required" | "personal_owner_required" | "owner_context_unexpected" | "owner_tenant_mismatch" | "owner_tenant_inactive" | "owner_principal_missing" | "owner_principal_inactive" | "enrollment_inactive" | "enrollment_generation_mismatch" | "owner_mismatch") | null;
             /** Repository Path */
             repository_path: string;
             /**
@@ -11382,6 +11382,8 @@ export interface components {
         };
         /** TerminationBody */
         TerminationBody: {
+            /** Expected Request Version */
+            expected_request_version: number;
             /** Observation */
             observation: string;
             /** Runtime Epoch */
@@ -11391,6 +11393,16 @@ export interface components {
         TerminationClaimBody: {
             /** Owner */
             owner: string;
+        };
+        /**
+         * TerminationClaimOut
+         * @description What the claimant's termination record presents back (#5377).
+         */
+        TerminationClaimOut: {
+            /** Request Version */
+            request_version: number;
+            /** Runtime Epoch */
+            runtime_epoch: number;
         };
         /** ThreadAttachmentAppend */
         ThreadAttachmentAppend: {
@@ -21049,9 +21061,7 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": {
-                        [key: string]: unknown;
-                    };
+                    "application/json": components["schemas"]["TerminationClaimOut"];
                 };
             };
             /** @description Validation Error */

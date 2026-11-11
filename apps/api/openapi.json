@@ -14852,6 +14852,8 @@
                   "factory_binding_changed",
                   "factory_surface_mismatch",
                   "factory_start_failed",
+                  "stale_version",
+                  "termination_observation_required",
                   "personal_owner_required",
                   "owner_context_unexpected",
                   "owner_tenant_mismatch",
@@ -15828,6 +15830,11 @@
       },
       "TerminationBody": {
         "properties": {
+          "expected_request_version": {
+            "minimum": 1.0,
+            "title": "Expected Request Version",
+            "type": "integer"
+          },
           "observation": {
             "minLength": 1,
             "title": "Observation",
@@ -15841,6 +15848,7 @@
         },
         "required": [
           "runtime_epoch",
+          "expected_request_version",
           "observation"
         ],
         "title": "TerminationBody",
@@ -15858,6 +15866,25 @@
           "owner"
         ],
         "title": "TerminationClaimBody",
+        "type": "object"
+      },
+      "TerminationClaimOut": {
+        "description": "What the claimant's termination record presents back (#5377).",
+        "properties": {
+          "request_version": {
+            "title": "Request Version",
+            "type": "integer"
+          },
+          "runtime_epoch": {
+            "title": "Runtime Epoch",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "runtime_epoch",
+          "request_version"
+        ],
+        "title": "TerminationClaimOut",
         "type": "object"
       },
       "ThreadAttachmentAppend": {
@@ -35006,9 +35033,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "additionalProperties": true,
-                  "title": "Response Claim Work Item Termination V1 Internal Work Items Requests  Request Id  Termination Claim Post",
-                  "type": "object"
+                  "$ref": "#/components/schemas/TerminationClaimOut"
                 }
               }
             },

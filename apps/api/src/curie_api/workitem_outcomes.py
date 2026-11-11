@@ -121,6 +121,9 @@ def _cause(
                 f"the {_deadline_seconds(req)} s execution deadline elapsed"
             ),
             "owner_lost": "the runtime owner stopped heartbeating",
+            "enrollment_fenced": (
+                "the owner replaced or disconnected the personal Claude enrollment"
+            ),
         }
         return (
             f"cancellation requested: {cause} ({reasons.get(cause or '', 'unknown')}); "
@@ -179,7 +182,17 @@ def _cause(
                 + _previous_start_failure(req)
             )
         text = f"failed: {cause}"
-        if cause == "deadline_halted":
+        if cause == "enrollment_fenced":
+            text += (
+                "; the owner replaced or disconnected the personal Claude enrollment, "
+                "so the run was stopped; revalidate the enrollment to resume"
+            )
+        elif cause == "authentication_required":
+            text += (
+                "; the personal Claude grant was missing or refused, reconnect or "
+                "replace the enrollment, then revalidate to resume"
+            )
+        elif cause == "deadline_halted":
             text += (
                 "; the run hit the delivery budget, raise "
                 "worker.deliveryBudgetSeconds if the work needs longer"

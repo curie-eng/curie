@@ -1187,16 +1187,24 @@ class ExecutionRequest(Base):
             f"interval '{MAX_EXECUTION_DEADLINE_SECONDS} seconds')",
             name="execution_requests_deadline_ck",
         ),
+        # Frozen with migration 0160 (#5377): an enrollment fence stops a
+        # running request (``enrollment_fenced``, which like ``owner_lost``
+        # ends failed with an observation), and a started completed or failed
+        # request may carry a confirmed teardown observation.
         CheckConstraint(
-            "((status = 'failed' AND started_at IS NULL "
-            "AND execution_deadline IS NULL AND terminal_at IS NOT NULL "
-            "AND terminal_cause = 'start_failed' AND termination_observation IS NULL) "
+            "((status = 'failed' AND started_at IS NULL AND execution_deadline IS NULL "
+            "AND terminal_at IS NOT NULL AND terminal_cause = 'start_failed' "
+            "AND termination_observation IS NULL) "
             "OR (status = 'queued' AND wait_deadline IS NULL AND started_at IS NULL "
             "AND execution_deadline IS NULL AND terminal_at IS NULL "
             "AND terminal_cause IS NULL AND termination_observation IS NULL) "
-            "OR (status = 'waiting' AND wait_deadline IS NOT NULL AND started_at IS NULL "
-            "AND execution_deadline IS NULL AND terminal_at IS NULL "
-            "AND terminal_cause IS NULL AND termination_observation IS NULL) "
+            "OR (status = 'cancelled' AND wait_deadline IS NULL AND started_at IS NULL "
+            "AND execution_deadline IS NULL AND terminal_at IS NOT NULL "
+            "AND terminal_cause IN ('issue_cancelled', 'issue_deleted', 'lineage_closed') "
+            "AND termination_observation IS NULL) "
+            "OR (status = 'waiting' AND started_at IS NULL AND execution_deadline IS NULL "
+            "AND terminal_at IS NULL AND terminal_cause IS NULL "
+            "AND termination_observation IS NULL) "
             "OR (status = 'running' AND started_at IS NOT NULL "
             "AND execution_deadline IS NOT NULL AND terminal_at IS NULL "
             "AND terminal_cause IS NULL AND termination_observation IS NULL) "
@@ -1204,29 +1212,26 @@ class ExecutionRequest(Base):
             "AND execution_deadline IS NOT NULL AND terminal_at IS NULL "
             "AND terminal_cause IS NOT NULL "
             "AND terminal_cause IN ('issue_cancelled', 'issue_deleted', "
-            "'execution_deadline', 'owner_lost') "
+            "'execution_deadline', 'owner_lost', 'enrollment_fenced') "
             "AND termination_observation IS NULL) "
             "OR (status = 'completed' AND started_at IS NOT NULL "
             "AND execution_deadline IS NOT NULL AND terminal_at IS NOT NULL "
-            "AND terminal_cause IS NOT NULL AND terminal_cause = 'completed' "
-            "AND termination_observation IS NULL) "
+            "AND terminal_cause IS NOT NULL AND terminal_cause = 'completed') "
             "OR (status = 'failed' AND started_at IS NOT NULL "
             "AND execution_deadline IS NOT NULL AND terminal_at IS NOT NULL "
-            "AND terminal_cause IS NOT NULL AND "
-            "((terminal_cause = 'owner_lost' AND termination_observation IS NOT NULL) "
-            "OR (terminal_cause <> 'owner_lost' AND termination_observation IS NULL))) "
+            "AND terminal_cause IS NOT NULL "
+            "AND (terminal_cause NOT IN ('owner_lost', 'enrollment_fenced') "
+            "OR termination_observation IS NOT NULL)) "
             "OR (status = 'expired' AND terminal_at IS NOT NULL AND "
             "((started_at IS NULL AND execution_deadline IS NULL "
-            "AND terminal_cause IS NOT NULL "
-            "AND terminal_cause = 'capacity_wait_expired' "
+            "AND terminal_cause IS NOT NULL AND terminal_cause = 'capacity_wait_expired' "
             "AND termination_observation IS NULL) OR "
             "(started_at IS NOT NULL AND execution_deadline IS NOT NULL "
-            "AND terminal_cause IS NOT NULL "
-            "AND terminal_cause = 'execution_deadline' "
+            "AND terminal_cause IS NOT NULL AND terminal_cause = 'execution_deadline' "
             "AND termination_observation IS NOT NULL))) "
             "OR (status = 'cancelled' AND terminal_at IS NOT NULL "
             "AND terminal_cause IS NOT NULL "
-            "AND terminal_cause IN ('issue_cancelled', 'issue_deleted', 'lineage_closed') AND "
+            "AND terminal_cause IN ('issue_cancelled', 'issue_deleted') AND "
             "((started_at IS NULL AND execution_deadline IS NULL "
             "AND termination_observation IS NULL) OR "
             "(started_at IS NOT NULL AND execution_deadline IS NOT NULL "
@@ -1234,7 +1239,8 @@ class ExecutionRequest(Base):
             name="execution_requests_state_shape_ck",
         ),
         CheckConstraint(
-            "teardown_unconfirmed_at IS NULL OR status = 'cancelled'",
+            "teardown_unconfirmed_at IS NULL OR status = 'cancelled' "
+            "OR (status IN ('completed', 'failed', 'expired') AND started_at IS NOT NULL)",
             name="execution_requests_teardown_unconfirmed_ck",
         ),
         CheckConstraint(
@@ -1420,8 +1426,10 @@ class ExecutionRequest(Base):
     cancellation_requested_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), default=None
     )
-    # A forced settle with no worker teardown receipt. Terminate wakes keep
-    # going out until a worker records the teardown and clears this.
+    # A runtime teardown no worker has confirmed: a forced settle with no
+    # receipt, or a started terminal request an enrollment fence (#5377)
+    # marked. Terminate wakes keep going out until a worker records the
+    # teardown and clears this.
     teardown_unconfirmed_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), default=None
     )
@@ -3526,6 +3534,107 @@ class PersonalClaudeEnrollment(Base):
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
     )
+
+
+class PersonalClaudeCustody(Base):
+    """A token-free reference to one enrollment generation's grant Secret (#5377).
+
+    ADR 0268 section 4. The row names the immutable Kubernetes Secret holding
+    the grant: its namespace, its computed name, its sole key and the UID
+    Kubernetes assigned. It never holds token bytes, and owner responses never
+    show it. ``staged`` rows exist before their Secret; ``published`` is the
+    generation the enrollment header names; ``retiring`` owes a Secret delete;
+    ``retired`` and a verified ``abandoned`` row record ``secret_absent_at``.
+    Migration 0160 freezes the CHECKs and partial indexes copied here.
+    """
+
+    __tablename__ = "personal_claude_custody"
+    __table_args__ = (
+        CheckConstraint("generation >= 1", name="personal_claude_custody_generation_ck"),
+        CheckConstraint("version >= 1", name="personal_claude_custody_version_ck"),
+        CheckConstraint(
+            "secret_namespace ~ '^[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?$'",
+            name="personal_claude_custody_namespace_ck",
+        ),
+        CheckConstraint(
+            "secret_name = 'curie-pe-' || replace(enrollment_id::text, '-', '') "
+            "|| '-g' || generation::text",
+            name="personal_claude_custody_name_ck",
+        ),
+        CheckConstraint(
+            "secret_key = 'CLAUDE_CODE_OAUTH_TOKEN'", name="personal_claude_custody_key_ck"
+        ),
+        CheckConstraint(
+            "state IN ('staged', 'published', 'retiring', 'retired', 'abandoned')",
+            name="personal_claude_custody_state_ck",
+        ),
+        CheckConstraint(
+            "(((state IN ('staged', 'abandoned') AND published_at IS NULL) "
+            "OR (state IN ('published', 'retiring', 'retired') "
+            "AND published_at IS NOT NULL AND secret_uid IS NOT NULL)) "
+            "AND (state = 'retired') = (retired_at IS NOT NULL) "
+            "AND (secret_uid IS NULL OR length(btrim(secret_uid)) > 0)) IS TRUE",
+            name="personal_claude_custody_shape_ck",
+        ),
+        CheckConstraint(
+            "((secret_absent_at IS NULL OR state IN ('abandoned', 'retired')) "
+            "AND (state <> 'retired' OR secret_absent_at IS NOT NULL)) IS TRUE",
+            name="personal_claude_custody_absence_ck",
+        ),
+        ForeignKeyConstraint(
+            ["tenant_id", "principal_id"],
+            [f"{SCHEMA}.principals.tenant_id", f"{SCHEMA}.principals.id"],
+            name="personal_claude_custody_principal_fkey",
+        ),
+        Index(
+            "uq_personal_claude_custody_generation",
+            "enrollment_id",
+            "generation",
+            unique=True,
+            postgresql_where=text("state <> 'abandoned'"),
+        ),
+        Index(
+            "uq_personal_claude_custody_published",
+            "enrollment_id",
+            unique=True,
+            postgresql_where=text("state = 'published'"),
+        ),
+        Index(
+            "uq_personal_claude_custody_staging",
+            "tenant_id",
+            "principal_id",
+            unique=True,
+            postgresql_where=text("state = 'staged'"),
+        ),
+        Index(
+            "ix_personal_claude_custody_pending",
+            "state",
+            "lease_expires_at",
+            postgresql_where=text(
+                "state IN ('staged', 'retiring', 'abandoned') AND secret_absent_at IS NULL"
+            ),
+        ),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    tenant_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True))
+    principal_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True))
+    # The header's id; no foreign key, since a first enrollment stages first.
+    enrollment_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True))
+    generation: Mapped[int] = mapped_column(BigInteger)
+    secret_namespace: Mapped[str] = mapped_column(Text)
+    secret_name: Mapped[str] = mapped_column(Text)
+    secret_key: Mapped[str] = mapped_column(Text)
+    secret_uid: Mapped[str | None] = mapped_column(Text, default=None)
+    state: Mapped[str] = mapped_column(Text)
+    staged_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    lease_expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    published_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), default=None)
+    retired_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), default=None)
+    secret_absent_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), default=None
+    )
+    version: Mapped[int] = mapped_column(BigInteger, default=1, server_default="1")
 
 
 class Team(Base):
