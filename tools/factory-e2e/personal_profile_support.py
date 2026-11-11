@@ -518,6 +518,20 @@ def load_grant(path: Path | None) -> HeldSecret:
     return HeldSecret(_open_grant(path).decode("ascii"))
 
 
+def iso_epoch(value: Any) -> float:
+    """An API timestamp (ISO 8601, UTC when no offset) as epoch seconds; 0.0 when unreadable."""
+
+    if not isinstance(value, str) or not value:
+        return 0.0
+    try:
+        parsed = dt.datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return 0.0
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=dt.UTC)
+    return parsed.timestamp()
+
+
 def parse_expiry(text: str | None) -> float:
     """``--grant-expires-at``: ISO 8601 with an explicit offset, or integer epoch seconds."""
 
@@ -1306,7 +1320,8 @@ def _session_facts(
         last=last,
         elapsed=(last - first) if first is not None and last is not None else 0.0,
         aci_tool_calls=aci,
-        usage_known=all(value is not None for value in by_id.values()),
+        # A session with no assistant usage at all (only user records) is not known.
+        usage_known=bool(by_id) and all(value is not None for value in by_id.values()),
         message_ids=frozenset(key for key in by_id if not key.startswith("<no id")),
     )
 
@@ -1696,12 +1711,9 @@ def processes():
             continue
     return {"kind": "process", "count": len(found), "processes": found}
 deadline = time.monotonic() + float(cfg["max_seconds"])
-synced = None
 while True:
     scan_files()
-    if synced != offsets:
-        synced = dict(offsets)
-        emit({"kind": "sync", "sizes": synced})
+    emit({"kind": "sync", "sizes": dict(offsets), "at": round(time.time(), 3)})
     scan_reviews()
     record = workspace()
     if record != state["workspace"]:
@@ -1763,6 +1775,7 @@ class HarvestState:
         self.bad_lines = 0
         self.ended = False
         self.synced: dict[str, int] | None = None
+        self.synced_at: float | None = None
 
     def __repr__(self) -> str:
         return "<harvest state>"
@@ -1832,12 +1845,17 @@ class HarvestState:
                     self.processes = [item for item in processes if isinstance(item, dict)]
         elif kind == "sync":
             sizes = record.get("sizes")
-            if not isinstance(sizes, dict) or not all(
-                isinstance(k, str) and type(v) is int for k, v in sizes.items()
+            at = record.get("at")
+            if (
+                not isinstance(sizes, dict)
+                or not all(isinstance(k, str) and type(v) is int for k, v in sizes.items())
+                or not isinstance(at, (int, float))
+                or isinstance(at, bool)
             ):
                 self.bad_lines += 1
                 return
             self.synced = dict(sizes)
+            self.synced_at = float(at)
         elif kind == "end":
             self.ended = True
         else:
@@ -1856,6 +1874,16 @@ class HarvestState:
         held = {path: len(data) for path, data in self.files.items()}
         reported = {path: size for path, size in self.synced.items() if size}
         return held == reported
+
+    def terminal_after(self, moment: float) -> bool:
+        """Complete, and the matching size report was taken at or after ``moment``.
+
+        ``moment`` is when native execution had ended (the approval's creation,
+        which follows the turn). Every transcript byte is written before it, so
+        a matching report taken later proves nothing was missed.
+        """
+
+        return self.complete and self.synced_at is not None and self.synced_at >= moment
 
     def transcript_files(self) -> dict[str, bytes]:
         merged = {path: bytes(data) for path, data in self.files.items()}
@@ -2638,8 +2666,6 @@ RESERVATION_LIMITS = {
 RESERVATION_GATE_PROGRAM = r"""
 import json, os, sys
 LIMITS = json.loads(sys.argv[1])
-TYPES = {"dark-factory:plan-reviewer": "plan", "plan-reviewer": "plan",
-         "dark-factory:diff-reviewer": "diff", "diff-reviewer": "diff"}
 def refuse(reason):
     print("reservation gate: " + reason, file=sys.stderr)
     sys.exit(2)
@@ -2649,7 +2675,12 @@ try:
         refuse("unreadable hook input")
     if event.get("tool_name") not in ("Agent", "Task"):
         sys.exit(0)
-    kind = TYPES.get(str((event.get("tool_input") or {}).get("subagent_type") or ""))
+    # The bundle's own reviewer resolution, including a type inferred from the
+    # description, so this gate admits exactly what review_gate.py routes.
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    import review_gate
+    resolved = review_gate.reviewer_kind(dict(event.get("tool_input") or {}))
+    kind = {review_gate.PLAN: "plan", review_gate.DIFF: "diff"}.get(resolved)
     if kind is None:
         refuse("only the reserved plan and diff reviewers may start in this run")
     folder = os.environ.get("PPA_RESERVATION_DIR") or "/tmp/ppa-reservations"

@@ -1305,6 +1305,7 @@ class Attempt:
     eof: threading.Event = dataclasses.field(default_factory=threading.Event)
     approval_id: str = ""
     publication_id: str = ""
+    parked_at: float = 0.0
     gone_at: float = 0.0
     facts: pps.TranscriptFacts | None = None
 
@@ -1358,6 +1359,7 @@ class LiveRun:
         self.issue_number: int | None = None
         self.owner: dict[str, Any] = {}
         self.grant_identity: tuple[str, str] | None = None
+        self.final_grant_identity: tuple[str, str] | None = None
         self.policy_set = False
         self.digests: dict[str, str] = {}
         self.chart = Path()
@@ -1457,6 +1459,9 @@ class LiveRun:
         started = self.clock.monotonic()
         run = self.ledger.run_row()
         if run["live_started_at"] is not None:
+            # Paid execution stops before the live window is closed.
+            if self.grant_identity is not None:
+                self.safe(self.fence_paid_starts, None)
             self.ledger.end_live(now=self.clock.now())
         steps = self.finalizer.run()
         inventory = self.query_inventory()
@@ -2189,38 +2194,48 @@ class LiveRun:
             self.settle(attempt)
 
     def fence_paid_starts(self) -> None:
-        """Make another paid start impossible: no worker, no grant, no runner pod.
+        """Make another paid start impossible: no grant, no running runner, no worker.
 
         The platform's CI repair (apps/api/src/curie_api/factory_ci.py) can queue a
-        continuation after publication; with no worker nothing consumes it, and a
-        runner without the grant Secret cannot start.
+        continuation after publication. Every protective delete is issued before
+        any wait, because a stopping worker drains its active handlers first.
         """
 
+        if self.grant_identity is not None and self.final_grant_identity is None:
+            self.final_grant_identity = self.safe(
+                lambda: self.secret_identity(self.grant_secret), None
+            )
         self.kube.ctl(
             "scale", f"deployment/{self.inputs.fullname}-worker", "--replicas=0", timeout=120
         )
-        self.kube.ctl(
-            "wait",
-            "--for=delete",
-            "pod",
-            "-l",
-            f"app.kubernetes.io/component=worker,app.kubernetes.io/instance={self.inputs.release}",
-            "--timeout=120s",
-            timeout=140,
-        )
         self.delete_secret(self.grant_secret)
-        for attempt in self.attempts.values():
-            if attempt.pod and self.pod_uid_present(attempt.pod, attempt.pod_uid):
-                self.kube.ctl("delete", "pod", attempt.pod, "--wait=true", timeout=300)
+        self.kube.ctl("delete", "pod", "-l", POD_CLAIM_LABEL, "--wait=false", timeout=120)
+        for selector in (
+            POD_CLAIM_LABEL,
+            f"app.kubernetes.io/component=worker,app.kubernetes.io/instance={self.inputs.release}",
+        ):
+            self.kube.ctl(
+                "wait",
+                "--for=delete",
+                "pod",
+                "-l",
+                selector,
+                "--timeout=120s",
+                timeout=140,
+                check=False,
+            )
         runners = self.kube.json("get", "pods", "-l", POD_CLAIM_LABEL)
         fenced = not [
-            item
-            for item in runners.get("items") or []
-            if (item.get("status") or {}).get("phase") in {"Pending", "Running"}
+            pod
+            for pod in runners.get("items") or []
+            if any(
+                (status.get("state") or {}).get("running")
+                for status in (pod.get("status") or {}).get("containerStatuses") or []
+            )
         ]
         self.ledger.record("budget", "paid_starts_fenced", fenced)
         if not fenced:
-            raise StepFailed("a runner pod is still active after fencing")
+            raise StepFailed("a runner container is still running after fencing")
 
     def check_allowance(self, attempt: Attempt) -> None:
         """Stop paid work once any running session reaches its reserved bound."""
@@ -2352,6 +2367,7 @@ class LiveRun:
             return False
 
         self.wait_until(parked, until=until, what="publication approval park")
+        attempt.parked_at = pps.iso_epoch(self.approval(attempt.approval_id).get("created_at"))
         publications = self.require_api().get("/publications?limit=200")
         attempt.publication_id = next(
             (
@@ -2441,7 +2457,12 @@ class LiveRun:
         harvest = attempt.harvest
         if not attempt.reservations:
             return
-        complete = harvest is not None and attempt.eof.is_set() and harvest.complete
+        complete = (
+            harvest is not None
+            and attempt.eof.is_set()
+            and attempt.parked_at > 0
+            and harvest.terminal_after(attempt.parked_at)
+        )
         facts = self.attempt_facts(attempt)
         attempt.facts = facts
         pps.settle_attempt(self.ledger, attempt.reservations, facts, complete=complete)
@@ -2738,9 +2759,9 @@ class LiveRun:
         self.ledger.record("publication", "owner_unchanged", unchanged)
         self.ledger.record("pod-restart", "owner_generation_unchanged", unchanged)
         first, second = self.attempts[1], self.attempts[2]
+        # Read by the fence just before it deleted the Secret.
         same_secret = (
-            self.grant_identity is not None
-            and self.secret_identity(self.grant_secret) == self.grant_identity
+            self.grant_identity is not None and self.final_grant_identity == self.grant_identity
         )
         same_ref = first.grant_ref == second.grant_ref == (self.grant_secret, "token")
         clean = all(

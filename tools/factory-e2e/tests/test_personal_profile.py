@@ -22,6 +22,7 @@ import http.server
 import json
 import os
 import re
+import shutil
 import signal
 import sqlite3
 import subprocess
@@ -1270,8 +1271,8 @@ def _file_record(path: str, offset: int, data: bytes) -> bytes:
     ).encode()
 
 
-def _sync_record(sizes: Mapping[str, int]) -> bytes:
-    return json.dumps({"kind": "sync", "sizes": dict(sizes)}).encode()
+def _sync_record(sizes: Mapping[str, int], at: float = T0) -> bytes:
+    return json.dumps({"kind": "sync", "sizes": dict(sizes), "at": at}).encode()
 
 
 def test_a_secret_split_across_harvest_chunks_is_found() -> None:
@@ -1300,8 +1301,24 @@ def test_harvest_is_complete_only_after_a_matching_size_report(tmp_path: Path) -
     assert harvest.complete
     harvest.feed(_file_record(path, 3, b"{}\n"))  # bytes after the last report
     assert not harvest.complete
-    harvest.feed(_sync_record({path: 6}))
+    harvest.feed(_sync_record({path: 6}, at=T0 + 5))
     assert harvest.complete
+    # Terminal only when the matching report was taken after native execution ended
+    # (the approval's creation): a synchronized prefix taken earlier proves nothing.
+    assert harvest.terminal_after(T0 + 5) and not harvest.terminal_after(T0 + 6)
+    assert pps.iso_epoch("2026-11-11T04:00:00.250000+00:00") == pytest.approx(
+        dt.datetime(2026, 11, 11, 4, 0, 0, 250000, tzinfo=dt.UTC).timestamp()
+    )
+    assert pps.iso_epoch("2026-11-11T04:00:00") == pps.iso_epoch("2026-11-11T04:00:00Z")
+    assert pps.iso_epoch(None) == pps.iso_epoch("not a time") == 0.0
+    user_only = {
+        "c/projects/p/s.jsonl": json.dumps(
+            {"type": "user", "timestamp": "2026-11-11T04:00:00Z", "message": {"role": "user"}}
+        ).encode()
+        + b"\n"
+    }
+    sessions = pps.parse_native_transcripts(user_only).sessions
+    assert all(not session.usage_known for session in sessions)
 
     ledger = _live_ledger(tmp_path)
     reservations = ledger.reserve(pps.ATTEMPT_ROLES, attempt=1, now=T0 + 10)
@@ -1325,6 +1342,8 @@ def test_harvest_is_complete_only_after_a_matching_size_report(tmp_path: Path) -
 def _gate(tmp_path: Path, event: Mapping[str, Any]) -> subprocess.CompletedProcess[str]:
     script = tmp_path / pps.RESERVATION_GATE_FILE
     script.write_text(pps.RESERVATION_GATE_PROGRAM)
+    # The gate resolves reviewers with the bundle's own review_gate.py beside it.
+    shutil.copy(REPO_ROOT / "examples/dark-factory/hooks/review_gate.py", tmp_path)
     limits = json.dumps(pps.RESERVATION_LIMITS)
     return subprocess.run(
         [sys.executable, "-I", str(script), limits],
@@ -1353,7 +1372,18 @@ def test_reservation_gate_refuses_reviewer_starts_past_the_reservation(tmp_path:
     )
     assert refused.returncode == 2 and "allowance is spent" in refused.stderr
     assert start("general-purpose") == 2
-    assert start("") == 2
+    assert start("") == 2  # no type and no reviewer description
+
+    inferred = tmp_path / "inferred"
+    inferred.mkdir()
+
+    def described(text: str) -> int:
+        event = {"tool_name": "Agent", "tool_input": {"description": text, "prompt": "review"}}
+        return _gate(inferred, event).returncode
+
+    assert described("Plan review round 1") == 0  # the bundle infers the plan reviewer
+    assert described("Plan review round 2") == 2
+    assert described("Diff review round 1") == 0
     assert _gate(tmp_path, {"tool_name": "Bash", "tool_input": {"command": "ls"}}).returncode == 0
     (tmp_path / "r" / "starts.json").write_text("[]")
     assert start("dark-factory:plan-reviewer") == 2  # unreadable state refuses
@@ -2133,6 +2163,61 @@ class _Rehearsal(_ScriptedRun):
 
 class _WrongRoute(_Rehearsal):
     route_users = ["U0ACMEOTHER"]
+
+
+class _FenceKube:
+    """Records kubectl verbs; answers secret identity and runner pod listings."""
+
+    def __init__(self, *, running: bool, secret: bool = True) -> None:
+        self.calls: list[tuple[str, ...]] = []
+        self.running = running
+        self.secret = secret
+
+    def ctl(self, *args: str, **kwargs: Any) -> pp.Completed:
+        self.calls.append(args)
+        if args[:2] == ("get", "secret"):
+            out = b"uid-grant 7" if self.secret else b""
+            return pp.Completed(0, out, b"")
+        if args[0] == "delete" and args[1] == "secret":
+            self.secret = False
+        # A worker that drains past the wait timeout answers nonzero; it must not stop the fence.
+        return pp.Completed(1 if args[0] == "wait" else 0, b"", b"")
+
+    def json(self, *args: str, **kwargs: Any) -> Any:
+        self.calls.append(args)
+        state = (
+            {"running": {"startedAt": "2026-11-11T04:00:00Z"}}
+            if self.running
+            else {"waiting": {"reason": "CreateContainerConfigError"}}
+        )
+        return {
+            "items": [{"status": {"phase": "Pending", "containerStatuses": [{"state": state}]}}]
+        }
+
+
+def test_fence_deletes_before_waiting_and_keeps_the_grant_identity(
+    tmp_path: Path,
+) -> None:
+    run = _scripted(tmp_path, _ScriptedRun, [])
+    run.grant_identity = ("uid-grant", "7")
+    kube = _FenceKube(running=False)
+    run.kube = kube  # type: ignore[assignment]
+    pp.LiveRun.fence_paid_starts(run)
+    verbs = [call[0] for call in kube.calls]
+    assert verbs.index("scale") < verbs.index("wait")
+    deletes = [i for i, call in enumerate(kube.calls) if call[0] == "delete"]
+    assert [kube.calls[i][1] for i in deletes] == ["secret", "pod"]
+    assert max(deletes) < verbs.index("wait")
+    assert verbs.index("get") < deletes[0]  # identity read before the Secret is deleted
+    assert run.final_grant_identity == ("uid-grant", "7")
+    assert run.ledger.observations("budget")["paid_starts_fenced"] is True
+
+    stuck = _scripted(_private(tmp_path / "stuck"), _ScriptedRun, [])
+    stuck.grant_identity = ("uid-grant", "7")
+    stuck.kube = _FenceKube(running=True)  # type: ignore[assignment]
+    with pytest.raises(pp.StepFailed):
+        pp.LiveRun.fence_paid_starts(stuck)
+    assert stuck.ledger.observations("budget")["paid_starts_fenced"] is False
 
 
 def test_rehearse_phase_cut_stops_after_forge_and_finalizes(

@@ -188,7 +188,9 @@ model.
 6. Reviewer starts are limited before any model call. The private bundle copy
    adds a `PreToolUse` hook (`reservation_gate.py`) that counts `Agent` and
    `Task` starts and refuses a second plan review, a third diff review, or any
-   other subagent type. It counts at invocation, so a review that returns no
+   other subagent type. It classifies a start with the bundle's own
+   `review_gate.reviewer_kind`, so a reviewer inferred from its description
+   counts the same way. It counts at invocation, so a review that returns no
    verdict still uses its reservation.
 7. A watchdog stops paid work while it runs. Every poll during an attempt
    parses the harvested transcripts and compares each session with its
@@ -196,16 +198,21 @@ model.
    the run fences paid starts and fails. Transcripts are written per completed
    response, so the overshoot is at most the response in flight, which
    `CLAUDE_CODE_MAX_OUTPUT_TOKENS` caps at 4096.
-8. The fence stops the worker, deletes the grant Secret and confirms no runner
-   pod is pending or running. It runs once the approved publication succeeds
+8. The fence reads the grant Secret's identity for the same-grant check, then
+   stops the worker, deletes the grant Secret and deletes every runner pod
+   before it waits for anything, and confirms no runner container is running. It runs once the approved publication succeeds
    and before the live window closes, because the platform's CI repair can
-   queue a continuation for a failing pull request. It also runs early in
-   teardown on every failure path.
+   queue a continuation for a failing pull request. On every failure path it
+   runs before the live window is closed and again early in teardown.
 9. Harvest capture is affirmative. The in-pod harvester reports every
-   transcript's size after each pass, and an attempt settles only when the last
-   report matches every reassembled file. A failed exec, an empty stream,
-   bytes after the last report, a malformed transcript line, or an attempt
-   with no implementer session leave the attempt's usage unknown.
+   transcript's size and the pod time after each pass. An attempt settles only
+   when the last report matches every reassembled file and was taken at or
+   after the publication approval's creation, which follows the end of the
+   native turn. A failed exec, an empty stream, a stream that ended before
+   that moment, bytes after the last report, a malformed transcript line, a
+   session with no assistant usage, or an attempt with no implementer session
+   leave the attempt's usage unknown. The comparison assumes the API and the
+   runner share a node clock, as on a single-node throwaway cluster.
 
 ## What each criterion observes
 
