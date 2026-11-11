@@ -65,12 +65,13 @@ CEILING="sessions=8,turns=96,session-turns=32,output-tokens=32768,session-output
 $P images $COMMON
 $P preflight $COMMON --approve-live "$CEILING"
 $P forge-probe $COMMON
-$P run $COMMON --approve-live "$CEILING"
+$P run $COMMON --approve-live "$CEILING" \
+  --slack-bot-token-file $SLACK_BOT_TOKEN_FILE --resolution-channel $RESOLUTION_CHANNEL
 $P judge --criterion all --candidate $SHA --state-dir $STATE_DIR --run-id acme-run-1
 ```
 
-1. `images` is unpaid. It builds `curie-api`, `curie-worker` and
-   `curie-runner` with the label
+1. `images` is unpaid. It builds `curie-api`, `curie-worker`, `curie-runner`
+   and `curie-dispatcher` (the channel gateway's image) with the label
    `org.opencontainers.image.revision=<candidate>`, pushes them as
    `<name>:<candidate12>-<run digest>` so each tag belongs to one run ID, then
    runs `curie build` on a private copy of `examples/dark-factory` whose
@@ -86,7 +87,14 @@ $P judge --criterion all --candidate $SHA --state-dir $STATE_DIR --run-id acme-r
    requests and issues (write) and checks and statuses (read), creates a
    run-owned branch with an empty commit, opens and closes a pull request,
    deletes the branch, and proves both are gone. It touches no other ref.
-4. `run` performs exactly one live attempt. A second `run` with the same run
+4. `run` performs exactly one live attempt. A factory publication's card goes
+   to the `publication` route's fixed Slack channel (ADR 0177), and the outbox
+   fails the publication after five failed deliveries. The install therefore
+   deploys the channel gateway, with the bot token from
+   `--slack-bot-token-file` in a run-owned Secret, and binds the route's
+   resolution to `--resolution-channel`. The dispatcher stays off; approvals
+   are resolved from the CLI. Each answer waits for its card to be delivered.
+   `run` A second `run` with the same run
    ID refuses with `paid_retry_refused`; there is no retry flag.
 5. `judge --criterion {roles,approval,pod-restart,publication,budget,cleanup,all}`
    reads the ledger only and prints
@@ -99,9 +107,15 @@ values.
 
 ## Rehearsing the unpaid phases
 
-`rehearse` runs the same `run` phases up to and including `forge`
-(refusals, namespace, images, install, setup and forge) against the real
-cluster, then the normal finalizer and inventory. It never loads a grant,
+`rehearse` runs the same `run` phases up to and including `drill`
+(refusals, namespace, images, install, setup, forge and drill) against the
+real cluster, then the normal finalizer and inventory. The drill creates two
+publications shaped like a factory one (reply kind `github`, the
+`publication` route and its card channel) through the internal API, waits for
+both cards, and requires the unlisted operator to be refused by the explicit
+list, the allowed operator to reject the first and approve the second. The
+drill's base commit does not exist, so the approved one pushes nothing. A
+`run` skips the drill. It never loads a grant,
 writes a live start or reserves a session, so the single paid `run` is not
 the first execution of the install, setup, forge and cleanup machinery.
 
@@ -109,6 +123,7 @@ the first execution of the install, setup, forge and cleanup machinery.
 $P rehearse --candidate $SHA --context "$KUBE_CONTEXT" --namespace ppa-acme-rehearsal \
   --release ppa-acme-r --registry 127.0.0.1:5999 --docker-context acme-builder \
   --kubeconfig $KUBECONFIG_FILE --app-dir $APP_DIR --state-dir $STATE_DIR \
+  --slack-bot-token-file $SLACK_BOT_TOKEN_FILE --resolution-channel $RESOLUTION_CHANNEL \
   --run-id acme-rehearsal-1
 $P judge --criterion cleanup --candidate $SHA --state-dir $STATE_DIR --run-id acme-rehearsal-1
 ```

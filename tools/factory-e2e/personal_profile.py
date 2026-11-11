@@ -51,6 +51,8 @@ from collections.abc import Callable, Iterator, Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
+import channel_protocol
+
 HERE = Path(__file__).resolve().parent
 if str(HERE) not in sys.path:
     sys.path.insert(0, str(HERE))
@@ -64,6 +66,7 @@ DOCKERFILES = {
     "curie-api": "apps/api/Dockerfile",
     "curie-worker": "apps/worker/Dockerfile",
     "curie-runner": "runner/Dockerfile",
+    "curie-dispatcher": "apps/dispatcher/Dockerfile",
 }
 BUNDLE_SOURCE = "examples/dark-factory"
 CLAIM_RESOURCE = "sandboxclaims.extensions.agents.x-k8s.io"
@@ -75,7 +78,11 @@ EXECUTION_DEADLINE = 1800
 POLL_SECONDS = 5.0
 REJECTION_SETTLE_SECONDS = 30.0
 # The last phase a rehearsal runs: everything unpaid, nothing from the grant on.
-REHEARSAL_CUT = "forge"
+REHEARSAL_CUT = "drill"
+# A delivered card is reported within a few outbox passes (2 s apart).
+CARD_WAIT_SECONDS = 120
+# apps/worker publication_store.PostgresPublicationStore result_max_attempts.
+CARD_MAX_ATTEMPTS = 5
 # Node and driver clocks may differ slightly; replayed history is minutes older.
 REPLAY_MARGIN_SECONDS = 30.0
 CI_WAIT_SECONDS = 1200.0
@@ -443,6 +450,9 @@ def build_parser() -> argparse.ArgumentParser:
         sub.add_argument("--grant-expires-at", default=grant_default)
         if name in {"preflight", "run", "rehearse"}:
             sub.add_argument("--approve-live", default=None)
+        if name in {"run", "rehearse"}:
+            sub.add_argument("--slack-bot-token-file", default="")
+            sub.add_argument("--resolution-channel", default="")
         if name == "judge":
             sub.add_argument("--criterion", required=True, choices=[*pps.CRITERIA, "all"])
     return parser
@@ -464,6 +474,8 @@ class Inputs:
     app: Mapping[str, Any] = dataclasses.field(default_factory=dict)
     grant_file: Path | None = None
     expires_at: float = 0.0
+    slack_bot_token_file: Path | None = None
+    resolution_channel: str = ""
 
     @property
     def work_dir(self) -> Path:
@@ -515,6 +527,11 @@ def with_app(inputs: Inputs, args: argparse.Namespace) -> Inputs:
         raise pps.Refusal("app_kit_invalid", "--app-dir")
     app_dir = Path(args.app_dir)
     return dataclasses.replace(inputs, app_dir=app_dir, app=pps.require_app_kit(app_dir))
+
+
+def with_slack(inputs: Inputs, args: argparse.Namespace) -> Inputs:
+    path, channel = pps.require_slack_kit(args.slack_bot_token_file, args.resolution_channel)
+    return dataclasses.replace(inputs, slack_bot_token_file=path, resolution_channel=channel)
 
 
 def with_grant(inputs: Inputs, args: argparse.Namespace, now: float) -> Inputs:
@@ -1297,7 +1314,7 @@ def cmd_run(args: argparse.Namespace, runtime: Runtime) -> int:
     inputs = base_inputs(args)
     pps.require_live_approval(args.approve_live)
     inputs = with_grant(inputs, args, runtime.clock.now())
-    inputs = with_app(with_cluster(inputs, args), args)
+    inputs = with_slack(with_app(with_cluster(inputs, args), args), args)
     ledger = pps.Ledger.open(inputs.state_dir, inputs.run_id, scrubber=runtime.scrubber)
     try:
         if ledger.is_rehearsal():
@@ -1325,7 +1342,7 @@ def cmd_rehearse(args: argparse.Namespace, runtime: Runtime) -> int:
     ]
     if supplied:
         raise pps.Refusal("arguments_invalid", "rehearse takes no " + ", ".join(supplied))
-    inputs = with_app(with_cluster(base_inputs(args), args), args)
+    inputs = with_slack(with_app(with_cluster(base_inputs(args), args), args), args)
     ledger = pps.Ledger.open(inputs.state_dir, inputs.run_id, scrubber=runtime.scrubber)
     try:
         ledger.ensure_run(inputs.candidate, phase="rehearse")
@@ -1399,6 +1416,7 @@ class LiveRun:
         self.unlisted_subject = pps.slack_shaped_subject(secrets.token_bytes(8))
         self.app_secret = f"{inputs.release}-github-app"
         self.grant_secret = f"{inputs.release}-personal-grant"
+        self.slack_secret = f"{inputs.release}-slack-bot"
         self.processes: list[subprocess.Popen[bytes]] = []
         self.pushed: list[Pushed] = []
         self.local_tags: list[str] = []
@@ -1444,6 +1462,7 @@ class LiveRun:
             ("install", self.phase_install),
             ("setup", self.phase_setup),
             ("forge", self.phase_forge),
+            ("drill", self.phase_drill),
             ("grant", self.phase_grant),
             ("attempt-1", lambda: self.phase_attempt(1)),
             ("old-pod-gone", self.phase_old_pod_gone),
@@ -1767,6 +1786,7 @@ class LiveRun:
             secret=True,
         )
         key.clear()
+        self.create_slack_secret()
         controller = self.kube.ctl(
             "get",
             "deployment",
@@ -1790,6 +1810,7 @@ class LiveRun:
             priority_classes=self.reused_priority_classes(),
             controller_deploy=not controller,
             model_addresses=self.resolver("api.anthropic.com"),
+            slack_bot_secret=self.slack_secret,
         )
         values_file = work / "values.json"
         self.finalizer.register("delete-values-file", lambda: values_file.unlink(missing_ok=True))
@@ -1813,8 +1834,8 @@ class LiveRun:
             timeout=960,
         )
         try:
-            # No Slack identity is configured, so the chart renders no dispatcher.
-            for workload in ("api", "worker"):
+            # The dispatcher stays off; the gateway posts routed publication cards.
+            for workload in ("api", "worker", "channel-gateway"):
                 self.kube.ctl(
                     "rollout",
                     "status",
@@ -1835,9 +1856,12 @@ class LiveRun:
         pods = self.kube.json("get", "pods")
         failures = pps.running_image_failures(
             pods,
-            {name: self.digests[name] for name in ("curie-api", "curie-worker")},
+            {
+                name: self.digests[name]
+                for name in ("curie-api", "curie-worker", "curie-dispatcher")
+            },
             registry=inputs.registry,
-            required=("curie-api", "curie-worker"),
+            required=("curie-api", "curie-worker", "curie-dispatcher"),
         )
         self.ledger.record("roles", "candidate_images_running", not failures)
         if failures:
@@ -1909,6 +1933,29 @@ class LiveRun:
                 ],
                 timeout=320,
             )
+
+    def create_slack_secret(self) -> None:
+        """The gateway's bot token, created through stdin and deleted by the finalizer."""
+
+        token = self.scrubber.hold(pps.load_slack_bot_token(self.inputs.slack_bot_token_file))
+        self.finalizer.register(
+            "delete-slack-secret", lambda: self.delete_secret(self.slack_secret)
+        )
+        try:
+            self.kube.create(
+                {
+                    "apiVersion": "v1",
+                    "kind": "Secret",
+                    "metadata": {"name": self.slack_secret},
+                    "type": "Opaque",
+                    "data": {
+                        pps.SLACK_BOT_SECRET_KEY: base64.b64encode(token.reveal().encode()).decode()
+                    },
+                },
+                secret=True,
+            )
+        finally:
+            token.clear()
 
     def delete_secret(self, name: str) -> None:
         self.kube.ctl("delete", "secret", name, "--ignore-not-found", "--wait=true")
@@ -1996,7 +2043,7 @@ class LiveRun:
             "approvals",
             self.agent,
             "--route-resolution",
-            f"{pps.PUBLICATION_ROUTE}={pps.RESOLUTION_CHANNEL}",
+            f"{pps.PUBLICATION_ROUTE}={self.inputs.resolution_channel}",
             "--route-approvers",
             f"{pps.PUBLICATION_ROUTE}=users:{self.allowed_subject}",
         )
@@ -2163,6 +2210,186 @@ class LiveRun:
             if not ref.startswith(f"refs/heads/{self.prefix}"):
                 continue
             forge.call("DELETE", forge.repo_path(f"/git/{ref}"), ok=(204,))
+
+    # -- phase 6b: the unpaid publication drill (rehearse only) ------------------
+
+    def phase_drill(self) -> None:
+        """Unpaid: routed tracker publications are carded on Slack and answered by the list.
+
+        Two publications on the run's own agent take a factory publication's shape:
+        reply kind ``github``, the publication route and its fixed card channel.
+        Each card must be delivered before anyone answers. The unlisted operator
+        must be refused by the explicit list; the allowed operator rejects the
+        first and approves the second. The base commit does not exist, so the
+        approved one fails in its job and pushes nothing. A paid run skips this.
+        """
+
+        if not self.rehearsal:
+            return
+        assert self.allowed_token is not None and self.unlisted_token is not None
+        first = self.drill_publication("reject")
+        second = self.drill_publication("approve")
+
+        def resolve(approval_id: str, token: pps.HeldSecret, *extra: str) -> Completed:
+            return self.curie.run(
+                "approvals",
+                self.agent,
+                "--resolve",
+                approval_id,
+                *extra,
+                check=False,
+                extra_env={"CURIE_APPROVAL_PRINCIPAL_TOKEN": token.reveal()},
+                secret_env=("CURIE_APPROVAL_PRINCIPAL_TOKEN",),
+            )
+
+        refused = resolve(first, self.unlisted_token)
+        unlisted = self.record_resolution(
+            "drill_unlisted", refused, self.audit(first), self.unlisted_subject
+        )
+        pending = self.approval(first).get("status") == "pending"
+        rejected = resolve(first, self.allowed_token, "--reject", "--note", "drill rejection")
+        audit = self.audit(first)
+        self.record_resolution("drill_reject", rejected, audit, self.allowed_subject)
+        reject_ok = (
+            rejected.returncode == 0
+            and self.approval(first).get("status") == "rejected"
+            and pps.audit_row(
+                audit,
+                action="resolved",
+                subject=self.allowed_subject,
+                authorized=True,
+                decision="rejected",
+            )
+        )
+        approved = resolve(second, self.allowed_token)
+        audit = self.audit(second)
+        self.record_resolution("drill_approve", approved, audit, self.allowed_subject)
+        approve_ok = (
+            approved.returncode == 0
+            and self.approval(second).get("status") == "approved"
+            and pps.audit_row(
+                audit,
+                action="resolved",
+                subject=self.allowed_subject,
+                authorized=True,
+                decision="approved",
+            )
+        )
+        checks = {
+            "drill_unlisted_refused_by_list": unlisted["http_status"] == 403
+            and unlisted["audit_authorizer"] == pps.EXPLICIT_USERS_AUTHORIZER
+            and pending,
+            "drill_reject_resolved": reject_ok,
+            "drill_approve_resolved": approve_ok,
+        }
+        for key, value in checks.items():
+            self.ledger.record("rehearsal", key, value)
+        failed = sorted(key for key, value in checks.items() if not value)
+        if failed:
+            raise StepFailed("publication drill failed: " + ", ".join(failed))
+
+    def drill_publication(self, label: str) -> str:
+        """Create one tracker-shaped routed publication and wait for its card."""
+
+        api = self.require_api()
+        repo = str(self.inputs.app["repo"])
+        deployments = api.get(f"/deployments?agent_id={self.agent_id}")
+        deployment = next(
+            (
+                str(row["id"])
+                for row in deployments or []
+                if isinstance(row, dict) and row.get("environment") == "prod" and row.get("id")
+            ),
+            "",
+        )
+        if not deployment:
+            raise StepFailed("drill found no prod deployment")
+        reply = f"drill-{self.nonce}-{label}"
+        conversation = channel_protocol.scoped_conversation_id("github", repo, reply)
+        author = f"drill:{self.allowed_subject}"
+        status, _ = api.post(
+            f"/v1/internal/workspaces/{deployment}/selection",
+            {"conversation_id": conversation, "author": author, "repo_full_name": repo},
+            internal=True,
+        )
+        if status != 200:
+            raise StepFailed(f"drill workspace selection returned {status}")
+        name = f".curie-drill-{self.nonce}"
+        status, body = api.post(
+            "/v1/internal/publications",
+            {
+                "deployment_id": deployment,
+                "conversation_id": conversation,
+                "reply_conversation_id": reply,
+                "repo_full_name": repo,
+                "author": author,
+                "summary": "Personal profile publication drill",
+                "reply_kind": "github",
+                "reply_channel": repo,
+                "reply_placeholder": None,
+                "dedupe_key": f"drill-{self.nonce}-{label}",
+                "base_sha": "0" * 40,
+                "patch_b64": base64.b64encode(pps.drill_patch(self.nonce)).decode(),
+                "changed_paths": [name],
+                "expires_in_seconds": 900,
+                "route": pps.PUBLICATION_ROUTE,
+                "card_channel": self.inputs.resolution_channel,
+            },
+            internal=True,
+        )
+        if status not in (200, 201) or not isinstance(body, dict) or not body.get("approval_id"):
+            raise StepFailed(f"drill publication create returned {status}")
+        stored = self.approval(str(body["approval_id"]))
+        self.ledger.record(
+            "rehearsal",
+            f"drill_{label}_card_on_route_channel",
+            stored.get("card_channel") == self.inputs.resolution_channel,
+        )
+        self.await_card(str(body["id"]), f"drill_{label}")
+        return str(body["approval_id"])
+
+    def card_state(self, publication_id: str) -> dict[str, Any]:
+        """The worker's card outbox state for one publication, read from Postgres."""
+
+        ident = str(uuid.UUID(publication_id))
+        row = self.kube.ctl(
+            "exec",
+            f"{self.inputs.fullname}-postgres-0",
+            "--",
+            "psql",
+            "-U",
+            "postgres",
+            "-d",
+            "postgres",
+            "-At",
+            "-c",
+            "SELECT approval_card_reported_at IS NOT NULL, approval_card_delivery_attempts, "
+            "approval_card_delivery_error IS NOT NULL FROM curie.publications "
+            f"WHERE id = '{ident}'",
+        ).stdout.decode(errors="replace")
+        return pps.card_delivery(row)
+
+    def await_card(self, publication_id: str, key: str) -> None:
+        """Wait for the card to reach the route's channel; a failed card fails the step.
+
+        The outbox fails the publication and expires its approval after five
+        failed deliveries, so nothing may be resolved before the card lands.
+        """
+
+        state: dict[str, Any] = {}
+
+        def delivered() -> bool:
+            nonlocal state
+            state = self.card_state(publication_id)
+            # Retries clear the error on success; only the fifth failure is final.
+            return bool(state["delivered"]) or (state["attempts"] or 0) >= CARD_MAX_ATTEMPTS
+
+        try:
+            self.wait_until(delivered, until=self.clock.now() + CARD_WAIT_SECONDS, what=key)
+        finally:
+            self.ledger.record("approval", f"{key}_card", state)
+        if not state.get("delivered"):
+            raise StepFailed(f"{key} card was not delivered")
 
     # -- phase 7: grant -------------------------------------------------------
 
@@ -2594,6 +2821,7 @@ class LiveRun:
     def phase_unlisted_control(self) -> None:
         first = self.attempts[1]
         assert self.unlisted_token is not None
+        self.await_card(first.publication_id, "attempt_1")
         before = self.work_item()
         result = self.curie.run(
             "approvals",
@@ -2695,6 +2923,7 @@ class LiveRun:
     def phase_approve(self) -> None:
         first, second = self.attempts[1], self.attempts[2]
         assert self.allowed_token is not None
+        self.await_card(second.publication_id, "attempt_2")
         self.ledger.record(
             "approval",
             "approval_digests",

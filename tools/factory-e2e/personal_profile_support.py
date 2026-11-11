@@ -82,7 +82,8 @@ DEFAULT_TENANT = "00000000-0000-0000-0000-000000000001"
 PERSONAL_MODE = "personal"
 OWNER_GENERATION = 1
 REVISION_LABEL = "org.opencontainers.image.revision"
-PLATFORM_IMAGES = ("curie-api", "curie-worker", "curie-runner")
+# curie-dispatcher is the channel gateway's image; the dispatcher itself stays off.
+PLATFORM_IMAGES = ("curie-api", "curie-worker", "curie-runner", "curie-dispatcher")
 LAYER_IMAGE = "curie-factory-runner"
 REQUIRED_IMAGES = (*PLATFORM_IMAGES, LAYER_IMAGE)
 IMAGE_MANIFEST_TYPES = (
@@ -134,6 +135,8 @@ FIXES: dict[str, str] = {
     "budget_exceeded": "an approved bound was exceeded; no further start is allowed",
     "allowance_exhausted": "the remaining approved allowance cannot cover another start",
     "arguments_invalid": "fix the named argument",
+    "slack_kit_invalid": "pass --slack-bot-token-file naming a private file holding one Slack "
+    "bot token (xoxb-), and --resolution-channel as a Slack channel id",
     "namespace_exists": "choose a namespace that does not exist; the driver deletes it on exit",
     "release_reserved": "choose a release name other than curie",
     "deployed_service_credential": "the deployed settings carry a service credential or "
@@ -512,6 +515,37 @@ def _open_grant(path: Path | None) -> bytes:
     if not _GRANT_LINE.fullmatch(line):
         raise Refusal("grant_unsafe", "--grant-file")
     return line
+
+
+_SLACK_CHANNEL = re.compile(r"C[A-Z0-9]{8,20}")
+
+
+def require_slack_kit(token_file: str, channel: str) -> tuple[Path, str]:
+    """The channel gateway's bot token file and the route's fixed card channel.
+
+    A routed publication card is delivered to the route's fixed Slack channel
+    (ADR 0177), so the install needs a gateway that can post there. The token
+    is checked here and read again only inside the install.
+    """
+
+    if not _SLACK_CHANNEL.fullmatch(channel or ""):
+        raise Refusal("slack_kit_invalid", "--resolution-channel")
+    path = Path(token_file) if token_file else None
+    load_slack_bot_token(path).clear()
+    assert path is not None
+    return path, channel
+
+
+def load_slack_bot_token(path: Path | None) -> HeldSecret:
+    """The gateway's bot token as a held secret, from a private one-line file."""
+
+    try:
+        line = _open_grant(path)
+    except Refusal:
+        raise Refusal("slack_kit_invalid", "--slack-bot-token-file") from None
+    if not line.startswith(b"xoxb-"):
+        raise Refusal("slack_kit_invalid", "--slack-bot-token-file")
+    return HeldSecret(line.decode("ascii"))
 
 
 def check_grant_file(path: Path | None) -> None:
@@ -2437,7 +2471,7 @@ FORGE_PERMISSIONS = {
 }
 PUBLICATION_ROUTE = "publication"
 PUBLICATION_GATE = "mcp__curie__publish_changes"
-RESOLUTION_CHANNEL = "C0EXAMPLE1"
+SLACK_BOT_SECRET_KEY = "slackBotToken"
 _BASE32 = "ABCDEFGHIJKLMNOPQRSTUVWXYZ234567"
 
 
@@ -2594,6 +2628,25 @@ def cli_outcome(returncode: int, stdout: bytes, stderr: bytes) -> dict[str, Any]
     }
 
 
+def drill_patch(nonce: str) -> bytes:
+    """A one-file patch for the unpaid publication drill. The drill never pushes it."""
+
+    name = f".curie-drill-{nonce}"
+    return (
+        f"diff --git a/{name} b/{name}\nnew file mode 100644\n--- /dev/null\n"
+        f"+++ b/{name}\n@@ -0,0 +1 @@\n+drill\n"
+    ).encode()
+
+
+def card_delivery(row: str) -> dict[str, Any]:
+    """``psql -At`` of ``reported IS NOT NULL | attempts | error IS NOT NULL`` for one card."""
+
+    parts = row.strip().split("|")
+    if len(parts) != 3 or not parts[1].isdigit():
+        return {"delivered": False, "attempts": None, "error": None}
+    return {"delivered": parts[0] == "t", "attempts": int(parts[1]), "error": parts[2] == "t"}
+
+
 def minted_token(stdout: bytes) -> str | None:
     """The token of ``approvals --mint-operator-principal --json``, else None."""
 
@@ -2644,8 +2697,14 @@ def install_values(
     priority_classes: tuple[str, str] | None,
     controller_deploy: bool,
     model_addresses: Sequence[str],
+    slack_bot_secret: str,
 ) -> dict[str, Any]:
-    """Helm values for the personal-profile install. No fake model, no service credential."""
+    """Helm values for the personal-profile install. No fake model, no service credential.
+
+    The channel gateway posts the routed publication card to the route's fixed
+    Slack channel with the bot token in ``slack_bot_secret``. The dispatcher, a
+    Socket Mode client, stays off: approvals are resolved from the CLI.
+    """
 
     def image(name: str) -> dict[str, Any]:
         return {
@@ -2679,7 +2738,15 @@ def install_values(
             "maxConcurrency": 1,
             "workItemMaxTurns": SESSION_TURNS,
         },
-        "dispatcher": {"deploy": False},
+        "dispatcher": {
+            "deploy": False,
+            "image": image("curie-dispatcher"),
+            "slack": {
+                "botTokenExistingSecret": slack_bot_secret,
+                "botTokenExistingSecretKey": SLACK_BOT_SECRET_KEY,
+            },
+        },
+        "channelGateway": {"deploy": True},
         "ui": {"deploy": False},
         "inference": {"deploy": False},
         "agentSandbox": {

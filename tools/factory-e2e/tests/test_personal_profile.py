@@ -62,6 +62,17 @@ def _private(path: Path) -> Path:
     return path
 
 
+SLACK_BOT = "xoxb-synthetic-gateway-bot-not-a-token"
+RESOLUTION_CHANNEL = "C0EXAMPLE1"
+
+
+def _slack_file(directory: Path, content: bytes = SLACK_BOT.encode() + b"\n") -> Path:
+    path = directory / "slack-bot"
+    path.write_bytes(content)
+    os.chmod(path, 0o600)
+    return path
+
+
 def _grant_file(
     directory: Path, content: bytes = GRANT.encode() + b"\n", mode: int = 0o600
 ) -> Path:
@@ -320,6 +331,9 @@ def _command_argv(command: str, base: Path, port: int, **overrides: str | None) 
         "--run-id": "acme-run-1",
         "--approve-live": pps.approved_ceiling(),
     }
+    if command in {"run", "rehearse"}:
+        values["--slack-bot-token-file"] = str(_slack_file(base))
+        values["--resolution-channel"] = RESOLUTION_CHANNEL
     values.update(overrides)
     argv = [command]
     for flag, value in values.items():
@@ -1657,6 +1671,7 @@ def _values() -> dict[str, Any]:
         priority_classes=None,
         controller_deploy=False,
         model_addresses=["192.0.2.10", "192.0.2.10", "192.0.2.11"],
+        slack_bot_secret="ppa-acme-slack-bot",
     )
 
 
@@ -2018,6 +2033,13 @@ class _ScriptedRun(pp.LiveRun):
         self.issue_number = 7
         self.repo_id = "1001"
 
+    def phase_drill(self) -> None:
+        if self.rehearsal:
+            self.events.append("drill")
+            return
+        # A paid run skips the drill: the real phase returns before any call.
+        super().phase_drill()
+
     def query_inventory(self) -> dict[str, str]:
         self.events.append("inventory")
         return {kind: "absent" for kind in pps.INVENTORY_KINDS}
@@ -2250,7 +2272,7 @@ class _FakeCurie(pp.CurieCli):
                 "agent": args[0],
                 "routes": {
                     pps.PUBLICATION_ROUTE: {
-                        "resolution": {"kind": "slack", "address": pps.RESOLUTION_CHANNEL},
+                        "resolution": {"kind": "slack", "address": RESOLUTION_CHANNEL},
                         "approvers": {"users": self.route_users},
                     }
                 },
@@ -2364,7 +2386,7 @@ def test_rehearse_phase_cut_stops_after_forge_and_finalizes(
     code = run.execute()
     summary = json.loads(capsys.readouterr().out.strip().splitlines()[-1])
     assert code == 0, summary
-    assert summary["command"] == "rehearse" and summary["phase"] == "forge"
+    assert summary["command"] == "rehearse" and summary["phase"] == "drill"
     assert not any(event in {"grant", "admit"} or event.startswith("budget:") for event in events)
     assert [event for event in events if event.startswith("undo:")] == [
         "undo:fixture-issue",
@@ -2387,7 +2409,7 @@ def test_rehearse_phase_cut_stops_after_forge_and_finalizes(
         "api_pending_empty": True,
         "fence_exercised": True,
     }
-    assert events.index("fence") < events.index("undo:fixture-issue")
+    assert events.index("drill") < events.index("fence") < events.index("undo:fixture-issue")
     ledger.close()
     code, result = _judge(tmp_path / "state", "scripted-run", "cleanup", capsys)
     assert code == 0, [key for key, value in result["checks"].items() if not value]
@@ -2407,6 +2429,143 @@ def test_rehearse_phase_cut_stops_after_forge_and_finalizes(
     ]
     with pytest.raises(ValueError):
         _scripted(_private(tmp_path / "late"), _Rehearsal, [], stop_after="attempt-1")
+
+
+class _Drill(_Rehearsal):
+    """The drill's verdicts over recorded CLI and audit shapes; no cluster."""
+
+    authorizer = pps.EXPLICIT_USERS_AUTHORIZER
+
+    def phase_setup(self) -> None:
+        super().phase_setup()
+        self.allowed_token = pps.HeldSecret("synthetic-allowed")
+        self.unlisted_token = pps.HeldSecret("synthetic-unlisted")
+        self.status = {"a-reject": "pending", "a-approve": "pending"}
+        self.rows: dict[str, list[dict[str, Any]]] = {"a-reject": [], "a-approve": []}
+
+    def drill_publication(self, label: str) -> str:
+        self.events.append(f"drill:{label}")
+        return f"a-{label}"
+
+    def approval(self, approval_id: str) -> dict[str, Any]:
+        return {"status": self.status[approval_id]}
+
+    def audit(self, approval_id: str) -> Any:
+        return self.rows[approval_id]
+
+    def phase_drill(self) -> None:
+        drill = self
+
+        class Resolver:
+            def run(self, verb: str, *args: str, **kwargs: Any) -> pp.Completed:
+                approval_id = args[2]
+                token = kwargs["extra_env"]["CURIE_APPROVAL_PRINCIPAL_TOKEN"]
+                listed = token == "synthetic-allowed"
+                subject = drill.allowed_subject if listed else drill.unlisted_subject
+                if not listed or drill.authorizer != pps.EXPLICIT_USERS_AUTHORIZER:
+                    drill.rows[approval_id].append(
+                        {
+                            "action": "denied",
+                            "actor": subject,
+                            "authorized": False,
+                            "authorizer": drill.authorizer,
+                            "reason": "refused",
+                            "created_at": "2026-11-11T10:00:00",
+                        }
+                    )
+                    return pp.Completed(1, TRACKER_REFUSAL_STDOUT, b"")
+                decision = "rejected" if "--reject" in args else "approved"
+                drill.status[approval_id] = decision
+                drill.rows[approval_id].append(
+                    {
+                        "action": "resolved",
+                        "actor": subject,
+                        "authorized": True,
+                        "principal_kind": "operator",
+                        "decision": decision,
+                    }
+                )
+                return pp.Completed(0, b"{}", b"")
+
+        self.curie = Resolver()  # type: ignore[assignment]
+        pp.LiveRun.phase_drill(self)
+
+
+def test_drill_proves_the_list_refusal_reject_and_approve(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    events: list[str] = []
+    run = _scripted(tmp_path, _Drill, events, stop_after=pp.REHEARSAL_CUT)
+    capsys.readouterr()
+    assert run.execute() == 0
+    assert events.index("drill:reject") < events.index("drill:approve") < events.index("fence")
+    ledger = pps.Ledger.open(tmp_path / "state", "scripted-run")
+    observed = ledger.observations("rehearsal")
+    assert observed["drill_unlisted_refused_by_list"] is True
+    assert observed["drill_reject_resolved"] is True
+    assert observed["drill_approve_resolved"] is True
+    assert ledger.observations("approval")["cli_drill_unlisted"]["audit_authorizer"] == (
+        pps.EXPLICIT_USERS_AUTHORIZER
+    )
+    ledger.close()
+    # The tracker-surface refusal denies everyone; the drill must not pass on it.
+    nobody: list[str] = []
+    failed = _scripted(_private(tmp_path / "nobody"), _Drill, nobody, stop_after="drill")
+    failed.authorizer = "NoVerifiableApprovers"
+    capsys.readouterr()
+    assert failed.execute() == 1
+    summary = json.loads(capsys.readouterr().out.strip().splitlines()[-1])
+    assert summary["phase"] == "drill" and "drill_unlisted_refused_by_list" in summary["detail"]
+
+
+def test_slack_kit_refuses_before_any_mutation(tmp_path: Path) -> None:
+    good = _slack_file(_private(tmp_path / "good"))
+    assert pps.require_slack_kit(str(good), RESOLUTION_CHANNEL) == (good, RESOLUTION_CHANNEL)
+    for token_file, channel in (
+        ("", RESOLUTION_CHANNEL),
+        (str(good), ""),
+        (str(good), "#testing"),
+        (str(_slack_file(_private(tmp_path / "user"), b"xoxp-user-token\n")), RESOLUTION_CHANNEL),
+    ):
+        with pytest.raises(pps.Refusal) as refused:
+            pps.require_slack_kit(token_file, channel)
+        assert refused.value.code == "slack_kit_invalid"
+    os.chmod(good, 0o644)
+    with pytest.raises(pps.Refusal):
+        pps.require_slack_kit(str(good), RESOLUTION_CHANNEL)
+    # Through the real command, before any cluster call.
+    base = _private(tmp_path / "command")
+    result = _run_script(
+        _command_argv(
+            "rehearse",
+            base,
+            5999,
+            **{
+                "--grant-file": None,
+                "--grant-expires-at": None,
+                "--approve-live": None,
+                "--resolution-channel": "general",
+            },
+        ),
+        tmp_path,
+    )
+    assert _refusal(result) == "slack_kit_invalid"
+
+
+def test_install_values_deploy_the_gateway_but_not_the_dispatcher() -> None:
+    values = _values()
+    assert values["channelGateway"] == {"deploy": True}
+    dispatcher = values["dispatcher"]
+    assert dispatcher["deploy"] is False
+    assert dispatcher["image"]["repository"] == "localhost:5999/curie-dispatcher"
+    assert dispatcher["slack"] == {
+        "botTokenExistingSecret": "ppa-acme-slack-bot",
+        "botTokenExistingSecretKey": "slackBotToken",
+    }
+    assert "appToken" not in json.dumps(dispatcher)
+    assert pps.card_delivery("t|1|f\n") == {"delivered": True, "attempts": 1, "error": False}
+    assert pps.card_delivery("f|5|t") == {"delivered": False, "attempts": 5, "error": True}
+    assert pps.card_delivery("") == {"delivered": False, "attempts": None, "error": None}
 
 
 def test_rehearse_ledger_is_refused_by_run_and_judge(
