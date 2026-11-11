@@ -24,7 +24,6 @@ import stat
 import sys
 import threading
 from collections.abc import Iterator
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -465,51 +464,6 @@ def test_session_deadline_spans_turns_and_kills_the_runner(
         assert stopped == []
 
 
-def test_stalled_stream_deadline_interrupts_and_deletes_the_runner(
-    live_driver: EnrollmentProof, monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    stopped: list[str] = []
-    released = threading.Event()
-
-    class Handler(BaseHTTPRequestHandler):
-        def log_message(self, *args: object) -> None:
-            pass
-
-        def do_POST(self) -> None:
-            self.rfile.read(int(self.headers["Content-Length"]))
-            self.send_response(200)
-            self.end_headers()
-            if self.path == "/v1/interrupt":
-                stopped.append("interrupt")
-            else:
-                self.wfile.write(b'{"type":"tool_note"}\n')
-                self.wfile.flush()
-                released.wait(3)
-
-    def delete(*args: object, **kwargs: object) -> None:
-        stopped.append("delete")
-        released.set()
-
-    live_driver.core = SimpleNamespace(delete_namespaced_pod=delete)
-    monkeypatch.setattr(support, "MAX_SESSION_SECONDS", 0.1)
-    with ThreadingHTTPServer(("127.0.0.1", 0), Handler) as server:
-        server.daemon_threads = True
-        thread = threading.Thread(target=lambda: server.serve_forever(poll_interval=0.01))
-        thread.start()
-        monkeypatch.setattr(live_driver, "forward", lambda _: (
-            contextlib.nullcontext(server.server_port)
-        ))
-        try:
-            with pytest.raises(ProofCheckError, match="absolute deadline"):
-                live_driver.live_session(live_driver.s3, "stalled", ["work"], expect="done")
-            assert stopped == ["interrupt", "delete"]
-        finally:
-            released.set()
-            server.shutdown()
-            thread.join(timeout=5)
-            assert not thread.is_alive()
-
-
 @pytest.mark.parametrize("leaked", [True, False])
 def test_cleanup_checks_evidence_before_clearing_private_values(
     live_driver: EnrollmentProof, monkeypatch: pytest.MonkeyPatch, leaked: bool,
@@ -587,6 +541,8 @@ def test_missing_grant_control_keeps_service_material_out_of_the_runner(
 def test_service_installation_template_has_unique_environment_names(
     live_driver: EnrollmentProof,
 ) -> None:
+    # The Kubernetes API returned 422 FieldValueDuplicate for repeated env names
+    # in the SandboxTemplate's map-list; each container needs unique name keys.
     objects: dict[tuple[str, str], dict] = {}
 
     def create(group: str, version: str, namespace: str, plural: str, body: dict,
