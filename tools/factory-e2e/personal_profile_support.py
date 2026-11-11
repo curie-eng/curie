@@ -60,6 +60,20 @@ UNATTRIBUTED = "unattributed"
 ATTEMPT_ROLES = (IMPLEMENTER, PLAN_REVIEWER, DIFF_REVIEWER, DIFF_REVIEWER)
 
 
+def require_output_token_ceiling(raw: str | None) -> int | None:
+    """A stricter output-token ceiling for one run, or None for the approved maximum.
+
+    A maintainer may hold a run below the approved total (for example to what an
+    earlier live run left of it); nothing may raise it above the approval.
+    """
+
+    if raw is None or raw == "":
+        return None
+    if not raw.isdigit() or not 0 < int(raw) <= MAX_OUTPUT_TOKENS:
+        raise Refusal("arguments_invalid", "--output-token-ceiling")
+    return int(raw)
+
+
 def approved_ceiling() -> str:
     """The canonical ``--approve-live`` string, derived from the constants above."""
 
@@ -1047,7 +1061,8 @@ class Ledger:
             used_turns = sum(int(item["assistant_turns"]) for item in sessions)
             used_tokens = sum(int(item["output_tokens"]) for item in sessions)
             turns = min(SESSION_TURNS, (MAX_TURNS - used_turns) // count)
-            tokens = min(SESSION_OUTPUT_TOKENS, (MAX_OUTPUT_TOKENS - used_tokens) // count)
+            ceiling = self.output_token_ceiling()
+            tokens = min(SESSION_OUTPUT_TOKENS, (ceiling - used_tokens) // count)
             if turns < 1:
                 raise Refusal("allowance_exhausted", "turns")
             if tokens < 1:
@@ -1129,7 +1144,7 @@ class Ledger:
                 or float(item["elapsed"]) > SESSION_SECONDS
                 for item in settled
             )
-            or sum(int(item["output_tokens"]) for item in settled) > MAX_OUTPUT_TOKENS
+            or sum(int(item["output_tokens"]) for item in settled) > self.output_token_ceiling()
             or sum(int(item["assistant_turns"]) for item in settled) > MAX_TURNS
             or len(sessions) > MAX_SESSIONS
         ):
@@ -1149,6 +1164,42 @@ class Ledger:
                 "value_json=excluded.value_json, recorded_at=excluded.recorded_at",
                 (self.run_id, criterion, key, text, time.time()),
             )
+
+    def output_token_ceiling(self) -> int:
+        """The run's output-token ceiling: the approved maximum or a stricter recorded one."""
+
+        row = self.db.execute(
+            "SELECT value_json FROM observations WHERE run_id=? AND criterion='budget' "
+            "AND key='output_token_ceiling'",
+            (self.run_id,),
+        ).fetchone()
+        if row is None:
+            return MAX_OUTPUT_TOKENS
+        value = json.loads(row[0])
+        if (
+            not isinstance(value, int)
+            or isinstance(value, bool)
+            or not 0 < value <= MAX_OUTPUT_TOKENS
+        ):
+            raise Refusal("ledger_unsafe", "output_token_ceiling")
+        return value
+
+    def set_output_token_ceiling(self, ceiling: int) -> None:
+        """Record a stricter ceiling before the first reservation; it never changes after."""
+
+        with self.transaction() as db:
+            row = db.execute(
+                "SELECT value_json FROM observations WHERE run_id=? AND criterion='budget' "
+                "AND key='output_token_ceiling'",
+                (self.run_id,),
+            ).fetchone()
+            reserved = db.execute(
+                "SELECT COUNT(*) FROM sessions WHERE run_id=?", (self.run_id,)
+            ).fetchone()[0]
+            if (row is not None and json.loads(row[0]) != ceiling) or (row is None and reserved):
+                raise Refusal("arguments_invalid", "--output-token-ceiling")
+        if row is None:
+            self.record("budget", "output_token_ceiling", ceiling)
 
     def observations(self, criterion: str) -> dict[str, Any]:
         rows = self.db.execute(
@@ -2370,7 +2421,7 @@ def _judge_budget(ledger: Ledger) -> tuple[dict[str, bool], dict[str, int]]:
         "total_turns_within": known
         and sum(int(item["assistant_turns"]) for item in sessions) <= MAX_TURNS,
         "total_output_tokens_within": known
-        and sum(int(item["output_tokens"]) for item in sessions) <= MAX_OUTPUT_TOKENS,
+        and sum(int(item["output_tokens"]) for item in sessions) <= ledger.output_token_ceiling(),
         "budget_not_exceeded": run["budget_state"] == "ok",
         "no_paid_retry": run["live_starts"] == 1 and "paid_retry" not in observed,
         # Starts were fenced (worker stopped, grant removed, no runner pod) before

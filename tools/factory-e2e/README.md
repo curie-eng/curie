@@ -94,8 +94,11 @@ $P judge --criterion all --candidate $SHA --state-dir $STATE_DIR --run-id acme-r
    `--slack-bot-token-file` in a run-owned Secret, and binds the route's
    resolution to `--resolution-channel`. The dispatcher stays off; approvals
    are resolved from the CLI. Each answer waits for its card to be delivered.
-   `run` A second `run` with the same run
-   ID refuses with `paid_retry_refused`; there is no retry flag.
+   `--output-token-ceiling N` (on `preflight` and `run`) holds one run below
+   the approved total output tokens; it can only lower the ceiling, is recorded
+   before the first reservation, and bounds reservations, the overrun check and
+   `judge --criterion budget`. A second `run` with the same run ID refuses with
+   `paid_retry_refused`; there is no retry flag.
 5. `judge --criterion {roles,approval,pod-restart,publication,budget,cleanup,all}`
    reads the ledger only and prints
    `{"criterion", "verdict", "checks", "counts"}` with booleans and counts and

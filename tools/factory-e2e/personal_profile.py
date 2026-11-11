@@ -448,6 +448,8 @@ def build_parser() -> argparse.ArgumentParser:
         sub.add_argument("--grant-expires-at", default=grant_default)
         if name in {"preflight", "run", "rehearse"}:
             sub.add_argument("--approve-live", default=None)
+        if name in {"preflight", "run"}:
+            sub.add_argument("--output-token-ceiling", default="")
         if name in {"run", "rehearse"}:
             sub.add_argument("--slack-bot-token-file", default="")
             sub.add_argument("--resolution-channel", default="")
@@ -1174,6 +1176,7 @@ def verify_images(inputs: Inputs, ledger: pps.Ledger) -> dict[str, pps.RegistryI
 def cmd_preflight(args: argparse.Namespace, runtime: Runtime) -> int:
     inputs = base_inputs(args)
     pps.require_live_approval(args.approve_live)
+    pps.require_output_token_ceiling(args.output_token_ceiling)
     inputs = with_grant(inputs, args, runtime.clock.now())
     inputs = with_app(with_cluster(inputs, args), args)
     ledger = pps.Ledger.open(inputs.state_dir, inputs.run_id, scrubber=runtime.scrubber)
@@ -1311,6 +1314,7 @@ def cmd_judge(args: argparse.Namespace, runtime: Runtime) -> int:
 def cmd_run(args: argparse.Namespace, runtime: Runtime) -> int:
     inputs = base_inputs(args)
     pps.require_live_approval(args.approve_live)
+    ceiling = pps.require_output_token_ceiling(args.output_token_ceiling)
     inputs = with_grant(inputs, args, runtime.clock.now())
     inputs = with_slack(with_app(with_cluster(inputs, args), args), args)
     ledger = pps.Ledger.open(inputs.state_dir, inputs.run_id, scrubber=runtime.scrubber)
@@ -1319,6 +1323,8 @@ def cmd_run(args: argparse.Namespace, runtime: Runtime) -> int:
             raise pps.Refusal("rehearsal_run_id", "--run-id")
         ledger.ensure_run(inputs.candidate, phase="run")
         ledger.refuse_paid_retry()
+        if ceiling is not None:
+            ledger.set_output_token_ceiling(ceiling)
     except pps.Refusal:
         ledger.close()
         raise

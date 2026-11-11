@@ -1120,6 +1120,50 @@ def test_budget_caps_refuse_past_any_allowance(tmp_path: Path) -> None:
     unreserved.close()
 
 
+def test_a_stricter_output_token_ceiling_holds_both_attempts(tmp_path: Path) -> None:
+    assert pps.require_output_token_ceiling(None) is None
+    assert pps.require_output_token_ceiling("") is None
+    assert pps.require_output_token_ceiling("28302") == 28302
+    for raw in ("0", "-1", "abc", str(pps.MAX_OUTPUT_TOKENS + 1)):
+        with pytest.raises(pps.Refusal):
+            pps.require_output_token_ceiling(raw)
+    ledger = _live_ledger(tmp_path)
+    assert ledger.output_token_ceiling() == pps.MAX_OUTPUT_TOKENS
+    ledger.set_output_token_ceiling(28302)
+    ledger.set_output_token_ceiling(28302)
+    assert _refused(lambda: ledger.set_output_token_ceiling(30000)) == "arguments_invalid"
+    first = ledger.reserve(list(pps.ATTEMPT_ROLES), attempt=1, now=T0 + 1)
+    assert [item.output_tokens for item in first] == [28302 // 4] * 4
+    # The first live run's shape: three sessions used, one diff slot unused.
+    for item, used in zip(first, (2584, 1282, 600, 0), strict=True):
+        ledger.settle(
+            item.seq, pps.SessionUsage(used, 3, 20.0, pps.REVIEWER_MODEL), source="native"
+        )
+    second = ledger.reserve(list(pps.ATTEMPT_ROLES), attempt=2, now=T0 + 2)
+    assert [item.output_tokens for item in second] == [(28302 - 4466) // 4] * 4
+    for item in second:
+        ledger.settle(
+            item.seq, pps.SessionUsage(5959, 3, 20.0, pps.REVIEWER_MODEL), source="native"
+        )
+    # 4466 + 4 * 5959 = 28302: at the ceiling, not over it.
+    assert ledger.budget_state() == "ok"
+    ledger.close()
+    over = _live_ledger(tmp_path / "over", run_id="over-run")
+    over.set_output_token_ceiling(1000)
+    item = over.reserve([pps.IMPLEMENTER], attempt=1, now=T0 + 1)[0]
+    assert item.output_tokens == 1000
+    over.settle(item.seq, pps.SessionUsage(1001, 3, 20.0, pps.IMPLEMENTER_MODEL), source="native")
+    # Over the run's ceiling though far under the approved maximum.
+    assert over.budget_state() == "exceeded"
+    checks, _ = pps._judge_budget(over)
+    assert checks["total_output_tokens_within"] is False
+    over.close()
+    late = _live_ledger(tmp_path / "late", run_id="late-run")
+    late.reserve([pps.IMPLEMENTER], attempt=1, now=T0 + 1)
+    assert _refused(lambda: late.set_output_token_ceiling(28302)) == "arguments_invalid"
+    late.close()
+
+
 def test_budget_live_window_and_grant_lifetime_refuse(tmp_path: Path) -> None:
     ledger = _live_ledger(tmp_path)
     late = T0 + pps.LIVE_SECONDS - pps.SESSION_SECONDS + 1
