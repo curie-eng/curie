@@ -54,7 +54,7 @@ import threading
 import time
 import urllib.parse
 import uuid
-from collections.abc import Callable, Coroutine, Mapping, Sequence
+from collections.abc import Callable, Coroutine, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -1513,6 +1513,50 @@ class EnrollmentProof(ClusterProof):
 
     # --- live turns ------------------------------------------------------------
 
+    @contextlib.contextmanager
+    def session_deadline(self, launched: Launched, port: int) -> Iterator[float]:
+        deadline = time.monotonic() + MAX_SESSION_SECONDS
+        expired = threading.Event()
+        expiry_lock = threading.Lock()
+        problems: list[str] = []
+
+        def expire() -> None:
+            with expiry_lock:
+                if expired.is_set():
+                    return
+                expired.set()
+                connection = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+                try:
+                    connection.request(
+                        "POST", "/v1/interrupt", body=b"{}",
+                        headers={"Authorization": f"Bearer {launched.runner_token.reveal()}",
+                                 "Content-Type": "application/json"},
+                    )
+                    connection.getresponse().close()
+                except (OSError, http.client.HTTPException):
+                    pass
+                finally:
+                    connection.close()
+                    try:
+                        self.core.delete_namespaced_pod(
+                            launched.pod, self.namespace, grace_period_seconds=0,
+                            _request_timeout=10,
+                        )
+                    except Exception:  # noqa: BLE001 - deadline failure remains fatal
+                        problems.append("runner pod deletion failed")
+
+        timer = threading.Timer(MAX_SESSION_SECONDS, expire)
+        timer.start()
+        try:
+            yield deadline
+        finally:
+            timer.cancel()
+            if time.monotonic() >= deadline:
+                expire()
+            timer.join()
+            require(not expired.is_set(), "session exceeded its absolute deadline"
+                    + (": " + "; ".join(problems) if problems else ""))
+
     def stream(
         self,
         port: int,
@@ -1520,13 +1564,15 @@ class EnrollmentProof(ClusterProof):
         prompt: str,
         *,
         on_event: Callable[[dict[str, Any]], None] | None = None,
-        until: float = MAX_SESSION_SECONDS,
+        deadline: float,
     ) -> tuple[list[dict[str, Any]], bytes, float, bool]:
         """One ACI turn; returns its events and whether the stream ended unfinished."""
 
         __tracebackhide__ = True
         started = time.monotonic()
-        connection = http.client.HTTPConnection("127.0.0.1", port, timeout=until)
+        remaining = deadline - started
+        require(remaining > 0, "session exceeded its absolute deadline")
+        connection = http.client.HTTPConnection("127.0.0.1", port, timeout=remaining)
         events: list[dict[str, Any]] = []
         raw = bytearray()
         ended = False
@@ -1540,7 +1586,11 @@ class EnrollmentProof(ClusterProof):
             )
             response = connection.getresponse()
             require(response.status == 200, "ACI turn did not return a streaming response")
-            while time.monotonic() - started < until:
+            while True:
+                remaining = deadline - time.monotonic()
+                require(remaining > 0, "session exceeded its absolute deadline")
+                if connection.sock is not None:
+                    connection.sock.settimeout(remaining)
                 line = response.readline()
                 if not line:
                     ended = True
@@ -1553,8 +1603,8 @@ class EnrollmentProof(ClusterProof):
                     on_event(event)
                 if event.get("type") == "final":
                     break
-            else:
-                raise RuntimeError("ACI turn exceeded its wall ceiling")
+        except TimeoutError:
+            raise ProofCheckError("session exceeded its absolute deadline") from None
         except (OSError, http.client.HTTPException):
             ended = True
         except ValueError:
@@ -1616,10 +1666,13 @@ class EnrollmentProof(ClusterProof):
             sequence, allowance = self.ledger.start(self.candidate)
             require(allowance == remaining, "live allowance changed before session admission")
             started = time.monotonic()
-            for prompt in prompts:
-                turn, _raw, _elapsed, ended = self.stream(port, launched.runner_token, prompt)
-                events += turn
-                require(not ended, "a live turn ended without a final; no paid retry")
+            with self.session_deadline(launched, port) as deadline:
+                for prompt in prompts:
+                    turn, _raw, _elapsed, ended = self.stream(
+                        port, launched.runner_token, prompt, deadline=deadline,
+                    )
+                    events += turn
+                    require(not ended, "a live turn ended without a final; no paid retry")
         elapsed = time.monotonic() - started
         observed = self.observe_files(launched.pod)
         self.account(sequence, launched, events, observed, elapsed, allowance=allowance, name=name)
@@ -1897,47 +1950,67 @@ class EnrollmentProof(ClusterProof):
             sequence, allowance = self.ledger.start(self.candidate)
             require(allowance == remaining, "live allowance changed before session admission")
             started = time.monotonic()
-            first, _raw, _elapsed, ended = self.stream(
-                port, self.s3.runner_token,
-                "What code word did I ask you to remember? Reply with only the code word.",
-            )
-            require(not ended, "session 3's first turn ended without a final; no paid retry")
-            final = next(event for event in first if event.get("type") == "final")
-            self.check("AC5", "session 3 answers marker M from the rehydrated transcript",
-                       [True, "done"], [self.marker in str(final.get("text")), final.get("status")])
-            tool = threading.Event()
-            box: dict[str, Any] = {}
+            with self.session_deadline(self.s3, port) as deadline:
+                first, _raw, _elapsed, ended = self.stream(
+                    port, self.s3.runner_token,
+                    "What code word did I ask you to remember? Reply with only the code word.",
+                    deadline=deadline,
+                )
+                require(not ended, "session 3's first turn ended without a final; no paid retry")
+                final = next(event for event in first if event.get("type") == "final")
+                self.check("AC5", "session 3 answers marker M from the rehydrated transcript",
+                           [True, "done"],
+                           [self.marker in str(final.get("text")), final.get("status")])
+                tool = threading.Event()
+                box: dict[str, Any] = {}
 
-            def second_turn() -> None:
+                def second_turn() -> None:
+                    try:
+                        box["result"] = self.stream(
+                            port, self.s3.runner_token,
+                            f"Use the Bash tool to run exactly: sleep {TOOL_SLEEP_SECONDS}. "
+                            "Then reply DONE.",
+                            on_event=lambda event: (
+                                tool.set() if event.get("type") == "tool_note" else None
+                            ),
+                            deadline=deadline,
+                        )
+                    except Exception as exc:  # noqa: BLE001 - reported by the main thread
+                        box["error"] = type(exc).__name__
+
+                thread = threading.Thread(target=second_turn, daemon=True)
+                self.readers.append(thread)
+                thread.start()
                 try:
-                    box["result"] = self.stream(
-                        port, self.s3.runner_token,
-                        f"Use the Bash tool to run exactly: sleep {TOOL_SLEEP_SECONDS}. "
-                        "Then reply DONE.",
-                        on_event=lambda event: (
-                            tool.set() if event.get("type") == "tool_note" else None
+                    ran_tool = wait_until(
+                        lambda: True if tool.is_set() else (
+                            False if not thread.is_alive() else None
                         ),
+                        timeout=max(0, deadline - time.monotonic()), interval=0.5,
+                        failure="session 3's second turn never ran its tool",
                     )
-                except Exception as exc:  # noqa: BLE001 - reported by the main thread
-                    box["error"] = type(exc).__name__
-
-            thread = threading.Thread(target=second_turn, daemon=True)
-            thread.start()
-            ran_tool = wait_until(
-                lambda: True if tool.is_set() else (False if not thread.is_alive() else None),
-                timeout=120, interval=0.5, failure="session 3's second turn never ran its tool",
-            )
-            require(ran_tool, "session 3's second turn ended before running its tool")
-            observed = self.observe_files(self.s3.pod)
-            self.capture_pod(self.s3.pod)
-            disconnected = self.write(
-                "disconnect", token=None, previous=self.headers_seen["restored"]
-            )
-            thread.join(timeout=MAX_SESSION_SECONDS)
-            require(not thread.is_alive(), "session 3's interrupted turn did not stop")
-        second = box.get("result", ([], b"", 0.0, True))[0]
-        self.check("AC5", "the disconnect landed while session 3's tool was running", 0,
-                   sum(event.get("type") == "final" for event in second))
+                    require(ran_tool, "session 3's second turn ended before running its tool")
+                    observed = self.observe_files(self.s3.pod)
+                    self.capture_pod(self.s3.pod)
+                    self.check(
+                        "AC5", "session 3's second turn is active when disconnect begins", True,
+                        thread.is_alive() and "result" not in box and "error" not in box,
+                    )
+                    disconnected = self.write(
+                        "disconnect", token=None, previous=self.headers_seen["restored"]
+                    )
+                finally:
+                    thread.join(timeout=max(0, deadline - time.monotonic()))
+                require(not thread.is_alive(), "session 3's interrupted turn did not stop")
+                require("error" not in box, "session 3's second turn raised an error")
+                require("result" in box, "session 3's second turn returned no result")
+                second, _raw, _elapsed, ended = box["result"]
+                finals = [event for event in second if event.get("type") == "final"]
+                self.check(
+                    "AC5", "session 3's disconnected turn interrupts or ends at teardown", True,
+                    (len(finals) == 1 and finals[0].get("status") == "idle-awaiting-input")
+                    or (not finals and ended),
+                )
         self.account(sequence, self.s3, [*first, *second], observed,
                      time.monotonic() - started, allowance=allowance, name="c-d")
         return disconnected
@@ -2078,6 +2151,7 @@ class EnrollmentProof(ClusterProof):
     def cleanup(self) -> None:
         __tracebackhide__ = True
         problems: list[str] = []
+        values = self.held_values()
         if self.launcher is not None:
             try:
                 self.run_async(self.launch.close, timeout=60)
@@ -2134,8 +2208,6 @@ class EnrollmentProof(ClusterProof):
             shutil.rmtree(private, ignore_errors=True)
             if Path(private).exists():
                 problems.append("private run directory remains")
-        for secret in self.held():
-            secret.clear()
         self.evidence["cleanup"] = {
             **self.evidence.get("cleanup", {}),
             "passed": not problems,
@@ -2145,7 +2217,12 @@ class EnrollmentProof(ClusterProof):
             "source_processes_running": sum(p.poll() is None for p in self.processes),
             "problems": problems,
         }
-        self.write_evidence()
+        try:
+            self.write_evidence(values=values)
+        finally:
+            for secret in self.held():
+                secret.clear()
+            values.clear()
         require(not problems, "; ".join(problems))
 
     def delete_owned_namespace(self, name: str, uid: str) -> None:
@@ -2196,9 +2273,11 @@ class EnrollmentProof(ClusterProof):
                 problems.append("a retained log carried a private value and was removed")
         return problems
 
-    def write_evidence(self) -> None:
+    def write_evidence(self, *, values: Sequence[str] | None = None) -> None:
         """Anonymized JSON per acceptance criterion, in the caller's directory."""
 
+        values = self.held_values() if values is None else values
+        require(bool(values) and all(values), "evidence audit has no private values")
         self.evidence_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
         common = {
             "candidate_sha": self.evidence.get("candidate_sha"),
@@ -2214,18 +2293,20 @@ class EnrollmentProof(ClusterProof):
         documents["ac5"]["sessions"] = self.evidence.get("sessions")
         documents["ac5"]["steps"] = self.evidence.get("steps")
         documents["run"] = self.evidence
-        values = self.held_values()
+        withheld = False
         for name, document in documents.items():
             encoded = anonymize(
                 json.dumps(document, indent=2, sort_keys=True, default=str).encode(),
                 self.targets(),
             )
             if leaks(encoded, values):
+                withheld = True
                 encoded = json.dumps({"withheld": "evidence carried a private value"}).encode()
             path = self.evidence_dir / f"personal-enrollment-{name}.json"
             fd = os.open(path, os.O_CREAT | os.O_TRUNC | os.O_WRONLY | os.O_NOFOLLOW, 0o600)
             with os.fdopen(fd, "wb") as stream:
                 stream.write(encoded)
+        require(not withheld, "evidence carried a private value and was withheld")
 
 
 class Launcher:

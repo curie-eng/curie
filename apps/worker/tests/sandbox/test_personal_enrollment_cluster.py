@@ -16,6 +16,7 @@ The offline tests below cover the driver's own guards and run everywhere.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import socket
@@ -23,13 +24,16 @@ import stat
 import sys
 import threading
 from collections.abc import Iterator
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
 # importlib import mode does not add this test directory to sys.path.
 sys.path.insert(0, str(Path(__file__).parent))
 
+import personal_enrollment_cluster_support as support  # noqa: E402
 from personal_enrollment_cluster_support import (  # noqa: E402
     ROOT,
     EnrollmentLedger,
@@ -296,6 +300,218 @@ def test_relay_forwards_both_directions_and_stops() -> None:
             relay.close()
         thread.join(timeout=5)
         assert not relay.alive
+
+
+@pytest.fixture
+def live_driver(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> EnrollmentProof:
+    _inputs(monkeypatch, tmp_path)
+    proof = EnrollmentProof("synthetic")
+    proof.candidate = "candidate"
+    proof.s3 = SimpleNamespace(pod="owned-pod", runner_token=support.HeldSecret("runner"))
+    proof.ledger = SimpleNamespace(remaining=lambda: 1024, start=lambda _: (3, 1024))
+    proof.headers_seen["restored"] = {"version": 3}
+    monkeypatch.setattr(proof, "forward", lambda _: contextlib.nullcontext(1234))
+    monkeypatch.setattr(proof, "observe_files", lambda _: {})
+    monkeypatch.setattr(proof, "capture_pod", lambda _: None)
+    monkeypatch.setattr(proof, "account", lambda *args, **kwargs: {})
+    return proof
+
+
+@pytest.mark.parametrize("outcome", ["interrupted", "eof", "error", "done", "inactive"])
+def test_disconnect_requires_active_work_and_propagates_turn_errors(
+    live_driver: EnrollmentProof, monkeypatch: pytest.MonkeyPatch, outcome: str,
+) -> None:
+    released = threading.Event()
+    finished = threading.Event()
+    writes: list[str] = []
+    calls = 0
+
+    def stream(
+        *args: object, **kwargs: object,
+    ) -> tuple[list[dict[str, object]], bytes, float, bool]:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return [{"type": "final", "status": "done", "text": live_driver.marker}], b"", 1, False
+        callback = kwargs["on_event"]
+        callback({"type": "tool_note"})
+        if outcome != "inactive":
+            assert released.wait(5), "disconnect never released the running turn"
+        finished.set()
+        if outcome == "error":
+            raise RuntimeError("unexpected thread failure")
+        if outcome in {"eof", "inactive"}:
+            return [], b"", 1, True
+        return [{"type": "final", "status": (
+            "done" if outcome == "done" else "idle-awaiting-input"
+        )}], b"", 1, False
+
+    def write(action: str, **kwargs: object) -> dict[str, int]:
+        writes.append(action)
+        released.set()
+        return {"version": 4}
+
+    monkeypatch.setattr(live_driver, "stream", stream)
+    monkeypatch.setattr(live_driver, "write", write)
+    if outcome == "inactive":
+        monkeypatch.setattr(live_driver, "observe_files", lambda _: finished.wait(5) or {})
+    try:
+        if outcome in {"interrupted", "eof"}:
+            assert live_driver.live_disconnect_during_work() == {"version": 4}
+        else:
+            with pytest.raises(ProofCheckError):
+                live_driver.live_disconnect_during_work()
+        assert writes == ([] if outcome == "inactive" else ["disconnect"])
+    finally:
+        released.set()
+
+
+@pytest.mark.parametrize("elapsed", [(100, 81), (100, 20)])
+def test_session_deadline_spans_turns_and_kills_the_runner(
+    live_driver: EnrollmentProof, monkeypatch: pytest.MonkeyPatch, elapsed: tuple[int, int],
+) -> None:
+    clock = [0.0]
+    timers: list[object] = []
+    stopped: list[str] = []
+
+    class Timer:
+        def __init__(self, seconds: float, callback: object) -> None:
+            self.deadline = clock[0] + seconds
+            self.callback = callback
+            self.cancelled = False
+            timers.append(self)
+
+        def start(self) -> None:
+            pass
+
+        def cancel(self) -> None:
+            self.cancelled = True
+
+        def join(self) -> None:
+            pass
+
+    class Connection:
+        def __init__(self, *args: object, **kwargs: object) -> None:
+            pass
+
+        def request(self, method: str, path: str, **kwargs: object) -> None:
+            assert (method, path) == ("POST", "/v1/interrupt")
+            stopped.append("interrupt")
+
+        def getresponse(self) -> object:
+            return SimpleNamespace(status=200, close=lambda: None)
+
+        def close(self) -> None:
+            pass
+
+    def delete(pod: str, namespace: str, **kwargs: object) -> None:
+        assert pod == "owned-pod" and kwargs["grace_period_seconds"] == 0
+        stopped.append("delete")
+
+    durations = iter(elapsed)
+
+    def stream(*args: object, **kwargs: object) -> tuple[list[dict[str, object]], bytes, int, bool]:
+        duration = next(durations)
+        clock[0] += duration
+        for timer in timers:
+            if not timer.cancelled and clock[0] >= timer.deadline:
+                timer.callback()
+        return [{"type": "final", "status": "authentication-required"}], b"", duration, False
+
+    live_driver.core = SimpleNamespace(delete_namespaced_pod=delete)
+    monkeypatch.setattr(support.time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(support.threading, "Timer", Timer)
+    monkeypatch.setattr(support.http.client, "HTTPConnection", Connection)
+    monkeypatch.setattr(live_driver, "stream", stream)
+    if sum(elapsed) > 180:
+        with pytest.raises(ProofCheckError, match="absolute deadline"):
+            live_driver.live_session(live_driver.s3, "deadline", ["first", "second"],
+                                     expect="authentication-required")
+        assert stopped == ["interrupt", "delete"]
+    else:
+        live_driver.live_session(live_driver.s3, "deadline", ["first", "second"],
+                                 expect="authentication-required")
+        assert stopped == []
+
+
+def test_stalled_stream_deadline_interrupts_and_deletes_the_runner(
+    live_driver: EnrollmentProof, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    stopped: list[str] = []
+    released = threading.Event()
+
+    class Handler(BaseHTTPRequestHandler):
+        def log_message(self, *args: object) -> None:
+            pass
+
+        def do_POST(self) -> None:
+            self.rfile.read(int(self.headers["Content-Length"]))
+            self.send_response(200)
+            self.end_headers()
+            if self.path == "/v1/interrupt":
+                stopped.append("interrupt")
+            else:
+                self.wfile.write(b'{"type":"tool_note"}\n')
+                self.wfile.flush()
+                released.wait(3)
+
+    def delete(*args: object, **kwargs: object) -> None:
+        stopped.append("delete")
+        released.set()
+
+    live_driver.core = SimpleNamespace(delete_namespaced_pod=delete)
+    monkeypatch.setattr(support, "MAX_SESSION_SECONDS", 0.1)
+    with ThreadingHTTPServer(("127.0.0.1", 0), Handler) as server:
+        server.daemon_threads = True
+        thread = threading.Thread(target=lambda: server.serve_forever(poll_interval=0.01))
+        thread.start()
+        monkeypatch.setattr(live_driver, "forward", lambda _: (
+            contextlib.nullcontext(server.server_port)
+        ))
+        try:
+            with pytest.raises(ProofCheckError, match="absolute deadline"):
+                live_driver.live_session(live_driver.s3, "stalled", ["work"], expect="done")
+            assert stopped == ["interrupt", "delete"]
+        finally:
+            released.set()
+            server.shutdown()
+            thread.join(timeout=5)
+            assert not thread.is_alive()
+
+
+@pytest.mark.parametrize("leaked", [True, False])
+def test_cleanup_checks_evidence_before_clearing_private_values(
+    live_driver: EnrollmentProof, monkeypatch: pytest.MonkeyPatch, leaked: bool,
+) -> None:
+    sentinel = live_driver.grant.reveal()
+    live_driver.evidence["sentinel"] = sentinel if leaked else "public outcome"
+
+    def parent_cleanup(proof: EnrollmentProof) -> None:
+        proof.grant.clear()
+        proof.runner_auth.clear()
+        proof.progress_auth.clear()
+
+    monkeypatch.setattr(support.ClusterProof, "cleanup", parent_cleanup)
+    if leaked:
+        with pytest.raises(ProofCheckError, match="evidence carried a private value"):
+            live_driver.cleanup()
+    else:
+        live_driver.cleanup()
+    path = live_driver.evidence_dir / "personal-enrollment-run.json"
+    document = json.loads(path.read_bytes())
+    assert sentinel not in path.read_text()
+    if leaked:
+        assert document == {"withheld": "evidence carried a private value"}
+    else:
+        assert document["sentinel"] == "public outcome"
+    assert all(not secret.reveal() for secret in live_driver.held())
+
+
+def test_evidence_refuses_an_empty_private_value_list(live_driver: EnrollmentProof) -> None:
+    for secret in live_driver.held():
+        secret.clear()
+    with pytest.raises(ProofCheckError, match="no private values"):
+        live_driver.write_evidence()
 
 
 @pytest.fixture
