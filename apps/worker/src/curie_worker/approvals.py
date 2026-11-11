@@ -199,6 +199,9 @@ class PublicationCreateRequest:
     max_patch_bytes: int = 900_000
     review_origin_key: str | None = None
     route: str | None = None
+    # The route's fixed Slack card channel (ADR 0177 decisions 1 and 2,
+    # #5542). None keeps the card on the reply route.
+    card_channel: str | None = None
     work_item_request_id: uuid.UUID | None = None
     work_item_runtime_epoch: int | None = None
     observed_title: str | None = None
@@ -238,6 +241,8 @@ class PublicationCreateRequest:
             payload["review_origin_key"] = self.review_origin_key
         if self.route is not None:
             payload["route"] = self.route
+        if self.card_channel is not None:
+            payload["card_channel"] = self.card_channel
         if self.work_item_request_id is not None:
             payload["work_item_request_id"] = str(self.work_item_request_id)
         if self.work_item_runtime_epoch is not None:

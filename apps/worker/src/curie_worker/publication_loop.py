@@ -459,11 +459,6 @@ class PublicationReconciler:
                 raise PublicationReconcileError(
                     "publication approval card post returned no durable reply ref"
                 )
-            conversation_id = work.target.conversation_id
-            if conversation_id is None:
-                raise PublicationReconcileError(
-                    "publication approval card has no session conversation"
-                )
             await self._card_store.remember(
                 str(work.approval_id),
                 channel=work.target.address,
