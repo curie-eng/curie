@@ -802,6 +802,25 @@ def test_a_refused_slack_caller_is_logged_at_debug_but_still_counted(
     ]
 
 
+def test_a_refused_direct_message_is_logged_at_info_and_still_counted(
+    config: DispatcherConfig,
+    redis_client: redis.Redis,
+    admission_api: FakeAdmissionApi,
+    refused_metrics: tuple[MeterProvider, InMemoryMetricReader],
+) -> None:
+    # A direct message is one person addressing the agent, so its refusal
+    # cannot flood a shared channel; an operator must see why it went unanswered.
+    admission_api.lists[(DM_CHANNEL, "default")] = {LISTED}
+    harness = _deliver(
+        config, redis_client, _events_api_request("env-dm-info", "Ev-dm-info", _dm())
+    )
+    refusals = [r for r in harness.records if "caller_not_allowed" in r.getMessage()]
+    assert [r.levelno for r in refusals] == [logging.INFO]
+    assert _refused_points(refused_metrics) == [
+        (1, {"service.name": "curie-dispatcher", "reason": "caller_not_allowed"})
+    ]
+
+
 def test_after_a_failed_fetch_nobody_asks_again_until_the_backoff_passes(
     admission_api: FakeAdmissionApi, store: _Store
 ) -> None:
