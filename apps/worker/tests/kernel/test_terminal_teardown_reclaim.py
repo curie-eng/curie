@@ -19,6 +19,11 @@ refusals are proved against Postgres by the API suite.
 The owner's stop is also driven end to end through ``Kernel.process_event``
 (r1-G1): the live owner's re-claim keeps the epoch, so the turn it interrupts
 still finishes as itself, ``not_running``, and settles its delivery.
+
+The thread lock's lease is fenced after the re-claim and after the interrupt
+(r1-C1): a lease that expired while either was in flight, with a peer's real
+``ThreadLock`` holding the key since, stops the teardown before anything more is
+interrupted, deleted or recorded, and the peer's lock is left as it is.
 """
 
 from __future__ import annotations
@@ -27,6 +32,7 @@ import asyncio
 import contextlib
 import json
 import uuid
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from typing import Any
@@ -36,6 +42,7 @@ import pytest
 from aci_protocol import Final, SessionStatus
 from curie_worker.binding import FactoryWake
 from curie_worker.kernel import routing
+from curie_worker.threadlock import ThreadLock
 from curie_worker.workitem_dispatch import (
     WorkItemAcquireGrant,
     WorkItemDispatchClient,
@@ -96,6 +103,9 @@ class TeardownApi:
     records: list[dict[str, Any]] = field(default_factory=list)
     read_gate: asyncio.Event | None = None
     read_entered: asyncio.Event = field(default_factory=asyncio.Event)
+    # Awaited while a claim made under the thread lock is being answered, as a
+    # delayed response would be (r1-C1).
+    on_locked_claim: Callable[[], Awaitable[None]] | None = None
 
     async def __call__(self, request: httpx.Request) -> httpx.Response:
         base = f"/v1/internal/work-items/requests/{self.request_id}"
@@ -137,6 +147,8 @@ class TeardownApi:
             "lock_held": bool(await self.redis.exists(self.lock_key)),
             "interrupts_before": self.runner.interrupts,
         }
+        if seen["lock_held"] and self.on_locked_claim is not None:
+            await self.on_locked_claim()
         eligible = row.status == "cancellation_requested" or (
             row.status in _TERMINAL and row.teardown_pending
         )
@@ -326,6 +338,7 @@ def test_terminate_records_with_the_epoch_and_version_of_its_reclaim(
             )
             assert old.claim_name in record["observation"]
             assert old.claim_name not in h.fake_k8s.claims
+            assert h.fake_k8s.deleted_claims == [old.claim_name]
 
     asyncio.run(go())
 
@@ -441,8 +454,229 @@ def test_owner_stop_records_with_the_epoch_and_version_of_its_reclaim(make_harne
             assert record["runtime_epoch"] == run.runtime_epoch == 3
             assert record["expected_request_version"] == 5
             assert handle.claim_name not in h.fake_k8s.claims
+            assert h.fake_k8s.deleted_claims == [handle.claim_name]
             assert api.row.status == "cancelled"
             assert run.finished is True
+
+    asyncio.run(go())
+
+
+# --- a lease lost mid-teardown stops it (r1-C1) ----------------------------------------
+
+
+async def _peer_takes_the_lock(h: Any, lock_key: str) -> str:
+    """This worker's lease expires and a peer worker's real ``ThreadLock`` acquires the key."""
+
+    await h.async_redis.delete(lock_key)  # the expiry, without waiting out the TTL
+    peer = ThreadLock(
+        h.async_redis,
+        ttl_ms=h.config.lock_ttl_ms,
+        acquire_timeout_s=1.0,
+        poll_interval_s=0.01,
+        owner=PEER,
+    )
+    return await peer.acquire(lock_key)
+
+
+@dataclass
+class _Teardown:
+    """What ``_halt_work_item_runtime`` returned, and every ``terminate_thread`` call."""
+
+    halts: list[object] = field(default_factory=list)
+    terminated: list[str] = field(default_factory=list)
+
+
+def _observe_teardown(h: Any, monkeypatch: pytest.MonkeyPatch) -> _Teardown:
+    seen = _Teardown()
+    halt = h.kernel._halt_work_item_runtime
+    terminate = h.substrate.terminate_thread
+
+    async def observed_halt(*args: Any, **kwargs: Any) -> Any:
+        try:
+            result = await halt(*args, **kwargs)
+        except Exception as exc:
+            seen.halts.append(exc)
+            raise
+        seen.halts.append(result)
+        return result
+
+    def observed_terminate(thread_key: str, **kwargs: Any) -> Any:
+        seen.terminated.append(thread_key)
+        return terminate(thread_key, **kwargs)
+
+    monkeypatch.setattr(h.kernel, "_halt_work_item_runtime", observed_halt)
+    monkeypatch.setattr(h.substrate, "terminate_thread", observed_terminate)
+    return seen
+
+
+async def _raised(teardown: Awaitable[object]) -> Exception | None:
+    """What a teardown entry point raised; callers assert it after its effects."""
+
+    try:
+        await teardown
+    except Exception as exc:  # noqa: BLE001 - the caller asserts it is None
+        return exc
+    return None
+
+
+def _terminal_api(h: Any, request_id: uuid.UUID, lock_key: str, old: Any) -> TeardownApi:
+    return TeardownApi(
+        request_id,
+        _Row(
+            status="failed",
+            runtime_epoch=3,
+            version=5,
+            teardown_pending=True,
+            claim_name=old.claim_name,
+            sandbox_name=old.sandbox_name,
+        ),
+        h.async_redis,
+        lock_key,
+        h.runner,
+    )
+
+
+def test_terminate_whose_lock_is_lost_during_its_reclaim_stops_nothing(
+    make_harness: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The re-claim is granted only after the lease expired and a peer took the lock."""
+
+    async def go() -> None:
+        async with _harness(make_harness) as h:
+            request_id = uuid.uuid4()
+            terminate = _turn(f"work-item-{request_id}-terminate", "terminate")
+            thread_key = routing._thread_key_for(terminate)
+            lock_key = h.config.lock_key(thread_key)
+            old = await _claim_thread(h, thread_key)
+            api = _terminal_api(h, request_id, lock_key, old)
+            peer_tokens: list[str] = []
+
+            async def lose_the_lock() -> None:
+                peer_tokens.append(await _peer_takes_the_lock(h, lock_key))
+
+            api.on_locked_claim = lose_the_lock
+            seen = _observe_teardown(h, monkeypatch)
+            async with httpx.AsyncClient(transport=httpx.MockTransport(api)) as http:
+                h.kernel._work_items = _client(http)
+                raised = await _raised(h.kernel.process_event(terminate))
+
+            assert [(c["outcome"], c["lock_held"]) for c in api.claims] == [
+                ("claimed", False),
+                ("claimed", True),
+            ]
+            assert h.runner.interrupts == 0
+            assert seen.terminated == []
+            assert old.claim_name in h.fake_k8s.claims
+            assert old.claim_name not in h.fake_k8s.deleted_claims
+            assert api.records == []
+            assert seen.halts == [None]
+            [peer_token] = peer_tokens
+            assert await h.async_redis.get(lock_key) == peer_token
+            assert raised is None
+
+    asyncio.run(go())
+
+
+def test_owner_stop_whose_lock_is_lost_during_its_reclaim_stops_nothing(
+    make_harness: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The heartbeat's stop: the same loss during its only re-claim."""
+
+    async def go() -> None:
+        async with _harness(make_harness) as h:
+            thread_key = f"teardown-{uuid.uuid4().hex}"
+            lock_key = h.config.lock_key(thread_key)
+            api = TeardownApi(
+                uuid.uuid4(),
+                _Row(
+                    status="cancellation_requested",
+                    runtime_epoch=3,
+                    version=5,
+                    teardown_pending=False,
+                    claim_name=None,
+                    sandbox_name=None,
+                    runtime_owner=OWNER,
+                    lease_live=True,
+                ),
+                h.async_redis,
+                lock_key,
+                h.runner,
+            )
+            peer_tokens: list[str] = []
+
+            async def lose_the_lock() -> None:
+                peer_tokens.append(await _peer_takes_the_lock(h, lock_key))
+
+            api.on_locked_claim = lose_the_lock
+            seen = _observe_teardown(h, monkeypatch)
+            async with httpx.AsyncClient(transport=httpx.MockTransport(api)) as http:
+                h.kernel._work_items = _client(http)
+                run, handle = await _owned_run(h, api, http, thread_key)
+                try:
+                    raised = await _raised(h.kernel._stop_owned_work_item(thread_key, run))
+                finally:
+                    await run.close()
+
+            assert [(c["owner"], c["outcome"], c["lock_held"]) for c in api.claims] == [
+                (OWNER, "claimed", True)
+            ]
+            assert h.runner.interrupts == 0
+            assert seen.terminated == []
+            assert handle.claim_name in h.fake_k8s.claims
+            assert handle.claim_name not in h.fake_k8s.deleted_claims
+            assert api.records == []
+            assert run.finished is False
+            assert seen.halts == [None]
+            [peer_token] = peer_tokens
+            assert await h.async_redis.get(lock_key) == peer_token
+            assert raised is None
+
+    asyncio.run(go())
+
+
+def test_terminate_whose_lock_is_lost_during_its_interrupt_deletes_and_records_nothing(
+    make_harness: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The lease is held through the re-claim and lost while the interrupt runs."""
+
+    async def go() -> None:
+        async with _harness(make_harness) as h:
+            request_id = uuid.uuid4()
+            terminate = _turn(f"work-item-{request_id}-terminate", "terminate")
+            thread_key = routing._thread_key_for(terminate)
+            lock_key = h.config.lock_key(thread_key)
+            old = await _claim_thread(h, thread_key)
+            api = _terminal_api(h, request_id, lock_key, old)
+            peer_tokens: list[str] = []
+            interrupt = h.kernel.interrupt_thread
+
+            async def interrupt_and_lose_the_lock(
+                interrupted: str, reason: str, **kwargs: Any
+            ) -> bool:
+                signalled = await interrupt(interrupted, reason, **kwargs)
+                peer_tokens.append(await _peer_takes_the_lock(h, lock_key))
+                return bool(signalled)
+
+            monkeypatch.setattr(h.kernel, "interrupt_thread", interrupt_and_lose_the_lock)
+            seen = _observe_teardown(h, monkeypatch)
+            async with httpx.AsyncClient(transport=httpx.MockTransport(api)) as http:
+                h.kernel._work_items = _client(http)
+                raised = await _raised(h.kernel.process_event(terminate))
+
+            assert [(c["outcome"], c["lock_held"]) for c in api.claims] == [
+                ("claimed", False),
+                ("claimed", True),
+            ]
+            # The interrupt went out while the lease was still held.
+            assert h.runner.interrupts == 1
+            assert seen.terminated == []
+            assert old.claim_name in h.fake_k8s.claims
+            assert old.claim_name not in h.fake_k8s.deleted_claims
+            assert api.records == []
+            assert seen.halts == [None]
+            [peer_token] = peer_tokens
+            assert await h.async_redis.get(lock_key) == peer_token
+            assert raised is None
 
     asyncio.run(go())
 

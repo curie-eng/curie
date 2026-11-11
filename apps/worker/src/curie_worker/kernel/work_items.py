@@ -975,42 +975,61 @@ async def _halt_work_item_runtime(
     this request's termination. A claimant that stalled past its lease while a
     peer tore the runtime down and a successor took the thread is refused here:
     it interrupts nothing, deletes nothing and records nothing. The record names
-    the re-claim's epoch and request version. None when the re-claim is refused
-    or absence was not observed.
+    the re-claim's epoch and request version.
+
+    The thread lock's renewer only marks a lost lease, so the lease is fenced
+    after the re-claim answers and again after the interrupt, before
+    ``terminate_thread`` deletes anything. A lease that expired while the
+    re-claim or the interrupt was in flight may already belong to a peer that
+    started a successor runtime on the thread; on ``LockLeaseLost`` nothing more
+    is interrupted, nothing is deleted and None is returned, so nothing is
+    recorded. None also when the re-claim is refused or absence was not observed.
     """
 
     assert self._work_items is not None
-    async with self._lock.hold(self._config.lock_key(thread_key)):
-        try:
-            claimed = await self._work_items.claim_termination(
-                request_id, owner=self._config.consumer_name
-            )
-        except (WorkItemConflict, WorkItemTransportError) as exc:
-            logger.info(
-                "work-item %s teardown re-claim refused (%s); leaving thread %s",
-                request_id,
-                exc.code if isinstance(exc, WorkItemConflict) else type(exc).__name__,
+    try:
+        async with self._lock.hold(self._config.lock_key(thread_key)) as lease:
+            try:
+                claimed = await self._work_items.claim_termination(
+                    request_id, owner=self._config.consumer_name
+                )
+            except (WorkItemConflict, WorkItemTransportError) as exc:
+                logger.info(
+                    "work-item %s teardown re-claim refused (%s); leaving thread %s",
+                    request_id,
+                    exc.code if isinstance(exc, WorkItemConflict) else type(exc).__name__,
+                    thread_key,
+                )
+                return None
+            # Both fences stay outside the interrupt's broad catch: LockLeaseLost
+            # is a TimeoutError, and that handler would swallow it.
+            await lease.ensure_owned()
+            try:
+                await asyncio.wait_for(
+                    self.interrupt_thread(thread_key, "work-item termination"),
+                    constants._RESET_INTERRUPT_TIMEOUT_S,
+                )
+            except Exception:  # noqa: BLE001 - broad catch kept at a failure boundary
+                logger.warning(
+                    "work-item interrupt did not land for thread %s; terminating anyway",
+                    thread_key,
+                    exc_info=True,
+                )
+            await lease.ensure_owned()
+            observation = await asyncio.to_thread(
+                self._substrate.terminate_thread,
                 thread_key,
+                claim_name=claim_name,
+                sandbox_name=sandbox_name,
+                observer=self._config.consumer_name,
             )
-            return None
-        try:
-            await asyncio.wait_for(
-                self.interrupt_thread(thread_key, "work-item termination"),
-                constants._RESET_INTERRUPT_TIMEOUT_S,
-            )
-        except Exception:  # noqa: BLE001 - broad catch kept at a failure boundary
-            logger.warning(
-                "work-item interrupt did not land for thread %s; terminating anyway",
-                thread_key,
-                exc_info=True,
-            )
-        observation = await asyncio.to_thread(
-            self._substrate.terminate_thread,
+    except LockLeaseLost:
+        logger.warning(
+            "work-item %s teardown lost thread %s's lock; deleting and recording nothing",
+            request_id,
             thread_key,
-            claim_name=claim_name,
-            sandbox_name=sandbox_name,
-            observer=self._config.consumer_name,
         )
+        return None
     return None if observation is None else (observation, claimed)
 
 
