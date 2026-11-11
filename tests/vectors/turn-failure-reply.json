@@ -1,6 +1,7 @@
 {
-  "comment": "The machine-readable marker on a delivered reply when a runner turn fails (#3401). The worker prefixes the channel reply. The factory status comment carries the same class on its own line. The CLI refuses to grade a reply that starts with the marker as a successful task reply. Python and Rust cannot share the literal, so it is frozen here. An unknown top-level key is rejected.",
+  "comment": "The machine-readable marker on a delivered reply when a runner turn fails (#3401). The worker prefixes the channel reply. The factory status comment carries the same class on its own line. The CLI refuses to grade a reply that starts with the marker as a successful task reply. Python and Rust cannot share the literal, so it is frozen here. An unknown top-level key is rejected. identity_refused_class is the class the worker writes on the cluster message relay when it refuses a turn for lack of an HTTP identity (#5518); the CLI eval stops on it.",
   "reply_prefix": "curie-turn-failure:",
+  "identity_refused_class": "identity-refused",
   "factory_class_line_prefix": "Failure class:",
   "examples": [
     {
