@@ -46,7 +46,7 @@ from curie_runner.session import SessionRunner
 from curie_runner.side_effects import SideEffectClassifier
 from curie_runner.startup_diagnostics import StderrTail
 from curie_runner.subprocess_env import lock_process_environ, proc_dumpable_library
-from curie_telemetry.redact import RedactingLogFilter
+from curie_telemetry.redact import RedactingLogFilter, register_held_secrets
 from personal_auth_support import (
     BUNDLED_CLI,
     IMPLEMENTER_MODEL,
@@ -942,6 +942,37 @@ def test_redaction_through_native_cli_http_aci_and_exported_spans(
         assert public_reply_observed
         assert public_export_observed
         assert redacted_export_observed
+
+
+@pytest.mark.parametrize("boundary", ("finish", "discard"))
+def test_redaction_keeps_overlapping_held_prefixes_protected(boundary: str) -> None:
+    prefix = "overlap-"
+    first = "outer-" + prefix + "alpha-credential-fixture"
+    actual = prefix + "beta-credential-fixture"
+    register_held_secrets((first, actual))
+    forwarded: list[str] = []
+    tail = StderrTail(forwarded.append, partial_line_chars=1024)
+    tail.start()
+    tail("p" * 1024 + "outer-" + prefix)
+
+    getattr(tail, boundary)()
+    tail(actual[len(prefix):] + " " + PUBLIC_MARKER)
+    tail("Loading tools")
+    tail("MCP server ready")
+
+    raw = "\n".join(forwarded)
+    assert first not in raw
+    assert actual not in raw
+    assert "outer-" + prefix not in raw
+    assert prefix not in raw
+    assert actual[len(prefix):] not in raw
+    assert forwarded == [
+        "p" * 1024,
+        *(["[REDACTED:held_secret]"] if boundary == "finish" else []),
+        "[REDACTED:held_secret] " + PUBLIC_MARKER,
+        "Loading tools",
+        "MCP server ready",
+    ]
 
 
 @pytest.mark.parametrize("boundary", ("finish", "discard"))

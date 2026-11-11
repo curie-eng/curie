@@ -130,9 +130,10 @@ class StderrTail:
         # A capture boundary can bisect a physical SDK line. Keep references
         # and offsets into held literals, never the raw pending prefix.
         self._continuations = tuple(
-            (literal, len(self._pending))
+            (literal, size)
             for literal in held_secret_literals(registered_held_secrets())
-            if literal.startswith(self._pending)
+            for size in range(1, min(len(self._pending), len(literal) - 1) + 1)
+            if self._pending.endswith(literal[:size])
         )
         self._pending = ""
         return True
