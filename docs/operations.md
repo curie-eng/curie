@@ -36,7 +36,7 @@ pod; if `cluster message` can't auto-detect a pod-reachable host, pass
   which does not require x86 AVX. It still checks AVX on x86 and rejects
   unsupported architectures. Older released charts check only the x86 flag
   and can reject a valid ARM64 node. For that specific failure, use the
-  [factory ARM recovery](guides/dark-factory-quickstart.md#apple-silicon-recovery-for-older-charts)
+  [factory ARM recovery](guides/factory-quickstart-reference.md#apple-silicon-recovery-for-older-charts)
   with the same trial kubeconfig and explicit context. Do not disable the check
   on an x86 node or downgrade ClickHouse independently of Langfuse: older
   SSE4.2-safe tags cannot apply the current migration set.

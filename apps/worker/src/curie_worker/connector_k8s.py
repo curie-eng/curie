@@ -64,9 +64,9 @@ class UnsupportedKind(ValueError):
 
 def _load_cluster_config(kubeconfig: str | None) -> None:
     try:
-        k8s_config.load_incluster_config()
+        k8s_config.load_incluster_config()  # type: ignore[no-untyped-call]
     except k8s_config.ConfigException:
-        k8s_config.load_kube_config(config_file=kubeconfig)
+        k8s_config.load_kube_config(config_file=kubeconfig)  # type: ignore[no-untyped-call]
 
 
 def connector_deployments_api(*, kubeconfig: str | None = None) -> k8s_client.AppsV1Api:

@@ -32,7 +32,7 @@ bot user's personal access token. A self-managed server can also use a service
 account, project access token or group access token. Record its expiry and
 plan to replace it before expiration. Curie never mints or rotates static
 tokens; replace it as described in
-[Replace a static token](dark-factory-quickstart.md#replace-a-static-token).
+[Replace a static token](factory-quickstart-reference.md#replace-a-static-token).
 
 Save the token in a local file outside the repository using your editor. Do not
 put it in a command, commit or chat. Quickstart reads the file into a Kubernetes
@@ -66,7 +66,7 @@ with a trailing newline works. A token with a line break or other control
 character inside it is refused at startup, naming the entry and the file.
 
 The URL is the web base, including any self-managed sub-path. For a private
-certificate, also follow [custom CA configuration](dark-factory-quickstart.md#self-managed-servers)
+certificate, also follow [custom CA configuration](factory-quickstart-reference.md#self-managed-servers)
 and add the same `--ca-file` to every quickstart invocation below.
 
 Enter a real Anthropic or OpenRouter API key silently:

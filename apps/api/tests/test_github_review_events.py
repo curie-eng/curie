@@ -1561,6 +1561,7 @@ def test_real_review_consumer_waits_for_active_turn_and_revalidates_before_new_t
     review_stack,
     tmp_path,
     permission_case,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Actual API/DB/Valkey/consumer/RunnerClient; GitHub and ACI peer are fixtures.
 
@@ -1784,6 +1785,39 @@ def test_real_review_consumer_waits_for_active_turn_and_revalidates_before_new_t
                             while entry_id in consumer._inflight_ids:
                                 await asyncio.sleep(0.01)
 
+                    start_release = asyncio.Event()
+                    start_finished = asyncio.Event()
+                    if permission_case == "bad_login":
+                        # Complete the first start after the follow-up reads its
+                        # predecessor, before it inspects the local order lock.
+                        finish_order = consumer._waits.finish_order
+                        has_predecessor = consumer._waits.has_predecessor
+
+                        async def finish_first_start(*args, **kwargs):
+                            first_start = args[1] == original.event_id and kwargs["started"]
+                            if first_start:
+                                await start_release.wait()
+                            result = await finish_order(*args, **kwargs)
+                            if first_start:
+                                start_finished.set()
+                            return result
+
+                        async def release_start_after_predecessor_read(*args, **kwargs):
+                            blocked = await has_predecessor(*args, **kwargs)
+                            if args[1] != original.event_id and not start_release.is_set():
+                                assert blocked
+                                start_release.set()
+                                async with asyncio.timeout(10):
+                                    await start_finished.wait()
+                            return blocked
+
+                        monkeypatch.setattr(consumer._waits, "finish_order", finish_first_start)
+                        monkeypatch.setattr(
+                            consumer._waits,
+                            "has_predecessor",
+                            release_start_after_predecessor_read,
+                        )
+
                     try:
                         await h.async_redis.xadd(stream, to_stream_fields(original))
                         first_id, _ = await dispatch_new()
@@ -1957,6 +1991,7 @@ def test_real_review_consumer_waits_for_active_turn_and_revalidates_before_new_t
                         reconciler = client.app.state.github_review_reconciler
                         assert await reconciler.reconcile_terminal() == 1
                     finally:
+                        start_release.set()
                         hold.set()
                         await asyncio.gather(*list(consumer._inflight), return_exceptions=True)
                         await asyncio.to_thread(remove_reservation_fault)

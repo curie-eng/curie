@@ -47,6 +47,13 @@ class _JsonFormatter(logging.Formatter):
         }
         if record.exc_info is not None:
             payload["exception"] = redact_text(self.formatException(record.exc_info))
+            exception_type = record.exc_info[0]
+            if exception_type is not None:
+                # The same class-name token the OTLP path exports, so a stderr
+                # recovery parser sees the type without the traceback or message.
+                payload["exception.type"] = _bounded(
+                    exception_type.__name__, _MAX_OTLP_ATTRIBUTE_LENGTH
+                )
         return json.dumps(payload, separators=(",", ":"), sort_keys=True)
 
 
