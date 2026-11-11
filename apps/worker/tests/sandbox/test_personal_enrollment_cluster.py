@@ -342,6 +342,9 @@ def live_driver(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> EnrollmentPr
     proof.headers_seen["restored"] = {"version": 3}
     monkeypatch.setattr(proof, "forward", lambda _: contextlib.nullcontext(1234))
     monkeypatch.setattr(proof, "observe_files", lambda _: {})
+    monkeypatch.setattr(proof, "snapshot_replay", lambda _: None)
+    monkeypatch.setattr(proof, "retain_transcript", lambda *args, **kwargs: None)
+    monkeypatch.setattr(support, "live_transcript_identity", lambda _: ({"new"}, {support.MODEL}))
     monkeypatch.setattr(proof, "capture_pod", lambda _: None)
     monkeypatch.setattr(proof, "account", lambda *args, **kwargs: {})
     return proof
@@ -497,6 +500,32 @@ def test_evidence_refuses_an_empty_private_value_list(live_driver: EnrollmentPro
         secret.clear()
     with pytest.raises(ProofCheckError, match="no private values"):
         live_driver.write_evidence()
+
+
+@pytest.mark.parametrize("leaked", [False, True])
+def test_retained_transcript_metadata_is_covered_by_the_secret_audit(
+    live_driver: EnrollmentProof, leaked: bool,
+) -> None:
+    sentinel = live_driver.grant.reveal()
+    live_driver.evidence["transcript_entries"] = [{
+        "session": 1, "step": "a", "turn": 1,
+        "entries": [{"index": 0, "turn": 1, "provenance": "new-response",
+                     "model": sentinel if leaked else support.MODEL,
+                     "usage": {"output_tokens": 3}}],
+    }]
+    if leaked:
+        with pytest.raises(ProofCheckError, match="evidence carried a private value"):
+            live_driver.write_evidence()
+    else:
+        live_driver.write_evidence()
+    path = live_driver.evidence_dir / "personal-enrollment-transcript.json"
+    assert stat.S_IMODE(path.stat().st_mode) == 0o600
+    assert sentinel not in path.read_text()
+    document = json.loads(path.read_text())
+    if leaked:
+        assert document == {"withheld": "evidence carried a private value"}
+    else:
+        assert document["observations"] == live_driver.evidence["transcript_entries"]
 
 
 def test_missing_grant_control_keeps_service_material_out_of_the_runner(

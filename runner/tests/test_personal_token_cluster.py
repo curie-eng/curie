@@ -13,6 +13,7 @@ from __future__ import annotations
 import json
 import os
 from collections.abc import Iterator
+from dataclasses import replace
 from pathlib import Path
 
 import anyio
@@ -26,6 +27,7 @@ from personal_token_cluster_support import (
     live_observations,
     live_transcript_identity,
     native_transcript_records,
+    transcript_entry_metadata,
     validate_inputs,
 )
 
@@ -161,6 +163,126 @@ def test_live_transcript_identity_retains_wrong_model_refusal() -> None:
     files[path] += b"\n" + json.dumps(record("claude-wrong", "wrong")).encode()
     with pytest.raises(ProofCheckError, match="unexpected model"):
         live_transcript_identity(native_transcript_records(files))
+
+
+@pytest.mark.parametrize("mutation", [None, "seeded-content", "new-model"])
+def test_native_replay_identity_requires_seed_provenance(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, mutation: str | None,
+) -> None:
+    from aci_protocol import Event
+    from curie_runner.adapter import ClaudeAgentSession, build_structured_resume
+    from curie_runner.history import ConversationMessage
+    from curie_runner.otel import RunTracer
+    from curie_runner.session import SessionRunner
+    from curie_runner.side_effects import SideEffectClassifier
+    from personal_auth_support import (
+        OWNER_GRANT,
+        TURN_TIMEOUT_S,
+        TextReply,
+        installed,
+        wire_session,
+    )
+
+    with installed(tmp_path, monkeypatch, lambda _: TextReply("public response")) as installation:
+        monkeypatch.setenv("CURIE_MODEL_AUTH_MODE", "personal")
+        monkeypatch.setenv("CLAUDE_CODE_OAUTH_TOKEN", OWNER_GRANT)
+        wiring = wire_session(installation, reviewer_model=MODEL, implementer_model=MODEL)
+        resume = build_structured_resume(
+            (
+                ConversationMessage(role="user", content="Earlier request"),
+                ConversationMessage(role="assistant", content="Earlier answer",
+                                    assistant_group="a" * 64),
+            ),
+            curie_session_id="replay-provenance-control", cwd=str(installation.workspace),
+        )
+        session = ClaudeAgentSession(replace(
+            wiring.options, resume=resume.resume, session_id=None,
+            session_store=resume.session_store, session_store_flush="eager",
+        ))
+        runner = SessionRunner(
+            held_secrets=frozenset({OWNER_GRANT}), session_factory=lambda: session,
+            ceiling=0, max_usd_per_day=None, tracer=RunTracer(None),
+            classifier=SideEffectClassifier(), trace_name="curie-run:replay-provenance",
+            session_id="session-PLACEHOLDER", model=MODEL, tool_access=wiring.access,
+        )
+
+        async def scenario():
+            assert resume.session_store is not None
+            seeds = await resume.session_store.load(resume.session_key)
+            assert seeds
+            try:
+                with anyio.fail_after(TURN_TIMEOUT_S):
+                    await runner.start()
+                    async for _line in runner.run_turn(Event(
+                        type="message", text="Return the public response.",
+                        user="U0EXAMPLE1", ts="1",
+                    )):
+                        pass
+                    assert session._personal_config is not None
+                    entries = await resume.session_store.load(resume.session_key)
+                    assert entries
+                    observed = native_transcript_records({
+                        "/home/runner/.claude/projects/replay.jsonl": b"\n".join(
+                            json.dumps(entry).encode() for entry in entries
+                        ),
+                    })
+                    observed["seeded_records"] = seeds
+                    return observed
+            finally:
+                await runner.close()
+
+        observed = anyio.run(scenario)
+        seeded, generated = observed["assistant_messages"]
+        # Observed with the pinned native CLI: portable replay has neither
+        # provider model nor usage, while the new fake-provider response has both.
+        assert "model" not in seeded["message"] and "usage" not in seeded["message"]
+        assert generated["message"]["model"] == MODEL
+        assert {
+            r.body["model"] for r in installation.proxy.requests if "model" in r.body
+        } == {MODEL}
+        if mutation == "seeded-content":
+            seeded["message"]["content"] = "Changed history"
+            with pytest.raises(ProofCheckError, match="seeded transcript record changed"):
+                live_transcript_identity(observed)
+        elif mutation == "new-model":
+            generated["message"].pop("model")
+            with pytest.raises(ProofCheckError, match="unexpected model"):
+                live_transcript_identity(observed)
+        else:
+            assert live_transcript_identity(observed) == ({generated["message"]["id"]}, {MODEL})
+
+
+def test_missing_model_requires_the_exact_seeded_record() -> None:
+    seed = {"type": "assistant", "uuid": "prior", "message": {"id": "old", "content": "old"}}
+    response = {"type": "assistant", "uuid": "new", "message": {"id": "new", "model": MODEL}}
+    observed = {"messages": [seed, response], "assistant_messages": [seed, response]}
+    with pytest.raises(ProofCheckError, match="unexpected model"):
+        live_transcript_identity(observed)
+    observed["seeded_records"] = [{**seed, "uuid": "another"}]
+    with pytest.raises(ProofCheckError, match="unexpected model"):
+        live_transcript_identity(observed)
+
+
+def test_transcript_metadata_keeps_only_identity_usage_and_turn() -> None:
+    seed = {"type": "assistant", "uuid": "prior", "message": {"content": "private history"}}
+    response = {"type": "assistant", "uuid": "new", "message": {
+        "model": MODEL, "content": "private response",
+        "usage": {"input_tokens": 2, "output_tokens": 3, "private": "private usage"},
+    }}
+    observed = {"messages": [seed, response], "seeded_records": [seed]}
+    first = transcript_entry_metadata(observed, turn=1)
+    assert first == [
+        {"index": 0, "record_type": "assistant", "turn": 0, "provenance": "seeded",
+         "model": None, "usage": None},
+        {"index": 1, "record_type": "assistant", "turn": 1,
+         "provenance": "new-response", "model": MODEL,
+         "usage": {"input_tokens": 2, "output_tokens": 3}},
+    ]
+    observed["messages"].append({"type": "assistant", "uuid": "next", "message": {}})
+    second = transcript_entry_metadata(observed, turn=2, prior=first)
+    assert second[:2] == first and second[-1]["turn"] == 2
+    assert second[-1]["model"] is None and second[-1]["provenance"] == "new-response"
+    assert "private" not in json.dumps(second)
 
 
 def test_diagnostic_retry_preserves_unknown_reservation_and_stops_at_two_sessions(

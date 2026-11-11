@@ -361,7 +361,12 @@ def native_transcript_records(files: Mapping[str, bytes]) -> dict[str, Any]:
 def live_transcript_identity(observed: Mapping[str, Any]) -> tuple[set[str], set[str]]:
     from test_personal_claude_live import _same_model
 
-    assistants = observed["assistant_messages"]
+    for item in observed.get("messages", ()):
+        seeded_transcript_record(item, observed.get("seeded_records", ()))
+    assistants = [
+        item for item in observed["assistant_messages"]
+        if not seeded_transcript_record(item, observed.get("seeded_records", ()))
+    ]
     unique = {item.get("message", {}).get("id") for item in assistants}
     require(
         None not in unique and bool(unique), "native transcript did not identify assistant turns"
@@ -372,6 +377,60 @@ def live_transcript_identity(observed: Mapping[str, Any]) -> tuple[set[str], set
         "live transcript used an unexpected model",
     )
     return unique, models
+
+
+def seeded_transcript_record(
+    record: Mapping[str, Any], seeds: Sequence[Mapping[str, Any]],
+) -> bool:
+    matches = [seed for seed in seeds if seed.get("uuid") == record.get("uuid")]
+    if not matches or record.get("uuid") is None:
+        return False
+    require(any(record == seed for seed in matches), "seeded transcript record changed")
+    return True
+
+
+def transcript_entry_metadata(
+    observed: Mapping[str, Any], *, turn: int,
+    prior: Sequence[Mapping[str, Any]] = (),
+) -> list[dict[str, Any]]:
+    counts = (
+        "input_tokens", "output_tokens", "cache_creation_input_tokens", "cache_read_input_tokens",
+    )
+    retained = []
+    previous = {item["index"]: item for item in prior}
+    for index, record in enumerate(observed["messages"]):
+        seeds = observed.get("seeded_records", ())
+        matched = any(seed.get("uuid") == record.get("uuid") for seed in seeds)
+        unchanged = matched and any(record == seed for seed in seeds)
+        message = record.get("message", {})
+        usage = message.get("usage")
+        usage_counts = None
+        if isinstance(usage, dict):
+            usage_counts = {key: usage[key] for key in counts
+                            if type(usage.get(key)) is int and usage[key] >= 0}
+            for group, names in (
+                ("output_tokens_details", ("thinking_tokens",)),
+                ("server_tool_use", ("web_search_requests", "web_fetch_requests")),
+                ("cache_creation", ("ephemeral_1h_input_tokens", "ephemeral_5m_input_tokens")),
+            ):
+                nested = usage.get(group)
+                if isinstance(nested, dict):
+                    usage_counts[group] = {
+                        key: nested[key] for key in names
+                        if type(nested.get(key)) is int and nested[key] >= 0
+                    }
+        entry = {
+            "index": index,
+            "record_type": record.get("type")
+            if record.get("type") in {"user", "assistant", "system", "progress"} else "other",
+            "turn": 0 if matched else previous.get(index, {}).get("turn", turn),
+            "provenance": ("seeded" if unchanged else "changed-seed") if matched
+            else "new-response",
+            "model": message.get("model") if isinstance(message.get("model"), str) else None,
+            "usage": usage_counts,
+        }
+        retained.append(entry)
+    return retained
 
 
 def live_observations(

@@ -80,6 +80,8 @@ from personal_token_cluster_support import (  # noqa: E402
     require,
     scrubbed_env,
     secret_env,
+    seeded_transcript_record,
+    transcript_entry_metadata,
     value_env,
 )
 
@@ -144,6 +146,35 @@ store = StateApiTranscriptStore(env["CURIE_HISTORY_REF"], env.get("CURIE_HISTORY
 records = asyncio.run(store.load())
 text = [str(getattr(r, "user", "")) + " " + str(getattr(r, "assistant", "")) for r in records]
 print(json.dumps({"records": len(records), "found": any(sys.argv[1] in t for t in text)}))
+"""
+
+_REPLAY_SEED_READ = """\
+import asyncio, json, os
+from pathlib import Path
+from curie_runner.adapter import build_structured_resume
+from curie_runner.config import RunnerConfig
+from curie_runner.history import (
+    DEFAULT_REPLAY_MAX_BYTES, DEFAULT_REPLAY_MAX_TURNS,
+    build_conversation_replay, resolve_history,
+)
+async def read():
+    config = RunnerConfig.from_env(os.environ)
+    records = await resolve_history(config.history_ref, os.environ).load()
+    replay, summary = build_conversation_replay(
+        records,
+        max_turns=config.history_max_turns or DEFAULT_REPLAY_MAX_TURNS,
+        max_bytes=config.history_max_bytes or DEFAULT_REPLAY_MAX_BYTES,
+    )
+    assert summary is None, "proof history unexpectedly requires compaction"
+    cwd = "/workspace" if Path("/workspace/.git").exists() else None
+    envelope = build_structured_resume(
+        replay.messages, curie_session_id=config.session.session_id, cwd=cwd,
+    )
+    seeds = await envelope.session_store.load(envelope.session_key) or []
+    if replay.harness_replay is not None:
+        seeds.extend(replay.harness_replay.entries)
+    print(json.dumps(seeds))
+asyncio.run(read())
 """
 
 
@@ -508,6 +539,8 @@ class EnrollmentProof(ClusterProof):
         self.session_tokens: list[HeldSecret] = []
         self.private_dir = ""
         self.retained_dir: Path | None = None
+        self.replay_seeds: dict[str, list[dict[str, Any]]] = {}
+        self.transcript_metadata: dict[str, list[dict[str, Any]]] = {}
         self.containers: list[str] = []
         self.container_volumes: list[str] = []
         self.ports: dict[str, int] = {}
@@ -1455,6 +1488,7 @@ class EnrollmentProof(ClusterProof):
         self.check("AC2", f"generation {generation} grant only in its per-claim Secret", True,
                    stored == launched.grant.reveal().encode())
         self.assert_service_isolated(launched.pod, tokens.data or {})
+        self.snapshot_replay(launched.pod)
         self.check("AC5", f"generation {generation} request running under the driver",
                    "running", self.request_row(request_id)["status"])
         self.start_worker()
@@ -1668,6 +1702,7 @@ class EnrollmentProof(ClusterProof):
         by_id = {
             record.get("message", {}).get("id"): record
             for record in observed["assistant_messages"]
+            if not seeded_transcript_record(record, observed.get("seeded_records", ()))
         }
         native = sum(
             int((record.get("message", {}).get("usage") or {}).get("output_tokens", 0))
@@ -1686,6 +1721,24 @@ class EnrollmentProof(ClusterProof):
         self.evidence["sessions"].append(record)
         return record
 
+    def snapshot_replay(self, pod: str) -> None:
+        self.replay_seeds[pod] = json.loads(self.exec(
+            pod, "python3", "-c", _REPLAY_SEED_READ, retain_output=False,
+        ))
+
+    def retain_transcript(
+        self, pod: str, observed: dict[str, Any], *, sequence: int, name: str, turn: int,
+    ) -> None:
+        observed["seeded_records"] = self.replay_seeds[pod]
+        entries = transcript_entry_metadata(
+            observed, turn=turn, prior=self.transcript_metadata.get(pod, ()),
+        )
+        self.transcript_metadata[pod] = entries
+        self.evidence.setdefault("transcript_entries", []).append({
+            "session": sequence, "step": name, "turn": turn, "entries": entries,
+        })
+        self.write_evidence()
+
     def live_session(
         self, launched: Launched, name: str, prompts: Sequence[str], *, expect: str
     ) -> list[dict[str, Any]]:
@@ -1700,14 +1753,17 @@ class EnrollmentProof(ClusterProof):
             require(allowance == remaining, "live allowance changed before session admission")
             started = time.monotonic()
             with self.session_deadline(launched.pod, launched.runner_token, port) as deadline:
-                for prompt in prompts:
+                for turn_number, prompt in enumerate(prompts, 1):
                     turn, _raw, _elapsed, ended = self.stream(
                         port, launched.runner_token, prompt, deadline=deadline,
                     )
                     events += turn
+                    observed = self.observe_files(launched.pod)
+                    self.retain_transcript(
+                        launched.pod, observed, sequence=sequence, name=name, turn=turn_number,
+                    )
                     require(not ended, "a live turn ended without a final; no paid retry")
         elapsed = time.monotonic() - started
-        observed = self.observe_files(launched.pod)
         self.account(sequence, launched, events, observed, elapsed, allowance=allowance, name=name)
         finals = [event for event in events if event.get("type") == "final"]
         self.check("AC5", f"session {sequence} final status", expect,
@@ -1990,6 +2046,10 @@ class EnrollmentProof(ClusterProof):
                     deadline=deadline,
                 )
                 require(not ended, "session 3's first turn ended without a final; no paid retry")
+                observed = self.observe_files(self.s3.pod)
+                self.retain_transcript(
+                    self.s3.pod, observed, sequence=sequence, name="c-d", turn=1,
+                )
                 final = next(event for event in first if event.get("type") == "final")
                 self.check("AC5", "session 3 answers marker M from the rehydrated transcript",
                            [True, "done"],
@@ -2024,6 +2084,9 @@ class EnrollmentProof(ClusterProof):
                     )
                     require(ran_tool, "session 3's second turn ended before running its tool")
                     observed = self.observe_files(self.s3.pod)
+                    self.retain_transcript(
+                        self.s3.pod, observed, sequence=sequence, name="c-d", turn=2,
+                    )
                     self.capture_pod(self.s3.pod)
                     self.check(
                         "AC5", "session 3's second turn is active when disconnect begins", True,
@@ -2046,6 +2109,7 @@ class EnrollmentProof(ClusterProof):
                 )
         self.account(sequence, self.s3, [*first, *second], observed,
                      time.monotonic() - started, allowance=allowance, name="c-d")
+        live_transcript_identity(observed)
         return disconnected
 
     def step_e(self) -> None:
@@ -2343,6 +2407,9 @@ class EnrollmentProof(ClusterProof):
         documents = {name.lower(): {**common, **body} for name, body in self.ac.items()}
         documents["ac5"]["sessions"] = self.evidence.get("sessions")
         documents["ac5"]["steps"] = self.evidence.get("steps")
+        documents["transcript"] = {
+            **common, "observations": self.evidence.get("transcript_entries", []),
+        }
         documents["run"] = self.evidence
         withheld = False
         for name, document in documents.items():
