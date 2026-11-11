@@ -104,7 +104,10 @@ $P judge --criterion all --candidate $SHA --state-dir $STATE_DIR --run-id acme-r
    `--output-token-ceiling N` (on `preflight` and `run`) holds one run below
    the approved total output tokens; it can only lower the ceiling, is recorded
    before the first reservation, and bounds reservations, the overrun check and
-   `judge --criterion budget`. A second `run` with the same run ID refuses with
+   `judge --criterion budget`. `--item-output-tokens-spent N` (on `run`) gives
+   what the item's earlier live runs actually spent; the watchdog then stops
+   paid work when that plus this run's observed output reaches the approved
+   32,768, and the budget judge checks the same total. A second `run` with the same run ID refuses with
    `paid_retry_refused`; there is no retry flag. Immediately before the first
    reservation, `run` makes the same probe. A failed probe fails the run
    before any attempt is reserved. Its cost is recorded under `grant_probe` in

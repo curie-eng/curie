@@ -463,6 +463,8 @@ def build_parser() -> argparse.ArgumentParser:
             sub.add_argument("--approve-live", default=None)
         if name in {"preflight", "run"}:
             sub.add_argument("--output-token-ceiling", default="")
+        if name == "run":
+            sub.add_argument("--item-output-tokens-spent", default="")
         if name in {"run", "grant-probe"}:
             sub.add_argument("--grant-probe-cli", default=DEFAULT_PROBE_CLI)
         if name in {"run", "rehearse"}:
@@ -1424,6 +1426,7 @@ def cmd_run(args: argparse.Namespace, runtime: Runtime) -> int:
     inputs = base_inputs(args)
     pps.require_live_approval(args.approve_live)
     ceiling = pps.require_output_token_ceiling(args.output_token_ceiling)
+    spent = pps.require_item_spent(args.item_output_tokens_spent)
     inputs = with_grant(inputs, args, runtime.clock.now())
     inputs = with_probe(with_slack(with_app(with_cluster(inputs, args), args), args), args)
     ledger = pps.Ledger.open(inputs.state_dir, inputs.run_id, scrubber=runtime.scrubber)
@@ -1434,6 +1437,8 @@ def cmd_run(args: argparse.Namespace, runtime: Runtime) -> int:
         ledger.refuse_paid_retry()
         if ceiling is not None:
             ledger.set_output_token_ceiling(ceiling)
+        if spent is not None:
+            ledger.record("budget", "item_output_tokens_spent", spent)
     except pps.Refusal:
         ledger.close()
         raise
@@ -2764,13 +2769,25 @@ class LiveRun:
             raise StepFailed("a runner container is still running after fencing")
 
     def check_allowance(self, attempt: Attempt) -> None:
-        """Stop paid work once any running session reaches its reserved bound."""
+        """Stop paid work once any running session reaches its reserved bound.
+
+        With the item's earlier spend recorded, it also stops when that spend
+        plus everything this run has observed reaches the item's approved total.
+        """
 
         if attempt.harvest is None:
             return
-        breaches = pps.allowance_breaches(
-            attempt.reservations, self.attempt_facts(attempt), now=self.clock.now()
-        )
+        facts = self.attempt_facts(attempt)
+        breaches = pps.allowance_breaches(attempt.reservations, facts, now=self.clock.now())
+        spent = self.ledger.observations("budget").get("item_output_tokens_spent")
+        observed = sum(
+            session.output_tokens
+            for other in self.attempts.values()
+            if other.number < attempt.number and other.facts is not None
+            for session in other.facts.sessions
+        ) + sum(session.output_tokens for session in (facts.sessions if facts else []))
+        if pps.item_limit_reached(spent if isinstance(spent, int) else None, observed):
+            breaches.append("item_output_tokens")
         if breaches:
             self.ledger.record("budget", "allowance_breach", sorted(set(breaches)))
             self.fence_paid_starts()

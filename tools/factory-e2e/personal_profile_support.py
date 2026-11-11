@@ -74,6 +74,26 @@ def require_output_token_ceiling(raw: str | None) -> int | None:
     return int(raw)
 
 
+def require_item_spent(raw: str | None) -> int | None:
+    """Output tokens the item's earlier live runs actually spent, or None when not given.
+
+    With it, this run's observed output plus that spend may not reach the
+    item's approved total: the watchdog stops paid work at the limit.
+    """
+
+    if raw is None or raw == "":
+        return None
+    if not raw.isdigit() or not 0 <= int(raw) < MAX_OUTPUT_TOKENS:
+        raise Refusal("arguments_invalid", "--item-output-tokens-spent")
+    return int(raw)
+
+
+def item_limit_reached(spent: int | None, observed: int) -> bool:
+    """Whether the item's cumulative actual output has reached its approved total. Pure."""
+
+    return spent is not None and spent + observed >= MAX_OUTPUT_TOKENS
+
+
 def approved_ceiling() -> str:
     """The canonical ``--approve-live`` string, derived from the constants above."""
 
@@ -2715,6 +2735,14 @@ def _judge_budget(ledger: Ledger) -> tuple[dict[str, bool], dict[str, int]]:
         and sum(int(item["assistant_turns"]) for item in sessions) <= MAX_TURNS,
         "total_output_tokens_within": known
         and sum(int(item["output_tokens"]) for item in sessions) <= ledger.output_token_ceiling(),
+        # When the item's earlier spend is recorded, the item total stays within approval.
+        "item_output_tokens_within": not isinstance(observed.get("item_output_tokens_spent"), int)
+        or (
+            known
+            and int(observed["item_output_tokens_spent"])
+            + sum(int(item["output_tokens"]) for item in sessions)
+            <= MAX_OUTPUT_TOKENS
+        ),
         "budget_not_exceeded": run["budget_state"] == "ok",
         "no_paid_retry": run["live_starts"] == 1 and "paid_retry" not in observed,
         # Starts were fenced (worker stopped, grant removed, no runner pod) before

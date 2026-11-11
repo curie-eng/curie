@@ -3356,3 +3356,48 @@ def test_a_retained_volume_of_the_run_is_recorded_deleted_and_checked(tmp_path: 
     with pytest.raises(pp.StepFailed, match="bound elsewhere"):
         other.delete_owned_volumes()
     assert not any(call[:2] == ("delete", "persistentvolume") for call in rebound.calls)
+
+
+def test_the_item_total_stops_paid_work_at_its_approved_limit(tmp_path: Path) -> None:
+    assert pps.require_item_spent("21831") == 21831 and pps.require_item_spent("") is None
+    with pytest.raises(pps.Refusal):
+        pps.require_item_spent(str(pps.MAX_OUTPUT_TOKENS))
+    run = _scripted(tmp_path, _ScriptedRun, [])
+    run.ledger.record("budget", "item_output_tokens_spent", 25000)
+    run.ledger.begin_live(now=T0, grant_expires_at=T0 + 4000)
+    attempt = pp.Attempt(1)
+    run.attempts[1] = attempt
+    attempt.admitted_at = T0
+    attempt.reservations = run.ledger.reserve(pps.ATTEMPT_ROLES, attempt=1, now=T0)
+    project = f"curie-claude-config-a1b2/projects/-workspace/{SESSION}.jsonl"
+    records = [
+        {
+            "type": "user",
+            "timestamp": _stamp(0),
+            "sessionId": SESSION,
+            "isSidechain": False,
+            "message": {"role": "user", "content": "work the fixture issue"},
+        },
+        # Inside its 8,192 session reservation, but 25,000 + 8,000 passes the item's 32,768.
+        _assistant("msg_01", "claude-sonnet-5-5", 8000, 5, [{"type": "text", "text": "a"}]),
+    ]
+    harvest = pps.HarvestState(run.scan)
+    harvest.feed(_file_record(project, 0, _jsonl(records)))
+    attempt.harvest = harvest
+    run.grant_identity = ("uid-grant", "7")
+    run.kube = _FenceKube(running=False)  # type: ignore[assignment]
+    with pytest.raises(pp.StepFailed, match="paid work stopped"):
+        run.check_allowance(attempt)
+    budget = run.ledger.observations("budget")
+    assert budget["allowance_breach"] == ["item_output_tokens"]
+    assert budget["paid_starts_fenced"] is True
+
+    under = _scripted(_private(tmp_path / "under"), _ScriptedRun, [])
+    under.ledger.record("budget", "item_output_tokens_spent", 21831)
+    under.ledger.begin_live(now=T0, grant_expires_at=T0 + 4000)
+    second = pp.Attempt(1)
+    under.attempts[1] = second
+    second.admitted_at = T0
+    second.reservations = under.ledger.reserve(pps.ATTEMPT_ROLES, attempt=1, now=T0)
+    second.harvest = harvest
+    under.check_allowance(second)  # 21,831 + 8,000 stays inside the item total
