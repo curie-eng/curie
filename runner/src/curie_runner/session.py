@@ -196,12 +196,7 @@ def _personal_mode() -> bool:
         return True
 
 
-def _personal_refusal_reason(exc: PersonalAuthError) -> str:
-    """A fixed, value-free reason for a personal_auth refusal; never ``str(exc)``."""
-
-    if isinstance(exc, AuthenticationRequiredError):
-        return "no personal Claude grant reached this runner"
-    return f"personal model authentication refused the launch ({type(exc).__name__})"
+_MISSING_GRANT_REASON = "no personal Claude grant reached this runner"
 
 # Classification tagging the OBSERVE-ONLY reconciliation warning (#544, Decision
 # A2): a resumed policy-gate turn that armed gates yet took no action -- the
@@ -1750,22 +1745,27 @@ class SessionRunner:
                                     status=SessionStatus.IDLE_AWAITING_INPUT,
                                 )
                             )
-                        elif isinstance(exc, PersonalAuthError):
-                            # #5377: classified before anything logs ``exc`` or
-                            # copies its text; it is terminal, not a retryable
-                            # runner-error, and no service credential is tried.
-                            lines = self._personal_auth_halt_lines(_personal_refusal_reason(exc))
+                        elif isinstance(exc, AuthenticationRequiredError):
+                            # #5377: a missing owner grant, classified before
+                            # anything logs ``exc`` or copies its text; it is
+                            # terminal, not a retryable runner-error, and no
+                            # service credential is tried.
+                            lines = self._personal_auth_halt_lines(_MISSING_GRANT_REASON)
                             metric_outcome = self._metric_outcome(tracker)
                             self._set_failed(gen)
                             terminal_for_log = True
                             for line in lines:
                                 yield line
                         else:
+                            # Other personal_auth refusals (reviewer model, launch
+                            # refused, invalid mode) keep the runner-error class
+                            # but never log or copy their text: the class only.
+                            refusal = isinstance(exc, PersonalAuthError)
                             logger.error(
                                 "turn failed session=%s error_class=%s: %s duration_ms=%d",
                                 self._session_id,
                                 type(exc).__name__,
-                                exc,
+                                "personal model authentication refused" if refusal else exc,
                                 int((time.monotonic() - start) * 1000),
                             )
                             self._status = SessionStatus.CLASSIFIED_FAILURE
@@ -1773,7 +1773,11 @@ class SessionRunner:
                             self._set_failed(gen)
                             yield to_ndjson_line(
                                 ErrorEvent(
-                                    message=f"runner error: {exc}",
+                                    message=(
+                                        f"runner error: {type(exc).__name__}"
+                                        if refusal
+                                        else f"runner error: {exc}"
+                                    ),
                                     classification="runner-error",
                                 )
                             )

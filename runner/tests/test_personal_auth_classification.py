@@ -29,6 +29,7 @@ from curie_runner.adapter import ClaudeAgentSession, build_options
 from curie_runner.fake import FakeModelSession
 from curie_runner.personal_auth import (
     AuthenticationRequiredError,
+    InvalidAuthModeError,
     PersonalLaunchRefusedError,
     ReviewerModelRequiredError,
 )
@@ -169,20 +170,9 @@ def test_missing_grant_in_personal_mode_ends_authentication_required_before_any_
         assert all(placeholder not in str(event) for event in events)
 
 
-@pytest.mark.parametrize(
-    "refusal",
-    [
-        AuthenticationRequiredError(REFUSAL_TEXT),
-        PersonalLaunchRefusedError(REFUSAL_TEXT),
-        ReviewerModelRequiredError(REFUSAL_TEXT),
-    ],
-    ids=["missing-grant", "launch-refused", "reviewer-model"],
-)
-def test_personal_auth_refusal_text_is_never_logged_or_copied(
-    monkeypatch: pytest.MonkeyPatch,
-    caplog: pytest.LogCaptureFixture,
-    refusal: Exception,
-) -> None:
+def _refusing_turn(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture, refusal: Exception
+) -> list[object]:
     _clear_model_env(monkeypatch)
     monkeypatch.setenv(AUTH_MODE_ENV, "personal")
 
@@ -192,16 +182,50 @@ def test_personal_auth_refusal_text_is_never_logged_or_copied(
 
     runner = _session_runner(lambda: RefusingSession(_rejection_script))
     with caplog.at_level(logging.INFO, logger="curie_runner"):
-        events = _turn(runner)
+        return _turn(runner)
 
-    reason = (
-        "no personal Claude grant reached this runner"
-        if isinstance(refusal, AuthenticationRequiredError)
-        else f"personal model authentication refused the launch ({type(refusal).__name__})"
+
+def test_missing_grant_refusal_text_is_never_logged_or_copied(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    events = _refusing_turn(monkeypatch, caplog, AuthenticationRequiredError(REFUSAL_TEXT))
+
+    error = _assert_authentication_required(
+        events, reason="no personal Claude grant reached this runner"
     )
-    error = _assert_authentication_required(events, reason=reason)
     assert REFUSAL_TEXT not in error.message
     assert REFUSAL_TEXT not in _logged(caplog)
+    assert all(REFUSAL_TEXT not in str(event) for event in events)
+
+
+@pytest.mark.parametrize(
+    "refusal",
+    [
+        PersonalLaunchRefusedError(REFUSAL_TEXT),
+        ReviewerModelRequiredError(REFUSAL_TEXT),
+        InvalidAuthModeError(REFUSAL_TEXT),
+    ],
+    ids=["launch-refused", "reviewer-model", "invalid-mode"],
+)
+def test_other_personal_refusals_keep_runner_error_and_never_log_or_copy_text(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    refusal: Exception,
+) -> None:
+    events = _refusing_turn(monkeypatch, caplog, refusal)
+
+    assert [type(event) for event in events] == [ErrorEvent, Final]
+    error, final = events
+    assert isinstance(error, ErrorEvent) and isinstance(final, Final)
+    # The classification the turn had before #5377, never the reconnect guidance.
+    assert error.classification == "runner-error"
+    assert error.message == f"runner error: {type(refusal).__name__}"
+    assert "reconnect" not in error.message and "enrollment" not in error.message
+    assert final.status is SessionStatus.CLASSIFIED_FAILURE
+    assert REFUSAL_TEXT not in error.message
+    logged = _logged(caplog)
+    assert REFUSAL_TEXT not in logged
+    assert type(refusal).__name__ in logged
     assert all(REFUSAL_TEXT not in str(event) for event in events)
 
 

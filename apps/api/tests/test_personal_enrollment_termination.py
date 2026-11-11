@@ -627,6 +627,34 @@ def test_terminal_teardown_claim_is_an_exclusive_lease_that_keeps_the_epoch(
     _conflict(_claim(api, first.request_id, support.OTHER_RUNTIME_OWNER), "not_running")
 
 
+def test_reclaim_refuses_after_a_sibling_acquires_between_claims(
+    api: TestClient, world: support.World
+) -> None:
+    agent_id = support.insert_agent(world.tenant_id)
+    first, epoch = _finished(api, world, agent_id, 61451, cause="model_error")
+    sibling = _revise(agent_id, 61451)
+    _fence(world)
+    first_claim = _claimed(api, first.request_id)
+    claimed = _request(first.request_id)
+
+    # Between the two claims the sibling becomes the sandbox owner, so the
+    # same owner's re-claim must not interrupt a sandbox the sibling now holds.
+    _acquire(sibling)
+    _conflict(_claim(api, first.request_id), "not_running")
+    refused = _request(first.request_id)
+    assert refused["version"] == claimed["version"] == first_claim["request_version"]
+    assert refused["runtime_heartbeat_expires_at"] == claimed["runtime_heartbeat_expires_at"]
+    assert refused["teardown_unconfirmed_at"] is not None
+
+    # Liveness: once the sibling is terminal again the same claim succeeds.
+    sibling_epoch = support.start_request(sibling)
+    _conflict(_claim(api, first.request_id), "not_running")
+    support.finish_failed(sibling, sibling_epoch, cause="model_error")
+    reclaim = _claimed(api, first.request_id)
+    assert reclaim["runtime_epoch"] == epoch
+    assert reclaim["request_version"] == first_claim["request_version"] + 1
+
+
 @pytest.mark.parametrize("ending", ["completed", "failed"])
 def test_confirmation_preserves_the_prior_terminal_outcome_and_epoch(
     api: TestClient, world: support.World, ending: str
