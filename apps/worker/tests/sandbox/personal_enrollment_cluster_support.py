@@ -1514,7 +1514,7 @@ class EnrollmentProof(ClusterProof):
     # --- live turns ------------------------------------------------------------
 
     @contextlib.contextmanager
-    def session_deadline(self, launched: Launched, port: int) -> Iterator[float]:
+    def session_deadline(self, pod: str, token: HeldSecret, port: int) -> Iterator[float]:
         deadline = time.monotonic() + MAX_SESSION_SECONDS
         expired = threading.Event()
         expiry_lock = threading.Lock()
@@ -1529,7 +1529,7 @@ class EnrollmentProof(ClusterProof):
                 try:
                     connection.request(
                         "POST", "/v1/interrupt", body=b"{}",
-                        headers={"Authorization": f"Bearer {launched.runner_token.reveal()}",
+                        headers={"Authorization": f"Bearer {token.reveal()}",
                                  "Content-Type": "application/json"},
                     )
                     connection.getresponse().close()
@@ -1539,7 +1539,7 @@ class EnrollmentProof(ClusterProof):
                     connection.close()
                     try:
                         self.core.delete_namespaced_pod(
-                            launched.pod, self.namespace, grace_period_seconds=0,
+                            pod, self.namespace, grace_period_seconds=0,
                             _request_timeout=10,
                         )
                     except Exception:  # noqa: BLE001 - deadline failure remains fatal
@@ -1666,7 +1666,7 @@ class EnrollmentProof(ClusterProof):
             sequence, allowance = self.ledger.start(self.candidate)
             require(allowance == remaining, "live allowance changed before session admission")
             started = time.monotonic()
-            with self.session_deadline(launched, port) as deadline:
+            with self.session_deadline(launched.pod, launched.runner_token, port) as deadline:
                 for prompt in prompts:
                     turn, _raw, _elapsed, ended = self.stream(
                         port, launched.runner_token, prompt, deadline=deadline,
@@ -1950,7 +1950,7 @@ class EnrollmentProof(ClusterProof):
             sequence, allowance = self.ledger.start(self.candidate)
             require(allowance == remaining, "live allowance changed before session admission")
             started = time.monotonic()
-            with self.session_deadline(self.s3, port) as deadline:
+            with self.session_deadline(self.s3.pod, self.s3.runner_token, port) as deadline:
                 first, _raw, _elapsed, ended = self.stream(
                     port, self.s3.runner_token,
                     "What code word did I ask you to remember? Reply with only the code word.",
@@ -2053,16 +2053,34 @@ class EnrollmentProof(ClusterProof):
         runner = spec["containers"][0]
         runner["env"] += [
             value_env("CURIE_MODEL_AUTH_MODE", "personal"),
-            # The installation's credential itself: real and usable in the live phase.
-            secret_env("CURIE_CREDENTIALS", "installation-model", "grant"),
             value_env("HTTPS_PROXY", "http://127.0.0.1:4319"),
             secret_env("CURIE_RUNNER_TOKEN", "refusal-auth", "CURIE_RUNNER_TOKEN"),
             secret_env("CURIE_PROGRESS_TOKEN", "refusal-auth", "CURIE_PROGRESS_TOKEN"),
         ]
         pod, _ = self.create_pod("missing-grant-service-present", spec)
-        with self.forward(pod) as port:
+        credential_names = json.loads(self.exec(
+            pod, "python3", "-c",
+            "import json, os; print(json.dumps(sorted(set(os.environ) & "
+            "{'CURIE_CREDENTIALS', 'CURIE_MODEL_ENV_KEY', 'ACME_MODEL_TOKEN', "
+            "'CLAUDE_CODE_OAUTH_TOKEN', 'ANTHROPIC_API_KEY', 'ANTHROPIC_AUTH_TOKEN'})))",
+        ))
+        self.check("AC5", "the missing-grant runner has no model credential environment", [],
+                   credential_names)
+        from curie_worker.sandbox.claim_tokens import claim_object_names
+
+        personal_secret = self.core.read_namespaced_secret(
+            claim_object_names(self.s4.claim_name).secret, self.namespace, _request_timeout=30,
+        )
+        self.check("AC5", "the service credential never enters the personal claim Secret", False,
+                   any(base64.b64decode(encoded) == self.service.reveal().encode()
+                       for encoded in (personal_secret.data or {}).values()))
+        with (
+            self.forward(pod) as port,
+            self.session_deadline(pod, self.runner_auth, port) as deadline,
+        ):
             events, _raw, _elapsed, ended = self.stream(
-                port, self.runner_auth, "Refuse before model work because no grant exists."
+                port, self.runner_auth, "Refuse before model work because no grant exists.",
+                deadline=deadline,
             )
         require(not ended, "the missing-grant turn ended without a final")
         errors = [event for event in events if event.get("type") == "error"]

@@ -514,6 +514,45 @@ def test_evidence_refuses_an_empty_private_value_list(live_driver: EnrollmentPro
         live_driver.write_evidence()
 
 
+def test_missing_grant_control_keeps_service_material_out_of_the_runner(
+    live_driver: EnrollmentProof, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    live_driver.s4 = SimpleNamespace(claim_name="personal-claim")
+    live_driver.core = SimpleNamespace(read_namespaced_secret=lambda *args, **kwargs: (
+        SimpleNamespace(data={})
+    ))
+    monkeypatch.setattr(live_driver, "secret", lambda *args, **kwargs: None)
+    monkeypatch.setattr(live_driver, "exec", lambda *args: b"[]")
+    monkeypatch.setattr(live_driver, "capture_pod", lambda *args: None)
+    monkeypatch.setattr(live_driver, "observe_files", lambda *args: {
+        "provider_attempts": 0, "assistant_messages": [], "usage": [],
+    })
+
+    def create_pod(name: str, spec: dict[str, object]) -> tuple[str, dict[str, object]]:
+        for container in [*spec["containers"], *spec["initContainers"]]:
+            assert not container.get("envFrom")
+            assert all(
+                entry.get("valueFrom", {}).get("secretKeyRef", {}).get("name")
+                != "installation-model"
+                for entry in container.get("env", [])
+            )
+        return name, {}
+
+    def stream(
+        port: int, token: object, prompt: str, *, deadline: float,
+    ) -> tuple[list[dict[str, str]], bytes, int, bool]:
+        assert deadline > support.time.monotonic()
+        return [
+            {"type": "error", "message": "Authentication required"},
+            {"type": "final", "status": "classified-failure"},
+        ], b"", 0, False
+
+    monkeypatch.setattr(live_driver, "create_pod", create_pod)
+    monkeypatch.setattr(live_driver, "stream", stream)
+    live_driver.step_f()
+    assert live_driver.evidence["missing_grant_service_present"]["sessions_consumed"] == 0
+
+
 @pytest.fixture
 def enrollment_cluster(request: pytest.FixtureRequest) -> Iterator[EnrollmentProof]:
     __tracebackhide__ = True
