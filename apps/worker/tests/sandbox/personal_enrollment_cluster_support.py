@@ -854,9 +854,10 @@ class EnrollmentProof(ClusterProof):
         def pod_spec() -> dict[str, Any]:
             spec = original()
             for container in [*spec["containers"], *spec["initContainers"]]:
-                container["env"] += [
-                    secret_env(name, "installation-model", name)
-                    for name in ("ANTHROPIC_API_KEY", "ANTHROPIC_BASE_URL")
+                container["env"] = [
+                    *container["env"],
+                    *(secret_env(name, "installation-model", name)
+                      for name in ("ANTHROPIC_API_KEY", "ANTHROPIC_BASE_URL")),
                 ]
             staging = spec["initContainers"][0]
             staging["name"] = "bundle-fetch"

@@ -584,6 +584,36 @@ def test_missing_grant_control_keeps_service_material_out_of_the_runner(
     assert live_driver.evidence["missing_grant_service_present"]["sessions_consumed"] == 0
 
 
+def test_service_installation_template_has_unique_environment_names(
+    live_driver: EnrollmentProof,
+) -> None:
+    objects: dict[tuple[str, str], dict] = {}
+
+    def create(group: str, version: str, namespace: str, plural: str, body: dict,
+               **kwargs: object) -> dict:
+        objects[plural, body["metadata"]["name"]] = body
+        return body
+
+    def get(group: str, version: str, namespace: str, plural: str, name: str,
+            **kwargs: object) -> dict:
+        return objects[plural, name]
+
+    live_driver.custom = SimpleNamespace(
+        create_namespaced_custom_object=create, get_namespaced_custom_object=get,
+    )
+    live_driver.core = SimpleNamespace(
+        create_namespaced_secret=lambda *args, **kwargs: None,
+        create_namespaced_config_map=lambda *args, **kwargs: None,
+        patch_namespaced_secret=lambda *args, **kwargs: None,
+    )
+    live_driver.create_inputs()
+    pod = live_driver.source["podTemplate"]["spec"]
+    for container in [*pod["containers"], *pod["initContainers"]]:
+        names = [entry["name"] for entry in container["env"]]
+        assert len(names) == len(set(names))
+        assert {"ANTHROPIC_API_KEY", "ANTHROPIC_BASE_URL"} <= set(names)
+
+
 @pytest.fixture
 def enrollment_cluster(request: pytest.FixtureRequest) -> Iterator[EnrollmentProof]:
     __tracebackhide__ = True
