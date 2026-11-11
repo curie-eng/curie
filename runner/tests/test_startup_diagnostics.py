@@ -402,6 +402,8 @@ def _failing_cli(tmp_path: Path) -> Path:
         if sys.argv[1:] == ["-v"]:
             print("9.9.9 (Claude Code)")
             sys.exit(0)
+        sys.stderr.write("Loading tools\\nMCP server ready\\n")
+        sys.stderr.write("service key {_API_KEY}\\n")
         sys.stderr.write("synthetic diagnostic: upstream refused Authorization: {_BEARER}\\n")
         sys.stderr.flush()
         sys.exit(7)
@@ -431,17 +433,73 @@ def _real_options(cli_path: Path | None, *, with_permission_callback: bool, **en
     return options if cli_path is None else replace(options, cli_path=str(cli_path))
 
 
+def test_service_stderr_preserves_real_line_boundaries(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    session = ClaudeAgentSession(
+        _real_options(None, with_permission_callback=False, ANTHROPIC_API_KEY=_API_KEY)
+    )
+    tail = session._options.stderr  # noqa: SLF001
+    assert tail is not None
+    expected = "Loading tools\nMCP server ready\nChecking plugins\n"
+
+    session._stderr_tail.start()  # noqa: SLF001
+    for line in expected.splitlines():
+        tail(line)
+    assert capsys.readouterr().err == expected
+    assert session._stderr_tail.finish() == expected.rstrip("\n")  # noqa: SLF001
+    tail("after finish")
+    assert capsys.readouterr().err == "after finish\n"
+
+
+@pytest.mark.parametrize("boundary", ["finish", "discard"])
+def test_service_stderr_capture_boundary_clears_pending_secret_prefix(
+    capsys: pytest.CaptureFixture[str],
+    boundary: str,
+) -> None:
+    session = ClaudeAgentSession(
+        replace(
+            _real_options(None, with_permission_callback=False, ANTHROPIC_API_KEY=_API_KEY),
+            max_buffer_size=100,
+        )
+    )
+    tail = session._stderr_tail  # noqa: SLF001
+    tail.start()
+    tail("p" * 100 + _API_KEY[:11])
+    assert capsys.readouterr().err == "p" * 100 + "\n"
+
+    result = getattr(tail, boundary)()
+
+    if boundary == "finish":
+        assert result == _CAPTURE_STOPPED
+        assert capsys.readouterr().err == "[REDACTED:held_secret]\n"
+    else:
+        assert result is None
+        assert capsys.readouterr().err == ""
+    tail.start()
+    tail("MCP server ready")
+    assert tail.finish() == "MCP server ready"
+    assert capsys.readouterr().err == "MCP server ready\n"
+    assert tail.finish() == ""
+    assert capsys.readouterr().err == ""
+
+
 @pytest.mark.parametrize("with_permission_callback", [False, True], ids=["plain", "can-use-tool"])
 def test_real_sdk_process_failure_retains_diagnostic(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
+    capsys: pytest.CaptureFixture[str],
     with_permission_callback: bool,
 ) -> None:
     caplog.set_level(logging.INFO, logger="curie_runner")
     monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path / "claude-config"))
     session = ClaudeAgentSession(
-        _real_options(_failing_cli(tmp_path), with_permission_callback=with_permission_callback)
+        _real_options(
+            _failing_cli(tmp_path),
+            with_permission_callback=with_permission_callback,
+            ANTHROPIC_API_KEY=_API_KEY,
+        )
     )
     env_before = dict(os.environ)
 
@@ -458,7 +516,12 @@ def test_real_sdk_process_failure_retains_diagnostic(
     (finish,) = _finishes(caplog)
     _assert_record_shape(finish, "failure")
     assert finish.error_class == "ProcessError"  # type: ignore[attr-defined]
-    expected = "synthetic diagnostic: upstream refused Authorization: [REDACTED:bearer_token]"
+    expected = (
+        "Loading tools\nMCP server ready\n"
+        "service key [REDACTED:held_secret]\n"
+        "synthetic diagnostic: upstream refused Authorization: [REDACTED:bearer_token]"
+    )
+    assert capsys.readouterr().err == expected + "\n"
     (tail,) = _tails(caplog)
     assert _tail_text(tail) == expected
     runner_records = [r for r in caplog.records if r.name.startswith("curie_runner")]

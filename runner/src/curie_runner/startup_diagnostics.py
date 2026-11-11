@@ -19,8 +19,8 @@ on failure only, the exception class. Never options, env, prompts, or
 exception text: the SDK's message text can carry a header value.
 
 Held values and supported encodings are scrubbed before forwarding or retention.
-An unfinished held-value prefix is retained between callbacks; private key
-blocks are tracked across lines. Diagnostics remain byte bounded.
+An unfinished held-value prefix is retained after a forced partial flush;
+private key blocks are tracked across lines. Diagnostics remain byte bounded.
 """
 
 from __future__ import annotations
@@ -84,6 +84,7 @@ class StderrTail:
         return self._passthrough
 
     def __call__(self, line: str) -> None:
+        partial = len(line) >= self._partial_line_chars
         raw = self._pending + line
         self._pending = ""
         literals = held_secret_literals(registered_held_secrets())
@@ -91,16 +92,21 @@ class StderrTail:
         # overlapping prefixes never retain part of a complete credential.
         for literal in literals:
             raw = raw.replace(literal, "[REDACTED:held_secret]")
-        keep = max(
-            (size for literal in literals for size in range(1, min(len(raw), len(literal) - 1) + 1)
-             if raw.endswith(literal[:size])),
-            default=0,
-        )
-        if keep:
-            self._pending = raw[-keep:]
-            raw = raw[:-keep]
+        if partial:
+            keep = max(
+                (
+                    size
+                    for literal in literals
+                    for size in range(1, min(len(raw), len(literal) - 1) + 1)
+                    if raw.endswith(literal[:size])
+                ),
+                default=0,
+            )
+            if keep:
+                self._pending = raw[-keep:]
+                raw = raw[:-keep]
         if raw:
-            self._emit(self._sanitize(raw), partial=len(line) >= self._partial_line_chars)
+            self._emit(self._sanitize(raw), partial=partial)
 
     def _emit(self, text: str, *, partial: bool = False) -> None:
         if self._capturing and not self._stopped:
@@ -155,6 +161,9 @@ class StderrTail:
     def finish(self) -> str:
         """Stop capturing and hand back the retained tail, clearing it."""
 
+        if self._pending:
+            self._pending = ""
+            self._emit("[REDACTED:held_secret]")
         self._capturing = False
         self._stopped = False
         tail = self._buffer.decode("utf-8").rstrip("\n")
@@ -162,6 +171,7 @@ class StderrTail:
         return tail
 
     def discard(self) -> None:
+        self._pending = ""
         self._capturing = False
         self._stopped = False
         self._buffer.clear()

@@ -775,11 +775,16 @@ def test_redaction_scrubs_actual_stderr_passthrough_logs_and_publication_seriali
     destination: list[str] = []
     tail = StderrTail(destination.append, partial_line_chars=1024)
     tail.start()
-    tail(PUBLIC_MARKER + " " + value[:11])
+    tail(PUBLIC_MARKER + " " + value)
+    tail("p" * 1024 + value[:11])
     tail(value[11:])
     tail(" " + PUBLIC_MARKER)
     retained = tail.finish()
     raw_passthrough = "\n".join(destination)
+    assert raw_passthrough == (
+        PUBLIC_MARKER + " [REDACTED:held_secret]\n"
+        + "p" * 1024 + "\n[REDACTED:held_secret]\n " + PUBLIC_MARKER
+    )
     stream = io.StringIO()
     handler = logging.StreamHandler(stream)
     handler.addFilter(RedactingLogFilter())
@@ -945,8 +950,8 @@ def test_redaction_keeps_split_stderr_protected_after_initialization(boundary: s
     forwarded: list[str] = []
     tail = StderrTail(forwarded.append, partial_line_chars=1024)
     tail.start()
-    tail(PUBLIC_MARKER + " " + _OPAQUE_GRANT[:11])
     getattr(tail, boundary)()
+    tail("p" * 1024 + PUBLIC_MARKER + " " + _OPAQUE_GRANT[:11])
     tail(_OPAQUE_GRANT[11:])
     tail(" " + PUBLIC_MARKER)
     raw = "\n".join(forwarded)
@@ -955,4 +960,6 @@ def test_redaction_keeps_split_stderr_protected_after_initialization(boundary: s
     public_observed = PUBLIC_MARKER in raw
     assert not grant_exposed
     assert not suffix_exposed
+    assert _OPAQUE_GRANT[:11] not in raw
+    assert "[REDACTED:held_secret]" in raw
     assert public_observed
