@@ -312,15 +312,18 @@ def _refused_caller(
     )
     if reason is None:
         return False
-    # A refused caller is logged at DEBUG: in a busy shared channel most
-    # people may be unlisted, and one INFO line per message would drown the
-    # log. The counter below still counts every refusal. An unavailable API is
-    # an outage signal and stays at INFO.
+    # A refused caller in a channel is logged at DEBUG: in a busy shared
+    # channel most people may be unlisted, and one INFO line per message would
+    # drown the log. A direct message is one person addressing the agent, so
+    # its refusal stays at INFO, where an operator can see why it went
+    # unanswered. The counter below still counts every refusal. An unavailable
+    # API is an outage signal and stays at INFO.
+    quiet = reason is DropReason.CALLER_NOT_ALLOWED and lane != "im"
     drop(
         log,
         reason,
         event_id=event_id,
-        level=logging.DEBUG if reason is DropReason.CALLER_NOT_ALLOWED else logging.INFO,
+        level=logging.DEBUG if quiet else logging.INFO,
         lane=lane,
     )
     record_metric(
