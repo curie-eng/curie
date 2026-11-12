@@ -2704,3 +2704,285 @@ def test_ledger_rows_are_never_rewritten_by_judging(tmp_path: Path) -> None:
     ledger.close()
     with sqlite3.connect(path) as db:
         assert db.execute("SELECT COUNT(*) FROM session_groups").fetchone()[0] == 16
+
+
+# --------------------------------------------------------------------------
+# J. Live evidence readers
+# --------------------------------------------------------------------------
+
+PROJECT = "curie-claude-config-t1/projects/-workspace"
+
+
+def _stamp(offset: float) -> str:
+    import datetime as dt
+
+    return dt.datetime.fromtimestamp(T0 + offset, dt.UTC).isoformat().replace("+00:00", "Z")
+
+
+def _jsonl(records: Sequence[Mapping[str, Any]]) -> bytes:
+    return b"".join(json.dumps(record).encode() + b"\n" for record in records)
+
+
+def _reply(message_id: str, at: float, tokens: int, content: list[Any]) -> dict[str, Any]:
+    """An assistant record in the native CLI transcript shape."""
+
+    return {
+        "type": "assistant",
+        "timestamp": _stamp(at),
+        "message": {
+            "id": message_id,
+            "model": pps.IMPLEMENTER_MODEL,
+            "role": "assistant",
+            "content": content,
+            "usage": {"input_tokens": 10, "output_tokens": tokens},
+        },
+    }
+
+
+def _result(tool_id: str, at: float) -> dict[str, Any]:
+    return {
+        "type": "user",
+        "timestamp": _stamp(at),
+        "message": {
+            "role": "user",
+            "content": [{"type": "tool_result", "tool_use_id": tool_id, "content": "ok"}],
+        },
+    }
+
+
+def _tool(tool_id: str, name: str = "Bash") -> dict[str, Any]:
+    return {"type": "tool_use", "id": tool_id, "name": name, "input": {}}
+
+
+def test_hold_relpath_names_only_transcripts_under_the_runner_tmp() -> None:
+    good = f"/tmp/{PROJECT}/session-1.jsonl"
+    assert pto.hold_relpath(good) == f"{PROJECT}/session-1.jsonl"
+    sub = f"/tmp/{PROJECT}/session-1/subagents/agent-x1.jsonl"
+    assert pto.hold_relpath(sub) == f"{PROJECT}/session-1/subagents/agent-x1.jsonl"
+    for bad in (
+        None,
+        f"/var/{PROJECT}/session-1.jsonl",
+        f"/tmp/{PROJECT}/../session-1.jsonl",
+        f"/tmp/{PROJECT}/session-1.json",
+        "/tmp/other/projects/-workspace/session-1.jsonl",
+        f"/tmp/{PROJECT}//session-1.jsonl",
+    ):
+        assert pto.hold_relpath(bad) is None
+
+
+def test_probe_argv_uses_the_probe_model() -> None:
+    argv = pto.probe_argv("/opt/cli/claude")
+    assert argv[argv.index("--model") + 1] == pto.PROBE_MODEL
+    assert argv[argv.index("--max-turns") + 1] == "1"
+    assert "--no-session-persistence" in argv
+
+
+def _probe_json(**body: Any) -> bytes:
+    base: dict[str, Any] = {
+        "type": "result",
+        "subtype": "success",
+        "is_error": False,
+        "num_turns": 1,
+        "result": "ok",
+        "total_cost_usd": 0.0001,
+        "usage": {"output_tokens": 5},
+        "modelUsage": {pto.PROBE_MODEL: {}},
+    }
+    base.update(body)
+    return json.dumps(base).encode()
+
+
+def test_probe_outcome_reads_turns_model_and_limits() -> None:
+    passed = pto.probe_outcome(0, _probe_json())
+    assert passed["ok"] and passed["on_probe_model"] and passed["within_limits"]
+    assert passed["turns"] == 1 and passed["output_tokens"] == 5
+    over = pto.probe_outcome(0, _probe_json(usage={"output_tokens": pto.PROBE_OUTPUT_TOKENS + 1}))
+    assert over["within_limits"] is False
+    turns = pto.probe_outcome(0, _probe_json(num_turns=2))
+    assert turns["within_limits"] is False
+    unread = pto.probe_outcome(0, _probe_json(usage={}))
+    assert unread["within_limits"] is False and unread["output_tokens"] is None
+    other = pto.probe_outcome(0, _probe_json(modelUsage={pps.IMPLEMENTER_MODEL: {}}))
+    assert other["on_probe_model"] is False
+
+
+def test_probe_outcome_classifies_a_usage_limit_refusal() -> None:
+    refused = pto.probe_outcome(
+        1,
+        _probe_json(
+            is_error=True,
+            terminal_reason="api_error",
+            api_error_status=429,
+            result='API Error: 429 {"type":"error","error":{"type":"rate_limit_error"}}',
+            usage={"output_tokens": 0},
+            modelUsage={},
+        ),
+    )
+    assert refused["ok"] is False
+    assert pps.error_summary(refused["error"]) == "api_error 429 rate_limit_error"
+
+
+def test_native_tool_calls_and_first_tool_after() -> None:
+    main = f"{PROJECT}/session-1.jsonl"
+    sub = f"{PROJECT}/session-1/subagents/agent-x1.jsonl"
+    files = {
+        main: _jsonl(
+            [
+                _reply("m1", 1, 10, [_tool("t1")]),
+                _result("t1", 2),
+                _reply("m2", 5, 10, [_tool("t2")]),
+            ]
+        ),
+        sub: _jsonl([_reply("s1", 3, 10, [_tool("t3")]), _result("t3", 4)]),
+    }
+    calls = pto.native_tool_calls(files)
+    assert [(call["id"], call["subagent"], call["result"]) for call in calls] == [
+        ("t1", False, True),
+        ("t3", True, True),
+        ("t2", False, False),
+    ]
+    assert pto.first_tool_after(calls, T0) == T0 + 1
+    # A subagent call or a call without a result never counts; nothing after is None.
+    assert pto.first_tool_after(calls, T0 + 1) is None
+    replayed = pto.native_tool_calls(files, exclude_ids=frozenset({"m1"}))
+    assert [call["id"] for call in replayed] == ["t3", "t2"]
+    assert pto.native_tool_calls(files, not_before=T0 + 4) == [
+        {"id": "t2", "name": "Bash", "at": T0 + 5, "subagent": False, "result": False}
+    ]
+
+
+def test_claim_labels_match_needs_every_owner_label() -> None:
+    labels = {
+        pto.CLAIM_OWNER_LABELS["principal"]: "p-1",
+        pto.CLAIM_OWNER_LABELS["tenant"]: "t-1",
+        pto.CLAIM_OWNER_LABELS["generation"]: "1",
+        pto.CLAIM_OWNER_LABELS["mode"]: pps.PERSONAL_MODE,
+    }
+    assert pto.claim_labels_match(labels, tenant_id="t-1", principal_id="p-1", generation=1)
+    for name in pto.CLAIM_OWNER_LABELS.values():
+        partial = {key: value for key, value in labels.items() if key != name}
+        assert not pto.claim_labels_match(
+            partial, tenant_id="t-1", principal_id="p-1", generation=1
+        )
+    assert not pto.claim_labels_match(labels, tenant_id="t-1", principal_id="p-2", generation=1)
+    assert not pto.claim_labels_match(labels, tenant_id="t-1", principal_id="p-1", generation=2)
+    assert not pto.claim_labels_match(None, tenant_id="t-1", principal_id="p-1", generation=1)
+
+
+def test_marker_turn_is_a_turn_record() -> None:
+    marker = "pto-a-synthetic"
+    turn = pto.marker_turn(marker, "r" * 32, _stamp(0))
+    assert turn["type"] == "turn" and turn["record_id"] == "r" * 32
+    assert marker in turn["user"] and turn["status"] == "done"
+    assert [item["role"] for item in turn["messages"]] == ["user", "assistant"]
+
+
+def test_stream_has_event_reads_the_payload_field() -> None:
+    event = "work-item-5d0c7f3e-0000-4000-8000-0000000c0001-ci-2"
+    entries = [
+        ("1-0", {pto.STREAM_PAYLOAD_FIELD: json.dumps({"event_id": "other"})}),
+        ("2-0", {pto.STREAM_PAYLOAD_FIELD: "not json"}),
+        ("3-0", {pto.STREAM_PAYLOAD_FIELD: json.dumps({"event_id": event})}),
+    ]
+    assert pto.stream_has_event(entries, event)
+    assert not pto.stream_has_event(entries[:2], event)
+    assert not pto.stream_has_event([("4-0", {"other": json.dumps({"event_id": event})})], event)
+
+
+def _check_run(run_id: int, name: str, status: str, conclusion: str | None, app: str) -> Any:
+    return {
+        "id": run_id,
+        "name": name,
+        "status": status,
+        "conclusion": conclusion,
+        "app": {"slug": app},
+    }
+
+
+def test_failing_actions_runs_and_rerun_count() -> None:
+    runs = {
+        "check_runs": [
+            _check_run(1, "unit", "completed", "failure", pto.ACTIONS_APP),
+            _check_run(2, "lint", "completed", "success", pto.ACTIONS_APP),
+            _check_run(3, "other", "completed", "failure", "another-app"),
+            _check_run(4, "unit", "in_progress", None, pto.ACTIONS_APP),
+        ]
+    }
+    assert pto.failing_actions_runs(runs) == [{"id": 1, "name": "unit"}]
+    assert pto.failing_actions_runs({"check_runs": runs["check_runs"][1:2]}) == []
+    assert pto.rerun_count(runs, "unit") == (2, False)
+    done = {"check_runs": [runs["check_runs"][0], {**runs["check_runs"][3], "status": "completed"}]}
+    assert pto.rerun_count(done, "unit") == (2, True)
+    assert pto.rerun_count(runs, "missing") == (0, False)
+
+
+def test_annotations_name_the_ack_file() -> None:
+    assert pto.annotations_name([{"path": pto.CI_ACK_FILE, "message": "x"}], pto.CI_ACK_FILE)
+    assert pto.annotations_name([{"path": "t.py", "message": "CI_ACK.md must..."}], "CI_ACK.md")
+    assert not pto.annotations_name([{"path": "t.py", "message": "other"}], pto.CI_ACK_FILE)
+    assert not pto.annotations_name(None, pto.CI_ACK_FILE)
+
+
+def test_required_check_names_from_rules_and_protection() -> None:
+    rules = [
+        {"type": "pull_request"},
+        {
+            "type": "required_status_checks",
+            "parameters": {"required_status_checks": [{"context": "unit"}]},
+        },
+    ]
+    branch = {"protection": {"required_status_checks": {"contexts": ["lint"], "checks": []}}}
+    assert pto.required_check_names(rules, branch) == ["lint", "unit"]
+    assert pto.required_check_names([], {}) == []
+
+
+def test_checks_present_needs_a_success_for_every_name() -> None:
+    runs = {"check_runs": [_check_run(1, "unit", "completed", "success", pto.ACTIONS_APP)]}
+    statuses = {"statuses": [{"context": "lint", "state": "success"}]}
+    assert pto.checks_present(["unit", "lint"], runs, statuses)
+    pending = {"statuses": [{"context": "lint", "state": "pending"}]}
+    assert not pto.checks_present(["unit", "lint"], runs, pending)
+    assert not pto.checks_present(["unit", "missing"], runs, statuses)
+    assert not pto.checks_present([], runs, statuses)
+
+
+def test_ci_ack_present_names_the_branch() -> None:
+    branch = "curie/publication-" + "0" * 32
+    assert pto.ci_ack_present(f"# ack\nci ack: {branch}\n".encode(), branch)
+    assert not pto.ci_ack_present(b"ci ack: curie/publication-other\n", branch)
+    assert not pto.ci_ack_present(b"ci ack: \n", "")
+
+
+def _facts(files: Mapping[str, bytes]) -> pps.TranscriptFacts:
+    return pps.parse_native_transcripts(files)
+
+
+def test_elapsed_reading_charges_the_latest_session_until_now() -> None:
+    main = f"{PROJECT}/session-1.jsonl"
+    facts = _facts({main: _jsonl([_reply("m1", 0, 10, []), _reply("m2", 10, 10, [])])})
+    session = facts.sessions[0]
+    assert pto.elapsed_reading(session, facts.sessions, T0 + 10) == 10.0
+    assert pto.elapsed_reading(session, facts.sessions, T0 + 300) == 300.0
+    assert pto.elapsed_reading(None, facts.sessions, T0 + 300) == 0.0
+
+
+def test_hold_usage_is_zero_before_a_response_and_unknown_when_cut() -> None:
+    main = f"{PROJECT}/session-1.jsonl"
+    assert pto.hold_usage(None) == pps.SessionUsage(0, 0, 0.0, "")
+    prompt_only = _facts(
+        {main: _jsonl([{"type": "user", "timestamp": _stamp(0), "message": {"content": "go"}}])}
+    )
+    assert pto.hold_usage(prompt_only.sessions[0]) == pps.SessionUsage(0, 0, 0.0, "")
+    replied = _facts({main: _jsonl([_reply("m1", 0, 42, [])])})
+    usage = pto.hold_usage(replied.sessions[0])
+    assert usage is not None and usage.output_tokens == 42 and usage.assistant_turns == 1
+    cut = _facts({main: _jsonl([_reply("m1", 0, 42, [])]) + b'{"type": "assist'})
+    assert pto.hold_usage(cut.sessions[0]) is None
+
+
+def test_zero_usage_class_keeps_the_error_class_or_the_planned_name() -> None:
+    error = {"cli_error": "api_error", "http_status": 429, "provider_error_type": None}
+    assert pto.zero_usage_class({"error_classes": [error]}) == "api_error 429"
+    assert pto.zero_usage_class({"error_classes": [], "synthetic": 1}) is None
+    assert pto.zero_usage_class({"error_classes": []}, planned="prompt_hold") == "prompt_hold"
+    assert pto.zero_usage_class({"error_classes": []}) is None

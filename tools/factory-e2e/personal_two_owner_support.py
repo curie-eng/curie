@@ -43,7 +43,7 @@ import time
 import urllib.parse
 import uuid
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any, Literal, cast
 
 HERE = Path(__file__).resolve().parent
@@ -2561,8 +2561,6 @@ EXPECTED: dict[str, dict[str, str]] = {
         "owner_mismatch",
         "personal_context_b_hidden": "the owner-scoped personal-context read of A's WorkItem "
         "with B's principal answered 404",
-        "message_into_a_refused": "curie cluster message into A's conversation was refused "
-        "personal_owner_required",
         "a_marker_unchanged": "A's durable transcript marker is unchanged by the controls",
         "no_b_claim_on_a_thread": "no claim or pod for B appeared on A's thread",
         "no_foreign_runnable_request": "no runnable request with B's tuple exists on A's WorkItem",
@@ -2878,3 +2876,345 @@ def judge(ledger: TwoOwnerLedger, criterion: str) -> dict[str, Any]:
         "counts": counts,
         "not_met": list(NOT_MET.get(criterion, [])),
     }
+
+
+# --------------------------------------------------------------------------
+# J. Live evidence readers (the paid phases read these shapes)
+# --------------------------------------------------------------------------
+
+#: The runner's temporary root the harvester walks (pps.harvest_config).
+HOLD_TMP_ROOT = "/tmp"
+_CONFIG_DIR = re.compile(r"curie-claude-config-[A-Za-z0-9._-]+")
+#: SandboxClaim owner labels the worker writes (apps/worker sandbox/types.py).
+CLAIM_OWNER_LABELS = {
+    "principal": "curietech.ai/owner-principal",
+    "tenant": "curietech.ai/owner-tenant",
+    "generation": "curietech.ai/enrollment-generation",
+    "mode": "curietech.ai/model-auth-mode",
+}
+#: The runs-stream entry field holding the QueuedTurn JSON.
+STREAM_PAYLOAD_FIELD = "payload"
+ACTIONS_APP = "github-actions"
+CI_ACK_FILE = "CI_ACK.md"
+
+
+def hold_relpath(path: Any, *, tmp_root: str = HOLD_TMP_ROOT) -> str | None:
+    """The harvest key of a transcript path a gate hold reports. Pure.
+
+    The harvester names files relative to the runner's temporary root
+    (``curie-claude-config-<x>/projects/.../<session>.jsonl``). A path outside
+    that tree, with a parent hop, or not a ``.jsonl`` file is None: the driver
+    cannot prove it read it, so the hold is stopped.
+    """
+
+    root = tmp_root.rstrip("/") + "/"
+    if not isinstance(path, str) or not path.startswith(root) or not path.endswith(".jsonl"):
+        return None
+    rel = path[len(root) :]
+    parts = PurePosixPath(rel).parts
+    if (
+        len(parts) < 4
+        or not _CONFIG_DIR.fullmatch(parts[0])
+        or parts[1] != "projects"
+        or any(part in {"", ".", ".."} for part in parts)
+        or str(PurePosixPath(*parts)) != rel
+    ):
+        return None
+    return rel
+
+
+def probe_argv(cli: str) -> list[str]:
+    """``pps.grant_probe_argv`` on PROBE_MODEL: one turn, no tools, no persistence. Pure."""
+
+    argv = pps.grant_probe_argv(cli)
+    argv[argv.index("--model") + 1] = PROBE_MODEL
+    return argv
+
+
+def probe_outcome(returncode: int, stdout: bytes, stderr: bytes = b"") -> dict[str, Any]:
+    """The probe's sanitized outcome and whether it stayed inside the probe limits. Pure.
+
+    ``pps.grant_probe_result`` plus the CLI JSON's ``num_turns``, the models
+    its ``modelUsage`` names, and ``within_limits``: output tokens read as an
+    int no larger than PROBE_OUTPUT_TOKENS and at most PROBE_TURNS turns. A
+    missing usage reading is never inside the limits.
+    """
+
+    outcome = pps.grant_probe_result(returncode, stdout, stderr)
+    try:
+        body = json.loads(stdout)
+    except ValueError:
+        body = None
+    turns = body.get("num_turns") if isinstance(body, dict) else None
+    tokens = outcome.get("output_tokens")
+    models = [str(name) for name in outcome.get("models") or []]
+    outcome["model"] = PROBE_MODEL
+    outcome["turns"] = turns if type(turns) is int and turns >= 0 else None
+    outcome["on_probe_model"] = bool(models) and all(
+        pps.same_model(name, PROBE_MODEL) for name in models
+    )
+    outcome["within_limits"] = (
+        type(tokens) is int
+        and 0 <= tokens <= PROBE_OUTPUT_TOKENS
+        and outcome["turns"] is not None
+        and outcome["turns"] <= PROBE_TURNS
+    )
+    return outcome
+
+
+def native_tool_calls(
+    files: Mapping[str, bytes],
+    *,
+    exclude_ids: frozenset[str] = frozenset(),
+    not_before: float | None = None,
+) -> list[dict[str, Any]]:
+    """Every native tool call in harvested transcripts, oldest first. Pure.
+
+    Each item names the tool, its record time (epoch seconds or None),
+    whether it was made in a subagent, and whether a ``tool_result`` for it
+    was recorded. Records the replay rule of ``pps.parse_native_transcripts``
+    excludes (older than ``not_before``, or an assistant message id in
+    ``exclude_ids``) are not this session's calls.
+    """
+
+    calls: list[dict[str, Any]] = []
+    results: set[str] = set()
+    for name, data in sorted(files.items()):
+        parts = PurePosixPath(name).parts
+        if not name.endswith(".jsonl") or "projects" not in parts:
+            continue
+        records, _malformed, _cut = pps._records(data)
+        for record in records:
+            for item in pps._content(record):
+                if item.get("type") == "tool_result" and isinstance(item.get("tool_use_id"), str):
+                    results.add(item["tool_use_id"])
+            if record.get("type") != "assistant" or pps._replayed(record, exclude_ids, not_before):
+                continue
+            stamp = pps._timestamp(record.get("timestamp"))
+            for item in pps._content(record):
+                if item.get("type") == "tool_use" and isinstance(item.get("id"), str):
+                    calls.append(
+                        {
+                            "id": item["id"],
+                            "name": str(item.get("name") or ""),
+                            "at": stamp,
+                            "subagent": "subagents" in parts,
+                        }
+                    )
+    for call in calls:
+        call["result"] = call["id"] in results
+    return sorted(calls, key=lambda call: (call["at"] is None, call["at"] or 0.0))
+
+
+def first_tool_after(calls: Sequence[Mapping[str, Any]], moment: float) -> float | None:
+    """The time of the first main-session tool call with a result after ``moment``. Pure."""
+
+    for call in calls:
+        at = call.get("at")
+        if (
+            not call.get("subagent")
+            and call.get("result") is True
+            and isinstance(at, (int, float))
+            and not isinstance(at, bool)
+            and at > moment
+        ):
+            return float(at)
+    return None
+
+
+def claim_labels_match(labels: Any, *, tenant_id: str, principal_id: str, generation: int) -> bool:
+    """A SandboxClaim's labels name this owner, generation and personal mode. Pure."""
+
+    if not isinstance(labels, Mapping) or not tenant_id or not principal_id:
+        return False
+    return (
+        labels.get(CLAIM_OWNER_LABELS["principal"]) == principal_id
+        and labels.get(CLAIM_OWNER_LABELS["tenant"]) == tenant_id
+        and labels.get(CLAIM_OWNER_LABELS["generation"]) == str(generation)
+        and labels.get(CLAIM_OWNER_LABELS["mode"]) == pps.PERSONAL_MODE
+    )
+
+
+def marker_turn(marker: str, record_id: str, ts: str) -> dict[str, Any]:
+    """One durable transcript record carrying ``marker`` (runner TurnRecord.to_dict shape). Pure."""
+
+    user = f"Remember the proof marker {marker}."
+    return {
+        "type": "turn",
+        "user": user,
+        "assistant": "NOTED",
+        "ts": ts,
+        "messages": [
+            {"role": "user", "content": user},
+            {"role": "assistant", "content": [{"type": "text", "text": "NOTED"}]},
+        ],
+        "status": "done",
+        "approval": None,
+        "harness_replay": None,
+        "record_id": record_id,
+    }
+
+
+def stream_has_event(entries: Sequence[tuple[str, Mapping[str, str]]], event_id: str) -> bool:
+    """Whether an XRANGE answer holds a QueuedTurn with ``event_id`` in its payload. Pure."""
+
+    for _entry_id, fields in entries:
+        raw = fields.get(STREAM_PAYLOAD_FIELD) if isinstance(fields, Mapping) else None
+        try:
+            payload = json.loads(raw) if isinstance(raw, str) else None
+        except ValueError:
+            payload = None
+        if isinstance(payload, dict) and payload.get("event_id") == event_id:
+            return True
+    return False
+
+
+def failing_actions_runs(check_runs: Any) -> list[dict[str, Any]]:
+    """Completed GitHub Actions check runs that failed, as ``{"id", "name"}``. Pure.
+
+    Shape: ``GET /repos/{o}/{r}/commits/{sha}/check-runs`` (``check_runs[]``
+    with ``id``, ``name``, ``status``, ``conclusion``, ``app.slug``).
+    """
+
+    runs = check_runs.get("check_runs") if isinstance(check_runs, dict) else None
+    found = []
+    for run in runs if isinstance(runs, list) else []:
+        if not isinstance(run, dict) or type(run.get("id")) is not int:
+            continue
+        raw_app = run.get("app")
+        app: Mapping[str, Any] = raw_app if isinstance(raw_app, dict) else {}
+        if (
+            run.get("status") == "completed"
+            and run.get("conclusion") == "failure"
+            and app.get("slug") == ACTIONS_APP
+        ):
+            found.append({"id": run["id"], "name": str(run.get("name") or "")})
+    return found
+
+
+def annotations_name(annotations: Any, path: str) -> bool:
+    """Whether a check run's annotations point at ``path`` (``GET .../annotations``). Pure."""
+
+    return any(
+        isinstance(item, dict)
+        and (item.get("path") == path or path in str(item.get("message") or ""))
+        for item in (annotations if isinstance(annotations, list) else [])
+    )
+
+
+def rerun_count(check_runs: Any, name: str) -> tuple[int, bool]:
+    """Check runs named ``name`` at one head (``filter=all``) and whether all completed. Pure."""
+
+    runs = check_runs.get("check_runs") if isinstance(check_runs, dict) else None
+    named = [
+        run
+        for run in (runs if isinstance(runs, list) else [])
+        if isinstance(run, dict) and run.get("name") == name
+    ]
+    return len(named), bool(named) and all(run.get("status") == "completed" for run in named)
+
+
+def required_check_names(rules: Any, branch: Any) -> list[str]:
+    """Required status check names of a branch from its rules and its protection. Pure.
+
+    Shapes: ``GET /repos/{o}/{r}/rules/branches/{b}`` answers a list of rules,
+    the ``required_status_checks`` rule naming ``parameters.
+    required_status_checks[].context``; ``GET /repos/{o}/{r}/branches/{b}``
+    answers ``protection.required_status_checks`` with ``contexts`` and
+    ``checks[].context``.
+    """
+
+    names: set[str] = set()
+    for rule in rules if isinstance(rules, list) else []:
+        if not isinstance(rule, dict) or rule.get("type") != "required_status_checks":
+            continue
+        raw = rule.get("parameters")
+        parameters: Mapping[str, Any] = raw if isinstance(raw, dict) else {}
+        for item in parameters.get("required_status_checks") or []:
+            if isinstance(item, dict) and isinstance(item.get("context"), str):
+                names.add(item["context"])
+    protection = branch.get("protection") if isinstance(branch, dict) else None
+    required = protection.get("required_status_checks") if isinstance(protection, dict) else None
+    if isinstance(required, dict):
+        names.update(str(item) for item in required.get("contexts") or [] if isinstance(item, str))
+        for item in required.get("checks") or []:
+            if isinstance(item, dict) and isinstance(item.get("context"), str):
+                names.add(item["context"])
+    return sorted(names)
+
+
+def checks_present(names: Sequence[str], check_runs: Any, statuses: Any) -> bool:
+    """Every name has a successful latest check run or commit status at the head. Pure."""
+
+    runs = check_runs.get("check_runs") if isinstance(check_runs, dict) else None
+    contexts = statuses.get("statuses") if isinstance(statuses, dict) else None
+    passed = {
+        str(run.get("name"))
+        for run in (runs if isinstance(runs, list) else [])
+        if isinstance(run, dict)
+        and run.get("status") == "completed"
+        and run.get("conclusion") == "success"
+    } | {
+        str(item.get("context"))
+        for item in (contexts if isinstance(contexts, list) else [])
+        if isinstance(item, dict) and item.get("state") == "success"
+    }
+    return bool(names) and all(name in passed for name in names)
+
+
+def ci_ack_present(content: bytes, branch: str) -> bool:
+    """``CI_ACK.md`` holds the line the fixture test asks for on ``branch``. Pure."""
+
+    expected = "ci ack: " + branch
+    lines = content.decode("utf-8", errors="replace").splitlines()
+    return bool(branch) and expected in [line.strip() for line in lines]
+
+
+def elapsed_reading(
+    session: pps.SessionFacts | None, sessions: Sequence[pps.SessionFacts], now: float
+) -> float:
+    """A session's elapsed seconds as the ledger settles them, read while it may run. Pure.
+
+    ``pps.allowance_breaches``'s rule: the parsed elapsed (nested subagent
+    time excluded), plus the time since the last record when this session
+    wrote the pod's latest record, since it may still be running.
+    """
+
+    if session is None:
+        return 0.0
+    latest = max((item.last for item in sessions if item.last is not None), default=None)
+    reading = float(session.elapsed)
+    if latest is not None and session.last == latest:
+        reading += max(0.0, now - latest)
+    return reading
+
+
+def hold_usage(session: pps.SessionFacts | None) -> pps.SessionUsage | None:
+    """A session's usage at a hold: zero before its first response, None when unknown. Pure."""
+
+    if session is None:
+        return pps.SessionUsage(0, 0, 0.0, "")
+    if session.truncated:
+        return None
+    if session.assistant_turns == 0 and session.synthetic == 0:
+        return pps.SessionUsage(0, 0, round(session.elapsed, 3), "")
+    return session.usage()
+
+
+def zero_usage_class(summary: Mapping[str, Any], *, planned: str | None = None) -> str | None:
+    """The class of a zero-output or synthetic session summary, or None when unclassified. Pure.
+
+    A synthetic or provider-error record keeps its sanitized error class
+    (``pps.error_class``: cli_error, http_status, provider_error_type); a
+    planned zero (an interrupted prompt hold, an unused reviewer slot) is
+    named by the caller. Anything else is unclassified.
+    """
+
+    errors = [item for item in summary.get("error_classes") or [] if isinstance(item, Mapping)]
+    for item in errors:
+        text = pps.error_summary(item)
+        if text:
+            return text
+    if summary.get("synthetic"):
+        return None
+    return planned

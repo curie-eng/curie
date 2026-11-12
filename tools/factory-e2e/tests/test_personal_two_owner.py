@@ -18,8 +18,10 @@ registry fixture, and no value is a real credential or identifier.
 
 from __future__ import annotations
 
+import base64
 import contextlib
 import dataclasses
+import datetime as dt
 import hashlib
 import http.server
 import io
@@ -898,9 +900,18 @@ def test_live_run_takes_the_paid_phases_after_forge(tmp_path: Path) -> None:
     assert names == [*pt.UNPAID_PHASES, *pt.PAID_PHASES]
     assert h.run.stop_after is None and not h.run.rehearsal and h.run.command == "run"
     assert not h.ledger.is_rehearsal()
-    for _name, phase in h.run.phases()[len(pt.UNPAID_PHASES) :]:
-        with pytest.raises(pp.StepFailed, match=pt.NOT_IMPLEMENTED):
-            phase()
+    paid = dict(h.run.phases()[len(pt.UNPAID_PHASES) :])
+    for name in pt.PAID_PHASES:
+        method = getattr(pt.TwoOwnerRun, "phase_" + name.replace("-", "_"))
+        assert getattr(paid[name], "__func__", None) is method, name
+    # The two methods stream S2b-2 supplies raise until they land.
+    _connect(h)
+    with pytest.raises(pp.StepFailed, match="interrupt_native_process: provided by stream S2b-2"):
+        h.run.interrupt_native_process("pod-b", {"cli_pid": 1, "cli_start": 2})
+    with pytest.raises(pp.StepFailed, match="delivery_checks: provided by stream S2b-2"):
+        h.run.delivery_checks(h.run.owners["a"], "claim-a")
+    # A paid phase does nothing before its first reservation without the live window.
+    assert h.ledger.session_rows() == []
 
 
 def test_a_rehearsal_cannot_be_cut_at_or_after_a_paid_phase(tmp_path: Path) -> None:
@@ -1751,3 +1762,915 @@ def test_inventory_queries_every_two_owner_kind(
     results = h.run.query_inventory()
     assert results["dex"] == "present" and results["claim_tokens"] == "uncertain"
     assert repr(h.run.owners["a"]) == "<owner a>"
+
+
+# --------------------------------------------------------------------------
+# Paid phases: reservations, the gate, settlement and the phase checks
+#
+# The cluster-facing seams (runner image check, harvest and gate streams, the
+# S2b-2 methods, the fence) are replaced; the ledger, the gate decision, the
+# transcript parsing and the phase logic are the real ones. Transcripts take
+# the native CLI shape (test_personal_profile.py _transcripts), harvest lines
+# the pps.HARVEST_PROGRAM shape, and holds the pto.GATE_HOOK_PROGRAM record.
+# --------------------------------------------------------------------------
+
+PROJECT = "curie-claude-config-t1/projects/-workspace"
+MAIN = f"{PROJECT}/session-1.jsonl"
+REQUEST_A1 = "5d0c7f3e-0000-4000-8000-0000000d0a01"
+REQUEST_B1 = "5d0c7f3e-0000-4000-8000-0000000d0b01"
+WORK_ITEM_B = "5d0c7f3e-0000-4000-8000-0000000c0002"
+HEAD_B1 = "1" * 40
+HEAD_B2 = "2" * 40
+BRANCH_B = "curie/publication-" + "b" * 32
+
+
+class _FakeGate:
+    """``GateChannel`` answering a limits command the way GATE_STREAM_PROGRAM does."""
+
+    def __init__(self, *, ack: bool = True) -> None:
+        self.queue: list[dict[str, Any]] = []
+        self.sent: list[dict[str, Any]] = []
+        self.ack = ack
+        self.closed = False
+
+    def events(self) -> list[dict[str, Any]]:
+        drained, self.queue = self.queue, []
+        return drained
+
+    def send(self, command: Mapping[str, Any]) -> None:
+        self.sent.append(dict(command))
+        if self.ack and "limits" in command:
+            self.queue.append({"limits_applied": dict(command["limits"])})
+
+    def ended(self) -> bool:
+        return self.closed
+
+    def close(self) -> None:
+        self.closed = True
+
+
+class _Live(pt.TwoOwnerRun):
+    """The live driver with its cluster-facing seams replaced."""
+
+    def __init__(self, **kwargs: Any) -> None:
+        super().__init__(**kwargs)
+        self.trace: list[str] = []
+        self.gates: list[_FakeGate] = []
+
+    def fence_paid_starts(self) -> None:
+        self.trace.append("fence")
+
+    def check_runner_image(self, attempt: pp.Attempt) -> None:
+        self.trace.append(f"image-{attempt.number}")
+
+    def delivery_checks(self, owner: pt.Owner, claim: str) -> dict[str, bool]:
+        self.trace.append(f"delivery-{owner.name}")
+        return {"own_grant": True, "not_other": True}
+
+    def open_harvest(self, run: pt.PodRun) -> None:
+        run.harvest = pps.HarvestState(self.scan)
+        self.trace.append(f"harvest-{run.group}")
+
+    def open_gate(self, run: pt.PodRun) -> pt.GateChannel:
+        gate = _FakeGate()
+        self.gates.append(gate)
+        return gate
+
+    def resolve_probe_cli(self) -> str:
+        return "/opt/fake/bin/claude"
+
+    def record_summary_keys(self) -> None:
+        self.trace.append("summary")
+
+
+def _live(tmp_path: Path, *, begin: bool = True) -> _Harness:
+    h = _harness(tmp_path, rehearsal=False, cls=_Live)
+    _connect(h)
+    for owner in pto.OWNERS:
+        h.ledger.set_owner_window(owner, WINDOW)
+    if begin:
+        h.ledger.begin_live(now=T0, grant_expires_at=WINDOW)
+    return h
+
+
+def _trace(h: _Harness) -> list[str]:
+    run = h.run
+    assert isinstance(run, _Live)
+    return run.trace
+
+
+def _settle_group(h: _Harness, group: str) -> None:
+    probe = pto.GROUPS[group].kind == "probe"
+    for item in h.ledger.reserve_group(group, now=h.clock.now()):
+        h.ledger.settle(
+            item.seq,
+            pps.SessionUsage(5 if probe else 0, 1 if probe else 0, 0.0, ""),
+            source="probe" if probe else "not_started",
+        )
+
+
+def _through(h: _Harness, group: str) -> None:
+    """Reserve and settle every earlier group of the same owner, in manifest order."""
+
+    owner = pto.GROUPS[group].owner
+    for spec in pto.MANIFEST[: pto.group_index(group) - 1]:
+        if spec.owner == owner:
+            _settle_group(h, spec.name)
+
+
+def _pod_run(
+    h: _Harness, group: str, *, policy: str = pt.RELEASE, card: int = 0, reserve: bool = True
+) -> pt.PodRun:
+    run = h.run.new_run(group, card=card, policy=policy)
+    if reserve:
+        h.run.reserve(run)
+    run.claim, run.pod, run.pod_uid = f"claim-{group}", f"pod-{group}", f"uid-{group}"
+    run.harvest = pps.HarvestState(h.runtime.scan)
+    run.gate = _FakeGate()
+    run.limits = pto.subagent_limits(group)
+    run.limits_acked = True
+    run.started_at = h.clock.now()
+    h.run.pods.append(run)
+    return run
+
+
+def _stamp(offset: float) -> str:
+    return dt.datetime.fromtimestamp(T0 + offset, dt.UTC).isoformat().replace("+00:00", "Z")
+
+
+def _jsonl(records: Sequence[Mapping[str, Any]]) -> bytes:
+    return b"".join(json.dumps(record).encode() + b"\n" for record in records)
+
+
+def _reply(message_id: str, at: float, tokens: int, content: list[Any]) -> dict[str, Any]:
+    return {
+        "type": "assistant",
+        "timestamp": _stamp(at),
+        "message": {
+            "id": message_id,
+            "model": pps.IMPLEMENTER_MODEL,
+            "role": "assistant",
+            "content": content,
+            "usage": {"input_tokens": 10, "output_tokens": tokens},
+        },
+    }
+
+
+def _tool(tool_id: str, name: str = "Bash") -> dict[str, Any]:
+    return {"type": "tool_use", "id": tool_id, "name": name, "input": {}}
+
+
+def _result(tool_id: str, at: float) -> dict[str, Any]:
+    return {
+        "type": "user",
+        "timestamp": _stamp(at),
+        "message": {
+            "role": "user",
+            "content": [{"type": "tool_result", "tool_use_id": tool_id, "content": "ok"}],
+        },
+    }
+
+
+def _prompt(at: float = 0) -> dict[str, Any]:
+    return {"type": "user", "timestamp": _stamp(at), "message": {"role": "user", "content": "go"}}
+
+
+def _feed(run: pt.PodRun, files: Mapping[str, bytes], *, at: float = T0) -> None:
+    """Harvest ``file`` and ``sync`` lines (pps.HARVEST_PROGRAM) up to ``files``."""
+
+    state = run.harvest
+    assert state is not None
+    for path, data in sorted(files.items()):
+        offset = len(state.files.get(path, b""))
+        if len(data) > offset:
+            chunk = base64.b64encode(data[offset:]).decode()
+            line = {"kind": "file", "path": path, "offset": offset, "data": chunk}
+            state.feed(json.dumps(line).encode())
+    sizes = {path: len(data) for path, data in files.items()}
+    state.feed(json.dumps({"kind": "sync", "sizes": sizes, "at": at}).encode())
+
+
+def _hold(
+    mode: str,
+    number: int,
+    *,
+    size: int | None = None,
+    written: float = T0,
+    tool: str | None = None,
+    kind: str | None = None,
+    agent: str | None = None,
+    cli: tuple[int, int] = (4242, 77),
+) -> dict[str, Any]:
+    """One gate stream ``hold`` event carrying a GATE_HOOK_PROGRAM record."""
+
+    key = f"{mode}-{number}-{number}"
+    record = {
+        "key": key,
+        "mode": mode,
+        "tool_name": tool,
+        "subagent_kind": kind,
+        "session_id": "session-1",
+        "transcript_path": f"/tmp/{MAIN}",
+        "transcript_size": size,
+        "agent_id": agent,
+        "agent_transcript_path": None,
+        "agent_transcript_size": None,
+        "cli_pid": cli[0],
+        "cli_start": cli[1],
+        "hook_pid": 5000 + number,
+        "hook_start": 9,
+        "written_at": written,
+    }
+    return {"hold": record, "key": key}
+
+
+def _gate(run: pt.PodRun) -> _FakeGate:
+    assert isinstance(run.gate, _FakeGate)
+    return run.gate
+
+
+def _rows(h: _Harness, group: str) -> list[dict[str, Any]]:
+    return [row for row in h.ledger.session_rows() if row["grp"] == group]
+
+
+# -- reservations come first ----------------------------------------------------
+
+
+def _admission_answer(owner: str, request_id: str) -> dict[str, Any]:
+    principal = PRINCIPAL_A if owner == "a" else PRINCIPAL_B
+    tuple_ = {
+        "tenant_id": TENANT,
+        "model_auth_mode": "personal",
+        "owner_principal_id": principal,
+        "enrollment_generation": 1,
+    }
+    return {
+        "work_item": {"id": WORK_ITEM, "conversation_id": "issue-11", **tuple_},
+        "request": {"id": request_id, "sequence": 1, "status": "queued", **tuple_},
+        "replayed": False,
+    }
+
+
+def test_reservation_precedes_the_admission(tmp_path: Path) -> None:
+    h = _live(tmp_path)
+    _through(h, "a1")
+    seen: list[int] = []
+
+    @h.api.route("POST", "/v1/internal/work-items/admissions")
+    def admit(_path: str, _headers: Mapping[str, str], _body: Any) -> tuple[int, Any]:
+        seen.append(len(h.ledger.reservations_of("a1")))
+        return 200, _admission_answer("a", REQUEST_A1)
+
+    run = h.run.new_run("a1", card=1)
+    h.run.admit_group(run, h.run.owners["a"])
+    assert seen == [3]
+    assert run.request_id == REQUEST_A1 and run.work_item_id == WORK_ITEM
+    assert run.admitted_owner is True and h.run.owners["a"].work_item_ids == [WORK_ITEM]
+    # Control: a group that cannot be reserved is never admitted.
+    with pytest.raises(pps.Refusal) as refused:
+        h.run.admit_group(h.run.new_run("b1", card=3), h.run.owners["b"])
+    assert refused.value.code == "group_out_of_order"
+    assert seen == [3]
+
+
+@pytest.mark.parametrize(("status", "source"), [(409, "not_started"), (503, "unknown")])
+def test_a_failed_admission_settles_its_reservations_and_fences(
+    tmp_path: Path, status: int, source: str
+) -> None:
+    h = _live(tmp_path)
+    _through(h, "a1")
+    h.api.route("POST", "/v1/internal/work-items/admissions")(
+        lambda _p, _h, _b: (status, {"detail": {"code": "owner_mismatch"}})
+    )
+    with pytest.raises(pp.StepFailed, match=f"admission returned {status}"):
+        h.run.admit_group(h.run.new_run("a1", card=1), h.run.owners["a"])
+    assert {row["source"] for row in _rows(h, "a1")} == {source}
+    assert _trace(h).count("fence") == 1
+
+
+def test_reservation_precedes_the_worker_scale_up(tmp_path: Path) -> None:
+    h = _live(tmp_path)
+    _through(h, "b-r1")
+    first = _pod_run(h, "b1", card=3, reserve=False)
+    first.request_id, first.work_item_id = REQUEST_B1, WORK_ITEM_B
+    h.run.worker_before = ["uid-worker-1"]
+    seen: list[int] = []
+
+    @h.shell.on("scale")
+    def scale(_argv: list[str], _stdin: bytes | None) -> bytes:
+        seen.append(len(h.ledger.reservations_of("b-r1")))
+        return b""
+
+    worker = _pod("worker-2", "worker", "curie-worker", DIGESTS["curie-worker"], uid="uid-w2")
+    h.run.worker_pods = lambda pods=None: [worker]  # type: ignore[method-assign]
+    h.run.observe_worker = lambda pods=None: ("uid-w2", True)  # type: ignore[method-assign]
+    h.run.phase_worker_start()
+    assert seen == [1]
+    restarts = h.ledger.observations("restarts")
+    assert restarts["worker_fresh_runtime"] is True
+    assert restarts["worker_candidate_image"] is True
+    assert h.run.worker_name == "worker-2"
+
+
+def test_the_worker_is_not_scaled_up_when_b_r1_cannot_be_reserved(tmp_path: Path) -> None:
+    h = _live(tmp_path)
+    _through(h, "b-r1")
+    first = _pod_run(h, "b1", card=3, reserve=False)
+    first.request_id, first.work_item_id = REQUEST_B1, WORK_ITEM_B
+    # An unknown session anywhere blocks every further reservation.
+    seq = h.ledger.reserve_group("a-probe", now=T0)[0].seq
+    h.ledger.settle(seq, None, source="unknown")
+    with pytest.raises(pps.Refusal) as refused:
+        h.run.phase_worker_start()
+    assert refused.value.code == "usage_unknown"
+    assert not [argv for argv in h.shell.kubectl() if "scale" in argv]
+
+
+def _interruption_setup(h: _Harness, *, prompt_only: bool = True) -> pt.PodRun:
+    _through(h, "b-r1")
+    held = _pod_run(h, "b-r1", policy=pt.KEEP_PROMPT)
+    held.request_id, held.work_item_id = REQUEST_B1, WORK_ITEM_B
+    held.conversation_id = "issue-12"
+    records = [_prompt()] if prompt_only else [_prompt(), _reply("m1", 1, 40, [])]
+    files = {MAIN: _jsonl(records)}
+    _feed(held, files)
+    held.kept = _hold("prompt", 1, size=len(files[MAIN]))["hold"]
+    held.kept_files, held.kept_facts = files, h.run.pod_facts(held, files)
+    held.clis = [(4242, 77)]
+    held.eof.set()
+    h.run.a_stop_at = T0 + 5
+    row = {
+        "id": REQUEST_B1,
+        "work_item_id": WORK_ITEM_B,
+        "runtime_epoch": 3,
+        "runtime_claim_name": held.claim,
+        "owner_principal_id": PRINCIPAL_B,
+        "tenant_id": TENANT,
+        "enrollment_generation": 1,
+    }
+    h.run.request_row = lambda _request: dict(row)  # type: ignore[method-assign]
+    h.run.marker_present = lambda _owner: True  # type: ignore[method-assign]
+    h.run.owner_claims = lambda _owner: [held.claim]  # type: ignore[method-assign]
+    h.run.await_container_restart = lambda _run: {"metadata": {"uid": held.pod_uid}}  # type: ignore[method-assign]
+
+    def begin(run: pt.PodRun) -> None:
+        run.clis = [(5151, 88)]
+        run.delivery = {"own_grant": True, "not_other": True}
+        h.run.pods.append(run)
+
+    h.run.begin_pod_run = begin  # type: ignore[method-assign]
+    h.run.first_tool = lambda _run, _moment: T0 + 50  # type: ignore[method-assign]
+    return held
+
+
+def test_reservation_precedes_the_interruption_call(tmp_path: Path) -> None:
+    h = _live(tmp_path)
+    held = _interruption_setup(h)
+    seen: list[tuple[int, bool]] = []
+
+    def interrupt(pod: str, hold: Mapping[str, Any]) -> dict[str, Any]:
+        seen.append((len(h.ledger.reservations_of("b-r2")), h.run.settled_known("b-r1")))
+        assert pod == held.pod and hold["cli_pid"] == 4242
+        return {"action": "signal_processes", "native_identity_matched": True, "native_gone": True}
+
+    h.run.interrupt_native_process = interrupt  # type: ignore[method-assign]
+    h.run.phase_process_interruption()
+    assert seen == [(3, True)]
+    restarts = h.ledger.observations("restarts")
+    for key in (
+        "process_lineage_before",
+        "process_termination_epoch",
+        "process_fresh_runtime",
+        "process_usage_settled",
+        "process_identity_matched",
+        "process_no_pod_delete",
+        "process_claim_still_bound",
+        "process_no_successor_claim",
+        "process_same_request_epoch",
+    ):
+        assert restarts[key] is True, key
+    assert h.ledger.observations("disconnect")["b_tool_after_a_stop"] is True
+    assert [row["output_tokens"] for row in _rows(h, "b-r1")] == [0]
+
+
+def test_no_interruption_when_the_held_prompt_did_not_settle_to_zero(tmp_path: Path) -> None:
+    h = _live(tmp_path)
+    _interruption_setup(h, prompt_only=False)
+    calls: list[str] = []
+    h.run.interrupt_native_process = lambda pod, _hold: calls.append(pod) or {}  # type: ignore[method-assign]
+    with pytest.raises(pp.StepFailed, match="usage unknown or unmapped"):
+        h.run.phase_process_interruption()
+    assert calls == [] and h.ledger.reservations_of("b-r2") == []
+    assert {row["source"] for row in _rows(h, "b-r1")} == {"unknown"}
+    assert "fence" in _trace(h)
+
+
+# -- the gate -------------------------------------------------------------------
+
+
+def test_a_prompt_hold_waits_for_the_limits_ack(tmp_path: Path) -> None:
+    h = _live(tmp_path)
+    _through(h, "a1")
+    run = _pod_run(h, "a1", card=1)
+    run.limits_acked = False
+    files = {MAIN: _jsonl([_prompt()])}
+    _feed(run, files)
+    _gate(run).queue.append(_hold("prompt", 1, size=len(files[MAIN])))
+    h.run.pump()
+    assert _gate(run).sent == [] and run.deferred
+    _gate(run).queue.append({"limits_applied": dict(run.limits)})
+    h.run.pump()
+    assert _gate(run).sent == [{"release": "prompt-1-1", "verdict": "go"}]
+    assert run.limits_acked and run.prompt_seen and not run.deferred
+
+
+def test_an_unacknowledged_limits_command_stops_the_pod(tmp_path: Path) -> None:
+    h = _live(tmp_path)
+    _through(h, "a1")
+    run = _pod_run(h, "a1", card=1)
+    run.limits_acked, run.limits_sent_at = False, h.clock.now()
+    _feed(run, {MAIN: _jsonl([_prompt()])})
+    _gate(run).queue.append(_hold("prompt", 1))
+    h.run.pump()
+    h.clock.wait(pt.LIMITS_ACK_SECONDS + 1)
+    with pytest.raises(pp.StepFailed, match="gate_limits_unacknowledged"):
+        h.run.pump()
+    assert _gate(run).sent == [] and "fence" in _trace(h)
+
+
+def test_a_hold_the_capture_does_not_cover_stops(tmp_path: Path) -> None:
+    h = _live(tmp_path)
+    _through(h, "a1")
+    run = _pod_run(h, "a1", card=1)
+    files = {MAIN: _jsonl([_prompt(), _reply("m1", 1, 10, [_tool("t1")])])}
+    _feed(run, files)
+    # Control: a hold the harvest has read to its reported size is released.
+    _gate(run).queue.append(_hold("response", 1, size=len(files[MAIN]), tool="Bash"))
+    h.run.pump()
+    assert _gate(run).sent == [{"release": "response-1-1", "verdict": "go"}]
+    _gate(run).queue.append(_hold("response", 2, size=len(files[MAIN]) + 50, tool="Bash"))
+    with pytest.raises(pp.StepFailed, match="capture_incomplete"):
+        h.run.pump()
+    assert _gate(run).sent[-1] == {"release": "response-2-2", "verdict": "stop"}
+    assert "a1:-:capture_incomplete" in h.ledger.observations("budget")["gate_violations"]
+    assert "fence" in _trace(h)
+
+
+def test_a_stop_verdict_at_a_hold_interrupts_and_fences(tmp_path: Path) -> None:
+    h = _live(tmp_path)
+    _through(h, "a1")
+    run = _pod_run(h, "a1", card=1)
+    share = run.reservations[0].output_tokens
+    under = {MAIN: _jsonl([_prompt(), _reply("m1", 1, 100, [_tool("t1")])])}
+    _feed(run, under)
+    # Control: under the share the response is released.
+    _gate(run).queue.append(_hold("response", 1, size=len(under[MAIN]), tool="Bash"))
+    h.run.pump()
+    assert _gate(run).sent[-1] == {"release": "response-1-1", "verdict": "go"}
+    over = {MAIN: under[MAIN] + _jsonl([_result("t1", 2), _reply("m2", 3, share, [_tool("t2")])])}
+    _feed(run, over)
+    _gate(run).queue.append(_hold("response", 2, size=len(over[MAIN]), tool="Bash"))
+    with pytest.raises(pp.StepFailed, match="session_share"):
+        h.run.pump()
+    assert _gate(run).sent[-1] == {"release": "response-2-2", "verdict": "stop"}
+    deletes = [argv for argv in h.shell.kubectl() if "delete" in argv and "pod-a1" in argv]
+    assert deletes and "--grace-period=0" in deletes[0]
+    budget = h.ledger.observations("budget")
+    assert budget["allowance_breach"] == ["a1:implementer:session_share"]
+    assert budget["no_allowance_breach"] is False
+    assert {row["source"] for row in _rows(h, "a1")} == {"unknown"}
+    assert "fence" in _trace(h)
+
+
+def test_the_session_deadline_fires_on_the_fake_clock(tmp_path: Path) -> None:
+    h = _live(tmp_path)
+    _through(h, "a1")
+    run = _pod_run(h, "a1", card=1)
+    _feed(run, {MAIN: _jsonl([_prompt(0), _reply("m1", 10, 10, [])])})
+    h.clock.current = T0 + 10
+    h.run.pump()
+    h.clock.current = T0 + pto.SESSION_SECONDS - 1
+    h.run.pump()  # control: one second before the deadline nothing stops
+    assert "fence" not in _trace(h)
+    h.clock.current = T0 + pto.SESSION_SECONDS
+    with pytest.raises(pp.StepFailed, match="session_seconds"):
+        h.run.pump()
+    assert h.ledger.observations("budget")["allowance_breach"] == ["a1:implementer:session_seconds"]
+    assert any("delete" in argv and "pod-a1" in argv for argv in h.shell.kubectl())
+
+
+def test_a_kept_hold_is_stopped_before_the_hook_gives_up(tmp_path: Path) -> None:
+    h = _live(tmp_path)
+    _through(h, "b-r1")
+    run = _pod_run(h, "b-r1", policy=pt.KEEP_PROMPT)
+    files = {MAIN: _jsonl([_prompt()])}
+    _feed(run, files)
+    _gate(run).queue.append(_hold("prompt", 1, size=len(files[MAIN])))
+    h.run.pump()
+    assert run.kept is not None and _gate(run).sent == []
+    h.clock.wait(pto.HOLD_SECONDS - pt.KEPT_MARGIN_SECONDS - 1)
+    h.run.pump()  # control: inside the window the kept hold stays kept
+    h.clock.wait(1)
+    with pytest.raises(pp.StepFailed, match="kept_hold_expired"):
+        h.run.pump()
+
+
+def test_an_unmapped_session_fences(tmp_path: Path) -> None:
+    h = _live(tmp_path)
+    _through(h, "a3")
+    run = _pod_run(h, "a3", policy=pt.RELEASE)
+    files = {MAIN: _jsonl([_prompt(), _reply("m1", 1, 20, [_tool("t1", "Agent")])])}
+    _feed(run, files)
+    # Control: the main session maps to A3's implementer and its Agent call is released.
+    _gate(run).queue.append(_hold("response", 1, size=len(files[MAIN]), tool="Agent", kind="plan"))
+    h.run.pump()
+    assert _gate(run).sent == [{"release": "response-1-1", "verdict": "go"}]
+    assert run.sessions == {MAIN.removesuffix(".jsonl"): run.reservations[0].seq}
+    # A3 reserved no plan reviewer: the subagent's first hold has nowhere to map.
+    _gate(run).queue.append(_hold("response", 2, size=len(files[MAIN]), agent="x1"))
+    with pytest.raises(pp.StepFailed, match="unmapped_session"):
+        h.run.pump()
+    unreserved = [row for row in h.ledger.session_rows() if row["source"] == "unreserved"]
+    assert [(row["grp"], row["role"]) for row in unreserved] == [("a3", pto.PLAN_REVIEWER)]
+    assert h.ledger.run_row()["budget_state"] != "ok"
+    assert h.ledger.observations("roles")["sessions_mapped"] is False
+    assert "fence" in _trace(h)
+
+
+# -- settlement -----------------------------------------------------------------
+
+
+def test_unknown_usage_is_charged_and_fences(tmp_path: Path) -> None:
+    h = _live(tmp_path)
+    _through(h, "a1")
+    run = _pod_run(h, "a1", card=1)
+    _feed(run, {MAIN: _jsonl([_prompt(), _reply("m1", 1, 30, [])])})
+    with pytest.raises(pp.StepFailed, match="usage unknown or unmapped"):
+        h.run.settle_run(run, facts=h.run.pod_facts(run), complete=False)
+    rows = _rows(h, "a1")
+    assert {row["source"] for row in rows} == {"unknown"}
+    # Each unknown session is charged its full share, not the 30 tokens it showed.
+    probe = sum(row["output_tokens"] for row in _rows(h, "a-probe"))
+    assert h.ledger.owner_spent("a") == probe + sum(row["reserved_output"] for row in rows)
+    assert "fence" in _trace(h)
+    with pytest.raises(pps.Refusal) as refused:
+        h.ledger.reserve_group("b-probe", now=h.clock.now())
+    assert refused.value.code == "usage_unknown"
+
+
+def test_complete_capture_settles_known_usage(tmp_path: Path) -> None:
+    h = _live(tmp_path)
+    _through(h, "a1")
+    run = _pod_run(h, "a1", card=1)
+    _feed(run, {MAIN: _jsonl([_prompt(), _reply("m1", 1, 30, [])])})
+    h.run.settle_run(run, facts=h.run.pod_facts(run), complete=True)
+    sources = sorted(row["source"] for row in _rows(h, "a1"))
+    assert sources == ["native", "not_started", "not_started"]
+    assert h.run.settled_known("a1") and "fence" not in _trace(h)
+    classes = h.ledger.observations("budget")["zero_usage_sessions"]
+    assert {item["class"] for item in classes} == {"not_started"}
+
+
+# -- the grant probe ------------------------------------------------------------
+
+
+def _probe_answer(h: _Harness, body: Mapping[str, Any], returncode: int = 0) -> None:
+    base: dict[str, Any] = {
+        "type": "result",
+        "subtype": "success",
+        "is_error": False,
+        "num_turns": 1,
+        "result": "ok",
+        "total_cost_usd": 0.0001,
+        "usage": {"output_tokens": 5},
+        "modelUsage": {pto.PROBE_MODEL: {}},
+    }
+    answer = pp.Completed(returncode, json.dumps({**base, **body}).encode(), b"")
+    h.shell.on("--model", pto.PROBE_MODEL)(lambda _argv, _stdin: answer)
+
+
+def test_a_probe_usage_limit_refusal_stops_before_any_reservation(tmp_path: Path) -> None:
+    h = _live(tmp_path, begin=False)
+    _probe_answer(
+        h,
+        {
+            "is_error": True,
+            "terminal_reason": "api_error",
+            "api_error_status": 429,
+            "result": "API Error: 429 weekly limit reached "
+            '{"type":"error","error":{"type":"rate_limit_error"}}',
+            "usage": {"output_tokens": 0},
+            "modelUsage": {},
+        },
+        returncode=1,
+    )
+    with pytest.raises(pp.StepFailed, match="grant probe failed: api_error 429 rate_limit_error"):
+        h.run.phase_probe_a()
+    assert {row["grp"] for row in h.ledger.session_rows()} == {"a-probe"}
+    assert [row["source"] for row in _rows(h, "a-probe")] == ["probe"]
+    budget = h.ledger.observations("budget")
+    assert budget["probe_a_ok"] is False
+    assert budget["probe_a_error"] == "api_error 429 rate_limit_error"
+    assert budget["probe_isolated_a"] is True
+    result = h.ledger.observations("grant_probe")["result_a"]
+    assert "first_line" not in json.dumps(result) and "weekly" not in json.dumps(result)
+    assert "fence" in _trace(h)
+    # The next phase's reservation is never reached: the run stops on the failure.
+    probe = [call for call in h.shell.calls if "--model" in call.argv]
+    assert len(probe) == 1 and MARKER_A not in " ".join(probe[0].argv)
+
+
+def test_a_passing_probe_settles_with_source_probe(tmp_path: Path) -> None:
+    h = _live(tmp_path, begin=False)
+    _probe_answer(h, {})
+    h.run.phase_probe_a()
+    budget = h.ledger.observations("budget")
+    assert budget["probe_a_ok"] is True and budget["probe_isolated_a"] is True
+    assert budget["allowance_breach"] == []
+    assert [(row["source"], row["output_tokens"]) for row in _rows(h, "a-probe")] == [("probe", 5)]
+    assert h.ledger.run_row()["live_started_at"] == T0
+    assert "fence" not in _trace(h)
+
+
+# -- the disconnect -------------------------------------------------------------
+
+_DISCONNECT_BREAKS: dict[str, dict[str, Any]] = {
+    "disconnect_inactive": {"disconnect": {"inactive": False}},
+    "disconnect_generation_advanced": {"disconnect": {"generation_advanced": False}},
+    "teardown_pending_runtimes": {"disconnect": {"pending_runtimes": 1}},
+    "teardown_pending_custody_cleanup": {"disconnect": {"pending_custody_cleanup": None}},
+    "a_custody_secret_absent": {"disconnect": {"custody_secret_absent": False}},
+    "a3_failed_enrollment_fenced": {"row": {"terminal_cause": "cancelled"}},
+    "a3_termination_observation": {"row": {"observed": False}},
+    "a3_pod_absent": {"pod_present": True},
+    "a3_tokens_secret_absent": {"secret": True},
+    "a_claims_absent": {"claims": ["claim-a9"]},
+}
+
+
+def _disconnect_setup(h: _Harness, breaks: Mapping[str, Any]) -> None:
+    _through(h, "a3")
+    _through(h, "b-r1")
+    held = _pod_run(h, "b-r1", policy=pt.KEEP_PROMPT)
+    held.request_id = REQUEST_B1
+    follow = _pod_run(h, "a3", policy=pt.KEEP_AFTER_TOOL)
+    follow.request_id = REQUEST_A1
+    records = [_prompt(), _reply("m1", 1, 40, [_tool("t1")]), _result("t1", 2)]
+    records.append(_reply("m2", 3, 20, [_tool("t2")]))
+    files = {MAIN: _jsonl(records)}
+    _feed(follow, files)
+    follow.kept = _hold("response", 3, size=len(files[MAIN]), tool="Bash")["hold"]
+    follow.kept_at = h.clock.now()
+    follow.kept_files, follow.kept_facts = files, h.run.pod_facts(follow, files)
+    follow.eof.set()
+    disconnect = {
+        "inactive": True,
+        "generation_advanced": True,
+        "pending_runtimes": 0,
+        "pending_custody_cleanup": 0,
+        "custody_secret_absent": True,
+        **breaks.get("disconnect", {}),
+    }
+    row = {"status": "failed", "terminal_cause": "enrollment_fenced", "observed": True}
+    row.update(breaks.get("row", {}))
+    h.run.disconnect_owner = lambda _owner: dict(disconnect)  # type: ignore[method-assign]
+    h.run.request_row = lambda _request: dict(row)  # type: ignore[method-assign]
+    h.run.pod_uid_present = lambda _n, _u: bool(breaks.get("pod_present"))  # type: ignore[method-assign]
+    h.run.owner_claims = lambda _owner: list(breaks.get("claims", []))  # type: ignore[method-assign]
+    if breaks.get("secret"):
+        h.shell.on("get", "secret", "claim-a3-tokens")(lambda _a, _s: b"secret/claim-a3-tokens\n")
+
+
+def test_the_disconnect_confirms_every_key(tmp_path: Path) -> None:
+    h = _live(tmp_path)
+    _disconnect_setup(h, {})
+    h.run.phase_disconnect_a()
+    observed = h.ledger.observations("disconnect")
+    for key in _DISCONNECT_BREAKS:
+        expected = 0 if key.startswith("teardown_") else True
+        assert observed[key] == expected and type(observed[key]) is type(expected), key
+    assert observed["a3_settled_from_hold"] is True
+    assert observed["b_grant_unchanged"] is True
+    assert h.run.a_stop_at == h.clock.now()
+    assert [row["source"] for row in _rows(h, "a3")] == ["native"]
+    assert "fence" not in _trace(h)
+
+
+@pytest.mark.parametrize("key", sorted(_DISCONNECT_BREAKS))
+def test_the_disconnect_fails_when_a_confirmation_is_missing(tmp_path: Path, key: str) -> None:
+    h = _live(tmp_path)
+    _disconnect_setup(h, _DISCONNECT_BREAKS[key])
+    with pytest.raises(pp.StepFailed, match=key):
+        h.run.phase_disconnect_a()
+    observed = h.ledger.observations("disconnect")[key]
+    assert observed is not True and not (type(observed) is int and observed == 0)
+    assert "fence" in _trace(h)
+
+
+# -- CI repair --------------------------------------------------------------------
+
+
+def _ci_runs(conclusion: str, status: str = "completed") -> dict[str, Any]:
+    return {
+        "total_count": 1,
+        "check_runs": [
+            {
+                "id": 31,
+                "name": "unit",
+                "status": status,
+                "conclusion": conclusion if status == "completed" else None,
+                "app": {"slug": pto.ACTIONS_APP},
+            }
+        ],
+    }
+
+
+def _ci_setup(h: _Harness, *, failing: bool = True, event: bool = True) -> None:
+    _through(h, "b-r1")
+    first = _pod_run(h, "b1", card=3, reserve=False)
+    first.request_id = REQUEST_B1
+    h.run.b1_head = HEAD_B1
+    runs = _ci_runs("failure" if failing else "success")
+    answers = {
+        f"/commits/{HEAD_B1}/check-runs?filter=all&per_page=100": runs,
+        f"/commits/{HEAD_B1}/check-runs?filter=latest&per_page=100": runs,
+        "/check-runs/31/annotations": [{"path": "CI_ACK.md", "message": "missing line"}],
+    }
+    h.run.forge_get = lambda suffix: answers[suffix]  # type: ignore[method-assign]
+    h.run.phase_notes = lambda _r: [pt.RERUN_FORBIDDEN_NOTE]  # type: ignore[method-assign]
+    payload = json.dumps({"event_id": f"work-item-{REQUEST_B1}-ci-2"})
+    entries = [("1-0", {pto.STREAM_PAYLOAD_FIELD: payload})] if event else []
+    h.run.valkey_xrange = lambda *_a, **_k: list(entries)  # type: ignore[method-assign]
+    h.run.request_row = lambda _r: {"heartbeat_parked": True}  # type: ignore[method-assign]
+
+
+def test_the_ci_failure_is_observed_from_real_reads(tmp_path: Path) -> None:
+    h = _live(tmp_path)
+    _ci_setup(h)
+    h.run.observe_ci_failure()
+    observed = h.ledger.observations("ci-repair")
+    for key in (
+        "b1_head_check_failed",
+        "b1_failure_names_ci_ack",
+        "rerun_settled",
+        "round2_event_enqueued",
+        "round2_heartbeat_parked",
+    ):
+        assert observed[key] is True, key
+    assert h.run.b1_check_names == ["unit"]
+
+
+def test_the_ci_phase_fails_when_the_head_check_is_not_failing(tmp_path: Path) -> None:
+    h = _live(tmp_path)
+    _ci_setup(h, failing=False)
+    with pytest.raises(pp.StepFailed, match="no failing Actions check"):
+        h.run.observe_ci_failure()
+    assert h.ledger.observations("ci-repair")["b1_head_check_failed"] is False
+    assert "fence" in _trace(h)
+
+
+def test_the_ci_phase_fails_without_the_round_two_event(tmp_path: Path) -> None:
+    h = _live(tmp_path)
+    _ci_setup(h, event=False)
+    with pytest.raises(pp.StepFailed, match="round2_event_enqueued"):
+        h.run.observe_ci_failure()
+    assert h.ledger.observations("ci-repair")["round2_event_enqueued"] is False
+
+
+def _repaired_setup(h: _Harness, runs: Any, *, required: str = "unit") -> None:
+    h.run.default_branch = "main"
+    h.run.b1_check_names = ["unit"]
+    rules = [
+        {
+            "type": "required_status_checks",
+            "parameters": {"required_status_checks": [{"context": required}]},
+        }
+    ]
+    answers = {
+        f"/commits/{HEAD_B2}/check-runs?filter=latest&per_page=100": runs,
+        f"/commits/{HEAD_B2}/status": {"state": "success", "statuses": []},
+        "/rules/branches/main": rules,
+        "/branches/main": {"protection": {}},
+    }
+    h.run.forge_get = lambda suffix: answers[suffix]  # type: ignore[method-assign]
+    ack = f"ci ack: {BRANCH_B}\n".encode()
+    h.run.forge_file = lambda path, ref: ack if path == pto.CI_ACK_FILE else None  # type: ignore[method-assign]
+
+
+def test_the_repaired_head_passes_with_every_required_check(tmp_path: Path) -> None:
+    h = _live(tmp_path)
+    _repaired_setup(h, _ci_runs("success"))
+    assert h.run.repaired_checks(HEAD_B2, BRANCH_B) == {
+        "repaired_head_adds_ci_ack": True,
+        "repaired_checks_passed": True,
+        "required_checks_present": True,
+    }
+
+
+def test_the_repaired_head_fails_with_a_pending_check(tmp_path: Path) -> None:
+    h = _live(tmp_path)
+    _repaired_setup(h, _ci_runs("success", status="in_progress"))
+    checks = h.run.repaired_checks(HEAD_B2, BRANCH_B)
+    assert checks["repaired_checks_passed"] is False
+    assert checks["required_checks_present"] is False
+    assert h.clock.now() >= T0 + pp.CI_WAIT_SECONDS
+
+
+def test_the_repaired_head_fails_with_a_missing_required_check(tmp_path: Path) -> None:
+    h = _live(tmp_path)
+    _repaired_setup(h, _ci_runs("success"), required="integration")
+    checks = h.run.repaired_checks(HEAD_B2, BRANCH_B)
+    assert checks["repaired_checks_passed"] is True
+    assert checks["required_checks_present"] is False
+
+
+# -- after the disconnect ---------------------------------------------------------
+
+
+def _post_setup(h: _Harness, *, a_claims: list[str]) -> None:
+    follow = _pod_run(h, "a3", reserve=False)
+    follow.request_id, follow.work_item_id = REQUEST_A1, WORK_ITEM
+    first = _pod_run(h, "b1", reserve=False)
+    first.request_id = REQUEST_B1
+    h.run.stop_worker = lambda: ["uid-w2"]  # type: ignore[method-assign]
+    h.run.restart_worker = lambda before: {"new_worker_uid": True, "candidate_image": True}  # type: ignore[method-assign]
+    h.api.route("POST", "/v1/internal/work-items/admissions")(
+        lambda _p, _h, _b: (409, {"detail": {"code": "enrollment_inactive"}})
+    )
+    h.api.route("GET", f"/work-items/{WORK_ITEM}")(
+        lambda _p, _h, _b: (200, {"requests": [{"id": REQUEST_A1, "status": "failed"}]})
+    )
+    h.run.owner_claims = (  # type: ignore[method-assign]
+        lambda owner: list(a_claims) if owner.name == "a" else ["claim-b1"]
+    )
+    rows = [{"id": REQUEST_A1, "sequence": 3, "owner_lost_retry": False}]
+    h.run.request_rows = lambda _w: list(rows)  # type: ignore[method-assign]
+    h.run.revalidate = lambda _owner, _run: True  # type: ignore[method-assign]
+    active = _enrollment("active", 1, 1)
+    h.run.subscription = lambda owner, verb, *extra: (0, dict(active))  # type: ignore[method-assign]
+    h.run.valkey_xrange = lambda *_a, **_k: []  # type: ignore[method-assign]
+    h.run.agent_claims = lambda: []  # type: ignore[method-assign]
+
+
+def test_post_disconnect_refusals_pass_and_close_the_live_window(tmp_path: Path) -> None:
+    h = _live(tmp_path)
+    _post_setup(h, a_claims=[])
+    h.run.phase_post_disconnect()
+    observed = h.ledger.observations("disconnect")
+    for key in (
+        "post_restart_admission_refused",
+        "post_restart_no_a_claim",
+        "post_restart_no_a_running",
+        "post_restart_no_a3_successor",
+        "post_restart_revalidation_refused",
+        "b_active_gen1_after",
+    ):
+        assert observed[key] is True, key
+    assert h.ledger.observations("budget")["unplanned_starts_fenced"] is True
+    assert h.ledger.observations("ci-repair")["no_round3"] is True
+    assert _trace(h)[-2:] == ["fence", "summary"]
+    assert h.ledger.run_row()["live_ended_at"] is not None
+
+
+def test_post_disconnect_fails_if_an_a_claim_appears(tmp_path: Path) -> None:
+    h = _live(tmp_path)
+    _post_setup(h, a_claims=["claim-a9"])
+    with pytest.raises(pp.StepFailed, match="post_restart_no_a_claim"):
+        h.run.phase_post_disconnect()
+    assert h.ledger.observations("disconnect")["post_restart_no_a_claim"] is False
+    assert "fence" in _trace(h)
+
+
+def test_summary_keys_read_the_gathered_evidence(tmp_path: Path) -> None:
+    h = _live(tmp_path)
+    _through(h, "a1")
+    run = _pod_run(h, "a1", card=1)
+    files = {MAIN: _jsonl([_prompt(), _reply("m1", 1, 30, [_tool("t1", "mcp__curie__x")])])}
+    _feed(run, files)
+    _gate(run).queue.append(_hold("prompt", 1, size=len(files[MAIN])))
+    h.run.pump()
+    h.run.settle_run(run, facts=h.run.pod_facts(run), complete=True)
+    h.run.owners["a"].work_item_ids = [WORK_ITEM]
+    item = _admission_answer("a", REQUEST_A1)
+    work_item = {**item["work_item"], "requests": [item["request"]]}
+    h.api.route("GET", f"/work-items/{WORK_ITEM}")(lambda _p, _h, _b: (200, work_item))
+    h.shell.on("work-items", WORK_ITEM)(lambda _a, _s: {"item": work_item})
+    h.ledger.record("owners", "installation_grant_absent", True)
+    h.ledger.record("owners", "service_credentials_absent", True)
+    pt.TwoOwnerRun.record_summary_keys(h.run)
+    owners = h.ledger.observations("owners")
+    assert owners["work_item_owner_a"] is True and owners["request_owners_a"] is True
+    assert owners["cli_owner_a"] is True
+    roles = h.ledger.observations("roles")
+    assert roles["implementer_session_a"] is True and roles["aci_tool_observed_a"] is True
+    # No plan or diff reviewer ran in this one-session fixture.
+    assert roles["plan_reviewer_session_a"] is False
+    assert roles["sessions_mapped"] is True
+    budget = h.ledger.observations("budget")
+    assert budget["limits_written_before_prompt"] is True
+    assert budget["gate_every_response"] is True and budget["no_allowance_breach"] is True
+    assert budget["zero_usage_classified"] is True
+    # B never ran, so the per-claim grant reference was read for one owner only.
+    assert budget["no_credential_fallback"] is False
+    # Cards 2 to 4 never parked here.
+    assert h.ledger.observations("approval")["no_push_before_approval"] is False
