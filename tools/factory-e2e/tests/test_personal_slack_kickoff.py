@@ -30,6 +30,7 @@ import http.server
 import inspect
 import json
 import os
+import queue
 import random
 import shutil
 import socket
@@ -75,6 +76,7 @@ REPO = "acme-corp/acme-fixture"
 ISSUE_URL = f"https://github.com/{REPO}/issues/7"
 SESSION = "5d0c7f3e-0000-4000-8000-00000000b001"
 CONTINUATION = "5d0c7f3e-0000-4000-8000-00000000b002"
+THIRD_SESSION = "5d0c7f3e-0000-4000-8000-00000000b003"
 # Observed model ids in the fixture transcripts; the driver never pins a model.
 IMPLEMENTER_MODEL = "claude-sonnet-5-5-20261001"
 REVIEWER_MODEL = "claude-opus-5-5"
@@ -160,6 +162,17 @@ def _assistant(message_id: str, model: str, tokens: int | None, at: float) -> di
             "content": [{"type": "text", "text": "working"}],
             "usage": usage,
         },
+    }
+
+
+def _user(at: float) -> dict[str, Any]:
+    """A native CLI user record: the prompt a session opens with, before any response."""
+
+    return {
+        "type": "user",
+        "timestamp": _stamp(at),
+        "sessionId": SESSION,
+        "message": {"role": "user", "content": "work the issue"},
     }
 
 
@@ -738,7 +751,7 @@ REFUSALS = [
     ),
     pytest.param(
         "run",
-        _value("--approve-live", CEILING.replace("sessions=8", "sessions=3")),
+        _value("--approve-live", CEILING.replace("sessions=8", "sessions=4")),
         "live_unapproved",
         id="sessions-below-roles",
     ),
@@ -935,10 +948,13 @@ def test_reservations_persist_before_a_paid_start_and_unknown_usage_refuses_the_
     assert [
         (r["role"], r["reserved_output"], r["reserved_turns"], r["output_tokens"]) for r in rows
     ] == [
+        # The main implementer session keeps the lead share; the publish continuation's
+        # slot splits the rest with the reviewers.
         (sks.IMPLEMENTER, 8192, 32, None),
-        (sks.PLAN_REVIEWER, 2730, 21, None),
-        (sks.DIFF_REVIEWER, 2730, 21, None),
-        (sks.DIFF_REVIEWER, 2730, 21, None),
+        (sks.IMPLEMENTER, 2048, 16, None),
+        (sks.PLAN_REVIEWER, 2048, 16, None),
+        (sks.DIFF_REVIEWER, 2048, 16, None),
+        (sks.DIFF_REVIEWER, 2048, 16, None),
     ]
     assert sum(r["reserved_output"] for r in rows) <= 16384
     assert sum(r["reserved_turns"] for r in rows) <= 96
@@ -947,13 +963,14 @@ def test_reservations_persist_before_a_paid_start_and_unknown_usage_refuses_the_
     assert refused.value.code == "usage_unknown"  # the attempt's own usage is not known yet
     # An incomplete capture leaves every slot unknown, charged its full share.
     counts = sks.settle_attempt(ledger, reservations, None, complete=False)
-    assert counts == {"settled": 0, "unknown": 4, "unreserved": 0}
+    assert counts == {"settled": 0, "unknown": 5, "unreserved": 0}
     assert ledger.budget_state() == "unknown"
     assert [sks.charged(row) for row in ledger.sessions()] == [
         (8192, 32, 300.0),
-        (2730, 21, 300.0),
-        (2730, 21, 300.0),
-        (2730, 21, 300.0),
+        (2048, 16, 300.0),
+        (2048, 16, 300.0),
+        (2048, 16, 300.0),
+        (2048, 16, 300.0),
     ]
     with pytest.raises(sks.Refusal) as refused:
         ledger.reserve([sks.IMPLEMENTER], now=T0 + 600)
@@ -972,11 +989,12 @@ def test_reservations_persist_before_a_paid_start_and_unknown_usage_refuses_the_
     reservations = settled.reserve(sks.ATTEMPT_ROLES, now=T0 + 1)
     facts = sks.attempt_facts([_attempt_files()], not_before=T0 - 30)
     counts = sks.settle_attempt(settled, reservations, facts.sessions, complete=True)
-    assert counts == {"settled": 4, "unknown": 0, "unreserved": 0}
+    assert counts == {"settled": 5, "unknown": 0, "unreserved": 0}
     assert [
         (r["source"], r["output_tokens"], r["assistant_turns"]) for r in settled.sessions()
     ] == [
         ("native", 12 * 150 + 2 * 90, 14),
+        ("not_started", 0, 0),  # no publish continuation ran
         ("native", 900, 3),
         ("native", 900, 3),
         ("not_started", 0, 0),
@@ -993,20 +1011,26 @@ def test_reservations_persist_before_a_paid_start_and_unknown_usage_refuses_the_
 
 RESERVATIONS = [
     sks.Reservation(1, sks.IMPLEMENTER, 8192, 32, 300.0),
-    sks.Reservation(2, sks.PLAN_REVIEWER, 2730, 21, 300.0),
-    sks.Reservation(3, sks.DIFF_REVIEWER, 2730, 21, 300.0),
-    sks.Reservation(4, sks.DIFF_REVIEWER, 2730, 21, 300.0),
+    sks.Reservation(2, sks.IMPLEMENTER, 2048, 16, 300.0),
+    sks.Reservation(3, sks.PLAN_REVIEWER, 2048, 16, 300.0),
+    sks.Reservation(4, sks.DIFF_REVIEWER, 2048, 16, 300.0),
+    sks.Reservation(5, sks.DIFF_REVIEWER, 2048, 16, 300.0),
 ]
 
 
-def _breaches(pods: Sequence[Mapping[str, bytes]], now: float) -> list[str]:
+def _breaches(
+    pods: Sequence[Mapping[str, bytes]], now: float, *, running: bool = False
+) -> list[str]:
     facts = sks.attempt_facts(pods, not_before=T0 - 30)
-    return sks.watchdog_breaches(RESERVATIONS, facts.sessions, sks.parse_ceiling(CEILING), now=now)
+    return sks.watchdog_breaches(
+        RESERVATIONS, facts.sessions, sks.parse_ceiling(CEILING), now=now, running=running
+    )
 
 
 def test_watchdog_charges_every_session_against_the_ceiling() -> None:
-    """Behavior: output tokens first, then turns, then seconds; totals, the publish
-    continuation, unknown usage and unreserved starts all bind."""
+    """Behavior: output tokens first, then turns, then seconds; totals, each native
+    session's own caps (the publish continuation's included), unknown usage and
+    unreserved starts all bind."""
 
     calm = _attempt_files()
     roles = {session.role for session in sks.parse_native_transcripts(calm).sessions}
@@ -1021,7 +1045,8 @@ def test_watchdog_charges_every_session_against_the_ceiling() -> None:
     ]
 
     # The publish continuation replays its history into a new pod's session. The
-    # replay is not charged again; its new turns go to the implementer's one slot.
+    # replay is not charged again; the continuation is its own native session in its
+    # own implementer slot, so the per-session caps bind each session on its own.
     first = _turns("msg_impl", IMPLEMENTER_MODEL, 20, 100, start=0)
     second = [*first, *_turns("msg_cont", IMPLEMENTER_MODEL, 12, 100, start=200)]
     pods = [
@@ -1030,9 +1055,12 @@ def test_watchdog_charges_every_session_against_the_ceiling() -> None:
     ]
     facts = sks.attempt_facts(pods, not_before=T0 - 30)
     slots, unreserved = sks.match_slots(RESERVATIONS, facts.sessions)
-    assert (slots[1].sessions, slots[1].assistant_turns, slots[1].output_tokens) == (2, 32, 3200)
+    assert [
+        (slots[seq].sessions, slots[seq].assistant_turns, slots[seq].output_tokens)
+        for seq in (1, 2)
+    ] == [(1, 20, 2000), (1, 12, 1200)]
     assert unreserved == []
-    assert _breaches(pods, T0 + 212) == ["turns:implementer"]
+    assert _breaches(pods, T0 + 212) == []
 
     # The totals bind even when no single session reaches its own cap.
     spread = _pod_files(
@@ -1075,6 +1103,237 @@ def test_watchdog_charges_every_session_against_the_ceiling() -> None:
         + [("other1", "general-purpose", _turns("msg_other", REVIEWER_MODEL, 1, 50, start=9))],
     )
     assert _breaches([extra], T0 + 10) == ["unreserved:diff-reviewer", "unreserved:unattributed"]
+
+
+def test_watchdog_bounds_wall_clock_and_charges_a_live_session_from_its_first_record(
+    tmp_path: Path,
+) -> None:
+    """Behavior: every session's seconds are wall clock, never less the time its reviewers
+    ran, in the watchdog, the ledger and the judge; while a native process runs, the newest
+    implementer session is charged now minus its first record, so waiting on a reviewer
+    never pauses its bound; nothing breaches before the deadline."""
+
+    ceiling = sks.parse_ceiling(CEILING)
+    # The implementer waits on its plan review and answers 302 s after it started; the
+    # shared parser's figure leaves out the 290 s the reviewer ran.
+    waited = _pod_files(
+        [
+            *_turns("msg_impl", IMPLEMENTER_MODEL, 3, 50, start=0),
+            *_turns("msg_back", IMPLEMENTER_MODEL, 2, 50, start=301),
+        ],
+        [("plan01", PLAN_KIND, _turns("msg_plan", REVIEWER_MODEL, 3, 50, start=5, step=145))],
+    )
+    facts = sks.attempt_facts([waited], not_before=T0 - 30)
+    implementer = next(item for item in facts.sessions if item.role == sks.IMPLEMENTER)
+    assert implementer.elapsed < 300 <= sks.wall_seconds(implementer) == 302.0
+    assert _breaches([waited], T0 + 302) == ["seconds:implementer"]
+    slots, _unreserved = sks.match_slots(RESERVATIONS, facts.sessions)
+    assert slots[1].elapsed == 302.0
+    assert sks.session_record(implementer)["elapsed"] == 302.0
+    ledger = _run_ledger(_private(tmp_path / "state"))
+    ledger.begin_live(now=T0, grant_expires_at=T0 + 3 * 3600)
+    reservations = ledger.reserve(sks.ATTEMPT_ROLES, now=T0 + 1)
+    sks.settle_attempt(ledger, reservations, facts.sessions, complete=True)
+    rows = ledger.sessions()
+    assert rows[0]["elapsed"] == 302.0
+    assert "session_seconds" in sks.budget_findings(rows, ceiling)
+    ledger.close()
+
+    # A reviewer is still active and the implementer has written nothing since it started
+    # the review. While its process runs, the implementer is charged now minus its first
+    # record; the reviewer, the most recently active, is charged since its last record.
+    active = _pod_files(
+        _turns("msg_impl", IMPLEMENTER_MODEL, 3, 50, start=0),
+        [("plan01", PLAN_KIND, _turns("msg_plan", REVIEWER_MODEL, 3, 50, start=10, step=140))],
+    )
+    assert _breaches([active], T0 + 299, running=True) == []
+    assert _breaches([active], T0 + 300, running=True) == ["seconds:implementer"]
+    assert _breaches([active], T0 + 300) == []  # no native process runs: no live charge
+
+    # The live session is the implementer session with the latest first record: the
+    # publish continuation, not the main session that ended before it.
+    pods = [
+        _pod_files(_turns("msg_impl", IMPLEMENTER_MODEL, 2, 50, start=0, step=50)),
+        _pod_files(
+            _turns("msg_cont", IMPLEMENTER_MODEL, 2, 50, start=200, step=10),
+            session=CONTINUATION,
+            config="curie-claude-config-c3d4",
+        ),
+    ]
+    assert _breaches(pods, T0 + 499, running=True) == []
+    assert _breaches(pods, T0 + 500, running=True) == ["seconds:implementer"]
+
+
+def test_every_native_start_takes_its_own_slot_and_the_session_count_binds(
+    tmp_path: Path,
+) -> None:
+    """Behavior: the implementer, the publish continuation, the plan reviewer and two diff
+    reviewers settle as five rows, each against its own per-session caps; a third
+    implementer session is unreserved in the watchdog and in the judge's findings, more
+    native sessions than the ceiling breach, and a ceiling under five sessions is refused."""
+
+    ceiling = sks.parse_ceiling(CEILING)
+    tight = sks.parse_ceiling(CEILING.replace("sessions=8", "sessions=5"))
+    # Each implementer session alone is under the per-session caps; together they are not.
+    implementer = _turns("msg_impl", IMPLEMENTER_MODEL, 20, 250, start=0)
+    pods = [
+        _pod_files(
+            implementer,
+            [
+                ("plan01", PLAN_KIND, _turns("msg_plan", REVIEWER_MODEL, 3, 300, start=20)),
+                ("diff01", DIFF_KIND, _turns("msg_diff", REVIEWER_MODEL, 3, 300, start=30)),
+                ("diff02", DIFF_KIND, _turns("msg_redo", REVIEWER_MODEL, 3, 300, start=40)),
+            ],
+        ),
+        _pod_files(
+            [*implementer, *_turns("msg_cont", IMPLEMENTER_MODEL, 20, 200, start=100)],
+            session=CONTINUATION,
+            config="curie-claude-config-c3d4",
+        ),
+    ]
+    five = sks.attempt_facts(pods, not_before=T0 - 30).sessions
+    assert len(five) == 5
+    assert sks.watchdog_breaches(RESERVATIONS, five, ceiling, now=T0 + 120, running=False) == []
+    assert sks.watchdog_breaches(RESERVATIONS, five, tight, now=T0 + 120, running=False) == []
+    state = _private(tmp_path / "state")
+    ledger = _run_ledger(state)
+    ledger.begin_live(now=T0, grant_expires_at=T0 + 3 * 3600)
+    reservations = ledger.reserve(sks.ATTEMPT_ROLES, now=T0 + 1)
+    counts = sks.settle_attempt(ledger, reservations, five, complete=True)
+    assert counts == {"settled": 5, "unknown": 0, "unreserved": 0}
+    rows = ledger.sessions()
+    assert [(r["role"], r["source"], r["output_tokens"], r["assistant_turns"]) for r in rows] == [
+        (sks.IMPLEMENTER, "native", 5000, 20),
+        (sks.IMPLEMENTER, "native", 4000, 20),
+        (sks.PLAN_REVIEWER, "native", 900, 3),
+        (sks.DIFF_REVIEWER, "native", 900, 3),
+        (sks.DIFF_REVIEWER, "native", 900, 3),
+    ]
+    assert sks.budget_findings(rows, ceiling) == [] and ledger.budget_state() == "ok"
+    ledger.close()
+
+    # A sixth native session, a third implementer session, has no slot left.
+    third = _pod_files(
+        _turns("msg_third", IMPLEMENTER_MODEL, 1, 50, start=130),
+        session=THIRD_SESSION,
+        config="curie-claude-config-e5f6",
+    )
+    six = sks.attempt_facts([*pods, third], not_before=T0 - 30).sessions
+    assert sks.watchdog_breaches(RESERVATIONS, six, ceiling, now=T0 + 131, running=False) == [
+        "unreserved:implementer"
+    ]
+    assert sks.watchdog_breaches(RESERVATIONS, six, tight, now=T0 + 131, running=False) == [
+        "sessions:total",
+        "unreserved:implementer",
+    ]
+    for run_id, complete, settled, unknown in (
+        ("acme-kickoff-2", True, 5, 0),
+        ("acme-kickoff-3", False, 0, 5),  # an incomplete capture still counts every start
+    ):
+        judged = _run_ledger(state, run_id)
+        judged.begin_live(now=T0, grant_expires_at=T0 + 3 * 3600)
+        reservations = judged.reserve(sks.ATTEMPT_ROLES, now=T0 + 1)
+        counts = sks.settle_attempt(judged, reservations, six, complete=complete)
+        assert counts == {"settled": settled, "unknown": unknown, "unreserved": 1}
+        rows = judged.sessions()
+        assert len(rows) == 6
+        assert (rows[-1]["role"], rows[-1]["source"]) == (sks.IMPLEMENTER, "unreserved")
+        assert "unreserved" in sks.budget_findings(rows, ceiling)
+        assert {"sessions", "unreserved"} <= set(sks.budget_findings(rows, tight))
+        assert judged.budget_state() == "exceeded"
+        judged.close()
+
+    with pytest.raises(sks.Refusal) as refused:
+        sks.attempt_roles(sks.parse_ceiling(CEILING.replace("sessions=8", "sessions=4")))
+    assert refused.value.code == "live_unapproved"
+    assert sks.attempt_roles(tight) == sks.ATTEMPT_ROLES
+    # Implementer slots never pass the bundle's reviewer gate, so the image limits hold.
+    assert sks.reviewer_limits(sks.ATTEMPT_ROLES) == {"plan": 1, "diff": 2}
+
+
+def test_settlement_checks_the_ceiling_once_every_slot_holds_its_usage(
+    tmp_path: Path,
+) -> None:
+    """Behavior: an attempt whose observed totals fit the ceiling settles ok even when the
+    implementer and continuation together use more than their reserved shares; a slot not
+    yet settled is charged its full share, so a check between slots would mark it
+    exceeded. A real excess is still exceeded."""
+
+    ceiling = sks.parse_ceiling(CEILING)
+
+    def attempt(continuation_tokens: int) -> Sequence[Any]:
+        pods = [
+            _pod_files(
+                _turns("msg_impl", IMPLEMENTER_MODEL, 20, 400, start=0),
+                [
+                    ("plan01", PLAN_KIND, _turns("msg_plan", REVIEWER_MODEL, 3, 100, start=25)),
+                    ("diff01", DIFF_KIND, _turns("msg_diff", REVIEWER_MODEL, 3, 100, start=30)),
+                    ("diff02", DIFF_KIND, _turns("msg_redo", REVIEWER_MODEL, 3, 100, start=35)),
+                ],
+            ),
+            _pod_files(
+                _turns("msg_cont", IMPLEMENTER_MODEL, 13, continuation_tokens, start=100),
+                session=CONTINUATION,
+                config="curie-claude-config-c3d4",
+            ),
+        ]
+        return sks.attempt_facts(pods, not_before=T0 - 30).sessions
+
+    state = _private(tmp_path / "state")
+    for run_id, continuation_tokens, expected in (
+        # 8000 + 2600 + 900 = 11,500 observed; 8000 + 2600 + 3 x 2048 reserved mid-way.
+        ("acme-kickoff-fits", 200, "ok"),
+        # 8000 + 13 x 600 + 900 = 16,700 observed: over the 16,384 total, under each cap.
+        ("acme-kickoff-over", 600, "exceeded"),
+    ):
+        sessions = attempt(continuation_tokens)
+        assert len(sessions) == 5
+        ledger = _run_ledger(state, run_id)
+        ledger.begin_live(now=T0, grant_expires_at=T0 + 3 * 3600)
+        reservations = ledger.reserve(sks.ATTEMPT_ROLES, now=T0 + 1)
+        counts = sks.settle_attempt(ledger, reservations, sessions, complete=True)
+        assert counts == {"settled": 5, "unknown": 0, "unreserved": 0}
+        rows = ledger.sessions()
+        assert [r["output_tokens"] for r in rows] == [
+            8000,
+            13 * continuation_tokens,
+            300,
+            300,
+            300,
+        ]
+        assert ledger.budget_state() == expected
+        assert (sks.budget_findings(rows, ceiling) == []) == (expected == "ok")
+        ledger.close()
+
+
+def test_a_session_awaiting_its_first_response_is_pending_not_unknown(tmp_path: Path) -> None:
+    """Behavior: a transcript holding only user records is pending, bound only by its
+    seconds; its first valid response is counted normally; a response without usage is
+    still unknown; settlement of a session with no assistant usage stays unknown."""
+
+    waiting = _pod_files([_user(0)])
+    assert _breaches([waiting], T0 + 10) == []
+    assert _breaches([waiting], T0 + 10, running=True) == []
+    assert _breaches([waiting], T0 + 300) == ["seconds:implementer"]
+    answered = _pod_files([_user(0), *_turns("msg_impl", IMPLEMENTER_MODEL, 1, 120, start=4)])
+    assert _breaches([answered], T0 + 10) == []
+    facts = sks.attempt_facts([answered], not_before=T0 - 30)
+    slots, _unreserved = sks.match_slots(RESERVATIONS, facts.sessions)
+    assert (slots[1].known, slots[1].output_tokens, slots[1].assistant_turns) == (True, 120, 1)
+    no_usage = _pod_files([_user(0), *_turns("msg_impl", IMPLEMENTER_MODEL, 1, None, start=4)])
+    assert _breaches([no_usage], T0 + 10) == ["usage_unknown:implementer"]
+
+    # Settlement stays fail closed: no assistant usage is unknown, charged its full share.
+    ledger = _run_ledger(_private(tmp_path / "state"))
+    ledger.begin_live(now=T0, grant_expires_at=T0 + 3 * 3600)
+    reservations = ledger.reserve(sks.ATTEMPT_ROLES, now=T0 + 1)
+    facts = sks.attempt_facts([waiting], not_before=T0 - 30)
+    counts = sks.settle_attempt(ledger, reservations, facts.sessions, complete=True)
+    assert counts == {"settled": 4, "unknown": 1, "unreserved": 0}
+    rows = ledger.sessions()
+    assert rows[0]["source"] == "unknown" and sks.charged(rows[0]) == (8192, 32, 300.0)
+    assert ledger.budget_state() == "unknown"
+    ledger.close()
 
 
 # --------------------------------------------------------------------------
@@ -1144,18 +1403,36 @@ def _pod(name: str, uid: str, phase: str, *, running: bool) -> dict[str, Any]:
     }
 
 
+def _ready_worker() -> dict[str, Any]:
+    """A worker pod whose readiness heartbeat still reports Ready."""
+
+    return {
+        "metadata": {"name": "psk-acme-worker-0"},
+        "status": {"conditions": [{"type": "Ready", "status": "True"}]},
+    }
+
+
 def _cluster(
     pods: Sequence[dict[str, Any]],
+    *,
+    workers: Sequence[dict[str, Any]] = (),
+    late: Sequence[dict[str, Any]] = (),
 ) -> tuple[Callable[[list[str]], psk.Completed], dict[str, Any]]:
-    """Runner pods by the claim label until a pod delete removes them; every other read empty."""
+    """Runner pods by the claim label until a runner delete removes them (leaving ``late``).
 
-    cluster: dict[str, Any] = {"pods": list(pods)}
+    Worker pods by the worker selector stay as given; every other read is empty.
+    """
+
+    cluster: dict[str, Any] = {"pods": list(pods), "workers": list(workers)}
 
     def answer(argv: list[str]) -> psk.Completed:
         args = argv[1:]
         verb = _verb(args)
-        if verb == "delete" and "pod" in args:
-            cluster["pods"] = []
+        worker = any("component=worker" in arg for arg in args)
+        if verb == "delete" and "pod" in args and not worker:
+            cluster["pods"] = list(late)
+        if verb == "get" and "pods" in args and worker:
+            return psk.Completed(0, json.dumps({"items": cluster["workers"]}).encode(), b"")
         if verb == "get" and "pods" in args and psk.POD_CLAIM_LABEL in args:
             return psk.Completed(0, json.dumps({"items": cluster["pods"]}).encode(), b"")
         if verb == "get":
@@ -1241,24 +1518,44 @@ def _file_record(path: str, offset: int, data: bytes) -> dict[str, Any]:
     }
 
 
-def _feed(pod: psk.RunnerPod, *records: Mapping[str, Any]) -> None:
+def _feed(pod: psk.RunnerPod, *records: Mapping[str, Any], now: float = T0) -> None:
+    """Feed harvester records as the driver's reader does, at the reader's ``now``."""
+
     for record in records:
         line = json.dumps(record).encode()
         pod.harvest.feed(line)
-        pod.watch.feed(line)
+        pod.watch.feed(line, now=now)
 
 
 def _fence_order(shell: FakeShell, start: int) -> list[str]:
-    """The fence's verbs from ``start``; checks scale first and every wait after the delete."""
+    """The fence's steps from ``start``, asserting the accepted order.
 
-    verbs = shell.verbs()[start:]
-    names = [verb for verb, _gate in verbs]
+    Scale, worker pod delete with a one second grace period, worker wait, worker read,
+    each runner exec, runner pod delete, runner wait; every worker step before any
+    runner exec or delete, and the gate closed after the scale.
+    """
+
+    calls = shell.calls[start:]
+    names: list[str] = []
+    for argv, _gate in calls:
+        args = argv[1:]
+        verb = _verb(args)
+        kind = "worker" if any("component=worker" in arg for arg in args) else "runner"
+        names.append(verb if verb in {"scale", "exec"} else f"{verb}-{kind}")
     scale = names.index("scale")
+    assert all(gate == "closed" for _argv, gate in calls[scale + 1 :])
+    worker_delete = names.index("delete-worker")
+    worker_wait = names.index("wait-worker")
+    worker_read = names.index("get-worker")
     execs = [index for index, name in enumerate(names) if name == "exec"]
-    delete = names.index("delete")
-    assert all(gate == "closed" for _verb_name, gate in verbs[scale + 1 :])
-    assert scale < delete < names.index("wait")
-    assert all(scale < index < delete for index in execs)
+    runner_delete = names.index("delete-runner")
+    runner_wait = names.index("wait-runner")
+    assert scale < worker_delete < worker_wait < worker_read
+    assert "--grace-period=1" in calls[worker_delete][0]
+    assert "--wait=false" in calls[worker_delete][0]
+    assert "--timeout=60s" in calls[worker_wait][0]
+    assert all(worker_read < index < runner_delete for index in execs)
+    assert runner_delete < runner_wait
     return names
 
 
@@ -1285,12 +1582,13 @@ def test_queued_continuation_during_shutdown_gets_no_paid_start(tmp_path: Path) 
     with pytest.raises(psk.StepFailed, match="after the attempt settled"):
         run.tick()
     names = _fence_order(shell, 1)
-    assert names[:2] == ["get", "scale"]
+    assert names[:2] == ["get-runner", "scale"]
     interrupted = [argv[argv.index("exec") + 1] for argv, _gate in shell.calls if "exec" in argv]
     assert interrupted == ["acme-claim-1-runner", "acme-claim-2-runner"]
     budget = ledger.observations("budget")
     assert budget["allowance_breach"] == ["unreserved:after_attempt"]
     assert budget["paid_starts_fenced"] is True
+    assert budget["workers_stopped_first"] is True
     assert ledger.gate() == "closed" and run.guard_starts is False
     assert len(ledger.sessions()) == len(sks.ATTEMPT_ROLES)
     with pytest.raises(sks.Refusal) as refused:
@@ -1328,6 +1626,7 @@ def test_watchdog_fences_paid_starts_at_the_first_reached_bound(tmp_path: Path) 
     budget = ledger.observations("budget")
     assert budget["allowance_breach"] == ["output_tokens:implementer", "turns:implementer"]
     assert budget["paid_starts_fenced"] is True
+    assert budget["workers_stopped_first"] is True
     assert ledger.gate() == "closed" and run.attempt_live is False
     # The native CLI exits and the harvester reports sizes after it: the capture settles.
     _feed(
@@ -1342,13 +1641,438 @@ def test_watchdog_fences_paid_starts_at_the_first_reached_bound(tmp_path: Path) 
         4 * 100 + 28 * 300,
         32,
     )
-    assert [row["source"] for row in rows[1:]] == ["not_started"] * 3
+    assert [row["source"] for row in rows[1:]] == ["not_started"] * 4
     assert ledger.budget_state() == "exceeded"
     assert ledger.observations("grant")["role_models"] == {sks.IMPLEMENTER: [IMPLEMENTER_MODEL]}
     with pytest.raises(sks.Refusal) as refused:
         ledger.reserve([sks.IMPLEMENTER], now=T0 + 900)
     assert refused.value.code == "gate_closed"
     ledger.close()
+
+
+def _armed_fence(tmp_path: Path, answer: Callable[[list[str]], psk.Completed]) -> Live:
+    live = _live_run(tmp_path, answer=answer)
+    live.ledger.begin_live(now=T0, grant_expires_at=T0 + 3 * 3600)
+    return live
+
+
+def test_fence_interrupts_runners_even_when_a_worker_stays_ready(tmp_path: Path) -> None:
+    """Behavior: a worker pod still Ready after its stop does not leave a runner running;
+    every runner is interrupted and deleted, and the fence records the worker and fails."""
+
+    followed = _pod("acme-claim-1-runner", "uid-1", "Running", running=True)
+    answer, _state = _cluster([followed], workers=[_ready_worker()])
+    live = _armed_fence(tmp_path, answer)
+    with pytest.raises(psk.StepFailed, match="a worker is still active"):
+        live.run.fence_paid_starts()
+    names = _fence_order(live.shell, 0)
+    assert names.count("exec") == 1
+    budget = live.ledger.observations("budget")
+    assert budget["workers_stopped_first"] is False
+    assert budget["paid_starts_fenced"] is False
+    live.ledger.close()
+
+
+def test_fence_fails_on_a_runner_started_after_the_runner_delete(tmp_path: Path) -> None:
+    """Behavior: a continuation runner that is running on the final read fails the fence."""
+
+    followed = _pod("acme-claim-1-runner", "uid-1", "Running", running=True)
+    retry = _pod("acme-claim-2-runner", "uid-2", "Running", running=True)
+    answer, _state = _cluster([followed], late=[retry])
+    live = _armed_fence(tmp_path, answer)
+    with pytest.raises(psk.StepFailed, match="a runner is still active"):
+        live.run.fence_paid_starts()
+    _fence_order(live.shell, 0)
+    budget = live.ledger.observations("budget")
+    assert budget["workers_stopped_first"] is True
+    assert budget["paid_starts_fenced"] is False
+    live.ledger.close()
+
+
+class SteppedClock(FakeClock):
+    """FakeClock for the deadline enforcer: each of its waits parks until the test runs a pass.
+
+    The test sets ``at`` itself, so the enforcer thread sees exactly the time the test
+    chose, and the main loop stays blocked simply by not calling ``tick``.
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.parked: queue.Queue[float] = queue.Queue()
+        self.go: queue.Queue[None] = queue.Queue()
+
+    def wait(self, seconds: float) -> None:
+        self.parked.put(seconds)
+        self.go.get(timeout=30)
+
+    def run_pass(self) -> None:
+        """Let the parked enforcer run one more pass; return once it parks again."""
+
+        self.go.put(None)
+        assert self.parked.get(timeout=30) == psk.DEADLINE_SECONDS
+
+
+@dataclasses.dataclass
+class Exited:
+    """What ``Shell.spawn`` hands back, for a command that already exited quietly."""
+
+    stdout: Any = None
+    stderr: Any = None
+
+    def poll(self) -> int:
+        return 0
+
+
+class SpawningShell(FakeShell):
+    """FakeShell that records each command started without waiting, and runs none."""
+
+    def __init__(self, *args: Any) -> None:
+        super().__init__(*args)
+        self.spawned: list[list[str]] = []
+
+    def spawn(self, argv: Sequence[str]) -> Any:
+        self.guard(list(argv))
+        self.spawned.append(list(argv))
+        return Exited()
+
+
+def test_deadline_enforcer_stops_a_runner_at_its_bound_while_the_main_loop_blocks(
+    tmp_path: Path,
+) -> None:
+    """Behavior: a native process starts at the caller's time, no later than its runner
+    container; with the main loop blocked, the enforcer thread interrupts the runner and
+    deletes its pod at start plus the session bound without waiting on either; the next
+    tick records the breach and runs the full fence; nothing fires before the deadline."""
+
+    record = _pod("acme-claim-1-runner", "uid-1", "Running", running=True)
+    assert sks.runner_started_at(record) == T0  # the pod record's startedAt
+
+    def process(count: int) -> bytes:
+        return json.dumps({"kind": "process", "count": count, "processes": []}).encode()
+
+    watch = sks.ProcessWatch(container_started=T0 + 50)
+    watch.feed(process(1), now=T0 + 40)
+    assert (watch.running, watch.started, watch.deadline(300.0)) == (True, T0 + 40, T0 + 340)
+    watch.feed(process(2), now=T0 + 60)
+    assert watch.started == T0 + 40  # more processes in the same run start nothing new
+    watch.feed(process(0), now=T0 + 90)
+    assert not watch.running and watch.deadline(300.0) is None
+    watch.feed(process(1), now=T0 + 400)
+    assert watch.started == T0 + 400  # a later process is its own start
+
+    answer, _cluster_state = _cluster([record])
+    live = _live_run(tmp_path, answer=answer)
+    run, ledger = live.run, live.ledger
+    shell = SpawningShell(run.runtime, ledger, answer)
+    run.shell, run.kube = shell, psk.Kube(shell, CONTEXT, NAMESPACE)
+    clock = SteppedClock()
+    run.clock = clock
+    ledger.begin_live(now=T0, grant_expires_at=T0 + 3 * 3600)
+    ledger.record("budget", "allowance_breach", [])
+    run.reservations = ledger.reserve(sks.ATTEMPT_ROLES, now=T0)
+    run.attempt_live, run.attempt_started = True, T0
+    pod = _runner_pod(run, "uid-1")
+    pod.watch.container_started = sks.runner_started_at(record)
+    run.pods[pod.uid] = pod
+    # The harvester reports the native process 40 s after the runner container started.
+    _feed(pod, {"kind": "process", "count": 1, "processes": []}, now=T0 + 40)
+    assert pod.watch.deadline(300.0) == T0 + 300
+    clock.at = T0 + 40
+    run.start_deadline_enforcer(sks.parse_ceiling(CEILING))
+    assert "stop-deadline-enforcer" in [name for name, _step in run.finalizer.steps]
+    assert clock.parked.get(timeout=30) == psk.DEADLINE_SECONDS  # the first pass ran
+
+    # Liveness: nothing fires before the deadline, and the main loop sees nothing either.
+    clock.at = T0 + 299
+    clock.run_pass()
+    assert shell.spawned == [] and run.deadline_breach == ""
+    run.tick()
+    calls = len(shell.calls)
+
+    # At the deadline, with the main loop blocked: interrupt and delete, nothing awaited.
+    clock.at = T0 + 300
+    clock.run_pass()
+    prefix = ["kubectl", "--context", CONTEXT, "--namespace", NAMESPACE]
+    assert shell.spawned == [
+        [*prefix, "exec", pod.name, "-c", "runner", "--", "python3", "-c", psk.INTERRUPT_PROGRAM],
+        [*prefix, "delete", "pod", pod.name, "--wait=false"],
+    ]
+    assert run.deadline_breach == f"seconds:{sks.IMPLEMENTER}"
+    clock.at = T0 + 301
+    clock.run_pass()
+    assert len(shell.spawned) == 2  # one stop per runner
+    assert len(shell.calls) == calls  # the enforcer ran nothing through the blocking shell
+    assert ledger.observations("budget")["allowance_breach"] == []  # nor touched the ledger
+
+    # The main loop's next tick records the breach and runs the full fence.
+    with pytest.raises(psk.StepFailed, match="absolute time bound"):
+        run.tick()
+    _fence_order(shell, calls)
+    budget = ledger.observations("budget")
+    assert budget["allowance_breach"] == [f"seconds:{sks.IMPLEMENTER}"]
+    assert budget["paid_starts_fenced"] is True
+    assert budget["workers_stopped_first"] is True
+    assert ledger.gate() == "closed" and run.attempt_live is False
+    assert run.deadline_stop.is_set()
+    fenced = len(shell.calls)
+    run.tick()  # reported once: a later tick fences nothing again
+    assert len(shell.calls) == fenced
+
+    clock.go.put(None)  # release the parked enforcer; its stop is already set
+    run.close_deadline_enforcer()
+    assert run.deadline_thread is not None and not run.deadline_thread.is_alive()
+    ledger.close()
+
+
+def test_finalize_records_a_deadline_the_enforcer_reached_before_fencing(
+    tmp_path: Path,
+) -> None:
+    """Behavior: when the enforcer stopped a runner at its deadline but the main loop then
+    failed some other way, finalize still records the seconds breach, once, before the
+    fence, and stops the enforcer."""
+
+    live_run = _live_run(tmp_path)
+    run, ledger = live_run.run, live_run.ledger
+    ledger.begin_live(now=T0, grant_expires_at=T0 + 3 * 3600)
+    ledger.record("budget", "allowance_breach", ["output_tokens:total"])
+    run.mutated = True
+    run.deadline_breach = f"seconds:{sks.IMPLEMENTER}"
+    run.finalize()
+    assert ledger.observations("budget")["allowance_breach"] == [
+        "output_tokens:total",
+        f"seconds:{sks.IMPLEMENTER}",
+    ]
+    assert run.deadline_stop.is_set() and run.deadline_reported
+    assert run.record_deadline_breach() is False  # recorded once
+    ledger.close()
+
+
+OWN_HEAD = "a" * 40
+MOVED_HEAD = "b" * 40
+
+
+class FakeForge:
+    """The fixture repository's branches and pull requests, as the GitHub API shapes them."""
+
+    repo = "acme/fixture"
+
+    def __init__(self) -> None:
+        self.branches: dict[str, str] = {}
+        self.pulls: list[dict[str, Any]] = []
+        self.deleted: list[str] = []
+        self.closed: list[int] = []
+
+    def open_pull(self, number: int, branch: str) -> None:
+        head = {"sha": self.branches[branch], "ref": branch}
+        self.pulls.append({"number": number, "state": "open", "head": head})
+
+    def repo_path(self, suffix: str) -> str:
+        return f"/repos/{self.repo}{suffix}"
+
+    def request(self, method: str, path: str, body: Any = None) -> tuple[int, Any]:
+        prefix = f"/repos/{self.repo}"
+        if method == "GET" and path.startswith(f"{prefix}/pulls?"):
+            branch = urllib.parse.unquote(path.rsplit(":", 1)[1])
+            return 200, [
+                pull
+                for pull in self.pulls
+                if pull["state"] == "open" and pull["head"]["ref"] == branch
+            ]
+        if method == "PATCH" and path.startswith(f"{prefix}/pulls/"):
+            number = int(path.rsplit("/", 1)[1])
+            for pull in self.pulls:
+                if pull["number"] == number:
+                    pull["state"] = "closed"
+            self.closed.append(number)
+            return 200, {}
+        if method == "GET" and path.startswith(f"{prefix}/git/ref/heads/"):
+            branch = path.removeprefix(f"{prefix}/git/ref/heads/")
+            if branch not in self.branches:
+                return 404, {}
+            return 200, {"object": {"sha": self.branches[branch]}}
+        if method == "DELETE" and path.startswith(f"{prefix}/git/refs/heads/"):
+            branch = path.removeprefix(f"{prefix}/git/refs/heads/")
+            self.branches.pop(branch, None)
+            self.deleted.append(branch)
+            return 204, None
+        raise AssertionError((method, path))
+
+    def call(self, method: str, path: str, body: Any = None, *, ok: Sequence[int] = (200,)) -> Any:
+        status, payload = self.request(method, path, body)
+        if status not in ok:
+            raise psk.StepFailed(f"forge {method} returned {status}")
+        return payload
+
+    def revoke(self) -> None:
+        return None
+
+
+class FakeApi:
+    def __init__(self, records: Mapping[str, Mapping[str, Any]]) -> None:
+        self.records = records
+
+    def get(self, path: str) -> Any:
+        return dict(self.records[path.rsplit("/", 1)[1]])
+
+
+def _recovering_run(
+    tmp_path: Path, forge: FakeForge, *, live: bool, publications: list[dict[str, Any]]
+) -> Live:
+    """A run whose publication rows and platform records exist but whose read-back never ran."""
+
+    live_run = _live_run(tmp_path)
+    run = live_run.run
+    if live:
+        live_run.ledger.begin_live(now=T0, grant_expires_at=T0 + 3 * 3600)
+    run.mutated = True
+    run.agent_id = str(uuid.uuid4())
+    ids = [str(uuid.uuid4()) for _ in publications]
+    queries: list[str] = []
+
+    def sql(query: str) -> list[dict[str, Any]]:
+        queries.append(query)
+        return [{"id": item} for item in ids]
+
+    run.sql = sql  # type: ignore[method-assign]
+    run.forge = forge  # type: ignore[assignment]
+    run.api = FakeApi(dict(zip(ids, publications, strict=True)))  # type: ignore[assignment]
+    run.finalizer.register("close-run-pulls", run.close_run_pulls)
+    run.finalizer.register("delete-run-branches", run.delete_run_branches)
+    run.finalizer.register("recover-publications", run.recover_publications)
+    run.queries = queries  # type: ignore[attr-defined]
+    return live_run
+
+
+def _inventory(live_run: Live) -> dict[str, str]:
+    return {
+        row["kind"].removeprefix("inventory:"): row["status"]
+        for row in live_run.ledger.cleanup_rows()
+        if row["kind"].startswith("inventory:")
+    }
+
+
+def test_finalize_cleans_a_publication_the_run_failed_before_reading_back(
+    tmp_path: Path,
+) -> None:
+    """Behavior: a branch and pull request the platform published are found through the
+    agent's work items, closed and deleted at their own head, even when the run failed
+    before read-back; a foreign branch and a branch that moved off our commit stay."""
+
+    forge = FakeForge()
+    forge.branches = {"curie/pub-1": OWN_HEAD, "curie/pub-2": MOVED_HEAD, "someone/else": OWN_HEAD}
+    forge.open_pull(7, "curie/pub-1")
+    forge.open_pull(8, "someone/else")
+    live_run = _recovering_run(
+        tmp_path,
+        forge,
+        live=True,
+        publications=[
+            {"branch": "curie/pub-1", "lineage_head_sha": OWN_HEAD},
+            {"branch": "curie/pub-2", "lineage_head_sha": OWN_HEAD},
+        ],
+    )
+    run = live_run.run
+    assert run.publication_branches == {}
+    assert run.finalize() is False
+    assert "JOIN curie.work_items" in run.queries[0]  # type: ignore[attr-defined]
+    assert forge.closed == [7] and forge.deleted == ["curie/pub-1"]
+    assert forge.branches == {"curie/pub-2": MOVED_HEAD, "someone/else": OWN_HEAD}
+    assert _inventory(live_run)["forge_prs"] == "absent"
+    assert _inventory(live_run)["forge_branches"] == "present"
+    live_run.ledger.close()
+
+
+def test_finalize_reports_absent_forge_state_after_recovering_an_own_publication(
+    tmp_path: Path,
+) -> None:
+    forge = FakeForge()
+    forge.branches = {"curie/pub-1": OWN_HEAD, "someone/else": MOVED_HEAD}
+    forge.open_pull(7, "curie/pub-1")
+    live_run = _recovering_run(
+        tmp_path,
+        forge,
+        live=True,
+        publications=[{"branch": "curie/pub-1", "lineage_head_sha": OWN_HEAD}],
+    )
+    live_run.run.finalize()
+    steps = {row["kind"]: row["status"] for row in live_run.ledger.cleanup_rows()}
+    assert steps["step:recover-publications"] == "ok"
+    assert steps["step:close-run-pulls"] == "ok" and steps["step:delete-run-branches"] == "ok"
+    assert (_inventory(live_run)["forge_prs"], _inventory(live_run)["forge_branches"]) == (
+        "absent",
+        "absent",
+    )
+    assert forge.branches == {"someone/else": MOVED_HEAD}
+    live_run.ledger.close()
+
+
+def test_failed_publication_enumeration_after_going_live_is_uncertain(tmp_path: Path) -> None:
+    """Behavior: when the attempt went live and the platform cannot list the run's
+    publications, nothing on the forge is touched and the inventory is uncertain."""
+
+    forge = FakeForge()
+    forge.branches = {"curie/pub-1": OWN_HEAD}
+    forge.open_pull(7, "curie/pub-1")
+    live_run = _recovering_run(
+        tmp_path,
+        forge,
+        live=True,
+        publications=[{"branch": "curie/pub-1", "lineage_head_sha": OWN_HEAD}],
+    )
+    run = live_run.run
+
+    def broken(_query: str) -> list[dict[str, Any]]:
+        raise psk.StepFailed("the database is unreachable")
+
+    run.sql = broken  # type: ignore[method-assign,assignment]
+    assert run.finalize() is False
+    inventory = _inventory(live_run)
+    assert (inventory["forge_prs"], inventory["forge_branches"]) == ("uncertain", "uncertain")
+    assert forge.closed == [] and forge.deleted == []
+    steps = {row["kind"]: row["status"] for row in live_run.ledger.cleanup_rows()}
+    assert steps["step:close-run-pulls"] == "failed" and steps["step:recover-publications"] == (
+        "failed"
+    )
+    live_run.ledger.close()
+
+
+def test_missing_api_client_after_going_live_is_uncertain_but_not_before(tmp_path: Path) -> None:
+    forge = FakeForge()
+    live_run = _recovering_run(
+        tmp_path, forge, live=True, publications=[{"branch": "x", "lineage_head_sha": OWN_HEAD}]
+    )
+    live_run.run.api = None
+    with pytest.raises(psk.StepFailed):
+        live_run.run.pulls_closed()
+    live_run.ledger.close()
+    early = _recovering_run(tmp_path / "early", forge, live=False, publications=[])
+    early.run.api = None
+    assert early.run.pulls_closed() is True and early.run.branches_absent() is True
+    early.ledger.close()
+
+
+def test_a_publication_without_a_commit_head_is_tracked_but_never_touched(
+    tmp_path: Path,
+) -> None:
+    forge = FakeForge()
+    forge.branches = {"curie/pub-1": OWN_HEAD}
+    forge.open_pull(7, "curie/pub-1")
+    live_run = _recovering_run(
+        tmp_path,
+        forge,
+        live=True,
+        publications=[{"branch": "curie/pub-1", "lineage_head_sha": None}],
+    )
+    run = live_run.run
+    run.recover_publications()
+    assert run.publication_branches == {"curie/pub-1": ""}
+    with pytest.raises(psk.StepFailed, match="not provably"):
+        run.close_run_pulls()
+    with pytest.raises(psk.StepFailed, match="not provably"):
+        run.delete_run_branches()
+    assert forge.closed == [] and forge.deleted == []
+    assert run.pulls_closed() is False and run.branches_absent() is False
+    live_run.ledger.close()
 
 
 def test_harvest_stream_settles_only_after_a_post_exit_size_report(tmp_path: Path) -> None:
@@ -1393,25 +2117,26 @@ def test_harvest_stream_settles_only_after_a_post_exit_size_report(tmp_path: Pat
     harvest, watch = sks.HarvestState(scan), sks.ProcessWatch()
     for line in result.stdout.splitlines():
         harvest.feed(line)
-        watch.feed(line)
+        watch.feed(line, now=T0 + 10)
     assert isinstance(scan.channels["harvest"], sks.ChannelScan) and sks.scan_clean(scan)
     assert (harvest.container_credential or {}).get("credential") == "present"
     assert harvest.transcript_files() == files
     assert harvest.complete and watch.ran and not watch.exited
+    assert watch.running and watch.started == T0 + 10
     assert not sks.settled_capture(harvest, watch)  # the CLI still runs
     sizes = {name: len(data) for name, data in files.items() if name.endswith(".jsonl")}
     exited = json.dumps({"kind": "process", "count": 0, "processes": []}).encode()
     harvest.feed(exited)
-    watch.feed(exited)
+    watch.feed(exited, now=T0 + 20)
     assert not sks.settled_capture(harvest, watch)  # no size report since the exit
     report = json.dumps({"kind": "sync", "sizes": sizes, "at": T0}).encode()
     harvest.feed(report)
-    watch.feed(report)
+    watch.feed(report, now=T0 + 21)
     assert sks.settled_capture(harvest, watch)
     main = next(name for name in files if name.endswith(f"{SESSION}.jsonl"))
     late = json.dumps(_file_record(main, len(files[main]), b"{}\n")).encode()
     harvest.feed(late)
-    watch.feed(late)
+    watch.feed(late, now=T0 + 22)
     assert not sks.settled_capture(harvest, watch)  # bytes after the last size report
     facts = sks.attempt_facts([harvest.transcript_files()], not_before=T0 - 30)
     summary = {item["role"]: item for item in map(sks.session_summary, facts.sessions)}
@@ -1598,7 +2323,8 @@ def _passing_ledger(state: Path, *, rehearsal: bool = False) -> None:
         ledger.record("grant_probe", "turn_cap", sks.GRANT_PROBE_TURNS)
         result = {"ok": True, "turns": 1, "output_tokens": 4, "models": [sks.GRANT_PROBE_MODEL]}
         ledger.record("grant_probe", "result", result)
-        reservations = ledger.reserve(sks.ATTEMPT_ROLES, now=now + 1)
+        # After every record above, however long they took: the judge orders them by time.
+        reservations = ledger.reserve(sks.ATTEMPT_ROLES, now=time.time() + 1)
         facts = sks.attempt_facts([_attempt_files()], not_before=T0 - 30)
         sks.settle_attempt(ledger, reservations, facts.sessions, complete=True)
         request_id = str(sks.kickoff_request_id(sks.DEFAULT_IDENTITY, DELIVERY))

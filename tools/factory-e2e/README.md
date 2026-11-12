@@ -1030,11 +1030,12 @@ ceiling is recorded before the first reservation. The 32 turns per session
 follow #5540, which recorded 11 to 14 implementer turns; the 16,384 output
 token total is the spend guard.
 
-One attempt reserves four sessions: the implementer, the plan reviewer and two
-diff reviewers (one re-review round). Every implementer-role session, the
-kernel's publish continuation included, is charged to the implementer's slot,
-which takes up to half of the remaining tokens and turns; the reviewers split
-the rest. No share exceeds the per-session caps. Reservations are written to
+One attempt reserves five native sessions, one slot per start: the
+implementer, the kernel's publish continuation (a second implementer-role
+session), the plan reviewer and two diff reviewers (one re-review round), so
+`sessions` below 5 is refused. The main implementer slot takes up to half of
+the remaining tokens and turns; the continuation and the reviewers split the
+rest. No share exceeds the per-session caps. Reservations are written to
 the ledger before the kickoff post, and a reservation is refused once the gate
 is closed, a session's usage is unknown, or the budget is exceeded. Inside the
 runner, the private bundle's reservation gate is a `PreToolUse` hook on
@@ -1043,18 +1044,33 @@ so parallel hooks never share one, and refuses any other subagent type or a
 start past one plan and two diff reviews.
 
 While the attempt runs, every poll reads the native transcripts and checks,
-in this order, output tokens (in total and per slot), then turns, then
-seconds (300 s per native session, and the attempt's whole window). The runner
-caps each response at 4,096 output tokens, so the overshoot past a reached
-bound is at most the response in flight. A session without usage, or one no
-reservation covers, also ends the attempt. Ending it fences paid starts before
-anything waits: the worker Deployment is scaled to zero, the ledger gate
-closes, each runner is interrupted and its pod deleted, and only then does the
-driver wait for no ready worker and no running runner. The same fence runs in
-the finalizer whenever a live start was recorded. After the attempt settles
-and until the disconnect's teardown completes, any runner the driver did not
-follow is an unreserved paid start and fences everything. ToolSearch calls in
-the transcripts are counted and reported with the budget.
+in this order, output tokens (in total and per native session), then turns,
+then seconds (300 s of wall clock per native session, first record to last,
+never less the time its reviewers ran, and the attempt's whole window). While
+a native process runs, the newest implementer session is charged from its
+first record to now. The runner caps each response at 4,096 output tokens, so
+the overshoot past a reached bound is at most the response in flight. A
+completed response without usage, a session no reservation covers (a third
+implementer session included), or more native sessions than `sessions` also
+ends the attempt; a session still waiting for its first response is only
+bound by its seconds, and settles as unknown if it never answers. Because a
+poll runs only between blocking calls, a deadline thread also checks every
+followed runner about once a second: once a native process has run 300 s
+since it started (no later than its runner container's start), it starts the
+runner interrupt and a `--wait=false` delete of that pod without waiting on
+either, and the next poll records the breach and fences. Ending the attempt
+fences paid starts in a fixed order: the worker Deployment is scaled to zero,
+the ledger gate closes, the worker pods are deleted with a one second grace
+period and awaited, and the driver records whether no worker is Ready. Only
+then is each runner interrupted and its pod deleted, and the deletion awaited,
+even when a worker would not stop. The worker is stopped rather than drained
+because its readiness is a heartbeat file: a draining worker stays Ready while
+its turn handler waits on the runner, which would hold a paid session past its
+bound. The fence fails when a worker is Ready or a runner container still runs.
+The same fence runs in the finalizer whenever a live start was recorded. After
+the attempt settles and until the disconnect's teardown completes, any runner
+the driver did not follow is an unreserved paid start and fences everything.
+ToolSearch calls in the transcripts are counted and reported with the budget.
 
 ### The grant probe
 

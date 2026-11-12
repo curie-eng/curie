@@ -20,6 +20,7 @@ from __future__ import annotations
 import base64
 import contextlib
 import dataclasses
+import datetime as dt
 import json
 import os
 import re
@@ -398,10 +399,12 @@ def parse_ceiling(text: str | None) -> Ceiling:
     return ceiling
 
 
-# The one attempt's reserved sessions. The bundle runs its plan review once and
-# its diff review in a loop; one diff re-review round is reserved, and the
-# bundle's reservation gate refuses any reviewer start beyond these.
-ATTEMPT_ROLES = (IMPLEMENTER, PLAN_REVIEWER, DIFF_REVIEWER, DIFF_REVIEWER)
+# The one attempt's reserved native sessions, one slot per start. The implementer
+# runs once and the kernel's publish continuation is a second implementer-role
+# native session with its own slot. The bundle runs its plan review once and its
+# diff review in a loop; one diff re-review round is reserved, and the bundle's
+# reservation gate refuses any reviewer start beyond these.
+ATTEMPT_ROLES = (IMPLEMENTER, IMPLEMENTER, PLAN_REVIEWER, DIFF_REVIEWER, DIFF_REVIEWER)
 
 
 def attempt_roles(ceiling: Ceiling) -> tuple[str, ...]:
@@ -424,29 +427,29 @@ def reservation_shares(
 ) -> list[Share]:
     """Each reserved session's share of what remains, capped per session. Pure.
 
-    The implementer is the session #5540 recorded at 11 to 14 turns, and every
-    implementer-role session (the publish continuation included) is charged to
-    its one slot, so it takes up to half of what remains; the reviewers split
-    the rest equally. Nothing exceeds the per-session caps, and the shares
-    never sum past the remaining totals.
+    The first implementer slot is the main implementer session, which #5540
+    recorded at 11 to 14 turns, so it takes up to half of what remains. Every
+    other slot, the publish continuation's implementer slot included, splits
+    the rest equally with the reviewers. Nothing exceeds the per-session caps,
+    and the shares never sum past the remaining totals.
     """
 
     if not roles:
         raise Refusal("arguments_invalid", "roles")
     tokens_left = ceiling.output_tokens - used_tokens
     turns_left = ceiling.turns - used_turns
-    others = [role for role in roles if role != IMPLEMENTER]
-    lead = IMPLEMENTER in roles
+    lead = roles.index(IMPLEMENTER) if IMPLEMENTER in roles else None
+    others = len(roles) - (0 if lead is None else 1)
     lead_tokens = lead_turns = 0
-    if lead:
+    if lead is not None:
         divisor = 2 if others else 1
         lead_tokens = min(ceiling.session_output_tokens, tokens_left // divisor)
         lead_turns = min(ceiling.turns_for(IMPLEMENTER), turns_left // divisor)
-    rest_tokens = (tokens_left - lead_tokens) // len(others) if others else 0
-    rest_turns = (turns_left - lead_turns) // len(others) if others else 0
+    rest_tokens = (tokens_left - lead_tokens) // others if others else 0
+    rest_turns = (turns_left - lead_turns) // others if others else 0
     shares = []
-    for role in roles:
-        if role == IMPLEMENTER:
+    for index, role in enumerate(roles):
+        if index == lead:
             shares.append(Share(lead_tokens, lead_turns, float(ceiling.session_seconds)))
         else:
             shares.append(
@@ -464,7 +467,11 @@ def reservation_shares(
 
 
 def reviewer_limits(roles: Sequence[str]) -> dict[str, int]:
-    """The bundle reservation gate's per-kind start limits for one attempt's roles."""
+    """The bundle reservation gate's per-kind start limits for one attempt's roles.
+
+    Only reviewer starts pass the gate, so the implementer slots (the main
+    session and the publish continuation) never change these limits.
+    """
 
     return {"plan": list(roles).count(PLAN_REVIEWER), "diff": list(roles).count(DIFF_REVIEWER)}
 
@@ -972,6 +979,30 @@ def pod_grant_checks(pod: Any, claim: Any, owner: Mapping[str, Any]) -> dict[str
     }
 
 
+def runner_started_at(pod: Any) -> float | None:
+    """When the runner container started running, from a pod record, if it reports one.
+
+    Reads ``status.containerStatuses[name=runner].state.running.startedAt``
+    (https://kubernetes.io/docs/reference/kubernetes-api/workload-resources/pod-v1/).
+    Pure.
+    """
+
+    status = pod.get("status") if isinstance(pod, dict) else None
+    for item in (status or {}).get("containerStatuses") or []:
+        if not isinstance(item, dict) or item.get("name") != "runner":
+            continue
+        running = (item.get("state") or {}).get("running")
+        stamp = running.get("startedAt") if isinstance(running, dict) else None
+        if not isinstance(stamp, str):
+            return None
+        try:
+            parsed = dt.datetime.fromisoformat(stamp.replace("Z", "+00:00"))
+        except ValueError:
+            return None
+        return parsed.timestamp() if parsed.tzinfo is not None else None
+    return None
+
+
 # --------------------------------------------------------------------------
 # Native usage: slots, the watchdog and settlement
 # --------------------------------------------------------------------------
@@ -986,13 +1017,31 @@ class Reservation:
     seconds: float
 
 
+def wall_seconds(session: Any) -> float:
+    """A native session's wall clock: its first record to its last. Pure.
+
+    The shared parser's ``elapsed`` leaves out the time an implementer waited
+    on its nested reviewers, but the approved seconds bound is absolute, so
+    this module bounds and records wall clock and never that figure.
+    """
+
+    if session.first is None or session.last is None:
+        return 0.0
+    return max(0.0, float(session.last) - float(session.first))
+
+
+def session_record(session: Any) -> dict[str, Any]:
+    """The sanitized per-session fact the ledger keeps, its ``elapsed`` wall clock. Pure."""
+
+    return {**session_summary(session), "elapsed": round(wall_seconds(session), 3)}
+
+
 @dataclasses.dataclass
 class SlotUsage:
-    """One reserved slot's observed usage: every native session charged to it, summed.
+    """One reserved slot's observed usage: the one native session charged to it.
 
-    ``elapsed`` is the longest single session, since the seconds bound is per
-    native session; tokens and turns are the slot's sums, so the publish
-    continuation counts against the implementer's allowance.
+    ``elapsed`` is the session's wall clock (``wall_seconds``). ``add`` also
+    builds the usage of one unreserved session for settlement.
     """
 
     output_tokens: int = 0
@@ -1006,7 +1055,7 @@ class SlotUsage:
     def add(self, session: Any) -> None:
         self.output_tokens += int(session.output_tokens)
         self.assistant_turns += int(session.assistant_turns)
-        self.elapsed = max(self.elapsed, float(session.elapsed))
+        self.elapsed = max(self.elapsed, wall_seconds(session))
         self.models = tuple(sorted({*self.models, *session.models}))
         self.sessions += 1
         self.known = self.known and bool(session.usage_known)
@@ -1019,21 +1068,18 @@ def match_slots(
 ) -> tuple[dict[int, SlotUsage], list[Any]]:
     """Charge observed sessions to reservations; return the slots and unreserved sessions.
 
-    Every implementer-role session (the main session and any publish
-    continuation the kernel queues) is charged to the one implementer slot;
-    each reviewer subagent session takes the next reviewer slot of its role in
-    order of first activity. Anything else is unreserved.
+    Every native start takes its own slot: in order of first activity, each
+    implementer-role session (the main session, then the publish
+    continuation) takes the next implementer slot, and each reviewer subagent
+    session the next reviewer slot of its role. A session with no slot left,
+    a third implementer session included, is unreserved.
     """
 
     slots = {item.seq: SlotUsage() for item in reservations}
     pending = {role: [item for item in reservations if item.role == role] for role in ROLES}
-    implementer = pending[IMPLEMENTER][0] if pending[IMPLEMENTER] else None
     unreserved: list[Any] = []
     for session in sorted(sessions, key=lambda item: (item.first is None, item.first or 0.0)):
-        if session.role == IMPLEMENTER and implementer is not None:
-            slots[implementer.seq].add(session)
-            continue
-        queue = pending.get(session.role) if session.role != IMPLEMENTER else None
+        queue = pending.get(session.role)
         if not queue:
             unreserved.append(session)
             continue
@@ -1047,22 +1093,34 @@ def watchdog_breaches(
     ceiling: Ceiling,
     *,
     now: float,
+    running: bool,
 ) -> list[str]:
     """Bounds reached after the latest response: output tokens first, then turns, then seconds.
 
     The bounds are the approved ceiling's own (coordinator ruling 1): total
-    output tokens and turns across every session, each slot's output tokens
-    and turns against the per-session caps (the implementer's slot includes
-    the publish continuation), and the absolute seconds of each native
-    session, the most recently active one charged the time since its last
-    record. A session whose complete records lack usage is unknown, and a
-    session no reservation covers is unreserved; both end the attempt, and an
-    in-flight unterminated final record is neither. Pure.
+    output tokens and turns across every session, each native session's
+    output tokens and turns against the per-session caps (each takes its own
+    slot), and the absolute wall clock of each native session. The most
+    recently active session is charged the time since its last record, and
+    while a native process runs (``running``) the implementer main session
+    with the latest first record is live and charged ``now`` minus its first
+    record, so waiting on a reviewer never pauses its bound; a subagent starts
+    after and ends before its parent, so that bound covers it too.
+
+    A session with no assistant record yet is pending and gets only the
+    seconds bound. A session whose complete responses lack usage is unknown,
+    a session no reservation covers is unreserved, and more native sessions
+    than the ceiling allows exceed it; each ends the attempt, and an in-flight
+    unterminated final record is none of these. Pure.
     """
 
     slots, unreserved = match_slots(reservations, sessions)
     by_seq = {item.seq: item for item in reservations}
     latest = max((item.last for item in sessions if item.last is not None), default=None)
+    live: Any = None
+    if running:
+        mains = [item for item in sessions if item.role == IMPLEMENTER and item.first is not None]
+        live = max(mains, key=lambda item: float(item.first), default=None)
     tokens: list[str] = []
     turns: list[str] = []
     seconds: list[str] = []
@@ -1077,36 +1135,58 @@ def watchdog_breaches(
         if slot.assistant_turns >= ceiling.turns_for(role):
             turns.append(f"turns:{role}")
     for item in sessions:
-        elapsed = float(item.elapsed)
+        elapsed = wall_seconds(item)
         if latest is not None and item.last == latest:
             elapsed += max(0.0, now - latest)
+        if item is live:
+            elapsed = max(elapsed, now - float(item.first))
         if elapsed >= ceiling.session_seconds:
             seconds.append(f"seconds:{item.role}")
     unknown = sorted(
         {
             f"usage_unknown:{item.role}"
             for item in sessions
-            if not item.usage_known and not item.truncated
+            if not item.usage_known and not item.truncated and int(item.assistant_turns) > 0
         }
     )
+    count = ["sessions:total"] if len(sessions) > ceiling.sessions else []
     extra = sorted({f"unreserved:{item.role}" for item in unreserved})
-    return [*tokens, *turns, *sorted(set(seconds)), *unknown, *extra]
+    return [*tokens, *turns, *sorted(set(seconds)), *unknown, *count, *extra]
 
 
 @dataclasses.dataclass
 class ProcessWatch:
-    """The native CLI's lifetime from one harvester stream, for affirmative settlement.
+    """The native CLI's lifetime from one harvester stream, for settlement and the deadline.
 
     Complete capture needs a size report taken after the CLI processes exited:
     every transcript byte is written by then, so a matching report proves none
     was missed. Reads the harvester's ``process`` and ``sync`` records.
+
+    ``started`` is the wall-clock time the running native process started: the
+    caller's ``now`` when the process count went from 0 to above 0, and for
+    the pod's first process no later than the runner container's start
+    (``container_started``), since the stream can report it late.
     """
 
     ran: bool = False
     exited: bool = False
     synced_after_exit: bool = False
+    container_started: float | None = None
+    started: float | None = None
+    count: int = 0
 
-    def feed(self, line: bytes) -> None:
+    @property
+    def running(self) -> bool:
+        return self.ran and not self.exited
+
+    def deadline(self, seconds: float) -> float | None:
+        """When the running native process reaches ``seconds``; None while none runs."""
+
+        if not self.running or self.started is None:
+            return None
+        return self.started + seconds
+
+    def feed(self, line: bytes, *, now: float) -> None:
         try:
             record = json.loads(line)
         except ValueError:
@@ -1115,10 +1195,17 @@ class ProcessWatch:
             return
         kind = record.get("kind")
         if kind == "process" and type(record.get("count")) is int:
-            if record["count"] > 0:
+            count = int(record["count"])
+            if count > 0:
+                if self.count <= 0:
+                    start = now
+                    if not self.ran and self.container_started is not None:
+                        start = min(start, self.container_started)
+                    self.started = start
                 self.ran, self.exited, self.synced_after_exit = True, False, False
             elif self.ran:
                 self.exited = True
+            self.count = count
         elif kind == "sync" and self.exited:
             self.synced_after_exit = True
 
@@ -1501,8 +1588,14 @@ class Ledger:
                 reservations.append(reservation)
             return reservations
 
-    def settle(self, seq: int, usage: SlotUsage | None, *, source: str) -> None:
-        """Record observed usage. ``None`` leaves it unknown: charged its full share."""
+    def settle(self, seq: int, usage: SlotUsage | None, *, source: str, check: bool = True) -> None:
+        """Record observed usage. ``None`` leaves it unknown: charged its full share.
+
+        ``check`` False defers the bound check to the caller, which settles a
+        whole attempt and then checks once: a slot not yet settled is charged
+        its full reserved share, so checking between slots could mark a run
+        exceeded that its observed totals do not exceed.
+        """
 
         with self.transaction() as db:
             if usage is None:
@@ -1528,7 +1621,8 @@ class Ledger:
                     seq,
                 ),
             )
-        self._check_bounds()
+        if check:
+            self.check_bounds()
 
     def record_unreserved(self, role: str, usage: SlotUsage | None) -> None:
         with self.transaction() as db:
@@ -1550,7 +1644,7 @@ class Ledger:
             )
             db.execute("UPDATE runs SET budget_state='exceeded' WHERE run_id=?", (self.run_id,))
 
-    def _check_bounds(self) -> None:
+    def check_bounds(self) -> None:
         ceiling = self.ceiling()
         if budget_findings(self.sessions(), ceiling):
             with self.transaction() as db:
@@ -1670,12 +1764,16 @@ def settle_attempt(
     complete: bool,
     malformed: int = 0,
 ) -> dict[str, int]:
-    """Settle every reserved slot from the attempt's sessions.
+    """Settle every reserved slot from the attempt's sessions, one row per native session.
 
-    An incomplete capture, an unreadable line or an attempt with no
-    implementer session leaves every slot unknown, charged its full share.
-    Otherwise each slot takes its matched usage, an unused slot settles to
-    zero, and an observed session beyond the reservations is unreserved.
+    Each observed native session holds its own row: its slot's, or an
+    unreserved row when no slot was left, so the judge counts every start
+    against ``ceiling.sessions``. An incomplete capture, an unreadable line or
+    an attempt with no implementer session leaves every slot unknown, charged
+    its full share, and every unreserved session unknown. Otherwise each slot
+    takes its matched usage and an unused slot settles to zero. A session
+    with no assistant usage, one still waiting for its first response
+    included, is unknown.
     """
 
     has_implementer = bool(sessions) and any(
@@ -1684,24 +1782,29 @@ def settle_attempt(
     if not complete or sessions is None or malformed or not has_implementer:
         for item in reservations:
             ledger.settle(item.seq, None, source="unknown")
-        return {"settled": 0, "unknown": len(reservations), "unreserved": 0}
+        _, beyond = match_slots(reservations, sessions or ())
+        for session in beyond:
+            ledger.record_unreserved(session.role, None)
+        return {"settled": 0, "unknown": len(reservations), "unreserved": len(beyond)}
     slots, unreserved = match_slots(reservations, sessions)
     settled = unknown = 0
     for item in reservations:
         slot = slots[item.seq]
         if slot.sessions == 0:
-            ledger.settle(item.seq, SlotUsage(), source="not_started")
+            ledger.settle(item.seq, SlotUsage(), source="not_started", check=False)
             settled += 1
         elif not slot.known:
-            ledger.settle(item.seq, None, source="unknown")
+            ledger.settle(item.seq, None, source="unknown", check=False)
             unknown += 1
         else:
-            ledger.settle(item.seq, slot, source="native")
+            ledger.settle(item.seq, slot, source="native", check=False)
             settled += 1
     for session in unreserved:
         usage = SlotUsage()
         usage.add(session)
         ledger.record_unreserved(session.role, usage if usage.known else None)
+    # Checked once, after every slot holds its observed usage.
+    ledger.check_bounds()
     return {"settled": settled, "unknown": unknown, "unreserved": len(unreserved)}
 
 

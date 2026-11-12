@@ -106,6 +106,9 @@ FORGE_PERMISSIONS = {
 MODEL_HOST = "api.anthropic.com"
 API_PORT = 8000
 POLL_SECONDS = 2.0
+# The deadline enforcer's pass interval, and how long its stop waits for it.
+DEADLINE_SECONDS = 1.0
+DEADLINE_JOIN_SECONDS = 10.0
 # Scheduling and the image pull before a runner's first native record.
 STARTUP_SECONDS = 600.0
 RECEIPT_SECONDS = 90.0
@@ -665,11 +668,19 @@ class Kube:
         self.context = context
         self.namespace = namespace
 
-    def ctl(self, *args: str, namespaced: bool = True, **kwargs: Any) -> Completed:
+    def argv(self, *args: str, namespaced: bool = True) -> list[str]:
         argv = ["kubectl", "--context", self.context]
         if namespaced:
             argv += ["--namespace", self.namespace]
-        return self.shell.run([*argv, *args], **kwargs)
+        return [*argv, *args]
+
+    def ctl(self, *args: str, namespaced: bool = True, **kwargs: Any) -> Completed:
+        return self.shell.run(self.argv(*args, namespaced=namespaced), **kwargs)
+
+    def start(self, *args: str) -> subprocess.Popen[bytes]:
+        """Start a namespaced kubectl command without waiting on it."""
+
+        return self.shell.spawn(self.argv(*args))
 
     def json(self, *args: str, namespaced: bool = True, **kwargs: Any) -> Any:
         result = self.ctl(*args, "-o", "json", namespaced=namespaced, **kwargs)
@@ -1650,7 +1661,19 @@ class LiveRun:
         self.attempt_live = False
         self.guard_starts = False
         self.attempt_started = 0.0
+        # The deadline enforcer's thread. Only ``deadline_breach`` is shared with the main
+        # thread, under ``deadline_lock``; the fired set and spawned list are its own.
+        self.deadline_lock = threading.Lock()
+        self.deadline_breach = ""
+        self.deadline_reported = False
+        self.deadline_stop = threading.Event()
+        self.deadline_thread: threading.Thread | None = None
+        self.deadline_fired: set[str] = set()
+        self.deadline_processes: list[subprocess.Popen[bytes]] = []
+        # Branch to this run's published head; an empty head means ownership is unproved.
         self.publication_branches: dict[str, str] = {}
+        self.publications_recovered = False
+        self.publications_uncertain = False
         self.policy_set = False
         self.outcome: dict[str, Any] = {}
         self.signals: list[int] = []
@@ -1736,6 +1759,8 @@ class LiveRun:
         run = self.ledger.run_row()
         if run["live_started_at"] is not None:
             # Paid execution stops before the live window closes or anything is torn down.
+            self.stop_deadline_enforcer()
+            self.safe(self.record_deadline_breach, False)
             self.safe(self.fence_paid_starts, None)
             self.ledger.end_live(now=self.clock.now())
         steps = self.finalizer.run()
@@ -2337,6 +2362,8 @@ class LiveRun:
         self.curie.run("surfaces", self.agent, "--add", f"github={repo}")
         self.finalizer.register("close-run-pulls", self.close_run_pulls)
         self.finalizer.register("delete-run-branches", self.delete_run_branches)
+        # Registered last so it runs first, while the api and database are still up.
+        self.finalizer.register("recover-publications", self.recover_publications)
         self.policy_set = True
         self.curie.run(
             "publication-policy",
@@ -2703,6 +2730,26 @@ class LiveRun:
         self.reservations = self.ledger.reserve(roles, now=self.clock.now())
         self.attempt_live = True
         self.attempt_started = self.clock.now()
+        self.start_deadline_enforcer(ceiling)
+        try:
+            self.admit_kickoff(kit)
+            try:
+                self.watch_attempt()
+            finally:
+                self.attempt_live = False
+                self.stop_deadline_enforcer()
+                self.settle()
+                self.ledger.close_gate()
+        finally:
+            # The attempt settled or failed: no deadline pass runs after it.
+            self.stop_deadline_enforcer()
+        self.guard_starts = True
+        # A deadline the enforcer reached while the main loop was blocked still fences.
+        self.report_deadline_breach()
+
+    def admit_kickoff(self, kit: SlackKit) -> None:
+        """Post the kickoff, observe its delivery, and wait for its one admission."""
+
         before = self.counts()
         self.ledger.record(
             "admission",
@@ -2740,13 +2787,6 @@ class LiveRun:
         self.ledger.record("progress", "expected_thread", expected_thread)
         self.wait_until(self.admitted, seconds=ADMISSION_SECONDS, what="the kickoff admission")
         self.record_admission()
-        try:
-            self.watch_attempt()
-        finally:
-            self.attempt_live = False
-            self.settle()
-            self.ledger.close_gate()
-        self.guard_starts = True
 
     def run_grant_probe(self) -> None:
         """Right before the first reservation, recorded under grant_probe before it runs."""
@@ -2846,11 +2886,13 @@ class LiveRun:
     def tick(self) -> None:
         """While paid work can start: follow runner pods, then check every bound.
 
+        A deadline the enforcer thread reached is reported and fenced first.
         After the attempt settles and until the disconnect's teardown ends, any
         runner the run did not follow (a continuation the platform queued after
         the attempt) is an unreserved paid start, and fences everything.
         """
 
+        self.report_deadline_breach()
         if self.guard_starts and not self.attempt_live:
             if self.unfollowed_runner_pods():
                 self.ledger.record("budget", "allowance_breach", ["unreserved:after_attempt"])
@@ -2866,7 +2908,11 @@ class LiveRun:
         facts = self.attempt_facts()
         if facts is not None:
             breaches = sks.watchdog_breaches(
-                self.reservations, facts.sessions, ceiling, now=self.clock.now()
+                self.reservations,
+                facts.sessions,
+                ceiling,
+                now=self.clock.now(),
+                running=self.native_running(),
             )
         window = sum(item.seconds for item in self.reservations)
         if self.clock.now() - self.attempt_started > window + STARTUP_SECONDS:
@@ -2875,8 +2921,137 @@ class LiveRun:
             # In the order reached: output tokens first, then turns, then seconds.
             self.ledger.record("budget", "allowance_breach", list(dict.fromkeys(breaches)))
             self.attempt_live = False
+            self.stop_deadline_enforcer()
             self.fence_paid_starts()
             raise StepFailed("an approved bound was reached; paid work stopped")
+
+    def native_running(self) -> bool:
+        """Whether any followed runner pod reports a native CLI process still running."""
+
+        running = False
+        for pod in tuple(self.pods.values()):
+            with pod.lock:
+                running = running or pod.watch.running
+        return running
+
+    def report_deadline_breach(self) -> None:
+        """Record and fence, on the main thread, a deadline the enforcer thread reached.
+
+        The enforcer only interrupts the runner and deletes its pod; the ledger
+        record and the full fence happen here, once, as for any other bound.
+        """
+
+        if not self.record_deadline_breach():
+            return
+        self.attempt_live = False
+        self.guard_starts = False
+        self.stop_deadline_enforcer()
+        self.fence_paid_starts()
+        raise StepFailed("a native session reached its absolute time bound; paid work stopped")
+
+    def record_deadline_breach(self) -> bool:
+        """Append, once, a deadline the enforcer reached to the recorded breaches.
+
+        Returns whether this call recorded it. ``finalize`` calls it too, so a
+        deadline reached while the main loop failed some other way is still
+        recorded before the fence.
+        """
+
+        with self.deadline_lock:
+            breach = "" if self.deadline_reported else self.deadline_breach
+            self.deadline_reported = self.deadline_reported or bool(breach)
+        if not breach:
+            return False
+        recorded = self.ledger.observations("budget").get("allowance_breach")
+        prior = [str(item) for item in recorded] if isinstance(recorded, list) else []
+        self.ledger.record("budget", "allowance_breach", list(dict.fromkeys([*prior, breach])))
+        return True
+
+    # -- the deadline enforcer ----------------------------------------------------------
+
+    def start_deadline_enforcer(self, ceiling: sks.Ceiling) -> None:
+        """Bound each native process's wall clock without waiting on the main loop.
+
+        ``tick`` runs only between blocking calls (kubectl, SQL through
+        kubectl, Slack HTTP) whose timeouts reach minutes, so it can overshoot
+        a deadline. This daemon thread checks the followed pods about once a
+        second instead, on the driver's clock. Its stop is registered with the
+        finalizer before it starts.
+        """
+
+        self.finalizer.register("stop-deadline-enforcer", self.close_deadline_enforcer)
+        thread = threading.Thread(
+            target=self.deadline_loop, args=(float(ceiling.session_seconds),), daemon=True
+        )
+        self.deadline_thread = thread
+        thread.start()
+
+    def deadline_loop(self, seconds: float) -> None:
+        while not self.deadline_stop.is_set():
+            self.safe(lambda: self.enforce_deadlines(seconds), None)
+            if self.deadline_stop.is_set():
+                return
+            self.clock.wait(DEADLINE_SECONDS)
+
+    def enforce_deadlines(self, seconds: float) -> None:
+        """One enforcer pass: stop each runner whose native process reached ``seconds``.
+
+        A process's start is its wall-clock start (``ProcessWatch.started``), so
+        the bound is absolute. Each native process runs one implementer-role
+        session, the main session or the publish continuation, with its
+        reviewer subagents inside it, so the breach is that role's seconds. At
+        the deadline the runner interrupt (the fence's own command) and a
+        ``--wait=false`` delete of the pod start with nothing waiting on them,
+        and the breach is left for ``report_deadline_breach``. The ledger is
+        never touched here: its connection belongs to the main thread.
+        """
+
+        now = self.clock.now()
+        for pod in tuple(self.pods.values()):
+            with pod.lock:
+                deadline = pod.watch.deadline(seconds)
+            if deadline is None or now < deadline or pod.uid in self.deadline_fired:
+                continue
+            self.deadline_fired.add(pod.uid)
+            with self.deadline_lock:
+                self.deadline_breach = self.deadline_breach or f"seconds:{sks.IMPLEMENTER}"
+            self.start_unwaited(
+                "exec", pod.name, "-c", "runner", "--", "python3", "-c", INTERRUPT_PROGRAM
+            )
+            self.start_unwaited("delete", "pod", pod.name, "--wait=false")
+
+    def start_unwaited(self, *args: str) -> None:
+        """Start one kubectl command for the enforcer; its output is scanned, never awaited."""
+
+        try:
+            process = self.kube.start(*args)
+        except Exception:  # noqa: BLE001 - the main thread's fence still stops the runner
+            return
+        self.deadline_processes.append(process)
+        self.processes.append(process)
+        for stream in (process.stdout, process.stderr):
+            threading.Thread(target=self.scan_children, args=(stream,), daemon=True).start()
+
+    def scan_children(self, stream: Any) -> None:
+        for line in stream if stream is not None else ():
+            self.scan.scan("children", line)
+
+    def stop_deadline_enforcer(self) -> None:
+        """No enforcer pass starts after this; a pass in flight may still finish."""
+
+        self.deadline_stop.set()
+
+    def close_deadline_enforcer(self) -> None:
+        """The finalizer step: stop the enforcer, wait for it, and reap what it started."""
+
+        self.stop_deadline_enforcer()
+        thread = self.deadline_thread
+        if thread is not None:
+            thread.join(timeout=DEADLINE_JOIN_SECONDS)
+        for process in tuple(self.deadline_processes):
+            stop_process(process)
+        if thread is not None and thread.is_alive():
+            raise StepFailed("the deadline enforcer did not stop")
 
     def discover_runner_pods(self) -> None:
         claims = self.kube.json("get", CLAIM_RESOURCE, "-l", f"{CLAIM_AGENT_LABEL}={self.agent}")
@@ -2904,7 +3079,7 @@ class LiveRun:
             claim=str((claim.get("metadata") or {}).get("name")),
             record=pod,
             harvest=sks.HarvestState(self.scan),
-            watch=sks.ProcessWatch(),
+            watch=sks.ProcessWatch(container_started=sks.runner_started_at(pod)),
             lock=threading.Lock(),
             eof=threading.Event(),
         )
@@ -2973,7 +3148,7 @@ class LiveRun:
             for line in stream if stream is not None else ():
                 with observed.lock:
                     observed.harvest.feed(line)
-                    observed.watch.feed(line)
+                    observed.watch.feed(line, now=self.clock.now())
             observed.eof.set()
 
         def drain(stream: Any) -> None:
@@ -3053,7 +3228,7 @@ class LiveRun:
         self.ledger.record("budget", "settlement", settled)
         if facts is None:
             return
-        self.ledger.record("grant", "sessions", [sks.session_summary(s) for s in facts.sessions])
+        self.ledger.record("grant", "sessions", [sks.session_record(s) for s in facts.sessions])
         self.ledger.record("grant", "role_models", sks.role_models(facts.sessions))
         self.ledger.record("grant", "synthetic_records", int(facts.synthetic_records))
         self.ledger.record(
@@ -3088,19 +3263,62 @@ class LiveRun:
         self.ledger.record("owner", "request_owners", [sks.owner_tuple(row) for row in requests])
 
     def fence_paid_starts(self) -> None:
-        """Make another paid start impossible, issuing every protective step before any wait.
+        """Make another paid start impossible: stop the worker first, then the runners.
 
-        Order (accepted change 7): the worker is scaled to zero first, so no
-        queued continuation can be claimed; the private reservation gate
-        closes; then each runner is interrupted and its pod deleted. Only then
-        does anything wait: no worker pod may be ready and no runner container
-        may still run. A stopping worker drains its active handler first, which
-        is why the runner delete is not held behind the worker wait.
+        Order (accepted change 7): the worker Deployment is scaled to zero, the
+        private reservation gate closes, and the worker pods are deleted with a
+        one second grace period and waited on until the kubelet reports them gone,
+        so no worker can claim a queued continuation or retry its turn. The worker
+        is stopped, not drained: its readiness probe is a heartbeat file, so a
+        draining worker stays Ready until its turn handler returns, and that
+        handler waits on the very runner this fence must stop, which would hold a
+        paid session past its absolute bound. Only then is each runner interrupted
+        and its pod deleted, and the deletions awaited. That happens even when a
+        worker would not stop, because the absolute session bound outranks the
+        order; the fence still fails in that case. Last, no worker pod may be
+        Ready and no runner container may run.
+
+        The deadline enforcer deliberately stops a runner at its deadline without
+        waiting on the worker; the main-thread fence that follows stops the worker
+        and catches any runner a retry started.
         """
 
         fullname = self.inputs.fullname
+        worker_selector = (
+            f"app.kubernetes.io/component=worker,app.kubernetes.io/instance={self.inputs.release}"
+        )
         self.kube.ctl("scale", f"deployment/{fullname}-worker", "--replicas=0", timeout=120)
         self.ledger.close_gate()
+        self.kube.ctl(
+            "delete",
+            "pod",
+            "-l",
+            worker_selector,
+            "--grace-period=1",
+            "--wait=false",
+            timeout=120,
+        )
+        self.kube.ctl(
+            "wait",
+            "--for=delete",
+            "pod",
+            "-l",
+            worker_selector,
+            "--timeout=60s",
+            timeout=75,
+            check=False,
+        )
+        workers = self.kube.json("get", "pods", "-l", worker_selector)
+        ready_workers = [
+            pod
+            for pod in (workers or {}).get("items") or []
+            if any(
+                item.get("type") == "Ready" and item.get("status") == "True"
+                for item in (pod.get("status") or {}).get("conditions") or []
+            )
+        ]
+        workers_stopped = not ready_workers
+        self.ledger.record("budget", "workers_stopped_first", workers_stopped)
         runners = self.kube.json("get", "pods", "-l", POD_CLAIM_LABEL)
         for pod in (runners or {}).get("items") or []:
             name = str((pod.get("metadata") or {}).get("name") or "")
@@ -3118,29 +3336,16 @@ class LiveRun:
                     timeout=30,
                 )
         self.kube.ctl("delete", "pod", "-l", POD_CLAIM_LABEL, "--wait=false", timeout=120)
-        worker_selector = (
-            f"app.kubernetes.io/component=worker,app.kubernetes.io/instance={self.inputs.release}"
+        self.kube.ctl(
+            "wait",
+            "--for=delete",
+            "pod",
+            "-l",
+            POD_CLAIM_LABEL,
+            "--timeout=180s",
+            timeout=200,
+            check=False,
         )
-        for selector in (POD_CLAIM_LABEL, worker_selector):
-            self.kube.ctl(
-                "wait",
-                "--for=delete",
-                "pod",
-                "-l",
-                selector,
-                "--timeout=180s",
-                timeout=200,
-                check=False,
-            )
-        workers = self.kube.json("get", "pods", "-l", worker_selector)
-        ready_workers = [
-            pod
-            for pod in (workers or {}).get("items") or []
-            if any(
-                item.get("type") == "Ready" and item.get("status") == "True"
-                for item in (pod.get("status") or {}).get("conditions") or []
-            )
-        ]
         runners = self.kube.json("get", "pods", "-l", POD_CLAIM_LABEL)
         running = [
             pod
@@ -3150,10 +3355,11 @@ class LiveRun:
                 for status in (pod.get("status") or {}).get("containerStatuses") or []
             )
         ]
-        fenced = not ready_workers and not running
+        fenced = workers_stopped and not running
         self.ledger.record("budget", "paid_starts_fenced", fenced)
         if not fenced:
-            raise StepFailed("a worker or runner is still active after fencing")
+            active = "a worker" if not workers_stopped else "a runner"
+            raise StepFailed(f"{active} is still active after fencing")
 
     # -- phase: read-back ---------------------------------------------------------------
 
@@ -3186,10 +3392,7 @@ class LiveRun:
         pull_request = False
         for row in publications:
             record = self.publication(sks.sql_uuid(row.get("id")))
-            branch = str(record.get("branch") or "")
-            head = str(record.get("lineage_head_sha") or "")
-            if branch and re.fullmatch(r"[0-9a-f]{40}", head):
-                self.publication_branches[branch] = head
+            self.track_publication(record)
             pull_request = pull_request or bool(record.get("pr_number") or record.get("pr_url"))
         self.ledger.record("progress", "thread", self.slack_thread())
         self.ledger.record(
@@ -3290,14 +3493,62 @@ class LiveRun:
         self.fence_paid_starts()
         self.ledger.record("rehearsal", "fence_exercised", True)
 
+    def track_publication(self, record: Mapping[str, Any]) -> None:
+        """Remember a publication's branch; a head that is not a commit stays unproved."""
+
+        branch = str(record.get("branch") or "")
+        head = str(record.get("lineage_head_sha") or "")
+        if not branch:
+            return
+        if re.fullmatch(r"[0-9a-f]{40}", head):
+            self.publication_branches[branch] = head
+        else:
+            self.publication_branches.setdefault(branch, "")
+
+    def recover_publications(self) -> None:
+        """Merge every publication of this run's agent into the branch map, once.
+
+        Before the attempt went live no publication can exist. After it, a failed
+        enumeration leaves the forge state uncertain, so cleanup fails and the
+        inventory cannot report absent.
+        """
+
+        if self.publications_recovered:
+            return
+        self.publications_recovered = True
+        if self.ledger.run_row()["live_started_at"] is None:
+            return
+        try:
+            if not self.agent_id:
+                raise StepFailed("the agent id is unknown")
+            rows = self.sql(
+                "SELECT p.id FROM curie.publications p JOIN curie.execution_requests r ON "
+                "p.execution_request_id = r.id JOIN curie.work_items w ON r.work_item_id = w.id "
+                f"WHERE w.agent_id = '{self.agent_id}'"
+            )
+            for row in rows:
+                self.track_publication(self.publication(sks.sql_uuid(row.get("id"))))
+        except Exception as error:  # noqa: BLE001 - any failure leaves the forge uncertain
+            self.publications_uncertain = True
+            raise StepFailed("this run's publications could not be enumerated") from error
+
+    def require_publications_known(self) -> None:
+        self.recover_publications()
+        if self.publications_uncertain:
+            raise StepFailed("this run's publications are uncertain; forge objects left in place")
+
     # -- cleanup steps ------------------------------------------------------------------------
 
     def close_run_pulls(self) -> None:
         """Close an open pull request only while its head is this run's published commit."""
 
+        self.require_publications_known()
         forge = self.require_forge()
         skipped = 0
         for branch, head in sorted(self.publication_branches.items()):
+            if not head:
+                skipped += 1
+                continue
             pulls = forge.call(
                 "GET",
                 forge.repo_path(
@@ -3315,14 +3566,20 @@ class LiveRun:
                     "PATCH", forge.repo_path(f"/pulls/{pull.get('number')}"), {"state": "closed"}
                 )
         if skipped:
-            raise StepFailed("an open run pull request is not at this run's commit; left open")
+            raise StepFailed(
+                "an open run pull request is not provably at this run's commit; left open"
+            )
 
     def delete_run_branches(self) -> None:
         """Delete a branch only while its head is the commit this run's publication made."""
 
+        self.require_publications_known()
         forge = self.require_forge()
         skipped = 0
         for branch, head in sorted(self.publication_branches.items()):
+            if not head:
+                skipped += 1
+                continue
             status, current = forge.request("GET", forge.repo_path(f"/git/ref/heads/{branch}"))
             if status == 404:
                 continue
@@ -3331,7 +3588,7 @@ class LiveRun:
                 continue
             forge.call("DELETE", forge.repo_path(f"/git/refs/heads/{branch}"), ok=(204,))
         if skipped:
-            raise StepFailed("a run branch is not at this run's commit; left in place")
+            raise StepFailed("a run branch is not provably at this run's commit; left in place")
 
     def delete_slack_messages(self) -> None:
         """Every message in the run's threads, each deleted with the token that posted it.
@@ -3438,6 +3695,7 @@ class LiveRun:
         return True
 
     def pulls_closed(self) -> bool:
+        self.require_publications_known()
         if not self.publication_branches:
             return True
         forge = self.require_forge()
@@ -3455,6 +3713,7 @@ class LiveRun:
         return True
 
     def branches_absent(self) -> bool:
+        self.require_publications_known()
         if not self.publication_branches:
             return True
         forge = self.require_forge()
