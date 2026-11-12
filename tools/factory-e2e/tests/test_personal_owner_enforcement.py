@@ -67,9 +67,9 @@ def _input(tmp_path: Path, **overrides: Any) -> Path:
 def _flag_values(tmp_path: Path, **overrides: str) -> dict[str, str]:
     values = {
         "candidate": CANDIDATE,
-        "context": "acme-throwaway",
+        "context": "fixture-context",
         "namespace": "acme-owner-proof",
-        "docker_context": "acme-scratch",
+        "docker_context": "other-context",
         "registry": "127.0.0.1:5005",
         "state_dir": str(_state(tmp_path)),
         "run_id": "acme-run-1",
@@ -239,9 +239,9 @@ def _main(argv: list[str], environ: dict[str, str] | None = None) -> int:
 def _cluster_args(tmp_path: Path, command: str, **overrides: str) -> list[str]:
     values = {
         "--candidate": CANDIDATE,
-        "--context": "acme-throwaway",
+        "--context": "fixture-context",
         "--namespace": "acme-owner-proof",
-        "--docker-context": "acme-scratch",
+        "--docker-context": "other-context",
         "--registry": "127.0.0.1:5005",
         "--input-file": str(_input(tmp_path)),
         "--state-dir": str(_state(tmp_path)),
@@ -691,13 +691,13 @@ def test_ledger_rows_are_scrubbed(tmp_path: Path) -> None:
 
 
 def test_argv_builders_name_the_context_and_carry_no_value(tmp_path: Path) -> None:
-    kubectl = poe.kubectl_argv("acme-throwaway", "acme-owner-proof", "get", "pods")
-    assert kubectl[:3] == ["kubectl", "--context", "acme-throwaway"]
-    assert poe.kubectl_argv("acme-throwaway", None, "get", "--raw=/readyz")[1:3] == [
+    kubectl = poe.kubectl_argv("fixture-context", "acme-owner-proof", "get", "pods")
+    assert kubectl[:3] == ["kubectl", "--context", "fixture-context"]
+    assert poe.kubectl_argv("fixture-context", None, "get", "--raw=/readyz")[1:3] == [
         "--context",
-        "acme-throwaway",
+        "fixture-context",
     ]
-    assert poe.docker_argv("acme-scratch", "info")[:3] == ["docker", "--context", "acme-scratch"]
+    assert poe.docker_argv("other-context", "info")[:3] == ["docker", "--context", "other-context"]
     for argv in (kubectl, pps.grant_probe_argv("/usr/bin/claude")):
         assert all(GRANT not in arg and HEADER not in arg for arg in argv)
 
@@ -726,7 +726,7 @@ def test_child_environment_is_an_allowlist_of_names_and_paths(tmp_path: Path) ->
         "CURIE_PERSONAL_PROOF_STATE_DIR",
     }
     assert all(GRANT not in value and HEADER not in value for value in env.values())
-    assert env["THROWAWAY_CONTEXT"] == "acme-throwaway"
+    assert env["THROWAWAY_CONTEXT"] == "fixture-context"
 
 
 def test_forwarded_child_argv_carries_paths_never_values(tmp_path: Path) -> None:
@@ -1121,3 +1121,86 @@ def test_teardown_order_fences_first_and_proves_absence_last() -> None:
         finalizer.register(name, step(name))
     finalizer.run()
     assert tuple(ran) == order
+
+
+def test_vanished_is_only_a_not_found() -> None:
+    class Status(Exception):
+        def __init__(self, status: int) -> None:
+            super().__init__("synthetic")
+            self.status = status
+
+    assert poe.vanished(Status(404))
+    assert not poe.vanished(Status(403))
+    assert not poe.vanished(RuntimeError("synthetic"))
+
+
+def test_failure_site_names_class_and_functions_never_values() -> None:
+    marker = "synthetic-value-never-in-a-site"
+
+    def capture_pod() -> None:
+        raise LookupError(marker)
+
+    def revalidated() -> None:
+        capture_pod()
+
+    try:
+        revalidated()
+    except LookupError as exc:
+        site = poe.failure_site(exc, Path(__file__).resolve().parents[3])
+    assert site.startswith("LookupError in capture_pod (test_personal_owner_enforcement.py:")
+    assert marker not in site
+    try:
+        raise ValueError(marker)
+    except ValueError as exc:
+        assert poe.failure_site(exc, Path("/nonexistent-root")) == "ValueError"
+
+
+# --------------------------------------------------------------------------
+# Publication on: one session, at most two queries
+# --------------------------------------------------------------------------
+
+
+def _check_of(verdict: dict[str, Any], key: str) -> dict[str, Any]:
+    checks = [check for item in verdict["criteria"] for check in item["checks"]]
+    return next(check for check in checks if check["key"] == key)
+
+
+def test_session_ceiling_is_one_constant_over_every_query(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The execute query and the kernel's one continuation share the session.
+    assert poe.SESSION_QUERIES == 2
+    worst_case = poe.SESSION_QUERIES * poe.SESSION_TURNS
+    assert worst_case == 4 > poe.SESSION_ASSISTANT_TURNS_CEILING == 2
+    ledger = _live_ledger(tmp_path / "a")
+    reservation = ledger.reserve(poe.SLOT_NAMES[0], T0 + 10)
+    usage = poe.SessionUsage(300, 3, True, models=(poe.MODEL,))
+    ledger.settle(reservation.seq, usage, 60.0, T0 + 20)
+    ledger.record("budget", "grant_probe.ok", True, T0)
+    verdict = poe.judge(ledger, "budget")
+    assert verdict["verdict"] == "fail"
+    assert _check_of(verdict, "session_assistant_turns_within_ceiling")["observed"] is False
+    assert _check_of(verdict, "every_session_within_share")["observed"] is False
+    # A later start is refused once a session overran the ceiling.
+    with pytest.raises(pps.Refusal):
+        ledger.reserve(poe.SLOT_NAMES[1], T0 + 30)
+    monkeypatch.setattr(poe, "SESSION_ASSISTANT_TURNS_CEILING", worst_case)
+    raised = poe.judge(ledger, "budget")
+    assert _check_of(raised, "session_assistant_turns_within_ceiling")["observed"] is True
+    assert _check_of(raised, "every_session_within_share")["observed"] is True
+
+
+def test_paid_objectives_answer_the_continuation_without_a_tool() -> None:
+    for objective in (driver.PAIR_OBJECTIVE, driver.HOSTED_OBJECTIVE):
+        assert objective.endswith(driver.CONTINUATION_ANSWER)
+        assert "`No changes needed:`" in objective and "call no tool" in objective
+    assert driver.REHEARSE_PAIR_OBJECTIVE == "[fake:progress-demo]"
+
+
+def test_hold_script_holds_read_once_per_process_and_every_stop() -> None:
+    script = driver.HOLD_SCRIPT
+    compile(script, "hold", "exec")
+    assert 'once = root / f"held-{mode}-{pid}-{start}"' in script
+    assert 'if mode == "read" and once.exists():' in script
+    # Stop has no once marker: each query's Stop is harvested and released.
+    assert 'mode == "stop"' not in script

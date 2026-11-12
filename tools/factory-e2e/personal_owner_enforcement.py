@@ -120,16 +120,22 @@ REFERENCE_TTL_SECONDS = 900
 # creates anything, in reverse, because the finalizer is LIFO.
 TEARDOWN_ORDER = ("fence", "inventory", "proof-cleanup", "registry", "absence")
 
+# The kernel may ask once more after a turn that published nothing; the
+# objective answers that continuation without a tool or a publication.
+CONTINUATION_ANSWER = (
+    " This request needs no change to any pull request: if you are asked to continue, "
+    "reply with one line beginning `No changes needed:` and call no tool."
+)
 PAIR_OBJECTIVE = (
     "This is an automated platform check. Use the Read tool exactly once to read "
     "/bundle/custody/brief.txt, then reply with exactly the single line it contains. "
-    "Use no other tool."
+    "Use no other tool." + CONTINUATION_ANSWER
 )
 HOSTED_OBJECTIVE = (
     "This is an automated platform check. In one response, call exactly these three tools "
     "and no others: the Bash tool with the command `python3 /bundle/custody/scan.py`, the "
     "`challenge` tool of the sentinel connector, and the `public_file` tool. After their "
-    "results arrive, reply with exactly the text the challenge tool returned."
+    "results arrive, reply with exactly the text the challenge tool returned." + CONTINUATION_ANSWER
 )
 REHEARSE_PAIR_OBJECTIVE = "[fake:progress-demo]"
 REHEARSE_HOSTED_OBJECTIVE = "[fake:connector-call]"
@@ -162,6 +168,15 @@ try:
 except ValueError:
     hook = {{}}
 pid, start = cli()
+# A continuation runs in the same native process; its Read passes through so
+# only the first Read of a process is the interruption point. Every Stop holds,
+# so the driver harvests the transcript after each query.
+once = root / f"held-{{mode}}-{{pid}}-{{start}}"
+if mode == "read" and once.exists():
+    print("{{}}")
+    raise SystemExit(0)
+if mode == "read":
+    once.write_text("held")
 holding = root / f"holding-{{mode}}"
 release = root / f"release-{{mode}}"
 holding.write_text(json.dumps({{
@@ -827,6 +842,10 @@ class Track:
     work_item_id: str = ""
     request_id: str = ""
     runtime_owner: str | None = None
+    # The hook process of the hold last seen, and every transcript file the
+    # native process wrote, latest bytes per path: one session's queries.
+    hook_pid: int | None = None
+    transcripts: dict[str, bytes] = dataclasses.field(default_factory=dict)
 
 
 def load_enrollment() -> Any:
@@ -888,6 +907,8 @@ def owner_proof_class(e: Any) -> type[Any]:  # noqa: C901 - one scenario, one cl
             self.runner_forwards: dict[str, dict[str, Any]] = {}
             self.runner_addresses: set[str] = set()
             self.forward_count = 0
+            # Pods whose logs could not be kept because they were already gone.
+            self.captures_missing = 0
             if self.paid:
                 grant = pps.load_grant(Path(ctx.grant_file))
                 self.grant = e.HeldSecret(grant.reveal())
@@ -963,7 +984,12 @@ def owner_proof_class(e: Any) -> type[Any]:  # noqa: C901 - one scenario, one cl
                 "CURIE_WORKSPACE_ENABLED": "true",
                 "CURIE_WORKSPACE_SCRATCH_ROOT": str(Path(self.private_dir) / "workspaces"),
                 "CURIE_WORKSPACE_REFERENCE_TTL_SECONDS": str(REFERENCE_TTL_SECONDS),
-                "CURIE_PUBLICATION_ENABLED": "false",
+                # Production's factory configuration: the kernel binds a
+                # publication context before every workspace-backed execute turn
+                # and refuses the turn without one. No proof step publishes, so
+                # no Job is created; any would land in the owned namespace.
+                "CURIE_PUBLICATION_ENABLED": "true",
+                "CURIE_PUBLICATION_NAMESPACE": self.namespace,
                 "CURIE_WORK_ITEM_MAX_TURNS": str(poe.SESSION_TURNS),
                 "DEFAULT_MAX_OUTPUT_TOKENS_PER_RUN": str(poe.SESSION_OUTPUT_TOKENS),
                 "CURIE_MAX_ATTEMPTS": "2",
@@ -1831,6 +1857,16 @@ def owner_proof_class(e: Any) -> type[Any]:  # noqa: C901 - one scenario, one cl
             )
             return result.returncode, result.stdout
 
+        def capture_pod(self, pod: str) -> None:
+            """#5377's log capture for the audit; a Pod already gone is counted, not raised."""
+
+            try:
+                super().capture_pod(pod)
+            except Exception as exc:  # noqa: BLE001 - only a vanished Pod is expected
+                if not poe.vanished(exc):
+                    raise
+                self.captures_missing += 1
+
         def image_ok(self, pod: Mapping[str, Any]) -> bool:
             status = pod.get("status") or {}
             observed = [
@@ -2091,6 +2127,7 @@ def owner_proof_class(e: Any) -> type[Any]:  # noqa: C901 - one scenario, one cl
                             continue
                         track.cli, track.session_id = ref, str(hold.get("session_id") or "")
                         track.transcript = str(hold.get("transcript_path") or "")
+                        track.hook_pid = hold.get("hook_pid")
                     else:
                         ref = f"{state['uid']}:{state['restarts']}"
                         if ref in exclude or not state.get("ready"):
@@ -2142,7 +2179,15 @@ def owner_proof_class(e: Any) -> type[Any]:  # noqa: C901 - one scenario, one cl
                 code, raw = self.pod_exec(track.pod, e._REPLAY_SEED_READ, retain=False)
                 with contextlib.suppress(ValueError):
                     track.seeds = json.loads(raw) if code == 0 else []
-            return data, poe.transcript_usage(data, track.seeds, scrub=self.scrub)
+            # Every query of the session counts: a continuation appends to the
+            # same file, and a file it may start is kept beside the first.
+            track.transcripts[track.transcript] = data
+            return data, combined_usage(
+                [
+                    poe.transcript_usage(part, track.seeds, scrub=self.scrub)
+                    for part in track.transcripts.values()
+                ]
+            )
 
         def settle(self, track: Track, usage: poe.SessionUsage) -> None:
             if track.seq is None:
@@ -2306,15 +2351,56 @@ def owner_proof_class(e: Any) -> type[Any]:  # noqa: C901 - one scenario, one cl
             self.work_items[issue] = item
             return item
 
-        def observe_selection(self, track: Track, item: Mapping[str, Any]) -> None:
-            from curie_worker.sandbox import types
+        def snapshot_selection(self, track: Track) -> dict[str, Any]:
+            """The claim, its ``<claim>-tokens`` Secret and the Pod, read the moment it is seen.
+
+            Every name is the claim the Pod is labeled with, which ``boundary``
+            matched to the started request's ``runtime_claim_name``. A claim,
+            Secret or Pod already gone is recorded missing, never raised. Only
+            booleans about the grant leave this method.
+            """
+
             from curie_worker.sandbox.claim_tokens import claim_object_names
+
+            snapshot: dict[str, Any] = {
+                "claim": track.claim,
+                "labels": self.claim_labels(track.claim),
+                "secret": "missing",
+                "pod": None,
+            }
+            secret_name = claim_object_names(track.claim).secret
+            snapshot["secret_name"] = secret_name
+            try:
+                stored = self.core.read_namespaced_secret(
+                    secret_name, self.namespace, _request_timeout=30
+                )
+            except Exception as exc:  # noqa: BLE001 - only a vanished Secret is expected
+                if not poe.vanished(exc):
+                    raise
+            else:
+                data = base64.b64decode((stored.data or {}).get("CLAUDE_CODE_OAUTH_TOKEN", ""))
+                snapshot["secret"] = bool(data) and data == self.grant.reveal().encode()
+                del data
+            try:
+                snapshot["pod"] = self.api_client.sanitize_for_serialization(
+                    self.core.read_namespaced_pod(track.pod, self.namespace, _request_timeout=30)
+                )
+            except Exception as exc:  # noqa: BLE001 - only a vanished Pod is expected
+                if not poe.vanished(exc):
+                    raise
+            return snapshot
+
+        def observe_selection(
+            self, track: Track, item: Mapping[str, Any], snapshot: Mapping[str, Any]
+        ) -> None:
+            from curie_worker.sandbox import types
 
             self.observe("selection", "admission.model_auth_mode", item.get("model_auth_mode"))
             self.observe(
                 "selection", "admission.enrollment_generation", item.get("enrollment_generation")
             )
-            labels = self.claim_labels(track.claim)
+            labels: Mapping[str, str] = snapshot["labels"]
+            self.observe("selection", "claim.observed", "present" if labels else "missing")
             self.observe(
                 "selection", "claim.label.model_auth_mode", labels.get(types.MODEL_AUTH_MODE_LABEL)
             )
@@ -2333,30 +2419,31 @@ def owner_proof_class(e: Any) -> type[Any]:  # noqa: C901 - one scenario, one cl
                 "claim.label.enrollment_generation",
                 labels.get(types.ENROLLMENT_GENERATION_LABEL),
             )
-            secret_name = claim_object_names(track.claim).secret
-            try:
-                stored = self.core.read_namespaced_secret(
-                    secret_name, self.namespace, _request_timeout=30
-                )
-                data = base64.b64decode((stored.data or {}).get("CLAUDE_CODE_OAUTH_TOKEN", ""))
-            except Exception:  # noqa: BLE001 - recorded as not carrying the grant
-                data = b""
+            secret = snapshot["secret"]
             self.observe(
                 "selection",
-                "claim.tokens_secret_carries_grant",
-                bool(data) and data == self.grant.reveal().encode(),
+                "claim.tokens_secret_observed",
+                "missing" if secret == "missing" else "present",
             )
-            del data
-            pod = self.api_client.sanitize_for_serialization(
-                self.core.read_namespaced_pod(track.pod, self.namespace, _request_timeout=30)
+            self.observe("selection", "claim.tokens_secret_carries_grant", secret is True)
+            pod: Mapping[str, Any] | None = snapshot["pod"]
+            self.observe("selection", "pod.observed", "present" if pod else "missing")
+            runner: dict[str, Any] = next(
+                (
+                    c
+                    for c in ((pod or {}).get("spec") or {}).get("containers") or []
+                    if c["name"] == "runner"
+                ),
+                {},
             )
-            runner = next(c for c in pod["spec"]["containers"] if c["name"] == "runner")
-            env = {item["name"]: item for item in runner.get("env") or []}
+            env = {entry["name"]: entry for entry in runner.get("env") or []}
             ref = ((env.get("CLAUDE_CODE_OAUTH_TOKEN") or {}).get("valueFrom") or {}).get(
                 "secretKeyRef"
             ) or {}
             self.observe(
-                "selection", "pod.grant_env_from_tokens_secret", ref.get("name") == secret_name
+                "selection",
+                "pod.grant_env_from_tokens_secret",
+                bool(pod) and ref.get("name") == snapshot["secret_name"],
             )
             self.observe(
                 "selection",
@@ -2371,13 +2458,16 @@ def owner_proof_class(e: Any) -> type[Any]:  # noqa: C901 - one scenario, one cl
                         "CURIE_CREDENTIALS",
                         "ANTHROPIC_AUTH_TOKEN",
                     }
-                ),
+                )
+                if pod
+                else None,
             )
-            self.observe("selection", "pod.image_digest_matches", self.image_ok(pod))
+            image = bool(pod) and self.image_ok(pod or {})
+            self.observe("selection", "pod.image_digest_matches", image)
             self.observe(
                 "selection",
                 "pod.revision_label_matches",
-                self.image_ok(pod) and bool(self.evidence.get("oci_revision_matches_source")),
+                image and bool(self.evidence.get("oci_revision_matches_source")),
             )
             # Durable: the start the worker's acquire made (started_at and this
             # claim), and the runtime owner read while the request ran, which
@@ -2385,6 +2475,11 @@ def owner_proof_class(e: Any) -> type[Any]:  # noqa: C901 - one scenario, one cl
             row = next(
                 (r for r in self.requests_of(str(item["id"])) if str(r["id"]) == track.request_id),
                 None,
+            )
+            self.observe(
+                "selection",
+                "claim.name_is_request_runtime_claim",
+                row is not None and row["runtime_claim_name"] == snapshot["claim"],
             )
             self.observe(
                 "selection",
@@ -2410,9 +2505,14 @@ def owner_proof_class(e: Any) -> type[Any]:  # noqa: C901 - one scenario, one cl
                 self.pod_exec(track.pod, INTERRUPT_PROGRAM, timeout=30)
                 return {"kind": kind}
             if kind == "pod":
-                self.core.delete_namespaced_pod(
-                    track.pod, self.namespace, grace_period_seconds=0, _request_timeout=30
-                )
+                try:
+                    self.core.delete_namespaced_pod(
+                        track.pod, self.namespace, grace_period_seconds=0, _request_timeout=30
+                    )
+                except Exception as exc:  # noqa: BLE001 - only a vanished Pod is expected
+                    if not poe.vanished(exc):
+                        raise
+                    return {"kind": kind, "pod_already_gone": True}
                 return {"kind": kind}
             before = self.kill_worker()
             e.require(before is not None, "the candidate worker is not running")
@@ -2460,7 +2560,9 @@ def owner_proof_class(e: Any) -> type[Any]:  # noqa: C901 - one scenario, one cl
                 self.check_stub()
                 raise poe.StepFailed(f"{kind}: the first session never reached its boundary")
             # Only what must precede the interruption runs before it: the
-            # rehearsal's offline turn lasts seconds and nothing holds it.
+            # rehearsal's offline turn lasts seconds and nothing holds it. The
+            # claim is read now, by the name the Pod carries, before it can go.
+            selection = self.snapshot_selection(a) if kind == "process" else None
             before = self.workspace_state(a.pod, nonce=secrets.token_hex(16))
             ids_before = self.durable_ids(thread)
             if self.paid:
@@ -2469,9 +2571,8 @@ def owner_proof_class(e: Any) -> type[Any]:  # noqa: C901 - one scenario, one cl
             self.settle(a, usage)
             self.reserve(b_slot)
             facts = self.interrupt(kind, a)
-            if kind == "process":
-                # The claim, its Secret and the Pod outlive a container restart.
-                self.observe_selection(a, item)
+            if selection is not None:
+                self.observe_selection(a, item, selection)
             b = self.boundary(b_slot, "read", work_item_id=work_item_id, exclude=[a.cli])
             restart: dict[str, Any] = {
                 "automatic_recovery": b is not None,
@@ -2541,24 +2642,77 @@ def owner_proof_class(e: Any) -> type[Any]:  # noqa: C901 - one scenario, one cl
             self.check_stub()
 
         def finish_session(self, track: Track) -> bytes | None:
-            """Release the read hold, harvest at the Stop hold, settle, release it."""
+            """Release the read hold, then harvest at every Stop until the request ends."""
 
             self.release_hold(track, "read")
             if not self.paid:
                 self.wait_soft(lambda: None, timeout=10)
                 track.closed = True
                 return None
-            stopped = self.boundary(
-                track.slot, "stop", work_item_id=track.work_item_id, timeout=poe.SESSION_SECONDS
-            )
-            data, usage = (
-                self.harvest(track) if stopped is not None else (None, poe.SessionUsage.unknown())
-            )
-            self.settle(track, usage)
-            self.capture_pod(track.pod)
-            self.release_hold(track, "stop")
-            track.closed = True
+            data, _usage = self.drain_stops(track, seen=set())
             return data
+
+        def drain_stops(
+            self,
+            track: Track,
+            *,
+            seen: set[Any],
+            harvested: tuple[bytes | None, poe.SessionUsage] | None = None,
+        ) -> tuple[bytes | None, poe.SessionUsage]:
+            """Harvest and release each Stop of the session, then settle it once.
+
+            The kernel opens at most one unpublished continuation on the same
+            native process after the execute turn, and each query ends at its
+            own Stop. The loop harvests at every Stop hook not in ``seen`` and
+            ends when the request is terminal, ``poe.SESSION_QUERIES`` Stops
+            were seen, or the session's one absolute deadline passes (the sweep
+            then harvests, interrupts and settles it itself). ``harvested`` is
+            what a caller already read at the Stops in ``seen``.
+            """
+
+            data, usage = harvested or (None, poe.SessionUsage.unknown())
+            stops = len(seen)
+
+            def next_stop() -> tuple[str, dict[str, Any] | None] | None:
+                state = self.pod_states.get(track.pod_uid) or {}
+                hold = (state.get("holds") or {}).get("stop")
+                if (
+                    hold
+                    and f"{track.pod_uid}:{hold.get('cli_pid')}:{hold.get('cli_start')}"
+                    == track.cli
+                    and hold.get("hook_pid") not in seen
+                ):
+                    return "stop", hold
+                row = next(
+                    (
+                        r
+                        for r in self.requests_of(track.work_item_id)
+                        if str(r["id"]) == track.request_id
+                    ),
+                    None,
+                )
+                if track.closed or row is None or row["terminal_at"] is not None:
+                    return "ended", None
+                return None
+
+            while stops < poe.SESSION_QUERIES:
+                left = max(0.0, track.deadline - time.time()) if track.deadline else 0.0
+                found = self.wait_soft(next_stop, timeout=left)
+                if found is None or found[0] == "ended" or found[1] is None:
+                    break
+                hold = found[1]
+                seen.add(hold.get("hook_pid"))
+                stops += 1
+                track.transcript = str(hold.get("transcript_path") or track.transcript)
+                data, usage = self.harvest(track)
+                self.capture_pod(track.pod)
+                self.release_hold(track, "stop")
+            if track.closed:
+                # The deadline action already harvested, interrupted and settled it.
+                return data, usage
+            self.settle(track, usage)
+            track.closed = True
+            return data, usage
 
         def owner_claims(self) -> list[str]:
             """Every claim in the namespace labeled with the owner principal."""
@@ -2862,10 +3016,14 @@ def owner_proof_class(e: Any) -> type[Any]:  # noqa: C901 - one scenario, one cl
                     lambda: True if self.sentinel_counts()["authorized"] else None, timeout=60
                 )
             counts = self.sentinel_counts()
-            if self.paid:
-                self.settle(track, usage)
             self.capture_pod(track.pod)
             self.release_hold(track, "stop")
+            if self.paid:
+                # The kernel's one unpublished continuation may follow on the
+                # same process; the session settles once, over both queries.
+                data, usage = self.drain_stops(
+                    track, seen={track.hook_pid}, harvested=(data, usage)
+                )
             track.closed = True
             results = poe.tool_results(data or b"")
             self.observe(
@@ -3017,6 +3175,7 @@ def owner_proof_class(e: Any) -> type[Any]:  # noqa: C901 - one scenario, one cl
         def final_audit(self) -> None:
             """No header or grant bytes in manifests, logs, events or the private ledger."""
 
+            self.observe("hosted-header", "audit.pod_captures_missing", self.captures_missing)
             for plural in ("sandboxclaims", "sandboxtemplates", "sandboxwarmpools"):
                 self.captures.append(
                     json.dumps(
@@ -3322,6 +3481,12 @@ def child_main(args: argparse.Namespace, rt: Runtime) -> int:
     finalizer = poe.Finalizer(record)
     outcome, detail = "failed", ""
     proof: Any = None
+
+    def step_of() -> str:
+        evidence = getattr(proof, "evidence", None)
+        stage = evidence.get("stage") if isinstance(evidence, dict) else None
+        return f"step {stage}: " if isinstance(stage, str) and stage else ""
+
     try:
         with signals_to_exit():
             enrollment = load_enrollment()
@@ -3330,13 +3495,13 @@ def child_main(args: argparse.Namespace, rt: Runtime) -> int:
             proof.execute()
         outcome = "completed"
     except (poe.StepFailed, pps.Refusal) as failure:
-        detail = str(failure.payload() if isinstance(failure, pps.Refusal) else failure)
+        detail = step_of() + str(failure.payload() if isinstance(failure, pps.Refusal) else failure)
     except SystemExit as stop:
-        detail = f"interrupted ({stop.code})"
+        detail = f"{step_of()}interrupted ({stop.code})"
     except AssertionError as failure:
-        detail = str(failure)
-    except BaseException as failure:  # noqa: BLE001 - a fixed name, never the message
-        detail = type(failure).__name__
+        detail = f"{step_of()}{failure} [{poe.failure_site(failure, REPO_ROOT)}]"
+    except BaseException as failure:  # noqa: BLE001 - names only, never the message
+        detail = step_of() + poe.failure_site(failure, REPO_ROOT)
         if proof is not None:
             with contextlib.suppress(Exception):
                 proof.retain_failure(failure)

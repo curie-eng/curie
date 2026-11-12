@@ -398,8 +398,14 @@ own `workspace-init` program, read from the candidate's `agent-sandbox.yaml`,
 the chart's default `emptyDir` workspace at `/workspace`, and the chart's
 `codeHostTrust` mount at `/etc/curie/code-host-trust/ca.crt` with
 `CURIE_REPO_CA_BUNDLE`, `GIT_SSL_CAINFO`, `SSL_CERT_FILE` and
-`REQUESTS_CA_BUNDLE` naming it. Publication stays off
-(`CURIE_PUBLICATION_ENABLED=false`); no proof step depends on a pull request.
+`REQUESTS_CA_BUNDLE` naming it. Publication is on, as in a factory install
+(`CURIE_PUBLICATION_ENABLED=true`, its namespace the owned one): the kernel
+binds a publication context before every workspace-backed execute turn and
+refuses the turn without one. For a WorkItem with no pull request the API's
+context mint answers 204 without a code host read, so the API needs nothing
+more. No proof step publishes, and each objective tells the model to answer
+the kernel's one unpublished continuation with `No changes needed:` and no
+tool, so no publication Job is created.
 After each pair and at the end of the audit, the driver reads the stub's record
 of unsupported calls and fails with the call's method and path if there is one.
 
@@ -419,7 +425,10 @@ drops it when the Pod goes away. Teardown stops every runner forward and proves
 each address closed.
 
 Every observation is scoped to its own WorkItem: a pod counts only when its
-claim is the `runtime_claim_name` of a started request of that WorkItem.
+claim is the `runtime_claim_name` of a started request of that WorkItem, and
+the claim, its `<claim>-tokens` Secret and the Pod are read the moment the pod
+is seen, by the claim name the Pod carries. A claim, Secret or Pod that is
+already gone is recorded missing, never raised.
 Only the start route writes that column and `started_at`, for the owner holding
 the request's acquire, and the driver never acquires; `selection` also requires
 the request's `runtime_owner`, read while it runs (terminal settlement clears
@@ -529,7 +538,17 @@ session reserves an even share (1,024 output tokens, 2 turns, 180 s) in the
 ledger before anything can start it, and every share is checked to fit before
 the first start. The worker runs with `CURIE_WORK_ITEM_MAX_TURNS=2`,
 `DEFAULT_MAX_OUTPUT_TOKENS_PER_RUN=1024` and `CURIE_MAX_ATTEMPTS=2`; the
-template keeps 256 output tokens per response. Immediately before the first
+template keeps 256 output tokens per response. `CURIE_WORK_ITEM_MAX_TURNS`
+bounds each query, and with publication on the kernel opens at most one
+unpublished continuation on the same native process after an execute turn, so
+a session carries at most two queries (4 assistant turns in the worst case).
+The ledger records one session across both: the bundle's hook holds only the
+first Read of a process and every Stop, the driver harvests and releases each
+Stop until the request is terminal, and the session settles once, inside its
+one 180 s absolute deadline. The budget judge and the over-share stop compare
+each session's assistant turns with `SESSION_ASSISTANT_TURNS_CEILING` (2) in
+`personal_owner_enforcement_support.py`, the one number to change if the
+ceiling is ruled otherwise. Immediately before the first
 reservation, a one-turn grant probe runs on the cheapest model with an empty
 `HOME`; if it fails, nothing is reserved.
 
@@ -584,15 +603,16 @@ chart's 300 s, so a Pod the controller recreates late in a pair can still stage
 the checkout. Recovery is whatever the product does on its own (the kernel's
 transient retry, or the owner-lost successor after a worker loss); when no
 fresh session starts within 150 s, the WorkItem is cancelled and the recovery
-checks record false. After a worker kill the API declares the request
-owner-lost once its heartbeat expiry is a full runtime TTL in the past (#5377's
-24 s TTL, an 8 s heartbeat, so 40 to 48 s after the kill, on a 2 s reconciler
-pass); the restarted worker tears the retained claim down on the terminate
-wake (retried every 6 s), the settlement admits the successor, and its execute
-wake follows on the next pass, so the successor is expected 60 to 90 s after
-the kill. The rehearsal's offline turn lasts about 6 s and nothing holds it,
-so the driver runs only the nonce write between the boundary and the
-interruption; the durable history check is an ordered prefix, because a turn
+checks record false. The restarted worker reuses its consumer name, so its
+orphan sweep declares the killed incarnation's running request owner-lost as
+it starts (#3076); the terminate chain tears the retained claim down, the
+settlement admits the successor, and its execute wake follows on the next 2 s
+reconciler pass, so the successor claims within seconds. The API's own
+heartbeat path (expiry a full 24 s TTL in the past, 40 to 48 s after the kill)
+is only the backstop. The rehearsal's offline turn lasts about 6 s and nothing
+holds it, and the runner's fake model has no directive that keeps a turn open,
+so the driver runs only the claim snapshot and the nonce write between the
+boundary and the interruption; the durable history check is an ordered prefix, because a turn
 that ended first appends its own record. Teardown stops the code host and
 runner forwards and the object store relay before #5377's cleanup and proves
 their ports closed; the stub's Pod, Service and ConfigMaps go with the owned

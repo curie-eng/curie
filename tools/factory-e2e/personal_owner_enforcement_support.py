@@ -24,6 +24,7 @@ import sqlite3
 import stat
 import sys
 import textwrap
+import traceback
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from pathlib import Path
 from typing import Any
@@ -40,7 +41,15 @@ import personal_profile_support as pps  # noqa: E402
 
 MODEL = "claude-sonnet-5-5"
 MAX_SESSIONS = 8
+# CURIE_WORK_ITEM_MAX_TURNS: the SDK turn budget of each query.
 SESSION_TURNS = 2
+# Queries one native session can carry: the execute turn, then at most one
+# unpublished continuation the kernel opens on the same runner
+# (curie_worker.kernel.publication._continue_unpublished).
+SESSION_QUERIES = 2
+# The per-session assistant-turn ceiling, across every query of the session.
+# The budget judge and the over-share stop compare against this one number.
+SESSION_ASSISTANT_TURNS_CEILING = 2
 MAX_TURNS = 16
 MAX_OUTPUT_TOKENS = 8192
 SESSION_SECONDS = 180
@@ -137,11 +146,11 @@ EXIT_NOT_MET = 3
 FIXES: dict[str, str] = {
     "input_file_invalid": "--input-file must be a private (0600, yours) JSON object with "
     "kubeconfig, curie_bin and runner_api_host, and optionally grant_probe_cli",
-    "context_invalid": "pass --context naming the throwaway kube context",
+    "context_invalid": "pass --context <context> naming the throwaway kube context",
     "docker_context_invalid": "pass --docker-context naming the scratch Docker context",
     "namespace_invalid": "pass --namespace as a DNS label of at most 42 characters",
     "namespace_exists": "choose a namespace that does not exist; the driver creates and deletes it",
-    "cluster_unready": "the cluster's /readyz did not answer ok through --context",
+    "cluster_unready": "the cluster's /readyz did not answer ok through --context <context>",
     "rbac_denied": "the caller cannot create, read or delete a required resource in a "
     "fresh namespace",
     "docker_unavailable": "docker info failed through --docker-context",
@@ -569,7 +578,7 @@ def over_share(row: SessionRow) -> bool:
         and row.known
         and (
             (row.output_tokens or 0) > SESSION_OUTPUT_TOKENS
-            or (row.assistant_turns or 0) > SESSION_TURNS
+            or (row.assistant_turns or 0) > SESSION_ASSISTANT_TURNS_CEILING
             or (row.elapsed or 0.0) > SESSION_SECONDS
         )
     )
@@ -1153,6 +1162,8 @@ def committed_restoration(
 # Runner reachability: the worker runs outside the cluster
 # --------------------------------------------------------------------------
 
+# The driver's own source files, named in a failure site.
+DRIVER_STEM = "personal_owner_enforcement"
 # The worker's default runner port (curie_worker.sandbox.types.SubstrateConfig).
 RUNNER_PORT = 8080
 # Request statuses that refuse a new admission on the same WorkItem
@@ -1272,6 +1283,38 @@ def active_requests(rows: Sequence[Mapping[str, Any]]) -> list[Mapping[str, Any]
     """Requests that refuse a new admission on their WorkItem (``active_request``)."""
 
     return [row for row in rows if row.get("status") in ACTIVE_REQUEST_STATUSES]
+
+
+def vanished(exc: BaseException) -> bool:
+    """A Kubernetes read or delete of an object that no longer exists (HTTP 404)."""
+
+    return getattr(exc, "status", None) == 404
+
+
+def failure_site(exc: BaseException, root: Path) -> str:
+    """Where an unexpected exception came from: its class and function names, never values.
+
+    Names the innermost frame in a source file under ``root`` (outside any
+    virtual environment) and, when it differs, the innermost frame of the
+    driver itself, each as ``function (file:line)`` with the file's base name.
+    """
+
+    frames = [
+        frame
+        for frame in traceback.extract_tb(exc.__traceback__)
+        if Path(frame.filename).is_relative_to(root) and ".venv" not in Path(frame.filename).parts
+    ]
+    driver = [frame for frame in frames if Path(frame.filename).name.startswith(DRIVER_STEM)]
+
+    def where(frame: traceback.FrameSummary) -> str:
+        return f"{frame.name} ({Path(frame.filename).name}:{frame.lineno})"
+
+    site = type(exc).__name__
+    if frames:
+        site += f" in {where(frames[-1])}"
+    if driver and (not frames or driver[-1] is not frames[-1]):
+        site += f" from {where(driver[-1])}"
+    return site
 
 
 # --------------------------------------------------------------------------
@@ -1450,6 +1493,10 @@ def _judge_budget(ledger: OwnerLedger) -> list[dict[str, Any]]:
         "turns_within_ceiling": not unknown and turns <= MAX_TURNS,
         "output_tokens_within_ceiling": not unknown and tokens <= MAX_OUTPUT_TOKENS,
         "every_session_within_share": not any(over_share(row) for row in rows),
+        "session_assistant_turns_within_ceiling": not unknown
+        and all(
+            (item["assistant_turns"] or 0) <= SESSION_ASSISTANT_TURNS_CEILING for item in sessions
+        ),
         "usage_known": not unknown,
         "unreserved_starts": sum(bool(item["unreserved"]) for item in sessions),
         "paid_retries": sum(
@@ -1467,6 +1514,7 @@ def _judge_budget(ledger: OwnerLedger) -> list[dict[str, Any]]:
         "turns_within_ceiling": True,
         "output_tokens_within_ceiling": True,
         "every_session_within_share": True,
+        "session_assistant_turns_within_ceiling": True,
         "usage_known": True,
         "unreserved_starts": 0,
         "paid_retries": 0,
