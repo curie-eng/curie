@@ -295,7 +295,11 @@ def test_run_requires_grant_flags(tmp_path: Path) -> None:
 def test_ceiling_splits_evenly_and_fits() -> None:
     assert len(poe.SESSION_PLAN) == poe.MAX_SESSIONS == 8
     assert poe.SESSION_OUTPUT_TOKENS * poe.MAX_SESSIONS == poe.MAX_OUTPUT_TOKENS == 8192
-    assert poe.SESSION_TURNS * poe.MAX_SESSIONS == poe.MAX_TURNS == 16
+    assert (
+        poe.SESSION_ASSISTANT_TURNS_CEILING * poe.MAX_SESSIONS
+        == poe.TOTAL_ASSISTANT_TURNS_CEILING
+        == 32
+    )
     assert poe.SESSION_SECONDS * poe.MAX_SESSIONS <= poe.LIVE_SECONDS == 1440
     assert poe.CLEANUP_SECONDS == 180 and poe.PAID_RETRIES == 0
     assert poe.MODEL == "claude-sonnet-5-5"
@@ -307,7 +311,7 @@ def test_ceiling_splits_evenly_and_fits() -> None:
     "overrides",
     [
         {"session_tokens": poe.SESSION_OUTPUT_TOKENS + 1},
-        {"session_turns": poe.SESSION_TURNS + 1},
+        {"session_turns": poe.SESSION_ASSISTANT_TURNS_CEILING + 1},
         {"session_seconds": poe.SESSION_SECONDS + 1},
         {"sessions": poe.MAX_SESSIONS + 1},
     ],
@@ -329,7 +333,7 @@ def _decide(rows: list[poe.SessionRow], **overrides: Any) -> poe.Reservation:
 
 def test_first_reservation_takes_one_even_share() -> None:
     first = _decide([])
-    assert (first.seq, first.tokens, first.turns) == (1, 1024, 2)
+    assert (first.seq, first.tokens, first.turns) == (1, 1024, 4)
     assert first.deadline == T0 + poe.SESSION_SECONDS
 
 
@@ -344,16 +348,25 @@ def test_reservation_deadline_never_passes_the_live_window() -> None:
 def test_unknown_or_unsettled_usage_exhausts_the_allowance() -> None:
     _refused("usage_unknown", lambda: _decide([_row(1, known=False, output_tokens=None)]))
     _refused("usage_unknown", lambda: _decide([_row(1, settled=False)]))
-    assert poe.spent([_row(1, known=False)]) == (poe.MAX_OUTPUT_TOKENS, poe.MAX_TURNS)
-    assert poe.spent([_row(1, unreserved=True)]) == (poe.MAX_OUTPUT_TOKENS, poe.MAX_TURNS)
-    assert poe.spent([_row(1, settled=False)]) == (poe.SESSION_OUTPUT_TOKENS, poe.SESSION_TURNS)
+    assert poe.spent([_row(1, known=False)]) == (
+        poe.MAX_OUTPUT_TOKENS,
+        poe.TOTAL_ASSISTANT_TURNS_CEILING,
+    )
+    assert poe.spent([_row(1, unreserved=True)]) == (
+        poe.MAX_OUTPUT_TOKENS,
+        poe.TOTAL_ASSISTANT_TURNS_CEILING,
+    )
+    assert poe.spent([_row(1, settled=False)]) == (
+        poe.SESSION_OUTPUT_TOKENS,
+        poe.SESSION_ASSISTANT_TURNS_CEILING,
+    )
     assert poe.spent([_row(1), _row(2, output_tokens=0, assistant_turns=0)]) == (300, 2)
 
 
 def test_unreserved_start_or_overrun_fences_every_start() -> None:
     _refused("budget_exceeded", lambda: _decide([_row(1, unreserved=True)]))
     _refused("budget_exceeded", lambda: _decide([_row(1, output_tokens=1025)]))
-    _refused("budget_exceeded", lambda: _decide([_row(1, assistant_turns=3)]))
+    _refused("budget_exceeded", lambda: _decide([_row(1, assistant_turns=5)]))
     _refused("budget_exceeded", lambda: _decide([_row(1, elapsed=181.0)]))
 
 
@@ -749,6 +762,8 @@ def test_refusal_payload_names_codes_only() -> None:
 def test_in_pod_programs_compile() -> None:
     for name in (
         "HOLD_SCRIPT",
+        "LAUNCH_SCRIPT",
+        "LAUNCH_RELEASE_PROGRAM",
         "SCAN_SCRIPT",
         "SENTINEL_SERVER",
         "SWEEP_PROGRAM",
@@ -1165,29 +1180,19 @@ def _check_of(verdict: dict[str, Any], key: str) -> dict[str, Any]:
     return next(check for check in checks if check["key"] == key)
 
 
-def test_session_ceiling_is_one_constant_over_every_query(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    # The execute query and the kernel's one continuation share the session.
-    assert poe.SESSION_QUERIES == 2
-    worst_case = poe.SESSION_QUERIES * poe.SESSION_TURNS
-    assert worst_case == 4 > poe.SESSION_ASSISTANT_TURNS_CEILING == 2
-    ledger = _live_ledger(tmp_path / "a")
+def test_session_ceiling_is_one_constant_over_every_query(tmp_path: Path) -> None:
+    assert poe.SESSION_QUERIES * poe.SESSION_TURNS == poe.SESSION_ASSISTANT_TURNS_CEILING == 4
+    ledger = _live_ledger(tmp_path)
     reservation = ledger.reserve(poe.SLOT_NAMES[0], T0 + 10)
-    usage = poe.SessionUsage(300, 3, True, models=(poe.MODEL,))
-    ledger.settle(reservation.seq, usage, 60.0, T0 + 20)
+    ledger.settle(reservation.seq, poe.SessionUsage(600, 4, True, models=(poe.MODEL,)), 60, T0 + 20)
     ledger.record("budget", "grant_probe.ok", True, T0)
     verdict = poe.judge(ledger, "budget")
-    assert verdict["verdict"] == "fail"
-    assert _check_of(verdict, "session_assistant_turns_within_ceiling")["observed"] is False
-    assert _check_of(verdict, "every_session_within_share")["observed"] is False
-    # A later start is refused once a session overran the ceiling.
-    with pytest.raises(pps.Refusal):
-        ledger.reserve(poe.SLOT_NAMES[1], T0 + 30)
-    monkeypatch.setattr(poe, "SESSION_ASSISTANT_TURNS_CEILING", worst_case)
-    raised = poe.judge(ledger, "budget")
-    assert _check_of(raised, "session_assistant_turns_within_ceiling")["observed"] is True
-    assert _check_of(raised, "every_session_within_share")["observed"] is True
+    assert _check_of(verdict, "session.process-interrupted.assistant_turns")["observed"] == 4
+    assert _check_of(verdict, "every_session_within_share")["observed"] is True
+    ledger.settle(reservation.seq, poe.SessionUsage(700, 5, True, models=(poe.MODEL,)), 61, T0 + 21)
+    verdict = poe.judge(ledger, "budget")
+    assert _check_of(verdict, "session.process-interrupted.assistant_turns")["status"] == "fail"
+    _refused("budget_exceeded", lambda: ledger.reserve(poe.SLOT_NAMES[1], T0 + 30))
 
 
 def test_paid_objectives_answer_the_continuation_without_a_tool() -> None:
@@ -1204,3 +1209,346 @@ def test_hold_script_holds_read_once_per_process_and_every_stop() -> None:
     assert 'if mode == "read" and once.exists():' in script
     # Stop has no once marker: each query's Stop is harvested and released.
     assert 'mode == "stop"' not in script
+
+
+# Proof-driver guards use the actual scenario methods with synthetic observations.
+def _proof() -> Any:
+    cls = driver.owner_proof_class(driver.load_enrollment())
+    return cls.__new__(cls)
+
+
+@pytest.mark.parametrize(
+    "tokens,turns,expected",
+    [
+        (0, 0, None),
+        (512, 2, None),
+        (600, 3, "session_assistant_turns"),
+        (800, 2, "session_output_tokens"),
+    ],
+)
+def test_query_gate_checks_the_continuation_before_it_starts(
+    tokens: int, turns: int, expected: str | None
+) -> None:
+    row = _row(1, settled=False)
+    assert (
+        poe.next_query_refusal([row], seq=1, session=poe.SessionUsage(tokens, turns, True))
+        == expected
+    )
+    assert poe.next_query_refusal([row], seq=None, session=None) == "unreserved"
+    assert poe.next_query_refusal([row], seq=1, session=None) == "usage_unknown"
+
+
+def test_token_guard_takes_precedence_over_turn_counts(tmp_path: Path) -> None:
+    ledger = _live_ledger(tmp_path)
+    r = ledger.reserve(poe.SLOT_NAMES[0], T0)
+    reading = ledger.check_spend({r.seq: poe.SessionUsage(8193, 1, True)}, T0 + 1)
+    assert reading.breach == "output_tokens"
+    assert ledger.observations("budget")["spend_guard.breach"] == "output_tokens"
+    # A second reading must neither count settled usage twice nor lose an increase.
+    ledger.settle(r.seq, poe.SessionUsage(400, 2, True), 1, T0 + 1)
+    assert (
+        poe.spend_reading(ledger.rows(), {r.seq: poe.SessionUsage(512, 2, True)}).output_tokens
+        == 512
+    )
+
+
+def test_stop_refuses_an_over_budget_continuation_and_allows_one_that_fits() -> None:
+    from types import SimpleNamespace
+
+    proof = _proof()
+    track = driver.Track("process-recovered", 1, usage=poe.SessionUsage(512, 2, True))
+    proof.paid = True
+    proof.ctx = SimpleNamespace(ledger=SimpleNamespace(rows=lambda: [_row(1, settled=False)]))
+    released: list[str] = []
+    proof.release_hold = lambda _track, mode: released.append(mode)
+
+    def refuse(_pod: str, _ref: str, _track: Any, reason: str) -> None:
+        raise poe.StepFailed(reason)
+
+    proof.refuse_query = refuse
+    proof.release_stop(track, 1)
+    assert released == ["stop"]
+    track.usage = poe.SessionUsage(700, 3, True)
+    with pytest.raises(poe.StepFailed, match="session_assistant_turns"):
+        proof.release_stop(track, 1)
+    assert released == ["stop"]
+
+
+def test_native_launch_is_reserved_durably_before_release(tmp_path: Path) -> None:
+    from types import SimpleNamespace
+
+    ledger = _live_ledger(tmp_path)
+    r = ledger.reserve(poe.SLOT_NAMES[0], T0)
+    proof = _proof()
+    proof.paid, proof.pending = True, [r]
+    proof.ctx = SimpleNamespace(ledger=ledger)
+    proof.live_deadline = T0 + 1440
+    proof.native = {"uid:123:456": {"pod": "acme-pod", "uid": "uid"}}
+    proof.tracks = [driver.Track(r.slot, r.seq)]
+    released: list[str] = []
+
+    def pod_exec(pod: str, program: str, *args: str) -> None:
+        assert ledger.sessions()[0]["native_ref"] == "uid:123:456"
+        assert program == driver.LAUNCH_RELEASE_PROGRAM and args == ("123", "456")
+        released.append(pod)
+
+    proof.pod_exec = pod_exec
+    proof.on_native_start("uid:123:456", T0 + 1)
+    assert released == ["acme-pod"] and proof.pending == []
+    proof.kill_cli = lambda *args: True
+    proof.fence = lambda: None
+    proof.native["uid:789:456"] = {"pod": "acme-pod", "uid": "uid"}
+    with pytest.raises(poe.StepFailed, match="without a reservation"):
+        proof.on_native_start("uid:789:456", T0 + 2)
+    assert released == ["acme-pod"]
+
+
+@pytest.mark.parametrize("allowed", [False, True])
+def test_launch_wrapper_refuses_before_native_exec_and_accepts_one_permit(
+    tmp_path: Path, allowed: bool
+) -> None:
+    import subprocess
+    import sys
+
+    marker = tmp_path / "native-ran"
+    native = tmp_path / "claude-native"
+    native.write_text(f"#!/bin/sh\nprintf ran > {marker}\n")
+    native.chmod(0o755)
+    script = driver.LAUNCH_SCRIPT.replace(repr(driver.WORK_DIR), repr(str(tmp_path)))
+    script = script.replace(f"+ {driver.HOLD_SECONDS}", "+ 0")
+    if allowed:
+        script = script.replace(
+            'hold = root / "holding-launch"',
+            'permit.write_text("go")\nhold = root / "holding-launch"',
+        )
+    wrapper = tmp_path / "claude"
+    wrapper.write_text(script)
+    result = subprocess.run(
+        [sys.executable, str(wrapper), "--print"], capture_output=True, timeout=5, check=False
+    )
+    assert result.returncode == (0 if allowed else 2)
+    assert marker.exists() is allowed
+    assert list(tmp_path.glob("launch-*")) == []
+
+
+def test_expiry_deletes_the_pod_without_harvesting_even_when_kill_fails() -> None:
+    proof = _proof()
+    deleted: list[str] = []
+    proof.delete_runner_pod = deleted.append
+    track = driver.Track("process-interrupted", 1, pod="acme-pod", cli="uid:1:2", transcript="t")
+
+    def fail(*args: Any, **kwargs: Any) -> Any:
+        raise RuntimeError("synthetic transport failure")
+
+    proof.kill_cli = fail
+    with pytest.raises(RuntimeError):
+        proof.expire(track)
+    assert deleted == ["acme-pod"]
+    proof.kill_cli = lambda *args, **kwargs: True
+    proof.exec_unlogged = fail
+    proof.expire(track)
+    assert deleted == ["acme-pod", "acme-pod"]
+
+
+def test_cleanup_has_one_budget_and_preserves_absence_time() -> None:
+    import signal
+
+    budget = poe.CleanupBudget(T0)
+    assert budget.wait_bound(T0 + 100) == 50
+    assert budget.wait_bound(T0 + 170) == 0 and budget.remaining(T0 + 170) == 10
+    with pytest.raises(poe.StepFailed, match="budget was exhausted"):
+        with driver.cleanup_time_limit(0):
+            pytest.fail("expired cleanup ran")
+    with pytest.raises(poe.StepFailed, match="budget was exhausted"):
+        with driver.cleanup_time_limit(30):
+            signal.raise_signal(signal.SIGALRM)
+    with driver.cleanup_time_limit(30):
+        assert True
+    assert signal.getitimer(signal.ITIMER_REAL)[0] == 0
+
+
+@pytest.mark.parametrize(
+    "uid,label,expected",
+    [
+        ("owned", "acme", True),
+        ("foreign", "acme", False),
+        ("owned", "other", False),
+        (None, "acme", False),
+    ],
+)
+def test_failure_fence_preserves_a_foreign_namespace(
+    uid: str | None, label: str, expected: bool
+) -> None:
+    from types import SimpleNamespace
+
+    proof = _proof()
+    proof.namespace, proof.namespace_uid, proof.ownership = "acme-proof", uid, "acme"
+    proof.core = SimpleNamespace(
+        read_namespace=lambda *a, **k: SimpleNamespace(
+            metadata=SimpleNamespace(uid="owned", labels={poe.OWNERSHIP_LABEL: label})
+        )
+    )
+    deleted: list[str] = []
+    proof.stop_worker = lambda: None
+    proof.runner_pods = lambda: []
+    proof.custom = SimpleNamespace(
+        list_namespaced_custom_object=lambda *a, **k: {
+            "items": [{"metadata": {"name": "acme-claim"}}]
+        },
+        delete_namespaced_custom_object=lambda *a, **k: deleted.append(a[4]),
+    )
+    proof.fence()
+    assert deleted == (["acme-claim"] if expected else [])
+
+
+@pytest.mark.parametrize(
+    "key",
+    [
+        "bash.grant_found",
+        "audit.grant_in_captures",
+        "audit.invalid_grant_in_captures",
+        "audit.captures_complete",
+    ],
+)
+def test_confidentiality_judge_requires_grant_containment_and_complete_captures(
+    tmp_path: Path, key: str
+) -> None:
+    ledger = _live_ledger(tmp_path)
+    _record_all(ledger, "hosted-header")
+    assert poe.judge(ledger, "hosted-header")["verdict"] == "pass"
+    ledger.record("hosted-header", key, not poe.EXPECTED["hosted-header"][key], T0)
+    assert _check_of(poe.judge(ledger, "hosted-header"), key)["status"] == "fail"
+
+
+def test_service_fallback_includes_unlabelled_claims_and_orphan_pods() -> None:
+    keys = {"mode": "m", "tenant": "t", "principal": "p"}
+    owner = {"tenant": "acme", "principal": "owner"}
+    personal = {"m": "personal", "t": "acme", "p": "owner"}
+    assert (
+        poe.fallback_runtimes({"good": personal}, {"pod": "good"}, labels=keys, owner=owner) == []
+    )
+    assert poe.fallback_runtimes(
+        {"service": {}}, {"pod": "service", "orphan": "missing"}, labels=keys, owner=owner
+    ) == ["claim/service", "pod/orphan", "pod/pod"]
+
+
+@pytest.mark.parametrize("kind", ["process", "pod"])
+def test_recovery_boundary_matches_the_new_claim_for_the_active_request(kind: str) -> None:
+    proof = _proof()
+    thread = "acme-thread"
+    from curie_worker.sandbox.types import SubstrateConfig
+
+    config = SubstrateConfig(namespace="acme-proof", warm_pool="acme-pool")
+    original, resumed = config.claim_name_for(thread, "a"), config.claim_name_for(thread, "b")
+    row = {
+        "id": "r",
+        "started_at": T0,
+        "runtime_claim_name": original,
+        "runtime_owner": "acme-worker",
+        "status": "running",
+    }
+    proof.paid, proof.tracks = False, []
+    proof.work_items = {"issue": {"id": "w", "conversation_id": thread}}
+    proof.requests_of = lambda _: [row]
+    proof.pod_states = {
+        "new": {"claim": resumed, "pod": "acme-pod", "uid": "new", "restarts": 1, "ready": True}
+    }
+    proof.wait_soft = lambda predicate, **kwargs: predicate()
+    found = proof.boundary(f"{kind}-recovered", "read", work_item_id="w")
+    assert found is not None and found.claim == resumed and found.request_id == "r"
+    row["status"] = "completed"
+    assert proof.boundary(f"{kind}-recovered", "read", work_item_id="w") is None
+
+
+def test_process_absence_is_observed_without_a_recovered_session() -> None:
+    proof = _proof()
+    proof.paid = True
+    proof.live_clis = lambda: set()
+    a = driver.Track("process-interrupted", 1, pod_uid="old", restart_count=0, cli="old:1:2")
+    pod = {
+        "metadata": {"uid": "old"},
+        "status": {"containerStatuses": [{"name": "runner", "restartCount": 1}]},
+    }
+    proof.runner_pods = lambda: [pod]
+    assert proof.old_runtime_gone("process", a, None, {})
+    pod["status"]["containerStatuses"][0]["restartCount"] = 0
+    assert not proof.old_runtime_gone("process", a, None, {})
+    proof.runner_pods = lambda: []
+    assert proof.old_runtime_gone("process", a, None, {})
+
+
+def test_missing_waiting_request_is_missing_evidence(tmp_path: Path) -> None:
+    assert poe.waiting_request_started([], "r") is None
+    assert poe.waiting_request_started([{"id": "r", "started_at": None}], "r") is False
+    assert poe.waiting_request_started([{"id": "r", "started_at": T0}], "r") is True
+    ledger = _live_ledger(tmp_path)
+    _record_all(ledger, "disconnect")
+    ledger.record("disconnect", "disconnect.waiting_request_started", None, T0)
+    assert poe.judge(ledger, "disconnect")["verdict"] == "fail"
+
+
+def test_rehearsal_judge_preserves_provider_only_readings_without_calling_them_proof(
+    tmp_path: Path,
+) -> None:
+    ledger = poe.OwnerLedger.open(_state(tmp_path), "acme-rehearse", create=True)
+    ledger.begin(CANDIDATE, "rehearse", T0)
+    for name in OBSERVED:
+        _record_all(ledger, name)
+    ledger.record("authentication-required", "rejected.http_status", None, T0)
+    ledger.record("hosted-header", "sentinel.challenge_returned", False, T0)
+    result = poe.judge(ledger, "rehearsal")
+    for key in ("rejected.http_status", "sentinel.challenge_returned", "per_response_output_cap"):
+        assert _check_of(result, key)["status"] == "rehearsal_only"
+    ledger.record("disconnect", "disconnect.waiting_request_started", None, T0)
+    assert (
+        _check_of(poe.judge(ledger, "rehearsal"), "disconnect.waiting_request_started")["status"]
+        == "fail"
+    )
+
+
+def test_sentinel_missing_counts_are_never_invented_zeroes() -> None:
+    from types import SimpleNamespace
+
+    proof = _proof()
+    proof.command = lambda *a, **k: SimpleNamespace(returncode=1, stdout=b"")
+    proof.context, proof.namespace, proof.env = "fixture", "acme-proof", {}
+    proof.pod_exec = lambda *a, **k: (1, b"")
+    assert proof.sentinel_counts() == dict.fromkeys(("authorized", "unauthorized", "tool_calls"))
+
+
+def test_final_audit_scans_both_grants_and_the_hosted_header(tmp_path: Path) -> None:
+    from types import SimpleNamespace
+
+    proof = _proof()
+    proof.captures_missing, proof.captures = 0, [GRANT.encode(), b"synthetic-invalid-grant"]
+    proof.grant, proof.invalid = pps.HeldSecret(GRANT), pps.HeldSecret("synthetic-invalid-grant")
+    proof.sentinel_token = pps.HeldSecret(HEADER)
+    proof.namespace, proof.grant_namespace = "acme-proof", "acme-grants"
+    proof.custom = SimpleNamespace(list_namespaced_custom_object=lambda *a, **k: {})
+    proof.core = SimpleNamespace(list_namespaced_event=lambda *a, **k: {})
+    proof.api_client = SimpleNamespace(sanitize_for_serialization=lambda x: x)
+    proof.capture_pod, proof.check_stub = lambda _: None, lambda: None
+    ledger = _live_ledger(tmp_path)
+    proof.observe = lambda c, k, v: ledger.record(c, k, v, T0)
+    proof.final_audit()
+    found = ledger.observations("hosted-header")
+    assert found["audit.grant_in_captures"] is True
+    assert found["audit.invalid_grant_in_captures"] is True
+    assert found["audit.header_in_captures"] is False
+    assert found["audit.captures_complete"] is True
+
+
+def test_watchdog_expires_a_session_without_a_sweep(monkeypatch: pytest.MonkeyPatch) -> None:
+    from types import SimpleNamespace
+
+    proof = _proof()
+    events = iter([False, True])
+    proof.watchdog_stop = SimpleNamespace(wait=lambda _: next(events))
+    proof.live_expired, proof.live_deadline = False, T0 + 100
+    proof.tracks = [driver.Track("process-interrupted", 1, cli="uid:1:2", deadline=T0 - 1)]
+    expired: list[str] = []
+    proof.expire = lambda t: expired.append(t.slot)
+    monkeypatch.setattr(driver.time, "time", lambda: T0)
+    proof.watch()
+    assert expired == ["process-interrupted"]
+    assert proof.tracks[0].expired_at == T0

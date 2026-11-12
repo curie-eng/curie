@@ -47,10 +47,12 @@ SESSION_TURNS = 2
 # unpublished continuation the kernel opens on the same runner
 # (curie_worker.kernel.publication._continue_unpublished).
 SESSION_QUERIES = 2
-# The per-session assistant-turn ceiling, across every query of the session.
-# The budget judge and the over-share stop compare against this one number.
-SESSION_ASSISTANT_TURNS_CEILING = 2
-MAX_TURNS = 16
+# The per-session assistant-turn ceiling, across every query of the session:
+# SESSION_QUERIES x SESSION_TURNS, the continuation included. The budget judge,
+# the reservation and the spend guard compare against this one number.
+SESSION_ASSISTANT_TURNS_CEILING = 4
+# Every session's assistant turns together, continuation turns included.
+TOTAL_ASSISTANT_TURNS_CEILING = 32
 MAX_OUTPUT_TOKENS = 8192
 SESSION_SECONDS = 180
 LIVE_SECONDS = 1440
@@ -58,8 +60,24 @@ CLEANUP_SECONDS = 180
 PAID_RETRIES = 0
 # The ceiling split evenly across the sessions.
 SESSION_OUTPUT_TOKENS = MAX_OUTPUT_TOKENS // MAX_SESSIONS
-# Per model response, inside the session share.
+# Per model response, inside the session share (the template's
+# CLAUDE_CODE_MAX_OUTPUT_TOKENS).
 RESPONSE_OUTPUT_TOKENS = 256
+# The runner's per-query cap (DEFAULT_MAX_OUTPUT_TOKENS_PER_RUN): a fresh
+# BudgetTracker per runner turn, so two queries must fit one session share.
+QUERY_OUTPUT_TOKENS = SESSION_OUTPUT_TOKENS // SESSION_QUERIES
+# The runner checks its cap after each response, never mid-response
+# (curie_runner/budget.py), so one query can pass it by at most one response;
+# its SDK turn budget bounds it independently.
+QUERY_WORST_OUTPUT_TOKENS = min(
+    SESSION_TURNS * RESPONSE_OUTPUT_TOKENS, QUERY_OUTPUT_TOKENS + RESPONSE_OUTPUT_TOKENS
+)
+# Recorded in the ledger when the live window opens; the budget judge reads them back.
+SPEND_CEILINGS = {
+    "ceiling.session_assistant_turns": SESSION_ASSISTANT_TURNS_CEILING,
+    "ceiling.total_assistant_turns": TOTAL_ASSISTANT_TURNS_CEILING,
+    "ceiling.output_tokens": MAX_OUTPUT_TOKENS,
+}
 # A session needs at least this much of the live window left to be reserved.
 MIN_SESSION_WINDOW = 90
 # A reservation whose native process has not started within this window is
@@ -103,7 +121,8 @@ def ceiling() -> dict[str, Any]:
         "model": MODEL,
         "max_sessions": MAX_SESSIONS,
         "session_turns": SESSION_TURNS,
-        "max_turns": MAX_TURNS,
+        "session_assistant_turns_ceiling": SESSION_ASSISTANT_TURNS_CEILING,
+        "total_assistant_turns_ceiling": TOTAL_ASSISTANT_TURNS_CEILING,
         "max_output_tokens": MAX_OUTPUT_TOKENS,
         "session_output_tokens": SESSION_OUTPUT_TOKENS,
         "response_output_tokens": RESPONSE_OUTPUT_TOKENS,
@@ -118,7 +137,7 @@ def shares_fit(
     *,
     sessions: int = MAX_SESSIONS,
     session_tokens: int = SESSION_OUTPUT_TOKENS,
-    session_turns: int = SESSION_TURNS,
+    session_turns: int = SESSION_ASSISTANT_TURNS_CEILING,
     session_seconds: int = SESSION_SECONDS,
     plan: Sequence[Slot] = SESSION_PLAN,
 ) -> bool:
@@ -127,7 +146,10 @@ def shares_fit(
     return (
         len(plan) <= sessions <= MAX_SESSIONS
         and session_tokens * sessions <= MAX_OUTPUT_TOKENS
-        and session_turns * sessions <= MAX_TURNS
+        and session_turns <= SESSION_ASSISTANT_TURNS_CEILING
+        and session_turns * sessions <= TOTAL_ASSISTANT_TURNS_CEILING
+        and SESSION_QUERIES * SESSION_TURNS <= SESSION_ASSISTANT_TURNS_CEILING
+        and SESSION_QUERIES * QUERY_WORST_OUTPUT_TOKENS <= session_tokens
         and session_seconds * sessions <= LIVE_SECONDS
         and session_seconds <= SESSION_SECONDS
         and RESPONSE_OUTPUT_TOKENS * session_turns <= session_tokens
@@ -560,7 +582,7 @@ def spent(rows: Sequence[SessionRow]) -> tuple[int, int]:
     """Tokens and turns already consumed. Unknown usage consumes the whole ceiling."""
 
     if any(row.unreserved or (row.settled and not row.known) for row in rows):
-        return MAX_OUTPUT_TOKENS, MAX_TURNS
+        return MAX_OUTPUT_TOKENS, TOTAL_ASSISTANT_TURNS_CEILING
     tokens = turns = 0
     for row in rows:
         if row.settled:
@@ -568,8 +590,91 @@ def spent(rows: Sequence[SessionRow]) -> tuple[int, int]:
             turns += row.assistant_turns or 0
         else:
             tokens += SESSION_OUTPUT_TOKENS
-            turns += SESSION_TURNS
+            turns += SESSION_ASSISTANT_TURNS_CEILING
     return tokens, turns
+
+
+@dataclasses.dataclass(frozen=True)
+class SpendReading:
+    """The known usage so far, an open session's harvested usage included."""
+
+    output_tokens: int
+    assistant_turns: int
+    # Assistant turns by session seq.
+    session_turns: Mapping[int, int]
+
+    @property
+    def breach(self) -> str | None:
+        """The ceiling passed, or None. Output tokens first: that is the spend guard."""
+
+        if self.output_tokens > MAX_OUTPUT_TOKENS:
+            return "output_tokens"
+        if any(turns > SESSION_ASSISTANT_TURNS_CEILING for turns in self.session_turns.values()):
+            return "session_assistant_turns"
+        if self.assistant_turns > TOTAL_ASSISTANT_TURNS_CEILING:
+            return "total_assistant_turns"
+        return None
+
+
+def spend_reading(
+    rows: Sequence[SessionRow], open_usage: Mapping[int, SessionUsage] | None = None
+) -> SpendReading:
+    """Sum every session's known usage. Pure.
+
+    ``open_usage`` is what a harvest read, by seq, for a session that may not
+    have settled; a settled row's usage only rises with it. Unknown usage adds
+    nothing here: ``spent`` already treats it as the whole ceiling.
+    """
+
+    tokens = turns = 0
+    per_session: dict[int, int] = {}
+    for row in rows:
+        usage = (open_usage or {}).get(row.seq)
+        read = (
+            (usage.output_tokens or 0, usage.assistant_turns or 0)
+            if usage and usage.known
+            else None
+        )
+        if row.settled and row.known:
+            settled = (row.output_tokens or 0, row.assistant_turns or 0)
+            read = settled if read is None else (max(read[0], settled[0]), max(read[1], settled[1]))
+        if read is None:
+            continue
+        tokens += read[0]
+        turns += read[1]
+        per_session[row.seq] = read[1]
+    return SpendReading(tokens, turns, per_session)
+
+
+def next_query_refusal(
+    rows: Sequence[SessionRow], *, seq: int | None, session: SessionUsage | None
+) -> str | None:
+    """Why session ``seq`` may not start one more query, or None when it fits. Pure.
+
+    Checked before any further model call can start: at the gate that holds
+    every query's prompt, and before a Stop is released while a continuation
+    may still follow. The worst query adds ``SESSION_TURNS`` assistant turns and
+    ``QUERY_WORST_OUTPUT_TOKENS`` output tokens; it must fit the session's
+    turns and token share and the run's turns and output tokens.
+    """
+
+    if seq is None:
+        return "unreserved"
+    if session is None or not session.known:
+        return "usage_unknown"
+    reading = spend_reading(rows, {seq: session})
+    if reading.breach is not None:
+        return reading.breach
+    if reading.output_tokens + QUERY_WORST_OUTPUT_TOKENS > MAX_OUTPUT_TOKENS:
+        return "output_tokens"
+    turns = reading.session_turns.get(seq, 0)
+    if turns + SESSION_TURNS > SESSION_ASSISTANT_TURNS_CEILING:
+        return "session_assistant_turns"
+    if reading.assistant_turns + SESSION_TURNS > TOTAL_ASSISTANT_TURNS_CEILING:
+        return "total_assistant_turns"
+    if (session.output_tokens or 0) + QUERY_WORST_OUTPUT_TOKENS > SESSION_OUTPUT_TOKENS:
+        return "session_output_tokens"
+    return None
 
 
 def over_share(row: SessionRow) -> bool:
@@ -604,14 +709,21 @@ def reservation_decision(
         raise Refusal("ceiling_invalid")
     if slot not in SLOT_NAMES or any(row.slot == slot for row in rows):
         raise Refusal("paid_retry_refused", slot)
-    if any(row.unreserved for row in rows) or any(over_share(row) for row in rows):
+    if (
+        any(row.unreserved for row in rows)
+        or any(over_share(row) for row in rows)
+        or spend_reading(rows).breach is not None
+    ):
         raise Refusal("budget_exceeded")
     if any(not row.settled or not row.known for row in rows):
         raise Refusal("usage_unknown")
     if len(rows) >= MAX_SESSIONS:
         raise Refusal("allowance_exhausted", "sessions")
     tokens, turns = spent(rows)
-    if MAX_OUTPUT_TOKENS - tokens < SESSION_OUTPUT_TOKENS or MAX_TURNS - turns < SESSION_TURNS:
+    if (
+        MAX_OUTPUT_TOKENS - tokens < SESSION_OUTPUT_TOKENS
+        or TOTAL_ASSISTANT_TURNS_CEILING - turns < SESSION_ASSISTANT_TURNS_CEILING
+    ):
         raise Refusal("allowance_exhausted", "tokens or turns")
     if live_deadline is None or now >= live_deadline:
         raise Refusal("live_window_exhausted")
@@ -620,7 +732,9 @@ def reservation_decision(
         raise Refusal("live_window_exhausted")
     if grant_expires_at is None or grant_expires_at < live_deadline + CLEANUP_SECONDS:
         raise Refusal("lifetime_insufficient", "--grant-expires-at")
-    return Reservation(len(rows) + 1, slot, SESSION_OUTPUT_TOKENS, SESSION_TURNS, deadline)
+    return Reservation(
+        len(rows) + 1, slot, SESSION_OUTPUT_TOKENS, SESSION_ASSISTANT_TURNS_CEILING, deadline
+    )
 
 
 # --------------------------------------------------------------------------
@@ -734,6 +848,9 @@ class OwnerLedger:
             "WHERE run_id = ? AND live_started_at IS NULL",
             (now, deadline, grant_expires_at, self.run_id),
         )
+        # The ceilings this run is held to, for the budget judge and the receipt.
+        for key, value in SPEND_CEILINGS.items():
+            self.record("budget", key, value, now)
         return deadline
 
     def mark_cleanup(self, *, started: float | None = None, finished: float | None = None) -> None:
@@ -880,6 +997,16 @@ class OwnerLedger:
                 seq,
             ),
         )
+
+    def check_spend(self, open_usage: Mapping[int, SessionUsage], now: float) -> SpendReading:
+        """Read the spend so far, a harvested open session included, and record it."""
+
+        reading = spend_reading(self.rows(), open_usage)
+        self.record("budget", "spend_guard.output_tokens", reading.output_tokens, now)
+        self.record("budget", "spend_guard.assistant_turns", reading.assistant_turns, now)
+        if reading.breach is not None:
+            self.record("budget", "spend_guard.breach", reading.breach, now)
+        return reading
 
     def record_unreserved(self, native_ref: str, now: float) -> None:
         """A native start nothing reserved: it exhausts the allowance and fences starts."""
@@ -1169,6 +1296,8 @@ RUNNER_PORT = 8080
 # Request statuses that refuse a new admission on the same WorkItem
 # (curie_api.workitems.lifecycle._ACTIVE_STATUSES).
 ACTIVE_REQUEST_STATUSES = ("waiting", "running", "cancellation_requested")
+# The label every namespace this run creates carries, valued with its ownership.
+OWNERSHIP_LABEL = "curie-proof-owner"
 
 
 def runner_suffix(namespace: str) -> str:
@@ -1283,6 +1412,101 @@ def active_requests(rows: Sequence[Mapping[str, Any]]) -> list[Mapping[str, Any]
     """Requests that refuse a new admission on their WorkItem (``active_request``)."""
 
     return [row for row in rows if row.get("status") in ACTIVE_REQUEST_STATUSES]
+
+
+def thread_claim_prefix(thread_key: str, claim_prefix: str = "curie-thread") -> str:
+    """The prefix of every claim of a thread: ``SubstrateConfig.claim_name_for(key, "")``."""
+
+    digest = hashlib.sha256(thread_key.encode("utf-8")).hexdigest()[:10]
+    return f"{claim_prefix}-{digest}-"
+
+
+def request_on_claim(
+    rows: Sequence[Mapping[str, Any]], claim: str, prefix: str
+) -> Mapping[str, Any] | None:
+    """The started request a runtime claim of the WorkItem serves, or None.
+
+    The start route writes ``runtime_claim_name`` once per request. A resume
+    inside a running request binds a new claim of the same thread without a
+    new start, so a claim on the thread's prefix maps to the latest started
+    request while that request is still active.
+    """
+
+    started = [row for row in rows if row["runtime_claim_name"] and row["started_at"] is not None]
+    exact = [row for row in started if row["runtime_claim_name"] == claim]
+    if exact:
+        return exact[-1]
+    if not started or not claim.startswith(prefix):
+        return None
+    latest = started[-1]
+    if not str(latest["runtime_claim_name"]).startswith(prefix):
+        return None
+    return latest if latest["status"] in ACTIVE_REQUEST_STATUSES else None
+
+
+def waiting_request_started(rows: Sequence[Mapping[str, Any]], request_id: str) -> bool | None:
+    row = next((r for r in rows if str(r["id"]) == request_id), None)
+    return None if row is None else row["started_at"] is not None
+
+
+def namespace_owned(meta: Mapping[str, Any] | None, *, uid: str | None, ownership: str) -> bool:
+    """The namespace is the one this run created: its UID and its ownership label.
+
+    A namespace this run did not create (no recorded UID) is never touched.
+    """
+
+    if not uid or not meta:
+        return False
+    labels = meta.get("labels") or {}
+    return meta.get("uid") == uid and labels.get(OWNERSHIP_LABEL) == ownership
+
+
+def fallback_runtimes(
+    claims: Mapping[str, Mapping[str, str]],
+    pods: Mapping[str, str],
+    *,
+    labels: Mapping[str, str],
+    owner: Mapping[str, str],
+) -> list[str]:
+    """Every claim or runner Pod without the owner's personal provenance.
+
+    ``claims`` maps a claim name to its labels; ``pods`` maps a runner Pod to
+    the claim it serves. ``labels`` names the mode, tenant and principal label
+    keys and ``owner`` their values. A service claim carries no mode label at
+    all, so anything short of the owner's personal labels counts, and a Pod
+    whose claim was never seen counts too.
+    """
+
+    def personal(claim_labels: Mapping[str, str]) -> bool:
+        return claim_labels.get(labels["mode"]) == "personal" and all(
+            claim_labels.get(labels[key]) == owner[key] for key in ("tenant", "principal")
+        )
+
+    found = [f"claim/{name}" for name, item in sorted(claims.items()) if not personal(item)]
+    found += [
+        f"pod/{name}"
+        for name, claim in sorted(pods.items())
+        if claim not in claims or not personal(claims[claim])
+    ]
+    return found
+
+
+@dataclasses.dataclass(frozen=True)
+class CleanupBudget:
+    """One remaining-time budget across every cleanup step."""
+
+    started: float
+    seconds: float = CLEANUP_SECONDS
+    # Kept back for the absence proof, which always runs last.
+    reserve: float = 30.0
+
+    def remaining(self, now: float) -> float:
+        return max(0.0, self.started + self.seconds - now)
+
+    def wait_bound(self, now: float) -> float:
+        """How long one cleanup wait may still take, leaving the absence proof its time."""
+
+        return max(0.0, self.remaining(now) - self.reserve)
 
 
 def vanished(exc: BaseException) -> bool:
@@ -1422,7 +1646,14 @@ EXPECTED: dict[str, dict[str, Any]] = {
         "bash.scan_ran": True,
         "bash.negative_control_found": True,
         "bash.header_found": False,
+        # ADR 0268 decision 4: native coding tools are outside the custody
+        # boundary, so Bash must not recover the grant (acceptance row 2).
+        "bash.grant_found": False,
+        # Every runner Pod's logs were kept, so the negatives below are complete.
+        "audit.captures_complete": True,
         "audit.header_in_captures": False,
+        "audit.grant_in_captures": False,
+        "audit.invalid_grant_in_captures": False,
         "audit.header_in_ledger_or_output": False,
     },
 }
@@ -1476,27 +1707,31 @@ def _judge_observed(ledger: OwnerLedger, criterion: str) -> list[dict[str, Any]]
     ]
 
 
+def _within(key: str, ceiling: int, observed: int | None) -> dict[str, Any]:
+    """A count against its ceiling: expected ``<= ceiling``, observed the count."""
+
+    status = "missing" if observed is None else "pass" if observed <= ceiling else "fail"
+    return {"key": key, "expected": f"<= {ceiling}", "observed": observed, "status": status}
+
+
 def _judge_budget(ledger: OwnerLedger) -> list[dict[str, Any]]:
     run = ledger.run() or {}
     sessions = ledger.sessions()
     rows = ledger.rows()
-    tokens, turns = spent(rows) if rows else (0, 0)
     unknown = any(not item["known"] for item in sessions)
+    reading = spend_reading(rows)
+    recorded = ledger.observations("budget")
     zero_usage = [item for item in sessions if item["known"] and not item["output_tokens"]]
     live = None
     if run.get("live_started_at") is not None and run.get("cleanup_started_at") is not None:
         live = round(run["cleanup_started_at"] - run["live_started_at"], 3)
     models = sorted({model for item in sessions for model in item["models"]})
-    probe = ledger.observations("budget").get("grant_probe.ok")
+    probe = recorded.get("grant_probe.ok")
     found = {
+        **{key: recorded[key] for key in SPEND_CEILINGS if key in recorded},
+        "spend_guard.breach": recorded.get("spend_guard.breach"),
         "sessions_within_ceiling": len(sessions) <= MAX_SESSIONS,
-        "turns_within_ceiling": not unknown and turns <= MAX_TURNS,
-        "output_tokens_within_ceiling": not unknown and tokens <= MAX_OUTPUT_TOKENS,
         "every_session_within_share": not any(over_share(row) for row in rows),
-        "session_assistant_turns_within_ceiling": not unknown
-        and all(
-            (item["assistant_turns"] or 0) <= SESSION_ASSISTANT_TURNS_CEILING for item in sessions
-        ),
         "usage_known": not unknown,
         "unreserved_starts": sum(bool(item["unreserved"]) for item in sessions),
         "paid_retries": sum(
@@ -1510,11 +1745,10 @@ def _judge_budget(ledger: OwnerLedger) -> list[dict[str, Any]]:
         "grant_probe_ok": probe is True,
     }
     expected = {
+        **SPEND_CEILINGS,
+        "spend_guard.breach": None,
         "sessions_within_ceiling": True,
-        "turns_within_ceiling": True,
-        "output_tokens_within_ceiling": True,
         "every_session_within_share": True,
-        "session_assistant_turns_within_ceiling": True,
         "usage_known": True,
         "unreserved_starts": 0,
         "paid_retries": 0,
@@ -1525,7 +1759,30 @@ def _judge_budget(ledger: OwnerLedger) -> list[dict[str, Any]]:
     }
     if not sessions:
         found.pop("usage_known")
-    return [_check(key, value, found, None) for key, value in expected.items()]
+    counts = [
+        _within(
+            f"session.{item['slot']}.assistant_turns",
+            SESSION_ASSISTANT_TURNS_CEILING,
+            item["assistant_turns"] if item["known"] else None,
+        )
+        for item in sessions
+        if not item["unreserved"]
+    ]
+    totals = [
+        _within(
+            "total.assistant_turns",
+            TOTAL_ASSISTANT_TURNS_CEILING,
+            None if unknown else reading.assistant_turns,
+        ),
+        _within(
+            "total.output_tokens", MAX_OUTPUT_TOKENS, None if unknown else reading.output_tokens
+        ),
+    ]
+    return [
+        *(_check(key, value, found, None) for key, value in expected.items()),
+        *counts,
+        *totals,
+    ]
 
 
 def _judge_cleanup(ledger: OwnerLedger) -> list[dict[str, Any]]:
@@ -1548,9 +1805,70 @@ def _judge_cleanup(ledger: OwnerLedger) -> list[dict[str, Any]]:
     return [_check(key, value, found, None) for key, value in expected.items()]
 
 
+REHEARSAL_ONLY = {
+    "authentication-required": {
+        "rejected.http_status",
+        "rejected.provider_error_type",
+        "rejected.terminal_cause",
+        "rejected.output_tokens",
+        "rejected.transcript_preserved",
+        "revalidated.replay_marker_seen",
+        "revalidated.assistant_turns_positive",
+    },
+    "hosted-header": {
+        "sentinel.challenge_returned",
+        "sentinel.authorized_calls_positive",
+        "sentinel.unauthorized_calls",
+        "public_control.returned",
+        "bash.scan_ran",
+        "bash.negative_control_found",
+        "bash.header_found",
+        "bash.grant_found",
+    },
+}
+
+
+def judge_rehearsal(ledger: OwnerLedger) -> dict[str, Any]:
+    run = ledger.run() or {}
+    if run.get("mode") != "rehearse":
+        raise Refusal("rehearsal_ledger", "--criterion rehearsal")
+    criteria = []
+    for name in CRITERIA:
+        if name == "budget":
+            checks = [
+                _check("native_sessions", 0, {"native_sessions": len(ledger.sessions())}, None),
+                {
+                    "key": "per_response_output_cap",
+                    "expected": RESPONSE_OUTPUT_TOKENS,
+                    "observed": "fake model does not emit native provider usage",
+                    "status": "rehearsal_only",
+                },
+            ]
+        elif name == "cleanup":
+            checks = _judge_cleanup(ledger)
+        else:
+            checks = _judge_observed(ledger, name)
+            for check in checks:
+                if check["key"] in REHEARSAL_ONLY.get(name, set()):
+                    check["status"] = "rehearsal_only"
+                    check["reason"] = "requires the native provider; fake-model reading retained"
+        criteria.append({"criterion": name, "verdict": verdict_of(checks), "checks": checks})
+    return {
+        "run_id": ledger.run_id,
+        "candidate": run["candidate"],
+        "criterion": "rehearsal",
+        "evidence_mode": "unpaid_rehearsal",
+        "ceilings": ceiling(),
+        "verdict": verdict_of({"status": c["verdict"]} for c in criteria),
+        "criteria": criteria,
+    }
+
+
 def judge(ledger: OwnerLedger, criterion: str) -> dict[str, Any]:
     """One criterion's verdict from the ledger only. ``all`` judges every criterion."""
 
+    if criterion == "rehearsal":
+        return judge_rehearsal(ledger)
     if criterion != "all" and criterion not in CRITERIA:
         raise Refusal("criterion_invalid", "--criterion")
     run = ledger.run()

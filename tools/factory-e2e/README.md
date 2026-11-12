@@ -483,12 +483,15 @@ the driver as a child whose environment holds only `PATH`, `HOME`, `LANG`,
 `/dev/null`. Only that child opens the grant file.
 
 `judge --criterion` takes `selection`, `fencing`, `authentication-required`,
-`disconnect`, `restart`, `hosted-header`, `budget`, `cleanup` or `all`. It
+`disconnect`, `restart`, `hosted-header`, `budget`, `cleanup`, `rehearsal` or `all`. It
 reads only the private ledger, compares each observation with the expected
 value defined in `personal_owner_enforcement_support.py`, and prints every
 check's expected and observed value. Exit code 0 is a pass, 1 a failed or
 missing observation, 2 a refusal, and 3 a run whose only shortfall is a
-recorded Not met. A rehearsal ledger is judged only with `--criterion cleanup`.
+recorded Not met. A rehearsal ledger supports `--criterion cleanup` and `--criterion rehearsal`.
+The latter retains every reading and marks provider rejection, native tool calls,
+and the native response cap as `rehearsal_only`; it never treats them as live proof.
+Product and cleanup failures still fail that judge.
 
 ### What rehearse covers
 
@@ -526,31 +529,36 @@ transcript usage settlement against the ledger, the provider's real rejection
 of the invalid grant, the Bash scan for the hosted header, the sentinel
 challenge and public control through the model, and history replay inside a
 fresh native process. Rehearsal turns end on their own, so an interruption can
-miss its turn; rehearsal observations are recorded but not judged.
+miss its turn; the rehearsal judge reports the observations and their evidence limits.
 
 ### Sessions and reservations
 
-The approved ceiling is enforced in code: 8 native sessions, 2 assistant turns
-each (16 in total), 8,192 output tokens, 180 s per session as one absolute
-deadline that harvests, interrupts the native process and deletes its Pod,
-1,440 s live plus 180 s cleanup, no paid retry and `claude-sonnet-5-5`. Each
-session reserves an even share (1,024 output tokens, 2 turns, 180 s) in the
-ledger before anything can start it, and every share is checked to fit before
-the first start. The worker runs with `CURIE_WORK_ITEM_MAX_TURNS=2`,
-`DEFAULT_MAX_OUTPUT_TOKENS_PER_RUN=1024` and `CURIE_MAX_ATTEMPTS=2`; the
-template keeps 256 output tokens per response. `CURIE_WORK_ITEM_MAX_TURNS`
-bounds each query, and with publication on the kernel opens at most one
-unpublished continuation on the same native process after an execute turn, so
-a session carries at most two queries (4 assistant turns in the worst case).
-The ledger records one session across both: the bundle's hook holds only the
-first Read of a process and every Stop, the driver harvests and releases each
-Stop until the request is terminal, and the session settles once, inside its
-one 180 s absolute deadline. The budget judge and the over-share stop compare
-each session's assistant turns with `SESSION_ASSISTANT_TURNS_CEILING` (2) in
-`personal_owner_enforcement_support.py`, the one number to change if the
-ceiling is ruled otherwise. Immediately before the first
-reservation, a one-turn grant probe runs on the cheapest model with an empty
-`HOME`; if it fails, nothing is reserved.
+The approved ceiling is 8 native session attempts, 4 assistant turns per session
+and 32 in total, including publication continuation, 8,192 output tokens in
+total, 180 s per session, 1,440 s live plus 180 s cleanup, zero paid retries,
+and `claude-sonnet-5-5`. Each attempt reserves 1,024 tokens and 4 turns in the
+private ledger. The candidate fixture wraps the SDK's native executable with
+a gate that waits for that committed reservation before executing it; every
+permit is consumed once. A retry without a reservation never executes the
+native CLI. The original native executable remains unchanged.
+
+Each query has 2 turns and a 512-token runner cap; each response has a
+256-token native cap. At each prompt the driver checks that the next query's
+worst case fits the session and run allowance. Tool hooks and Stop hold after
+responses while the driver harvests their usage, with the output-token total
+checked first. Stop is released for continuation only when it fits. Unknown
+usage stops the run. The judge and run receipt include ceilings and observed
+counts.
+
+An independent watchdog interrupts the native process and deletes its Pod at
+the session deadline even if harvesting fails, and fences starts at the live
+window deadline. Cleanup uses one 180 s budget with time reserved for absence
+checks. Namespaced deletion requires the recorded namespace UID and ownership
+label. The capture audit requires complete Pod logs and scans the valid grant,
+invalid grant and hosted header. Grant recovery by Bash fails confidentiality.
+
+Immediately before the first reservation, a one-turn grant probe runs on the
+cheapest model with an empty `HOME`; if it fails, nothing is reserved.
 
 1. `process-interrupted` and `process-recovered`: the first holds at Read, is
    settled, the second is reserved, and the runner container restarts in place.

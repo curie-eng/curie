@@ -37,6 +37,7 @@ import inspect
 import json
 import os
 import secrets
+import shlex
 import shutil
 import signal
 import ssl
@@ -170,7 +171,9 @@ except ValueError:
 pid, start = cli()
 # A continuation runs in the same native process; its Read passes through so
 # only the first Read of a process is the interruption point. Every Stop holds,
-# so the driver harvests the transcript after each query.
+# so the driver harvests the transcript after each query. Every prompt holds
+# before its model call until the driver matches the process to a reservation
+# and the query to the allowance; one it never releases is refused (exit 2).
 once = root / f"held-{{mode}}-{{pid}}-{{start}}"
 if mode == "read" and once.exists():
     print("{{}}")
@@ -188,8 +191,15 @@ waited = 0.0
 while not release.exists() and waited < {HOLD_SECONDS}:
     pause.wait(0.5)
     waited += 0.5
+try:
+    verdict = release.read_text()
+except OSError:
+    verdict = ""
 holding.unlink(missing_ok=True)
 release.unlink(missing_ok=True)
+if mode == "prompt" and verdict != "go":
+    sys.stderr.write("the proof driver did not release this prompt\\n")
+    raise SystemExit(2)
 print("{{}}")
 """
 SCAN_SCRIPT = f"""\
@@ -233,6 +243,7 @@ CHALLENGE = os.environ["SENTINEL_CHALLENGE"]
 COUNTS = pathlib.Path("/tmp/sentinel/counts.json")
 COUNTS.parent.mkdir(parents=True, exist_ok=True)
 counts = {"authorized": 0, "unauthorized": 0, "tool_calls": 0}
+COUNTS.write_text(json.dumps(counts))
 lock = threading.Lock()
 TOOL = {"name": "challenge", "description": "Return the sentinel challenge text.",
         "inputSchema": {"type": "object", "properties": {}, "additionalProperties": False},
@@ -294,6 +305,39 @@ http.server.ThreadingHTTPServer(("0.0.0.0", 8000), Handler).serve_forever()
 
 # --- programs the driver runs in a runner container ----------------------------
 
+LAUNCH_SCRIPT = f"""\
+#!/usr/bin/env python3
+import json, os, pathlib, sys, threading, time
+real = pathlib.Path(__file__).with_name("claude-native")
+if sys.argv[1:] in (["-v"], ["--version"]):
+    os.execv(str(real), [str(real), *sys.argv[1:]])
+root = pathlib.Path({WORK_DIR!r})
+root.mkdir(parents=True, exist_ok=True)
+pid = os.getpid()
+start = int(pathlib.Path(f"/proc/{{pid}}/stat").read_text().rsplit(")", 1)[1].split()[19])
+permit = root / f"launch-{{pid}}-{{start}}"
+hold = root / "holding-launch"
+hold.write_text(json.dumps({{"cli_pid": pid, "cli_start": start, "hook_pid": pid}}))
+deadline = time.monotonic() + {HOLD_SECONDS}
+while not permit.exists() and time.monotonic() < deadline:
+    threading.Event().wait(0.1)
+try:
+    allowed = permit.read_text() == "go"
+except OSError:
+    allowed = False
+permit.unlink(missing_ok=True)
+hold.unlink(missing_ok=True)
+if not allowed:
+    sys.stderr.write("native launch lacks a committed reservation\\n")
+    raise SystemExit(2)
+os.execv(str(real), [str(real), *sys.argv[1:]])
+"""
+LAUNCH_RELEASE_PROGRAM = f"""\
+import pathlib, sys
+root = pathlib.Path({WORK_DIR!r})
+(root / f"launch-{{sys.argv[1]}}-{{sys.argv[2]}}").write_text("go")
+"""
+
 SWEEP_PROGRAM = f"""\
 import json, os, pathlib
 def fields(pid):
@@ -320,7 +364,7 @@ for top in ("/home/runner", "/tmp"):
                 except OSError:
                     pass
 holds = {{}}
-for mode in ("read", "stop"):
+for mode in ("launch", "prompt", "response", "read", "stop"):
     try:
         holds[mode] = json.loads((pathlib.Path({WORK_DIR!r}) / f"holding-{{mode}}").read_text())
     except (OSError, ValueError):
@@ -340,7 +384,7 @@ RELEASE_PROGRAM = f"""\
 import pathlib, sys
 root = pathlib.Path({WORK_DIR!r})
 root.mkdir(parents=True, exist_ok=True)
-(root / f"release-{{sys.argv[1]}}").write_text("go")
+(root / f"release-{{sys.argv[1]}}").write_text(sys.argv[2] if len(sys.argv) > 2 else "go")
 print("released")
 """
 # The real repository workspace: HEAD, the SHA-256 of every tracked file, the
@@ -529,6 +573,22 @@ def signals_deferred() -> Iterator[list[int]]:
             signal.signal(sig, old)
 
 
+@contextlib.contextmanager
+def cleanup_time_limit(seconds: float) -> Iterator[None]:
+    def expired(_sig: int, _frame: object) -> None:
+        raise poe.StepFailed("the cleanup budget was exhausted")
+
+    if seconds <= 0:
+        raise poe.StepFailed("the cleanup budget was exhausted")
+    previous = signal.signal(signal.SIGALRM, expired)
+    signal.setitimer(signal.ITIMER_REAL, seconds)
+    try:
+        yield
+    finally:
+        signal.setitimer(signal.ITIMER_REAL, 0)
+        signal.signal(signal.SIGALRM, previous)
+
+
 def pause(seconds: float) -> None:
     threading.Event().wait(max(0.0, seconds))
 
@@ -563,7 +623,7 @@ def build_parser() -> argparse.ArgumentParser:
     judge = commands.add_parser("judge")
     judge.add_argument("--state-dir", required=True)
     judge.add_argument("--run-id", required=True)
-    judge.add_argument("--criterion", required=True, choices=(*poe.CRITERIA, "all"))
+    judge.add_argument("--criterion", required=True, choices=(*poe.CRITERIA, "all", "rehearsal"))
     judge.add_argument("--candidate", default="")
     child = commands.add_parser(CHILD)
     child.add_argument("mode", choices=("rehearse", "run"))
@@ -846,6 +906,12 @@ class Track:
     # native process wrote, latest bytes per path: one session's queries.
     hook_pid: int | None = None
     transcripts: dict[str, bytes] = dataclasses.field(default_factory=dict)
+    # The latest harvested usage and the queries the prompt gate released.
+    usage: poe.SessionUsage | None = None
+    queries: int = 0
+    # Set by the deadline watchdog: when it fired, and what it read after the kill.
+    expired_at: float | None = None
+    expiry: dict[str, Any] = dataclasses.field(default_factory=dict)
 
 
 def load_enrollment() -> Any:
@@ -891,6 +957,13 @@ def owner_proof_class(e: Any) -> type[Any]:  # noqa: C901 - one scenario, one cl
             self.held_scrubbed: set[str] = set()
             self.work_items: dict[str, dict[str, Any]] = {}
             self.fenced = False
+            # Prompt holds already decided, by Pod UID and hook process.
+            self.gated: set[tuple[str, Any]] = set()
+            # The deadline watchdog and the cleanup allowance (see Watchdog).
+            self.watchdog: threading.Thread | None = None
+            self.watchdog_stop = threading.Event()
+            self.live_expired = False
+            self.cleanup_budget: poe.CleanupBudget | None = None
             # The stub code host: its forward, trust bundle, App key, issues
             # and committed source; the object store relay the sandbox reads.
             self.app_key = e.HeldSecret("")
@@ -991,7 +1064,8 @@ def owner_proof_class(e: Any) -> type[Any]:  # noqa: C901 - one scenario, one cl
                 "CURIE_PUBLICATION_ENABLED": "true",
                 "CURIE_PUBLICATION_NAMESPACE": self.namespace,
                 "CURIE_WORK_ITEM_MAX_TURNS": str(poe.SESSION_TURNS),
-                "DEFAULT_MAX_OUTPUT_TOKENS_PER_RUN": str(poe.SESSION_OUTPUT_TOKENS),
+                # Per runner turn (query): two queries fit one session share.
+                "DEFAULT_MAX_OUTPUT_TOKENS_PER_RUN": str(poe.QUERY_OUTPUT_TOKENS),
                 "CURIE_MAX_ATTEMPTS": "2",
                 "CURIE_RELEASE": self.release,
                 "CURIE_RUNNER_TOTAL_TIMEOUT_S": str(poe.SESSION_SECONDS),
@@ -1033,6 +1107,15 @@ def owner_proof_class(e: Any) -> type[Any]:  # noqa: C901 - one scenario, one cl
             dockerfile = (
                 f"FROM {tag}\nLABEL {pps.REVISION_LABEL}={self.candidate}\n"
                 f"LABEL curie-proof-owner={self.ownership}\n"
+                "USER root\n"
+                "RUN /app/.venv/bin/python3 -c "
+                + shlex.quote(
+                    "import pathlib,claude_agent_sdk; "
+                    "p=pathlib.Path(claude_agent_sdk.__file__).parent/'_bundled'/'claude'; "
+                    "p.rename(p.with_name('claude-native')); "
+                    f"p.write_text({LAUNCH_SCRIPT!r}); p.chmod(0o755)"
+                )
+                + "\nUSER 1000:1000\n"
             )
             self.docker(
                 "build",
@@ -1481,7 +1564,28 @@ def owner_proof_class(e: Any) -> type[Any]:  # noqa: C901 - one scenario, one cl
             files["hooks/hooks.json"] = json.dumps(
                 {
                     "hooks": {
+                        "UserPromptSubmit": [
+                            {
+                                "hooks": [
+                                    {
+                                        "type": "command",
+                                        "command": f"{hold} prompt",
+                                        "timeout": HOLD_SECONDS + 10,
+                                    }
+                                ]
+                            }
+                        ],
                         "PreToolUse": [
+                            {
+                                "matcher": "*",
+                                "hooks": [
+                                    {
+                                        "type": "command",
+                                        "command": f"{hold} response",
+                                        "timeout": HOLD_SECONDS + 10,
+                                    }
+                                ],
+                            },
                             {
                                 "matcher": "Read",
                                 "hooks": [
@@ -1491,7 +1595,7 @@ def owner_proof_class(e: Any) -> type[Any]:  # noqa: C901 - one scenario, one cl
                                         "timeout": HOLD_SECONDS + 10,
                                     }
                                 ],
-                            }
+                            },
                         ],
                         "Stop": [
                             {
@@ -1615,13 +1719,16 @@ def owner_proof_class(e: Any) -> type[Any]:  # noqa: C901 - one scenario, one cl
                 ),
                 check=False,
             )
+            # The sentinel writes zero counts at start: an unreadable file is
+            # missing evidence (None), never zero calls.
             try:
-                body = json.loads(result.stdout) if result.returncode == 0 else {}
+                body = json.loads(result.stdout) if result.returncode == 0 else None
             except ValueError:
-                body = {}
-            return {
-                key: int(body.get(key, 0)) for key in ("authorized", "unauthorized", "tool_calls")
-            }
+                body = None
+            keys = ("authorized", "unauthorized", "tool_calls")
+            if not isinstance(body, dict):
+                return dict.fromkeys(keys)
+            return {key: int(body[key]) if isinstance(body.get(key), int) else None for key in keys}
 
         # --- agent, principals, enrollment -------------------------------------
 
@@ -1879,11 +1986,89 @@ def owner_proof_class(e: Any) -> type[Any]:  # noqa: C901 - one scenario, one cl
                 if item.get("imageID")
             )
 
+        def owns_namespace(self, *, timeout: float = 5) -> bool:
+            """The namespace is the one this run created, by UID and ownership label.
+
+            Checked before every namespaced delete, failure cleanup included: a
+            namespace setup refused to adopt has no recorded UID and is never touched.
+            """
+
+            uid = vars(self).get("namespace_uid")
+            if not uid or self.core is None:
+                return False
+            try:
+                found = self.core.read_namespace(self.namespace, _request_timeout=timeout)
+            except Exception:  # noqa: BLE001 - an unreadable namespace is not proven ours
+                return False
+            meta = {"uid": found.metadata.uid, "labels": found.metadata.labels or {}}
+            return poe.namespace_owned(meta, uid=uid, ownership=self.ownership)
+
+        def delete_runner_pod(self, pod: str) -> None:
+            """Delete one runner Pod now, only in the namespace this run owns."""
+
+            if not pod or not self.owns_namespace():
+                return
+            try:
+                self.core.delete_namespaced_pod(
+                    pod, self.namespace, grace_period_seconds=0, _request_timeout=5
+                )
+            except Exception as exc:  # noqa: BLE001 - only a vanished Pod is expected
+                if not poe.vanished(exc):
+                    raise
+
+        def kill_cli(self, pod: str, ref: str, *, timeout: float = 15) -> bool:
+            """SIGKILL one native CLI process, without the audited command log.
+
+            Safe from the watchdog thread: the command log is the main thread's,
+            and the argv carries no held value.
+            """
+
+            if not pod or ref.count(":") < 2:
+                return False
+            code, _ = self.exec_unlogged(pod, KILL_PROGRAM, ref.split(":")[1], timeout=timeout)
+            return code == 0
+
+        def exec_unlogged(
+            self, pod: str, program: str, *args: str, timeout: float = 15
+        ) -> tuple[int, bytes]:
+            """One bounded exec in a runner Pod outside the command log (any thread)."""
+
+            argv = poe.kubectl_argv(
+                self.context,
+                self.namespace,
+                "exec",
+                pod,
+                "--container",
+                "runner",
+                "--",
+                "python3",
+                "-c",
+                program,
+                *args,
+            )
+            try:
+                done = subprocess.run(
+                    argv,
+                    env=self.env,
+                    stdin=subprocess.DEVNULL,
+                    capture_output=True,
+                    timeout=timeout,
+                    check=False,
+                )
+            except (OSError, subprocess.TimeoutExpired):
+                return -1, b""
+            return done.returncode, done.stdout
+
         def fence(self) -> None:
-            """Stop every start: the worker, then every claim and runner pod in the namespace."""
+            """Stop every start: the worker, then every claim and runner pod in the namespace.
+
+            Nothing namespaced is deleted unless the namespace is proven this run's.
+            """
 
             self.fenced = True
             self.stop_worker()
+            if not self.owns_namespace():
+                return
             with contextlib.suppress(Exception):
                 for claim in self.custom.list_namespaced_custom_object(
                     cluster.GROUP,
@@ -1917,7 +2102,9 @@ def owner_proof_class(e: Any) -> type[Any]:  # noqa: C901 - one scenario, one cl
             """
 
             now = time.time()
-            if self.paid and self.live_deadline is not None and now > self.live_deadline:
+            if self.paid and (
+                self.live_expired or (self.live_deadline is not None and now > self.live_deadline)
+            ):
                 self.fence()
                 raise poe.StepFailed("the live window was exceeded; starts are fenced")
             states: dict[str, dict[str, Any]] = {}
@@ -1968,23 +2155,31 @@ def owner_proof_class(e: Any) -> type[Any]:  # noqa: C901 - one scenario, one cl
                         }
                         self.on_native_start(ref, now)
             self.pod_states = states
+            if self.paid:
+                for state in states.values():
+                    self.gate_prompt(state)
+                    self.gate_response(state)
             for track in self.tracks:
                 if track.closed or not track.cli or not self.paid:
                     continue
+                if track.expired_at is not None:
+                    # The watchdog stopped it at its deadline; settle what it read.
+                    self.deadline_action(track)
                 # Gone: its pod was read and the process is absent, or the pod is gone.
                 # An unreadable pod proves nothing, so its deadline still holds.
-                if (track.pod_uid in states and track.cli not in live) or (
+                elif (track.pod_uid in states and track.cli not in live) or (
                     track.pod_uid not in listed
                 ):
                     track.closed = True
-                elif track.deadline and now > track.deadline:
-                    self.deadline_action(track)
             for reservation in list(self.pending):
                 if now - self.reserved_at.get(reservation.seq, now) > poe.START_WINDOW:
                     self.close_unstarted(reservation, now)
 
         def on_native_start(self, ref: str, now: float) -> None:
             if not self.paid or not self.pending:
+                # Its prompt is held until the driver releases it, so it has
+                # made no model call: kill it there, then fence every start.
+                self.kill_cli(str(self.native[ref]["pod"]), ref)
                 self.ctx.ledger.record_unreserved(ref, now)
                 self.fence()
                 raise poe.StepFailed(
@@ -2004,6 +2199,8 @@ def owner_proof_class(e: Any) -> type[Any]:  # noqa: C901 - one scenario, one cl
                     track.cli = ref
                     track.pod = str(self.native[ref]["pod"])
                     track.pod_uid = str(self.native[ref]["uid"])
+            pid, start = ref.split(":")[1:]
+            self.pod_exec(str(self.native[ref]["pod"]), LAUNCH_RELEASE_PROGRAM, pid, start)
 
         def close_unstarted(self, reservation: poe.Reservation, now: float) -> None:
             self.pending.remove(reservation)
@@ -2022,23 +2219,156 @@ def owner_proof_class(e: Any) -> type[Any]:  # noqa: C901 - one scenario, one cl
             )
             self.ctx.ledger.settle(reservation.seq, usage, 0.0, now)
 
-        def deadline_action(self, track: Track) -> None:
-            """The absolute deadline: harvest, interrupt the native process, delete its pod.
+        def gate_prompt(self, state: Mapping[str, Any]) -> None:
+            """Release a held prompt only for a reserved session whose next query fits.
 
-            The session settles from what it wrote by then; usage that cannot be
-            read is unknown, which exhausts the allowance and stops the run.
+            Every query of a native process holds at its prompt before any model
+            call. One with no reservation, or whose worst case would pass a
+            ceiling, is refused while held: its process is killed and its Pod
+            deleted, so it never reaches the model.
+            """
+
+            hold = (state.get("holds") or {}).get("prompt")
+            if not hold or not hold.get("cli_pid"):
+                return
+            key = (str(state["uid"]), hold.get("hook_pid"))
+            if key in self.gated:
+                return
+            self.gated.add(key)
+            ref = f"{state['uid']}:{hold['cli_pid']}:{hold['cli_start']}"
+            native = self.native.get(ref)
+            seq = native["seq"] if native is not None else None
+            track = next((t for t in self.tracks if seq is not None and t.seq == seq), None)
+            session = None
+            if track is not None:
+                session = track.usage if track.queries else poe.SessionUsage(0, 0, True)
+            refusal = poe.next_query_refusal(self.ctx.ledger.rows(), seq=seq, session=session)
+            if refusal is None:
+                self.pod_exec(str(state["pod"]), RELEASE_PROGRAM, "prompt", "go", timeout=20)
+                if track is not None:
+                    track.queries += 1
+                return
+            self.refuse_query(str(state["pod"]), ref, track, refusal)
+
+        def gate_response(self, state: Mapping[str, Any]) -> None:
+            hold = (state.get("holds") or {}).get("response")
+            if not hold:
+                return
+            key = (str(state["uid"]), hold.get("hook_pid"))
+            if key in self.gated:
+                return
+            ref = f"{state['uid']}:{hold['cli_pid']}:{hold['cli_start']}"
+            track = next((t for t in self.tracks if t.cli == ref), None)
+            if track is None:
+                self.refuse_query(str(state["pod"]), ref, None, "unreserved")
+                return
+            track.transcript = str(hold.get("transcript_path") or track.transcript)
+            _data, usage = self.harvest(track)
+            if not usage.known:
+                self.refuse_query(track.pod, ref, track, "usage_unknown")
+            self.gated.add(key)
+            self.release_hold(track, "response")
+
+        def release_stop(self, track: Track, stops: int) -> None:
+            """Release a Stop only when the continuation it may let start still fits."""
+
+            if self.paid and stops < poe.SESSION_QUERIES:
+                refusal = poe.next_query_refusal(
+                    self.ctx.ledger.rows(), seq=track.seq, session=track.usage
+                )
+                if refusal is not None:
+                    self.refuse_query(track.pod, track.cli, track, refusal)
+            self.release_hold(track, "stop")
+
+        def refuse_query(self, pod: str, ref: str, track: Track | None, refusal: str) -> None:
+            """Kill a held process before its next model call, delete its Pod, settle, stop."""
+
+            with contextlib.suppress(Exception):
+                self.pod_exec(pod, RELEASE_PROGRAM, "prompt", "deny", timeout=20)
+            self.kill_cli(pod, ref)
+            self.delete_runner_pod(pod)
+            self.observe(
+                "budget",
+                "gate.refused",
+                {"slot": track.slot if track is not None else "unreserved", "reason": refusal},
+            )
+            if track is not None:
+                track.closed = True
+                if track.queries:
+                    usage = track.usage or poe.SessionUsage.unknown()
+                else:
+                    usage = poe.SessionUsage(0, 0, True)
+                self.settle_ledger(track, usage)
+            elif refusal == "unreserved":
+                self.ctx.ledger.record_unreserved(ref, time.time())
+            self.fence()
+            raise poe.StepFailed(f"a query was refused before its model call ({refusal})")
+
+        # --- deadlines: the watchdog -------------------------------------------
+
+        def start_watchdog(self) -> None:
+            if self.watchdog is None:
+                self.watchdog = threading.Thread(
+                    target=self.watch, name="owner-deadlines", daemon=True
+                )
+                self.watchdog.start()
+
+        def stop_watchdog(self) -> None:
+            self.watchdog_stop.set()
+            if self.watchdog is not None:
+                self.watchdog.join(timeout=30)
+
+        def watch(self) -> None:
+            """Each second, whatever the main loop is doing: the live window and each deadline.
+
+            It kills and deletes first and reads after, so a failed read never
+            keeps a process or Pod alive. It never writes the ledger or the
+            command log, which belong to the main thread; ``sweep`` settles.
+            """
+
+            while not self.watchdog_stop.wait(1.0):
+                now = time.time()
+                if (
+                    not self.live_expired
+                    and self.live_deadline is not None
+                    and now > self.live_deadline
+                ):
+                    self.live_expired = True
+                    with contextlib.suppress(Exception):
+                        self.fence()
+                for track in list(self.tracks):
+                    if track.closed or not track.cli or track.expired_at is not None:
+                        continue
+                    if not track.deadline or now <= track.deadline:
+                        continue
+                    try:
+                        self.expire(track)
+                    except Exception:  # noqa: BLE001 - still settle and stop after watchdog failure
+                        track.expiry["failed"] = True
+                    finally:
+                        track.expired_at = now
+
+        def expire(self, track: Track) -> None:
+            """Interrupt and delete at the deadline, without any blocking harvest first."""
+
+            try:
+                self.kill_cli(track.pod, track.cli, timeout=3)
+            finally:
+                self.delete_runner_pod(track.pod)
+
+        def deadline_action(self, track: Track) -> None:
+            """Settle a session the watchdog stopped at its absolute deadline.
+
+            Final usage cannot be observed after Pod deletion. It is unknown,
+            which exhausts the allowance and stops the run.
             """
 
             track.closed = True
-            _data, usage = self.harvest(track)
-            if track.cli:
-                self.pod_exec(track.pod, KILL_PROGRAM, track.cli.split(":")[1], timeout=20)
-            with contextlib.suppress(Exception):
-                self.core.delete_namespaced_pod(
-                    track.pod, self.namespace, grace_period_seconds=0, _request_timeout=30
-                )
+            usage = poe.SessionUsage.unknown()
             self.settle(track, usage)
             self.observe("budget", f"deadline.{track.slot}", "enforced")
+            self.fence()
+            raise poe.StepFailed("a session reached its absolute deadline")
             if not usage.known:
                 self.fence()
                 raise poe.StepFailed("a session passed its deadline with unknown usage")
@@ -2112,9 +2442,15 @@ def owner_proof_class(e: Any) -> type[Any]:  # noqa: C901 - one scenario, one cl
             track = self.track_of(slot)
 
             def held() -> Track | None:
-                started = self.started_claims(work_item_id)
+                rows = self.requests_of(work_item_id)
+                thread = next(
+                    str(item["conversation_id"])
+                    for item in self.work_items.values()
+                    if str(item["id"]) == work_item_id
+                )
+                prefix = poe.thread_claim_prefix(thread)
                 for state in self.pod_states.values():
-                    row = started.get(state["claim"])
+                    row = poe.request_on_claim(rows, state["claim"], prefix)
                     if row is None:
                         continue
                     if self.paid:
@@ -2182,19 +2518,49 @@ def owner_proof_class(e: Any) -> type[Any]:  # noqa: C901 - one scenario, one cl
             # Every query of the session counts: a continuation appends to the
             # same file, and a file it may start is kept beside the first.
             track.transcripts[track.transcript] = data
-            return data, combined_usage(
+            usage = combined_usage(
                 [
                     poe.transcript_usage(part, track.seeds, scrub=self.scrub)
                     for part in track.transcripts.values()
                 ]
             )
+            track.usage = usage
+            self.guard_spend(track, usage)
+            return data, usage
 
         def settle(self, track: Track, usage: poe.SessionUsage) -> None:
+            if track.seq is None:
+                return
+            self.settle_ledger(track, usage)
+            self.guard_spend(None, None)
+
+        def settle_ledger(self, track: Track, usage: poe.SessionUsage) -> None:
             if track.seq is None:
                 return
             now = time.time()
             elapsed = now - track.started_at if track.started_at else None
             self.ctx.ledger.settle(track.seq, usage, elapsed, now)
+
+        def guard_spend(self, track: Track | None, usage: poe.SessionUsage | None) -> None:
+            """Stop the run at once when the usage read so far passes a ceiling.
+
+            Runs after every harvest and settlement, so a Stop's reading counts
+            before its session settles. The output-token total is checked first,
+            whatever the turn counts say.
+            """
+
+            if not self.paid:
+                return
+            open_usage: dict[int, poe.SessionUsage] = {}
+            if track is not None and track.seq is not None and usage is not None and usage.known:
+                open_usage[track.seq] = usage
+            reading = self.ctx.ledger.check_spend(open_usage, time.time())
+            if reading.breach is None:
+                return
+            if track is not None and usage is not None:
+                self.settle_ledger(track, usage)
+            self.fence()
+            raise poe.StepFailed(f"the {reading.breach} ceiling was passed; the run is stopped")
 
         def claim_labels(self, claim: str) -> dict[str, str]:
             try:
@@ -2243,10 +2609,20 @@ def owner_proof_class(e: Any) -> type[Any]:  # noqa: C901 - one scenario, one cl
 
             if kind == "process":
                 # A container restart ends every process in it, the native CLI included.
-                return (
-                    b is not None
-                    and b.restart_count > a.restart_count
-                    and (not self.paid or a.cli not in self.live_clis())
+                pods = self.runner_pods()
+                old = next((p for p in pods if p["metadata"]["uid"] == a.pod_uid), None)
+                if old is None:
+                    return True
+                runner = next(
+                    (
+                        c
+                        for c in old.get("status", {}).get("containerStatuses", [])
+                        if c.get("name") == "runner"
+                    ),
+                    {},
+                )
+                return int(runner.get("restartCount") or 0) > a.restart_count and (
+                    not self.paid or a.cli not in self.live_clis()
                 )
             if kind == "pod":
                 return a.pod_uid not in {pod["metadata"]["uid"] for pod in self.runner_pods()}
@@ -2288,6 +2664,7 @@ def owner_proof_class(e: Any) -> type[Any]:  # noqa: C901 - one scenario, one cl
             if not outcome["ok"]:
                 raise poe.Refusal("grant_probe_failed", pps.probe_summary(outcome))
             self.live_deadline = self.ctx.ledger.start_live(time.time(), expires_at)
+            self.start_watchdog()
 
         # --- the scenario -------------------------------------------------------
 
@@ -2706,7 +3083,7 @@ def owner_proof_class(e: Any) -> type[Any]:  # noqa: C901 - one scenario, one cl
                 track.transcript = str(hold.get("transcript_path") or track.transcript)
                 data, usage = self.harvest(track)
                 self.capture_pod(track.pod)
-                self.release_hold(track, "stop")
+                self.release_stop(track, stops)
             if track.closed:
                 # The deadline action already harvested, interrupted and settled it.
                 return data, usage
@@ -2795,7 +3172,11 @@ def owner_proof_class(e: Any) -> type[Any]:  # noqa: C901 - one scenario, one cl
                 self.settle(track, usage)
                 self.capture_pod(track.pod)
             self.kill_worker()
-            target = poe.retained_request(self.requests_of(work_item_id), claim)
+            target = poe.request_on_claim(
+                self.requests_of(work_item_id),
+                claim,
+                poe.thread_claim_prefix(str(item["conversation_id"])),
+            )
             target_id = str(target["id"]) if target is not None else ""
             self.observe(
                 "fencing",
@@ -2955,14 +3336,28 @@ def owner_proof_class(e: Any) -> type[Any]:  # noqa: C901 - one scenario, one cl
             )
             from curie_worker.sandbox import types
 
-            service = self.custom.list_namespaced_custom_object(
+            claims = self.custom.list_namespaced_custom_object(
                 cluster.GROUP,
                 cluster.VERSION,
                 self.namespace,
                 "sandboxclaims",
-                label_selector=f"{types.MODEL_AUTH_MODE_LABEL}=service",
                 _request_timeout=30,
             ).get("items", [])
+            service = poe.fallback_runtimes(
+                {c["metadata"]["name"]: c["metadata"].get("labels", {}) for c in claims},
+                {
+                    p["metadata"]["name"]: p["metadata"]
+                    .get("labels", {})
+                    .get(e.ADMISSION_LABEL, "")
+                    for p in self.runner_pods()
+                },
+                labels={
+                    "mode": types.MODEL_AUTH_MODE_LABEL,
+                    "tenant": types.OWNER_TENANT_LABEL,
+                    "principal": types.OWNER_PRINCIPAL_LABEL,
+                },
+                owner={"tenant": self.tenant_id, "principal": self.principals["owner"]["id"]},
+            )
             self.observe(
                 "authentication-required", "rejected.service_fallback_claims", len(service)
             )
@@ -3017,7 +3412,7 @@ def owner_proof_class(e: Any) -> type[Any]:  # noqa: C901 - one scenario, one cl
                 )
             counts = self.sentinel_counts()
             self.capture_pod(track.pod)
-            self.release_hold(track, "stop")
+            self.release_stop(track, 1)
             if self.paid:
                 # The kernel's one unpublished continuation may follow on the
                 # same process; the session settles once, over both queries.
@@ -3044,7 +3439,9 @@ def owner_proof_class(e: Any) -> type[Any]:  # noqa: C901 - one scenario, one cl
                 any(self.sentinel_challenge in text for text in results),
             )
             self.observe(
-                "hosted-header", "sentinel.authorized_calls_positive", counts["authorized"] > 0
+                "hosted-header",
+                "sentinel.authorized_calls_positive",
+                counts["authorized"] is not None and counts["authorized"] > 0,
             )
             self.observe("hosted-header", "sentinel.unauthorized_calls", counts["unauthorized"])
             self.observe(
@@ -3065,7 +3462,7 @@ def owner_proof_class(e: Any) -> type[Any]:  # noqa: C901 - one scenario, one cl
             )
             self.observe(
                 "hosted-header",
-                "bash.grant_found_informational",
+                "bash.grant_found",
                 scan is not None and e.leaks(scan, [grant.decode()]),
             )
             del scan, header, grant
@@ -3140,18 +3537,10 @@ def owner_proof_class(e: Any) -> type[Any]:  # noqa: C901 - one scenario, one cl
                 "disconnect.native_sessions_after_restarts",
                 len(set(self.native) - known),
             )
-            row = next(
-                (
-                    r
-                    for r in self.requests_of(work_item_id)
-                    if str(r["id"]) == waiting["_request_id"]
-                ),
-                None,
-            )
             self.observe(
                 "disconnect",
                 "disconnect.waiting_request_started",
-                row is not None and row["started_at"] is not None,
+                poe.waiting_request_started(self.requests_of(work_item_id), waiting["_request_id"]),
             )
             status, body = self.admit_item(issue, conversation, self.objective(), 4)
             self.observe(
@@ -3176,6 +3565,7 @@ def owner_proof_class(e: Any) -> type[Any]:  # noqa: C901 - one scenario, one cl
             """No header or grant bytes in manifests, logs, events or the private ledger."""
 
             self.observe("hosted-header", "audit.pod_captures_missing", self.captures_missing)
+            self.observe("hosted-header", "audit.captures_complete", self.captures_missing == 0)
             for plural in ("sandboxclaims", "sandboxtemplates", "sandboxwarmpools"):
                 self.captures.append(
                     json.dumps(
@@ -3204,6 +3594,12 @@ def owner_proof_class(e: Any) -> type[Any]:  # noqa: C901 - one scenario, one cl
                 "audit.header_in_captures",
                 any(e.leaks(capture, header) for capture in self.captures),
             )
+            for key, held in (("grant", self.grant), ("invalid_grant", self.invalid)):
+                self.observe(
+                    "hosted-header",
+                    f"audit.{key}_in_captures",
+                    any(e.leaks(capture, [held.reveal()]) for capture in self.captures),
+                )
             self.check_stub()
 
         # --- foreign resources, inventory, teardown ---------------------------
@@ -3253,6 +3649,7 @@ def owner_proof_class(e: Any) -> type[Any]:  # noqa: C901 - one scenario, one cl
             self.foreign_before = self.foreign_snapshot()
 
         def fence_step(self) -> None:
+            self.stop_watchdog()
             self.fence()
 
         def inventory_step(self) -> None:
@@ -3301,7 +3698,41 @@ def owner_proof_class(e: Any) -> type[Any]:  # noqa: C901 - one scenario, one cl
                     self.stop_process(forward["process"])
             if self.s3_relay is not None:
                 self.s3_relay.close()
-            super().cleanup()
+            requested, uid = self.namespace_requested, self.namespace_uid
+            try:
+                if uid:
+                    self.delete_owned_namespace(self.namespace, uid)
+                self.namespace_requested, self.namespace_uid = False, ""
+                super().cleanup()
+            finally:
+                self.namespace_requested, self.namespace_uid = requested, uid
+
+        def delete_owned_namespace(self, name: str, uid: str) -> None:
+            if not uid:
+                return
+            try:
+                current = self.core.read_namespace(name, _request_timeout=10)
+            except Exception as exc:
+                if poe.vanished(exc):
+                    return
+                raise
+            e.require(
+                poe.namespace_owned(
+                    {"uid": current.metadata.uid, "labels": current.metadata.labels},
+                    uid=uid,
+                    ownership=self.ownership,
+                ),
+                "namespace ownership changed",
+            )
+            try:
+                self.core.delete_namespace(
+                    name,
+                    body={"preconditions": {"uid": uid}, "propagationPolicy": "Foreground"},
+                    _request_timeout=10,
+                )
+            except Exception as exc:
+                if not poe.vanished(exc):
+                    raise
 
         def registry_step(self) -> None:
             port = self.ctx.flags.registry_port
@@ -3325,9 +3756,15 @@ def owner_proof_class(e: Any) -> type[Any]:  # noqa: C901 - one scenario, one cl
             now = time.time()
             ledger = self.ctx.ledger
             names = {"namespace": self.namespace, "grant_namespace": self.grant_namespace}
-            gone = {
-                kind: kube_absent(self.context, "namespace", name) for kind, name in names.items()
-            }
+            gone = {kind: False for kind in names}
+            while not all(gone.values()):
+                gone = {
+                    kind: kube_absent(self.context, "namespace", name)
+                    for kind, name in names.items()
+                }
+                if all(gone.values()):
+                    break
+                pause(0.5)
             for kind, name in names.items():
                 ledger.record_cleanup(kind, name, "absent" if gone[kind] else "present", "", now)
             both = all(gone.values())
@@ -3416,8 +3853,24 @@ def owner_proof_class(e: Any) -> type[Any]:  # noqa: C901 - one scenario, one cl
                 "registry": self.registry_step,
                 "absence": self.absence_step,
             }
+
+            def bounded(name: str) -> Callable[[], None]:
+                def run() -> None:
+                    budget = self.cleanup_budget
+                    if budget is None:
+                        raise poe.StepFailed("the cleanup budget was not registered")
+                    remaining = (
+                        budget.remaining(time.monotonic())
+                        if name == "absence"
+                        else budget.wait_bound(time.monotonic())
+                    )
+                    with cleanup_time_limit(remaining):
+                        steps[name]()
+
+                return run
+
             for name in reversed(TEARDOWN_ORDER):
-                finalizer.register(name, steps[name])
+                finalizer.register(name, bounded(name))
 
     return OwnerProof
 
@@ -3508,6 +3961,8 @@ def child_main(args: argparse.Namespace, rt: Runtime) -> int:
     finally:
         with signals_deferred():
             ledger.mark_cleanup(started=time.time())
+            if proof is not None:
+                proof.cleanup_budget = poe.CleanupBudget(time.monotonic())
             results = finalizer.run()
             ledger.mark_cleanup(finished=time.time())
             ledger.finish(outcome, time.time())
@@ -3517,6 +3972,8 @@ def child_main(args: argparse.Namespace, rt: Runtime) -> int:
         "mode": args.mode,
         "outcome": outcome,
         "detail": rt.scrubber.scrub(detail),
+        "ceilings": poe.ceiling(),
+        "observed": dataclasses.asdict(poe.spend_reading(ledger.rows())),
         "sessions": [
             {
                 key: item[key]
