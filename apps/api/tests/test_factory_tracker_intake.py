@@ -2085,10 +2085,17 @@ def test_deleted_jira_issue_cancels_running_work_item(intake: Intake) -> None:
             assert [wake.request_id for wake in wakes] == [request["id"]]
 
     intake.client.portal.call(teardown_wake)
+    [stopping] = _rows(
+        "SELECT version FROM curie.execution_requests WHERE id = :id", {"id": request["id"]}
+    )
     recorded = intake.client.post(
         f"/v1/internal/work-items/requests/{request['id']}/termination",
         headers={"X-Curie-Worker-Token": get_settings().internal_worker_token},
-        json={"runtime_epoch": started.json()["runtime_epoch"], "observation": "sandbox deleted"},
+        json={
+            "runtime_epoch": started.json()["runtime_epoch"],
+            "expected_request_version": stopping["version"],
+            "observation": "sandbox deleted",
+        },
     )
     assert recorded.status_code == 200, recorded.text
     assert _rows(

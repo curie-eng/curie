@@ -37,6 +37,7 @@ from uuid import UUID
 
 import httpx
 import pytest
+from curie_api import rollout_hold
 from curie_api.config import get_settings
 from curie_api.forges.identity import notice_request_id
 from curie_api.forges.types import Disposition, MarkedNotice
@@ -56,6 +57,7 @@ from forge_fakes.github import (
     factory_env,
     fake_installation_tokens,
 )
+from personal_enrollment_support import FakeApiPods, api_pod, held_by
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncConnection, create_async_engine
 from sqlalchemy.pool import NullPool
@@ -518,6 +520,83 @@ def test_service_admission_stays_live_with_no_subscription_owner(
     _assert_views(admitted.json(), tenant=world.tenant, mode="service", owner=None, generation=None)
     _assert_one_bound(
         number, request_id, tenant=world.tenant, mode="service", owner=None, generation=None
+    )
+
+
+@pytest.fixture
+def api_pods() -> FakeApiPods:
+    """This API pod and its peer on one template until a test rolls one (#5377 R9)."""
+
+    return FakeApiPods([api_pod("curie-api-a", "5d8f7c"), api_pod("curie-api-b", "5d8f7c")])
+
+
+@pytest.fixture
+def held_dispatch_client(
+    clean_db: None, monkeypatch: pytest.MonkeyPatch, api_pods: FakeApiPods
+) -> Iterator[TestClient]:
+    """``dispatch_client`` with the personal rollout hold on, over a faked API pod list."""
+
+    monkeypatch.setenv("INTERNAL_WORKER_TOKEN", WORKER_TOKEN)
+    monkeypatch.setenv("RESUME_RECONCILER_ENABLED", "false")
+    monkeypatch.setenv("CURIE_WORK_ITEM_RECONCILER_ENABLED", "false")
+    monkeypatch.setenv("APPROVAL_SWEEP_INTERVAL_S", "0")
+    monkeypatch.setenv("DEAD_LETTER_WATCH_INTERVAL_S", "0")
+    monkeypatch.setenv("GITHUB_REPO_ALLOWLIST", '["acme-corp/*"]')
+    monkeypatch.setenv("CURIE_PERSONAL_ROLLOUT_HOLD", "true")
+    monkeypatch.delenv("FACTORY_MODEL_AUTH_MODE", raising=False)
+    monkeypatch.setattr(rollout_hold, "build_rollout_hold", lambda settings: held_by(api_pods))
+    get_settings.cache_clear()
+    with TestClient(create_app()) as client:
+        yield client
+    get_settings.cache_clear()
+
+
+def test_personal_admission_is_held_while_api_replicas_run_mixed_templates(
+    held_dispatch_client: TestClient, world: World, api_pods: FakeApiPods
+) -> None:
+    """An older API replica would expire a fenced run's transcript, so no new
+    personal WorkItem is admitted until every API pod runs one template."""
+
+    def personal(number: int, request_id: UUID) -> httpx.Response:
+        body = _body(
+            world.agent,
+            ADDRESS,
+            number,
+            request_id,
+            mode="personal",
+            owner=world.owner_context(),
+        )
+        return _admit(held_dispatch_client, body)
+
+    api_pods.pods = [api_pod("curie-api-a", "5d8f7c"), api_pod("curie-api-c", "7b9e41")]
+    number, request_id = next(_ISSUES), uuid.uuid4()
+    _assert_refused(personal(number, request_id), "personal_rollout_in_progress")
+    _assert_no_runnable_state(number, request_id)
+
+    api_pods.pods = [api_pod("curie-api-a", "5d8f7c")]
+    api_pods.error = RuntimeError("the pod list failed")
+    _assert_refused(personal(number, request_id), "personal_rollout_in_progress")
+    _assert_no_runnable_state(number, request_id)
+
+    # A service admission is never held.
+    service_number, service_id = next(_ISSUES), uuid.uuid4()
+    served = _admit(held_dispatch_client, _body(world.agent, ADDRESS, service_number, service_id))
+    assert served.status_code == 200, served.text
+    _assert_one_bound(
+        service_number, service_id, tenant=world.tenant, mode="service", owner=None, generation=None
+    )
+
+    # The rollout completes: the same personal admission binds its owner.
+    api_pods.error = None
+    admitted = personal(number, request_id)
+    assert admitted.status_code == 200, admitted.text
+    _assert_one_bound(
+        number,
+        request_id,
+        tenant=world.tenant,
+        mode="personal",
+        owner=world.owner,
+        generation=OWNER_GENERATION,
     )
 
 

@@ -29,7 +29,14 @@ link checks (any difference is ``authority_changed``), takes the issue lock,
 re-reads the WorkItem and lineage, and admits a revision through
 `workitem_dispatch.admit_revision` with the WorkItem's own tracker binding and
 conversation, the pull request as the reply target, and a request id derived
-from the delivery, so a redelivered mention admits once. A redelivery whose
+from the delivery, so a redelivered mention admits once. The admission carries
+the mode and owner the locked WorkItem calls for (#5378, ADR 0268): a personal
+WorkItem names the sender as its owner at the sender's current enrollment
+generation, so admission refuses anyone but its owner and a stale or inactive
+enrollment; a service WorkItem carries the installation's mode and no owner,
+as tracker ingress does, so a personal installation refuses it with
+``personal_owner_required``. The revision copies the WorkItem's owner tuple,
+never the sender's. A redelivery whose
 facts no longer match the request an earlier attempt committed (the account's
 login was renamed meanwhile, say) answers that committed request as admitted
 and replayed, never a refusal: it was admitted under the authority valid then.
@@ -77,9 +84,11 @@ from .models import (
     FactorySlackThread,
     IdentityLink,
     IdentityNamespace,
+    PersonalClaudeEnrollment,
     ThreadPublicationLineage,
     WorkItem,
 )
+from .personal_execution import ModelAuthMode, OwnerContext
 from .schemas.workitems import (
     FactorySlackSteerIn,
     FactorySlackSteerOut,
@@ -408,11 +417,58 @@ async def _decide(
 
     try:
         return await _admit(
-            session, registry, data, receipt, evidence, principal_id, link, run, login
+            session,
+            registry,
+            data,
+            receipt,
+            evidence,
+            principal_id,
+            link,
+            run,
+            login,
+            installation_mode=settings.factory_model_auth_mode,
         )
     finally:
         if session.in_transaction():
             await session.rollback()
+
+
+async def _owner_facts(
+    session: AsyncSession,
+    item: WorkItem,
+    principal_id: uuid.UUID,
+    installation_mode: ModelAuthMode,
+) -> tuple[ModelAuthMode, OwnerContext | None]:
+    """The mode and owner a steer of the locked ``item`` admits under (#5378).
+
+    A personal WorkItem names the sender as its owner, in the tenant `_resolve`
+    resolved the sender in, at the generation the sender is enrolled at now
+    (held ``FOR SHARE`` until the admission commits). Admission then refuses
+    another principal whatever its code host access (``owner_mismatch``), a
+    WorkItem bound to an older generation (``enrollment_generation_mismatch``),
+    an inactive or missing enrollment (``enrollment_inactive``; 0 is never a
+    generation) and another tenant's WorkItem (``owner_tenant_mismatch``).
+
+    A service WorkItem carries the installation's mode and never an owner, as
+    tracker ingress does: a personal installation refuses it with
+    ``personal_owner_required``. Either way the revision copies the WorkItem's
+    own tuple.
+    """
+
+    if item.model_auth_mode != "personal":
+        return installation_mode, None
+    enrolled = (
+        await session.execute(
+            select(PersonalClaudeEnrollment.generation)
+            .where(
+                PersonalClaudeEnrollment.tenant_id == DEFAULT_TENANT_ID,
+                PersonalClaudeEnrollment.principal_id == principal_id,
+            )
+            .with_for_update(read=True)
+        )
+    ).scalar_one_or_none()
+    generation = 0 if enrolled is None else int(enrolled)
+    return "personal", OwnerContext(DEFAULT_TENANT_ID, principal_id, generation)
 
 
 async def _admit(
@@ -425,6 +481,8 @@ async def _admit(
     link: _Link,
     run: _Run,
     login: str,
+    *,
+    installation_mode: ModelAuthMode,
 ) -> FactorySlackSteerOut:
     """Under the identity reader and issue locks, re-check and admit in one transaction."""
 
@@ -465,6 +523,7 @@ async def _admit(
     if len(text) > MAX_OBJECTIVE:
         return _refused("objective_too_large")
     kind, address, conversation = reply_route(registry, item.tracker_issue, item.repository_path)
+    mode, owner = await _owner_facts(session, item, principal_id, installation_mode)
     facts = Admission(
         agent_id=item.agent_id,
         kind=kind,
@@ -480,6 +539,8 @@ async def _admit(
             PullRequestRef(run.repository, str(run.pr_number))
         ),
         reply_url=pr_url,
+        model_auth_mode=mode,
+        owner=owner,
     )
     # Dispatch commits inside a savepoint, so the identity reader and issue
     # locks stay held until the admission commits with them.

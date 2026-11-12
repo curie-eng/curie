@@ -5962,6 +5962,519 @@ impl ApiClient {
     }
 }
 
+// --- Owner-scoped personal Claude enrollment (#5377) ------------------------
+//
+// These routes authenticate a PERSON by their Console session cookie
+// (`auth.require_principal_session`). The platform key is a different
+// identity and never travels on them, so they have their own client rather
+// than an `ApiClient` method: `OwnerApiClient` has no key field to send.
+
+/// The cookie the owner API reads (`auth.CONSOLE_SESSION_COOKIE`).
+pub const CONSOLE_SESSION_COOKIE: &str = "__Host-curie_console_session";
+
+/// The longest grant token the owner API accepts
+/// (`tests/vectors/personal-enrollment-token.json`).
+pub const PERSONAL_TOKEN_MAX_LEN: usize = 4096;
+
+/// The longest Console session cookie value this CLI sends.
+pub const SESSION_COOKIE_MAX_LEN: usize = 4096;
+
+/// How long one owner API request may take, connect included.
+const OWNER_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Why a session cookie or grant token value was refused. It never carries the
+/// value, so it is safe to render anywhere.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CredentialShapeError {
+    Empty,
+    TooLong,
+    InvalidByte,
+    NamedCookie,
+}
+
+impl std::fmt::Display for CredentialShapeError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Empty => "it is empty",
+            Self::TooLong => "it is longer than 4096 bytes",
+            Self::InvalidByte => {
+                "it contains a space, control, non-ASCII or otherwise disallowed character"
+            }
+            Self::NamedCookie => {
+                "it starts with the cookie name; the file must hold only the cookie value"
+            }
+        })
+    }
+}
+
+/// RFC 6265 `cookie-octet`: printable ASCII except space, `"`, `,`, `;` and `\`.
+fn is_cookie_octet(byte: u8) -> bool {
+    matches!(byte, 0x21 | 0x23..=0x2B | 0x2D..=0x3A | 0x3C..=0x5B | 0x5D..=0x7E)
+}
+
+/// A Console session cookie value. `Debug` is redacted and there is no
+/// `Display`, so no diagnostic can print it by accident.
+pub struct SessionCookie(String);
+
+impl std::fmt::Debug for SessionCookie {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("SessionCookie(<redacted>)")
+    }
+}
+
+impl SessionCookie {
+    /// Accept 1 to 4096 cookie-octets, and refuse a value that still carries
+    /// the `__Host-curie_console_session=` name.
+    pub fn parse(value: &[u8]) -> std::result::Result<Self, CredentialShapeError> {
+        if value.is_empty() {
+            return Err(CredentialShapeError::Empty);
+        }
+        if value.len() > SESSION_COOKIE_MAX_LEN {
+            return Err(CredentialShapeError::TooLong);
+        }
+        if !value.iter().copied().all(is_cookie_octet) {
+            return Err(CredentialShapeError::InvalidByte);
+        }
+        if value.starts_with(format!("{CONSOLE_SESSION_COOKIE}=").as_bytes()) {
+            return Err(CredentialShapeError::NamedCookie);
+        }
+        String::from_utf8(value.to_vec())
+            .map(Self)
+            .map_err(|_| CredentialShapeError::InvalidByte)
+    }
+
+    /// The `Cookie` header, marked sensitive so the HTTP stack never logs it.
+    fn header_value(&self) -> Result<reqwest::header::HeaderValue> {
+        let mut value =
+            reqwest::header::HeaderValue::from_str(&format!("{CONSOLE_SESSION_COOKIE}={}", self.0))
+                .map_err(|_| anyhow::anyhow!("the session cookie is not a valid header value"))?;
+        value.set_sensitive(true);
+        Ok(value)
+    }
+}
+
+/// A personal Claude grant token. `Debug` is redacted, there is no `Display`,
+/// and the only way out is the request body it serializes into.
+pub struct GrantToken(String);
+
+impl std::fmt::Debug for GrantToken {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("GrantToken(<redacted>)")
+    }
+}
+
+impl GrantToken {
+    /// The shared token rule: 1 to 4096 characters, each printable ASCII
+    /// `0x21..=0x7E`. Shape only; it never implies validity or expiry.
+    pub fn parse(value: &[u8]) -> std::result::Result<Self, CredentialShapeError> {
+        if value.is_empty() {
+            return Err(CredentialShapeError::Empty);
+        }
+        if value.len() > PERSONAL_TOKEN_MAX_LEN {
+            return Err(CredentialShapeError::TooLong);
+        }
+        if !value.iter().all(|byte| (0x21..=0x7E).contains(byte)) {
+            return Err(CredentialShapeError::InvalidByte);
+        }
+        String::from_utf8(value.to_vec())
+            .map(Self)
+            .map_err(|_| CredentialShapeError::InvalidByte)
+    }
+}
+
+impl Serialize for GrantToken {
+    fn serialize<S: serde::Serializer>(
+        &self,
+        serializer: S,
+    ) -> std::result::Result<S::Ok, S::Error> {
+        serializer.serialize_str(&self.0)
+    }
+}
+
+/// What a `PUT /personal-claude/enrollment` asks for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum EnrollmentIntent {
+    Enroll,
+    Replace,
+    Reconnect,
+}
+
+/// `PUT /personal-claude/enrollment` (`PersonalEnrollmentWrite`).
+/// `expected_version` is always sent: null for an enroll, the CAS version
+/// otherwise.
+#[derive(Debug, Serialize)]
+pub struct PersonalEnrollmentWrite {
+    pub intent: EnrollmentIntent,
+    pub expected_version: Option<i64>,
+    pub token: GrantToken,
+}
+
+/// The owner's enrollment state as the API reports it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum EnrollmentState {
+    Absent,
+    Active,
+    Inactive,
+}
+
+/// The owner's teardown still outstanding after a replace or disconnect.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+pub struct PersonalEnrollmentTeardown {
+    pub pending_runtimes: i64,
+    pub pending_custody_cleanup: i64,
+}
+
+/// Every owner enrollment route's answer (`PersonalEnrollmentOut`). It never
+/// carries the grant or where it is kept.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+pub struct PersonalEnrollmentStatus {
+    pub state: EnrollmentState,
+    pub generation: Option<i64>,
+    pub version: Option<i64>,
+    pub teardown: PersonalEnrollmentTeardown,
+}
+
+/// The `detail.code` of an owner enrollment refusal, when it is one the
+/// contract defines. Any other body is dropped, never echoed.
+fn allowlisted_enrollment_code(body: &str) -> Option<&'static str> {
+    let value = serde_json::from_str::<serde_json::Value>(body).ok()?;
+    let code = value.get("detail")?.get("code")?.as_str()?;
+    Some(match code {
+        "enrollment_absent" => "enrollment_absent",
+        "stale_version" => "stale_version",
+        "enrollment_exists" => "enrollment_exists",
+        "enrollment_active" => "enrollment_active",
+        "enrollment_inactive" => "enrollment_inactive",
+        "staging_conflict" => "staging_conflict",
+        "invalid_enrollment_request" => "invalid_enrollment_request",
+        "custody_unconfigured" => "custody_unconfigured",
+        "custody_unavailable" => "custody_unavailable",
+        "enrollment_busy" => "enrollment_busy",
+        "personal_rollout_in_progress" => "personal_rollout_in_progress",
+        _ => return None,
+    })
+}
+
+const ENROLLMENT_SESSION_FIX: &str = "sign in to the Curie Console again, then write the new \
+     __Host-curie_console_session cookie value to the --session-file with mode 0600";
+const ENROLLMENT_ORIGIN_FIX: &str =
+    "pass --api-url with the same host and port as the Console that issued the session";
+const ENROLLMENT_ABSENT_FIX: &str = "run `curie cluster subscription enroll` first";
+const ENROLLMENT_CONFLICT_FIX: &str = "run `curie cluster subscription status`, then retry with \
+     --expected-version set to its version, or with the verb its state calls for: enroll when \
+     absent, replace when active, reconnect when inactive";
+const ENROLLMENT_INVALID_FIX: &str = "check that the token file holds only the token printed by \
+     `claude setup-token`, and that --expected-version is the version `status` reports";
+const ENROLLMENT_UNCONFIGURED_FIX: &str = "ask an operator to set the chart value \
+     personalClaude.grantNamespace and upgrade the release";
+const ENROLLMENT_RETRY_FIX: &str = "retry; the previous enrollment is unchanged";
+const ENROLLMENT_ROLLOUT_FIX: &str =
+    "retry after the API rollout completes; the previous enrollment is unchanged";
+
+/// Map one owner enrollment refusal onto the CLI exit class. The message names
+/// the status, an allowlisted code and the fix; it never includes the body.
+fn enrollment_refusal(operation: &str, status: reqwest::StatusCode, body: &str) -> anyhow::Error {
+    use crate::exit::ExitClass::{Failure, Transient, Usage};
+
+    let code = allowlisted_enrollment_code(body);
+    let (class, problem, fix): (_, String, Option<&str>) = match (status.as_u16(), code) {
+        (401, _) => (
+            Failure,
+            "the platform refused the Console session (HTTP 401): it is missing, expired, \
+             revoked, or not a person's session"
+                .to_string(),
+            Some(ENROLLMENT_SESSION_FIX),
+        ),
+        (403, _) => (
+            Failure,
+            "the platform rejected the request origin (HTTP 403)".to_string(),
+            Some(ENROLLMENT_ORIGIN_FIX),
+        ),
+        (404, Some("enrollment_absent")) => (
+            Failure,
+            "no personal Claude enrollment exists for this person (enrollment_absent)".to_string(),
+            Some(ENROLLMENT_ABSENT_FIX),
+        ),
+        (404, _) if is_unrouted(status, body) => (
+            Failure,
+            "this platform release does not serve /personal-claude/enrollment, so it is older \
+             than this CLI"
+                .to_string(),
+            Some("upgrade the release, or use a CLI matching it"),
+        ),
+        (409, code) => (
+            Failure,
+            format!(
+                "the enrollment is not at that version or in that state ({})",
+                code.unwrap_or("conflict")
+            ),
+            Some(ENROLLMENT_CONFLICT_FIX),
+        ),
+        (422, _) => (
+            Usage,
+            "the platform refused the request as invalid (invalid_enrollment_request)".to_string(),
+            Some(ENROLLMENT_INVALID_FIX),
+        ),
+        (503, Some("custody_unconfigured")) => (
+            Failure,
+            "personal Claude custody is not configured on this release (custody_unconfigured)"
+                .to_string(),
+            Some(ENROLLMENT_UNCONFIGURED_FIX),
+        ),
+        (503, Some("custody_unavailable")) => (
+            Transient,
+            "the platform could not reach its grant custody store (custody_unavailable)"
+                .to_string(),
+            Some(ENROLLMENT_RETRY_FIX),
+        ),
+        (503, Some("enrollment_busy")) => (
+            Transient,
+            "another change to this enrollment is in progress (enrollment_busy)".to_string(),
+            Some(ENROLLMENT_RETRY_FIX),
+        ),
+        (503, Some("personal_rollout_in_progress")) => (
+            Transient,
+            "the platform API is mid-rollout, so it holds enrollment changes \
+             (personal_rollout_in_progress)"
+                .to_string(),
+            Some(ENROLLMENT_ROLLOUT_FIX),
+        ),
+        (502..=504, _) => (
+            Transient,
+            format!("the platform API is temporarily unavailable (HTTP {status})"),
+            None,
+        ),
+        _ if status.is_redirection() => (
+            Failure,
+            format!(
+                "the endpoint answered {status} with a redirect, which this CLI never follows \
+                 because the session cookie would go with it"
+            ),
+            Some("point --api-url at the platform API's own address"),
+        ),
+        _ => (
+            Failure,
+            format!("the platform answered HTTP {status}"),
+            None,
+        ),
+    };
+    let message = match fix {
+        Some(fix) => format!("{operation} failed: {problem}; {fix}"),
+        None => format!("{operation} failed: {problem}"),
+    };
+    anyhow::Error::from(crate::exit::CliError {
+        message,
+        fix: fix.map(str::to_string),
+        class,
+    })
+}
+
+/// The owner enrollment client. It holds the caller's Console session cookie
+/// and no platform key, sends the cookie on every request and `Origin` on every
+/// unsafe one, and never follows a redirect.
+pub struct OwnerApiClient {
+    base_url: String,
+    origin: reqwest::header::HeaderValue,
+    cookie: SessionCookie,
+    http: reqwest::Client,
+}
+
+impl OwnerApiClient {
+    pub fn new(base_url: &str, cookie: SessionCookie) -> Result<Self> {
+        let base_url = base_url.trim().trim_end_matches('/').to_string();
+        let endpoint = reqwest::Url::parse(&base_url)
+            .ok()
+            .filter(|endpoint| matches!(endpoint.scheme(), "http" | "https"))
+            .ok_or_else(|| {
+                crate::exit::usage(format!(
+                    "--api-url {base_url:?} is not an absolute http(s) URL"
+                ))
+            })?;
+        let origin =
+            reqwest::header::HeaderValue::from_str(&endpoint.origin().ascii_serialization())
+                .context("building the Origin header")?;
+        let http = http_client(&base_url, Some(std::time::Duration::from_secs(5)))
+            .context("building HTTP client")?;
+        Ok(Self {
+            base_url,
+            origin,
+            cookie,
+            http,
+        })
+    }
+
+    /// `GET /personal-claude/enrollment`. An absent enrollment is a 200 with
+    /// `state: "absent"`.
+    pub async fn get_personal_enrollment(&self) -> Result<PersonalEnrollmentStatus> {
+        let request = self
+            .http
+            .get(format!("{}/personal-claude/enrollment", self.base_url))
+            .header(reqwest::header::COOKIE, self.cookie.header_value()?);
+        self.exchange(request, "GET /personal-claude/enrollment")
+            .await
+    }
+
+    /// `PUT /personal-claude/enrollment`: enroll, replace or reconnect.
+    pub async fn put_personal_enrollment(
+        &self,
+        body: &PersonalEnrollmentWrite,
+    ) -> Result<PersonalEnrollmentStatus> {
+        let request = self
+            .http
+            .put(format!("{}/personal-claude/enrollment", self.base_url))
+            .header(reqwest::header::COOKIE, self.cookie.header_value()?)
+            .header(reqwest::header::ORIGIN, self.origin.clone())
+            .json::<PersonalEnrollmentWrite>(body);
+        self.exchange(request, "PUT /personal-claude/enrollment")
+            .await
+    }
+
+    /// `DELETE /personal-claude/enrollment?expected_version=N`: disconnect.
+    pub async fn delete_personal_enrollment(
+        &self,
+        expected_version: i64,
+    ) -> Result<PersonalEnrollmentStatus> {
+        let request = self
+            .http
+            .delete(format!("{}/personal-claude/enrollment", self.base_url))
+            .query(&[("expected_version", expected_version)])
+            .header(reqwest::header::COOKIE, self.cookie.header_value()?)
+            .header(reqwest::header::ORIGIN, self.origin.clone());
+        self.exchange(request, "DELETE /personal-claude/enrollment")
+            .await
+    }
+
+    async fn exchange(
+        &self,
+        request: reqwest::RequestBuilder,
+        operation: &'static str,
+    ) -> Result<PersonalEnrollmentStatus> {
+        let response = match request.timeout(OWNER_REQUEST_TIMEOUT).send().await {
+            Ok(response) => response,
+            Err(err) => {
+                let transient = err.is_connect() || err.is_timeout();
+                let source = anyhow::Error::new(err.without_url()).context(operation);
+                let (message, remedy) = if transient {
+                    (
+                        format!("the platform API at {} is unreachable", self.base_url),
+                        format!(
+                            "Run `curl -fsS {}/health` to check it, then retry.",
+                            self.base_url
+                        ),
+                    )
+                } else {
+                    (
+                        format!(
+                            "the platform API at {} could not be sent the request",
+                            self.base_url
+                        ),
+                        "Set --api-url to an absolute http(s) URL, then retry.".to_string(),
+                    )
+                };
+                return Err(crate::exit::operator_context(source, message, Some(remedy)));
+            }
+        };
+        let status = response.status();
+        if status.is_success() {
+            let body = response
+                .bytes()
+                .await
+                .with_context(|| format!("{operation}: reading the response"))?;
+            return serde_json::from_slice::<PersonalEnrollmentStatus>(&body).map_err(|_| {
+                anyhow::Error::from(
+                    crate::exit::CliError::failure(format!(
+                        "{operation} answered {status} with a body that is not a personal \
+                         enrollment; the platform release may not match this CLI"
+                    ))
+                    .with_fix("use a CLI matching the release"),
+                )
+            });
+        }
+        let body = if status.is_redirection() {
+            String::new()
+        } else {
+            response.text().await.unwrap_or_default()
+        };
+        Err(enrollment_refusal(operation, status, &body))
+    }
+}
+
+#[cfg(test)]
+mod owner_enrollment_tests {
+    use super::*;
+
+    #[test]
+    fn credential_debug_is_redacted() {
+        let cookie = SessionCookie::parse(b"cookie-sentinel-1234").expect("valid cookie");
+        let token = GrantToken::parse(b"token-sentinel-5678").expect("valid token");
+        let write = PersonalEnrollmentWrite {
+            intent: EnrollmentIntent::Replace,
+            expected_version: Some(3),
+            token,
+        };
+        let rendered = format!("{cookie:?} {write:?} {write:#?}");
+        assert!(!rendered.contains("cookie-sentinel"), "{rendered}");
+        assert!(!rendered.contains("token-sentinel"), "{rendered}");
+        assert!(rendered.contains("<redacted>"), "{rendered}");
+        let header = cookie.header_value().expect("header");
+        assert!(header.is_sensitive());
+        assert!(!format!("{header:?}").contains("cookie-sentinel"));
+    }
+
+    #[test]
+    fn write_body_carries_the_token_and_an_explicit_null_version() {
+        let write = PersonalEnrollmentWrite {
+            intent: EnrollmentIntent::Enroll,
+            expected_version: None,
+            token: GrantToken::parse(b"abc").expect("valid token"),
+        };
+        assert_eq!(
+            serde_json::to_value(&write).expect("serializes"),
+            serde_json::json!({"intent": "enroll", "expected_version": null, "token": "abc"})
+        );
+    }
+
+    #[test]
+    fn cookie_octets_follow_rfc_6265() {
+        for refused in [
+            &b" "[..],
+            b"a b",
+            b"a\"b",
+            b"a,b",
+            b"a;b",
+            b"a\\b",
+            b"a\x7f",
+            b"\xc3\xa9",
+        ] {
+            assert_eq!(
+                SessionCookie::parse(refused).map(|_| ()),
+                Err(CredentialShapeError::InvalidByte),
+                "{refused:?}"
+            );
+        }
+        assert!(SessionCookie::parse(b"A-z0.9_~!#$%&'()*+-./:<=>?@[]^`{|}").is_ok());
+        assert_eq!(
+            SessionCookie::parse(b"__Host-curie_console_session=abc").map(|_| ()),
+            Err(CredentialShapeError::NamedCookie)
+        );
+    }
+
+    #[test]
+    fn refusal_never_echoes_the_body() {
+        let error = enrollment_refusal(
+            "PUT /personal-claude/enrollment",
+            reqwest::StatusCode::UNPROCESSABLE_ENTITY,
+            r#"{"detail":{"code":"invalid_enrollment_request","input":"body-sentinel"}}"#,
+        );
+        let (class, fix) = crate::exit::classify(&error);
+        assert_eq!(class, crate::exit::ExitClass::Usage);
+        assert!(fix.is_some());
+        assert!(!format!("{error:#}").contains("body-sentinel"));
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{

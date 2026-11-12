@@ -14,6 +14,7 @@ import math
 import os
 import signal
 import socket
+import threading
 import time
 import uuid
 from collections.abc import Awaitable, Callable, Mapping
@@ -76,6 +77,13 @@ from .kernel.memory import drain_pending_memory_closes
 from .killswitch import KillSwitch
 from .ledger_client import ThreadAttachmentLedgerClient
 from .markers import Markers
+from .personal_custody import (
+    CustodySecret,
+    PersonalCustodyReader,
+    SecretReader,
+    build_secret_reader,
+)
+from .personal_execution import PersonalExecution, owner_lease_ttl_ms
 from .progress import ProgressStore
 from .publication_clients import (
     PublicationCodeHostClient,
@@ -596,11 +604,89 @@ def _attachment_coordinator(
     )
 
 
+def refuse_personal_without_kubernetes(config: WorkerConfig, env: Mapping[str, str]) -> None:
+    """A personal installation needs the Kubernetes substrate (#5378, ADR 0268).
+
+    Docker and static runners have no per-claim grant Secret or owner labels,
+    so worker start refuses before any substrate or container exists.
+    """
+
+    if config.factory_model_auth_mode == "personal" and sandbox_substrate(env) != "kubernetes":
+        raise ValueError(
+            "personal_mode_requires_kubernetes: FACTORY_MODEL_AUTH_MODE=personal needs "
+            "CURIE_SANDBOX_SUBSTRATE=kubernetes"
+        )
+
+
+class _LazySecretReader:
+    """The custody Secret reader, built on the first personal grant read.
+
+    A worker that never launches a personal execution (a laptop on Docker)
+    never loads cluster credentials. A failed build is a failed read, which
+    the custody reader refuses ``custody_unreadable``.
+    """
+
+    def __init__(self) -> None:
+        self._reader: SecretReader | None = None
+        self._guard = threading.Lock()
+
+    def read_secret(self, namespace: str, name: str) -> CustodySecret | None:
+        with self._guard:
+            if self._reader is None:
+                self._reader = build_secret_reader()
+            reader = self._reader
+        return reader.read_secret(namespace, name)
+
+
+def build_personal_execution(
+    config: WorkerConfig,
+    env: Mapping[str, str],
+    *,
+    engine: AsyncEngine,
+    binding: BindingResolver,
+    async_redis: AsyncRedis,
+    claim_timeout_seconds: float,
+) -> PersonalExecution:
+    """The Kernel's personal execution authority (#5378), in both modes.
+
+    A service installation still meets personal requests only through their
+    own snapshot, so it carries the same authority and refuses what it
+    cannot run (``personal_mode_requires_kubernetes`` off Kubernetes).
+    """
+
+    return PersonalExecution(
+        authority=binding,
+        custody=PersonalCustodyReader(
+            engine,
+            schema=config.db_schema,
+            namespace=config.personal_grant_namespace,
+            secrets=_LazySecretReader(),
+        ),
+        owner_lock=ThreadLock(
+            async_redis,
+            ttl_ms=owner_lease_ttl_ms(
+                thread_lock_ttl_ms=config.lock_ttl_ms,
+                claim_timeout_seconds=claim_timeout_seconds,
+            ),
+            # One attempt: a held owner lease answers OwnerBusy at once.
+            acquire_timeout_s=0.0,
+            poll_interval_s=config.lock_poll_interval_s,
+            owner=config.consumer_name,
+        ),
+        owner_key=lambda provenance: (
+            f"{config.key_prefix}:personal-owner:"
+            f"{provenance.owner_tenant_id}:{provenance.owner_principal_id}"
+        ),
+        kubernetes=sandbox_substrate(env) == "kubernetes",
+    )
+
+
 def build(
     config: WorkerConfig, env: Mapping[str, str], *, resources: WorkerResources | None = None
 ) -> Runtime:
     """@spec PROTECTED-HOOK-SOURCE-2."""
     refuse_slack_tokens(env)
+    refuse_personal_without_kubernetes(config, env)
     owner = resources if resources is not None else WorkerResources()
     owner.register_close("memory-drain", drain_pending_memory_closes, order=0)
     # Channel read revocations likewise (ADR 0100): one not finished leaves the
@@ -948,6 +1034,15 @@ def build(
         # Factory run steering (#5414): always built, so a factory run's Slack
         # root never starts ordinary chat on any worker.
         factory_steering=_build_factory_steering(config, engine, async_redis, client=eval_http),
+        # #5378: a WorkItem request runs only as the owner its snapshot names.
+        personal_execution=build_personal_execution(
+            config,
+            env,
+            engine=engine,
+            binding=binding,
+            async_redis=async_redis,
+            claim_timeout_seconds=sub_config.claim_timeout_seconds,
+        ),
     )
     owner.register_close("work-item-settlement", kernel.close, order=5)
     killswitch = KillSwitch(async_redis, on_kill=kernel.interrupt_agent)

@@ -88,6 +88,9 @@ PLATFORM_ERROR_CLASSIFICATIONS = frozenset(
         "max-turns",
         # #4333: the model endpoint was unreachable at the transport layer.
         "model-unreachable",
+        # #5377 (ADR 0268): personal mode had no usable owner grant, or the
+        # provider rejected it. The owner replaces or reconnects the enrollment.
+        "authentication-required",
     }
 )
 UNCLASSIFIED_ERROR_CLASSIFICATION = "unclassified"

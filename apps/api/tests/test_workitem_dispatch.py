@@ -968,6 +968,7 @@ def test_termination_claim_waits_for_heartbeat_expiry_and_maps_owner_lost(
             session,
             owner_lost_facts.request_id,
             runtime_epoch=termination.runtime_epoch,
+            expected_request_version=termination.request_version,
             observation=TERMINATION_OBSERVATION,
         )
         row = await _request_row(session, owner_lost_facts.request_id)
@@ -1052,6 +1053,7 @@ def _auth_routes() -> list[tuple[str, str, dict[str, Any] | None]]:
             f"{INTERNAL_PREFIX}/requests/{request_id}/termination",
             {
                 "runtime_epoch": 1,
+                "expected_request_version": 1,
                 "observation": TERMINATION_OBSERVATION,
             },
         ),
@@ -1281,6 +1283,7 @@ def test_declare_owner_lost_drives_the_terminate_chain_to_failed(
             session,
             facts.request_id,
             runtime_epoch=claimed.runtime_epoch,
+            expected_request_version=claimed.request_version,
             observation=TERMINATION_OBSERVATION,
         )
         final = await _request_row(session, facts.request_id)
@@ -3188,7 +3191,11 @@ async def _assert_successor_terminates(
     stale_beat = await heartbeat(session, request_id, runtime_epoch=prior_epoch)
     assert _code(stale_beat) == "stale_owner"
     stale_record = await record_termination(
-        session, request_id, runtime_epoch=prior_epoch, observation=TERMINATION_OBSERVATION
+        session,
+        request_id,
+        runtime_epoch=prior_epoch,
+        expected_request_version=claimed.request_version,
+        observation=TERMINATION_OBSERVATION,
     )
     assert _code(stale_record) == "stale_owner"
     assert await _full_request(session, request_id) == claimed_row
@@ -3197,6 +3204,7 @@ async def _assert_successor_terminates(
         session,
         request_id,
         runtime_epoch=claimed.runtime_epoch,
+        expected_request_version=claimed.request_version,
         observation=TERMINATION_OBSERVATION,
     )
     assert not hasattr(settled, "code"), settled

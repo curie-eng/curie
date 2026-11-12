@@ -43,6 +43,7 @@ from .forges.types import GITHUB, FeedbackKind, PullRequestRef, ReplyTarget, Rev
 from .github_factory import lock_issue
 from .github_factory_events import mentions_login
 from .models import ThreadPublicationLineage, WorkItem
+from .personal_execution import ModelAuthMode
 from .workitem_dispatch import Admission
 
 logger = logging.getLogger(__name__)
@@ -149,7 +150,14 @@ async def _poll_lineage(
         if not await feedback_actionable(code_host, feedback, allowlist):
             continue
         async with sessionmaker() as session:
-            await _admit(session, registry, code_host, lineage.id, feedback)
+            await _admit(
+                session,
+                registry,
+                code_host,
+                lineage.id,
+                feedback,
+                installation_mode=settings.factory_model_auth_mode,
+            )
     await valkey.set(key, page.cursor, ex=_CURSOR_TTL_SECONDS)
 
 
@@ -186,12 +194,18 @@ async def _admit(
     code_host: CodeHost,
     lineage_id: uuid.UUID,
     feedback: ReviewFeedback,
+    *,
+    installation_mode: ModelAuthMode,
 ) -> None:
     """Admit one actionable piece of feedback on the WorkItem owning the lineage.
 
     The WorkItem and lineage are re-read under the issue lock: a cancelled
     WorkItem, a closed lineage, or one the WorkItem no longer owns, or whose
-    pull request is no longer the feedback's, admits nothing.
+    pull request is no longer the feedback's, admits nothing. The facts carry
+    the installation's mode and never an owner, as tracker ingress does: a
+    personal installation refuses a service WorkItem with
+    ``personal_owner_required``, and a personal WorkItem's revision copies its
+    locked owner tuple, since a reviewer is not an owner (#5378).
     """
 
     work_item = await session.scalar(
@@ -247,6 +261,7 @@ async def _admit(
         ),
         reply_target=_reply_target(feedback),
         reply_url=lineage.pr_url,
+        model_auth_mode=installation_mode,
     )
     async with AsyncSession(
         bind=await session.connection(),

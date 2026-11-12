@@ -92,6 +92,16 @@ _UNPUBLISHED_CAUSES = frozenset({"no_pull_request", "early_stop", "revision_unch
 _NOTICE_DETAIL_MAX = 4000
 # Consecutive owner_lost requests a WorkItem runs before a person is needed (ADR 0206).
 OWNER_LOST_RETRY_LIMIT = 3
+# Started terminal statuses whose runtime teardown an enrollment fence can owe
+# (#5377). A force-settled ``cancelled`` request owes one too, by its own path.
+TEARDOWN_TERMINAL_STATUSES = ("completed", "failed", "expired")
+# A personal request ending with one of these is resumed by its owner after a
+# replace or reconnect, so its WorkItem keeps its transcript (#5377). A personal
+# request whose start deferrals ran out (``start_failed``, #5378) is resumed the
+# same way, after reconnect and revalidation.
+_RESUMABLE_PERSONAL_CAUSES = frozenset(
+    {"enrollment_fenced", "authentication_required", "start_failed"}
+)
 
 _NO_READMIT: dict[str, Any] = {
     "readmit_request_id": None,
@@ -493,7 +503,11 @@ async def settle_terminal(
     That is the factory comment and, per ADR-0170, deleting the thread's
     transcript: a terminal WorkItem's history is not resumed again. A queued
     revision, an active request (an owner_lost successor, ADR 0206) or a
-    pending relabel continues the WorkItem, so its transcript survives.
+    pending relabel continues the WorkItem, so its transcript survives. So
+    does a personal request stopped by an enrollment fence or ending
+    authentication-required on an uncancelled WorkItem (#5377, ADR 0268
+    section 3): its owner resumes it after a replace or reconnect. A personal
+    request that ended ``start_failed`` keeps it too (#5378).
     """
 
     if request.terminal_at is None:
@@ -507,7 +521,12 @@ async def settle_terminal(
         )
         .limit(1)
     )
-    if continuing is None and work_item.readmit_request_id is None:
+    resumable = (
+        request.model_auth_mode == "personal"
+        and request.terminal_cause in _RESUMABLE_PERSONAL_CAUSES
+        and work_item.cancelled_at is None
+    )
+    if continuing is None and work_item.readmit_request_id is None and not resumable:
         await transcripts.expire_for_work_item(session, work_item)
 
 
@@ -2072,7 +2091,7 @@ async def request_cancellation(
     elif (
         active is not None
         and active.status == "cancellation_requested"
-        and active.terminal_cause in ("execution_deadline", "owner_lost")
+        and active.terminal_cause in ("execution_deadline", "owner_lost", "enrollment_fenced")
     ):
         await session.execute(
             update(ExecutionRequest)
@@ -2586,6 +2605,80 @@ async def request_owner_lost_cancellation(
     return await outcome(session, work_item, request)
 
 
+@dataclass(frozen=True)
+class EnrollmentFence:
+    """The requests one enrollment fence changed (#5377), by id."""
+
+    stopping: tuple[uuid.UUID, ...]
+    pending_teardown: tuple[uuid.UUID, ...]
+
+
+async def fence_enrollment_generation(
+    session: AsyncSession, *, tenant_id: uuid.UUID, owner_principal_id: uuid.UUID
+) -> EnrollmentFence:
+    """Fence every personal request of one owner after a replace or disconnect.
+
+    ADR 0268 section 3. Runs in the caller's transaction, which already holds
+    the owner's WorkItems and requests locked and owns the commit; nothing here
+    commits. Every existing request of the owner ran under a generation at or
+    below the enrollment's, so each is superseded:
+
+    1. A ``running`` request becomes ``cancellation_requested`` with cause
+       ``enrollment_fenced``; a parked approval or CI hold is released so any
+       worker can claim the termination. It ends ``failed`` once a worker
+       records the teardown.
+    2. A started ``completed``, ``failed`` or ``expired`` request with no
+       termination observation is marked ``teardown_unconfirmed_at``, so
+       terminate wakes run until a worker records its runtime gone.
+    3. ``cancellation_requested`` requests already end with an observation,
+       and ``queued`` and ``waiting`` ones are fenced by their generation, so
+       neither changes. The WorkItem is never cancelled.
+    """
+
+    owner = (
+        ExecutionRequest.tenant_id == tenant_id,
+        ExecutionRequest.owner_principal_id == owner_principal_id,
+        ExecutionRequest.model_auth_mode == "personal",
+    )
+    stopping = await session.scalars(
+        update(ExecutionRequest)
+        .where(*owner, ExecutionRequest.status == "running")
+        .values(
+            status="cancellation_requested",
+            terminal_cause="enrollment_fenced",
+            cancellation_requested_at=func.clock_timestamp(),
+            runtime_heartbeat_expires_at=_release_parked_hold(),
+            version=ExecutionRequest.version + 1,
+            updated_at=func.clock_timestamp(),
+        )
+        .returning(ExecutionRequest.id)
+    )
+    stopped = tuple(stopping.all())
+    pending = await session.scalars(
+        update(ExecutionRequest)
+        .where(
+            *owner,
+            ExecutionRequest.status.in_(TEARDOWN_TERMINAL_STATUSES),
+            ExecutionRequest.started_at.is_not(None),
+            or_(
+                ExecutionRequest.termination_observation.is_(None),
+                func.btrim(ExecutionRequest.termination_observation) == "",
+            ),
+            ExecutionRequest.teardown_unconfirmed_at.is_(None),
+        )
+        .values(
+            teardown_unconfirmed_at=func.clock_timestamp(),
+            # A lease parked at the deadline would keep another worker from
+            # claiming the teardown until then.
+            runtime_heartbeat_expires_at=_release_parked_hold(),
+            version=ExecutionRequest.version + 1,
+            updated_at=func.clock_timestamp(),
+        )
+        .returning(ExecutionRequest.id)
+    )
+    return EnrollmentFence(stopping=stopped, pending_teardown=tuple(pending.all()))
+
+
 async def record_runtime_termination(
     session: AsyncSession,
     *,
@@ -2628,7 +2721,11 @@ async def record_runtime_termination_where(
         return await _conflict(session, "not_found", work_item=work_item, request_id=request_id)
     if request.version != expected_request_version:
         return await _conflict(session, "stale_version", work_item=work_item, request=request)
-    if request.status == "cancelled" and request.teardown_unconfirmed_at is not None:
+    if (
+        request.status in ("cancelled", *TEARDOWN_TERMINAL_STATUSES)
+        and request.terminal_at is not None
+        and request.teardown_unconfirmed_at is not None
+    ):
         return await _confirm_settled_teardown(
             session,
             work_item=work_item,
@@ -2649,7 +2746,7 @@ async def record_runtime_termination_where(
         terminal_status = "cancelled"
     elif request.terminal_cause == "execution_deadline":
         terminal_status = "expired"
-    elif request.terminal_cause == "owner_lost":
+    elif request.terminal_cause in ("owner_lost", "enrollment_fenced"):
         terminal_status = "failed"
     else:
         return await _conflict(session, "illegal_transition", work_item=work_item, request=request)
@@ -2791,10 +2888,13 @@ async def _confirm_settled_teardown(
     termination_observation: str,
     extra_where: Sequence[ColumnElement[bool]],
 ) -> WorkItemResult:
-    """Record a late worker teardown for a force-settled cancellation.
+    """Record a worker teardown a terminal request still owes.
 
-    The request is already terminal and its notice already went out, so this
-    only replaces the placeholder observation and clears the flag.
+    Either a force-settled cancellation or a started completed, failed or
+    expired request an enrollment fence marked (#5377). The request is already
+    terminal and its notice already went out, so this only records the
+    observation (replacing a settle placeholder) and clears the flag. Its
+    status, cause, ``terminal_at`` and runtime epoch stay as they were.
     """
 
     if not termination_observation.strip():
@@ -2810,7 +2910,8 @@ async def _confirm_settled_teardown(
             ExecutionRequest.id == request.id,
             ExecutionRequest.work_item_id == work_item.id,
             ExecutionRequest.version == request.version,
-            ExecutionRequest.status == "cancelled",
+            ExecutionRequest.status == request.status,
+            ExecutionRequest.terminal_at.is_not(None),
             ExecutionRequest.teardown_unconfirmed_at.is_not(None),
             *extra_where,
         )

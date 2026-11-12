@@ -128,7 +128,7 @@ def executor_withheld_names(env: Mapping[str, str]) -> frozenset[str]:
 
 
 def personal_withheld_names(source_spec: Mapping[str, Any]) -> frozenset[str]:
-    """Model credential names declared anywhere in a personal pod template."""
+    """Installation credential and endpoint names withheld from personal templates."""
 
     pod = source_spec.get("podTemplate", {}).get("spec", {})
     env = [
@@ -137,7 +137,7 @@ def personal_withheld_names(source_spec: Mapping[str, Any]) -> frozenset[str]:
         for container in pod.get(field) or []
         for entry in container.get("env") or []
     ]
-    return _template_withheld_names(env)
+    return _template_withheld_names(env) | {BootEnv.env_key("base_url")}
 
 
 # Names the connector secret values the claim env carries.

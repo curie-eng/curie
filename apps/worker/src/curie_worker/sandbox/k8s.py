@@ -53,6 +53,7 @@ from .resources import claim_resources_spec, pod_resources, prepare_resources_cl
 from .types import (
     MANAGED_BY_LABEL,
     MANAGED_BY_VALUE,
+    MODEL_AUTH_MODE_LABEL,
     CapacityInventory,
     CapacityPod,
     ClaimNameConflict,
@@ -1122,6 +1123,10 @@ class KubernetesSandboxClient:
         env = filter_agent_child_env(env)
         executor = executor_secret_names is not None
         personal_mode = not executor and env.get(MODEL_AUTH_MODE_ENV) == "personal"
+        if (labels or {}).get(MODEL_AUTH_MODE_LABEL) == "personal" and not personal_mode:
+            # #5378: a claim recorded as one owner's personal runtime boots only
+            # from the stripped personal template, never the service pool's.
+            raise ValueError("a personal-provenance claim must carry the personal mode env")
         withheld: frozenset[str] = frozenset()
         if executor or personal_mode:
             withheld = executor_withheld_names(env)
@@ -1314,7 +1319,12 @@ class KubernetesSandboxClient:
             if exc.status != 404:
                 raise
 
-    def list_claims(self, *, label_selector: str) -> list[ClaimView]:
+    def list_claims(
+        self, *, label_selector: str, request_timeout_seconds: float | None = None
+    ) -> list[ClaimView]:
+        bound: dict[str, Any] = (
+            {} if request_timeout_seconds is None else {"_request_timeout": request_timeout_seconds}
+        )
         result = cast(
             dict[str, Any],
             self._api.list_namespaced_custom_object(
@@ -1323,6 +1333,7 @@ class KubernetesSandboxClient:
                 self._namespace,
                 "sandboxclaims",
                 label_selector=label_selector,
+                **bound,
             ),
         )
         return [_claim_view(item) for item in result.get("items", [])]

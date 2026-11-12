@@ -1017,6 +1017,7 @@ def test_poll_uses_current_labels_at_claim_and_replaces_only_a_pinned_selection(
             headers=headers,
             json={
                 "runtime_epoch": teardown.json()["runtime_epoch"],
+                "expected_request_version": teardown.json()["request_version"],
                 "observation": "runtime stopped",
             },
         )

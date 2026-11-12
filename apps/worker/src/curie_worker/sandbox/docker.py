@@ -82,18 +82,20 @@ from ..workspace import (
     WORKSPACE_SHA256_ENV,
     WorkspaceLimits,
 )
-from .claim_tokens import executor_claim_env
+from .claim_tokens import MODEL_AUTH_MODE_ENV, executor_claim_env
 from .staging import WORKER_OWNED_ENV, ClaimInputStaging, NoAttachments
 from .types import (
     BUNDLE_REF_LABEL,
     MANAGED_BY_LABEL,
     MANAGED_BY_VALUE,
+    MODEL_AUTH_MODE_LABEL,
     CapacityInventory,
     ClaimView,
     DaemonObjectKind,
     DaemonObjectView,
     ListableDaemonKind,
     OperatingMode,
+    PersonalModeUnsupported,
     QuotaRejection,
     QuotaStatus,
     SandboxError,
@@ -377,6 +379,13 @@ class DockerSandboxClient(ClaimInputStaging):
         executor_secret_names: frozenset[str] | None = None,
         tool_daemon: ToolDaemonMount | None = None,
     ) -> None:
+        if (env or {}).get(MODEL_AUTH_MODE_ENV) == "personal" or (labels or {}).get(
+            MODEL_AUTH_MODE_LABEL
+        ) == "personal":
+            # ADR 0268 decision 2: a personal grant runs only on Kubernetes,
+            # whose per-claim Secret keeps it out of the runner's plain env.
+            # Refused before any docker call, so nothing is created or staged.
+            raise PersonalModeUnsupported()
         if tool_daemon is not None:
             raise SandboxError(_NO_TOOL_DAEMON)
         env = filter_agent_child_env(env)
@@ -603,7 +612,12 @@ class DockerSandboxClient(ClaimInputStaging):
             name, request_timeout_seconds=request_timeout_seconds, include_runner=True
         )
 
-    def list_claims(self, *, label_selector: str) -> list[ClaimView]:
+    def list_claims(
+        self,
+        *,
+        label_selector: str,
+        request_timeout_seconds: float | None = None,  # noqa: ARG002 - each call bounds itself
+    ) -> list[ClaimView]:
         out = self._docker(
             [
                 "ps",

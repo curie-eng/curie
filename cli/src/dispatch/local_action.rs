@@ -17,6 +17,7 @@ pub(super) async fn run(action: LocalAction) -> Result<()> {
             env_file,
             build,
         } => {
+            curie::personal_mode::refuse_personal_mode()?;
             let mut opts = bind_local_opts(project, files, dry_run, build).await?;
             opts.minimal = minimal;
             opts.local_model = local_model;
@@ -37,6 +38,7 @@ pub(super) async fn run(action: LocalAction) -> Result<()> {
             slack,
             env_file,
         } => {
+            curie::personal_mode::refuse_personal_mode()?;
             let mut opts = bind_local_opts(project, files, dry_run, false).await?;
             opts.minimal = minimal;
             opts.local_model = local_model;

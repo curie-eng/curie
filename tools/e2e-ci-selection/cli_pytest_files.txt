@@ -22,6 +22,7 @@ apps/worker/tests/binding/test_eval_memory_isolation.py
 apps/worker/tests/binding/test_reserved_boot_env_pin.py
 apps/worker/tests/eval/test_schema_compat.py
 apps/worker/tests/sandbox/test_e2e_tool_daemon.py
+apps/worker/tests/sandbox/test_personal_enrollment_cluster.py
 apps/worker/tests/test_blocks_progress.py
 apps/worker/tests/test_completion_outbox_vector.py
 apps/worker/tests/test_delivery_lease.py
@@ -152,6 +153,7 @@ tools/factory-e2e/tests/test_gitlab_acceptance.py
 tools/factory-e2e/tests/test_gitlab_driver.py
 tools/factory-e2e/tests/test_jira_driver.py
 tools/factory-e2e/tests/test_kind_images.py
+tools/factory-e2e/tests/test_personal_owner_enforcement.py
 tools/factory-e2e/tests/test_personal_profile.py
 tools/factory-e2e/tests/test_recordings_hygiene.py
 tools/factory-e2e/tests/test_repo_runner.py

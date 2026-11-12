@@ -1,7 +1,7 @@
 ---
 seam: CLI output (agent-facing `--json`)
 kind: CLEAN
-impls: 80 outputs behind one trait
+impls: 81 outputs behind one trait
 grade: not separately graded
 epics:
   - "#456"
@@ -13,7 +13,7 @@ order: 18
 > Part of the Curie swappable-seam catalog — see the [seam index](../../interfaces.md).
 
 <!-- BEGIN GENERATED: header (curie dev docs-lint) -->
-> **Kind:** CLEAN &nbsp;·&nbsp; **Implementations today:** 80 outputs behind one trait &nbsp;·&nbsp; **Swap-readiness grade:** not separately graded
+> **Kind:** CLEAN &nbsp;·&nbsp; **Implementations today:** 81 outputs behind one trait &nbsp;·&nbsp; **Swap-readiness grade:** not separately graded
 <!-- END GENERATED: header -->
 
 **Kind legend:** CLEAN = a real `Protocol`/typed port class · SOFT = swap via env/URL/prefix/wire, no code interface · NONE = not built yet.
@@ -66,7 +66,7 @@ This is the catalog's first **Rust** seam. It is listed here because the agent-f
 
 ## Implementations today
 
-80 `CliOutput` implementations, all in the CLI crate, grouped by owning module:
+81 `CliOutput` implementations, all in the CLI crate, grouped by owning module:
 
 `MigrationOutput` in `cli/src/process_migrate.rs` reports the completed offline
 protected-process migration as one JSON object or a human confirmation.
@@ -102,6 +102,9 @@ protected-process migration as one JSON object or a human confirmation.
   `RepoRunnerBuildOutput` (`cli/src/commands/repo_runner_build.rs`, type in
   `cli/src/repo_runner.rs`) is the `curie build --repo-runner` receipt (ADR 0216):
   the Helm `runner` values block, rendered as YAML for humans.
+  `SubscriptionOutput` (`cli/src/commands/subscription.rs`) is the
+  `curie cluster subscription` result: the owner's enrollment state, generation,
+  version and teardown counts, or the dry-run plan. It never carries the token.
 - **`cli/src/local.rs`**, **`cli/src/ops/up.rs`**, **`cli/src/ops/upgrade.rs`**, and **`cli/src/ops/verbs.rs`**, the operator verbs, one output per
   verb per tier: `LocalUpOutput`, `LocalRebuildOutput`, `LocalStatusOutput`,
   `LocalDownOutput`; `ClusterUpOutput`, `ClusterUpgradeOutput`, `ClusterStatusOutput`, `ClusterDownOutput`,
@@ -148,7 +151,7 @@ That set is not hand-maintained prose: `cli/schema/index.json` carries one
   result. This syntactic inventory does not prove that every verb returns a
   `CliOutput` or honors the one-object JSON contract.
 2. **Committed JSON Schemas with a drift gate (since #841).** Each `to_json` is no
-  longer schema-free: there are 80 committed schemas under `cli/schema/` with an
+  longer schema-free: there are 81 committed schemas under `cli/schema/` with an
   index (`cli/schema/index.json`), a `syn`-based inventory gate over every `impl
   CliOutput`, and per-family output validation — result families are validated
   against real `to_json()` output across 86 tests in `cli/tests/json_contract.rs`.

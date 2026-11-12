@@ -35,16 +35,17 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use curie::api::{
-    AgentAccessPolicy, ApprovalRecord, ChannelBinding, HookFireRecord, HookWakeRotation,
-    HookWakeSecret, MemoryEntry, MetricPoint, MetricSeries, MetricsSummary, ScheduleList, Version,
+    AgentAccessPolicy, ApprovalRecord, ChannelBinding, EnrollmentState, HookFireRecord,
+    HookWakeRotation, HookWakeSecret, MemoryEntry, MetricPoint, MetricSeries, MetricsSummary,
+    PersonalEnrollmentStatus, PersonalEnrollmentTeardown, ScheduleList, Version,
 };
 use curie::channel_token::ChannelTokenOutput;
 use curie::commands::{
     AccessPolicyOutput, ActionsOutput, ApprovalsOutput, BudgetOutput, CallersOutput,
     ChannelsOutput, DeleteOutput, DirectoryOutput, HookFireOutput, HookOutput, KillOutput,
     MemoryChannel, MemoryOutput, OverridesOutput, PublicationPolicyOutput, ResetThreadOutput,
-    ResumeOutput, SchedulesOutput, SkillApprovalsOutput, VersionsOutput, WakeKeyOutput,
-    WorkItemsOutput,
+    ResumeOutput, SchedulesOutput, SkillApprovalsOutput, SubscriptionOutput, SubscriptionVerb,
+    VersionsOutput, WakeKeyOutput, WorkItemsOutput,
 };
 use curie::comms::CommsOutput;
 use curie::factory_intake::FactoryIntakeOutput;
@@ -152,6 +153,18 @@ macro_rules! samples {
 fn plan() -> DryRunPlan {
     DryRunPlan {
         lines: vec!["a planned step".to_string()],
+    }
+}
+
+fn personal_enrollment(state: EnrollmentState, version: Option<i64>) -> PersonalEnrollmentStatus {
+    PersonalEnrollmentStatus {
+        state,
+        generation: version,
+        version,
+        teardown: PersonalEnrollmentTeardown {
+            pending_runtimes: 1,
+            pending_custody_cleanup: 0,
+        },
     }
 }
 
@@ -691,6 +704,18 @@ fn registry() -> BTreeMap<&'static str, Vec<VariantJson>> {
                 hook: "queue-ready".to_string(),
                 generation: 2,
             }),
+        ],
+    );
+    m.insert(
+        "SubscriptionOutput",
+        samples![
+            "DryRun" => SubscriptionOutput::DryRun(plan()),
+            "Status" => SubscriptionOutput::Status(personal_enrollment(EnrollmentState::Absent, None)),
+            "Changed" => SubscriptionOutput::Changed {
+                action: SubscriptionVerb::Replace,
+                previous_version: Some(3),
+                enrollment: personal_enrollment(EnrollmentState::Active, Some(4)),
+            },
         ],
     );
     m.insert(

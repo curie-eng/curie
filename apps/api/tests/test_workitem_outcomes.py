@@ -764,6 +764,7 @@ def test_cancelled_after_termination_is_recorded(
             session,
             facts.request_id,
             runtime_epoch=claim.runtime_epoch,
+            expected_request_version=claim.request_version,
             observation=TERMINATION_OBSERVATION,
         )
 
@@ -2091,6 +2092,7 @@ def _terminate(request_id: uuid.UUID) -> None:
             session,
             request_id,
             runtime_epoch=claim.runtime_epoch,
+            expected_request_version=claim.request_version,
             observation=OWNER_OBSERVATION,
         )
         assert getattr(recorded, "code", None) is None, recorded

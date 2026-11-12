@@ -71,6 +71,30 @@ print("{}")
 """
 
 
+def require_native_prerequisites() -> str:
+    """The bundled native CLI and the process-lock library a custody case needs.
+
+    Each custody test module's ``native_prerequisites`` fixture returns this.
+    Absence is an error, never a skip: these cases are the containment proof.
+    """
+
+    from curie_runner.subprocess_env import proc_dumpable_library
+    from personal_auth_support import BUNDLED_CLI
+
+    if not BUNDLED_CLI.is_file():
+        raise RuntimeError("the required bundled native CLI is missing")
+    library = proc_dumpable_library(os.environ)
+    if not Path(library).is_file():
+        raise RuntimeError("the required process-lock library is missing")
+    if Path("/app/runner").is_dir():
+        configured = os.environ.get("CURIE_PROC_DUMPABLE_PRELOAD", "")
+        if configured != "/usr/local/lib/curie/libproc_dumpable.so":
+            raise RuntimeError("candidate image must use its installed process-lock library")
+        if Path(configured).stat().st_uid != 0:
+            raise RuntimeError("candidate process-lock library is not root owned")
+    return library
+
+
 @dataclass(frozen=True)
 class ContainmentBundle:
     root: Path

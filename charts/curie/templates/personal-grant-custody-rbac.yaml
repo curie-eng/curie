@@ -1,0 +1,82 @@
+{{/*
+RBAC for personal Claude enrollment custody (#5377, ADR 0268). Off unless
+`personalClaude.grantNamespace` names a namespace. The grant is namespaced: the
+Roles live in the grant namespace and bind ServiceAccounts of this release.
+
+  - The API writes and retires custody Secrets: create, get, list, delete.
+  - The worker only reads one: get.
+
+Secret get and list cannot be scoped by label, so the grant namespace must hold
+nothing but custody Secrets. The release namespace is refused because the API
+would otherwise hold Secret create, get and delete over the platform's own
+Secrets. The chart does not create the namespace.
+*/}}
+{{- $grantNs := dig "personalClaude" "grantNamespace" "" (.Values | toYaml | fromYaml) }}
+{{- if $grantNs }}
+{{- if eq $grantNs .Release.Namespace }}
+{{- fail "personalClaude.grantNamespace must differ from the release namespace: it must be a dedicated namespace that holds only personal custody Secrets" }}
+{{- end }}
+{{- if .Values.api.deploy }}
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ include "curie.fullname" . }}-api-personal-grants
+  namespace: {{ $grantNs | quote }}
+  labels:
+    {{- include "curie.labels" . | nindent 4 }}
+    app.kubernetes.io/component: api
+rules:
+  - apiGroups: [""]
+    resources: ["secrets"]
+    verbs: ["create", "get", "list", "delete"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ include "curie.fullname" . }}-api-personal-grants
+  namespace: {{ $grantNs | quote }}
+  labels:
+    {{- include "curie.labels" . | nindent 4 }}
+    app.kubernetes.io/component: api
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: {{ include "curie.fullname" . }}-api-personal-grants
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "curie.fullname" . }}-api
+    namespace: {{ .Release.Namespace }}
+---
+{{- end }}
+{{- if .Values.worker.deploy }}
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ include "curie.fullname" . }}-worker-personal-grants
+  namespace: {{ $grantNs | quote }}
+  labels:
+    {{- include "curie.labels" . | nindent 4 }}
+    app.kubernetes.io/component: worker
+rules:
+  - apiGroups: [""]
+    resources: ["secrets"]
+    verbs: ["get"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ include "curie.fullname" . }}-worker-personal-grants
+  namespace: {{ $grantNs | quote }}
+  labels:
+    {{- include "curie.labels" . | nindent 4 }}
+    app.kubernetes.io/component: worker
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: {{ include "curie.fullname" . }}-worker-personal-grants
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "curie.fullname" . }}-worker
+    namespace: {{ .Release.Namespace }}
+{{- end }}
+{{- end }}

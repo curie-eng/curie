@@ -867,6 +867,7 @@ def _observe_termination(client: Any, request_id: uuid.UUID) -> None:
         headers=WORKER,
         json={
             "runtime_epoch": claimed.json()["runtime_epoch"],
+            "expected_request_version": claimed.json()["request_version"],
             "observation": "runtime stopped",
         },
     )

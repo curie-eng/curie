@@ -656,7 +656,11 @@ class FakeK8s:
             self.deleted_claims.append(name)
             self.sandboxes.pop(claim.sandbox_name, None)
 
-    def list_claims(self, *, label_selector: str) -> list[ClaimView]:
+    def list_claims(
+        self, *, label_selector: str, request_timeout_seconds: float | None = None
+    ) -> list[ClaimView]:
+        # The owner inventory (#5378) bounds its read; any other caller omits it.
+        assert request_timeout_seconds is None or request_timeout_seconds > 0
         key, _, value = label_selector.partition("=")
         out = []
         for claim in self.claims.values():
@@ -1176,6 +1180,7 @@ async def kernel_harness(
     attachment_access: object | None = None,
     recovery_factory: Callable[[object | None], object] | None = None,
     factory_steering: object | None = None,
+    personal_execution_factory: Callable[[AsyncRedis, WorkerConfig], object] | None = None,
     **config_overrides: object,
 ) -> AsyncIterator[Harness]:
     """Assemble a live kernel. @spec HTTP-INVOCATION-EXECUTION-18."""
@@ -1307,6 +1312,13 @@ async def kernel_harness(
         # The factory Slack steering diversion (#5414); omitted, the kernel has
         # none and every Slack turn takes the ordinary path.
         **({"factory_steering": factory_steering} if factory_steering is not None else {}),
+        # The personal execution authority (#5378), built from the harness's own
+        # Valkey client and config; omitted, the kernel enforces nothing.
+        **(
+            {"personal_execution": personal_execution_factory(async_redis, config)}
+            if personal_execution_factory is not None
+            else {}
+        ),
     )
     killswitch = None
     if with_killswitch:

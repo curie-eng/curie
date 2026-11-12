@@ -10366,6 +10366,115 @@
         "title": "PersonalContextRequestOut",
         "type": "object"
       },
+      "PersonalEnrollmentOut": {
+        "description": "The caller's own enrollment; ``generation`` and ``version`` are null when absent.",
+        "properties": {
+          "generation": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Generation"
+          },
+          "state": {
+            "enum": [
+              "absent",
+              "active",
+              "inactive"
+            ],
+            "title": "State",
+            "type": "string"
+          },
+          "teardown": {
+            "$ref": "#/components/schemas/PersonalEnrollmentTeardownOut"
+          },
+          "version": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Version"
+          }
+        },
+        "required": [
+          "state",
+          "generation",
+          "version",
+          "teardown"
+        ],
+        "title": "PersonalEnrollmentOut",
+        "type": "object"
+      },
+      "PersonalEnrollmentTeardownOut": {
+        "description": "Teardown still owed after a replace or disconnect.",
+        "properties": {
+          "pending_custody_cleanup": {
+            "minimum": 0.0,
+            "title": "Pending Custody Cleanup",
+            "type": "integer"
+          },
+          "pending_runtimes": {
+            "minimum": 0.0,
+            "title": "Pending Runtimes",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "pending_runtimes",
+          "pending_custody_cleanup"
+        ],
+        "title": "PersonalEnrollmentTeardownOut",
+        "type": "object"
+      },
+      "PersonalEnrollmentWrite": {
+        "additionalProperties": false,
+        "description": "``PUT /personal-claude/enrollment``. ``expected_version`` is null only for enroll.",
+        "properties": {
+          "expected_version": {
+            "anyOf": [
+              {
+                "minimum": 1.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Expected Version"
+          },
+          "intent": {
+            "enum": [
+              "enroll",
+              "replace",
+              "reconnect"
+            ],
+            "title": "Intent",
+            "type": "string"
+          },
+          "token": {
+            "format": "password",
+            "maxLength": 4096,
+            "minLength": 1,
+            "title": "Token",
+            "type": "string",
+            "writeOnly": true
+          }
+        },
+        "required": [
+          "intent",
+          "token"
+        ],
+        "title": "PersonalEnrollmentWrite",
+        "type": "object"
+      },
       "PhaseDeclaration": {
         "additionalProperties": false,
         "properties": {
@@ -14863,6 +14972,8 @@
                   "factory_binding_changed",
                   "factory_surface_mismatch",
                   "factory_start_failed",
+                  "stale_version",
+                  "termination_observation_required",
                   "personal_owner_required",
                   "owner_context_unexpected",
                   "owner_tenant_mismatch",
@@ -14871,7 +14982,8 @@
                   "owner_principal_inactive",
                   "enrollment_inactive",
                   "enrollment_generation_mismatch",
-                  "owner_mismatch"
+                  "owner_mismatch",
+                  "personal_rollout_in_progress"
                 ],
                 "type": "string"
               },
@@ -15839,6 +15951,11 @@
       },
       "TerminationBody": {
         "properties": {
+          "expected_request_version": {
+            "minimum": 1.0,
+            "title": "Expected Request Version",
+            "type": "integer"
+          },
           "observation": {
             "minLength": 1,
             "title": "Observation",
@@ -15852,6 +15969,7 @@
         },
         "required": [
           "runtime_epoch",
+          "expected_request_version",
           "observation"
         ],
         "title": "TerminationBody",
@@ -15869,6 +15987,25 @@
           "owner"
         ],
         "title": "TerminationClaimBody",
+        "type": "object"
+      },
+      "TerminationClaimOut": {
+        "description": "What the claimant's termination record presents back (#5377).",
+        "properties": {
+          "request_version": {
+            "title": "Request Version",
+            "type": "integer"
+          },
+          "runtime_epoch": {
+            "title": "Runtime Epoch",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "runtime_epoch",
+          "request_version"
+        ],
+        "title": "TerminationClaimOut",
         "type": "object"
       },
       "ThreadAttachmentAppend": {
@@ -30830,6 +30967,181 @@
         ]
       }
     },
+    "/personal-claude/enrollment": {
+      "delete": {
+        "description": "Disconnect: inactive at a new generation, runtimes fenced, Secret retired.\n\nRepeating it at the inactive version answers 200 and changes nothing. It is\nnever held for a rollout, since it only reduces access.",
+        "operationId": "disconnect_enrollment_personal_claude_enrollment_delete",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "expected_version",
+            "required": true,
+            "schema": {
+              "minimum": 1,
+              "title": "Expected Version",
+              "type": "integer"
+            }
+          },
+          {
+            "in": "cookie",
+            "name": "__Host-curie_console_session",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "  Host-Curie Console Session"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PersonalEnrollmentOut"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "401": {
+            "description": "No live principal session, or another credential was presented"
+          },
+          "403": {
+            "description": "Console session origin rejected"
+          },
+          "404": {
+            "description": "`enrollment_absent`"
+          },
+          "409": {
+            "description": "Version or intent conflict: `detail.code` names it"
+          },
+          "422": {
+            "description": "`invalid_enrollment_request`; the input is never echoed"
+          },
+          "503": {
+            "description": "`custody_unconfigured`, `custody_unavailable`, `enrollment_busy` or `personal_rollout_in_progress`"
+          }
+        },
+        "summary": "Disconnect Enrollment",
+        "tags": [
+          "personal-enrollment"
+        ]
+      },
+      "get": {
+        "description": "The caller's enrollment; ``absent`` before the first enroll.",
+        "operationId": "read_enrollment_personal_claude_enrollment_get",
+        "parameters": [
+          {
+            "in": "cookie",
+            "name": "__Host-curie_console_session",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "  Host-Curie Console Session"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PersonalEnrollmentOut"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "401": {
+            "description": "No live principal session, or another credential was presented"
+          },
+          "422": {
+            "description": "`invalid_enrollment_request`; the input is never echoed"
+          }
+        },
+        "summary": "Read Enrollment",
+        "tags": [
+          "personal-enrollment"
+        ]
+      },
+      "put": {
+        "description": "Enroll (generation 1), or replace or reconnect at ``expected_version``.",
+        "operationId": "write_enrollment_personal_claude_enrollment_put",
+        "parameters": [
+          {
+            "in": "cookie",
+            "name": "__Host-curie_console_session",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "  Host-Curie Console Session"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/PersonalEnrollmentWrite"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PersonalEnrollmentOut"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "401": {
+            "description": "No live principal session, or another credential was presented"
+          },
+          "403": {
+            "description": "Console session origin rejected"
+          },
+          "409": {
+            "description": "Version or intent conflict: `detail.code` names it"
+          },
+          "422": {
+            "description": "`invalid_enrollment_request`; the input is never echoed"
+          },
+          "503": {
+            "description": "`custody_unconfigured`, `custody_unavailable`, `enrollment_busy` or `personal_rollout_in_progress`"
+          }
+        },
+        "summary": "Write Enrollment",
+        "tags": [
+          "personal-enrollment"
+        ]
+      }
+    },
     "/provider-installations": {
       "get": {
         "operationId": "list_provider_installations_provider_installations_get",
@@ -35013,9 +35325,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "additionalProperties": true,
-                  "title": "Response Claim Work Item Termination V1 Internal Work Items Requests  Request Id  Termination Claim Post",
-                  "type": "object"
+                  "$ref": "#/components/schemas/TerminationClaimOut"
                 }
               }
             },

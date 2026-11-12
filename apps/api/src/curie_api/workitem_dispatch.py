@@ -49,6 +49,7 @@ from .models import (
     AgentChannel,
     ExecutionRequest,
     FactoryBaseTransition,
+    PersonalClaudeEnrollment,
     WorkItem,
 )
 from .personal_execution import (
@@ -115,6 +116,10 @@ RefusalCode = Literal[
     "factory_binding_changed",
     "factory_surface_mismatch",
     "factory_start_failed",
+    # A termination record whose request version moved since its claim, or
+    # whose observation is blank (#5377).
+    "stale_version",
+    "termination_observation_required",
     # Execution owner admission refusals (#5376).
     OwnerRefusalCode,
 ]
@@ -241,7 +246,10 @@ class HeartbeatResult:
 
 @dataclass(frozen=True)
 class TerminationClaim:
+    """The epoch and request version a termination record must present (#5377)."""
+
     runtime_epoch: int
+    request_version: int
 
 
 @dataclass(frozen=True)
@@ -1426,6 +1434,13 @@ async def start(
         return await _defer_factory_refusal(
             session, work_item, request, owner=owner, generation=generation, refusal=refusal
         )
+    enrollment_refusal = await _personal_enrollment_refusal(session, request)
+    if enrollment_refusal is not None:
+        # #5378: the request stays waiting with its acquire held, so the worker
+        # releases the claim it made and defers; revalidation can rebind it.
+        return await _refuse(
+            session, enrollment_refusal, work_item_id=work_item.id, request_id=request.id
+        )
     settings = get_settings()
     ttl = timedelta(seconds=settings.work_item_runtime_ttl_seconds)
     result = await start_execution_where(
@@ -1470,11 +1485,43 @@ async def start(
     )
 
 
+async def _personal_enrollment_refusal(
+    session: AsyncSession, request: ExecutionRequest
+) -> Literal["enrollment_inactive", "enrollment_generation_mismatch"] | None:
+    """Whether a personal request's owner is still enrolled at its generation (#5378).
+
+    Read ``FOR SHARE`` after the WorkItem and request locks, the order an
+    enrollment publish takes, so a disconnect or replacement cannot commit
+    between this check and the start below. A service request passes.
+    """
+
+    if request.model_auth_mode != "personal":
+        return None
+    enrollment = (
+        await session.execute(
+            select(PersonalClaudeEnrollment.generation, PersonalClaudeEnrollment.active)
+            .where(
+                PersonalClaudeEnrollment.tenant_id == request.tenant_id,
+                PersonalClaudeEnrollment.principal_id == request.owner_principal_id,
+            )
+            .with_for_update(read=True)
+        )
+    ).one_or_none()
+    if enrollment is None or not enrollment.active:
+        return "enrollment_inactive"
+    if enrollment.generation != request.enrollment_generation:
+        return "enrollment_generation_mismatch"
+    return None
+
+
 def _map_start_conflict(result: WorkItemConflict) -> RefusalCode:
     if result.code in {
         "not_found",
         "work_item_cancelled",
         "waiting_deadline_elapsed",
+        # #5378: the worker keeps a personal request waiting on these.
+        "enrollment_inactive",
+        "enrollment_generation_mismatch",
     }:
         return cast(RefusalCode, result.code)
     return "not_dispatchable"
@@ -1745,6 +1792,8 @@ def _map_finish_conflict(result: WorkItemConflict, request: ExecutionRequest | N
         return "stale_owner"
     if result.code == "publication_pending":
         return "publication_pending"
+    if result.code == "termination_observation_required":
+        return "termination_observation_required"
     if request is not None and request.status == "cancellation_requested":
         if request.terminal_cause in ("issue_cancelled", "issue_deleted"):
             return "work_item_cancelled"
@@ -1834,16 +1883,65 @@ def _unconfirmed_settle_teardown() -> ColumnElement[bool]:
     )
 
 
+def _unconfirmed_terminal_teardown() -> ColumnElement[bool]:
+    """A started terminal request whose runtime teardown an enrollment fence owes (#5377).
+
+    The sibling rule is narrower than a settled cancellation's: only a request
+    that may own the thread's sandbox blocks the teardown, that is a running or
+    stopping one, or a waiting one under a live acquire lease (a worker is
+    starting it). A waiting request nobody is acquiring owns no sandbox, and
+    revalidation must still be able to rebind it once the teardown is
+    confirmed.
+    """
+
+    sibling = aliased(ExecutionRequest)
+    return and_(
+        ExecutionRequest.status.in_(lifecycle.TEARDOWN_TERMINAL_STATUSES),
+        ExecutionRequest.started_at.is_not(None),
+        ExecutionRequest.teardown_unconfirmed_at.is_not(None),
+        ~exists().where(
+            sibling.work_item_id == ExecutionRequest.work_item_id,
+            sibling.id != ExecutionRequest.id,
+            or_(
+                sibling.status.in_(("running", "cancellation_requested")),
+                and_(
+                    sibling.status == "waiting",
+                    sibling.acquire_expires_at > func.clock_timestamp(),
+                ),
+            ),
+        ),
+    )
+
+
 async def claim_termination(
     session: AsyncSession, request_id: uuid.UUID, *, owner: str
 ) -> TerminationClaim | DispatchConflict:
+    """Lease the termination of a stopping request, or of a terminal one owing teardown.
+
+    The claimant holds the runtime lease until it lapses; another owner is
+    refused ``duplicate`` meanwhile. Claiming a stopping request or a settled
+    cancellation advances the runtime epoch only when the claim takes the
+    runtime over: from a different owner, from a lapsed heartbeat, or from no
+    owner. The live owner's own claim renews its lease and keeps the epoch, so
+    the turn it is stopping still finishes with the epoch it started with and
+    is answered ``not_running`` rather than ``stale_owner``; a superseded
+    previous owner still presents an older epoch. Claiming a completed, failed
+    or expired request leaves the epoch alone, since an ADR 0251 recovery
+    capture of that run is bound to it, and advances the request version
+    instead, so only the latest claimant's record is accepted (#5377). The
+    claim returns the request's epoch and version as they stand after it.
+    """
+
     request = await lock_request_by_id(session, request_id)
     if request is None:
         return await _refuse(session, "not_found", request_id=request_id)
     settled_teardown = request.status == "cancelled" and request.teardown_unconfirmed_at is not None
-    # A settled teardown is re-checked against active siblings in the
-    # guarded update below.
-    if not settled_teardown and request.status != "cancellation_requested":
+    terminal_teardown = (
+        request.status in lifecycle.TEARDOWN_TERMINAL_STATUSES
+        and request.teardown_unconfirmed_at is not None
+    )
+    # A teardown claim is re-checked against siblings in the guarded update below.
+    if not (settled_teardown or terminal_teardown) and request.status != "cancellation_requested":
         return await _refuse(
             session,
             "not_running",
@@ -1855,29 +1953,36 @@ async def claim_termination(
         request.runtime_heartbeat_expires_at is not None
         and request.runtime_heartbeat_expires_at > now
     )
-    allowed = request.runtime_owner is None or not heartbeat_live or request.runtime_owner == owner
+    live_owner = heartbeat_live and request.runtime_owner == owner
+    allowed = request.runtime_owner is None or not heartbeat_live or live_owner
     if not allowed:
         return await _refuse(session, "duplicate", request_id=request.id)
+    if terminal_teardown:
+        eligible = _unconfirmed_terminal_teardown()
+        fence: dict[str, Any] = {"version": ExecutionRequest.version + 1}
+    else:
+        eligible = (
+            _unconfirmed_settle_teardown()
+            if settled_teardown
+            else ExecutionRequest.status == "cancellation_requested"
+        )
+        # A renewal by the live owner keeps the epoch its running turn holds.
+        fence = {} if live_owner else {"runtime_epoch": ExecutionRequest.runtime_epoch + 1}
     settings = get_settings()
     changed_id = await session.scalar(
         update(ExecutionRequest)
-        .where(
-            ExecutionRequest.id == request.id,
-            _unconfirmed_settle_teardown()
-            if settled_teardown
-            else ExecutionRequest.status == "cancellation_requested",
-        )
+        .where(ExecutionRequest.id == request.id, eligible)
         .values(
             runtime_owner=owner,
-            runtime_epoch=ExecutionRequest.runtime_epoch + 1,
             runtime_heartbeat_expires_at=func.clock_timestamp()
             + timedelta(seconds=settings.work_item_runtime_ttl_seconds),
             updated_at=func.clock_timestamp(),
+            **fence,
         )
         .returning(ExecutionRequest.id)
     )
     if changed_id is None:
-        if settled_teardown:
+        if settled_teardown or terminal_teardown:
             # A newer request on the thread owns the sandbox lifecycle.
             return await _refuse(
                 session,
@@ -1887,7 +1992,7 @@ async def claim_termination(
             )
         return await _refuse(session, "duplicate", request_id=request.id)
     request = await reload_request(session, request.id)
-    claimed = TerminationClaim(runtime_epoch=request.runtime_epoch)
+    claimed = TerminationClaim(runtime_epoch=request.runtime_epoch, request_version=request.version)
     await session.commit()
     return claimed
 
@@ -1897,8 +2002,18 @@ async def record_termination(
     request_id: uuid.UUID,
     *,
     runtime_epoch: int,
+    expected_request_version: int,
     observation: str,
 ) -> WorkItemOutcome | DispatchConflict:
+    """Record a claimed termination's observation.
+
+    The epoch and request version are the ones the claim returned: another
+    epoch is ``stale_owner``, another version ``stale_version`` (a later claim
+    or write superseded this one), and a blank observation
+    ``termination_observation_required``. A terminal request keeps its
+    status, cause and ``terminal_at`` (#5377).
+    """
+
     locked = await _lock_pair(session, request_id)
     if isinstance(locked, DispatchConflict):
         return locked
@@ -1911,13 +2026,21 @@ async def record_termination(
             request_id=request.id,
             status=request.status,
         )
+    if request.version != expected_request_version:
+        return await _refuse(
+            session,
+            "stale_version",
+            work_item_id=work_item.id,
+            request_id=request.id,
+            status=request.status,
+        )
     result = await record_runtime_termination_where(
         session,
         work_item_id=work_item.id,
         request_id=request.id,
         termination_observation=observation,
         expected_work_item_version=work_item.version,
-        expected_request_version=request.version,
+        expected_request_version=expected_request_version,
         extra_where=(ExecutionRequest.runtime_epoch == runtime_epoch,),
     )
     if isinstance(result, WorkItemConflict):
@@ -2067,15 +2190,20 @@ async def claim_terminate_publishes(
                 and_(
                     ExecutionRequest.status == "cancellation_requested",
                     or_(
-                        # An issue cancellation stops a live runtime too.
-                        ExecutionRequest.terminal_cause.in_(("issue_cancelled", "issue_deleted")),
+                        # An issue cancellation or an enrollment fence stops a
+                        # live runtime too.
+                        ExecutionRequest.terminal_cause.in_(
+                            ("issue_cancelled", "issue_deleted", "enrollment_fenced")
+                        ),
                         ExecutionRequest.runtime_owner.is_(None),
                         ExecutionRequest.runtime_heartbeat_expires_at.is_(None),
                         ExecutionRequest.runtime_heartbeat_expires_at <= func.clock_timestamp(),
                     ),
                 ),
-                # A forced settle still owes the sandbox a teardown.
+                # A forced settle still owes the sandbox a teardown, and so
+                # does a terminal request an enrollment fence marked.
                 _unconfirmed_settle_teardown(),
+                _unconfirmed_terminal_teardown(),
             ),
             or_(
                 ExecutionRequest.terminate_published_at.is_(None),

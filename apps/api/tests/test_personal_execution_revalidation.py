@@ -36,10 +36,17 @@ import pytest
 from curie_api import workitem_dispatch
 from curie_api.config import get_settings
 from curie_api.main import create_app
-from curie_api.workitem_dispatch import HeartbeatResult, TerminatePublish
+from curie_api.workitem_dispatch import (
+    AcquireGrant,
+    DeferResult,
+    DispatchConflict,
+    HeartbeatResult,
+    TerminatePublish,
+)
 from curie_api.workitems import lifecycle
 from curie_api.workitems.lifecycle import WorkItemOutcome
 from fastapi.testclient import TestClient
+from forge_fakes import factory_wake, no_external_calls
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
 
@@ -889,3 +896,96 @@ def test_concurrent_revalidations_with_identical_versions_bind_exactly_once(
         "version": fresh["work_item_version"] + 1,
         "enrollment_generation": next_generation,
     }
+
+
+# --- #5378: a start refused for a moved enrollment is rebindable -------------------------
+
+
+def _acquire_as_worker(request_id: UUID) -> tuple[int, Any]:
+    async def body(session: AsyncSession) -> tuple[int, Any]:
+        generation = await session.scalar(
+            text("SELECT dispatch_generation FROM curie.execution_requests WHERE id = :id"),
+            {"id": request_id},
+        )
+        assert isinstance(generation, int), request_id
+        async with no_external_calls() as http_client:
+            acquired = await workitem_dispatch.acquire(
+                session,
+                request_id,
+                owner=support.RUNTIME_OWNER,
+                generation=generation,
+                wake=await factory_wake(session, request_id),
+                context=None,
+                client=http_client,
+            )
+        assert isinstance(acquired, AcquireGrant), acquired
+        return generation, acquired.context
+
+    return support.with_session(body)
+
+
+def test_a_start_refused_for_a_moved_enrollment_rebinds_after_its_defer_and_starts_fresh(
+    api: TestClient, world: support.World
+) -> None:
+    agent_id = support.insert_agent(world.tenant_id)
+    first = support.admit_personal(api, WORKER_HEADERS, world, agent_id, issue_number=53792)
+    generation, context = _acquire_as_worker(first.request_id)
+    # The owner replaces the subscription after the worker claimed a runtime.
+    new_generation, _ = support.advance_enrollment(world)
+
+    refused = support.with_session(
+        lambda session: workitem_dispatch.start(
+            session,
+            first.request_id,
+            owner=support.RUNTIME_OWNER,
+            generation=generation,
+            claim_name=support.CLAIM_NAME,
+            sandbox_name=support.SANDBOX_NAME,
+            context=context,
+        )
+    )
+    assert isinstance(refused, DispatchConflict), refused
+    assert refused.code == "enrollment_generation_mismatch"
+
+    # While the worker still holds the acquire, nothing rebinds the request.
+    held = _read(api, world, agent_id, first.work_item_id)
+    assert (held["request"]["id"], held["request"]["status"]) == (str(first.request_id), "waiting")
+    _assert_conflict(
+        _revalidate(api, first.work_item_id, _body(world, agent_id, held)), "runtime_live"
+    )
+
+    # The worker releases its claim and defers: still waiting, not terminal.
+    deferred = support.with_session(
+        lambda session: workitem_dispatch.defer(
+            session,
+            first.request_id,
+            owner=support.RUNTIME_OWNER,
+            generation=generation,
+            reason="not_started:enrollment_generation_mismatch",
+            capacity=False,
+            start_failure_detail=None,
+        )
+    )
+    assert isinstance(deferred, DeferResult), deferred
+    assert deferred.terminal_cause is None
+    assert support.request_column(first.request_id, "status") == "waiting"
+
+    current = _read(api, world, agent_id, first.work_item_id)
+    bound = _revalidate(api, first.work_item_id, _body(world, agent_id, current))
+    assert bound.status_code == 200, bound.text
+    assert bound.json()["enrollment_generation"] == new_generation
+    support.assert_owner_tuples(
+        first.work_item_id,
+        work_item=world.personal(new_generation),
+        requests={first.request_id: world.personal(new_generation)},
+    )
+
+    # The next dispatch starts a fresh runtime at the rebound generation, once
+    # the defer's backoff (a NOT NULL ``dispatch_not_before``) has passed.
+    support.rows(
+        "UPDATE curie.execution_requests SET dispatch_not_before = clock_timestamp() "
+        "WHERE id = :id",
+        {"id": first.request_id},
+    )
+    assert support.start_request(first.request_id) >= 1
+    assert support.request_column(first.request_id, "status") == "running"

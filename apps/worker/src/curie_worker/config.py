@@ -325,6 +325,21 @@ class WorkerConfig(BaseSettings):
         StaticConnectorEndpoints | None, NoDecode, BeforeValidator(parse_endpoint_json)
     ] = Field(default=None, validation_alias="CURIE_CONNECTOR_ENDPOINTS")
     sandbox_substrate: str = Field(default="kubernetes", validation_alias="CURIE_SANDBOX_SUBSTRATE")
+    # The dedicated namespace holding personal Claude custody Secrets (#5377,
+    # ADR 0268), rendered from the chart's personalClaude.grantNamespace. Empty
+    # means personal custody is unconfigured: every personal grant read is
+    # refused authentication-required, never answered with a service credential.
+    personal_grant_namespace: str = Field(
+        default="", validation_alias="CURIE_PERSONAL_GRANT_NAMESPACE"
+    )
+    # The installation's model auth mode (#5378, ADR 0268), the same
+    # FACTORY_MODEL_AUTH_MODE the API reads. A WorkItem execution takes its mode
+    # from its ExecutionRequest, never from here; this decides only lanes with
+    # no owner (plain runs, cron, evals), which a personal installation refuses
+    # personal_owner_required, and that personal mode needs Kubernetes.
+    factory_model_auth_mode: Literal["service", "personal"] = Field(
+        default="service", validation_alias="FACTORY_MODEL_AUTH_MODE"
+    )
 
     # The Ed25519 seed that signs each sandbox's connector caller token
     # (ADR-0168 decision 7), standard base64. Empty mints no token. The chart

@@ -646,6 +646,17 @@ jobs:
           set -euo pipefail
           bash charts/curie/ci/connector-reconciler-rbac-assertions.sh
 
+      # Prove personal Claude enrollment custody RBAC (#5377): nothing renders
+      # while `personalClaude.grantNamespace` is empty; when set, the API Role
+      # (secrets create/get/list/delete) and worker Role (secrets get) live in
+      # the grant namespace bound to this release's ServiceAccounts, both
+      # Deployments carry the env, and a value equal to the release namespace
+      # fails the render.
+      - name: helm render assertions (personal grant custody RBAC)
+        run: |
+          set -euo pipefail
+          bash charts/curie/ci/personal-grant-custody-rbac-assertions.sh
+
       # Prove the action executor switch (ACTION-EXECUTOR-1, -12, -14): one
       # value renders CURIE_ACTION_EXECUTOR_ENABLED identically into the API and
       # the worker, default off, and the worker Role gains only a single-object
