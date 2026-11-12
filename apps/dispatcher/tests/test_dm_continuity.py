@@ -260,6 +260,23 @@ def _assert_header(header: str) -> None:
     assert _denies(lowered, "instructions")
     assert _denies(lowered, "authorization")
     assert "follows" in lowered
+    # The quoted messages came before this thread. Without saying so, a later
+    # reply that asks about "the start of this thread" can resolve to the
+    # first quoted message instead of the person's new one (#5570).
+    assert "before this thread" in lowered
+    assert "not part of this thread" in lowered
+
+
+def _assert_starts_thread(after: str, current: str) -> None:
+    """Outside the block, a label names the new message as this thread's start."""
+
+    label, sep, message = after.lstrip("\n").partition("\n")
+    assert sep == "\n"
+    assert "/" not in label
+    lowered = label.lower()
+    assert "new message" in lowered
+    assert "starts this thread" in lowered
+    assert message == current
 
 
 def _assert_quoted(text: str, *, current: str) -> None:
@@ -277,6 +294,7 @@ def _assert_quoted(text: str, *, current: str) -> None:
     assert "<note>" not in text
     assert text.rindex(current) > text.index("</prior_dm_turns>")
     assert current in after
+    _assert_starts_thread(after, current)
 
 
 def _slack_message(
@@ -549,6 +567,33 @@ def _assert_quoted_roles(rendered: str, person_text: str) -> None:
     assert rendered.rstrip().endswith(CURRENT_TEXT)
     assert CURRENT_TEXT not in block
     assert CURRENT_TEXT in after
+    _assert_starts_thread(after, CURRENT_TEXT)
+
+
+def test_similar_quoted_content_stays_before_the_thread_start() -> None:
+    """Quoted DMs that look like a thread opener stay labeled as earlier ones.
+
+    The quoted block may hold earlier messages much like the new one. The
+    rendered turn must still say which message starts this thread, outside the
+    block, and keep the quoted ones marked as coming before it.
+    """
+
+    earlier = "the codeword for this thread is alpha"
+    current = "the codeword for this thread is bravo"
+    rendered = render_dm_continuity(
+        [("person", earlier), ("agent", "noted: alpha")],
+        current,
+    )
+    header, _, rest = rendered.partition("<prior_dm_turns>")
+    block, _, after = rest.partition("</prior_dm_turns>")
+    _assert_header(header)
+    assert earlier in block and earlier not in header and earlier not in after
+    assert current not in header and current not in block
+    _assert_starts_thread(after, current)
+    # A multi-line new message is carried whole after the label, unescaped.
+    multi = "line one\nline <two> a/b"
+    _h, _, tail = render_dm_continuity([("person", earlier)], multi).partition("</prior_dm_turns>")
+    _assert_starts_thread(tail, multi)
 
 
 def _assert_int_bound(value: object, expected: int) -> None:
