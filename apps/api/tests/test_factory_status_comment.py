@@ -2673,6 +2673,11 @@ def test_port_lineage_state_refinalizes_unchanged_completed_comments_idempotentl
     assert _request(55836)["status"] == "completed"
     assert before["finalized_at"] is not None
     assert before["applied_label"] == "curie-factory:pr-open"
+    digest = _rows(
+        "SELECT rendered_digest FROM curie.factory_terminal_notices "
+        "WHERE execution_request_id = :id",
+        {"id": request_id},
+    )[0]["rendered_digest"]
     writes = jira.writes
 
     _observe_lineage_state(client, work_item_id, state)
@@ -2681,10 +2686,17 @@ def test_port_lineage_state_refinalizes_unchanged_completed_comments_idempotentl
 
     after = _notices(request_id)[0]
     assert after["finalized_at"] is not None
-    assert after["rendered_digest"] == before["rendered_digest"]
+    assert (
+        _rows(
+            "SELECT rendered_digest FROM curie.factory_terminal_notices "
+            "WHERE execution_request_id = :id",
+            {"id": request_id},
+        )[0]["rendered_digest"]
+        == digest
+    )
     assert after["comment_id"] == before["comment_id"]
     assert jira.writes == writes
-    assert linked == [request_id]
+    assert len(jira.issue(ticket.id).remote_links) == 1
     assert "curie-factory:pr-open" in jira.issue(ticket.id).labels
     _reconcile()
     repeated = _notices(request_id)[0]
