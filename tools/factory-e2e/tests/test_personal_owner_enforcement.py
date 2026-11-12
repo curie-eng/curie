@@ -1610,3 +1610,21 @@ def test_a_terminating_pod_keeps_its_observed_personal_claim_provenance() -> Non
     assert poe.fallback_runtimes(
         {"deleted": {}}, {"pod": "deleted"}, observed_claims=seen, labels=keys, owner=owner
     ) == ["claim/deleted", "pod/pod"]
+
+
+@pytest.mark.parametrize("paid", [False, True])
+def test_a_failed_live_criterion_stops_before_a_later_session(tmp_path: Path, paid: bool) -> None:
+    from types import SimpleNamespace
+
+    proof = _proof()
+    ledger = _live_ledger(tmp_path)
+    proof.ctx, proof.paid = SimpleNamespace(ledger=ledger), paid
+    proof.observe("selection", "claim.label.owner_tenant_matches", True)
+    if paid:
+        with pytest.raises(poe.StepFailed, match="selection.claim.label.owner_tenant_matches"):
+            proof.observe("selection", "claim.label.owner_tenant_matches", False)
+    else:
+        proof.observe("selection", "claim.label.owner_tenant_matches", False)
+    assert ledger.observations("selection")["claim.label.owner_tenant_matches"] is False
+    proof.observe("restart", "pod.workspace_nonce_restored", False)
+    proof.observe("restart", "informational", "recorded")

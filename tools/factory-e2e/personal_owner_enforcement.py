@@ -1006,6 +1006,14 @@ def owner_proof_class(e: Any) -> type[Any]:  # noqa: C901 - one scenario, one cl
 
         def observe(self, criterion: str, key: str, observed: Any) -> None:
             self.ctx.ledger.record(criterion, key, observed, time.time())
+            expected = poe.EXPECTED.get(criterion, {})
+            if (
+                self.paid
+                and key in expected
+                and observed != expected[key]
+                and (criterion, key) not in poe.NOT_MET
+            ):
+                raise poe.StepFailed(f"criterion failed: {criterion}.{key}")
 
         def say(self, message: str) -> None:
             self.ctx.rt.out.progress(message)
