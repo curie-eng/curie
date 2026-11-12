@@ -4304,6 +4304,7 @@ def combined_usage(parts: Sequence[poe.SessionUsage]) -> poe.SessionUsage:
 
 
 PROOF_ONLY_PATHS = {
+    "cli/tests/local/test_personal_mode_refusal.py",
     "tools/factory-e2e/personal_owner_enforcement.py",
     "tools/factory-e2e/personal_owner_enforcement_support.py",
     "tools/factory-e2e/tests/test_personal_owner_enforcement.py",

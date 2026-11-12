@@ -23,7 +23,6 @@ ROOT = Path(__file__).resolve().parents[3]
 PERSONAL_VARS = ("CURIE_MODEL_AUTH_MODE", "FACTORY_MODEL_AUTH_MODE")
 CODE = "personal_mode_requires_kubernetes"
 MANAGED_LABEL = "label=curietech.ai/managed-by=curie-cli"
-RUNNER_IMAGE = "curie-runner"
 SNAPSHOT_OWNER = "curietech.ai/snapshot-owner"
 
 
@@ -176,9 +175,12 @@ def trial(tmp_path: Path, request: pytest.FixtureRequest) -> Trial:
 
 @pytest.fixture
 def runner_image(trial: Trial) -> str:
-    if not _docker("image", "ls", "-q", RUNNER_IMAGE).strip():
-        raise RuntimeError(f"The {RUNNER_IMAGE} image is absent on the engine; run `curie build`")
-    return RUNNER_IMAGE
+    image = os.environ.get("CURIE_TEST_RUNNER_IMAGE", "")
+    if not image:
+        raise RuntimeError("CURIE_TEST_RUNNER_IMAGE must name a caller-owned candidate image")
+    if not _docker("image", "ls", "-q", image).strip():
+        raise RuntimeError("The caller-owned candidate runner image is absent")
+    return image
 
 
 def _commands(trial: Trial) -> dict[str, list[str]]:
@@ -223,6 +225,8 @@ def test_a_non_personal_value_still_starts_the_runner_and_down_removes_it(
 ) -> None:
     result = trial.run(
         *_commands(trial)["skill-up"],
+        "--image",
+        runner_image,
         "--json",
         CURIE_MODEL_AUTH_MODE="service",
         FACTORY_MODEL_AUTH_MODE="",
