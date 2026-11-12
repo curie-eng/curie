@@ -1745,6 +1745,7 @@ def _build_factory_steering(
         api_base_url=config.api_base_url,
         worker_token=config.internal_worker_token or None,
         client=client,
+        intent_key=config.steering_sent_key,
     )
 
 

@@ -190,6 +190,23 @@ def slack_evidence(body: dict[str, Any]) -> dict[str, Any] | None:
     return evidence
 
 
+def driver_evidence(body: dict[str, Any], bot_user_id: str) -> dict[str, Any] | None:
+    """The sender evidence of a declared ADR 0202 driver's event in ``body`` (#5380).
+
+    ``slack_evidence`` of a copy of ``body`` whose event ``user`` is the
+    declared ``bot_user_id``, so the evidence names the operator-declared bot
+    user and never what the event says its user is. Every other field is
+    copied exactly as ``slack_evidence`` copies it. None when ``body`` carries
+    no event or ``bot_user_id`` is blank. The caller has already matched the
+    event's ``bot_id`` to the declaration.
+    """
+
+    event = body.get("event")
+    if not isinstance(event, dict):
+        return None
+    return slack_evidence({**body, "event": {**event, "user": bot_user_id}})
+
+
 class IdentityResolveClient:
     """Thin client for the API's ``POST /identity/resolve``."""
 

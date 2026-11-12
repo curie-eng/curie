@@ -5,7 +5,10 @@ The worker hands over a threaded ``app_mention`` whose root it found in
 module decides, in order, and refuses with a named outcome at the first check
 that fails:
 
-1. The receipt names the same delivery, route and sender as the turn.
+1. The receipt names the same delivery, route and sender as the turn, and
+   is a person's version 1 receipt for a thread reply: a root mention's
+   receipt and a declared test driver's version 2 receipt, which kickoff
+   reads (#5380), never steer.
 2. The root is a factory run's root.
 3. The sender resolves to an active principal in the receiving channel
    identity (`identity.service.resolve_principal`).
@@ -184,6 +187,10 @@ def _receipt(data: FactorySlackSteerIn) -> tuple[SlackMentionReceipt, SlackEvide
         or receipt.user_id != data.author
         or evidence.user_id != receipt.user_id
     ):
+        return None
+    # Cross-consumer controls (#5380): kickoff also reads root and declared
+    # driver receipts; steering judges a person's thread reply only.
+    if receipt.version != 1 or receipt.message_ts == receipt.root_ts:
         return None
     return receipt, evidence
 

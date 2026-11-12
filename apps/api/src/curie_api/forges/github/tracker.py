@@ -107,6 +107,16 @@ class IssueFacts:
     default_branch: str | None
 
 
+@dataclass(frozen=True)
+class IssueState:
+    """One issue as GitHub answers it now (#5380): its state, its label names,
+    and whether the number is a pull request's."""
+
+    state: str | None
+    labels: frozenset[str]
+    pull_request: bool
+
+
 def last_label_event(events: list[Any], label: str) -> dict[str, Any] | None:
     """The newest ``labeled`` event for this label, or None."""
 
@@ -859,6 +869,33 @@ class GitHubTracker:
         body = comment.get("body")
         if not isinstance(body, str) or not mentions_login(body, self.mention):
             raise FactoryRefused("ordinary_comment")
+
+    async def issue_state(self, number: int) -> IssueState:
+        """The issue's state and labels now, and whether it is a pull request (#5380).
+
+        https://docs.github.com/en/rest/issues/issues#get-an-issue: every pull
+        request is also an issue, and its issue payload carries a
+        ``pull_request`` key. A 404 is `NotFound`, which no retry changes; any
+        other failure, or a payload that does not name this issue or lists
+        malformed labels, is `Unavailable`.
+        """
+
+        issue = await self._get(f"{self._repo_path}/issues/{number}")
+        if (
+            not isinstance(issue, dict)
+            or type(issue.get("number")) is not int
+            or issue["number"] != number
+        ):
+            raise Unavailable("issue")
+        names = label_names(issue)
+        if names is None:
+            raise Unavailable("issue")
+        state = issue.get("state")
+        return IssueState(
+            state=state if isinstance(state, str) else None,
+            labels=frozenset(names),
+            pull_request="pull_request" in issue,
+        )
 
     async def issue_events(self, number: int) -> list[Any]:
         """Every event on one issue, in GitHub's order, or `Unavailable`."""

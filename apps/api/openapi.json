@@ -8035,6 +8035,153 @@
         "title": "FactoryContext",
         "type": "object"
       },
+      "FactorySlackKickoffIn": {
+        "additionalProperties": false,
+        "description": "One Slack mention linking an issue, at a channel root or in a thread no\nfactory run owns, as the worker consumed it.\n\n``receipt`` is the dispatcher's verified mention receipt\n(``curie_internal.slack_mention_receipt.SlackMentionReceipt``, version 1\nfor a person, 2 for a declared test driver), validated by the route so a\nmalformed one is a refusal, not a retry. ``root_ts`` is the thread's ts, or\nthe message's own at root. ``author`` is the turn's Slack user id; the\nreceipt must name the same delivery, route and sender.",
+        "properties": {
+          "author": {
+            "maxLength": 64,
+            "minLength": 1,
+            "title": "Author",
+            "type": "string"
+          },
+          "channel": {
+            "maxLength": 64,
+            "minLength": 1,
+            "title": "Channel",
+            "type": "string"
+          },
+          "channel_identity": {
+            "maxLength": 256,
+            "minLength": 1,
+            "title": "Channel Identity",
+            "type": "string"
+          },
+          "delivery_id": {
+            "maxLength": 256,
+            "minLength": 1,
+            "title": "Delivery Id",
+            "type": "string"
+          },
+          "receipt": {
+            "additionalProperties": true,
+            "title": "Receipt",
+            "type": "object"
+          },
+          "root_ts": {
+            "maxLength": 64,
+            "minLength": 1,
+            "title": "Root Ts",
+            "type": "string"
+          }
+        },
+        "required": [
+          "delivery_id",
+          "channel_identity",
+          "channel",
+          "root_ts",
+          "author",
+          "receipt"
+        ],
+        "title": "FactorySlackKickoffIn",
+        "type": "object"
+      },
+      "FactorySlackKickoffOut": {
+        "description": "The kickoff decision. ``reason`` is the resolver's reason for\n``sender_unverified``, the base refusal code for ``base_refused`` and the\nadmission refusal code for ``admission_refused``.",
+        "properties": {
+          "issue_url": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Issue Url"
+          },
+          "outcome": {
+            "enum": [
+              "admitted",
+              "not_factory",
+              "receipt_mismatch",
+              "test_driver_refused",
+              "binding_missing",
+              "binding_ambiguous",
+              "link_missing",
+              "link_multiple",
+              "link_malformed",
+              "link_host_unsupported",
+              "link_pull_request",
+              "sender_unverified",
+              "enrollment_inactive",
+              "issue_inaccessible",
+              "issue_closed",
+              "publication_exists",
+              "base_refused",
+              "thread_conflict",
+              "authority_changed",
+              "admission_refused"
+            ],
+            "title": "Outcome",
+            "type": "string"
+          },
+          "reason": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Reason"
+          },
+          "replayed": {
+            "default": false,
+            "title": "Replayed",
+            "type": "boolean"
+          },
+          "request_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Request Id"
+          },
+          "request_status": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Request Status"
+          },
+          "work_item_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Work Item Id"
+          }
+        },
+        "required": [
+          "outcome"
+        ],
+        "title": "FactorySlackKickoffOut",
+        "type": "object"
+      },
       "FactorySlackSteerIn": {
         "additionalProperties": false,
         "description": "One threaded Slack mention in a factory run's root, as the worker consumed it.\n\n``receipt`` is the dispatcher's verified mention receipt\n(``curie_internal.slack_mention_receipt.SlackMentionReceipt``), validated by\nthe route so a malformed one is a refusal, not a retry. ``author`` is the\nturn's Slack user id; the receipt must name the same delivery, route and\nsender.",
@@ -32713,6 +32860,66 @@
         "summary": "Append Cluster Message Reply",
         "tags": [
           "internal-cluster-message-replies"
+        ]
+      }
+    },
+    "/v1/internal/factory-slack/kickoff": {
+      "post": {
+        "description": "Admit a personal factory run for the one issue a mention links, or name why not.\n\n``not_factory`` sends the mention down the ordinary path; every other\nrefusal is final for the delivery. Both answer 200. A code host that\ncannot answer now is 503, so the worker keeps the delivery pending, and so\nis a database failure, raised without its exception chain: the driver's\nerror may carry bound parameters that hold the Slack body.",
+        "operationId": "kickoff_factory_run_v1_internal_factory_slack_kickoff_post",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "X-Curie-Worker-Token",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Curie-Worker-Token"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/FactorySlackKickoffIn"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/FactorySlackKickoffOut"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Kickoff Factory Run",
+        "tags": [
+          "internal-factory-slack"
         ]
       }
     },

@@ -3406,6 +3406,32 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/v1/internal/factory-slack/kickoff": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Kickoff Factory Run
+         * @description Admit a personal factory run for the one issue a mention links, or name why not.
+         *
+         *     ``not_factory`` sends the mention down the ordinary path; every other
+         *     refusal is final for the delivery. Both answer 200. A code host that
+         *     cannot answer now is 503, so the worker keeps the delivery pending, and so
+         *     is a database failure, raised without its exception chain: the driver's
+         *     error may carry bound parameters that hold the Slack body.
+         */
+        post: operations["kickoff_factory_run_v1_internal_factory_slack_kickoff_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/v1/internal/factory-slack/steer": {
         parameters: {
             query?: never;
@@ -7953,6 +7979,62 @@ export interface components {
              * Format: uuid
              */
             tenant_id: string;
+        };
+        /**
+         * FactorySlackKickoffIn
+         * @description One Slack mention linking an issue, at a channel root or in a thread no
+         *     factory run owns, as the worker consumed it.
+         *
+         *     ``receipt`` is the dispatcher's verified mention receipt
+         *     (``curie_internal.slack_mention_receipt.SlackMentionReceipt``, version 1
+         *     for a person, 2 for a declared test driver), validated by the route so a
+         *     malformed one is a refusal, not a retry. ``root_ts`` is the thread's ts, or
+         *     the message's own at root. ``author`` is the turn's Slack user id; the
+         *     receipt must name the same delivery, route and sender.
+         */
+        FactorySlackKickoffIn: {
+            /** Author */
+            author: string;
+            /** Channel */
+            channel: string;
+            /** Channel Identity */
+            channel_identity: string;
+            /** Delivery Id */
+            delivery_id: string;
+            /** Receipt */
+            receipt: {
+                [key: string]: unknown;
+            };
+            /** Root Ts */
+            root_ts: string;
+        };
+        /**
+         * FactorySlackKickoffOut
+         * @description The kickoff decision. ``reason`` is the resolver's reason for
+         *     ``sender_unverified``, the base refusal code for ``base_refused`` and the
+         *     admission refusal code for ``admission_refused``.
+         */
+        FactorySlackKickoffOut: {
+            /** Issue Url */
+            issue_url?: string | null;
+            /**
+             * Outcome
+             * @enum {string}
+             */
+            outcome: "admitted" | "not_factory" | "receipt_mismatch" | "test_driver_refused" | "binding_missing" | "binding_ambiguous" | "link_missing" | "link_multiple" | "link_malformed" | "link_host_unsupported" | "link_pull_request" | "sender_unverified" | "enrollment_inactive" | "issue_inaccessible" | "issue_closed" | "publication_exists" | "base_refused" | "thread_conflict" | "authority_changed" | "admission_refused";
+            /** Reason */
+            reason?: string | null;
+            /**
+             * Replayed
+             * @default false
+             */
+            replayed?: boolean;
+            /** Request Id */
+            request_id?: string | null;
+            /** Request Status */
+            request_status?: string | null;
+            /** Work Item Id */
+            work_item_id?: string | null;
         };
         /**
          * FactorySlackSteerIn
@@ -19827,6 +19909,41 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["ClusterMessageReplyAck"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    kickoff_factory_run_v1_internal_factory_slack_kickoff_post: {
+        parameters: {
+            query?: never;
+            header?: {
+                "X-Curie-Worker-Token"?: string | null;
+            };
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["FactorySlackKickoffIn"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["FactorySlackKickoffOut"];
                 };
             };
             /** @description Validation Error */

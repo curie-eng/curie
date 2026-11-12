@@ -1,26 +1,38 @@
-"""Durable factory run progress in one Slack root per WorkItem (#5414).
-
-An agent with ``factory_slack_channel`` set posts each factory run's progress
-to that channel, as the agent's one Slack binding for that channel (exactly one
-``agent_channels`` row of kind ``slack`` with that address and an adapter; the
-adapter names the posting identity). Nothing posts for an agent without a
-destination or whose destination has no single bound identity.
-
-A WorkItem's thread stays in the channel its root was posted to, as the
-identity that posted it, for as long as the agent has any destination and
-that channel still holds that one binding: changing the destination moves
-only WorkItems discovered afterwards, and clearing it stops every thread.
+"""Durable factory run progress in one Slack root per WorkItem (#5414, #5380).
 
 ``factory_slack_threads`` binds a WorkItem to its Slack root for the WorkItem's
-whole life, across revisions. ``factory_slack_posts`` is the owed outbox, with
-the lease discipline of ``remediation_receipts``. Each pass first materializes
-what is owed from existing records, with no lifecycle hook:
+whole life, across revisions. Its ``origin`` says how the root came to be:
 
-1. a thread and its root post for a WorkItem with an eligible request. A
-   request is eligible when it was live at or after ``factory_slack_since``
-   (created then or later, still open, or ended then or later).
-   ``first_sequence`` is the smallest eligible sequence, set once here and
-   never advanced;
+1. ``configured``: an agent with ``factory_slack_channel`` set posts each
+   factory run's progress to that channel, as the agent's one Slack binding
+   for that channel (exactly one ``agent_channels`` row of kind ``slack`` with
+   that address and an adapter; the adapter names the posting identity).
+   Discovery below inserts such a thread unrooted and owes its root post.
+   Nothing is discovered for an agent without a destination or whose
+   destination has no single bound identity. The thread stays in the channel
+   its root was posted to for as long as the agent has any destination:
+   changing the destination moves only WorkItems discovered afterwards, and
+   clearing it stops every configured thread.
+2. ``kickoff``: the API's Slack kickoff route inserts the thread already
+   rooted at the message that started the run, so no root post is ever owed
+   and discovery skips the WorkItem. It needs no destination: clearing,
+   setting or changing ``factory_slack_channel`` neither stops nor moves it.
+
+Origin is stored, never inferred from ``root_ts``. For both origins a thread
+is delivered only while its channel still holds exactly one adapter-bearing
+Slack binding of the agent and that binding names the thread's identity; a
+removed or changed binding leaves its posts owed and unsent until it is
+restored.
+
+``factory_slack_posts`` is the owed outbox, with the lease discipline of
+``remediation_receipts``. Each pass first materializes what is owed from
+existing records, with no lifecycle hook:
+
+1. a configured thread and its root post for a WorkItem with an eligible
+   request. A request is eligible when it was live at or after
+   ``factory_slack_since`` (created then or later, still open, or ended then or
+   later). ``first_sequence`` is the smallest eligible sequence, set once here
+   and never advanced (a kickoff thread's is its kickoff request's);
 2. one ``phase`` post per phase report of a request at or after
    ``first_sequence`` that has no ``phase:<report id>`` post yet. Eligibility
    is the request's sequence only, never a report id floor: CI check writers
@@ -176,16 +188,17 @@ class PostgresFactorySlackStore:
     async def materialize(self) -> None:
         """Record every post now owed, once; repeated passes add nothing new."""
 
-        # The destination is live for a thread while its agent still names the
-        # thread's channel and exactly one Slack binding there names an adapter.
+        # Discovery roots a configured thread in the agent's destination while
+        # exactly one Slack binding there names an adapter. A kickoff thread is
+        # inserted rooted by the API, so the NOT EXISTS below skips it.
         discover = text(
             f"""
             WITH discovered AS (
                 INSERT INTO {self._threads} AS t
                        (work_item_id, agent_id, channel_identity, channel,
-                        root_ts, first_sequence)
+                        root_ts, first_sequence, origin)
                 SELECT w.id, w.agent_id, b.adapters[1], a.factory_slack_channel,
-                       NULL, e.first_sequence
+                       NULL, e.first_sequence, 'configured'
                   FROM {self._work_items} w
                   JOIN {self._agents} a ON a.id = w.agent_id
                   CROSS JOIN LATERAL (
@@ -227,11 +240,13 @@ class PostgresFactorySlackStore:
             ON CONFLICT (work_item_id, post_key) DO NOTHING
             """
         )
+        # A configured thread is live while its agent has any destination; a
+        # kickoff thread needs none.
         live_threads = f"""
             SELECT t.work_item_id, t.first_sequence
               FROM {self._threads} t
-              JOIN {self._agents} a
-                ON a.id = t.agent_id AND a.factory_slack_channel IS NOT NULL
+              JOIN {self._agents} a ON a.id = t.agent_id
+             WHERE t.origin = 'kickoff' OR a.factory_slack_channel IS NOT NULL
         """
         # Every report of an eligible request without its post, on every pass. The
         # anti-join keeps a pass from rewriting recorded posts; the unique post
@@ -302,9 +317,9 @@ class PostgresFactorySlackStore:
                    t.channel_identity, t.channel, t.root_ts
               FROM {self._posts} p
               JOIN {self._threads} t ON t.work_item_id = p.work_item_id
-              JOIN {self._agents} a
-                ON a.id = t.agent_id AND a.factory_slack_channel IS NOT NULL
-             WHERE p.posted_at IS NULL
+              JOIN {self._agents} a ON a.id = t.agent_id
+             WHERE (t.origin = 'kickoff' OR a.factory_slack_channel IS NOT NULL)
+               AND p.posted_at IS NULL
                AND p.failed_at IS NULL
                AND (p.lease_expires_at IS NULL OR p.lease_expires_at < now())
                AND (p.not_before IS NULL OR p.not_before <= now())

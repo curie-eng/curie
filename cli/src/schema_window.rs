@@ -771,9 +771,10 @@ print(json.dumps(graph))
         // the 0156 answer gate. The factory Slack progress loop reads the tables
         // 0157 introduces, and the code host link route writes the github_host
         // kind 0158 allows. Owner tuple reads require 0159, and personal
-        // custody reads and enrollment fences require 0160.
-        assert_eq!(candidate.schema_min, "0160");
-        assert_eq!(candidate.schema_head, "0160");
+        // custody reads and enrollment fences require 0160, and Slack kickoff
+        // thread origin reads require 0161.
+        assert_eq!(candidate.schema_min, "0161");
+        assert_eq!(candidate.schema_head, "0161");
         assert_eq!(
             candidate.schema_head.as_str(),
             catalog().revisions.last().unwrap()
@@ -822,7 +823,8 @@ print(json.dumps(graph))
         assert!(!live_in_window("0157", &current));
         assert!(!live_in_window("0158", &current));
         assert!(!live_in_window("0159", &current));
-        assert!(live_in_window("0160", &current));
+        assert!(!live_in_window("0160", &current));
+        assert!(live_in_window("0161", &current));
         assert!(!live_in_window("0075", &current));
         assert!(!live_in_window("0076", &current));
         let retained = window_for("0.12.0").expect("published foundation remains catalogued");

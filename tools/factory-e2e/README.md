@@ -831,3 +831,266 @@ that ended first appends its own record. Teardown stops the code host and
 runner forwards and the object store relay before #5377's cleanup and proves
 their ports closed; the stub's Pod, Service and ConfigMaps go with the owned
 namespace.
+
+## Personal Slack kickoff acceptance (#5380)
+
+`personal_slack_kickoff.py` is the live proof for issue #5380 acceptance
+criterion 4 and ADR 0268 row 13: a Slack mention that links one issue starts a
+personal factory run on the sender's own grant, and its progress comes back in
+the thread that started it. Everything inside the path is the candidate's own:
+no tracker label, no direct admission call, no injected progress state and no
+fake component. Its stateless helpers come from `personal_profile_support.py`
+in one import block; its own logic lives in `personal_slack_kickoff_support.py`
+and its hermetic tests in `tests/test_personal_slack_kickoff.py`.
+
+### What it proves
+
+The judge has eight criteria, each computed from recorded observations only.
+
+1. `slack`: a separate sender bot posts `<@CURIE_BOT_USER> [test action] <issue URL>`
+   at the testing channel's root with `chat.postMessage`. The candidate's
+   dispatcher receives it over Socket Mode, stores its mention receipt in
+   Valkey (read back by delivery and checked field by field) and logs the
+   enqueue for that delivery. The dispatcher's Socket Mode connection ends at
+   uninstall.
+2. `admission` and `owner`: production identity resolves the sender's bot user
+   to its linked test principal, and trusted admission records exactly one
+   personal WorkItem and one ExecutionRequest with that principal's owner tuple
+   (agent tenant, principal, current enrollment generation), the kickoff
+   request id derived from the delivery, the issue link as the objective, the
+   sender as requester and no trigger label.
+3. `grant`: the factory runs on that owner's grant. Every runner pod reads
+   `CLAUDE_CODE_OAUTH_TOKEN` from its claim's `<claim>-tokens` Secret, runs the
+   candidate runner image, and leaves native transcripts with real usage and no
+   synthetic record. Provider errors from the CLI's debug stderr must agree with
+   the terminal frame. Each role's observed model is recorded
+   (`grant.role_models`) and printed in the judge output.
+4. `progress`: every `factory_slack_posts` row for the WorkItem was delivered
+   into the kickoff thread, read back with `conversations.replies`. The thread
+   row is origin `kickoff` at the kickoff message, no root post exists, the
+   admitted reply and the terminal post are there, and the pull request post is
+   there whenever a pull request exists.
+5. `refusal`: the enrollment is disconnected through
+   `curie cluster subscription disconnect`, the run waits for teardown to
+   settle, and the same sender kicks off a second fixture issue. The reply in
+   that thread names `enrollment_inactive`, and the WorkItem, request, claim
+   and runner pod counts are unchanged, with zero new native sessions.
+
+`budget` checks the approved ceiling, the reservations and the grant probe, and
+`cleanup` checks that every owned resource is gone and no held secret reached a
+scanned channel.
+
+### Setup the run performs
+
+The run creates its namespace and `<namespace>-grants` for custody, deploys a
+Dex in the namespace, and installs the candidate chart with every image pinned
+by digest from the loopback registry. The dispatcher runs in Socket Mode with
+the test app's bot and app-level tokens from a run-owned Secret created
+through stdin. `testInstallation.enabled` is true with one driver whose
+`channel_id`, `bot_id` and `bot_user_id` come from the sender token's
+`auth.test`. The chart generates the API key, worker token and attester
+secret. The factory is on with the GitHub App as code host and tracker for the
+fixture repository only, `FACTORY_MODEL_AUTH_MODE=personal`, one worker slot
+and no warm pool. Poll intake watches an unused per-run label, so the kickoff
+is the only admission. The agent is deployed from a private copy of
+`examples/dark-factory` that adds only the reservation gate hook, gets a
+`github=<repo>` surface and publication policy `auto` with a per-run branch
+prefix, and its execution deadline and output token budget come from the
+ceiling.
+
+OIDC is split horizon. The issuer is Dex's in-cluster Service name, so the API
+pod can discover it and exchange codes server-side. The driver logs in through
+its own port-forward while presenting the issuer's authority, and dials no
+other origin. The resulting console session must be bound to a principal in
+the agent's tenant, and enrollment runs through
+`curie cluster subscription enroll --token-file` with that session.
+
+One step is setup, not part of the proved path: no API creates a Slack
+identity link, so the sender bot user's link to the test principal is seeded
+`admin_mapped` by SQL, the way #5375 seeds its principal. The ledger records it
+as `setup.slack_link_seeded_admin_mapped`.
+
+Before enrollment the sender posts `<@CURIE_BOT_USER> [test action] ping`, and
+the run waits for Curie's answer in that thread. That proves Socket Mode
+delivery and declared-driver admission without a model turn.
+
+### Inputs
+
+Every target comes from the caller. Nothing names an environment, cluster,
+host, workspace or channel.
+
+1. `--candidate`: a full 40 hex commit that exists locally. Run from a clean
+   checkout at it, under `uv run`.
+2. `--state-dir` (an existing directory you own, mode 0700) and `--run-id`. The
+   ledger is `slack-kickoff-ledger.sqlite3` in the state directory.
+3. `--context` and, optionally, `--kubeconfig`: a throwaway cluster. The
+   agent-sandbox controller is installed with the release when the cluster
+   does not already run one.
+4. `--namespace` (neither it nor `<namespace>-grants` may exist) and
+   `--release` (never `curie`). `--priority-classes PLATFORM,SANDBOX` reuses
+   existing PriorityClasses, which are cluster scoped.
+5. `--docker-context` and `--registry-port` (1024 to 32767, free). The run's
+   registry listens on 127.0.0.1 of that Docker endpoint. The caller mirrors
+   the port onto this host's loopback, and the cluster's nodes must pull
+   `localhost:<port>` from the same loopback.
+6. `--app-dir`: a private directory holding `app.json`
+   (`{"id", "installation_id", "repo"}`) and `app.pem` for a GitHub App
+   installed on an owned fixture repository with contents, pull requests and
+   issues write and checks and statuses read. Use a fixture repository with no
+   CI workflows.
+7. `--curie-bot-token-file` (`xoxb-`), `--app-token-file` (`xapp-`) and
+   `--sender-token-file` (another app's `xoxb-`), each a private mode 0600
+   file of one line, plus `--channel-file` holding `{"channel_id": "C..."}`.
+   Both bots must be members of that channel.
+8. `--isolation-file`: the maintainer's test-app isolation confirmation,
+   `{"confirmed": true, "team_id": "T...", "curie_bot_user_id": "U..."}`. It
+   must name the workspace and bot user the Curie token authenticates as. No
+   Socket Mode client connects before it is checked.
+9. `--grant-file` (a private one-line personal Claude grant) and
+   `--grant-expires-at` (ISO 8601 with an offset, or epoch seconds) with at
+   least 2,700 s remaining.
+10. `--approve-live`: the exact ceiling string below.
+11. `--grant-probe-cli` (default `claude`).
+
+The calling shell must hold no service credential and no `CURIE_FAKE_MODEL`.
+The `curie` binary is `CURIE_BIN`, or `cli/target/debug/curie` in the checkout.
+
+### Commands
+
+```bash
+uv run python3 tools/factory-e2e/personal_slack_kickoff.py images \
+  --candidate "$SHA" --state-dir "$STATE" --run-id "$IMAGES_ID" \
+  --context "$CTX" --docker-context "$DCTX" --registry-port "$PORT"
+
+uv run python3 tools/factory-e2e/personal_slack_kickoff.py slack-probe \
+  --candidate "$SHA" --state-dir "$STATE" --run-id "$PROBE_ID" \
+  --curie-bot-token-file "$CURIE_BOT" --app-token-file "$APP_TOKEN" \
+  --sender-token-file "$SENDER_BOT" --channel-file "$CHANNEL" --isolation-file "$ISOLATION"
+
+uv run python3 tools/factory-e2e/personal_slack_kickoff.py preflight \
+  --candidate "$SHA" --state-dir "$STATE" --run-id "$RUN_ID" --app-dir "$APP_DIR" \
+  --curie-bot-token-file "$CURIE_BOT" --app-token-file "$APP_TOKEN" \
+  --sender-token-file "$SENDER_BOT" --channel-file "$CHANNEL" --isolation-file "$ISOLATION" \
+  --grant-file "$GRANT_FILE" --grant-expires-at "$GRANT_EXPIRES_AT" --approve-live "$CEILING"
+
+uv run python3 tools/factory-e2e/personal_slack_kickoff.py rehearse \
+  --candidate "$SHA" --state-dir "$STATE" --run-id "$REHEARSAL_ID" \
+  --context "$CTX" --docker-context "$DCTX" --registry-port "$PORT" \
+  --namespace "$NS" --release "$RELEASE" --app-dir "$APP_DIR" \
+  --curie-bot-token-file "$CURIE_BOT" --app-token-file "$APP_TOKEN" \
+  --sender-token-file "$SENDER_BOT" --channel-file "$CHANNEL" --isolation-file "$ISOLATION"
+
+uv run python3 tools/factory-e2e/personal_slack_kickoff.py --live \
+  --candidate "$SHA" --state-dir "$STATE" --run-id "$RUN_ID" \
+  --context "$CTX" --docker-context "$DCTX" --registry-port "$PORT" \
+  --namespace "$NS" --release "$RELEASE" --app-dir "$APP_DIR" \
+  --curie-bot-token-file "$CURIE_BOT" --app-token-file "$APP_TOKEN" \
+  --sender-token-file "$SENDER_BOT" --channel-file "$CHANNEL" --isolation-file "$ISOLATION" \
+  --grant-file "$GRANT_FILE" --grant-expires-at "$GRANT_EXPIRES_AT" --approve-live "$CEILING"
+
+uv run python3 tools/factory-e2e/personal_slack_kickoff.py judge \
+  --candidate "$SHA" --state-dir "$STATE" --run-id "$RUN_ID" --criterion all
+```
+
+`images` builds the api, worker, dispatcher and runner images and the
+dark-factory runner layer at the candidate through `git archive` with the OCI
+revision label, pushes them to a per-run `registry:2.8.3`, verifies each by
+digest and revision, then removes the images and the registry. `rehearse` and
+`run` build their own images the same way and check every running pod's digest
+and revision as it appears, runner pods included. `slack-probe` checks both bot
+tokens with `auth.test`, the app-level token with `apps.connections.open` and
+channel membership, then posts one message as the sender, reads it back and
+deletes it. `preflight` is offline. `rehearse` takes no grant and no approval,
+starts no model session, enrolls a well-formed token that was never issued,
+runs the ping, the disconnected control and the paid-start fence against the
+real install, then the full finalizer; it is judged on `slack`, `refusal` and
+`cleanup`. `run` (the ticket's `--live`) adds the one paid kickoff. A run ID
+gets one live start, and a rehearsal's run ID never gets one. `judge` reads
+only the ledger and refuses a candidate that differs from the recorded one.
+Each command's result is one JSON object of codes and counts; a refusal is
+`{"error", "fix"}` and exits 2.
+
+### The live ceiling
+
+The coordinator's ruling of 2026-11-12 sets the ceiling. `--approve-live` must
+be exactly this string, or the same string with lower values:
+
+```text
+sessions=8,turns=96,session-turns=32,output-tokens=16384,session-output-tokens=8192,session-seconds=300,paid-retries=0
+```
+
+`session-turns.<role>=N` entries may follow `session-turns`, and
+`model.<role>=MODEL` entries may end the string, each sorted by role
+(`diff-reviewer`, `implementer`, `plan-reviewer`). A model entry pins nothing:
+the bundle's roles run exactly as it configures them (reviewers on
+`claude-opus-5-5`, the implementer on the bundle's model), and the entry only
+names the model the judge expects to observe for that role. The string must
+equal its own canonical rendering, `paid-retries` must be 0, and the parsed
+ceiling is recorded before the first reservation. The 32 turns per session
+follow #5540, which recorded 11 to 14 implementer turns; the 16,384 output
+token total is the spend guard.
+
+One attempt reserves four sessions: the implementer, the plan reviewer and two
+diff reviewers (one re-review round). Every implementer-role session, the
+kernel's publish continuation included, is charged to the implementer's slot,
+which takes up to half of the remaining tokens and turns; the reviewers split
+the rest. No share exceeds the per-session caps. Reservations are written to
+the ledger before the kickoff post, and a reservation is refused once the gate
+is closed, a session's usage is unknown, or the budget is exceeded. Inside the
+runner, the private bundle's reservation gate is a `PreToolUse` hook on
+`Agent` and `Task`. It claims one slot file per reviewer start with `O_EXCL`,
+so parallel hooks never share one, and refuses any other subagent type or a
+start past one plan and two diff reviews.
+
+While the attempt runs, every poll reads the native transcripts and checks,
+in this order, output tokens (in total and per slot), then turns, then
+seconds (300 s per native session, and the attempt's whole window). The runner
+caps each response at 4,096 output tokens, so the overshoot past a reached
+bound is at most the response in flight. A session without usage, or one no
+reservation covers, also ends the attempt. Ending it fences paid starts before
+anything waits: the worker Deployment is scaled to zero, the ledger gate
+closes, each runner is interrupted and its pod deleted, and only then does the
+driver wait for no ready worker and no running runner. The same fence runs in
+the finalizer whenever a live start was recorded. After the attempt settles
+and until the disconnect's teardown completes, any runner the driver did not
+follow is an unreserved paid start and fences everything. ToolSearch calls in
+the transcripts are counted and reported with the budget.
+
+### The grant probe
+
+Right before the first reservation, one turn on `claude-haiku-5-5` runs with an
+empty temporary HOME and the grant as its only credential, so a host login
+cannot answer for it. Its model, 32 token output cap and one turn cap are
+recorded under `grant_probe` before it starts, and its result after. It stays
+outside the ceiling only within those bounds: a failure (a weekly limit
+included), a second turn, another model, or unknown or more than 32 output
+tokens refuses the run with `grant_probe_refused` before any reservation.
+
+### Cleanup
+
+The finalizer registers each step before the resource it removes is created,
+runs in reverse order, runs every step, and defers further signals while it
+works. It uninstalls the release and confirms the dispatcher pods are gone,
+deletes the run's Secrets, both namespaces (after UID and label checks),
+cluster-scoped objects and volumes, closes pull requests and deletes branches
+only while their head is this run's published commit (read from
+`GET /publications/{id}`, never by prefix), closes the fixture issues, deletes
+every message in the run's threads with the token that posted it (a message by
+anyone else fails the step), and removes the registry tags, local images,
+registry container and work directory. An inventory of thirteen kinds must then
+read absent, and the GitHub installation token is revoked last. A token scan
+covers stdout, stderr, child output, HTTP bodies, the harvest, the ledger and
+the evidence.
+
+### Known limits
+
+1. The Slack identity link is seeded by SQL as setup.
+2. The registry is reachable only where the cluster's nodes share the Docker
+   endpoint's loopback.
+3. Each `rehearse` and `run` rebuilds its images; `images` alone proves the
+   build and cleans up.
+4. Socket Mode's two-release ownership handoff is not exercised; it needs a
+   real Slack retry across connections.
+5. The hermetic tests replace `kubectl`, `docker`, `helm`, `git` and `openssl`
+   with recording stubs and substitute the Slack Web API. They prove refusals,
+   ordering and the judge, not the live path.

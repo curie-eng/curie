@@ -9,6 +9,7 @@ Slack.
 
 import logging
 import uuid
+from collections.abc import Collection
 from dataclasses import dataclass, replace
 from typing import Any
 
@@ -63,7 +64,7 @@ from .github_factory_events import (
 )
 from .github_review_audit import claim_review_delivery, settle_review_delivery
 from .github_review_events import FeedbackIgnored, FeedbackUnavailable
-from .models import AgentChannel, WorkItem
+from .models import AgentChannel, FactorySlackThread, WorkItem
 from .workitem_dispatch import Admission, DispatchConflict
 from .workspace_policy import repository_is_allowed
 
@@ -278,18 +279,49 @@ def admission_result(
     return ignored(code)
 
 
-def admitting_label(registry: ForgeRegistry, item: WorkItem) -> str | None:
-    """The label whose removal cancels ``item`` (#4361 decision 10).
+async def kickoff_work_items(
+    session: AsyncSession, item_ids: Collection[uuid.UUID]
+) -> frozenset[uuid.UUID]:
+    """The WorkItems among ``item_ids`` a Slack kickoff started (#5380).
 
-    The label stored when it was admitted or last readmitted. A WorkItem with
-    no stored label predates the column, when the configured GitHub tracker
-    label was the only install label, so it compares with that alone. Never
-    consults a binding: a removed or moved surface cannot change what cancels
-    the run (ADR 0161).
+    No label admitted them (no stored trigger label) and their factory Slack
+    thread's origin is ``kickoff``. A WorkItem a label later readmitted stores
+    that label, so it is not one of them.
+    """
+
+    if not item_ids:
+        return frozenset()
+    found = await session.scalars(
+        select(WorkItem.id)
+        .join(FactorySlackThread, FactorySlackThread.work_item_id == WorkItem.id)
+        .where(
+            WorkItem.id.in_(list(item_ids)),
+            WorkItem.trigger_label.is_(None),
+            FactorySlackThread.origin == "kickoff",
+        )
+    )
+    return frozenset(found)
+
+
+def admitting_label(
+    registry: ForgeRegistry, item: WorkItem, *, kickoff_items: Collection[uuid.UUID]
+) -> str | None:
+    """The label whose removal cancels ``item`` (#4361 decision 10), or None.
+
+    The label stored when it was admitted or last readmitted. A WorkItem a
+    Slack kickoff started (one of ``kickoff_items``, from
+    `kickoff_work_items`) has none: no label removal, earlier or later,
+    cancels it, while closing its issue still does (#5380). Any other WorkItem
+    with no stored label predates the column, when the configured GitHub
+    tracker label was the only install label, so it compares with that alone.
+    Never consults a binding: a removed or moved surface cannot change what
+    cancels the run (ADR 0161).
     """
 
     if item.trigger_label is not None:
         return item.trigger_label
+    if item.id in kickoff_items:
+        return None
     tracker = registry.github_tracker()
     return None if tracker is None else tracker.config.label
 
@@ -325,7 +357,15 @@ async def _refuse_label_admission(
     bound = await bound_labels(session, registry, GITHUB_CHANNEL_KIND, notice.repo_full_name)
     refusal = label_refusal(
         label=notice.label,
-        owner_label=None if existing is None else admitting_label(registry, existing),
+        owner_label=(
+            None
+            if existing is None
+            else admitting_label(
+                registry,
+                existing,
+                kickoff_items=await kickoff_work_items(session, [existing.id]),
+            )
+        ),
         other_agent=existing is not None and existing.agent_id != binding.agent_id,
         present=sorted(label for label in bound if label in verified.labels),
     )
@@ -521,9 +561,14 @@ async def cancel_notice(
     if not _same_notice_identity(item, notice, registry):
         raise FactoryRefused("identity_mismatch")
     # Closing cancels whatever label admitted it; removing a label cancels
-    # only when it is the label that admitted it (#4361 decision 10).
-    if notice.action == "unlabeled" and notice.label != admitting_label(registry, item):
-        return ignored("label_not_admitting")
+    # only when it is the label that admitted it (#4361 decision 10). A Slack
+    # kickoff's WorkItem has no admitting label, so no removal cancels it.
+    if notice.action == "unlabeled":
+        admitting = admitting_label(
+            registry, item, kickoff_items=await kickoff_work_items(session, [item.id])
+        )
+        if admitting is None or notice.label != admitting:
+            return ignored("label_not_admitting")
     return await cancel_work_item(session, item)
 
 
