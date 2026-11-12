@@ -558,7 +558,7 @@ def test_two_agents_with_secrets_alternate_on_the_generic_shell(
                 assert not (root / "home" / "left-by-previous-claim").exists()
                 assert not (set(child.values()) & previous_secrets)
             previous_secrets = {secret}
-            (root / "home" / "left-by-previous-claim").write_text(secret)
+            (root / "home" / "left-by-previous-claim").write_text("x")
             assert substrate.release(f"thread-{index}")
             assert not root.exists()
             previous_root = root
