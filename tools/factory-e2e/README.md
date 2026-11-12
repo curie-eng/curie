@@ -535,6 +535,13 @@ miss its turn; the rehearsal judge reports the observations and their evidence l
 
 ### Sessions and reservations
 
+The disk limits are explicit caller inputs: `--disk-start-percent` (default 82)
+and `--disk-stop-percent` (default 88). During live runs the driver checks before each reservation
+and native launch and samples every 30 seconds, including during the build.
+At the stop limit it interrupts the native runtime, deletes its Pod, cancels
+owned commands and tears down. Receipts include before, peak and after disk
+percentages; the caller records the final reading after removing its registry.
+
 The approved ceiling is 8 native session attempts, 4 assistant turns per session
 and 32 in total, including publication continuation, 8,192 output tokens in
 total, 180 s per session, 1,440 s live plus 180 s cleanup, zero paid retries,

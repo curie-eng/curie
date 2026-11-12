@@ -614,6 +614,8 @@ def build_parser() -> argparse.ArgumentParser:
         sub.add_argument("--input-file", required=True)
         sub.add_argument("--state-dir", required=True)
         sub.add_argument("--run-id", required=True)
+        sub.add_argument("--disk-start-percent", type=int, default=82)
+        sub.add_argument("--disk-stop-percent", type=int, default=88)
         sub.add_argument("--grant-file", required=grant, default="")
         sub.add_argument("--grant-expires-at", required=grant, default="")
 
@@ -640,6 +642,8 @@ def flags_of(args: argparse.Namespace) -> poe.Flags:
         registry=args.registry,
         state_dir=args.state_dir,
         run_id=args.run_id,
+        disk_start_percent=args.disk_start_percent,
+        disk_stop_percent=args.disk_stop_percent,
     )
 
 
@@ -649,6 +653,8 @@ def forwarded(args: argparse.Namespace) -> list[str]:
         "candidate",
         "context",
         "namespace",
+        "disk_start_percent",
+        "disk_stop_percent",
         "docker_context",
         "registry",
         "input_file",
@@ -822,7 +828,9 @@ def spawn_child(mode: str, args: argparse.Namespace, rt: Runtime, found: Mapping
         evidence_dir=flags.state_dir / f"evidence-{flags.run_id}",
     )
     argv = [sys.executable, str(Path(__file__).resolve()), CHILD, mode, *forwarded(args)]
-    process = subprocess.Popen(argv, env=env, stdin=subprocess.DEVNULL, cwd=REPO_ROOT)
+    process = subprocess.Popen(
+        argv, env=env, stdin=subprocess.DEVNULL, cwd=REPO_ROOT, start_new_session=True
+    )
 
     def relay(signum: int, _frame: object) -> None:
         with contextlib.suppress(OSError):
@@ -964,6 +972,8 @@ def owner_proof_class(e: Any) -> type[Any]:  # noqa: C901 - one scenario, one cl
             self.watchdog: threading.Thread | None = None
             self.watchdog_stop = threading.Event()
             self.live_expired = False
+            self.disk_meter: poe.DiskMeter | None = None
+            self.disk_failure: str | None = None
             self.cleanup_budget: poe.CleanupBudget | None = None
             # The stub code host: its forward, trust bundle, App key, issues
             # and committed source; the object store relay the sandbox reads.
@@ -1093,11 +1103,30 @@ def owner_proof_class(e: Any) -> type[Any]:  # noqa: C901 - one scenario, one cl
         def build_image(self) -> None:
             port = self.ctx.flags.registry_port
             root = self.docker("info", "--format", "{{.DockerRootDir}}").stdout.decode().strip()
-            disk = self.command([*self.ssh_argv(), "df", "-P", root]).stdout.decode().splitlines()
-            e.require(
-                len(disk) >= 2 and int(disk[-1].split()[-2].rstrip("%")) <= 82,
-                "scratch Docker storage exceeds the build threshold",
+            ssh = self.ssh_argv()
+
+            def read_disk() -> int:
+                result = subprocess.run(
+                    [*ssh, "df", "-P", root],
+                    env=self.env,
+                    stdin=subprocess.DEVNULL,
+                    capture_output=True,
+                    timeout=10,
+                    check=False,
+                )
+                if result.returncode != 0:
+                    raise poe.StepFailed("disk reading is unavailable")
+                try:
+                    return int(result.stdout.decode().splitlines()[-1].split()[-2].rstrip("%"))
+                except (ValueError, IndexError):
+                    raise poe.StepFailed("disk reading is unavailable") from None
+
+            self.disk_meter = poe.DiskMeter(
+                read_disk, self.ctx.flags.disk_start_percent, self.ctx.flags.disk_stop_percent
             )
+            self.disk_meter.sample(initial=True)
+            if self.paid:
+                self.start_watchdog()
             tag = f"{self.namespace}-runner:{self.candidate[:12]}"
             published = (
                 f"127.0.0.1:{port}/{REPOSITORY}:"
@@ -2194,6 +2223,7 @@ def owner_proof_class(e: Any) -> type[Any]:  # noqa: C901 - one scenario, one cl
                     self.close_unstarted(reservation, now)
 
         def on_native_start(self, ref: str, now: float) -> None:
+            self.check_disk()
             if not self.paid or not self.pending:
                 # Its prompt is held until the driver releases it, so it has
                 # made no model call: kill it there, then fence every start.
@@ -2324,6 +2354,37 @@ def owner_proof_class(e: Any) -> type[Any]:  # noqa: C901 - one scenario, one cl
 
         # --- deadlines: the watchdog -------------------------------------------
 
+        def record_disk(self) -> None:
+            if self.disk_meter is not None:
+                for key, value in self.disk_meter.snapshot().items():
+                    self.ctx.ledger.record("budget", f"disk.{key}", value, time.time())
+
+        def check_disk(self) -> None:
+            if self.disk_meter is not None:
+                try:
+                    self.disk_meter.sample()
+                except Exception:
+                    self.stop_for_disk()
+                    raise
+                finally:
+                    self.record_disk()
+
+        def stop_for_disk(self) -> None:
+            if self.disk_failure is not None:
+                return
+            self.disk_failure = "disk stop limit reached or monitoring failed"
+            try:
+                with contextlib.suppress(Exception):
+                    self.kill_worker()
+                for track in list(self.tracks):
+                    if track.cli and not track.closed:
+                        with contextlib.suppress(Exception):
+                            self.expire(track)
+            finally:
+                # The proof child owns this session and every in-flight local command.
+                if self.cleanup_budget is None and os.getpgrp() == os.getpid():
+                    os.killpg(os.getpgrp(), signal.SIGTERM)
+
         def start_watchdog(self) -> None:
             if self.watchdog is None:
                 self.watchdog = threading.Thread(
@@ -2344,7 +2405,17 @@ def owner_proof_class(e: Any) -> type[Any]:  # noqa: C901 - one scenario, one cl
             command log, which belong to the main thread; ``sweep`` settles.
             """
 
+            next_disk = 0.0
             while not self.watchdog_stop.wait(1.0):
+                meter = getattr(self, "disk_meter", None)
+                if meter is not None and time.monotonic() >= next_disk:
+                    try:
+                        meter.sample()
+                    except Exception:  # noqa: BLE001 - unavailable monitoring also stops the run
+                        self.stop_for_disk()
+                    next_disk = time.monotonic() + 30
+                if getattr(self, "cleanup_budget", None) is not None or self.disk_failure:
+                    continue
                 now = time.time()
                 if (
                     not self.live_expired
@@ -2410,6 +2481,7 @@ def owner_proof_class(e: Any) -> type[Any]:  # noqa: C901 - one scenario, one cl
         def reserve(self, slot: str) -> poe.Reservation | None:
             if not self.paid:
                 return None
+            self.check_disk()
             reservation = self.ctx.ledger.reserve(slot, time.time())
             self.reserved_at[reservation.seq] = time.time()
             self.pending.append(reservation)
@@ -3673,7 +3745,6 @@ def owner_proof_class(e: Any) -> type[Any]:  # noqa: C901 - one scenario, one cl
             self.foreign_before = self.foreign_snapshot()
 
         def fence_step(self) -> None:
-            self.stop_watchdog()
             self.fence()
 
         def inventory_step(self) -> None:
@@ -3974,7 +4045,9 @@ def child_main(args: argparse.Namespace, rt: Runtime) -> int:
     except (poe.StepFailed, pps.Refusal) as failure:
         detail = step_of() + str(failure.payload() if isinstance(failure, pps.Refusal) else failure)
     except SystemExit as stop:
-        detail = f"{step_of()}interrupted ({stop.code})"
+        detail = (
+            f"{step_of()}{getattr(proof, 'disk_failure', None) or f'interrupted ({stop.code})'}"
+        )
     except AssertionError as failure:
         detail = f"{step_of()}{failure} [{poe.failure_site(failure, REPO_ROOT)}]"
     except BaseException as failure:  # noqa: BLE001 - names only, never the message
@@ -3988,6 +4061,14 @@ def child_main(args: argparse.Namespace, rt: Runtime) -> int:
             if proof is not None:
                 proof.cleanup_budget = poe.CleanupBudget(time.monotonic())
             results = finalizer.run()
+            if proof is not None:
+                proof.stop_watchdog()
+            if proof is not None and proof.disk_meter is not None:
+                with contextlib.suppress(Exception):
+                    proof.disk_meter.sample(final=True)
+                proof.record_disk()
+            if proof is not None and proof.disk_failure:
+                outcome, detail = "failed", proof.disk_failure
             ledger.mark_cleanup(finished=time.time())
             ledger.finish(outcome, time.time())
     sessions = ledger.sessions()
@@ -3997,6 +4078,7 @@ def child_main(args: argparse.Namespace, rt: Runtime) -> int:
         "outcome": outcome,
         "detail": rt.scrubber.scrub(detail),
         "ceilings": poe.ceiling(),
+        "disk": poe.disk_receipt(ledger),
         "observed": dataclasses.asdict(poe.spend_reading(ledger.rows())),
         "sessions": [
             {

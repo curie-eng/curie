@@ -24,6 +24,7 @@ import sqlite3
 import stat
 import sys
 import textwrap
+import threading
 import traceback
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from pathlib import Path
@@ -281,6 +282,8 @@ class Flags:
     registry_port: int
     state_dir: Path
     run_id: str
+    disk_start_percent: int = 82
+    disk_stop_percent: int = 88
 
     @property
     def grant_namespace(self) -> str:
@@ -300,6 +303,8 @@ def require_flags(
     registry: str,
     state_dir: str,
     run_id: str,
+    disk_start_percent: int = 82,
+    disk_stop_percent: int = 88,
 ) -> Flags:
     pps.require_candidate(candidate)
     if not _CONTEXT.fullmatch(context or ""):
@@ -316,7 +321,24 @@ def require_flags(
         raise Refusal("state_dir_unsafe", "--state-dir")
     pps.require_private_dir(directory)
     pps.require_run_id(run_id)
-    return Flags(candidate, context, namespace, docker_context, registry, port, directory, run_id)
+    if not (
+        type(disk_start_percent) is int
+        and type(disk_stop_percent) is int
+        and 0 < disk_start_percent < disk_stop_percent <= 100
+    ):
+        raise Refusal("disk_limits_invalid", "--disk-start-percent / --disk-stop-percent")
+    return Flags(
+        candidate,
+        context,
+        namespace,
+        docker_context,
+        registry,
+        port,
+        directory,
+        run_id,
+        disk_start_percent,
+        disk_stop_percent,
+    )
 
 
 def stat_grant_file(path: Path | None) -> None:
@@ -1905,6 +1927,7 @@ def judge(ledger: OwnerLedger, criterion: str) -> dict[str, Any]:
         "run_id": ledger.run_id,
         "candidate": run["candidate"],
         "criterion": criterion,
+        "disk": disk_receipt(ledger),
         "verdict": overall,
         "criteria": verdicts,
     }
@@ -1930,6 +1953,47 @@ def exit_code(verdict: str) -> int:
 # --------------------------------------------------------------------------
 # The finalizer: LIFO, registered before each resource is created
 # --------------------------------------------------------------------------
+
+
+class DiskMeter:
+    def __init__(self, reader: Callable[[], int], start: int, stop: int):
+        self.reader, self.start, self.stop = reader, start, stop
+        self.before: int | None = None
+        self.peak: int | None = None
+        self.after: int | None = None
+        self.lock = threading.Lock()
+
+    def sample(self, *, initial: bool = False, final: bool = False) -> int:
+        with self.lock:
+            value = self.reader()
+            if type(value) is not int or not 0 <= value <= 100:
+                raise StepFailed("disk reading is unavailable")
+            if self.before is None:
+                self.before = value
+            self.peak = max(self.peak or 0, value)
+            if final:
+                self.after = value
+            if not final and (value >= self.stop or (initial and value > self.start)):
+                raise StepFailed("disk usage reached the configured limit")
+            return value
+
+    def snapshot(self) -> dict[str, int | None]:
+        with self.lock:
+            return {
+                "start_limit_percent": self.start,
+                "stop_limit_percent": self.stop,
+                "before_percent": self.before,
+                "peak_percent": self.peak,
+                "after_percent": self.after,
+            }
+
+
+def disk_receipt(ledger: OwnerLedger) -> dict[str, Any]:
+    return {
+        key.removeprefix("disk."): value
+        for key, value in ledger.observations("budget").items()
+        if key.startswith("disk.")
+    }
 
 
 class StepFailed(Exception):

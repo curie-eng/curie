@@ -1214,7 +1214,11 @@ def test_hold_script_holds_read_once_per_process_and_every_stop() -> None:
 # Proof-driver guards use the actual scenario methods with synthetic observations.
 def _proof() -> Any:
     cls = driver.owner_proof_class(driver.load_enrollment())
-    return cls.__new__(cls)
+    proof = cls.__new__(cls)
+    proof.disk_meter = None
+    proof.disk_failure = None
+    proof.cleanup_budget = None
+    return proof
 
 
 @pytest.mark.parametrize(
@@ -1628,3 +1632,95 @@ def test_a_failed_live_criterion_stops_before_a_later_session(tmp_path: Path, pa
     assert ledger.observations("selection")["claim.label.owner_tenant_matches"] is False
     proof.observe("restart", "pod.workspace_nonce_restored", False)
     proof.observe("restart", "informational", "recorded")
+
+
+def test_disk_start_override_is_explicit_and_forwarded(tmp_path: Path) -> None:
+    args = driver.build_parser().parse_args(
+        _cluster_args(tmp_path, "run") + ["--disk-start-percent", "85", "--disk-stop-percent", "88"]
+    )
+    flags = driver.flags_of(args)
+    assert (flags.disk_start_percent, flags.disk_stop_percent) == (85, 88)
+    child = driver.forwarded(args)
+    assert child[child.index("--disk-start-percent") + 1] == "85"
+    _refused(
+        "disk_limits_invalid",
+        lambda: poe.require_flags(
+            **_flag_values(tmp_path / "invalid"), disk_start_percent=88, disk_stop_percent=85
+        ),
+    )
+
+
+def test_disk_meter_samples_peak_and_stops_at_the_exact_limit() -> None:
+    values = iter([85, 87, 88, 83])
+    meter = poe.DiskMeter(lambda: next(values), 85, 88)
+    assert meter.sample(initial=True) == 85
+    assert meter.sample() == 87
+    with pytest.raises(poe.StepFailed, match="disk usage"):
+        meter.sample()
+    assert meter.sample(final=True) == 83
+    assert meter.snapshot() == {
+        "start_limit_percent": 85,
+        "stop_limit_percent": 88,
+        "before_percent": 85,
+        "peak_percent": 88,
+        "after_percent": 83,
+    }
+    with pytest.raises(poe.StepFailed):
+        poe.DiskMeter(lambda: 86, 85, 88).sample(initial=True)
+
+
+def test_disk_stop_interrupts_the_runtime_before_cancelling_owned_commands(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    proof = _proof()
+    proof.tracks = [driver.Track("process-interrupted", 1, cli="pod:1:2")]
+    called: list[str] = []
+    proof.kill_worker = lambda: called.append("worker")
+    proof.expire = lambda _: called.append("runtime")
+    monkeypatch.setattr(driver.os, "getpgrp", lambda: 123)
+    monkeypatch.setattr(driver.os, "getpid", lambda: 123)
+    monkeypatch.setattr(driver.os, "killpg", lambda *args: called.append("commands"))
+    proof.stop_for_disk()
+    assert called == ["worker", "runtime", "commands"]
+
+
+def test_every_session_checks_disk_before_reserving_and_records_the_peak(tmp_path: Path) -> None:
+    from types import SimpleNamespace
+
+    proof = _proof()
+    ledger = _live_ledger(tmp_path)
+    proof.ctx, proof.paid = SimpleNamespace(ledger=ledger), True
+    proof.pending, proof.tracks, proof.reserved_at = [], [], {}
+    values = iter([87, 88])
+    proof.disk_meter = poe.DiskMeter(lambda: next(values), 85, 88)
+    stopped: list[bool] = []
+    proof.stop_for_disk = lambda: stopped.append(True)
+    proof.reserve(poe.SLOT_NAMES[0])
+    with pytest.raises(poe.StepFailed):
+        proof.reserve(poe.SLOT_NAMES[1])
+    assert len(ledger.sessions()) == 1 and stopped == [True]
+    assert poe.disk_receipt(ledger)["peak_percent"] == 88
+
+
+def test_watchdog_checks_disk_every_thirty_seconds(monkeypatch: pytest.MonkeyPatch) -> None:
+    from types import SimpleNamespace
+
+    proof = _proof()
+    clock = [0]
+
+    def wait(_seconds: float) -> bool:
+        clock[0] += 30
+        return clock[0] > 90
+
+    proof.watchdog_stop = SimpleNamespace(wait=wait)
+    proof.live_expired, proof.live_deadline, proof.tracks = False, None, []
+    observed: list[int] = []
+
+    def read() -> int:
+        observed.append(clock[0])
+        return 83
+
+    proof.disk_meter = poe.DiskMeter(read, 85, 88)
+    monkeypatch.setattr(driver.time, "monotonic", lambda: clock[0])
+    proof.watch()
+    assert observed == [30, 60, 90]
