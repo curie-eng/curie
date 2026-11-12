@@ -13,6 +13,7 @@ import time
 import uuid
 from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
+from datetime import datetime, timedelta
 from types import SimpleNamespace
 from typing import Any
 
@@ -294,6 +295,39 @@ def test_uncontended_slow_lookup_within_the_budget_queues_once(
         assert outcome == "yielded"
         assert SLOW <= elapsed < BUDGET
         assert len(provider.requests) == 2
+        assert len(valkey.xrange(runs_stream)) == 2
+
+
+def test_a_composition_reaching_revalidation_late_in_its_budget_still_queues(
+    clean_db: None, valkey: redis.Redis, runs_stream: str,
+    synthetic_provider: SimpleNamespace, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """@spec HTTP-INVOCATION-EXECUTION-4: shared fixture facts outlive the composition budget.
+
+    The API revalidates provider facts against the wall clock after the writer
+    phase. A loaded runner can reach that point seconds after the provider's
+    observation while still inside the composition budget, so the synthetic
+    source must stay fresh for the whole budget or an in-time turn reads as
+    identity_authority_unavailable. The clock is advanced, not slept.
+    """
+    provider = synthetic_provider
+    late = timedelta(seconds=http_invocation._COMPOSITION_BUDGET_SECONDS)
+
+    class LateClock(datetime):
+        """@spec HTTP-INVOCATION-EXECUTION-4: revalidation at the end of the budget."""
+
+        @classmethod
+        def now(cls, tz: Any = None) -> datetime:  # type: ignore[override]
+            """@spec HTTP-INVOCATION-EXECUTION-4."""
+            return datetime.now(tz) + late
+
+    with turn_authority.queued_invocation(provider, valkey, runs_stream) as invocation:
+        token = membership._credential(invocation.client, invocation.scope)
+        monkeypatch.setattr(http_invocation, "datetime", LateClock)
+        accepted = membership._post(
+            invocation.client, token, *membership._submission(invocation.scope),
+        )
+        assert accepted.status_code == 200, accepted.text
         assert len(valkey.xrange(runs_stream)) == 2
 
 
