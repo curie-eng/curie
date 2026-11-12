@@ -96,6 +96,7 @@ from .types import (
     SubstrateConfig,
     SuspendedThreadError,
     UnschedulableClaimError,
+    WorkItemRouteOwner,
     agent_warm_pool_name,
     claim_warm_pool,
     has_connector_secrets,
@@ -780,6 +781,35 @@ class SandboxSubstrate:
         if sandbox is None or sandbox.operating_mode != "Running":
             return None
         return record.handle
+
+    def bind_work_item(
+        self, thread_key: str, claim_name: str, owner: WorkItemRouteOwner
+    ) -> None:
+        """Record a delivery's adoption while its caller holds the thread lock."""
+
+        record = self._affinity.get(thread_key)
+        if record is None or record.handle.claim_name != claim_name:
+            raise RouteChangedError(thread_key)
+        if not self._affinity.replace_if_generation(
+            thread_key,
+            expected_claim=claim_name,
+            expected_generation=record.handle.generation,
+            record=replace(record, work_item_owner=owner),
+            ttl_seconds=self._config.route_ttl_seconds,
+        ):
+            raise RouteChangedError(thread_key)
+
+    def owns_work_item_claim(
+        self, thread_key: str, claim_name: str, owner: WorkItemRouteOwner
+    ) -> bool:
+        """Compare the route's claim and delivery identity under the thread lock."""
+
+        record = self._affinity.get(thread_key)
+        return (
+            record is not None
+            and record.handle.claim_name == claim_name
+            and record.work_item_owner == owner
+        )
 
     def touch_live(self, thread_key: str, claim_name: str) -> bool:
         """Refresh the route TTL while a turn streams on ``claim_name`` (#3188).

@@ -555,6 +555,7 @@ def test_provider_rejection_is_classified_and_scrubbed() -> None:
         "message": {
             "id": "synthetic-1",
             "model": poe.SYNTHETIC_MODEL,
+            "usage": {"output_tokens": 0},
             "content": [
                 {
                     "type": "text",
@@ -2416,3 +2417,97 @@ def test_watchdog_checks_disk_every_thirty_seconds(monkeypatch: pytest.MonkeyPat
     monkeypatch.setattr(driver.time, "monotonic", lambda: clock[0])
     proof.watch()
     assert observed == [30, 60, 90]
+
+
+@pytest.mark.parametrize("tokens", [0, 17, 2048])
+def test_rejection_usage_is_measured_and_charged(tmp_path: Path, tokens: int) -> None:
+    events = _aci_refusal()
+    events[-1]["output_tokens"] = tokens
+    error = poe.native_refusal(_native_refusal_fixture()["native_debug_stderr"].encode(), events)
+    assert error.get("output_tokens") == tokens
+    usage = poe.refusal_usage(error, poe.SessionUsage.unknown())
+    assert usage.output_tokens == tokens
+    ledger = _live_ledger(tmp_path)
+    reservation = ledger.reserve("rejected", T0)
+    ledger.mark_started(reservation.seq, "example:1:2", T0)
+    ledger.settle(reservation.seq, usage, 1, T0 + 1)
+    assert ledger.item_usage()["charged_output_tokens"] >= max(tokens, reservation.tokens)
+    ledger.close()
+
+
+def test_rejection_without_measured_usage_stays_unknown(tmp_path: Path) -> None:
+    error = poe.native_refusal(
+        _native_refusal_fixture()["native_debug_stderr"].encode(), _aci_refusal()
+    )
+    usage = poe.refusal_usage(error, poe.SessionUsage.unknown())
+    assert usage.output_tokens is None and not usage.known
+    measured = poe.refusal_usage(error, poe.SessionUsage(23, 1, True))
+    assert measured.known and measured.output_tokens == 23
+
+
+@pytest.mark.parametrize("phase", ["full", "remaining", "post-rejection"])
+@pytest.mark.parametrize("previous", [None, "old:1:2"])
+def test_revalidation_requires_a_recorded_predecessor(phase: str, previous: str | None) -> None:
+    from types import SimpleNamespace
+
+    proof = _proof()
+    proof.paid = True
+    proof.grant_file = None
+    proof.files = {"token-valid": Path("synthetic-fixture")}
+    proof.issues = {"worker": "example-issue"}
+    proof.work_items = {"example-issue": {"id": "example-work-item"}}
+    proof.headers_seen = {"replaced": {}}
+    proof.ctx = SimpleNamespace(
+        phases=phase,
+        ledger=SimpleNamespace(observations=lambda _: {"rejection": {"native_ref": previous}}),
+    )
+    proof.write = lambda *args, **kwargs: {}
+    proof.wait_soft = lambda *args, **kwargs: True
+    proof.revalidate_item = lambda _: (200, 3, "ok")
+    proof.observe = lambda *args: None
+    proof.admit_owner = lambda *args: None
+    proof.reserve = lambda *args: None
+    proof.start_worker = lambda: None
+    proof.boundary = lambda *args, **kwargs: driver.Track("revalidated", 1, cli="new:1:2")
+    if previous is not None:
+        proof.rejected_track = driver.Track("rejected", 1, cli=previous)
+
+    class ReachedHarvest(Exception):
+        pass
+
+    def harvest(_track: Any) -> Any:
+        raise ReachedHarvest
+
+    proof.harvest = harvest
+    expected = ReachedHarvest if previous is not None else AssertionError
+    with pytest.raises(expected):
+        proof.revalidated()
+
+
+def test_rejection_judge_keeps_unknown_usage_as_an_observation(tmp_path: Path) -> None:
+    ledger = _live_ledger(tmp_path)
+    for key, value in poe.EXPECTED["authentication-required"].items():
+        ledger.record("authentication-required", key, value, T0)
+    ledger.record("authentication-required", "rejected.output_tokens", None, T0)
+    result = poe.judge(ledger, "authentication-required")
+    assert result["verdict"] == "pass"
+    [usage] = [c for c in result["criteria"][0]["checks"] if c["key"] == "rejected.output_tokens"]
+    assert usage["observed"] is None and usage["status"] == "informational"
+    ledger.record("authentication-required", "rejected.output_tokens", 17, T0)
+    assert poe.judge(ledger, "authentication-required")["verdict"] == "fail"
+    ledger.close()
+
+
+def test_rejection_usage_refuses_duplicate_terminal_frames() -> None:
+    events = _aci_refusal()
+    events.append(dict(events[-1], output_tokens=17))
+    with pytest.raises(poe.StepFailed, match="rejection_capture_conflicting_aci_terminal"):
+        poe.native_refusal(_native_refusal_fixture()["native_debug_stderr"].encode(), events)
+
+
+@pytest.mark.parametrize("count", [None, 17])
+def test_synthetic_refusal_never_invents_zero_usage(count: int | None) -> None:
+    record = dict(_native_refusal_fixture()["native_stream"][0])
+    record["message"] = {**record["message"], "usage": {"output_tokens": count}}
+    usage = poe.transcript_usage(_jsonl(record))
+    assert not usage.known and usage.output_tokens == count

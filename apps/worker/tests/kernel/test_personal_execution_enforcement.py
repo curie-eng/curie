@@ -802,7 +802,7 @@ _Change = Callable[[_Owner, uuid.UUID], Awaitable[None]]
         ),
         pytest.param(_disable_principal, {}, "owner_principal_inactive", id="principal-disabled"),
         pytest.param(_suspend_tenant, {}, "owner_tenant_inactive", id="tenant-suspended"),
-        pytest.param(_cancel_work_item, {}, "execution_authority_lost", id="work-item-cancelled"),
+        pytest.param(_cancel_work_item, {}, "work_item_cancelled", id="work-item-cancelled"),
         pytest.param(
             _acquired_by_another_worker,
             {},
@@ -1038,7 +1038,7 @@ def test_the_credential_capping_handoff_after_start_is_authorized_against_the_li
             id="advanced",
         ),
         pytest.param(
-            _cancel_work_item, "execution_authority_lost", "runner_escalated", id="cancelled"
+            _cancel_work_item, "work_item_cancelled", "runner_escalated", id="cancelled"
         ),
     ],
 )

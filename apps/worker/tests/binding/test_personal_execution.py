@@ -849,7 +849,7 @@ _Change = Callable[[AsyncEngine, _Launching], Awaitable[None]]
         (_nothing, {"agent": True}, {}, "owner_mismatch", False),
         (_nothing, {"tenant": True}, {}, "owner_mismatch", False),
         (_nothing, {}, {"kubernetes": False}, "personal_mode_requires_kubernetes", False),
-        (_cancel_work_item, {}, {}, "execution_authority_lost", False),
+        (_cancel_work_item, {}, {}, "work_item_cancelled", False),
         (_nothing, {"owner": "acme-worker-b"}, {}, "execution_authority_lost", False),
         (_nothing, {"generation": _ACQUIRED + 1}, {}, "execution_authority_lost", False),
         (_expire_acquire, {}, {}, "execution_authority_lost", False),

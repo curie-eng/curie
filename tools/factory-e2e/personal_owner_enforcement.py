@@ -3668,8 +3668,7 @@ def owner_proof_class(e: Any) -> type[Any]:  # noqa: C901 - one scenario, one cl
                     "rejected.aci_classification",
                     error["aci_classification"],
                 )
-                usage = poe.SessionUsage(0, 0, True, error_classes=(error,))
-                self.settle(track, usage)
+                usage = poe.refusal_usage(error, poe.SessionUsage.unknown())
             row = self.requests_of(work_item_id)[-1]
             self.observe(
                 "authentication-required", "rejected.http_status", error.get("http_status")
@@ -3726,6 +3725,13 @@ def owner_proof_class(e: Any) -> type[Any]:  # noqa: C901 - one scenario, one cl
                 "authentication-required", "rejected.service_fallback_claims", len(service)
             )
             self.rejected_track = track
+            if self.paid:
+                _data, transcript = self.harvest(track)
+                usage = poe.refusal_usage(error, transcript)
+                self.observe(
+                    "authentication-required", "rejected.output_tokens", usage.output_tokens
+                )
+                self.settle(track, usage)
 
         def revalidated(self) -> None:
             """Replace with the valid grant, confirm teardown, revalidate, fresh process."""
@@ -3772,10 +3778,11 @@ def owner_proof_class(e: Any) -> type[Any]:  # noqa: C901 - one scenario, one cl
                 if before is not None
                 else None
             )
+            assert previous_cli, "revalidation requires a recorded predecessor native process"
             self.observe(
                 "authentication-required",
                 "revalidated.fresh_native_process",
-                previous_cli is None or track.cli != previous_cli,
+                track.cli != previous_cli,
             )
             data, usage = self.harvest(track)
             after = self.workspace_state(track.pod)

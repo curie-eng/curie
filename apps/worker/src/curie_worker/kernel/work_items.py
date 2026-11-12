@@ -15,7 +15,7 @@ from aci_protocol import (
 from ..binding import FactoryWake
 from ..delivery_lease import DeliveryLease
 from ..killswitch import KillSwitch
-from ..sandbox.types import SandboxHandle
+from ..sandbox.types import SandboxHandle, WorkItemRouteOwner
 from ..threadlock import LockLeaseLost
 from ..workitem_dispatch import (
     TerminationClaim,
@@ -733,11 +733,22 @@ async def _release_unstarted_personal_claim(self: Kernel, run: WorkItemRun) -> N
     """
 
     if not run.started and run.claim_name is not None:
-        await _release_claim_locked(self, run.thread_key, run.claim_name, wait_gone=True)
+        await _release_claim_locked(
+            self,
+            run.thread_key,
+            run.claim_name,
+            wait_gone=True,
+            expected_owner=WorkItemRouteOwner(str(run.request_id), run.generation, run.owner),
+        )
 
 
 async def _release_claim_locked(
-    self: Kernel, thread_key: str, claim_name: str, *, wait_gone: bool = False
+    self: Kernel,
+    thread_key: str,
+    claim_name: str,
+    *,
+    wait_gone: bool = False,
+    expected_owner: WorkItemRouteOwner | None = None,
 ) -> None:
     """The plain release: lock the thread, release the recorded claim, unlock.
 
@@ -758,6 +769,10 @@ async def _release_claim_locked(
         )
         return
     try:
+        if expected_owner is not None and not await asyncio.to_thread(
+            self._substrate.owns_work_item_claim, thread_key, claim_name, expected_owner
+        ):
+            return
         await _release_claim(self, thread_key, claim_name, wait_gone=wait_gone)
     finally:
         await self._lock.release(self._config.lock_key(thread_key), token)

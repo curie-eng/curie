@@ -373,3 +373,159 @@ def test_a_lost_acquire_refusal_keeps_the_claim_for_the_replacement_to_adopt(
                 assert await owner.status(request_id) == "running"
 
     asyncio.run(exercise())
+
+
+@pytest.mark.parametrize(
+    ("deferral", "replacement_generation"),
+    [
+        pytest.param("factory-refusal-at-start", 2, id="factory-refusal-next-generation"),
+        pytest.param("transient-before-start", 1, id="transient-failure-acquire-transfer"),
+    ],
+)
+def test_cleanup_preserves_a_replacements_adopted_live_claim(
+    make_harness, monkeypatch, deferral: str, replacement_generation: int
+) -> None:
+    async def exercise() -> None:
+        async with _seeded_owner() as owner:
+            k8s = _CreateHookK8s()
+            async with (
+                _harness(
+                    make_harness,
+                    owner,
+                    k8s,
+                    monkeypatch,
+                    consumer_name="acme-worker-a",
+                    max_attempts=1,
+                ) as ha,
+                _harness(
+                    make_harness,
+                    owner,
+                    k8s,
+                    monkeypatch,
+                    consumer_name="acme-worker-b",
+                    approvals=_Approvals(),
+                ) as hb,
+            ):
+                _enforce(ha, owner)
+                _enforce(hb, owner)
+                work_a, work_b = _CancellableWorkItems(owner), _CancellableWorkItems(owner)
+                ha.kernel._work_items, hb.kernel._work_items = work_a, work_b
+                ha.runner.default_script = list(_AWAITING_APPROVAL)
+                request_id = await owner.request()
+                acquire_a = ha.kernel._lock.acquire
+                routing_failed = False
+                adopted: list[str] = []
+
+                async def acquire_after_replacement(key: str) -> str:
+                    nonlocal routing_failed
+                    if routing_failed:
+                        routing_failed = False
+                        await owner.sql(
+                            "UPDATE {schema}.execution_requests SET "
+                            "dispatch_generation = :generation, acquire_owner = NULL, "
+                            "acquired_generation = NULL, acquire_expires_at = NULL "
+                            "WHERE id = :id AND status = 'waiting'",
+                            generation=replacement_generation,
+                            id=request_id,
+                        )
+                        await hb.kernel.process_event(
+                            _execute(request_id, generation=replacement_generation)
+                        )
+                        [(created, _labels)] = k8s.creates
+                        [held] = [
+                            run
+                            for run in hb.kernel._held_work_items.values()
+                            if run.request_id == request_id
+                        ]
+                        assert held.started and not held.finished
+                        assert held.claim_name == created
+                        assert created in k8s.claims
+                        adopted.append(created)
+                    return await acquire_a(key)
+
+                monkeypatch.setattr(ha.kernel._lock, "acquire", acquire_after_replacement)
+
+                if deferral == "factory-refusal-at-start":
+
+                    async def defer_at_start() -> None:
+                        nonlocal routing_failed
+                        await _PgWorkItems.defer(
+                            work_a,
+                            request_id,
+                            reason="not_started:factory_binding_changed",
+                            capacity=False,
+                        )
+                        routing_failed = True
+                        raise WorkItemStartRefused("factory_binding_changed")
+
+                    work_a.before_start = defer_at_start
+                else:
+                    read = BindingResolver.resolve_execution_authority
+
+                    async def unavailable_to_a(resolver: BindingResolver, armed: uuid.UUID) -> Any:
+                        nonlocal routing_failed
+                        if armed == request_id and k8s.creates:
+                            row = await owner.row(
+                                "SELECT acquire_owner FROM {schema}.execution_requests "
+                                "WHERE id = :id",
+                                id=request_id,
+                            )
+                            assert row is not None
+                            if row["acquire_owner"] == "acme-worker-a":
+                                routing_failed = True
+                                raise ConnectionResetError("execution authority read reset")
+                        return await read(resolver, armed)
+
+                    monkeypatch.setattr(
+                        BindingResolver, "resolve_execution_authority", unavailable_to_a
+                    )
+
+                async with asyncio.timeout(15):
+                    await ha.kernel.process_event(_execute(request_id))
+
+                [created] = adopted
+                route = hb.substrate._affinity.get(_thread_key())
+                assert route is not None and route.handle.claim_name == created
+                assert created in k8s.claims
+                assert created not in k8s.deleted_claims
+                assert len(k8s.creates) == 1
+                assert work_b.calls.count("start") == 1
+                assert await owner.status(request_id) == "running"
+                assert _turns(ha.runner) == [_execute(request_id).text]
+                assert hb.runner.opened == []
+
+    asyncio.run(exercise())
+
+
+def test_cancellation_after_claim_before_turn_start_releases_the_owner_slot(
+    make_harness, monkeypatch
+) -> None:
+    async def exercise() -> None:
+        async with _seeded_owner() as owner:
+            k8s = _CreateHookK8s()
+            async with _harness(make_harness, owner, k8s, monkeypatch) as h:
+                _enforce(h, owner)
+                h.kernel._work_items = _CancellableWorkItems(owner)
+                request_id = await owner.request()
+                k8s.after_create = _bridge(
+                    asyncio.get_running_loop(), _cancel_while_waiting(owner, request_id)
+                )
+                await h.kernel.process_event(_execute(request_id))
+                [(created, _labels)] = k8s.creates
+                assert await owner.status(request_id) == "cancelled"
+                assert h.runner.opened == []
+                next_request = await owner.request()
+                await h.kernel.process_event(
+                    _execute(next_request, conversation=_NEXT_CONVERSATION)
+                )
+                assert {
+                    "claim_released": created not in k8s.claims,
+                    "route_released": h.substrate._affinity.get(_thread_key()) is None,
+                    "next_status": await owner.status(next_request),
+                } == {
+                    "claim_released": True,
+                    "route_released": True,
+                    "next_status": "running",
+                }
+
+    asyncio.run(exercise())

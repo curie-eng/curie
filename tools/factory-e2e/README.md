@@ -738,6 +738,17 @@ full 1,024-token reservation remains charged. Subsequent response harvests keep
 mode-0600 native records and exact replay seeds in the private evidence directory,
 after the held-value scan, so Pod deletion cannot erase the usage evidence.
 
+Attempt 4's retained rejection ACI final also carries no usage, and no retained
+rejection transcript certifies its output count. The provider's HTTP 401 and
+`authentication_error` plus the matching ACI classification remain real rejection
+proof. Re-judging them offline records unknown usage and charges the rejection's
+full 1,024-token share, alongside revalidation's full share. The conservative item
+total is 6,029 of 16,384 output tokens. The judge reports unknown rejection usage
+as an observation, while measured nonzero rejection output fails its zero-output
+control. A partial measured count can never charge less than either that count
+or its full reservation. Revalidation requires a recorded predecessor identity
+before it compares native processes in any phase scope.
+
 The empty-HOME, filtered-environment unpaid probe ran the real bundled CLI
 through the launch wrapper and stderr sanitizer with an invalid OAuth token.
 It observed HTTP 401, provider type `authentication_error` and zero output
@@ -758,7 +769,7 @@ fake provider; those readings never become paid-provider proof.
 | Rejection | `rejected.capture_source`, `rejected.http_status`, `rejected.provider_error_type` | Provider response in the actual rejected native process's debug stderr, retained by the pre-launch Pod log stream. |
 | Rejection | `rejected.aci_classification` | Actual worker-consumed error/final frames, paired by runner epoch in private SQLite. |
 | Rejection | `rejected.terminal_cause` | The worker's terminal ExecutionRequest row, read through the real database. |
-| Rejection | `rejected.output_tokens` | The classified provider authentication refusal and matching ACI terminal; the real invalid-token probe independently reports zero. |
+| Rejection | `rejected.output_tokens` | The paired ACI final output-token count or retained native transcript usage. Missing usage stays unknown and charges the full reservation; a classified refusal alone never certifies zero. |
 | Rejection | `rejected.transcript_preserved` | Durable transcript record IDs before and after the refused request. |
 | Rejection | `rejected.owner_preserved` | The immutable WorkItem owner read after the refusal. |
 | Rejection | `rejected.service_fallback_claims` | Current claim labels, retained provenance for deleted claims and every observed runner Pod. |
@@ -782,7 +793,7 @@ fake provider; those readings never become paid-provider proof.
 | Disconnect | `disconnect.admission_code`, `disconnect.revalidation_code`, `disconnect.custody_reader_code`, `disconnect.route` | Real admission/revalidation responses, custody-reader refusal and route lookup. |
 | Budget | Recorded session, total-turn and output-token ceilings | The live-window ledger records the same enforced constants used by reservations and query/response gates. |
 | Budget | `spend_guard.breach`, `sessions_within_ceiling`, `every_session_within_share`, `unreserved_starts`, `paid_retries` | Durable reservations, native launch observations, per-response harvests and settlements. |
-| Budget | `usage_known`, `zero_usage_sessions_classified`, per-session assistant turns, total turns/output tokens | Complete native records or the classified refusal; unknown capture stops the attempt. |
+| Budget | `usage_known`, `zero_usage_sessions_classified`, per-session assistant turns, total turns/output tokens | Complete native usage records or measured ACI counts; incomplete usage stops the attempt and charges at least its full share. |
 | Budget | `models`, `grant_probe_ok`, `live_seconds_within_ceiling` | Native model metadata, the immediately preceding empty-HOME probe, and measured live/cleanup timestamps. |
 | Budget | `item.output_tokens` | All linked attempts, measured usage, full reservation charges for unknown usage and qualification-probe output. |
 | Cleanup | `namespace.absent`, `grant_namespace.absent`, `claims.absent`, `pods.absent`, `grant_copies.absent` | Post-teardown Kubernetes absence checks in the owned namespaces. |

@@ -323,22 +323,34 @@ class SandboxHandle:
         return f"{self.transport}://{self.service_fqdn}:{self.port}{self.base_path}"
 
 
+@dataclass(frozen=True)
+class WorkItemRouteOwner:
+    request_id: str
+    dispatch_generation: int
+    acquire_owner: str
+
+
 @dataclass
 class RouteRecord:
     """The affinity-store value for one thread: handle fields plus route state."""
 
     handle: SandboxHandle
     state: RouteState = RouteState.LIVE
+    work_item_owner: WorkItemRouteOwner | None = None
 
     def to_json(self) -> str:
         payload = asdict(self.handle)
         payload["state"] = self.state.value
+        payload["work_item_owner"] = (
+            asdict(self.work_item_owner) if self.work_item_owner is not None else None
+        )
         return json.dumps(payload, sort_keys=True)
 
     @classmethod
     def from_json(cls, raw: str) -> RouteRecord:
         payload = json.loads(raw)
         state = RouteState(payload.pop("state", RouteState.LIVE.value))
+        owner = payload.pop("work_item_owner", None)
         # Data migration of routes stored before the endpoint fields existed:
         # every such route was written by a plain HTTP substrate at the root,
         # so it reads back as exactly that and drains on its own TTL.
@@ -347,7 +359,11 @@ class RouteRecord:
         # JSON has no tuple; equality with a freshly claimed handle needs one.
         if payload.get("runner_digests") is not None:
             payload["runner_digests"] = tuple(payload["runner_digests"])
-        return cls(handle=SandboxHandle(**payload), state=state)
+        return cls(
+            handle=SandboxHandle(**payload),
+            state=state,
+            work_item_owner=WorkItemRouteOwner(**owner) if owner is not None else None,
+        )
 
 
 @dataclass(frozen=True)

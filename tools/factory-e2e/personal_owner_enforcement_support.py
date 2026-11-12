@@ -528,6 +528,16 @@ def transcript_usage(
             found["first_line"] = scrub(str(found.get("first_line") or ""))
             errors.append(found)
             if model == SYNTHETIC_MODEL:
+                tokens = usage.get("output_tokens") if isinstance(usage, dict) else None
+                if type(tokens) is not int or tokens < 0 or tokens != 0:
+                    measured = (
+                        sum(per_message.values()) + tokens
+                        if type(tokens) is int and tokens >= 0
+                        else sum(per_message.values()) if per_message else None
+                    )
+                    return SessionUsage(
+                        measured, None, False, error_classes=tuple(errors[: pps.MAX_ERROR_CLASSES])
+                    )
                 continue
         message_id = message.get("id")
         tokens = usage.get("output_tokens") if isinstance(usage, dict) else None
@@ -593,12 +603,32 @@ def native_refusal(log: bytes, events: Sequence[Mapping[str, Any]]) -> dict[str,
     }
     if len(epochs) != 1 or None in epochs or not epochs <= finals:
         raise StepFailed("rejection_capture_missing_aci_terminal")
+    terminal = [
+        row for row in events if row.get("kind") == "final" and row.get("epoch") in epochs
+    ]
+    if len(terminal) != 1:
+        raise StepFailed("rejection_capture_conflicting_aci_terminal")
+    output_tokens = terminal[0].get("output_tokens")
+    if type(output_tokens) is not int or output_tokens < 0:
+        output_tokens = None
     return {
         **response,
         "cli_error": "authentication-required",
         "first_line": "provider refused native request",
         "aci_classification": "authentication-required",
+        "output_tokens": output_tokens,
     }
+
+
+def refusal_usage(error: Mapping[str, Any], transcript: SessionUsage) -> SessionUsage:
+    """Keep measured tokens; incomplete turn usage still charges the reservation."""
+
+    tokens = error.get("output_tokens")
+    if transcript.output_tokens is not None:
+        tokens = max(tokens or 0, transcript.output_tokens)
+    return dataclasses.replace(
+        transcript, output_tokens=tokens, error_classes=(*transcript.error_classes, dict(error))
+    )
 
 
 def tool_results(data: bytes) -> list[str]:
@@ -1059,11 +1089,12 @@ class OwnerLedger:
                 probes.append({"run_id": run_id, "output_tokens": probe.get("output_tokens")})
             for row in ledger.sessions():
                 usage = (open_usage or {}).get(row["seq"]) if run_id == self.run_id else None
-                measured = (
-                    row["output_tokens"] if row["settled_at"] is not None and row["known"] else None
-                )
-                if usage is not None and usage.known:
-                    measured = max(measured or 0, usage.output_tokens or 0)
+                measured = row["output_tokens"] if row["settled_at"] is not None else None
+                known = bool(row["known"])
+                if usage is not None:
+                    if usage.output_tokens is not None:
+                        measured = max(measured or 0, usage.output_tokens)
+                    known = usage.known and (row["settled_at"] is None or known)
                 sessions.append(
                     {
                         "run_id": run_id,
@@ -1071,9 +1102,9 @@ class OwnerLedger:
                         "slot": row["slot"],
                         "measured_output_tokens": measured,
                         "charged_output_tokens": (
-                            row["tokens_reserved"] if measured is None else measured
+                            measured if known else max(row["tokens_reserved"], measured or 0)
                         ),
-                        "basis": "full_reservation" if measured is None else "native_transcript",
+                        "basis": "native_transcript" if known else "full_reservation",
                         "settled": row["settled_at"] is not None,
                     }
                 )
@@ -1105,8 +1136,10 @@ class OwnerLedger:
         if current is None:
             raise Refusal("ledger_missing")
         known = usage.known and (current[0] is None or bool(current[1]))
-        tokens = usage.output_tokens if known else None
+        tokens = usage.output_tokens
         turns = usage.assistant_turns if known else None
+        if current[0] is not None and current[2]:
+            tokens = max(tokens or 0, current[2])
         if known and current[0] is not None:
             tokens = max(tokens or 0, current[2] or 0)
             turns = max(turns or 0, current[3] or 0)
@@ -1891,6 +1924,10 @@ def _judge_observed(ledger: OwnerLedger, criterion: str) -> list[dict[str, Any]]
         _check(key, expected, found, NOT_MET.get((criterion, key)))
         for key, expected in EXPECTED[criterion].items()
     ]
+    if criterion == "authentication-required" and found.get("rejected.output_tokens", 0) is None:
+        for check in checks:
+            if check["key"] == "rejected.output_tokens":
+                check.update(status="informational", expected="unknown usage charges full share")
     if criterion == "authentication-required" and prior is not None:
         for check in checks:
             if check["key"].startswith("rejected."):

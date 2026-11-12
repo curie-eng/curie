@@ -61,6 +61,7 @@ from ..sandbox.types import (
     RouteChangedError,
     SandboxHandle,
     SuspendedThreadError,
+    WorkItemRouteOwner,
     provenance_admits,
 )
 from ..turn_progress import (
@@ -1024,6 +1025,13 @@ async def _route_and_start(
     # own (a continuation adopts without claiming, and a claim can adopt a
     # route the snapshot never saw), and a personal request is authorized
     # afresh: the owner rows, the enrollment and this worker's authority.
+    if launch is not None and owned_run is not None:
+        await asyncio.to_thread(
+            self._substrate.bind_work_item,
+            thread_key,
+            handle.claim_name,
+            WorkItemRouteOwner(str(owned_run.request_id), owned_run.generation, owned_run.owner),
+        )
     await _authorize_turn_start(handle)
     if wait is not None:
         # A capacity wake may meet a different live turn on this thread.

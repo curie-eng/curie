@@ -53,6 +53,7 @@ OWNER_MISMATCH = "owner_mismatch"
 OWNER_TENANT_INACTIVE = "owner_tenant_inactive"
 OWNER_PRINCIPAL_INACTIVE = "owner_principal_inactive"
 EXECUTION_AUTHORITY_LOST = "execution_authority_lost"
+WORK_ITEM_CANCELLED = "work_item_cancelled"
 OWNER_PROVENANCE_MISMATCH = "owner_provenance_mismatch"
 #: Enrollment fences, classified authentication-required like a grant refusal:
 #: the owner reconnects or replaces the enrollment, then the request resumes.
@@ -125,24 +126,26 @@ def _provenance_of(authority: ExecutionAuthority) -> ClaimProvenance | None:
     )
 
 
-def _authority_lost(authority: ExecutionAuthority, run: RunView) -> bool:
+def _authority_lost(authority: ExecutionAuthority, run: RunView) -> str | None:
     """Whether this worker no longer holds the request it is launching."""
 
     if authority.work_item_cancelled:
-        return True
+        return WORK_ITEM_CANCELLED
     if run.started:
-        return (
+        lost = (
             authority.status != "running"
             or run.runtime_epoch is None
             or authority.runtime_epoch != run.runtime_epoch
             or not authority.deadline_live
         )
-    return (
-        authority.status != "waiting"
-        or authority.acquire_owner != run.owner
-        or authority.acquired_generation != run.generation
-        or not authority.acquire_live
-    )
+    else:
+        lost = (
+            authority.status != "waiting"
+            or authority.acquire_owner != run.owner
+            or authority.acquired_generation != run.generation
+            or not authority.acquire_live
+        )
+    return EXECUTION_AUTHORITY_LOST if lost else None
 
 
 class PersonalExecution:
@@ -224,8 +227,10 @@ class PersonalLaunch:
             raise refused(PERSONAL_MODE_REQUIRES_KUBERNETES)
         # The tuple a request snapshotted changes only through revalidation,
         # which the API refuses while this worker holds the request.
-        if provenance != self.provenance or _authority_lost(authority, run):
+        if provenance != self.provenance:
             raise refused(EXECUTION_AUTHORITY_LOST)
+        if code := _authority_lost(authority, run):
+            raise refused(code)
         if authority.tenant_status != "active":
             raise refused(OWNER_TENANT_INACTIVE)
         if authority.principal_status != "active":
