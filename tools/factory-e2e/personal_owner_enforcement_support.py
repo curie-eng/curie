@@ -955,6 +955,9 @@ class OwnerLedger:
                 live_deadline=run["live_deadline"],
                 grant_expires_at=run["grant_expires_at"],
             )
+            item = self.item_usage()
+            if item["charged_output_tokens"] + decision.tokens > item["output_token_cap"]:
+                raise Refusal("budget_exceeded")
             self.db.execute(
                 "INSERT INTO sessions (run_id, seq, slot, reserved_at, deadline, "
                 "tokens_reserved, turns_reserved) VALUES (?, ?, ?, ?, ?, ?, ?)",
@@ -979,6 +982,63 @@ class OwnerLedger:
             "UPDATE sessions SET native_ref = ?, started_at = ? WHERE run_id = ? AND seq = ?",
             (native_ref, now, self.run_id, seq),
         )
+
+    def configure_item(self, prior_runs: Sequence[str], token_cap: int, now: float) -> None:
+        if token_cap <= 0 or self.run_id in prior_runs or len(set(prior_runs)) != len(prior_runs):
+            raise Refusal("ceiling_invalid")
+        for run_id in prior_runs:
+            prior = OwnerLedger(self.db, run_id, self.scrub).run()
+            if prior is None or prior["mode"] != "live" or prior["finished_at"] is None:
+                raise Refusal("usage_unknown")
+        self.record("budget", "item.prior_runs", list(prior_runs), now)
+        self.record("budget", "item.output_token_cap", token_cap, now)
+        self.record("budget", "item.usage", self.item_usage(), now)
+
+    def item_usage(self, open_usage: Mapping[int, SessionUsage] | None = None) -> dict[str, Any]:
+        config = self.observations("budget")
+        sessions = []
+        probes = []
+        for run_id in [*config.get("item.prior_runs", []), self.run_id]:
+            ledger = OwnerLedger(self.db, run_id, self.scrub)
+            probe = ledger.observations("budget").get("grant_probe.outcome")
+            if probe is not None:
+                probes.append({"run_id": run_id, "output_tokens": probe.get("output_tokens")})
+            for row in ledger.sessions():
+                usage = (open_usage or {}).get(row["seq"]) if run_id == self.run_id else None
+                measured = (
+                    row["output_tokens"] if row["settled_at"] is not None and row["known"] else None
+                )
+                if usage is not None and usage.known:
+                    measured = max(measured or 0, usage.output_tokens or 0)
+                sessions.append(
+                    {
+                        "run_id": run_id,
+                        "seq": row["seq"],
+                        "slot": row["slot"],
+                        "measured_output_tokens": measured,
+                        "charged_output_tokens": (
+                            row["tokens_reserved"] if measured is None else measured
+                        ),
+                        "basis": "full_reservation" if measured is None else "native_transcript",
+                        "settled": row["settled_at"] is not None,
+                    }
+                )
+        return {
+            "output_token_cap": config.get("item.output_token_cap", MAX_OUTPUT_TOKENS),
+            "charged_output_tokens": (
+                sum(row["charged_output_tokens"] for row in sessions)
+                + sum(probe["output_tokens"] or 0 for probe in probes)
+            ),
+            "sessions": sessions,
+            "qualification_probes": probes,
+        }
+
+    def check_item_spend(self, open_usage: Mapping[int, SessionUsage], now: float) -> None:
+        usage = self.item_usage(open_usage)
+        self.record("budget", "item.usage", usage, now)
+        if usage["charged_output_tokens"] > usage["output_token_cap"]:
+            self.record("budget", "spend_guard.breach", "item_output_tokens", now)
+            raise Refusal("budget_exceeded")
 
     def settle(self, seq: int, usage: SessionUsage, elapsed: float | None, now: float) -> None:
         """Settle once; a later, larger observation of the same session only raises it."""
@@ -1028,6 +1088,9 @@ class OwnerLedger:
         self.record("budget", "spend_guard.assistant_turns", reading.assistant_turns, now)
         if reading.breach is not None:
             self.record("budget", "spend_guard.breach", reading.breach, now)
+            self.record("budget", "item.usage", self.item_usage(open_usage), now)
+        else:
+            self.check_item_spend(open_usage, now)
         return reading
 
     def record_unreserved(self, native_ref: str, now: float) -> None:
@@ -1383,6 +1446,27 @@ def runner_forwards(
     return found
 
 
+def process_interruption_checks(facts: Mapping[str, Any]) -> dict[str, bool]:
+    process_only = (
+        facts.get("action") == "signal_processes"
+        and facts.get("driver_pod_delete_calls") == 0
+        and facts.get("native_identity_matched") is True
+    )
+    epoch = facts.get("old_epoch")
+    return {
+        "interruption_process_only": process_only,
+        "old_epoch_confirmed_before_bind": (
+            process_only
+            and facts.get("native_gone") is True
+            and type(epoch) is int
+            and epoch > 0
+            and facts.get("confirmed_epoch") == epoch
+            and facts.get("old_claim_still_bound_to_request") is True
+            and facts.get("successor_claim_observed") is False
+        ),
+    }
+
+
 def history_restored(before: Sequence[str], loaded: Sequence[str] | None) -> bool:
     """The recovered runtime's history holds every record from before, in order.
 
@@ -1654,9 +1738,8 @@ EXPECTED: dict[str, dict[str, Any]] = {
                 "committed_files_restored",
             )
         },
-        "process.same_pod": True,
-        "process.container_restarted": True,
-        # The same Pod keeps its workspace volume, uncommitted files included.
+        "process.interruption_process_only": True,
+        "process.old_epoch_confirmed_before_bind": True,
         "process.workspace_nonce_restored": True,
         "pod.new_pod": True,
         # Not met by design today: #5541 (blocked by #5092).
@@ -1726,10 +1809,17 @@ def _check(
 
 def _judge_observed(ledger: OwnerLedger, criterion: str) -> list[dict[str, Any]]:
     found = ledger.observations(criterion)
-    return [
+    checks = [
         _check(key, expected, found, NOT_MET.get((criterion, key)))
         for key, expected in EXPECTED[criterion].items()
     ]
+    if criterion == "restart":
+        checks.extend(
+            {"key": key, "observed": found[key], "status": "informational"}
+            for key in ("process.same_pod", "process.container_restarted")
+            if key in found
+        )
+    return checks
 
 
 def _within(key: str, ceiling: int, observed: int | None) -> dict[str, Any]:
@@ -1795,6 +1885,11 @@ def _judge_budget(ledger: OwnerLedger) -> list[dict[str, Any]]:
     ]
     totals = [
         _within(
+            "item.output_tokens",
+            ledger.item_usage()["output_token_cap"],
+            ledger.item_usage()["charged_output_tokens"],
+        ),
+        _within(
             "total.assistant_turns",
             TOTAL_ASSISTANT_TURNS_CEILING,
             None if unknown else reading.assistant_turns,
@@ -1831,6 +1926,7 @@ def _judge_cleanup(ledger: OwnerLedger) -> list[dict[str, Any]]:
 
 
 REHEARSAL_ONLY = {
+    "restart": {"process.old_epoch_confirmed_before_bind"},
     "authentication-required": {
         "rejected.http_status",
         "rejected.provider_error_type",
@@ -1928,6 +2024,7 @@ def judge(ledger: OwnerLedger, criterion: str) -> dict[str, Any]:
         "candidate": run["candidate"],
         "criterion": criterion,
         "disk": disk_receipt(ledger),
+        "item_usage": ledger.item_usage(),
         "verdict": overall,
         "criteria": verdicts,
     }

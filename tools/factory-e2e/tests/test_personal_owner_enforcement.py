@@ -554,6 +554,99 @@ def test_pod_workspace_restoration_is_not_met_naming_the_blocker(tmp_path: Path)
     assert poe.exit_code("not_met") == poe.EXIT_NOT_MET
 
 
+def test_process_recovery_allows_a_fresh_pod_and_requires_interruption_proof(
+    tmp_path: Path,
+) -> None:
+    ledger = _live_ledger(tmp_path)
+    _record_all(ledger, "restart")
+    for key in ("same_pod", "container_restarted"):
+        ledger.record("restart", f"process.{key}", False, T0)
+    result = poe.judge(ledger, "restart")
+    assert result["verdict"] == "pass"
+    checks = {row["key"]: row for row in result["criteria"][0]["checks"]}
+    assert checks["process.same_pod"]["status"] == "informational"
+    assert checks["process.container_restarted"]["observed"] is False
+    for key in ("interruption_process_only", "old_epoch_confirmed_before_bind"):
+        ledger.record("restart", f"process.{key}", False, T0)
+        assert poe.judge(ledger, "restart")["verdict"] == "fail"
+        ledger.record("restart", f"process.{key}", True, T0)
+        ledger.db.execute(
+            "DELETE FROM observations WHERE run_id=? AND key=?", (ledger.run_id, f"process.{key}")
+        )
+        assert poe.judge(ledger, "restart")["verdict"] == "missing"
+        ledger.record("restart", f"process.{key}", True, T0)
+
+
+@pytest.mark.parametrize(
+    "bad",
+    [
+        {"action": "delete_pod"},
+        {"driver_pod_delete_calls": 1},
+        {"native_identity_matched": False},
+        {"native_gone": False},
+        {"confirmed_epoch": 6},
+        {"old_epoch": None},
+        {"old_claim_still_bound_to_request": False},
+        {"successor_claim_observed": True},
+    ],
+)
+def test_process_epoch_confirmation_rejects_unproved_or_late_absence(bad: dict[str, Any]) -> None:
+    facts = {
+        "action": "signal_processes",
+        "driver_pod_delete_calls": 0,
+        "native_identity_matched": True,
+        "native_gone": True,
+        "old_epoch": 7,
+        "confirmed_epoch": 7,
+        "old_claim_still_bound_to_request": True,
+        "successor_claim_observed": False,
+    }
+    assert all(poe.process_interruption_checks(facts).values())
+    assert not poe.process_interruption_checks({**facts, **bad})["old_epoch_confirmed_before_bind"]
+
+
+def test_item_usage_preserves_unknown_settlement_and_charges_full_share(tmp_path: Path) -> None:
+    first = _live_ledger(tmp_path)
+    a = first.reserve(poe.SLOT_NAMES[0], T0)
+    first.settle(a.seq, poe.SessionUsage(60, 1, True), 6, T0 + 6)
+    b = first.reserve(poe.SLOT_NAMES[1], T0 + 7)
+    first.mark_started(b.seq, "synthetic-native-2", T0 + 8)
+    first.finish("failed", T0 + 9)
+    second = poe.OwnerLedger(first.db, "acme-run-2", first.scrub)
+    second.begin(CANDIDATE, "live", T0 + 10)
+    second.start_live(T0 + 10, T0 + poe.GRANT_MIN_LIFETIME + 60)
+    second.configure_item([first.run_id], 16384, T0 + 10)
+    usage = second.item_usage()
+    assert usage["charged_output_tokens"] == 1084
+    assert [s["basis"] for s in usage["sessions"]] == ["native_transcript", "full_reservation"]
+    assert usage["sessions"][1]["measured_output_tokens"] is None
+    assert first.sessions()[1]["settled_at"] is None
+    assert first.sessions()[1]["known"] is None
+    second.reserve(poe.SLOT_NAMES[0], T0 + 10)
+    second.check_spend({1: poe.SessionUsage(200, 1, True)}, T0 + 11)
+    assert second.observations("budget")["item.usage"]["charged_output_tokens"] == 1284
+    second.configure_item([first.run_id], 1283, T0 + 12)
+    _refused(
+        "budget_exceeded", lambda: second.check_spend({1: poe.SessionUsage(200, 1, True)}, T0 + 13)
+    )
+    assert second.observations("budget")["spend_guard.breach"] == "item_output_tokens"
+
+
+def test_item_cap_refuses_a_reservation_before_start(tmp_path: Path) -> None:
+    ledger = _live_ledger(tmp_path)
+    ledger.configure_item([], poe.SESSION_OUTPUT_TOKENS - 1, T0)
+    _refused("budget_exceeded", lambda: ledger.reserve(poe.SLOT_NAMES[0], T0))
+    assert ledger.sessions() == []
+
+
+def test_item_cap_counts_qualification_probe_output(tmp_path: Path) -> None:
+    ledger = _live_ledger(tmp_path)
+    ledger.record("budget", "grant_probe.outcome", {"output_tokens": 4}, T0)
+    ledger.configure_item([], poe.SESSION_OUTPUT_TOKENS, T0)
+    assert ledger.item_usage()["charged_output_tokens"] == 4
+    _refused("budget_exceeded", lambda: ledger.reserve(poe.SLOT_NAMES[0], T0))
+
+
 @pytest.mark.parametrize("kind", poe.RESTART_KINDS)
 @pytest.mark.parametrize(
     "key", ["committed_head_restored", "committed_files_restored", "old_runtime_gone"]
@@ -1221,6 +1314,60 @@ def _proof() -> Any:
     return proof
 
 
+def test_process_interruption_records_absence_and_epoch_before_recovery() -> None:
+    proof = _proof()
+    proof.paid = True
+    proof.driver_pod_deletions = []
+    trace: list[str] = []
+    proof.owner_claims = lambda: trace.append("claims") or ["acme-claim"]
+    proof.requests_of = lambda _: (
+        trace.append("epoch")
+        or [{"id": "acme-request", "runtime_epoch": 7, "runtime_claim_name": "acme-claim"}]
+    )
+    proof.observe = lambda *args: None
+
+    def execute(pod: str, program: str, pid: str, start: str, **kwargs: Any) -> tuple[int, bytes]:
+        assert (pod, program, pid, start) == ("acme-pod", driver.INTERRUPT_PROGRAM, "42", "200")
+        trace.append("processes_signalled")
+        return 0, json.dumps(
+            {"action": "signal_processes", "native_identity_matched": True, "native_gone": True}
+        ).encode()
+
+    proof.pod_exec = execute
+    track = driver.Track(
+        "process-interrupted",
+        1,
+        pod="acme-pod",
+        claim="acme-claim",
+        cli="acme-uid:42:200",
+        work_item_id="acme-work-item",
+        request_id="acme-request",
+        runtime_epoch=7,
+    )
+    facts = proof.interrupt("process", track)
+    assert trace == ["claims", "processes_signalled", "epoch", "claims"]
+    assert proof.driver_pod_deletions == []
+    assert all(poe.process_interruption_checks(facts).values())
+
+
+@pytest.mark.parametrize(
+    "prior_runs,cap,expected",
+    [
+        (["acme-run-1"], 16384, "ceiling_invalid"),
+        (["missing"], 16384, "usage_unknown"),
+        ([], 0, "ceiling_invalid"),
+    ],
+)
+def test_item_accounting_refuses_invalid_history(
+    tmp_path: Path,
+    prior_runs: list[str],
+    cap: int,
+    expected: str,
+) -> None:
+    ledger = _live_ledger(tmp_path)
+    _refused(expected, lambda: ledger.configure_item(prior_runs, cap, T0))
+
+
 @pytest.mark.parametrize(
     "tokens,turns,expected",
     [
@@ -1456,6 +1603,7 @@ def test_recovery_boundary_matches_the_new_claim_for_the_active_request(kind: st
         "started_at": T0,
         "runtime_claim_name": original,
         "runtime_owner": "acme-worker",
+        "runtime_epoch": 7,
         "status": "running",
     }
     proof.paid, proof.tracks = False, []

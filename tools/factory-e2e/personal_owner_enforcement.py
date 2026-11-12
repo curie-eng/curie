@@ -450,16 +450,33 @@ stub = [sys.executable, "/stub/github_stub.py", "serve", *sys.argv[1:]]
 os.execv(sys.executable, stub)
 """
 INTERRUPT_PROGRAM = """\
-import os, signal
+import json, os, pathlib, signal, sys, time
 me = os.getpid()
+target, expected_start = sys.argv[1:3]
+def native_state():
+    try:
+        stat = pathlib.Path('/proc/' + target + '/stat').read_text().rsplit(')', 1)[1].split()
+        return stat[0], stat[19]
+    except FileNotFoundError:
+        return None
+before = native_state()
+if target == '1' and expected_start == '0' and before is not None:
+    expected_start = before[1]
 for name in os.listdir("/proc"):
     if name.isdigit() and int(name) not in (1, me, os.getppid()):
         try:
             os.kill(int(name), signal.SIGKILL)
         except OSError:
             pass
+until = time.monotonic() + 2
+after = native_state()
+while (after is not None and after[0] != 'Z' and after[1] == expected_start
+       and time.monotonic() < until):
+    after = native_state()
+gone = after is None or after[0] == 'Z' or after[1] != expected_start
+print(json.dumps({'action': 'signal_processes', 'native_identity_matched':
+    before is not None and before[1] == expected_start, 'native_gone': gone}), flush=True)
 os.kill(1, signal.SIGTERM)
-print("interrupted")
 """
 KILL_PROGRAM = """\
 import os, signal, sys
@@ -616,6 +633,8 @@ def build_parser() -> argparse.ArgumentParser:
         sub.add_argument("--run-id", required=True)
         sub.add_argument("--disk-start-percent", type=int, default=82)
         sub.add_argument("--disk-stop-percent", type=int, default=88)
+        sub.add_argument("--prior-run-id", action="append", default=[])
+        sub.add_argument("--item-output-token-cap", type=int, default=poe.MAX_OUTPUT_TOKENS)
         sub.add_argument("--grant-file", required=grant, default="")
         sub.add_argument("--grant-expires-at", required=grant, default="")
 
@@ -662,10 +681,13 @@ def forwarded(args: argparse.Namespace) -> list[str]:
         "run_id",
         "grant_file",
         "grant_expires_at",
+        "item_output_token_cap",
     ):
         value = getattr(args, flag)
         if value:
             argv += ["--" + flag.replace("_", "-"), str(value)]
+    for run_id in args.prior_run_id:
+        argv += ["--prior-run-id", run_id]
     return argv
 
 
@@ -910,6 +932,7 @@ class Track:
     work_item_id: str = ""
     request_id: str = ""
     runtime_owner: str | None = None
+    runtime_epoch: int | None = None
     # The hook process of the hold last seen, and every transcript file the
     # native process wrote, latest bytes per path: one session's queries.
     hook_pid: int | None = None
@@ -993,6 +1016,7 @@ def owner_proof_class(e: Any) -> type[Any]:  # noqa: C901 - one scenario, one cl
             self.forward_count = 0
             # Pods whose logs could not be kept because they were already gone.
             self.captures_missing = 0
+            self.driver_pod_deletions: list[str] = []
             if self.paid:
                 self.grant_file = ctx.grant_file
                 # Well formed and never issued, so the provider refuses it.
@@ -1962,7 +1986,7 @@ def owner_proof_class(e: Any) -> type[Any]:  # noqa: C901 - one scenario, one cl
             rows: list[dict[str, Any]] = self.sql_rows(
                 "SELECT id, status, terminal_cause, terminal_at, termination_observation, "
                 "teardown_unconfirmed_at, runtime_claim_name, runtime_owner, started_at, "
-                "enrollment_generation FROM curie.execution_requests "
+                "enrollment_generation, runtime_epoch FROM curie.execution_requests "
                 "WHERE work_item_id = :w ORDER BY created_at",
                 {"w": uuid.UUID(work_item_id)},
             )
@@ -2044,6 +2068,7 @@ def owner_proof_class(e: Any) -> type[Any]:  # noqa: C901 - one scenario, one cl
             if not pod or not self.owns_namespace():
                 return
             try:
+                self.driver_pod_deletions.append(pod)
                 self.core.delete_namespaced_pod(
                     pod, self.namespace, grace_period_seconds=0, _request_timeout=5
                 )
@@ -2122,6 +2147,7 @@ def owner_proof_class(e: Any) -> type[Any]:  # noqa: C901 - one scenario, one cl
                     )
             with contextlib.suppress(Exception):
                 for pod in self.runner_pods():
+                    self.driver_pod_deletions.append(pod["metadata"]["name"])
                     self.core.delete_namespaced_pod(
                         pod["metadata"]["name"],
                         self.namespace,
@@ -2560,6 +2586,7 @@ def owner_proof_class(e: Any) -> type[Any]:  # noqa: C901 - one scenario, one cl
                     track.claim, track.restart_count = state["claim"], state["restarts"]
                     track.work_item_id, track.request_id = work_item_id, str(row["id"])
                     track.runtime_owner = row["runtime_owner"]
+                    track.runtime_epoch = row["runtime_epoch"]
                     return track
                 return None
 
@@ -2641,7 +2668,11 @@ def owner_proof_class(e: Any) -> type[Any]:  # noqa: C901 - one scenario, one cl
             open_usage: dict[int, poe.SessionUsage] = {}
             if track is not None and track.seq is not None and usage is not None and usage.known:
                 open_usage[track.seq] = usage
-            reading = self.ctx.ledger.check_spend(open_usage, time.time())
+            try:
+                reading = self.ctx.ledger.check_spend(open_usage, time.time())
+            except poe.Refusal:
+                self.fence()
+                raise
             if reading.breach is None:
                 return
             if track is not None and usage is not None:
@@ -2975,10 +3006,43 @@ def owner_proof_class(e: Any) -> type[Any]:  # noqa: C901 - one scenario, one cl
 
         def interrupt(self, kind: str, track: Track) -> dict[str, Any]:
             if kind == "process":
-                self.pod_exec(track.pod, INTERRUPT_PROGRAM, timeout=30)
-                return {"kind": kind}
+                claims_before = self.owner_claims()
+                deleted_before = len(self.driver_pod_deletions)
+                pid, start = track.cli.split(":")[1:] if self.paid else ("1", "0")
+                code, raw = self.pod_exec(track.pod, INTERRUPT_PROGRAM, pid, start, timeout=30)
+                try:
+                    witness = json.loads(raw)
+                except ValueError:
+                    witness = {}
+                row = next(
+                    (
+                        r
+                        for r in self.requests_of(track.work_item_id)
+                        if str(r["id"]) == track.request_id
+                    ),
+                    {},
+                )
+                claims_after = self.owner_claims()
+                facts = {
+                    "kind": kind,
+                    "exec_exit_code": code,
+                    "action": witness.get("action"),
+                    "native_identity_matched": witness.get("native_identity_matched"),
+                    "native_gone": witness.get("native_gone"),
+                    "driver_pod_delete_calls": len(self.driver_pod_deletions) - deleted_before,
+                    "old_epoch": track.runtime_epoch,
+                    "confirmed_epoch": row.get("runtime_epoch"),
+                    "old_claim_still_bound_to_request": (
+                        row.get("runtime_claim_name") == track.claim
+                    ),
+                    "successor_claim_observed": bool(set(claims_after) - set(claims_before)),
+                    "confirmed_at": time.time(),
+                }
+                self.observe("restart", "process.interruption_evidence", facts)
+                return facts
             if kind == "pod":
                 try:
+                    self.driver_pod_deletions.append(track.pod)
                     self.core.delete_namespaced_pod(
                         track.pod, self.namespace, grace_period_seconds=0, _request_timeout=30
                     )
@@ -3044,6 +3108,9 @@ def owner_proof_class(e: Any) -> type[Any]:  # noqa: C901 - one scenario, one cl
             self.settle(a, usage)
             self.reserve(b_slot)
             facts = self.interrupt(kind, a)
+            if kind == "process":
+                for key, value in poe.process_interruption_checks(facts).items():
+                    self.observe("restart", f"process.{key}", value)
             if selection is not None:
                 self.observe_selection(a, item, selection)
             b = self.boundary(b_slot, "read", work_item_id=work_item_id, exclude=[a.cli])
@@ -4021,6 +4088,7 @@ def child_main(args: argparse.Namespace, rt: Runtime) -> int:
         flags.state_dir, flags.run_id, create=True, scrub=rt.scrubber.scrub
     )
     ledger.begin(flags.candidate, "live" if paid else "rehearse", time.time())
+    ledger.configure_item(args.prior_run_id, args.item_output_token_cap, time.time())
     ctx = ChildContext(args.mode, flags, inputs, args.grant_file, args.grant_expires_at, ledger, rt)
 
     def record(name: str, ok: bool, detail: str) -> None:
@@ -4080,6 +4148,7 @@ def child_main(args: argparse.Namespace, rt: Runtime) -> int:
         "ceilings": poe.ceiling(),
         "disk": poe.disk_receipt(ledger),
         "observed": dataclasses.asdict(poe.spend_reading(ledger.rows())),
+        "item_usage": ledger.item_usage(),
         "sessions": [
             {
                 key: item[key]

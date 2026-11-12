@@ -482,6 +482,14 @@ the driver as a child whose environment holds only `PATH`, `HOME`, `LANG`,
 `SSH_AUTH_SOCK` and the names and paths the proof needs, with stdin from
 `/dev/null`. Only that child opens the grant file.
 
+A separately authorized attempt uses a new run ID. Pass `--prior-run-id` for
+each earlier attempt and `--item-output-token-cap` for the approved combined
+ceiling. The item ledger includes every session from those attempts. Settled
+native usage is measured; missing settlement is charged its full reservation
+share and remains unknown. Reservations and every response check enforce the
+combined cap as well as the unchanged per-attempt ceilings. These accounting
+flags grant no retry authority.
+
 `judge --criterion` takes `selection`, `fencing`, `authentication-required`,
 `disconnect`, `restart`, `hosted-header`, `budget`, `cleanup`, `rehearsal` or `all`. It
 reads only the private ledger, compares each observation with the expected
@@ -490,7 +498,8 @@ check's expected and observed value. Exit code 0 is a pass, 1 a failed or
 missing observation, 2 a refusal, and 3 a run whose only shortfall is a
 recorded Not met. A rehearsal ledger supports `--criterion cleanup` and `--criterion rehearsal`.
 The latter retains every reading and marks provider rejection, native tool calls,
-and the native response cap as `rehearsal_only`; it never treats them as live proof.
+native process epoch confirmation and the native response cap as `rehearsal_only`;
+it never treats them as live proof.
 A fake turn can finish and delete its Pod before log capture, so missing
 captures remain visible as `rehearsal_only`. The live confidentiality judge
 still requires complete captures. Product and cleanup failures fail the rehearsal judge.
@@ -602,8 +611,15 @@ three interruptions `restart` requires `HEAD` and the committed file hashes to
 equal the stub's on both sides, the interrupted runtime to be gone (the native
 process after a container restart, the Pod UID after deletion, the worker
 process after its kill), a fresh native process, and the same owner labels and
-generation on the recovered claim. The process interruption keeps the same Pod
-and its workspace volume, so its uncommitted nonce must survive. The Pod
+generation on the recovered claim. For process interruption, Pod identity and
+container restart are observations rather than pass conditions. The driver
+records the exact native process identity before signalling it, observes it
+gone, and confirms the request still binds the captured runtime epoch and
+claim before any successor owner claim appears. It records every driver Pod
+delete call and requires none during this interruption. The process case still
+requires its uncommitted nonce to survive. Live-provider recovery used a fresh
+Pod, while the fake-model rehearsal restarted the container in place. This is
+an observed difference. The Pod
 recreation stages the checkout again from its durable source, so committed
 state is restored and the uncommitted nonce is absent: that one check is
 recorded Not met citing #5541 (blocked by #5092), and the judge exits 3 when it
