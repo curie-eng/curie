@@ -291,6 +291,13 @@ Every environment command takes a **target noun** in the middle: `skill`,
 `curie init` is the exception, a top-level verb that scaffolds a bundle on
 disk and targets no environment.
 
+Personal Claude subscription mode (`CURIE_MODEL_AUTH_MODE=personal` or
+`FACTORY_MODEL_AUTH_MODE=personal` in the CLI's own environment) runs only on
+Kubernetes. `skill up`, `skill eval`, `local up` and `local rebuild` refuse it
+before any Docker call, including under `--dry-run`, with
+`personal_mode_requires_kubernetes` and exit code 2; unset the variable or use
+`curie cluster ...`.
+
 | Target | What runs | Slack | Kubernetes | Verbs | Reach for it to |
 |---|---|---|---|---|---|
 | `skill` | Just the runner container on the host Docker daemon. No platform, no queue, no API, no Slack. Fully offline. | none | none | `up` `check` `down` `status` `message` `eval` | Iterate a plugin/skill against a local runner, the fastest loop. |

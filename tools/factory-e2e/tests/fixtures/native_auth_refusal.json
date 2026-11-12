@@ -1,0 +1,75 @@
+{
+  "observed_cli_version": "2.1.317 (Claude Code)",
+  "environment": "empty HOME, filtered environment, well-formed invalid OAuth token omitted",
+  "native_stream": [
+    {
+      "type": "assistant",
+      "error": "authentication_failed",
+      "api_error_status": 401,
+      "message": {
+        "model": "<synthetic>",
+        "role": "assistant",
+        "type": "message",
+        "usage": {
+          "output_tokens_details": null,
+          "input_tokens": 0,
+          "output_tokens": 0,
+          "cache_creation_input_tokens": 0,
+          "cache_read_input_tokens": 0,
+          "server_tool_use": {
+            "web_search_requests": 0,
+            "web_fetch_requests": 0
+          },
+          "service_tier": null,
+          "cache_creation": {
+            "ephemeral_1h_input_tokens": 0,
+            "ephemeral_5m_input_tokens": 0
+          },
+          "inference_geo": null,
+          "iterations": null,
+          "speed": null,
+          "fallback_credit": null
+        },
+        "content": [
+          {
+            "type": "text",
+            "text": "Failed to authenticate. API Error: 401 OAuth access token is invalid."
+          }
+        ]
+      }
+    },
+    {
+      "type": "result",
+      "subtype": "success",
+      "is_error": true,
+      "api_error_status": 401,
+      "terminal_reason": "api_error",
+      "result": "Failed to authenticate. API Error: 401 OAuth access token is invalid.",
+      "usage": {
+        "output_tokens_details": {
+          "thinking_tokens": 0
+        },
+        "input_tokens": 0,
+        "cache_creation_input_tokens": 0,
+        "cache_read_input_tokens": 0,
+        "output_tokens": 0,
+        "server_tool_use": {
+          "web_search_requests": 0,
+          "web_fetch_requests": 0
+        },
+        "service_tier": "standard",
+        "cache_creation": {
+          "ephemeral_1h_input_tokens": 0,
+          "ephemeral_5m_input_tokens": 0
+        },
+        "inference_geo": "",
+        "iterations": [],
+        "speed": "standard",
+        "fallback_credit": null
+      },
+      "modelUsage": {}
+    }
+  ],
+  "native_debug_stderr": "2026-11-12T08:51:29.964Z [ERROR] API error (attempt 1/11): 401 401 {\"type\":\"error\",\"error\":{\"type\":\"authentication_error\",\"message\":\"OAuth access token is invalid.\"},\"request_id\":\"req_EXAMPLE\"}\n",
+  "exit_code": 1
+}

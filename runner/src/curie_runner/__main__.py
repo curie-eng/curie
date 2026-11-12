@@ -109,6 +109,12 @@ from .history import (
 )
 from .hooks import build_factory_foreground_hooks, build_gated_pre_tool_use_hooks, load_bundle_hooks
 from .issue_read import build_issue_tool, resolve_issue_read
+from .mcp_header_channel import (
+    connector_grant_env,
+    derived_header_placeholders,
+    hosted_header_values,
+    mount_hosted_header_channel,
+)
 from .mcp_tool_capability import (
     ConnectorAvailability,
     ConnectorCapabilityFailure,
@@ -1125,6 +1131,9 @@ def build_runner(
         connector_names=declared_secret_names(config.session.plugin_dir),
         server_groups=(bundle_servers, derived_mcp_servers),
     )
+    # Before any header is materialized: the hosted-header channel (#5378)
+    # relays exactly the values only this process will hold.
+    derived_headers = derived_header_placeholders(derived_mcp_servers)
     dropped = materialize_hosted_bearer_headers(derived_mcp_servers, spawn_env)
     if spawn_env is not os.environ:
         drop_connector_secret_names(os.environ, dropped)
@@ -1218,11 +1227,17 @@ def build_runner(
             connector_availability = ConnectorAvailability(boot_connector_failures)
             reprobe_servers = derived_mcp_servers
             reprobe_env = sdk_env
+            # The hosted-header mount below drops the grant's env name (#5378).
+            reprobe_grant = connector_grant_env(os.environ, sdk_env)
 
             async def reprobe(
                 failures: tuple[ConnectorCapabilityFailure, ...],
             ) -> tuple[ConnectorCapabilityFailure, ...]:
-                return await reprobe_connector_failures(failures, reprobe_servers, reprobe_env)
+                return await reprobe_connector_failures(
+                    failures,
+                    reprobe_servers,
+                    {**(reprobe_env or {}), **reprobe_grant} if reprobe_grant else reprobe_env,
+                )
 
             connector_reprobe = reprobe
 
@@ -1233,6 +1248,20 @@ def build_runner(
         # Per-turn tool access fronts ALL of them (RUNNER-TOOL-ACCESS-2): a call a
         # read-only turn may not make reaches no approval, bundle or factory
         # callback. On an unrestricted turn every front abstains.
+        # #5378: each runner-materialized hosted entry reaches the CLI as an
+        # in-process relay holding its headers, never as headers in the CLI's
+        # --mcp-config file. The gate, redaction, probe and re-probe above
+        # keep the real entries; only the CLI's map changes.
+        cli_connector_servers = mount_hosted_header_channel(
+            derived_mcp_servers,
+            derived_headers=derived_headers,
+            env={**os.environ, **(sdk_env or {})},
+            release=(spawn_env, os.environ),
+        )
+        relay_held = hosted_header_values(cli_connector_servers)
+        register_held_secrets(relay_held)
+        held_secrets = held_secrets | relay_held
+
         session_hooks = front_pre_tool_use_hooks(
             _merge_pre_tool_use_hooks(
                 build_gated_pre_tool_use_hooks(
@@ -1377,7 +1406,7 @@ def build_runner(
                     **bundle_servers,
                     **build_mcp_servers(
                         platform=platform_servers,
-                        derived=derived_mcp_servers,
+                        derived=cli_connector_servers,
                     ),
                 },
                 # Fronted only when a gate exists: with no callback the session keeps

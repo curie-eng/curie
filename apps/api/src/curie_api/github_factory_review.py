@@ -286,6 +286,11 @@ async def admit_parsed_feedback(
         request_id=uuid.uuid5(uuid.NAMESPACE_URL, feedback.event_id),
         reply_target=_reply_target(feedback, work_item),
         reply_url=url,
+        # The installation's mode and never an owner, as tracker ingress does: a
+        # personal installation refuses a service WorkItem, and a personal
+        # WorkItem's revision copies its locked tuple; a reviewer is not an
+        # owner (#5378).
+        model_auth_mode=settings.factory_model_auth_mode,
     )
     # Keep dispatch commits inside savepoints so the caller's issue lock remains
     # held until admission and delivery settlement commit together.

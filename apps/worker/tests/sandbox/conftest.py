@@ -1055,7 +1055,11 @@ class FakeSandboxClient:
             self.sandboxes.pop(claim.sandbox_name, None)
         self.deleted.append(name)
 
-    def list_claims(self, *, label_selector: str) -> list[ClaimView]:
+    def list_claims(
+        self, *, label_selector: str, request_timeout_seconds: float | None = None
+    ) -> list[ClaimView]:
+        # The owner inventory (#5378) bounds its read; any other caller omits it.
+        assert request_timeout_seconds is None or request_timeout_seconds > 0
         key, _, value = label_selector.partition("=")
         views = []
         for claim in self.claims.values():

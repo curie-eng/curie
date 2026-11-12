@@ -539,6 +539,14 @@ class EvalStreamConsumer(StreamConsumer):
 
     async def _run_and_report(self, item: EvalJob, stream_id: str) -> EvalRunResult:
         repo = await self._repo_lookup.repo_full_name(item.agent_id)
+        if self._config.factory_model_auth_mode == "personal":
+            # #5378, ADR 0268 decision 1: an eval runs as no owner, so a
+            # personal installation refuses it before any bundle read or
+            # claim. A decision, not a fault: INFO, a failed report, an ack.
+            logger.info("eval %s @ %s refused: personal_owner_required", item.suite, item.sha)
+            refused = EvalRunResult(version=item.sha, suite=item.suite, results=[])
+            await self._report(item, repo, refused, stream_id=stream_id)
+            return refused
         loaded = await self._load_suite(item)
         if loaded is None:
             return await self._report_failed(

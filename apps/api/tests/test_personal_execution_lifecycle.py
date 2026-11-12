@@ -16,8 +16,10 @@ Valkey are real; only forge HTTP would be faked, and no step here calls it.
 
 from __future__ import annotations
 
+import uuid
 from collections.abc import Iterator
 from datetime import timedelta
+from typing import Any
 from uuid import UUID, uuid4
 
 import personal_execution_support as support
@@ -26,13 +28,19 @@ from curie_api import workitem_dispatch
 from curie_api.config import get_settings
 from curie_api.main import create_app
 from curie_api.workitem_dispatch import (
+    AcquireGrant,
+    DeferResult,
+    DispatchConflict,
     HeartbeatResult,
     OwnerLostResult,
+    StartResult,
     TerminationClaim,
 )
 from curie_api.workitems import lifecycle
 from curie_api.workitems.lifecycle import WorkItemOutcome
 from fastapi.testclient import TestClient
+from forge_fakes import factory_wake, no_external_calls
+from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 from test_workitems import _grant_opened_pull_request
 
@@ -406,3 +414,162 @@ def test_approval_by_another_principal_changes_only_the_approval_facts(
         work_item_id=first.work_item_id,
         generations={first.request_id: world.generation},
     )
+
+
+# --- #5378: the start gate and start_failed retention -----------------------------------
+
+
+def _acquire(request_id: UUID) -> tuple[int, Any]:
+    """Acquire as the worker does; the generation and context its start names."""
+
+    async def body(session: AsyncSession) -> tuple[int, Any]:
+        generation = await session.scalar(
+            text("SELECT dispatch_generation FROM curie.execution_requests WHERE id = :id"),
+            {"id": request_id},
+        )
+        assert isinstance(generation, int), request_id
+        async with no_external_calls() as http_client:
+            acquired = await workitem_dispatch.acquire(
+                session,
+                request_id,
+                owner=support.RUNTIME_OWNER,
+                generation=generation,
+                wake=await factory_wake(session, request_id),
+                context=None,
+                client=http_client,
+            )
+        assert isinstance(acquired, AcquireGrant), acquired
+        return generation, acquired.context
+
+    return support.with_session(body)
+
+
+def _start(request_id: UUID, generation: int, context: Any) -> StartResult | DispatchConflict:
+    return support.with_session(
+        lambda session: workitem_dispatch.start(
+            session,
+            request_id,
+            owner=support.RUNTIME_OWNER,
+            generation=generation,
+            claim_name=support.CLAIM_NAME,
+            sandbox_name=support.SANDBOX_NAME,
+            context=context,
+        )
+    )
+
+
+def _defer(request_id: UUID, generation: int, reason: str) -> DeferResult | DispatchConflict:
+    return support.with_session(
+        lambda session: workitem_dispatch.defer(
+            session,
+            request_id,
+            owner=support.RUNTIME_OWNER,
+            generation=generation,
+            reason=reason,
+            capacity=False,
+            start_failure_detail=None,
+        )
+    )
+
+
+def _waiting_shape(request_id: UUID) -> dict[str, Any]:
+    [row] = support.rows(
+        "SELECT status, acquire_owner, started_at, terminal_cause "
+        "FROM curie.execution_requests WHERE id = :id",
+        {"id": request_id},
+    )
+    return row
+
+
+def _seed_transcript(agent_id: UUID, work_item_id: UUID) -> str:
+    [item] = support.rows(
+        "SELECT conversation_id FROM curie.work_items WHERE id = :id", {"id": work_item_id}
+    )
+    thread = str(item["conversation_id"])
+    support.rows(
+        "INSERT INTO curie.thread_transcripts (id, agent_id, thread_key, value) "
+        'VALUES (:id, :agent, :thread, CAST(\'[{"role": "user"}]\' AS jsonb))',
+        {"id": uuid.uuid4(), "agent": agent_id, "thread": thread},
+    )
+    return thread
+
+
+def _transcripts(agent_id: UUID, thread: str) -> int:
+    [row] = support.rows(
+        "SELECT count(*) AS n FROM curie.thread_transcripts "
+        "WHERE agent_id = :agent AND thread_key = :thread",
+        {"agent": agent_id, "thread": thread},
+    )
+    return int(row["n"])
+
+
+def test_start_refuses_a_personal_request_whose_enrollment_moved_and_leaves_it_waiting(
+    api: TestClient, world: support.World
+) -> None:
+    agent_id = support.insert_agent(world.tenant_id)
+    moved = support.admit_personal(api, WORKER_HEADERS, world, agent_id, issue_number=53781)
+    disabled = support.admit_personal(
+        api, WORKER_HEADERS, world, agent_id, issue_number=53782, conversation="53782.000100"
+    )
+    service = support.admit_service(
+        api, WORKER_HEADERS, agent_id, issue_number=53783, conversation="53783.000100"
+    )
+    moved_generation, moved_context = _acquire(moved.request_id)
+    disabled_generation, disabled_context = _acquire(disabled.request_id)
+
+    # The owner disconnects: no personal start, and the request is not ended.
+    support.set_enrollment_active(world, False)
+    refused = _start(disabled.request_id, disabled_generation, disabled_context)
+    assert isinstance(refused, DispatchConflict), refused
+    assert refused.code == "enrollment_inactive"
+    assert _waiting_shape(disabled.request_id) == {
+        "status": "waiting",
+        "acquire_owner": support.RUNTIME_OWNER,
+        "started_at": None,
+        "terminal_cause": None,
+    }
+    # Liveness: reconnected at the same generation, the same acquire starts.
+    support.set_enrollment_active(world, True)
+    started = _start(disabled.request_id, disabled_generation, disabled_context)
+    assert isinstance(started, StartResult), started
+
+    # The owner replaces the subscription: the request's generation is stale.
+    support.advance_enrollment(world)
+    refused = _start(moved.request_id, moved_generation, moved_context)
+    assert isinstance(refused, DispatchConflict), refused
+    assert refused.code == "enrollment_generation_mismatch"
+    assert _waiting_shape(moved.request_id)["status"] == "waiting"
+    assert _waiting_shape(moved.request_id)["acquire_owner"] == support.RUNTIME_OWNER
+    # A service request never consults an enrollment.
+    assert support.start_request(service.request_id) >= 1
+
+
+def test_a_personal_start_failed_keeps_the_transcript_and_a_service_one_does_not(
+    api: TestClient, world: support.World
+) -> None:
+    agent_id = support.insert_agent(world.tenant_id)
+    personal = support.admit_personal(api, WORKER_HEADERS, world, agent_id, issue_number=53784)
+    service = support.admit_service(
+        api, WORKER_HEADERS, agent_id, issue_number=53785, conversation="53785.000100"
+    )
+    limit = get_settings().work_item_start_deferral_limit
+    threads: dict[UUID, str] = {}
+    for admitted in (personal, service):
+        threads[admitted.request_id] = _seed_transcript(agent_id, admitted.work_item_id)
+        # One start deferral short of the limit, as earlier refused deliveries leave it.
+        support.rows(
+            "UPDATE curie.execution_requests SET start_deferrals = :n WHERE id = :id",
+            {"n": limit - 1, "id": admitted.request_id},
+        )
+        generation, _context = _acquire(admitted.request_id)
+        deferred = _defer(admitted.request_id, generation, "not_started:enrollment_inactive")
+        assert isinstance(deferred, DeferResult), deferred
+        assert deferred.terminal_cause == "start_failed"
+
+    # The owner resumes a personal WorkItem after reconnecting, so its history stays.
+    assert _transcripts(agent_id, threads[personal.request_id]) == 1
+    assert _transcripts(agent_id, threads[service.request_id]) == 0
+    assert support.rows(
+        "SELECT cancelled_at FROM curie.work_items WHERE id = :id",
+        {"id": personal.work_item_id},
+    ) == [{"cancelled_at": None}]

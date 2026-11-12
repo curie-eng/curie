@@ -70,6 +70,7 @@ from .work_items import _SettlingWorkItem
 
 if TYPE_CHECKING:
     from ..factory_steering import FactorySteeringClient
+    from ..personal_execution import PersonalExecution
 
 
 class Kernel:
@@ -111,6 +112,7 @@ class Kernel:
         bundles: BundleReader | None = None,
         recovery: WorkspaceRecoveryCapture | None = None,
         factory_steering: FactorySteeringClient | None = None,
+        personal_execution: PersonalExecution | None = None,
     ) -> None:
         self._substrate = substrate
         self._runner = runner
@@ -198,6 +200,10 @@ class Kernel:
         # ordinary path; wired, a mention in a factory run's Slack root is
         # answered by the API's steering decision and never claims a sandbox.
         self._factory_steering = factory_steering
+        # The personal execution authority (#5378, ADR 0268). Every production
+        # entry point wires it; a WorkItem request is then launched only as the
+        # owner its own snapshot names. None (a unit harness) enforces nothing.
+        self._personal_execution = personal_execution
         # ADR 0100: where a turn's channel read grant is read from (the stored
         # bundle's manifest). None means the grant is never known locally.
         self._bundles = bundles

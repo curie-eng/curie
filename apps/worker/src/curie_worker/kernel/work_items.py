@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import functools
 import json
 import uuid
 from dataclasses import dataclass
@@ -14,7 +15,7 @@ from aci_protocol import (
 from ..binding import FactoryWake
 from ..delivery_lease import DeliveryLease
 from ..killswitch import KillSwitch
-from ..sandbox.types import SandboxHandle
+from ..sandbox.types import SandboxHandle, WorkItemRouteOwner
 from ..threadlock import LockLeaseLost
 from ..workitem_dispatch import (
     TerminationClaim,
@@ -722,8 +723,38 @@ async def _release_work_item_sandbox(self: Kernel, run: WorkItemRun) -> None:
     await _release_claim_locked(self, thread_key, claim_name)
 
 
-async def _release_claim_locked(self: Kernel, thread_key: str, claim_name: str) -> None:
-    """The plain release: lock the thread, release the recorded claim, unlock."""
+async def _release_unstarted_personal_claim(self: Kernel, run: WorkItemRun) -> None:
+    """Free the owner's one native process before a personal request waits (#5378).
+
+    A waiting request otherwise keeps its claim for the next acquire of the
+    thread to adopt, but a personal claim is the owner's only slot, and a
+    request cancelled while it waits gets no terminate wake to release it.
+    Fenced to the claim this run recorded, and observed gone.
+    """
+
+    if not run.started and run.claim_name is not None:
+        await _release_claim_locked(
+            self,
+            run.thread_key,
+            run.claim_name,
+            wait_gone=True,
+            expected_owner=WorkItemRouteOwner(str(run.request_id), run.generation, run.owner),
+        )
+
+
+async def _release_claim_locked(
+    self: Kernel,
+    thread_key: str,
+    claim_name: str,
+    *,
+    wait_gone: bool = False,
+    expected_owner: WorkItemRouteOwner | None = None,
+) -> None:
+    """The plain release: lock the thread, release the recorded claim, unlock.
+
+    ``wait_gone`` also waits, bounded, for the claim and its sandbox to be
+    absent (#5378: a refused personal start leaves the owner's slot free).
+    """
 
     try:
         token = await asyncio.wait_for(
@@ -738,19 +769,35 @@ async def _release_claim_locked(self: Kernel, thread_key: str, claim_name: str) 
         )
         return
     try:
-        await _release_claim(self, thread_key, claim_name)
+        if expected_owner is not None and not await asyncio.to_thread(
+            self._substrate.owns_work_item_claim, thread_key, claim_name, expected_owner
+        ):
+            return
+        await _release_claim(self, thread_key, claim_name, wait_gone=wait_gone)
     finally:
         await self._lock.release(self._config.lock_key(thread_key), token)
 
 
-async def _release_claim(self: Kernel, thread_key: str, claim_name: str) -> None:
+async def _release_claim(
+    self: Kernel, thread_key: str, claim_name: str, *, wait_gone: bool = False
+) -> None:
     """Release ``claim_name`` if the route still names it. Caller holds the lock."""
 
     try:
-        released = await asyncio.wait_for(
-            asyncio.to_thread(self._substrate.release_if_claim, thread_key, claim_name),
-            constants._RESET_RELEASE_TIMEOUT_S,
-        )
+        if wait_gone:
+            released = await asyncio.wait_for(
+                asyncio.to_thread(
+                    functools.partial(
+                        self._substrate.release_if_claim, thread_key, claim_name, wait_gone=True
+                    )
+                ),
+                constants._ENROLLMENT_REFUSAL_RELEASE_TIMEOUT_S,
+            )
+        else:
+            released = await asyncio.wait_for(
+                asyncio.to_thread(self._substrate.release_if_claim, thread_key, claim_name),
+                constants._RESET_RELEASE_TIMEOUT_S,
+            )
         if released and self._workspace is not None:
             await asyncio.to_thread(self._workspace.release, thread_key)
     except Exception:  # noqa: BLE001 - broad catch kept at a failure boundary

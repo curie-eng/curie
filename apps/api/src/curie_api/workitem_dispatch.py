@@ -49,6 +49,7 @@ from .models import (
     AgentChannel,
     ExecutionRequest,
     FactoryBaseTransition,
+    PersonalClaudeEnrollment,
     WorkItem,
 )
 from .personal_execution import (
@@ -1433,6 +1434,13 @@ async def start(
         return await _defer_factory_refusal(
             session, work_item, request, owner=owner, generation=generation, refusal=refusal
         )
+    enrollment_refusal = await _personal_enrollment_refusal(session, request)
+    if enrollment_refusal is not None:
+        # #5378: the request stays waiting with its acquire held, so the worker
+        # releases the claim it made and defers; revalidation can rebind it.
+        return await _refuse(
+            session, enrollment_refusal, work_item_id=work_item.id, request_id=request.id
+        )
     settings = get_settings()
     ttl = timedelta(seconds=settings.work_item_runtime_ttl_seconds)
     result = await start_execution_where(
@@ -1477,11 +1485,43 @@ async def start(
     )
 
 
+async def _personal_enrollment_refusal(
+    session: AsyncSession, request: ExecutionRequest
+) -> Literal["enrollment_inactive", "enrollment_generation_mismatch"] | None:
+    """Whether a personal request's owner is still enrolled at its generation (#5378).
+
+    Read ``FOR SHARE`` after the WorkItem and request locks, the order an
+    enrollment publish takes, so a disconnect or replacement cannot commit
+    between this check and the start below. A service request passes.
+    """
+
+    if request.model_auth_mode != "personal":
+        return None
+    enrollment = (
+        await session.execute(
+            select(PersonalClaudeEnrollment.generation, PersonalClaudeEnrollment.active)
+            .where(
+                PersonalClaudeEnrollment.tenant_id == request.tenant_id,
+                PersonalClaudeEnrollment.principal_id == request.owner_principal_id,
+            )
+            .with_for_update(read=True)
+        )
+    ).one_or_none()
+    if enrollment is None or not enrollment.active:
+        return "enrollment_inactive"
+    if enrollment.generation != request.enrollment_generation:
+        return "enrollment_generation_mismatch"
+    return None
+
+
 def _map_start_conflict(result: WorkItemConflict) -> RefusalCode:
     if result.code in {
         "not_found",
         "work_item_cancelled",
         "waiting_deadline_elapsed",
+        # #5378: the worker keeps a personal request waiting on these.
+        "enrollment_inactive",
+        "enrollment_generation_mismatch",
     }:
         return cast(RefusalCode, result.code)
     return "not_dispatchable"

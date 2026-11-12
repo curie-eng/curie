@@ -34,7 +34,7 @@ from curie_api import workitem_dispatch
 from curie_api.config import get_settings
 from curie_api.main import create_app
 from curie_api.models import ExecutionRequest, PersonalClaudeEnrollment, WorkItem
-from curie_api.workitem_dispatch import AcquireGrant
+from curie_api.workitem_dispatch import AcquireGrant, DeferResult
 from curie_api.workitems import lifecycle
 from curie_api.workitems.lifecycle import EnrollmentFence, WorkItemOutcome
 from fastapi.testclient import TestClient
@@ -657,10 +657,22 @@ def test_reclaim_refuses_after_a_sibling_acquires_between_claims(
     assert refused["runtime_heartbeat_expires_at"] == claimed["runtime_heartbeat_expires_at"]
     assert refused["teardown_unconfirmed_at"] is not None
 
-    # Liveness: once the sibling is terminal again the same claim succeeds.
-    sibling_epoch = support.start_request(sibling)
-    _conflict(_claim(api, first.request_id), "not_running")
-    support.finish_failed(sibling, sibling_epoch, cause="model_error")
+    # Liveness: once the sibling no longer holds the sandbox the same claim
+    # succeeds. A fenced sibling can never start, because start refuses its
+    # stale generation, so the worker releases its acquire by deferring it.
+    generation = support.request_column(sibling, "dispatch_generation")
+    deferred = support.with_session(
+        lambda session: workitem_dispatch.defer(
+            session,
+            sibling,
+            owner=support.RUNTIME_OWNER,
+            generation=generation,
+            reason="not_started:enrollment_generation_mismatch",
+            capacity=False,
+            start_failure_detail=None,
+        )
+    )
+    assert isinstance(deferred, DeferResult), deferred
     reclaim = _claimed(api, first.request_id)
     assert reclaim["runtime_epoch"] == epoch
     assert reclaim["request_version"] == first_claim["request_version"] + 1

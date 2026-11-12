@@ -96,8 +96,12 @@ OWNER_LOST_RETRY_LIMIT = 3
 # (#5377). A force-settled ``cancelled`` request owes one too, by its own path.
 TEARDOWN_TERMINAL_STATUSES = ("completed", "failed", "expired")
 # A personal request ending with one of these is resumed by its owner after a
-# replace or reconnect, so its WorkItem keeps its transcript (#5377).
-_RESUMABLE_PERSONAL_CAUSES = frozenset({"enrollment_fenced", "authentication_required"})
+# replace or reconnect, so its WorkItem keeps its transcript (#5377). A personal
+# request whose start deferrals ran out (``start_failed``, #5378) is resumed the
+# same way, after reconnect and revalidation.
+_RESUMABLE_PERSONAL_CAUSES = frozenset(
+    {"enrollment_fenced", "authentication_required", "start_failed"}
+)
 
 _NO_READMIT: dict[str, Any] = {
     "readmit_request_id": None,
@@ -502,7 +506,8 @@ async def settle_terminal(
     pending relabel continues the WorkItem, so its transcript survives. So
     does a personal request stopped by an enrollment fence or ending
     authentication-required on an uncancelled WorkItem (#5377, ADR 0268
-    section 3): its owner resumes it after a replace or reconnect.
+    section 3): its owner resumes it after a replace or reconnect. A personal
+    request that ended ``start_failed`` keeps it too (#5378).
     """
 
     if request.terminal_at is None:

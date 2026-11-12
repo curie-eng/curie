@@ -53,6 +53,7 @@ pub mod observability;
 pub mod oci_registry;
 pub mod openrouter_credit;
 pub mod ops;
+pub mod personal_mode;
 pub mod process_migrate;
 pub mod queue;
 pub mod recipes;

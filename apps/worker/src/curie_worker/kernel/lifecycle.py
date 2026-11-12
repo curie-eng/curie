@@ -17,7 +17,7 @@ from channel_protocol.reply import (
 from curie_internal import sandbox_token
 from opentelemetry.trace import SpanKind, StatusCode
 
-from .. import sweep
+from .. import personal_execution, sweep
 from ..behaviorpacks import (
     BehaviorPacks,
 )
@@ -47,12 +47,14 @@ from ..hook_runs import HookRunOutcome, HookRunReason, HookRunRecorderError, ret
 from ..reply_sink import (
     TargetRoute,
 )
+from ..sandbox.types import OwnerBusy, PersonalLaunchRefused
 from ..turn_progress import (
     ELIGIBILITY_ENV,
     plan_turn_progress,
     progress_eligible,
 )
 from ..workitem_dispatch import (
+    _FACTORY_AUTHORITY_REFUSALS,
     WorkItemConflict,
     WorkItemRun,
     WorkItemStartRefused,
@@ -76,6 +78,7 @@ from . import (
     log,
     memory,
     routing,
+    work_items,
     workspace,
 )
 from .log import logger
@@ -276,6 +279,7 @@ async def _process_event(
 
     owned_work_item_id: uuid.UUID | None = None
     owned_token = constants._OWNED_WORK_ITEM.set(None)
+    personal_token = constants._PERSONAL_LAUNCH.set(None)
     publication_token = constants._PUBLICATION_CONTEXT.set(None)
     progress_token = constants._TURN_PROGRESS.set(None)
     try:
@@ -558,6 +562,26 @@ async def _process_event(
                 )
                 return
 
+        # #5378, ADR 0268 decision 1: a personal installation runs only as a
+        # WorkItem request's owner. A turn with no owner (a plain run, a cron
+        # or webhook hook, a continuation outside a WorkItem) is refused here,
+        # before any binding lookup, card, claim or model call, and answered
+        # once. A decision, not a fault: INFO, and the entry is acked.
+        if owned_work_item_id is None and self._config.factory_model_auth_mode == "personal":
+            logger.info("event %s refused: personal_owner_required", event_id)
+            if not targetless:
+                await self._reply_for(qevent, route, constants._PERSONAL_OWNER_REQUIRED_REPLY)
+            await self._complete(
+                qevent,
+                route,
+                "dropped",
+                telemetry_outcome="interrupted",
+                lease=lease,
+                hook_outcome="blocked",
+                hook_reason="identity_refused",
+            )
+            return
+
         # If this is an approval resume, settle its live card before running
         # the continuation: expired (#419) or resolved (#1084). Best-effort,
         # and gated on the resume event id so an ordinary turn pays nothing.
@@ -821,6 +845,11 @@ async def _process_event(
                             # is refused once it committed; the request ended.
                             factory_run.finished = True
                     await self._markers.mark_done(event_id, marker_value="1")
+                    return
+                # #5378: the request's own owner snapshot decides its mode. A
+                # refused personal launch settles here, before any boot env
+                # or claim; a service request carries no launch at all.
+                if await _start_personal_launch(self, factory_run, event_id):
                     return
             else:
                 try:
@@ -1397,6 +1426,55 @@ async def _process_event(
                 return
             except failures._WorkItemDeferred:
                 return
+            except PersonalLaunchRefused as exc:
+                release_order()
+                refused_run = (
+                    self._work_item_runs.get(owned_work_item_id)
+                    if owned_work_item_id is not None
+                    else None
+                )
+                if refused_run is not None:
+                    await _settle_personal_refusal(self, refused_run, exc, event_id)
+                    return
+                # A delivery with no personal launch met a runtime that booted
+                # with a personal grant (#5378): it never steers into it.
+                logger.info("event %s refused: %s", event_id, exc.code)
+                if not targetless:
+                    await self._reply_for(qevent, route, constants._PERSONAL_RUNTIME_REFUSED_REPLY)
+                await self._complete(
+                    qevent,
+                    route,
+                    "dropped",
+                    telemetry_outcome="interrupted",
+                    lease=lease,
+                    hook_outcome="blocked",
+                    hook_reason="identity_refused",
+                )
+                return
+            except OwnerBusy:
+                # ADR 0268 decision 2: the owner's one native process is in
+                # use. A waiting request waits for it like capacity, without
+                # spending start attempts. A started continuation retries as
+                # sandbox capacity within this loop's existing bound, and
+                # never through pressure reclamation.
+                release_order()
+                busy_run = (
+                    self._work_item_runs.get(owned_work_item_id)
+                    if owned_work_item_id is not None
+                    else None
+                )
+                logger.info("event %s waiting for its owner's runtime slot", event_id)
+                if busy_run is not None and not busy_run.started:
+                    try:
+                        await busy_run.defer("owner_busy", capacity=True, start_failure_detail=None)
+                    except WorkItemConflict as conflict:
+                        logger.info(
+                            "work-item owner_busy defer refused for %s: %s",
+                            event_id,
+                            conflict.code,
+                        )
+                    return
+                outcome = failures.TurnOutcome(terminal_ok=False, classification="sandbox-capacity")
             except failures.SweepClaimGone as exc:
                 # ADR-0160: a continuation never claims, resumes or hands off
                 # a sandbox. The sweep stops; ``_complete`` posts the notice.
@@ -1417,6 +1495,39 @@ async def _process_event(
                     event_id,
                     exc.code,
                 )
+                if exc.code in constants._WORK_ITEM_ENROLLMENT_START_REFUSALS:
+                    # #5378: the owner's enrollment moved after the claim was
+                    # made. The request stays waiting; release exactly that
+                    # claim, observed gone, then defer so it can be rebound.
+                    refused_run = (
+                        self._work_item_runs.get(owned_work_item_id)
+                        if owned_work_item_id is not None
+                        else None
+                    )
+                    if refused_run is not None:
+                        await _settle_personal_refusal(
+                            self,
+                            refused_run,
+                            personal_execution.refused(exc.code),
+                            event_id,
+                        )
+                    return
+                if (
+                    exc.code in _FACTORY_AUTHORITY_REFUSALS
+                    and constants._PERSONAL_LAUNCH.get() is not None
+                ):
+                    # #5378: the API deferred this personal request itself
+                    # (``_defer_factory_refusal``) and it stays waiting.
+                    # Release the claim this delivery recorded, so the
+                    # owner's one slot is free; no second defer.
+                    refused_run = (
+                        self._work_item_runs.get(owned_work_item_id)
+                        if owned_work_item_id is not None
+                        else None
+                    )
+                    if refused_run is not None:
+                        await work_items._release_unstarted_personal_claim(self, refused_run)
+                    return
                 if exc.code in constants._WORK_ITEM_TERMINAL_START_REFUSALS:
                     # #3208: the request settled before a turn opened, so
                     # this delivery is the only one that can release the
@@ -1904,6 +2015,7 @@ async def _process_event(
                         # nothing on this thread needs the sandbox (#3075).
                         await self._release_work_item_sandbox(owned_run)
         constants._OWNED_WORK_ITEM.reset(owned_token)
+        constants._PERSONAL_LAUNCH.reset(personal_token)
         constants._PUBLICATION_CONTEXT.reset(publication_token)
         constants._TURN_PROGRESS.reset(progress_token)
         release_order()
@@ -1934,6 +2046,61 @@ async def _process_event(
         # its chance to read it. Popping earlier would make the shimmer clear
         # address a message the rest of the turn had already adopted.
         self._minted_refs.pop(event_id, None)
+
+
+async def _start_personal_launch(self: Kernel, run: WorkItemRun, event_id: str) -> bool:
+    """Carry this delivery's personal launch, or settle its refusal (#5378).
+
+    True when the request was refused and settled: the caller returns. A
+    service request carries no launch. A kernel built without the personal
+    execution service (``Kernel(personal_execution=...)``) enforces nothing.
+    """
+
+    service = self._personal_execution
+    if service is None:
+        return False
+    try:
+        launch = await service.launch_for(run)
+    except PersonalLaunchRefused as exc:
+        await _settle_personal_refusal(self, run, exc, event_id)
+        return True
+    constants._PERSONAL_LAUNCH.set(launch)
+    return False
+
+
+async def _settle_personal_refusal(
+    self: Kernel, run: WorkItemRun, exc: PersonalLaunchRefused, event_id: str
+) -> None:
+    """Settle a refused personal execution the way a binding refusal settles.
+
+    Decision 3 of #5378: an unstarted request defers ``not_started:<code>``
+    (bounded by the start deferral limit, ending ``start_failed``), first
+    releasing the claim this delivery recorded unless the refusal is one of
+    ``_PERSONAL_REFUSALS_KEEPING_CLAIM``. A started request finishes failed:
+    ``authentication_required`` for grant refusals and enrollment fences,
+    ``runner_escalated`` for structural refusals.
+    """
+
+    logger.info("personal execution refused for %s: %s", event_id, exc.code)
+    try:
+        if run.started:
+            await run.finish(
+                outcome="failed",
+                cause=(
+                    "authentication_required" if exc.authentication_required else "runner_escalated"
+                ),
+                detail=f"The personal execution was refused ({exc.code}).",
+                ci_fix_round=None,
+            )
+        else:
+            if exc.code not in constants._PERSONAL_REFUSALS_KEEPING_CLAIM:
+                await work_items._release_unstarted_personal_claim(self, run)
+            await run.defer(f"not_started:{exc.code}", capacity=False, start_failure_detail=None)
+    except WorkItemConflict as conflict:
+        logger.info("personal refusal settlement for %s refused: %s", event_id, conflict.code)
+        if run.started and conflict.code == "not_running":
+            run.finished = True
+    await self._markers.mark_done(event_id, marker_value="1")
 
 
 def _acquire_order_entry(self: Kernel, thread_key: str) -> delivery._LockEntry:
