@@ -2978,7 +2978,10 @@ def owner_proof_class(e: Any) -> type[Any]:  # noqa: C901 - one scenario, one cl
         def prepare_remaining(self) -> None:
             issue, conversation = self.issues["worker"], PAIRS[2][1]
             item = self.admit_owner(
-                issue, conversation, self.objective(hosted=self.ctx.phases == "post-rejection"), 1
+                issue,
+                conversation,
+                self.objective(hosted=self.paid and self.ctx.phases == "post-rejection"),
+                1,
             )
             self.seed_history(str(item["conversation_id"]))
             self.headers_seen["replaced"] = self.write(

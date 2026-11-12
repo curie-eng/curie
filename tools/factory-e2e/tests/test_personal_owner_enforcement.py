@@ -1704,6 +1704,27 @@ def test_phase_scope_keeps_every_remaining_phase(tmp_path: Path, mode: str) -> N
     assert ("remaining-generation" in order) == (mode != "full")
 
 
+@pytest.mark.parametrize("paid", [False, True])
+def test_post_rejection_bootstrap_uses_an_observable_unpaid_turn(paid: bool) -> None:
+    from types import SimpleNamespace
+
+    proof = _proof()
+    proof.paid = paid
+    proof.ctx = SimpleNamespace(phases="post-rejection")
+    proof.issues = {"worker": "example-issue"}
+    proof.files = {"token-invalid": "invalid-control-file"}
+    proof.headers_seen = {"enrolled": {"generation": 1}}
+    admitted: list[str] = []
+    proof.admit_owner = lambda issue, conversation, objective, generation: (
+        admitted.append(objective) or {"id": "example-item", "conversation_id": "example-thread"}
+    )
+    proof.seed_history = lambda _: None
+    proof.write = lambda *args, **kwargs: {"generation": 2}
+    proof.revalidate_item = lambda _: (200, 2, None)
+    proof.prepare_remaining()
+    assert admitted == [driver.HOSTED_OBJECTIVE if paid else driver.REHEARSE_PAIR_OBJECTIVE]
+
+
 @pytest.mark.parametrize("changed_product", [False, True])
 def test_scope_reuses_only_proven_criteria_with_unchanged_product(
     tmp_path: Path,
