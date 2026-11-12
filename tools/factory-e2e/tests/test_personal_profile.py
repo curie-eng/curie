@@ -3195,6 +3195,77 @@ def test_forge_probe_never_deletes_a_branch_it_did_not_create(
     assert not any(method == "PATCH" for method, _path in _ProbeForge.writes)
 
 
+class _OwnedProbeForge(_ProbeForge):
+    """The probe creates its own branch; the ref listing lags the delete by ``lag`` reads."""
+
+    lag = 0
+    reads_after_delete = 0
+    deleted = False
+
+    def request(self, method: str, path: str, body: Any = None) -> tuple[int, Any]:
+        if "/git/ref/heads/ppa-probe-" in path and method == "GET":
+            if not type(self).deleted:
+                return 200, {"object": {"sha": OWN_SHA}}
+            type(self).reads_after_delete += 1
+            if type(self).reads_after_delete > type(self).lag:
+                return 404, {}
+            return 200, {"object": {"sha": OWN_SHA}}
+        if method == "DELETE":
+            type(self).deleted = True
+            _ProbeForge.writes.append((method, path))
+            return 204, {}
+        if method == "POST" and path.endswith("/git/refs"):
+            return 201, {}
+        if method == "POST" and path.endswith("/pulls"):
+            return 201, {"number": 7}
+        if method == "GET" and path.endswith("/pulls/7"):
+            closed = any(m == "PATCH" for m, _p in _ProbeForge.writes)
+            return 200, {"head": {"sha": OWN_SHA}, "state": "closed" if closed else "open"}
+        return super().request(method, path, body)
+
+
+def _run_owned_probe(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, forge: type[_OwnedProbeForge], lag: int
+) -> int:
+    forge.lag = lag
+    forge.reads_after_delete = 0
+    forge.deleted = False
+    monkeypatch.setattr(pp, "Forge", forge)
+    return pp.main(
+        [
+            "forge-probe",
+            "--candidate",
+            CANDIDATE,
+            "--state-dir",
+            str(_private(tmp_path / "state")),
+            "--run-id",
+            "probe-lag",
+            "--app-dir",
+            str(_app_dir(_private(tmp_path / "apps"))),
+        ],
+        environ={"PATH": "/usr/bin:/bin", "HOME": str(tmp_path)},
+        clock=_FakeClock(T0),
+    )
+
+
+def test_forge_probe_waits_for_the_ref_listing_to_catch_up_with_the_delete(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    code = _run_owned_probe(tmp_path, monkeypatch, _OwnedProbeForge, lag=2)
+    assert code == 0, capsys.readouterr()
+    assert _OwnedProbeForge.reads_after_delete == 3
+
+
+def test_forge_probe_fails_when_the_branch_never_disappears(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    code = _run_owned_probe(tmp_path, monkeypatch, _OwnedProbeForge, lag=10_000)
+    capsys.readouterr()
+    assert code == 1
+    # Bounded: about 30 s at one read per 2 s, not unbounded.
+    assert _OwnedProbeForge.reads_after_delete <= 17
+
+
 # --------------------------------------------------------------------------
 # A cut final record, the runner image, and retained volumes
 # --------------------------------------------------------------------------

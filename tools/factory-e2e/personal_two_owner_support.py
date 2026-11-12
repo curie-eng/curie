@@ -1846,7 +1846,7 @@ def dex_manifests(
                                 "name": "dex",
                                 "image": image_ref,
                                 "imagePullPolicy": "IfNotPresent",
-                                "args": ["dex", "serve", f"/etc/dex/{DEX_CONFIG_KEY}"],
+                                "command": ["dex", "serve", f"/etc/dex/{DEX_CONFIG_KEY}"],
                                 "ports": [{"name": "http", "containerPort": DEX_PORT}],
                                 "readinessProbe": {"tcpSocket": {"port": DEX_PORT}},
                                 "resources": {
@@ -1859,11 +1859,15 @@ def dex_manifests(
                                     "capabilities": {"drop": ["ALL"]},
                                 },
                                 "volumeMounts": [
-                                    {"name": "config", "mountPath": "/etc/dex", "readOnly": True}
+                                    {"name": "config", "mountPath": "/etc/dex", "readOnly": True},
+                                    {"name": "tmp", "mountPath": "/tmp"},
                                 ],
                             }
                         ],
-                        "volumes": [{"name": "config", "secret": {"secretName": config_secret}}],
+                        "volumes": [
+                            {"name": "config", "secret": {"secretName": config_secret}},
+                            {"name": "tmp", "emptyDir": {}},
+                        ],
                     },
                 },
             },

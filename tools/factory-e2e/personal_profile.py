@@ -1353,7 +1353,15 @@ def cmd_forge_probe(args: argparse.Namespace, runtime: Runtime) -> int:
             ):
                 raise StepFailed("probe branch head is not this run's commit; not deleting")
             status, _ = forge.request("DELETE", forge.repo_path(f"/git/refs/heads/{branch}"))
-            gone, _ = forge.request("GET", forge.repo_path(f"/git/ref/heads/{branch}"))
+            gone = 0
+            if status in {204, 422}:
+                # GitHub's ref listing lags the DELETE by a few seconds.
+                deadline = runtime.clock.now() + 30.0
+                while True:
+                    gone, _ = forge.request("GET", forge.repo_path(f"/git/ref/heads/{branch}"))
+                    if gone == 404 or runtime.clock.now() >= deadline:
+                        break
+                    runtime.clock.wait(2.0)
             results["forge_branch_deleted"] = status in {204, 422} and gone == 404
             if not results["forge_branch_deleted"]:
                 raise StepFailed("probe branch still exists")

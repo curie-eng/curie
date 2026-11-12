@@ -1141,6 +1141,57 @@ def test_install_applies_dex_before_helm_with_no_runner_grant(tmp_path: Path) ->
     assert h.ledger.observations("install")["dex_image_running"] is True
 
 
+def test_stalled_rollout_records_the_log_tail_of_each_restarting_container(
+    tmp_path: Path,
+) -> None:
+    h = _harness(tmp_path)
+    secret = "s3cr3t-marker-value"
+    h.run.scrubber.hold(pps.HeldSecret(secret))
+    crashed = {
+        "metadata": {"name": "dex-0"},
+        "status": {
+            "containerStatuses": [
+                {
+                    "name": "dex",
+                    "restartCount": 4,
+                    "state": {"waiting": {"reason": "CrashLoopBackOff"}},
+                },
+                {"name": "side", "restartCount": 0, "state": {"running": {}}},
+            ]
+        },
+    }
+    fresh = {
+        "metadata": {"name": "api-0"},
+        "status": {
+            "containerStatuses": [
+                {"name": "api", "restartCount": 1, "state": {"running": {}}},
+                {"name": "gone", "restartCount": 2, "state": {"running": {}}},
+            ]
+        },
+    }
+    h.shell.on("get", "pods", "-o", "json")(lambda _a, _s: {"items": [crashed, fresh]})
+    h.shell.on("logs", "dex-0", "--previous")(
+        lambda _a, _s: ("boom\n" * 5 + secret + "\n" + "x" * 5000).encode()
+    )
+    # api: no previous log yet, the current one is read.
+    h.shell.on("logs", "api-0", "-c", "api", "--previous")(lambda _a, _s: pp.Completed(1, b"", b""))
+    h.shell.on("logs", "api-0", "-c", "api")(lambda _a, _s: b"listening\n")
+    # gone: neither read works, so it is recorded as unavailable and nothing raises.
+    h.shell.on("logs", "api-0", "-c", "gone")(lambda _a, _s: pp.Completed(1, b"", b""))
+
+    h.run.record_rollout_diagnostics()
+
+    logs = h.ledger.observations("install")["rollout_container_logs"]
+    assert set(logs) == {"dex-0/dex", "api-0/api", "api-0/gone"}
+    assert logs["dex-0/dex"].startswith("boom") and len(logs["dex-0/dex"]) <= 2000
+    assert secret not in json.dumps(logs)
+    assert logs["api-0/api"] == "listening\n"
+    assert logs["api-0/gone"] == "unavailable"
+    log_calls = [argv for argv in h.shell.kubectl() if "logs" in argv]
+    assert log_calls and all(argv[1:3] == ["--context", CONTEXT] for argv in log_calls)
+    assert all("--tail=20" in argv for argv in log_calls)
+
+
 def test_install_refuses_a_rendered_runner_grant(tmp_path: Path) -> None:
     h = _harness(tmp_path)
     h.run.digests = dict(DIGESTS)

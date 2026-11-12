@@ -1898,7 +1898,13 @@ def test_dex_manifests_shape() -> None:
         == template["metadata"]["labels"]
     )
     container = template["spec"]["containers"][0]
-    assert container["args"] == ["dex", "serve", "/etc/dex/config.yaml"]
+    # The image ENTRYPOINT (docker-entrypoint) templates config and needs a writable root
+    # filesystem, so under readOnlyRootFilesystem the pod crash-loops. Running dex directly
+    # with a writable emptyDir at /tmp starts and listens on 5556.
+    assert container["command"] == ["dex", "serve", "/etc/dex/config.yaml"]
+    assert "args" not in container
+    assert {"name": "tmp", "mountPath": "/tmp"} in container["volumeMounts"]
+    assert {"name": "tmp", "emptyDir": {}} in template["spec"]["volumes"]
     assert container["securityContext"]["readOnlyRootFilesystem"] is True
     assert template["spec"]["automountServiceAccountToken"] is False
     assert service["spec"] == {

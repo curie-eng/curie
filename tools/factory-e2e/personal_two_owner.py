@@ -1035,6 +1035,45 @@ class TwoOwnerRun(pp.LiveRun):
 
     # -- phase 4: install ---------------------------------------------------------------
 
+    def record_rollout_diagnostics(self) -> None:
+        """Pod states and Warning events, plus the log tail of each restarting container."""
+
+        super().record_rollout_diagnostics()
+        logs = self.safe(self.restarting_container_logs, {"unavailable": "pod list unreadable"})
+        self.ledger.record("install", "rollout_container_logs", logs)
+        self.out.progress("rollout container logs: " + json.dumps(logs, sort_keys=True))
+
+    def restarting_container_logs(self) -> dict[str, str]:
+        """Last 20 log lines (previous, else current) of each restarting container."""
+
+        found: dict[str, str] = {}
+        for pod in self.kube.json("get", "pods").get("items") or []:
+            name = str((pod.get("metadata") or {}).get("name"))
+            status = pod.get("status") or {}
+            for item in [
+                *(status.get("initContainerStatuses") or []),
+                *(status.get("containerStatuses") or []),
+            ]:
+                waiting = (item.get("state") or {}).get("waiting") or {}
+                if not (item.get("restartCount", 0) or waiting.get("reason") == "CrashLoopBackOff"):
+                    continue
+                container = str(item.get("name"))
+                found[f"{name}/{container}"] = self.container_log_tail(name, container)
+        return found
+
+    def container_log_tail(self, pod: str, container: str) -> str:
+        for flags in (("--previous",), ()):
+            try:
+                result = self.kube.ctl(
+                    "logs", pod, "-c", container, *flags, "--tail=20", check=False
+                )
+            except Exception:  # noqa: BLE001 - a failed read is recorded, never raised
+                continue
+            text = result.stdout.decode(errors="replace")
+            if result.returncode == 0 and text.strip():
+                return self.scrubber.scrub(text)[:2000]
+        return "unavailable"
+
     def phase_install(self) -> None:
         inputs = self.inputs
         work = pp.private_dir(inputs.work_dir)
