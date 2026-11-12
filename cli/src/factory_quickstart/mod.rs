@@ -2636,6 +2636,9 @@ async fn run_command(
 mod tests {
     use super::*;
 
+    const KIND_CONTEXT: &str = "kind-curie-factory";
+    const TEST_CONTEXT: &str = "scratch-cluster";
+
     fn agent_holding(kind: &str, address: &str, label: Option<&str>) -> crate::api::Agent {
         serde_json::from_value(serde_json::json!({
             "id": "agent-1",
@@ -2862,7 +2865,10 @@ mod tests {
             text.contains("scale deployment/coredns --replicas=1"),
             "{text}"
         );
-        assert!(text.contains("--context kind-curie-factory"), "{text}");
+        assert!(
+            text.contains(&format!("--context {KIND_CONTEXT}")),
+            "{text}"
+        );
         assert!(text.contains("--set security.gvisor.mode=off"), "{text}");
         assert!(text.contains("--model z-ai/glm-5.3-flash"), "{text}");
         assert!(
@@ -2891,33 +2897,38 @@ mod tests {
     #[test]
     fn an_explicit_context_skips_kind_and_does_not_force_gvisor_off() {
         let mut input = base();
-        input.explicit_context = Some("remote-cluster".into());
+        let context = "remote-cluster";
+        input.explicit_context = Some(context.into());
         let text = describe(&quickstart_plan(&input).unwrap()).join("\n");
         assert!(!text.contains("kind "), "{text}");
         assert!(!text.contains("security.gvisor.mode=off"), "{text}");
-        assert!(text.contains("--context remote-cluster"), "{text}");
+        assert!(text.contains(&format!("--context {context}")), "{text}");
         assert!(text.contains("registration link"), "{text}");
     }
 
     #[test]
     fn a_current_context_skips_kind_the_same_way() {
         let mut input = base();
-        input.current_context = Some("k8".into());
+        input.current_context = Some(TEST_CONTEXT.into());
         let text = describe(&quickstart_plan(&input).unwrap()).join("\n");
         assert!(!text.contains("kind create"), "{text}");
-        assert!(text.contains("--context k8"), "{text}");
+        assert!(
+            text.contains(&format!("--context {TEST_CONTEXT}")),
+            "{text}"
+        );
         assert!(text.contains("must confirm"), "{text}");
         assert!(!text.contains("security.gvisor.mode=off"), "{text}");
     }
 
     #[test]
     fn a_declined_context_confirmation_names_the_context_flag() {
-        let err = context_confirmation_line("work-cluster", "n").unwrap_err();
+        let context = "work-cluster";
+        let err = context_confirmation_line(context, "n").unwrap_err();
         let shown = format!("{err:#}");
-        assert!(shown.contains("--context work-cluster"), "{shown}");
-        assert!(context_confirmation_line("work-cluster", "y").is_ok());
-        assert!(context_confirmation_line("work-cluster", "yes").is_ok());
-        assert!(context_confirmation_line("work-cluster", "").is_err());
+        assert!(shown.contains(&format!("--context {context}")), "{shown}");
+        assert!(context_confirmation_line(context, "y").is_ok());
+        assert!(context_confirmation_line(context, "yes").is_ok());
+        assert!(context_confirmation_line(context, "").is_err());
     }
 
     #[test]
@@ -2965,9 +2976,9 @@ mod tests {
             org: None,
         });
         let text = steps.join("\n");
-        assert!(text.contains(
-            "curie factory quickstart --repo acme/widgets --context kind-curie-factory --namespace factory-ns --release factory --app-id <APP_ID> --private-key-file <PATH.pem>"
-        ));
+        assert!(text.contains(&format!(
+            "curie factory quickstart --repo acme/widgets --context {KIND_CONTEXT} --namespace factory-ns --release factory --app-id <APP_ID> --private-key-file <PATH.pem>"
+        )));
         assert!(!text.contains("--model"));
         assert!(!text.to_ascii_lowercase().contains("gh "));
         assert!(!text.contains("webhook secret"));
@@ -2978,13 +2989,17 @@ mod tests {
     #[test]
     fn the_printed_rerun_keeps_an_explicit_context() {
         let mut input = base();
-        input.explicit_context = Some("remote-cluster".into());
+        let context = "remote-cluster";
+        input.explicit_context = Some(context.into());
         input.namespace = "acme".into();
         input.release = "trial".into();
         let text = describe(&quickstart_plan(&input).unwrap()).join("\n");
-        assert!(text.contains(
-            "--repo acme/widgets --context remote-cluster --namespace acme --release trial --app-id"
-        ), "{text}");
+        assert!(
+            text.contains(&format!(
+                "--repo acme/widgets --context {context} --namespace acme --release trial --app-id"
+            )),
+            "{text}"
+        );
         let rerun = text
             .lines()
             .find(|line| line.starts_with("Rerun:"))
@@ -3117,19 +3132,19 @@ mod tests {
         // The complete ordered single-repository plan, retaining the stable deadline fix.
         let expected: Vec<String> = vec![
             crate::factory_toolchain::PLAN_NOTE.to_string(),
-            "Kubernetes context: kind-curie-factory because --context was passed".to_string(),
+            format!("Kubernetes context: {KIND_CONTEXT} because --context was passed"),
             "model credential: use CURIE_CREDENTIALS (no prompt)".to_string(),
-            "kubectl --context kind-curie-factory -n kube-system scale deployment/coredns --replicas=1".to_string(),
-            "curie cluster up --context kind-curie-factory --namespace curie --release curie --model z-ai/glm-5.3-flash --chart charts/curie --set security.gvisor.mode=off".to_string(),
+            format!("kubectl --context {KIND_CONTEXT} -n kube-system scale deployment/coredns --replicas=1"),
+            format!("curie cluster up --context {KIND_CONTEXT} --namespace curie --release curie --model z-ai/glm-5.3-flash --chart charts/curie --set security.gvisor.mode=off"),
             "configure factory intake factory.intake=poll for acme/widgets with --app-id 12345 --private-key-file /keys/app.pem and no webhook secret; the same helm upgrade binds the dark factory runner image".to_string(),
             "configure agentSandbox.runnerEnv.dark-factory.CLAUDE_CODE_MAX_OUTPUT_TOKENS=16000 with helm upgrade --reuse-values unless the release already records that string; preserve sibling values".to_string(),
             "render the dark factory and deploy the published ghcr.io/curie-eng/curie-dark-factory-runner image".to_string(),
             "create agent dark-factory only if absent, with initial surface github=acme/widgets and the tracker default label; preserve an existing agent".to_string(),
-            format!("curie cluster deploy --context kind-curie-factory --namespace curie --release curie --plugin-dir {} --agent dark-factory --env prod --repo acme/widgets", dir.display()),
-            "curie cluster surfaces dark-factory --context kind-curie-factory --namespace curie --release curie --add github=acme/widgets".to_string(),
-            "curie cluster overrides dark-factory --context kind-curie-factory --namespace curie --release curie --execution-deadline 10800".to_string(),
-            "curie cluster publication-policy dark-factory --context kind-curie-factory --namespace curie --release curie --policy auto".to_string(),
-            "curie cluster budget dark-factory --context kind-curie-factory --namespace curie --release curie --limit 5 --output-tokens 250000".to_string(),
+            format!("curie cluster deploy --context {KIND_CONTEXT} --namespace curie --release curie --plugin-dir {} --agent dark-factory --env prod --repo acme/widgets", dir.display()),
+            format!("curie cluster surfaces dark-factory --context {KIND_CONTEXT} --namespace curie --release curie --add github=acme/widgets"),
+            format!("curie cluster overrides dark-factory --context {KIND_CONTEXT} --namespace curie --release curie --execution-deadline 10800"),
+            format!("curie cluster publication-policy dark-factory --context {KIND_CONTEXT} --namespace curie --release curie --policy auto"),
+            format!("curie cluster budget dark-factory --context {KIND_CONTEXT} --namespace curie --release curie --limit 5 --output-tokens 250000"),
         ];
         assert_eq!(lines, expected);
         let ready = QuickstartOutput::Ready {
@@ -3172,7 +3187,7 @@ mod tests {
         );
         assert_eq!(
             steps[3],
-            "Rerun: curie factory quickstart --repo acme/widgets --context kind-curie-factory --app-id <APP_ID> --private-key-file <PATH.pem>"
+            format!("Rerun: curie factory quickstart --repo acme/widgets --context {KIND_CONTEXT} --app-id <APP_ID> --private-key-file <PATH.pem>")
         );
     }
 
@@ -3238,8 +3253,9 @@ mod tests {
     #[test]
     fn quickstart_multi_repo_deploy_binds_every_repository_and_deploys_the_first() {
         let repos = vec!["a/x".to_string(), "b/y".to_string()];
+        let context = "ctx";
         let argvs = deploy_args(
-            "ctx",
+            context,
             "ns",
             "rel",
             &repos,
@@ -3268,7 +3284,7 @@ mod tests {
             cluster_agent(
                 "surfaces",
                 DEFAULT_AGENT,
-                "ctx",
+                context,
                 "ns",
                 "rel",
                 &["--add".to_string(), format!("github={repo}")],
@@ -3283,7 +3299,7 @@ mod tests {
                 "surfaces",
                 "dark-factory",
                 "--context",
-                "ctx",
+                context,
                 "--namespace",
                 "ns",
                 "--release",
@@ -3295,7 +3311,7 @@ mod tests {
         // One repository keeps one deploy and one surfaces argv.
         assert_eq!(
             deploy_args(
-                "ctx",
+                context,
                 "ns",
                 "rel",
                 &repos[..1],
@@ -3333,9 +3349,9 @@ mod tests {
         assert!(install.contains("a/x and b/y"), "{install}");
         let rerun = steps.iter().find(|s| s.starts_with("Rerun:")).unwrap();
         assert!(
-            rerun.starts_with(
-                "Rerun: curie factory quickstart --repo a/x,b/y --context kind-curie-factory"
-            ),
+            rerun.starts_with(&format!(
+                "Rerun: curie factory quickstart --repo a/x,b/y --context {KIND_CONTEXT}"
+            )),
             "{rerun}"
         );
         // The first pass (no App id) prints the same through describe().
@@ -3476,7 +3492,7 @@ mod tests {
     /// A release that records factory intake, no App flags: the add agent path.
     fn add_input() -> PlanInput {
         let mut input = base();
-        input.explicit_context = Some("k8".into());
+        input.explicit_context = Some(TEST_CONTEXT.into());
         input.namespace = "factory-ns".into();
         input.release = "factory".into();
         input.credential_in_env = true;

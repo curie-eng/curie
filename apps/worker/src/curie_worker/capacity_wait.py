@@ -66,6 +66,23 @@ class ThreadOrderWaitRequested(CapacityWaitRequested):
         super().__init__(WAIT_REASON_PREDECESSOR)
 
 
+# ADR 0270 decision 3: the wait record ``reason`` of a different requester's
+# deferred delivery. Sticky across re-parks, and it keeps the delivery out of
+# the thread order (see ``_PARK_LUA``).
+REQUESTER_HANDOFF_REASON = "requester_handoff"
+
+
+class RequesterHandoffWaitRequested(CapacityWaitRequested):
+    """A different requester met a live turn, and its delivery can park.
+
+    ADR 0270 decision 3: another requester never steers a live turn; it waits
+    durably for a subsequent execution. The consumer parks this delivery with
+    reason ``requester_handoff`` and without a thread order entry, so the live
+    turn's own requester keeps steering it. A delivery that cannot park keeps
+    the pending ``failures.RequesterHandoffPending`` deferral instead.
+    """
+
+
 class CapacityWaitRefused(RuntimeError):
     """The delivery or wait generation no longer owns this transition."""
 
@@ -93,6 +110,10 @@ class CapacityWaitRecord:
     grant_confirmed: bool
     grant_unknown: bool
     wait_reason: str
+    # ADR 0270 decision 3: why the delivery waits. ``REQUESTER_HANDOFF_REASON``
+    # for a different requester's deferral, "" for capacity and for a record
+    # written before the field existed.
+    reason: str = ""
 
 
 _CURRENT_WAIT: ContextVar[tuple[CapacityWaitStore, str, int, DeliveryLease] | None] = ContextVar(
@@ -176,7 +197,10 @@ if #pending == 0 or pending[1][2] ~= ARGV[6] then return {0} end
 if (redis.call('HGET', KEYS[2], 'order_scan_after') or '') ~= ARGV[11] then return {0} end
 local rank = redis.call('HGET', KEYS[2], 'order_token') or ARGV[8]
 local member = rank .. '|' .. ARGV[7]
-if redis.call('HGET', KEYS[2], 'order_started') ~= '1' then
+-- ADR 0270 decision 3: a requester handoff wait (ARGV[14]) never joins the
+-- thread order, neither as this delivery nor as an earlier pending one.
+if redis.call('HGET', KEYS[2], 'order_started') ~= '1' and
+   redis.call('HGET', KEYS[2], 'reason') ~= ARGV[14] then
   redis.call('ZADD', KEYS[1], 0, member)
   redis.call('HSET', KEYS[2], 'order_token', rank,
     'order_stream', ARGV[3], 'order_group', ARGV[4], 'order_entry', ARGV[5])
@@ -186,7 +210,8 @@ for i, candidate in ipairs(candidates) do
   local record = KEYS[4 + i]
   local earlier = redis.call('XPENDING', ARGV[3], ARGV[4],
     'IDLE', 0, candidate[1], candidate[1], 1)
-  if #earlier > 0 and redis.call('HGET', record, 'order_started') ~= '1' then
+  if #earlier > 0 and redis.call('HGET', record, 'order_started') ~= '1' and
+     redis.call('HGET', record, 'reason') ~= ARGV[14] then
     local earlier_rank = redis.call('HGET', record, 'order_token') or candidate[3]
     redis.call('ZADD', KEYS[1], 0, earlier_rank .. '|' .. candidate[2])
     redis.call('HSET', record, 'order_token', earlier_rank,
@@ -271,7 +296,12 @@ local deferrals = tonumber(redis.call('HGET', record, 'deferrals')) or 0
 deferrals = deferrals + 1
 local retry_ms = tonumber(ARGV[12])
 local next_due = math.min(deadline, now + retry_ms)
-if ARGV[13] ~= '' then
+-- ADR 0270 decision 3: the wait's reason is sticky. A re-park that names
+-- none keeps the stored one, and a requester handoff wait never joins the
+-- thread order, so the live turn's requester keeps steering it.
+local reason = ARGV[16]
+if reason == '' then reason = redis.call('HGET', record, 'reason') or '' end
+if ARGV[13] ~= '' and reason ~= ARGV[17] then
   local rank = redis.call('HGET', record, 'order_token') or ARGV[14]
   redis.call('HSET', record, 'order_token', rank)
   redis.call('ZADD', KEYS[11], 0, rank .. '|' .. ARGV[11])
@@ -294,6 +324,9 @@ redis.call('HSET', record,
   'state', 'waiting', 'generation', generation, 'first_wait_ms', first,
   'deadline_ms', deadline, 'due_ms', next_due, 'deferrals', deferrals,
   'cause', '', 'notice_pending', notice_flag)
+-- Only a named reason is stored: a capacity or order wait keeps the field set
+-- it always had, which the protected wait store admits before any wake.
+if reason ~= '' then redis.call('HSET', record, 'reason', reason) end
 redis.call('SET', KEYS[12], next_reason, 'PXAT', retained_until)
 redis.call('PEXPIREAT', record, retained_until)
 redis.call('ZADD', due, next_due, ARGV[11])
@@ -783,6 +816,7 @@ class CapacityWaitStore:
             grant_confirmed=val("grant_confirmed") == "1",
             grant_unknown=val("grant_unknown") == "1",
             wait_reason=reason.decode() if isinstance(reason, bytes) else str(reason or ""),
+            reason=val("reason"),
         )
 
     def _thread_order(self, thread_key: str) -> str:
@@ -850,6 +884,7 @@ class CapacityWaitStore:
             page[0],
             page[1],
             str(int(page[2])),
+            REQUESTER_HANDOFF_REASON,
         )
         if int(raw[0]) != 1:
             raise CapacityWaitRefused("thread order registration lost its delivery or scan")
@@ -959,7 +994,19 @@ class CapacityWaitStore:
         *,
         thread_key: str | None = None,
         wait_reason: str = WAIT_REASON_ADMISSION,
+        reason: str = "",
     ) -> CapacityWaitRecord:
+        """Park one owned delivery, acking its entry.
+
+        ``thread_key`` registers the wait in that thread's order.
+        ``wait_reason`` is the durable notice cause, validated against the
+        known notices and stored outside the record hash. ``reason`` names why
+        the delivery waits for thread ordering (ADR 0270 decision 3); "" keeps
+        a stored reason, and a ``REQUESTER_HANDOFF_REASON`` wait is never
+        registered in the thread order, on this park or any re-park. The park
+        script reads them as ARGV[15], ARGV[16] and, for the handoff
+        constant, ARGV[17].
+        """
         if wait_reason not in _DURABLE_WAIT_NOTICES:
             raise CapacityWaitRefused("unknown durable wait reason")
         if not lease.owner or not lease.stream or not lease.group:
@@ -995,12 +1042,16 @@ class CapacityWaitStore:
             thread_key or "",
             delivery_order_token(entry_id),
             wait_reason,
+            reason,
+            REQUESTER_HANDOFF_REASON,
         )
         if int(raw[0]) != 1:
             raise CapacityWaitRefused(str(raw[1]))
-        logger.info("capacity wait parked event_id=%s cause=capacity", event_id)
         record = await self.get(event_id)
         assert record is not None
+        logger.info(
+            "capacity wait parked event_id=%s cause=%s", event_id, record.reason or "capacity"
+        )
         return record
 
     async def remember_wait_reason(

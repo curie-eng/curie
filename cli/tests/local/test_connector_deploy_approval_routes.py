@@ -213,7 +213,6 @@ def _write_override(path: pathlib.Path, api_image: str, host_ports: dict[str, in
       GITHUB_APP_ID: \"\"
       GITHUB_APP_PRIVATE_KEY: \"\"
       GITHUB_WEBHOOK_SECRET: dev-webhook-secret
-      SLACK_BOT_TOKEN: \"\"
       OTEL_EXPORTER_OTLP_ENDPOINT: \"\"
       OTEL_EXPORTER_OTLP_PROTOCOL: \"\"
     ports: !override [\"127.0.0.1:{host_ports["curie-api"]}:8000\"]
@@ -224,10 +223,12 @@ def _write_override(path: pathlib.Path, api_image: str, host_ports: dict[str, in
       VALKEY_PORT: ${{VALKEY_PORT}}
       S3_ENDPOINT_URL: ${{S3_ENDPOINT_URL}}
       CURIE_API_URL: ${{CURIE_API_URL}}
-      SLACK_API_BASE_URL: http://127.0.0.1:${{CURIE_LOCAL_STUB_PORT}}/api/
       CURIE_DOCKER_NETWORK: ${{CURIE_DOCKER_NETWORK}}
     volumes: !override
       - /var/run/docker.sock:/var/run/docker.sock
+  curie-channel-gateway:
+    environment:
+      SLACK_API_BASE_URL: http://127.0.0.1:${{CURIE_LOCAL_STUB_PORT}}/api/
 networks:
   curie_runner:
     name: \"${{COMPOSE_PROJECT_NAME}}_runner\"
@@ -323,6 +324,7 @@ def local_case(request: pytest.FixtureRequest, tmp_path: pathlib.Path, source_ar
             "CURIE_LOCAL_POSTGRES_HOST": "127.0.0.1",
             "CURIE_LOCAL_POSTGRES_PORT": str(host_ports["postgres"]),
             "CURIE_LOCAL_STUB_PORT": "9",
+            "CURIE_LOCAL_GATEWAY_PORT": str(_kernel_picked_ports(1)[0]),
             "S3_ENDPOINT_URL": f"http://127.0.0.1:{host_ports['rustfs']}",
             "VALKEY_HOST": "127.0.0.1",
             "VALKEY_PORT": str(host_ports["valkey"]),

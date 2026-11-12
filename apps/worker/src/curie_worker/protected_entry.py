@@ -18,6 +18,10 @@ from contextlib import AsyncExitStack, asynccontextmanager
 from dataclasses import dataclass, field
 from urllib.parse import urlsplit
 
+from curie_channel_gateway.gateway_reply import GatewayReplySink, UnconfiguredGatewayReplySink
+from curie_channel_gateway.read_transport import validate_endpoint
+from curie_channel_gateway.reply_transport import HttpReplyAdapter
+from curie_channel_gateway.token_custody import refuse_slack_tokens
 from curie_protected_hooks.artifact_measurement import ArtifactMeasurementDirectory, _open_root
 from curie_protected_hooks.authority_records import parse_qualification, parse_readiness
 from curie_protected_hooks.worker_artifact_selection import select_artifact
@@ -40,8 +44,17 @@ from .protected_worker_bootstrap import (
     _require,
     load_worker_bootstrap,
 )
-from .reply_sink import HttpReplyAdapter, ReplySinkRouter
-from .slack_sink import SlackReplyAdapter
+from .reply_sink import ReplySinkRouter
+
+PROCESS_MIGRATION_HINT = (
+    "process.json v1 is unsupported; run curie migrate-protected-process "
+    "--runtime-dir <directory> --gateway-config <gateway.json>; "
+    "see the channel gateway upgrade guide"
+)
+
+
+class ProcessSettingsMigrationRequired(WorkerBootstrapInvalid):
+    """The operator must migrate the file before starting this image."""
 
 
 @dataclass(frozen=True, slots=True, repr=False)
@@ -51,10 +64,10 @@ class ProcessSettings:
     api_base_url: str = field(repr=False)
     internal_worker_token: str = field(repr=False)
     adapter_credentials: dict[str, str] = field(repr=False)
-    slack_token: str = field(repr=False)
-    slack_base_url: str = field(repr=False)
-    slack_trusted_origins: tuple[str, ...] = field(repr=False)
-    slack_identity_tokens: dict[str, str] = field(repr=False)
+    gateway_url: str = field(repr=False)
+    gateway_token: str = field(repr=False)
+    gateway_allow_insecure_http: bool = field(repr=False)
+    gateway_identities: tuple[str, ...] = field(repr=False)
     launch_tls: LaunchTLSConfig = field(repr=False)
 
     def __repr__(self) -> str:
@@ -73,7 +86,9 @@ def _http_origin(raw: str, *, allow_path: bool = False) -> None:
 
 def load_process_settings(directory: str) -> ProcessSettings:
     """Read one bounded regular process.json; no environment fallback."""
+    needs_migration = False
     try:
+        refuse_slack_tokens({})
         root = _open_root(directory)
         try:
             value = json.loads(
@@ -82,11 +97,27 @@ def load_process_settings(directory: str) -> ProcessSettings:
             )
         finally:
             os.close(root)
-        _require(type(value) is dict and value.keys() == {
-            "schema_version", "database_url", "db_schema", "api_base_url",
-            "internal_worker_token", "adapter_credentials", "slack", "launch_tls",
-        })
-        _require(type(value["schema_version"]) is int and value["schema_version"] == 1)
+        needs_migration = (
+            type(value) is dict
+            and type(value.get("schema_version")) is int
+            and value["schema_version"] == 1
+        )
+        _require(not needs_migration)
+        _require(
+            type(value) is dict
+            and value.keys()
+            == {
+                "schema_version",
+                "database_url",
+                "db_schema",
+                "api_base_url",
+                "internal_worker_token",
+                "adapter_credentials",
+                "channel_gateway",
+                "launch_tls",
+            }
+        )
+        _require(type(value["schema_version"]) is int and value["schema_version"] == 2)
         for name in ("database_url", "db_schema", "api_base_url", "internal_worker_token"):
             _require(type(value[name]) is str and bool(value[name]))
         _require(make_url(value["database_url"]).drivername == "postgresql+asyncpg")
@@ -96,33 +127,57 @@ def load_process_settings(directory: str) -> ProcessSettings:
         _require(type(adapters) is dict and all(
             type(k) is str and bool(k) and type(v) is str and bool(v) for k, v in adapters.items()
         ))
-        slack = value["slack"]
-        _require(type(slack) is dict and slack.keys() == {
-            "token", "base_url", "trusted_origins", "identity_tokens",
-        })
-        _require(type(slack["token"]) is str and type(slack["base_url"]) is str)
-        if slack["base_url"]:
-            _http_origin(slack["base_url"], allow_path=True)
-        origins = slack["trusted_origins"]
-        _require(type(origins) is list and all(type(v) is str for v in origins))
-        for origin in origins:
-            _http_origin(origin)
-        tokens = slack["identity_tokens"]
-        _require(type(tokens) is dict and all(
-            type(k) is str and bool(k) and type(v) is str and bool(v) for k, v in tokens.items()
-        ))
+        gateway = value["channel_gateway"]
+        _require(
+            type(gateway) is dict
+            and gateway.keys()
+            == {
+                "url",
+                "token",
+                "allow_insecure_http",
+                "identities",
+            }
+        )
+        _require(type(gateway["url"]) is str and type(gateway["token"]) is str)
+        _require(type(gateway["allow_insecure_http"]) is bool)
+        identities = gateway["identities"]
+        _require(type(identities) is list and all(type(v) is str and bool(v) for v in identities))
+        _require(len(identities) == len(set(identities)))
+        refuse_slack_tokens({"CURIE_CHANNEL_GATEWAY_TOKEN": gateway["token"]})
+        if gateway["url"] or gateway["token"]:
+            validate_endpoint(
+                gateway["url"],
+                gateway["token"],
+                allow_insecure_http=gateway["allow_insecure_http"],
+            )
+        else:
+            _require(not identities)
         tls = value["launch_tls"]
         _require(type(tls) is dict and tls.keys() == {
             "origin", "ca_file", "server_name", "server_spki_sha256",
             "client_certificate", "client_key", "worker_principal_id",
         } and all(type(v) is str for v in tls.values()))
         return ProcessSettings(
-            value["database_url"], value["db_schema"], value["api_base_url"],
-            value["internal_worker_token"], dict(adapters), slack["token"],
-            slack["base_url"], tuple(origins), dict(tokens), LaunchTLSConfig(**tls),
+            value["database_url"],
+            value["db_schema"],
+            value["api_base_url"],
+            value["internal_worker_token"],
+            dict(adapters),
+            gateway["url"],
+            gateway["token"],
+            gateway["allow_insecure_http"],
+            tuple(identities),
+            LaunchTLSConfig(**tls),
         )
     except Exception:  # noqa: BLE001  Never retain private configuration diagnostics.
         pass
+    if needs_migration:
+        error = ProcessSettingsMigrationRequired(PROCESS_MIGRATION_HINT)
+        try:
+            raise error from None
+        finally:
+            error.__context__ = None
+            error.__cause__ = None
     _refuse()
 
 
@@ -183,10 +238,15 @@ async def open_runtime(directory: str) -> AsyncIterator[ProtectedRuntime]:
             measurement=measurement, projection=projection,
         )
         owner.push_async_callback(client.close)
-        slack = SlackReplyAdapter(
-            settings.slack_token, identity_tokens=settings.slack_identity_tokens,
-            base_url=settings.slack_base_url or None,
-            trusted_origins=settings.slack_trusted_origins,
+        slack = (
+            GatewayReplySink(
+                settings.gateway_url,
+                settings.gateway_token,
+                allow_insecure_http=settings.gateway_allow_insecure_http,
+                identities=settings.gateway_identities,
+            )
+            if settings.gateway_url
+            else UnconfiguredGatewayReplySink()
         )
         reply = ReplySinkRouter(
             adapters={"slack": slack}, default=HttpReplyAdapter(settings.adapter_credentials)
@@ -236,12 +296,15 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Run one provisioned protected worker")
     parser.add_argument("--runtime-dir", required=True)
     args = parser.parse_args()
+    diagnostic = "protected worker stopped without confirmed completion"
     try:
         asyncio.run(_serve(args.runtime_dir))
         return
+    except ProcessSettingsMigrationRequired:
+        diagnostic = PROCESS_MIGRATION_HINT
     except Exception:  # noqa: BLE001  Process diagnostics must not disclose supplied credentials.
         pass
-    error = SystemExit("protected worker stopped without confirmed completion")
+    error = SystemExit(diagnostic)
     try:
         raise error from None
     finally:

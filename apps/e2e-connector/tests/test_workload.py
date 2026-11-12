@@ -1592,18 +1592,18 @@ def test_httpx_cluster_reads_text_plain_bodies() -> None:
             200, text="line one\nline two\n", headers={"content-type": "text/plain"}
         )
 
-    client = httpx.Client(base_url="https://k8.test", transport=httpx.MockTransport(handler))
+    client = httpx.Client(base_url="https://cluster.test", transport=httpx.MockTransport(handler))
     path = f"{CORE}/pods/web-5d9c/log?tailLines=10"
 
     assert HttpxCluster(client).read_text(path) == (200, "line one\nline two\n")
-    assert seen == [f"https://k8.test{path}"]
+    assert seen == [f"https://cluster.test{path}"]
 
 
 def test_httpx_cluster_read_text_raises_on_transport_errors() -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         raise httpx.ConnectError("refused", request=request)
 
-    client = httpx.Client(base_url="https://k8.test", transport=httpx.MockTransport(handler))
+    client = httpx.Client(base_url="https://cluster.test", transport=httpx.MockTransport(handler))
 
     with pytest.raises(ClusterError):
         HttpxCluster(client).read_text(f"{CORE}/pods/web-5d9c/log")

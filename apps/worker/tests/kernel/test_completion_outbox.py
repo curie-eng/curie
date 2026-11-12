@@ -34,9 +34,9 @@ from pathlib import Path
 import pytest
 from aci_protocol import Final, SessionStatus
 from channel_protocol.reply import REPLY_WIRE_VERSION, ReplyTarget, TurnCompleted
-from curie_dispatcher.queue import to_stream_fields
-from curie_worker.consumer import Consumer
-from curie_worker.delivery_lease import DeliveryLeaseStore
+from curie_internal.turn_queue import to_stream_fields
+from curie_worker.consumer import Consumer, refuse_unconfigured_reminder
+from curie_worker.delivery_lease import DeliveryLeaseStore, LeaseLostError
 from curie_worker.markers import CompletionRecord, Markers
 from curie_worker.reply_sink import TargetRoute
 from curie_worker.runner_client import RunnerClient
@@ -122,6 +122,7 @@ def test_a_retryable_failure_emits_no_completion_and_leaves_the_entry_pending(
                 kernel=h.kernel,
                 config=h.config,
                 leases=DeliveryLeaseStore(h.async_redis, h.config),
+                reminders=refuse_unconfigured_reminder,
             )
             await consumer.ensure_group()
 
@@ -297,6 +298,7 @@ def test_the_startup_sweep_delivers_a_record_whose_entry_was_already_acked(
                 kernel=h.kernel,
                 config=h.config,
                 leases=DeliveryLeaseStore(h.async_redis, h.config),
+                reminders=refuse_unconfigured_reminder,
             )
             await consumer.ensure_group()
 
@@ -567,7 +569,9 @@ def test_a_failed_terminal_send_recovers_to_exactly_one_user_visible_effect(
             shimmer=False, completion_sweep_grace_s=0.0, **_R6_LEASE_KNOBS
         ) as h:
             store = DeliveryLeaseStore(h.async_redis, h.config)
-            consumer = Consumer(redis=h.async_redis, kernel=h.kernel, config=h.config, leases=store)
+            consumer = Consumer(redis=h.async_redis, kernel=h.kernel, config=h.config, leases=store,
+                                reminders=refuse_unconfigured_reminder,
+                       )
             await consumer.ensure_group()
             h.runner.default_script = [Final(text="answer", status=DONE)]
 
@@ -648,7 +652,9 @@ def test_a_stale_generation_owner_writes_no_marker_clears_nothing_and_emits_noth
     async def go() -> None:
         async with make_harness(shimmer=False, **_R6_LEASE_KNOBS) as h:
             store = DeliveryLeaseStore(h.async_redis, h.config)
-            consumer = Consumer(redis=h.async_redis, kernel=h.kernel, config=h.config, leases=store)
+            consumer = Consumer(redis=h.async_redis, kernel=h.kernel, config=h.config, leases=store,
+                                reminders=refuse_unconfigured_reminder,
+                       )
             await consumer.ensure_group()
             h.runner.default_script = [Final(text="answer", status=DONE)]
 
@@ -687,7 +693,9 @@ def test_a_stale_generation_owner_writes_no_marker_clears_nothing_and_emits_noth
             )
             assert await h.async_redis.smembers(h.config.completions_pending_key()) == {"r6-stale"}
 
-            await h.kernel.process_event(qe, lease=stale)
+            with pytest.raises(LeaseLostError):
+                await h.kernel.process_event(qe, lease=stale)
+            assert h.runner.opened == [], "a fenced-out owner started a model turn"
 
             assert h.sink.completions == [], "a fenced-out owner emitted a terminal result"
             assert await h.async_redis.exists(h.config.done_key("r6-stale")) == 0, (
@@ -1037,7 +1045,9 @@ def test_verbatim_fenced_settlement_refuses_stale_owner_then_accepts_current(mak
     async def go():
         async with make_harness(shimmer=False, **_R6_LEASE_KNOBS) as h:
             store = DeliveryLeaseStore(h.async_redis, h.config)
-            consumer = Consumer(redis=h.async_redis, kernel=h.kernel, config=h.config, leases=store)
+            consumer = Consumer(redis=h.async_redis, kernel=h.kernel, config=h.config, leases=store,
+                                reminders=refuse_unconfigured_reminder,
+                       )
             await consumer.ensure_group()
             qe = _qevent(thread="verbatim-fence", event_id="verbatim-fence-event")
             await h.async_redis.xadd(h.config.stream, to_stream_fields(qe))

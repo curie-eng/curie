@@ -81,17 +81,26 @@ impl crate::ui::CliOutput for HookFireOutput {
             HookFireOutput::Record(record) => {
                 let outcome = record.outcome.as_deref().unwrap_or("-");
                 let reason = record.reason.as_deref().unwrap_or("");
-                if reason.is_empty() {
-                    ui.payload(&format!(
+                let mut line = if reason.is_empty() {
+                    format!(
                         "{} {} {} {} {}",
                         record.agent, record.name, record.slot_utc, outcome, record.id
-                    ));
+                    )
                 } else {
-                    ui.payload(&format!(
+                    format!(
                         "{} {} {} {} {} {}",
                         record.agent, record.name, record.slot_utc, outcome, reason, record.id
-                    ));
+                    )
+                };
+                // Keep the existing line byte-identical unless a field is webhook.
+                // `ui.kv` pads the key, so these phrases are payload words.
+                if record.source == "webhook" {
+                    line.push_str(" source webhook");
                 }
+                if record.trigger == "webhook" {
+                    line.push_str(" trigger webhook");
+                }
+                ui.payload(&line);
             }
         }
     }
@@ -156,6 +165,87 @@ pub async fn hook_record(opts: HookRecordOpts) -> Result<HookFireOutput> {
         .get_hook_run(&opts.agent, &opts.name, &opts.run_id)
         .await?;
     Ok(HookFireOutput::Record(Box::new(record)))
+}
+
+/// Inputs for `<tier> hook wake-key` and `<tier> hook wake-key rotate`.
+pub struct HookWakeKeyOpts {
+    pub api_url: String,
+    pub api_key: String,
+    pub agent: String,
+    pub name: String,
+    pub rotate: bool,
+    pub dry_run: bool,
+}
+
+/// Output of `<tier> hook wake-key`. `Rotation` has no secret field.
+pub enum WakeKeyOutput {
+    DryRun(crate::ui::DryRunPlan),
+    Secret(crate::api::HookWakeSecret),
+    Rotation(crate::api::HookWakeRotation),
+}
+
+impl crate::ui::CliOutput for WakeKeyOutput {
+    fn to_json(&self) -> serde_json::Value {
+        match self {
+            WakeKeyOutput::DryRun(plan) => plan.to_json(),
+            WakeKeyOutput::Secret(secret) => serde_json::to_value(secret).unwrap_or_default(),
+            WakeKeyOutput::Rotation(rotation) => serde_json::to_value(rotation).unwrap_or_default(),
+        }
+    }
+
+    fn render(&self, ui: &crate::ui::Ui) {
+        match self {
+            WakeKeyOutput::DryRun(plan) => plan.render(ui),
+            WakeKeyOutput::Secret(secret) => {
+                ui.payload(&secret.secret);
+                ui.payload(&format!("generation {}", secret.generation));
+            }
+            WakeKeyOutput::Rotation(rotation) => {
+                ui.payload(&format!("generation {}", rotation.generation));
+            }
+        }
+    }
+}
+
+/// The agent and hook a wake-key read names. Rotate carries its own pair.
+pub fn require_wake_key_target(
+    agent: Option<String>,
+    name: Option<String>,
+) -> Result<(String, String)> {
+    match (agent, name) {
+        (Some(agent), Some(name)) => Ok((agent, name)),
+        _ => Err(crate::exit::CliError::usage("hook wake-key requires <AGENT> and <NAME>").into()),
+    }
+}
+
+/// `<tier> hook wake-key`: read or rotate the targetless wake key.
+///
+/// Dry-run prints the percent-encoded route for the identifier the operator
+/// typed and does not look the agent up. A live call resolves the name first.
+pub async fn hook_wake_key(opts: HookWakeKeyOpts) -> Result<WakeKeyOutput> {
+    let path = if opts.rotate {
+        crate::api::hook_wake_secret_rotate_path(&opts.agent, &opts.name)
+    } else {
+        crate::api::hook_wake_secret_path(&opts.agent, &opts.name)
+    };
+    if opts.dry_run {
+        let verb = if opts.rotate { "POST" } else { "GET" };
+        return Ok(WakeKeyOutput::DryRun(crate::ui::DryRunPlan {
+            lines: vec![format!(
+                "{verb} {}{path} redacted",
+                opts.api_url.trim_end_matches('/')
+            )],
+        }));
+    }
+    let client = ApiClient::new(&opts.api_url, &opts.api_key)?;
+    let agent = client.find_agent(&opts.agent).await?;
+    if opts.rotate {
+        let rotation = client.rotate_hook_wake_key(&agent.id, &opts.name).await?;
+        Ok(WakeKeyOutput::Rotation(rotation))
+    } else {
+        let secret = client.read_hook_wake_key(&agent.id, &opts.name).await?;
+        Ok(WakeKeyOutput::Secret(secret))
+    }
 }
 
 /// Inputs for `<tier> schedules [--agent NAME_OR_ID]`.
@@ -399,6 +489,18 @@ impl crate::ui::CliOutput for WorkItemsOutput {
                     &format!("{} {}", work_item_issue_label(item), item.tracker.url),
                 );
                 line("state", &item.state);
+                line(
+                    "auth",
+                    &match (item.model_auth_mode.as_deref(), &item.owner_principal_id) {
+                        (Some("personal"), Some(owner)) => format!(
+                            "personal, owner {owner}, generation {}, tenant {}",
+                            item.enrollment_generation
+                                .map_or_else(|| "-".into(), |g| g.to_string()),
+                            item.tenant_id.as_deref().unwrap_or("-")
+                        ),
+                        _ => "service".into(),
+                    },
+                );
                 line("cause", &item.actionable_cause);
                 line(
                     "pr",

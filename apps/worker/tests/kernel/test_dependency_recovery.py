@@ -777,7 +777,8 @@ def test_pending_stream_order_wins_when_the_later_delivery_registers_first(
                 ]
             entry, fields = await _wake(peer, later, second.event_id)
             await later._sem.acquire()
-            await later._handle(entry, fields)
+            async with asyncio.timeout(10):
+                await later._handle(entry, fields)
             assert h.runner.opened + (peer.runner.opened if separate_kernel else []) == [
                 "first",
                 "second",

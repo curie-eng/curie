@@ -31,6 +31,20 @@ _BASE = {
 }
 
 
+@pytest.mark.parametrize("raw", ["0", "-1", "nan", "inf", "garbage"])
+def test_cleanup_timeout_rejects_invalid_bounds(raw: str) -> None:
+    with pytest.raises(ValueError):
+        RunnerConfig.from_env(dict(_BASE, CURIE_RUNNER_CLEANUP_TIMEOUT_S=raw))
+
+
+def test_cleanup_timeout_is_runner_local_and_configurable() -> None:
+    assert RunnerConfig.from_env(_BASE).cleanup_timeout_s == 30.0
+    assert (
+        RunnerConfig.from_env(dict(_BASE, CURIE_RUNNER_CLEANUP_TIMEOUT_S="0.25")).cleanup_timeout_s
+        == 0.25
+    )
+
+
 def _field_names() -> set[str]:
     return {f.name for f in dataclasses.fields(RunnerConfig)}
 

@@ -1572,10 +1572,10 @@ def test_real_review_consumer_waits_for_active_turn_and_revalidates_before_new_t
     import uvicorn
     from aci_protocol import Final, QueuedTurn, ReplyHandle, SessionStatus, TextDelta
     from aci_protocol.s3 import build_s3_client
-    from curie_dispatcher.queue import to_stream_fields
+    from curie_internal.turn_queue import to_stream_fields
     from curie_worker.approvals import ApprovalClient
     from curie_worker.binding import BindingResolver
-    from curie_worker.consumer import Consumer
+    from curie_worker.consumer import Consumer, refuse_unconfigured_reminder
     from curie_worker.delivery_lease import DeliveryLeaseStore
     from curie_worker.workspace import (
         SubprocessCommands,
@@ -1760,6 +1760,7 @@ def test_real_review_consumer_waits_for_active_turn_and_revalidates_before_new_t
                         kernel=h.kernel,
                         config=h.config,
                         leases=DeliveryLeaseStore(h.async_redis, h.config),
+                        reminders=refuse_unconfigured_reminder,
                     )
                     await consumer.ensure_group()
                     hold = asyncio.Event()
@@ -2051,10 +2052,10 @@ def test_reserved_review_keeps_ordinary_slack_routing(
         TurnSource,
     )
     from aci_protocol.s3 import build_s3_client
-    from curie_dispatcher.queue import to_stream_fields
+    from curie_internal.turn_queue import to_stream_fields
     from curie_worker.approvals import ApprovalClient
     from curie_worker.binding import BindingResolver
-    from curie_worker.consumer import Consumer
+    from curie_worker.consumer import Consumer, refuse_unconfigured_reminder
     from curie_worker.delivery_lease import DeliveryLeaseStore
     from curie_worker.workspace import (
         SubprocessCommands,
@@ -2165,6 +2166,7 @@ def test_reserved_review_keeps_ordinary_slack_routing(
                         kernel=h.kernel,
                         config=h.config,
                         leases=DeliveryLeaseStore(h.async_redis, h.config),
+                        reminders=refuse_unconfigured_reminder,
                     )
                     await consumer.ensure_group()
                     review_hold = asyncio.Event()
@@ -2343,7 +2345,7 @@ def test_review_history_capacity_failure_posts_one_pr_notice_end_to_end(
     from aci_protocol.s3 import build_s3_client
     from curie_worker.approvals import ApprovalClient
     from curie_worker.binding import BindingResolver
-    from curie_worker.consumer import Consumer
+    from curie_worker.consumer import Consumer, refuse_unconfigured_reminder
     from curie_worker.delivery_lease import DeliveryLeaseStore
     from curie_worker.workspace import (
         SubprocessCommands,
@@ -2445,6 +2447,7 @@ def test_review_history_capacity_failure_posts_one_pr_notice_end_to_end(
                         kernel=h.kernel,
                         config=h.config,
                         leases=DeliveryLeaseStore(h.async_redis, h.config),
+                        reminders=refuse_unconfigured_reminder,
                     )
                     await consumer.ensure_group()
                     h.runner.default_script = [
@@ -3893,7 +3896,7 @@ def test_review_graveyard_cursor_survives_restart_and_never_treats_absence_as_te
 
 
 def test_actual_consumer_dead_letter_settles_only_the_matching_review_origin(review_stack):
-    from curie_worker.consumer import Consumer
+    from curie_worker.consumer import Consumer, refuse_unconfigured_reminder
     from curie_worker.delivery_lease import DeliveryLeaseStore
 
     from apps.worker.tests.kernel.conftest import kernel_harness
@@ -3919,7 +3922,8 @@ def test_actual_consumer_dead_letter_settles_only_the_matching_review_origin(rev
         ) as h:
             leases = DeliveryLeaseStore(h.async_redis, h.config)
             consumer = Consumer(
-                redis=h.async_redis, kernel=h.kernel, config=h.config, leases=leases
+                redis=h.async_redis, kernel=h.kernel, config=h.config, leases=leases,
+                reminders=refuse_unconfigured_reminder,
             )
             # The running consumer group predates this queued event. Production
             # ensure_group intentionally skips historical backlog on first boot.

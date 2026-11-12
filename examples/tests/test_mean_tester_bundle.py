@@ -227,7 +227,7 @@ def test_every_platform_text_the_skill_judges_by_still_exists_in_the_platform():
     sources = "\n".join(
         (REPO / path).read_text()
         for path in (
-            "apps/dispatcher/src/curie_dispatcher/config.py",
+            "packages/channel-gateway/src/curie_channel_gateway/slack/config.py",
             "apps/worker/src/curie_worker/config.py",
         )
     )

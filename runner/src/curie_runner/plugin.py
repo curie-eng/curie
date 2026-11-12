@@ -305,9 +305,10 @@ def bundle_mcp_servers(plugin_dir: str | None) -> dict[str, Any]:
     the ``--mcp-config`` path does not, so it is substituted here and exported to
     a stdio server's env. An absent optional secret's whole-value stdio env
     reference is omitted before mounting (#4129); the bundle stays immutable.
-    Every other ``${VAR}`` is left for the CLI, which
-    expands ``--mcp-config`` entries from the session env exactly as it expands a
-    plugin's. Call only after ``load_plugins`` has validated the bundle; a
+    Other references are validated here and materialized from the scrubbed
+    environment at the final SDK or probe boundary, after hosted credential
+    cleanup.
+    Call only after ``load_plugins`` has validated the bundle; a
     malformed declaration was already refused there.
     """
 
@@ -354,7 +355,9 @@ def bundle_mcp_servers(plugin_dir: str | None) -> dict[str, Any]:
                 env.setdefault("CLAUDE_PLUGIN_ROOT", plugin_root)
                 entry["env"] = env
             servers[f"plugin:{manifest.name}:{name}"] = entry
-    return servers
+    from .mcp_stdio import sanitize_mcp_servers
+
+    return sanitize_mcp_servers(servers, os.environ, resolve_references=False)
 
 
 def bundle_skill_names(plugin_dir: str | None) -> list[str]:

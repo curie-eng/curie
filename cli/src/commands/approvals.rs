@@ -25,6 +25,9 @@ pub struct ApprovalCmd {
     pub routes_from: Option<PathBuf>,
     pub list_routes: bool,
     pub clear_routes: bool,
+    /// `--routes-expected-version N`: overrides the version read from the
+    /// agent for a route write (ADR 0271).
+    pub routes_expected_version: Option<u64>,
     /// `--report-identity`: the installation-wide approval identity report.
     pub report_identity: bool,
     /// `--recover <APPROVAL_ID>`: administratively reject one approval under
@@ -223,7 +226,7 @@ pub(super) fn build_route_bindings(
                             "a route binding requires `resolution: {kind: \"slack\", \
                              address: \"C...\"}` or `resolution: {mode: \
                              \"requesting_surface\"}` and accepts optional `notification` and \
-                             `approvers` blocks, and nothing else. The retired `channel` key \
+                             `approvers` blocks, `expires_in_seconds` and `remind_every_s` (positive integer or null). The retired `channel` key \
                              is not accepted",
                         ),
                     )
@@ -245,6 +248,10 @@ pub(super) fn build_route_bindings(
                 resolution: crate::api::ApprovalResolutionWrite::slack(channel),
                 notification: None,
                 approvers: None,
+                expires_in_seconds: None,
+                approver_ticket: None,
+                separation: None,
+                remind_every_s: None,
             });
     }
 
@@ -274,6 +281,15 @@ pub(super) fn build_route_bindings(
     for (name, binding) in &bindings {
         validate_resolution_target(name, &binding.resolution)?;
         if let Some(notification) = &binding.notification {
+            if matches!(
+                binding.resolution,
+                crate::api::ApprovalResolutionWrite::ApproverDm(_)
+            ) {
+                return Err(crate::exit::usage(format!(
+                    "route {name:?}: an approver_dm resolution cannot carry a notification; \
+                     the card is a DM to the approver the selector picks"
+                )));
+            }
             let crate::api::ApprovalResolutionWrite::Fixed(resolution) = &binding.resolution else {
                 // ADR-0177 decision 1, mirroring the API: the card already
                 // joins the conversation that asked, so there is nobody further
@@ -285,6 +301,18 @@ pub(super) fn build_route_bindings(
             };
             validate_notification_target(name, notification)?;
             reject_identical_targets(name, resolution, notification)?;
+        }
+        if matches!(
+            binding.resolution,
+            crate::api::ApprovalResolutionWrite::ApproverDm(_)
+        ) && binding.approver_ticket.is_none()
+        {
+            return Err(crate::exit::CliError::usage(format!(
+                "route {name:?}: an approver_dm resolution needs an approver_ticket on the same \
+                 route; the ticket's selector picks the one approver the card is sent to"
+            ))
+            .with_fix("add an approver_ticket block to the route in --routes-from")
+            .into());
         }
         if let Some(approvers) = &binding.approvers {
             validate_parsed_approvers(name, approvers)?;
@@ -313,6 +341,124 @@ pub(super) fn build_route_bindings(
     Ok(bindings)
 }
 
+/// Carry the routes that hold an approver-ticket selector or a separation
+/// block into a flag-only route edit (ADR 0271). The write replaces the whole
+/// map and the response is never a writer, so each such route is rebuilt field
+/// by field from the readback, echoing the server-owned pin. An edited route
+/// keeps its own selector, separation and stored deadline; removing one takes
+/// an explicit `--routes-from`.
+fn carry_over_selector_routes(
+    existing: Option<&BTreeMap<String, crate::api::ApprovalRouteBindingResponse>>,
+    bindings: &mut BTreeMap<String, crate::api::ApprovalRouteBindingWrite>,
+) -> Result<()> {
+    use crate::api::{
+        ApprovalSeparationWrite, ApproverCeilingWrite, ApproverTicketWrite, ApproverUserWrite,
+        ExemptGroupWrite,
+    };
+    for (name, current) in existing.into_iter().flatten() {
+        if current.approver_ticket.is_none() && current.separation.is_none() {
+            continue;
+        }
+        if current.notification.is_some() {
+            return Err(crate::exit::CliError::usage(format!(
+                "route {name:?} carries an approver_ticket or separation and a notification; \
+                 the API redacts a notification's transport, so this edit cannot write the \
+                 route back faithfully"
+            ))
+            .with_fix("write the whole route map, notification included, with --routes-from")
+            .into());
+        }
+        let incomplete = || {
+            anyhow::Error::from(
+                crate::exit::CliError::usage(format!(
+                    "route {name:?}: the API's approver_ticket or separation readback is \
+                     missing a field, so this edit cannot write the route back faithfully"
+                ))
+                .with_fix("write the whole route map with --routes-from"),
+            )
+        };
+        let ticket = match &current.approver_ticket {
+            None => None,
+            Some(ticket) => {
+                let ceiling = ticket.ceiling.as_ref().ok_or_else(incomplete)?;
+                let users = match &ceiling.users {
+                    None => None,
+                    Some(users) => Some(
+                        users
+                            .iter()
+                            .map(|user| {
+                                Ok(ApproverUserWrite {
+                                    issuer: user.issuer.clone().ok_or_else(incomplete)?,
+                                    subject: user.subject.clone().ok_or_else(incomplete)?,
+                                })
+                            })
+                            .collect::<Result<Vec<_>>>()?,
+                    ),
+                };
+                Some(ApproverTicketWrite {
+                    connector: ticket.connector.clone().ok_or_else(incomplete)?,
+                    tool: ticket.tool.clone().ok_or_else(incomplete)?,
+                    key_id: ticket.key_id.clone().ok_or_else(incomplete)?,
+                    public_key: ticket.public_key.clone().ok_or_else(incomplete)?,
+                    ceiling: ApproverCeilingWrite {
+                        approver_role_version: ceiling
+                            .approver_role_version
+                            .ok_or_else(incomplete)?,
+                        users,
+                        approver_role: ceiling.approver_role.clone(),
+                    },
+                })
+            }
+        };
+        let separation = match &current.separation {
+            None => None,
+            Some(separation) => Some(ApprovalSeparationWrite {
+                exclude_requester: separation.exclude_requester.ok_or_else(incomplete)?,
+                exempt_group: match &separation.exempt_group {
+                    None => None,
+                    Some(group) => Some(ExemptGroupWrite {
+                        issuer: group.issuer.clone().ok_or_else(incomplete)?,
+                        id: group.id.clone().ok_or_else(incomplete)?,
+                    }),
+                },
+            }),
+        };
+        match bindings.get_mut(name) {
+            Some(edited) => {
+                if edited.approver_ticket.is_none() {
+                    edited.approver_ticket = ticket;
+                }
+                if edited.separation.is_none() {
+                    edited.separation = separation;
+                }
+                // No route flag sets a deadline, so the stored one is kept
+                // as read: a number, an explicit null, or absent (ADR 0273).
+                if edited.expires_in_seconds.is_none() {
+                    edited.expires_in_seconds = current.expires_in_seconds;
+                }
+                if edited.remind_every_s.is_none() {
+                    edited.remind_every_s = current.remind_every_s;
+                }
+            }
+            None => {
+                bindings.insert(
+                    name.clone(),
+                    crate::api::ApprovalRouteBindingWrite {
+                        resolution: current.resolution.clone().into(),
+                        notification: None,
+                        approvers: current.approvers.clone(),
+                        expires_in_seconds: current.expires_in_seconds,
+                        remind_every_s: current.remind_every_s,
+                        approver_ticket: ticket,
+                        separation,
+                    },
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
 /// A fixed target stays Slack-only; the only way off Slack is the
 /// `requesting_surface` mode, which shows the card in the conversation that
 /// asked (ADR-0177). Mirrors the API's `ApprovalRouteBinding.resolution`.
@@ -325,9 +471,24 @@ pub(super) fn validate_resolution_target(
         crate::api::ApprovalResolutionWrite::RequestingSurface(target) => {
             if target.mode != "requesting_surface" {
                 return Err(crate::exit::usage(format!(
-                    "route {route:?}: resolution mode {:?} is unsupported; the only mode is \
-                     \"requesting_surface\"",
+                    "route {route:?}: resolution mode {:?} is unsupported; the modes are \
+                     \"requesting_surface\" and \"approver_dm\"",
                     target.mode
+                )));
+            }
+            return Ok(());
+        }
+        crate::api::ApprovalResolutionWrite::ApproverDm(target) => {
+            if target.mode != "approver_dm" {
+                return Err(crate::exit::usage(format!(
+                    "route {route:?}: resolution mode {:?} is unsupported; the modes are \
+                     \"requesting_surface\" and \"approver_dm\"",
+                    target.mode
+                )));
+            }
+            if target.identity.trim().is_empty() {
+                return Err(crate::exit::usage(format!(
+                    "route {route:?}: an approver_dm resolution needs a non-empty identity"
                 )));
             }
             return Ok(());
@@ -877,6 +1038,13 @@ impl crate::ui::CliOutput for ApprovalsOutput {
                                  conversation that asked)"
                                     .to_string()
                             }
+                            crate::api::ApprovalResolutionResponse::ApproverDm(target) => {
+                                format!(
+                                    "resolution approver_dm (identity {}; the card is a DM to \
+                                     the approver the selector picks)",
+                                    target.identity
+                                )
+                            }
                         };
                         ui.kv(name, &resolution);
                         let notification = binding
@@ -904,6 +1072,11 @@ pub(super) fn describe_approvers(binding: &crate::api::ApprovalRouteBindingRespo
             crate::api::ApprovalResolutionResponse::RequestingSurface(_) => {
                 "the asking channel's members in Slack, and nobody on any other channel \
                  (the default: no approvers block declared)"
+                    .to_string()
+            }
+            crate::api::ApprovalResolutionResponse::ApproverDm(_) => {
+                "the one approver the selector picks (the default: no approvers block \
+                 declared)"
                     .to_string()
             }
         },
@@ -1029,6 +1202,16 @@ pub async fn approvals(
         || !cmd.route_approvers.is_empty()
         || cmd.routes_from.is_some()
         || cmd.clear_routes;
+
+    // ADR 0271: the version only means something beside a route write, so a
+    // stray one is refused before any other branch can swallow it.
+    if cmd.routes_expected_version.is_some() && !route_write {
+        return Err(crate::exit::usage(
+            "--routes-expected-version applies only to a route write \
+             (--route-resolution/--route-approvers/--routes-from/--clear-routes); drop it, \
+             or add the route write it should guard",
+        ));
+    }
 
     // --- Administrative recovery (#2753) -------------------------------------
     //
@@ -1306,6 +1489,18 @@ pub async fn approvals(
         let client = ApiClient::new(&opts.api_url, &opts.api_key)?;
         let agent = client.find_agent(&opts.agent).await?;
         let agent = if route_write {
+            // ADR 0271: a flag-only edit replaces the whole map, so a route that
+            // carries a selector must ride along or the write would unregister it.
+            let mut bindings = bindings;
+            if !cmd.clear_routes && cmd.routes_from.is_none() {
+                carry_over_selector_routes(agent.approval_routes.as_ref(), &mut bindings)?;
+            }
+            // The version the operator named, else the one just read: the API
+            // compares it against the stored one, so a write that raced another
+            // operator's is refused rather than merged.
+            let expected_version = cmd
+                .routes_expected_version
+                .or(agent.connector_requester_identity_version);
             // #2448: advisory pre-check against every active deployment's
             // declared routes. Fail-open; the platform API remains the gate.
             let (declaring, unreadable) = active_declared_routes(&client, &agent.id).await;
@@ -1321,7 +1516,10 @@ pub async fn approvals(
             }
             let cl = ui.checklist();
             let step = cl.step(&format!("updating approval routes for {}", agent.name));
-            match client.set_approval_routes(&agent.id, &bindings).await {
+            match client
+                .set_approval_routes(&agent.id, &bindings, expected_version)
+                .await
+            {
                 Ok(updated) => {
                     step.done("updated");
                     updated
@@ -1474,6 +1672,159 @@ pub async fn approvals(
         gated_tools: gates,
         manifest_unreadable: unreadable,
     })
+}
+
+// --- Connector requester identity (ADR 0270 decision 1) ------------------------
+//
+// The operator's opt-in for hosted connectors receiving the verified human
+// requester. It lives on the agent row beside a version, and the API writes it
+// only as a compare-and-set that is alone in its PATCH, so this verb sends
+// exactly the flag and the version and never retries a conflict with a version
+// it read itself: the operator must see what changed first.
+
+/// `--requester-identity <on|off|show>`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+pub enum RequesterIdentityMode {
+    /// Enable requester transport (needs HTTP identity and a registered receiver).
+    On,
+    /// Disable requester transport.
+    Off,
+    /// Show the flag and the version its next write must name.
+    Show,
+}
+
+/// The flag as read back from the agent row. @spec CONNECTOR-REQUESTER-1.
+#[derive(Debug)]
+pub struct RequesterIdentityOutput {
+    pub agent: String,
+    pub agent_id: String,
+    pub connector_requester_identity: bool,
+    pub connector_requester_identity_version: u64,
+}
+
+impl RequesterIdentityOutput {
+    fn from_agent(agent: crate::api::Agent) -> Result<Self> {
+        match (
+            agent.connector_requester_identity,
+            agent.connector_requester_identity_version,
+        ) {
+            (Some(enabled), Some(version)) => Ok(Self {
+                agent: agent.name,
+                agent_id: agent.id,
+                connector_requester_identity: enabled,
+                connector_requester_identity_version: version,
+            }),
+            _ => Err(crate::exit::CliError::failure(format!(
+                "the platform API did not report connector requester identity for agent {}, so \
+                 it is older than this CLI",
+                agent.name
+            ))
+            .with_fix("upgrade the release to one that carries the flag, or use a CLI matching it")
+            .into()),
+        }
+    }
+}
+
+impl crate::ui::CliOutput for RequesterIdentityOutput {
+    fn to_json(&self) -> serde_json::Value {
+        serde_json::json!({
+            "agent": self.agent,
+            "agent_id": self.agent_id,
+            "connector_requester_identity": self.connector_requester_identity,
+            "connector_requester_identity_version": self.connector_requester_identity_version,
+        })
+    }
+
+    fn render(&self, ui: &crate::ui::Ui) {
+        let state = if self.connector_requester_identity {
+            "on"
+        } else {
+            "off"
+        };
+        ui.payload(&format!(
+            "{}: connector requester identity {state} (version {})",
+            self.agent, self.connector_requester_identity_version
+        ));
+    }
+}
+
+/// `<tier> approvals <agent> --requester-identity <on|off|show>
+/// [--expected-version N]`. `show` reads; `on`/`off` send one compare-and-set
+/// PATCH, naming `expected_version` or, when omitted, the version just read.
+/// @spec CONNECTOR-REQUESTER-1.
+pub async fn approvals_requester_identity(
+    opts: AgentActionOpts,
+    mode: RequesterIdentityMode,
+    expected_version: Option<u64>,
+) -> Result<Box<dyn crate::ui::CliOutput>> {
+    let enabled = match mode {
+        RequesterIdentityMode::On => Some(true),
+        RequesterIdentityMode::Off => Some(false),
+        RequesterIdentityMode::Show => None,
+    };
+    if enabled.is_none() && expected_version.is_some() {
+        return Err(crate::exit::usage(
+            "--expected-version names the version an on/off write compares against; drop it \
+             with --requester-identity show",
+        ));
+    }
+    if expected_version == Some(0) {
+        return Err(crate::exit::usage(
+            "--expected-version starts at 1; read the current one with --requester-identity show",
+        ));
+    }
+    if opts.dry_run {
+        let line = match enabled {
+            Some(enabled) => {
+                let version = expected_version.map_or_else(
+                    || "<the version read from the agent first>".to_string(),
+                    |version| version.to_string(),
+                );
+                format!(
+                    "PATCH {}/agents/<id> {{\"connector_requester_identity\": {enabled}, \
+                     \"connector_requester_identity_expected_version\": {version}}}  (alone in \
+                     its request; would resolve agent {:?} first)",
+                    opts.api_url, opts.agent
+                )
+            }
+            None => format!(
+                "GET {}/agents (show connector requester identity; would resolve agent {:?})",
+                opts.api_url, opts.agent
+            ),
+        };
+        return Ok(Box::new(crate::ui::DryRunPlan { lines: vec![line] }));
+    }
+    let client = ApiClient::new(&opts.api_url, &opts.api_key)?;
+    let agent = client.find_agent(&opts.agent).await?;
+    let Some(enabled) = enabled else {
+        return Ok(Box::new(RequesterIdentityOutput::from_agent(agent)?));
+    };
+    let expected = match expected_version {
+        Some(version) => version,
+        None => {
+            RequesterIdentityOutput::from_agent(agent.clone())?.connector_requester_identity_version
+        }
+    };
+    let ui = crate::ui::ui();
+    let cl = ui.checklist();
+    let step = cl.step(&format!(
+        "setting connector requester identity {} for {}",
+        if enabled { "on" } else { "off" },
+        agent.name
+    ));
+    match client
+        .set_connector_requester_identity(&agent.id, enabled, expected)
+        .await
+    {
+        Ok(updated) => {
+            step.done("updated");
+            Ok(Box::new(RequesterIdentityOutput::from_agent(updated)?))
+        }
+        Err(err) => {
+            step.fail("failed");
+            Err(err)
+        }
+    }
 }
 
 /// The one-time credential a `--mint-*` flag asks the API to issue.

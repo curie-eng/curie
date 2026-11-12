@@ -681,7 +681,12 @@ def test_reserved_credential_secret_name_is_rejected(tmp_path: Path, name: str) 
 _REDIRECT_CAPTURE_KEYS = [
     "HTTPS_PROXY",
     "HTTP_PROXY",
+    "ALL_PROXY",
+    "SSL_CERT_FILE",
+    "SSL_CERT_DIR",
     "NODE_EXTRA_CA_CERTS",
+    "NODE_TLS_REJECT_UNAUTHORIZED",
+    "NODE_OPTIONS",
     "ANTHROPIC_CUSTOM_HEADERS",
 ]
 

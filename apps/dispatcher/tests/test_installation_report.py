@@ -26,7 +26,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-from curie_dispatcher.installation_report import (
+from curie_channel_gateway.slack.installation_report import (
     InstallationReportClient,
     auth_test_report,
     start_installation_reports,
@@ -574,7 +574,7 @@ def test_run_main_starts_the_reports_after_the_connections_and_stops_them_on_shu
     signals and the supervisor group's run are faked. One identity, so it also
     pins that the reporter does not depend on preflight's auth.test."""
 
-    from curie_dispatcher import run
+    from curie_channel_gateway.slack import run
 
     _set_run_env(monkeypatch)
     monkeypatch.setenv("SLACK_APP_TOKEN", "xapp-default")

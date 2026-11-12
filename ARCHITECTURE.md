@@ -344,12 +344,12 @@ sequenceDiagram
 
 The pieces, cited:
 
-- **Dedupe + placeholder + enqueue** live in the dispatcher:
-  - dedupe `SET NX` at [`apps/dispatcher/src/curie_dispatcher/queue.py::claim_event`](apps/dispatcher/src/curie_dispatcher/queue.py)
-  - placeholder post at [`apps/dispatcher/src/curie_dispatcher/handlers.py::process_event`](apps/dispatcher/src/curie_dispatcher/handlers.py)
-  - `XADD curie:runs` at [`apps/dispatcher/src/curie_dispatcher/queue.py::enqueue`](apps/dispatcher/src/curie_dispatcher/queue.py)
+- **Dedupe + placeholder + enqueue** run in the gateway-owned Slack intake process:
+  - dedupe `SET NX` at [`packages/curie-internal/src/curie_internal/turn_queue.py::claim_event`](packages/curie-internal/src/curie_internal/turn_queue.py)
+  - placeholder post at [`packages/channel-gateway/src/curie_channel_gateway/slack/handlers.py::process_event`](packages/channel-gateway/src/curie_channel_gateway/slack/handlers.py)
+  - `XADD curie:runs` at [`packages/curie-internal/src/curie_internal/turn_queue.py::enqueue`](packages/curie-internal/src/curie_internal/turn_queue.py)
 
-  The Socket Mode handler is at [`apps/dispatcher/src/curie_dispatcher/app.py::SocketModeConnection`](apps/dispatcher/src/curie_dispatcher/app.py). The stream name is configured on [`apps/dispatcher/src/curie_dispatcher/config.py::DispatcherConfig`](apps/dispatcher/src/curie_dispatcher/config.py) (default `curie:runs`), and the payload model is the channel-neutral [`packages/aci-protocol/src/aci_protocol/turn.py::QueuedTurn`](packages/aci-protocol/src/aci_protocol/turn.py).
+  The Socket Mode handler is at [`packages/channel-gateway/src/curie_channel_gateway/slack/app.py::SocketModeConnection`](packages/channel-gateway/src/curie_channel_gateway/slack/app.py). The stream name is configured on [`packages/channel-gateway/src/curie_channel_gateway/slack/config.py::DispatcherConfig`](packages/channel-gateway/src/curie_channel_gateway/slack/config.py) (default `curie:runs`), and the payload model is the channel-neutral [`packages/aci-protocol/src/aci_protocol/turn.py::QueuedTurn`](packages/aci-protocol/src/aci_protocol/turn.py).
 - **The kernel** consumes at [`apps/worker/src/curie_worker/consumer.py::Consumer.run`](apps/worker/src/curie_worker/consumer.py) and processes at [`apps/worker/src/curie_worker/kernel/core.py::Kernel.process_event`](apps/worker/src/curie_worker/kernel/core.py). It talks to the runner over `POST /v1/event`, `/v1/steer`, `/v1/interrupt` ([`apps/worker/src/curie_worker/runner_client.py::RunnerClient`](apps/worker/src/curie_worker/runner_client.py)). These are the same routes the runner serves at [`runner/src/curie_runner/server.py::create_app`](runner/src/curie_runner/server.py).
 - **Deployment binding**: a run resolves its agent, version, and `bundle_ref` by exact-match on the required `(kind, address)` channel-routing pair against the active deployment, joining `agents` -> `agent_channels` -> `deployments` -> `agent_versions` ([`apps/worker/src/curie_worker/binding.py::BindingResolver`](apps/worker/src/curie_worker/binding.py)). Neither half has a fallback: the same address may be bound under different kinds. This is how one worker serves many agents: the routing pair selects the bundle.
 
@@ -407,10 +407,12 @@ never assumed across a suspend. The `thread_ts -> sandbox_id` affinity store
 ([`apps/worker/src/curie_worker/sandbox/affinity.py`](apps/worker/src/curie_worker/sandbox/affinity.py))
 is what routes a thread back to its sandbox.
 
-Two TTLs, and the difference matters:
-
-- **`route_ttl_seconds: int = 3600`** — the live route, one hour ([`apps/worker/src/curie_worker/sandbox/types.py`](apps/worker/src/curie_worker/sandbox/types.py)).
-- **`suspended_route_ttl_seconds: int = 86400`** — a **suspended** route survives 24 hours, which is the real budget a human has to click Approve ([`apps/worker/src/curie_worker/sandbox/substrate.py`](apps/worker/src/curie_worker/sandbox/substrate.py) applies it on suspend).
+The live affinity route lasts one hour (`route_ttl_seconds = 3600`), and its
+suspended form lasts 24 hours (`suspended_route_ttl_seconds = 86400`). These
+locate a sandbox; the approval's separately stored decision deadline determines
+how long it may remain pending. A later resume can cold-create a fresh claim.
+See [`SubstrateConfig`](apps/worker/src/curie_worker/sandbox/types.py) and the
+[suspend owner](apps/worker/src/curie_worker/sandbox/substrate.py).
 
 Two background loops close the loop rather than trusting the click to arrive:
 
@@ -1120,15 +1122,15 @@ worker-global setting. `ReplyHandle.endpoint` on the queued turn carries the bas
 URL of the channel API that this turn's reply is delivered through
 ([`packages/aci-protocol/src/aci_protocol/turn.py::ReplyHandle`](packages/aci-protocol/src/aci_protocol/turn.py)).
 The sink builds (and caches) a client per endpoint
-([`apps/worker/src/curie_worker/slack_sink.py::SlackReplyAdapter`](apps/worker/src/curie_worker/slack_sink.py),
+([`packages/channel-gateway/src/curie_channel_gateway/slack/slack_sink.py::SlackReplyAdapter`](packages/channel-gateway/src/curie_channel_gateway/slack/slack_sink.py),
 behind the [`ReplySink`](apps/worker/src/curie_worker/reply_sink.py) port), and refuses
 any endpoint outside the configured Slack origin.
-The worker-global `SLACK_API_BASE_URL`
-([`apps/worker/src/curie_worker/config.py::WorkerConfig.slack_api_base_url`](apps/worker/src/curie_worker/config.py))
-is now the **fallback**: `endpoint = None` means "use the worker's configured
-default", i.e. real Slack. That is what routes a reply back to the ingress that
-enqueued the turn. As a result, a real Slack workspace and a no-Slack CLI stub
-can coexist on **one** worker rather than needing one worker per channel.
+The gateway's `SLACK_API_BASE_URL`
+([`packages/channel-gateway/src/curie_channel_gateway/slack/read_server.py::GatewayConfig.slack_api_base_url`](packages/channel-gateway/src/curie_channel_gateway/slack/read_server.py))
+selects the default provider endpoint when the reply handle carries none. The
+worker forwards the server-authored reply target over authenticated gateway
+transport; only the gateway holds Slack credentials and applies the provider
+origin policy. Real Slack and a trusted CLI stub can share one worker.
 
 The CLI's `curie local message` path does four things:
 

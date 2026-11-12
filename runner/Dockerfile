@@ -61,17 +61,15 @@ RUN python3 -m venv /app/.venv \
 RUN python3 runner/export_dependency_pins.py < uv.lock > /tmp/runner-dependency-pins.txt \
     && /app/.venv/bin/pip install --no-cache-dir --require-hashes --no-deps -r /tmp/runner-dependency-pins.txt
 
-# The five source trees the runner needs: the two frozen workspace packages,
-# the shared telemetry implementation and schema, and the runner itself.
-# Copied by path so the image is reproducible from the lockfile above them
-# (root pyproject/uv.lock are the workspace source of truth).
 COPY packages/aci-protocol ./packages/aci-protocol
+COPY packages/curie-internal ./packages/curie-internal
 COPY packages/plugin-format ./packages/plugin-format
 COPY packages/telemetry ./packages/telemetry
 COPY packages/telemetry-schema ./packages/telemetry-schema
 COPY runner ./runner
 RUN /app/.venv/bin/pip install --no-cache-dir --no-deps \
         ./packages/aci-protocol \
+        ./packages/curie-internal \
         ./packages/plugin-format \
         ./packages/telemetry \
         ./packages/telemetry-schema \

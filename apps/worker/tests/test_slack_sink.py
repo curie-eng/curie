@@ -44,10 +44,14 @@ from channel_protocol.reply import (
     SettledOutcome,
     TurnStatus,
 )
-from curie_worker import slack_sink as slack_sink_module
+from curie_channel_gateway.reply_errors import (
+    UntrustedSlackEndpointError,
+)
+from curie_channel_gateway.slack import slack_sink as slack_sink_module
+from curie_channel_gateway.slack.read_server import GatewayConfig
+from curie_channel_gateway.slack.slack_sink import SlackReplyAdapter
 from curie_worker.config import WorkerConfig
 from curie_worker.reply_sink import TargetRoute
-from curie_worker.slack_sink import SlackReplyAdapter, UntrustedSlackEndpointError
 from slack_sdk.errors import SlackApiError
 
 # The worker default and a SECOND PATH under the same origin. Before D4.4 these
@@ -64,7 +68,7 @@ _ELSEWHERE = "https://slack.com/elsewhere/"
 
 @pytest.fixture(autouse=True)
 def _instant_synthetic_slack_delays(monkeypatch):
-    from curie_worker import slack_sink
+    from curie_channel_gateway.slack import slack_sink
 
     async def sleep(_delay):
         return None
@@ -149,9 +153,9 @@ def test_config_reads_slack_api_base_url_from_env(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.delenv("SLACK_API_BASE_URL", raising=False)
-    assert WorkerConfig().slack_api_base_url == ""
+    assert GatewayConfig().slack_api_base_url == ""
     monkeypatch.setenv("SLACK_API_BASE_URL", "http://localhost:9999")
-    assert WorkerConfig().slack_api_base_url == "http://localhost:9999"
+    assert GatewayConfig().slack_api_base_url == "http://localhost:9999"
 
 
 def test_update_converts_markdown_to_mrkdwn() -> None:
@@ -566,7 +570,7 @@ def test_slack_api_error_not_swallowed_even_with_best_effort() -> None:
     # A SlackApiError means the endpoint IS reachable but rejected the call; it is
     # NOT an unreachability, so best_effort_unreachable must NOT swallow it (that
     # would hide a real delivery rejection). Only transport-unreachable errors
-    # (_UNREACHABLE_ERRORS) are in scope for the best-effort resume swallow.
+    # (UNREACHABLE_REPLY_ERRORS) are in scope for the best-effort resume swallow.
     # Arranged on a PER-TURN target with a configured default, restoring the
     # dimension this case carried before the seam swap: a rejection on a second
     # target must be neither swallowed by the best-effort flag NOR re-sent to the
@@ -647,7 +651,7 @@ def test_post_renders_the_approval_card_from_a_confirm_intent() -> None:
     # The adapter turns a Confirm intent into the Block Kit approval card: header,
     # the summary section, a "Requested by" context line, and Approve/Reject
     # buttons carrying the dispatcher's action ids + the record id as value.
-    from curie_dispatcher.approval_actions import APPROVE_ACTION_ID, REJECT_ACTION_ID
+    from curie_channel_gateway.slack.approval_actions import APPROVE_ACTION_ID, REJECT_ACTION_ID
 
     sink = SlackReplyAdapter("xoxb-test")
     captured: dict[str, object] = {}

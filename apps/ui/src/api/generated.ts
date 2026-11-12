@@ -774,6 +774,52 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/agents/{agent_id}/hooks/{hook}/wake-secret": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Get Wake Secret
+         * @description Read the current wake key of one declared webhook wake hook.
+         *
+         *     Repeated reads return the same key until rotation. Provision it into the
+         *     connector's operator-managed secret as ``CURIE_HOOK_WAKE_KEY``.
+         */
+        get: operations["get_wake_secret_agents__agent_id__hooks__hook__wake_secret_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/agents/{agent_id}/hooks/{hook}/wake-secret/rotate": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Rotate Wake Secret
+         * @description Rotate one hook's wake key; the previous key stops working at once.
+         *
+         *     The answer carries the new generation and no key; read the key back with
+         *     the GET. Rotation does not cancel an admitted run.
+         */
+        post: operations["rotate_wake_secret_agents__agent_id__hooks__hook__wake_secret_rotate_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/agents/{agent_id}/hooks/{name}/fire": {
         parameters: {
             query?: never;
@@ -1561,7 +1607,10 @@ export interface paths {
          *     The authorizer runs first, server-side (#246): the route's approvers decide
          *     whether the authenticated principal belongs -- an explicit user list, a
          *     Slack user group, or (declaring none) the card channel's members (#420).
-         *     Requester equality neither grants nor vetoes membership. Then exactly one
+         *     Requester equality neither grants nor vetoes membership, except on a
+         *     canonical route (ADR 0271: dynamic selection or requester exclusion), which
+         *     only the HTTP answer composition may answer; every other principal there is
+         *     refused and audited, an operator first. Then exactly one
          *     authorized resolver wins
          *     the conditional UPDATE; a loser gets 409 naming who resolved it, and a
          *     past-SLA record flips to expired and returns 410 while still enqueuing the
@@ -1814,6 +1863,30 @@ export interface paths {
          *        answers 403.
          */
         post: operations["ingest_turn_channels_turns_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/channels/turns/admission": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Check Receiver Admission
+         * @description Apply the turn's authenticated HTTP identity admission without claiming a delivery.
+         *
+         *     ADR 0202 pings and bounded driver turns ask before any reply or budget write.
+         *     The same receiver proof, channel credential and live authority checks as
+         *     enqueue apply; no caller or directory decision is made by the gateway.
+         */
+        post: operations["check_receiver_admission_channels_turns_admission_post"];
         delete?: never;
         options?: never;
         head?: never;
@@ -2523,6 +2596,74 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/hooks/{agent_id}/{hook}/wake": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Wake Hook
+         * @description Admit one targetless run of a declared webhook wake hook.
+         *
+         *     The body is exactly ``{}``, signed with the hook's wake key; there are no
+         *     query parameters. 202 ``queued`` names the admitted run; 200 ``coalesced``
+         *     means a run was already open or this delivery id was already reserved, so
+         *     poll again later with a fresh delivery id if work remains.
+         */
+        post: operations["wake_hook_hooks__agent_id___hook__wake_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/identity/admin/{tenant_id}/code-host-links": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Create Code Host Link
+         * @description Map a principal to one GitHub account by its numeric id (#5414, ADR 0198).
+         *
+         *     The link is ``admin_mapped`` in the host's ``github_host`` namespace. A
+         *     person may hold several accounts; one account belongs to one active link.
+         */
+        post: operations["create_code_host_link_identity_admin__tenant_id__code_host_links_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/identity/admin/{tenant_id}/links/{link_id}/revoke": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Revoke Link
+         * @description Revoke one link of any provider. Revocation is set once and kept.
+         */
+        post: operations["revoke_link_identity_admin__tenant_id__links__link_id__revoke_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/identity/admin/{tenant_id}/{resource}": {
         parameters: {
             query?: never;
@@ -2534,6 +2675,75 @@ export interface paths {
         get: operations["identity_view_identity_admin__tenant_id___resource__get"];
         put?: never;
         post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/identity/authorities": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** List Authorities */
+        get: operations["list_authorities_identity_authorities_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/identity/authorities/{tenant_id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Get Authority */
+        get: operations["get_authority_identity_authorities__tenant_id__get"];
+        /** Adopt Authority */
+        put: operations["adopt_authority_identity_authorities__tenant_id__put"];
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/identity/authorities/{tenant_id}/replace": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Replace Authority */
+        post: operations["replace_authority_identity_authorities__tenant_id__replace_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/identity/authorities/{tenant_id}/retire": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Retire Authority */
+        post: operations["retire_authority_identity_authorities__tenant_id__retire_post"];
         delete?: never;
         options?: never;
         head?: never;
@@ -2586,6 +2796,41 @@ export interface paths {
         /** Resolve */
         post: operations["resolve_identity_resolve_post"];
         delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/identity/roles/{tenant_id}/{agent_id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** List Role Filters */
+        get: operations["list_role_filters_identity_roles__tenant_id___agent_id__get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/identity/roles/{tenant_id}/{agent_id}/{role}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        /** Set Group Filter */
+        put: operations["set_group_filter_identity_roles__tenant_id___agent_id___role__put"];
+        post?: never;
+        /** Remove Group Filter */
+        delete: operations["remove_group_filter_identity_roles__tenant_id___agent_id___role__delete"];
         options?: never;
         head?: never;
         patch?: never;
@@ -2911,7 +3156,7 @@ export interface paths {
         put?: never;
         /**
          * Pause Schedule
-         * @description Pause a named cron hook without changing its in force bundle.
+         * @description Pause a named cron or webhook wake hook without changing its in force bundle.
          */
         post: operations["pause_schedule_schedules__agent___name__pause_post"];
         delete?: never;
@@ -2931,7 +3176,7 @@ export interface paths {
         put?: never;
         /**
          * Resume Schedule
-         * @description Resume a named cron hook with one bounded catch up opportunity.
+         * @description Resume a named hook: a cron hook gets one bounded catch up, a wake none.
          */
         post: operations["resume_schedule_schedules__agent___name__resume_post"];
         delete?: never;
@@ -3130,6 +3375,31 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/v1/internal/factory-slack/steer": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Steer Factory Run
+         * @description Admit a revision of the run's pull request, or name why not.
+         *
+         *     Every refusal is final for the delivery and answers 200. A code host that
+         *     cannot answer now is 503, so the worker keeps the delivery pending. A
+         *     database failure is 503 too, raised without its exception chain: the
+         *     driver's error carries the bound objective, which holds the Slack body.
+         */
+        post: operations["steer_factory_run_v1_internal_factory_slack_steer_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/v1/internal/github/reviews/{event_id}/reserve": {
         parameters: {
             query?: never;
@@ -3195,9 +3465,31 @@ export interface paths {
         put?: never;
         /**
          * Create Identity Approval
-         * @description @spec HTTP-APPROVAL-CONTINUITY-3.
+         * @description V2 only for a dynamic approval. @spec HTTP-APPROVAL-CONTINUITY-3 REQUEST-APPROVAL-4.
          */
         post: operations["create_identity_approval_v1_internal_identity_approvals_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/internal/identity/approvals/{approval_id}/card": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Register Identity Approval Card
+         * @description Register the provider-returned DM channel of one approver-DM card.
+         *
+         *     @spec APPROVER-DM-2.
+         */
+        post: operations["register_identity_approval_card_v1_internal_identity_approvals__approval_id__card_post"];
         delete?: never;
         options?: never;
         head?: never;
@@ -3237,7 +3529,7 @@ export interface paths {
         put?: never;
         /**
          * Check Turn Authority
-         * @description @spec HTTP-INVOCATION-EXECUTION-8/16.
+         * @description @spec HTTP-INVOCATION-EXECUTION-8/16 CONNECTOR-REQUESTER-1.
          */
         post: operations["check_turn_authority_v1_internal_identity_turn_authority_check_post"];
         delete?: never;
@@ -3476,6 +3768,66 @@ export interface paths {
          * @description Prove the marked revision and its authoritative publication parent.
          */
         post: operations["verify_publication_revision_v1_internal_publications__publication_id__revision_commit_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/internal/publications/{publication_id}/ui-evidence": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        /**
+         * Put Publication Ui Evidence
+         * @description Store the evidence index once; an identical replay answers 200.
+         */
+        put: operations["put_publication_ui_evidence_v1_internal_publications__publication_id__ui_evidence_put"];
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/internal/publications/{publication_id}/ui-evidence/images/{ordinal}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        /**
+         * Put Publication Ui Evidence Image
+         * @description Store one expected image whose bytes match its entry exactly.
+         */
+        put: operations["put_publication_ui_evidence_image_v1_internal_publications__publication_id__ui_evidence_images__ordinal__put"];
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/internal/publications/{publication_id}/ui-evidence/seal": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Seal Publication Ui Evidence
+         * @description Close the upload; the reconciler may publish it from now on.
+         */
+        post: operations["seal_publication_ui_evidence_v1_internal_publications__publication_id__ui_evidence_seal_post"];
         delete?: never;
         options?: never;
         head?: never;
@@ -3808,6 +4160,50 @@ export interface paths {
         put?: never;
         /** Cancel Work Item */
         post: operations["cancel_work_item_v1_internal_work_items__work_item_id__cancel_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/internal/work-items/{work_item_id}/personal-context": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Read Personal Context
+         * @description The token-free facts a worker revalidates a personal WorkItem from (#5376).
+         */
+        get: operations["read_personal_context_v1_internal_work_items__work_item_id__personal_context_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/internal/work-items/{work_item_id}/personal-context/revalidate": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Revalidate Personal Context
+         * @description Bind a personal WorkItem to its owner's current enrollment generation.
+         *
+         *     Compare-and-set on the WorkItem, request and enrollment versions; a stale
+         *     version, another owner, an inactive enrollment, a live runtime or an
+         *     unchanged generation is 409 with its code (#5376).
+         */
+        post: operations["revalidate_personal_context_v1_internal_work_items__work_item_id__personal_context_revalidate_post"];
         delete?: never;
         options?: never;
         head?: never;
@@ -4517,8 +4913,15 @@ export interface components {
             code_host_installation_id?: number | null;
             /** Kind */
             kind: string;
+            /**
+             * Model Auth Mode
+             * @default service
+             * @enum {string}
+             */
+            model_auth_mode?: "service" | "personal";
             /** Objective */
             objective: string;
+            owner?: components["schemas"]["OwnerContextIn"] | null;
             /** Reply Conversation Id */
             reply_conversation_id: string;
             repository: components["schemas"]["RepositoryIn"];
@@ -4682,6 +5085,16 @@ export interface components {
             /** Channels */
             channels: components["schemas"]["ChannelBindingOut"][];
             /**
+             * Connector Requester Identity
+             * @default false
+             */
+            connector_requester_identity?: boolean;
+            /**
+             * Connector Requester Identity Version
+             * @default 1
+             */
+            connector_requester_identity_version?: number;
+            /**
              * Created At
              * Format: date-time
              */
@@ -4690,6 +5103,8 @@ export interface components {
             deploy_notifications: boolean;
             /** Execution Deadline Seconds */
             execution_deadline_seconds?: number | null;
+            /** Factory Slack Channel */
+            factory_slack_channel?: string | null;
             /** Hook Partitions */
             hook_partitions: {
                 [key: string]: components["schemas"]["HookPartitionConfig"];
@@ -4783,10 +5198,18 @@ export interface components {
             approval_routes?: {
                 [key: string]: components["schemas"]["ApprovalRouteBinding"];
             } | null;
+            /** Approval Routes Expected Version */
+            approval_routes_expected_version?: number | null;
+            /** Connector Requester Identity */
+            connector_requester_identity?: boolean | null;
+            /** Connector Requester Identity Expected Version */
+            connector_requester_identity_expected_version?: number | null;
             /** Deploy Notifications */
             deploy_notifications?: boolean | null;
             /** Execution Deadline Seconds */
             execution_deadline_seconds?: number | null;
+            /** Factory Slack Channel */
+            factory_slack_channel?: string | null;
             /** Hook Partitions */
             hook_partitions?: {
                 [key: string]: components["schemas"]["HookPartitionConfig"];
@@ -4829,6 +5252,41 @@ export interface components {
         AppConfig: {
             /** Org Name */
             org_name: string;
+        };
+        /**
+         * ApprovalApproverDmTarget
+         * @description Deliver the one card to the selected approver's DM (ADR 0272 decision 1).
+         *
+         *     The third form of a route's ``resolution``. ``identity`` names the Slack
+         *     bot identity (the same lowercase slug as a notification target's
+         *     ``adapter``; ``default`` is the default app and is stored as written) whose
+         *     installation posts the card to the one canonical person an approver ticket
+         *     selected. Valid only on a route that also registers ``approver_ticket``, and
+         *     never with a ``notification``; the route writer checks the first and that
+         *     the identity has a registered receiver. Strict, like the requesting-surface
+         *     form: no ``kind``, ``address`` or recipient may ride beside it.
+         */
+        ApprovalApproverDmTarget: {
+            /** Identity */
+            identity: string;
+            /**
+             * Mode
+             * @constant
+             */
+            mode: "approver_dm";
+        };
+        /**
+         * ApprovalApproverDmTargetOut
+         * @description Read projection of ``ApprovalApproverDmTarget`` (ADR 0272); tolerant for repair.
+         */
+        ApprovalApproverDmTargetOut: {
+            /** Identity */
+            identity: string;
+            /**
+             * Mode
+             * @constant
+             */
+            mode: "approver_dm";
         };
         /**
          * ApprovalApprovers
@@ -4915,6 +5373,62 @@ export interface components {
             team_epoch?: number | null;
             /** Team Id */
             team_id?: string | null;
+        };
+        /**
+         * ApprovalCardRegistrationRequestV1
+         * @description Register the provider-returned DM channel of one approver-DM card.
+         *
+         *     ``identity`` is the same block the creation sent; ``card_identity`` and
+         *     ``recipient`` the delivery the creation returned; ``channel`` the DM
+         *     channel id the provider answered the post with, never the user id the post
+         *     named. @spec APPROVER-DM-2.
+         */
+        ApprovalCardRegistrationRequestV1: {
+            /** Approval Id */
+            approval_id: string;
+            /** Card Identity */
+            card_identity: string;
+            /** Channel */
+            channel: string;
+            /** Dedupe Key */
+            dedupe_key: string;
+            identity: components["schemas"]["ApprovalCreationIdentityV1"];
+            /** Recipient */
+            recipient: string;
+            /** Request Id */
+            request_id: string;
+            /**
+             * Schema Version
+             * @constant
+             */
+            schema_version: 1;
+        };
+        /**
+         * ApprovalCardRegistrationResponseV1
+         * @description The approval's status and stored card channel after a registration.
+         *
+         *     A terminal status means the card was never registered and the worker
+         *     settles the posted card now. @spec APPROVER-DM-2.
+         */
+        ApprovalCardRegistrationResponseV1: {
+            /** Approval Id */
+            approval_id: string;
+            /** Card Channel */
+            card_channel: string | null;
+            /** Duplicate */
+            duplicate: boolean;
+            /** Request Id */
+            request_id: string;
+            /**
+             * Schema Version
+             * @constant
+             */
+            schema_version: 1;
+            /**
+             * Status
+             * @enum {string}
+             */
+            status: "pending" | "approved" | "rejected" | "expired";
         };
         /**
          * ApprovalCreateOut
@@ -5024,6 +5538,88 @@ export interface components {
              * @enum {string}
              */
             status: "pending" | "approved" | "rejected" | "expired";
+        };
+        /**
+         * ApprovalCreationResponseV2
+         * @description A dynamic approval's receipt: V1 plus the persisted grant and selection.
+         *
+         *     ``granted_arguments`` is the canonical JSON text of the stored object, the
+         *     opaque ``approval_ticket`` included; the worker renders these stored values,
+         *     never its original model summary. Display data, never a permit.
+         *     ``delivery`` is present only for an approver-DM approval (ADR 0272), which
+         *     is always dynamic, and is omitted, not null, otherwise.
+         *     @spec REQUEST-APPROVAL-4 REQUEST-APPROVAL-8 HTTP-APPROVAL-CONTINUITY-3 APPROVER-DM-2.
+         */
+        ApprovalCreationResponseV2: {
+            delivery?: components["schemas"]["ApprovalDmDeliveryV1"] | null;
+            /** Duplicate */
+            duplicate: boolean;
+            /** Granted Arguments */
+            granted_arguments: string;
+            /** Granted Tool */
+            granted_tool: string;
+            /** Id */
+            id: string;
+            /** Request Id */
+            request_id: string;
+            /** Requested By */
+            requested_by: string | null;
+            /**
+             * Schema Version
+             * @constant
+             */
+            schema_version: 2;
+            /** Selected Approvers */
+            selected_approvers: components["schemas"]["SelectedApproverV1"][];
+            /**
+             * Status
+             * @enum {string}
+             */
+            status: "pending" | "approved" | "rejected" | "expired";
+        };
+        /**
+         * ApprovalDmDeliveryV1
+         * @description The server-verified single recipient of an approver-DM card (ADR 0272).
+         *
+         *     ``identity`` is the Slack bot identity that posts the card,
+         *     ``provider_installation_id`` its installation, ``recipient`` the selected
+         *     approver's native user id there. @spec APPROVER-DM-2.
+         */
+        ApprovalDmDeliveryV1: {
+            /** Identity */
+            identity: string;
+            /**
+             * Mode
+             * @constant
+             */
+            mode: "approver_dm";
+            /** Provider Installation Id */
+            provider_installation_id: string;
+            /** Recipient */
+            recipient: string;
+        };
+        /**
+         * ApprovalExemptGroup
+         * @description The one identity provider group exempt from requester exclusion (ADR 0271).
+         *
+         *     Named by canonical issuer and stable group id, compared byte for byte with
+         *     the requester's current directory groups at answer time.
+         */
+        ApprovalExemptGroup: {
+            /** Id */
+            id: string;
+            /** Issuer */
+            issuer: string;
+        };
+        /**
+         * ApprovalExemptGroupOut
+         * @description Read projection of a stored exempt group; tolerant for repair.
+         */
+        ApprovalExemptGroupOut: {
+            /** Id */
+            id?: string | null;
+            /** Issuer */
+            issuer?: string | null;
         };
         /**
          * ApprovalGrantAuthorityRequestV1
@@ -5426,27 +6022,72 @@ export interface components {
          * @description One strict workspace binding for a declared approval route (#1460).
          *
          *     ``resolution`` is the single verified-identity action surface: a fixed
-         *     Slack channel, or the conversation that asked (ADR-0177).
+         *     Slack channel, the conversation that asked (ADR-0177), or the one selected
+         *     approver's DM (ADR 0272).
          *     ``notification`` may make the pending request visible elsewhere, but its
          *     message carries no interaction. ``approvers`` continues to narrow WHO may
          *     act through the resolution card path and is never inferred from notification
-         *     recipients.
+         *     recipients. ``approver_ticket`` registers a per-request approver selector and
+         *     ``separation`` the route's requester exclusion, with or without a selector
+         *     (ADR 0271).
          */
         ApprovalRouteBinding: {
+            approver_ticket?: components["schemas"]["ApproverTicketRegistration"] | null;
             approvers?: components["schemas"]["ApprovalApprovers"] | null;
+            /** Expires In Seconds */
+            expires_in_seconds?: number | null;
             notification?: components["schemas"]["ApprovalNotificationTarget"] | null;
+            /** Remind Every S */
+            remind_every_s?: number | null;
             /** Resolution */
-            resolution: components["schemas"]["ApprovalResolutionTarget"] | components["schemas"]["ApprovalRequestingSurfaceTarget"];
+            resolution: components["schemas"]["ApprovalResolutionTarget"] | components["schemas"]["ApprovalRequestingSurfaceTarget"] | components["schemas"]["ApprovalApproverDmTarget"];
+            separation?: components["schemas"]["ApprovalSeparation"] | null;
         };
         /**
          * ApprovalRouteBindingOut
          * @description The required resolution plus optional, redacted visibility policy.
+         *
+         *     ``approver_ticket`` and ``separation`` are omitted, not null, on a route
+         *     without a selector, so every existing route reads back exactly as before.
          */
         ApprovalRouteBindingOut: {
+            approver_ticket?: components["schemas"]["ApproverTicketOut"] | null;
             approvers?: components["schemas"]["ApprovalApproversOut"] | null;
+            /** Expires In Seconds */
+            expires_in_seconds?: number | null;
             notification?: components["schemas"]["ApprovalTargetOut"] | null;
+            /** Remind Every S */
+            remind_every_s?: number | null;
             /** Resolution */
-            resolution: components["schemas"]["ApprovalTargetOut"] | components["schemas"]["ApprovalRequestingSurfaceTargetOut"];
+            resolution: components["schemas"]["ApprovalTargetOut"] | components["schemas"]["ApprovalApproverDmTargetOut"] | components["schemas"]["ApprovalRequestingSurfaceTargetOut"];
+            separation?: components["schemas"]["ApprovalSeparationOut"] | null;
+        };
+        /**
+         * ApprovalSeparation
+         * @description Requester exclusion on an approval route (ADR 0271 decision 6).
+         *
+         *     On a route that registers an ``approver_ticket`` selector, omitting it
+         *     stores ``{"exclude_requester": true}`` and ``false`` is the audited opt-out.
+         *     On any other route it is stored as written: ``true`` enables static
+         *     exclusion, and omitting it keeps ordinary ADR 0106 self-confirmation.
+         *     ``exempt_group`` is valid only beside ``exclude_requester: true``.
+         */
+        ApprovalSeparation: {
+            /** Exclude Requester */
+            exclude_requester: boolean;
+            exempt_group?: components["schemas"]["ApprovalExemptGroup"] | null;
+        };
+        /**
+         * ApprovalSeparationOut
+         * @description Read projection of the stored, effective requester exclusion.
+         *
+         *     ``exempt_group`` is omitted, not null, when the route stores none, so a
+         *     route without one reads back exactly as before.
+         */
+        ApprovalSeparationOut: {
+            /** Exclude Requester */
+            exclude_requester?: boolean | null;
+            exempt_group?: components["schemas"]["ApprovalExemptGroupOut"] | null;
         };
         /**
          * ApprovalTargetOut
@@ -5461,6 +6102,90 @@ export interface components {
             address: string;
             /** Kind */
             kind: string;
+        };
+        /**
+         * ApproverTicketCeiling
+         * @description The operator ceiling a selector chooses inside (ADR 0271 decision 1).
+         *
+         *     ``approver_role_version`` names the agent access-policy version whose
+         *     approver role the operator approves. ``approver_role`` is server-owned: the
+         *     platform pins that role's canonical JSON on write and returns it on
+         *     readback, and a write may echo it back unchanged or omit it.
+         */
+        ApproverTicketCeiling: {
+            /** Approver Role */
+            approver_role?: string | null;
+            /** Approver Role Version */
+            approver_role_version: number;
+            /** Users */
+            users?: components["schemas"]["ApproverTicketCeilingUser"][] | null;
+        };
+        /**
+         * ApproverTicketCeilingOut
+         * @description Read projection of a registration ceiling, including the server-owned pin.
+         */
+        ApproverTicketCeilingOut: {
+            /** Approver Role */
+            approver_role?: string | null;
+            /** Approver Role Version */
+            approver_role_version?: number | null;
+            /** Users */
+            users?: components["schemas"]["ApproverTicketCeilingUserOut"][] | null;
+        };
+        /**
+         * ApproverTicketCeilingUser
+         * @description One exact canonical person the operator allows inside the pinned role.
+         */
+        ApproverTicketCeilingUser: {
+            /** Issuer */
+            issuer: string;
+            /** Subject */
+            subject: string;
+        };
+        /**
+         * ApproverTicketCeilingUserOut
+         * @description Read projection of one ceiling user; tolerant for repair.
+         */
+        ApproverTicketCeilingUserOut: {
+            /** Issuer */
+            issuer?: string | null;
+            /** Subject */
+            subject?: string | null;
+        };
+        /**
+         * ApproverTicketOut
+         * @description Read projection of a selector registration (ADR 0271). The public key is
+         *     public material and reads back so a readback can be written back.
+         */
+        ApproverTicketOut: {
+            ceiling?: components["schemas"]["ApproverTicketCeilingOut"] | null;
+            /** Connector */
+            connector?: string | null;
+            /** Key Id */
+            key_id?: string | null;
+            /** Public Key */
+            public_key?: string | null;
+            /** Tool */
+            tool?: string | null;
+        };
+        /**
+         * ApproverTicketRegistration
+         * @description A selector registered on one approval route (ADR 0271 decision 1).
+         *
+         *     One hosted connector and one exact upstream tool, the Ed25519 public key
+         *     (unpadded base64url of 32 bytes) and key id its tickets are verified with,
+         *     and the mandatory ceiling. The private key never reaches the platform.
+         */
+        ApproverTicketRegistration: {
+            ceiling: components["schemas"]["ApproverTicketCeiling"];
+            /** Connector */
+            connector: string;
+            /** Key Id */
+            key_id: string;
+            /** Public Key */
+            public_key: string;
+            /** Tool */
+            tool: string;
         };
         /**
          * Attachment
@@ -5506,6 +6231,31 @@ export interface components {
             name: string;
             /** Size Bytes */
             size_bytes?: number | null;
+        };
+        /** AuthorityMutation */
+        AuthorityMutation: {
+            /** Expected Lifecycle Generation */
+            expected_lifecycle_generation: number;
+            /** Expected Version */
+            expected_version: number;
+            /**
+             * Request Id
+             * Format: uuid
+             */
+            request_id: string;
+        };
+        /** AuthoritySelectionMutation */
+        AuthoritySelectionMutation: {
+            /** Expected Lifecycle Generation */
+            expected_lifecycle_generation: number;
+            /** Expected Version */
+            expected_version: number;
+            /**
+             * Request Id
+             * Format: uuid
+             */
+            request_id: string;
+            selection: components["schemas"]["HttpSelectionV1"];
         };
         /**
          * BehaviorPacksConfig
@@ -6127,6 +6877,47 @@ export interface components {
             /** Terminal */
             terminal: boolean;
         };
+        /**
+         * CodeHostLinkIn
+         * @description An operator's assertion that a principal holds one code host account (#5414).
+         *
+         *     Recorded as an ``admin_mapped`` link in the host's ``github_host``
+         *     namespace (ADR 0198 decision 8). The account is named by its immutable id.
+         */
+        CodeHostLinkIn: {
+            /** Account Id */
+            account_id: string;
+            /**
+             * Code Host Kind
+             * @constant
+             */
+            code_host_kind: "github";
+            /**
+             * Created By Principal Id
+             * Format: uuid
+             */
+            created_by_principal_id: string;
+            /** Host */
+            host: string;
+            /**
+             * Principal Id
+             * Format: uuid
+             */
+            principal_id: string;
+        };
+        /** CodeHostLinkOut */
+        CodeHostLinkOut: {
+            /**
+             * Identity Namespace Id
+             * Format: uuid
+             */
+            identity_namespace_id: string;
+            /**
+             * Link Id
+             * Format: uuid
+             */
+            link_id: string;
+        };
         /** Completed */
         Completed: {
             /** Sha256 */
@@ -6292,6 +7083,16 @@ export interface components {
          * @enum {string}
          */
         CredentialHeader: "authorization_basic" | "authorization_bearer" | "private_token";
+        /**
+         * CredentialReferenceV1
+         * @description @spec HTTP-AUTHORITY-CONFIG-V1-4.
+         */
+        CredentialReferenceV1: {
+            /** Generation */
+            generation: number;
+            /** Id */
+            id: string;
+        };
         /** Declaration */
         Declaration: {
             /** Loops */
@@ -7122,6 +7923,53 @@ export interface components {
              */
             tenant_id: string;
         };
+        /**
+         * FactorySlackSteerIn
+         * @description One threaded Slack mention in a factory run's root, as the worker consumed it.
+         *
+         *     ``receipt`` is the dispatcher's verified mention receipt
+         *     (``curie_internal.slack_mention_receipt.SlackMentionReceipt``), validated by
+         *     the route so a malformed one is a refusal, not a retry. ``author`` is the
+         *     turn's Slack user id; the receipt must name the same delivery, route and
+         *     sender.
+         */
+        FactorySlackSteerIn: {
+            /** Author */
+            author: string;
+            /** Channel */
+            channel: string;
+            /** Channel Identity */
+            channel_identity: string;
+            /** Delivery Id */
+            delivery_id: string;
+            /** Receipt */
+            receipt: {
+                [key: string]: unknown;
+            };
+            /** Root Ts */
+            root_ts: string;
+        };
+        /** FactorySlackSteerOut */
+        FactorySlackSteerOut: {
+            /**
+             * Outcome
+             * @enum {string}
+             */
+            outcome: "admitted" | "not_mapped" | "receipt_mismatch" | "sender_unverified" | "code_host_identity_missing" | "code_host_identity_ambiguous" | "code_host_identity_unsupported" | "code_host_mismatch" | "repository_mismatch" | "not_authorized" | "work_item_cancelled" | "lineage_closed" | "no_pull_request" | "pull_request_not_open" | "pull_request_branch_mismatch" | "authority_changed" | "objective_too_large" | "admission_refused";
+            /** Pull Request Url */
+            pull_request_url?: string | null;
+            /** Reason */
+            reason?: string | null;
+            /**
+             * Replayed
+             * @default false
+             */
+            replayed?: boolean;
+            /** Request Id */
+            request_id?: string | null;
+            /** Request Status */
+            request_status?: string | null;
+        };
         /** FactoryWake */
         FactoryWake: {
             /** Adapter */
@@ -7259,6 +8107,31 @@ export interface components {
              */
             reply?: string;
         };
+        /** GroupFilterMutation */
+        GroupFilterMutation: {
+            /** Expected Version */
+            expected_version: number;
+            /** Groups */
+            groups: components["schemas"]["GroupV1"][];
+            /**
+             * Request Id
+             * Format: uuid
+             */
+            request_id: string;
+        };
+        /**
+         * GroupV1
+         * @description @spec HTTP-IDENTITY-V1-2.
+         */
+        GroupV1: {
+            /** Id */
+            id: string;
+            /**
+             * Issuer
+             * @description Structural HTTPS issuer constraints preserve exact-string URL parsing compatibility. Unicode NFKC netloc checks require semantic validation with the pure facts validator; schema validation alone is insufficient.
+             */
+            issuer: string;
+        };
         /** HTTPValidationError */
         HTTPValidationError: {
             /** Detail */
@@ -7380,7 +8253,7 @@ export interface components {
              * Source
              * @enum {string}
              */
-            source: "schedule" | "manual";
+            source: "schedule" | "manual" | "webhook";
             /**
              * Started At
              * Format: date-time
@@ -7540,6 +8413,104 @@ export interface components {
             source_generation: string | null;
             /** Supported */
             supported: boolean;
+        };
+        /**
+         * HookWakeCoalescedOut
+         * @description 200: the wake joined a live open run, or its delivery id was already reserved.
+         */
+        HookWakeCoalescedOut: {
+            /**
+             * Status
+             * @constant
+             */
+            status: "coalesced";
+        };
+        /**
+         * HookWakeErrorOut
+         * @description Every wake and wake-key refusal: exactly one reason string.
+         */
+        HookWakeErrorOut: {
+            /** Detail */
+            detail: string;
+        };
+        /**
+         * HookWakeQueuedOut
+         * @description 202: one webhook run was admitted and its turn enqueued.
+         */
+        HookWakeQueuedOut: {
+            /**
+             * Run Id
+             * Format: uuid
+             */
+            run_id: string;
+            /**
+             * Status
+             * @constant
+             */
+            status: "queued";
+        };
+        /**
+         * HookWakeRotationOut
+         * @description The generation a rotation committed. Carries no key.
+         */
+        HookWakeRotationOut: {
+            /** Agent Id */
+            agent_id: string;
+            /** Generation */
+            generation: number;
+            /** Hook */
+            hook: string;
+        };
+        /**
+         * HookWakeSecretOut
+         * @description The current wake key of one agent hook. Served with ``Cache-Control: no-store``.
+         */
+        HookWakeSecretOut: {
+            /** Agent Id */
+            agent_id: string;
+            /** Generation */
+            generation: number;
+            /** Hook */
+            hook: string;
+            /** Secret */
+            secret: string;
+        };
+        /**
+         * HttpSelectionV1
+         * @description @spec HTTP-AUTHORITY-CONFIG-V1-1.
+         *
+         *     @spec HTTP-AUTHORITY-CONFIG-V1-3 to HTTP-AUTHORITY-CONFIG-V1-5.
+         */
+        HttpSelectionV1: {
+            credential_ref: components["schemas"]["CredentialReferenceV1"];
+            /** Issuer */
+            issuer: string;
+            /** Lookup Url */
+            lookup_url: string;
+            /** Max Clock Skew Ms */
+            max_clock_skew_ms: number;
+            /** Max Identity Age Ms */
+            max_identity_age_ms: number;
+            /** Max Membership Age Ms */
+            max_membership_age_ms: number;
+            /**
+             * Mode
+             * @constant
+             */
+            mode: "http";
+        };
+        /** IdentityLinkRevokedOut */
+        IdentityLinkRevokedOut: {
+            /**
+             * Link Id
+             * Format: uuid
+             */
+            link_id: string;
+            /**
+             * Revoked At
+             * Format: date-time
+             */
+            revoked_at: string;
         };
         /**
          * IssueReadContext
@@ -7927,6 +8898,16 @@ export interface components {
                 [key: string]: unknown;
             } | null;
         };
+        /** OperatorMutation */
+        OperatorMutation: {
+            /** Expected Version */
+            expected_version: number;
+            /**
+             * Request Id
+             * Format: uuid
+             */
+            request_id: string;
+        };
         /** Owner */
         Owner: {
             /**
@@ -7941,6 +8922,27 @@ export interface components {
             /** Thread Key */
             thread_key: string;
         };
+        /**
+         * OwnerContextIn
+         * @description The verified owner a personal execution runs as (#5376, ADR 0268).
+         *
+         *     Accepted only here, from the trusted worker: a principal of the agent's
+         *     tenant and the enrollment generation it is bound to.
+         */
+        OwnerContextIn: {
+            /** Enrollment Generation */
+            enrollment_generation: number;
+            /**
+             * Principal Id
+             * Format: uuid
+             */
+            principal_id: string;
+            /**
+             * Tenant Id
+             * Format: uuid
+             */
+            tenant_id: string;
+        };
         /** OwnerLostBody */
         OwnerLostBody: {
             /** Owner */
@@ -7954,6 +8956,77 @@ export interface components {
             files: components["schemas"]["FileDescriptor"][];
             /** Next Cursor */
             next_cursor: string | null;
+        };
+        /**
+         * PersonalContextEnrollmentOut
+         * @description The owner's enrollment header: its generation, state and CAS version.
+         */
+        PersonalContextEnrollmentOut: {
+            /** Active */
+            active: boolean;
+            /** Generation */
+            generation: number;
+            /** Version */
+            version: number;
+        };
+        /**
+         * PersonalContextOut
+         * @description A personal WorkItem's owner, bound generation and versions (#5376).
+         *
+         *     Token free: identifiers, generations and versions only. ``enrollment`` is
+         *     null when the owner has no enrollment row.
+         */
+        PersonalContextOut: {
+            /**
+             * Agent Id
+             * Format: uuid
+             */
+            agent_id: string;
+            enrollment: components["schemas"]["PersonalContextEnrollmentOut"] | null;
+            /** Enrollment Generation */
+            enrollment_generation: number;
+            /**
+             * Model Auth Mode
+             * @enum {string}
+             */
+            model_auth_mode: "service" | "personal";
+            /**
+             * Owner Principal Id
+             * Format: uuid
+             */
+            owner_principal_id: string;
+            request: components["schemas"]["PersonalContextRequestOut"] | null;
+            /**
+             * Tenant Id
+             * Format: uuid
+             */
+            tenant_id: string;
+            /**
+             * Work Item Id
+             * Format: uuid
+             */
+            work_item_id: string;
+            /** Work Item Version */
+            work_item_version: number;
+        };
+        /**
+         * PersonalContextRequestOut
+         * @description The WorkItem's latest request and the generation it snapshotted.
+         */
+        PersonalContextRequestOut: {
+            /** Enrollment Generation */
+            enrollment_generation: number | null;
+            /**
+             * Id
+             * Format: uuid
+             */
+            id: string;
+            /** Sequence */
+            sequence: number;
+            /** Status */
+            status: string;
+            /** Version */
+            version: number;
         };
         /** PhaseDeclaration */
         PhaseDeclaration: {
@@ -8270,6 +9343,8 @@ export interface components {
             base_sha: string;
             /** Body */
             body?: string | null;
+            /** Card Channel */
+            card_channel?: string | null;
             /** Changed Paths */
             changed_paths: string[];
             /** Conversation Id */
@@ -9642,6 +10717,64 @@ export interface components {
             /** Slack Channel */
             slack_channel?: string | null;
         };
+        /**
+         * RevalidationBody
+         * @description The versions the caller read, compared and set in one transaction.
+         */
+        RevalidationBody: {
+            /**
+             * Agent Id
+             * Format: uuid
+             */
+            agent_id: string;
+            /** Expected Enrollment Version */
+            expected_enrollment_version: number;
+            /** Expected Request Version */
+            expected_request_version: number;
+            /** Expected Work Item Version */
+            expected_work_item_version: number;
+            /**
+             * Owner Principal Id
+             * Format: uuid
+             */
+            owner_principal_id: string;
+            /**
+             * Request Id
+             * Format: uuid
+             */
+            request_id: string;
+            /**
+             * Tenant Id
+             * Format: uuid
+             */
+            tenant_id: string;
+        };
+        /**
+         * RevalidationOut
+         * @description The generation the WorkItem is now bound to and the versions it moved to.
+         */
+        RevalidationOut: {
+            /** Enrollment Generation */
+            enrollment_generation: number;
+            /** Enrollment Version */
+            enrollment_version: number;
+            /** Previous Generation */
+            previous_generation: number;
+            /**
+             * Request Id
+             * Format: uuid
+             */
+            request_id: string;
+            /** Request Version */
+            request_version: number;
+            /**
+             * Work Item Id
+             * Format: uuid
+             */
+            work_item_id: string;
+            /** Work Item Version */
+            work_item_version: number;
+        };
         /** ReviewReservationOut */
         ReviewReservationOut: {
             /** Origin Key */
@@ -9860,7 +10993,7 @@ export interface components {
             /** Lease Held To Deadline */
             lease_held_to_deadline: boolean;
             /** Refusal */
-            refusal: ("not_found" | "identity_mismatch" | "active_request" | "work_item_cancelled" | "not_dispatchable" | "not_published" | "duplicate" | "stale_owner" | "not_running" | "waiting_deadline_elapsed" | "binding_missing" | "repository_not_allowed" | "publication_pending" | "factory_wake_mismatch" | "factory_agent_missing" | "factory_agent_mismatch" | "factory_tenant_mismatch" | "factory_binding_missing" | "factory_binding_ambiguous" | "factory_binding_changed" | "factory_surface_mismatch" | "factory_start_failed") | null;
+            refusal: ("not_found" | "identity_mismatch" | "active_request" | "work_item_cancelled" | "not_dispatchable" | "not_published" | "duplicate" | "stale_owner" | "not_running" | "waiting_deadline_elapsed" | "binding_missing" | "repository_not_allowed" | "publication_pending" | "factory_wake_mismatch" | "factory_agent_missing" | "factory_agent_mismatch" | "factory_tenant_mismatch" | "factory_binding_missing" | "factory_binding_ambiguous" | "factory_binding_changed" | "factory_surface_mismatch" | "factory_start_failed" | "personal_owner_required" | "owner_context_unexpected" | "owner_tenant_mismatch" | "owner_tenant_inactive" | "owner_principal_missing" | "owner_principal_inactive" | "enrollment_inactive" | "enrollment_generation_mismatch" | "owner_mismatch") | null;
             /** Repository Path */
             repository_path: string;
             /**
@@ -9948,6 +11081,18 @@ export interface components {
         ScheduleListOut: {
             /** Schedules */
             schedules: components["schemas"]["AgentSchedulesOut"][];
+        };
+        /**
+         * SelectedApproverV1
+         * @description One verified selected person, projected to canonical identity. @spec REQUEST-APPROVAL-4.
+         */
+        SelectedApproverV1: {
+            /** Issuer */
+            issuer: string;
+            /** Subject */
+            subject: string;
+            /** Tenant Id */
+            tenant_id: string;
         };
         /** Selection */
         Selection: {
@@ -10512,6 +11657,45 @@ export interface components {
             stage: "prepare" | "claim_or_resume" | "start" | "steer";
         };
         /**
+         * TurnAuthorityResponseV2
+         * @description Every version 1 field plus the required-nullable requester projection.
+         *
+         *     The API answers version 2 only for a continue on an agent that opted in to
+         *     connector requester identity; a null requester means no verified human. A
+         *     requester is bound to this answer's own checked scope and never rides a
+         *     refused or unavailable answer. @spec CONNECTOR-REQUESTER-1.
+         */
+        TurnAuthorityResponseV2: {
+            /** Context Sha256 */
+            context_sha256: string;
+            /**
+             * Decision
+             * @enum {string}
+             */
+            decision: "continue" | "refuse" | "unavailable";
+            /** Event Id */
+            event_id: string;
+            /**
+             * Reason
+             * @enum {string}
+             */
+            reason: "current_authority" | "caller_not_allowed" | "invalid_context" | "unsupported_resume" | "authority_unavailable";
+            /** Request Id */
+            request_id: string;
+            requester: components["schemas"]["TurnRequesterV1"] | null;
+            /**
+             * Schema Version
+             * @constant
+             */
+            schema_version: 2;
+            scope: components["schemas"]["TurnAuthorityScopeV1"];
+            /**
+             * Stage
+             * @enum {string}
+             */
+            stage: "prepare" | "claim_or_resume" | "start" | "steer";
+        };
+        /**
          * TurnAuthorityScopeV1
          * @description @spec HTTP-INVOCATION-EXECUTION-16.
          */
@@ -10554,6 +11738,20 @@ export interface components {
             version: "1.0";
         };
         /**
+         * TurnRequesterV1
+         * @description The verified original requester: tenant and canonical issuer and subject only.
+         *
+         *     Compared exactly; never normalized. @spec CONNECTOR-REQUESTER-1.
+         */
+        TurnRequesterV1: {
+            /** Issuer */
+            issuer: string;
+            /** Subject */
+            subject: string;
+            /** Tenant Id */
+            tenant_id: string;
+        };
+        /**
          * TurnSource
          * @description What started this turn: a person speaking, or the system doing a job.
          *
@@ -10580,6 +11778,29 @@ export interface components {
          * @enum {string}
          */
         TurnSource: "slack" | "webhook" | "cron";
+        /** UiEvidenceImageOut */
+        UiEvidenceImageOut: {
+            /** Ordinal */
+            ordinal: number;
+            /** Stored */
+            stored: boolean;
+        };
+        /** UiEvidenceIndexOut */
+        UiEvidenceIndexOut: {
+            /** Expected */
+            expected: number[];
+            /** Status */
+            status: string;
+        };
+        /** UiEvidenceSealOut */
+        UiEvidenceSealOut: {
+            /** Missing */
+            missing: number[];
+            /** Status */
+            status: string;
+            /** Stored */
+            stored: number[];
+        };
         /** UsageReport */
         UsageReport: {
             /** Models */
@@ -10754,15 +11975,25 @@ export interface components {
              * Format: date-time
              */
             created_at: string;
+            /** Enrollment Generation */
+            enrollment_generation?: number | null;
             /**
              * Id
              * Format: uuid
              */
             id: string;
+            /**
+             * Model Auth Mode
+             * @default service
+             * @enum {string}
+             */
+            model_auth_mode?: "service" | "personal";
             /** Objective */
             objective: string | null;
             /** Objective Truncated */
             objective_truncated: boolean;
+            /** Owner Principal Id */
+            owner_principal_id?: string | null;
             pr: components["schemas"]["WorkItemPrOut"] | null;
             progress?: components["schemas"]["WorkItemProgressOut"] | null;
             publication: components["schemas"]["WorkItemPublicationOut"] | null;
@@ -10776,6 +12007,8 @@ export interface components {
              * @enum {string}
              */
             state: "queued" | "waiting" | "running" | "cancellation_requested" | "cancelled" | "expired" | "failed" | "awaiting_approval" | "publishing" | "published" | "completed_unpublished";
+            /** Tenant Id */
+            tenant_id?: string | null;
             /** Title */
             title?: string | null;
             tracker: components["schemas"]["WorkItemTrackerOut"];
@@ -10842,18 +12075,30 @@ export interface components {
              * Format: date-time
              */
             created_at: string;
+            /** Enrollment Generation */
+            enrollment_generation?: number | null;
             /** Execution Deadline */
             execution_deadline: string | null;
             /** Last Deferral Reason */
             last_deferral_reason: string | null;
             /** Last Start Failure Detail */
             last_start_failure_detail: string | null;
+            /**
+             * Model Auth Mode
+             * @default service
+             * @enum {string}
+             */
+            model_auth_mode?: "service" | "personal";
+            /** Owner Principal Id */
+            owner_principal_id?: string | null;
             /** Sequence */
             sequence: number;
             /** Started At */
             started_at: string | null;
             /** Status */
             status: string;
+            /** Tenant Id */
+            tenant_id?: string | null;
             /** Terminal At */
             terminal_at: string | null;
             /** Terminal Cause */
@@ -12869,6 +14114,146 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["HookSourceRefusal"];
+                };
+            };
+        };
+    };
+    get_wake_secret_agents__agent_id__hooks__hook__wake_secret_get: {
+        parameters: {
+            query?: never;
+            header?: {
+                "x-api-key"?: string | null;
+            };
+            path: {
+                agent_id: string;
+                hook: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HookWakeSecretOut"];
+                };
+            };
+            /** @description wake_query_forbidden */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HookWakeErrorOut"];
+                };
+            };
+            /** @description wake_not_declared */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HookWakeErrorOut"];
+                };
+            };
+            /** @description wake_source_not_ordinary */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HookWakeErrorOut"];
+                };
+            };
+            /** @description wake_body_invalid */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HookWakeErrorOut"];
+                };
+            };
+            /** @description authority_unavailable or wake_declaration_unavailable */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HookWakeErrorOut"];
+                };
+            };
+        };
+    };
+    rotate_wake_secret_agents__agent_id__hooks__hook__wake_secret_rotate_post: {
+        parameters: {
+            query?: never;
+            header?: {
+                "x-api-key"?: string | null;
+            };
+            path: {
+                agent_id: string;
+                hook: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HookWakeRotationOut"];
+                };
+            };
+            /** @description wake_query_forbidden */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HookWakeErrorOut"];
+                };
+            };
+            /** @description wake_not_declared */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HookWakeErrorOut"];
+                };
+            };
+            /** @description wake_source_not_ordinary */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HookWakeErrorOut"];
+                };
+            };
+            /** @description wake_body_invalid */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HookWakeErrorOut"];
+                };
+            };
+            /** @description authority_unavailable, wake_declaration_unavailable or wake_generation_exhausted */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HookWakeErrorOut"];
                 };
             };
         };
@@ -15183,6 +16568,36 @@ export interface operations {
             };
         };
     };
+    check_receiver_admission_channels_turns_admission_post: {
+        parameters: {
+            query?: never;
+            header?: {
+                "x-api-key"?: string | null;
+                "x-curie-receiver-proof"?: string | null;
+            };
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
     get_cluster_message_replies_cluster_message_replies__reply_ref__get: {
         parameters: {
             query?: {
@@ -16397,6 +17812,181 @@ export interface operations {
             };
         };
     };
+    wake_hook_hooks__agent_id___hook__wake_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                agent_id: string;
+                hook: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Joined a live open run, or the delivery id is already reserved */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HookWakeCoalescedOut"];
+                };
+            };
+            /** @description One webhook run admitted and enqueued */
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HookWakeQueuedOut"];
+                };
+            };
+            /** @description wake_query_forbidden */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HookWakeErrorOut"];
+                };
+            };
+            /** @description invalid_wake_signature */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HookWakeErrorOut"];
+                };
+            };
+            /** @description wake_not_declared */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HookWakeErrorOut"];
+                };
+            };
+            /** @description wake_source_not_ordinary, hook_paused or agent_killed */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HookWakeErrorOut"];
+                };
+            };
+            /** @description hook body exceeds the maximum size */
+            413: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HookWakeErrorOut"];
+                };
+            };
+            /** @description wake_body_invalid */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HookWakeErrorOut"];
+                };
+            };
+            /** @description budget_exhausted */
+            429: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HookWakeErrorOut"];
+                };
+            };
+            /** @description authority_unavailable, wake_declaration_unavailable, wake_dedupe_unavailable or wake_enqueue_unavailable */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HookWakeErrorOut"];
+                };
+            };
+        };
+    };
+    create_code_host_link_identity_admin__tenant_id__code_host_links_post: {
+        parameters: {
+            query?: never;
+            header?: {
+                "x-api-key"?: string | null;
+            };
+            path: {
+                tenant_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["CodeHostLinkIn"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["CodeHostLinkOut"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    revoke_link_identity_admin__tenant_id__links__link_id__revoke_post: {
+        parameters: {
+            query?: never;
+            header?: {
+                "x-api-key"?: string | null;
+            };
+            path: {
+                tenant_id: string;
+                link_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["IdentityLinkRevokedOut"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
     identity_view_identity_admin__tenant_id___resource__get: {
         parameters: {
             query?: {
@@ -16413,6 +18003,198 @@ export interface operations {
             cookie?: never;
         };
         requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        [key: string]: unknown;
+                    };
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    list_authorities_identity_authorities_get: {
+        parameters: {
+            query?: {
+                limit?: number;
+                after?: string | null;
+            };
+            header?: {
+                "x-api-key"?: string | null;
+            };
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        [key: string]: unknown;
+                    };
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    get_authority_identity_authorities__tenant_id__get: {
+        parameters: {
+            query?: never;
+            header?: {
+                "x-api-key"?: string | null;
+            };
+            path: {
+                tenant_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        [key: string]: unknown;
+                    };
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    adopt_authority_identity_authorities__tenant_id__put: {
+        parameters: {
+            query?: {
+                dry_run?: boolean;
+            };
+            header?: {
+                "x-api-key"?: string | null;
+            };
+            path: {
+                tenant_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["AuthoritySelectionMutation"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        [key: string]: unknown;
+                    };
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    replace_authority_identity_authorities__tenant_id__replace_post: {
+        parameters: {
+            query?: {
+                dry_run?: boolean;
+            };
+            header?: {
+                "x-api-key"?: string | null;
+            };
+            path: {
+                tenant_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["AuthoritySelectionMutation"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        [key: string]: unknown;
+                    };
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    retire_authority_identity_authorities__tenant_id__retire_post: {
+        parameters: {
+            query?: never;
+            header?: {
+                "x-api-key"?: string | null;
+            };
+            path: {
+                tenant_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["AuthorityMutation"];
+            };
+        };
         responses: {
             /** @description Successful Response */
             200: {
@@ -16524,6 +18306,124 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["PrincipalResolutionOut"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    list_role_filters_identity_roles__tenant_id___agent_id__get: {
+        parameters: {
+            query?: never;
+            header?: {
+                "x-api-key"?: string | null;
+            };
+            path: {
+                tenant_id: string;
+                agent_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        [key: string]: unknown;
+                    };
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    set_group_filter_identity_roles__tenant_id___agent_id___role__put: {
+        parameters: {
+            query?: never;
+            header?: {
+                "x-api-key"?: string | null;
+            };
+            path: {
+                tenant_id: string;
+                agent_id: string;
+                role: "invocation" | "approver";
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["GroupFilterMutation"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        [key: string]: unknown;
+                    };
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    remove_group_filter_identity_roles__tenant_id___agent_id___role__delete: {
+        parameters: {
+            query?: never;
+            header?: {
+                "x-api-key"?: string | null;
+            };
+            path: {
+                tenant_id: string;
+                agent_id: string;
+                role: "invocation" | "approver";
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["OperatorMutation"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        [key: string]: unknown;
+                    };
                 };
             };
             /** @description Validation Error */
@@ -17690,6 +19590,41 @@ export interface operations {
             };
         };
     };
+    steer_factory_run_v1_internal_factory_slack_steer_post: {
+        parameters: {
+            query?: never;
+            header?: {
+                "X-Curie-Worker-Token"?: string | null;
+            };
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["FactorySlackSteerIn"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["FactorySlackSteerOut"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
     reserve_review_v1_internal_github_reviews__event_id__reserve_post: {
         parameters: {
             query?: never;
@@ -17820,7 +19755,44 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": components["schemas"]["ApprovalCreationResponseV1"];
+                    "application/json": components["schemas"]["ApprovalCreationResponseV1"] | components["schemas"]["ApprovalCreationResponseV2"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    register_identity_approval_card_v1_internal_identity_approvals__approval_id__card_post: {
+        parameters: {
+            query?: never;
+            header?: {
+                "X-Curie-Worker-Token"?: string | null;
+            };
+            path: {
+                approval_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ApprovalCardRegistrationRequestV1"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ApprovalCardRegistrationResponseV1"];
                 };
             };
             /** @description Validation Error */
@@ -17890,7 +19862,7 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": components["schemas"]["TurnAuthorityResponseV1"];
+                    "application/json": components["schemas"]["TurnAuthorityResponseV1"] | components["schemas"]["TurnAuthorityResponseV2"];
                 };
             };
             /** @description Validation Error */
@@ -18360,6 +20332,107 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["PublicationRevisionOut"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    put_publication_ui_evidence_v1_internal_publications__publication_id__ui_evidence_put: {
+        parameters: {
+            query?: never;
+            header?: {
+                "X-Curie-Worker-Token"?: string | null;
+            };
+            path: {
+                publication_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["UiEvidenceIndexOut"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    put_publication_ui_evidence_image_v1_internal_publications__publication_id__ui_evidence_images__ordinal__put: {
+        parameters: {
+            query?: never;
+            header: {
+                "X-Curie-Evidence-Sha256": string;
+                "X-Curie-Worker-Token"?: string | null;
+            };
+            path: {
+                publication_id: string;
+                ordinal: number;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["UiEvidenceImageOut"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    seal_publication_ui_evidence_v1_internal_publications__publication_id__ui_evidence_seal_post: {
+        parameters: {
+            query?: never;
+            header?: {
+                "X-Curie-Worker-Token"?: string | null;
+            };
+            path: {
+                publication_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["UiEvidenceSealOut"];
                 };
             };
             /** @description Validation Error */
@@ -19092,6 +21165,80 @@ export interface operations {
                     "application/json": {
                         [key: string]: unknown;
                     };
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    read_personal_context_v1_internal_work_items__work_item_id__personal_context_get: {
+        parameters: {
+            query: {
+                tenant_id: string;
+                agent_id: string;
+                owner_principal_id: string;
+            };
+            header?: {
+                "X-Curie-Worker-Token"?: string | null;
+            };
+            path: {
+                work_item_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["PersonalContextOut"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    revalidate_personal_context_v1_internal_work_items__work_item_id__personal_context_revalidate_post: {
+        parameters: {
+            query?: never;
+            header?: {
+                "X-Curie-Worker-Token"?: string | null;
+            };
+            path: {
+                work_item_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["RevalidationBody"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RevalidationOut"];
                 };
             };
             /** @description Validation Error */

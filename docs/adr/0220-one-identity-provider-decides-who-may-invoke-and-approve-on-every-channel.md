@@ -4,6 +4,17 @@ Date: 2026-10-13
 
 Status: Accepted
 
+**Partially amended by [ADR 0272](0272-approver-dm-delivery-uses-one-selected-recipient.md)**
+(back link added under [ADR 0045](0045-the-status-line-is-the-mutable-part-of-an-immutable-adr.md)):
+ADR 0272 amends decision 10's card-location clause by adding one selected
+approver's DM.
+
+**Partially amended by [ADR 0271](0271-per-request-approver-sets-and-separation-of-duties.md)**
+(back link added under [ADR 0045](0045-the-status-line-is-the-mutable-part-of-an-immutable-adr.md)):
+ADR 0271 amends decision 10 by defaulting dynamic routes to canonical
+separation, with an audited operator opt-out and narrow current-group
+exemptions.
+
 Partially superseded by [ADR 0246](0246-common-admission-resolves-an-optional-http-identity-before-authorized-enqueue.md):
 the projection-only choice, HTTP link/connect source, expressly migrated raw-grant
 and role-policy clauses, and migrated enqueue cache authority enumerated there.

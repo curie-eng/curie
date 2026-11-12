@@ -6,6 +6,7 @@ Read from the version's stored bundle, like the channel read grant beside it.
 from __future__ import annotations
 
 import asyncio
+import base64
 import io
 import json
 import zipfile
@@ -88,7 +89,7 @@ def test_a_bundle_without_valid_connectors_names_none() -> None:
     assert route_tokens.read_route_connectors(reader, "bad", "acme-dev", _LIMITS) == frozenset()
 
 
-_SEED = "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8="
+_SEED = base64.b64encode(bytes(range(32))).decode()
 
 
 def _kernel(reader: _Bundles | None, *, key: str = _SEED) -> SimpleNamespace:

@@ -55,6 +55,9 @@ from typing import Any, Literal
 
 from aci_protocol.service_config import STREAM_PAYLOAD_FIELD
 from channel_protocol.reply import ReplyUpdate, TurnCompleted
+from curie_channel_gateway.reply_errors import (
+    ProviderEgressRefusedError,
+)
 from curie_internal.channel_read_ledger import LEDGER_TTL_S as _CHANNEL_READ_PIN_TTL_S
 from curie_internal.channel_read_ledger import refresh_owner as _refresh_channel_read_owner
 from curie_internal.channel_read_ledger import revoke_by_owner as _revoke_channel_read_by_owner
@@ -64,7 +67,8 @@ from pydantic import BaseModel, Field
 from redis.asyncio import Redis
 
 from .config import WorkerConfig
-from .reply_sink import ProviderEgressRefusedError, TargetRoute
+from .delivery_lease import DeliveryLease, LeaseLostError
+from .reply_sink import TargetRoute
 
 DoneMarkerValue = Literal["1", "history_capacity"]
 
@@ -418,6 +422,140 @@ class Markers:
         self._config = config
         self._completion_sample_offset = 0
 
+    def _turn_recovery_key(self) -> str:
+        return f"{self._config.key_prefix}:turn-recovery"
+
+    async def watch_turn(
+        self, thread_key: str, claim_name: str, lease: DeliveryLease, event_id: str
+    ) -> None:
+        lease.raise_if_lost()
+        value = json.dumps(
+            {
+                "thread_key": thread_key,
+                "lease_key": self._config.delivery_lease_key(
+                    lease.stream, lease.group, lease.entry_id
+                ),
+                "owner": lease.owner,
+                "event_id": event_id,
+            }
+        )
+        accepted = await self._redis.eval(
+            """
+            if redis.call('GET', KEYS[2]) ~= ARGV[2] then return 0 end
+            redis.call('HSET', KEYS[1], ARGV[1], ARGV[3])
+            redis.call('HDEL', KEYS[3], ARGV[1])
+            return 1
+            """,
+            3,
+            self._turn_recovery_key(),
+            self._config.delivery_lease_key(lease.stream, lease.group, lease.entry_id),
+            self._turn_recovery_key() + ":absent",
+            claim_name,
+            lease.owner,
+            value,
+        )
+        if not accepted:
+            raise LeaseLostError("turn recovery registration lost its delivery lease")
+
+    async def watched_turns(self) -> dict[str, str]:
+        rows = await self._redis.hgetall(self._turn_recovery_key())
+        return {
+            key.decode() if isinstance(key, bytes) else key: value.decode()
+            if isinstance(value, bytes)
+            else value
+            for key, value in rows.items()
+        }
+
+    async def watched_turn(self, claim_name: str) -> str | None:
+        value = await self._redis.hget(self._turn_recovery_key(), claim_name)
+        return value.decode() if isinstance(value, bytes) else value
+
+    async def watched_turn_live(self, claim_name: str, expected: str) -> bool:
+        return bool(
+            await self._redis.eval(
+                """
+                local value = redis.call('HGET', KEYS[1], ARGV[1])
+                if value ~= ARGV[2] then return 0 end
+                local record = cjson.decode(value)
+                return redis.call('GET', record.lease_key) == record.owner and 1 or 0
+                """,
+                1,
+                self._turn_recovery_key(),
+                claim_name,
+                expected,
+            )
+        )
+
+    async def abandoned_turn(self, claim_name: str, expected: str) -> bool:
+        return bool(
+            await self._redis.eval(
+                """
+            local value = redis.call('HGET', KEYS[1], ARGV[1])
+            if value ~= ARGV[2] then return 0 end
+            local record = cjson.decode(value)
+            if redis.call('GET', record.lease_key) == record.owner then
+              redis.call('HDEL', KEYS[2], ARGV[1])
+              return 0
+            end
+            local t = redis.call('TIME')
+            local now = t[1] * 1000 + math.floor(t[2] / 1000)
+            local since = redis.call('HGET', KEYS[2], ARGV[1])
+            if not since then
+              redis.call('HSET', KEYS[2], ARGV[1], now)
+              return 0
+            end
+            return now - tonumber(since) >= tonumber(ARGV[3]) and 1 or 0
+            """,
+                2,
+                self._turn_recovery_key(),
+                self._turn_recovery_key() + ":absent",
+                claim_name,
+                expected,
+                int(self._config.abandoned_turn_grace_s * 1000),
+            )
+        )
+
+    async def forget_watched_turn(self, claim_name: str, expected: str) -> None:
+        await self._redis.eval(
+            """
+            if redis.call('HGET', KEYS[1], ARGV[1]) ~= ARGV[2] then return 0 end
+            redis.call('HDEL', KEYS[1], ARGV[1])
+            redis.call('HDEL', KEYS[2], ARGV[1])
+            return 1
+            """,
+            2,
+            self._turn_recovery_key(),
+            self._turn_recovery_key() + ":absent",
+            claim_name,
+            expected,
+        )
+
+    async def note_terminal_status_failure(
+        self, claim_name: str, expected: str, *, limit: int
+    ) -> None:
+        await self._redis.eval(
+            """
+            local value = redis.call('HGET', KEYS[1], ARGV[1])
+            if value ~= ARGV[2] then return 0 end
+            local record = cjson.decode(value)
+            local failures = (record.status_read_failures or 0) + 1
+            if failures >= tonumber(ARGV[3]) then
+              redis.call('HDEL', KEYS[1], ARGV[1])
+              redis.call('HDEL', KEYS[2], ARGV[1])
+            else
+              record.status_read_failures = failures
+              redis.call('HSET', KEYS[1], ARGV[1], cjson.encode(record))
+            end
+            return failures
+            """,
+            2,
+            self._turn_recovery_key(),
+            self._turn_recovery_key() + ":absent",
+            claim_name,
+            expected,
+            limit,
+        )
+
     def _completion_storage_key(self, event_id: str, *, answer: CompletionNamespace = False) -> str:
         key = self._config.completion_key(event_id)
         if answer == "verbatim":
@@ -721,6 +859,17 @@ class Markers:
             str(generation),
         )
         return int(settled) == 1
+
+    async def mark_steering_sent(self, event_id: str) -> None:
+        """Record that a steering request may reach the API (#5414).
+
+        One SET, kept as long as the done marker, so every redelivery the
+        dedupe window still admits sees it.
+        """
+        await self._redis.set(self._config.steering_sent_key(event_id), "1", ex=self._done_ttl_s())
+
+    async def saw_steering_sent(self, event_id: str) -> bool:
+        return bool(await self._redis.exists(self._config.steering_sent_key(event_id)))
 
     async def saw_side_effect(self, event_id: str) -> bool:
         return bool(await self._redis.exists(self._config.side_effect_key(event_id)))

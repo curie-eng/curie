@@ -13,26 +13,26 @@ as a whole; remembered only):
   together in `tests/vectors/model-credential-forwarding.json`.
   [vector: `tests/vectors/model-credential-forwarding.json`]
 2. dispatcher vs CLI approval action ids -- the approval-card action-id constants
-  (`apps/dispatcher/src/curie_dispatcher/approval_actions.py`) and the CLI's
+  (`packages/channel-gateway/src/curie_channel_gateway/slack/approval_actions.py`) and the CLI's
   `APPROVE_ACTION_ID_PREFIX` (`cli/src/chat.rs`) can't share code across
   Python/Rust, so they are frozen together in
   `tests/vectors/approval-action-ids.json`.
   [vector: `tests/vectors/approval-action-ids.json`]
 3. worker vs CLI progress block ids -- the Slack progress card and milestone
   `block_id` prefixes (`PROGRESS_CARD_BLOCK_ID_PREFIX` and
-  `PROGRESS_MILESTONE_BLOCK_ID_PREFIX` in `apps/worker/src/curie_worker/blocks.py`)
+  `PROGRESS_MILESTONE_BLOCK_ID_PREFIX` in `packages/channel-gateway/src/curie_channel_gateway/slack/blocks.py`)
   and the CLI stub's copies (`cli/src/chat.rs`), which tell a progress post or
   edit from the turn's answer, can't share code across Python/Rust, so they are
   frozen together in `tests/vectors/progress-blocks.json`.
   [vector: `tests/vectors/progress-blocks.json`]
 4. dispatcher vs API approval-principal tokens -- the dispatcher mint codec
-  (`apps/dispatcher/src/curie_dispatcher/approval_principal.py`) and API verifier
+  (`packages/channel-gateway/src/curie_channel_gateway/slack/approval_principal.py`) and API verifier
   (`apps/api/src/curie_api/approval_principal.py`) are frozen together in
   `tests/vectors/approval-principal.json`.
   [vector: `tests/vectors/approval-principal.json`]
 5. dispatcher vs API approval-row miss -- the API 404 detail
   (`apps/api/src/curie_api/routers/approvals.py`) and the dispatcher's
-  ownership-miss match (`apps/dispatcher/src/curie_dispatcher/approval_actions.py`)
+  ownership-miss match (`packages/channel-gateway/src/curie_channel_gateway/slack/approval_actions.py`)
   cannot share code, so they are frozen together in
   `tests/vectors/approval-ownership.json`.
   [vector: `tests/vectors/approval-ownership.json`]
@@ -94,12 +94,26 @@ as a whole; remembered only):
   (`apps/worker/src/curie_worker/caller_token.py`) and `decide`
   (`apps/worker/src/curie_connector_proxy/caller.py`) run in different pods,
   and the proxy may not import the worker, so both read one frozen corpus; the
-  CLI derives its generated public keys against the same seeds.
+  CLI derives its generated public keys against the same seeds. The corpus also
+  pins the optional requester `principal` (ADR 0270): principal-bearing tokens
+  the minter reproduces and the verifier admits, malformed and tampered
+  principals the verifier refuses as invalid, and forged `X-Curie-Principal`
+  headers the proxy strips on `cct` and `ccr` paths. Its `principal_headers`
+  and `malformed_principal_headers` sections freeze the one header spelling the
+  proxy sets (`principal_header_value`) and the values a reader refuses, read by
+  both header readers: the proxy package's `read_principal_header`
+  (`apps/worker/src/curie_connector_proxy/caller.py`) and the reference
+  connector's reader (`tools/identity-e2e/human_restricted_connector.py`).
   [vector: `tests/vectors/connector-caller-token.json`]
+  The upload-only minter and verifier use the distinct `ccu` scope and share
+  [vector: `tests/vectors/connector-upload-token.json`].
 21. connector proxy refusal vs runner diagnosis -- the proxy's refusal body
   (`apps/worker/src/curie_connector_proxy/server.py`) and the runner's
   `caller_refused` reason (`runner/src/curie_runner/mcp_tool_capability.py`)
-  ship in different images, so they are frozen together.
+  ship in different images, so they are frozen together. Its
+  `principal_refusals` show a principal-bearing token refused as `invalid`,
+  `not_admitted` or `expired` gets the same body as any other token, so the
+  runner names it the same way.
   [vector: `tests/vectors/connector-caller-refusal.json`]
 22. worker vs runner vs API deliberate progress capability (ADR-0130) -- the
   runner control headers and `turn.progress` token scope the worker mints
@@ -184,6 +198,28 @@ as a whole; remembered only):
   (`charts/curie/ci/attachment-init-behavior-assertions.sh` and
   `apps/worker/tests/sandbox/test_docker_attachment_claim.py`).
   [vector: `tests/vectors/attachment-init-outcomes.json`]
+29. UI evidence refusals: runner vs worker vs API -- the runner
+  (`runner/src/curie_runner/ui_evidence.py`) validates the gitignored
+  `.curie/ui-evidence/` manifest and PNGs and applies the before and after
+  binding rule, the worker (`apps/worker/src/curie_worker/ui_evidence.py`)
+  re-derives that binding and adds transfer and timeout refusals, and the API
+  (`apps/api/src/curie_api/crud/ui_evidence.py`,
+  `apps/api/src/curie_api/ui_evidence_reconciler.py`) applies the binding a
+  third time against the publication base and adds the stored, head and size
+  refusals. The refusal codes, their comment sentences and the limits (10 MiB
+  per image, 1 MiB manifest, 100 MiB per publication) are one corpus driven at
+  each boundary.
+  [vector: `tests/vectors/ui-evidence-cases.json`]
+
+30. Connector selector signer vs API approval preparation verifier (ADR 0271):
+  `packages/curie-internal/src/curie_internal/approver_ticket.py` and
+  `apps/api/src/curie_api/approver_tickets.py` consume the same signed payloads,
+  strict refusal codes, identity-owner character bounds, recipient namespace
+  objects, untrusted key selection and execution size cases. The API uses its production
+  argument canonicalizer; the signer checks the shared canonical argument corpus.
+  No approval creation or proxy wiring is implied by this pure contract.
+  [vector: `tests/vectors/approver-ticket.json`]
+  [vector: `tests/vectors/action-canonical-arguments.json`]
 
 A PR touching one side of a seam must route the behavior through a shared helper
 both sides call, change both sides in the same PR, or name the sibling in the PR

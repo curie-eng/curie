@@ -135,10 +135,12 @@ fn approval_route_split_is_a_v2_schema_contract() {
     )
     .expect("approvals schema is JSON");
     assert_eq!(
-        schema["$id"], "https://schemas.curietech.ai/cli/approvals/v2.4.json",
+        schema["$id"], "https://schemas.curietech.ai/cli/approvals/v2.6.json",
         "removing the fused channel field and requiring resolution is a major schema break; \
          v2.3 adds the read-time route approver view to pending results (#2940); v2.4 adds \
-         the remediation_principal mint result (#4228)"
+         the remediation_principal mint result (#4228); v2.5 adds the connector requester \
+         identity readback (ADR 0270); v2.6 adds the route approver_ticket and separation \
+         readback (ADR 0271)"
     );
 
     let binding = &schema["$defs"]["approvalRouteBinding"];
@@ -165,7 +167,7 @@ fn approval_route_split_is_a_v2_schema_contract() {
         .iter()
         .find(|entry| entry["result"] == "ApprovalsOutput")
         .expect("ApprovalsOutput inventory entry");
-    assert_eq!(approvals["version"], "2.4");
+    assert_eq!(approvals["version"], "2.6");
 }
 
 #[test]
@@ -513,7 +515,7 @@ fn a_schema_may_not_change_shape_while_keeping_its_id() {
 }
 
 #[test]
-fn schedules_history_split_is_v3_and_hook_source_is_v1_2() {
+fn schedules_history_split_is_v3_and_hook_fire_is_v1_3() {
     let schedules: Value = serde_json::from_str(
         &std::fs::read_to_string(repo_path("cli/schema/schedules.schema.json"))
             .expect("read schedules schema"),
@@ -544,7 +546,7 @@ fn schedules_history_split_is_v3_and_hook_source_is_v1_2() {
     .expect("hook-fire schema is JSON");
     assert_eq!(
         fire["$id"],
-        "https://schemas.curietech.ai/cli/hook-fire/v1.2.json"
+        "https://schemas.curietech.ai/cli/hook-fire/v1.3.json"
     );
     assert!(fire["$defs"]["record"]["properties"]
         .get("source")
@@ -560,7 +562,7 @@ fn schedules_history_split_is_v3_and_hook_source_is_v1_2() {
         .expect("schema result inventory");
     for (schema, version) in [
         ("schedules.schema.json", "3.0"),
-        ("hook-fire.schema.json", "1.2"),
+        ("hook-fire.schema.json", "1.3"),
     ] {
         let entry = results
             .iter()

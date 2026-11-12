@@ -21,7 +21,7 @@ from _support import (
     completed,
     post_event,
 )
-from curie_mail_adapter.adapter import MailAdapter
+from curie_channel_gateway.mail.adapter import MailAdapter
 
 LEAKED_LABELS = ["unauthenticated", "spam", "blocked"]
 
@@ -30,7 +30,8 @@ def _adapter_warnings(caplog: pytest.LogCaptureFixture) -> list[str]:
     return [
         record.getMessage()
         for record in caplog.records
-        if record.levelno >= logging.WARNING and record.name.startswith("curie_mail_adapter")
+        if record.levelno >= logging.WARNING
+        and record.name.startswith("curie_channel_gateway.mail")
     ]
 
 

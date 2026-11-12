@@ -71,24 +71,31 @@ def test_the_refusal_vector_names_the_header_the_runner_sends() -> None:
         "content_type",
         "unpaired",
         "vectors",
+        "principal_refusals",
     }
     assert set(_REFUSAL["unpaired"]) == {"why", "token", "refusal"}
     assert _REFUSAL["header"] == CALLER_HEADER
+    for entry in _REFUSAL["principal_refusals"]:
+        assert set(entry) == {"name", "why", "token", "refusal"}, entry.get("name")
+
+
+def _probe_refused(
+    body: dict[str, Any], token: str = "cct.payload.signature"
+) -> tuple[ConnectorCapabilityFailure, ...]:
+    async def go() -> tuple[ConnectorCapabilityFailure, ...]:
+        async with _answering(
+            _REFUSAL["status"], json.dumps(body).encode(), _REFUSAL["content_type"]
+        ) as (url, _seen):
+            probe = await probe_mcp_tool_capability(None, _derived(url), {_TOKEN_ENV: token})
+        return probe.connector_failures
+
+    return asyncio.run(go())
 
 
 # @spec ADR-0168 d7
 @pytest.mark.parametrize("vector", _REFUSAL["vectors"], ids=lambda v: v["refusal"])
 def test_a_refused_caller_is_reported_as_its_own_reason(vector: dict[str, Any]) -> None:
-    async def go() -> tuple[ConnectorCapabilityFailure, ...]:
-        async with _answering(
-            _REFUSAL["status"], json.dumps(vector["body"]).encode(), _REFUSAL["content_type"]
-        ) as (url, _seen):
-            probe = await probe_mcp_tool_capability(
-                None, _derived(url), {_TOKEN_ENV: "cct.payload.signature"}
-            )
-        return probe.connector_failures
-
-    [failure] = asyncio.run(go())
+    [failure] = _probe_refused(vector["body"])
     assert (failure.connector, failure.reason, failure.refusal) == (
         "grafana",
         "caller_refused",
@@ -100,6 +107,36 @@ def test_a_refused_caller_is_reported_as_its_own_reason(vector: dict[str, Any]) 
     assert "sandbox" not in message
     assert "refused this sandbox" in failure.diagnostic_message()
     assert "cct.payload.signature" not in message
+
+
+# @spec CONNECTOR-REQUESTER-2
+def test_every_principal_refusal_names_a_frozen_refusal() -> None:
+    frozen = {vector["refusal"] for vector in _REFUSAL["vectors"]}
+    refusals = [entry["refusal"] for entry in _REFUSAL["principal_refusals"]]
+    assert refusals
+    assert set(refusals) <= frozen
+    assert {"invalid", "not_admitted"} <= set(refusals)
+
+
+# @spec CONNECTOR-REQUESTER-2
+@pytest.mark.parametrize("entry", _REFUSAL["principal_refusals"], ids=lambda e: e["name"])
+def test_a_principal_refusal_is_reported_as_its_own_reason(entry: dict[str, Any]) -> None:
+    # The proxy answers a principal-bearing token's refusal with the same body
+    # as any other, so the runner names it the same way and never echoes the
+    # token that carried the requester.
+    body = next(v["body"] for v in _REFUSAL["vectors"] if v["refusal"] == entry["refusal"])
+    token = str(entry["token"])
+    [failure] = _probe_refused(body, token)
+    assert (failure.connector, failure.reason, failure.refusal) == (
+        "grafana",
+        "caller_refused",
+        entry["refusal"],
+    )
+    message = failure.caller_message()
+    assert message.startswith("Connected service access was refused.")
+    for segment in token.split(".")[1:]:
+        assert segment not in message
+        assert segment not in failure.diagnostic_message()
 
 
 # @spec ADR-0168 d7

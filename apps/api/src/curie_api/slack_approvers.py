@@ -34,11 +34,14 @@ from typing import Any
 
 import httpx
 from aci_protocol.turn import DEFAULT_IDENTITY, slack_speaking_identity
+from curie_channel_gateway.group_models import UserGroupLookupError, UserGroupMembership
+from curie_channel_gateway.ports.groups import GroupMembershipSource
 from pydantic import ValidationError
 
 from curie_api.schemas.approvals import ApprovalApprovers
 from curie_api.schemas.channels import EMAIL_KIND
 
+from .approver_dm import DmCard
 from .approvers import (
     ApproverSet,
     EmailApprovers,
@@ -46,16 +49,15 @@ from .approvers import (
     InvalidApprovers,
     MembershipVerdict,
     NoVerifiableApprovers,
+    SelectedApprovers,
     UnboundRoute,
     shown_off_slack,
 )
 from .config import Settings
-from .identities import slack_bot_tokens
+from .identities import gateway_client
 from .models import Approval
-from .slack_usergroups import SlackUserGroupClient
-from .usergroups import GroupMembershipSource, UserGroupLookupError, UserGroupMembership
 
-_NO_API_TOKEN = "no Slack bot token is configured for the API"
+_NO_GATEWAY = "no channel gateway is configured for the API"
 
 
 class SlackChannelMembers:
@@ -105,7 +107,7 @@ class SlackUserGroupMembers:
 
     Owns its lookup: it holds the ``GroupMembershipSource`` port and fetches
     inside ``contains``, rather than being handed a member set the caller already
-    resolved. ``source`` is None when no bot token is configured, which is a
+    resolved. ``source`` is None when no gateway is configured, which is a
     normal Slack-free deployment and not an error -- it simply cannot determine
     membership, so a route bound to a group fails closed.
 
@@ -129,9 +131,9 @@ class SlackUserGroupMembers:
     def __init__(
         self,
         group_id: str,
-        source: GroupMembershipSource | None,
+        source: GroupMembershipSource[UserGroupMembership] | None,
         *,
-        missing_source_reason: str = _NO_API_TOKEN,
+        missing_source_reason: str = _NO_GATEWAY,
     ) -> None:
         self._group_id = group_id
         self._source = source
@@ -177,7 +179,7 @@ class SlackUserGroupMembers:
         returned set is undetermined. @spec HTTP-APPROVAL-CONTINUITY-8.
         """
 
-        fetch = getattr(self._source, "fresh_members", None)
+        fetch = self._source.fresh_members if self._source is not None else None
         return SlackUserGroupMembers(
             self._group_id,
             None if fetch is None else _FreshMembers(fetch),
@@ -220,14 +222,24 @@ class _FreshMembers:
         membership: UserGroupMembership = await self._fetch(group_id)
         return membership
 
+    async def fresh_members(self, group_id: str) -> UserGroupMembership:
+        return await self.members(group_id)
 
-def approval_token_identity(approval: Approval) -> str:
+
+def approval_token_identity(approval: Approval, dm: DmCard | None = None) -> str:
     """The Slack identity whose token resolves this approval's groups (ADR-0168 decision 5).
 
     The rule is ``aci_protocol.turn.slack_speaking_identity``, shared with the
     worker so the two cannot disagree about a route.
+
+    An approval with a registered approver-DM card (``dm``, loaded once by the
+    caller from ``approver_dm.card``) speaks through the identity recorded at
+    registration instead: its card, its answers and its group lookups all
+    belong to that bot, never the invocation's reply identity. @spec APPROVER-DM-3.
     """
 
+    if dm is not None:
+        return dm.identity
     kind = approval.reply_kind or ""
     return slack_speaking_identity(kind, approval.reply_adapter, approval.reply_endpoint)
 
@@ -236,7 +248,7 @@ class SlackApproverSetSelector:
     """Reads a route binding and picks the set it calls for (``ApproverSetSelector``).
 
     Holds the ``GroupMembershipSource`` so it can hand it to a user-group set;
-    None when no bot token is configured, which is a normal Slack-free deployment
+    None when no gateway is configured, which is a normal Slack-free deployment
     (a route bound to a group then fails closed at resolve time).
     ``identity_clients`` holds each named Slack identity's own source
     (ADR-0168 decision 5); ``group_client`` is ``default``'s.
@@ -250,20 +262,29 @@ class SlackApproverSetSelector:
     a route in ``requesting_surface`` mode) takes a provider-neutral set, since
     no Slack set can be proven there (ADR-0177): the route's approver
     ``emails`` on an email card, and nobody otherwise (ADR-0177 amendment).
+
+    A dynamic approval (ADR 0271) whose bound route declares no ``approvers``
+    takes ``SelectedApprovers`` ahead of that: its stored selected set is the
+    narrowing, judged by the HTTP answer composition.
     """
 
     def __init__(
         self,
-        group_client: GroupMembershipSource | None,
+        group_client: GroupMembershipSource[UserGroupMembership] | None,
         *,
-        identity_clients: Mapping[str, GroupMembershipSource] | None = None,
+        identity_clients: Mapping[str, GroupMembershipSource[UserGroupMembership]] | None = None,
     ) -> None:
         self._group_client = group_client
         self._identity_clients = dict(identity_clients or {})
 
-    def __call__(self, approval: Approval, binding: Any) -> ApproverSet:
+    def __call__(
+        self, approval: Approval, binding: Any, dm: DmCard | None = None,
+    ) -> ApproverSet:
         """Precedence, exactly as issue #420 states it: ``users`` wins over
         ``group``, which wins over channel membership. No I/O happens here.
+
+        ``dm`` is the approval's registered approver-DM card: a group is then
+        read through the DM identity's client (@spec APPROVER-DM-3).
 
         Channel membership is not the universal fallback it once was: an
         approval that named a route whose binding is absent is refused outright
@@ -280,6 +301,13 @@ class SlackApproverSetSelector:
             # approver set to everyone in the card's channel -- the opposite of
             # what the binding was trying to say.
             return InvalidApprovers(spec_error)
+        if approval.selection_mode == "dynamic" and approvers is None and binding is not None:
+            # ADR 0271 decision 5: a dynamic row's stored selection is the
+            # explicit narrowing even with no legacy ``approvers`` block, on any
+            # card surface, so it never widens to channel membership. A missing
+            # binding still falls through to ``UnboundRoute`` below, and a
+            # declared block stays an additional constraint.
+            return SelectedApprovers()
         if shown_off_slack(approval, binding):
             # ADR-0177: the card is in a non-Slack conversation, so none of
             # Slack's sets below can be proven there. ADR-0177 amendment: an email card is
@@ -329,33 +357,56 @@ class SlackApproverSetSelector:
             # real refusal: an assert is stripped under `python -O`, and the
             # line below would then bind a set to a group named None.
             return InvalidApprovers("approvers block declares neither users nor group")
-        identity = approval_token_identity(approval)
+        identity = approval_token_identity(approval, dm)
         if identity == DEFAULT_IDENTITY:
             return SlackUserGroupMembers(group, self._group_client)
         return SlackUserGroupMembers(
             group,
             self._identity_clients.get(identity),
-            missing_source_reason=f"{_NO_API_TOKEN} for identity {identity!r}",
+            missing_source_reason=f"{_NO_GATEWAY} for identity {identity!r}",
         )
+
+
+class _GroupMembershipPolicy:
+    """The API decides how old provider membership may be for authorization."""
+
+    def __init__(
+        self, source: GroupMembershipSource[UserGroupMembership], max_age_s: float
+    ) -> None:
+        self._source = source
+        self._max_age_s = max_age_s
+
+    async def members(self, group_id: str) -> UserGroupMembership:
+        if self._max_age_s <= 0:
+            return await self._source.fresh_members(group_id)
+        membership = await self._source.members(group_id)
+        if membership.cache_age_s >= self._max_age_s:
+            return await self._source.fresh_members(group_id)
+        return membership
+
+    async def fresh_members(self, group_id: str) -> UserGroupMembership:
+        return await self._source.fresh_members(group_id)
 
 
 def build_approver_set_selector(
     http: httpx.AsyncClient,
     settings: Settings,
-    *,
-    environ: Mapping[str, str] | None = None,
 ) -> SlackApproverSetSelector:
     """The API's selector, with one user-group client per Slack identity.
 
-    Each client keeps its own member cache, so one bot's answer never stands
-    in for another's. A stock install builds the one client, or none, that it
-    always built.
+    Each gateway source retains its identity's provider cache. The API selects
+    an uncached port call whenever authorization requires fresh membership.
     """
 
-    clients = {
-        name: SlackUserGroupClient(http, token=token, ttl_s=settings.slack_usergroup_cache_ttl_s)
-        for name, token in slack_bot_tokens(settings, environ=environ).items()
-    }
+    client = gateway_client(settings, http)
+    clients = (
+        {
+            name: _GroupMembershipPolicy(client.groups(name), settings.slack_usergroup_cache_ttl_s)
+            for name in client.identities
+        }
+        if client
+        else {}
+    )
     return SlackApproverSetSelector(
         clients.pop(DEFAULT_IDENTITY, None), identity_clients=clients
     )

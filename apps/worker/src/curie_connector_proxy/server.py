@@ -13,6 +13,10 @@ forwarded like any other; an admitted caller reaches whatever the server
 serves, and a refused one reaches nothing. A declared route admits only a
 ``ccr`` route token for this connector, streams its body under the route's own
 limit, and is the only place such a token is admitted.
+
+ADR 0271 decision 7: when an admitted ``tools/call`` spends a grant, the proxy
+tells the connector so with one ``X-Curie-Grant-Verified`` header carrying the
+grant's ``jti``. Inbound copies of that header are dropped on every path.
 """
 
 from __future__ import annotations
@@ -23,6 +27,7 @@ import logging
 import posixpath
 import re
 import time
+import uuid
 from collections.abc import AsyncIterator, Callable, Mapping
 from dataclasses import dataclass
 from fnmatch import fnmatchcase
@@ -83,6 +88,13 @@ _NOT_FORWARDED = frozenset(
         caller.AGENT_HEADER.lower(),
         caller.RUN_HEADER.lower(),
         caller.WORK_ITEM_HEADER.lower(),
+        # Inbound copies are forged, on cct and ccr paths alike, and all are
+        # dropped. ADR 0270 decision 4: the proxy sets one from the verified
+        # claim of an admitted cct, never on a route.
+        caller.PRINCIPAL_HEADER.lower(),
+        # ADR 0271 decision 7: likewise forged on every path. The proxy sets
+        # one only for the grant this very request spent.
+        caller.GRANT_VERIFIED_HEADER.lower(),
     }
 )
 
@@ -92,7 +104,8 @@ logger = logging.getLogger("curie_connector_proxy")
 # aiohttp's parse-error log quotes the bytes it refused, which can be a token
 # cut anywhere.
 _TOKEN_TEXT = re.compile(
-    rf"(?:{caller.PREFIX}|{caller.GRANT_PREFIX}|{caller.ROUTE_PREFIX})\.[A-Za-z0-9_.-]*"
+    rf"(?:{caller.PREFIX}|{caller.GRANT_PREFIX}|{caller.ROUTE_PREFIX}|{caller.UPLOAD_PREFIX})"
+    r"\.[A-Za-z0-9_.-]*"
     r"|[A-Za-z0-9_-]{32,}"
 )
 _REDACTED = "<redacted>"
@@ -149,8 +162,8 @@ def _resp(*parts: str) -> bytes:
     return head + body
 
 
-def _set_nx_ex(url: str, key: str, ttl: int) -> bool:
-    """SET key 1 NX EX ttl over the Redis wire. True only when this call stored it.
+def _set_nx_ex(url: str, key: str, ttl: int, *, ca_file: str | None = None) -> bytes:
+    """The SET NX EX reply, preserving ACL refusal for the portable startup check.
 
     The proxy package cannot import the redis client. A missing store, a TLS
     failure, or any reply other than ``+OK`` is a failed spend.
@@ -163,15 +176,16 @@ def _set_nx_ex(url: str, key: str, ttl: int) -> bool:
     parsed = urlparse(url)
     host = parsed.hostname or ""
     if not host or parsed.scheme not in {"redis", "rediss"}:
-        return False
+        return b""
     port = parsed.port or 6379
     password = unquote(parsed.password) if parsed.password else ""
+    username = unquote(parsed.username) if parsed.username else ""
     database = (parsed.path or "/0").lstrip("/") or "0"
     raw = socket.create_connection((host, port), timeout=2)
+    conn: socket.socket = raw
     try:
-        conn: socket.socket = raw
         if parsed.scheme == "rediss":
-            context = ssl.create_default_context()
+            context = ssl.create_default_context(cafile=ca_file)
             context.minimum_version = ssl.TLSVersion.TLSv1_2
             conn = context.wrap_socket(raw, server_hostname=host)
 
@@ -188,27 +202,54 @@ def _set_nx_ex(url: str, key: str, ttl: int) -> bool:
             conn.sendall(_resp(*parts))
             return reply()
 
-        if password and command("AUTH", password) != b"+OK":
-            return False
-        if database != "0" and command("SELECT", database) != b"+OK":
-            return False
-        return command("SET", key, "1", "NX", "EX", str(ttl)) == b"+OK"
+        auth = (username, password) if username else (password,)
+        if password:
+            authenticated = command("AUTH", *auth)
+            if authenticated != b"+OK":
+                return authenticated
+        if database != "0":
+            selected = command("SELECT", database)
+            if selected != b"+OK":
+                return selected
+        return command("SET", key, "1", "NX", "EX", str(ttl))
     finally:
+        conn.close()
         raw.close()
 
 
 class _ValkeyGrantStore:
     """SET ``connector-grant:<jti>`` NX EX without importing the redis client."""
 
-    def __init__(self, url: str) -> None:
+    def __init__(
+        self, url: str, *, ca_file: str | None = None, key_prefix: str = "connector-grant:"
+    ) -> None:
         self._url = url
+        self._ca_file = ca_file
+        self._key_prefix = key_prefix
 
     def spend(self, jti: str, ttl: int) -> bool:
         try:
-            return _set_nx_ex(self._url, f"connector-grant:{jti}", max(ttl, 1))
+            return (
+                _set_nx_ex(
+                    self._url, f"{self._key_prefix}{jti}", max(ttl, 1), ca_file=self._ca_file
+                )
+                == b"+OK"
+            )
         except Exception:  # noqa: BLE001 - existing broad catch retained
             logger.warning("connector grant spend failed")
             return False
+
+    def require_scoped_acl(self) -> None:
+        probe = uuid.uuid4().hex
+        accepted = _set_nx_ex(
+            self._url, f"{self._key_prefix}scope-probe-{probe}", 1, ca_file=self._ca_file
+        )
+        denied = _set_nx_ex(
+            self._url, f"connector-grant:scope-probe:{probe}", 1, ca_file=self._ca_file
+        )
+        if accepted != b"+OK" or not denied.startswith(b"-NOPERM "):
+            logger.error("grant store scope check failed")
+            raise ValueError("grant store scope must permit own keys and refuse outside keys")
 
 
 def _gated_tools(env: Mapping[str, str]) -> tuple[str, ...]:
@@ -279,6 +320,8 @@ class ProxyConfig:
     upstream_host: str | None = None
     # ADR 0240: the routes a ``ccr`` token is admitted on.
     routes: tuple[RouteConfig, ...] = ()
+    upload_only: bool = False
+    upload_path: str | None = None
 
     @classmethod
     def from_env(cls, env: Mapping[str, str]) -> ProxyConfig:
@@ -397,8 +440,16 @@ def _tool_call(parsed: object) -> _ToolCall | None:
     return _ToolCall(name=name, arguments={})
 
 
-def _tool_calls(body: bytes) -> tuple[_ToolCall, ...]:
-    """Tool calls in one JSON object or a top-level JSON array.
+@dataclass(frozen=True)
+class _ToolCalls:
+    """The tool calls one body carries, and whether it was a JSON-RPC batch."""
+
+    calls: tuple[_ToolCall, ...]
+    batch: bool
+
+
+def _tool_calls(body: bytes) -> _ToolCalls:
+    """Tool calls in one JSON object or a top-level JSON array (a batch).
 
     Invalid JSON, and a value that is neither an object nor an array, yields
     no calls, so the body stays on the forward path. Each array element uses
@@ -408,18 +459,14 @@ def _tool_calls(body: bytes) -> tuple[_ToolCall, ...]:
     try:
         parsed = json.loads(body)
     except ValueError:
-        return ()
+        return _ToolCalls(calls=(), batch=False)
     if isinstance(parsed, dict):
         call = _tool_call(parsed)
-        return (call,) if call is not None else ()
+        return _ToolCalls(calls=(call,) if call is not None else (), batch=False)
     if not isinstance(parsed, list):
-        return ()
-    found: list[_ToolCall] = []
-    for item in parsed:
-        call = _tool_call(item)
-        if call is not None:
-            found.append(call)
-    return tuple(found)
+        return _ToolCalls(calls=(), batch=False)
+    found = (_tool_call(item) for item in parsed)
+    return _ToolCalls(calls=tuple(call for call in found if call is not None), batch=True)
 
 
 def _is_gated(config: ProxyConfig, name: str) -> bool:
@@ -444,6 +491,7 @@ def _canonical_arguments(arguments: object) -> str | None:
 # still receives the one ``grant_required`` body: a sub-reason names a check,
 # never a claim value, so it carries no grant, token or argument text.
 GRANT_MULTIPLE_CALLS = "multiple_gated_calls"
+GRANT_BATCHED_CALL = "batched_call"
 GRANT_HEADER_MISSING = "header_missing"
 GRANT_HEADER_REPEATED = "header_repeated"
 GRANT_INVALID = "grant_invalid"
@@ -475,39 +523,122 @@ def _grant_spent(config: ProxyConfig, grant: caller.Grant, now: int) -> str | No
     return None if spent else GRANT_NOT_SPENT
 
 
-def _grant_refused(request: web.Request, agent: str, body: bytes, now: int) -> str | None:
-    """Why a gated tools/call in this admitted POST lacks one live grant, or None.
+@dataclass(frozen=True)
+class _GrantCheck:
+    """What the grant checks decided for one admitted POST (ADR 0271 decision 7).
 
-    Two or more gated calls are refused before a grant is spent.
+    ``refusal`` is the sub-reason of the check that failed. ``attested`` is the
+    ``jti`` of the grant this request spent. At most one is set; with neither,
+    the request forwards unattested.
     """
 
-    config = request.app[_CONFIG]
-    gated = [call for call in _tool_calls(body) if _is_gated(config, call.name)]
-    if not gated:
-        return None
-    if len(gated) > 1:
-        return GRANT_MULTIPLE_CALLS
-    call = gated[0]
-    presented = request.headers.getall(GRANT_HEADER, [])
-    if not presented:
-        return GRANT_HEADER_MISSING
-    if len(presented) != 1:
-        return GRANT_HEADER_REPEATED
-    grant = caller.verify(config.public_keys, presented[0])
-    if grant is None:
+    refusal: str | None = None
+    attested: str | None = None
+
+
+def _unusable(grant: caller.Grant, agent: str, now: int) -> str | None:
+    """Why a verified grant cannot be spent by ``agent`` at ``now``, or None.
+
+    ADR 0271 decision 7: the attested ``jti`` is a canonical lowercase UUID,
+    the one spelling the worker mints, so any other spelling is invalid.
+    """
+
+    if not caller.is_canonical_uuid(grant.jti):
         return GRANT_INVALID
     if grant.exp <= now:
         return GRANT_EXPIRED
     if grant.agent != agent:
         return GRANT_AGENT_MISMATCH
-    if grant.connector != config.connector:
-        return GRANT_CONNECTOR_MISMATCH
-    if grant.tool != call.name:
-        return GRANT_TOOL_MISMATCH
-    canonical = _canonical_arguments(call.arguments)
-    if canonical is None or grant.args != canonical:
-        return GRANT_ARGUMENTS_MISMATCH
-    return _grant_spent(config, grant, now)
+    return None
+
+
+def _matching_grant(
+    config: ProxyConfig, calls: tuple[_ToolCall, ...], presented: list[str]
+) -> caller.Grant | None:
+    """The first presented grant that verifies and names one of ``calls``, or None.
+
+    A grant names a call when its connector is this connector, its tool is the
+    call's tool and its arguments are the call's canonical arguments. The
+    connector is part of the match because the runner sends its static grant
+    header to every hosted connector, so another connector's same-named tool
+    is unrelated.
+    """
+
+    if not calls:
+        return None
+    named = {(call.name, _canonical_arguments(call.arguments)) for call in calls}
+    for text in presented:
+        grant = caller.verify(config.public_keys, text)
+        if (
+            grant is not None
+            and grant.connector == config.connector
+            and (grant.tool, grant.args) in named
+        ):
+            return grant
+    return None
+
+
+def _grant_refused(request: web.Request, agent: str, body: bytes, now: int) -> _GrantCheck:
+    """Refuse, attest or forward the tools/call in this admitted POST (ADR 0271 decision 7).
+
+    A gated call needs exactly one live grant for it, spent here. Two gated
+    calls, or a gated call inside a batch, are refused before any spend; then
+    the one presented grant must verify, carry a canonical UUID ``jti``, be
+    unexpired, and name this agent, connector, tool and canonical arguments.
+
+    An ungated call is considered only when a presented grant verifies and
+    names it (``_matching_grant``). That grant then needs a single call that is
+    not a batch, no second grant header, the same ``jti``, expiry and agent
+    checks, and a spend; a failure refuses. Any other grant is the runner's
+    static header riding along on an unrelated call: the call forwards
+    unattested and nothing is spent.
+
+    Every spend goes through ``_grant_spent``, which also refuses a replay. A
+    spend happens before forwarding and is never undone.
+    """
+
+    config = request.app[_CONFIG]
+    found = _tool_calls(body)
+    presented = request.headers.getall(GRANT_HEADER, [])
+    gated = [call for call in found.calls if _is_gated(config, call.name)]
+    if gated:
+        if len(gated) > 1:
+            return _GrantCheck(refusal=GRANT_MULTIPLE_CALLS)
+        if found.batch:
+            return _GrantCheck(refusal=GRANT_BATCHED_CALL)
+        if not presented:
+            return _GrantCheck(refusal=GRANT_HEADER_MISSING)
+        if len(presented) != 1:
+            return _GrantCheck(refusal=GRANT_HEADER_REPEATED)
+        grant = caller.verify(config.public_keys, presented[0])
+        if grant is None:
+            return _GrantCheck(refusal=GRANT_INVALID)
+        refusal = _unusable(grant, agent, now)
+        if refusal is not None:
+            return _GrantCheck(refusal=refusal)
+        call = gated[0]
+        if grant.connector != config.connector:
+            return _GrantCheck(refusal=GRANT_CONNECTOR_MISMATCH)
+        if grant.tool != call.name:
+            return _GrantCheck(refusal=GRANT_TOOL_MISMATCH)
+        canonical = _canonical_arguments(call.arguments)
+        if canonical is None or grant.args != canonical:
+            return _GrantCheck(refusal=GRANT_ARGUMENTS_MISMATCH)
+    else:
+        grant = _matching_grant(config, found.calls, presented)
+        if grant is None:
+            return _GrantCheck()
+        if found.batch:
+            return _GrantCheck(refusal=GRANT_BATCHED_CALL)
+        if len(presented) != 1:
+            return _GrantCheck(refusal=GRANT_HEADER_REPEATED)
+        refusal = _unusable(grant, agent, now)
+        if refusal is not None:
+            return _GrantCheck(refusal=refusal)
+    refusal = _grant_spent(config, grant, now)
+    if refusal is not None:
+        return _GrantCheck(refusal=refusal)
+    return _GrantCheck(attested=grant.jti)
 
 
 def _decide(request: web.Request) -> caller.Decision:
@@ -586,7 +717,8 @@ def _decide_route(request: web.Request) -> caller.Decision:
     tokens = request.headers.getall(caller.HEADER, [])
     if len(tokens) > 1:
         return caller.Decision(agent=None, refusal=caller.INVALID)
-    return caller.decide_route(
+    decide = caller.decide_upload if config.upload_only else caller.decide_route
+    return decide(
         config.public_keys,
         tokens[0] if tokens else None,
         connector=config.connector,
@@ -608,6 +740,31 @@ def _too_large(request: web.Request, agent: str | None, route: RouteConfig | Non
     return web.Response(status=REFUSAL_STATUS, text="the request body is too large\n")
 
 
+def _identity_headers(
+    decision: caller.Decision, *, route: bool, attested: str | None
+) -> list[tuple[str, str]]:
+    """The verified identity an admitted request carries to the connector.
+
+    Called only after every admission and grant check. ``X-Curie-Principal``
+    is set once, from an admitted ``cct``'s principal (ADR 0270 decision 4); a
+    route token carries no human. ``X-Curie-Grant-Verified`` is set once, to
+    the ``jti`` of the grant this request spent (ADR 0271 decision 7); a route
+    carries no tool call, so never one. Neither value is ever logged.
+    """
+
+    headers: list[tuple[str, str]] = []
+    if decision.agent is not None:
+        headers.append((caller.AGENT_HEADER, decision.agent))
+    if decision.run is not None and decision.work_item is not None:
+        headers.append((caller.RUN_HEADER, decision.run))
+        headers.append((caller.WORK_ITEM_HEADER, decision.work_item))
+    if not route and decision.principal is not None:
+        headers.append((caller.PRINCIPAL_HEADER, caller.principal_header_value(decision.principal)))
+    if not route and attested is not None:
+        headers.append((caller.GRANT_VERIFIED_HEADER, attested))
+    return headers
+
+
 @web.middleware
 async def _handle(request: web.Request, handler: Handler) -> web.StreamResponse:
     del handler  # Every request is decided and answered here; never delegated.
@@ -622,12 +779,20 @@ async def _handle(request: web.Request, handler: Handler) -> web.StreamResponse:
     # ADR 0240 decision 3: a declared route admits only a ``ccr``, and every
     # other path only a ``cct``, so neither token reaches the other's paths.
     # Another spelling of a route is neither: it is refused outright.
-    if route is None and _shadows_route(request):
+    config = request.app[_CONFIG]
+    if config.upload_path is not None and _spelling(request.rel_url.raw_path) == _spelling(
+        config.upload_path
+    ):
+        decision = caller.Decision(agent=None, refusal=caller.INVALID)
+    elif config.upload_only and (route is None or GRANT_HEADER in request.headers):
+        decision = caller.Decision(agent=None, refusal=caller.INVALID)
+    elif route is None and _shadows_route(request):
         decision = caller.Decision(agent=None, refusal=caller.INVALID)
     else:
         decision = _decide_route(request) if route is not None else _decide(request)
     refusal = decision.refusal
     grant_reason: str | None = None
+    attested: str | None = None
     body: bytes | None = None
     buffered = False
     counted: _CountedBody | None = None
@@ -644,11 +809,12 @@ async def _handle(request: web.Request, handler: Handler) -> web.StreamResponse:
             # A body over 1 MiB is refused rather than forwarded unread.
             return _too_large(request, decision.agent, None)
         buffered = True
-        grant_reason = (
-            GRANT_BODY_TOO_LARGE
+        check = (
+            _GrantCheck(refusal=GRANT_BODY_TOO_LARGE)
             if len(body) > _MAX_BODY_BYTES
             else _grant_refused(request, decision.agent or "", body, int(request.app[_CLOCK]()))
         )
+        grant_reason, attested = check.refusal, check.attested
         if grant_reason is not None:
             refusal = caller.GRANT_REQUIRED
     elif refusal is None and request.body_exists:
@@ -660,15 +826,24 @@ async def _handle(request: web.Request, handler: Handler) -> web.StreamResponse:
     # The path is decoded, so it is quoted: an encoded newline in it stays
     # `\n` inside this line rather than starting a line of its own.
     # ``grant=`` names which grant check refused, from a fixed set, and is
-    # absent otherwise; it is never a claim value.
+    # absent otherwise; it is never a claim value. ``principal=`` says only
+    # whether an admitted ``cct`` named a requester (ADR 0270 decision 2); a
+    # refusal and a ``ccr`` carry none, and no principal value is ever logged.
+    # ``attested=present`` appears only when this request spent a grant and
+    # carries its attestation (ADR 0271 decision 7); the ``jti`` is never logged.
+    principal = ""
+    if refusal is None and route is None:
+        principal = " principal=" + ("present" if decision.principal is not None else "absent")
     logger.info(
-        "caller=%s outcome=%s method=%s path=%r%s%s",
+        "caller=%s outcome=%s method=%s path=%r%s%s%s%s",
         decision.agent or "-",
         refusal or "admitted",
         request.method,
         request.path,
         f" route={route.path!r}" if route is not None else "",
         f" grant={grant_reason}" if grant_reason is not None else "",
+        principal,
+        " attested=present" if attested is not None else "",
     )
     if refusal is not None:
         return web.json_response(refusal_body(refusal), status=REFUSAL_STATUS)
@@ -692,11 +867,8 @@ async def _handle(request: web.Request, handler: Handler) -> web.StreamResponse:
         )
     # ADR 0178 decision 5. The token stays stripped. The connector sees the
     # verified claims as headers only this proxy can set.
-    if decision.agent is not None:
-        forwarded.add(caller.AGENT_HEADER, decision.agent)
-    if decision.run is not None and decision.work_item is not None:
-        forwarded.add(caller.RUN_HEADER, decision.run)
-        forwarded.add(caller.WORK_ITEM_HEADER, decision.work_item)
+    for name, value in _identity_headers(decision, route=route is not None, attested=attested):
+        forwarded.add(name, value)
     data: object
     if buffered:
         data = body

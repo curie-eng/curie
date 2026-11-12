@@ -12,7 +12,7 @@ is documentation of where the code already draws the line, not a new abstraction
 <!-- BEGIN GENERATED: seam-table (curie dev docs-lint) -->
 | Seam | Kind | Impls | Grade | Epic(s) | INTERFACE.md |
 |---|---|---|---|---|---|
-| Substrate / SandboxClient | CLEAN | 2 (k8s, docker) | not separately graded | #86, #44 | [Substrate / SandboxClient](interfaces/substrate/INTERFACE.md) |
+| Substrate / SandboxClient | CLEAN | 3 (k8s, docker, static) | not separately graded | #86, #44 | [Substrate / SandboxClient](interfaces/substrate/INTERFACE.md) |
 | Harness in-proc / ModelSession | CLEAN | 1 production + fake + blocked-preflight | A- | (folds into #25) | [Harness in-proc / ModelSession](interfaces/harness-modelsession/INTERFACE.md) |
 | ACI producer (frozen protocol) | CLEAN, frozen | 1 + reference | A- | #25, #47 | [ACI producer (frozen protocol)](interfaces/aci-producer/INTERFACE.md) |
 | Channel / ingress | CLEAN | 4 reply adapter implementations behind the `ReplySink` port (Slack, HTTP, built-in cluster-message relay, acknowledge-only tracker for GitHub/GitLab/Jira) + a second wire ingress producer (Rust CLI) | B- | #7, #19, #27, #38, #1515 | [Channel / ingress](interfaces/channel-ingress/INTERFACE.md) |
@@ -29,7 +29,7 @@ is documentation of where the code already draws the line, not a new abstraction
 | Memory | CLEAN | 1 loader (StateApiMemoryStore) + facts store (MemoryFactsStore) | not separately graded | #28 | [Memory](interfaces/memory/INTERFACE.md) |
 | Conversation history | CLEAN | 1 loader (StateApiTranscriptStore) | not separately graded | #20 | [Conversation history](interfaces/conversation-history/INTERFACE.md) |
 | Triggers | SOFT | 10 hardcoded (Slack, GH push, GH review, commit poll, generic HMAC hook, GH factory issue intake, GH factory poll intake, factory missed-label reconcile, tracker intake poll, code-host review feedback poll) + per-agent cron scheduler (worker cron_loop) | not separately graded | #29 | [Triggers](interfaces/triggers/INTERFACE.md) |
-| CLI output (agent-facing `--json`) | CLEAN | 77 outputs behind one trait | not separately graded | #456 | [CLI output (agent-facing `--json`)](interfaces/cli-output/INTERFACE.md) |
+| CLI output (agent-facing `--json`) | CLEAN | 80 outputs behind one trait | not separately graded | #456 | [CLI output (agent-facing `--json`)](interfaces/cli-output/INTERFACE.md) |
 | Harness package (declared contribution) | CLEAN | 1 supported built in Claude contribution | not separately graded | #3828 | [Harness package (declared contribution)](interfaces/harness-package/INTERFACE.md) |
 | Connector host (bundle-declared MCP servers) | CLEAN | 1 (Kubernetes) + in-memory fake | not separately graded | #1063, #1184 | [Connector host (bundle-declared MCP servers)](interfaces/connector-host/INTERFACE.md) |
 | Sealed credential (cluster-sealed connector secrets) | SOFT | 2 halves (Rust sealer, Python opener) over one frozen wire | not separately graded | #1240 | [Sealed credential (cluster-sealed connector secrets)](interfaces/sealed-credential/INTERFACE.md) |

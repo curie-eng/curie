@@ -142,14 +142,14 @@ def test_real_ci_registers_its_calico_runtime_assertions() -> None:
         [
             "charts/curie/ci/runtime/publication-job-assertions.sh",
             "charts/curie/ci/runtime/connector-readiness-runtime.sh",
+            "charts/curie/ci/runtime/metrics-alerts-runtime.sh",
         ],
     )
 
 
-def test_real_ci_does_not_register_an_assertion_the_parity_ladder_only_covers() -> None:
-    # The general cluster ladder runs on every chart change; it is not proof.
+def test_real_ci_rejects_an_unregistered_runtime_assertion() -> None:
     with pytest.raises(gate.GateError, match="unregistered"):
-        gate.check_registration(CI, ["charts/curie/ci/runtime/metrics-alerts-runtime.sh"])
+        gate.check_registration(CI, [gate.NEGATIVE_UNREGISTERED])
 
 
 def _repo(tmp_path: Path, body: str, script: str = SCRIPT) -> Path:
@@ -344,7 +344,7 @@ def test_self_test_passes_on_the_real_workflow() -> None:
 def test_self_test_refuses_an_unregistered_anchor() -> None:
     # A control anchored on an unregistered script would prove nothing.
     with pytest.raises(gate.GateError, match="unregistered"):
-        gate.self_test(CI, "charts/curie/ci/runtime/metrics-alerts-runtime.sh")
+        gate.self_test(CI, gate.NEGATIVE_UNREGISTERED)
 
 
 CHART_JOB = "e2e-cluster-chart-regressions"
@@ -360,6 +360,7 @@ CHART_RUNTIME_SCRIPTS = [
     "charts/curie/ci/runtime/e2e-connector-identity-runtime.sh",
     "charts/curie/ci/runtime/runner-resources-assertions.sh",
     "charts/curie/ci/runtime/connector-readiness-runtime.sh",
+    "charts/curie/ci/runtime/metrics-alerts-runtime.sh",
     "charts/curie/ci/runtime/idle-capacity-reclamation-runtime.sh",
     "charts/curie/ci/runtime/factory-resource-profile-runtime.sh",
 ]

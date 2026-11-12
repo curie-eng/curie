@@ -265,8 +265,8 @@ Two things to know:
 Copy [`examples/curie.yaml`](../examples/curie.yaml) into your repository as
 `curie.yaml` and customize it, or write the same starter from a released binary
 with `curie apply --init`. Credential fields contain credential names, not
-secret values. `install.context` (and `curie apply --context` / `curie diff
---context`, which win over the file) selects the kube context; `curie diff`
+secret values. `install.context` (and `curie apply --context <context>` / `curie diff
+--context <context>`, which win over the file) selects the kube context; `curie diff`
 prints the cluster that context names. Shared-cluster singleton opt-outs are
 modeled as `platform.sandbox_controller` and `platform.priority_classes.platform`
 / `sandbox`. `platform.gvisor` is `auto`, `require`, or `off` and controls
@@ -1498,7 +1498,11 @@ configuration loaded. No separate Helm upgrade is needed.
 
 Factory intake polls GitHub by default. It is off until `factory.enabled` is
 true (environment `FACTORY_ENABLED=true`). `factory.intake` (`FACTORY_INTAKE`)
-is `poll` or `webhook`, and `poll` is the default. The `factory:` block replaces
+is `poll` or `webhook`, and `poll` is the default. The API setting
+`FACTORY_MODEL_AUTH_MODE` (default `service`) selects the mode GitHub and
+tracker intake admit under. Intake never names an owner, so `personal` makes
+every new intake admission refuse with `personal_owner_required`; it is an
+environment setting only, with no chart value. The `factory:` block replaces
 the removed `api.githubFactory*` keys. For a v0.12.5 installation configured
 with `curie cluster factory`, use the
 [automatic retained migration](#automatic-migration-of-a-legacy-github-factory)
@@ -1914,6 +1918,21 @@ list. Admission, acquire, start, heartbeat, finish, and termination are internal
 worker-token routes under `/v1/internal/work-items`. The API lifespan reconciler
 publishes execute and terminate wakes onto `curie:runs`.
 
+A personal WorkItem has two more worker-token routes:
+`GET /v1/internal/work-items/{id}/personal-context` reads its owner tuple, and
+`POST /v1/internal/work-items/{id}/personal-context/revalidate` moves the item,
+and its queued or waiting requests, to the owner's current enrollment
+generation. Requests that already ran keep the generation they ran under.
+Revalidation proceeds only once every request of the WorkItem that started has
+a worker-recorded runtime termination. A run that finished normally records
+none, so its WorkItem answers `runtime_live` until an explicit termination
+confirmation exists. On the read, a wrong tenant, agent or owner gets the same
+404 as an unknown id. On revalidation, a wrong tenant or agent gets that 404,
+while another owner, a stale version, an inactive enrollment, a live runtime or
+an unchanged generation returns 409 with its code (`owner_mismatch`,
+`stale_version`, `enrollment_inactive`, `runtime_live` or
+`generation_current`).
+
 Reconciler steps fail independently: each failure logs the step and traceback,
 and execute wakes continue despite an unrelated step failure. OpenTelemetry
 records the `curie.work_item.reconciler.step.failure` counter and
@@ -2039,7 +2058,8 @@ first line of the channel reply, `curie-turn-failure: <class>`, so a consumer
 that sees only the delivered text can tell the turn from a successful reply.
 Other escalations use that same first line with their own token
 (`delivery-deadline`, `prior-side-effect`, `approval-route-unbound`,
-`approval-approvers-unverifiable`, `approval-no-email-approvers`, `approval-backend-missing`,
+`approval-approvers-unverifiable`, `approval-route-unsupported`, `approval-no-email-approvers`,
+`approval-backend-missing`,
 `publication-unavailable`, or `approval-create-failed`). A failed run whose cause is `runner_escalated`,
 `sandbox_terminated`, `publication_unrecorded`, `unclassified`, `max_turns`, or `ci_failed`
 still shows as needing a person.
@@ -2394,6 +2414,19 @@ request, a `state` and an `actionable_cause`. The states:
 - `completed_unpublished`: the run completed with no publication, or its
   publication was denied, expired or failed.
 
+Each item and each of its requests carry four owner facts: `tenant_id`,
+`model_auth_mode`, `owner_principal_id` and `enrollment_generation`. A service
+item has `model_auth_mode` of `service` and null `owner_principal_id` and
+`enrollment_generation`. A personal item has `model_auth_mode` of `personal`
+with an owner principal and a generation. A row written by an older API during
+the schema upgrade window can also show a null `tenant_id`. The tenant, mode
+and owner are fixed at creation. A worker-token revalidation can move the
+item's generation together with that of its queued or waiting requests; a
+request that already ran keeps the generation it ran under. The fields name
+identifiers and a generation only, never a credential.
+`curie <tier> work-items --json` carries the same four fields,
+and the human detail view prints one `auth` line.
+
 The platform never asserts correctness: every item reports
 `correctness: {"asserted": false, "owner": "bundle"}`. Verification belongs
 to the bundle.
@@ -2522,6 +2555,11 @@ The path, and what an operator can check on each hop:
 The fake model is network-free, including when progress headers are present.
 Use a live model or the API/worker integration fixture to exercise the ingress;
 `[fake:progress-demo]` is only a deterministic long turn for steering tests.
+Its one network directive, `[fake:connector-call]`, sends one MCP `initialize`
+and one `tools/list` to each hosted connector behind the caller proxy and
+answers one `connector-call <name>: ok tools=<n> caller=<fp>` or
+`... failed <reason> caller=<fp>` line each; `<fp>` is a sha256 prefix of the
+caller token, never the token.
 
 With an integration turn, inspect the durable result with:
 
@@ -2618,6 +2656,27 @@ share it with a local dispatcher or another cluster install.
 
 For the `local`-target equivalent (`curie local comms --slack`), see
 [`cli/README.md`](../cli/README.md).
+
+### Factory Slack progress
+
+An agent opts in with `PATCH /agents/{agent_id}` and `{"factory_slack_channel": "C0EXAMPLE1"}` (`null` clears), described in the [Software Factory guide](software-factory.md#follow-a-runs-progress-in-slack). The channel must have exactly one Slack binding on that agent, whose app identity posts; otherwise the API answers 409 `factory_slack_channel_unbound`. Only runs live at or after the moment the channel was set are posted. Changing the channel keeps each existing WorkItem in its original thread while that channel keeps its binding; clearing it stops all posting.
+
+The worker's progress lane derives what is owed from existing run records on each pass and keeps it in a durable outbox (`factory_slack_threads` binds each WorkItem to one Slack root for its whole life, `factory_slack_posts` holds the owed posts). Two settings govern it: `CURIE_FACTORY_SLACK_PROGRESS_ENABLED` (default true) and `CURIE_FACTORY_SLACK_INTERVAL_S` (default 2 seconds). With the switch off a worker posts nothing; a worker with it on later still finds and posts what is owed.
+
+Delivery is at least once and ordered per WorkItem: the root first, then each post only after every earlier one. A rejected send, including one for an identity whose token this worker lacks, stays owed and retries with backoff; only an invalid target fails permanently. A worker that stops mid-send posts that message again after a restart, and a worker restarted after a long outage posts everything owed since. A phase report that commits late is still posted when a later pass finds it, so it can land out of order.
+
+### Factory Slack steering
+
+A person steers a run by explicitly mentioning the app in that run's Slack thread; the [Software Factory guide](software-factory.md#follow-a-runs-progress-in-slack) describes what a steering mention does. Membership in the channel and having tagged the original issue confer no authority. Steering needs an operator-managed account link from the person to a code-host account, created with the platform key:
+
+1. `POST /identity/admin/{tenant_id}/code-host-links` with `principal_id`, `code_host_kind` (`github`), `host` (for example `github.com`), the numeric `account_id`, and `created_by_principal_id`. An account already actively linked answers 409 `link_exists`.
+2. `POST /identity/admin/{tenant_id}/links/{link_id}/revoke` ends a link. A revoked link, a disabled principal or a lost write permission refuses a mention that was queued before the change.
+
+The dispatcher stores a short-lived receipt for each threaded human app mention it receives over Socket Mode, before its dedupe claim, so the worker can verify the sender and the exact message. `CURIE_MENTION_RECEIPT_TTL_SECONDS` (default 604800) sets how long it is kept; a mention whose receipt has expired is refused in a mapped root. Turns selected through the HTTP receiver stay outside native steering and are refused in a mapped root.
+
+Every worker intercepts a mention in a mapped run root before any sandbox starts. A worker without its internal worker token refuses it with `steering_unconfigured`; a delivery with too little budget left is refused with `steering_budget_expired`. When the worker cannot read a decision, the delivery stays pending under its usual lease and delivery cap, and a request whose answer was lost is replied to as unconfirmed rather than with an invitation to send it again. Each reply names its outcome code.
+
+Live Slack Socket Mode delivery and the runner's checkout of the revised branch are not covered by the automated verification of this feature.
 
 ### Connecting email
 
@@ -2830,6 +2889,15 @@ thread identifiers, recovery text, and delivery receipts, though never the three
 credentials or a platform database credential. Back up with a storage snapshot
 that is consistent for SQLite, or stop the Deployment before copying the file.
 Restore the claim before starting the writer.
+
+That claim is local single-writer storage. A network filesystem is a different
+deployment: set `CURIE_MAIL_EXCLUSIVE_WAL=true` so the process takes SQLite
+exclusive locking before it touches the WAL, and still run one replica with
+stop-before-start. Give that adapter its own access point, mount it as the
+process UID, and encrypt the mount. Backups on that volume follow the same
+rule, a stopped adapter or a consistent SQLite backup. EFS locking and crash
+recovery still need qualification on real tasks. The chart does not set the
+variable. See the mail adapter README for the process contract.
 
 A disposable synthetic restore of postgres records, immutable bundle objects,
 that SQLite delivery state, and a Valkey dump is `curie dev restore-drill`
@@ -3054,6 +3122,10 @@ ordinary approval path on a **disposable target inside the policy's bounds**:
      leaves the ledger record without a `post_version`, so it cannot produce
      this evidence: recording the qualification is refused
      `evidence_not_idempotent` and the action cannot be made automatic.
+     The SRE example's opt-in
+     [`restarter`](../examples/sre-bot/README.md#remediation-restarter-connector-opt-in)
+     is such a connector for a rolling restart: its `restart_at` token makes a
+     repeat write nothing and leave the same `post_version`.
 4. **Run the verifier twice** against a literal member of the action's allowed
    targets, with the target recovered (outcome `verified`) and not recovered
    (`not-recovered`), under the same verifier declaration:
@@ -3196,6 +3268,25 @@ nominates, admits or executes.
 A chart upgrade is a **full** upgrade: anything the new chart does not render is
 deleted. For a Deployment that means a restart. For a StatefulSet it means the
 data too.
+
+### Channel gateway and protected workers
+
+Slack installations require `channelGateway.deploy: true` with a TLS certificate
+in `channelGateway.tlsSecret`, or an authenticated gateway at
+`channelGateway.url`. `curie cluster up` enables the gateway for a retained Slack
+installation that has no external gateway URL. Supply the TLS Secret before
+upgrading; plaintext HTTP requires an explicit `channelGateway.allowInsecure:
+true` opt-out. The chart refuses a Slack installation without a gateway, and
+rejects an HTTP URL when a TLS Secret is set.
+
+Protected workers commissioned with a schema-1 `process.json` must be
+re-commissioned before starting the upgraded worker image. The new image accepts
+only schema 2, whose `channel_gateway` configuration replaces process-owned
+Slack tokens with the gateway URL and worker caller credential. An image-only
+upgrade leaves the old process file invalid and the worker refuses to boot.
+Use the protected-worker commissioning workflow to produce a new process file
+and provision the gateway; do not copy Slack tokens into the new worker's
+environment or edit the schema number alone.
 
 ### Connector action executor (0.13.0)
 

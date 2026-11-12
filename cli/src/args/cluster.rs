@@ -30,6 +30,35 @@ pub(crate) enum ClusterHookAction {
         #[arg(long)]
         dry_run: bool,
     },
+    /// Read or rotate the targetless wake key for one named webhook.
+    #[command(
+        subcommand_precedence_over_arg = true,
+        subcommand_negates_reqs = true,
+        override_usage = "curie cluster hook wake-key [OPTIONS] <AGENT> <NAME>\n       curie cluster hook wake-key rotate [OPTIONS] <AGENT> <NAME>"
+    )]
+    WakeKey {
+        #[command(subcommand)]
+        command: Option<ClusterWakeKeyCommand>,
+        /// Agent name or id.
+        agent: Option<String>,
+        /// Trigger name on the in-force bundle.
+        name: Option<String>,
+        /// Print the route and the word redacted, and exit without making a request.
+        #[arg(long, global = true)]
+        dry_run: bool,
+    },
+}
+
+/// `cluster hook wake-key rotate`.
+#[derive(Subcommand)]
+pub(crate) enum ClusterWakeKeyCommand {
+    /// Rotate the wake key. The new secret is not printed.
+    Rotate {
+        /// Agent name or id.
+        agent: String,
+        /// Trigger name on the in-force bundle.
+        name: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -1057,6 +1086,45 @@ pub(crate) enum ClusterAction {
         #[arg(long)]
         dry_run: bool,
     },
+    /// Adopt, inspect, replace or retire a tenant HTTP identity authority.
+    IdentityAuthority {
+        #[arg(value_parser = ["list", "get", "adopt", "replace", "retire"])]
+        action: String,
+        #[arg(long, value_name = "UUID", required_if_eq_any = [
+            ("action", "get"), ("action", "adopt"), ("action", "replace"), ("action", "retire")
+        ])]
+        tenant: Option<uuid::Uuid>,
+        /// Mutation JSON with request_id and expected versions. Never a literal bearer.
+        #[arg(long, required_if_eq_any = [
+            ("action", "adopt"), ("action", "replace"), ("action", "retire")
+        ])]
+        apply: Option<std::path::PathBuf>,
+        #[arg(long)]
+        after: Option<uuid::Uuid>,
+        #[command(flatten)]
+        conn: ClusterConn,
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Set, inspect or remove issuer group filters for an agent role.
+    RoleFilter {
+        #[arg(value_parser = ["list", "set", "remove"])]
+        action: String,
+        #[arg(long)]
+        tenant: uuid::Uuid,
+        #[arg(long)]
+        agent: uuid::Uuid,
+        #[arg(long, value_parser = ["invocation", "approver"],
+            required_if_eq_any = [("action", "set"), ("action", "remove")])]
+        role: Option<String>,
+        /// Mutation JSON with request_id, expected_version and groups for set.
+        #[arg(long, required_if_eq_any = [("action", "set"), ("action", "remove")])]
+        apply: Option<std::path::PathBuf>,
+        #[command(flatten)]
+        conn: ClusterConn,
+        #[arg(long)]
+        dry_run: bool,
+    },
     /// Inspect tenant identities or apply IdP configuration, namespace or team JSON.
     /// Writes use the API's expected-version contract; links and people are read-only.
     Directory {
@@ -1329,5 +1397,9 @@ pub(crate) enum ClusterAction {
         clear_routes: bool,
         #[command(flatten)]
         recovery: ApprovalRecoveryArgs,
+        #[command(flatten)]
+        routes_version: ApprovalRoutesVersionArgs,
+        #[command(flatten)]
+        requester: RequesterIdentityArgs,
     },
 }

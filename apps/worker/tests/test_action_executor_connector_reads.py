@@ -15,6 +15,7 @@ apps API and the agent binding are stand-ins.
 
 from __future__ import annotations
 
+import base64
 import sys
 import types
 import uuid
@@ -51,7 +52,7 @@ from executor_loop_fixtures import (  # noqa: E402
 
 pytestmark = pytest.mark.anyio
 
-SEED = "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8="
+SEED = base64.b64encode(bytes(range(32))).decode()
 RELEASE = "example-release"
 APP_NAME = "curie"
 VERSION_ID = "00000000-0000-4000-8000-0000000000b2"

@@ -2,14 +2,61 @@
 
 from __future__ import annotations
 
+import json
 import os
+import shutil
 import subprocess
+import sys
+from pathlib import Path
 
+import pytest
 from curie_runner.subprocess_env import (
     BASH_CREDENTIAL_PRELUDE,
+    proc_dumpable_library,
     release_platform_credentials,
     shell_and_hook_env,
 )
+
+
+@pytest.fixture
+def real_compiler() -> str:
+    compiler = shutil.which("gcc")
+    if compiler is None:
+        raise RuntimeError("the source runner requires a working C compiler")
+    return compiler
+
+
+def test_source_compiler_does_not_receive_personal_credentials(
+    tmp_path: Path, real_compiler: str,
+) -> None:
+    capture = tmp_path / "compiler-environment.json"
+    wrapper = tmp_path / "gcc"
+    wrapper.write_text(
+        f"#!{sys.executable}\n"
+        "import json, os, pathlib, sys\n"
+        f"pathlib.Path({str(capture)!r}).write_text(json.dumps({{\n"
+        " 'grant': os.environ.get('CLAUDE_CODE_OAUTH_TOKEN'),\n"
+        " 'connector': os.environ.get('ACME_CONNECTOR_VALUE'),\n"
+        "}))\n"
+        f"os.execv({real_compiler!r}, [{real_compiler!r}, *sys.argv[1:]])\n",
+        encoding="utf-8",
+    )
+    wrapper.chmod(0o700)
+    grant = "synthetic-personal-compiler-sentinel"
+    library = Path(proc_dumpable_library({
+        "PATH": str(tmp_path) + os.pathsep + os.environ.get("PATH", "/usr/bin:/bin"),
+        "CLAUDE_CODE_OAUTH_TOKEN": grant,
+        "ACME_CONNECTOR_VALUE": "public-compiler-control",
+    }))
+    try:
+        observed = capture.read_text(encoding="utf-8")
+        grant_exposed = grant in observed
+        assert not grant_exposed
+        assert json.loads(observed) == {"grant": None, "connector": "public-compiler-control"}
+        assert library.is_file()
+    finally:
+        library.unlink()
+        library.parent.rmdir()
 
 
 def test_release_drops_platform_tokens_and_keeps_the_cli_model_key() -> None:
@@ -65,6 +112,29 @@ def test_shell_and_hook_env_also_drops_the_model_key() -> None:
     assert "runner-sentinel" not in rendered
     assert "sbx.example-state" not in rendered
     assert "cct.example-caller" not in rendered
+
+
+@pytest.mark.parametrize("name", ("CURIE_STATE_TOKEN1", "CURIE_STATE_TOKEN_1"))
+def test_indexed_credentials_leave_public_digit_values_usable(name: str) -> None:
+    child = shell_and_hook_env(
+        {
+            name: "indexed-platform-credential-placeholder",
+            "CURIE_RUNNER_ALLOW_TOKENLESS": "1",
+            "ACME_PUBLIC_VALUE": "public/v1",
+        }
+    )
+    observed = subprocess.run(
+        [sys.executable, "-c", "import json,os; print(json.dumps(dict(os.environ)))"],
+        env=child,
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    payload = json.loads(observed.stdout)
+    assert payload["ACME_PUBLIC_VALUE"] == "public/v1"
+    assert name not in payload
+    exposed = "indexed-platform-credential-placeholder" in observed.stdout
+    assert not exposed
 
 
 def test_bash_prelude_unsets_platform_credentials_before_the_command() -> None:
@@ -136,6 +206,39 @@ def test_a_declared_provider_credential_name_is_not_a_shell_variable() -> None:
     assert "provider-sentinel" not in "\n".join(child.values())
     assert child["CURIE_MODEL_ENV_KEY"] == "ACME_PROVIDER_KEY"
     assert child["PATH"] == "/usr/bin"
+
+
+@pytest.mark.parametrize("launcher", [False, True])
+def test_bundle_shell_can_read_upload_file_while_platform_tokens_stay_hidden(
+    tmp_path: Path, launcher: bool
+) -> None:
+    path = tmp_path / "uploads.json"
+    path.write_text('{"reviewer":"ccu.test.signature"}')
+    path.chmod(0o400)
+    source = {
+        "PATH": os.environ["PATH"],
+        "CURIE_CONNECTOR_UPLOAD_TOKENS_FILE": str(path),
+        "CURIE_RUNNER_TOKEN": "runner-sentinel",
+        "CURIE_CONNECTOR_CALLER_TOKEN": "cct.test.signature",
+        "CURIE_CONNECTOR_UPLOAD_TOKENS": "raw-token-sentinel",
+        "CURIE_OTHER_TOKEN_FILE": "other-token-sentinel",
+        "BASH_ENV": str(BASH_CREDENTIAL_PRELUDE),
+    }
+    command = (
+        'test -z "${CURIE_RUNNER_TOKEN-}${CURIE_CONNECTOR_CALLER_TOKEN-}'
+        '${CURIE_CONNECTOR_UPLOAD_TOKENS-}${CURIE_OTHER_TOKEN_FILE-}" '
+        '&& cat "$CURIE_CONNECTOR_UPLOAD_TOKENS_FILE"'
+    )
+    if launcher:
+        argv = [sys.executable, "-I", "-m", "curie_runner.shell_launcher", "-c", command]
+        env = source
+    else:
+        release_platform_credentials(source)
+        argv = ["bash", "-c", command]
+        env = shell_and_hook_env(source)
+    completed = subprocess.run(argv, env=env, capture_output=True, text=True, check=False)
+    assert completed.returncode == 0, completed.stderr
+    assert completed.stdout == path.read_text()
 
 
 class _EnvSnapshotSession:

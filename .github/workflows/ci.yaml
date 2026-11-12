@@ -3,8 +3,10 @@ name: CI
 on:
   merge_group:
     types: [checks_requested]
+  # backport/** holds maintenance backports: a release tag plus cherry-picked
+  # fixes. A push there gets the same proof as a push to a release branch.
   push:
-    branches: [main, next]
+    branches: [main, next, "backport/**"]
   pull_request:
     branches: [main, next, "task/**"]
     # Commit events only. A title or body edit must not cancel an in-flight
@@ -506,10 +508,7 @@ jobs:
   python-container-fixtures:
     name: Python container fixtures (pytest)
     needs: [changes]
-    if: >-
-      ${{ needs.changes.outputs.pytest == 'true' &&
-          (!contains(format(',{0},', needs.changes.outputs.pytest_deselect), ',tools/factory-e2e/tests/test_c4_tracker_scope.py,') ||
-           !contains(format(',{0},', needs.changes.outputs.pytest_deselect), ',examples/tests/test_sre_bot_observability_runtime.py,')) }}
+    if: ${{ needs.changes.outputs.pytest == 'true' }}
     runs-on: ubuntu-24.04
     permissions:
       contents: read
@@ -578,6 +577,10 @@ jobs:
           node_image: kindest/node:v1.31.4@sha256:2cb39f7295fe7eafee0842b1052a599a4fb0f8bcf3f83d96c7f4864c357c6c30
           install_only: true
       - name: Pytest
+        if: >-
+          ${{ needs.changes.outputs.pytest == 'true' &&
+              (!contains(format(',{0},', needs.changes.outputs.pytest_deselect), ',tools/factory-e2e/tests/test_c4_tracker_scope.py,') ||
+               !contains(format(',{0},', needs.changes.outputs.pytest_deselect), ',examples/tests/test_sre_bot_observability_runtime.py,')) }}
         env:
           PYTEST_DESELECT: ${{ needs.changes.outputs.pytest_deselect }}
           PYTEST_SCOPE: ${{ needs.changes.outputs.pytest_scope }}
@@ -617,6 +620,9 @@ jobs:
           fi
           unset PYTEST_SCOPE
           uv run pytest -q -n 2 --dist loadgroup --reruns 1 -rsR --durations=25 "${selected_files[@]}"
+
+      - name: Protected commissioning crash recovery
+        run: uv run python -m pytest -q -n 0 --durations=25 cli/tests/local/test_commissioning_claim_execution.py
 
   python-dry-run-fixture:
     name: Python dry run fixture (pytest)
@@ -754,6 +760,10 @@ jobs:
         run: |
           uv run python3 scripts/check-private-imports.py --self-test
           uv run python3 scripts/check-private-imports.py
+      - name: Explicit kube-context policy
+        run: |
+          uv run python3 scripts/check-kube-contexts.py --self-test
+          uv run python3 scripts/check-kube-contexts.py
       # The CLI pytest list is generated from every test file, so a path
       # filter cannot tell when it is stale. This job has no if and feeds
       # the required Python aggregate. A stale list fails here, and the
@@ -904,10 +914,7 @@ jobs:
           CONTAINER_RESULT: ${{ needs.python-container-fixtures.result }}
           CI_POLICY_SELECTED: ${{ needs.changes.outputs.ci_policy }}
           CI_POLICY_RESULT: ${{ needs.ci-policy.result }}
-          CONTAINER_SELECTED: >-
-            ${{ needs.changes.outputs.pytest == 'true' &&
-                (!contains(format(',{0},', needs.changes.outputs.pytest_deselect), ',tools/factory-e2e/tests/test_c4_tracker_scope.py,') ||
-                 !contains(format(',{0},', needs.changes.outputs.pytest_deselect), ',examples/tests/test_sre_bot_observability_runtime.py,')) }}
+          CONTAINER_SELECTED: ${{ needs.changes.outputs.pytest == 'true' }}
           DRY_RUN_RESULT: ${{ needs.python-dry-run-fixture.result }}
           DRY_RUN_SELECTED: >-
             ${{ needs.changes.outputs.pytest == 'true' &&
@@ -1788,14 +1795,17 @@ jobs:
       # `curie local up` the `full` profile; assert the release stack renders
       # exactly those service counts so a profile regression cannot silently
       # start the wrong set.
-      - name: Core profile renders 8 services
+      - name: Core profile renders 10 services
         run: |
-          count=$(docker compose -f compose.release.yaml --profile core config --services | wc -l)
-          [ "$count" -eq 8 ] || { echo "core profile must render 8 services, got $count" >&2; exit 1; }
-      - name: Full profile renders 14 services
+          services=$(docker compose -f compose.release.yaml --profile core config --services)
+          count=$(printf '%s\n' "$services" | wc -l)
+          [ "$count" -eq 10 ] || { echo "core profile must render 10 services, got $count" >&2; exit 1; }
+          printf '%s\n' "$services" | grep -qx curie-channel-gateway
+          printf '%s\n' "$services" | grep -qx curie-gateway-replay-perms
+      - name: Full profile renders 16 services
         run: |
           count=$(docker compose -f compose.release.yaml --profile full config --services | wc -l)
-          [ "$count" -eq 14 ] || { echo "full profile must render 14 services, got $count" >&2; exit 1; }
+          [ "$count" -eq 16 ] || { echo "full profile must render 16 services, got $count" >&2; exit 1; }
 
   # Build every image CI runs exactly once per workflow run, in one job, and
   # hand the result to every consumer as an artifact. Before this job the same
@@ -1967,12 +1977,22 @@ jobs:
             context: examples/sre-bot/connectors/self-upgrade
             dockerfile: examples/sre-bot/connectors/self-upgrade/Dockerfile
             platforms: linux/amd64,linux/arm64
-          # Opt-in and undeclared by default, so release.yaml does not publish
-          # it; an operator who opts in builds it with `curie build`. Built
-          # here so its Dockerfile cannot break unnoticed on either architecture.
+          # Opt-in and undeclared by default, as is the restarter below, so
+          # release.yaml does not publish either; an operator who opts in builds
+          # it with `curie build`. Built here so neither Dockerfile can break
+          # unnoticed on either architecture.
           - name: sre-bot-scaler
             context: examples/sre-bot/connectors/scaler
             dockerfile: examples/sre-bot/connectors/scaler/Dockerfile
+            platforms: linux/amd64,linux/arm64
+          - name: sre-bot-restarter
+            context: examples/sre-bot/connectors/restarter
+            dockerfile: examples/sre-bot/connectors/restarter/Dockerfile
+            platforms: linux/amd64,linux/arm64
+          # Opt-in and undeclared by default, like the scaler it verifies.
+          - name: sre-bot-metrics
+            context: examples/sre-bot/connectors/metrics
+            dockerfile: examples/sre-bot/connectors/metrics/Dockerfile
             platforms: linux/amd64,linux/arm64
           - name: github-activity-github
             context: examples/github-activity/connectors/github
@@ -2054,6 +2074,19 @@ jobs:
     if: ${{ !cancelled() && needs.changes.result == 'success' && (needs.ci-images.result == 'success' || needs.ci-images.result == 'skipped') }}
     env:
       CURIE_REPO_TOOLCHAIN_PROOF: required
+      CI_REQUIRE_VALKEY_TESTS: "1"
+      TEST_VALKEY_PW: ""
+    services:
+      valkey:
+        image: valkey/valkey:8.1.10-alpine
+        ports:
+          - 26379:6379
+        options: >-
+          --restart unless-stopped
+          --health-cmd "valkey-cli ping"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
     steps:
       # The per-run Docker daemon image (ADR 0217 decision 4): the curie-authz
       # plugin crate's fmt, clippy and tests, a build for both release arches (the
@@ -2193,7 +2226,7 @@ jobs:
         run: docker tag curie-ci/dispatcher:candidate curie-dispatcher:ci-smoke
       - name: "Dispatcher: Entrypoint imports resolve in the built image"
         if: ${{ !cancelled() && needs.changes.outputs.images == 'true' }}
-        run: docker run --rm --entrypoint python curie-dispatcher:ci-smoke -c "import curie_dispatcher; import aci_protocol"
+        run: docker run --rm --entrypoint python curie-dispatcher:ci-smoke -c "import curie_channel_gateway.slack.run; import curie_dispatcher; import aci_protocol"
 
       # Same gap, same shape (issue #428). The mail adapter image also builds with
       # `uv sync --no-editable`, so it installs only the package's DECLARED
@@ -2216,7 +2249,7 @@ jobs:
         run: docker tag curie-ci/mail-adapter:candidate curie-mail-adapter:ci-smoke
       - name: "Mail adapter: Entrypoint imports resolve in the built image"
         if: ${{ !cancelled() && needs.changes.outputs.images == 'true' }}
-        run: docker run --rm --entrypoint python curie-mail-adapter:ci-smoke -c "import curie_mail_adapter; import aci_protocol; import pydantic_settings"
+        run: docker run --rm --entrypoint python curie-mail-adapter:ci-smoke -c "import curie_channel_gateway.mail.run; import curie_mail_adapter; import aci_protocol; import pydantic_settings"
 
       # The console UI image serves its build through an nginx template that lives
       # as a heredoc in apps/ui/Dockerfile, not as a checked-in config file, so
@@ -2583,6 +2616,39 @@ jobs:
         env:
           CURIE_PROOF_EVIDENCE_DIR: ${{ runner.temp }}/repo-toolchain-proof
         run: uv run pytest runner/tests/test_repo_toolchain_proof.py -q --durations=25
+      # The static-pool shell image (packages/shell-supervisor/Dockerfile) on
+      # this run's runner image, run as a root container: a recycled shell
+      # holds nothing from the previous claim, and an image path the runner
+      # could write stops the shell before it serves.
+      - name: "Shell: Load the API image for the crash proof"
+        if: ${{ !cancelled() && needs.changes.outputs.images == 'true' }}
+        uses: ./.github/actions/load-ci-images
+        with:
+          images: api
+      - name: "Shell: Build the shell image on the runner image"
+        if: ${{ !cancelled() && needs.changes.outputs.images == 'true' }}
+        run: >-
+          docker build -f packages/shell-supervisor/Dockerfile
+          --build-arg RUNNER_IMAGE=curie-ci/runner:candidate
+          -t curie-ci/shell:candidate .
+      - name: "Shell: Absent image fails in required mode (negative control)"
+        if: ${{ !cancelled() && needs.changes.outputs.images == 'true' }}
+        env:
+          CURIE_SHELL_CONTAINER_PROOF: required
+        run: |
+          set -euo pipefail
+          if uv run pytest packages/shell-supervisor/tests/test_shell_container.py -q; then
+            echo "the shell container proof passed or skipped without an image" >&2
+            exit 1
+          fi
+      - name: "Shell: Recycled shells hold nothing from the previous claim"
+        if: ${{ !cancelled() && needs.changes.outputs.images == 'true' }}
+        env:
+          CURIE_SHELL_IMAGE: curie-ci/shell:candidate
+          CURIE_RUNNER_IMAGE: curie-ci/runner:candidate
+          CURIE_CRASH_API_IMAGE: curie-ci/api:candidate
+          CURIE_SHELL_CONTAINER_PROOF: required
+        run: uv run pytest packages/shell-supervisor/tests/test_shell_container.py -q
 
   # FALSIFIABILITY gate for the committed eval suites (issue #619). This is NOT
   # an E2E test: it never runs a real agent or makes a model call. It boots the
@@ -2843,12 +2909,13 @@ jobs:
       - name: Load the images built by the ci-images job
         uses: ./.github/actions/load-ci-images
         with:
-          images: "{api,ui}"
-      - name: Tag the candidate API and console UI for the driver
+          images: "{api,ui,dispatcher}"
+      - name: Tag the candidate API, console UI and gateway for the driver
         run: |
           set -euo pipefail
           docker tag curie-ci/api:candidate ghcr.io/curie-eng/curie-api:oidc-e2e
           docker tag curie-ci/ui:candidate ghcr.io/curie-eng/curie-ui:oidc-e2e
+          docker tag curie-ci/dispatcher:candidate ghcr.io/curie-eng/curie-dispatcher:oidc-e2e
       - name: OIDC end to end (real Dex, isolated compose project)
         env:
           CURIE_BIN: cli/target/release/curie
@@ -3336,7 +3403,9 @@ jobs:
         env:
           CURIE_BIN: cli/target/release/curie
           CURIE_E2E_TIERS: cluster
-        run: bash cli/scripts/e2e-ladder.sh
+        run: |
+          export CURIE_E2E_KUBE_CONTEXT="$(kubectl config current-context)"
+          bash cli/scripts/e2e-ladder.sh
       # Rail 1 (ADR-0067) is a load-bearing security control that nothing else
       # here asserts ENFORCES -- only that its policies exist (#1153). Runs
       # after the round trip so a genuine turn failure surfaces first, and is
@@ -3948,8 +4017,7 @@ jobs:
         uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
         with:
           python-version: "3.13"
-      # Connector readiness (#3338). The script defaults to k8scratch; this
-      # job's kube context is kind-curie-e2e and must be passed explicitly.
+      # Connector readiness (#3338) takes the job-owned context explicitly.
       # The namespace is this run's id so a retry does not reuse a leftover.
       - name: Connector that never listens stays not-Ready until it binds
         if: ${{ matrix.leg == 'chart' && contains(fromJSON(needs.changes.outputs.chart_scenarios), 'connector-readiness') }}
@@ -3960,6 +4028,18 @@ jobs:
           set -euo pipefail
           bash tools/runtime-assertion-gate/run.sh \
             charts/curie/ci/runtime/connector-readiness-runtime.sh
+      - name: Retained metrics and absent-data runtime
+        if: ${{ matrix.leg == 'chart' && contains(fromJSON(needs.changes.outputs.chart_scenarios), 'metrics-alerts') }}
+        env:
+          CURIE_2428_CONTEXT: kind-curie-e2e
+          CURIE_2428_NAMESPACE: metrics-${{ github.run_id }}-${{ github.run_attempt }}
+          CURIE_2428_OBS_NAMESPACE: metrics-obs-${{ github.run_id }}-${{ github.run_attempt }}
+          CURIE_2428_RELEASE: metrics-${{ github.run_id }}-${{ github.run_attempt }}
+          CURIE_2428_PROM_RELEASE: metrics-prom-${{ github.run_id }}-${{ github.run_attempt }}
+        run: |
+          set -euo pipefail
+          bash tools/runtime-assertion-gate/run.sh \
+            charts/curie/ci/runtime/metrics-alerts-runtime.sh
       # Runner BYO egress (#2369). Render assertions prove the CIDRs land in
       # NetworkPolicy YAML; this proves a runner-labelled pod can actually
       # reach each declared peer (rustfs, sts, otel, api) and that an
@@ -4119,8 +4199,9 @@ jobs:
       - name: Dump cluster diagnostics after lifecycle retry failure
         if: failure()
         run: |
-          kubectl --context kind-curie-e2e get pods -A -o wide || true
-          kubectl --context kind-curie-e2e get events -A --sort-by=.lastTimestamp | tail -50 || true
+          context="$(kubectl config current-context)"
+          kubectl --context "$context" get pods -A -o wide || true
+          kubectl --context "$context" get events -A --sort-by=.lastTimestamp | tail -50 || true
       - name: Delete the job-owned kind cluster
         if: always()
         run: |
@@ -5106,6 +5187,7 @@ jobs:
           kubectl rollout status deploy/curie-worker -n curie --timeout=600s
           kubectl rollout status deploy/curie-ui -n curie --timeout=600s
           kubectl rollout status daemonset/curie-runner-prewarm -n curie --timeout=600s
+          export CURIE_E2E_KUBE_CONTEXT="$(kubectl config current-context)"
           bash cli/scripts/e2e-ladder.sh
       - name: Delete the historical upgrade cluster before factory migration
         run: |

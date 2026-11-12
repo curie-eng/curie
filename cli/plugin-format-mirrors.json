@@ -85,6 +85,12 @@
       "omissions": []
     },
     {
+      "struct": "ConnectorScratchDecl",
+      "file": "cli/src/connector_build.rs",
+      "schema": "ConnectorScratch",
+      "omissions": []
+    },
+    {
       "struct": "ConnectorRouteDecl",
       "file": "cli/src/connector_build.rs",
       "schema": "ConnectorRoute",

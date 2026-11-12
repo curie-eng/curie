@@ -1081,7 +1081,7 @@ const ARM64_DIGEST: &str =
     "sha256:e6089d9710c40f8cf78e59440f8c67160698ffb710822892691a3c5bba58af80";
 
 /// The shape recorded from `docker buildx imagetools inspect --raw` of a
-/// pushed bake output (prototype on the k8 builder): two platform images plus
+/// pushed bake output on a disposable builder: two platform images plus
 /// one buildx attestation manifest per platform, platform unknown/unknown.
 fn recorded_index(manifests: Vec<Value>) -> String {
     json!({

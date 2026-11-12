@@ -77,6 +77,7 @@ from .yaml_loader import DuplicateKeyError, safe_load_unique
 # to validate both the inline object and a declared hooks file.
 _HOOKS_ADAPTER = TypeAdapter(dict[str, list[HookMatcherConfig]])
 _TRIGGERS_ADAPTER = TypeAdapter(list[TriggerDeclaration])
+_WAKE_HOOK_NAME = re.compile(r"[a-z0-9][a-z0-9._-]{0,62}")
 
 # The two existing platform exemptions are separate from the reserved names.
 # The reserved channel read server remains subject to toolPolicy when granted.
@@ -1192,6 +1193,19 @@ def _validate_triggers(manifest: PluginManifest, c: _Collector) -> None:
         # is present; the model collapses that and an omitted key to None.
         schedule_text = _stripped(trigger.schedule)
         name_text = _stripped(trigger.name)
+        if trigger.wake:
+            if trigger.type != "webhook":
+                c.error("triggers.wake_type_invalid", "wake requires type 'webhook'", loc)
+            if trigger.name is None or _WAKE_HOOK_NAME.fullmatch(trigger.name) is None:
+                c.error(
+                    "triggers.wake_invalid_name",
+                    "a wake requires a hook name matching [a-z0-9][a-z0-9._-]{0,62}",
+                    loc,
+                )
+            if not _stripped(trigger.prompt):
+                c.error("triggers.wake_missing_prompt", "a wake requires a standing prompt", loc)
+            if "target" in raw_item:
+                c.error("triggers.wake_target_forbidden", "a wake must not define target", loc)
         if trigger.type != "cron" and "schedule" in raw_item:
             c.error(
                 "triggers.schedule_forbidden",
@@ -1252,6 +1266,20 @@ def _validate_triggers(manifest: PluginManifest, c: _Collector) -> None:
                 )
             else:
                 seen_names.add(name_text)
+
+
+def load_wake_triggers(manifest: PluginManifest) -> dict[str, TriggerDeclaration]:
+    """Resolve explicit wake declarations using the deploy-time trigger rules."""
+
+    collector = _Collector()
+    _validate_triggers(manifest, collector)
+    if collector.errors:
+        raise ValueError("invalid triggers: " + ", ".join(issue.code for issue in collector.errors))
+    return {
+        trigger.name: trigger
+        for trigger in _TRIGGERS_ADAPTER.validate_python(manifest.triggers or [])
+        if trigger.wake and trigger.name is not None
+    }
 
 
 def _validate_approval_policy(

@@ -34,7 +34,7 @@ CURRENT_STARTED=""
 BIN="${CURIE_BIN:-}"
 NAMESPACE="${CURIE_E2E_NAMESPACE:-acme-2590}"
 RELEASE="${CURIE_E2E_RELEASE:-t2590}"
-KIND_CLUSTER="${CURIE_E2E_KIND_CLUSTER:-curie-t2590}"
+KIND_CLUSTER="${CURIE_E2E_KIND_CLUSTER:-}"
 KUBECONFIG_FILE="${CURIE_E2E_KUBECONFIG:-$REPO_ROOT/.projects/kubeconfig-t2590}"
 export KUBECONFIG="$KUBECONFIG_FILE"
 EVIDENCE_DIR="${CURIE_E2E_EVIDENCE_DIR:-$REPO_ROOT/.projects/2590-evidence}"
@@ -73,10 +73,15 @@ REL_089="https://github.com/curie-eng/curie/releases/download/v0.8.9"
 # Published v0.8.8 ships alembic 0039. The candidate head is the checkout's
 # schema_compat.json, so a rebase onto a newer next does not hard-code 0043.
 PUBLISHED_HEAD="0039"
-TARGET_HEAD="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["schema_head"])' \
-    "$REPO_ROOT/apps/api/src/curie_api/schema_compat.json")"
-SUPPORTED_ROLLBACK_HEAD="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["windows"]["0.10.0"]["schema_head"])' \
-    "$REPO_ROOT/cli/src/application_schema_windows.json")"
+TARGET_HEAD=""
+SUPPORTED_ROLLBACK_HEAD=""
+
+load_schema_heads() {
+    TARGET_HEAD="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["schema_head"])' \
+        "$REPO_ROOT/apps/api/src/curie_api/schema_compat.json")"
+    SUPPORTED_ROLLBACK_HEAD="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["windows"]["0.10.0"]["schema_head"])' \
+        "$REPO_ROOT/cli/src/application_schema_windows.json")"
+}
 
 SCENARIOS_ALL=(
     soak-refusal
@@ -147,7 +152,7 @@ die() {
 
 usage() {
     cat <<'EOF' >&2
-usage: cluster-upgrade-matrix.sh [--scenario all|soak-refusal|fresh-n|n1-to-n-nonempty|same-version|fail-every-phase|interrupt-resume|n-to-n1|guarded-rollback|rollback-published-088|rollback-published-089|migration-crash|converge-negative|previous-serves|apply-kill-takeover|rollback-to-serving|rollback-interrupted|runner-layer-retire|hook-fail-not-serving|terminal-pods|rollback-uncatalogued] [--shard <id>] [--list-shards] [--force] [--keep] [--json] [--self-test]
+usage: cluster-upgrade-matrix.sh [--kind-cluster <name>] [--scenario all|soak-refusal|fresh-n|n1-to-n-nonempty|same-version|fail-every-phase|interrupt-resume|n-to-n1|guarded-rollback|rollback-published-088|rollback-published-089|migration-crash|converge-negative|previous-serves|apply-kill-takeover|rollback-to-serving|rollback-interrupted|runner-layer-retire|hook-fail-not-serving|terminal-pods|rollback-uncatalogued] [--shard <id>] [--list-shards] [--force] [--keep] [--json] [--self-test]
 EOF
 }
 
@@ -269,6 +274,9 @@ verify_sha256() {
 parse_args() {
     while [[ $# -gt 0 ]]; do
         case "$1" in
+            --kind-cluster)
+                [[ $# -ge 2 && -n "$2" ]] || die "--kind-cluster needs a value"
+                KIND_CLUSTER="$2"; shift 2 ;;
             --scenario) SCENARIO="${2:-}"; SCENARIO_SET=1; shift 2 ;;
             --shard) SHARD="${2:-}"; [[ -n "$SHARD" ]] || die "--shard needs an id"; shift 2 ;;
             --list-shards) LIST_SHARDS=1; shift ;;
@@ -305,6 +313,7 @@ parse_args() {
 }
 
 run_self_test() {
+    load_schema_heads
     local failed=0 tmp script_path
     script_path="${BASH_SOURCE[0]}"
     if is_soak_namespace "curie" && is_soak_namespace "default" && ! is_soak_namespace "acme-2590"; then
@@ -562,18 +571,6 @@ run_self_test() {
         log "apply-kill-takeover sends SIGKILL to every descendant"
     else
         log "self-test: apply-kill-takeover must send SIGKILL to the binary and every descendant"
-        failed=1
-    fi
-    if awk '/^prepare_takeover_context\(\)/,/^}/' "$script_path" | awk '
-        /kubeconfig_is_named_kind/ { verifies=1 }
-        /--kubeconfig "\$KUBECONFIG_FILE" config rename-context "kind-\$KIND_CLUSTER" k8/ { private=1 }
-        /KUBECTL_CONTEXT_ARGS=\(--context k8\)/ { kubectl=1 }
-        /HELM_CONTEXT_ARGS=\(--kube-context k8\)/ { helm=1 }
-        END { exit (verifies && private && kubectl && helm) ? 0 : 1 }
-    '; then
-        log "apply-kill-takeover pins its private kind cluster to context k8"
-    else
-        log "self-test: apply-kill-takeover must verify its named kind cluster before selecting k8 in its private kubeconfig"
         failed=1
     fi
     if shard_manifest check "$SHARDS"; then
@@ -1055,19 +1052,22 @@ EOF
                 || die "self-test: cluster upgrade omitted the verified kind context"
             log "verified named kind context reaches kubectl helm and cluster upgrade"
             prepare_takeover_context
-            [[ "$(cat "$state/current-context")" == k8 ]] || die "self-test: adopted kind context was not renamed"
-            [[ "${KUBECTL_CONTEXT_ARGS[*]}" == '--context k8' && "${HELM_CONTEXT_ARGS[*]}" == '--kube-context k8' ]] \
+            [[ "$(cat "$state/current-context")" == "kind-$KIND_CLUSTER" ]] || die "self-test: adopted kind context changed"
+            [[ "${KUBECTL_CONTEXT_ARGS[*]}" == "--context kind-$KIND_CLUSTER" && "${HELM_CONTEXT_ARGS[*]}" == "--kube-context kind-$KIND_CLUSTER" ]] \
                 || die "self-test: adopted kind context was not passed to both clients"
+            kubectl_ns get pods >/dev/null
+            helm_ns history "$RELEASE" >/dev/null
             (( OWNED_KIND == 0 )) || die "self-test: context preparation changed cluster cleanup ownership"
         ); then
-            if grep -Fq -- "--kubeconfig $KUBECONFIG_FILE config rename-context kind-$CURIE_SETTLE_KIND_CLUSTER k8" "$logf"; then
-                log "adopted named kind cluster prepared private context k8"
+            if ! grep -Fq -- "rename-context" "$logf"; then
+                log "apply-kill-takeover retains its verified private kind context"
+                log "adopted named kind cluster retained its private context"
             else
                 log "self-test: adopted kind context preparation did not select the private kubeconfig"
                 failed=1
             fi
         else
-            log "self-test: a verified adopted named kind cluster could not prepare context k8"
+            log "self-test: a verified adopted named kind cluster could not retain its context"
             failed=1
         fi
         printf 'other-context' >"$state/current-context"
@@ -1083,7 +1083,7 @@ EOF
             log "self-test: invalid kind kubeconfig was changed before refusal"
             failed=1
         else
-            log "invalid kind kubeconfig refused before selecting k8"
+            log "invalid kind kubeconfig refused before runtime calls"
         fi
         printf 'kind-%s' "$CURIE_SETTLE_KIND_CLUSTER" >"$state/current-context"
         printf 'https://127.0.0.1:7443' >"$state/server"
@@ -1099,7 +1099,7 @@ EOF
             log "self-test: mismatched kind server was renamed before refusal"
             failed=1
         else
-            log "mismatched kind server refused before selecting k8"
+            log "mismatched kind server refused before runtime calls"
         fi
         NAMESPACE="$saved_ns"
         KUBECONFIG_FILE="$saved_kube"
@@ -1117,7 +1117,8 @@ EOF
         unset CURIE_SETTLE_STATE CURIE_SETTLE_LOG CURIE_SETTLE_KIND_CLUSTER
         rm -rf "$probe"
     fi
-    current=$'helm --kube-context kind-curie-upgrade-matrix rollback t2590 3 -n acme-2590'
+    local fixture_context="kind-acme-upgrade-matrix"
+    current="helm --kube-context $fixture_context rollback t2590 3 -n acme-2590"
     takeover=$(printf '%s\n' \
         "$current --wait --timeout 15m" \
         'helm upgrade t2590 /example/charts/curie-0.10.1.tgz -n acme-2590 --wait --timeout 21900s -f <retained-values>')
@@ -1451,7 +1452,7 @@ kubeconfig_is_named_kind() {
     local ctx server expected
     ctx="$(kubectl --kubeconfig "$KUBECONFIG_FILE" config current-context 2>/dev/null || true)"
     [[ "$ctx" == "kind-${KIND_CLUSTER}" ]] || return 1
-    server="$(kubectl --kubeconfig "$KUBECONFIG_FILE" config view --minify -o jsonpath='{.clusters[0].cluster.server}' 2>/dev/null || true)"
+    server="$(kubectl --kubeconfig "$KUBECONFIG_FILE" --context "kind-$KIND_CLUSTER" config view --minify -o jsonpath='{.clusters[0].cluster.server}' 2>/dev/null || true)"
     expected="$(kind get kubeconfig --name "$KIND_CLUSTER" 2>/dev/null | awk '/server:/{print $2; exit}')"
     [[ -n "$server" && -n "$expected" && "$server" == "$expected" ]]
 }
@@ -1483,16 +1484,9 @@ ensure_kind() {
 
 prepare_takeover_context() {
     kubeconfig_is_named_kind || die "apply-kill-takeover private kubeconfig does not select the named kind cluster"
-    kubectl --kubeconfig "$KUBECONFIG_FILE" config rename-context "kind-$KIND_CLUSTER" k8 >/dev/null
-    KUBECTL_CONTEXT_ARGS=(--context k8)
-    HELM_CONTEXT_ARGS=(--kube-context k8)
-    local server expected
-    server="$(kubectl --kubeconfig "$KUBECONFIG_FILE" --context k8 config view --minify -o jsonpath='{.clusters[0].cluster.server}')"
-    expected="$(kind get kubeconfig --name "$KIND_CLUSTER" | awk '/server:/{print $2; exit}')"
-    [[ -n "$server" && "$server" == "$expected" ]] || die "private k8 context does not point to the named kind cluster"
-    [[ "$(kubectl --kubeconfig "$KUBECONFIG_FILE" config current-context)" == k8 ]] \
-        || die "private kubeconfig did not select context k8"
-    log "private context k8 selects kind cluster $KIND_CLUSTER"
+    KUBECTL_CONTEXT_ARGS=(--context "kind-$KIND_CLUSTER")
+    HELM_CONTEXT_ARGS=(--kube-context "kind-$KIND_CLUSTER")
+    log "private context kind-$KIND_CLUSTER selects the verified named kind cluster"
 }
 
 image_for() {
@@ -3879,6 +3873,8 @@ fi
 # Soak identity is a parse-time refuse. Do it before the exclusive lock so a
 # unit test (or a second invocation) cannot be blocked by a live matrix run.
 refuse_soak "$NAMESPACE" "$RELEASE"
+[[ -n "$KIND_CLUSTER" ]] || die "--kind-cluster or CURIE_E2E_KIND_CLUSTER is required"
+load_schema_heads
 exec 9>"$LOCK_FILE"
 if ! "$GNU_PROCESS" flock -n 9; then
     die "another cluster-upgrade-matrix holds $LOCK_FILE"

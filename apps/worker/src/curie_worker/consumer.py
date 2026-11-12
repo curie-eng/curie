@@ -40,11 +40,13 @@ import asyncio
 import hashlib
 import logging
 import time
+from collections.abc import Awaitable, Callable
 from contextlib import nullcontext
 from datetime import UTC, datetime
 
 from aci_protocol import STREAM_PAYLOAD_FIELD, QueuedTurn
-from curie_dispatcher.queue import from_stream_fields
+from curie_internal.approval_reminder import APPROVAL_REMINDER_FIELD, ApprovalReminderV1
+from curie_internal.turn_queue import from_stream_fields
 from curie_telemetry import (
     TRACEPARENT_STREAM_FIELD,
     channel_event_id_scope,
@@ -59,6 +61,7 @@ from redis.exceptions import RedisError
 
 from . import capacity_wait as capacity_wait_module
 from .capacity_wait import (
+    REQUESTER_HANDOFF_REASON,
     WAIT_GENERATION_FIELD,
     WAIT_REPLY_REF_FIELD,
     WAIT_TERMINAL_ONLY_FIELD,
@@ -67,6 +70,7 @@ from .capacity_wait import (
     CapacityWaitRefused,
     CapacityWaitRequested,
     CapacityWaitStore,
+    RequesterHandoffWaitRequested,
     ThreadOrderWaitRequested,
     order_delivery_scope,
     wait_delivery_scope,
@@ -185,6 +189,11 @@ return claimed
 _THREAD_RESET_DRAIN_BUDGET_S = 30.0
 
 
+async def refuse_unconfigured_reminder(_reminder: ApprovalReminderV1) -> None:
+    """Fail closed for a lane that has no card delivery."""
+    raise RuntimeError("approval reminder delivery is not configured")
+
+
 class Consumer(StreamConsumer):
     """Runs the read loop and the periodic reclaim/reap maintenance loop."""
 
@@ -195,6 +204,7 @@ class Consumer(StreamConsumer):
         kernel: Kernel,
         config: WorkerConfig,
         leases: DeliveryLeaseStore,
+        reminders: Callable[[ApprovalReminderV1], Awaitable[None]],
         max_concurrency: int | None = None,
         drain: UpgradeDrainGate | None = None,
     ) -> None:
@@ -217,6 +227,7 @@ class Consumer(StreamConsumer):
         # rather than widening StreamBroker for one unrelated feature.
         self._valkey: Redis = redis
         self._kernel = kernel
+        self._reminders = reminders
         self._config = config
         self._waits = CapacityWaitStore(redis, config)
         # None, which the production entry point passes, sizes the lane from
@@ -552,6 +563,18 @@ class Consumer(StreamConsumer):
                         # race.
                         return
                     try:
+                        if APPROVAL_REMINDER_FIELD in fields:
+                            if (
+                                STREAM_PAYLOAD_FIELD in fields
+                                or "curie_identity_context_v1" in fields
+                            ):
+                                raise ValueError("reminder entries cannot carry a turn")
+                            raw_reminder = fields[APPROVAL_REMINDER_FIELD]
+                            if not isinstance(raw_reminder, str) or len(raw_reminder) > 1024:
+                                raise ValueError("invalid approval reminder size")
+                            reminder = ApprovalReminderV1.model_validate_json(raw_reminder)
+                        else:
+                            reminder = None
                         # @spec HTTP-INVOCATION-EXECUTION-18: hash before any wire rewrite.
                         identity_arguments: dict[str, str] = {}
                         if "curie_identity_context_v1" in fields:
@@ -565,7 +588,8 @@ class Consumer(StreamConsumer):
                                 # @spec HTTP-APPROVAL-CONTINUITY-4: exact bytes for creation.
                                 "original_payload": raw_payload,
                             }
-                        qevent = from_stream_fields(fields)
+                        if reminder is None:
+                            qevent = from_stream_fields(fields)
                     except Exception as exc:
                         if hasattr(span, "set_status"):
                             span.set_status(StatusCode.ERROR)
@@ -584,6 +608,15 @@ class Consumer(StreamConsumer):
                             reason="unparseable",
                             delivery_count=await self._pending_delivery_count(entry_id),
                         )
+                        return
+
+                    if reminder is not None:
+                        lease.raise_if_lost()
+                        await self._reminders(reminder)
+                        lease.raise_if_lost()
+                        await self._ack(entry_id)
+                        await self._settle_delivery_best_effort(entry_id)
+                        process_outcome = "success"
                         return
 
                     # The ``curie.queue.process`` span opened before the parse,
@@ -876,7 +909,22 @@ class Consumer(StreamConsumer):
                             )
                             return
                         except CapacityWaitRequested as requested:
+                            # ADR 0270 decision 3: a different requester's
+                            # deferral waits outside the thread order, so the
+                            # live turn's requester keeps steering it. Its
+                            # order slot, registered before the kernel ran, is
+                            # released first, and the record's sticky reason
+                            # keeps every wake and re-park out of the order.
+                            handoff = isinstance(requested, RequesterHandoffWaitRequested)
+                            parkable = self._kernel._can_park(qevent)
                             try:
+                                if handoff and parkable:
+                                    await self._waits.finish_order(
+                                        _thread_key_for(qevent),
+                                        qevent.event_id,
+                                        lease,
+                                        started=True,
+                                    )
                                 record = await self._waits.park(
                                     entry_id,
                                     fields,
@@ -884,10 +932,11 @@ class Consumer(StreamConsumer):
                                     lease,
                                     thread_key=(
                                         _thread_key_for(qevent)
-                                        if self._kernel._can_park(qevent)
+                                        if parkable and not handoff
                                         else None
                                     ),
                                     wait_reason=requested.wait_reason,
+                                    reason=REQUESTER_HANDOFF_REASON if handoff else "",
                                 )
                             except Exception:
                                 logger.exception(
@@ -1019,23 +1068,35 @@ class Consumer(StreamConsumer):
 
         A capacity wake may have started no turn, or a later message may now
         own the thread. Its recorded epoch is the only runner turn this callback
-        may stop. Other deliveries keep the existing thread interrupt path.
+        may stop.
+
+        Every other delivery stops only what this lease acquisition opened or
+        steered into, at the sandbox it recorded (ADR 0270 decision 3). One
+        that opened or steered nothing (it lost its lease waiting on the order
+        lock, the authority answer or a liveness probe) stops nothing, so it
+        never ends another delivery's turn, another person's included.
 
         Every failure is logged and swallowed. Failing to interrupt must not mask
         the lease loss itself, which ``lease.lost`` has already recorded and which
         the pre-ack fence enforces on its own; and the replacement's preflight is
         the second, independent guard against a turn that keeps running here.
         """
+        if APPROVAL_REMINDER_FIELD in fields:
+            return
         try:
-            qevent = from_stream_fields(fields)
+            # Read before any await: the loss task drops ``_notice_lease``.
+            lease = self._held_leases.get(entry_id) or self._notice_lease.get(entry_id)
             if WAIT_GENERATION_FIELD in fields:
+                qevent = from_stream_fields(fields)
                 generation = int(fields[WAIT_GENERATION_FIELD])
                 record = await self._waits.get(qevent.event_id)
                 if record is None or record.generation != generation or record.grant_epoch is None:
                     return
                 await self._kernel.resolve_capacity_grant(qevent, record.grant_epoch)
                 return
-            await self._kernel.interrupt_thread(_thread_key_for(qevent), "delivery lease lost")
+            if lease is None:
+                return
+            await self._kernel.stop_owned_execution(lease.owner, "delivery lease lost")
         except Exception:
             logger.exception(
                 "could not interrupt the runner for entry %s after its delivery "
@@ -1045,6 +1106,8 @@ class Consumer(StreamConsumer):
 
     async def _notice_vanished_entry(self, entry_id: str, fields: dict[str, str]) -> None:
         """Post the not-started edit when the broker entry itself is gone."""
+        if APPROVAL_REMINDER_FIELD in fields:
+            return
         try:
             qevent = from_stream_fields(fields)
             lease = self._held_leases.get(entry_id) or self._notice_lease.get(entry_id)

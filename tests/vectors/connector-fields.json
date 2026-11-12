@@ -16,6 +16,7 @@
       "readiness_path",
       "resources",
       "routes",
+      "scratch",
       "sealed_secrets",
       "secret_files",
       "secrets",
@@ -34,6 +35,10 @@
     "ConnectorResourceQuantities": [
       "cpu",
       "memory"
+    ],
+    "ConnectorScratch": [
+      "path",
+      "size_limit"
     ],
     "ConnectorRoute": [
       "callers",

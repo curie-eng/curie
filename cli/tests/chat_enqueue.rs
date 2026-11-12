@@ -23,6 +23,29 @@ use crate::support;
 use support::{unique_stream, valkey_or_skip, Response};
 
 #[tokio::test]
+async fn constructed_valkey_url_authenticates_with_the_configured_password() {
+    let Some(_connection) = valkey_or_skip("constructed_valkey_url_authenticates").await else {
+        return;
+    };
+    let client = redis::Client::open(support::valkey_url()).unwrap();
+    let info = client.get_connection_info();
+    let redis::ConnectionAddr::Tcp(host, port) = info.addr() else {
+        panic!("this local transport proof requires a TCP Valkey endpoint");
+    };
+    let url = curie::message::local_valkey_url(
+        info.redis_settings().password().unwrap_or(""),
+        host,
+        *port,
+    );
+    let mut connection = curie::queue::connect(&url).await.unwrap();
+    let pong: String = redis::cmd("PING")
+        .query_async(&mut connection)
+        .await
+        .unwrap();
+    assert_eq!(pong, "PONG");
+}
+
+#[tokio::test]
 async fn xadd_lands_the_exact_seam_shape_on_real_valkey() {
     let Some(mut conn) = valkey_or_skip("xadd_lands_the_exact_seam_shape_on_real_valkey").await
     else {

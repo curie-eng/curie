@@ -36,7 +36,7 @@ from sqlalchemy import (
 from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship, validates
 
-from .approval_wording import approval_display
+from .approval_wording import approval_display, describe_approval
 from .db import SCHEMA, Base
 from .forges.types import RepositoryRef, TrackerIssueRef
 from .repo_full_name import normalize_repo_full_name
@@ -126,6 +126,15 @@ class ActionStatus(enum.StrEnum):
     failed = "failed"
 
 
+# ADR 0271 decision 1: a route map carrying an ``approver_ticket`` key (even a
+# malformed one, as ``approver_tickets.has_selector`` reads it) keeps the
+# requester flag on, for every writer. Migration 0153 carries a frozen copy.
+AGENT_SELECTOR_REQUIRES_REQUESTER_IDENTITY_CHECK = (
+    "connector_requester_identity OR NOT COALESCE(jsonb_path_exists(approval_routes, "
+    "'strict $.* ? (@.type() == \"object\" && exists(@.approver_ticket))', '{}', true), false)"
+)
+
+
 class Agent(Base):
     __tablename__ = "agents"
     __table_args__ = (
@@ -154,6 +163,18 @@ class Agent(Base):
         CheckConstraint(
             "status IN ('active', 'paused', 'draining', 'retired')",
             name="agents_status_ck",
+        ),
+        CheckConstraint(
+            "connector_requester_identity_version >= 1",
+            name="agents_connector_requester_identity_version_ck",
+        ),
+        CheckConstraint(
+            AGENT_SELECTOR_REQUIRES_REQUESTER_IDENTITY_CHECK,
+            name="agents_approver_ticket_requires_requester_identity_ck",
+        ),
+        CheckConstraint(
+            "factory_slack_channel IS NULL OR factory_slack_channel ~ '^[CG][A-Z0-9]{6,}$'",
+            name="agents_factory_slack_channel_ck",
         ),
         # Carries tenant_id, so the owning team must be a team of the same tenant.
         ForeignKeyConstraint(
@@ -323,6 +344,24 @@ class Agent(Base):
     # agent (#1461, ADR-0167). Operator-owned; off by default. When on, the
     # worker hands the runner the binding-scoped channel memory URL.
     memory_writes: Mapped[bool] = mapped_column(default=False, server_default="false")
+    # Whether this agent's connector calls carry the verified human requester
+    # (ADR 0270 decision 1, @spec CONNECTOR-REQUESTER-1). Operator-owned and
+    # off by default. Written only by the `PATCH /agents/{id}` compare-and-set
+    # on the version below, which every accepted write bumps
+    # (`crud.agents.update_agent_connector_requester_identity`).
+    connector_requester_identity: Mapped[bool] = mapped_column(
+        default=False, server_default="false"
+    )
+    connector_requester_identity_version: Mapped[int] = mapped_column(default=1, server_default="1")
+    # The one Slack channel this agent's factory runs post progress to (#5414).
+    # The posting identity is the agent's single Slack binding for that channel,
+    # checked on write. NULL posts nothing. ``factory_slack_since`` is the
+    # database time it was last set, so only runs live from then on are posted;
+    # both are cleared together.
+    factory_slack_channel: Mapped[str | None] = mapped_column(Text, default=None)
+    factory_slack_since: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), default=None
+    )
     created_at: Mapped[datetime] = mapped_column(server_default=func.now())
 
     versions: Mapped[list[AgentVersion]] = relationship(
@@ -557,6 +596,25 @@ class ThreadWorkspace(Base):
     )
 
 
+APPROVAL_SELECTION_MODE_CHECK = "selection_mode IN ('ordinary', 'dynamic')"
+_SELECTION_SNAPSHOT_COLUMNS = (
+    "selection_requester",
+    "selection_connector",
+    "selection_tool",
+    "selection_key_id",
+    "selection_nonce",
+    "selection_arguments_sha256",
+    "selected_approvers",
+)
+APPROVAL_SELECTION_SNAPSHOT_CHECK = (
+    "(selection_mode = 'dynamic' AND "
+    + " AND ".join(f"{column} IS NOT NULL" for column in _SELECTION_SNAPSHOT_COLUMNS)
+    + ") OR (selection_mode = 'ordinary' AND "
+    + " AND ".join(f"{column} IS NULL" for column in _SELECTION_SNAPSHOT_COLUMNS)
+    + ")"
+)
+
+
 class Approval(Base):
     """A durable approval request (#244, ADR-0010).
 
@@ -573,15 +631,41 @@ class Approval(Base):
 
     __tablename__ = "approvals"
     __table_args__ = (
+        Index(
+            "ix_approvals_next_remind_at",
+            "next_remind_at",
+            "id",
+            postgresql_where=text("next_remind_at IS NOT NULL"),
+        ),
         # @spec HTTP-APPROVAL-CONTINUITY-5. Private, bounded provenance.
         CheckConstraint(
             "identity_context IS NULL OR octet_length(identity_context) <= 16384",
             name="approvals_identity_context_length_ck",
         ),
         CheckConstraint(
+            "remind_every_s IS NULL OR remind_every_s > 0",
+            name="approvals_remind_every_s_positive_ck",
+        ),
+        CheckConstraint(
             "(policy_identity IS NULL AND policy_version IS NULL) OR "
             "(policy_identity = 'publication:auto' AND policy_version >= 1)",
             name="approvals_policy_identity_ck",
+        ),
+        # ADR 0271 decision 4 (plan D10): the two selection modes stay explicit
+        # in storage. Migration 0153 carries a frozen copy of both checks.
+        CheckConstraint(
+            APPROVAL_SELECTION_MODE_CHECK, name="approvals_selection_mode_ck",
+        ),
+        CheckConstraint(
+            APPROVAL_SELECTION_SNAPSHOT_CHECK, name="approvals_selection_snapshot_ck",
+        ),
+        # A ticket nonce is single use per agent, only among rows that carry one.
+        Index(
+            "approvals_selection_nonce_key",
+            "agent_id",
+            "selection_nonce",
+            unique=True,
+            postgresql_where=text("selection_nonce IS NOT NULL"),
         ),
     )
 
@@ -605,7 +689,13 @@ class Approval(Base):
     summary: Mapped[str]
     @property
     def display_summary(self) -> str:
-        """Computed presentation; grants still bind to the stored exact fields."""
+        """Computed presentation; grants still bind to the stored exact fields.
+
+        A dynamic row describes its stored grant, never its summary text
+        (ADR 0271 decision 8); the describer leaves out the opaque ticket.
+        """
+        if self.selection_mode == "dynamic":
+            return describe_approval(self.granted_tool, self.granted_arguments)
         return approval_display(self.summary, self.granted_tool, self.granted_arguments)
 
     # The reply handle of the requesting turn, replayed onto the resume turn so
@@ -644,6 +734,8 @@ class Approval(Base):
     # Optional SLA: past this instant the record can no longer be approved or
     # rejected; a resolve attempt flips it to expired instead.
     expires_at: Mapped[datetime | None] = mapped_column(default=None)
+    remind_every_s: Mapped[int | None] = mapped_column(default=None)
+    next_remind_at: Mapped[datetime | None] = mapped_column(default=None)
     resolved_by: Mapped[str | None] = mapped_column(default=None)
     resolution_note: Mapped[str | None] = mapped_column(default=None)
     created_at: Mapped[datetime] = mapped_column(server_default=func.now())
@@ -679,6 +771,25 @@ class Approval(Base):
     # resolutions leave both NULL so they stay distinguishable in the audit.
     policy_identity: Mapped[str | None] = mapped_column(default=None)
     policy_version: Mapped[int | None] = mapped_column(default=None)
+    # ADR 0271 decision 4: ``dynamic`` rows were created from a verified approver
+    # ticket and carry the immutable selection below; ``ordinary`` rows carry
+    # none of it. Private: no public approval DTO exposes these columns, and the
+    # record digest covers them only on dynamic rows, so ordinary seals are
+    # unchanged (``identity.http_approval.approval_record_digest``).
+    selection_mode: Mapped[str] = mapped_column(
+        Text, default="ordinary", server_default="ordinary"
+    )
+    selection_requester: Mapped[dict[str, Any] | None] = mapped_column(
+        JSONB(none_as_null=True), default=None
+    )
+    selection_connector: Mapped[str | None] = mapped_column(Text, default=None)
+    selection_tool: Mapped[str | None] = mapped_column(Text, default=None)
+    selection_key_id: Mapped[str | None] = mapped_column(Text, default=None)
+    selection_nonce: Mapped[str | None] = mapped_column(Text, default=None)
+    selection_arguments_sha256: Mapped[str | None] = mapped_column(Text, default=None)
+    selected_approvers: Mapped[list[dict[str, Any]] | None] = mapped_column(
+        JSONB(none_as_null=True), default=None
+    )
 
     publication: Mapped[Publication | None] = relationship(back_populates="approval", uselist=False)
 
@@ -809,6 +920,20 @@ class ThreadPublicationLineage(Base):
         )
 
 
+# The execution owner tuple shared by work_items and execution_requests (#5376,
+# ADR 0268). Migration 0159 carries a frozen copy. A service row names no owner
+# or generation; a personal row names its tenant, owner and a positive
+# generation. ``IS TRUE`` keeps an UNKNOWN from passing.
+MODEL_AUTH_MODE_CHECK = "model_auth_mode IN ('service', 'personal')"
+OWNER_TUPLE_CHECK = (
+    "((model_auth_mode = 'service' AND owner_principal_id IS NULL "
+    "AND enrollment_generation IS NULL) "
+    "OR (model_auth_mode = 'personal' AND tenant_id IS NOT NULL "
+    "AND owner_principal_id IS NOT NULL AND enrollment_generation IS NOT NULL "
+    "AND enrollment_generation >= 1)) IS TRUE"
+)
+
+
 class WorkItem(Base):
     """Durable execution identity for one tracker issue (ADR 0162, ADR 0197).
 
@@ -873,11 +998,39 @@ class WorkItem(Base):
             "base_source IS NULL OR base_source IN ('label', 'default')",
             name="work_items_base_source_ck",
         ),
+        # The execution owner tuple (#5376, migration 0159).
+        CheckConstraint(MODEL_AUTH_MODE_CHECK, name="work_items_model_auth_mode_ck"),
+        CheckConstraint(OWNER_TUPLE_CHECK, name="work_items_owner_tuple_ck"),
+        ForeignKeyConstraint(
+            ["tenant_id", "agent_id"],
+            [f"{SCHEMA}.agents.tenant_id", f"{SCHEMA}.agents.id"],
+            name="work_items_tenant_agent_fkey",
+            ondelete="CASCADE",
+        ),
+        ForeignKeyConstraint(
+            ["tenant_id", "owner_principal_id"],
+            [f"{SCHEMA}.principals.tenant_id", f"{SCHEMA}.principals.id"],
+            name="work_items_tenant_owner_fkey",
+        ),
+        # Targets of the request snapshot's composite foreign keys.
+        UniqueConstraint("id", "model_auth_mode", name="work_items_id_model_auth_mode_key"),
+        UniqueConstraint("id", "tenant_id", name="work_items_id_tenant_id_key"),
+        UniqueConstraint(
+            "id", "tenant_id", "owner_principal_id", name="work_items_id_tenant_owner_key"
+        ),
     )
 
     id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
     )
+    # The owner tuple, fixed when the WorkItem is created from validated
+    # admission facts (#5376, ADR 0268). Only the versioned revalidation moves
+    # ``enrollment_generation``; the owner never changes. ``tenant_id`` is the
+    # agent's tenant; it stays nullable until a contract revision.
+    tenant_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), default=None)
+    model_auth_mode: Mapped[str] = mapped_column(Text, default="service", server_default="service")
+    owner_principal_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), default=None)
+    enrollment_generation: Mapped[int | None] = mapped_column(BigInteger, default=None)
     tracker_kind: Mapped[str] = mapped_column(Text)
     tracker_host: Mapped[str] = mapped_column(Text)
     tracker_scope_id: Mapped[str] = mapped_column(Text)
@@ -946,10 +1099,12 @@ class WorkItem(Base):
     )
 
     publication_lineage: Mapped[ThreadPublicationLineage | None] = relationship()
+    # Named explicitly: the snapshot's composite keys also reference work_items.
     execution_requests: Mapped[list[ExecutionRequest]] = relationship(
         back_populates="work_item",
         cascade="all, delete-orphan",
         passive_deletes=True,
+        foreign_keys="ExecutionRequest.work_item_id",
     )
 
     @property
@@ -1133,6 +1288,33 @@ class ExecutionRequest(Base):
             LAST_START_FAILURE_DETAIL_CHECK,
             name="execution_requests_last_start_failure_detail_ck",
         ),
+        # The owner snapshot (#5376, migration 0159). MATCH SIMPLE skips a
+        # composite key with a NULL member, so three keys bind it to its
+        # WorkItem: the mode (never NULL), the tenant, and the owner.
+        CheckConstraint(MODEL_AUTH_MODE_CHECK, name="execution_requests_model_auth_mode_ck"),
+        CheckConstraint(OWNER_TUPLE_CHECK, name="execution_requests_owner_tuple_ck"),
+        ForeignKeyConstraint(
+            ["work_item_id", "model_auth_mode"],
+            [f"{SCHEMA}.work_items.id", f"{SCHEMA}.work_items.model_auth_mode"],
+            name="execution_requests_work_item_mode_fkey",
+            ondelete="CASCADE",
+        ),
+        ForeignKeyConstraint(
+            ["work_item_id", "tenant_id"],
+            [f"{SCHEMA}.work_items.id", f"{SCHEMA}.work_items.tenant_id"],
+            name="execution_requests_work_item_tenant_fkey",
+            ondelete="CASCADE",
+        ),
+        ForeignKeyConstraint(
+            ["work_item_id", "tenant_id", "owner_principal_id"],
+            [
+                f"{SCHEMA}.work_items.id",
+                f"{SCHEMA}.work_items.tenant_id",
+                f"{SCHEMA}.work_items.owner_principal_id",
+            ],
+            name="execution_requests_work_item_owner_fkey",
+            ondelete="CASCADE",
+        ),
         UniqueConstraint(
             "work_item_id",
             "sequence",
@@ -1170,6 +1352,14 @@ class ExecutionRequest(Base):
     work_item_id: Mapped[uuid.UUID] = mapped_column(
         ForeignKey(f"{SCHEMA}.work_items.id", ondelete="CASCADE")
     )
+    # The WorkItem's owner tuple, copied at insertion from the locked WorkItem
+    # (``personal_execution.snapshot_columns``), never from admission facts or
+    # the newest author. Only revalidation rebinds a queued or waiting
+    # request's generation.
+    tenant_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), default=None)
+    model_auth_mode: Mapped[str] = mapped_column(Text, default="service", server_default="service")
+    owner_principal_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), default=None)
+    enrollment_generation: Mapped[int | None] = mapped_column(BigInteger, default=None)
     sequence: Mapped[int]
     status: Mapped[str] = mapped_column(default="waiting", server_default="waiting")
     wait_deadline: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
@@ -1253,7 +1443,9 @@ class ExecutionRequest(Base):
     reply_target_comment_id: Mapped[str | None] = mapped_column(Text, default=None)
     reply_target_url: Mapped[str | None] = mapped_column(Text, default=None)
 
-    work_item: Mapped[WorkItem] = relationship(back_populates="execution_requests")
+    work_item: Mapped[WorkItem] = relationship(
+        back_populates="execution_requests", foreign_keys=[work_item_id]
+    )
 
 
 def new_card_token() -> str:
@@ -1421,6 +1613,85 @@ class ExecutionRequestPhaseReport(Base):
     loop_round: Mapped[int | None] = mapped_column(default=None)
     reported_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.clock_timestamp()
+    )
+
+
+class FactorySlackThread(Base):
+    """The one Slack root a WorkItem's factory progress posts into (#5414).
+
+    Bound for the WorkItem's whole life, across revisions. ``root_ts`` is NULL
+    until the root post is delivered. ``first_sequence`` is the first request
+    posted, set once at discovery and never advanced.
+    """
+
+    __tablename__ = "factory_slack_threads"
+    __table_args__ = (
+        UniqueConstraint(
+            "channel_identity", "channel", "root_ts", name="factory_slack_threads_root_key"
+        ),
+    )
+
+    work_item_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey(f"{SCHEMA}.work_items.id", ondelete="CASCADE"),
+        primary_key=True,
+    )
+    agent_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True))
+    channel_identity: Mapped[str] = mapped_column(Text)
+    channel: Mapped[str] = mapped_column(Text)
+    root_ts: Mapped[str | None] = mapped_column(Text, default=None)
+    first_sequence: Mapped[int] = mapped_column()
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+
+
+FACTORY_SLACK_POST_KINDS = ("root", "phase", "pull_request", "terminal")
+
+
+class FactorySlackPost(Base):
+    """One message owed to a factory Slack root, delivered at least once (#5414)."""
+
+    __tablename__ = "factory_slack_posts"
+    __table_args__ = (
+        CheckConstraint(
+            f"kind IN ({', '.join(repr(kind) for kind in FACTORY_SLACK_POST_KINDS)})",
+            name="factory_slack_posts_kind_ck",
+        ),
+        UniqueConstraint("work_item_id", "post_key", name="factory_slack_posts_post_key_key"),
+        Index(
+            "ix_factory_slack_posts_owed",
+            "work_item_id",
+            "sequence",
+            "rank",
+            "ordinal",
+            postgresql_where=text("posted_at IS NULL AND failed_at IS NULL"),
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(BigInteger, Identity(), primary_key=True)
+    work_item_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey(f"{SCHEMA}.factory_slack_threads.work_item_id", ondelete="CASCADE"),
+    )
+    post_key: Mapped[str] = mapped_column(Text)
+    kind: Mapped[str] = mapped_column(Text)
+    sequence: Mapped[int] = mapped_column()
+    rank: Mapped[int] = mapped_column()
+    ordinal: Mapped[int] = mapped_column(BigInteger)
+    payload: Mapped[dict[str, Any]] = mapped_column(JSONB)
+    attempts: Mapped[int] = mapped_column(default=0, server_default="0")
+    not_before: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), default=None)
+    lease_owner: Mapped[str | None] = mapped_column(Text, default=None)
+    lease_expires_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), default=None
+    )
+    posted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), default=None)
+    posted_ref: Mapped[str | None] = mapped_column(Text, default=None)
+    failed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), default=None)
+    last_error: Mapped[str | None] = mapped_column(Text, default=None)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
     )
 
 
@@ -1791,6 +2062,172 @@ class Publication(Base):
     @property
     def pr_url(self) -> str | None:
         return self.lineage.pr_url if self.lineage is not None else None
+
+
+UI_EVIDENCE_STATUSES = (
+    "receiving",
+    "ready",
+    "publishing",
+    "published",
+    "unsupported",
+    "failed",
+    "superseded",
+    "abandoned",
+)
+UI_EVIDENCE_TERMINAL = frozenset({"published", "unsupported", "failed", "superseded", "abandoned"})
+
+
+def _sql_column_in(column: str, values: tuple[str, ...]) -> str:
+    return f"{column} IN ({', '.join(repr(value) for value in values)})"
+
+
+class PublicationUiEvidence(Base):
+    """Optional UI evidence one publication's worker uploaded (migration 0146).
+
+    It is bonus evidence: nothing here is read by the code publication path.
+    The image bytes in `PublicationUiEvidenceImage.content` are cleared once
+    the row is terminal, as ``publications.patch_bytes`` is.
+    """
+
+    __tablename__ = "publication_ui_evidence"
+    __table_args__ = (
+        CheckConstraint(
+            _sql_column_in("status", UI_EVIDENCE_STATUSES), name="publication_ui_evidence_status_ck"
+        ),
+        CheckConstraint(
+            _sql_column_in("manifest_state", ("valid", "invalid")),
+            name="publication_ui_evidence_manifest_state_ck",
+        ),
+        CheckConstraint(
+            "manifest_status IS NULL OR "
+            + _sql_column_in("manifest_status", ("complete", "partial", "skipped", "failed")),
+            name="publication_ui_evidence_manifest_status_ck",
+        ),
+        CheckConstraint(
+            "total_bytes >= 0 AND total_bytes <= 104857600",
+            name="publication_ui_evidence_total_bytes_ck",
+        ),
+        CheckConstraint(
+            "version >= 1 AND attempts >= 0", name="publication_ui_evidence_version_ck"
+        ),
+        Index("ix_publication_ui_evidence_status_lease", "status", "lease_expires_at"),
+        Index("ix_publication_ui_evidence_lineage_id", "lineage_id"),
+    )
+
+    publication_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey(f"{SCHEMA}.publications.id", ondelete="CASCADE"), primary_key=True
+    )
+    lineage_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey(f"{SCHEMA}.thread_publication_lineages.id", ondelete="CASCADE")
+    )
+    status: Mapped[str] = mapped_column(Text)
+    index_sha256: Mapped[str] = mapped_column(Text)
+    manifest_state: Mapped[str] = mapped_column(Text)
+    manifest_refusal: Mapped[str | None] = mapped_column(Text, default=None)
+    manifest_status: Mapped[str | None] = mapped_column(Text, default=None)
+    reason: Mapped[str | None] = mapped_column(Text, default=None)
+    base_sha: Mapped[str] = mapped_column(Text)
+    manifest_base_sha: Mapped[str | None] = mapped_column(Text, default=None)
+    manifest_head_sha: Mapped[str | None] = mapped_column(Text, default=None)
+    manifest_candidate_tree: Mapped[str | None] = mapped_column(Text, default=None)
+    candidate_tree: Mapped[str | None] = mapped_column(Text, default=None)
+    head_tree: Mapped[str | None] = mapped_column(Text, default=None)
+    candidate_dirty: Mapped[bool | None] = mapped_column(default=None)
+    warnings: Mapped[list[str]] = mapped_column(JSONB, default=list, server_default="[]")
+    total_bytes: Mapped[int] = mapped_column(BigInteger, default=0, server_default="0")
+    upload_deadline_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    publish_deadline_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), default=None
+    )
+    lease_owner: Mapped[str | None] = mapped_column(Text, default=None)
+    lease_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), default=None)
+    attempts: Mapped[int] = mapped_column(default=0, server_default="0")
+    outcome: Mapped[str | None] = mapped_column(Text, default=None)
+    error: Mapped[str | None] = mapped_column(Text, default=None)
+    evidence_commit_sha: Mapped[str | None] = mapped_column(Text, default=None)
+    comment_written_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), default=None
+    )
+    version: Mapped[int] = mapped_column(default=1, server_default="1")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
+    )
+    terminal_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), default=None)
+
+
+class PublicationUiEvidenceImage(Base):
+    """One manifest entry of a publication's UI evidence, with its stored bytes."""
+
+    __tablename__ = "publication_ui_evidence_images"
+    __table_args__ = (
+        CheckConstraint("ordinal >= 0", name="publication_ui_evidence_images_ordinal_ck"),
+        CheckConstraint("char_length(path) <= 512", name="publication_ui_evidence_images_path_ck"),
+        CheckConstraint(
+            "char_length(label) <= 200", name="publication_ui_evidence_images_label_ck"
+        ),
+        CheckConstraint(
+            _sql_column_in("state", ("before", "after")),
+            name="publication_ui_evidence_images_state_ck"
+        ),
+        CheckConstraint(
+            "size_bytes IS NULL OR (size_bytes >= 0 AND size_bytes <= 10485760)",
+            name="publication_ui_evidence_images_size_ck",
+        ),
+    )
+
+    publication_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey(f"{SCHEMA}.publication_ui_evidence.publication_id", ondelete="CASCADE"),
+        primary_key=True,
+    )
+    ordinal: Mapped[int] = mapped_column(primary_key=True)
+    # A refused entry whose manifest path or label was ill-typed stores "".
+    path: Mapped[str] = mapped_column(Text)
+    label: Mapped[str] = mapped_column(Text)
+    # Null only on a refused entry whose manifest state was ill-typed.
+    state: Mapped[str | None] = mapped_column(Text, default=None)
+    size_bytes: Mapped[int | None] = mapped_column(BigInteger, default=None)
+    sha256: Mapped[str | None] = mapped_column(Text, default=None)
+    refusal: Mapped[str | None] = mapped_column(Text, default=None)
+    bound: Mapped[bool]
+    # Deliberately excluded from every DTO; cleared on every terminal transition.
+    content: Mapped[bytes | None] = mapped_column(LargeBinary, default=None)
+    stored_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), default=None)
+    url: Mapped[str | None] = mapped_column(Text, default=None)
+
+
+class PublicationLineageUiEvidence(Base):
+    """The evidence comment and ref one lineage's pull request carries."""
+
+    __tablename__ = "publication_lineage_ui_evidence"
+    __table_args__ = (
+        CheckConstraint(
+            "comment_kind IS NULL OR "
+            + _sql_column_in("comment_kind", ("evidence", "unsupported", "stale", "failed")),
+            name="publication_lineage_ui_evidence_comment_kind_ck",
+        ),
+        CheckConstraint("version >= 1", name="publication_lineage_ui_evidence_version_ck"),
+    )
+
+    lineage_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey(f"{SCHEMA}.thread_publication_lineages.id", ondelete="CASCADE"),
+        primary_key=True,
+    )
+    ref_commit_sha: Mapped[str | None] = mapped_column(Text, default=None)
+    # True from just before a ref store until its commit is recorded or the ref
+    # is deleted: a ref the code host may hold that cleanup must still delete.
+    ref_pending: Mapped[bool] = mapped_column(default=False, server_default="false")
+    comment_revision: Mapped[int | None] = mapped_column(default=None)
+    # True from just before a comment post until it is recorded: a comment the
+    # pull request may carry that a later revision's stale notice must replace.
+    comment_pending: Mapped[bool] = mapped_column(default=False, server_default="false")
+    comment_kind: Mapped[str | None] = mapped_column(Text, default=None)
+    lease_owner: Mapped[str | None] = mapped_column(Text, default=None)
+    lease_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), default=None)
+    version: Mapped[int] = mapped_column(default=1, server_default="1")
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
+    )
 
 
 class CredentialRedemptionAuditEntry(Base):
@@ -2931,7 +3368,7 @@ class HookRun(Base):
             name="hook_runs_outcome_ck",
         ),
         CheckConstraint(
-            "source IN ('schedule', 'manual')",
+            "source IN ('schedule', 'manual', 'webhook')",
             name="hook_runs_source_ck",
         ),
     )
@@ -2958,6 +3395,31 @@ class HookRun(Base):
     )
     # When an open claim becomes reclaimable by the hook's next fire (#2931).
     lease_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
+class HookWakeKey(Base):
+    """The generation of one hook's wake key. Key material is not stored."""
+
+    __tablename__ = "hook_wake_keys"
+    __table_args__ = (
+        CheckConstraint("generation >= 1", name="hook_wake_keys_generation_ck"),
+    )
+
+    agent_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey(f"{SCHEMA}.agents.id", ondelete="CASCADE"),
+        primary_key=True,
+    )
+    hook: Mapped[str] = mapped_column(String(63), primary_key=True)
+    generation: Mapped[int] = mapped_column(
+        BigInteger, nullable=False, server_default=text("1")
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
 
 
 class Tenant(Base):
@@ -3028,6 +3490,41 @@ class Principal(Base):
     )
     authorization_version: Mapped[int] = mapped_column(
         Integer, default=1, server_default="1"
+    )
+
+
+class PersonalClaudeEnrollment(Base):
+    """The token-free header of one principal's personal enrollment (#5376, ADR 0268).
+
+    One row per tenant principal. ``generation`` names the enrolled subscription
+    a personal WorkItem binds; ``version`` is the CAS counter its writers
+    compare. No Secret reference or token lives here; #5377 owns the
+    enrollment mutations and their custody.
+    """
+
+    __tablename__ = "personal_claude_enrollments"
+    __table_args__ = (
+        CheckConstraint("generation >= 1", name="personal_claude_enrollments_generation_ck"),
+        CheckConstraint("version >= 1", name="personal_claude_enrollments_version_ck"),
+        UniqueConstraint(
+            "tenant_id", "principal_id", name="personal_claude_enrollments_tenant_principal_key"
+        ),
+        ForeignKeyConstraint(
+            ["tenant_id", "principal_id"],
+            [f"{SCHEMA}.principals.tenant_id", f"{SCHEMA}.principals.id"],
+            name="personal_claude_enrollments_principal_fkey",
+        ),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    tenant_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True))
+    principal_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True))
+    generation: Mapped[int] = mapped_column(BigInteger)
+    active: Mapped[bool] = mapped_column(default=True, server_default=text("true"))
+    version: Mapped[int] = mapped_column(BigInteger, default=1, server_default="1")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
     )
 
 
@@ -3737,7 +4234,7 @@ class IdentityNamespace(Base):
     __table_args__ = (
         CheckConstraint(_PROVIDER_CK[:-1] + ", 'email')", name="identity_namespaces_provider_ck"),
         CheckConstraint(
-            "kind IN ('slack_workspace', 'email_domain', 'slack_enterprise')",
+            "kind IN ('slack_workspace', 'email_domain', 'slack_enterprise', 'github_host')",
             name="identity_namespaces_kind_ck",
         ),
         CheckConstraint(
@@ -3753,6 +4250,12 @@ class IdentityNamespace(Base):
         CheckConstraint(
             "kind <> 'slack_enterprise' OR (provider = 'slack' AND key ~ '^E[A-Z0-9]{2,}$')",
             name="identity_namespaces_slack_enterprise_key_ck",
+        ),
+        # Operator mapped GitHub accounts, one namespace per host (#5414).
+        CheckConstraint(
+            "kind <> 'github_host' OR (provider = 'github' AND authority <> '' "
+            "AND key = authority)",
+            name="identity_namespaces_github_host_key_ck",
         ),
         CheckConstraint("length(key) > 0", name="identity_namespaces_key_ck"),
         UniqueConstraint(

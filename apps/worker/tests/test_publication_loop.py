@@ -26,6 +26,9 @@ from aiohttp import web
 from aiohttp.test_utils import TestServer
 from channel_protocol import scoped_conversation_id
 from channel_protocol.reply import ReplyAck, ReplyTarget
+from curie_channel_gateway.reply_errors import (
+    UnconfiguredSlackIdentityError,
+)
 from curie_test_support.postgres import pg_connect_or_skip
 from curie_worker.approval_cards import ApprovalCardRef
 from curie_worker.config import WorkerConfig
@@ -41,7 +44,6 @@ from curie_worker.publication_store import (
     PublicationStoreError,
 )
 from curie_worker.reply_sink import CLUSTER_MESSAGE_ADAPTER, TargetRoute, build_reply_sink
-from curie_worker.slack_sink import UnconfiguredSlackIdentityError
 from sqlalchemy import make_url, text
 from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
 from sqlalchemy.pool import NullPool
@@ -2240,19 +2242,25 @@ async def test_untokened_identity_card_delivery_retries_rather_than_dead_letters
     publication finally gives up.
     """
     loop, store, _, _, _, _ = _loop(publication, _Cards())
-    loop._replies = build_reply_sink(WorkerConfig(slack_bot_token=""))
+    from curie_test_support.channel_gateway import reply_gateway
+
     work = _card_work()
     work.route = TargetRoute(endpoint=None, adapter="ghost")
     store.card_pending = work
-
-    with pytest.raises(UnconfiguredSlackIdentityError):
-        await loop.deliver_pending_card()
+    with reply_gateway({}, "") as values:
+        sink = build_reply_sink(WorkerConfig(**values))
+        loop._replies = sink
+        try:
+            with pytest.raises(UnconfiguredSlackIdentityError):
+                await loop.deliver_pending_card()
+        finally:
+            await sink.aclose()
 
     assert store.card_delivery_permanent == [False]
     assert store.completed == {}
     assert len(store.card_delivery_retries) == 1
     _, error = store.card_delivery_retries[0]
-    assert "ghost" in error
+    assert error == "unconfigured_slack_identity"
 
 
 async def test_cluster_message_card_relay_outage_is_a_bounded_retry(

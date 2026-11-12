@@ -4,7 +4,7 @@ from typing import Literal
 
 from pydantic import BaseModel
 
-HookRunSource = Literal["schedule", "manual"]
+HookRunSource = Literal["schedule", "manual", "webhook"]
 ScheduleOutcome = Literal["ran", "deferred", "skipped", "blocked", "reclaimed", "failed"]
 # Closed set pinned by tests/vectors/hook-run-reasons.json. The worker Literal
 # is the other side. NULL means ran, in flight, or a row from before the column.

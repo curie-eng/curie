@@ -361,9 +361,10 @@ cat >"$LADDER_STUB_DIR/kubectl" <<'SH'
 set -euo pipefail
 
 expected_deployment="deployment/${LADDER_STUB_DEPLOYMENT:?}"
-if (( $# != 6 )) || [[ "$1" != "-n" ]] || [[ "$2" != "${LADDER_STUB_NAMESPACE:?}" ]] \
-  || [[ "$3" != "get" ]] || [[ "$4" != "$expected_deployment" ]] \
-  || [[ "$5" != "-o" ]] || [[ "$6" != "json" ]]; then
+if (( $# != 8 )) || [[ "$1" != "--context" ]] || [[ "$2" != "${LADDER_STUB_CONTEXT:?}" ]] \
+  || [[ "$3" != "-n" ]] || [[ "$4" != "${LADDER_STUB_NAMESPACE:?}" ]] \
+  || [[ "$5" != "get" ]] || [[ "$6" != "$expected_deployment" ]] \
+  || [[ "$7" != "-o" ]] || [[ "$8" != "json" ]]; then
   printf 'kubectl stub received an unexpected request: %q ' "$@" >&2
   printf '\n' >&2
   exit 64
@@ -445,12 +446,15 @@ PY
 # `!p;}`, because macOS's sed refuses a `}` straight after a command.
 run_ladder_reply_timeout() {
   local deployment_json="$1" stdout="$2" stderr="$3"
+  local context="fixture-context"
   PATH="$LADDER_STUB_DIR:$PATH" \
     LADDER_STUB_JSON="$deployment_json" \
+    LADDER_STUB_CONTEXT="$context" \
     LADDER_STUB_NAMESPACE="worker-budget-contract" \
     LADDER_STUB_DEPLOYMENT="curie-worker" \
     CURIE_NAMESPACE="worker-budget-contract" \
     CURIE_RELEASE="curie" \
+    KUBE_CONTEXT="$context" \
     bash -c '
       set -euo pipefail
       eval "$(sed -n "/^cluster_worker_deploy()/,/^probe_cluster_fake_model()/{/^probe_cluster_fake_model()/!p;}" "$1")"

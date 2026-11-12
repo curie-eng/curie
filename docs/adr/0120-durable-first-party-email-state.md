@@ -7,10 +7,10 @@ Status: Accepted
 Accepted with explicit maintainer approval on 2026-08-25 for issue #1515 and
 published alongside its implementation under
 [ADR-0102](0102-accepted-alongside-implementation-with-explicit-approval.md).
-Realizing code paths are `apps/mail-adapter/src/curie_mail_adapter/state.py` for
+Realizing code paths are `packages/channel-gateway/src/curie_channel_gateway/mail/state.py` for
 the SQLite transaction and recovery boundary,
-`apps/mail-adapter/src/curie_mail_adapter/adapter.py` and
-`apps/mail-adapter/src/curie_mail_adapter/egress.py` for durable ingress and
+`packages/channel-gateway/src/curie_channel_gateway/mail/adapter.py` and
+`packages/channel-gateway/src/curie_channel_gateway/mail/egress.py` for durable ingress and
 reply ownership, and `charts/curie/templates/mail-adapter.yaml` plus
 `charts/curie/templates/mail-adapter-persistence.yaml` for the one-writer RWO
 deployment.

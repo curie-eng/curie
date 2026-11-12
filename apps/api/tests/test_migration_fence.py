@@ -69,18 +69,25 @@ bounded so a hang FAILS rather than wedging CI.
 from __future__ import annotations
 
 import asyncio
+import io
 import json
 import time
 import uuid
+from collections.abc import Iterator
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any
 
+import asyncpg
 import pytest
 from _migration_support import IsolatedMigrationDb, alembic_config, sql_rows, stamped_revision
 from alembic import command
 from alembic.config import Config
+from alembic.script import ScriptDirectory
 from curie_api.config import get_settings
+from sqlalchemy import make_url
+from sqlalchemy.engine import URL
+from sqlalchemy.exc import ProgrammingError
 from sqlalchemy.ext.asyncio import create_async_engine
 from sqlalchemy.sql import text
 
@@ -123,6 +130,129 @@ PAUSE_SECONDS = 2.0
 # Every poll and every join in this file is bounded by this, so a fence that
 # never releases fails the test instead of hanging the run.
 BOUND_SECONDS = 20.0
+
+
+@pytest.fixture
+def migration_role(
+    isolated_migration_db: IsolatedMigrationDb, monkeypatch: pytest.MonkeyPatch
+) -> Iterator[URL]:
+    admin_url = make_url(get_settings().database_url)
+    role = f"migration_{uuid.uuid4().hex}"
+    quoted_database = '"' + str(admin_url.database).replace('"', '""') + '"'
+    try:
+        sql_rows(
+            f"CREATE ROLE {role} LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE "
+            "PASSWORD 'migration-test-password'"
+        )
+        sql_rows(f"REVOKE CREATE ON DATABASE {quoted_database} FROM PUBLIC")
+        sql_rows(f"REVOKE ALL ON DATABASE {quoted_database} FROM {role}")
+        sql_rows(f"GRANT CONNECT ON DATABASE {quoted_database} TO {role}")
+        yield admin_url.set(username=role, password="migration-test-password")
+    finally:
+        monkeypatch.setenv("DATABASE_URL", admin_url.render_as_string(hide_password=False))
+        get_settings.cache_clear()
+        sql_rows(f"DROP OWNED BY {role}")
+        sql_rows(f"DROP ROLE {role}")
+        assert not sql_rows("SELECT 1 FROM pg_roles WHERE rolname = :role", {"role": role})
+
+
+def _upgrade_as_role(url: URL, revision: str, mode: str) -> None:
+    config = alembic_config()
+    if mode == "online":
+        command.upgrade(config, revision)
+        return
+
+    output = io.StringIO()
+    config.output_buffer = output
+    command.upgrade(config, revision, sql=True)
+
+    async def execute_script() -> None:
+        conn = await asyncpg.connect(
+            url.set(drivername="postgresql").render_as_string(hide_password=False)
+        )
+        try:
+            await conn.execute(output.getvalue())
+        finally:
+            await conn.close()
+
+    asyncio.run(execute_script())
+
+
+@pytest.mark.parametrize("mode", ["online", "sql"])
+@pytest.mark.parametrize("schema_exists", [True, False])
+def test_migrations_run_as_schema_owner(
+    migration_role: URL,
+    monkeypatch: pytest.MonkeyPatch,
+    mode: str,
+    schema_exists: bool,
+) -> None:
+    role = migration_role.username
+    database = migration_role.database
+    if schema_exists:
+        sql_rows(f"CREATE SCHEMA curie AUTHORIZATION {role}")
+    else:
+        sql_rows(f'GRANT CREATE ON DATABASE "{database}" TO {role}')
+    monkeypatch.setenv("DATABASE_URL", migration_role.render_as_string(hide_password=False))
+    get_settings.cache_clear()
+    assert sql_rows(
+        "SELECT current_user, has_database_privilege(current_user, current_database(), 'CREATE')"
+    ) == [(role, not schema_exists)]
+    assert bool(sql_rows("SELECT 1 FROM pg_namespace WHERE nspname = 'curie'")) == schema_exists
+
+    revision = "head" if mode == "online" else "0001"
+    _upgrade_as_role(migration_role, revision, mode)
+
+    expected = ScriptDirectory.from_config(alembic_config()).get_current_head()
+    assert stamped_revision() == (expected if mode == "online" else "0001")
+    assert sql_rows(
+        "SELECT pg_get_userbyid(nspowner) FROM pg_namespace WHERE nspname = 'curie'"
+    ) == [(role,)]
+    assert sql_rows("SELECT count(*) FROM curie.agents") == [(0,)]
+    assert sql_rows(
+        "SELECT has_database_privilege(current_user, current_database(), 'CREATE')"
+    ) == [(not schema_exists,)]
+
+
+@pytest.mark.parametrize("mode", ["online", "sql"])
+def test_missing_schema_still_requires_database_create(
+    migration_role: URL, monkeypatch: pytest.MonkeyPatch, mode: str
+) -> None:
+    monkeypatch.setenv("DATABASE_URL", migration_role.render_as_string(hide_password=False))
+    get_settings.cache_clear()
+    error = ProgrammingError if mode == "online" else asyncpg.InsufficientPrivilegeError
+    with pytest.raises(error, match="permission denied for database"):
+        _upgrade_as_role(migration_role, "0001", mode)
+    assert not sql_rows("SELECT 1 FROM pg_namespace WHERE nspname = 'curie'")
+
+
+@pytest.mark.parametrize("mode", ["online", "sql"])
+@pytest.mark.parametrize("schema_exists", [True, False])
+def test_migration_schema_name_is_quoted(
+    migration_role: URL,
+    monkeypatch: pytest.MonkeyPatch,
+    mode: str,
+    schema_exists: bool,
+) -> None:
+    from curie_api import db
+
+    schema = "migration 'quoted\"\\$schema$"
+    quoted_schema = '"' + schema.replace('"', '""') + '"'
+    if schema_exists:
+        sql_rows(f"CREATE SCHEMA {quoted_schema} AUTHORIZATION {migration_role.username}")
+    else:
+        sql_rows(
+            f'GRANT CREATE ON DATABASE "{migration_role.database}" TO {migration_role.username}'
+        )
+    monkeypatch.setattr(db, "SCHEMA", schema)
+    monkeypatch.setenv("DATABASE_URL", migration_role.render_as_string(hide_password=False))
+    get_settings.cache_clear()
+
+    _upgrade_as_role(migration_role, "base", mode)
+
+    assert sql_rows(
+        "SELECT pg_get_userbyid(nspowner) FROM pg_namespace WHERE nspname = :schema",
+        {"schema": schema},
+    ) == [(migration_role.username,)]
 
 
 def _at(db: IsolatedMigrationDb, revision: str) -> Config:

@@ -7,6 +7,7 @@ synthetic inputs only. @spec HTTP-APPROVAL-CONTINUITY-8/10/11.
 
 from __future__ import annotations
 
+import hashlib
 import os
 import uuid
 from types import SimpleNamespace
@@ -41,6 +42,8 @@ from apps.api.tests.test_http_approval_resume import (
     with_stores,
 )
 from apps.api.tests.test_http_invocation_membership import synthetic_provider as synthetic_provider
+from apps.api.tests.test_http_turn_authority import assert_response, post_check
+from apps.api.tests.test_http_turn_authority import request_for as check_for
 
 
 def narrow_approver(case: SimpleNamespace) -> None:
@@ -179,3 +182,47 @@ def test_a_refused_publication_still_returns_the_committed_answer(
     row, _ = sealed_actor(case, "approved")
     assert row["resumed_at"] is None
     assert resumes(case, valkey, runs_stream) == []
+
+
+def test_an_approver_revoked_during_the_resume_check_never_continues(
+    published_case: SimpleNamespace, valkey: redis.Redis, runs_stream: str,
+) -> None:
+    """@spec HTTP-APPROVAL-CONTINUITY-8/12: both subjects meet in one final boundary.
+
+    The approver role narrows while the check's second lookup is in flight. A
+    retry for the original invoker alone must not carry the earlier approver
+    observation to a continue.
+    """
+    case = published_case
+    assert resolve(case, *answer(case)).status_code == 200
+    entry = resumes(case, valkey, runs_stream)[0]
+    turn = QueuedTurn.model_validate_json(entry["payload"])
+    request = check_for(case, stage="claim_or_resume")
+    request.update(
+        context=entry[CONTEXT_FIELD], event_id=turn.event_id, approval_id=str(case.row["id"]),
+        payload_sha256=hashlib.sha256(entry["payload"].encode("utf-8")).hexdigest(),
+    )
+    assert_response(
+        post_check(case.client, request), request,
+        decision="continue", reason="current_authority",
+    )
+
+    lookups = {"seen": 0}
+
+    def revoke_on_second_lookup() -> None:
+        """@spec HTTP-APPROVAL-CONTINUITY-8: a committed policy change outside SQL."""
+        lookups["seen"] += 1
+        if lookups["seen"] == 2:
+            narrow_approver(case)
+
+    case.provider.during_lookup = revoke_on_second_lookup
+    try:
+        racing = post_check(case.client, request)
+    finally:
+        case.provider.during_lookup = None
+    assert lookups["seen"] >= 2
+    assert racing.status_code == 200, racing.text
+    assert racing.json()["decision"] != "continue", racing.json()
+
+    after = post_check(case.client, request)
+    assert_response(after, request, decision="refuse", reason="caller_not_allowed")

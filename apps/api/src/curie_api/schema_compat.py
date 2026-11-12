@@ -27,6 +27,7 @@ import asyncpg  # type: ignore[import-untyped]
 from alembic import command
 from alembic.config import Config
 from alembic.script import ScriptDirectory
+from curie_internal.valkey import AsyncRedis
 from curie_protected_hooks.schema_serving import AppWindow, SchemaServingUnavailable, load_window
 from curie_protected_hooks.schema_serving import assert_servable as shared_assert_servable
 from curie_protected_hooks.schema_serving import can_serve as shared_can_serve
@@ -515,7 +516,7 @@ async def upgrade_with_pause(*, forward_only: bool) -> int:
             settings.installation_id,
             os.environ["CURIE_UPGRADE_LEGACY_QUIESCE"].lower() in {"1", "true", "yes"},
         )
-        redis = Redis.from_url(
+        redis = AsyncRedis.from_url(
             settings.valkey_dsn(),
             socket_connect_timeout=2,
             socket_timeout=2,

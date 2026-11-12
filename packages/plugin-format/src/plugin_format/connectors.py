@@ -51,6 +51,7 @@ from .reserved_env import SECRET_NAME_RE, is_reserved_boot_env_name
 # (the deploy validator, the approval-policy gate-name derivation, the API's
 # bundle reader) names one constant rather than its own copy of the string.
 CONNECTORS_FILE = "connectors.yaml"
+HOOK_WAKE_KEY_ENV: Final = "CURIE_HOOK_WAKE_KEY"
 
 # A connector name becomes a Kubernetes object name and a DNS label, so it is
 # held to the stricter of those: lowercase alphanumeric and dashes, starting and
@@ -161,6 +162,20 @@ class ConnectorResources(BaseModel):
     limits: ConnectorResourceQuantities | None = None
 
 
+class ConnectorScratch(BaseModel):
+    """A hosted connector's bounded writable scratch volume (#5415).
+
+    A disk-backed ``emptyDir`` with ``size_limit`` as its ``sizeLimit``,
+    mounted read-write at ``path`` on the server container alone. Both keys are
+    required: an unbounded scratch volume could fill the node's disk.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    path: str
+    size_limit: str
+
+
 # The server container's resources when a connector declares none. Owned here
 # rather than in the renderer so validation compares a declared request with
 # the limit it will actually run under.
@@ -223,6 +238,60 @@ def is_valid_readiness_path(text: str) -> bool:
         and "?" not in text
         and "#" not in text
     )
+
+
+# `scratch.size_limit`: whole bytes with an optional binary suffix, bounded.
+# Narrower than a Kubernetes quantity so the CLI's local tier, which must turn
+# it into a tmpfs size, reads it exactly as this module does; the shared
+# reading is tests/vectors/connector-scratch-size.json.
+_SCRATCH_SIZE_RE = re.compile(r"(?P<number>[1-9][0-9]*)(?P<suffix>Ki|Mi|Gi)?")
+_SCRATCH_SIZE_SCALE: Final[dict[str, int]] = {"": 1, "Ki": 2**10, "Mi": 2**20, "Gi": 2**30}
+SCRATCH_MIN_BYTES: Final = 2**20
+# Spool space on the node's ephemeral disk, not storage.
+SCRATCH_MAX_BYTES: Final = 64 * 2**30
+# Mounting over these would shadow the image's or the runtime's own files.
+SCRATCH_RESERVED_DIRS: Final = (
+    "/bin",
+    "/boot",
+    "/dev",
+    "/etc",
+    "/lib",
+    "/lib64",
+    "/proc",
+    "/run",
+    "/sbin",
+    "/sys",
+    "/usr",
+)
+_SCRATCH_SEGMENT_RE = re.compile(r"[A-Za-z0-9._-]+")
+
+
+def scratch_size_bytes(text: str) -> int | None:
+    """The bytes a ``scratch.size_limit`` means, or None when it is refused."""
+
+    match = _SCRATCH_SIZE_RE.fullmatch(text)
+    if match is None:
+        return None
+    size = int(match["number"]) * _SCRATCH_SIZE_SCALE[match["suffix"] or ""]
+    return size if SCRATCH_MIN_BYTES <= size <= SCRATCH_MAX_BYTES else None
+
+
+def _is_at_or_under(path: str, directory: str) -> bool:
+    return path == directory or path.startswith(directory + "/")
+
+
+def is_valid_scratch_path(text: str) -> bool:
+    """Whether ``text`` may be ``scratch.path``: a dedicated absolute directory."""
+
+    if not text.startswith("/") or text == "/":
+        return False
+    segments = text[1:].split("/")
+    if not all(
+        _SCRATCH_SEGMENT_RE.fullmatch(segment) is not None and segment not in {".", ".."}
+        for segment in segments
+    ):
+        return False
+    return not any(_is_at_or_under(text, reserved) for reserved in SCRATCH_RESERVED_DIRS)
 
 
 # ADR 0240 decision 1. The MCP path every hosted entry dials
@@ -332,6 +401,10 @@ class ConnectorSpec(BaseModel):
     # The server container's requests and limits, merged per key over
     # DEFAULT_SERVER_RESOURCES. None renders the defaults unchanged.
     resources: ConnectorResources | None = None
+
+    # A bounded writable volume for the server container (#5415). None mounts
+    # nothing writable, which keeps the render unchanged.
+    scratch: ConnectorScratch | None = None
 
     # -- remote form --
     url: str | None = None
@@ -674,6 +747,48 @@ def _escapes(path: str) -> bool:
     return False
 
 
+def _validate_scratch(
+    where: str, spec: ConnectorSpec, scratch: ConnectorScratch, errors: list[tuple[str, str]]
+) -> None:
+    if spec.url is not None:
+        errors.append(
+            (
+                "connectors.remote_has_scratch",
+                f"{where}: `scratch` mounts a volume into a container Curie starts; a `url` "
+                "connector is already running elsewhere, so it would mount nothing",
+            )
+        )
+        return
+    if not is_valid_scratch_path(scratch.path):
+        errors.append(
+            (
+                "connectors.bad_scratch_path",
+                f"{where}: scratch.path is {scratch.path!r}; it must be an absolute path of "
+                "letters, digits, `.`, `_`, `-` and `/` with no empty, `.` or `..` segment, "
+                f"not `/` and not at or under {', '.join(SCRATCH_RESERVED_DIRS)}",
+            )
+        )
+    else:
+        for name, mount in sorted(spec.secret_files.items()):
+            if _is_at_or_under(mount, scratch.path) or _is_at_or_under(scratch.path, mount):
+                errors.append(
+                    (
+                        "connectors.scratch_overlaps_secret_file",
+                        f"{where}: scratch.path {scratch.path} overlaps secret_files[{name}] "
+                        f"at {mount}; a credential does not belong in writable scratch space, "
+                        "and either mount would shadow the other",
+                    )
+                )
+    if scratch_size_bytes(scratch.size_limit) is None:
+        errors.append(
+            (
+                "connectors.bad_scratch_size",
+                f"{where}: scratch.size_limit is {scratch.size_limit!r}; it must be a whole "
+                "number of bytes with an optional Ki, Mi or Gi suffix, from 1Mi to 64Gi",
+            )
+        )
+
+
 def _validate_resources(
     where: str, spec: ConnectorSpec, resources: ConnectorResources, errors: list[tuple[str, str]]
 ) -> None:
@@ -759,6 +874,40 @@ def _validate_build(
                     "`os/arch/variant`, such as `linux/amd64` or `linux/arm/v7`",
                 )
             )
+
+
+def _validate_wake_key_role(where: str, spec: ConnectorSpec, errors: list[tuple[str, str]]) -> None:
+    if spec.bearer_secret == HOOK_WAKE_KEY_ENV:
+        errors.append(
+            ("connectors.wake_key_bearer", f"{where}: the wake key cannot be an MCP bearer")
+        )
+    invalid_secret = any(
+        (isinstance(secret, str) and secret == HOOK_WAKE_KEY_ENV)
+        or (
+            isinstance(secret, SecretRef)
+            and secret.name == HOOK_WAKE_KEY_ENV
+            and not spec.is_hosted
+        )
+        for secret in spec.secrets
+    )
+    expanded = [spec.url or "", spec.unhosted_url or "", *spec.headers.values()]
+    if spec.bearer_secret != HOOK_WAKE_KEY_ENV:
+        expanded.append(spec.bearer_secret or "")
+    if (
+        invalid_secret
+        or HOOK_WAKE_KEY_ENV in spec.secret_files
+        or HOOK_WAKE_KEY_ENV in spec.sealed_secrets
+        or HOOK_WAKE_KEY_ENV in spec.config
+        or HOOK_WAKE_KEY_ENV in spec.env
+        or any(HOOK_WAKE_KEY_ENV in text for text in expanded)
+    ):
+        errors.append(
+            (
+                "connectors.wake_key_delivery",
+                f"{where}: deliver the wake key only through a hosted secrets SecretRef; "
+                "it cannot enter client configuration or the per-agent secret store",
+            )
+        )
 
 
 def validate_connectors(data: Any) -> tuple[ConnectorsFile | None, list[tuple[str, str]]]:
@@ -1082,6 +1231,8 @@ def validate_connectors(data: Any) -> tuple[ConnectorsFile | None, list[tuple[st
                 )
             else:
                 _validate_resources(where, spec, spec.resources, errors)
+        if spec.scratch is not None:
+            _validate_scratch(where, spec, spec.scratch, errors)
         if spec.admits is not None and spec.url is not None:
             errors.append(
                 (
@@ -1165,9 +1316,16 @@ def validate_connectors(data: Any) -> tuple[ConnectorsFile | None, list[tuple[st
         # credential resolved from their environment or vault and handed to the
         # bundle's own container, and at the skill tier that happens before this
         # validator ever runs.
-        declared_names = [s if isinstance(s, str) else s.name for s in spec.secrets]
-        declared_names += list(spec.secret_files)
-        for declared_name in declared_names:
+        _validate_wake_key_role(where, spec, errors)
+        declared_names = [
+            (
+                s if isinstance(s, str) else s.name,
+                isinstance(s, SecretRef) and s.name == HOOK_WAKE_KEY_ENV and spec.is_hosted,
+            )
+            for s in spec.secrets
+        ]
+        declared_names += [(name, False) for name in spec.secret_files]
+        for declared_name, connector_only_wake_key in declared_names:
             if not SECRET_NAME_RE.match(declared_name):
                 errors.append(
                     (
@@ -1178,7 +1336,7 @@ def validate_connectors(data: Any) -> tuple[ConnectorsFile | None, list[tuple[st
                         "outside that shape can never bind",
                     )
                 )
-            elif is_reserved_boot_env_name(declared_name):
+            elif is_reserved_boot_env_name(declared_name) and not connector_only_wake_key:
                 errors.append(
                     (
                         "connectors.secret_name_reserved",

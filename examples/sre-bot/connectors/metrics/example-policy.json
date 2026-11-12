@@ -1,0 +1,45 @@
+{
+  "route": "sre-approvals",
+  "limits": {
+    "per_policy_per_hour": 3,
+    "per_incident_per_target": 1,
+    "incident_window_seconds": 3600,
+    "approval_ttl_seconds": 14400
+  },
+  "actions": [
+    {
+      "name": "restore-example-api",
+      "kind": "remediate",
+      "connector": "scaler",
+      "tool": "scale_deployment",
+      "arguments": {
+        "name": {"type": "string", "allowed": ["example-api"]},
+        "replicas": {"type": "integer", "minimum": 1, "maximum": 1}
+      },
+      "target": {"argument": "name", "allowed": ["example-api"]},
+      "reversibility": "reversible",
+      "precondition": {
+        "connector": "metrics",
+        "tool": "query_value",
+        "arguments": {"query": "max(kube_deployment_status_replicas_available{namespace=\"sre-demo\",deployment=\"example-api\"}) or vector(0)"},
+        "pointer": "/data/0/value/1",
+        "comparator": "lt",
+        "value": 1
+      },
+      "verifier": {
+        "connector": "metrics",
+        "tool": "query_value",
+        "arguments": {"query": "max(kube_deployment_status_replicas_available{namespace=\"sre-demo\",deployment=\"example-api\"}) or vector(0)"},
+        "pointer": "/data/0/value/1",
+        "comparator": "ge",
+        "value": 1,
+        "settle_seconds": 60,
+        "deadline_seconds": 600,
+        "interval_seconds": 60,
+        "consecutive": 2
+      },
+      "automatic": false,
+      "qualification": null
+    }
+  ]
+}

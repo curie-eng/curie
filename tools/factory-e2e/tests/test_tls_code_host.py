@@ -68,6 +68,7 @@ import tls_code_host
 # The sandbox claim kind the collector lists, as the kubectl resource argument.
 CLAIM_RESOURCE = "sandboxclaims" + ".extensions.agents.x-k8s.io"
 
+CONTEXT = "scratch-cluster"
 NAMESPACE = "test-factory-tls0001"
 IMAGE = "registry.example/curie-worker:sha-" + "c" * 40
 STUB_HOST = f"github-stub.{NAMESPACE}.svc.cluster.local"
@@ -210,7 +211,7 @@ def test_only_the_stub_container_mounts_the_state_volume() -> None:
 
 def _config() -> fe.FactoryConfig:
     return fe.FactoryConfig(
-        kube_context="k8",
+        kube_context=CONTEXT,
         app_id="51",
         installation_id=5501,
         private_key_file=Path("app.pem"),
@@ -376,9 +377,9 @@ def test_load_tls_config_needs_only_the_model_key_and_a_context(tmp_path: Path) 
         # Pointing at nothing must not matter: the tls path never reads it.
         "CURIE_FACTORY_APP_DIR": str(tmp_path / "absent"),
     }
-    config = tls_code_host.load_tls_config(env, context="k8")
+    config = tls_code_host.load_tls_config(env, context=CONTEXT)
     assert isinstance(config, fe.FactoryConfig)
-    assert config.kube_context == "k8"
+    assert config.kube_context == CONTEXT
     assert config.model_api_key == "test-model-key"
     assert config.app_id == "51"
     assert config.installation_id == 5501
@@ -387,13 +388,13 @@ def test_load_tls_config_needs_only_the_model_key_and_a_context(tmp_path: Path) 
 
 
 def test_load_tls_config_reads_the_context_from_the_environment() -> None:
-    env = {"CURIE_FACTORY_MODEL_API_KEY": "k", "CURIE_FACTORY_KUBE_CONTEXT": "k8"}
-    assert tls_code_host.load_tls_config(env, context=None).kube_context == "k8"
+    env = {"CURIE_FACTORY_MODEL_API_KEY": "k", "CURIE_FACTORY_KUBE_CONTEXT": CONTEXT}
+    assert tls_code_host.load_tls_config(env, context=None).kube_context == CONTEXT
 
 
 def test_load_tls_config_names_the_model_key_and_no_github_app_input() -> None:
     with pytest.raises(fe.ConfigError) as caught:
-        tls_code_host.load_tls_config({}, context="k8")
+        tls_code_host.load_tls_config({}, context=CONTEXT)
     message = str(caught.value)
     assert "CURIE_FACTORY_MODEL_API_KEY" in message
     for app_only in (
@@ -712,7 +713,7 @@ def test_main_refuses_tls_code_host_without_a_model_key_before_installing(
     monkeypatch.setattr(subprocess, "run", refuse)
     monkeypatch.setattr(subprocess, "Popen", refuse)
 
-    code = fe.main(["run", "--scenario", "tls-code-host", "--context", "k8"])
+    code = fe.main(["run", "--scenario", "tls-code-host", "--context", CONTEXT])
     err = capsys.readouterr().err
     assert code == fe.EXIT_CONFIG
     assert "tls-code-host" in err
@@ -751,7 +752,7 @@ def test_main_runs_tls_code_host_without_any_github_app_or_fixture_env(
 
     code: int | None
     try:
-        code = fe.main(["run", "--scenario", "tls-code-host", "--context", "k8"])
+        code = fe.main(["run", "--scenario", "tls-code-host", "--context", CONTEXT])
     except _Reached:
         code = None
     err = capsys.readouterr().err
@@ -908,7 +909,7 @@ class _FakePreflight:
     def __init__(self, record_status: str, workdir: Path) -> None:
         self.namespace = NAMESPACE
         self.workdir = workdir
-        self.config = types.SimpleNamespace(kube_context="k8")
+        self.config = types.SimpleNamespace(kube_context=CONTEXT)
         self.teardown = _FakeTeardown()
         self.labelled_at = 0.0
         self.record_status = record_status
@@ -963,7 +964,7 @@ def _collect(
     run.start_job_watch()
     assert len(watches) == 1
     argv = watches[0].argv
-    assert argv[:3] == ["kubectl", "--context", "k8"]
+    assert argv[:3] == ["kubectl", "--context", CONTEXT]
     assert argv[argv.index("-n") + 1] == fake.publication_namespace()
     for flag in ("--watch", "--output-watch-events"):
         assert flag in argv

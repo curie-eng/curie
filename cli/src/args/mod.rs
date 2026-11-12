@@ -66,6 +66,70 @@ pub(crate) struct ApprovalRecoveryArgs {
     pub(crate) recovery_key: Option<String>,
 }
 
+/// The connector requester identity flag on `<tier> approvals` (ADR 0270
+/// decision 1). A separate object from gates, routes and pending records, so it
+/// combines with none of their flags.
+#[derive(Args, Debug, Clone, Default)]
+pub(crate) struct RequesterIdentityArgs {
+    /// Show or set whether this agent's hosted connector calls carry the
+    /// verified human requester. `on` requires the tenant's HTTP identity
+    /// selection and an operator receiver registration listing one of the
+    /// agent's bindings. Experimental in this release: keep it off outside
+    /// test installs. When on, the agent's hosted connector caller tokens
+    /// carry the verified human requester. On a cluster install the connector
+    /// proxy verifies it and passes it to hosted connectors as
+    /// `X-Curie-Principal`; the local tier runs no caller proxy, so its
+    /// connectors never receive the requester. The worker replaces a sandbox
+    /// before serving a different requester, and a different person's message
+    /// that arrives during a live turn waits for that turn to end, for up to
+    /// the capacity wait budget (24 hours by default); a message still waiting
+    /// then ends without running. A person's turn runs for at
+    /// most the one-hour life of their connector credential, less the boot
+    /// grace and the sandbox claim time; a turn still working then is stopped
+    /// and reported as `requester-window`. Precondition: the api, the
+    /// worker and the agent's connector proxies must all run this release
+    /// (redeploy the agent if its connector proxies predate it); a partial
+    /// rollout refuses the agent's HTTP turns or connector calls.
+    #[arg(
+        long = "requester-identity",
+        value_name = "MODE",
+        value_enum,
+        conflicts_with_all = [
+            "gate", "clear", "list", "resolve", "reject", "note",
+            "mint_operator_principal", "mint_remediation_principal", "mint_console_login_code",
+            "route_resolution", "route_approvers", "routes_from", "list_routes", "clear_routes",
+            "report_identity", "recover", "reason", "recovery_key", "routes_expected_version",
+        ]
+    )]
+    pub(crate) requester_identity: Option<commands::RequesterIdentityMode>,
+    /// The connector requester identity version an on/off write compares
+    /// against, as `--requester-identity show` reports it. Omit to use the
+    /// version read from the agent just before the write.
+    #[arg(
+        long = "expected-version",
+        value_name = "N",
+        requires = "requester_identity",
+        value_parser = clap::value_parser!(u64).range(1..)
+    )]
+    pub(crate) expected_version: Option<u64>,
+}
+
+/// The route-write compare-and-set version on `<tier> approvals` (ADR 0271).
+/// Valid only beside a route write flag; the command refuses it otherwise.
+#[derive(Args, Debug, Clone, Default)]
+pub(crate) struct ApprovalRoutesVersionArgs {
+    /// The connector requester identity version a route write compares
+    /// against, as `--requester-identity show` reports it. Omit to use the
+    /// version read from the agent in the same command. Only valid with
+    /// --route-resolution, --route-approvers, --routes-from or --clear-routes.
+    #[arg(
+        long = "routes-expected-version",
+        value_name = "N",
+        value_parser = clap::value_parser!(u64).range(1..)
+    )]
+    pub(crate) routes_expected_version: Option<u64>,
+}
+
 #[derive(Args, Debug, Clone)]
 pub(crate) struct AgentTarget<T: TierDefaults> {
     /// Agent name or id.
@@ -1004,6 +1068,15 @@ pub(crate) struct Cli {
 
 #[derive(Subcommand)]
 pub(crate) enum Command {
+    /// Migrate a protected worker process.json from v1 to v2 offline.
+    MigrateProtectedProcess {
+        /// Directory containing the stopped worker's process.json.
+        #[arg(long)]
+        runtime_dir: PathBuf,
+        /// Private v2 channel_gateway JSON object.
+        #[arg(long)]
+        gateway_config: PathBuf,
+    },
     /// Scaffold a keyless first reply, using a saved or environment model credential when available.
     Try {
         /// Keep the standard scaffold in ./curie-demo for normal skill commands.

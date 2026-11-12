@@ -33,16 +33,21 @@ redefine them.
 ## Current contract
 
 A second implementation is an **ACI server**, an HTTP process serving eight required authenticated
-control routes (seven POSTs and `GET /v1/status`) plus two optional runner-private routes. The nine POST endpoints (`runner/src/curie_runner/server.py`, seven every
-server serves plus two optional runner-private routes, the executor route and the checkpoint route): `POST /v1/event` opens a
+control routes (seven POSTs and `GET /v1/status`) plus four optional runner-private routes. The 11 POST endpoints (`runner/src/curie_runner/server.py`, seven every
+server serves plus four optional runner-private routes: the executor route, the checkpoint route and the two UI evidence routes): `POST /v1/event` opens a
 turn, `POST /v1/steer` injects into the live turn (409 if none running),
 `POST /v1/interrupt` hard-stops it, `POST /v1/reset` discards the conversation so the
 next turn starts fresh (409 while a turn is active), `POST /v1/snapshot` captures a
 bounded managed-workspace snapshot for publication, `POST /v1/timeout` stops the
 exact open turn named by the event response epoch, and `POST /v1/turn-admit` grants or denies
 the exact waiting turn epoch; only in executor mode, the optional `POST /v1/execute` runs one
-connector action for the worker's executor, and the optional `POST /v1/checkpoint` captures the
-managed workspace against a worker-supplied trusted base commit. Two GETs sit alongside them and stay
+connector action for the worker's executor, the optional `POST /v1/checkpoint` captures the
+managed workspace against a worker-supplied trusted base commit, and the optional
+`POST /v1/ui-evidence/index` and `POST /v1/ui-evidence/image` return the validated index
+and the raw bytes of one indexed PNG from the gitignored `.curie/ui-evidence/` directory.
+The two evidence routes are bearer-authenticated, carry no ACI frame, answer `409` without a
+managed workspace and in executor mode, and a server without them answers `404`, which the
+worker records as unavailable evidence without changing publication. Two GETs sit alongside them and stay
 unauthenticated, `GET /healthz` and `GET /status`, because the chart's readiness probe
 sends no auth header. The eighth authenticated control route, `GET /v1/status`, returns
 the credential-free boot attestation (`session_id`, `sandbox_id`, `managed_workspace`,

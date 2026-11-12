@@ -90,7 +90,7 @@ pub(crate) fn capped(budget: Duration, deadline: Instant) -> Duration {
 }
 
 /// The shared prefix of every approval-card Approve action id
-/// (`curie_dispatcher.approval_actions`). Its presence in a captured Slack call
+/// (`curie_channel_gateway.slack.approval_actions`). Its presence in a captured Slack call
 /// body is the unambiguous signal that a turn parked awaiting approval and
 /// posted a card (#529).
 ///

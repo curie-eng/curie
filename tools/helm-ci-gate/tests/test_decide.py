@@ -425,8 +425,10 @@ def test_deep_aggregate_cli_refuses_a_wrong_kind_outcome(
 
 def test_workflow_triggers_are_unfiltered_on_both_releasable_branches():
     triggers = _workflow()[True]
+    # Maintenance backport branches cut from a release tag get the same proof.
+    expected = {"push": ["main", "next", "backport/**"], "pull_request": ["main", "next"]}
     for event in ("push", "pull_request"):
-        assert triggers[event]["branches"] == ["main", "next"]
+        assert triggers[event]["branches"] == expected[event]
         assert "paths" not in triggers[event]
         assert "paths-ignore" not in triggers[event]
     assert triggers["merge_group"] == {"types": ["checks_requested"]}

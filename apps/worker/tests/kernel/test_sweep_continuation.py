@@ -22,6 +22,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
+import pytest
 from aci_protocol import ErrorEvent, Final, SessionStatus, TextDelta
 from curie_worker.binding import BindingResolver
 from curie_worker.cron_loop import CronPassSummary, CronSchedulerLoop, _Target
@@ -1020,9 +1021,10 @@ def test_paused_first_fire_still_defers(make_hook_run, make_harness) -> None:
     asyncio.run(go())
 
 
-def test_targetless_budget_cut_is_unchanged(make_hook_run, make_harness) -> None:
+@pytest.mark.parametrize("source", ["schedule", "manual", "webhook"])
+def test_targetless_budget_cut_is_unchanged(make_hook_run, make_harness, source: str) -> None:
     async def go() -> None:
-        async with make_hook_run() as seed:
+        async with make_hook_run(source=source) as seed:
             # A targetless turn routes by the hook agent's active deployment
             # (#2963), so the agent needs one, resolved by the real resolver.
             deployment_id = uuid.uuid4()

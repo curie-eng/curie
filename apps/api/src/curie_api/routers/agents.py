@@ -48,8 +48,9 @@ from curie_api.schemas.channels import (
 from curie_api.schemas.deployments import ConnectorManifests
 from curie_api.schemas.versions import BundleFile, BundleFiles, VersionCreate, VersionOut
 
-from .. import bundles, deploy, hook_signing
+from .. import approver_tickets, bundles, deploy, hook_signing
 from ..action_forward import RESTORE_TOOL
+from ..approver_dm import dm_route
 from ..auth import require_api_key
 from ..config import get_settings
 from ..deps import SessionDep, StoreDep
@@ -232,6 +233,33 @@ async def create_agent(data: AgentCreate, session: SessionDep) -> AgentOut:
     # Reject oversized behavior packs (#936) before we touch the DB.
     if data.behavior_packs is not None:
         enforce_behavior_packs_size(data.behavior_packs)
+    # ADR 0271 decision 6: a route's separation is written only by the
+    # versioned, audited route write, and enabling it needs one of the agent's
+    # bindings in an operator receiver registration, which a binding created by
+    # this request cannot be.
+    if data.approval_routes is not None and any(
+        binding.separation is not None for binding in data.approval_routes.values()
+    ):
+        raise HTTPException(
+            status.HTTP_422_UNPROCESSABLE_ENTITY,
+            "separation cannot be set when an agent is created: create the agent, then "
+            "write it with PATCH approval_routes and approval_routes_expected_version",
+        )
+    # ADR 0272 decision 1: an approver_dm resolution needs the route's selector
+    # registration and a registered receiver, both judged only by the
+    # versioned PATCH route write.
+    if data.approval_routes is not None and any(
+        dm_route(binding) is not None for binding in data.approval_routes.values()
+    ):
+        raise HTTPException(
+            status.HTTP_422_UNPROCESSABLE_ENTITY,
+            {
+                "code": crud_agents.APPROVER_DM_STATIC_ROUTE,
+                "message": "an approver_dm resolution cannot be set when an agent is created: "
+                "create the agent, register its approver_ticket selector, then write the "
+                "route with PATCH approval_routes and approval_routes_expected_version",
+            },
+        )
     # name and repo_full_name are unique. A collision is a caller conflict (409),
     # not a server fault: catch the DB IntegrityError and map it, rather than
     # letting it bubble as an opaque 500. A non-unique violation (NOT NULL, FK)
@@ -306,7 +334,11 @@ async def get_hook_secret(
 
 @router.patch("/{agent_id}", response_model=AgentOut)
 async def update_agent(
-    agent_id: uuid.UUID, data: AgentUpdate, session: SessionDep, store: StoreDep
+    agent_id: uuid.UUID,
+    data: AgentUpdate,
+    session: SessionDep,
+    store: StoreDep,
+    request: Request,
 ) -> AgentOut:
     # No binding key here since ADR-0118: an agent may hold several bindings, so
     # "move the agent's channel" has no referent and the write surface is the
@@ -315,6 +347,31 @@ async def update_agent(
     agent = await crud_agents.get_agent(session, agent_id)
     if agent is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "agent not found")
+    # ADR 0270 decision 1 (@spec CONNECTOR-REQUESTER-1). The schema has already
+    # refused a flag write sharing the request with any other field, so this
+    # compare-and-set is the request's only write and returns before any other
+    # field block runs.
+    if "connector_requester_identity" in data.model_fields_set:
+        assert data.connector_requester_identity is not None
+        assert data.connector_requester_identity_expected_version is not None
+        try:
+            agent = await crud_agents.update_agent_connector_requester_identity(
+                session,
+                agent,
+                enabled=data.connector_requester_identity,
+                expected_version=data.connector_requester_identity_expected_version,
+                runtime=getattr(request.app.state, "http_identity_runtime", None),
+            )
+        except crud_agents.RequesterIdentityRefused as exc:
+            raise HTTPException(
+                status.HTTP_422_UNPROCESSABLE_ENTITY, {"code": exc.code, "message": str(exc)}
+            ) from exc
+        except crud_agents.RequesterIdentityConflict as exc:
+            raise HTTPException(
+                status.HTTP_409_CONFLICT,
+                {"code": crud_agents.REQUESTER_IDENTITY_VERSION_CONFLICT, "message": str(exc)},
+            ) from exc
+        return AgentOut.model_validate(agent)
     # The declared/bound approval-route join, judged BEFORE the first mutation
     # (#2436). A write to `approval_routes` is a full replacement (`--route`,
     # `--routes-from` and `--clear-routes` all replace the whole map), so
@@ -337,7 +394,31 @@ async def update_agent(
     # single fetch.
     if data.approval_routes is not None:
         proposed = {name: b.model_dump() for name, b in data.approval_routes.items()}
-        for version in await crud_deployments.list_active_deployment_versions(session, agent_id):
+        # ADR 0272 decision 1: refuse an undeliverable approver_dm resolution
+        # early too, in the order the locked write judges it, which repeats the
+        # check authoritatively under the agent row lock.
+        try:
+            await crud_agents.check_approver_dm_routes(
+                session, agent, proposed,
+                runtime=getattr(request.app.state, "http_identity_runtime", None),
+            )
+        except crud_agents.ApprovalRoutesRefused as exc:
+            raise HTTPException(exc.status, {"code": exc.code, "message": str(exc)}) from exc
+        # ADR 0271 decision 1: refuse a selector write early, before any field
+        # commits; `update_agent_approval_routes` repeats the version checks
+        # under the agent row lock, where they are authoritative.
+        _preflight_selector_write(agent, data, proposed)
+        versions = await crud_deployments.list_active_deployment_versions(session, agent_id)
+        if not versions and approver_tickets.has_selector(proposed):
+            raise HTTPException(
+                status.HTTP_422_UNPROCESSABLE_ENTITY,
+                {
+                    "code": approver_tickets.NO_SERVING_BUNDLE,
+                    "message": "an approver_ticket registration needs at least one active "
+                    "deployment whose bundle gates the registered connector tool on its route",
+                },
+            )
+        for version in versions:
             try:
                 await deploy.check_approval_route_bindings(store, version, proposed)
             except deploy.BundleTooLarge as exc:
@@ -351,6 +432,10 @@ async def update_agent(
                 raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, str(exc)) from exc
             except deploy.ApprovalRoutesUnbound as exc:
                 raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, str(exc)) from exc
+            except approver_tickets.BundleGateMismatch as exc:
+                raise HTTPException(
+                    status.HTTP_422_UNPROCESSABLE_ENTITY, {"code": exc.code, "message": str(exc)}
+                ) from exc
     # Same preflight shape (#3209). The helpers below each commit on their own,
     # so a quota refusal after `model` or `thinking` would persist those fields
     # on a request this handler answered 422.
@@ -376,6 +461,17 @@ async def update_agent(
     # on. Both nullable overrides get it -- they are the same seam, and fixing
     # one beside the other would leave the sibling broken on an adjacent line.
     sent = data.model_fields_set
+    if "factory_slack_channel" in sent:
+        # First among the writes: each helper commits on its own, so a refusal
+        # here leaves no other field of this request persisted.
+        try:
+            agent = await crud_agents.update_agent_factory_slack_channel(
+                session, agent, data.factory_slack_channel
+            )
+        except crud_agents.FactorySlackChannelUnbound:
+            raise HTTPException(
+                status.HTTP_409_CONFLICT, {"code": "factory_slack_channel_unbound"}
+            ) from None
     if "model" in sent:
         agent = await crud_agents.update_agent_model(session, agent, data.model)
     if "reviewer_model" in sent:
@@ -410,11 +506,16 @@ async def update_agent(
         # Only the write: the preflight at the top of this handler has already
         # judged this same map against every active deployment's declared routes
         # (#2436), because by here four other fields are already committed.
-        agent = await crud_agents.update_agent_approval_routes(
-            session,
-            agent,
-            {name: b.model_dump() for name, b in data.approval_routes.items()},
-        )
+        try:
+            agent = await crud_agents.update_agent_approval_routes(
+                session,
+                agent,
+                {name: b.model_dump() for name, b in data.approval_routes.items()},
+                expected_version=data.approval_routes_expected_version,
+                runtime=getattr(request.app.state, "http_identity_runtime", None),
+            )
+        except crud_agents.ApprovalRoutesRefused as exc:
+            raise HTTPException(exc.status, {"code": exc.code, "message": str(exc)}) from exc
     if data.repo_full_name is not None:
         # Binds this agent to a repository so git-flow can route pushes to it
         # (ADR-0091). Several agents may share one, so this cannot collide.
@@ -459,6 +560,43 @@ async def update_agent(
                 },
             ) from exc
     return AgentOut.model_validate(agent)
+
+
+def _preflight_selector_write(agent: Agent, data: AgentUpdate, proposed: dict[str, Any]) -> None:
+    """The early half of the ADR 0271 route write checks, against the loaded row.
+
+    Version presence and equality, then one owning route per connector tool,
+    all before the bundle gate and before any sibling field could commit. A
+    selector or a ``separation`` on either side makes the write versioned.
+    """
+
+    expected = data.approval_routes_expected_version
+    versioned = approver_tickets.needs_configuration_version(agent.approval_routes) or (
+        approver_tickets.needs_configuration_version(proposed)
+    )
+    if versioned and expected is None:
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            {
+                "code": approver_tickets.EXPECTED_VERSION_REQUIRED,
+                "message": "this route map write involves an approver_ticket selector or a "
+                "separation: send approval_routes_expected_version",
+            },
+        )
+    if expected is not None and expected != agent.connector_requester_identity_version:
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            {
+                "code": approver_tickets.VERSION_CONFLICT,
+                "message": f"approval_routes_expected_version {expected} is not the stored "
+                f"configuration version {agent.connector_requester_identity_version}",
+            },
+        )
+    assert data.approval_routes is not None
+    try:
+        approver_tickets.check_pair_conflicts(data.approval_routes)
+    except approver_tickets.ApproverTicketRefusal as exc:
+        raise HTTPException(exc.status, {"code": exc.code, "message": str(exc)}) from exc
 
 
 @router.delete("/{agent_id}", status_code=status.HTTP_204_NO_CONTENT)

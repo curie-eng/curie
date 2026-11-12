@@ -4,6 +4,17 @@ Date: 2026-09-27
 
 Status: Accepted
 
+**Partially amended by [ADR 0271](0271-per-request-approver-sets-and-separation-of-duties.md)**
+(back link added under [ADR 0045](0045-the-status-line-is-the-mutable-part-of-an-immutable-adr.md)):
+ADR 0271 extends decisions 5 and 6 with the proxy-only spent-grant id and its
+connector trust rule.
+
+**Partially amended by [ADR 0270](0270-hosted-connectors-receive-the-verified-requester-as-a-signed-caller-claim.md)**
+(back link added under [ADR 0045](0045-the-status-line-is-the-mutable-part-of-an-immutable-adr.md)):
+ADR 0270 changes decision 2's non-work-item byte promise, decision 3's
+requester-token lifetime, decision 4's closed claims and decision 5's
+identity-header projection, only for the opted-in capability.
+
 **Amended by [ADR-0229](0229-a-hosted-connector-may-declare-the-host-the-caller-proxy-presents-upstream.md)**
 (back-link added under [ADR-0045](0045-the-status-line-is-the-mutable-part-of-an-immutable-adr.md)):
 0229 amends decision 5 so a hosted connector may declare the `Host` its caller

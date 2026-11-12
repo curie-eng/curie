@@ -38,13 +38,16 @@ EXPIRES = datetime(2027, 1, 31, tzinfo=UTC)
 DC_API_URL = "https://bitbucket-dc.example.invalid/bitbucket"
 
 # Decision 3: every mandatory operation supported; diagnostics, rerun and the
-# write check unsupported on both kinds.
+# write check unsupported on both kinds, as is UI evidence hosting.
 EXPECTED_CAPABILITIES = {
     **dict.fromkeys(CODE_HOST_OPERATIONS, Support.SUPPORTED),
     Operation.CI_DIAGNOSTICS: Support.UNSUPPORTED,
     Operation.RERUN_FAILED: Support.UNSUPPORTED,
     Operation.USER_CAN_WRITE: Support.UNSUPPORTED,
     Operation.REQUIRED_CHECKS: Support.UNSUPPORTED,
+    # UI evidence hosting is GitHub only: both kinds declare it unsupported.
+    Operation.STORE_EVIDENCE: Support.UNSUPPORTED,
+    Operation.DELETE_EVIDENCE: Support.UNSUPPORTED,
 }
 
 KINDS = [
@@ -96,8 +99,10 @@ def test_bitbucket_config_jira_pairs_and_github_refuses(kind: str) -> None:
 @pytest.mark.parametrize("kind", KINDS)
 def test_bitbucket_config_capabilities_are_exact(kind: str) -> None:
     adapter = _adapter(_entry(kind))
+    # Code host account login reads are GitHub only (#5414).
+    expected = {**EXPECTED_CAPABILITIES, Operation.ACCOUNT_LOGIN: Support.UNSUPPORTED}
 
-    assert dict(adapter.capabilities) == EXPECTED_CAPABILITIES
+    assert dict(adapter.capabilities) == expected
     assert dict(adapter.marked_comments.capabilities) == dict.fromkeys(
         MARKED_COMMENT_OPERATIONS, Support.SUPPORTED
     )

@@ -21,6 +21,9 @@ from typing import cast
 
 import httpx
 from aci_protocol.turn import SLACK_KIND
+from curie_channel_gateway.read_errors import ChannelReadRefused
+from curie_channel_gateway.read_models import BindingRoute, ProviderPage, ResolvedWindow
+from curie_channel_gateway.read_transport import RemoteChannelReader
 from curie_internal.channel_read_ledger import turn_key
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -28,7 +31,7 @@ from starlette.concurrency import run_in_threadpool
 
 from .. import bundles
 from ..config import Settings
-from ..identities import slack_bot_tokens
+from ..identities import gateway_client
 from ..models import AgentChannel, AgentVersion, Approval, Deployment
 from ..resumequeue import parse_resume_event_id
 from ..schemas.channel_read import (
@@ -41,16 +44,13 @@ from ..schemas.channel_read import (
 )
 from ..storage import ObjectStore
 from . import token as capability
-from .errors import ChannelReadRefused
 from .ledger import ChannelReadLedger
 from .provider_guard import ProviderGuard
-from .readers import BindingRoute, ChannelReader, ProviderPage, reader_for
-from .slack_reads import SlackChannelReader
+from .readers import ChannelReader, reader_for
 from .token import ChannelPair, ChannelReadClaims, GrantName
 from .window import (
     CursorState,
     Operation,
-    ResolvedWindow,
     mint_cursor,
     reconcile,
     resolve_limit,
@@ -65,7 +65,8 @@ _NO_GRANT = "the bundle grants no channel read or canvas operation"
 def channel_readers(settings: Settings, http: httpx.AsyncClient) -> Mapping[str, ChannelReader]:
     """Every readable surface, keyed by binding kind."""
 
-    return {SLACK_KIND: SlackChannelReader(http, slack_bot_tokens(settings))}
+    client = gateway_client(settings, http)
+    return {SLACK_KIND: RemoteChannelReader(client)}
 
 
 # The platform Slack grants a stored bundle declares, keyed by its digest. The

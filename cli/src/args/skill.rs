@@ -272,4 +272,22 @@ pub(crate) enum SkillHookAction {
     Schedule,
     /// Not available at this tier: there is no hook run record.
     Record,
+    /// Not available at this tier: there is no durable wake key.
+    #[command(subcommand_precedence_over_arg = true, subcommand_negates_reqs = true)]
+    WakeKey {
+        #[command(subcommand)]
+        command: Option<SkillWakeKeyCommand>,
+        /// Trigger name.
+        name: Option<String>,
+    },
+}
+
+/// `skill hook wake-key rotate`.
+#[derive(Subcommand)]
+pub(crate) enum SkillWakeKeyCommand {
+    /// Not available at this tier: there is no durable wake key.
+    Rotate {
+        /// Trigger name.
+        name: String,
+    },
 }

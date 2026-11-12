@@ -126,6 +126,10 @@
         {
           "field": "created_at",
           "why": "No CLI verb prints an agent's creation timestamp; the deploy summary and lifecycle verbs render id/name/channel only."
+        },
+        {
+          "field": "factory_slack_channel",
+          "why": "No CLI verb reads an agent's factory Slack progress channel; it is set through the agent API PATCH, so no agent response consumer reads it."
         }
       ]
     },
@@ -160,6 +164,56 @@
       "omissions": []
     },
     {
+      "struct": "ApproverTicketResponse",
+      "schema": "ApproverTicketOut",
+      "omissions": []
+    },
+    {
+      "struct": "ApproverCeilingResponse",
+      "schema": "ApproverTicketCeilingOut",
+      "omissions": []
+    },
+    {
+      "struct": "ApproverUserResponse",
+      "schema": "ApproverTicketCeilingUserOut",
+      "omissions": []
+    },
+    {
+      "struct": "ApprovalSeparationResponse",
+      "schema": "ApprovalSeparationOut",
+      "omissions": []
+    },
+    {
+      "struct": "ExemptGroupResponse",
+      "schema": "ApprovalExemptGroupOut",
+      "omissions": []
+    },
+    {
+      "struct": "ApproverTicketWrite",
+      "schema": "ApproverTicketRegistration",
+      "omissions": []
+    },
+    {
+      "struct": "ApproverCeilingWrite",
+      "schema": "ApproverTicketCeiling",
+      "omissions": []
+    },
+    {
+      "struct": "ApproverUserWrite",
+      "schema": "ApproverTicketCeilingUser",
+      "omissions": []
+    },
+    {
+      "struct": "ApprovalSeparationWrite",
+      "schema": "ApprovalSeparation",
+      "omissions": []
+    },
+    {
+      "struct": "ExemptGroupWrite",
+      "schema": "ApprovalExemptGroup",
+      "omissions": []
+    },
+    {
       "struct": "ApprovalResolutionTargetResponse",
       "schema": "ApprovalTargetOut",
       "omissions": []
@@ -167,6 +221,11 @@
     {
       "struct": "RequestingSurfaceTargetResponse",
       "schema": "ApprovalRequestingSurfaceTargetOut",
+      "omissions": []
+    },
+    {
+      "struct": "ApproverDmTargetResponse",
+      "schema": "ApprovalApproverDmTargetOut",
       "omissions": []
     },
     {
@@ -192,6 +251,11 @@
     {
       "struct": "RequestingSurfaceTargetWrite",
       "schema": "ApprovalRequestingSurfaceTarget",
+      "omissions": []
+    },
+    {
+      "struct": "ApproverDmTargetWrite",
+      "schema": "ApprovalApproverDmTarget",
       "omissions": []
     },
     {
@@ -524,6 +588,16 @@
       "struct": "RemediationVerifierRunOut",
       "schema": "RemediationVerifierRunOut",
       "omissions": []
+    },
+    {
+      "struct": "HookWakeSecret",
+      "schema": "HookWakeSecretOut",
+      "omissions": []
+    },
+    {
+      "struct": "HookWakeRotation",
+      "schema": "HookWakeRotationOut",
+      "omissions": []
     }
   ],
   "non_mirrors": [
@@ -617,6 +691,10 @@
       "struct": "AgentUpdate",
       "schema": "AgentUpdate",
       "omissions": [
+        {
+          "field": "factory_slack_channel",
+          "why": "The factory Slack progress channel is set through the agent API PATCH directly; no CLI verb sends it."
+        },
         {
           "field": "deploy_notifications",
           "why": "No CLI verb toggles deploy notices; the opt-in is set through the agent API directly, so a CLI PATCH never carries it."
@@ -770,6 +848,37 @@
       "struct": "DirectoryTeamIn",
       "schema": "DirectoryTeamIn",
       "omissions": []
+    },
+    {
+      "struct": "AuthoritySelectionMutation",
+      "schema": "AuthoritySelectionMutation"
+    },
+    {
+      "struct": "AuthorityMutation",
+      "schema": "AuthorityMutation"
+    },
+    {
+      "struct": "OperatorMutation",
+      "schema": "OperatorMutation"
+    },
+    {
+      "struct": "GroupFilterMutation",
+      "schema": "GroupFilterMutation"
+    },
+    {
+      "struct": "HttpSelectionV1",
+      "schema": "HttpSelectionV1",
+      "omissions": []
+    },
+    {
+      "struct": "CredentialReferenceV1",
+      "schema": "CredentialReferenceV1",
+      "omissions": []
+    },
+    {
+      "struct": "GroupV1",
+      "schema": "GroupV1",
+      "omissions": []
     }
   ],
   "requests": [
@@ -906,6 +1015,12 @@
       "path": "/agents/{agent_id}"
     },
     {
+      "function": "set_connector_requester_identity",
+      "struct": "AgentUpdate",
+      "method": "patch",
+      "path": "/agents/{agent_id}"
+    },
+    {
       "function": "trigger_eval",
       "struct": "EvalTriggerRequest",
       "method": "post",
@@ -970,6 +1085,36 @@
       "struct": "DirectoryTeamIn",
       "method": "post",
       "path": "/directory/teams"
+    },
+    {
+      "function": "adopt_http_authority",
+      "struct": "AuthoritySelectionMutation",
+      "method": "put",
+      "path": "/identity/authorities/{tenant_id}"
+    },
+    {
+      "function": "replace_http_authority",
+      "struct": "AuthoritySelectionMutation",
+      "method": "post",
+      "path": "/identity/authorities/{tenant_id}/replace"
+    },
+    {
+      "function": "retire_http_authority",
+      "struct": "AuthorityMutation",
+      "method": "post",
+      "path": "/identity/authorities/{tenant_id}/retire"
+    },
+    {
+      "function": "set_http_role_filter",
+      "struct": "GroupFilterMutation",
+      "method": "put",
+      "path": "/identity/roles/{tenant_id}/{agent_id}/{role}"
+    },
+    {
+      "function": "remove_http_role_filter",
+      "struct": "OperatorMutation",
+      "method": "delete",
+      "path": "/identity/roles/{tenant_id}/{agent_id}/{role}"
     }
   ],
   "_emits_comment": "The second, emit-hop gate (#699): a CliOutput::to_json can hand-project one of the mirror structs above into a serde_json::json! literal and drop a field the struct-level gate already proved it carries (the named drift was VersionsOutput dropping Version.id, fixed in #691). Each entry below declares that a specific `output` type's to_json projects a specific mirror `struct`, and every allowlisted omission needs a consumer-derived justification just like the mirrors list above. Check with: curie dev emit-parity. This is a narrower gate than the struct-level one: it verifies every DECLARED (output, struct) pair stays honest, but (unlike mirrors' UndeclaredStruct check) it cannot discover a NEW projection on its own -- see cli/tests/support/emit_parity.rs's module doc for why that reach is out of scope for a syntax-only check.",
@@ -998,7 +1143,9 @@
         {"field": "publication_policy", "why": "Publication policy has its own operator command."},
         {"field": "publication_policy_version", "why": "Publication policy has its own operator command."},
         {"field": "publication_draft", "why": "Publication policy has its own operator command."},
-        {"field": "publication_branch_prefix", "why": "Publication policy has its own operator command."}
+        {"field": "publication_branch_prefix", "why": "Publication policy has its own operator command."},
+        {"field": "connector_requester_identity", "why": "The connector requester identity flag belongs to approvals --requester-identity."},
+        {"field": "connector_requester_identity_version", "why": "The connector requester identity flag belongs to approvals --requester-identity."}
       ]
     },
     {
@@ -1110,6 +1257,14 @@
         {
           "field": "source_bindings",
           "why": "Hook configuration has its own operator command. The overrides command changes model behavior only."
+        },
+        {
+          "field": "connector_requester_identity",
+          "why": "The connector requester identity flag has its own verb, approvals --requester-identity (ADR 0270 decision 1). Emitting it from overrides would imply that verb can change it."
+        },
+        {
+          "field": "connector_requester_identity_version",
+          "why": "The connector requester identity flag has its own verb, approvals --requester-identity (ADR 0270 decision 1). Emitting it from overrides would imply that verb can change it."
         }
       ]
     },

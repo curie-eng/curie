@@ -19,7 +19,7 @@ import pytest
 import redis
 from curie_api import identity_fence
 from curie_api.config import get_settings
-from curie_dispatcher import admission
+from curie_channel_gateway.slack import admission
 
 DEFAULT = "curie:identity:admission-fence"
 
@@ -138,10 +138,10 @@ def test_namespace_installation_is_pure_nested_and_restores_exact_prior_values(
     assert dict(os.environ) == environment and get_settings() is settings
 
 
-def test_copied_child_environment_and_actual_factory_agree(
+def test_copied_child_environment_preserves_explicit_inputs(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """@spec IDENTITY-WRITER-LIFETIME-V1-10. Actual create_app and child imports share the key."""
+    """@spec IDENTITY-WRITER-LIFETIME-V1-10. Copy only the supplied environment."""
     overlay = helper("fence_child_env")
     monkeypatch.setenv("FENCE_PROBE_UNRELATED_AMBIENT", "must-not-copy")
     assert set(overlay({}, "curie:test:synthetic-child")) == {
@@ -158,28 +158,26 @@ def test_copied_child_environment_and_actual_factory_agree(
         str(Path(__file__).resolve().parent),
         "synthetic-existing-path",
     ]
-    env = overlay(import_env(), identity_fence.FENCE_KEY)
-    code = (
-        "import json,identity_fence_support as h;from curie_api import identity_fence as w;"
-        "from curie_dispatcher import admission as r;from fastapi import FastAPI;"
-        "from curie_api.main import create_app;baseline=create_app();"
-        "app=h.create_namespaced_app();"
-        "print(json.dumps([w.FENCE_KEY,r.IDENTITY_FENCE_KEY,"
-        "isinstance(app,FastAPI) and app.openapi()==baseline.openapi()]))"
-    )
-    result = subprocess.run(
-        [sys.executable, "-c", code],
-        env=env,
-        capture_output=True,
-        text=True,
-        timeout=15,
-        check=True,
-    )
-    assert json.loads(result.stdout) == [
-        identity_fence.FENCE_KEY,
-        admission.IDENTITY_FENCE_KEY,
-        True,
-    ]
+
+
+def test_namespaced_factory_preserves_authority_and_schema(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """@spec IDENTITY-WRITER-LIFETIME-V1-10. Real factory, paired authority and full schema."""
+    from curie_api.main import create_app
+    from fastapi import FastAPI
+
+    key = "curie:test:synthetic-child"
+    env = helper("fence_child_env")({}, key)
+    monkeypatch.setenv("CURIE_TEST_IDENTITY_FENCE_KEY", env["CURIE_TEST_IDENTITY_FENCE_KEY"])
+    monkeypatch.setattr(identity_fence, "FENCE_KEY", "curie:test:prior-writer")
+    monkeypatch.setattr(admission, "IDENTITY_FENCE_KEY", "curie:test:prior-reader")
+    baseline = create_app()
+    app = helper("create_namespaced_app")()
+
+    assert isinstance(app, FastAPI)
+    assert (identity_fence.FENCE_KEY, admission.IDENTITY_FENCE_KEY) == (key, key)
+    assert app.openapi() == baseline.openapi()
 
 
 def test_fresh_unmodified_imports_and_missing_child_key_preserve_wire_defaults() -> None:
@@ -188,7 +186,7 @@ def test_fresh_unmodified_imports_and_missing_child_key_preserve_wire_defaults()
     env.pop("CURIE_TEST_IDENTITY_FENCE_KEY", None)
     code = (
         "import json,identity_fence_support;from curie_api import identity_fence as w;"
-        "from curie_dispatcher import admission as r;"
+        "from curie_channel_gateway.slack import admission as r;"
         "print(json.dumps([w.FENCE_KEY,r.IDENTITY_FENCE_KEY]))"
     )
     result = subprocess.run(

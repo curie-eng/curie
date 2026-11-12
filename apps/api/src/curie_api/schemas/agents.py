@@ -459,6 +459,91 @@ def _reject_null_publication_switches(data: Any) -> Any:
     return data
 
 
+REQUESTER_IDENTITY_WRITE = frozenset(
+    {"connector_requester_identity", "connector_requester_identity_expected_version"}
+)
+# The flag column is INTEGER and every accepted write stores expected + 1.
+MAX_REQUESTER_IDENTITY_EXPECTED_VERSION = 2_147_483_646
+
+
+def _requester_identity_write_shape(update: "AgentUpdate") -> "AgentUpdate":
+    """One complete, solitary flag write (ADR 0270 decision 1).
+
+    The flag and the version it expects travel together, both non-null, and
+    nothing else rides in the same PATCH: every other field block in
+    ``update_agent`` commits on its own, so a flag write beside one could leave
+    that field persisted from a request answered with a refusal, or a losing
+    compare-and-set beside a winning sibling write. Refused here, before the
+    handler runs. @spec CONNECTOR-REQUESTER-1.
+    """
+
+    sent = update.model_fields_set
+    named = sent & REQUESTER_IDENTITY_WRITE
+    if not named:
+        return update
+    if (
+        named != REQUESTER_IDENTITY_WRITE
+        or update.connector_requester_identity is None
+        or update.connector_requester_identity_expected_version is None
+    ):
+        raise ValueError(
+            "connector_requester_identity and connector_requester_identity_expected_version "
+            "are written together and neither may be null"
+        )
+    if sent - REQUESTER_IDENTITY_WRITE:
+        raise ValueError(
+            "requester_identity_write_must_be_alone: send connector_requester_identity and "
+            "its expected version in a PATCH of their own"
+        )
+    return update
+
+
+ROUTES_EXPECTED_VERSION = "approval_routes_expected_version"
+
+
+def _routes_expected_version_shape(update: "AgentUpdate") -> "AgentUpdate":
+    """The route map's expected configuration version travels only with it.
+
+    ADR 0271 decision 1: a selector route write compare-and-sets on
+    ``connector_requester_identity_version``. For the same reason as the flag
+    write above, nothing but ``approval_routes`` may share that PATCH: every
+    other field block commits on its own, so a sibling field could persist from
+    a request whose route write lost the compare-and-set. Explicit null is the
+    same as omitting it.
+    """
+
+    if update.approval_routes_expected_version is None:
+        return update
+    if update.approval_routes is None:
+        raise ValueError(
+            "approval_routes_expected_version is sent only with the approval_routes it guards"
+        )
+    if update.model_fields_set - {"approval_routes", ROUTES_EXPECTED_VERSION}:
+        raise ValueError(
+            "approval_routes_write_must_be_alone: send approval_routes and "
+            "approval_routes_expected_version in a PATCH of their own"
+        )
+    return update
+
+
+def _no_selector_at_creation(
+    value: "dict[str, ApprovalRouteBinding] | None",
+) -> "dict[str, ApprovalRouteBinding] | None":
+    """No approver_ticket on AgentCreate (ADR 0271 decision 1).
+
+    A new agent's requester identity flag is off, and a selector needs it on,
+    so a registration here could only ever be refused later at its first use.
+    """
+
+    if value is not None and any(b.approver_ticket is not None for b in value.values()):
+        raise ValueError(
+            "approver_ticket cannot be registered when an agent is created: the "
+            "agent's connector_requester_identity flag starts off. Create the agent, "
+            "enable the flag, then register the selector with PATCH approval_routes"
+        )
+    return value
+
+
 def _validate_publication_policy_value(value: str | None) -> str | None:
     if value is None:
         return None
@@ -530,6 +615,7 @@ class AgentCreate(BaseModel):
     _check_thinking = field_validator("thinking")(validate_thinking_override)
     _check_approval_tools = field_validator("approval_required_tools")(_validate_tool_names)
     _check_approval_routes = field_validator("approval_routes")(_validate_route_names)
+    _no_selector = field_validator("approval_routes")(_no_selector_at_creation)
     _check_secrets = field_validator("secrets")(_validate_secret_map)
     _check_hook_partitions = field_validator("hook_partitions")(_validate_hook_partitions)
     _check_source_bindings = field_validator("source_bindings")(_validate_source_bindings)
@@ -617,6 +703,25 @@ class AgentUpdate(BaseModel):
     publication_policy: Literal["approve", "auto"] | None = None
     publication_draft: bool | None = None
     publication_branch_prefix: str | None = None
+    # Whether this agent's connector calls carry the verified requester (ADR
+    # 0270 decision 1). Written only with the version last read, alone in its
+    # PATCH; explicit null is refused. Enabling also needs HTTP identity and a
+    # registered receiver, judged by the handler.
+    connector_requester_identity: Annotated[bool, Field(strict=True)] | None = None
+    connector_requester_identity_expected_version: (
+        Annotated[int, Field(strict=True, ge=1, le=MAX_REQUESTER_IDENTITY_EXPECTED_VERSION)] | None
+    ) = None
+    # The shared configuration version (ADR 0271 decision 1) the route map
+    # replacement expects: required when the stored or proposed map carries an
+    # ``approver_ticket`` selector, compared whenever sent, and sent only with
+    # ``approval_routes``.
+    approval_routes_expected_version: (
+        Annotated[int, Field(strict=True, ge=1, le=MAX_REQUESTER_IDENTITY_EXPECTED_VERSION)] | None
+    ) = None
+    # The Slack channel factory runs post progress to (#5414). Same three-way
+    # semantics as `reviewer_model`: omitted is unchanged, explicit null stops
+    # posting. A channel needs exactly one Slack binding of this agent there.
+    factory_slack_channel: Annotated[str, Field(pattern=r"^[CG][A-Z0-9]{6,}$")] | None = None
 
     _check_reviewer_model = field_validator("reviewer_model")(
         nullable_override_validator("reviewer_model", "a reviewer model id like 'claude-opus-5-5'")
@@ -640,6 +745,8 @@ class AgentUpdate(BaseModel):
     # same key stays required on `AgentCreate`.
     _reject_retired_channel_key = model_validator(mode="before")(_reject_retired_update_binding_key)
     _reject_null_publication = model_validator(mode="before")(_reject_null_publication_switches)
+    _requester_identity_alone = model_validator(mode="after")(_requester_identity_write_shape)
+    _routes_expected_version_alone = model_validator(mode="after")(_routes_expected_version_shape)
 
 
 class AgentOut(BaseModel):
@@ -683,6 +790,12 @@ class AgentOut(BaseModel):
     publication_policy_version: int = 1
     publication_draft: bool = False
     publication_branch_prefix: str | None = None
+    # ADR 0270 decision 1: the operator's requester identity flag and the
+    # version its next write must name.
+    connector_requester_identity: bool = False
+    connector_requester_identity_version: int = 1
+    # Null means factory runs post no Slack progress (#5414).
+    factory_slack_channel: str | None = None
     created_at: datetime
 
     @field_validator("secrets", mode="before")

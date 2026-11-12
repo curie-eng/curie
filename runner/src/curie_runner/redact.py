@@ -6,18 +6,22 @@ import base64
 import json
 import re
 from collections.abc import Collection, Iterable, Mapping
+from pathlib import Path
 from typing import Any, cast
 
 from aci_protocol import BootEnv
+from curie_internal.connector_endpoints import UPLOAD_TOKENS_FILE_ENV
 from curie_telemetry.bootstrap import _exporter_headers
 from curie_telemetry.redact import (
     REDACTION_BOUNDARIES,
     REDACTION_RULES,
     RedactingLogFilter,
     RedactionRule,
+    held_secret_literals,
     install_stdout_redaction,
     redact_span_attribute,
     redact_text,
+    register_held_secrets,
 )
 
 from .config import RunnerConfig
@@ -35,6 +39,22 @@ _ENV_REFERENCE = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)(?::-([^}]*))?\}")
 _CONTENT_FIELDS = frozenset(
     ("text", "message", "detail", "result", "approval_summary", "approval_display")
 )
+
+
+def _upload_token_values(path: str) -> set[str]:
+    try:
+        tokens = json.loads(Path(path).read_text(encoding="utf-8"))
+        if not isinstance(tokens, dict) or not all(
+            isinstance(name, str) and name and isinstance(token, str) and token
+            for name, token in tokens.items()
+        ):
+            raise ValueError
+    except (OSError, UnicodeError, ValueError):
+        raise ValueError(
+            f"{UPLOAD_TOKENS_FILE_ENV} must name a readable JSON map of connector names "
+            "to nonempty tokens; fix the claim token file before starting the runner"
+        ) from None
+    return set(tokens.values())
 
 
 def collect_held_secrets(
@@ -72,6 +92,8 @@ def collect_held_secrets(
     }
     names.discard(_CONNECTOR_SECRET_KEYS_ENV)
     values.update(value for env in sources for name in names if (value := env.get(name)))
+    for path in {env[UPLOAD_TOKENS_FILE_ENV] for env in sources if UPLOAD_TOKENS_FILE_ENV in env}:
+        values.update(_upload_token_values(path))
     otel_header_maps: list[dict[str, str]] = []
     if config.session.otel.headers is not None:
         otel_header_maps.append(
@@ -139,6 +161,7 @@ def collect_held_secrets(
                             _collect_header_value(values, normalized, expanded)
                 else:
                     _collect_header_value(values, normalized, raw)
+    register_held_secrets(values)
     return frozenset(values)
 
 
@@ -168,7 +191,6 @@ _BLOCK_BREAK = "\n\n"
 _MAX_REJECTED_BREAKS = 4
 # Encodings shorter than this match ordinary text. A 4 character value
 # encodes to 8 characters; shorter values stay exact matches only.
-_HELD_ENCODING_MIN_LENGTH = 8
 
 
 # @spec ACTION-EXECUTOR-9: the sealed envelope grammar, frozen in
@@ -209,23 +231,7 @@ def is_sealed_envelope(value: object) -> bool:
 
 
 def _held_literals(held_secrets: Collection[str]) -> tuple[str, ...]:
-    """Exact held values plus standard and URL-safe base64 of the longer ones."""
-
-    literals: set[str] = set()
-    for value in held_secrets:
-        if not value:
-            continue
-        literals.add(value)
-        encoded = value.encode()
-        for raw in (
-            base64.standard_b64encode(encoded),
-            base64.urlsafe_b64encode(encoded),
-        ):
-            text = raw.decode()
-            for form in (text, text.rstrip("=")):
-                if form and form != value and len(form) >= _HELD_ENCODING_MIN_LENGTH:
-                    literals.add(form)
-    return tuple(sorted(literals, key=lambda item: (-len(item), item)))
+    return held_secret_literals(held_secrets)
 
 
 class OutboundRedactor:
@@ -562,4 +568,5 @@ __all__ = [
     "install_stdout_redaction",
     "redact_span_attribute",
     "redact_text",
+    "register_held_secrets",
 ]

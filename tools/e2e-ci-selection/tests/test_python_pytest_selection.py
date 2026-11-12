@@ -113,6 +113,7 @@ DRY_RUN_FILE = "tools/factory-e2e/tests/test_c4_dry_run.py"
 SHARD_NEIGHBOR = "tools/factory-e2e/tests/test_c4_reinstall_publication.py"
 PRIVATE_IMPORT_STEP = "API private import boundaries"
 ALWAYS_RUN_PYTHON_STEPS = (
+    "Explicit kube-context policy",
     "Alembic revision gate",
     "Ruff",
     "Mypy",
@@ -353,7 +354,8 @@ def test_docs_only_path_runs_impact_readers(tmp_path: Path, path: str) -> None:
         "packages/aci-protocol/src/aci_protocol/wire.py",
         "apps/api/src/curie_api/main.py",
         "apps/worker/src/curie_worker/binding.py",
-        "apps/dispatcher/src/curie_dispatcher/app.py",
+        "packages/channel-gateway/src/curie_channel_gateway/slack/valkey.py",
+        "packages/channel-gateway/src/curie_channel_gateway/slack/app.py",
         "runner/src/curie_runner/session.py",
         "examples/tests/test_example.py",
         "cli/src/main.rs",
@@ -593,6 +595,7 @@ def test_static_job_holds_exactly_the_moved_gates_in_order() -> None:
         "Lockfile is up to date",
         "Sync workspace",
         PRIVATE_IMPORT_STEP,
+        "Explicit kube-context policy",
         "CLI pytest file list",
         *MOVED_STATIC_STEPS[1:4],
         # ADR 0232 (#4610) added this gate after the move.
@@ -1008,25 +1011,18 @@ def test_container_job_has_its_own_setup_without_a_shared_stack() -> None:
 
 @pytest.mark.parametrize(("deselect", "files"), CONTAINER_SELECTION_CASES)
 @pytest.mark.parametrize("selected", ["true", "false"])
-def test_container_job_and_aggregate_use_complete_deselect_tokens(
+def test_container_step_uses_complete_deselect_tokens(
     deselect: str, files: tuple[str, ...], selected: str
 ) -> None:
-    expressions = (
-        _python_job(CONTAINER_JOB)["if"],
-        _named_steps()["Require pytest outcome to match selection"]["env"]["CONTAINER_SELECTED"],
-    )
+    expressions = (_named_steps(CONTAINER_JOB)["Pytest"]["if"],)
     for expression in expressions:
         assert _selection_expression(expression, selected, deselect) == (
             selected == "true" and bool(files)
         )
 
 
-@pytest.mark.parametrize("copy", ["job", "aggregate"])
-def test_container_selection_guard_rejects_substring_membership(copy: str) -> None:
-    expression = (
-        _python_job(CONTAINER_JOB)["if"] if copy == "job" else
-        _named_steps()["Require pytest outcome to match selection"]["env"]["CONTAINER_SELECTED"]
-    )
+def test_container_selection_guard_rejects_substring_membership() -> None:
+    expression = _named_steps(CONTAINER_JOB)["Pytest"]["if"]
     assert _selection_expression(expression, "true", ",".join(CONTAINER_FILES)) is False
     mutated = re.sub(
         r"format\(\s*',\{0\},'\s*,\s*needs\.changes\.outputs\.pytest_deselect\s*\)",
@@ -1109,13 +1105,17 @@ def test_container_caller_follows_real_selection_for_pr_push_and_dispatch(
     assert completed.returncode == 0, completed.stderr
     selection = _outputs(output)
     assert selection["pytest_scope"] == scope
+    assert _selection_expression(
+        _named_steps(CONTAINER_JOB)["Pytest"]["if"],
+        selection["pytest"], selection["pytest_deselect"],
+    ) == bool(files)
     for expression in (
         _python_job(CONTAINER_JOB)["if"],
         _named_steps()["Require pytest outcome to match selection"]["env"]["CONTAINER_SELECTED"],
     ):
         assert _selection_expression(
             expression, selection["pytest"], selection["pytest_deselect"]
-        ) == bool(files)
+        ) == (selection["pytest"] == "true")
     if files:
         caller = tmp_path / "caller"
         caller.mkdir()
@@ -1128,6 +1128,39 @@ def test_container_caller_follows_real_selection_for_pr_push_and_dispatch(
         assert [path for path in argv if path in CONTAINER_FILES] == list(files)
 
 
+@pytest.mark.parametrize("exit_code", [0, 1])
+def test_commissioning_crash_case_is_required_without_a_shard_budget(
+    tmp_path: Path, exit_code: int
+) -> None:
+    step = _named_steps(CONTAINER_JOB)["Protected commissioning crash recovery"]
+    assert "if" not in step and not step.get("continue-on-error", False)
+    result, argv = _record_uv_step(tmp_path, step, environment={}, exit_code=exit_code)
+    assert result.returncode == exit_code
+    assert argv == [
+        "run", "python", "-m", "pytest", "-q", "-n", "0", "--durations=25",
+        "cli/tests/local/test_commissioning_claim_execution.py",
+    ]
+
+
+def test_commissioning_crash_step_collects_without_pythonpath() -> None:
+    step = _named_steps(CONTAINER_JOB)["Protected commissioning crash recovery"]
+    environment = os.environ.copy()
+    environment.pop("PYTHONPATH", None)
+    result = subprocess.run(
+        [*shlex.split(_string(step, "run")), "--collect-only"],
+        cwd=REPO_ROOT,
+        env=environment,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert (
+        "cli/tests/local/test_commissioning_claim_execution.py::"
+        "test_a_hard_killed_executor_is_not_replayed_by_a_fresh_os_process"
+    ) in result.stdout
+
+
 def test_dry_run_job_matches_container_setup_and_runs_only_its_file() -> None:
     job = _python_job(DRY_RUN_JOB)
     assert job["name"] == "Python dry run fixture (pytest)"
@@ -1137,7 +1170,7 @@ def test_dry_run_job_matches_container_setup_and_runs_only_its_file() -> None:
     container = _named_steps(CONTAINER_JOB)
     for name, step in container.items():
         if name == "Pytest":
-            continue
+            break
         assert named[name] == step, name
     pytest_step = named["Pytest"]
     assert pytest_step["env"] == {
@@ -1847,7 +1880,7 @@ def test_ci_policy_aggregate_mutation_exposes_bypassed_result_check(
     ("true", "", True),
     ("true", CONTAINER_FILES[0], True),
     ("true", CONTAINER_FILES[1], True),
-    ("true", ",".join(CONTAINER_FILES), False),
+    ("true", ",".join(CONTAINER_FILES), True),
     ("false", "", False),
 ])
 @pytest.mark.parametrize("container_result", ["success", "skipped", "failure", "cancelled", ""])

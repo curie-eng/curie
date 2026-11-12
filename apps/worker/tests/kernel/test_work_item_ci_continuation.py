@@ -32,7 +32,7 @@ from aci_protocol import (
     TurnSource,
 )
 from channel_protocol import work_item_events
-from curie_dispatcher.queue import to_stream_fields
+from curie_internal.turn_queue import to_stream_fields
 from curie_worker.approvals import PublicationLineage
 from curie_worker.behaviorpacks import BehaviorPacks
 from curie_worker.binding import FactoryContext, FactoryWake, HttpIdentityBinding

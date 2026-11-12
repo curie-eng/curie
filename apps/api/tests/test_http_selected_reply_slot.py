@@ -28,11 +28,11 @@ from channel_protocol.reply import REPLY_WIRE_VERSION, ReplyUpdate
 from curie_api.delivery import sha16
 from curie_api.identity.http_transport import HttpIdentityClient
 from curie_api.main import create_app
+from curie_channel_gateway.slack.slack_sink import SlackReplyAdapter
 from curie_internal import identity_context as codec
 from curie_internal.keyspace import CHANNEL_KEY_PREFIX
 from curie_worker.kernel.routing import _target_for
 from curie_worker.reply_sink import TargetRoute
-from curie_worker.slack_sink import SlackReplyAdapter
 from fastapi.testclient import TestClient
 from slack_sdk.web import WebClient
 
@@ -51,7 +51,7 @@ log = logging.getLogger("synthetic-selected-reply-slot")
 
 def _orchestrator() -> Callable[..., Any]:
     """@spec HTTP-INVOCATION-EXECUTION-27: a missing owner fails in the test body."""
-    handlers = importlib.import_module("curie_dispatcher.handlers")
+    handlers = importlib.import_module("curie_channel_gateway.slack.handlers")
     owner = getattr(handlers, "submit_selected_mention", None)
     assert callable(owner), "submit_selected_mention is not implemented"
     return owner  # type: ignore[no-any-return]
@@ -59,7 +59,7 @@ def _orchestrator() -> Callable[..., Any]:
 
 def _dispatcher_config() -> Any:
     """@spec HTTP-INVOCATION-EXECUTION-27: the placeholder text the legacy lane posts."""
-    config = importlib.import_module("curie_dispatcher.config")
+    config = importlib.import_module("curie_channel_gateway.slack.config")
     return config.DispatcherConfig(slack_app_token="xapp-test", slack_bot_token="xoxb-test")
 
 
@@ -72,7 +72,9 @@ def _native(scope: dict[str, Any], *, text: str = "Synthetic reply slot") -> dic
     }
     return {
         "type": "event_callback", "event_id": "EvSyntheticReplySlot",
-        "team_id": membership.ACCOUNT, "is_ext_shared_channel": False, "event": event,
+        "team_id": membership.ACCOUNT,
+        "authorizations": [{"team_id": membership.ACCOUNT, "user_id": BOT, "is_bot": True}],
+        "is_ext_shared_channel": False, "event": event,
     }
 
 
@@ -115,7 +117,7 @@ class Rig:
 
     def _runtime(self) -> Any:
         """@spec HTTP-INVOCATION-EXECUTION-27."""
-        receiver = importlib.import_module("curie_dispatcher.http_receiver")
+        receiver = importlib.import_module("curie_channel_gateway.slack.http_receiver")
         scope = self.scope
         return receiver.build_http_receiver_runtime(
             receiver.HttpReceiverScopeV1(

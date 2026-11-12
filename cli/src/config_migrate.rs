@@ -79,6 +79,11 @@ const EXTRA_ENV_SUCCESSORS: &[(&str, &str, Coerce)] = &[
         Coerce::Integer,
     ),
     (
+        "CURIE_HOOK_CLAIM_LEASE_S",
+        "worker.hookClaimLeaseSeconds",
+        Coerce::Number,
+    ),
+    (
         "CURIE_SLACK_TRUSTED_ORIGINS",
         "worker.slackTrustedOrigins",
         Coerce::String,
@@ -130,6 +135,7 @@ pub fn extra_env_successors() -> &'static [(&'static str, &'static str)] {
             "worker.suspendedRouteTtlSeconds",
         ),
         ("CURIE_DELIVERY_BUDGET_S", "worker.deliveryBudgetSeconds"),
+        ("CURIE_HOOK_CLAIM_LEASE_S", "worker.hookClaimLeaseSeconds"),
         ("CURIE_SLACK_TRUSTED_ORIGINS", "worker.slackTrustedOrigins"),
     ];
     PAIRS

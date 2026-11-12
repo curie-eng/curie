@@ -13,11 +13,11 @@ from collections.abc import Callable, Iterator
 import httpx
 import pytest
 import redis
-from curie_dispatcher import identity as identity_module
-from curie_dispatcher.app import _stop_session_runner
-from curie_dispatcher.config import DispatcherConfig
-from curie_dispatcher.identity import IdentityResolveClient
-from curie_dispatcher.relevance import DROP_RATIONALES, DropReason
+from curie_channel_gateway.slack import identity as identity_module
+from curie_channel_gateway.slack.app import _stop_session_runner
+from curie_channel_gateway.slack.config import DispatcherConfig
+from curie_channel_gateway.slack.identity import IdentityResolveClient
+from curie_channel_gateway.slack.relevance import DROP_RATIONALES, DropReason
 from curie_telemetry import build_resource, configure_meter_provider
 from curie_telemetry import metrics as telemetry_metrics
 from opentelemetry.sdk.metrics import MeterProvider
@@ -158,7 +158,7 @@ def test_a_canary_never_submits_a_principal_lookup(
     with httpx.Client(transport=httpx.MockTransport(api)) as http:
         lookup = IdentityResolveClient("http://api.example.com", "example-key", client=http)
         monkeypatch.setattr(
-            "curie_dispatcher.handlers.build_identity_client", lambda _config: lookup
+            "curie_channel_gateway.slack.handlers.build_identity_client", lambda _config: lookup
         )
         harness = _build_harness(config, redis_client)
         event = _mention(text="<@U0BOT> delivery canary")

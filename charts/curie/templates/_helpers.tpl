@@ -176,14 +176,14 @@ affinity:
      define's body and fails CI if the two lists drift.
 
      IMPORTANT: the pin scans this body for env-name-shaped uppercase tokens, so
-     the body must contain EXACTLY these eight keys and no other stray ones (this
+     the body must contain EXACTLY the enumerated keys and no other stray ones (this
      comment lives OUTSIDE the define so it is never scanned): the four runner
-     credential keys plus the four redirect/capture-capable keys (#487). The whole
+     credential keys plus the transport-control keys. The whole
      CURIE_ namespace is fenced separately by the hasPrefix rule in the
      connector-secret guard, so it is intentionally absent here. Emitted
      space-separated for consumption via `splitList " "`. */}}
 {{- define "curie.reservedConnectorSecretNames" -}}
-ANTHROPIC_BASE_URL ANTHROPIC_API_KEY CLAUDE_CODE_OAUTH_TOKEN ANTHROPIC_AUTH_TOKEN HTTPS_PROXY HTTP_PROXY NODE_EXTRA_CA_CERTS ANTHROPIC_CUSTOM_HEADERS
+ANTHROPIC_BASE_URL ANTHROPIC_API_KEY CLAUDE_CODE_OAUTH_TOKEN ANTHROPIC_AUTH_TOKEN HTTPS_PROXY HTTP_PROXY ALL_PROXY SSL_CERT_FILE SSL_CERT_DIR NODE_EXTRA_CA_CERTS NODE_TLS_REJECT_UNAUTHORIZED NODE_OPTIONS ANTHROPIC_CUSTOM_HEADERS https_proxy http_proxy all_proxy ssl_cert_file ssl_cert_dir node_extra_ca_certs node_tls_reject_unauthorized node_options anthropic_custom_headers
 {{- end -}}
 
 {{/* @spec ACTION-EXECUTOR-16: the reserved snapshot sealing key names. The
@@ -1265,6 +1265,12 @@ credentials and the derived collector header cannot disagree. */}}
 {{- $langfuseInitProjectSecretKey := include "curie.managedSecret" (dict "root" . "key" "langfuseInitProjectSecretKey" "value" .Values.langfuse.init.projectSecretKey "default" "sk-lf-curie-dev" "hex" false "existingData" $existingSecretData) -}}
 {{- $langfuseInitUserPassword := include "curie.managedSecret" (dict "root" . "key" "langfuseInitUserPassword" "value" .Values.langfuse.init.userPassword "default" "curie-dev-password" "hex" false "existingData" $existingSecretData) -}}
 {{- $content := dict -}}
+{{- $gateway := .Values.channelGateway | default dict -}}
+{{- range $caller := list "api" "worker" -}}
+{{- $key := printf "channelGateway%sToken" (title $caller) -}}
+{{- $_ := set $content $key (include "curie.managedSecret" (dict "root" $ "key" $key "value" (index $gateway (printf "%sToken" $caller)) "default" (printf "curie-dev-gateway-%s" $caller) "hex" false "existingData" $existingSecretData)) -}}
+{{- end -}}
+
 {{- $_ := set $content "installationId" ((include "curie.installationId" .) | toString) -}}
 {{- $_ := set $content "postgresPassword" ((include "curie.managedSecret" (dict "root" . "key" "postgresPassword" "value" .Values.postgres.auth.password "default" "postgres" "hex" false "existingData" $existingSecretData)) | toString) -}}
 {{- $_ := set $content "valkeyPassword" ((include "curie.managedSecret" (dict "root" . "key" "valkeyPassword" "value" .Values.valkey.password "default" "valkeypass" "hex" false "existingData" $existingSecretData)) | toString) -}}

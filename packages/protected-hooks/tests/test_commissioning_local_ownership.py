@@ -230,14 +230,14 @@ def test_argv_always_pins_the_private_kubeconfig_and_profile(tmp_path: Path) -> 
 @pytest.mark.parametrize(
     "args",
     [
-        ("--context", "prod"),
-        ("--context=prod",),
+        ("--context", "fixture-context"),
+        ("--context=fixture-context",),
         ("--kubeconfig", "/home/user/.kube/config"),
         ("--kubeconfig=/x",),
         ("--cluster=x",),
         ("--user=admin",),
         ("config", "use-context", "prod"),
-        ("get", "pods", "--context=prod"),
+        ("get", "pods", "--context=fixture-context"),
     ],
 )
 def test_kubectl_refuses_caller_supplied_cluster_selection(
@@ -281,8 +281,8 @@ def test_docker_refuses_global_prune(tmp_path: Path, args: tuple[str, ...]) -> N
 @pytest.mark.parametrize(
     "argv",
     [
-        ["--context", "prod"],
-        ["--context=prod"],
+        ["--context", "fixture-context"],
+        ["--context=fixture-context"],
         ["--kubeconfig", "/x"],
         ["--target", "t", "--kubeconfig=/x"],
         ["-p", "other"],
@@ -361,11 +361,11 @@ def test_minikube_refuses_glued_profile_shorthand(tmp_path: Path, args: tuple[st
 @pytest.mark.parametrize(
     "args",
     [
-        ("--context", "remote", "ps"),
+        ("--context", "fixture-context", "ps"),
         ("-H", "tcp://remote:2375", "ps"),
         ("-Htcp://remote:2375", "ps"),
         ("--host=tcp://remote:2375", "ps"),
-        ("network", "inspect", "--context=remote", OWNER),
+        ("network", "inspect", "--context=fixture-context", OWNER),
         ("context", "use", "remote"),
         ("network", "rm", "--config=/x"),
     ],

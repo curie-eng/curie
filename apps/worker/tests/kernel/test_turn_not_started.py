@@ -51,9 +51,9 @@ from channel_protocol.reply import (
     ReplyUpdate,
     TurnCompleted,
 )
-from curie_dispatcher.queue import to_stream_fields
+from curie_internal.turn_queue import to_stream_fields
 from curie_worker.config import WorkerConfig
-from curie_worker.consumer import Consumer
+from curie_worker.consumer import Consumer, refuse_unconfigured_reminder
 from curie_worker.delivery_lease import DeliveryLeaseStore
 from curie_worker.kernel.routing import _route_from_handle
 from curie_worker.markers import CompletionRecord
@@ -135,6 +135,7 @@ def test_a_failed_turn_edits_the_placeholder_to_the_not_started_text(make_harnes
                 kernel=h.kernel,
                 config=h.config,
                 leases=DeliveryLeaseStore(h.async_redis, h.config),
+                reminders=refuse_unconfigured_reminder,
             )
             await consumer.ensure_group()
             attempts = _failing_process_event(h)
@@ -175,6 +176,7 @@ def test_a_placeholderless_turn_gets_no_message_at_all(make_harness) -> None:
                 kernel=h.kernel,
                 config=h.config,
                 leases=DeliveryLeaseStore(h.async_redis, h.config),
+                reminders=refuse_unconfigured_reminder,
             )
             await consumer.ensure_group()
             attempts = _failing_process_event(h)
@@ -214,6 +216,7 @@ def test_the_notice_fires_even_under_no_edit_streaming(make_harness) -> None:
                 kernel=h.kernel,
                 config=h.config,
                 leases=DeliveryLeaseStore(h.async_redis, h.config),
+                reminders=refuse_unconfigured_reminder,
             )
             await consumer.ensure_group()
             _failing_process_event(h)
@@ -247,6 +250,7 @@ def test_a_failing_slack_sink_does_not_change_the_pending_outcome(
                 kernel=h.kernel,
                 config=h.config,
                 leases=DeliveryLeaseStore(h.async_redis, h.config),
+                reminders=refuse_unconfigured_reminder,
             )
             await consumer.ensure_group()
             _failing_process_event(h)
@@ -297,6 +301,7 @@ def test_a_turn_that_already_settled_keeps_its_answer(make_harness) -> None:
                 kernel=h.kernel,
                 config=h.config,
                 leases=DeliveryLeaseStore(h.async_redis, h.config),
+                reminders=refuse_unconfigured_reminder,
             )
             await consumer.ensure_group()
 
@@ -352,6 +357,7 @@ def test_a_done_outbox_record_without_a_done_marker_keeps_its_answer(
                 kernel=h.kernel,
                 config=h.config,
                 leases=DeliveryLeaseStore(h.async_redis, h.config),
+                reminders=refuse_unconfigured_reminder,
             )
             await consumer.ensure_group()
             _failing_process_event(h)
@@ -422,6 +428,7 @@ def test_an_unreadable_terminality_check_leaves_the_placeholder_alone(
                 kernel=h.kernel,
                 config=h.config,
                 leases=DeliveryLeaseStore(h.async_redis, h.config),
+                reminders=refuse_unconfigured_reminder,
             )
             await consumer.ensure_group()
             _failing_process_event(h)
@@ -505,7 +512,8 @@ def test_a_polite_drop_is_not_overwritten_by_the_notice(make_harness) -> None:
         async with make_harness(binding=_UnmappedBinding(), **_LEASE_KNOBS) as h:
             store = DeliveryLeaseStore(h.async_redis, h.config)
             consumer = Consumer(
-                redis=h.async_redis, kernel=h.kernel, config=h.config, leases=store
+                redis=h.async_redis, kernel=h.kernel, config=h.config, leases=store,
+                reminders=refuse_unconfigured_reminder,
             )
             await consumer.ensure_group()
 
@@ -553,7 +561,8 @@ def test_a_notice_is_skipped_when_this_owner_lost_the_fence(
         async with make_harness(**_LEASE_KNOBS) as h:
             store = DeliveryLeaseStore(h.async_redis, h.config)
             consumer = Consumer(
-                redis=h.async_redis, kernel=h.kernel, config=h.config, leases=store
+                redis=h.async_redis, kernel=h.kernel, config=h.config, leases=store,
+                reminders=refuse_unconfigured_reminder,
             )
             await consumer.ensure_group()
 
@@ -601,7 +610,8 @@ def test_a_notice_is_skipped_when_the_lease_is_lost_during_the_terminality_read(
         async with make_harness(**_LEASE_KNOBS) as h:
             store = DeliveryLeaseStore(h.async_redis, h.config)
             consumer = Consumer(
-                redis=h.async_redis, kernel=h.kernel, config=h.config, leases=store
+                redis=h.async_redis, kernel=h.kernel, config=h.config, leases=store,
+                reminders=refuse_unconfigured_reminder,
             )
             await consumer.ensure_group()
 
@@ -645,7 +655,8 @@ def test_a_settle_that_fails_before_writing_gets_the_notice(make_harness) -> Non
         async with make_harness(**_LEASE_KNOBS) as h:
             store = DeliveryLeaseStore(h.async_redis, h.config)
             consumer = Consumer(
-                redis=h.async_redis, kernel=h.kernel, config=h.config, leases=store
+                redis=h.async_redis, kernel=h.kernel, config=h.config, leases=store,
+                reminders=refuse_unconfigured_reminder,
             )
             await consumer.ensure_group()
             h.runner.default_script = [Final(text="the answer", status=DONE)]
@@ -683,7 +694,8 @@ def test_an_answer_delivered_before_a_failed_clear_is_not_overwritten(
         async with make_harness(**_LEASE_KNOBS) as h:
             store = DeliveryLeaseStore(h.async_redis, h.config)
             consumer = Consumer(
-                redis=h.async_redis, kernel=h.kernel, config=h.config, leases=store
+                redis=h.async_redis, kernel=h.kernel, config=h.config, leases=store,
+                reminders=refuse_unconfigured_reminder,
             )
             await consumer.ensure_group()
             h.runner.default_script = [Final(text="the answer", status=DONE)]
@@ -727,7 +739,8 @@ def test_a_terminal_send_that_lands_then_raises_stays_owed_and_replays(
         async with make_harness(**_LEASE_KNOBS) as h:
             store = DeliveryLeaseStore(h.async_redis, h.config)
             consumer = Consumer(
-                redis=h.async_redis, kernel=h.kernel, config=h.config, leases=store
+                redis=h.async_redis, kernel=h.kernel, config=h.config, leases=store,
+                reminders=refuse_unconfigured_reminder,
             )
             await consumer.ensure_group()
             h.runner.default_script = [Final(text="the answer", status=DONE)]
@@ -783,7 +796,8 @@ def test_a_turn_that_raised_before_its_answer_still_gets_the_notice(
         async with make_harness(**_LEASE_KNOBS) as h:
             store = DeliveryLeaseStore(h.async_redis, h.config)
             consumer = Consumer(
-                redis=h.async_redis, kernel=h.kernel, config=h.config, leases=store
+                redis=h.async_redis, kernel=h.kernel, config=h.config, leases=store,
+                reminders=refuse_unconfigured_reminder,
             )
             await consumer.ensure_group()
             h.runner.default_script = [

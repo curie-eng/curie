@@ -538,8 +538,9 @@ def test_committed_publication_with_a_lost_reply_continues_as_settled(
     asyncio.run(go())
 
 
+@pytest.mark.parametrize("persisted", [False, True])
 def test_uncommitted_publication_with_a_lost_reply_redelivers_to_the_side_effect_stop(
-    make_hook_run, make_harness
+    make_hook_run, make_harness, persisted: bool
 ) -> None:
     async def go() -> None:
         async with sweep_case(make_hook_run, make_harness) as c:
@@ -563,6 +564,9 @@ def test_uncommitted_publication_with_a_lost_reply_redelivers_to_the_side_effect
             assert not await h.async_redis.exists(h.config.done_key(first.event.event_id))
             assert notices(h) == []
 
+            if not persisted:
+                await h.async_redis.delete(h.config.side_effect_key(first.event.event_id))
+                h.runner.side_effect_emitted = True
             again = await redeliver(h, first)
             assert again.lease.generation == 2
             await h.kernel.process_event(again.event, lease=again.lease)

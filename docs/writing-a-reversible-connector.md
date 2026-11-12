@@ -291,6 +291,25 @@ Do not fake a snapshot to look cooperative. A record that claims to be undoable
 and holds nothing to restore is the one failure mode this design exists to
 prevent.
 
+### An idempotent action that cannot be undone
+
+Automated remediation admits one more case
+([ADR-0203](adr/0203-automated-remediation-is-a-pre-qualified-action-the-platform-executes-and-verifies.md)
+REMEDIATION-11): an action that is not reversible but idempotent, such as a
+rolling restart keyed by the incident. Its qualification compares the
+`post_version` of two approved forwards with the same arguments, and the ledger
+records a `post_version` only from a sealed reply. So such a connector replies
+with a sealed `prior`, a `version` and a `target` exactly as above, and serves
+**neither** `restore` **nor** `observe_version`. Without the pair the capability
+probe never records it as restore capable, so its records are not undoable
+(`refused_not_restore_capable`) and nothing claims an undo it cannot perform.
+Two rules make the `version` usable as evidence: it names the state the write
+left, not the write, and a repeat with the same arguments leaves that state
+unchanged. Keep such a verb on its own connector: undo capability is recorded
+per connector, so a non-reversible verb beside a restore-capable pair would be
+reported undoable. The worked example is the SRE example's
+[`restarter`](../examples/sre-bot/connectors/restarter/server.py).
+
 ## Rules that are easy to get wrong
 
 **Read before you write, and refuse if you cannot.** An action that happened and

@@ -35,7 +35,20 @@ def test_credential_keys_are_members_of_the_set(name: str) -> None:
 
 @pytest.mark.parametrize(
     "name",
-    ["HTTPS_PROXY", "HTTP_PROXY", "NODE_EXTRA_CA_CERTS", "ANTHROPIC_CUSTOM_HEADERS"],
+    [
+        "HTTPS_PROXY",
+        "HTTP_PROXY",
+        "NODE_EXTRA_CA_CERTS",
+        "ANTHROPIC_CUSTOM_HEADERS",
+        "ALL_PROXY",
+        "SSL_CERT_FILE",
+        "SSL_CERT_DIR",
+        "all_proxy",
+        "ssl_cert_file",
+        "ssl_cert_dir",
+        "NODE_TLS_REJECT_UNAUTHORIZED",
+        "NODE_OPTIONS",
+    ],
 )
 def test_redirect_capture_keys_are_reserved(name: str) -> None:
     # #487: generic env that redirects/captures the model session (proxy, extra

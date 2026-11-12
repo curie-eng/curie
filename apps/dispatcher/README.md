@@ -1,5 +1,16 @@
 # apps/dispatcher
 
+The dispatcher image is the deployment shell for gateway-owned Slack intake.
+Its command is `python -m curie_channel_gateway.slack.run`. Admission caching,
+Redis/Valkey construction and heartbeat live in the gateway's `slack/` package;
+shared stream encoding, publication and dedupe live in
+`curie_internal.turn_queue`. The one-shot CLI producer runs
+`python -m curie_channel_gateway.slack.enqueue_once`. `curie_dispatcher` contains
+only deployment metadata. An import-linter independence contract forbids either
+package from importing the other, including indirectly and under `TYPE_CHECKING`.
+The behavior below is implemented by the gateway with the existing storage keys,
+admission ordering and heartbeat timings.
+
 The Slack dispatcher: Slack Bolt for Python in Socket Mode.
 On an `app_mention` (channel) or direct `message` (DM) for the bot it acks the
 Socket Mode envelope fast, posts an in-thread placeholder reply, and enqueues a
@@ -191,6 +202,19 @@ ID, channel, and root timestamp, for
 `CURIE_THREAD_CONTEXT_TTL_SECONDS`, so a restart keeps it and a long thread
 reads Slack once; a root that is not this bot's is cached without its text.
 
+## Earlier messages in a direct message
+
+A new top-level message in a one to one direct message quotes recent earlier
+messages from that person and this agent into the turn text, as untrusted
+context. The quote is the newest of those messages inside the last seven days,
+up to `CURIE_DM_CONTINUITY_MAX_MESSAGES` (default 20, allowed 0 through 40),
+oldest first. Zero does not call Slack. A thread reply, a channel mention, a
+group direct message, and any envelope whose `is_ext_shared_channel` is not
+exactly false are unchanged. The conversation id stays the Slack thread
+timestamp. The block is escaped the same way as a quoted thread root. A Slack
+error leaves the person's text unchanged and still admits the turn. Operators
+set the bound through `dispatcher.extraEnv`.
+
 ## The queue seam (what the worker consumes)
 
 The dispatcher `XADD`s onto a Valkey Stream (`CURIE_STREAM`, default
@@ -208,10 +232,10 @@ parenthetical is what the Slack adapter maps onto each one:
 | `received_at` | ISO-8601 UTC timestamp the adapter received it |
 
 The worker reconstructs it with `from_stream_fields(fields)`, a module-level
-helper in `curie_dispatcher.queue`. The model lives in the frozen `aci_protocol`
+helper in `curie_internal.turn_queue`. The model lives in the frozen `aci_protocol`
 package (promoted out of the dispatcher in issue #7) so the producer and the
 Rust/TS consumers share one schema-gated contract instead of a hand-mirrored copy;
-the dispatcher's queue module owns only the Stream transport of it. The
+the shared queue module owns only the Stream transport of it. The
 single-`payload`-field encoding keeps the seam explicit and lets fields be added
 without reshaping the Stream schema.
 
@@ -364,6 +388,8 @@ Read from the environment by `DispatcherConfig()` (a `pydantic_settings.BaseSett
 | `CURIE_ADMISSION_CACHE_PREFIX` | `curie:admission:` | Valkey key prefix for the persisted caller-list answers, so a restarted dispatcher keeps them; change it only when two installs share one Valkey |
 | `CURIE_THREAD_CONTEXT_CACHE_PREFIX` | `curie:slack-root-context:` | Valkey key prefix for the cached thread-root answers (see *Replies in a thread this bot rooted*); change it only when two installs share one Valkey |
 | `CURIE_THREAD_CONTEXT_TTL_SECONDS` | `2592000` | how long a cached thread-root answer is kept, 30 days by default to match the idle transcript window; must be positive |
+| `CURIE_MENTION_RECEIPT_TTL_SECONDS` | `604800` | how long the receipt of a human mention in a channel thread is kept (Valkey key `curie:slack-mention-receipt:<delivery id>`, written once before the dedupe claim); the worker reads it to decide factory run steering, and a turn in a factory run thread whose receipt has expired is refused. 7 days by default; must be positive |
+| `CURIE_DM_CONTINUITY_MAX_MESSAGES` | `20` | how many earlier direct messages a top-level one to one direct message may quote; 0 turns the read off; allowed 0 through 40 |
 
 ### Boot preflights
 
@@ -451,7 +477,7 @@ the Console, or operators.
 ## Run it
 
 ```bash
-python -m curie_dispatcher
+python -m curie_channel_gateway.slack.run
 ```
 
 ## Runbook: point it at a real Slack workspace (once one exists)
@@ -467,7 +493,7 @@ python -m curie_dispatcher
 2. Generate an App-Level Token with `connections:write` -> `SLACK_APP_TOKEN`
    (`xapp-...`); copy the Bot User OAuth Token -> `SLACK_BOT_TOKEN` (`xoxb-...`).
 3. Set both env vars (plus `VALKEY_*` for the target Valkey) and run
-   `python -m curie_dispatcher`. @-mention the bot in a channel it is in, or DM
+   `python -m curie_channel_gateway.slack.run`. @-mention the bot in a channel it is in, or DM
    it: you should see the placeholder reply appear and one entry land on the
    Stream (`XLEN curie:runs`). The worker consumes from there.
 
@@ -487,3 +513,48 @@ uv run pytest apps/dispatcher/tests -q
 event-filtering cases; `tests/test_queue.py` covers the seam and dedupe against
 real Valkey; `tests/test_supervisor.py` covers backoff, reconnect, and graceful
 shutdown with a fake connection.
+
+
+## Provider gateway
+
+Run `python -m curie_channel_gateway.slack.read_server` alongside the dispatcher
+for provider reads, group membership, attachment fetches, sender identities and
+worker replies. Only these processes receive Slack credentials. The dispatcher
+retains the chat attester key; the read gateway does not mint approval evidence.
+
+Set distinct `CURIE_CHANNEL_GATEWAY_API_TOKEN` and
+`CURIE_CHANNEL_GATEWAY_WORKER_TOKEN` on the gateway. Each application receives
+its own value as `CURIE_CHANNEL_GATEWAY_TOKEN`, plus `CURIE_CHANNEL_GATEWAY_URL`.
+API credentials authorize channel, canvas and membership operations; worker
+credentials authorize files, sender lookup and replies. Provider identities are
+configured at the gateway; reply origins pass its origin policy. File responses
+are capped at 32 MiB by default on both sides. Helm derives
+the gateway cap from `worker.attachments.maxFileBytes`; standalone gateways use
+`CURIE_CHANNEL_GATEWAY_MAX_FILE_BYTES`.
+
+The listener requires `CURIE_CHANNEL_GATEWAY_TLS_CERT` and
+`CURIE_CHANNEL_GATEWAY_TLS_KEY`. Clients verify the certificate using their
+system trust store, including an operator-supplied `SSL_CERT_FILE`.
+`CURIE_CHANNEL_GATEWAY_ALLOW_INSECURE=true` explicitly permits HTTP on both ends;
+Compose uses that opt-out only for its local development listener.
+
+Existing installations must remove bot, user and app token environment variables
+from API and worker before upgrading, including named identity token variables.
+Both applications refuse those credentials at boot. In Helm, enable
+`channelGateway.deploy` with a trusted `channelGateway.tlsSecret`, or explicitly
+opt out of TLS with `channelGateway.allowInsecure`. Set `channelGateway.url` to
+use an external gateway. The gateway is opt-in because the chart cannot choose
+or trust an operator's server certificate. Until configured, provider-dependent
+operations fail closed; authorization never borrows a different identity or
+widens group membership when a gateway answer is missing.
+
+Gateway requests carry a signed timestamp and nonce as well as the caller
+credential. The replay ledger consumes each nonce once, survives restart and
+rejects stale or altered requests. Set `CURIE_CHANNEL_GATEWAY_REPLAY_DB` to a
+persistent SQLite file; Helm and Compose mount a dedicated volume. The chart
+uses one gateway replica with Recreate so the SQLite volume has one owner.
+
+Reply delivery uses the shared durable delivery claims as well as request replay
+protection. A retry of identical bytes at the same identity and provider route
+returns its confirmed result. An unconfirmed claim refuses after restart.
+Distinct posts with identical content require distinct delivery IDs.

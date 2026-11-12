@@ -30,7 +30,7 @@ from _support import (
     stop,
     wait_for_healthz,
 )
-from curie_mail_adapter.adapter import MailAdapter
+from curie_channel_gateway.mail.adapter import MailAdapter
 
 
 def test_ingress_enabled_with_an_empty_allow_list_refuses_to_boot(

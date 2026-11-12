@@ -9,18 +9,21 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import importlib.util
 import inspect
 import json
 import uuid
+from pathlib import Path
 from typing import Any
 
+import httpx
 import pytest
 from aci_protocol import Final, SessionStatus
 from curie_internal.identity_approval import ApprovalCreationIdentityV1
-from curie_worker.approvals import ApprovalContinuityRefused, CreatedApproval
+from curie_worker.approvals import ApprovalClient, ApprovalContinuityRefused, CreatedApproval
 from curie_worker.binding import GRANT_ARGUMENTS_ENV, GRANT_TOOL_ENV
 from curie_worker.capacity_wait import WAIT_REPLY_REF_FIELD
-from curie_worker.consumer import Consumer
+from curie_worker.consumer import Consumer, refuse_unconfigured_reminder
 from curie_worker.delivery_lease import DeliveryLeaseStore
 from curie_worker.identity_authority import TurnAuthorityUnavailable
 from curie_worker.kernel import identity
@@ -29,6 +32,22 @@ from plugin_format import PLATFORM_PUBLISH_TOOL_NAME
 from ..queue_fixtures import qevent
 from .test_approval_lifecycle import RecordingApprovals
 from .test_http_identity_authority import CAPSULE, Binding, Core, expected_scope, pending_entry
+
+
+def _identity_approval_contract() -> Any:
+    """Load the root ``tests/test_identity_approval.py`` module by its path.
+
+    The repository root ``tests`` directory is not an importable package, so
+    ``from tests.test_identity_approval import ...`` resolved only when the same
+    pytest process had already collected that file. Run alone, or in a shard
+    that does not select it, the import failed with ModuleNotFoundError.
+    """
+    path = Path(__file__).resolve().parents[4] / "tests" / "test_identity_approval.py"
+    spec = importlib.util.spec_from_file_location("_worker_identity_approval_contract", path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
 
 
 def raw_payload(event: Any) -> str:
@@ -136,6 +155,7 @@ def test_park_wake_reclaim_keeps_original_bytes_through_actual_approval_pause(
             leases = DeliveryLeaseStore(h.async_redis, h.config)
             consumer = Consumer(
                 redis=h.async_redis, kernel=h.kernel, config=h.config, leases=leases,
+                reminders=refuse_unconfigured_reminder,
             )
             entry_id, observed = await pending_entry(h, consumer, fields)
             lease = await leases.acquire(
@@ -210,7 +230,8 @@ def test_expired_resume_notification_keeps_wire_author_and_original_invoker_sepa
     """@spec HTTP-APPROVAL-CONTINUITY-4/12: synthetic current-core boundary, no grant proof."""
     from curie_internal import identity_approval, identity_context
 
-    from tests.test_identity_approval import KEY, KEY_ID, context_body
+    contract = _identity_approval_contract()
+    KEY, KEY_ID, context_body = contract.KEY, contract.KEY_ID, contract.context_body
 
     class NotificationBinding(Binding):
         """@spec HTTP-APPROVAL-CONTINUITY-12: external SQL result is a non-grant notification."""
@@ -372,6 +393,7 @@ def test_identity_creation_outcome_never_uses_legacy_escalation_or_unverified_re
             leases = DeliveryLeaseStore(h.async_redis, h.config)
             consumer = Consumer(
                 redis=h.async_redis, kernel=h.kernel, config=h.config, leases=leases,
+                reminders=refuse_unconfigured_reminder,
             )
             entry_id, observed = await pending_entry(h, consumer, {
                 "payload": raw, "curie_identity_context_v1": CAPSULE,
@@ -406,4 +428,97 @@ def test_explicit_local_approval_keeps_the_legacy_creator_signature_and_pause(
             assert [item.operating_mode for item in h.fake_k8s.sandboxes.values()] == ["Suspended"]
             assert len(h.sink.posts) == 1
             assert await h.async_redis.exists(h.config.done_key(event.event_id))
+    asyncio.run(run())
+
+
+def test_selected_email_turn_without_approver_emails_reaches_identity_creation(
+    make_harness: Any,
+) -> None:
+    """@spec HTTP-APPROVAL-CONTINUITY-4/15: the approver role, not a route list, decides.
+
+    A legacy email turn with no route approver emails escalates; a selected one
+    creates through the identity transport, whose answer owner applies the role.
+    """
+    async def run() -> None:
+        """@spec HTTP-APPROVAL-CONTINUITY-4/15."""
+        binding, creator = Binding(), Creator()
+        binding._by_route[("email", "acme-agent@example.com")] = binding.resolved
+        async with make_harness(binding=binding, identity_authority=Core(), approvals=creator) as h:
+            h.runner.default_script = awaiting()
+            event = qevent(
+                "synthetic email approval", kind="email", channel="acme-agent@example.com",
+                adapter="acme-mail", endpoint="https://mail.example.com/reply",
+            )
+            raw = raw_payload(event)
+            leases = DeliveryLeaseStore(h.async_redis, h.config)
+            consumer = Consumer(
+                redis=h.async_redis, kernel=h.kernel, config=h.config, leases=leases,
+                reminders=refuse_unconfigured_reminder,
+            )
+            entry_id, observed = await pending_entry(h, consumer, {
+                "payload": raw, "curie_identity_context_v1": CAPSULE,
+            })
+            await consumer._handle(entry_id, observed)
+            request = assert_identity(creator, binding, raw)
+            assert request.reply_kind == "email"
+            assert request.route is None
+            assert request.card_channel == "acme-agent@example.com"
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize(
+    ("status", "detail", "settled"),
+    [
+        (422, "approval_ticket_preparation_expired", True),
+        (422, "approver_dm_recipient_count", True),
+        (503, "authority_unavailable", False),
+    ],
+)
+def test_definite_creation_refusal_settles_the_turn(
+    make_harness: Any, status: int, detail: str, settled: bool,
+) -> None:
+    """A coded creation refusal ACKs the turn. Availability failure stays pending."""
+
+    async def run() -> None:
+        async def handle(_request: httpx.Request) -> httpx.Response:
+            return httpx.Response(status, json={"detail": detail})
+
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handle)) as http:
+            approvals = ApprovalClient(
+                api_base_url="https://core.example.test",
+                api_key="SyntheticPlatformKey",
+                client=http,
+                read_timeout_s=30,
+                worker_token="SyntheticPrivateWorkerToken",
+            )
+            async with make_harness(
+                binding=Binding(), identity_authority=Core(), approvals=approvals,
+            ) as h:
+                h.runner.default_script = awaiting()
+                event = qevent("synthetic creation refusal")
+                raw = raw_payload(event)
+                consumer = Consumer(
+                    redis=h.async_redis,
+                    kernel=h.kernel,
+                    config=h.config,
+                    leases=DeliveryLeaseStore(h.async_redis, h.config),
+                    reminders=refuse_unconfigured_reminder,
+                )
+                entry_id, observed = await pending_entry(h, consumer, {
+                    "payload": raw, "curie_identity_context_v1": CAPSULE,
+                })
+                await consumer._handle(entry_id, observed)
+                pending = await h.async_redis.xpending(
+                    h.config.stream, h.config.consumer_group,
+                )
+                done = bool(await h.async_redis.exists(h.config.done_key(event.event_id)))
+                assert pending["pending"] == (0 if settled else 1)
+                assert done is settled
+                assert await h.async_redis.xlen(h.config.dead_letter_stream_name()) == 0
+                assert h.sink.events == []
+                assert all(
+                    item.operating_mode != "Suspended"
+                    for item in h.fake_k8s.sandboxes.values()
+                )
+
     asyncio.run(run())

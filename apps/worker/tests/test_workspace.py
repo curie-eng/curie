@@ -742,7 +742,7 @@ def test_quoted_prior_reply_never_selects_a_repository(workspace: Any) -> None:
     neutralizes every slash in the quoted root, so both old and new workers see
     its repository-looking tokens as inert during a rolling upgrade.
     """
-    from curie_dispatcher.thread_context import (
+    from curie_channel_gateway.slack.thread_context import (
         render_prior_reply,
         render_unavailable_notice,
     )

@@ -1,0 +1,45 @@
+# The opt-in declaration for the metrics connector, a read-only verifier for
+# automated remediation. OFF BY DEFAULT: the bundle's connectors.yaml does not
+# declare it and plugin.json names none of its tools, so an install that does
+# not opt in is unchanged.
+#
+# To opt in, in your copy of the bundle:
+#   1. add `connector.metrics` below under `connectors:` in connectors.yaml;
+#   2. add the `plugin` entry to .claude-plugin/plugin.json (`toolPolicy`);
+#   3. point METRICS_URL at your Prometheus (or any server that answers the
+#      Prometheus HTTP API's /api/v1/query);
+#   4. build and deploy as for the other source-built connectors.
+#
+# examples/tests/test_sre_bot_metrics_opt_in.py applies exactly this file to the
+# shipped bundle and validates the result, so the steps above stay valid.
+connector:
+  metrics:
+    build:
+      context: connectors/metrics
+      platforms: [linux/amd64, linux/arm64]
+    env:
+      # The Prometheus base URL; /api/v1/query is appended. The default is the
+      # bundled observability stack's server. EMPTY MEANS EVERY CALL IS REFUSED.
+      METRICS_URL: http://prometheus-server.observability.svc.cluster.local
+      # Seconds one query may take before it is a tool error (an unsuccessful
+      # sample, never a pass).
+      METRICS_TIMEOUT_SECONDS: "10"
+      # More series than this is a tool error: aggregate to one.
+      METRICS_MAX_SERIES: "50"
+    # A Prometheus that requires a bearer token: create a Secret holding
+    # METRICS_BEARER_TOKEN and uncomment this. A secretKeyRef to a missing key
+    # stops the pod, so do not declare it without the Secret.
+    #
+    # The token must not be one the acting connector's headers expand: the
+    # platform refuses a verifier whose header secret names overlap the acting
+    # connector's (`verifier_not_independent`). A SecretRef derives no header.
+    #
+    # secrets:
+    #   - name: METRICS_BEARER_TOKEN
+    #     from_secret: sre-bot-metrics
+plugin:
+  toolPolicy:
+    # Read-only and never gated: the platform's executor samples it without a
+    # grant, and the model may read it too.
+    allow:
+      - metrics/query_value

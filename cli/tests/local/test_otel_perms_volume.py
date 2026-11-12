@@ -209,6 +209,8 @@ def _override_text(project: str, ports: dict[tuple[str, int], int], stub: int) -
             f'      S3_ENDPOINT_URL: "http://127.0.0.1:{s3}"',
             f'      CURIE_API_URL: "http://127.0.0.1:{api}"',
             f'      CURIE_DOCKER_NETWORK: "{project}_runner"',
+            "  curie-channel-gateway:",
+            "    environment:",
             f'      SLACK_API_BASE_URL: "http://127.0.0.1:{stub}/api/"',
             "networks:",
             "  curie_runner:",
@@ -223,6 +225,7 @@ def _isolated_env(
     project: str,
     ports: dict[tuple[str, int], int],
     stub: int,
+    gateway: int,
     config: Path,
 ) -> dict[str, str]:
     env = os.environ.copy()
@@ -249,6 +252,7 @@ def _isolated_env(
             "S3_ENDPOINT_URL": f"http://127.0.0.1:{ports[('rustfs', 9000)]}",
             "CURIE_DOCKER_NETWORK": f"{project}_runner",
             "CURIE_LOCAL_STUB_PORT": str(stub),
+            "CURIE_LOCAL_GATEWAY_PORT": str(gateway),
             "CURIE_LOCAL_POSTGRES_HOST": "127.0.0.1",
             "CURIE_LOCAL_POSTGRES_PORT": str(ports[("postgres", 5432)]),
             "NO_COLOR": "1",
@@ -400,9 +404,9 @@ def cycle(tmp_path: Path, curie_binary: Path) -> Iterator[Cycle]:
     )
     project = f"c5362{uuid.uuid4().hex[:10]}"
     foreign = f"c5362foreign{uuid.uuid4().hex[:10]}"
-    hosts = _free_ports(len(PUBLISHED) + 1)
-    ports = {spec: host for spec, host in zip(PUBLISHED, hosts[:-1], strict=True)}
-    stub = hosts[-1]
+    hosts = _free_ports(len(PUBLISHED) + 2)
+    ports = {spec: host for spec, host in zip(PUBLISHED, hosts[:-2], strict=True)}
+    stub, gateway = hosts[-2:]
     override = tmp_path / "compose.override.yaml"
     override.write_text(_override_text(project, ports, stub))
     config = tmp_path / "config"
@@ -412,7 +416,7 @@ def cycle(tmp_path: Path, curie_binary: Path) -> Iterator[Cycle]:
         project=project,
         foreign=foreign,
         override=override,
-        env=_isolated_env(project, ports, stub, config),
+        env=_isolated_env(project, ports, stub, gateway, config),
     )
     try:
         _require(

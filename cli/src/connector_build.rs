@@ -34,6 +34,7 @@ use sha2::{Digest, Sha256};
 /// The declaration this module reads, named once (its Python twin is
 /// `plugin_format.connectors.CONNECTORS_FILE`).
 pub const CONNECTORS_FILE: &str = "connectors.yaml";
+pub const HOOK_WAKE_KEY_ENV: &str = "CURIE_HOOK_WAKE_KEY";
 
 /// The lock `curie build` writes, named once (its Python twin is
 /// `plugin_format.connector_lock.CONNECTOR_LOCK_FILE`).
@@ -110,6 +111,12 @@ pub struct ConnectorSpecDecl {
     /// written; the quantity and request-within-limit rules are Python's.
     #[serde(default)]
     pub resources: Option<ConnectorResourcesDecl>,
+    /// A bounded writable volume for the server container (#5415). Carried
+    /// as written; `plugin_format.validate_connectors` owns the path rules,
+    /// and the local docker tier reads `size_limit` with
+    /// [`scratch_size_bytes`].
+    #[serde(default)]
+    pub scratch: Option<ConnectorScratchDecl>,
     /// Non-MCP routes the caller proxy admits a connector-scoped route token
     /// on (ADR 0240). Carried as written; `plugin_format.validate_connectors`
     /// and `validate_bundle` own the path, method, size and caller rules.
@@ -168,6 +175,38 @@ pub struct ConnectorResourcesDecl {
     pub requests: Option<ConnectorResourceQuantitiesDecl>,
     #[serde(default)]
     pub limits: Option<ConnectorResourceQuantitiesDecl>,
+}
+
+/// `scratch:` on a hosted connector: both keys are required.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ConnectorScratchDecl {
+    pub path: String,
+    pub size_limit: String,
+}
+
+/// The bytes a `scratch.size_limit` means, or `None` when it is refused.
+///
+/// A whole number of bytes with an optional `Ki`, `Mi` or `Gi` suffix, from
+/// 1Mi to 64Gi inclusive: the grammar `plugin_format.scratch_size_bytes`
+/// reads, pinned for both by `tests/vectors/connector-scratch-size.json`.
+pub fn scratch_size_bytes(text: &str) -> Option<u64> {
+    const MIN: u64 = 1 << 20;
+    const MAX: u64 = 64 << 30;
+    let (digits, scale) = if let Some(rest) = text.strip_suffix("Ki") {
+        (rest, 1u64 << 10)
+    } else if let Some(rest) = text.strip_suffix("Mi") {
+        (rest, 1u64 << 20)
+    } else if let Some(rest) = text.strip_suffix("Gi") {
+        (rest, 1u64 << 30)
+    } else {
+        (text, 1u64)
+    };
+    if digits.is_empty() || digits.starts_with('0') || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let bytes = digits.parse::<u64>().ok()?.checked_mul(scale)?;
+    (MIN..=MAX).contains(&bytes).then_some(bytes)
 }
 
 /// One side of [`ConnectorResourcesDecl`]: Kubernetes quantity strings.
@@ -231,6 +270,7 @@ impl Default for ConnectorSpecDecl {
             proxy_upstream_host: None,
             readiness_path: None,
             resources: None,
+            scratch: None,
             routes: Vec::new(),
             url: None,
             headers: BTreeMap::new(),
@@ -682,6 +722,7 @@ pub fn locked_runner_image(bundle_dir: &Path) -> Result<Option<String>> {
 }
 
 fn check_spec(name: &str, spec: &ConnectorSpecDecl) -> Result<()> {
+    check_wake_key_role(name, spec)?;
     let forms = [
         spec.image.is_some(),
         spec.build.is_some(),
@@ -731,6 +772,120 @@ fn check_spec(name: &str, spec: &ConnectorSpecDecl) -> Result<()> {
     }
     if let Some(build) = &spec.build {
         check_build(&format!("connectors.{name}"), build)?;
+    }
+    Ok(())
+}
+
+fn check_wake_key_role(name: &str, spec: &ConnectorSpecDecl) -> Result<()> {
+    if spec.bearer_secret.as_deref() == Some(HOOK_WAKE_KEY_ENV) {
+        bail!(
+            "connectors.wake_key_bearer: connectors.{name}: the wake key cannot be an MCP bearer"
+        );
+    }
+    let invalid_secret = spec.secrets.iter().any(|secret| match secret {
+        SecretDecl::Name(key) => key == HOOK_WAKE_KEY_ENV,
+        SecretDecl::Ref { name, .. } => name == HOOK_WAKE_KEY_ENV && spec.url.is_some(),
+    });
+    let expanded = spec.headers.values().map(String::as_str).chain([
+        spec.url.as_deref().unwrap_or_default(),
+        spec.unhosted_url.as_deref().unwrap_or_default(),
+        spec.bearer_secret.as_deref().unwrap_or_default(),
+    ]);
+    if invalid_secret
+        || spec.secret_files.contains_key(HOOK_WAKE_KEY_ENV)
+        || spec.sealed_secrets.contains_key(HOOK_WAKE_KEY_ENV)
+        || spec.config.iter().any(|key| key == HOOK_WAKE_KEY_ENV)
+        || spec.env.contains_key(HOOK_WAKE_KEY_ENV)
+        || expanded
+            .into_iter()
+            .any(|text| text.contains(HOOK_WAKE_KEY_ENV))
+    {
+        bail!(
+            "connectors.wake_key_delivery: connectors.{name}: deliver the wake key only \
+             through a hosted secrets SecretRef; it cannot enter client configuration \
+             or the per-agent secret store"
+        );
+    }
+    Ok(())
+}
+
+/// Wake-specific declaration checks for the existing connector-build entrypoint.
+pub fn validate_wake_manifest(bundle_dir: &Path) -> Result<()> {
+    if ![".claude-plugin/plugin.json", "plugin.json"]
+        .iter()
+        .any(|relative| bundle_dir.join(relative).is_file())
+    {
+        return Ok(());
+    }
+    let (_, manifest) = crate::scaffold::load_manifest_json(bundle_dir)?;
+    let Some(triggers) = manifest.get("triggers").filter(|value| !value.is_null()) else {
+        return Ok(());
+    };
+    let triggers = triggers
+        .as_array()
+        .ok_or_else(|| anyhow!("triggers.invalid: triggers must be a list"))?;
+    let mut names = BTreeSet::new();
+    for trigger in triggers {
+        let trigger = trigger
+            .as_object()
+            .ok_or_else(|| anyhow!("triggers.invalid: each trigger must be an object"))?;
+        let wake = match trigger.get("wake") {
+            None => false,
+            Some(value) => value
+                .as_bool()
+                .ok_or_else(|| anyhow!("triggers.invalid: wake must be a boolean"))?,
+        };
+        let text = |key: &str| trigger.get(key).and_then(serde_json::Value::as_str);
+        let trim = |text: &str| {
+            text.trim_matches(|c: char| c.is_whitespace() || matches!(c, '\u{1c}'..='\u{1f}'))
+                .to_string()
+        };
+        if let Some(name) = text("name").map(trim).filter(|name| !name.is_empty()) {
+            if !names.insert(name) {
+                bail!("triggers.duplicate_name: trigger names must be unique");
+            }
+        }
+        if wake {
+            if text("type") != Some("webhook") {
+                bail!("triggers.wake_type_invalid: wake requires type webhook");
+            }
+            let valid_name = text("name").is_some_and(|name| {
+                let alnum = |byte: u8| byte.is_ascii_lowercase() || byte.is_ascii_digit();
+                !name.is_empty()
+                    && name.len() <= 63
+                    && alnum(name.as_bytes()[0])
+                    && name
+                        .bytes()
+                        .all(|byte| alnum(byte) || b"._-".contains(&byte))
+            });
+            if !valid_name {
+                bail!("triggers.wake_invalid_name: invalid wake hook name");
+            }
+            if text("prompt").is_none_or(|value| trim(value).is_empty()) {
+                bail!("triggers.wake_missing_prompt: wake requires a standing prompt");
+            }
+            if trigger.contains_key("target") {
+                bail!("triggers.wake_target_forbidden: wake must not define target");
+            }
+            if trigger.contains_key("schedule") {
+                bail!("triggers.schedule_forbidden: webhook must not define schedule");
+            }
+            if trigger.contains_key("timezone")
+                && text("schedule").is_none_or(|value| trim(value).is_empty())
+            {
+                bail!("triggers.timezone_without_schedule: timezone requires a schedule");
+            }
+        }
+        if trigger.contains_key("target")
+            && text("target").is_none_or(|value| trim(value).is_empty())
+        {
+            bail!("triggers.target_invalid: target must be a nonblank string");
+        }
+        if text("type") == Some("webhook")
+            && text("path").is_none_or(|value| trim(value).is_empty())
+        {
+            bail!("triggers.webhook_missing_path: webhook requires a path");
+        }
     }
     Ok(())
 }
@@ -2363,15 +2518,29 @@ pub fn restrict_to(decl: &ConnectorsFileDecl, allowlist: Option<&[String]>) -> C
 /// `apps/worker/tests/binding/test_reserved_boot_env_pin.py` is the drift pin
 /// that fails CI if the two lists diverge -- the same mechanism that pins the
 /// Helm list.
-pub const RESERVED_CONNECTOR_SECRET_NAMES: [&str; 8] = [
+pub const RESERVED_CONNECTOR_SECRET_NAMES: [&str; 22] = [
     "ANTHROPIC_BASE_URL",
     "ANTHROPIC_API_KEY",
     "CLAUDE_CODE_OAUTH_TOKEN",
     "ANTHROPIC_AUTH_TOKEN",
     "HTTPS_PROXY",
     "HTTP_PROXY",
+    "ALL_PROXY",
+    "SSL_CERT_FILE",
+    "SSL_CERT_DIR",
     "NODE_EXTRA_CA_CERTS",
+    "NODE_TLS_REJECT_UNAUTHORIZED",
+    "NODE_OPTIONS",
     "ANTHROPIC_CUSTOM_HEADERS",
+    "https_proxy",
+    "http_proxy",
+    "all_proxy",
+    "ssl_cert_file",
+    "ssl_cert_dir",
+    "node_extra_ca_certs",
+    "node_tls_reject_unauthorized",
+    "node_options",
+    "anthropic_custom_headers",
 ];
 
 /// Whether `name` is reserved: an enumerated platform credential or
@@ -2410,16 +2579,22 @@ pub fn refuse_reserved_secret_names(decl: &ConnectorsFileDecl) -> Result<()> {
         if spec.url.is_some() || spec.unhosted_url.is_some() {
             continue;
         }
-        for name in declared_secret_names(spec)
-            .into_iter()
-            .chain(spec.secret_files.keys().cloned())
+        for name in spec
+            .secrets
+            .iter()
+            .filter_map(|secret| match secret {
+                SecretDecl::Ref { name, .. } if name == HOOK_WAKE_KEY_ENV => None,
+                SecretDecl::Name(name) | SecretDecl::Ref { name, .. } => Some(name),
+            })
+            .chain(spec.config.iter())
+            .chain(spec.secret_files.keys())
         {
-            crate::secrets::validate_name(&name).map_err(|err| {
+            crate::secrets::validate_name(name).map_err(|err| {
                 crate::exit::usage(format!(
                     "connectors.{connector}: `{name}` is not a usable secret name: {err}"
                 ))
             })?;
-            if is_reserved_secret_name(&name) {
+            if is_reserved_secret_name(name) {
                 return Err(crate::exit::usage(format!(
                     "connectors.{connector}: `{name}` is a reserved platform boot-env or \
                      model-credential key and cannot be a connector secret. Curie would resolve \
@@ -2691,6 +2866,18 @@ connectors:
             "connectors:\n  docs:\n    image: ghcr.io/example/docs-mcp:1\n    config: [ANTHROPIC_API_KEY]\n",
         );
         assert!(refuse_reserved_secret_names(&decl).is_err());
+    }
+
+    #[test]
+    fn node_tls_controls_are_refused_before_secret_resolution() {
+        for name in ["NODE_TLS_REJECT_UNAUTHORIZED", "NODE_OPTIONS"] {
+            let declared = decl(&format!(
+                "connectors:\n  docs:\n    image: ghcr.io/example/docs-mcp:1\n    secrets: [{name}]\n"
+            ));
+            assert!(refuse_reserved_secret_names(&declared).is_err());
+            assert!(refuse_reserved_env_secret_name(name).is_err());
+        }
+        assert!(refuse_reserved_env_secret_name("EXAMPLE_API_TOKEN").is_ok());
     }
 
     const NO_CLIENT_AUTH: &str = r#"

@@ -811,7 +811,7 @@ fn chart_runtime_sustains_a_ready_bounded_outage_before_restart_and_overflow() {
     assert!(storage_observer.contains("mountPath: /var/lib/otelcol"));
     assert!(storage_observer.contains("readOnly: true"));
     let observer_exec = bounded_function
-        .find("kubectl exec \"$OTEL_STORAGE_OBSERVER\"")
+        .find("kubectl --context \"$KUBE_CONTEXT\" exec \"$OTEL_STORAGE_OBSERVER\"")
         .expect("the sustained-outage path must measure storage through its PVC observer");
     let usage = bounded_function
         .find("du -sk /var/lib/otelcol")
@@ -821,18 +821,20 @@ fn chart_runtime_sustains_a_ready_bounded_outage_before_restart_and_overflow() {
         "the durable PVC usage measurement must run through the task-owned storage observer"
     );
     assert!(
-        !bounded_function.contains("kubectl exec \"$pod\" -n \"$NAMESPACE\" -- sh"),
+        !bounded_function
+            .contains("kubectl --context \"$KUBE_CONTEXT\" exec \"$pod\" -n \"$NAMESPACE\" -- sh"),
         "the distroless Collector pod must not be used to run sh for PVC measurement"
     );
     assert!(
-        !bounded_function.contains("kubectl exec \"$pod\" -n \"$NAMESPACE\" -- du"),
+        !bounded_function
+            .contains("kubectl --context \"$KUBE_CONTEXT\" exec \"$pod\" -n \"$NAMESPACE\" -- du"),
         "the distroless Collector pod must not be used to run du for PVC measurement"
     );
     let observer_delete = text
-        .find("kubectl delete pod \"$OTEL_STORAGE_OBSERVER\"")
+        .find("kubectl --context \"$KUBE_CONTEXT\" delete pod \"$OTEL_STORAGE_OBSERVER\"")
         .expect("the PVC observer must release its read-only mount before Collector restart");
     let collector_delete = text
-        .find("kubectl delete pod \"$OLD_COLLECTOR_POD\"")
+        .find("kubectl --context \"$KUBE_CONTEXT\" delete pod \"$OLD_COLLECTOR_POD\"")
         .expect("chart runtime must retain the explicit Collector pod restart");
     assert!(
         bounded < observer_delete && observer_delete < collector_delete,
@@ -906,7 +908,9 @@ fn chart_runtime_falsifies_collector_metrics_ingress_policy() {
         .map(|offset| temporary_allow + offset)
         .expect("the denied observer must scrape after only its targeted allow is applied");
     let remove_allow = proof
-        .find("kubectl delete networkpolicy \"$OTEL_METRICS_TEST_ALLOW\"")
+        .find(
+            "kubectl --context \"$KUBE_CONTEXT\" delete networkpolicy \"$OTEL_METRICS_TEST_ALLOW\"",
+        )
         .expect("proof must remove its temporary targeted allow");
     assert!(
         selected_positive < unselected_negative
@@ -930,6 +934,7 @@ fn chart_runtime_falsifies_collector_metrics_ingress_policy() {
 #[test]
 fn cluster_worker_probe_uses_the_configured_namespace() {
     const NAMESPACE: &str = "test-2593-chart-ladder";
+    const CONTEXT: &str = "scratch-cluster";
 
     let harness = tempfile::tempdir().expect("create cluster probe harness");
     let invocation_log = harness.path().join("kubectl-invocation.log");
@@ -955,6 +960,7 @@ printf '1'
         .arg(script)
         .env("PATH", path)
         .env("CURIE_NAMESPACE", NAMESPACE)
+        .env("KUBE_CONTEXT", CONTEXT)
         .env("STUB_KUBECTL_INVOCATION_LOG", &invocation_log)
         .output()
         .expect("run the real cluster worker probe");
@@ -974,7 +980,7 @@ printf '1'
     assert_eq!(
         invocation,
         format!(
-            "-n {NAMESPACE} get deployment/curie-worker -o \
+            "--context {CONTEXT} -n {NAMESPACE} get deployment/curie-worker -o \
              jsonpath={{.spec.template.spec.containers[*].env[?(@.name==\"CURIE_FAKE_MODEL\")].value}}"
         ),
         "the direct worker read must use the configured namespace while preserving the standard release's deployment and model-mode assertion"
@@ -2646,7 +2652,7 @@ fn live_cluster_rung_emits_the_graded_reply_for_passing_cases() {
 fn cluster_rung_uses_the_worker_delivery_budget_without_weakening_reply_gates() {
     let timeout_reader = ladder_function("cluster_reply_timeout_seconds");
     assert!(
-        timeout_reader.contains(r#"kubectl -n "$CURIE_NAMESPACE""#)
+        timeout_reader.contains(r#"kubectl --context "$KUBE_CONTEXT" -n "$CURIE_NAMESPACE""#)
             && timeout_reader.contains("cluster_worker_deploy")
             && timeout_reader.contains("-o json"),
         "the timeout reader must inspect the selected worker Deployment as JSON; helper contents:\n{timeout_reader}"
@@ -2919,6 +2925,10 @@ done
 require_expected_ns_rel() {
     expect_ns="${STUB_EXPECT_NAMESPACE:-curie}"
     expect_rel="${STUB_EXPECT_RELEASE:-curie}"
+    if [ "$context" != "${STUB_EXPECT_CONTEXT:-stub-context}" ]; then
+        echo "unexpected cluster context: $context" >&2
+        exit 97
+    fi
     if [ -z "$namespace" ] || [ -z "$release" ] \
         || [ "$namespace" != "$expect_ns" ] || [ "$release" != "$expect_rel" ]; then
         echo "unexpected curie invocation: $*" >&2
@@ -3052,7 +3062,7 @@ case "$*" in
         printf '%s\n' '{"name":"curie-demo"}' > curie-demo/.claude-plugin/plugin.json
         echo "stub try all done"
         ;;
-    "--json cluster status --namespace "*" --release "*)
+    "--json cluster status --context ${STUB_EXPECT_CONTEXT:-stub-context} --namespace "*" --release "*)
         # The case-ids-only control's single injection point: after the local
         # rung deployed and before the cluster rung does, rewrite ONLY the case
         # ids in the bundle both rungs deploy. Suite name and case count are
@@ -3214,7 +3224,7 @@ print(json.dumps({
         fi
         emit_deploy "${STUB_LOCAL_SHA256:-$(sha_of_bundle "$bundle_dir")}"
         ;;
-    "--json cluster deploy --namespace "*" --release "*" --plugin-dir "*)
+    "--json cluster deploy --context ${STUB_EXPECT_CONTEXT:-stub-context} --namespace "*" --release "*" --plugin-dir "*)
         require_expected_ns_rel "$@"
         printf '%s' "$bundle_dir" > "$STUB_STATE/last_plugin_dir"
         emit_deploy "${STUB_CLUSTER_SHA256:-$(sha_of_bundle "$bundle_dir")}"
@@ -3304,18 +3314,18 @@ print(json.dumps({
     "--json local eval --dry-run")
         emit_plan local 1 weather
         ;;
-    "--json cluster eval --namespace "*" --release "*" --cases "*--dry-run*)
+    "--json cluster eval --context ${STUB_EXPECT_CONTEXT:-stub-context} --namespace "*" --release "*" --cases "*--dry-run*)
         require_expected_ns_rel "$@"
         # Only the cluster count is an override: it is the knob the suite
         # divergence control moves. Everything else is the constant the weather
         # bundle declares.
         emit_plan cluster "${STUB_CLUSTER_PLAN_COUNT:-1}" weather
         ;;
-    "--json cluster eval --namespace "*" --release "*" --listen-host "*--dry-run*)
+    "--json cluster eval --context ${STUB_EXPECT_CONTEXT:-stub-context} --namespace "*" --release "*" --listen-host "*--dry-run*)
         require_expected_ns_rel "$@"
         emit_plan cluster "${STUB_CLUSTER_PLAN_COUNT:-1}" weather
         ;;
-    "--json cluster eval --namespace "*" --release "*" --dry-run")
+    "--json cluster eval --context ${STUB_EXPECT_CONTEXT:-stub-context} --namespace "*" --release "*" --dry-run")
         require_expected_ns_rel "$@"
         emit_plan cluster "${STUB_CLUSTER_PLAN_COUNT:-1}" weather
         ;;
@@ -3331,7 +3341,7 @@ print(json.dumps({
         fi
         exit "${STUB_EVAL_EXIT:-0}"
         ;;
-    "--json cluster eval --namespace "*" --release "*" --cases "*|"--json cluster eval --namespace "*" --release "*)
+    "--json cluster eval --context ${STUB_EXPECT_CONTEXT:-stub-context} --namespace "*" --release "*" --cases "*|"--json cluster eval --context ${STUB_EXPECT_CONTEXT:-stub-context} --namespace "*" --release "*)
         require_expected_ns_rel "$@"
         if [ -n "${STUB_EVAL_MARKER:-}" ]; then
             printf '%s\n' called > "$STUB_EVAL_MARKER"
@@ -3724,6 +3734,7 @@ fn run_ladder_script(script: &Path, harness: &Path, envs: &[(&str, &str)]) -> Ou
             UNKNOWN_OBSERVABILITY_TRACE_ID,
         )
         .env("STUB_UNAVAILABLE_API_URL", UNAVAILABLE_API_URL)
+        .env("CURIE_E2E_KUBE_CONTEXT", "stub-context")
         .env_remove("CURIE_E2E_TIERS")
         .env_remove("CURIE_E2E_LIVE")
         .env_remove("CURIE_E2E_LISTEN_HOST")
@@ -6045,6 +6056,7 @@ CLUSTER_PRODUCT_EVIDENCE="$WORKDIR/evidence.json"
 PRODUCT_OBSERVABILITY_RUN_ID=run-cluster-receipts
 OBSERVABILITY_POLL_ATTEMPTS=1
 OBSERVABILITY_POLL_INTERVAL_SECONDS=0
+KUBE_CONTEXT=scratch-cluster
 CURIE_NAMESPACE=test-cluster-receipts
 CURIE_RELEASE=test-cluster-receipts
 CLUSTER_IMAGE_IDS_MATCH=false

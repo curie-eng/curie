@@ -728,6 +728,21 @@ def test_execute_revalidates_current_authority(
         tenant = uuid.uuid4()
         table = "agents" if change == "agent_tenant" else "agent_channels"
         where = f"id='{agent_id}'" if change == "agent_tenant" else binding
+        if change == "agent_tenant":
+            assert before["model_auth_mode"] == "service"
+            assert before["owner_principal_id"] is None
+            assert before["enrollment_generation"] is None
+            # Older service writers may omit tenant snapshots during the expand window.
+            item_id = uuid.UUID(before["work_item_id"])
+            run.write_sql(
+                "UPDATE curie.execution_requests SET tenant_id=NULL "
+                f"WHERE work_item_id='{item_id}'; "
+                f"UPDATE curie.work_items SET tenant_id=NULL WHERE id='{item_id}'"
+            )
+            assert request_state(run, before["id"])["tenant_id"] is None
+            assert run.sql(
+                f"SELECT to_json(tenant_id IS NULL) FROM curie.work_items WHERE id='{item_id}'"
+            ) is True
         run.write_sql(
             "INSERT INTO curie.tenants (id,deployment_id,status) "
             f"VALUES ('{tenant}','acme-other','active'); "

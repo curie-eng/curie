@@ -21,7 +21,7 @@ from ..sandbox.types import (
 )
 
 if TYPE_CHECKING:
-    pass
+    from ..ui_evidence import UiEvidenceCapture
 
 from . import constants
 
@@ -224,6 +224,7 @@ class TurnOutcome:
     approval_display: str | None = None
     publication_snapshot: RunnerWorkspaceSnapshot | None = None
     publication_snapshot_error: str | None = None
+    ui_evidence: UiEvidenceCapture | None = None
     review_origin_key: str | None = None
     # The repository this turn attached because its own message named it
     # (#2659). Read by `_pause_for_approval` for the notice composition. None on
@@ -266,6 +267,14 @@ class ThreadBusyError(RuntimeError):
     cron turn does not take this path: the kernel records its hook run
     ``deferred`` and the scheduler retries it within the catch-up bound (#2929).
     """
+
+
+class HandoffPending(ThreadBusyError):
+    """A retained turn has not reached its durable handoff boundary."""
+
+
+class PriorSideEffectObserved(Exception):
+    """The delivery's replay fence was recovered while routing its retry."""
 
 
 class ToolAccessUnenforced(Exception):
@@ -324,6 +333,30 @@ class LiveSessionBusy(ThreadBusyError):
     The one ``ThreadBusyError`` a cron fire records as ``deferred`` (#2929): the
     others (a pending publication, a failed handoff) are not a live session.
     """
+
+
+class RequesterHandoffPending(LiveSessionBusy):
+    """A different requester met the thread's live turn (ADR 0270 decision 3).
+
+    Raised under the per-thread lock before any steer, start or interrupt, so
+    nothing reaches the runner. As a ``LiveSessionBusy`` it keeps every
+    deferral the kernel already gives a live session: the stream entry stays
+    pending and is redelivered, a cron fire records ``deferred``, and an
+    unstarted work item defers ``thread_busy``. The message names the thread
+    only, never the requester.
+    """
+
+
+class RequesterTokenWindowShort(RunnerError):
+    """A requester sandbox's caller token cannot cover the turn about to start.
+
+    ADR 0270 decision 3: the admission check right before the runner start.
+    A ``RunnerError``, so it is the retryable ``runner-error`` outcome; the
+    retry replaces the sandbox with one whose claim-time token covers the turn.
+    """
+
+    def __init__(self) -> None:
+        super().__init__("requester_token_window_short")
 
 
 class CatchUpExpired(ThreadBusyError):

@@ -543,9 +543,9 @@ class UpgradeDrainGate:
 
 
 def _client(config: WorkerConfig) -> Redis:
-    from redis.asyncio import Redis
+    from curie_internal.valkey import AsyncRedis
 
-    return Redis(**config.valkey_client_kwargs())
+    return AsyncRedis(**config.valkey_client_kwargs())
 
 
 async def _read_claim_status(config: WorkerConfig) -> ClaimStatus:

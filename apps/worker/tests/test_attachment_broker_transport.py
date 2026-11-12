@@ -38,12 +38,12 @@ def test_error_body_is_bounded_and_slow_body_yields_before_eof() -> None:
     thread.start()
     base = f"http://127.0.0.1:{server.server_port}"
     try:
-        error = attachments._slack_transport(
+        error = attachments._file_transport(
             method="GET", url=base + "/error", headers={}, chunk_bytes=1024 * 1024
         )
         assert error.status == 500
         assert len(b"".join(error.chunks)) <= 65537
-        response = attachments._slack_transport(
+        response = attachments._file_transport(
             method="GET", url=base + "/slow", headers={}, chunk_bytes=1024 * 1024
         )
         with ThreadPoolExecutor(max_workers=1) as pool:
@@ -87,7 +87,7 @@ def test_cancel_scope_interrupts_owned_stalled_socket() -> None:
 
     def read() -> None:
         with scope:
-            response = attachments._slack_transport(
+            response = attachments._file_transport(
                 method="GET",
                 url=f"http://127.0.0.1:{server.server_port}",
                 headers={},
@@ -147,7 +147,7 @@ def test_scope_interrupts_dripping_response_head(stage: str, stop: str) -> None:
 
     def read() -> None:
         with scope:
-            attachments._slack_transport(
+            attachments._file_transport(
                 method="GET",
                 url=f"{'https' if stage == 'tls' else 'http'}://127.0.0.1:{server.server_address[1]}",
                 headers={},

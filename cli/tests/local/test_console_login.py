@@ -11,6 +11,7 @@ import json
 import os
 import pathlib
 import shutil
+import socket
 import subprocess
 import urllib.error
 import urllib.request
@@ -162,7 +163,6 @@ def stack(request: pytest.FixtureRequest, tmp_path: pathlib.Path, source_artifac
       FACTORY_ENABLED: "false"
       GITHUB_APP_ID: ""
       GITHUB_APP_PRIVATE_KEY: ""
-      SLACK_BOT_TOKEN: ""
       OTEL_EXPORTER_OTLP_ENDPOINT: ""
       OTEL_EXPORTER_OTLP_PROTOCOL: ""
     ports: !override ["127.0.0.1::8000"]
@@ -174,10 +174,12 @@ def stack(request: pytest.FixtureRequest, tmp_path: pathlib.Path, source_artifac
       S3_ENDPOINT_URL: "${{S3_ENDPOINT_URL}}"
       CURIE_API_URL: "${{CURIE_API_URL}}"
       CURIE_DOCKER_NETWORK: "${{CURIE_DOCKER_NETWORK}}"
-      SLACK_API_BASE_URL: "http://127.0.0.1:${{CURIE_LOCAL_STUB_PORT}}/api/"
       OTEL_EXPORTER_OTLP_ENDPOINT: ""
     volumes: !override
       - /var/run/docker.sock:/var/run/docker.sock
+  curie-channel-gateway:
+    environment:
+      SLACK_API_BASE_URL: "http://127.0.0.1:${{CURIE_LOCAL_STUB_PORT}}/api/"
 networks:
   curie_runner:
     name: "{project}_runner"
@@ -198,6 +200,9 @@ networks:
         "all_proxy",
     ):
         env.pop(name, None)
+    with socket.socket() as gateway_probe:
+        gateway_probe.bind(("127.0.0.1", 0))
+        gateway_port = gateway_probe.getsockname()[1]
     env.update(
         {
             "COMPOSE_PROJECT_NAME": project,
@@ -212,6 +217,7 @@ networks:
             "CURIE_LOCAL_POSTGRES_HOST": "127.0.0.1",
             "CURIE_LOCAL_POSTGRES_PORT": "1",
             "CURIE_LOCAL_STUB_PORT": "1",
+            "CURIE_LOCAL_GATEWAY_PORT": str(gateway_port),
             "CURIE_API_KEY": POISONED_KEY,
             "CURIE_TEST_DISCOVERED_KEY": api_key,
             "CURIE_TEST_KUBECTL_LOG": str(kubectl_log),

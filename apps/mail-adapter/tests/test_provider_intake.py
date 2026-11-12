@@ -4,7 +4,7 @@ ADR 0228 rebuilds the intake path once, in the neutral adapter, behind a gate
 only a verifying provider can open. These tests drive it end to end: the real
 adapter, its own egress server, the fake AgentMail HTTP server behind
 `VerifyingTestProvider`, and the fake platform. Nothing inside
-`curie_mail_adapter` is patched.
+`curie_channel_gateway.mail` is patched.
 
 The gate (decision 3): before any fetch, a provider that does not verify senders
 refuses everything, and the listed From must be one mailbox the sender filter
@@ -31,12 +31,12 @@ from _support import (
     update,
 )
 from _verifying_provider import VerifyingTestProvider, failed, verified
-from curie_mail_adapter.adapter import (
+from curie_channel_gateway.mail.adapter import (
     APPROVAL_CARD_REF_PREFIX,
     APPROVAL_REF_PATTERN,
     MailAdapter,
 )
-from curie_mail_adapter.config import MailAdapterConfig
+from curie_channel_gateway.mail.config import MailAdapterConfig
 
 PRINCIPAL = "adp.test-payload.test-signature"
 APPROVER = "approver@example.com"

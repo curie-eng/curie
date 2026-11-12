@@ -58,14 +58,14 @@ satisfying the egress Protocol, or out of process over the HTTP wire.
   started the turn: a person's message or a job), `attachments`
   (`QueuedTurn.attachments`, a list of `Attachment` file REFERENCES — an
   adapter-scoped opaque `id` plus a `name`, never bytes and deliberately never a
-  url, so only the worker's `apps/worker/src/curie_worker/attachments.py::AttachmentFilePort` can resolve one), and `reply_handle` — a `ReplyHandle`
+  url, so only the worker's `packages/channel-gateway/src/curie_channel_gateway/ports/reads.py::FileSource` can resolve one), and `reply_handle` — a `ReplyHandle`
   (`packages/aci-protocol/src/aci_protocol/turn.py::ReplyHandle`) carrying the required
   `kind` and `channel` routing pair, required nullable `placeholder`, an optional
   per-turn `endpoint`, and optional `adapter` (`ReplyHandle.adapter`, the egress
   adapter identity whose credential authenticates the reply). The Slack adapter
   currently supplies the pre-posted reply ts that the worker edits in place. The
   dispatcher serializes the turn to a single Stream field via `to_stream_fields`
-  (`apps/dispatcher/src/curie_dispatcher/queue.py::to_stream_fields`), keyed by
+  (`packages/curie-internal/src/curie_internal/turn_queue.py::to_stream_fields`), keyed by
   `STREAM_PAYLOAD_FIELD = "payload"`. That key is not the dispatcher's: it is frozen-package
   contract in
   `packages/aci-protocol/src/aci_protocol/service_config.py::STREAM_PAYLOAD_FIELD`, imported
@@ -81,7 +81,7 @@ satisfying the egress Protocol, or out of process over the HTTP wire.
   Its `text` is the person's message, except in a thread whose root this bot
   posted: there the root is quoted ahead of it as untrusted context inside a
   `<prior_assistant_reply>` block
-  (`apps/dispatcher/src/curie_dispatcher/thread_context.py::SlackThreadContext`),
+  (`packages/channel-gateway/src/curie_channel_gateway/slack/thread_context.py::SlackThreadContext`),
   with root slashes neutralized as XML entities so repository-looking alert
   text stays inert even to an older worker's raw repository parser during a
   rolling upgrade.
@@ -127,11 +127,11 @@ satisfying the egress Protocol, or out of process over the HTTP wire.
   keeps ordinary behavior only for an ordinary source.
 - **Egress** — the `ReplySink` Protocol (`apps/worker/src/curie_worker/reply_sink.py::ReplySink`),
   whose one method is `async def emit(self, event, *, route, best_effort_unreachable=False)`
-  (`apps/worker/src/curie_worker/reply_sink.py::ReplySink.emit`) — four versioned neutral
+  (`packages/channel-gateway/src/curie_channel_gateway/ports/reply.py::ReplyEventTransport.emit`) — four versioned neutral
   events (`turn.status`, `reply.update`, `reply.post`, `turn.completed`) over a
   worker-local `TargetRoute`. Beside the verb, the kernel asks two optional capability
   questions that are not on the Protocol: `undeliverable_reason(kind, route)`, which drops a
-  turn addressed to a Slack identity this worker holds no token for before any model call,
+  turn addressed to an undeclared Slack identity before any model call,
   and `edits_in_place(kind, route)`, which decides whether a sibling-limit notice can edit
   the placeholder. `ReplySinkRouter`
   (`apps/worker/src/curie_worker/reply_sink.py::ReplySinkRouter`) finds them with `getattr`
@@ -156,11 +156,11 @@ satisfying the egress Protocol, or out of process over the HTTP wire.
     empty status is the clear.
 
   Slack dialect and widget shape stay BELOW that port, in `SlackReplyAdapter`
-  (`apps/worker/src/curie_worker/slack_sink.py::SlackReplyAdapter`) — its edit-in-place
+  (`packages/channel-gateway/src/curie_channel_gateway/slack/slack_sink.py::SlackReplyAdapter`) — its edit-in-place
   `chat.update`, its `chat.postMessage`, and its assistant-thread status — plus `to_mrkdwn`
-  (`apps/worker/src/curie_worker/mrkdwn.py::to_mrkdwn`) and the Block Kit rendering in
-  `render` (`apps/worker/src/curie_worker/blocks.py::render`) and `approval_card`
-  (`apps/worker/src/curie_worker/blocks.py::approval_card`).
+  (`packages/channel-gateway/src/curie_channel_gateway/slack/mrkdwn.py::to_mrkdwn`) and the Block Kit rendering in
+  `render` (`packages/channel-gateway/src/curie_channel_gateway/slack/blocks.py::render`) and `approval_card`
+  (`packages/channel-gateway/src/curie_channel_gateway/slack/blocks.py::approval_card`).
   The third sink is the built-in cluster-message relay,
   `_ClusterMessageReplyAdapter`
   (`apps/worker/src/curie_worker/reply_sink.py::_ClusterMessageReplyAdapter`), selected by
@@ -175,7 +175,7 @@ satisfying the egress Protocol, or out of process over the HTTP wire.
   and `{"detail": "caller_not_allowed"}`, which every adapter treats as final (a
   403 without that code stays retryable). The Slack dispatcher has no database, so it
   asks `POST /channels/admission` (platform key only) through `AdmissionGate`
-  (`apps/dispatcher/src/curie_dispatcher/admission.py::AdmissionGate`) after its
+  (`packages/channel-gateway/src/curie_channel_gateway/slack/admission.py::AdmissionGate`) after its
   own filters and before `claim_event`, on mentions, direct messages and
   turn-starting clicks, with the sender (plus the bot id when a bot sent it) or the
   clicking user. It caches answers per route for 30 seconds in memory and in
@@ -193,7 +193,7 @@ satisfying the egress Protocol, or out of process over the HTTP wire.
   linked account who passes `admit`: when OIDC is enabled with an HTTPS redirect
   origin, `POST /channels/admission` may return a
   `connect_url`, and the dispatcher's `_refused_caller`
-  (`apps/dispatcher/src/curie_dispatcher/handlers.py`) posts it as a private
+  (`packages/channel-gateway/src/curie_channel_gateway/slack/handlers.py`) posts it as a private
   ephemeral "Connect your account, then ask again." offer while still refusing the
   turn;
   the dispatcher logs `caller_not_allowed` or `admission_unavailable` and counts
@@ -212,7 +212,7 @@ satisfying the egress Protocol, or out of process over the HTTP wire.
   `CURIE_SLACK_DELIVERY_CANARY_CHANNELS` proves that Slack still delivers to that
   identity, and nothing more. The dispatcher counts it on
   `curie.slack.delivery_canary` and refuses it as `delivery_canary` in
-  `process_event` (`apps/dispatcher/src/curie_dispatcher/handlers.py::process_event`),
+  `process_event` (`packages/channel-gateway/src/curie_channel_gateway/slack/handlers.py::process_event`),
   after envelope validation and before relevance, admission and `claim_event`. It
   never asks the API, posts a placeholder or enqueues a turn (#4960).
 - **Binding** — a channel resolves to a deployment by exact `(kind, address)` equality in
@@ -230,7 +230,7 @@ satisfying the egress Protocol, or out of process over the HTTP wire.
 Slack and Discord provide production ingress and egress; email provides HTTP egress,
 with AgentMail inbound admission disabled. There is also a CLI transport stub. Slack ingress
 is `apps/dispatcher` (Bolt / Socket Mode); Slack egress is `SlackReplyAdapter`
-(`apps/worker/src/curie_worker/slack_sink.py::SlackReplyAdapter`) on the Slack
+(`packages/channel-gateway/src/curie_channel_gateway/slack/slack_sink.py::SlackReplyAdapter`) on the Slack
 Web API. Discord (`adapters/discord`) and email's reply receiver (`apps/mail-adapter`) join on
 the authenticated HTTP edge: they neither construct a `QueuedTurn` nor implement
 `ReplySink`; the worker delivers through `HttpReplyAdapter`
@@ -265,10 +265,10 @@ Anything decidable from the routed payload belongs at the routing seam
 (`BindingResolver.resolve` above), so what stays in `apps/dispatcher` is normalization plus
 the few refusals that seam structurally cannot make. Every drop the adapter's own code
 makes is an enumerated member of
-`apps/dispatcher/src/curie_dispatcher/relevance.py::DropReason`, carries a documented
-rationale in `apps/dispatcher/src/curie_dispatcher/relevance.py::DROP_RATIONALES`, and is
+`packages/channel-gateway/src/curie_channel_gateway/slack/relevance.py::DropReason`, carries a documented
+rationale in `packages/channel-gateway/src/curie_channel_gateway/slack/relevance.py::DROP_RATIONALES`, and is
 emitted as exactly one INFO record by
-`apps/dispatcher/src/curie_dispatcher/relevance.py::drop`. There are no silent drops inside
+`packages/channel-gateway/src/curie_channel_gateway/slack/relevance.py::drop`. There are no silent drops inside
 the adapter: a bare `return None` on the ingest path is the defect #2006 closed, not a
 style preference. The module is the system of record for this table, and the dispatcher's
 tests assert the two sets equal in both directions.
@@ -289,14 +289,14 @@ tests assert the two sets equal in both directions.
 | `UNADDRESSABLE_ACTION` | An App Home or modal click carries no channel and no message, so there is no thread in which a reply could be delivered. |
 
 The last three sit on the Block Kit click lane, which is a real ingest lane:
-`apps/dispatcher/src/curie_dispatcher/handlers.py::process_action` mints a `QueuedTurn`
-exactly as `apps/dispatcher/src/curie_dispatcher/handlers.py::process_event` does, so a
+`packages/channel-gateway/src/curie_channel_gateway/slack/handlers.py::process_action` mints a `QueuedTurn`
+exactly as `packages/channel-gateway/src/curie_channel_gateway/slack/handlers.py::process_event` does, so a
 dropped click is inbound loss of the same class. Of the three, only `UNADDRESSABLE_ACTION`
 is a disposition Bolt actually delivers today: an App Home or modal click really does
 arrive with no channel and no message. `NO_ACTION_IN_PAYLOAD` and `EMPTY_ACTION_COMMAND`
 are **defensive guards on that lane that the current matcher does not reach**. The
 catch-all registration in
-`apps/dispatcher/src/curie_dispatcher/handlers.py::register_handlers` is
+`packages/channel-gateway/src/curie_channel_gateway/slack/handlers.py::register_handlers` is
 `@app.action(re.compile(r".+"))`, and `slack_bolt` resolves the clicked action inside its
 own matcher before invoking the listener: a payload with an empty `actions` list raises
 there rather than arriving at `process_action`, and an empty `action_id` never matches
@@ -310,7 +310,7 @@ absent — it is *handled* by the dedicated approval listener, not dropped.
 
 - **The framework's admission boundary sits above the adapter, and is documented rather
   than re-implemented.** Three of Bolt's own mechanisms admit or refuse an event before any
-  listener in `apps/dispatcher/src/curie_dispatcher/handlers.py` runs, so none of them can
+  listener in `packages/channel-gateway/src/curie_channel_gateway/slack/handlers.py` runs, so none of them can
   be a `DropReason`. `slack_bolt`'s built-in `IgnoringSelfEvents` middleware compares the
   incoming identity against the authorized bot identity and acks a self-authored event
   without invoking a listener, logging only at DEBUG — so at production log levels that
@@ -332,7 +332,7 @@ absent — it is *handled* by the dedicated approval listener, not dropped.
   `(kind, channel)` pair, so the routing seam has no field on which to tell a mention from
   ordinary chatter and would simply mint a turn.
 - **Subtype handling is open-world.**
-  `apps/dispatcher/src/curie_dispatcher/relevance.py::NON_CONTENT_SUBTYPES` is a small
+  `packages/channel-gateway/src/curie_channel_gateway/slack/relevance.py::NON_CONTENT_SUBTYPES` is a small
   closed denylist of things that are structurally not new user content; everything else,
   including subtypes Slack ships after this was written, is admitted and left to routing.
   The inverse rule this replaced — refuse *any* subtype — swallowed `file_share` (a person
@@ -359,7 +359,7 @@ absent — it is *handled* by the dedicated approval listener, not dropped.
 - **Bot authorship is a mention-lane rule, and its cost is accepted.** A foreign bot's
   *root* `@`-mention is admitted — the alert-app case this work exists for, whose body
   typically arrives as Block Kit and is normalized by
-  `apps/dispatcher/src/curie_dispatcher/inbound_text.py::derive_text` rather than read off
+  `packages/channel-gateway/src/curie_channel_gateway/slack/inbound_text.py::derive_text` rather than read off
   an empty top-level `text`. A bot-authored mention carrying `thread_ts` is refused as
   `BOT_AUTHORED_THREAD_REPLY` for the cross-installation loop above, unless the event's
   exact channel/bot pair is in `CURIE_SLACK_THREADED_BOT_ALLOWLIST` or its `bot_id`
@@ -481,10 +481,10 @@ only for a provider that verifies senders. The AgentMail provider exposes labels
 arbitrary headers without a trusted aligned authentication verdict or header
 provenance guarantee, so it declares that it cannot verify senders, and
 `MailAdapter._listing_rejection`
-(`apps/mail-adapter/src/curie_mail_adapter/adapter.py::MailAdapter._listing_rejection`)
+(`packages/channel-gateway/src/curie_channel_gateway/mail/adapter.py::MailAdapter._listing_rejection`)
 refuses all of its inbound messages, including approval replies, before any fetch. An
 allowed sender list cannot replace that authentication evidence. Outbound reply and approval-card rendering remain
-implemented through `apps/mail-adapter/src/curie_mail_adapter/egress.py::EgressHandler`.
+implemented through `packages/channel-gateway/src/curie_channel_gateway/mail/egress.py::EgressHandler`.
 
 1. **Fixed (#7).** The ingress field names were Slack's (`slack_event_id`, `thread_ts`,
    `placeholder_ts`); the payload was promoted into `packages/aci-protocol` as `QueuedTurn`
@@ -493,7 +493,7 @@ implemented through `apps/mail-adapter/src/curie_mail_adapter/egress.py::EgressH
    `ReplyHandle.endpoint`, so a real Slack workspace and a no-Slack CLI stub can coexist on
    one deployment. `WorkerConfig.slack_api_base_url` (`apps/worker/src/curie_worker/config.py::WorkerConfig`)
    is now only the default when a turn sets no `endpoint`, fed to `SlackReplyAdapter`
-   (`apps/worker/src/curie_worker/slack_sink.py::SlackReplyAdapter.__init__`), which
+   (`packages/channel-gateway/src/curie_channel_gateway/slack/slack_sink.py::SlackReplyAdapter.__init__`), which
    also makes it the only TRUSTED Slack origin, so a per-turn endpoint elsewhere is
    refused rather than handed the platform bot token.
 3. **Still leaks: egress semantics.** The streamed reply is edit-a-placeholder: it runs on
@@ -502,12 +502,12 @@ implemented through `apps/mail-adapter/src/curie_mail_adapter/egress.py::EgressH
    posts platform-owned messages such as approval cards and settles them in place afterwards.
    Email is another datapoint: it accumulates reply events per
    `(conversation_id, reply_ref)` and sends one threaded mail on `turn.completed`
-   (`apps/mail-adapter/src/curie_mail_adapter/adapter.py::MailAdapter.send_reply`).
+   (`packages/channel-gateway/src/curie_channel_gateway/mail/adapter.py::MailAdapter.send_reply`).
 4. **Still leaks: Slack-only capability queries.** The kernel calls
    `undeliverable_reason` and `edits_in_place` on its sink
    (`apps/worker/src/curie_worker/kernel/core.py::Kernel`), but only `SlackReplyAdapter`
-   (`apps/worker/src/curie_worker/slack_sink.py::SlackReplyAdapter.undeliverable_reason`,
-   `apps/worker/src/curie_worker/slack_sink.py::SlackReplyAdapter.edits_in_place`) implements
+   (`packages/channel-gateway/src/curie_channel_gateway/slack/slack_sink.py::SlackReplyAdapter.undeliverable_reason`,
+   `packages/channel-gateway/src/curie_channel_gateway/slack/slack_sink.py::SlackReplyAdapter.edits_in_place`) implements
    them. They are duck-typed rather than declared on `ReplySink`, so a second adapter that
    edits in place or holds per-identity credentials gets the defaults silently, with no
    conformance failure.
@@ -538,7 +538,7 @@ implemented through `apps/mail-adapter/src/curie_mail_adapter/egress.py::EgressH
    (`apps/worker/src/curie_worker/kernel/core.py::Kernel._resolve_attachments`), and the
    lane picks the file port from its kind
    (`apps/worker/src/curie_worker/attachments.py::AttachmentCoordinator`). Slack keeps
-   `apps/worker/src/curie_worker/attachments.py::SlackFileClient` (`files.info` /
+   `packages/channel-gateway/src/curie_channel_gateway/slack/files.py::SlackFileClient` (`files.info` /
    `url_private_download` with the bot token; a missing `files:read` scope degrades
    attachments only, 4a71d99f). Every other kind goes to
    `apps/worker/src/curie_worker/attachments.py::ChannelPortFileClient`, which fetches

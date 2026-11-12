@@ -79,11 +79,14 @@ spec:
         {{- include "curie.labels" . | nindent 8 }}
         {{- include "curie.selectorLabels" (dict "root" . "component" "api") | nindent 8 }}
       annotations:
+        {{- with (include "curie.channelGateway.tlsChecksum" .) }}
+        checksum/gateway-tls: {{ . | quote }}
+        {{- end }}
         {{- with (include "curie.secretChecksum" (dict
         "root" $
         "keys" (list "apiKey" "approvalChatAttesterSecret" "remediationAuthorityKey" "internalWorkerToken" "installationId" "githubWebhookSecret")
         "refs" $checksumRefs
-        "env" (printf "%s\n%s\n%s\n%s\n%s" (include "curie.env.postgres" $) (include "curie.env.valkey" $) (include "curie.env.slack" (dict "root" $ "workload" "api")) (include "curie.env.otel" (dict "root" $ "extraEnv" $.Values.api.extraEnv)) $checksumExtraEnv))) }}
+        "env" (printf "%s\n%s\n%s\n%s\n%s\n%s" (include "curie.env.postgres" $) (include "curie.env.valkey" $) (include "curie.env.slack" (dict "root" $ "workload" "api")) (include "curie.env.channelGateway" (dict "root" $ "caller" "api")) (include "curie.env.otel" (dict "root" $ "extraEnv" $.Values.api.extraEnv)) $checksumExtraEnv))) }}
         checksum/secret: {{ . }}
         {{- end }}
         {{- with (include "curie.placement.annotations" (dict "root" $ "class" "platform")) }}
@@ -270,6 +273,15 @@ spec:
             # the render when it is on and the executor is off.
             - name: CURIE_REMEDIATION_ENABLED
               value: {{ include "curie.remediationEnabled" . | quote }}
+            # Delivery budget and optional cron claim lease. Both come from the
+            # worker values, the same source the worker Deployment renders, so
+            # the pair cannot be split. Null leaves the lease unset.
+            - name: CURIE_DELIVERY_BUDGET_S
+              value: {{ .Values.worker.deliveryBudgetSeconds | quote }}
+            {{- if .Values.worker.hookClaimLeaseSeconds }}
+            - name: CURIE_HOOK_CLAIM_LEASE_S
+              value: {{ .Values.worker.hookClaimLeaseSeconds | quote }}
+            {{- end }}
             # The test installation declaration (ADR 0202 decision 1). The
             # dispatcher renders the same two values from the same helpers;
             # secrets.yaml refuses the render when it is on and unsafe.
@@ -481,14 +493,9 @@ spec:
               value: {{ $resumeReconcilerGrace | quote }}
             - name: RESUME_RECONCILER_BATCH_LIMIT
               value: {{ .Values.api.resumeReconciler.batchLimit | quote }}
-            # Slack bot token for the approval user-group authorizer (#420): the
-            # API resolves usergroups.users.list itself rather than trusting a
-            # caller-asserted membership claim (ADR-0034). Every Slack identity's
-            # bot token comes from the one helper dispatcher.yaml and worker.yaml
-            # also render (curie.env.slack), so the three cannot drift apart.
-            # Rendered unconditionally; a declared approver group with no token
-            # then fails closed at resolve time, which is the intended posture.
+            # Identity declarations select gateway ports without mounting provider credentials.
             {{- include "curie.env.slack" (dict "root" . "workload" "api") | trim | nindent 12 }}
+            {{- include "curie.env.channelGateway" (dict "root" . "caller" "api") | nindent 12 }}
             # Expiry sweeper cadence (#412). Rendered unconditionally, not behind
             # an optional-value guard, because the disable value 0 is falsy in Go
             # templates and would be silently dropped, leaving the app default
@@ -532,8 +539,9 @@ spec:
           {{- $forgeCredentials := include "curie.factory.hasCredentials" . }}
           {{- $httpIdentity := include "curie.httpIdentity.apiSecret" . }}
           {{- $providerCa := include "curie.httpIdentity.providerCaBundle" . }}
-          {{- if or $codeHostTrust $forgeCredentials $httpIdentity }}
+          {{- if or $codeHostTrust $forgeCredentials $httpIdentity (include "curie.channelGateway.tlsSecret" .) }}
           volumeMounts:
+            {{- include "curie.channelGateway.clientMount" . | nindent 12 }}
             {{- include "curie.codeHostTrust.volumeMount" . | nindent 12 }}
             {{- include "curie.factory.credentialMount" . | nindent 12 }}
             {{- if $httpIdentity }}
@@ -542,8 +550,9 @@ spec:
               readOnly: true
             {{- end }}
           {{- end }}
-      {{- if or $codeHostTrust $forgeCredentials $httpIdentity }}
+      {{- if or $codeHostTrust $forgeCredentials $httpIdentity (include "curie.channelGateway.tlsSecret" .) }}
       volumes:
+        {{- include "curie.channelGateway.clientVolume" . | nindent 8 }}
         {{- include "curie.codeHostTrust.volume" . | nindent 8 }}
         {{- include "curie.factory.credentialVolume" . | nindent 8 }}
         {{- if $httpIdentity }}

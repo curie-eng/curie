@@ -5,11 +5,21 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from curie_worker.kernel.constants import TURN_FAILURE_REPLY_PREFIX
+from curie_worker.kernel.constants import (
+    IDENTITY_REFUSED_FAILURE_CLASS,
+    IDENTITY_REFUSED_RELAY_NOTICE,
+    TURN_FAILURE_REPLY_PREFIX,
+)
 from curie_worker.kernel.failures import failure_class_from_reply, turn_failure_reply
 
 _VECTOR = Path(__file__).resolve().parents[3] / "tests" / "vectors" / "turn-failure-reply.json"
-_KEYS = {"comment", "reply_prefix", "factory_class_line_prefix", "examples"}
+_KEYS = {
+    "comment",
+    "reply_prefix",
+    "identity_refused_class",
+    "factory_class_line_prefix",
+    "examples",
+}
 
 
 def test_turn_failure_reply_matches_the_frozen_vector() -> None:
@@ -22,3 +32,11 @@ def test_turn_failure_reply_matches_the_frozen_vector() -> None:
         assert reply.splitlines()[0] == example["reply_first_line"]
         assert failure_class_from_reply(reply) == example["classification"]
         assert example["factory_class_line"].startswith(vector["factory_class_line_prefix"])
+
+
+def test_identity_refused_class_matches_the_frozen_vector() -> None:
+    """#5518: the relay refusal class is the one the CLI eval stops on."""
+    vector = json.loads(_VECTOR.read_text())
+    assert vector["identity_refused_class"] == IDENTITY_REFUSED_FAILURE_CLASS
+    reply = turn_failure_reply(IDENTITY_REFUSED_FAILURE_CLASS, IDENTITY_REFUSED_RELAY_NOTICE)
+    assert failure_class_from_reply(reply) == vector["identity_refused_class"]

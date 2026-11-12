@@ -76,6 +76,7 @@ from ..turn_progress import (
     deactivate_turn_progress,
     start_progress_pump,
 )
+from ..ui_evidence import capture_ui_evidence
 from ..workitem_dispatch import (
     WorkItemConflict,
     parse_work_item_event_id,
@@ -991,6 +992,18 @@ async def _attempt_turn(
                         allow_dependency_additions=self._config.publication_allow_dependency_additions,
                     )
                     outcome.publication_snapshot = snapshot
+                    outcome.ui_evidence = await capture_ui_evidence(
+                        self._runner,
+                        routed.handle.base_url,
+                        routed.handle.token or None,
+                        base_sha=snapshot.base_sha,
+                        remaining_s=(
+                            None
+                            if snapshot_budget_s is None
+                            else snapshot_budget_s - (clock.time.monotonic() - snapshot_started)
+                        ),
+                        execution_deadline=self._execution_deadline_for(qevent.event_id),
+                    )
                 except WorkspacePreparationError as exc:
                     outcome.publication_snapshot_error = f"publication snapshot failed: {exc}"
         return outcome
@@ -1142,6 +1155,17 @@ async def _consume(
                 if exc.timeout_result == "accepted"
                 else "runner-timeout-unconfirmed"
             )
+            if getattr(turn, "requester_window_bound", False) is True:
+                # ADR 0270 decision 3: the requester window, not the configured
+                # bound, ended this turn. Visible and not retried; an
+                # unconfirmed stop keeps its own classification.
+                logger.info(
+                    "requester turn %s ended at the requester token window (stop %s)",
+                    qevent.event_id,
+                    exc.timeout_result,
+                )
+                if exc.timeout_result == "accepted":
+                    classification = constants.REQUESTER_WINDOW_CLASSIFICATION
         else:
             classification = "runner-error"
             if stream_reading and isinstance(exc, aiohttp.ClientError):

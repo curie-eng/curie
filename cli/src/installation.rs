@@ -1034,10 +1034,10 @@ comms:
     #[test]
     fn install_context_is_accepted_and_empty_is_refused() {
         let cfg = Installation::parse(
-            "version: 1\ninstall:\n  namespace: a\n  release: a\n  context: k8\n",
+            "version: 1\ninstall:\n  namespace: a\n  release: a\n  context: scratch-cluster\n",
         )
         .expect("named context must parse");
-        assert_eq!(cfg.install.context.as_deref(), Some("k8"));
+        assert_eq!(cfg.install.context.as_deref(), Some("scratch-cluster"));
     }
 
     #[test]
@@ -3852,7 +3852,7 @@ mod diff_tests {
             unresolved_credentials: Vec::new(),
             namespace: "acme".into(),
             release: "acme".into(),
-            cluster: Some("k8scratch".into()),
+            cluster: Some("scratch-cluster".into()),
             release_exists: false,
             chart_deployed: None,
             chart_target: "0.6.0".into(),
@@ -3861,7 +3861,7 @@ mod diff_tests {
             migration: None,
         };
         let json = out.to_json();
-        assert_eq!(json["cluster"], serde_json::json!("k8scratch"));
+        assert_eq!(json["cluster"], serde_json::json!("scratch-cluster"));
     }
 }
 

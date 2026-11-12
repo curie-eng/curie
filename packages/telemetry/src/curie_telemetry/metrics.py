@@ -251,7 +251,9 @@ _RUNNER_RPC_ATTRIBUTES = {
 }
 _APPROVAL_ATTRIBUTES = {
     "service.name": ["curie-api", "curie-worker"],
-    "operation": ["request", "resolve", "expire", "suspend", "resume", "observe"],
+    # ``dm_delivery``: an approver DM card that was not posted or not registered
+    # (ADR 0272); it records only ``failure``.
+    "operation": ["request", "resolve", "expire", "suspend", "resume", "observe", "dm_delivery"],
     "outcome": [
         "requested",
         "resolved",
@@ -356,6 +358,8 @@ _HTTP_OPERATIONS = [
     "/agents/{agent_id}/hooks/{hook}/remediation-policy/disarm",
     "/agents/{agent_id}/hooks/{hook}/remediation-policy/breakers",
     "/agents/{agent_id}/hooks/{hook}/remediation-policy/breakers/{breaker_id}/close",
+    "/agents/{agent_id}/hooks/{hook}/wake-secret",
+    "/agents/{agent_id}/hooks/{hook}/wake-secret/rotate",
     "/agents/{agent_id}/remediation-qualifications/{qualification_id}",
     "/agents/{agent_id}/remediation-qualifications/{qualification_id}/verifier-runs",
     "/agents/{agent_id}/remediation-qualifications/{qualification_id}/verifier-runs/{run_id}",
@@ -391,6 +395,8 @@ _HTTP_OPERATIONS = [
     "/v1/internal/identity/turn-authority/check",
     # @spec HTTP-APPROVAL-CONTINUITY-3
     "/v1/internal/identity/approvals",
+    # @spec APPROVER-DM-2
+    "/v1/internal/identity/approvals/{approval_id}/card",
     # @spec HTTP-APPROVAL-CONTINUITY-12
     "/v1/internal/identity/approval-grant/check",
     # @spec HTTP-INVOCATION-EXECUTION-22
@@ -399,6 +405,7 @@ _HTTP_OPERATIONS = [
     "/channels/admission",
     "/channels/token",
     "/channels/turns",
+    "/channels/turns/admission",
     "/cluster-message-replies/{reply_ref}",
     "/config",
     "/connector-capabilities/probes",
@@ -422,6 +429,7 @@ _HTTP_OPERATIONS = [
     "/ready",
     "/hooks/{agent_id}/{hook}",
     "/hooks/{agent_id}/{hook}/support",
+    "/hooks/{agent_id}/{hook}/wake",
     "/langfuse/traces",
     "/langfuse/traces/{trace_id}",
     "/langfuse/traces/{trace_id}/eval-case",
@@ -442,6 +450,15 @@ _HTTP_OPERATIONS = [
     "/identity/resolve",
     "/identity/slack-reports",
     "/identity/admin/{tenant_id}/{resource}",
+    # Operator code host links and link revocation (#5414).
+    "/identity/admin/{tenant_id}/code-host-links",
+    "/identity/admin/{tenant_id}/links/{link_id}/revoke",
+    "/identity/authorities",
+    "/identity/authorities/{tenant_id}",
+    "/identity/authorities/{tenant_id}/replace",
+    "/identity/authorities/{tenant_id}/retire",
+    "/identity/roles/{tenant_id}/{agent_id}",
+    "/identity/roles/{tenant_id}/{agent_id}/{role}",
     "/directory/binding",
     "/directory/config/{tenant_id}",
     "/directory/credentials",
@@ -478,6 +495,9 @@ _HTTP_OPERATIONS = [
     "/v1/internal/publications/{publication_id}/pull-request/metadata",
     "/v1/internal/publications/{publication_id}/branch-head",
     "/v1/internal/publications/{publication_id}/revision-commit",
+    "/v1/internal/publications/{publication_id}/ui-evidence",
+    "/v1/internal/publications/{publication_id}/ui-evidence/images/{ordinal}",
+    "/v1/internal/publications/{publication_id}/ui-evidence/seal",
     "/v1/internal/workspace-recovery/context",
     "/v1/internal/workspace-recovery/outcome",
     "/v1/internal/workspace-recovery/reserve",
@@ -492,6 +512,9 @@ _HTTP_OPERATIONS = [
     "/v1/internal/work-items/admissions",
     "/v1/internal/work-items/requests/{request_id}",
     "/v1/internal/work-items/{work_item_id}/cancel",
+    # Personal execution owner context and revalidation (#5376).
+    "/v1/internal/work-items/{work_item_id}/personal-context",
+    "/v1/internal/work-items/{work_item_id}/personal-context/revalidate",
     "/v1/internal/work-items/requests/{request_id}/acquire",
     "/v1/internal/work-items/requests/{request_id}/defer",
     "/v1/internal/work-items/requests/{request_id}/start",
@@ -504,6 +527,8 @@ _HTTP_OPERATIONS = [
     "/v1/internal/work-items/requests/{request_id}/termination/claim",
     "/v1/internal/work-items/requests/{request_id}/termination",
     "/v1/internal/work-items/issue-read/context",
+    # Factory Slack run steering (#5414).
+    "/v1/internal/factory-slack/steer",
     "/v1/internal/channel-read/context",
     # The thread attachment ledger (ADR 0205).
     "/v1/internal/thread-attachments/query",

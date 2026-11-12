@@ -1,0 +1,5 @@
+**
+!cli/
+!cli/tests/
+!cli/tests/local/
+!cli/tests/local/webhook_wake_connector.py

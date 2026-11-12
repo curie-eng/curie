@@ -35,6 +35,7 @@ import uuid
 from collections.abc import AsyncIterator, Callable, Sequence
 from contextlib import asynccontextmanager
 from dataclasses import replace
+from multiprocessing.managers import BaseManager
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -1594,8 +1595,8 @@ def test_retained_workspace_file_turn_refuses_without_mutating_any_owned_state(
     """The v0.9.1 workspace boundary is visible, terminal, and mutation free."""
 
     async def go() -> None:
-        from curie_dispatcher.queue import to_stream_fields
-        from curie_worker.consumer import Consumer
+        from curie_internal.turn_queue import to_stream_fields
+        from curie_worker.consumer import Consumer, refuse_unconfigured_reminder
         from curie_worker.delivery_lease import DeliveryLeaseStore
 
         deployment_id = uuid.uuid4()
@@ -1628,6 +1629,7 @@ def test_retained_workspace_file_turn_refuses_without_mutating_any_owned_state(
                 kernel=h.kernel,
                 config=h.config,
                 leases=store,
+                reminders=refuse_unconfigured_reminder,
             )
             await consumer.ensure_group()
             file_event = _qevent(
@@ -2296,5 +2298,424 @@ def test_a_channel_port_turn_hands_the_lane_the_binding_it_arrived_on(make_harne
                 email,
                 slack,
             ]
+
+    asyncio.run(go())
+
+
+@pytest.mark.parametrize("side_effect", [False, True])
+def test_attachment_handoff_preserves_predecessor_action_marker(make_harness, side_effect) -> None:
+    from curie_internal.turn_queue import to_stream_fields
+    from curie_worker.consumer import Consumer, refuse_unconfigured_reminder
+    from curie_worker.delivery_lease import DeliveryLeaseStore
+    from curie_worker.kernel.routing import _thread_key_for
+
+    async def go() -> None:
+        async with make_harness() as h:
+            first = _qevent("action A", event_id="crashed-before-file")
+            thread = _thread_key_for(first)
+            handle = h.substrate.claim(
+                thread,
+                env={
+                    "CURIE_RUNNER_TOKEN": "recovery-test-token",
+                    "CURIE_SESSION_ID": f"session:{thread}",
+                    "CURIE_HISTORY_REF": f"history:{thread}",
+                },
+            )
+            store = DeliveryLeaseStore(h.async_redis, h.config)
+            consumer = Consumer(
+                redis=h.async_redis,
+                kernel=h.kernel,
+                config=h.config,
+                leases=store,
+                reminders=refuse_unconfigured_reminder,
+            )
+            await consumer.ensure_group()
+            await h.async_redis.xadd(h.config.stream, to_stream_fields(first))
+            rows = await h.async_redis.xreadgroup(
+                h.config.consumer_group, h.config.consumer_name, {h.config.stream: ">"}, count=1
+            )
+            entry, fields = rows[0][1][0]
+            old = await store.acquire(
+                h.config.stream, h.config.consumer_group, entry, consumer=h.config.consumer_name
+            )
+            await h.kernel._markers.watch_turn(thread, handle.claim_name, old, first.event_id)
+            h.runner.side_effect_emitted = side_effect
+            h.kernel._attachments = _FakeAttachmentLane()
+            file_event = _qevent(
+                "file B", event_id="file-followup", attachments=[Attachment(id="F1", name="a.txt")]
+            )
+            await h.kernel.process_event(file_event)
+            replacement = h.substrate.lookup(thread)
+            assert replacement is not None and replacement.claim_name != handle.claim_name
+            assert await h.kernel._markers.saw_side_effect(first.event_id) is side_effect
+            h.runner.side_effect_emitted = False
+            await store.release(
+                old.stream, old.group, old.entry_id, owner=old.owner, resume_event_id=None
+            )
+            h.kernel._attachments = None
+            await consumer._dispatch(entry, fields)
+            await asyncio.gather(*list(consumer._inflight))
+            assert h.runner.opened == (["file B"] if side_effect else ["file B", "action A"])
+            assert [c.outcome for c in h.sink.completions if c.event_id == first.event_id] == [
+                "escalated" if side_effect else "delivered"
+            ]
+            assert (await h.async_redis.xpending(h.config.stream, h.config.consumer_group))[
+                "pending"
+            ] == 0
+
+    asyncio.run(go())
+
+
+# --- ADR 0270 decision 3 [D5]: the retained attachment handoff re-mints at claim -----------
+
+
+def _requester_handoff() -> Any:
+    """The requester fixtures, imported late: their import chain imports this module."""
+    from . import test_requester_handoff
+
+    return test_requester_handoff
+
+
+def _retained_file_turn(thread: str) -> QueuedTurn:
+    return _qevent(
+        "read the file",
+        thread=thread,
+        attachments=[Attachment(id="F3", name="requester-notes.txt", mime_type="text/plain")],
+    )
+
+
+@pytest.mark.parametrize(
+    "first_handoff_delay_s",
+    [200.0, 0.0],
+    ids=["delayed-attempt", "timely-control"],
+)
+def test_a_retained_attachment_turn_starts_once_on_a_claim_time_token(
+    make_harness,
+    monkeypatch: pytest.MonkeyPatch,
+    first_handoff_delay_s: float,
+) -> None:
+    """[D5] ADR 0270 decision 3: the retained-file handoff gets a claim-time token.
+
+    The retained attachment path hands an idle route off with the delivery's
+    own boot env, so the requester ``cct`` is refreshed only by the claim-time
+    minter. The handoff's token carries the same principal field for field and
+    an expiry of exactly its mint time plus one hour. When the handoff's claim
+    spends 200 s with a 3400 s runner bound, admission caps the turn at what
+    that token has left instead of refusing it, so the file turn still opens
+    exactly once on the one handed-off sandbox. Control (``timely-control``):
+    no delay, the same single handoff and start.
+    """
+    handoff = _requester_handoff()
+    short_cls = handoff.window_short()
+    clock = handoff.install_clock(monkeypatch)
+
+    async def go() -> None:
+        binding, alice, _bob, core = handoff.parties()
+        binding.resolved.deployment_id = uuid.uuid4()
+        async with make_harness(
+            binding=binding,
+            identity_authority=core,
+            per_sandbox_runners=3,
+            runner_total_timeout_s=3400.0,
+            delivery_budget_s=3600.0,
+        ) as h:
+            lane = _FakeAttachmentLane()
+            probe = _WorkspaceProbe(h.substrate, selected_repo=None)
+            h.kernel._attachments = lane  # type: ignore[attr-defined]
+            h.kernel._workspace = probe  # type: ignore[assignment]
+            await handoff.process(h, _qevent("first", thread="tRequesterFile"))
+            assert len(h.fake_k8s.claim_envs) == 1
+            retained = handoff.route(h, _thread_key("tRequesterFile"))
+
+            delays = [first_handoff_delay_s]
+            handoff.delay_claims(h, clock, lambda: delays.pop(0) if delays else 0.0)
+            outcomes = handoff.observe_starts(h)
+            file_turn = _retained_file_turn("tRequesterFile")
+            await handoff.process(h, file_turn)
+
+            envs = h.fake_k8s.claim_envs
+            assert len(binding.boot_ccts) == 2, "the file turn's boot env was rebuilt per attempt"
+            started_env = envs[-1]
+            assert started_env is not None and started_env[ATTACHMENTS_REF_ENV] == REF_VALUE
+            started_cct = handoff.cct_of(started_env)
+            started = handoff.cct_claims(started_cct)
+            assert started["principal"] == handoff.principal_dict(alice)
+            run = binding.minter_runs[len(envs) - 1]
+            assert run.cct == started_cct, "the handoff did not carry a claim-time token"
+            handoff.assert_signed_by(started_cct, binding.signing_key)
+            assert outcomes == ["started"], "a delayed handoff was refused instead of capped"
+            assert short_cls not in outcomes
+            assert len(envs) == 2
+            assert int(run.before) + 3600 <= started["exp"] <= int(run.after) + 3600
+
+            opened = [text for runner in h.runners.values() for text in runner.opened]
+            assert opened.count("read the file") == 1
+            final = handoff.route(h, _thread_key("tRequesterFile"))
+            assert final.claim_name != retained.claim_name
+            assert handoff.runner_at(h, final).opened == ["read the file"]
+            assert handoff.recorded(final) == (handoff.requester_digest(alice), started["exp"])
+            assert await handoff.is_done(h, file_turn)
+
+    asyncio.run(go())
+
+
+class _HandoffControlPlane(BaseManager):
+    pass
+
+
+def _run_attachment_handoff_worker(
+    client: Any,
+    substrate_config: Any,
+    config: Any,
+    binding: Any,
+    entry: str,
+    fields: dict[str, str],
+) -> None:
+    import redis
+    from curie_test_support.valkey import VALKEY_HOST, VALKEY_PORT, VALKEY_PW
+    from curie_worker.consumer import Consumer, refuse_unconfigured_reminder
+    from curie_worker.delivery_lease import DeliveryLeaseStore
+    from curie_worker.markers import Markers
+    from curie_worker.runner_client import RunnerClient
+    from curie_worker.sandbox import AffinityStore, SandboxSubstrate
+    from curie_worker.threadlock import ThreadLock
+    from redis.asyncio import Redis
+
+    from .conftest import FakeSink
+
+    async def work() -> None:
+        connection = {
+            "host": VALKEY_HOST,
+            "port": VALKEY_PORT,
+            "password": VALKEY_PW or None,
+            "decode_responses": True,
+        }
+        broker = Redis(**connection)
+        substrate = SandboxSubstrate(
+            client,
+            AffinityStore(
+                redis.Redis(**connection),
+                pressure_client=broker,
+                key_prefix=substrate_config.key_prefix,
+            ),
+            substrate_config,
+        )
+        lock_options = {
+            "ttl_ms": config.lock_ttl_ms,
+            "acquire_timeout_s": config.lock_acquire_timeout_s,
+            "poll_interval_s": config.lock_poll_interval_s,
+        }
+        kernel = Kernel(
+            substrate=substrate,
+            runner=RunnerClient(total_timeout_s=config.runner_total_timeout_s),
+            sink=FakeSink(),
+            lock=ThreadLock(broker, **lock_options),
+            pressure_lock=ThreadLock(broker, **lock_options),
+            markers=Markers(broker, config),
+            config=config,
+            binding=binding,
+            attachments=_FakeAttachmentLane(),
+        )
+        worker = Consumer(
+            redis=broker,
+            kernel=kernel,
+            config=config,
+            leases=DeliveryLeaseStore(broker, config),
+            reminders=refuse_unconfigured_reminder,
+        )
+        await worker._dispatch(entry, fields)
+        await asyncio.gather(*list(worker._inflight))
+
+    asyncio.run(work())
+
+
+@pytest.mark.parametrize("crash_point", ["before-action", "before-marker", "after-marker"])
+def test_retained_attachment_handoff_recovers_without_repeating_action(
+    make_harness, sync_redis, crash_point: str
+) -> None:
+    import multiprocessing
+    import signal
+
+    from aci_protocol import SideEffectFlag
+    from curie_internal.turn_queue import to_stream_fields
+    from curie_worker.consumer import Consumer, refuse_unconfigured_reminder
+    from curie_worker.delivery_lease import DeliveryLeaseStore
+    from curie_worker.kernel.routing import _thread_key_for
+
+    from .conftest import FakeK8s, FakeRunner
+
+    _HandoffControlPlane.register("client", FakeK8s)
+    context = multiprocessing.get_context("spawn")
+
+    class ActionRunner(FakeRunner):
+        actions = 0
+
+        async def _event(self, request):
+            if self.opened or crash_point != "before-action":
+                self.actions += 1
+                self.side_effect_emitted = True
+            return await super()._event(request)
+
+    async def go(control_plane) -> None:
+        runner = ActionRunner()
+        runner.default_script = [TextDelta(text="working")]
+        if crash_point == "after-marker":
+            runner.default_script.insert(0, SideEffectFlag(tool="action"))
+        runner.hold = asyncio.Event()
+        runner.tail = [Final(text="done", status=DONE)]
+        binding = _HistoryBinding(uuid.uuid4(), workspace_enabled=False)
+        client = control_plane.client()
+        async with make_harness(
+            runner_app=runner.app,
+            binding=binding,
+            sandbox_client=client,
+            delivery_lease_ttl_s=1.0,
+            delivery_lease_heartbeat_s=0.3,
+        ) as h:
+            event = _qevent(
+                "file action",
+                event_id="handoff-action",
+                attachments=[Attachment(id="F1", name="a.txt")],
+            )
+            thread = _thread_key_for(event)
+            retained = h.substrate.claim(thread, env=binding.boot_env(binding.resolved, thread))
+            store = DeliveryLeaseStore(h.async_redis, h.config)
+            consumer = Consumer(
+                redis=h.async_redis,
+                kernel=h.kernel,
+                config=h.config,
+                leases=store,
+                reminders=refuse_unconfigured_reminder,
+            )
+            await consumer.ensure_group()
+            await h.async_redis.xadd(h.config.stream, to_stream_fields(event))
+            rows = await h.async_redis.xreadgroup(
+                h.config.consumer_group, h.config.consumer_name, {h.config.stream: ">"}, count=1
+            )
+            entry, fields = rows[0][1][0]
+            lease_key = h.config.delivery_lease_key(h.config.stream, h.config.consumer_group, entry)
+
+            process = context.Process(
+                target=_run_attachment_handoff_worker,
+                args=(client, h.substrate._config, h.config, binding, entry, fields),
+            )
+            process.start()
+            try:
+                await _wait_until(lambda: bool(runner.queried), timeout=5.0)
+                replacement = h.substrate.lookup(thread)
+                assert replacement is not None and replacement.claim_name != retained.claim_name
+                if crash_point == "after-marker":
+                    async with asyncio.timeout(5):
+                        while not await h.kernel._markers.saw_side_effect(event.event_id):
+                            pass
+                else:
+                    assert not await h.kernel._markers.saw_side_effect(event.event_id)
+                assert runner.actions == (0 if crash_point == "before-action" else 1)
+                assert sync_redis.exists(lease_key)
+            finally:
+                if process.is_alive():
+                    process.kill()
+                await asyncio.to_thread(process.join, 5.0)
+                runner.hold.set()
+            assert not process.is_alive()
+            assert process.exitcode == -signal.SIGKILL
+            await _wait_until(lambda: not runner.turn_active)
+            await _wait_until(lambda: not sync_redis.exists(lease_key), timeout=5.0)
+            assert not await h.kernel._markers.is_terminal(event.event_id)
+            recovered_kernel = Kernel(
+                substrate=h.substrate,
+                runner=h.kernel._runner,
+                sink=h.sink,
+                lock=h.kernel._lock,
+                pressure_lock=h.kernel._pressure_lock,
+                markers=h.kernel._markers,
+                config=h.config,
+                binding=binding,
+                attachments=_FakeAttachmentLane(),
+            )
+            recovered = Consumer(
+                redis=h.async_redis,
+                kernel=recovered_kernel,
+                config=h.config,
+                leases=store,
+                reminders=refuse_unconfigured_reminder,
+            )
+            await recovered._dispatch(entry, fields)
+            await asyncio.gather(*list(recovered._inflight))
+            assert runner.actions == 1
+            assert runner.opened == ["file action"] * (2 if crash_point == "before-action" else 1)
+            assert [c.outcome for c in h.sink.completions] == [
+                "delivered" if crash_point == "before-action" else "escalated"
+            ]
+            assert await h.kernel._markers.is_terminal(event.event_id)
+            assert (await h.async_redis.xpending(h.config.stream, h.config.consumer_group))[
+                "pending"
+            ] == 0
+            assert await h.async_redis.xlen(h.config.dead_letter_stream_name()) == 0
+
+    with _HandoffControlPlane(ctx=context) as control_plane:
+        asyncio.run(go(control_plane))
+
+
+@pytest.mark.parametrize("side_effect", [False, True])
+def test_attachment_handoff_checks_marker_recovered_during_fetch(
+    make_harness, side_effect: bool
+) -> None:
+    from curie_internal.turn_queue import to_stream_fields
+    from curie_worker.consumer import Consumer, refuse_unconfigured_reminder
+    from curie_worker.delivery_lease import DeliveryLeaseStore
+    from curie_worker.kernel.routing import _thread_key_for
+
+    async def go() -> None:
+        binding = _HistoryBinding(uuid.uuid4(), workspace_enabled=False)
+        async with make_harness(binding=binding) as h:
+            event = _qevent(
+                "recover file action",
+                event_id="late-handoff-action",
+                attachments=[Attachment(id="F1", name="a.txt")],
+            )
+            thread = _thread_key_for(event)
+            retained = h.substrate.claim(thread, env=binding.boot_env(binding.resolved, thread))
+            store = DeliveryLeaseStore(h.async_redis, h.config)
+            consumer = Consumer(
+                redis=h.async_redis,
+                kernel=h.kernel,
+                config=h.config,
+                leases=store,
+                reminders=refuse_unconfigured_reminder,
+            )
+            await consumer.ensure_group()
+            await h.async_redis.xadd(h.config.stream, to_stream_fields(event))
+            rows = await h.async_redis.xreadgroup(
+                h.config.consumer_group, h.config.consumer_name, {h.config.stream: ">"}, count=1
+            )
+            entry, fields = rows[0][1][0]
+            old = await store.acquire(
+                h.config.stream, h.config.consumer_group, entry, consumer=h.config.consumer_name
+            )
+            await h.kernel._markers.watch_turn(thread, retained.claim_name, old, event.event_id)
+            await store.release(
+                old.stream, old.group, old.entry_id, owner=old.owner, resume_event_id=None
+            )
+
+            class CompletingActionLane(_FakeAttachmentLane):
+                def resolve(self, **kwargs):
+                    h.runner.side_effect_emitted = side_effect
+                    return super().resolve(**kwargs)
+
+            h.kernel._attachments = CompletingActionLane()
+            await consumer._dispatch(entry, fields)
+            await asyncio.gather(*list(consumer._inflight))
+            replacement = h.substrate.lookup(thread)
+            assert replacement is not None and replacement.claim_name != retained.claim_name
+            assert h.runner.opened == ([] if side_effect else ["recover file action"])
+            assert await h.kernel._markers.saw_side_effect(event.event_id) is side_effect
+            assert [c.outcome for c in h.sink.completions] == [
+                "escalated" if side_effect else "delivered"
+            ]
+            assert (await h.async_redis.xpending(h.config.stream, h.config.consumer_group))[
+                "pending"
+            ] == 0
+            assert await h.async_redis.xlen(h.config.dead_letter_stream_name()) == 0
 
     asyncio.run(go())

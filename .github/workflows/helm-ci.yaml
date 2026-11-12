@@ -10,9 +10,10 @@ on:
   # Pull requests to main and next always start this workflow so the chart
   # aggregator can report. chart-changes decides whether the shards run,
   # using the historical path list in tools/helm-ci-gate/decide.py. Pushes
-  # stay unfiltered in effect because select treats push as chart-relevant.
+  # stay unfiltered in effect because select treats push as chart-relevant,
+  # including pushes to backport/** maintenance branches.
   push:
-    branches: [main, next]
+    branches: [main, next, "backport/**"]
   pull_request:
     branches: [main, next]
 
@@ -185,6 +186,9 @@ jobs:
           set -euo pipefail
           bash charts/curie/ci/render-assertions.sh
 
+      - name: Unchanged Slack gateway upgrade scenario
+        run: bash charts/curie/ci/channel-gateway-upgrade-assertions.sh
+
       - name: Release name length assertions
         run: bash charts/curie/ci/release-name-length-assertions.sh
 
@@ -193,6 +197,10 @@ jobs:
 
       - name: Reject chart-owned extraEnv duplicates
         run: bash charts/curie/ci/reserved-env-assertions.sh
+
+      # API and worker render the same delivery budget and hook claim lease.
+      - name: Hook claim lease render
+        run: bash charts/curie/ci/hook-claim-lease-render.sh
 
       # A Service named <release>-<x> injects CURIE_<X>_PORT as a URL into any
       # pod with service links on, which broke the drain hook (#5350).
@@ -785,6 +793,14 @@ jobs:
           set -euo pipefail
           bash charts/curie/ci/dispatcher-api-wiring-assertions.sh
 
+      # The dispatcher is a Slack Socket Mode client, and Slack delivers each
+      # event to only one connected client, so the chart refuses more than one
+      # dispatcher replica (issue #2944).
+      - name: helm render assertions (dispatcher single replica)
+        run: |
+          set -euo pipefail
+          bash charts/curie/ci/dispatcher-single-replica-assertions.sh
+
       - name: helm render assertions (approval principal wiring)
         run: |
           set -euo pipefail
@@ -990,7 +1006,7 @@ jobs:
 
       # Prove the first-class bot-thread allowlist (#2437) renders a value the
       # REAL dispatcher parser accepts, not a hand-copied regex: the rendered
-      # env string is fed through curie_dispatcher.config.DispatcherConfig, so a
+      # env string is fed through curie_channel_gateway.slack.config.DispatcherConfig, so a
       # future drift in ThreadedBotAdmission breaks this chart gate. Needs the
       # uv workspace above, which is why it sits here rather than beside the
       # other reserved-env assertions earlier in this job.

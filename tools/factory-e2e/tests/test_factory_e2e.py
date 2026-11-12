@@ -1495,7 +1495,7 @@ def test_evaluation_report_rejects_a_skipped_pull_request_check() -> None:
 
 def test_helm_upgrade_reuses_values_so_the_agent_pool_survives() -> None:
     argv = fe.helm_upgrade_command(
-        context="k8",
+        context="scratch-cluster",
         release="curie",
         chart="/chart",
         namespace="ns",
@@ -1530,7 +1530,7 @@ def test_quota_hard_pods_reads_the_sandbox_quota() -> None:
 
 def test_real_model_install_declares_the_gateway_context_window(tmp_path: Path) -> None:
     config = fe.FactoryConfig(
-        kube_context="k8",
+        kube_context="scratch-cluster",
         app_id="1",
         installation_id=1,
         private_key_file=tmp_path / "app.pem",
@@ -2583,7 +2583,7 @@ def test_install_stops_before_any_mutation_when_the_controller_read_fails(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     error = fe.PreflightFailed(
-        "kubectl --context failed: Error from server (Forbidden): deployments.apps "
+        "kubectl failed: Error from server (Forbidden): deployments.apps "
         '"agent-sandbox-controller" is forbidden'
     )
     preflight, order, captured = _install_until_helm(tmp_path, monkeypatch, error)
@@ -2707,7 +2707,7 @@ def test_check_app_names_a_missing_ci_permission(
 
 def test_only_the_default_model_gets_a_context_window_by_default(tmp_path: Path) -> None:
     config = fe.FactoryConfig(
-        kube_context="k8",
+        kube_context="scratch-cluster",
         app_id="1",
         installation_id=1,
         private_key_file=tmp_path / "app.pem",
@@ -3160,7 +3160,7 @@ def test_quiesce_is_a_registered_scenario() -> None:
 
 def test_helm_upgrade_command_passes_the_timeout() -> None:
     argv = fe.helm_upgrade_command(
-        context="k8",
+        context="scratch-cluster",
         release="curie",
         chart="/chart",
         namespace="ns",
