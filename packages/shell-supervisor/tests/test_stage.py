@@ -131,6 +131,23 @@ def test_the_bundle_is_read_only_and_home_is_private(tmp_path: Path) -> None:
     assert not staged.root.exists()
 
 
+def test_every_claim_stages_at_the_same_path_and_never_into_a_leftover(
+    tmp_path: Path,
+) -> None:
+    """#5571: a resumed claim works where the approved arguments point."""
+
+    first, _ = _stage(tmp_path)
+    (first.home / "approval-check.txt").write_text("from the first claim")
+    with pytest.raises(FileExistsError):
+        _stage(tmp_path)
+    assert (first.home / "approval-check.txt").read_text() == "from the first claim"
+    assert stage.wipe(first.root)
+    second, _ = _stage(tmp_path)
+    assert second.root == first.root and second.home == first.home
+    assert not (second.home / "approval-check.txt").exists()
+    assert stat.S_IMODE(second.root.stat().st_mode) == 0o711
+
+
 def test_upload_tokens_are_private_claim_files_and_wiped(tmp_path: Path) -> None:
     tokens = {"reviewer": "ccu.example.signature"}
     staged, manifest = _stage(tmp_path, connector_upload_tokens=tokens)
