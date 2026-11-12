@@ -211,8 +211,12 @@ up to `CURIE_DM_CONTINUITY_MAX_MESSAGES` (default 20, allowed 0 through 40),
 oldest first. Zero does not call Slack. A thread reply, a channel mention, a
 group direct message, and any envelope whose `is_ext_shared_channel` is not
 exactly false are unchanged. The conversation id stays the Slack thread
-timestamp. The block is escaped the same way as a quoted thread root. A Slack
-error leaves the person's text unchanged and still admits the turn. Operators
+timestamp. The block is escaped the same way as a quoted thread root. Its
+header says the quoted messages come from before this thread and are not part
+of it. The person's new message stays outside the block, after a label that
+names it as the message that starts this thread, so a later reply that asks
+about the start of the thread is not answered from a similar quoted message. A
+Slack error leaves the person's text unchanged and still admits the turn. Operators
 set the bound through `dispatcher.extraEnv`.
 
 ## The queue seam (what the worker consumes)
