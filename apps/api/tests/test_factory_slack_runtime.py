@@ -82,11 +82,14 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from forge_fakes.github import (  # noqa: E402
     INSTALLATION_ID,
+    MENTION,
     REPO,
     REPO_ID,
     SENDER,
     SENDER_ID,
     GitHubAPI,
+    _comment_event,
+    _post,
     factory_env,
     fake_installation_tokens,
 )
@@ -455,11 +458,25 @@ class Stack:
     def internal(self) -> dict[str, str]:
         return {"X-Curie-Worker-Token": WORKER_TOKEN}
 
-    def admit(self, number: int, *, requester: str | None = None) -> tuple[uuid.UUID, uuid.UUID]:
+    def admit(
+        self,
+        number: int,
+        *,
+        requester: str | None = None,
+        owner: dict[str, Any] | None = None,
+    ) -> tuple[uuid.UUID, uuid.UUID]:
+        """A service WorkItem, or with ``owner`` a personal one bound to that owner.
+
+        ``owner`` is the trusted owner-bearing admission's context (#5376):
+        ``tenant_id``, ``principal_id`` and ``enrollment_generation``.
+        """
+
+        personal = {} if owner is None else {"model_auth_mode": "personal", "owner": owner}
         response = self.client.post(
             "/v1/internal/work-items/admissions",
             headers=self.internal,
             json={
+                **personal,
                 "agent_id": self.agent_id,
                 "kind": "github",
                 "address": REPO,
@@ -2691,11 +2708,16 @@ class SteeringStack(Stack):
 
     # Runs ----------------------------------------------------------------------
 
-    def open_steered_run(self, *, requester: str | None = None) -> SteerRun:
-        """A running factory request, its open PR on GitHub, and its posted Slack root."""
+    def open_steered_run(
+        self, *, requester: str | None = None, owner: dict[str, Any] | None = None
+    ) -> SteerRun:
+        """A running factory request, its open PR on GitHub, and its posted Slack root.
+
+        ``owner`` admits it as a personal WorkItem (``admit``).
+        """
 
         number = next(_ISSUES)
-        request_id, work_item_id = self.admit(number, requester=requester)
+        request_id, work_item_id = self.admit(number, requester=requester, owner=owner)
         epoch = self.start(request_id)
         pr = next(_PULLS)
         lineage_id, branch = self.own_pull_request(work_item_id, pr)
@@ -3385,6 +3407,50 @@ def _disable(person: Person) -> None:
     )
 
 
+# A WorkItem's or request's owner facts (#5376): ``(tenant_id, model_auth_mode,
+# owner_principal_id, enrollment_generation)``.
+OwnerTuple = tuple[uuid.UUID | None, str, uuid.UUID | None, int | None]
+
+
+def owner_tuples(work_item_id: uuid.UUID) -> dict[uuid.UUID, OwnerTuple]:
+    """The owner tuple of the WorkItem and of every one of its requests, by id."""
+
+    columns = "id, tenant_id, model_auth_mode, owner_principal_id, enrollment_generation"
+    found = _rows(
+        f"SELECT {columns} FROM curie.work_items WHERE id = :id "
+        f"UNION ALL SELECT {columns} FROM curie.execution_requests WHERE work_item_id = :id",
+        {"id": work_item_id},
+    )
+    return {
+        row["id"]: (
+            row["tenant_id"],
+            row["model_auth_mode"],
+            row["owner_principal_id"],
+            None if row["enrollment_generation"] is None else int(row["enrollment_generation"]),
+        )
+        for row in found
+    }
+
+
+def runnable_requests() -> set[uuid.UUID]:
+    """Every request a worker could still start: queued or waiting."""
+
+    return {
+        row["id"]
+        for row in _rows(
+            "SELECT id FROM curie.execution_requests WHERE status IN ('queued', 'waiting')"
+        )
+    }
+
+
+def installation_mode(monkeypatch: pytest.MonkeyPatch, mode: str) -> None:
+    """Switch the installation's ``FACTORY_MODEL_AUTH_MODE``, as an operator's
+    restart does; the API reads its settings anew on the next request."""
+
+    monkeypatch.setenv("FACTORY_MODEL_AUTH_MODE", mode)
+    get_settings.cache_clear()
+
+
 # --- AC2: an authorized mention revises the same pull request -----------------------
 
 
@@ -3756,6 +3822,72 @@ def test_each_refusal_fails_closed_beside_a_valid_liveness_admission(
     admitted = [row for row in stack.requests() if row["id"] not in own_requests]
     assert len(admitted) == 1, admitted
     assert all(row["requester"] == writer.requester for row in admitted)
+    _assert_no_sandbox(stack)
+
+
+# --- #5378 Decision 8: Slack steering admits under the installation's mode ------------
+
+
+def test_a_personal_installation_refuses_a_legacy_service_work_item_on_tracker_and_slack_ingress(
+    steering: SteeringStack, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#5378 AC5: Slack steering supplies the installation's mode, as tracker ingress does.
+
+    A WorkItem admitted as service before the installation switched to
+    personal mode has no owner. On the personal installation a write
+    collaborator's mention on its issue (tracker revision ingress) and an
+    authorized writer's mention in its Slack root are both refused
+    ``personal_owner_required``: no revision is queued and no owner is
+    invented, so the WorkItem and its request keep the service tuple.
+    Liveness: back on the service setting the same writer's steer admits a
+    revision carrying the service tuple.
+
+    Falsifiable: a steering route that admits under service mode whatever the
+    installation's mode admits the Slack mention on the personal installation.
+    """
+
+    from curie_api.models import DEFAULT_TENANT_ID
+
+    stack = steering
+    writer = stack.person()
+    run = stack.open_steered_run()
+    service: OwnerTuple = (DEFAULT_TENANT_ID, "service", None, None)
+    legacy = {run.work_item_id: service, run.request_id: service}
+    assert owner_tuples(run.work_item_id) == legacy
+    installation_mode(monkeypatch, "personal")
+
+    # Tracker revision ingress: a write collaborator mentions the factory on the issue.
+    before = len(stack.requests())
+    stack.github.issue_number = run.number
+    stack.github.comment_body = f"Please revise @{MENTION}"
+    tracked = _post(
+        stack.client,
+        "issue_comment",
+        _comment_event(run.number, stack.github.comment_body, 7_100_000 + run.number),
+    )
+    assert tracked.status_code == 200, tracked.text
+    assert tracked.json()["status"] == "factory_ignored", tracked.text
+    assert tracked.json()["errors"] == [{"code": "personal_owner_required"}], tracked.text
+    assert len(stack.requests()) == before
+
+    # Slack steering: the same refusal through the steer route and the worker.
+    _api_refused(
+        stack.steer(writer.slack_user, "Please rename the helper.", thread_ts=run.root_ts),
+        "admission_refused",
+        "personal_owner_required",
+    )
+    assert owner_tuples(run.work_item_id) == legacy
+    assert runnable_requests() == set()
+    _assert_no_sandbox(stack)
+
+    # Liveness: a service installation steers the service WorkItem.
+    installation_mode(monkeypatch, "service")
+    admitted = stack.steer(writer.slack_user, "Please rename the helper.", thread_ts=run.root_ts)
+    _admitted(admitted)
+    (revision,) = admitted.new_requests
+    assert revision["requester"] == writer.requester
+    assert owner_tuples(run.work_item_id) == {**legacy, revision["id"]: service}
+    assert runnable_requests() == {revision["id"]}
     _assert_no_sandbox(stack)
 
 

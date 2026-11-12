@@ -355,3 +355,148 @@ Transcripts are parsed in memory; the ledger keeps only sanitized per-session
 facts, never a raw transcript. A transcript whose final record is unterminated
 or unreadable makes that attempt's usage unknown, so the budget judge fails
 rather than counting a partial session.
+
+## Personal owner enforcement proof
+
+`personal_owner_enforcement.py` is the live proof for issue #5378: personal
+Claude subscription execution keeps its owner binding across claims, adoption,
+steering and recovery. It builds on #5377's `EnrollmentProof`
+(`apps/worker/tests/sandbox/personal_enrollment_cluster_support.py`) and #5374's
+exact-image harness. The difference from #5377 is the launch boundary: here the
+candidate worker kernel authorizes the owner, reads custody and launches. The
+driver only admits through the API's trusted internal admission route
+(`POST /v1/internal/work-items/admissions` with `X-Curie-Worker-Token`), seeds
+one marker record into a WorkItem's durable transcript through the state API,
+interrupts, and observes. The worker runs from the candidate checkout with
+`FACTORY_MODEL_AUTH_MODE=personal`, the Kubernetes substrate and the production
+custody reader, and holds no model credential.
+
+### Inputs and preconditions
+
+Every target comes from flags and the input file. `--input-file` is a private
+JSON object (mode 0600, owned by the caller) with `kubeconfig` and `curie_bin`
+(absolute paths), `runner_api_host` (this host's IPv4 address as the cluster
+reaches it) and optionally `grant_probe_cli` (default `claude`). `--registry` is
+the caller's loopback registry, `127.0.0.1:PORT` or `localhost:PORT`, with
+manifest deletes enabled. The Docker context must have an SSH endpoint whose
+loopback ports the caller mirrors onto this host's loopback, as #5377 requires.
+The cluster runs the agent-sandbox controller. Run the driver under the
+repository environment (`uv run`), from a clean checkout at `--candidate`.
+
+### Commands
+
+```bash
+uv run python3 tools/factory-e2e/personal_owner_enforcement.py preflight \
+  --candidate "$SHA" --context "$CTX" --namespace "$NS" --docker-context "$DCTX" \
+  --registry "$REG" --input-file "$INPUT" --state-dir "$STATE" --run-id "$RUN_ID" \
+  --grant-file "$GRANT_FILE" --grant-expires-at "$GRANT_EXPIRES_AT"
+
+uv run python3 tools/factory-e2e/personal_owner_enforcement.py rehearse \
+  --candidate "$SHA" --context "$CTX" --namespace "$NS" --docker-context "$DCTX" \
+  --registry "$REG" --input-file "$INPUT" --state-dir "$STATE" --run-id "$REHEARSAL_ID"
+
+uv run python3 tools/factory-e2e/personal_owner_enforcement.py run \
+  --candidate "$SHA" --context "$CTX" --namespace "$NS" --docker-context "$DCTX" \
+  --registry "$REG" --input-file "$INPUT" --state-dir "$STATE" --run-id "$RUN_ID" \
+  --grant-file "$GRANT_FILE" --grant-expires-at "$GRANT_EXPIRES_AT"
+
+uv run python3 tools/factory-e2e/personal_owner_enforcement.py judge \
+  --state-dir "$STATE" --run-id "$RUN_ID" --criterion all
+```
+
+`preflight` is read-only and unpaid. It checks, in order: no service
+credential or fake mode in the caller environment, the flags, the input file,
+the grant file by `stat` only (present, regular, mode 0600, the caller's, 1 to
+4097 bytes; never opened), an expiry that leaves at least 1,620 s, the Python
+environment, a clean checkout at the SHA, `docker info`, the registry's `/v2/`,
+`/readyz` through `--context`, the absence of both namespaces, RBAC for every
+verb the run needs, and an unused run ID. A missing prerequisite is a refusal
+with exit code 2, never a skip. `rehearse` and `run` repeat it, then re-execute
+the driver as a child whose environment holds only `PATH`, `HOME`, `LANG`,
+`SSH_AUTH_SOCK` and the names and paths the proof needs, with stdin from
+`/dev/null`. Only that child opens the grant file.
+
+`judge --criterion` takes `selection`, `fencing`, `authentication-required`,
+`disconnect`, `restart`, `hosted-header`, `budget`, `cleanup` or `all`. It
+reads only the private ledger, compares each observation with the expected
+value defined in `personal_owner_enforcement_support.py`, and prints every
+check's expected and observed value. Exit code 0 is a pass, 1 a failed or
+missing observation, 2 a refusal, and 3 a run whose only shortfall is a
+recorded Not met. A rehearsal ledger is judged only with `--criterion cleanup`.
+
+### What rehearse covers
+
+`rehearse` starts zero native model sessions. The worker and every runner use
+the runner's offline fake model, the grant is a synthetic value, and any native
+CLI process seen in a runner pod is recorded as an unreserved start, fences
+every start and fails the rehearsal. Against the real cluster it runs:
+
+1. The candidate image build, its push to the caller's registry under a per-run
+   tag, digest pinning, and the revision label and digest check on every pod.
+2. Both owned namespaces, the backing containers, the migration, the candidate
+   API and worker, the agent deploy, the two OIDC principals and the sentinel
+   hosted connector (Pod, Service, bearer Secret).
+3. Enrollment through `curie cluster subscription`, the other principal's
+   refused admission, the owner's admission and the worker-driven personal
+   claim with its owner labels and `<claim>-tokens` grant delivery.
+4. The three interruptions against fake-model turns: SIGKILL of every process
+   in the runner container except the runner, then SIGTERM to the runner, so
+   the container restarts in place; deletion of the runner Pod; SIGKILL of the
+   worker followed by a restart. It observes the recovered pod, labels, durable
+   history and the uncommitted workspace nonce.
+5. The generation advance while the worker is down and the claim retained, the
+   refused revalidation, the old generation's custody refusal, teardown after
+   the worker restarts, revalidation, the later generations' admissions, the
+   disconnect with a waiting request and two worker restarts.
+6. The full finalizer and the absence proof.
+
+Only `run` covers: the grant probe, native CLI sessions under the owner's
+grant, the bundle hooks that hold each session at a Read call and at Stop,
+transcript usage settlement against the ledger, the provider's real rejection
+of the invalid grant, the Bash scan for the hosted header, the sentinel
+challenge and public control through the model, and history replay inside a
+fresh native process. Rehearsal turns end on their own, so an interruption can
+miss its turn; rehearsal observations are recorded but not judged.
+
+### Sessions and reservations
+
+The approved ceiling is enforced in code: 8 native sessions, 2 assistant turns
+each (16 in total), 8,192 output tokens, 180 s per session as one absolute
+deadline that harvests, interrupts the native process and deletes its Pod,
+1,440 s live plus 180 s cleanup, no paid retry and `claude-sonnet-5-5`. Each
+session reserves an even share (1,024 output tokens, 2 turns, 180 s) in the
+ledger before anything can start it, and every share is checked to fit before
+the first start. The worker runs with `CURIE_WORK_ITEM_MAX_TURNS=2`,
+`DEFAULT_MAX_OUTPUT_TOKENS_PER_RUN=1024` and `CURIE_MAX_ATTEMPTS=2`; the
+template keeps 256 output tokens per response. Immediately before the first
+reservation, a one-turn grant probe runs on the cheapest model with an empty
+`HOME`; if it fails, nothing is reserved.
+
+1. `process-interrupted` and `process-recovered`: the first holds at Read, is
+   settled, the second is reserved, and the runner container restarts in place.
+2. `pod-interrupted` and `pod-recovered`: the same, with the Pod deleted.
+3. `worker-interrupted` and `worker-recovered`: the same, with the worker
+   killed. The recovered session is held while the worker is killed again, the
+   grant is replaced by a deliberately invalid one (generation 2), and the
+   retained claim's fate is observed.
+4. `rejected`: generation 2 on the same WorkItem; the provider's 401 must end
+   it `authentication_required` with the transcript and owner intact.
+5. `revalidated`: generation 3 after replace, teardown and revalidation; one
+   response calls the Bash scan, the sentinel `challenge` tool and the public
+   control tool, then answers.
+
+Unknown usage, an unsettled earlier session, an unterminated final transcript
+record or a native start without a reservation stops every later start. Only
+records that exactly match the seeded history are excluded from the count.
+Every synthetic or zero-usage record keeps a sanitized error class.
+
+### Known limits
+
+Restoring uncommitted workspace content after Pod recreation is blocked by
+issue #5092 (ADR 0251 restoration is not wired), so `restart` records the
+nonce's absence and reports it Not met. The durable repository workspace is disabled
+(`CURIE_WORKSPACE_ENABLED=false`) because the proof has no code-host fixture;
+the workspace checks use a nonce under `/tmp`. Recovery is whatever the
+product does on its own (the kernel's transient retry, or the owner-lost
+successor after a worker loss); when no fresh session starts within 150 s, the
+WorkItem is cancelled and the recovery checks record false.

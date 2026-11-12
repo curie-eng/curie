@@ -467,6 +467,41 @@ JOIN {schema}.agents a ON a.id = w.agent_id
 WHERE r.id = :request_id AND a.tenant_id = :tenant_id
 """
 
+# #5378: the owner tuple plus every fact a launch is authorized by, in one
+# statement so they are one snapshot. Clock comparisons use the database clock,
+# as the API's start gate does. The owner's tenant, principal and enrollment
+# header are joined on the request's own snapshot, so a service request reads
+# them as NULL and a personal one reads its owner's current rows.
+_EXECUTION_AUTHORITY_SQL = """
+SELECT w.id AS work_item_id,
+       r.id AS request_id,
+       w.agent_id AS agent_id,
+       r.tenant_id AS tenant_id,
+       r.model_auth_mode AS model_auth_mode,
+       r.owner_principal_id AS owner_principal_id,
+       r.enrollment_generation AS enrollment_generation,
+       r.status AS status,
+       r.acquire_owner AS acquire_owner,
+       r.acquired_generation AS acquired_generation,
+       COALESCE(r.acquire_expires_at > clock_timestamp(), false) AS acquire_live,
+       r.runtime_epoch AS runtime_epoch,
+       COALESCE(r.execution_deadline > clock_timestamp(), false) AS deadline_live,
+       w.cancelled_at IS NOT NULL AS work_item_cancelled,
+       t.status AS tenant_status,
+       p.status AS principal_status,
+       e.active AS enrollment_active,
+       e.generation AS enrollment_current_generation
+FROM {schema}.execution_requests r
+JOIN {schema}.work_items w ON w.id = r.work_item_id
+JOIN {schema}.agents a ON a.id = w.agent_id
+LEFT JOIN {schema}.tenants t ON t.id = r.tenant_id
+LEFT JOIN {schema}.principals p
+  ON p.id = r.owner_principal_id AND p.tenant_id = r.tenant_id
+LEFT JOIN {schema}.personal_claude_enrollments e
+  ON e.tenant_id = r.tenant_id AND e.principal_id = r.owner_principal_id
+WHERE r.id = :request_id AND a.tenant_id = :tenant_id
+"""
+
 # ADR-0168 decision 6: the identity bound at an address, if any. A channel-port
 # identity is one adapter deployment on one address and writes as that
 # address. Case-insensitive because the mail adapter lowercases a sender
@@ -595,6 +630,26 @@ class ExecutionOwner(BaseModel):
     model_auth_mode: Literal["service", "personal"]
     owner_principal_id: uuid.UUID | None
     enrollment_generation: int | None
+
+
+class ExecutionAuthority(ExecutionOwner):
+    """The owner tuple plus the request's launch facts, read in one statement (#5378).
+
+    Facts only: ``personal_execution.authorize`` decides. The owner rows are
+    NULL for a service request and for an owner whose row is missing.
+    """
+
+    status: str
+    acquire_owner: str | None
+    acquired_generation: int | None
+    acquire_live: bool
+    runtime_epoch: int
+    deadline_live: bool
+    work_item_cancelled: bool
+    tenant_status: str | None
+    principal_status: str | None
+    enrollment_active: bool | None
+    enrollment_current_generation: int | None
 
 
 class FactoryContext(BaseModel):
@@ -808,6 +863,9 @@ class BindingResolver:
         self._resolve_agent_sql = text(_RESOLVE_AGENT_SQL.format(schema=config.db_schema))
         self._address_identity_sql = text(_ADDRESS_IDENTITY_SQL.format(schema=config.db_schema))
         self._execution_owner_sql = text(_EXECUTION_OWNER_SQL.format(schema=config.db_schema))
+        self._execution_authority_sql = text(
+            _EXECUTION_AUTHORITY_SQL.format(schema=config.db_schema)
+        )
 
     async def identity_binding(
         self, kind: str, adapter: str | None, address: str,
@@ -981,6 +1039,20 @@ class BindingResolver:
         if row is None:
             return None
         return ExecutionOwner.model_validate(dict(row._mapping))
+
+    async def resolve_execution_authority(self, request_id: uuid.UUID) -> ExecutionAuthority | None:
+        """The owner tuple and launch facts of ``request_id`` (#5378), or None
+        when unknown or foreign. A fresh read every call; never cached."""
+        async with self._engine.connect() as conn:
+            row = (
+                await conn.execute(
+                    self._execution_authority_sql,
+                    {"request_id": request_id, "tenant_id": self._tenant_id},
+                )
+            ).first()
+        if row is None:
+            return None
+        return ExecutionAuthority.model_validate(dict(row._mapping))
 
     async def identity_for_address(self, kind: str, address: str) -> str | None:
         """The identity bound at ``address`` on ``kind``, or None (ADR-0168 decision 6)."""

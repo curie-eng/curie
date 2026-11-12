@@ -21,6 +21,7 @@ pub(super) async fn run(action: SkillAction) -> Result<()> {
             env_file,
             replace,
         } => {
+            curie::personal_mode::refuse_personal_mode()?;
             let image = skill_runner_image(&plugin_dir, image.as_deref())?;
             commands::start(StartOpts {
                 plugin_dir,
@@ -131,6 +132,7 @@ pub(super) async fn run(action: SkillAction) -> Result<()> {
             image,
             sampling,
         } => {
+            curie::personal_mode::refuse_personal_mode()?;
             let image = if model.is_empty() {
                 artifacts::resolve_image(
                     image.as_deref(),

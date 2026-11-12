@@ -1091,3 +1091,237 @@ def test_factory_review_truth_mints_with_the_code_host_credential(
         client_cm.__exit__(None, None, None)
         github_app._RESOLVERS.clear()
         get_settings.cache_clear()
+
+
+# --- #5378: review feedback admits under the installation's mode ------------------------
+
+PERSONAL_WORKER_TOKEN = "factory-review-personal-worker"
+OWNER_MARK = "test-factory-review-owner-"
+# The owner's enrollment generation; not 1, so a default generation is caught.
+GENERATION = 2
+_TUPLE = "tenant_id, model_auth_mode, owner_principal_id, enrollment_generation"
+
+
+def _installation_mode(monkeypatch: pytest.MonkeyPatch, mode: str) -> None:
+    """Switch the installation's ``FACTORY_MODEL_AUTH_MODE``, as an operator's
+    restart does; the webhook route reads its settings anew on the next delivery."""
+
+    monkeypatch.setenv("FACTORY_MODEL_AUTH_MODE", mode)
+    get_settings.cache_clear()
+
+
+def _owner_tuples(work_item_id: uuid.UUID) -> dict[uuid.UUID, tuple[Any, ...]]:
+    """The owner tuple of the WorkItem and of every one of its requests, by id."""
+
+    found = _rows(
+        f"SELECT id, {_TUPLE} FROM curie.work_items WHERE id = :id "
+        f"UNION ALL SELECT id, {_TUPLE} FROM curie.execution_requests WHERE work_item_id = :id",
+        {"id": work_item_id},
+    )
+    return {
+        row["id"]: (
+            row["tenant_id"],
+            row["model_auth_mode"],
+            row["owner_principal_id"],
+            row["enrollment_generation"],
+        )
+        for row in found
+    }
+
+
+def _seed_owner() -> uuid.UUID:
+    """An active default-tenant principal enrolled at ``GENERATION`` (standing in for #5377)."""
+
+    from curie_api.models import DEFAULT_TENANT_ID
+
+    principal_id = uuid.uuid4()
+    _execute(
+        "INSERT INTO curie.principals (id, tenant_id, idp_subject, type, status, display_name) "
+        "VALUES (:id, :tenant, :subject, 'human', 'active', 'Acme Owner')",
+        {"id": principal_id, "tenant": DEFAULT_TENANT_ID, "subject": f"{OWNER_MARK}{principal_id}"},
+    )
+    _execute(
+        "INSERT INTO curie.personal_claude_enrollments "
+        "(id, tenant_id, principal_id, generation, active, version) "
+        "VALUES (:id, :tenant, :principal, :generation, true, 1)",
+        {
+            "id": uuid.uuid4(),
+            "tenant": DEFAULT_TENANT_ID,
+            "principal": principal_id,
+            "generation": GENERATION,
+        },
+    )
+    return principal_id
+
+
+def _drop_owners() -> None:
+    """Remove the seeded owners with every WorkItem, request and enrollment naming them."""
+
+    _execute(
+        "TRUNCATE curie.execution_requests, curie.work_items, "
+        "curie.personal_claude_enrollments CASCADE",
+        {},
+    )
+    _execute(
+        "DELETE FROM curie.principals WHERE idp_subject LIKE :mark", {"mark": f"{OWNER_MARK}%"}
+    )
+
+
+@pytest.fixture
+def personal_factory(
+    monkeypatch: pytest.MonkeyPatch,
+    clean_db: None,
+    review_api: ReviewGitHubAPI,
+    tmp_path: Path,
+) -> Any:
+    """The ``factory`` app, also accepting the worker's trusted owner-bearing admission."""
+
+    monkeypatch.delenv("FACTORY_MODEL_AUTH_MODE", raising=False)
+    _boot(monkeypatch, review_api, {"INTERNAL_WORKER_TOKEN": PERSONAL_WORKER_TOKEN}, tmp_path)
+    client_cm, client, external = _client_with_agent(review_api)
+    try:
+        yield client, review_api
+    finally:
+        client.portal.call(external.aclose)
+        client_cm.__exit__(None, None, None)
+        get_settings.cache_clear()
+        _drop_owners()
+
+
+def _owned_personal(
+    client: TestClient, api: ReviewGitHubAPI, owner: uuid.UUID
+) -> tuple[int, int, dict[str, Any]]:
+    """``_owned`` for a personal WorkItem: the trusted admission names ``owner`` (#5376)."""
+
+    from curie_api.models import DEFAULT_TENANT_ID
+
+    number = next(_ISSUES)
+    api.issue_number = number
+    (agent,) = _rows("SELECT id FROM curie.agents")
+    admitted = client.post(
+        "/v1/internal/work-items/admissions",
+        headers={"X-Curie-Worker-Token": PERSONAL_WORKER_TOKEN},
+        json={
+            "agent_id": str(agent["id"]),
+            "kind": "github",
+            "address": REPO,
+            "reply_conversation_id": f"issue-{number}",
+            "tracker": {
+                "kind": "github",
+                "host": "github.com",
+                "scope_id": str(REPO_ID),
+                "issue_id": str(number),
+            },
+            "repository": {
+                "code_host_kind": "github",
+                "host": "github.com",
+                "project_id": str(REPO_ID),
+                "path": REPO,
+            },
+            "code_host_installation_id": INSTALLATION_ID,
+            "objective": f"Resolve {REPO}#{number}",
+            "requester": f"github:{SENDER_ID}:{SENDER}",
+            "request_id": str(uuid.uuid4()),
+            "model_auth_mode": "personal",
+            "owner": {
+                "tenant_id": str(DEFAULT_TENANT_ID),
+                "principal_id": str(owner),
+                "enrollment_generation": GENERATION,
+            },
+        },
+    )
+    assert admitted.status_code == 200, admitted.text
+    (first,) = _requests(number)
+    pr = next(_PULLS)
+    api.open_pull(pr)
+    _own_pull_request(first["work_item_id"], pr)
+    _complete(client, first["id"])
+    return number, pr, first
+
+
+@pytest.mark.parametrize("event", EVENTS)
+def test_review_feedback_on_a_personal_installation_refuses_a_legacy_service_work_item(
+    factory: tuple[TestClient, ReviewGitHubAPI], monkeypatch: pytest.MonkeyPatch, event: str
+) -> None:
+    """#5378: review feedback supplies the installation's mode, as tracker ingress does.
+
+    A WorkItem admitted as service before the installation switched to
+    personal mode has no owner. On the personal installation a writer's
+    review mention on its pull request is refused ``personal_owner_required``:
+    no revision, no owner invented, every tuple still service. Liveness: back
+    on the service setting the same kind of feedback admits a service revision.
+
+    Falsifiable: a review admission that passes service mode whatever the
+    installation's mode admits the mention on the personal installation.
+    """
+
+    from curie_api.models import DEFAULT_TENANT_ID
+
+    client, api = factory
+    number, pr, first = _owned(client, api)
+    service = (DEFAULT_TENANT_ID, "service", None, None)
+    legacy = {first["work_item_id"]: service, first["id"]: service}
+    assert _owner_tuples(first["work_item_id"]) == legacy
+
+    _installation_mode(monkeypatch, "personal")
+    payload, _ = _feedback_event(api, event, pr, _mention())
+    _refused(client, number, event, payload, "personal_owner_required")
+    assert _owner_tuples(first["work_item_id"]) == legacy
+
+    _installation_mode(monkeypatch, "service")
+    payload, _ = _feedback_event(api, event, pr, _mention())
+    response = _post(client, event, payload)
+    assert response.status_code == 200, response.text
+    assert response.json()["status"] == "factory_admitted", response.text
+    (_first, revision) = _requests(number)
+    assert _owner_tuples(first["work_item_id"]) == {**legacy, revision["id"]: service}
+
+
+@pytest.mark.parametrize("installation", ["service", "personal"])
+def test_review_feedback_on_a_personal_work_item_keeps_its_owner_tuple(
+    personal_factory: tuple[TestClient, ReviewGitHubAPI],
+    monkeypatch: pytest.MonkeyPatch,
+    installation: str,
+) -> None:
+    """#5378: a reviewer's revision of a personal WorkItem runs as the WorkItem's owner.
+
+    The reviewer is a write collaborator, not the owner. On a service and a
+    personal installation alike the revision is admitted with the reviewer as
+    its requester and the locked WorkItem's tuple as its owner, and a
+    reconstructed worker resolver projects that owner. Reviewers never supply
+    ownership. Liveness for the refusal above on a personal installation.
+    """
+
+    import personal_execution_support as support
+    from curie_api.models import DEFAULT_TENANT_ID
+
+    client, api = personal_factory
+    owner = _seed_owner()
+    number, pr, first = _owned_personal(client, api, owner)
+    personal = (DEFAULT_TENANT_ID, "personal", owner, GENERATION)
+    work_item_id = first["work_item_id"]
+    assert _owner_tuples(work_item_id) == {work_item_id: personal, first["id"]: personal}
+
+    _installation_mode(monkeypatch, installation)
+    payload, _ = _feedback_event(api, "pull_request_review_comment", pr, _mention())
+    response = _post(client, "pull_request_review_comment", payload)
+
+    assert response.status_code == 200, response.text
+    assert response.json()["status"] == "factory_admitted", response.text
+    (_first, revision) = _requests(number)
+    assert revision["requester"] == f"github:{SENDER_ID}:{SENDER}"
+    assert _owner_tuples(work_item_id) == {
+        work_item_id: personal,
+        first["id"]: personal,
+        revision["id"]: personal,
+    }
+    projected = support.resolve_execution_owners([revision["id"]], tenant_id=DEFAULT_TENANT_ID)
+    resolved = projected[revision["id"]]
+    assert resolved is not None
+    assert (
+        resolved.work_item_id,
+        resolved.tenant_id,
+        resolved.model_auth_mode,
+        resolved.owner_principal_id,
+        resolved.enrollment_generation,
+    ) == (work_item_id, *personal)

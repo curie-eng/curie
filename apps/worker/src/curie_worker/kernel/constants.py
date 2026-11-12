@@ -23,6 +23,7 @@ from ..turn_progress import (
 from . import attachment_access, channel_read, hooks, memory
 
 if TYPE_CHECKING:
+    from ..personal_execution import PersonalLaunch
     from ..sandbox.types import SandboxHandle, SandboxTermination
 
 logger = logging.getLogger(__name__)
@@ -387,6 +388,29 @@ _WORK_ITEM_TERMINAL_START_REFUSALS = frozenset(
     {"work_item_cancelled", "waiting_deadline_elapsed", "not_found", "factory_start_failed"}
 )
 
+# #5378: the API refused a personal start because the owner's enrollment is no
+# longer active at the request's generation. The request stays waiting (the
+# versioned revalidation can rebind it), so this delivery releases exactly the
+# claim it made, observed absent, and defers ``not_started:<code>``. Passed
+# through unchanged by the API's ``_map_start_conflict``.
+_WORK_ITEM_ENROLLMENT_START_REFUSALS = frozenset(
+    {"enrollment_inactive", "enrollment_generation_mismatch"}
+)
+# Bounds that release: the delete plus the substrate's own absence poll.
+_ENROLLMENT_REFUSAL_RELEASE_TIMEOUT_S = 45.0
+
+#: The one answer an ownerless turn gets on a personal installation (#5378).
+_PERSONAL_OWNER_REQUIRED_REPLY = (
+    "This installation runs personal subscriptions, and this request has no "
+    "owner to run it as (personal_owner_required). Nothing was started."
+)
+#: A delivery with no personal launch met a runtime booted with a personal
+#: grant (#5378). It is never steered into or adopted.
+_PERSONAL_RUNTIME_REFUSED_REPLY = (
+    "This thread's runtime belongs to a personal execution, so this request "
+    "did not run in it (owner_provenance_mismatch). Start a new thread."
+)
+
 # A factory execute turn that ends done or idle without calling publish_changes
 # is re-prompted once in the same session (#3128). The progress tool's canonical
 # spelling is runner/src/curie_runner/approval.py ``PROGRESS_TOOL_NAME``; the
@@ -637,6 +661,13 @@ _OWNED_WORK_ITEM: ContextVar[uuid.UUID | None] = ContextVar(
 
 _DELIVERY_LEASE: ContextVar[DeliveryLease | None] = ContextVar(
     "curie_worker_delivery_lease", default=None
+)
+
+# The personal launch of this delivery's WorkItem request (#5378), or None for
+# a service request and every ownerless lane. Per delivery, like the owned
+# WorkItem above; its expectations are read live from that run.
+_PERSONAL_LAUNCH: ContextVar[PersonalLaunch | None] = ContextVar(
+    "curie_worker_personal_launch", default=None
 )
 
 

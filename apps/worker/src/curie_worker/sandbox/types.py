@@ -46,6 +46,13 @@ TURN_PROGRESS_ELIGIBILITY_ENV = "CURIE_TURN_PROGRESS_ENABLED"
 # ACTION-EXECUTOR-5): ``action-exec:<execution id>``. Pressure reclamation keys
 # on it, so the substrate refuses a claim whose key and executor keyword disagree.
 EXECUTOR_THREAD_KEY_PREFIX = "action-exec:"
+# Claim-object labels naming whose personal grant a claim booted with (#5378,
+# ADR 0268). Only a personal claim carries them; they are evidence and the
+# owner inventory's selector, never authority (the route record is).
+MODEL_AUTH_MODE_LABEL = "curietech.ai/model-auth-mode"
+OWNER_TENANT_LABEL = "curietech.ai/owner-tenant"
+OWNER_PRINCIPAL_LABEL = "curietech.ai/owner-principal"
+ENROLLMENT_GENERATION_LABEL = "curietech.ai/enrollment-generation"
 
 
 def is_executor_thread_key(thread_key: str) -> bool:
@@ -293,6 +300,14 @@ class SandboxHandle:
     # HTTP at the root when it is read (``RouteRecord.from_json``).
     transport: Transport = "http"
     base_path: str = ""
+    # Whose grant the runner booted with (#5378, ADR 0268): ``"personal"`` and
+    # the owner's tenant, principal and enrollment generation for a personal
+    # claim. None on a service claim and on a route written before the fields
+    # existed, which is unknown provenance: a personal request never adopts it.
+    model_auth_mode: str | None = None
+    owner_tenant_id: str | None = None
+    owner_principal_id: str | None = None
+    enrollment_generation: int | None = None
 
     def __post_init__(self) -> None:
         _check_endpoint(self.transport, self.service_fqdn, self.base_path)
@@ -333,6 +348,125 @@ class RouteRecord:
         if payload.get("runner_digests") is not None:
             payload["runner_digests"] = tuple(payload["runner_digests"])
         return cls(handle=SandboxHandle(**payload), state=state)
+
+
+@dataclass(frozen=True)
+class ClaimProvenance:
+    """Whose grant a personal claim boots with (#5378, ADR 0268). Never the grant.
+
+    The tuple an ExecutionRequest snapshotted. A service request passes no
+    provenance at all; ``provenance_admits`` gives None the service rule.
+    """
+
+    owner_tenant_id: str
+    owner_principal_id: str
+    enrollment_generation: int
+    model_auth_mode: Literal["personal"] = "personal"
+
+    def labels(self) -> dict[str, str]:
+        return {
+            MODEL_AUTH_MODE_LABEL: self.model_auth_mode,
+            OWNER_TENANT_LABEL: self.owner_tenant_id,
+            OWNER_PRINCIPAL_LABEL: self.owner_principal_id,
+            ENROLLMENT_GENERATION_LABEL: str(self.enrollment_generation),
+        }
+
+    def recorded_by(self, handle: SandboxHandle) -> bool:
+        return (
+            handle.model_auth_mode,
+            handle.owner_tenant_id,
+            handle.owner_principal_id,
+            handle.enrollment_generation,
+        ) == (
+            self.model_auth_mode,
+            self.owner_tenant_id,
+            self.owner_principal_id,
+            self.enrollment_generation,
+        )
+
+
+def provenance_admits(provenance: ClaimProvenance | None, handle: SandboxHandle) -> bool:
+    """Whether a retained route may serve a request with ``provenance``.
+
+    A personal request needs the exact tuple; a route with unknown provenance
+    (written before the fields existed) or any other owner or generation fails
+    closed. A service request (None) takes any route that did not boot with a
+    personal grant, so no mode crosses in either direction.
+    """
+
+    if provenance is None:
+        return handle.model_auth_mode != "personal"
+    return provenance.recorded_by(handle)
+
+
+class PersonalCreate(Protocol):
+    """What a personal claim create needs from the kernel (#5378, ADR 0268).
+
+    The substrate runs on a worker thread and calls these synchronously; the
+    kernel bridges each to its event loop. ``begin`` takes the owner launch
+    lease (``OwnerBusy`` when another create holds it), ``grant_env`` runs the
+    final authority check after all preparation and returns the grant's claim
+    env (a refusal raises), and ``fence`` proves the lease is still this
+    create's immediately before the create write (``OwnerBusy`` when lost).
+    """
+
+    @property
+    def provenance(self) -> ClaimProvenance: ...
+
+    def begin(self) -> None: ...
+
+    def grant_env(self) -> Mapping[str, str]: ...
+
+    def fence(self) -> None: ...
+
+
+#: Grant refusals and enrollment fences: the owner reconnects or the request
+#: is revalidated, and a started request ends authentication-required.
+AUTHENTICATION_REQUIRED = "authentication-required"
+
+
+class PersonalLaunchRefused(Exception):
+    """A personal execution may not claim, adopt, steer or start (#5378).
+
+    Deliberately not a ``SandboxError``: a refusal is a decision, so the
+    kernel settles it instead of retrying it as a runner error. ``code`` is
+    the named refusal; ``classification`` is ``authentication-required`` for
+    grant refusals and enrollment fences, and None for a structural refusal.
+    The message names the code only, never an owner or a grant.
+    """
+
+    def __init__(self, code: str, *, classification: str | None = None) -> None:
+        self.code = code
+        self.classification = classification
+        super().__init__(code)
+
+    @property
+    def authentication_required(self) -> bool:
+        return self.classification == AUTHENTICATION_REQUIRED
+
+
+class PersonalModeUnsupported(PersonalLaunchRefused):
+    """Personal mode on a Docker or static substrate (ADR 0268 decision 2)."""
+
+    def __init__(self) -> None:
+        super().__init__("personal_mode_requires_kubernetes")
+
+
+class ProvenanceMismatch(PersonalLaunchRefused):
+    """A concurrent route winner booted for another owner, generation or mode."""
+
+    def __init__(self) -> None:
+        super().__init__("owner_provenance_mismatch")
+
+
+class OwnerBusy(Exception):  # noqa: N818 - a capacity condition, not an error
+    """The owner's one native process slot is taken (ADR 0268 decision 2).
+
+    Another thread's claim for the same owner exists, another create holds the
+    owner launch lease, or this create lost that lease. Capacity-like: an
+    unstarted request waits without spending start attempts. Not a
+    ``CapacityExhaustedError``, so pressure reclamation never runs for it.
+    """
 
 
 @dataclass(frozen=True)
@@ -667,7 +801,16 @@ class SandboxClient(Protocol):
 
     def delete_claim(self, name: str, *, request_timeout_seconds: float) -> None: ...
 
-    def list_claims(self, *, label_selector: str) -> list[ClaimView]: ...
+    def list_claims(
+        self, *, label_selector: str, request_timeout_seconds: float | None = None
+    ) -> list[ClaimView]:
+        """Claims matching ``label_selector``; a timeout bounds the one request.
+
+        The personal owner inventory always passes one (#5378): it runs under
+        the owner launch lease, so it must end before that lease could lapse.
+        """
+
+        ...
 
     def reap_claim_templates(self, *, keep: set[str], created_before: datetime) -> list[str]:
         """Delete claim-scoped templates whose claim is gone; return their names.
