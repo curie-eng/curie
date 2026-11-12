@@ -3,15 +3,17 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import time
 from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
-from dataclasses import replace
+from dataclasses import asdict, replace
 from typing import Any
 
 import pytest
 import redis
 from curie_worker.sandbox import AffinityStore, RouteRecord, RouteState, SandboxHandle
+from curie_worker.sandbox.types import WorkItemRouteOwner
 from redis.asyncio import Redis as AsyncRedis
 
 
@@ -852,3 +854,21 @@ def test_route_replacement_after_scan_preserves_the_reused_sandbox(
             assert affinity.get("T-replaced") == replacement
 
     asyncio.run(go())
+
+
+@pytest.mark.parametrize("mode", [None, "service", "personal"])
+def test_unowned_routes_keep_the_previous_release_serialization(mode: str | None) -> None:
+    record = RouteRecord(handle=replace(_handle(), model_auth_mode=mode))
+    previous = {**asdict(record.handle), "state": record.state.value}
+    assert record.to_json() == json.dumps(previous, sort_keys=True)
+    assert RouteRecord.from_json(record.to_json()) == record
+    previous["work_item_owner"] = None
+    assert RouteRecord.from_json(json.dumps(previous)) == record
+
+
+def test_work_item_route_owner_round_trips() -> None:
+    record = RouteRecord(
+        handle=_handle(),
+        work_item_owner=WorkItemRouteOwner("example-request", 2, "acme-worker"),
+    )
+    assert RouteRecord.from_json(record.to_json()) == record

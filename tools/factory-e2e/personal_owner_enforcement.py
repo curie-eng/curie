@@ -3778,7 +3778,8 @@ def owner_proof_class(e: Any) -> type[Any]:  # noqa: C901 - one scenario, one cl
                 if before is not None
                 else None
             )
-            assert previous_cli, "revalidation requires a recorded predecessor native process"
+            if not previous_cli:
+                raise poe.StepFailed("revalidation_predecessor_missing")
             self.observe(
                 "authentication-required",
                 "revalidated.fresh_native_process",

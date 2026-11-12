@@ -2479,7 +2479,7 @@ def test_revalidation_requires_a_recorded_predecessor(phase: str, previous: str 
         raise ReachedHarvest
 
     proof.harvest = harvest
-    expected = ReachedHarvest if previous is not None else AssertionError
+    expected = ReachedHarvest if previous is not None else poe.StepFailed
     with pytest.raises(expected):
         proof.revalidated()
 

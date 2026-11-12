@@ -341,9 +341,8 @@ class RouteRecord:
     def to_json(self) -> str:
         payload = asdict(self.handle)
         payload["state"] = self.state.value
-        payload["work_item_owner"] = (
-            asdict(self.work_item_owner) if self.work_item_owner is not None else None
-        )
+        if self.work_item_owner is not None:
+            payload["work_item_owner"] = asdict(self.work_item_owner)
         return json.dumps(payload, sort_keys=True)
 
     @classmethod
