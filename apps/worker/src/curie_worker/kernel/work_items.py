@@ -723,6 +723,19 @@ async def _release_work_item_sandbox(self: Kernel, run: WorkItemRun) -> None:
     await _release_claim_locked(self, thread_key, claim_name)
 
 
+async def _release_unstarted_personal_claim(self: Kernel, run: WorkItemRun) -> None:
+    """Free the owner's one native process before a personal request waits (#5378).
+
+    A waiting request otherwise keeps its claim for the next acquire of the
+    thread to adopt, but a personal claim is the owner's only slot, and a
+    request cancelled while it waits gets no terminate wake to release it.
+    Fenced to the claim this run recorded, and observed gone.
+    """
+
+    if not run.started and run.claim_name is not None:
+        await _release_claim_locked(self, run.thread_key, run.claim_name, wait_gone=True)
+
+
 async def _release_claim_locked(
     self: Kernel, thread_key: str, claim_name: str, *, wait_gone: bool = False
 ) -> None:

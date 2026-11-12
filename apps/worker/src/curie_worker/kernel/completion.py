@@ -49,7 +49,7 @@ from ..workitem_dispatch import (
 if TYPE_CHECKING:
     from .core import Kernel
 
-from . import claim, clock, constants, failures, log, routing
+from . import claim, clock, constants, failures, log, routing, work_items
 from .log import logger
 
 
@@ -230,6 +230,9 @@ async def _complete(
             else None
         )
         try:
+            if constants._PERSONAL_LAUNCH.get() is not None:
+                # #5378: a failure after the claim and before the API start.
+                await work_items._release_unstarted_personal_claim(self, run)
             await run.defer(
                 (
                     "workspace_timeout"

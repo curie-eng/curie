@@ -54,6 +54,7 @@ from ..turn_progress import (
     progress_eligible,
 )
 from ..workitem_dispatch import (
+    _FACTORY_AUTHORITY_REFUSALS,
     WorkItemConflict,
     WorkItemRun,
     WorkItemStartRefused,
@@ -1511,6 +1512,22 @@ async def _process_event(
                             event_id,
                         )
                     return
+                if (
+                    exc.code in _FACTORY_AUTHORITY_REFUSALS
+                    and constants._PERSONAL_LAUNCH.get() is not None
+                ):
+                    # #5378: the API deferred this personal request itself
+                    # (``_defer_factory_refusal``) and it stays waiting.
+                    # Release the claim this delivery recorded, so the
+                    # owner's one slot is free; no second defer.
+                    refused_run = (
+                        self._work_item_runs.get(owned_work_item_id)
+                        if owned_work_item_id is not None
+                        else None
+                    )
+                    if refused_run is not None:
+                        await work_items._release_unstarted_personal_claim(self, refused_run)
+                    return
                 if exc.code in constants._WORK_ITEM_TERMINAL_START_REFUSALS:
                     # #3208: the request settled before a turn opened, so
                     # this delivery is the only one that can release the
@@ -2058,8 +2075,8 @@ async def _settle_personal_refusal(
 
     Decision 3 of #5378: an unstarted request defers ``not_started:<code>``
     (bounded by the start deferral limit, ending ``start_failed``), first
-    releasing a claim this delivery made when the refusal is about the
-    owner's grant or enrollment. A started request finishes failed:
+    releasing the claim this delivery recorded unless the refusal is one of
+    ``_PERSONAL_REFUSALS_KEEPING_CLAIM``. A started request finishes failed:
     ``authentication_required`` for grant refusals and enrollment fences,
     ``runner_escalated`` for structural refusals.
     """
@@ -2076,10 +2093,8 @@ async def _settle_personal_refusal(
                 ci_fix_round=None,
             )
         else:
-            if exc.authentication_required and run.claim_name is not None:
-                await work_items._release_claim_locked(
-                    self, run.thread_key, run.claim_name, wait_gone=True
-                )
+            if exc.code not in constants._PERSONAL_REFUSALS_KEEPING_CLAIM:
+                await work_items._release_unstarted_personal_claim(self, run)
             await run.defer(f"not_started:{exc.code}", capacity=False, start_failure_detail=None)
     except WorkItemConflict as conflict:
         logger.info("personal refusal settlement for %s refused: %s", event_id, conflict.code)

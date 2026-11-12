@@ -398,6 +398,16 @@ _WORK_ITEM_ENROLLMENT_START_REFUSALS = frozenset(
 )
 # Bounds that release: the delete plus the substrate's own absence poll.
 _ENROLLMENT_REFUSAL_RELEASE_TIMEOUT_S = 45.0
+# #5378: an unstarted personal run never defers while holding the claim it
+# recorded, because that claim is the owner's one native process. These
+# refusals are the exception and keep it. ``execution_authority_lost`` also
+# covers a lapsed or transferred acquire, where another delivery holds the same
+# request and adopts this thread's route; the code does not say which, so the
+# claim stays. ``owner_provenance_mismatch`` names a route another delivery
+# booted, never this run's own.
+_PERSONAL_REFUSALS_KEEPING_CLAIM = frozenset(
+    {"execution_authority_lost", "owner_provenance_mismatch"}
+)
 
 #: The one answer an ownerless turn gets on a personal installation (#5378).
 _PERSONAL_OWNER_REQUIRED_REPLY = (
