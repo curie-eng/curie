@@ -1584,6 +1584,8 @@ def test_deep_label_is_documented_in_the_ci_gates_subsection() -> None:
     assert "container and dry run fixtures" in section
     assert "CI policy" in section
     assert "close and reopen" in section
+    assert "task branch" in section
+    assert "never enters a merge queue" in section
 
 
 def _select_outputs(tmp_path: Path, paths: tuple[str, ...]) -> dict[str, str]:

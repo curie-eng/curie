@@ -195,7 +195,8 @@ and convergence tiers to the merge queue, which runs them on the exact merge
 combination before anything lands. Add the `ci:deep` label and then push, or
 close and reopen the pull request, to run all of them on the pull request. A
 pull request with a broad Python change should carry the label before it is
-queued.
+queued. A pull request targeting a task branch never enters a merge queue, so
+these deferred jobs run there only with the `ci:deep` label.
 
 ## Test policy
 

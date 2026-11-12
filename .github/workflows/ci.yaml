@@ -1013,7 +1013,6 @@ jobs:
             if [[ "$CI_POLICY_SELECTED" == "true" ]]; then
               defer "Deferred to the merge queue: CI policy (workflow meta-tests): ${CI_POLICY_FILES}"
             fi
-            echo "Python pytest and CI policy deferred to the merge queue"
             exit 0
           fi
           if [[ "$CHANGES_RESULT" != "success" ]]; then

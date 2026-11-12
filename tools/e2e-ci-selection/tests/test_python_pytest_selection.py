@@ -2303,8 +2303,9 @@ def test_unlabeled_pull_request_with_nothing_selected_prints_no_deferral(
         ci_policy_files="",
     )
     assert result.returncode == 0, result.stdout + result.stderr
+    combined = result.stdout + result.stderr + (tmp_path / "github-step-summary").read_text()
+    assert "deferred" not in combined.lower()
     assert _deferred_lines(tmp_path) == []
-    assert DEFERRED_PREFIX not in result.stdout
 
 
 def test_unlabeled_pull_request_omits_a_deselected_dry_run(tmp_path: Path) -> None:
