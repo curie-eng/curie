@@ -935,28 +935,35 @@ jobs:
           # `deep` is true in the merge queue, on a push, on a dispatch, and on
           # a pull request labeled ci:deep. An unlabeled pull request defers the
           # four broad jobs. Anything else is a broken selection and fails.
-          case "$DEEP" in
-            true|false) ;;
-            *)
-              echo "Python deep selection must be true or false, got ${DEEP:-<empty>}" >&2
-              exit 1
-              ;;
-          esac
+          # `if`, not `case`: a repeated `*)` arm in this `run:` body is a
+          # hand-rolled retry to the CI policy gate.
+          if [[ "$DEEP" != "true" && "$DEEP" != "false" ]]; then
+            echo "Python deep selection must be true or false, got ${DEEP:-<empty>}" >&2
+            exit 1
+          fi
+          # Read once. The unlabeled path and the unselected path both refuse a
+          # stray record, and a second identical `find` is the same retry shape.
+          shard_record_present=false
+          if [[ -d "$SHARD_RESULTS_DIR" ]] && [[ -n "$(find "$SHARD_RESULTS_DIR" -type f -print -quit)" ]]; then
+            shard_record_present=true
+          fi
           if [[ "$EVENT_NAME" != "pull_request" && "$DEEP" != "true" ]]; then
             echo "Python deep tiers must run on ${EVENT_NAME:-<empty>}" >&2
             exit 1
           fi
+          # Once, ahead of both paths. A second copy is the same command twice
+          # to the CI policy gate, which does not follow the branch.
+          if [[ "$CHANGES_RESULT" != "success" ]]; then
+            echo "the changes job finished $CHANGES_RESULT; pytest selection cannot be trusted" >&2
+            exit 1
+          fi
+          if [[ "$PYTEST_SELECTED" != "true" && "$PYTEST_SELECTED" != "false" ]]; then
+            echo "pytest selection must be true or false, got ${PYTEST_SELECTED:-<empty>}" >&2
+            exit 1
+          fi
           if [[ "$DEEP" == "false" ]]; then
-            if [[ "$CHANGES_RESULT" != "success" ]]; then
-              echo "the changes job finished $CHANGES_RESULT; pytest selection cannot be trusted" >&2
-              exit 1
-            fi
             if [[ "$CI_POLICY_SELECTED" != "true" && "$CI_POLICY_SELECTED" != "false" ]]; then
               echo "CI policy selection must be true or false, got ${CI_POLICY_SELECTED:-<empty>}" >&2
-              exit 1
-            fi
-            if [[ "$PYTEST_SELECTED" != "true" && "$PYTEST_SELECTED" != "false" ]]; then
-              echo "pytest selection must be true or false, got ${PYTEST_SELECTED:-<empty>}" >&2
               exit 1
             fi
             if [[ "$CONTAINER_SELECTED" != "true" && "$CONTAINER_SELECTED" != "false" ]]; then
@@ -967,31 +974,27 @@ jobs:
               echo "dry run selection must be true or false, got ${DRY_RUN_SELECTED:-<empty>}" >&2
               exit 1
             fi
-            case "$PYTEST_SCOPE" in
-              full|cli|impact) ;;
-              *)
-                echo "pytest scope must be full, cli or impact, got ${PYTEST_SCOPE:-<empty>}" >&2
-                exit 1
-                ;;
-            esac
+            if [[ "$PYTEST_SCOPE" != "full" && "$PYTEST_SCOPE" != "cli" && "$PYTEST_SCOPE" != "impact" ]]; then
+              echo "pytest scope must be full, cli or impact, got ${PYTEST_SCOPE:-<empty>}" >&2
+              exit 1
+            fi
             if [[ "$SHARDS_RESULT" != "skipped" ]]; then
-              echo "Python pytest finished ${SHARDS_RESULT:-<empty>}; an unlabeled pull request defers it" >&2
+              echo "Python pytest finished ${SHARDS_RESULT:-<empty>}, and an unlabeled pull request defers it" >&2
               exit 1
             fi
             if [[ "$CONTAINER_RESULT" != "skipped" ]]; then
-              echo "Python container fixtures finished ${CONTAINER_RESULT:-<empty>}; an unlabeled pull request defers them" >&2
+              echo "Python container fixtures finished ${CONTAINER_RESULT:-<empty>}, and an unlabeled pull request defers them" >&2
               exit 1
             fi
             if [[ "$DRY_RUN_RESULT" != "skipped" ]]; then
-              echo "Python dry run fixture finished ${DRY_RUN_RESULT:-<empty>}; an unlabeled pull request defers it" >&2
+              echo "Python dry run fixture finished ${DRY_RUN_RESULT:-<empty>}, and an unlabeled pull request defers it" >&2
               exit 1
             fi
             if [[ "$CI_POLICY_RESULT" != "skipped" ]]; then
-              echo "CI policy finished ${CI_POLICY_RESULT:-<empty>}; an unlabeled pull request defers it" >&2
+              echo "CI policy finished ${CI_POLICY_RESULT:-<empty>}, and an unlabeled pull request defers it" >&2
               exit 1
             fi
-            if [[ -d "$SHARD_RESULTS_DIR" ]] \
-              && [[ -n "$(find "$SHARD_RESULTS_DIR" -type f -print -quit)" ]]; then
+            if [[ "$shard_record_present" == "true" ]]; then
               echo "an unlabeled pull request deferred pytest, but a shard recorded a result" >&2
               exit 1
             fi
@@ -1015,10 +1018,6 @@ jobs:
             fi
             exit 0
           fi
-          if [[ "$CHANGES_RESULT" != "success" ]]; then
-            echo "the changes job finished $CHANGES_RESULT; pytest selection cannot be trusted" >&2
-            exit 1
-          fi
           if [[ "$CI_POLICY_SELECTED" == "true" ]]; then
             ci_policy_expected=success
           elif [[ "$CI_POLICY_SELECTED" == "false" ]]; then
@@ -1029,10 +1028,6 @@ jobs:
           fi
           if [[ "$CI_POLICY_RESULT" != "$ci_policy_expected" ]]; then
             echo "CI policy finished ${CI_POLICY_RESULT:-<empty>}; expected $ci_policy_expected" >&2
-            exit 1
-          fi
-          if [[ "$PYTEST_SELECTED" != "true" && "$PYTEST_SELECTED" != "false" ]]; then
-            echo "pytest selection must be true or false, got ${PYTEST_SELECTED:-<empty>}" >&2
             exit 1
           fi
           case "$PYTEST_SCOPE" in
@@ -1063,8 +1058,7 @@ jobs:
               echo "pytest was not selected, but the shards finished $SHARDS_RESULT" >&2
               exit 1
             fi
-            if [[ -d "$SHARD_RESULTS_DIR" ]] \
-              && [[ -n "$(find "$SHARD_RESULTS_DIR" -type f -print -quit)" ]]; then
+            if [[ "$shard_record_present" == "true" ]]; then
               echo "pytest was not selected, but a shard reported a result" >&2
               exit 1
             fi
