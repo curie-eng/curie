@@ -17,7 +17,9 @@ Six subcommands share one private SQLite ledger under ``--state-dir``:
 4. ``rehearse`` (unpaid, zero model sessions) runs every phase except the paid
    kickoff: it enrolls a well-formed token that was never issued, proves Socket
    Mode delivery and declared-driver admission with a ``[test action] ping``,
-   runs the disconnected control, then the full finalizer.
+   runs the disconnected control, then the full finalizer. ``rehearse --kickoff``
+   also runs the kickoff and read-back on that never-issued token (no grant
+   probe), so the paid path's diagnostics are captured with nothing to spend.
 5. ``run`` (also reachable as ``--live``) performs exactly one paid kickoff and
    the disconnected control, then finalizes every owned resource.
 6. ``judge --criterion X`` reads the ledger only and prints a verdict.
@@ -33,6 +35,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import collections
 import contextlib
 import dataclasses
 import functools
@@ -109,6 +112,20 @@ POLL_SECONDS = 2.0
 # The deadline enforcer's pass interval, and how long its stop waits for it.
 DEADLINE_SECONDS = 1.0
 DEADLINE_JOIN_SECONDS = 10.0
+# The claim-pod follower's pass interval, its one listing's timeout, and how long its
+# stop waits for it.
+FOLLOW_SECONDS = 1.0
+FOLLOW_GET_SECONDS = 20.0
+FOLLOW_JOIN_SECONDS = 30.0
+# A stream into a runner container that exits silently is respawned this often, this long.
+STREAM_RETRY_SECONDS = 0.5
+STREAM_RETRY_LIMIT = 120.0
+# Diagnostics: each runner log tail, and the worker log read for the escalation reason.
+# The read precedes the fence's scale, so its timeout is short: it delays the stop.
+RUNNER_LOG_TAIL = 80
+WORKER_LOG_TAIL = 400
+WORKER_LOG_LINES = 60
+WORKER_LOG_SECONDS = 15.0
 # Scheduling and the image pull before a runner's first native record.
 STARTUP_SECONDS = 600.0
 RECEIPT_SECONDS = 90.0
@@ -493,6 +510,9 @@ def build_parser() -> argparse.ArgumentParser:
             sub.add_argument("--approve-live", default=None)
         if name in {"preflight", "run"}:
             sub.add_argument("--grant-probe-cli", default=DEFAULT_PROBE_CLI)
+        if name == "rehearse":
+            # The kickoff and read-back on the rehearsal's own never-issued token.
+            sub.add_argument("--kickoff", action="store_true")
         if name == "judge":
             sub.add_argument("--criterion", required=True, choices=[*sks.CRITERIA, "all"])
     return parser
@@ -1547,28 +1567,51 @@ def cmd_run(args: argparse.Namespace, runtime: Runtime) -> int:
 
 
 def cmd_rehearse(args: argparse.Namespace, runtime: Runtime) -> int:
-    """Every unpaid phase against the real cluster and Slack, then the full finalizer."""
+    """Every unpaid phase against the real cluster and Slack, then the full finalizer.
+
+    ``--kickoff`` adds the kickoff and read-back, enrolled with the rehearsal's own
+    never-issued token so nothing can be spent: the ceiling is ``--approve-live``
+    and the live window ends at ``--grant-expires-at``, both required with it and
+    refused without it. ``--grant-file`` is refused either way.
+    """
 
     supplied = [
         flag
-        for flag, value in (
-            ("--grant-file", args.grant_file),
-            ("--grant-expires-at", args.grant_expires_at),
-            ("--approve-live", args.approve_live),
+        for flag, value, allowed in (
+            ("--grant-file", args.grant_file, False),
+            ("--grant-expires-at", args.grant_expires_at, args.kickoff),
+            ("--approve-live", args.approve_live, args.kickoff),
         )
-        if value is not None
+        if value is not None and not allowed
     ]
     if supplied:
         raise sks.Refusal("arguments_invalid", "rehearse takes no " + ", ".join(supplied))
-    inputs = live_inputs(base_inputs(args), args)
+    inputs = base_inputs(args)
+    ceiling: sks.Ceiling | None = None
+    if args.kickoff:
+        ceiling = sks.parse_ceiling(args.approve_live)
+        sks.attempt_roles(ceiling)
+        expires_at = sks.parse_expiry(args.grant_expires_at)
+        sks.require_lifetime(expires_at, runtime.clock.now())
+        inputs = dataclasses.replace(inputs, expires_at=expires_at)
+    inputs = live_inputs(inputs, args)
     ledger = sks.Ledger.open(inputs.state_dir, inputs.run_id, scrubber=runtime.scrubber)
     try:
         ledger.ensure_run(inputs.candidate, phase="rehearse")
         ledger.mark_live_kind("rehearse")
+        if ceiling is not None:
+            ledger.record_ceiling(args.approve_live, ceiling)
+            ledger.record("rehearsal", "kickoff_diagnostic", True)
     except sks.Refusal:
         ledger.close()
         raise
-    return LiveRun(inputs=inputs, runtime=runtime, ledger=ledger, ceiling=None).execute()
+    return LiveRun(
+        inputs=inputs,
+        runtime=runtime,
+        ledger=ledger,
+        ceiling=ceiling,
+        kickoff_diagnostic=ceiling is not None,
+    ).execute()
 
 
 # --------------------------------------------------------------------------
@@ -1578,7 +1621,12 @@ def cmd_rehearse(args: argparse.Namespace, runtime: Runtime) -> int:
 
 @dataclasses.dataclass
 class RunnerPod:
-    """One runner pod the run observed, with its own harvest and stderr classes."""
+    """One runner pod the run observed, with its own harvest and stderr classes.
+
+    ``attach_pod`` creates it (on any thread) and ``audit_pod`` fills ``checks`` on
+    the main thread once the pod runs; ``lock`` guards every field a reader thread
+    writes. ``log_tail`` is the scrubbed tail of its runner container log.
+    """
 
     name: str
     uid: str
@@ -1591,6 +1639,11 @@ class RunnerPod:
     stderr: list[bytes] = dataclasses.field(default_factory=list)
     processes: list[subprocess.Popen[bytes]] = dataclasses.field(default_factory=list)
     checks: dict[str, Any] = dataclasses.field(default_factory=dict)
+    audited: bool = False
+    log_tail: collections.deque[str] = dataclasses.field(
+        default_factory=lambda: collections.deque(maxlen=RUNNER_LOG_TAIL)
+    )
+    threads: list[threading.Thread] = dataclasses.field(default_factory=list)
 
 
 class LiveRun:
@@ -1605,12 +1658,15 @@ class LiveRun:
         ceiling: sks.Ceiling | None,
         shell: Shell | None = None,
         resolver: Callable[[str], list[str]] | None = None,
+        kickoff_diagnostic: bool = False,
     ) -> None:
         self.inputs = inputs
         self.runtime = runtime
         self.ledger = ledger
         self.ceiling = ceiling
-        self.rehearsal = ceiling is None
+        # ``rehearse --kickoff``: the run path's kickoff on the rehearsal's invalid token.
+        self.kickoff_diagnostic = kickoff_diagnostic
+        self.rehearsal = ceiling is None or kickoff_diagnostic
         self.command = "rehearse" if self.rehearsal else "run"
         self.clock = runtime.clock
         self.out = runtime.out
@@ -1674,6 +1730,13 @@ class LiveRun:
         self.deadline_thread: threading.Thread | None = None
         self.deadline_fired: set[str] = set()
         self.deadline_processes: list[subprocess.Popen[bytes]] = []
+        # The claim-pod follower's thread. ``follow_lock`` guards ``pods``, ``processes``
+        # appends from stream threads, ``present_pods`` and ``terminations``.
+        self.follow_lock = threading.Lock()
+        self.follow_stop = threading.Event()
+        self.follow_thread: threading.Thread | None = None
+        self.present_pods: set[str] = set()
+        self.terminations: dict[tuple[str, str, str], dict[str, Any]] = {}
         # Branch to this run's published head; an empty head means ownership is unproved.
         self.publication_branches: dict[str, str] = {}
         self.publications_recovered = False
@@ -1700,7 +1763,7 @@ class LiveRun:
             ("enroll", self.phase_enroll),
             ("fixtures", self.phase_fixtures),
         ]
-        if not self.rehearsal:
+        if not self.rehearsal or self.kickoff_diagnostic:
             phases += [("kickoff", self.phase_kickoff), ("read-back", self.phase_read_back)]
         phases.append(("control", self.phase_control))
         if self.rehearsal:
@@ -1834,7 +1897,7 @@ class LiveRun:
     # -- phase: refusals (no mutation) ----------------------------------------
 
     def phase_refusals(self) -> None:
-        if not self.rehearsal:
+        if self.ceiling is not None:
             sks.require_lifetime(self.inputs.expires_at, self.clock.now())
         for name in (self.inputs.namespace, self.inputs.grant_namespace):
             existing = self.kube.ctl(
@@ -2728,13 +2791,21 @@ class LiveRun:
         built = self.ledger.observations("images").get("gate_limits")
         if built != sks.reviewer_limits(roles):
             raise sks.Refusal("gate_mismatch", "rebuild the runner layer")
-        self.ledger.begin_live(now=self.clock.now(), grant_expires_at=self.inputs.expires_at)
+        self.ledger.begin_live(
+            now=self.clock.now(),
+            grant_expires_at=self.inputs.expires_at,
+            diagnostic=self.kickoff_diagnostic,
+        )
         self.ledger.record("budget", "allowance_breach", [])
-        self.run_grant_probe()
+        if not self.kickoff_diagnostic:
+            # A diagnostic enrolled the rehearsal's never-issued token: a probe would
+            # only prove that token refused.
+            self.run_grant_probe()
         self.reservations = self.ledger.reserve(roles, now=self.clock.now())
         self.attempt_live = True
         self.attempt_started = self.clock.now()
         self.start_deadline_enforcer(ceiling)
+        self.start_follower()
         try:
             self.admit_kickoff(kit)
             try:
@@ -2742,11 +2813,14 @@ class LiveRun:
             finally:
                 self.attempt_live = False
                 self.stop_deadline_enforcer()
+                # No pod is attached and no stream respawned once the attempt settles.
+                self.safe(self.close_follower, None)
                 self.settle()
                 self.ledger.close_gate()
         finally:
-            # The attempt settled or failed: no deadline pass runs after it.
+            # The attempt settled or failed: no deadline or follower pass runs after it.
             self.stop_deadline_enforcer()
+            self.follow_stop.set()
         self.guard_starts = True
         # A deadline the enforcer reached while the main loop was blocked still fences.
         self.report_deadline_breach()
@@ -2933,7 +3007,7 @@ class LiveRun:
         """Whether any followed runner pod reports a native CLI process still running."""
 
         running = False
-        for pod in tuple(self.pods.values()):
+        for pod in self.followed():
             with pod.lock:
                 running = running or pod.watch.running
         return running
@@ -3011,7 +3085,7 @@ class LiveRun:
         """
 
         now = self.clock.now()
-        for pod in tuple(self.pods.values()):
+        for pod in self.followed():
             with pod.lock:
                 deadline = pod.watch.deadline(seconds)
             if deadline is None or now < deadline or pod.uid in self.deadline_fired:
@@ -3058,6 +3132,13 @@ class LiveRun:
             raise StepFailed("the deadline enforcer did not stop")
 
     def discover_runner_pods(self) -> None:
+        """The main thread's pass over the agent's claims: terminations, attach, then audit.
+
+        It notes every claim pod's container terminations, attaches any pod the
+        follower has not yet (in any phase), and audits each attached pod once it
+        runs. The audit reads the ledger and the registry, so it runs only here.
+        """
+
         claims = self.kube.json("get", CLAIM_RESOURCE, "-l", f"{CLAIM_AGENT_LABEL}={self.agent}")
         for claim in (claims or {}).get("items") or []:
             name = str((claim.get("metadata") or {}).get("name") or "")
@@ -3065,29 +3146,30 @@ class LiveRun:
                 continue
             pods = self.kube.json("get", "pods", "-l", f"{POD_CLAIM_LABEL}={name}")
             for pod in (pods or {}).get("items") or []:
-                meta = pod.get("metadata") or {}
-                uid = str(meta.get("uid") or "")
+                uid = str((pod.get("metadata") or {}).get("uid") or "")
+                if not uid:
+                    continue
+                self.note_terminations(pod)
+                self.attach_pod(pod)
+                with self.follow_lock:
+                    observed = self.pods.get(uid)
                 if (
-                    not uid
-                    or uid in self.pods
+                    observed is None
+                    or observed.audited
                     or (pod.get("status") or {}).get("phase") != "Running"
                 ):
                     continue
-                self.follow_pod(pod, claim)
+                self.audit_pod(observed, pod, claim)
 
-    def follow_pod(self, pod: dict[str, Any], claim: dict[str, Any]) -> None:
-        meta = pod.get("metadata") or {}
-        observed = RunnerPod(
-            name=str(meta.get("name")),
-            uid=str(meta.get("uid")),
-            claim=str((claim.get("metadata") or {}).get("name")),
-            record=pod,
-            harvest=sks.HarvestState(self.scan),
-            watch=sks.ProcessWatch(container_started=sks.runner_started_at(pod)),
-            lock=threading.Lock(),
-            eof=threading.Event(),
-        )
-        self.pods[observed.uid] = observed
+    def followed(self) -> list[RunnerPod]:
+        """A snapshot of the followed pods; the follower thread may add one at any time."""
+
+        with self.follow_lock:
+            return list(self.pods.values())
+
+    def audit_pod(self, observed: RunnerPod, pod: dict[str, Any], claim: dict[str, Any]) -> None:
+        """Main thread only: the image and grant checks of one attached pod that runs."""
+
         checks, running = sks.runner_image_check(
             pod, registry=self.inputs.registry, digest=self.digests.get(sks.LAYER_IMAGE, "")
         )
@@ -3098,86 +3180,232 @@ class LiveRun:
             get = sks.loopback_get("127.0.0.1", self.inputs.registry_port)
             image = self.safe(lambda: sks.registry_image(get, repository, running), None)
         checks["revision_matches"] = image is not None and image.revision == self.inputs.candidate
-        observed.checks = {
+        audit = {
             "image": checks,
             **sks.pod_grant_checks(
                 pod, claim, self.ledger.observations("owner").get("expected") or {}
             ),
         }
-        harvester = self.shell.spawn(
-            [
-                "kubectl",
-                "--context",
-                self.inputs.context,
-                "--namespace",
-                self.inputs.namespace,
-                "exec",
-                "-i",
-                observed.name,
-                "-c",
-                "runner",
-                "--",
-                "python3",
-                "-c",
-                sks.HARVEST_PROGRAM,
-                sks.harvest_config(
-                    nonce=self.nonce,
-                    max_seconds=sum(item.seconds for item in self.reservations) + STARTUP_SECONDS,
-                ),
-            ]
-        )
-        logs = self.shell.spawn(
-            [
-                "kubectl",
-                "--context",
-                self.inputs.context,
-                "--namespace",
-                self.inputs.namespace,
-                "logs",
-                "-f",
-                observed.name,
-                "-c",
-                "runner",
-            ]
-        )
-        for process in (harvester, logs):
-            observed.processes.append(process)
-            self.processes.append(process)
-            self.finalizer.register(
-                f"stop-{observed.name}", functools.partial(stop_process, process)
-            )
-
-        def read() -> None:
-            stream = harvester.stdout
-            for line in stream if stream is not None else ():
-                with observed.lock:
-                    observed.harvest.feed(line)
-                    observed.watch.feed(line, now=self.clock.now())
-            observed.eof.set()
-
-        def drain(stream: Any) -> None:
-            for line in stream if stream is not None else ():
-                self.scan.scan("children", line)
-
-        def stderr_lines() -> None:
-            stream = logs.stdout
-            for line in stream if stream is not None else ():
-                self.scan.scan("children", line)
-                if sks.stderr_error_classes([line]):
-                    with observed.lock:
-                        observed.stderr.append(line)
-
-        threading.Thread(target=read, daemon=True).start()
-        threading.Thread(target=drain, args=(harvester.stderr,), daemon=True).start()
-        threading.Thread(target=stderr_lines, daemon=True).start()
-        threading.Thread(target=drain, args=(logs.stderr,), daemon=True).start()
-        self.ledger.record("grant", "runner_pods_seen", len(self.pods))
+        started = sks.runner_started_at(pod)
+        with observed.lock:
+            observed.record = pod
+            observed.checks = audit
+            observed.audited = True
+            if observed.watch.container_started is None:
+                observed.watch.container_started = started
+        self.ledger.record("grant", "runner_pods_seen", len(self.followed()))
         if not all(checks.values()):
             raise StepFailed("a runner pod is not running the candidate runner layer")
 
+    def note_terminations(self, pod: Mapping[str, Any]) -> None:
+        """Keep each terminated container of a claim pod, the latest per container and state."""
+
+        name = str((pod.get("metadata") or {}).get("name") or "")
+        if not name:
+            return
+        ref = sks.ref_digest(name)
+        found = sks.container_terminations(pod)
+        with self.follow_lock:
+            for item in found:
+                self.terminations[(ref, str(item["container"]), str(item["from"]))] = {
+                    "pod": ref,
+                    **item,
+                }
+
+    def attach_pod(self, pod: Mapping[str, Any]) -> RunnerPod | None:
+        """Follow one claim pod from the moment it exists, in any phase. Thread safe.
+
+        Creates its RunnerPod and starts its harvester ``exec`` and its runner
+        ``logs -f`` stream, each through ``follow_stream``. It reads neither the
+        ledger nor the registry and registers nothing: ``audit_pod`` runs on the
+        main thread, and ``stop_runner_streams`` (registered before the follower
+        starts) stops every stream. Returns None when the pod is already followed.
+        """
+
+        meta = pod.get("metadata") or {}
+        uid, name = str(meta.get("uid") or ""), str(meta.get("name") or "")
+        if not uid or not name:
+            return None
+        observed = RunnerPod(
+            name=name,
+            uid=uid,
+            claim=str((meta.get("labels") or {}).get(POD_CLAIM_LABEL) or ""),
+            record=dict(pod),
+            harvest=sks.HarvestState(self.scan),
+            watch=sks.ProcessWatch(container_started=sks.runner_started_at(pod)),
+            lock=threading.Lock(),
+            eof=threading.Event(),
+        )
+        with self.follow_lock:
+            if uid in self.pods:
+                return None
+            self.pods[uid] = observed
+        harvester = self.kube.argv(
+            "exec",
+            "-i",
+            name,
+            "-c",
+            "runner",
+            "--",
+            "python3",
+            "-c",
+            sks.HARVEST_PROGRAM,
+            sks.harvest_config(
+                nonce=self.nonce,
+                max_seconds=sum(item.seconds for item in self.reservations) + STARTUP_SECONDS,
+            ),
+        )
+        logs = self.kube.argv("logs", "-f", name, "-c", "runner")
+
+        def harvest(line: bytes) -> None:
+            with observed.lock:
+                observed.harvest.feed(line)
+                observed.watch.feed(line, now=self.clock.now())
+
+        def log(line: bytes) -> None:
+            self.scan.scan("children", line)
+            text = self.scrubber.scrub(line.decode(errors="replace").rstrip("\r\n"))
+            with observed.lock:
+                observed.log_tail.append(text)
+                if sks.stderr_error_classes([line]):
+                    observed.stderr.append(line)
+
+        def read_harvest() -> None:
+            try:
+                self.follow_stream(observed, harvester, harvest)
+            finally:
+                observed.eof.set()
+
+        threads = [
+            threading.Thread(target=read_harvest, daemon=True),
+            threading.Thread(target=self.follow_stream, args=(observed, logs, log), daemon=True),
+        ]
+        with observed.lock:
+            observed.threads.extend(threads)
+        for thread in threads:
+            thread.start()
+        return observed
+
+    def follow_stream(
+        self, observed: RunnerPod, argv: list[str], on_line: Callable[[bytes], None]
+    ) -> None:
+        """Read one stream into a runner container, respawning it while it exits silently.
+
+        A ``kubectl exec`` or ``logs -f`` started before the container runs exits
+        with nothing on stdout. While the pod still exists (in the follower's
+        latest listing) the command is respawned every STREAM_RETRY_SECONDS, for
+        at most STREAM_RETRY_LIMIT, so an early stream still connects and a
+        container that already terminated still returns its logs. A stream that
+        produced output is not respawned, and none is once the follower stops.
+        Never touches the ledger.
+        """
+
+        until = self.clock.monotonic() + STREAM_RETRY_LIMIT
+        while True:
+            try:
+                process = self.shell.spawn(argv)
+            except Exception:  # noqa: BLE001 - the main-thread watchdog still bounds the attempt
+                return
+            with self.follow_lock:
+                self.processes.append(process)
+            with observed.lock:
+                observed.processes.append(process)
+            if self.follow_stop.is_set():
+                stop_process(process)
+                return
+            if process.stderr is not None:
+                threading.Thread(
+                    target=self.scan_children, args=(process.stderr,), daemon=True
+                ).start()
+            produced = False
+            for line in process.stdout if process.stdout is not None else ():
+                produced = True
+                on_line(line)
+            if (
+                produced
+                or self.follow_stop.is_set()
+                or self.clock.monotonic() >= until
+                or not self.pod_present(observed.uid)
+            ):
+                return
+            self.clock.wait(STREAM_RETRY_SECONDS)
+
+    def pod_present(self, uid: str) -> bool:
+        with self.follow_lock:
+            return uid in self.present_pods
+
+    # -- the claim-pod follower ---------------------------------------------------------
+
+    def start_follower(self) -> None:
+        """Attach each claim pod the moment it exists, without waiting on the main loop.
+
+        ``discover_runner_pods`` runs only between the main loop's blocking calls,
+        so a runner that lives seconds is missed. This daemon thread lists the
+        claim pods about once a second on the driver's clock and attaches each new
+        one in any phase. The stop of every stream, and its own stop, are
+        registered with the finalizer before it starts. Everything the attach
+        path needs is in memory already; nothing it does touches the ledger.
+        """
+
+        self.finalizer.register("stop-runner-streams", self.stop_runner_streams)
+        self.finalizer.register("stop-runner-follower", self.close_follower)
+        thread = threading.Thread(target=self.follow_loop, daemon=True)
+        self.follow_thread = thread
+        thread.start()
+
+    def follow_loop(self) -> None:
+        while not self.follow_stop.is_set():
+            self.safe(self.follow_pass, None)
+            if self.follow_stop.is_set():
+                return
+            self.clock.wait(FOLLOW_SECONDS)
+
+    def follow_pass(self) -> None:
+        """One follower pass: one claim-pod listing, its terminations, each new pod attached."""
+
+        listing = self.kube.json("get", "pods", "-l", POD_CLAIM_LABEL, timeout=FOLLOW_GET_SECONDS)
+        items = [pod for pod in (listing or {}).get("items") or [] if isinstance(pod, dict)]
+        with self.follow_lock:
+            self.present_pods = {str((pod.get("metadata") or {}).get("uid") or "") for pod in items}
+        for pod in items:
+            if self.follow_stop.is_set():
+                return
+            self.note_terminations(pod)
+            if self.attach_pod(pod) is not None:
+                continue
+            # An attached pod's runner start, once reported, bounds its first process.
+            with self.follow_lock:
+                observed = self.pods.get(str((pod.get("metadata") or {}).get("uid") or ""))
+            started = sks.runner_started_at(pod)
+            if observed is not None and started is not None:
+                with observed.lock:
+                    if observed.watch.container_started is None:
+                        observed.watch.container_started = started
+
+    def close_follower(self) -> None:
+        """Stop the follower and wait for it; no stream is respawned after this."""
+
+        self.follow_stop.set()
+        thread = self.follow_thread
+        if thread is None:
+            return
+        thread.join(timeout=FOLLOW_JOIN_SECONDS)
+        if thread.is_alive():
+            raise StepFailed("the runner pod follower did not stop")
+
+    def stop_runner_streams(self) -> None:
+        """The finalizer step: stop every harvester and log stream into a runner container."""
+
+        self.follow_stop.set()
+        for pod in self.followed():
+            with pod.lock:
+                processes = tuple(pod.processes)
+            for process in processes:
+                stop_process(process)
+
     def attempt_facts(self) -> sks.AttemptFacts | None:
         files: list[dict[str, bytes]] = []
-        for pod in self.pods.values():
+        for pod in self.followed():
             with pod.lock:
                 files.append(pod.harvest.transcript_files())
         if not files:
@@ -3186,11 +3414,12 @@ class LiveRun:
 
     def unfollowed_runner_pods(self) -> list[str]:
         pods = self.kube.json("get", "pods", "-l", POD_CLAIM_LABEL)
+        followed = {pod.uid for pod in self.followed()}
         return [
             str((pod.get("metadata") or {}).get("uid"))
             for pod in (pods or {}).get("items") or []
             if (pod.get("status") or {}).get("phase") in {"Pending", "Running"}
-            and str((pod.get("metadata") or {}).get("uid")) not in self.pods
+            and str((pod.get("metadata") or {}).get("uid")) not in followed
         ]
 
     def quiescent(self) -> bool:
@@ -3205,7 +3434,7 @@ class LiveRun:
             return False
         return all(
             pod.eof.is_set() or (pod.watch.exited and pod.watch.synced_after_exit)
-            for pod in self.pods.values()
+            for pod in self.followed()
         )
 
     def watch_attempt(self) -> None:
@@ -3216,9 +3445,12 @@ class LiveRun:
     def settle(self) -> None:
         if not self.reservations:
             return
+        # Why the attempt ended, before anything else can fail: diagnostics never fail it.
+        self.safe(self.record_diagnostics, None)
         facts = self.safe(self.attempt_facts, None)
-        complete = bool(self.pods)
-        for pod in self.pods.values():
+        pods = self.followed()
+        complete = bool(pods)
+        for pod in pods:
             with pod.lock:
                 complete = complete and sks.settled_capture(pod.harvest, pod.watch)
         sessions = facts.sessions if facts is not None else None
@@ -3239,7 +3471,7 @@ class LiveRun:
             "grant", "transcript_error_classes", sks.transcript_error_classes(facts.sessions)
         )
         lines: list[bytes] = []
-        for pod in self.pods.values():
+        for pod in pods:
             with pod.lock:
                 lines += pod.stderr
         self.ledger.record("grant", "stderr_error_classes", sks.stderr_error_classes(lines))
@@ -3253,11 +3485,11 @@ class LiveRun:
                         "credential"
                     ),
                 }
-                for pod in self.pods.values()
+                for pod in pods
             ],
         )
         searches = 0
-        for pod in self.pods.values():
+        for pod in pods:
             with pod.lock:
                 searches += sks.tool_search_calls(pod.harvest.transcript_files())
         self.ledger.record("budget", "tool_search_calls", searches)
@@ -3285,12 +3517,15 @@ class LiveRun:
         The deadline enforcer deliberately stops a runner at its deadline without
         waiting on the worker; the main-thread fence that follows stops the worker
         and catches any runner a retry started.
+
+        Once an attempt reserved anything, the worker's log is read first, while
+        the worker can still be read, for the reason the attempt ended.
         """
 
         fullname = self.inputs.fullname
-        worker_selector = (
-            f"app.kubernetes.io/component=worker,app.kubernetes.io/instance={self.inputs.release}"
-        )
+        worker_selector = self.worker_selector
+        if self.reservations:
+            self.capture_worker_escalation()
         self.kube.ctl("scale", f"deployment/{fullname}-worker", "--replicas=0", timeout=120)
         self.ledger.close_gate()
         self.kube.ctl(
@@ -3364,6 +3599,89 @@ class LiveRun:
         if not fenced:
             active = "a worker" if not workers_stopped else "a runner"
             raise StepFailed(f"{active} is still active after fencing")
+
+    @property
+    def worker_selector(self) -> str:
+        return (
+            f"app.kubernetes.io/component=worker,app.kubernetes.io/instance={self.inputs.release}"
+        )
+
+    # -- diagnostics: why an attempt ended ------------------------------------------------
+
+    def record_diagnostics(self) -> None:
+        """At settlement, into the private ledger: each followed runner's scrubbed log
+        tail, every container termination seen, the worker's escalation lines and the
+        attempt's request terminal detail. Pods appear only as ``ref_digest`` refs."""
+
+        tails: list[dict[str, Any]] = []
+        for pod in self.followed():
+            with pod.lock:
+                tails.append({"pod": sks.ref_digest(pod.name), "lines": list(pod.log_tail)})
+        self.ledger.record("grant", "runner_log_tails", tails)
+        with self.follow_lock:
+            terminations = [self.terminations[key] for key in sorted(self.terminations)]
+        self.ledger.record("grant", "runner_terminations", terminations)
+        self.capture_worker_escalation()
+        self.ledger.record("grant", "request_terminal", self.safe(self.request_terminal, None))
+
+    def capture_worker_escalation(self) -> None:
+        """Keep the worker's recent log lines about the attempt, scrubbed; never fails.
+
+        One ``kubectl logs`` over the worker selector, every container, unprefixed;
+        at most WORKER_LOG_LINES lines that name the attempt's work item or request
+        or match an escalation marker (``sks.escalation_lines``). The shell scans
+        the raw output. The latest capture wins; a failed read records an empty list.
+        """
+
+        expected = self.safe(
+            lambda: self.ledger.observations("admission").get("expected_request_id"), None
+        )
+        ids = [str(item) for item in (self.work_item_id, expected) if item]
+        lines: list[str] = []
+        try:
+            result = self.kube.ctl(
+                "logs",
+                "-l",
+                self.worker_selector,
+                f"--tail={WORKER_LOG_TAIL}",
+                "--prefix=false",
+                "--all-containers=true",
+                check=False,
+                timeout=WORKER_LOG_SECONDS,
+            )
+            if result.returncode == 0:
+                lines = sks.escalation_lines(
+                    result.stdout, ids, self.scrubber.scrub, limit=WORKER_LOG_LINES
+                )
+        except Exception:  # noqa: BLE001 - a diagnostic read never fails the run
+            lines = []
+        self.safe(lambda: self.ledger.record("grant", "worker_escalation_lines", lines), None)
+
+    def request_terminal(self) -> dict[str, Any] | None:
+        """The attempt's execution request: status, terminal cause, termination observation."""
+
+        if not self.work_item_id:
+            return None
+        rows = self.sql(
+            "SELECT id, status, terminal_cause, termination_observation FROM "
+            f"curie.execution_requests WHERE work_item_id = '{self.work_item_id}' "
+            "ORDER BY sequence"
+        )
+        expected = self.ledger.observations("admission").get("expected_request_id")
+        row = next(
+            (item for item in rows if str(item.get("id") or "") == expected),
+            rows[0] if rows else None,
+        )
+        if row is None:
+            return None
+        observation = row.get("termination_observation")
+        return {
+            "status": row.get("status"),
+            "terminal_cause": row.get("terminal_cause"),
+            "termination_observation": (
+                None if observation is None else self.scrubber.scrub(str(observation))
+            ),
+        }
 
     # -- phase: read-back ---------------------------------------------------------------
 
@@ -3459,7 +3777,7 @@ class LiveRun:
         self.ledger.record("refusal", "teardown_settled", True)
         self.ledger.record("refusal", "expected_outcome", sks.ENROLLMENT_INACTIVE)
         before = self.counts()
-        seen_pods = set(self.pods)
+        seen_pods = {pod.uid for pod in self.followed()}
         self.ledger.record("refusal", "before", before)
         ts = kit.sender.post(
             kit.channel, sks.kickoff_text(kit.curie_auth.user_id, self.issues["b"]["url"])
@@ -3653,7 +3971,9 @@ class LiveRun:
             "local_images": lambda: local_images_absent(
                 self.shell, self.builder.local_tags if self.builder else []
             ),
-            "processes": lambda: all(process.poll() is not None for process in self.processes),
+            "processes": lambda: all(
+                process.poll() is not None for process in tuple(self.processes)
+            ),
             "work_dir": lambda: not self.inputs.work_dir.exists(),
             "forge_issues": self.issues_closed,
             "forge_prs": self.pulls_closed,

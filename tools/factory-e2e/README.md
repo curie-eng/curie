@@ -1004,8 +1004,15 @@ deletes it. `preflight` is offline. `rehearse` takes no grant and no approval,
 starts no model session, enrolls a well-formed token that was never issued,
 runs the ping, the disconnected control and the paid-start fence against the
 real install, then the full finalizer; it is judged on `slack`, `refusal` and
-`cleanup`. `run` (the ticket's `--live`) adds the one paid kickoff. A run ID
-gets one live start, and a rehearsal's run ID never gets one. `judge` reads
+`cleanup`. `rehearse --kickoff --approve-live <ceiling> --grant-expires-at <t>`
+also runs the kickoff and read-back on that never-issued token, with the run's
+reservations, watchdog, deadline enforcer, fence and settlement but no grant
+probe, so it can spend nothing; it opens the rehearsal ledger's one live window
+and records `rehearsal.kickoff_diagnostic`. Every live attempt records, in the
+private ledger, each runner's scrubbed 80-line log tail, every container
+termination, the worker's escalation lines and the request's terminal detail.
+`run` (the ticket's `--live`) adds the one paid kickoff. A run ID gets one live
+start, and a plain rehearsal's run ID never gets one. `judge` reads
 only the ledger and refuses a candidate that differs from the recorded one.
 Each command's result is one JSON object of codes and counts; a refusal is
 `{"error", "fix"}` and exits 2.

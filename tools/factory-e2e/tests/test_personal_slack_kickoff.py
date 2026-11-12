@@ -453,6 +453,8 @@ FLAGS = {
     "preflight": (*FLAGS_BASE, "--app-dir", *FLAGS_SLACK, *FLAGS_GRANT),
     "slack-probe": (*FLAGS_BASE, *FLAGS_SLACK),
 }
+# Flags that take no value.
+SWITCHES = {"--kickoff"}
 
 
 @dataclasses.dataclass
@@ -471,7 +473,9 @@ class Kit:
         argv = [command]
         for flag in FLAGS[command] if flags is None else flags:
             value = self.values.get(flag)
-            if value is not None:
+            if flag in SWITCHES:
+                argv.append(flag)
+            elif value is not None:
                 argv += [flag, value]
         return psk.main(argv, environ=self.environ, clock=self.clock, slack_transport=self.slack)
 
@@ -710,6 +714,19 @@ def _grant_flags(_kit: Kit, _stack: contextlib.ExitStack[Any]) -> Sequence[str]:
     return (*FLAGS["rehearse"], *FLAGS_GRANT)
 
 
+def _rehearse_with(*extra: str, ceiling: str = CEILING) -> Setup:
+    """``rehearse`` with ``extra`` flags (``--kickoff`` among them) and the given ceiling."""
+
+    def setup(kit: Kit, _stack: contextlib.ExitStack[Any]) -> Sequence[str]:
+        kit.values["--approve-live"] = ceiling
+        return (*FLAGS["rehearse"], *extra)
+
+    return setup
+
+
+KICKOFF_FLAGS = ("--kickoff", "--approve-live", "--grant-expires-at")
+
+
 def _prior(kind: str) -> Setup:
     def setup(kit: Kit, _stack: contextlib.ExitStack[Any]) -> None:
         ledger = sks.Ledger.open(kit.state, RUN_ID, scrubber=sks.Scrubber())
@@ -783,6 +800,36 @@ REFUSALS = [
     pytest.param("run", _value("--registry-port", "80"), "registry_port_invalid", id="port"),
     pytest.param("run", _registry_busy, "registry_port_busy", id="port-busy"),
     pytest.param("rehearse", _grant_flags, "arguments_invalid", id="rehearse-with-grant"),
+    pytest.param(
+        "rehearse",
+        _rehearse_with("--approve-live"),
+        "arguments_invalid",
+        id="rehearse-approval-without-kickoff",
+    ),
+    pytest.param(
+        "rehearse",
+        _rehearse_with("--kickoff", "--grant-expires-at"),
+        "live_unapproved",
+        id="kickoff-without-approval",
+    ),
+    pytest.param(
+        "rehearse",
+        _rehearse_with(*KICKOFF_FLAGS, ceiling=CEILING.replace("sessions=8", "sessions=9")),
+        "live_unapproved",
+        id="kickoff-approval-malformed",
+    ),
+    pytest.param(
+        "rehearse",
+        _rehearse_with("--kickoff", "--approve-live"),
+        "expiry_unknown",
+        id="kickoff-without-window",
+    ),
+    pytest.param(
+        "rehearse",
+        _rehearse_with(*KICKOFF_FLAGS, "--grant-file"),
+        "arguments_invalid",
+        id="kickoff-with-grant-file",
+    ),
     pytest.param("run", _prior("run"), "paid_retry_refused", id="second-live-start"),
     pytest.param("run", _prior("rehearse"), "rehearsal_run_id", id="rehearsal-run-id"),
     pytest.param("preflight", _chmod("--grant-file", 0o644), "grant_unsafe", id="preflight"),
@@ -1845,6 +1892,450 @@ def test_finalize_records_a_deadline_the_enforcer_reached_before_fencing(
     assert run.deadline_stop.is_set() and run.deadline_reported
     assert run.record_deadline_breach() is False  # recorded once
     ledger.close()
+
+
+# --------------------------------------------------------------------------
+# 4b. Diagnostics: the claim-pod follower and why an attempt ended
+# --------------------------------------------------------------------------
+
+REQUEST = "7a1b2c3d-0000-4000-8000-00000000c004"
+OTHER_REQUEST = "7a1b2c3d-0000-4000-8000-00000000c005"
+
+
+class StreamShell(FakeShell):
+    """FakeShell that is safe off the main thread and scripts each spawned stream.
+
+    Commands are recorded with no ledger read (the ledger belongs to the main
+    thread). Each spawn of a verb takes that verb's next scripted stdout, the
+    last one repeating, from a command that already exited.
+    """
+
+    def __init__(
+        self,
+        runtime: psk.Runtime,
+        ledger: sks.Ledger,
+        answer: Callable[[list[str]], psk.Completed],
+        streams: Mapping[str, Sequence[Sequence[bytes]]],
+    ) -> None:
+        super().__init__(runtime, ledger, answer)
+        self.streams = {verb: list(outputs) for verb, outputs in streams.items()}
+        self.spawned: list[list[str]] = []
+        self.lock = threading.Lock()
+
+    def run(self, argv: Sequence[str], **kwargs: Any) -> psk.Completed:
+        command = list(argv)
+        self.guard(command)
+        with self.lock:
+            self.calls.append((command, ""))
+        result = self.answer(command)
+        if kwargs.get("check", True) and result.returncode != 0:
+            raise psk.StepFailed(f"{command[0]} exited {result.returncode}")
+        return result
+
+    def spawn(self, argv: Sequence[str]) -> Any:
+        command = list(argv)
+        self.guard(command)
+        with self.lock:
+            self.spawned.append(command)
+            outputs = self.streams.get(_verb(command[1:])) or [[]]
+            lines = outputs.pop(0) if len(outputs) > 1 else outputs[0]
+        return Exited(stdout=list(lines))
+
+
+class FollowerClock(FakeClock):
+    """Each follower pass parks until the test runs the next; stream retries move time."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.lock = threading.Lock()
+        self.parked: queue.Queue[float] = queue.Queue()
+        self.go: queue.Queue[None] = queue.Queue()
+
+    def wait(self, seconds: float) -> None:
+        if seconds == psk.FOLLOW_SECONDS:
+            self.parked.put(seconds)
+            self.go.get(timeout=30)
+            return
+        with self.lock:
+            super().wait(seconds)
+
+
+def _claim_answer(
+    claim: str, pods: dict[str, dict[str, Any]]
+) -> Callable[[list[str]], psk.Completed]:
+    """One claim of the agent and its pod (``pods["pod"]``, swappable); other reads empty."""
+
+    def answer(argv: list[str]) -> psk.Completed:
+        if psk.CLAIM_RESOURCE in argv:
+            items = [{"metadata": {"name": claim}}]
+            return psk.Completed(0, json.dumps({"items": items}).encode(), b"")
+        if "pods" in argv:
+            return psk.Completed(0, json.dumps({"items": [pods["pod"]]}).encode(), b"")
+        return _empty(argv)
+
+    return answer
+
+
+def _streams_of(run: psk.LiveRun, shell: StreamShell) -> None:
+    run.shell, run.kube = shell, psk.Kube(shell, CONTEXT, NAMESPACE)
+
+
+def test_runner_log_tail_keeps_the_last_lines_scrubbed(tmp_path: Path) -> None:
+    """Behavior: an attached runner's log stream keeps only its last 80 lines, each scanned
+    raw and kept scrubbed, and settlement records them under a sanitized pod reference."""
+
+    live = _live_run(tmp_path)
+    run, ledger = live.run, live.ledger
+    marker = "synthetic-runner-log-marker"
+    run.scrubber.hold(sks.HeldSecret(marker))
+    lines = [f"runner line {index} {marker}\n".encode() for index in range(100)]
+    record = json.dumps({"kind": "process", "count": 0, "processes": []}).encode()
+    shell = StreamShell(run.runtime, ledger, _empty, {"exec": [[record]], "logs": [lines]})
+    _streams_of(run, shell)
+    observed = run.attach_pod(_pod("acme-claim-1-runner", "uid-1", "Running", running=True))
+    assert observed is not None
+    for thread in observed.threads:
+        thread.join(timeout=30)
+    tail = list(observed.log_tail)
+    assert len(tail) == psk.RUNNER_LOG_TAIL == 80
+    assert tail[0] == "runner line 20 <redacted>" and tail[-1] == "runner line 99 <redacted>"
+    assert not any(marker in line for line in tail)
+    assert run.scan.channels["children"].token_bytes_found  # scanned raw before scrubbing
+    run.record_diagnostics()
+    assert ledger.observations("grant")["runner_log_tails"] == [
+        {"pod": sks.ref_digest("acme-claim-1-runner"), "lines": tail}
+    ]
+    assert marker not in ledger.dump()
+    ledger.close()
+
+
+def test_discovery_records_every_container_termination(tmp_path: Path) -> None:
+    """Behavior: a discovery pass reads a claim pod's init and regular container statuses,
+    current and last state, attaches the pod in any phase without auditing it, and
+    settlement records each terminated container's exit code, reason and signal."""
+
+    pod = _pod("acme-claim-1-runner", "uid-1", "Failed", running=False)
+    pod["status"]["initContainerStatuses"] = [
+        {"name": "prepare", "state": {"terminated": {"exitCode": 0, "reason": "Completed"}}}
+    ]
+    pod["status"]["containerStatuses"] = [
+        {
+            "name": "runner",
+            "state": {"terminated": {"exitCode": 1, "reason": "Error", "message": "free text"}},
+            "lastState": {"terminated": {"exitCode": 137, "reason": "OOMKilled", "signal": 9}},
+        }
+    ]
+    answer = _claim_answer("acme-claim-1", {"pod": pod})
+    live = _live_run(tmp_path, answer=answer)
+    run, ledger = live.run, live.ledger
+    _streams_of(run, StreamShell(run.runtime, ledger, answer, {}))
+    run.discover_runner_pods()
+    observed = run.pods["uid-1"]
+    for thread in observed.threads:
+        thread.join(timeout=30)
+    assert not observed.audited and observed.eof.is_set()
+    run.record_diagnostics()
+    ref = sks.ref_digest("acme-claim-1-runner")
+    assert ledger.observations("grant")["runner_terminations"] == [
+        {
+            "pod": ref,
+            "container": "prepare",
+            "init": True,
+            "from": "state",
+            "exitCode": 0,
+            "reason": "Completed",
+            "signal": None,
+        },
+        {
+            "pod": ref,
+            "container": "runner",
+            "init": False,
+            "from": "lastState",
+            "exitCode": 137,
+            "reason": "OOMKilled",
+            "signal": 9,
+        },
+        {
+            "pod": ref,
+            "container": "runner",
+            "init": False,
+            "from": "state",
+            "exitCode": 1,
+            "reason": "Error",
+            "signal": None,
+        },
+    ]
+    assert "free text" not in ledger.dump()
+    ledger.close()
+
+
+def test_worker_escalation_lines_are_read_before_the_fence_stops_the_worker(
+    tmp_path: Path,
+) -> None:
+    """Behavior: once an attempt reserved, the fence reads the worker's log before its scale;
+    only lines naming the work item or request or an escalation marker are kept, at most
+    60, scrubbed; the latest capture wins and a failed read records an empty list."""
+
+    marker = "synthetic-worker-log-marker"
+    logs: dict[str, Any] = {"stdout": b"", "code": 0, "raise": False}
+    cluster, _state = _cluster([_pod("acme-claim-1-runner", "uid-1", "Running", running=True)])
+
+    def answer(argv: list[str]) -> psk.Completed:
+        if _verb(argv[1:]) == "logs":
+            if logs["raise"]:
+                raise psk.StepFailed("kubectl could not complete")
+            return psk.Completed(int(logs["code"]), bytes(logs["stdout"]), b"")
+        return cluster(argv)
+
+    live = _armed_fence(tmp_path, answer)
+    run, ledger, shell = live.run, live.ledger, live.shell
+    run.scrubber.hold(sks.HeldSecret(marker))
+    run.reservations = ledger.reserve(sks.ATTEMPT_ROLES, now=T0)
+    run.work_item_id = WORK_ITEM
+    ledger.record("admission", "expected_request_id", REQUEST)
+    kept = [
+        f"INFO claimed work item {WORK_ITEM}",
+        f"INFO turn started for {REQUEST} with {marker}",
+        "INFO request runner_escalated after the runner exited",
+        "WARNING slow poll",
+        "INFO personal launch Refused by the gate",
+        "Traceback (most recent call last):",
+        "apps.worker RunnerError: runner exited 1",
+    ]
+    logs["stdout"] = "\n".join(["INFO heartbeat ok", *kept, "INFO idle"]).encode()
+    run.fence_paid_starts()
+    names = _fence_order(shell, 0)
+    assert names[:2] == ["logs-worker", "scale"]
+    argv = next(argv for argv, _gate in shell.calls if _verb(argv[1:]) == "logs")
+    assert argv[argv.index("logs") + 1 :] == [
+        "-l",
+        run.worker_selector,
+        "--tail=400",
+        "--prefix=false",
+        "--all-containers=true",
+    ]
+    lines = ledger.observations("grant")["worker_escalation_lines"]
+    assert lines == [line.replace(marker, "<redacted>") for line in kept]
+    logs["stdout"] = "\n".join(f"ERROR attempt {index} failed" for index in range(70)).encode()
+    run.capture_worker_escalation()
+    lines = ledger.observations("grant")["worker_escalation_lines"]
+    assert lines == [f"ERROR attempt {index} failed" for index in range(10, 70)]
+    logs["code"] = 1
+    run.capture_worker_escalation()
+    assert ledger.observations("grant")["worker_escalation_lines"] == []
+    ledger.record("grant", "worker_escalation_lines", ["stale"])
+    logs["code"], logs["raise"] = 0, True
+    run.capture_worker_escalation()
+    assert ledger.observations("grant")["worker_escalation_lines"] == []
+    assert marker not in ledger.dump()
+    ledger.close()
+
+
+def test_settlement_records_the_attempts_request_terminal_detail(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Behavior: settlement records the attempt's own execution request status, terminal
+    cause and termination observation, scrubbed, from the request row."""
+
+    live = _live_run(tmp_path)
+    run, ledger = live.run, live.ledger
+    marker = "synthetic-termination-marker"
+    run.scrubber.hold(sks.HeldSecret(marker))
+    ledger.begin_live(now=T0, grant_expires_at=T0 + 3 * 3600)
+    run.reservations = ledger.reserve(sks.ATTEMPT_ROLES, now=T0)
+    run.work_item_id = WORK_ITEM
+    ledger.record("admission", "expected_request_id", REQUEST)
+    rows: list[dict[str, Any]] = [
+        {
+            "id": OTHER_REQUEST,
+            "status": "completed",
+            "terminal_cause": None,
+            "termination_observation": None,
+        },
+        {
+            "id": REQUEST,
+            "status": "failed",
+            "terminal_cause": "runner_escalated",
+            "termination_observation": f"runner exited 1 holding {marker}",
+        },
+    ]
+    queries: list[str] = []
+
+    def sql(query: str) -> list[dict[str, Any]]:
+        queries.append(query)
+        return rows if "termination_observation" in query else []
+
+    monkeypatch.setattr(run, "sql", sql)
+    run.settle()
+    assert ledger.observations("grant")["request_terminal"] == {
+        "status": "failed",
+        "terminal_cause": "runner_escalated",
+        "termination_observation": "runner exited 1 holding <redacted>",
+    }
+    assert any(f"work_item_id = '{WORK_ITEM}'" in query for query in queries)
+    ledger.close()
+
+
+def test_follower_attaches_a_pending_claim_pod_and_audits_on_the_main_thread(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Behavior: the follower thread lists the claim pods once per pass and attaches a
+    Pending pod on its first pass; each stream into it is respawned while it exits
+    silently and connects once output arrives; the audit runs only on the main thread's
+    discovery, and the follower's stops are registered before it starts."""
+
+    pending = _pod("acme-claim-1-runner", "uid-1", "Pending", running=False)
+    running = _pod("acme-claim-1-runner", "uid-1", "Running", running=True)
+    current = {"pod": pending}
+    answer = _claim_answer("acme-claim-1", current)
+    live = _live_run(tmp_path, answer=answer)
+    run, ledger = live.run, live.ledger
+    record = json.dumps({"kind": "process", "count": 1, "processes": []}).encode()
+    shell = StreamShell(
+        run.runtime,
+        ledger,
+        answer,
+        {"exec": [[], [], [record]], "logs": [[], [b"runner booting\n"]]},
+    )
+    _streams_of(run, shell)
+    clock = FollowerClock()
+    run.clock = clock
+    ledger.begin_live(now=T0, grant_expires_at=T0 + 3 * 3600)
+    run.reservations = ledger.reserve(sks.ATTEMPT_ROLES, now=T0)
+    run.attempt_live, run.attempt_started = True, T0
+    audits: list[str] = []
+    audit = run.audit_pod
+
+    def spy(observed: psk.RunnerPod, pod: dict[str, Any], claim: dict[str, Any]) -> None:
+        audits.append(threading.current_thread().name)
+        audit(observed, pod, claim)
+
+    monkeypatch.setattr(run, "audit_pod", spy)
+    run.start_follower()
+    steps = [name for name, _step in run.finalizer.steps]
+    assert steps[-2:] == ["stop-runner-streams", "stop-runner-follower"]
+    assert clock.parked.get(timeout=30) == psk.FOLLOW_SECONDS  # the first pass ran
+    observed = run.pods["uid-1"]
+    for thread in observed.threads:
+        thread.join(timeout=30)
+    assert observed.eof.is_set()
+    execs = [argv for argv in shell.spawned if "exec" in argv]
+    streams = [argv for argv in shell.spawned if "logs" in argv]
+    # Two silent harvester exits and one silent log stream were respawned until output.
+    assert (len(execs), len(streams)) == (3, 2)
+    assert execs[0][execs[0].index("exec") :][:6] == [
+        "exec",
+        "-i",
+        "acme-claim-1-runner",
+        "-c",
+        "runner",
+        "--",
+    ]
+    assert streams[0][-5:] == ["logs", "-f", "acme-claim-1-runner", "-c", "runner"]
+    assert observed.watch.ran and list(observed.log_tail) == ["runner booting"]
+    listing = run.kube.argv("get", "pods", "-l", psk.POD_CLAIM_LABEL, "-o", "json")
+    assert [argv for argv, _gate in shell.calls] == [listing]  # one listing per pass
+    assert audits == [] and not observed.audited
+    assert "runner_pods_seen" not in ledger.observations("grant")
+    # The main thread's discovery audits the attached pod once it runs.
+    current["pod"] = running
+    with pytest.raises(psk.StepFailed, match="candidate runner layer"):
+        run.discover_runner_pods()
+    assert audits == [threading.main_thread().name]
+    assert observed.audited and ledger.observations("grant")["runner_pods_seen"] == 1
+    assert observed.watch.container_started == sks.runner_started_at(running)
+    assert len(shell.spawned) == 5  # an attached pod is never attached again
+    run.follow_stop.set()
+    clock.go.put(None)  # release the parked follower; its stop is already set
+    run.close_follower()
+    assert run.follow_thread is not None and not run.follow_thread.is_alive()
+    ledger.close()
+
+
+def _diagnostic_run(tmp_path: Path) -> Live:
+    """A ``rehearse --kickoff`` run: a rehearsal ledger holding the approved ceiling."""
+
+    base = _live_run(tmp_path)
+    base.ledger.close()
+    run_id = f"{RUN_ID}-diagnostic"
+    ledger = sks.Ledger.open(base.run.inputs.state_dir, run_id, scrubber=base.run.scrubber)
+    ledger.ensure_run(CANDIDATE, phase="rehearse", now=T0)
+    ledger.mark_live_kind("rehearse")
+    ledger.record_ceiling(CEILING, sks.parse_ceiling(CEILING))
+    shell = FakeShell(base.run.runtime, ledger, _empty)
+    run = psk.LiveRun(
+        inputs=dataclasses.replace(base.run.inputs, run_id=run_id),
+        runtime=base.run.runtime,
+        ledger=ledger,
+        ceiling=sks.parse_ceiling(CEILING),
+        shell=shell,
+        resolver=lambda _host: ["192.0.2.10"],
+        kickoff_diagnostic=True,
+    )
+    return Live(run, ledger, shell, base.clock)
+
+
+def test_rehearse_kickoff_runs_the_paid_path_on_the_invalid_token_without_a_probe(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Behavior: ``rehearse --kickoff`` takes the ceiling and the live window, records the
+    diagnostic mode on the rehearsal ledger, and runs kickoff and read-back before control
+    and fence; its kickoff opens the live window and reserves without the grant probe.
+    A plain rehearsal still has no kickoff, and neither ledger kind opens the other's window."""
+
+    kit = _kit(tmp_path / "cli")
+    assert kit.run("rehearse", (*FLAGS["rehearse"], *KICKOFF_FLAGS)) == sks.EXIT_FAIL
+    payload, _text = _output(capsys)
+    assert (payload["command"], payload["phase"]) == ("rehearse", "registry")
+    assert kit.mutations() == [("docker", "run")]
+    cli_ledger = sks.Ledger.open_existing(kit.state, RUN_ID)
+    try:
+        assert cli_ledger.live_kind() == "rehearse"
+        assert cli_ledger.observations("rehearsal")["kickoff_diagnostic"] is True
+        assert cli_ledger.observations("budget")["approved_ceiling"] == CEILING
+    finally:
+        cli_ledger.close()
+
+    live = _diagnostic_run(tmp_path / "unit")
+    run, ledger = live.run, live.ledger
+    names = [name for name, _phase in run.phases()]
+    assert names[names.index("fixtures") + 1 :] == ["kickoff", "read-back", "control", "fence"]
+    assert run.rehearsal and run.command == "rehearse"
+    plain = psk.LiveRun(
+        inputs=run.inputs, runtime=run.runtime, ledger=ledger, ceiling=None, shell=live.shell
+    )
+    plain_names = [name for name, _phase in plain.phases()]
+    assert "kickoff" not in plain_names and plain_names[-2:] == ["control", "fence"]
+    with pytest.raises(sks.Refusal) as refused:
+        ledger.begin_live(now=T0, grant_expires_at=T0 + 3 * 3600)
+    assert refused.value.code == "rehearsal_run_id"
+
+    roles = sks.attempt_roles(sks.parse_ceiling(CEILING))
+    ledger.record("images", "gate_limits", sks.reviewer_limits(roles))
+    steps: list[str] = []
+
+    def probe() -> None:
+        raise AssertionError("the grant probe ran")
+
+    monkeypatch.setattr(run, "run_grant_probe", probe)
+    monkeypatch.setattr(run, "start_deadline_enforcer", lambda _ceiling: steps.append("deadline"))
+    monkeypatch.setattr(run, "start_follower", lambda: steps.append("follower"))
+    monkeypatch.setattr(run, "admit_kickoff", lambda _kit: steps.append("admit"))
+    monkeypatch.setattr(run, "watch_attempt", lambda: steps.append("watch"))
+    run.kit = object()  # type: ignore[assignment]
+    run.phase_kickoff()
+    assert steps == ["deadline", "follower", "admit", "watch"]
+    assert ledger.observations("grant_probe") == {}
+    assert ledger.run_row()["live_starts"] == 1
+    assert [item.role for item in run.reservations] == list(roles)
+    assert ledger.gate() == "closed" and run.guard_starts
+    ledger.close()
+
+    run_ledger = _run_ledger(_private(tmp_path / "run-state"))
+    with pytest.raises(sks.Refusal) as refused:
+        run_ledger.begin_live(now=T0, grant_expires_at=T0 + 3 * 3600, diagnostic=True)
+    assert refused.value.code == "rehearsal_run_id"
+    run_ledger.close()
 
 
 OWN_HEAD = "a" * 40

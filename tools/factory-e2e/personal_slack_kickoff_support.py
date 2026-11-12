@@ -1023,6 +1023,63 @@ def runner_started_at(pod: Any) -> float | None:
     return None
 
 
+def container_terminations(pod: Any) -> list[dict[str, Any]]:
+    """Every terminated container of a pod record, init and regular, current and last. Pure.
+
+    Reads ``status.initContainerStatuses`` and ``status.containerStatuses``, each
+    entry's ``state.terminated`` and ``lastState.terminated``, and keeps the
+    container's name with ``exitCode``, ``reason`` and ``signal``
+    (https://kubernetes.io/docs/reference/kubernetes-api/workload-resources/pod-v1/#PodStatus).
+    The free-text ``message`` is never kept.
+    """
+
+    status = pod.get("status") if isinstance(pod, dict) else None
+    found: list[dict[str, Any]] = []
+    for field, init in (("initContainerStatuses", True), ("containerStatuses", False)):
+        for item in (status or {}).get(field) or []:
+            if not isinstance(item, dict):
+                continue
+            for source in ("state", "lastState"):
+                terminated = (item.get(source) or {}).get("terminated")
+                if not isinstance(terminated, dict):
+                    continue
+                code, signal = terminated.get("exitCode"), terminated.get("signal")
+                reason = terminated.get("reason")
+                found.append(
+                    {
+                        "container": str(item.get("name") or ""),
+                        "init": init,
+                        "from": source,
+                        "exitCode": code if type(code) is int else None,
+                        "reason": reason if isinstance(reason, str) else None,
+                        "signal": signal if type(signal) is int else None,
+                    }
+                )
+    return found
+
+
+# A worker log line that can explain an attempt's end, besides one naming the attempt.
+_ESCALATION_LINE = re.compile(r"(?i:escalat|refus)|RunnerError|Traceback|ERROR|WARNING")
+
+
+def escalation_lines(
+    log: bytes, ids: Sequence[str], scrub: Callable[[str], str], *, limit: int
+) -> list[str]:
+    """The latest ``limit`` worker log lines naming an id or an escalation marker. Pure.
+
+    A line is kept when it mentions any of ``ids`` (the attempt's work item and
+    request) or matches ``escalat``, ``RunnerError``, ``refus``, ``Traceback``,
+    ``ERROR`` or ``WARNING``; each kept line passes through ``scrub``.
+    """
+
+    kept = [
+        line
+        for line in log.decode(errors="replace").splitlines()
+        if any(item and item in line for item in ids) or _ESCALATION_LINE.search(line)
+    ]
+    return [scrub(line) for line in kept[-limit:]] if limit > 0 else []
+
+
 # --------------------------------------------------------------------------
 # Native usage: slots, the watchdog and settlement
 # --------------------------------------------------------------------------
@@ -1513,14 +1570,17 @@ class Ledger:
             raise Refusal("live_unapproved", "no ceiling recorded for this run ID")
         return ceiling
 
-    def begin_live(self, *, now: float, grant_expires_at: float) -> None:
+    def begin_live(self, *, now: float, grant_expires_at: float, diagnostic: bool = False) -> None:
+        """Open the one live window. ``diagnostic`` is ``rehearse --kickoff``: its kickoff
+        runs on a rehearsal ledger with a never-issued token, so only that ledger opens it."""
+
         with self.transaction() as db:
             row = db.execute(
                 "SELECT live_kind, live_starts FROM runs WHERE run_id=?", (self.run_id,)
             ).fetchone()
             if row is None:
                 raise Refusal("ledger_missing", "--run-id")
-            if row[0] != "run":
+            if row[0] != ("rehearse" if diagnostic else "run"):
                 raise Refusal("rehearsal_run_id", "--run-id")
             if row[1]:
                 raise Refusal("paid_retry_refused", "--run-id")
