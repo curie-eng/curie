@@ -23,6 +23,7 @@ class InventoryAPI(_FakeApi):
         super().__init__()
         self.pods: list[kube.V1Pod] = []
         self.pod_list_error: Exception | None = None
+        self.pod_list_calls: list[float] = []
         self.runtime_reads: list[str] = []
         self.runtime_error: Exception | None = None
         self.overhead = {"cpu": "100m", "memory": "64Mi"}
@@ -30,6 +31,7 @@ class InventoryAPI(_FakeApi):
     def list_namespaced_pod(self, namespace: str, **kwargs: Any) -> SimpleNamespace:
         assert namespace == "test-ns"
         assert 0 < kwargs["_request_timeout"] <= 1.0
+        self.pod_list_calls.append(kwargs["_request_timeout"])
         if self.pod_list_error is not None:
             raise self.pod_list_error
         return SimpleNamespace(items=self.pods)
@@ -490,6 +492,38 @@ def test_incomplete_inventory_raises_instead_of_reporting_empty_capacity(resourc
         _client(api).capacity_inventory(
             priority_class="acme-sandbox", known_claim_resources={}, request_timeout_seconds=1
         )
+
+
+@pytest.mark.parametrize("status", [500, 502, 503, 504])
+def test_pod_list_transient_http_status_preserves_cause_without_retry(status: int) -> None:
+    api = InventoryAPI()
+    # #5544 observed the Kubernetes SDK raising ApiException(status=503) on Pod LIST.
+    fault = kube.ApiException(status=status)
+    api.pod_list_error = fault
+    with pytest.raises(KubeTransientError) as error:
+        _client(api).capacity_inventory(
+            priority_class="acme-sandbox", known_claim_resources={}, request_timeout_seconds=1
+        )
+    assert error.value.__cause__ is fault
+    assert len(api.pod_list_calls) == 1
+    assert [plural for plural, _selector in api.lists] == ["sandboxclaims", "sandboxes"]
+    assert api.created == api.patches == []
+    assert api.secrets == {}
+
+
+@pytest.mark.parametrize("status", [403, 404])
+def test_pod_list_permanent_http_status_preserves_api_exception(status: int) -> None:
+    api = InventoryAPI()
+    fault = kube.ApiException(status=status)
+    api.pod_list_error = fault
+    with pytest.raises(kube.ApiException) as error:
+        _client(api).capacity_inventory(
+            priority_class="acme-sandbox", known_claim_resources={}, request_timeout_seconds=1
+        )
+    assert error.value is fault
+    assert len(api.pod_list_calls) == 1
+    assert api.created == api.patches == []
+    assert api.secrets == {}
 
 
 @pytest.mark.parametrize("budget", [0.0, -0.01, 0.01])
