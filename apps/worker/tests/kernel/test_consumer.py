@@ -43,6 +43,7 @@ from curie_worker.binding import HttpIdentityBinding
 from curie_worker.capacity_wait import (
     WAIT_GENERATION_FIELD,
     WAIT_TERMINAL_ONLY_FIELD,
+    CapacityWaitRecord,
     CapacityWaitStore,
 )
 from curie_worker.consumer import Consumer, refuse_unconfigured_reminder
@@ -63,6 +64,7 @@ from curie_worker.sandbox.k8s import KubernetesSandboxClient
 from curie_worker.stream_consumer import ConsumerLivenessExpired
 from curie_worker.threadlock import ThreadLock
 from curie_worker.workspace import WorkspacePreparationError
+from kubernetes import client as kube
 from kubernetes.utils.quantity import parse_quantity
 from opentelemetry.sdk.trace import TracerProvider
 from opentelemetry.sdk.trace.export import SimpleSpanProcessor
@@ -1176,6 +1178,15 @@ def _inventory_timeout_client(
             return super().list_namespaced_custom_object(*args, **kwargs)
 
         def list_namespaced_pod(self, namespace: str, **kwargs: Any) -> SimpleNamespace:
+            if failure.startswith("pod-http-"):
+                self.pod_list_error = None
+                if self.failures_left:
+                    if restore:
+                        self.failures_left -= 1
+                    # #5544 observed this ApiException shape on the external Pod LIST.
+                    self.pod_list_error = kube.ApiException(
+                        status=int(failure.removeprefix("pod-http-"))
+                    )
             if failure in {"sdk-timeout", "transient"} and self.failures_left:
                 if restore:
                     self.failures_left -= 1
@@ -1356,6 +1367,228 @@ def test_inventory_timeout_capacity_wait_preserves_delivery_bound(
                 assert api.created == []
                 assert api.secrets == {}
                 assert h.runner.opened == h.sink.completions == []
+
+    asyncio.run(go())
+
+
+async def _wake_inventory_delivery(h: Any, consumer: Consumer, event_id: str) -> None:
+    await h.async_redis.zadd(consumer._waits._due, {event_id: 0})
+    assert await consumer._waits.wake_due() == 1
+    rows = await h.async_redis.xreadgroup(
+        h.config.consumer_group,
+        h.config.consumer_name,
+        {h.config.stream: ">"},
+        count=1,
+    )
+    assert len(rows) == 1 and len(rows[0][1]) == 1
+    entry_id, fields = rows[0][1][0]
+    await consumer._sem.acquire()
+    await consumer._handle(entry_id, fields)
+
+
+async def _assert_pod_list_admission_wait(
+    h: Any,
+    consumer: Consumer,
+    api: Any,
+    event: QueuedTurn,
+    *,
+    deferrals: int,
+    original: CapacityWaitRecord | None = None,
+) -> CapacityWaitRecord:
+    record = await consumer._waits.get(event.event_id)
+    assert record is not None, "Pod LIST failure did not enter durable admission wait"
+    assert record.state == "waiting"
+    assert record.wait_reason == "sandbox_admission"
+    assert record.fields == to_stream_fields(event)
+    assert record.deferrals == deferrals
+    assert record.first_wait_ms < record.deadline_ms
+    if original is not None:
+        assert record.first_wait_ms == original.first_wait_ms
+        assert record.deadline_ms == original.deadline_ms
+    assert len(api.pod_list_calls) == deferrals
+    assert [plural for plural, _selector in api.lists] == [
+        "sandboxclaims", "sandboxes"
+    ] * deferrals
+    assert api.quota_error is api.runtime_error is None
+    assert api.failures == {}
+    assert api.created == api.patches == []
+    assert api.secrets == {}
+    assert h.runner.opened == h.runner.queried == h.sink.completions == []
+    assert not await h.async_redis.exists(h.config.done_key(event.event_id))
+    assert (await h.async_redis.xpending(h.config.stream, h.config.consumer_group))["pending"] == 0
+    assert not await h.async_redis.exists(f"{h.config.stream}:dead")
+    return record
+
+
+def test_pod_list_503_capacity_wait_preserves_delivery_bound(
+    make_harness,
+    sync_redis,
+    names,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client, api, admission = _inventory_timeout_client(
+        sync_redis, names, monkeypatch, failure="pod-http-503", restore=True, failures=2
+    )
+
+    async def go() -> None:
+        async with make_harness(
+            sandbox_client=client,
+            substrate_env={"CURIE_SANDBOX_ADMISSION": admission},
+            slack_no_edit_streaming=True,
+            max_delivery=2,
+        ) as h:
+            h.runner.default_script = [Final(text="inventory restored", status=DONE)]
+            consumer = _capacity_consumer(h)
+            await consumer.ensure_group()
+            event = _qevent("hello", thread="pod-list-thread", event_id="pod-list-turn")
+            entry_id, fields = await _pending_local_entry(h, event)
+            await consumer._sem.acquire()
+            await consumer._handle(entry_id, fields)
+            first = await _assert_pod_list_admission_wait(h, consumer, api, event, deferrals=1)
+            await _wake_inventory_delivery(h, consumer, event.event_id)
+            await _assert_pod_list_admission_wait(
+                h, consumer, api, event, deferrals=2, original=first
+            )
+            assert api.failures_left == 0
+
+            await _wake_inventory_delivery(h, consumer, event.event_id)
+            record = await consumer._waits.get(event.event_id)
+            assert record is not None and record.state == "done"
+            assert record.deferrals == 2
+            assert record.first_wait_ms == first.first_wait_ms
+            assert record.deadline_ms == first.deadline_ms
+            assert max(api.delivery_counts) <= 2, api.delivery_counts
+            assert h.runner.opened == h.runner.queried == ["hello"]
+            assert h.sink.last_text == "inventory restored"
+            assert len(h.sink.completions) == 1
+            assert sum(
+                verb == "create" and plural == "sandboxclaims" for verb, plural, _ in api.calls
+            ) == 1
+            assert await h.async_redis.exists(h.config.done_key(event.event_id))
+            assert (await h.async_redis.xpending(h.config.stream, h.config.consumer_group))[
+                "pending"
+            ] == 0
+            assert not await h.async_redis.exists(f"{h.config.stream}:dead")
+
+    asyncio.run(go())
+
+
+def test_persistent_pod_list_503_keeps_first_admission_deadline(
+    make_harness,
+    sync_redis,
+    names,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client, api, admission = _inventory_timeout_client(
+        sync_redis, names, monkeypatch, failure="pod-http-503", restore=False
+    )
+
+    async def go() -> None:
+        async with make_harness(
+            sandbox_client=client,
+            substrate_env={"CURIE_SANDBOX_ADMISSION": admission},
+            slack_no_edit_streaming=True,
+            max_delivery=2,
+        ) as h:
+            consumer = _capacity_consumer(h)
+            await consumer.ensure_group()
+            event = _qevent("hello", thread="pod-list-thread", event_id="pod-list-turn")
+            entry_id, fields = await _pending_local_entry(h, event)
+            await consumer._sem.acquire()
+            await consumer._handle(entry_id, fields)
+            first = await _assert_pod_list_admission_wait(h, consumer, api, event, deferrals=1)
+            for deferrals in (2, 3):
+                await _wake_inventory_delivery(h, consumer, event.event_id)
+                await _assert_pod_list_admission_wait(
+                    h, consumer, api, event, deferrals=deferrals, original=first
+                )
+            assert max(api.delivery_counts) <= 2, api.delivery_counts
+
+    asyncio.run(go())
+
+
+def test_healthy_pod_list_admits_one_turn_without_durable_wait(
+    make_harness,
+    sync_redis,
+    names,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client, api, admission = _inventory_timeout_client(
+        sync_redis, names, monkeypatch, failure="pod-http-503", restore=True, failures=0
+    )
+
+    async def go() -> None:
+        async with make_harness(
+            sandbox_client=client,
+            substrate_env={"CURIE_SANDBOX_ADMISSION": admission},
+            slack_no_edit_streaming=True,
+        ) as h:
+            h.runner.default_script = [Final(text="admitted", status=DONE)]
+            consumer = _capacity_consumer(h)
+            await consumer.ensure_group()
+            event = _qevent("hello", thread="pod-list-thread", event_id="pod-list-turn")
+            entry_id, fields = await _pending_local_entry(h, event)
+            await consumer._sem.acquire()
+            await consumer._handle(entry_id, fields)
+            assert len(api.pod_list_calls) == 1
+            assert api.pod_list_error is api.quota_error is api.runtime_error is None
+            assert any(name.startswith("get:resourcequotas:") for name, _ in api.request_timeouts)
+            assert h.runner.opened == h.runner.queried == ["hello"]
+            assert h.sink.last_text == "admitted"
+            assert len(h.sink.completions) == 1
+            assert sum(
+                verb == "create" and plural == "sandboxclaims" for verb, plural, _ in api.calls
+            ) == 1
+            assert await consumer._waits.get(event.event_id) is None
+            assert await h.async_redis.exists(h.config.done_key(event.event_id))
+            assert (await h.async_redis.xpending(h.config.stream, h.config.consumer_group))[
+                "pending"
+            ] == 0
+            assert not await h.async_redis.exists(f"{h.config.stream}:dead")
+
+    asyncio.run(go())
+
+
+@pytest.mark.parametrize("status", [403, 404])
+def test_permanent_pod_list_error_fails_closed_without_durable_wait(
+    make_harness,
+    sync_redis,
+    names,
+    monkeypatch: pytest.MonkeyPatch,
+    status: int,
+) -> None:
+    client, api, admission = _inventory_timeout_client(
+        sync_redis, names, monkeypatch, failure=f"pod-http-{status}", restore=False
+    )
+
+    async def go() -> None:
+        async with make_harness(
+            sandbox_client=client,
+            substrate_env={"CURIE_SANDBOX_ADMISSION": admission},
+            slack_no_edit_streaming=True,
+        ) as h:
+            consumer = _capacity_consumer(h)
+            await consumer.ensure_group()
+            event = _qevent("hello", thread="pod-list-thread", event_id="pod-list-turn")
+            entry_id, fields = await _pending_local_entry(h, event)
+            await consumer._sem.acquire()
+            await consumer._handle(entry_id, fields)
+            assert len(api.pod_list_calls) == 1
+            assert api.pod_list_error is not None and api.pod_list_error.status == status
+            assert api.quota_error is api.runtime_error is None
+            assert api.failures == {}
+            assert api.created == api.patches == []
+            assert api.secrets == {}
+            assert h.runner.opened == h.runner.queried == h.sink.completions == []
+            assert await consumer._waits.get(event.event_id) is None
+            assert not await h.async_redis.exists(h.config.done_key(event.event_id))
+            pending = await h.async_redis.xpending_range(
+                h.config.stream, h.config.consumer_group, "-", "+", 10
+            )
+            assert len(pending) == 1
+            assert pending[0]["message_id"] == entry_id
+            assert pending[0]["times_delivered"] == 1
+            assert not await h.async_redis.exists(f"{h.config.stream}:dead")
 
     asyncio.run(go())
 

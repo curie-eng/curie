@@ -946,9 +946,14 @@ class KubernetesSandboxClient:
                 _request_timeout=budget(),
             ),
         )["items"]
-        pods = self._core_api.list_namespaced_pod(
-            self._namespace, _request_timeout=budget()
-        ).items
+        try:
+            pods = self._core_api.list_namespaced_pod(
+                self._namespace, _request_timeout=budget()
+            ).items
+        except k8s_client.ApiException as exc:
+            if exc.status in _TRANSIENT_STATUSES:
+                raise KubeTransientError(f"kube API {exc.status} listing pods") from exc
+            raise
         footprints: dict[str, dict[str, str]] = {}
         claim_names: set[str] = set()
         runtime_class_overheads: dict[str, dict[str, str]] = {}
