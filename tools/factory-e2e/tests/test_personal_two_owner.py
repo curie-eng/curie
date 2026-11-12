@@ -648,6 +648,93 @@ def test_install_applies_dex_before_helm_with_no_runner_grant(tmp_path: Path) ->
     assert h.ledger.observations("install")["dex_image_running"] is True
 
 
+def _dex_check(
+    tmp_path: Path, *, reports: list[str | None], api_digest: str | None = None
+) -> tuple[_Harness, Exception | None]:
+    """Run check_install_images; each ``get pods`` poll serves the next Dex ``imageID`` digest."""
+
+    h = _harness(tmp_path)
+    h.run.digests = dict(DIGESTS)
+    h.run.dex_image = f"{REGISTRY}/{pt.DEX_REPOSITORY}@{DEX_DIGEST}"
+    h.ledger.record("images", "dex", {"repository": pt.DEX_REPOSITORY, "digest": DEX_DIGEST})
+    polls = iter(reports)
+    last: list[str | None] = [reports[-1]]
+
+    def pods(_argv: list[str], _stdin: bytes | None) -> dict[str, Any]:
+        reported = next(polls, last[0])
+        dex = _pod("dex-0", "dex", pt.DEX_REPOSITORY, DEX_DIGEST)
+        status = dex["status"]["containerStatuses"][0]
+        if reported is None:
+            status.pop("imageID")
+            dex["status"]["phase"] = "Pending"
+        else:
+            status["imageID"] = f"docker.io/dexidp/dex@{reported}"
+        api = _pod("api-0", "api", "curie-api", api_digest or DIGESTS["curie-api"])
+        return {
+            "items": [
+                api,
+                _pod("worker-0", "worker", "curie-worker", DIGESTS["curie-worker"]),
+                _pod("gw-0", "channel-gateway", "curie-dispatcher", DIGESTS["curie-dispatcher"]),
+                dex,
+            ]
+        }
+
+    h.shell.handlers.insert(0, (("get", "pods", "-o", "json"), pods))
+    try:
+        h.run.check_install_images()
+    except pt.StepFailed as error:
+        return h, error
+    return h, None
+
+
+SOURCE_DIGEST = pto.DEX_IMAGE.split("@", 1)[1]
+
+
+def test_dex_reported_under_the_pinned_source_digest_passes(tmp_path: Path) -> None:
+    h, error = _dex_check(tmp_path, reports=[SOURCE_DIGEST])
+    assert error is None
+    install = h.ledger.observations("install")
+    assert install["dex_image_running"] is True
+    assert install["dex_image_digest_source"] == "source"
+    assert install["dex_image_failures"] == []
+
+
+def test_dex_reported_under_the_mirror_digest_passes(tmp_path: Path) -> None:
+    h, error = _dex_check(tmp_path, reports=[DEX_DIGEST])
+    assert error is None
+    assert h.ledger.observations("install")["dex_image_digest_source"] == "mirror"
+
+
+def test_dex_reported_under_an_unrelated_digest_fails_with_its_name(tmp_path: Path) -> None:
+    h, error = _dex_check(tmp_path, reports=["sha256:" + "9" * 64])
+    assert error is not None
+    install = h.ledger.observations("install")
+    assert install["dex_image_running"] is False
+    assert install["dex_image_failures"] == [
+        f"{pt.DEX_REPOSITORY}_digest_mismatch",
+        f"{pt.DEX_REPOSITORY}_not_running",
+    ]
+    assert "dex_image_digest_source" not in install
+
+
+def test_dex_without_an_image_id_yet_is_waited_for(tmp_path: Path) -> None:
+    h, error = _dex_check(tmp_path, reports=[None, None, SOURCE_DIGEST])
+    assert error is None
+    assert h.ledger.observations("install")["dex_image_digest_source"] == "source"
+
+
+def test_platform_digest_mismatch_still_fails_with_dex_accepted(tmp_path: Path) -> None:
+    h, error = _dex_check(tmp_path, reports=[DEX_DIGEST], api_digest="sha256:" + "8" * 64)
+    assert error is not None
+    install = h.ledger.observations("install")
+    assert install["dex_image_running"] is True
+    assert install["platform_image_failures"] == [
+        "curie-api_digest_mismatch",
+        "curie-api_not_running",
+    ]
+    assert h.ledger.observations("owners")["platform_images_candidate"] is False
+
+
 def test_stalled_rollout_records_the_log_tail_of_each_restarting_container(
     tmp_path: Path,
 ) -> None:

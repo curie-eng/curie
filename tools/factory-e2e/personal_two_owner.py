@@ -210,6 +210,58 @@ _STREAM_KEY = re.compile(r"[A-Za-z0-9][A-Za-z0-9:_.\-]{0,200}")
 _STREAM_ID = re.compile(r"[-+]|\(?[0-9]{1,20}(-[0-9]{1,20})?")
 _DIGEST = re.compile(r"sha256:[0-9a-f]{64}")
 
+DEX_IMAGE_WAIT_SECONDS = 120.0
+DEX_SOURCE_DIGEST = pto.DEX_IMAGE.split("@", 1)[1]
+
+
+def dex_containers(pods: Any, registry: str) -> list[tuple[str, str, str]]:
+    """``(pod phase, spec image, reported imageID digest or "")`` per Dex container."""
+
+    found: list[tuple[str, str, str]] = []
+    prefix = f"{registry}/{DEX_REPOSITORY}"
+    items = pods.get("items") if isinstance(pods, dict) else None
+    for pod in items or []:
+        if not isinstance(pod, dict):
+            continue
+        images = {
+            str(item.get("name")): str(item.get("image") or "")
+            for item in (pod.get("spec") or {}).get("containers") or []
+            if isinstance(item, dict)
+        }
+        status = pod.get("status") or {}
+        for item in status.get("containerStatuses") or []:
+            if not isinstance(item, dict):
+                continue
+            image = images.get(str(item.get("name")), "")
+            if not image.startswith(prefix) or image[len(prefix) : len(prefix) + 1] not in "@:":
+                continue
+            digests = _DIGEST.findall(str(item.get("imageID") or ""))
+            found.append((str(status.get("phase") or ""), image, digests[-1] if digests else ""))
+    return found
+
+
+def dex_image_verdict(pods: Any, *, registry: str, mirror: str) -> tuple[str, list[str]]:
+    """Which digest the running Dex reports (``mirror`` or ``source``) and the failure names.
+
+    The runtime may report the pinned source digest or the pushed manifest
+    digest for identical content; the spec image must name the run's
+    repository at the mirrored digest either way.
+    """
+
+    for label, digest in (("mirror", mirror), ("source", DEX_SOURCE_DIGEST)):
+        failures = pps.running_image_failures(
+            pods, {DEX_REPOSITORY: digest}, registry=registry, required=(DEX_REPOSITORY,)
+        )
+        if failures:
+            continue
+        spec = f"{registry}/{DEX_REPOSITORY}@{mirror}"
+        if any(image != spec for _phase, image, _reported in dex_containers(pods, registry)):
+            return "", [f"{DEX_REPOSITORY}_spec_image_mismatch"]
+        return label, []
+    return "", pps.running_image_failures(
+        pods, {DEX_REPOSITORY: mirror}, registry=registry, required=(DEX_REPOSITORY,)
+    )
+
 
 # --------------------------------------------------------------------------
 # Per-owner state
@@ -3997,7 +4049,24 @@ class TwoOwnerRun(pp.LiveRun):
         )
         self.ledger.record("install", "api_single_template", True)
 
+    def dex_pod_reports_image(self) -> bool:
+        """Whether a Running Dex pod's container already reports an ``imageID`` digest."""
+
+        pods = self.kube.json("get", "pods")
+        return any(
+            phase == "Running" and reported
+            for phase, _spec, reported in dex_containers(pods, self.inputs.registry)
+        )
+
     def check_install_images(self) -> None:
+        try:
+            self.wait_until(
+                self.dex_pod_reports_image,
+                until=self.clock.now() + DEX_IMAGE_WAIT_SECONDS,
+                what="Dex image report",
+            )
+        except StepFailed:
+            pass
         pods = self.kube.json("get", "pods")
         failures = pps.running_image_failures(
             pods,
@@ -4008,12 +4077,21 @@ class TwoOwnerRun(pp.LiveRun):
             registry=self.inputs.registry,
             required=("curie-api", "curie-worker", "curie-dispatcher"),
         )
-        dex = self.dex_image.rsplit("@", 1)[-1]
-        dex_failures = pps.running_image_failures(
-            pods, {DEX_REPOSITORY: dex}, registry=self.inputs.registry, required=(DEX_REPOSITORY,)
-        )
+        mirror = self.dex_image.rsplit("@", 1)[-1]
+        recorded = self.ledger.observations("images").get("dex")
+        if (
+            isinstance(recorded, dict)
+            and isinstance(recorded.get("digest"), str)
+            and recorded["digest"]
+        ):
+            mirror = recorded["digest"]
+        source, dex_failures = dex_image_verdict(pods, registry=self.inputs.registry, mirror=mirror)
         self.ledger.record("owners", "platform_images_candidate", not failures)
         self.ledger.record("install", "dex_image_running", not dex_failures)
+        if source:
+            self.ledger.record("install", "dex_image_digest_source", source)
+        self.ledger.record("install", "dex_image_failures", dex_failures)
+        self.ledger.record("install", "platform_image_failures", failures)
         self.observe_worker(pods)
         if failures or dex_failures:
             raise StepFailed("candidate images are not the running images")
