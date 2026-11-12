@@ -731,7 +731,7 @@ def test_publish_decisions_vectors_and_body_recovery(
     assert after["diff_approved_fingerprint"] == before["diff_approved_fingerprint"]
 
 
-def test_publish_missing_body_is_recoverable(session: Session) -> None:
+def test_publish_decisions_missing_body_is_recoverable(session: Session) -> None:
     session.review(PLAN, reply(PLAN, "APPROVE"))
     session.review(DIFF, reply(DIFF, "APPROVE"))
     before = _saved_state(session)
