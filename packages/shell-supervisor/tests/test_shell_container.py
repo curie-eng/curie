@@ -1338,8 +1338,8 @@ def _drained_after(response: Any) -> int:
     """Read what is left of a cut stream; it must end, not keep flowing.
 
     Bytes already in socket buffers still arrive, and published container
-    ports add buffering hops, so the bound here is loose; the in-process
-    supervisor test bounds it on loopback.
+    ports add buffering hops, so the bound here is loose. No tighter
+    loopback bound is asserted anywhere.
     """
 
     after = 0
