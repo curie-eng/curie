@@ -405,9 +405,11 @@ class PersonalCreate(Protocol):
     The substrate runs on a worker thread and calls these synchronously; the
     kernel bridges each to its event loop. ``begin`` takes the owner launch
     lease (``OwnerBusy`` when another create holds it), ``grant_env`` runs the
-    final authority check after all preparation and returns the grant's claim
-    env (a refusal raises), and ``fence`` proves the lease is still this
-    create's immediately before the create write (``OwnerBusy`` when lost).
+    authority check after all preparation and returns the grant's claim env
+    (a refusal raises), and ``fence`` runs the authority check again (a
+    refusal raises) and proves the lease is still this create's, immediately
+    before the create write and after any predecessor teardown (``OwnerBusy``
+    when lost).
     """
 
     @property

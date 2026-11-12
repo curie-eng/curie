@@ -206,9 +206,10 @@ class _HostedUpstream:
     """A loopback connector that answers only requests carrying all held headers.
 
     It records each request's method, id, tool, status and whether it was
-    authorized, never a header value. ``restart`` forgets every session, as a
-    restarted connector does; ``halt`` and ``resume`` close and reopen the
-    listener on the same port.
+    authorized, never a header value, and each write it ran in ``committed``.
+    ``restart`` forgets every session, as a restarted connector does; ``halt``
+    and ``resume`` close and reopen the listener on the same port; ``withhold``
+    runs one write and never answers it.
     """
 
     def __init__(self, sentinels: _Sentinels, *, require_grant: bool) -> None:
@@ -217,8 +218,11 @@ class _HostedUpstream:
         self.challenge = f"CHALLENGE-{uuid4().hex}"
         self.generation = 0
         self.calls: list[dict[str, Any]] = []
+        self.committed: list[str] = []
         self._sessions: set[str] = set()
         self._runner: web.AppRunner | None = None
+        self._withheld: dict[str, anyio.Event] = {}
+        self._released: anyio.Event | None = None
         self.port = 0
 
     @property
@@ -248,7 +252,22 @@ class _HostedUpstream:
         self.generation += 1
         self._sessions.clear()
 
+    def withhold(self, value: str) -> anyio.Event:
+        """Run the next write of ``value`` and hold its answer until ``halt``.
+
+        Returns an event set once that write has run, so a test can act while
+        its answer is outstanding.
+        """
+
+        ran = anyio.Event()
+        self._withheld[value] = ran
+        if self._released is None:
+            self._released = anyio.Event()
+        return ran
+
     async def halt(self) -> None:
+        if self._released is not None:
+            self._released.set()
         runner, self._runner = self._runner, None
         if runner is not None:
             await runner.cleanup()
@@ -281,6 +300,17 @@ class _HostedUpstream:
         }
         response = self._answer(request, message, params, authorized=record["authorized"])
         self.calls.append({**record, "status": response.status})
+        arguments = params.get("arguments")
+        value = arguments.get("value") if isinstance(arguments, dict) else None
+        ran = (
+            self._withheld.pop(value, None)
+            if isinstance(value, str) and record["tool"] == "record" and response.status == 200
+            else None
+        )
+        if ran is not None and self._released is not None:
+            # The write ran; its answer waits until the connector halts.
+            ran.set()
+            await self._released.wait()
         return response
 
     def _answer(
@@ -322,6 +352,7 @@ class _HostedUpstream:
             if name == "challenge":
                 text = self.challenge
             elif name in ("record", "write_gated"):
+                self.committed.append(str(arguments.get("value")))
                 text = json.dumps({"recorded": arguments.get("value")})
             else:
                 return self._error(message, -32602, "unknown tool")
@@ -1077,6 +1108,15 @@ def _challenge(request_id: int) -> dict[str, Any]:
     }
 
 
+def _record(request_id: int, value: str) -> dict[str, Any]:
+    return {
+        "jsonrpc": "2.0",
+        "id": request_id,
+        "method": "tools/call",
+        "params": {"name": "record", "arguments": {"value": value}},
+    }
+
+
 def test_relay_redials_a_dropped_connector_and_refuses_while_it_is_down(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
@@ -1144,6 +1184,78 @@ def test_relay_redials_a_dropped_connector_and_refuses_while_it_is_down(
         ("the relay repr", relay_repr),
         ("the logs", caplog.text),
     ):
+        assert not _carries(data, sentinels.values()), f"{surface} carried a relay-held value"
+
+
+def test_session_expiry_replays_only_the_refused_call_never_a_write_in_flight(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A connector restart between running a write and answering it.
+
+    The write's answer is lost with the old session, and a concurrent call on
+    that session is refused for the expired session. Only the refused call is
+    sent again; the write fails back to its caller and runs exactly once.
+    """
+
+    sentinels = _Sentinels.fresh()
+    write_value = f"acme-write-{uuid4().hex}"
+    caplog.set_level(logging.DEBUG)
+
+    async def scenario() -> tuple[dict[str, Any], list[str], list[dict[str, Any]], str]:
+        async with _HostedUpstream(sentinels, require_grant=True) as upstream:
+            servers, snapshot, env = _materialized(upstream.base_url, sentinels)
+            mounted = mount_hosted_header_channel(
+                servers, derived_headers=snapshot, env=env, release=(env,)
+            )
+            relay = mounted[CONNECTOR]["instance"]
+            assert isinstance(relay, HostedHeaderRelay)
+            bridge = SdkMcpBridge(relay.name, relay)  # type: ignore[arg-type]
+            replies: dict[str, Any] = {}
+
+            async def write() -> None:
+                replies["write"] = await bridge.handle(_record(3, write_value))
+
+            try:
+                with anyio.fail_after(_BRIDGE_TIMEOUT_S):
+                    await bridge.handle(_initialize(1))
+                    await bridge.handle(_INITIALIZED)
+                    replies["list"] = await bridge.handle(
+                        {"jsonrpc": "2.0", "id": 2, "method": "tools/list"}
+                    )
+                    ran = upstream.withhold(write_value)
+                    async with anyio.create_task_group() as tasks:
+                        tasks.start_soon(write)
+                        await ran.wait()
+                        upstream.restart()
+                        replies["refused"] = await bridge.handle(_challenge(4))
+                    replies["next"] = await bridge.handle(_challenge(5))
+            finally:
+                await bridge.aclose()
+            return replies, list(upstream.committed), list(upstream.calls), upstream.challenge
+
+    replies, committed, calls, challenge = anyio.run(scenario)
+    assert committed == [write_value], "the write ran other than exactly once"
+    written = replies["write"]
+    assert "result" not in written, "the write was replayed after its answer was lost"
+    assert written["error"]["code"] == CONNECTION_CLOSED
+    assert written["error"]["message"] == f"hosted connector {CONNECTOR} is unavailable"
+    for key in ("refused", "next"):
+        assert replies[key]["result"]["content"][0]["text"] == challenge, key
+    writes = [(call["id"], call["generation"]) for call in calls if call["tool"] == "record"]
+    assert writes == [(3, 0)]
+    # The refused call: once on the expired session, once on the replayed handshake's.
+    challenges = [
+        (call["id"], call["generation"], call["status"])
+        for call in calls
+        if call["tool"] == "challenge"
+    ]
+    assert challenges == [(4, 1, 404), (4, 1, 200), (5, 1, 200)]
+    initializes = [
+        (call["id"], call["generation"]) for call in calls if call["method"] == "initialize"
+    ]
+    assert initializes == [(1, 0), (f"{_REPLAY_PREFIX}1", 1)]
+    assert all(call["authorized"] for call in calls)
+    for surface, data in (("a bridge reply", json.dumps(replies)), ("the logs", caplog.text)):
         assert not _carries(data, sentinels.values()), f"{surface} carried a relay-held value"
 
 

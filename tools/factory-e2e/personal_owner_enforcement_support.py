@@ -3,8 +3,9 @@
 Everything here is deterministic and touches no cluster, Docker engine,
 registry or network: the approved live ceiling, flag and input validation, the
 stat-only grant check, the private SQLite ledger and its reservation math,
-native transcript usage counting, the judge, argv and environment builders,
-and the LIFO finalizer. ``personal_owner_enforcement.py`` owns every side effect.
+native transcript usage counting, the stub code host and workspace template
+transforms, the judge, argv and environment builders, and the LIFO finalizer.
+``personal_owner_enforcement.py`` owns every side effect.
 
 No function here returns, logs or raises a held value. Refusals carry fixed
 codes and flag names only.
@@ -12,6 +13,7 @@ codes and flag names only.
 
 from __future__ import annotations
 
+import copy
 import dataclasses
 import hashlib
 import ipaddress
@@ -21,6 +23,7 @@ import re
 import sqlite3
 import stat
 import sys
+import textwrap
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from pathlib import Path
 from typing import Any
@@ -54,7 +57,10 @@ MIN_SESSION_WINDOW = 90
 # closed unstarted; a later start is unreserved and fences every start.
 START_WINDOW = 150
 GRANT_MIN_LIFETIME = LIVE_SECONDS + CLEANUP_SECONDS
-BLOCKING_ISSUE = "#5092"
+# Restoring uncommitted workspace files into a fresh process after Pod
+# recreation is the epic follow-up #5541, itself blocked by #5092.
+BLOCKING_ISSUE = "#5541"
+BLOCKING_UPSTREAM = {"#5541": "#5092"}
 
 
 @dataclasses.dataclass(frozen=True)
@@ -915,6 +921,235 @@ class OwnerLedger:
 
 
 # --------------------------------------------------------------------------
+# The code host and the repository workspace (pure transforms)
+# --------------------------------------------------------------------------
+
+WORKSPACE_MOUNT = "/workspace"
+WORKSPACE_SIZE = "1Gi"  # the chart's standard profile workspaceSizeLimit
+WORKSPACE_INIT = "workspace-init"
+# The claim env the chart's workspace-init declares empty, so the claim's
+# Overrides injection has an entry to replace (charts/curie agent-sandbox.yaml).
+WORKSPACE_INIT_ENV = (
+    "CURIE_WORKSPACE_REF",
+    "CURIE_WORKSPACE_SHA256",
+    "CURIE_REPO_ORIGIN",
+    "CURIE_REPO_PATH",
+)
+# The chart's codeHostTrust mount and the sandbox client env that reads it.
+CODE_HOST_TRUST_VOLUME = "code-host-trust"
+CODE_HOST_TRUST_DIR = "/etc/curie/code-host-trust"
+CODE_HOST_TRUST_ENV = (
+    "CURIE_REPO_CA_BUNDLE",
+    "GIT_SSL_CAINFO",
+    "SSL_CERT_FILE",
+    "REQUESTS_CA_BUNDLE",
+)
+# The chart's default workspace values, substituted into its init program.
+CHART_WORKSPACE_VALUES = {
+    "{{ $wf.mountPath }}": WORKSPACE_MOUNT,
+    "{{ $wf.fetchTimeoutSeconds }}": "45",
+    "{{ $wf.extractTimeoutSeconds }}": "45",
+    "{{ .Values.worker.workspace.maxArchiveBytes }}": "268435456",
+}
+_CHART_NOTICE = re.compile(
+    r'\{\{ include "curie\.sandbox\.claimEnvNoOpNotice" \(dict [^)]*\) \| quote \}\}'
+)
+STUB_SEED_DIR = "/seed"
+STUB_WORK_DIR = "/work"
+
+
+def chart_workspace_init(template: str, values: Mapping[str, str]) -> str:
+    """The chart's own ``workspace-init`` program, its template values filled in.
+
+    Read from the candidate's ``agent-sandbox.yaml`` so the proof's sandbox
+    stages the checkout exactly as an installed chart does. Raises
+    ``ValueError`` when the block is missing or a template expression remains.
+    """
+
+    lines = template.splitlines()
+    try:
+        start = next(
+            i for i, line in enumerate(lines) if line.strip() == f"- name: {WORKSPACE_INIT}"
+        )
+        block = next(i for i in range(start, len(lines)) if lines[i].strip() == "- |")
+    except StopIteration:
+        raise ValueError("the chart has no workspace-init program") from None
+    indent = len(lines[block]) - len(lines[block].lstrip())
+    body: list[str] = []
+    for line in lines[block + 1 :]:
+        if line.strip() and len(line) - len(line.lstrip()) <= indent:
+            break
+        body.append(line)
+    program = textwrap.dedent("\n".join(body)).strip("\n") + "\n"
+    program = _CHART_NOTICE.sub(
+        lambda _match: repr("no CURIE_WORKSPACE_REF in this container's env: nothing to stage"),
+        program,
+    )
+    for expression, value in values.items():
+        program = program.replace(expression, value)
+    if "{{" in program or "}}" in program or "CURIE_WORKSPACE_REF" not in program:
+        raise ValueError("the chart's workspace-init program did not render")
+    compile(program, WORKSPACE_INIT, "exec")
+    return program
+
+
+def workspace_template(
+    spec: Mapping[str, Any], *, program: str, ca_config_map: str, ca_key: str
+) -> dict[str, Any]:
+    """The source SandboxTemplate with the chart's workspace and code host trust.
+
+    Adds the claim-scoped ``workspace`` emptyDir (the chart's default scratch
+    type), the ``workspace-init`` init container after the bundle pair, the
+    runner's ``/workspace`` mount and ``safe.directory``, and the
+    ``codeHostTrust`` CA mount with the chart's four client env names.
+    """
+
+    result: dict[str, Any] = copy.deepcopy(dict(spec))
+    pod = result["podTemplate"]["spec"]
+    inits = pod.get("initContainers") or []
+    if not inits or any(item.get("name") == WORKSPACE_INIT for item in inits):
+        raise ValueError("the source template cannot take a workspace-init container")
+    runner = next((item for item in pod["containers"] if item.get("name") == "runner"), None)
+    if runner is None:
+        raise ValueError("the source template has no runner container")
+    added_env = {"GIT_CONFIG_COUNT", "GIT_CONFIG_KEY_0", "GIT_CONFIG_VALUE_0", *CODE_HOST_TRUST_ENV}
+    if any(entry.get("name") in added_env for entry in runner.get("env") or []):
+        raise ValueError("the runner already names a workspace or trust variable")
+    base = inits[0]
+    pod["volumes"] = [
+        *(pod.get("volumes") or []),
+        {"name": "workspace", "emptyDir": {"sizeLimit": WORKSPACE_SIZE}},
+        {
+            "name": CODE_HOST_TRUST_VOLUME,
+            "configMap": {"name": ca_config_map, "items": [{"key": ca_key, "path": "ca.crt"}]},
+        },
+    ]
+    pod["initContainers"] = [
+        *inits,
+        {
+            "name": WORKSPACE_INIT,
+            **{
+                key: copy.deepcopy(base[key])
+                for key in ("image", "imagePullPolicy", "securityContext", "resources")
+                if key in base
+            },
+            "command": ["python", "-c", program],
+            "env": [{"name": name, "value": ""} for name in WORKSPACE_INIT_ENV],
+            "volumeMounts": [{"name": "workspace", "mountPath": WORKSPACE_MOUNT}],
+        },
+    ]
+    trust = f"{CODE_HOST_TRUST_DIR}/ca.crt"
+    runner["volumeMounts"] = [
+        *(runner.get("volumeMounts") or []),
+        {"name": "workspace", "mountPath": WORKSPACE_MOUNT},
+        {"name": CODE_HOST_TRUST_VOLUME, "mountPath": CODE_HOST_TRUST_DIR, "readOnly": True},
+    ]
+    runner["env"] = [
+        *(runner.get("env") or []),
+        {"name": "GIT_CONFIG_COUNT", "value": "1"},
+        {"name": "GIT_CONFIG_KEY_0", "value": "safe.directory"},
+        {"name": "GIT_CONFIG_VALUE_0", "value": WORKSPACE_MOUNT},
+        *({"name": name, "value": trust} for name in CODE_HOST_TRUST_ENV),
+    ]
+    return result
+
+
+def code_host_manifests(
+    base: Sequence[Mapping[str, Any]],
+    *,
+    image: str,
+    port: int,
+    seed_files: Mapping[str, str],
+    issue_body: str,
+    boot: str,
+    labels: Mapping[str, str],
+) -> list[dict[str, Any]]:
+    """The recorded stub's ConfigMap, Pod and Service, with a seeded repository.
+
+    ``base`` is ``tls_code_host.stub_manifests``. The stub requires a seed tree
+    and an issue file; both ride in its ConfigMap, and ``boot`` copies them
+    into a Pod-owned directory before it starts the stub with the added flags.
+    The Pod runs the digest-pinned candidate image and reports Ready only once
+    it listens.
+    """
+
+    manifests = [copy.deepcopy(dict(item)) for item in base]
+    by_kind = {item["kind"]: item for item in manifests}
+    if set(by_kind) != {"ConfigMap", "Pod", "Service"} or len(manifests) != 3:
+        raise ValueError("the stub manifests are not one ConfigMap, Pod and Service")
+    source, pod = by_kind["ConfigMap"], by_kind["Pod"]
+    names = sorted(seed_files)
+    if not names or any("/" in name or name.startswith(".") for name in names):
+        raise ValueError("seed files must be plain top-level names")
+    keys = {f"seed-{index}": name for index, name in enumerate(names)}
+    source["data"] = {
+        **source["data"],
+        **{key: seed_files[name] for key, name in keys.items()},
+        "seed-issue": issue_body,
+    }
+    for item in manifests:
+        meta = item["metadata"]
+        meta["labels"] = {**(meta.get("labels") or {}), **labels}
+    spec = pod["spec"]
+    container = spec["containers"][0]
+    container.update(
+        {
+            "image": image,
+            "imagePullPolicy": "Always",
+            "command": ["python3", "-c", boot],
+            "args": [
+                *container["args"],
+                "--seed-tree",
+                f"{STUB_WORK_DIR}/tree",
+                "--issue-file",
+                f"{STUB_WORK_DIR}/issue.md",
+            ],
+            "readinessProbe": {"tcpSocket": {"port": port}, "periodSeconds": 1},
+        }
+    )
+    container["volumeMounts"] = [
+        *container["volumeMounts"],
+        {"name": "seed", "mountPath": STUB_SEED_DIR, "readOnly": True},
+        {"name": "work", "mountPath": STUB_WORK_DIR},
+    ]
+    items = [{"key": key, "path": f"tree/{name}"} for key, name in keys.items()]
+    spec["volumes"] = [
+        *spec["volumes"],
+        {
+            "name": "seed",
+            "configMap": {
+                "name": source["metadata"]["name"],
+                "items": [*items, {"key": "seed-issue", "path": "issue.md"}],
+            },
+        },
+        {"name": "work", "emptyDir": {"sizeLimit": "16Mi"}},
+    ]
+    return manifests
+
+
+def committed_restoration(
+    source: Mapping[str, Any], before: Mapping[str, Any], after: Mapping[str, Any]
+) -> dict[str, bool]:
+    """Whether the workspace held the stub repository's committed state on both sides.
+
+    ``source`` is the stub's bare repository (main's commit and the SHA-256 of
+    each committed blob); ``before`` and ``after`` are the sandbox workspace
+    (HEAD and the SHA-256 of each tracked file) before the interruption and
+    after recovery.
+    """
+
+    head, files = source.get("head"), source.get("files")
+    return {
+        "committed_head_restored": bool(head)
+        and before.get("head") == head
+        and after.get("head") == head,
+        "committed_files_restored": bool(files)
+        and before.get("files") == files
+        and after.get("files") == files,
+    }
+
+
+# --------------------------------------------------------------------------
 # The judge: expected values live here, observed values only in the ledger
 # --------------------------------------------------------------------------
 
@@ -995,12 +1230,19 @@ EXPECTED: dict[str, dict[str, Any]] = {
                 "replay_marker_seen",
                 "fresh_native_process",
                 "automatic_recovery",
+                "old_runtime_gone",
+                # The stub repository's commit and committed blobs, in the
+                # sandbox workspace before the interruption and after recovery.
+                "committed_head_restored",
+                "committed_files_restored",
             )
         },
         "process.same_pod": True,
         "process.container_restarted": True,
+        # The same Pod keeps its workspace volume, uncommitted files included.
         "process.workspace_nonce_restored": True,
         "pod.new_pod": True,
+        # Not met by design today: #5541 (blocked by #5092).
         "pod.workspace_nonce_restored": True,
         "worker.worker_restarted": True,
     },
@@ -1028,6 +1270,7 @@ CLEANUP_KINDS = (
     "grant_copies",
     "pvcs",
     "pvs",
+    "code_host",
     "registry",
     "containers",
     "port_forwards",
@@ -1050,8 +1293,10 @@ def _check(
     else:
         status = "fail"
     check = {"key": key, "expected": expected, "observed": observed, "status": status}
-    if status == "not_met":
+    if status == "not_met" and blocked_by is not None:
         check["blocked_by"] = blocked_by
+        if blocked_by in BLOCKING_UPSTREAM:
+            check["upstream"] = BLOCKING_UPSTREAM[blocked_by]
     return check
 
 

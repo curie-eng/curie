@@ -24,6 +24,7 @@ PERSONAL_VARS = ("CURIE_MODEL_AUTH_MODE", "FACTORY_MODEL_AUTH_MODE")
 CODE = "personal_mode_requires_kubernetes"
 MANAGED_LABEL = "label=curietech.ai/managed-by=curie-cli"
 RUNNER_IMAGE = "curie-runner"
+SNAPSHOT_OWNER = "curietech.ai/snapshot-owner"
 
 
 def _docker(*args: str) -> str:
@@ -33,6 +34,16 @@ def _docker(*args: str) -> str:
     if result.returncode:
         raise RuntimeError(f"docker {' '.join(args)} failed: {result.stderr.strip()}")
     return result.stdout
+
+
+def _volume_labels(volume: str) -> dict[str, str]:
+    try:
+        raw = _docker("volume", "inspect", "--format", "{{json .Labels}}", volume).strip()
+    except RuntimeError:
+        # Removed between the listing and the inspect: not this trial's.
+        return {}
+    labels = json.loads(raw) if raw and raw != "null" else {}
+    return {str(key): str(value) for key, value in labels.items()}
 
 
 def _free_port() -> int:
@@ -85,13 +96,24 @@ class Trial:
         ).split()
 
     def new_volumes(self) -> set[str]:
+        """Volumes this trial's own runner or compose project created, never another's.
+
+        A CLI snapshot volume names its owner as ``<container>:<session>``, so only a
+        volume whose owner is this trial's uniquely named runner is the trial's.
+        """
+
         managed = set(_docker("volume", "ls", "-q", "--filter", MANAGED_LABEL).split())
+        owned = {
+            volume
+            for volume in managed - self.baseline_volumes
+            if _volume_labels(volume).get(SNAPSHOT_OWNER, "").startswith(f"{self.runner}:")
+        }
         project = set(
             _docker(
                 "volume", "ls", "-q", "--filter", f"label=com.docker.compose.project={self.project}"
             ).split()
         )
-        return (managed - self.baseline_volumes) | project
+        return owned | project
 
     def leftovers(self) -> dict[str, object]:
         return {
@@ -211,3 +233,26 @@ def test_a_non_personal_value_still_starts_the_runner_and_down_removes_it(
     down = trial.run("skill", "down", "--name", trial.runner, "--json")
     assert down.returncode == 0, down.stdout + down.stderr
     assert trial.containers() == []
+
+
+def test_cleanup_and_the_leftover_check_ignore_another_runs_cli_volume(trial: Trial) -> None:
+    foreign = f"curie-snapshot-foreign-{uuid.uuid4().hex[:10]}"
+    _docker(
+        "volume",
+        "create",
+        "--label",
+        "curietech.ai/managed-by=curie-cli",
+        "--label",
+        f"{SNAPSHOT_OWNER}=acme-foreign-runner:{uuid.uuid4()}",
+        foreign,
+    )
+    try:
+        result = trial.run(
+            *_commands(trial)["skill-up"], "--json", CURIE_MODEL_AUTH_MODE="personal"
+        )
+        assert result.returncode == 2, result.stdout + result.stderr
+        assert trial.leftovers() == {"containers": [], "networks": [], "volumes": []}
+        trial.close()
+        assert foreign in _docker("volume", "ls", "-q", "--filter", f"name=^{foreign}$").split()
+    finally:
+        _docker("volume", "rm", "-f", foreign)

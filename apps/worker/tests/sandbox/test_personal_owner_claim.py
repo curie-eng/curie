@@ -12,12 +12,14 @@ from __future__ import annotations
 import copy
 import ssl
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
+from typing import Any
 
 import pytest
 import redis
 from curie_worker.sandbox import AffinityStore, SandboxSubstrate, SubstrateConfig
 from curie_worker.sandbox.static import StaticPoolSandboxClient, StaticShellSlot
+from curie_worker.sandbox.substrate import HISTORY_ENV, SESSION_ENV
 from curie_worker.sandbox.types import (
     AUTHENTICATION_REQUIRED,
     ClaimProvenance,
@@ -27,6 +29,7 @@ from curie_worker.sandbox.types import (
     ProvenanceMismatch,
     RouteRecord,
     SandboxHandle,
+    SandboxView,
 )
 
 from .conftest import FakeSandboxClient, _FakeBundleStore, _RecordingDocker
@@ -64,6 +67,8 @@ class _Owner:
     refusal: PersonalLaunchRefused | None = None
     busy: bool = False
     lose_lease: bool = False
+    # The fence's fresh authority check refuses (after any predecessor teardown).
+    fence_refusal: PersonalLaunchRefused | None = None
 
     def begin(self) -> None:
         self.steps.append("begin")
@@ -78,6 +83,8 @@ class _Owner:
 
     def fence(self) -> None:
         self.steps.append("fence")
+        if self.fence_refusal is not None:
+            raise self.fence_refusal
         if self.lose_lease:
             raise OwnerBusy()
 
@@ -405,3 +412,237 @@ def test_kubernetes_refuses_owner_labels_without_the_personal_template() -> None
         api.secrets[f"{_CLAIM}-tokens"]["stringData"]["CLAUDE_CODE_OAUTH_TOKEN"]
         == "personal-grant-placeholder"
     )
+
+
+# --- Session identity, refusals and teardown across handoff and resume (r1) ------
+
+_RETAINED_ENV = {
+    SESSION_ENV: "session-of-the-retained-runtime",
+    HISTORY_ENV: "https://state.example/transcript/retained",
+}
+_SUSPENDED_HISTORY = "https://state.example/transcript/suspended"
+_FRESH_ENV = {"CURIE_RUNNER_TOKEN": "runner-token-placeholder"}
+
+_PROVENANCE_PAIRS = [
+    pytest.param(_provenance(), _provenance(), True, id="same-owner"),
+    pytest.param(None, None, True, id="service"),
+    pytest.param(
+        _provenance(generation=GENERATION - 1), _provenance(), False, id="older-generation"
+    ),
+    pytest.param(_provenance(principal=OTHER_PRINCIPAL), _provenance(), False, id="another-owner"),
+    pytest.param(None, _provenance(), False, id="personal-after-service-or-unknown"),
+    pytest.param(_provenance(), None, False, id="service-after-personal"),
+]
+
+
+def _as(provenance: ClaimProvenance | None) -> _Owner | None:
+    return None if provenance is None else _Owner(provenance=provenance)
+
+
+@pytest.mark.parametrize(("first", "second", "inherits"), _PROVENANCE_PAIRS)
+def test_a_handoff_hands_on_the_session_only_within_one_provenance(
+    fake_k8s: FakeSandboxClient,
+    affinity: AffinityStore,
+    config: SubstrateConfig,
+    first: ClaimProvenance | None,
+    second: ClaimProvenance | None,
+    inherits: bool,
+) -> None:
+    """An idle runtime replaced through ``handoff`` passes its session and
+    history on only to a runtime of its own provenance. Another owner,
+    generation or mode, or unknown provenance, gets a new session identity,
+    as ``claim()`` gives it, and never boots with the retained transcript."""
+
+    substrate = _substrate(fake_k8s, affinity, config)
+    retained = substrate.claim(THREAD, env=dict(_RETAINED_ENV), personal=_as(first))
+    assert (retained.session_id, retained.history_ref) == tuple(_RETAINED_ENV.values())
+
+    new = substrate.handoff(
+        THREAD, expected=retained, env=dict(_FRESH_ENV), workspace_repo=None, personal=_as(second)
+    )
+
+    boot = fake_k8s.claims[new.claim_name].env
+    if inherits:
+        assert (new.session_id, new.history_ref) == (retained.session_id, retained.history_ref)
+        assert (boot[SESSION_ENV], boot[HISTORY_ENV]) == tuple(_RETAINED_ENV.values())
+    else:
+        assert new.session_id != retained.session_id
+        assert new.history_ref is None
+        assert SESSION_ENV not in boot and HISTORY_ENV not in boot
+    # Either way the route names the replacement and the retained runtime is gone.
+    assert substrate.adopt(THREAD, provenance=second) == new
+    assert set(fake_k8s.claims) == {new.claim_name}
+
+
+@pytest.mark.parametrize(("first", "second", "inherits"), _PROVENANCE_PAIRS)
+def test_a_resume_hands_on_the_session_only_within_one_provenance(
+    fake_k8s: FakeSandboxClient,
+    affinity: AffinityStore,
+    config: SubstrateConfig,
+    first: ClaimProvenance | None,
+    second: ClaimProvenance | None,
+    inherits: bool,
+) -> None:
+    """A suspended runtime resumes its session and history only for a request
+    of its own provenance. A plain service turn on a thread holding a
+    suspended personal claim, and a personal request on a service or
+    unknown-provenance one, boot a new session instead."""
+
+    substrate = _substrate(fake_k8s, affinity, config)
+    retained = substrate.claim(THREAD, env=dict(_RETAINED_ENV), personal=_as(first))
+    substrate.suspend(THREAD, history_ref=_SUSPENDED_HISTORY)
+
+    resumed = substrate.resume(THREAD, env=dict(_FRESH_ENV), personal=_as(second))
+
+    boot = fake_k8s.claims[resumed.claim_name].env
+    if inherits:
+        assert (resumed.session_id, resumed.history_ref) == (
+            retained.session_id,
+            _SUSPENDED_HISTORY,
+        )
+        assert (boot[SESSION_ENV], boot[HISTORY_ENV]) == (retained.session_id, _SUSPENDED_HISTORY)
+    else:
+        assert resumed.session_id != retained.session_id
+        assert resumed.history_ref is None
+        assert SESSION_ENV not in boot and HISTORY_ENV not in boot
+    assert set(fake_k8s.claims) == {resumed.claim_name}
+    assert substrate.adopt(THREAD, provenance=second) == resumed
+
+
+@pytest.mark.parametrize(
+    ("step", "code", "retired"),
+    [
+        pytest.param("busy", None, False, id="owner-busy"),
+        pytest.param("refusal", "custody_missing", False, id="grant-refused"),
+        pytest.param("refusal", "enrollment_inactive", False, id="authorization-refused"),
+        pytest.param(
+            "fence_refusal", "enrollment_generation_mismatch", True, id="refused-after-teardown"
+        ),
+    ],
+)
+def test_a_refused_personal_resume_keeps_the_suspended_route_for_a_later_resume(
+    fake_k8s: FakeSandboxClient,
+    affinity: AffinityStore,
+    config: SubstrateConfig,
+    step: str,
+    code: str | None,
+    retired: bool,
+) -> None:
+    """A personal resume takes the owner slot and reads the grant before it
+    deletes anything. Refused there, the suspended claim and its route stay
+    exactly as they were; refused by the fence after the teardown, the claim
+    is gone but the route (session and history) stays. Either way the thread
+    resumes its own session once the owner is authorized again."""
+
+    substrate = _substrate(fake_k8s, affinity, config)
+    retained = substrate.claim(THREAD, env=dict(_RETAINED_ENV), personal=_Owner())
+    substrate.suspend(THREAD, history_ref=_SUSPENDED_HISTORY)
+    suspended = affinity.get(THREAD)
+    refusing: dict[str, Any] = (
+        {"busy": True}
+        if code is None
+        else {step: PersonalLaunchRefused(code, classification=AUTHENTICATION_REQUIRED)}
+    )
+
+    with pytest.raises((OwnerBusy, PersonalLaunchRefused)):
+        substrate.resume(THREAD, env=dict(_FRESH_ENV), personal=_Owner(**refusing))
+
+    assert fake_k8s.created == [retained.claim_name]
+    assert affinity.get(THREAD) == suspended
+    assert (retained.claim_name in fake_k8s.claims) is not retired
+
+    # Liveness: authorized again, the same thread resumes its own session.
+    resumed = substrate.resume(THREAD, env=dict(_FRESH_ENV), personal=_Owner())
+    assert (resumed.session_id, resumed.history_ref) == (retained.session_id, _SUSPENDED_HISTORY)
+    assert set(fake_k8s.claims) == {resumed.claim_name}
+
+
+@dataclass
+class _LingeringClient(FakeSandboxClient):
+    """Kubernetes deletion as it is: a deleted claim is gone at once while its
+    sandbox stays for ``linger_reads`` more reads (None: for good). Every
+    claim create records the sandboxes still lingering then in ``overlaps``."""
+
+    linger_reads: int | None = 3
+    lingering: dict[str, int | None] = field(default_factory=dict)
+    overlaps: list[str] = field(default_factory=list)
+
+    def delete_claim(self, name: str, *, request_timeout_seconds: float) -> None:
+        claim = self.claims.get(name)
+        sandbox = None if claim is None else self.sandboxes.get(claim.sandbox_name)
+        super().delete_claim(name, request_timeout_seconds=request_timeout_seconds)
+        if sandbox is not None:
+            self.sandboxes[sandbox.name] = sandbox
+            self.lingering[sandbox.name] = self.linger_reads
+
+    def get_sandbox(self, name: str, *, request_timeout_seconds: float) -> SandboxView | None:
+        if name in self.lingering:
+            left = self.lingering[name]
+            if left is not None and left <= 0:
+                del self.lingering[name]
+                self.sandboxes.pop(name, None)
+            elif left is not None:
+                self.lingering[name] = left - 1
+        return super().get_sandbox(name, request_timeout_seconds=request_timeout_seconds)
+
+    def create_claim(self, name: str, **kwargs: Any) -> None:
+        self.overlaps.extend(sorted(self.lingering))
+        super().create_claim(name, **kwargs)
+
+
+def _replace_by_resume(substrate: SandboxSubstrate, client: _LingeringClient) -> SandboxHandle:
+    substrate.claim(THREAD, personal=_Owner())
+    substrate.suspend(THREAD, history_ref=_SUSPENDED_HISTORY)
+    return substrate.resume(THREAD, env=dict(_FRESH_ENV), personal=_Owner())
+
+
+def _replace_by_claim(substrate: SandboxSubstrate, client: _LingeringClient) -> SandboxHandle:
+    # The owner's runtime of an older generation is retired by the next claim.
+    substrate.claim(THREAD, personal=_Owner(provenance=_provenance(generation=GENERATION - 1)))
+    return substrate.claim(THREAD, personal=_Owner())
+
+
+def _replace_after_adopt(substrate: SandboxSubstrate, client: _LingeringClient) -> SandboxHandle:
+    # Its claim stops binding: adopt refuses the stale route, the claim replaces it.
+    old = substrate.claim(THREAD, personal=_Owner())
+    client.claims[old.claim_name].ready = False
+    assert substrate.adopt(THREAD, provenance=_provenance()) is None
+    return substrate.claim(THREAD, personal=_Owner())
+
+
+@pytest.mark.parametrize(
+    "replace_runtime",
+    [
+        pytest.param(_replace_by_resume, id="resume"),
+        pytest.param(_replace_by_claim, id="stale-route-eviction"),
+        pytest.param(_replace_after_adopt, id="adopt-then-claim"),
+    ],
+)
+@pytest.mark.parametrize("linger_reads", [3, None], ids=["sandbox-goes", "sandbox-stays"])
+def test_a_predecessor_whose_claim_goes_before_its_sandbox_never_overlaps_the_create(
+    affinity: AffinityStore,
+    config: SubstrateConfig,
+    replace_runtime: Any,
+    linger_reads: int | None,
+) -> None:
+    """ADR 0268 decision 2. The owner's earlier runtime on this thread is
+    deleted while its sandbox outlives its claim. The successor is created
+    only after both are observed gone (the create waits), or not at all when
+    the sandbox stays past the bound (``OwnerBusy``): never two at once."""
+
+    client = _LingeringClient(linger_reads=linger_reads)
+    bounded = replace(config, release_gone_timeout_seconds=0.2)
+    substrate = SandboxSubstrate(client, affinity, bounded)
+
+    if linger_reads is None:
+        with pytest.raises(OwnerBusy):
+            replace_runtime(substrate, client)
+        assert len(client.created) == 1
+    else:
+        new = replace_runtime(substrate, client)
+        # Liveness: the successor exists, routed, and its predecessor is gone.
+        assert len(client.created) == 2
+        assert set(client.claims) == {new.claim_name}
+        assert set(client.sandboxes) == {new.sandbox_name}
+        assert substrate.adopt(THREAD, provenance=_provenance()) == new
+    assert client.overlaps == []

@@ -23,6 +23,7 @@ import personal_owner_enforcement as driver
 import personal_owner_enforcement_support as poe
 import personal_profile_support as pps
 import pytest
+import tls_code_host as tch
 
 CANDIDATE = "0123456789abcdef0123456789abcdef01234567"
 GRANT = "synthetic-owner-grant-sentinel-not-a-token"
@@ -536,8 +537,37 @@ def test_pod_workspace_restoration_is_not_met_naming_the_blocker(tmp_path: Path)
     check = next(
         c for c in verdict["criteria"][0]["checks"] if c["key"] == "pod.workspace_nonce_restored"
     )
-    assert check["blocked_by"] == "#5092"
+    assert check["blocked_by"] == "#5541" and check["upstream"] == "#5092"
     assert poe.exit_code("not_met") == poe.EXIT_NOT_MET
+
+
+@pytest.mark.parametrize("kind", poe.RESTART_KINDS)
+@pytest.mark.parametrize(
+    "key", ["committed_head_restored", "committed_files_restored", "old_runtime_gone"]
+)
+def test_committed_state_and_old_runtime_are_hard_requirements(
+    tmp_path: Path, kind: str, key: str
+) -> None:
+    ledger = _live_ledger(tmp_path)
+    _record_all(ledger, "restart")
+    ledger.record("restart", "pod.workspace_nonce_restored", False, T0)
+    ledger.record("restart", f"{kind}.{key}", False, T0)
+    verdict = poe.judge(ledger, "restart")
+    assert verdict["verdict"] == "fail"
+    check = next(c for c in verdict["criteria"][0]["checks"] if c["key"] == f"{kind}.{key}")
+    assert check["status"] == "fail" and "blocked_by" not in check
+
+
+def test_only_the_pod_nonce_is_not_met_and_the_process_nonce_is_required(
+    tmp_path: Path,
+) -> None:
+    blocked = [key for criterion, key in poe.NOT_MET if criterion == "restart"]
+    assert blocked == ["pod.workspace_nonce_restored"]
+    ledger = _live_ledger(tmp_path)
+    _record_all(ledger, "restart")
+    ledger.record("restart", "process.workspace_nonce_restored", False, T0)
+    assert poe.judge(ledger, "restart")["verdict"] == "fail"
+    assert "worker.workspace_nonce_retained_informational" not in poe.EXPECTED["restart"]
     assert poe.exit_code("missing") == poe.exit_code("fail") == poe.EXIT_FAIL
 
 
@@ -724,13 +754,164 @@ def test_in_pod_programs_compile() -> None:
         "SWEEP_PROGRAM",
         "READ_PROGRAM",
         "RELEASE_PROGRAM",
-        "NONCE_PROGRAM",
+        "WORKSPACE_PROGRAM",
+        "STUB_TREE_PROGRAM",
+        "STUB_BOOT",
         "INTERRUPT_PROGRAM",
         "KILL_PROGRAM",
         "HISTORY_IDS_PROGRAM",
     ):
         compile(getattr(driver, name), name, "exec")
         assert GRANT not in getattr(driver, name)
+
+
+# --------------------------------------------------------------------------
+# The code host stub and the repository workspace
+# --------------------------------------------------------------------------
+
+IMAGE = "localhost:5005/acme-runner@sha256:" + "0" * 64
+
+
+def test_chart_workspace_init_is_the_candidate_charts_program() -> None:
+    program = poe.chart_workspace_init(driver.CHART_SANDBOX.read_text(), poe.CHART_WORKSPACE_VALUES)
+    assert "{{" not in program and "}}" not in program
+    assert 'pathlib.Path("/workspace")' in program
+    assert "workspace-fetch: archive digest mismatch" in program
+    assert "checkout origin is not credential-free" in program
+
+
+def test_chart_workspace_init_refuses_a_missing_or_unrendered_block() -> None:
+    with pytest.raises(ValueError):
+        poe.chart_workspace_init("containers:\n  - name: runner\n", poe.CHART_WORKSPACE_VALUES)
+    template = (
+        "        - name: workspace-init\n"
+        "          command:\n"
+        "            - python\n"
+        "            - -c\n"
+        "            - |\n"
+        '              ref = "CURIE_WORKSPACE_REF"\n'
+        "              limit = {{ .Values.unknown }}\n"
+        "          env:\n"
+    )
+    with pytest.raises(ValueError):
+        poe.chart_workspace_init(template, poe.CHART_WORKSPACE_VALUES)
+    rendered = poe.chart_workspace_init(
+        template.replace("{{ .Values.unknown }}", "{{ $wf.fetchTimeoutSeconds }}"),
+        poe.CHART_WORKSPACE_VALUES,
+    )
+    assert rendered == 'ref = "CURIE_WORKSPACE_REF"\nlimit = 45\n'
+
+
+def _source_template() -> dict[str, Any]:
+    common = {"image": IMAGE, "imagePullPolicy": "Always", "securityContext": {"a": 1}}
+    return {
+        "podTemplate": {
+            "spec": {
+                "volumes": [{"name": "tmp", "emptyDir": {}}],
+                "initContainers": [
+                    {**common, "name": "bundle-fetch", "env": []},
+                    {**common, "name": "bundle-extract", "env": []},
+                ],
+                "containers": [
+                    {**common, "name": "runner", "env": [{"name": "HOME", "value": "/h"}]},
+                    {**common, "name": "capture", "env": []},
+                ],
+            }
+        }
+    }
+
+
+def test_workspace_template_adds_the_charts_workspace_and_code_host_trust() -> None:
+    source = _source_template()
+    spec = poe.workspace_template(
+        source, program="print('stage')\n", ca_config_map="code-host-ca", ca_key="ca.crt"
+    )
+    assert source == _source_template()
+    pod = spec["podTemplate"]["spec"]
+    assert [item["name"] for item in pod["initContainers"]] == [
+        "bundle-fetch",
+        "bundle-extract",
+        "workspace-init",
+    ]
+    init = pod["initContainers"][-1]
+    assert init["image"] == IMAGE and init["command"] == ["python", "-c", "print('stage')\n"]
+    assert init["env"] == [{"name": name, "value": ""} for name in poe.WORKSPACE_INIT_ENV]
+    volumes = {item["name"]: item for item in pod["volumes"]}
+    assert volumes["workspace"] == {"name": "workspace", "emptyDir": {"sizeLimit": "1Gi"}}
+    assert volumes["code-host-trust"]["configMap"] == {
+        "name": "code-host-ca",
+        "items": [{"key": "ca.crt", "path": "ca.crt"}],
+    }
+    runner = pod["containers"][0]
+    mounts = {item["mountPath"]: item for item in runner["volumeMounts"]}
+    assert mounts["/workspace"]["name"] == "workspace"
+    assert mounts["/etc/curie/code-host-trust"]["readOnly"] is True
+    env = {item["name"]: item["value"] for item in runner["env"]}
+    for name in poe.CODE_HOST_TRUST_ENV:
+        assert env[name] == "/etc/curie/code-host-trust/ca.crt"
+    assert env["GIT_CONFIG_KEY_0"] == "safe.directory"
+    assert env["GIT_CONFIG_VALUE_0"] == "/workspace"
+    assert "volumeMounts" not in pod["containers"][1]
+    with pytest.raises(ValueError):
+        poe.workspace_template(spec, program="pass\n", ca_config_map="c", ca_key="k")
+
+
+def test_code_host_manifests_seed_the_recorded_stub() -> None:
+    base = tch.stub_manifests("acme-owner-proof", IMAGE, driver.STUB_PORT)
+    manifests = poe.code_host_manifests(
+        base,
+        image=IMAGE,
+        port=driver.STUB_PORT,
+        seed_files=driver.SEED_FILES,
+        issue_body=driver.SEED_ISSUE,
+        boot=driver.STUB_BOOT,
+        labels={"curie-proof-owner": "acme-run"},
+    )
+    by_kind = {item["kind"]: item for item in manifests}
+    assert all(item["metadata"]["labels"]["curie-proof-owner"] == "acme-run" for item in manifests)
+    container = by_kind["Pod"]["spec"]["containers"][0]
+    assert container["image"] == IMAGE and container["imagePullPolicy"] == "Always"
+    assert container["command"] == ["python3", "-c", driver.STUB_BOOT]
+    args = container["args"]
+    assert args[args.index("--seed-tree") + 1] == "/work/tree"
+    assert args[args.index("--issue-file") + 1] == "/work/issue.md"
+    assert args[args.index("--host") + 1] == "github-stub.acme-owner-proof.svc.cluster.local"
+    assert container["readinessProbe"]["tcpSocket"]["port"] == driver.STUB_PORT
+    seed = next(v for v in by_kind["Pod"]["spec"]["volumes"] if v["name"] == "seed")
+    paths = {item["path"] for item in seed["configMap"]["items"]}
+    assert paths == {"tree/README.md", "tree/example.py", "issue.md"}
+    data = by_kind["ConfigMap"]["data"]
+    assert sorted(value for key, value in data.items() if key.startswith("seed-")) == sorted(
+        [*driver.SEED_FILES.values(), driver.SEED_ISSUE]
+    )
+    assert base[1]["spec"]["containers"][0]["image"] == IMAGE
+    assert "--seed-tree" not in base[1]["spec"]["containers"][0]["args"]
+    for bad in ({"../escape": "x"}, {".hidden": "x"}, {}):
+        with pytest.raises(ValueError):
+            poe.code_host_manifests(
+                base,
+                image=IMAGE,
+                port=driver.STUB_PORT,
+                seed_files=bad,
+                issue_body="",
+                boot="",
+                labels={},
+            )
+
+
+def test_committed_restoration_compares_both_sides_with_the_stub() -> None:
+    source = {"head": "a" * 40, "files": {"README.md": "1" * 64}}
+    same = {"head": "a" * 40, "files": {"README.md": "1" * 64}, "nonce": "absent"}
+    assert poe.committed_restoration(source, same, same) == {
+        "committed_head_restored": True,
+        "committed_files_restored": True,
+    }
+    moved = {**same, "head": "b" * 40}
+    edited = {**same, "files": {"README.md": "2" * 64}}
+    assert poe.committed_restoration(source, same, moved)["committed_head_restored"] is False
+    assert poe.committed_restoration(source, edited, same)["committed_files_restored"] is False
+    empty = poe.committed_restoration({}, {}, {})
+    assert empty == {"committed_head_restored": False, "committed_files_restored": False}
 
 
 # --------------------------------------------------------------------------

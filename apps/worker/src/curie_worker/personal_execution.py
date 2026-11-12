@@ -13,7 +13,8 @@ started one). ``grant_env`` repeats ``authorize`` and only then reads custody,
 and only when a new runtime is about to be created. The substrate calls it
 inside the owner's launch lease (``PersonalCreate``), after all preparation
 and after the owner's claim inventory, so the grant is never read for a
-create that cannot happen.
+create that cannot happen. The create fence repeats ``authorize`` once more
+after the predecessor teardown, immediately before the create write.
 
 No log line, exception or repr here carries a grant. Refusals carry their
 code only.
@@ -62,6 +63,8 @@ ENROLLMENT_GENERATION_MISMATCH = "enrollment_generation_mismatch"
 #: loop. A timeout is transient (the create is retried), never a refusal.
 LEASE_BRIDGE_TIMEOUT_S = 5.0
 GRANT_BRIDGE_TIMEOUT_S = SECRET_READ_TIMEOUT_S + 10.0
+#: The create fence reads the authority rows and then the lease.
+FENCE_BRIDGE_TIMEOUT_S = 2 * LEASE_BRIDGE_TIMEOUT_S
 #: Margin the owner lease TTL keeps over the claim budget it spans.
 OWNER_LEASE_MARGIN_S = 30.0
 
@@ -289,7 +292,7 @@ class OwnerLaunchGuard:
         )
 
     def fence(self) -> None:
-        self._bridge(self._fence, LEASE_BRIDGE_TIMEOUT_S, timeout_error=OwnerBusy)
+        self._bridge(self._fence, FENCE_BRIDGE_TIMEOUT_S, timeout_error=OwnerBusy)
 
     # -- loop side -------------------------------------------------------------
 
@@ -327,6 +330,10 @@ class OwnerLaunchGuard:
         lease = self._lease
         if self._closed or lease is None:
             raise OwnerBusy()
+        # The same SQL authority check again, after the predecessor teardown
+        # and every other blocking step since the grant read: a disconnect,
+        # an advanced enrollment or a cancellation then creates nothing.
+        await self._launch.authorize()
         try:
             await lease.ensure_owned()
         except LockLeaseLost:

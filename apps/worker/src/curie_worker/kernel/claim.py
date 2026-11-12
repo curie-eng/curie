@@ -1024,10 +1024,7 @@ async def _route_and_start(
     # own (a continuation adopts without claiming, and a claim can adopt a
     # route the snapshot never saw), and a personal request is authorized
     # afresh: the owner rows, the enrollment and this worker's authority.
-    if not provenance_admits(desired_provenance, handle):
-        raise ProvenanceMismatch()
-    if launch is not None:
-        await launch.authorize()
+    await _authorize_turn_start(handle)
     if wait is not None:
         # A capacity wake may meet a different live turn on this thread.
         # Keep its original deadline and retry after that turn finishes;
@@ -1551,6 +1548,21 @@ async def _claim_or_resume(
     finally:
         if guard is not None:
             await guard.close()
+
+
+async def _authorize_turn_start(handle: SandboxHandle) -> None:
+    """Refuse a steer or turn start on a runtime this delivery may not use (#5378).
+
+    The runtime must have booted with this delivery's provenance (none for a
+    service delivery), and a personal request is authorized afresh. Raises
+    ``PersonalLaunchRefused``, which the delivery settles.
+    """
+
+    launch = constants._PERSONAL_LAUNCH.get()
+    if not provenance_admits(None if launch is None else launch.provenance, handle):
+        raise ProvenanceMismatch()
+    if launch is not None:
+        await launch.authorize()
 
 
 async def _adopt(self: Kernel, thread_key: str) -> SandboxHandle | None:

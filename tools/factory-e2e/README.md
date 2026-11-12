@@ -371,6 +371,38 @@ interrupts, and observes. The worker runs from the candidate checkout with
 `FACTORY_MODEL_AUTH_MODE=personal`, the Kubernetes substrate and the production
 custody reader, and holds no model credential.
 
+### Code host and repository workspace
+
+Every WorkItem runs with a real repository workspace against the recorded TLS
+GitHub stub (`tools/github-stub/github_stub.py`), run as `tls_code_host.py`
+runs it and built from its `stub_manifests`: one Pod in the owned namespace on
+the digest-pinned candidate image, a headless Service, and the stub's source
+ConfigMap, which also carries a two-file seed tree and an issue body. The stub
+generates a per-run test CA and seeds a bare `acme-corp/acme-bot` repository;
+only its public certificate leaves the Pod, as the `code-host-ca` ConfigMap.
+The driver creates one stub issue per WorkItem (the refused other principal
+and each interruption pair) and admits each owner WorkItem against that issue,
+the stub's repository id and its installation.
+
+The candidate API and worker are source processes, so they reach the stub
+through a `kubectl port-forward` the driver owns on loopback (the stub's
+certificate names `127.0.0.1`). The API's GitHub API and clone bases point at
+that forward, its App is the stub's App id with a key generated per run that
+reaches only the API process environment, and its repository allowlist is the
+stub repository. Both processes trust the stub CA plus the public roots through
+a private bundle (`SSL_CERT_FILE` for the API, `GIT_SSL_CAINFO` for the
+worker's clone). The worker clones, archives and uploads the checkout as in
+production, and signs the sandbox's one-object read against the object store
+through a relay on the runner API host. The sandbox template gains the chart's
+own `workspace-init` program, read from the candidate's `agent-sandbox.yaml`,
+the chart's default `emptyDir` workspace at `/workspace`, and the chart's
+`codeHostTrust` mount at `/etc/curie/code-host-trust/ca.crt` with
+`CURIE_REPO_CA_BUNDLE`, `GIT_SSL_CAINFO`, `SSL_CERT_FILE` and
+`REQUESTS_CA_BUNDLE` naming it. Publication stays off
+(`CURIE_PUBLICATION_ENABLED=false`); no proof step depends on a pull request.
+After each pair and at the end of the audit, the driver reads the stub's record
+of unsupported calls and fails with the call's method and path if there is one.
+
 ### Inputs and preconditions
 
 Every target comes from flags and the input file. `--input-file` is a private
@@ -433,22 +465,26 @@ every start and fails the rehearsal. Against the real cluster it runs:
 
 1. The candidate image build, its push to the caller's registry under a per-run
    tag, digest pinning, and the revision label and digest check on every pod.
-2. Both owned namespaces, the backing containers, the migration, the candidate
-   API and worker, the agent deploy, the two OIDC principals and the sentinel
+2. Both owned namespaces, the backing containers, the migration, the stub code
+   host with its CA, forward, issues and seeded repository, the candidate API
+   and worker, the agent deploy, the two OIDC principals and the sentinel
    hosted connector (Pod, Service, bearer Secret).
-3. Enrollment through `curie cluster subscription`, the other principal's
+3. For every WorkItem, workspace selection, the worker's clone of the stub
+   repository, the archive upload and the sandbox's `workspace-init` staging.
+4. Enrollment through `curie cluster subscription`, the other principal's
    refused admission, the owner's admission and the worker-driven personal
    claim with its owner labels and `<claim>-tokens` grant delivery.
-4. The three interruptions against fake-model turns: SIGKILL of every process
+5. The three interruptions against fake-model turns: SIGKILL of every process
    in the runner container except the runner, then SIGTERM to the runner, so
    the container restarts in place; deletion of the runner Pod; SIGKILL of the
    worker followed by a restart. It observes the recovered pod, labels, durable
-   history and the uncommitted workspace nonce.
-5. The generation advance while the worker is down and the claim retained, the
+   history, the stub repository's committed state in the workspace and the
+   uncommitted workspace nonce.
+6. The generation advance while the worker is down and the claim retained, the
    refused revalidation, the old generation's custody refusal, teardown after
    the worker restarts, revalidation, the later generations' admissions, the
    disconnect with a waiting request and two worker restarts.
-6. The full finalizer and the absence proof.
+7. The full finalizer and the absence proof.
 
 Only `run` covers: the grant probe, native CLI sessions under the owner's
 grant, the bundle hooks that hold each session at a Read call and at Stop,
@@ -490,13 +526,35 @@ record or a native start without a reservation stops every later start. Only
 records that exactly match the seeded history are excluded from the count.
 Every synthetic or zero-usage record keeps a sanitized error class.
 
+### Workspace checks
+
+Before each interruption the driver writes a random nonce into an untracked
+file in the sandbox's `/workspace` checkout and reads the checkout's `HEAD`,
+the SHA-256 of every tracked file and its porcelain status; after recovery it
+reads them again in the recovered pod. The stub's bare repository is the
+durable source: `main`'s commit and the SHA-256 of each committed blob. For all
+three interruptions `restart` requires `HEAD` and the committed file hashes to
+equal the stub's on both sides, the interrupted runtime to be gone (the native
+process after a container restart, the Pod UID after deletion, the worker
+process after its kill), a fresh native process, and the same owner labels and
+generation on the recovered claim. The process interruption keeps the same Pod
+and its workspace volume, so its uncommitted nonce must survive. The Pod
+recreation stages the checkout again from its durable source, so committed
+state is restored and the uncommitted nonce is absent: that one check is
+recorded Not met citing #5541 (blocked by #5092), and the judge exits 3 when it
+is the only shortfall. The worker interruption records whether the nonce
+survived as information only, since recovery may adopt the retained Pod or
+start a new one. The status before and after is recorded for every pair.
+
 ### Known limits
 
-Restoring uncommitted workspace content after Pod recreation is blocked by
-issue #5092 (ADR 0251 restoration is not wired), so `restart` records the
-nonce's absence and reports it Not met. The durable repository workspace is disabled
-(`CURIE_WORKSPACE_ENABLED=false`) because the proof has no code-host fixture;
-the workspace checks use a nonce under `/tmp`. Recovery is whatever the
-product does on its own (the kernel's transient retry, or the owner-lost
-successor after a worker loss); when no fresh session starts within 150 s, the
-WorkItem is cancelled and the recovery checks record false.
+The workspace volume is the chart's default `emptyDir`, so the run creates no
+PVC; the inventory still records every PVC's bound volume before deletion and
+proves each one absent. The signed workspace read lives 900 s instead of the
+chart's 300 s, so a Pod the controller recreates late in a pair can still stage
+the checkout. Recovery is whatever the product does on its own (the kernel's
+transient retry, or the owner-lost successor after a worker loss); when no
+fresh session starts within 150 s, the WorkItem is cancelled and the recovery
+checks record false. Teardown stops the forward and the object store relay
+before #5377's cleanup and proves the forward's port closed; the stub's Pod,
+Service and ConfigMaps go with the owned namespace.

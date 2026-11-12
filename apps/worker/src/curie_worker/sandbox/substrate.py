@@ -657,9 +657,10 @@ class SandboxSubstrate:
 
         ``personal`` makes this a personal owner's claim (#5378, ADR 0268): a
         live route is reused only when it recorded exactly the same owner
-        provenance, and otherwise (including unknown provenance) it is retired
-        and replaced. Without it a route that booted with a personal grant is
-        never reused either, so no mode crosses.
+        provenance and its claim still binds a ready sandbox, and otherwise
+        (including unknown provenance) it is retired under the owner slot,
+        observed gone, and replaced. Without it a route that booted with a
+        personal grant is never reused either, so no mode crosses.
         """
 
         if (executor_secret_names is not None) != is_executor_thread_key(thread_key):
@@ -681,6 +682,7 @@ class SandboxSubstrate:
                 # route is evicted, so a refusal leaves the thread as it was.
                 preflight = self._preflight_repo_runner(workspace_repo, env, agent_name)
                 record = self._affinity.get(thread_key)
+                predecessors: tuple[SandboxHandle, ...] = ()
                 if record is not None:
                     if record.state is RouteState.SUSPENDED:
                         raise SuspendedThreadError(thread_key)
@@ -702,12 +704,21 @@ class SandboxSubstrate:
                             agent_name=agent_name,
                             desired=preflight,
                         )
+                        # ``adopt`` leaves a stale personal route for this
+                        # create, so a personal reuse applies adopt's test too.
+                        and (
+                            personal is None or (sandbox.ready and self._claim_binds(record.handle))
+                        )
                     ):
                         if fresh_only:
                             raise RouteChangedError(thread_key)
                         self._affinity.touch(thread_key, self._config.route_ttl_seconds)
                         handle = record.handle
                         outcome = "reused"
+                    elif personal is not None:
+                        # #5378: kept, and retired under the owner slot and
+                        # observed gone (claim and sandbox) before the create.
+                        predecessors = (record.handle,)
                     else:
                         # A stopped sandbox, a runner image its repository's
                         # policy no longer names (ADR 0216), or a runtime that
@@ -729,6 +740,7 @@ class SandboxSubstrate:
                         executor_secret_names=executor_secret_names,
                         repo_runner=preflight,
                         personal=personal,
+                        predecessors=predecessors,
                     )
                     outcome = "claimed"
             except Exception as exc:  # noqa: BLE001 - existing broad catch retained
@@ -881,33 +893,29 @@ class SandboxSubstrate:
 
         A ready route that did not record ``provenance`` exactly (#5378; for
         None, one that booted with a personal grant) is not adopted: None, so
-        the caller replaces it through a fresh claim, which retires it.
+        the caller replaces it through a fresh claim, which retires it. A
+        personal request (``provenance`` given) evicts nothing here either:
+        its create retires a stale route under the owner slot and observes it
+        gone first, since a claim deleted here can vanish from the owner's
+        claim inventory while its sandbox still runs.
         """
 
         record = self._affinity.get(thread_key)
         if record is None or record.state is not RouteState.LIVE:
             return None
 
-        claim = self._k8s.get_claim(
-            record.handle.claim_name,
-            request_timeout_seconds=_CONTROL_REQUEST_TIMEOUT_S,
-        )
-        if claim is None or not claim.ready or claim.sandbox_name != record.handle.sandbox_name:
-            self._evict_stale(thread_key, record)
-            return None
-
-        sandbox = self._k8s.get_sandbox(
-            record.handle.sandbox_name,
-            request_timeout_seconds=_CONTROL_REQUEST_TIMEOUT_S,
-        )
-        if sandbox is None or not sandbox.ready or sandbox.operating_mode != "Running":
-            self._evict_stale(thread_key, record)
-            return None
-
+        stale = not self._claim_binds(record.handle)
+        if not stale:
+            sandbox = self._k8s.get_sandbox(
+                record.handle.sandbox_name,
+                request_timeout_seconds=_CONTROL_REQUEST_TIMEOUT_S,
+            )
+            stale = sandbox is None or not sandbox.ready or sandbox.operating_mode != "Running"
         # A runner whose image its repository's entry no longer names is
         # retired, so the caller's fresh claim boots the current one (ADR 0216).
-        if not self._route_matches_runner(record.handle, None):
-            self._evict_stale(thread_key, record)
+        if stale or not self._route_matches_runner(record.handle, None):
+            if provenance is None:
+                self._evict_stale(thread_key, record)
             return None
 
         if not provenance_admits(provenance, record.handle):
@@ -947,19 +955,26 @@ class SandboxSubstrate:
         one native process slot, so ``_claim_fresh`` deletes the retained claim
         and observes it gone before the candidate is created. The route still
         names the old claim until the CAS below.
+
+        Only a runtime of this request's own provenance hands on its session
+        and history (#5378). Any other one (another owner, generation or mode,
+        or unknown provenance) is replaced by a new session identity, as
+        ``claim()`` replaces it.
         """
 
         _refuse_executor_key(thread_key, "handoff")
+        inherits = provenance_admits(None if personal is None else personal.provenance, expected)
         boot = dict(env)
-        boot[SESSION_ENV] = expected.session_id
-        if expected.history_ref is not None:
-            boot[HISTORY_ENV] = expected.history_ref
+        if inherits:
+            boot[SESSION_ENV] = expected.session_id
+            if expected.history_ref is not None:
+                boot[HISTORY_ENV] = expected.history_ref
         candidate = self._claim_fresh(
             thread_key,
             env=boot,
             state=RouteState.LIVE,
-            session_id=expected.session_id,
-            history_ref=expected.history_ref,
+            session_id=expected.session_id if inherits else None,
+            history_ref=expected.history_ref if inherits else None,
             agent_name=agent_name,
             workspace_repo=workspace_repo,
             workspace_materialized_head=workspace_materialized_head,
@@ -1087,6 +1102,15 @@ class SandboxSubstrate:
         An executor route is refused with ``ValueError`` before any route read
         or write: executor routes are never suspended, and a replacement would
         boot from the unstripped pool template (@spec ACTION-EXECUTOR-5).
+
+        #5378: only a suspended runtime of this request's own provenance hands
+        on its session and history; any other one is replaced by a new
+        session. A personal resume deletes nothing before the owner slot: the
+        suspended claim is retired under the owner lease, after the grant
+        read, and observed gone, and its route goes only once the replacement
+        exists. A refusal (``OwnerBusy``, the grant read, authorization)
+        before that teardown leaves the route and the suspended claim as
+        they were, so the thread can still be resumed after revalidation.
         """
 
         _refuse_executor_key(thread_key, "resume")
@@ -1104,28 +1128,31 @@ class SandboxSubstrate:
                 if record is None:
                     raise NoRouteError(thread_key)
                 old = record.handle
+                inherits = provenance_admits(None if personal is None else personal.provenance, old)
                 boot = dict(env) if env else {}
-                boot.setdefault(SESSION_ENV, old.session_id)
+                if inherits:
+                    boot.setdefault(SESSION_ENV, old.session_id)
                 if not boot.get(RUNNER_TOKEN_ENV):
                     boot[RUNNER_TOKEN_ENV] = secrets.token_urlsafe(32)
-                if old.history_ref is not None:
+                if inherits and old.history_ref is not None:
                     boot.setdefault(HISTORY_ENV, old.history_ref)
                 # Every refusal is decided before the suspended claim is retired.
                 resume_repo = workspace_repo or old.workspace_repo
                 runner = self._preflight_repo_runner(resume_repo, boot, agent_name)
 
-                self._retire_claim(
-                    old.claim_name,
-                    request_timeout_seconds=_CONTROL_REQUEST_TIMEOUT_S,
-                    handle=old,
-                )
-                self._affinity.delete_if_claim(thread_key, old.claim_name)
+                if personal is None:
+                    self._retire_claim(
+                        old.claim_name,
+                        request_timeout_seconds=_CONTROL_REQUEST_TIMEOUT_S,
+                        handle=old,
+                    )
+                    self._affinity.delete_if_claim(thread_key, old.claim_name)
                 handle = self._claim_fresh(
                     thread_key,
                     env=boot,
                     state=RouteState.LIVE,
-                    session_id=old.session_id,
-                    history_ref=old.history_ref,
+                    session_id=old.session_id if inherits else None,
+                    history_ref=old.history_ref if inherits else None,
                     agent_name=agent_name,
                     workspace_repo=resume_repo,
                     workspace_materialized_head=(
@@ -1141,6 +1168,7 @@ class SandboxSubstrate:
                     caller_run=caller_run,
                     repo_runner=runner,
                     personal=personal,
+                    predecessors=() if personal is None else (old,),
                 )
             except Exception as exc:  # noqa: BLE001 - existing broad catch retained
                 error = exc
@@ -2097,10 +2125,14 @@ class SandboxSubstrate:
         executor_secret_names: frozenset[str] | None = None,
         repo_runner: RepoRunnerPool | None = None,
         personal: PersonalCreate | None = None,
+        predecessors: tuple[SandboxHandle, ...] = (),
     ) -> SandboxHandle:
         # ``repo_runner`` is a caller's preflight of ``workspace_repo``'s entry,
         # refusals already decided. None recomputes it: a repository without an
-        # entry resolves to None again with no probe.
+        # entry resolves to None again with no probe. ``predecessors`` (a
+        # personal create only) are runtimes of this thread its caller kept
+        # instead of deleting: retired under the owner slot, and their routes
+        # dropped only once this create has bound (#5378).
         config = self._config
         nonce = uuid.uuid4().hex[:6]
         name = config.claim_name_for(thread_key, nonce)
@@ -2114,7 +2146,7 @@ class SandboxSubstrate:
             # #5378, ADR 0268 decision 2: refused before any container call.
             if isinstance(self._k8s, (DockerSandboxClient, StaticPoolSandboxClient)):
                 raise PersonalModeUnsupported()
-            env = {**(env or {}), **self._take_owner_slot(thread_key, personal)}
+            env = {**(env or {}), **self._take_owner_slot(thread_key, personal, predecessors)}
             labels.update(provenance.labels())
 
         # Docker has no warm pools and passes connector secrets directly to
@@ -2151,9 +2183,10 @@ class SandboxSubstrate:
         marked = remembered = created = False
         try:
             if personal is not None:
-                # The owner lease is still this create's after the inventory,
-                # the predecessor's absence and the grant read; a lost one
-                # refuses with no write (``OwnerBusy``).
+                # After the inventory, the grant read, the predecessor's
+                # absence and admission: the request is still authorized and
+                # the owner lease still this create's, or nothing is written
+                # (a refusal, or ``OwnerBusy``).
                 personal.fence()
             if daemon is not None:
                 # Associated before the first object exists, so even a crash
@@ -2270,6 +2303,8 @@ class SandboxSubstrate:
         )
         if not publish:
             return handle
+        for predecessor in predecessors:
+            self._affinity.delete_if_claim(thread_key, predecessor.claim_name)
         record = RouteRecord(handle=handle, state=state)
         for _ in range(3):
             if self._affinity.put_if_absent(thread_key, record, config.route_ttl_seconds):
@@ -2334,16 +2369,23 @@ class SandboxSubstrate:
         )
         raise NoRouteError(f"could not record a route for {thread_key} after repeated races")
 
-    def _take_owner_slot(self, thread_key: str, personal: PersonalCreate) -> Mapping[str, str]:
+    def _take_owner_slot(
+        self,
+        thread_key: str,
+        personal: PersonalCreate,
+        predecessors: tuple[SandboxHandle, ...] = (),
+    ) -> Mapping[str, str]:
         """Make this thread the owner's one native process; return its grant env.
 
         ADR 0268 decision 2 (#5378). Under the owner launch lease: list the
         owner's claims by label; another thread's claim, suspended or not, is
         the owner's live slot (``OwnerBusy``). Then read the grant (a fresh
         authority check after all preparation; a refusal raises before any
-        delete). This thread's own earlier claims are deleted and observed
-        gone, claim and sandbox, before the caller creates the successor.
-        Every request here carries a timeout well inside the lease TTL.
+        delete). This thread's own earlier claims, and the ``predecessors``
+        the caller kept (whose claim the listing may no longer show while its
+        sandbox still runs), are deleted and observed gone, claim and
+        sandbox, before the caller creates the successor. Every request here
+        carries a timeout well inside the lease TTL.
         """
 
         personal.begin()
@@ -2363,25 +2405,32 @@ class SandboxSubstrate:
             logger.info("owner launch for thread %s deferred: the owner holds a claim", thread_key)
             raise OwnerBusy()
         grant_env = dict(personal.grant_env())
-        if views:
-            self._retire_predecessors(thread_key, views)
+        if views or predecessors:
+            self._retire_predecessors(thread_key, views, predecessors)
         return grant_env
 
-    def _retire_predecessors(self, thread_key: str, views: list[ClaimView]) -> None:
+    def _retire_predecessors(
+        self,
+        thread_key: str,
+        views: list[ClaimView],
+        predecessors: tuple[SandboxHandle, ...] = (),
+    ) -> None:
         """Delete this thread's earlier owner claims and observe them gone."""
 
         record = self._affinity.get(thread_key)
-        claim_names = {view.name for view in views}
+        handles = {handle.claim_name: handle for handle in predecessors}
+        if record is not None:
+            handles.setdefault(record.handle.claim_name, record.handle)
+        claim_names = {view.name for view in views} | {h.claim_name for h in predecessors}
         sandbox_names = {view.sandbox_name for view in views if view.sandbox_name}
         for name in sorted(claim_names):
-            routed = record is not None and record.handle.claim_name == name
-            if routed:
-                assert record is not None
-                sandbox_names.add(record.handle.sandbox_name)
+            handle = handles.get(name)
+            if handle is not None:
+                sandbox_names.add(handle.sandbox_name)
             self._retire_claim(
                 name,
                 request_timeout_seconds=_CONTROL_REQUEST_TIMEOUT_S,
-                handle=record.handle if routed and record is not None else None,
+                handle=handle,
             )
         deadline = time.monotonic() + self._config.release_gone_timeout_seconds
         sleeps = _poll_sleeps(self._config)
@@ -2414,6 +2463,14 @@ class SandboxSubstrate:
         if runner is None or not runner.egress or found is None:
             return "public"
         return "repo-" + hashlib.sha256(found[0].encode()).hexdigest()[:16]
+
+    def _claim_binds(self, handle: SandboxHandle) -> bool:
+        """Whether a route's claim still exists, is ready and names its sandbox."""
+
+        claim = self._k8s.get_claim(
+            handle.claim_name, request_timeout_seconds=_CONTROL_REQUEST_TIMEOUT_S
+        )
+        return claim is not None and claim.ready and claim.sandbox_name == handle.sandbox_name
 
     def _evict_stale(self, thread_key: str, record: RouteRecord) -> None:
         """Retire a route whose sandbox is gone: delete its claim (idempotent)

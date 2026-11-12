@@ -23,7 +23,10 @@ Reconnect: every ``initialize`` from the CLI dials a fresh upstream session. An
 upstream that dropped is dialed again on the next request with the CLI's own
 handshake replayed, and a request the connector refused because it no longer
 knows the session is sent once more on the new one, as the CLI does for an HTTP
-server whose session expired.
+server whose session expired. Only that refused request is sent again: the
+connector answered it, so it did not run. Any other request still unanswered
+when the expired session is closed may have run before its answer was lost, so
+it fails back to the CLI with an error and is never sent again.
 
 Bundle servers, and remote connector headers the CLI expands from ``${VAR}``,
 are not runner-materialized and keep their existing delivery.
@@ -517,10 +520,10 @@ class _RelaySession:
                     item.answered.set()
                 elif item.message is None or self._closing:
                     continue
-                elif upstream.expired and not item.retried:
-                    # The connector refused the session; nothing sent on it ran.
-                    self._requeue(item.message)
                 else:
+                    # Sent and never answered, even on a session the connector
+                    # refused for another request: it may have run, so it is
+                    # never sent again.
                     request = item.message.message
                     if isinstance(request, JSONRPCRequest):
                         await self._refuse(request.id)
@@ -573,6 +576,8 @@ class _RelaySession:
                 return
             if pending is not None:
                 if isinstance(message, JSONRPCError) and not pending.retried and _expired(message):
+                    # The connector refused this request without running it:
+                    # only this one is sent again, on a fresh session.
                     upstream.expired = True
                     assert pending.message is not None
                     self._requeue(pending.message)

@@ -16,6 +16,8 @@ Four subcommands share one private SQLite ledger under ``--state-dir``:
 4. ``judge --criterion X`` reads the ledger only and prints a sanitized verdict.
 
 The candidate worker kernel authorizes the owner, reads custody and launches.
+Every WorkItem runs with a real repository workspace cloned from the recorded
+TLS GitHub stub, which runs in the owned namespace as tls_code_host runs it.
 The driver admits through the API's trusted internal admission route, seeds a
 marker record into the durable transcript, interrupts, and observes. ``rehearse``
 and ``run`` re-execute this file as an ``env -i`` child whose environment is an
@@ -36,6 +38,7 @@ import os
 import secrets
 import shutil
 import signal
+import ssl
 import subprocess
 import sys
 import tempfile
@@ -51,13 +54,19 @@ HERE = Path(__file__).resolve().parent
 if str(HERE) not in sys.path:
     sys.path.insert(0, str(HERE))
 
+# factory_e2e registers the tls-code-host scenario at import time by loading
+# tls_code_host itself, so it is imported before tls_code_host; the reverse
+# order re-enters factory_e2e while tls_code_host is half initialized.
+import factory_e2e  # noqa: E402, F401
 import personal_owner_enforcement_support as poe  # noqa: E402
 import personal_profile_support as pps  # noqa: E402
+import tls_code_host as tch  # noqa: E402
 
 REPO_ROOT = HERE.parents[1]
 ENROLLMENT_SUPPORT = (
     REPO_ROOT / "apps" / "worker" / "tests" / "sandbox" / "personal_enrollment_cluster_support.py"
 )
+CHART_SANDBOX = REPO_ROOT / "charts" / "curie" / "templates" / "agent-sandbox.yaml"
 SUBCOMMANDS = ("preflight", "rehearse", "run", "judge")
 CHILD = "_child"
 POLL_SECONDS = 1.0
@@ -69,16 +78,42 @@ SENTINEL_PORT = 8000
 SENTINEL_SECRET_NAME = "acme-sentinel"
 SENTINEL_ENV = "SENTINEL_TOKEN"
 SENTINEL_SERVER_MAP = "acme-sentinel-server"
-REQUIRED_MODULES = ("curie_api", "curie_worker", "curie_runner", "kubernetes", "sqlalchemy")
-# Interruption pairs: kind, tracker issue id, reply conversation. Each pair is
-# its own WorkItem, so its recovery is judged on its own thread.
-PAIRS = (
-    ("process", "11", "1700000000.000311"),
-    ("pod", "12", "1700000000.000312"),
-    ("worker", "13", "1700000000.000313"),
+REQUIRED_MODULES = (
+    "curie_api",
+    "curie_worker",
+    "curie_runner",
+    "kubernetes",
+    "sqlalchemy",
+    "cryptography",
 )
-OTHER_ISSUE = ("10", "1700000000.000310")
+# Interruption pairs: kind and reply conversation. Each pair is its own
+# WorkItem on its own stub issue, so its recovery is judged on its own thread.
+PAIRS = (
+    ("process", "1700000000.000311"),
+    ("pod", "1700000000.000312"),
+    ("worker", "1700000000.000313"),
+)
+OTHER_CONVERSATION = "1700000000.000310"
+# One stub issue per WorkItem: the refused other principal, then each pair.
+ISSUE_ROLES = ("other", "process", "pod", "worker")
 CUSTODY_LABEL = "curietech.ai/personal-custody=true"
+# The recorded TLS GitHub stub (tools/github-stub), as tls_code_host runs it.
+STUB_PORT = tch.STUB_PORT_DEFAULT
+STUB_OBJECTS = (
+    f"pod/{tch.STUB_NAME}",
+    f"service/{tch.STUB_NAME}",
+    f"configmap/{tch.STUB_SOURCE_CONFIG_MAP}",
+    f"configmap/{tch.CA_CONFIG_MAP}",
+)
+SEED_FILES = {
+    "README.md": "# acme-bot\n\nExample repository for the owner enforcement proof.\n",
+    "example.py": 'def example() -> str:\n    return "example"\n',
+}
+SEED_ISSUE = "Owner enforcement proof fixture. Read the brief and reply; change nothing.\n"
+NONCE_FILE = ".proof-nonce"
+# The signed workspace reference outlives one interruption pair, so a Pod the
+# controller recreates can still stage the checkout (the chart default is 300).
+REFERENCE_TTL_SECONDS = 900
 # The finalizer runs these in this order. Each is registered before setup
 # creates anything, in reverse, because the finalizer is LIFO.
 TEARDOWN_ORDER = ("fence", "inventory", "proof-cleanup", "registry", "absence")
@@ -291,16 +326,67 @@ root.mkdir(parents=True, exist_ok=True)
 (root / f"release-{{sys.argv[1]}}").write_text("go")
 print("released")
 """
-NONCE_PROGRAM = f"""\
-import hashlib, pathlib, sys
-path = pathlib.Path({WORK_DIR!r}) / "nonce"
-if len(sys.argv) > 1:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(sys.argv[1])
-try:
-    print(hashlib.sha256(path.read_bytes()).hexdigest())
-except OSError:
-    print("absent")
+# The real repository workspace: HEAD, the SHA-256 of every tracked file, the
+# porcelain status, and the uncommitted nonce (by hash). argv: write <nonce> | read.
+WORKSPACE_PROGRAM = f"""\
+import hashlib, json, os, pathlib, subprocess, sys
+root = pathlib.Path({poe.WORKSPACE_MOUNT!r})
+nonce = root / {NONCE_FILE!r}
+if len(sys.argv) > 2 and sys.argv[1] == "write":
+    nonce.write_text(sys.argv[2])
+env = {{**os.environ, "GIT_OPTIONAL_LOCKS": "0"}}
+git = ["git", "-c", "safe.directory=" + str(root), "-C", str(root)]
+def run(*args):
+    try:
+        return subprocess.run([*git, *args], capture_output=True, env=env, timeout=30)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+state = {{"head": None, "files": {{}}, "status": None, "nonce": "absent"}}
+head = run("rev-parse", "HEAD")
+if head is not None and head.returncode == 0:
+    state["head"] = head.stdout.decode().strip()
+    listed = run("ls-files", "-z")
+    for raw in listed.stdout.split(b"\\0") if listed is not None else []:
+        if raw:
+            try:
+                digest = hashlib.sha256((root / raw.decode()).read_bytes()).hexdigest()
+            except OSError:
+                digest = "unreadable"
+            state["files"][raw.decode()] = digest
+    status = run("status", "--porcelain=v1", "--untracked-files=all")
+    if status is not None and status.returncode == 0:
+        state["status"] = sorted(status.stdout.decode().splitlines())
+if nonce.is_file():
+    state["nonce"] = hashlib.sha256(nonce.read_bytes()).hexdigest()
+print(json.dumps(state))
+"""
+# In the stub Pod: main's commit and the SHA-256 of each committed blob of the
+# stub's bare repository, the durable source a workspace is restored from.
+STUB_TREE_PROGRAM = f"""\
+import hashlib, json, subprocess
+git = ["git", "--git-dir", {tch.STUB_BARE_REPO!r}]
+head = subprocess.check_output([*git, "rev-parse", "refs/heads/main"], timeout=30).decode().strip()
+names = subprocess.check_output([*git, "ls-tree", "-r", "-z", "--name-only", head], timeout=30)
+files = {{}}
+for raw in names.split(b"\\0"):
+    if raw:
+        path = raw.decode()
+        blob = subprocess.check_output([*git, "cat-file", "blob", head + ":" + path], timeout=30)
+        files[path] = hashlib.sha256(blob).hexdigest()
+print(json.dumps({{"head": head, "files": files}}))
+"""
+# The stub Pod's entrypoint: copy the seed tree and issue out of the ConfigMap
+# into a directory the stub's user owns, then become the stub with its flags.
+STUB_BOOT = f"""\
+import os, shutil, sys
+seed, work = {poe.STUB_SEED_DIR!r}, {poe.STUB_WORK_DIR!r}
+os.makedirs(os.path.join(work, "tree"))
+for name in sorted(os.listdir(os.path.join(seed, "tree"))):
+    if not name.startswith("."):
+        shutil.copyfile(os.path.join(seed, "tree", name), os.path.join(work, "tree", name))
+shutil.copyfile(os.path.join(seed, "issue.md"), os.path.join(work, "issue.md"))
+stub = [sys.executable, "/stub/github_stub.py", "serve", *sys.argv[1:]]
+os.execv(sys.executable, stub)
 """
 INTERRUPT_PROGRAM = """\
 import os, signal
@@ -509,6 +595,8 @@ def rbac_checks(namespace: str, grant_namespace: str) -> list[tuple[str, str, st
         "configmaps",
         "services",
         "pods/exec",
+        # The driver's forward to the stub code host.
+        "pods/portforward",
         "persistentvolumeclaims",
         "sandboxtemplates.extensions.agents.x-k8s.io",
         "sandboxwarmpools.extensions.agents.x-k8s.io",
@@ -746,6 +834,17 @@ def owner_proof_class(e: Any) -> type[Any]:  # noqa: C901 - one scenario, one cl
             self.held_scrubbed: set[str] = set()
             self.work_items: dict[str, dict[str, Any]] = {}
             self.fenced = False
+            # The stub code host: its forward, trust bundle, App key, issues
+            # and committed source; the object store relay the sandbox reads.
+            self.app_key = e.HeldSecret("")
+            self.ca_bundle_path: Path | None = None
+            self.forward_port = 0
+            self.forward_process: subprocess.Popen[bytes] | None = None
+            self.forward_restarts = 0
+            self.s3_relay: Any = None
+            self.repository_id = ""
+            self.issues: dict[str, str] = {}
+            self.stub_source: dict[str, Any] = {}
             if self.paid:
                 grant = pps.load_grant(Path(ctx.grant_file))
                 self.grant = e.HeldSecret(grant.reveal())
@@ -758,7 +857,7 @@ def owner_proof_class(e: Any) -> type[Any]:  # noqa: C901 - one scenario, one cl
         # --- private values ---------------------------------------------------
 
         def held(self) -> list[Any]:
-            return [*super().held(), self.sentinel_token]
+            return [*super().held(), self.sentinel_token, self.app_key]
 
         def sync_scrubber(self) -> None:
             for value in self.held_values():
@@ -785,14 +884,42 @@ def owner_proof_class(e: Any) -> type[Any]:  # noqa: C901 - one scenario, one cl
 
         # --- environment of the candidate API and worker ---------------------
 
+        @property
+        def code_host_origin(self) -> str:
+            """The stub through the driver's forward; its certificate names 127.0.0.1."""
+
+            e.require(self.forward_port > 0, "the code host stub is not running")
+            return f"https://127.0.0.1:{self.forward_port}"
+
         def api_env(self) -> dict[str, str]:
-            return {**super().api_env(), "FACTORY_MODEL_AUTH_MODE": "personal"}
+            """The source API on the stub: its GitHub API and clone bases, App and trust.
+
+            The API is a host process, so it trusts the stub's CA (plus the public
+            roots) through ``SSL_CERT_FILE``; ``CURIE_CODE_HOST_CA_BUNDLE`` stays
+            unset so no host path reaches a claim. The sandbox gets the chart's
+            code host trust mount instead (``poe.workspace_template``).
+            """
+
+            e.require(self.ca_bundle_path is not None, "the code host trust bundle is missing")
+            origin = self.code_host_origin
+            return {
+                **super().api_env(),
+                "FACTORY_MODEL_AUTH_MODE": "personal",
+                "GITHUB_API_URL": f"{origin}/api/v3",
+                "GITHUB_CLONE_BASE": origin,
+                "GITHUB_APP_ID": tch.STUB_APP_ID,
+                "GITHUB_APP_PRIVATE_KEY": self.app_key.reveal(),
+                "GITHUB_REPO_ALLOWLIST": json.dumps([tch.STUB_REPO]),
+                "SSL_CERT_FILE": str(self.ca_bundle_path),
+            }
 
         def worker_env(self) -> dict[str, str]:
             env = {
                 **super().worker_env(),
                 "FACTORY_MODEL_AUTH_MODE": "personal",
-                "CURIE_WORKSPACE_ENABLED": "false",
+                "CURIE_WORKSPACE_ENABLED": "true",
+                "CURIE_WORKSPACE_SCRATCH_ROOT": str(Path(self.private_dir) / "workspaces"),
+                "CURIE_WORKSPACE_REFERENCE_TTL_SECONDS": str(REFERENCE_TTL_SECONDS),
                 "CURIE_PUBLICATION_ENABLED": "false",
                 "CURIE_WORK_ITEM_MAX_TURNS": str(poe.SESSION_TURNS),
                 "DEFAULT_MAX_OUTPUT_TOKENS_PER_RUN": str(poe.SESSION_OUTPUT_TOKENS),
@@ -800,6 +927,14 @@ def owner_proof_class(e: Any) -> type[Any]:  # noqa: C901 - one scenario, one cl
                 "CURIE_RELEASE": self.release,
                 "CURIE_RUNNER_TOTAL_TIMEOUT_S": str(poe.SESSION_SECONDS),
             }
+            if self.ca_bundle_path is not None:
+                # The worker clones the stub itself; git reads this, the scrubbed
+                # clone environment keeps it.
+                env["GIT_SSL_CAINFO"] = str(self.ca_bundle_path)
+            if self.s3_relay is not None:
+                # The worker signs workspace reads against this endpoint, so the
+                # sandbox's workspace-init can redeem them through the relay.
+                env["S3_ENDPOINT_URL"] = f"http://{self.runner_host}:{self.s3_relay.port}"
             if not self.paid:
                 env["CURIE_FAKE_MODEL"] = "1"
             return env
@@ -903,6 +1038,286 @@ def owner_proof_class(e: Any) -> type[Any]:  # noqa: C901 - one scenario, one cl
                 {"data": {"files.json": json.dumps(self.bundle())}},
                 _request_timeout=30,
             )
+            # Before the API starts: its GitHub bases name the stub's forward.
+            self.start_code_host()
+
+        def extension(self, plural: str, kind: str, name: str, spec: Mapping[str, Any]) -> None:
+            """The source template gains the chart's workspace and code host trust."""
+
+            if plural == "sandboxtemplates" and name == "custody-source":
+                try:
+                    program = poe.chart_workspace_init(
+                        CHART_SANDBOX.read_text(), poe.CHART_WORKSPACE_VALUES
+                    )
+                    spec = poe.workspace_template(
+                        spec, program=program, ca_config_map=tch.CA_CONFIG_MAP, ca_key=tch.CA_KEY
+                    )
+                except (OSError, ValueError) as failure:
+                    raise poe.StepFailed(f"workspace template: {failure}") from None
+            super().extension(plural, kind, name, spec)
+
+        def start_backing_services(self) -> None:
+            super().start_backing_services()
+            # The object store binds loopback; the sandbox redeems its signed
+            # workspace read through this relay on the caller's runner API host.
+            self.s3_relay = e.TcpRelay(self.runner_host, self.ports["s3"])
+
+        # --- the code host: the recorded TLS GitHub stub ------------------------
+
+        def stub_exec(self, *argv: str, timeout: float = 60) -> tuple[int, bytes]:
+            result = self.command(
+                poe.kubectl_argv(
+                    self.context,
+                    self.namespace,
+                    "exec",
+                    tch.STUB_NAME,
+                    "--container",
+                    tch.STUB_NAME,
+                    "--",
+                    *argv,
+                ),
+                timeout=timeout,
+                check=False,
+            )
+            return result.returncode, result.stdout
+
+        def stub_api(self, method: str, path: str, body: Any = None) -> tuple[int, Any]:
+            """One REST call inside the stub Pod, verified against its CA (tls_code_host's)."""
+
+            code, raw = self.stub_exec(
+                "python3",
+                "-c",
+                tch._STUB_CLIENT,
+                method,
+                path,
+                json.dumps(body) if body is not None else "",
+                str(STUB_PORT),
+            )
+            try:
+                reply = json.loads(raw.decode().strip().splitlines()[-1]) if code == 0 else {}
+            except (ValueError, IndexError):
+                reply = {}
+            return int(reply.get("status") or 0), reply.get("body")
+
+        def stub_tree(self) -> dict[str, Any]:
+            code, raw = self.stub_exec("python3", "-c", STUB_TREE_PROGRAM)
+            try:
+                found = json.loads(raw) if code == 0 else {}
+            except ValueError:
+                found = {}
+            return found if isinstance(found, dict) else {}
+
+        def start_code_host(self) -> None:
+            """The stub Pod, its seeded repository and issues, its CA, the App key, the forward.
+
+            One Pod in the owned namespace on the digest-pinned candidate image,
+            as tls_code_host runs it. Only the public CA leaves the Pod, as the
+            ``code-host-ca`` ConfigMap the template mounts; the App key is made
+            here and reaches only the API process environment.
+            """
+
+            from cryptography.hazmat.primitives import serialization
+            from cryptography.hazmat.primitives.asymmetric import rsa
+
+            manifests = poe.code_host_manifests(
+                tch.stub_manifests(self.namespace, self.image, STUB_PORT),
+                image=self.image,
+                port=STUB_PORT,
+                seed_files=SEED_FILES,
+                issue_body=SEED_ISSUE,
+                boot=STUB_BOOT,
+                labels={"curie-proof-owner": self.ownership},
+            )
+            create = {
+                "ConfigMap": self.core.create_namespaced_config_map,
+                "Pod": self.core.create_namespaced_pod,
+                "Service": self.core.create_namespaced_service,
+            }
+            for manifest in manifests:
+                create[manifest["kind"]](self.namespace, manifest, _request_timeout=30)
+            try:
+                # Ready once it listens; its image is asserted to be the candidate digest.
+                self.wait_pod(f"{tch.STUB_COMPONENT_LABEL}={tch.STUB_NAME}")
+            except RuntimeError:
+                raise poe.StepFailed("the code host stub Pod never became ready") from None
+
+            def started() -> dict[str, str] | None:
+                logs = self.command(
+                    poe.kubectl_argv(
+                        self.context, self.namespace, "logs", tch.STUB_NAME, "-c", tch.STUB_NAME
+                    ),
+                    check=False,
+                ).stdout.decode(errors="replace")
+                with contextlib.suppress(Exception):
+                    return tch.parse_stub_startup(logs)
+                return None
+
+            startup = e.wait_until(
+                started, timeout=120, interval=1, failure="the code host stub never started"
+            )
+            e.require(
+                startup["base_url"] == f"https://{tch.stub_host(self.namespace)}:{STUB_PORT}",
+                "the code host stub advertises an unexpected origin",
+            )
+            status, repository = self.stub_api("GET", f"/repos/{tch.STUB_REPO}")
+            e.require(
+                status == 200 and isinstance(repository, dict),
+                "the code host stub did not serve its repository",
+            )
+            self.repository_id = str(repository["id"])
+            for role in ISSUE_ROLES:
+                status, issue = self.stub_api(
+                    "POST",
+                    f"/repos/{tch.STUB_REPO}/issues",
+                    {"title": f"Owner enforcement proof: {role}", "body": SEED_ISSUE},
+                )
+                e.require(
+                    status == 201 and isinstance(issue, dict), "the code host stub refused an issue"
+                )
+                self.issues[role] = str(issue["number"])
+            self.stub_source = self.stub_tree()
+            e.require(
+                bool(self.stub_source.get("head")) and bool(self.stub_source.get("files")),
+                "the code host stub's repository has no committed tree",
+            )
+            self.observe(
+                "restart",
+                "code_host.source",
+                {"head": self.stub_source["head"], "files": sorted(self.stub_source["files"])},
+            )
+            code, ca = self.stub_exec("cat", tch.STUB_CA_FILE)
+            e.require(
+                code == 0 and b"CERTIFICATE" in ca and b"PRIVATE" not in ca,
+                "the stub CA is not one public certificate",
+            )
+            code, roots = self.stub_exec("cat", tch.SYSTEM_ROOTS)
+            e.require(code == 0 and b"CERTIFICATE" in roots, "the image's public roots are missing")
+            # Stub CA first, then the public roots: this becomes the sandbox's
+            # whole SSL_CERT_FILE store, as the chart's codeHostTrust bundle does.
+            bundle = ca.rstrip(b"\n") + b"\n" + roots
+            path = Path(self.private_dir) / "code-host-ca.crt"
+            fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY | os.O_NOFOLLOW, 0o600)
+            with os.fdopen(fd, "wb") as stream:
+                stream.write(bundle)
+            self.ca_bundle_path = path
+            self.core.create_namespaced_config_map(
+                self.namespace,
+                {
+                    "apiVersion": "v1",
+                    "kind": "ConfigMap",
+                    "metadata": {
+                        "name": tch.CA_CONFIG_MAP,
+                        "labels": {"curie-proof-owner": self.ownership},
+                    },
+                    "data": {tch.CA_KEY: bundle.decode()},
+                },
+                _request_timeout=30,
+            )
+            # The stub checks no App JWT; any RSA key signs one. Per run, held.
+            key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+            self.app_key = e.HeldSecret(
+                key.private_bytes(
+                    serialization.Encoding.PEM,
+                    serialization.PrivateFormat.PKCS8,
+                    serialization.NoEncryption(),
+                ).decode()
+            )
+            del key
+            self.sync_scrubber()
+            (Path(self.private_dir) / "workspaces").mkdir(mode=0o700)
+            self.forward_port = e.free_local_port()
+            self.ensure_forward()
+            self.evidence["code_host"] = {
+                "stub": "tools/github-stub (recorded, TLS)",
+                "image": "candidate digest",
+                "trust": "codeHostTrust ConfigMap mount; host processes via SSL_CERT_FILE",
+            }
+
+        def forward_ready(self) -> bool | None:
+            """A TLS read of the stub's repository through the forward, verified."""
+
+            if self.ca_bundle_path is None:
+                return None
+            context = ssl.create_default_context(cafile=str(self.ca_bundle_path))
+            connection = http.client.HTTPSConnection(
+                "127.0.0.1", self.forward_port, context=context, timeout=10
+            )
+            try:
+                connection.request(
+                    "GET",
+                    f"/api/v3/repos/{tch.STUB_REPO}",
+                    headers={"Accept": "application/vnd.github+json"},
+                )
+                status = connection.getresponse().status
+            except (OSError, http.client.HTTPException):
+                return None
+            finally:
+                connection.close()
+            return True if status == 200 else None
+
+        def ensure_forward(self) -> None:
+            """The driver-owned forward to the stub Pod, restarted on the same port if it died."""
+
+            process = self.forward_process
+            if process is not None and process.poll() is None and self.forward_ready():
+                return
+            if process is not None:
+                self.stop_process(process)
+                self.forward_restarts += 1
+                self.observe("restart", "code_host.forward_restarts", self.forward_restarts)
+            self.forward_process = self.spawn(
+                "code-host-forward",
+                poe.kubectl_argv(
+                    self.context,
+                    self.namespace,
+                    "port-forward",
+                    "--address",
+                    "127.0.0.1",
+                    f"pod/{tch.STUB_NAME}",
+                    f"{self.forward_port}:{STUB_PORT}",
+                ),
+                self.env,
+            )
+            e.wait_until(
+                self.forward_ready,
+                timeout=60,
+                interval=0.5,
+                failure="the code host forward never served the stub over TLS",
+            )
+
+        def check_stub(self) -> None:
+            """The stub answered every call; an unsupported one stops it, so name it."""
+
+            code, raw = self.stub_exec("python3", "-c", tch._STUB_UNSUPPORTED)
+            try:
+                refused = json.loads(raw) if code == 0 else None
+            except ValueError:
+                refused = None
+            if not isinstance(refused, list):
+                logs = self.command(
+                    poe.kubectl_argv(
+                        self.context, self.namespace, "logs", tch.STUB_NAME, "-c", tch.STUB_NAME
+                    ),
+                    check=False,
+                ).stdout.decode(errors="replace")
+                refused = tch._UNSUPPORTED_LINE.findall(logs) or ["no answer from the stub"]
+            self.observe("restart", "code_host.unsupported_requests", refused)
+            if refused:
+                raise poe.StepFailed(f"the code host stub refused {refused[0]}")
+
+        def workspace_state(self, pod: str, *, nonce: str | None = None) -> dict[str, Any]:
+            """HEAD, tracked file hashes, status and nonce hash of the real workspace."""
+
+            code, raw = self.pod_exec(
+                pod, WORKSPACE_PROGRAM, *(("write", nonce) if nonce else ("read",)), timeout=60
+            )
+            try:
+                state = json.loads(raw) if code == 0 else None
+            except ValueError:
+                state = None
+            if not isinstance(state, dict):
+                return {"head": None, "files": {}, "status": None, "nonce": "unreadable"}
+            return state
 
         def bundle(self) -> dict[str, str]:
             files = dict(cluster.bundle_files())
@@ -1160,6 +1575,10 @@ def owner_proof_class(e: Any) -> type[Any]:  # noqa: C901 - one scenario, one cl
             principal: str = "owner",
         ) -> tuple[int, dict[str, Any]]:
             request_id = uuid.uuid4()
+            # The stub's own identities: the API's GitHub host is the forward's
+            # authority, the repository id scopes the issue, and 5501 is the
+            # only installation the stub mints tokens for.
+            host = self.code_host_origin.removeprefix("https://")
             status, body = self.api(
                 "POST",
                 "/v1/internal/work-items/admissions",
@@ -1170,17 +1589,17 @@ def owner_proof_class(e: Any) -> type[Any]:  # noqa: C901 - one scenario, one cl
                     "reply_conversation_id": conversation,
                     "tracker": {
                         "kind": "github",
-                        "host": "github.com",
-                        "scope_id": "1000001",
+                        "host": host,
+                        "scope_id": self.repository_id,
                         "issue_id": issue,
                     },
                     "repository": {
                         "code_host_kind": "github",
-                        "host": "github.com",
-                        "project_id": "1000001",
-                        "path": e.REPOSITORY,
+                        "host": host,
+                        "project_id": self.repository_id,
+                        "path": tch.STUB_REPO,
                     },
-                    "code_host_installation_id": 202,
+                    "code_host_installation_id": tch.STUB_INSTALLATION_ID,
                     "objective": objective,
                     "requester": e.REQUESTER,
                     "request_id": str(request_id),
@@ -1610,9 +2029,28 @@ def owner_proof_class(e: Any) -> type[Any]:  # noqa: C901 - one scenario, one cl
                 return None
             return [str(item) for item in found] if isinstance(found, list) else None
 
-        def nonce(self, pod: str, value: str | None = None) -> str:
-            code, raw = self.pod_exec(pod, NONCE_PROGRAM, *([value] if value else []))
-            return raw.decode().strip() if code == 0 else "unreadable"
+        def live_clis(self) -> set[str]:
+            return {
+                f"{state['uid']}:{cli['pid']}:{cli['start']}"
+                for state in self.pod_states.values()
+                for cli in state.get("clis", [])
+            }
+
+        def old_runtime_gone(
+            self, kind: str, a: Track, b: Track | None, facts: Mapping[str, Any]
+        ) -> bool:
+            """The interrupted runtime no longer exists: process, Pod or worker."""
+
+            if kind == "process":
+                # A container restart ends every process in it, the native CLI included.
+                return (
+                    b is not None
+                    and b.restart_count > a.restart_count
+                    and (not self.paid or a.cli not in self.live_clis())
+                )
+            if kind == "pod":
+                return a.pod_uid not in {pod["metadata"]["uid"] for pod in self.runner_pods()}
+            return bool(facts.get("old_worker_exited"))
 
         # --- the live window and the grant probe -------------------------------
 
@@ -1682,7 +2120,9 @@ def owner_proof_class(e: Any) -> type[Any]:  # noqa: C901 - one scenario, one cl
             self.headers_seen["enrolled"] = self.write(
                 "enroll", token=self.valid_token, previous=None
             )
-            status, body = self.admit_item(*OTHER_ISSUE, self.objective(), 1, principal="other")
+            status, body = self.admit_item(
+                self.issues["other"], OTHER_CONVERSATION, self.objective(), 1, principal="other"
+            )
             self.observe(
                 "selection",
                 "other_principal.admission_code",
@@ -1702,6 +2142,8 @@ def owner_proof_class(e: Any) -> type[Any]:  # noqa: C901 - one scenario, one cl
             self, issue: str, conversation: str, objective: str, generation: int
         ) -> dict[str, Any]:
             self.stop_worker()
+            # The worker clones through the forward when this WorkItem starts.
+            self.ensure_forward()
             status, body = self.admit_item(issue, conversation, objective, generation)
             e.require(status == 200, f"owner admission was refused: {self.code_of(body)}")
             item = dict(body["work_item"])
@@ -1801,11 +2243,14 @@ def owner_proof_class(e: Any) -> type[Any]:  # noqa: C901 - one scenario, one cl
                 return {"kind": kind}
             before = self.kill_worker()
             e.require(before is not None, "the candidate worker is not running")
+            # SIGKILL was reaped above; the old worker's PID is gone before the new one starts.
+            exited = before is not None and not Path(f"/proc/{before}").exists()
             self.start_worker()
             restarted: Any = vars(self).get("worker_process")
             return {
                 "kind": kind,
                 "worker_restarted": restarted is not None and restarted.pid != before,
+                "old_worker_exited": exited,
             }
 
         def kill_worker(self) -> int | None:
@@ -1821,32 +2266,48 @@ def owner_proof_class(e: Any) -> type[Any]:  # noqa: C901 - one scenario, one cl
             state["worker_process"] = None
             return pid
 
-        def pair(self, kind: str, issue: str, conversation: str) -> None:
-            """One interruption and its automatic recovery on its own WorkItem."""
+        def pair(self, kind: str, conversation: str) -> None:
+            """One interruption and its automatic recovery on its own WorkItem and stub issue.
+
+            The workspace is the real repository checkout the worker cloned from
+            the stub. Before the interruption the driver writes an uncommitted
+            nonce into it and reads HEAD, every tracked file's hash and the
+            status; after recovery it reads them again. Committed state must match
+            the stub repository on both sides for every kind.
+            """
 
             a_slot, b_slot = f"{kind}-interrupted", f"{kind}-recovered"
-            item = self.admit_owner(issue, conversation, self.objective(), 1)
+            item = self.admit_owner(self.issues[kind], conversation, self.objective(), 1)
             thread = str(item["conversation_id"])
             self.seed_history(thread)
             self.reserve(a_slot)
             self.start_worker()
             a = self.boundary(a_slot, "read")
-            e.require(a is not None, f"{kind}: the first session never reached its boundary")
-            assert a is not None
+            if a is None:
+                self.check_stub()
+                raise poe.StepFailed(f"{kind}: the first session never reached its boundary")
             if kind == "process":
                 self.observe_selection(a, item)
             ids_before = self.durable_ids(thread)
-            nonce_hash = self.nonce(a.pod, secrets.token_hex(16))
+            before = self.workspace_state(a.pod, nonce=secrets.token_hex(16))
             self.capture_pod(a.pod)
             _data, usage = self.harvest(a)
             self.settle(a, usage)
             self.reserve(b_slot)
             facts = self.interrupt(kind, a)
             b = self.boundary(b_slot, "read", exclude=[a.cli])
-            restart: dict[str, Any] = {"automatic_recovery": b is not None}
+            restart: dict[str, Any] = {
+                "automatic_recovery": b is not None,
+                "old_runtime_gone": self.old_runtime_gone(kind, a, b, facts),
+                "git_status_before": before.get("status"),
+            }
             if b is not None:
                 b_data, _ = self.harvest(b)
                 loaded = self.history_in_pod(b.pod)
+                after = self.workspace_state(b.pod)
+                restored = before.get("nonce") not in {"absent", "unreadable", None} and (
+                    after.get("nonce") == before.get("nonce")
+                )
                 restart.update(
                     {
                         "owner_labels_match": self.owner_labels_match(b.claim, 1),
@@ -1857,37 +2318,45 @@ def owner_proof_class(e: Any) -> type[Any]:  # noqa: C901 - one scenario, one cl
                         if self.paid
                         else loaded is not None and loaded == ids_before,
                         "fresh_native_process": b.cli != a.cli,
+                        **poe.committed_restoration(self.stub_source, before, after),
+                        "git_status_after": after.get("status"),
                     }
                 )
-                restored = self.nonce(b.pod)
                 if kind == "process":
                     restart.update(
                         {
                             "same_pod": b.pod_uid == a.pod_uid,
                             "container_restarted": b.restart_count == a.restart_count + 1,
-                            "workspace_nonce_restored": restored == nonce_hash,
+                            "workspace_nonce_restored": restored,
                         }
                     )
                 elif kind == "pod":
                     restart.update(
                         {
                             "new_pod": b.pod_uid != a.pod_uid,
-                            "workspace_nonce_restored": restored == nonce_hash,
-                            "workspace_nonce_after_recreation": restored,
+                            "workspace_nonce_restored": restored,
+                            "workspace_nonce_after_recreation": (
+                                "present" if restored else after.get("nonce")
+                            ),
                         }
                     )
                 else:
                     restart["worker_restarted"] = bool(facts.get("worker_restarted"))
+                    # Whether recovery adopted the retained Pod; informational only.
+                    restart["workspace_nonce_retained_informational"] = restored
             for key, value in restart.items():
                 self.observe("restart", f"{kind}.{key}", value)
-            if b is None:
-                self.abandon(str(item["id"]))
-                return
             if kind == "worker":
+                # The generation advance runs even without a recovered session, so
+                # the later phases keep their generations; the retained-claim
+                # checks are then missing and the fencing judge fails on them.
                 self.fence_retained(b, item)
-                return
-            self.finish_session(b)
-            self.settled_runtime(str(item["id"]))
+            elif b is None:
+                self.abandon(str(item["id"]))
+            else:
+                self.finish_session(b)
+                self.settled_runtime(str(item["id"]))
+            self.check_stub()
 
         def finish_session(self, track: Track) -> bytes | None:
             """Release the read hold, harvest at the Stop hold, settle, release it."""
@@ -1943,13 +2412,14 @@ def owner_proof_class(e: Any) -> type[Any]:  # noqa: C901 - one scenario, one cl
                 timeout=120,
             )
 
-        def fence_retained(self, track: Track, item: Mapping[str, Any]) -> None:
+        def fence_retained(self, track: Track | None, item: Mapping[str, Any]) -> None:
             """Advance the generation while the worker is down and the g1 claim is retained."""
 
             work_item_id = str(item["id"])
-            data, usage = self.harvest(track)
-            self.settle(track, usage)
-            self.capture_pod(track.pod)
+            if track is not None:
+                _data, usage = self.harvest(track)
+                self.settle(track, usage)
+                self.capture_pod(track.pod)
             self.kill_worker()
             self.headers_seen["replaced"] = self.write(
                 "replace",
@@ -1987,29 +2457,29 @@ def owner_proof_class(e: Any) -> type[Any]:  # noqa: C901 - one scenario, one cl
                 )
 
             row = self.wait_soft(confirmed, timeout=150)
-            track.closed = True
             from curie_worker.sandbox.claim_tokens import claim_object_names
 
             self.observe("fencing", "retained.teardown_confirmed", row is not None)
-            self.observe(
-                "fencing", "retained.claim_absent", self.absent("sandboxclaims", track.claim)
-            )
-            self.observe(
-                "fencing",
-                "retained.tokens_secret_absent",
-                self.secret_absent(self.namespace, claim_object_names(track.claim).secret),
-            )
+            if track is not None:
+                track.closed = True
+                self.observe(
+                    "fencing", "retained.claim_absent", self.absent("sandboxclaims", track.claim)
+                )
+                self.observe(
+                    "fencing",
+                    "retained.tokens_secret_absent",
+                    self.secret_absent(self.namespace, claim_object_names(track.claim).secret),
+                )
             self.observe(
                 "fencing", "retained.native_sessions_after_restart", len(set(self.native) - known)
             )
             status, generation, _code = self.revalidate_item(work_item_id)
             self.observe("fencing", "revalidated.generation", generation if status == 200 else None)
-            del data
 
         def rejected(self) -> None:
             """Generation 2 holds a deliberately invalid grant: the provider refuses it."""
 
-            issue, conversation = PAIRS[2][1], PAIRS[2][2]
+            issue, conversation = self.issues["worker"], PAIRS[2][1]
             work_item_id = str(self.work_items[issue]["id"])
             thread = str(self.work_items[issue]["conversation_id"])
             ids_before = self.durable_ids(thread)
@@ -2097,7 +2567,7 @@ def owner_proof_class(e: Any) -> type[Any]:  # noqa: C901 - one scenario, one cl
         def revalidated(self) -> None:
             """Replace with the valid grant, confirm teardown, revalidate, fresh process."""
 
-            issue, conversation = PAIRS[2][1], PAIRS[2][2]
+            issue, conversation = self.issues["worker"], PAIRS[2][1]
             work_item_id = str(self.work_items[issue]["id"])
             self.headers_seen["restored"] = self.write(
                 "replace", token=self.valid_token, previous=self.headers_seen["replaced"]
@@ -2194,7 +2664,7 @@ def owner_proof_class(e: Any) -> type[Any]:  # noqa: C901 - one scenario, one cl
         def disconnect(self) -> None:
             """Disconnect with a waiting request; two worker restarts start nothing."""
 
-            issue, conversation = PAIRS[2][1], PAIRS[2][2]
+            issue, conversation = self.issues["worker"], PAIRS[2][1]
             work_item_id = str(self.work_items[issue]["id"])
             self.thread_key = str(self.work_items[issue]["conversation_id"])
             waiting = self.admit_owner(issue, conversation, self.objective(), 3)
@@ -2323,6 +2793,7 @@ def owner_proof_class(e: Any) -> type[Any]:  # noqa: C901 - one scenario, one cl
                 "audit.header_in_captures",
                 any(e.leaks(capture, header) for capture in self.captures),
             )
+            self.check_stub()
 
         # --- foreign resources, inventory, teardown ---------------------------
 
@@ -2403,6 +2874,21 @@ def owner_proof_class(e: Any) -> type[Any]:  # noqa: C901 - one scenario, one cl
         def proof_cleanup_step(self) -> None:
             self.cleanup()
 
+        def cleanup(self) -> None:
+            """Stop the code host forward and close the object store relay, then #5377's cleanup.
+
+            The stub Pod, Service and ConfigMaps go with the owned namespace; the
+            trust bundle and the worker's clone scratch go with the private
+            directory; the App key is cleared with every other held value.
+            """
+
+            if self.forward_process is not None:
+                with contextlib.suppress(Exception):
+                    self.stop_process(self.forward_process)
+            if self.s3_relay is not None:
+                self.s3_relay.close()
+            super().cleanup()
+
         def registry_step(self) -> None:
             port = self.ctx.flags.registry_port
             for repository, digest in self.pushed:
@@ -2434,6 +2920,12 @@ def owner_proof_class(e: Any) -> type[Any]:  # noqa: C901 - one scenario, one cl
             # Namespaced objects cannot outlive their namespaces.
             for owned in ("claims", "pods", "grant_copies", "pvcs"):
                 ledger.record_cleanup(owned, "namespaced", "absent" if both else "present", "", now)
+            # The stub's Pod, Service and ConfigMaps (source, seed, CA) live in
+            # the owned namespace; the App key was never a cluster object.
+            for name in STUB_OBJECTS:
+                ledger.record_cleanup(
+                    "code_host", name, "absent" if gone["namespace"] else "present", "", now
+                )
             for name in sorted(self.pvs):
                 ok = kube_absent(self.context, "persistentvolume", name)
                 ledger.record_cleanup("pvs", name, "absent" if ok else "present", "", now)
@@ -2447,14 +2939,23 @@ def owner_proof_class(e: Any) -> type[Any]:  # noqa: C901 - one scenario, one cl
             ledger.record_cleanup(
                 "processes", "source", "absent" if not running else "present", "", now
             )
-            relay = self.relay is None or not self.relay.alive
-            ledger.record_cleanup(
-                "port_forwards",
-                "relay+forwards",
-                "absent" if relay and not running else "present",
-                "",
-                now,
-            )
+            forward_closed = not self.forward_port or not e.tcp_open("127.0.0.1", self.forward_port)
+            forwards = {
+                "api-relay": self.relay is None or not self.relay.alive,
+                "object-store-relay": self.s3_relay is None or not self.s3_relay.alive,
+                "code-host-forward": (
+                    self.forward_process is None or self.forward_process.poll() is not None
+                )
+                and forward_closed,
+            }
+            for name, closed in forwards.items():
+                ledger.record_cleanup(
+                    "port_forwards",
+                    name,
+                    "absent" if closed and not running else "present",
+                    "",
+                    now,
+                )
             problems = (self.evidence.get("cleanup") or {}).get("problems") or []
             ledger.record_cleanup(
                 "containers",

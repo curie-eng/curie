@@ -249,6 +249,8 @@ async def _continue_unpublished(
                 left, rebound = self._bound_requester_turn(handle, left)
                 window_bound = window_bound or rebound
                 if attachment_turn is None:
+                    # #5378: the continuation opens a turn too.
+                    await claim._authorize_turn_start(handle)
                     turn = await self._runner.start_turn(
                         handle.base_url, event, token=handle.token or None, remaining_s=left
                     )
@@ -264,6 +266,7 @@ async def _continue_unpublished(
                         event = await attachment_access.with_attachment_access(
                             self, event, handle, left, turn=attachment_turn
                         )
+                        await claim._authorize_turn_start(handle)
                         turn = await self._runner.start_turn(
                             handle.base_url, event, token=handle.token or None, remaining_s=left
                         )

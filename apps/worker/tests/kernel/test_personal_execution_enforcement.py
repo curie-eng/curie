@@ -19,6 +19,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import contextlib
+import functools
 import logging
 import os
 import secrets
@@ -344,11 +345,14 @@ class _OwnerK8s(FakeK8s):
     after the next owner inventory read has been answered.
     ``after_termination_read`` runs once, with the sandbox name, right after
     the next pod termination read for a dropped stream has been answered.
+    ``after_claim_delete`` runs once, on the substrate's worker thread, right
+    after the next claim delete has been answered.
     """
 
     creates: list[tuple[str, dict[str, str]]] = field(default_factory=list)
     after_owner_listing: Callable[[], None] | None = None
     after_termination_read: Callable[[str], None] | None = None
+    after_claim_delete: Callable[[], None] | None = None
 
     def create_claim(self, *args: Any, **kwargs: Any) -> None:
         self.creates.append((str(args[0]), dict(kwargs.get("labels") or {})))
@@ -365,6 +369,12 @@ class _OwnerK8s(FakeK8s):
             if hook is not None:
                 hook()
         return views
+
+    def delete_claim(self, name: str, *, request_timeout_seconds: float) -> None:
+        super().delete_claim(name, request_timeout_seconds=request_timeout_seconds)
+        hook, self.after_claim_delete = self.after_claim_delete, None
+        if hook is not None:
+            hook()
 
     def pod_termination(
         self, name: str, *, request_timeout_seconds: float, since: datetime
@@ -1011,6 +1021,73 @@ def test_the_credential_capping_handoff_after_start_is_authorized_against_the_li
     asyncio.run(exercise())
 
 
+@pytest.mark.parametrize(
+    ("fence", "code", "cause"),
+    [
+        pytest.param(None, None, None, id="authorized"),
+        pytest.param(
+            _deactivate_enrollment,
+            "enrollment_inactive",
+            "authentication_required",
+            id="disconnected",
+        ),
+        pytest.param(
+            _advance_enrollment,
+            "enrollment_generation_mismatch",
+            "authentication_required",
+            id="advanced",
+        ),
+        pytest.param(
+            _cancel_work_item, "execution_authority_lost", "runner_escalated", id="cancelled"
+        ),
+    ],
+)
+def test_a_fence_during_predecessor_teardown_refuses_the_successor_create(
+    make_harness, monkeypatch, fence: _Change | None, code: str | None, cause: str | None
+) -> None:
+    """The credential-capping handoff after the API start reads the grant under
+    the owner lease, then retires its predecessor and waits for it to go. A
+    disconnect, an advanced enrollment or a cancellation that lands during
+    that teardown is caught by the create fence's fresh authority check: no
+    successor claim, so no ``<claim>-tokens`` Secret either (only a claim
+    create writes one), and the started run settles as a refused personal
+    execution. Authorized, the successor is created as before."""
+
+    async def exercise() -> None:
+        async with _seeded_owner() as owner:
+            k8s = _OwnerK8s()
+            key = base64.b64encode(secrets.token_bytes(32)).decode()
+            async with _harness(make_harness, owner, k8s, monkeypatch, caller_key=key) as h:
+                work_items = _enforce(h, owner)
+                request_id = await owner.request()
+                if fence is not None:
+                    k8s.after_claim_delete = _bridge(
+                        asyncio.get_running_loop(), fence(owner, request_id)
+                    )
+
+                await h.kernel.process_event(_execute(request_id))
+
+                created = k8s.owner_creates(owner)
+                granted = [env for env in k8s.claim_envs if PERSONAL_TOKEN_ENV in (env or {})]
+                assert work_items.calls.count("start") == 1
+                # The predecessor was torn down after the second grant read.
+                assert created[0] in k8s.deleted_claims
+                assert len(owner.secrets.reads) == 2
+                assert await h.async_redis.exists(_owner_key(h, owner)) == 0
+                if fence is None:
+                    assert len(created) == len(granted) == 2
+                    assert _turns(h.runner) == [_PROMPT]
+                else:
+                    assert len(created) == len(granted) == 1
+                    assert h.runner.opened == []
+                    [finish] = work_items.finishes
+                    assert finish["outcome"] == "failed"
+                    assert finish["cause"] == cause
+                    assert str(code) in str(finish["detail"])
+
+    asyncio.run(exercise())
+
+
 _FENCES = [
     pytest.param(None, None, id="authorized"),
     pytest.param(_deactivate_enrollment, "enrollment_inactive", id="disconnected"),
@@ -1195,6 +1272,83 @@ def test_a_ci_continuation_keeps_the_owner_and_refuses_after_a_fence_before_any_
                     assert finish["outcome"] == "failed"
                     assert finish["cause"] == "authentication_required"
                     assert finish["runtime_epoch"] == held.runtime_epoch
+                    assert str(code) in str(finish["detail"])
+
+    asyncio.run(exercise())
+
+
+class _WhileTurnRuns:
+    """A ``FakeRunner.hold`` that runs ``change`` once while the first turn is
+    live (its opening frames written, its final not yet), then lets it end."""
+
+    def __init__(self, change: Callable[[], Awaitable[None]] | None) -> None:
+        self._change = change
+
+    async def wait(self) -> None:
+        change, self._change = self._change, None
+        if change is not None:
+            await change()
+
+    def set(self) -> None:
+        """``/v1/interrupt`` and ``/v1/timeout`` release a hold; nothing waits here."""
+
+
+@pytest.mark.parametrize(
+    ("change", "code", "cause"),
+    [
+        pytest.param(None, None, None, id="authorized"),
+        pytest.param(
+            _disable_principal,
+            "owner_principal_inactive",
+            "runner_escalated",
+            id="principal-disabled",
+        ),
+        pytest.param(
+            _advance_enrollment,
+            "enrollment_generation_mismatch",
+            "authentication_required",
+            id="enrollment-advanced",
+        ),
+    ],
+)
+def test_an_automatic_continuation_is_authorized_afresh_before_it_opens(
+    make_harness, monkeypatch, change: _Change | None, code: str | None, cause: str | None
+) -> None:
+    """The execute turn ends without publishing, so the kernel re-prompts it
+    once on the same runtime (``kernel/publication.py``). The owner principal
+    is disabled, or the enrollment advanced, while that first turn runs: the
+    continuation is refused before it opens, and the started run settles as a
+    refused personal execution. Authorized, the continuation opens as before."""
+
+    async def exercise() -> None:
+        async with _seeded_owner() as owner:
+            k8s = _OwnerK8s()
+            async with _harness(make_harness, owner, k8s, monkeypatch) as h:
+                work_items = _enforce(h, owner)
+                request_id = await owner.request()
+                h.runner.default_script = [TextDelta(text="Working. ")]
+                h.runner.tail = [Final(text="Working. Done.", status=SessionStatus.DONE)]
+                h.runner.hold = _WhileTurnRuns(
+                    None if change is None else functools.partial(change, owner, request_id)
+                )
+
+                await h.kernel.process_event(_execute(request_id))
+
+                assert work_items.calls.count("start") == 1
+                assert len(k8s.owner_creates(owner)) == 1
+                assert h.runner.opened[0] == _PROMPT
+                if change is None:
+                    [continuation] = h.runner.opened[1:]
+                    assert any(prompt in continuation for prompt in _CONTINUATIONS)
+                    assert all(
+                        "personal execution was refused" not in str(f.get("detail"))
+                        for f in work_items.finishes
+                    )
+                else:
+                    assert h.runner.opened == [_PROMPT]
+                    [finish] = work_items.finishes
+                    assert finish["outcome"] == "failed"
+                    assert finish["cause"] == cause
                     assert str(code) in str(finish["detail"])
 
     asyncio.run(exercise())
