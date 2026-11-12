@@ -189,10 +189,13 @@ delivery cap is a bug.
 
 ### CI gates
 
-Pull requests run the fast tiers and defer the kind, upgrade and convergence
-tiers to the merge queue, which runs them on the exact merge combination before
-anything lands; add the `ci:deep` label (then push) to run the deep tiers on the
-pull request too.
+Pull requests run the static Python gates and defer the Python pytest shards,
+the container and dry run fixtures, the CI policy tests, and the kind, upgrade
+and convergence tiers to the merge queue, which runs them on the exact merge
+combination before anything lands. Add the `ci:deep` label and then push, or
+close and reopen the pull request, to run all of them on the pull request. A
+pull request with a broad Python change should carry the label before it is
+queued.
 
 ## Test policy
 

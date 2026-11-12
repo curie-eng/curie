@@ -1402,6 +1402,7 @@ DEEP_JOBS = {
         "e2e-ladder-cluster", "e2e-scripted-factory", "factory-admitted-agent",
         "e2e-cluster-chart-regressions", "e2e-cluster-approval-resume-restarts",
         "e2e-released-upgrade-negative", "e2e-cluster-upgrade-matrix", "rust-convergence",
+        "python-pytest", "python-container-fixtures", "python-dry-run-fixture", "ci-policy",
     }),
     "helm-ci.yaml": frozenset({"reserved-env-upgrade", "automatic-thread-isolation"}),
 }
@@ -1441,6 +1442,14 @@ OLD_PR_CONDITIONS = {
         ),
         "e2e-released-upgrade-negative": "${{ needs.changes.outputs.released_upgrade == 'true' }}",
         "e2e-cluster-upgrade-matrix": "${{ needs.changes.outputs.released_upgrade == 'true' }}",
+        "python-pytest": "${{ needs.changes.outputs.pytest == 'true' }}",
+        "python-container-fixtures": "${{ needs.changes.outputs.pytest == 'true' }}",
+        "python-dry-run-fixture": (
+            "${{ needs.changes.outputs.pytest == 'true' &&\n"
+            "    !contains(format(',{0},', needs.changes.outputs.pytest_deselect), "
+            "',tools/factory-e2e/tests/test_c4_dry_run.py,') }}"
+        ),
+        "ci-policy": "${{ needs.changes.outputs.ci_policy == 'true' }}",
     },
     "helm-ci.yaml": {
         "reserved-env-upgrade": "${{ needs.chart-changes.outputs.chart == 'true' }}",
@@ -1570,6 +1579,11 @@ def test_deep_label_is_documented_in_the_ci_gates_subsection() -> None:
     section = text[gates:following]
     assert "ci:deep" in section
     assert "merge queue" in section
+    assert "static Python gates" in section
+    assert "Python pytest" in section
+    assert "container and dry run fixtures" in section
+    assert "CI policy" in section
+    assert "close and reopen" in section
 
 
 def _select_outputs(tmp_path: Path, paths: tuple[str, ...]) -> dict[str, str]:
