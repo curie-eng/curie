@@ -2561,3 +2561,70 @@ def test_lineage_state_stale_version_and_another_work_item_do_not_invalidate(
         for path, _ in _patches(sink)
     )
     assert _curie_labels(sink, 55830) == {"curie-factory:needs-human"}
+
+
+@pytest.mark.parametrize("terminal", ["failed", "expired"])
+def test_merged_lineage_state_refreshes_previously_finalized_comments_idempotently(
+    admitted: Any, terminal: str, monkeypatch: pytest.MonkeyPatch  # noqa: F811
+) -> None:
+    import hashlib
+
+    import curie_api.workitems.lifecycle as lifecycle
+    from test_factory_terminus import _observe_termination
+
+    client, github, sink = admitted
+    request_id = _admit(client, github, sink, 55835)
+    epoch = _start_running(client, request_id)
+    work_item_id = _request(55835)["work_item_id"]
+    _attach_publication(work_item_id, status="succeeded", pr=77)
+    if terminal == "failed":
+        _finish_failed(client, request_id, epoch, "runner_escalated")
+    else:
+        original = lifecycle.database_now
+
+        async def later(session: AsyncSession) -> Any:
+            return await original(session) + timedelta(seconds=1900)
+
+        with monkeypatch.context() as clock:
+            clock.setattr(lifecycle, "database_now", later)
+            client.portal.call(
+                client.app.state.work_item_reconciler._request_deadline_cancellations
+            )
+        _observe_termination(client, request_id)
+    _reconcile()
+    request = _request(55835)
+    assert request["status"] == terminal
+    before = _notices(request_id)[0]
+    assert before["finalized_at"] is not None
+    (comment,) = _marked(sink, request_id)
+    comment["body"] = "\n".join(
+        line for line in comment["body"].split("\n") if not line.startswith("Pull request:")
+    )
+    _execute(
+        "UPDATE curie.factory_terminal_notices SET rendered_digest = :digest "
+        "WHERE execution_request_id = :id",
+        {"digest": hashlib.sha256(comment["body"].encode()).hexdigest(), "id": request_id},
+    )
+    _execute(
+        "UPDATE curie.thread_publication_lineages SET status = 'merged', version = version + 1 "
+        "WHERE id = (SELECT publication_lineage_id FROM curie.work_items WHERE id = :id)",
+        {"id": work_item_id},
+    )
+    assert _curie_labels(sink, 55835) == {"curie-factory:needs-human"}
+    sink.requests.clear()
+
+    _reconcile()
+
+    (updated,) = _marked(sink, request_id)
+    assert updated["id"] == comment["id"]
+    assert f"Cause: {request['terminal_cause']}" in updated["body"]
+    assert f"Pull request: https://github.com/{REPO}/pull/77 (merged)" in updated["body"]
+    assert len(_patches(sink)) == 1
+    assert _posts(sink) == []
+    assert _curie_labels(sink, 55835) == set()
+    assert not any(method == "POST" for method, _, _ in _label_writes(sink))
+    assert _request(55835) == request
+    assert _notices(request_id)[0]["finalized_at"] is not None
+    sink.requests.clear()
+    _reconcile()
+    assert _writes(sink) == []

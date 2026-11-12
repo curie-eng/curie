@@ -841,6 +841,8 @@ async def _claim_next(
     row, work_item, request, pr_url, pr_number, pr_state, latest = selected
     if pr_number is None or not pr_url:
         pr_state = None
+    if pr_state == "merged" and request.status in {"failed", "expired"}:
+        row.finalized_at = None
     now = await _clock(session)
     await session.execute(
         update(FactoryStatusComment)
