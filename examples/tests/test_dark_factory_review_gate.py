@@ -742,69 +742,20 @@ def test_publish_decisions_missing_body_is_recoverable(session: Session) -> None
     assert session.pre(PUBLISH, {"body": VALID_PR_BODY})["permissionDecision"] == "allow"
 
 
-@pytest.mark.parametrize(
-    ("case_id", "answer", "accepted"),
-    [
-        (
-            "answers-recorded-decision",
-            "No changes needed: Decision 1 rejects per-event commits because their "
-            "transaction overhead grows with the event count. The recorded trace "
-            "compares 40 commits with one batch commit.",
-            True,
-        ),
-        (
-            "answers-recorded-decision",
-            "No changes needed: Batching reduces the cost of a commit for each event; "
-            "entry #1 records this choice and its storage trace.",
-            True,
-        ),
-        (
-            "answers-recorded-decision",
-            "No changes needed: Decision 1 uses batches to preserve event order.",
-            False,
-        ),
-        (
-            "answers-recorded-decision",
-            "No changes needed: Decision 2 avoids per-event commit overhead.",
-            False,
-        ),
-        (
-            "answers-recorded-decision",
-            "No changes needed: The code saves a batch in one transaction.",
-            False,
-        ),
-        (
-            "admits-unrecorded-decision",
-            "No changes needed: The rationale for choosing 256 was not recorded. "
-            "The supplied diff establishes the value, but not why it was selected.",
-            True,
-        ),
-        (
-            "admits-unrecorded-decision",
-            "No changes needed: The PR body does not explain why 256 was selected; "
-            "the repository excerpt only defines that capacity.",
-            True,
-        ),
-        (
-            "admits-unrecorded-decision",
-            "No changes needed: 256 was selected to match the expected peak load.",
-            False,
-        ),
-        (
-            "admits-unrecorded-decision",
-            "No changes needed: The queue is bounded at 256 entries.",
-            False,
-        ),
-    ],
-)
-def test_decision_followup_eval_grades_the_answer(
-    case_id: str, answer: str, accepted: bool
-) -> None:
+@pytest.mark.parametrize("case_id", ["answers-recorded-decision", "admits-unrecorded-decision"])
+def test_decision_followup_eval_grades_the_answer(case_id: str) -> None:
     from curie_worker.eval.models import EvalSuite
 
     suite = EvalSuite.model_validate_json((BUNDLE / "evals" / "cases.json").read_text())
     case = next(case for case in suite.cases if case.id == case_id)
-    assert case.grader.grade(answer) is accepted
+    fixtures = json.loads(
+        (REPO_ROOT / "cli/tests/data/eval_falsifiability_fixtures.json").read_text()
+    )
+    key = f"dark-factory/{case_id}"
+    for answer in [fixtures["exemplars"][key], *fixtures["paraphrases"][key]]:
+        assert case.grader.grade(answer)
+    for answer in fixtures["counterexamples"][key]:
+        assert not case.grader.grade(answer)
     for empty_answer in ("", "Done.", "No changes needed:", case.input):
         assert not case.grader.grade(empty_answer)
 
