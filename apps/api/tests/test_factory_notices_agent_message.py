@@ -395,7 +395,7 @@ def test_a_completed_unchanged_notice_quotes_the_agents_message(revision: bool) 
 
     before, quoted, after = _quoted(body)
     headline = (
-        "No changes needed: this pull request already covers the requested revision."
+        "No changes needed: this pull request is unchanged."
         if revision
         else f"No changes needed: the open pull request already covers this request: {pr_url}"
     )
@@ -413,6 +413,32 @@ def test_a_completed_unchanged_notice_quotes_the_agents_message(revision: bool) 
     assert after == (f"\nIn response to {feedback_url}\n" if revision else "\n")
     assert "Could not complete:" not in body
     assert "Note:" not in body
+
+
+@pytest.mark.parametrize("revision", [False, True], ids=["relabel", "feedback"])
+def test_completed_unchanged_notice_retains_the_agents_answer(revision: bool) -> None:
+    pr_url = "https://github.com/acme-corp/acme-bot/pull/77"
+    feedback_url = f"{pr_url}#discussion_r88121" if revision else None
+    body = result_section(
+        "completed",
+        pr_url=pr_url,
+        feedback_url=feedback_url,
+        unchanged=True,
+        detail="The check rejects malformed records before parsing.",
+    )
+
+    headline = (
+        "No changes needed: this pull request is unchanged."
+        if revision
+        else f"No changes needed: the open pull request already covers this request: {pr_url}"
+    )
+    assert body == (
+        f"{headline}\n"
+        "Agent's last message:\n"
+        "> The check rejects malformed records before parsing.\n"
+        "\n"
+        + (f"In response to {feedback_url}\n" if revision else "")
+    )
 
 
 @pytest.mark.parametrize("revision", [False, True])

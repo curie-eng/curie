@@ -1894,7 +1894,7 @@ def test_a_review_revision_with_no_changes_completes_in_its_thread(
     assert [posted_path for posted_path, _body in posts] == [path]
     body = posts[0][1] or ""
     assert "Status: SUCCEEDED" in body
-    assert "No changes needed: this pull request already covers the requested revision." in body
+    assert "No changes needed: this pull request is unchanged." in body
     assert f"In response to https://github.com/{REPO}/pull/{pr}#discussion_r88121" in body
     assert "Agent's last message:" in body
     assert detail in body

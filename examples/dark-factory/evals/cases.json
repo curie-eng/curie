@@ -243,6 +243,24 @@
         "expected": "Skill",
         "case_sensitive": true
       }
+    },
+    {
+      "id": "answers-recorded-decision",
+      "input": "{\n  \"objective\": \"Answer the maintainer question about this existing pull request. No implementation change is requested. Question: Why does the writer accumulate events before saving them?\",\n  \"issue\": \"Persist every event and retain input order. The acceptance check requires a batch of 40 events to appear in the same order after reopening storage.\",\n  \"pull_request_body\": \"Save completed event batches.\\n\\n## Decisions\\n1. Save a completed batch with one database transaction. Rejected: Save each event in its own transaction, because repeated transaction setup grows with the number of events. (plan review) Evidence: the storage trace shows 40 commits for individual writes and one for a batch.\\n\\n## Acceptance criteria\\n1. Reopening storage returns all 40 events in input order.\\n\\n## Reviews\\nPlan review APPROVE; diff review round 1 APPROVE.\",\n  \"diff\": \"--- a/writer.py\\n+++ b/writer.py\\n@@ -1,2 +1 @@\\n-for event in events:\\n-    store.save(event)\\n+store.save_batch(events)\\n\",\n  \"repository_context\": \"save_batch opens one transaction for its argument list, preserves list order and commits before returning.\"\n}",
+      "grader": {
+        "kind": "regex",
+        "expected": "(?is)^No changes needed:(?:.{0,600}\\b(?:decision|entry)\\s*(?:number\\s*)?#?\\s*1\\b.{0,600}(?:(?:per[- ](?:event|row)|each (?:event|row)|every (?:event|row)|transaction|commit).{0,100}\\b(?:overhead|cost|expens\\w*|round.?trip\\w*)\\b|\\b(?:overhead|cost|expens\\w*|round.?trip\\w*)\\b.{0,100}(?:per[- ](?:event|row)|each (?:event|row)|every (?:event|row)|transaction|commit))|.{0,600}(?:(?:per[- ](?:event|row)|each (?:event|row)|every (?:event|row)|transaction|commit).{0,100}\\b(?:overhead|cost|expens\\w*|round.?trip\\w*)\\b|\\b(?:overhead|cost|expens\\w*|round.?trip\\w*)\\b.{0,100}(?:per[- ](?:event|row)|each (?:event|row)|every (?:event|row)|transaction|commit)).{0,600}\\b(?:decision|entry)\\s*(?:number\\s*)?#?\\s*1\\b).{0,800}$",
+        "case_sensitive": false
+      }
+    },
+    {
+      "id": "admits-unrecorded-decision",
+      "input": "{\n  \"objective\": \"Answer the maintainer question about this existing pull request. No implementation change is requested. Question: Why was 256 selected as the queue capacity?\",\n  \"issue\": \"Add a bounded queue and retain delivery order. The acceptance check enqueues three messages and observes their original order.\",\n  \"pull_request_body\": \"Bound the delivery queue.\\n\\n## Decisions\\nNone: the change follows directly from the acceptance criteria.\\n\\n## Acceptance criteria\\n1. Three messages are delivered in input order.\\n\\n## Reviews\\nPlan review APPROVE; diff review round 1 APPROVE.\",\n  \"diff\": \"--- a/queue.py\\n+++ b/queue.py\\n@@ -1 +1,2 @@\\n-queue = Queue()\\n+QUEUE_CAPACITY = 256\\n+queue = Queue(maxsize=QUEUE_CAPACITY)\\n\",\n  \"repository_context\": \"queue.py contains the capacity constant and queue construction shown in the diff. The provided repository excerpt has no accompanying design comment.\"\n}",
+      "grader": {
+        "kind": "regex",
+        "expected": "(?is)^No changes needed:.{0,1600}(?:(?:reason|rationale|choice|decision).{0,100}(?:not (?:documented|recorded|provided)|unrecorded|not available)|(?:does not|doesn't|do not|don't).{0,60}(?:record|document|explain).{0,80}(?:why|reason|rationale|256)|(?:cannot|can't).{0,50}(?:determine|establish).{0,60}(?:why|reason|rationale)).{0,800}$",
+        "case_sensitive": false
+      }
     }
   ]
 }

@@ -1,0 +1,351 @@
+{
+  "cases": [
+    {
+      "id": "one-plan-decision",
+      "body": "## Decisions\n1. Keep the review approval when only the body is corrected. Rejected: Repeat the diff review, because the reviewed candidate is unchanged. (plan) Evidence: the publication hook compares the candidate fingerprint.",
+      "valid": true,
+      "entries": [
+        {
+          "n": 1,
+          "choice": "Keep the review approval when only the body is corrected",
+          "rejected": "Repeat the diff review",
+          "reason": "the reviewed candidate is unchanged",
+          "source": "plan",
+          "evidence": "the publication hook compares the candidate fingerprint"
+        }
+      ]
+    },
+    {
+      "id": "sole-none",
+      "body": "## Decisions\nNone: the change follows directly from the acceptance criteria.",
+      "valid": true,
+      "entries": []
+    },
+    {
+      "id": "none-with-blank-lines",
+      "body": "Summary.\n\n## Decisions\n\nNone: the change follows directly from the acceptance criteria.\n \n## Checks\nChecks passed.",
+      "valid": true,
+      "entries": []
+    },
+    {
+      "id": "seven-all-sources",
+      "body": "## Decisions\n1. Keep the review approval when only the body is corrected. Rejected: Repeat the diff review, because the reviewed candidate is unchanged. (plan) Evidence: the publication hook compares the candidate fingerprint.\n2. Keep the review approval when only the body is corrected. Rejected: Repeat the diff review, because the reviewed candidate is unchanged. (plan review) Evidence: the publication hook compares the candidate fingerprint.\n3. Keep the review approval when only the body is corrected. Rejected: Repeat the diff review, because the reviewed candidate is unchanged. (diff review) Evidence: the publication hook compares the candidate fingerprint.\n4. Keep the review approval when only the body is corrected. Rejected: Repeat the diff review, because the reviewed candidate is unchanged. (plan) Evidence: the publication hook compares the candidate fingerprint.\n5. Keep the review approval when only the body is corrected. Rejected: Repeat the diff review, because the reviewed candidate is unchanged. (plan review) Evidence: the publication hook compares the candidate fingerprint.\n6. Keep the review approval when only the body is corrected. Rejected: Repeat the diff review, because the reviewed candidate is unchanged. (diff review) Evidence: the publication hook compares the candidate fingerprint.\n7. Keep the review approval when only the body is corrected. Rejected: Repeat the diff review, because the reviewed candidate is unchanged. (plan) Evidence: the publication hook compares the candidate fingerprint.",
+      "valid": true,
+      "entries": [
+        {
+          "n": 1,
+          "choice": "Keep the review approval when only the body is corrected",
+          "rejected": "Repeat the diff review",
+          "reason": "the reviewed candidate is unchanged",
+          "source": "plan",
+          "evidence": "the publication hook compares the candidate fingerprint"
+        },
+        {
+          "n": 2,
+          "choice": "Keep the review approval when only the body is corrected",
+          "rejected": "Repeat the diff review",
+          "reason": "the reviewed candidate is unchanged",
+          "source": "plan review",
+          "evidence": "the publication hook compares the candidate fingerprint"
+        },
+        {
+          "n": 3,
+          "choice": "Keep the review approval when only the body is corrected",
+          "rejected": "Repeat the diff review",
+          "reason": "the reviewed candidate is unchanged",
+          "source": "diff review",
+          "evidence": "the publication hook compares the candidate fingerprint"
+        },
+        {
+          "n": 4,
+          "choice": "Keep the review approval when only the body is corrected",
+          "rejected": "Repeat the diff review",
+          "reason": "the reviewed candidate is unchanged",
+          "source": "plan",
+          "evidence": "the publication hook compares the candidate fingerprint"
+        },
+        {
+          "n": 5,
+          "choice": "Keep the review approval when only the body is corrected",
+          "rejected": "Repeat the diff review",
+          "reason": "the reviewed candidate is unchanged",
+          "source": "plan review",
+          "evidence": "the publication hook compares the candidate fingerprint"
+        },
+        {
+          "n": 6,
+          "choice": "Keep the review approval when only the body is corrected",
+          "rejected": "Repeat the diff review",
+          "reason": "the reviewed candidate is unchanged",
+          "source": "diff review",
+          "evidence": "the publication hook compares the candidate fingerprint"
+        },
+        {
+          "n": 7,
+          "choice": "Keep the review approval when only the body is corrected",
+          "rejected": "Repeat the diff review",
+          "reason": "the reviewed candidate is unchanged",
+          "source": "plan",
+          "evidence": "the publication hook compares the candidate fingerprint"
+        }
+      ]
+    },
+    {
+      "id": "blank-lines-between-entries",
+      "body": "## Decisions\n\n1. Keep the review approval when only the body is corrected. Rejected: Repeat the diff review, because the reviewed candidate is unchanged. (plan) Evidence: the publication hook compares the candidate fingerprint.\n  \n2. Keep the review approval when only the body is corrected. Rejected: Repeat the diff review, because the reviewed candidate is unchanged. (plan review) Evidence: the publication hook compares the candidate fingerprint.\n",
+      "valid": true,
+      "entries": [
+        {
+          "n": 1,
+          "choice": "Keep the review approval when only the body is corrected",
+          "rejected": "Repeat the diff review",
+          "reason": "the reviewed candidate is unchanged",
+          "source": "plan",
+          "evidence": "the publication hook compares the candidate fingerprint"
+        },
+        {
+          "n": 2,
+          "choice": "Keep the review approval when only the body is corrected",
+          "rejected": "Repeat the diff review",
+          "reason": "the reviewed candidate is unchanged",
+          "source": "plan review",
+          "evidence": "the publication hook compares the candidate fingerprint"
+        }
+      ]
+    },
+    {
+      "id": "crlf-and-section-boundary",
+      "body": "## Decisions\r\n1. Keep the review approval when only the body is corrected. Rejected: Repeat the diff review, because the reviewed candidate is unchanged. (plan) Evidence: the publication hook compares the candidate fingerprint.\r\n## Review detail\r\nNot part of Decisions.",
+      "valid": true,
+      "entries": [
+        {
+          "n": 1,
+          "choice": "Keep the review approval when only the body is corrected",
+          "rejected": "Repeat the diff review",
+          "reason": "the reviewed candidate is unchanged",
+          "source": "plan",
+          "evidence": "the publication hook compares the candidate fingerprint"
+        }
+      ]
+    },
+    {
+      "id": "heading-without-space-does-not-end-section",
+      "body": "## Decisions\n1. Keep the review approval when only the body is corrected. Rejected: Repeat the diff review, because the reviewed candidate is unchanged. (plan) Evidence: the publication hook compares the candidate fingerprint.\n##Checks\nNot part of Decisions.",
+      "valid": false
+    },
+    {
+      "id": "nontext-null-body",
+      "body": null,
+      "valid": false
+    },
+    {
+      "id": "nontext-number-body",
+      "body": 7,
+      "valid": false
+    },
+    {
+      "id": "nontext-object-body",
+      "body": {
+        "Decisions": "None: the change follows directly from the acceptance criteria."
+      },
+      "valid": false
+    },
+    {
+      "id": "nontext-list-body",
+      "body": [
+        "None: the change follows directly from the acceptance criteria."
+      ],
+      "valid": false
+    },
+    {
+      "id": "empty-body",
+      "body": "",
+      "valid": false
+    },
+    {
+      "id": "missing-heading",
+      "body": "Summary only.",
+      "valid": false
+    },
+    {
+      "id": "wrong-heading-case",
+      "body": "## decisions\nNone: the change follows directly from the acceptance criteria.",
+      "valid": false
+    },
+    {
+      "id": "heading-with-trailing-space",
+      "body": "## Decisions \nNone: the change follows directly from the acceptance criteria.",
+      "valid": false
+    },
+    {
+      "id": "heading-with-leading-space",
+      "body": " ## Decisions\nNone: the change follows directly from the acceptance criteria.",
+      "valid": false
+    },
+    {
+      "id": "wrong-heading-level",
+      "body": "### Decisions\nNone: the change follows directly from the acceptance criteria.",
+      "valid": false
+    },
+    {
+      "id": "empty-section",
+      "body": "## Decisions\n\n \n## Checks\nDone.",
+      "valid": false
+    },
+    {
+      "id": "heading-at-eof",
+      "body": "## Decisions",
+      "valid": false
+    },
+    {
+      "id": "eight-entries",
+      "body": "## Decisions\n1. Keep the review approval when only the body is corrected. Rejected: Repeat the diff review, because the reviewed candidate is unchanged. (plan) Evidence: the publication hook compares the candidate fingerprint.\n2. Keep the review approval when only the body is corrected. Rejected: Repeat the diff review, because the reviewed candidate is unchanged. (plan) Evidence: the publication hook compares the candidate fingerprint.\n3. Keep the review approval when only the body is corrected. Rejected: Repeat the diff review, because the reviewed candidate is unchanged. (plan) Evidence: the publication hook compares the candidate fingerprint.\n4. Keep the review approval when only the body is corrected. Rejected: Repeat the diff review, because the reviewed candidate is unchanged. (plan) Evidence: the publication hook compares the candidate fingerprint.\n5. Keep the review approval when only the body is corrected. Rejected: Repeat the diff review, because the reviewed candidate is unchanged. (plan) Evidence: the publication hook compares the candidate fingerprint.\n6. Keep the review approval when only the body is corrected. Rejected: Repeat the diff review, because the reviewed candidate is unchanged. (plan) Evidence: the publication hook compares the candidate fingerprint.\n7. Keep the review approval when only the body is corrected. Rejected: Repeat the diff review, because the reviewed candidate is unchanged. (plan) Evidence: the publication hook compares the candidate fingerprint.\n8. Keep the review approval when only the body is corrected. Rejected: Repeat the diff review, because the reviewed candidate is unchanged. (plan) Evidence: the publication hook compares the candidate fingerprint.",
+      "valid": false
+    },
+    {
+      "id": "missing-rejected",
+      "body": "## Decisions\n1. Keep the review approval when only the body is corrected. Repeat the diff review, because the reviewed candidate is unchanged. (plan) Evidence: the publication hook compares the candidate fingerprint.",
+      "valid": false
+    },
+    {
+      "id": "invalid-source",
+      "body": "## Decisions\n1. Keep the review approval when only the body is corrected. Rejected: Repeat the diff review, because the reviewed candidate is unchanged. (review) Evidence: the publication hook compares the candidate fingerprint.",
+      "valid": false
+    },
+    {
+      "id": "wrong-source-case",
+      "body": "## Decisions\n1. Keep the review approval when only the body is corrected. Rejected: Repeat the diff review, because the reviewed candidate is unchanged. (Plan) Evidence: the publication hook compares the candidate fingerprint.",
+      "valid": false
+    },
+    {
+      "id": "missing-evidence",
+      "body": "## Decisions\n1. Keep the review approval when only the body is corrected. Rejected: Repeat the diff review, because the reviewed candidate is unchanged. (plan)",
+      "valid": false
+    },
+    {
+      "id": "none-mixed-with-entry",
+      "body": "## Decisions\nNone: the change follows directly from the acceptance criteria.\n1. Keep the review approval when only the body is corrected. Rejected: Repeat the diff review, because the reviewed candidate is unchanged. (plan) Evidence: the publication hook compares the candidate fingerprint.",
+      "valid": false
+    },
+    {
+      "id": "entry-mixed-with-none",
+      "body": "## Decisions\n1. Keep the review approval when only the body is corrected. Rejected: Repeat the diff review, because the reviewed candidate is unchanged. (plan) Evidence: the publication hook compares the candidate fingerprint.\nNone: the change follows directly from the acceptance criteria.",
+      "valid": false
+    },
+    {
+      "id": "duplicate-none",
+      "body": "## Decisions\nNone: the change follows directly from the acceptance criteria.\nNone: the change follows directly from the acceptance criteria.",
+      "valid": false
+    },
+    {
+      "id": "wrong-none-declaration",
+      "body": "## Decisions\nNone: no choices were needed.",
+      "valid": false
+    },
+    {
+      "id": "duplicate-section",
+      "body": "## Decisions\n1. Keep the review approval when only the body is corrected. Rejected: Repeat the diff review, because the reviewed candidate is unchanged. (plan) Evidence: the publication hook compares the candidate fingerprint.\n## Checks\nDone.\n## Decisions\nNone: the change follows directly from the acceptance criteria.",
+      "valid": false
+    },
+    {
+      "id": "repeated-number",
+      "body": "## Decisions\n1. Keep the review approval when only the body is corrected. Rejected: Repeat the diff review, because the reviewed candidate is unchanged. (plan) Evidence: the publication hook compares the candidate fingerprint.\n1. Keep the review approval when only the body is corrected. Rejected: Repeat the diff review, because the reviewed candidate is unchanged. (plan) Evidence: the publication hook compares the candidate fingerprint.",
+      "valid": false
+    },
+    {
+      "id": "number-gap",
+      "body": "## Decisions\n1. Keep the review approval when only the body is corrected. Rejected: Repeat the diff review, because the reviewed candidate is unchanged. (plan) Evidence: the publication hook compares the candidate fingerprint.\n3. Keep the review approval when only the body is corrected. Rejected: Repeat the diff review, because the reviewed candidate is unchanged. (plan) Evidence: the publication hook compares the candidate fingerprint.",
+      "valid": false
+    },
+    {
+      "id": "starts-at-two",
+      "body": "## Decisions\n2. Keep the review approval when only the body is corrected. Rejected: Repeat the diff review, because the reviewed candidate is unchanged. (plan) Evidence: the publication hook compares the candidate fingerprint.",
+      "valid": false
+    },
+    {
+      "id": "starts-at-zero",
+      "body": "## Decisions\n0. Keep the review approval when only the body is corrected. Rejected: Repeat the diff review, because the reviewed candidate is unchanged. (plan) Evidence: the publication hook compares the candidate fingerprint.",
+      "valid": false
+    },
+    {
+      "id": "blank-choice",
+      "body": "## Decisions\n1.  . Rejected: Repeat the diff review, because the reviewed candidate is unchanged. (plan) Evidence: the publication hook compares the candidate fingerprint.",
+      "valid": false
+    },
+    {
+      "id": "blank-alternative",
+      "body": "## Decisions\n1. Keep the review approval when only the body is corrected. Rejected:  , because the reviewed candidate is unchanged. (plan) Evidence: the publication hook compares the candidate fingerprint.",
+      "valid": false
+    },
+    {
+      "id": "blank-reason",
+      "body": "## Decisions\n1. Keep the review approval when only the body is corrected. Rejected: Repeat the diff review, because  . (plan) Evidence: the publication hook compares the candidate fingerprint.",
+      "valid": false
+    },
+    {
+      "id": "blank-evidence",
+      "body": "## Decisions\n1. Keep the review approval when only the body is corrected. Rejected: Repeat the diff review, because the reviewed candidate is unchanged. (plan) Evidence:  .",
+      "valid": false
+    },
+    {
+      "id": "missing-choice",
+      "body": "## Decisions\n1. . Rejected: Repeat the diff review, because the reviewed candidate is unchanged. (plan) Evidence: the publication hook compares the candidate fingerprint.",
+      "valid": false
+    },
+    {
+      "id": "missing-alternative",
+      "body": "## Decisions\n1. Keep the review approval when only the body is corrected. Rejected: , because the reviewed candidate is unchanged. (plan) Evidence: the publication hook compares the candidate fingerprint.",
+      "valid": false
+    },
+    {
+      "id": "missing-reason",
+      "body": "## Decisions\n1. Keep the review approval when only the body is corrected. Rejected: Repeat the diff review, because . (plan) Evidence: the publication hook compares the candidate fingerprint.",
+      "valid": false
+    },
+    {
+      "id": "missing-evidence-value",
+      "body": "## Decisions\n1. Keep the review approval when only the body is corrected. Rejected: Repeat the diff review, because the reviewed candidate is unchanged. (plan) Evidence: .",
+      "valid": false
+    },
+    {
+      "id": "missing-because",
+      "body": "## Decisions\n1. Keep the review approval when only the body is corrected. Rejected: Repeat the diff review, the reviewed candidate is unchanged. (plan) Evidence: the publication hook compares the candidate fingerprint.",
+      "valid": false
+    },
+    {
+      "id": "missing-final-period",
+      "body": "## Decisions\n1. Keep the review approval when only the body is corrected. Rejected: Repeat the diff review, because the reviewed candidate is unchanged. (plan) Evidence: the publication hook compares the candidate fingerprint",
+      "valid": false
+    },
+    {
+      "id": "multiline-entry",
+      "body": "## Decisions\n1. Keep the review approval when only the body is corrected. Rejected: Repeat the diff review, because the reviewed candidate is unchanged. (plan)\nEvidence: the publication hook compares the candidate fingerprint.",
+      "valid": false
+    },
+    {
+      "id": "unnumbered-prose",
+      "body": "## Decisions\n1. Keep the review approval when only the body is corrected. Rejected: Repeat the diff review, because the reviewed candidate is unchanged. (plan) Evidence: the publication hook compares the candidate fingerprint.\nThe implementation is complete.",
+      "valid": false
+    },
+    {
+      "id": "leading-entry-space",
+      "body": "## Decisions\n 1. Keep the review approval when only the body is corrected. Rejected: Repeat the diff review, because the reviewed candidate is unchanged. (plan) Evidence: the publication hook compares the candidate fingerprint.",
+      "valid": false
+    },
+    {
+      "id": "trailing-entry-space",
+      "body": "## Decisions\n1. Keep the review approval when only the body is corrected. Rejected: Repeat the diff review, because the reviewed candidate is unchanged. (plan) Evidence: the publication hook compares the candidate fingerprint. ",
+      "valid": false
+    },
+    {
+      "id": "none-trailing-prose",
+      "body": "## Decisions\nNone: the change follows directly from the acceptance criteria. Done.",
+      "valid": false
+    },
+    {
+      "id": "nested-heading-does-not-end-section",
+      "body": "## Decisions\n1. Keep the review approval when only the body is corrected. Rejected: Repeat the diff review, because the reviewed candidate is unchanged. (plan) Evidence: the publication hook compares the candidate fingerprint.\n### Review detail\nNot part of an entry.",
+      "valid": false
+    }
+  ]
+}
