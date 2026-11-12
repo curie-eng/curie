@@ -258,6 +258,12 @@ class Settings(BaseSettings):
     langfuse_host: str = "http://localhost:23000"
     langfuse_public_key: str = "pk-lf-curie-dev"
     langfuse_secret_key: str = "sk-lf-curie-dev"
+    # Which Langfuse read API generation to call. "v3" uses the legacy traces /
+    # observations / metrics endpoints (the compose and chart pin, and every
+    # self-hosted v3). "v4" uses Observations API v2 and Metrics API v2, the
+    # only read path on Langfuse Cloud from 2026-11-16, when Langfuse removes the
+    # legacy read APIs there.
+    langfuse_api_version: Literal["v3", "v4"] = "v3"
 
     # RustFS / S3 for immutable plugin bundles (compose stack RustFS on 29000).
     # The credentials default to EMPTY on purpose (#1559): an empty credential

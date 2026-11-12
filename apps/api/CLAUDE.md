@@ -200,7 +200,10 @@ compose DB once your revision is merged to main.
 
 `Settings` (`config.py`, env-driven) covers the Postgres DSN, the bundle
 store (RustFS/S3 endpoint + bucket), the Langfuse public API base + keys, the
-GitHub webhook secret, `api_key`, `kube_config_path` (empty = no cluster
+Langfuse read API generation (`LANGFUSE_API_VERSION`: `v3`, the default, calls the
+legacy traces/observations/metrics endpoints the compose and chart pin serve;
+`v4` calls Observations API v2 and Metrics API v2, the only read path on
+Langfuse Cloud from 2026-11-16), the GitHub webhook secret, `api_key`, `kube_config_path` (empty = no cluster
 configured, the 503 case above), and `metrics_default_window_hours`.
 
 ## Verify
