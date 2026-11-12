@@ -3411,6 +3411,49 @@ def test_candidate_images_are_verified_by_digest_and_revision(tmp_path: Path) ->
     ledger.close()
 
 
+def test_the_agent_names_an_explicit_reviewer_model_for_personal_mode(tmp_path: Path) -> None:
+    """Behavior: setup gives the agent the explicit Claude reviewer model personal mode
+    requires, the approved one on a live run and the bundle's on a rehearsal, alongside
+    the approved deadline; an approval whose reviewer models differ is refused. Without
+    it the runner refuses every session before any provider call (runner_escalated)."""
+
+    live_run = _live_run(tmp_path)
+    run = live_run.run
+    calls: list[tuple[str, ...]] = []
+
+    class RecordingCli:
+        def run(self, verb: str, *args: str, **_kwargs: Any) -> None:
+            calls.append((verb, *args))
+
+    run.curie = RecordingCli()  # type: ignore[assignment]
+    run.agent, run.prefix = "acme-psk", "curie/acme"
+    run.ceiling = sks.parse_ceiling(MODEL_CEILING)
+    run.configure_agent()
+    window = str(len(sks.ATTEMPT_ROLES) * 300)
+    assert (
+        "overrides",
+        "acme-psk",
+        "--reviewer-model",
+        "claude-opus-5-5",
+        "--execution-deadline",
+        window,
+    ) in calls
+    assert calls[0][0] == "publication-policy"
+
+    calls.clear()
+    run.ceiling = None
+    run.configure_agent()
+    assert ("overrides", "acme-psk", "--reviewer-model", sks.REVIEWER_MODEL) in calls
+    assert sks.reviewer_model(sks.parse_ceiling(CEILING)) == sks.REVIEWER_MODEL
+    differing = (
+        f"{CEILING},model.diff-reviewer=claude-opus-5-5,model.plan-reviewer=claude-sonnet-5-5"
+    )
+    with pytest.raises(sks.Refusal) as refused:
+        sks.reviewer_model(sks.parse_ceiling(differing))
+    assert refused.value.code == "live_unapproved"
+    live_run.ledger.close()
+
+
 def test_every_image_a_run_builds_carries_its_own_run_label() -> None:
     """Behavior: every candidate image and the runner layer carry the candidate revision
     and the run's own tag, so two runs at one revision never build the same image config.

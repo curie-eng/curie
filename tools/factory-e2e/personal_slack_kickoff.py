@@ -1490,6 +1490,7 @@ def cmd_preflight(args: argparse.Namespace, runtime: Runtime) -> int:
     inputs = base_inputs(args)
     ceiling = sks.parse_ceiling(args.approve_live)
     roles = sks.attempt_roles(ceiling)
+    sks.reviewer_model(ceiling)
     inputs = with_grant(inputs, args, runtime.clock.now())
     inputs = with_probe(with_slack(with_app(inputs, args), args), args)
     shell = Shell(
@@ -1553,6 +1554,7 @@ def cmd_run(args: argparse.Namespace, runtime: Runtime) -> int:
     inputs = base_inputs(args)
     ceiling = sks.parse_ceiling(args.approve_live)
     sks.attempt_roles(ceiling)
+    sks.reviewer_model(ceiling)
     inputs = with_grant(inputs, args, runtime.clock.now())
     inputs = with_probe(live_inputs(inputs, args), args)
     ledger = sks.Ledger.open(inputs.state_dir, inputs.run_id, scrubber=runtime.scrubber)
@@ -1591,6 +1593,7 @@ def cmd_rehearse(args: argparse.Namespace, runtime: Runtime) -> int:
     if args.kickoff:
         ceiling = sks.parse_ceiling(args.approve_live)
         sks.attempt_roles(ceiling)
+        sks.reviewer_model(ceiling)
         expires_at = sks.parse_expiry(args.grant_expires_at)
         sks.require_lifetime(expires_at, runtime.clock.now())
         inputs = dataclasses.replace(inputs, expires_at=expires_at)
@@ -2401,6 +2404,32 @@ class LiveRun:
             stdin=statement.encode(),
         )
 
+    def configure_agent(self) -> None:
+        """Publication policy, the explicit reviewer model, and the approved bounds.
+
+        Personal model authentication refuses every session of an agent with no
+        explicit Claude reviewer model, before any provider call, and the request
+        ends runner_escalated; the bundle's reviewer agents name only an alias.
+        """
+
+        self.curie.run(
+            "publication-policy",
+            self.agent,
+            "--policy",
+            "auto",
+            "--no-draft",
+            "--branch-prefix",
+            self.prefix,
+        )
+        overrides = ["--reviewer-model", sks.reviewer_model(self.ceiling)]
+        if self.ceiling is not None:
+            roles = sks.attempt_roles(self.ceiling)
+            window = int(len(roles) * self.ceiling.session_seconds)
+            overrides += ["--execution-deadline", str(window)]
+        self.curie.run("overrides", self.agent, *overrides)
+        if self.ceiling is not None:
+            self.curie.run("budget", self.agent, "--output-tokens", str(self.ceiling.output_tokens))
+
     def phase_setup(self) -> None:
         inputs = self.inputs
         kit = self.require_kit()
@@ -2432,20 +2461,7 @@ class LiveRun:
         # Registered last so it runs first, while the api and database are still up.
         self.finalizer.register("recover-publications", self.recover_publications)
         self.policy_set = True
-        self.curie.run(
-            "publication-policy",
-            self.agent,
-            "--policy",
-            "auto",
-            "--no-draft",
-            "--branch-prefix",
-            self.prefix,
-        )
-        if self.ceiling is not None:
-            roles = sks.attempt_roles(self.ceiling)
-            window = int(len(roles) * self.ceiling.session_seconds)
-            self.curie.run("overrides", self.agent, "--execution-deadline", str(window))
-            self.curie.run("budget", self.agent, "--output-tokens", str(self.ceiling.output_tokens))
+        self.configure_agent()
         agents = self.sql(f"SELECT id, tenant_id FROM curie.agents WHERE name = '{self.agent}'")
         if len(agents) != 1:
             raise StepFailed("the deployed agent is missing")

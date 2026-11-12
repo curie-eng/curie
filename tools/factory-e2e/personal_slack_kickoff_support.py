@@ -409,6 +409,31 @@ def parse_ceiling(text: str | None) -> Ceiling:
 ATTEMPT_ROLES = (IMPLEMENTER, IMPLEMENTER, PLAN_REVIEWER, DIFF_REVIEWER, DIFF_REVIEWER)
 
 
+# The full model ID behind the bundle's reviewer agents' ``opus`` alias. Personal
+# model authentication refuses a session unless the agent names an explicit
+# Claude reviewer model (runner/src/curie_runner/personal_auth.py,
+# require_claude_reviewer_model), and the alias is not one.
+REVIEWER_MODEL = "claude-opus-5-5"
+
+
+def reviewer_model(ceiling: Ceiling | None) -> str:
+    """The explicit reviewer model the agent carries, refused when the approval disagrees. Pure.
+
+    The approved ceiling's ``model.plan-reviewer`` and ``model.diff-reviewer``
+    must name one model; without a ceiling (a rehearsal) or without either key
+    the bundle's reviewer model applies.
+    """
+
+    if ceiling is None:
+        return REVIEWER_MODEL
+    named = {
+        ceiling.models[role] for role in (PLAN_REVIEWER, DIFF_REVIEWER) if role in ceiling.models
+    }
+    if len(named) > 1:
+        raise Refusal("live_unapproved", "--approve-live reviewer models differ")
+    return named.pop() if named else REVIEWER_MODEL
+
+
 def attempt_roles(ceiling: Ceiling) -> tuple[str, ...]:
     """The attempt's reserved roles, refused when the approved sessions cannot cover them."""
 
