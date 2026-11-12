@@ -261,7 +261,9 @@ relevant repository context. Make no edits and do not call
 3000 characters, answer the question from that evidence, and cite the
 Decisions entry number when it records the reason. When it does not, say
 plainly that the reason was not recorded. A plausible explanation from the
-current code is not a historical decision record.
+current code is not a historical decision record. Such an answer never enters
+plan review or publication, so a review gate notice about the checkout does
+not stop it; answer from the sources you can read and name any you could not.
 
 ## 2. Pin the acceptance criteria (phase `pin_criteria`)
 
