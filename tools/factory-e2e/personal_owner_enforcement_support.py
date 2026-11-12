@@ -2046,7 +2046,10 @@ def judge_rehearsal(ledger: OwnerLedger) -> dict[str, Any]:
         else:
             checks = _judge_observed(source, name)
             for check in checks:
-                if check["key"] in REHEARSAL_ONLY.get(name, set()):
+                if (
+                    (source.run() or {}).get("mode") == "rehearse"
+                    and check["key"] in REHEARSAL_ONLY.get(name, set())
+                ):
                     check["status"] = "rehearsal_only"
                     check["reason"] = "requires the native provider; fake-model reading retained"
         if name == "hosted-header":

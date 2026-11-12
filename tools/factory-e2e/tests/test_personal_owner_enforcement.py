@@ -1599,6 +1599,17 @@ def test_scope_reuses_only_proven_criteria_with_unchanged_product(
         assert result["criteria"][0]["source_run_id"] == "prior"
         assert poe.judge(current, "fencing")["verdict"] == "pass"
         assert poe.judge(current, "authentication-required")["verdict"] == "missing"
+        rehearsal = poe.OwnerLedger(prior.db, "rehearsal", prior.scrub)
+        rehearsal.begin(candidate, "rehearse", T0 + 2)
+        driver.reuse_prior_proof(rehearsal, candidate, "prior")
+        inherited = next(
+            c for c in poe.judge_rehearsal(rehearsal)["criteria"] if c["criterion"] == "restart"
+        )
+        epoch = next(
+            c for c in inherited["checks"] if c["key"] == "process.old_epoch_confirmed_before_bind"
+        )
+        assert epoch["status"] == "pass"
+        assert inherited["source_candidate"] == source_sha
         prior.record("selection", "claim.label.owner_principal_matches", False, T0)
         with pytest.raises(poe.StepFailed, match="remaining_scope_missing_selection_proof"):
             driver.reuse_prior_proof(current, candidate, "prior")
