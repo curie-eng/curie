@@ -50,6 +50,11 @@ def build_s3_client(
     half a pair (one value set, the other empty) still raises
     `PartialCredentialsError` at construction rather than quietly resolving an
     ambient identity, which would mask a typo'd key as a working deployment.
+
+    SigV4 is pinned explicitly: without `signature_version`, `generate_presigned_url`
+    emits SigV2 query parameters (`AWSAccessKeyId`/`Signature`) even though
+    `client.meta.config.signature_version` reports `s3v4`, and SSE-KMS buckets
+    reject SigV2 presigned URLs.
     """
     import boto3
     from botocore.client import Config as BotoConfig
@@ -60,5 +65,5 @@ def build_s3_client(
         aws_access_key_id=access_key or None,
         aws_secret_access_key=secret_key or None,
         region_name=region,
-        config=BotoConfig(s3={"addressing_style": "path"}),
+        config=BotoConfig(signature_version="s3v4", s3={"addressing_style": "path"}),
     )
