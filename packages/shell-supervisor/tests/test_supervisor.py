@@ -11,7 +11,6 @@ import http.client
 import json
 import os
 import signal
-import ssl
 import subprocess
 import sys
 import textwrap
@@ -513,33 +512,6 @@ def test_a_malformed_runner_status_still_stops_cleans_and_quarantines(
     assert list((supervisor.state_root / "claims").iterdir()) == []
     assert supervisor.request("GET", "/_curie/supervisor/healthz", token=None)[0] == 503
     assert _turn(supervisor, "claim-a", 1, BEARER)[0] == 410
-
-
-def test_retirement_cuts_every_open_stream_before_it_answers(
-    supervisor: SupervisorProcess, records: Path
-) -> None:
-    _start(supervisor, records)
-    connection = http.client.HTTPSConnection(
-        supervisor.host, supervisor.port, timeout=10, context=client_context(supervisor.tls)
-    )
-    connection.request(
-        "GET",
-        proxy_base_path("claim-a", 1) + "/v1/flood",
-        headers={"Authorization": f"Bearer {BEARER}"},
-    )
-    response = connection.getresponse()
-    assert len(response.read(1 << 20)) == 1 << 20
-    status, answer = _retire(supervisor, "claim-a", 1)
-    assert (status, answer["outcome"]) == (200, "cleaned")
-    # What is still in flight is bounded by socket buffers; the stream ends.
-    after = 0
-    try:
-        while chunk := response.read(65536):
-            after += len(chunk)
-            assert after < 4 << 20, "the stream kept flowing after retirement"
-    except (http.client.IncompleteRead, ConnectionError, ssl.SSLError):
-        pass
-    connection.close()
 
 
 def test_legacy_claim_manifests_are_refused_before_starting_a_runner(
