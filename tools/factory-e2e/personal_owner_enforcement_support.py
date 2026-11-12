@@ -1978,7 +1978,7 @@ def _judge_budget(ledger: OwnerLedger) -> list[dict[str, Any]]:
         "zero_usage_sessions_classified": all(item["error_classes"] for item in zero_usage),
         "grant_probe_ok": probe is True,
     }
-    expected = {
+    expected: dict[str, Any] = {
         **SPEND_CEILINGS,
         "spend_guard.breach": None,
         "sessions_within_ceiling": True,

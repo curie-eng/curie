@@ -30,10 +30,12 @@ import os
 import tarfile
 import threading
 import urllib.parse
+import uuid
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
+import personal_owner_enforcement_support as poes
 import personal_profile as pp
 import personal_profile_support as pps
 import personal_two_owner as pt
@@ -194,6 +196,8 @@ class _FakeShell(pp.Shell):
     Every argv is recorded after the guard accepts it. ``on(match, answer)``
     answers the first argv whose tokens include every ``match`` token in
     order; anything else exits 0, with ``{"items": []}`` for ``-o json``.
+    With ``log`` set, each call goes to the command log as ``pp.Shell.run``
+    writes it.
     """
 
     def __init__(self, runtime: pp.Runtime, cwd: Path, events: list[str] | None = None) -> None:
@@ -254,6 +258,8 @@ class _FakeShell(pp.Shell):
                 result = pp.Completed(0, b'{"items": []}', b"")
         if not sensitive_output:
             self.scan.scan("children", result.stdout)
+        if record_output:
+            self.record(call.argv, result, sensitive=sensitive_output, full=full_output)
         if check and result.returncode != 0:
             raise pp.StepFailed(f"{Path(call.argv[0]).name} exited {result.returncode}")
         return result
@@ -904,12 +910,6 @@ def test_live_run_takes_the_paid_phases_after_forge(tmp_path: Path) -> None:
     for name in pt.PAID_PHASES:
         method = getattr(pt.TwoOwnerRun, "phase_" + name.replace("-", "_"))
         assert getattr(paid[name], "__func__", None) is method, name
-    # The two methods stream S2b-2 supplies raise until they land.
-    _connect(h)
-    with pytest.raises(pp.StepFailed, match="interrupt_native_process: provided by stream S2b-2"):
-        h.run.interrupt_native_process("pod-b", {"cli_pid": 1, "cli_start": 2})
-    with pytest.raises(pp.StepFailed, match="delivery_checks: provided by stream S2b-2"):
-        h.run.delivery_checks(h.run.owners["a"], "claim-a")
     # A paid phase does nothing before its first reservation without the live window.
     assert h.ledger.session_rows() == []
 
@@ -1767,9 +1767,11 @@ def test_inventory_queries_every_two_owner_kind(
 # --------------------------------------------------------------------------
 # Paid phases: reservations, the gate, settlement and the phase checks
 #
-# The cluster-facing seams (runner image check, harvest and gate streams, the
-# S2b-2 methods, the fence) are replaced; the ledger, the gate decision, the
-# transcript parsing and the phase logic are the real ones. Transcripts take
+# The cluster-facing seams (runner image check, harvest and gate streams,
+# delivery_checks, the fence) are replaced; the ledger, the gate decision, the
+# transcript parsing and the phase logic are the real ones. The interruption
+# and delivery tests below run the real methods against the fake shell.
+# Transcripts take
 # the native CLI shape (test_personal_profile.py _transcripts), harvest lines
 # the pps.HARVEST_PROGRAM shape, and holds the pto.GATE_HOOK_PROGRAM record.
 # --------------------------------------------------------------------------
@@ -1780,6 +1782,7 @@ REQUEST_A1 = "5d0c7f3e-0000-4000-8000-0000000d0a01"
 REQUEST_B1 = "5d0c7f3e-0000-4000-8000-0000000d0b01"
 WORK_ITEM_B = "5d0c7f3e-0000-4000-8000-0000000c0002"
 HEAD_B1 = "1" * 40
+DELIVERY_KEYS = ("own_grant", "not_other", "runner_grant_ref_per_claim", "custody_secret_matches")
 HEAD_B2 = "2" * 40
 BRANCH_B = "curie/publication-" + "b" * 32
 
@@ -1825,7 +1828,7 @@ class _Live(pt.TwoOwnerRun):
 
     def delivery_checks(self, owner: pt.Owner, claim: str) -> dict[str, bool]:
         self.trace.append(f"delivery-{owner.name}")
-        return {"own_grant": True, "not_other": True}
+        return dict.fromkeys(DELIVERY_KEYS, True)
 
     def open_harvest(self, run: pt.PodRun) -> None:
         run.harvest = pps.HarvestState(self.scan)
@@ -2163,6 +2166,238 @@ def test_no_interruption_when_the_held_prompt_did_not_settle_to_zero(tmp_path: P
     assert calls == [] and h.ledger.reservations_of("b-r2") == []
     assert {row["source"] for row in _rows(h, "b-r1")} == {"unknown"}
     assert "fence" in _trace(h)
+
+
+def _witness(*, matched: bool = True, gone: bool = True) -> bytes:
+    """pto.INTERRUPT_PROGRAM's one stdout line."""
+
+    line = {"action": "signal_processes", "native_identity_matched": matched, "native_gone": gone}
+    return json.dumps(line).encode() + b"\n"
+
+
+def _answer(stdout: bytes) -> Answer:
+    return lambda _argv, _stdin: stdout
+
+
+def _interrupts(h: _Harness) -> list[list[str]]:
+    return [argv for argv in h.shell.kubectl() if "exec" in argv and "python3" in argv]
+
+
+def test_interruption_signals_the_held_identity_and_returns_the_judged_facts(
+    tmp_path: Path,
+) -> None:
+    h = _live(tmp_path)
+    held = _interruption_setup(h)
+    h.shell.on("exec", held.pod, "python3")(lambda _a, _s: _witness())
+    facts = h.run.interrupt_native_process(held.pod, held.kept or {})
+    assert facts == {
+        "action": "signal_processes",
+        "native_identity_matched": True,
+        "native_gone": True,
+        "old_epoch": 3,
+        "confirmed_epoch": 3,
+        "old_claim_still_bound_to_request": True,
+        "successor_claim_observed": False,
+        "driver_pod_delete_calls": 0,
+    }
+    assert poes.process_interruption_checks(facts) == {
+        "interruption_process_only": True,
+        "old_epoch_confirmed_before_bind": True,
+    }
+    (argv,) = _interrupts(h)
+    assert argv[:3] == ["kubectl", "--context", CONTEXT]
+    assert argv[argv.index("exec") :] == [
+        "exec",
+        held.pod,
+        "-c",
+        "runner",
+        "--",
+        "python3",
+        "-c",
+        pto.INTERRUPT_PROGRAM,
+        "4242",
+        "77",
+    ]
+    assert not [argv for argv in h.shell.kubectl() if "delete" in argv]
+    assert h.ledger.observations("diagnostics")["process_interruption_witness"] == facts
+    assert "fence" not in _trace(h)
+
+
+def test_interruption_fails_fenced_on_a_mismatch_or_an_unreadable_witness(
+    tmp_path: Path,
+) -> None:
+    for name, answer, match, recorded in (
+        ("mismatch", _witness(matched=False, gone=False), "identity did not match", True),
+        ("unreadable", b"Error from server: container not found\n", "no readable witness", False),
+        ("two-lines", _witness() + _witness(), "no readable witness", False),
+    ):
+        h = _live(tmp_path / name)
+        held = _interruption_setup(h)
+        h.shell.on("exec", held.pod, "python3")(_answer(answer))
+        with pytest.raises(pp.StepFailed, match=match):
+            h.run.interrupt_native_process(held.pod, held.kept or {})
+        assert len(_interrupts(h)) == 1 and "fence" in _trace(h), name
+        # fail_paid charged the open B-r1 reservation at its share.
+        assert {row["source"] for row in _rows(h, "b-r1")} == {"unknown"}, name
+        witness = h.ledger.observations("diagnostics").get("process_interruption_witness")
+        assert (witness is not None) is recorded, name
+        assert witness is None or witness["native_identity_matched"] is False
+    # An unknown hold or pod signals nothing: the program never runs.
+    h = _live(tmp_path / "unknown")
+    held = _interruption_setup(h)
+    for pod, hold in (
+        (held.pod, {**(held.kept or {}), "cli_pid": None}),
+        (held.pod, {**(held.kept or {}), "cli_pid": 1}),
+        ("pod-elsewhere", held.kept or {}),
+    ):
+        with pytest.raises(pp.StepFailed, match="nothing was signalled"):
+            h.run.interrupt_native_process(pod, hold)
+    assert _interrupts(h) == []
+
+
+def test_interruption_fails_fenced_when_a_successor_claim_appears(tmp_path: Path) -> None:
+    h = _live(tmp_path)
+    held = _interruption_setup(h)
+    listings = iter([[held.claim], [held.claim, "claim-b-r2"]])
+
+    def owner_claims(owner: pt.Owner) -> list[str]:
+        return next(listings)
+
+    h.run.owner_claims = owner_claims  # type: ignore[method-assign]
+    h.shell.on("exec", held.pod, "python3")(lambda _a, _s: _witness())
+    with pytest.raises(pp.StepFailed, match="successor claim"):
+        h.run.interrupt_native_process(held.pod, held.kept or {})
+    facts = h.ledger.observations("diagnostics")["process_interruption_witness"]
+    assert facts["successor_claim_observed"] is True and "fence" in _trace(h)
+    assert poes.process_interruption_checks(facts)["old_epoch_confirmed_before_bind"] is False
+
+
+def test_process_phase_passes_through_the_real_interruption(tmp_path: Path) -> None:
+    h = _live(tmp_path)
+    held = _interruption_setup(h)
+    h.shell.on("exec", held.pod, "python3")(lambda _a, _s: _witness())
+    h.run.phase_process_interruption()
+    assert len(_interrupts(h)) == 1
+    restarts = h.ledger.observations("restarts")
+    for key in (
+        "process_termination_epoch",
+        "process_identity_matched",
+        "process_no_pod_delete",
+        "process_old_runtime_absent",
+    ):
+        assert restarts[key] is True, key
+    assert h.ledger.observations("diagnostics")["process_interruption"] == {
+        "interruption_process_only": True,
+        "old_epoch_confirmed_before_bind": True,
+    }
+
+
+ENROLLMENT_A = "5d0c7f3e-0000-4000-8000-0000000e0a01"
+
+
+def _delivery_cluster(h: _Harness) -> dict[str, Any]:
+    """``claim-a-tokens``, its runner pod, A's custody row and Secret metadata.
+
+    Shapes: ``kubectl get secret -o json`` (data base64), a pod's
+    ``secretKeyRef`` env entry, the joined custody row as ``sql_rows`` reads
+    it, and the pto.CUSTODY_METADATA_JSONPATH line.
+    """
+
+    custody = f"curie-pe-{uuid.UUID(ENROLLMENT_A).hex}-g1"
+    state: dict[str, Any] = {"value": MARKER_A, "key": pps.PERSONAL_GRANT_ENV, "absent": False}
+
+    @h.shell.on("get", "secret", "claim-a-tokens")
+    def tokens(_argv: list[str], _stdin: bytes | None) -> Any:
+        if state["absent"]:
+            return pp.Completed(1, b"", b'Error from server (NotFound): secrets "x" not found\n')
+        encoded = base64.b64encode(state["value"].encode()).decode()
+        return {"metadata": {"name": "claim-a-tokens"}, "data": {state["key"]: encoded}}
+
+    ref = {"secretKeyRef": {"name": "claim-a-tokens", "key": pps.PERSONAL_GRANT_ENV}}
+    env = [{"name": pps.PERSONAL_GRANT_ENV, "valueFrom": ref}]
+    pod = {"metadata": {"name": "pod-a1"}, "spec": {"containers": [{"name": "runner", "env": env}]}}
+    h.shell.on("get", "pods")(lambda _a, _s: {"items": [pod]})
+    row = {
+        "enrollment_id": ENROLLMENT_A,
+        "generation": 1,
+        "state": "published",
+        "secret_namespace": h.run.grant_namespace,
+        "secret_name": custody,
+        "secret_key": pps.PERSONAL_GRANT_ENV,
+        "secret_uid": "uid-custody-a",
+        "header_generation": 1,
+        "active": True,
+    }
+    h.shell.on("psql")(lambda _a, _s: [row])
+    line = f"{custody}|uid-custody-a|curie|true|{uuid.UUID(ENROLLMENT_A).hex}|1"
+    h.shell.on("get", "secret", custody)(lambda _a, _s: line)
+    return state
+
+
+def test_delivery_checks_compare_digests_and_never_surface_the_grant(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    h = _harness(tmp_path, rehearsal=False)
+    _connect(h)
+    h.shell.log = h.run.inputs.command_log
+    state = _delivery_cluster(h)
+    owner = h.run.owners["a"]
+    assert h.run.delivery_checks(owner, "claim-a") == dict.fromkeys(DELIVERY_KEYS, True)
+    # B's grant in A's claim: neither A's own nor "not the other owner's".
+    state["value"] = MARKER_B
+    assert h.run.delivery_checks(owner, "claim-a") == {
+        **dict.fromkeys(DELIVERY_KEYS, True),
+        "own_grant": False,
+        "not_other": False,
+    }
+    # A missing key, a missing Secret, a failing read and no claim answer False.
+    state["value"], state["key"] = MARKER_A, "token"
+    missing = h.run.delivery_checks(owner, "claim-a")
+    state["key"], state["absent"] = pps.PERSONAL_GRANT_ENV, True
+    absent = h.run.delivery_checks(owner, "claim-a")
+    for result in (missing, absent):
+        assert result["own_grant"] is False and result["not_other"] is False
+    assert h.run.delivery_checks(owner, "") == dict.fromkeys(DELIVERY_KEYS, False)
+    reads = [call for call in h.shell.calls if "claim-a-tokens" in call.argv]
+    assert len(reads) == 4 and all(call.sensitive_output for call in reads)
+    selectors = [argv[argv.index("-l") + 1] for argv in h.shell.kubectl() if "pods" in argv]
+    assert set(selectors) == {f"{pp.POD_CLAIM_LABEL}=claim-a"}
+    # No grant form reaches argv, stdin, the command log, the ledger, a scan or the output.
+    forms = {
+        form
+        for marker in (MARKER_A, MARKER_B)
+        for raw in (marker.encode(),)
+        for form in (raw, base64.b64encode(raw), base64.b64encode(raw).rstrip(b"="))
+    }
+    for call in h.shell.calls:
+        assert not any(form.decode() in arg for form in forms for arg in call.argv)
+        assert not any(form in (call.stdin or b"") for form in forms)
+    entries = [json.loads(line) for line in h.run.inputs.command_log.read_bytes().splitlines()]
+    assert len(entries) == len(h.shell.calls)
+    for call, entry in zip(h.shell.calls, entries, strict=True):
+        if call in reads:
+            # pp.Shell.record keeps a sensitive call's exit only: no stdout, no stderr.
+            assert entry == {"argv": call.argv[:6], "exit": entry["exit"], "stderr_tail": ""}
+    for path in h.run.inputs.state_dir.rglob("*"):
+        if path.is_file():
+            assert not any(form in path.read_bytes() for form in forms), path.name
+    assert not any(entry.token_bytes_found for entry in h.runtime.scan.channels.values())
+    captured = capsys.readouterr()
+    assert not any(form.decode() in captured.out + captured.err for form in forms)
+
+
+def test_delivery_checks_never_raise_past_the_caller(tmp_path: Path) -> None:
+    h = _harness(tmp_path, rehearsal=False)
+    _connect(h)
+
+    def broken(_argv: list[str], _stdin: bytes | None) -> Any:
+        raise pp.StepFailed("kubectl could not complete")
+
+    for match in (("get", "secret"), ("get", "pods"), ("psql",)):
+        h.shell.on(*match)(broken)
+    assert h.run.delivery_checks(h.run.owners["b"], "claim-b") == dict.fromkeys(
+        DELIVERY_KEYS, False
+    )
 
 
 # -- the gate -------------------------------------------------------------------

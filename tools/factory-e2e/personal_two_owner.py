@@ -106,8 +106,6 @@ PAID_PHASES = (
     "approve-b2",
     "post-disconnect",
 )
-#: The two methods another stream supplies; this build raises with this text.
-S2B2 = "provided by stream S2b-2"
 
 # --------------------------------------------------------------------------
 # Names and labels
@@ -1821,11 +1819,16 @@ class TwoOwnerRun(pp.LiveRun):
             generation=pps.OWNER_GENERATION,
         )
         self.note("owners", "claim_labels", run.owner, labels)
-        own_ref = run.grant_ref == (f"{run.claim}{pto.CLAIM_TOKENS_SUFFIX}", pps.PERSONAL_GRANT_ENV)
-        self.note("owners", "runner_grant_ref_per_claim", run.owner, own_ref)
         run.delivery = self.delivery_checks(owner, run.claim)
+        own_ref = (
+            run.grant_ref == (f"{run.claim}{pto.CLAIM_TOKENS_SUFFIX}", pps.PERSONAL_GRANT_ENV)
+            and run.delivery.get("runner_grant_ref_per_claim") is True
+        )
+        self.note("owners", "runner_grant_ref_per_claim", run.owner, own_ref)
         self.note("owners", "delivery_own_grant", run.owner, run.delivery.get("own_grant"))
         self.note("owners", "delivery_not_other", run.owner, run.delivery.get("not_other"))
+        custody = run.delivery.get("custody_secret_matches") is True
+        self.note("owners", "delivery_custody_matches", run.owner, custody)
         if self.resolutions[run.owner]:
             # A claim started after one of the owner's cards was resolved.
             self.note(
@@ -1836,7 +1839,11 @@ class TwoOwnerRun(pp.LiveRun):
             )
         if not (candidate and labels and own_ref and not others):
             self.fail_paid(f"{run.group} runner pod failed its owner or image checks")
-        if not (run.delivery.get("own_grant") is True and run.delivery.get("not_other") is True):
+        if not (
+            run.delivery.get("own_grant") is True
+            and run.delivery.get("not_other") is True
+            and custody
+        ):
             self.fail_paid(f"{run.group} claim does not deliver the owner's own grant")
         self.open_harvest(run)
         run.gate = self.open_gate(run)
@@ -3353,34 +3360,171 @@ class TwoOwnerRun(pp.LiveRun):
         )
         return code == 409 and self.code_of(body) == "enrollment_inactive"
 
-    # -- the two methods stream S2b-2 supplies -------------------------------------------
+    # -- the native-process interruption and grant delivery ---------------------------
 
     def interrupt_native_process(self, pod: str, hold: Mapping[str, Any]) -> dict[str, Any]:
-        """Kill B-r1's held native CLI and SIGTERM runner PID 1 in ``pod`` (stream S2b-2).
+        """Kill B-r1's held native CLI and SIGTERM runner PID 1 in ``pod``.
 
         ``hold`` is B-r1's kept prompt-hold record; its ``cli_pid`` and raw
-        ``cli_start`` ticks name the native process, which must match before
-        any signal. The pod is never deleted. Returns the runner-side witness
-        facts ``poes.process_interruption_checks`` reads: ``action``
-        (``"signal_processes"``), ``native_identity_matched`` (the signalled
-        process had that pid and starttime) and ``native_gone`` (it is absent
-        afterwards), plus ``confirmed_epoch`` when the termination evidence
-        names one. The driver adds the epoch, claim and pod-delete facts from
-        SQL, the claim listing and its own delete log.
+        ``cli_start`` ticks name the native process, and ``pto.INTERRUPT_PROGRAM``
+        signals nothing unless that pid still has that starttime. Only the held
+        CLI (SIGKILL) and the runner (SIGTERM, so the container restarts in
+        place) are signalled; the pod is never deleted. Returns the witness
+        (``action``, ``native_identity_matched``, ``native_gone``) merged with
+        what ``poes.process_interruption_checks`` reads, read right after the
+        signals: ``old_epoch`` (the request row before), ``confirmed_epoch``
+        and ``old_claim_still_bound_to_request`` (the row after),
+        ``successor_claim_observed`` (any claim of the owner other than the
+        held one, before or after) and ``driver_pod_delete_calls`` (deletes of
+        this pod uid in the driver's log meanwhile). An unknown hold, an
+        unreadable witness, a mismatched identity or a successor claim fails
+        the phase, fenced.
         """
 
-        raise StepFailed(f"interrupt_native_process: {S2B2}")
+        held = next(
+            (run for run in self.active_pods() if run.pod == pod and run.kept is not None), None
+        )
+        identity = self.cli_identity(hold)
+        if not pod or held is None or identity is None or identity[0] <= 1:
+            self.fail_paid("the held native process is unknown; nothing was signalled")
+        owner = self.owners[held.owner]
+        before = self.request_row(held.request_id)
+        claims_before = set(self.owner_claims(owner))
+        deletes = len(self.pod_deletions)
+        pid, start = identity
+        try:
+            result = self.kube.ctl(
+                "exec",
+                pod,
+                "-c",
+                "runner",
+                "--",
+                "python3",
+                "-c",
+                pto.INTERRUPT_PROGRAM,
+                str(pid),
+                str(start),
+                check=False,
+                timeout=30,
+            )
+        except StepFailed:
+            self.fail_paid("the native-process interruption did not complete")
+        witness = pto.interrupt_witness(result.stdout)
+        if witness is None:
+            self.fail_paid("the native-process interruption left no readable witness")
+        # Recorded now and replaced by the merged facts below (one upserted key).
+        self.ledger.record("diagnostics", "process_interruption_witness", witness)
+        if not witness["native_identity_matched"]:
+            self.fail_paid(f"{held.group}'s native process identity did not match; not signalled")
+        after = self.request_row(held.request_id)
+        claims_after = set(self.owner_claims(owner))
+        facts = {
+            **witness,
+            "old_epoch": before.get("runtime_epoch"),
+            "confirmed_epoch": after.get("runtime_epoch"),
+            "old_claim_still_bound_to_request": bool(held.claim)
+            and after.get("runtime_claim_name") == held.claim,
+            "successor_claim_observed": bool((claims_before | claims_after) - {held.claim}),
+            "driver_pod_delete_calls": sum(
+                1 for _name, uid, _at in self.pod_deletions[deletes:] if uid == held.pod_uid
+            ),
+        }
+        self.ledger.record("diagnostics", "process_interruption_witness", facts)
+        if facts["successor_claim_observed"]:
+            self.fail_paid(f"a successor claim appeared at {held.group}'s interruption")
+        return facts
 
     def delivery_checks(self, owner: Owner, claim: str) -> dict[str, bool]:
-        """Whether ``<claim>-tokens`` delivers ``owner``'s own grant (stream S2b-2).
+        """Whether ``claim`` delivers ``owner``'s own grant, per claim, from its custody.
 
-        Returns ``own_grant`` (the Secret's grant digest equals the digest of
-        ``owner``'s grant file) and ``not_other`` (it differs from the other
-        owner's). Digests only: the Secret's bytes and the grant are never
-        printed, logged, recorded or placed in argv.
+        1. ``own_grant``: the ``<claim>-tokens`` Secret's grant digest equals
+           the digest of ``owner``'s held grant; ``not_other``: it differs from
+           the other owner's (``pto.claim_grant_delivery``).
+        2. ``runner_grant_ref_per_claim``: every runner pod of the claim reads
+           the grant only through a ``secretKeyRef`` to that Secret and key
+           (``pto.claim_grant_ref``).
+        3. ``custody_secret_matches``: the owner's one published custody row
+           (``curie.personal_claude_custody`` joined to its active enrollment
+           header) names a Secret in the grant namespace that exists with the
+           row's name, UID and labels (``pto.custody_secret_matches``).
+
+        The Secret is read with ``sensitive_output``: its stdout is neither
+        scanned into a channel nor logged, and only the comparisons leave; no
+        grant byte is printed, logged, recorded or placed in argv. A missing
+        Secret, key, pod or row, or any read that fails, answers False; this
+        never raises, so the caller's own checks fence.
         """
 
-        raise StepFailed(f"delivery_checks: {S2B2}")
+        other = next(item for name, item in self.owners.items() if name != owner.name)
+        secret = f"{claim}{pto.CLAIM_TOKENS_SUFFIX}"
+        checks = {
+            "own_grant": False,
+            "not_other": False,
+            "runner_grant_ref_per_claim": False,
+            "custody_secret_matches": False,
+        }
+        if not claim:
+            return checks
+        checks.update(self.safe(lambda: self.claim_grant(secret, owner, other), {}))
+        checks["runner_grant_ref_per_claim"] = self.safe(
+            lambda: pto.claim_grant_ref(
+                self.kube.json("get", "pods", "-l", f"{pp.POD_CLAIM_LABEL}={claim}", timeout=60),
+                secret,
+            ),
+            False,
+        )
+        checks["custody_secret_matches"] = self.safe(
+            functools.partial(self.custody_matches, owner), False
+        )
+        return checks
+
+    def claim_grant(self, secret: str, owner: Owner, other: Owner) -> dict[str, bool]:
+        """``pto.claim_grant_delivery`` over one ``<claim>-tokens`` read; digests only."""
+
+        values = [item.token.reveal() if item.token is not None else "" for item in (owner, other)]
+        if not all(values):
+            return {}
+        own, theirs = (pto.grant_digest(value) for value in values)
+        del values
+        result = self.kube.ctl(
+            "get", "secret", secret, "-o", "json", check=False, sensitive_output=True, timeout=60
+        )
+        try:
+            if result.returncode != 0:
+                return {}
+            return pto.claim_grant_delivery(result.stdout, secret=secret, own=own, other=theirs)
+        finally:
+            del result
+
+    def custody_matches(self, owner: Owner) -> bool:
+        """The owner's published custody row and the grant-namespace Secret it names agree."""
+
+        rows = self.sql_rows(
+            "SELECT c.enrollment_id, c.generation, c.state, c.secret_namespace, c.secret_name, "
+            "c.secret_key, c.secret_uid, e.generation AS header_generation, e.active "
+            "FROM curie.personal_claude_custody AS c "
+            "JOIN curie.personal_claude_enrollments AS e ON e.id = c.enrollment_id "
+            "AND e.tenant_id = c.tenant_id AND e.principal_id = c.principal_id "
+            "WHERE e.tenant_id = :'tenant'::uuid AND e.principal_id = :'principal'::uuid "
+            "AND c.state = 'published'",
+            {"tenant": owner.tenant_id, "principal": owner.principal_id},
+        )
+        name = pto.custody_row_secret(rows[0], namespace=self.grant_namespace) if rows else None
+        if len(rows) != 1 or name is None:
+            return False
+        listed = self.kube_in(self.grant_namespace).ctl(
+            "get",
+            "secret",
+            name,
+            "--ignore-not-found",
+            "-o",
+            pto.CUSTODY_METADATA_JSONPATH,
+            check=False,
+            timeout=60,
+        )
+        return listed.returncode == 0 and pto.custody_secret_matches(
+            rows[0], listed.stdout, namespace=self.grant_namespace
+        )
 
     # -- keys read across the run ---------------------------------------------------------
 

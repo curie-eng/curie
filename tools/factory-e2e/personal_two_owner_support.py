@@ -16,7 +16,9 @@ can be tested without a cluster:
 6. Dex, OIDC and chart values for a two-owner install, and a scan for any
    installation-wide grant;
 7. the OIDC login flow with an injected opener;
-8. issue fixtures, and the evidence contract and judges.
+8. issue fixtures, and the evidence contract and judges;
+9. the native-process interruption program and the per-claim grant-delivery
+   readers (digests and names only).
 
 Nothing here touches a cluster, a forge or a network. The only IO is the
 SQLite ledger file, the inputs file and the files it names (stat and the
@@ -27,9 +29,11 @@ names only.
 
 from __future__ import annotations
 
+import base64
 import copy
 import dataclasses
 import hashlib
+import hmac
 import html
 import http.cookies
 import json
@@ -3218,3 +3222,258 @@ def zero_usage_class(summary: Mapping[str, Any], *, planned: str | None = None) 
     if summary.get("synthetic"):
         return None
     return planned
+
+
+# --------------------------------------------------------------------------
+# K. The native-process interruption and per-claim grant delivery
+# --------------------------------------------------------------------------
+
+#: Test hook only: the process that stands in for runner PID 1. ``kubectl
+#: exec`` forwards no local environment, so in a runner container the program
+#: always signals PID 1.
+INTERRUPT_RUNNER_ENV = "PTO_INTERRUPT_RUNNER_PID"
+INTERRUPT_ACTION = "signal_processes"
+INTERRUPT_WITNESS_KEYS = frozenset({"action", "native_identity_matched", "native_gone"})
+INTERRUPT_POLL_SECONDS = 2
+
+# Run by ``kubectl exec <pod> -c runner -- python3 -c INTERRUPT_PROGRAM <pid>
+# <starttime>``. It is #5378's INTERRUPT_PROGRAM (personal_owner_enforcement.py)
+# narrowed to two signals. The held CLI is the process whose /proc stat field 22
+# (starttime, in clock ticks, the GATE_HOOK_PROGRAM ``cli_start``) equals the
+# argument; only that process gets SIGKILL, and only after the match. The
+# program polls for up to 2 s until it is gone, a zombie, or another process,
+# prints one witness line, then sends SIGTERM to the runner (PID 1) so the
+# container restarts in place and the kernel retries the turn on the same
+# request. A mismatch, a malformed argument, or a target that is PID 1, the
+# runner or the program itself signals nothing at all.
+_INTERRUPT_TEMPLATE = r"""
+import json, os, signal, sys, threading, time
+RUNNER = int(os.environ.get("@RUNNER_ENV@") or "1")
+
+
+def identity(pid):
+    try:
+        with open("/proc/%d/stat" % pid) as handle:
+            fields = handle.read().rsplit(")", 1)[1].split()
+        return fields[0], int(fields[19])
+    except (OSError, IndexError, ValueError):
+        return None
+
+
+def ended(pid, start):
+    now = identity(pid)
+    return now is None or now[0] == "Z" or now[1] != start
+
+
+try:
+    target, start = int(sys.argv[1]), int(sys.argv[2])
+except (IndexError, ValueError):
+    target, start = 0, -1
+eligible = (
+    len(sys.argv) == 3
+    and target > 1
+    and start >= 0
+    and target not in (RUNNER, os.getpid(), os.getppid())
+)
+before = identity(target) if eligible else None
+matched = before is not None and before[1] == start
+gone = False
+if matched:
+    try:
+        os.kill(target, signal.SIGKILL)
+    except OSError:
+        pass
+    pause = threading.Event()
+    until = time.monotonic() + @POLL_SECONDS@
+    gone = ended(target, start)
+    while not gone and time.monotonic() < until:
+        pause.wait(0.02)
+        gone = ended(target, start)
+witness = {"action": "@ACTION@", "native_identity_matched": matched, "native_gone": gone}
+print(json.dumps(witness), flush=True)
+if matched:
+    os.kill(RUNNER, signal.SIGTERM)
+"""
+INTERRUPT_PROGRAM = (
+    _INTERRUPT_TEMPLATE.replace("@RUNNER_ENV@", INTERRUPT_RUNNER_ENV)
+    .replace("@POLL_SECONDS@", str(INTERRUPT_POLL_SECONDS))
+    .replace("@ACTION@", INTERRUPT_ACTION)
+)
+
+
+def interrupt_witness(stdout: bytes) -> dict[str, Any] | None:
+    """INTERRUPT_PROGRAM's one witness line, or None for anything else. Pure.
+
+    Exactly one non-blank line holding exactly the three keys, the action
+    ``signal_processes`` and two booleans; a process reported gone that was
+    never matched is not a witness.
+    """
+
+    lines = [line for line in stdout.splitlines() if line.strip()]
+    if len(lines) != 1:
+        return None
+    try:
+        value = json.loads(lines[0])
+    except ValueError:
+        return None
+    if not isinstance(value, dict) or set(value) != INTERRUPT_WITNESS_KEYS:
+        return None
+    matched, gone = value["native_identity_matched"], value["native_gone"]
+    if value["action"] != INTERRUPT_ACTION or type(matched) is not bool or type(gone) is not bool:
+        return None
+    if gone and not matched:
+        return None
+    return {"action": INTERRUPT_ACTION, "native_identity_matched": matched, "native_gone": gone}
+
+
+#: The grant's env name in the runner and its sole key in ``<claim>-tokens``
+#: and in the custody Secret (custody_store.CUSTODY_SECRET_KEY).
+GRANT_KEY = pps.PERSONAL_GRANT_ENV
+
+
+def grant_digest(value: str) -> bytes:
+    """SHA-256 of one held grant, compared and never shown. Pure."""
+
+    return hashlib.sha256(value.encode()).digest()
+
+
+def claim_grant_delivery(
+    document: bytes, *, secret: str, own: bytes, other: bytes
+) -> dict[str, bool]:
+    """Whether a ``<claim>-tokens`` Secret JSON holds ``own``'s grant and not ``other``'s. Pure.
+
+    ``own`` and ``other`` are ``grant_digest`` values of the two owners'
+    distinct grants. The data value is decoded in memory, hashed and dropped;
+    only the two comparisons leave. Another Secret name, a missing or empty
+    key, a value that is not strict base64, or equal digests answer False for
+    both.
+    """
+
+    refused = {"own_grant": False, "not_other": False}
+    if len(own) != 32 or len(other) != 32 or hmac.compare_digest(own, other):
+        return refused
+    try:
+        parsed = json.loads(document)
+    except ValueError:
+        return refused
+    meta = parsed.get("metadata") if isinstance(parsed, dict) else None
+    data = parsed.get("data") if isinstance(parsed, dict) else None
+    encoded = data.get(GRANT_KEY) if isinstance(data, dict) else None
+    del parsed, data
+    if not isinstance(meta, dict) or meta.get("name") != secret or not isinstance(encoded, str):
+        return refused
+    try:
+        decoded = base64.b64decode(encoded, validate=True)
+    except ValueError:
+        return refused
+    finally:
+        del encoded
+    digest = hashlib.sha256(decoded).digest() if decoded else b""
+    del decoded
+    if not digest:
+        return refused
+    return {
+        "own_grant": hmac.compare_digest(digest, own),
+        "not_other": not hmac.compare_digest(digest, other),
+    }
+
+
+def claim_grant_ref(pods: Any, secret: str) -> bool:
+    """Every listed runner pod reads its grant only from ``secret``'s grant key. Pure.
+
+    True only for a non-empty pod list in which each pod has one ``runner``
+    container with exactly one ``CLAUDE_CODE_OAUTH_TOKEN`` env entry, whose
+    sole source is a required ``secretKeyRef`` to ``secret`` and that key, with
+    no literal value. Reads names only; a pod spec carries no Secret value.
+    """
+
+    items = pods.get("items") if isinstance(pods, dict) else None
+    if not isinstance(items, list) or not items:
+        return False
+    for pod in items:
+        spec = pod.get("spec") if isinstance(pod, dict) else None
+        containers = spec.get("containers") if isinstance(spec, dict) else None
+        runners = [
+            item
+            for item in (containers if isinstance(containers, list) else [])
+            if isinstance(item, dict) and item.get("name") == "runner"
+        ]
+        env = runners[0].get("env") if len(runners) == 1 else None
+        entries = [
+            item
+            for item in (env if isinstance(env, list) else [])
+            if isinstance(item, dict) and item.get("name") == GRANT_KEY
+        ]
+        if len(entries) != 1 or set(entries[0]) != {"name", "valueFrom"}:
+            return False
+        source = entries[0]["valueFrom"]
+        ref = source.get("secretKeyRef") if isinstance(source, dict) else None
+        if not isinstance(source, dict) or set(source) != {"secretKeyRef"}:
+            return False
+        if not isinstance(ref, dict) or ref.get("optional") is True:
+            return False
+        if ref.get("name") != secret or ref.get("key") != GRANT_KEY:
+            return False
+    return True
+
+
+#: kubectl jsonpath: ``name|uid|managed-by|custody|enrollment|generation`` for
+#: one custody Secret. Metadata only; its data never leaves the cluster.
+CUSTODY_METADATA_JSONPATH = (
+    'jsonpath={.metadata.name}{"|"}{.metadata.uid}{"|"}'
+    '{.metadata.labels.app\\.kubernetes\\.io/managed-by}{"|"}'
+    '{.metadata.labels.curietech\\.ai/personal-custody}{"|"}'
+    '{.metadata.labels.curietech\\.ai/personal-enrollment}{"|"}'
+    "{.metadata.labels.curietech\\.ai/personal-generation}"
+)
+
+
+def custody_row_secret(row: Mapping[str, Any], *, namespace: str) -> str | None:
+    """The Secret name one published custody row names, or None when the row is off. Pure.
+
+    ``row`` is one ``personal_claude_custody`` row joined to its enrollment
+    header (``header_generation``, ``active``). The name is computed from the
+    enrollment UUID and generation (``custody_store.custody_secret_name``), so
+    a caller's argv never carries a database string. None unless the row is
+    published for the active header's generation in ``namespace`` with the
+    grant key, a UID, and exactly that name.
+    """
+
+    try:
+        enrollment = uuid.UUID(str(row.get("enrollment_id")))
+    except ValueError:
+        return None
+    generation, uid = row.get("generation"), row.get("secret_uid")
+    if type(generation) is not int or generation < 1 or not isinstance(uid, str) or not uid.strip():
+        return None
+    name = f"curie-pe-{enrollment.hex}-g{generation}"
+    if (
+        row.get("state") == "published"
+        and row.get("active") is True
+        and row.get("header_generation") == generation
+        and row.get("secret_namespace") == namespace
+        and row.get("secret_name") == name
+        and row.get("secret_key") == GRANT_KEY
+    ):
+        return name
+    return None
+
+
+def custody_secret_matches(row: Mapping[str, Any], listed: bytes, *, namespace: str) -> bool:
+    """The owner's published custody row and the Secret it names agree. Pure.
+
+    ``listed`` is the CUSTODY_METADATA_JSONPATH line for the Secret
+    ``custody_row_secret`` names. True only when that Secret carries the name,
+    the row's UID and the four ``custody_store.custody_labels`` (managed by
+    curie, custody true, the enrollment hex and the generation).
+    """
+
+    name = custody_row_secret(row, namespace=namespace)
+    if name is None:
+        return False
+    lines = [line for line in listed.decode(errors="replace").splitlines() if line.strip()]
+    if len(lines) != 1:
+        return False
+    enrollment = uuid.UUID(str(row["enrollment_id"])).hex
+    expected = [name, str(row["secret_uid"]), "curie", "true", enrollment, str(row["generation"])]
+    return lines[0].strip().split("|") == expected

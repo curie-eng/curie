@@ -18,6 +18,8 @@ from __future__ import annotations
 
 import ast
 import atexit
+import base64
+import contextlib
 import copy
 import dataclasses
 import functools
@@ -25,6 +27,7 @@ import json
 import os
 import queue
 import shutil
+import signal
 import sqlite3
 import subprocess
 import sys
@@ -32,7 +35,7 @@ import tempfile
 import threading
 import urllib.parse
 import uuid
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from pathlib import Path
 from typing import Any, Literal
 
@@ -2986,3 +2989,246 @@ def test_zero_usage_class_keeps_the_error_class_or_the_planned_name() -> None:
     assert pto.zero_usage_class({"error_classes": [], "synthetic": 1}) is None
     assert pto.zero_usage_class({"error_classes": []}, planned="prompt_hold") == "prompt_hold"
     assert pto.zero_usage_class({"error_classes": []}) is None
+
+
+# --------------------------------------------------------------------------
+# K. The native-process interruption and per-claim grant delivery
+# --------------------------------------------------------------------------
+
+needs_proc = pytest.mark.skipif(
+    not Path("/proc/self/stat").exists(), reason="reads /proc as the runner container does"
+)
+WITNESS = {"action": "signal_processes", "native_identity_matched": True, "native_gone": True}
+UNMATCHED = {"action": "signal_processes", "native_identity_matched": False, "native_gone": False}
+
+
+def _starttime(pid: int) -> int:
+    """/proc stat field 22, as GATE_HOOK_PROGRAM records ``cli_start``."""
+
+    return int(Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()[19])
+
+
+@contextlib.contextmanager
+def _sleepers(count: int) -> Iterator[list[subprocess.Popen[bytes]]]:
+    """Harmless stand-ins blocked on stdin; an EOF ends each one with status 0."""
+
+    processes = [
+        subprocess.Popen(
+            [sys.executable, "-I", "-c", "import sys; sys.stdin.read()"], stdin=subprocess.PIPE
+        )
+        for _ in range(count)
+    ]
+    try:
+        yield processes
+    finally:
+        for process in processes:
+            if process.poll() is None:
+                process.kill()
+            process.wait(timeout=30)
+            if process.stdin is not None:
+                process.stdin.close()
+
+
+def _ended(process: subprocess.Popen[bytes]) -> int:
+    """Close the stand-in's stdin and reap it: 0 means no signal ever reached it."""
+
+    assert process.stdin is not None
+    process.stdin.close()
+    return process.wait(timeout=30)
+
+
+def _interrupt(target: int, start: int | str, runner: int) -> dict[str, Any] | None:
+    """INTERRUPT_PROGRAM as a real process; ``runner`` always stands in for PID 1."""
+
+    result = subprocess.run(
+        [sys.executable, "-I", "-c", pto.INTERRUPT_PROGRAM, str(target), str(start)],
+        env={"PATH": os.environ.get("PATH", ""), pto.INTERRUPT_RUNNER_ENV: str(runner)},
+        capture_output=True,
+        timeout=60,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
+    return pto.interrupt_witness(result.stdout)
+
+
+def test_interrupt_program_signals_only_the_held_cli_and_the_runner() -> None:
+    compile(pto.INTERRUPT_PROGRAM, "interrupt", "exec")
+    assert "@" not in pto.INTERRUPT_PROGRAM
+    tree = ast.parse(pto.INTERRUPT_PROGRAM)
+    senders = {"kill", "killpg", "pidfd_send_signal", "raise_signal", "pthread_kill"}
+    signals = sorted(
+        ast.unparse(node)
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call) and ast.unparse(node.func).split(".")[-1] in senders
+    )
+    # Two signals in all: SIGKILL to the matched target, SIGTERM to the runner.
+    assert signals == ["os.kill(RUNNER, signal.SIGTERM)", "os.kill(target, signal.SIGKILL)"]
+    assert "listdir" not in pto.INTERRUPT_PROGRAM
+
+
+@needs_proc
+def test_interrupt_program_kills_the_matched_cli_then_terms_the_runner() -> None:
+    with _sleepers(3) as (cli, runner, bystander):
+        witness = _interrupt(cli.pid, _starttime(cli.pid), runner.pid)
+        # The killed CLI is this test's unreaped child, so the program saw a zombie.
+        assert witness == WITNESS
+        assert cli.wait(timeout=30) == -signal.SIGKILL
+        assert _ended(runner) == -signal.SIGTERM
+        assert _ended(bystander) == 0
+
+
+@needs_proc
+def test_interrupt_program_signals_nothing_without_an_identity_match() -> None:
+    with _sleepers(2) as (cli, runner):
+        start = _starttime(cli.pid)
+        for target, ticks in (
+            (cli.pid, start + 1),
+            (cli.pid, "not-a-tick"),
+            (runner.pid, _starttime(runner.pid)),
+        ):
+            assert _interrupt(target, ticks, runner.pid) == UNMATCHED, (target, ticks)
+        assert _ended(cli) == 0 and _ended(runner) == 0
+
+
+def test_interrupt_witness_reads_exactly_one_witness_line() -> None:
+    line = json.dumps(WITNESS).encode()
+    assert pto.interrupt_witness(line + b"\n") == WITNESS
+    assert pto.interrupt_witness(b"\n" + json.dumps(UNMATCHED).encode() + b"\n") == UNMATCHED
+    for bad in (
+        b"",
+        line + b"\n" + line,
+        b"not json",
+        b"[]",
+        json.dumps({**WITNESS, "extra": 1}).encode(),
+        json.dumps({**WITNESS, "action": "delete_pod"}).encode(),
+        json.dumps({**WITNESS, "native_gone": "true"}).encode(),
+        json.dumps({**UNMATCHED, "native_gone": True}).encode(),
+        json.dumps({key: WITNESS[key] for key in ("action", "native_gone")}).encode(),
+    ):
+        assert pto.interrupt_witness(bad) is None, bad
+
+
+def _tokens_secret(
+    value: str | None, *, name: str = "claim-a-tokens", key: str = pto.GRANT_KEY
+) -> bytes:
+    """A ``<claim>-tokens`` Secret as ``kubectl get secret -o json`` prints it."""
+
+    data = {} if value is None else {key: base64.b64encode(value.encode()).decode()}
+    secret = {"apiVersion": "v1", "kind": "Secret", "metadata": {"name": name}, "data": data}
+    return json.dumps({**secret, "type": "Opaque"}).encode()
+
+
+def test_claim_grant_delivery_compares_digests_only() -> None:
+    own, other = pto.grant_digest(GRANT_A), pto.grant_digest(GRANT_B)
+    check = functools.partial(
+        pto.claim_grant_delivery, secret="claim-a-tokens", own=own, other=other
+    )
+    refused = {"own_grant": False, "not_other": False}
+    assert check(_tokens_secret(GRANT_A)) == {"own_grant": True, "not_other": True}
+    assert check(_tokens_secret(GRANT_B)) == refused
+    marker = "synthetic-unrelated-marker"
+    assert check(_tokens_secret(marker)) == {"own_grant": False, "not_other": True}
+    invalid = {"metadata": {"name": "claim-a-tokens"}, "data": {pto.GRANT_KEY: "!!not base64"}}
+    for document in (
+        _tokens_secret(None),
+        _tokens_secret(""),
+        _tokens_secret(GRANT_A, key="token"),
+        _tokens_secret(GRANT_A, name="claim-b-tokens"),
+        json.dumps(invalid).encode(),
+        b"{",
+        b"[]",
+    ):
+        assert check(document) == refused, document
+    # Equal digests prove nothing about "not the other owner's".
+    same = pto.claim_grant_delivery(
+        _tokens_secret(GRANT_A), secret="claim-a-tokens", own=own, other=own
+    )
+    assert same == refused
+
+
+def _runner_pod(env: list[dict[str, Any]]) -> dict[str, Any]:
+    containers = [{"name": "runner", "env": env}, {"name": "sidecar", "env": []}]
+    return {"metadata": {"name": "pod-a"}, "spec": {"containers": containers}}
+
+
+def test_claim_grant_ref_needs_exactly_the_claim_secret_and_key() -> None:
+    def ref(**source: Any) -> dict[str, Any]:
+        selector = {"name": "claim-a-tokens", "key": pto.GRANT_KEY, **source}
+        return {"name": pto.GRANT_KEY, "valueFrom": {"secretKeyRef": selector}}
+
+    plain = {"name": "CURIE_SETTING", "value": "marker"}
+    assert pto.claim_grant_ref(
+        {"items": [_runner_pod([ref()]), _runner_pod([plain, ref()])]}, "claim-a-tokens"
+    )
+    literal = {"name": pto.GRANT_KEY, "value": "marker"}
+    config = {"name": pto.GRANT_KEY, "valueFrom": {"configMapKeyRef": {"name": "c", "key": "k"}}}
+    both = {**ref(), "value": "marker"}
+    cases: list[dict[str, Any]] = [
+        {},
+        {"items": []},
+        {"items": [_runner_pod([])]},
+        {"items": [_runner_pod([ref(), ref()])]},
+        {"items": [_runner_pod([ref(name="claim-b-tokens")])]},
+        {"items": [_runner_pod([ref(key="token")])]},
+        {"items": [_runner_pod([ref(optional=True)])]},
+        {"items": [_runner_pod([literal])]},
+        {"items": [_runner_pod([config])]},
+        {"items": [_runner_pod([both])]},
+        {"items": [_runner_pod([ref()]), {"spec": {"containers": []}}]},
+    ]
+    for pods in cases:
+        assert not pto.claim_grant_ref(pods, "claim-a-tokens"), pods
+
+
+ENROLLMENT = uuid.UUID("5d0c7f3e-0000-4000-8000-0000000e0a01")
+GRANT_NAMESPACE = "pto-acme-1-grants"
+CUSTODY_NAME = f"curie-pe-{ENROLLMENT.hex}-g1"
+
+
+def _custody_row(**changes: Any) -> dict[str, Any]:
+    """One joined custody row as ``sql_rows`` returns it (row_to_json shapes)."""
+
+    row = {
+        "enrollment_id": str(ENROLLMENT),
+        "generation": 1,
+        "state": "published",
+        "secret_namespace": GRANT_NAMESPACE,
+        "secret_name": CUSTODY_NAME,
+        "secret_key": pto.GRANT_KEY,
+        "secret_uid": "uid-custody-a",
+        "header_generation": 1,
+        "active": True,
+    }
+    return {**row, **changes}
+
+
+def test_custody_secret_matches_the_published_row_name_uid_and_labels() -> None:
+    assert ".data" not in pto.CUSTODY_METADATA_JSONPATH
+    listed = f"{CUSTODY_NAME}|uid-custody-a|curie|true|{ENROLLMENT.hex}|1".encode()
+    row = _custody_row()
+    assert pto.custody_row_secret(row, namespace=GRANT_NAMESPACE) == CUSTODY_NAME
+    assert pto.custody_secret_matches(row, listed, namespace=GRANT_NAMESPACE)
+    for changes in (
+        {"state": "retiring"},
+        {"active": False},
+        {"header_generation": 2},
+        {"secret_namespace": "pto-acme-1"},
+        {"secret_name": "curie-pe-other-g1"},
+        {"secret_key": "token"},
+        {"secret_uid": None},
+        {"secret_uid": " "},
+        {"enrollment_id": "not-a-uuid"},
+        {"generation": True},
+    ):
+        changed = _custody_row(**changes)
+        assert pto.custody_row_secret(changed, namespace=GRANT_NAMESPACE) is None, changes
+        assert not pto.custody_secret_matches(changed, listed, namespace=GRANT_NAMESPACE)
+    for line in (
+        b"",
+        listed.replace(b"uid-custody-a", b"uid-other"),
+        listed.replace(b"|curie|", b"|helm|"),
+        listed.replace(b"|true|", b"||"),
+        listed[: -len(b"|1")] + b"|2",
+        listed + b"\n" + listed,
+    ):
+        assert not pto.custody_secret_matches(row, line, namespace=GRANT_NAMESPACE), line
