@@ -664,17 +664,55 @@ def test_committed_state_and_old_runtime_are_hard_requirements(
     assert check["status"] == "fail" and "blocked_by" not in check
 
 
-def test_only_the_pod_nonce_is_not_met_and_the_process_nonce_is_required(
+def test_process_and_pod_uncommitted_workspace_gaps_are_observations(
     tmp_path: Path,
 ) -> None:
-    blocked = [key for criterion, key in poe.NOT_MET if criterion == "restart"]
-    assert blocked == ["pod.workspace_nonce_restored"]
     ledger = _live_ledger(tmp_path)
     _record_all(ledger, "restart")
-    ledger.record("restart", "process.workspace_nonce_restored", False, T0)
-    assert poe.judge(ledger, "restart")["verdict"] == "fail"
-    assert "worker.workspace_nonce_retained_informational" not in poe.EXPECTED["restart"]
+    for kind in ("process", "pod"):
+        ledger.record("restart", f"{kind}.workspace_nonce_restored", False, T0)
+    ledger.record("restart", "process.same_pod", False, T0)
+    ledger.record("restart", "process.container_restarted", False, T0)
+    ledger.record("restart", "worker.workspace_nonce_retained_informational", False, T0)
+    for kind in poe.RESTART_KINDS:
+        ledger.record("restart", f"{kind}.git_status_before", ["?? .proof-nonce"], T0)
+        ledger.record("restart", f"{kind}.git_status_after", [], T0)
+    result = poe.judge(ledger, "restart")
+    assert result["verdict"] == "not_met"
+    checks = {c["key"]: c for c in result["criteria"][0]["checks"]}
+    for kind in ("process", "pod"):
+        check = checks[f"{kind}.workspace_nonce_restored"]
+        assert check["status"] == "not_met"
+        assert check["blocked_by"] == "#5541" and check["upstream"] == "#5092"
+    assert checks["process.same_pod"]["status"] == "informational"
+    assert checks["process.container_restarted"]["status"] == "informational"
     assert poe.exit_code("missing") == poe.exit_code("fail") == poe.EXIT_FAIL
+
+
+@pytest.mark.parametrize(
+    "key",
+    [
+        *[
+            f"{kind}.{field}"
+            for kind in poe.RESTART_KINDS
+            for field in ("history_identity", "fresh_native_process", "committed_files_restored")
+        ],
+        "pod.new_pod",
+        "worker.worker_restarted",
+        "process.interruption_process_only",
+        "process.old_epoch_confirmed_before_bind",
+    ],
+)
+def test_audit_keeps_explicit_recovery_requirements_blocking(tmp_path: Path, key: str) -> None:
+    ledger = _live_ledger(tmp_path)
+    _record_all(ledger, "restart")
+    for kind in ("process", "pod"):
+        ledger.record("restart", f"{kind}.workspace_nonce_restored", False, T0)
+    ledger.record("restart", key, False, T0)
+    result = poe.judge(ledger, "restart")
+    assert result["verdict"] == "fail"
+    check = next(c for c in result["criteria"][0]["checks"] if c["key"] == key)
+    assert check["status"] == "fail" and "blocked_by" not in check
 
 
 def _budget_ledger(tmp_path: Path, **session: Any) -> poe.OwnerLedger:
@@ -1779,6 +1817,7 @@ def test_a_failed_live_criterion_stops_before_a_later_session(tmp_path: Path, pa
         proof.observe("selection", "claim.label.owner_tenant_matches", False)
     assert ledger.observations("selection")["claim.label.owner_tenant_matches"] is False
     proof.observe("restart", "pod.workspace_nonce_restored", False)
+    proof.observe("restart", "process.workspace_nonce_restored", False)
     proof.observe("restart", "informational", "recorded")
 
 

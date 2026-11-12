@@ -1740,9 +1740,9 @@ EXPECTED: dict[str, dict[str, Any]] = {
         },
         "process.interruption_process_only": True,
         "process.old_epoch_confirmed_before_bind": True,
+        # Observations of the tracked restoration gap, never live stop conditions.
         "process.workspace_nonce_restored": True,
         "pod.new_pod": True,
-        # Not met by design today: #5541 (blocked by #5092).
         "pod.workspace_nonce_restored": True,
         "worker.worker_restarted": True,
     },
@@ -1767,6 +1767,7 @@ EXPECTED: dict[str, dict[str, Any]] = {
 }
 # Recorded as Not met, naming the blocking issue, when observed differs.
 NOT_MET: dict[tuple[str, str], str] = {
+    ("restart", "process.workspace_nonce_restored"): BLOCKING_ISSUE,
     ("restart", "pod.workspace_nonce_restored"): BLOCKING_ISSUE,
 }
 CLEANUP_KINDS = (

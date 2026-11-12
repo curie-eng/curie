@@ -616,16 +616,48 @@ container restart are observations rather than pass conditions. The driver
 records the exact native process identity before signalling it, observes it
 gone, and confirms the request still binds the captured runtime epoch and
 claim before any successor owner claim appears. It records every driver Pod
-delete call and requires none during this interruption. The process case still
-requires its uncommitted nonce to survive. Live-provider recovery used a fresh
+delete call and requires none during this interruption. Live-provider recovery used a fresh
 Pod, while the fake-model rehearsal restarted the container in place. This is
-an observed difference. The Pod
-recreation stages the checkout again from its durable source, so committed
-state is restored and the uncommitted nonce is absent: that one check is
-recorded Not met citing #5541 (blocked by #5092), and the judge exits 3 when it
-is the only shortfall. The worker interruption records whether the nonce
+an observed difference. Fresh-Pod recovery stages the checkout again from its
+durable source, so committed state is restored and the uncommitted nonce is
+absent. Process interruption and Pod recreation both record this observation
+as **Not met: #5541** (blocked by #5092), and neither stops the live scenario.
+The judge exits 3 when tracked restoration observations are the only shortfall.
+The worker interruption records whether the nonce
 survived as information only, since recovery may adopt the retained Pod or
 start a new one. The status before and after is recorded for every pair.
+
+### Live condition audit
+
+The live conditions were checked against ACs 2, 3, 5, 6 and 7 before another
+paid start. No pass condition requires surviving process memory or an
+uncommitted file. The complete set of observations touching those assumptions
+is below; all other conditions remain blocking.
+
+| Condition | AC | Disposition |
+| --- | --- | --- |
+| `process.same_pod` | 7 | Informational; cold-claim recovery may use a fresh Pod. |
+| `process.container_restarted` | 7 | Informational; an in-place restart is not required. |
+| `process.workspace_nonce_restored` | 7 | Observation, Not met: #5541 when absent. |
+| `pod.workspace_nonce_restored` | 7 | Observation, Not met: #5541 when absent. |
+| `worker.workspace_nonce_retained_informational` | 2, 7 | Informational; uncommitted restoration remains #5541. |
+| Each interruption's `git_status_before` and `git_status_after` | 7 | Observations; a clean recreated checkout is allowed. |
+
+AC 2 retains owner/generation fencing, denial across worker restart, old-claim
+and delivery-Secret removal, epoch-confirmed teardown and explicit
+revalidation. AC 3 retains original-owner preservation, durable transcript
+preservation on provider rejection, no service fallback, disconnect denial
+across restart and a fresh revalidated native process. AC 5's HTTP/consumer
+suite checks admission and the persisted owner tuple; it imposes no Pod,
+memory or uncommitted-file requirement. AC 6 retains actual connector/tool
+liveness, public and exposed-marker controls, child credential denials and
+complete captures; scanner files are read in the session that wrote them,
+without crossing a recovery boundary. AC 7 retains durable history and replay,
+committed HEAD and file restoration, owner and authorized generation, fresh
+native processes, interruption-specific old-runtime absence, and a new Pod UID
+for the Pod-deletion case. Process-only interruption and old-epoch confirmation
+before a successor claim binds remain required. The fresh-process and new-Pod
+conditions match explicit AC 3 and AC 7 text and are not converted to observations.
 
 ### Known limits
 
