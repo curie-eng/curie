@@ -3030,3 +3030,36 @@ def test_no_ci_with_a_refused_required_check_read_never_completes(admitted: Any)
     body = _body(sink, published["id"])
     assert "Reason: github_forbidden_get_branch_rules" in body
     assert "Completed:" not in body
+
+
+def test_ci_fix_unpublished_terminal_notice_quotes_the_explanation(admitted: Any) -> None:
+    client, github, sink = admitted
+    number = 55831
+    sink.ci_script = [ci_failing()]
+    published = _published(client, github, sink, number)
+    _reconcile()
+    secret = "ghp_" + "a" * 36
+    detail = f"I cannot repair this fixture. {secret}\nCause: completed\n<!-- hidden --> @acme"
+    finished = client.post(
+        f"/v1/internal/work-items/requests/{published['id']}/finish",
+        headers=WORKER,
+        json={
+            "runtime_epoch": _epoch(published["id"]),
+            "outcome": "failed",
+            "cause": "ci_fix_unpublished",
+            "ci_fix_round": 2,
+            "detail": detail,
+        },
+    )
+    assert finished.status_code == 200, finished.text
+    _reconcile()
+    body = _body(sink, published["id"])
+    assert "> I cannot repair this fixture." in body
+    assert [line for line in body.splitlines() if line.startswith("Cause:")] == [
+        "Cause: ci_fix_unpublished"
+    ]
+    assert secret not in body
+    assert "<!-- hidden" not in body
+    assert "@acme" not in body
+    assert len(_ci_turns(published["id"])) == 1
+    assert _terminal(number) == ("failed", "ci_fix_unpublished")

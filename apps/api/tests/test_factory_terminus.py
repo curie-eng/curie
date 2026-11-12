@@ -1282,7 +1282,12 @@ def test_failure_and_opened_pull_request_each_post_one_final_comment(
 
 
 def _attach_publication(
-    work_item_id: uuid.UUID, *, status: str, pr: int | None, head_sha: str = HEAD_A
+    work_item_id: uuid.UUID,
+    *,
+    status: str,
+    pr: int | None,
+    head_sha: str = HEAD_A,
+    bind_lineage: bool = True,
 ) -> None:
     async def go() -> None:
         engine = create_async_engine(get_settings().database_url)
@@ -1423,7 +1428,7 @@ def _attach_publication(
                         "result": pr_url,
                     },
                 )
-                if pr is not None:
+                if pr is not None and bind_lineage:
                     changed = await conn.execute(
                         text(
                             "UPDATE curie.work_items SET publication_lineage_id = :lineage, "

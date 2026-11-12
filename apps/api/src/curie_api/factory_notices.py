@@ -211,7 +211,9 @@ _PROVIDER_MESSAGE_CAUSES = frozenset(
 )
 # A run that ended without publishing carries the agent's own last message
 # (#3128). Quote each line and neutralize HTML, image syntax and mentions.
-_AGENT_MESSAGE_CAUSES = frozenset({"early_stop", "no_pull_request", "revision_unchanged"})
+_AGENT_MESSAGE_CAUSES = frozenset(
+    {"early_stop", "no_pull_request", "revision_unchanged", "ci_fix_unpublished"}
+)
 # Wire classification a text-only consumer reads off the status comment (#3401).
 # Same tokens as the channel reply's ``curie-turn-failure:`` line. Causes with
 # no entry stay unlabeled rather than inventing a class.
@@ -324,7 +326,7 @@ def render_base_line(
 async def mark_status_comment_stale(session: AsyncSession, work_item_id: uuid.UUID) -> None:
     """Let the reconciler edit the latest status comment once more.
 
-    A selected or requested base change must reach a comment that was already
+    A base or publication change must reach a comment that was already
     finalized. A sync holding the lease is flagged so its writeback leaves the
     row due. The comment re-finalizes after the edit.
     """
@@ -352,6 +354,14 @@ async def mark_status_comment_stale(session: AsyncSession, work_item_id: uuid.UU
             sync_invalidated=FactoryStatusComment.sync_owner.is_not(None),
         )
     )
+
+
+async def mark_lineage_status_comment_stale(session: AsyncSession, lineage_id: uuid.UUID) -> None:
+    work_item_id = await session.scalar(
+        select(WorkItem.id).where(WorkItem.publication_lineage_id == lineage_id)
+    )
+    if work_item_id is not None:
+        await mark_status_comment_stale(session, work_item_id)
 
 
 # The four state labels the pass owns (#3077, #3221). A closed set, never a
@@ -385,9 +395,11 @@ _PAUSED_FOR_UPGRADE_LINE = (
 )
 
 
-def desired_label(status: str) -> str:
+def desired_label(status: str, *, pr_state: str | None = None) -> str:
     """The state label for a request status; '' means none of the four."""
 
+    if status in {"failed", "expired"} and pr_state == "merged":
+        return ""
     return _DESIRED_LABEL.get(status, "")
 
 
@@ -651,6 +663,15 @@ def _digest(body: str) -> str:
 
 def _desired_label_sql() -> Any:
     return case(
+        (
+            and_(
+                ExecutionRequest.status.in_(("failed", "expired")),
+                ThreadPublicationLineage.status == "merged",
+                ThreadPublicationLineage.pr_number.is_not(None),
+                ThreadPublicationLineage.pr_url.is_not(None),
+            ),
+            literal(""),
+        ),
         *[
             (ExecutionRequest.status == status, literal(label))
             for status, label in _DESIRED_LABEL.items()
@@ -743,6 +764,7 @@ class _StatusClaim:
     opened_pr: int | None
     work_item_id: uuid.UUID
     status: str
+    pr_state: str | None
     target: ReplyTarget
     body: str
     latest: bool
@@ -784,6 +806,7 @@ async def _claim_next(
                 ExecutionRequest,
                 ThreadPublicationLineage.pr_url,
                 ThreadPublicationLineage.pr_number,
+                ThreadPublicationLineage.status,
                 is_latest.label("is_latest"),
             )
             .join(WorkItem, WorkItem.id == FactoryStatusComment.work_item_id)
@@ -815,7 +838,9 @@ async def _claim_next(
     ).one_or_none()
     if selected is None:
         return None
-    row, work_item, request, pr_url, pr_number, latest = selected
+    row, work_item, request, pr_url, pr_number, pr_state, latest = selected
+    if pr_number is None or not pr_url:
+        pr_state = None
     now = await _clock(session)
     await session.execute(
         update(FactoryStatusComment)
@@ -854,6 +879,7 @@ async def _claim_next(
         request,
         target,
         pr_url=pr_url,
+        pr_state=pr_state,
         paused_for_upgrade=paused_for_upgrade,
     )
     claim = _StatusClaim(
@@ -865,6 +891,7 @@ async def _claim_next(
         opened_pr=opened_pr,
         work_item_id=work_item.id,
         status=request.status,
+        pr_state=pr_state,
         target=target,
         body=body,
         latest=bool(latest),
@@ -1150,6 +1177,7 @@ async def _render(
     target: ReplyTarget,
     *,
     pr_url: str | None,
+    pr_state: str | None = None,
     paused_for_upgrade: bool = False,
 ) -> str:
     cause = row.terminal_cause or request.terminal_cause
@@ -1233,6 +1261,13 @@ async def _render(
                 lost_retried=retrying,
                 run_cost_usd=run_cost_usd,
             )
+            if (
+                request.status in {"failed", "expired", "cancelled"}
+                and pr_url
+                and pr_state in {"open", "merged", "closed"}
+            ):
+                state = "closed without merging" if pr_state == "closed" else pr_state
+                result += f"Pull request: {pr_url} ({state})\n"
             # Tokens and estimated cost over every round of the work item
             # (#3223), after the Cause line so its parse is unchanged.
             line = usage_line(usage)
@@ -1364,7 +1399,7 @@ async def _sync_labels(tracker: Tracker, claim: _StatusClaim) -> int:
     row = claim.row
     if row.applied_label == "":
         return 0
-    desired = desired_label(claim.status)
+    desired = desired_label(claim.status, pr_state=claim.pr_state)
     if row.applied_label == desired:
         return 0
     issue = claim.tracker_issue

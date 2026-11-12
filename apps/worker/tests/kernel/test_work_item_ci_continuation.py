@@ -376,8 +376,9 @@ def test_a_ci_turn_is_a_factory_work_item_turn(make_harness) -> None:
 
 @pytest.mark.parametrize("round_", [2, 3])
 @pytest.mark.parametrize("pr_url", [PR_URL, None, "", " \t "])
-def test_an_unpublished_fix_turn_finishes_the_same_request_as_ci_fix_unpublished(
-    make_harness, round_: int, pr_url: str | None
+@pytest.mark.parametrize("oversized", [False, True])
+def test_unpublished_ci_fix_reports_the_agent_explanation(
+    make_harness, round_: int, pr_url: str | None, oversized: bool
 ) -> None:
     """#4752: a recorded pull request does not change CI's unpublished cause or round."""
 
@@ -395,7 +396,11 @@ def test_an_unpublished_fix_turn_finishes_the_same_request_as_ci_fix_unpublished
             h.runner.default_script = [
                 TextDelta(text="Looked at the failure. "),
                 Final(
-                    text="Could not complete: the test needs a fixture.",
+                    text=(
+                        "Could not complete: the test needs a fixture. token=ghp_"
+                        + "a" * 36
+                        + ("\n" + "x" * 5000 if oversized else "")
+                    ),
                     status=SessionStatus.DONE,
                 ),
             ]
@@ -412,7 +417,11 @@ def test_an_unpublished_fix_turn_finishes_the_same_request_as_ci_fix_unpublished
             assert finish["runtime_epoch"] == EPOCH
             assert finish["outcome"] == "failed"
             assert finish["cause"] == "ci_fix_unpublished"
-            assert finish["detail"] is None
+            assert "the test needs a fixture" in finish["detail"]
+            assert "ghp_" + "a" * 36 not in finish["detail"]
+            assert "[REDACTED:" in finish["detail"]
+            assert len(finish["detail"]) <= 4000
+            assert finish["detail"].endswith("...") == oversized
             assert finish["ci_fix_round"] == round_
             # A CI fix turn has its own bounded loop: no #3128 continuation.
             assert len(h.runner.opened) == 1
