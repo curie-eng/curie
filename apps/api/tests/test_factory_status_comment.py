@@ -2518,9 +2518,7 @@ def test_lineage_state_late_adoption_refreshes_a_finalized_failure(
 def test_lineage_state_stale_version_and_another_work_item_do_not_invalidate(
     admitted: Any,  # noqa: F811
 ) -> None:
-    from curie_api.crud import lineages
-    from curie_api.crud.errors import PublicationLineageConflict
-    from curie_api.models import ThreadPublicationLineage
+    from curie_api.lineage_reconciler import LineageReconciler
 
     client, _github, sink, request_id = _failed_pr_status(admitted)
     item_id = _request(55830)["work_item_id"]
@@ -2530,17 +2528,24 @@ def test_lineage_state_stale_version_and_another_work_item_do_not_invalidate(
     )[0]["publication_lineage_id"]
 
     async def stale() -> None:
-        async with client.app.state.sessionmaker() as session:
-            lineage = await session.get(ThreadPublicationLineage, lineage_id)
-            assert lineage is not None
-            with pytest.raises(PublicationLineageConflict):
-                await lineages.mark_publication_lineage_terminal(
-                    session,
-                    lineage,
-                    expected_version=lineage.version - 1,
-                    expected_head_sha=HEAD_A,
-                    state="merged",
-                )
+        maker = client.app.state.sessionmaker
+        reconciler = LineageReconciler(
+            maker,
+            get_settings(),
+            lambda _repository: pytest.fail("a stale record must not read the provider"),
+            interval_seconds=60,
+        )
+        (pending,) = await reconciler._batch()
+        async with maker() as session:
+            await session.execute(
+                text(
+                    "UPDATE curie.thread_publication_lineages SET version = version + 1 "
+                    "WHERE id = :id"
+                ),
+                {"id": lineage_id},
+            )
+            await session.commit()
+        assert not await reconciler._record(pending, "merged")
 
     client.portal.call(stale)
     assert _notices(request_id)[0]["finalized_at"] is not None
