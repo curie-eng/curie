@@ -915,6 +915,168 @@ def test_committed_restoration_compares_both_sides_with_the_stub() -> None:
 
 
 # --------------------------------------------------------------------------
+# Runner reachability and the request each observation reads
+# --------------------------------------------------------------------------
+
+NAMESPACE = "acme-owner-proof"
+SUFFIX = f".{NAMESPACE}.svc.cluster.local"
+
+
+def _pod(name: str, uid: str, *, phase: str = "Running", **meta: Any) -> dict[str, Any]:
+    return {"metadata": {"name": name, "uid": uid, **meta}, "status": {"phase": phase}}
+
+
+def test_runner_loopback_is_deterministic_and_never_the_driver_loopback() -> None:
+    import ipaddress
+
+    names = [f"acme-thread-{index}{SUFFIX}" for index in range(200)]
+    addresses = [poe.runner_loopback(name) for name in names]
+    assert addresses == [poe.runner_loopback(name.upper() + ".") for name in names]
+    for address in addresses:
+        parsed = ipaddress.ip_address(address)
+        assert parsed.is_loopback and address != "127.0.0.1"
+        assert int(address.split(".")[1]) >= 64
+    assert poe.runner_suffix(NAMESPACE) == SUFFIX
+
+
+def test_runner_port_is_the_workers_default() -> None:
+    import dataclasses
+
+    from curie_worker.sandbox.types import SubstrateConfig
+
+    field = next(f for f in dataclasses.fields(SubstrateConfig) if f.name == "runner_port")
+    assert field.default == poe.RUNNER_PORT
+
+
+def test_runner_forwards_follow_each_sandboxes_running_pod() -> None:
+    sandboxes = [
+        {"metadata": {"name": "acme-a"}, "status": {"serviceFQDN": f"acme-a{SUFFIX}"}},
+        {"metadata": {"name": "acme-b"}, "status": {}},
+        {"metadata": {"name": "acme-c"}, "status": {"serviceFQDN": f"acme-c{SUFFIX}"}},
+        {"metadata": {"name": "acme-d"}, "status": {"serviceFQDN": f"acme-d{SUFFIX}"}},
+        {"metadata": {"name": "acme-e"}, "status": {"serviceFQDN": "acme-e.elsewhere.svc"}},
+    ]
+    pods = [
+        _pod("acme-a", "uid-a"),
+        # Before serviceFQDN is published the Service is named for the Sandbox.
+        _pod("acme-b", "uid-b"),
+        # Adopted: the Pod names its Sandbox by owner reference.
+        _pod("acme-warm-1", "uid-c", ownerReferences=[{"kind": "Sandbox", "name": "acme-c"}]),
+        _pod("acme-d", "uid-d", deletionTimestamp="2026-01-01T00:00:00Z"),
+        _pod("acme-e", "uid-e"),
+    ]
+    found = poe.runner_forwards(sandboxes, pods, NAMESPACE)
+    assert sorted(found) == [f"acme-a{SUFFIX}", f"acme-b{SUFFIX}", f"acme-c{SUFFIX}"]
+    assert found[f"acme-a{SUFFIX}"] == {
+        "address": poe.runner_loopback(f"acme-a{SUFFIX}"),
+        "pod": "acme-a",
+        "uid": "uid-a",
+    }
+    assert found[f"acme-c{SUFFIX}"]["pod"] == "acme-warm-1"
+    pending = [_pod("acme-a", "uid-a", phase="Pending")]
+    assert poe.runner_forwards(sandboxes[:1], pending, NAMESPACE) == {}
+
+
+def test_runner_forwards_refuse_two_names_on_one_address(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(poe, "runner_loopback", lambda _name: "127.64.0.1")
+    sandboxes = [{"metadata": {"name": name}, "status": {}} for name in ("acme-a", "acme-b")]
+    pods = [_pod("acme-a", "uid-a"), _pod("acme-b", "uid-b")]
+    with pytest.raises(ValueError, match="share one loopback"):
+        poe.runner_forwards(sandboxes, pods, NAMESPACE)
+
+
+def test_worker_resolver_maps_only_runner_names_to_their_loopback() -> None:
+    import socket
+
+    namespace: dict[str, Any] = {}
+    exec(compile(driver.RESOLVER_DEFS, "resolver", "exec"), namespace)  # noqa: S102 - the program
+    calls: list[tuple[Any, ...]] = []
+
+    def resolve(*args: Any) -> list[Any]:
+        calls.append(args)
+        return []
+
+    getaddrinfo = namespace["_resolver"](SUFFIX, resolve)
+    getaddrinfo(f"acme-a{SUFFIX}", 8080, socket.AF_UNSPEC, socket.SOCK_STREAM, 0, 0)
+    getaddrinfo(f"acme-a{SUFFIX}.".encode(), 8080)
+    getaddrinfo("127.0.0.1", 5432, socket.AF_UNSPEC, socket.SOCK_STREAM)
+    getaddrinfo("acme-a.elsewhere.svc.cluster.local", 8080)
+    address = poe.runner_loopback(f"acme-a{SUFFIX}")
+    assert calls[0] == (address, 8080, socket.AF_INET, socket.SOCK_STREAM, 0, 0)
+    assert calls[1][:3] == (address, 8080, socket.AF_INET)
+    assert calls[2] == ("127.0.0.1", 5432, socket.AF_UNSPEC, socket.SOCK_STREAM, 0, 0)
+    assert calls[3][0] == "acme-a.elsewhere.svc.cluster.local"
+    assert namespace["runner_loopback"](f"acme-b{SUFFIX}") == poe.runner_loopback(f"acme-b{SUFFIX}")
+
+
+def test_worker_program_runs_the_worker_module_behind_the_resolver() -> None:
+    compile(driver.WORKER_PROGRAM, "worker", "exec")
+    assert driver.WORKER_PROGRAM.startswith(driver.RESOLVER_DEFS)
+    assert 'runpy.run_module("curie_worker", run_name="__main__"' in driver.WORKER_PROGRAM
+    assert "socket.getaddrinfo = _resolver(sys.argv[1], socket.getaddrinfo)" in (
+        driver.WORKER_PROGRAM
+    )
+
+
+def test_rbac_covers_the_runner_forwards() -> None:
+    checks = driver.rbac_checks(NAMESPACE, f"{NAMESPACE}-grant")
+    assert ("create", "pods/portforward", NAMESPACE) in checks
+    assert ("list", "sandboxes.agents.x-k8s.io", NAMESPACE) in checks
+
+
+def test_history_restored_is_an_ordered_prefix() -> None:
+    assert poe.history_restored(["m"], ["m"])
+    # A turn that finished before the interruption appends after the marker.
+    assert poe.history_restored(["m"], ["m", "t1"])
+    assert not poe.history_restored(["m"], [])
+    assert not poe.history_restored(["m"], ["other"])
+    assert not poe.history_restored(["m", "t1"], ["t1", "m"])
+    assert not poe.history_restored([], [])
+    assert not poe.history_restored(["m"], None)
+
+
+def test_worker_launched_needs_the_workers_start_on_the_observed_claim() -> None:
+    worker = "acme-proof-worker"
+    running = {"started_at": T0, "runtime_claim_name": "acme-claim", "terminal_at": None}
+    settled = {**running, "terminal_at": T0 + 5}
+
+    def launched(row: Any, owner: str | None, *, rehearsal: bool = False) -> bool:
+        return poe.worker_launched(
+            row,
+            claim="acme-claim",
+            captured_owner=owner,
+            worker_owner=worker,
+            rehearsal=rehearsal,
+        )
+
+    assert launched(running, worker)
+    assert not launched(running, "acme-proof-launcher")
+    assert not launched({**running, "started_at": None}, worker)
+    assert not launched({**running, "runtime_claim_name": "acme-other"}, worker)
+    assert not launched(None, worker)
+    # Terminal settlement cleared the owner: only a rehearsal accepts that.
+    assert launched(settled, None, rehearsal=True)
+    assert not launched(settled, None)
+    assert not launched(running, None, rehearsal=True)
+
+
+def test_retained_request_is_the_started_request_on_the_claim() -> None:
+    rows: list[dict[str, Any]] = [
+        {"id": "r1", "runtime_claim_name": "acme-a", "started_at": T0, "status": "failed"},
+        {"id": "r2", "runtime_claim_name": "acme-b", "started_at": T0, "status": "running"},
+        {"id": "r3", "runtime_claim_name": None, "started_at": None, "status": "waiting"},
+    ]
+    assert poe.retained_request(rows, "acme-b") == rows[1]
+    assert poe.retained_request(rows, "acme-a") == rows[0]
+    # A never-started request holds no claim, so it is never the target.
+    assert poe.retained_request(rows, "") is None
+    assert poe.retained_request(rows[2:], "acme-b") is None
+    assert [row["id"] for row in poe.active_requests(rows)] == ["r2", "r3"]
+    assert poe.active_requests([{"status": "cancellation_requested"}]) != []
+    assert poe.active_requests([{"status": s} for s in ("completed", "failed", "expired")]) == []
+
+
+# --------------------------------------------------------------------------
 # The finalizer
 # --------------------------------------------------------------------------
 

@@ -403,6 +403,31 @@ the chart's default `emptyDir` workspace at `/workspace`, and the chart's
 After each pair and at the end of the audit, the driver reads the stub's record
 of unsupported calls and fails with the call's method and path if there is one.
 
+### Runner reachability
+
+#5377 drives its turns itself, so its worker never dials a runner. Here the
+worker opens and streams every turn, and runner Service names
+(`<sandbox>.<namespace>.svc.cluster.local`) do not resolve outside the cluster:
+without help every status read fails closed and the request defers before it
+starts. The driver therefore starts the candidate worker through a launcher
+that maps exactly that namespace's Service names to a deterministic loopback
+address (never `127.0.0.1`) and then runs `curie_worker` as `python -m` would;
+every other name resolves as before. On every sweep the driver keeps one
+`kubectl port-forward` per Running runner Pod from that address to the Pod's
+runner port, replaces it when the Pod is recreated or the forward exits, and
+drops it when the Pod goes away. Teardown stops every runner forward and proves
+each address closed.
+
+Every observation is scoped to its own WorkItem: a pod counts only when its
+claim is the `runtime_claim_name` of a started request of that WorkItem.
+Only the start route writes that column and `started_at`, for the owner holding
+the request's acquire, and the driver never acquires; `selection` also requires
+the request's `runtime_owner`, read while it runs (terminal settlement clears
+it), to be the worker's consumer. The owner has one runtime slot (ADR 0268
+decision 2), so after each pair the driver waits until every request is
+terminal, its Pods are gone and no claim carries the owner's label, and stops
+the run, naming it, if a claim outlives its WorkItem.
+
 ### Inputs and preconditions
 
 Every target comes from flags and the input file. `--input-file` is a private
@@ -514,9 +539,13 @@ reservation, a one-turn grant probe runs on the cheapest model with an empty
 3. `worker-interrupted` and `worker-recovered`: the same, with the worker
    killed. The recovered session is held while the worker is killed again, the
    grant is replaced by a deliberately invalid one (generation 2), and the
-   retained claim's fate is observed.
-4. `rejected`: generation 2 on the same WorkItem; the provider's 401 must end
-   it `authentication_required` with the transcript and owner intact.
+   retained claim's fate is observed. The fence aims at the started request
+   whose runtime is the retained claim (the recovered session's, else the
+   interrupted one's), never at a request that has not started.
+4. `rejected`: generation 2 on the same WorkItem, admitted once every earlier
+   request is terminal (admission refuses `active_request` while one waits,
+   runs or stops); the provider's 401 must end it `authentication_required`
+   with the transcript and owner intact.
 5. `revalidated`: generation 3 after replace, teardown and revalidation; one
    response calls the Bash scan, the sentinel `challenge` tool and the public
    control tool, then answers.
@@ -555,6 +584,16 @@ chart's 300 s, so a Pod the controller recreates late in a pair can still stage
 the checkout. Recovery is whatever the product does on its own (the kernel's
 transient retry, or the owner-lost successor after a worker loss); when no
 fresh session starts within 150 s, the WorkItem is cancelled and the recovery
-checks record false. Teardown stops the forward and the object store relay
-before #5377's cleanup and proves the forward's port closed; the stub's Pod,
-Service and ConfigMaps go with the owned namespace.
+checks record false. After a worker kill the API declares the request
+owner-lost once its heartbeat expiry is a full runtime TTL in the past (#5377's
+24 s TTL, an 8 s heartbeat, so 40 to 48 s after the kill, on a 2 s reconciler
+pass); the restarted worker tears the retained claim down on the terminate
+wake (retried every 6 s), the settlement admits the successor, and its execute
+wake follows on the next pass, so the successor is expected 60 to 90 s after
+the kill. The rehearsal's offline turn lasts about 6 s and nothing holds it,
+so the driver runs only the nonce write between the boundary and the
+interruption; the durable history check is an ordered prefix, because a turn
+that ended first appends its own record. Teardown stops the code host and
+runner forwards and the object store relay before #5377's cleanup and proves
+their ports closed; the stub's Pod, Service and ConfigMaps go with the owned
+namespace.

@@ -1150,6 +1150,131 @@ def committed_restoration(
 
 
 # --------------------------------------------------------------------------
+# Runner reachability: the worker runs outside the cluster
+# --------------------------------------------------------------------------
+
+# The worker's default runner port (curie_worker.sandbox.types.SubstrateConfig).
+RUNNER_PORT = 8080
+# Request statuses that refuse a new admission on the same WorkItem
+# (curie_api.workitems.lifecycle._ACTIVE_STATUSES).
+ACTIVE_REQUEST_STATUSES = ("waiting", "running", "cancellation_requested")
+
+
+def runner_suffix(namespace: str) -> str:
+    """The DNS suffix of every runner Service the worker dials in ``namespace``."""
+
+    return f".{namespace}.svc.cluster.local"
+
+
+def runner_loopback(name: str) -> str:
+    """The loopback address the proof's worker resolves one runner Service name to.
+
+    Deterministic, so the worker's resolver and the driver's forwards agree
+    without sharing state; never 127.0.0.1, where the driver's other relays
+    listen. The proof's worker launcher carries this function's source.
+    """
+
+    digest = hashlib.sha256(name.lower().rstrip(".").encode()).digest()
+    return f"127.{64 + digest[0] % 128}.{digest[1]}.{1 + digest[2] % 254}"
+
+
+def runner_forwards(
+    sandboxes: Sequence[Mapping[str, Any]],
+    pods: Sequence[Mapping[str, Any]],
+    namespace: str,
+) -> dict[str, dict[str, str]]:
+    """Each runner Service name the worker dials, mapped to its loopback and Running Pod.
+
+    A Sandbox's Pod carries its name, or an owner reference to it when it was
+    adopted; its Service name is ``status.serviceFQDN``, or the Sandbox name
+    before that is published. A terminating Pod gets no forward. Two names on
+    one address refuse, because the worker would reach the wrong runner.
+    """
+
+    suffix = runner_suffix(namespace)
+    named: dict[str, Mapping[str, Any]] = {}
+    adopted: dict[str, Mapping[str, Any]] = {}
+    for pod in pods:
+        meta = pod.get("metadata") or {}
+        if (pod.get("status") or {}).get("phase") != "Running" or meta.get("deletionTimestamp"):
+            continue
+        named[str(meta.get("name"))] = meta
+        for ref in meta.get("ownerReferences") or []:
+            if ref.get("kind") == "Sandbox" and ref.get("name"):
+                adopted[str(ref["name"])] = meta
+    found: dict[str, dict[str, str]] = {}
+    for sandbox in sandboxes:
+        name = str((sandbox.get("metadata") or {}).get("name") or "")
+        published = (sandbox.get("status") or {}).get("serviceFQDN")
+        fqdn = str(published or f"{name}{suffix}").lower().rstrip(".")
+        meta = named.get(name) or adopted.get(name)
+        if not name or not fqdn.endswith(suffix) or meta is None:
+            continue
+        found[fqdn] = {
+            "address": runner_loopback(fqdn),
+            "pod": str(meta.get("name")),
+            "uid": str(meta.get("uid")),
+        }
+    addresses = [target["address"] for target in found.values()]
+    if len(set(addresses)) != len(addresses):
+        raise ValueError("two runner Service names share one loopback address")
+    return found
+
+
+def history_restored(before: Sequence[str], loaded: Sequence[str] | None) -> bool:
+    """The recovered runtime's history holds every record from before, in order.
+
+    A turn that finished before the interruption appends its own record after
+    them, so the comparison is a prefix, never a subset.
+    """
+
+    return bool(before) and loaded is not None and list(loaded[: len(before)]) == list(before)
+
+
+def worker_launched(
+    row: Mapping[str, Any] | None,
+    *,
+    claim: str,
+    captured_owner: str | None,
+    worker_owner: str,
+    rehearsal: bool,
+) -> bool:
+    """The candidate worker, not the driver, acquired and started this request.
+
+    The start route records ``started_at`` and the claim only for the owner
+    holding the acquire, and ``runtime_owner`` is that owner until terminal
+    settlement clears it, so the driver captures it while the request runs. A
+    rehearsal's offline turn can settle before the first poll; there a started,
+    settled request on the observed claim is the signal.
+    """
+
+    if row is None or row.get("started_at") is None:
+        return False
+    if not claim or row.get("runtime_claim_name") != claim:
+        return False
+    if captured_owner is not None:
+        return captured_owner == worker_owner
+    return rehearsal and row.get("terminal_at") is not None
+
+
+def retained_request(rows: Sequence[Mapping[str, Any]], claim: str) -> Mapping[str, Any] | None:
+    """The latest started request whose runtime is ``claim``: the one a retained claim holds."""
+
+    held = [
+        row
+        for row in rows
+        if claim and row.get("runtime_claim_name") == claim and row.get("started_at") is not None
+    ]
+    return held[-1] if held else None
+
+
+def active_requests(rows: Sequence[Mapping[str, Any]]) -> list[Mapping[str, Any]]:
+    """Requests that refuse a new admission on their WorkItem (``active_request``)."""
+
+    return [row for row in rows if row.get("status") in ACTIVE_REQUEST_STATUSES]
+
+
+# --------------------------------------------------------------------------
 # The judge: expected values live here, observed values only in the ledger
 # --------------------------------------------------------------------------
 

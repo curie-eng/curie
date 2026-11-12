@@ -33,6 +33,7 @@ import contextlib
 import dataclasses
 import http.client
 import importlib.util
+import inspect
 import json
 import os
 import secrets
@@ -42,6 +43,7 @@ import ssl
 import subprocess
 import sys
 import tempfile
+import textwrap
 import threading
 import time
 import urllib.parse
@@ -416,6 +418,35 @@ store = StateApiTranscriptStore(env["CURIE_HISTORY_REF"], env.get("CURIE_HISTORY
 records = asyncio.run(store.load())
 print(json.dumps([str(getattr(record, "record_id", "") or "") for record in records]))
 """
+# The candidate worker runs on the driver's side of the cluster, where runner
+# Service names (``<sandbox>.<namespace>.svc.cluster.local``) do not resolve,
+# so every status read and turn would fail closed and defer. Its launcher maps
+# exactly those names to the loopback address ``poe.runner_loopback`` gives,
+# where the driver keeps a port-forward to that Sandbox's Pod; every other
+# name resolves as before and nothing else in the worker changes.
+RESOLVER_DEFS = (
+    "import hashlib, socket\n"
+    + textwrap.dedent(inspect.getsource(poe.runner_loopback))
+    + """
+def _resolver(suffix, resolve):
+    def getaddrinfo(host, port, family=0, type=0, proto=0, flags=0):
+        name = host.decode() if isinstance(host, bytes) else host
+        if isinstance(name, str) and name.lower().rstrip(".").endswith(suffix):
+            return resolve(runner_loopback(name), port, socket.AF_INET, type, proto, flags)
+        return resolve(host, port, family, type, proto, flags)
+    return getaddrinfo
+"""
+)
+# argv: <runner suffix>. Runs curie_worker exactly as ``python -m`` would.
+WORKER_PROGRAM = (
+    RESOLVER_DEFS
+    + """
+import runpy, sys
+socket.getaddrinfo = _resolver(sys.argv[1], socket.getaddrinfo)
+del sys.argv[1:]
+runpy.run_module("curie_worker", run_name="__main__", alter_sys=True)
+"""
+)
 
 
 # --------------------------------------------------------------------------
@@ -595,7 +626,7 @@ def rbac_checks(namespace: str, grant_namespace: str) -> list[tuple[str, str, st
         "configmaps",
         "services",
         "pods/exec",
-        # The driver's forward to the stub code host.
+        # The driver's forwards to the stub code host and to each runner Pod.
         "pods/portforward",
         "persistentvolumeclaims",
         "sandboxtemplates.extensions.agents.x-k8s.io",
@@ -605,6 +636,8 @@ def rbac_checks(namespace: str, grant_namespace: str) -> list[tuple[str, str, st
             ("create" if resource != "persistentvolumeclaims" else "list", resource, namespace)
         )
     found.append(("get", "pods/log", namespace))
+    # The runner forwards follow each Sandbox's Pod and Service name.
+    found.append(("list", "sandboxes.agents.x-k8s.io", namespace))
     return found
 
 
@@ -789,6 +822,11 @@ class Track:
     deadline: float = 0.0
     closed: bool = False
     seeds: list[dict[str, Any]] = dataclasses.field(default_factory=list)
+    # The started request whose claim this runtime is, and its runtime owner
+    # as read while it ran (terminal settlement clears the column).
+    work_item_id: str = ""
+    request_id: str = ""
+    runtime_owner: str | None = None
 
 
 def load_enrollment() -> Any:
@@ -845,6 +883,11 @@ def owner_proof_class(e: Any) -> type[Any]:  # noqa: C901 - one scenario, one cl
             self.repository_id = ""
             self.issues: dict[str, str] = {}
             self.stub_source: dict[str, Any] = {}
+            # Runner Service name -> the driver's forward to its Pod (see
+            # WORKER_PROGRAM), and every loopback address one ever bound.
+            self.runner_forwards: dict[str, dict[str, Any]] = {}
+            self.runner_addresses: set[str] = set()
+            self.forward_count = 0
             if self.paid:
                 grant = pps.load_grant(Path(ctx.grant_file))
                 self.grant = e.HeldSecret(grant.reveal())
@@ -1061,6 +1104,93 @@ def owner_proof_class(e: Any) -> type[Any]:  # noqa: C901 - one scenario, one cl
             # The object store binds loopback; the sandbox redeems its signed
             # workspace read through this relay on the caller's runner API host.
             self.s3_relay = e.TcpRelay(self.runner_host, self.ports["s3"])
+
+        # --- the worker and its runner reachability -----------------------------
+
+        def start_worker(self) -> None:
+            """#5377's worker start, launched through ``WORKER_PROGRAM``'s resolver.
+
+            #5377 drives turns itself, so its worker never dials a runner. Here
+            the worker launches and streams every turn, so it must reach the
+            runner Services; ``sync_runner_forwards`` serves the addresses.
+            """
+
+            e.require(
+                vars(self).get("worker_process") is None, "the candidate worker is already running"
+            )
+            env = self.worker_env()
+            for name in ("CURIE_CREDENTIALS", "ANTHROPIC_API_KEY", "CLAUDE_CODE_OAUTH_TOKEN"):
+                e.require(name not in env, "the candidate worker must hold no model credential")
+            process = self.spawn(
+                "worker",
+                [sys.executable, "-c", WORKER_PROGRAM, poe.runner_suffix(self.namespace)],
+                env,
+            )
+            self.worker_process = process
+
+            def consuming() -> bool | None:
+                e.require(
+                    process.poll() is None,
+                    "candidate worker exited during startup; log retained privately",
+                )
+                return True if self.consumer_registered() else None
+
+            e.wait_until(
+                consuming,
+                timeout=180,
+                interval=1,
+                failure="candidate worker never joined the runs stream",
+            )
+
+        def sync_runner_forwards(self, pods: Sequence[Mapping[str, Any]]) -> None:
+            """One driver-owned forward per runner Pod, on its Service's loopback address.
+
+            A recreated Pod (a new UID) or a forward that exited is replaced; a
+            Pod that is gone or terminating loses its forward. Unreadable
+            Sandboxes leave the forwards as they are until the next sweep.
+            """
+
+            from curie_worker.sandbox.k8s import CORE_GROUP, CORE_VERSION
+
+            try:
+                sandboxes = self.custom.list_namespaced_custom_object(
+                    CORE_GROUP, CORE_VERSION, self.namespace, "sandboxes", _request_timeout=30
+                ).get("items", [])
+            except Exception:  # noqa: BLE001 - the next sweep lists again
+                return
+            try:
+                wanted = poe.runner_forwards(sandboxes, pods, self.namespace)
+            except ValueError as exc:
+                self.fence()
+                raise poe.StepFailed(str(exc)) from None
+            for name in [name for name in self.runner_forwards if name not in wanted]:
+                self.stop_process(self.runner_forwards.pop(name)["process"])
+            for name, target in wanted.items():
+                current = self.runner_forwards.get(name)
+                if (
+                    current is not None
+                    and current["process"].poll() is None
+                    and current["uid"] == target["uid"]
+                ):
+                    continue
+                if current is not None:
+                    self.stop_process(current["process"])
+                self.forward_count += 1
+                self.runner_addresses.add(target["address"])
+                process = self.spawn(
+                    f"runner-forward-{self.forward_count}",
+                    poe.kubectl_argv(
+                        self.context,
+                        self.namespace,
+                        "port-forward",
+                        "--address",
+                        target["address"],
+                        f"pod/{target['pod']}",
+                        f"{poe.RUNNER_PORT}:{poe.RUNNER_PORT}",
+                    ),
+                    self.env,
+                )
+                self.runner_forwards[name] = {**target, "process": process}
 
         # --- the code host: the recorded TLS GitHub stub ------------------------
 
@@ -1757,7 +1887,9 @@ def owner_proof_class(e: Any) -> type[Any]:  # noqa: C901 - one scenario, one cl
             states: dict[str, dict[str, Any]] = {}
             live: set[str] = set()
             listed: set[str] = set()
-            for pod in self.runner_pods():
+            pods = self.runner_pods()
+            self.sync_runner_forwards(pods)
+            for pod in pods:
                 meta, status = pod["metadata"], pod.get("status") or {}
                 listed.add(meta["uid"])
                 if status.get("phase") != "Running":
@@ -1910,24 +2042,45 @@ def owner_proof_class(e: Any) -> type[Any]:  # noqa: C901 - one scenario, one cl
                 self.tracks.append(found)
             return found
 
+        def started_claims(self, work_item_id: str) -> dict[str, dict[str, Any]]:
+            """Each claim a started request of the WorkItem runs on, to its latest such request.
+
+            Only the start route writes ``runtime_claim_name`` and ``started_at``,
+            for the owner that holds the request's acquire; the driver never
+            acquires, so a claim here was started by the candidate worker.
+            """
+
+            found: dict[str, dict[str, Any]] = {}
+            for row in self.requests_of(work_item_id):
+                if row["runtime_claim_name"] and row["started_at"] is not None:
+                    found[str(row["runtime_claim_name"])] = row
+            return found
+
         def boundary(
             self,
             slot: str,
             mode: str,
             *,
+            work_item_id: str,
             exclude: Sequence[str] = (),
             timeout: float = poe.START_WINDOW + 30,
         ) -> Track | None:
             """The pod and process of ``slot`` once it holds at ``mode``.
 
-            Paid: the bundle's hook holds the native process and names it. Rehearsal:
-            a Ready runner pod with no native process (the fake model holds nothing).
+            Only a pod whose claim a started request of ``work_item_id`` runs on
+            counts, so another WorkItem's runtime is never observed as this one's.
+            Paid: the bundle's hook holds the native process and names it.
+            Rehearsal: that pod Ready (the offline fake model holds nothing).
             """
 
             track = self.track_of(slot)
 
             def held() -> Track | None:
+                started = self.started_claims(work_item_id)
                 for state in self.pod_states.values():
+                    row = started.get(state["claim"])
+                    if row is None:
+                        continue
                     if self.paid:
                         hold = (state.get("holds") or {}).get(mode)
                         if not hold or not hold.get("cli_pid"):
@@ -1945,6 +2098,8 @@ def owner_proof_class(e: Any) -> type[Any]:  # noqa: C901 - one scenario, one cl
                         track.cli = ref
                     track.pod, track.pod_uid = state["pod"], state["uid"]
                     track.claim, track.restart_count = state["claim"], state["restarts"]
+                    track.work_item_id, track.request_id = work_item_id, str(row["id"])
+                    track.runtime_owner = row["runtime_owner"]
                     return track
                 return None
 
@@ -2224,12 +2379,30 @@ def owner_proof_class(e: Any) -> type[Any]:  # noqa: C901 - one scenario, one cl
                 "pod.revision_label_matches",
                 self.image_ok(pod) and bool(self.evidence.get("oci_revision_matches_source")),
             )
-            rows = self.requests_of(str(item["id"]))
-            owner = rows[-1]["runtime_owner"] if rows else None
+            # Durable: the start the worker's acquire made (started_at and this
+            # claim), and the runtime owner read while the request ran, which
+            # terminal settlement clears. The driver never acquires or starts.
+            row = next(
+                (r for r in self.requests_of(str(item["id"])) if str(r["id"]) == track.request_id),
+                None,
+            )
+            self.observe(
+                "selection",
+                "worker.runtime_owner_while_running",
+                "worker"
+                if track.runtime_owner == e.WORKER_CONSUMER
+                else ("settled" if track.runtime_owner is None else "other"),
+            )
             self.observe(
                 "selection",
                 "worker.launched_without_driver",
-                owner is not None and owner != e.DRIVER_OWNER,
+                poe.worker_launched(
+                    row,
+                    claim=track.claim,
+                    captured_owner=track.runtime_owner,
+                    worker_owner=e.WORKER_CONSUMER,
+                    rehearsal=not self.paid,
+                ),
             )
 
         def interrupt(self, kind: str, track: Track) -> dict[str, Any]:
@@ -2278,24 +2451,28 @@ def owner_proof_class(e: Any) -> type[Any]:  # noqa: C901 - one scenario, one cl
 
             a_slot, b_slot = f"{kind}-interrupted", f"{kind}-recovered"
             item = self.admit_owner(self.issues[kind], conversation, self.objective(), 1)
-            thread = str(item["conversation_id"])
+            work_item_id, thread = str(item["id"]), str(item["conversation_id"])
             self.seed_history(thread)
             self.reserve(a_slot)
             self.start_worker()
-            a = self.boundary(a_slot, "read")
+            a = self.boundary(a_slot, "read", work_item_id=work_item_id)
             if a is None:
                 self.check_stub()
                 raise poe.StepFailed(f"{kind}: the first session never reached its boundary")
-            if kind == "process":
-                self.observe_selection(a, item)
-            ids_before = self.durable_ids(thread)
+            # Only what must precede the interruption runs before it: the
+            # rehearsal's offline turn lasts seconds and nothing holds it.
             before = self.workspace_state(a.pod, nonce=secrets.token_hex(16))
-            self.capture_pod(a.pod)
+            ids_before = self.durable_ids(thread)
+            if self.paid:
+                self.capture_pod(a.pod)
             _data, usage = self.harvest(a)
             self.settle(a, usage)
             self.reserve(b_slot)
             facts = self.interrupt(kind, a)
-            b = self.boundary(b_slot, "read", exclude=[a.cli])
+            if kind == "process":
+                # The claim, its Secret and the Pod outlive a container restart.
+                self.observe_selection(a, item)
+            b = self.boundary(b_slot, "read", work_item_id=work_item_id, exclude=[a.cli])
             restart: dict[str, Any] = {
                 "automatic_recovery": b is not None,
                 "old_runtime_gone": self.old_runtime_gone(kind, a, b, facts),
@@ -2305,18 +2482,21 @@ def owner_proof_class(e: Any) -> type[Any]:  # noqa: C901 - one scenario, one cl
                 b_data, _ = self.harvest(b)
                 loaded = self.history_in_pod(b.pod)
                 after = self.workspace_state(b.pod)
+                if not self.paid:
+                    self.capture_pod(b.pod)
                 restored = before.get("nonce") not in {"absent", "unreadable", None} and (
                     after.get("nonce") == before.get("nonce")
                 )
+                history = poe.history_restored(ids_before, loaded)
                 restart.update(
                     {
                         "owner_labels_match": self.owner_labels_match(b.claim, 1),
-                        "history_identity": loaded is not None and loaded == ids_before,
+                        "history_identity": history,
                         "replay_marker_seen": (
                             b_data is not None and self.marker.encode() in b_data
                         )
                         if self.paid
-                        else loaded is not None and loaded == ids_before,
+                        else history,
                         "fresh_native_process": b.cli != a.cli,
                         **poe.committed_restoration(self.stub_source, before, after),
                         "git_status_after": after.get("status"),
@@ -2348,14 +2528,16 @@ def owner_proof_class(e: Any) -> type[Any]:  # noqa: C901 - one scenario, one cl
                 self.observe("restart", f"{kind}.{key}", value)
             if kind == "worker":
                 # The generation advance runs even without a recovered session, so
-                # the later phases keep their generations; the retained-claim
-                # checks are then missing and the fencing judge fails on them.
-                self.fence_retained(b, item)
+                # the later phases keep their generations; it then aims at the
+                # interrupted runtime's claim, and the fencing judge reads what
+                # that request did.
+                self.fence_retained(b, item, claim=(b or a).claim)
             elif b is None:
-                self.abandon(str(item["id"]))
+                self.abandon(work_item_id)
+                self.settled_runtime(work_item_id)
             else:
                 self.finish_session(b)
-                self.settled_runtime(str(item["id"]))
+                self.settled_runtime(work_item_id)
             self.check_stub()
 
         def finish_session(self, track: Track) -> bytes | None:
@@ -2366,7 +2548,9 @@ def owner_proof_class(e: Any) -> type[Any]:  # noqa: C901 - one scenario, one cl
                 self.wait_soft(lambda: None, timeout=10)
                 track.closed = True
                 return None
-            stopped = self.boundary(track.slot, "stop", timeout=poe.SESSION_SECONDS)
+            stopped = self.boundary(
+                track.slot, "stop", work_item_id=track.work_item_id, timeout=poe.SESSION_SECONDS
+            )
             data, usage = (
                 self.harvest(track) if stopped is not None else (None, poe.SessionUsage.unknown())
             )
@@ -2376,8 +2560,31 @@ def owner_proof_class(e: Any) -> type[Any]:  # noqa: C901 - one scenario, one cl
             track.closed = True
             return data
 
+        def owner_claims(self) -> list[str]:
+            """Every claim in the namespace labeled with the owner principal."""
+
+            from curie_worker.sandbox import types
+
+            return [
+                str(item["metadata"]["name"])
+                for item in self.custom.list_namespaced_custom_object(
+                    cluster.GROUP,
+                    cluster.VERSION,
+                    self.namespace,
+                    "sandboxclaims",
+                    label_selector=f"{types.OWNER_PRINCIPAL_LABEL}={self.principals['owner']['id']}",
+                    _request_timeout=30,
+                ).get("items", [])
+            ]
+
         def settled_runtime(self, work_item_id: str) -> None:
-            """Every request of the WorkItem terminal and its runtime gone (bounded)."""
+            """Every request terminal, its runtime gone and no owner claim left (bounded).
+
+            The owner has one runtime slot (ADR 0268 decision 2): a claim that
+            outlives its WorkItem defers the owner's next WorkItem ("the owner
+            holds a claim"), so the run stops here, named, instead of the next
+            phase observing nothing of its own.
+            """
 
             def done() -> bool | None:
                 rows = self.requests_of(work_item_id)
@@ -2387,10 +2594,15 @@ def owner_proof_class(e: Any) -> type[Any]:  # noqa: C901 - one scenario, one cl
                     for pod in self.runner_pods()
                     if (pod["metadata"].get("labels") or {}).get(e.ADMISSION_LABEL) in claims
                 ]
-                return True if all(row["terminal_at"] for row in rows) and not live else None
+                settled = all(row["terminal_at"] for row in rows) and not live
+                return True if settled and not self.owner_claims() else None
 
             if self.wait_soft(done, timeout=150) is None:
                 self.abandon(work_item_id)
+                if self.wait_soft(done, timeout=30) is None:
+                    raise poe.StepFailed(
+                        "an owner claim outlived its WorkItem; the next WorkItem cannot launch"
+                    )
 
         def abandon(self, work_item_id: str) -> None:
             """Cancel a WorkItem whose recovery never came, through the internal route."""
@@ -2412,8 +2624,16 @@ def owner_proof_class(e: Any) -> type[Any]:  # noqa: C901 - one scenario, one cl
                 timeout=120,
             )
 
-        def fence_retained(self, track: Track | None, item: Mapping[str, Any]) -> None:
-            """Advance the generation while the worker is down and the g1 claim is retained."""
+        def fence_retained(
+            self, track: Track | None, item: Mapping[str, Any], *, claim: str
+        ) -> None:
+            """Advance the generation while the worker is down and a g1 claim is retained.
+
+            The target is the started request whose runtime is ``claim`` (the
+            recovered session's, else the interrupted one's): the request that
+            holds the retained claim. A never-started request holds nothing, so
+            revalidating past it would prove nothing about AC 2.
+            """
 
             work_item_id = str(item["id"])
             if track is not None:
@@ -2421,6 +2641,19 @@ def owner_proof_class(e: Any) -> type[Any]:  # noqa: C901 - one scenario, one cl
                 self.settle(track, usage)
                 self.capture_pod(track.pod)
             self.kill_worker()
+            target = poe.retained_request(self.requests_of(work_item_id), claim)
+            target_id = str(target["id"]) if target is not None else ""
+            self.observe(
+                "fencing",
+                "advance.retained_request_status",
+                target["status"] if target is not None else None,
+            )
+
+            def target_row() -> dict[str, Any] | None:
+                return next(
+                    (r for r in self.requests_of(work_item_id) if str(r["id"]) == target_id), None
+                )
+
             self.headers_seen["replaced"] = self.write(
                 "replace",
                 token=self.files["token-invalid"],
@@ -2429,8 +2662,12 @@ def owner_proof_class(e: Any) -> type[Any]:  # noqa: C901 - one scenario, one cl
             self.observe(
                 "fencing", "advance.generation", int(self.headers_seen["replaced"]["generation"])
             )
-            fenced = self.requests_of(work_item_id)[-1]
-            self.observe("fencing", "advance.request_cause", fenced["terminal_cause"])
+            fenced = target_row()
+            self.observe(
+                "fencing",
+                "advance.request_cause",
+                fenced["terminal_cause"] if fenced is not None else None,
+            )
             status, _generation, code = self.revalidate_item(work_item_id)
             self.observe(
                 "fencing",
@@ -2445,11 +2682,12 @@ def owner_proof_class(e: Any) -> type[Any]:  # noqa: C901 - one scenario, one cl
             self.start_worker()
 
             def confirmed() -> dict[str, Any] | None:
-                row = self.requests_of(work_item_id)[-1]
+                row = target_row()
                 return (
                     row
                     if (
-                        row["terminal_at"] is not None
+                        row is not None
+                        and row["terminal_at"] is not None
                         and (row["termination_observation"] or "").strip()
                         and row["teardown_unconfirmed_at"] is None
                     )
@@ -2462,13 +2700,14 @@ def owner_proof_class(e: Any) -> type[Any]:  # noqa: C901 - one scenario, one cl
             self.observe("fencing", "retained.teardown_confirmed", row is not None)
             if track is not None:
                 track.closed = True
+            if claim:
                 self.observe(
-                    "fencing", "retained.claim_absent", self.absent("sandboxclaims", track.claim)
+                    "fencing", "retained.claim_absent", self.absent("sandboxclaims", claim)
                 )
                 self.observe(
                     "fencing",
                     "retained.tokens_secret_absent",
-                    self.secret_absent(self.namespace, claim_object_names(track.claim).secret),
+                    self.secret_absent(self.namespace, claim_object_names(claim).secret),
                 )
             self.observe(
                 "fencing", "retained.native_sessions_after_restart", len(set(self.native) - known)
@@ -2482,6 +2721,17 @@ def owner_proof_class(e: Any) -> type[Any]:  # noqa: C901 - one scenario, one cl
             issue, conversation = self.issues["worker"], PAIRS[2][1]
             work_item_id = str(self.work_items[issue]["id"])
             thread = str(self.work_items[issue]["conversation_id"])
+
+            # Generation 2 is a new request on the same WorkItem, which admission
+            # refuses (active_request) while any request is waiting, running or
+            # stopping; the revision path is for verified mentions, not this.
+            def settled() -> bool | None:
+                return None if poe.active_requests(self.requests_of(work_item_id)) else True
+
+            prior = self.wait_soft(settled, timeout=150)
+            self.observe("authentication-required", "rejected.prior_requests_terminal", bool(prior))
+            if prior is None:
+                raise poe.StepFailed("generation 2 cannot be admitted: a request is still active")
             ids_before = self.durable_ids(thread)
             self.admit_owner(issue, conversation, self.objective(), 2)
             self.reserve("rejected")
@@ -2592,7 +2842,9 @@ def owner_proof_class(e: Any) -> type[Any]:  # noqa: C901 - one scenario, one cl
             self.admit_owner(issue, conversation, self.objective(hosted=True), 3)
             self.reserve("revalidated")
             self.start_worker()
-            track = self.boundary("revalidated", "stop" if self.paid else "read")
+            track = self.boundary(
+                "revalidated", "stop" if self.paid else "read", work_item_id=work_item_id
+            )
             if track is None:
                 self.observe("authentication-required", "revalidated.fresh_native_process", False)
                 return
@@ -2875,7 +3127,7 @@ def owner_proof_class(e: Any) -> type[Any]:  # noqa: C901 - one scenario, one cl
             self.cleanup()
 
         def cleanup(self) -> None:
-            """Stop the code host forward and close the object store relay, then #5377's cleanup.
+            """Stop the code host and runner forwards, close the store relay, then #5377's cleanup.
 
             The stub Pod, Service and ConfigMaps go with the owned namespace; the
             trust bundle and the worker's clone scratch go with the private
@@ -2885,6 +3137,9 @@ def owner_proof_class(e: Any) -> type[Any]:  # noqa: C901 - one scenario, one cl
             if self.forward_process is not None:
                 with contextlib.suppress(Exception):
                     self.stop_process(self.forward_process)
+            for forward in list(self.runner_forwards.values()):
+                with contextlib.suppress(Exception):
+                    self.stop_process(forward["process"])
             if self.s3_relay is not None:
                 self.s3_relay.close()
             super().cleanup()
@@ -2947,6 +3202,15 @@ def owner_proof_class(e: Any) -> type[Any]:  # noqa: C901 - one scenario, one cl
                     self.forward_process is None or self.forward_process.poll() is not None
                 )
                 and forward_closed,
+                # Every runner forward ever started is a spawned process (in
+                # ``processes`` above) and none of their addresses still listens.
+                "runner-forwards": all(
+                    forward["process"].poll() is not None
+                    for forward in self.runner_forwards.values()
+                )
+                and not any(
+                    e.tcp_open(address, poe.RUNNER_PORT) for address in self.runner_addresses
+                ),
             }
             for name, closed in forwards.items():
                 ledger.record_cleanup(
