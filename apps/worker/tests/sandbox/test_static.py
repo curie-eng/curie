@@ -552,9 +552,13 @@ def test_two_agents_with_secrets_alternate_on_the_generic_shell(
             assert child["CURIE_CONNECTOR_AGENT"] == agent
             assert "CURIE_SHELL_CLAIM_ENV_FILE" not in child
             if previous_root is not None:
-                assert not previous_root.exists()
+                # Every claim stages at the same path (#5571), recreated empty:
+                # nothing the previous claim left there survives.
+                assert root == previous_root
+                assert not (root / "home" / "left-by-previous-claim").exists()
                 assert not (set(child.values()) & previous_secrets)
             previous_secrets = {secret}
+            (root / "home" / "left-by-previous-claim").write_text(secret)
             assert substrate.release(f"thread-{index}")
             assert not root.exists()
             previous_root = root
