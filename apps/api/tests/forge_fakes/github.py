@@ -47,6 +47,8 @@ LABEL_ACTOR_REFUSALS = [
     ({"id": 42, "login": "fixture[bot]", "type": "Bot"}, {"id": 52}, "actor_bot"),
     ({"id": 42, "login": "ghost", "type": "User"}, None, "actor_unverifiable"),
     (None, None, "actor_unverifiable"),
+    ({"login": "fixture[bot]", "type": "Bot"}, None, "actor_unverifiable"),
+    ({"id": 42, "login": "ghost", "type": "Bot"}, None, "actor_unverifiable"),
     ({"id": True, "login": SENDER, "type": "User"}, None, "actor_unverifiable"),
     ({"id": SENDER_ID, "login": "", "type": "User"}, None, "actor_unverifiable"),
 ]

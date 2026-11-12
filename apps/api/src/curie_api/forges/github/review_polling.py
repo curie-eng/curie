@@ -19,6 +19,7 @@ from curie_api.github_review_events import (
     FeedbackUnavailable,
     human_sender,
     parse_feedback,
+    positive_identifier,
 )
 from curie_api.github_review_truth import VerifiedRepository
 from curie_api.models import ThreadPublicationLineage, WorkItem
@@ -79,7 +80,13 @@ def label_actor(event: dict[str, Any], *, app_id: str) -> tuple[int, str]:
     """Read the canonical label actor; App provenance contributes no authority."""
 
     actor = event.get("actor")
-    if isinstance(actor, dict) and actor.get("type") == "Bot":
+    if not isinstance(actor, dict):
+        raise FeedbackIgnored("actor_unverifiable")
+    login = actor.get("login")
+    if not isinstance(login, str) or not login or login.casefold() == "ghost":
+        raise FeedbackIgnored("actor_unverifiable")
+    positive_identifier(actor.get("id"), "actor_unverifiable")
+    if actor.get("type") == "Bot":
         raise FeedbackIgnored("actor_bot")
     try:
         sender = human_sender(actor)
