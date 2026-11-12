@@ -28,7 +28,12 @@ pure ``decide``:
   check with no matching run or status on the head stays pending and, at the
   CI deadline, ends ``ci_unverified``. The notice names each check that never
   started and says it may need a trigger the factory does not apply (for
-  example a label). Publication applies only operator-configured labels. A rules
+  example a label). The configured Python aggregate is the exception while a
+  shard matching its pending prefix is queued or in progress: the verdict
+  stays pending with reason ``required_python_aggregate_waiting_on_shards``
+  and, at the same deadline, is ``timed_out`` (``ci_timeout``). The notice
+  names those shards and does not say the aggregate never started.
+  Publication applies only operator-configured labels. A rules
   HTTP 404 or an empty rules list adds no names. A transient required-check read stays
   pending until the deadline and then ends ``ci_timeout``. Any other unreadable
   read ends ``ci_unverified`` immediately, and a 403 names the read it refused
@@ -113,6 +118,7 @@ CI_CLAIM_SECONDS = 60
 # by the worker and stays bounded by the deadline. ``workitems`` keeps an equal
 # literal set (importing this one there would be circular).
 CI_CAUSES = frozenset({"ci_failed", "ci_timeout", "ci_unverified", "merge_conflict", "pr_closed"})
+PYTHON_AGGREGATE_WAITING_ON_SHARDS = "required_python_aggregate_waiting_on_shards"
 
 # Reason codes that can never become readable by waiting.
 PERMANENT_UNREADABLE = frozenset(
@@ -580,6 +586,25 @@ def _metadata_revision_detail(
     )
 
 
+def _aggregate_waiting_on_shards(
+    check_runs: Sequence[NormalizedCheck], python_ci: PythonCiPolicy | None
+) -> bool:
+    """True when a matching shard is queued or in progress.
+
+    Completed shards share the key prefix and are not dependency evidence.
+    """
+
+    prefix = None if python_ci is None else python_ci.pending_check_prefix
+    if not prefix:
+        return False
+    return any(
+        run.key.startswith(prefix)
+        and run.state is CheckState.PENDING
+        and run.reported_state in {"queued", "in_progress"}
+        for run in check_runs
+    )
+
+
 def decide(
     view: CiView,
     *,
@@ -763,10 +788,14 @@ def decide(
             for name in dict.fromkeys(host_required_checks)
             if name not in present and status_key(name) not in present
         )
-        if missing:
-            # Before the Python-CI missing return. A required check that never
-            # started stays pending until the CI deadline even when that name
-            # is also the repository's Python check.
+        if missing and not (
+            requires_python_ci
+            and python_ci is not None
+            and missing == [python_ci.check]
+            and not required_python_runs
+            and _aggregate_waiting_on_shards(check_runs, python_ci)
+        ):
+            # Any other missing required check keeps the absent-trigger ending.
             return Verdict(
                 kind="unverified" if expired else "pending",
                 pending=pending,
@@ -779,6 +808,12 @@ def decide(
         # Shard jobs stay in the list after they complete, and the aggregate
         # check is created only then. Their presence means that check can
         # still appear, so keep waiting until the CI deadline.
+        if _aggregate_waiting_on_shards(check_runs, python_ci):
+            return Verdict(
+                kind="timed_out" if expired else "pending",
+                pending=pending,
+                reason=PYTHON_AGGREGATE_WAITING_ON_SHARDS,
+            )
         shard_prefix = python_ci.pending_check_prefix if python_ci is not None else None
         shards_expect_aggregate = shard_prefix is not None and any(
             run.key.startswith(shard_prefix) for run in check_runs
