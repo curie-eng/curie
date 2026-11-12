@@ -1113,8 +1113,11 @@ class ImageBuilder:
                     "build",
                     "--platform",
                     platform,
-                    "--label",
-                    f"{sks.REVISION_LABEL}={inputs.candidate}",
+                    *[
+                        arg
+                        for label in sks.candidate_labels(inputs.candidate, tag)
+                        for arg in ("--label", label)
+                    ],
                     "-f",
                     str(source / dockerfile),
                     "-t",
@@ -1146,9 +1149,10 @@ class ImageBuilder:
         manifest = json.loads((bundle / ".claude-plugin" / "plugin.json").read_text())
         repository = f"{inputs.registry}/{manifest.get('name')}-runner"
         self.ledger.record("images", "layer_repository", repository)
+        layer_file = bundle / "runner.Dockerfile"
+        layer_file.write_text(sks.run_layer_dockerfile(layer_file.read_text(), tag))
         layer = self.build_layer(bundle, platform, tag)
         if layer.revision != inputs.candidate:
-            layer_file = bundle / "runner.Dockerfile"
             layer_file.write_text(
                 layer_file.read_text() + f"\nLABEL {sks.REVISION_LABEL}={inputs.candidate}\n"
             )

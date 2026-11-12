@@ -143,6 +143,8 @@ UNATTRIBUTED = "unattributed"
 ROLES = (IMPLEMENTER, PLAN_REVIEWER, DIFF_REVIEWER)
 LAYER_IMAGE = "curie-factory-runner"
 REVISION_LABEL = "org.opencontainers.image.revision"
+# A label unique to one run, on every image it builds (see candidate_labels).
+RUN_LABEL = "org.curie.e2e.run"
 PERSONAL_MODE = "personal"
 GRANT_KEY = "CLAUDE_CODE_OAUTH_TOKEN"
 CLAIM_TOKENS_SUFFIX = "-tokens"
@@ -977,6 +979,24 @@ def pod_grant_checks(pod: Any, claim: Any, owner: Mapping[str, Any]) -> dict[str
         and labels.get(OWNER_PRINCIPAL_LABEL) == owner.get("principal_id")
         and labels.get(GENERATION_LABEL) == str(owner.get("generation")),
     }
+
+
+def candidate_labels(candidate: str, tag: str) -> list[str]:
+    """The labels on every image a run builds: the candidate revision and the run's tag. Pure.
+
+    The run's tag makes each run's image config unique. A node that already holds an
+    identical image from an earlier run reports that run's pushed digest as the
+    running image ID, so a rebuild at the same revision without it fails the exact
+    running-digest check even though the pod runs the right bytes.
+    """
+
+    return [f"{REVISION_LABEL}={candidate}", f"{RUN_LABEL}={tag}"]
+
+
+def run_layer_dockerfile(text: str, tag: str) -> str:
+    """The runner layer's Dockerfile with this run's label appended, as candidate_labels. Pure."""
+
+    return f"{text.rstrip(chr(10))}\nLABEL {RUN_LABEL}={tag}\n"
 
 
 def runner_started_at(pod: Any) -> float | None:

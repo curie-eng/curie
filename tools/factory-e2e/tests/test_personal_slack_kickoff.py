@@ -2920,6 +2920,34 @@ def test_candidate_images_are_verified_by_digest_and_revision(tmp_path: Path) ->
     ledger.close()
 
 
+def test_every_image_a_run_builds_carries_its_own_run_label() -> None:
+    """Behavior: every candidate image and the runner layer carry the candidate revision
+    and the run's own tag, so two runs at one revision never build the same image config.
+    A node holding an identical image from an earlier run reports that run's digest as
+    the running image ID, which the exact running-digest check rejects."""
+
+    first, second = sks.image_tag(CANDIDATE, RUN_ID), sks.image_tag(CANDIDATE, "acme-kickoff-2")
+    labels = sks.candidate_labels(CANDIDATE, first)
+    assert labels == [f"{sks.REVISION_LABEL}={CANDIDATE}", f"{sks.RUN_LABEL}={first}"]
+    assert labels != sks.candidate_labels(CANDIDATE, second)
+    layer = sks.run_layer_dockerfile("FROM base\nLABEL a=b\n", first)
+    assert layer == f"FROM base\nLABEL a=b\nLABEL {sks.RUN_LABEL}={first}\n"
+    assert layer != sks.run_layer_dockerfile("FROM base\nLABEL a=b\n", second)
+
+    # The node's report for a rebuilt identical image names the earlier run's digest.
+    earlier, pushed = "sha256:" + "1" * 64, "sha256:" + "2" * 64
+    registry = "localhost:25001"
+    aliased = {
+        "items": [
+            _container_pod("acme-api", "api", f"{registry}/curie-api@{pushed}", f"x@{earlier}")
+        ]
+    }
+    failures = sks.running_image_failures(
+        aliased, {"curie-api": pushed}, registry=registry, required=("curie-api",)
+    )
+    assert "curie-api_digest_mismatch" in failures
+
+
 def _container_pod(
     name: str, container: str, image: str, image_id: str, *, env: Sequence[Any] = ()
 ) -> dict[str, Any]:
