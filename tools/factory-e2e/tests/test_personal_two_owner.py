@@ -19,19 +19,15 @@ registry fixture, and no value is a real credential or identifier.
 from __future__ import annotations
 
 import base64
-import contextlib
 import dataclasses
 import datetime as dt
 import hashlib
-import http.server
 import io
 import json
-import os
 import tarfile
-import threading
 import urllib.parse
 import uuid
-from collections.abc import Callable, Iterator, Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
@@ -41,117 +37,40 @@ import personal_profile_support as pps
 import personal_two_owner as pt
 import personal_two_owner_support as pto
 import pytest
-
-REPO_ROOT = pp.REPO_ROOT
-T0 = 1_800_000_000.0
-CANDIDATE = "0123456789abcdef0123456789abcdef01234567"
-OTHER_SHA = "fedcba9876543210fedcba9876543210fedcba98"
-RUN_ID = "acme-two-owner-1"
-TAG = pps.image_tag(CANDIDATE, RUN_ID)
-MARKER_A = "synthetic-owner-a-marker-not-a-token"
-MARKER_B = "synthetic-owner-b-marker-not-a-token"
-SLACK_MARKER = "xoxb-synthetic-gateway-marker-not-a-token"
-SESSION_MARKER = "session-marker-0001"
-STATE_MARKER = "state-marker-0001"
-CHANNEL = "C0EXAMPLE1"
-REPO = "acme-corp/acme-fixture"
-CONTEXT = "kind-acme-test"
-NAMESPACE = "pto-acme-1"
-RELEASE = "pto-acme"
-FULLNAME = pps.chart_fullname(RELEASE)
-REGISTRY = "localhost:5999"
-WINDOW = T0 + pto.GRANT_MIN_LIFETIME + 3600
-TENANT = pps.DEFAULT_TENANT
-PRINCIPAL_A = "5d0c7f3e-0000-4000-8000-00000000a001"
-PRINCIPAL_B = "5d0c7f3e-0000-4000-8000-00000000b002"
-AGENT_ID = "5d0c7f3e-0000-4000-8000-0000000a9e01"
-WORK_ITEM = "5d0c7f3e-0000-4000-8000-0000000c0001"
-DIGESTS = {
-    name: "sha256:" + hashlib.sha256(name.encode()).hexdigest() for name in pps.REQUIRED_IMAGES
-}
-DEX_DIGEST = "sha256:" + "d" * 64
-API_PORT = 41001
-DEX_PORT = 41002
-PATH_ONLY = {"PATH": "/nonexistent"}
-
-
-# --------------------------------------------------------------------------
-# Builders (no provisioning fixtures)
-# --------------------------------------------------------------------------
-
-
-def _private(path: Path) -> Path:
-    path.mkdir(parents=True, exist_ok=True)
-    os.chmod(path, 0o700)
-    return path
-
-
-def _file(path: Path, content: bytes, mode: int = 0o600) -> Path:
-    path.write_bytes(content)
-    os.chmod(path, mode)
-    return path
-
-
-def _kit(tmp_path: Path, *, registry: str = REGISTRY, prior: int = 0) -> dict[str, Any]:
-    """A valid live inputs document (personal_two_owner_support.load_inputs_file)."""
-
-    kit = _private(tmp_path / "kit")
-    app = _private(kit / "app")
-    (app / "app.json").write_text(json.dumps({"id": 42, "installation_id": 7, "repo": REPO}))
-    (app / "app.pem").write_text("placeholder, never read here\n")
-    kubeconfig = _file(kit / "kubeconfig", b"apiVersion: v1\nkind: Config\n")
-    slack = _file(kit / "slack-bot", SLACK_MARKER.encode() + b"\n")
-    grant_a = _file(kit / "grant-a", MARKER_A.encode() + b"\n")
-    grant_b = _file(kit / "grant-b", MARKER_B.encode() + b"\n")
-    return {
-        "target": {
-            "context": CONTEXT,
-            "namespace": NAMESPACE,
-            "release": RELEASE,
-            "registry": registry,
-            "docker_context": "acme-docker",
-            "kubeconfig": str(kubeconfig),
-        },
-        "forge": {"app_dir": str(app)},
-        "gateway": {"slack_bot_token_file": str(slack), "resolution_channel": CHANNEL},
-        "owners": {
-            "a": {"grant_file": str(grant_a), "usable_until": int(WINDOW)},
-            "b": {"grant_file": str(grant_b), "usable_until": int(WINDOW)},
-        },
-        "independent_accounts": True,
-        "prior_item_output_tokens": prior,
-        "probe_cli": "claude",
-    }
-
-
-def _setup_document(tmp_path: Path, **kwargs: Any) -> dict[str, Any]:
-    document = _kit(tmp_path, **kwargs)
-    for key in ("owners", "independent_accounts"):
-        document.pop(key)
-    return document
-
-
-def _inputs_file(tmp_path: Path, document: Mapping[str, Any]) -> Path:
-    folder = _private(tmp_path / "inputs")
-    return _file(folder / "two-owner.json", json.dumps(document).encode())
-
-
-class _FakeClock(pp.Clock):
-    """Waiting advances time; nothing sleeps."""
-
-    def __init__(self, now: float = T0) -> None:
-        self.current = now
-        self.ticks = 0.0
-
-    def now(self) -> float:
-        return self.current
-
-    def monotonic(self) -> float:
-        return self.ticks
-
-    def wait(self, seconds: float) -> None:
-        self.current += max(0.0, seconds)
-        self.ticks += max(0.0, seconds)
+from two_owner_shared import (
+    AGENT_ID,
+    API_PORT,
+    CANDIDATE,
+    CONTEXT,
+    DEX_DIGEST,
+    DEX_PORT,
+    DIGESTS,
+    FULLNAME,
+    MARKER_A,
+    MARKER_B,
+    NAMESPACE,
+    PATH_ONLY,
+    PRINCIPAL_A,
+    PRINCIPAL_B,
+    REGISTRY,
+    RELEASE,
+    REPO_ROOT,
+    RUN_ID,
+    SESSION_MARKER,
+    STATE_MARKER,
+    T0,
+    TAG,
+    TENANT,
+    WINDOW,
+    WORK_ITEM,
+    _FakeClock,
+    _image,
+    _inputs_file,
+    _kit,
+    _private,
+    _registry,
+    _setup_document,
+)
 
 
 def _runtime(clock: pp.Clock | None = None) -> pp.Runtime:
@@ -428,429 +347,6 @@ def _connect(h: _Harness) -> None:
         pp.write_private(current.session_file, f"session-marker-{owner}\n".encode())
         current.custody_secret = f"curie-pe-{owner * 8}-g1"
         run.prepare_token(current)
-
-
-def _refusal(capsys: pytest.CaptureFixture[str]) -> dict[str, Any]:
-    lines = [line for line in capsys.readouterr().out.splitlines() if line.strip()]
-    payload = json.loads(lines[-1])
-    assert isinstance(payload, dict)
-    return payload
-
-
-# --------------------------------------------------------------------------
-# A loopback registry (the pp tests' recorded registry:2.8.3 shapes)
-# --------------------------------------------------------------------------
-
-
-def _image(revision: str) -> tuple[bytes, bytes]:
-    """Docker manifest v2 schema 2 plus its config blob (distribution spec manifest-v2-2)."""
-
-    config = json.dumps(
-        {
-            "architecture": "amd64",
-            "os": "linux",
-            "config": {"Labels": {pps.REVISION_LABEL: revision}},
-            "rootfs": {"type": "layers", "diff_ids": ["sha256:" + "1" * 64]},
-        }
-    ).encode()
-    manifest = json.dumps(
-        {
-            "schemaVersion": 2,
-            "mediaType": "application/vnd.docker.distribution.manifest.v2+json",
-            "config": {
-                "mediaType": "application/vnd.docker.container.image.v1+json",
-                "size": len(config),
-                "digest": "sha256:" + hashlib.sha256(config).hexdigest(),
-            },
-            "layers": [
-                {
-                    "mediaType": "application/vnd.docker.image.rootfs.diff.tar.gzip",
-                    "size": 32,
-                    "digest": "sha256:" + "2" * 64,
-                }
-            ],
-        }
-    ).encode()
-    return manifest, config
-
-
-@contextlib.contextmanager
-def _registry(images: Mapping[tuple[str, str], tuple[bytes, bytes]]) -> Iterator[int]:
-    """Registry HTTP API v2 GETs for manifests (by tag or digest) and config blobs."""
-
-    manifests = {key: value[0] for key, value in images.items()}
-    blobs = {
-        "sha256:" + hashlib.sha256(config).hexdigest(): config for _m, config in images.values()
-    }
-
-    class Handler(http.server.BaseHTTPRequestHandler):
-        def log_message(self, *args: Any) -> None:
-            pass
-
-        def do_GET(self) -> None:  # noqa: N802 - http.server naming
-            parts = self.path.split("/")
-            body: bytes | None = None
-            headers: dict[str, str] = {}
-            if len(parts) == 5 and parts[1] == "v2" and parts[3] == "manifests":
-                found = manifests.get((parts[2], parts[4]))
-                accepted = [item.strip() for item in self.headers.get("Accept", "").split(",")]
-                media_type = json.loads(found).get("mediaType") if found else None
-                if found and media_type in accepted:
-                    body = found
-                    headers = {
-                        "Content-Type": str(media_type),
-                        "Docker-Content-Digest": "sha256:" + hashlib.sha256(body).hexdigest(),
-                    }
-            elif len(parts) == 5 and parts[1] == "v2" and parts[3] == "blobs":
-                body = blobs.get(parts[4])
-            if body is None:
-                self.send_response(404)
-                self.send_header("Content-Length", "0")
-                self.end_headers()
-                return
-            self.send_response(200)
-            for key, value in headers.items():
-                self.send_header(key, value)
-            self.send_header("Content-Length", str(len(body)))
-            self.end_headers()
-            self.wfile.write(body)
-
-    server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
-    thread = threading.Thread(target=server.serve_forever, daemon=True)
-    thread.start()
-    try:
-        yield server.server_address[1]
-    finally:
-        server.shutdown()
-        server.server_close()
-        thread.join(timeout=10)
-
-
-def _candidate_registry(revision: str = CANDIDATE) -> dict[tuple[str, str], tuple[bytes, bytes]]:
-    images = {(name, TAG): _image(revision) for name in pps.REQUIRED_IMAGES}
-    dex = _image("dex-upstream")
-    images[(pt.DEX_REPOSITORY, "sha256:" + hashlib.sha256(dex[0]).hexdigest())] = dex
-    return images
-
-
-def _record_dex(state: Path, *, digest: str) -> None:
-    ledger = pto.TwoOwnerLedger.open(state, RUN_ID)
-    ledger.ensure_run(CANDIDATE, phase="images")
-    ledger.record(
-        "images",
-        "dex",
-        {"source": pt.DEX_SOURCE, "repository": pt.DEX_REPOSITORY, "digest": digest, "tag": TAG},
-    )
-    ledger.close()
-
-
-# --------------------------------------------------------------------------
-# Command path: refusals through the real main, each with its control
-# --------------------------------------------------------------------------
-
-
-def _argv(command: str, inputs: Path | None, state: Path, *extra: str) -> list[str]:
-    argv = [command, "--scenario", "two-owner"]
-    if inputs is not None:
-        argv += ["--inputs-file", str(inputs)]
-    return [*argv, "--candidate", CANDIDATE, "--state-dir", str(state), "--run-id", RUN_ID, *extra]
-
-
-def _main(
-    argv: list[str], capsys: pytest.CaptureFixture[str], environ: Mapping[str, str] = PATH_ONLY
-) -> tuple[int, dict[str, Any]]:
-    code = pp.main(argv, environ=dict(environ), clock=_FakeClock())
-    return code, _refusal(capsys)
-
-
-APPROVE = ("--approve-live", pto.approved_ceiling())
-
-
-def test_preflight_passes_with_candidate_images_and_the_mirrored_dex(
-    tmp_path: Path, capsys: pytest.CaptureFixture[str]
-) -> None:
-    images = _candidate_registry()
-    dex_digest = next(ref for (repo, ref) in images if repo == pt.DEX_REPOSITORY)
-    with _registry(images) as port:
-        state = _private(tmp_path / "state")
-        _record_dex(state, digest=dex_digest)
-        inputs = _inputs_file(tmp_path, _kit(tmp_path, registry=f"localhost:{port}"))
-        code, result = _main(_argv("preflight", inputs, state, *APPROVE), capsys)
-    assert code == 0, result
-    assert result["verdict"] == "pass" and result["scenario"] == "two-owner"
-    assert all(result["checks"].values())
-    assert {row["owner"] for row in result["schedule"]["groups"]} == {"a", "b"}
-    ledger = pto.TwoOwnerLedger.open_existing(state, RUN_ID)
-    try:
-        dex_ref = f"localhost:{port}/{pt.DEX_REPOSITORY}@{dex_digest}"
-        assert ledger.observations("images")["preflight_dex"] == dex_ref
-    finally:
-        ledger.close()
-
-
-@pytest.mark.parametrize(
-    ("served", "dex", "detail"),
-    [("other", "served", "curie-"), ("candidate", "missing", "dex")],
-)
-def test_preflight_refuses_a_candidate_or_dex_image_mismatch(
-    tmp_path: Path, capsys: pytest.CaptureFixture[str], served: str, dex: str, detail: str
-) -> None:
-    images = _candidate_registry(OTHER_SHA if served == "other" else CANDIDATE)
-    dex_digest = next(ref for (repo, ref) in images if repo == pt.DEX_REPOSITORY)
-    with _registry(images) as port:
-        state = _private(tmp_path / "state")
-        _record_dex(state, digest=dex_digest if dex == "served" else "sha256:" + "e" * 64)
-        inputs = _inputs_file(tmp_path, _kit(tmp_path, registry=f"localhost:{port}"))
-        code, result = _main(_argv("preflight", inputs, state, *APPROVE), capsys)
-    assert code == 2 and result["error"] == "candidate_image_mismatch", result
-    assert detail in result["fix"]
-
-
-@pytest.mark.parametrize("command", ["preflight", "run"])
-def test_live_commands_refuse_a_setup_descriptor(
-    tmp_path: Path, capsys: pytest.CaptureFixture[str], command: str
-) -> None:
-    state = _private(tmp_path / "state")
-    setup = _inputs_file(tmp_path / "setup", _setup_document(tmp_path / "setup"))
-    code, result = _main(_argv(command, setup, state, *APPROVE), capsys)
-    assert code == 2 and result["error"] == "independence_unasserted"
-    # Control: the live descriptor gets past every input refusal.
-    with _registry({}) as port:
-        live = _inputs_file(
-            tmp_path / "live", _kit(tmp_path / "live", registry=f"localhost:{port}")
-        )
-        code, result = _main(_argv(command, live, state, *APPROVE), capsys)
-    assert result.get("error") != "independence_unasserted"
-    if command == "run":
-        assert code == 1 and result["phase"] == "refusals" and result["error"] == "step_failed"
-        ledger = pto.TwoOwnerLedger.open_existing(state, RUN_ID)
-        try:
-            assert ledger.observations("budget")["schedule_check_passed"] is True
-            assert not ledger.is_rehearsal()
-        finally:
-            ledger.close()
-
-
-@pytest.mark.parametrize("command", ["images", "forge-probe", "rehearse"])
-def test_setup_commands_refuse_a_live_descriptor(
-    tmp_path: Path, capsys: pytest.CaptureFixture[str], command: str
-) -> None:
-    state = _private(tmp_path / "state")
-    live = _inputs_file(tmp_path / "live", _kit(tmp_path / "live"))
-    code, result = _main(_argv(command, live, state), capsys)
-    assert code == 2 and result["error"] == "setup_inputs_carry_grants"
-    # Control: a setup descriptor is accepted and the command reaches its first
-    # child, which this PATH lacks (git, openssl or kubectl): a step failure.
-    setup = _inputs_file(tmp_path / "setup", _setup_document(tmp_path / "setup"))
-    code, result = _main(_argv(command, setup, state), capsys)
-    assert code == 1 and result.get("error", "step_failed") == "step_failed", result
-    if command == "rehearse":
-        ledger = pto.TwoOwnerLedger.open_existing(state, RUN_ID)
-        try:
-            assert ledger.is_rehearsal()
-            assert ledger.observations("rehearsal")["schedule_check_passed"] is True
-        finally:
-            ledger.close()
-
-
-@pytest.mark.parametrize(
-    ("command", "flag", "value"),
-    [
-        ("images", "--context", CONTEXT),
-        ("forge-probe", "--app-dir", "app"),
-        ("rehearse", "--resolution-channel", CHANNEL),
-        ("rehearse", "--grant-file", "grant"),
-        ("preflight", "--output-token-ceiling", "32768"),
-        ("run", "--item-output-tokens-spent", "0"),
-        # Equal to its default, still a single-profile flag.
-        ("run", "--grant-probe-cli", pp.DEFAULT_PROBE_CLI),
-    ],
-)
-def test_single_profile_flags_are_refused_with_the_scenario(
-    tmp_path: Path, capsys: pytest.CaptureFixture[str], command: str, flag: str, value: str
-) -> None:
-    state = _private(tmp_path / "state")
-    live = command in {"preflight", "run"}
-    approve = APPROVE if live else ()
-    with _registry({}) as port:
-        build = _kit if live else _setup_document
-        inputs = _inputs_file(tmp_path, build(tmp_path, registry=f"localhost:{port}"))
-        code, result = _main(_argv(command, inputs, state, *approve, flag, value), capsys)
-        assert code == 2 and result["error"] == "arguments_invalid" and flag in result["fix"]
-        code, result = _main(_argv(command, inputs, state, *approve), capsys)
-    assert result.get("error") != "arguments_invalid", result
-
-
-def test_inputs_file_is_a_two_owner_flag(
-    tmp_path: Path, capsys: pytest.CaptureFixture[str]
-) -> None:
-    state = _private(tmp_path / "state")
-    inputs = _inputs_file(tmp_path, _setup_document(tmp_path))
-    argv = ["judge", "--inputs-file", str(inputs), "--candidate", CANDIDATE]
-    argv += ["--state-dir", str(state), "--run-id", RUN_ID, "--criterion", "roles"]
-    code, result = _main(argv, capsys)
-    assert code == 2 and result["error"] == "arguments_invalid"
-    # Control: without it the single-profile judge runs as before (no ledger yet).
-    code, result = _main([argv[0], *argv[3:]], capsys)
-    assert result["error"] != "arguments_invalid"
-
-
-@pytest.mark.parametrize("command", ["preflight", "run"])
-@pytest.mark.parametrize("approval", [None, "approve everything"])
-def test_live_commands_need_the_exact_live_approval(
-    tmp_path: Path, capsys: pytest.CaptureFixture[str], command: str, approval: str | None
-) -> None:
-    state = _private(tmp_path / "state")
-    extra = () if approval is None else ("--approve-live", approval)
-    with _registry({}) as port:
-        inputs = _inputs_file(tmp_path, _kit(tmp_path, registry=f"localhost:{port}"))
-        code, result = _main(_argv(command, inputs, state, *extra), capsys)
-        assert code == 2 and result["error"] == "live_not_approved"
-        code, result = _main(_argv(command, inputs, state, *APPROVE), capsys)
-    assert result.get("error") != "live_not_approved"
-
-
-def test_rehearse_refuses_a_live_approval(
-    tmp_path: Path, capsys: pytest.CaptureFixture[str]
-) -> None:
-    state = _private(tmp_path / "state")
-    inputs = _inputs_file(tmp_path, _setup_document(tmp_path))
-    code, result = _main(_argv("rehearse", inputs, state, *APPROVE), capsys)
-    assert code == 2 and result["error"] == "arguments_invalid"
-
-
-@pytest.mark.parametrize("command", ["preflight", "run", "rehearse"])
-def test_an_impossible_schedule_is_refused_before_any_mutation(
-    tmp_path: Path, capsys: pytest.CaptureFixture[str], command: str
-) -> None:
-    state = _private(tmp_path / "state")
-    build = _setup_document if command == "rehearse" else _kit
-    approve = () if command == "rehearse" else APPROVE
-    inputs = _inputs_file(tmp_path / "high", build(tmp_path / "high", prior=12_000))
-    code, result = _main(_argv(command, inputs, state, *approve), capsys)
-    assert code == 2 and result["error"] == "session_plan_impossible"
-    assert not (state / f"{RUN_ID}.work").exists()
-    with _registry({}) as port:
-        low = build(tmp_path / "low", prior=4_000, registry=f"localhost:{port}")
-        code, result = _main(
-            _argv(command, _inputs_file(tmp_path / "low", low), state, *approve), capsys
-        )
-    assert result.get("error") != "session_plan_impossible"
-
-
-@pytest.mark.parametrize("command", ["images", "preflight", "rehearse", "run", "judge"])
-@pytest.mark.parametrize(
-    ("variable", "code"),
-    [("ANTHROPIC_API_KEY", "service_credentials"), (pps.FAKE_MODEL_NAME, "fake_mode")],
-)
-def test_ambient_credentials_and_fake_mode_are_refused_first(
-    tmp_path: Path,
-    capsys: pytest.CaptureFixture[str],
-    command: str,
-    variable: str,
-    code: str,
-) -> None:
-    state = _private(tmp_path / "state")
-    live = command in {"preflight", "run"}
-    with _registry({}) as port:
-        build = _kit if live else _setup_document
-        inputs = _inputs_file(tmp_path, build(tmp_path, registry=f"localhost:{port}"))
-        argv = _argv(command, None if command == "judge" else inputs, state)
-        argv += [*APPROVE] if live else []
-        if command == "judge":
-            argv += ["--criterion", "rehearsal"]
-        exit_code, result = _main(argv, capsys, {**PATH_ONLY, variable: "marker-value-1"})
-        assert exit_code == 2 and result["error"] == code
-        assert "marker-value-1" not in json.dumps(result)
-        _exit, control = _main(argv, capsys)
-    assert control.get("error") not in {"service_credentials", "fake_mode"}
-
-
-def test_grant_probe_is_refused_for_the_scenario(
-    tmp_path: Path, capsys: pytest.CaptureFixture[str]
-) -> None:
-    state = _private(tmp_path / "state")
-    code, result = _main(_argv("grant-probe", None, state), capsys)
-    assert code == 2 and result["error"] == "arguments_invalid"
-
-
-# --------------------------------------------------------------------------
-# judge: receipts only
-# --------------------------------------------------------------------------
-
-
-def _rehearsal_ledger(state: Path, *, drop: str | None = None) -> None:
-    ledger = pto.TwoOwnerLedger.open(state, RUN_ID)
-    ledger.ensure_run(CANDIDATE, phase="rehearse")
-    ledger.mark_rehearsal()
-    for key in pto.REHEARSAL_EXPECTED:
-        if key != drop:
-            ledger.record("rehearsal", key, 403 if key == "card_unlisted_status" else True)
-    ledger.close()
-
-
-def _judge_argv(state: Path, criterion: str, candidate: str = CANDIDATE) -> list[str]:
-    return [
-        "judge",
-        "--scenario",
-        "two-owner",
-        "--candidate",
-        candidate,
-        "--state-dir",
-        str(state),
-        "--run-id",
-        RUN_ID,
-        "--criterion",
-        criterion,
-    ]
-
-
-def test_judge_reads_a_complete_rehearsal_ledger_and_nothing_else(
-    tmp_path: Path, capsys: pytest.CaptureFixture[str]
-) -> None:
-    state = _private(tmp_path / "state")
-    _rehearsal_ledger(state)
-    # No inputs file, no tools on PATH, no credential: receipts only.
-    code, result = _main(_judge_argv(state, "rehearsal"), capsys)
-    assert code == 0 and result["verdict"] == "pass" and result["scenario"] == "two-owner"
-    assert result["checks"]["no_native_sessions"] is True
-    code, result = _main(_judge_argv(state, "owners"), capsys)
-    assert code == 1 and result["checks"] == {"live_ledger": False}
-    code, result = _main(_judge_argv(state, "rehearsal", OTHER_SHA), capsys)
-    assert code == 2 and result["error"] == "candidate_mismatch"
-
-
-def test_judge_fails_a_rehearsal_ledger_missing_one_key(
-    tmp_path: Path, capsys: pytest.CaptureFixture[str]
-) -> None:
-    state = _private(tmp_path / "state")
-    _rehearsal_ledger(state, drop="admission_controls_refused")
-    code, result = _main(_judge_argv(state, "rehearsal"), capsys)
-    assert code == 1 and result["checks"]["admission_controls_refused"] is False
-
-
-def test_judge_refuses_a_single_profile_ledger_and_inputs(
-    tmp_path: Path, capsys: pytest.CaptureFixture[str]
-) -> None:
-    state = _private(tmp_path / "state")
-    ledger = pps.Ledger.open(state, RUN_ID)
-    ledger.ensure_run(CANDIDATE, phase="run")
-    ledger.close()
-    code, result = _main(_judge_argv(state, "rehearsal"), capsys)
-    assert code == 2 and result["error"] == "ledger_missing"
-    inputs = _inputs_file(tmp_path, _setup_document(tmp_path))
-    argv = [*_judge_argv(state, "rehearsal"), "--inputs-file", str(inputs)]
-    code, result = _main(argv, capsys)
-    assert code == 2 and result["error"] == "arguments_invalid"
-    # A two-owner criterion is not a single-profile one.
-    single = [arg for arg in _judge_argv(state, "owners") if arg not in {"--scenario", "two-owner"}]
-    code, result = _main(single, capsys)
-    assert code == 2 and result["error"] == "arguments_invalid"
-
-
-def test_parser_criteria_cover_every_two_owner_criterion() -> None:
-    choices = {*pps.CRITERIA, *pp.TWO_OWNER_CRITERIA}
-    assert {*pto.CRITERIA, "rehearsal"} <= choices
 
 
 # --------------------------------------------------------------------------
