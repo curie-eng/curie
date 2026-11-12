@@ -356,6 +356,236 @@ facts, never a raw transcript. A transcript whose final record is unterminated
 or unreadable makes that attempt's usage unknown, so the budget judge fails
 rather than counting a partial session.
 
+## Two-owner scenario (#5379)
+
+`personal_profile.py --scenario two-owner` proves issue #5379 against ADR 0268
+section 6 rows 4, 5, 7, 11 and 12: two independently enrolled owners share one
+installation and keep separate grants through execution, approval, CI repair,
+recovery and disconnect. Its code is `personal_two_owner.py` (live driver, a
+subclass of the single-profile harness) and `personal_two_owner_support.py`
+(pure core: ceilings, inputs, manifest, ledger, gate, judges). Every
+single-profile flag is refused under `--scenario`; the scenario reads one
+private inputs file instead.
+
+### What each criterion proves
+
+1. `owners` and `roles`: both owners run the implementer, plan reviewer, diff
+   reviewer, real tools and a bundle hook on their own grant only. WorkItem,
+   every request, custody and delivery identity, session and CLI reads agree on
+   tenant, immutable owner and generation, and no installation-wide grant exists.
+2. `approval` and `publication`: a listed operator rejects A's first
+   publication and approves its fresh successor and B's publications, an
+   unlisted operator gets 403, nothing is pushed before approval, and approved
+   trees equal the reviewed workspace on the branch the API reports.
+3. `ci-repair`: a real failing check on B's published head reaches production
+   CI ingestion; the production repair keeps B's owner and grant, pushes a
+   repaired head and its latest and required checks pass.
+4. `restarts`: pod, worker and native-process interruptions each keep the
+   WorkItem, conversation, owner and generation, confirm the old runtime gone
+   and show a fresh native process continuing on the same owner's grant.
+5. `wrong-owner`: B cannot adopt or read A's work before A's authorized
+   continuation, which then runs with its original tuple.
+6. `disconnect`: A's disconnect during active work fences and tears A down; B
+   makes a new tool call after A's confirmed stop and publishes a passing head;
+   after a worker restart A cannot launch, reuse or resume.
+7. `budget` and `cleanup`: every start was reserved and settled from native
+   usage inside the ceiling, and every owned resource is absent with no grant
+   bytes in any scanned channel. `rehearsal` judges the unpaid rehearsal ledger.
+
+### Inputs file
+
+`--inputs-file` is one JSON object: a regular file you own, mode 0600, at most
+64 KiB, not a symlink, in a directory no group or other user can write. Every
+path is absolute, unknown or duplicate keys are refused, and any credential-like
+key or token-shaped string is refused as `inline_grant_refused`. Grant bytes
+never appear in it; it names grant files, which `check_grant_file` validates.
+
+```json
+{
+  "target": {"context": "kube-context", "namespace": "pto-demo", "release": "pto-demo",
+             "registry": "127.0.0.1:5999", "docker_context": "builder",
+             "kubeconfig": "/path/to/kubeconfig"},
+  "forge": {"app_dir": "/path/to/app-kit"},
+  "gateway": {"resolution_channel": "C0EXAMPLE1",
+              "slack_bot_token_file": "/path/to/bot-token-file"},
+  "independent_accounts": true,
+  "owners": {"a": {"grant_file": "/path/to/grant-a", "usable_until": "2026-11-12T20:00:00Z"},
+             "b": {"grant_file": "/path/to/grant-b", "usable_until": 1794000000}},
+  "prior_item_output_tokens": 0,
+  "probe_cli": "claude"
+}
+```
+
+1. The setup descriptor (`images`, `rehearse`, `forge-probe`) holds only
+   `target`, `forge`, `gateway` and optionally `probe_cli`. Owners,
+   `independent_accounts` or any `grant_file` in it is `setup_inputs_carry_grants`.
+2. The live descriptor (`preflight`, `run`) must set `independent_accounts` to
+   exactly `true` (the caller's independent-enrollment assertion, else
+   `independence_unasserted`). The two grant files must differ by resolved
+   path, inode and content digest (`duplicate_owner_grant`).
+3. `usable_until` is ISO 8601 with an offset or epoch seconds, stated by the
+   caller. Each must be at least 5,400 s (live plus cleanup) after now, else
+   `lifetime_insufficient`; the run records the window and the budget judge
+   checks it covers the live end.
+4. `prior_item_output_tokens` is the item's earlier actual spend (0 to 32,768).
+   It counts against the aggregate guard and shrinks the schedule's room.
+5. `namespace` is at most 56 characters because the driver also owns
+   `<namespace>-grants`, the custody namespace, created before helm.
+
+### Commands
+
+```sh
+p() {
+  python3 tools/factory-e2e/personal_profile.py "$@" \
+    --scenario two-owner --candidate "$SHA" \
+    --state-dir "$STATE_DIR" --run-id "$RUN_ID"
+}
+p images --inputs-file "$PRIVATE_SETUP_FILE"
+p rehearse --inputs-file "$PRIVATE_SETUP_FILE"
+p forge-probe --inputs-file "$PRIVATE_SETUP_FILE"
+p preflight --inputs-file "$PRIVATE_LIVE_FILE" --approve-live "$APPROVED_CEILING"
+p run --inputs-file "$PRIVATE_LIVE_FILE" --approve-live "$APPROVED_CEILING"
+p judge --criterion all
+```
+
+1. `images` builds the candidate images and the gated private bundle, and
+   mirrors a pinned Dex image into the run's loopback registry. Use a distinct
+   rehearsal run ID.
+2. `rehearse` is unpaid and takes no grant and no `--approve-live`: namespace,
+   install, Dex logins per owner, forge issues, delivered-card controls
+   (unlisted 403, authorized reject and approve), wrong-owner admission
+   controls with the worker stopped, post-restart refusals, the fence and
+   cleanup. It cannot pass a live criterion.
+3. `forge-probe` is the single-profile write probe plus read-only CI reads.
+4. `preflight` is unpaid and mutates nothing: exact approval string, inputs
+   file safety, windows, the schedule check, and image digests. It does not
+   authenticate grants or sessions.
+5. `run` performs the one live run. A second `run` for the same run ID is
+   refused; there is no retry flag.
+6. `judge` reads receipts only: no inputs file, no credential, no inference.
+   Criteria: `owners`, `roles`, `approval`, `publication`, `ci-repair`,
+   `restarts`, `wrong-owner`, `disconnect`, `budget`, `cleanup`, `rehearsal`,
+   `all`. Output carries `not_met` for items reported but never failing.
+
+The approved ceiling, exactly as `approved_ceiling()` builds it:
+
+```text
+sessions=16,turns=192,session-turns=32,output-tokens=32768,session-output-tokens=8192,owner-output-tokens=16384,session-seconds=300,live-seconds=4800,cleanup-seconds=600,paid-retries=0,probe-model=claude-haiku-5-5,probe-output-tokens=32,probe-turns=1,probe-seconds=30
+```
+
+### The 16-start manifest
+
+Each group is reserved and persisted before the native start it covers, in
+this order. A group's per-session share is `min(8192, floor(available /
+sessions))` with `available` the smaller of the owner's and the aggregate's
+remaining output tokens, counting settled actual usage and charging unknown
+usage at its full share. Turns per session are `min(32, (192 - used) /
+sessions)`.
+
+| Group | Owner | Sessions | Production transition that starts it |
+|---|---|---|---|
+| a-probe | A | 1 probe | driver grant probe in an empty HOME, before A1 |
+| a1 | A | implementer, plan reviewer, diff reviewer | trusted admission, execute turn; reviewers via the Agent tool |
+| b-probe | B | 1 probe | driver grant probe, before B1 |
+| b1 | B | implementer, plan reviewer, diff reviewer | trusted admission, execute turn |
+| a2 | A | implementer, plan reviewer, diff reviewer | admission of the fresh successor after rejection |
+| b-r1 | B | implementer, held at its prompt, zero usage | the `factory_ci` round-2 continuation consumed after the worker restart |
+| a3 | A | implementer | admission of the authorized follow-up; ended by disconnect |
+| b-r2 | B | implementer, diff reviewer, second diff reviewer | kernel runner-error retry on the same request and epoch |
+
+Transitions that start nothing: kernel publish continuation, reviewer start
+inside a reserved group, approval resolve and rejection, the publication job,
+CI polling and rerun, the owner-lost refusal, pod deletion at a park, the
+wrong-owner controls, disconnect terminate and worker restarts. Fenced as
+unplanned starts: an owner-lost successor, a round-3 repair, an unpublished
+continuation of a CI turn, and any session the harvest cannot map to a
+reservation. The unpaid schedule check (G-SESSION-PLAN, run by `preflight` and
+`rehearse`) simulates the manifest on planning usage (implementer 2,700, plan
+reviewer 1,000, diff reviewer 800, probe 32 output tokens) and requires 16
+starts, a share of at least 2,700 for implementer groups and 1,000 for others,
+at least 16 turns per session, each owner at most 16,384 and the aggregate at
+most 32,768 minus prior spend, and every production transition mapped.
+
+### Live phase order
+
+1. Unpaid: `refusals`, `namespace`, `images`, `install`, `setup` (Dex login and
+   enrollment per owner), `forge`. Then `probe-a`, `attempt-a1` (parks on
+   card 1), `probe-b`, `attempt-b1` (parks on card 3). Every attempt's pod is
+   deleted at its park after terminal capture, so each later start is a fresh
+   native process.
+2. `wrong-owner`, then `reject-a1` (unlisted operator refused, listed operator
+   rejects), `attempt-a2` (fresh successor in a new pod), `approve-a2`.
+3. `approve-b1` once A is quiescent, then `worker-stop`: B's real failing check
+   queues the round-2 repair while the worker is down.
+4. `queue-a3` (A3 admitted with the worker stopped), `worker-start` (a new
+   worker pod; B-r1 reserved), `hold-both` (B-r1 held at its prompt, A3 runs one
+   tool and is held).
+5. `disconnect-a`, `process-interruption` (B-r1's CLI killed and runner PID 1
+   signalled; the kernel retries as B-r2), `approve-b2`, `post-disconnect`
+   (another worker restart; A cannot launch, reuse or resume, B stays active).
+6. The fence (worker to zero, claims and runner pods deleted, active owners
+   disconnected), cleanup and inventory.
+
+### Response gate and subagent limits
+
+The private bundle gains `hooks/two_owner_gate.py` on `UserPromptSubmit`,
+`PreToolUse` (`*`), `Stop` and `SubagentStop`. Each hook writes a hold file keyed
+by its pid and start time and waits up to 240 s (hook timeout 250 s) for a
+release; a stop verdict or timeout fails closed. A long-lived in-pod stream
+reports holds to the driver, which waits until the harvest has read the
+transcript to the reported size, recomputes usage, and releases only if the
+session share, per-session cap, turns, 300 s, owner allocation (16,384) and
+aggregate guard all hold with one more response (2,048 tokens) in flight.
+Otherwise it stops the hold, interrupts the runner, deletes the pod and records
+the breach; unknown usage always stops. Before the first prompt release the
+driver writes `/tmp/pto-gate/limits.json` with the pod's reviewer allowance from
+its group (one plan and one diff reviewer for three-role groups, two diff
+reviewers for b-r2, none for probes, a3 and b-r1). An absent file, a missing
+type or a spent allowance denies the Agent call.
+
+### CI repair fixture
+
+A's issue asks only for a nonce line, so A's CI passes. B's issue asks for
+`unitconv/tests/test_ci_ack.py` with exact content: skipped unless
+`GITHUB_HEAD_REF` is set, otherwise it fails unless `CI_ACK.md` at the root has
+the line `ci ack: <GITHUB_HEAD_REF>`, printing an `::error file=CI_ACK.md` line.
+The head ref (`curie/publication-<hex>`) exists only after the first
+publication, so B's first head fails in real Actions CI. The driver observes
+the failure, the single rerun (or its forbidden refusal) and the production
+`work-item-<request>-ci-2` event, then the repair adds `CI_ACK.md`.
+
+### Ledger and public output
+
+The private SQLite ledger (`ledger.sqlite3` in `$STATE_DIR`, mode 0600) holds
+reservations per owner and group, sanitized per-session facts and native error
+classes, every observation each criterion judges, cleanup steps, inventories and
+the token scan over stdout, stderr, children, http, harvest, ledger and evidence.
+Public output is verdicts, booleans, counts and refusal codes: no identifier, no
+transcript, no grant, session or client value. Grants travel only by file; the
+CLI reads session files the driver writes 0600 and the finalizer removes.
+
+### Interpretations recorded for reviewers
+
+1. Pod recreation lands at the quiescent approval park between A's first and
+   second attempts; A1's pod is deleted after its terminal capture and A2 must
+   run in a new pod. The process interruption restarts the runner container in
+   place, and the same pod, claim, request and epoch continue.
+2. B's fourth repair start is a second diff-review round, admitted only when the
+   first returns changes, so b-r2 reserves for it either way.
+3. Principal sessions are minted during the run through a run-local identity
+   provider, so `preflight` validates file safety, windows, schedule and images,
+   and the run validates sessions through `/console/principal`.
+4. Code-host steering by another owner is admitted under the original owner by
+   design and is not driven.
+5. `curie cluster message` cannot target a GitHub-issue conversation, so no
+   message control is recorded.
+
+### Not met
+
+Restoring uncommitted workspace edits into a fresh or continuing process is Not
+met and not claimed. It is tracked in #5541. `judge` lists it under `not_met`
+for `restarts` and it never changes a verdict.
+
 ## Personal owner enforcement proof
 
 `personal_owner_enforcement.py` is the live proof for issue #5378: personal
