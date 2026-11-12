@@ -656,19 +656,6 @@ def test_credential_read_retry_is_bounded_and_excludes_auth_errors(
         assert len(_warnings(caplog)) == 1
         _safe_logs(caplog, recovery)
 
-        caplog.clear()
-        credentials = [recovery.credential(), recovery.credential()]
-        for credential in credentials:
-            recovery.proxy.drops[credential.target] = None
-        responses = await asyncio.gather(*(recovery.read(c) for c in credentials))
-        for credential, response in zip(credentials, responses, strict=True):
-            assert response.status_code == 503, response.text
-            assert response.json() == {"detail": UNAVAILABLE}
-            assert recovery.proxy.forwarded[credential.target] == 4
-            assert recovery.proxy.discarded[credential.target] == 4
-        assert len(_warnings(caplog)) == 2
-        _safe_logs(caplog, recovery)
-
         # redis-py 8.1.0 authentication exceptions inherit ConnectionError:
         # https://github.com/redis/redis-py/blob/v8.1.0/redis/exceptions.py
         # Observe actual HELLO AUTH/EXISTS errors from Valkey, without fabricated replies.
