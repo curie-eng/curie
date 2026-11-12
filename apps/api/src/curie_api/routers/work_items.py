@@ -169,8 +169,17 @@ class TerminationClaimBody(BaseModel):
     owner: str = Field(min_length=1)
 
 
+class TerminationClaimOut(BaseModel):
+    """What the claimant's termination record presents back (#5377)."""
+
+    runtime_epoch: int
+    request_version: int
+
+
 class TerminationBody(BaseModel):
     runtime_epoch: int = Field(ge=1)
+    # The request version the claim returned; a later claim or write moves it.
+    expected_request_version: int = Field(ge=1)
     observation: str = Field(min_length=1)
 
 
@@ -570,14 +579,16 @@ async def finish_work_item_request(
 @router.post("/requests/{request_id}/termination/claim")
 async def claim_work_item_termination(
     request_id: uuid.UUID, body: TerminationClaimBody, session: SessionDep
-) -> dict[str, Any]:
+) -> TerminationClaimOut:
     result = await workitem_dispatch.claim_termination(
         session, request_id, owner=body.owner
     )
     if isinstance(result, DispatchConflict):
         _raise_conflict(result)
     assert not isinstance(result, DispatchConflict)
-    return {"runtime_epoch": result.runtime_epoch}
+    return TerminationClaimOut(
+        runtime_epoch=result.runtime_epoch, request_version=result.request_version
+    )
 
 
 @router.post("/requests/{request_id}/termination")
@@ -588,6 +599,7 @@ async def record_work_item_termination(
         session,
         request_id,
         runtime_epoch=body.runtime_epoch,
+        expected_request_version=body.expected_request_version,
         observation=body.observation,
     )
     if isinstance(result, DispatchConflict):

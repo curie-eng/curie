@@ -93,7 +93,18 @@ def scrubbed_env() -> dict[str, str]:
 
 
 class BudgetLedger:
-    """A started session with unknown usage reserves the entire remaining budget."""
+    """A started session with unknown usage reserves the entire remaining budget.
+
+    The class attributes are the logical proof's session bounds; a driver with
+    another approved ceiling subclasses them. ``unpaid_sessions`` admits a
+    session that the provider refused before any output (zero tokens, zero
+    assistant turns); it still counts against ``max_sessions``.
+    """
+
+    max_sessions = 2
+    max_assistant_turns = 4
+    max_session_seconds = 180
+    unpaid_sessions = False
 
     def __init__(self, run_id: str, *, diagnostic_retry: bool = False) -> None:
         __tracebackhide__ = True
@@ -130,7 +141,10 @@ class BudgetLedger:
                 "SELECT output_tokens, reserved FROM sessions WHERE run_id=? ORDER BY sequence",
                 (self.run_id,),
             ).fetchall()
-            require(len(rows) < 2, "the logical proof has used its two-session allowance")
+            require(
+                len(rows) < self.max_sessions,
+                f"the logical proof has used its {self.max_sessions}-session allowance",
+            )
             spent = sum(output if output is not None else reserved for output, reserved in rows)
             remaining = min(self.session_limit, self.limit - spent)
             require(remaining > 0, "the logical proof has no remaining output-token budget")
@@ -150,7 +164,10 @@ class BudgetLedger:
         rows = self.db.execute(
             "SELECT output_tokens,reserved FROM sessions WHERE run_id=?", (self.run_id,)
         ).fetchall()
-        require(len(rows) < 2, "the logical proof has used its two-session allowance")
+        require(
+            len(rows) < self.max_sessions,
+            f"the logical proof has used its {self.max_sessions}-session allowance",
+        )
         remaining = min(self.session_limit, self.limit - sum(
             output if output is not None else reserved for output, reserved in rows
         ))
@@ -167,13 +184,19 @@ class BudgetLedger:
             "SELECT output_tokens,reserved FROM sessions WHERE run_id=?", (self.run_id,)
         ).fetchall()
         total = sum(output if output is not None else reserved for output, reserved in rows)
+        least = 0 if self.unpaid_sessions else 1
         require(
-            0 < tokens <= rows[sequence - 1][1], "the live session exceeded its output allowance"
+            least <= tokens <= rows[sequence - 1][1],
+            "the live session exceeded its output allowance",
         )
         require(
-            len(rows) <= 2 and total <= self.limit, "the logical proof exceeded its live budget"
+            len(rows) <= self.max_sessions and total <= self.limit,
+            "the logical proof exceeded its live budget",
         )
-        require(0 < turns <= 4 and elapsed <= 180, "the live session exceeded a session bound")
+        require(
+            least <= turns <= self.max_assistant_turns and elapsed <= self.max_session_seconds,
+            "the live session exceeded a session bound",
+        )
         return {
             "sessions": len(rows),
             "assistant_turns": turns,
@@ -338,7 +361,12 @@ def native_transcript_records(files: Mapping[str, bytes]) -> dict[str, Any]:
 def live_transcript_identity(observed: Mapping[str, Any]) -> tuple[set[str], set[str]]:
     from test_personal_claude_live import _same_model
 
-    assistants = observed["assistant_messages"]
+    for item in observed.get("messages", ()):
+        seeded_transcript_record(item, observed.get("seeded_records", ()))
+    assistants = [
+        item for item in observed["assistant_messages"]
+        if not seeded_transcript_record(item, observed.get("seeded_records", ()))
+    ]
     unique = {item.get("message", {}).get("id") for item in assistants}
     require(
         None not in unique and bool(unique), "native transcript did not identify assistant turns"
@@ -349,6 +377,111 @@ def live_transcript_identity(observed: Mapping[str, Any]) -> tuple[set[str], set
         "live transcript used an unexpected model",
     )
     return unique, models
+
+
+def seeded_transcript_record(
+    record: Mapping[str, Any], seeds: Sequence[Mapping[str, Any]],
+) -> bool:
+    matches = [seed for seed in seeds if seed.get("uuid") == record.get("uuid")]
+    if not matches or record.get("uuid") is None:
+        return False
+    require(any(record == seed for seed in matches), "seeded transcript record changed")
+    return True
+
+
+def transcript_entry_metadata(
+    observed: Mapping[str, Any], *, turn: int,
+    prior: Sequence[Mapping[str, Any]] = (),
+    held_values: Sequence[str] = (),
+) -> list[dict[str, Any]]:
+    counts = (
+        "input_tokens", "output_tokens", "cache_creation_input_tokens", "cache_read_input_tokens",
+    )
+    retained = []
+    previous = {item["index"]: item for item in prior}
+    for index, record in enumerate(observed["messages"]):
+        seeds = observed.get("seeded_records", ())
+        matched = any(seed.get("uuid") == record.get("uuid") for seed in seeds)
+        unchanged = matched and any(record == seed for seed in seeds)
+        message = record.get("message", {})
+        usage = message.get("usage")
+        usage_counts = None
+        if isinstance(usage, dict):
+            usage_counts = {key: usage[key] for key in counts
+                            if type(usage.get(key)) is int and usage[key] >= 0}
+            for group, names in (
+                ("output_tokens_details", ("thinking_tokens",)),
+                ("server_tool_use", ("web_search_requests", "web_fetch_requests")),
+                ("cache_creation", ("ephemeral_1h_input_tokens", "ephemeral_5m_input_tokens")),
+            ):
+                nested = usage.get(group)
+                if isinstance(nested, dict):
+                    usage_counts[group] = {
+                        key: nested[key] for key in names
+                        if type(nested.get(key)) is int and nested[key] >= 0
+                    }
+        entry = {
+            "index": index,
+            "record_type": record.get("type")
+            if record.get("type") in {"user", "assistant", "system", "progress"} else "other",
+            "turn": 0 if matched else previous.get(index, {}).get("turn", turn),
+            "provenance": ("seeded" if unchanged else "changed-seed") if matched
+            else "new-response",
+            "model": message.get("model") if isinstance(message.get("model"), str) else None,
+            "usage": usage_counts,
+        }
+        if message.get("model") == "<synthetic>" or (
+            isinstance(usage, dict) and any(key in usage for key in counts)
+            and all(usage.get(key, 0) == 0 for key in counts)
+        ):
+            content = message.get("content", [])
+            text = content if isinstance(content, str) else "\n".join(
+                block.get("text", "") for block in content
+                if isinstance(block, dict) and isinstance(block.get("text"), str)
+            )
+            entry["error_class"] = cli_error_class(
+                text, held_values=held_values, cli_error_type=record.get("error"),
+                error_record=message.get("model") == "<synthetic>",
+            )
+        retained.append(entry)
+    return retained
+
+
+def cli_error_class(
+    text: str, *, held_values: Sequence[str] = (),
+    cli_error_type: str | None = None, error_record: bool = False,
+) -> dict[str, Any]:
+    from curie_telemetry.redact import held_secret_literals, redact_text
+
+    first = next((line.strip() for line in text.splitlines() if line.strip()), "")
+    cli_type = cli_error_type if isinstance(cli_error_type, str) and re.fullmatch(
+        r"[a-z_]{1,64}", cli_error_type,
+    ) else None
+    if not error_record and not re.search(
+        r"(?:API Error:|Error:|HTTP [1-5][0-9]{2})", first, re.IGNORECASE,
+    ):
+        return {"http_status": None, "provider_error_type": None,
+                "cli_error_type": cli_type, "first_error_line": None}
+    status = re.search(r"(?:API Error:\s*|HTTP\s+)([1-5][0-9]{2})\b", first, re.IGNORECASE)
+    provider_type = None
+    start = text.find("{")
+    if start >= 0:
+        try:
+            body, _ = json.JSONDecoder().raw_decode(text[start:])
+            error = body.get("error", {}) if isinstance(body, dict) else {}
+            kind = error.get("type") if isinstance(error, dict) else None
+            if isinstance(kind, str) and re.fullmatch(r"[a-z_]{1,64}", kind):
+                provider_type = kind
+        except ValueError:
+            pass
+    for literal in held_secret_literals(held_values):
+        first = first.replace(literal, "[REDACTED:held_secret]")
+    return {
+        "http_status": int(status.group(1)) if status else None,
+        "provider_error_type": redact_text(provider_type) if provider_type else None,
+        "cli_error_type": redact_text(cli_type) if cli_type else None,
+        "first_error_line": redact_text(first)[:2048],
+    }
 
 
 def live_observations(
@@ -673,7 +806,9 @@ class ClusterProof:
         )
         self.registry_volumes = [mount["Name"] for mount in mounts if mount["Type"] == "volume"]
         tag = f"{self.namespace}-runner:{self.candidate[:12]}"
-        published = f"127.0.0.1:{port}/curie-runner-candidate:{self.candidate[:12]}"
+        published = (
+            f"127.0.0.1:{port}/curie-runner-candidate:{self.candidate[:12]}-{self.ownership}"
+        )
         for name in (tag, published):
             require(
                 self.docker("image", "inspect", name, check=False).returncode != 0,
@@ -681,7 +816,10 @@ class ClusterProof:
             )
             self.tags.append(name)
         self.command([self.cli, "build", "--tag", tag], timeout=1200)
-        dockerfile = f"FROM {tag}\nLABEL org.opencontainers.image.revision={self.candidate}\n"
+        dockerfile = (
+            f"FROM {tag}\nLABEL org.opencontainers.image.revision={self.candidate}\n"
+            f"LABEL curie-proof-owner={self.ownership}\n"
+        )
         self.docker(
             "build", "--file", "-", "--tag", published, ".", data=dockerfile.encode(), timeout=300
         )

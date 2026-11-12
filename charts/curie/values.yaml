@@ -1295,6 +1295,17 @@ codeHostTrust:
     configMapRef:
       name: ""
       key: ca.crt
+# Personal Claude enrollment (#5377). Empty leaves the feature off: no RBAC,
+# no env, and the owner API answers 503 `custody_unconfigured`. Set it to the
+# name of a DEDICATED namespace you create yourself (the chart never creates
+# it). The API gets Secret create, get, list and delete there, and the worker
+# gets Secret get only, both through Roles in that namespace. The namespace must
+# be dedicated because Secret get and list cannot be scoped by label. It must
+# differ from the release namespace (the chart refuses an equal value), and
+# changing it requires every user to reconnect. See docs/operations.md,
+# "Personal Claude enrollment".
+personalClaude:
+  grantNamespace: ""
 # ---------------------------------------------------------------------------
 # The factory (#4397) as CURIE_FORGES; `curie cluster factory` writes it.
 # A credential names its Secret: existingSecret, existingSecretKey.

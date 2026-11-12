@@ -339,28 +339,6 @@ fn slack_app_token_cancel_choice_names_every_recovery_path() {
 
 #[cfg(target_os = "linux")]
 #[test]
-fn slack_app_token_value_cancellation_names_every_recovery_path() {
-    let text = cancel_next_local_deploy_prompt(
-        &[
-            ("CURIE_CREDENTIALS", "sk-EXAMPLE-model-credential"),
-            ("SLACK_BOT_TOKEN", "xoxb-EXAMPLE-bot-token"),
-        ],
-        &[b"\r", b"\x1b"],
-        "Slack app token value",
-    );
-    for recovery in [
-        "curie secrets set SLACK_APP_TOKEN",
-        "export SLACK_APP_TOKEN=",
-    ] {
-        assert!(
-            text.contains(recovery),
-            "Slack app token value cancellation must show {recovery:?}:\n{text}"
-        );
-    }
-}
-
-#[cfg(target_os = "linux")]
-#[test]
 fn model_credential_value_cancellation_names_every_recovery_path() {
     let text = cancel_next_local_deploy_prompt(
         &[

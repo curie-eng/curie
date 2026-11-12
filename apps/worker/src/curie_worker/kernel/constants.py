@@ -256,6 +256,10 @@ PLATFORM_ERROR_CLASSIFICATIONS = frozenset(
         # cannot enforce one. Not retryable: the same runner refuses again.
         TOOL_ACCESS_UNENFORCED_CLASSIFICATION,
         "tool-access-refused",
+        # #5377 (ADR 0268): a personal run whose owner grant is missing or was
+        # rejected by the provider. Not retryable: the owner must replace or
+        # reconnect the enrollment, and no service credential stands in.
+        "authentication-required",
     }
 )
 
@@ -297,6 +301,7 @@ _ESCALATION_CAUSES = {
     "model-credit-exhausted": "model_credit_exhausted",
     "model-usage-limited": "model_usage_limited",
     "model-credential-rejected": "model_credential_rejected",
+    "authentication-required": "authentication_required",
     "rate-limit": "model_rate_limited",
     "server-error": "model_error",
     "model-unreachable": "model_unreachable",

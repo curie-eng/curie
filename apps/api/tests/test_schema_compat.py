@@ -70,8 +70,9 @@ CONTRACT = "0041"
 # Approval ORM reads require the 0153 dynamic approval selection columns, and
 # dynamic approval answers require the 0156 answer gate. The factory Slack
 # progress loop reads the 0157 thread tables. GitHub host namespaces require
-# 0158; owner tuple reads require 0159.
-APP_SCHEMA_MIN = "0159"
+# 0158; owner tuple reads require 0159; personal custody reads and the
+# enrollment_fenced cause require 0160.
+APP_SCHEMA_MIN = "0160"
 REVIEW_SCHEMA_MIN = "0063"
 PREV = "0040"
 
@@ -187,6 +188,7 @@ def test_upgrade_from_either_train_applies_the_missing_sibling_and_preserves_row
             "0157",
             "0158",
             "0159",
+            "0160",
         } <= pending
         assert not pending & {"0091", "0092", "0093"}
     else:
@@ -232,8 +234,9 @@ def test_upgrade_from_either_train_applies_the_missing_sibling_and_preserves_row
             "0157",
             "0158",
             "0159",
+            "0160",
         }
-    assert current_revision() == "0159"
+    assert current_revision() == "0160"
     assert sql_rows("SELECT name FROM curie.agents WHERE id=:id", {"id": agent_id}) == [
         ("merge-example",)
     ]
@@ -336,9 +339,10 @@ def test_agent_reads_refuse_the_schema_before_deploy_notification_expand() -> No
     # reads require the 0151 connector requester identity columns, and
     # Approval ORM reads require the 0153 approval selection columns, and
     # dynamic approval answers require the 0156 answer gate. Factory Slack
-    # progress reads the 0157 tables. GitHub host namespaces require 0158, and
-    # execution owner reads require 0159.
-    for revision in sorted(known - {"0159"}):
+    # progress reads the 0157 tables. GitHub host namespaces require 0158,
+    # execution owner reads require 0159, and personal custody reads and
+    # enrollment fences require 0160.
+    for revision in sorted(known - {"0160"}):
         assert can_serve(revision, window, known) is False
     assert can_serve("0140", window, known) is False
     assert can_serve("0141", window, known) is False
@@ -356,7 +360,8 @@ def test_agent_reads_refuse_the_schema_before_deploy_notification_expand() -> No
     assert can_serve("0156", window, known) is False
     assert can_serve("0157", window, known) is False
     assert can_serve("0158", window, known) is False
-    assert can_serve("0159", window, known) is True
+    assert can_serve("0159", window, known) is False
+    assert can_serve("0160", window, known) is True
 
 
 def test_planner_refuses_irreversible_before_mutation() -> None:

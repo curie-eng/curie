@@ -18,7 +18,8 @@
     "history-persistence-error",
     "max-turns",
     "model-unreachable",
-    "final-answer-validation"
+    "final-answer-validation",
+    "authentication-required"
   ],
   "vectors": [
     {
@@ -145,6 +146,11 @@
       "name": "final_answer_validation_remains_terminal",
       "input": "final-answer-validation",
       "expected": "final-answer-validation"
+    },
+    {
+      "name": "platform_authentication_required",
+      "input": "authentication-required",
+      "expected": "authentication-required"
     }
   ]
 }

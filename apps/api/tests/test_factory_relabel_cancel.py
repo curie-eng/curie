@@ -299,10 +299,18 @@ def test_unowned_cancel_settles_after_the_window_and_fences_the_old_epoch(
     assert (after["status"], after["terminal_cause"]) == ("cancelled", "issue_cancelled")
     assert after["termination_observation"]
     assert after["runtime_epoch"] > before["runtime_epoch"]
+    # The current request version: only the old epoch is stale.
+    [current] = _rows(
+        "SELECT version FROM curie.execution_requests WHERE id = :id", {"id": before["id"]}
+    )
     late = client.post(
         f"/v1/internal/work-items/requests/{before['id']}/termination",
         headers=WORKER,
-        json={"runtime_epoch": before["runtime_epoch"], "observation": "late teardown"},
+        json={
+            "runtime_epoch": before["runtime_epoch"],
+            "expected_request_version": current["version"],
+            "observation": "late teardown",
+        },
     )
     assert late.status_code == 409, late.text
     assert _all(9607)[0]["termination_observation"] == after["termination_observation"]
@@ -443,6 +451,7 @@ def test_forced_settle_keeps_publishing_teardown_until_a_worker_records_it(
         headers=WORKER,
         json={
             "runtime_epoch": claimed.json()["runtime_epoch"],
+            "expected_request_version": claimed.json()["request_version"],
             "observation": "sandbox claim absent",
         },
     )

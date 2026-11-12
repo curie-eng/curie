@@ -148,6 +148,17 @@ _CAUSE_TEXT = {
     "capacity_wait_expired": "sandbox admission did not complete before the wait expired.",
     "start_failed": "the sandbox did not start.",
     "owner_lost": "the worker running this request stopped responding.",
+    # Personal Claude execution (#5377, ADR 0268 section 3).
+    "enrollment_fenced": (
+        "the run was stopped because its owner replaced or disconnected their personal "
+        "Claude enrollment. The work is kept; the owner reconnects or replaces the "
+        "enrollment, then resumes it."
+    ),
+    "authentication_required": (
+        "the owner's personal Claude grant was missing or refused by the model provider. "
+        "The work is kept; the owner reconnects or replaces the personal Claude "
+        "enrollment, then resumes it."
+    ),
     "issue_cancelled": "the request was cancelled.",
     "issue_deleted": "the tracker issue no longer exists.",
     "publication_denied": "a person denied the request to open the pull request.",
@@ -218,6 +229,7 @@ _FAILURE_CLASS_BY_CAUSE = {
     "runner_timeout": "runner-timeout",
     "sandbox_terminated": "sandbox-terminated",
     "workspace_error": "workspace-error",
+    "authentication_required": "authentication-required",
 }
 _BACKTICK_RUN = re.compile(r"`+")
 _OUTPUT_TOKEN_BUDGET_DETAIL = re.compile(

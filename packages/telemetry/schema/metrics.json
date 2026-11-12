@@ -516,6 +516,7 @@
           "/console/oidc/login",
           "/console/principal",
           "/console/session",
+          "/personal-claude/enrollment",
           "/deploy-targets/list",
           "/deploy-targets/resolve",
           "/deployments",
@@ -663,7 +664,7 @@
           "OTHER"
         ]
       },
-      "cardinality_bound": 1784,
+      "cardinality_bound": 1792,
       "description": "Active HTTP server requests.",
       "monotonic": false,
       "type": "up_down_counter",
@@ -766,6 +767,7 @@
           "/console/oidc/login",
           "/console/principal",
           "/console/session",
+          "/personal-claude/enrollment",
           "/deploy-targets/list",
           "/deploy-targets/resolve",
           "/deployments",
@@ -920,7 +922,7 @@
           "OTHER"
         ]
       },
-      "cardinality_bound": 8920,
+      "cardinality_bound": 8960,
       "description": "HTTP server requests.",
       "monotonic": true,
       "type": "counter",
@@ -1023,6 +1025,7 @@
           "/console/oidc/login",
           "/console/principal",
           "/console/session",
+          "/personal-claude/enrollment",
           "/deploy-targets/list",
           "/deploy-targets/resolve",
           "/deployments",
@@ -1177,7 +1180,7 @@
           "OTHER"
         ]
       },
-      "cardinality_bound": 8920,
+      "cardinality_bound": 8960,
       "description": "HTTP server request duration.",
       "monotonic": false,
       "type": "histogram",

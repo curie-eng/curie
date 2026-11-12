@@ -49,8 +49,9 @@ def test_candidate_requires_deploy_notices_after_ledger_schema(resource: str) ->
     # 0149 stores webhook provenance and a wake-key generation and does not
     # raise the floor. Dynamic approval answers require the 0156 answer gate,
     # and the factory Slack progress loop reads the 0157 tables. GitHub host
-    # namespaces require 0158. Execution owner reads require 0159.
-    assert window == {"schema_min": "0159", "schema_head": "0159"}
+    # namespaces require 0158. Execution owner reads require 0159, and personal
+    # custody reads and enrollment fences require 0160.
+    assert window == {"schema_min": "0160", "schema_head": "0160"}
 
 
 @pytest.mark.parametrize("field", ["cargo", "chart", "app"])
@@ -81,7 +82,7 @@ def test_new_candidate_has_its_own_window_and_append_only_revision() -> None:
     assert data["windows"].get("0.14.2") == {"schema_min": "0123", "schema_head": "0123"}
     assert data["windows"].get("0.14.3") == {"schema_min": "0140", "schema_head": "0140"}
     assert data["windows"].get("0.14.4") == {"schema_min": "0140", "schema_head": "0140"}
-    assert data["revisions"][-41:] == [
+    assert data["revisions"][-42:] == [
         "0095",
         "0096",
         "0097",
@@ -123,6 +124,7 @@ def test_new_candidate_has_its_own_window_and_append_only_revision() -> None:
         "0157",
         "0158",
         "0159",
+        "0160",
     ]
     kinds = json.loads((ROOT / "apps/api/src/curie_api/revision_kinds.json").read_text())
     assert kinds["0102"] == "expand"
@@ -160,6 +162,7 @@ def test_new_candidate_has_its_own_window_and_append_only_revision() -> None:
     assert kinds["0157"] == "expand"
     assert kinds["0158"] == "expand"
     assert kinds["0159"] == "expand"
+    assert kinds["0160"] == "expand"
 
 
 def test_every_prior_registered_window_is_exactly_preserved() -> None:
@@ -258,7 +261,7 @@ def test_both_train_heads_upgrade_without_losing_existing_rows(
 
     command.upgrade(alembic_config(), "head")
 
-    assert current_revision() == "0159"
+    assert current_revision() == "0160"
     assert sql_dicts("SELECT name FROM curie.agents WHERE id = :id", {"id": agent_id}) == [
         {"name": "acme-retained"}
     ]
@@ -295,6 +298,7 @@ def test_both_train_heads_upgrade_without_losing_existing_rows(
         ("work_items", "model_auth_mode"),
         ("execution_requests", "owner_principal_id"),
         ("personal_claude_enrollments", "generation"),
+        ("personal_claude_custody", "secret_uid"),
     } <= columns
     assert {
         ("tenant_identity_providers", "http_selection"),

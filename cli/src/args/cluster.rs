@@ -83,12 +83,127 @@ pub(crate) enum ClusterConsoleAction {
     },
 }
 
+/// The connection and session flags every `cluster subscription` verb shares.
+/// The caller's Console session cookie is the only credential: there is no
+/// `--api-key`, and the release's platform key is never read.
+#[derive(Args, Debug, Clone)]
+pub(crate) struct SubscriptionSession {
+    /// Private file (mode 0600 or stricter) holding only the value of your
+    /// Console session cookie, __Host-curie_console_session.
+    #[arg(long, value_name = "PATH")]
+    pub(crate) session_file: PathBuf,
+    /// Platform API base URL. Omit to reach the release API over loopback. A
+    /// direct URL must use HTTPS unless it is loopback.
+    #[arg(long, env = "CURIE_API_URL")]
+    pub(crate) api_url: Option<String>,
+    /// Kubernetes namespace of the release. Default: curie.
+    #[arg(long, default_value = "curie", env = "CURIE_NAMESPACE")]
+    pub(crate) namespace: String,
+    /// Helm release name. Default: curie.
+    #[arg(long, default_value = "curie")]
+    pub(crate) release: String,
+    /// Validate the files and print the request plan without making a request.
+    #[arg(long)]
+    pub(crate) dry_run: bool,
+}
+
+/// The grant file an enroll, replace or reconnect sends.
+#[derive(Args, Debug, Clone)]
+pub(crate) struct SubscriptionTokenFile {
+    /// Private file (mode 0600 or stricter) holding only the token printed by
+    /// `claude setup-token`. One trailing newline is ignored.
+    #[arg(long, value_name = "PATH")]
+    pub(crate) token_file: PathBuf,
+}
+
+/// The compare-and-set version a replace, reconnect or disconnect writes at.
+#[derive(Args, Debug, Clone)]
+pub(crate) struct SubscriptionExpectedVersion {
+    /// Enrollment version to change, as `status` reports it. Omit to read the
+    /// current version first.
+    #[arg(long, value_name = "N", value_parser = clap::value_parser!(i64).range(1..))]
+    pub(crate) expected_version: Option<i64>,
+}
+
+/// Subcommands of `curie cluster subscription`.
+#[derive(Subcommand, Debug, Clone)]
+pub(crate) enum ClusterSubscriptionAction {
+    /// Show your personal Claude enrollment: state, generation, version and
+    /// pending teardown.
+    Status {
+        #[command(flatten)]
+        session: SubscriptionSession,
+    },
+    /// Enroll a personal Claude grant for the first time (generation 1).
+    Enroll {
+        #[command(flatten)]
+        session: SubscriptionSession,
+        #[command(flatten)]
+        token: SubscriptionTokenFile,
+    },
+    /// Replace the active grant. Runtimes using the old grant are stopped.
+    Replace {
+        #[command(flatten)]
+        session: SubscriptionSession,
+        #[command(flatten)]
+        token: SubscriptionTokenFile,
+        #[command(flatten)]
+        expected: SubscriptionExpectedVersion,
+    },
+    /// Reconnect a disconnected enrollment with a new grant.
+    Reconnect {
+        #[command(flatten)]
+        session: SubscriptionSession,
+        #[command(flatten)]
+        token: SubscriptionTokenFile,
+        #[command(flatten)]
+        expected: SubscriptionExpectedVersion,
+    },
+    /// Disconnect the active grant and stop its runtimes. This does not revoke
+    /// the grant at the provider.
+    Disconnect {
+        #[command(flatten)]
+        session: SubscriptionSession,
+        #[command(flatten)]
+        expected: SubscriptionExpectedVersion,
+    },
+}
+
+impl ClusterSubscriptionAction {
+    pub(crate) fn session(&self) -> &SubscriptionSession {
+        match self {
+            Self::Status { session }
+            | Self::Enroll { session, .. }
+            | Self::Replace { session, .. }
+            | Self::Reconnect { session, .. }
+            | Self::Disconnect { session, .. } => session,
+        }
+    }
+
+    pub(crate) fn session_mut(&mut self) -> &mut SubscriptionSession {
+        match self {
+            Self::Status { session }
+            | Self::Enroll { session, .. }
+            | Self::Replace { session, .. }
+            | Self::Reconnect { session, .. }
+            | Self::Disconnect { session, .. } => session,
+        }
+    }
+}
+
 #[derive(Subcommand)]
 pub(crate) enum ClusterAction {
     /// Bootstrap access to the Curie Console.
     Console {
         #[command(subcommand)]
         action: ClusterConsoleAction,
+    },
+    /// Enroll, replace, reconnect or disconnect your own personal Claude grant,
+    /// authenticated by your Console session. The token is read from a private
+    /// file and is never printed.
+    Subscription {
+        #[command(subcommand)]
+        action: ClusterSubscriptionAction,
     },
     /// Report value paths that differ between a release and pending Helm files.
     /// A nonempty report is advisory and exits successfully.

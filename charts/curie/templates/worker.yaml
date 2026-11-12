@@ -461,6 +461,13 @@ spec:
               valueFrom:
                 secretKeyRef:
                   {{- include "curie.secretRef" (dict "root" . "existingSecret" (get (.Values.connectorCaller | default dict) "existingSecret") "existingSecretKey" ((get (.Values.connectorCaller | default dict) "signingKeyKey") | default "signingKey") "defaultKey" "connectorCallerSigningKey") | nindent 18 }}
+            {{- $personalGrantNamespace := dig "personalClaude" "grantNamespace" "" (.Values | toYaml | fromYaml) }}
+            {{- if $personalGrantNamespace }}
+            # Personal Claude enrollment custody namespace (#5377). Rendered
+            # only when set; the RBAC lives in personal-grant-custody-rbac.yaml.
+            - name: CURIE_PERSONAL_GRANT_NAMESPACE
+              value: {{ $personalGrantNamespace | quote }}
+            {{- end }}
             # The action executor switch (ACTION-EXECUTOR-1). The API renders
             # the same value from the same helper; the two must never differ.
             - name: CURIE_ACTION_EXECUTOR_ENABLED

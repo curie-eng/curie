@@ -2609,6 +2609,19 @@ runner's route to an external API and does not apply here; an egress control
 outside the chart must allow the lookup itself. Rendering these mounts is wiring; key custody, the effective
 mounts on a real cluster and activation remain separate qualification.
 
+### Personal Claude enrollment
+
+`personalClaude.grantNamespace` (default `""`, off) names the namespace that
+holds personal custody Secrets. Set it to a namespace you create yourself and
+dedicate to that purpose, because Secret get and list cannot be label-scoped.
+It must differ from the release namespace; the chart fails the render
+otherwise. When set, the API gets Secret create, get, list and delete there
+(Role `<fullname>-api-personal-grants`), the worker gets Secret get
+(`<fullname>-worker-personal-grants`), each bound to its ServiceAccount in the
+release namespace, and both Deployments receive
+`CURIE_PERSONAL_GRANT_NAMESPACE`. Changing it requires every user to
+reconnect. See `docs/operations.md`, "Personal Claude enrollment".
+
 ### Reserved environment variables
 
 Every workload accepting `extraEnv` uses the reserved names and replacement

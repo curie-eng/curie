@@ -653,6 +653,59 @@ curie --json local console login --subject operator@example.com --dry-run
 curie --json cluster --context <context> console login --subject operator@example.com --dry-run
 ```
 
+##### Personal Claude subscription
+
+A person enrolls, replaces, reconnects or disconnects their own personal Claude
+grant. The command acts as that person, authenticated only by their Console
+session, so it needs no platform key and does not read one:
+
+```bash
+curie cluster --context <context> subscription status --session-file session.txt
+curie cluster --context <context> subscription enroll --session-file session.txt --token-file token.txt
+curie cluster --context <context> subscription replace --session-file session.txt --token-file token.txt
+curie cluster --context <context> subscription disconnect --session-file session.txt
+curie cluster --context <context> subscription reconnect --session-file session.txt --token-file token.txt
+```
+
+Run `claude setup-token` yourself, unmodified, and save the token it prints to a
+file with mode 0600; Curie never asks for a password or a saved profile. `--session-file` holds only the value of your
+`__Host-curie_console_session` cookie. `--token-file` holds only the token. Each
+file must be a regular file that only its owner can read or write (mode 0600
+or 0400), and one trailing newline is ignored. Nothing is read from stdin, and
+the token and cookie never appear in argv, output, `--debug`, errors or a dry
+run. A token is 1 to 4096 printable ASCII characters with no spaces; its shape
+says nothing about whether it is valid or expired.
+
+| Command | What it does |
+|---|---|
+| `status` | Show the enrollment `state` (`absent`, `active` or `inactive`), `generation`, `version` and pending teardown. An absent enrollment is a normal answer. |
+| `enroll` | Create the enrollment at generation 1. Refused when one exists. |
+| `replace` | Replace the active grant. Generation and version advance by one, and runtimes using the old grant are stopped without cancelling their work items. |
+| `reconnect` | Give a disconnected enrollment a new grant. Generation and version advance by one. |
+| `disconnect` | Make the enrollment inactive and stop its runtimes. Generation and version advance by one; repeating it at the inactive version changes nothing. It does not revoke the grant at the provider or reverse billed usage. |
+
+`--expected-version <N>` is optional for `replace`, `reconnect` and `disconnect`.
+When supplied, the CLI sends that version with the compare-and-set write. When
+omitted, it first reads the owner's enrollment and sends the returned version
+with the write. If that read finds no enrollment, the command exits 1 with an
+instruction to enroll first and sends no write. A concurrent change produces
+a conflict (HTTP 409) and exits 1; run `status` and retry with its version.
+Direct API callers must supply `expected_version` in the PUT body for replace
+or reconnect, or in the DELETE query for disconnect.
+
+Without `--api-url` the command reaches the release API over a loopback
+port-forward selected by `--namespace` and `--release`. A direct `--api-url`
+must use HTTPS unless it is loopback, and must name the same host and port as
+the Console that issued the session, because writes send that origin. With
+`--json`, stdout is one object (`cli/schema/subscription.schema.json`): the
+enrollment for `status`, the enrollment plus `action`, `previous_version` and
+`changed` for a write, or the dry run plan. Exit codes: 1 for a refused session, a rejected
+origin, an absent enrollment, a conflict or unconfigured custody (each with its
+own fix); 2 for a bad file, a bad token or a request the API refuses as
+invalid; 3 when the API is unreachable or custody is briefly unavailable.
+`--dry-run` checks both files and prints the plan without a request or a
+tunnel.
+
 ##### `curie local|cluster observability`: API-backed queries
 
 The bare commands above remain URL/surface reports. Queries are read-only and

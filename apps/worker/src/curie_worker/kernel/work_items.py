@@ -17,6 +17,7 @@ from ..killswitch import KillSwitch
 from ..sandbox.types import SandboxHandle
 from ..threadlock import LockLeaseLost
 from ..workitem_dispatch import (
+    TerminationClaim,
     TerminationObservation,
     WorkItemConflict,
     WorkItemRun,
@@ -843,7 +844,9 @@ async def _terminate_work_item(self: Kernel, qevent: QueuedTurn, request_id: uui
         return
     thread_key = routing._thread_key_for(qevent)
     try:
-        epoch = await self._work_items.claim_termination(
+        # Gates the local cleanup below; the record names the re-claim taken
+        # under the thread lock in _halt_work_item_runtime (#5377).
+        await self._work_items.claim_termination(
             request_id,
             owner=self._config.consumer_name,
         )
@@ -871,21 +874,24 @@ async def _terminate_work_item(self: Kernel, qevent: QueuedTurn, request_id: uui
     else:
         claim_name = view.runtime_claim_name
         sandbox_name = view.runtime_sandbox_name
-    observation = await self._halt_work_item_runtime(
+    halted = await self._halt_work_item_runtime(
         thread_key,
+        request_id,
         claim_name=claim_name,
         sandbox_name=sandbox_name,
     )
-    if observation is None:
+    if halted is None:
         logger.warning(
             "work-item terminate for %s did not observe absence; reconciler retries",
             request_id,
         )
         return
+    observation, claimed = halted
     try:
         await self._work_items.record_termination(
             request_id,
-            runtime_epoch=epoch,
+            runtime_epoch=claimed.runtime_epoch,
+            expected_request_version=claimed.request_version,
             observation=observation.render(),
         )
     except WorkItemConflict as exc:
@@ -903,21 +909,24 @@ async def _stop_owned_work_item(self: Kernel, thread_key: str, run: WorkItemRun)
     await self._cancel_settling_work_items(request_id=run.request_id)
     if self._work_items is None or run.runtime_epoch is None:
         return
-    observation = await self._halt_work_item_runtime(
+    halted = await self._halt_work_item_runtime(
         thread_key,
+        run.request_id,
         claim_name=run.claim_name,
         sandbox_name=run.sandbox_name,
     )
-    if observation is None:
+    if halted is None:
         logger.warning(
             "work-item owner stop for %s did not observe absence",
             run.request_id,
         )
         return
+    observation, claimed = halted
     try:
         await self._work_items.record_termination(
             run.request_id,
-            runtime_epoch=run.runtime_epoch,
+            runtime_epoch=claimed.runtime_epoch,
+            expected_request_version=claimed.request_version,
             observation=observation.render(),
         )
         run.finished = True
@@ -953,31 +962,75 @@ def _forget_held_run(self: Kernel, thread_key: str, run: WorkItemRun, *, reason:
 async def _halt_work_item_runtime(
     self: Kernel,
     thread_key: str,
+    request_id: uuid.UUID,
     *,
     claim_name: str | None,
     sandbox_name: str | None,
-) -> TerminationObservation | None:
-    """Interrupt, then poll until stored claim and sandbox names are gone."""
+) -> tuple[TerminationObservation, TerminationClaim] | None:
+    """Re-claim under the thread lock, interrupt, then poll until the runtime is gone.
 
+    The re-claim is the last check before anything is stopped (#5377). It runs
+    while the thread lock is held, so no route decision moves the thread between
+    it and the teardown, and the API refuses it once another worker has recorded
+    this request's termination. A claimant that stalled past its lease while a
+    peer tore the runtime down and a successor took the thread is refused here:
+    it interrupts nothing, deletes nothing and records nothing. The record names
+    the re-claim's epoch and request version.
+
+    The thread lock's renewer only marks a lost lease, so the lease is fenced
+    after the re-claim answers and again after the interrupt, before
+    ``terminate_thread`` deletes anything. A lease that expired while the
+    re-claim or the interrupt was in flight may already belong to a peer that
+    started a successor runtime on the thread; on ``LockLeaseLost`` nothing more
+    is interrupted, nothing is deleted and None is returned, so nothing is
+    recorded. None also when the re-claim is refused or absence was not observed.
+    """
+
+    assert self._work_items is not None
     try:
-        await asyncio.wait_for(
-            self.interrupt_thread(thread_key, "work-item termination"),
-            constants._RESET_INTERRUPT_TIMEOUT_S,
-        )
-    except Exception:  # noqa: BLE001 - broad catch kept at a failure boundary
+        async with self._lock.hold(self._config.lock_key(thread_key)) as lease:
+            try:
+                claimed = await self._work_items.claim_termination(
+                    request_id, owner=self._config.consumer_name
+                )
+            except (WorkItemConflict, WorkItemTransportError) as exc:
+                logger.info(
+                    "work-item %s teardown re-claim refused (%s); leaving thread %s",
+                    request_id,
+                    exc.code if isinstance(exc, WorkItemConflict) else type(exc).__name__,
+                    thread_key,
+                )
+                return None
+            # Both fences stay outside the interrupt's broad catch: LockLeaseLost
+            # is a TimeoutError, and that handler would swallow it.
+            await lease.ensure_owned()
+            try:
+                await asyncio.wait_for(
+                    self.interrupt_thread(thread_key, "work-item termination"),
+                    constants._RESET_INTERRUPT_TIMEOUT_S,
+                )
+            except Exception:  # noqa: BLE001 - broad catch kept at a failure boundary
+                logger.warning(
+                    "work-item interrupt did not land for thread %s; terminating anyway",
+                    thread_key,
+                    exc_info=True,
+                )
+            await lease.ensure_owned()
+            observation = await asyncio.to_thread(
+                self._substrate.terminate_thread,
+                thread_key,
+                claim_name=claim_name,
+                sandbox_name=sandbox_name,
+                observer=self._config.consumer_name,
+            )
+    except LockLeaseLost:
         logger.warning(
-            "work-item interrupt did not land for thread %s; terminating anyway",
+            "work-item %s teardown lost thread %s's lock; deleting and recording nothing",
+            request_id,
             thread_key,
-            exc_info=True,
         )
-    async with self._lock.hold(self._config.lock_key(thread_key)):
-        return await asyncio.to_thread(
-            self._substrate.terminate_thread,
-            thread_key,
-            claim_name=claim_name,
-            sandbox_name=sandbox_name,
-            observer=self._config.consumer_name,
-        )
+        return None
+    return None if observation is None else (observation, claimed)
 
 
 def attach_killswitch(self: Kernel, killswitch: KillSwitch) -> None:

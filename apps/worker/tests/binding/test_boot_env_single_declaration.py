@@ -455,6 +455,9 @@ _NON_BOOT_ALLOWLIST: frozenset[str] = frozenset(
         # the runner's personal_auth policy from its own env. #5373 decides it is
         # not a BootEnv field; worker emission of a personal boot env is #5378.
         "CURIE_MODEL_AUTH_MODE",
+        # Worker service config (#5377): the namespace the trusted worker reads
+        # personal custody Secrets from. Never written into a boot env.
+        "CURIE_PERSONAL_GRANT_NAMESPACE",
         # CLI-owned profile directory. personal_auth points it at a fresh
         # runner-owned directory for a personal launch; it is never a boot key.
         "ANTHROPIC_CONFIG_DIR",

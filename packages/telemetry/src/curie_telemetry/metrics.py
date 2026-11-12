@@ -416,6 +416,8 @@ _HTTP_OPERATIONS = [
     "/console/oidc/login",
     "/console/principal",
     "/console/session",
+    # Owner personal Claude enrollment (#5377).
+    "/personal-claude/enrollment",
     "/deploy-targets/list",
     "/deploy-targets/resolve",
     "/deployments",

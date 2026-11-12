@@ -33,7 +33,7 @@ from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from curie_api.crud import agents as crud_agents
 
-from . import __version__, oidc
+from . import __version__, custody_store, oidc, rollout_hold
 from .approval_reminders import enqueue_reminder
 from .channel_identities import start_static_slack_bootstrap
 from .code_host_trust import code_host_verify
@@ -65,6 +65,7 @@ from .k8s import build_lazy_pod_lister, build_lazy_pod_log_reader
 from .killswitch import KillSwitch
 from .langfuse import LangfuseClient
 from .lineage_reconciler import start_lineage_reconciler
+from .personal_custody_reconciler import start_personal_custody_reconciler
 from .protected_reconciler import ProtectedAdmissionReconciler
 from .remediation_admission import reconcile_admissions
 from .resumequeue import ResumeQueue
@@ -107,6 +108,7 @@ from .routers import (
     identity_operator,
     memory,
     observability,
+    personal_enrollments,
     provider_installations,
     publication_code_host,
     publication_precheck,
@@ -276,6 +278,14 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     app.state.ui_evidence_reconciler_task = start_ui_evidence_reconciler(
         app.state.sessionmaker, settings, http_client
     )
+    # Personal grant custody (#5377): the Secret store exists only when a grant
+    # namespace is configured, and its cleanup loop is independent of the factory.
+    app.state.custody_store = custody_store.build_custody_secret_store(settings)
+    app.state.personal_custody_reconciler_task = start_personal_custody_reconciler(
+        app.state.sessionmaker, settings, app.state.custody_store
+    )
+    app.state.rollout_hold = rollout_hold.build_rollout_hold(settings)
+    rollout_hold.install(app.state.rollout_hold)
     # The expiry sweeper (#412) flips lapsed pending approvals and resumes their
     # stranded sessions. It shares this lifecycle's resources (sessionmaker,
     # resume_queue); interval <= 0 disables it (no task started).
@@ -427,6 +437,14 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
                     await work_item_task
                 except asyncio.CancelledError:
                     pass
+            custody_task = getattr(app.state, "personal_custody_reconciler_task", None)
+            if custody_task is not None:
+                custody_task.cancel()
+                try:
+                    await custody_task
+                except asyncio.CancelledError:
+                    pass
+            rollout_hold.uninstall(app.state.rollout_hold)
             evidence_task = getattr(app.state, "ui_evidence_reconciler_task", None)
             if evidence_task is not None:
                 evidence_task.cancel()
@@ -754,6 +772,7 @@ def create_app(
     app.include_router(channel_identities.router)
     app.include_router(identity_admin.router)
     app.include_router(identity_operator.router)
+    app.include_router(personal_enrollments.router)
     app.include_router(identity_authority.router)
     app.include_router(identity_authority.grant_router)
     app.include_router(identity_authority.classification_router)

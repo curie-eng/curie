@@ -2980,6 +2980,37 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/personal-claude/enrollment": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Read Enrollment
+         * @description The caller's enrollment; ``absent`` before the first enroll.
+         */
+        get: operations["read_enrollment_personal_claude_enrollment_get"];
+        /**
+         * Write Enrollment
+         * @description Enroll (generation 1), or replace or reconnect at ``expected_version``.
+         */
+        put: operations["write_enrollment_personal_claude_enrollment_put"];
+        post?: never;
+        /**
+         * Disconnect Enrollment
+         * @description Disconnect: inactive at a new generation, runtimes fenced, Secret retired.
+         *
+         *     Repeating it at the inactive version answers 200 and changes nothing. It is
+         *     never held for a rollout, since it only reduces access.
+         */
+        delete: operations["disconnect_enrollment_personal_claude_enrollment_delete"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/provider-installations": {
         parameters: {
             query?: never;
@@ -9028,6 +9059,50 @@ export interface components {
             /** Version */
             version: number;
         };
+        /**
+         * PersonalEnrollmentOut
+         * @description The caller's own enrollment; ``generation`` and ``version`` are null when absent.
+         */
+        PersonalEnrollmentOut: {
+            /** Generation */
+            generation: number | null;
+            /**
+             * State
+             * @enum {string}
+             */
+            state: "absent" | "active" | "inactive";
+            teardown: components["schemas"]["PersonalEnrollmentTeardownOut"];
+            /** Version */
+            version: number | null;
+        };
+        /**
+         * PersonalEnrollmentTeardownOut
+         * @description Teardown still owed after a replace or disconnect.
+         */
+        PersonalEnrollmentTeardownOut: {
+            /** Pending Custody Cleanup */
+            pending_custody_cleanup: number;
+            /** Pending Runtimes */
+            pending_runtimes: number;
+        };
+        /**
+         * PersonalEnrollmentWrite
+         * @description ``PUT /personal-claude/enrollment``. ``expected_version`` is null only for enroll.
+         */
+        PersonalEnrollmentWrite: {
+            /** Expected Version */
+            expected_version?: number | null;
+            /**
+             * Intent
+             * @enum {string}
+             */
+            intent: "enroll" | "replace" | "reconnect";
+            /**
+             * Token
+             * Format: password
+             */
+            token: string;
+        };
         /** PhaseDeclaration */
         PhaseDeclaration: {
             /** Id */
@@ -10993,7 +11068,7 @@ export interface components {
             /** Lease Held To Deadline */
             lease_held_to_deadline: boolean;
             /** Refusal */
-            refusal: ("not_found" | "identity_mismatch" | "active_request" | "work_item_cancelled" | "not_dispatchable" | "not_published" | "duplicate" | "stale_owner" | "not_running" | "waiting_deadline_elapsed" | "binding_missing" | "repository_not_allowed" | "publication_pending" | "factory_wake_mismatch" | "factory_agent_missing" | "factory_agent_mismatch" | "factory_tenant_mismatch" | "factory_binding_missing" | "factory_binding_ambiguous" | "factory_binding_changed" | "factory_surface_mismatch" | "factory_start_failed" | "personal_owner_required" | "owner_context_unexpected" | "owner_tenant_mismatch" | "owner_tenant_inactive" | "owner_principal_missing" | "owner_principal_inactive" | "enrollment_inactive" | "enrollment_generation_mismatch" | "owner_mismatch") | null;
+            refusal: ("not_found" | "identity_mismatch" | "active_request" | "work_item_cancelled" | "not_dispatchable" | "not_published" | "duplicate" | "stale_owner" | "not_running" | "waiting_deadline_elapsed" | "binding_missing" | "repository_not_allowed" | "publication_pending" | "factory_wake_mismatch" | "factory_agent_missing" | "factory_agent_mismatch" | "factory_tenant_mismatch" | "factory_binding_missing" | "factory_binding_ambiguous" | "factory_binding_changed" | "factory_surface_mismatch" | "factory_start_failed" | "stale_version" | "termination_observation_required" | "personal_owner_required" | "owner_context_unexpected" | "owner_tenant_mismatch" | "owner_tenant_inactive" | "owner_principal_missing" | "owner_principal_inactive" | "enrollment_inactive" | "enrollment_generation_mismatch" | "owner_mismatch" | "personal_rollout_in_progress") | null;
             /** Repository Path */
             repository_path: string;
             /**
@@ -11384,6 +11459,8 @@ export interface components {
         };
         /** TerminationBody */
         TerminationBody: {
+            /** Expected Request Version */
+            expected_request_version: number;
             /** Observation */
             observation: string;
             /** Runtime Epoch */
@@ -11393,6 +11470,16 @@ export interface components {
         TerminationClaimBody: {
             /** Owner */
             owner: string;
+        };
+        /**
+         * TerminationClaimOut
+         * @description What the claimant's termination record presents back (#5377).
+         */
+        TerminationClaimOut: {
+            /** Request Version */
+            request_version: number;
+            /** Runtime Epoch */
+            runtime_epoch: number;
         };
         /** ThreadAttachmentAppend */
         ThreadAttachmentAppend: {
@@ -18719,6 +18806,169 @@ export interface operations {
             };
         };
     };
+    read_enrollment_personal_claude_enrollment_get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: {
+                "__Host-curie_console_session"?: string | null;
+            };
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["PersonalEnrollmentOut"];
+                };
+            };
+            /** @description No live principal session, or another credential was presented */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description `invalid_enrollment_request`; the input is never echoed */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    write_enrollment_personal_claude_enrollment_put: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: {
+                "__Host-curie_console_session"?: string | null;
+            };
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["PersonalEnrollmentWrite"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["PersonalEnrollmentOut"];
+                };
+            };
+            /** @description No live principal session, or another credential was presented */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Console session origin rejected */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Version or intent conflict: `detail.code` names it */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description `invalid_enrollment_request`; the input is never echoed */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description `custody_unconfigured`, `custody_unavailable`, `enrollment_busy` or `personal_rollout_in_progress` */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    disconnect_enrollment_personal_claude_enrollment_delete: {
+        parameters: {
+            query: {
+                expected_version: number;
+            };
+            header?: never;
+            path?: never;
+            cookie?: {
+                "__Host-curie_console_session"?: string | null;
+            };
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["PersonalEnrollmentOut"];
+                };
+            };
+            /** @description No live principal session, or another credential was presented */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Console session origin rejected */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description `enrollment_absent` */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Version or intent conflict: `detail.code` names it */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description `invalid_enrollment_request`; the input is never echoed */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description `custody_unconfigured`, `custody_unavailable`, `enrollment_busy` or `personal_rollout_in_progress` */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
     list_provider_installations_provider_installations_get: {
         parameters: {
             query?: {
@@ -21051,9 +21301,7 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": {
-                        [key: string]: unknown;
-                    };
+                    "application/json": components["schemas"]["TerminationClaimOut"];
                 };
             };
             /** @description Validation Error */

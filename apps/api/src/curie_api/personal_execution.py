@@ -35,6 +35,7 @@ from typing import Any, Literal, cast
 from sqlalchemy import func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from . import rollout_hold
 from .models import Agent, ExecutionRequest, PersonalClaudeEnrollment, Principal, Tenant, WorkItem
 
 # Declared beside the operator read schemas that serialize it.
@@ -50,6 +51,7 @@ OwnerRefusalCode = Literal[
     "enrollment_inactive",
     "enrollment_generation_mismatch",
     "owner_mismatch",
+    "personal_rollout_in_progress",
 ]
 
 # What an explicit owner that passed validation can still conflict on.
@@ -223,6 +225,10 @@ async def new_work_item_owner(
         return None
     if owner is None:
         return OwnerRefusal("personal_owner_required")
+    # #5377: no new personal WorkItem while API replicas run mixed templates;
+    # an older replica would expire the transcript a fenced run keeps.
+    if await rollout_hold.personal_rollout_held():
+        return OwnerRefusal("personal_rollout_in_progress")
     refused = await _verify(session, owner, agent_id=facts.agent_id)
     if refused is not None:
         return OwnerRefusal(refused)
@@ -404,8 +410,12 @@ def _runtime_proven_gone(row: ExecutionRequest) -> bool:
 
     A normal finish, a failed finish and an expired heartbeat are not evidence:
     worker sandbox cleanup after a finish is best effort, so the sandbox may
-    outlive it. An explicit epoch-bound termination confirmation for normally
-    finished runs is tracked in issue #5378.
+    outlive it. A normally finished run gets that evidence through the
+    enrollment fence (#5377): ``lifecycle.fence_enrollment_generation`` marks
+    it ``teardown_unconfirmed_at``, terminate wakes follow, and
+    ``workitem_dispatch.record_termination`` records the observation under the
+    claim's runtime epoch and request version, preserving the run's status and
+    cause and clearing the flag.
     """
 
     return (

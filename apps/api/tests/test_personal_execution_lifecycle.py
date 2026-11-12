@@ -183,6 +183,7 @@ def test_relabel_and_base_reconcile_readmissions_keep_the_original_owner(
             session,
             first.request_id,
             runtime_epoch=claimed.runtime_epoch,
+            expected_request_version=claimed.request_version,
             observation=support.TERMINATION_OBSERVATION,
         )
     )
@@ -318,6 +319,7 @@ def test_owner_lost_successor_carries_the_original_owner(
             session,
             first.request_id,
             runtime_epoch=claimed.runtime_epoch,
+            expected_request_version=claimed.request_version,
             observation=support.TERMINATION_OBSERVATION,
         )
     )

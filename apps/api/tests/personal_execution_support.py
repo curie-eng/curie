@@ -76,6 +76,7 @@ _TRUNCATED = (
     "curie.github_review_deliveries",
     "curie.factory_poll_cursors",
     "curie.personal_claude_enrollments",
+    "curie.personal_claude_custody",
 )
 _TUPLE = "tenant_id, model_auth_mode, owner_principal_id, enrollment_generation"
 
@@ -593,12 +594,13 @@ def record_termination(request_id: UUID, *, owner: str = RUNTIME_OWNER) -> Execu
         lambda session: workitem_dispatch.claim_termination(session, request_id, owner=owner)
     )
     assert isinstance(claimed, TerminationClaim), claimed
-    runtime_epoch = claimed.runtime_epoch
+    runtime_epoch, request_version = claimed.runtime_epoch, claimed.request_version
     ended = with_session(
         lambda session: workitem_dispatch.record_termination(
             session,
             request_id,
             runtime_epoch=runtime_epoch,
+            expected_request_version=request_version,
             observation=TERMINATION_OBSERVATION,
         )
     )
