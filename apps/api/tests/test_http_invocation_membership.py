@@ -42,6 +42,7 @@ from curie_api.models import (
 )
 from curie_api.schemas.http_identity import LookupRequestV1, NamespaceV1
 from curie_internal import identity_context as codec
+from curie_internal.identity_authority import IDENTITY_CALLER_WAIT_SECONDS
 from curie_internal.keyspace import CHANNEL_KEY_PREFIX
 from fastapi.testclient import TestClient
 from principal_adoption_support import ISSUER, VECTORS, selection
@@ -57,6 +58,13 @@ GROUP = "SyntheticRequiredGroup"
 # @spec HTTP-INVOCATION-EXECUTION-21: synthetic Grid organisation and workspace.
 GRID_ORG = "E0EXAMPLEORG"
 GRID_WORKSPACE = "T0EXAMPLEHOME"
+# @spec HTTP-INVOCATION-EXECUTION-4: the API revalidates these facts against the wall
+# clock after its writer phase, anywhere inside the composition budget, and the
+# sealed delivery window inherits them. A window shorter than the caller wait lets
+# runner scheduling stalls, not the code under test, turn an in-time turn into
+# identity_authority_unavailable. Freshness expiry tests set their own limits.
+FIXTURE_IDENTITY_AGE_MS = int(IDENTITY_CALLER_WAIT_SECONDS * 2000)
+FIXTURE_MEMBERSHIP_AGE_MS = int(IDENTITY_CALLER_WAIT_SECONDS * 3000)
 
 
 def _transport_harness() -> ModuleType:
@@ -211,7 +219,11 @@ def _scope(endpoint: str, *, grid: bool = False) -> dict[str, Any]:
                 tenant_id=tenant,
                 expected_version=0,
                 expected_lifecycle_generation=0,
-                selection=selection(lookup_url=endpoint),
+                selection=selection(
+                    lookup_url=endpoint,
+                    max_identity_age_ms=FIXTURE_IDENTITY_AGE_MS,
+                    max_membership_age_ms=FIXTURE_MEMBERSHIP_AGE_MS,
+                ),
             )
             installation = ProviderInstallation(
                 tenant_id=tenant,
