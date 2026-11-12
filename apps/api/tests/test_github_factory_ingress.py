@@ -538,7 +538,9 @@ def test_admission_retains_issue_lock_until_caller_commit(
                 request_visible = text(
                     "SELECT EXISTS (SELECT 1 FROM curie.execution_requests WHERE id = :request_id)"
                 )
-                assert not await observer.scalar(request_visible, {"request_id": notice.request_id})
+                assert not await observer.scalar(
+                    request_visible, {"request_id": canonical.request_id}
+                )
                 assert await observer.scalar(
                     text(
                         "SELECT EXISTS (SELECT 1 FROM pg_locks WHERE locktype = 'advisory' "
@@ -554,7 +556,7 @@ def test_admission_retains_issue_lock_until_caller_commit(
                     },
                 )
                 await session.commit()
-                assert await observer.scalar(request_visible, {"request_id": notice.request_id})
+                assert await observer.scalar(request_visible, {"request_id": canonical.request_id})
         finally:
             await engine.dispose()
 
