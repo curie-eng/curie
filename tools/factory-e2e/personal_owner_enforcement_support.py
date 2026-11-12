@@ -1879,10 +1879,22 @@ def _check(
 
 def _judge_observed(ledger: OwnerLedger, criterion: str) -> list[dict[str, Any]]:
     found = ledger.observations(criterion)
+    prior = ledger.observations("coverage").get("rejection")
+    if criterion == "authentication-required" and prior is not None:
+        source = OwnerLedger(ledger.db, prior["run_id"], ledger.scrub)
+        if (source.run() or {}).get("candidate") != prior["candidate"]:
+            raise Refusal("ledger_missing")
+        found.update(
+            {k: v for k, v in source.observations(criterion).items() if k.startswith("rejected.")}
+        )
     checks = [
         _check(key, expected, found, NOT_MET.get((criterion, key)))
         for key, expected in EXPECTED[criterion].items()
     ]
+    if criterion == "authentication-required" and prior is not None:
+        for check in checks:
+            if check["key"].startswith("rejected."):
+                check.update(source_run_id=prior["run_id"], source_candidate=prior["candidate"])
     if criterion == "restart":
         checks.extend(
             {"key": key, "observed": found[key], "status": "informational"}
@@ -2048,6 +2060,7 @@ def judge_rehearsal(ledger: OwnerLedger) -> dict[str, Any]:
             for check in checks:
                 if (
                     (source.run() or {}).get("mode") == "rehearse"
+                    and "source_run_id" not in check
                     and check["key"] in REHEARSAL_ONLY.get(name, set())
                 ):
                     check["status"] = "rehearsal_only"

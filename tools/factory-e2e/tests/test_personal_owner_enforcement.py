@@ -1419,6 +1419,160 @@ def test_hold_script_holds_read_once_per_process_and_every_stop() -> None:
     assert 'mode == "stop"' not in script
 
 
+def _revalidation_fixture() -> dict[str, Any]:
+    return json.loads((Path(__file__).parent / "fixtures/native_revalidation_end.json").read_text())
+
+
+def test_parallel_response_hooks_each_receive_their_own_release() -> None:
+    sample = _revalidation_fixture()
+    proof = _proof()
+    track = driver.Track("revalidated", 1, pod="example-pod", cli="example-uid:28:100")
+    proof.tracks, proof.gated = [track], set()
+    proof.harvest = lambda _: (b"", poe.SessionUsage(258, 2, True))
+    released: list[tuple[str, ...]] = []
+    proof.pod_exec = lambda pod, program, *args, **kw: released.append(args)
+    state = {
+        "pod": "example-pod",
+        "uid": "example-uid",
+        "holds": {
+            "response": [
+                {"cli_pid": 28, "cli_start": 100, "hook_pid": pid}
+                for pid in sample["observed_response_hook_pids"]
+            ]
+        },
+    }
+    proof.gate_response(state)
+    proof.gate_response(state)
+    assert released == [
+        ("response", "go", str(pid)) for pid in sample["observed_response_hook_pids"]
+    ]
+
+
+def test_sweep_and_release_keep_parallel_hook_files_independent(tmp_path: Path) -> None:
+    import sys
+
+    sample = _revalidation_fixture()
+    root = tmp_path / "hooks"
+    root.mkdir()
+    for pid in sample["observed_response_hook_pids"]:
+        (root / f"holding-response-{pid}").write_text(json.dumps({"hook_pid": pid}))
+    sweep = driver.SWEEP_PROGRAM.replace(repr(driver.WORK_DIR), repr(str(root)))
+    found = json.loads(subprocess.check_output([sys.executable, "-c", sweep]))
+    assert isinstance(found["holds"]["response"], list)
+    assert [h["hook_pid"] for h in found["holds"]["response"]] == sample[
+        "observed_response_hook_pids"
+    ]
+    release = driver.RELEASE_PROGRAM.replace(repr(driver.WORK_DIR), repr(str(root)))
+    for pid in sample["observed_response_hook_pids"]:
+        subprocess.run(
+            [sys.executable, "-c", release, "response", "go", str(pid)],
+            check=True,
+            capture_output=True,
+        )
+    assert sorted(p.name for p in root.glob("release-*")) == [
+        f"release-response-{pid}" for pid in sample["observed_response_hook_pids"]
+    ]
+
+
+def test_native_terminal_failure_does_not_wait_for_a_stop_hook() -> None:
+    sample = _revalidation_fixture()
+    proof = _proof()
+    proof.paid = True
+    track = driver.Track("revalidated", 1)
+    track.event_cursor = 2
+    proof.tracks = [track]
+    proof.requests_of = lambda _: []
+    proof.work_items = {"issue": {"id": "example-item", "conversation_id": "example-thread"}}
+    proof.pod_states = {}
+    proof.worker_events = lambda: sample["aci_events"]
+    proof.wait_soft = lambda predicate, **kwargs: predicate()
+    with pytest.raises(poe.StepFailed, match="native_turn_failed_before_stop:max-turns"):
+        proof.boundary("revalidated", "stop", work_item_id="example-item")
+
+
+def test_two_turn_fixture_exposes_its_tools_in_the_native_launch_environment() -> None:
+    from curie_runner.subprocess_env import cli_parent_env
+
+    proof = _proof()
+    proof.image = "example.invalid/runner@sha256:" + "0" * 64
+    container = proof.pod_spec()["containers"][0]
+    environment = {entry["name"]: entry["value"] for entry in container["env"] if "value" in entry}
+    # The real attempt used ToolSearch for one of its two responses. The native
+    # header controls observe that this CLI flag sends the complete tool catalog.
+    assert cli_parent_env(environment)["ENABLE_TOOL_SEARCH"] == "false"
+    assert poe.SESSION_TURNS == 2 and poe.SESSION_ASSISTANT_TURNS_CEILING == 4
+
+
+def test_parallel_native_hook_processes_cannot_consume_each_others_release(tmp_path: Path) -> None:
+    import ctypes
+    import select
+    import sys
+    import time
+
+    root = tmp_path / "hooks"
+    root.mkdir()
+    libc = ctypes.CDLL(None, use_errno=True)
+    fd = libc.inotify_init1(os.O_NONBLOCK)
+    assert fd >= 0 and libc.inotify_add_watch(fd, os.fsencode(root), 8) >= 0
+    program = driver.HOLD_SCRIPT.replace(repr(driver.WORK_DIR), repr(str(root)))
+    release = driver.RELEASE_PROGRAM.replace(repr(driver.WORK_DIR), repr(str(root)))
+    children: list[Any] = []
+    try:
+        for _ in _revalidation_fixture()["tool_calls"][1:]:
+            children.append(
+                subprocess.Popen(
+                    [sys.executable, "-c", program, "response"],
+                    stdin=subprocess.PIPE,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                )
+            )
+            children[-1].stdin.write(b"{}")
+            children[-1].stdin.close()
+        until = time.monotonic() + 5
+        while len(list(root.glob("holding-response-*"))) != len(children):
+            left = max(0.0, until - time.monotonic())
+            assert left > 0 and select.select([fd], [], [], left)[0]
+            os.read(fd, 65536)
+        for index, child in enumerate(children):
+            subprocess.run(
+                [sys.executable, "-c", release, "response", "go", str(child.pid)],
+                check=True,
+                capture_output=True,
+            )
+            assert child.wait(timeout=5) == 0
+            assert all(p.poll() is None for p in children[index + 1 :])
+    finally:
+        os.close(fd)
+        for child in children:
+            if child.poll() is None:
+                child.kill()
+            child.wait(timeout=5)
+
+
+def test_response_harvest_retains_native_records_before_pod_teardown(tmp_path: Path) -> None:
+    from types import SimpleNamespace
+
+    proof = _proof()
+    proof.paid = True
+    proof.retained_dir = tmp_path
+    proof.scrub = lambda value: value
+    proof.guard_spend = lambda *args: None
+    scanned: list[bytes] = []
+    proof.ctx = SimpleNamespace(
+        rt=SimpleNamespace(scan=SimpleNamespace(scan=lambda channel, value: scanned.append(value)))
+    )
+    raw = _jsonl(_assistant("example-message", 17, uuid="example-record"))
+    proof.read_pod_file = lambda *args: raw
+    proof.pod_exec = lambda *args, **kw: (0, b"[]")
+    proof.harvest(driver.Track("revalidated", 1, pod="example-pod", transcript="session.jsonl"))
+    captures = list(tmp_path.glob("native-*.jsonl"))
+    assert len(captures) == 1 and captures[0].read_bytes() == raw
+    assert captures[0].stat().st_mode & 0o777 == 0o600
+    assert json.loads(next(tmp_path.glob("*.seeds.json")).read_bytes()) == []
+    assert raw in scanned
+
+
 # Proof-driver guards use the actual scenario methods with synthetic observations.
 def _proof() -> Any:
     cls = driver.owner_proof_class(driver.load_enrollment())
@@ -1426,6 +1580,7 @@ def _proof() -> Any:
     proof.disk_meter = None
     proof.disk_failure = None
     proof.cleanup_budget = None
+    proof.worker_events = lambda: []
     return proof
 
 
@@ -1518,7 +1673,7 @@ def test_worker_observer_persists_real_transport_frames_before_consumption(
     )
 
 
-@pytest.mark.parametrize("mode", ["full", "remaining"])
+@pytest.mark.parametrize("mode", ["full", "remaining", "post-rejection"])
 def test_phase_scope_keeps_every_remaining_phase(tmp_path: Path, mode: str) -> None:
     from types import SimpleNamespace
 
@@ -1543,9 +1698,10 @@ def test_phase_scope_keeps_every_remaining_phase(tmp_path: Path, mode: str) -> N
     pairs: list[str] = []
     proof.pair = lambda kind, _: pairs.append(kind)
     proof.execute()
-    assert order[-5:] == ["rejected", "revalidated", "disconnect", "audit", "completed"]
-    assert pairs == ([] if mode == "remaining" else ["process", "pod", "worker"])
-    assert ("remaining-generation" in order) == (mode == "remaining")
+    assert order[-4:] == ["revalidated", "disconnect", "audit", "completed"]
+    assert ("rejected" in order) == (mode != "post-rejection")
+    assert pairs == (["process", "pod", "worker"] if mode == "full" else [])
+    assert ("remaining-generation" in order) == (mode != "full")
 
 
 @pytest.mark.parametrize("changed_product", [False, True])
@@ -1581,6 +1737,13 @@ def test_scope_reuses_only_proven_criteria_with_unchanged_product(
     state = _state(tmp_path)
     prior = poe.OwnerLedger.open(state, "prior", create=True)
     prior.begin(source_sha, "live", T0)
+    prior.start_live(T0, T0 + poe.GRANT_MIN_LIFETIME + 60)
+    reservation = prior.reserve("revalidated", T0)
+    prior.mark_started(reservation.seq, "old-pod:28:100", T0)
+    for kind in poe.CLEANUP_KINDS:
+        prior.record_cleanup(kind, "ref", "ok" if kind == "foreign_untouched" else "absent", "", T0)
+    prior.record_cleanup("step", "fence", "ok", "", T0)
+    prior.mark_cleanup(started=T0, finished=T0 + 1)
     for criterion in ("selection", "restart", "fencing", "authentication-required"):
         _record_all(prior, criterion)
     prior.record("restart", "process.workspace_nonce_restored", False, T0)
@@ -1610,6 +1773,25 @@ def test_scope_reuses_only_proven_criteria_with_unchanged_product(
         )
         assert epoch["status"] == "pass"
         assert inherited["source_candidate"] == source_sha
+        driver.reuse_prior_proof(current, candidate, "prior", rejection=True)
+        result = poe.judge(current, "authentication-required")
+        checks = result["criteria"][0]["checks"]
+        assert all(c["status"] == "pass" for c in checks if c["key"].startswith("rejected."))
+        assert all(c["status"] == "missing" for c in checks if c["key"].startswith("revalidated."))
+        check = next(c for c in checks if c["key"] == "rejected.http_status")
+        assert check["source_run_id"] == "prior" and check["source_candidate"] == source_sha
+        assert not current.observations("authentication-required")
+        prior.record("authentication-required", "rejected.http_status", 500, T0)
+        with pytest.raises(poe.StepFailed, match="post_rejection_scope_missing"):
+            driver.reuse_prior_proof(current, candidate, "prior", rejection=True)
+        prior.record("authentication-required", "rejected.http_status", 401, T0)
+        current.finish("failed", T0 + 3)
+        hop = poe.OwnerLedger(prior.db, "hop", prior.scrub)
+        hop.begin(candidate, "live", T0 + 4)
+        driver.reuse_prior_proof(hop, candidate, "current")
+        hop_result = poe.judge(hop, "fencing")
+        assert hop_result["verdict"] == "pass"
+        assert hop_result["criteria"][0]["source_run_id"] == "prior"
         prior.record("selection", "claim.label.owner_principal_matches", False, T0)
         with pytest.raises(poe.StepFailed, match="remaining_scope_missing_selection_proof"):
             driver.reuse_prior_proof(current, candidate, "prior")

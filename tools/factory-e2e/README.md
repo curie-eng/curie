@@ -509,6 +509,20 @@ and no recovery requirement is dropped. Only the `rejected` and `revalidated`
 native sessions are reserved; each retains its original 1,024-token and
 four-assistant-turn share, and all attempt and item ceilings still apply.
 
+`--phases post-rejection --reuse-run-id SOURCE_RUN` omits the already-proved
+rejection session as well. It requires every rejection check and cleanup to
+have passed in that finished live source. The judge reads those rejection
+checks from the original ledger, naming their original candidate and run on
+each check. Selection, restart and fencing provenance is flattened to its
+original source. Revalidation and later checks must come from the new run.
+The bootstrap admits a waiting request, seeds durable history, advances to
+the invalid generation without starting it, then replaces it with the valid
+grant and explicitly revalidates the same waiting request to generation 3.
+The workspace is checked against the durable repository before native launch
+and again before continued work; the new process is compared with the source
+run's old native identity, whose teardown was confirmed. No failed request or
+completion is fabricated. Only the valid revalidation session is reserved.
+
 `judge --criterion` takes `selection`, `fencing`, `authentication-required`,
 `disconnect`, `restart`, `hosted-header`, `budget`, `cleanup`, `rehearsal` or `all`. It
 reads only the private ledger, compares each observation with the expected
@@ -698,6 +712,31 @@ the enrollment driver's ACI observation mechanism. No frame is replaced.
 The refusal requires both the provider response and a same-epoch ACI
 authentication-required error plus classified-failure final. Missing,
 truncated or conflicting evidence stops with a named capture reason.
+
+Attempt 4's retained runner log and actual worker-consumed ACI journal show a
+`max-turns` error and classified-failure final at the end of the revalidation
+turn. The runner logged that turn end at `10:49:53.236930Z`, before cleanup
+started at `10:49:53.626400Z`. This was a terminal failure, not an approval or
+publication wait, and it was not a successful Stop. ToolSearch consumed the
+first of the fixture's two allowed responses; the second issued Bash and both
+MCP calls in parallel. The trace observed only three response-hook gates for
+the four tool calls. A shared response holding/release filename allowed those
+parallel callbacks to overwrite or remove each other's gates. The executable
+regression starts parallel copies of the actual hook and proves that releasing
+one cannot release another. Each response hook now owns its PID-specific gate.
+The fixture also sets `ENABLE_TOOL_SEARCH=false`, as the unpaid native header
+controls do, so the actual catalog is available within the unchanged two-turn
+query budget. All session, continuation and response ceilings remain unchanged.
+An ACI terminal error now fails revalidation immediately with its classification
+instead of waiting for Stop and misreporting the absence as no fresh process.
+The sanitized real trace is `tests/fixtures/native_revalidation_end.json`.
+
+Attempt 4's last response reading was 258 output tokens and two assistant turns,
+but its ACI failure final carries no usage. Raw native transcript reads had been
+omitted from retained command output. That does not certify final usage: its
+full 1,024-token reservation remains charged. Subsequent response harvests keep
+mode-0600 native records and exact replay seeds in the private evidence directory,
+after the held-value scan, so Pod deletion cannot erase the usage evidence.
 
 The empty-HOME, filtered-environment unpaid probe ran the real bundled CLI
 through the launch wrapper and stderr sanitizer with an invalid OAuth token.

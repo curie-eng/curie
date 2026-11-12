@@ -31,6 +31,7 @@ import argparse
 import base64
 import contextlib
 import dataclasses
+import hashlib
 import http.client
 import importlib.util
 import inspect
@@ -181,8 +182,9 @@ if mode == "read" and once.exists():
     raise SystemExit(0)
 if mode == "read":
     once.write_text("held")
-holding = root / f"holding-{{mode}}"
-release = root / f"release-{{mode}}"
+suffix = f"-{{os.getpid()}}" if mode == "response" else ""
+holding = root / f"holding-{{mode}}{{suffix}}"
+release = root / f"release-{{mode}}{{suffix}}"
 holding.write_text(json.dumps({{
     "cli_pid": pid, "cli_start": start, "session_id": hook.get("session_id"),
     "transcript_path": hook.get("transcript_path"), "hook_pid": os.getpid(),
@@ -370,11 +372,17 @@ for top in ("/home/runner", "/tmp"):
                 except OSError:
                     pass
 holds = {{}}
-for mode in ("launch", "prompt", "response", "read", "stop"):
+for mode in ("launch", "prompt", "read", "stop"):
     try:
         holds[mode] = json.loads((pathlib.Path({WORK_DIR!r}) / f"holding-{{mode}}").read_text())
     except (OSError, ValueError):
         holds[mode] = None
+holds["response"] = []
+for path in sorted(pathlib.Path({WORK_DIR!r}).glob("holding-response-*")):
+    try:
+        holds["response"].append(json.loads(path.read_text()))
+    except (OSError, ValueError):
+        pass
 print(json.dumps({{"clis": clis, "files": files, "holds": holds}}))
 """
 READ_PROGRAM = """\
@@ -390,7 +398,8 @@ RELEASE_PROGRAM = f"""\
 import pathlib, sys
 root = pathlib.Path({WORK_DIR!r})
 root.mkdir(parents=True, exist_ok=True)
-(root / f"release-{{sys.argv[1]}}").write_text(sys.argv[2] if len(sys.argv) > 2 else "go")
+suffix = "-" + sys.argv[3] if sys.argv[1] == "response" else ""
+(root / f"release-{{sys.argv[1]}}{{suffix}}").write_text(sys.argv[2] if len(sys.argv) > 2 else "go")
 print("released")
 """
 # The real repository workspace: HEAD, the SHA-256 of every tracked file, the
@@ -665,7 +674,9 @@ def build_parser() -> argparse.ArgumentParser:
         sub.add_argument("--disk-stop-percent", type=int, default=88)
         sub.add_argument("--prior-run-id", action="append", default=[])
         sub.add_argument("--item-output-token-cap", type=int, default=poe.MAX_OUTPUT_TOKENS)
-        sub.add_argument("--phases", choices=("full", "remaining"), default="full")
+        sub.add_argument(
+            "--phases", choices=("full", "remaining", "post-rejection"), default="full"
+        )
         sub.add_argument("--reuse-run-id", default="")
         sub.add_argument("--grant-file", required=grant, default="")
         sub.add_argument("--grant-expires-at", required=grant, default="")
@@ -975,6 +986,7 @@ class Track:
     # The latest harvested usage and the queries the prompt gate released.
     usage: poe.SessionUsage | None = None
     queries: int = 0
+    event_cursor: int = 0
     # Set by the deadline watchdog: when it fired, and what it read after the kill.
     expired_at: float | None = None
     expiry: dict[str, Any] = dataclasses.field(default_factory=dict)
@@ -1272,6 +1284,7 @@ def owner_proof_class(e: Any) -> type[Any]:  # noqa: C901 - one scenario, one cl
             runner["env"] = [
                 *runner["env"],
                 cluster.secret_env(SENTINEL_ENV, SENTINEL_SECRET_NAME, "token"),
+                cluster.value_env("ENABLE_TOOL_SEARCH", "false"),
             ]
             return spec
 
@@ -2331,8 +2344,10 @@ def owner_proof_class(e: Any) -> type[Any]:  # noqa: C901 - one scenario, one cl
             if reservation.slot == "rejected":
                 self.enable_refusal_capture(str(self.native[ref]["pod"]))
                 self.refusal_log = log
-                self.rejected_workspace = self.workspace_state(str(self.native[ref]["pod"]))
+                self.workspace_baseline = self.workspace_state(str(self.native[ref]["pod"]))
                 capture = ("refusal",)
+            elif reservation.slot == "revalidated" and self.ctx.phases == "post-rejection":
+                self.workspace_baseline = self.workspace_state(str(self.native[ref]["pod"]))
             self.pod_exec(
                 str(self.native[ref]["pod"]), LAUNCH_RELEASE_PROGRAM, pid, start, *capture
             )
@@ -2439,23 +2454,23 @@ def owner_proof_class(e: Any) -> type[Any]:  # noqa: C901 - one scenario, one cl
             self.refuse_query(str(state["pod"]), ref, track, refusal)
 
         def gate_response(self, state: Mapping[str, Any]) -> None:
-            hold = (state.get("holds") or {}).get("response")
-            if not hold:
-                return
-            key = (str(state["uid"]), hold.get("hook_pid"))
-            if key in self.gated:
-                return
-            ref = f"{state['uid']}:{hold['cli_pid']}:{hold['cli_start']}"
-            track = next((t for t in self.tracks if t.cli == ref), None)
-            if track is None:
-                self.refuse_query(str(state["pod"]), ref, None, "unreserved")
-                return
-            track.transcript = str(hold.get("transcript_path") or track.transcript)
-            _data, usage = self.harvest(track)
-            if not usage.known:
-                self.refuse_query(track.pod, ref, track, "usage_unknown")
-            self.gated.add(key)
-            self.release_hold(track, "response")
+            for hold in (state.get("holds") or {}).get("response") or []:
+                key = (str(state["uid"]), hold["hook_pid"])
+                if key in self.gated:
+                    continue
+                ref = f"{state['uid']}:{hold['cli_pid']}:{hold['cli_start']}"
+                track = next((t for t in self.tracks if t.cli == ref), None)
+                if track is None:
+                    self.refuse_query(str(state["pod"]), ref, None, "unreserved")
+                    return
+                track.transcript = str(hold.get("transcript_path") or track.transcript)
+                _data, usage = self.harvest(track)
+                if not usage.known:
+                    self.refuse_query(track.pod, ref, track, "usage_unknown")
+                self.gated.add(key)
+                self.pod_exec(
+                    track.pod, RELEASE_PROGRAM, "response", "go", str(hold["hook_pid"]), timeout=20
+                )
 
         def release_stop(self, track: Track, stops: int) -> None:
             """Release a Stop only when the continuation it may let start still fits."""
@@ -2625,7 +2640,13 @@ def owner_proof_class(e: Any) -> type[Any]:  # noqa: C901 - one scenario, one cl
             reservation = self.ctx.ledger.reserve(slot, time.time())
             self.reserved_at[reservation.seq] = time.time()
             self.pending.append(reservation)
-            self.tracks.append(Track(slot=slot, seq=reservation.seq))
+            self.tracks.append(
+                Track(
+                    slot=slot,
+                    seq=reservation.seq,
+                    event_cursor=max((r["ordinal"] for r in self.worker_events()), default=0),
+                )
+            )
             return reservation
 
         def track_of(self, slot: str) -> Track:
@@ -2669,6 +2690,13 @@ def owner_proof_class(e: Any) -> type[Any]:  # noqa: C901 - one scenario, one cl
             track = self.track_of(slot)
 
             def held() -> Track | None:
+                failures = [
+                    r["classification"]
+                    for r in (self.worker_events() if self.paid and slot == "revalidated" else [])
+                    if r["ordinal"] > track.event_cursor and r["kind"] == "error"
+                ]
+                if failures:
+                    raise poe.StepFailed(f"native_turn_failed_before_{mode}:{failures[-1]}")
                 rows = self.requests_of(work_item_id)
                 thread = next(
                     str(item["conversation_id"])
@@ -2727,7 +2755,10 @@ def owner_proof_class(e: Any) -> type[Any]:  # noqa: C901 - one scenario, one cl
             if not track.transcript:
                 # A session that never held at Read may still hold at Stop.
                 state = self.pod_states.get(track.pod_uid) or {}
-                for hold in (state.get("holds") or {}).values():
+                holds = state.get("holds") or {}
+                candidates = [v for k, v in holds.items() if k != "response"]
+                candidates.extend(holds.get("response") or [])
+                for hold in candidates:
                     if (
                         hold
                         and f"{track.pod_uid}:{hold.get('cli_pid')}:{hold.get('cli_start')}"
@@ -2753,6 +2784,21 @@ def owner_proof_class(e: Any) -> type[Any]:  # noqa: C901 - one scenario, one cl
                 ]
             )
             track.usage = usage
+            name = (
+                f"native-{track.seq}-{hashlib.sha256(track.transcript.encode()).hexdigest()[:12]}"
+            )
+            for suffix, payload in (
+                (".jsonl", data),
+                (".seeds.json", json.dumps(track.seeds).encode()),
+            ):
+                self.ctx.rt.scan.scan("children", payload)
+                fd = os.open(
+                    self.retained_dir / (name + suffix),
+                    os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW,
+                    0o600,
+                )
+                with os.fdopen(fd, "wb") as stream:
+                    stream.write(payload)
             self.guard_spend(track, usage)
             return data, usage
 
@@ -2908,7 +2954,7 @@ def owner_proof_class(e: Any) -> type[Any]:  # noqa: C901 - one scenario, one cl
                 ("sentinel", self.deploy_sentinel),
                 ("enroll", self.enroll),
             )
-            if self.ctx.phases == "remaining":
+            if self.ctx.phases != "full":
                 phases += (("remaining-generation", self.prepare_remaining),)
             else:
                 phases += (
@@ -2916,8 +2962,9 @@ def owner_proof_class(e: Any) -> type[Any]:  # noqa: C901 - one scenario, one cl
                     ("pod", lambda: self.pair(*PAIRS[1])),
                     ("worker", lambda: self.pair(*PAIRS[2])),
                 )
+            if self.ctx.phases != "post-rejection":
+                phases += (("rejected", self.rejected),)
             phases += (
-                ("rejected", self.rejected),
                 ("revalidated", self.revalidated),
                 ("disconnect", self.disconnect),
                 ("audit", self.final_audit),
@@ -2930,7 +2977,9 @@ def owner_proof_class(e: Any) -> type[Any]:  # noqa: C901 - one scenario, one cl
 
         def prepare_remaining(self) -> None:
             issue, conversation = self.issues["worker"], PAIRS[2][1]
-            item = self.admit_owner(issue, conversation, self.objective(), 1)
+            item = self.admit_owner(
+                issue, conversation, self.objective(hosted=self.ctx.phases == "post-rejection"), 1
+            )
             self.seed_history(str(item["conversation_id"]))
             self.headers_seen["replaced"] = self.write(
                 "replace", token=self.files["token-invalid"], previous=self.headers_seen["enrolled"]
@@ -3683,24 +3732,27 @@ def owner_proof_class(e: Any) -> type[Any]:  # noqa: C901 - one scenario, one cl
             self.headers_seen["restored"] = self.write(
                 "replace", token=self.valid_token, previous=self.headers_seen["replaced"]
             )
-            self.wait_soft(
-                lambda: (
-                    True
-                    if (
-                        self.requests_of(work_item_id)[-1]["teardown_unconfirmed_at"] is None
-                        and self.requests_of(work_item_id)[-1]["terminal_at"] is not None
-                    )
-                    else None
-                ),
-                timeout=150,
-            )
+            scoped = self.ctx.phases == "post-rejection"
+            if not scoped:
+                self.wait_soft(
+                    lambda: (
+                        True
+                        if (
+                            self.requests_of(work_item_id)[-1]["teardown_unconfirmed_at"] is None
+                            and self.requests_of(work_item_id)[-1]["terminal_at"] is not None
+                        )
+                        else None
+                    ),
+                    timeout=150,
+                )
             status, generation, _code = self.revalidate_item(work_item_id)
             self.observe(
                 "authentication-required",
                 "revalidated.generation",
                 generation if status == 200 else None,
             )
-            self.admit_owner(issue, conversation, self.objective(hosted=True), 3)
+            if not scoped:
+                self.admit_owner(issue, conversation, self.objective(hosted=True), 3)
             self.reserve("revalidated")
             self.start_worker()
             track = self.boundary(
@@ -3710,16 +3762,23 @@ def owner_proof_class(e: Any) -> type[Any]:  # noqa: C901 - one scenario, one cl
                 self.observe("authentication-required", "revalidated.fresh_native_process", False)
                 return
             before = getattr(self, "rejected_track", None)
+            previous_cli = (
+                self.ctx.ledger.observations("coverage")["rejection"]["native_ref"]
+                if scoped
+                else before.cli
+                if before is not None
+                else None
+            )
             self.observe(
                 "authentication-required",
                 "revalidated.fresh_native_process",
-                before is None or track.cli != before.cli,
+                previous_cli is None or track.cli != previous_cli,
             )
             data, usage = self.harvest(track)
             after = self.workspace_state(track.pod)
             if self.paid:
                 for key, value in poe.committed_restoration(
-                    self.stub_source, self.rejected_workspace, after
+                    self.stub_source, self.workspace_baseline, after
                 ).items():
                     self.observe("authentication-required", f"revalidated.{key}", value)
             scan = self.read_pod_file(track.pod, f"{WORK_DIR}/scan.bin") if self.paid else None
@@ -4246,11 +4305,14 @@ PROOF_ONLY_PATHS = {
     "tools/factory-e2e/personal_owner_enforcement_support.py",
     "tools/factory-e2e/tests/test_personal_owner_enforcement.py",
     "tools/factory-e2e/tests/fixtures/native_auth_refusal.json",
+    "tools/factory-e2e/tests/fixtures/native_revalidation_end.json",
     "tools/factory-e2e/README.md",
 }
 
 
-def reuse_prior_proof(ledger: poe.OwnerLedger, candidate: str, run_id: str) -> None:
+def reuse_prior_proof(
+    ledger: poe.OwnerLedger, candidate: str, run_id: str, *, rejection: bool = False
+) -> None:
     if not run_id or run_id == ledger.run_id:
         raise poe.StepFailed("remaining_scope_requires_prior_live_proof")
     source = poe.OwnerLedger(ledger.db, run_id, ledger.scrub)
@@ -4271,7 +4333,33 @@ def reuse_prior_proof(ledger: poe.OwnerLedger, candidate: str, run_id: str) -> N
         result = poe.judge(source, criterion)
         if result["verdict"] not in {"pass", "not_met"}:
             raise poe.StepFailed(f"remaining_scope_missing_{criterion}_proof")
-        inherited[criterion] = {"run_id": run_id, "candidate": run["candidate"]}
+        proof = result["criteria"][0]
+        inherited[criterion] = {
+            "run_id": proof["source_run_id"],
+            "candidate": proof["source_candidate"],
+        }
+    if rejection:
+        checks = poe.judge(source, "authentication-required")["criteria"][0]["checks"]
+        refused = [c for c in checks if c["key"].startswith("rejected.")]
+        sessions = [s for s in source.sessions() if s["slot"] == "revalidated"]
+        if (
+            not refused
+            or any(c["status"] != "pass" for c in refused)
+            or poe.judge(source, "cleanup")["verdict"] != "pass"
+            or len(sessions) != 1
+            or not sessions[0]["native_ref"]
+        ):
+            raise poe.StepFailed("post_rejection_scope_missing_prior_rejection_or_teardown")
+        ledger.record(
+            "coverage",
+            "rejection",
+            {
+                "run_id": run_id,
+                "candidate": run["candidate"],
+                "native_ref": sessions[0]["native_ref"],
+            },
+            time.time(),
+        )
     ledger.record("coverage", "inherited", inherited, time.time())
     ledger.record(
         "coverage",
@@ -4304,8 +4392,10 @@ def child_main(args: argparse.Namespace, rt: Runtime) -> int:
     )
     ledger.begin(flags.candidate, "live" if paid else "rehearse", time.time())
     ledger.configure_item(args.prior_run_id, args.item_output_token_cap, time.time())
-    if args.phases == "remaining":
-        reuse_prior_proof(ledger, flags.candidate, args.reuse_run_id)
+    if args.phases in {"remaining", "post-rejection"}:
+        reuse_prior_proof(
+            ledger, flags.candidate, args.reuse_run_id, rejection=args.phases == "post-rejection"
+        )
     elif args.reuse_run_id:
         raise poe.Refusal("input_file_invalid", "--reuse-run-id requires --phases remaining")
     ctx = ChildContext(
