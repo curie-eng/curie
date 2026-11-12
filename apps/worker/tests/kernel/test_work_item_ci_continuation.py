@@ -417,6 +417,7 @@ def test_unpublished_ci_fix_reports_the_agent_explanation(
             assert finish["runtime_epoch"] == EPOCH
             assert finish["outcome"] == "failed"
             assert finish["cause"] == "ci_fix_unpublished"
+            assert isinstance(finish["detail"], str)
             assert "the test needs a fixture" in finish["detail"]
             assert "ghp_" + "a" * 36 not in finish["detail"]
             assert "[REDACTED:" in finish["detail"]

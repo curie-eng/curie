@@ -38,7 +38,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from curie_api.config import get_settings
 from curie_api.factory_comment_text import marker_for
-from curie_api.factory_notices import FINAL_MARKER, cause_text, result_section
+from curie_api.factory_notices import FINAL_MARKER, STATE_LABELS, cause_text, result_section
 from curie_api.forges.registry import forges_registry
 from curie_api.workitem_dispatch import DispatchConflict, acquire, start
 from curie_api.workitem_reconciler import WorkItemReconciler
@@ -2010,8 +2010,12 @@ def test_a_no_change_reply_outside_an_open_follow_up_still_fails(
     assert "Status: NEEDS HUMAN" in body
     assert "Could not complete:" in body
     assert f"Cause: {cause}" in body
-    assert "curie-factory:needs-human" in sink.issue_labels[number]
-    assert "curie-factory:pr-open" not in sink.issue_labels[number]
+    if case == "merged":
+        assert not set(STATE_LABELS) & sink.issue_labels.get(number, set())
+        assert f"Pull request: https://github.com/{REPO}/pull/{pr} (merged)" in body
+    else:
+        assert "curie-factory:needs-human" in sink.issue_labels[number]
+        assert "curie-factory:pr-open" not in sink.issue_labels[number]
 
 
 @pytest.mark.parametrize("cause", ["no_pull_request", "early_stop", "revision_unchanged"])
@@ -2125,7 +2129,11 @@ def test_a_relabel_outside_an_adopted_pull_request_still_fails(admitted: Any, ca
         [comment["body"] for comment in sink.lists[path]], second["id"]
     )
     assert "Status: NEEDS HUMAN" in body
-    assert "curie-factory:needs-human" in sink.issue_labels[number]
+    if case == "merged":
+        assert not set(STATE_LABELS) & sink.issue_labels.get(number, set())
+        assert f"Pull request: https://github.com/{REPO}/pull/{number} (merged)" in body
+    else:
+        assert "curie-factory:needs-human" in sink.issue_labels[number]
 
 
 def test_a_relabel_revision_on_an_adopted_pull_request_settles_through_the_ci_gate(

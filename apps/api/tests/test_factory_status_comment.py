@@ -2264,11 +2264,13 @@ def test_declaration_fixture_matches_nine_phases() -> None:
     assert len(DECLARATION["phases"]) == 9
 
 
-def _failed_pr_status(fixture: Any, *, number: int = 55830) -> tuple[Any, Any, Any, uuid.UUID]:
+def _failed_pr_status(
+    fixture: Any, *, number: int = 55830, pr: int = 77
+) -> tuple[Any, Any, Any, uuid.UUID]:
     client, github, sink = fixture
     request_id = _admit(client, github, sink, number)
     epoch = _start_running(client, request_id)
-    _attach_publication(_request(number)["work_item_id"], status="succeeded", pr=77)
+    _attach_publication(_request(number)["work_item_id"], status="succeeded", pr=pr)
     _finish_failed(client, request_id, epoch, "runner_escalated", "The fixture cannot be repaired.")
     _reconcile()
     assert _notices(request_id)[0]["finalized_at"] is not None
@@ -2549,7 +2551,7 @@ def test_lineage_state_stale_version_and_another_work_item_do_not_invalidate(
 
     client.portal.call(stale)
     assert _notices(request_id)[0]["finalized_at"] is not None
-    client, _github, sink, _other = _failed_pr_status(admitted, number=55834)
+    client, _github, sink, _other = _failed_pr_status(admitted, number=55834, pr=78)
     sink.requests.clear()
     _observe_lineage_state(client, _request(55834)["work_item_id"], "merged")
     assert _notices(request_id)[0]["finalized_at"] is not None
