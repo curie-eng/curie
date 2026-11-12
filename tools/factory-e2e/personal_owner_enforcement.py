@@ -197,7 +197,7 @@ except OSError:
     verdict = ""
 holding.unlink(missing_ok=True)
 release.unlink(missing_ok=True)
-if mode == "prompt" and verdict != "go":
+if mode in {{"prompt", "response"}} and verdict != "go":
     sys.stderr.write("the proof driver did not release this prompt\\n")
     raise SystemExit(2)
 print("{{}}")
@@ -983,9 +983,6 @@ def owner_proof_class(e: Any) -> type[Any]:  # noqa: C901 - one scenario, one cl
             # Pods whose logs could not be kept because they were already gone.
             self.captures_missing = 0
             if self.paid:
-                grant = pps.load_grant(Path(ctx.grant_file))
-                self.grant = e.HeldSecret(grant.reveal())
-                grant.clear()
                 self.grant_file = ctx.grant_file
                 # Well formed and never issued, so the provider refuses it.
                 self.invalid = e.HeldSecret("sk-ant-oat01-" + secrets.token_urlsafe(72))
@@ -2369,9 +2366,6 @@ def owner_proof_class(e: Any) -> type[Any]:  # noqa: C901 - one scenario, one cl
             self.observe("budget", f"deadline.{track.slot}", "enforced")
             self.fence()
             raise poe.StepFailed("a session reached its absolute deadline")
-            if not usage.known:
-                self.fence()
-                raise poe.StepFailed("a session passed its deadline with unknown usage")
 
         def wait(self, predicate: Callable[[], Any], *, timeout: float, failure: str) -> Any:
             deadline = time.monotonic() + timeout
@@ -2693,7 +2687,16 @@ def owner_proof_class(e: Any) -> type[Any]:  # noqa: C901 - one scenario, one cl
                 return HOSTED_OBJECTIVE if hosted else PAIR_OBJECTIVE
             return REHEARSE_HOSTED_OBJECTIVE if hosted else REHEARSE_PAIR_OBJECTIVE
 
+        def load_live_grant(self) -> None:
+            if self.paid:
+                grant = pps.load_grant(Path(self.ctx.grant_file))
+                self.grant.clear()
+                self.grant = e.HeldSecret(grant.reveal())
+                grant.clear()
+                self.sync_scrubber()
+
         def enroll(self) -> None:
+            self.load_live_grant()
             self.headers_seen["enrolled"] = self.write(
                 "enroll", token=self.valid_token, previous=None
             )
@@ -3564,8 +3567,6 @@ def owner_proof_class(e: Any) -> type[Any]:  # noqa: C901 - one scenario, one cl
         def final_audit(self) -> None:
             """No header or grant bytes in manifests, logs, events or the private ledger."""
 
-            self.observe("hosted-header", "audit.pod_captures_missing", self.captures_missing)
-            self.observe("hosted-header", "audit.captures_complete", self.captures_missing == 0)
             for plural in ("sandboxclaims", "sandboxtemplates", "sandboxwarmpools"):
                 self.captures.append(
                     json.dumps(
@@ -3586,8 +3587,9 @@ def owner_proof_class(e: Any) -> type[Any]:  # noqa: C901 - one scenario, one cl
                         )
                     ).encode()
                 )
-            with contextlib.suppress(Exception):
-                self.capture_pod("acme-sentinel")
+            self.capture_pod("acme-sentinel")
+            self.observe("hosted-header", "audit.pod_captures_missing", self.captures_missing)
+            self.observe("hosted-header", "audit.captures_complete", self.captures_missing == 0)
             header = [self.sentinel_token.reveal()]
             self.observe(
                 "hosted-header",

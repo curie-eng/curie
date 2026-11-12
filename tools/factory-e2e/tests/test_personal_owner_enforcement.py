@@ -1516,7 +1516,10 @@ def test_sentinel_missing_counts_are_never_invented_zeroes() -> None:
     assert proof.sentinel_counts() == dict.fromkeys(("authorized", "unauthorized", "tool_calls"))
 
 
-def test_final_audit_scans_both_grants_and_the_hosted_header(tmp_path: Path) -> None:
+@pytest.mark.parametrize("missing_sentinel_capture", [False, True])
+def test_final_audit_scans_both_grants_and_the_hosted_header(
+    tmp_path: Path, missing_sentinel_capture: bool
+) -> None:
     from types import SimpleNamespace
 
     proof = _proof()
@@ -1527,7 +1530,11 @@ def test_final_audit_scans_both_grants_and_the_hosted_header(tmp_path: Path) -> 
     proof.custom = SimpleNamespace(list_namespaced_custom_object=lambda *a, **k: {})
     proof.core = SimpleNamespace(list_namespaced_event=lambda *a, **k: {})
     proof.api_client = SimpleNamespace(sanitize_for_serialization=lambda x: x)
-    proof.capture_pod, proof.check_stub = lambda _: None, lambda: None
+
+    def capture_pod(_pod: str) -> None:
+        proof.captures_missing += int(missing_sentinel_capture)
+
+    proof.capture_pod, proof.check_stub = capture_pod, lambda: None
     ledger = _live_ledger(tmp_path)
     proof.observe = lambda c, k, v: ledger.record(c, k, v, T0)
     proof.final_audit()
@@ -1535,7 +1542,7 @@ def test_final_audit_scans_both_grants_and_the_hosted_header(tmp_path: Path) -> 
     assert found["audit.grant_in_captures"] is True
     assert found["audit.invalid_grant_in_captures"] is True
     assert found["audit.header_in_captures"] is False
-    assert found["audit.captures_complete"] is True
+    assert found["audit.captures_complete"] is (not missing_sentinel_capture)
 
 
 def test_watchdog_expires_a_session_without_a_sweep(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1552,3 +1559,29 @@ def test_watchdog_expires_a_session_without_a_sweep(monkeypatch: pytest.MonkeyPa
     proof.watch()
     assert expired == ["process-interrupted"]
     assert proof.tracks[0].expired_at == T0
+
+
+def test_live_grant_is_loaded_after_unpaid_setup_not_in_the_constructor(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from types import SimpleNamespace
+
+    enrollment = driver.load_enrollment()
+    monkeypatch.setattr(enrollment.EnrollmentProof, "__init__", lambda *args: None)
+    cls = driver.owner_proof_class(enrollment)
+    monkeypatch.setattr(cls, "sync_scrubber", lambda _: None)
+    opened: list[str] = []
+
+    def load(path: Path) -> pps.HeldSecret:
+        opened.append(str(path))
+        return pps.HeldSecret(GRANT)
+
+    monkeypatch.setattr(pps, "load_grant", load)
+    ctx = SimpleNamespace(
+        mode="run", flags=SimpleNamespace(release="acme-proof"), grant_file="/private/acme-grant"
+    )
+    proof = cls(ctx)
+    assert opened == []
+    proof.grant = pps.HeldSecret("synthetic-unpaid-grant")
+    proof.load_live_grant()
+    assert opened == ["/private/acme-grant"] and proof.grant.reveal() == GRANT
