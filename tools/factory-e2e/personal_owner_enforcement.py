@@ -40,6 +40,7 @@ import secrets
 import shlex
 import shutil
 import signal
+import sqlite3
 import ssl
 import subprocess
 import sys
@@ -330,11 +331,16 @@ hold.unlink(missing_ok=True)
 if not allowed:
     sys.stderr.write("native launch lacks a committed reservation\\n")
     raise SystemExit(2)
-os.execv(str(real), [str(real), *sys.argv[1:]])
+args = [str(real), *sys.argv[1:]]
+if (root / f"refusal-debug-{{pid}}-{{start}}").exists():
+    args += ["--debug-file", "/dev/stderr"]
+os.execv(str(real), args)
 """
 LAUNCH_RELEASE_PROGRAM = f"""\
 import pathlib, sys
 root = pathlib.Path({WORK_DIR!r})
+if len(sys.argv) == 4 and sys.argv[3] == "refusal":
+    (root / f"refusal-debug-{{sys.argv[1]}}-{{sys.argv[2]}}").write_text("enabled")
 (root / f"launch-{{sys.argv[1]}}-{{sys.argv[2]}}").write_text("go")
 """
 
@@ -514,11 +520,35 @@ def _resolver(suffix, resolve):
 """
 )
 # argv: <runner suffix>. Runs curie_worker exactly as ``python -m`` would.
+WORKER_EVENTS_PROGRAM = """
+import json, os, sqlite3
+from curie_worker.runner_client import TurnStream
+def observe_runner_events(path):
+    fd = os.open(path, os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
+    os.close(fd)
+    db = sqlite3.connect(path, isolation_level=None)
+    db.execute('CREATE TABLE IF NOT EXISTS events ('
+               'ordinal INTEGER PRIMARY KEY, epoch TEXT, kind TEXT, classification TEXT, '
+               'status TEXT, output_tokens INTEGER)')
+    original = TurnStream.__aiter__
+    async def observed(self):
+        async for frame in original(self):
+            body = frame.model_dump(mode='json')
+            if body.get('type') in ('error', 'final'):
+                db.execute('INSERT INTO events(epoch,kind,classification,status,output_tokens) '
+                           'VALUES(?,?,?,?,?)', (self.turn_epoch, body.get('type'),
+                           body.get('classification'), body.get('status'),
+                           body.get('output_tokens')))
+            yield frame
+    TurnStream.__aiter__ = observed
+"""
 WORKER_PROGRAM = (
     RESOLVER_DEFS
+    + WORKER_EVENTS_PROGRAM
     + """
 import runpy, sys
 socket.getaddrinfo = _resolver(sys.argv[1], socket.getaddrinfo)
+observe_runner_events(sys.argv[2])
 del sys.argv[1:]
 runpy.run_module("curie_worker", run_name="__main__", alter_sys=True)
 """
@@ -635,6 +665,8 @@ def build_parser() -> argparse.ArgumentParser:
         sub.add_argument("--disk-stop-percent", type=int, default=88)
         sub.add_argument("--prior-run-id", action="append", default=[])
         sub.add_argument("--item-output-token-cap", type=int, default=poe.MAX_OUTPUT_TOKENS)
+        sub.add_argument("--phases", choices=("full", "remaining"), default="full")
+        sub.add_argument("--reuse-run-id", default="")
         sub.add_argument("--grant-file", required=grant, default="")
         sub.add_argument("--grant-expires-at", required=grant, default="")
 
@@ -682,6 +714,8 @@ def forwarded(args: argparse.Namespace) -> list[str]:
         "grant_file",
         "grant_expires_at",
         "item_output_token_cap",
+        "phases",
+        "reuse_run_id",
     ):
         value = getattr(args, flag)
         if value:
@@ -908,6 +942,7 @@ class ChildContext:
     expires_text: str
     ledger: poe.OwnerLedger
     rt: Runtime
+    phases: str = "full"
 
 
 @dataclasses.dataclass
@@ -1017,6 +1052,7 @@ def owner_proof_class(e: Any) -> type[Any]:  # noqa: C901 - one scenario, one cl
             # Pods whose logs could not be kept because they were already gone.
             self.captures_missing = 0
             self.driver_pod_deletions: list[str] = []
+            self.pod_log_streams: dict[str, list[tuple[Path, Any]]] = {}
             if self.paid:
                 self.grant_file = ctx.grant_file
                 # Well formed and never issued, so the provider refuses it.
@@ -1149,8 +1185,7 @@ def owner_proof_class(e: Any) -> type[Any]:  # noqa: C901 - one scenario, one cl
                 read_disk, self.ctx.flags.disk_start_percent, self.ctx.flags.disk_stop_percent
             )
             self.disk_meter.sample(initial=True)
-            if self.paid:
-                self.start_watchdog()
+            self.start_watchdog()
             tag = f"{self.namespace}-runner:{self.candidate[:12]}"
             published = (
                 f"127.0.0.1:{port}/{REPOSITORY}:"
@@ -1291,7 +1326,13 @@ def owner_proof_class(e: Any) -> type[Any]:  # noqa: C901 - one scenario, one cl
                 e.require(name not in env, "the candidate worker must hold no model credential")
             process = self.spawn(
                 "worker",
-                [sys.executable, "-c", WORKER_PROGRAM, poe.runner_suffix(self.namespace)],
+                [
+                    sys.executable,
+                    "-c",
+                    WORKER_PROGRAM,
+                    poe.runner_suffix(self.namespace),
+                    str(self.retained_dir / "worker-events.sqlite3"),
+                ],
                 env,
             )
             self.worker_process = process
@@ -2024,7 +2065,16 @@ def owner_proof_class(e: Any) -> type[Any]:  # noqa: C901 - one scenario, one cl
             return result.returncode, result.stdout
 
         def capture_pod(self, pod: str) -> None:
-            """#5377's log capture for the audit; a Pod already gone is counted, not raised."""
+            """Runner logs are streamed before launch and survive Pod deletion."""
+
+            if pod in self.pod_log_streams:
+                streams = self.pod_log_streams.get(pod)
+                if not streams:
+                    raise poe.StepFailed("pod_log_capture_unregistered")
+                self.captures.extend(path.read_bytes() for path, _ in streams)
+                return
+            if self.paid and pod != "acme-sentinel":
+                raise poe.StepFailed("pod_log_capture_unregistered")
 
             try:
                 super().capture_pod(pod)
@@ -2191,6 +2241,8 @@ def owner_proof_class(e: Any) -> type[Any]:  # noqa: C901 - one scenario, one cl
                 if status.get("phase") != "Running":
                     continue
                 e.require(self.image_ok(pod), "a runner pod is not the pushed candidate digest")
+                if not self.paid and meta["name"] not in self.pod_log_streams:
+                    self.start_log_capture(meta["name"], len(self.pod_log_streams) + 1)
                 code, raw = self.pod_exec(meta["name"], SWEEP_PROGRAM, timeout=30)
                 if code != 0:
                     continue
@@ -2274,7 +2326,69 @@ def owner_proof_class(e: Any) -> type[Any]:  # noqa: C901 - one scenario, one cl
                     track.pod = str(self.native[ref]["pod"])
                     track.pod_uid = str(self.native[ref]["uid"])
             pid, start = ref.split(":")[1:]
-            self.pod_exec(str(self.native[ref]["pod"]), LAUNCH_RELEASE_PROGRAM, pid, start)
+            log = self.start_log_capture(str(self.native[ref]["pod"]), reservation.seq)
+            capture = ()
+            if reservation.slot == "rejected":
+                self.enable_refusal_capture(str(self.native[ref]["pod"]))
+                self.refusal_log = log
+                self.rejected_workspace = self.workspace_state(str(self.native[ref]["pod"]))
+                capture = ("refusal",)
+            self.pod_exec(
+                str(self.native[ref]["pod"]), LAUNCH_RELEASE_PROGRAM, pid, start, *capture
+            )
+
+        def enable_refusal_capture(self, pod: str) -> None:
+            spec = self.core.read_namespaced_pod(pod, self.namespace, _request_timeout=10)
+            runner = next(c for c in spec.spec.containers if c.name == "runner")
+            ref = next(
+                (
+                    v.value_from.secret_key_ref
+                    for v in runner.env
+                    if v.name == "CLAUDE_CODE_OAUTH_TOKEN"
+                ),
+                None,
+            )
+            if ref is None:
+                raise poe.StepFailed("rejection_capture_missing_grant_reference")
+            credential = self.core.read_namespaced_secret(
+                ref.name, self.namespace, _request_timeout=10
+            )
+            if (
+                base64.b64decode((credential.data or {}).get(ref.key, ""))
+                != self.invalid.reveal().encode()
+            ):
+                raise poe.StepFailed("rejection_capture_refuses_debug_for_a_real_grant")
+
+        def start_log_capture(self, pod: str, seq: int) -> Path:
+            name = f"runner-log-{seq}"
+            log = self.retained_dir / f"{name}.log"
+            process = self.spawn(
+                name,
+                poe.kubectl_argv(
+                    self.context, self.namespace, "logs", pod, "--container", "runner", "--follow"
+                ),
+                self.env,
+            )
+            self.pod_log_streams.setdefault(pod, []).append((log, process))
+            ready = self.wait_soft(
+                lambda: (
+                    True
+                    if (log.exists() and log.stat().st_size and process.poll() is None)
+                    else None
+                ),
+                timeout=15,
+            )
+            if ready is None:
+                raise poe.StepFailed("pod_log_capture_not_ready")
+            return log
+
+        def worker_events(self) -> list[dict[str, Any]]:
+            path = self.retained_dir / "worker-events.sqlite3"
+            if not path.exists():
+                return []
+            with sqlite3.connect(path.as_uri() + "?mode=ro", uri=True) as db:
+                db.row_factory = sqlite3.Row
+                return [dict(row) for row in db.execute("SELECT * FROM events ORDER BY ordinal")]
 
         def close_unstarted(self, reservation: poe.Reservation, now: float) -> None:
             self.pending.remove(reservation)
@@ -2788,23 +2902,44 @@ def owner_proof_class(e: Any) -> type[Any]:  # noqa: C901 - one scenario, one cl
 
         def execute(self) -> None:
             self.snapshot_foreign()
-            for name, action in (
+            phases = (
                 ("setup", self.setup),
                 ("prepare", self.prepare_owner),
                 ("sentinel", self.deploy_sentinel),
                 ("enroll", self.enroll),
-                ("process", lambda: self.pair(*PAIRS[0])),
-                ("pod", lambda: self.pair(*PAIRS[1])),
-                ("worker", lambda: self.pair(*PAIRS[2])),
+            )
+            if self.ctx.phases == "remaining":
+                phases += (("remaining-generation", self.prepare_remaining),)
+            else:
+                phases += (
+                    ("process", lambda: self.pair(*PAIRS[0])),
+                    ("pod", lambda: self.pair(*PAIRS[1])),
+                    ("worker", lambda: self.pair(*PAIRS[2])),
+                )
+            phases += (
                 ("rejected", self.rejected),
                 ("revalidated", self.revalidated),
                 ("disconnect", self.disconnect),
                 ("audit", self.final_audit),
-            ):
+            )
+            for name, action in phases:
                 self.step(name)
                 self.say(f"phase {name}")
                 action()
             self.step("completed")
+
+        def prepare_remaining(self) -> None:
+            issue, conversation = self.issues["worker"], PAIRS[2][1]
+            item = self.admit_owner(issue, conversation, self.objective(), 1)
+            self.seed_history(str(item["conversation_id"]))
+            self.headers_seen["replaced"] = self.write(
+                "replace", token=self.files["token-invalid"], previous=self.headers_seen["enrolled"]
+            )
+            if self.headers_seen["replaced"]["generation"] != 2:
+                raise poe.StepFailed("remaining_scope_generation_not_two")
+            status, generation, _ = self.revalidate_item(str(item["id"]))
+            if status != 200 or generation != 2:
+                raise poe.StepFailed("remaining_scope_revalidation_not_two")
 
         def objective(self, hosted: bool = False) -> str:
             if self.paid:
@@ -3417,8 +3552,8 @@ def owner_proof_class(e: Any) -> type[Any]:  # noqa: C901 - one scenario, one cl
             """Generation 2 holds a deliberately invalid grant: the provider refuses it."""
 
             issue, conversation = self.issues["worker"], PAIRS[2][1]
-            work_item_id = str(self.work_items[issue]["id"])
-            thread = str(self.work_items[issue]["conversation_id"])
+            item = self.work_items[issue]
+            work_item_id, thread = str(item["id"]), str(item["conversation_id"])
 
             # Generation 2 is a new request on the same WorkItem, which admission
             # refuses (active_request) while any request is waiting, running or
@@ -3426,51 +3561,64 @@ def owner_proof_class(e: Any) -> type[Any]:  # noqa: C901 - one scenario, one cl
             def settled() -> bool | None:
                 return None if poe.active_requests(self.requests_of(work_item_id)) else True
 
-            prior = self.wait_soft(settled, timeout=150)
-            self.observe("authentication-required", "rejected.prior_requests_terminal", bool(prior))
-            if prior is None:
-                raise poe.StepFailed("generation 2 cannot be admitted: a request is still active")
+            if self.ctx.phases == "full":
+                prior = self.wait_soft(settled, timeout=150)
+                self.observe(
+                    "authentication-required", "rejected.prior_requests_terminal", bool(prior)
+                )
+                if prior is None:
+                    raise poe.StepFailed(
+                        "generation 2 cannot be admitted: a request is still active"
+                    )
+                self.admit_owner(issue, conversation, self.objective(), 2)
             ids_before = self.durable_ids(thread)
-            self.admit_owner(issue, conversation, self.objective(), 2)
+            self.observe(
+                "authentication-required",
+                "rejected.generation",
+                self.requests_of(work_item_id)[-1]["enrollment_generation"],
+            )
             self.reserve("rejected")
+            event_start = max((r["ordinal"] for r in self.worker_events()), default=0)
             self.start_worker()
             track = self.track_of("rejected")
-            files: dict[str, bytes] = {}
 
             def terminal() -> bool | None:
-                # No hook holds a refused session, so every transcript file in its
-                # pod is read on every poll, until the request is terminal.
                 rows = self.requests_of(work_item_id)
-                for state in self.pod_states.values():
-                    mine = track.seq is not None and any(
-                        n["seq"] == track.seq and n["uid"] == state["uid"]
-                        for n in self.native.values()
-                    )
-                    if not self.paid or not mine:
-                        continue
-                    track.pod, track.pod_uid = state["pod"], state["uid"]
-                    if not track.seeds:
-                        code, raw = self.pod_exec(state["pod"], e._REPLAY_SEED_READ, retain=False)
-                        with contextlib.suppress(ValueError):
-                            track.seeds = json.loads(raw) if code == 0 else []
-                    for path in state.get("files", {}):
-                        data = self.read_pod_file(state["pod"], path)
-                        if data:
-                            files[path] = data
                 return True if rows and rows[-1]["terminal_at"] is not None else None
 
-            self.wait_soft(terminal, timeout=poe.SESSION_SECONDS)
+            if self.wait_soft(terminal, timeout=poe.SESSION_SECONDS) is None:
+                raise poe.StepFailed("rejection_capture_missing_terminal_request")
             track.closed = True
-            usage = combined_usage(
-                [
-                    poe.transcript_usage(data, track.seeds, scrub=self.scrub)
-                    for data in files.values()
-                ]
-            )
+            error: dict[str, Any] = {}
+            usage = poe.SessionUsage.unknown()
             if self.paid:
+                reason = "rejection_capture_missing_provider_response"
+
+                def captured() -> dict[str, Any] | None:
+                    nonlocal reason
+                    log = self.refusal_log.read_bytes()
+                    self.ctx.rt.scan.scan("children", log)
+                    events = [r for r in self.worker_events() if r["ordinal"] > event_start]
+                    try:
+                        return poe.native_refusal(log, events)
+                    except poe.StepFailed as failure:
+                        reason = str(failure)
+                        if not reason.startswith("rejection_capture_missing_"):
+                            raise
+                        return None
+
+                error = self.wait_soft(captured, timeout=15)
+                if error is None:
+                    raise poe.StepFailed(reason)
+                self.observe("authentication-required", "rejected.capture_source", error["source"])
+                self.observe(
+                    "authentication-required",
+                    "rejected.aci_classification",
+                    error["aci_classification"],
+                )
+                usage = poe.SessionUsage(0, 0, True, error_classes=(error,))
                 self.settle(track, usage)
             row = self.requests_of(work_item_id)[-1]
-            error = usage.error_classes[0] if usage.error_classes else {}
             self.observe(
                 "authentication-required", "rejected.http_status", error.get("http_status")
             )
@@ -3568,6 +3716,12 @@ def owner_proof_class(e: Any) -> type[Any]:  # noqa: C901 - one scenario, one cl
                 before is None or track.cli != before.cli,
             )
             data, usage = self.harvest(track)
+            after = self.workspace_state(track.pod)
+            if self.paid:
+                for key, value in poe.committed_restoration(
+                    self.stub_source, self.rejected_workspace, after
+                ).items():
+                    self.observe("authentication-required", f"revalidated.{key}", value)
             scan = self.read_pod_file(track.pod, f"{WORK_DIR}/scan.bin") if self.paid else None
             if not self.paid:
                 # The fake model dials the hosted connector after the pod is ready.
@@ -3584,11 +3738,12 @@ def owner_proof_class(e: Any) -> type[Any]:  # noqa: C901 - one scenario, one cl
                     track, seen={track.hook_pid}, harvested=(data, usage)
                 )
             track.closed = True
-            results = poe.tool_results(data or b"")
+            captured = b"\n".join(track.transcripts.values())
+            results = poe.tool_results(captured)
             self.observe(
                 "authentication-required",
                 "revalidated.replay_marker_seen",
-                data is not None and self.marker.encode() in data,
+                bool(captured) and self.marker.encode() in captured,
             )
             self.observe(
                 "authentication-required",
@@ -3728,6 +3883,9 @@ def owner_proof_class(e: Any) -> type[Any]:  # noqa: C901 - one scenario, one cl
         def final_audit(self) -> None:
             """No header or grant bytes in manifests, logs, events or the private ledger."""
 
+            if self.pod_log_streams:
+                self.collect_completed_logs()
+
             for plural in ("sandboxclaims", "sandboxtemplates", "sandboxwarmpools"):
                 self.captures.append(
                     json.dumps(
@@ -3764,6 +3922,19 @@ def owner_proof_class(e: Any) -> type[Any]:  # noqa: C901 - one scenario, one cl
                     any(e.leaks(capture, [held.reveal()]) for capture in self.captures),
                 )
             self.check_stub()
+
+        def collect_completed_logs(self) -> None:
+            streams = [item for items in self.pod_log_streams.values() for item in items]
+            complete = self.wait_soft(
+                lambda: True if all(p.poll() is not None for _, p in streams) else None,
+                timeout=15,
+            )
+            if complete is None:
+                raise poe.StepFailed("pod_log_capture_missing_eof")
+            for path, process in streams:
+                if process.returncode != 0:
+                    raise poe.StepFailed("pod_log_capture_transport_failed")
+                self.captures.append(path.read_bytes())
 
         # --- foreign resources, inventory, teardown ---------------------------
 
@@ -4070,6 +4241,50 @@ def combined_usage(parts: Sequence[poe.SessionUsage]) -> poe.SessionUsage:
     )
 
 
+PROOF_ONLY_PATHS = {
+    "tools/factory-e2e/personal_owner_enforcement.py",
+    "tools/factory-e2e/personal_owner_enforcement_support.py",
+    "tools/factory-e2e/tests/test_personal_owner_enforcement.py",
+    "tools/factory-e2e/tests/fixtures/native_auth_refusal.json",
+    "tools/factory-e2e/README.md",
+}
+
+
+def reuse_prior_proof(ledger: poe.OwnerLedger, candidate: str, run_id: str) -> None:
+    if not run_id or run_id == ledger.run_id:
+        raise poe.StepFailed("remaining_scope_requires_prior_live_proof")
+    source = poe.OwnerLedger(ledger.db, run_id, ledger.scrub)
+    run = source.run()
+    if run is None or run["mode"] != "live" or run["finished_at"] is None:
+        raise poe.StepFailed("remaining_scope_requires_finished_live_proof")
+    changed = (
+        subprocess.check_output(
+            ["git", "diff", "--name-only", run["candidate"], candidate], cwd=REPO_ROOT, timeout=30
+        )
+        .decode()
+        .splitlines()
+    )
+    if set(changed) - PROOF_ONLY_PATHS:
+        raise poe.StepFailed("remaining_scope_product_changed")
+    inherited = {}
+    for criterion in ("selection", "restart", "fencing"):
+        result = poe.judge(source, criterion)
+        if result["verdict"] not in {"pass", "not_met"}:
+            raise poe.StepFailed(f"remaining_scope_missing_{criterion}_proof")
+        inherited[criterion] = {"run_id": run_id, "candidate": run["candidate"]}
+    ledger.record("coverage", "inherited", inherited, time.time())
+    ledger.record(
+        "coverage",
+        "unchanged_product",
+        {
+            "candidate": candidate,
+            "source_candidate": run["candidate"],
+            "changed_proof_paths": changed,
+        },
+        time.time(),
+    )
+
+
 def functools_partial(function: Callable[..., Any], *args: Any) -> Callable[[], Any]:
     def call() -> Any:
         return function(*args)
@@ -4089,7 +4304,20 @@ def child_main(args: argparse.Namespace, rt: Runtime) -> int:
     )
     ledger.begin(flags.candidate, "live" if paid else "rehearse", time.time())
     ledger.configure_item(args.prior_run_id, args.item_output_token_cap, time.time())
-    ctx = ChildContext(args.mode, flags, inputs, args.grant_file, args.grant_expires_at, ledger, rt)
+    if args.phases == "remaining":
+        reuse_prior_proof(ledger, flags.candidate, args.reuse_run_id)
+    elif args.reuse_run_id:
+        raise poe.Refusal("input_file_invalid", "--reuse-run-id requires --phases remaining")
+    ctx = ChildContext(
+        args.mode,
+        flags,
+        inputs,
+        args.grant_file,
+        args.grant_expires_at,
+        ledger,
+        rt,
+        phases=args.phases,
+    )
 
     def record(name: str, ok: bool, detail: str) -> None:
         ledger.record_cleanup("step", name, "ok" if ok else "failed", detail, time.time())

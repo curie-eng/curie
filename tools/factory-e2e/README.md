@@ -490,6 +490,25 @@ share and remains unknown. Reservations and every response check enforce the
 combined cap as well as the unchanged per-attempt ceilings. These accounting
 flags grant no retry authority.
 
+`--phases remaining --reuse-run-id SOURCE_RUN` runs only rejection,
+revalidation, disconnect and the hosted-header audit. The source must be a
+finished live run whose selection, restart and fencing judgments passed,
+allowing only the tracked #5541 observations. The driver refuses reuse when
+any path outside this proof's driver, tests, fixture or README changed. Each
+reused criterion names its original run and candidate in the judge output;
+its observations are never relabeled as fresh proof.
+
+The remaining-phase bootstrap admits an owner-bound generation-1 WorkItem
+without starting a model, seeds the same durable history marker, replaces the
+enrollment with the invalid generation-2 control and explicitly revalidates
+the waiting request. The real worker executes that request. Generation 3
+still replaces the invalid grant, waits for teardown and explicitly
+revalidates that same WorkItem before a fresh native process starts. No SQL
+completion is forged, no live state is restored from a previous test namespace
+and no recovery requirement is dropped. Only the `rejected` and `revalidated`
+native sessions are reserved; each retains its original 1,024-token and
+four-assistant-turn share, and all attempt and item ceilings still apply.
+
 `judge --criterion` takes `selection`, `fencing`, `authentication-required`,
 `disconnect`, `restart`, `hosted-header`, `budget`, `cleanup`, `rehearsal` or `all`. It
 reads only the private ledger, compares each observation with the expected
@@ -658,6 +677,86 @@ native processes, interruption-specific old-runtime absence, and a new Pod UID
 for the Pod-deletion case. Process-only interruption and old-epoch confirmation
 before a successor claim binds remain required. The fresh-process and new-Pod
 conditions match explicit AC 3 and AC 7 text and are not converted to observations.
+
+### Remaining evidence capture audit
+
+The native CLI does not reliably persist an authentication failure in its
+project transcript. In observed SDK-bundled CLI 2.1.317 output, stream-json
+assistant/result records expose `api_error_status: 401`; the assistant uses
+the CLI classification `authentication_failed`. The provider's distinct
+`authentication_error` type is in the native debug response body. The sanitized
+fixture is `tests/fixtures/native_auth_refusal.json`.
+
+Every native session now starts a Pod log stream before its launch permit is
+released. Only the deliberately invalid control enables `--debug-file
+/dev/stderr`, after the driver confirms that Pod's delivery Secret contains
+the invalid control. A real grant is refused debug capture. The SDK's normal
+stderr sanitizer forwards the response to the already attached stream.
+The trusted worker records error/final frames from its actual `TurnStream`
+iterator into private SQLite before delivering them to the kernel, reusing
+the enrollment driver's ACI observation mechanism. No frame is replaced.
+The refusal requires both the provider response and a same-epoch ACI
+authentication-required error plus classified-failure final. Missing,
+truncated or conflicting evidence stops with a named capture reason.
+
+The empty-HOME, filtered-environment unpaid probe ran the real bundled CLI
+through the launch wrapper and stderr sanitizer with an invalid OAuth token.
+It observed HTTP 401, provider type `authentication_error` and zero output
+tokens. Neither an empty capture nor seeded history alone is accepted as
+measured zero usage. Logs remain available after Pod deletion; the final
+audit requires every native log stream to reach successful EOF.
+
+The table names every remaining pass condition and its live evidence source.
+Unpaid tests cover parsers, missing/conflicting inputs, capture ordering,
+grant selection for debug, stream persistence, EOF, scope provenance,
+reservations, response gates and cleanup. The offline rehearsal drives the
+real API, worker, backing services, workspace and connector with its declared
+fake provider; those readings never become paid-provider proof.
+
+| Phase | Conditions | Evidence on the live path |
+| --- | --- | --- |
+| Rejection | `rejected.generation` | The current ExecutionRequest row after explicit revalidation or generation-2 admission. |
+| Rejection | `rejected.capture_source`, `rejected.http_status`, `rejected.provider_error_type` | Provider response in the actual rejected native process's debug stderr, retained by the pre-launch Pod log stream. |
+| Rejection | `rejected.aci_classification` | Actual worker-consumed error/final frames, paired by runner epoch in private SQLite. |
+| Rejection | `rejected.terminal_cause` | The worker's terminal ExecutionRequest row, read through the real database. |
+| Rejection | `rejected.output_tokens` | The classified provider authentication refusal and matching ACI terminal; the real invalid-token probe independently reports zero. |
+| Rejection | `rejected.transcript_preserved` | Durable transcript record IDs before and after the refused request. |
+| Rejection | `rejected.owner_preserved` | The immutable WorkItem owner read after the refusal. |
+| Rejection | `rejected.service_fallback_claims` | Current claim labels, retained provenance for deleted claims and every observed runner Pod. |
+| Revalidation | `revalidated.generation` | The explicit revalidation API response after generation-2 teardown confirmation. |
+| Revalidation | `revalidated.fresh_native_process` | Pod UID, native PID and process-start identity compared with the rejected process. |
+| Revalidation | `revalidated.committed_head_restored`, `revalidated.committed_files_restored` | Real workspace HEAD and tracked-file hashes before rejection and in the fresh valid process, compared with the durable stub repository. |
+| Revalidation | `revalidated.replay_marker_seen` | All retained native transcript files for the recovered session, including any continuation. |
+| Revalidation | `revalidated.assistant_turns_positive` | Complete native assistant usage records, excluding only exactly matched seeded records. |
+| Hosted header | `sentinel.challenge_returned`, `public_control.returned` | Actual tool-result records across the session's complete captured transcript set. |
+| Hosted header | `sentinel.authorized_calls_positive`, `sentinel.unauthorized_calls` | Counters read from the real namespaced sentinel service. |
+| Hosted header | `bash.scan_ran`, `bash.negative_control_found` | Scanner output retained at the first Stop before permitting continuation; the deliberately exposed marker must be present. |
+| Hosted header | `bash.header_found`, `bash.grant_found` | Exact and encoded held-value scans of the captured Bash scanner output. Missing scanner output remains a failure. |
+| Hosted header | `audit.captures_complete` | Every pre-launch native log stream ended successfully; sentinel logs and all declared captures are present. |
+| Hosted header | `audit.header_in_captures`, `audit.grant_in_captures`, `audit.invalid_grant_in_captures` | Blocking scans of complete logs, claim/template manifests and events. |
+| Hosted header | `audit.header_in_ledger_or_output` | Blocking raw-byte scans before retained command output, ledger entries or driver output are published. |
+| Disconnect | `disconnect.generation`, `disconnect.state` | Disconnect API response. |
+| Disconnect | `disconnect.waiting_request_started` | The specifically admitted waiting request's `started_at`. |
+| Disconnect | `disconnect.custody_secrets` | Custody Secret inventory in the owned grant namespace after reconciliation. |
+| Disconnect | `disconnect.claims_after_restarts`, `disconnect.pods_after_restarts`, `disconnect.tokens_secrets_after_restarts` | Claim, Pod and delivery-Secret inventory across both actual worker restarts. |
+| Disconnect | `disconnect.native_sessions_after_restarts` | Launch-gated native process identities observed before and after both restarts. |
+| Disconnect | `disconnect.admission_code`, `disconnect.revalidation_code`, `disconnect.custody_reader_code`, `disconnect.route` | Real admission/revalidation responses, custody-reader refusal and route lookup. |
+| Budget | Recorded session, total-turn and output-token ceilings | The live-window ledger records the same enforced constants used by reservations and query/response gates. |
+| Budget | `spend_guard.breach`, `sessions_within_ceiling`, `every_session_within_share`, `unreserved_starts`, `paid_retries` | Durable reservations, native launch observations, per-response harvests and settlements. |
+| Budget | `usage_known`, `zero_usage_sessions_classified`, per-session assistant turns, total turns/output tokens | Complete native records or the classified refusal; unknown capture stops the attempt. |
+| Budget | `models`, `grant_probe_ok`, `live_seconds_within_ceiling` | Native model metadata, the immediately preceding empty-HOME probe, and measured live/cleanup timestamps. |
+| Budget | `item.output_tokens` | All linked attempts, measured usage, full reservation charges for unknown usage and qualification-probe output. |
+| Cleanup | `namespace.absent`, `grant_namespace.absent`, `claims.absent`, `pods.absent`, `grant_copies.absent` | Post-teardown Kubernetes absence checks in the owned namespaces. |
+| Cleanup | `pvcs.absent`, `pvs.absent` | The pre-teardown ownership inventory and post-teardown volume absence checks. |
+| Cleanup | `code_host.absent`, `registry.absent`, `containers.absent`, `port_forwards.absent`, `processes.absent`, `private_dir.absent` | Registered owned-resource finalizers followed by independent absence checks. |
+| Cleanup | `foreign_untouched.absent`, `finalizer.steps_ok`, `cleanup.within_bound` | Before/after foreign inventories, each finalizer result and measured cleanup timestamps. |
+
+Only a valid-grant pass can prove successful generation-3 native recovery,
+marker recall, positive real assistant usage, actual native hosted-tool/public
+control results and native Bash confidentiality with the real grant. The
+combined real-provider revalidation/disconnect/header run therefore remains
+required. Offline results and a standalone invalid-token probe do not fill
+those acceptance rows.
 
 ### Known limits
 

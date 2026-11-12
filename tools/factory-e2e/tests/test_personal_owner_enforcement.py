@@ -15,6 +15,8 @@ from __future__ import annotations
 import base64
 import json
 import os
+import sqlite3
+import subprocess
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
@@ -454,6 +456,81 @@ def test_usage_excludes_only_exactly_matched_seeds() -> None:
     changed = {**seed, "message": {**seed["message"], "id": "seed-changed"}}
     assert not poe.transcript_usage(_jsonl(changed), [seed]).known
     assert not poe.transcript_usage(_jsonl(seed)).known
+
+
+def test_seed_only_or_empty_capture_is_not_measured_zero_usage() -> None:
+    seed = _assistant("seed-1", None, uuid="s1")
+    assert not poe.transcript_usage(_jsonl(seed), [seed]).known
+    assert not poe.transcript_usage(b"").known
+
+
+def _native_refusal_fixture() -> dict[str, Any]:
+    # Observed from SDK-bundled CLI 2.1.317 in an empty HOME with an invalid
+    # OAuth token, 2026-11-12. The native debug response exposes the provider
+    # type; the stream's authentication_failed is the CLI's classification.
+    return json.loads((Path(__file__).parent / "fixtures/native_auth_refusal.json").read_text())
+
+
+def _aci_refusal() -> list[dict[str, Any]]:
+    # The error/final pair consumed by the enrollment driver's AC5 live_session.
+    return [
+        {"epoch": "example-epoch", "kind": "error", "classification": "authentication-required"},
+        {"epoch": "example-epoch", "kind": "final", "status": "classified-failure"},
+    ]
+
+
+def test_rejection_uses_observed_provider_debug_response_and_aci_terminal() -> None:
+    sample = _native_refusal_fixture()
+    reading = poe.native_refusal(sample["native_debug_stderr"].encode(), _aci_refusal())
+    assert reading["http_status"] == 401
+    assert reading["provider_error_type"] == "authentication_error"
+    assert reading["source"] == "native_debug_stderr"
+    assert reading["aci_classification"] == "authentication-required"
+    assert sample["native_stream"][0]["error"] == "authentication_failed"
+
+
+@pytest.mark.parametrize(
+    "kind",
+    [
+        "empty",
+        "stream_only",
+        "truncated",
+        "no_aci",
+        "no_final",
+        "different_epoch",
+        "no_epoch",
+        "conflicting",
+    ],
+)
+def test_rejection_capture_fails_with_a_named_reason(kind: str) -> None:
+    sample = _native_refusal_fixture()
+    log = sample["native_debug_stderr"].encode()
+    events = _aci_refusal()
+    reason = "rejection_capture_missing_provider_response"
+    if kind == "empty":
+        log = b""
+    elif kind == "stream_only":
+        log = _jsonl(*sample["native_stream"])
+    elif kind == "truncated":
+        log = log[: log.index(b"{") + 1]
+    elif kind == "no_aci":
+        events = []
+        reason = "rejection_capture_missing_aci_terminal"
+    elif kind == "no_final":
+        events = events[:1]
+        reason = "rejection_capture_missing_aci_terminal"
+    elif kind == "different_epoch":
+        events[1]["epoch"] = "different-epoch"
+        reason = "rejection_capture_missing_aci_terminal"
+    elif kind == "no_epoch":
+        for event in events:
+            event["epoch"] = None
+        reason = "rejection_capture_missing_aci_terminal"
+    else:
+        log += b'API error: 500 {"error":{"type":"api_error"}}\n'
+        reason = "rejection_capture_conflicting_provider_responses"
+    with pytest.raises(poe.StepFailed, match=reason):
+        poe.native_refusal(log, events)
 
 
 @pytest.mark.parametrize(
@@ -1388,6 +1465,208 @@ def test_process_interruption_records_absence_and_epoch_before_recovery() -> Non
     assert all(poe.process_interruption_checks(facts).values())
 
 
+def test_worker_observer_persists_real_transport_frames_before_consumption(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import asyncio
+    from types import SimpleNamespace
+
+    from aci_protocol import ErrorEvent, Final, SessionStatus
+    from curie_worker.runner_client import TurnStream
+
+    monkeypatch.setattr(TurnStream, "__aiter__", TurnStream.__aiter__)
+    scope: dict[str, Any] = {}
+    exec(driver.WORKER_EVENTS_PROGRAM, scope)
+    target = tmp_path / "worker-events.sqlite3"
+    scope["observe_runner_events"](str(target))
+    messages = [
+        ErrorEvent(message="provider refused", classification="authentication-required"),
+        Final(text="authentication required", status=SessionStatus.CLASSIFIED_FAILURE),
+    ]
+
+    class Content:
+        async def __aiter__(self) -> Any:
+            for message in messages:
+                yield (message.model_dump_json() + "\n").encode()
+
+    async def consume() -> list[Any]:
+        stream = TurnStream(
+            SimpleNamespace(content=Content()),
+            10,
+            asyncio.get_running_loop().time() + 10,
+            "example-epoch",
+        )
+        observed = []
+        async for frame in stream:
+            with sqlite3.connect(target) as db:
+                count = db.execute("SELECT count(*) FROM events").fetchone()[0]
+            assert count == len(observed) + 1
+            observed.append(frame)
+        return observed
+
+    observed = asyncio.run(consume())
+    assert [frame.model_dump() for frame in observed] == [m.model_dump() for m in messages]
+    with sqlite3.connect(target) as db:
+        db.row_factory = sqlite3.Row
+        rows = [dict(row) for row in db.execute("SELECT * FROM events")]
+    assert (
+        poe.native_refusal(_native_refusal_fixture()["native_debug_stderr"].encode(), rows)[
+            "aci_classification"
+        ]
+        == "authentication-required"
+    )
+
+
+@pytest.mark.parametrize("mode", ["full", "remaining"])
+def test_phase_scope_keeps_every_remaining_phase(tmp_path: Path, mode: str) -> None:
+    from types import SimpleNamespace
+
+    proof = _proof()
+    proof.ctx = SimpleNamespace(phases=mode)
+    order: list[str] = []
+    proof.snapshot_foreign = lambda: None
+    proof.say = lambda _: None
+    proof.step = order.append
+    for method in (
+        "setup",
+        "prepare_owner",
+        "deploy_sentinel",
+        "enroll",
+        "prepare_remaining",
+        "rejected",
+        "revalidated",
+        "disconnect",
+        "final_audit",
+    ):
+        setattr(proof, method, lambda: None)
+    pairs: list[str] = []
+    proof.pair = lambda kind, _: pairs.append(kind)
+    proof.execute()
+    assert order[-5:] == ["rejected", "revalidated", "disconnect", "audit", "completed"]
+    assert pairs == ([] if mode == "remaining" else ["process", "pod", "worker"])
+    assert ("remaining-generation" in order) == (mode == "remaining")
+
+
+@pytest.mark.parametrize("changed_product", [False, True])
+def test_scope_reuses_only_proven_criteria_with_unchanged_product(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    changed_product: bool,
+) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+
+    def git(*args: str) -> str:
+        return subprocess.check_output(["git", "-C", str(repo), *args], text=True).strip()
+
+    git("init", "-q", "-b", "fixture")
+    source_file = repo / "product.py"
+    source_file.write_text("x = 1\n")
+    git("add", ".")
+    git("-c", "user.name=Example", "-c", "user.email=example@example.com", "commit", "-qm", "base")
+    source_sha = git("rev-parse", "HEAD")
+    if changed_product:
+        source_file.write_text("x = 2\n")
+    else:
+        change = repo / "tools/factory-e2e/README.md"
+        change.parent.mkdir(parents=True)
+        change.write_text("proof change\n")
+    git("add", ".")
+    git(
+        "-c", "user.name=Example", "-c", "user.email=example@example.com", "commit", "-qm", "change"
+    )
+    candidate = git("rev-parse", "HEAD")
+    monkeypatch.setattr(driver, "REPO_ROOT", repo)
+    state = _state(tmp_path)
+    prior = poe.OwnerLedger.open(state, "prior", create=True)
+    prior.begin(source_sha, "live", T0)
+    for criterion in ("selection", "restart", "fencing", "authentication-required"):
+        _record_all(prior, criterion)
+    prior.record("restart", "process.workspace_nonce_restored", False, T0)
+    prior.finish("failed", T0 + 1)
+    current = poe.OwnerLedger(prior.db, "current", prior.scrub)
+    current.begin(candidate, "live", T0 + 2)
+    if changed_product:
+        with pytest.raises(poe.StepFailed, match="remaining_scope_product_changed"):
+            driver.reuse_prior_proof(current, candidate, "prior")
+    else:
+        driver.reuse_prior_proof(current, candidate, "prior")
+        result = poe.judge(current, "restart")
+        assert result["verdict"] == "not_met"
+        assert result["candidate"] == candidate
+        assert result["criteria"][0]["source_candidate"] == source_sha
+        assert result["criteria"][0]["source_run_id"] == "prior"
+        assert poe.judge(current, "fencing")["verdict"] == "pass"
+        assert poe.judge(current, "authentication-required")["verdict"] == "missing"
+        prior.record("selection", "claim.label.owner_principal_matches", False, T0)
+        with pytest.raises(poe.StepFailed, match="remaining_scope_missing_selection_proof"):
+            driver.reuse_prior_proof(current, candidate, "prior")
+
+
+@pytest.mark.parametrize(
+    "finished,status,reason",
+    [(False, None, "pod_log_capture_missing_eof"), (True, 1, "pod_log_capture_transport_failed")],
+)
+def test_live_capture_requires_complete_successful_streams(
+    tmp_path: Path,
+    finished: bool,
+    status: int | None,
+    reason: str,
+) -> None:
+    from types import SimpleNamespace
+
+    proof = _proof()
+    proof.paid = True
+    proof.captures = []
+    log = tmp_path / "runner.log"
+    log.write_bytes(b"partial capture\n")
+    proof.pod_log_streams = {
+        "example-pod": [(log, SimpleNamespace(poll=lambda: status, returncode=status))]
+    }
+    proof.wait_soft = lambda predicate, **kwargs: predicate() if finished else None
+    with pytest.raises(poe.StepFailed, match=reason):
+        proof.collect_completed_logs()
+
+
+def test_live_capture_keeps_complete_successful_streams(tmp_path: Path) -> None:
+    from types import SimpleNamespace
+
+    proof = _proof()
+    proof.captures = []
+    log = tmp_path / "runner.log"
+    log.write_bytes(b"complete capture\n")
+    proof.pod_log_streams = {
+        "example-pod": [(log, SimpleNamespace(poll=lambda: 0, returncode=0))]
+    }
+    proof.wait_soft = lambda predicate, **kwargs: predicate()
+    proof.collect_completed_logs()
+    assert proof.captures == [b"complete capture\n"]
+
+
+def test_debug_capture_refuses_every_grant_except_the_invalid_control() -> None:
+    from types import SimpleNamespace
+
+    proof = _proof()
+    proof.namespace = "acme-proof"
+    proof.invalid = pps.HeldSecret("synthetic-invalid-control")
+    ref = SimpleNamespace(name="example-token", key="grant")
+    env = SimpleNamespace(
+        name="CLAUDE_CODE_OAUTH_TOKEN", value_from=SimpleNamespace(secret_key_ref=ref)
+    )
+    pod = SimpleNamespace(
+        spec=SimpleNamespace(containers=[SimpleNamespace(name="runner", env=[env])])
+    )
+    token = SimpleNamespace(data={"grant": base64.b64encode(b"synthetic-invalid-control").decode()})
+    proof.core = SimpleNamespace(
+        read_namespaced_pod=lambda *a, **kw: pod, read_namespaced_secret=lambda *a, **kw: token
+    )
+    proof.enable_refusal_capture("example-pod")
+    token.data["grant"] = base64.b64encode(GRANT.encode()).decode()
+    with pytest.raises(poe.StepFailed, match="rejection_capture_refuses_debug_for_a_real_grant"):
+        proof.enable_refusal_capture("example-pod")
+
+
 @pytest.mark.parametrize(
     "prior_runs,cap,expected",
     [
@@ -1463,14 +1742,19 @@ def test_stop_refuses_an_over_budget_continuation_and_allows_one_that_fits() -> 
     assert released == ["stop"]
 
 
-def test_native_launch_is_reserved_durably_before_release(tmp_path: Path) -> None:
+@pytest.mark.parametrize("slot", [poe.SLOT_NAMES[0], "rejected"])
+def test_native_launch_is_reserved_durably_before_release(tmp_path: Path, slot: str) -> None:
     from types import SimpleNamespace
 
     ledger = _live_ledger(tmp_path)
-    r = ledger.reserve(poe.SLOT_NAMES[0], T0)
+    r = ledger.reserve(slot, T0)
     proof = _proof()
     proof.paid, proof.pending = True, [r]
     proof.ctx = SimpleNamespace(ledger=ledger)
+    captures: list[str] = []
+    proof.start_log_capture = lambda *args: captures.append("logs") or tmp_path / "native.log"
+    proof.enable_refusal_capture = lambda *args: captures.append("invalid-control-only")
+    proof.workspace_state = lambda *args: {}
     proof.live_deadline = T0 + 1440
     proof.native = {"uid:123:456": {"pod": "acme-pod", "uid": "uid"}}
     proof.tracks = [driver.Track(r.slot, r.seq)]
@@ -1478,7 +1762,9 @@ def test_native_launch_is_reserved_durably_before_release(tmp_path: Path) -> Non
 
     def pod_exec(pod: str, program: str, *args: str) -> None:
         assert ledger.sessions()[0]["native_ref"] == "uid:123:456"
-        assert program == driver.LAUNCH_RELEASE_PROGRAM and args == ("123", "456")
+        assert captures == (["logs", "invalid-control-only"] if slot == "rejected" else ["logs"])
+        assert program == driver.LAUNCH_RELEASE_PROGRAM
+        assert args == (("123", "456", "refusal") if slot == "rejected" else ("123", "456"))
         released.append(pod)
 
     proof.pod_exec = pod_exec
@@ -1720,6 +2006,11 @@ def test_final_audit_scans_both_grants_and_the_hosted_header(
     from types import SimpleNamespace
 
     proof = _proof()
+    proof.paid = True
+    log = tmp_path / "runner.log"
+    log.write_bytes(b"completed stream\n")
+    proof.pod_log_streams = {"example-pod": [(log, SimpleNamespace(poll=lambda: 0, returncode=0))]}
+    proof.wait_soft = lambda predicate, **kwargs: predicate()
     proof.captures_missing, proof.captures = 0, [GRANT.encode(), b"synthetic-invalid-grant"]
     proof.grant, proof.invalid = pps.HeldSecret(GRANT), pps.HeldSecret("synthetic-invalid-grant")
     proof.sentinel_token = pps.HeldSecret(HEADER)

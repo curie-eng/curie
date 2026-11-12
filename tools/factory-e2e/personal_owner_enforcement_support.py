@@ -537,6 +537,8 @@ def transcript_usage(
         if isinstance(model, str):
             models.add(model)
         texts.extend(scrub(text) for text in _texts(message))
+    if not per_message and not errors:
+        return SessionUsage.unknown()
     return SessionUsage(
         output_tokens=sum(per_message.values()),
         assistant_turns=len(per_message),
@@ -545,6 +547,58 @@ def transcript_usage(
         error_classes=tuple(errors[: pps.MAX_ERROR_CLASSES]),
         texts=tuple(texts),
     )
+
+
+def native_provider_response(log: bytes) -> dict[str, Any]:
+    """The provider's status and error type as exposed in native debug stderr."""
+
+    responses: set[tuple[int, str]] = set()
+    for line in log.decode(errors="replace").splitlines():
+        match = re.search(
+            r"(?:API error(?: \(attempt [^)]+\))?|Error in API request):\s*(\d{3})",
+            line,
+            re.IGNORECASE,
+        )
+        if match is None or "{" not in line:
+            continue
+        try:
+            body, _ = json.JSONDecoder().raw_decode(line[line.index("{") :])
+        except ValueError:
+            continue
+        error = body.get("error") if isinstance(body, dict) else None
+        kind = error.get("type") if isinstance(error, dict) else None
+        if isinstance(kind, str) and re.fullmatch(r"[a-z_]+_error", kind):
+            responses.add((int(match.group(1)), kind))
+    if not responses:
+        raise StepFailed("rejection_capture_missing_provider_response")
+    if len(responses) != 1:
+        raise StepFailed("rejection_capture_conflicting_provider_responses")
+    status, kind = next(iter(responses))
+    return {"http_status": status, "provider_error_type": kind, "source": "native_debug_stderr"}
+
+
+def native_refusal(log: bytes, events: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
+    """Provider response paired with the ACI frames consumed by the real worker."""
+
+    response = native_provider_response(log)
+    epochs = {
+        row.get("epoch")
+        for row in events
+        if row.get("kind") == "error" and row.get("classification") == "authentication-required"
+    }
+    finals = {
+        row.get("epoch")
+        for row in events
+        if row.get("kind") == "final" and row.get("status") == "classified-failure"
+    }
+    if len(epochs) != 1 or None in epochs or not epochs <= finals:
+        raise StepFailed("rejection_capture_missing_aci_terminal")
+    return {
+        **response,
+        "cli_error": "authentication-required",
+        "first_line": "provider refused native request",
+        "aci_classification": "authentication-required",
+    }
 
 
 def tool_results(data: bytes) -> list[str]:
@@ -1123,6 +1177,16 @@ class OwnerLedger:
             )
         }
 
+    def evidence_source(self, criterion: str) -> OwnerLedger:
+        inherited = self.observations("coverage").get("inherited", {})
+        source = inherited.get(criterion)
+        if source is None:
+            return self
+        ledger = OwnerLedger(self.db, source["run_id"], self.scrub)
+        if (ledger.run() or {}).get("candidate") != source["candidate"]:
+            raise Refusal("ledger_missing")
+        return ledger
+
     def record_cleanup(self, kind: str, ref: str, status: str, detail: str, now: float) -> None:
         self.db.execute(
             "INSERT INTO cleanup (run_id, kind, ref, status, detail, recorded_at) "
@@ -1695,6 +1759,9 @@ EXPECTED: dict[str, dict[str, Any]] = {
         "revalidated.generation": 2,
     },
     "authentication-required": {
+        "rejected.generation": 2,
+        "rejected.capture_source": "native_debug_stderr",
+        "rejected.aci_classification": "authentication-required",
         "rejected.http_status": 401,
         "rejected.provider_error_type": "authentication_error",
         "rejected.terminal_cause": "authentication_required",
@@ -1706,6 +1773,8 @@ EXPECTED: dict[str, dict[str, Any]] = {
         "revalidated.fresh_native_process": True,
         "revalidated.replay_marker_seen": True,
         "revalidated.assistant_turns_positive": True,
+        "revalidated.committed_head_restored": True,
+        "revalidated.committed_files_restored": True,
     },
     "disconnect": {
         "disconnect.generation": 4,
@@ -1929,6 +1998,8 @@ def _judge_cleanup(ledger: OwnerLedger) -> list[dict[str, Any]]:
 REHEARSAL_ONLY = {
     "restart": {"process.old_epoch_confirmed_before_bind"},
     "authentication-required": {
+        "rejected.capture_source",
+        "rejected.aci_classification",
         "rejected.http_status",
         "rejected.provider_error_type",
         "rejected.terminal_cause",
@@ -1936,6 +2007,8 @@ REHEARSAL_ONLY = {
         "rejected.transcript_preserved",
         "revalidated.replay_marker_seen",
         "revalidated.assistant_turns_positive",
+        "revalidated.committed_head_restored",
+        "revalidated.committed_files_restored",
     },
     "hosted-header": {
         "audit.captures_complete",
@@ -1957,6 +2030,7 @@ def judge_rehearsal(ledger: OwnerLedger) -> dict[str, Any]:
         raise Refusal("rehearsal_ledger", "--criterion rehearsal")
     criteria = []
     for name in CRITERIA:
+        source = ledger.evidence_source(name)
         if name == "budget":
             checks = [
                 _check("native_sessions", 0, {"native_sessions": len(ledger.sessions())}, None),
@@ -1970,7 +2044,7 @@ def judge_rehearsal(ledger: OwnerLedger) -> dict[str, Any]:
         elif name == "cleanup":
             checks = _judge_cleanup(ledger)
         else:
-            checks = _judge_observed(ledger, name)
+            checks = _judge_observed(source, name)
             for check in checks:
                 if check["key"] in REHEARSAL_ONLY.get(name, set()):
                     check["status"] = "rehearsal_only"
@@ -1985,7 +2059,15 @@ def judge_rehearsal(ledger: OwnerLedger) -> dict[str, Any]:
                     "reason": "fake turns cannot hold a quiescent native capture boundary",
                 }
             )
-        criteria.append({"criterion": name, "verdict": verdict_of(checks), "checks": checks})
+        criteria.append(
+            {
+                "criterion": name,
+                "verdict": verdict_of(checks),
+                "checks": checks,
+                "source_run_id": source.run_id,
+                "source_candidate": (source.run() or {}).get("candidate"),
+            }
+        )
     return {
         "run_id": ledger.run_id,
         "candidate": run["candidate"],
@@ -2012,13 +2094,22 @@ def judge(ledger: OwnerLedger, criterion: str) -> dict[str, Any]:
     names = CRITERIA if criterion == "all" else (criterion,)
     verdicts = []
     for name in names:
+        source = ledger.evidence_source(name)
         if name == "budget":
             checks = _judge_budget(ledger)
         elif name == "cleanup":
             checks = _judge_cleanup(ledger)
         else:
-            checks = _judge_observed(ledger, name)
-        verdicts.append({"criterion": name, "verdict": verdict_of(checks), "checks": checks})
+            checks = _judge_observed(source, name)
+        verdicts.append(
+            {
+                "criterion": name,
+                "verdict": verdict_of(checks),
+                "checks": checks,
+                "source_run_id": source.run_id,
+                "source_candidate": (source.run() or {}).get("candidate"),
+            }
+        )
     overall = verdict_of([{"status": item["verdict"]} for item in verdicts])
     return {
         "run_id": ledger.run_id,
