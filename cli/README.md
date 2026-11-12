@@ -375,8 +375,8 @@ runner wire). Local and cluster see only the delivered reply, so their
 `tool_calls` is null, meaning not observable rather than none. A trajectory
 eval on local/cluster runs on the platform eval plane and omits `trials`. The
 bundle under test is `bundle_digest` at the skill tier and `bundle_revision`
-(agent, in-force deployment, version, commit, bundle sha256) on the in-CLI
-local/cluster path. `bundle_revision` is read once before the first sample and
+(the agent bound to the exact Slack route the turns are sent on, its in-force
+deployment, version, commit, bundle sha256) on the in-CLI local/cluster path. `bundle_revision` is read once before the first sample and
 once after the last, and reported only when both agree: it is the revision in
 force at the start and at the end, unchanged, not proof that every sample ran
 on it. It is null when the reads disagree, when a lookup fails or exceeds its

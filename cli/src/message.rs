@@ -4053,19 +4053,69 @@ fn relay_trial(
     }
 }
 
-/// The bundle revision this eval is routed to: the agent bound to `channel`
-/// (or named by `agent`), its in-force deployment, and that deployment's
-/// version, read from the platform API.
+/// The agent the worker routes this eval's turns to: the one bound to the
+/// exact Slack route the turns are sent on, `("slack", channel, identity)`,
+/// where `identity` `None` is the installation's default identity (an omitted
+/// adapter or `default`). Matching the address alone is not enough: two agents
+/// may share one channel under different identities, and only one of them
+/// answers the turns this eval sends. When `agent` was named, the route must
+/// be that agent's. Zero or several agents on the route is an error, so the
+/// revision is reported as unknown rather than guessed.
+fn eval_route_agent_id(
+    agents: &[Agent],
+    agent: Option<&str>,
+    channel: &str,
+    identity: Option<&str>,
+) -> Result<String> {
+    let on_route: Vec<&Agent> = agents
+        .iter()
+        .filter(|a| {
+            a.channels.iter().any(|binding| {
+                binding.kind == "slack"
+                    && binding.address == channel
+                    && binding.named_adapter() == identity
+            })
+        })
+        .collect();
+    let route = match identity {
+        Some(identity) => format!("{channel} as {identity}"),
+        None => format!("{channel} as the default identity"),
+    };
+    match on_route.as_slice() {
+        [only] => match agent {
+            Some(named) if only.name != named && only.id != named => {
+                bail!(
+                    "the Slack route {route} is bound to {}, not {named}",
+                    only.name
+                )
+            }
+            _ => Ok(only.id.clone()),
+        },
+        [] => bail!("no agent is bound to the Slack route {route}"),
+        many => bail!(
+            "several agents are bound to the Slack route {route} ({})",
+            many.iter()
+                .map(|a| a.name.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+    }
+}
+
+/// The bundle revision this eval is routed to: the agent bound to the exact
+/// Slack route the turns are sent on, its in-force deployment, and that
+/// deployment's version, read from the platform API.
 async fn eval_route_revision(
     api: &ApiClient,
     agent: Option<&str>,
     channel: &str,
+    identity: Option<&str>,
 ) -> Result<Option<crate::commands::EvalBundleRevision>> {
     let agents = api
         .list_agents()
         .await
         .context("listing agents to resolve the evaluated bundle revision")?;
-    let agent_id = select_agent_id(&agents, agent, Some(channel))?;
+    let agent_id = eval_route_agent_id(&agents, agent, channel, identity)?;
     let deployments = api
         .list_deployments(&agent_id)
         .await
@@ -4094,6 +4144,7 @@ async fn eval_route_revision_or_warn(
     api: &ApiClient,
     agent: Option<&str>,
     channel: &str,
+    identity: Option<&str>,
     budget: Duration,
 ) -> Option<crate::commands::EvalBundleRevision> {
     let warn = |reason: String| {
@@ -4102,7 +4153,7 @@ async fn eval_route_revision_or_warn(
              {reason}"
         ));
     };
-    match tokio::time::timeout(budget, eval_route_revision(api, agent, channel)).await {
+    match tokio::time::timeout(budget, eval_route_revision(api, agent, channel, identity)).await {
         Ok(Ok(revision)) => revision,
         Ok(Err(err)) => {
             warn(format!("{err:#}"));
@@ -5284,6 +5335,7 @@ async fn eval_local(opts: EvalOpts, suite: EvalSuite) -> Result<()> {
         &api,
         opts.agent.as_deref(),
         &channel,
+        identity.as_deref(),
         EVAL_REVISION_LOOKUP_BUDGET,
     )
     .await;
@@ -5300,6 +5352,7 @@ async fn eval_local(opts: EvalOpts, suite: EvalSuite) -> Result<()> {
         &api,
         opts.agent.as_deref(),
         &channel,
+        identity.as_deref(),
         EVAL_REVISION_LOOKUP_BUDGET,
     )
     .await;
@@ -5422,6 +5475,7 @@ async fn eval_cluster(opts: EvalOpts, suite: EvalSuite) -> Result<()> {
         &api,
         opts.agent.as_deref(),
         &channel,
+        identity.as_deref(),
         EVAL_REVISION_LOOKUP_BUDGET,
     )
     .await;
@@ -5442,6 +5496,7 @@ async fn eval_cluster(opts: EvalOpts, suite: EvalSuite) -> Result<()> {
         &api,
         opts.agent.as_deref(),
         &channel,
+        identity.as_deref(),
         EVAL_REVISION_LOOKUP_BUDGET,
     )
     .await;
@@ -6046,6 +6101,63 @@ mod tests {
         );
     }
 
+    /// Review finding on #5553: two agents share one Slack address under
+    /// different identities. A channel-only eval speaks as the default
+    /// identity, so its revision must come from the default binding's agent
+    /// even when the named-identity agent is listed first; picking by address
+    /// alone reported the other agent's bundle.
+    #[test]
+    fn the_eval_revision_agent_is_the_one_bound_to_the_exact_route() {
+        let agents = [
+            agent_on("ops", &[("C0EXAMPLE1", Some("ops-bot"))]),
+            agent_on("sre-bot", &[("C0EXAMPLE1", Some("default"))]),
+        ];
+        let sre = &agents[1].id;
+        let ops = &agents[0].id;
+        // Channel only: the turn speaks as the default identity.
+        assert_eq!(
+            &eval_route_agent_id(&agents, None, "C0EXAMPLE1", None).unwrap(),
+            sre
+        );
+        // `--agent ops` resolves the named identity, which is what is sent.
+        assert_eq!(
+            &eval_route_agent_id(&agents, Some("ops"), "C0EXAMPLE1", Some("ops-bot")).unwrap(),
+            ops
+        );
+        // An omitted adapter is the default identity too.
+        let implicit = [
+            agent_on("ops", &[("C0EXAMPLE1", Some("ops-bot"))]),
+            agent_on("sre-bot", &[("C0EXAMPLE1", None)]),
+        ];
+        assert_eq!(
+            eval_route_agent_id(&implicit, None, "C0EXAMPLE1", None).unwrap(),
+            implicit[1].id
+        );
+    }
+
+    /// No binding, or more than one agent on the exact route, is an unknown
+    /// revision rather than a guess; a non-Slack binding on the same address
+    /// is a different route.
+    #[test]
+    fn the_eval_revision_agent_is_unknown_when_the_route_is_not_unique() {
+        let none = [agent_on("ops", &[("C0EXAMPLE1", Some("ops-bot"))])];
+        assert!(eval_route_agent_id(&none, None, "C0EXAMPLE1", None).is_err());
+        let twice = [
+            agent_on("a", &[("C0EXAMPLE1", None)]),
+            agent_on("b", &[("C0EXAMPLE1", Some("default"))]),
+        ];
+        assert!(eval_route_agent_id(&twice, None, "C0EXAMPLE1", None).is_err());
+        let mut other_kind = agent_on("mail", &[("C0EXAMPLE1", None)]);
+        other_kind.channels[0].kind = "email".into();
+        assert!(eval_route_agent_id(&[other_kind], None, "C0EXAMPLE1", None).is_err());
+        // A named agent that is not the route's agent is refused, not swapped.
+        let agents = [
+            agent_on("ops", &[("C0EXAMPLE1", Some("ops-bot"))]),
+            agent_on("sre-bot", &[("C0EXAMPLE1", None)]),
+        ];
+        assert!(eval_route_agent_id(&agents, Some("ops"), "C0EXAMPLE1", None).is_err());
+    }
+
     /// The revision lookup is best effort, so a platform API that accepts the
     /// connection and never answers must cost at most the budget, then degrade
     /// to an unknown revision. `ApiClient` has a connect timeout but no read
@@ -6059,7 +6171,7 @@ mod tests {
         let started = Instant::now();
         let revision = tokio::time::timeout(
             budget * 20,
-            eval_route_revision_or_warn(&api, None, "C0EXAMPLE1", budget),
+            eval_route_revision_or_warn(&api, None, "C0EXAMPLE1", None, budget),
         )
         .await
         .expect("nothing bounded the lookup against a stalled API");
