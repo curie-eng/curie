@@ -236,6 +236,7 @@ class GitHubTracker:
         self._token = token
         self.label = label
         self.mention = mention
+        self.app_id = app_id
         self._page_size = page_size
         self._comments = GitHubMarkedComments(
             client,

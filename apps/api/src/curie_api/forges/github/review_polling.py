@@ -75,6 +75,22 @@ def human_actor(event: dict[str, Any]) -> tuple[int, str] | None:
         return None
 
 
+def label_actor(event: dict[str, Any], *, app_id: str) -> tuple[int, str]:
+    """Read the canonical label actor; App provenance contributes no authority."""
+
+    actor = event.get("actor")
+    if isinstance(actor, dict) and actor.get("type") == "Bot":
+        raise FeedbackIgnored("actor_bot")
+    try:
+        sender = human_sender(actor)
+    except FeedbackIgnored:
+        raise FeedbackIgnored("actor_unverifiable") from None
+    via = event.get("performed_via_github_app")
+    if isinstance(via, dict) and str(via.get("id")) == app_id:
+        raise FeedbackIgnored("actor_own_app")
+    return sender
+
+
 async def open_pulls(
     sessionmaker: async_sessionmaker[AsyncSession], repository: RepositoryRef
 ) -> list[int]:

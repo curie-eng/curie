@@ -29,6 +29,7 @@ from curie_api.config import get_settings
 from curie_api.forges.github.identity import issue_lock_keys_for
 from curie_api.forges.hosts import github_issue_ref
 from curie_api.github_factory import (
+    _with_label_event,
     admit_notice,
     handle_factory_delivery,
     lock_issue,
@@ -42,6 +43,9 @@ from forge_fakes import factory_wake
 from forge_fakes.github import (
     INSTALLATION_ID,
     LABEL,
+    LABEL_ACTOR_PERMISSIONS,
+    LABEL_ACTOR_REFUSAL_IDS,
+    LABEL_ACTOR_REFUSALS,
     MENTION,
     REPO,
     REPO_ID,
@@ -173,6 +177,7 @@ def test_bad_signature_is_rejected_before_a_work_item_exists(
 
     assert response.status_code == 401, response.text
     assert _requests(number) == []
+    assert _rows("SELECT delivery_id FROM curie.github_review_deliveries") == []
 
 
 def _signed_webhook(client: TestClient, secret: str) -> httpx.Response:
@@ -209,6 +214,7 @@ def test_empty_webhook_secret_rejects_its_own_hmac(
         get_settings.cache_clear()
 
     assert response.status_code == 401, response.text
+    assert _rows("SELECT delivery_id FROM curie.github_review_deliveries") == []
 
 
 def test_configured_webhook_secret_accepts_a_valid_signature(
@@ -314,6 +320,7 @@ def test_ordinary_comment_and_app_sender_do_not_execute(
         "issue_comment",
         _comment_event(number, "thanks, looking later", 7001),
     )
+    api.label_actor = {"id": 4242, "login": "curie[bot]", "type": "Bot"}
     app = _post(
         client,
         "issues",
@@ -328,7 +335,7 @@ def test_ordinary_comment_and_app_sender_do_not_execute(
     assert ordinary.status_code == 200, ordinary.text
     assert _code(ordinary) == "ordinary_comment"
     assert app.status_code == 200, app.text
-    assert _code(app) == "app_authored"
+    assert _code(app) == "actor_bot"
     assert len(_requests(number)) == 1
 
 
@@ -515,9 +522,10 @@ def test_admission_retains_issue_lock_until_caller_commit(
                     session,
                     github_issue_ref(get_settings(), repository_id=REPO_ID, issue_number=number),
                 )
-                verified = await verify_current(notice, settings=get_settings(), client=github)
+                canonical = await _with_label_event(notice, settings=get_settings(), client=github)
+                verified = await verify_current(canonical, settings=get_settings(), client=github)
                 admitted = await admit_notice(
-                    session, notice, get_settings(), verified, client=github
+                    session, canonical, get_settings(), verified, client=github
                 )
                 assert admitted.status == "factory_admitted", admitted
                 assert not await observer.scalar(
@@ -948,3 +956,122 @@ def test_a_factory_fix_push_and_its_ci_events_start_no_execution_request(
     assert response.json()["status"] == "ignored"
     assert _rows("SELECT id FROM curie.execution_requests") == before
     assert len(_requests(number)) == 1
+
+
+# GitHub attributes user access tokens to the person:
+# https://docs.github.com/en/apps/creating-github-apps/authenticating-with-a-github-app/authenticating-on-behalf-of-a-user
+# Issue events expose performed_via_github_app independently of actor:
+# https://docs.github.com/en/rest/issues/events#list-issue-events
+# Recorded User-with-App shapes: #5510 event 35610976470 and #4485 on 2026-11-12.
+@pytest.mark.parametrize("app", [None, {"id": 52, "slug": "fixture-connector"}])
+def test_label_actor_admits_person_directly_or_through_app(
+    factory_app: tuple[TestClient, GitHubAPI], app: dict[str, Any] | None
+) -> None:
+    client, api = factory_app
+    api.label_app = app
+    number = next(_ISSUES)
+    payload = _issue_event("labeled", number, label={"name": LABEL})
+    assert _post(client, "issues", payload).json()["status"] == "factory_admitted"
+    assert _post(client, "issues", payload).json()["status"] == "factory_duplicate"
+    assert [r["requester"] for r in _requests(number)] == [f"github:{SENDER_ID}:{SENDER}"]
+
+
+@pytest.mark.parametrize("permission", LABEL_ACTOR_PERMISSIONS)
+def test_label_actor_permission(factory_app: tuple[TestClient, GitHubAPI], permission: str) -> None:
+    client, api = factory_app
+    api.label_app = {"id": 52}
+    api.permission = "write" if permission == "maintain" else permission
+    api.role_name = permission
+    admits = permission in {"write", "maintain", "admin"}
+    number = next(_ISSUES)
+    response = _post(client, "issues", _issue_event("labeled", number, label={"name": LABEL}))
+    assert response.status_code == 200
+    assert len(_requests(number)) == int(admits)
+    if not admits:
+        assert _code(response) == "sender_permission_refused"
+
+
+def test_label_actor_permission_retries_same_delivery(
+    factory_app: tuple[TestClient, GitHubAPI],
+) -> None:
+    client, api = factory_app
+    api.label_app = {"id": 52}
+    api.permission_status = 500
+    number, delivery = next(_ISSUES), str(uuid.uuid4())
+    payload = _issue_event("labeled", number, label={"name": LABEL})
+    assert _post(client, "issues", payload, delivery=delivery).status_code == 503
+    assert _requests(number) == []
+    api.permission_status = 200
+    assert (
+        _post(client, "issues", payload, delivery=delivery).json()["status"] == "factory_admitted"
+    )
+    assert len(_requests(number)) == 1
+
+
+@pytest.mark.parametrize("actor,app,reason", LABEL_ACTOR_REFUSALS, ids=LABEL_ACTOR_REFUSAL_IDS)
+def test_label_actor_own_app_bot_or_unverifiable(
+    factory_app: tuple[TestClient, GitHubAPI], actor: Any, app: dict[str, Any] | None, reason: str
+) -> None:
+    client, api = factory_app
+    api.label_actor, api.label_app = actor, app
+    number, delivery = next(_ISSUES), str(uuid.uuid4())
+    response = _post(
+        client, "issues", _issue_event("labeled", number, label={"name": LABEL}), delivery=delivery
+    )
+    assert _code(response) == reason
+    assert _requests(number) == []
+    assert api.permission_requests == []
+    assert _rows(
+        "SELECT reason FROM curie.github_review_deliveries WHERE delivery_id = :id",
+        {"id": uuid.UUID(delivery)},
+    ) == [{"reason": reason}]
+
+
+@pytest.mark.parametrize(
+    "sender", [_sender("User", "another-writer", 7707), _sender("Bot", "fixture[bot]", 42), None]
+)
+def test_label_actor_event_decides(factory_app: tuple[TestClient, GitHubAPI], sender: Any) -> None:
+    client, api = factory_app
+    api.label_app = {"id": 52}
+    number = next(_ISSUES)
+    payload = _issue_event("labeled", number, label={"name": LABEL})
+    payload["sender"] = sender
+    payload["issue"]["performed_via_github_app"] = {"id": 51}
+    response = _post(client, "issues", payload)
+    assert response.json()["status"] == "factory_admitted"
+    assert [r["requester"] for r in _requests(number)] == [f"github:{SENDER_ID}:{SENDER}"]
+    assert api.permission_requests[0].url.path.endswith(f"/collaborators/{SENDER}/permission")
+
+
+def test_label_actor_permission_identity_mismatch(
+    factory_app: tuple[TestClient, GitHubAPI],
+) -> None:
+    client, api = factory_app
+    api.label_app, api.permission_user_id = {"id": 52}, SENDER_ID + 1
+    number = next(_ISSUES)
+    payload = _issue_event("labeled", number, label={"name": LABEL})
+    response = _post(client, "issues", payload)
+    assert _code(response) == "sender_permission_identity_mismatch"
+    assert _requests(number) == []
+    api.permission_user_id = SENDER_ID
+    assert _post(client, "issues", payload).json()["status"] == "factory_admitted"
+
+
+@pytest.mark.parametrize("event_app,admits", [(51, True), (53, False)])
+def test_label_actor_own_app_uses_tracker_credential(
+    factory_app: tuple[TestClient, GitHubAPI],
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    event_app: int,
+    admits: bool,
+) -> None:
+    client, api = factory_app
+    for key, value in factory_env(tmp_path, app_id="53").items():
+        monkeypatch.setenv(key, value)
+    get_settings.cache_clear()
+    api.label_app = {"id": event_app}
+    number = next(_ISSUES)
+    response = _post(client, "issues", _issue_event("labeled", number, label={"name": LABEL}))
+    assert len(_requests(number)) == int(admits)
+    if not admits:
+        assert _code(response) == "actor_own_app"

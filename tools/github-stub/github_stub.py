@@ -337,7 +337,15 @@ class GithubStub:
             "updated_at": _utc(),
         }
 
-    def _label_event(self, number: int, label: str, event: str, actor: dict[str, Any]) -> None:
+    def _label_event(
+        self,
+        number: int,
+        label: str,
+        event: str,
+        actor: dict[str, Any],
+        *,
+        performed_via_github_app: dict[str, Any] | None = None,
+    ) -> None:
         identifier = max((row["id"] for row in self._rows("event")), default=0) + 1
         row = {
             "id": identifier,
@@ -347,8 +355,11 @@ class GithubStub:
             "actor": actor,
             "created_at": _utc(),
         }
-        if actor == BOT:
-            row["performed_via_github_app"] = {"id": 51}
+        row["performed_via_github_app"] = (
+            {"id": 51}
+            if actor == BOT and performed_via_github_app is None
+            else performed_via_github_app
+        )
         self._put("event", identifier, row)
 
     def _ref(self, branch: str) -> str:
