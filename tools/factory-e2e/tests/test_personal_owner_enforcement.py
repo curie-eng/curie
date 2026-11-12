@@ -1425,10 +1425,17 @@ def test_service_fallback_includes_unlabelled_claims_and_orphan_pods() -> None:
     owner = {"tenant": "acme", "principal": "owner"}
     personal = {"m": "personal", "t": "acme", "p": "owner"}
     assert (
-        poe.fallback_runtimes({"good": personal}, {"pod": "good"}, labels=keys, owner=owner) == []
+        poe.fallback_runtimes(
+            {"good": personal}, {"pod": "good"}, observed_claims={}, labels=keys, owner=owner
+        )
+        == []
     )
     assert poe.fallback_runtimes(
-        {"service": {}}, {"pod": "service", "orphan": "missing"}, labels=keys, owner=owner
+        {"service": {}},
+        {"pod": "service", "orphan": "missing"},
+        observed_claims={},
+        labels=keys,
+        owner=owner,
     ) == ["claim/service", "pod/orphan", "pod/pod"]
 
 
@@ -1585,3 +1592,21 @@ def test_live_grant_is_loaded_after_unpaid_setup_not_in_the_constructor(
     proof.grant = pps.HeldSecret("synthetic-unpaid-grant")
     proof.load_live_grant()
     assert opened == ["/private/acme-grant"] and proof.grant.reveal() == GRANT
+
+
+def test_a_terminating_pod_keeps_its_observed_personal_claim_provenance() -> None:
+    keys = {"mode": "m", "tenant": "t", "principal": "p"}
+    owner = {"tenant": "acme", "principal": "owner"}
+    seen = {"deleted": {"m": "personal", "t": "acme", "p": "owner"}}
+    assert (
+        poe.fallback_runtimes(
+            {}, {"terminating": "deleted"}, observed_claims=seen, labels=keys, owner=owner
+        )
+        == []
+    )
+    assert poe.fallback_runtimes(
+        {}, {"unknown": "unseen"}, observed_claims=seen, labels=keys, owner=owner
+    ) == ["pod/unknown"]
+    assert poe.fallback_runtimes(
+        {"deleted": {}}, {"pod": "deleted"}, observed_claims=seen, labels=keys, owner=owner
+    ) == ["claim/deleted", "pod/pod"]

@@ -951,6 +951,7 @@ def owner_proof_class(e: Any) -> type[Any]:  # noqa: C901 - one scenario, one cl
             self.reserved_at: dict[int, float] = {}
             self.tracks: list[Track] = []
             self.pod_states: dict[str, dict[str, Any]] = {}
+            self.observed_claims: dict[str, dict[str, str]] = {}
             self.pvs: set[str] = set()
             self.foreign_before: dict[str, str] = {}
             self.live_deadline: float | None = None
@@ -2107,6 +2108,18 @@ def owner_proof_class(e: Any) -> type[Any]:  # noqa: C901 - one scenario, one cl
             states: dict[str, dict[str, Any]] = {}
             live: set[str] = set()
             listed: set[str] = set()
+            self.observed_claims.update(
+                {
+                    item["metadata"]["name"]: item["metadata"].get("labels", {})
+                    for item in self.custom.list_namespaced_custom_object(
+                        cluster.GROUP,
+                        cluster.VERSION,
+                        self.namespace,
+                        "sandboxclaims",
+                        _request_timeout=20,
+                    ).get("items", [])
+                }
+            )
             pods = self.runner_pods()
             self.sync_runner_forwards(pods)
             for pod in pods:
@@ -3354,6 +3367,7 @@ def owner_proof_class(e: Any) -> type[Any]:  # noqa: C901 - one scenario, one cl
                     .get(e.ADMISSION_LABEL, "")
                     for p in self.runner_pods()
                 },
+                observed_claims=self.observed_claims,
                 labels={
                     "mode": types.MODEL_AUTH_MODE_LABEL,
                     "tenant": types.OWNER_TENANT_LABEL,

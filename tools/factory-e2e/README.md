@@ -491,7 +491,9 @@ missing observation, 2 a refusal, and 3 a run whose only shortfall is a
 recorded Not met. A rehearsal ledger supports `--criterion cleanup` and `--criterion rehearsal`.
 The latter retains every reading and marks provider rejection, native tool calls,
 and the native response cap as `rehearsal_only`; it never treats them as live proof.
-Product and cleanup failures still fail that judge.
+A fake turn can finish and delete its Pod before log capture, so missing
+captures remain visible as `rehearsal_only`. The live confidentiality judge
+still requires complete captures. Product and cleanup failures fail the rehearsal judge.
 
 ### What rehearse covers
 

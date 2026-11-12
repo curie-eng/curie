@@ -1465,6 +1465,7 @@ def fallback_runtimes(
     claims: Mapping[str, Mapping[str, str]],
     pods: Mapping[str, str],
     *,
+    observed_claims: Mapping[str, Mapping[str, str]],
     labels: Mapping[str, str],
     owner: Mapping[str, str],
 ) -> list[str]:
@@ -1474,7 +1475,9 @@ def fallback_runtimes(
     the claim it serves. ``labels`` names the mode, tenant and principal label
     keys and ``owner`` their values. A service claim carries no mode label at
     all, so anything short of the owner's personal labels counts, and a Pod
-    whose claim was never seen counts too.
+    whose claim was never seen counts too. A deleted claim's previously
+    observed labels remain evidence for a Pod still terminating after it.
+    Current labels always override that earlier observation.
     """
 
     def personal(claim_labels: Mapping[str, str]) -> bool:
@@ -1486,7 +1489,7 @@ def fallback_runtimes(
     found += [
         f"pod/{name}"
         for name, claim in sorted(pods.items())
-        if claim not in claims or not personal(claims[claim])
+        if not personal(claims[claim] if claim in claims else observed_claims.get(claim, {}))
     ]
     return found
 
@@ -1816,6 +1819,7 @@ REHEARSAL_ONLY = {
         "revalidated.assistant_turns_positive",
     },
     "hosted-header": {
+        "audit.captures_complete",
         "sentinel.challenge_returned",
         "sentinel.authorized_calls_positive",
         "sentinel.unauthorized_calls",
@@ -1852,6 +1856,16 @@ def judge_rehearsal(ledger: OwnerLedger) -> dict[str, Any]:
                 if check["key"] in REHEARSAL_ONLY.get(name, set()):
                     check["status"] = "rehearsal_only"
                     check["reason"] = "requires the native provider; fake-model reading retained"
+        if name == "hosted-header":
+            checks.append(
+                {
+                    "key": "audit.pod_captures_missing",
+                    "expected": 0,
+                    "observed": ledger.observations(name).get("audit.pod_captures_missing"),
+                    "status": "rehearsal_only",
+                    "reason": "fake turns cannot hold a quiescent native capture boundary",
+                }
+            )
         criteria.append({"criterion": name, "verdict": verdict_of(checks), "checks": checks})
     return {
         "run_id": ledger.run_id,
@@ -1902,11 +1916,15 @@ def verdict_of(checks: Iterable[Mapping[str, Any]]) -> str:
         return "fail" if "fail" in statuses else "missing"
     if any(status == "not_met" for status in statuses):
         return "not_met"
+    if any(status == "rehearsal_only" for status in statuses):
+        return "rehearsal_only"
     return "pass"
 
 
 def exit_code(verdict: str) -> int:
-    return {"pass": EXIT_PASS, "not_met": EXIT_NOT_MET}.get(verdict, EXIT_FAIL)
+    return {"pass": EXIT_PASS, "rehearsal_only": EXIT_PASS, "not_met": EXIT_NOT_MET}.get(
+        verdict, EXIT_FAIL
+    )
 
 
 # --------------------------------------------------------------------------
