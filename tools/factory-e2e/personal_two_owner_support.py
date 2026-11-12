@@ -1281,6 +1281,8 @@ GATE_DIR = "/tmp/pto-gate"
 GATE_FILE = "two_owner_gate.py"
 GATE_LIMITS_FILE = "limits.json"
 GATE_MODES = ("prompt", "response", "stop", "subagent-stop")
+#: Holds after a session's last response: releasing one asks the model for nothing more.
+FINAL_MODES = frozenset({"stop", "subagent-stop"})
 GATE_HEARTBEAT_SECONDS = 5
 #: Hook events the gate is merged into: event, matcher, mode.
 GATE_EVENTS: tuple[tuple[str, str | None, str], ...] = (
@@ -1619,16 +1621,25 @@ def gate_decision(
     aggregate_spent: int | None,
     session_started_at: float | None,
     now: float,
+    final: bool,
 ) -> tuple[str, str]:
     """``("go", "")`` or ``("stop", reason)`` for one hold. Pure.
 
     ``session_usage`` is the session's usage read to the hold's reported
     transcript size; ``owner_spent`` and ``aggregate_spent`` (the latter with
-    prior spend) include this session's live usage. A share or turn share
-    already reached stops; so does any next response (RESPONSE_OUTPUT_TOKENS)
-    that could cross the per-session cap, the owner allocation, or the
-    aggregate guard with one response in flight per owner, and the session's
-    seconds. Unknown usage stops.
+    prior spend) include this session's live usage. ``session_started_at``
+    and ``now`` are readings of one monotonic clock: the session's clock
+    starts at the first observation of its native process and never stops.
+    Unknown usage stops.
+
+    Every approved ceiling is inclusive: usage equal to a ceiling is within
+    it, usage above it is a breach. A ``final`` hold (Stop or SubagentStop)
+    asks for no further response, so it passes at a ceiling and stops above
+    one. Any other hold precedes one more response, so it stops once the
+    share, a turn limit or the session's seconds are reached (the next
+    response would cross them), and when one more response
+    (RESPONSE_OUTPUT_TOKENS) could cross the per-session cap, the owner
+    allocation, or the aggregate guard with one response in flight per owner.
     """
 
     if session_usage is None or type(owner_spent) is not int or type(aggregate_spent) is not int:
@@ -1638,13 +1649,29 @@ def gate_decision(
     tokens, turns = session_usage.output_tokens, session_usage.assistant_turns
     if type(tokens) is not int or type(turns) is not int or tokens < 0 or turns < 0:
         return "stop", "usage_unknown"
+    elapsed = now - float(session_started_at)
+    seconds = min(float(reservation.seconds), float(SESSION_SECONDS))
+    if final:
+        if tokens > reservation.output_tokens:
+            return "stop", "session_share"
+        if tokens > SESSION_OUTPUT_TOKENS:
+            return "stop", "session_output_tokens"
+        if turns > reservation.turns or turns > SESSION_TURNS:
+            return "stop", "session_turns"
+        if elapsed > seconds:
+            return "stop", "session_seconds"
+        if owner_spent > OWNER_OUTPUT_TOKENS:
+            return "stop", "owner_allocation"
+        if aggregate_spent > MAX_OUTPUT_TOKENS:
+            return "stop", "aggregate_guard"
+        return "go", ""
     if tokens >= reservation.output_tokens:
         return "stop", "session_share"
     if tokens + RESPONSE_OUTPUT_TOKENS > SESSION_OUTPUT_TOKENS:
         return "stop", "session_output_tokens"
     if turns >= reservation.turns or turns >= SESSION_TURNS:
         return "stop", "session_turns"
-    if now - float(session_started_at) >= min(float(reservation.seconds), float(SESSION_SECONDS)):
+    if elapsed >= seconds:
         return "stop", "session_seconds"
     if owner_spent + RESPONSE_OUTPUT_TOKENS > OWNER_OUTPUT_TOKENS:
         return "stop", "owner_allocation"
@@ -2627,6 +2654,8 @@ EXPECTED: dict[str, dict[str, str]] = {
         "card_residue_recorded": "external approval-card residue was recorded, not claimed removed",
         "forge_removal_guarded": "every forge object removed was confirmed created and still "
         "at this run's recorded head",
+        "cleanup_within_window": "every cleanup step, from the fence that opens finalize to the "
+        "last inventory, finished within 600 s of one cleanup clock",
     },
 }
 #: Numeric observations: (operator, bound). Every other key must be exactly True.
@@ -3174,34 +3203,57 @@ def ci_ack_present(content: bytes, branch: str) -> bool:
     return bool(branch) and expected in [line.strip() for line in lines]
 
 
-def elapsed_reading(
-    session: pps.SessionFacts | None, sessions: Sequence[pps.SessionFacts], now: float
-) -> float:
-    """A session's elapsed seconds as the ledger settles them, read while it may run. Pure.
+def runner_started_at(pod: Any) -> float | None:
+    """The runner container's current start (``state.running.startedAt``) as epoch seconds. Pure.
 
-    ``pps.allowance_breaches``'s rule: the parsed elapsed (nested subagent
-    time excluded), plus the time since the last record when this session
-    wrote the pod's latest record, since it may still be running.
+    None when the pod reports no running runner container or an unreadable time.
+    """
+
+    status = pod.get("status") if isinstance(pod, Mapping) else None
+    statuses = status.get("containerStatuses") if isinstance(status, Mapping) else None
+    for item in statuses if isinstance(statuses, list) else []:
+        if isinstance(item, Mapping) and item.get("name") == pps.RUNNER_CONTAINER:
+            state = item.get("state")
+            running = state.get("running") if isinstance(state, Mapping) else None
+            if not isinstance(running, Mapping):
+                return None
+            return pps.iso_epoch(running.get("startedAt")) or None
+    return None
+
+
+def native_clock_start(*, monotonic: float, wall: float, container_started: float | None) -> float:
+    """Where a native runtime's clock starts on the driver's monotonic clock. Pure.
+
+    ``monotonic`` and ``wall`` are read together at the first observation; a
+    readable, earlier runner container start moves the start back by the
+    container's age. A container start after the observation moves nothing.
+    """
+
+    if container_started is None:
+        return monotonic
+    return monotonic - max(0.0, wall - container_started)
+
+
+def hold_usage(
+    session: pps.SessionFacts | None, *, initial_prompt: bool
+) -> pps.SessionUsage | None:
+    """A session's usage at a hold, or None when it is unknown. Pure.
+
+    Zero is a reading only at a session's initial prompt hold, before its
+    first model request: no session parsed yet, or one with no assistant
+    record. At any other hold (a later prompt, a response, a Stop or a
+    SubagentStop) the session must be parsed with at least one assistant
+    record and known usage. A cut record, a synthetic record or an API error
+    leaves usage unknown: the failed request may have spent what the
+    transcript does not show.
     """
 
     if session is None:
-        return 0.0
-    latest = max((item.last for item in sessions if item.last is not None), default=None)
-    reading = float(session.elapsed)
-    if latest is not None and session.last == latest:
-        reading += max(0.0, now - latest)
-    return reading
-
-
-def hold_usage(session: pps.SessionFacts | None) -> pps.SessionUsage | None:
-    """A session's usage at a hold: zero before its first response, None when unknown. Pure."""
-
-    if session is None:
-        return pps.SessionUsage(0, 0, 0.0, "")
-    if session.truncated:
+        return pps.SessionUsage(0, 0, 0.0, "") if initial_prompt else None
+    if session.truncated or session.synthetic or session.errors:
         return None
-    if session.assistant_turns == 0 and session.synthetic == 0:
-        return pps.SessionUsage(0, 0, round(session.elapsed, 3), "")
+    if session.assistant_turns == 0:
+        return pps.SessionUsage(0, 0, round(session.elapsed, 3), "") if initial_prompt else None
     return session.usage()
 
 

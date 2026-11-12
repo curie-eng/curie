@@ -52,6 +52,7 @@ from two_owner_shared import (
     PATH_ONLY,
     PRINCIPAL_A,
     PRINCIPAL_B,
+    REFUSED_CLASS,
     REGISTRY,
     RELEASE,
     REPO_ROOT,
@@ -68,6 +69,7 @@ from two_owner_shared import (
     _inputs_file,
     _kit,
     _private,
+    _refused_record,
     _registry,
     _setup_document,
 )
@@ -1428,6 +1430,10 @@ class _Live(pt.TwoOwnerRun):
     def record_summary_keys(self) -> None:
         self.trace.append("summary")
 
+    def start_watchdog(self) -> None:
+        # Tests drive the watchdog's pass (watchdog_tick) on the fake clock.
+        self.trace.append("watchdog-start")
+
 
 def _live(tmp_path: Path, *, begin: bool = True) -> _Harness:
     h = _harness(tmp_path, rehearsal=False, cls=_Live)
@@ -1634,8 +1640,67 @@ def test_a_failed_admission_settles_its_reservations_and_fences(
     assert _trace(h).count("fence") == 1
 
 
-def test_reservation_precedes_the_worker_scale_up(tmp_path: Path) -> None:
+def _approve_b1_setup(h: _Harness) -> list[tuple[str, str, int, bool]]:
+    """B1 parked at its card and A quiescent; ``resolve_card`` records what was reserved."""
+
+    _through(h, "b-r1")
+    first = _pod_run(h, "b1", card=3, reserve=False)
+    first.request_id, first.work_item_id = REQUEST_B1, WORK_ITEM_B
+    first.conversation_id = "issue-12"
+    _pod_run(h, "a2", card=2, reserve=False).work_item_id = WORK_ITEM
+    h.run.owner_claims = lambda _owner: []  # type: ignore[method-assign]
+    h.run.request_rows = lambda _item: [{"status": "completed"}]  # type: ignore[method-assign]
+    resolved: list[tuple[str, str, int, bool]] = []
+
+    def resolve(run: pt.PodRun, decision: Any) -> None:
+        reserved = len(h.ledger.reservations_of("b-r1"))
+        resolved.append((run.group, str(decision), reserved, h.run.early_watch is not None))
+
+    h.run.resolve_card = resolve  # type: ignore[method-assign]
+    published = {
+        "head": HEAD_B1,
+        "pr": 7,
+        "succeeded": True,
+        "branch_from_api": True,
+        "pr_ready": True,
+        "tree": True,
+    }
+    h.run.published_facts = lambda _run, full: dict(published)  # type: ignore[method-assign]
+    return resolved
+
+
+def test_b_r1_is_reserved_before_b1s_card_is_resolved(tmp_path: Path) -> None:
     h = _live(tmp_path)
+    _through(h, "a3")
+    resolved = _approve_b1_setup(h)
+    h.run.phase_approve_b1()
+    # Production may start the repair once the card is resolved: B-r1 is persisted first.
+    assert resolved == [("b1", "approved", 1, True)]
+    held = h.run.pod_run("b-r1")
+    assert held.policy == pt.KEEP_PROMPT and h.run.early_watch is held
+    assert (held.request_id, held.work_item_id) == (REQUEST_B1, WORK_ITEM_B)
+    assert held.conversation_id == "issue-12"
+    assert h.ledger.observations("publication")["b1_publication_succeeded"] is True
+    # Manifest order: A3 is reserved after B-r1 and charges it, still open, at its share.
+    follow = h.run.new_run("a3", policy=pt.KEEP_AFTER_TOOL)
+    h.run.reserve(follow)
+    assert held.reservations[0].seq < follow.reservations[0].seq
+    assert {row["source"] for row in _rows(h, "b-r1")} == {"reserved"}
+
+
+def test_b1s_card_is_not_resolved_when_b_r1_cannot_be_reserved(tmp_path: Path) -> None:
+    h = _live(tmp_path)
+    resolved = _approve_b1_setup(h)
+    # An unknown session anywhere blocks every further reservation.
+    seq = h.ledger.reserve_group("a-probe", now=T0)[0].seq
+    h.ledger.settle(seq, None, source="unknown")
+    with pytest.raises(pps.Refusal) as refused:
+        h.run.phase_approve_b1()
+    assert refused.value.code == "usage_unknown"
+    assert resolved == [] and h.ledger.reservations_of("b-r1") == []
+
+
+def _worker_start_setup(h: _Harness) -> list[int]:
     _through(h, "b-r1")
     first = _pod_run(h, "b1", card=3, reserve=False)
     first.request_id, first.work_item_id = REQUEST_B1, WORK_ITEM_B
@@ -1650,26 +1715,120 @@ def test_reservation_precedes_the_worker_scale_up(tmp_path: Path) -> None:
     worker = _pod("worker-2", "worker", "curie-worker", DIGESTS["curie-worker"], uid="uid-w2")
     h.run.worker_pods = lambda pods=None: [worker]  # type: ignore[method-assign]
     h.run.observe_worker = lambda pods=None: ("uid-w2", True)  # type: ignore[method-assign]
+    return seen
+
+
+def test_the_worker_start_scales_up_on_the_reservation_made_at_the_approval(
+    tmp_path: Path,
+) -> None:
+    h = _live(tmp_path)
+    seen = _worker_start_setup(h)
+    h.run.reserve(h.run.new_run("b-r1", policy=pt.KEEP_PROMPT))
     h.run.phase_worker_start()
-    assert seen == [1]
+    # The scale-up reserves nothing more: B-r1 holds the one group approve-b1 reserved.
+    assert seen == [1] and len(h.ledger.reservations_of("b-r1")) == 1
     restarts = h.ledger.observations("restarts")
     assert restarts["worker_fresh_runtime"] is True
     assert restarts["worker_candidate_image"] is True
     assert h.run.worker_name == "worker-2"
 
 
-def test_the_worker_is_not_scaled_up_when_b_r1_cannot_be_reserved(tmp_path: Path) -> None:
+@pytest.mark.parametrize("cause", ["unreserved", "paid_failure"])
+def test_the_worker_is_not_scaled_up_without_b_r1_or_after_a_paid_failure(
+    tmp_path: Path, cause: str
+) -> None:
+    h = _live(tmp_path)
+    seen = _worker_start_setup(h)
+    if cause == "paid_failure":
+        h.run.reserve(h.run.new_run("b-r1", policy=pt.KEEP_PROMPT))
+        h.run.paid_failure = "a2: the gate stopped a session (session_share)"
+    message = "not reserved before" if cause == "unreserved" else "session_share"
+    with pytest.raises(pp.StepFailed, match=message):
+        h.run.phase_worker_start()
+    assert seen == [] and not [argv for argv in h.shell.kubectl() if "scale" in argv]
+    assert len(h.ledger.reservations_of("b-r1")) == (0 if cause == "unreserved" else 1)
+
+
+@pytest.mark.parametrize(
+    ("stopped_at", "kept"),
+    [(None, False), (T0 + 1, False), (T0 - 1, True)],
+    ids=["stop-unobserved", "hold-before-the-stop", "hold-after-the-stop"],
+)
+def test_a_b_r1_hold_before_the_worker_stop_fails_the_scenario_order(
+    tmp_path: Path, stopped_at: float | None, kept: bool
+) -> None:
     h = _live(tmp_path)
     _through(h, "b-r1")
-    first = _pod_run(h, "b1", card=3, reserve=False)
-    first.request_id, first.work_item_id = REQUEST_B1, WORK_ITEM_B
-    # An unknown session anywhere blocks every further reservation.
-    seq = h.ledger.reserve_group("a-probe", now=T0)[0].seq
-    h.ledger.settle(seq, None, source="unknown")
-    with pytest.raises(pps.Refusal) as refused:
-        h.run.phase_worker_start()
-    assert refused.value.code == "usage_unknown"
-    assert not [argv for argv in h.shell.kubectl() if "scale" in argv]
+    run = _pod_run(h, "b-r1", policy=pt.KEEP_PROMPT)
+    h.run.worker_stopped_at = stopped_at
+    _feed(run, {})
+    _gate(run).queue.append(_hold("prompt", 1, written=T0))
+    if kept:
+        # Control: a hold written after the observed stop is the planned start, kept.
+        h.run.pump()
+        assert run.kept is not None and "fence" not in _trace(h)
+        assert {row["source"] for row in _rows(h, "b-r1")} == {"reserved"}
+        return
+    with pytest.raises(pp.StepFailed, match="scenario_order"):
+        h.run.pump()
+    # Counted against B-r1's reservation, released nowhere, charged at its share.
+    assert run.sessions == {MAIN.removesuffix(".jsonl"): run.reservations[0].seq}
+    assert _gate(run).sent == [] and run.kept is None and "prompt-1-1" in run.ignored
+    assert {row["source"] for row in _rows(h, "b-r1")} == {"unknown"}
+    violations = h.ledger.observations("budget")["gate_violations"]
+    assert "b-r1:implementer:scenario_order" in violations
+    deletes = _pod_deletes(h, "pod-b-r1")
+    assert len(deletes) == 1 and "--grace-period=0" in deletes[0]
+    assert "fence" in _trace(h)
+
+
+def _runner_cluster(h: _Harness, group: str, *, started: str) -> None:
+    """One bound SandboxClaim of ``group``'s owner and its Running runner pod (kubectl JSON)."""
+
+    principal = PRINCIPAL_A if pto.GROUPS[group].owner == "a" else PRINCIPAL_B
+    labels = {pp.CLAIM_AGENT_LABEL: h.run.agent, pt.OWNER_PRINCIPAL_LABEL: principal}
+    claim = {
+        "metadata": {"name": f"claim-{group}", "labels": labels},
+        "status": {"sandbox": {"name": f"sandbox-{group}"}},
+    }
+    pod = _pod(f"pod-{group}", pps.RUNNER_CONTAINER, "curie-runner", DIGESTS["curie-runner"])
+    pod["status"]["containerStatuses"][0]["state"] = {"running": {"startedAt": started}}
+    h.shell.on("get", pp.CLAIM_RESOURCE, "-l")(lambda _argv, _stdin: {"items": [claim]})
+    h.shell.on("get", "pods", "-l")(lambda _argv, _stdin: {"items": [pod]})
+
+
+def test_an_early_b_r1_pod_is_adopted_while_the_worker_stop_is_unobserved(
+    tmp_path: Path,
+) -> None:
+    h = _live(tmp_path)
+    _through(h, "b-r1")
+    held = h.run.new_run("b-r1", policy=pt.KEEP_PROMPT)
+    h.run.reserve(held)
+    h.run.early_watch, h.run.early_checked = held, float("-inf")
+    _runner_cluster(h, "b-r1", started=_stamp(0))
+    adopted: list[pt.PodRun] = []
+
+    def begin(run: pt.PodRun) -> None:
+        adopted.append(run)
+        h.run.pods.append(run)
+
+    h.run.begin_pod_run = begin  # type: ignore[method-assign]
+    h.run.pump()
+    assert adopted == [held] and held.pod == "pod-b-r1" and held.claim == "claim-b-r1"
+    assert held.clock_started == h.clock.monotonic()
+    lookups = len([argv for argv in h.shell.kubectl() if pp.CLAIM_RESOURCE in argv])
+    h.run.pump()  # an adopted run is not looked for again
+    assert len([argv for argv in h.shell.kubectl() if pp.CLAIM_RESOURCE in argv]) == lookups
+
+
+def test_pod_run_finds_a_reserved_run_before_its_pod(tmp_path: Path) -> None:
+    h = _live(tmp_path)
+    _through(h, "b-r1")
+    held = h.run.new_run("b-r1", policy=pt.KEEP_PROMPT)
+    h.run.reserve(held)
+    assert h.run.pod_run("b-r1") is held
+    with pytest.raises(pp.StepFailed, match="a3 has no runner"):
+        h.run.pod_run("a3")
 
 
 def _interruption_setup(h: _Harness, *, prompt_only: bool = True) -> pt.PodRun:
@@ -2029,8 +2188,11 @@ def test_a_hold_the_capture_does_not_cover_stops(tmp_path: Path) -> None:
     _gate(run).queue.append(_hold("response", 2, size=len(files[MAIN]) + 50, tool="Bash"))
     with pytest.raises(pp.StepFailed, match="capture_incomplete"):
         h.run.pump()
-    assert _gate(run).sent[-1] == {"release": "response-2-2", "verdict": "stop"}
+    # The stopped hold is kept, never answered: the pod is deleted while it holds.
+    assert _gate(run).sent == [{"release": "response-1-1", "verdict": "go"}]
+    assert "response-2-2" in run.ignored
     assert "a1:-:capture_incomplete" in h.ledger.observations("budget")["gate_violations"]
+    assert {row["source"] for row in _rows(h, "a1")} == {"unknown"}
     assert "fence" in _trace(h)
 
 
@@ -2050,9 +2212,11 @@ def test_a_stop_verdict_at_a_hold_interrupts_and_fences(tmp_path: Path) -> None:
     _gate(run).queue.append(_hold("response", 2, size=len(over[MAIN]), tool="Bash"))
     with pytest.raises(pp.StepFailed, match="session_share"):
         h.run.pump()
-    assert _gate(run).sent[-1] == {"release": "response-2-2", "verdict": "stop"}
+    # No stop verdict is sent: the CLI would answer a blocked call with a model request.
+    assert _gate(run).sent == [{"release": "response-1-1", "verdict": "go"}]
+    assert "response-2-2" in run.ignored
     deletes = [argv for argv in h.shell.kubectl() if "delete" in argv and "pod-a1" in argv]
-    assert deletes and "--grace-period=0" in deletes[0]
+    assert len(deletes) == 1 and "--grace-period=0" in deletes[0]
     budget = h.ledger.observations("budget")
     assert budget["allowance_breach"] == ["a1:implementer:session_share"]
     assert budget["no_allowance_breach"] is False
@@ -2060,27 +2224,46 @@ def test_a_stop_verdict_at_a_hold_interrupts_and_fences(tmp_path: Path) -> None:
     assert "fence" in _trace(h)
 
 
+def _pod_deletes(h: _Harness, pod: str) -> list[list[str]]:
+    return [argv for argv in h.shell.kubectl() if "delete" in argv and pod in argv]
+
+
 def test_the_session_deadline_fires_on_the_fake_clock(tmp_path: Path) -> None:
     h = _live(tmp_path)
     _through(h, "a1")
     run = _pod_run(h, "a1", card=1)
-    _feed(run, {MAIN: _jsonl([_prompt(0), _reply("m1", 10, 10, [])])})
-    h.clock.current = T0 + 10
+    _feed(run, {})
+    # The initial prompt hold, before any transcript exists, starts the native clock.
+    _gate(run).queue.append(_hold("prompt", 1))
     h.run.pump()
-    h.clock.current = T0 + pto.SESSION_SECONDS - 1
+    assert _gate(run).sent == [{"release": "prompt-1-1", "verdict": "go"}]
+    assert run.clock_started == h.clock.monotonic()
+    h.clock.wait(200)
+    # The transcript's own records begin 200 s after the process was first seen.
+    files = {MAIN: _jsonl([_prompt(200), _reply("m1", 205, 10, [_tool("t1")])])}
+    _feed(run, files, at=h.clock.now())
+    hold = _hold("response", 2, size=len(files[MAIN]), tool="Bash", written=h.clock.now())
+    _gate(run).queue.append(hold)
+    h.run.pump()
+    assert _gate(run).sent[-1] == {"release": "response-2-2", "verdict": "go"}
+    h.clock.wait(pto.SESSION_SECONDS - 200 - 1)
     h.run.pump()  # control: one second before the deadline nothing stops
     assert "fence" not in _trace(h)
-    h.clock.current = T0 + pto.SESSION_SECONDS
+    h.clock.wait(1)
     with pytest.raises(pp.StepFailed, match="session_seconds"):
         h.run.pump()
-    assert h.ledger.observations("budget")["allowance_breach"] == ["a1:implementer:session_seconds"]
-    assert any("delete" in argv and "pod-a1" in argv for argv in h.shell.kubectl())
+    assert h.ledger.observations("budget")["allowance_breach"] == ["a1:-:session_seconds"]
+    deletes = _pod_deletes(h, "pod-a1")
+    assert len(deletes) == 1 and "--grace-period=0" in deletes[0]
+    assert {row["source"] for row in _rows(h, "a1")} == {"unknown"}
+    assert "fence" in _trace(h)
 
 
 def test_a_kept_hold_is_stopped_before_the_hook_gives_up(tmp_path: Path) -> None:
     h = _live(tmp_path)
     _through(h, "b-r1")
     run = _pod_run(h, "b-r1", policy=pt.KEEP_PROMPT)
+    h.run.worker_stopped_at = T0 - 1
     files = {MAIN: _jsonl([_prompt()])}
     _feed(run, files)
     _gate(run).queue.append(_hold("prompt", 1, size=len(files[MAIN])))
@@ -2115,6 +2298,213 @@ def test_an_unmapped_session_fences(tmp_path: Path) -> None:
     assert "fence" in _trace(h)
 
 
+def test_an_initial_prompt_hold_before_any_transcript_is_released(tmp_path: Path) -> None:
+    h = _live(tmp_path)
+    _through(h, "a1")
+    run = _pod_run(h, "a1", card=1)
+    _feed(run, {})
+    # Written before the session's first model request: its transcript has no size yet.
+    _gate(run).queue.append(_hold("prompt", 1))
+    h.run.pump()
+    assert _gate(run).sent == [{"release": "prompt-1-1", "verdict": "go"}]
+    assert run.sessions == {MAIN.removesuffix(".jsonl"): run.reservations[0].seq}
+    assert "fence" not in _trace(h)
+
+
+@pytest.mark.parametrize(
+    ("mode", "reported", "reason"),
+    [
+        ("response", None, "capture_incomplete"),
+        ("stop", None, "capture_incomplete"),
+        ("response", "prompt-only", "usage_unknown"),
+        ("subagent-stop", "absent", "usage_unknown"),
+        ("prompt", "prompt-only", "usage_unknown"),
+    ],
+    ids=[
+        "response-without-a-size",
+        "stop-without-a-size",
+        "response-without-an-assistant-record",
+        "subagent-stop-without-its-transcript",
+        "later-prompt-without-an-assistant-record",
+    ],
+)
+def test_missing_usage_evidence_after_the_initial_prompt_is_unknown(
+    tmp_path: Path, mode: str, reported: str | None, reason: str
+) -> None:
+    h = _live(tmp_path)
+    _through(h, "a1")
+    run = _pod_run(h, "a1", card=1)
+    files = {MAIN: _jsonl([_prompt()])}
+    _feed(run, files)
+    # Control: the session's initial prompt hold reads zero and is released.
+    _gate(run).queue.append(_hold("prompt", 1, size=len(files[MAIN])))
+    h.run.pump()
+    assert _gate(run).sent == [{"release": "prompt-1-1", "verdict": "go"}]
+    hold = _hold(mode, 2, size=None if reported is None else len(files[MAIN]))
+    if reported == "absent":
+        # A plan reviewer (its kind named by the main session's Agent call) holds at its
+        # SubagentStop, naming a transcript the harvest has never received.
+        run.agent_roles["r1"] = pto.PLAN_REVIEWER
+        hold["hold"]["agent_id"] = "r1"
+        hold["hold"]["agent_transcript_path"] = f"/tmp/{PROJECT}/session-1/subagents/agent-r1.jsonl"
+        hold["hold"]["agent_transcript_size"] = 0
+    _gate(run).queue.append(hold)
+    with pytest.raises(pp.StepFailed, match=reason):
+        h.run.pump()
+    # Unknown usage: the hold is kept unanswered and every open share is charged.
+    assert _gate(run).sent == [{"release": "prompt-1-1", "verdict": "go"}]
+    assert f"{mode}-2-2" in run.ignored
+    assert {row["source"] for row in _rows(h, "a1")} == {"unknown"}
+    assert len(_pod_deletes(h, "pod-a1")) == 1 and "fence" in _trace(h)
+
+
+def test_a_native_error_after_usage_stops_the_session_and_keeps_its_class(
+    tmp_path: Path,
+) -> None:
+    h = _live(tmp_path)
+    _through(h, "a1")
+    run = _pod_run(h, "a1", card=1)
+    records = [_prompt(), _reply("m1", 1, 120, [_tool("t1")])]
+    files = {MAIN: _jsonl(records)}
+    _feed(run, files)
+    # Control: the response before the error is released.
+    _gate(run).queue.append(_hold("response", 1, size=len(files[MAIN]), tool="Bash"))
+    h.run.pump()
+    assert _gate(run).sent == [{"release": "response-1-1", "verdict": "go"}]
+    records += [_result("t1", 2), _refused_record(_stamp(3))]
+    files = {MAIN: _jsonl(records)}
+    _feed(run, files)
+    _gate(run).queue.append(_hold("stop", 2, size=len(files[MAIN])))
+    with pytest.raises(pp.StepFailed, match="native_error"):
+        h.run.pump()
+    assert _gate(run).sent == [{"release": "response-1-1", "verdict": "go"}]
+    classes = h.ledger.observations("budget")["zero_usage_sessions"]
+    assert {"group": "a1", "role": pto.IMPLEMENTER, "class": REFUSED_CLASS} in classes
+    violations = h.ledger.observations("budget")["gate_violations"]
+    assert "a1:implementer:native_error" in violations
+    assert {row["source"] for row in _rows(h, "a1")} == {"unknown"}
+    assert len(_pod_deletes(h, "pod-a1")) == 1 and "fence" in _trace(h)
+    # Charged at its share, the error unlocks no other start.
+    with pytest.raises(pps.Refusal) as refused:
+        h.ledger.reserve_group("b-probe", now=h.clock.now())
+    assert refused.value.code == "usage_unknown"
+
+
+# -- the watchdog ---------------------------------------------------------------
+
+
+def test_a_runner_pod_with_no_parsed_session_is_stopped_by_its_pod_clock(
+    tmp_path: Path,
+) -> None:
+    h = _live(tmp_path)
+    _through(h, "a1")
+    run = _pod_run(h, "a1", card=1)
+    run.pod = run.pod_uid = ""
+    # The runner container started 20 s before the driver found its pod.
+    _runner_cluster(h, "a1", started=_stamp(-20))
+    assert h.run.find_runner_pod(run)
+    assert run.clock_started == h.clock.monotonic() - 20
+    h.clock.wait(pto.SESSION_SECONDS - 20 - 1)
+    h.run.pump()  # control: no gate event and no transcript, one second inside the limit
+    assert "fence" not in _trace(h)
+    h.clock.wait(1)
+    with pytest.raises(pp.StepFailed, match="session_seconds"):
+        h.run.pump()
+    deletes = _pod_deletes(h, "pod-a1")
+    assert len(deletes) == 1 and "--grace-period=0" in deletes[0]
+    assert {row["source"] for row in _rows(h, "a1")} == {"unknown"}
+
+
+def test_the_watchdog_stops_paid_work_while_the_main_thread_is_blocked(tmp_path: Path) -> None:
+    h = _live(tmp_path)
+    _through(h, "a1")
+    run = _pod_run(h, "a1", card=1)
+    h.run.observe_start(run, h.clock.monotonic())
+    h.clock.wait(pto.SESSION_SECONDS)
+    # One watchdog pass, as its thread runs it: nothing on the main thread pumps.
+    h.run.watchdog_tick()
+    assert h.run.paid_failure == "a1: the watchdog stopped paid work (session_seconds)"
+    assert len(_pod_deletes(h, "pod-a1")) == 1
+    assert {row["source"] for row in _rows(h, "a1")} == {"unknown"}
+    assert h.ledger.observations("diagnostics")["watchdog_trips"] == ["a1:-:session_seconds"]
+    assert _trace(h).count("fence") == 1
+    # The main thread then fails at its next step and answers no hold.
+    _gate(run).queue.append(_hold("response", 1, size=0, tool="Bash"))
+    with pytest.raises(pp.StepFailed, match="watchdog stopped paid work"):
+        h.run.pump()
+    with pytest.raises(pp.StepFailed, match="watchdog stopped paid work"):
+        h.run.release(run, "response-1-1")
+    assert _gate(run).sent == []
+    with pytest.raises(pp.StepFailed, match="watchdog stopped paid work"):
+        h.run.reserve(h.run.new_run("b-probe"))
+
+
+def test_the_live_window_end_fences_paid_work(tmp_path: Path) -> None:
+    h = _live(tmp_path)
+    _through(h, "a1")
+    run = _pod_run(h, "a1", card=1)
+    h.clock.current = T0 + pto.LIVE_SECONDS - 1
+    h.run.watchdog_tick()
+    assert h.run.paid_failure is None and "fence" not in _trace(h)
+    h.clock.current = T0 + pto.LIVE_SECONDS
+    h.run.watchdog_tick()
+    assert h.run.paid_failure == "live: the watchdog stopped paid work (live_window)"
+    assert _trace(h).count("fence") == 1
+    assert h.ledger.observations("budget")["allowance_breach"] == ["live:-:live_window"]
+    assert {row["source"] for row in _rows(h, "a1")} == {"unknown"}
+    # The fence ends every runner; no further reservation or release follows.
+    assert run.stopped is False and _pod_deletes(h, "pod-a1") == []
+    with pytest.raises(pp.StepFailed, match="live_window"):
+        h.run.reserve(h.run.new_run("b-probe"))
+
+
+def test_a_watchdog_stop_and_a_main_thread_stop_delete_and_charge_once(tmp_path: Path) -> None:
+    h = _live(tmp_path)
+    _through(h, "a1")
+    run = _pod_run(h, "a1", card=1)
+    h.run.observe_start(run, h.clock.monotonic())
+    h.clock.wait(pto.SESSION_SECONDS)
+    h.run.watchdog_tick()
+    spent = h.ledger.owner_spent("a")
+    # The main thread meets the same run on its own stop path, then in its teardown.
+    with pytest.raises(pp.StepFailed, match="gate_hold_expired"):
+        h.run.stop_session(run, "gate_hold_expired")
+    h.run.watchdog_tick()
+    h.run.pod_uid_present = lambda _name, _uid: True  # type: ignore[method-assign]
+    with pytest.raises(pp.StepFailed, match="watchdog stopped paid work"):
+        h.run.remove_pod(run)
+    assert len(_pod_deletes(h, "pod-a1")) == 1
+    assert h.ledger.owner_spent("a") == spent
+    assert h.run.paid_failure == "a1: the watchdog stopped paid work (session_seconds)"
+    assert h.ledger.observations("diagnostics")["watchdog_trips"] == ["a1:-:session_seconds"]
+
+
+def test_a_run_idle_after_its_final_stop_is_not_stopped_by_its_clock(tmp_path: Path) -> None:
+    h = _live(tmp_path)
+    _through(h, "a1")
+    run = _pod_run(h, "a1", card=1)
+    files = {MAIN: _jsonl([_prompt(), _reply("m1", 1, 30, [])])}
+    _feed(run, files)
+    _gate(run).queue.append(_hold("stop", 1, size=len(files[MAIN])))
+    h.run.pump()
+    assert _gate(run).sent == [{"release": "stop-1-1", "verdict": "go"}] and run.idle
+    # The CLI ended after its final response: it asks the model for nothing more.
+    h.clock.wait(pto.SESSION_SECONDS + 100)
+    h.run.pump()
+    assert h.run.paid_failure is None and "fence" not in _trace(h)
+    assert _pod_deletes(h, "pod-a1") == []
+
+
+def test_the_watchdog_thread_starts_and_stops_without_sleeping(tmp_path: Path) -> None:
+    h = _live(tmp_path)
+    pt.TwoOwnerRun.start_watchdog(h.run)
+    thread = h.run.watch_thread
+    assert thread is not None and thread.daemon and thread.is_alive()
+    h.run.stop_watchdog()
+    assert not thread.is_alive()
+    assert h.run.paid_failure is None and h.run.watch_ledger is None
+
+
 # -- settlement -----------------------------------------------------------------
 
 
@@ -2134,6 +2524,25 @@ def test_unknown_usage_is_charged_and_fences(tmp_path: Path) -> None:
     with pytest.raises(pps.Refusal) as refused:
         h.ledger.reserve_group("b-probe", now=h.clock.now())
     assert refused.value.code == "usage_unknown"
+
+
+def test_an_errored_session_settles_unknown_with_its_class(tmp_path: Path) -> None:
+    h = _live(tmp_path)
+    _through(h, "a1")
+    run = _pod_run(h, "a1", card=1)
+    records = [_prompt(), _reply("m1", 1, 30, []), _refused_record(_stamp(2))]
+    _feed(run, {MAIN: _jsonl(records)})
+    facts = h.run.pod_facts(run)
+    assert facts.sessions[0].usage_known and facts.sessions[0].errors
+    with pytest.raises(pp.StepFailed, match="usage unknown or unmapped"):
+        h.run.settle_run(run, facts=facts, complete=True)
+    # The 30 visible tokens are not the charge: the failed request may have spent more.
+    implementer = next(row for row in _rows(h, "a1") if row["role"] == pto.IMPLEMENTER)
+    assert implementer["source"] == "unknown" and implementer["output_tokens"] is None
+    classes = h.ledger.observations("budget")["zero_usage_sessions"]
+    assert {"group": "a1", "role": pto.IMPLEMENTER, "class": REFUSED_CLASS} in classes
+    assert "a1:implementer:native_error" in h.run.violations
+    assert "fence" in _trace(h)
 
 
 def test_complete_capture_settles_known_usage(tmp_path: Path) -> None:
@@ -2202,6 +2611,8 @@ def test_a_passing_probe_settles_with_source_probe(tmp_path: Path) -> None:
     h = _live(tmp_path, begin=False)
     _probe_answer(h, {})
     h.run.phase_probe_a()
+    # The watchdog keeps every clock from the first paid start on.
+    assert _trace(h).count("watchdog-start") == 1
     budget = h.ledger.observations("budget")
     assert budget["probe_a_ok"] is True and budget["probe_isolated_a"] is True
     assert budget["allowance_breach"] == []
@@ -2238,7 +2649,7 @@ def _disconnect_setup(h: _Harness, breaks: Mapping[str, Any]) -> None:
     files = {MAIN: _jsonl(records)}
     _feed(follow, files)
     follow.kept = _hold("response", 3, size=len(files[MAIN]), tool="Bash")["hold"]
-    follow.kept_at = h.clock.now()
+    follow.kept_at = h.clock.monotonic()
     follow.kept_files, follow.kept_facts = files, h.run.pod_facts(follow, files)
     follow.eof.set()
     disconnect = {
@@ -2492,3 +2903,91 @@ def test_summary_keys_read_the_gathered_evidence(tmp_path: Path) -> None:
     assert budget["no_credential_fallback"] is False
     # Cards 2 to 4 never parked here.
     assert h.ledger.observations("approval")["no_push_before_approval"] is False
+
+
+@pytest.mark.parametrize(
+    ("extra", "within"),
+    [((0, 0, 0.0), True), ((1, 0, 0.0), False), ((0, 1, 0.0), False), ((0, 0, 1.0), False)],
+    ids=["at-every-ceiling", "one-token-over", "one-turn-over", "one-second-over"],
+)
+def test_the_allowance_check_is_inclusive_at_each_ceiling(
+    tmp_path: Path, extra: tuple[int, int, float], within: bool
+) -> None:
+    h = _live(tmp_path)
+    _through(h, "a1")
+    run = _pod_run(h, "a1", card=1)
+    implementer = run.reservations[0]
+    tokens, turns, seconds = extra
+    usage = pps.SessionUsage(
+        implementer.output_tokens + tokens,
+        implementer.turns + turns,
+        implementer.seconds + seconds,
+        pps.IMPLEMENTER_MODEL,
+    )
+    h.ledger.settle(implementer.seq, usage, source="native")
+    pt.TwoOwnerRun.record_summary_keys(h.run)
+    assert h.ledger.observations("budget")["no_allowance_breach"] is within
+
+
+# -- finalize: the fence first, one cleanup clock ---------------------------------
+
+
+def _teardown(h: _Harness, monkeypatch: pytest.MonkeyPatch, seconds: float) -> None:
+    """The inherited teardown (finalizer, inventory, leak scan) as one traced step."""
+
+    def finalize(_run: pp.LiveRun) -> bool:
+        _trace(h).append("teardown")
+        h.clock.wait(seconds)
+        return True
+
+    monkeypatch.setattr(pp.LiveRun, "finalize", finalize)
+
+
+def test_finalize_fences_before_it_charges_or_observes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    h = _live(tmp_path)
+    _through(h, "a1")
+    run = _pod_run(h, "a1", card=1)
+    h.run.mutated = True
+    fenced: list[set[str]] = []
+
+    def fence() -> None:
+        _trace(h).append("fence")
+        fenced.append({row["source"] for row in _rows(h, "a1")})
+
+    h.run.fence_paid_starts = fence  # type: ignore[method-assign]
+    _teardown(h, monkeypatch, 5.0)
+    assert h.run.finalize() is True
+    # Runner execution and grant delivery stop before any charge or observation.
+    assert _trace(h) == ["fence", "summary", "teardown"]
+    assert fenced == [{"reserved"}]
+    assert {row["source"] for row in _rows(h, "a1")} == {"unknown"}
+    assert _gate(run).closed and run.closed and h.run.watch_stop.is_set()
+
+
+@pytest.mark.parametrize(
+    ("fence_seconds", "within"),
+    [(pto.CLEANUP_SECONDS - 5.0, True), (pto.CLEANUP_SECONDS - 4.0, False)],
+    ids=["at-the-window", "one-second-past"],
+)
+def test_cleanup_past_its_window_is_recorded_and_the_teardown_still_runs(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, fence_seconds: float, within: bool
+) -> None:
+    h = _live(tmp_path)
+    h.run.mutated = True
+
+    def fence() -> None:
+        _trace(h).append("fence")
+        h.clock.wait(fence_seconds)
+
+    h.run.fence_paid_starts = fence  # type: ignore[method-assign]
+    _teardown(h, monkeypatch, 5.0)
+    assert h.run.finalize() is True
+    # The cleanup clock starts before the fence; every later step still runs.
+    assert _trace(h) == ["fence", "summary", "teardown"]
+    elapsed = h.ledger.observations("budget")["cleanup_elapsed"]
+    assert elapsed == pto.CLEANUP_SECONDS + (0 if within else 1)
+    cleanup = h.ledger.observations("cleanup")
+    assert cleanup["cleanup_within_window"] is within
+    assert cleanup["card_residue_recorded"] is True

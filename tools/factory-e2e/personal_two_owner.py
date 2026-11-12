@@ -159,6 +159,12 @@ COVERAGE_SECONDS = 30.0
 KEPT_MARGIN_SECONDS = 15.0
 #: How long the gate stream may take to acknowledge a pod's subagent limits.
 LIMITS_ACK_SECONDS = 60.0
+#: How often the watchdog thread reads every clock.
+WATCHDOG_SECONDS = 1.0
+#: How long finalize waits for the watchdog thread to finish its last pass.
+WATCHDOG_JOIN_SECONDS = 300.0
+#: How often a wait looks for a B-r1 runner pod before the worker stop is observed.
+EARLY_WATCH_SECONDS = 10.0
 #: How long a parked pod may take to report a terminal harvest, end its stream or vanish.
 SETTLE_SECONDS = 120.0
 QUIESCENT_SECONDS = 300.0
@@ -183,8 +189,9 @@ THREAD_QUERY = (
     "ELSE '[]'::jsonb END) AS e) AS record_ids FROM curie.thread_transcripts "
     "WHERE agent_id = :'agent'::uuid AND binding_scope IS NULL"
 )
-#: The gate decision reasons that are allowance breaches (every other stop is a
-#: gate violation: an unreadable hold, unmapped session or incomplete capture).
+#: The stop reasons that are allowance breaches (every other stop is a gate
+#: violation: an unreadable hold, unknown usage, a native error, an unmapped
+#: session, an incomplete capture or a scenario-order start).
 ALLOWANCE_REASONS = frozenset(
     {
         "session_share",
@@ -193,6 +200,7 @@ ALLOWANCE_REASONS = frozenset(
         "session_seconds",
         "owner_allocation",
         "aggregate_guard",
+        "live_window",
     }
 )
 _REQUEST_COLUMNS = (
@@ -454,12 +462,25 @@ class PodRun(pp.Attempt):
     to the reservation seq it was mapped to at its first hold. ``baseline``
     holds the transcripts an earlier group in the same container left; a file
     that still starts with them is read past them.
+
+    ``clock_started`` is where the run's native clock starts on the driver's
+    monotonic clock: the first observation of its native process (the runner
+    container's start when readable, else the pod's discovery or its first
+    gate event). Subagents run inside that process, so every session of the
+    run shares it, and it never stops. ``kept_at`` is on the same clock.
+    ``idle`` is true between the release of the main session's final Stop
+    hold and the next hold: the CLI asks the model for nothing in between.
+    ``stopped`` is true once the driver ended the native runtime itself (a
+    pod deletion or the process interruption); no clock acts on it again.
     """
 
     owner: str = ""
     group: str = ""
     card: int = 0
     policy: str = RELEASE
+    clock_started: float | None = None
+    idle: bool = False
+    stopped: bool = False
     work_item_id: str = ""
     admission_key: str = ""
     conversation_id: str = ""
@@ -1156,6 +1177,23 @@ class TwoOwnerRun(pp.LiveRun):
         self.worker_name = ""
         self.default_branch = ""
         self.claims_after_b2: set[str] = set()
+        # -- stops, the watchdog and the scenario order ----------------------
+        # Serializes the watchdog thread with the main thread's stop, charge and
+        # fence paths, so a pod is deleted and a share charged once.
+        self.guard = threading.RLock()
+        # The first paid failure (a gate stop, a watchdog trip, a failed check);
+        # once set, nothing releases a hold, reserves, admits or scales up again.
+        self.paid_failure: str | None = None
+        self.deleted_uids: set[str] = set()
+        self.watch_stop = threading.Event()
+        self.watch_thread: threading.Thread | None = None
+        self.watch_ledger: pto.TwoOwnerLedger | None = None
+        self.watch_trips: list[str] = []
+        # B-r1 is reserved before B1's card is resolved; until the worker stop is
+        # observed (wall time), a runner pod for it is a scenario-order start.
+        self.early_watch: PodRun | None = None
+        self.early_checked = float("-inf")
+        self.worker_stopped_at: float | None = None
 
     def __repr__(self) -> str:
         return "<two-owner run>"
@@ -1247,28 +1285,38 @@ class TwoOwnerRun(pp.LiveRun):
         return [run for run in self.pods if not run.closed]
 
     def pod_run(self, group: str) -> PodRun:
-        for run in self.pods:
-            if run.group == group:
+        """The group's run: begun on a runner pod, or reserved and waiting for one."""
+
+        for run in [*self.pods, *self.attempts.values()]:
+            if isinstance(run, PodRun) and run.group == group:
                 return run
         raise StepFailed(f"{group} has no runner")
 
     def pump(self) -> None:
-        """Serve every open gate: apply its events, then check its clocks."""
+        """Serve every open gate and its limits, then run the watchdog's clocks once.
 
+        After any paid failure it raises before touching a gate, so no hold is
+        released once paid work was stopped.
+        """
+
+        self.check_paid()
         if self.pumping:
             return
         self.pumping = True
         try:
+            self.watch_early_start()
             for run in self.active_pods():
                 self.pump_pod(run)
         finally:
             self.pumping = False
+        self.watchdog_tick()
+        self.check_paid()
 
     def pump_pod(self, run: PodRun) -> None:
         if run.gate is not None:
             for event in run.gate.events():
                 self.gate_event(run, event)
-        self.check_clock(run)
+        self.check_limits_ack(run)
 
     def gate_event(self, run: PodRun, event: Mapping[str, Any]) -> None:
         if "hold" in event:
@@ -1308,7 +1356,11 @@ class TwoOwnerRun(pp.LiveRun):
         The harvest must have read every transcript the hold names to the
         reported size; the session's usage, the owner's spend and the
         aggregate (settled plus every open session's live usage) then go to
-        ``pto.gate_decision``. A stop interrupts the runner and fences.
+        ``pto.gate_decision`` with the run's native clock. Zero usage is a
+        reading only at the session's initial prompt hold; anywhere else a
+        missing, unreadable or incomplete transcript is unknown usage, and a
+        synthetic or API-error record is a native error. A stop keeps the
+        hold, deletes the runner pod, charges every open share and fences.
         """
 
         key = str(record.get("key") or "")
@@ -1322,6 +1374,8 @@ class TwoOwnerRun(pp.LiveRun):
             # A hold file the interrupted process left behind: never released.
             run.ignored.add(key)
             return
+        run.idle = False
+        self.observe_start(run, self.clock.monotonic())
         if cli is None:
             self.stop_session(run, "native_process_unknown", record=record)
         if cli not in run.clis:
@@ -1331,18 +1385,24 @@ class TwoOwnerRun(pp.LiveRun):
             if not run.limits_acked:
                 run.deferred.append(dict(record))
                 return
-        if not self.await_coverage(run, record):
+        initial = self.initial_prompt(run, record)
+        if not self.await_coverage(run, record, allow_missing=initial):
             self.stop_session(run, "capture_incomplete", record=record)
         files = self.pod_files(run)
         facts = self.pod_facts(run, files)
         stem, role, session = self.session_of(run, record, facts)
-        usage = pto.hold_usage(session)
+        usage = pto.hold_usage(session, initial_prompt=initial)
         reservation = self.map_session(run, stem, role, usage)
-        now = self.clock.now()
+        if session is not None and (session.synthetic or session.errors):
+            self.classify_error(run, session)
+            self.stop_session(run, "native_error", record=record, role=role)
+        if run.group == "b-r1" and not self.after_worker_stop(record):
+            # Production started the repair before the worker stop was observed.
+            self.stop_session(run, "scenario_order", record=record, role=role)
+        now = self.clock.monotonic()
         live = self.live_usage()
         if usage is not None:
             live[reservation.seq] = usage.output_tokens
-        reading = pto.elapsed_reading(session, facts.sessions, now)
         verdict, reason = pto.gate_decision(
             session_usage=usage,
             reservation=reservation,
@@ -1352,23 +1412,56 @@ class TwoOwnerRun(pp.LiveRun):
             aggregate_spent=(
                 self.owner_ledger.aggregate_spent(live=live) if usage is not None else None
             ),
-            session_started_at=now - reading,
+            session_started_at=run.clock_started,
             now=now,
+            final=mode in pto.FINAL_MODES,
         )
         if verdict != "go":
             self.stop_session(run, reason, record=record, role=role)
         if self.keeps(run, record, files):
             run.kept_keys.add(key)
             if run.kept is None:
-                run.kept, run.kept_at = dict(record), now
-                run.kept_files, run.kept_facts = files, facts
+                # The watchdog reads kept_at once kept is set, so kept goes last.
+                run.kept_at, run.kept_files, run.kept_facts = now, files, facts
+                run.kept = dict(record)
             return
         if mode == "response" and record.get("tool_name") in pps.AGENT_TOOLS:
             kind = record.get("subagent_kind")
             if kind in ROLE_OF_KIND:
                 run.pending_kinds.append(str(kind))
-        self.release(run, key, "go")
+        self.release(run, key)
         self.releases += 1
+        if mode == "stop" and not record.get("agent_id"):
+            # The main session's final response: its CLI ends without asking again.
+            run.idle = True
+
+    def initial_prompt(self, run: PodRun, record: Mapping[str, Any]) -> bool:
+        """The main session's first prompt hold in this run: before any model request."""
+
+        if record.get("mode") != "prompt" or record.get("agent_id"):
+            return False
+        main = pto.hold_relpath(record.get("transcript_path"))
+        return main is not None and main.removesuffix(".jsonl") not in run.sessions
+
+    def after_worker_stop(self, record: Mapping[str, Any]) -> bool:
+        """The hold was written after the driver observed the worker stop (wall clock)."""
+
+        stopped, written = self.worker_stopped_at, record.get("written_at")
+        return (
+            stopped is not None
+            and isinstance(written, (int, float))
+            and not isinstance(written, bool)
+            and float(written) >= stopped
+        )
+
+    def classify_error(self, run: PodRun, session: pps.SessionFacts) -> None:
+        """A native error seen at a hold keeps its sanitized class (budget key)."""
+
+        summary = pps.session_summary(session)
+        self.zero_classes.append(
+            {"group": run.group, "role": session.role, "class": pto.zero_usage_class(summary)}
+        )
+        self.ledger.record("budget", "zero_usage_sessions", self.zero_classes)
 
     def keeps(self, run: PodRun, record: Mapping[str, Any], files: Mapping[str, bytes]) -> bool:
         """Whether this hold is one the scenario keeps on purpose (B-r1's prompt, A3's next)."""
@@ -1386,15 +1479,25 @@ class TwoOwnerRun(pp.LiveRun):
             return any(not call["subagent"] and call["result"] for call in calls)
         return False
 
-    def release(self, run: PodRun, key: str, verdict: str) -> None:
-        if run.gate is None:
-            raise StepFailed(f"{run.group} has no gate stream")
-        run.gate.send({"release": key, "verdict": verdict})
-        if verdict == "go":
+    def release(self, run: PodRun, key: str) -> None:
+        """Answer one hold ``go``; never once paid work was stopped. A stop keeps the hold."""
+
+        with self.guard:
+            self.check_paid()
+            if run.gate is None:
+                raise StepFailed(f"{run.group} has no gate stream")
+            run.gate.send({"release": key, "verdict": "go"})
             run.released.add(key)
 
-    def await_coverage(self, run: PodRun, record: Mapping[str, Any]) -> bool:
-        """Wait until the harvest synced after the hold and holds every reported byte."""
+    def await_coverage(
+        self, run: PodRun, record: Mapping[str, Any], *, allow_missing: bool
+    ) -> bool:
+        """Wait until the harvest synced after the hold and holds every reported byte.
+
+        A reported transcript must carry its size. Only the initial prompt hold
+        (``allow_missing``), written before the session's first model request,
+        may name a transcript that does not exist yet.
+        """
 
         wanted: list[tuple[str, int]] = []
         for path_key, size_key in (
@@ -1408,7 +1511,9 @@ class TwoOwnerRun(pp.LiveRun):
             if rel is None:
                 return False
             if size is None:
-                continue
+                if allow_missing:
+                    continue
+                return False
             if type(size) is not int or size < 0:
                 return False
             wanted.append((rel, size))
@@ -1538,31 +1643,176 @@ class TwoOwnerRun(pp.LiveRun):
                     live[seq] = session.output_tokens
         return live
 
-    def check_clock(self, run: PodRun) -> None:
-        """The session deadline and kept-hold limits, on a timer from harvest data."""
+    def check_limits_ack(self, run: PodRun) -> None:
+        """A pod whose subagent limits were never acknowledged stops before any prompt release."""
 
-        if run.closed or run.harvest is None:
+        if run.closed or run.settled or run.ending:
             return
         now = self.clock.now()
-        expired = now - run.kept_at >= pto.HOLD_SECONDS - KEPT_MARGIN_SECONDS
-        if run.kept is not None and not run.eof.is_set() and expired:
-            # The hook would fail the held call closed and the model would answer it.
-            self.stop_session(run, "kept_hold_expired")
-        if run.settled or run.ending:
-            return
         if run.deferred and run.limits_sent_at and now - run.limits_sent_at > LIMITS_ACK_SECONDS:
             self.stop_session(run, "gate_limits_unacknowledged")
-        facts = self.pod_facts(run)
-        by_seq = {item.seq: item for item in run.reservations}
-        for session in facts.sessions:
-            seq = run.sessions.get(session.path)
-            limit = float(pto.SESSION_SECONDS)
-            if seq is not None:
-                limit = min(limit, float(by_seq[seq].seconds))
-            if pto.elapsed_reading(session, facts.sessions, now) >= limit:
-                self.stop_session(run, "session_seconds", role=session.role)
+
+    # -- the watchdog: native clocks, kept holds and the live window ----------------
+
+    def observe_start(self, run: PodRun, at: float) -> None:
+        """Start the run's native clock at ``at`` (monotonic) unless it started earlier."""
+
+        if run.clock_started is None or at < run.clock_started:
+            run.clock_started = at
+
+    def runner_clock_start(self, pod: Mapping[str, Any]) -> float:
+        """Where a runner pod's native clock starts, read now (pto.native_clock_start)."""
+
+        return pto.native_clock_start(
+            monotonic=self.clock.monotonic(),
+            wall=self.clock.now(),
+            container_started=pto.runner_started_at(pod),
+        )
+
+    @staticmethod
+    def session_limit(run: PodRun) -> float:
+        """The run's session seconds: 300, or less where one of its reservations holds less."""
+
+        return min(
+            [float(pto.SESSION_SECONDS), *(float(item.seconds) for item in run.reservations)]
+        )
+
+    def clock_breach(self, run: PodRun, now: float) -> str:
+        """The clock ``run`` has reached at ``now`` (monotonic), or "".
+
+        A kept hold stops KEPT_MARGIN_SECONDS before its hook gives up: the
+        hook would fail the held call closed and the model would answer it.
+        The native clock stops a run at its session limit while its native
+        process may still ask the model for more, whether or not any session
+        was parsed. It does not act on a run the driver closed or stopped
+        itself, on one idle after its final Stop release, or on one the driver
+        settled and is ending on purpose (that run's kept hold is still timed).
+        """
+
+        if run.closed or run.stopped:
+            return ""
+        held = now - run.kept_at >= pto.HOLD_SECONDS - KEPT_MARGIN_SECONDS
+        if run.kept is not None and not run.eof.is_set() and held:
+            return "kept_hold_expired"
+        if run.clock_started is None or run.idle or (run.ending and run.settled):
+            return ""
+        if now - run.clock_started >= self.session_limit(run):
+            return "session_seconds"
+        return ""
+
+    def watchdog_tick(self) -> None:
+        """One pass over every clock; the first one reached stops paid work.
+
+        The watchdog thread runs it every WATCHDOG_SECONDS and every pump runs
+        it on the main thread; ``guard`` serializes it with the main thread's
+        stop paths. A run at its session or kept-hold limit is interrupted (its
+        pod deleted while the hook still holds), every open share is charged
+        and paid starts are fenced. The live window's end fences paid starts
+        the same way, even while the main thread is blocked in a call. The
+        main thread fails at its next check (``check_paid``).
+        """
+
+        with self.guard:
+            if self.paid_failure is not None or self.watch_stop.is_set():
+                return
+            now = self.clock.monotonic()
+            for run in list(self.pods):
+                reason = self.clock_breach(run, now)
+                if reason:
+                    self.trip(run, reason)
+                    return
+            row = self.book().run_row()
+            started, ended = row["live_started_at"], row["live_ended_at"]
+            if (
+                started is not None
+                and ended is None
+                and self.clock.now() >= float(started) + pto.LIVE_SECONDS
+            ):
+                self.trip(None, "live_window")
+
+    def trip(self, run: PodRun | None, reason: str) -> None:
+        """The watchdog's stop: interrupt the run, charge every open share, fence, fail."""
+
+        where = run.group if run is not None else "live"
+        entry = f"{where}:-:{reason}"
+        with self.guard:
+            self.paid_failure = f"{where}: the watchdog stopped paid work ({reason})"
+            self.watch_trips.append(entry)
+            book = self.book()
+            trips = sorted(set(self.watch_trips))
+            self.safe(lambda: book.record("diagnostics", "watchdog_trips", trips), None)
+            self.safe(lambda: self.note_stop(entry, reason), None)
+            if run is not None:
+                self.safe(functools.partial(self.interrupt_runner, run), None)
+            self.safe(self.charge_open, None)
+            self.safe(self.fence_paid_starts, None)
+
+    def check_paid(self) -> None:
+        """Raise once paid work was stopped: nothing releases, reserves or scales up after."""
+
+        if self.paid_failure is not None:
+            raise StepFailed(self.paid_failure + "; paid work fenced")
+
+    def book(self) -> pto.TwoOwnerLedger:
+        """The calling thread's ledger connection (an SQLite connection serves one thread)."""
+
+        ledger = self.watch_ledger
+        if ledger is not None and threading.current_thread() is self.watch_thread:
+            return ledger
+        return self.owner_ledger
+
+    def start_watchdog(self) -> None:
+        """Start the daemon thread that keeps every clock while the main thread is busy."""
+
+        if self.watch_thread is not None:
+            return
+        self.watch_thread = threading.Thread(target=self.watch, name="pto-watchdog", daemon=True)
+        self.watch_thread.start()
+
+    def watch(self) -> None:
+        """The watchdog thread: its own ledger connection and one tick per interval."""
+
+        ledger: pto.TwoOwnerLedger | None = None
+        try:
+            ledger = pto.TwoOwnerLedger.open(
+                self.inputs.state_dir, self.inputs.run_id, scrubber=self.scrubber
+            )
+            self.watch_ledger = ledger
+            while not self.watch_stop.wait(WATCHDOG_SECONDS):
+                self.watchdog_tick()
+        except Exception:  # noqa: BLE001 - a watchdog that cannot keep its clocks fails closed
+            with self.guard:
+                if self.paid_failure is None:
+                    self.paid_failure = "the watchdog could not keep the clocks"
+                    self.safe(self.fence_paid_starts, None)
+        finally:
+            self.watch_ledger = None
+            if ledger is not None:
+                ledger.close()
+
+    def stop_watchdog(self) -> None:
+        """Stop the watchdog thread and wait for its last pass."""
+
+        self.watch_stop.set()
+        thread = self.watch_thread
+        if thread is not None and thread is not threading.current_thread():
+            thread.join(timeout=WATCHDOG_JOIN_SECONDS)
 
     # -- stopping, fencing and charging -------------------------------------------
+
+    def note_stop(self, entry: str, reason: str) -> None:
+        """Record one stop as an allowance breach or a gate violation."""
+
+        with self.guard:
+            book = self.book()
+            if reason in ALLOWANCE_REASONS:
+                self.breaches.append(entry)
+                book.record("budget", "allowance_breach", sorted(set(self.breaches)))
+                book.record("budget", "no_allowance_breach", False)
+            else:
+                self.violations.append(entry)
+                book.record("budget", "gate_violations", sorted(set(self.violations)))
+                book.record("budget", "gate_every_response", False)
 
     def stop_session(
         self,
@@ -1572,31 +1822,37 @@ class TwoOwnerRun(pp.LiveRun):
         record: Mapping[str, Any] | None = None,
         role: str = "",
     ) -> NoReturn:
-        """Stop the hold, interrupt the runner, charge the group, fence, and fail."""
+        """Keep the hold, delete the runner pod, charge every open share, fence, and fail.
+
+        The hold is never answered. A released stop fails the hook closed while
+        the CLI is alive, and the CLI answers a blocked call with another model
+        request; deleting the pod while the hook still holds ends the native
+        process first.
+        """
 
         entry = f"{run.group}:{role or '-'}:{reason}"
-        if reason in ALLOWANCE_REASONS:
-            self.breaches.append(entry)
-            self.ledger.record("budget", "allowance_breach", sorted(set(self.breaches)))
-            self.ledger.record("budget", "no_allowance_breach", False)
-        else:
-            self.violations.append(entry)
-            self.ledger.record("budget", "gate_violations", sorted(set(self.violations)))
-            self.ledger.record("budget", "gate_every_response", False)
-        key = str((record or {}).get("key") or "")
-        if run.gate is not None and pto.GATE_KEY.fullmatch(key):
-            with contextlib.suppress(StepFailed):
-                self.release(run, key, "stop")
-        self.safe(lambda: self.interrupt_runner(run), None)
-        self.charge_open()
-        self.safe(self.fence_paid_starts, None)
-        raise StepFailed(f"{run.group}: the gate stopped a session ({reason}); paid work fenced")
+        message = f"{run.group}: the gate stopped a session ({reason})"
+        with self.guard:
+            if self.paid_failure is None:
+                self.paid_failure = message
+            key = str((record or {}).get("key") or "")
+            if pto.GATE_KEY.fullmatch(key):
+                run.ignored.add(key)
+            self.note_stop(entry, reason)
+            self.safe(lambda: self.interrupt_runner(run), None)
+            self.charge_open()
+            self.safe(self.fence_paid_starts, None)
+        raise StepFailed(message + "; paid work fenced")
 
     def interrupt_runner(self, run: PodRun) -> None:
-        """Delete the runner pod at once; the hook already failed the held call closed."""
+        """Delete the runner pod at once while its hook still holds; never twice."""
 
-        run.ending = True
-        if run.pod:
+        with self.guard:
+            run.ending = run.stopped = True
+            identity = run.pod_uid or run.pod
+            if not run.pod or identity in self.deleted_uids:
+                return
+            self.deleted_uids.add(identity)
             self.pod_deletions.append((run.pod, run.pod_uid, self.clock.now()))
             self.kube.ctl(
                 "delete",
@@ -1612,18 +1868,24 @@ class TwoOwnerRun(pp.LiveRun):
     def charge_open(self) -> None:
         """Every reserved, unsettled session becomes unknown: charged at its full share."""
 
-        for row in self.owner_ledger.session_rows():
-            if row["source"] == "reserved" and row["output_tokens"] is None:
-                self.ledger.settle(int(row["seq"]), None, source="unknown")
+        with self.guard:
+            book = self.book()
+            for row in book.session_rows():
+                if row["source"] == "reserved" and row["output_tokens"] is None:
+                    book.settle(int(row["seq"]), None, source="unknown")
 
     def fail_paid(self, message: str) -> NoReturn:
         """A paid phase failed: charge what is open, fence, and stop."""
 
-        self.charge_open()
-        self.safe(self.fence_paid_starts, None)
+        with self.guard:
+            if self.paid_failure is None:
+                self.paid_failure = message
+            self.charge_open()
+            self.safe(self.fence_paid_starts, None)
         raise StepFailed(message + "; paid work fenced")
 
     def require(self, checks: Mapping[str, bool], what: str) -> None:
+        self.check_paid()
         failed = sorted(key for key, value in checks.items() if value is not True)
         if failed:
             self.fail_paid(f"{what} failed: " + ", ".join(failed))
@@ -1638,19 +1900,25 @@ class TwoOwnerRun(pp.LiveRun):
         Every other group goes through ``pps.settle_attempt``: an incomplete
         capture leaves every slot unknown (charged at its share), a slot with
         no session settles not_started, and a session beyond the group's
-        reservations is recorded unreserved.
+        reservations is recorded unreserved. A session with a synthetic or
+        API-error record settles unknown even after real usage, since the
+        failed request may have spent what its transcript does not show; it
+        keeps its sanitized error class and fails the run fenced.
         """
 
         group = pto.GROUPS[run.group]
+        sessions = facts.sessions if facts is not None else []
+        errored = [item for item in sessions if item.synthetic or item.errors]
+        for item in errored:
+            self.violations.append(f"{run.group}:{item.role}:native_error")
         if group.kind == "interrupted":
             zero = (
                 complete
                 and facts is not None
                 and not facts.malformed_lines
                 and not facts.truncated_files
-                and all(
-                    item.assistant_turns == 0 and item.synthetic == 0 for item in facts.sessions
-                )
+                and not errored
+                and all(item.assistant_turns == 0 for item in facts.sessions)
             )
             elapsed = max((item.elapsed for item in facts.sessions), default=0.0) if facts else 0.0
             for reservation in run.reservations:
@@ -1665,7 +1933,16 @@ class TwoOwnerRun(pp.LiveRun):
                 "unreserved": 0,
             }
         else:
-            counts = pps.settle_attempt(self.ledger, run.reservations, facts, complete=complete)
+            settled = facts
+            if facts is not None and errored:
+                settled = dataclasses.replace(
+                    facts,
+                    sessions=[
+                        dataclasses.replace(item, usage_known=False) if item in errored else item
+                        for item in facts.sessions
+                    ],
+                )
+            counts = pps.settle_attempt(self.ledger, run.reservations, settled, complete=complete)
         run.facts, run.settled = facts, True
         summaries = [pps.session_summary(item) for item in facts.sessions] if facts else []
         self.summaries[run.group] = summaries
@@ -1682,7 +1959,7 @@ class TwoOwnerRun(pp.LiveRun):
     def classify_zero(
         self, run: PodRun, summaries: Sequence[Mapping[str, Any]], *, interrupted: bool
     ) -> None:
-        """Every zero-output or synthetic session keeps a sanitized class (budget key)."""
+        """Every zero-output, synthetic or errored session keeps a sanitized class (budget key)."""
 
         for row in self.owner_ledger.session_rows():
             if row["grp"] == run.group and row["source"] == "not_started":
@@ -1690,7 +1967,11 @@ class TwoOwnerRun(pp.LiveRun):
                     {"group": run.group, "role": row["role"], "class": "not_started"}
                 )
         for summary in summaries:
-            if summary.get("output_tokens") == 0 or summary.get("synthetic"):
+            if (
+                summary.get("output_tokens") == 0
+                or summary.get("synthetic")
+                or summary.get("error_classes")
+            ):
                 planned = "prompt_hold" if interrupted else None
                 self.zero_classes.append(
                     {
@@ -1731,6 +2012,7 @@ class TwoOwnerRun(pp.LiveRun):
     def reserve(self, run: PodRun) -> None:
         """Persist the group's reservations (``reserve_group``) before the start they cover."""
 
+        self.check_paid()
         now = self.clock.now()
         run.reservations = self.owner_ledger.reserve_group(run.group, now=now)
         run.reserved_at = now
@@ -1816,6 +2098,8 @@ class TwoOwnerRun(pp.LiveRun):
                 uid = str(pod_meta.get("uid") or "")
                 if uid and uid not in old and (pod.get("status") or {}).get("phase") == "Running":
                     run.claim, run.pod, run.pod_uid = name, str(pod_meta.get("name")), uid
+                    # The first observation of its native process starts the run's clock.
+                    self.observe_start(run, self.runner_clock_start(pod))
                     run.grant_ref = pps.pod_grant_ref(pod)
                     run.pod_record = pod
                     run.claim_labels = {
@@ -1835,8 +2119,32 @@ class TwoOwnerRun(pp.LiveRun):
             what=f"{run.group} runner pod",
             every=2.0,
         )
+        self.adopt_runner(run)
+
+    def adopt_runner(self, run: PodRun) -> None:
+        """A discovered runner pod becomes the run's: checks, capture, gate and limits."""
+
         run.started_at = self.clock.now()
         self.begin_pod_run(run)
+
+    def watch_early_start(self) -> None:
+        """Look for a B-r1 runner pod while the worker stop is not yet observed.
+
+        B-r1 is reserved before B1's card is resolved, while the worker still
+        runs, so production may start the repair early. Such a pod is adopted
+        so its first hold is counted against B-r1's reservation, kept, and
+        fails the run as a scenario-order start (``handle_hold``).
+        """
+
+        run = self.early_watch
+        if run is None or run.pod:
+            return
+        now = self.clock.monotonic()
+        if now - self.early_checked < EARLY_WATCH_SECONDS:
+            return
+        self.early_checked = now
+        if self.find_runner_pod(run):
+            self.adopt_runner(run)
 
     def note(self, criterion: str, key: str, owner: str, value: Any) -> None:
         """Fold one more real reading into a per-owner key: true only while every reading is."""
@@ -1994,12 +2302,15 @@ class TwoOwnerRun(pp.LiveRun):
     def remove_pod(self, run: PodRun) -> None:
         """Delete the run's pod if it is still there; wait for it and the capture to end."""
 
-        run.ending = True
-        if self.pod_uid_present(run.pod, run.pod_uid):
-            self.pod_deletions.append((run.pod, run.pod_uid, self.clock.now()))
-            self.kube.ctl(
-                "delete", "pod", run.pod, "--ignore-not-found", "--wait=false", timeout=60
-            )
+        with self.guard:
+            run.ending = run.stopped = True
+            identity = run.pod_uid or run.pod
+            if identity not in self.deleted_uids and self.pod_uid_present(run.pod, run.pod_uid):
+                self.deleted_uids.add(identity)
+                self.pod_deletions.append((run.pod, run.pod_uid, self.clock.now()))
+                self.kube.ctl(
+                    "delete", "pod", run.pod, "--ignore-not-found", "--wait=false", timeout=60
+                )
         until = self.clock.now() + SETTLE_SECONDS
         self.wait_until(
             lambda: self.pod_uid_gone(run), until=until, what=f"{run.group} pod removal", every=2.0
@@ -2453,9 +2764,12 @@ class TwoOwnerRun(pp.LiveRun):
         and stops before any further reservation.
         """
 
+        self.check_paid()
         if self.ledger.run_row()["live_started_at"] is None:
             self.ledger.begin_live(now=self.clock.now(), grant_expires_at=self.inputs.expires_at)
             self.ledger.record("budget", "allowance_breach", [])
+        # The live window and every native clock are kept from here to finalize.
+        self.start_watchdog()
         token = owner.token
         if token is None or owner.token_kind != "grant" or not token.reveal():
             raise StepFailed(f"owner {owner.name} holds no grant")
@@ -2739,7 +3053,15 @@ class TwoOwnerRun(pp.LiveRun):
         self.require(checks, "A2's publication")
 
     def phase_approve_b1(self) -> None:
-        """Only once A has no claim and no running runner, B1's card is approved."""
+        """Once A is quiescent, B-r1 is reserved, then B1's card is approved.
+
+        The worker keeps running through the approval (it performs the
+        publication), so production may ingest the failing check and start
+        the repair before the worker stop. B-r1's group is therefore persisted
+        first, in manifest order (A2 is settled, A3 not yet reserved), and
+        until the stop is observed any B-r1 pod is watched for: its first hold
+        counts against B-r1, is never released, and fails the run fenced.
+        """
 
         self.require_live("approve-b1")
         a = self.owners["a"]
@@ -2750,6 +3072,11 @@ class TwoOwnerRun(pp.LiveRun):
             return not self.owner_claims(a) and all(row.get("status") != "running" for row in rows)
 
         self.wait_until(quiescent, until=self.clock.now() + QUIESCENT_SECONDS, what="A quiescent")
+        held = self.new_run("b-r1", policy=KEEP_PROMPT)
+        held.request_id, held.work_item_id = run.request_id, run.work_item_id
+        held.conversation_id = run.conversation_id
+        self.reserve(held)
+        self.early_watch, self.early_checked = held, float("-inf")
         self.resolve_card(run, "approved")
         facts = self.published_facts(run, full=True)
         self.b1_head, self.b1_pull = facts["head"], facts["pr"]
@@ -2764,10 +3091,18 @@ class TwoOwnerRun(pp.LiveRun):
         self.require(checks, "B1's publication")
 
     def phase_worker_stop(self) -> None:
-        """Worker to 0; B's real failing check queues the repair; A2 completes meanwhile."""
+        """Worker to 0; B's real failing check queues the repair; A2 completes meanwhile.
+
+        Once the stop is observed, one last look for an early B-r1 pod runs
+        before the observation is recorded; a B-r1 hold written after it is
+        the planned start.
+        """
 
         self.require_live("worker-stop")
         self.worker_before = self.stop_worker()
+        self.early_checked = float("-inf")
+        self.pump()
+        self.worker_stopped_at, self.early_watch = self.clock.now(), None
         self.ledger.record(
             "restarts",
             "worker_old_runtime_absent",
@@ -2880,21 +3215,19 @@ class TwoOwnerRun(pp.LiveRun):
         return True
 
     def phase_queue_a3(self) -> None:
-        """A3 is reserved, then admitted while the worker is stopped."""
+        """A3 is reserved (B-r1 still open at its share), then admitted with the worker stopped."""
 
         self.require_live("queue-a3")
         run = self.new_run("a3", policy=KEEP_AFTER_TOOL)
         self.admit_group(run, self.owners["a"])
 
     def phase_worker_start(self) -> None:
-        """B-r1 is reserved, then the worker returns as a new pod on the candidate image."""
+        """The worker returns as a new pod on the candidate image; B-r1 was reserved already."""
 
         self.require_live("worker-start")
-        first = self.pod_run("b1")
-        run = self.new_run("b-r1", policy=KEEP_PROMPT)
-        run.request_id, run.work_item_id = first.request_id, first.work_item_id
-        run.conversation_id = first.conversation_id
-        self.reserve(run)
+        self.check_paid()
+        if not self.owner_ledger.reservations_of("b-r1"):
+            raise StepFailed("B-r1 was not reserved before the worker restart")
         self.worker_started_at = self.clock.now()
         self.kube.ctl("scale", f"deployment/{self.fullname}-worker", "--replicas=1", timeout=120)
 
@@ -2934,8 +3267,7 @@ class TwoOwnerRun(pp.LiveRun):
         def found() -> bool:
             for run in (held, follow):
                 if not run.pod and self.find_runner_pod(run):
-                    run.started_at = self.clock.now()
-                    self.begin_pod_run(run)
+                    self.adopt_runner(run)
             return bool(held.pod and follow.pod)
 
         self.wait_until(found, until=self.deadline(), what="B-r1 and A3 runner pods", every=2.0)
@@ -3102,7 +3434,11 @@ class TwoOwnerRun(pp.LiveRun):
         self.reserve(repair)
         deletes = len(self.pod_deletions)
         witness = self.interrupt_native_process(held.pod, held.kept)
+        # The held native process is gone: no clock acts on B-r1 again.
+        held.stopped = True
         pod = self.await_container_restart(held)
+        # The restarted runner container is B-r2's native process: its clock starts here.
+        self.observe_start(repair, self.runner_clock_start(pod))
         self.wait_until(
             held.eof.is_set,
             until=self.clock.now() + SETTLE_SECONDS,
@@ -3635,10 +3971,12 @@ class TwoOwnerRun(pp.LiveRun):
             bool(self.zero_classes) and all(item["class"] for item in self.zero_classes),
         )
         rows = self.owner_ledger.session_rows()
+        # Every approved ceiling is inclusive: settled usage at its share, turns or
+        # seconds is within the allowance, above them is a breach.
         within = [
-            row["output_tokens"] < row["reserved_output"]
-            and row["assistant_turns"] < row["reserved_turns"]
-            and row["elapsed"] < row["reserved_seconds"]
+            row["output_tokens"] <= row["reserved_output"]
+            and row["assistant_turns"] <= row["reserved_turns"]
+            and row["elapsed"] <= row["reserved_seconds"]
             for row in rows
             if row["source"] == "native" and row["output_tokens"] is not None
         ]
@@ -4938,6 +5276,7 @@ class TwoOwnerRun(pp.LiveRun):
     def restart_worker(self, before: Sequence[str]) -> dict[str, bool]:
         """Scale the worker back to one: a new pod uid running the candidate worker image."""
 
+        self.check_paid()
         self.kube.ctl("scale", f"deployment/{self.fullname}-worker", "--replicas=1", timeout=120)
         self.kube.ctl(
             "rollout",
@@ -5143,7 +5482,11 @@ class TwoOwnerRun(pp.LiveRun):
         There is no release-wide grant Secret in this scenario: each owner's
         grant reaches only its own ``<claim>-tokens``, so disconnecting the
         owner (which retires its custody Secret) and deleting the claims is the
-        fence. Every protective step is issued before any wait.
+        fence. Every protective step is issued before any wait: the worker's
+        scale-down (it shuts down gracefully), then runner execution (the run
+        agent's runner pods, deleted without grace) and grant delivery (their
+        claims, then every owner that may be enrolled). Under ``guard``, so
+        the watchdog thread and the main thread never fence at once.
         """
 
         failures: list[str] = []
@@ -5155,45 +5498,47 @@ class TwoOwnerRun(pp.LiveRun):
                 failures.append(name)
                 return None
 
-        attempt(
-            "scale-worker",
-            lambda: self.kube.ctl(
-                "scale", f"deployment/{self.fullname}-worker", "--replicas=0", timeout=120
-            ),
-        )
-        claims = attempt("list-claims", self.agent_claims) or []
-        attempt("delete-claims", lambda: self.delete_claims(claims))
-        attempt("delete-runner-pods", lambda: self.delete_runner_pods(claims))
-        for owner in self.owners.values():
-            if owner.may_be_active():
-                step = functools.partial(self.disconnect_if_active, owner)
-                if not attempt(f"disconnect-{owner.name}", step):
-                    failures.append(f"owner-{owner.name}-active")
-        for selector in (pp.POD_CLAIM_LABEL, self.worker_selector()):
-            self.kube.ctl(
-                "wait",
-                "--for=delete",
-                "pod",
-                "-l",
-                selector,
-                "--timeout=120s",
-                timeout=140,
-                check=False,
+        with self.guard:
+            attempt(
+                "scale-worker",
+                lambda: self.kube.ctl(
+                    "scale", f"deployment/{self.fullname}-worker", "--replicas=0", timeout=120
+                ),
             )
-        runners = attempt(
-            "list-runner-pods", lambda: self.kube.json("get", "pods", "-l", pp.POD_CLAIM_LABEL)
-        )
-        running = [
-            pod
-            for pod in ((runners or {}).get("items") or [])
-            if any(
-                (status.get("state") or {}).get("running")
-                for status in (pod.get("status") or {}).get("containerStatuses") or []
+            claims = attempt("list-claims", self.agent_claims) or []
+            attempt("delete-runner-pods", lambda: self.delete_runner_pods(claims))
+            attempt("delete-claims", lambda: self.delete_claims(claims))
+            for owner in self.owners.values():
+                if owner.may_be_active():
+                    step = functools.partial(self.disconnect_if_active, owner)
+                    if not attempt(f"disconnect-{owner.name}", step):
+                        failures.append(f"owner-{owner.name}-active")
+            for selector in (pp.POD_CLAIM_LABEL, self.worker_selector()):
+                self.kube.ctl(
+                    "wait",
+                    "--for=delete",
+                    "pod",
+                    "-l",
+                    selector,
+                    "--timeout=120s",
+                    timeout=140,
+                    check=False,
+                )
+            runners = attempt(
+                "list-runner-pods", lambda: self.kube.json("get", "pods", "-l", pp.POD_CLAIM_LABEL)
             )
-        ]
-        fenced = not failures and runners is not None and not running
-        self.ledger.record("budget", "paid_starts_fenced", fenced)
-        self.ledger.record("budget", "fence_failures", sorted(set(failures)))
+            running = [
+                pod
+                for pod in ((runners or {}).get("items") or [])
+                if any(
+                    (status.get("state") or {}).get("running")
+                    for status in (pod.get("status") or {}).get("containerStatuses") or []
+                )
+            ]
+            fenced = not failures and runners is not None and not running
+            book = self.book()
+            book.record("budget", "paid_starts_fenced", fenced)
+            book.record("budget", "fence_failures", sorted(set(failures)))
         if not fenced:
             raise StepFailed(
                 "paid starts could not be fenced: "
@@ -5236,6 +5581,8 @@ class TwoOwnerRun(pp.LiveRun):
             )
 
     def delete_runner_pods(self, claims: Sequence[str]) -> None:
+        """Delete the claims' runner pods without grace: a fence stops runner execution now."""
+
         if claims:
             self.kube.ctl(
                 "delete",
@@ -5243,6 +5590,7 @@ class TwoOwnerRun(pp.LiveRun):
                 "-l",
                 self.claim_pod_selector(claims),
                 "--ignore-not-found",
+                "--grace-period=0",
                 "--wait=false",
                 timeout=120,
             )
@@ -5250,25 +5598,38 @@ class TwoOwnerRun(pp.LiveRun):
     # -- finalize and inventory ----------------------------------------------------------
 
     def finalize(self) -> bool:
-        if self.ledger.run_row()["live_started_at"] is not None:
-            # Whatever is still open is charged at its share; the keys gathered
-            # so far are recorded before the fence disconnects anyone.
+        """Fence, then charge and observe, then the inherited teardown, on one cleanup clock.
+
+        On success, failure and signal alike, the clock starts first and the
+        first action of a live run's finalize (or of any run whose owner may
+        still be enrolled) is the fence: runner execution and grant delivery
+        stop before anything waits for the worker's graceful exit. The
+        watchdog is stopped around it. Only then are open sessions charged at
+        their share, the summary keys gathered and the gate streams closed.
+        Every remaining teardown step runs even past CLEANUP_SECONDS; a
+        cleanup longer than that is recorded as a breach the cleanup judge
+        fails (``cleanup_within_window``).
+        """
+
+        started = self.clock.monotonic()
+        self.watch_stop.set()
+        live = self.ledger.run_row()["live_started_at"] is not None
+        if self.mutated and (live or any(owner.may_be_active() for owner in self.owners.values())):
+            self.safe(self.fence_paid_starts, None)
+        self.stop_watchdog()
+        if live:
             self.safe(self.charge_open, None)
             self.safe(self.record_summary_keys, None)
         for run in self.pods:
             if run.gate is not None and not run.closed:
                 self.safe(run.gate.close, None)
                 run.closed = True
-        if self.mutated and (
-            self.ledger.run_row()["live_started_at"] is not None
-            or any(owner.may_be_active() for owner in self.owners.values())
-        ):
-            # Fence first: no owner stays enrolled and no runner keeps going while
-            # the release is torn down.
-            self.safe(self.fence_paid_starts, None)
         ok = super().finalize()
         if self.mutated:
             self.record_cleanup_keys()
+            elapsed = self.clock.monotonic() - started
+            self.ledger.record("budget", "cleanup_elapsed", round(elapsed, 3))
+            self.ledger.record("cleanup", "cleanup_within_window", elapsed <= pto.CLEANUP_SECONDS)
         return ok
 
     def record_cleanup_keys(self) -> None:

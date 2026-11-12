@@ -56,6 +56,14 @@ DEX_DIGEST = "sha256:" + "d" * 64
 API_PORT = 41001
 DEX_PORT = 41002
 PATH_ONLY = {"PATH": "/nonexistent"}
+#: The native CLI's synthetic API-error text, as test_personal_profile.py
+#: _refused_transcript replays it (a refused OAuth grant), without secret bytes.
+REFUSED_TEXT = (
+    "Failed to authenticate. API Error: 401 "
+    '{"type":"error","error":{"type":"authentication_error","message":"OAuth token revoked"}}'
+)
+#: Its sanitized class (pps.error_summary of pps.error_class).
+REFUSED_CLASS = "authentication_failed 401 authentication_error"
 
 
 def _private(path: Path) -> Path:
@@ -68,6 +76,30 @@ def _file(path: Path, content: bytes, mode: int = 0o600) -> Path:
     path.write_bytes(content)
     os.chmod(path, mode)
     return path
+
+
+def _refused_record(timestamp: str, message_id: str = "msg_synth") -> dict[str, Any]:
+    """The native CLI's synthetic assistant record after a refused request.
+
+    Model ``<synthetic>`` with the CLI's ``error``, ``apiErrorStatus`` and
+    ``isApiErrorMessage`` fields, the shape test_personal_profile.py replays.
+    """
+
+    return {
+        "type": "assistant",
+        "timestamp": timestamp,
+        "isSidechain": False,
+        "message": {
+            "id": message_id,
+            "model": pps.SYNTHETIC_MODEL,
+            "role": "assistant",
+            "content": [{"type": "text", "text": REFUSED_TEXT}],
+            "usage": {"input_tokens": 10, "output_tokens": 0},
+        },
+        "error": "authentication_failed",
+        "apiErrorStatus": 401,
+        "isApiErrorMessage": True,
+    }
 
 
 def _kit(tmp_path: Path, *, registry: str = REGISTRY, prior: int = 0) -> dict[str, Any]:

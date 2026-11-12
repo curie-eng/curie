@@ -489,7 +489,7 @@ sessions)`.
 | b-probe | B | 1 probe | driver grant probe, before B1 |
 | b1 | B | implementer, plan reviewer, diff reviewer | trusted admission, execute turn |
 | a2 | A | implementer, plan reviewer, diff reviewer | admission of the fresh successor after rejection |
-| b-r1 | B | implementer, held at its prompt, zero usage | the `factory_ci` round-2 continuation consumed after the worker restart |
+| b-r1 | B | implementer, held at its prompt, zero usage | the `factory_ci` round-2 continuation consumed after the worker restart (reserved before B1's card is resolved) |
 | a3 | A | implementer | admission of the authorized follow-up; ended by disconnect |
 | b-r2 | B | implementer, diff reviewer, second diff reviewer | kernel runner-error retry on the same request and epoch |
 
@@ -515,29 +515,57 @@ most 32,768 minus prior spend, and every production transition mapped.
    native process.
 2. `wrong-owner`, then `reject-a1` (unlisted operator refused, listed operator
    rejects), `attempt-a2` (fresh successor in a new pod), `approve-a2`.
-3. `approve-b1` once A is quiescent, then `worker-stop`: B's real failing check
-   queues the round-2 repair while the worker is down.
-4. `queue-a3` (A3 admitted with the worker stopped), `worker-start` (a new
-   worker pod; B-r1 reserved), `hold-both` (B-r1 held at its prompt, A3 runs one
-   tool and is held).
+3. `approve-b1` once A is quiescent: B-r1 is reserved before B1's card is
+   resolved, because the worker keeps running to publish and production may
+   start the repair early. Until `worker-stop` observes the worker gone, any
+   B-r1 runner pod is watched for; its first hold counts against B-r1, is never
+   released, and fails the run as a scenario-order start. Then `worker-stop`:
+   B's real failing check queues the round-2 repair while the worker is down.
+4. `queue-a3` (A3 reserved with B-r1 open at its share, admitted with the
+   worker stopped), `worker-start` (a new worker pod), `hold-both` (B-r1 held
+   at its prompt, A3 runs one tool and is held).
 5. `disconnect-a`, `process-interruption` (B-r1's CLI killed and runner PID 1
    signalled; the kernel retries as B-r2), `approve-b2`, `post-disconnect`
    (another worker restart; A cannot launch, reuse or resume, B stays active).
-6. The fence (worker to zero, claims and runner pods deleted, active owners
-   disconnected), cleanup and inventory.
+6. The fence (worker to zero, runner pods deleted without grace, their claims
+   deleted, active owners disconnected), cleanup and inventory. On success,
+   failure and signal the fence is the first action of finalize, before any
+   charge, observation or wait for the worker's graceful exit. One cleanup
+   clock starts before it and covers every step; a cleanup past 600 s is
+   recorded (`cleanup_within_window` false) and fails the cleanup judge while
+   the remaining teardown still runs.
 
 ### Response gate and subagent limits
 
 The private bundle gains `hooks/two_owner_gate.py` on `UserPromptSubmit`,
 `PreToolUse` (`*`), `Stop` and `SubagentStop`. Each hook writes a hold file keyed
 by its pid and start time and waits up to 240 s (hook timeout 250 s) for a
-release; a stop verdict or timeout fails closed. A long-lived in-pod stream
-reports holds to the driver, which waits until the harvest has read the
-transcript to the reported size, recomputes usage, and releases only if the
-session share, per-session cap, turns, 300 s, owner allocation (16,384) and
-aggregate guard all hold with one more response (2,048 tokens) in flight.
-Otherwise it stops the hold, interrupts the runner, deletes the pod and records
-the breach; unknown usage always stops. Before the first prompt release the
+release; a timeout fails closed. A long-lived in-pod stream reports holds to
+the driver, which waits until the harvest has read the transcript to the
+reported size, recomputes usage, and releases only if the session share,
+per-session cap, turns, 300 s, owner allocation (16,384) and aggregate guard
+all hold. Every ceiling is inclusive: usage at a ceiling is within it, above
+it is a breach. A Stop or SubagentStop hold asks for nothing more, so it passes
+at a ceiling; any other hold precedes one more response, so it stops once the
+share, a turn limit or the time is reached, or when one more response (2,048
+tokens) could cross the per-session cap, the owner allocation or the aggregate
+guard. Zero usage is a reading only at a session's initial prompt hold; at any
+other hold a missing, unreadable or incomplete transcript is unknown usage,
+and a synthetic or API-error record is a native error that keeps its sanitized
+class. A stop never answers the hold (a blocked call would be answered by
+another model request): it deletes the runner pod while the hook still holds,
+charges every open session at its full share, fences and fails the run.
+
+Each run's clock is on the driver's monotonic clock and starts at the first
+observation of its native process (the runner container's start when the pod
+reports it, else the pod's discovery or its first hold); subagents run inside
+that process and share it, and it never stops. A watchdog thread, also run at
+every wait, stops a run at 300 s while its native process may still ask the
+model for more (not after its final Stop release), stops a kept hold 15 s
+before its hook gives up, and fences paid starts when the 4,800 s live window
+ends, even while the main thread is blocked in a call. It shares one lock with
+the main thread's stop paths, so a pod is deleted and a share charged once, and
+finalize stops it. Before the first prompt release the
 driver writes `/tmp/pto-gate/limits.json` with the pod's reviewer allowance from
 its group (one plan and one diff reviewer for three-role groups, two diff
 reviewers for b-r2, none for probes, a3 and b-r1). An absent file, a missing
@@ -579,6 +607,13 @@ CLI reads session files the driver writes 0600 and the finalizer removes.
    design and is not driven.
 5. `curie cluster message` cannot target a GitHub-issue conversation, so no
    message control is recorded.
+6. A run's 300 s clock counts its native process's whole life from the first
+   observation, but it does not act while the run is idle after the main
+   session's final Stop release, since that CLI asks for nothing more (a pod
+   parked at an approval is not stopped). A later hold on the run is judged on
+   the same clock.
+7. The watchdog acts at its deadline (300 s, 4,800 s), as the ceiling decision
+   says; settled usage exactly at a ceiling still passes the budget judge.
 
 ### Not met
 

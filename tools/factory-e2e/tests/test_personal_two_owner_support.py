@@ -42,6 +42,7 @@ from typing import Any, Literal
 import personal_profile_support as pps
 import personal_two_owner_support as pto
 import pytest
+from two_owner_shared import _refused_record
 
 HERE = Path(pto.__file__).resolve().parent
 REPO_ROOT = HERE.parents[1]
@@ -1106,6 +1107,28 @@ def test_settle_within_bounds_keeps_the_budget(tmp_path: Path) -> None:
     assert other.budget_state() == "ok"
 
 
+@pytest.mark.parametrize(("extra", "state"), [(0, "ok"), (1, "exceeded")])
+def test_settled_usage_at_every_ceiling_keeps_the_budget(
+    tmp_path: Path, extra: int, state: str
+) -> None:
+    # Inclusive ceilings: a session at 8,192 tokens, 32 turns and 300 s is within;
+    # the owner then reaches exactly 16,384 output tokens, and one more is over.
+    ledger = _ledger(tmp_path)
+    _settle(ledger, ledger.reserve_group("a-probe", now=T0))
+    a1 = ledger.reserve_group("a1", now=T0)
+    limits = pps.SessionUsage(
+        pto.SESSION_OUTPUT_TOKENS,
+        pto.SESSION_TURNS,
+        float(pto.SESSION_SECONDS),
+        pps.IMPLEMENTER_MODEL,
+    )
+    _settle(ledger, a1[:1], limits)
+    assert ledger.budget_state() == "ok"
+    rest = pto.OWNER_OUTPUT_TOKENS - ledger.owner_spent("a", live={a1[1].seq: 0, a1[2].seq: 0})
+    _settle(ledger, a1[1:2], pps.SessionUsage(rest + extra, 6, 30.0, pps.REVIEWER_MODEL))
+    assert ledger.budget_state() == state
+
+
 def test_prior_spend_and_windows_are_recorded_once(tmp_path: Path) -> None:
     ledger = _ledger(tmp_path, prior=10)
     ledger.set_prior_spend(10)
@@ -1158,6 +1181,7 @@ def _decide(**changes: Any) -> tuple[str, str]:
         "aggregate_spent": 12000,
         "session_started_at": T0,
         "now": T0 + 60,
+        "final": False,
     }
     arguments.update(changes)
     return pto.gate_decision(**arguments)
@@ -1212,6 +1236,68 @@ def test_gate_decision_releases_within_every_bound() -> None:
 )
 def test_gate_decision_stops(changes: dict[str, Any], reason: str) -> None:
     assert _decide(**changes) == ("stop", reason)
+
+
+#: A share above the per-session cap, so the cap's own check is reached.
+UNCAPPED_SHARE = dataclasses.replace(RESERVATION, output_tokens=pto.SESSION_OUTPUT_TOKENS + 1)
+TWELVE_TURNS = dataclasses.replace(RESERVATION, turns=12)
+#: (case, a final hold exactly at the ceiling, the same hold one above it, the reason).
+FINAL_BOUNDARIES: list[tuple[str, dict[str, Any], dict[str, Any], str]] = [
+    ("share", {"session_usage": _usage(5000)}, {"session_usage": _usage(5001)}, "session_share"),
+    (
+        "full share",
+        {"reservation": FULL_SHARE, "session_usage": _usage(pto.SESSION_OUTPUT_TOKENS)},
+        {"reservation": FULL_SHARE, "session_usage": _usage(pto.SESSION_OUTPUT_TOKENS + 1)},
+        "session_share",
+    ),
+    (
+        "session output tokens",
+        {"reservation": UNCAPPED_SHARE, "session_usage": _usage(pto.SESSION_OUTPUT_TOKENS)},
+        {"reservation": UNCAPPED_SHARE, "session_usage": _usage(pto.SESSION_OUTPUT_TOKENS + 1)},
+        "session_output_tokens",
+    ),
+    (
+        "session turns",
+        {"session_usage": _usage(1000, pto.SESSION_TURNS)},
+        {"session_usage": _usage(1000, pto.SESSION_TURNS + 1)},
+        "session_turns",
+    ),
+    (
+        "reserved turns",
+        {"reservation": TWELVE_TURNS, "session_usage": _usage(9, 12)},
+        {"reservation": TWELVE_TURNS, "session_usage": _usage(9, 13)},
+        "session_turns",
+    ),
+    (
+        "session seconds",
+        {"now": T0 + pto.SESSION_SECONDS},
+        {"now": T0 + pto.SESSION_SECONDS + 1},
+        "session_seconds",
+    ),
+    (
+        "owner allocation",
+        {"owner_spent": pto.OWNER_OUTPUT_TOKENS},
+        {"owner_spent": pto.OWNER_OUTPUT_TOKENS + 1},
+        "owner_allocation",
+    ),
+    (
+        "aggregate guard",
+        {"aggregate_spent": pto.MAX_OUTPUT_TOKENS},
+        {"aggregate_spent": pto.MAX_OUTPUT_TOKENS + 1},
+        "aggregate_guard",
+    ),
+]
+
+
+@pytest.mark.parametrize(
+    ("case", "at", "over", "reason"), FINAL_BOUNDARIES, ids=[b[0] for b in FINAL_BOUNDARIES]
+)
+def test_a_final_hold_passes_at_a_ceiling_and_stops_above_it(
+    case: str, at: dict[str, Any], over: dict[str, Any], reason: str
+) -> None:
+    # Stop and SubagentStop ask for no further response: every ceiling is inclusive.
+    assert _decide(final=True, **at) == ("go", "")
+    assert _decide(final=True, **over) == ("stop", reason)
 
 
 def _dark_factory_hooks() -> dict[str, Any]:
@@ -2557,6 +2643,101 @@ def test_budget_judge_reads_the_ledger(
     assert result["verdict"] == "fail" and result["checks"][check] is False, result["checks"]
 
 
+def _group_row(ledger: pto.TwoOwnerLedger, group: str) -> dict[str, Any]:
+    return next(row for row in ledger.session_rows() if row["grp"] == group)
+
+
+def _set_session(ledger: pto.TwoOwnerLedger, group: str, column: str, value: Any) -> None:
+    seq = _group_row(ledger, group)["seq"]
+    _session(ledger, f"UPDATE sessions SET {column}=? WHERE seq=?", value, seq)
+
+
+def _owner_a_at(ledger: pto.TwoOwnerLedger, extra: int) -> None:
+    spent = sum(int(row["output_tokens"]) for row in ledger.session_rows() if row["owner"] == "a")
+    tokens = int(_group_row(ledger, "a3")["output_tokens"])
+    _set_session(ledger, "a3", "output_tokens", tokens + pto.OWNER_OUTPUT_TOKENS - spent + extra)
+
+
+def _aggregate_at(ledger: pto.TwoOwnerLedger, extra: int) -> None:
+    total = sum(int(row["output_tokens"]) for row in ledger.session_rows())
+    _session(
+        ledger,
+        "UPDATE observations SET value_json=? WHERE criterion='budget' AND key=?",
+        json.dumps(pto.MAX_OUTPUT_TOKENS - total + extra),
+        pto.PRIOR_SPEND_KEY,
+    )
+
+
+def _turns_at(ledger: pto.TwoOwnerLedger, extra: int) -> None:
+    rows = ledger.session_rows()
+    need = pto.MAX_TURNS - sum(int(row["assistant_turns"]) for row in rows) + extra
+    for row in rows:
+        if pto.GROUPS[row["grp"]].kind == "probe" or need <= 0:
+            continue
+        more = min(need, pto.SESSION_TURNS - int(row["assistant_turns"]))
+        _session(
+            ledger,
+            "UPDATE sessions SET assistant_turns=? WHERE seq=?",
+            int(row["assistant_turns"]) + more,
+            row["seq"],
+        )
+        need -= more
+    assert need == 0
+
+
+#: (case, budget check, how to put the complete ledger at that ceiling plus ``extra``).
+BUDGET_CEILINGS: list[tuple[str, str, Callable[[pto.TwoOwnerLedger, int], None]]] = [
+    (
+        "session output tokens",
+        "session_bounds",
+        lambda led, extra: _set_session(
+            led, "b-r1", "output_tokens", pto.SESSION_OUTPUT_TOKENS + extra
+        ),
+    ),
+    (
+        "session turns",
+        "session_bounds",
+        lambda led, extra: _set_session(led, "a1", "assistant_turns", pto.SESSION_TURNS + extra),
+    ),
+    (
+        "session seconds",
+        "session_bounds",
+        lambda led, extra: _set_session(led, "a1", "elapsed", pto.SESSION_SECONDS + extra),
+    ),
+    ("owner output tokens", "owner_output_within_a", _owner_a_at),
+    ("aggregate output tokens", "aggregate_output_within", _aggregate_at),
+    ("total turns", "total_turns_within", _turns_at),
+    (
+        "live seconds",
+        "live_elapsed_within",
+        lambda led, extra: _session(
+            led, "UPDATE runs SET live_ended_at=?", T0 + pto.LIVE_SECONDS + extra
+        ),
+    ),
+    (
+        "cleanup seconds",
+        "cleanup_elapsed_within",
+        lambda led, extra: led.record(
+            "budget", "cleanup_elapsed", float(pto.CLEANUP_SECONDS + extra)
+        ),
+    ),
+]
+
+
+@pytest.mark.parametrize(
+    ("case", "check", "place"), BUDGET_CEILINGS, ids=[c[0] for c in BUDGET_CEILINGS]
+)
+def test_budget_ceilings_are_inclusive(
+    tmp_path: Path, case: str, check: str, place: Callable[[pto.TwoOwnerLedger, int], None]
+) -> None:
+    at = _complete(tmp_path / "at")
+    place(at, 0)
+    assert pto.judge(at, "budget")["checks"][check] is True
+    over = _complete(tmp_path / "over")
+    place(over, 1)
+    assert pto.judge(over, "budget")["checks"][check] is False
+
+
 CLEANUP_BREAKS: list[tuple[str, Callable[[pto.TwoOwnerLedger], None], str]] = [
     (
         "residual inventory",
@@ -2589,6 +2770,11 @@ CLEANUP_BREAKS: list[tuple[str, Callable[[pto.TwoOwnerLedger], None], str]] = [
         "channel not scanned",
         lambda led: led.record("cleanup", "token_scan", {"stdout": {"token_bytes_found": False}}),
         "token_scan_complete",
+    ),
+    (
+        "cleanup past its window",
+        lambda led: led.record("cleanup", "cleanup_within_window", False),
+        "cleanup_within_window",
     ),
 ]
 
@@ -2960,27 +3146,61 @@ def _facts(files: Mapping[str, bytes]) -> pps.TranscriptFacts:
     return pps.parse_native_transcripts(files)
 
 
-def test_elapsed_reading_charges_the_latest_session_until_now() -> None:
-    main = f"{PROJECT}/session-1.jsonl"
-    facts = _facts({main: _jsonl([_reply("m1", 0, 10, []), _reply("m2", 10, 10, [])])})
-    session = facts.sessions[0]
-    assert pto.elapsed_reading(session, facts.sessions, T0 + 10) == 10.0
-    assert pto.elapsed_reading(session, facts.sessions, T0 + 300) == 300.0
-    assert pto.elapsed_reading(None, facts.sessions, T0 + 300) == 0.0
+def _container_pod(state: Mapping[str, Any], name: str = pps.RUNNER_CONTAINER) -> dict[str, Any]:
+    """``kubectl get pod -o json`` with one container status in ``state``."""
+
+    return {"status": {"containerStatuses": [{"name": name, "restartCount": 0, "state": state}]}}
 
 
-def test_hold_usage_is_zero_before_a_response_and_unknown_when_cut() -> None:
+def test_runner_started_at_reads_the_running_runner_container() -> None:
+    running = {"running": {"startedAt": _stamp(-20)}}
+    assert pto.runner_started_at(_container_pod(running)) == T0 - 20
+    pod = _container_pod(running)
+    pod["status"]["containerStatuses"].insert(
+        0, {"name": "sidecar", "state": {"running": {"startedAt": _stamp(-90)}}}
+    )
+    assert pto.runner_started_at(pod) == T0 - 20
+    for unread in (
+        _container_pod({"waiting": {"reason": "ContainerCreating"}}),
+        _container_pod({"running": {"startedAt": "soon"}}),
+        _container_pod(running, name="sidecar"),
+        {"status": {}},
+        {},
+        None,
+    ):
+        assert pto.runner_started_at(unread) is None, unread
+
+
+def test_a_native_clock_starts_at_its_earliest_observation() -> None:
+    assert pto.native_clock_start(monotonic=50.0, wall=T0, container_started=None) == 50.0
+    # The runner container started 20 s before the driver first saw it.
+    assert pto.native_clock_start(monotonic=50.0, wall=T0, container_started=T0 - 20) == 30.0
+    # A container start reported after the observation moves nothing.
+    assert pto.native_clock_start(monotonic=50.0, wall=T0, container_started=T0 + 5) == 50.0
+
+
+def test_hold_usage_is_zero_only_at_the_initial_prompt_hold() -> None:
     main = f"{PROJECT}/session-1.jsonl"
-    assert pto.hold_usage(None) == pps.SessionUsage(0, 0, 0.0, "")
+    zero = pps.SessionUsage(0, 0, 0.0, "")
+    assert pto.hold_usage(None, initial_prompt=True) == zero
+    assert pto.hold_usage(None, initial_prompt=False) is None
     prompt_only = _facts(
         {main: _jsonl([{"type": "user", "timestamp": _stamp(0), "message": {"content": "go"}}])}
     )
-    assert pto.hold_usage(prompt_only.sessions[0]) == pps.SessionUsage(0, 0, 0.0, "")
+    assert pto.hold_usage(prompt_only.sessions[0], initial_prompt=True) == zero
+    assert pto.hold_usage(prompt_only.sessions[0], initial_prompt=False) is None
     replied = _facts({main: _jsonl([_reply("m1", 0, 42, [])])})
-    usage = pto.hold_usage(replied.sessions[0])
-    assert usage is not None and usage.output_tokens == 42 and usage.assistant_turns == 1
+    for initial in (True, False):
+        usage = pto.hold_usage(replied.sessions[0], initial_prompt=initial)
+        assert usage is not None and usage.output_tokens == 42 and usage.assistant_turns == 1
     cut = _facts({main: _jsonl([_reply("m1", 0, 42, [])]) + b'{"type": "assist'})
-    assert pto.hold_usage(cut.sessions[0]) is None
+    assert pto.hold_usage(cut.sessions[0], initial_prompt=False) is None
+    # An API error after real usage: the failed request may have spent what is not shown.
+    errored = _facts({main: _jsonl([_reply("m1", 0, 42, []), _refused_record(_stamp(5))])})
+    (session,) = errored.sessions
+    assert session.usage_known and session.errors
+    for initial in (True, False):
+        assert pto.hold_usage(session, initial_prompt=initial) is None
 
 
 def test_zero_usage_class_keeps_the_error_class_or_the_planned_name() -> None:
