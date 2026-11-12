@@ -2628,3 +2628,66 @@ def test_merged_lineage_state_refreshes_previously_finalized_comments_idempotent
     sink.requests.clear()
     _reconcile()
     assert _writes(sink) == []
+
+
+@pytest.mark.parametrize("state", ["merged", "closed"])
+def test_port_lineage_state_refinalizes_unchanged_completed_comments_idempotently(
+    admitted: Any,  # noqa: F811
+    state: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client, github, _sink = admitted
+    jira = JiraFake()
+    ticket = jira.seed_issue("Ticket")
+    linked: list[uuid.UUID] = []
+
+    async def sync_one(http: Any, settings: Any, claim: Any) -> int:
+        async with jira_client(jira) as jira_http:
+            tracker = jira_tracker(jira, client=jira_http)
+            code_host = _JiraLinkPorts(tracker, claim.row.execution_request_id, linked)
+            with monkeypatch.context() as adapters:
+                adapters.setattr(
+                    factory_notices, "tracker_for_work_item", lambda *_a, **_k: tracker
+                )
+                adapters.setattr(
+                    factory_notices, "code_host_for_repository", lambda *_a, **_k: code_host
+                )
+                issue = jira.ref(ticket)
+                return await factory_notices._sync_through_ports(
+                    http,
+                    settings,
+                    replace(claim, tracker_issue=issue, target=replace(claim.target, issue=issue)),
+                )
+
+    monkeypatch.setattr(factory_notices, "_sync_one", sync_one)
+    request_id = _admit(client, github, _sink, 55836)
+    _start_running(client, request_id)
+    work_item_id = _request(55836)["work_item_id"]
+    _reconcile()
+    assert _notices(request_id)[0]["finalized_at"] is None
+    _reconcile()
+    assert _notices(request_id)[0]["finalized_at"] is None
+    _attach_publication(work_item_id, status="succeeded", pr=77)
+    _reconcile()
+    before = _notices(request_id)[0]
+    assert _request(55836)["status"] == "completed"
+    assert before["finalized_at"] is not None
+    assert before["applied_label"] == "curie-factory:pr-open"
+    writes = jira.writes
+
+    _observe_lineage_state(client, work_item_id, state)
+    assert _notices(request_id)[0]["finalized_at"] is None
+    _reconcile()
+
+    after = _notices(request_id)[0]
+    assert after["finalized_at"] is not None
+    assert after["rendered_digest"] == before["rendered_digest"]
+    assert after["comment_id"] == before["comment_id"]
+    assert jira.writes == writes
+    assert linked == [request_id]
+    assert "curie-factory:pr-open" in jira.issue(ticket.id).labels
+    _reconcile()
+    repeated = _notices(request_id)[0]
+    assert repeated["attempts"] == after["attempts"]
+    assert repeated["finalized_at"] == after["finalized_at"]
+    assert jira.writes == writes

@@ -1061,6 +1061,8 @@ async def _sync_port_comment(tracker: Tracker, code_host: CodeHost, claim: _Stat
     linked = f"{digest}:{pr}"
     stored = row.rendered_digest
     if stored == (linked if link else digest):
+        if FINAL_MARKER in body:
+            row.finalized_at = now
         return 0
     already = link and stored is not None and stored.endswith(f":{pr}")
     try:
