@@ -24,6 +24,7 @@ import datetime as dt
 import hashlib
 import io
 import json
+import signal
 import tarfile
 import urllib.parse
 import uuid
@@ -2061,6 +2062,25 @@ def _recovered_pod(name: str, uid: str, *, restarts: int) -> dict[str, Any]:
     return pod
 
 
+def _held_capture_cluster(h: _Harness, run: pt.PodRun) -> None:
+    pod = {
+        "metadata": {"name": run.pod, "uid": run.pod_uid},
+        "status": {
+            "containerStatuses": [
+                {
+                    "name": "runner",
+                    "restartCount": 0,
+                    "state": {"running": {"startedAt": _stamp(0)}},
+                }
+            ]
+        },
+    }
+    h.shell.on("get", "pods", "--field-selector", f"metadata.name={run.pod}")(
+        lambda _a, _s: {"items": [pod]}
+    )
+    h.shell.on("logs", run.pod)(lambda _a, _s: b"runner log\n")
+
+
 def _interruption_setup(
     h: _Harness,
     *,
@@ -2095,6 +2115,7 @@ def _interruption_setup(
     held.kept_files, held.kept_facts = files, h.run.pod_facts(held, files)
     held.clis = [(4242, 77)]
     held.eof.set()
+    _held_capture_cluster(h, held)
     h.run.a_stop_at = T0 + 5
     h.run.b1_head = HEAD_B1
     h.run.marker_texts["b"] = MARKER_TEXT_B
@@ -3127,7 +3148,7 @@ def test_the_live_window_end_fences_paid_work(tmp_path: Path) -> None:
     assert h.ledger.observations("budget")["allowance_breach"] == ["live:-:live_window"]
     assert {row["source"] for row in _rows(h, "a1")} == {"unknown"}
     # The fence ends every runner; no further reservation or release follows.
-    assert run.stopped is False and _pod_deletes(h, "pod-a1") == []
+    assert run.stopped and len(_pod_deletes(h, "pod-a1")) == 1
     with pytest.raises(pp.StepFailed, match="live_window"):
         h.run.reserve(h.run.new_run("b-probe"))
 
@@ -3153,7 +3174,7 @@ def test_a_watchdog_stop_and_a_main_thread_stop_delete_and_charge_once(tmp_path:
     assert h.ledger.observations("diagnostics")["watchdog_trips"] == ["a1:-:session_seconds"]
 
 
-def test_a_run_idle_after_its_final_stop_is_not_stopped_by_its_clock(tmp_path: Path) -> None:
+def test_a_run_idle_after_its_final_stop_keeps_the_session_deadline(tmp_path: Path) -> None:
     h = _live(tmp_path)
     _through(h, "a1")
     run = _pod_run(h, "a1", card=1)
@@ -3162,11 +3183,13 @@ def test_a_run_idle_after_its_final_stop_is_not_stopped_by_its_clock(tmp_path: P
     _gate(run).queue.append(_hold("stop", 1, size=len(files[MAIN])))
     h.run.pump()
     assert _gate(run).sent == [{"release": "stop-1-1", "verdict": "go"}] and run.idle
-    # The CLI ended after its final response: it asks the model for nothing more.
-    h.clock.wait(pto.SESSION_SECONDS + 100)
+    h.clock.wait(pto.SESSION_SECONDS - 1)
     h.run.pump()
-    assert h.run.paid_failure is None and "fence" not in _trace(h)
-    assert _pod_deletes(h, "pod-a1") == []
+    assert h.run.paid_failure is None
+    h.clock.wait(1)
+    with pytest.raises(pp.StepFailed, match="session_seconds"):
+        h.run.pump()
+    assert len(_pod_deletes(h, "pod-a1")) == 1
 
 
 def test_the_watchdog_thread_starts_and_stops_without_sleeping(tmp_path: Path) -> None:
@@ -3326,6 +3349,7 @@ def _disconnect_setup(h: _Harness, breaks: Mapping[str, Any]) -> None:
     follow.kept_at = h.clock.monotonic()
     follow.kept_files, follow.kept_facts = files, h.run.pod_facts(follow, files)
     follow.eof.set()
+    _held_capture_cluster(h, follow)
     disconnect = {
         "inactive": True,
         "generation_advanced": True,
@@ -4376,7 +4400,7 @@ def test_every_stop_path_takes_the_uncaptured_fence_and_names_the_pod_it_interru
     live = h.run
     assert isinstance(live, _Live) and live.fences == ["emergency"]
     assert _log_reads(h) == []
-    interrupted = path in {"watchdog", "gate-stop"}
+    interrupted = True
     uncaptured = [_removed("pod-a1", "runner", "emergency-stop")] if interrupted else []
     assert h.run.capture_receipts["pod_logs"]["uncaptured"] == uncaptured
     assert len(_pod_deletes(h, "pod-a1")) == int(interrupted)
@@ -4415,3 +4439,157 @@ def test_card_residue_names_every_delivered_card_or_is_not_recorded(tmp_path: Pa
     h.ledger.record("approval", "card3_card", {"delivered": True, "attempts": 1, "error": False})
     h.run.record_cleanup_keys()
     assert h.ledger.observations("cleanup")["card_residue_recorded"] is False
+
+
+@pytest.mark.parametrize("exit_path", ["success", "failure", "signal"])
+def test_finalize_deletes_all_known_runners_before_locks_reads_or_watchdog_stop(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, exit_path: str
+) -> None:
+    h = _live(tmp_path)
+    for group in ("a1", "b1"):
+        _through(h, group)
+        _pod_run(h, group)
+    h.run.mutated = True
+    order = _removal_cluster(h)
+
+    class Guard:
+        def __enter__(self) -> None:
+            assert order[:2] == ["delete-pod-a1", "delete-pod-b1"]
+
+        def __exit__(self, *_args: Any) -> None:
+            pass
+
+    h.run.guard = Guard()  # type: ignore[assignment]
+
+    def fence() -> None:
+        assert not h.run.watch_stop.is_set()
+        assert order[:2] == ["delete-pod-a1", "delete-pod-b1"]
+        order.append("fence")
+
+    h.run.fence_paid_starts = fence  # type: ignore[method-assign]
+    _teardown(h, monkeypatch, 0)
+
+    def phase() -> None:
+        if exit_path == "signal":
+            signal.raise_signal(signal.SIGTERM)
+        if exit_path == "failure":
+            raise pp.StepFailed("fixture failure")
+
+    h.run.phases = lambda: [("running", phase)]  # type: ignore[method-assign]
+    h.run.stop_after = ""
+    result = h.run.execute()
+    assert result == (pps.EXIT_PASS if exit_path == "success" else pps.EXIT_FAIL)
+    assert order[:3] == ["delete-pod-a1", "delete-pod-b1", "fence"]
+    assert h.run.watch_stop.is_set()
+
+
+def test_live_deadline_deletes_both_known_runners_before_scaling_or_discovery(
+    tmp_path: Path,
+) -> None:
+    h = _live(tmp_path)
+    for group in ("a1", "b1"):
+        _through(h, group)
+        _pod_run(h, group)
+    order = _removal_cluster(h)
+    _claims_cluster(h)
+    h.run.emergency_fence = pt.TwoOwnerRun.emergency_fence.__get__(h.run)  # type: ignore[method-assign]
+    h.run.owners["a"].state = h.run.owners["b"].state = "inactive"
+
+    @h.shell.on("get", pp.CLAIM_RESOURCE)
+    def claims(_a: list[str], _s: bytes | None) -> dict[str, Any]:
+        assert order[:2] == ["delete-pod-a1", "delete-pod-b1"]
+        return {"items": []}
+
+    h.clock.current = T0 + pto.LIVE_SECONDS
+    h.run.watchdog_tick()
+    assert order[:3] == ["delete-pod-a1", "delete-pod-b1", "scale-0"]
+    assert h.run.paid_failure == "live: the watchdog stopped paid work (live_window)"
+
+
+@pytest.mark.parametrize("phase", ["disconnect", "process-interruption"])
+def test_planned_runtime_stops_capture_logs_and_transcripts_before_product_deletion(
+    tmp_path: Path, phase: str
+) -> None:
+    h = _live(tmp_path)
+    if phase == "disconnect":
+        _disconnect_setup(h, {})
+        run = h.run.pod_run("a3")
+
+        def stop(_owner: pt.Owner) -> dict[str, Any]:
+            assert [call.argv[call.argv.index("logs") + 1] for call in _log_reads(h)] == [run.pod]
+            assert run.kept_files and h.run.await_coverage(run, run.kept or {}, allow_missing=False)
+            raise pp.StepFailed("captured before disconnect")
+
+        h.run.disconnect_owner = stop  # type: ignore[method-assign]
+        call = h.run.phase_disconnect_a
+    else:
+        run = _interruption_setup(h)
+
+        def interrupt(_pod: str, _hold: Mapping[str, Any]) -> dict[str, Any]:
+            assert [call.argv[call.argv.index("logs") + 1] for call in _log_reads(h)] == [run.pod]
+            assert run.kept_files and h.run.await_coverage(run, run.kept or {}, allow_missing=False)
+            raise pp.StepFailed("captured before interruption")
+
+        h.run.interrupt_native_process = interrupt  # type: ignore[method-assign]
+        call = h.run.phase_process_interruption
+    with pytest.raises(pp.StepFailed, match="captured before"):
+        call()
+    assert h.run.capture_receipts["pod_logs"]["before_deletion"] == [
+        _removed(run.pod, "runner", phase)
+    ]
+    assert h.runtime.scan.as_json()["pod_logs"]["scanned_bytes"] > 0
+
+
+@pytest.mark.parametrize("missing", ["pod", "logs", "transcript", "restarted"])
+def test_capture_loss_before_disconnect_charges_full_share_and_ends_attempt(
+    tmp_path: Path, missing: str
+) -> None:
+    h = _live(tmp_path)
+    _disconnect_setup(h, {})
+    run = h.run.pod_run("a3")
+    if missing == "pod":
+        h.shell.handlers.insert(
+            0, (("get", "pods", "--field-selector"), lambda _a, _s: {"items": []})
+        )
+    elif missing == "logs":
+        h.shell.handlers.insert(
+            0, (("logs", run.pod), lambda _a, _s: pp.Completed(1, b"", b"not found"))
+        )
+    elif missing == "restarted":
+        run.restart_count += 1
+    else:
+        run.harvest = pps.HarvestState(h.runtime.scan)
+    with pytest.raises(pp.StepFailed, match="capture incomplete"):
+        h.run.phase_disconnect_a()
+    assert {row["source"] for row in _rows(h, "a3")} == {"unknown"}
+    assert sum(int(row["reserved_output"]) for row in _rows(h, "a3")) <= h.ledger.owner_spent("a")
+    assert "fence" in _trace(h)
+
+
+def test_capture_audit_accounts_for_a_runner_deleted_by_the_product(tmp_path: Path) -> None:
+    h = _live(tmp_path)
+    _through(h, "a1")
+    run = _pod_run(h, "a1")
+    files = {MAIN: _jsonl([_prompt(), _reply("m1", 1, 30, [])])}
+    _feed(run, files)
+    h.run.settle_run(run, facts=h.run.pod_facts(run), complete=True)
+    _capture_cluster(h)
+    pt.TwoOwnerRun.capture_audit(h.run)
+    assert {row["source"] for row in _rows(h, "a1")} == {"unknown"}
+    assert h.ledger.owner_spent("a") >= sum(r.output_tokens for r in run.reservations)
+    receipts = h.ledger.observations("cleanup")["capture_audit"]
+    assert receipts["pod_logs"]["failures"] > 0
+    assert receipts["pod_logs"]["uncaptured"] == [_removed(run.pod, "runner", "capture-missing")]
+
+
+def test_capture_audit_cannot_reuse_a_prior_containers_logs(tmp_path: Path) -> None:
+    h = _live(tmp_path)
+    _disconnect_setup(h, {})
+    run = h.run.pod_run("a3")
+    pods = h.run.kube.json("get", "pods", "--field-selector", f"metadata.name={run.pod}")
+    h.run.capture_before_deletion(pods["items"], workload="runner", step="disconnect")
+    h.run.settle_run(run, facts=run.kept_facts, complete=True)
+    run.restart_count += 1
+    _capture_cluster(h)
+    pt.TwoOwnerRun.capture_audit(h.run)
+    assert {row["source"] for row in _rows(h, "a3")} == {"unknown"}

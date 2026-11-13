@@ -1041,6 +1041,8 @@ class TwoOwnerLedger(pps.Ledger):
 
     @staticmethod
     def _tokens(row: Mapping[str, Any], live: Mapping[int, int] | None) -> int:
+        if row["source"] == "unknown":
+            return int(row["reserved_output"])
         if row["output_tokens"] is not None:
             return int(row["output_tokens"])
         if row["source"] == "reserved":
@@ -1054,6 +1056,8 @@ class TwoOwnerLedger(pps.Ledger):
 
     @staticmethod
     def _turns(row: Mapping[str, Any]) -> int:
+        if row["source"] == "unknown":
+            return int(row["reserved_turns"])
         if row["assistant_turns"] is not None:
             return int(row["assistant_turns"])
         if row["source"] == "unreserved":
@@ -1177,7 +1181,10 @@ class TwoOwnerLedger(pps.Ledger):
             if live_remaining < SESSION_SECONDS:
                 raise pps.Refusal("allowance_exhausted", "live seconds")
             window = self._recorded(db, _window_key(group.owner))
-            if not isinstance(window, (int, float)) or float(window) - now < live_remaining:
+            if (
+                not isinstance(window, (int, float))
+                or float(window) - now < live_remaining + CLEANUP_SECONDS
+            ):
                 raise pps.Refusal("lifetime_insufficient", f"owner {group.owner} window")
             base = max((int(row["seq"]) for row in rows), default=0)
             attempt = group_index(name)
@@ -2814,9 +2821,9 @@ REMOVAL_RECORDS = ("before_deletion", "uncaptured")
 POD_WORKLOADS = ("worker", "runner")
 #: The removals that capture first: a worker scale-down, a runner pod deletion
 #: and the planned fence (the live end, the rehearsal cut and finalize).
-CAPTURED_REMOVALS = ("stop-worker", "remove-pod", "fence")
+CAPTURED_REMOVALS = ("stop-worker", "remove-pod", "fence", "disconnect", "process-interruption")
 #: Every removal step; the stop path's two capture nothing.
-REMOVAL_STEPS = (*CAPTURED_REMOVALS, "emergency-stop", "emergency-fence")
+REMOVAL_STEPS = (*CAPTURED_REMOVALS, "emergency-stop", "emergency-fence", "capture-missing")
 #: Forge file contents read at published heads (``TwoOwnerRun.forge_file``).
 FORGE_CHANNEL = "forge"
 #: Every channel a live ledger must show scanned, with at least one byte and no token.
@@ -3237,8 +3244,12 @@ def _judge_budget(ledger: TwoOwnerLedger) -> tuple[dict[str, bool], dict[str, in
         "cleanup_elapsed_within": isinstance(cleanup, (int, float))
         and not isinstance(cleanup, bool)
         and 0 <= float(cleanup) <= CLEANUP_SECONDS,
-        "owner_windows_covered": live_end is not None
-        and all(value is not None and value >= float(live_end) for value in windows.values()),
+        "owner_windows_covered": live_start is not None
+        and live_end is not None
+        and all(
+            value is not None and value >= float(live_start) + GRANT_MIN_LIFETIME
+            for value in windows.values()
+        ),
     }
     counts = {
         "sessions": len(rows),

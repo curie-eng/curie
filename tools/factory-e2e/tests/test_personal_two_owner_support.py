@@ -939,7 +939,7 @@ def test_reserve_group_refusals(
 
 
 def test_reserve_group_boundaries_are_admitted(tmp_path: Path) -> None:
-    ledger = _ledger(tmp_path, windows={"a": T0 + pto.LIVE_SECONDS, "b": WINDOW})
+    ledger = _ledger(tmp_path, windows={"a": T0 + pto.GRANT_MIN_LIFETIME, "b": WINDOW})
     now = T0 + pto.LIVE_SECONDS - pto.SESSION_SECONDS
     assert len(ledger.reserve_group("a-probe", now=now)) == 1
 
@@ -4223,3 +4223,34 @@ def test_restart_observations_are_reported_and_never_required(tmp_path: Path) ->
     every = pto.judge(ledger, "all")
     assert every["verdict"] == "pass"
     assert every["observed"] == {f"restarts.{key}": value for key, value in recorded.items()}
+
+
+@pytest.mark.parametrize("extra", [-600, -1, 0, 1])
+def test_reservation_requires_grant_through_live_and_cleanup(tmp_path: Path, extra: int) -> None:
+    ledger = _ledger(tmp_path, windows={"a": T0 + pto.GRANT_MIN_LIFETIME + extra, "b": WINDOW})
+    if extra < 0:
+        _refused("lifetime_insufficient", lambda: ledger.reserve_group("a-probe", now=T0 + 100))
+        assert ledger.session_rows() == []
+    else:
+        assert len(ledger.reserve_group("a-probe", now=T0 + 100)) == 1
+
+
+def test_budget_judge_rejects_window_ending_before_cleanup(tmp_path: Path) -> None:
+    ledger = _complete(tmp_path)
+    _session(
+        ledger,
+        "UPDATE observations SET value_json=? WHERE criterion='budget' AND key='usable_until_b'",
+        json.dumps(T0 + pto.GRANT_MIN_LIFETIME - 1),
+    )
+    result = pto.judge(ledger, "budget")
+    assert result["checks"]["owner_windows_covered"] is False
+
+
+def test_lost_capture_charges_previously_settled_usage_in_full(tmp_path: Path) -> None:
+    ledger = _ledger(tmp_path)
+    reservation = ledger.reserve_group("a-probe", now=T0)[0]
+    ledger.settle(reservation.seq, pps.SessionUsage(1, 1, 1, pto.PROBE_MODEL), source="probe")
+    ledger.settle(reservation.seq, None, source="unknown")
+    assert ledger.owner_spent("a") == reservation.output_tokens
+    assert ledger.aggregate_spent() == reservation.output_tokens
+    _refused("usage_unknown", lambda: ledger.reserve_group("b-probe", now=T0))

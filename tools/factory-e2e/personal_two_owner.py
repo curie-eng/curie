@@ -479,7 +479,7 @@ class PodRun(pp.Attempt):
     gate event). Subagents run inside that process, so every session of the
     run shares it, and it never stops. ``kept_at`` is on the same clock.
     ``idle`` is true between the release of the main session's final Stop
-    hold and the next hold: the CLI asks the model for nothing in between.
+    hold and the next hold; released subagents may still be calling the model.
     ``stopped`` is true once the driver ended the native runtime itself (a
     pod deletion or the process interruption); no clock acts on it again.
     ``workspace_first`` is a fresh runtime's workspace (``pto.workspace_state``)
@@ -1217,6 +1217,7 @@ class TwoOwnerRun(pp.LiveRun):
         # once set, nothing releases a hold, reserves, admits or scales up again.
         self.paid_failure: str | None = None
         self.deleted_uids: set[str] = set()
+        self.runner_log_instances: set[tuple[str, int]] = set()
         self.watch_stop = threading.Event()
         self.watch_thread: threading.Thread | None = None
         self.watch_ledger: pto.TwoOwnerLedger | None = None
@@ -1714,8 +1715,7 @@ class TwoOwnerRun(pp.LiveRun):
         The native clock stops a run at its session limit while its native
         process may still ask the model for more, whether or not any session
         was parsed. It does not act on a run the driver closed or stopped
-        itself, on one idle after its final Stop release, or on one the driver
-        settled and is ending on purpose (that run's kept hold is still timed).
+        itself, or one settled and ending on purpose (its kept hold is still timed).
         """
 
         if run.closed or run.stopped:
@@ -1723,7 +1723,7 @@ class TwoOwnerRun(pp.LiveRun):
         held = now - run.kept_at >= pto.HOLD_SECONDS - KEPT_MARGIN_SECONDS
         if run.kept is not None and not run.eof.is_set() and held:
             return "kept_hold_expired"
-        if run.clock_started is None or run.idle or (run.ending and run.settled):
+        if run.clock_started is None or (run.ending and run.settled):
             return ""
         if now - run.clock_started >= self.session_limit(run):
             return "session_seconds"
@@ -1762,6 +1762,7 @@ class TwoOwnerRun(pp.LiveRun):
     def trip(self, run: PodRun | None, reason: str) -> None:
         """The watchdog's stop: interrupt the run, charge every open share, fence, fail."""
 
+        self.interrupt_known_runners()
         where = run.group if run is not None else "live"
         entry = f"{where}:-:{reason}"
         with self.guard:
@@ -1810,6 +1811,7 @@ class TwoOwnerRun(pp.LiveRun):
             while not self.watch_stop.wait(WATCHDOG_SECONDS):
                 self.watchdog_tick()
         except Exception:  # noqa: BLE001 - a watchdog that cannot keep its clocks fails closed
+            self.interrupt_known_runners()
             with self.guard:
                 if self.paid_failure is None:
                     self.paid_failure = "the watchdog could not keep the clocks"
@@ -1859,6 +1861,7 @@ class TwoOwnerRun(pp.LiveRun):
         process first.
         """
 
+        self.interrupt_known_runners()
         entry = f"{run.group}:{role or '-'}:{reason}"
         message = f"{run.group}: the gate stopped a session ({reason})"
         with self.guard:
@@ -1879,24 +1882,42 @@ class TwoOwnerRun(pp.LiveRun):
         The stop path reads no log first: the pod is named uncaptured instead.
         """
 
-        with self.guard:
+        self.interrupt_known_runners([run])
+
+    def interrupt_known_runners(self, runs: Sequence[PodRun] | None = None) -> None:
+        """Issue every known pod delete before taking a lock or doing other IO."""
+
+        removed: list[PodRun] = []
+        for run in list(self.pods) if runs is None else runs:
             run.ending = run.stopped = True
             identity = run.pod_uid or run.pod
             if not run.pod or identity in self.deleted_uids:
-                return
-            self.deleted_uids.add(identity)
+                continue
             self.pod_deletions.append((run.pod, run.pod_uid, self.clock.now()))
-            self.kube.ctl(
-                "delete",
-                "pod",
-                run.pod,
-                "--ignore-not-found",
-                "--grace-period=0",
-                "--wait=false",
-                timeout=60,
-                check=False,
+            result = self.safe(
+                functools.partial(
+                    self.kube.ctl,
+                    "delete",
+                    "pod",
+                    run.pod,
+                    "--ignore-not-found",
+                    "--grace-period=0",
+                    "--wait=false",
+                    timeout=60,
+                    check=False,
+                ),
+                None,
             )
-            self.note_removal(run.pod, workload="runner", step="emergency-stop", captured=False)
+            if result is not None and result.returncode == 0:
+                self.deleted_uids.add(identity)
+            removed.append(run)
+        for run in removed:
+            self.note_removal(
+                run.pod,
+                workload="runner",
+                step="emergency-stop",
+                captured=(run.pod_uid, run.restart_count) in self.runner_log_instances,
+            )
 
     def charge_open(self) -> None:
         """Every reserved, unsettled session becomes unknown: charged at its full share."""
@@ -1910,6 +1931,7 @@ class TwoOwnerRun(pp.LiveRun):
     def fail_paid(self, message: str) -> NoReturn:
         """A paid phase failed: charge what is open, fence, and stop."""
 
+        self.interrupt_known_runners()
         with self.guard:
             if self.paid_failure is None:
                 self.paid_failure = message
@@ -2450,6 +2472,9 @@ class TwoOwnerRun(pp.LiveRun):
                 ]
                 names = self.capture_before_deletion(pods, workload="runner", step="remove-pod")
                 captured = run.pod in names
+            if (run.pod_uid, run.restart_count) not in self.runner_log_instances:
+                self.unknown_runner(run)
+                self.fail_paid(f"{run.group}: runner vanished before capture")
         with self.guard:
             run.ending = run.stopped = True
             if identity not in self.deleted_uids and self.pod_uid_present(run.pod, run.pod_uid):
@@ -3531,6 +3556,7 @@ class TwoOwnerRun(pp.LiveRun):
         self.require_live("disconnect-a")
         a = self.owners["a"]
         follow, held = self.pod_run("a3"), self.pod_run("b-r1")
+        self.capture_held_runner(follow, step="disconnect")
         follow.ending = True
         self.settle_run(follow, facts=follow.kept_facts, complete=follow.kept is not None)
         self.ledger.record("disconnect", "a3_settled_from_hold", self.settled_known("a3"))
@@ -3625,6 +3651,7 @@ class TwoOwnerRun(pp.LiveRun):
         held = self.pod_run("b-r1")
         if held.kept is None:
             self.fail_paid("B-r1 is not held at its prompt")
+        self.capture_held_runner(held, step="process-interruption")
         held.ending = True
         self.settle_run(held, facts=held.kept_facts, complete=True)
         before = self.request_row(held.request_id)
@@ -5878,15 +5905,9 @@ class TwoOwnerRun(pp.LiveRun):
     # -- fences -----------------------------------------------------------------------------
 
     def fence_paid_starts(self) -> None:
-        """The planned fence (live end, rehearsal cut, finalize): logs first, then ``fence``.
+        """Stop known runners first, capture remaining pods, then fence discovery and grants."""
 
-        Every worker and runner pod in the release namespace is listed and its
-        logs captured (``capture_before_deletion``, each read bounded) before
-        the worker is scaled down and the runner pods deleted. The captures run
-        outside ``guard``, so the watchdog's stop is never held behind them; a
-        runner pod the fence deletes that was not captured is named uncaptured.
-        """
-
+        self.interrupt_known_runners()
         captured: set[str] = set()
         listed = self.listed_before_deletion("get", "pods")
         if listed is not None:
@@ -5909,6 +5930,7 @@ class TwoOwnerRun(pp.LiveRun):
         named uncaptured in the pod_logs receipt, so the gap is explicit.
         """
 
+        self.interrupt_known_runners()
         self.fence("emergency-fence", None)
 
     def fence(self, step: str, captured: set[str] | None) -> None:
@@ -5926,6 +5948,7 @@ class TwoOwnerRun(pp.LiveRun):
         are named (``note_fenced``).
         """
 
+        self.interrupt_known_runners()
         failures: list[str] = []
 
         def attempt(name: str, call: Callable[[], Any]) -> Any:
@@ -6071,24 +6094,15 @@ class TwoOwnerRun(pp.LiveRun):
     # -- finalize and inventory ----------------------------------------------------------
 
     def finalize(self) -> bool:
-        """Fence, then charge and observe, then the inherited teardown, on one cleanup clock.
+        """Delete known runners before any lock or read, then fence and audit on one clock.
 
-        On success, failure and signal alike, the clock starts first and the
-        first action of a live run's finalize (or of any run whose owner may
-        still be enrolled) is the fence: runner execution and grant delivery
-        stop before anything waits for the worker's graceful exit. The
-        watchdog is stopped around it. Only then are open sessions charged at
-        their share, the summary keys gathered and the gate streams closed.
-        The fence first captures the logs of the pods it removes, each read
-        bounded (``fence_paid_starts``); the capture audit (``capture_audit``)
-        follows, before any teardown removes what it reads. Every remaining
-        teardown step runs even past CLEANUP_SECONDS; a cleanup longer than
-        that is recorded as a breach the cleanup judge fails
-        (``cleanup_within_window``).
+        The watchdog stays active until the fence has stopped execution and
+        grant delivery. Missing pre-stop captures fail the audit and charge
+        usage as unknown. Teardown still runs after a cleanup deadline breach.
         """
 
         started = self.clock.monotonic()
-        self.watch_stop.set()
+        self.interrupt_known_runners()
         live = self.ledger.run_row()["live_started_at"] is not None
         if self.mutated and (live or any(owner.may_be_active() for owner in self.owners.values())):
             self.safe(self.fence_paid_starts, None)
@@ -6167,6 +6181,10 @@ class TwoOwnerRun(pp.LiveRun):
         try:
             for namespace in (self.inputs.namespace, self.grant_namespace):
                 self.capture_namespace(self.kube_in(namespace), receipts)
+            for run in self.pods:
+                identity = (run.pod_uid, run.restart_count)
+                if run.pod_uid and identity not in self.runner_log_instances:
+                    self.unknown_runner(run)
             self.capture_api(receipts)
             self.capture_traces(backend, receipts)
         except Exception:  # noqa: BLE001 - an audit that cannot finish fails its channels
@@ -6241,8 +6259,9 @@ class TwoOwnerRun(pp.LiveRun):
             name = str((pod.get("metadata") or {}).get("name") or "")
             if not name:
                 continue
-            complete = True
-            for _pod, container, previous in pto.container_log_reads({"items": [pod]}):
+            reads = pto.container_log_reads({"items": [pod]})
+            complete = bool(reads)
+            for _pod, container, previous in reads:
                 flags = ("--previous",) if previous else ()
                 read = functools.partial(
                     self.captured_output,
@@ -6255,9 +6274,43 @@ class TwoOwnerRun(pp.LiveRun):
                     timeout=PRE_DELETE_READ_SECONDS,
                 )
                 complete = self.capture(pto.POD_LOGS_CHANNEL, receipts, read) and complete
+            if complete and workload == "runner":
+                uid = str((pod.get("metadata") or {}).get("uid") or "")
+                if uid:
+                    self.runner_log_instances.add((uid, self.runner_restarts(pod)))
             self.note_removal(name, workload=workload, step=step, captured=complete)
-            named.add(name)
+            if complete:
+                named.add(name)
         return named
+
+    def capture_held_runner(self, run: PodRun, *, step: str) -> None:
+        """Require the held transcript and that exact pod's logs before a planned stop."""
+
+        listed = self.listed_before_deletion(
+            "get", "pods", "--field-selector", f"metadata.name={run.pod}"
+        )
+        pods = [
+            pod
+            for pod in self.listed_items(listed)
+            if (pod.get("metadata") or {}).get("uid") == run.pod_uid
+            and (pod.get("metadata") or {}).get("name") == run.pod
+            and self.runner_restarts(pod) == run.restart_count
+        ]
+        transcript = run.kept is not None and self.await_coverage(
+            run, run.kept, allow_missing=run.kept.get("mode") == "prompt"
+        )
+        captured = self.capture_before_deletion(pods, workload="runner", step=step)
+        if not transcript or run.pod not in captured:
+            self.unknown_runner(run)
+            self.fail_paid(f"{run.group}: runner capture incomplete before {step}")
+
+    def unknown_runner(self, run: PodRun) -> None:
+        """A lost capture invalidates even previously settled usage."""
+
+        self.note_missed(run.pod, workload="runner", step="capture-missing")
+        self.capture_receipts[pto.POD_LOGS_CHANNEL]["failures"] += 1
+        for reservation in run.reservations:
+            self.book().settle(reservation.seq, None, source="unknown")
 
     def note_removal(self, pod: str, *, workload: str, step: str, captured: bool) -> bool:
         """Name one removed pod in the pod_logs receipt, once, as captured first or not.
@@ -6288,13 +6341,25 @@ class TwoOwnerRun(pp.LiveRun):
         if not isinstance(pods, dict):
             # An unread pod list is an unread log, never an empty namespace.
             receipts[pto.POD_LOGS_CHANNEL]["failures"] += 1
+        complete_uids: dict[tuple[str, int], bool] = {}
+        names = {
+            str((pod.get("metadata") or {}).get("name") or ""): (
+                str((pod.get("metadata") or {}).get("uid") or ""), self.runner_restarts(pod)
+            )
+            for pod in self.listed_items(pods)
+        }
         for pod, container, previous in pto.container_log_reads(pods):
             flags = ("--previous",) if previous else ()
-            self.capture(
+            ok = self.capture(
                 pto.POD_LOGS_CHANNEL,
                 receipts,
                 functools.partial(self.captured_output, kube, "logs", pod, "-c", container, *flags),
             )
+            uid = names[pod]
+            complete_uids[uid] = complete_uids.get(uid, True) and ok
+        self.runner_log_instances.update(
+            identity for identity, ok in complete_uids.items() if identity[0] and ok
+        )
         self.capture(
             pto.EVENTS_CHANNEL,
             receipts,

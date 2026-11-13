@@ -593,11 +593,12 @@ observation of its native process (the runner container's start when the pod
 reports it, else the pod's discovery or its first hold); subagents run inside
 that process and share it, and it never stops. A watchdog thread, also run at
 every wait, stops a run at 300 s while its native process may still ask the
-model for more (not after its final Stop release), stops a kept hold 15 s
-before its hook gives up, and fences paid starts when the 4,800 s live window
-ends, even while the main thread is blocked in a call. It shares one lock with
-the main thread's stop paths, so a pod is deleted and a share charged once, and
-finalize stops it. Before the first prompt release the
+model for more, including while the main session is idle after Stop, stops a
+kept hold 15 s before its hook gives up, and fences paid starts when the 4,800 s live window
+ends, even while the main thread is blocked in a call. Known runner pods are
+deleted before any log read, scale call, claim discovery or lock wait on exit.
+Finalize keeps the watchdog until the fence has stopped execution and grant
+delivery. Settlement uses the shared lock. Before the first prompt release the
 driver writes `/tmp/pto-gate/limits.json` with the pod's reviewer allowance from
 its group (one plan and one diff reviewer for three-role groups, two diff
 reviewers for b-r2, none for probes, a3 and b-r1). An absent file, a missing
@@ -647,34 +648,33 @@ CLI reads session files the driver writes 0600 and the finalizer removes.
 3. Principal sessions are minted during the run through a run-local identity
    provider, so `preflight` validates file safety, windows, schedule and images,
    and the run validates sessions through `/console/principal`.
-4. Code-host steering by another owner is admitted under the original owner by
-   design and is not driven.
+4. Code-host steering by another owner was observed admitted under the original
+   owner, with billing remaining that owner's; whether this should be admitted
+   is a product question. It is not the wrong-owner Slack steer control.
 5. `curie cluster message` cannot target a GitHub-issue conversation, so no
    message control is recorded.
 6. A run's 300 s clock counts its native process's whole life from the first
-   observation, but it does not act while the run is idle after the main
-   session's final Stop release, since that CLI asks for nothing more (a pod
-   parked at an approval is not stopped). A later hold on the run is judged on
-   the same clock.
+   observation, including idle time after the main session's Stop, because a
+   previously released subagent may still be generating.
 7. The watchdog acts at its deadline (300 s, 4,800 s), as the ceiling decision
    says; settled usage exactly at a ceiling still passes the budget judge.
 8. The drill runs in the live run too. A publication approval owes no model
    wake and the approved drill publication's push Job fails fetching its
    all-zero base, so the drill starts no native session and pushes nothing;
    the driver also checks both after the drill.
-9. The capture audit runs after the fence, when the pods the driver removed
-   on purpose are gone, so each planned removal reads their logs first: the
-   worker pods before every worker scale-down, a runner pod before its
-   deletion at its park (A1's pod recreation included), and every worker and
-   runner pod before the planned fence (the live end, the rehearsal cut and
-   finalize). Each read is one `kubectl logs` per container instance, current
-   and previous, bounded at 10 s and scanned in memory on pod_logs; a read
-   that fails or times out fails that channel and the removal goes ahead. A
-   planned removal that missed a pod names it `uncaptured` and fails the
-   channel. The stop path (watchdog, gate stop, paid failure) reads no log, for
-   speed: it names each runner pod it deleted and each worker pod still
-   draining as `uncaptured`, counted (`pods_uncaptured`) but not failed, since
-   that path has already failed the run.
+9. Each planned runtime removal captures the runner's logs and transcripts
+   first, including A's disconnect and B's process interruption. Worker logs
+   are read before planned scale-downs. Each log read is bounded at 10 s and
+   scanned in memory. Emergency exits delete known runners first; any missing
+   capture is recorded and fails the audit. The audit checks every runner pod
+   seen during the run, including pods the product removed before finalization.
+   Missing capture makes that group's usage unknown, charges its full share
+   even if previously settled, and prevents a passing result.
+10. Grant windows cover the 4,800 s live window and the 600 s cleanup window;
+    reservations recheck the fixed end of both windows after unpaid preparation.
+11. The shared forge probe polls the ref listing after deleting its own branch,
+    for both scenarios, so an eventually consistent listing can converge before
+    the unchanged absence check. It changes neither ownership nor cleanup scope.
 
 ### Not met
 
