@@ -96,9 +96,10 @@ def test_reader_produces_the_shared_valid_replies(facts_world: Any, vector: dict
                     select(AgentChannel).where(AgentChannel.agent_id == world.agent_id)
                 )
                 binding.trigger_label = expected.subject.trigger_label
-                for kind, entries in (
-                    ("tool", [*expected.executables, *expected.services]),
-                    ("model_credit", [expected.model_credit]),
+                for kind, entries, prefix in (
+                    ("tool", expected.executables, ""),
+                    ("tool", expected.services, "service:"),
+                    ("model_credit", [expected.model_credit], ""),
                 ):
                     for item in entries:
                         if item.reason == "observation_missing":
@@ -108,7 +109,7 @@ def test_reader_produces_the_shared_valid_replies(facts_world: Any, vector: dict
                                 kind=kind,
                                 agent_id=world.agent_id,
                                 scope=expected.subject.repository_id if kind == "tool" else "",
-                                item=item.name if kind == "tool" else "",
+                                item=prefix + item.name if kind == "tool" else "",
                                 subject_digest="sha256:" + "b" * 64,
                                 state=item.state,
                                 reason=item.reason,
@@ -377,6 +378,55 @@ def test_selected_image_rows_distinguish_absent_outside_and_unobserved(
     )
     assert answer.services[0].state == ("unknown" if expiry == "missing" else "configured")
     assert answer.services[1].state == "unknown"
+
+
+@pytest.mark.parametrize(
+    ("state", "reason"),
+    [
+        ("unknown", "runner_unavailable"),
+        ("unknown", "unreadable"),
+        ("present", None),
+        ("absent", None),
+    ],
+)
+def test_non_docker_services_do_not_read_executable_observations(
+    facts_world: Any, state: str, reason: str | None
+) -> None:
+    from curie_api.models import FactoryFactObservation
+    from forge_fakes.github import REPO_ID
+    from test_factory_facts_intake import facts
+
+    world = facts_world
+
+    async def seed() -> None:
+        now = datetime.now(UTC)
+        async with world.sessions() as session:
+            session.add(
+                FactoryFactObservation(
+                    kind="tool",
+                    agent_id=world.agent_id,
+                    scope=str(REPO_ID),
+                    item="git",
+                    subject_digest="sha256:" + "a" * 64,
+                    state=state,
+                    reason=reason,
+                    observed_at=now,
+                    expires_at=now + timedelta(seconds=900),
+                )
+            )
+            await session.commit()
+
+    asyncio.run(seed())
+    world.add(executables=["git"], services=["git"])
+    world.cycle()
+    answer = facts(world)
+    assert (answer.executables[0].state, answer.executables[0].reason) == (state, reason)
+    service = answer.services[0]
+    assert (service.state, service.reason, service.observed_at) == (
+        "unknown",
+        "observation_missing",
+        None,
+    )
 
 
 def test_no_http_method_accepts_an_uploaded_tool_observation(facts_world: Any) -> None:

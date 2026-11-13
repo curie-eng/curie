@@ -120,7 +120,7 @@ async def read_facts(
                     kind="tool",
                     agent_id=binding.agent_id,
                     scope=repository_id,
-                    item="service:docker" if model is ServiceFact and name == "docker" else name,
+                    item=f"service:{name}" if model is ServiceFact else name,
                     now=now,
                 )
                 identity["observations"].append(["tool", name, observation.subject_digest])

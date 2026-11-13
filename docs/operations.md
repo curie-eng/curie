@@ -4194,9 +4194,11 @@ Catalog version 1 contains `bash`, `sh`, `git`, `curl`, `wget`, `jq`, `make`,
 
 Observations expire 900 seconds after their original observation time. Reading
 facts or ticking an unchanged subject never extends a positive observation;
-renewal requires another successful probe. A changed selection, configuration
-or catalog deletes old rows before replacement. The API reads these cached
-rows without starting a run or accepting uploaded observations. A name outside
+renewal requires another successful probe. Unchanged subjects reprobe when
+300 seconds or less remain, keeping the old rows readable until replacement.
+A changed selection, configuration or catalog deletes old rows before
+replacement. The API reads these cached rows without starting a run or
+accepting uploaded observations. A name outside
 the current catalog answers `unknown` with reason `outside_catalog`; missing or
 expired observations remain `unknown`.
 

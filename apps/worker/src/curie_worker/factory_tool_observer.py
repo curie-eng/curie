@@ -191,25 +191,31 @@ class FactoryToolObserver:
             ]
         )
         previous = self._current.get(key)
-        if previous is not None and previous[0] == configuration:
+        unchanged = previous is not None and previous[0] == configuration
+        if unchanged and previous is not None:
             async with self._engine.begin() as conn:
-                current = await conn.scalar(
-                    text(f"""
-                    SELECT count(*) FROM {self._schema}.factory_fact_observations
+                current = (
+                    await conn.execute(
+                        text(f"""
+                    SELECT count(*), min(expires_at)
+                    FROM {self._schema}.factory_fact_observations
                     WHERE kind = 'tool' AND agent_id = :agent AND scope = :scope
-                      AND subject_digest = :digest AND expires_at > :now
+                      AND subject_digest = :digest
                 """),
-                    {
-                        "now": now,
-                        "agent": subject.agent_id,
-                        "scope": subject.repository_id,
-                        "digest": previous[1],
-                    },
-                )
-                if current == len(CATALOG) + int(docker):
+                        {
+                            "agent": subject.agent_id,
+                            "scope": subject.repository_id,
+                            "digest": previous[1],
+                        },
+                    )
+                ).one()
+                if current[0] == len(CATALOG) + int(docker) and current[1] > now + timedelta(
+                    seconds=INTERVAL_SECONDS
+                ):
                     return
-        self._current.pop(key, None)
-        await self._delete(subject)
+        if not unchanged:
+            self._current.pop(key, None)
+            await self._delete(subject)
         identity = digest(
             [str(subject.agent_id), subject.repository_id, selection.identity, CATALOG_VERSION]
         )

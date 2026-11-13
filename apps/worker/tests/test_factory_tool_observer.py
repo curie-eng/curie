@@ -108,6 +108,98 @@ class ClusterAPI:
                     del self.objects[key]
 
 
+class ProbeCoreAPI:
+    # Kubernetes v1.31 Pod, ContainerStatus and NodeSystemInfo response fields:
+    # https://kubernetes.io/docs/reference/generated/kubernetes-api/v1.31/
+    def __init__(self) -> None:
+        self.runner_status = NS(name="runner", image_id=IMAGE, state=NS(terminated=NS(exit_code=0)))
+        self.runner = NS(name="runner", security_context=NS(run_as_user=1001))
+        self.pod = NS(
+            status=NS(
+                container_statuses=[
+                    NS(name="sidecar", image_id="invalid", state=NS(terminated=NS(exit_code=1))),
+                    self.runner_status,
+                ]
+            ),
+            spec=NS(
+                containers=[NS(name="sidecar"), self.runner],
+                security_context=NS(run_as_user=1000),
+                node_name="acme-node",
+            ),
+        )
+        self.platform = NS(operating_system="linux", architecture="amd64")
+        self.node = NS(status=NS(node_info=self.platform))
+        self.output = "".join(f"{name}={int(name in {'sh', 'git'})}\n" for name in CATALOG)
+
+    def read_namespaced_pod(self, name: str, namespace: str, **kwargs: Any) -> Any:
+        return self.pod
+
+    def read_node(self, name: str, **kwargs: Any) -> Any:
+        assert name == "acme-node"
+        return self.node
+
+    def read_namespaced_pod_log(
+        self, name: str, namespace: str, *, container: str, **kwargs: Any
+    ) -> str:
+        assert container == "runner"
+        return self.output
+
+
+@pytest.mark.parametrize("variant", ["container_user", "pod_user", "arm64", "containerd"])
+def test_real_client_reads_the_runner_container_result(variant: str) -> None:
+    client, _ = cluster_client()
+    core = ProbeCoreAPI()
+    client._core_api = core  # type: ignore[assignment]
+    if variant == "pod_user":
+        core.runner.security_context = None
+    elif variant == "arm64":
+        core.platform.architecture = "arm64"
+    elif variant == "containerd":
+        core.runner_status.image_id = "containerd://sha256:" + "a" * 64
+    result = client.read_tool_probe("acme-probe", deadline=time.monotonic() + 5)
+    assert result is not None
+    assert result.present == frozenset({"sh", "git"})
+    assert result.image_digest == "sha256:" + "a" * 64
+    assert result.user_id == (1000 if variant == "pod_user" else 1001)
+    assert result.platform == ("linux/arm64" if variant == "arm64" else "linux/amd64")
+
+
+@pytest.mark.parametrize(
+    "invalid", ["exit", "user", "node", "platform", "os", "architecture", "image", "log"]
+)
+def test_real_client_rejects_unreadable_runner_results(invalid: str) -> None:
+    client, _ = cluster_client()
+    core = ProbeCoreAPI()
+    client._core_api = core  # type: ignore[assignment]
+    if invalid == "exit":
+        core.runner_status.state.terminated.exit_code = 1
+    elif invalid == "user":
+        core.runner.security_context = None
+        core.pod.spec.security_context = None
+    elif invalid == "node":
+        core.pod.spec.node_name = None
+    elif invalid == "platform":
+        core.node.status.node_info = None
+    elif invalid == "os":
+        core.platform.operating_system = "windows"
+    elif invalid == "architecture":
+        core.platform.architecture = "unknown"
+    elif invalid == "image":
+        core.runner_status.image_id = "registry.example.com/acme-runner:latest"
+    else:
+        core.output = "git=1\n"
+    with pytest.raises(ValueError):
+        client.read_tool_probe("acme-probe", deadline=time.monotonic() + 5)
+
+
+def test_real_client_waits_for_a_running_probe() -> None:
+    client, _ = cluster_client()
+    core = ProbeCoreAPI()
+    client._core_api = core  # type: ignore[assignment]
+    core.runner_status.state.terminated = None
+    assert client.read_tool_probe("acme-probe", deadline=time.monotonic() + 5) is None
+
+
 def cluster_client() -> tuple[KubernetesSandboxClient, ClusterAPI]:
     client = KubernetesSandboxClient.__new__(KubernetesSandboxClient)
     api = ClusterAPI()
@@ -380,10 +472,23 @@ def test_tick_preserves_expiry_until_a_fresh_probe(
         assert all(row["observed_at"] == now for row in refreshed)
         assert all(row["expires_at"] == now + timedelta(seconds=900) for row in refreshed)
         assert len(client.created) == 1 and client.released == client.created
-        await loop.tick(now=now + timedelta(seconds=900))
+        await loop.tick(now=now + timedelta(seconds=599))
+        assert len(client.created) == 1
+
+        def assert_previous_observations_stay_readable() -> None:
+            async def read() -> None:
+                previous = await observation_rows(world)
+                assert len(previous) == len(CATALOG)
+                assert {row["state"] for row in previous} == {"present", "absent"}
+                assert all(row["expires_at"] == now + timedelta(seconds=900) for row in previous)
+
+            asyncio.run(read())
+
+        client.before_probe = assert_previous_observations_stay_readable
+        await loop.tick(now=now + timedelta(seconds=600))
         reprobed = await observation_rows(world)
-        assert all(row["observed_at"] == now + timedelta(seconds=900) for row in reprobed)
-        assert all(row["expires_at"] == now + timedelta(seconds=1800) for row in reprobed)
+        assert all(row["observed_at"] == now + timedelta(seconds=600) for row in reprobed)
+        assert all(row["expires_at"] == now + timedelta(seconds=1500) for row in reprobed)
         assert len(client.created) == 2 and client.released == client.created
         assert not client.claims
 
@@ -605,10 +710,18 @@ def test_mutable_image_identity_change_does_not_refresh_old_positive_rows(
     asyncio.run(check())
 
 
-def test_runtime_digest_must_match_the_deployments_declared_digest(observation_world: Any) -> None:
+def test_runtime_digest_must_match_the_deployments_declared_digest(
+    observation_world: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
     world = observation_world
     client = ProbeClient()
-    client.runtime_digest = "sha256:" + "b" * 64
+    core = ProbeCoreAPI()
+    core.runner_status.image_id = "registry.example.com/acme-runner@sha256:" + "b" * 64
+    client._core_api = core  # type: ignore[assignment]
+    client._namespace = "acme"
+    monkeypatch.setattr(
+        client, "read_tool_probe", KubernetesSandboxClient.read_tool_probe.__get__(client)
+    )
     loop = observer(world, client)
 
     async def check() -> None:
@@ -617,7 +730,7 @@ def test_runtime_digest_must_match_the_deployments_declared_digest(observation_w
         assert len(rows) == len(CATALOG)
         assert all(row["state"] == "unknown" and row["reason"] == "unreadable" for row in rows)
         assert len(client.created) == 1 and client.created == client.released
-        client.runtime_digest = "sha256:" + "a" * 64
+        core.runner_status.image_id = IMAGE
         await loop.tick()
         assert {row["state"] for row in await observation_rows(world)} == {"present", "absent"}
 
