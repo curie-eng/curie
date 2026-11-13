@@ -194,8 +194,15 @@ a declared test driver on a test installation, are in
 2. Ordinary Slack chat that is not a kickoff is refused before a claim or a
    model call: "This installation runs personal subscriptions, and this request
    has no owner to run it as (personal_owner_required). Nothing was started."
-3. A cron job, a webhook hook, or an eval has no owner. The worker refuses it
-   with `personal_owner_required` before a claim, using that same sentence.
+3. A webhook hook has a reply target and no owner. The worker posts the sentence
+   in item 2, then finishes the delivery. It does not take a claim or call a model.
+4. A cron hook with no reply target is targetless. The worker logs
+   `personal_owner_required` and posts no reply, then finishes the delivery.
+   A cron hook that names a reply target posts the sentence in item 2, then
+   finishes the same way.
+5. An eval has no owner. The worker logs `personal_owner_required` and reports
+   an empty result. It does not post that sentence, and it does not read the
+   bundle or take a claim.
 
 ## The version check
 
@@ -217,11 +224,13 @@ The current CLI and API agreement is
 3. HTTP 409 `stale_version` means someone changed the enrollment after the
    version you sent. Run `curie cluster subscription status` and retry with
    the version it prints.
-4. The other 409 codes are `enrollment_exists` (enroll when one already
-   exists), `enrollment_absent` (a write when none exists),
-   `enrollment_inactive` (replace while disconnected), `enrollment_active`
-   (reconnect while still connected), and `staging_conflict` (custody staging
-   did not settle). Run status and retry the verb that fits.
+4. Replace and reconnect answer HTTP 409 `enrollment_absent` when no
+   enrollment exists. Disconnect answers HTTP 404 `enrollment_absent` in that
+   case. The other 409 codes are `enrollment_exists` (enroll when one already
+   exists), `enrollment_inactive` (replace while disconnected),
+   `enrollment_active` (reconnect while still connected), and
+   `staging_conflict` (custody staging did not settle). Run status and retry
+   the verb that fits.
 
 ## Limits
 
