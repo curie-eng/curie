@@ -8,6 +8,9 @@ incomplete evidence, the SQLite budget ledger, native transcript parsing, the
 in-pod harvester program against a recorded-shape tree, secret scanning, and
 the finalizer's behavior on failure, refusal and interruption.
 
+The two-owner scenario (#5379) command-path refusals and their authorized
+controls are in the section at the end of this file.
+
 Nothing here touches a cluster, GitHub, Docker or a network beyond a loopback
 registry fixture, and no value is a real credential or identifier.
 """
@@ -35,7 +38,10 @@ from typing import Any
 
 import personal_profile as pp
 import personal_profile_support as pps
+import personal_two_owner as pt
+import personal_two_owner_support as pto
 import pytest
+import two_owner_shared as tos
 
 SCRIPT = Path(pp.__file__).resolve()
 REPO_ROOT = pp.REPO_ROOT
@@ -3195,6 +3201,77 @@ def test_forge_probe_never_deletes_a_branch_it_did_not_create(
     assert not any(method == "PATCH" for method, _path in _ProbeForge.writes)
 
 
+class _OwnedProbeForge(_ProbeForge):
+    """The probe creates its own branch; the ref listing lags the delete by ``lag`` reads."""
+
+    lag = 0
+    reads_after_delete = 0
+    deleted = False
+
+    def request(self, method: str, path: str, body: Any = None) -> tuple[int, Any]:
+        if "/git/ref/heads/ppa-probe-" in path and method == "GET":
+            if not type(self).deleted:
+                return 200, {"object": {"sha": OWN_SHA}}
+            type(self).reads_after_delete += 1
+            if type(self).reads_after_delete > type(self).lag:
+                return 404, {}
+            return 200, {"object": {"sha": OWN_SHA}}
+        if method == "DELETE":
+            type(self).deleted = True
+            _ProbeForge.writes.append((method, path))
+            return 204, {}
+        if method == "POST" and path.endswith("/git/refs"):
+            return 201, {}
+        if method == "POST" and path.endswith("/pulls"):
+            return 201, {"number": 7}
+        if method == "GET" and path.endswith("/pulls/7"):
+            closed = any(m == "PATCH" for m, _p in _ProbeForge.writes)
+            return 200, {"head": {"sha": OWN_SHA}, "state": "closed" if closed else "open"}
+        return super().request(method, path, body)
+
+
+def _run_owned_probe(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, forge: type[_OwnedProbeForge], lag: int
+) -> int:
+    forge.lag = lag
+    forge.reads_after_delete = 0
+    forge.deleted = False
+    monkeypatch.setattr(pp, "Forge", forge)
+    return pp.main(
+        [
+            "forge-probe",
+            "--candidate",
+            CANDIDATE,
+            "--state-dir",
+            str(_private(tmp_path / "state")),
+            "--run-id",
+            "probe-lag",
+            "--app-dir",
+            str(_app_dir(_private(tmp_path / "apps"))),
+        ],
+        environ={"PATH": "/usr/bin:/bin", "HOME": str(tmp_path)},
+        clock=_FakeClock(T0),
+    )
+
+
+def test_forge_probe_waits_for_the_ref_listing_to_catch_up_with_the_delete(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    code = _run_owned_probe(tmp_path, monkeypatch, _OwnedProbeForge, lag=2)
+    assert code == 0, capsys.readouterr()
+    assert _OwnedProbeForge.reads_after_delete == 3
+
+
+def test_forge_probe_fails_when_the_branch_never_disappears(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    code = _run_owned_probe(tmp_path, monkeypatch, _OwnedProbeForge, lag=10_000)
+    capsys.readouterr()
+    assert code == 1
+    # Bounded: about 30 s at one read per 2 s, not unbounded.
+    assert _OwnedProbeForge.reads_after_delete <= 17
+
+
 # --------------------------------------------------------------------------
 # A cut final record, the runner image, and retained volumes
 # --------------------------------------------------------------------------
@@ -3401,3 +3478,354 @@ def test_the_item_total_stops_paid_work_at_its_approved_limit(tmp_path: Path) ->
     second.reservations = under.ledger.reserve(pps.ATTEMPT_ROLES, attempt=1, now=T0)
     second.harvest = harvest
     under.check_allowance(second)  # 21,831 + 8,000 stays inside the item total
+
+
+# --------------------------------------------------------------------------
+# Two-owner scenario (#5379): command-path refusals, each with its control
+#
+# ``personal_profile.py --scenario two-owner`` refuses before paid admission.
+# Every case drives the real ``main`` and ends with an authorized positive
+# control; the driver-level cases live in test_personal_two_owner.py.
+# --------------------------------------------------------------------------
+
+
+def test_preflight_passes_with_candidate_images_and_the_mirrored_dex(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    images = tos._candidate_registry()
+    dex_digest = next(ref for (repo, ref) in images if repo == pt.DEX_REPOSITORY)
+    with tos._registry(images) as port:
+        state = tos._private(tmp_path / "state")
+        tos._record_dex(state, digest=dex_digest)
+        inputs = tos._inputs_file(tmp_path, tos._kit(tmp_path, registry=f"localhost:{port}"))
+        code, result = tos._main(tos._argv("preflight", inputs, state, *tos.APPROVE), capsys)
+    assert code == 0, result
+    assert result["verdict"] == "pass" and result["scenario"] == "two-owner"
+    assert all(result["checks"].values())
+    assert {row["owner"] for row in result["schedule"]["groups"]} == {"a", "b"}
+    ledger = pto.TwoOwnerLedger.open_existing(state, tos.RUN_ID)
+    try:
+        dex_ref = f"localhost:{port}/{pt.DEX_REPOSITORY}@{dex_digest}"
+        assert ledger.observations("images")["preflight_dex"] == dex_ref
+    finally:
+        ledger.close()
+
+
+@pytest.mark.parametrize(
+    ("served", "dex", "detail"),
+    [("other", "served", "curie-"), ("candidate", "missing", "dex")],
+)
+def test_preflight_refuses_a_candidate_or_dex_image_mismatch(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], served: str, dex: str, detail: str
+) -> None:
+    images = tos._candidate_registry(tos.OTHER_SHA if served == "other" else tos.CANDIDATE)
+    dex_digest = next(ref for (repo, ref) in images if repo == pt.DEX_REPOSITORY)
+    with tos._registry(images) as port:
+        state = tos._private(tmp_path / "state")
+        tos._record_dex(state, digest=dex_digest if dex == "served" else "sha256:" + "e" * 64)
+        inputs = tos._inputs_file(tmp_path, tos._kit(tmp_path, registry=f"localhost:{port}"))
+        code, result = tos._main(tos._argv("preflight", inputs, state, *tos.APPROVE), capsys)
+    assert code == 2 and result["error"] == "candidate_image_mismatch", result
+    assert detail in result["fix"]
+
+
+@pytest.mark.parametrize("command", ["preflight", "run"])
+def test_live_commands_refuse_a_setup_descriptor(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], command: str
+) -> None:
+    state = tos._private(tmp_path / "state")
+    setup = tos._inputs_file(tmp_path / "setup", tos._setup_document(tmp_path / "setup"))
+    code, result = tos._main(tos._argv(command, setup, state, *tos.APPROVE), capsys)
+    assert code == 2 and result["error"] == "independence_unasserted"
+    # Control: the live descriptor gets past every input refusal.
+    with tos._registry({}) as port:
+        live = tos._inputs_file(
+            tmp_path / "live", tos._kit(tmp_path / "live", registry=f"localhost:{port}")
+        )
+        code, result = tos._main(tos._argv(command, live, state, *tos.APPROVE), capsys)
+    assert result.get("error") != "independence_unasserted"
+    if command == "run":
+        assert code == 1 and result["phase"] == "refusals" and result["error"] == "step_failed"
+        ledger = pto.TwoOwnerLedger.open_existing(state, tos.RUN_ID)
+        try:
+            assert ledger.observations("budget")["schedule_check_passed"] is True
+            assert not ledger.is_rehearsal()
+        finally:
+            ledger.close()
+
+
+@pytest.mark.parametrize("command", ["images", "forge-probe", "rehearse"])
+def test_setup_commands_refuse_a_live_descriptor(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], command: str
+) -> None:
+    state = tos._private(tmp_path / "state")
+    live = tos._inputs_file(tmp_path / "live", tos._kit(tmp_path / "live"))
+    code, result = tos._main(tos._argv(command, live, state), capsys)
+    assert code == 2 and result["error"] == "setup_inputs_carry_grants"
+    # Control: a setup descriptor is accepted and the command reaches its first
+    # child, which this PATH lacks (git, openssl or kubectl): a step failure.
+    setup = tos._inputs_file(tmp_path / "setup", tos._setup_document(tmp_path / "setup"))
+    code, result = tos._main(tos._argv(command, setup, state), capsys)
+    assert code == 1 and result.get("error", "step_failed") == "step_failed", result
+    if command == "rehearse":
+        ledger = pto.TwoOwnerLedger.open_existing(state, tos.RUN_ID)
+        try:
+            assert ledger.is_rehearsal()
+            assert ledger.observations("rehearsal")["schedule_check_passed"] is True
+        finally:
+            ledger.close()
+
+
+@pytest.mark.parametrize(
+    ("command", "flag", "value"),
+    [
+        ("images", "--context", tos.CONTEXT),
+        ("forge-probe", "--app-dir", "app"),
+        ("rehearse", "--resolution-channel", tos.CHANNEL),
+        ("rehearse", "--grant-file", "grant"),
+        ("preflight", "--output-token-ceiling", "32768"),
+        ("run", "--item-output-tokens-spent", "0"),
+        # Equal to its default, still a single-profile flag.
+        ("run", "--grant-probe-cli", pp.DEFAULT_PROBE_CLI),
+    ],
+)
+def test_single_profile_flags_are_refused_with_the_scenario(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], command: str, flag: str, value: str
+) -> None:
+    state = tos._private(tmp_path / "state")
+    live = command in {"preflight", "run"}
+    approve = tos.APPROVE if live else ()
+    with tos._registry({}) as port:
+        build = tos._kit if live else tos._setup_document
+        inputs = tos._inputs_file(tmp_path, build(tmp_path, registry=f"localhost:{port}"))
+        code, result = tos._main(tos._argv(command, inputs, state, *approve, flag, value), capsys)
+        assert code == 2 and result["error"] == "arguments_invalid" and flag in result["fix"]
+        code, result = tos._main(tos._argv(command, inputs, state, *approve), capsys)
+    assert result.get("error") != "arguments_invalid", result
+
+
+def test_inputs_file_is_a_two_owner_flag(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    state = tos._private(tmp_path / "state")
+    inputs = tos._inputs_file(tmp_path, tos._setup_document(tmp_path))
+    argv = ["judge", "--inputs-file", str(inputs), "--candidate", tos.CANDIDATE]
+    argv += ["--state-dir", str(state), "--run-id", tos.RUN_ID, "--criterion", "roles"]
+    code, result = tos._main(argv, capsys)
+    assert code == 2 and result["error"] == "arguments_invalid"
+    # Control: without it the single-profile judge runs as before (no ledger yet).
+    code, result = tos._main([argv[0], *argv[3:]], capsys)
+    assert result["error"] != "arguments_invalid"
+
+
+@pytest.mark.parametrize("command", ["preflight", "run"])
+@pytest.mark.parametrize("approval", [None, "approve everything"])
+def test_live_commands_need_the_exact_live_approval(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], command: str, approval: str | None
+) -> None:
+    state = tos._private(tmp_path / "state")
+    extra = () if approval is None else ("--approve-live", approval)
+    with tos._registry({}) as port:
+        inputs = tos._inputs_file(tmp_path, tos._kit(tmp_path, registry=f"localhost:{port}"))
+        code, result = tos._main(tos._argv(command, inputs, state, *extra), capsys)
+        assert code == 2 and result["error"] == "live_not_approved"
+        code, result = tos._main(tos._argv(command, inputs, state, *tos.APPROVE), capsys)
+    assert result.get("error") != "live_not_approved"
+
+
+def test_rehearse_refuses_a_live_approval(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    state = tos._private(tmp_path / "state")
+    inputs = tos._inputs_file(tmp_path, tos._setup_document(tmp_path))
+    code, result = tos._main(tos._argv("rehearse", inputs, state, *tos.APPROVE), capsys)
+    assert code == 2 and result["error"] == "arguments_invalid"
+
+
+@pytest.mark.parametrize("command", ["preflight", "run", "rehearse"])
+def test_an_impossible_schedule_is_refused_before_any_mutation(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], command: str
+) -> None:
+    state = tos._private(tmp_path / "state")
+    build = tos._setup_document if command == "rehearse" else tos._kit
+    approve = () if command == "rehearse" else tos.APPROVE
+    inputs = tos._inputs_file(tmp_path / "high", build(tmp_path / "high", prior=12_000))
+    code, result = tos._main(tos._argv(command, inputs, state, *approve), capsys)
+    assert code == 2 and result["error"] == "session_plan_impossible"
+    assert not (state / f"{tos.RUN_ID}.work").exists()
+    with tos._registry({}) as port:
+        low = build(tmp_path / "low", prior=4_000, registry=f"localhost:{port}")
+        code, result = tos._main(
+            tos._argv(command, tos._inputs_file(tmp_path / "low", low), state, *approve), capsys
+        )
+    assert result.get("error") != "session_plan_impossible"
+
+
+@pytest.mark.parametrize("command", ["images", "preflight", "rehearse", "run", "judge"])
+@pytest.mark.parametrize(
+    ("variable", "code"),
+    [("ANTHROPIC_API_KEY", "service_credentials"), (pps.FAKE_MODEL_NAME, "fake_mode")],
+)
+def test_ambient_credentials_and_fake_mode_are_refused_first(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    command: str,
+    variable: str,
+    code: str,
+) -> None:
+    state = tos._private(tmp_path / "state")
+    live = command in {"preflight", "run"}
+    with tos._registry({}) as port:
+        build = tos._kit if live else tos._setup_document
+        inputs = tos._inputs_file(tmp_path, build(tmp_path, registry=f"localhost:{port}"))
+        argv = tos._argv(command, None if command == "judge" else inputs, state)
+        argv += [*tos.APPROVE] if live else []
+        if command == "judge":
+            argv += ["--criterion", "rehearsal"]
+        exit_code, result = tos._main(argv, capsys, {**tos.PATH_ONLY, variable: "marker-value-1"})
+        assert exit_code == 2 and result["error"] == code
+        assert "marker-value-1" not in json.dumps(result)
+        _exit, control = tos._main(argv, capsys)
+    assert control.get("error") not in {"service_credentials", "fake_mode"}
+
+
+def test_grant_probe_is_refused_for_the_scenario(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    state = tos._private(tmp_path / "state")
+    code, result = tos._main(tos._argv("grant-probe", None, state), capsys)
+    assert code == 2 and result["error"] == "arguments_invalid"
+
+
+def test_judge_reads_a_complete_rehearsal_ledger_and_nothing_else(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    state = tos._private(tmp_path / "state")
+    tos._rehearsal_ledger(state)
+    # No inputs file, no tools on PATH, no credential: receipts only.
+    code, result = tos._main(tos._judge_argv(state, "rehearsal"), capsys)
+    assert code == 0 and result["verdict"] == "pass" and result["scenario"] == "two-owner"
+    assert result["checks"]["no_native_sessions"] is True
+    code, result = tos._main(tos._judge_argv(state, "owners"), capsys)
+    assert code == 1 and result["checks"] == {"live_ledger": False}
+    code, result = tos._main(tos._judge_argv(state, "rehearsal", tos.OTHER_SHA), capsys)
+    assert code == 2 and result["error"] == "candidate_mismatch"
+
+
+def test_judge_fails_a_rehearsal_ledger_missing_one_key(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    state = tos._private(tmp_path / "state")
+    tos._rehearsal_ledger(state, drop="admission_controls_refused")
+    code, result = tos._main(tos._judge_argv(state, "rehearsal"), capsys)
+    assert code == 1 and result["checks"]["admission_controls_refused"] is False
+
+
+def test_judge_refuses_a_single_profile_ledger_and_inputs(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    state = tos._private(tmp_path / "state")
+    ledger = pps.Ledger.open(state, tos.RUN_ID)
+    ledger.ensure_run(tos.CANDIDATE, phase="run")
+    ledger.close()
+    code, result = tos._main(tos._judge_argv(state, "rehearsal"), capsys)
+    assert code == 2 and result["error"] == "ledger_missing"
+    inputs = tos._inputs_file(tmp_path, tos._setup_document(tmp_path))
+    argv = [*tos._judge_argv(state, "rehearsal"), "--inputs-file", str(inputs)]
+    code, result = tos._main(argv, capsys)
+    assert code == 2 and result["error"] == "arguments_invalid"
+    # A two-owner criterion is not a single-profile one.
+    single = [
+        arg for arg in tos._judge_argv(state, "owners") if arg not in {"--scenario", "two-owner"}
+    ]
+    code, result = tos._main(single, capsys)
+    assert code == 2 and result["error"] == "arguments_invalid"
+
+
+def test_parser_criteria_cover_every_two_owner_criterion() -> None:
+    choices = {*pps.CRITERIA, *pp.TWO_OWNER_CRITERIA}
+    assert {*pto.CRITERIA, "rehearsal"} <= choices
+
+
+@pytest.mark.parametrize("command", ["preflight", "run"])
+@pytest.mark.parametrize("duplicate", ["same_path", "same_content", "hard_link"])
+def test_two_owner_duplicate_grants_are_refused_by_the_real_command(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], command: str, duplicate: str
+) -> None:
+    state = tos._private(tmp_path / "state")
+    document = tos._kit(tmp_path)
+    grant_a = Path(document["owners"]["a"]["grant_file"])
+    grant_b = Path(document["owners"]["b"]["grant_file"])
+    if duplicate == "same_path":
+        document["owners"]["b"]["grant_file"] = str(grant_a)
+    elif duplicate == "same_content":
+        grant_b.write_bytes(grant_a.read_bytes())
+    else:
+        grant_b.unlink()
+        os.link(grant_a, grant_b)
+    inputs = tos._inputs_file(tmp_path, document)
+    code, result = tos._main(tos._argv(command, inputs, state, *tos.APPROVE), capsys)
+    assert code == 2 and result["error"] == "duplicate_owner_grant", result
+    # Control: two distinct grant files pass the duplicate check.
+    with tos._registry({}) as port:
+        control = tos._inputs_file(
+            tmp_path / "ok", tos._kit(tmp_path / "ok", registry=f"localhost:{port}")
+        )
+        code, result = tos._main(tos._argv(command, control, state, *tos.APPROVE), capsys)
+    assert result.get("error") != "duplicate_owner_grant", result
+
+
+@pytest.mark.parametrize("command", ["images", "forge-probe", "rehearse", "preflight", "run"])
+@pytest.mark.parametrize("unsafe", ["mode", "symlink", "inline_grant"])
+def test_two_owner_unsafe_inputs_files_are_refused_by_the_real_command(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], command: str, unsafe: str
+) -> None:
+    state = tos._private(tmp_path / "state")
+    live = command in {"preflight", "run"}
+    approve = tos.APPROVE if live else ()
+    build = tos._kit if live else tos._setup_document
+    document = build(tmp_path)
+    if unsafe == "inline_grant":
+        document["target"]["grant"] = "synthetic-inline-marker-not-a-token"
+    inputs = tos._inputs_file(tmp_path, document)
+    if unsafe == "mode":
+        os.chmod(inputs, 0o644)
+    elif unsafe == "symlink":
+        link = inputs.with_name("link.json")
+        link.symlink_to(inputs)
+        inputs = link
+    code, result = tos._main(tos._argv(command, inputs, state, *approve), capsys)
+    expected = {
+        "mode": "inputs_unsafe",
+        "symlink": "inputs_unsafe",
+        "inline_grant": "inline_grant_refused",
+    }[unsafe]
+    assert code == 2 and result["error"] == expected, result
+    assert "synthetic-inline-marker" not in json.dumps(result)
+    # Control: the same document in a safe file is not refused for its file.
+    with tos._registry({}) as port:
+        good = build(tmp_path / "ok", registry=f"localhost:{port}")
+        safe = tos._inputs_file(tmp_path / "ok", good)
+        code, result = tos._main(tos._argv(command, safe, state, *approve), capsys)
+    assert result.get("error") not in {"inputs_unsafe", "inline_grant_refused"}, result
+
+
+@pytest.mark.parametrize("command", ["preflight", "run"])
+@pytest.mark.parametrize("owner", ["a", "b"])
+def test_two_owner_insufficient_lifetime_is_refused_by_the_real_command(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], command: str, owner: str
+) -> None:
+    state = tos._private(tmp_path / "state")
+    document = tos._kit(tmp_path)
+    document["owners"][owner]["usable_until"] = int(tos.T0 + 60)
+    inputs = tos._inputs_file(tmp_path, document)
+    code, result = tos._main(tos._argv(command, inputs, state, *tos.APPROVE), capsys)
+    assert code == 2 and result["error"] == "lifetime_insufficient", result
+    assert f"owners.{owner}.usable_until" in json.dumps(result)
+    # Control: a window covering the live and cleanup seconds is not refused.
+    with tos._registry({}) as port:
+        ok = tos._kit(tmp_path / "ok", registry=f"localhost:{port}")
+        code, result = tos._main(
+            tos._argv(command, tos._inputs_file(tmp_path / "ok", ok), state, *tos.APPROVE), capsys
+        )
+    assert result.get("error") != "lifetime_insufficient", result

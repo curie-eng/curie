@@ -434,6 +434,28 @@ def signals_deferred() -> Iterator[list[int]]:
 # --------------------------------------------------------------------------
 
 
+SINGLE_PROFILE = "single-profile"
+#: #5379: two owners, each enrolled through its own console session; see personal_two_owner.py.
+TWO_OWNER = "two-owner"
+SCENARIOS = (SINGLE_PROFILE, TWO_OWNER)
+#: Criteria only the two-owner scenario judges (personal_two_owner_support.CRITERIA).
+TWO_OWNER_CRITERIA = ("owners", "ci-repair", "restarts", "wrong-owner", "disconnect", "rehearsal")
+
+
+class _Supplied(argparse.Action):
+    """Store the value and remember the flag was given, even when it equals its default."""
+
+    def __call__(
+        self,
+        parser: argparse.ArgumentParser,
+        namespace: argparse.Namespace,
+        values: Any,
+        option_string: str | None = None,
+    ) -> None:
+        setattr(namespace, self.dest, values)
+        namespace.supplied = frozenset({*getattr(namespace, "supplied", frozenset()), self.dest})
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="personal_profile.py",
@@ -442,6 +464,11 @@ def build_parser() -> argparse.ArgumentParser:
     commands = parser.add_subparsers(dest="command", required=True)
     for name in SUBCOMMANDS:
         sub = commands.add_parser(name)
+        # ``supplied`` names every single-profile flag given; --scenario two-owner refuses them.
+        sub.set_defaults(supplied=frozenset())
+        sub.add_argument("--scenario", choices=SCENARIOS, default=SINGLE_PROFILE)
+        # The two-owner scenario's private descriptor (personal_two_owner_support.load_inputs_file).
+        sub.add_argument("--inputs-file", default=None)
         sub.add_argument("--candidate", default="")
         sub.add_argument("--state-dir", default="")
         sub.add_argument("--run-id", default="")
@@ -454,24 +481,26 @@ def build_parser() -> argparse.ArgumentParser:
             "--kubeconfig",
             "--app-dir",
         ):
-            sub.add_argument(flag, default="")
+            sub.add_argument(flag, default="", action=_Supplied)
         # A rehearsal takes no grant input at all; None tells "supplied" from "absent".
         grant_default = None if name == "rehearse" else ""
-        sub.add_argument("--grant-file", default=grant_default)
-        sub.add_argument("--grant-expires-at", default=grant_default)
+        sub.add_argument("--grant-file", default=grant_default, action=_Supplied)
+        sub.add_argument("--grant-expires-at", default=grant_default, action=_Supplied)
         if name in {"preflight", "run", "rehearse"}:
             sub.add_argument("--approve-live", default=None)
         if name in {"preflight", "run"}:
-            sub.add_argument("--output-token-ceiling", default="")
+            sub.add_argument("--output-token-ceiling", default="", action=_Supplied)
         if name == "run":
-            sub.add_argument("--item-output-tokens-spent", default="")
+            sub.add_argument("--item-output-tokens-spent", default="", action=_Supplied)
         if name in {"run", "grant-probe"}:
-            sub.add_argument("--grant-probe-cli", default=DEFAULT_PROBE_CLI)
+            sub.add_argument("--grant-probe-cli", default=DEFAULT_PROBE_CLI, action=_Supplied)
         if name in {"run", "rehearse"}:
-            sub.add_argument("--slack-bot-token-file", default="")
-            sub.add_argument("--resolution-channel", default="")
+            sub.add_argument("--slack-bot-token-file", default="", action=_Supplied)
+            sub.add_argument("--resolution-channel", default="", action=_Supplied)
         if name == "judge":
-            sub.add_argument("--criterion", required=True, choices=[*pps.CRITERIA, "all"])
+            sub.add_argument(
+                "--criterion", required=True, choices=[*pps.CRITERIA, *TWO_OWNER_CRITERIA, "all"]
+            )
     return parser
 
 
@@ -1324,7 +1353,15 @@ def cmd_forge_probe(args: argparse.Namespace, runtime: Runtime) -> int:
             ):
                 raise StepFailed("probe branch head is not this run's commit; not deleting")
             status, _ = forge.request("DELETE", forge.repo_path(f"/git/refs/heads/{branch}"))
-            gone, _ = forge.request("GET", forge.repo_path(f"/git/ref/heads/{branch}"))
+            gone = 0
+            if status in {204, 422}:
+                # GitHub's ref listing lags the DELETE by a few seconds.
+                deadline = runtime.clock.now() + 30.0
+                while True:
+                    gone, _ = forge.request("GET", forge.repo_path(f"/git/ref/heads/{branch}"))
+                    if gone == 404 or runtime.clock.now() >= deadline:
+                        break
+                    runtime.clock.wait(2.0)
             results["forge_branch_deleted"] = status in {204, 422} and gone == 404
             if not results["forge_branch_deleted"]:
                 raise StepFailed("probe branch still exists")
@@ -3489,6 +3526,15 @@ def main(
     try:
         pps.refuse_ambient_credentials(environ)
         args = build_parser().parse_args(argv)
+        if args.scenario == TWO_OWNER:
+            # Imported only here, so the single-profile path never loads it.
+            import personal_two_owner
+
+            return personal_two_owner.run_command(args.command, args, runtime)
+        if args.inputs_file is not None:
+            raise pps.Refusal("arguments_invalid", "--inputs-file needs --scenario two-owner")
+        if getattr(args, "criterion", None) in set(TWO_OWNER_CRITERIA) - set(pps.CRITERIA):
+            raise pps.Refusal("arguments_invalid", "--criterion")
         return COMMANDS[args.command](args, runtime)
     except pps.Refusal as refusal:
         runtime.out.emit(refusal.payload())
@@ -3499,4 +3545,7 @@ def main(
 
 
 if __name__ == "__main__":
+    # personal_two_owner imports this module by name; one module object keeps
+    # one StepFailed, one LiveRun and one set of constants.
+    sys.modules.setdefault("personal_profile", sys.modules[__name__])
     sys.exit(main())
