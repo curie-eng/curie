@@ -989,6 +989,19 @@ class WorkItem(Base):
     __tablename__ = "work_items"
     __table_args__ = (
         CheckConstraint(
+            "((coding_instructions_state = 'absent' "
+            "AND coding_instructions_absence_reason IN "
+            "('no_profile', 'no_verified_requester', 'tenant_disabled', "
+            "'application_unavailable', 'historical') "
+            "AND coding_instructions_revision IS NULL AND coding_instructions_sha256 IS NULL "
+            "AND coding_instructions_format_version IS NULL) "
+            "OR (coding_instructions_state = 'selected' AND requester_principal_id IS NOT NULL "
+            "AND coding_instructions_absence_reason IS NULL AND coding_instructions_revision >= 1 "
+            "AND coding_instructions_sha256 ~ '^[0-9a-f]{64}$' "
+            "AND coding_instructions_format_version = 1)) IS TRUE",
+            name="work_items_coding_selection_ck",
+        ),
+        CheckConstraint(
             "length(btrim(tracker_kind)) > 0 AND length(btrim(tracker_host)) > 0 "
             "AND length(btrim(tracker_scope_id)) > 0 AND length(btrim(tracker_issue_id)) > 0 "
             "AND (tracker_display_key IS NULL OR length(btrim(tracker_display_key)) > 0) "
@@ -1086,6 +1099,18 @@ class WorkItem(Base):
     agent_id: Mapped[uuid.UUID] = mapped_column(
         ForeignKey(f"{SCHEMA}.agents.id", ondelete="CASCADE")
     )
+    requester_principal_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), default=None
+    )
+    coding_instructions_state: Mapped[str] = mapped_column(
+        Text, default="absent", server_default="absent"
+    )
+    coding_instructions_absence_reason: Mapped[str | None] = mapped_column(
+        Text, default="historical", server_default="historical"
+    )
+    coding_instructions_revision: Mapped[int | None] = mapped_column(BigInteger, default=None)
+    coding_instructions_sha256: Mapped[str | None] = mapped_column(String(64), default=None)
+    coding_instructions_format_version: Mapped[int | None] = mapped_column(Integer, default=None)
     conversation_id: Mapped[str]
     publication_lineage_id: Mapped[uuid.UUID | None] = mapped_column(
         ForeignKey(
@@ -1195,11 +1220,37 @@ REPLY_TARGET_CHECK = (
 )
 
 
+class WorkItemCodingSnapshot(Base):
+    """Private text pinned at admission and deleted with its WorkItem."""
+
+    __tablename__ = "work_item_coding_snapshots"
+    __table_args__ = (
+        CheckConstraint(
+            "octet_length(text) BETWEEN 1 AND 16384 AND position(chr(13) in text) = 0",
+            name="work_item_coding_snapshots_text_ck",
+        ),
+        {"schema": SCHEMA},
+    )
+
+    work_item_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey(f"{SCHEMA}.work_items.id", ondelete="CASCADE"), primary_key=True
+    )
+    text: Mapped[str] = mapped_column(Text)
+
+
 class ExecutionRequest(Base):
     """One bounded execution attempt owned by a WorkItem."""
 
     __tablename__ = "execution_requests"
     __table_args__ = (
+        CheckConstraint(
+            "(coding_instructions_selection_id IS NULL "
+            "OR coding_instructions_selection_id = work_item_id) "
+            "AND coding_instructions_evidence IN ('none', 'pending', 'applied', 'failed') "
+            "AND (coding_instructions_evidence = 'none' "
+            "OR coding_instructions_selection_id IS NOT NULL)",
+            name="execution_requests_coding_selection_ck",
+        ),
         CheckConstraint("sequence > 0", name="execution_requests_sequence_ck"),
         CheckConstraint("version >= 1", name="execution_requests_version_ck"),
         CheckConstraint(
@@ -1427,6 +1478,12 @@ class ExecutionRequest(Base):
     model_auth_mode: Mapped[str] = mapped_column(Text, default="service", server_default="service")
     owner_principal_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), default=None)
     enrollment_generation: Mapped[int | None] = mapped_column(BigInteger, default=None)
+    coding_instructions_selection_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), default=None
+    )
+    coding_instructions_evidence: Mapped[str] = mapped_column(
+        Text, default="none", server_default="none"
+    )
     sequence: Mapped[int]
     status: Mapped[str] = mapped_column(default="waiting", server_default="waiting")
     wait_deadline: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
