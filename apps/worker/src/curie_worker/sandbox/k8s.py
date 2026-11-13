@@ -19,6 +19,7 @@ import socket
 import threading
 import time
 from collections.abc import Callable, Iterator, Mapping
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from dataclasses import replace
 from datetime import UTC, datetime
@@ -932,28 +933,52 @@ class KubernetesSandboxClient:
                 raise TimeoutError("sandbox capacity inventory deadline expired")
             return remaining
 
-        claims = cast(
-            dict[str, Any],
-            self._api.list_namespaced_custom_object(
-                EXT_GROUP, EXT_VERSION, self._namespace, "sandboxclaims",
-                _request_timeout=budget(),
-            ),
-        )["items"]
-        sandboxes = cast(
-            dict[str, Any],
-            self._api.list_namespaced_custom_object(
-                CORE_GROUP, CORE_VERSION, self._namespace, "sandboxes",
-                _request_timeout=budget(),
-            ),
-        )["items"]
-        try:
-            pods = self._core_api.list_namespaced_pod(
-                self._namespace, _request_timeout=budget()
-            ).items
-        except k8s_client.ApiException as exc:
-            if exc.status in _TRANSIENT_STATUSES:
-                raise KubeTransientError(f"kube API {exc.status} listing pods") from exc
-            raise
+        def list_claims() -> list[dict[str, Any]]:
+            return cast(
+                dict[str, list[dict[str, Any]]],
+                self._api.list_namespaced_custom_object(
+                    EXT_GROUP, EXT_VERSION, self._namespace, "sandboxclaims",
+                    _request_timeout=budget(),
+                ),
+            )["items"]
+
+        def list_sandboxes() -> list[dict[str, Any]]:
+            return cast(
+                dict[str, list[dict[str, Any]]],
+                self._api.list_namespaced_custom_object(
+                    CORE_GROUP, CORE_VERSION, self._namespace, "sandboxes",
+                    _request_timeout=budget(),
+                ),
+            )["items"]
+
+        def list_pods() -> list[k8s_client.V1Pod]:
+            try:
+                return self._core_api.list_namespaced_pod(
+                    self._namespace, _request_timeout=budget()
+                ).items
+            except k8s_client.ApiException as exc:
+                if exc.status in _TRANSIENT_STATUSES:
+                    raise KubeTransientError(f"kube API {exc.status} listing pods") from exc
+                raise
+
+        # The three LISTs run concurrently (#5630): issued one after another,
+        # three healthy reads were summed against the one total budget, so
+        # ordinary API latency failed admission and maintenance. The bound is
+        # unchanged (#5296 Decision 3): each LIST still gets the budget
+        # remaining when it is issued, and an expired budget raises before any
+        # request. Leaving the ``with`` block joins every thread, so nothing
+        # outlives the call. Results are read in a fixed order and the first
+        # failure in that order is raised as-is; there is no partial inventory
+        # and no retry.
+        with ThreadPoolExecutor(
+            max_workers=3, thread_name_prefix="capacity-inventory"
+        ) as pool:
+            claims_listed = pool.submit(list_claims)
+            sandboxes_listed = pool.submit(list_sandboxes)
+            pods_listed = pool.submit(list_pods)
+        claims = claims_listed.result()
+        sandboxes = sandboxes_listed.result()
+        pods = pods_listed.result()
         footprints: dict[str, dict[str, str]] = {}
         claim_names: set[str] = set()
         runtime_class_overheads: dict[str, dict[str, str]] = {}
