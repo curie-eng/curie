@@ -1,5 +1,39 @@
 # Preparation behavior evaluation
 
+## Facts request and admission report
+
+The facts and handoff cases in `publication-cases.json` exercise one marked
+facts request, a local classification, a single trigger-label write, and the
+final report. The report has five dimensions.
+
+1. Publication is `local draft`, `published`, or `publication failed`.
+2. Facts are `clear for the requested set`, `known blocker`, `partial or unknown`,
+   or `response unavailable`.
+3. Selection is `not requested`, `withheld`, `label applied`, `label applied but
+   intake unconfirmed`, or `existing selection inspected`. The issue's decision 12
+   table gains `label applied`. Use it when this session applied the trigger label
+   and the factory acknowledged it within the wait, including a refusal. The
+   factory dimension carries that acknowledgement. `label applied but intake
+   unconfirmed` is the silent 180 second wait. `not requested` means this session
+   applied no label, including a known blocker or a withheld selection.
+4. Factory is `admitted or queued`, `running`, `refused`, `terminal outcome`, or
+   `none`. `admitted or queued` and `running` require the factory's acknowledgement
+   comment and a link to it.
+5. Deployment validation stays `unvalidated`.
+
+The replay command loads the current skill and reference into a fresh model
+conversation for each case. It loads the merge-base skill for the two control
+cases, which must fail grading. It uses an Anthropic Messages compatible
+endpoint, only fake tracker tools, and an injected clock. It writes a JSON
+evidence file and refuses session 41.
+
+```bash
+uv run python3 examples/tests/test_factory_preparation_facts_evals.py replay --base-url "$MODEL_BASE_URL" --model "$MODEL_ID" --max-sessions 40 --evidence preparation-replay.json
+```
+
+Set `ANTHROPIC_API_KEY` in the environment before that command. The evidence file
+records the session count and the per-case result. It does not record the key.
+
 `publication-cases.json` is a portable replay set for the preparation skill.
 These cases describe synthetic inputs, clarification behavior and tracker effects. They are
 not automated CI tests or proof of a real tracker integration.
