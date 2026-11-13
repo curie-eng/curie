@@ -112,7 +112,7 @@ jobs:
       # A `chart` selector runs charts/curie/ci/<name>.sh, which needs Helm.
       - name: Install Helm for fix pin verification
         if: ${{ github.event_name != 'merge_group' && (steps.fix-pin-curie.outputs.needed == 'true') }}
-        uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5
+        uses: azure/setup-helm@2f5e7bc67f1f9972ab16657bb795f36d8f04de0e # v5
         with:
           version: v3.16.4
       # The kind runtime pins build four candidate images (api, worker, ui,
