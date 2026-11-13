@@ -97,7 +97,7 @@ def test_the_shipped_policy_is_the_documented_default():
 
 
 def test_the_hook_declaration_matches_the_two_tools():
-    hooks = json.loads((BUNDLE / "hooks" / "hooks.json").read_text())
+    hooks = json.loads((BUNDLE / "hooks" / "hooks.json").read_text())["hooks"]
     assert set(hooks) == {"PostToolUse", "PreToolUse"}
     assert hooks["PostToolUse"][0]["matcher"] == ".*get_issue"
     assert hooks["PreToolUse"][0]["matcher"] == ".*update_issue"

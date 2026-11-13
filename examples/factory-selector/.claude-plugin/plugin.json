@@ -6,7 +6,6 @@
   "license": "Apache-2.0",
   "keywords": ["example", "factory", "github", "cron"],
   "secrets": ["GITHUB_PERSONAL_ACCESS_TOKEN"],
-  "hooks": "hooks/hooks.json",
   "starterPrompts": [
     "Select factory work from the policy."
   ],
