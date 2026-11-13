@@ -31,6 +31,14 @@ class CredentialUnreadable(Unavailable):
         super().__init__(f"the static token file {problem}")
 
 
+class LinkedIssueUnconfirmed(Unavailable):
+    """A linked issue create request was sent and may have been written, but
+    neither its answer nor an in-call relist confirmed it
+    (`Tracker.create_linked_issue`, ADR 0277). Elapsed time proves nothing
+    absent, so a caller must not create again for this output identity; it
+    reconciles with ``reconcile_only=True`` instead."""
+
+
 class Unauthorized(ForgeError):
     """The configured credential was refused."""
 

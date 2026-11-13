@@ -4,6 +4,11 @@ Date: 2026-10-01
 
 Status: Accepted
 
+**Partially amended by [ADR 0277](0277-factory-triage-publishes-tickets-before-implementation-admission.md)**
+(back-link added under [ADR 0045](0045-the-status-line-is-the-mutable-part-of-an-immutable-adr.md)):
+Adds the delegated-selection provenance path alongside tracker observations;
+scoped reads and credential custody are preserved.
+
 Partially amended by [ADR 0279](0279-a-person-acting-through-a-github-app-can-select-factory-work.md)
 under [ADR 0045](0045-the-status-line-is-the-mutable-part-of-an-immutable-adr.md),
 only where this record ignores every App-related label event.

@@ -678,6 +678,15 @@ class Settings(BaseSettings):
             "WORK_ITEM_BACKOFF_MAX_SECONDS",
         ),
     )
+    # How long a sealed tracker result stays owed after submission before it is
+    # recorded failed (ADR 0277, #5585). Read only by
+    # `factory_tracker_result_delivery.submit_result`; an int, so finite.
+    factory_tracker_result_delivery_deadline_seconds: int = Field(
+        default=900,
+        gt=0,
+        le=86400,
+        validation_alias=AliasChoices("CURIE_FACTORY_TRACKER_RESULT_DELIVERY_DEADLINE_SECONDS"),
+    )
     work_item_start_deferral_limit: int = Field(
         default=5,
         gt=0,

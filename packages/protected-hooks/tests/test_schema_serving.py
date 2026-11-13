@@ -91,12 +91,14 @@ def graph_payload() -> dict[str, Any]:
         # Dynamic approval answers require the 0156 answer gate.
         ("0156", False),
         # 0157 adds factory Slack tables, 0158 adds GitHub host namespaces,
-        # 0159 adds the execution owner columns, and 0160 adds the personal
-        # custody table and enrollment fence this candidate reads.
+        # 0159 adds the execution owner columns, 0160 adds the personal
+        # custody table and enrollment fence, and 0162 adds the agent version
+        # result policy columns this candidate reads.
         ("0157", False),
         ("0158", False),
         ("0159", False),
-        ("0160", True),
+        ("0160", False),
+        ("0162", True),
         ("0000", True),
         ("future-expand", True),
     ],
@@ -119,18 +121,19 @@ def test_installed_candidate_decision_preserves_unknown_revision_policy(
     )
 
 
-def test_candidate_window_raises_the_floor_to_0160() -> None:
+def test_candidate_window_raises_the_floor_to_0162() -> None:
     """@spec CONNECTOR-REQUESTER-1: agent ORM reads require the 0151 requester columns.
 
     Approval ORM reads require the 0154 reminder cursor, and dynamic approval
     answers require the 0156 answer gate. The factory Slack progress loop reads
     the 0157 tables, and the code host link route writes the github_host kind
-    0158 allows. Execution owner reads require 0159, and personal custody
-    reads and enrollment fences require 0160, which is the floor.
+    0158 allows. Execution owner reads require 0159, personal custody reads
+    and enrollment fences require 0160, and agent version reads select the
+    0162 result policy columns, which is the floor.
     """
     window = shared().load_metadata().window
-    assert window.schema_min == "0160"
-    assert window.schema_head == "0160"
+    assert window.schema_min == "0162"
+    assert window.schema_head == "0162"
 
 
 @pytest.mark.parametrize("mutation", ["bounds", "parent", "cycle", "duplicate", "type"])
