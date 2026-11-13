@@ -8,7 +8,7 @@
 # binary for the target arch with rust-lld, so a multi-arch build needs no
 # emulation: only the final stage, which copies files, is per target platform.
 
-FROM --platform=$BUILDPLATFORM rust:1.99.0-alpine3.24@sha256:0cce0a5e0e8ba67b455257a3a02a1d99005f382748789d6464460028810f1627 AS build
+FROM --platform=$BUILDPLATFORM rust:1.99.1-alpine3.24@sha256:44819b27be4c97b0e4d7203bd2e02c4820f97700211b6a37fb4c246a2de59383 AS build
 ARG TARGETARCH
 RUN rustup target add x86_64-unknown-linux-musl aarch64-unknown-linux-musl
 WORKDIR /src
@@ -24,7 +24,7 @@ RUN set -eu; \
       cargo build --locked --release --target "$t"; \
     cp "target/$t/release/curie-docker-authz" /curie-docker-authz
 
-FROM docker:29.9.0-dind@sha256:0b6d18a4a222e71c88be6034926b4f6cde2fc33c2218643d03ccfddc65995470
+FROM docker:29.9.2-dind@sha256:9e79b879b177fbd72c34376a3dd3d91747da5db49e1f560f76aea59561471977
 COPY --from=build /curie-docker-authz /usr/local/bin/curie-docker-authz
 COPY daemon.json /etc/docker/daemon.json
 COPY --chmod=0755 entrypoint.sh /usr/local/bin/curie-docker-daemon-entrypoint
