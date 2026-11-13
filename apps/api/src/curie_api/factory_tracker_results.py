@@ -39,10 +39,10 @@ code ``value``.
 
 Refusals. `parse_proposal` raises `ProposalInvalid`, whose ``issues`` are
 (field path, code) pairs and nothing else. Field paths are dotted
-(``reproduction.revision``; ``""`` for the top level). A path segment that is
-a key the submitter invented is reported as ``*`` unless it is a plain
-identifier of at most 64 characters, so no submitted text, key or value,
-can reach an exception, a log line or a row. Codes (`PROPOSAL_ISSUE_CODES`):
+(``reproduction.revision``; ``""`` for the top level). Only schema-owned
+field names survive in a path: any key the submitter invented is reported as
+the fixed placeholder ``*`` (``reproduction.*``), so no submitted text, key or
+value, can reach an exception, a log line or a row. Codes (`PROPOSAL_ISSUE_CODES`):
 
 1. ``not_object``: the proposal is not a JSON object.
 2. ``kind``: ``kind`` is missing or not ``ticket`` or ``findings``.
@@ -66,7 +66,6 @@ from __future__ import annotations
 
 import enum
 import hashlib
-import re
 from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Annotated, Literal
@@ -231,7 +230,12 @@ class ProposalInvalid(ValueError):
         super().__init__(f"the tracker result proposal failed validation: {listed}")
 
 
-_SAFE_SEGMENT = re.compile(r"[A-Za-z_][A-Za-z0-9_]{0,63}")
+# Every field name the shapes own; any other key is shown as ``*``.
+_SCHEMA_FIELDS = frozenset(
+    name
+    for model in (Reproduction, TicketProposal, FindingsProposal)
+    for name in model.model_fields
+)
 
 _CODES = {
     "extra_forbidden": "unknown_field",
@@ -251,7 +255,7 @@ def _field(loc: tuple[int | str, ...]) -> str:
         if isinstance(segment, int):
             parts.append(str(segment))
         else:
-            parts.append(segment if _SAFE_SEGMENT.fullmatch(segment) else "*")
+            parts.append(segment if segment in _SCHEMA_FIELDS else "*")
     return ".".join(parts)
 
 

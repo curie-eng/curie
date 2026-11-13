@@ -1,5 +1,5 @@
 {
-  "comment": "The typed tracker result proposal a triage run submits (ADR 0277 decision 4, #5585 decision 5). A valid case gives the proposal and proposal_sha256, the SHA-256 of the canonical JSON (keys sorted, UTF-8, separators , and :, no insignificant whitespace) of the proposal with null members dropped. An invalid case gives the proposal and the expected issues as [field, code] pairs in any order; field is the dotted path, \"\" for the top level. A case with fill sets the text at path to char repeated length times before parsing, so oversized inputs stay small here. Read by apps/api/tests/test_factory_tracker_results.py; the runner result tool of #5586 reads it later. Readers reject unknown top-level keys.",
+  "comment": "The typed tracker result proposal a triage run submits (ADR 0277 decision 4, #5585 decision 5). A valid case gives the proposal and proposal_sha256, the SHA-256 of the canonical JSON (keys sorted, UTF-8, separators , and :, no insignificant whitespace) of the proposal with null members dropped. An invalid case gives the proposal and the expected issues as [field, code] pairs in any order; field is the dotted path, \"\" for the top level, and a key the shape does not own is shown as * so no submitted key name is echoed. A case with fill sets the text at path to char repeated length times before parsing, so oversized inputs stay small here. Read by apps/api/tests/test_factory_tracker_results.py; the runner result tool of #5586 reads it later. Readers reject unknown top-level keys.",
   "valid": [
     {
       "name": "ticket",
@@ -117,7 +117,7 @@
       },
       "issues": [
         [
-          "repository",
+          "*",
           "unknown_field"
         ]
       ]
@@ -139,7 +139,7 @@
       },
       "issues": [
         [
-          "labels",
+          "*",
           "unknown_field"
         ]
       ]
@@ -155,7 +155,7 @@
       },
       "issues": [
         [
-          "agent",
+          "*",
           "unknown_field"
         ]
       ]
@@ -175,7 +175,7 @@
       },
       "issues": [
         [
-          "assignee",
+          "*",
           "unknown_field"
         ]
       ]
@@ -197,7 +197,7 @@
       },
       "issues": [
         [
-          "assignees",
+          "*",
           "unknown_field"
         ]
       ]
@@ -213,7 +213,7 @@
       },
       "issues": [
         [
-          "destination",
+          "*",
           "unknown_field"
         ]
       ]
@@ -233,7 +233,7 @@
       },
       "issues": [
         [
-          "priority",
+          "*",
           "unknown_field"
         ]
       ]
@@ -253,7 +253,7 @@
       },
       "issues": [
         [
-          "reproduction.exit_code",
+          "reproduction.*",
           "unknown_field"
         ]
       ]

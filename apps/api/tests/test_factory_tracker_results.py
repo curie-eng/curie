@@ -164,6 +164,31 @@ def test_a_refusal_never_carries_submitted_text() -> None:
     }
 
 
+def test_an_identifier_shaped_key_is_never_echoed() -> None:
+    sentinel = f"SENTINEL_KEY_{uuid.uuid4().hex[:4]}"
+    raw = {
+        "kind": "findings",
+        "reason": "not_reproduced",
+        "tried": sentinel,
+        "missing": "m",
+        sentinel: sentinel,
+    }
+    nested = {
+        "kind": "ticket",
+        "title": "t",
+        "body": "b",
+        "reproduction": {"command": "c", "observed": "o", "revision": REVISION, sentinel: 1},
+    }
+    for proposal, field in ((raw, "*"), (nested, "reproduction.*")):
+        with pytest.raises(ProposalInvalid) as refused:
+            parse_proposal(proposal)
+        assert [(issue.field, issue.code) for issue in refused.value.issues] == [
+            (field, "unknown_field")
+        ]
+        rendered = repr(refused.value.issues) + str(refused.value) + repr(refused.value.args)
+        assert sentinel not in rendered
+
+
 def test_budget_exhausted_is_platform_only() -> None:
     platform = PlatformFindings(
         kind="findings", reason=FindingsReason.BUDGET_EXHAUSTED, tried="t", missing="m"
@@ -424,6 +449,16 @@ def _age_lease(delivery_id: uuid.UUID) -> None:
     )
 
 
+def _make_due(delivery_id: uuid.UUID) -> None:
+    """Move the retry backoff past, as waiting for it would."""
+
+    _exec(
+        "UPDATE curie.factory_tracker_result_deliveries "
+        "SET next_attempt_at = clock_timestamp() - interval '1 second' WHERE id = :id",
+        {"id": delivery_id},
+    )
+
+
 def _age_deadline(delivery_id: uuid.UUID) -> None:
     _exec(
         "UPDATE curie.factory_tracker_result_deliveries "
@@ -539,8 +574,40 @@ def test_a_lost_create_response_reconciles_to_the_one_issue(admitted: Any) -> No
     assert _comments(src) == []
     assert _delivery(delivery_id)["output_issue_id"] is None
     assert _count("factory_tracker_result_receipts", delivery_id) == 0
+    _make_due(delivery_id)
     outcome = _deliver(src, delivery_id)
     assert outcome.state is DeliveryState.DELIVERED
+    _assert_delivered_once(src, delivery_id, "ticket")
+
+
+def test_an_immediate_retry_inside_the_listing_lag_is_refused_by_the_claim(
+    admitted: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    src = _source(admitted, 9306)
+    delivery_id = _submit(src, _ticket())
+    # The creator listing lags: a fresh create is not listed yet.
+    lagging = [True]
+    real_listing = src.tracker._own_marked
+
+    def listing(embedded: str) -> Any:
+        return [] if lagging[0] else real_listing(embedded)
+
+    monkeypatch.setattr(src.tracker, "_own_marked", listing)
+    src.tracker.write_faults.lose_next_response(Operation.CREATE_LINKED_ISSUE)
+    lost = _deliver(src, delivery_id)
+    assert (lost.state, lost.last_error_code) == (DeliveryState.OWED, "tracker_unavailable")
+    assert len(_own_issues(src)) == 1
+    writes = src.tracker.ledger.writes
+    # Still lagging, an immediate attempt would create a second issue; the claim refuses it.
+    early = _deliver(src, delivery_id)
+    assert (early.state, early.attempted) == (DeliveryState.OWED, False)
+    assert len(_own_issues(src)) == 1
+    assert src.tracker.ledger.writes == writes
+    assert _delivery(delivery_id)["attempts"] == 1
+    # The backoff passes and the listing catches up: the retry reconciles.
+    _make_due(delivery_id)
+    lagging[0] = False
+    assert _deliver(src, delivery_id).state is DeliveryState.DELIVERED
     _assert_delivered_once(src, delivery_id, "ticket")
 
 
@@ -571,11 +638,9 @@ def test_an_unconfirmed_create_waits_for_the_listing_to_settle(admitted: Any) ->
     )
     assert row == {"from_attempt": True, "still_out": True}
     assert due() == []
-    _exec(
-        "UPDATE curie.factory_tracker_result_deliveries "
-        "SET next_attempt_at = clock_timestamp() - interval '1 second' WHERE id = :id",
-        {"id": delivery_id},
-    )
+    # The claim refuses the row inside the settle window too.
+    assert _deliver(src, delivery_id).attempted is False
+    _make_due(delivery_id)
     assert due() == [delivery_id]
     assert _deliver(src, delivery_id).state is DeliveryState.DELIVERED
     _assert_delivered_once(src, delivery_id, "ticket")
@@ -591,6 +656,7 @@ def test_a_lost_comment_response_delivers_one_comment(admitted: Any, kind: str) 
     assert len(_comments(src)) == 1
     assert _count("factory_tracker_result_receipts", delivery_id) == 0
     assert _count("factory_tracker_result_artifacts", delivery_id) == 1
+    _make_due(delivery_id)
     outcome = _deliver(src, delivery_id)
     assert outcome.state is DeliveryState.DELIVERED
     _assert_delivered_once(src, delivery_id, kind)
@@ -837,6 +903,7 @@ def test_an_issue_read_back_mismatch_is_not_delivered_and_then_fails_at_the_dead
     (issue,) = _own_issues(src)
     # A person edits the output issue; the marker stays its last line.
     src.tracker.edit_issue_body(issue, "edited by a person\n\n" + src.tracker.issue_body(issue))
+    _make_due(delivery_id)
     mismatch = _deliver(src, delivery_id)
     assert (mismatch.state, mismatch.last_error_code) == (DeliveryState.OWED, "readback_mismatch")
     assert _count("factory_tracker_result_receipts", delivery_id) == 0
@@ -878,6 +945,7 @@ def test_a_comment_read_back_that_misses_is_not_delivered(
     assert _count("factory_tracker_result_receipts", delivery_id) == 0
     monkeypatch.setattr(comments, "upsert_marked", real_upsert)
     monkeypatch.setattr(comments, "find_marked", real_find)
+    _make_due(delivery_id)
     assert _deliver(src, delivery_id).state is DeliveryState.DELIVERED
     _assert_delivered_once(src, delivery_id, "findings")
 
@@ -1258,6 +1326,7 @@ def test_a_recorded_output_whose_marker_is_gone_is_never_recreated(admitted: Any
     assert _delivery(delivery_id)["output_issue_id"] == issue.issue_id
     # A person removes the marker line from the output issue.
     src.tracker.edit_issue_body(issue, "rewritten by a person, marker removed")
+    _make_due(delivery_id)
     missing = _deliver(src, delivery_id)
     assert (missing.state, missing.last_error_code) == (DeliveryState.OWED, "output_missing")
     assert _own_issues(src) == [issue]

@@ -66,8 +66,12 @@ leaves ``delivered`` or ``failed``. An attempt that hits a transient error
 as ``last_error_code``, backs off ``next_attempt_at`` with the WorkItem
 backoff settings and stays owed until the deadline,
 ``Settings.factory_tracker_result_delivery_deadline_seconds`` (default 900)
-after submission. `deliver` itself ignores ``next_attempt_at``; a scheduler
-picks rows with `due_deliveries`.
+after submission. The attempt claim itself refuses a row whose
+``next_attempt_at`` is still ahead (``attempted`` False, nothing written), so
+retry eligibility holds for every caller of `deliver`, not only for a
+scheduler that picks rows with `due_deliveries`. A row past its deadline is
+claimable at any time: that attempt only settles it failed, with no tracker
+call.
 
 Exactly once. An attempt holds a lease (``attempt_owner`` plus
 ``attempt_lease_expires_at``, `ATTEMPT_LEASE_SECONDS`), and every state write
@@ -87,7 +91,8 @@ create by seconds. So when the linked issue call raises `Unavailable` and no
 output is recorded (the create may have been written but was not confirmed),
 the attempt records ``tracker_unavailable`` with ``next_attempt_at`` at least
 `LISTING_SETTLE_SECONDS` out (the larger of that and the normal backoff), and
-`due_deliveries` does not return the row before then. A process that dies
+neither the attempt claim nor `due_deliveries` takes the row before then. A
+process that dies
 after an unconfirmed create is covered the same way by the attempt lease:
 the next attempt cannot claim for `ATTEMPT_LEASE_SECONDS` (120), which exceeds
 `LISTING_SETTLE_SECONDS`. Once an output is recorded, ``expected`` reads it
@@ -643,6 +648,12 @@ async def _claim(
                         delivery.attempt_owner.is_(None),
                         delivery.attempt_lease_expires_at <= func.clock_timestamp(),
                     ),
+                    # Retry eligibility, enforced here for every caller. Past the
+                    # deadline the attempt only settles failed, so it may run.
+                    or_(
+                        delivery.next_attempt_at <= func.clock_timestamp(),
+                        delivery.deadline_at <= func.clock_timestamp(),
+                    ),
                 )
                 .values(
                     attempt_owner=owner,
@@ -1040,6 +1051,8 @@ async def deliver(
     Catches only the forge errors of the ports. Anything else, a
     `BaseException` included, escapes with the lease held, which is how a
     process restart looks; the next attempt claims once the lease lapses.
+    A row another attempt holds, or whose ``next_attempt_at`` is still ahead
+    and whose deadline has not passed, is not claimed: ``attempted`` False.
     """
 
     claim = await _claim(sessionmaker, delivery_id, owner)
