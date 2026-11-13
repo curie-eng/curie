@@ -3,6 +3,10 @@
 Only GitHub HTTP is substituted, including installation discovery and token
 minting. Payloads follow the GitHub REST issue-event, App, issue-comment and
 pull-request resources: https://docs.github.com/en/rest
+App authentication response contracts:
+https://docs.github.com/en/rest/apps/apps#get-the-authenticated-app
+https://docs.github.com/en/rest/apps/apps#get-a-repository-installation-for-the-authenticated-app
+https://docs.github.com/en/rest/apps/installations#create-an-installation-access-token
 """
 
 from __future__ import annotations
@@ -62,6 +66,7 @@ class NoticeGitHub(PollGitHub):
     comment_failure = False
     lose_write = False
     missing_event = False
+    unknown_event_time = False
     incomplete_listing = False
     superseded = False
     completed_for: int | None = None
@@ -97,6 +102,10 @@ class NoticeGitHub(PollGitHub):
                     ],
                 )
             response = super().handle(request)
+            if self.unknown_event_time:
+                return httpx.Response(
+                    200, json=[{**event, "created_at": None} for event in response.json()]
+                )
             if self.missing_event:
                 return httpx.Response(
                     200, json=[{**event, "id": None} for event in response.json()]
@@ -455,14 +464,25 @@ def test_precedence_actor_before_labels_personal_and_installation(
 
 
 @pytest.mark.parametrize("path", PATHS)
-def test_precedence_completed_publication_later_label_admits(factory: Any, path: str) -> None:
+@pytest.mark.parametrize("order", ("after", "same", "unknown_event", "unknown_completion"))
+def test_precedence_completed_publication_order(factory: Any, path: str, order: str) -> None:
     _client, github, _agent = factory
     number = github.plant_issue(age=timedelta(minutes=5))
     github.completed_for = number
-    github.completed_at = github.issues[number].labeled_at - timedelta(seconds=1)
+    github.completed_at = github.issues[number].labeled_at
+    if order == "after":
+        github.completed_at -= timedelta(seconds=1)
+    elif order == "unknown_completion":
+        github.completed_at = None
+    github.unknown_event_time = order == "unknown_event"
     _observe(factory, path, number)
-    assert len(_work(number)) == len(_requests(number)) == 1
-    assert _notices(number) == []
+    if order == "after":
+        assert len(_work(number)) == len(_requests(number)) == 1
+        assert _notices(number) == []
+    else:
+        assert _work(number) == _requests(number) == []
+        assert [r["reason"] for r in _notices(number)] == ["publication_completed"]
+        assert _notices(number)[0]["publication_url"] == f"https://github.com/{REPO}/pull/76"
 
 
 @pytest.mark.parametrize("path", PATHS)

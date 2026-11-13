@@ -212,7 +212,7 @@ async def _reconcile_label(
         if event is None or type(event.get("id")) is not int:
             continue
         labeled_at = parse_time(event.get("created_at"))
-        if labeled_at is None or labeled_at > now - grace:
+        if labeled_at is not None and labeled_at > now - grace:
             # A delivery may still be in flight; let it land first.
             continue
         notice = FactoryNotice(
