@@ -1958,7 +1958,7 @@ def _runs(
 ) -> Callable[[httpx.Request], httpx.Response]:
     def handle(request: httpx.Request) -> httpx.Response:
         if request.url.path.endswith(f"/commits/{HEAD_SHA}/status"):
-            return httpx.Response(200, json={"state": "pending", "statuses": []})
+            return httpx.Response(200, json={"state": "pending", "statuses": [], "total_count": 0})
         return httpx.Response(
             200,
             json={

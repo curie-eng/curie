@@ -924,6 +924,10 @@ pub const DARK_FACTORY_BUNDLE_FILES: &[(&str, &[u8])] = &[
         include_bytes!("../../examples/dark-factory/hooks/hooks.json"),
     ),
     (
+        "hooks/decisions_section.py",
+        include_bytes!("../../examples/dark-factory/hooks/decisions_section.py"),
+    ),
+    (
         "hooks/review_gate.py",
         include_bytes!("../../examples/dark-factory/hooks/review_gate.py"),
     ),

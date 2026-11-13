@@ -1653,6 +1653,7 @@ pub struct WorkItemOutcome {
     pub publication: Option<WorkItemPublication>,
     pub correctness: WorkItemCorrectness,
     pub ci: Option<WorkItemCi>,
+    pub ci_observation: Option<WorkItemCiObservation>,
     pub requests: Vec<WorkItemRequest>,
 }
 
@@ -1717,6 +1718,17 @@ pub struct WorkItemCi {
     pub state: String,
     pub reason: Option<String>,
     pub head_sha: Option<String>,
+    pub observed_at: Option<String>,
+}
+
+/// `WorkItemCiObservationOut`: persisted CI observation for a work item.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkItemCiObservation {
+    pub status: String,
+    pub head_sha: String,
+    pub reason: Option<String>,
+    pub created_at: String,
+    pub expires_at: String,
     pub observed_at: Option<String>,
 }
 

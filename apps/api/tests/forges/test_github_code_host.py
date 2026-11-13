@@ -945,7 +945,14 @@ def _ci_handler(
         if path.endswith("/check-runs"):
             return httpx.Response(200, json={"total_count": len(runs), "check_runs": runs})
         if path.endswith("/status"):
-            return httpx.Response(200, json={"state": "success", "statuses": statuses or []})
+            return httpx.Response(
+                200,
+                json={
+                    "state": "success",
+                    "statuses": statuses or [],
+                    "total_count": len(statuses or []),
+                },
+            )
         if path.endswith("/annotations"):
             return httpx.Response(
                 200, json=[{"path": "src/app.py", "start_line": 7, "message": "assert 1 == 2"}]

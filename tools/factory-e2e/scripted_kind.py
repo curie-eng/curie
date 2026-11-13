@@ -172,12 +172,65 @@ def assert_observed(preflight_outcome: str, publication_paths: list[str]) -> Non
     scenario.assert_publication_paths(publication_paths)
 
 
+def assert_pull_request_decisions(bundle: Path, pull: dict[str, Any]) -> int:
+    rules = _module("factory_decisions_section", bundle / "hooks/decisions_section.py")
+    try:
+        return len(rules.parse_decisions_section(pull.get("body")))
+    except ValueError as exc:
+        raise ScriptedScenarioError(
+            f"stub pull request has an invalid Decisions section: {exc}"
+        ) from None
+
+
 def verdict(preflight_outcome: str, publication_paths: list[str]) -> int:
     try:
         assert_observed(preflight_outcome, publication_paths)
     except scenario.ScenarioAssertionError:
         return fe.EXIT_FAILED
     return 0
+
+
+def docker_command_environment(environment: dict[str, str]) -> dict[str, str]:
+    """Use one caller-selected endpoint for Docker, kind and buildx."""
+
+    env = dict(environment)
+    context = env.get("DOCKER_CONTEXT") or "default"
+    if not env.get("DOCKER_HOST") and context != "default":
+        try:
+            result = subprocess.run(
+                (
+                    "docker", "context", "inspect", context,
+                    "--format", "{{json .Endpoints.docker.Host}}",
+                ),
+                env=env,
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=30,
+            )
+            if result.returncode:
+                raise ValueError("context inspect failed")
+            endpoint = json.loads(result.stdout)
+            if not isinstance(endpoint, str) or any(char.isspace() for char in endpoint):
+                raise ValueError("invalid Docker endpoint")
+            address = urlsplit(endpoint)
+            if address.scheme in {"unix", "npipe"}:
+                valid = address.path.startswith("/")
+            else:
+                valid = (
+                    address.scheme in {"ssh", "tcp"}
+                    and bool(address.hostname)
+                    and (address.port is None or address.port > 0)
+                )
+            if not valid:
+                raise ValueError("invalid Docker endpoint")
+        except (OSError, ValueError, subprocess.SubprocessError):
+            raise fe.ConfigError(
+                f"Docker context {context!r} endpoint could not be resolved"
+            ) from None
+        env["DOCKER_HOST"] = endpoint
+    env["DOCKER_CONTEXT"] = "default"
+    return env
 
 
 def docker_engine_is_local(docker_host: str | None) -> bool:
@@ -275,9 +328,7 @@ class ScriptedRun:
         # Only the in-process recording proxy receives the upstream credential.
         self.env.pop("CURIE_FACTORY_RECORD_KEY", None)
         self.env["BUILDX_BUILDER"] = "default"
-        # An inherited remote context would split kind, docker and buildx
-        # across engines. The default context honours an inherited DOCKER_HOST.
-        self.env["DOCKER_CONTEXT"] = "default"
+        self.env = docker_command_environment(self.env)
         self.curie = os.environ.get("CURIE_BIN", "curie")
         self.record_start_remaining: float | None = None
         self.record_budget_start: float | None = None
@@ -1122,6 +1173,11 @@ class ScriptedRun:
         if len(pulls) != 1:
             raise ScriptedScenarioError("expected exactly one stub pull request")
         pull = self.stub._fresh_pull(pulls[0])
+        if self.workdir is None:
+            raise ScriptedScenarioError("scripted bundle is unavailable")
+        self.evidence["decision_count"] = assert_pull_request_decisions(
+            self.workdir / "bundle", pull
+        )
         status, files = self.stub._rest(
             "GET", f"/repos/acme-corp/acme-bot/pulls/{pull['number']}/files", {}, {}
         )
@@ -1459,10 +1515,10 @@ def main(args: argparse.Namespace) -> int:
     try:
         validate_configuration(args)
         curie_bin, curie_version = fe.resolve_curie_binary(os.environ.get("CURIE_BIN") or "curie")
+        run = ScriptedRun(args)
     except fe.ConfigError as exc:
         print(f"factory-e2e: {exc}", file=sys.stderr)
         return fe.EXIT_CONFIG
-    run = ScriptedRun(args)
     run.curie = curie_bin
     run.evidence.update(curie_bin=curie_bin, curie_version=curie_version)
     result = fe.EXIT_FAILED

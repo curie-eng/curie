@@ -233,6 +233,14 @@ fn work_item_outcome() -> Box<curie::api::WorkItemOutcome> {
             "publication": {"status": "published", "revision_number": 1, "approval_status": "approved"},
             "correctness": {"asserted": false, "owner": "bundle"},
             "ci": {"state": "passing", "reason": null, "head_sha": "abc1234", "observed_at": "2026-01-01T00:04:00Z"},
+            "ci_observation": {
+                "status": "observing",
+                "head_sha": "abc1234",
+                "reason": null,
+                "created_at": "2026-01-01T00:03:00Z",
+                "expires_at": "2026-01-02T00:03:00Z",
+                "observed_at": null
+            },
             "requests": [
                 {
                     "tenant_id": "55555555-5555-4555-8555-555555555555",

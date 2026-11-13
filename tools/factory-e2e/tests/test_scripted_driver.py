@@ -129,6 +129,46 @@ def _evidence(tmp_path: Path) -> dict[str, Any]:
     return json.loads(files[0].read_text())
 
 
+@pytest.fixture
+def scripted_decisions_bundle(tmp_path: Path) -> Path:
+    bundle = tmp_path / "bundle"
+    hooks = bundle / "hooks"
+    hooks.mkdir(parents=True)
+    helper = REPO_ROOT / "examples/dark-factory/hooks/decisions_section.py"
+    (hooks / helper.name).write_bytes(helper.read_bytes())
+    return bundle
+
+
+@pytest.mark.parametrize(
+    "case",
+    json.loads((REPO_ROOT / "tests/vectors/factory-decisions-section.json").read_text())["cases"],
+    ids=lambda case: case["id"],
+)
+def test_scripted_publication_decisions_match_the_shared_contract(
+    case: dict[str, Any], scripted_decisions_bundle: Path,
+) -> None:
+    pull = {"body": case["body"]}
+    if case["valid"]:
+        assert sk.assert_pull_request_decisions(scripted_decisions_bundle, pull) == len(
+            case["entries"]
+        )
+    else:
+        with pytest.raises(sk.ScriptedScenarioError, match="invalid Decisions section"):
+            sk.assert_pull_request_decisions(scripted_decisions_bundle, pull)
+
+
+def test_replayed_publication_contains_valid_decisions(scripted_decisions_bundle: Path) -> None:
+    transcript = json.loads(sk.TRANSCRIPT.read_text())
+    publications = [
+        block["input"]
+        for exchange in transcript["exchanges"]
+        for block in exchange["message"]["content"]
+        if block.get("name") == "mcp__curie__publish_changes"
+    ]
+    assert len(publications) == 1
+    assert sk.assert_pull_request_decisions(scripted_decisions_bundle, publications[0]) > 0
+
+
 def test_scripted_driver_records_the_curie_bin_it_used(
     candidate_curie: Path,
     tmp_path: Path,
@@ -1134,28 +1174,152 @@ def test_recording_runs_sharing_a_ledger_forward_serially_with_ample_budget(
         _close_models(model_module, models, set())
 
 
-def test_driver_pins_the_local_docker_engine_over_an_inherited_remote_context(
+@pytest.mark.parametrize("inherited_host", [None, ""])
+@pytest.mark.parametrize(
+    "endpoint",
+    [
+        "ssh://builder@engine.example.com",
+        "tcp://engine.example.com:2376",
+        "unix:///run/example/docker.sock",
+        "npipe:////./pipe/docker_engine",
+    ],
+)
+def test_driver_resolves_the_selected_docker_context_once_for_every_engine(
+    inherited_host: str | None,
+    endpoint: str,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """kind, docker and the registry must all talk to the same local engine."""
+    monkeypatch.setenv("DOCKER_CONTEXT", "example-builder")
+    if inherited_host is None:
+        monkeypatch.delenv("DOCKER_HOST", raising=False)
+    else:
+        monkeypatch.setenv("DOCKER_HOST", inherited_host)
+    calls: list[tuple[tuple[str, ...], dict[str, str]]] = []
 
-    monkeypatch.setenv("DOCKER_CONTEXT", "remote-box")
+    def command(argv: tuple[str, ...], **kwargs: Any) -> subprocess.CompletedProcess[str]:
+        calls.append((argv, dict(kwargs["env"])))
+        if argv[:3] == ("docker", "context", "inspect"):
+            # Docker exposes the endpoint through context inspect's Go template:
+            # https://docs.docker.com/reference/cli/docker/context/inspect/
+            assert argv == (
+                "docker", "context", "inspect", "example-builder",
+                "--format", "{{json .Endpoints.docker.Host}}",
+            )
+            return subprocess.CompletedProcess(argv, 0, json.dumps(endpoint) + "\n", "")
+        return subprocess.CompletedProcess(argv, 0, "", "")
+
+    monkeypatch.setattr(sk.subprocess, "run", command)
     run = sk.ScriptedRun(_replay_args(tmp_path))
-    assert run.env["DOCKER_CONTEXT"] == "default"
+    run.command("docker", "info")
+    run.command("kind", "get", "clusters")
+    run.command("docker", "buildx", "ls")
+
+    assert len(calls) == 4
+    assert calls[0][1]["DOCKER_CONTEXT"] == "example-builder"
+    assert calls[0][1].get("DOCKER_HOST") == inherited_host
+    assert [argv for argv, _env in calls[1:]] == [
+        ("docker", "info"), ("kind", "get", "clusters"), ("docker", "buildx", "ls"),
+    ]
+    for _argv, env in calls[1:]:
+        assert env["DOCKER_CONTEXT"] == "default"
+        assert env["DOCKER_HOST"] == endpoint
+        assert env["BUILDX_BUILDER"] == "default"
 
 
-def test_driver_pins_the_default_docker_context_and_keeps_an_inherited_docker_host(
+@pytest.mark.parametrize("context", [None, "default", "example-builder"])
+def test_driver_preserves_an_explicit_docker_host_without_inspecting_context(
+    context: str | None,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """The default context is the engine DOCKER_HOST names, so keep DOCKER_HOST."""
+    if context is None:
+        monkeypatch.delenv("DOCKER_CONTEXT", raising=False)
+    else:
+        monkeypatch.setenv("DOCKER_CONTEXT", context)
+    endpoint = "ssh://builder@engine.example.com"
+    monkeypatch.setenv("DOCKER_HOST", endpoint)
+    environments: list[dict[str, str]] = []
 
-    monkeypatch.delenv("DOCKER_CONTEXT", raising=False)
-    monkeypatch.setenv("DOCKER_HOST", "unix:///run/example/docker.sock")
+    def command(argv: tuple[str, ...], **kwargs: Any) -> subprocess.CompletedProcess[str]:
+        assert argv == ("docker", "info")
+        environments.append(dict(kwargs["env"]))
+        return subprocess.CompletedProcess(argv, 0, "", "")
+
+    monkeypatch.setattr(sk.subprocess, "run", command)
     run = sk.ScriptedRun(_replay_args(tmp_path))
-    assert run.env["DOCKER_CONTEXT"] == "default"
-    assert run.env["DOCKER_HOST"] == "unix:///run/example/docker.sock"
+    assert environments == []
+    run.command("docker", "info")
+    assert len(environments) == 1
+    assert environments[0]["DOCKER_CONTEXT"] == "default"
+    assert environments[0]["DOCKER_HOST"] == endpoint
+
+
+@pytest.mark.parametrize("context", [None, "", "default"])
+def test_driver_keeps_default_docker_selection_without_inspecting_context(
+    context: str | None,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    if context is None:
+        monkeypatch.delenv("DOCKER_CONTEXT", raising=False)
+    else:
+        monkeypatch.setenv("DOCKER_CONTEXT", context)
+    monkeypatch.delenv("DOCKER_HOST", raising=False)
+    environments: list[dict[str, str]] = []
+
+    def command(argv: tuple[str, ...], **kwargs: Any) -> subprocess.CompletedProcess[str]:
+        assert argv == ("docker", "info")
+        environments.append(dict(kwargs["env"]))
+        return subprocess.CompletedProcess(argv, 0, "", "")
+
+    monkeypatch.setattr(sk.subprocess, "run", command)
+    run = sk.ScriptedRun(_replay_args(tmp_path))
+    assert environments == []
+    run.command("docker", "info")
+    assert len(environments) == 1
+    assert environments[0]["DOCKER_CONTEXT"] == "default"
+    assert "DOCKER_HOST" not in environments[0]
+
+
+@pytest.mark.parametrize(
+    "resolution",
+    [
+        "failed-inspect", "missing-docker", "timeout", "malformed-json", "null",
+        '""', '"ssh://"', '"not-an-endpoint"', '"ssh://engine.example.com with spaces"',
+    ],
+)
+def test_unresolvable_docker_context_refuses_before_resource_mutation(
+    resolution: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.setenv("DOCKER_CONTEXT", "example-builder")
+    monkeypatch.delenv("DOCKER_HOST", raising=False)
+    monkeypatch.setattr(sk, "REPO_ROOT", tmp_path)
+    monkeypatch.setattr(sk.ScriptedRun, "execute", _refuse_external_command)
+    monkeypatch.setattr(sk.ScriptedRun, "cleanup", _refuse_external_command)
+    calls: list[tuple[str, ...]] = []
+
+    def command(argv: tuple[str, ...], **_kwargs: Any) -> subprocess.CompletedProcess[str]:
+        if len(argv) == 2 and argv[1] == "--version":
+            return subprocess_run(argv, capture_output=True, text=True, check=False)
+        calls.append(argv)
+        assert argv[:4] == ("docker", "context", "inspect", "example-builder")
+        if resolution == "missing-docker":
+            raise FileNotFoundError("docker is unavailable")
+        if resolution == "timeout":
+            raise subprocess.TimeoutExpired(argv, 30)
+        if resolution == "failed-inspect":
+            return subprocess.CompletedProcess(argv, 1, "", "context is unavailable")
+        return subprocess.CompletedProcess(argv, 0, resolution, "")
+
+    monkeypatch.setattr(sk.subprocess, "run", command)
+
+    assert sk.main(_replay_args(tmp_path)) == fe.EXIT_CONFIG
+    assert "example-builder" in capsys.readouterr().err
+    assert len(calls) == 1
 
 
 @pytest.mark.parametrize("docker_host", [None, "", "unix:///var/run/docker.sock"])

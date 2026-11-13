@@ -1,6 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://schemas.curietech.ai/cli/work-items/v2.1.json",
+  "$id": "https://schemas.curietech.ai/cli/work-items/v2.2.json",
   "title": "curie <tier> work-items --json",
   "description": "The agent-facing payload of `curie <tier> work-items [ID]`: the dry-run plan, the factory work item list (`items`, `limit`, `truncated`), or one work item under `item` with live CI. `state` and `actionable_cause` are the platform API's strings, never derived by the CLI.",
   "$defs": {
@@ -232,6 +232,56 @@
         }
       ]
     },
+    "ciObservation": {
+      "oneOf": [
+        {
+          "type": "null"
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "status",
+            "head_sha",
+            "reason",
+            "created_at",
+            "expires_at",
+            "observed_at"
+          ],
+          "properties": {
+            "status": {
+              "enum": [
+                "observing",
+                "completed",
+                "expired",
+                "invalidated"
+              ]
+            },
+            "head_sha": {
+              "type": "string"
+            },
+            "reason": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "created_at": {
+              "type": "string"
+            },
+            "expires_at": {
+              "type": "string"
+            },
+            "observed_at": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          }
+        }
+      ]
+    },
     "tracker": {
       "type": "object",
       "additionalProperties": false,
@@ -386,6 +436,9 @@
         },
         "ci": {
           "$ref": "#/$defs/ci"
+        },
+        "ci_observation": {
+          "$ref": "#/$defs/ciObservation"
         },
         "requests": {
           "type": "array",

@@ -152,7 +152,7 @@ def test_a_cancellation_without_proven_supersession_still_fails(
 ) -> None:
     checks = _checks(_run("cancelled", **cancelled_fields), _run("success", **success_fields))
 
-    assert [check.state for check in checks] == [CheckState.CANCELLED, CheckState.SUCCESS]
+    assert any(check.state is CheckState.CANCELLED for check in checks)
     assert _decide(checks).kind == "failing"
 
 
@@ -193,14 +193,36 @@ def test_a_later_pending_or_failing_run_keeps_its_own_verdict(
     assert _decide(checks).kind == verdict
 
 
-def test_an_older_failure_is_retained_after_same_named_success() -> None:
+def test_an_older_failure_is_superseded_by_same_named_success() -> None:
     checks = _checks(_run("failure", id=9, started_at=EARLIER), _run("success"))
 
-    assert [check.state for check in checks] == [CheckState.FAILURE, CheckState.SUCCESS]
-    assert _decide(checks).kind == "failing"
+    assert [check.state for check in checks] == [CheckState.SUCCESS]
+    assert _decide(checks).kind == "green"
 
 
-def test_commit_statuses_are_retained_and_do_not_supersede_a_cancelled_run() -> None:
+@pytest.mark.parametrize(
+    ("conclusion", "suite_id", "state", "verdict"),
+    [
+        (None, 101, CheckState.PENDING, "pending"),
+        (None, 202, CheckState.PENDING, "pending"),
+        ("failure", 101, CheckState.FAILURE, "failing"),
+        ("failure", None, CheckState.FAILURE, "failing"),
+    ],
+    ids=["independent-running", "same-suite-running", "independent-failed", "unknown-suite"],
+)
+def test_later_success_cannot_hide_unfinished_or_independent_workflow(
+    conclusion: str | None, suite_id: int | None, state: CheckState, verdict: str
+) -> None:
+    checks = _checks(
+        _run(conclusion, id=9, started_at=EARLIER, check_suite={"id": suite_id}),
+        _run("success"),
+    )
+
+    assert [check.state for check in checks] == [state, CheckState.SUCCESS]
+    assert _decide(checks).kind == verdict
+
+
+def test_newest_commit_statuses_do_not_supersede_a_cancelled_run() -> None:
     # https://docs.github.com/en/rest/commits/statuses#get-the-combined-status-for-a-specific-reference
     statuses = (
         {"id": 11, "context": CHECK, "state": "failure", "created_at": EARLIER},
@@ -211,7 +233,6 @@ def test_commit_statuses_are_retained_and_do_not_supersede_a_cancelled_run() -> 
 
     assert [(check.source, check.key, check.state) for check in checks] == [
         (CheckSource.RUN, CHECK, CheckState.CANCELLED),
-        (CheckSource.STATUS, f"status:{CHECK}", CheckState.FAILURE),
         (CheckSource.STATUS, f"status:{CHECK}", CheckState.SUCCESS),
         (CheckSource.STATUS, "status:other-status", CheckState.PENDING),
     ]

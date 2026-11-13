@@ -1,13 +1,13 @@
-"""Migration 0166 adds ``factory_slack_threads.origin`` (#5380).
+"""Migration 0167 adds ``factory_slack_threads.origin`` (#5380).
 
-An expand revision above 0162. Every thread that exists before it reads
+An expand revision above 0163. Every thread that exists before it reads
 ``configured``; the server default stays so an application at the prior
 revision keeps inserting valid rows; the CHECK admits only ``configured`` and
-``kickoff``. The downgrade to 0162 takes an exclusive table lock and refuses,
+``kickoff``. The downgrade to 0163 takes an exclusive table lock and refuses,
 before any DDL, while a ``kickoff`` row exists. Rows are seeded with raw SQL at
 the revision they belong to, never through the current models.
 
-Behavior tests (fail if the 0166 source is reverted): the upgrade backfill, the
+Behavior tests (fail if the 0167 source is reverted): the upgrade backfill, the
 CHECK refusal, the downgrade refusal, and the concurrent-insert case. The
 liveness tests (a kickoff row is admitted, a downgrade with only configured
 rows still succeeds and re-applies) guard the refusals against over-refusing.
@@ -37,8 +37,8 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import create_async_engine
 from sqlalchemy.pool import NullPool
 
-REVISION = "0166"
-BELOW = "0162"
+REVISION = "0167"
+BELOW = "0163"
 TABLE = "factory_slack_threads"
 CHECK = "factory_slack_threads_origin_ck"
 REFUSAL = "factory_slack_kickoff_threads_present"
@@ -114,7 +114,7 @@ def _check_definition() -> str | None:
     return str(rows[0][0]) if rows else None
 
 
-def test_0166_upgrade_backfills_existing_threads_as_configured(
+def test_0167_upgrade_backfills_existing_threads_as_configured(
     isolated_migration_db: IsolatedMigrationDb,
 ) -> None:
     isolated_migration_db.at(BELOW)
@@ -131,11 +131,11 @@ def test_0166_upgrade_backfills_existing_threads_as_configured(
     assert "configured" in definition and "kickoff" in definition
 
 
-def test_0166_default_keeps_prior_application_inserts_valid(
+def test_0167_default_keeps_prior_application_inserts_valid(
     isolated_migration_db: IsolatedMigrationDb,
 ) -> None:
     isolated_migration_db.at(REVISION)
-    # An application at 0162 never names origin.
+    # An application at 0163 never names origin.
     unnamed = _thread()
     assert _origins() == {unnamed: "configured"}
     columns = sql_dicts(
@@ -146,7 +146,7 @@ def test_0166_default_keeps_prior_application_inserts_valid(
     assert columns == [{"is_nullable": "NO", "column_default": "'configured'::text"}]
 
 
-def test_0166_check_admits_both_origins_and_refuses_any_other(
+def test_0167_check_admits_both_origins_and_refuses_any_other(
     isolated_migration_db: IsolatedMigrationDb,
 ) -> None:
     isolated_migration_db.at(REVISION)
@@ -163,7 +163,7 @@ def test_0166_check_admits_both_origins_and_refuses_any_other(
         _insert(TABLE, _thread_values(item_id, agent_id, origin=None))
 
 
-def test_0166_downgrade_refuses_a_kickoff_thread_before_any_ddl(
+def test_0167_downgrade_refuses_a_kickoff_thread_before_any_ddl(
     isolated_migration_db: IsolatedMigrationDb,
 ) -> None:
     isolated_migration_db.at(REVISION)
@@ -180,7 +180,7 @@ def test_0166_downgrade_refuses_a_kickoff_thread_before_any_ddl(
     assert _origins() == before == {configured: "configured", kickoff: "kickoff"}
 
 
-def test_0166_downgrade_without_a_kickoff_thread_removes_the_column_and_reapplies(
+def test_0167_downgrade_without_a_kickoff_thread_removes_the_column_and_reapplies(
     isolated_migration_db: IsolatedMigrationDb,
 ) -> None:
     isolated_migration_db.at(REVISION)
@@ -201,7 +201,7 @@ def test_0166_downgrade_without_a_kickoff_thread_removes_the_column_and_reapplie
     assert constraint_exists(CHECK)
 
 
-def test_0166_downgrade_waits_for_a_concurrent_kickoff_insert_then_refuses(
+def test_0167_downgrade_waits_for_a_concurrent_kickoff_insert_then_refuses(
     isolated_migration_db: IsolatedMigrationDb,
 ) -> None:
     """The table lock serializes the check with a writer that has not committed yet.

@@ -98,6 +98,11 @@
       "omissions": []
     },
     {
+      "struct": "WorkItemCiObservation",
+      "schema": "WorkItemCiObservationOut",
+      "omissions": []
+    },
+    {
       "struct": "WorkItemRequest",
       "schema": "WorkItemRequestOut",
       "omissions": [

@@ -514,10 +514,12 @@ class GitHubTracker:
         number = self._number(notice.issue)
         issue = await self._issue(number)
         if issue is None:
-            return False
+            return notice.disposition is Disposition.CANCEL
         names = label_names(issue) or set()
         state = issue.get("state")
         if notice.disposition is Disposition.CANCEL:
+            if state not in {"open", "closed"} or label_names(issue) is None:
+                raise Unavailable("issue_state")
             return state == "closed" or self.label not in names
         if state != "open":
             return False

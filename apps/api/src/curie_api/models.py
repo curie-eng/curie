@@ -1479,6 +1479,51 @@ def new_card_token() -> str:
     return secrets.token_hex(32)
 
 
+class FactoryCiObservation(Base):
+    """Bounded item-level CI proof after an immutable failed execution."""
+
+    __tablename__ = "factory_ci_observations"
+    __table_args__ = (
+        CheckConstraint(
+            "status IN ('observing', 'completed', 'expired', 'invalidated')",
+            name="factory_ci_observations_status_ck",
+        ),
+        CheckConstraint(
+            "expires_at = created_at + interval '86400 seconds'",
+            name="factory_ci_observations_window_ck",
+        ),
+        CheckConstraint("version >= 1", name="factory_ci_observations_version_ck"),
+        CheckConstraint("length(head_sha) > 0", name="factory_ci_observations_head_ck"),
+        CheckConstraint(
+            "(status = 'completed') = (observed_at IS NOT NULL)",
+            name="factory_ci_observations_proof_ck",
+        ),
+        Index(
+            "factory_ci_observations_due_idx",
+            "next_due_at",
+            postgresql_where=text("status = 'observing'"),
+        ),
+    )
+
+    request_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey(f"{SCHEMA}.execution_requests.id", ondelete="CASCADE"), primary_key=True
+    )
+    work_item_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey(f"{SCHEMA}.work_items.id", ondelete="CASCADE"), index=True
+    )
+    lineage_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey(f"{SCHEMA}.thread_publication_lineages.id", ondelete="CASCADE")
+    )
+    head_sha: Mapped[str] = mapped_column(Text)
+    status: Mapped[str] = mapped_column(Text, default="observing", server_default="observing")
+    reason: Mapped[str | None] = mapped_column(Text, default=None)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    next_due_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    observed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), default=None)
+    version: Mapped[int] = mapped_column(default=1, server_default="1")
+
+
 class FactoryStatusComment(Base):
     """One bot-authored GitHub status comment per factory execution request.
 

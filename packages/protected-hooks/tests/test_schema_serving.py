@@ -93,14 +93,16 @@ def graph_payload() -> dict[str, Any]:
         # 0157 adds factory Slack tables, 0158 adds GitHub host namespaces,
         # 0159 adds the execution owner columns, 0160 adds the personal
         # custody table and enrollment fence, 0162 adds the agent version
-        # result policy columns, and 0166 adds the Slack thread origin column
-        # this candidate reads.
+        # result policy columns. Factory CI observations require the 0163
+        # table, which stays below this floor. Slack kickoff thread origin
+        # reads require 0167, which this candidate reads.
         ("0157", False),
         ("0158", False),
         ("0159", False),
         ("0160", False),
         ("0162", False),
-        ("0166", True),
+        ("0163", False),
+        ("0167", True),
         ("0000", True),
         ("future-expand", True),
     ],
@@ -123,20 +125,20 @@ def test_installed_candidate_decision_preserves_unknown_revision_policy(
     )
 
 
-def test_candidate_window_raises_the_floor_to_0166() -> None:
+def test_candidate_window_raises_the_floor_to_0167() -> None:
     """@spec CONNECTOR-REQUESTER-1: agent ORM reads require the 0151 requester columns.
 
     Approval ORM reads require the 0154 reminder cursor, and dynamic approval
     answers require the 0156 answer gate. The factory Slack progress loop reads
     the 0157 tables, and the code host link route writes the github_host kind
     0158 allows. Execution owner reads require 0159, personal custody reads
-    and enrollment fences require 0160, agent version reads select the 0162
-    result policy columns, and the Slack kickoff thread origin reads require
-    0166, which is the floor.
+    and enrollment fences require 0160, and agent version reads select the
+    0162 result policy columns. Factory CI observations require the 0163
+    table. Slack kickoff thread origin reads require 0167, which is the floor.
     """
     window = shared().load_metadata().window
-    assert window.schema_min == "0166"
-    assert window.schema_head == "0166"
+    assert window.schema_min == "0167"
+    assert window.schema_head == "0167"
 
 
 @pytest.mark.parametrize("mutation", ["bounds", "parent", "cycle", "duplicate", "type"])
