@@ -7,10 +7,12 @@ are objects with a name. Each refusal is paired with an allowed call.
 
 from __future__ import annotations
 
+import fcntl
 import json
 import os
 import subprocess
 import sys
+import time
 from pathlib import Path
 from typing import Any
 
@@ -119,6 +121,15 @@ class Gate:
         )
         assert done.returncode == 0, done.stderr
         return json.loads(done.stdout) if done.stdout.strip() else None
+
+    def raw(self, payload: bytes) -> subprocess.CompletedProcess[bytes]:
+        return subprocess.run(
+            [sys.executable, str(HOOK)],
+            input=payload,
+            capture_output=True,
+            env=self.env,
+            check=False,
+        )
 
     def read(self, number: int, labels: list[str], **identity: str) -> None:
         self.send(
@@ -257,3 +268,201 @@ def test_state_lives_under_the_session_workspace_when_no_directory_is_set(tmp_pa
     _allow(gate, 12, ["bug"])
     stored = json.loads((gate.cwd / ".factory-selector" / "payload-session.json").read_text())
     assert stored["allowed"] == ["acme-corp/acme-bot/12"]
+
+
+def _reason(done: subprocess.CompletedProcess[bytes]) -> str:
+    assert done.returncode == 0, done.stderr
+    output = json.loads(done.stdout)["hookSpecificOutput"]
+    assert output["permissionDecision"] == "deny"
+    assert output["hookEventName"] == "PreToolUse"
+    return output["permissionDecisionReason"]
+
+
+def _decision_of(payload: dict[str, Any] | None) -> dict[str, Any]:
+    assert payload is not None
+    return payload["hookSpecificOutput"]
+
+
+def test_a_state_reset_is_denied_and_the_fourth_write_stays_refused(tmp_path: Path) -> None:
+    gate = Gate(tmp_path)
+    for number, labels in ((12, ["bug"]), (15, ["docs"]), (18, ["help wanted"])):
+        _allow(gate, number, labels)
+    state_path = gate.state / "sess-1.json"
+    before = state_path.read_bytes()
+    reset = _decision_of(
+        gate.send(
+            "PreToolUse",
+            tool_name="Write",
+            tool_input={
+                "file_path": str(state_path),
+                "content": json.dumps({"reads": {}, "allowed": []}),
+            },
+        )
+    )
+    assert reset["permissionDecision"] == "deny"
+    assert "session cap state" in reset["permissionDecisionReason"]
+    assert state_path.read_bytes() == before
+
+    edited = _decision_of(
+        gate.send(
+            "PreToolUse",
+            tool_name="Edit",
+            tool_input={
+                "file_path": str(state_path),
+                "old_string": "allowed",
+                "new_string": "cleared",
+            },
+        )
+    )
+    assert edited["permissionDecision"] == "deny"
+    assert state_path.read_bytes() == before
+
+    nested = _decision_of(
+        gate.send(
+            "PreToolUse",
+            tool_name="MultiEdit",
+            tool_input={
+                "edits": [{"file_path": str(state_path), "old_string": "a", "new_string": "b"}]
+            },
+        )
+    )
+    assert nested["permissionDecision"] == "deny"
+    assert state_path.read_bytes() == before
+
+    shell = _decision_of(
+        gate.send("PreToolUse", tool_name="Bash", tool_input={"command": "rm -rf ."})
+    )
+    assert "shell" in shell["permissionDecisionReason"]
+    other = _decision_of(
+        gate.send("PreToolUse", tool_name="ApplyPatch", tool_input={"command": "patch the state"})
+    )
+    assert "shell" in other["permissionDecisionReason"]
+    assert state_path.read_bytes() == before
+
+    assert (
+        gate.send(
+            "PreToolUse",
+            tool_name="Write",
+            tool_input={"file_path": str(gate.cwd / "notes.txt"), "content": "leave the cap alone"},
+        )
+        is None
+    )
+    assert (
+        gate.send(
+            "PreToolUse",
+            tool_name="Read",
+            tool_input={"file_path": str(state_path)},
+        )
+        is None
+    )
+
+    gate.read(21, ["bug"])
+    denied = gate.update(21, ["bug", LABEL])
+    assert denied["permissionDecision"] == "deny"
+    assert "cap of 3" in denied["permissionDecisionReason"]
+    stored = json.loads(state_path.read_text())
+    assert stored["allowed"] == [
+        "acme-corp/acme-bot/12",
+        "acme-corp/acme-bot/15",
+        "acme-corp/acme-bot/18",
+    ]
+
+
+def _blocked_on_state_lock(pid: int) -> bool:
+    try:
+        wchan = Path(f"/proc/{pid}/wchan").read_text(encoding="utf-8")
+    except OSError:
+        return False
+    return "locks_" in wchan
+
+
+def test_concurrent_updates_admit_exactly_three(tmp_path: Path) -> None:
+    gate = Gate(tmp_path)
+    batches = ((12, ["bug"]), (15, ["docs"]), (18, ["help wanted"]), (21, ["chore"]))
+    for number, labels in batches:
+        gate.read(number, labels)
+    lock_path = gate.state / "sess-1.json.lock"
+    descriptor = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
+    processes: list[subprocess.Popen[bytes]] = []
+    try:
+        fcntl.flock(descriptor, fcntl.LOCK_EX)
+        for number, labels in batches:
+            payload = json.dumps(
+                {
+                    "session_id": "payload-session",
+                    "hook_event_name": "PreToolUse",
+                    "cwd": str(gate.cwd),
+                    "tool_name": UPDATE,
+                    "tool_input": {
+                        "owner": "acme-corp",
+                        "repo": "acme-bot",
+                        "issue_number": number,
+                        "labels": [*labels, LABEL],
+                    },
+                }
+            ).encode()
+            proc = subprocess.Popen(
+                [sys.executable, str(HOOK)],
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                env=gate.env,
+                close_fds=True,
+            )
+            assert proc.stdin is not None
+            proc.stdin.write(payload)
+            proc.stdin.close()
+            processes.append(proc)
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            if all(_blocked_on_state_lock(proc.pid) for proc in processes):
+                break
+            exited = [proc for proc in processes if proc.poll() is not None]
+            if exited:
+                stderr = exited[0].stderr.read() if exited[0].stderr is not None else b""
+                raise AssertionError(stderr.decode(errors="replace"))
+        else:
+            raise AssertionError("updates did not wait on the state lock")
+    finally:
+        fcntl.flock(descriptor, fcntl.LOCK_UN)
+        os.close(descriptor)
+    try:
+        allows = 0
+        reasons: list[str] = []
+        for proc in processes:
+            stdout, stderr = proc.communicate(timeout=5)
+            assert proc.returncode == 0, stderr
+            decision = json.loads(stdout)["hookSpecificOutput"]
+            if decision["permissionDecision"] == "allow":
+                allows += 1
+            else:
+                reasons.append(decision["permissionDecisionReason"])
+    finally:
+        for proc in processes:
+            if proc.poll() is None:
+                proc.kill()
+                proc.wait(timeout=5)
+    assert allows == 3
+    assert len(reasons) == 1
+    assert "cap of 3" in reasons[0]
+    stored = json.loads((gate.state / "sess-1.json").read_text())
+    assert len(stored["allowed"]) == 3
+    assert set(stored["allowed"]) <= {
+        "acme-corp/acme-bot/12",
+        "acme-corp/acme-bot/15",
+        "acme-corp/acme-bot/18",
+        "acme-corp/acme-bot/21",
+    }
+
+
+def test_missing_malformed_and_undecodable_input_fails_closed(tmp_path: Path) -> None:
+    gate = Gate(tmp_path)
+    assert "hook input is missing" in _reason(gate.raw(b""))
+    assert "hook input is missing" in _reason(gate.raw(b" \n\t"))
+    assert "hook input is malformed" in _reason(gate.raw(b"{"))
+    assert "hook input is malformed" in _reason(gate.raw(b"[]"))
+    assert "hook input is not valid UTF-8" in _reason(gate.raw(b"\xff"))
+    gate.state.write_text("occupied", encoding="utf-8")
+    failed = gate.update(12, ["bug", LABEL])
+    assert failed["permissionDecision"] == "deny"
+    assert "hook failed closed" in failed["permissionDecisionReason"]

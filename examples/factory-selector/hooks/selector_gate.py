@@ -3,21 +3,32 @@
 
 PostToolUse on get_issue records that issue's labels. PreToolUse on
 update_issue allows the call only when it adds the policy label to those
-labels and this session is still under the cap. State is one JSON file per
-session. A missing policy, an out-of-range cap, or a bad state file refuses
-every label write.
+labels and this session is still under the cap. The read and the allow
+share one file lock for the whole state transaction, so concurrent calls
+cannot pass the cap. State is one JSON file per session. A missing policy,
+an out-of-range cap, or a bad state file refuses every label write.
+PreToolUse also refuses a shell command and any write that lands in the
+state directory, so the model cannot clear the cap. Missing, malformed, or
+undecodable hook input, and any other failure, deny.
 """
 
 from __future__ import annotations
 
+import fcntl
 import json
 import os
 import re
 import sys
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
 _CHANGED = ("title", "body", "state", "assignees", "milestone")
+_SHELL_TOOLS = frozenset({"bash", "shell", "powershell", "exec"})
+_WRITE_TOOLS = frozenset({"write", "edit", "multiedit", "notebookedit", "applypatch"})
+_READ_TOOLS = frozenset({"read", "glob", "grep"})
+_PATH_KEYS = frozenset({"file_path", "path", "notebook_path", "target_file", "target_notebook"})
+_COMMAND_KEYS = ("command", "cmd")
 
 
 def _env_path(name: str) -> Path | None:
@@ -55,6 +66,27 @@ def _decision(kind: str, reason: str) -> dict[str, Any]:
             "permissionDecisionReason": reason,
         }
     }
+
+
+def _with_state_lock(path: Path, body: Callable[[], Any]) -> Any:
+    """Hold the session lock for one read-modify-write of the state file.
+
+    The directory is created here, before the lock, so two callers cannot
+    both observe a missing file and then write. A symlink in the lock's
+    place fails the open instead of being followed.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    descriptor = os.open(
+        str(path) + ".lock",
+        os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW | os.O_CLOEXEC,
+        0o600,
+    )
+    try:
+        fcntl.flock(descriptor, fcntl.LOCK_EX)
+        return body()
+    finally:
+        fcntl.flock(descriptor, fcntl.LOCK_UN)
+        os.close(descriptor)
 
 
 def load_policy(path: Path) -> tuple[dict[str, Any] | None, str | None]:
@@ -100,14 +132,30 @@ def _valid_state(data: object) -> bool:
     )
 
 
+def _read_text(path: Path) -> str:
+    descriptor = os.open(str(path), os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
+    try:
+        chunks: list[bytes] = []
+        while True:
+            block = os.read(descriptor, 65536)
+            if not block:
+                break
+            chunks.append(block)
+    finally:
+        os.close(descriptor)
+    return b"".join(chunks).decode("utf-8")
+
+
 def load_state(path: Path) -> tuple[dict[str, Any] | None, str | None]:
+    if path.is_symlink():
+        return None, "state file is unreadable"
     if not path.exists():
         return {"reads": {}, "allowed": []}, None
     try:
-        data = json.loads(path.read_text(encoding="utf-8"))
+        data = json.loads(_read_text(path))
     except OSError:
         return None, "state file is unreadable"
-    except json.JSONDecodeError:
+    except (json.JSONDecodeError, UnicodeDecodeError):
         return None, "state file is malformed"
     if not _valid_state(data):
         return None, "state file is malformed"
@@ -115,11 +163,20 @@ def load_state(path: Path) -> tuple[dict[str, Any] | None, str | None]:
 
 
 def save_state(path: Path, state: dict[str, Any]) -> str | None:
+    temporary = path.with_suffix(".tmp")
+    payload = json.dumps(state).encode("utf-8")
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
-        temporary = path.with_suffix(".tmp")
-        temporary.write_text(json.dumps(state), encoding="utf-8")
-        temporary.replace(path)
+        descriptor = os.open(
+            str(temporary),
+            os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW | os.O_CLOEXEC,
+            0o600,
+        )
+        try:
+            os.write(descriptor, payload)
+        finally:
+            os.close(descriptor)
+        os.replace(str(temporary), str(path))
     except OSError:
         return "state file is unreadable"
     return None
@@ -179,18 +236,21 @@ def _label_names(issue: dict[str, Any]) -> list[str] | None:
 
 
 def _record_read(data: dict[str, Any], path: Path) -> None:
-    identity = _identity(data.get("tool_input"))
-    issue = _issue_object(data.get("tool_response"))
-    if identity is None or issue is None:
-        return
-    names = _label_names(issue)
-    if names is None:
-        return
-    state, error = load_state(path)
-    if error is not None or state is None:
-        return
-    state["reads"][identity[1]] = names
-    save_state(path, state)
+    def body() -> None:
+        identity = _identity(data.get("tool_input"))
+        issue = _issue_object(data.get("tool_response"))
+        if identity is None or issue is None:
+            return
+        names = _label_names(issue)
+        if names is None:
+            return
+        state, error = load_state(path)
+        if error is not None or state is None:
+            return
+        state["reads"][identity[1]] = names
+        save_state(path, state)
+
+    _with_state_lock(path, body)
 
 
 def _label_refusal(recorded: list[str], requested: object, policy_label: str) -> str | None:
@@ -215,64 +275,155 @@ def _label_refusal(recorded: list[str], requested: object, policy_label: str) ->
 
 
 def _decide_update(data: dict[str, Any], path: Path) -> dict[str, Any]:
-    policy, error = load_policy(policy_path())
-    if error is not None or policy is None:
-        return _decision("deny", error or "policy file is missing")
-    state, error = load_state(path)
-    if error is not None or state is None:
-        return _decision("deny", error or "state file is malformed")
-    tool_input = data.get("tool_input")
-    identity = _identity(tool_input)
-    if not isinstance(tool_input, dict) or identity is None:
-        return _decision("deny", "call does not name the issue")
-    repository, key = identity
-    if repository != policy["repository"]:
-        return _decision("deny", "repository is not the policy repository")
-    recorded = state["reads"].get(key)
-    if not isinstance(recorded, list):
-        return _decision("deny", "issue was not read in this session")
-    refusal = _label_refusal(recorded, tool_input.get("labels"), policy["label"])
-    if refusal is not None:
-        return _decision("deny", refusal)
-    changed = next(
-        (field for field in _CHANGED if field in tool_input and tool_input[field] is not None),
-        None,
-    )
-    if changed is not None:
-        return _decision("deny", f"call changes {changed}")
-    allowed: list[str] = state["allowed"]
-    if key not in allowed and len(allowed) >= policy["cap"]:
-        return _decision(
-            "deny",
-            f"cap of {policy['cap']} distinct issues already allowed in this session",
+    def body() -> dict[str, Any]:
+        policy, error = load_policy(policy_path())
+        if error is not None or policy is None:
+            return _decision("deny", error or "policy file is missing")
+        state, error = load_state(path)
+        if error is not None or state is None:
+            return _decision("deny", error or "state file is malformed")
+        tool_input = data.get("tool_input")
+        identity = _identity(tool_input)
+        if not isinstance(tool_input, dict) or identity is None:
+            return _decision("deny", "call does not name the issue")
+        repository, key = identity
+        if repository != policy["repository"]:
+            return _decision("deny", "repository is not the policy repository")
+        recorded = state["reads"].get(key)
+        if not isinstance(recorded, list):
+            return _decision("deny", "issue was not read in this session")
+        refusal = _label_refusal(recorded, tool_input.get("labels"), policy["label"])
+        if refusal is not None:
+            return _decision("deny", refusal)
+        changed = next(
+            (field for field in _CHANGED if field in tool_input and tool_input[field] is not None),
+            None,
         )
-    if key not in allowed:
-        allowed.append(key)
-    error = save_state(path, state)
-    if error is not None:
-        return _decision("deny", error)
-    return _decision(
-        "allow",
-        "label add keeps the recorded labels and is within the session cap",
-    )
+        if changed is not None:
+            return _decision("deny", f"call changes {changed}")
+        allowed: list[str] = state["allowed"]
+        if key not in allowed and len(allowed) >= policy["cap"]:
+            return _decision(
+                "deny",
+                f"cap of {policy['cap']} distinct issues already allowed in this session",
+            )
+        if key not in allowed:
+            allowed.append(key)
+        error = save_state(path, state)
+        if error is not None:
+            return _decision("deny", error)
+        return _decision(
+            "allow",
+            "label add keeps the recorded labels and is within the session cap",
+        )
+
+    return _with_state_lock(path, body)
 
 
-def main() -> None:
+def _leaf(tool: str) -> str:
+    name = tool.strip()
+    if "__" in name:
+        name = name.rsplit("__", 1)[-1]
+    return name.casefold()
+
+
+def _path_strings(tool_input: object) -> list[str]:
+    if not isinstance(tool_input, dict):
+        return []
+    found: list[str] = []
+    for key, value in tool_input.items():
+        if key in _PATH_KEYS and isinstance(value, str) and value.strip():
+            found.append(value)
+        elif isinstance(value, list):
+            for item in value:
+                if not isinstance(item, dict):
+                    continue
+                for child_key, child in item.items():
+                    if child_key in _PATH_KEYS and isinstance(child, str) and child.strip():
+                        found.append(child)
+    return found
+
+
+def _lands_in_state(candidate: Path, directory: Path) -> bool:
     try:
-        data = json.load(sys.stdin)
-    except json.JSONDecodeError:
-        return
-    if not isinstance(data, dict):
-        return
+        candidate.resolve().relative_to(directory.resolve())
+    except ValueError:
+        return False
+    except (OSError, RuntimeError):
+        return True
+    return True
+
+
+def _state_write_refusal(data: dict[str, Any], path: Path) -> str | None:
+    tool_input = data.get("tool_input")
+    leaf = _leaf(str(data.get("tool_name") or ""))
+    if leaf in _READ_TOOLS:
+        return None
+    if leaf in _SHELL_TOOLS or (
+        isinstance(tool_input, dict)
+        and any(isinstance(tool_input.get(key), str) for key in _COMMAND_KEYS)
+    ):
+        return "a shell command can rewrite the session cap state"
+    raw_paths = _path_strings(tool_input)
+    if leaf in _WRITE_TOOLS and not raw_paths:
+        return "a write can rewrite the session cap state"
+    cwd = Path(str(data.get("cwd") or ""))
+    for raw in raw_paths:
+        candidate = Path(raw)
+        if not candidate.is_absolute():
+            candidate = cwd / candidate
+        if _lands_in_state(candidate, path.parent):
+            return "a write targets the session cap state"
+    return None
+
+
+def _dispatch(data: dict[str, Any]) -> dict[str, Any] | None:
     path = state_file(data)
     event = str(data.get("hook_event_name") or "")
     tool = str(data.get("tool_name") or "")
     if event == "PostToolUse" and tool.endswith("get_issue"):
         _record_read(data, path)
+        return None
+    if event != "PreToolUse":
+        return None
+    if tool.endswith("update_issue"):
+        return _decide_update(data, path)
+    refusal = _state_write_refusal(data, path)
+    if refusal is None:
+        return None
+    return _decision("deny", refusal)
+
+
+def _emit(decision: dict[str, Any]) -> None:
+    json.dump(decision, sys.stdout)
+    sys.stdout.write("\n")
+
+
+def main() -> None:
+    try:
+        raw = sys.stdin.buffer.read()
+        try:
+            text = raw.decode("utf-8")
+        except UnicodeDecodeError:
+            _emit(_decision("deny", "hook input is not valid UTF-8"))
+            return
+        if not text.strip():
+            _emit(_decision("deny", "hook input is missing"))
+            return
+        try:
+            data = json.loads(text)
+        except json.JSONDecodeError:
+            _emit(_decision("deny", "hook input is malformed"))
+            return
+        if not isinstance(data, dict):
+            _emit(_decision("deny", "hook input is malformed"))
+            return
+        decision = _dispatch(data)
+    except Exception:  # noqa: BLE001 - any hook failure must deny
+        _emit(_decision("deny", "hook failed closed"))
         return
-    if event == "PreToolUse" and tool.endswith("update_issue"):
-        json.dump(_decide_update(data, path), sys.stdout)
-        sys.stdout.write("\n")
+    if decision is not None:
+        _emit(decision)
 
 
 if __name__ == "__main__":

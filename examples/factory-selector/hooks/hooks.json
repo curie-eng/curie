@@ -14,7 +14,7 @@
     ],
     "PreToolUse": [
       {
-        "matcher": ".*update_issue",
+        "matcher": ".*",
         "hooks": [
           {
             "type": "command",

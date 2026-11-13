@@ -100,7 +100,7 @@ def test_the_hook_declaration_matches_the_two_tools():
     hooks = json.loads((BUNDLE / "hooks" / "hooks.json").read_text())["hooks"]
     assert set(hooks) == {"PostToolUse", "PreToolUse"}
     assert hooks["PostToolUse"][0]["matcher"] == ".*get_issue"
-    assert hooks["PreToolUse"][0]["matcher"] == ".*update_issue"
+    assert hooks["PreToolUse"][0]["matcher"] == ".*"
     command = "python3 ${CLAUDE_PLUGIN_ROOT}/hooks/selector_gate.py"
     assert hooks["PostToolUse"][0]["hooks"][0]["command"] == command
     assert hooks["PreToolUse"][0]["hooks"][0]["command"] == command
