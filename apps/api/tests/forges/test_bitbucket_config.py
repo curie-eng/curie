@@ -48,6 +48,7 @@ EXPECTED_CAPABILITIES = {
     # UI evidence hosting is GitHub only: both kinds declare it unsupported.
     Operation.STORE_EVIDENCE: Support.UNSUPPORTED,
     Operation.DELETE_EVIDENCE: Support.UNSUPPORTED,
+    Operation.CURRENT_INSTALLATION_CREDENTIAL: Support.UNSUPPORTED,
 }
 
 KINDS = [
