@@ -48,6 +48,7 @@ from curie_api.forges.types import (
     FactoryPublication,
     FeedbackKind,
     FeedbackPage,
+    LinkedIssue,
     MarkedComment,
     MarkedNotice,
     NormalizedCheck,
@@ -67,10 +68,18 @@ from curie_api.forges.types import (
     TicketLabels,
     TrackerIssueRef,
     UpsertResult,
+    body_sha256,
+    ends_with_marker,
+    linked_issue_body,
+    linked_issue_marker,
+    valid_output_identity,
 )
 from curie_api.publication_policy import is_publication_branch
 
 BOT = Actor(id="1000", login="curie-bot")
+# Who created a seeded issue unless the test names someone: a person, never
+# the adapter's own identity.
+REPORTER = Actor(id="2001", login="issue-reporter")
 _COMMIT_SHA = re.compile(r"[0-9a-f]{40,64}")
 
 
@@ -104,6 +113,46 @@ class PageFaults:
             self._countdown = None
             raise Unavailable(what)
         self._countdown -= 1
+
+
+class WriteFaults:
+    """Injectable write failures, one shot each, keyed by `Operation`.
+
+    `InMemoryTracker` honours them for `Operation.CREATE_LINKED_ISSUE` and its
+    `InMemoryMarkedComments` for `Operation.UPSERT_MARKED`; both share the one
+    object the tracker was built with (``InMemoryTracker.write_faults``).
+    """
+
+    def __init__(self) -> None:
+        self._lost: set[Operation] = set()
+        self._aborts: dict[Operation, BaseException] = {}
+
+    def lose_next_response(self, operation: Operation) -> None:
+        """The next call of ``operation`` does its work, writes included, then
+        raises `Unavailable` instead of answering: a lost response."""
+
+        self._lost.add(operation)
+
+    def abort_before_next(self, operation: Operation, error: BaseException) -> None:
+        """The next call of ``operation`` that passes its argument checks
+        raises ``error`` before it lists or writes anything. A `BaseException`
+        subclass models a process dying."""
+
+        self._aborts[operation] = error
+
+    def before(self, operation: Operation) -> None:
+        """Called by an adapter at the start of ``operation``, after its gate."""
+
+        error = self._aborts.pop(operation, None)
+        if error is not None:
+            raise error
+
+    def after(self, operation: Operation) -> None:
+        """Called by an adapter once ``operation`` has done its work."""
+
+        if operation in self._lost:
+            self._lost.discard(operation)
+            raise Unavailable(f"{operation.value} response lost")
 
 
 def _declared(
@@ -157,11 +206,13 @@ class InMemoryMarkedComments(_Declared):
         faults: PageFaults,
         page_size: int,
         capabilities: Mapping[Operation, Support] | None = None,
+        write_faults: WriteFaults | None = None,
     ) -> None:
         self.kind = kind
         self.host = host
         self.identity = identity
         self.capabilities = _declared(capabilities, MARKED_COMMENT_OPERATIONS)
+        self.write_faults = write_faults or WriteFaults()
         self._accepts = frozenset(accepts)
         self._ledger = ledger
         self._faults = faults
@@ -203,7 +254,15 @@ class InMemoryMarkedComments(_Declared):
         return None
 
     async def upsert_marked(self, target: ReplyTarget, marker: str, body: str) -> UpsertResult:
+        """Honours ``write_faults`` for `Operation.UPSERT_MARKED`."""
+
         self._gate(Operation.UPSERT_MARKED)
+        self.write_faults.before(Operation.UPSERT_MARKED)
+        result = await self._upsert(target, marker, body)
+        self.write_faults.after(Operation.UPSERT_MARKED)
+        return result
+
+    async def _upsert(self, target: ReplyTarget, marker: str, body: str) -> UpsertResult:
         text = self.embed(marker, body)
         found = await self.find_marked(target, marker)
         thread = self._accept(target)
@@ -227,6 +286,7 @@ class _Issue:
     labels: set[str] = field(default_factory=set)
     dependencies: tuple[TrackerIssueRef, ...] = ()
     linked: list[PullRequestRef] = field(default_factory=list)
+    author: Actor = REPORTER
 
 
 @dataclass(frozen=True)
@@ -262,6 +322,7 @@ class InMemoryTracker(_Declared):
         comment_capabilities: Mapping[Operation, Support] | None = None,
         ledger: WriteLedger | None = None,
         faults: PageFaults | None = None,
+        write_faults: WriteFaults | None = None,
     ) -> None:
         self.kind = kind
         self.host = host
@@ -272,6 +333,9 @@ class InMemoryTracker(_Declared):
         self.capabilities = _declared(capabilities, TRACKER_OPERATIONS)
         self.ledger = ledger or WriteLedger()
         self.faults = faults or PageFaults()
+        self.write_faults = write_faults or WriteFaults()
+        # Each composed body a `create_linked_issue` create wrote, in order.
+        self.sent_issue_bodies: list[str] = []
         self._page_size = page_size
         self._issues: dict[TrackerIssueRef, _Issue] = {}
         self._timeline: list[_TimelineEvent] = []
@@ -287,6 +351,7 @@ class InMemoryTracker(_Declared):
             faults=self.faults,
             page_size=page_size,
             capabilities=comment_capabilities,
+            write_faults=self.write_faults,
         )
 
     @property
@@ -295,14 +360,52 @@ class InMemoryTracker(_Declared):
 
     # Seeding --------------------------------------------------------------
 
+    def _next_issue_id(self) -> str:
+        number = len(self._issues) + 1
+        while TrackerIssueRef(self.kind, self.host, self.scope_id, str(number)) in self._issues:
+            number += 1
+        return str(number)
+
     def seed_issue(
-        self, title: str, body: str, *, display_key: str | None = None
+        self,
+        title: str,
+        body: str,
+        *,
+        display_key: str | None = None,
+        issue_id: str | None = None,
+        author: Actor | None = None,
+        labels: Collection[str] = (),
     ) -> TrackerIssueRef:
+        """An issue created from outside the port, by ``author`` (a person,
+        `REPORTER`, by default; pass ``self.identity`` for one a past run of
+        the adapter created). ``issue_id`` names the id, so a test can seed the
+        issue a real WorkItem names; ValueError when it is already taken.
+        ``labels`` are set without timeline events."""
+
         ref = TrackerIssueRef(
-            self.kind, self.host, self.scope_id, str(len(self._issues) + 1), display_key
+            self.kind, self.host, self.scope_id, issue_id or self._next_issue_id(), display_key
         )
-        self._issues[ref] = _Issue(ref, title, body)
+        if ref in self._issues:
+            raise ValueError(f"issue {ref.issue_id} is already seeded")
+        self._issues[ref] = _Issue(ref, title, body, labels=set(labels), author=author or REPORTER)
         return ref
+
+    def issue_body(self, issue: TrackerIssueRef) -> str:
+        """The issue's stored body now; `NotFound` outside this tracker."""
+
+        return self._issue(issue).body
+
+    def edit_issue_body(self, issue: TrackerIssueRef, body: str) -> None:
+        """A person edits the issue's body. Not a port write: no ledger entry."""
+
+        self._issue(issue).body = body
+
+    def issues(self, *, author: Actor | None = None) -> list[TrackerIssueRef]:
+        """Every issue in creation order, only those ``author`` created when given."""
+
+        return [
+            found.ref for found in self._issues.values() if author is None or found.author == author
+        ]
 
     def seed_dependencies(self, issue: TrackerIssueRef, *depends_on: TrackerIssueRef) -> None:
         self._issue(issue).dependencies = depends_on
@@ -495,6 +598,76 @@ class InMemoryTracker(_Declared):
         if own:
             return (f"Closes #{issue.issue_id}",)
         return (f"Closes {issue.scope_id}#{issue.issue_id}",)
+
+    @staticmethod
+    def embed_linked_marker(output_identity: str) -> str:
+        """How this adapter carries the linked issue marker: an HTML comment."""
+
+        return f"<!-- {linked_issue_marker(output_identity)} -->"
+
+    def _own_marked(self, embedded: str) -> list[_Issue]:
+        """Issues in this scope our own identity created whose last line is
+        ``embedded``, read page by page as a creator-filtered listing is."""
+
+        own = [
+            found
+            for found in self._issues.values()
+            if found.ref.scope_id == self.scope_id and found.author == self.identity
+        ]
+        matches: list[_Issue] = []
+        for start in range(0, max(len(own), 1), self._page_size):
+            self.faults.read_page("issues")
+            matches.extend(
+                found
+                for found in own[start : start + self._page_size]
+                if ends_with_marker(found.body, embedded)
+            )
+        return matches
+
+    async def create_linked_issue(
+        self,
+        source: TrackerIssueRef,
+        *,
+        output_identity: str,
+        title: str,
+        body: str,
+        labels: Collection[str],
+    ) -> LinkedIssue:
+        """The port operation over dict state; honours ``write_faults`` for
+        `Operation.CREATE_LINKED_ISSUE`. The related-source line is
+        ``Related to <issue_url(source)>.``; the marker is
+        `embed_linked_marker`. A create counts one ledger write and appends
+        the composed body to ``sent_issue_bodies``."""
+
+        self._gate(Operation.CREATE_LINKED_ISSUE)
+        valid_output_identity(output_identity)
+        self._issue(source)
+        self.write_faults.before(Operation.CREATE_LINKED_ISSUE)
+        embedded = self.embed_linked_marker(output_identity)
+        text = linked_issue_body(
+            body, related=f"Related to {self.issue_url(source)}.", embedded=embedded
+        )
+        matches = self._own_marked(embedded)
+        if len(matches) > 1:
+            raise Ambiguous("linked_issue")
+        created = not matches
+        if matches:
+            found = matches[0]
+        else:
+            ref = TrackerIssueRef(self.kind, self.host, self.scope_id, self._next_issue_id())
+            found = _Issue(ref, title, text, labels=set(labels), author=self.identity)
+            self._issues[ref] = found
+            self.sent_issue_bodies.append(text)
+            self.ledger.record()
+        self.write_faults.after(Operation.CREATE_LINKED_ISSUE)
+        return LinkedIssue(
+            issue=found.ref,
+            url=self.issue_url(found.ref),
+            labels=frozenset(found.labels),
+            body_sha256=body_sha256(found.body),
+            sent_body_sha256=body_sha256(text),
+            created=created,
+        )
 
     async def link_pull_request(self, issue: TrackerIssueRef, pull_request: PullRequest) -> None:
         if not self._gate(Operation.LINK_PULL_REQUEST):

@@ -26,6 +26,8 @@ https://docs.github.com/en/rest/issues/issues#list-repository-issues
 https://docs.github.com/en/rest/collaborators/collaborators#get-repository-permissions-for-a-user
 https://docs.github.com/en/rest/issues/labels#add-labels-to-an-issue
 https://docs.github.com/en/rest/issues/labels#remove-a-label-from-an-issue
+https://docs.github.com/en/rest/issues/issues#create-an-issue
+https://docs.github.com/en/rest/issues/issues#get-an-issue
 """
 
 from __future__ import annotations
@@ -40,7 +42,7 @@ from urllib.parse import quote, urlsplit
 import httpx
 
 from curie_api.forges.capabilities import TRACKER_OPERATIONS, Operation, Support
-from curie_api.forges.errors import NotFound, Unauthorized, Unavailable, Unsupported
+from curie_api.forges.errors import Ambiguous, NotFound, Unauthorized, Unavailable, Unsupported
 from curie_api.forges.github.comments import GitHubMarkedComments, TokenSource
 from curie_api.forges.github.marked_comments import REFUSED_STATUSES, github_request
 from curie_api.forges.github.review_polling import human_actor
@@ -58,12 +60,19 @@ from curie_api.forges.types import (
     GITHUB,
     Actor,
     Disposition,
+    LinkedIssue,
     MarkedNotice,
     NoticePage,
     PullRequest,
     RepositoryRef,
     TicketLabels,
     TrackerIssueRef,
+    body_sha256,
+    ends_with_marker,
+    linked_issue_body,
+    linked_issue_marker,
+    publication_url,
+    valid_output_identity,
 )
 from curie_api.github_factory_events import FactoryNotice, FactoryRefused, mentions_login
 from curie_api.github_review_truth import verify_sender_write_permission
@@ -196,6 +205,32 @@ def issue_url(html_base: str, repo_full_name: str, issue: TrackerIssueRef) -> st
     return f"{html_base.rstrip('/')}/{repo_full_name}/issues/{issue.issue_id}"
 
 
+def linked_listing_params(own: str) -> dict[str, str]:
+    """The query of the linked issue lookup: every issue ``own`` created, in
+    any state, oldest first
+    (https://docs.github.com/en/rest/issues/issues#list-repository-issues).
+    ``per_page`` and ``page`` are added by the pager."""
+
+    return {"creator": own, "state": "all", "sort": "created", "direction": "asc"}
+
+
+def created_by(item: Mapping[str, Any], own: str) -> bool:
+    """Whether the listed issue's author is ``own``, the App's bot user.
+
+    The login is compared case-insensitively and the account type must be
+    ``Bot``, so a person's issue never counts even if a listing ignored the
+    ``creator`` filter.
+    """
+
+    user = item.get("user")
+    if not isinstance(user, dict):
+        return False
+    login = user.get("login")
+    return (
+        isinstance(login, str) and login.casefold() == own.casefold() and user.get("type") == "Bot"
+    )
+
+
 class GitHubTracker:
     """The factory's tracker on one GitHub repository."""
 
@@ -222,8 +257,14 @@ class GitHubTracker:
         label: str,
         mention: str,
         app_id: str,
+        own_login: TokenSource,
         page_size: int = 100,
     ) -> None:
+        """``own_login`` answers the login this adapter's token writes as: the
+        App's bot user ``<slug>[bot]`` (`GitHubTrackerConnection` reads the slug
+        under the App JWT). ``create_linked_issue`` counts only issues that
+        login created."""
+
         if page_size < 1:
             raise ValueError("page_size must be positive")
         self._client = client
@@ -234,6 +275,7 @@ class GitHubTracker:
         self.repository_id = repository_id
         self._repo_path = f"/repos/{repo_url_path(repo_full_name)}"
         self._token = token
+        self._own_login = own_login
         self.label = label
         self.mention = mention
         self._page_size = page_size
@@ -666,6 +708,152 @@ class GitHubTracker:
         ``Closes #n`` only in the issue's own repository, else ``owner/repo#n``."""
 
         return (await self.closing_reference(issue, repository),)
+
+    # Linked output issues (ADR 0277) ------------------------------------
+
+    @staticmethod
+    def embed_linked_marker(output_identity: str) -> str:
+        """How GitHub carries the linked issue marker: a hidden HTML comment."""
+
+        return f"<!-- {linked_issue_marker(output_identity)} -->"
+
+    async def _linked_matches(self, own: str, embedded: str) -> list[int]:
+        """Numbers of the repository's issues ``own`` created whose last
+        non-empty body line is ``embedded``, oldest first.
+
+        Lists repository issues filtered by creator, never the search API,
+        whose index lags a create
+        (https://docs.github.com/en/rest/issues/issues#list-repository-issues).
+        That listing returns pull requests too, marked by a ``pull_request``
+        key; they are skipped. The creator filter is the server's; the owner
+        check (`created_by`) is ours. A listing past the page bound, an own
+        item whose body is not text, or a matching item without a usable
+        number is `Unavailable`: absence is proven only by a readable listing.
+        """
+
+        items = await self._pages(f"{self._repo_path}/issues", linked_listing_params(own))
+        matches: list[int] = []
+        for item in items:
+            if (
+                not isinstance(item, dict)
+                or "pull_request" in item
+                or not created_by(item, own)
+                or not ends_with_marker(_text(item.get("body")), embedded)
+            ):
+                continue
+            number = _positive_int(item.get("number"))
+            if number is None:
+                raise Unavailable("linked_issue")
+            matches.append(number)
+        return matches
+
+    async def _create_issue(self, title: str, body: str, labels: Collection[str]) -> int | None:
+        """POST the issue; its number, or None when the answer is uncertain.
+
+        https://docs.github.com/en/rest/issues/issues#create-an-issue
+        A transport error, a 5xx or an unreadable 201 may have created it, so
+        it is None and the caller lists again. A definite refusal raises:
+        401 or 403 `Unauthorized`, 404 `NotFound`, 422 and anything else
+        `Unavailable`.
+        """
+
+        template = "/repos/{owner}/{repo}/issues"
+        try:
+            response = await github_request(
+                self._client,
+                "POST",
+                f"{self._api}{self._repo_path}/issues",
+                path_template=template,
+                headers=github_headers(await self._token()),
+                json={"title": title, "body": body, "labels": sorted(set(labels))},
+                follow_redirects=False,
+            )
+        except httpx.HTTPError:
+            return None
+        status = response.status_code
+        if status >= 500:
+            return None
+        if status in {401, 403}:
+            raise Unauthorized("linked_issue")
+        if status == 404:
+            raise NotFound("linked_issue")
+        if status == 422:
+            raise Unavailable("unprocessable")
+        if status != 201:
+            raise Unavailable("linked_issue")
+        try:
+            payload = response.json()
+        except ValueError:
+            return None
+        return _positive_int(payload.get("number")) if isinstance(payload, dict) else None
+
+    async def _single(self, own: str, embedded: str) -> int | None:
+        matches = await self._linked_matches(own, embedded)
+        if len(matches) > 1:
+            raise Ambiguous("linked_issue")
+        return matches[0] if matches else None
+
+    async def create_linked_issue(
+        self,
+        source: TrackerIssueRef,
+        *,
+        output_identity: str,
+        title: str,
+        body: str,
+        labels: Collection[str],
+    ) -> LinkedIssue:
+        """One issue in this repository linked to ``source`` (ADR 0277).
+
+        The body ends with ``Related to #<source>.``, a bare same-repository
+        reference that makes GitHub's cross-reference and neither closes the
+        source nor records a dependency, then `embed_linked_marker`. The
+        lookup (`_linked_matches`) runs before the create and again after an
+        uncertain create; one match reconciles, none after an uncertain
+        create is `Unavailable("linked_issue_unconfirmed")`, two or more are
+        `Ambiguous`. The issue is then read back
+        (https://docs.github.com/en/rest/issues/issues#get-an-issue) for its
+        body digest, labels and ``html_url``.
+        """
+
+        valid_output_identity(output_identity)
+        source_number = self._number(source)
+        embedded = self.embed_linked_marker(output_identity)
+        text = linked_issue_body(body, related=f"Related to #{source_number}.", embedded=embedded)
+        own = await self._own_login()
+        number = await self._single(own, embedded)
+        created = False
+        if number is None:
+            number = await self._create_issue(title, text, labels)
+            created = number is not None
+            if number is None:
+                number = await self._single(own, embedded)
+                if number is None:
+                    raise Unavailable("linked_issue_unconfirmed")
+        return await self._linked_issue(number, text, created=created)
+
+    async def _linked_issue(self, number: int, sent: str, *, created: bool) -> LinkedIssue:
+        found = await self._issue(number)
+        if found is None:
+            raise Unavailable("linked_issue")
+        # An empty body reads back as null; anything else that is not text
+        # cannot be digested and is `Unavailable`.
+        body = _text(found.get("body"))
+        names = label_names(found)
+        if names is None:
+            raise Unavailable("linked_issue")
+        ref = self.issue(number)
+        try:
+            url = publication_url(found.get("html_url"), self._html_base)
+        except Unavailable:
+            url = issue_url(self._html_base, self.repo_full_name, ref)
+        return LinkedIssue(
+            issue=ref,
+            url=url,
+            labels=frozenset(names),
+            body_sha256=body_sha256(body),
+            sent_body_sha256=body_sha256(sent),
+            created=created,
+        )
 
     async def link_pull_request(self, issue: TrackerIssueRef, pull_request: PullRequest) -> None:
         self._number(issue)

@@ -110,6 +110,8 @@ JIRA_TRACKER_CAPABILITIES: Mapping[Operation, Support] = {
     Operation.LINK_PULL_REQUEST: Support.NOOP,
     Operation.DEPENDENCIES: Support.NOOP,
     Operation.GROUP_MEMBERSHIP: Support.UNSUPPORTED,
+    # Linked output issues are GitHub only (ADR 0277).
+    Operation.CREATE_LINKED_ISSUE: Support.UNSUPPORTED,
 }
 
 

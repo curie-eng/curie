@@ -41,6 +41,13 @@ async def _optional_calls(harness: AdapterHarness) -> dict[Operation, Call]:
         Operation.LINK_PULL_REQUEST: lambda: tracker.link_pull_request(issue, pull),
         Operation.DEPENDENCIES: lambda: tracker.dependencies(issue),
         Operation.GROUP_MEMBERSHIP: lambda: tracker.in_group(harness.writer, "starters"),
+        Operation.CREATE_LINKED_ISSUE: lambda: tracker.create_linked_issue(
+            issue,
+            output_identity="capabilities-output",
+            title="Found while triaging",
+            body="Steps to reproduce.",
+            labels=("factory",),
+        ),
         Operation.CI_DIAGNOSTICS: lambda: code_host.ci_diagnostics(
             repository, pull.head_sha, base_ref=None
         ),

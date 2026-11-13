@@ -51,10 +51,17 @@ from curie_api.forges.types import (
     RepositoryRef,
     StoredEvidence,
     TrackerIssueRef,
+    ends_with_marker,
 )
 
 from forge_fakes import jira as jira_fake
-from forge_fakes.github import CONTRACT_APP_ID, REPO, REPO_ID, GitHubRepositoryFake
+from forge_fakes.github import (
+    CONTRACT_APP_ID,
+    CONTRACT_BOT,
+    REPO,
+    REPO_ID,
+    GitHubRepositoryFake,
+)
 
 
 class AdapterHarness(Protocol):
@@ -138,6 +145,33 @@ class AdapterHarness(Protocol):
         None when it serves nothing."""
 
 
+class LinkedIssueHarness(AdapterHarness, Protocol):
+    """The hooks the linked output issue vectors need (ADR 0277,
+    ``apps/api/tests/forges/contract/test_linked_issue.py``). Implemented only
+    by the pairs whose tracker supports `Operation.CREATE_LINKED_ISSUE`:
+    `InMemoryHarness` and `GitHubHarness`."""
+
+    def lose_next_create_response(self) -> None:
+        """The next issue create is applied, then its answer is lost."""
+
+    def add_issue(self, author: Actor | None, body: str) -> TrackerIssueRef:
+        """An issue in the tracker's scope created from outside the port by
+        ``author``, or by the adapter's own identity when None (a past run)."""
+
+    def marked_issue_count(self, output_identity: str) -> int:
+        """Issues our own identity created whose last non-empty line is the
+        embedded marker for ``output_identity``, read from outside the port."""
+
+    def issue_body(self, issue: TrackerIssueRef) -> str:
+        """The issue's stored body, read from outside the port."""
+
+    def sent_issue_bodies(self) -> list[str]:
+        """The body of every issue create the adapter sent, in order."""
+
+    def embed_linked_marker(self, output_identity: str) -> str:
+        """The marker line exactly as the adapter embeds it."""
+
+
 async def open_pull(harness: AdapterHarness, branch: str) -> PullRequest:
     """Push ``branch`` and open a pull request from it through the port."""
 
@@ -184,6 +218,8 @@ class InMemoryHarness:
             tracker_caps[Operation.LINK_PULL_REQUEST] = Support.NOOP
             tracker_caps[Operation.DEPENDENCIES] = Support.NOOP
             tracker_caps[Operation.GROUP_MEMBERSHIP] = Support.UNSUPPORTED
+            # Jira's shape: linked output issues are GitHub only (ADR 0277).
+            tracker_caps[Operation.CREATE_LINKED_ISSUE] = Support.UNSUPPORTED
             code_caps[Operation.RERUN_FAILED] = Support.NOOP
             code_caps[Operation.CI_DIAGNOSTICS] = Support.UNSUPPORTED
             code_caps[Operation.USER_CAN_WRITE] = Support.UNSUPPORTED
@@ -279,6 +315,28 @@ class InMemoryHarness:
     def evidence_raw(self, url: str) -> bytes | None:
         return self._code_host.raw(url)
 
+    def lose_next_create_response(self) -> None:
+        self._tracker.write_faults.lose_next_response(Operation.CREATE_LINKED_ISSUE)
+
+    def add_issue(self, author: Actor | None, body: str) -> TrackerIssueRef:
+        return self._tracker.seed_issue(
+            "Planted", body, author=self._tracker.identity if author is None else author
+        )
+
+    def marked_issue_count(self, output_identity: str) -> int:
+        embedded = self.embed_linked_marker(output_identity)
+        own = self._tracker.issues(author=self._tracker.identity)
+        return sum(ends_with_marker(self._tracker.issue_body(ref), embedded) for ref in own)
+
+    def issue_body(self, issue: TrackerIssueRef) -> str:
+        return self._tracker.issue_body(issue)
+
+    def sent_issue_bodies(self) -> list[str]:
+        return list(self._tracker.sent_issue_bodies)
+
+    def embed_linked_marker(self, output_identity: str) -> str:
+        return InMemoryTracker.embed_linked_marker(output_identity)
+
 
 class _ObservedEvidenceCodeHost(InMemoryCodeHost):
     """The in-memory code host, unchanged, noting which commit each evidence
@@ -363,6 +421,7 @@ class GitHubHarness:
             label=LABEL,
             mention="curie",
             app_id=str(CONTRACT_APP_ID),
+            own_login=static_token(str(CONTRACT_BOT["login"])),
             page_size=2,
         )
         settings = Settings(github_api_url="https://api.github.com")
@@ -496,6 +555,32 @@ class GitHubHarness:
         response = self.fake.handle(httpx.Request("GET", url))
         return response.content if response.status_code == 200 else None
 
+    def lose_next_create_response(self) -> None:
+        self.fake.lose_write_responses(rf"^POST /repos/{REPO}/issues$")
+
+    def add_issue(self, author: Actor | None, body: str) -> TrackerIssueRef:
+        user = dict(self.fake.bot_user) if author is None else _github_user(author)
+        return self._tracker.issue(self.fake.seed_issue("Planted", body, user=user))
+
+    def marked_issue_count(self, output_identity: str) -> int:
+        embedded = self.embed_linked_marker(output_identity)
+        own = str(self.fake.bot_user["login"]).casefold()
+        return sum(
+            "pull_request" not in issue
+            and str(issue["user"]["login"]).casefold() == own
+            and ends_with_marker(issue.get("body"), embedded)
+            for issue in self.fake.issues.values()
+        )
+
+    def issue_body(self, issue: TrackerIssueRef) -> str:
+        return str(self.fake.issues[int(issue.issue_id)].get("body") or "")
+
+    def sent_issue_bodies(self) -> list[str]:
+        return [str(post["body"]) for post in self.fake.issue_posts]
+
+    def embed_linked_marker(self, output_identity: str) -> str:
+        return GitHubTracker.embed_linked_marker(output_identity)
+
 
 class JiraGitHubHarness:
     """The Jira Cloud tracker over `jira_fake.JiraFake`, paired with the GitHub
@@ -613,5 +698,11 @@ class JiraGitHubHarness:
 
 def _conforms(harness: InMemoryHarness | GitHubHarness | JiraGitHubHarness) -> AdapterHarness:
     """Type-checked proof that each harness satisfies the protocol."""
+
+    return harness
+
+
+def _conforms_linked(harness: InMemoryHarness | GitHubHarness) -> LinkedIssueHarness:
+    """Type-checked proof that the two linked issue pairs satisfy theirs."""
 
     return harness

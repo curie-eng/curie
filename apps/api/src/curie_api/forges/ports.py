@@ -23,6 +23,7 @@ from curie_api.forges.types import (
     EvidenceFile,
     FactoryPublication,
     FeedbackPage,
+    LinkedIssue,
     MarkedComment,
     MarkedNotice,
     NoticePage,
@@ -155,6 +156,38 @@ class Tracker(Protocol):
         returned. A tracker whose issues can move returns the reference for
         every key the issue held. A reference that cannot be read raises
         `Unavailable`; nothing is guessed.
+        """
+        ...
+
+    async def create_linked_issue(
+        self,
+        source: TrackerIssueRef,
+        *,
+        output_identity: str,
+        title: str,
+        body: str,
+        labels: Collection[str],
+    ) -> LinkedIssue:
+        """Optional: one new issue in ``source``'s own scope, linked to it (ADR 0277).
+
+        The body is ``body``, then a related-source line naming ``source``, then the
+        hidden marker ``linked_issue_marker(output_identity)`` as the last line
+        (`curie_api.forges.types.linked_issue_body`). It carries no closing
+        keyword and creates no blocked-by relation. Before creating, and again
+        after any uncertain create response, the adapter lists the scope's
+        issues created by its own identity (never a search API) and reconciles
+        to the one whose last non-empty line is that marker
+        (`curie_api.forges.types.ends_with_marker`); a marker in an issue
+        another identity created counts for nothing. More than one match raises
+        `Ambiguous` and writes nothing. A listing that cannot be read to its end
+        raises `Unavailable` and writes nothing, as does an uncertain create the
+        second listing cannot confirm. ``labels`` are applied at creation and
+        never edited on a reconciled issue. ValueError for an invalid
+        ``output_identity`` (`curie_api.forges.types.valid_output_identity`);
+        `NotFound` for a source outside this tracker; `Unsupported` where the
+        adapter declares `Operation.CREATE_LINKED_ISSUE` unsupported (GitLab
+        and Jira Cloud). Callers compare the returned `LinkedIssue.body_sha256`
+        with `LinkedIssue.sent_body_sha256` before recording delivery.
         """
         ...
 

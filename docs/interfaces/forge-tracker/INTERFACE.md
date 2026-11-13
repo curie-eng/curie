@@ -68,8 +68,20 @@ marked and described:
    held before a move. An unreadable answer raises `Unavailable`.
 10. `issue_url` gives the issue's web URL, which work item links come from.
     It makes no request and raises `NotFound` for an issue outside the tracker.
-11. Optional: `link_pull_request`, `dependencies` and `in_group` (group start
-    authority).
+11. Optional: `link_pull_request`, `dependencies`, `in_group` (group start
+    authority) and `create_linked_issue`
+    ([ADR 0277](../../adr/0277-factory-triage-publishes-tickets-before-implementation-admission.md)).
+    `create_linked_issue` opens one issue in the source issue's own scope whose
+    body ends with a related-source line and a hidden marker carrying the
+    caller's output identity, with no closing keyword and no blocked-by
+    relation, and returns a `LinkedIssue` with the read-back body digest. It
+    is idempotent: before creating, and again after an uncertain create, the
+    adapter lists the scope's issues its own identity created (never a search
+    API) and reconciles to the one whose last non-empty line is the marker. A
+    marker in an issue anyone else created counts for nothing, and two matches
+    raise `Ambiguous` without writing. The GitHub and in-memory adapters
+    implement it; GitLab and Jira Cloud declare it unsupported and raise
+    `Unsupported`.
 
 ### CodeHost
 
