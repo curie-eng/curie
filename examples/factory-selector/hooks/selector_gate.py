@@ -8,10 +8,10 @@ share one file lock for the whole state transaction, so concurrent calls
 cannot pass the cap. The runner allows a tool when this hook is still
 running at 60 seconds, so the hook denies itself first. State is one JSON
 file per session. A missing policy, an out-of-range cap, or a bad state
-file refuses every label write. PreToolUse also refuses a shell command
-and any write that lands in the state directory, so the model cannot clear
-the cap. Missing, malformed, or undecodable hook input, and any other
-failure, deny.
+file refuses every label write. PreToolUse refuses a shell command and
+every file write, whatever the path, so the model cannot replace this
+hook or clear the cap. Missing, malformed, or undecodable hook input, and
+any other failure, deny.
 """
 
 from __future__ import annotations
@@ -31,7 +31,24 @@ _CHANGED = ("title", "body", "state", "assignees", "milestone")
 # This deadline is also under the 10s command timeout declared for the hook.
 _HOOK_DEADLINE_SECONDS = 8.0
 _SHELL_TOOLS = frozenset({"bash", "shell", "powershell", "exec"})
-_WRITE_TOOLS = frozenset({"write", "edit", "multiedit", "notebookedit", "applypatch"})
+_WRITE_TOOLS = frozenset(
+    {
+        "write",
+        "edit",
+        "multiedit",
+        "notebookedit",
+        "applypatch",
+        "strreplace",
+        "write_file",
+        "edit_file",
+        "create_file",
+        "update_file",
+        "delete_file",
+        "move_file",
+        "push_files",
+        "create_or_update_file",
+    }
+)
 _READ_TOOLS = frozenset({"read", "glob", "grep"})
 _PATH_KEYS = frozenset({"file_path", "path", "notebook_path", "target_file", "target_notebook"})
 _COMMAND_KEYS = ("command", "cmd")
@@ -388,17 +405,13 @@ def _path_strings(tool_input: object) -> list[str]:
     return found
 
 
-def _lands_in_state(candidate: Path, directory: Path) -> bool:
-    try:
-        candidate.resolve().relative_to(directory.resolve())
-    except ValueError:
-        return False
-    except (OSError, RuntimeError):
-        return True
-    return True
+def _file_writer(leaf: str) -> bool:
+    """True for editor tools and MCP tools that write files, whatever the path."""
+    return leaf in _WRITE_TOOLS or leaf.endswith(("_file", "_files"))
 
 
 def _state_write_refusal(data: dict[str, Any], path: Path) -> str | None:
+    del path  # file writes are denied wherever they point, including this hook
     tool_input = data.get("tool_input")
     leaf = _leaf(str(data.get("tool_name") or ""))
     if leaf in _READ_TOOLS:
@@ -408,16 +421,8 @@ def _state_write_refusal(data: dict[str, Any], path: Path) -> str | None:
         and any(isinstance(tool_input.get(key), str) for key in _COMMAND_KEYS)
     ):
         return "a shell command can rewrite the session cap state"
-    raw_paths = _path_strings(tool_input)
-    if leaf in _WRITE_TOOLS and not raw_paths:
-        return "a write can rewrite the session cap state"
-    cwd = Path(str(data.get("cwd") or ""))
-    for raw in raw_paths:
-        candidate = Path(raw)
-        if not candidate.is_absolute():
-            candidate = cwd / candidate
-        if _lands_in_state(candidate, path.parent):
-            return "a write targets the session cap state"
+    if _file_writer(leaf) or _path_strings(tool_input):
+        return "a file write can rewrite the session cap state"
     return None
 
 

@@ -340,14 +340,14 @@ def test_a_state_reset_is_denied_and_the_fourth_write_stays_refused(tmp_path: Pa
     assert "shell" in other["permissionDecisionReason"]
     assert state_path.read_bytes() == before
 
-    assert (
+    outside = _decision_of(
         gate.send(
             "PreToolUse",
             tool_name="Write",
             tool_input={"file_path": str(gate.cwd / "notes.txt"), "content": "leave the cap alone"},
         )
-        is None
     )
+    assert outside["permissionDecision"] == "deny"
     assert (
         gate.send(
             "PreToolUse",
@@ -362,6 +362,64 @@ def test_a_state_reset_is_denied_and_the_fourth_write_stays_refused(tmp_path: Pa
     assert denied["permissionDecision"] == "deny"
     assert "cap of 3" in denied["permissionDecisionReason"]
     stored = json.loads(state_path.read_text())
+    assert stored["allowed"] == [
+        "acme-corp/acme-bot/12",
+        "acme-corp/acme-bot/15",
+        "acme-corp/acme-bot/18",
+    ]
+
+
+def test_overwriting_the_hook_is_denied_and_the_fourth_write_stays_refused(
+    tmp_path: Path,
+) -> None:
+    gate = Gate(tmp_path)
+    for number, labels in ((12, ["bug"]), (15, ["docs"]), (18, ["help wanted"])):
+        _allow(gate, number, labels)
+    bundle = HOOK.parent.parent
+    targets = (
+        HOOK,
+        HOOK.parent / "hooks.json",
+        bundle / ".claude-plugin" / "plugin.json",
+        bundle / "policy.json",
+    )
+    before = {path: path.read_bytes() for path in targets}
+    overwrite = _decision_of(
+        gate.send(
+            "PreToolUse",
+            tool_name="Write",
+            tool_input={"file_path": str(HOOK), "content": "pass\n"},
+        )
+    )
+    assert overwrite["permissionDecision"] == "deny"
+    assert "file write" in overwrite["permissionDecisionReason"]
+    for path in (
+        HOOK.parent / "hooks.json",
+        bundle / ".claude-plugin" / "plugin.json",
+        bundle / "policy.json",
+    ):
+        decision = _decision_of(
+            gate.send(
+                "PreToolUse",
+                tool_name="Edit",
+                tool_input={"file_path": str(path), "old_string": "{", "new_string": "pass"},
+            )
+        )
+        assert decision["permissionDecision"] == "deny"
+    pushed = _decision_of(
+        gate.send(
+            "PreToolUse",
+            tool_name="mcp__plugin_factory-selector_github__push_files",
+            tool_input={"files": [{"path": str(HOOK), "content": "pass\n"}]},
+        )
+    )
+    assert pushed["permissionDecision"] == "deny"
+    for path, original in before.items():
+        assert path.read_bytes() == original
+    gate.read(21, ["bug"])
+    denied = gate.update(21, ["bug", LABEL])
+    assert denied["permissionDecision"] == "deny"
+    assert "cap of 3" in denied["permissionDecisionReason"]
+    stored = json.loads((gate.state / "sess-1.json").read_text())
     assert stored["allowed"] == [
         "acme-corp/acme-bot/12",
         "acme-corp/acme-bot/15",
