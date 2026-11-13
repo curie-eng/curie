@@ -53,7 +53,7 @@ from claude_agent_sdk import (
     TaskNotificationMessage,
     TaskUpdatedMessage,
 )
-from curie_telemetry import record_metric
+from curie_telemetry import agent_metric_label, record_metric
 from opentelemetry.context import Context
 from plugin_format import PLATFORM_PUBLISH_TOOL_NAME
 
@@ -416,6 +416,7 @@ class SessionRunner:
         held_secrets: frozenset[str],
         session_id: str | None = None,
         model: str | None = None,
+        agent_name: str | None = None,
         memory_store: MemoryStore | None = None,
         history_store: TranscriptStore | None = None,
         approval_gate: ApprovalGate | None = None,
@@ -500,6 +501,7 @@ class SessionRunner:
         self._trace_name = trace_name
         self._session_id = session_id
         self._model = model
+        self._agent_name = agent_name
         # The memory port (#264). Prior memory is loaded at boot and delivered
         # via the system prompt; this store is the write side for learned records
         # (append + provenance). NullMemoryStore when no CURIE_MEMORY_REF.
@@ -1519,7 +1521,12 @@ class SessionRunner:
                 }
                 elapsed = time.monotonic() - start
                 record_metric("curie.turn.completed", attributes=completed_attributes)
-                record_metric("curie.turn.duration", elapsed, attributes=completed_attributes)
+                record_metric(
+                    "curie.turn.duration", elapsed,
+                    attributes={
+                        **completed_attributes, "agent": agent_metric_label(self._agent_name),
+                    },
+                )
 
             try:
                 with self._tracer.run_span(

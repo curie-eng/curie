@@ -2387,6 +2387,9 @@ def test_publication_create_stops_retrying_when_its_budget_is_spent() -> None:
 class _FactoryBinding:
     """A workspace-enabled deployment for a factory execute turn."""
 
+    async def approval_agent_name(self, event_id: str) -> str | None:
+        return "acme-bot"
+
     async def identity_binding(
         self, kind: str, adapter: str | None, address: str,
     ) -> HttpIdentityBinding | None:
@@ -3552,6 +3555,9 @@ class GrantBinding:
     mirroring the worker's real derivation from durable approval state.
     """
 
+    async def approval_agent_name(self, event_id: str) -> str | None:
+        return "test-agent" if event_id == self.grant_event_id else None
+
     async def identity_binding(
         self, kind: str, adapter: str | None, address: str,
     ) -> HttpIdentityBinding | None:
@@ -3980,6 +3986,9 @@ def _awaiting_routed_script(summary: str, route: str) -> list:
 
 class RoutedBinding:
     """A minimal binding stand-in: one channel -> one agent with route bindings."""
+
+    async def approval_agent_name(self, event_id: str) -> str | None:
+        return "test-agent"
 
     async def identity_binding(
         self, kind: str, adapter: str | None, address: str,
@@ -6113,6 +6122,9 @@ def test_publication_with_named_unbound_route_escalates_and_creates_nothing(
 class _WorkspacelessBinding:
     """A deployment with repository workspaces off, as `curie cluster message`
     installs it: a deployment id (so selection runs) and no bound repository."""
+
+    async def approval_agent_name(self, event_id: str) -> str | None:
+        return None
 
     async def identity_binding(
         self, kind: str, adapter: str | None, address: str,

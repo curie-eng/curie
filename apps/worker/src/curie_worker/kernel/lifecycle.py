@@ -15,6 +15,7 @@ from channel_protocol.reply import (
     NavAffordance,
 )
 from curie_internal import sandbox_token
+from curie_telemetry import agent_metric_label
 from opentelemetry.trace import SpanKind, StatusCode
 
 from .. import personal_execution, sweep
@@ -601,12 +602,22 @@ async def _process_event(
             ) as approval_span:
                 await self._finalize_settled_card(qevent, route)
                 approval_span.add_event("approval.resumed", {"outcome": "resumed"})
+            resume_agent: str | None = None
+            if self._binding is not None:
+                try:
+                    resume_agent = await self._binding.approval_agent_name(qevent.event_id)
+                except Exception as exc:  # noqa: BLE001 - telemetry never gates the resume.
+                    logger.warning(
+                        "approval telemetry agent lookup failed (%s)", type(exc).__name__
+                    )
+                    resume_agent = "other"
             log.record_metric(
                 "curie.approval.lifecycle",
                 attributes={
                     "service.name": "curie-worker",
                     "operation": "resume",
                     "outcome": "resumed",
+                    "agent": agent_metric_label(resume_agent),
                 },
             )
         elif not targetless:

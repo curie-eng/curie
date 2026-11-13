@@ -1552,6 +1552,7 @@ def build_runner(
             held_secrets=held_secrets,
             session_id=config.session.session_id,
             model=config.model,
+            agent_name=config.connector_agent,
             memory_store=memory_store,
             history_store=history_store,
             approval_gate=approval_gate,

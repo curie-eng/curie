@@ -115,16 +115,39 @@ than an open bag of `gen_ai.*` names.
   instruments, attribute keys, and enum values. Its allowlisted dimensions describe
   operation classes and outcomes, not event, run, session, sandbox, user, or
   deployment identifiers. Three bounded identifier dimensions are declared:
-  `curie.agent.turn.completed`, whose
-  `agent` label admits at most 32 distinct slugs per process and folds the rest,
-  plus any name that is not a 1 to 63 character slug, into `other`
-  (`packages/telemetry/src/curie_telemetry/metrics.py::record_metric`).
+  `curie.agent.turn.completed`, `curie.turn.duration`,
+  `curie.approval.lifecycle`, `curie.approval.pending`, and
+  `curie.approval.pending.age` share the `agent` dimension. All five instruments
+  use the same normalization and admission budget: at most 32 distinct slugs
+  per process, plus `other` and `unbound`. Names that are not 1 to 63 character
+  slugs, and names past the ceiling, share `other`
+  (`packages/telemetry/src/curie_telemetry/metrics.py::agent_metric_label`).
   Admission is first-come and resets when the process restarts, so the same slug
   can be named on one worker and counted as `other` on another. A rising
   `agent="other"` series means the ceiling or the slug rule is hiding a name.
-  `unbound` is only a turn that never resolved an agent. A real agent named
-  `other` or `unbound` shares `other`. Every other instrument refuses an
-  agent identifier. `curie.action_executor.execution` admits at most 16 distinct connector
+  `unbound` means no agent was resolved for the turn or approval. A real agent
+  named `other` or `unbound` shares `other`. The worker uses exactly the same
+  label on a turn's duration and agent completion counter. The runner uses
+  its existing configured connector agent name, or `unbound` when absent.
+  The fleet counter `curie.turn.completed` keeps its existing attributes.
+  Approval resolution and expiry use the approval's stored agent, and approval
+  resume looks up that agent independently of a channel's current binding.
+  An unavailable resume telemetry lookup shares `other` and never blocks the
+  resume. An approval is raised when the worker emits
+  `curie.approval.lifecycle{operation="request",outcome="requested"}` after
+  durable creation. Count that event by `agent`, rather than counting the
+  later `suspended` event as another raised approval.
+  The API observes pending approvals without pagination, grouped by agent.
+  Each normalized label gets one pending count and the age of its oldest
+  pending approval; overflow groups sum counts and keep the oldest creation
+  time before recording gauges. Every previously observed agent label gets
+  zero count and age when it has no pending approvals, including after an
+  agent is deleted. An empty fleet still exports `agent="unbound"` at zero.
+  Existing metric names and other attributes remain unchanged. Fleet queries
+  sum `curie.approval.pending` across agents and take the maximum of
+  `curie.approval.pending.age`; no duplicate fleet-total series is emitted.
+  Other instruments refuse an agent identifier.
+  `curie.action_executor.execution` admits at most 16 distinct connector
   slugs per process through its `connector` dimension, folding invalid names and
   overflow into `other` (`packages/telemetry/src/curie_telemetry/metrics.py`).
   `curie.slack.socket.envelopes` and `curie.slack.delivery_canary` admit at most

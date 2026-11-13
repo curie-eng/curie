@@ -7,6 +7,7 @@ import logging
 import os
 import threading
 import time
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, cast
 from unittest.mock import Mock
@@ -258,12 +259,63 @@ def test_runner_turn_records_declared_metrics_through_configured_provider() -> N
             "source": "runner",
             "outcome": "done",
         }
+        duration = points["curie.turn.duration"]
+        assert len(duration) == 1
+        assert dict(duration[0].attributes) == {
+            "service.name": "curie-runner",
+            "source": "runner",
+            "outcome": "done",
+            "agent": "unbound",
+        }
         assert all(
             "session-example" not in str(point.attributes)
             and "U0EXAMPLE1" not in str(point.attributes)
             for metric_points in points.values()
             for point in metric_points
         )
+    finally:
+        provider.shutdown()
+
+
+@pytest.mark.usefixtures("fresh_agent_metric_labels")
+@pytest.mark.parametrize(("agent_name", "expected"), [
+    ("acme-bot", "acme-bot"), ("unbound", "other"), ("not a slug", "other"),
+])
+def test_runner_boot_passes_configured_agent_to_turn_duration(
+    tmp_path: Path, agent_name: str, expected: str,
+) -> None:
+    plugin_dir = tmp_path / "bundle"
+    manifest_dir = plugin_dir / ".claude-plugin"
+    manifest_dir.mkdir(parents=True)
+    (manifest_dir / "plugin.json").write_text(json.dumps({"name": "acme-bot"}))
+    config = RunnerConfig.from_env({
+        "CURIE_PLUGIN_DIR": str(plugin_dir),
+        "CURIE_SESSION_ID": "session-example",
+        "CURIE_SANDBOX_ID": "sandbox-example",
+        "CURIE_BUDGET": '{"max_output_tokens_per_run": 10000, "max_usd_per_day": 1.0}',
+        "CURIE_CONNECTOR_AGENT": agent_name,
+    })
+    reader = InMemoryMetricReader()
+    provider = MeterProvider(metric_readers=[reader], shutdown_on_exit=False)
+    configure_meter_provider(provider)
+    runner = boot.build_runner(config, fake_model=True)
+
+    async def go() -> None:
+        await runner.start()
+        try:
+            async for _ in runner.run_turn(
+                Event(type="message", text="go", user="U0EXAMPLE1", ts="1")
+            ):
+                pass
+        finally:
+            await runner.close()
+
+    try:
+        anyio.run(go)
+        assert provider.force_flush(timeout_millis=5000)
+        duration = _metric_points(reader)["curie.turn.duration"]
+        assert len(duration) == 1
+        assert duration[0].attributes["agent"] == expected
     finally:
         provider.shutdown()
 

@@ -1259,6 +1259,22 @@ class BindingResolver:
             except (ValueError, TypeError, RecursionError):
                 raise ValueError("invalid_approval_grant") from None
 
+    async def approval_agent_name(self, event_id: str) -> str | None:
+        """The approval's agent name, independent of its current channel binding."""
+
+        approval_id = _parse_resume_event_id(event_id)
+        if approval_id is None:
+            return None
+        sql = text(
+            f"SELECT agent.name FROM {self._config.db_schema}.approvals approval "
+            f"JOIN {self._config.db_schema}.agents agent ON agent.id = approval.agent_id "
+            "WHERE approval.id = :id AND agent.tenant_id = :tenant_id"
+        )
+        async with self._engine.connect() as conn:
+            result = await conn.execute(sql, {"id": approval_id, "tenant_id": self._tenant_id})
+            name: str | None = result.scalar_one_or_none()
+        return name
+
     async def approval_resumed_kind(self, event_id: str, agent_id: uuid.UUID) -> str | None:
         """The gate provenance of the approval a resume turn is resuming (#544,
         Decision A2), or None.

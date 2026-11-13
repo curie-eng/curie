@@ -469,3 +469,36 @@ def test_approved_permission_gate_returns_stored_arguments_not_summary() -> None
             await engine.dispose()
 
     asyncio.run(go())
+
+
+@pytest.mark.parametrize("status", ["approved", "rejected", "expired"])
+def test_approval_metric_agent_comes_from_the_record_after_channel_rebind(status: str) -> None:
+    async def go() -> None:
+        engine = create_async_engine(_DB_URL)
+        agents = [uuid.uuid4(), uuid.uuid4()]
+        approvals = [uuid.uuid4(), uuid.uuid4()]
+        try:
+            await pg_connect_or_skip(engine)
+            for agent_id in agents:
+                await _seed_agent(engine, agent_id)
+            await _seed_approval(engine, approval_id=approvals[0], agent_id=agents[0],
+                                 status=status, summary="example approval")
+            await _seed_approval(engine, approval_id=approvals[1], agent_id=None,
+                                 status=status, summary="unbound example approval")
+            async with engine.begin() as conn:
+                await conn.execute(text(
+                    f"UPDATE {_SCHEMA}.agent_channels SET agent_id = :new WHERE agent_id = :old"
+                ), {"new": agents[1], "old": agents[0]})
+            resolver = _resolver(engine)
+            assert await resolver.approval_agent_name(resume_event_id(approvals[0])) == (
+                f"agent-{agents[0].hex[:8]}"
+            )
+            assert await resolver.approval_agent_name(resume_event_id(approvals[1])) is None
+            assert await resolver.approval_agent_name(resume_event_id(uuid.uuid4())) is None
+            assert await resolver.approval_agent_name("ordinary-event") is None
+        finally:
+            await _cleanup_approvals(engine, approvals)
+            await _cleanup_agents(engine, agents)
+            await engine.dispose()
+
+    asyncio.run(go())

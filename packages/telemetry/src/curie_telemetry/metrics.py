@@ -40,19 +40,20 @@ _TURN_OUTCOMES: Final = [
 ]
 
 
-# Distinct agent names admitted on ``curie.agent.turn.completed`` in one
-# process. Names past the ceiling, and names that are not a short slug, share
-# the reserved ``other`` series. ``unbound`` is the series for a terminal turn
-# that never resolved an agent. Neither reserved value consumes a ceiling slot.
+# Agent-labeled metrics share one process-local admission ceiling. Invalid
+# names and overflow share ``other``; missing agents use ``unbound``. Neither
+# reserved label consumes a ceiling slot.
 _AGENT_LABEL_CEILING: Final = 32
 _AGENT_LABEL_RE: Final = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,62}$")
 _BOUNDED_SEEN: dict[tuple[str, str], dict[str, None]] = {}
+_AGENT_METRIC_LABELS: set[str] = set()
 
 
 def reset_bounded_labels() -> None:
     """Drop process-local bounded-label admissions. Tests only."""
 
     _BOUNDED_SEEN.clear()
+    _AGENT_METRIC_LABELS.clear()
 
 
 def _bounded_agent_label() -> dict[str, Any]:
@@ -107,9 +108,12 @@ _TURN_COMPLETED_ATTRIBUTES = {
     "source": _TURN_SOURCES,
     "outcome": _TURN_OUTCOMES,
 }
-# One agent dimension, on its own instrument, so the fleet-wide turn counter
-# stays unlabeled. The ceiling is the cardinality contract (#2952).
-_AGENT_TURN_ATTRIBUTES = {
+_TURN_DURATION_ATTRIBUTES = {
+    **_TURN_COMPLETED_ATTRIBUTES,
+    "agent": _bounded_agent_label(),
+}
+# The fleet-wide turn counter stays unlabeled (#2952).
+_AGENT_TURN_ATTRIBUTES: dict[str, Any] = {
     "service.name": ["curie-worker"],
     "source": ["worker"],
     "outcome": _TURN_OUTCOMES,
@@ -251,6 +255,7 @@ _RUNNER_RPC_ATTRIBUTES = {
 }
 _APPROVAL_ATTRIBUTES = {
     "service.name": ["curie-api", "curie-worker"],
+    "agent": _bounded_agent_label(),
     # ``dm_delivery``: an approver DM card that was not posted or not registered
     # (ADR 0272); it records only ``failure``.
     "operation": ["request", "resolve", "expire", "suspend", "resume", "observe", "dm_delivery"],
@@ -267,6 +272,7 @@ _APPROVAL_ATTRIBUTES = {
 }
 _APPROVAL_PENDING_ATTRIBUTES = {
     "service.name": ["curie-api"],
+    "agent": _bounded_agent_label(),
     "operation": ["observe"],
     "outcome": ["pending"],
 }
@@ -787,13 +793,14 @@ _METRICS: dict[str, dict[str, Any]] = {
         _TURN_REFUSED_ATTRIBUTES,
     ),
     "curie.turn.duration": _definition(
-        "histogram", "s", "End to end turn duration.", False, _TURN_COMPLETED_ATTRIBUTES
+        "histogram", "s", "End to end turn duration.", False, _TURN_DURATION_ATTRIBUTES
     ),
     "curie.agent.turn.completed": _definition(
         "counter",
         "{turn}",
-        "Terminal turns for one agent. Each process admits at most 32 distinct "
-        "slugs; further slugs, non-slugs, and the reserved names other and unbound "
+        "Terminal turns for one agent. Agent-labeled metrics in each process share "
+        "at most 32 distinct slugs; further slugs, non-slugs, and the reserved "
+        "names other and unbound "
         "share other. A turn with no resolved agent is unbound. The cap is per "
         "process, so a fleet query can still fold a slug into other on one worker.",
         True,
@@ -1119,19 +1126,41 @@ def _admit_bounded(metric: str, key: str, spec: Mapping[str, Any], value: str) -
     """Map one label onto the declared ceiling without raising."""
 
     overflow = str(spec["overflow"])
-    reserved = spec["reserved"]
-    if value in reserved:
-        return value
+    admission_key = ("agent", key) if key == "agent" else (metric, key)
+    seen = _BOUNDED_SEEN.setdefault(admission_key, {})
     pattern = re.compile(str(spec.get("pattern") or _AGENT_LABEL_RE.pattern))
-    if pattern.fullmatch(value) is None:
-        return overflow
-    seen = _BOUNDED_SEEN.setdefault((metric, key), {})
-    if value in seen:
-        return value
-    if len(seen) >= int(spec["ceiling"]):
-        return overflow
-    seen[value] = None
-    return value
+    if value in spec["reserved"]:
+        normalized = value
+    elif pattern.fullmatch(value) is None:
+        normalized = overflow
+    elif value not in seen and len(seen) >= int(spec["ceiling"]):
+        normalized = overflow
+    else:
+        seen[value] = None
+        normalized = value
+    if key == "agent":
+        _AGENT_METRIC_LABELS.add(normalized)
+    return normalized
+
+
+def agent_metric_label(agent_name: str | None) -> str:
+    """Normalize an agent name into the shared process-local metric domain."""
+
+    if not agent_name:
+        label = "unbound"
+    elif agent_name in {"other", "unbound"}:
+        label = "other"
+    else:
+        label = agent_name
+    return _admit_bounded(
+        "curie.agent.turn.completed", "agent", _AGENT_TURN_ATTRIBUTES["agent"], label
+    )
+
+
+def observed_agent_metric_labels() -> frozenset[str]:
+    """Labels used in this process, including reserved and overflow labels."""
+
+    return frozenset(_AGENT_METRIC_LABELS)
 
 
 def record_metric(

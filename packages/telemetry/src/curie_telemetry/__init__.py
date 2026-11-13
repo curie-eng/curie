@@ -13,7 +13,12 @@ from .context import (
     inject_trace_context,
 )
 from .logging import configure_service_logging
-from .metrics import configure_meter_provider, record_metric
+from .metrics import (
+    agent_metric_label,
+    configure_meter_provider,
+    observed_agent_metric_labels,
+    record_metric,
+)
 from .resource import build_resource, deployment_environment, service_instance_id
 from .tracing import (
     channel_event_id_scope,
@@ -24,6 +29,7 @@ from .tracing import (
 __all__ = [
     "TRACEPARENT_STREAM_FIELD",
     "ServiceTelemetry",
+    "agent_metric_label",
     "bootstrap_service_telemetry",
     "build_otlp_span_exporter",
     "build_resource",
@@ -34,6 +40,7 @@ __all__ = [
     "deployment_environment",
     "extract_trace_context",
     "inject_trace_context",
+    "observed_agent_metric_labels",
     "operation_span",
     "record_metric",
     "resolve_otlp_endpoint",
